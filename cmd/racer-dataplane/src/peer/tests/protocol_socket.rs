@@ -2,7 +2,7 @@
 
 use super::*;
 use racer_control_wire::CacheId;
-use racer_platform::reactor::IoBuffer;
+use uring_runtime::reactor::IoBuffer;
 
 #[test]
 fn signed_opaque_relay_roundtrip_and_exact_attempt_binding() {
@@ -490,7 +490,7 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
             let fd = socket
                 .reactor
                 .accept(
-                    Rc::new(racer_platform::reactor::descriptor::Descriptor::from(
+                    Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
                         listener,
                     )),
                     &scope,
@@ -969,7 +969,7 @@ fn signed_tcp_case(case: &str) {
     let server_work = async {
         let fd = reactor
             .accept(
-                Rc::new(racer_platform::reactor::descriptor::Descriptor::from(
+                Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
                     listener,
                 )),
                 &scope,
@@ -1327,10 +1327,10 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     let scope =
         RequestScope::new(RequestId([7; 16]), Instant::now() + Duration::from_secs(30)).unwrap();
     let server = async {
-        use racer_platform::reactor::IoBuffer;
+        use uring_runtime::reactor::IoBuffer;
         let fd = reactor
             .accept(
-                Rc::new(racer_platform::reactor::descriptor::Descriptor::from(
+                Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(
                     listener,
                 )),
                 &scope,

@@ -11,12 +11,12 @@ use racer_crypto::identity::{
     Certificates, KeyEpochs, Keyring,
     test_util::{ca, issue},
 };
-use racer_platform::environment::{Deadline, SimulationClock, now};
 use std::{
     rc::Rc,
     sync::Arc,
     time::{Duration, Instant, UNIX_EPOCH},
 };
+use uring_runtime::environment::{Deadline, SimulationClock, now};
 
 struct NoMac;
 
@@ -101,12 +101,12 @@ fn head_and_sign_reject_unmappable_deadlines() {
     for deadline in [(wall_seconds + 1) * 1000, u64::MAX] {
         assert!(matches!(
             decode_deadline(deadline),
-            Err(Error::Runtime(racer_platform::Error::InvalidInput))
+            Err(Error::Runtime(uring_runtime::Error::InvalidInput))
         ));
         let binding = binding(deadline);
         assert!(matches!(
             binding.head(Phase::Fallback, &[0; 32], 0, vec![]),
-            Err(Error::Runtime(racer_platform::Error::InvalidInput))
+            Err(Error::Runtime(uring_runtime::Error::InvalidInput))
         ));
         assert!(matches!(
             binding.sign(
@@ -117,7 +117,7 @@ fn head_and_sign_reject_unmappable_deadlines() {
                 0,
                 vec![]
             ),
-            Err(Error::Runtime(racer_platform::Error::InvalidInput))
+            Err(Error::Runtime(uring_runtime::Error::InvalidInput))
         ));
     }
 }

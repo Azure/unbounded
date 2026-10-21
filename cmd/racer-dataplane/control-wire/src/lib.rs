@@ -16,7 +16,7 @@
 //!
 //! `racer_crypto::enrollment` owns durable node-private enrollment, certificate
 //! validation, projected token reads, and identity recovery. It uses
-//! `racer_platform::fs::secure` for bounded descriptor-relative I/O,
+//! `uring_runtime::reactor::filesystem::secure` for bounded descriptor-relative I/O,
 //! private access checks, durable replacement, and fencing abandoned attempts.
 //! The caller supplies current NIC inventory and shares, persists NIC reservations
 //! before preparing enrollment, and exclusively owns the identity directory.

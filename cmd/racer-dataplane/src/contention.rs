@@ -5,11 +5,11 @@ use crate::admission::AdmissionPolicy;
 use crate::admission::ResourceClass;
 use crate::model::PAGE_BYTES;
 use racer_control_wire::CacheId;
-#[cfg(test)]
-use racer_platform::group::Service;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
+#[cfg(test)]
+use uring_runtime::group::Service;
 
 const PLAIN: usize = PAGE_BYTES as usize;
 const CIPHER: usize = PLAIN + 16;
@@ -1071,13 +1071,13 @@ mod fidelity {
     use crate::topology::Member;
     use crate::topology::Membership;
     use crate::topology::Placement;
-    use racer_platform::reactor::IoBuffer;
     use std::num::NonZeroU32;
     use std::num::NonZeroUsize;
     use std::rc::Rc;
     use std::task::Context;
     use std::time::Duration;
     use std::time::Instant;
+    use uring_runtime::reactor::IoBuffer;
 
     // The abstract side owns no payload. Production pages put the same non-cloneable
     // charges inside Arc<VerifiedBytes>/Arc<CiphertextBytes> (memory/pool.rs:41-58).
@@ -1636,7 +1636,7 @@ mod fidelity {
         };
         let scope = scope();
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 4, 8);
-        let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         let mut read = fill.publish_bootstrap_with_context(
             OriginPage {
@@ -1651,8 +1651,8 @@ mod fidelity {
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let mut result = None;
         for _ in 0..32 {
-            racer_platform::drivers::poll(&mut cx, 8);
-            engine.poll(&mut cx, 8).unwrap();
+            uring_runtime::drivers::poll(&mut cx, 8);
+            engine.poll_budgeted(&mut cx, 8).unwrap();
             client.poll_budgeted(8).unwrap();
             if let std::task::Poll::Ready(value) = read.as_mut().poll(&mut cx) {
                 result = Some(value.unwrap());
@@ -1682,7 +1682,7 @@ mod fidelity {
         assert!(old_model.bundle.idle());
         assert!(next_model.bundle.idle());
         drop(fill);
-        assert_eq!(racer_platform::drivers::pending(), 0);
+        assert_eq!(uring_runtime::drivers::pending(), 0);
         drop((old_model, next_model, model_dirty, real_dirty));
         assert_eq!(memory.evict_idle(usize::MAX), Ok(44));
         checkpoint("dirty and page owners drained", &model, &real, [0, 0, 0]);
@@ -1749,7 +1749,7 @@ mod fidelity {
         assert_eq!(client.outstanding(), 1);
         // Failed inputs survive the engine as well, security/aead.rs:259-260;
         // abandoned completion release occurs in runtime/crypto.rs:497-518.
-        engine.poll(&mut cx, 1).unwrap();
+        engine.poll_budgeted(&mut cx, 1).unwrap();
         assert!(completion_owner.bundle.idle());
         checkpoint(
             "completion published but not reaped",

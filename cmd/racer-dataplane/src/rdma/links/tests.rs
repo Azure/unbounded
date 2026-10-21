@@ -2,14 +2,14 @@
 //! limit, and page grants without HTTP.
 
 use super::*;
-use racer_platform::environment::Environment;
-use racer_platform::environment::SimulationClock;
 use rdma_verbs::BufferState;
 use rdma_verbs::Owner;
 use rdma_verbs::simulation::Device;
 use rdma_verbs::simulation::Simulation;
 use std::future::Future;
 use std::task::Context;
+use uring_runtime::environment::Environment;
+use uring_runtime::environment::SimulationClock;
 
 const RAIL: RailId = RailId(7);
 
@@ -22,7 +22,7 @@ pub(crate) struct Node {
 pub(crate) struct World {
     pub _sim: Simulation,
     pub clock: SimulationClock,
-    pub _environment: Option<racer_platform::environment::Guard>,
+    pub _environment: Option<uring_runtime::environment::Guard>,
     pub a: Node,
     pub b: Node,
 }
@@ -44,7 +44,7 @@ fn mapping(n: u8) -> RailMapping {
 pub(crate) fn scope() -> RequestScope {
     RequestScope::new(
         crate::model::RequestId([1; 16]),
-        racer_platform::environment::now() + Duration::from_secs(5),
+        uring_runtime::environment::now() + Duration::from_secs(5),
     )
     .unwrap()
 }

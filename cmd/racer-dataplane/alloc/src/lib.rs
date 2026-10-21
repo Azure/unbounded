@@ -168,7 +168,6 @@ pub use demand::{
     DEFAULT_DECAY_WINDOWS, DEFAULT_INITIAL_TARGET, DEFAULT_MAX_DEPTH, DEFAULT_MIN_DEPTH,
     DEFAULT_WINDOW, PoolDemand, PoolStats,
 };
-use racer_platform::reactor::IoBuffer;
 pub use segments::{
     FreezeGuard, Generation, SegmentClock, SegmentEntries, SegmentId, SegmentLease,
     SegmentSnapshot, SegmentState, Segments,
@@ -184,6 +183,7 @@ use std::{
     rc::{Rc, Weak},
     sync::{Arc, Mutex, MutexGuard, Weak as SyncWeak},
 };
+use uring_runtime::reactor::IoBuffer;
 
 /// Storage failures, separated from application record and admission policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -456,7 +456,7 @@ impl Index {
     }
 
     pub(super) fn restore_holds(&self, segments: &[page_alloc::SegmentSnapshot]) -> Result<()> {
-        let now = racer_platform::environment::wall_now();
+        let now = uring_runtime::environment::wall_now();
         let mut deadlines = HashMap::default();
         for segment in segments {
             for (offset, until) in &segment.retained_records {
@@ -474,7 +474,7 @@ impl Index {
                 let Some(monotonic) = until
                     .duration_since(now)
                     .ok()
-                    .and_then(|ttl| racer_platform::environment::now().checked_add(ttl))
+                    .and_then(|ttl| uring_runtime::environment::now().checked_add(ttl))
                 else {
                     continue;
                 };
@@ -512,7 +512,7 @@ impl Index {
         snapshot: &IndexSnapshot,
         segments: &[page_alloc::SegmentSnapshot],
     ) -> Result<()> {
-        let now = racer_platform::environment::wall_now();
+        let now = uring_runtime::environment::wall_now();
         let mut offsets = HashSet::default();
         for segment in segments {
             for (offset, until) in &segment.retained_records {
@@ -641,7 +641,7 @@ impl Index {
     /// never changed by retention, so checkpoint traversal remains monotonic.
     fn victim(&self, state: &State) -> Option<PageId> {
         let retention = self.retention();
-        let scoring = retention.scoring_at(racer_platform::environment::now());
+        let scoring = retention.scoring_at(uring_runtime::environment::now());
         state.pages.victim_if(64, |page, _| {
             (!self.is_held(page)).then(|| u64::from(scoring.score(page)))
         })
@@ -787,7 +787,7 @@ impl Index {
             .borrow()
             .current
             .get(object)
-            .filter(|v| racer_platform::environment::wall_now() < v.expires_at.as_system_time())
+            .filter(|v| uring_runtime::environment::wall_now() < v.expires_at.as_system_time())
             .cloned())
     }
     /// Page-zero owner only, after fresh revalidation. Atomically retain the
@@ -800,7 +800,7 @@ impl Index {
         self.publish_version(metadata.immutable())?;
         let mut s = self.state.borrow_mut();
         s.current.remove(&metadata.version.object);
-        if racer_platform::environment::wall_now() < metadata.expires_at.as_system_time() {
+        if uring_runtime::environment::wall_now() < metadata.expires_at.as_system_time() {
             s.current.insert(
                 metadata.version.object.clone(),
                 CurrentVersion {
@@ -1007,7 +1007,7 @@ impl Index {
         let retention = self.retention();
         self.segment_score_with(
             segment,
-            &retention.scoring_at(racer_platform::environment::now()),
+            &retention.scoring_at(uring_runtime::environment::now()),
         )
     }
     fn segment_score_with(
@@ -1182,7 +1182,7 @@ impl SegmentClock {
     /// Rank at most 64 slots before eviction. Busy segments remain Evicting until
     /// a later poll; ownership and heat cannot prevent eventual reclamation.
     pub fn reclaim_now(&self) -> Result<()> {
-        let now = racer_platform::environment::now();
+        let now = uring_runtime::environment::now();
         let retention = self.index.retention();
         let scoring = retention.scoring_at(now);
         self.clock
@@ -1327,7 +1327,7 @@ mod tests {
         let (page, entry) = indexed(descriptor("held", 17), 0);
         drop(segments.append(1024).unwrap());
         index.publish(page.clone(), entry).unwrap();
-        let until = racer_platform::environment::wall_now() + std::time::Duration::from_secs(60);
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
         index.reserve_hold(&page.version, 2, until).unwrap();
         index.reserve_hold(&page.version, 2, until).unwrap();
         index
@@ -1400,7 +1400,7 @@ mod tests {
         index.publish(cached.clone(), entry).unwrap();
         let mut primary = cached.clone();
         primary.number = crate::model::PageNumber(1);
-        let until = racer_platform::environment::wall_now() + std::time::Duration::from_secs(60);
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
         index
             .reserve_hold_pages(&cached.version, &page_set(&[]), until)
             .unwrap();
@@ -1441,7 +1441,7 @@ mod tests {
         let (cached, entry) = indexed(descriptor("union", 3 * crate::model::PAGE_BYTES), 0);
         drop(segments.append(1024).unwrap());
         index.publish(cached.clone(), entry).unwrap();
-        let until = racer_platform::environment::wall_now() + std::time::Duration::from_secs(60);
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
         index
             .reserve_hold_pages(&cached.version, &page_set(&[0, 2]), until)
             .unwrap();
@@ -1499,7 +1499,7 @@ mod tests {
             index.publish(page, entry).unwrap();
         }
         let held: Vec<u64> = (0..count).rev().step_by(3).collect();
-        let until = racer_platform::environment::wall_now() + std::time::Duration::from_secs(60);
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
         index
             .reserve_hold_pages(&first.version, &page_set(&held), until)
             .unwrap();
@@ -1536,7 +1536,7 @@ mod tests {
             index.publish(page.clone(), entry).unwrap();
             pages.push(page);
         }
-        let until = racer_platform::environment::wall_now() + std::time::Duration::from_secs(60);
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
         index
             .reserve_hold_pages(&first.version, &page_set(&[1]), until)
             .unwrap();
@@ -1562,7 +1562,7 @@ mod tests {
         let segments = Rc::new(segments(1024, 8));
         let index = Rc::new(index(8));
         let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
-        let until = racer_platform::environment::wall_now() + std::time::Duration::from_secs(60);
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
         let (first, entry) = indexed(descriptor("first", 17), 0);
         index.reserve_hold(&first.version, 2, until).unwrap();
         let pending = index.reserve_page_for(&first, false).unwrap();
@@ -1616,7 +1616,7 @@ mod tests {
             .entries
             .get_mut(&first.version)
             .unwrap()
-            .monotonic = racer_platform::environment::now() - std::time::Duration::from_secs(1);
+            .monotonic = uring_runtime::environment::now() - std::time::Duration::from_secs(1);
         assert_eq!(index.held_snapshot(), HeldSnapshot::default());
         assert!(
             index.lookup(&first).unwrap().is_some(),
@@ -1633,7 +1633,7 @@ mod tests {
         drop(segments.append(1024).unwrap());
         index.publish(page.clone(), entry).unwrap();
         segments.begin_evict(SegmentId(0)).unwrap();
-        let until = racer_platform::environment::wall_now() + std::time::Duration::from_secs(60);
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
         assert_eq!(
             index.reserve_hold(&page.version, 1, until),
             Err(Error::Overloaded)
@@ -1648,7 +1648,7 @@ mod tests {
         let index = Rc::new(index(8));
         let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
         let (page, entry) = indexed(descriptor("partial", 17), 0);
-        let until = racer_platform::environment::wall_now() + std::time::Duration::from_secs(60);
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
         index.reserve_hold(&page.version, 2, until).unwrap();
         assert_eq!(index.held_page_expiry(&page), None);
         drop(segments.append(1024).unwrap());
@@ -1670,7 +1670,7 @@ mod tests {
         index.set_page_capacity(4).unwrap();
         let _clock = SegmentClock::new(index.clone(), segments, 1);
         let version = descriptor("held", 17).version;
-        let now = racer_platform::environment::wall_now();
+        let now = uring_runtime::environment::wall_now();
         assert_eq!(
             index.reserve_hold(&version, 1, now),
             Err(Error::InvalidConfiguration)
@@ -1718,7 +1718,7 @@ mod tests {
         let index = Rc::new(index(8));
         let _clock = SegmentClock::new(index.clone(), segments, 1);
         let version = descriptor("ttl", 17).version;
-        let now = racer_platform::environment::wall_now();
+        let now = uring_runtime::environment::wall_now();
         index
             .reserve_hold(&version, 1, now + std::time::Duration::from_secs(60))
             .unwrap();
@@ -1736,7 +1736,7 @@ mod tests {
             .entries
             .get_mut(&version)
             .unwrap()
-            .monotonic = racer_platform::environment::now() - std::time::Duration::from_secs(1);
+            .monotonic = uring_runtime::environment::now() - std::time::Duration::from_secs(1);
         assert_eq!(index.hold_expiry(&version), None);
         assert_eq!(index.hold_unused(), 0);
     }

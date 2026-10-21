@@ -36,7 +36,6 @@ use racer_control_wire::SCHEMA_VERSION;
 use racer_control_wire::{CacheId, ClusterId, NodeId};
 use racer_crypto::identity::KeyEpochs;
 use racer_crypto::identity::Keyring;
-use racer_platform::reactor::IoBuffer;
 use runtime::Reactor;
 use runtime::RequestScope;
 use security::OriginContext;
@@ -48,6 +47,7 @@ use std::task::Context;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::UNIX_EPOCH;
+use uring_runtime::reactor::IoBuffer;
 
 // Only origin content is generated. No client wire framing, scheduling, credit
 // accounting, page validation, encryption, or delivery is implemented here.
@@ -185,7 +185,7 @@ struct SubscriptionFixture {
     root: PathBuf,
     clients: client::listener::ClientListeners,
     endpoint: read::dispatch::WorkerEndpoint,
-    drivers: Rc<racer_platform::drivers::DriverQueue>,
+    drivers: Rc<uring_runtime::drivers::DriverQueue>,
     engine: security::PageCryptoEngine,
     crypto: Rc<security::CryptoClient>,
     reactor: Rc<Reactor>,
@@ -377,7 +377,7 @@ impl SubscriptionFixture {
         futures::executor::block_on(clients.reconcile(std::slice::from_ref(&cache), &scope))
             .unwrap();
         std::fs::write(root.join("ready"), b"ready").unwrap();
-        let drivers = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+        let drivers = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
         Self {
             root,
             clients,
@@ -414,7 +414,7 @@ impl SubscriptionFixture {
         self.clients.poll_budgeted(cx, 64).unwrap();
         self.endpoint.poll_budgeted(64).unwrap();
         self.drivers.poll(cx, 64);
-        racer_platform::group::Service::poll(
+        uring_runtime::group::Service::poll_budgeted(
             &mut self.engine,
             &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
             64,

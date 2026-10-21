@@ -91,7 +91,7 @@ impl NativeNode {
         &self,
         worker: WorkerId,
         engine: PageCryptoEngine,
-    ) -> Result<Box<dyn racer_platform::group::Service<RequestScope>>> {
+    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
         let mut owner = self.owner.lock().map_err(|_| Error::Unavailable)?;
         Ok(match owner.take_if(|(hosted, _)| *hosted == worker) {
             // Build the owner here, on the native thread that polls it.
@@ -126,7 +126,7 @@ impl WorkerApplication {
             self.actual_rails.clear();
             self.discovered_nics = snapshot.nics;
             self.inventory_generation = snapshot.generation;
-            self.native_retry = racer_platform::environment::now();
+            self.native_retry = uring_runtime::environment::now();
         }
         Ok(())
     }
@@ -160,7 +160,7 @@ impl WorkerApplication {
             && let Poll::Ready(result) = task.as_mut().poll(cx)
         {
             self.native_task = None;
-            self.native_retry = racer_platform::environment::now() + Duration::from_secs(1);
+            self.native_retry = uring_runtime::environment::now() + Duration::from_secs(1);
             if result.is_err() {
                 links.close();
             }
@@ -169,7 +169,7 @@ impl WorkerApplication {
         if !self.native_owner()
             || self.native_task.is_some()
             || !self.actual_rails.is_empty()
-            || racer_platform::environment::now() < self.native_retry
+            || uring_runtime::environment::now() < self.native_retry
         {
             return Ok(());
         }
@@ -382,7 +382,7 @@ mod tests {
         for _ in 0..20 {
             worker.poll_native(&mut cx).unwrap();
             service
-                .poll(&mut Context::from_waker(futures::task::noop_waker_ref()), 8)
+                .poll_budgeted(&mut Context::from_waker(futures::task::noop_waker_ref()), 8)
                 .unwrap();
         }
         assert_eq!(worker.actual_rails[0].device, "new");
@@ -392,7 +392,7 @@ mod tests {
         worker.refresh_inventory().unwrap();
         assert!(!worker.links.as_ref().unwrap().rail_ready(RailId(7)));
         service
-            .poll(
+            .poll_budgeted(
                 &mut Context::from_waker(futures::task::noop_waker_ref()),
                 256,
             )
@@ -402,7 +402,7 @@ mod tests {
         for _ in 0..20 {
             worker.poll_native(&mut cx).unwrap();
             service
-                .poll(&mut Context::from_waker(futures::task::noop_waker_ref()), 8)
+                .poll_budgeted(&mut Context::from_waker(futures::task::noop_waker_ref()), 8)
                 .unwrap();
         }
         assert!(worker.links.as_ref().unwrap().rail_ready(RailId(7)));
@@ -412,7 +412,7 @@ mod tests {
         worker.refresh_inventory().unwrap();
         assert!(!worker.links.as_ref().unwrap().rail_ready(RailId(7)));
         service
-            .poll(
+            .poll_budgeted(
                 &mut Context::from_waker(futures::task::noop_waker_ref()),
                 256,
             )
@@ -552,12 +552,18 @@ mod tests {
     }
 
     fn core_plan(config: &Config, cores: usize) -> AffinityPlan {
-        use racer_platform::group::affinity::EffectiveTopology;
+        use uring_runtime::group::affinity::CpuLocation;
+        use uring_runtime::group::affinity::EffectiveTopology;
         AffinityPlan::from_topology(
             config,
             EffectiveTopology {
                 cpus: (0..cores)
-                    .map(|cpu| crate::worker::cpu_location(cpu, Some(0), Some(cpu), None))
+                    .map(|cpu| CpuLocation {
+                        cpu,
+                        package: 0,
+                        core: cpu,
+                        numa_node: None,
+                    })
                     .collect(),
                 quota: None,
                 nics: vec![],
@@ -607,12 +613,18 @@ mod tests {
     }
 
     fn four_pair_plan(config: &Config) -> AffinityPlan {
-        use racer_platform::group::affinity::EffectiveTopology;
+        use uring_runtime::group::affinity::CpuLocation;
+        use uring_runtime::group::affinity::EffectiveTopology;
         let plan = AffinityPlan::from_topology(
             config,
             EffectiveTopology {
                 cpus: (0..8)
-                    .map(|cpu| crate::worker::cpu_location(cpu, Some(0), Some(cpu), None))
+                    .map(|cpu| CpuLocation {
+                        cpu,
+                        package: 0,
+                        core: cpu,
+                        numa_node: None,
+                    })
                     .collect(),
                 quota: None,
                 nics: vec![],
@@ -626,7 +638,8 @@ mod tests {
 
     #[test]
     fn smt_startup_final_count_partitions_live_budgets_and_obeys_memory_floors() {
-        use racer_platform::group::affinity::EffectiveTopology;
+        use uring_runtime::group::affinity::CpuLocation;
+        use uring_runtime::group::affinity::EffectiveTopology;
         for (allow_smt, expected) in [(false, 3), (true, 5)] {
             let mut config = Config::from_lookup(|name| {
                 Ok(match name {
@@ -648,8 +661,11 @@ mod tests {
                     config,
                     EffectiveTopology {
                         cpus: (0..8)
-                            .map(|cpu| {
-                                crate::worker::cpu_location(cpu, Some(0), Some(cpu % 4), Some(0))
+                            .map(|cpu| CpuLocation {
+                                cpu,
+                                package: 0,
+                                core: cpu % 4,
+                                numa_node: Some(0),
                             })
                             .collect(),
                         quota: None,
@@ -708,7 +724,8 @@ mod tests {
 
     #[test]
     fn resource_shortage_reduces_and_regroups_uneven_numa_workers() {
-        use racer_platform::group::affinity::EffectiveTopology;
+        use uring_runtime::group::affinity::CpuLocation;
+        use uring_runtime::group::affinity::EffectiveTopology;
         let mut config = default_config(false);
         config.scale_limits(11).unwrap();
         let floor = 3 * crate::model::PAGE_BYTES as usize;
@@ -721,13 +738,11 @@ mod tests {
                 &config,
                 EffectiveTopology {
                     cpus: (0..16)
-                        .map(|cpu| {
-                            crate::worker::cpu_location(
-                                cpu,
-                                Some(0),
-                                Some(cpu),
-                                Some(usize::from(cpu >= 7)),
-                            )
+                        .map(|cpu| CpuLocation {
+                            cpu,
+                            core: cpu,
+                            package: 0,
+                            numa_node: Some(usize::from(cpu >= 7)),
                         })
                         .collect(),
                     quota: None,
@@ -1090,7 +1105,7 @@ mod tests {
         for _ in 0..20 {
             worker.poll_native(&mut cx).unwrap();
             service
-                .poll(&mut Context::from_waker(futures::task::noop_waker_ref()), 8)
+                .poll_budgeted(&mut Context::from_waker(futures::task::noop_waker_ref()), 8)
                 .unwrap();
         }
         assert!(worker.links.as_ref().unwrap().rail_ready(RailId(7)));
@@ -1099,17 +1114,17 @@ mod tests {
         worker.links.as_ref().unwrap().close();
         worker.actual_rails.clear();
         service
-            .poll(
+            .poll_budgeted(
                 &mut Context::from_waker(futures::task::noop_waker_ref()),
                 256,
             )
             .unwrap();
         assert_eq!(worker.runtime.admission.used(ResourceClass::Registered), 0);
-        worker.native_retry = racer_platform::environment::now();
+        worker.native_retry = uring_runtime::environment::now();
         for _ in 0..20 {
             worker.poll_native(&mut cx).unwrap();
             service
-                .poll(&mut Context::from_waker(futures::task::noop_waker_ref()), 8)
+                .poll_budgeted(&mut Context::from_waker(futures::task::noop_waker_ref()), 8)
                 .unwrap();
         }
         assert!(worker.links.as_ref().unwrap().rail_ready(RailId(7)));
@@ -1140,7 +1155,7 @@ mod tests {
         assert!(worker.actual_rails.is_empty());
         assert!(!worker.links.as_ref().unwrap().rail_ready(RailId(7)));
         service
-            .poll(
+            .poll_budgeted(
                 &mut Context::from_waker(futures::task::noop_waker_ref()),
                 256,
             )
@@ -1225,7 +1240,7 @@ mod tests {
                 .spawn(|| {
                     let mut service = app.build_crypto(WorkerId(0), engine).unwrap();
                     service
-                        .poll(&mut Context::from_waker(futures::task::noop_waker_ref()), 1)
+                        .poll_budgeted(&mut Context::from_waker(futures::task::noop_waker_ref()), 1)
                         .unwrap();
                 })
                 .join()

@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
-"""Exact pure racer-platform Miri allowlist; no io_uring, affinity, or filesystem syscalls.
-
-Library memory tests (reactor, filesystem) run in the crates-miri CI job.
-"""
+"""Exact pure-runtime Miri allowlist; no io_uring, affinity, or filesystem syscalls."""
 
 import argparse
 import os
@@ -55,6 +52,11 @@ GROUPS = {
         "drivers::tests::owned_operation_progresses_after_request_receiver_disappears",
         "drivers::tests::recursive_poll_defers_children_and_crash_preserves_unused_permits",
     ],
+    "memory": [
+        "reactor::filesystem::memory_tests::delayed_pathname_consumer_survives_owner_moves",
+        "reactor::filesystem::memory_tests::delayed_syscall_read_and_write_survive_owner_moves",
+        "reactor::tests::sockaddr_encoding_is_owned_and_validated",
+    ],
 }
 
 
@@ -74,7 +76,7 @@ def main():
         "cargo", "+" + TOOLCHAIN, "miri", "test", "--locked",
         "--manifest-path", str(root / "cmd/racer-dataplane/Cargo.toml"),
         "--target-dir", os.environ.get("RUNTIME_MIRI_TARGET_DIR", str(root / "tmp/runtime-miri-target")),
-        "-p", "racer-platform", "--no-default-features", "--lib", "-j", "2",
+        "-p", "uring-runtime", "--no-default-features", "--lib", "-j", "2",
         "--", "--exact", "--test-threads=1", *tests,
     ]
     # Keep Miri's default isolation, aliasing, alignment, and leak checks enabled.

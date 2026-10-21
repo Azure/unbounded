@@ -139,7 +139,7 @@ impl std::fmt::Debug for CiphertextBuffer {
 }
 // SAFETY: the detached allocation is exclusively owned, stable, and live
 // until Drop, and is only exposed through these borrows.
-unsafe impl racer_platform::reactor::IoBuffer for CiphertextBuffer {
+unsafe impl uring_runtime::reactor::IoBuffer for CiphertextBuffer {
     type Error = Error;
     fn bytes(&self) -> Result<&[u8]> {
         Ok(self.as_slice())
@@ -196,7 +196,7 @@ impl PlaintextBuffer {
     }
 }
 // SAFETY: private fixed backing and reservation remain exclusively owned.
-unsafe impl racer_platform::reactor::IoBuffer for PlaintextBuffer {
+unsafe impl uring_runtime::reactor::IoBuffer for PlaintextBuffer {
     type Error = Error;
     fn bytes(&self) -> Result<&[u8]> {
         Ok(self.0.bytes())
@@ -904,7 +904,7 @@ impl CiphertextPage {
     }
 }
 // SAFETY: shared ciphertext backing is immutable and retained by the owner.
-unsafe impl racer_platform::reactor::SendBuffer for CiphertextPage {
+unsafe impl uring_runtime::reactor::SendBuffer for CiphertextPage {
     type Error = Error;
     fn send_bytes(&self) -> Result<&[u8]> {
         Ok(self.bytes())
@@ -1470,7 +1470,7 @@ pub(crate) mod tests {
     use crate::model::Nonce;
     use crate::model::PageNumber;
     use crate::model::VersionMetadata;
-    use racer_platform::reactor::IoBuffer;
+    use uring_runtime::reactor::IoBuffer;
     mod cache {
         use super::*;
         use crate::model::ExpiresAt;
@@ -2997,22 +2997,28 @@ pub(crate) mod tests {
             let scope =
                 RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(5))
                     .unwrap();
-            // Registrations are unbounded now; observe them by count instead of
-            // exhausting a registration limit.
+            let mut registrations = Vec::new();
+            loop {
+                match scope.cancellation.subscribe() {
+                    Ok(registration) => registrations.push(registration),
+                    Err(Error::Overloaded) => break,
+                    Err(error) => panic!("unexpected registration failure: {error:?}"),
+                }
+                assert!(registrations.len() <= 1024);
+            }
             let mut cx = Context::from_waker(Waker::noop());
             let Poll::Ready(Ok(held)) = acquire_wait(&pool, &scope).as_mut().poll(&mut cx) else {
-                panic!("immediate acquisition failed")
+                panic!("immediate acquisition unnecessarily subscribed")
             };
-            assert_eq!(
-                scope.cancellation.registrations(),
-                0,
-                "immediate acquisition unnecessarily subscribed"
-            );
+            assert!(matches!(
+                acquire_wait(&pool, &scope).as_mut().poll(&mut cx),
+                Poll::Ready(Err(Error::Overloaded))
+            ));
             assert_eq!(admission.used(ResourceClass::RequestContext), 0);
             assert_eq!(admission.used(ResourceClass::Pipe), 1);
+            drop(registrations);
             let mut wait = acquire_wait(&pool, &scope);
             assert!(wait.as_mut().poll(&mut cx).is_pending());
-            assert!(scope.cancellation.registrations() > 0);
             drop(held);
             assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
             assert_eq!(admission.used(ResourceClass::RequestContext), 0);

@@ -43,10 +43,10 @@ use racer_control_wire::CacheId;
 use racer_control_wire::MembershipVersion;
 use racer_control_wire::NodeId;
 use racer_control_wire::RailId;
-use racer_platform::reactor::IoBuffer;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
+use uring_runtime::reactor::IoBuffer;
 
 const HEADER: &str = "racer-payload-control";
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,7 +90,7 @@ impl Binding {
         rail: RailId,
     ) -> Result<Self> {
         let mut transfer = [0; 16];
-        racer_platform::environment::fill_random(&mut transfer).map_err(|_| Error::Unavailable)?;
+        uring_runtime::environment::fill_random(&mut transfer).map_err(|_| Error::Unavailable)?;
         Ok(Self {
             request: envelope_digest(auth)?,
             response: [0; 32],
@@ -199,7 +199,7 @@ fn native_scope(scope: &RequestScope) -> RequestScope {
     bounded.deadline.0 = bounded
         .deadline
         .0
-        .min(racer_platform::environment::now() + Duration::from_secs(5));
+        .min(uring_runtime::environment::now() + Duration::from_secs(5));
     bounded
 }
 fn native_failure(error: Error, scope: &RequestScope) -> bool {
@@ -729,10 +729,10 @@ pub(crate) async fn connect_link(
     rail: RailId,
 ) -> Result<()> {
     let mut request = [0; 16];
-    racer_platform::environment::fill_random(&mut request).map_err(|_| Error::Unavailable)?;
+    uring_runtime::environment::fill_random(&mut request).map_err(|_| Error::Unavailable)?;
     let scope = RequestScope::new(
         crate::model::RequestId(request),
-        racer_platform::environment::now() + crate::rdma::SETUP_DEADLINE,
+        uring_runtime::environment::now() + crate::rdma::SETUP_DEADLINE,
     )?;
     let connection = http
         .checkout_with_state(&endpoint, Default::default(), &scope)
@@ -1312,7 +1312,7 @@ impl Transfers {
                             reads,
                             first: first.map(timestamp).unwrap_or_default(),
                             last: last.map(timestamp).unwrap_or_default(),
-                            now: timestamp(racer_platform::environment::now()),
+                            now: timestamp(uring_runtime::environment::now()),
                             original: scope
                                 .body_deadlines
                                 .map(|d| timestamp(d.0))
@@ -1345,7 +1345,7 @@ impl Transfers {
                     return Err(Error::Io);
                 }
                 offset += completion.bytes;
-                let now = racer_platform::environment::now();
+                let now = uring_runtime::environment::now();
                 first.get_or_insert(now);
                 last = Some(now);
                 reads = reads.saturating_add(1);
@@ -1424,7 +1424,7 @@ pub(crate) async fn relay_body(
                 tick.deadline.0 = tick
                     .deadline
                     .0
-                    .min(racer_platform::environment::now() + Duration::from_millis(10));
+                    .min(uring_runtime::environment::now() + Duration::from_millis(10));
                 tick
             },
             |error| error == Error::DeadlineExceeded,
@@ -1443,7 +1443,7 @@ mod tests {
     fn adaptive_socket_attribution_ignores_local_pressure_and_expired_scope() {
         let scope = RequestScope::new(
             crate::model::RequestId([91; 16]),
-            racer_platform::environment::now() + std::time::Duration::from_secs(10),
+            uring_runtime::environment::now() + std::time::Duration::from_secs(10),
         )
         .unwrap();
         let owner =

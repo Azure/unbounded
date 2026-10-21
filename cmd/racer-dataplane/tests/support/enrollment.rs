@@ -109,7 +109,7 @@ pub fn issue(
         ca,
         key,
         node,
-        racer_platform::environment::wall_now() - std::time::Duration::from_secs(1),
+        uring_runtime::environment::wall_now() - std::time::Duration::from_secs(1),
     )
 }
 

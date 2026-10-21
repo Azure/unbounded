@@ -8,11 +8,11 @@ description = "Bounded byte codecs, canonical lowercase hexadecimal, and optiona
 
 [features]
 default = []
-rest = ["dep:racer-platform", "dep:httparse", "dep:libc", "dep:rustls", "dep:rustls-pemfile", "dep:sha2", "dep:zeroize"]
-simulation = ["rest", "racer-platform/simulation"]
+rest = ["dep:uring-runtime", "dep:httparse", "dep:libc", "dep:rustls", "dep:rustls-pemfile", "dep:sha2", "dep:zeroize"]
+simulation = ["rest", "uring-runtime/simulation"]
 
 [dependencies]
-racer-platform = { path = "../platform", optional = true }
+uring-runtime = { path = "../runtime", optional = true }
 httparse = { version = "1", optional = true }
 libc = { version = "0.2", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }

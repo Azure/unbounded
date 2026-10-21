@@ -47,9 +47,9 @@ pub struct Flights {
 
     pub(super) table: RefCell<Table>,
 
-    waiting: racer_platform::offload::AdmissionQueue<PageId>,
+    waiting: uring_runtime::offload::AdmissionQueue<PageId>,
 
-    admission_deadlines: Rc<racer_platform::environment::Registry>,
+    admission_deadlines: Rc<uring_runtime::environment::Registry>,
 
     capacity_wake: CapacityWake,
 }
@@ -59,7 +59,7 @@ type CapacityWake = Rc<RefCell<Option<(u64, Waker)>>>;
 
 /// Retire only this ticket's wake before its queue guard can wake a successor.
 struct AdmissionTicket<'a> {
-    ticket: Option<racer_platform::offload::CapacityWaiter<'a, PageId>>,
+    ticket: Option<uring_runtime::offload::CapacityWaiter<'a, PageId>>,
 
     wake: CapacityWake,
 
@@ -216,7 +216,7 @@ impl DriverDiagnostic {
     pub(super) fn set(&self, stage: DriverStage) {
         let mut state = self.0.get();
         state.stage = stage;
-        state.since = racer_platform::environment::now();
+        state.since = uring_runtime::environment::now();
         self.0.set(state);
     }
 
@@ -234,7 +234,7 @@ impl DriverDiagnostic {
         let mut state = self.0.get();
         state
             .cancel_seen
-            .get_or_insert_with(racer_platform::environment::now);
+            .get_or_insert_with(uring_runtime::environment::now);
         self.0.set(state);
     }
 
@@ -265,7 +265,7 @@ impl coalesce::flight::state::WaiterPolicy for WaiterRecord {
     type Error = Error;
     fn check(&self) -> Option<Error> {
         self.scope.check().err().or_else(|| {
-            (racer_platform::environment::now() >= self.budget_deadline)
+            (uring_runtime::environment::now() >= self.budget_deadline)
                 .then_some(Error::DeadlineExceeded)
         })
     }
@@ -543,7 +543,7 @@ pub struct AcquisitionWaiter<'a> {
 
 pub(super) struct Registration {
     flights: Rc<Flights>,
-    cancellation: racer_platform::scope::CancellationRegistration,
+    cancellation: uring_runtime::environment::CancellationRegistration,
     // Waiters survive acquisition generations. Match owner/page/incarnation/id
     // for registration, then refresh this generation only on a new election.
     fence: Fence,
@@ -588,7 +588,7 @@ pub enum AcquisitionEvent {
 pub struct AcquisitionContext<'a> {
     pub origin: &'a OriginContext,
     pub scope: &'a RequestScope,
-    pub(crate) cancellation: &'a racer_platform::scope::CancellationRegistration,
+    pub(crate) cancellation: &'a uring_runtime::environment::CancellationRegistration,
     pub membership: &'a std::sync::Arc<crate::topology::Membership>,
     pub budget: &'a mut AcquisitionBudget,
 }
@@ -675,7 +675,7 @@ impl AcquisitionWaiter<'_> {
                     return Poll::Ready(Ok(AcquisitionEvent::Failed(error)));
                 }
                 if matches!(entry.state.phase, Phase::RetryPending) && !waiter.issued {
-                    if racer_platform::environment::now() >= self.budget.deadline
+                    if uring_runtime::environment::now() >= self.budget.deadline
                         || (self.budget.attempts == 0 && entry.state.partial.is_none())
                     {
                         let error = if self.budget.attempts == 0 {
@@ -794,7 +794,7 @@ impl Flights {
     pub(super) fn driver_diagnostic(&self, leader: &FlightLeader) -> Option<DriverDiagnostic> {
         let diagnostic = DriverDiagnostic(Rc::new(std::cell::Cell::new(DriverObservation {
             stage: DriverStage::Starting,
-            since: racer_platform::environment::now(),
+            since: uring_runtime::environment::now(),
             cancel_seen: None,
             abandoned: false,
         })));
@@ -821,7 +821,7 @@ impl Flights {
             owner: Rc::new(()),
             limits,
             table: RefCell::new(Table::default()),
-            waiting: racer_platform::offload::AdmissionQueue::new(
+            waiting: uring_runtime::offload::AdmissionQueue::new(
                 admission.policy().limits().queue_entries,
             ),
             admission_deadlines: Rc::default(),
@@ -847,7 +847,7 @@ impl Flights {
             owner: Rc::new(()),
             limits,
             table: RefCell::new(Table::default()),
-            waiting: racer_platform::offload::AdmissionQueue::new(
+            waiting: uring_runtime::offload::AdmissionQueue::new(
                 admission.policy().limits().queue_entries,
             ),
             admission_deadlines: Rc::default(),
@@ -920,7 +920,7 @@ impl Flights {
             return Err(Error::Cancelled);
         }
         if !self.table.borrow().contains_key(&page) {
-            if racer_platform::environment::now() >= budget.deadline {
+            if uring_runtime::environment::now() >= budget.deadline {
                 return Err(Error::DeadlineExceeded);
             }
             if budget.attempts == 0 {
@@ -989,7 +989,7 @@ impl Flights {
                     return Err(Error::Overloaded);
                 }
             }
-            if racer_platform::environment::now() >= budget.deadline {
+            if uring_runtime::environment::now() >= budget.deadline {
                 return Err(Error::DeadlineExceeded);
             }
             if budget.attempts == 0 && table.get(&page).is_none_or(|e| e.partial.is_none()) {
@@ -1039,7 +1039,7 @@ impl Flights {
                 if let Err(owned) = table.insert(
                     page.clone(),
                     Entry {
-                        created: racer_platform::environment::now(),
+                        created: uring_runtime::environment::now(),
                         diagnostic: None,
                         fence: Fence {
                             page: page.clone(),
@@ -1121,7 +1121,7 @@ impl Flights {
             return Err(Error::Cancelled);
         }
         self.admit_join(&page, None)?;
-        if racer_platform::environment::now() >= budget.deadline {
+        if uring_runtime::environment::now() >= budget.deadline {
             return Err(Error::DeadlineExceeded);
         }
         if budget.attempts == 0 {
@@ -1136,7 +1136,7 @@ impl Flights {
         {
             return self.join(page, membership, context, scope, budget);
         }
-        let cutoff = racer_platform::environment::now() + std::time::Duration::from_millis(100);
+        let cutoff = uring_runtime::environment::now() + std::time::Duration::from_millis(100);
         let deadline = cutoff.min(scope.deadline.0).min(budget.deadline);
         let (reservation, detail) = crate::admission::capture_rejection(&self.admission, || {
             self.admission
@@ -1174,7 +1174,7 @@ impl Flights {
                 };
                 return Poll::Ready(Err(error));
             }
-            let now = racer_platform::environment::now();
+            let now = uring_runtime::environment::now();
             if now >= budget.deadline {
                 reason = crate::telemetry::WaitGate::BudgetDeadline;
                 return Poll::Ready(Err(Error::DeadlineExceeded));
@@ -1199,7 +1199,7 @@ impl Flights {
                 let entered = match self.waiting.enter(page.clone(), cx) {
                     Ok(ticket) => ticket,
                     Err(error) => {
-                        reason = if error == racer_platform::Error::Overloaded {
+                        reason = if error == uring_runtime::Error::Overloaded {
                             crate::telemetry::WaitGate::QueueFull
                         } else {
                             crate::telemetry::WaitGate::QueueAdmissionRejected
@@ -1593,9 +1593,9 @@ impl Flights {
     /// Reactor-facing variant registers its real waker with owned drivers. The
     /// worker must also poll at request deadlines to expire parked waiters.
     pub fn poll_with_context(&self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
-        racer_platform::drivers::poll(cx, work_budget);
+        uring_runtime::drivers::poll(cx, work_budget);
         self.admission_deadlines
-            .poll(racer_platform::environment::now(), work_budget);
+            .poll(uring_runtime::environment::now(), work_budget);
         self.sweep_budgeted(work_budget)
     }
 
@@ -1644,7 +1644,7 @@ impl Flights {
                 let mut table = self.table.borrow_mut();
                 if table.is_empty()
                     && self.waiting.is_empty()
-                    && racer_platform::drivers::pending() == 0
+                    && uring_runtime::drivers::pending() == 0
                 {
                     return Poll::Ready(Ok(()));
                 }
@@ -1774,7 +1774,7 @@ fn refresh(entry: &mut Entry, wakes: &mut Vec<Waker>) {
         entry.operations.is_empty(),
         Error::Unavailable,
         Error::Cancelled,
-        racer_platform::environment::now,
+        uring_runtime::environment::now,
         split_result,
         wakes,
     );
@@ -1869,12 +1869,12 @@ mod admission_wake_tests {
     /// Serial completion, error, abandonment, and old cells cannot invent an outcome.
     #[test]
     fn expiry_snapshot_call_guards_and_generation_cells() {
-        let clock = racer_platform::environment::SimulationClock::new(920);
+        let clock = uring_runtime::environment::SimulationClock::new(920);
         let _environment = clock.environment(0).enter();
         let make = || {
             DriverDiagnostic(Rc::new(std::cell::Cell::new(DriverObservation {
                 stage: DriverStage::Starting,
-                since: racer_platform::environment::now(),
+                since: uring_runtime::environment::now(),
                 cancel_seen: None,
                 abandoned: false,
             })))

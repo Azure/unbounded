@@ -12,12 +12,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use racer_platform::environment::{Environment, SimulationClock};
 use rdma_verbs::{
     Arrival, BACKOFF_MIN, BufferState, COMMAND_QUEUE, Client, Epoch, Error, Granted, LinkKey,
     LinkState, NodeConfig, Op, Opened, Owner, SETUP_TIMEOUT, Setup, Source,
     simulation::{Device, Fault, Operation, Simulation},
 };
+use uring_runtime::environment::{Environment, SimulationClock};
 
 const LEN: usize = 4096;
 const BUFFERS: usize = 4;
@@ -51,7 +51,7 @@ struct World {
 
     clock: SimulationClock,
 
-    _environment: racer_platform::environment::Guard,
+    _environment: uring_runtime::environment::Guard,
 
     a: Node,
 
@@ -128,7 +128,7 @@ fn world() -> World {
 }
 
 fn now() -> Instant {
-    racer_platform::environment::now()
+    uring_runtime::environment::now()
 }
 
 fn ready<T>(op: &Op<T>) -> rdma_verbs::Result<T> {
@@ -591,7 +591,7 @@ fn worker_drop() {
 #[test]
 /// The owner can be hosted by `WithNative` and drained by its fence.
 fn owner_hosted_by_with_native() {
-    use racer_platform::group::Service;
+    use uring_runtime::group::Service;
 
     let mut w = world();
     let owner = w.a.owner.take().unwrap();
@@ -599,7 +599,7 @@ fn owner_hosted_by_with_native() {
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     service.register_driver(cx.waker());
     let opened = w.a.clients[0].open(TO_B);
-    service.poll(&mut cx, 8).unwrap();
+    service.poll_budgeted(&mut cx, 8).unwrap();
     assert!(ready(&opened).is_ok());
     futures::executor::block_on(service.fence(&inner::Scope)).unwrap();
     assert!(w.a.clients[0].drained());
@@ -615,7 +615,7 @@ fn owner_hosted_by_with_native() {
 /// returns while its own drain or fence runs; draining the native side first
 /// would wait forever.
 fn with_native_drives_inner_work_holding_buffers() {
-    use racer_platform::group::Service;
+    use uring_runtime::group::Service;
 
     for fence in [false, true] {
         let mut w = world();
@@ -631,7 +631,7 @@ fn with_native_drives_inner_work_holding_buffers() {
         let holder = inner::Holder(Some(staged));
         let mut service = rdma_verbs::WithNative::with_host(holder, owner);
         service.register_driver(cx.waker());
-        service.poll(&mut cx, 8).unwrap();
+        service.poll_budgeted(&mut cx, 8).unwrap();
         let scope = inner::Scope;
         let mut teardown = if fence {
             service.fence(&scope)
@@ -661,19 +661,13 @@ fn with_native_drives_inner_work_holding_buffers() {
 mod inner {
     use std::task::{Context, Waker};
 
-    use racer_platform::{Operation, group::Service};
+    use uring_runtime::{Operation, group::Service};
 
     #[derive(Clone, Copy, Debug)]
     pub struct Failure;
 
-    impl From<racer_platform::Error> for Failure {
-        fn from(_: racer_platform::Error) -> Self {
-            Self
-        }
-    }
-
-    impl From<racer_platform::uring::Error> for Failure {
-        fn from(_: racer_platform::uring::Error) -> Self {
+    impl From<uring_runtime::Error> for Failure {
+        fn from(_: uring_runtime::Error) -> Self {
             Self
         }
     }
@@ -687,14 +681,14 @@ mod inner {
     #[derive(Clone)]
     pub struct Scope;
 
-    impl racer_platform::scope::LibraryScope for Scope {
+    impl uring_runtime::Scope for Scope {
         type Error = Failure;
 
         fn check(&self) -> Result<(), Failure> {
             Ok(())
         }
 
-        fn cancellation(&self) -> Option<&racer_platform::Cancellation> {
+        fn cancellation(&self) -> Option<&uring_runtime::environment::Cancellation> {
             None
         }
     }
@@ -715,7 +709,7 @@ mod inner {
             Box::pin(async { Ok(()) })
         }
 
-        fn poll(&mut self, _: &mut Context<'_>, _: usize) -> Result<(), Failure> {
+        fn poll_budgeted(&mut self, _: &mut Context<'_>, _: usize) -> Result<(), Failure> {
             Ok(())
         }
 
@@ -761,7 +755,7 @@ mod inner {
             Box::pin(async { Ok(()) })
         }
 
-        fn poll(&mut self, _: &mut Context<'_>, _: usize) -> Result<(), Failure> {
+        fn poll_budgeted(&mut self, _: &mut Context<'_>, _: usize) -> Result<(), Failure> {
             Ok(())
         }
 

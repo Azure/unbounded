@@ -17,9 +17,6 @@ use ::telemetry::server::Handler;
 use ::telemetry::server::Response;
 use ::telemetry::server::Server;
 use racer_control_wire::NodeId;
-use racer_platform::environment;
-use racer_platform::environment::Deadline;
-use racer_platform::reactor::descriptor::Descriptor;
 use std::cell::OnceCell;
 use std::fmt::Write;
 use std::net::SocketAddr;
@@ -33,6 +30,9 @@ use std::sync::OnceLock;
 use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
+use uring_runtime::environment;
+use uring_runtime::environment::Deadline;
+use uring_runtime::reactor::descriptor::Descriptor;
 
 pub use server::CONNECTION_TIMEOUT;
 pub use server::CONTROL_SLOTS;
@@ -187,9 +187,9 @@ impl DiagnosticIo {
         let mut memory = admission.reserve(
             None,
             ResourceClass::RequestContext,
-            RESERVED_BYTES + (slots - CONTROL_SLOTS) * racer_platform::reactor::SUBMISSION_BYTES,
+            RESERVED_BYTES + (slots - CONTROL_SLOTS) * uring_runtime::reactor::SUBMISSION_BYTES,
         )?;
-        let bookkeeping = memory.split(slots * racer_platform::reactor::SUBMISSION_BYTES)?;
+        let bookkeeping = memory.split(slots * uring_runtime::reactor::SUBMISSION_BYTES)?;
         let submissions = reactor.reserve_submissions(control, bookkeeping)?;
         let mut server = Server::new(submissions.clone(), memory);
         if binary {
@@ -872,7 +872,7 @@ impl Resources {
 }
 impl Health {
     pub fn state(&self) -> Result<State> {
-        self.state_at(racer_platform::environment::now())
+        self.state_at(uring_runtime::environment::now())
     }
     pub fn state_at(&self, now: Instant) -> Result<State> {
         self.0
@@ -892,7 +892,7 @@ impl Health {
     pub fn transition(&self, state: State) -> Result<()> {
         self.0
             .transition(state, |resources| {
-                resources.usable_at(racer_platform::environment::now())
+                resources.usable_at(uring_runtime::environment::now())
             })
             .map_err(|_| Error::Unavailable)
     }
@@ -1411,7 +1411,7 @@ pub(crate) enum GateFacts {
 
         error: Error,
     },
-    Reactor(racer_platform::reactor::SubmissionRejection),
+    Reactor(uring_runtime::reactor::SubmissionRejection),
     Join {
         gate: JoinGate,
         copy: bool,
@@ -1499,7 +1499,7 @@ pub struct BodyProgress {
 }
 
 pub(crate) fn timestamp(at: std::time::Instant) -> u64 {
-    crate::peer::protocol::encode_deadline(racer_platform::environment::Deadline(at))
+    crate::peer::protocol::encode_deadline(uring_runtime::environment::Deadline(at))
         .unwrap_or_default()
 }
 
@@ -1515,7 +1515,7 @@ pub struct Failure {
 impl Failure {
     pub fn new(stage: Stage, error: Error) -> Self {
         Self {
-            unix_millis: racer_platform::environment::wall_now()
+            unix_millis: uring_runtime::environment::wall_now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis()
@@ -1582,7 +1582,7 @@ pub(crate) struct FlightExpiry {
 
     pub overshoot_us: u64,
 
-    pub queue: racer_platform::offload::AdmissionSnapshot,
+    pub queue: uring_runtime::offload::AdmissionSnapshot,
 
     pub caller_head: Option<bool>,
 
@@ -2228,13 +2228,13 @@ mod gate_event_tests {
         let observer = failures.observer(WorkerId(u16::MAX));
         let scope = RequestScope::new(
             RequestId([255; 16]),
-            racer_platform::environment::now() + std::time::Duration::from_secs(5),
+            uring_runtime::environment::now() + std::time::Duration::from_secs(5),
         )
         .unwrap();
         let facts = FlightExpiry {
             observed_unix_ms: u64::MAX,
             overshoot_us: u64::MAX,
-            queue: racer_platform::offload::AdmissionSnapshot {
+            queue: uring_runtime::offload::AdmissionSnapshot {
                 queued: usize::MAX,
                 capacity: usize::MAX,
                 head: Some(u64::MAX),
@@ -2285,7 +2285,7 @@ mod gate_event_tests {
         let observer = failures.observer(WorkerId(u16::MAX));
         let scope = RequestScope::new(
             RequestId([255; 16]),
-            racer_platform::environment::now() + std::time::Duration::from_secs(5),
+            uring_runtime::environment::now() + std::time::Duration::from_secs(5),
         )
         .unwrap();
         for _ in 0..65 {
@@ -2325,9 +2325,9 @@ mod gate_event_tests {
             observer.gate_rejection(
                 &scope,
                 Some(u64::MAX),
-                GateFacts::Reactor(racer_platform::reactor::SubmissionRejection {
-                    reason: racer_platform::reactor::RejectionReason::SubmissionQueueFull,
-                    kind: racer_platform::reactor::SubmissionKind::Readiness,
+                GateFacts::Reactor(uring_runtime::reactor::SubmissionRejection {
+                    reason: uring_runtime::reactor::RejectionReason::SubmissionQueueFull,
+                    kind: uring_runtime::reactor::SubmissionKind::Readiness,
                     reserved: true,
                     used: Some(usize::MAX),
                     limit: Some(usize::MAX),
@@ -2481,7 +2481,7 @@ mod protected_failure_tests {
         let observer = failures.observer(WorkerId(u16::MAX));
         let scope = RequestScope::new(
             RequestId([255; 16]),
-            racer_platform::environment::now() + std::time::Duration::from_secs(10),
+            uring_runtime::environment::now() + std::time::Duration::from_secs(10),
         )
         .unwrap();
         observer.record(
@@ -4386,7 +4386,7 @@ pub(crate) mod tests {
                     admission.used(ResourceClass::RequestContext) - baseline,
                     RESERVED_BYTES
                         + if enabled {
-                            server::BINARY_CONTROL_SLOTS * racer_platform::reactor::SUBMISSION_BYTES
+                            server::BINARY_CONTROL_SLOTS * uring_runtime::reactor::SUBMISSION_BYTES
                         } else {
                             0
                         }
@@ -4532,7 +4532,7 @@ pub(crate) mod tests {
         }
         #[test]
         fn observation_and_credential_expiry_are_inclusive() {
-            let now = racer_platform::environment::now();
+            let now = uring_runtime::environment::now();
             for (observed, boundary) in [(5, 5), (20, 10)] {
                 let health = Health::default();
                 health

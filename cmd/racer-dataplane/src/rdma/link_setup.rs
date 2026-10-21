@@ -42,7 +42,7 @@ impl Setup {
         grants_per_link: u32,
     ) -> Result<Self> {
         let mut nonce = [0; 16];
-        racer_platform::environment::fill_random(&mut nonce).map_err(|_| Error::Io)?;
+        uring_runtime::environment::fill_random(&mut nonce).map_err(|_| Error::Io)?;
         let setup = Self {
             rail,
             nonce,

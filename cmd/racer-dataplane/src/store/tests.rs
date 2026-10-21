@@ -331,14 +331,14 @@ mod index_pressure {
 
 #[test]
 fn hard_hold_persist_confirms_publication_and_protects_pending() {
-    let simulation = racer_platform::simulation::Simulation::new();
+    let simulation = uring_runtime::reactor::simulation::Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
     let _ = futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let copy = f.copy(1, 113);
     let id = copy.ciphertext.envelope().page.clone();
-    let until = racer_platform::environment::wall_now() + Duration::from_secs(60);
+    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
     let index = f.store.writer.index();
     index.reserve_hold(&id.version, 1, until).unwrap();
     f.enqueue(copy.clone()).unwrap();
@@ -362,7 +362,7 @@ fn hard_hold_persist_confirms_publication_and_protects_pending() {
 
 #[test]
 fn hard_hold_write_failure_is_not_success_and_unused_capacity_releases() {
-    use racer_platform::simulation::{Fault, Simulation};
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
     let simulation = Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
@@ -382,7 +382,7 @@ fn hard_hold_write_failure_is_not_success_and_unused_capacity_releases() {
         .reserve_hold(
             &id.version,
             1,
-            racer_platform::environment::wall_now() + Duration::from_secs(60),
+            uring_runtime::environment::wall_now() + Duration::from_secs(60),
         )
         .unwrap();
     simulation.inject("write", Fault::Errno(libc::EIO)).unwrap();
@@ -398,7 +398,7 @@ fn hard_hold_write_failure_is_not_success_and_unused_capacity_releases() {
 #[test]
 fn hard_hold_checkpoint_roundtrip_restores_only_live_disk_reservations() {
     use crate::store::checkpoint;
-    let simulation = racer_platform::simulation::Simulation::new();
+    let simulation = uring_runtime::reactor::simulation::Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
     let _ = futures::executor::block_on(f.store.open()).unwrap();
@@ -406,7 +406,7 @@ fn hard_hold_checkpoint_roundtrip_restores_only_live_disk_reservations() {
     let copy = f.copy(1, 113);
     let id = copy.ciphertext.envelope().page.clone();
     let index = f.store.writer.index();
-    let until = racer_platform::environment::wall_now() + Duration::from_secs(60);
+    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
     index.reserve_hold(&id.version, 1, until).unwrap();
     drive(&f.reactor, f.store.writer.persist_held(copy, &scope())).unwrap();
     let shard = futures::executor::block_on(f.store.checkpoint.snapshot_shard()).unwrap();
@@ -450,7 +450,7 @@ fn hard_hold_checkpoint_frozen_arrival_sleeps_until_thaw_without_discard() {
             this.0.fetch_add(1, Ordering::Relaxed);
         }
     }
-    let simulation = racer_platform::simulation::Simulation::new();
+    let simulation = uring_runtime::reactor::simulation::Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
     let _ = futures::executor::block_on(f.store.open()).unwrap();
@@ -459,7 +459,7 @@ fn hard_hold_checkpoint_frozen_arrival_sleeps_until_thaw_without_discard() {
     assert!(cut.index.entries.is_empty());
     let copy = f.copy(1, 113);
     let id = copy.ciphertext.envelope().page.clone();
-    let until = racer_platform::environment::wall_now() + Duration::from_secs(60);
+    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
     f.store
         .writer
         .index()
@@ -491,7 +491,7 @@ fn hard_hold_checkpoint_frozen_arrival_sleeps_until_thaw_without_discard() {
 
 #[test]
 fn hard_hold_checkpoint_fences_warm_owned_publication_and_restores_veto() {
-    use racer_platform::simulation::{Fault, Simulation};
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
     let simulation = Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
@@ -500,7 +500,7 @@ fn hard_hold_checkpoint_fences_warm_owned_publication_and_restores_veto() {
     let copy = f.copy(1, 113);
     let id = copy.ciphertext.envelope().page.clone();
     let index = f.store.writer.index();
-    let until = racer_platform::environment::wall_now() + Duration::from_secs(60);
+    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
     index.reserve_hold(&id.version, 1, until).unwrap();
     simulation.inject("write", Fault::Delay(6)).unwrap();
     let request = scope();
@@ -546,7 +546,7 @@ fn hard_hold_checkpoint_fences_warm_owned_publication_and_restores_veto() {
 
 #[test]
 fn hard_hold_checkpoint_abandoned_pause_reopens_writer() {
-    let simulation = racer_platform::simulation::Simulation::new();
+    let simulation = uring_runtime::reactor::simulation::Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
     let _ = futures::executor::block_on(f.store.open()).unwrap();
@@ -568,7 +568,7 @@ fn hard_hold_checkpoint_abandoned_pause_reopens_writer() {
 
 #[test]
 fn hard_hold_checkpoint_captures_hold_added_during_index_traversal() {
-    let simulation = racer_platform::simulation::Simulation::new();
+    let simulation = uring_runtime::reactor::simulation::Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
     let _ = futures::executor::block_on(f.store.open()).unwrap();
@@ -603,7 +603,7 @@ fn hard_hold_checkpoint_captures_hold_added_during_index_traversal() {
             .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
             .is_pending()
     );
-    let until = racer_platform::environment::wall_now() + Duration::from_secs(60);
+    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
     index.reserve_hold(&id.version, 1, until).unwrap();
     let shard = futures::executor::block_on(snapshot).unwrap();
     assert_eq!(
@@ -621,7 +621,7 @@ fn hard_hold_checkpoint_captures_hold_added_during_index_traversal() {
 
 #[test]
 fn hard_hold_cancel_waits_for_stalled_background_writer_without_self_wakes() {
-    use racer_platform::simulation::{Fault, Simulation};
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
     struct Wakes(std::sync::atomic::AtomicUsize);
     impl futures::task::ArcWake for Wakes {
         fn wake_by_ref(this: &std::sync::Arc<Self>) {
@@ -636,7 +636,7 @@ fn hard_hold_cancel_waits_for_stalled_background_writer_without_self_wakes() {
     let copy = f.copy(1, 113);
     let id = copy.ciphertext.envelope().page.clone();
     let index = f.store.writer.index();
-    let until = racer_platform::environment::wall_now() + Duration::from_secs(60);
+    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
     index.reserve_hold(&id.version, 1, until).unwrap();
     f.enqueue(copy.clone()).unwrap();
     assert_eq!(index.release_hold(&id.version), Err(Error::Overloaded));
@@ -692,7 +692,7 @@ fn hard_hold_cancel_waits_for_stalled_background_writer_without_self_wakes() {
 
 #[test]
 fn hard_hold_cancel_removes_unsubmitted_ticket_after_background_fence() {
-    let simulation = racer_platform::simulation::Simulation::new();
+    let simulation = uring_runtime::reactor::simulation::Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
     let _ = futures::executor::block_on(f.store.open()).unwrap();
@@ -704,7 +704,7 @@ fn hard_hold_cancel_removes_unsubmitted_ticket_after_background_fence() {
         .reserve_hold(
             &id.version,
             1,
-            racer_platform::environment::wall_now() + Duration::from_secs(60),
+            uring_runtime::environment::wall_now() + Duration::from_secs(60),
         )
         .unwrap();
     f.store.writer.busy.set(true);
@@ -728,7 +728,7 @@ fn hard_hold_cancel_removes_unsubmitted_ticket_after_background_fence() {
 
 #[test]
 fn hard_hold_cancel_fences_kernel_write_after_background_future_is_dropped() {
-    use racer_platform::simulation::{Fault, Simulation};
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
     let simulation = Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
@@ -741,7 +741,7 @@ fn hard_hold_cancel_fences_kernel_write_after_background_future_is_dropped() {
         .reserve_hold(
             &id.version,
             1,
-            racer_platform::environment::wall_now() + Duration::from_secs(60),
+            uring_runtime::environment::wall_now() + Duration::from_secs(60),
         )
         .unwrap();
     f.enqueue(copy.clone()).unwrap();
@@ -820,7 +820,7 @@ fn disk_observability_publication_read_and_pending_cleanup() {
 }
 #[test]
 fn disk_observability_failed_write_and_read_do_not_credit_bytes() {
-    use racer_platform::simulation::{Fault, Simulation};
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
     let simulation = Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
@@ -1452,8 +1452,7 @@ fn concurrent_writes_reserve_distinct_extents_and_capacity_before_completion() {
 
 #[test]
 fn pipeline_out_of_order_failure_and_short_cqes_preserve_other_mapping() {
-    use racer_platform::simulation::Fault;
-    use racer_platform::simulation::Simulation;
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
     for fault in [Fault::Delay(6), Fault::Errno(libc::EIO), Fault::Short(512)] {
         let simulation = Simulation::new();
         let _environment = simulation.enter();
@@ -1485,7 +1484,7 @@ fn pipeline_out_of_order_failure_and_short_cqes_preserve_other_mapping() {
 }
 #[test]
 fn second_sight_delayed_sealed_write_keeps_publication_authority() {
-    use racer_platform::simulation::{Fault, Simulation};
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
     let simulation = Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
@@ -1532,7 +1531,7 @@ fn second_sight_delayed_sealed_write_keeps_publication_authority() {
 
 #[test]
 fn checkpoint_infeasible_budget_does_not_pause_an_inflight_writer() {
-    use racer_platform::simulation::{Fault, Simulation};
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
     let simulation = Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
@@ -1548,7 +1547,7 @@ fn checkpoint_infeasible_budget_does_not_pause_an_inflight_writer() {
         .reserve_hold(
             &metadata.version,
             1,
-            racer_platform::environment::wall_now() + Duration::from_secs(60),
+            uring_runtime::environment::wall_now() + Duration::from_secs(60),
         )
         .unwrap();
     let base = super::checkpoint::snapshot_base_bytes(f.segments.count()).unwrap();
@@ -1590,7 +1589,7 @@ fn checkpoint_infeasible_budget_does_not_pause_an_inflight_writer() {
 #[test]
 fn checkpoint_exact_budget_matches_full_snapshot_with_holds() {
     use super::checkpoint::{CHECKPOINT_VERSION, CheckpointImage, encode};
-    let simulation = racer_platform::simulation::Simulation::new();
+    let simulation = uring_runtime::reactor::simulation::Simulation::new();
     let _environment = simulation.enter();
     let f = Fixture::new();
     let _ = futures::executor::block_on(f.store.open()).unwrap();
@@ -1603,7 +1602,7 @@ fn checkpoint_exact_budget_matches_full_snapshot_with_holds() {
         .reserve_hold(
             &metadata.version,
             1,
-            racer_platform::environment::wall_now() + Duration::from_secs(60),
+            uring_runtime::environment::wall_now() + Duration::from_secs(60),
         )
         .unwrap();
     let budget = super::checkpoint::snapshot_base_bytes(f.segments.count()).unwrap()
@@ -1727,7 +1726,7 @@ fn checkpoint_preflights_segment_metadata_and_page_clones() {
 
 #[test]
 fn checkpoint_directory_startup_is_bounded_and_simulation_compatible() {
-    use racer_platform::simulation::Simulation;
+    use uring_runtime::reactor::simulation::Simulation;
     let sim = Simulation::new();
     let _os = sim.enter();
     let f = Fixture::new();
@@ -5010,8 +5009,7 @@ fn zero_copy_body_serves_a_shorter_record_body_and_rejects_misfits() {
 
 #[test]
 fn zero_copy_write_failure_releases_charges_and_does_not_publish() {
-    use racer_platform::simulation::Fault;
-    use racer_platform::simulation::Simulation;
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
     for fault in [Fault::Errno(libc::EIO), Fault::Short(512)] {
         let simulation = Simulation::new();
         let _environment = simulation.enter();

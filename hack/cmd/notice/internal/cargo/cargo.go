@@ -341,20 +341,13 @@ func (c *Collector) home() (string, error) {
 }
 
 func directDependencies(data string) (map[string]dependency, error) {
-	return directDependenciesInheriting(data, nil)
-}
-
-// directDependenciesInheriting is directDependencies for a package whose
-// `workspace = true` entries are resolved from its own workspace root's
-// [workspace.dependencies] table. A nil table rejects inheritance.
-func directDependenciesInheriting(data string, inherited map[string]any) (map[string]dependency, error) {
 	var manifest map[string]any
 	if err := toml.Unmarshal([]byte(data), &manifest); err != nil {
 		return nil, err
 	}
 
 	direct := map[string]dependency{}
-	if err := collectDependencyTables(manifest, direct, inherited); err != nil {
+	if err := collectDependencyTables(manifest, direct); err != nil {
 		return nil, err
 	}
 
@@ -365,7 +358,7 @@ func directDependenciesInheriting(data string, inherited map[string]any) (map[st
 				return nil, fmt.Errorf("invalid target dependency table")
 			}
 
-			if err := collectDependencyTables(tables, direct, inherited); err != nil {
+			if err := collectDependencyTables(tables, direct); err != nil {
 				return nil, err
 			}
 		}
@@ -374,7 +367,7 @@ func directDependenciesInheriting(data string, inherited map[string]any) (map[st
 	return direct, nil
 }
 
-func collectDependencyTables(tables map[string]any, direct map[string]dependency, inherited map[string]any) error {
+func collectDependencyTables(tables map[string]any, direct map[string]dependency) error {
 	for _, section := range []string{"dependencies", "build-dependencies", "dev-dependencies"} {
 		value, exists := tables[section]
 		if !exists {
@@ -386,12 +379,7 @@ func collectDependencyTables(tables map[string]any, direct map[string]dependency
 			return fmt.Errorf("invalid %s table", section)
 		}
 
-		for alias, declared := range deps {
-			value, err := inheritDependency(alias, declared, inherited)
-			if err != nil {
-				return err
-			}
-
+		for alias, value := range deps {
 			// Cargo can implicitly enroll path dependencies as workspace members,
 			// even through development edges. Retain those paths for validation,
 			// but never collect registry development dependencies for NOTICE.
@@ -452,61 +440,6 @@ func collectDependencyTables(tables map[string]any, direct map[string]dependency
 	}
 
 	return nil
-}
-
-// inheritDependency replaces a `workspace = true` declaration with its
-// workspace's spec, as Cargo does. Local keys other than `features`,
-// `optional` and `default-features` cannot be combined with inheritance, so
-// they are rejected. Paths in the inherited spec must already be rebased onto
-// the package directory by the caller.
-func inheritDependency(alias string, value any, inherited map[string]any) (any, error) {
-	spec, ok := value.(map[string]any)
-	if !ok {
-		return value, nil
-	}
-
-	flag, exists := spec["workspace"]
-	if !exists {
-		return value, nil
-	}
-
-	if enabled, ok := flag.(bool); !ok || !enabled || inherited == nil {
-		return nil, fmt.Errorf("dependency %s: workspace inheritance is not supported", alias)
-	}
-
-	base, exists := inherited[alias]
-	if !exists {
-		return nil, fmt.Errorf("dependency %s: not found in [workspace.dependencies]", alias)
-	}
-
-	merged := map[string]any{}
-
-	switch base := base.(type) {
-	case string:
-		merged["version"] = base
-	case map[string]any:
-		if _, nested := base["workspace"]; nested {
-			return nil, fmt.Errorf("dependency %s: invalid workspace dependency", alias)
-		}
-
-		for key, item := range base {
-			merged[key] = item
-		}
-	default:
-		return nil, fmt.Errorf("dependency %s: invalid workspace dependency", alias)
-	}
-
-	for key, item := range spec {
-		switch key {
-		case "workspace":
-		case "features", "optional", "default-features":
-			merged[key] = item
-		default:
-			return nil, fmt.Errorf("dependency %s: key %q cannot be combined with workspace inheritance", alias, key)
-		}
-	}
-
-	return merged, nil
 }
 
 func lockedDirectVersions(data string, direct map[string]dependency) (map[string]string, error) {

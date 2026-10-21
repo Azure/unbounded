@@ -17,13 +17,6 @@ use page_alloc::{
     AlignedBuffer, Alignment, Charge, Error, Extent, FreezeGuard, Generation, SegmentClock,
     SegmentEntries, SegmentId, SegmentLease, SegmentSnapshot, SegmentState, Segments, Slab,
 };
-use racer_platform::{
-    Operation,
-    reactor::Reactor,
-    scope::LibraryScope,
-    simulation::{EventKind, Fault, Simulation},
-    uring::backend::OpKind,
-};
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, VecDeque},
@@ -33,6 +26,13 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     task::{Context, Poll, Wake, Waker},
+};
+use uring_runtime::{
+    Operation, Scope,
+    reactor::{
+        Reactor,
+        simulation::{Fault, Simulation},
+    },
 };
 
 const PAGE: u64 = 4096;
@@ -50,7 +50,7 @@ const TURNS: usize = 200;
 enum TestError {
     Alloc(Error),
 
-    Runtime(racer_platform::Error),
+    Runtime(uring_runtime::Error),
 }
 
 impl From<Error> for TestError {
@@ -60,9 +60,9 @@ impl From<Error> for TestError {
     }
 }
 
-impl From<racer_platform::Error> for TestError {
+impl From<uring_runtime::Error> for TestError {
     /// Keep runtime categories visible.
-    fn from(error: racer_platform::Error) -> Self {
+    fn from(error: uring_runtime::Error) -> Self {
         Self::Runtime(error)
     }
 }
@@ -71,14 +71,7 @@ impl From<racer_platform::Error> for TestError {
 #[derive(Clone)]
 struct TestScope;
 
-impl From<racer_platform::uring::Error> for TestError {
-    /// Library errors take the runtime category.
-    fn from(error: racer_platform::uring::Error) -> Self {
-        Self::Runtime(error.into())
-    }
-}
-
-impl LibraryScope for TestScope {
+impl Scope for TestScope {
     type Error = TestError;
 
     /// Never cancel from the scope.
@@ -1492,7 +1485,7 @@ impl<'t, 'w> Phase<'t, 'w> {
                 let pending = &self.pending[0];
                 assert!(pending.write && pending.polled);
                 assert!(self.sim.trace().iter().any(|event| {
-                    event.kind == EventKind::Complete(OpKind::Write)
+                    event.operation == "complete:write"
                         && event.result == self.w.records[pending.record].extent.length() as i64
                 }));
                 assert_eq!(self.t.reactor.in_flight(), 1);
@@ -1503,7 +1496,7 @@ impl<'t, 'w> Phase<'t, 'w> {
                 let pending = &self.pending[0];
                 assert!(!pending.write && pending.polled);
                 assert!(self.sim.trace().iter().any(|event| {
-                    event.kind == EventKind::Complete(OpKind::Read)
+                    event.operation == "complete:read"
                         && event.result == self.w.records[pending.record].extent.length() as i64
                 }));
                 assert_eq!(self.t.reactor.in_flight(), 1);

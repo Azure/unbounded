@@ -28,13 +28,6 @@ use racer_control_wire::PublicationSequence;
 use racer_crypto::identity::BundleInstaller;
 use racer_crypto::identity::KeyPurpose;
 use racer_crypto::identity::Keyring;
-use racer_platform::drivers::Busy;
-use racer_platform::fs::secure;
-#[cfg(test)]
-use racer_platform::fs::secure::{
-    BENEATH, NO_MAGICLINKS, atomic_write, directory, read_at, read_path,
-};
-use racer_platform::reactor::descriptor::Descriptor;
 use std::cell::Cell;
 #[cfg(test)]
 use std::cell::RefCell;
@@ -55,6 +48,13 @@ use std::time::Duration;
 use std::time::Instant;
 #[cfg(test)]
 use std::time::SystemTime;
+use uring_runtime::drivers::Busy;
+use uring_runtime::reactor::descriptor::Descriptor;
+use uring_runtime::reactor::filesystem::secure;
+#[cfg(test)]
+use uring_runtime::reactor::filesystem::secure::{
+    BENEATH, NO_MAGICLINKS, atomic_write, directory, read_at, read_path,
+};
 use wire_codec::rest;
 #[cfg(test)]
 use wire_codec::rest::Response;
@@ -240,7 +240,7 @@ impl secure::Host for ReactorControlIo {
 
     type Budget = crate::runtime::AdmissionBudget;
 
-    fn reactor(&self) -> &racer_platform::reactor::Reactor<Self::Scope, Self::Budget> {
+    fn reactor(&self) -> &uring_runtime::reactor::Reactor<Self::Scope, Self::Budget> {
         &self.reactor
     }
 
@@ -248,7 +248,7 @@ impl secure::Host for ReactorControlIo {
         parent.check()?;
         let mut scope = parent.clone();
         let mut id = [0; 16];
-        racer_platform::environment::fill_random(&mut id).map_err(|_| Error::Io)?;
+        uring_runtime::environment::fill_random(&mut id).map_err(|_| Error::Io)?;
         scope.request = crate::model::RequestId(id);
         Ok(scope)
     }
@@ -278,7 +278,7 @@ impl controlplane::Host for ReactorControlIo {
 }
 
 impl rest::Io for ReactorControlIo {
-    type FileBytes = racer_platform::fs::ReadBuffer;
+    type FileBytes = uring_runtime::reactor::filesystem::ReadBuffer;
 
     type Error = Error;
 
@@ -366,9 +366,9 @@ impl ReactorControlIo {
     /// Wait until an absolute deadline under the caller's cancellation scope.
     pub fn sleep<'a>(&'a self, until: Instant, scope: &'a RequestScope) -> Operation<'a, ()> {
         Box::pin(async move {
-            use racer_platform::reactor::timer::SleepMode;
+            use uring_runtime::reactor::timer::SleepMode;
             #[cfg(test)]
-            let mode = if racer_platform::environment::simulation_seed().is_some() {
+            let mode = if uring_runtime::environment::simulation_seed().is_some() {
                 SleepMode::ClockPoll
             } else {
                 SleepMode::Kernel
@@ -415,7 +415,7 @@ pub(crate) mod tests {
 
     #[test]
     fn socket_readiness_errno_is_transient_but_file_errno_is_not() {
-        use racer_platform::simulation::{Fault, Simulation};
+        use uring_runtime::reactor::simulation::{Fault, Simulation};
         use wire_codec::rest::Io;
         let sim = Simulation::new();
         let _os = sim.enter();
@@ -442,9 +442,9 @@ pub(crate) mod tests {
     #[test]
     fn atomic_write_preserves_cause_and_requires_reconciliation_after_publication() {
         use crate::error::PublicationCause;
-        use racer_platform::simulation::{Fault, Simulation};
         use std::future::Future;
         use std::task::{Context, Poll};
+        use uring_runtime::reactor::simulation::{Fault, Simulation};
         for case in ["success", "write", "rename", "cancel-rename", "sync"] {
             let sim = Simulation::new();
             let _os = sim.enter();
@@ -482,12 +482,11 @@ pub(crate) mod tests {
                     assert!(matches!(operation.as_mut().poll(&mut cx), Poll::Pending));
                     r.poll_budgeted(64).unwrap();
                     r.wait(Duration::from_millis(1)).unwrap();
-                    if sim.trace().iter().any(|event| {
-                        event.kind
-                            == racer_platform::simulation::EventKind::Complete(
-                                racer_platform::uring::backend::OpKind::RenameAt,
-                            )
-                    }) {
+                    if sim
+                        .trace()
+                        .iter()
+                        .any(|event| event.operation == "complete:rename")
+                    {
                         break;
                     }
                 }
@@ -502,9 +501,7 @@ pub(crate) mod tests {
             let expected = match case {
                 "write" => Err(Error::Os(libc::ENOSPC)),
                 "rename" => Err(Error::RenameUncertain(PublicationCause::Os(libc::EIO))),
-                // The kernel's rename result wins over the late cancel, so the
-                // rename is known to be published and the canceled step is the sync.
-                "cancel-rename" => Err(Error::PublishedNotDurable(PublicationCause::Cancelled)),
+                "cancel-rename" => Err(Error::RenameUncertain(PublicationCause::Cancelled)),
                 "sync" => Err(Error::PublishedNotDurable(PublicationCause::Os(libc::EIO))),
                 _ => Ok(()),
             };
@@ -536,10 +533,7 @@ pub(crate) mod tests {
             assert_eq!(
                 sim.trace()
                     .iter()
-                    .filter(|event| event.kind
-                        == racer_platform::simulation::EventKind::Submit(
-                            racer_platform::uring::backend::OpKind::RenameAt
-                        ))
+                    .filter(|event| event.operation == "submit:rename")
                     .count(),
                 usize::from(case != "write")
             );
@@ -1020,11 +1014,11 @@ pub(crate) mod tests {
                 _: Option<&'a str>,
                 _: usize,
                 scope: &'a RequestScope,
-            ) -> racer_platform::Operation<'a, Response, controlplane::feed::FetchError<Error>>
+            ) -> uring_runtime::Operation<'a, Response, controlplane::feed::FetchError<Error>>
             {
                 Box::pin(async move {
                     if self.0.replace(true) {
-                        racer_platform::drivers::poll_scoped(scope, |_| {
+                        uring_runtime::drivers::poll_scoped(scope, |_| {
                             std::task::Poll::<Result<Response>>::Pending
                         })
                         .await
@@ -1045,9 +1039,9 @@ pub(crate) mod tests {
         /// Cancel before or during a turn and fence the retained finite CPU closure.
         fn preparation_fence(cancel_wait: bool) {
             use std::future::Future;
-            let clock = racer_platform::environment::SimulationClock::new(407);
+            let clock = uring_runtime::environment::SimulationClock::new(407);
             let _time = clock.environment(0).enter();
-            let sim = racer_platform::simulation::Simulation::new();
+            let sim = uring_runtime::reactor::simulation::Simulation::new();
             let _os = sim.enter();
             let reactor = Rc::new(Reactor::new(Rc::new(flow_control::Quotas::new(
                 crate::admission::AdmissionPolicy::new(
@@ -1082,7 +1076,7 @@ pub(crate) mod tests {
             .unwrap();
             let scope = RequestScope::new(
                 crate::model::RequestId([7; 16]),
-                racer_platform::environment::now() + Duration::from_secs(10),
+                uring_runtime::environment::now() + Duration::from_secs(10),
             )
             .unwrap();
             testing::drive(&reactor, Box::pin(sync.turn(&scope))).unwrap();
@@ -1113,7 +1107,7 @@ pub(crate) mod tests {
             release.send(()).unwrap();
             let shutdown_scope = RequestScope::new(
                 crate::model::RequestId([8; 16]),
-                racer_platform::environment::now() + Duration::from_secs(10),
+                uring_runtime::environment::now() + Duration::from_secs(10),
             )
             .unwrap();
             let mut shutdown = Box::pin(sync.shutdown(&shutdown_scope));
@@ -1169,7 +1163,7 @@ pub(crate) mod tests {
                     assert_eq!(
                         store
                             .published
-                            .resolve(old, racer_platform::environment::now())
+                            .resolve(old, uring_runtime::environment::now())
                             .unwrap()
                             .unwrap()
                             .version
@@ -1181,7 +1175,7 @@ pub(crate) mod tests {
                     assert!(
                         store
                             .published
-                            .resolve(version - 3, racer_platform::environment::now())
+                            .resolve(version - 3, uring_runtime::environment::now())
                             .unwrap()
                             .is_none()
                     );
@@ -1202,7 +1196,7 @@ pub(crate) mod tests {
                 assert!(
                     store
                         .published
-                        .resolve(2, racer_platform::environment::now())
+                        .resolve(2, uring_runtime::environment::now())
                         .unwrap()
                         .is_none()
                 );
@@ -1219,14 +1213,14 @@ pub(crate) mod tests {
                 assert!(
                     store
                         .published
-                        .resolve(version, racer_platform::environment::now())
+                        .resolve(version, uring_runtime::environment::now())
                         .unwrap()
                         .is_some()
                 );
                 assert!(
                     store
                         .published
-                        .resolve(version - 1, racer_platform::environment::now())
+                        .resolve(version - 1, uring_runtime::environment::now())
                         .unwrap()
                         .is_none()
                 );
@@ -1244,7 +1238,7 @@ pub(crate) mod tests {
                 ready_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 let incoming = published
-                    .resolve(1, racer_platform::environment::now())
+                    .resolve(1, uring_runtime::environment::now())
                     .unwrap()
                     .unwrap();
                 assert!(Arc::ptr_eq(&snapshot.membership, &incoming));
@@ -1371,7 +1365,7 @@ pub(crate) mod tests {
                 let target = PublicationTarget::new(publication(1).cluster, published.clone());
                 target.apply(publication(1)).unwrap();
                 target.apply(membership(2, 2)).unwrap();
-                let now = racer_platform::environment::now();
+                let now = uring_runtime::environment::now();
                 let held = published.resolve(1, now).unwrap();
                 assert_eq!(held.is_some(), budget >= bytes);
                 let expired = now + Duration::from_secs(31);
@@ -1955,7 +1949,7 @@ pub(crate) mod tests {
             let (ca, key) = testing::ca();
             let identity = enrolled(&r, &d, &ca, &key);
             assert!(identity.valid_now());
-            let clock = racer_platform::environment::SimulationClock::new(17);
+            let clock = uring_runtime::environment::SimulationClock::new(17);
             let environment = clock.environment(1);
             // Roll only the scoped wall clock back after real enrollment. The generic
             // Identity has expiry only; Racer must enforce its not-before policy itself.
@@ -2001,7 +1995,7 @@ pub(crate) mod tests {
                 let der =
                     rustls::pki_types::CertificateSigningRequestDer::from(request.csr_der.clone());
                 let mut csr = rcgen::CertificateSigningRequestParams::from_der(&der).unwrap();
-                let now = racer_platform::environment::wall_now();
+                let now = uring_runtime::environment::wall_now();
                 csr.params.not_before = (now - Duration::from_secs(1)).into();
                 csr.params.not_after = (now + Duration::from_secs(3600)).into();
                 csr.params.subject_alt_names = vec![
@@ -2127,7 +2121,7 @@ pub(crate) mod tests {
                 csr.params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
                 response.certificate_chain = vec![csr.signed_by(&ca, &key).unwrap().der().to_vec()];
                 let identity = testing::drive(&r, e.accept_response(response, &scope)).unwrap();
-                let clock = racer_platform::environment::SimulationClock::new_at(
+                let clock = uring_runtime::environment::SimulationClock::new_at(
                     51,
                     std::time::Instant::now(),
                     wall + Duration::from_secs(due - 1),
@@ -2165,7 +2159,7 @@ pub(crate) mod tests {
                     e.accept_response(testing::issue(&request, &ca, &key, OLD_NODE), &scope),
                 )
                 .unwrap();
-                let clock = racer_platform::environment::SimulationClock::new_at(
+                let clock = uring_runtime::environment::SimulationClock::new_at(
                     31,
                     std::time::Instant::now(),
                     SystemTime::now() + Duration::from_secs(172800),
@@ -2593,7 +2587,7 @@ pub(crate) mod tests {
         use crate::test_support::enrollment as testing;
         #[test]
         fn secure_adapters_preserve_token_symlinks_identity_rejection_and_errors() {
-            use racer_platform::simulation::Simulation;
+            use uring_runtime::reactor::simulation::Simulation;
             let sim = Simulation::new();
             let _environment = sim.enter();
             let r = testing::reactor().unwrap();

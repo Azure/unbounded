@@ -403,7 +403,7 @@ fn adapter_connection(
 
 struct Rig {
     bootstrap: Bootstrap,
-    drivers: Rc<racer_platform::drivers::DriverQueue>,
+    drivers: Rc<uring_runtime::drivers::DriverQueue>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     reactor: Rc<Reactor>,
     crypto: Rc<CryptoClient>,
@@ -639,7 +639,7 @@ impl Rig {
         Self {
             bootstrap,
             admission,
-            drivers: Rc::new(racer_platform::drivers::DriverQueue::new(1024)),
+            drivers: Rc::new(uring_runtime::drivers::DriverQueue::new(1024)),
             reactor,
             crypto,
             engine,
@@ -661,7 +661,7 @@ impl Rig {
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         self.reactor.poll_budgeted(128).unwrap();
         if let Some(engine) = &self.engine {
-            racer_platform::group::Service::poll(
+            uring_runtime::group::Service::poll_budgeted(
                 &mut *engine.borrow_mut(),
                 &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
                 64,

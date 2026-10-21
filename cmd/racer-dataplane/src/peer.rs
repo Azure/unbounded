@@ -22,11 +22,11 @@ use crate::telemetry::Stage;
 use crate::topology::Paths;
 use racer_control_wire::MembershipVersion;
 use racer_control_wire::NodeId;
-use racer_platform::environment::now;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use uring_runtime::environment::now;
 
 pub mod forwarding;
 pub mod protocol;
@@ -221,7 +221,7 @@ impl PeerNetwork {
         version: MembershipVersion,
     ) -> Result<std::sync::Arc<crate::topology::Membership>> {
         self.published
-            .resolve(version.0, racer_platform::environment::now())?
+            .resolve(version.0, uring_runtime::environment::now())?
             .ok_or(Error::IncompatibleMembership)
     }
 

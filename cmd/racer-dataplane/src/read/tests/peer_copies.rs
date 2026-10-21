@@ -33,7 +33,7 @@ struct ScriptedPeers {
 
     canceled_primary: Cell<bool>,
 
-    advance_primary: RefCell<Option<racer_platform::environment::SimulationClock>>,
+    advance_primary: RefCell<Option<uring_runtime::environment::SimulationClock>>,
 
     local: usize,
 
@@ -290,7 +290,7 @@ fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Ve
 #[test]
 fn bounded_admission_reciprocal_signed_peers_reject_while_both_owners_are_full() {
     use crate::peer::server::LocalPageService;
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut a = fixture();
     let mut b = fixture();
@@ -390,7 +390,7 @@ fn bounded_admission_reciprocal_signed_peers_reject_while_both_owners_are_full()
 
 #[test]
 fn bounded_admission_signed_remote_saturation_exits_without_request_expiry() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut target = fixture();
     install_peers(&mut target, Some(0));
@@ -443,7 +443,7 @@ fn bounded_admission_signed_remote_saturation_exits_without_request_expiry() {
 
 #[test]
 fn serial_zero_grant_reaches_real_pending_and_disk_copy() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for (disk, missing) in [(false, false), (true, false), (false, true)] {
         let mut target = fixture();
@@ -534,9 +534,9 @@ fn serial_zero_grant_reaches_real_pending_and_disk_copy() {
         let mut result = None;
         for _ in 0..4096 {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-            racer_platform::drivers::poll(&mut cx, 64);
+            uring_runtime::drivers::poll(&mut cx, 64);
             for f in [&mut source, &mut target] {
-                racer_platform::group::Service::poll(&mut f.engine, &mut cx, 64).unwrap();
+                uring_runtime::group::Service::poll_budgeted(&mut f.engine, &mut cx, 64).unwrap();
                 f.crypto.poll_budgeted(64).unwrap();
             }
             target.reactor.poll_budgeted(64).unwrap();
@@ -602,8 +602,8 @@ fn serial_zero_grant_reaches_real_pending_and_disk_copy() {
         let mut copy = None;
         for _ in 0..4096 {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-            racer_platform::drivers::poll(&mut cx, 64);
-            racer_platform::group::Service::poll(&mut target.engine, &mut cx, 64).unwrap();
+            uring_runtime::drivers::poll(&mut cx, 64);
+            uring_runtime::group::Service::poll_budgeted(&mut target.engine, &mut cx, 64).unwrap();
             target.crypto.poll_budgeted(64).unwrap();
             target.reactor.poll_budgeted(64).unwrap();
             if let Poll::Ready(done) = control.as_mut().poll(&mut cx) {
@@ -636,7 +636,7 @@ fn serial_zero_grant_reaches_real_pending_and_disk_copy() {
 
 #[test]
 fn serial_zero_grant_copy_failures_and_positive_grant_acquire() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for attempts in [8, 16] {
         for case in ["good", "corrupt", "missing", "auth", "cancel"] {
@@ -736,7 +736,7 @@ fn serial_zero_grant_copy_failures_and_positive_grant_acquire() {
 
 #[test]
 fn serial_zero_grant_cancel_waits_for_accepted_copy_fence() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let (peers, ordered) = install_peers(&mut f, None);
@@ -804,7 +804,7 @@ fn serial_zero_grant_cancel_waits_for_accepted_copy_fence() {
 
 #[test]
 fn serial_zero_grant_predicate_matches_unpartitioned_remote_grant() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for attempts in 0u32..=16 {
         let mut f = fixture();
@@ -833,7 +833,7 @@ fn serial_zero_grant_predicate_matches_unpartitioned_remote_grant() {
 
 #[test]
 fn invalid_signed_selection_falls_back_without_resetting_acquisition_budget() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for missing_key in [false, true] {
         for origin in [false, true] {
@@ -880,8 +880,8 @@ fn invalid_signed_selection_falls_back_without_resetting_acquisition_budget() {
                     break;
                 }
                 endpoint.poll(&mut cx, 64).unwrap();
-                racer_platform::drivers::poll(&mut cx, 64);
-                racer_platform::group::Service::poll(
+                uring_runtime::drivers::poll(&mut cx, 64);
+                uring_runtime::group::Service::poll_budgeted(
                     &mut f.engine,
                     &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
                     64,
@@ -908,7 +908,7 @@ fn invalid_signed_selection_falls_back_without_resetting_acquisition_budget() {
 
 #[test]
 fn subscription_behind_remote_warm_selects_only_published_pages() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let (peers, ordered) = install_peers(&mut f, None);
@@ -958,8 +958,8 @@ fn subscription_behind_remote_warm_selects_only_published_pages() {
             break;
         }
         endpoint.poll(&mut cx, 64).unwrap();
-        racer_platform::drivers::poll(&mut cx, 64);
-        racer_platform::group::Service::poll(
+        uring_runtime::drivers::poll(&mut cx, 64);
+        uring_runtime::group::Service::poll_budgeted(
             &mut f.engine,
             &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
             64,
@@ -990,7 +990,7 @@ fn subscription_behind_remote_warm_selects_only_published_pages() {
 
 #[test]
 fn hedged_plaintext_validates_aead_and_preserves_singleflight_and_original_credits() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for corrupt in [false, true] {
         let mut f = fixture();
@@ -1074,7 +1074,7 @@ fn hedged_plaintext_validates_aead_and_preserves_singleflight_and_original_credi
 
 #[test]
 fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for reason in ["route", "credits", "memory", "slots"] {
         let mut f = fixture();
@@ -1185,7 +1185,7 @@ fn encrypted_copy(f: &mut Fixture) -> CiphertextCopy {
 
 #[test]
 fn retained_small_copy_admits_actual_plaintext_with_live_pressure() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for free in [3, 4096] {
         let mut f = fixture();
@@ -1425,15 +1425,15 @@ fn enable_hedge(f: &mut Fixture, peers: &Rc<ScriptedPeers>) -> crate::telemetry:
 
 #[test]
 fn hedge_stalled_primary_copy_miss_keeps_time_and_credits_for_later_acquire() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for third in [false, true] {
-        let clock = racer_platform::environment::SimulationClock::new(920);
+        let clock = uring_runtime::environment::SimulationClock::new(920);
         let _env = clock.environment(0).enter();
         let mut f = fixture();
         f.scope = RequestScope::new(
             f.scope.request,
-            racer_platform::environment::now() + Duration::from_secs(30),
+            uring_runtime::environment::now() + Duration::from_secs(30),
         )
         .unwrap();
         let (peers, ordered) = install_peers(&mut f, None);
@@ -1459,15 +1459,13 @@ fn hedge_stalled_primary_copy_miss_keeps_time_and_credits_for_later_acquire() {
                 .borrow_mut()
                 .push_back((ordered[2].clone(), Reply::Copy(good)));
         }
-        let start = racer_platform::environment::now();
+        let start = uring_runtime::environment::now();
         let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
         let result = acquire(&mut f, &mut budget).unwrap();
         assert_eq!(result.plaintext.bytes(), b"abc");
         assert!(peers.canceled_primary.get());
-        assert!(racer_platform::environment::now() < f.scope.deadline.0);
-        assert!(
-            racer_platform::environment::now().duration_since(start) <= Duration::from_secs(12)
-        );
+        assert!(uring_runtime::environment::now() < f.scope.deadline.0);
+        assert!(uring_runtime::environment::now().duration_since(start) <= Duration::from_secs(12));
         let calls = peers.calls.borrow();
         assert_eq!(calls.len(), if third { 4 } else { 3 });
         assert!(calls[1].1);
@@ -1486,7 +1484,7 @@ fn hedge_stalled_primary_copy_miss_keeps_time_and_credits_for_later_acquire() {
 
 #[test]
 fn hedge_stale_membership_refreshes_once_without_fresh_credits() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for stale_again in [false, true] {
         for secondary_stale in [false, true] {
@@ -1562,7 +1560,7 @@ fn hedge_stale_membership_refreshes_once_without_fresh_credits() {
 
 #[test]
 fn hedge_continuation_preserves_version_failure_and_never_restarts_consumed_primary() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let (peers, ordered) = install_peers(&mut f, None);
@@ -1585,7 +1583,7 @@ fn hedge_continuation_preserves_version_failure_and_never_restarts_consumed_prim
 
 #[test]
 fn hedge_default_budget_never_sends_underfunded_second_cold_fallback() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let (peers, ordered) = install_peers(&mut f, None);
@@ -1728,7 +1726,7 @@ impl Peer {
 
 #[test]
 fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_original_budget() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for target_rank in [1usize, 2] {
         let hedge_metrics = crate::telemetry::Metrics::default();
@@ -1824,9 +1822,9 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let mut result = None;
         for _ in 0..512 {
-            racer_platform::drivers::poll(&mut cx, 64);
+            uring_runtime::drivers::poll(&mut cx, 64);
             for f in &mut fixtures {
-                racer_platform::group::Service::poll(
+                uring_runtime::group::Service::poll_budgeted(
                     &mut f.engine,
                     &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
                     64,
@@ -1890,7 +1888,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
 
 #[test]
 fn hedge_full_page_exact_plaintext_quotas_suppress_before_spending_serial_credits() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for pages in [2, 3, 4] {
         let mut limits = crate::test_support::cluster::config(false).limits;
@@ -1962,7 +1960,7 @@ fn hedge_full_page_exact_plaintext_quotas_suppress_before_spending_serial_credit
 
 #[test]
 fn hedge_authenticated_metadata_conflict_cannot_win_over_retained_descriptor() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for content_type in [false, true] {
         let mut f = fixture_with(PAGE_BYTES + 3, None);
@@ -2036,7 +2034,7 @@ fn hedge_authenticated_metadata_conflict_cannot_win_over_retained_descriptor() {
 
 #[test]
 fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let (peers, ordered) = install_peers(&mut f, None);
@@ -2091,13 +2089,13 @@ fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
         "primary crypto accepted before winner"
     );
     assert_eq!(scopes.borrow().len(), 2);
-    assert!(scopes.borrow()[0].cancellation.is_canceled());
-    assert!(!f.scope.cancellation.is_canceled());
+    assert!(scopes.borrow()[0].cancellation.is_cancelled());
+    assert!(!f.scope.cancellation.is_cancelled());
     assert!(
         pair.as_mut().poll(&mut cx).is_pending(),
         "cancellation is not the crypto fence"
     );
-    racer_platform::group::Service::poll(
+    uring_runtime::group::Service::poll_budgeted(
         &mut f.engine,
         &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
         8,
@@ -2120,7 +2118,7 @@ fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
 /// Both hedge validations remain one composite driver call while crypto is parked.
 #[test]
 fn expiry_snapshot_overlapped_hedge_validation_stays_composite() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let (peers, ordered) = install_peers(&mut f, None);
@@ -2153,7 +2151,7 @@ fn expiry_snapshot_overlapped_hedge_validation_stays_composite() {
     let flights = &f.fill.dependencies.flights;
     for _ in 0..2 {
         let entry = flights
-            .expiry_snapshot_without_ticket(racer_platform::environment::now())
+            .expiry_snapshot_without_ticket(uring_runtime::environment::now())
             .entries[0]
             .unwrap();
         assert_eq!(
@@ -2169,7 +2167,7 @@ fn expiry_snapshot_overlapped_hedge_validation_stays_composite() {
 
 #[test]
 fn hedge_child_cancellation_removes_crypto_admission_wait_without_canceling_accepted_job() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.queue_entries = std::num::NonZeroUsize::new(1).unwrap();
@@ -2201,9 +2199,9 @@ fn hedge_child_cancellation_removes_crypto_admission_wait_without_canceling_acce
         Poll::Ready(Err(Error::Cancelled))
     ));
     drop(waiting);
-    assert!(!f.scope.cancellation.is_canceled());
+    assert!(!f.scope.cancellation.is_cancelled());
     assert_eq!(f.crypto.outstanding(), 1);
-    racer_platform::group::Service::poll(
+    uring_runtime::group::Service::poll_budgeted(
         &mut f.engine,
         &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
         8,
@@ -2297,7 +2295,7 @@ fn assert_published(f: &Fixture, result: &PageResult, persist: bool) {
         assert_eq!(copy.ciphertext.bytes(), result.ciphertext.bytes());
     }
     assert_eq!(f.crypto.outstanding(), 0);
-    assert_eq!(racer_platform::drivers::pending(), 0);
+    assert_eq!(uring_runtime::drivers::pending(), 0);
 }
 
 fn assert_unpublished(f: &Fixture) {
@@ -2326,7 +2324,7 @@ fn assert_unpublished(f: &Fixture) {
 
 #[test]
 fn unusable_peer_copy_advances_to_alternate_or_authorized_origin() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for missing_key in [false, true] {
         for (rank, use_origin) in [(None, false), (Some(2), false), (Some(2), true)] {
@@ -2404,7 +2402,7 @@ fn unusable_peer_copy_advances_to_alternate_or_authorized_origin() {
 
 #[test]
 fn peer_ciphertext_from_another_version_cannot_be_published_under_the_pin() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let (peers, ordered) = install_peers(&mut f, Some(1));
@@ -2453,7 +2451,7 @@ fn peer_ciphertext_from_another_version_cannot_be_published_under_the_pin() {
 
 #[test]
 fn origin_version_miss_checks_every_later_copy_without_claiming_false_absence() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for healthy_last in [false, true] {
         let mut f = fixture();
@@ -2494,7 +2492,7 @@ fn origin_version_miss_checks_every_later_copy_without_claiming_false_absence() 
 
 #[test]
 fn corrupt_predecessor_evidence_survives_origin_and_later_copy_misses() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let (peers, ordered) = install_peers(&mut f, Some(1));
@@ -2518,7 +2516,7 @@ fn corrupt_predecessor_evidence_survives_origin_and_later_copy_misses() {
 
 #[test]
 fn corrupt_copies_exhaust_sources_or_original_credits_without_origin_for_noncandidate() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for (attempts, links, expected_calls, expected_error) in [
         (8, 16, 3, Error::Unavailable),
@@ -2557,7 +2555,7 @@ fn corrupt_copies_exhaust_sources_or_original_credits_without_origin_for_noncand
 
 #[test]
 fn unauthorized_after_corrupt_copy_is_terminal_not_origin_evidence() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let (peers, ordered) = install_peers(&mut f, Some(2));
@@ -2580,9 +2578,9 @@ fn unauthorized_after_corrupt_copy_is_terminal_not_origin_evidence() {
 
 #[test]
 fn corrupt_copy_cannot_extend_original_budget_deadline() {
-    let clock = racer_platform::environment::SimulationClock::new(921);
+    let clock = uring_runtime::environment::SimulationClock::new(921);
     let _environment = clock.environment(0).enter();
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let (peers, ordered) = install_peers(&mut f, Some(2));
@@ -2592,7 +2590,7 @@ fn corrupt_copy_cannot_extend_original_budget_deadline() {
         .replies
         .borrow_mut()
         .push_back((ordered[0].clone(), Reply::Copy(bad)));
-    let deadline = racer_platform::environment::now() + Duration::from_millis(100);
+    let deadline = uring_runtime::environment::now() + Duration::from_millis(100);
     let mut budget = AcquisitionBudget::new(deadline, 8, 16);
     let mut future = Box::pin(f.fill.acquire_once(
         &f.page,
@@ -2607,7 +2605,7 @@ fn corrupt_copy_cannot_extend_original_budget_deadline() {
     assert_eq!(f.crypto.outstanding(), 1);
     // Complete AEAD while live, then resume fallback after the tighter budget
     // deadline. The caller scope is still live and must not renew that deadline.
-    racer_platform::group::Service::poll(
+    uring_runtime::group::Service::poll_budgeted(
         &mut f.engine,
         &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
         64,
@@ -2633,7 +2631,7 @@ fn corrupt_copy_cannot_extend_original_budget_deadline() {
 #[test]
 fn replica_selection_orders_first_acquire_and_non_primary_owner_fills() {
     use crate::read::candidates::ReplicaSelection;
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for selection in [ReplicaSelection::Primary, ReplicaSelection::Spread] {
         let mut fixtures: Vec<_> = (0..4).map(|_| fixture()).collect();
@@ -2720,9 +2718,9 @@ fn replica_selection_orders_first_acquire_and_non_primary_owner_fills() {
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let mut result = None;
         for _ in 0..512 {
-            racer_platform::drivers::poll(&mut cx, 64);
+            uring_runtime::drivers::poll(&mut cx, 64);
             for f in &mut fixtures {
-                racer_platform::group::Service::poll(
+                uring_runtime::group::Service::poll_budgeted(
                     &mut f.engine,
                     &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
                     64,

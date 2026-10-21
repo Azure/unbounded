@@ -2,12 +2,6 @@
 use flow_control::{Charge, Policy, Quotas, Rejection};
 use http1::connection::{self, Context as HttpContext, Endpoint as EndpointPolicy, PoolConfig};
 use http1::{Codec, Header, MessageHead, StartLine};
-use racer_platform::{
-    Cancellation,
-    environment::now,
-    reactor::{IoBuffer, SocketAddress, descriptor::Descriptor},
-    scope::LibraryScope,
-};
 use std::{
     future::Future,
     io::{Read, Write},
@@ -21,12 +15,17 @@ use std::{
     task::{Context, Poll, Wake, Waker},
     time::{Duration, Instant},
 };
+use uring_runtime::{
+    Scope,
+    environment::{Cancellation, now},
+    reactor::{IoBuffer, SocketAddress, descriptor::Descriptor},
+};
 
 /// Keep protocol failures distinct from runtime and quota admission failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Error {
     Http(http1::Error),
-    Runtime(racer_platform::Error),
+    Runtime(uring_runtime::Error),
     Quota(flow_control::Error),
 }
 impl From<http1::Error> for Error {
@@ -34,22 +33,15 @@ impl From<http1::Error> for Error {
         Self::Http(e)
     }
 }
-impl From<racer_platform::uring::Error> for Error {
-    /// Library errors take the Racer runtime mapping.
-    fn from(error: racer_platform::uring::Error) -> Self {
-        racer_platform::Error::from(error).into()
-    }
-}
-
-impl From<racer_platform::Error> for Error {
-    fn from(e: racer_platform::Error) -> Self {
+impl From<uring_runtime::Error> for Error {
+    fn from(e: uring_runtime::Error) -> Self {
         Self::Runtime(e)
     }
 }
 impl From<flow_control::Error> for Error {
     fn from(e: flow_control::Error) -> Self {
         match e {
-            flow_control::Error::Overloaded => Self::Runtime(racer_platform::Error::Overloaded),
+            flow_control::Error::Overloaded => Self::Runtime(uring_runtime::Error::Overloaded),
             other => Self::Quota(other),
         }
     }
@@ -104,15 +96,15 @@ struct RequestScope {
 
     cancellation: Cancellation,
 }
-impl LibraryScope for RequestScope {
+impl Scope for RequestScope {
     type Error = Error;
 
     fn check(&self) -> Result<()> {
-        if self.cancellation.is_canceled() {
-            return Err(racer_platform::Error::Canceled.into());
+        if self.cancellation.is_cancelled() {
+            return Err(uring_runtime::Error::Cancelled.into());
         }
         if now() >= self.deadline {
-            return Err(racer_platform::Error::DeadlineExceeded.into());
+            return Err(uring_runtime::Error::DeadlineExceeded.into());
         }
         Ok(())
     }
@@ -125,7 +117,7 @@ impl LibraryScope for RequestScope {
 fn scope() -> RequestScope {
     RequestScope {
         deadline: now() + Duration::from_secs(5),
-        cancellation: Cancellation::new(),
+        cancellation: Cancellation::new().unwrap(),
     }
 }
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -174,7 +166,7 @@ impl HttpContext for Caller {
         self.0.is_stopped()
     }
 }
-type Reactor = racer_platform::reactor::Reactor<RequestScope, ()>;
+type Reactor = uring_runtime::reactor::Reactor<RequestScope, ()>;
 type Pool = connection::HttpPool<Caller>;
 type Io = connection::HttpIo<Caller>;
 type Lease = connection::ConnectionLease<Caller>;
@@ -366,24 +358,24 @@ fn waiting_cancel_deadline_close_stop_and_drop_release_only_waiter_quota() {
         assert!(wait.as_mut().poll(&mut cx).is_pending());
         let expected = match case {
             "cancel" => {
-                scope.cancellation.cancel();
-                racer_platform::Error::Canceled
+                scope.cancellation.cancel().unwrap();
+                uring_runtime::Error::Cancelled
             }
             "deadline" => {
                 std::thread::sleep(Duration::from_millis(30));
                 pool.poll_waiters(1);
-                racer_platform::Error::DeadlineExceeded
+                uring_runtime::Error::DeadlineExceeded
             }
             "close" => {
                 pool.close();
-                racer_platform::Error::Unavailable
+                uring_runtime::Error::Unavailable
             }
             "stop" => {
                 admission.stop();
                 pool.poll_waiters(1);
-                racer_platform::Error::Unavailable
+                uring_runtime::Error::Unavailable
             }
-            _ => racer_platform::Error::InvalidInput,
+            _ => uring_runtime::Error::InvalidInput,
         };
         if case != "drop" {
             assert!(count.count() > 0);
@@ -438,7 +430,7 @@ fn worker_tick_wakes_bounded_round_robin_waiters_even_in_nested_executor() {
         assert!(matches!(
             std::pin::Pin::new(&mut futures).poll_next(&mut cx),
             Poll::Ready(Some(Err(Error::Runtime(
-                racer_platform::Error::DeadlineExceeded
+                uring_runtime::Error::DeadlineExceeded
             ))))
         ));
         std::thread::sleep(Duration::from_millis(2));
@@ -477,7 +469,7 @@ fn waiting_connection_quota_releases_and_connect_abandonment_keeps_fence() {
     assert_eq!(pool.snapshot().entries[&endpoint].0, 1);
     assert!(matches!(
         pool.checkout(&endpoint, &scope).as_mut().poll(&mut cx),
-        Poll::Ready(Err(Error::Runtime(racer_platform::Error::Overloaded)))
+        Poll::Ready(Err(Error::Runtime(uring_runtime::Error::Overloaded)))
     ));
     drain(&reactor);
     assert!(pool.snapshot().entries.is_empty());
@@ -504,7 +496,7 @@ fn waiting_endpoint_table_and_context_pressure_remain_bounded() {
         .unwrap();
     assert!(matches!(
         pool.checkout_wait(&second, &scope).as_mut().poll(&mut cx),
-        Poll::Ready(Err(Error::Runtime(racer_platform::Error::Overloaded)))
+        Poll::Ready(Err(Error::Runtime(uring_runtime::Error::Overloaded)))
     ));
     assert_eq!(pool.snapshot().waiting, 0);
     assert_eq!(pool.snapshot().entries.len(), 1);
@@ -593,7 +585,7 @@ fn tcp_pool_reuses_only_finished_exchanges_and_enforces_capacity() {
         let connection = drive(&reactor, pool.checkout(&endpoint, &scope)).unwrap();
         assert!(matches!(
             drive(&reactor, pool.checkout(&endpoint, &scope)),
-            Err(Error::Runtime(racer_platform::Error::Overloaded))
+            Err(Error::Runtime(uring_runtime::Error::Overloaded))
         ));
         let received = drive(&reactor, io.exchange_head(connection, request(), &scope)).unwrap();
         let mut completed =
@@ -623,7 +615,7 @@ fn truncation_and_future_drop_do_not_recycle_live_buffers() {
     let received = drive(&reactor, io.receive_head(connection, &scope)).unwrap();
     assert!(matches!(
         drive(&reactor, io.collect_body(received.connection, 9, &scope)),
-        Err(Error::Runtime(racer_platform::Error::Io))
+        Err(Error::Runtime(uring_runtime::Error::Io))
     ));
     drop(received.value);
     drop(received._decoded);
@@ -632,7 +624,7 @@ fn truncation_and_future_drop_do_not_recycle_live_buffers() {
     let mut cx = Context::from_waker(Waker::noop());
     assert!(future.as_mut().poll(&mut cx).is_pending());
     drop(future);
-    scope.cancellation.cancel();
+    scope.cancellation.cancel().unwrap();
     drain(&reactor);
     assert_eq!(
         admission.used(Resource::Context),
@@ -653,7 +645,7 @@ fn deadline_expires_without_peer_traffic() {
             &reactor,
             io.receive_head(accepted(socket.into(), &admission), &scope)
         ),
-        Err(Error::Runtime(racer_platform::Error::DeadlineExceeded))
+        Err(Error::Runtime(uring_runtime::Error::DeadlineExceeded))
     ));
     drain(&reactor);
     assert_eq!(admission.used(Resource::Connection), 0);
@@ -669,11 +661,11 @@ fn canceled_receive_retains_resources_until_completion_and_reports_canceled() {
     let mut future = io.receive_head(accepted(socket.into(), &admission), &scope);
     let mut cx = Context::from_waker(Waker::noop());
     assert!(future.as_mut().poll(&mut cx).is_pending());
-    scope.cancellation.cancel();
+    scope.cancellation.cancel().unwrap();
     assert_eq!(admission.used(Resource::Connection), 1);
     assert!(matches!(
         drive(&reactor, future),
-        Err(Error::Runtime(racer_platform::Error::Canceled))
+        Err(Error::Runtime(uring_runtime::Error::Cancelled))
     ));
     assert_eq!(admission.used(Resource::Connection), 0);
     assert_eq!(
@@ -721,7 +713,7 @@ fn unix_pool_reconnects_after_unread_response_and_bounds_endpoints() {
     let other = Endpoint(SocketAddress::Inet("127.0.0.1:1".parse().unwrap()));
     assert!(matches!(
         drive(&reactor, pool.checkout(&other, &scope)),
-        Err(Error::Runtime(racer_platform::Error::Overloaded))
+        Err(Error::Runtime(uring_runtime::Error::Overloaded))
     ));
     pool.invalidate(&endpoint);
     drop(connection);
@@ -731,7 +723,7 @@ fn unix_pool_reconnects_after_unread_response_and_bounds_endpoints() {
     std::fs::remove_file(path).unwrap();
     assert!(matches!(
         drive(&reactor, pool.checkout(&endpoint, &scope)),
-        Err(Error::Runtime(racer_platform::Error::Unavailable))
+        Err(Error::Runtime(uring_runtime::Error::Unavailable))
     ));
     assert_eq!(admission.used(Resource::Connection), 0);
 }
@@ -893,7 +885,7 @@ fn waiter_fifo_capacity_and_independent_endpoint_progress() {
     assert_eq!(count.count(), 1);
     assert!(matches!(
         pool.checkout_wait(&endpoint, &scope).as_mut().poll(&mut cx),
-        Poll::Ready(Err(Error::Runtime(racer_platform::Error::Overloaded)))
+        Poll::Ready(Err(Error::Runtime(uring_runtime::Error::Overloaded)))
     ));
     assert!(admission.used(Resource::Context) > baseline);
     assert_eq!(reactor.in_flight(), 0);

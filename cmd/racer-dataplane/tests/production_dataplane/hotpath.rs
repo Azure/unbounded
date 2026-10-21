@@ -128,7 +128,7 @@ impl Factory {
         &self,
         worker: WorkerId,
         runtime: WorkerRuntime,
-    ) -> Result<Box<dyn racer_platform::group::Service<RequestScope>>> {
+    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
         let rig = Rc::new(Rig::assemble(
             P,
             false,
@@ -155,22 +155,22 @@ impl Factory {
         &self,
         _: WorkerId,
         runtime: CryptoRuntime,
-    ) -> Result<Box<dyn racer_platform::group::Service<RequestScope>>> {
+    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
         Ok(Box::new(PageCryptoEngine::new(runtime)))
     }
 }
-impl racer_platform::group::Factory<RequestScope> for Factory {
+impl uring_runtime::group::Factory<RequestScope> for Factory {
     fn build_lane(
         &self,
         lane: usize,
-    ) -> Result<Box<dyn racer_platform::group::Service<RequestScope>>> {
+    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
         self.resources
             .build_lane(lane, |worker, runtime| self.build(worker, runtime))
     }
     fn build_helper(
         &self,
         lane: usize,
-    ) -> Result<Box<dyn racer_platform::group::Service<RequestScope>>> {
+    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
         self.resources
             .build_helper(lane, |worker, runtime| self.build_crypto(worker, runtime))
     }
@@ -292,11 +292,11 @@ impl Service {
         Ok(())
     }
 }
-impl racer_platform::group::Service<RequestScope> for Service {
+impl uring_runtime::group::Service<RequestScope> for Service {
     fn start<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
         Box::pin(async { Ok(()) })
     }
-    fn poll(&mut self, cx: &mut Context<'_>, _: usize) -> Result<()> {
+    fn poll_budgeted(&mut self, cx: &mut Context<'_>, _: usize) -> Result<()> {
         self.poll(cx)
     }
     fn stop_admission(&mut self) -> Result<()> {
@@ -433,16 +433,15 @@ fn balanced_workload_covers_owners_without_multiplying_pages() {
 
 #[test]
 fn automatic_and_capped_plans_preserve_shared_and_explicit_paired_crypto() {
-    use racer_platform::group::affinity::CpuLocation;
+    use uring_runtime::group::affinity::CpuLocation;
     let mut config = default_config();
     let topology = EffectiveTopology {
         cpus: (0..12)
-            .map(|cpu| {
-                let mut location = CpuLocation::new(cpu);
-                location.package = Some(0);
-                location.core = Some(cpu);
-                location.numa_node = Some(0);
-                location
+            .map(|cpu| CpuLocation {
+                cpu,
+                package: 0,
+                core: cpu,
+                numa_node: Some(0),
             })
             .collect(),
         quota: None,
@@ -965,4 +964,4 @@ impl Drop for Brd {
         }
     }
 }
-use racer_platform::group::affinity::EffectiveTopology;
+use uring_runtime::group::affinity::EffectiveTopology;

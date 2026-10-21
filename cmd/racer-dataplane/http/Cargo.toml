@@ -12,7 +12,7 @@ test-util = []
 [dependencies]
 futures = "0.3"
 flow-control = { path = "../flow" }
-racer-platform = { path = "../platform" }
+uring-runtime = { path = "../runtime" }
 httparse = "1"
 zeroize = "1"
 libc = "0.2"

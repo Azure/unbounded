@@ -46,7 +46,6 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use http1::{Header, MessageHead, StartLine};
 use racer_control_wire::NodeId;
 use racer_crypto::identity::{Certificates, Keyring, VerifiedPeer};
-use racer_platform::environment::Deadline;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
@@ -54,6 +53,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use uring_runtime::environment::Deadline;
 
 /// Failures contain no signed fields, credentials, or body bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,7 +75,7 @@ pub enum Error {
     /// Preserve the identity component's failure classification.
     Identity(racer_crypto::identity::Error),
     /// Preserve the runtime component's failure classification.
-    Runtime(racer_platform::Error),
+    Runtime(uring_runtime::Error),
 }
 
 /// A bounded wire mechanism result.
@@ -96,15 +96,8 @@ impl From<racer_crypto::identity::Error> for Error {
     }
 }
 
-impl From<racer_platform::uring::Error> for Error {
-    /// Library errors take the Racer runtime mapping.
-    fn from(error: racer_platform::uring::Error) -> Self {
-        racer_platform::Error::from(error).into()
-    }
-}
-
-impl From<racer_platform::Error> for Error {
-    fn from(value: racer_platform::Error) -> Self {
+impl From<uring_runtime::Error> for Error {
+    fn from(value: uring_runtime::Error) -> Self {
         Self::Runtime(value)
     }
 }
@@ -229,7 +222,7 @@ impl Signatures {
         push(
             &mut head,
             "racer-timestamp",
-            millis(racer_platform::environment::wall_now())?,
+            millis(uring_runtime::environment::wall_now())?,
         );
         self.request_mac.sign(&self.keys, &mut head)?;
         let input = signature_input(&head)?;
@@ -268,7 +261,7 @@ impl Signatures {
         signed: &SignedHead,
         deadline: u64,
     ) -> Result<VerifiedPeer> {
-        if deadline <= millis(racer_platform::environment::wall_now())? {
+        if deadline <= millis(uring_runtime::environment::wall_now())? {
             return Err(Error::DeadlineExceeded);
         }
         if field(&signed.head, "racer-kind")? != "request"
@@ -305,7 +298,7 @@ impl Signatures {
         let timestamp = UNIX_EPOCH
             .checked_add(Duration::from_millis(number(head, "racer-timestamp")?))
             .ok_or(Error::Unauthorized)?;
-        let now = racer_platform::environment::wall_now();
+        let now = uring_runtime::environment::wall_now();
         if timestamp
             > now
                 .checked_add(Duration::from_secs(5))
@@ -573,7 +566,7 @@ pub fn push_binary(head: &mut MessageHead, name: &str, bytes: &[u8]) {
 }
 /// Map a wall-clock timestamp to canonical milliseconds.
 pub fn millis(time: SystemTime) -> Result<u64> {
-    racer_platform::environment::unix_millis(time).map_err(Into::into)
+    uring_runtime::environment::unix_millis(time).map_err(Into::into)
 }
 /// Encode a deadline using the environment's stable clock mapping.
 pub fn encode_deadline(deadline: Deadline) -> Result<u64> {

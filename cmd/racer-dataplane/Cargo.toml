@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "platform", "alloc", "crypto", "verbs", "http", "topology", "telemetry", "flow", "control-wire", "controlplane", "uds-endpoint", "wire-codec", "peer-wire", "object-wire"]
+members = [".", "runtime", "alloc", "crypto", "verbs", "http", "topology", "telemetry", "flow", "control-wire", "controlplane", "uds-endpoint", "wire-codec", "peer-wire", "object-wire"]
 resolver = "3"
 
 [package]
@@ -37,7 +37,7 @@ http1 = { path = "http" }
 racer-crypto = { path = "crypto" }
 rdma-verbs = { path = "verbs" }
 page-alloc = { path = "alloc" }
-racer-platform = { path = "platform" }
+uring-runtime = { path = "runtime" }
 base64 = "0.22"
 futures = "0.3"
 getrandom = "0.2"
@@ -63,12 +63,12 @@ wire-codec = { path = "wire-codec", features = ["simulation"] }
 rdma-verbs = { path = "verbs", features = ["simulation"] }
 http1 = { path = "http", features = ["test-util"] }
 page-alloc = { path = "alloc", features = ["simulation"] }
-racer-platform = { path = "platform", features = ["simulation", "test-util"] }
+uring-runtime = { path = "runtime", features = ["simulation", "test-util"] }
 
 # Keep source locations and inline frames for Parca.
 #
 # The hot path crosses crate boundaries on every operation (racer-dataplane ->
-# racer-platform -> flow-control -> page-alloc -> http1), so cross-crate inlining
+# uring-runtime -> flow-control -> page-alloc -> http1), so cross-crate inlining
 # is load bearing. `panic = "abort"` is deliberately absent: `catch_unwind` is
 # relied upon by the worker group and the reactor completion loop.
 [profile.release]

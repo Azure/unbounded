@@ -10,10 +10,6 @@ use crate::{
     AlignedBuffer, Alignment, Charge, Error, Extent, Result, SegmentGeometry, SegmentLease,
     Segments,
 };
-use racer_platform::{
-    Budget, Operation, Scope,
-    reactor::{Reactor, SharedWriteBuffer, descriptor::Descriptor},
-};
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
@@ -29,6 +25,10 @@ use std::{
     rc::Rc,
     sync::Arc,
     task::{Context, Poll, Waker},
+};
+use uring_runtime::{
+    Budget, Operation, Scope,
+    reactor::{Reactor, SharedWriteBuffer, descriptor::Descriptor},
 };
 
 /// One logical segment's range on a caller-opened device.
@@ -395,39 +395,33 @@ impl<C: Charge> Slab<C> {
             return Err(Error::InvalidConfiguration);
         }
         #[cfg(feature = "simulation")]
-        if let Some(sim) = racer_platform::simulation::Simulation::current() {
+        if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                 sim.create_dir_all(parent)
                     .map_err(|e| system_error("mkdir", e))?;
             }
-            // The simulated open creates files as 0o666 before the umask; mask
-            // to the private 0o600 the host path requests.
-            let umask = sim.world().set_umask(0o177);
-            let file = sim.open(
-                None,
-                path,
-                libc::O_CREAT | libc::O_RDWR | libc::O_DIRECT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            );
-            sim.world().set_umask(umask);
-            let file = file.map_err(|e| direct_error("open", e))?;
+            let file = sim
+                .open(
+                    None,
+                    path,
+                    libc::O_CREAT
+                        | libc::O_RDWR
+                        | libc::O_DIRECT
+                        | libc::O_CLOEXEC
+                        | libc::O_NOFOLLOW,
+                )
+                .map_err(|e| direct_error("open", e))?;
             let handle = file.as_sim().expect("simulation descriptor");
-            handle.lock().map_err(|e| lock_error(e.into()))?;
-            let stat = handle.stat().map_err(|e| system_error("statx", e.into()))?;
-            // The simulated world owns files as the effective uid, like the host.
-            // SAFETY: geteuid has no arguments or borrowed memory.
-            let owner = unsafe { libc::geteuid() };
-            validate_file(
-                stat.stx_mode as u32,
-                stat.stx_uid,
-                owner,
-                stat.stx_nlink as u64,
-            )?;
+            handle.lock().map_err(lock_error)?;
+            let stat = handle.stat().map_err(|e| system_error("statx", e))?;
+            // The virtual filesystem has a fixed root owner, independent of host uid.
+            validate_file(stat.stx_mode as u32, stat.stx_uid, 0, stat.stx_nlink as u64)?;
             let a = alignment_from_stat(&stat)?;
             let geometry = self.validate_layout(a, stat.stx_size)?;
             if stat.stx_size == 0 {
                 handle
                     .set_len(self.capacity_bytes)
-                    .map_err(|e| system_error("ftruncate", e.into()))?;
+                    .map_err(|e| system_error("ftruncate", e))?;
             }
             self.publish(file, geometry);
             return Ok(a);
@@ -1562,31 +1556,26 @@ mod tests {
     #[cfg(feature = "simulation")]
     #[test]
     fn device_io_faults_release_completion_resources() {
-        use racer_platform::simulation::{Fault, Simulation};
+        use uring_runtime::reactor::simulation::{Fault, Simulation};
 
         #[derive(Clone, Copy, Debug, PartialEq)]
         enum TestError {
             Alloc(Error),
-            Runtime(racer_platform::Error),
+            Runtime(uring_runtime::Error),
         }
         impl From<Error> for TestError {
             fn from(error: Error) -> Self {
                 Self::Alloc(error)
             }
         }
-        impl From<racer_platform::Error> for TestError {
-            fn from(error: racer_platform::Error) -> Self {
+        impl From<uring_runtime::Error> for TestError {
+            fn from(error: uring_runtime::Error) -> Self {
                 Self::Runtime(error)
-            }
-        }
-        impl From<racer_platform::uring::Error> for TestError {
-            fn from(error: racer_platform::uring::Error) -> Self {
-                Self::Runtime(error.into())
             }
         }
         #[derive(Clone)]
         struct TestScope;
-        impl racer_platform::scope::LibraryScope for TestScope {
+        impl Scope for TestScope {
             type Error = TestError;
             fn check(&self) -> std::result::Result<(), TestError> {
                 Ok(())
@@ -1626,7 +1615,7 @@ mod tests {
                 (Fault::Short(512), TestError::Alloc(Error::Io)),
                 (
                     Fault::Errno(libc::EIO),
-                    TestError::Runtime(racer_platform::Error::Os(libc::EIO)),
+                    TestError::Runtime(uring_runtime::Error::Os(libc::EIO)),
                 ),
             ] {
                 sim.inject(if write { "write" } else { "read" }, fault)

@@ -2,7 +2,7 @@
 
 use crate::*;
 use http1::connection::{ConnectionLease, HttpIo};
-use racer_platform::scope::LibraryScope as _;
+use uring_runtime::Scope;
 
 const SESSION_TARGET: &str = "/racer/peer/v1/session";
 const SESSION_DOMAIN: &[u8] = b"racer-peer-v1/connection\0";
@@ -80,7 +80,7 @@ impl Session {
                 direction,
                 tx: 0,
                 rx: 0,
-                expires: racer_platform::environment::now() + Duration::from_secs(3600),
+                expires: uring_runtime::environment::now() + Duration::from_secs(3600),
             },
         }
     }
@@ -91,7 +91,7 @@ impl Session {
     }
 
     fn check(&self) -> Result<()> {
-        if racer_platform::environment::now() >= self.state.expires {
+        if uring_runtime::environment::now() >= self.state.expires {
             return Err(Error::DeadlineExceeded);
         }
         Ok(())
@@ -323,7 +323,7 @@ fn signature(head: &MessageHead) -> Result<Vec<u8>> {
 
 fn random() -> Result<[u8; 32]> {
     let mut bytes = [0; 32];
-    racer_platform::environment::fill_random(&mut bytes).map_err(|_| Error::Unavailable)?;
+    uring_runtime::environment::fill_random(&mut bytes).map_err(|_| Error::Unavailable)?;
     Ok(bytes)
 }
 
@@ -629,7 +629,7 @@ mod tests {
         let mut reconnected = Session::new(n[1].clone(), n[0].node().clone(), random().unwrap(), 1);
         assert!(reconnected.admit(copy(&old)).is_err());
         assert_eq!(reconnected.state.rx, 0);
-        b.state.expires = racer_platform::environment::now();
+        b.state.expires = uring_runtime::environment::now();
         assert!(matches!(b.admit(old), Err(Error::DeadlineExceeded)));
         a.state.tx = u64::MAX;
         assert!(matches!(a.sign(frame()), Err(Error::Replay)));

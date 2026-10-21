@@ -1124,7 +1124,7 @@ impl<P: Policy> Drop for ChargedBuffer<P> {
 }
 
 // SAFETY: private fixed backing and charge remain exclusively owned.
-unsafe impl<P: Policy> racer_platform::reactor::IoBuffer for ChargedBuffer<P> {
+unsafe impl<P: Policy> uring_runtime::reactor::IoBuffer for ChargedBuffer<P> {
     /// Buffer access uses the crate's application-independent error type.
     type Error = Error;
 

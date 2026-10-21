@@ -182,7 +182,7 @@ impl WarmRegistry {
         key: &LeaseKey,
         until: SystemTime,
     ) -> Result<()> {
-        let now = racer_platform::environment::wall_now();
+        let now = uring_runtime::environment::wall_now();
         let cap = self.config().max_jobs.saturating_mul(LEASES_PER_JOB);
         let mut emptied = Vec::new();
         let outcome = {
@@ -237,7 +237,7 @@ impl WarmRegistry {
     }
 
     pub(crate) fn has_lease(&self, version: &ObjectVersion, key: &LeaseKey) -> bool {
-        let now = racer_platform::environment::wall_now();
+        let now = uring_runtime::environment::wall_now();
         self.leases
             .lock()
             .unwrap()
@@ -255,7 +255,7 @@ impl WarmRegistry {
         key: &LeaseKey,
         workers: &[crate::model::WorkerId],
     ) -> bool {
-        let now = racer_platform::environment::wall_now();
+        let now = uring_runtime::environment::wall_now();
         let last = {
             let mut leases = self.leases.lock().unwrap();
             let generation = leases.next;
@@ -490,7 +490,7 @@ impl WarmRegistry {
             let progress = job.progress.lock().unwrap();
             let expired = progress
                 .until
-                .is_some_and(|until| until <= racer_platform::environment::wall_now());
+                .is_some_and(|until| until <= uring_runtime::environment::wall_now());
             progress.running || progress.admissions != 0 || (!expired && !progress.stopped)
         });
         if let Some(job) = jobs.get(version) {
@@ -523,7 +523,7 @@ impl WarmRegistry {
             return Err(Error::Overloaded);
         }
         let mut request = [0; 16];
-        racer_platform::environment::fill_random(&mut request).map_err(|_| Error::Unavailable)?;
+        uring_runtime::environment::fill_random(&mut request).map_err(|_| Error::Unavailable)?;
         let job = Arc::new(Job {
             previous_until,
             lease: lease.unwrap_or(request),
@@ -531,7 +531,7 @@ impl WarmRegistry {
             version: version.clone(),
             scope: RequestScope::new(
                 RequestId(request),
-                racer_platform::environment::now() + config.fill_timeout,
+                uring_runtime::environment::now() + config.fill_timeout,
             )?,
             admission: futures::lock::Mutex::new(()),
             progress: Mutex::new(Progress {
@@ -568,8 +568,8 @@ impl WarmRegistry {
     }
 
     pub(crate) fn poll_deadlines(&self) {
-        let now = racer_platform::environment::now();
-        let wall = racer_platform::environment::wall_now();
+        let now = uring_runtime::environment::now();
+        let wall = uring_runtime::environment::wall_now();
         let mut jobs = self.jobs.lock().unwrap();
         let mut cancel = Vec::new();
         let mut wake = Vec::new();
@@ -725,7 +725,7 @@ impl Waiter {
             || (!progress.running
                 && progress
                     .until
-                    .is_some_and(|until| until <= racer_platform::environment::wall_now()))
+                    .is_some_and(|until| until <= uring_runtime::environment::wall_now()))
         {
             return Poll::Ready(Ok(false));
         }
@@ -835,10 +835,10 @@ pub(crate) async fn admit(
     if ttl.is_zero() {
         return Err(Error::InvalidRequest);
     }
-    let until = racer_platform::environment::wall_now()
+    let until = uring_runtime::environment::wall_now()
         .checked_add(ttl.min(config.max_ttl))
         .ok_or(Error::InvalidRequest)?;
-    let permit = racer_platform::drivers::reserve()?;
+    let permit = uring_runtime::drivers::reserve()?;
     let (job, fresh) = directory
         .subscriptions
         .admit_warm(&metadata.version, &directory.warm)?;
@@ -890,7 +890,7 @@ pub(crate) async fn admit(
         } else {
             RequestScope::new(
                 job.scope.request,
-                racer_platform::environment::now() + config.fill_timeout,
+                uring_runtime::environment::now() + config.fill_timeout,
             )?
         };
         let existing = job.plan.lock().unwrap().clone();
@@ -1031,7 +1031,7 @@ async fn run(
                 .lock()
                 .unwrap()
                 .until
-                .is_none_or(|until| until <= racer_platform::environment::wall_now())
+                .is_none_or(|until| until <= uring_runtime::environment::wall_now())
             {
                 let _lock = job.admission.lock().await;
                 if job
@@ -1039,7 +1039,7 @@ async fn run(
                     .lock()
                     .unwrap()
                     .until
-                    .is_none_or(|until| until <= racer_platform::environment::wall_now())
+                    .is_none_or(|until| until <= uring_runtime::environment::wall_now())
                 {
                     failure = Some(Error::DeadlineExceeded);
                     break;
@@ -1164,7 +1164,7 @@ async fn plan(
             }
         }
         if number % 1024 == 1023 {
-            racer_platform::drivers::yield_now().await;
+            uring_runtime::drivers::yield_now().await;
         }
     }
     plan.remote = remote.into_iter().collect();
@@ -1265,7 +1265,7 @@ async fn release_all(
     }
     let Ok(scope) = RequestScope::new(
         job.scope.request,
-        racer_platform::environment::now() + RELEASE_TIMEOUT.min(config.fill_timeout),
+        uring_runtime::environment::now() + RELEASE_TIMEOUT.min(config.fill_timeout),
     ) else {
         return;
     };
@@ -1467,7 +1467,7 @@ pub(crate) async fn serve(
     let key = (requester, lease);
     match action {
         WarmAction::Hold { pages, until } => {
-            let now = racer_platform::environment::wall_now();
+            let now = uring_runtime::environment::wall_now();
             let until = until.min(
                 now.checked_add(directory.warm.config().max_ttl)
                     .ok_or(Error::InvalidRequest)?,
@@ -1500,7 +1500,7 @@ pub(crate) async fn serve(
                         .insert(PageNumber(number));
                 }
                 if number % 1024 == 1023 {
-                    racer_platform::drivers::yield_now().await;
+                    uring_runtime::drivers::yield_now().await;
                 }
             }
             if held.is_empty() {
@@ -1615,7 +1615,7 @@ mod tests {
 
     #[test]
     fn admission_and_job_metrics_survive_caller_drop_and_count_coalescing_once() {
-        let queue = std::rc::Rc::new(racer_platform::drivers::DriverQueue::new(64));
+        let queue = std::rc::Rc::new(uring_runtime::drivers::DriverQueue::new(64));
         let _queue = queue.enter();
         let (local, _fixture) = crate::read::tests::admission_coordinator();
         let directory = Arc::new(
@@ -1773,7 +1773,7 @@ mod tests {
 
     #[test]
     fn completed_jobs_renew_one_lease_across_many_heads() {
-        let queue = std::rc::Rc::new(racer_platform::drivers::DriverQueue::new(64));
+        let queue = std::rc::Rc::new(uring_runtime::drivers::DriverQueue::new(64));
         let _queue = queue.enter();
         let (local, _fixture) = crate::read::tests::admission_coordinator();
         let directory = Arc::new(
@@ -2022,7 +2022,7 @@ mod tests {
     fn scope() -> RequestScope {
         RequestScope::new(
             RequestId([7; 16]),
-            racer_platform::environment::now() + Duration::from_secs(30),
+            uring_runtime::environment::now() + Duration::from_secs(30),
         )
         .unwrap()
     }
@@ -2074,7 +2074,7 @@ mod tests {
     fn repeated_grant_for_same_lease_coalesces_without_shortening() {
         let registry = WarmRegistry::new(4);
         let v = version("a");
-        let now = racer_platform::environment::wall_now();
+        let now = uring_runtime::environment::wall_now();
         let a = (NodeId("a".into()), [1; 16]);
         let far = now + Duration::from_secs(120);
         registry.grant_lease(&v, &a, far).unwrap();
@@ -2098,7 +2098,7 @@ mod tests {
                 ..Config::default()
             })
             .unwrap();
-        let until = racer_platform::environment::wall_now() + Duration::from_secs(60);
+        let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
         let v = version("a");
         let key = |i: u8| (NodeId(format!("n{i}")), [i; 16]);
         for i in 0..MAX_LEASES_PER_VERSION as u8 {
@@ -2131,7 +2131,7 @@ mod tests {
                 ..Config::default()
             })
             .unwrap();
-        let now = racer_platform::environment::wall_now();
+        let now = uring_runtime::environment::wall_now();
         let key = |i: u8| (NodeId(format!("n{i}")), [i; 16]);
         // Fill the node-wide cap with already expired leases on other versions.
         for i in 0..LEASES_PER_JOB as u8 {
@@ -2158,7 +2158,7 @@ mod tests {
         let registry = WarmRegistry::new(4);
         let worker = crate::model::WorkerId(0);
         let v = version("a");
-        let until = racer_platform::environment::wall_now() + Duration::from_secs(60);
+        let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
         let a = (NodeId("a".into()), [1; 16]);
         let b = (NodeId("b".into()), [2; 16]);
         registry.grant_lease(&v, &a, until).unwrap();
@@ -2184,7 +2184,7 @@ mod tests {
         let registry = WarmRegistry::new(4);
         let worker = crate::model::WorkerId(0);
         let v = version("a");
-        let until = racer_platform::environment::wall_now() + Duration::from_secs(60);
+        let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
         let a = (NodeId("a".into()), [1; 16]);
         // Hold grants the lease, then awaits its reservation.
         registry.grant_lease(&v, &a, until).unwrap();
@@ -2208,7 +2208,7 @@ mod tests {
     /// short one in place. Returns the version and registered worker.
     #[test]
     fn retry_with_shorter_ttl_keeps_lease_through_advertised_deadline() {
-        let queue = std::rc::Rc::new(racer_platform::drivers::DriverQueue::new(64));
+        let queue = std::rc::Rc::new(uring_runtime::drivers::DriverQueue::new(64));
         let _queue = queue.enter();
         let (local, _fixture) = crate::read::tests::admission_coordinator();
         let directory = Arc::new(
@@ -2244,7 +2244,7 @@ mod tests {
         let max = directory.warm.config().max_ttl;
         // A hold that outlived its lease, such as completed pages kept after a
         // failed warm, already promises a long deadline.
-        let long = racer_platform::environment::wall_now() + max;
+        let long = uring_runtime::environment::wall_now() + max;
         let caller = scope();
         let mut seed = Box::pin({
             let directory = directory.clone();
@@ -2272,7 +2272,7 @@ mod tests {
         // Retry with a shorter TTL: the hold keeps its longer deadline.
         let ttl = max / 4;
         let caller = scope();
-        let requested = racer_platform::environment::wall_now() + ttl;
+        let requested = uring_runtime::environment::wall_now() + ttl;
         let mut admission = Box::pin(admit(
             directory.clone(),
             metadata.clone(),
@@ -2328,7 +2328,7 @@ mod tests {
         let worker = crate::model::WorkerId(0);
         assert!(release_all(registry, worker).is_empty(), "registers worker");
         let v = version("a");
-        let now = racer_platform::environment::wall_now();
+        let now = uring_runtime::environment::wall_now();
         let long = (NodeId("long".into()), [1; 16]);
         let short = (NodeId("short".into()), [2; 16]);
         registry
@@ -2367,7 +2367,7 @@ mod tests {
         let registry = WarmRegistry::new(4);
         let (v, worker) = expire_last_lease(&registry);
         let other = (NodeId("other".into()), [3; 16]);
-        let until = racer_platform::environment::wall_now() + Duration::from_secs(60);
+        let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
         registry.grant_lease(&version("b"), &other, until).unwrap();
         assert_eq!(registry.lease_count(&v), 0);
         assert_eq!(release_all(&registry, worker), vec![v]);
@@ -2378,7 +2378,7 @@ mod tests {
         let registry = WarmRegistry::new(4);
         let (v, worker) = expire_last_lease(&registry);
         let fresh = (NodeId("fresh".into()), [4; 16]);
-        let until = racer_platform::environment::wall_now() + Duration::from_secs(60);
+        let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
         // The grant prunes the expired lease, queuing a release, then stamps a
         // newer generation that fences it off.
         registry.grant_lease(&v, &fresh, until).unwrap();
@@ -2397,7 +2397,7 @@ mod tests {
         let registry = WarmRegistry::new(4);
         let worker = crate::model::WorkerId(0);
         let v = version("a");
-        let until = racer_platform::environment::wall_now() + Duration::from_secs(60);
+        let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
         let a = (NodeId("a".into()), [1; 16]);
         let b = (NodeId("b".into()), [2; 16]);
         registry.grant_lease(&v, &a, until).unwrap();
@@ -2547,7 +2547,7 @@ mod tests {
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(waiting.as_mut().poll(&mut cx).is_pending());
         registry.stop();
-        assert!(job.scope.cancellation.is_canceled());
+        assert!(job.scope.cancellation.is_cancelled());
         assert!(waiting.as_mut().poll(&mut cx).is_pending());
         assert!(matches!(registry.begin(&version), Err(Error::Unavailable)));
         job.stop();
@@ -2586,7 +2586,7 @@ mod tests {
         drop(first);
         assert_eq!(registry.snapshot(), (1, 0));
         let expired =
-            RequestScope::new(RequestId([1; 16]), racer_platform::environment::now()).unwrap();
+            RequestScope::new(RequestId([1; 16]), uring_runtime::environment::now()).unwrap();
         assert_eq!(
             futures::executor::block_on(registry.wait(&page, &expired)),
             Err(Error::DeadlineExceeded)

@@ -26,21 +26,6 @@ use crate::security::CryptoClient;
 use crate::security::CryptoPort;
 use crate::security::IoCryptoPort;
 use racer_control_wire::RailMapping;
-use racer_platform::drivers::drive_local_with;
-use racer_platform::environment::Deadline;
-use racer_platform::group::Factory;
-use racer_platform::group::FailureReporter;
-use racer_platform::group::FatalPolicy;
-use racer_platform::group::Group;
-use racer_platform::group::GroupConfig;
-use racer_platform::group::GroupError;
-use racer_platform::group::Plan;
-use racer_platform::group::Service;
-use racer_platform::group::affinity::CpuLocation;
-use racer_platform::group::affinity::EffectiveTopology;
-use racer_platform::group::affinity::NicLocality;
-#[cfg(test)]
-use racer_platform::group::affinity::current_cpus;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -58,6 +43,20 @@ use std::thread;
 use std::time::Duration;
 #[cfg(test)]
 use std::time::Instant;
+use uring_runtime::drivers::drive_local_with;
+use uring_runtime::environment::Deadline;
+use uring_runtime::group::Factory;
+use uring_runtime::group::FailureReporter;
+use uring_runtime::group::Group;
+use uring_runtime::group::Helper;
+use uring_runtime::group::Lane;
+use uring_runtime::group::Plan;
+use uring_runtime::group::Service;
+use uring_runtime::group::affinity::CpuLocation;
+use uring_runtime::group::affinity::EffectiveTopology;
+use uring_runtime::group::affinity::NicLocality;
+#[cfg(test)]
+use uring_runtime::group::affinity::current_cpus;
 
 const WORK_BUDGET: usize = 64;
 const IDLE_WAIT: Duration = Duration::from_millis(1);
@@ -118,7 +117,7 @@ impl AffinityPlan {
                     && (rails.is_empty()
                         || rails.iter().any(|rail| rail.numa_node == nic.numa_node))
             });
-            let pairs = racer_platform::group::affinity::place_exact(
+            let pairs = uring_runtime::group::affinity::place_exact(
                 topology,
                 config.max_threads,
                 io,
@@ -160,7 +159,7 @@ impl AffinityPlan {
             nic.numa_node.is_some()
                 && (rails.is_empty() || rails.iter().any(|rail| rail.numa_node == nic.numa_node))
         });
-        let pairs = racer_platform::group::affinity::place(
+        let pairs = uring_runtime::group::affinity::place(
             topology,
             max_threads,
             usize::from(u16::MAX) + 1,
@@ -229,7 +228,7 @@ pub use crate::security::CryptoRuntime;
 /// ```compile_fail
 /// use std::rc::Rc;
 /// use racer_dataplane::{error::Result, runtime::RequestScope};
-/// use racer_platform::group::{Factory, Service};
+/// use uring_runtime::group::{Factory, Service};
 /// struct LocalFactory(Rc<()>);
 /// impl Factory<RequestScope> for LocalFactory {
 ///     fn build_lane(&self, _: usize) -> Result<Box<dyn Service<RequestScope>>> { todo!() }
@@ -237,8 +236,7 @@ pub use crate::security::CryptoRuntime;
 /// ```
 pub struct WorkerGroup {
     plan: AffinityPlan,
-    /// Built by `prepare` for each execution; `None` before the first one.
-    runtime: Option<Group<RequestScope>>,
+    runtime: Group<RequestScope>,
     generation: u64,
 }
 
@@ -287,17 +285,10 @@ trait FaultRecipe: Sync {
 impl WorkerGroup {
     pub fn new(plan: AffinityPlan) -> Self {
         Self {
-            runtime: None,
+            runtime: Group::new(runtime_plan(&plan)),
             plan,
             generation: 0,
         }
-    }
-    /// Lifecycle diagnostics for the current execution (zero before the first).
-    pub fn stats(&self) -> racer_platform::group::Stats {
-        self.runtime.as_ref().map(Group::stats).unwrap_or_default()
-    }
-    fn group(&mut self) -> Result<&mut Group<RequestScope>> {
-        self.runtime.as_mut().ok_or(Error::InvalidConfiguration)
     }
     /// Driver-controlled adapter over the same scoped execution used by `run`.
     /// The coordinator becomes the first I/O worker, not an extra helper thread.
@@ -308,12 +299,12 @@ impl WorkerGroup {
         scope: &RequestScope,
     ) -> Result<()> {
         self.prepare(false)?;
-        self.group()?.start(factory, scope).map_err(group_error)
+        self.runtime.start(factory, scope)
     }
     pub fn run(&mut self, factory: &dyn Factory<RequestScope>) -> Result<()> {
         let scope = lifecycle_scope()?;
         self.prepare(true)?;
-        self.group()?.run(factory, &scope).map_err(group_error)
+        self.runtime.run(factory, &scope)
     }
     pub fn run_with_scope(
         &mut self,
@@ -321,9 +312,7 @@ impl WorkerGroup {
         scope: &RequestScope,
     ) -> Result<()> {
         self.prepare(true)?;
-        self.group()?
-            .run_scoped(factory, scope)
-            .map_err(group_error)
+        self.runtime.run_with_scope(factory, scope)
     }
     #[cfg(test)]
     fn start_recipe(
@@ -343,28 +332,24 @@ impl WorkerGroup {
     ) -> Result<()> {
         self.prepare(false)?;
         let resources = self.allocate(&*factory, allocate)?;
-        self.group()?
+        self.runtime
             .start(Arc::new(Adapter { factory, resources }), scope)
-            .map_err(group_error)
     }
     /// Stop I/O admission first. Drive both roles during I/O drain, then close
     /// crypto submissions and reap all completions. Deadline expiry requests
     /// cancellation but does not release resources before completion fences.
     pub fn drain(&mut self, scope: &RequestScope) -> Result<()> {
-        self.group()?.drain(scope).map_err(group_error)
+        self.runtime.drain(scope)
     }
     /// After drain, shut down both services and fence kernel/NIC references.
     /// Never terminate crypto with an outstanding job or unconsumed completion.
     pub fn shutdown(&mut self, scope: &RequestScope) -> Result<()> {
-        self.group()?.shutdown(scope).map_err(group_error)
+        self.runtime.shutdown(scope)
     }
     /// Join every I/O and unique crypto OS thread, including partial startup.
     /// Cannot succeed while a service can still access its retained resources.
     pub fn join(&mut self) -> Result<()> {
-        match &mut self.runtime {
-            Some(group) => group.join().map_err(group_error),
-            None => Ok(()),
-        }
+        self.runtime.join()
     }
     /// Ordered start, budgeted drive, drain, shutdown, and join (also on failure).
     #[cfg(test)]
@@ -385,7 +370,7 @@ impl WorkerGroup {
     }
 
     fn prepare(&mut self, caller_is_worker: bool) -> Result<()> {
-        if self.stats().joinable || self.plan.pairs.is_empty() {
+        if self.runtime.stats().coordinators != 0 || self.plan.pairs.is_empty() {
             return Err(Error::InvalidConfiguration);
         }
         let mut workers = HashSet::new();
@@ -408,9 +393,8 @@ impl WorkerGroup {
                 return Err(Error::InvalidConfiguration);
             }
         }
-        let plan = runtime_plan(&self.plan)?;
-        validate_plan(&plan, caller_is_worker)?;
-        self.runtime = Some(Group::new(plan, group_config())?);
+        self.runtime = Group::new(runtime_plan(&self.plan));
+        self.runtime.validate(caller_is_worker)?;
         self.generation = self
             .generation
             .checked_add(1)
@@ -458,13 +442,11 @@ impl WorkerGroup {
         self.prepare(true)?;
         let resources = self.allocate(factory, allocate)?;
         let adapter = Adapter { factory, resources };
-        let group = self.group()?;
         if check_scope {
-            group.run_scoped(&adapter, scope)
+            self.runtime.run_with_scope(&adapter, scope)
         } else {
-            group.run(&adapter, scope)
+            self.runtime.run(&adapter, scope)
         }
-        .map_err(group_error)
     }
 }
 
@@ -476,7 +458,7 @@ impl Drop for WorkerGroup {
 
 fn driver_waker(runtime: Option<&WorkerRuntime>) -> Result<Waker> {
     let reactor = runtime.map(|runtime| runtime.reactor.waker()).transpose()?;
-    Ok(racer_platform::drivers::thread_waker(reactor))
+    Ok(uring_runtime::drivers::thread_waker(reactor))
 }
 
 /// Independently drive resource completions while a service future borrows its
@@ -509,7 +491,7 @@ fn lifecycle_scope() -> Result<RequestScope> {
     Ok(RequestScope {
         body_deadlines: None,
         request: RequestId([0; 16]),
-        deadline: Deadline(racer_platform::environment::now() + Duration::from_secs(30)),
+        deadline: Deadline(uring_runtime::environment::now() + Duration::from_secs(30)),
         cancellation: Cancellation::new()?,
     })
 }
@@ -562,53 +544,30 @@ fn fence_runtime<'a>(
     })
 }
 
-fn runtime_plan(plan: &AffinityPlan) -> Result<Plan> {
-    let mut builder = Plan::builder().max_threads(plan.max_threads);
-    for pair in &plan.pairs {
-        builder = builder.lane(format!("racer-io-{}", pair.worker.0), pair.io.cpu);
+fn runtime_plan(plan: &AffinityPlan) -> Plan {
+    Plan {
+        lanes: plan
+            .pairs
+            .iter()
+            .map(|pair| Lane {
+                name: format!("racer-io-{}", pair.worker.0),
+                cpu: pair.io.cpu,
+            })
+            .collect(),
+        helpers: plan
+            .crypto_groups()
+            .into_iter()
+            .map(|lanes| {
+                let cpu = plan.pairs[lanes[0]].crypto.cpu;
+                Helper {
+                    name: format!("racer-crypto-{cpu}"),
+                    cpu,
+                    lanes,
+                }
+            })
+            .collect(),
+        max_threads: plan.max_threads,
     }
-    for lanes in plan.crypto_groups() {
-        let cpu = plan.pairs[lanes[0]].crypto.cpu;
-        builder = builder.helper(format!("racer-crypto-{cpu}"), cpu, lanes);
-    }
-    Ok(builder.build()?)
-}
-
-/// Keep the legacy classification: a caught panic (or an unconfirmed fence
-/// without an error) is reported as `Io`, not the library's `Unavailable`.
-fn group_error(error: GroupError<Error>) -> Error {
-    error.error().copied().unwrap_or(Error::Io)
-}
-
-/// Group tuning. A failed or abandoned ownership fence aborts the process, as
-/// the legacy runtime always did: a leaked service may still be referenced by
-/// in-flight kernel or NIC I/O, and Racer has no supervisor that could recover
-/// a worker whose buffers can never be proven unreferenced.
-fn group_config() -> GroupConfig {
-    GroupConfig::default()
-        .with_idle_wait(IDLE_WAIT)
-        .with_work_budget(WORK_BUDGET)
-        .with_fatal(FatalPolicy::Abort)
-}
-
-/// Nonmutating preflight before allocating resources: the library validates the
-/// same plan at startup, but only after Racer has already paired endpoints.
-/// Pass true for `run`, false for `start` (which needs a coordinator slot).
-fn validate_plan(plan: &Plan, caller_is_worker: bool) -> Result<()> {
-    let threads = plan.threads() + usize::from(!caller_is_worker);
-    if threads > plan.max_threads() {
-        return Err(Error::InvalidConfiguration);
-    }
-    let allowed = racer_platform::group::affinity::current_cpus()?;
-    let cpus = plan.lanes().iter().map(|lane| lane.cpu);
-    if cpus
-        .chain(plan.helpers().iter().map(|helper| helper.cpu))
-        .flatten()
-        .any(|cpu| !allowed.contains(cpu))
-    {
-        return Err(Error::InvalidConfiguration);
-    }
-    Ok(())
 }
 /// One-shot paired endpoints retained until their owning services are constructed.
 pub struct Resources {
@@ -784,11 +743,11 @@ impl Service<RequestScope> for IoService {
             }
         }
     }
-    fn poll(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
+    fn poll_budgeted(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
         self.runtime.crypto.register_driver(cx.waker());
         poll_runtime(&self.runtime).inspect_err(|error| log_fatal("io-runtime-poll", *error))?;
         if let Ok(service) = &mut self.built {
-            service.poll(cx, budget)?;
+            service.poll_budgeted(cx, budget)?;
         }
         // Even a zero wait submits SQEs queued during the service turn.
         self.runtime
@@ -852,29 +811,14 @@ impl Service<RequestScope> for IoService {
     }
 }
 
-/// Build a CPU location for test topologies (the library type is non-exhaustive).
-#[cfg(test)]
-pub(crate) fn cpu_location(
-    cpu: usize,
-    package: Option<usize>,
-    core: Option<usize>,
-    numa_node: Option<usize>,
-) -> CpuLocation {
-    let mut location = CpuLocation::new(cpu);
-    location.package = package;
-    location.core = core;
-    location.numa_node = numa_node;
-    location
-}
-
 #[cfg(test)]
 fn colocated_plan(max_threads: usize, workers: u16) -> AffinityPlan {
-    let location = crate::worker::cpu_location(
-        current_cpus().unwrap().first().unwrap(),
-        Some(0),
-        Some(0),
-        None,
-    );
+    let location = uring_runtime::group::affinity::CpuLocation {
+        cpu: *current_cpus().unwrap().first().unwrap(),
+        package: 0,
+        core: 0,
+        numa_node: None,
+    };
     AffinityPlan {
         pairs: (0..workers)
             .map(|id| WorkerPair {
@@ -998,7 +942,7 @@ mod tests {
             fn start<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
                 Box::pin(async { Ok(()) })
             }
-            fn poll(&mut self, _: &mut Context<'_>, _: usize) -> Result<()> {
+            fn poll_budgeted(&mut self, _: &mut Context<'_>, _: usize) -> Result<()> {
                 self.polled.set(true);
                 Ok(())
             }
@@ -1037,7 +981,7 @@ mod tests {
         assert_eq!(service.wait_timeout(IDLE_WAIT), IDLE_WAIT);
         assert_eq!(observed.get(), 1);
         service
-            .poll(&mut Context::from_waker(Waker::noop()), 1)
+            .poll_budgeted(&mut Context::from_waker(Waker::noop()), 1)
             .unwrap();
         assert!(polled.get());
         assert_eq!(observed.get(), 2, "the reactor wait queries after polling");
@@ -1048,7 +992,7 @@ mod tests {
 
     #[test]
     fn direct_factory_resources_validate_sets_consume_once_and_fence() {
-        use racer_platform::group::Factory;
+        use uring_runtime::group::Factory;
         let limits = crate::test_support::cluster::config(false).limits;
         for workers in [vec![], vec![WorkerId(7), WorkerId(7)]] {
             assert!(matches!(
@@ -1102,7 +1046,7 @@ mod tests {
             fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
                 Box::pin(async move { scope.check() })
             }
-            fn poll(&mut self, _: &mut Context<'_>, _: usize) -> Result<()> {
+            fn poll_budgeted(&mut self, _: &mut Context<'_>, _: usize) -> Result<()> {
                 Ok(())
             }
             fn drain<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
@@ -1134,10 +1078,10 @@ mod tests {
 
         use crate::worker::*;
         #[cfg(test)]
-        use racer_platform::group::affinity::CpuQuota;
-        use racer_platform::group::affinity::current_cpus;
-        use racer_platform::group::affinity::pin_cpu;
-        use racer_platform::group::affinity::set_cpus;
+        use uring_runtime::group::affinity::CpuQuota;
+        use uring_runtime::group::affinity::current_cpus;
+        use uring_runtime::group::affinity::pin_cpu;
+        use uring_runtime::group::affinity::set_cpus;
 
         #[cfg(test)]
         mod tests {
@@ -1149,13 +1093,16 @@ mod tests {
             fn topology(cores: usize, quota: Option<(u64, u64)>) -> EffectiveTopology {
                 EffectiveTopology {
                     cpus: (0..cores)
-                        .map(|cpu| crate::worker::cpu_location(cpu, Some(0), Some(cpu), Some(0)))
+                        .map(|cpu| CpuLocation {
+                            cpu,
+                            package: 0,
+                            core: cpu,
+                            numa_node: Some(0),
+                        })
                         .collect(),
-                    quota: quota.map(|(quota, period)| {
-                        CpuQuota::new(
-                            NonZeroU64::new(quota).unwrap(),
-                            NonZeroU64::new(period).unwrap(),
-                        )
+                    quota: quota.map(|(quota, period)| CpuQuota {
+                        quota: NonZeroU64::new(quota).unwrap(),
+                        period: NonZeroU64::new(period).unwrap(),
                     }),
                     nics: vec![],
                 }
@@ -1179,10 +1126,10 @@ mod tests {
                         .map(|index| vec![index, index + 10])
                         .collect::<Vec<_>>()
                 );
-                let runtime = runtime_plan(&plan).unwrap();
-                assert_eq!(runtime.lanes().len(), 20);
-                assert_eq!(runtime.helpers().len(), 10);
-                assert_eq!(runtime.max_threads(), 30);
+                let runtime = runtime_plan(&plan);
+                assert_eq!(runtime.lanes.len(), 20);
+                assert_eq!(runtime.helpers.len(), 10);
+                assert_eq!(runtime.max_threads, 30);
             }
 
             #[test]
@@ -1214,9 +1161,9 @@ mod tests {
                         assert_eq!(pair.io.cpu, index);
                         assert_eq!(pair.crypto.cpu, 20 + index % helpers);
                     }
-                    let runtime = runtime_plan(&plan).unwrap();
+                    let runtime = runtime_plan(&plan);
                     let mut lanes = runtime
-                        .helpers()
+                        .helpers
                         .iter()
                         .flat_map(|h| h.lanes.iter().copied())
                         .collect::<Vec<_>>();
@@ -1227,7 +1174,7 @@ mod tests {
 
             #[test]
             fn exact_placement_rejects_insufficient_or_unknown_local_capacity() {
-                use racer_platform::group::affinity::place_exact;
+                use uring_runtime::group::affinity::place_exact;
                 assert!(place_exact(topology(72, None), 30, 20, 20, false).is_err());
                 assert!(place_exact(topology(39, None), 40, 20, 20, false).is_err());
                 assert!(place_exact(topology(72, Some((39, 1))), 40, 20, 20, false).is_err());
@@ -1248,10 +1195,10 @@ mod tests {
 
             #[test]
             fn exact_smt_requires_opt_in_and_keeps_io_on_distinct_cores() {
-                use racer_platform::group::affinity::place_exact;
+                use uring_runtime::group::affinity::place_exact;
                 let mut hardware = topology(8, None);
                 for cpu in &mut hardware.cpus {
-                    cpu.core = Some(cpu.cpu % 4);
+                    cpu.core = cpu.cpu % 4;
                 }
                 assert!(place_exact(hardware.clone(), 8, 4, 4, false).is_err());
                 let plan = place_exact(hardware, 8, 4, 4, true).unwrap();
@@ -1263,7 +1210,7 @@ mod tests {
 
             #[test]
             fn exact_nic_preference_selects_one_node_without_capacity_fallback() {
-                use racer_platform::group::affinity::place_exact;
+                use uring_runtime::group::affinity::place_exact;
                 let mut hardware = topology(16, None);
                 for cpu in &mut hardware.cpus {
                     cpu.numa_node = Some(cpu.cpu / 8);
@@ -1301,8 +1248,9 @@ mod tests {
                     }
                     for quota in [None, Some((1, 2)), Some((3, 1)), Some((7, 1))] {
                         let mut hardware = hardware.clone();
-                        hardware.quota = quota.map(|(q, p)| {
-                            CpuQuota::new(NonZeroU64::new(q).unwrap(), NonZeroU64::new(p).unwrap())
+                        hardware.quota = quota.map(|(q, p)| CpuQuota {
+                            quota: NonZeroU64::new(q).unwrap(),
+                            period: NonZeroU64::new(p).unwrap(),
                         });
                         let capacity = quota
                             .map_or(offset, |(q, p)| (q / p).max(1) as usize)
@@ -1424,13 +1372,13 @@ mod tests {
                 }
                 let mut smt = topology(8, None);
                 for cpu in &mut smt.cpus {
-                    cpu.core = cpu.core.map(|core| core / 2);
+                    cpu.core /= 2;
                 }
                 assert_eq!(pair_count(8, &smt), Ok(3));
                 // Core zero on different packages is not an SMT sibling.
                 for cpu in &mut smt.cpus {
-                    cpu.package = Some(cpu.cpu);
-                    cpu.core = Some(0);
+                    cpu.package = cpu.cpu;
+                    cpu.core = 0;
                 }
                 assert_eq!(pair_count(8, &smt), Ok(5));
             }
@@ -1439,7 +1387,7 @@ mod tests {
             fn smt_places_four_unique_pairs_and_preserves_default_physical_policy() {
                 let mut hardware = topology(8, None);
                 for cpu in &mut hardware.cpus {
-                    cpu.core = cpu.core.map(|core| core % 4);
+                    cpu.core %= 4;
                 }
                 let physical = AffinityPlan::place(
                     8,
@@ -1486,7 +1434,7 @@ mod tests {
                 ] {
                     let mut hardware = topology(logical, quota);
                     for cpu in &mut hardware.cpus {
-                        cpu.core = cpu.core.map(|core| core / 2);
+                        cpu.core /= 2;
                     }
                     let plan = AffinityPlan::place_with_policy(cap, hardware, &[], true).unwrap();
                     assert_eq!(plan.pairs.len(), expected);
@@ -1525,8 +1473,11 @@ mod tests {
                     (26, 0, 2),
                     (30, 1, 2),
                 ]
-                .map(|(cpu, package, core)| {
-                    crate::worker::cpu_location(cpu, Some(package), Some(core), Some(package))
+                .map(|(cpu, package, core)| CpuLocation {
+                    cpu,
+                    package,
+                    core,
+                    numa_node: Some(package),
                 });
                 for reverse in [false, true] {
                     let mut allowed = cpus.to_vec();
@@ -1610,8 +1561,10 @@ mod tests {
                             .all(|pair| pair.io.numa_node == pair.crypto.numa_node)
                     );
                     for node in [Some(0), Some(1)] {
-                        let local_cores =
-                            cores.iter().filter(|(package, _)| *package == node).count();
+                        let local_cores = cores
+                            .iter()
+                            .filter(|(package, _)| Some(*package) == node)
+                            .count();
                         let local_reactors = plan
                             .pairs
                             .iter()
@@ -1619,7 +1572,7 @@ mod tests {
                             .count();
                         let distinct = reactor_cores
                             .iter()
-                            .filter(|(package, _)| *package == node)
+                            .filter(|(package, _)| Some(*package) == node)
                             .count();
                         assert_eq!(distinct, local_reactors.min(local_cores));
                     }
@@ -1660,7 +1613,7 @@ mod tests {
             fn actual_affinity_is_applied_on_the_calling_thread() {
                 std::thread::spawn(|| {
                     let allowed = current_cpus().unwrap();
-                    let cpu = allowed.first().unwrap();
+                    let cpu = *allowed.first().unwrap();
                     pin_cpu(cpu).unwrap();
                     let discovered = EffectiveTopology::discover().unwrap();
                     let plan = AffinityPlan::place_with_policy(8, discovered, &[], true).unwrap();
@@ -1760,9 +1713,7 @@ mod tests {
             ) -> Result<Box<dyn Service<RequestScope>>> {
                 assert_eq!(
                     current_cpus().unwrap(),
-                    [self.cpu]
-                        .into_iter()
-                        .collect::<racer_platform::group::affinity::CpuSet>()
+                    std::collections::BTreeSet::from([self.cpu])
                 );
                 self.observed.event(worker, "io-build");
                 if worker.0 == 1 && self.failure == Failure::BuildIo {
@@ -1790,9 +1741,7 @@ mod tests {
                 };
                 assert_eq!(
                     current_cpus().unwrap(),
-                    [cpu]
-                        .into_iter()
-                        .collect::<racer_platform::group::affinity::CpuSet>()
+                    std::collections::BTreeSet::from([cpu])
                 );
                 self.observed.event(worker, "crypto-build");
                 if worker.0 == 1 && self.failure == Failure::BuildCrypto {
@@ -1925,7 +1874,7 @@ mod tests {
                     }
                 })
             }
-            fn poll(&mut self, _: &mut Context<'_>, _: usize) -> Result<()> {
+            fn poll_budgeted(&mut self, _: &mut Context<'_>, _: usize) -> Result<()> {
                 Ok(())
             }
             fn stop_admission(&mut self) -> Result<()> {
@@ -1987,7 +1936,7 @@ mod tests {
                     self.engine.as_mut().unwrap().start(scope).await
                 })
             }
-            fn poll(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
+            fn poll_budgeted(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
                 assert_eq!(*self.local, thread::current().id());
                 assert_eq!(budget, 1, "one page per shard per pass");
                 let mut polls = self.observed.polls.lock().unwrap();
@@ -1999,7 +1948,7 @@ mod tests {
                 if self.observed.release.load(Ordering::SeqCst)
                     || self.observed.io_draining.load(Ordering::SeqCst) > 0
                 {
-                    self.engine.as_mut().unwrap().poll(cx, budget)?;
+                    self.engine.as_mut().unwrap().poll_budgeted(cx, budget)?;
                 }
                 if self.worker.0 == 1 && self.failure == Failure::PollCrypto {
                     Err(Error::Io)
@@ -2078,18 +2027,19 @@ mod tests {
             let mut group = WorkerGroup::new(plan);
             let scope = scope();
             group.start_recipe(Arc::new(factory), &scope).unwrap();
-            assert!(
-                group.stats().joinable,
+            assert_eq!(
+                group.runtime.stats().coordinators,
+                1,
                 "one coordinator owns the scoped workers"
             );
-            assert_eq!(group.stats().total, 3);
-            assert_eq!(group.stats().ready, 3);
+            assert_eq!(group.runtime.stats().total, 3);
+            assert_eq!(group.runtime.stats().ready, 3);
             assert_eq!(observed.submitted.load(Ordering::SeqCst), 8);
             group.drain(&scope).unwrap();
-            assert_eq!(group.stats().drained, 3);
+            assert_eq!(group.runtime.stats().drained, 3);
             group.shutdown(&scope).unwrap();
             group.join().unwrap();
-            assert_eq!(group.stats().done, 3);
+            assert_eq!(group.runtime.stats().done, 3);
             let events = observed.events.lock().unwrap();
             let thread_for = |worker, name| {
                 events
@@ -2137,7 +2087,7 @@ mod tests {
                 Err(Error::DeadlineExceeded)
             );
             assert_eq!(current_cpus().unwrap(), before);
-            assert_eq!(group.stats().done, 3);
+            assert_eq!(group.runtime.stats().done, 3);
             assert_eq!(factory.observed.submitted.load(Ordering::SeqCst), 8);
             let (plan, factory) = fixture(3, Failure::None, false);
             assert_eq!(
@@ -2174,7 +2124,7 @@ mod tests {
                         group.start_recipe(Arc::new(factory), &scope)
                     };
                     assert_eq!(result, Err(expected));
-                    assert_eq!(group.stats().done, 3);
+                    assert_eq!(group.runtime.stats().done, 3);
                     let events = observed.events.lock().unwrap();
                     for id in 0..if failure == Failure::BuildCrypto {
                         1
@@ -2218,7 +2168,7 @@ mod tests {
                 let _ = group.drain(&scope);
                 let _ = group.shutdown(&scope);
                 assert_eq!(group.join(), Err(Error::Io));
-                assert_eq!(group.stats().done, 3);
+                assert_eq!(group.runtime.stats().done, 3);
                 assert_eq!(observed.shutdown.load(Ordering::SeqCst), 2);
             }
         }
@@ -2250,7 +2200,7 @@ mod tests {
             let drained = group.drain(&scope);
             assert!(drained == Err(Error::Cancelled) || drained == Ok(()));
             group.join().unwrap();
-            assert_eq!(group.stats().done, 3);
+            assert_eq!(group.runtime.stats().done, 3);
         }
 
         #[test]
@@ -2267,13 +2217,13 @@ mod tests {
                 Err(Error::DeadlineExceeded)
             );
             assert_eq!(observed.completed.load(Ordering::SeqCst), 1);
-            assert_eq!(group.stats().done, 3);
+            assert_eq!(group.runtime.stats().done, 3);
         }
 
         #[test]
         fn later_crypto_group_allocation_failure_rolls_back_live_first_group() {
             let allowed = current_cpus().unwrap();
-            let Some(second_cpu) = allowed.iter().nth(1) else {
+            let Some(&second_cpu) = allowed.iter().nth(1) else {
                 return;
             };
             for borrowed in [false, true] {
@@ -2300,8 +2250,8 @@ mod tests {
                     group.start_with_allocator(Arc::new(factory), &scope, allocate)
                 };
                 assert_eq!(result, Err(Error::Overloaded));
-                assert_eq!(group.stats().done, 0);
-                assert!(!group.stats().joinable);
+                assert_eq!(group.runtime.stats().done, 0);
+                assert_eq!(group.runtime.stats().coordinators, 0);
                 assert_eq!(current_cpus().unwrap(), allowed);
                 let events = observed.events.lock().unwrap();
                 assert!(events.is_empty());
@@ -2311,7 +2261,7 @@ mod tests {
         #[test]
         fn distinct_crypto_cpus_create_distinct_execution_threads() {
             let allowed = current_cpus().unwrap();
-            let Some(second_cpu) = allowed.iter().nth(1) else {
+            let Some(&second_cpu) = allowed.iter().nth(1) else {
                 return;
             };
             let (mut plan, mut factory) = fixture(5, Failure::None, false);
@@ -2321,8 +2271,8 @@ mod tests {
             let mut group = WorkerGroup::new(plan);
             let scope = scope();
             group.start_recipe(Arc::new(factory), &scope).unwrap();
-            assert!(group.stats().joinable);
-            assert_eq!(group.stats().ready, 4);
+            assert_eq!(group.runtime.stats().coordinators, 1);
+            assert_eq!(group.runtime.stats().ready, 4);
             group.drain(&scope).unwrap();
             group.shutdown(&scope).unwrap();
             group.join().unwrap();
@@ -2359,7 +2309,7 @@ mod tests {
                 );
             }
             assert_eq!(observed.shutdown.load(Ordering::SeqCst), 2);
-            assert_eq!(group.stats().done, 3);
+            assert_eq!(group.runtime.stats().done, 3);
             let events = observed.events.lock().unwrap();
             for worker in 0..2 {
                 let event = |name| {
@@ -2391,7 +2341,7 @@ mod tests {
         fn factory_and_crypto_runtime_have_cross_thread_bounds() {
             fn sync<T: Sync + ?Sized>() {}
             fn send<T: Send + 'static>() {}
-            sync::<dyn racer_platform::group::Factory<RequestScope>>();
+            sync::<dyn uring_runtime::group::Factory<RequestScope>>();
             send::<CryptoRuntime>();
         }
 
@@ -2426,9 +2376,7 @@ mod tests {
             ) -> Result<Box<dyn Service<RequestScope>>> {
                 assert_eq!(
                     current_cpus().unwrap(),
-                    [self.cpu]
-                        .into_iter()
-                        .collect::<racer_platform::group::affinity::CpuSet>()
+                    std::collections::BTreeSet::from([self.cpu])
                 );
                 self.event("io-build");
                 if self.fail_io {
@@ -2447,9 +2395,7 @@ mod tests {
             ) -> Result<Box<dyn Service<RequestScope>>> {
                 assert_eq!(
                     current_cpus().unwrap(),
-                    [self.cpu]
-                        .into_iter()
-                        .collect::<racer_platform::group::affinity::CpuSet>()
+                    std::collections::BTreeSet::from([self.cpu])
                 );
                 self.event("crypto-build");
                 if self.fail_crypto {
@@ -2469,7 +2415,7 @@ mod tests {
                     Poll::Ready(Ok(()))
                 }))
             }
-            fn poll(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
+            fn poll_budgeted(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
                 assert!(
                     self.driver.as_ref().unwrap().will_wake(cx.waker()),
                     "steady-state polling must retain the lifecycle driver waker"
@@ -2523,7 +2469,7 @@ mod tests {
                     Ok(())
                 })
             }
-            fn poll(&mut self, _: &mut Context<'_>, budget: usize) -> Result<()> {
+            fn poll_budgeted(&mut self, _: &mut Context<'_>, budget: usize) -> Result<()> {
                 assert!(budget <= WORK_BUDGET);
                 self.factory
                     .crypto_polls
@@ -2575,8 +2521,8 @@ mod tests {
                 let mut second = group.plan.pairs[0].clone();
                 second.worker = WorkerId(1);
                 match dimension {
-                    0 => second.crypto.package = second.crypto.package.map(|id| id + 1),
-                    1 => second.crypto.core = second.crypto.core.map(|id| id + 1),
+                    0 => second.crypto.package += 1,
+                    1 => second.crypto.core += 1,
                     _ => second.crypto.numa_node = Some(1),
                 }
                 group.plan.pairs.push(second);
@@ -2600,7 +2546,10 @@ mod tests {
                 second.worker = WorkerId(1);
                 group.plan.pairs.push(second);
                 group.prepare(false).unwrap();
-                assert_eq!(runtime_plan(&group.plan).unwrap().threads(), 3);
+                assert_eq!(
+                    runtime_plan(&group.plan).lanes.len() + runtime_plan(&group.plan).helpers.len(),
+                    3
+                );
             }
         }
 
@@ -2620,10 +2569,33 @@ mod tests {
             assert!(position("io-drain") < position("crypto-drain"));
             assert!(position("crypto-drain") < position("crypto-shutdown"));
             assert!(events.contains(&"io-shutdown"));
-            assert_eq!(group.stats().done, 2);
-            // Completed workers cannot retain cancellation registrations in
-            // the caller's scope.
-            assert_eq!(scope.cancellation.registrations(), 0);
+            assert_eq!(group.runtime.stats().done, 2);
+            // Completed workers cannot retain cancellation slots in the caller's scope.
+            let registrations = (0..1024)
+                .map(|_| scope.cancellation.subscribe().unwrap())
+                .collect::<Vec<_>>();
+            assert!(matches!(
+                scope.cancellation.subscribe(),
+                Err(Error::Overloaded)
+            ));
+            drop(registrations);
+        }
+
+        #[test]
+        fn cancellation_subscription_failure_tears_down_built_services() {
+            let (mut group, factory) = fixture(3);
+            let events = factory.events.clone();
+            let scope = lifecycle_scope().unwrap();
+            let _registrations = (0..1024)
+                .map(|_| scope.cancellation.subscribe().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                group.start_recipe(Arc::new(factory), &scope),
+                Err(Error::Overloaded)
+            );
+            assert_eq!(group.runtime.stats().coordinators, 0);
+            assert_eq!(group.runtime.stats().done, 2);
+            assert!(events.lock().unwrap().contains(&"crypto-shutdown"));
         }
 
         #[test]
@@ -2644,8 +2616,8 @@ mod tests {
                     Error::InvalidRequest
                 };
                 assert_eq!(group.start_recipe(Arc::new(factory), &scope), Err(expected));
-                assert!(!group.stats().joinable);
-                assert_eq!(group.stats().done, 2);
+                assert_eq!(group.runtime.stats().coordinators, 0);
+                assert_eq!(group.runtime.stats().done, 2);
             }
         }
 
@@ -2662,7 +2634,7 @@ mod tests {
             let mut group = WorkerGroup::new(plan);
             assert_eq!(group.run_recipe(&factory), Err(Error::Cancelled));
             assert_eq!(current_cpus().unwrap(), before);
-            assert_eq!(group.stats().done, 2);
+            assert_eq!(group.runtime.stats().done, 2);
             assert!(factory.events.lock().unwrap().contains(&"crypto-shutdown"));
         }
 
@@ -2679,12 +2651,12 @@ mod tests {
                 scoped.run_recipe_with_scope(&factory, &scope),
                 Err(Error::DeadlineExceeded)
             );
-            assert_eq!(scoped.stats().done, 2);
+            assert_eq!(scoped.runtime.stats().done, 2);
         }
 
         #[test]
         fn engine_driver_wake_survives_noop_operation_poll() {
-            use racer_platform::test_util::WakeCounter;
+            use uring_runtime::test_util::WakeCounter;
             let (_, factory) = fixture(3);
             let (io, port) = security::pair(WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
             let mut engine = TestCrypto {
@@ -2713,8 +2685,8 @@ mod tests {
                 }),
                 Err(Error::Io)
             );
-            assert!(!group.stats().joinable);
-            assert_eq!(group.stats().done, 0);
+            assert_eq!(group.runtime.stats().coordinators, 0);
+            assert_eq!(group.runtime.stats().done, 0);
             let factory = fixture(3).1;
             let mut borrowed = WorkerGroup::new(colocated_plan(2, 1));
             let before = current_cpus().unwrap();
@@ -2724,7 +2696,7 @@ mod tests {
                 }),
                 Err(Error::Io)
             );
-            assert_eq!(borrowed.stats().done, 0);
+            assert_eq!(borrowed.runtime.stats().done, 0);
             assert_eq!(current_cpus().unwrap(), before);
         }
 
@@ -2757,13 +2729,13 @@ mod tests {
                 group.start_recipe(Arc::new(PanicLimits), &scope),
                 Err(Error::Io)
             );
-            assert_eq!(group.stats().done, 0);
-            assert!(!group.stats().joinable);
+            assert_eq!(group.runtime.stats().done, 0);
+            assert_eq!(group.runtime.stats().coordinators, 0);
             assert_eq!(
                 group.run_recipe_with_scope(&PanicLimits, &scope),
                 Err(Error::Io)
             );
-            assert_eq!(group.stats().done, 0);
+            assert_eq!(group.runtime.stats().done, 0);
             assert_eq!(current_cpus().unwrap(), before);
         }
 
@@ -2839,7 +2811,7 @@ mod tests {
                         },
                     )
                 }
-                fn poll(&mut self, _: &mut Context<'_>, _: usize) -> Result<()> {
+                fn poll_budgeted(&mut self, _: &mut Context<'_>, _: usize) -> Result<()> {
                     Ok(())
                 }
                 fn drain<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
@@ -2866,7 +2838,7 @@ mod tests {
                 }
             }
             for fail_wait in [false, true] {
-                let cpu = current_cpus().unwrap().first().unwrap();
+                let cpu = *current_cpus().unwrap().first().unwrap();
                 let factory = Arc::new(BackendFactory {
                     resources: Resources::new(
                         crate::test_support::cluster::config(false).limits,
@@ -2879,22 +2851,25 @@ mod tests {
                     fences: Arc::default(),
                     fail_wait,
                 });
-                let plan = Plan::builder()
-                    .lane("failure-lane-0", cpu)
-                    .lane("failure-lane-1", cpu)
-                    .helper("failure-helper", cpu, [0, 1])
-                    .max_threads(4)
-                    .build()
-                    .unwrap();
-                let mut group = Group::new(plan, group_config()).unwrap();
+                let mut group = Group::new(Plan {
+                    lanes: (0..2)
+                        .map(|i| Lane {
+                            name: format!("failure-lane-{i}"),
+                            cpu,
+                        })
+                        .collect(),
+                    helpers: vec![Helper {
+                        name: "failure-helper".into(),
+                        cpu,
+                        lanes: vec![0, 1],
+                    }],
+                    max_threads: 4,
+                });
                 let scope =
                     RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(3))
                         .unwrap();
                 let started = Instant::now();
-                assert_eq!(
-                    group.start(factory.clone(), &scope).map_err(group_error),
-                    Err(Error::Io)
-                );
+                assert_eq!(group.start(factory.clone(), &scope), Err(Error::Io));
                 assert!(
                     started.elapsed() < Duration::from_secs(1),
                     "backend failure must not wait for the startup deadline"
@@ -2966,7 +2941,7 @@ mod tests {
                 fn register_driver(&self, _: &Waker) {
                     self.drivers.fetch_add(1, Ordering::SeqCst);
                 }
-                fn poll(&mut self, _: &mut Context<'_>, _: usize) -> Result<()> {
+                fn poll_budgeted(&mut self, _: &mut Context<'_>, _: usize) -> Result<()> {
                     Ok(())
                 }
                 fn drain<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
@@ -3025,7 +3000,7 @@ mod tests {
                 }
             }
             for pending_fence in [false, true] {
-                let cpu = current_cpus().unwrap().first().unwrap();
+                let cpu = *current_cpus().unwrap().first().unwrap();
                 let factory = Arc::new(PendingFactory {
                     resources: Resources::new(
                         crate::test_support::cluster::config(false).limits,
@@ -3040,13 +3015,18 @@ mod tests {
                     drops: Arc::default(),
                     pending_fence,
                 });
-                let plan = Plan::builder()
-                    .lane("pending-drain", cpu)
-                    .helper("pending-helper", cpu, [0])
-                    .max_threads(3)
-                    .build()
-                    .unwrap();
-                let mut group = Group::new(plan, group_config()).unwrap();
+                let mut group = Group::new(Plan {
+                    lanes: vec![Lane {
+                        name: "pending-drain".into(),
+                        cpu,
+                    }],
+                    helpers: vec![Helper {
+                        name: "pending-helper".into(),
+                        cpu,
+                        lanes: vec![0],
+                    }],
+                    max_threads: 3,
+                });
                 let scope =
                     RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(3))
                         .unwrap();
@@ -3059,14 +3039,14 @@ mod tests {
                     thread::yield_now();
                 }
                 let started = Instant::now();
-                let result = group.drain(&scope).map_err(group_error);
+                let result = group.drain(&scope);
                 let elapsed = started.elapsed();
                 let before = group.stats();
                 let fences_before = factory.fences.load(Ordering::SeqCst);
                 let drops_before = factory.drops.load(Ordering::SeqCst);
                 // Release before assertions so a failed regression cannot hang Drop.
                 factory.release.store(true, Ordering::SeqCst);
-                let joined = group.join().map_err(group_error);
+                let joined = group.join();
                 assert_eq!(result, Err(Error::Io));
                 assert!(elapsed < Duration::from_secs(1));
                 assert_eq!(before.drained, 0);
@@ -3102,8 +3082,8 @@ mod tests {
                 },
             );
             assert_eq!(result, Err(Error::Overloaded));
-            assert!(!group.stats().joinable);
-            assert_eq!(group.stats().done, 0);
+            assert_eq!(group.runtime.stats().coordinators, 0);
+            assert_eq!(group.runtime.stats().done, 0);
             let events = events.lock().unwrap();
             assert!(events.is_empty());
         }
@@ -3134,8 +3114,8 @@ mod tests {
             );
             assert_eq!(result, Err(Error::Overloaded));
             assert_eq!(current_cpus().unwrap(), before);
-            assert_eq!(scoped.stats().done, 0);
-            assert!(!scoped.stats().joinable);
+            assert_eq!(scoped.runtime.stats().done, 0);
+            assert_eq!(scoped.runtime.stats().coordinators, 0);
             let events = factory.events.lock().unwrap();
             assert!(events.is_empty());
         }

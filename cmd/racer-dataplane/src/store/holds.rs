@@ -94,8 +94,8 @@ pub(super) struct Hold {
 
 impl Hold {
     pub fn live(&self) -> bool {
-        racer_platform::environment::wall_now() < self.until
-            || racer_platform::environment::now() < self.monotonic
+        uring_runtime::environment::wall_now() < self.until
+            || uring_runtime::environment::now() < self.monotonic
     }
 
     pub fn unused(&self) -> usize {
@@ -145,12 +145,12 @@ impl Holds {
 
     pub fn deadline(until: SystemTime) -> Result<Instant> {
         let ttl = until
-            .duration_since(racer_platform::environment::wall_now())
+            .duration_since(uring_runtime::environment::wall_now())
             .map_err(|_| Error::InvalidConfiguration)?;
         if ttl.is_zero() || ttl > MAX_HOLD_TTL {
             return Err(Error::InvalidConfiguration);
         }
-        racer_platform::environment::now()
+        uring_runtime::environment::now()
             .checked_add(ttl)
             .ok_or(Error::InvalidConfiguration)
     }

@@ -1,17 +1,14 @@
 use super::*;
 use http1::connection::{HttpPool, PoolConfig, State};
-use racer_platform::{
-    Cancellation,
-    environment::{SimulationClock, now},
-    reactor::{Reactor, SocketAddress},
-    simulation::{EventKind, Simulation, SyncOp},
-    uring::backend::OpKind,
-};
 use std::{
     cell::Cell,
     future::{Future, poll_fn},
     task::{Poll, Waker},
     time::Instant,
+};
+use uring_runtime::{
+    environment::{Cancellation, SimulationClock, now},
+    reactor::{Reactor, SocketAddress, simulation::Simulation},
 };
 
 #[derive(Clone)]
@@ -23,18 +20,18 @@ struct TestScope {
 impl TestScope {
     fn new(duration: Duration) -> Self {
         Self {
-            cancellation: Cancellation::new(),
+            cancellation: Cancellation::new().unwrap(),
             deadline: now() + duration,
         }
     }
 }
 
-impl racer_platform::scope::LibraryScope for TestScope {
+impl Scope for TestScope {
     type Error = Error;
 
     fn check(&self) -> Result<()> {
-        if self.cancellation.is_canceled() {
-            return Err(racer_platform::Error::Canceled.into());
+        if self.cancellation.is_cancelled() {
+            return Err(uring_runtime::Error::Cancelled.into());
         }
         if now() >= self.deadline {
             return Err(Error::DeadlineExceeded);
@@ -193,7 +190,7 @@ impl Harness {
             .unwrap();
         client.state_mut().installations = self.hooks.installations.clone();
         let server = ConnectionLease::from_reserved(
-            listener.as_sim().unwrap().accept().unwrap().into(),
+            listener.as_sim().unwrap().accept().unwrap(),
             self.hooks.outbound_slot().unwrap(),
             Policy {
                 installations: self.hooks.installations.clone(),
@@ -645,8 +642,8 @@ fn cancellation_and_deadlines_abort_each_handshake_wait_and_release_slots() {
                         assert!(operation.as_mut().poll(&mut cx).is_pending());
                     }
                     let expected = if stop == "cancel" {
-                        scope.cancellation.cancel();
-                        Error::Runtime(racer_platform::Error::Canceled)
+                        scope.cancellation.cancel().unwrap();
+                        Error::Runtime(uring_runtime::Error::Cancelled)
                     } else {
                         let seconds = if stop == "parent-deadline" { 2 } else { 5 };
                         let remaining = Duration::from_secs(seconds - u64::from(second_round));
@@ -693,7 +690,7 @@ fn pooled_sessions_reject_wrong_peer_expiry_and_canceled_parent_without_io() {
                 let mut scope = TestScope::new(Duration::from_secs(30));
                 match fault {
                     "expired" => client.state_mut().session.as_mut().unwrap().state.expires = now(),
-                    "cancel" => scope.cancellation.cancel(),
+                    "cancel" => scope.cancellation.cancel().unwrap(),
                     "deadline" => scope.deadline = now(),
                     _ => (),
                 }
@@ -712,7 +709,7 @@ fn pooled_sessions_reject_wrong_peer_expiry_and_canceled_parent_without_io() {
                 };
                 let expected = match fault {
                     "peer" => Error::Unauthorized,
-                    "cancel" => Error::Runtime(racer_platform::Error::Canceled),
+                    "cancel" => Error::Runtime(uring_runtime::Error::Cancelled),
                     _ => Error::DeadlineExceeded,
                 };
                 assert!(
@@ -720,12 +717,11 @@ fn pooled_sessions_reject_wrong_peer_expiry_and_canceled_parent_without_io() {
                     "outbound={outbound} {fault}"
                 );
                 let new_events = sim.trace();
-                assert!(new_events[trace.len()..].iter().all(|event| !matches!(
-                    event.kind,
-                    EventKind::Submit(OpKind::Send | OpKind::Recv)
-                        | EventKind::Complete(OpKind::Send | OpKind::Recv)
-                        | EventKind::Call(SyncOp::Send | SyncOp::Recv)
-                )));
+                assert!(
+                    new_events[trace.len()..]
+                        .iter()
+                        .all(|event| event.operation != "send" && event.operation != "recv")
+                );
                 if matches!(fault, "peer" | "expired") {
                     assert!(
                         socket.upgrade().is_none(),

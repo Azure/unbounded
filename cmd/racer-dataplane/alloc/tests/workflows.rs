@@ -4,9 +4,6 @@ use page_alloc::{Alignment, DevicePlacement, Error, Generation, SegmentId, Segme
 #[cfg(feature = "simulation")]
 use page_alloc::{Charge, SegmentState};
 #[cfg(feature = "simulation")]
-use racer_platform::simulation::{Fault, Simulation};
-use racer_platform::{Operation, reactor::Reactor, scope::LibraryScope};
-#[cfg(feature = "simulation")]
 use std::{cell::Cell, path::Path, rc::Rc};
 use std::{
     fs::File,
@@ -17,13 +14,16 @@ use std::{
     sync::Arc,
     task::{Context, Poll, Waker},
 };
+#[cfg(feature = "simulation")]
+use uring_runtime::reactor::simulation::{Fault, Simulation};
+use uring_runtime::{Operation, Scope, reactor::Reactor};
 
 /// Distinguishes allocator validation errors from runtime completion failures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TestError {
     Alloc(Error),
 
-    Runtime(racer_platform::Error),
+    Runtime(uring_runtime::Error),
 }
 
 impl From<Error> for TestError {
@@ -33,9 +33,9 @@ impl From<Error> for TestError {
     }
 }
 
-impl From<racer_platform::Error> for TestError {
+impl From<uring_runtime::Error> for TestError {
     /// Preserve runtime errors without enriching them as synchronous allocator errors.
-    fn from(error: racer_platform::Error) -> Self {
+    fn from(error: uring_runtime::Error) -> Self {
         Self::Runtime(error)
     }
 }
@@ -44,14 +44,7 @@ impl From<racer_platform::Error> for TestError {
 #[derive(Clone)]
 struct TestScope;
 
-impl From<racer_platform::uring::Error> for TestError {
-    /// Library errors take the runtime category.
-    fn from(error: racer_platform::uring::Error) -> Self {
-        Self::Runtime(error.into())
-    }
-}
-
-impl LibraryScope for TestScope {
+impl Scope for TestScope {
     type Error = TestError;
 
     /// Keep the scope live; cancellation is injected by dropping waiting futures.
@@ -591,7 +584,7 @@ fn roundtrip_short_io_and_runtime_errors() {
     sim.inject("read", Fault::Errno(libc::EIO)).unwrap();
     assert!(matches!(
         drive(&reactor, read()),
-        Err(TestError::Runtime(racer_platform::Error::Os(libc::EIO)))
+        Err(TestError::Runtime(uring_runtime::Error::Os(libc::EIO)))
     ));
     assert_eq!(reactor.in_flight(), 0);
     segments.begin_evict(SegmentId(0)).unwrap();
@@ -1372,7 +1365,7 @@ struct SharedBody(Rc<page_alloc::AlignedBuffer<()>>, std::ops::Range<usize>);
 // SAFETY: the Rc keeps the immutable allocation alive and unmoved; no alias
 // mutates it while the body is owned by a write.
 #[cfg(feature = "simulation")]
-unsafe impl racer_platform::reactor::SharedWriteBuffer for SharedBody {
+unsafe impl uring_runtime::reactor::SharedWriteBuffer for SharedBody {
     type Error = Error;
 
     fn write_bytes(&self) -> Result<&[u8], Error> {
@@ -1488,7 +1481,7 @@ fn vectored_write_roundtrip_validation_and_faults() {
     );
     assert!(matches!(
         drive(&reactor, op),
-        Err(TestError::Runtime(racer_platform::Error::Os(libc::EIO)))
+        Err(TestError::Runtime(uring_runtime::Error::Os(libc::EIO)))
     ));
     assert_eq!(slab.writes_in_flight(), 0);
     assert_eq!(reactor.in_flight(), 0);

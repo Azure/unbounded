@@ -154,13 +154,13 @@ impl RefreshTable {
 
 #[derive(Default)]
 struct IngressDeadlines {
-    inner: Rc<racer_platform::environment::Registry>,
+    inner: Rc<uring_runtime::environment::Registry>,
 }
 /// One entry per admitted resolve, shared across its follower and leader waits.
 /// The refresh registration quota bounds these entries. Drivers never own this
 /// guard: ingress expiry must not release their acquisition or completion fences.
 struct IngressDeadline {
-    inner: racer_platform::environment::Registration,
+    inner: uring_runtime::environment::Registration,
 }
 impl IngressDeadlines {
     fn register(self: &Rc<Self>, deadline: Instant) -> Result<IngressDeadline> {
@@ -188,7 +188,7 @@ impl IngressDeadline {
 
 #[derive(Default)]
 struct Clock {
-    inner: racer_platform::environment::Observer,
+    inner: uring_runtime::environment::Observer,
 }
 impl Clock {
     fn observe(&mut self, wall: SystemTime, monotonic: Instant) -> bool {
@@ -320,11 +320,11 @@ impl MetadataService {
 
     /// Invalidate current observations when the clock's freshness is uncertain.
     fn observe_clock(&self) -> Result<SystemTime> {
-        let now = racer_platform::environment::wall_now();
+        let now = uring_runtime::environment::wall_now();
         if self
             .clock
             .borrow_mut()
-            .observe(now, racer_platform::environment::now())
+            .observe(now, uring_runtime::environment::now())
         {
             self.storage.index.invalidate_freshness()?;
         }
@@ -357,7 +357,7 @@ impl MetadataService {
             let deadline = self.deadlines.register(scope.deadline.0)?;
             let cancellation = scope.cancellation.subscribe()?;
             let event = poll_fn(|cx| {
-                racer_platform::drivers::poll(cx, 64);
+                uring_runtime::drivers::poll(cx, 64);
                 cancellation.register(cx.waker());
                 if let Err(error) = deadline.check(scope, cx.waker()) {
                     return Poll::Ready(Err(error));
@@ -376,9 +376,9 @@ impl MetadataService {
                     if budget.remaining_attempts() == 0 {
                         return Err(Error::Unavailable);
                     }
-                    let driver_permit = racer_platform::drivers::reserve().map_err(Error::from)?;
+                    let driver_permit = uring_runtime::drivers::reserve().map_err(Error::from)?;
                     let mut nonce = [0; 16];
-                    racer_platform::environment::fill_random(&mut nonce)
+                    uring_runtime::environment::fill_random(&mut nonce)
                         .map_err(|_| Error::Unavailable)?;
                     let attempt = crate::model::AttemptId(nonce);
                     let sealed = self.credentials.seal(context, attempt, scope)?;
@@ -404,10 +404,10 @@ impl MetadataService {
                             &mut owned_budget,
                         ));
                         let result = poll_fn(|cx| {
-                            if !caller_scope.cancellation.is_canceled() {
+                            if !caller_scope.cancellation.is_cancelled() {
                                 caller_cancellation.register(cx.waker());
                             }
-                            if !owned_scope.cancellation.is_canceled()
+                            if !owned_scope.cancellation.is_cancelled()
                                 && (caller_scope.check().is_err()
                                     || driver_registration.is_only_handle())
                             {
@@ -443,7 +443,7 @@ impl MetadataService {
                     let (result, remaining) = poll_fn(|cx| {
                         cancellation.register(cx.waker());
                         deadline.check(scope, cx.waker())?;
-                        racer_platform::drivers::poll(cx, 64);
+                        uring_runtime::drivers::poll(cx, 64);
                         match Pin::new(&mut receive).poll(cx) {
                             Poll::Ready(Ok(value)) => Poll::Ready(Ok(value)),
                             Poll::Ready(Err(_)) => Poll::Ready(Err(Error::Unavailable)),
@@ -565,7 +565,7 @@ impl MetadataService {
         budget: &mut AcquisitionBudget,
     ) -> std::result::Result<RefreshOutput, RefreshFailure> {
         authority.validate(&context.object, PageNumber(0))?;
-        budget.begin_attempt(racer_platform::environment::now(), scope.deadline.0)?;
+        budget.begin_attempt(uring_runtime::environment::now(), scope.deadline.0)?;
         let selector = purpose.selector();
         let acquisition = match purpose {
             RefreshPurpose::Bootstrap => {
@@ -1063,9 +1063,7 @@ pub(crate) mod tests {
         assert_eq!(refreshes.inner.active_count(), 0);
         assert_eq!(refreshes.inner.registration_count(), 0);
         let table = Rc::new(IngressDeadlines {
-            inner: Rc::new(racer_platform::environment::Registry::with_next_id(
-                u64::MAX,
-            )),
+            inner: Rc::new(uring_runtime::environment::Registry::with_next_id(u64::MAX)),
         });
         assert!(matches!(table.register(due), Err(Error::Overloaded)));
         assert!(table.inner.is_empty());
@@ -1114,7 +1112,7 @@ pub(crate) mod tests {
 
     #[test]
     fn worker_driver_retains_leadership_after_request_drop_until_completion() {
-        let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         let table = Rc::new(RefreshTable::default());
         let request = table.join(key(), 1).unwrap();
@@ -1126,7 +1124,7 @@ pub(crate) mod tests {
         ));
         let driver = request.clone();
         let (complete, fence) = futures::channel::oneshot::channel::<()>();
-        racer_platform::drivers::reserve()
+        uring_runtime::drivers::reserve()
             .unwrap()
             .submit_detached(Box::pin(async move {
                 fence.await.map_err(|_| Error::Io)?;
@@ -1134,12 +1132,12 @@ pub(crate) mod tests {
                 Ok::<_, Error>(())
             }));
         let mut cx = std::task::Context::from_waker(&waker);
-        racer_platform::drivers::poll(&mut cx, 64);
+        uring_runtime::drivers::poll(&mut cx, 64);
         drop(request);
         assert!(follower.event(&waker).is_pending());
         assert_eq!(table.inner.registration_count(), 2);
         complete.send(()).unwrap();
-        racer_platform::drivers::poll(&mut cx, 64);
+        uring_runtime::drivers::poll(&mut cx, 64);
         assert_eq!(table.inner.registration_count(), 1);
         assert!(matches!(
             follower.event(&waker),

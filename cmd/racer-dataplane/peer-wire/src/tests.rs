@@ -363,7 +363,7 @@ fn ed25519_rfc9421_base_tamper_replay_and_receiver_challenge() {
 
 #[test]
 fn timestamp_window_and_retained_deadline_revalidate_authority() {
-    let clock = racer_platform::environment::SimulationClock::new_at(
+    let clock = uring_runtime::environment::SimulationClock::new_at(
         87,
         std::time::Instant::now(),
         SystemTime::now(),
@@ -373,7 +373,7 @@ fn timestamp_window_and_retained_deadline_revalidate_authority() {
     let mut head = head();
     head.headers.retain(|h| h.name != "racer-kind");
     push(&mut head, "racer-kind", "request");
-    let deadline = millis(racer_platform::environment::wall_now()).unwrap() + 120_000;
+    let deadline = millis(uring_runtime::environment::wall_now()).unwrap() + 120_000;
     push(&mut head, "racer-route-deadline", deadline);
     let signed = n[0].sign(head).unwrap();
     clock.advance(Duration::from_secs(60));
@@ -478,7 +478,7 @@ fn control_chain_rejects_phase_previous_identity_and_extension_substitution() {
         transfer: [3; 16],
         membership: 1,
         deadline: encode_deadline(Deadline(
-            racer_platform::environment::now() + Duration::from_secs(30),
+            uring_runtime::environment::now() + Duration::from_secs(30),
         ))
         .unwrap(),
         rail: racer_control_wire::RailId(1),

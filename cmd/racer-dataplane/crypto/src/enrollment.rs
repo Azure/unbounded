@@ -14,14 +14,6 @@ use racer_control_wire::{
     self as wire, ClusterId, EnrollmentId, EnrollmentRequest, EnrollmentResponse, NodeId,
     RailMapping,
 };
-use racer_platform::{
-    Operation,
-    fs::{
-        operations::ReplacementError,
-        secure::{self, Attempts, Host},
-    },
-    scope::LibraryScope,
-};
 use serde::{Deserialize, Serialize};
 use std::{
     cell::RefCell,
@@ -29,6 +21,13 @@ use std::{
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use uring_runtime::{
+    Operation, Scope,
+    reactor::filesystem::{
+        operations::ReplacementError,
+        secure::{self, Attempts, Host},
+    },
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -216,7 +215,7 @@ impl<H: Host> Enrollment<H> {
         params.distinguished_name = rcgen::DistinguishedName::new();
         let csr = params.serialize_request(&signing).map_err(|_| Error::Io)?;
         let mut id = [0; 16];
-        racer_platform::environment::fill_random(&mut id).map_err(|_| Error::Io)?;
+        uring_runtime::environment::fill_random(&mut id).map_err(|_| Error::Io)?;
         id[6] = (id[6] & 0x0f) | 0x40;
         id[8] = (id[8] & 0x3f) | 0x80;
         let h = format!("{:032x}", u128::from_be_bytes(id));
@@ -337,9 +336,9 @@ impl<H: Host> Enrollment<H> {
 
 impl<H: Host> Enrollment<H>
 where
-    <H::Scope as LibraryScope>::Error: From<Error>
+    <H::Scope as Scope>::Error: From<Error>
         + From<secure::AccessError>
-        + From<ReplacementError<<H::Scope as LibraryScope>::Error>>,
+        + From<ReplacementError<<H::Scope as Scope>::Error>>,
 {
     /// Persist the private key before returning a request. The caller must durably
     /// persist its NIC reservations before calling this method, including retries.
@@ -348,7 +347,7 @@ where
         nics: Vec<RailMapping>,
         shares: NonZeroU32,
         parent: &'a H::Scope,
-    ) -> Operation<'a, EnrollmentRequest, <H::Scope as LibraryScope>::Error> {
+    ) -> Operation<'a, EnrollmentRequest, <H::Scope as Scope>::Error> {
         Box::pin(async move {
             let (_guard, scope) = self.attempts.begin(&self.host, parent).await?;
             let r = self.host.reactor();
@@ -383,7 +382,7 @@ where
     pub fn read_token<'a>(
         &'a self,
         scope: &'a H::Scope,
-    ) -> Operation<'a, Zeroizing<String>, <H::Scope as LibraryScope>::Error> {
+    ) -> Operation<'a, Zeroizing<String>, <H::Scope as Scope>::Error> {
         Box::pin(async move {
             let bytes = secure::read_path(
                 self.host.reactor(),
@@ -402,7 +401,7 @@ where
         &'a self,
         response: EnrollmentResponse,
         parent: &'a H::Scope,
-    ) -> Operation<'a, LocalSigningIdentity, <H::Scope as LibraryScope>::Error> {
+    ) -> Operation<'a, LocalSigningIdentity, <H::Scope as Scope>::Error> {
         Box::pin(async move {
             let (_guard, scope) = self.attempts.begin(&self.host, parent).await?;
             let r = self.host.reactor();
@@ -446,7 +445,7 @@ where
     pub fn load_identity<'a>(
         &'a self,
         parent: &'a H::Scope,
-    ) -> Operation<'a, Option<LocalSigningIdentity>, <H::Scope as LibraryScope>::Error> {
+    ) -> Operation<'a, Option<LocalSigningIdentity>, <H::Scope as Scope>::Error> {
         Box::pin(async move {
             let (_guard, scope) = self.attempts.begin(&self.host, parent).await?;
             let r = self.host.reactor();
@@ -547,14 +546,14 @@ impl LocalSigningIdentity {
 
     /// Check both ends of the leaf's lifetime against the scoped wall clock.
     pub fn valid_now(&self) -> bool {
-        let now = racer_platform::environment::wall_now();
+        let now = uring_runtime::environment::wall_now();
         now >= UNIX_EPOCH + Duration::from_secs(self.not_before) && now < self.expires_at()
     }
 
     /// Renew after two thirds of the issued lifetime, capped by wire policy.
     pub fn renewal_due(&self) -> bool {
         let lifetime = Duration::from_secs(self.not_after - self.not_before);
-        racer_platform::environment::wall_now()
+        uring_runtime::environment::wall_now()
             >= UNIX_EPOCH
                 + Duration::from_secs(self.not_before)
                 + (lifetime * 2 / 3).min(wire::RENEW_AFTER)
@@ -657,17 +656,19 @@ fn check_pending_key(pending: &PendingIdentity, csr: &[u8]) -> Result<(), Error>
 mod tests {
     //! Real enrollment state transitions over deterministic reactor completions.
     use super::*;
-    use racer_platform::{
-        Cancellation,
-        reactor::Reactor,
-        simulation::{Fault, Simulation},
-    };
     use std::{
         cell::Cell,
         path::Path,
         rc::Rc,
         task::{Context, Poll},
         time::Instant,
+    };
+    use uring_runtime::{
+        environment::Cancellation,
+        reactor::{
+            Reactor,
+            simulation::{Fault, Simulation},
+        },
     };
 
     std::thread_local! {
@@ -801,23 +802,16 @@ mod tests {
     /// Independent component errors crossing the test host boundary.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum Cause {
-        Runtime(racer_platform::Error),
+        Runtime(uring_runtime::Error),
 
         Enrollment(Error),
 
         Access(secure::AccessError),
     }
 
-    impl From<racer_platform::uring::Error> for Failure {
-        /// Library errors take the Racer runtime mapping.
-        fn from(error: racer_platform::uring::Error) -> Self {
-            racer_platform::Error::from(error).into()
-        }
-    }
-
-    impl From<racer_platform::Error> for Failure {
+    impl From<uring_runtime::Error> for Failure {
         /// Retain the runtime cause before any replacement phase is attached.
-        fn from(e: racer_platform::Error) -> Self {
+        fn from(e: uring_runtime::Error) -> Self {
             Self {
                 cause: Cause::Runtime(e),
                 phase: 0,
@@ -864,13 +858,13 @@ mod tests {
         cancellation: Cancellation,
     }
 
-    impl racer_platform::scope::LibraryScope for Request {
+    impl Scope for Request {
         type Error = Failure;
 
         /// Stop cancelled requests before admitting more simulated I/O.
         fn check(&self) -> Result<(), Failure> {
-            if self.cancellation.is_canceled() {
-                Err(racer_platform::Error::Canceled.into())
+            if self.cancellation.is_cancelled() {
+                Err(uring_runtime::Error::Cancelled.into())
             } else {
                 Ok(())
             }
@@ -916,7 +910,7 @@ mod tests {
 
         /// Distinguish absent records from other filesystem and policy failures.
         fn is_missing(error: Failure) -> bool {
-            error == racer_platform::Error::NotFound.into()
+            error == uring_runtime::Error::NotFound.into()
         }
     }
 
@@ -943,7 +937,7 @@ mod tests {
             enrollment,
             Request {
                 id: 0,
-                cancellation: Cancellation::new(),
+                cancellation: Cancellation::new().unwrap(),
             },
         )
     }
@@ -973,7 +967,7 @@ mod tests {
     ) -> EnrollmentResponse {
         let der = rustls::pki_types::CertificateSigningRequestDer::from(request.csr_der.clone());
         let mut csr = rcgen::CertificateSigningRequestParams::from_der(&der).unwrap();
-        let now = racer_platform::environment::wall_now();
+        let now = uring_runtime::environment::wall_now();
         csr.params.not_before = (now - Duration::from_secs(1)).into();
         csr.params.not_after = (now + Duration::from_secs(3600)).into();
         csr.params.subject_alt_names = vec![rcgen::SanType::URI(
@@ -1180,9 +1174,8 @@ mod tests {
                     .subject_alt_names
                     .push(rcgen::SanType::DnsName("extra.example".try_into().unwrap())),
                 "lifetime" => {
-                    params.not_after = (racer_platform::environment::wall_now()
-                        + Duration::from_secs(90000))
-                    .into()
+                    params.not_after =
+                        (uring_runtime::environment::wall_now() + Duration::from_secs(90000)).into()
                 }
                 "usage" => {
                     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth]
@@ -1254,13 +1247,13 @@ mod tests {
                 "missing-usage" => params.key_usages.clear(),
                 "future" => {
                     params.not_before =
-                        (racer_platform::environment::wall_now() + Duration::from_secs(600)).into()
+                        (uring_runtime::environment::wall_now() + Duration::from_secs(600)).into()
                 }
                 "expired" => {
                     params.not_before =
-                        (racer_platform::environment::wall_now() - Duration::from_secs(600)).into();
+                        (uring_runtime::environment::wall_now() - Duration::from_secs(600)).into();
                     params.not_after =
-                        (racer_platform::environment::wall_now() - Duration::from_secs(300)).into();
+                        (uring_runtime::environment::wall_now() - Duration::from_secs(300)).into();
                 }
                 _ => unreachable!(),
             });
@@ -1354,7 +1347,7 @@ mod tests {
             "too-many",
             "oversized",
         ] {
-            let now = racer_platform::environment::wall_now();
+            let now = uring_runtime::environment::wall_now();
             let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
             params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
             params.not_before = (now - Duration::from_secs(600)).into();
@@ -1420,7 +1413,7 @@ mod tests {
     fn root_expiring_after_installation_blocks_persistence_and_recovery() {
         let sim = Simulation::new();
         let _environment = sim.enter();
-        let clock = racer_platform::environment::SimulationClock::new(105);
+        let clock = uring_runtime::environment::SimulationClock::new(105);
         let _time = clock.environment(0).enter();
         let (files, e, scope) = fixture();
         let (ca, key) = identity::test_util::ca();
@@ -1445,7 +1438,7 @@ mod tests {
         let pending = sim.read_file(Path::new("/private/pending.json")).unwrap();
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let now = racer_platform::environment::wall_now();
+        let now = uring_runtime::environment::wall_now();
         params.not_before = (now - Duration::from_secs(60)).into();
         params.not_after = (now + Duration::from_secs(60)).into();
         let short = params.self_signed(&key).unwrap();
@@ -1522,19 +1515,17 @@ mod tests {
                     sim.inject("fsync", Fault::Errno(5)).unwrap();
                 }
                 if case == "cancel-rename" {
-                    scope.cancellation.cancel();
+                    scope.cancellation.cancel().unwrap();
                 }
                 let expected = Failure {
                     cause: Cause::Runtime(if case == "cancel-rename" {
-                        racer_platform::Error::Canceled
+                        uring_runtime::Error::Cancelled
                     } else {
-                        racer_platform::Error::Os(if case == "write" { 28 } else { 5 })
+                        uring_runtime::Error::Os(if case == "write" { 28 } else { 5 })
                     }),
-                    // The held rename's successful result wins over the late
-                    // cancellation, so cancellation is observed while syncing.
                     phase: match case {
-                        "rename" => 1,
-                        "sync" | "cancel-rename" => 2,
+                        "rename" | "cancel-rename" => 1,
+                        "sync" => 2,
                         _ => 0,
                     },
                 };
@@ -1544,7 +1535,7 @@ mod tests {
                 );
                 let scope = Request {
                     id: 0,
-                    cancellation: Cancellation::new(),
+                    cancellation: Cancellation::new().unwrap(),
                 };
                 assert_eq!(
                     drive(&files, e.load_identity(&scope)).unwrap().is_some(),
@@ -1576,7 +1567,7 @@ mod tests {
         );
         assert_eq!(files.next.get(), 1);
         assert!(
-            matches!(drive(&files, e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope)), Err(error) if error == racer_platform::Error::Overloaded.into())
+            matches!(drive(&files, e.prepare(vec![], NonZeroU32::new(4).unwrap(), &scope)), Err(error) if error == uring_runtime::Error::Overloaded.into())
         );
         assert_eq!(files.next.get(), 1);
         drop(first);
@@ -1588,10 +1579,10 @@ mod tests {
         .unwrap();
         assert_eq!(files.next.get(), 2);
         assert_eq!(files.reactor.in_flight(), 0);
-        scope.cancellation.cancel();
+        scope.cancellation.cancel().unwrap();
         let before = sim.trace().len();
         assert!(
-            matches!(drive(&files, e.load_identity(&scope)), Err(error) if error == racer_platform::Error::Canceled.into())
+            matches!(drive(&files, e.load_identity(&scope)), Err(error) if error == uring_runtime::Error::Cancelled.into())
         );
         assert_eq!(sim.trace().len(), before);
         assert_eq!(files.next.get(), 2);
@@ -1602,7 +1593,7 @@ mod tests {
     fn renewal_and_expired_recovery_follow_scoped_time() {
         let sim = Simulation::new();
         let _environment = sim.enter();
-        let clock = racer_platform::environment::SimulationClock::new(99);
+        let clock = uring_runtime::environment::SimulationClock::new(99);
         let _time = clock.environment(0).enter();
         let (files, e, scope) = fixture();
         let request = drive(
@@ -1662,18 +1653,18 @@ mod tests {
         )
         .unwrap();
         for (name, limit, private, expected) in [
-            ("link", 5, false, racer_platform::Error::Os(40).into()),
+            ("link", 5, false, uring_runtime::Error::Os(40).into()),
             (
                 "pending.json",
                 1024 * 1024 + 1,
                 true,
-                racer_platform::Error::Overloaded.into(),
+                uring_runtime::Error::Overloaded.into(),
             ),
             (
                 "pending.json",
                 1,
                 true,
-                racer_platform::Error::InvalidInput.into(),
+                uring_runtime::Error::InvalidInput.into(),
             ),
         ] {
             assert!(
@@ -1689,7 +1680,7 @@ mod tests {
                     .map_err(Failure::from)
             }),
         );
-        assert_eq!(result, Err(racer_platform::Error::Overloaded.into()));
+        assert_eq!(result, Err(uring_runtime::Error::Overloaded.into()));
         assert!(sim.metadata(Path::new("/private/.large.stage")).is_err());
     }
 }

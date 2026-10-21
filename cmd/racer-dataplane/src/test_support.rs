@@ -36,22 +36,22 @@ use racer_control_wire::CacheDefinition;
 use racer_control_wire::MembershipVersion;
 use racer_control_wire::Publication;
 use racer_control_wire::PublicationSequence;
-use racer_platform::drivers::DriverQueue;
 use std::cell::RefCell;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::Context;
+use uring_runtime::drivers::DriverQueue;
 
 pub mod clock {
     use crate::error::Error;
     use crate::error::Result;
-    use racer_platform::environment::Deadline;
     use std::cell::Cell;
     use std::time::Duration;
     use std::time::Instant;
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
+    use uring_runtime::environment::Deadline;
 
     /// Pure deadline/freshness fixture. Reactor timers use SimulationClock.
     pub struct Clock {
@@ -354,7 +354,7 @@ pub mod cluster {
     }
 }
 
-pub use racer_platform::test_util::WakeCounter;
+pub use uring_runtime::test_util::WakeCounter;
 
 /// Assemble the real worker without activating I/O for wake and quota scenarios.
 pub(crate) fn wake_test_worker() -> crate::app::WorkerApplication {
@@ -388,10 +388,11 @@ pub(crate) async fn projected_file(
     file: &str,
     limit: usize,
     scope: &crate::runtime::RequestScope,
-) -> crate::error::Result<racer_platform::fs::ReadBuffer> {
-    use racer_platform::fs::secure::{BENEATH, NO_MAGICLINKS};
+) -> crate::error::Result<uring_runtime::reactor::filesystem::ReadBuffer> {
+    use uring_runtime::reactor::filesystem::secure::{BENEATH, NO_MAGICLINKS};
 
-    let dir = racer_platform::fs::secure::directory(r, path, false, false, scope).await?;
+    let dir =
+        uring_runtime::reactor::filesystem::secure::directory(r, path, false, false, scope).await?;
     // One openat2 resolves ..data and pins the target directory across rotation.
     // BENEATH rejects absolute/escaping links; NO_MAGICLINKS rejects proc escapes.
     let generation = r
@@ -403,7 +404,8 @@ pub(crate) async fn projected_file(
             scope,
         )
         .await?;
-    racer_platform::fs::secure::read_at(r, &generation, file, limit, false, scope).await
+    uring_runtime::reactor::filesystem::secure::read_at(r, &generation, file, limit, false, scope)
+        .await
 }
 
 /// Enrollment I/O and certificate fixtures shared by control and application tests.
@@ -498,7 +500,7 @@ pub(crate) fn published_membership(
     published
         .publish(
             Arc::new(Snapshot::membership_fixture(membership)),
-            racer_platform::environment::now(),
+            uring_runtime::environment::now(),
             |_, _| Ok::<_, crate::error::Error>(()),
             || (),
         )
@@ -646,7 +648,7 @@ impl ReadWorker {
         let _queue = self.drivers.enter();
         self.endpoint.borrow_mut().poll_budgeted(64).unwrap();
         self.drivers.poll(cx, 64);
-        racer_platform::group::Service::poll(
+        uring_runtime::group::Service::poll_budgeted(
             &mut *self.engine.borrow_mut(),
             &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
             64,

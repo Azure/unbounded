@@ -8,9 +8,9 @@ description = "Worker-local aligned buffers and lease-fenced sparse slab storage
 
 [features]
 default = []
-simulation = ["racer-platform/simulation"]
+simulation = ["uring-runtime/simulation"]
 
 [dependencies]
 libc = "0.2"
 zeroize = "1"
-racer-platform = { path = "../platform" }
+uring-runtime = { path = "../runtime" }

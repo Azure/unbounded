@@ -9,13 +9,13 @@ description = "Bounded paired-thread RDMA verbs ownership and simulated fabric"
 [features]
 default = []
 native = []
-simulation = ["racer-platform/simulation"]
+simulation = ["uring-runtime/simulation"]
 
 [dependencies]
 futures = "0.3"
 libc = "0.2"
 serde_json = "1"
-racer-platform = { path = "../platform" }
+uring-runtime = { path = "../runtime" }
 
 [dev-dependencies]
-racer-platform = { path = "../platform", features = ["simulation"] }
+uring-runtime = { path = "../runtime", features = ["simulation"] }

@@ -292,7 +292,6 @@ pub mod identity {
         BundleGeneration, CacheId, CacheKeyRef, CacheKeyState, ClusterId, KeyId, NodeId,
         SCHEMA_VERSION,
     };
-    use racer_platform::environment;
     use rustls::{
         RootCertStore,
         pki_types::{CertificateDer, PrivatePkcs8KeyDer},
@@ -304,6 +303,7 @@ pub mod identity {
         rc::Rc,
         sync::{Arc, Mutex},
     };
+    use uring_runtime::environment;
     use x509_parser::{extensions::GeneralName, parse_x509_certificate};
     use zeroize::Zeroizing;
 

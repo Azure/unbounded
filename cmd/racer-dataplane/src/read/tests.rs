@@ -90,7 +90,7 @@ pub(crate) fn page(byte: u8) -> crate::memory::PageResult {
 }
 #[test]
 fn racer_capacity_and_reservation_errors_are_preserved() {
-    use racer_platform::drivers::*;
+    use uring_runtime::drivers::*;
     assert!(matches!(
         reserve().map_err(Error::from),
         Err(Error::InvalidConfiguration)
@@ -108,7 +108,7 @@ fn racer_capacity_and_reservation_errors_are_preserved() {
 }
 #[test]
 fn detached_operation_errors_release_capacity() {
-    use racer_platform::drivers::*;
+    use uring_runtime::drivers::*;
     let queue = Rc::new(DriverQueue::new(1024));
     let _owner = queue.enter();
     reserve()
@@ -122,7 +122,7 @@ fn detached_operation_errors_release_capacity() {
 }
 #[test]
 fn remote_budget_charges_final_incoming_link_and_never_restores_attempts() {
-    let now = racer_platform::environment::now();
+    let now = uring_runtime::environment::now();
     let scope = RequestScope::new(
         crate::model::RequestId([1; 16]),
         now + std::time::Duration::from_secs(60),
@@ -255,7 +255,7 @@ mod flight {
                     waiters.push(waiter);
                 }
                 let held = flights.reserve_copy_flight(&fence().page, &scope).unwrap();
-                let now = racer_platform::environment::now();
+                let now = uring_runtime::environment::now();
                 let facts = flights.expiry_snapshot_without_ticket(now);
                 assert_eq!(facts.total, count);
                 assert_eq!(facts.entries.iter().flatten().count(), count.min(6));
@@ -297,7 +297,7 @@ mod flight {
         #[test]
         fn expiry_snapshot_prior_cap_can_be_free_at_expiry() {
             use std::future::Future;
-            let clock = racer_platform::environment::SimulationClock::new(742);
+            let clock = uring_runtime::environment::SimulationClock::new(742);
             let _environment = clock.environment(0).enter();
             let flights = flights(FlightLimits {
                 entries: 1,
@@ -349,7 +349,7 @@ mod flight {
         #[test]
         fn expiry_snapshot_scope_deadline_is_excluded() {
             use std::future::Future;
-            let clock = racer_platform::environment::SimulationClock::new(743);
+            let clock = uring_runtime::environment::SimulationClock::new(743);
             let _environment = clock.environment(0).enter();
             let flights = flights(FlightLimits {
                 entries: 1,
@@ -363,7 +363,7 @@ mod flight {
             let (context, owner_scope) = (origin(), scope());
             let short = RequestScope::new(
                 crate::model::RequestId([3; 16]),
-                racer_platform::environment::now() + Duration::from_millis(50),
+                uring_runtime::environment::now() + Duration::from_millis(50),
             )
             .unwrap();
             let (mut active_budget, mut next_budget) = (budget(), budget());
@@ -417,7 +417,7 @@ mod flight {
                 let mut cx = Context::from_waker(Waker::noop());
                 assert!(queued.as_mut().poll(&mut cx).is_pending());
                 assert!(scope.check().is_ok());
-                let mut expired = AcquisitionBudget::new(racer_platform::environment::now(), 0, 8);
+                let mut expired = AcquisitionBudget::new(uring_runtime::environment::now(), 0, 8);
                 assert!(matches!(
                     flights.join_for(
                         absent.clone(),
@@ -715,9 +715,9 @@ mod flight {
         fn bounded_admission_original_deadline_and_allowance_are_distinct() {
             use std::future::Future;
             for original_expires in [false, true] {
-                let clock = racer_platform::environment::SimulationClock::new(741);
+                let clock = uring_runtime::environment::SimulationClock::new(741);
                 let _environment = clock.environment(0).enter();
-                let now = racer_platform::environment::now();
+                let now = uring_runtime::environment::now();
                 let flights = flights(FlightLimits {
                     entries: 1,
                     ..FlightLimits::default()
@@ -1010,7 +1010,7 @@ mod flight {
 
         #[test]
         fn worker_poll_drives_owned_completion_after_waiter_disappears() {
-            let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+            let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
             let _owner = queue.enter();
             let flights = flights(FlightLimits::default());
             let (context, scope) = (origin(), scope());
@@ -1020,7 +1020,7 @@ mod flight {
             let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
             let (send, receive) = futures::channel::oneshot::channel::<()>();
             let worker = flights.clone();
-            racer_platform::drivers::reserve()
+            uring_runtime::drivers::reserve()
                 .unwrap()
                 .submit_detached(Box::pin(async move {
                     receive.await.map_err(|_| Error::Io)?;
@@ -1037,7 +1037,7 @@ mod flight {
             send.send(()).unwrap();
             flights.poll_budgeted(1).unwrap();
             assert!(flights.table.borrow().is_empty());
-            assert_eq!(racer_platform::drivers::pending(), 0);
+            assert_eq!(uring_runtime::drivers::pending(), 0);
         }
 
         #[test]
@@ -1178,7 +1178,7 @@ mod flight {
             old_diagnostic.set(DriverStage::WorkReturned);
             assert_eq!(
                 flights
-                    .expiry_snapshot_without_ticket(racer_platform::environment::now())
+                    .expiry_snapshot_without_ticket(uring_runtime::environment::now())
                     .entries[0]
                     .unwrap()
                     .stage,
@@ -1898,7 +1898,7 @@ mod flight {
 
     #[test]
     fn worker_poll_drives_parent_owned_queue_after_caller_drop() {
-        let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         let flights = flights(FlightLimits::default());
         let (context, scope) = (origin(), scope());
@@ -1907,7 +1907,7 @@ mod flight {
         let leader = lead(&mut a);
         let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
         let (send, recv) = futures::channel::oneshot::channel::<()>();
-        racer_platform::drivers::reserve()
+        uring_runtime::drivers::reserve()
             .unwrap()
             .submit_detached(Box::pin(async move {
                 recv.await.map_err(|_| Error::Io)?;
@@ -1920,7 +1920,7 @@ mod flight {
         assert_eq!(flights.table.borrow().len(), 1);
         send.send(()).unwrap();
         assert!(matches!(poll(flights.drain(&scope)), Poll::Ready(Ok(()))));
-        assert_eq!(racer_platform::drivers::pending(), 0);
+        assert_eq!(uring_runtime::drivers::pending(), 0);
     }
 
     fn fence() -> Fence {
@@ -2049,7 +2049,6 @@ mod timeouts {
     use crate::topology::Membership;
     use racer_control_wire::MembershipVersion;
     use racer_control_wire::NodeId;
-    use racer_platform::environment::Deadline;
     use std::cell::Cell;
     use std::cell::RefCell;
     use std::future::Future;
@@ -2061,6 +2060,7 @@ mod timeouts {
     use std::task::Poll;
     use std::time::Duration;
     use std::time::Instant;
+    use uring_runtime::environment::Deadline;
 
     struct Call {
         scope: RequestScope,
@@ -2179,7 +2179,7 @@ mod timeouts {
                         Err(Error::Cancelled)
                     };
                     poll_fn(|_| {
-                        if scope.cancellation.is_canceled() && self.fenced.get() {
+                        if scope.cancellation.is_cancelled() && self.fenced.get() {
                             Poll::Ready(())
                         } else {
                             Poll::Pending
@@ -2205,7 +2205,7 @@ mod timeouts {
 
     impl Fixture {
         fn bounded(mut self, request: u8, seconds: u64, links: u8) -> Self {
-            let deadline = racer_platform::environment::now() + Duration::from_secs(seconds);
+            let deadline = uring_runtime::environment::now() + Duration::from_secs(seconds);
             self.scope = RequestScope::new(RequestId([request; 16]), deadline).unwrap();
             self.budget = AcquisitionBudget::new(deadline, 16, links);
             self
@@ -2291,7 +2291,7 @@ mod timeouts {
 
     #[test]
     fn continuously_slow_candidate_reserves_fenced_fallback_and_conserves_credits() {
-        let clock = racer_platform::environment::SimulationClock::new_at(
+        let clock = uring_runtime::environment::SimulationClock::new_at(
             94,
             Instant::now(),
             std::time::SystemTime::now(),
@@ -2322,7 +2322,7 @@ mod timeouts {
             Err(Error::DeadlineExceeded)
         );
         assert!(poll(resolve.as_mut()).is_pending());
-        assert!(first.cancellation.is_canceled());
+        assert!(first.cancellation.is_cancelled());
         assert_eq!(
             f.peers.calls.borrow().len(),
             1,
@@ -2348,13 +2348,13 @@ mod timeouts {
         );
         assert_eq!(f.budget.remaining_links(), 12);
         assert_eq!(f.budget.deadline(), original);
-        assert!(racer_platform::environment::now() < original);
+        assert!(uring_runtime::environment::now() < original);
     }
 
     #[test]
     fn slow_body_without_alternative_or_failure_route_credit_keeps_original_ceiling() {
         for (opportunities, links) in [(1, 24), (3, 4)] {
-            let clock = racer_platform::environment::SimulationClock::new_at(
+            let clock = uring_runtime::environment::SimulationClock::new_at(
                 95,
                 Instant::now(),
                 std::time::SystemTime::now(),
@@ -2390,7 +2390,7 @@ mod timeouts {
                 Err(Error::DeadlineExceeded)
             );
             assert!(poll(request.as_mut()).is_pending());
-            assert!(first.cancellation.is_canceled());
+            assert!(first.cancellation.is_cancelled());
             assert_eq!(first.deadline.0, original);
             assert_eq!(f.scope.check(), Ok(()));
             assert_eq!(f.peers.calls.borrow()[0].signed_deadline, original);
@@ -2412,7 +2412,7 @@ mod timeouts {
     #[test]
     fn known_healthy_body_outlives_share_with_or_without_affordable_fallback() {
         for links in [4, 24] {
-            let clock = racer_platform::environment::SimulationClock::new_at(
+            let clock = uring_runtime::environment::SimulationClock::new_at(
                 100,
                 Instant::now(),
                 std::time::SystemTime::now(),
@@ -2438,9 +2438,9 @@ mod timeouts {
                 clock.advance(Duration::from_secs(2));
                 first.candidate_body_progress(received, 80).unwrap();
                 assert!(poll(request.as_mut()).is_pending());
-                assert!(!first.cancellation.is_canceled());
+                assert!(!first.cancellation.is_cancelled());
             }
-            assert!(racer_platform::environment::now() > first.body_deadlines.unwrap().1);
+            assert!(uring_runtime::environment::now() > first.body_deadlines.unwrap().1);
             assert_eq!(f.peers.calls.borrow()[0].signed_deadline, original);
             f.scope.cancel().unwrap();
             assert!(matches!(
@@ -2454,7 +2454,7 @@ mod timeouts {
 
     #[test]
     fn configured_total_cap_never_renews_or_accepts_late_success() {
-        let clock = racer_platform::environment::SimulationClock::new_at(
+        let clock = uring_runtime::environment::SimulationClock::new_at(
             96,
             Instant::now(),
             std::time::SystemTime::now(),
@@ -2486,7 +2486,7 @@ mod timeouts {
         clock.advance(Duration::from_secs(1));
         assert_eq!(first.candidate_progress(), Err(Error::DeadlineExceeded));
         assert!(poll(request.as_mut()).is_pending());
-        assert!(first.cancellation.is_canceled());
+        assert!(first.cancellation.is_cancelled());
         assert_eq!(f.scope.check(), Ok(()));
         assert_eq!(first.deadline.0, original);
         assert_eq!(f.peers.calls.borrow()[0].signed_deadline, original);
@@ -2505,7 +2505,7 @@ mod timeouts {
     #[test]
     fn candidate_final_early_credits_exhaustion_and_recovered_fallback() {
         for (credits, stalled, late, fails) in [(0, 0, false, true), (16, 1, true, false)] {
-            let clock = racer_platform::environment::SimulationClock::new(198);
+            let clock = uring_runtime::environment::SimulationClock::new(198);
             let _env = clock.environment(0).enter();
             let mut f = Fixture::new(None, stalled, late).bounded(198, 60, 24);
             f.budget = AcquisitionBudget::new(f.scope.deadline.0, credits, 24);
@@ -2554,7 +2554,7 @@ mod timeouts {
 
     #[test]
     fn candidate_final_preserves_late_success_and_effective_deadline_error() {
-        let clock = racer_platform::environment::SimulationClock::new(199);
+        let clock = uring_runtime::environment::SimulationClock::new(199);
         let _env = clock.environment(0).enter();
         let mut f = Fixture::new(None, 3, true).bounded(199, 60, 24);
         let failures = crate::telemetry::Failures::default();
@@ -2597,7 +2597,7 @@ mod timeouts {
 
     #[test]
     fn candidate_final_remaining_copy_and_origin_miss_only_at_final_boundary() {
-        let clock = racer_platform::environment::SimulationClock::new(200);
+        let clock = uring_runtime::environment::SimulationClock::new(200);
         let _env = clock.environment(0).enter();
         let mut f = Fixture::new(Some(1), 1, true).bounded(200, 60, 24);
         let failures = crate::telemetry::Failures::default();
@@ -2674,7 +2674,7 @@ mod timeouts {
 
     #[test]
     fn retries_get_independent_local_caps_but_never_extend_overall_authority() {
-        let clock = racer_platform::environment::SimulationClock::new_at(
+        let clock = uring_runtime::environment::SimulationClock::new_at(
             101,
             Instant::now(),
             std::time::SystemTime::now(),
@@ -2709,7 +2709,7 @@ mod timeouts {
             } else {
                 assert!(matches!(result, Poll::Ready(Err(Error::DeadlineExceeded))));
             }
-            assert!(child.cancellation.is_canceled());
+            assert!(child.cancellation.is_cancelled());
         }
         drop(resolve);
         let calls = f.peers.calls.borrow();
@@ -2724,7 +2724,7 @@ mod timeouts {
         );
         assert_eq!(f.budget.remaining_links(), 4);
         assert_eq!(f.budget.deadline(), original);
-        assert!(!f.scope.cancellation.is_canceled());
+        assert!(!f.scope.cancellation.is_cancelled());
     }
 
     #[test]
@@ -2761,7 +2761,7 @@ mod timeouts {
             poll(subscribe.as_mut()).is_pending(),
             "accepted exchange is not fenced"
         );
-        assert!(f.peers.calls.borrow()[0].scope.cancellation.is_canceled());
+        assert!(f.peers.calls.borrow()[0].scope.cancellation.is_cancelled());
         assert!(f.scope.check().is_ok());
         f.peers.fenced.set(true);
         assert!(matches!(poll(subscribe.as_mut()), Poll::Ready(Ok(None))));
@@ -2823,7 +2823,7 @@ mod timeouts {
                     f.candidates.membership.version,
                     f.policy.node.clone(),
                     crate::peer::protocol::encode_deadline(Deadline(call.signed_deadline)).unwrap(),
-                    crate::peer::protocol::millis(racer_platform::environment::wall_now()).unwrap(),
+                    crate::peer::protocol::millis(uring_runtime::environment::wall_now()).unwrap(),
                 )
                 .expect("later exchange must not renew the provider contract");
             let crate::peer::subscriptions::Selection::Leader { work, waiter } = selected else {
@@ -2867,7 +2867,7 @@ mod timeouts {
         assert!(poll(subscribe.as_mut()).is_pending());
         f.scope.cancel().unwrap();
         assert!(poll(subscribe.as_mut()).is_pending());
-        assert!(f.peers.calls.borrow()[0].scope.cancellation.is_canceled());
+        assert!(f.peers.calls.borrow()[0].scope.cancellation.is_cancelled());
         f.peers.fenced.set(true);
         assert!(matches!(
             poll(subscribe.as_mut()),
@@ -2905,7 +2905,7 @@ mod timeouts {
             1,
             "must wait for completion fence"
         );
-        assert!(f.peers.calls.borrow()[0].scope.cancellation.is_canceled());
+        assert!(f.peers.calls.borrow()[0].scope.cancellation.is_cancelled());
         assert_eq!(f.scope.check(), Ok(()), "attempt must not cancel parent");
         f.peers.fenced.set(true);
         let Poll::Ready(Ok(CandidateResolution::Copy(response))) = poll(resolve.as_mut()) else {
@@ -3055,7 +3055,7 @@ mod timeouts {
         assert_eq!(f.peers.calls.borrow().len(), 3);
         assert_eq!(f.budget.remaining_attempts(), 0);
         assert_eq!(f.budget.remaining_links(), 4);
-        assert!(!f.scope.cancellation.is_canceled());
+        assert!(!f.scope.cancellation.is_cancelled());
     }
 
     #[test]
@@ -3074,7 +3074,7 @@ mod timeouts {
         assert!(poll(resolve.as_mut()).is_pending());
         f.scope.cancel().unwrap();
         assert!(poll(resolve.as_mut()).is_pending());
-        assert!(f.peers.calls.borrow()[0].scope.cancellation.is_canceled());
+        assert!(f.peers.calls.borrow()[0].scope.cancellation.is_cancelled());
         assert!(
             membership.upgrade().is_some(),
             "cancellation is not a membership completion fence"

@@ -819,8 +819,8 @@ fn queued_handoffs_reject_retired_generations_and_stopped_receivers() {
 
 #[test]
 fn simulated_listener_preparation_rollback_and_real_http_exchange() {
-    use racer_platform::reactor::SocketAddress;
-    use racer_platform::simulation::Simulation;
+    use uring_runtime::reactor::SocketAddress;
+    use uring_runtime::reactor::simulation::Simulation;
     let sim = Simulation::new();
     let _environment = sim.enter();
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits())));
@@ -890,9 +890,9 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
             .unwrap();
         reactor.poll_budgeted(16).unwrap();
         worker.poll(&mut Context::from_waker(futures::task::noop_waker_ref()));
-        match client.recv(&mut bytes, false) {
+        match client.recv(&mut bytes) {
             Ok(n) => response.extend_from_slice(&bytes[..n]),
-            Err(e) if e.is_would_block() => (),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
             Err(e) => panic!("{e}"),
         }
         if response.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -1075,7 +1075,7 @@ impl Fixture {
             scope.cancel().unwrap();
         }
         self.listeners.active.borrow_mut().push_back(Active {
-            runnable: racer_platform::drivers::Runnable::new(),
+            runnable: uring_runtime::drivers::Runnable::new(),
             deadline: Rc::new(Cell::new(scope.deadline.0)),
             expired: None,
             cache: definition().id,
@@ -1181,9 +1181,7 @@ fn client_listener_readiness_recovers_from_queue_pressure() {
     fixture.reconcile(&[definition()]).unwrap();
     let scope = scope();
     let (reader, _writer) = UnixStream::pair().unwrap();
-    let reader = Rc::new(racer_platform::reactor::descriptor::Descriptor::from(
-        reader,
-    ));
+    let reader = Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(reader));
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let mut pressure = Vec::new();
     for _ in 0..8 {
@@ -1351,7 +1349,7 @@ fn accepted_client_wakes_before_first_poll_and_blocked_clients_are_fair() {
         senders.push(send);
         let order = order.clone();
         fixture.listeners.active.borrow_mut().push_back(Active {
-            runnable: racer_platform::drivers::Runnable::new(),
+            runnable: uring_runtime::drivers::Runnable::new(),
             deadline: Rc::new(Cell::new(Instant::now() + Duration::from_secs(5))),
             expired: None,
             cache: definition().id,
@@ -1401,7 +1399,7 @@ fn accepted_client_wakes_before_first_poll_and_blocked_clients_are_fair() {
     assert_eq!(fixture.listeners.active_connections(), 0);
     let mut yielded = false;
     fixture.listeners.active.borrow_mut().push_back(Active {
-        runnable: racer_platform::drivers::Runnable::new(),
+        runnable: uring_runtime::drivers::Runnable::new(),
         deadline: Rc::new(Cell::new(Instant::now() + Duration::from_secs(5))),
         expired: None,
         cache: definition().id,
@@ -1844,7 +1842,7 @@ fn client_disconnect_cancels_pending_metadata_before_acquisition_deadline() {
     for _ in 0..64 {
         fixture.pump(16);
     }
-    assert!(scope.cancellation.is_canceled());
+    assert!(scope.cancellation.is_cancelled());
     assert!(Instant::now() < scope.deadline.0);
     assert_no_body_leases(&fixture);
 }
@@ -3462,7 +3460,7 @@ mod response {
     }
     #[test]
     fn gate_actual_readiness_rejection_selects_client_boundary() {
-        let sim = racer_platform::simulation::Simulation::new();
+        let sim = uring_runtime::reactor::simulation::Simulation::new();
         let _environment = sim.enter();
         let mut limits = crate::test_support::cluster::config(false).limits;
         limits.queue_entries = std::num::NonZeroUsize::new(1).unwrap();
@@ -3499,7 +3497,7 @@ mod response {
     }
     #[test]
     fn gate_payload_readiness_and_early_boundary_contracts() {
-        let sim = racer_platform::simulation::Simulation::new();
+        let sim = uring_runtime::reactor::simulation::Simulation::new();
         let _environment = sim.enter();
         let mut limits = crate::test_support::cluster::config(false).limits;
         limits.queue_entries = std::num::NonZeroUsize::new(1).unwrap();

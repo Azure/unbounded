@@ -6,8 +6,8 @@ use crate::{
     runtime::RequestScope,
 };
 use racer_control_wire::RailMapping;
-use racer_platform::fs::secure::{self, Attempts, Host};
 use std::{cell::Cell, path::PathBuf, rc::Rc, sync::Arc};
+use uring_runtime::reactor::filesystem::secure::{self, Attempts, Host};
 
 /// Own one journal namespace and fence abandoned writes before reusing its stage name.
 pub struct RailJournal {
@@ -87,13 +87,13 @@ mod tests {
     use super::*;
     use crate::test_support::enrollment::drive;
     use racer_crypto::enrollment::Enrollment;
-    use racer_platform::simulation::{Fault, Simulation};
     use std::{
         num::NonZeroU32,
         path::Path,
         task::{Context, Poll},
         time::Duration,
     };
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
 
     /// Failed durability never reaches crypto preparation, including a renewal CSR.
     #[test]
@@ -189,12 +189,11 @@ mod tests {
             assert!(matches!(pending.as_mut().poll(&mut cx), Poll::Pending));
             reactor.poll_budgeted(64).unwrap();
             reactor.wait(Duration::from_millis(1)).unwrap();
-            if sim.trace().iter().any(|event| {
-                event.kind
-                    == racer_platform::simulation::EventKind::Complete(
-                        racer_platform::uring::backend::OpKind::RenameAt,
-                    )
-            }) {
+            if sim
+                .trace()
+                .iter()
+                .any(|event| event.operation == "complete:rename")
+            {
                 break;
             }
         }

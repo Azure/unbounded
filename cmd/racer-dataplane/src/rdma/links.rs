@@ -246,7 +246,7 @@ impl Links {
     ) -> Self {
         // Simulation uses explicitly fired one-shot alarms, never ClockPoll.
         #[cfg(test)]
-        let reactor = reactor.filter(|_| racer_platform::environment::simulation_seed().is_none());
+        let reactor = reactor.filter(|_| uring_runtime::environment::simulation_seed().is_none());
         Self {
             client,
             node,
@@ -616,7 +616,7 @@ impl Links {
         {
             return SetupAdmission::Conflict;
         }
-        let now = racer_platform::environment::now();
+        let now = uring_runtime::environment::now();
         let mut setups = LinkNode::lock(&self.node.setups);
         if setups
             .get(&key)
@@ -643,7 +643,7 @@ impl Links {
         // The link id needs our nonce before the owner returns our endpoint.
         let mut nonce = [0; 16];
         while nonce == [0; 16] {
-            racer_platform::environment::fill_random(&mut nonce).map_err(|_| Error::Io)?;
+            uring_runtime::environment::fill_random(&mut nonce).map_err(|_| Error::Io)?;
         }
         let link_id = link_setup::LinkId::for_setup(remote, &nonce);
         let opened = self

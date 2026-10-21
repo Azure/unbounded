@@ -115,7 +115,7 @@ impl Retention {
         period: Duration,
         enabled: bool,
     ) -> Result<Self> {
-        let history = SecondSight::new(history_bytes, period, racer_platform::environment::now())
+        let history = SecondSight::new(history_bytes, period, uring_runtime::environment::now())
             .ok_or(Error::InvalidConfiguration)?;
         let heat = Heat::new(heat_entries).ok_or(Error::InvalidConfiguration)?;
         Ok(Self {
@@ -159,7 +159,7 @@ impl Retention {
         }
     }
     pub fn observe(&self, page: &PageId, interest: &Interest) -> Observation {
-        self.observe_at(page, interest, racer_platform::environment::now())
+        self.observe_at(page, interest, uring_runtime::environment::now())
     }
     fn observe_at(&self, page: &PageId, interest: &Interest, now: Instant) -> Observation {
         let mut latched = interest.0.lock().expect("interest mutex poisoned");
@@ -193,7 +193,7 @@ impl Retention {
         self.state
             .borrow_mut()
             .heat
-            .track(page, racer_platform::environment::now())
+            .track(page, uring_runtime::environment::now())
     }
     pub fn forget(&self, page: &PageId) {
         self.state.borrow_mut().heat.forget(page);
@@ -202,10 +202,10 @@ impl Retention {
         self.state
             .borrow_mut()
             .heat
-            .touch(page, racer_platform::environment::now());
+            .touch(page, uring_runtime::environment::now());
     }
     pub fn score(&self, page: &PageId) -> u8 {
-        self.score_at(page, racer_platform::environment::now())
+        self.score_at(page, uring_runtime::environment::now())
     }
     fn score_at(&self, page: &PageId, now: Instant) -> u8 {
         let owned = self.is_owned(page);
@@ -283,7 +283,7 @@ impl Retention {
     }
     pub fn snapshot(&self) -> Snapshot {
         let mut state = self.state.borrow_mut();
-        let (set_bits, bits) = state.history.occupancy(racer_platform::environment::now());
+        let (set_bits, bits) = state.history.occupancy(uring_runtime::environment::now());
         Snapshot {
             observations: self.counters.observations.load(Ordering::Relaxed),
             qualified: self.counters.qualified.load(Ordering::Relaxed),
@@ -305,7 +305,7 @@ mod tests {
     use std::cell::Cell;
     #[test]
     fn scoring_pass_pins_ownership_and_time_and_replacement_clears_factory() {
-        let clock = racer_platform::environment::SimulationClock::new(51);
+        let clock = uring_runtime::environment::SimulationClock::new(51);
         let _environment = clock.environment(0).enter();
         let policy = Retention::new(4096, 1).unwrap();
         let owned = Rc::new(Cell::new(true));
@@ -321,7 +321,7 @@ mod tests {
         }));
         policy.track(&page(0));
         policy.touch(&page(0));
-        let now = racer_platform::environment::now();
+        let now = uring_runtime::environment::now();
         let scoring = policy.scoring_at(now);
         owned.set(false);
         for _ in 0..256 {
@@ -415,7 +415,7 @@ mod tests {
     fn rotation_retains_three_to_four_minutes_and_clears_long_idle() {
         for period in [Duration::from_secs(60), Duration::from_millis(10)] {
             let policy = Retention::configured(4096, 1, period, true).unwrap();
-            let start = racer_platform::environment::now();
+            let start = uring_runtime::environment::now();
             let first = Interest::default();
             assert!(!policy.observe_at(&page(0), &first, start).eligible());
             assert!(
@@ -448,7 +448,7 @@ mod tests {
         }
         assert_eq!(policy.score(&page(0)), 3);
         assert_eq!(policy.score(&page(1)), 0);
-        let now = racer_platform::environment::now();
+        let now = uring_runtime::environment::now();
         assert_eq!(policy.score_at(&page(0), now + Duration::from_secs(60)), 2);
         let owned = Rc::new(Cell::new(true));
         let value = owned.clone();

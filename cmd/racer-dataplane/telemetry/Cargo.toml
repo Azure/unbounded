@@ -7,9 +7,9 @@ publish = false
 description = "Fixed metrics and bounded diagnostic primitives"
 
 [dependencies]
-racer-platform = { path = "../platform" }
+uring-runtime = { path = "../runtime" }
 httparse = "1"
 zeroize = "1"
 
 [dev-dependencies]
-racer-platform = { path = "../platform", features = ["simulation"] }
+uring-runtime = { path = "../runtime", features = ["simulation"] }

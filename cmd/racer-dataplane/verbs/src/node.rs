@@ -535,7 +535,7 @@ struct Backoff {
 /// Not `Send`. Poll it with [`Self::poll_budgeted`], or host it with
 /// [`crate::WithNative::with_host`].
 pub struct Owner {
-    environment: racer_platform::environment::Environment,
+    environment: uring_runtime::environment::Environment,
 
     #[cfg(any(test, feature = "simulation"))]
     simulation: Option<crate::simulation::Simulation>,
@@ -583,7 +583,7 @@ impl Owner {
             unsafe { (std::ptr::read(&port.channel), std::ptr::read(&port.shared)) };
 
         Self {
-            environment: racer_platform::environment::Environment::current(),
+            environment: uring_runtime::environment::Environment::current(),
             #[cfg(any(test, feature = "simulation"))]
             simulation: crate::simulation::current(),
             channel,
@@ -631,7 +631,7 @@ impl Owner {
         }
 
         let _environment = self.environment.enter();
-        let now = racer_platform::environment::now();
+        let now = uring_runtime::environment::now();
         let closed = self.shared.closed.load(Ordering::Acquire);
 
         if !closed && self.closing {
@@ -1227,7 +1227,7 @@ fn opened(link: &Link) -> Opened {
 fn jitter(delay: Duration) -> Duration {
     let mut bytes = [0u8; 2];
 
-    if racer_platform::environment::fill_random(&mut bytes).is_err() {
+    if uring_runtime::environment::fill_random(&mut bytes).is_err() {
         return delay;
     }
 

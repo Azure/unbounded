@@ -102,7 +102,7 @@ Owner-held, keyed by `LinkKey { peer: SHA-256(NodeId), rail }`:
   the initiator. Neither side sends data until `Ready`.
 - `Breaking`: QP moved to ERR, destroy pending. Quarantined buffers wait here.
 - `Backoff`: 1 s, doubling to 60 s, plus or minus 20 % jitter using
-  `racer_platform::environment` randomness. It resets after a link has been
+  `uring_runtime::environment` randomness. It resets after a link has been
   `Ready` for 60 s. Backoff throttles only our own `open`; an authenticated
   incoming setup is accepted in any state.
 - Idle close: a `Ready` link with no grant, write, or release for 120 s sends

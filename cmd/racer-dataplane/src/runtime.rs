@@ -8,18 +8,18 @@ use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
 use crate::model::RequestId;
-use racer_platform::environment::Deadline;
-use racer_platform::fs::Buffer;
-use racer_platform::reactor::ReactorWake;
-use racer_platform::reactor::SUBMISSION_BYTES;
-use racer_platform::reactor::SubmissionCapacity;
-use racer_platform::scope::CancellationRegistration;
 use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Instant;
+use uring_runtime::environment::CancellationRegistration;
+use uring_runtime::environment::Deadline;
+use uring_runtime::reactor::ReactorWake;
+use uring_runtime::reactor::SUBMISSION_BYTES;
+use uring_runtime::reactor::SubmissionCapacity;
+use uring_runtime::reactor::filesystem::Buffer;
 
 // Seeded hashing only in simulated worlds; production retains std hashing.
 #[cfg(not(test))]
@@ -39,7 +39,7 @@ pub(crate) enum HashState {
 #[cfg(test)]
 impl Default for HashState {
     fn default() -> Self {
-        match racer_platform::environment::simulation_seed() {
+        match uring_runtime::environment::simulation_seed() {
             Some(seed) => Self::Simulated(seed),
             None => Self::Real(std::collections::hash_map::RandomState::new()),
         }
@@ -64,7 +64,7 @@ impl std::hash::BuildHasher for HashState {
 /// Racer candidate policy shares the cancellation lifetime, but is not runtime policy.
 #[derive(Clone)]
 pub struct Cancellation {
-    inner: racer_platform::scope::Cancellation,
+    inner: uring_runtime::environment::Cancellation,
     state: Arc<CancellationState>,
 }
 struct CancellationState {
@@ -76,7 +76,7 @@ type CandidateBody = flow_control::progress::ProgressBudget;
 impl Cancellation {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            inner: racer_platform::scope::Cancellation::new(),
+            inner: uring_runtime::environment::Cancellation::new()?,
             state: Arc::new(CancellationState {
                 candidate_total: OnceLock::new(),
                 candidate_idle: OnceLock::new(),
@@ -84,23 +84,16 @@ impl Cancellation {
             }),
         })
     }
-    pub fn is_canceled(&self) -> bool {
-        self.inner.is_canceled()
-    }
-    /// Live wake registrations on the shared token (tests).
-    #[cfg(test)]
-    pub(crate) fn registrations(&self) -> usize {
-        self.inner.registrations()
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
     }
     /// Subscribe for one operation's lifetime, even when several operations share
     /// an executor waker. Dropping the subscription reclaims its capacity and wake.
     pub fn subscribe(&self) -> Result<CancellationRegistration> {
-        use racer_platform::scope::CancellationExt as _;
-        Ok(self.inner.subscribe())
+        self.inner.subscribe().map_err(Into::into)
     }
     pub fn cancel(&self) -> Result<()> {
-        self.inner.cancel();
-        Ok(())
+        self.inner.cancel().map_err(Into::into)
     }
 }
 #[derive(Clone)]
@@ -138,7 +131,7 @@ impl RequestScope {
             .candidate_idle
             .set(Mutex::new((
                 allowance,
-                racer_platform::environment::now() + allowance,
+                uring_runtime::environment::now() + allowance,
             )))
             .map_err(|_| Error::Internal)?;
         Ok(())
@@ -148,7 +141,7 @@ impl RequestScope {
         self.check()?;
         if let Some(idle) = self.cancellation.state.candidate_idle.get() {
             let mut idle = idle.lock().map_err(|_| Error::Unavailable)?;
-            idle.1 = racer_platform::environment::now() + idle.0;
+            idle.1 = uring_runtime::environment::now() + idle.0;
         }
         Ok(())
     }
@@ -179,7 +172,7 @@ impl RequestScope {
             return Err(Error::InvalidRequest);
         }
         if let Some(body) = self.cancellation.state.candidate_body.get() {
-            let now = racer_platform::environment::now();
+            let now = uring_runtime::environment::now();
             let mut body = body.lock().map_err(|_| Error::Unavailable)?;
             if !body.advance(now, received, total) {
                 return Err(Error::DeadlineExceeded);
@@ -197,24 +190,24 @@ impl RequestScope {
         })
     }
     pub fn check(&self) -> Result<()> {
-        if self.cancellation.is_canceled() {
+        if self.cancellation.is_cancelled() {
             Err(Error::Cancelled)
-        } else if racer_platform::environment::now() >= self.deadline.0 {
+        } else if uring_runtime::environment::now() >= self.deadline.0 {
             Err(Error::DeadlineExceeded)
         } else {
             if let Some(expires) = self.cancellation.state.candidate_total.get()
-                && racer_platform::environment::now() >= *expires
+                && uring_runtime::environment::now() >= *expires
             {
                 return Err(Error::DeadlineExceeded);
             }
             if let Some(body) = self.cancellation.state.candidate_body.get() {
                 let body = body.lock().map_err(|_| Error::Unavailable)?;
-                if body.expired(racer_platform::environment::now()) {
+                if body.expired(uring_runtime::environment::now()) {
                     return Err(Error::DeadlineExceeded);
                 }
             }
             if let Some(idle) = self.cancellation.state.candidate_idle.get()
-                && racer_platform::environment::now()
+                && uring_runtime::environment::now()
                     >= idle.lock().map_err(|_| Error::Unavailable)?.1
             {
                 return Err(Error::DeadlineExceeded);
@@ -226,20 +219,15 @@ impl RequestScope {
         self.cancellation.cancel()
     }
 }
-impl racer_platform::scope::LibraryScope for RequestScope {
+impl uring_runtime::Scope for RequestScope {
     type Error = Error;
 
     fn check(&self) -> Result<()> {
         RequestScope::check(self)
     }
 
-    fn cancellation(&self) -> Option<&racer_platform::scope::Cancellation> {
+    fn cancellation(&self) -> Option<&uring_runtime::environment::Cancellation> {
         Some(&self.cancellation.inner)
-    }
-
-    /// Report the same hard deadline as the wire-codec scope.
-    fn deadline(&self) -> Option<Instant> {
-        Some(self.deadline.0)
     }
 }
 impl wire_codec::rest::Scope for RequestScope {
@@ -255,18 +243,15 @@ impl wire_codec::rest::Scope for RequestScope {
 }
 
 pub struct AdmissionBudget(Rc<flow_control::Quotas<AdmissionPolicy>>);
-impl racer_platform::Budget for AdmissionBudget {
+impl uring_runtime::Budget for AdmissionBudget {
     type Charge = flow_control::Charge<AdmissionPolicy>;
-    fn charge(
-        &self,
-        bytes: usize,
-    ) -> racer_platform::Result<flow_control::Charge<AdmissionPolicy>> {
+    fn charge(&self, bytes: usize) -> uring_runtime::Result<flow_control::Charge<AdmissionPolicy>> {
         self.0
             .reserve_completion(None, ResourceClass::RequestContext, bytes)
             .map_err(|error| match error {
-                flow_control::Error::InvalidInput => racer_platform::Error::InvalidConfiguration,
-                flow_control::Error::Unavailable => racer_platform::Error::Unavailable,
-                _ => racer_platform::Error::Overloaded,
+                flow_control::Error::InvalidInput => uring_runtime::Error::InvalidConfiguration,
+                flow_control::Error::Unavailable => uring_runtime::Error::Unavailable,
+                _ => uring_runtime::Error::Overloaded,
             })
     }
 }
@@ -276,7 +261,7 @@ impl racer_platform::Budget for AdmissionBudget {
 /// Inline storage cannot meet the stable-buffer contract:
 /// ```compile_fail
 /// use racer_dataplane::error::Result;
-/// use racer_platform::reactor::IoBuffer;
+/// use uring_runtime::reactor::IoBuffer;
 /// struct Inline([u8; 16]);
 /// impl IoBuffer for Inline {
 ///     type Error = racer_dataplane::error::Error;
@@ -287,7 +272,7 @@ impl racer_platform::Budget for AdmissionBudget {
 /// Borrowed storage does not have an independent completion lifetime:
 /// ```compile_fail
 /// use racer_dataplane::error::Result;
-/// use racer_platform::reactor::IoBuffer;
+/// use uring_runtime::reactor::IoBuffer;
 /// struct Borrowed<'a>(&'a mut [u8]);
 /// unsafe impl IoBuffer for Borrowed<'_> {
 ///     type Error = racer_dataplane::error::Error;
@@ -298,7 +283,7 @@ impl racer_platform::Budget for AdmissionBudget {
 /// Audited production buffers own independent storage:
 /// ```
 /// use racer_dataplane::{memory::PlaintextBuffer, admission::AdmissionPolicy};
-/// use racer_platform::reactor::IoBuffer;
+/// use uring_runtime::reactor::IoBuffer;
 /// use flow_control::Charge;
 /// use page_alloc::AlignedBuffer;
 /// fn independent<T: 'static>() {}
@@ -310,17 +295,17 @@ impl racer_platform::Budget for AdmissionBudget {
 /// ```compile_fail
 /// use std::rc::Rc;
 /// use racer_dataplane::{memory::CiphertextPage, runtime::{Reactor, RequestScope}};
-/// use racer_platform::reactor::descriptor::Descriptor;
+/// use uring_runtime::reactor::descriptor::Descriptor;
 /// fn receive(r: &Reactor, fd: Rc<Descriptor>, page: CiphertextPage, scope: &RequestScope) {
 ///     let _ = r.recv(fd, page, (), scope);
 /// }
 /// ```
 pub struct Reactor {
-    core: racer_platform::reactor::Reactor<RequestScope, AdmissionBudget>,
+    core: uring_runtime::reactor::Reactor<RequestScope, AdmissionBudget>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
 }
 impl Deref for Reactor {
-    type Target = racer_platform::reactor::Reactor<RequestScope, AdmissionBudget>;
+    type Target = uring_runtime::reactor::Reactor<RequestScope, AdmissionBudget>;
     fn deref(&self) -> &Self::Target {
         &self.core
     }
@@ -333,7 +318,7 @@ impl Reactor {
     pub fn new(admission: Rc<flow_control::Quotas<AdmissionPolicy>>) -> Self {
         let diagnostics = admission.clone();
         Self {
-            core: racer_platform::reactor::Reactor::new(
+            core: uring_runtime::reactor::Reactor::new(
                 admission.policy().limits().queue_entries.get(),
                 AdmissionBudget(admission.clone()),
             )
@@ -393,7 +378,7 @@ impl Reactor {
         self.core
             .reserve_submissions(capacity, (slots, memory))
             .map_err(|error| match error {
-                racer_platform::Error::InvalidInput => Error::InvalidConfiguration,
+                uring_runtime::Error::InvalidInput => Error::InvalidConfiguration,
                 other => other.into(),
             })
     }
@@ -410,8 +395,8 @@ mod tests {
     use crate::error::Error;
     use crate::model::RequestId;
     use crate::runtime::RequestScope;
-    use racer_platform::environment::*;
     use std::time::Duration;
+    use uring_runtime::environment::*;
     mod deadline {
         //! Request scope and cancellation regression tests.
         use crate::runtime::*;
@@ -426,9 +411,9 @@ mod tests {
             #[test]
             fn rest_narrowing_preserves_policy_cancellation_and_parent_deadline() {
                 use wire_codec::rest::Scope;
-                let clock = racer_platform::environment::SimulationClock::new(102);
+                let clock = uring_runtime::environment::SimulationClock::new(102);
                 let _env = clock.environment(0).enter();
-                let start = racer_platform::environment::now();
+                let start = uring_runtime::environment::now();
                 let end = start + Duration::from_secs(30);
                 let scope = RequestScope::new(RequestId([102; 16]), end).unwrap();
                 scope
@@ -446,9 +431,9 @@ mod tests {
 
             #[test]
             fn candidate_total_survives_body_completion_and_never_changes_authority() {
-                let clock = racer_platform::environment::SimulationClock::new(97);
+                let clock = uring_runtime::environment::SimulationClock::new(97);
                 let _env = clock.environment(0).enter();
-                let start = racer_platform::environment::now();
+                let start = uring_runtime::environment::now();
                 let scope = RequestScope::new(RequestId([97; 16]), start + Duration::from_secs(60))
                     .unwrap();
                 let signed = crate::peer::protocol::encode_deadline(scope.deadline).unwrap();
@@ -487,9 +472,9 @@ mod tests {
 
             #[test]
             fn candidate_body_budget_accepts_original_ceiling_and_rejects_invalid_bounds() {
-                let clock = racer_platform::environment::SimulationClock::new(98);
+                let clock = uring_runtime::environment::SimulationClock::new(98);
                 let _env = clock.environment(0).enter();
-                let start = racer_platform::environment::now();
+                let start = uring_runtime::environment::now();
                 let end = start + Duration::from_secs(30);
                 let scope = RequestScope::new(RequestId([98; 16]), end).unwrap();
                 assert_eq!(
@@ -529,9 +514,9 @@ mod tests {
 
             #[test]
             fn candidate_body_reserve_keeps_healthy_progress_and_ignores_unknown_lengths() {
-                let clock = racer_platform::environment::SimulationClock::new(91);
+                let clock = uring_runtime::environment::SimulationClock::new(91);
                 let _env = clock.environment(0).enter();
-                let start = racer_platform::environment::now();
+                let start = uring_runtime::environment::now();
                 let healthy =
                     RequestScope::new(RequestId([91; 16]), start + Duration::from_secs(30))
                         .unwrap();
@@ -547,13 +532,13 @@ mod tests {
                     clock.advance(Duration::from_secs(2));
                     healthy.candidate_body_progress(received, 80).unwrap();
                 }
-                assert!(racer_platform::environment::now() > start + Duration::from_secs(10));
+                assert!(uring_runtime::environment::now() > start + Duration::from_secs(10));
                 assert_eq!(healthy.deadline.0, start + Duration::from_secs(30));
                 // Completed network body does not subject later verification to the reserve.
                 clock.advance(Duration::from_secs(7));
                 healthy.check().unwrap();
                 for reserve in [false, true] {
-                    let now = racer_platform::environment::now();
+                    let now = uring_runtime::environment::now();
                     let scope =
                         RequestScope::new(RequestId([92; 16]), now + Duration::from_secs(30))
                             .unwrap();
@@ -583,9 +568,9 @@ mod tests {
 
             #[test]
             fn candidate_body_rate_starts_at_first_bytes_and_expiry_is_sticky() {
-                let clock = racer_platform::environment::SimulationClock::new(93);
+                let clock = uring_runtime::environment::SimulationClock::new(93);
                 let _env = clock.environment(0).enter();
-                let start = racer_platform::environment::now();
+                let start = uring_runtime::environment::now();
                 let scope = RequestScope::new(RequestId([93; 16]), start + Duration::from_secs(30))
                     .unwrap();
                 scope.set_candidate_idle(Duration::from_secs(10)).unwrap();
@@ -612,14 +597,14 @@ mod tests {
                     scope.candidate_body_progress(usize::MAX, usize::MAX),
                     Err(Error::DeadlineExceeded)
                 );
-                assert!(racer_platform::environment::now() < scope.deadline.0);
+                assert!(uring_runtime::environment::now() < scope.deadline.0);
             }
 
             #[test]
             fn candidate_idle_progress_never_renews_hard_deadline_or_revives_expiry() {
-                let clock = racer_platform::environment::SimulationClock::new(39);
+                let clock = uring_runtime::environment::SimulationClock::new(39);
                 let _env = clock.environment(0).enter();
-                let start = racer_platform::environment::now();
+                let start = uring_runtime::environment::now();
                 let scope =
                     RequestScope::new(RequestId([39; 16]), start + Duration::from_secs(3)).unwrap();
                 scope.set_candidate_idle(Duration::from_secs(1)).unwrap();
@@ -650,9 +635,9 @@ mod tests {
             }
             #[test]
             fn runtime_scope_retains_candidate_policy_and_shared_cancellation() {
-                let clock = racer_platform::environment::SimulationClock::new(101);
+                let clock = uring_runtime::environment::SimulationClock::new(101);
                 let _env = clock.environment(0).enter();
-                let start = racer_platform::environment::now();
+                let start = uring_runtime::environment::now();
                 let scope =
                     RequestScope::new(RequestId([101; 16]), start + Duration::from_secs(30))
                         .unwrap();
@@ -662,19 +647,17 @@ mod tests {
                 let clone = scope.clone();
                 clock.advance(Duration::from_secs(10));
                 assert_eq!(
-                    racer_platform::scope::LibraryScope::check(&clone),
+                    uring_runtime::Scope::check(&clone),
                     Err(Error::DeadlineExceeded)
                 );
                 let count = Arc::new(Count(AtomicUsize::new(0)));
-                let registration = racer_platform::CancellationExt::subscribe(
-                    racer_platform::scope::LibraryScope::cancellation(&clone).unwrap(),
-                );
+                let registration = uring_runtime::Scope::cancellation(&clone)
+                    .unwrap()
+                    .subscribe()
+                    .unwrap();
                 registration.register(&Waker::from(count.clone()));
                 scope.cancel().unwrap();
-                assert_eq!(
-                    racer_platform::scope::LibraryScope::check(&clone),
-                    Err(Error::Cancelled)
-                );
+                assert_eq!(uring_runtime::Scope::check(&clone), Err(Error::Cancelled));
                 assert_eq!(count.0.load(Ordering::Relaxed), 1);
             }
             #[test]
@@ -709,15 +692,15 @@ mod tests {
 
         mod tests {
             use super::*;
-            use racer_platform::reactor::IoBuffer;
-            use racer_platform::reactor::SocketAddress;
-            use racer_platform::reactor::descriptor::Descriptor;
-            use racer_platform::simulation;
             use std::os::unix::net::UnixStream;
             use std::task::Context;
             use std::task::Poll;
             use std::time::Duration;
             use std::time::Instant;
+            use uring_runtime::reactor::IoBuffer;
+            use uring_runtime::reactor::SocketAddress;
+            use uring_runtime::reactor::descriptor::Descriptor;
+            use uring_runtime::reactor::simulation;
 
             #[test]
             fn direct_filesystem_buffers_preserve_nonempty_boundary_and_charge() {
@@ -732,7 +715,8 @@ mod tests {
                     Err(Error::InvalidConfiguration)
                 ));
                 assert_eq!(admission.used(ResourceClass::RequestContext), 0);
-                let mut buffer: racer_platform::fs::Buffer = reactor.file_bytes(b"abc").unwrap();
+                let mut buffer: uring_runtime::reactor::filesystem::Buffer =
+                    reactor.file_bytes(b"abc").unwrap();
                 assert_eq!(buffer.prefix(3).unwrap(), b"abc");
                 assert!(buffer.prefix(4).is_err());
                 assert!(buffer.advance(4).is_err());
@@ -903,7 +887,7 @@ mod tests {
                 assert!(poll(&mut busy).is_pending());
                 let address = SocketAddress::Unix("/retry-listener".into());
                 let listener = Rc::new(sim.listen(address.clone()).unwrap());
-                let mut accept = racer_platform::drivers::retry_listener(&request, || {
+                let mut accept = uring_runtime::drivers::retry_listener(&request, || {
                     reactor.accept(listener.clone(), &request)
                 });
                 assert!(poll(&mut accept).is_pending());
@@ -975,17 +959,10 @@ mod tests {
                 assert!(poll(&mut pending).is_pending());
                 drive(&reactor, reactor.drain()).unwrap();
                 assert_eq!(reactor.in_flight(), 0);
-                // Drain cancels the pending readiness wait, but a kernel result
-                // that arrives first wins over the cancellation (here the
-                // socket is already writable), so either outcome is final.
-                let drained = poll(&mut pending);
-                assert!(
-                    matches!(
-                        drained,
-                        Poll::Ready(Err(Error::Cancelled)) | Poll::Ready(Ok(_))
-                    ),
-                    "{drained:?}"
-                );
+                assert!(matches!(
+                    poll(&mut pending),
+                    Poll::Ready(Err(Error::Cancelled))
+                ));
                 assert_eq!(reactor.init(), Err(Error::Unavailable));
                 assert_eq!(reactor.admission.used(ResourceClass::ControlProgress), 2);
                 drop(control);
@@ -1126,15 +1103,15 @@ mod tests {
             use crate::error::Error;
             use crate::error::Result;
             use crate::runtime::RequestScope;
-            use racer_platform::simulation::DiskState;
-            use racer_platform::simulation::Environment;
-            use racer_platform::simulation::Fault;
-            use racer_platform::simulation::Simulation;
             use std::cell::Cell;
             use std::ffi::CString;
             use std::path::Path;
             use std::rc::Rc;
             use std::time::Duration;
+            use uring_runtime::reactor::simulation::Environment;
+            use uring_runtime::reactor::simulation::Fault;
+            use uring_runtime::reactor::simulation::Simulation;
+            use uring_runtime::reactor::simulation::disk::DiskState;
             fn reactor() -> Reactor {
                 Reactor::new(Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
@@ -1160,17 +1137,17 @@ mod tests {
                 );
                 let b = b.into_sim().unwrap();
                 let mut bytes = [0; 2];
-                b.recv(&mut bytes, false).unwrap();
+                b.recv(&mut bytes).unwrap();
                 assert_eq!(&bytes, b"ab");
                 assert_eq!(pipe.try_splice_descriptor(&a, 3).unwrap(), 1);
-                assert_eq!(b.recv(&mut bytes, false).unwrap(), 1);
+                assert_eq!(b.recv(&mut bytes).unwrap(), 1);
                 assert_eq!(bytes[0], b'c');
             }
             #[test]
             fn direct_io_faults_check_address_offset_and_length_independently() {
                 use page_alloc::AlignedBuffer;
                 use page_alloc::Alignment;
-                use racer_platform::reactor::IoBuffer;
+                use uring_runtime::reactor::IoBuffer;
                 struct View {
                     buffer: AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
                     start: usize,
@@ -1264,7 +1241,7 @@ mod tests {
             #[test]
             fn candidate_total_cancels_pending_receive_without_bytes_and_retains_both_fences() {
                 for cancel_first in [false, true] {
-                    let clock = racer_platform::environment::SimulationClock::new(99);
+                    let clock = uring_runtime::environment::SimulationClock::new(99);
                     let _clock = clock.environment(0).enter();
                     let sim = Simulation::new();
                     sim.set_cancel_first(cancel_first);
@@ -1272,7 +1249,7 @@ mod tests {
                     let r = reactor();
                     r.init().unwrap();
                     let baseline = r.admission.used(ResourceClass::RequestContext);
-                    let start = racer_platform::environment::now();
+                    let start = uring_runtime::environment::now();
                     let request = RequestScope::new(
                         crate::model::RequestId([99; 16]),
                         start + Duration::from_secs(60),
@@ -1298,7 +1275,7 @@ mod tests {
                     assert_eq!(r.poll_budgeted(1), Ok(0));
                     clock.advance(Duration::from_secs(1));
                     assert_eq!(r.poll_budgeted(1), Ok(0));
-                    assert!(!request.cancellation.is_canceled());
+                    assert!(!request.cancellation.is_cancelled());
                     assert_eq!(request.deadline.0, start + Duration::from_secs(60));
                     assert_eq!(r.poll_budgeted(1), Ok(1));
                     assert!(poll(&mut recv).is_pending());
@@ -1447,7 +1424,7 @@ mod tests {
                 assert_eq!(&*bytes, b"first");
                 let private = drive(
                     &r,
-                    Box::pin(racer_platform::fs::secure::directory(
+                    Box::pin(uring_runtime::reactor::filesystem::secure::directory(
                         &r,
                         Path::new("/private"),
                         true,
@@ -1460,7 +1437,7 @@ mod tests {
                 drive(
                     &r,
                     Box::pin(async {
-                        racer_platform::fs::secure::atomic_write(
+                        uring_runtime::reactor::filesystem::secure::atomic_write(
                             &r, &private, "identity", b"secret", &scope,
                         )
                         .await
@@ -1514,7 +1491,7 @@ mod tests {
         let mut bytes = [0; 32];
         fill_random(&mut bytes).unwrap();
         assert_eq!(sample(1).1, bytes);
-        let _real = racer_platform::environment::Environment::default().enter();
+        let _real = uring_runtime::environment::Environment::default().enter();
         assert!(matches!(HashState::default(), HashState::Real(_)));
     }
 
@@ -1558,15 +1535,15 @@ mod tests {
         use crate::model::RequestId;
         use crate::runtime::RequestScope;
         use crate::test_support::WakeCounter;
-        use racer_platform::drivers::retry_listener as retry;
-        use racer_platform::environment;
-        use racer_platform::environment::SimulationClock;
         use std::cell::Cell;
         use std::sync::Arc;
         use std::task::Context;
         use std::task::Poll;
         use std::task::Waker;
         use std::time::Duration;
+        use uring_runtime::drivers::retry_listener as retry;
+        use uring_runtime::environment;
+        use uring_runtime::environment::SimulationClock;
 
         #[test]
         fn repeated_pressure_is_rate_limited_without_self_wakes() {
@@ -1646,8 +1623,8 @@ mod tests {
         fn submitted_listener_cancellation_waits_for_cqe_fence() {
             use crate::admission::AdmissionPolicy;
             use crate::runtime::Reactor;
-            use racer_platform::simulation::Simulation;
             use std::rc::Rc;
+            use uring_runtime::reactor::simulation::Simulation;
             let sim = Simulation::new();
             let _os = sim.enter();
             let clock = SimulationClock::new(3);

@@ -31,9 +31,6 @@ use racer_control_wire as state;
 use racer_control_wire as wire;
 use racer_control_wire::CacheId;
 use racer_control_wire::MembershipVersion;
-#[cfg(test)]
-use racer_platform::group::Service;
-use racer_platform::group::affinity::EffectiveTopology;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io::Read;
@@ -43,6 +40,9 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::thread;
 use std::time::Instant;
+#[cfg(test)]
+use uring_runtime::group::Service;
+use uring_runtime::group::affinity::EffectiveTopology;
 
 /// Controllable TLS endpoints and observations for application lifecycle tests.
 pub(super) struct ControlFixture {
@@ -852,7 +852,12 @@ fn queue_limited_plan(planned: usize, supported: usize) -> (Limits, AffinityPlan
         max_threads: planned * 2,
         pairs: (0..planned)
             .map(|id| {
-                let io = crate::worker::cpu_location(id, Some(0), Some(id), Some(0));
+                let io = uring_runtime::group::affinity::CpuLocation {
+                    cpu: id,
+                    package: 0,
+                    core: id,
+                    numa_node: Some(0),
+                };
                 crate::worker::WorkerPair {
                     worker: WorkerId(id as u16),
                     crypto: io.clone(),
@@ -918,7 +923,8 @@ fn worker_sizing_reduces_at_or_above_half() {
 
 #[test]
 fn worker_sizing_funds_diagnostics_and_ordinary_progress() {
-    use racer_platform::simulation::Simulation;
+    use uring_runtime::group::affinity::CpuLocation;
+    use uring_runtime::reactor::simulation::Simulation;
     let mut config = Config::from_lookup(|name| {
         Ok(match name {
             "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
@@ -933,7 +939,12 @@ fn worker_sizing_funds_diagnostics_and_ordinary_progress() {
         &config,
         EffectiveTopology {
             cpus: (0..8)
-                .map(|cpu| crate::worker::cpu_location(cpu, Some(0), Some(cpu), Some(0)))
+                .map(|cpu| CpuLocation {
+                    cpu,
+                    package: 0,
+                    core: cpu,
+                    numa_node: Some(0),
+                })
                 .collect(),
             quota: None,
             nics: vec![],
@@ -1036,6 +1047,7 @@ fn worker_sizing_funds_diagnostics_and_ordinary_progress() {
 
 #[test]
 fn worker_sizing_rejects_four_queue_entries_with_two_threads() {
+    use uring_runtime::group::affinity::CpuLocation;
     let config = Config::from_lookup(|name| {
         Ok(match name {
             "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
@@ -1051,7 +1063,12 @@ fn worker_sizing_rejects_four_queue_entries_with_two_threads() {
         &config,
         EffectiveTopology {
             cpus: (0..8)
-                .map(|cpu| crate::worker::cpu_location(cpu, Some(0), Some(cpu), None))
+                .map(|cpu| CpuLocation {
+                    cpu,
+                    package: 0,
+                    core: cpu,
+                    numa_node: None,
+                })
                 .collect(),
             quota: None,
             nics: vec![],
@@ -1073,7 +1090,8 @@ fn worker_sizing_rejects_four_queue_entries_with_two_threads() {
 #[test]
 fn worker_sizing_funds_derived_connection_pools() {
     use crate::admission::ResourceClass;
-    use racer_platform::group::affinity::EffectiveTopology;
+    use uring_runtime::group::affinity::CpuLocation;
+    use uring_runtime::group::affinity::EffectiveTopology;
     let mut config = Config::from_lookup(|name| {
         Ok(match name {
             "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
@@ -1090,7 +1108,12 @@ fn worker_sizing_funds_derived_connection_pools() {
             &config,
             EffectiveTopology {
                 cpus: (0..8)
-                    .map(|cpu| crate::worker::cpu_location(cpu, Some(0), Some(cpu), Some(0)))
+                    .map(|cpu| CpuLocation {
+                        cpu,
+                        package: 0,
+                        core: cpu,
+                        numa_node: Some(0),
+                    })
                     .collect(),
                 quota: None,
                 nics: vec![],
@@ -1209,7 +1232,7 @@ fn assembled_worker_exports_live_quota_gauges() {
 
 #[test]
 fn disk_usage_worker_samples_recovery_and_reset() {
-    let simulation = racer_platform::simulation::Simulation::new();
+    let simulation = uring_runtime::reactor::simulation::Simulation::new();
     let _environment = simulation.enter();
     let worker = wake_test_worker();
     let geometry = futures::executor::block_on(worker.prepare_storage()).unwrap();
@@ -1267,11 +1290,11 @@ fn application_budget_poll_preserves_cooperative_and_completion_wakes() {
             Poll::Pending
         }
     })));
-    worker.poll(&mut cx, 0).unwrap();
+    worker.poll_budgeted(&mut cx, 0).unwrap();
     assert_eq!(count.count(), 0);
-    worker.poll(&mut cx, 1).unwrap();
+    worker.poll_budgeted(&mut cx, 1).unwrap();
     assert_eq!(count.count(), 1, "cooperative continuation reaches driver");
-    worker.poll(&mut cx, 1).unwrap();
+    worker.poll_budgeted(&mut cx, 1).unwrap();
     assert_eq!(count.count(), 1, "blocked task does not spin");
     std::thread::spawn(move || send.send(()).unwrap())
         .join()
@@ -1281,7 +1304,7 @@ fn application_budget_poll_preserves_cooperative_and_completion_wakes() {
         2,
         "registered completion wakes driver across threads"
     );
-    worker.poll(&mut cx, 1).unwrap();
+    worker.poll_budgeted(&mut cx, 1).unwrap();
     assert!(worker.peer_task.is_none());
     assert!(worker.diagnostic_task.is_none());
 }
@@ -1293,7 +1316,7 @@ fn placement_maintenance_retries_pressure_without_spinning_or_log_floods() {
     let count = Arc::new(crate::test_support::WakeCounter::default());
     let waker = std::task::Waker::from(count.clone());
     let mut cx = Context::from_waker(&waker);
-    let now = racer_platform::environment::now();
+    let now = uring_runtime::environment::now();
     worker.observe_placement_maintenance(Maintenance::Idle, now, &mut cx);
     assert_eq!(count.count(), 0);
     worker.observe_placement_maintenance(Maintenance::Progress, now, &mut cx);
@@ -1315,7 +1338,7 @@ fn placement_maintenance_retries_pressure_without_spinning_or_log_floods() {
 
 #[test]
 fn metadata_wait_uses_worker_clock_and_keeps_due_backlog_runnable() {
-    use racer_platform::environment::SimulationClock;
+    use uring_runtime::environment::SimulationClock;
     let clock = SimulationClock::new(913);
     let worker = {
         let _environment = clock.environment(0).enter();
@@ -1324,7 +1347,7 @@ fn metadata_wait_uses_worker_clock_and_keeps_due_backlog_runnable() {
         // deadlines. Construct every worker timer in the same simulated clock.
         worker
             .ownership_maintenance
-            .poll(racer_platform::environment::now(), false, || {
+            .poll(uring_runtime::environment::now(), false, || {
                 Ok(crate::topology::Maintenance::Idle)
             });
         worker
@@ -1332,10 +1355,10 @@ fn metadata_wait_uses_worker_clock_and_keeps_due_backlog_runnable() {
     let maximum = Duration::from_millis(1);
     let now = {
         let _environment = worker.environment.enter();
-        racer_platform::environment::now()
+        uring_runtime::environment::now()
     };
     // Require the hook to enter the worker environment, not sample host time.
-    let _required = racer_platform::environment::require_simulated();
+    let _required = uring_runtime::environment::require_simulated();
     assert_eq!(worker.wait_timeout(maximum), maximum);
     let probes: Vec<_> = (0..65)
         .map(|_| crate::read::metadata::tests::deadline_probe(&worker.metadata, now + maximum * 2))
@@ -1391,13 +1414,13 @@ fn application_metadata_deadline_hook_is_budgeted_and_precedes_peer_polling() {
         }
         Poll::Pending
     })));
-    worker.poll(&mut cx, 0).unwrap();
+    worker.poll_budgeted(&mut cx, 0).unwrap();
     assert_eq!(completed.get(), 0);
     assert_eq!(
         worker.wait_timeout(Duration::from_millis(1)),
         Duration::ZERO
     );
-    worker.poll(&mut cx, usize::MAX).unwrap();
+    worker.poll_budgeted(&mut cx, usize::MAX).unwrap();
     assert_eq!(
         completed.get(),
         64,
@@ -1407,14 +1430,14 @@ fn application_metadata_deadline_hook_is_budgeted_and_precedes_peer_polling() {
         worker.wait_timeout(Duration::from_millis(1)),
         Duration::ZERO
     );
-    worker.poll(&mut cx, 1).unwrap();
+    worker.poll_budgeted(&mut cx, 1).unwrap();
     assert_eq!(completed.get(), 65);
     assert_eq!(
         worker.wait_timeout(Duration::from_millis(1)),
         Duration::from_millis(1)
     );
     let settled = count.count();
-    worker.poll(&mut cx, 64).unwrap();
+    worker.poll_budgeted(&mut cx, 64).unwrap();
     assert_eq!(count.count(), settled);
 }
 
@@ -1495,8 +1518,8 @@ fn composes_http_and_optional_rdma_without_operational_side_effects() {
             "only one worker enrolls and publishes"
         );
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        assert_eq!(worker.poll(&mut cx, 0), Err(Error::Unavailable));
-        assert_eq!(worker.poll(&mut cx, 1), Err(Error::Unavailable));
+        assert_eq!(worker.poll_budgeted(&mut cx, 0), Err(Error::Unavailable));
+        assert_eq!(worker.poll_budgeted(&mut cx, 1), Err(Error::Unavailable));
         // Admission bounds retained generations once across the node.
         let mut publication = racer_control_wire::decode_publication(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -1763,7 +1786,7 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
     let memory = second.memory.clone();
     let late = late1.clone();
     let owner = second.drivers.enter();
-    racer_platform::drivers::reserve()
+    uring_runtime::drivers::reserve()
         .unwrap()
         .submit_detached(Box::pin(async move {
             receive.await.map_err(|_| Error::Cancelled)?;
@@ -1981,7 +2004,7 @@ fn cache_removal_installs_while_renewal_and_next_publication_poll_are_held() {
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     loop {
         runtime.reactor.poll_budgeted(64).unwrap();
-        engine.poll(&mut cx, 64).unwrap();
+        engine.poll_budgeted(&mut cx, 64).unwrap();
         runtime.crypto.poll_budgeted(64).unwrap();
         worker.poll_cache_preparation(&mut cx).unwrap();
         assert!(progress.as_mut().poll(&mut cx).is_pending());
@@ -2080,7 +2103,7 @@ fn cache_removal_during_retry_after(delay_renewal_entry: bool) {
     let mut installed_before_renewal = false;
     loop {
         runtime.reactor.poll_budgeted(64).unwrap();
-        engine.poll(&mut cx, 64).unwrap();
+        engine.poll_budgeted(&mut cx, 64).unwrap();
         runtime.crypto.poll_budgeted(64).unwrap();
         if let std::task::Poll::Ready(result) = progress.as_mut().poll(&mut cx) {
             panic!(
@@ -2154,9 +2177,9 @@ fn cache_removal_during_retry_after(delay_renewal_entry: bool) {
 #[test]
 fn same_node_renewal_backs_off_expires_closed_and_recovers() {
     use crate::telemetry::State;
-    use racer_platform::environment::SimulationClock;
-    use racer_platform::environment::now;
-    use racer_platform::environment::wall_now;
+    use uring_runtime::environment::SimulationClock;
+    use uring_runtime::environment::now;
+    use uring_runtime::environment::wall_now;
 
     // Complete each real control turn through the application's error handling.
     // Leave the next turn unsubmitted so the test controls all retry boundaries.
@@ -2498,7 +2521,7 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
     let polls = fixture.polls.load(Ordering::Acquire);
     while worker.snapshots.cursor().unwrap() != Some(wire::PublicationSequence(2)) {
         runtime.reactor.poll_budgeted(64).unwrap();
-        worker.poll(&mut cx, 64).unwrap();
+        worker.poll_budgeted(&mut cx, 64).unwrap();
         assert!(
             Instant::now() < until,
             "accepted publication depended on a second HTTP poll"
@@ -2540,7 +2563,7 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
     let mut response = Vec::new();
     while !response.windows(4).any(|w| w == b"\r\n\r\n") {
         runtime.reactor.poll_budgeted(64).unwrap();
-        worker.poll(&mut cx, 64).unwrap();
+        worker.poll_budgeted(&mut cx, 64).unwrap();
         let mut bytes = [0; 1024];
         match client.read(&mut bytes) {
             Ok(n) => response.extend_from_slice(&bytes[..n]),
@@ -2562,7 +2585,7 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
     let mut response = Vec::new();
     while !response.windows(4).any(|w| w == b"\r\n\r\n") {
         runtime.reactor.poll_budgeted(64).unwrap();
-        worker.poll(&mut cx, 64).unwrap();
+        worker.poll_budgeted(&mut cx, 64).unwrap();
         let mut bytes = [0; 1024];
         match diagnostic.read(&mut bytes) {
             Ok(n) => response.extend_from_slice(&bytes[..n]),
@@ -2681,7 +2704,7 @@ fn startup_reauthenticates_retained_identity_and_fails_closed() {
 #[test]
 fn node_replacement_drains_all_workers_and_restart_converges() {
     use crate::worker::WorkerPair;
-    use racer_platform::group::affinity::EffectiveTopology;
+    use uring_runtime::group::affinity::EffectiveTopology;
     for renewal_due in [false, true] {
         let mut fixture = ControlFixture::new();
         let (config, node) = fixture.bootstrap_node(2, Duration::from_secs(15));
@@ -2876,7 +2899,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
 fn stop_worker(
     worker: &mut WorkerApplication,
     runtime: &WorkerRuntime,
-    engine: &mut dyn racer_platform::group::Service<RequestScope>,
+    engine: &mut dyn uring_runtime::group::Service<RequestScope>,
 ) {
     drive(
         runtime,
@@ -2964,14 +2987,14 @@ fn oversized_populated_shutdown_cut_thaws_and_finishes_drain_without_publication
 
 fn drive<T>(
     runtime: &WorkerRuntime,
-    engine: &mut dyn racer_platform::group::Service<RequestScope>,
+    engine: &mut dyn uring_runtime::group::Service<RequestScope>,
     future: Operation<'_, T>,
 ) -> Result<T> {
     let mut future = future;
     let until = Instant::now() + Duration::from_secs(15);
     loop {
         runtime.reactor.poll_budgeted(64)?;
-        engine.poll(
+        engine.poll_budgeted(
             &mut Context::from_waker(futures::task::noop_waker_ref()),
             64,
         )?;
@@ -3051,13 +3074,13 @@ fn blocked_publication_is_superseded_while_projection_rotates() {
         assert!(Instant::now() < until);
         runtime.reactor.poll_budgeted(64).unwrap();
         worker
-            .poll(
+            .poll_budgeted(
                 &mut Context::from_waker(futures::task::noop_waker_ref()),
                 64,
             )
             .unwrap();
         engine
-            .poll(
+            .poll_budgeted(
                 &mut Context::from_waker(futures::task::noop_waker_ref()),
                 64,
             )
@@ -3292,7 +3315,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     for _ in 0..8 {
         runtime.reactor.poll_budgeted(64).unwrap();
         worker
-            .poll(
+            .poll_budgeted(
                 &mut Context::from_waker(futures::task::noop_waker_ref()),
                 64,
             )
@@ -3397,7 +3420,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     for _ in 0..8 {
         runtime.reactor.poll_budgeted(64).unwrap();
         worker
-            .poll(
+            .poll_budgeted(
                 &mut Context::from_waker(futures::task::noop_waker_ref()),
                 64,
             )
@@ -3419,7 +3442,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     );
     while runtime.crypto.outstanding() != 0 {
         engine
-            .poll(
+            .poll_budgeted(
                 &mut Context::from_waker(futures::task::noop_waker_ref()),
                 64,
             )
@@ -3427,7 +3450,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
         runtime.crypto.poll_budgeted(64).unwrap();
         runtime.reactor.poll_budgeted(64).unwrap();
         worker
-            .poll(
+            .poll_budgeted(
                 &mut Context::from_waker(futures::task::noop_waker_ref()),
                 64,
             )
@@ -3437,7 +3460,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     // Continued serving does not need an invalidation CQE or final key release.
     for _ in 0..4 {
         worker
-            .poll(
+            .poll_budgeted(
                 &mut Context::from_waker(futures::task::noop_waker_ref()),
                 64,
             )
@@ -3466,7 +3489,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     drop(lease);
     runtime.reactor.poll_budgeted(64).unwrap();
     worker
-        .poll(
+        .poll_budgeted(
             &mut Context::from_waker(futures::task::noop_waker_ref()),
             64,
         )
@@ -3626,7 +3649,7 @@ fn assembly_applies_configured_client_request_timeout() {
     use crate::admission::ResourceClass;
     use std::sync::atomic::AtomicBool;
     for timeout in [Duration::from_millis(250), Duration::from_secs(45)] {
-        let clock = racer_platform::environment::SimulationClock::new(908);
+        let clock = uring_runtime::environment::SimulationClock::new(908);
         let _environment = clock.environment(0).enter();
         let mut config = crate::test_support::cluster::config(false);
         config.request_timeout = timeout;
@@ -3729,7 +3752,7 @@ fn disabled_rdma_turn_does_not_refresh_inventory() {
 fn receive_gate_two_workers_share_capacity_and_wake_expiry_without_cqe() {
     use futures::Stream;
     use futures::stream::FuturesUnordered;
-    let clock = racer_platform::environment::SimulationClock::new(919);
+    let clock = uring_runtime::environment::SimulationClock::new(919);
     let _env = clock.environment(0).enter();
     let mut config = crate::test_support::cluster::config(false);
     config.peer_receive.active = 1;
@@ -3741,7 +3764,7 @@ fn receive_gate_two_workers_share_capacity_and_wake_expiry_without_cqe() {
     assert!(Arc::ptr_eq(&gate, second.node.peer_receive.get().unwrap()));
     let scope = crate::runtime::RequestScope::new(
         crate::model::RequestId([19; 16]),
-        racer_platform::environment::now() + Duration::from_secs(1),
+        uring_runtime::environment::now() + Duration::from_secs(1),
     )
     .unwrap();
     let permit = futures::executor::block_on(gate.acquire(&first.runtime.admission, &scope))
@@ -3759,13 +3782,13 @@ fn receive_gate_two_workers_share_capacity_and_wake_expiry_without_cqe() {
     first.started = true;
     first.stopping = true;
     clock.advance(Duration::from_millis(11));
-    first.poll(&mut cx, 0).unwrap();
+    first.poll_budgeted(&mut cx, 0).unwrap();
     assert!(
         std::pin::Pin::new(&mut children)
             .poll_next(&mut cx)
             .is_pending()
     );
-    first.poll(&mut cx, 64).unwrap();
+    first.poll_budgeted(&mut cx, 64).unwrap();
     assert!(matches!(
         std::pin::Pin::new(&mut children).poll_next(&mut cx),
         Poll::Ready(Some(Err(Error::DeadlineExceeded)))
@@ -3781,7 +3804,7 @@ fn receive_gate_two_workers_share_capacity_and_wake_expiry_without_cqe() {
 
 #[test]
 fn workers_share_configured_page_hedge_slots_and_bytes() {
-    let clock = racer_platform::environment::SimulationClock::new(907);
+    let clock = uring_runtime::environment::SimulationClock::new(907);
     let _environment = clock.environment(0).enter();
     let mut config = crate::test_support::cluster::config(false);
     config.page_hedge.slots = 1;
@@ -3821,9 +3844,7 @@ fn distributed_peer_listener_recovers_from_queue_pressure() {
     let mut serving = app.peers.listen(address, &scope);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
-    let reader = Rc::new(racer_platform::reactor::descriptor::Descriptor::from(
-        reader,
-    ));
+    let reader = Rc::new(uring_runtime::reactor::descriptor::Descriptor::from(reader));
     let mut pressure = Vec::new();
     for _ in 0..8 {
         let mut wait = runtime
@@ -4123,7 +4144,8 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
 
 #[test]
 fn peer_worker_partition_rejects_underfunding_and_reduces_worker_count() {
-    use racer_platform::group::affinity::EffectiveTopology;
+    use uring_runtime::group::affinity::CpuLocation;
+    use uring_runtime::group::affinity::EffectiveTopology;
     let mut config = crate::test_support::cluster::config(false);
     config.max_threads = 4;
     config.limits.range_window_pages = NonZeroUsize::new(1).unwrap();
@@ -4148,7 +4170,12 @@ fn peer_worker_partition_rejects_underfunding_and_reduces_worker_count() {
             &config,
             EffectiveTopology {
                 cpus: (0..4)
-                    .map(|cpu| crate::worker::cpu_location(cpu, Some(0), Some(cpu), None))
+                    .map(|cpu| CpuLocation {
+                        cpu,
+                        package: 0,
+                        core: cpu,
+                        numa_node: None,
+                    })
                     .collect(),
                 quota: None,
                 nics: vec![],
@@ -4364,7 +4391,7 @@ mod lifecycle {
     fn membership_attestation_requires_fresh_matching_workers() {
         use racer_control_wire::PublicationSequence;
         let observations = Observations::default();
-        let now = racer_platform::environment::now();
+        let now = uring_runtime::environment::now();
         let resources = Resources {
             workers_usable: true,
             observed_until: Some(now + Duration::from_secs(2)),
@@ -4411,7 +4438,7 @@ mod lifecycle {
     #[test]
     fn readiness_requires_every_worker_and_expires_without_progress() {
         let observations = Observations::default();
-        let now = racer_platform::environment::now();
+        let now = uring_runtime::environment::now();
         let resources = Resources {
             workers_usable: true,
             storage_usable: true,
@@ -4451,7 +4478,7 @@ mod lifecycle {
     #[test]
     fn concurrent_observations_never_fail_readiness_transition() {
         let observations = Arc::new(Observations::default());
-        let now = racer_platform::environment::now();
+        let now = uring_runtime::environment::now();
         let usable = Resources {
             workers_usable: true,
             storage_usable: true,
@@ -4500,7 +4527,7 @@ mod lifecycle {
     #[test]
     fn observation_expiring_during_readiness_transition_is_not_an_error() {
         let observations = Observations::default();
-        let now = racer_platform::environment::now();
+        let now = uring_runtime::environment::now();
         let usable = Resources {
             workers_usable: true,
             storage_usable: true,
@@ -4515,7 +4542,7 @@ mod lifecycle {
             // Sweep a stale peer's expiry across the few microseconds the next
             // observation spends between its usability check and transition.
             let until =
-                racer_platform::environment::now() + Duration::from_nanos(u64::from(turn % 4_000));
+                uring_runtime::environment::now() + Duration::from_nanos(u64::from(turn % 4_000));
             observations
                 .record(
                     WorkerId(1),
@@ -4531,7 +4558,7 @@ mod lifecycle {
                 .unwrap_or_else(|error| panic!("turn {turn}: {error:?}"));
         }
         let expired = Resources {
-            observed_until: Some(racer_platform::environment::now()),
+            observed_until: Some(uring_runtime::environment::now()),
             ..usable
         };
         observations.record(WorkerId(1), expired, 2).unwrap();
@@ -4586,7 +4613,7 @@ mod lifecycle {
     #[test]
     fn observation_after_drain_is_not_an_error() {
         let observations = Observations::default();
-        let now = racer_platform::environment::now();
+        let now = uring_runtime::environment::now();
         let resources = Resources {
             workers_usable: true,
             storage_usable: true,
@@ -4627,7 +4654,7 @@ fn shared_pressure_constrains_pools_and_releases_retained_buffers() {
     let (recycler, staging) = worker.pool_stats();
     assert!(recycler.bytes >= 1 << 20);
     assert!(!recycler.constrained && !staging.constrained);
-    let now = racer_platform::environment::now();
+    let now = uring_runtime::environment::now();
     // Normal is the initial level: polling changes nothing.
     worker.poll_pressure(now);
     assert!(worker.pool_stats().0.bytes >= 1 << 20);
@@ -4670,7 +4697,7 @@ fn disabled_pressure_ignores_shared_level_but_still_reports_resident_memory() {
     worker.pressure = WorkerPressure::new(false, &worker.node.pressure, true);
     assert!(worker.pressure.monitor.is_none());
     worker.node.pressure.store(PressureLevel::Critical);
-    let now = racer_platform::environment::now();
+    let now = uring_runtime::environment::now();
     worker.poll_pressure(now);
     assert_eq!(worker.pressure.responder.level(), PressureLevel::Normal);
     assert!(!worker.pool_stats().0.constrained);

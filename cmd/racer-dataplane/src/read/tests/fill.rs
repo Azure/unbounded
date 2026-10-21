@@ -3,7 +3,7 @@ use crate::read::dispatch::WorkerMap;
 /// Prefetched plaintext must never park behind Flight capacity.
 #[test]
 fn bounded_admission_prefetched_bootstrap_fails_without_waiting() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let admission = f.fill.dependencies.admission.clone();
@@ -42,9 +42,9 @@ fn bounded_admission_prefetched_bootstrap_fails_without_waiting() {
 /// Both saturated owners reject peer acquisition promptly while local reads park.
 #[test]
 fn bounded_admission_two_owners_peer_failfast_and_local_finite_exit() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let clock = racer_platform::environment::SimulationClock::new(751);
+    let clock = uring_runtime::environment::SimulationClock::new(751);
     let _environment = clock.environment(0).enter();
     // Crypto captures its clock at construction; match the request clock even
     // when this test runs long after the process-wide simulation anchor.
@@ -60,11 +60,11 @@ fn bounded_admission_two_owners_peer_failfast_and_local_finite_exit() {
             .unwrap();
         let scope = RequestScope::new(
             f.scope.request,
-            racer_platform::environment::now() + Duration::from_secs(30),
+            uring_runtime::environment::now() + Duration::from_secs(30),
         )
         .unwrap();
         let mut peer_budget = AcquisitionBudget::new(scope.deadline.0, 4, 8);
-        let before = racer_platform::environment::now();
+        let before = uring_runtime::environment::now();
         let peer = drive(
             f.fill.acquire_ciphertext(
                 f.page.clone(),
@@ -77,7 +77,7 @@ fn bounded_admission_two_owners_peer_failfast_and_local_finite_exit() {
             &f.crypto,
         );
         assert!(matches!(peer, Err(Error::Overloaded)));
-        assert_eq!(racer_platform::environment::now(), before);
+        assert_eq!(uring_runtime::environment::now(), before);
         assert_eq!(f.fill.dependencies.flights.admission_state(), (0, 0, false));
         let mut local_budget = AcquisitionBudget::new(scope.deadline.0, 4, 8);
         let mut local = f.fill.acquire(
@@ -129,7 +129,7 @@ fn bounded_admission_two_owners_peer_failfast_and_local_finite_exit() {
 /// Isolate staging admission from acquisition, publication, and queued-write reclamation.
 #[test]
 fn owned_writeback_staging_reclaims_only_idle_memory_after_hard_quota_rejection() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     for (owned, live, ciphertext) in [
         (true, false, true),
@@ -193,7 +193,7 @@ fn owned_writeback_staging_reclaims_only_idle_memory_after_hard_quota_rejection(
 
 #[test]
 fn optional_persistence_full_page_residency_above_half_budget_makes_progress() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.plaintext_bytes = std::num::NonZeroUsize::new(8 * PAGE_BYTES as usize).unwrap();
@@ -252,7 +252,7 @@ fn optional_persistence_full_page_residency_above_half_budget_makes_progress() {
 
 #[test]
 fn optional_persistence_recycler_pressure_does_not_evict_memory_unnecessarily() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let f = fixture();
     let deps = &f.fill.dependencies;
@@ -295,7 +295,7 @@ fn optional_persistence_recycler_pressure_does_not_evict_memory_unnecessarily() 
 
 #[test]
 fn optional_persistence_idle_memory_reclaim_is_bounded_and_stops_at_deficit() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.metadata_entries = std::num::NonZeroUsize::new(1024).unwrap();
@@ -363,7 +363,7 @@ fn optional_persistence_idle_memory_reclaim_is_bounded_and_stops_at_deficit() {
 
 #[test]
 fn optional_persistence_idle_reclaim_preserves_active_and_queued_owners() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let f = fixture();
     let deps = &f.fill.dependencies;
@@ -417,7 +417,7 @@ fn optional_persistence_idle_reclaim_preserves_active_and_queued_owners() {
 
 #[test]
 fn optional_persistence_reclaims_completed_idle_slab_before_pressure_rejection() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     for owned in [false, true] {
         let f = cold_disk_fixture();
@@ -465,7 +465,7 @@ fn optional_persistence_reclaims_completed_idle_slab_before_pressure_rejection()
 
 #[test]
 fn ready_memory_precedes_cold_ownership_refresh_and_preserves_one_interest() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let mut f = fixture();
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
@@ -593,7 +593,7 @@ fn optional_persistence_headroom_preserves_one_page_and_half_budget() {
 
 #[test]
 fn optional_persistence_minimum_dirty_budget_is_best_effort() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     for (bytes, succeeds) in [(18, false), (19, true)] {
         let mut limits = crate::test_support::cluster::config(false).limits;
@@ -619,7 +619,7 @@ fn optional_persistence_minimum_dirty_budget_is_best_effort() {
 
 #[test]
 fn optional_persistence_owned_dirty_pressure_reclaims_only_optional_queue() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     for queued_owned in [false, true] {
         let mut limits = crate::test_support::cluster::config(false).limits;
@@ -670,7 +670,7 @@ fn optional_persistence_owned_dirty_pressure_reclaims_only_optional_queue() {
 
 #[test]
 fn optional_persistence_staging_pressure_skips_without_read_failure() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let mut f = fixture();
     let policy = f.fill.dependencies.writer.retention();
@@ -699,7 +699,7 @@ fn optional_persistence_staging_pressure_skips_without_read_failure() {
 
 #[test]
 fn optional_persistence_owned_staging_pressure_reclaims_one_queued_optional() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let mut f = fixture();
     let policy = f.fill.dependencies.writer.retention();
@@ -746,7 +746,7 @@ fn optional_persistence_owned_staging_pressure_reclaims_one_queued_optional() {
 /// Staging pressure must not replace an already queued owned write with another.
 #[test]
 fn optional_persistence_owned_staging_preserves_queued_owned_victim() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let mut f = fixture();
     let policy = f.fill.dependencies.writer.retention();
@@ -810,7 +810,7 @@ fn optional_persistence_owned_staging_preserves_queued_owned_victim() {
 
 #[test]
 fn second_sight_subscription_probe_transfer_and_fanout_count_only_consumers() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let mut f = fixture();
     let policy = f.fill.dependencies.writer.retention();
@@ -853,7 +853,7 @@ fn second_sight_subscription_probe_transfer_and_fanout_count_only_consumers() {
 
 #[test]
 fn second_sight_memory_hit_persists_original_ciphertext_and_retry_does_not() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let mut f = fixture();
     f.fill
@@ -902,7 +902,7 @@ fn second_sight_memory_hit_persists_original_ciphertext_and_retry_does_not() {
 
 #[test]
 fn second_sight_selected_and_optional_pressure_preserve_read_success() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     for pressure in [false, true] {
         let mut f = fixture();
@@ -946,7 +946,7 @@ fn second_sight_selected_and_optional_pressure_preserve_read_success() {
 
 #[test]
 fn second_sight_simultaneous_followers_persist_without_second_acquisition() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     let mut f = fixture();
     f.fill
@@ -996,7 +996,7 @@ fn second_sight_simultaneous_followers_persist_without_second_acquisition() {
 
 #[test]
 fn second_sight_completed_flight_and_current_ownership_promote_verified_copy() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     for owned in [false, true] {
         let mut f = fixture();
@@ -1204,14 +1204,14 @@ fn network_plaintext_cleared_pressure_retry_is_bounded_and_reports_latest_failur
 #[test]
 fn network_plaintext_cleared_pressure_retry_checks_original_scope() {
     for deadline in [false, true] {
-        let clock = racer_platform::environment::SimulationClock::new(913);
+        let clock = uring_runtime::environment::SimulationClock::new(913);
         let _clock = clock.environment(0).enter();
         let f = fixture();
         let admission = &f.fill.dependencies.admission;
         let cache = &f.context.object.cache;
         let scope = RequestScope::new(
             f.scope.request,
-            racer_platform::environment::now() + Duration::from_secs(60),
+            uring_runtime::environment::now() + Duration::from_secs(60),
         )
         .unwrap();
         let mut held = Some(
@@ -1400,7 +1400,7 @@ fn idle_tiny_prefix_must_not_hide_reclaimable_full_page() {
 fn cooperative_reclaim_bounds_busy_cycle_and_preserves_cancellation() {
     for mode in ["busy", "cancel", "deadline"] {
         let cancel = mode != "busy";
-        let clock = racer_platform::environment::SimulationClock::new(912);
+        let clock = uring_runtime::environment::SimulationClock::new(912);
         let _clock = clock.environment(0).enter();
         let mut limits = crate::test_support::cluster::config(false).limits;
         limits.metadata_entries = std::num::NonZeroUsize::new(819).unwrap();
@@ -1428,7 +1428,7 @@ fn cooperative_reclaim_bounds_busy_cycle_and_preserves_cancellation() {
             .set_observer(failures.observer(WorkerId(0)));
         let scope = RequestScope::new(
             f.scope.request,
-            racer_platform::environment::now() + Duration::from_secs(60),
+            uring_runtime::environment::now() + Duration::from_secs(60),
         )
         .unwrap();
         let mut reserve = Box::pin(f.fill.reserve_network_plaintext(&scope, &f.page));
@@ -1596,7 +1596,7 @@ fn final_fill_reclaim_success_and_ignored_writeback_are_silent() {
 
 #[test]
 fn final_fill_disk_outer_retry_emits_only_exhausted_last_rejection() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for recover in [true, false] {
         let f = cold_disk_fixture();
@@ -1642,7 +1642,7 @@ fn final_fill_disk_outer_retry_emits_only_exhausted_last_rejection() {
 
 #[test]
 fn final_fill_diagnostic_reports_exhaustion_not_recovered_or_optional_reserves() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let admission = f.fill.dependencies.admission.clone();
@@ -1685,7 +1685,7 @@ fn final_fill_diagnostic_reports_exhaustion_not_recovered_or_optional_reserves()
     failures.write_protected(true, &mut text).unwrap();
     assert!(text.contains("total=1 retained=1"));
 }
-pub(super) use racer_platform::reactor::IoBuffer;
+pub(super) use uring_runtime::reactor::IoBuffer;
 
 pub(super) use crate::admission::AdmissionPolicy;
 pub(super) use crate::error::Error;
@@ -1727,7 +1727,7 @@ mod metadata {
     //! Metadata refresh, bootstrap publication, and independently timed callers.
     use super::*;
     use crate::read::candidates::OriginAuthority;
-    use racer_platform::drivers;
+    use uring_runtime::drivers;
 
     pub(super) struct GatedMetadataOrigin {
         pub(super) buffers: BufferPool,
@@ -1741,7 +1741,7 @@ mod metadata {
         use crate::test_support::origin::AdapterOrigin;
         use crate::test_support::origin::RequestKind;
         for failure in [None, Some(502)] {
-            let clock = racer_platform::environment::SimulationClock::new_at(
+            let clock = uring_runtime::environment::SimulationClock::new_at(
                 71,
                 Instant::now(),
                 std::time::SystemTime::now(),
@@ -2363,7 +2363,7 @@ mod pressure {
 
     #[test]
     fn sequential_full_pages_reclaim_idle_bytes_and_preserve_busy_reader_leases() {
-        let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         for (pages, ciphertext_pages, dirty_pages, hold_bundle) in
             [(8, 4, 2, false), (8, 3, 1, false), (12, 3, 2, true)]
@@ -2447,7 +2447,7 @@ mod pressure {
 
     #[test]
     fn bootstrap_admission_discards_queued_copy_before_evicting_idle_bundle() {
-        let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         let mut limits = crate::test_support::cluster::config(false).limits;
         limits.plaintext_bytes = std::num::NonZeroUsize::new(PAGE_BYTES as usize).unwrap();
@@ -2716,7 +2716,7 @@ mod pressure {
 
     #[test]
     fn dirty_only_pressure_skips_persistence_without_flushing_memory_or_queue() {
-        let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         let mut f = fixture();
         let cache = &f.context.object.cache;
@@ -3090,8 +3090,8 @@ pub(super) fn pump_worker(
 ) {
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     endpoint.poll(&mut cx, 64).unwrap();
-    racer_platform::drivers::poll(&mut cx, 64);
-    racer_platform::group::Service::poll(
+    uring_runtime::drivers::poll(&mut cx, 64);
+    uring_runtime::group::Service::poll_budgeted(
         engine,
         &mut Context::from_waker(futures::task::noop_waker_ref()),
         64,
@@ -3297,8 +3297,8 @@ pub(super) fn drive<T>(
     let mut future = Box::pin(future);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     for _ in 0..256 {
-        racer_platform::drivers::poll(&mut cx, 64);
-        racer_platform::group::Service::poll(
+        uring_runtime::drivers::poll(&mut cx, 64);
+        uring_runtime::group::Service::poll_budgeted(
             engine,
             &mut Context::from_waker(futures::task::noop_waker_ref()),
             64,
@@ -3367,8 +3367,8 @@ pub(super) fn drive_io<T>(
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        racer_platform::drivers::poll(&mut cx, 64);
-        racer_platform::group::Service::poll(
+        uring_runtime::drivers::poll(&mut cx, 64);
+        uring_runtime::group::Service::poll_budgeted(
             engine,
             &mut Context::from_waker(futures::task::noop_waker_ref()),
             64,
@@ -3398,7 +3398,7 @@ fn abandoned_acquisition_preserves_peer_scope(metadata: bool) {
     use crate::model::MetadataSelector;
     {
         let mut f = fixture();
-        let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
         let _queue = queue.enter();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
@@ -3456,7 +3456,7 @@ fn completed_fill_waits_release_shared_cancellation_capacity() {
     use futures::StreamExt;
     use futures::stream::FuturesUnordered;
     let mut f = fixture();
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     // Force a terminal fill failure without any accepted I/O. Every cohort must
     // release its waiter and driver before the same long-lived scope is reused.
@@ -3511,7 +3511,7 @@ fn completed_fill_waits_release_shared_cancellation_capacity() {
 
 #[test]
 fn selected_owner_reclaims_foreign_receive_charges_across_full_pages() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     use crate::model::PAGE_BYTES;
     use std::num::NonZeroUsize;
@@ -3618,7 +3618,7 @@ fn selected_owner_reclaims_foreign_receive_charges_across_full_pages() {
 
 #[test]
 fn ordinary_publication_rejects_foreign_worker_charges() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut source = fixture();
     let target = fixture();
@@ -3657,7 +3657,7 @@ fn ordinary_publication_rejects_foreign_worker_charges() {
 
 #[test]
 fn cached_corrupt_ciphertext_falls_back_without_exposing_plaintext() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
@@ -3717,7 +3717,7 @@ fn cached_corrupt_ciphertext_falls_back_without_exposing_plaintext() {
 
 #[test]
 fn ciphertext_ready_promotes_once_for_concurrent_plaintext_readers() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let metrics = Metrics::default();
@@ -3800,13 +3800,13 @@ fn ciphertext_ready_promotes_once_for_concurrent_plaintext_readers() {
         assert_eq!(budget.deadline(), f.scope.deadline.0);
     }
     assert_eq!(metrics.gauge(Gauge::ActiveFills), 0);
-    assert_eq!(racer_platform::drivers::pending(), 0);
+    assert_eq!(uring_runtime::drivers::pending(), 0);
     drop(holder);
 }
 
 #[test]
 fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     use crate::test_support::security::rotation_bundle;
     use racer_crypto::identity::KeyPurpose;
@@ -4061,7 +4061,7 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
 
 #[test]
 fn concurrent_readers_share_origin_encryption_and_pending_original_ciphertext() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let mut a = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
@@ -4121,7 +4121,7 @@ fn concurrent_readers_share_origin_encryption_and_pending_original_ciphertext() 
 
 #[test]
 fn ciphertext_origin_fill_retains_verified_publication_without_a_plaintext_waiter() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     f.context.authorization =
@@ -4214,7 +4214,7 @@ pub(super) fn drive_disk<T>(f: &Fixture, future: impl Future<Output = T>) -> T {
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     loop {
         f.scope.check().unwrap();
-        racer_platform::drivers::poll(&mut cx, 64);
+        uring_runtime::drivers::poll(&mut cx, 64);
         if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
             return result;
         }
@@ -4300,7 +4300,7 @@ fn local_tail_fixture(length: u64, disk: bool) -> Fixture {
 
 #[test]
 fn cold_partial_page_admits_exact_plaintext_from_disk_and_pending() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for disk in [true, false] {
         for free in [13_109_248usize, 13_109_247, PAGE_BYTES as usize] {
@@ -4348,7 +4348,7 @@ fn cold_partial_page_admits_exact_plaintext_from_disk_and_pending() {
 
 #[test]
 fn cold_copy_full_page_boundary_and_canceled_disk_read_release_staging() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for disk in [true, false] {
         let mut f = local_tail_fixture(4 * PAGE_BYTES, disk);
@@ -4416,7 +4416,7 @@ fn cold_copy_full_page_boundary_and_canceled_disk_read_release_staging() {
 
 #[test]
 fn copy_only_rejects_disk_payload_and_tag_corruption_before_retention() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for acquire in [false, true] {
         for corrupt_tag in [false, true] {
@@ -4542,7 +4542,7 @@ fn copy_only_rejects_disk_payload_and_tag_corruption_before_retention() {
 
 #[test]
 fn disk_crc_validation_preserves_replacement_and_intact_acquire() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = cold_disk_fixture();
     let (mut stale, token) = drive_disk(
@@ -4622,7 +4622,7 @@ fn disk_crc_validation_preserves_replacement_and_intact_acquire() {
 
 #[test]
 fn concurrent_cold_disk_copy_only_shares_io_and_retains_original_ciphertext() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = cold_disk_fixture();
     let disk_hits = f.fill.metrics.count(Event::DiskIndexLookupHit);
@@ -4713,7 +4713,7 @@ fn concurrent_cold_disk_copy_only_shares_io_and_retains_original_ciphertext() {
 
 #[test]
 fn detached_copy_only_keeps_disk_fence_and_independent_waiters() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = cold_disk_fixture();
     let caller = RequestScope::new(RequestId([9; 16]), f.scope.deadline.0).unwrap();
@@ -4752,7 +4752,7 @@ fn detached_copy_only_keeps_disk_fence_and_independent_waiters() {
 #[test]
 fn bounded_admission_private_copy_completion_wakes_queued_read() {
     use std::future::Future;
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = cold_disk_fixture();
     let admission = &f.fill.dependencies.admission;
@@ -4761,7 +4761,7 @@ fn bounded_admission_private_copy_completion_wakes_queued_read() {
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(copy.as_mut().poll(&mut cx).is_pending());
     assert_eq!(admission.used(ResourceClass::Flight), 1);
-    let facts = flights.expiry_snapshot_without_ticket(racer_platform::environment::now());
+    let facts = flights.expiry_snapshot_without_ticket(uring_runtime::environment::now());
     assert_eq!(facts.total, 0);
     assert_eq!(facts.flight_used, 1);
     assert!(facts.entries.iter().all(Option::is_none));
@@ -4821,7 +4821,7 @@ fn bounded_admission_private_copy_completion_wakes_queued_read() {
 /// Dropping a caller cannot report a returned outcome for a parked disk driver.
 #[test]
 fn expiry_snapshot_disk_driver_stage_survives_caller_drop() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = cold_disk_fixture();
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
@@ -4836,7 +4836,7 @@ fn expiry_snapshot_disk_driver_stage_survives_caller_drop() {
     assert!(acquire.as_mut().poll(&mut cx).is_pending());
     let flights = &f.fill.dependencies.flights;
     let entry = flights
-        .expiry_snapshot_without_ticket(racer_platform::environment::now())
+        .expiry_snapshot_without_ticket(uring_runtime::environment::now())
         .entries[0]
         .unwrap();
     assert_eq!(
@@ -4846,7 +4846,7 @@ fn expiry_snapshot_disk_driver_stage_survives_caller_drop() {
     assert_eq!(entry.operations, 1);
     drop(acquire);
     let entry = flights
-        .expiry_snapshot_without_ticket(racer_platform::environment::now())
+        .expiry_snapshot_without_ticket(uring_runtime::environment::now())
         .entries[0]
         .unwrap();
     assert_eq!(
@@ -4855,9 +4855,9 @@ fn expiry_snapshot_disk_driver_stage_survives_caller_drop() {
     );
     assert_eq!(entry.cancel_request_seen_age_us, None);
     f.scope.cancel().unwrap();
-    racer_platform::drivers::poll(&mut cx, 64);
+    uring_runtime::drivers::poll(&mut cx, 64);
     let entry = flights
-        .expiry_snapshot_without_ticket(racer_platform::environment::now())
+        .expiry_snapshot_without_ticket(uring_runtime::environment::now())
         .entries[0]
         .unwrap();
     assert!(entry.cancel_request_seen_age_us.is_some());
@@ -4875,7 +4875,7 @@ fn expiry_snapshot_disk_driver_stage_survives_caller_drop() {
 
 #[test]
 fn copy_only_miss_releases_shared_scope_subscriptions_across_cohorts() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     use futures::StreamExt;
     use futures::stream::FuturesUnordered;
@@ -4893,7 +4893,7 @@ fn copy_only_miss_releases_shared_scope_subscriptions_across_cohorts() {
         assert!(f.fill.local_copies.is_empty());
         assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Flight), 0);
         assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Waiter), 0);
-        assert_eq!(racer_platform::drivers::pending(), 0);
+        assert_eq!(uring_runtime::drivers::pending(), 0);
     }
     assert_eq!(f.origin.calls.get(), 0);
     assert_eq!(f.fill.metrics.count(Event::CiphertextLookupMiss), 1100);
@@ -4904,7 +4904,7 @@ fn copy_only_miss_releases_shared_scope_subscriptions_across_cohorts() {
 
 #[test]
 fn canceled_before_lookup_has_no_outcome() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let f = fixture();
     f.scope.cancel().unwrap();
@@ -4932,7 +4932,7 @@ fn canceled_before_lookup_has_no_outcome() {
 
 #[test]
 fn lookup_plaintext_and_pending_hits_do_not_probe_disk() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     assert!(f.fill.cached_page(&f.page, &f.scope).unwrap().is_none());
@@ -4986,7 +4986,7 @@ fn lookup_plaintext_and_pending_hits_do_not_probe_disk() {
 
 #[test]
 fn copy_only_local_state_admission_failure_releases_all_reservations() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let admission = &f.fill.dependencies.admission;
@@ -5007,7 +5007,7 @@ fn copy_only_local_state_admission_failure_releases_all_reservations() {
     ));
     assert!(f.fill.local_copies.is_empty());
     assert_eq!(admission.used(ResourceClass::Waiter), 0);
-    assert_eq!(racer_platform::drivers::pending(), 0);
+    assert_eq!(uring_runtime::drivers::pending(), 0);
     drop(pressure);
     assert!(
         drive(
@@ -5034,7 +5034,7 @@ fn peer_bootstrap_disk_copy_reclaims_idle_ciphertext_before_fresh_acquisition() 
 }
 
 fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.plaintext_bytes = std::num::NonZeroUsize::new(512 * 1024 * 1024).unwrap();
@@ -5181,7 +5181,7 @@ fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
     let mut read = read_copy();
     let copy = loop {
         f.scope.check().unwrap();
-        racer_platform::group::Service::poll(
+        uring_runtime::group::Service::poll_budgeted(
             &mut f.engine,
             &mut Context::from_waker(futures::task::noop_waker_ref()),
             64,
@@ -5226,7 +5226,7 @@ fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
 
 #[test]
 fn copy_only_miss_has_no_origin_side_effect_and_wrong_context_never_joins() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     assert!(
@@ -5251,7 +5251,7 @@ fn copy_only_miss_has_no_origin_side_effect_and_wrong_context_never_joins() {
 
 #[test]
 fn rejected_origin_supplier_does_not_fail_an_independent_coalesced_reader() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     f.origin.reject_once.set(true);
@@ -5283,7 +5283,7 @@ fn rejected_origin_supplier_does_not_fail_an_independent_coalesced_reader() {
 
 #[test]
 fn canceled_supplier_retains_crypto_fence_before_replacement_origin_work() {
-    let queue = Rc::new(racer_platform::drivers::DriverQueue::new(1024));
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let mut a = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
@@ -5299,7 +5299,7 @@ fn canceled_supplier_retains_crypto_fence_before_replacement_origin_work() {
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(first.as_mut().poll(&mut cx).is_pending());
     assert_eq!(f.origin.calls.get(), 1);
-    racer_platform::drivers::poll(&mut cx, 64);
+    uring_runtime::drivers::poll(&mut cx, 64);
     assert_eq!(
         f.crypto.outstanding(),
         1,
@@ -5322,7 +5322,7 @@ fn canceled_supplier_retains_crypto_fence_before_replacement_origin_work() {
     );
     // Reap no crypto here: a cancellation notification must not stand in for its
     // accepted completion even when the detached read driver is polled again.
-    racer_platform::drivers::poll(&mut cx, 64);
+    uring_runtime::drivers::poll(&mut cx, 64);
     assert!(second.as_mut().poll(&mut cx).is_pending());
     assert_eq!(
         f.origin.calls.get(),

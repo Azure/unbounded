@@ -5,7 +5,7 @@
 //! touches RDMA. It talks to the native thread through bounded command queues.
 //!
 //! This crate spawns no threads and runs no executor. Time and randomness come
-//! from the current `racer-platform` environment.
+//! from the current `uring-runtime` environment.
 //!
 //! # Basics
 //!
@@ -250,7 +250,7 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-use racer_platform::{
+use uring_runtime::{
     Operation, Scope,
     group::{FailureReporter, Service},
 };
@@ -295,8 +295,12 @@ where
     }
 
     /// Poll the inner service, then the native side, each with `budget`.
-    fn poll(&mut self, cx: &mut Context<'_>, budget: usize) -> std::result::Result<(), S::Error> {
-        self.inner.poll(cx, budget)?;
+    fn poll_budgeted(
+        &mut self,
+        cx: &mut Context<'_>,
+        budget: usize,
+    ) -> std::result::Result<(), S::Error> {
+        self.inner.poll_budgeted(cx, budget)?;
         self.native.poll_budgeted(budget).map_err(Into::into)
     }
 

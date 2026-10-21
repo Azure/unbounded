@@ -2,15 +2,12 @@
 //! Layout and access policy are supplied by the application, just as for host sockets.
 
 use crate::publication::{Endpoint, Rename};
-use racer_platform::{
-    reactor::{SocketAddress, descriptor::Descriptor},
-    simulation::Simulation,
-};
 use std::{
     cell::RefCell,
     io,
     path::{Path, PathBuf},
 };
+use uring_runtime::reactor::{SocketAddress, descriptor::Descriptor, simulation::Simulation};
 
 /// A simulated listener and the exact directory entry it owns.
 pub struct BoundSocket {
@@ -49,12 +46,7 @@ impl BoundSocket {
 
     /// Accept one queued connection without performing host syscalls.
     pub fn accept(&self) -> io::Result<Descriptor> {
-        self.listener
-            .as_sim()
-            .expect("simulated listener")
-            .accept()
-            .map(Descriptor::from)
-            .map_err(io::Error::from)
+        self.listener.as_sim().expect("simulated listener").accept()
     }
 
     /// Return the logical directory used by the simulated filesystem.
@@ -156,8 +148,8 @@ impl Drop for BoundSocket {
 mod tests {
     use super::*;
     use crate::publication::{Publication, Replacement};
-    use racer_platform::simulation::Fault;
     use std::rc::Rc;
+    use uring_runtime::reactor::simulation::Fault;
 
     #[test]
     fn bind_rejects_invalid_names_without_mutation() {

@@ -212,7 +212,7 @@ name = "controlplane"
 version = "0.1.0"
 dependencies = [
  "futures",
- "racer-platform",
+ "uring-runtime",
  "wire-codec",
 ]
 
@@ -425,7 +425,7 @@ dependencies = [
  "futures",
  "libc",
  "page-alloc",
- "racer-platform",
+ "uring-runtime",
  "zeroize",
 ]
 
@@ -556,7 +556,7 @@ dependencies = [
  "futures",
  "httparse",
  "libc",
- "racer-platform",
+ "uring-runtime",
  "zeroize",
 ]
 
@@ -699,7 +699,7 @@ name = "page-alloc"
 version = "0.1.0"
 dependencies = [
  "libc",
- "racer-platform",
+ "uring-runtime",
  "zeroize",
 ]
 
@@ -712,8 +712,8 @@ dependencies = [
  "racer-control-wire",
  "racer-crypto",
  "racer-object-wire",
- "racer-platform",
  "sha2",
+ "uring-runtime",
 ]
 
 [[package]]
@@ -837,12 +837,12 @@ dependencies = [
  "futures",
  "poly1305",
  "racer-control-wire",
- "racer-platform",
  "rcgen",
  "rustls",
  "serde",
  "serde_json",
  "sha2",
+ "uring-runtime",
  "x509-parser",
  "xaes-256-gcm",
  "zeroize",
@@ -867,7 +867,6 @@ dependencies = [
  "racer-control-wire",
  "racer-crypto",
  "racer-object-wire",
- "racer-platform",
  "rcgen",
  "rdma-verbs",
  "regex",
@@ -878,6 +877,7 @@ dependencies = [
  "telemetry",
  "topology",
  "uds-endpoint",
+ "uring-runtime",
  "wire-codec",
  "x509-parser",
  "zeroize",
@@ -890,17 +890,6 @@ dependencies = [
  "http1",
  "racer-control-wire",
  "wire-codec",
-]
-
-[[package]]
-name = "racer-platform"
-version = "0.1.0"
-dependencies = [
- "futures",
- "libc",
- "uring-runtime",
- "uring-runtime-sim",
- "zeroize",
 ]
 
 [[package]]
@@ -932,8 +921,8 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "libc",
- "racer-platform",
  "serde_json",
+ "uring-runtime",
 ]
 
 [[package]]
@@ -1175,7 +1164,7 @@ name = "telemetry"
 version = "0.1.0"
 dependencies = [
  "httparse",
- "racer-platform",
+ "uring-runtime",
  "zeroize",
 ]
 
@@ -1248,7 +1237,7 @@ name = "uds-endpoint"
 version = "0.1.0"
 dependencies = [
  "libc",
- "racer-platform",
+ "uring-runtime",
 ]
 
 [[package]]
@@ -1277,17 +1266,12 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 name = "uring-runtime"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "getrandom",
  "io-uring",
  "libc",
-]
-
-[[package]]
-name = "uring-runtime-sim"
-version = "0.1.0"
-dependencies = [
- "libc",
  "sha2",
- "uring-runtime",
+ "zeroize",
 ]
 
 [[package]]
@@ -1382,11 +1366,11 @@ dependencies = [
  "futures",
  "httparse",
  "libc",
- "racer-platform",
  "rcgen",
  "rustls",
  "rustls-pemfile",
  "sha2",
+ "uring-runtime",
  "zeroize",
 ]
 

@@ -1351,7 +1351,7 @@ struct DiskBody {
 }
 // SAFETY: the Arc-held ciphertext storage is never mutated after
 // construction, so the returned slice is stable while `self` is alive.
-unsafe impl racer_platform::reactor::SharedWriteBuffer for DiskBody {
+unsafe impl uring_runtime::reactor::SharedWriteBuffer for DiskBody {
     type Error = Error;
     fn write_bytes(&self) -> Result<&[u8]> {
         disk_body_prefix(&self.page, self.alignment, self.length).ok_or(Error::InvalidConfiguration)

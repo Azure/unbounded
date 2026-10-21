@@ -28,8 +28,6 @@ use racer_crypto::TAG_LEN;
 use racer_crypto::identity::KeyLease;
 use racer_crypto::identity::KeyPurpose;
 use racer_crypto::identity::Keyring;
-use racer_platform::offload;
-use racer_platform::reactor::IoBuffer;
 use std::cell::RefCell;
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -41,6 +39,8 @@ use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
+use uring_runtime::offload;
+use uring_runtime::reactor::IoBuffer;
 use zeroize::Zeroizing;
 
 impl From<racer_crypto::identity::Error> for crate::error::Error {
@@ -174,7 +174,7 @@ impl PeerOriginContext {
 
 pub(crate) fn fresh_nonce() -> Result<Nonce> {
     let mut nonce = [0u8; 24];
-    racer_platform::environment::fill_random(&mut nonce).map_err(|_| Error::Unavailable)?;
+    uring_runtime::environment::fill_random(&mut nonce).map_err(|_| Error::Unavailable)?;
     Ok(Nonce(nonce))
 }
 pub(crate) fn field(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
@@ -376,7 +376,7 @@ impl PageCrypto {
                 .active(&page.version.object.cache, KeyPurpose::Page)?;
             let ciphertext = match &self.buffers {
                 Some(buffers) => {
-                    use racer_platform::reactor::IoBuffer;
+                    use uring_runtime::reactor::IoBuffer;
                     let length = plaintext
                         .bytes()?
                         .len()
@@ -416,7 +416,7 @@ impl PageCrypto {
 /// The vetted AEAD adapter processes owned jobs in bounded quanta, checks the
 /// original deadline/cancellation, and returns every accepted job as a completion.
 pub struct PageCryptoEngine {
-    environment: racer_platform::environment::Environment,
+    environment: uring_runtime::environment::Environment,
 
     runtime: CryptoRuntime,
 
@@ -425,7 +425,7 @@ pub struct PageCryptoEngine {
 impl PageCryptoEngine {
     pub fn new(runtime: CryptoRuntime) -> Self {
         Self {
-            environment: racer_platform::environment::Environment::current(),
+            environment: uring_runtime::environment::Environment::current(),
             runtime,
             executor: offload::Worker::default(),
         }
@@ -433,7 +433,7 @@ impl PageCryptoEngine {
     /// All fallible work borrows input. Ownership transfers only after the final
     /// cancellation check, so failures retain the exact input and quota owners.
     pub fn process(job: CryptoJob) -> CryptoCompletion {
-        let measurement_start = racer_platform::environment::now();
+        let measurement_start = uring_runtime::environment::now();
         let CryptoJob {
             mut permit,
             input,
@@ -744,14 +744,14 @@ impl PageCryptoEngine {
             .map_err(Into::into)
     }
 }
-impl racer_platform::group::Service<RequestScope> for PageCryptoEngine {
+impl uring_runtime::group::Service<RequestScope> for PageCryptoEngine {
     fn register_driver(&self, waker: &std::task::Waker) {
         self.runtime.port.register_driver(waker);
     }
     fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
         Box::pin(self.environment.scope(async move { scope.check() }))
     }
-    fn poll(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
+    fn poll_budgeted(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
         // A helper error ends the worker group; name it before the process exits.
         self.drive(cx, work_budget).inspect_err(|error| {
             if *error != Error::Cancelled {
@@ -1050,8 +1050,8 @@ pub struct CryptoSendFailure<T> {
     pub command: T,
     pub error: Error,
 }
-impl<T> From<racer_platform::channel::SendFailure<T>> for CryptoSendFailure<T> {
-    fn from(failure: racer_platform::channel::SendFailure<T>) -> Self {
+impl<T> From<uring_runtime::channel::SendFailure<T>> for CryptoSendFailure<T> {
+    fn from(failure: uring_runtime::channel::SendFailure<T>) -> Self {
         Self {
             command: failure.command,
             error: failure.error.into(),
@@ -1201,7 +1201,7 @@ pub(crate) enum IntegrityRejection {
     Aead,
 }
 fn elapsed_ns(start: std::time::Instant) -> u64 {
-    racer_platform::environment::now()
+    uring_runtime::environment::now()
         .saturating_duration_since(start)
         .as_nanos()
         .min(u128::from(u64::MAX)) as u64
@@ -1222,7 +1222,7 @@ impl CryptoPermit {
 
     /// Start queue timing at each publication attempt, including a retry.
     fn submitted(&mut self) {
-        self.measurement.submitted = Some(racer_platform::environment::now());
+        self.measurement.submitted = Some(uring_runtime::environment::now());
     }
 
     /// Stop queue timing when the worker takes ownership, before execution.
@@ -1317,7 +1317,7 @@ pub struct CryptoJob {
 }
 impl CryptoPermit {
     pub fn job(mut self, input: CryptoInput, key: KeyLease, scope: RequestScope) -> CryptoJob {
-        use racer_platform::reactor::IoBuffer;
+        use uring_runtime::reactor::IoBuffer;
         self.measurement.checksum_only = matches!(
             input,
             CryptoInput::Checksum { .. }
@@ -1666,13 +1666,13 @@ mod tests {
     use crate::model::*;
     use racer_control_wire::CacheId;
     use racer_control_wire::KeyId;
-    use racer_platform::group::Service;
+    use uring_runtime::group::Service;
 
     /// Publication retries reset only queue timing, not execution or ownership.
     #[test]
     fn permit_bookkeeping_preserves_missing_submission_and_retry_timing() {
-        use racer_platform::environment::{SimulationClock, now};
         use std::time::Duration;
+        use uring_runtime::environment::{SimulationClock, now};
 
         let clock = SimulationClock::new(817);
         let _environment = clock.environment(0).enter();
@@ -2043,10 +2043,10 @@ mod tests {
             use crate::telemetry::Event::*;
             use crate::telemetry::Metrics;
             use racer_crypto::TAG_LEN;
-            use racer_platform::reactor::IoBuffer;
             use std::rc::Rc;
             use std::time::Duration;
             use std::time::Instant;
+            use uring_runtime::reactor::IoBuffer;
 
             fn page() -> PageId {
                 PageId {
@@ -2197,7 +2197,7 @@ mod tests {
                 let (io, mut engine) = pair(WorkerId(0), 0, NonZeroUsize::new(8).unwrap());
                 let client = CryptoClient::new(io);
                 client.set_metrics(metrics.clone());
-                let environment = racer_platform::environment::Environment::current();
+                let environment = uring_runtime::environment::Environment::current();
                 let thread = std::thread::spawn(move || {
                     let _env = environment.enter();
                     while let Some(job) =
@@ -2211,7 +2211,7 @@ mod tests {
                 });
                 let scope = RequestScope::new(
                     RequestId([0; 16]),
-                    racer_platform::environment::now() + Duration::from_secs(240),
+                    uring_runtime::environment::now() + Duration::from_secs(240),
                 )
                 .unwrap();
                 for batch in (0..iterations).step_by(8) {
@@ -2263,7 +2263,7 @@ mod tests {
                 ]) {
                     assert_eq!(metrics.count(event), expected);
                 }
-                if racer_platform::environment::simulation_seed().is_none() {
+                if uring_runtime::environment::simulation_seed().is_none() {
                     assert!(metrics.count(events[5]) > 0);
                     assert!(metrics.count(events[7]) > 0);
                 }
@@ -2271,8 +2271,8 @@ mod tests {
 
             #[test]
             fn attribution_preserves_client_cleanup_and_dst() {
-                use racer_platform::environment;
-                use racer_platform::environment::SimulationClock;
+                use uring_runtime::environment;
+                use uring_runtime::environment::SimulationClock;
                 let clock = SimulationClock::new(73);
                 let env = clock.environment(0);
                 let _env = env.enter();
@@ -2284,8 +2284,8 @@ mod tests {
 
             #[test]
             fn decrypt_submission_rejection_is_not_an_executed_failure() {
-                use racer_platform::environment::{SimulationClock, now};
                 use std::time::Duration;
+                use uring_runtime::environment::{SimulationClock, now};
                 let clock = SimulationClock::new(849);
                 let _environment = clock.environment(0).enter();
                 for closed in [false, true] {
@@ -2331,9 +2331,9 @@ mod tests {
 
             #[test]
             fn measurements_account_once_at_reap_even_for_cancel_and_abandon() {
-                use racer_platform::environment;
-                use racer_platform::environment::SimulationClock;
                 use std::time::Duration;
+                use uring_runtime::environment;
+                use uring_runtime::environment::SimulationClock;
                 let clock = SimulationClock::new(42);
                 let env = clock.environment(0);
                 let _env = env.enter();
@@ -2648,7 +2648,7 @@ mod tests {
                 use crate::security::PageCryptoEngine;
                 use crate::telemetry::Pair;
                 use crate::telemetry::Samples;
-                use racer_platform::environment;
+                use uring_runtime::environment;
                 let admission = std::rc::Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
                 )));
@@ -2780,7 +2780,7 @@ mod tests {
                         .unwrap();
                     let scope = RequestScope::new(
                         crate::model::RequestId([7; 16]),
-                        racer_platform::environment::now() + Duration::from_secs(10),
+                        uring_runtime::environment::now() + Duration::from_secs(10),
                     )
                     .unwrap();
                     let (io, mut engine) = pair(WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
@@ -2876,9 +2876,9 @@ mod tests {
 
             fn shared_worker_queue_measurements(decrypt: bool) {
                 use crate::security::PageCryptoEngine;
-                use racer_platform::environment;
-                use racer_platform::environment::SimulationClock;
                 use std::time::Duration;
+                use uring_runtime::environment;
+                use uring_runtime::environment::SimulationClock;
 
                 let clock = SimulationClock::new(43);
                 let env = clock.environment(0);
@@ -3022,21 +3022,15 @@ mod tests {
 
             #[test]
             fn duration_saturates_without_host_time_in_dst() {
-                use racer_platform::environment;
-                use racer_platform::environment::SimulationClock;
+                use uring_runtime::environment;
+                use uring_runtime::environment::SimulationClock;
                 let clock = SimulationClock::new(19);
                 let env = clock.environment(0);
                 let _env = env.enter();
                 let _strict = environment::require_simulated();
                 let start = environment::now();
-                // The library clock refuses to pass u64::MAX nanoseconds, so the
-                // saturating branch is unreachable in DST; measure the largest
-                // representable span exactly, from simulated time only.
-                let beyond = std::time::Duration::from_secs(u64::MAX / 1_000_000_000 + 1);
-                assert!(clock.checked_advance(beyond).is_err());
-                let span = std::time::Duration::from_secs(500 * 365 * 86_400);
-                clock.advance(span);
-                assert_eq!(u128::from(elapsed_ns(start)), span.as_nanos());
+                clock.advance(std::time::Duration::from_secs(u64::MAX / 1_000_000_000 + 1));
+                assert_eq!(elapsed_ns(start), u64::MAX);
             }
 
             fn measurement_events(decrypt: bool) -> [Event; 8] {
@@ -3258,10 +3252,10 @@ mod tests {
         mod channel_tests {
             #[cfg(test)]
             mod tests {
-                use racer_platform::Error;
-                use racer_platform::channel::*;
                 use std::task::Context;
                 use std::task::Poll;
+                use uring_runtime::Error;
+                use uring_runtime::channel::*;
 
                 #[test]
                 fn adapter_maps_errors_without_losing_command_ownership() {
@@ -3309,7 +3303,7 @@ mod tests {
                         engine,
                         scope: RequestScope::new(
                             crate::model::RequestId([0; 16]),
-                            racer_platform::environment::now() + std::time::Duration::from_secs(5),
+                            uring_runtime::environment::now() + std::time::Duration::from_secs(5),
                         )
                         .unwrap(),
                     }
@@ -3409,7 +3403,7 @@ mod tests {
 
             #[test]
             fn accepted_deadline_expiry_waits_for_engine_completion() {
-                let clock = racer_platform::environment::SimulationClock::new(91);
+                let clock = uring_runtime::environment::SimulationClock::new(91);
                 let _environment = clock.environment(0).enter();
                 let Fixture {
                     admission,
@@ -4185,7 +4179,7 @@ mod tests {
                 .is_ok()
             );
             engine
-                .poll(&mut Context::from_waker(futures::task::noop_waker_ref()), 1)
+                .poll_budgeted(&mut Context::from_waker(futures::task::noop_waker_ref()), 1)
                 .unwrap();
             let next = CryptoId {
                 sequence: sequence + 1,
@@ -4275,7 +4269,7 @@ mod tests {
                 )
                 .unwrap();
             {
-                use racer_platform::reactor::IoBuffer;
+                use uring_runtime::reactor::IoBuffer;
                 plaintext.bytes_mut().unwrap().fill(index as u8 + 1);
             }
             // Fill reserves the exact ciphertext length; the pool upgrades it.
@@ -4289,7 +4283,7 @@ mod tests {
         let mut done: Vec<_> = futures.iter().map(|_| None).collect();
         for _ in 0..16 {
             for engine in &mut engines {
-                engine.poll(&mut cx, 4).unwrap();
+                engine.poll_budgeted(&mut cx, 4).unwrap();
             }
             for (_, _, crypto) in &holders {
                 crypto.client.poll_budgeted(4).unwrap();
@@ -4420,7 +4414,7 @@ mod tests {
                 .is_ok()
             );
             engine
-                .poll(&mut Context::from_waker(futures::task::noop_waker_ref()), 1)
+                .poll_budgeted(&mut Context::from_waker(futures::task::noop_waker_ref()), 1)
                 .unwrap();
             let Poll::Ready(Ok(Some(completion))) = io.poll_completion(&mut cx) else {
                 panic!("completion");
@@ -4519,7 +4513,7 @@ mod tests {
         engine.register_driver(&waker);
         // Budget polling's noop task waker must not replace the runtime driver.
         engine
-            .poll(&mut Context::from_waker(futures::task::noop_waker_ref()), 1)
+            .poll_budgeted(&mut Context::from_waker(futures::task::noop_waker_ref()), 1)
             .unwrap();
         for sequence in 1..=9 {
             let job_scope =

@@ -13,9 +13,6 @@ use crate::runtime::RequestScope;
 use flow_control::PipeLease;
 use flow_control::PipePool;
 use http1::MessageHead;
-use racer_platform::reactor::SendBuffer;
-use racer_platform::reactor::SocketAddress;
-use racer_platform::reactor::descriptor::Descriptor;
 #[cfg(test)]
 use std::io;
 use std::path::PathBuf;
@@ -23,6 +20,9 @@ use std::rc::Rc;
 #[cfg(test)]
 use std::task::Waker;
 use std::time::Duration;
+use uring_runtime::reactor::SendBuffer;
+use uring_runtime::reactor::SocketAddress;
+use uring_runtime::reactor::descriptor::Descriptor;
 
 pub const MAX_HEAD_BYTES: usize = 32 * 1024;
 pub fn new_pipe_pool(
@@ -283,7 +283,7 @@ impl peer_wire::Context for HttpContext {
         scope.deadline.0 = scope
             .deadline
             .0
-            .min(racer_platform::environment::now() + Duration::from_secs(5));
+            .min(uring_runtime::environment::now() + Duration::from_secs(5));
         Ok(scope)
     }
 }
@@ -672,7 +672,6 @@ pub(crate) mod tests {
     use crate::model::RequestId;
     use http1::Header;
     use http1::StartLine;
-    use racer_platform::reactor::IoBuffer;
     use std::future::Future;
     use std::io::Read;
     use std::io::Write;
@@ -682,6 +681,7 @@ pub(crate) mod tests {
     use std::task::Poll;
     use std::time::Duration;
     use std::time::Instant;
+    use uring_runtime::reactor::IoBuffer;
 
     /// Optional gates and response outcomes must not change completion ownership.
     #[test]
@@ -950,7 +950,6 @@ pub(crate) mod tests {
         use crate::runtime::Cancellation;
         use crate::runtime::Reactor;
         use racer_control_wire::CacheId;
-        use racer_platform::environment::Deadline;
         use std::io::Read;
         use std::os::fd::AsRawFd;
         use std::os::unix::net::UnixStream;
@@ -958,6 +957,7 @@ pub(crate) mod tests {
         use std::task::Context;
         use std::task::Poll;
         use std::time::Instant;
+        use uring_runtime::environment::Deadline;
         fn admission(pipes: usize) -> Rc<flow_control::Quotas<AdmissionPolicy>> {
             let small = std::num::NonZeroUsize::new(8).unwrap();
             let bytes = std::num::NonZeroUsize::new(32 * 1024 * 1024).unwrap();
@@ -1906,10 +1906,10 @@ pub(crate) mod tests {
     mod pool {
         use super::*;
         use crate::test_support::WakeCounter;
-        use racer_platform::simulation::Fault;
-        use racer_platform::simulation::Simulation;
         use std::sync::Arc;
         use std::task::Waker;
+        use uring_runtime::reactor::simulation::Fault;
+        use uring_runtime::reactor::simulation::Simulation;
         enum Listener {
             Tcp(std::net::TcpListener),
             Unix(std::os::unix::net::UnixListener, PathBuf),
@@ -1958,7 +1958,7 @@ pub(crate) mod tests {
         fn scope() -> RequestScope {
             RequestScope::new(
                 RequestId([7; 16]),
-                racer_platform::environment::now() + Duration::from_secs(5),
+                uring_runtime::environment::now() + Duration::from_secs(5),
             )
             .unwrap()
         }
@@ -2079,7 +2079,7 @@ pub(crate) mod tests {
         }
         #[test]
         fn origin_wait_is_bounded_fifo_without_blocking_peers_or_other_caches() {
-            let clock = racer_platform::environment::SimulationClock::new(92);
+            let clock = uring_runtime::environment::SimulationClock::new(92);
             let _environment = clock.environment(0).enter();
             let (admission, reactor, pool) = setup();
             let (listener, endpoint) = Listener::origin();
@@ -2488,7 +2488,7 @@ pub(crate) mod tests {
                 let failure = Rc::new(std::cell::Cell::new(false));
                 let scope = RequestScope::new(
                     crate::model::RequestId([88; 16]),
-                    racer_platform::environment::now() + Duration::from_secs(5),
+                    uring_runtime::environment::now() + Duration::from_secs(5),
                 )
                 .unwrap();
                 let endpoint = Endpoint::Peer("127.0.0.1:9999".into());
@@ -2546,7 +2546,7 @@ pub(crate) mod tests {
             use futures::stream::FuturesUnordered;
             use std::sync::Arc;
             use std::task::Wake;
-            struct WakeReactor(racer_platform::reactor::ReactorWake);
+            struct WakeReactor(uring_runtime::reactor::ReactorWake);
             impl Wake for WakeReactor {
                 fn wake(self: Arc<Self>) {
                     self.0.wake().unwrap();

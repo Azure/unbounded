@@ -3,7 +3,6 @@
 //! This small test-only companion keeps one copy of the fixture machinery while
 //! preserving both external API tests and private connection-pool assertions.
 
-use racer_platform::{reactor::descriptor::Descriptor, scope::LibraryScope as _};
 use std::{
     io::{Read, Write},
     net::SocketAddr,
@@ -14,6 +13,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant, SystemTime},
 };
+use uring_runtime::{Scope as _, reactor::descriptor::Descriptor};
 use wire_codec::rest::{
     Config, Connection, Error as RestError, Identity, Io, Method, Operation, Request, Scope,
     Transport,
@@ -51,7 +51,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Clone)]
 pub struct TestScope(Instant);
 
-impl racer_platform::scope::LibraryScope for TestScope {
+impl uring_runtime::Scope for TestScope {
     type Error = Error;
 
     /// Expire operations after the fixture's absolute deadline.
@@ -76,17 +76,10 @@ impl Scope for TestScope {
     }
 }
 
-impl From<racer_platform::Error> for Error {
+impl From<uring_runtime::Error> for Error {
     /// Preserve the original fixture's runtime-to-I/O error mapping.
-    fn from(_: racer_platform::Error) -> Self {
+    fn from(_: uring_runtime::Error) -> Self {
         Self::IO
-    }
-}
-
-impl From<racer_platform::uring::Error> for Error {
-    /// Library errors take the same runtime-to-I/O mapping.
-    fn from(error: racer_platform::uring::Error) -> Self {
-        racer_platform::Error::from(error).into()
     }
 }
 

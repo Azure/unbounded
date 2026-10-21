@@ -44,13 +44,13 @@ impl NativeRetry {
             if self.immediate.replace(false) {
                 return Ok(());
             }
-            let until = (racer_platform::environment::now() + Duration::from_millis(1))
+            let until = (uring_runtime::environment::now() + Duration::from_millis(1))
                 .min(scope.deadline.0);
             if let Some(reactor) = &self.reactor {
                 reactor
                     .sleep_until(
                         until,
-                        racer_platform::reactor::timer::SleepMode::Kernel,
+                        uring_runtime::reactor::timer::SleepMode::Kernel,
                         scope,
                     )
                     .await
@@ -124,7 +124,7 @@ mod tests {
     fn scope() -> RequestScope {
         RequestScope::new(
             crate::model::RequestId([7; 16]),
-            racer_platform::environment::now() + Duration::from_secs(30),
+            uring_runtime::environment::now() + Duration::from_secs(30),
         )
         .unwrap()
     }
@@ -214,7 +214,7 @@ mod tests {
     #[test]
     fn alarm_wakes_child_to_observe_deadline_without_native_wake() {
         use futures::{Stream, stream::FuturesUnordered};
-        let clock = racer_platform::environment::SimulationClock::new(989);
+        let clock = uring_runtime::environment::SimulationClock::new(989);
         let _environment = clock.environment(0).enter();
         let retry = NativeRetry::unattached();
         let scope = scope();

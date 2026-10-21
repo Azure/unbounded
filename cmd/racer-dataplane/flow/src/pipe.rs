@@ -5,7 +5,6 @@
 //! recycled while a reader owns the lease. Writes copy into kernel
 //! pipe pages before splice: socket acceptance is not a userspace page reuse fence.
 use crate::{Charge, Error, Policy, Quotas, Result};
-use racer_platform::reactor::descriptor::Descriptor;
 use std::{
     cell::RefCell,
     collections::VecDeque,
@@ -15,6 +14,7 @@ use std::{
     rc::{Rc, Weak},
     task::{Poll, Waker},
 };
+use uring_runtime::reactor::descriptor::Descriptor;
 
 /// Maximum kernel buffer capacity per admitted reader. Pipe admission is in pipe
 /// units, so total pipe capacity is bounded by the pipe quota * MAX_PIPE_BYTES.
@@ -274,7 +274,7 @@ impl<P: Policy> PipeResources<P> {
     /// Create bounded descriptors, closing them before admission on any failure.
     fn new(reservation: Charge<P>) -> Result<Self> {
         #[cfg(feature = "simulation")]
-        if let Some(sim) = racer_platform::simulation::Simulation::current() {
+        if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
             let (read, write) = sim.pipe(MAX_PIPE_BYTES);
             return Ok(Self {
                 read,
@@ -1245,7 +1245,7 @@ mod tests {
     #[cfg(feature = "simulation")]
     #[test]
     fn simulation_uses_runtime_descriptors_and_preserves_accounting() {
-        let sim = racer_platform::simulation::Simulation::new();
+        let sim = uring_runtime::reactor::simulation::Simulation::new();
         let _environment = sim.enter();
         let quotas = admission(1);
         let pool = new_pool(quotas.clone());
@@ -1287,7 +1287,7 @@ mod tests {
         let (real_socket, _peer) = UnixStream::pair().unwrap();
         real_socket.set_nonblocking(true).unwrap();
         let real_socket = Descriptor::from(std::os::fd::OwnedFd::from(real_socket));
-        let sim = racer_platform::simulation::Simulation::new();
+        let sim = uring_runtime::reactor::simulation::Simulation::new();
         let _environment = sim.enter();
         let mut simulated_pipe = pool.acquire().unwrap();
         let (simulated_socket, _peer) = sim.socket_pair();

@@ -11,19 +11,19 @@ use racer_control_wire::CacheId;
 use racer_control_wire::MembershipVersion;
 use racer_crypto::identity::PendingIdentity;
 use racer_crypto::identity::SigningIdentity;
-use racer_platform::environment::SimulationClock;
-#[cfg(test)]
-use racer_platform::group::Service;
-use racer_platform::reactor::SocketAddress;
-use racer_platform::reactor::descriptor::Descriptor;
-use racer_platform::simulation::Fault;
-use racer_platform::simulation::Simulation;
 use sha2::Digest;
 use sha2::Sha256;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
+use uring_runtime::environment::SimulationClock;
+#[cfg(test)]
+use uring_runtime::group::Service;
+use uring_runtime::reactor::SocketAddress;
+use uring_runtime::reactor::descriptor::Descriptor;
+use uring_runtime::reactor::simulation::Fault;
+use uring_runtime::reactor::simulation::Simulation;
 
 const MAX_NODES: usize = 32;
 const MAX_TURNS: usize = 100_000;
@@ -32,10 +32,10 @@ const SUBSCRIPTION_FIELDS: &str = "Content-Length: 0\r\nRacer-Page-Credits: 64\r
 
 /// The application owns this deterministic replay domain, not the generic runtime.
 trait RacerEntropy {
-    fn racer_environment(&self, stream: u64) -> racer_platform::environment::Environment;
+    fn racer_environment(&self, stream: u64) -> uring_runtime::environment::Environment;
 }
 impl RacerEntropy for SimulationClock {
-    fn racer_environment(&self, stream: u64) -> racer_platform::environment::Environment {
+    fn racer_environment(&self, stream: u64) -> uring_runtime::environment::Environment {
         self.environment_with_entropy_domain(stream, &b"racer.dst.entropy.v1\0"[..])
     }
 }
@@ -47,7 +47,7 @@ fn racer_entropy_replay_bytes_are_stable() {
     let mut bytes = [0; 32];
     for chunk in bytes.chunks_mut(3) {
         let _role = role.clone().enter();
-        racer_platform::environment::fill_random(chunk).unwrap();
+        uring_runtime::environment::fill_random(chunk).unwrap();
     }
     assert_eq!(
         bytes,
@@ -58,7 +58,7 @@ fn racer_entropy_replay_bytes_are_stable() {
     );
     let _default = clock.environment(11).enter();
     let mut neutral = [0; 32];
-    racer_platform::environment::fill_random(&mut neutral).unwrap();
+    uring_runtime::environment::fill_random(&mut neutral).unwrap();
     assert_ne!(bytes, neutral);
 }
 
@@ -171,7 +171,7 @@ mod faults {
                     }
                 }
                 let mut bytes = [0; 32768];
-                match handle(&fd).recv(&mut bytes, false) {
+                match handle(&fd).recv(&mut bytes) {
                     Ok(0) => {
                         finished = true;
                         break;
@@ -298,7 +298,7 @@ mod faults {
         }
 
         pub(super) fn disk_corruption(&mut self) {
-            use racer_platform::simulation::DiskState;
+            use uring_runtime::reactor::simulation::disk::DiskState;
             self.settle();
             let entries: Vec<_> = self
                 .nodes
@@ -786,7 +786,7 @@ mod scenarios {
         let _os = sim.enter();
         let clock = SimulationClock::new(73);
         let _time = clock.racer_environment(0).enter();
-        let _strict = racer_platform::environment::require_simulated();
+        let _strict = uring_runtime::environment::require_simulated();
         let mut harness = Harness::new(73, sim, clock, false);
         harness.add(None);
         harness.add(None);
@@ -875,13 +875,13 @@ mod scenarios {
         let mut held = servers[0].dispatch(first, &scope);
         assert!(held.as_mut().poll(&mut cx).is_pending());
         let worker = &mut harness.nodes[target].workers[0];
-        worker.crypto.poll(&mut cx, 1).unwrap();
+        worker.crypto.poll_budgeted(&mut cx, 1).unwrap();
         worker.runtime.crypto.poll_budgeted(1).unwrap();
         assert!(held.as_mut().poll(&mut cx).is_pending());
         let mut rejected = servers[1].dispatch(contending, &scope);
         assert!(rejected.as_mut().poll(&mut cx).is_pending());
         let worker = &mut harness.nodes[target].workers[1];
-        worker.crypto.poll(&mut cx, 1).unwrap();
+        worker.crypto.poll_budgeted(&mut cx, 1).unwrap();
         worker.runtime.crypto.poll_budgeted(1).unwrap();
         let Poll::Ready(Ok(response)) = rejected.as_mut().poll(&mut cx) else {
             panic!("second server must reject the same live subscription");
@@ -936,7 +936,7 @@ mod scenarios {
         let clock = SimulationClock::new(73);
         let environment = clock.racer_environment(0);
         let _time = environment.enter();
-        let _strict = racer_platform::environment::require_simulated();
+        let _strict = uring_runtime::environment::require_simulated();
         let mut harness = Harness::new(73, sim, clock, false);
         harness.add(None);
         harness.add(None);
@@ -974,7 +974,7 @@ mod scenarios {
         for round in 0u64..1100 {
             let scope = RequestScope::new(
                 RequestId([1; 16]),
-                racer_platform::environment::now() + Duration::from_secs(5),
+                uring_runtime::environment::now() + Duration::from_secs(5),
             )
             .unwrap();
             let mut attempt = [0; 16];
@@ -1060,7 +1060,7 @@ mod scenarios {
         let clock = SimulationClock::new(73);
         let environment = clock.racer_environment(0);
         let _time = environment.enter();
-        let _strict = racer_platform::environment::require_simulated();
+        let _strict = uring_runtime::environment::require_simulated();
         let mut harness = Harness::new(73, sim.clone(), clock.clone(), false);
         harness.add(None);
         // The DST harness bypasses control enrollment and already attaches diagnostic
@@ -1104,7 +1104,10 @@ mod scenarios {
             let ordinary_in_flight = reactor.in_flight();
             assert!(ordinary_in_flight < limit);
             for _ in 0..32 {
-                harness.nodes[0].workers[0].app.poll(&mut cx, 64).unwrap();
+                harness.nodes[0].workers[0]
+                    .app
+                    .poll_budgeted(&mut cx, 64)
+                    .unwrap();
                 assert!(reactor.in_flight() >= ordinary_in_flight);
                 assert!(reactor.in_flight() <= limit);
                 assert!(harness.nodes[0].workers[0].app.diagnostic_task.is_some());
@@ -1129,13 +1132,13 @@ mod scenarios {
                 for _ in 0..1000 {
                     harness.tick();
                     let mut bytes = [0; 4096];
-                    match handle(&socket).recv(&mut bytes, false) {
+                    match handle(&socket).recv(&mut bytes) {
                         Ok(0) => {
                             closed = true;
                             break;
                         }
                         Ok(count) => response.extend_from_slice(&bytes[..count]),
-                        Err(error) if error.is_would_block() => (),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => (),
                         Err(error) => panic!("{error}"),
                     }
                 }
@@ -1155,7 +1158,7 @@ mod scenarios {
             .unwrap();
         for _ in 0..32 {
             worker.runtime.reactor.poll_budgeted(128).unwrap();
-            worker.app.poll(&mut cx, 64).unwrap();
+            worker.app.poll_budgeted(&mut cx, 64).unwrap();
         }
         assert!(worker.app.diagnostic_task.is_none());
         assert!(worker.app.peer_task.is_none());
@@ -1173,7 +1176,7 @@ mod scenarios {
         let clock = SimulationClock::new(71);
         let environment = clock.racer_environment(0);
         let _time = environment.enter();
-        let _strict = racer_platform::environment::require_simulated();
+        let _strict = uring_runtime::environment::require_simulated();
         let mut harness = Harness::new(71, sim, clock, false);
         harness.opaque_relay = opaque;
         // Match the deployed 64 MiB per-worker payload budgets. A five-page layer
@@ -1219,7 +1222,7 @@ mod scenarios {
         let clock = SimulationClock::new(73);
         let environment = clock.racer_environment(0);
         let _time = environment.enter();
-        let _strict = racer_platform::environment::require_simulated();
+        let _strict = uring_runtime::environment::require_simulated();
         let mut harness = Harness::new(73, sim, clock, false);
         harness.concurrent_layers = true;
         harness.opaque_relay = opaque;
@@ -1440,21 +1443,18 @@ mod traffic {
         }
         pub(super) fn collect(&mut self, sim: &Simulation) {
             for event in sim.take_trace() {
-                // Events are typed now; key coverage by their legacy labels.
-                let operation = racer_platform::simulation::event_label(event.kind)
-                    .unwrap_or_else(|| format!("{:?}", event.kind));
                 self.trace.record(format!(
                     "os:{}:{}:{}",
-                    operation, event.resource, event.result
+                    event.operation, event.resource, event.result
                 ));
-                if let Some(op) = operation.strip_prefix("fault:") {
+                if let Some(op) = event.operation.strip_prefix("fault:") {
                     *self.observed.entry(op.into()).or_default() += 1;
                 }
-                if (operation.starts_with("complete:") && event.result >= 0)
-                    || operation.starts_with("blocked:")
-                    || operation == "disk:crash"
+                if (event.operation.starts_with("complete:") && event.result >= 0)
+                    || event.operation.starts_with("blocked:")
+                    || event.operation == "disk:crash"
                 {
-                    *self.operations.entry(operation).or_default() += 1;
+                    *self.operations.entry(event.operation).or_default() += 1;
                 }
             }
         }
@@ -1483,7 +1483,7 @@ mod traffic {
                 }
             }
             let mut bytes = [0; 65536];
-            match fd.recv(&mut bytes, false) {
+            match fd.recv(&mut bytes) {
                 Ok(0) => {
                     self.disconnected = true;
                     return true;
@@ -1589,13 +1589,8 @@ mod traffic {
                     } else {
                         "recv"
                     };
-                    // Target the reactor operation: the harness's own
-                    // fixture sockets must not consume the fault.
                     self.sim
-                        .inject_at(
-                            reactor_fault(operation),
-                            Fault::Short(1 + self.rng.pick(128)),
-                        )
+                        .inject(operation, Fault::Short(1 + self.rng.pick(128)))
                         .unwrap();
                     *self.coverage.injected.entry(operation.into()).or_default() += 1;
                     self.coverage.action("short-io");
@@ -1603,7 +1598,7 @@ mod traffic {
                 }
                 Action::ConnectFailure => {
                     self.sim
-                        .inject_at(reactor_fault("connect"), Fault::Errno(libc::ECONNREFUSED))
+                        .inject("connect", Fault::Errno(libc::ECONNREFUSED))
                         .unwrap();
                     *self.coverage.injected.entry("connect".into()).or_default() += 1;
                     // A new version forces an origin connection despite warm peers.
@@ -1687,7 +1682,7 @@ mod traffic {
                 }
                 Action::Partition if self.nodes.len() > 1 => self.partition_traffic(),
                 Action::WallJump => {
-                    let wall = racer_platform::environment::wall_now();
+                    let wall = uring_runtime::environment::wall_now();
                     let amount = Duration::from_secs(1 + self.rng.pick(120) as u64);
                     self.clock.set_wall_time(if self.rng.pick(2) == 0 {
                         wall + amount
@@ -1697,9 +1692,9 @@ mod traffic {
                     self.traffic(1, true);
                     // Recover past replay admission's wall high-water mark.
                     self.clock.advance(Duration::from_secs(121));
-                    let (anchor, wall_anchor) = racer_platform::environment::clock_anchor();
+                    let (anchor, wall_anchor) = uring_runtime::environment::clock_anchor();
                     self.clock.set_wall_time(
-                        wall_anchor + racer_platform::environment::now().duration_since(anchor),
+                        wall_anchor + uring_runtime::environment::now().duration_since(anchor),
                     );
                     self.coverage.action("wall-jump");
                 }
@@ -1964,21 +1959,11 @@ impl PartialEq for ReplayTrace {
 }
 impl Eq for ReplayTrace {}
 
-fn handle(fd: &Descriptor) -> &racer_platform::simulation::SimFd {
+fn handle(fd: &Descriptor) -> &uring_runtime::reactor::simulation::Handle {
     fd.as_sim().expect("DST escaped into host I/O")
 }
-/// Library faults named like `connect` also match synchronous fixture calls;
-/// the legacy simulator only failed reactor operations, so target those.
-fn reactor_fault(name: &str) -> racer_platform::simulation::FaultTarget {
-    match racer_platform::simulation::fault_target(name).unwrap() {
-        racer_platform::simulation::FaultTarget::Either(op, _) => {
-            racer_platform::simulation::FaultTarget::Op(op)
-        }
-        target => target,
-    }
-}
-fn would_block(error: &racer_platform::uring::Error) -> bool {
-    error.is_would_block()
+fn would_block(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
 }
 fn key(object: usize) -> String {
     format!("{object:064x}")
@@ -2022,7 +2007,7 @@ impl Adapter {
     fn poll(&mut self, catalog: &Rc<RefCell<Catalog>>) {
         match handle(&self.listener).accept() {
             Ok(fd) => self.connections.push(OriginConnection {
-                fd: Descriptor::from(fd),
+                fd,
                 input: vec![],
                 output: vec![],
                 sent: 0,
@@ -2033,7 +2018,7 @@ impl Adapter {
         self.connections.retain_mut(|c| {
             if c.output.is_empty() {
                 let mut bytes = [0; 8192];
-                match handle(&c.fd).recv(&mut bytes, false) {
+                match handle(&c.fd).recv(&mut bytes) {
                     Ok(0) => return false,
                     Ok(n) => c.input.extend_from_slice(&bytes[..n]),
                     Err(e) if would_block(&e) => return true,
@@ -2176,7 +2161,7 @@ struct Node {
 struct LocalWorker {
     app: WorkerApplication,
     runtime: WorkerRuntime,
-    crypto: Box<dyn racer_platform::group::Service<RequestScope>>,
+    crypto: Box<dyn uring_runtime::group::Service<RequestScope>>,
 }
 impl Node {
     fn poll(&mut self, budget: usize) {
@@ -2194,7 +2179,7 @@ impl Node {
             worker.runtime.reactor.poll_budgeted(budget).unwrap();
             worker
                 .crypto
-                .poll(
+                .poll_budgeted(
                     &mut Context::from_waker(futures::task::noop_waker_ref()),
                     budget,
                 )
@@ -2202,7 +2187,7 @@ impl Node {
             worker.runtime.crypto.poll_budgeted(budget).unwrap();
             worker
                 .app
-                .poll(
+                .poll_budgeted(
                     &mut Context::from_waker(futures::task::noop_waker_ref()),
                     budget,
                 )
@@ -2507,7 +2492,7 @@ impl Harness {
             self.sim
                 .disk()
                 .sync(
-                    config
+                    &config
                         .slab_directory
                         .join(format!("worker-{}-slab-0.dat", worker.app.worker.0)),
                 )
@@ -2782,7 +2767,7 @@ impl Harness {
             }
             if let rdma_verbs::LinkState::Backoff(until) = links.state(&peer, rail) {
                 self.clock.advance(
-                    until.saturating_duration_since(racer_platform::environment::now())
+                    until.saturating_duration_since(uring_runtime::environment::now())
                         + Duration::from_millis(1),
                 );
             }
@@ -3134,7 +3119,7 @@ fn default_grace_staggered_nodes_and_periodic_checkpoint_traffic() {
                 .app
                 .node
                 .publications
-                .resolve(old.0, racer_platform::environment::now())
+                .resolve(old.0, uring_runtime::environment::now())
                 .unwrap()
                 .is_some()
         );
@@ -3174,7 +3159,7 @@ fn dst_origin_recovery_completes_before_concurrent_healthy_reads() {
         let clock = SimulationClock::new(106);
         let environment = clock.racer_environment(0);
         let _time = environment.enter();
-        let _strict = racer_platform::environment::require_simulated();
+        let _strict = uring_runtime::environment::require_simulated();
         let mut harness = Harness::new(106, sim, clock, native);
         for object in 0..8 {
             harness.update(object);
@@ -3217,7 +3202,7 @@ fn dst_native_faults_reach_warmed_peers_in_small_topologies() {
         let clock = SimulationClock::new(118);
         let environment = clock.racer_environment(0);
         let _time = environment.enter();
-        let _strict = racer_platform::environment::require_simulated();
+        let _strict = uring_runtime::environment::require_simulated();
         let mut harness = Harness::new(118, sim, clock, true);
         for _ in 0..nodes {
             harness.add(None);
@@ -3247,7 +3232,7 @@ fn dst_refused_peer_connect_preserves_candidate_fallback() {
         let clock = SimulationClock::new(119);
         let environment = clock.racer_environment(0);
         let _time = environment.enter();
-        let _strict = racer_platform::environment::require_simulated();
+        let _strict = uring_runtime::environment::require_simulated();
         let mut harness = Harness::new(119, sim, clock, native);
         for _ in 0..4 {
             harness.add(None);
@@ -3259,7 +3244,7 @@ fn dst_refused_peer_connect_preserves_candidate_fallback() {
         // origin. Raw ECONNREFUSED must retain the same fallback as synthetic Io.
         harness
             .sim
-            .inject_at(reactor_fault("connect"), Fault::Errno(libc::ECONNREFUSED))
+            .inject("connect", Fault::Errno(libc::ECONNREFUSED))
             .unwrap();
         let client = harness.request_on(2, false, false, requester);
         harness.exchange(client, false);
@@ -3294,7 +3279,7 @@ fn dst_shutdown_checkpoint_uses_async_io_and_releases_all_shards() {
         let clock = SimulationClock::new(120);
         let environment = clock.racer_environment(0);
         let _time = environment.enter();
-        let _strict = racer_platform::environment::require_simulated();
+        let _strict = uring_runtime::environment::require_simulated();
         let mut harness = Harness::new(120, sim, clock, false);
         harness.rng = Random((0..100).find(|seed| Random(*seed).pick(2) == 1).unwrap());
         harness.add(None);
@@ -3423,21 +3408,24 @@ fn dst_shutdown_checkpoint_uses_async_io_and_releases_all_shards() {
             assert_eq!(after[0].1.sequence, sequence + 1);
             assert_eq!(after[0].1.shards.len(), node.workers.len());
             assert_eq!(after[0].0, before.first().map_or(0, |(slot, _)| slot ^ 1));
-            assert!(harness.sim.take_trace().iter().any(|event| event.kind
-                == racer_platform::simulation::EventKind::Complete(
-                    racer_platform::uring::backend::OpKind::RenameAt
-                )));
+            assert!(
+                harness
+                    .sim
+                    .take_trace()
+                    .iter()
+                    .any(|event| event.operation == "complete:rename")
+            );
         } else {
             assert_eq!(after.len(), before.len(), "{case}");
             if case == "populated-budget" {
-                assert!(!harness.sim.take_trace().iter().any(|event| event.kind
-                    == racer_platform::simulation::EventKind::Submit(
-                        racer_platform::uring::backend::OpKind::Write
-                    )
-                    || event.kind
-                        == racer_platform::simulation::EventKind::Submit(
-                            racer_platform::uring::backend::OpKind::RenameAt
-                        )));
+                assert!(
+                    !harness
+                        .sim
+                        .take_trace()
+                        .iter()
+                        .any(|event| event.operation == "submit:write"
+                            || event.operation == "submit:rename")
+                );
             }
         }
         drop(operations);
@@ -3603,7 +3591,7 @@ fn replay(seed: u64, steps: usize, native: bool) -> Coverage {
     let clock = SimulationClock::new(seed);
     let environment = clock.racer_environment(0);
     let _time = environment.enter();
-    let _strict = racer_platform::environment::require_simulated();
+    let _strict = uring_runtime::environment::require_simulated();
     let mut harness = Harness::new(seed, sim, clock, native);
     harness
         .coverage
@@ -3684,7 +3672,7 @@ fn lifecycle(workers: &mut [LocalWorker], scope: &RequestScope, phase: Lifecycle
         for (runtime, crypto, operation) in &mut pending {
             runtime.reactor.poll_budgeted(64).unwrap();
             crypto
-                .poll(
+                .poll_budgeted(
                     &mut Context::from_waker(futures::task::noop_waker_ref()),
                     64,
                 )
@@ -3707,12 +3695,12 @@ fn lifecycle(workers: &mut [LocalWorker], scope: &RequestScope, phase: Lifecycle
 }
 fn drive_local<T>(
     runtime: &WorkerRuntime,
-    crypto: &mut dyn racer_platform::group::Service<RequestScope>,
+    crypto: &mut dyn uring_runtime::group::Service<RequestScope>,
     mut operation: Operation<'_, T>,
 ) -> Result<T> {
     for _ in 0..MAX_TURNS {
         runtime.reactor.poll_budgeted(64)?;
-        crypto.poll(
+        crypto.poll_budgeted(
             &mut Context::from_waker(futures::task::noop_waker_ref()),
             64,
         )?;
