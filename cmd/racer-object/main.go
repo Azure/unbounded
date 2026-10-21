@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -47,9 +48,13 @@ func (b *bucketFlag) Set(value string) error {
 	return nil
 }
 
+// cacheUIDPattern matches the canonical lowercase UUID form of a Kubernetes UID.
+var cacheUIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
 type options struct {
 	mode            string
 	cache           string
+	cacheUID        string
 	bucket          bucketFlag
 	provider        string
 	api             string
@@ -123,6 +128,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 
 	showVersion := fs.Bool("version", false, "Print version")
 	if o.mode == "origin" {
+		fs.StringVar(&o.cacheUID, "cache-uid", "", "Optional ClusterCache UID (lowercase UUID) this origin serves; when set, requests for any other or no cache UID are refused so a leftover origin cannot fill a recreated cache with the same name")
 		fs.Var(&o.bucket, "bucket", "Required bucket/container (S3 bucket or Azure container) served by this origin; requests for any other bucket are forbidden")
 		fs.StringVar(&o.provider, "provider", "s3", "Upstream provider: s3 or azure")
 		fs.StringVar(&o.accountURL, "account-url", "", "Azure account HTTP(S) URL; required for azure, without credentials or query")
@@ -172,6 +178,10 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 
 		if err := racerobject.ValidateBucket(string(o.bucket)); err != nil {
 			return o, errors.New("invalid --bucket")
+		}
+
+		if o.cacheUID != "" && !cacheUIDPattern.MatchString(o.cacheUID) {
+			return o, errors.New("invalid --cache-uid")
 		}
 	}
 
@@ -392,7 +402,7 @@ func runOrigin(ctx context.Context, o options) error {
 	}
 
 	err = racersdk.ServeOrigin(ctx, racersdk.OriginConfig{
-		Cache: o.cache, RecoverStaleSocket: true, MaxConcurrentRequests: o.maxRequests,
+		Cache: o.cache, CacheUID: o.cacheUID, RecoverStaleSocket: true, MaxConcurrentRequests: o.maxRequests,
 	}, origin)
 	if ctx.Err() != nil {
 		return nil
