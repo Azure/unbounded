@@ -119,12 +119,24 @@ class RootfsContractTest(unittest.TestCase):
             "#!/bin/sh\n"
             "set -eu\n"
             "\n"
+            "has_nvidia=\n"
+            "for vendor in /sys/bus/pci/devices/*/vendor; do\n"
+            '    if [ -f "$vendor" ] && [ "$(cat "$vendor")" = 0x10de ]; then\n'
+            "        has_nvidia=1\n"
+            "        break\n"
+            "    fi\n"
+            "done\n"
+            'if [ -z "$has_nvidia" ]; then\n'
+            "    exit 0\n"
+            "fi\n"
+            "\n"
             "/usr/bin/nvidia-modprobe -c 0\n"
+            "/usr/bin/nvidia-modprobe -u\n"
+            "/usr/bin/nvidia-modprobe -s\n"
+            "/usr/bin/udevadm settle --timeout=30 || true\n"
             "\n"
             "attempt=0\n"
-            'while [ "$attempt" -lt 30 ]; do\n'
-            "    /usr/bin/nvidia-modprobe -u\n"
-            "    /usr/bin/nvidia-modprobe -s\n"
+            'while [ "$attempt" -lt 60 ]; do\n'
             "    missing=\n"
             "    for path in \\\n"
             "        /dev/nvidiactl \\\n"
