@@ -276,6 +276,15 @@ fn every_non_fence_fault_still_drains_fences_and_drops() {
             // A steady-state fault may race with the startup wait.
             if step != "poll" {
                 assert_eq!(started.is_err(), step == "start", "{step}");
+            } else {
+                // `join` requests shutdown, so joining before the lane's
+                // first poll would skip the fault. Only a poll failure can
+                // drain the lane before `join`, so wait for that.
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                while group.stats().drained == 0 {
+                    assert!(std::time::Instant::now() < deadline, "poll never failed");
+                    thread::sleep(Duration::from_millis(1));
+                }
             }
             let error = group.join().unwrap_err();
             let stage = match step {
