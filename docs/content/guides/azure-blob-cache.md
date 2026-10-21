@@ -55,7 +55,8 @@ EOF
 | `spec.origin.bucket` | The one container pods may read. You cannot change it later. |
 | `spec.origin.azure.accountURL` | Your blob service URL, such as `https://ACCOUNT.blob.core.windows.net`. You cannot change it later. |
 
-To read another container or account, create another ClusterCache.
+You also cannot remove `spec.origin` later. To read another container or
+account, create another ClusterCache.
 
 Wait for the cache to start:
 

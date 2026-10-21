@@ -211,6 +211,71 @@ func TestEnvtestClusterCacheOriginValidation(t *testing.T) {
 		})
 	}
 
+	replace := func(t *testing.T, initial map[string]any, mutate func(obj *unstructured.Unstructured)) error {
+		t.Helper()
+
+		require.NoError(t, create(initial))
+
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(GroupVersion.WithKind("ClusterCache"))
+		require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: fmt.Sprintf("cache-%d", n)}, obj))
+		mutate(obj)
+
+		return c.Update(t.Context(), obj)
+	}
+
+	presence := map[string]struct {
+		initial map[string]any
+		mutate  func(*unstructured.Unstructured)
+	}{
+		"removal of origin": {map[string]any{"origin": validOrigin()}, func(o *unstructured.Unstructured) {
+			unstructured.RemoveNestedField(o.Object, "spec", "origin")
+		}},
+		"removal of spec": {map[string]any{"origin": validOrigin()}, func(o *unstructured.Unstructured) {
+			unstructured.RemoveNestedField(o.Object, "spec")
+		}},
+		"addition of origin": {map[string]any{}, func(o *unstructured.Unstructured) {
+			require.NoError(t, unstructured.SetNestedMap(o.Object, validOrigin(), "spec", "origin"))
+		}},
+		"addition of spec with origin": {nil, func(o *unstructured.Unstructured) {
+			require.NoError(t, unstructured.SetNestedMap(o.Object, map[string]any{"origin": validOrigin()}, "spec"))
+		}},
+	}
+	for name, tc := range presence {
+		t.Run("rejects "+name, func(t *testing.T) {
+			err := replace(t, tc.initial, tc.mutate)
+			require.True(t, apierrors.IsInvalid(err), "%v", err)
+			require.ErrorContains(t, err, "spec.origin cannot be added or removed")
+		})
+	}
+
+	t.Run("rejects source swap through origin removal", func(t *testing.T) {
+		for _, path := range [][]string{{"spec", "origin"}, {"spec"}} {
+			require.Error(t, replace(t, map[string]any{"origin": validOrigin()}, func(o *unstructured.Unstructured) {
+				unstructured.RemoveNestedField(o.Object, path...)
+			}))
+
+			// The removal never landed, so a re-add with another account is an
+			// ordinary in-place change and hits the accountURL rule.
+			obj := &unstructured.Unstructured{}
+			obj.SetGroupVersionKind(GroupVersion.WithKind("ClusterCache"))
+			require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: fmt.Sprintf("cache-%d", n)}, obj))
+			_, found, err := unstructured.NestedMap(obj.Object, "spec", "origin")
+			require.NoError(t, err)
+			require.True(t, found)
+			require.NoError(t, unstructured.SetNestedField(obj.Object, "https://other.blob.core.windows.net", "spec", "origin", "azure", "accountURL"))
+			err = c.Update(t.Context(), obj)
+			require.True(t, apierrors.IsInvalid(err), "%v", err)
+			require.ErrorContains(t, err, "accountURL is immutable")
+		}
+	})
+
+	t.Run("allows spec without origin to stay without origin", func(t *testing.T) {
+		require.NoError(t, replace(t, map[string]any{}, func(o *unstructured.Unstructured) {
+			unstructured.RemoveNestedField(o.Object, "spec")
+		}))
+	})
+
 	mutable := map[string]func(map[string]any){
 		"metadataTTL":           func(o map[string]any) { o["metadataTTL"] = "5s" },
 		"requestTimeout":        func(o map[string]any) { o["requestTimeout"] = "2m0s" },

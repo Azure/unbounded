@@ -11,10 +11,15 @@ import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 // Each DNS label is limited to 63 characters to match the wire contract;
 // Kubernetes metadata validation enforces DNS subdomain spelling.
 // The bounded regex checks label lengths without a costly CEL split/all loop.
+// Whether spec.origin is set is fixed at creation. Cache entries are keyed by
+// the ClusterCache UID, not by their source, so removing and re-adding origin,
+// or switching between a managed origin and a self-deployed one, would serve
+// entries fetched from a different source.
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster,shortName=ccache
 // +kubebuilder:validation:XValidation:rule="size(self.metadata.name) <= 82",message="name must fit the canonical Unix socket path"
 // +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[^.]{1,63}([.][^.]{1,63})*$')",message="each name label must be at most 63 characters"
+// +kubebuilder:validation:XValidation:rule="(has(self.spec) && has(self.spec.origin)) == (has(oldSelf.spec) && has(oldSelf.spec.origin))",message="spec.origin cannot be added or removed; create a new ClusterCache to change the origin"
 type ClusterCache struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -27,7 +32,8 @@ type ClusterCache struct {
 // ClusterCacheSpec configures optional cache features.
 type ClusterCacheSpec struct {
 	// Origin deploys a managed racer-object origin for this cache. The operator runs
-	// one origin pod per dataplane node and removes it when origin is unset.
+	// one origin pod per dataplane node. Origin can be set only at creation and
+	// cannot be removed later; leave it unset to deploy your own origin.
 	// +optional
 	Origin *ObjectOrigin `json:"origin,omitempty"`
 }
