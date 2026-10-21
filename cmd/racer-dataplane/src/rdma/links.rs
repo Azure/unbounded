@@ -10,6 +10,7 @@ use super::link_setup;
 use super::*;
 use rdma_verbs::Arrival;
 use rdma_verbs::Client;
+use rdma_verbs::DirectBytes;
 use rdma_verbs::Epoch;
 use rdma_verbs::LinkKey;
 use rdma_verbs::LinkState;
@@ -825,8 +826,11 @@ impl Links {
 /// Lends a ciphertext page to the owner as write source bytes.
 struct PageSource(CiphertextPage);
 
-impl AsRef<[u8]> for PageSource {
-    fn as_ref(&self) -> &[u8] {
+// SAFETY: a `CiphertextPage` is immutable: its bytes live in owned storage
+// that never moves or changes while the page is alive, so every call returns
+// the same slice.
+unsafe impl DirectBytes for PageSource {
+    fn bytes(&self) -> &[u8] {
         self.0.bytes()
     }
 }

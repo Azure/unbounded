@@ -1065,6 +1065,44 @@ fn zero_copy_write_reads_in_place_and_holds_the_source_until_completion() {
 }
 
 #[test]
+/// Any `DirectBytes` source goes out in place, and the receiver gets exactly
+/// the slice the source lends.
+fn zero_copy_writes_accept_boxed_and_static_sources() {
+    static BYTES: [u8; 48] = [0x5a; 48];
+    let sources: [Arc<dyn DirectBytes>; 2] = [
+        Arc::new(vec![0x2e; 80].into_boxed_slice()),
+        Arc::new(&BYTES[..]),
+    ];
+    let mut p = pair();
+    odp(&mut p.b);
+    for source in sources {
+        let expected = source.bytes().to_vec();
+        let (now, deadline) = (p.now, p.now + 5 * SECOND);
+        let granted = grant(&mut p.a, expected.len() as u32, deadline, now);
+        assert_eq!(pump(&mut p), (None, None));
+        let Granted { tag, arrival } = poll(&granted).unwrap().unwrap();
+        let (written, done) = op();
+        p.b.link.write(
+            &p.b.pool,
+            tag,
+            Source::Bytes(source.clone()),
+            deadline,
+            done,
+            now,
+        );
+        assert_eq!(pump(&mut p), (None, None));
+        assert_eq!(poll(&written), Some(Ok(())));
+        assert_eq!(free(&p.b), 4, "no send buffer");
+        assert_eq!(Arc::strong_count(&source), 1, "released on completion");
+        match poll(&arrival).unwrap().unwrap() {
+            Arrival::Page(page) => assert_eq!(page.bytes(), &expected[..]),
+            Arrival::Released => panic!("expected a page"),
+        }
+    }
+    finish(p);
+}
+
+#[test]
 /// A broken link holds an in-flight zero-copy source until the QP is
 /// destroyed, retrying a failed destroy; a leak never frees it.
 fn zero_copy_source_outlives_the_qp_or_leaks() {

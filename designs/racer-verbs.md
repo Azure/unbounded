@@ -155,7 +155,10 @@ pub enum Arrival {
     Released,
 }
 
-pub enum Source { Bytes(Arc<dyn AsRef<[u8]> + Send + Sync>), Staged(SendBuffer) }
+/// Implementors promise a stable slice: the owner reads the address and
+/// length once and the NIC reads those bytes until the write completes.
+pub unsafe trait DirectBytes: Send + Sync + 'static { fn bytes(&self) -> &[u8]; }
+pub enum Source { Bytes(Arc<dyn DirectBytes>), Staged(SendBuffer) }
 
 /// A page buffer with no valid MW and no posted WR. The only way Rust code
 /// can see registered page memory.

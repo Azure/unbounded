@@ -68,14 +68,67 @@ pub enum Arrival {
     Released,
 }
 
+/// Caller memory that a NIC may read in place for a [`Source::Bytes`] write.
+///
+/// # Safety
+///
+/// While the value is only shared (accessed through `&`), every call to
+/// [`bytes`](DirectBytes::bytes) must return the same initialized slice, the
+/// same pointer and length, and those bytes must stay allocated and unchanged
+/// until the value is dropped or mutably borrowed. The owner reads the slice
+/// once when it accepts a write and lets the NIC read that address range
+/// after the call returns, holding the `Arc` until the write completes or the
+/// queue pair is destroyed.
+///
+/// Arbitrary [`AsRef`] types cannot be written directly, because nothing
+/// stops a safe `AsRef` implementation from returning a different slice on
+/// each call:
+///
+/// ```compile_fail
+/// struct Shifting;
+///
+/// impl AsRef<[u8]> for Shifting {
+///     fn as_ref(&self) -> &[u8] {
+///         b"bytes"
+///     }
+/// }
+///
+/// let _ = rdma_verbs::Source::Bytes(std::sync::Arc::new(Shifting));
+/// ```
+pub unsafe trait DirectBytes: Send + Sync + 'static {
+    /// The bytes to write.
+    fn bytes(&self) -> &[u8];
+}
+
+// SAFETY: a shared `Vec` cannot reallocate or change its contents.
+unsafe impl DirectBytes for Vec<u8> {
+    fn bytes(&self) -> &[u8] {
+        self
+    }
+}
+
+// SAFETY: a shared boxed slice cannot move or change its contents.
+unsafe impl DirectBytes for Box<[u8]> {
+    fn bytes(&self) -> &[u8] {
+        self
+    }
+}
+
+// SAFETY: a `'static` shared slice lives forever and never changes.
+unsafe impl DirectBytes for &'static [u8] {
+    fn bytes(&self) -> &[u8] {
+        self
+    }
+}
+
 /// Bytes to write into a peer's grant.
 pub enum Source {
     /// Caller memory. With an implicit on-demand paging region on the
     /// link's device ([`crate::Client::zero_copy`]) the NIC reads it in place
     /// and the owner holds the `Arc` until the write completes or the QP is
-    /// destroyed; the bytes must not change meanwhile. Otherwise the owner
-    /// copies into a free page buffer on its thread.
-    Bytes(Arc<dyn AsRef<[u8]> + Send + Sync>),
+    /// destroyed. Otherwise the owner copies into a free page buffer on its
+    /// thread.
+    Bytes(Arc<dyn DirectBytes>),
 
     /// Already staged in a page buffer of the link's device.
     Staged(SendBuffer),
@@ -85,7 +138,7 @@ impl Source {
     /// Length in bytes.
     pub fn len(&self) -> usize {
         match self {
-            Self::Bytes(bytes) => (**bytes).as_ref().len(),
+            Self::Bytes(bytes) => (**bytes).bytes().len(),
             Self::Staged(buffer) => buffer.len(),
         }
     }
@@ -304,8 +357,13 @@ enum Payload {
     Buffer(Buffer),
 
     /// Caller memory read through the device's implicit region. Held until
-    /// the write completes or the QP is destroyed.
-    Direct(Arc<dyn AsRef<[u8]> + Send + Sync>),
+    /// the write completes or the QP is destroyed. `addr` is the start of the
+    /// slice captured when the write was accepted; the posted length comes
+    /// from the same slice.
+    Direct {
+        bytes: Arc<dyn DirectBytes>,
+        addr: u64,
+    },
 }
 
 impl Payload {
@@ -313,7 +371,7 @@ impl Payload {
     fn release(self, pool: &Pool) {
         match self {
             Self::Buffer(buffer) => pool.release(buffer),
-            Self::Direct(_) => {}
+            Self::Direct { .. } => {}
         }
     }
 }
@@ -398,7 +456,7 @@ pub(crate) struct Link {
 
     /// Zero-copy sources of failed posted writes, held until the QP is
     /// destroyed: the NIC may still read them.
-    held: Vec<Arc<dyn AsRef<[u8]> + Send + Sync>>,
+    held: Vec<Arc<dyn DirectBytes>>,
 
     created: Instant,
 
@@ -679,7 +737,15 @@ impl Link {
         done: Completer<()>,
     ) {
         let remote = self.remote[&tag];
-        let len = source.len();
+        // Capture the caller's slice once: the NIC reads exactly this range,
+        // so the length and the address must come from the same borrow.
+        let (len, addr) = match &source {
+            Source::Bytes(bytes) => {
+                let slice = (**bytes).bytes();
+                (slice.len(), slice.as_ptr() as u64)
+            }
+            Source::Staged(staged) => (staged.len(), 0),
+        };
 
         if len > remote.length as usize {
             let _ = done.complete(Err(Error::InvalidRange));
@@ -691,7 +757,7 @@ impl Link {
                 self.remote.remove(&tag);
                 self.outbox.push_back(Outgoing::Write {
                     tag,
-                    buffer: Payload::Direct(bytes),
+                    buffer: Payload::Direct { bytes, addr },
                     len: len as u32,
                     remote,
                     deadline,
@@ -704,7 +770,7 @@ impl Link {
                     let _ = done.complete(Err(Error::Overloaded));
                     return;
                 };
-                staged.bytes_mut().copy_from_slice((*bytes).as_ref());
+                staged.bytes_mut().copy_from_slice((*bytes).bytes());
                 staged
             }
             Source::Staged(staged) => staged,
@@ -1206,12 +1272,12 @@ impl Link {
                         remote.rkey,
                         tag,
                     ),
-                    Payload::Direct(bytes) => match pool.implicit() {
+                    Payload::Direct { addr, .. } => match pool.implicit() {
                         // The implicit region's offset is the virtual address.
                         Some(implicit) => self.qp.write_imm(
                             wr(WRITE, tag),
                             implicit,
-                            (**bytes).as_ref().as_ptr() as u64,
+                            *addr,
                             len,
                             remote.addr,
                             remote.rkey,
@@ -1431,7 +1497,7 @@ impl Link {
                 InFlight::Write { buffer, done } => {
                     match buffer {
                         Payload::Buffer(buffer) => quarantine.push(buffer),
-                        Payload::Direct(bytes) => self.held.push(bytes),
+                        Payload::Direct { bytes, .. } => self.held.push(bytes),
                     }
                     let _ = done.complete(Err(Error::Unavailable));
                 }
