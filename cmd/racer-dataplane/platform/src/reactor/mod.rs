@@ -248,6 +248,48 @@ unsafe impl<B: IoBuffer> SendBuffer for B {
     }
 }
 
+/// Completion-owned immutable storage for the body of a vectored file write.
+///
+/// This is the file-write counterpart of [`SendBuffer`] and carries the same
+/// contract. It is blanket-implemented for every [`SendBuffer`] (and therefore
+/// every [`IoBuffer`]), so shared, reference-counted bodies can be written
+/// without copying them into exclusive storage.
+///
+/// # Safety
+/// The slice returned by [`write_bytes`](Self::write_bytes) must keep the same
+/// address and length, and its bytes must stay initialized and immutable, for
+/// as long as the owner is alive, including across moves of the owner. No
+/// shared alias may mutate, resize, or free the bytes while the owner lives.
+pub unsafe trait SharedWriteBuffer: 'static {
+    /// Application error returned when access to this allocation is rejected.
+    type Error;
+
+    /// Borrow initialized immutable bytes for one write operation.
+    fn write_bytes(&self) -> Result<&[u8], Self::Error>;
+}
+
+// SAFETY: the SendBuffer contract is the SharedWriteBuffer contract.
+unsafe impl<B: SendBuffer> SharedWriteBuffer for B {
+    type Error = B::Error;
+
+    fn write_bytes(&self) -> Result<&[u8], Self::Error> {
+        self.send_bytes()
+    }
+}
+
+/// Owners returned by [`Reactor::write_vectored_at`] after every applicable
+/// completion fence.
+pub struct VectoredCompletion<H: 'static, B: 'static, L: 'static = ()> {
+    /// Header allocation, written first.
+    pub header: H,
+    /// Body allocation, written immediately after the header.
+    pub body: B,
+    /// Bytes written across both segments, possibly less than their sum.
+    pub bytes: usize,
+    /// Caller-owned admission or reuse guard retained through completion.
+    pub lease: L,
+}
+
 /// A Racer buffer viewed as a library buffer through a pointer derived once.
 struct Region<T> {
     owner: T,
@@ -952,6 +994,130 @@ impl<S: Scope, B: Budget> Reactor<S, B> {
             None,
             |buffer| Self::shared(buffer),
         ))
+    }
+
+    /// Write `header` then `body` contiguously at an explicit offset with one
+    /// vectored write, without copying either into a staging buffer.
+    ///
+    /// Both owners and the lease are retained until every completion fence.
+    /// Short progress is returned as is and may end inside either segment;
+    /// zero-progress `EINTR`/`EAGAIN` is retried like [`write_at`](Self::write_at).
+    /// A segment or total length above `u32::MAX`, or an offset above
+    /// `i64::MAX`, fails with [`Error::InvalidInput`].
+    pub fn write_vectored_at<'a, H: IoBuffer, T: SharedWriteBuffer, L: 'static>(
+        &'a self,
+        file: Rc<Descriptor>,
+        offset: u64,
+        header: H,
+        body: T,
+        lease: L,
+        scope: &'a S,
+    ) -> Operation<'a, VectoredCompletion<H, T, L>, S::Error>
+    where
+        S::Error: From<H::Error> + From<T::Error>,
+    {
+        Box::pin(self.vectored(file, offset, header, body, lease, scope, false))
+    }
+
+    /// [`write_vectored_at`](Self::write_vectored_at) executed in a kernel
+    /// worker (`IOSQE_ASYNC`), for cold buffered file I/O.
+    pub fn write_vectored_at_offloaded<'a, H: IoBuffer, T: SharedWriteBuffer, L: 'static>(
+        &'a self,
+        file: Rc<Descriptor>,
+        offset: u64,
+        header: H,
+        body: T,
+        lease: L,
+        scope: &'a S,
+    ) -> Operation<'a, VectoredCompletion<H, T, L>, S::Error>
+    where
+        S::Error: From<H::Error> + From<T::Error>,
+    {
+        Box::pin(self.vectored(file, offset, header, body, lease, scope, true))
+    }
+
+    /// One vectored positioned write with the data retry policy.
+    #[allow(clippy::too_many_arguments)]
+    async fn vectored<H: IoBuffer, T: SharedWriteBuffer, L: 'static>(
+        &self,
+        fd: Rc<Descriptor>,
+        offset: u64,
+        mut header: H,
+        mut body: T,
+        mut lease: L,
+        scope: &S,
+        offload: bool,
+    ) -> Result<VectoredCompletion<H, T, L>, S::Error>
+    where
+        S::Error: From<H::Error> + From<T::Error>,
+    {
+        if offset > i64::MAX as u64 {
+            return Err(Error::InvalidInput.into());
+        }
+        let op_scope = OpScope::wrap(scope);
+        for attempt in 0..=DATA_RETRIES {
+            scope.check()?;
+            let (header_ptr, header_len) = Self::shared(&mut header)?;
+            let body_bytes = body.write_bytes()?;
+            let (body_ptr, body_len) = (body_bytes.as_ptr().cast_mut(), body_bytes.len());
+            let total = header_len
+                .checked_add(body_len)
+                .filter(|total| u32::try_from(*total).is_ok());
+            if total.is_none() {
+                return Err(Error::InvalidInput.into());
+            }
+            let segments = (
+                Shared(Region::new(header, header_ptr, header_len)?),
+                Shared(Region::new(body, body_ptr, body_len)?),
+            );
+            let bytes = Self::bookkeeping::<L, (Shared<H>, Shared<T>)>()
+                + 2 * std::mem::size_of::<libc::iovec>();
+            let (core, held) = self.admit(scope, None, SubmissionKind::OtherIo, bytes, lease)?;
+            let op = core.writev_at(&fd, offset, segments, op_scope).lease(held);
+            let (BufResult { result, buf }, held) = if offload {
+                op.offload().await
+            } else {
+                op.await
+            };
+            header = buf.0.0.owner;
+            body = buf.1.0.owner;
+            lease = held.into_user();
+            let failure = match result {
+                Ok(bytes) => {
+                    return Ok(VectoredCompletion {
+                        header,
+                        body,
+                        bytes,
+                        lease,
+                    });
+                }
+                Err(failure) => failure,
+            };
+            let errno = failure.errno();
+            if attempt == DATA_RETRIES || !matches!(errno, Some(libc::EINTR | libc::EAGAIN)) {
+                return Err(failure.into_scope());
+            }
+            scope.check()?;
+            if errno == Some(libc::EAGAIN) {
+                // Keep the owners and lease in the readiness operation so that
+                // abandonment retains them until its fence too.
+                let bytes = Self::bookkeeping::<((H, T), L), ()>();
+                let (core, held) = self.admit(
+                    scope,
+                    None,
+                    SubmissionKind::Readiness,
+                    bytes,
+                    ((header, body), lease),
+                )?;
+                let (result, held) = core
+                    .readiness(&fd, Data::Write(offset).interest(), op_scope)
+                    .lease(held)
+                    .await;
+                ((header, body), lease) = held.into_user();
+                result.map_err(Failure::into_scope)?;
+            }
+        }
+        unreachable!("bounded retries return on the final attempt")
     }
 
     /// Receive into owned storage while retaining the caller's lease through fencing.

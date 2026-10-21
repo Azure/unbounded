@@ -299,6 +299,70 @@ fn cancellation_between_transient_completion_and_retry_prevents_resubmission() {
     assert_eq!(drops.get(), 2);
 }
 
+/// Vectored writes gather both segments, retry zero progress, report short
+/// progress once, and keep both owners and the lease until completion.
+#[test]
+fn vectored_write_gathers_retries_and_reports_short_progress() {
+    for errno in [libc::EINTR, libc::EAGAIN] {
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let reactor = SimReactor::new(1, ());
+        let request = scope();
+        let file = Rc::new(
+            sim.open(
+                None,
+                std::path::Path::new("/vectored"),
+                libc::O_CREAT | libc::O_RDWR,
+            )
+            .unwrap(),
+        );
+        let drops = Rc::new(Cell::new(0));
+        let written = drive(
+            &reactor,
+            reactor.write_vectored_at(
+                file.clone(),
+                1,
+                Counted(b"HD".to_vec(), drops.clone()),
+                Counted(b"body".to_vec(), drops.clone()),
+                Lease(drops.clone()),
+                &request,
+            ),
+        )
+        .unwrap();
+        assert_eq!(written.bytes, 6);
+        assert_eq!(
+            (&written.header.0[..], &written.body.0[..]),
+            (&b"HD"[..], &b"body"[..])
+        );
+        drop(written);
+        assert_eq!(drops.get(), 3);
+
+        sim.inject("writev", Fault::Errno(errno)).unwrap();
+        sim.inject("writev", Fault::Short(3)).unwrap();
+        let written = drive(
+            &reactor,
+            reactor.write_vectored_at(
+                file.clone(),
+                0,
+                Counted(b"xy".to_vec(), Rc::default()),
+                Counted(b"zw".to_vec(), Rc::default()),
+                (),
+                &request,
+            ),
+        )
+        .unwrap();
+        assert_eq!(written.bytes, 3, "short progress crosses into the body");
+        assert_eq!(submissions(&sim, OpKind::Writev), 3);
+        let read = drive(
+            &reactor,
+            reactor.read_at(file, 0, Counted(vec![0; 7], Rc::default()), (), &request),
+        )
+        .unwrap();
+        assert_eq!(&read.buffer.0, b"xyzbody");
+        assert_eq!(reactor.in_flight(), 0);
+    }
+}
+
 /// Preserve receive and positioned I/O contents and offsets across retries.
 #[test]
 fn recv_and_positioned_io_retry_without_changing_buffer_or_offset() {

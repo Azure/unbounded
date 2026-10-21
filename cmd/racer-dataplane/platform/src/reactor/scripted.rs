@@ -64,6 +64,12 @@ impl Scripted {
         let region = match *op {
             Op::Read { buf, len, .. } | Op::Recv { buf, len, .. } => Some((buf, len)),
             Op::Write { buf, len, .. } | Op::Send { buf, len, .. } => Some((buf.cast_mut(), len)),
+            // Vectored writes expose their first segment to the responder.
+            Op::Writev { iovecs, count, .. } if count > 0 => {
+                // SAFETY: the reactor keeps `count` iovecs valid until popped.
+                let first = unsafe { *iovecs };
+                Some((first.iov_base.cast(), first.iov_len as u32))
+            }
             _ => None,
         };
         state.queued.push((user_data, op.kind(), region));

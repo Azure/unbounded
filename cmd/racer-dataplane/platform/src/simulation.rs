@@ -115,6 +115,7 @@ pub fn fault_target(name: &str) -> io::Result<FaultTarget> {
         "*" => Any,
         "read" => Either(OpKind::Read, SyncOp::Read),
         "write" => Either(OpKind::Write, SyncOp::Write),
+        "writev" => Op(OpKind::Writev),
         "recv" => Either(OpKind::Recv, SyncOp::Recv),
         "send" => Either(OpKind::Send, SyncOp::Send),
         "accept" => Either(OpKind::Accept, SyncOp::Accept),

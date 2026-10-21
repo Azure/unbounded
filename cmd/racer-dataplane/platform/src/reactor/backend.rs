@@ -180,6 +180,17 @@ fn translate<'a, F>(
             buf,
             len,
         },
+        Op::Writev {
+            fd,
+            offset,
+            iovecs,
+            count,
+        } => Op::Writev {
+            fd: host(fd)?,
+            offset,
+            iovecs,
+            count,
+        },
         Op::Recv {
             fd,
             buf,

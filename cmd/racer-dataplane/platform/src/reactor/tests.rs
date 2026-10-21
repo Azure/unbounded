@@ -526,6 +526,113 @@ fn offloaded_file_io_sets_the_hint_and_sockets_do_not() {
     );
 }
 
+/// Immutable body storage shared with other owners.
+struct SharedBody(Rc<Vec<u8>>);
+
+// SAFETY: no owner mutates or resizes the shared Vec, so its bytes are stable.
+unsafe impl SendBuffer for SharedBody {
+    type Error = Error;
+
+    fn send_bytes(&self) -> Result<&[u8]> {
+        Ok(&self.0)
+    }
+}
+
+#[test]
+fn vectored_write_retries_offloads_and_returns_both_owners() {
+    let (reactor, state) = scripted(4, sequence(vec![-libc::EINTR, -libc::EAGAIN, 5, 2]));
+    let body = Rc::new(b"body".to_vec());
+    let lease = Rc::new(());
+    let completion = drive(
+        &reactor,
+        reactor.write_vectored_at(
+            null_fd(),
+            8,
+            Bytes(b"HDR".to_vec()),
+            SharedBody(body.clone()),
+            lease.clone(),
+            &scope(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(completion.bytes, 5);
+    assert_eq!(completion.header.0, b"HDR");
+    assert!(Rc::ptr_eq(&completion.body.0, &body));
+    assert!(Rc::ptr_eq(&completion.lease, &lease));
+    let offloaded = drive(
+        &reactor,
+        reactor.write_vectored_at_offloaded(
+            null_fd(),
+            0,
+            Bytes(vec![1]),
+            Bytes(vec![2]),
+            (),
+            &scope(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(offloaded.bytes, 2);
+    let offload = PushHints::new().with_offload(true);
+    assert_eq!(
+        state.borrow().pushes,
+        [
+            (OpKind::Writev, PushHints::new()),
+            (OpKind::Writev, PushHints::new()),
+            (OpKind::PollAdd, PushHints::new()),
+            (OpKind::Writev, PushHints::new()),
+            (OpKind::Writev, offload),
+        ]
+    );
+    assert_eq!(reactor.in_flight(), 0);
+}
+
+#[test]
+fn vectored_write_rejects_invalid_input_and_reports_errors() {
+    struct RejectingBody;
+    // SAFETY: never yields a region.
+    unsafe impl SendBuffer for RejectingBody {
+        type Error = Error;
+        fn send_bytes(&self) -> Result<&[u8]> {
+            Err(Error::InvalidInput)
+        }
+    }
+    let (reactor, state) = scripted(4, sequence(vec![-libc::EIO]));
+    for offset in [u64::MAX, i64::MAX as u64 + 1] {
+        assert!(matches!(
+            poll(&mut reactor.write_vectored_at(
+                null_fd(),
+                offset,
+                Bytes(vec![0]),
+                Bytes(vec![0]),
+                (),
+                &scope()
+            )),
+            Poll::Ready(Err(Error::InvalidInput))
+        ));
+    }
+    assert!(matches!(
+        poll(&mut reactor.write_vectored_at(
+            null_fd(),
+            0,
+            Bytes(vec![0]),
+            RejectingBody,
+            (),
+            &scope()
+        )),
+        Poll::Ready(Err(Error::InvalidInput))
+    ));
+    assert!(state.borrow().pushes.is_empty());
+    assert_eq!(
+        drive(
+            &reactor,
+            reactor.write_vectored_at(null_fd(), 0, Bytes(vec![0]), Bytes(vec![1]), (), &scope())
+        )
+        .err(),
+        Some(Error::Os(libc::EIO))
+    );
+    assert_eq!(reactor.in_flight(), 0);
+}
+
 #[test]
 fn fence_matching_cancels_only_matching_scopes() {
     let (reactor, state) = scripted(4, |_, _| None);
@@ -633,6 +740,56 @@ mod kernel {
         )
         .unwrap();
         assert_eq!(&read.buffer.0, b"hello");
+        assert_eq!(reactor.in_flight(), 0);
+    }
+
+    #[test]
+    fn vectored_file_write() {
+        let Some(reactor) = kernel_reactor(8) else {
+            return;
+        };
+        let file = tempfile();
+        let body = Rc::new(b"world".to_vec());
+        let written = drive(
+            &reactor,
+            reactor.write_vectored_at(
+                file.clone(),
+                2,
+                Bytes(b"hello ".to_vec()),
+                SharedBody(body.clone()),
+                7u8,
+                &scope(),
+            ),
+        )
+        .unwrap();
+        assert_eq!((written.bytes, written.lease), (11, 7));
+        assert!(Rc::ptr_eq(&written.body.0, &body));
+        let written = drive(
+            &reactor,
+            reactor.write_vectored_at_offloaded(
+                file.clone(),
+                0,
+                Bytes(b"<".to_vec()),
+                Bytes(b">".to_vec()),
+                (),
+                &scope(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(written.bytes, 2);
+        let read = drive(
+            &reactor,
+            reactor.read_at(file, 0, Bytes(vec![9; 16]), (), &scope()),
+        )
+        .unwrap();
+        assert_eq!(read.bytes, 13);
+        assert_eq!(&read.buffer.0[..13], b"<>hello world");
+        let error = drive(
+            &reactor,
+            reactor.write_vectored_at(null_fd(), 0, Bytes(vec![1]), Bytes(vec![2]), (), &scope()),
+        )
+        .err();
+        assert_eq!(error, Some(Error::Os(libc::EBADF)));
         assert_eq!(reactor.in_flight(), 0);
     }
 
