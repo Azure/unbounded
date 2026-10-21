@@ -65,10 +65,9 @@ var (
 	sharedRunning bool
 )
 
-// TestMain deletes the shared cluster after every test has run.
-func TestMain(m *testing.M) {
-	code := m.Run()
-
+// teardownShared deletes the shared cluster unless setup never ran or
+// RACER_E2E_KEEP is set. TestMain calls it after every test has run.
+func teardownShared() {
 	sharedMu.Lock()
 	h, tried := shared, sharedTried
 	sharedMu.Unlock()
@@ -76,8 +75,6 @@ func TestMain(m *testing.M) {
 	if tried && h != nil && !h.keep {
 		h.forTest(nil).teardown()
 	}
-
-	os.Exit(code)
 }
 
 // cluster returns a harness bound to t for the shared cluster, creating the
