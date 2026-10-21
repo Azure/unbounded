@@ -17,6 +17,9 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, SystemTime};
 
+/// Largest per-read spill horizon; spilled pages compete with warm holds.
+pub const MAX_RANGE_SPILL_PAGES: usize = 1024;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     pub max_ttl: Duration,
@@ -24,6 +27,9 @@ pub struct Config {
     pub max_jobs: usize,
     pub window: usize,
     pub retained_percent: usize,
+    /// Pages a read may fetch ahead of its in-memory window and park on local
+    /// disk under its own short hold. Zero disables read spill.
+    pub range_spill_pages: usize,
 }
 
 impl Default for Config {
@@ -34,6 +40,7 @@ impl Default for Config {
             max_jobs: 16,
             window: 2,
             retained_percent: 50,
+            range_spill_pages: 0,
         }
     }
 }
@@ -47,6 +54,7 @@ impl Config {
             || !(1..=1024).contains(&self.max_jobs)
             || !(1..=64).contains(&self.window)
             || !(1..=100).contains(&self.retained_percent)
+            || self.range_spill_pages > MAX_RANGE_SPILL_PAGES
         {
             return Err(Error::InvalidConfiguration);
         }
@@ -2788,6 +2796,10 @@ mod tests {
             },
             Config {
                 retained_percent: 101,
+                ..Default::default()
+            },
+            Config {
+                range_spill_pages: MAX_RANGE_SPILL_PAGES + 1,
                 ..Default::default()
             },
             Config {

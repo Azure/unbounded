@@ -192,6 +192,7 @@ impl Config {
                 max_jobs: to_usize(raw.warm_max_jobs.unwrap_or(16))?,
                 window: to_usize(raw.warm_window_pages.unwrap_or(2))?,
                 retained_percent: to_usize(raw.retained_segment_percent.unwrap_or(50))?,
+                range_spill_pages: to_usize(raw.range_spill_pages.unwrap_or(0))?,
             },
             send_crc_pair: raw
                 .send_crc_pair
@@ -630,6 +631,7 @@ const ENV_NAMES: &[&str] = &[
     "CLIENT_CONNECTIONS",
     "PIPES",
     "RANGE_WINDOW_PAGES",
+    "RANGE_SPILL_PAGES",
     "HEADER_BYTES",
     "PLACEMENT_CACHE_BYTES",
     "CACHED_PATHS",
@@ -742,6 +744,8 @@ struct RawConfig {
     pipes: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
     range_window_pages: Option<u64>,
+    #[serde(default, deserialize_with = "decimal")]
+    range_spill_pages: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
     header_bytes: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
@@ -1351,22 +1355,32 @@ mod tests {
         assert_eq!(warm.max_ttl, Duration::from_secs(3600));
         assert_eq!(warm.fill_timeout, Duration::from_secs(600));
         assert_eq!(
-            (warm.max_jobs, warm.window, warm.retained_percent),
-            (16, 2, 50)
+            (
+                warm.max_jobs,
+                warm.window,
+                warm.retained_percent,
+                warm.range_spill_pages
+            ),
+            (16, 2, 50, 0)
         );
         let warm = parse(&[
             ("RACER_WARM_MAX_JOBS", "8"),
             ("RACER_WARM_WINDOW_PAGES", "4"),
+            ("RACER_RANGE_SPILL_PAGES", "1024"),
         ])
         .unwrap()
         .warm;
-        assert_eq!((warm.max_jobs, warm.window), (8, 4));
+        assert_eq!(
+            (warm.max_jobs, warm.window, warm.range_spill_pages),
+            (8, 4, 1024)
+        );
         for (name, value) in [
             ("RACER_WARM_MAX_TTL_SECS", "0"),
             ("RACER_WARM_FILL_TIMEOUT_SECS", "0"),
             ("RACER_WARM_MAX_JOBS", "0"),
             ("RACER_WARM_WINDOW_PAGES", "65"),
             ("RACER_RETAINED_SEGMENT_PERCENT", "101"),
+            ("RACER_RANGE_SPILL_PAGES", "1025"),
         ] {
             assert!(parse(&[(name, value)]).is_err());
         }

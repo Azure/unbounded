@@ -16,6 +16,7 @@ use crate::model::ObjectId;
 use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
 use crate::model::PageId;
+use crate::model::PageNumber;
 use crate::model::VersionMetadata;
 use crate::model::WorkerId;
 use crate::peer::forwarding::VerifiedRequest;
@@ -541,6 +542,123 @@ impl WorkerDirectory {
             }
         }
         Ok(())
+    }
+
+    /// Add one holder to `page` on its owning worker only, until `until`.
+    /// Pair every success with one `release_read_pages` of the same page.
+    pub(super) async fn hold_read_page(
+        &self,
+        page: &PageId,
+        until: std::time::SystemTime,
+        scope: &RequestScope,
+    ) -> Result<()> {
+        let owner = self.page_owner(page)?;
+        let pages = std::iter::once(page.number).collect::<HoldPages>();
+        let receipt = self.submit(
+            owner,
+            Work::Hold(page.version.clone(), pages, until),
+            scope,
+            None,
+        )?;
+        match std::future::poll_fn(|cx| receipt.poll_completion(cx))
+            .await?
+            .value?
+        {
+            Value::Held(..) => Ok(()),
+            _ => Err(Error::StaleFlight),
+        }
+    }
+
+    /// Drop one holder from each page without waiting. Releases run on their
+    /// owning workers under a fresh short scope, so a canceled read still
+    /// returns its holds; hold expiry is the backstop if this cannot submit.
+    pub(super) fn release_read_pages(
+        &self,
+        version: &ObjectVersion,
+        pages: impl IntoIterator<Item = PageNumber>,
+        request: crate::model::RequestId,
+    ) {
+        let mut owners: std::collections::BTreeMap<WorkerId, HoldPages> =
+            std::collections::BTreeMap::new();
+        for number in pages {
+            let page = PageId {
+                version: version.clone(),
+                number,
+            };
+            if let Ok(owner) = self.page_owner(&page) {
+                owners.entry(owner).or_default().insert(number);
+            }
+        }
+        for (owner, held) in owners {
+            if self.is_local(owner) {
+                if let Ok(local) = self.local() {
+                    local
+                        .fill
+                        .dependencies
+                        .writer
+                        .index()
+                        .release_hold_pages(version, &held);
+                }
+                continue;
+            }
+            let Ok(permit) = uring_runtime::drivers::reserve() else {
+                continue;
+            };
+            let Ok(scope) = RequestScope::new(
+                request,
+                uring_runtime::environment::now() + std::time::Duration::from_secs(30),
+            ) else {
+                continue;
+            };
+            if let Ok(receipt) =
+                self.submit(owner, Work::Release(version.clone(), held), &scope, None)
+            {
+                permit.submit_detached(Box::pin(async move {
+                    let _ = receipt.await;
+                    Ok::<(), Error>(())
+                }));
+            }
+        }
+    }
+
+    /// Start a warm-path fill of a page a read holds: the owner fills it and
+    /// persists it under the hold. The context is sealed before returning.
+    pub(super) fn start_warm_page(
+        &self,
+        page: PageId,
+        metadata: crate::model::VersionMetadata,
+        membership: Arc<crate::topology::Membership>,
+        context: &OriginContext,
+        scope: &RequestScope,
+    ) -> Result<Operation<'static, ()>> {
+        let owner = self.page_owner(&page)?;
+        let work = Work::Warm(page, metadata, membership, self.seal(context, scope)?);
+        let receipt = self.submit(owner, work, scope, Some(super::default_budget(scope)))?;
+        Ok(Box::pin(async move {
+            match std::future::poll_fn(|cx| receipt.poll_completion(cx))
+                .await?
+                .value?
+            {
+                Value::Published => Ok(()),
+                _ => Err(Error::StaleFlight),
+            }
+        }))
+    }
+
+    /// Read a page this node holds: memory first, then the held disk copy.
+    pub(super) async fn held_page(&self, page: PageId, scope: &RequestScope) -> Result<PageResult> {
+        let owner = self.page_owner(&page)?;
+        if self.is_local(owner) {
+            return self.local()?.fill.warm_local(&page, scope).await;
+        }
+        match self
+            .submit(owner, Work::WarmLocal(page), scope, None)?
+            .await?
+            .value?
+        {
+            Value::Page(page) => Ok(page),
+            _ => Err(Error::StaleFlight),
+        }
     }
 
     pub(super) async fn warm_page(

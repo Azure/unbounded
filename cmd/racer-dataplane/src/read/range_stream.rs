@@ -46,6 +46,14 @@ const DIRECT_AHEAD: usize = 1;
 /// most one selection per version from this node (see `Scheduler::contract`).
 const SELECTIONS: usize = 1;
 
+/// Spill fills (hold plus warm fill) a read keeps in flight.
+const SPILL_FILLS: usize = 2;
+
+/// Lifetime of a read's spill hold. Holds are renewed by nothing; a page that
+/// expires before delivery is fetched again. Short, because a version's hold
+/// lasts until the latest deadline of all its holders.
+const SPILL_HOLD: Duration = Duration::from_secs(60);
+
 /// One open read window registered for selection fan-out.
 struct Reader {
     version: ObjectVersion,
@@ -399,6 +407,27 @@ enum Slot {
     Ready(Result<PageResult>),
 }
 
+/// A page fetched ahead of the in-memory window onto local disk.
+enum Spilling {
+    /// Reserving this read's hold on the page's owning worker.
+    Holding(Operation<'static, ()>),
+    /// Filling the held page through the warm path, which persists it.
+    Warming(Operation<'static, ()>),
+    /// Published under this read's hold.
+    Spilled,
+}
+
+/// Read spill state: pages in `[next + window, next + window + limit)` may be
+/// parked on disk under per-page holds until the window reaches them.
+struct Spill {
+    limit: usize,
+    /// Set once a hold is refused; the read then keeps only its memory window.
+    refused: bool,
+    pages: BTreeMap<u64, Spilling>,
+    /// Pages this read holds; each owes exactly one release.
+    held: BTreeSet<u64>,
+}
+
 /// One outstanding provider selection and the window pages it covers.
 struct Pending {
     operation: Fetch,
@@ -456,6 +485,8 @@ pub struct RangeStream {
     slots: VecDeque<Slot>,
 
     selections: Vec<Pending>,
+
+    spill: Option<Spill>,
 
     terminated: bool,
 }
@@ -520,6 +551,7 @@ impl RangeStreams {
             budget,
             slots: VecDeque::new(),
             selections: Vec::new(),
+            spill: None,
             terminated: false,
         })
     }
@@ -548,6 +580,13 @@ impl RangeStream {
             .open(self.metadata.version.clone())?;
         self.credits = Some(credits);
         self.lease = Some(lease);
+        let limit = self.directory.warm.config().range_spill_pages;
+        self.spill = (limit != 0).then(|| Spill {
+            limit,
+            refused: false,
+            pages: BTreeMap::new(),
+            held: BTreeSet::new(),
+        });
         Ok(())
     }
 
@@ -586,6 +625,8 @@ impl RangeStream {
             changed |= self.take_offered(&scope);
             changed |= self.poll_selections(cx)?;
             changed |= self.admit(&scope)?;
+            changed |= self.poll_spill(cx);
+            changed |= self.admit_spill(&scope);
             if !changed {
                 break;
             }
@@ -610,9 +651,32 @@ impl RangeStream {
             };
             let directory = self.directory.clone();
             let scope = scope.clone();
-            self.slots.push_back(Slot::Probing(Box::pin(async move {
-                directory.cached_page(page, &scope).await
-            })));
+            let spilled = self
+                .spill
+                .as_mut()
+                .and_then(|spill| spill.pages.remove(&number.0));
+            self.slots.push_back(Slot::Probing(match spilled {
+                // Holding pages stay with the spill state until the hold
+                // completes, so the hold is released exactly once.
+                None => Box::pin(async move { directory.cached_page(page, &scope).await }),
+                Some(Spilling::Holding(holding)) => {
+                    self.spill
+                        .as_mut()
+                        .unwrap()
+                        .pages
+                        .insert(number.0, Spilling::Holding(holding));
+                    Box::pin(async move { directory.cached_page(page, &scope).await })
+                }
+                // A spilled page is read back from memory or its held disk copy.
+                // If that fails the page is fetched normally.
+                Some(Spilling::Spilled) => {
+                    Box::pin(async move { directory.held_page(page, &scope).await.map(Some) })
+                }
+                Some(Spilling::Warming(warming)) => Box::pin(async move {
+                    warming.await?;
+                    directory.held_page(page, &scope).await.map(Some)
+                }),
+            }));
         }
     }
 
@@ -949,6 +1013,167 @@ impl RangeStream {
         lease.sync(wants, busy, cx.waker());
     }
 
+    /// Return every spill hold this read still owns.
+    fn release_spill(&mut self) {
+        let Some(spill) = self.spill.take() else {
+            return;
+        };
+        // A pending hold may still be applied; its completion fence says so.
+        for (number, state) in spill.pages {
+            let Spilling::Holding(holding) = state else {
+                continue;
+            };
+            let Ok(permit) = uring_runtime::drivers::reserve() else {
+                continue;
+            };
+            let directory = self.directory.clone();
+            let version = self.metadata.version.clone();
+            let request = self.scope.request;
+            permit.submit_detached(Box::pin(async move {
+                if holding.await.is_ok() {
+                    directory.release_read_pages(&version, [PageNumber(number)], request);
+                }
+                Ok::<(), Error>(())
+            }));
+        }
+        if !spill.held.is_empty() {
+            self.directory.release_read_pages(
+                &self.metadata.version,
+                spill.held.into_iter().map(PageNumber),
+                self.scope.request,
+            );
+        }
+    }
+
+    fn poll_spill(&mut self, cx: &mut Context<'_>) -> bool {
+        let horizon = self.page_at(self.slots.len());
+        let Some(spill) = self.spill.as_mut() else {
+            return false;
+        };
+        let mut changed = false;
+        let mut release = Vec::new();
+        let mut warm = Vec::new();
+        spill.pages.retain(|number, state| {
+            let result = match state {
+                Spilling::Holding(op) | Spilling::Warming(op) => match op.as_mut().poll(cx) {
+                    Poll::Pending => return true,
+                    Poll::Ready(result) => result,
+                },
+                Spilling::Spilled => return true,
+            };
+            changed = true;
+            match (&state, result) {
+                (Spilling::Holding(_), Ok(())) => {
+                    spill.held.insert(*number);
+                    // The window reached the page while its hold was pending.
+                    if *number < horizon {
+                        spill.held.remove(number);
+                        release.push(PageNumber(*number));
+                        return false;
+                    }
+                    warm.push(*number);
+                    true
+                }
+                // Hold limits, a missing key or no disk: keep the memory window.
+                (Spilling::Holding(_), Err(_)) => {
+                    spill.refused = true;
+                    false
+                }
+                (Spilling::Warming(_), Ok(())) => {
+                    *state = Spilling::Spilled;
+                    true
+                }
+                (_, Err(_)) => {
+                    if spill.held.remove(number) {
+                        release.push(PageNumber(*number));
+                    }
+                    false
+                }
+                (Spilling::Spilled, Ok(())) => true,
+            }
+        });
+        for number in warm {
+            let operation = self.start_spill_fill(PageNumber(number));
+            if let Some(spill) = self.spill.as_mut() {
+                spill.pages.insert(number, Spilling::Warming(operation));
+            }
+        }
+        if !release.is_empty() {
+            self.directory
+                .release_read_pages(&self.metadata.version, release, self.scope.request);
+        }
+        changed
+    }
+
+    fn start_spill_fill(&self, number: PageNumber) -> Operation<'static, ()> {
+        let page = PageId {
+            version: self.metadata.version.clone(),
+            number,
+        };
+        match self.directory.start_warm_page(
+            page,
+            self.metadata.immutable(),
+            self.membership.clone(),
+            &self.context,
+            &self.operation_scope(),
+        ) {
+            Ok(operation) => operation,
+            Err(error) => Box::pin(async move { Err(error) }),
+        }
+    }
+
+    /// Start holds for pages past the window, while no warm job covers the
+    /// version (its own holds already cover those pages).
+    fn admit_spill(&mut self, scope: &RequestScope) -> bool {
+        let start = self.page_at(self.slots.len());
+        let warming = self.directory.warm.contains(&self.metadata.version);
+        let Some(spill) = self.spill.as_mut() else {
+            return false;
+        };
+        if spill.refused || warming {
+            return false;
+        }
+        let remaining = scope
+            .deadline
+            .0
+            .saturating_duration_since(uring_runtime::environment::now());
+        let Some(until) =
+            uring_runtime::environment::wall_now().checked_add(SPILL_HOLD.min(remaining))
+        else {
+            return false;
+        };
+        let mut active = spill
+            .pages
+            .values()
+            .filter(|state| !matches!(state, Spilling::Spilled))
+            .count();
+        let end = start.saturating_add(spill.limit as u64).min(self.end);
+        let mut changed = false;
+        for number in start..end {
+            if active >= SPILL_FILLS {
+                break;
+            }
+            if spill.pages.contains_key(&number) {
+                continue;
+            }
+            let directory = self.directory.clone();
+            let page = PageId {
+                version: self.metadata.version.clone(),
+                number: PageNumber(number),
+            };
+            let scope = scope.clone();
+            spill.pages.insert(
+                number,
+                Spilling::Holding(Box::pin(async move {
+                    directory.hold_read_page(&page, until, &scope).await
+                })),
+            );
+            active += 1;
+            changed = true;
+        }
+        changed
+    }
+
     /// Only client HTTP delivery may release the initial operation deadline after
     /// acquiring the first slice. Already admitted pages retain their original deadlines
     /// and retry budgets; only newly admitted, distinct pages get child scopes.
@@ -1003,6 +1228,7 @@ impl RangeStream {
         })
     }
     fn terminate(&mut self) {
+        self.release_spill();
         self.terminated = true;
         self.slots.clear();
         self.selections.clear();
@@ -1051,6 +1277,12 @@ impl RangeStream {
             .issued(number)
             .map_err(window_error)?;
         self.retained.insert(number, result.plaintext.clone());
+        if let Some(spill) = self.spill.as_mut()
+            && spill.held.remove(&number.0)
+        {
+            self.directory
+                .release_read_pages(&self.metadata.version, [number], self.scope.request);
+        }
         self.delivery.attach(result.plaintext, slice).map(Some)
     }
 
@@ -1065,6 +1297,7 @@ impl RangeStream {
 
 impl Drop for RangeStream {
     fn drop(&mut self) {
+        self.release_spill();
         // ReaderLease and runtime completion owners retain already submitted I/O.
         // This cancels acquisition only; it cannot revoke another reader's lease.
         if !self.terminated {
