@@ -174,6 +174,8 @@ Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
 | `RACER_WARM_FILL_TIMEOUT_SECS` | `600` | Independent background fill deadline; 1..86,400 seconds |
 | `RACER_WARM_MAX_JOBS` | `16` | Node-wide tracked warm versions, including completed jobs until expiry; 1..1024 |
 | `RACER_WARM_WINDOW_PAGES` | `2` | Maximum in-flight pages per warm job; 1..64 |
+| `RACER_RANGE_WINDOW_PAGES` | `2` | Pages each read fetches ahead of delivery, in any order; 1..64. Per-worker plaintext budget must fit one page more than the window |
+| `RACER_RANGE_SPILL_PAGES` | `0` | Pages past the read window that a read may fetch to local disk under a short hold; 0..1024; `0` disables spill |
 | `RACER_RETAINED_SEGMENT_PERCENT` | `50` | Per-worker hard-hold cap as a percentage of segment count and page-index capacity; 1..100; free-segment reserve still applies |
 | `RACER_CHECKPOINT_BYTES` | `67108864` (64 MiB) | Node-wide checkpoint working-set budget; at most 512 MiB; device mode can raise it as described below |
 | `RACER_PLACEMENT_CACHE_BYTES` | `16777216` (16 MiB) | Node-wide placement capacity estimate, divided among I/O workers; 1,024 bytes..512 MiB, with at least 1,024 bytes per worker |
@@ -289,6 +291,34 @@ geometry rejects recovery and starts cold when no compatible checkpoint remains.
 Racer does not scan payloads to rebuild the index or migrate cached data. Preserve
 cluster and node identity state; it is separate from disposable cache checkpoints.
 
+### Range reads
+
+The dataplane always sends a read's pages to the client in order, but fetches
+them in any order:
+
+- It checks local memory for every page in the read window. A page already in
+  memory is ready without waiting for earlier pages.
+- It fills the next page to send and the page after it through the normal
+  fill path.
+- It asks peers for the other missing pages in the window. A peer sends them in
+  any order it chooses. Several requests can be in flight at once, to one or
+  more peers.
+- Pages that arrive early wait in memory until their turn. If
+  `RACER_RANGE_SPILL_PAGES` is above zero, a read can also fetch pages past the
+  window to local disk under a short hold. Each hold is released after its page
+  is sent or the read ends. If a hold is refused, the read uses its memory
+  window only.
+- Reads of the same version on one node share page fetches.
+
+The window is `RACER_RANGE_WINDOW_PAGES` pages, also limited by the client's
+unreleased credits. Clients cannot choose the order. The `Racer-Ordered` request
+header is no longer used and is ignored.
+
+Older dataplanes send pages out of order unless the client sends
+`Racer-Ordered: 1`, which current SDKs no longer send. Upgrade dataplanes
+before SDKs. Older peers accept only one page request at a time from a node.
+The dataplane detects this and falls back to one request at a time for that peer.
+
 ### Warm and hard retention
 
 Send `HEAD` on the client socket with `Cache-Control: max-age=<seconds>` to request
@@ -310,8 +340,8 @@ asynchronously with a separate cancellation scope. The TTL starts at HEAD
 admission and runs during the fill, so a short TTL can expire before all pages
 load. Repeated requests for the same cache, key, and ETag share the job and can
 extend, but never shorten, its hold. Admission can be refused because of job,
-storage, index, or request-context limits, shutdown, or a conflicting active
-read selection. A successful metadata response does not make these limits optional.
+storage, index, or request-context limits, or shutdown. A successful metadata
+response does not make these limits optional.
 
 Warm stores pages in the normal cache topology. Each page is held and stored by
 its **primary owner**, the first-ranked node for that page under the membership
@@ -328,8 +358,9 @@ is the primary owner of. Admission works like this:
 4. `Racer-Retain-Until` is the earliest expiry that any owner accepted. An owner
    caps a hold at its own `RACER_WARM_MAX_TTL_SECS`.
 
-The warm job then asks each owner to fill its pages, in ascending page order
-within a bounded pipeline. A remote owner fills the page through its own normal
+The warm job then asks each owner to fill its pages. It starts fills in
+ascending page order, at most `RACER_WARM_WINDOW_PAGES` at a time, and pages can
+finish in any order. A remote owner fills the page through its own normal
 path, writes it to its own disk under the hold, and replies with an
 acknowledgement only. No page bytes go back to the requesting node. Each fill
 request carries the admitted version's length and content type, and an owner
@@ -350,13 +381,12 @@ new lease is refused as overloaded once the version has 64 live leases or the
 node has 64 times `RACER_WARM_MAX_JOBS` live leases; expired leases are pruned
 first, and existing leases are never affected by a refusal.
 
-Both ordered and unordered reads of that exact version on the requesting node
-follow the warm progress, including pages the warm job has not started. Reads
-remain pipelined: they need not wait for the whole object, but cannot move a
-later page ahead of the warm window or launch a competing acquisition. After a
-page is warm, a read of a page held on this node reads it from local disk. A
-read of a page held by another owner uses the normal fill path, which reaches
-that owner's held copy. Their own deadlines and credits still apply. If the warm
+Reads of that exact version on the requesting node follow the warm job. Each
+page a read needs waits only for that page's warm fill, not for earlier pages.
+While it waits, the read starts no competing peer requests or fills. After a page is warm, a read of a page held on this node reads it
+from local disk. A read of a page held by another owner uses the normal fill
+path, which reaches that owner's held copy. Their own deadlines and credits
+still apply. If the warm
 job fails or expires, waiting reads use the normal fill path. A different ETag
 never joins the old job. Reads on other nodes do not wait for warm progress.
 
