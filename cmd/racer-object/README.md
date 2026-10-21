@@ -25,7 +25,9 @@ Run these as separate processes with their Racer sockets mounted. The origin
 provider (`--provider`) and sidecar API (`--api`) are independent; both default
 to `s3`. **Use a new cache when changing bucket, account, provider, or endpoint**;
 the cache key includes only the bucket, key, and version, so reusing a cache
-can serve stale data. Manifests for both are in
+can serve stale data. Pass `--cache-uid=<ClusterCache UID>` to the origin so
+that, if a ClusterCache is recreated under the same name, a leftover origin for
+the old UID refuses requests for the new one instead of filling it. Manifests for both are in
 [`deploy/racer-object`](../../deploy/racer-object).
 
 ## Diagnostics
