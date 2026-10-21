@@ -158,15 +158,19 @@ by a host reboot. On GPU hosts, the post-start hook stops kubelet and containerd
 rewires the driver root and CDI state, then restores both services. Hook failures
 fail the nspawn start and are retried through systemd. On the host,
 `unbounded-agent-nspawn-lifecycle nspawn-lifecycle reconcile <machine>` triggers both
-steps by restarting the managed nspawn unit. Managed `NodeReboot` operations
-invoke the same reconcile flow.
+steps by restarting the managed nspawn unit, as does
+`systemctl restart systemd-nspawn@<machine>.service`, which also works without
+the helper. Managed `NodeReboot` operations invoke the same reconcile flow.
 
 An application that embeds the agent can run the hooks' phases another way,
 such as in a container, by setting `NSpawnLifecycle` in the agent config. Its
 `PreStartCommand` and `PostStartCommand` replace the helper's commands in the
-units. Each is a systemd command line, in which `%i` is the machine's name, and
-must run its `nspawn-lifecycle` phase for that machine and fail when the phase
-fails. The agent then doesn't install the lifecycle helper:
+units. Each is a systemd command line that starts with the command's absolute
+path, in which `%i` is the machine's name. It must run its `nspawn-lifecycle`
+phase for that machine with the host's view of the filesystem, since the phases
+read host devices, `/etc/os-release`, and NVIDIA binaries and libraries, and
+write host unit files. It must fail when the phase fails. The agent then doesn't
+install the lifecycle helper:
 
 ```json
 {
@@ -176,6 +180,22 @@ fails. The agent then doesn't install the lifecycle helper:
   }
 }
 ```
+
+A unit that commands like these start runs its phase on every machine start
+only if:
+
+- it is a `Type=oneshot` unit without `RemainAfterExit=yes`, which would leave
+  it active, so that later starts do nothing;
+- it isn't ordered after the machine's units, or a target that waits for them,
+  such as `machines.target` or `multi-user.target`, which deadlocks the
+  machine's start. The pre-start unit has no start timeout, so it would wait
+  forever;
+- post-start finishes within the machine unit's start timeout, which also
+  covers the machine's boot.
+
+The agent doesn't remove a helper installed before. If a later config doesn't
+set `NSpawnLifecycle`, the pre-start hook reinstalls the helper when it's
+missing, before writing units that run it.
 
 Each lifecycle refresh discovers NVIDIA devices and driver libraries from the
 current host. On a node provisioned with the NVIDIA-capable rootfs, complete GPU

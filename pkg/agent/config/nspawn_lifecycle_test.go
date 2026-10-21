@@ -40,6 +40,18 @@ func TestValidateNSpawnLifecycle(t *testing.T) {
 				"NSpawnLifecycle.PostStartCommand is required",
 			},
 		},
+		"a relative command": {
+			lifecycle: &NSpawnLifecycleConfig{PreStartCommand: "systemctl start app-pre-start@%i.service", PostStartCommand: postStart},
+			wantErrs:  []string{"NSpawnLifecycle.PreStartCommand must start with the command's absolute path"},
+		},
+		"a prefix that ignores failure": {
+			lifecycle: &NSpawnLifecycleConfig{PreStartCommand: preStart, PostStartCommand: "-" + postStart},
+			wantErrs:  []string{"NSpawnLifecycle.PostStartCommand must start with the command's absolute path"},
+		},
+		"a trailing backslash would join the next line": {
+			lifecycle: &NSpawnLifecycleConfig{PreStartCommand: preStart, PostStartCommand: postStart + ` \ `},
+			wantErrs:  []string{"NSpawnLifecycle.PostStartCommand must not end in a backslash"},
+		},
 		"a newline would add a unit directive": {
 			lifecycle: &NSpawnLifecycleConfig{
 				PreStartCommand:  preStart + "\nExecStartPost=/bin/sh -c id",

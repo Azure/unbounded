@@ -364,6 +364,10 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 			Source: "/opt/config",
 		}},
 		Gantry: &GantryConfig{Disabled: true},
+		NSpawnLifecycle: &NSpawnLifecycleConfig{
+			PreStartCommand:  "/usr/bin/systemctl start app-pre-start@%i.service",
+			PostStartCommand: "/usr/bin/systemctl start app-post-start@%i.service",
+		},
 	}
 
 	copy := original.DeepCopy()
@@ -384,6 +388,7 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 	copy.AdditionalHostDevices[0] = "/dev/input/event0"
 	copy.AdditionalHostMounts[0].Source = "/opt/other"
 	copy.Gantry.Disabled = false
+	copy.NSpawnLifecycle.PreStartCommand = "/usr/bin/true"
 
 	require.Equal(t, "test", original.Kubelet.Labels["env"])
 	require.Equal(t, "dedicated=test:NoSchedule", original.Kubelet.RegisterWithTaints[0])
@@ -394,6 +399,7 @@ func TestAgentConfig_DeepCopy(t *testing.T) {
 	require.Equal(t, "/dev/uinput", original.AdditionalHostDevices[0])
 	require.Equal(t, "/opt/config", original.AdditionalHostMounts[0].Source)
 	require.True(t, original.Gantry.Disabled)
+	require.Equal(t, "/usr/bin/systemctl start app-pre-start@%i.service", original.NSpawnLifecycle.PreStartCommand)
 }
 
 func TestAgentKubeletConfigValidate(t *testing.T) {

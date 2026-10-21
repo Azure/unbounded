@@ -103,3 +103,54 @@ func TestEnsureNSpawnLifecycleHelperFor(t *testing.T) {
 		})
 	}
 }
+
+func TestRepairNSpawnLifecycleHelper(t *testing.T) {
+	t.Parallel()
+
+	configured := &config.NSpawnLifecycleConfig{
+		PreStartCommand:  "/usr/bin/systemctl start app-pre-start@%i.service",
+		PostStartCommand: "/usr/bin/systemctl start app-post-start@%i.service",
+	}
+
+	tests := map[string]struct {
+		lifecycle   *config.NSpawnLifecycleConfig
+		helperThere bool
+		wantInstall bool
+	}{
+		"hooks run configured commands":                  {lifecycle: configured},
+		"hooks run the helper, which is there":           {helperThere: true},
+		"hooks run the helper, which is missing":         {wantInstall: true},
+		"hooks run configured commands, helper is there": {lifecycle: configured, helperThere: true},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			target := filepath.Join(t.TempDir(), "bin", "unbounded-agent-nspawn-lifecycle")
+			if tc.helperThere {
+				require.NoError(t, os.MkdirAll(filepath.Dir(target), 0o755))
+				require.NoError(t, os.WriteFile(target, []byte("helper"), 0o755))
+			}
+
+			task, ok := RepairNSpawnLifecycleHelper(&goalstates.RootFS{NSpawnLifecycle: tc.lifecycle}).(*ensureNSpawnLifecycleHelper)
+			require.True(t, ok)
+			require.Equal(t, "repair-nspawn-lifecycle-helper", task.Name())
+
+			var targets []string
+
+			task.target = func() string { return target }
+			task.install = func(_, targetPath string) error {
+				targets = append(targets, targetPath)
+
+				return nil
+			}
+			require.NoError(t, task.Do(context.Background()))
+
+			if tc.wantInstall {
+				require.Equal(t, []string{target}, targets)
+			} else {
+				require.Empty(t, targets)
+			}
+		})
+	}
+}

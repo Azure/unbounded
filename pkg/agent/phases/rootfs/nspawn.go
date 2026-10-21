@@ -145,6 +145,13 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 	// "/var/lib/machines/kube1"); nspawn always names the machine after that
 	// directory.
 	machineName := filepath.Base(goalState.MachineDir)
+
+	// The resolvers validate these, but the goal state may come from elsewhere,
+	// and an empty command would clear its hook's command list in the unit.
+	if err := config.ValidateNSpawnLifecycle(goalState.NSpawnLifecycle); err != nil {
+		return err
+	}
+
 	hostDevicePaths := goalState.HostDevices.Paths()
 	hostDeviceGroupSpecifiers := goalState.HostDevices.DeviceGroupSpecifiers()
 	amdGPUDevicePaths := pathsExcluding(goalState.AMD.GPUDevicePaths, goalState.Nvidia.GPUDevicePaths)

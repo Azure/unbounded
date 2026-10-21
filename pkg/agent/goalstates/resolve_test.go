@@ -696,6 +696,7 @@ func TestResolveMachine_NSpawnLifecycle(t *testing.T) {
 	got, err := ResolveMachine(discardLogger(), cfg, "kube1", nil)
 	require.NoError(t, err)
 	require.Equal(t, lifecycle, got.RootFS.NSpawnLifecycle)
+	require.NotSame(t, lifecycle, got.RootFS.NSpawnLifecycle)
 	require.False(t, got.RootFS.UsesLifecycleHelper())
 
 	cfg.NSpawnLifecycle = nil

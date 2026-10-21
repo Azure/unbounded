@@ -40,12 +40,13 @@ func TestPreStartUsesApplicationConfigLoader(t *testing.T) {
 		return &goalstates.RootFS{MachineDir: "/var/lib/machines/kube1"}, nil
 	}
 
-	var executed, reloaded bool
+	var (
+		executed []string
+		reloaded bool
+	)
 
 	lifecycle.execute = func(_ context.Context, _ *slog.Logger, task phases.Task) error {
-		executed = true
-
-		require.Equal(t, "ensure-nspawn-config", task.Name())
+		executed = append(executed, task.Name())
 
 		return nil
 	}
@@ -56,7 +57,8 @@ func TestPreStartUsesApplicationConfigLoader(t *testing.T) {
 	}
 
 	require.NoError(t, lifecycle.PreStart(context.Background(), "kube1"))
-	require.True(t, executed)
+	// The helper is repaired before the config that names it is written.
+	require.Equal(t, []string{"repair-nspawn-lifecycle-helper", "ensure-nspawn-config"}, executed)
 	require.True(t, reloaded)
 }
 

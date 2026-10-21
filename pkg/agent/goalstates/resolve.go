@@ -99,7 +99,7 @@ func resolveNSpawnConfig(
 		AMD:                    ResolveAMDHost(),
 		HostDevices:            DiscoverHostDevices(cfg.AdditionalHostDevices),
 		AdditionalHostMounts:   additionalHostMounts,
-		NSpawnLifecycle:        cfg.NSpawnLifecycle,
+		NSpawnLifecycle:        cfg.NSpawnLifecycle.DeepCopy(),
 	}, nil
 }
 

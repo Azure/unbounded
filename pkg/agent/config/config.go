@@ -102,15 +102,27 @@ func ValidateProvisioningFormat(format string) error {
 // NSpawnLifecycleConfig supplies the nspawn lifecycle hooks' commands, for an
 // application that runs the agent's nspawn-lifecycle phases another way than
 // through the lifecycle helper, such as in a container. Each is a systemd
-// command line, as in ExecStart=, in a unit instance named after the machine,
-// so %i expands to the machine's name. Each must run its phase for that machine
-// and fail if the phase fails, as nspawn-lifecycle does.
+// command line, as in ExecStart=, starting with the command's absolute path, in
+// a unit instance named after the machine, so %i expands to the machine's name.
+// Each must run its phase for that machine with the host's view of the
+// filesystem, and fail if the phase fails, as nspawn-lifecycle does.
 type NSpawnLifecycleConfig struct {
 	// PreStartCommand runs the pre-start phase, which regenerates the
 	// machine's host-side config before it starts.
 	PreStartCommand string `json:"PreStartCommand"`
 	// PostStartCommand runs the post-start phase once the machine has started.
 	PostStartCommand string `json:"PostStartCommand"`
+}
+
+// DeepCopy returns a copy of the lifecycle hook commands.
+func (l *NSpawnLifecycleConfig) DeepCopy() *NSpawnLifecycleConfig {
+	if l == nil {
+		return nil
+	}
+
+	out := *l
+
+	return &out
 }
 
 // ValidateNSpawnLifecycle checks that configured lifecycle hook commands are
@@ -126,10 +138,17 @@ func ValidateNSpawnLifecycle(lifecycle *NSpawnLifecycleConfig) error {
 		{"PreStartCommand", lifecycle.PreStartCommand},
 		{"PostStartCommand", lifecycle.PostStartCommand},
 	} {
-		if strings.TrimSpace(hook.command) == "" {
+		switch {
+		case strings.TrimSpace(hook.command) == "":
 			errs = append(errs, fmt.Errorf("NSpawnLifecycle.%s is required", hook.name))
-		} else if strings.IndexFunc(hook.command, unicode.IsControl) >= 0 {
+		case strings.IndexFunc(hook.command, unicode.IsControl) >= 0:
 			errs = append(errs, fmt.Errorf("NSpawnLifecycle.%s must not contain control characters", hook.name))
+		case !strings.HasPrefix(hook.command, "/"):
+			// This also rules out systemd's prefixes, such as "-", which ignores the
+			// command's failure.
+			errs = append(errs, fmt.Errorf("NSpawnLifecycle.%s must start with the command's absolute path", hook.name))
+		case strings.HasSuffix(strings.TrimRightFunc(hook.command, unicode.IsSpace), `\`):
+			errs = append(errs, fmt.Errorf("NSpawnLifecycle.%s must not end in a backslash, which joins the unit's next line to it", hook.name))
 		}
 	}
 
@@ -240,6 +259,8 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 	if a.Gantry != nil {
 		out.Gantry = &GantryConfig{Disabled: a.Gantry.Disabled}
 	}
+
+	out.NSpawnLifecycle = a.NSpawnLifecycle.DeepCopy()
 
 	out.LocalDNS = a.LocalDNS.DeepCopy()
 

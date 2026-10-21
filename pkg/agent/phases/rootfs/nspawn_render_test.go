@@ -454,6 +454,24 @@ func TestWriteNSpawnConfigs_ConfiguredLifecycleCommands(t *testing.T) {
 	require.NotContains(t, string(unit), "unbounded-agent-nspawn-lifecycle")
 }
 
+func TestWriteNSpawnConfigs_RejectsInvalidLifecycleCommands(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	goalState := &goalstates.RootFS{
+		MachineDir:             filepath.Join(dir, "machines", "kube1"),
+		NSpawnConfigFile:       filepath.Join(dir, "kube1.nspawn"),
+		ServiceOverrideFile:    filepath.Join(dir, "override.conf"),
+		ConfigRegenerationFile: filepath.Join(dir, "unbounded-agent-regenerate-config@kube1.service"),
+		NSpawnLifecycle: &config.NSpawnLifecycleConfig{
+			PreStartCommand: "/usr/bin/systemctl start app-pre-start@%i.service",
+		},
+	}
+	require.ErrorContains(t, writeNSpawnConfigs(slog.New(slog.DiscardHandler), goalState), "NSpawnLifecycle.PostStartCommand")
+	require.NoFileExists(t, goalState.ServiceOverrideFile)
+	require.NoFileExists(t, goalState.ConfigRegenerationFile)
+}
+
 func defaultNSpawnTemplateData(machineName string) nspawnTemplateData {
 	return nspawnTemplateData{
 		MachineName:                  machineName,

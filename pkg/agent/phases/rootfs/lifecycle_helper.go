@@ -16,32 +16,69 @@ import (
 )
 
 type ensureNSpawnLifecycleHelper struct {
-	skip    bool
-	install func(sourcePath, targetPath string) error
+	name          string
+	skip          bool
+	onlyIfMissing bool
+	target        func() string
+	install       func(sourcePath, targetPath string) error
+}
+
+func newEnsureNSpawnLifecycleHelper(name string) *ensureNSpawnLifecycleHelper {
+	return &ensureNSpawnLifecycleHelper{
+		name:    name,
+		target:  func() string { return goalstates.ResolveHostPaths().NSpawnLifecycleBinary },
+		install: installNSpawnLifecycleHelper,
+	}
 }
 
 // EnsureNSpawnLifecycleHelper installs a rollback-stable lifecycle command helper.
 // Agent rollback changes the daemon's current symlink but leaves this helper in
-// place so already-generated nspawn hooks remain executable.
+// place so already-generated nspawn hooks remain executable. For a machine whose
+// config may supply the hooks' commands, use EnsureNSpawnLifecycleHelperFor.
 func EnsureNSpawnLifecycleHelper() phases.Task {
-	return &ensureNSpawnLifecycleHelper{install: installNSpawnLifecycleHelper}
+	return newEnsureNSpawnLifecycleHelper("ensure-nspawn-lifecycle-helper")
 }
 
 // EnsureNSpawnLifecycleHelperFor is EnsureNSpawnLifecycleHelper for a machine.
 // It installs nothing when the machine's hooks run configured commands instead
 // of the helper.
 func EnsureNSpawnLifecycleHelperFor(goalState *goalstates.RootFS) phases.Task {
-	return &ensureNSpawnLifecycleHelper{
-		skip:    !goalState.UsesLifecycleHelper(),
-		install: installNSpawnLifecycleHelper,
-	}
+	task := newEnsureNSpawnLifecycleHelper("ensure-nspawn-lifecycle-helper")
+	task.skip = !goalState.UsesLifecycleHelper()
+
+	return task
 }
 
-func (e *ensureNSpawnLifecycleHelper) Name() string { return "ensure-nspawn-lifecycle-helper" }
+// RepairNSpawnLifecycleHelper installs the lifecycle helper if the machine's
+// hooks run it and it is missing. Pre-start runs it before writing the hooks, so
+// a host whose config stops supplying the hooks' commands, which then installs
+// no helper, gets the helper back rather than hooks that cannot run.
+func RepairNSpawnLifecycleHelper(goalState *goalstates.RootFS) phases.Task {
+	task := newEnsureNSpawnLifecycleHelper("repair-nspawn-lifecycle-helper")
+	task.skip = !goalState.UsesLifecycleHelper()
+	task.onlyIfMissing = true
+
+	return task
+}
+
+func (e *ensureNSpawnLifecycleHelper) Name() string { return e.name }
 
 func (e *ensureNSpawnLifecycleHelper) Do(_ context.Context) error {
 	if e.skip {
 		return nil
+	}
+
+	targetPath := e.target()
+
+	if e.onlyIfMissing {
+		_, err := os.Stat(targetPath)
+		if err == nil {
+			return nil
+		}
+
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("check lifecycle helper %s: %w", targetPath, err)
+		}
 	}
 
 	sourcePath, err := os.Executable()
@@ -49,7 +86,7 @@ func (e *ensureNSpawnLifecycleHelper) Do(_ context.Context) error {
 		return fmt.Errorf("resolve running agent executable: %w", err)
 	}
 
-	return e.install(sourcePath, goalstates.ResolveHostPaths().NSpawnLifecycleBinary)
+	return e.install(sourcePath, targetPath)
 }
 
 func installNSpawnLifecycleHelper(sourcePath, targetPath string) (retErr error) {
