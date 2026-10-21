@@ -357,6 +357,10 @@ standalone Helm chart does not support Racer mode.
      name: gantry
    ```
 
+   Do not set `spec.origin` on this cache. Gantry is its origin. If
+   `spec.origin` is set, the operator keeps Gantry in default mode and reports
+   the reason `RacerOriginConflict`.
+
 Creating any ClusterCache makes the operator install Racer. When the `gantry`
 cache exists and Gantry is enabled, the operator changes the `gantry`
 DaemonSet in `unbounded-system`:

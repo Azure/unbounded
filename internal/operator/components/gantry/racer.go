@@ -36,6 +36,11 @@ const (
 	racerOriginVolume  = "racer-origin"
 	reasonRacerPending = "RacerPending"
 
+	// reasonRacerOriginConflict reports a ClusterCache/gantry that sets a
+	// managed origin. Racer would then run its own origin on the Gantry origin
+	// socket, and the SDK allows only one owner per socket.
+	reasonRacerOriginConflict = "RacerOriginConflict"
+
 	racerPendingRequeue = 30 * time.Second
 )
 
@@ -51,36 +56,42 @@ func racerSocketDir(role string) string {
 // is requested while ClusterCache/gantry exists and is not being deleted. A
 // nil placement with requested=true means the dataplane DaemonSet does not
 // exist yet, so no safe placement is known and the caller must wait.
-func racerMode(ctx context.Context, env *component.Env) (requested bool, placement *workload.NodePlacement, err error) {
+// conflict=true means the cache sets spec.origin; Racer then runs its own
+// origin on the Gantry origin socket, so Gantry stays in default mode.
+func racerMode(ctx context.Context, env *component.Env) (requested, conflict bool, placement *workload.NodePlacement, err error) {
 	cache := &racerv1.ClusterCache{}
 
 	err = env.LiveReader().Get(ctx, client.ObjectKey{Name: RacerCacheName}, cache)
 	if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
-		return false, nil, nil
+		return false, false, nil, nil
 	}
 
 	if err != nil {
-		return false, nil, fmt.Errorf("get ClusterCache/%s: %w", RacerCacheName, err)
+		return false, false, nil, fmt.Errorf("get ClusterCache/%s: %w", RacerCacheName, err)
 	}
 
 	if cache.DeletionTimestamp != nil {
-		return false, nil, nil
+		return false, false, nil, nil
+	}
+
+	if cache.Spec.Origin != nil {
+		return false, true, nil, nil
 	}
 
 	ds := &appsv1.DaemonSet{}
 
 	err = env.LiveReader().Get(ctx, client.ObjectKey{Namespace: env.Namespace, Name: workload.DataplaneDaemonSetName}, ds)
 	if apierrors.IsNotFound(err) {
-		return true, nil, nil
+		return true, false, nil, nil
 	}
 
 	if err != nil {
-		return false, nil, fmt.Errorf("get DaemonSet/%s placement: %w", workload.DataplaneDaemonSetName, err)
+		return false, false, nil, fmt.Errorf("get DaemonSet/%s placement: %w", workload.DataplaneDaemonSetName, err)
 	}
 
 	got := workload.PlacementOf(&ds.Spec.Template.Spec)
 
-	return true, &got, nil
+	return true, false, &got, nil
 }
 
 // racerPending is the result while Gantry waits for Racer to deploy its
@@ -89,6 +100,13 @@ func racerPending() component.Result {
 	return component.NotReadyAfter(reasonRacerPending,
 		fmt.Sprintf("ClusterCache/%s selects the Gantry Racer backend; waiting for DaemonSet/%s", RacerCacheName, workload.DataplaneDaemonSetName),
 		racerPendingRequeue)
+}
+
+// racerOriginConflict is the result while ClusterCache/gantry sets a managed
+// origin. Gantry stays in default mode because it is the origin for that cache.
+func racerOriginConflict() component.Result {
+	return component.NotReady(reasonRacerOriginConflict,
+		fmt.Sprintf("ClusterCache/%s must not set spec.origin because Gantry is its origin; Gantry stays in default mode", RacerCacheName))
 }
 
 // applyRacerMode configures the Gantry agent DaemonSet for the Racer backend:
@@ -240,8 +258,8 @@ func upsertNamed(obj map[string]any, field string, value any) error {
 }
 
 // racerCachePredicate reconciles Gantry when ClusterCache/gantry is created,
-// deleted, or starts deleting. Other updates, such as status writes, do not
-// change the Gantry mode.
+// deleted, starts deleting, or changes its spec (generation), such as adding
+// or removing spec.origin. Status-only writes do not change the Gantry mode.
 func racerCachePredicate() predicate.Predicate {
 	match := func(obj client.Object) bool { return obj.GetName() == RacerCacheName }
 
@@ -250,7 +268,8 @@ func racerCachePredicate() predicate.Predicate {
 		DeleteFunc: func(ev event.DeleteEvent) bool { return match(ev.Object) },
 		UpdateFunc: func(ev event.UpdateEvent) bool {
 			return match(ev.ObjectNew) &&
-				(ev.ObjectOld.GetDeletionTimestamp() == nil) != (ev.ObjectNew.GetDeletionTimestamp() == nil)
+				((ev.ObjectOld.GetDeletionTimestamp() == nil) != (ev.ObjectNew.GetDeletionTimestamp() == nil) ||
+					ev.ObjectOld.GetGeneration() != ev.ObjectNew.GetGeneration())
 		},
 		GenericFunc: func(event.GenericEvent) bool { return false },
 	}
