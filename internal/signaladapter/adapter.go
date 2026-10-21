@@ -753,7 +753,8 @@ func workloadEnvironment(
 ) []corev1.EnvVar {
 	result := slices.Clone(environment)
 
-	return append(result,
+	return append(
+		result,
 		corev1.EnvVar{Name: "PROJECT_SIGNAL_RUN_NAME", Value: config.RunName},
 		corev1.EnvVar{Name: "PROJECT_SIGNAL_RUN_UID", Value: string(config.RunUID)},
 		corev1.EnvVar{Name: "PROJECT_SIGNAL_PARTICIPANT_INDEX", Value: strconv.FormatInt(int64(participant.Index), 10)},
