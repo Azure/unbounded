@@ -2560,6 +2560,11 @@ pub(super) mod tests {
             let responses = Responses::new(io.clone(), delivery);
             let headers_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let reader_headers = headers_sent.clone();
+            // In the progressing case the reader holds the stream after its first
+            // page until the clock has crossed the original deadline, so the
+            // remaining pages are delivered after it.
+            let crossed = Arc::new(std::sync::atomic::AtomicBool::new(!progressing));
+            let reader_crossed = crossed.clone();
             let (server, mut client) = UnixStream::pair().unwrap();
             let reader = std::thread::spawn(move || {
                 client
@@ -2591,6 +2596,13 @@ pub(super) mod tests {
                 )));
                 let mut scratch = [0; 65536];
                 for number in 1..=4 {
+                    if number == 2 {
+                        let until = Instant::now() + Duration::from_secs(60);
+                        while !reader_crossed.load(std::sync::atomic::Ordering::Acquire) {
+                            assert!(Instant::now() < until, "clock never crossed the deadline");
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
                     let mut left = if number == 4 { 17 } else { PAGE_BYTES as usize };
                     let mut frame = [0; 21];
                     client.read_exact(&mut frame).unwrap();
@@ -2644,6 +2656,7 @@ pub(super) mod tests {
             };
             let mut work = std::pin::pin!(work);
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            let mut fetched = false;
             let result = loop {
                 if let Poll::Ready(result) = work.as_mut().poll(&mut cx) {
                     break result;
@@ -2651,8 +2664,26 @@ pub(super) mod tests {
                 reactor.poll_budgeted(128).unwrap();
                 worker.poll(&mut cx);
                 reactor.wait(Duration::from_millis(1)).unwrap();
-                if progressing && headers_sent.load(std::sync::atomic::Ordering::Acquire) {
-                    clock.advance(Duration::from_millis(1));
+                // Pages admitted before the headers keep the original deadline,
+                // and with four credits that is every page of this range. Their
+                // fetches take real time, so simulated time only moves once all of
+                // them have completed: the origin served every page and the worker
+                // replied to every command. The poll above has then made each
+                // window slot ready. Only delivery remains, which must outlive the
+                // original deadline.
+                if !crossed.load(std::sync::atomic::Ordering::Acquire)
+                    && headers_sent.load(std::sync::atomic::Ordering::Acquire)
+                    && worker
+                        .origin
+                        .completed(racer_object_wire::test_util::RequestKind::PinnedGet)
+                        == 4
+                    && worker.is_drained()
+                {
+                    if fetched {
+                        clock.advance(Duration::from_millis(31));
+                        crossed.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    fetched = true;
                 }
             };
             if capped {
