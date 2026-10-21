@@ -201,12 +201,12 @@ func TestWriteCNIConfigWritesExpectedConflist(t *testing.T) {
 		t.Fatalf("unexpected bridge plugin config: %#v", got.Plugins[0])
 	}
 
-	if len(got.Plugins[0].IPAM.Ranges) != 2 {
-		t.Fatalf("expected two IPAM ranges, got %d", len(got.Plugins[0].IPAM.Ranges))
+	if got.Plugins[0].IPAM.Type != "unbounded-ipam" || got.Plugins[0].IPAM.SocketPath != "" {
+		t.Fatalf("expected argument-free unbounded-ipam, got %#v", got.Plugins[0].IPAM)
 	}
 
-	if got.Plugins[0].IPAM.Ranges[0][0].Subnet != podCIDRs[0] || got.Plugins[0].IPAM.Ranges[1][0].Subnet != podCIDRs[1] {
-		t.Fatalf("unexpected IPAM ranges: %#v", got.Plugins[0].IPAM.Ranges)
+	if strings.Contains(string(raw), "10.244.0.0") || strings.Contains(string(raw), "fd00:10::") {
+		t.Fatalf("conflist contains cached PodCIDRs: %s", raw)
 	}
 
 	if _, err := os.Stat(confPath + ".tmp"); !os.IsNotExist(err) {

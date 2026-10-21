@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -71,6 +72,7 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 		wgCollector:                   wgCollector,
 		healthFlapMaxBackoff:          cfg.HealthFlapMaxBackoff,
 		netlinkCache:                  netlinkCache,
+		neighborGCTuner:               newNeighborGCTuner(),
 		healthState:                   healthState,
 		isGatewayNode:                 isGatewayNodeFromCRDs(gatewayPoolInformer, myPubKey),
 	}
@@ -87,25 +89,7 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 	state.routeManager = routeManager
 	state.routeTableID = cfg.RouteTableID
 
-	// Set preferred source IPs for routes based on node's podCIDRs.
-	// Collect both address families before calling SetPreferredSourceIPs
-	// to avoid one family overwriting the other with nil.
-	var preferredSrcIPv4, preferredSrcIPv6 net.IP
-
-	for _, cidr := range nodePodCIDRs {
-		gwIP := getGatewayIPFromCIDR(cidr)
-		if gwIP == nil {
-			continue
-		}
-
-		if gwIP.To4() != nil {
-			preferredSrcIPv4 = gwIP
-		} else {
-			preferredSrcIPv6 = gwIP
-		}
-	}
-
-	routeManager.SetPreferredSourceIPs(preferredSrcIPv4, preferredSrcIPv6)
+	setPodCIDRPreferredSources(routeManager, nodePodCIDRs)
 
 	// Initialize healthcheck manager for peer health monitoring.
 	healthCheckMgr, err := healthcheck.NewManager(cfg.NodeName, cfg.HealthCheckPort, func(peerHostname string, newState, oldState healthcheck.SessionState) {
@@ -930,7 +914,7 @@ var configureWireGuardFunc = configureWireGuard
 // It uses per-node podCIDRs from slices and gateway pools for routing
 // It also looks up gateway pools referenced by the site and adds gateway peers with all remote sites' CIDRs
 // For gateway nodes, it adds all nodes from all sites as peers (pubkey only, no endpoint)
-// When manageCniPlugin is false on non-gateway nodes, same-site peers are skipped but
+// Unless same-site routing is explicitly enabled, unmanaged non-gateway nodes skip same-site peers but
 // directly peered remote-site peers are still included for podCIDR routing.
 // Sites that are directly peered via SitePeering objects are treated as if they were the same site
 func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interface, siteInformer, sliceInformer, gatewayPoolInformer, gatewayNodeInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer cache.SharedIndexInformer, cfg *config, mySiteName, privKey, myPubKey string, manageCniPlugin bool, state *wireGuardState) error {
@@ -1759,7 +1743,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 					RouteDistances:         routeDistances,
 					LearnedRoutes:          learnedRoutes,
 					PodCIDRs:               gwNode.PodCIDRs,
-					SkipPodCIDRRoutes:      !manageCniPlugin && !isGatewayNode && gwNode.SiteName == mySiteName,
+					SkipPodCIDRRoutes:      !manageCniPlugin && !cfg.ManageSameSitePodRoutes && !isGatewayNode && gwNode.SiteName == mySiteName,
 				}, siteRouting.localCIDRs))
 			}
 		}
@@ -1819,9 +1803,9 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 				continue
 			}
 		}
-		// When manageCniPlugin is false, skip same-site peers for non-gateway nodes.
+		// An unmanaged CNI owns same-site routes unless explicitly overridden.
 		// Keep directly peered remote sites so unmanaged sites can still route to managed remote pods.
-		if !manageCniPlugin && !isGatewayNode && slice.SiteName == mySiteName {
+		if !manageCniPlugin && !cfg.ManageSameSitePodRoutes && !isGatewayNode && slice.SiteName == mySiteName {
 			continue
 		}
 
@@ -1852,7 +1836,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 				WireGuardPublicKey: node.WireGuardPublicKey,
 				InternalIPs:        node.InternalIPs,
 				PodCIDRs:           node.PodCIDRs,
-				SkipPodCIDRRoutes:  !manageCniPlugin && isGatewayNode && slice.SiteName == mySiteName,
+				SkipPodCIDRRoutes:  !manageCniPlugin && !cfg.ManageSameSitePodRoutes && isGatewayNode && slice.SiteName == mySiteName,
 			})
 		}
 	}
@@ -1891,7 +1875,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		}
 	}
 
-	if !manageCniPlugin && !isGatewayNode {
+	if !manageCniPlugin && !cfg.ManageSameSitePodRoutes && !isGatewayNode {
 		klog.V(2).Info("manageCniPlugin is false - skipping same-site tunnel peers for non-gateway nodes")
 	}
 
@@ -1922,6 +1906,12 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	resolvePeerTunnelMTUs(cfg, peers, gatewayPeers, mySiteName, peeredSites, networkPeeredSites,
 		siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs,
 		assignmentPoolTunnelMTUs, poolTunnelMTUs, state.netlinkCache)
+
+	if state.neighborGCTuner != nil {
+		if err := state.reconcileNeighborCapacity(cfg, peers, gatewayPeers, mySiteName, peeredSites, networkPeeredSites); err != nil {
+			return fmt.Errorf("reconcile mesh neighbor capacity: %w", err)
+		}
+	}
 
 	fabricMTU := resolveCNIConfigMTU(cfg.MTU, siteTunnelMTUs[mySiteName], peers, gatewayPeers,
 		unboundednetnetlink.DetectDefaultRouteMTUFromCache(state.netlinkCache))
@@ -1974,6 +1964,15 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	// netlink operations so getNodeStatus() is not blocked.
 	state.mu.Lock()
 
+	prevNodePodCIDRs := state.nodePodCIDRs
+	nodePodCIDRs := prevNodePodCIDRs
+
+	if state.healthState != nil {
+		if verified := state.healthState.verifiedIPAMAssignment(); len(verified) > 0 {
+			nodePodCIDRs = verified
+		}
+	}
+
 	prevIsGatewayNode := state.isGatewayNode
 	prevMyGatewayPort := state.myGatewayPort
 	prevLocalGatewayPools := append([]string(nil), state.localGatewayPools...)
@@ -1985,7 +1984,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		!strSliceEqual(prevLocalGatewayPools, localGatewayPools)
 
 	// Check if tunnel configuration needs to change
-	wgChanged := roleChanged ||
+	wgChanged := !slices.Equal(prevNodePodCIDRs, nodePodCIDRs) || roleChanged ||
 		!reflect.DeepEqual(state.siteRouting, siteRouting) ||
 		!meshPeersEqual(state.peers, peers) ||
 		!strSliceEqual(state.sitePodCIDRs, sitePodCIDRs) ||
@@ -2036,8 +2035,13 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	state.sitePodCIDRPools = append([]string(nil), sitePodCIDRPools...)
 	state.sitePodCIDRs = append([]string(nil), sitePodCIDRs...)
 	state.siteRouting = siteRouting
+	state.nodePodCIDRs = nodePodCIDRs
 
 	state.mu.Unlock()
+
+	if state.routeManager != nil {
+		setPodCIDRPreferredSources(state.routeManager, nodePodCIDRs)
+	}
 
 	committed := false
 
@@ -2055,7 +2059,12 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		state.sitePodCIDRPools = prevSitePodCIDRPools
 		state.sitePodCIDRs = prevSitePodCIDRs
 		state.siteRouting = prevSiteRouting
+		state.nodePodCIDRs = prevNodePodCIDRs
 		state.mu.Unlock()
+
+		if state.routeManager != nil {
+			setPodCIDRPreferredSources(state.routeManager, prevNodePodCIDRs)
+		}
 	}()
 
 	// Phase 2: Expensive network operations (lock-free).

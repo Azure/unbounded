@@ -32,9 +32,9 @@ import (
 )
 
 func TestNewRequestCanonicalIdentity(t *testing.T) {
-	want := `{"schema":1,"namespace":"store","bucket":"bucket","key":"a/../b%2Fc +雪","versionId":"v+/="}`
+	want := `{"schema":1,"bucket":"bucket","key":"a/../b%2Fc +雪","versionId":"v+/="}`
 
-	request, err := NewRequest("store", "bucket", "a/../b%2Fc +雪", "v+/=")
+	request, err := NewRequest("bucket", "a/../b%2Fc +雪", "v+/=")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,69 +43,66 @@ func TestNewRequestCanonicalIdentity(t *testing.T) {
 		t.Fatal("canonical identity changed")
 	}
 
-	for _, fields := range [][4]string{
-		{"other", "bucket", "a/../b%2Fc +雪", "v+/="},
-		{"store", "other", "a/../b%2Fc +雪", "v+/="},
-		{"store", "bucket", "b%2Fc +雪", "v+/="},
-		{"store", "bucket", "a/../b/c +雪", "v+/="},
-		{"store", "bucket", "a/../b%2Fc +雪", ""},
+	for _, fields := range [][3]string{
+		{"other", "a/../b%2Fc +雪", "v+/="},
+		{"bucket", "b%2Fc +雪", "v+/="},
+		{"bucket", "a/../b/c +雪", "v+/="},
+		{"bucket", "a/../b%2Fc +雪", ""},
 	} {
-		other, err := NewRequest(fields[0], fields[1], fields[2], fields[3])
+		other, err := NewRequest(fields[0], fields[1], fields[2])
 		if err != nil || other.Key == request.Key {
 			t.Fatalf("identity collision: %v", err)
 		}
 	}
 
-	plain, err := NewRequest("store", "bucket", "key", "")
+	plain, err := NewRequest("bucket", "key", "")
 	if err != nil || strings.Contains(plain.Metadata, "versionId") {
 		t.Fatal("empty version must be omitted", err)
 	}
 }
 
 func TestNewRequestValidation(t *testing.T) {
-	for _, fields := range [][4]string{
-		{"", "bucket", "key", ""},
-		{"with space", "bucket", "key", ""},
-		{"store\n", "bucket", "key", ""},
-		{"\xff", "bucket", "key", ""},
-		{"store", "", "key", ""},
-		{"store", "https://evil", "key", ""},
-		{"store", "../bucket", "key", ""},
-		{"store", "bucket", "", ""},
-		{"store", "bucket", strings.Repeat("k", 1025), ""},
-		{"store", "bucket", "\xff", ""},
-		{"store", "bucket", "key", "\xff"},
-		{"store", "bucket", "key", strings.Repeat("v", 1025)},
-		{strings.Repeat("n", 257), "bucket", "key", ""},
-		{"store\u00a0", "bucket", "key", ""},
-		{"store\x00", "bucket", "key", ""},
-		{"store", ".", "key", ""},
-		{"store", "..", "key", ""},
-		{"store", strings.Repeat("b", 256), "key", ""},
-		{"store", "buckét", "key", ""},
+	for _, fields := range [][3]string{
+		{"", "key", ""},
+		{"with space", "key", ""},
+		{"bucket\n", "key", ""},
+		{"\xff", "key", ""},
+		{"https://evil", "key", ""},
+		{"../bucket", "key", ""},
+		{"bucket", "", ""},
+		{"bucket", strings.Repeat("k", 1025), ""},
+		{"bucket", "\xff", ""},
+		{"bucket", "key", "\xff"},
+		{"bucket", "key", strings.Repeat("v", 1025)},
+		{"bucket\u00a0", "key", ""},
+		{"bucket\x00", "key", ""},
+		{".", "key", ""},
+		{"..", "key", ""},
+		{strings.Repeat("b", 256), "key", ""},
+		{"buckét", "key", ""},
 	} {
-		if _, err := NewRequest(fields[0], fields[1], fields[2], fields[3]); err == nil {
+		if _, err := NewRequest(fields[0], fields[1], fields[2]); err == nil {
 			t.Fatalf("accepted invalid fields %q", fields)
 		}
 	}
 
 	for _, key := range []string{"/", ".", "../", "a//b", "a\x00b", "line\nbreak", strings.Repeat("k", 1024)} {
-		if _, err := NewRequest("store", "bucket", key, "null"); err != nil {
+		if _, err := NewRequest("bucket", key, "null"); err != nil {
 			t.Fatalf("rejected exact key %q: %v", key, err)
 		}
 	}
 
-	for _, fields := range [][4]string{
-		{strings.Repeat("n", 256), strings.Repeat("b", 255), strings.Repeat("k", 1024), strings.Repeat("v", 1024)},
-		{"雪", "Legacy_Bucket-9.example", "key", "v\x00\n雪"},
+	for _, fields := range [][3]string{
+		{strings.Repeat("b", 255), strings.Repeat("k", 1024), strings.Repeat("v", 1024)},
+		{"Legacy_Bucket-9.example", "key", "v\x00\n雪"},
 	} {
-		if _, err := NewRequest(fields[0], fields[1], fields[2], fields[3]); err != nil {
+		if _, err := NewRequest(fields[0], fields[1], fields[2]); err != nil {
 			t.Fatalf("rejected valid boundary fields %q: %v", fields, err)
 		}
 	}
 
 	// Both strings fit the object limits, but escaping exceeds the SDK field cap.
-	_, err := NewRequest("store", "bucket", strings.Repeat("\x00", 1024), strings.Repeat("\x00", 1024))
+	_, err := NewRequest("bucket", strings.Repeat("\x00", 1024), strings.Repeat("\x00", 1024))
 	originAssertError(t, err, racersdk.ErrInvalidRequest)
 }
 
@@ -165,7 +162,7 @@ func testS3Client(server *httptest.Server) *s3.Client {
 func objectRequest(t *testing.T, version string) racersdk.Request {
 	t.Helper()
 
-	request, err := NewRequest("store", "bucket", "a/../exact%2F +雪", version)
+	request, err := NewRequest("bucket", "a/../exact%2F +雪", version)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +236,7 @@ func TestOriginBridgeHeadBootstrapPinnedAndEmpty(t *testing.T) {
 
 				return out, nil
 			}
-			client := originClient(t, stub, OriginConfig{Namespace: "store", MetadataTTL: 30 * time.Second})
+			client := originClient(t, stub, OriginConfig{Bucket: "bucket", MetadataTTL: 30 * time.Second})
 			request := objectRequest(t, version)
 			before := time.Now()
 
@@ -267,7 +264,7 @@ func TestOriginBridgeHeadBootstrapPinnedAndEmpty(t *testing.T) {
 
 				return originPage(io.NopCloser(strings.NewReader(data)), 0, int64(len(data))-1, int64(len(data))), nil
 			}
-			client := originClient(t, stub, OriginConfig{Namespace: "store"})
+			client := originClient(t, stub, OriginConfig{Bucket: "bucket"})
 
 			got, err := originReadValue(t, client, objectRequest(t, ""))
 			if err != nil || string(got) != data {
@@ -290,27 +287,27 @@ func TestOriginStrictIdentityBridge(t *testing.T) {
 		"case":      strings.Replace(canonical, "schema", "Schema", 1), "whitespace": strings.Replace(canonical, `"schema":1`, `"schema": 1`, 1),
 		"schema":   strings.Replace(canonical, `"schema":1`, `"schema":2`, 1),
 		"trailing": canonical + "{}", "empty-version": strings.TrimSuffix(canonical, "}") + `,"versionId":""}`,
-		"escaped": strings.Replace(canonical, "store", `\u0073tore`, 1),
+		"escaped": strings.Replace(canonical, `"bucket":"bucket"`, `"bucket":"\u0062ucket"`, 1),
 	} {
 		t.Run(name, func(t *testing.T) {
 			stub := &originS3Stub{head: func(context.Context, *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
 				t.Error("invalid identity reached S3")
 				return nil, nil
 			}}
-			client := originClient(t, stub, OriginConfig{Namespace: "store"})
+			client := originClient(t, stub, OriginConfig{Bucket: "bucket"})
 
 			_, err := client.Stat(t.Context(), racersdk.Request{Key: sha256.Sum256([]byte(raw)), Metadata: raw})
 			originAssertError(t, err, racersdk.ErrInvalidRequest)
 		})
 	}
 
-	for _, mode := range []string{"key", "namespace", "bucket"} {
+	for _, mode := range []string{"key", "bucket", "valid-other-bucket"} {
 		t.Run(mode, func(t *testing.T) {
 			stub := &originS3Stub{head: func(context.Context, *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
 				t.Error("forbidden request reached S3")
 				return nil, nil
 			}}
-			config := OriginConfig{Namespace: "store"}
+			config := OriginConfig{Bucket: "bucket"}
 			request := objectRequest(t, "")
 			want := racersdk.ErrForbidden
 
@@ -318,10 +315,15 @@ func TestOriginStrictIdentityBridge(t *testing.T) {
 			case "key":
 				request.Key[0] ^= 1
 				want = racersdk.ErrInvalidRequest
-			case "namespace":
-				config.Namespace = "other"
 			case "bucket":
-				config.Buckets = []string{"other"}
+				config.Bucket = "other"
+			case "valid-other-bucket":
+				var err error
+
+				request, err = NewRequest("other", "key", "")
+				if err != nil {
+					t.Fatal(err)
+				}
 			}
 
 			client := originClient(t, stub, config)
@@ -332,13 +334,13 @@ func TestOriginStrictIdentityBridge(t *testing.T) {
 }
 
 func TestOriginConfigValidation(t *testing.T) {
-	for _, config := range []OriginConfig{{}, {Namespace: "bad space"}, {Namespace: "store", MetadataTTL: -1}, {Namespace: "store", Buckets: []string{""}}, {Namespace: "store", Buckets: []string{"https://evil"}}} {
+	for _, config := range []OriginConfig{{}, {Bucket: "bad space"}, {Bucket: "bucket", MetadataTTL: -1}, {Bucket: ".."}, {Bucket: "https://evil"}} {
 		_, err := NewOrigin(&originS3Stub{}, config)
 		originAssertError(t, err, racersdk.ErrInvalidRequest)
 	}
 
 	for _, client := range []S3Client{nil, (*originS3Stub)(nil)} {
-		_, err := NewOrigin(client, OriginConfig{Namespace: "store"})
+		_, err := NewOrigin(client, OriginConfig{Bucket: "bucket"})
 		originAssertError(t, err, racersdk.ErrInvalidRequest)
 	}
 }
@@ -370,7 +372,7 @@ func TestOriginInvalidHeadMetadata(t *testing.T) {
 
 				return head, nil
 			}}
-			client := originClient(t, stub, OriginConfig{Namespace: "store"})
+			client := originClient(t, stub, OriginConfig{Bucket: "bucket"})
 
 			version := ""
 			if mode == "version" {
@@ -435,7 +437,7 @@ func TestOriginRejectsGetMetadataAndClosesBodies(t *testing.T) {
 
 				return out, nil
 			}
-			client := originClient(t, stub, OriginConfig{Namespace: "store"})
+			client := originClient(t, stub, OriginConfig{Bucket: "bucket"})
 
 			got, err := originReadValue(t, client, objectRequest(t, ""))
 			if mode == "short" || mode == "long" {
@@ -694,7 +696,7 @@ func TestOriginAWSClientBridge(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	client := originClient(t, testS3Client(server), OriginConfig{Namespace: "store", Buckets: []string{"bucket"}})
+	client := originClient(t, testS3Client(server), OriginConfig{Bucket: "bucket"})
 
 	got, err := originReadValue(t, client, objectRequest(t, "v+/="))
 	if err != nil || string(got) != "hello" || heads.Load() != 1 || gets.Load() != 1 {
@@ -739,7 +741,7 @@ func TestOriginPinnedHeadAndRaceFailures(t *testing.T) {
 					return nil, &smithy.GenericAPIError{Code: "PreconditionFailed"}
 				}
 			}
-			client := originClient(t, stub, OriginConfig{Namespace: "store"})
+			client := originClient(t, stub, OriginConfig{Bucket: "bucket"})
 
 			_, err := originReadValue(t, client, objectRequest(t, ""), racersdk.ReadOptions{ETag: `"opaque-multipart-2"`})
 
@@ -773,7 +775,7 @@ func TestOriginUpstreamErrorsBridge(t *testing.T) {
 			stub := &originS3Stub{head: func(context.Context, *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
 				return nil, &smithy.GenericAPIError{Code: tt.code, Message: "private"}
 			}}
-			client := originClient(t, stub, OriginConfig{Namespace: "store"})
+			client := originClient(t, stub, OriginConfig{Bucket: "bucket"})
 			_, err := client.Stat(t.Context(), objectRequest(t, ""))
 			originAssertError(t, err, tt.want)
 		})
@@ -810,9 +812,7 @@ func TestOriginMultipageAndCopiedAllowlist(t *testing.T) {
 
 		return originPage(io.NopCloser(strings.NewReader("end")), int64(racersdk.PageSize), size-1, size), nil
 	}
-	buckets := []string{"bucket"}
-	client := originClient(t, stub, OriginConfig{Namespace: "store", Buckets: buckets})
-	buckets[0] = "changed"
+	client := originClient(t, stub, OriginConfig{Bucket: "bucket"})
 
 	value, err := client.Get(t.Context(), objectRequest(t, ""))
 	if err != nil {
@@ -870,7 +870,7 @@ func TestOriginBodyCancellationBridge(t *testing.T) {
 			return originPage(body, 0, 4, 5), nil
 		},
 	}
-	client := originClient(t, stub, OriginConfig{Namespace: "store"})
+	client := originClient(t, stub, OriginConfig{Bucket: "bucket"})
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -914,7 +914,7 @@ func TestOriginHeadCancellationBridge(t *testing.T) {
 
 		return nil, ctx.Err()
 	}}
-	client := originClient(t, stub, OriginConfig{Namespace: "store"})
+	client := originClient(t, stub, OriginConfig{Bucket: "bucket"})
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -968,7 +968,7 @@ func TestOriginRangeResolvedAgainstPinnedHead(t *testing.T) {
 			return nil, nil
 		},
 	}
-	client := originClient(t, stub, OriginConfig{Namespace: "store"})
+	client := originClient(t, stub, OriginConfig{Bucket: "bucket"})
 	_, err := originReadValue(t, client, objectRequest(t, ""), racersdk.ReadOptions{Offset: racersdk.PageSize, Length: 3})
 	// The origin returns 416 with the new size. The SDK rejects that size because
 	// it differs from the selected snapshot for the same ETag.
@@ -1001,7 +1001,7 @@ func TestOriginContentEncoding(t *testing.T) {
 						return output, nil
 					},
 				}
-				client := originClient(t, stub, OriginConfig{Namespace: "store"})
+				client := originClient(t, stub, OriginConfig{Bucket: "bucket"})
 				request := objectRequest(t, "")
 
 				var (
@@ -1052,7 +1052,7 @@ func sidecarTestHandler(t *testing.T, origin racersdk.Origin) (http.Handler, *ra
 
 	client := testSDKClient(t, origin)
 
-	h, err := NewSidecar(client, SidecarConfig{Namespace: "test", Buckets: []string{"bucket"}})
+	h, err := NewSidecar(client, SidecarConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1243,7 +1243,6 @@ func TestSidecarRejectedRequests(t *testing.T) {
 		{"GET", "/bucket", nil, 400},
 		{"GET", "/bucket/", nil, 400},
 		{"GET", "/bucket%2Fkey", nil, 400},
-		{"GET", "/other/key", nil, 403},
 		{"GET", "/bucket/key?list-type=2", nil, 501},
 		{"GET", "/bucket/key?acl", nil, 400},
 		{"GET", "/bucket/key?partNumber=1", nil, 501},
@@ -1378,7 +1377,7 @@ func TestSidecarRangeInt64Bounds(t *testing.T) {
 func TestSidecarExactIdentity(t *testing.T) {
 	for _, key := range []string{"a//b/../c", "/leading", "./relative", "a%2Fb", "a+b c", "雪/☃", "trailing/", "a?b#c"} {
 		t.Run(key, func(t *testing.T) {
-			want, err := NewRequest("test", "bucket", key, "version+/%")
+			want, err := NewRequest("bucket", key, "version+/%")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1556,17 +1555,17 @@ func TestSidecarLateFailureAborts(t *testing.T) {
 }
 
 func TestSidecarAWSClient(t *testing.T) {
-	getRequest, err := NewRequest("test", "bucket", "a//b/../c", "")
+	getRequest, err := NewRequest("bucket", "a//b/../c", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	headRequest, err := NewRequest("test", "bucket", "key", "")
+	headRequest, err := NewRequest("bucket", "key", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	missingRequest, err := NewRequest("test", "bucket", "missing", "")
+	missingRequest, err := NewRequest("bucket", "missing", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1635,15 +1634,14 @@ func TestSidecarConfigAndClosedClient(t *testing.T) {
 		config  SidecarConfig
 		message string
 	}{
-		{SidecarConfig{}, "racer-object: invalid sidecar namespace"},
-		{SidecarConfig{Namespace: "test", Buckets: []string{""}}, "racer-object: invalid sidecar bucket"},
+		{SidecarConfig{API: "gcs"}, "racer-object: invalid sidecar API"},
 	} {
 		if _, err := NewSidecar(client, tc.config); err == nil || err.Error() != tc.message {
 			t.Fatalf("invalid config error: %v, want %q", err, tc.message)
 		}
 	}
 
-	if _, err := NewSidecar(nil, SidecarConfig{Namespace: "test"}); err == nil || err.Error() != "racer-object: missing sidecar client" {
+	if _, err := NewSidecar(nil, SidecarConfig{}); err == nil || err.Error() != "racer-object: missing sidecar client" {
 		t.Fatalf("nil client error: %v", err)
 	}
 
@@ -1724,30 +1722,71 @@ func TestSidecarCancellation(t *testing.T) {
 	}
 }
 
-func TestSidecarAllowlistSnapshot(t *testing.T) {
-	_, client := sidecarTestHandler(t, sidecarTestOrigin(t, "data", `"v"`, nil))
-	config := SidecarConfig{Namespace: "test", Buckets: []string{"bucket"}}
+func TestSidecarForwardsAnyBucket(t *testing.T) {
+	var calls atomic.Int32
 
-	h, err := NewSidecar(client, config)
+	origin := sidecarTestOrigin(t, "data", `"v"`, &calls)
+
+	for _, bucket := range []string{"bucket", "other", "Legacy_Bucket-9.example"} {
+		want, err := NewRequest(bucket, "key", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		h, _ := sidecarTestHandler(t, func(ctx context.Context, r racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+			if r.Request != want {
+				t.Errorf("bucket %q: identity changed", bucket)
+			}
+
+			return origin(ctx, r)
+		})
+
+		if w := sidecarTestRequest(h, "HEAD", "/"+bucket+"/key", nil); w.Code != 200 {
+			t.Fatalf("bucket %q rejected: %d", bucket, w.Code)
+		}
+	}
+
+	h, _ := sidecarTestHandler(t, origin)
+	before := calls.Load()
+
+	for _, target := range []string{"/../key", "/a%2Fb/key", "/a%20b/key"} {
+		if w := sidecarTestRequest(h, "HEAD", target, nil); w.Code != 400 {
+			t.Fatalf("invalid bucket %q: %d", target, w.Code)
+		}
+	}
+
+	if calls.Load() != before {
+		t.Fatal("invalid bucket reached origin")
+	}
+}
+
+func TestSidecarOriginEnforcesBucket(t *testing.T) {
+	var heads atomic.Int32
+
+	stub := &originS3Stub{head: func(_ context.Context, in *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
+		heads.Add(1)
+
+		if aws.ToString(in.Bucket) != "bucket" {
+			t.Errorf("origin read bucket %q", aws.ToString(in.Bucket))
+		}
+
+		return nil, errors.New("stop")
+	}}
+
+	h, err := NewSidecar(originClient(t, stub, OriginConfig{Bucket: "bucket"}), SidecarConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	config.Buckets[0] = "other"
-
-	w := sidecarTestRequest(h, "HEAD", "/bucket/key", nil)
-	if w.Code != 200 {
-		t.Fatal("caller mutation changed allowlist")
+	for _, method := range []string{"GET", "HEAD"} {
+		w := sidecarTestRequest(h, method, "/other/key", nil)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("%s other bucket: %d", method, w.Code)
+		}
 	}
 
-	h, err = NewSidecar(client, SidecarConfig{Namespace: "test"})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	w = sidecarTestRequest(h, "HEAD", "/other/key", nil)
-	if w.Code != 200 {
-		t.Fatal("empty allowlist rejected bucket")
+	if heads.Load() != 0 {
+		t.Fatal("forbidden bucket reached S3")
 	}
 }
 
@@ -1896,7 +1935,7 @@ func TestSidecarPathFallbackAndDefaultHeaders(t *testing.T) {
 	origin := sidecarTestOrigin(t, "data", `"v"`, nil)
 
 	h, _ := sidecarTestHandler(t, func(ctx context.Context, r racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
-		want, err := NewRequest("test", "bucket", "a%zz", "")
+		want, err := NewRequest("bucket", "a%zz", "")
 		if err != nil || r.Key != want.Key {
 			t.Error("invalid RawPath changed identity")
 		}
@@ -1921,7 +1960,7 @@ func TestSidecarPathFallbackAndDefaultHeaders(t *testing.T) {
 func TestSidecarEmptyStreamClosedBeforeCompletion(t *testing.T) {
 	_, client := sidecarTestHandler(t, sidecarTestOrigin(t, "", `"empty"`, nil))
 
-	request, err := NewRequest("test", "bucket", "key", "")
+	request, err := NewRequest("bucket", "key", "")
 	if err != nil {
 		t.Fatal(err)
 	}

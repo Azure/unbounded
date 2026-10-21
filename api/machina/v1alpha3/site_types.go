@@ -67,10 +67,10 @@ type SiteSpec struct {
 	// CNI config is written and all same-site nodes are tunnel peers.
 	// When false, only tunnel links to gateway pools for other sites are created,
 	// allowing an external CNI plugin to manage intra-site networking.
-	// Pod CIDR assignment is also disabled when manageCniPlugin is false,
-	// regardless of the assignmentEnabled setting on individual podCidrAssignments
-	// rules. The podCidrAssignments are still required to define the CIDR ranges
-	// used for inter-site routing.
+	// Omitted assignmentEnabled values on podCidrAssignments default to this
+	// setting. Explicit assignmentEnabled values override that default.
+	// The podCidrAssignments are still required to define the CIDR ranges
+	// used for inter-site routing, even when assignment is disabled.
 	// +optional
 	ManageCniPlugin *bool `json:"manageCniPlugin,omitempty"`
 
@@ -105,6 +105,16 @@ type SiteSpec struct {
 	// Components declares optional Unbounded components managed for this site.
 	// +optional
 	Components SiteComponents `json:"components,omitempty"`
+}
+
+// PodCIDRAssignmentEnabled resolves an assignment's explicit setting or the
+// site's CNI management default without persisting an inherited value.
+func (s SiteSpec) PodCIDRAssignmentEnabled(assignment unboundednetv1alpha1.PodCidrAssignment) bool {
+	if assignment.AssignmentEnabled != nil {
+		return *assignment.AssignmentEnabled
+	}
+
+	return s.ManageCniPlugin == nil || *s.ManageCniPlugin
 }
 
 // SiteComponents declares optional components managed by the unbounded operator.

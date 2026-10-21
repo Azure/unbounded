@@ -365,15 +365,16 @@ func TestDecodeSiteFromRequest(t *testing.T) {
 
 // TestAssignmentEnabledAndIPFamily tests assignment enabled and ipfamily.
 func TestAssignmentEnabledAndIPFamily(t *testing.T) {
-	if !assignmentEnabled(nil) {
+	spec := unboundedv1alpha3.SiteSpec{}
+	if !spec.PodCIDRAssignmentEnabled(unboundednetv1alpha1.PodCidrAssignment{}) {
 		t.Fatalf("expected nil assignmentEnabled to default true")
 	}
 
-	if assignmentEnabled(boolPtr(false)) {
+	if spec.PodCIDRAssignmentEnabled(unboundednetv1alpha1.PodCidrAssignment{AssignmentEnabled: new(false)}) {
 		t.Fatalf("expected explicit false assignmentEnabled")
 	}
 
-	if !assignmentEnabled(boolPtr(true)) {
+	if !spec.PodCIDRAssignmentEnabled(unboundednetv1alpha1.PodCidrAssignment{AssignmentEnabled: new(true)}) {
 		t.Fatalf("expected explicit true assignmentEnabled")
 	}
 
@@ -382,6 +383,80 @@ func TestAssignmentEnabledAndIPFamily(t *testing.T) {
 	_, v6, _ := net.ParseCIDR("fd00::/64")
 	if ipFamily(v4) != "ipv4" || ipFamily(v6) != "ipv6" {
 		t.Fatalf("unexpected ip families: %s %s", ipFamily(v4), ipFamily(v6))
+	}
+}
+
+func TestUnmanagedAssignmentValidation(t *testing.T) {
+	site := unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "site-a"},
+		Spec: unboundedv1alpha3.SiteSpec{
+			ManageCniPlugin: new(false),
+			NodeCidrs:       []string{"10.0.0.0/16"},
+			PodCidrAssignments: []unboundednetv1alpha1.PodCidrAssignment{{
+				CidrBlocks: []string{"10.244.0.0/16"},
+				NodeRegex:  []string{"("},
+			}},
+		},
+	}
+	if err := validateSiteSpec(site); err != nil {
+		t.Fatalf("inherited disabled assignment validated allocation settings: %v", err)
+	}
+
+	entries, err := collectPodCIDRs([]unboundedv1alpha3.Site{site})
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("unmanaged Site's declared pod networks missing from overlap checks: %v, %v", entries, err)
+	}
+
+	site.Spec.PodCidrAssignments[0].AssignmentEnabled = new(true)
+	if err := validateSiteSpec(site); err == nil || !strings.Contains(err.Error(), "nodeRegex") {
+		t.Fatalf("explicit enabled assignment skipped regex validation: %v", err)
+	}
+
+	entries, err = collectPodCIDRs([]unboundedv1alpha3.Site{site})
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("explicit enabled assignment missing from overlap checks: %v, %v", entries, err)
+	}
+
+	site.Spec.PodCidrAssignments[0].AssignmentEnabled = new(false)
+	if err := validateSiteSpec(site); err != nil {
+		t.Fatalf("explicit disabled assignment validated allocation settings: %v", err)
+	}
+}
+
+func TestManagedAndUnmanagedPodCIDRsCannotOverlap(t *testing.T) {
+	for _, cidrs := range [][]string{
+		{"10.244.0.0/16", "10.244.1.0/24", "10.245.0.0/16"},
+		{"fd00:244::/48", "fd00:244:0:1::/64", "fd00:245::/48"},
+	} {
+		t.Run(cidrs[0], func(t *testing.T) {
+			sites := []unboundedv1alpha3.Site{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "external"},
+					Spec: unboundedv1alpha3.SiteSpec{
+						ManageCniPlugin: new(false),
+						PodCidrAssignments: []unboundednetv1alpha1.PodCidrAssignment{{
+							CidrBlocks: []string{cidrs[0]},
+						}},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "managed"},
+					Spec: unboundedv1alpha3.SiteSpec{
+						PodCidrAssignments: []unboundednetv1alpha1.PodCidrAssignment{{
+							CidrBlocks: []string{cidrs[1]},
+						}},
+					},
+				},
+			}
+			if err := validatePodCIDRsNoOverlap(sites); err == nil || !strings.Contains(err.Error(), "overlapping podCIDR") {
+				t.Fatalf("managed/unmanaged overlap was not rejected: %v", err)
+			}
+
+			sites[1].Spec.PodCidrAssignments[0].CidrBlocks = []string{cidrs[2]}
+			if err := validatePodCIDRsNoOverlap(sites); err != nil {
+				t.Fatalf("disjoint managed/unmanaged networks rejected: %v", err)
+			}
+		})
 	}
 }
 

@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/vishvananda/netlink"
 )
 
 // TestDetectCIDRFamilies tests DetectCIDRFamilies.
@@ -45,6 +47,11 @@ func TestForwardPolicyIsDrop(t *testing.T) {
 func TestCollectNodeConfigValidationErrors(t *testing.T) {
 	deps := nodeConfigValidatorDeps{
 		readFile: func(path string) ([]byte, error) {
+			switch path {
+			case "/proc/sys/net/ipv4/neigh/default/gc_thresh3", "/proc/sys/net/ipv6/neigh/default/gc_thresh3":
+				return []byte("1024\n"), nil
+			}
+
 			values := map[string]string{
 				"/proc/sys/net/ipv4/ip_forward":           "0\n",
 				"/proc/sys/net/ipv6/conf/all/forwarding":  "0\n",
@@ -64,6 +71,8 @@ func TestCollectNodeConfigValidationErrors(t *testing.T) {
 
 			return nil, errors.New("not found")
 		},
+		neighList:   func(int, int) ([]netlink.Neigh, error) { return nil, nil },
+		linkByIndex: netlink.LinkByIndex,
 		glob: func(pattern string) ([]string, error) {
 			return []string{
 				"/proc/sys/net/ipv4/conf/all/rp_filter",
@@ -116,11 +125,15 @@ func TestCollectNodeConfigValidationErrors_NoIPv6CIDRSkipsIPv6Forwarding(t *test
 				return []byte("1\n"), nil
 			case "/proc/sys/net/ipv6/conf/all/forwarding":
 				return []byte("0\n"), nil
+			case "/proc/sys/net/ipv4/neigh/default/gc_thresh3", "/proc/sys/net/ipv6/neigh/default/gc_thresh3":
+				return []byte("1024\n"), nil
 			default:
 				return []byte("0\n"), nil
 			}
 		},
-		glob: func(pattern string) ([]string, error) { return nil, nil },
+		neighList:   func(int, int) ([]netlink.Neigh, error) { return nil, nil },
+		linkByIndex: netlink.LinkByIndex,
+		glob:        func(pattern string) ([]string, error) { return nil, nil },
 		runForwardPolicy: func(binary string) (string, error) {
 			return "-P FORWARD ACCEPT\n", nil
 		},
