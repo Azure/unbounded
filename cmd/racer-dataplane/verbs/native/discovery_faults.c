@@ -112,3 +112,28 @@ static void *test_calloc(size_t count, size_t size) {
 #define ibv_dealloc_pd test_dealloc_pd
 #define calloc test_calloc
 #include "verbs.c"
+
+/* Post one bind through a fake QP and return its send flags, or UINT_MAX if
+ * the post failed or was not a bind. */
+static unsigned posted_opcode, posted_flags;
+
+static int test_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_send_wr **bad) {
+    (void)qp; (void)bad;
+    posted_opcode = wr->opcode; posted_flags = wr->send_flags;
+    return 0;
+}
+
+unsigned rdma_test_bind_flags(void) {
+    static struct ibv_context context;
+    static struct ibv_qp qp;
+    struct ibv_mr mr = {0};
+    struct ibv_mw mw = {0};
+    context.ops.post_send = test_post_send;
+    qp.context = &context;
+    struct rdma_verbs_qp q = { .qp = &qp };
+    struct rdma_verbs_mr m = { .mr = &mr, .bytes = (void *)4096, .length = 8192 };
+    posted_opcode = UINT_MAX;
+    if (rdma_verbs_bind(&q, &mw, &m, 1, 2, 0, 4096) || posted_opcode != IBV_WR_BIND_MW)
+        return UINT_MAX;
+    return posted_flags;
+}

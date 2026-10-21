@@ -415,6 +415,12 @@ then posts `LOCAL_INV` with `IBV_SEND_FENCE | IBV_SEND_SIGNALED`. Only its
 successful CQE moves the buffer to `Owned`. A late write using the old rkey
 then fails with a remote access error, which breaks the link on both sides.
 
+`BIND_MW` is also posted with `IBV_SEND_FENCE`. On mlx5, a bind queued behind
+a zero-copy write whose implicit ODP source page faults can otherwise complete
+with `IBV_WC_MW_BIND_ERR` (vendor error `0x78`), which breaks every link that
+both writes zero-copy and grants. The fence makes a bind wait for earlier work
+on its QP.
+
 **Fence on every other path.** Cancel, deadline, any error CQE, any
 unexpected opcode, wr id, tag, or byte length, decode failure, credit
 violation, or owner shutdown breaks the link: modify to ERR, destroy the QP,

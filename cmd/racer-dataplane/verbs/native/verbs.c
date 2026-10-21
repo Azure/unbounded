@@ -293,12 +293,17 @@ int rdma_verbs_window_free(struct ibv_mw *mw) { return ibv_dealloc_mw(mw); }
 static int in_region(const struct rdma_verbs_mr *m, uint64_t offset, uint32_t length) {
     return length && offset <= m->length && length <= m->length - offset;
 }
-/* Post a bind: let the peer write `length` bytes of `m` at `offset` via `key`. */
+/* Post a bind: let the peer write `length` bytes of `m` at `offset` via `key`.
+ * IBV_SEND_FENCE holds the bind until earlier work on the QP completes. On
+ * mlx5, a bind posted behind an RDMA write whose implicit ODP source page
+ * faults can fail with IBV_WC_MW_BIND_ERR (vendor_err 0x78) and break the
+ * link; this happens when a link both writes zero-copy and grants. */
 int rdma_verbs_bind(struct rdma_verbs_qp *q, struct ibv_mw *mw, struct rdma_verbs_mr *m,
                     uint32_t key, uint64_t id, uint64_t offset, uint32_t length) {
     if (!in_region(m, offset, length)) return EINVAL;
     struct ibv_send_wr wr = {0}, *bad = NULL;
-    wr.wr_id = id; wr.opcode = IBV_WR_BIND_MW; wr.send_flags = IBV_SEND_SIGNALED;
+    wr.wr_id = id; wr.opcode = IBV_WR_BIND_MW;
+    wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_FENCE;
     wr.bind_mw.mw = mw; wr.bind_mw.rkey = key;
     wr.bind_mw.bind_info.mr = m->mr;
     wr.bind_mw.bind_info.addr = (uintptr_t)m->bytes + offset;
@@ -310,7 +315,7 @@ int rdma_verbs_bind(struct rdma_verbs_qp *q, struct ibv_mw *mw, struct rdma_verb
 int rdma_verbs_invalidate(struct rdma_verbs_qp *q, uint32_t key, uint64_t id) {
     struct ibv_send_wr wr = {0}, *bad = NULL;
     wr.wr_id = id; wr.opcode = IBV_WR_LOCAL_INV;
-    wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_FENCE; wr.invalidate_rkey = key;
+    wr.send_flags = IBV_SEND_SIGNALED; wr.invalidate_rkey = key;
     return ibv_post_send(q->qp, &wr, &bad);
 }
 /* Post an RDMA write of the first `length` bytes of `m` to the peer's
