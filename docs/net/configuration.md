@@ -100,6 +100,9 @@ controller:
 node:
   cniConfDir: /host/etc/cni/net.d
   cniConfFile: 10-unbounded.conflist
+  ipamSocketPath: /run/unbounded-net/ipam.sock
+  installIPAMPlugin: true
+  ipamBinDir: /host/opt/cni/bin
   bridgeName: cbr0
   wireGuardDir: /host/etc/wireguard
   wireGuardPort: 51820
@@ -293,6 +296,9 @@ graph TD
 |------|------|---------|-------------|
 | `--cni-conf-dir` | string | `/etc/cni/net.d` | Directory to write CNI configuration. |
 | `--cni-conf-file` | string | `10-unbounded.conflist` | Name of the CNI configuration file. |
+| `--ipam-socket-path` | string | `/run/unbounded-net/ipam.sock` | Host-shared Unix socket used by the IPAM plugin. |
+| `--install-ipam-plugin` | bool | `true` | Atomically install or upgrade the bundled IPAM binary on agent startup. |
+| `--ipam-bin-dir` | string | `/host/opt/cni/bin` | Host-mounted binary installation directory, as seen by the agent. |
 | `--bridge-name` | string | `cbr0` | Name of the bridge interface. |
 | `--mtu` | int | `0` | Optional maximum MTU for tunnel and bridge interfaces. With `0`, the node agent derives each route's MTU from the selected underlay route and encapsulation overhead. Positive values cap the automatically detected and CRD-configured MTU. |
 
@@ -628,11 +634,7 @@ The node agent generates a CNI configuration file with the following structure:
       "hairpinMode": true,
       "mtu": 1500,
       "ipam": {
-        "type": "host-local",
-        "ranges": [
-          [{"subnet": "100.64.0.0/24"}],
-          [{"subnet": "fdde::100/80"}]
-        ]
+        "type": "unbounded-ipam"
       }
     },
     {
@@ -647,6 +649,102 @@ The node agent generates a CNI configuration file with the following structure:
   ]
 }
 ```
+
+### Verified IPAM allocation
+
+`unbounded-ipam` is a Go CNI IPAM plugin that embeds the upstream host-local
+allocator and disk store. It takes standard CNI JSON on stdin and returns a
+standard CNI JSON result on stdout. It does not create interfaces or program
+routes. The default managed conflist carries no PodCIDRs or plugin arguments.
+
+On ADD, the plugin requests `GetIPAMConfig` over
+`/run/unbounded-net/ipam.sock`. This is a length-delimited protobuf exchange,
+not HTTP or gRPC, and is not exposed on the agent's TCP status endpoint.
+The agent obtains the Node's nonempty PodCIDRs from Kubernetes during startup
+and keeps the successful assignment only in memory. Managed sites also require
+successful bridge inspection and CNI publication. Missing or unverified
+assignments, a blocked managed bridge, an unavailable socket, and malformed or
+timed-out replies cause ADD to fail without allocating an address. The runtime
+can retry pod sandbox creation. No disk-cached CIDR or direct host-local fallback
+is used. The exchange uses protocol version 1, a 64 KiB serialized-message
+limit, and a five-second deadline.
+
+The plugin then uses the verified ranges with host-local's normal IPv4/IPv6
+allocation and locking. The calling CNI's network name remains the allocation
+namespace; reservations remain compatible with host-local under
+`/var/lib/cni/networks/<network-name>`. Requested IPs must belong to verified
+ranges. Caller-supplied IPAM allocation settings and `runtimeConfig.ipRanges`
+are rejected so they cannot bypass verification.
+
+DEL releases the attachment's local reservations without contacting the agent
+or needing the old CIDRs, including legacy host-local reservations. CHECK
+checks local reservations, and VERSION reports supported CNI versions; both
+also work without the agent. DEL is safe to repeat.
+
+The ConfigMap's `node.installIPAMPlugin` controls installation independently
+of `Site.spec.manageCniPlugin`. Set it to false to use a preinstalled binary.
+The agent still serves IPAM and generated conflists still use `unbounded-ipam`.
+The default DaemonSet mounts the host's `/opt/cni/bin` at `/host/opt/cni/bin`
+for installation and shares `/run/unbounded-net` with the host for the socket.
+The socket is root-accessible only.
+
+Set `node.ipamSocketPath` and, for a third-party CNI, the matching optional
+`ipam.socketPath` to use a nondefault socket. Managed conflists include that
+option automatically when needed:
+
+```json
+{
+  "ipam": {
+    "type": "unbounded-ipam",
+    "socketPath": "/run/unbounded-net/custom.sock"
+  }
+}
+```
+
+Custom socket directories and `node.ipamBinDir` require matching writable host
+mounts through workload overrides. The installation directory must also be in
+the runtime's CNI binary search path. The socket directory must be owned by the
+agent user and must not be writable by other users. The agent requires an
+existing installation directory rather than creating a container-local binary
+directory. Ensure that directory is actually backed by the host mount.
+
+The agent retains a `<socketPath>.lock` file beside the socket. An exclusive
+lock protects stale-socket recovery and shutdown cleanup across processes.
+The file remains after shutdown; do not remove it while an agent is running.
+
+For a third-party CNI, set `manageCniPlugin: false` on the Site and delegate
+IPAM to `unbounded-ipam`. Set `assignmentEnabled: true` on each desired
+`spec.podCidrAssignments` rule to have Unbounded allocate Node PodCIDRs, or use
+another controller that populates `Node.spec.podCIDRs`. With CNI management
+disabled, omitted assignment settings default to disabled. The agent obtains
+the startup assignment and serves IPAM without inspecting or changing that
+CNI's bridge or conflist. Nodes with no assignment remain unavailable for
+allocation without blocking their
+otherwise-unmanaged routing bootstrap. To retain direct host-local instead,
+provide your own conflist and set `manageCniPlugin: false`.
+
+Delegated IPAM does not provide inter-node routing. If the third-party CNI
+does not install those routes, set `node.manageSameSitePodRoutes: true` to
+have Unbounded manage same-site PodCIDR routes without managing the CNI
+configuration. The default remains false for unmanaged CNI sites. A Site
+with `tunnelProtocol: None` requires an underlay that routes unencapsulated
+PodCIDR traffic between peers. Otherwise, select an encapsulated transport.
+For delegated Cilium with Unbounded-managed routes, limit Cilium's managed
+devices to its underlay interface (for example, Helm `devices=eth0`), so it
+does not replace the TC programs on Unbounded's tunnel interfaces.
+
+**Migration:** The allocation gate only applies after the runtime loads a
+conflist that invokes `unbounded-ipam`. Install the binary, replace the active
+configuration, and verify your runtime has reloaded it; follow your runtime's
+reload/restart procedure when necessary. A cached legacy conflist invoking
+host-local directly still bypasses the gate. The agent does not restart the
+runtime or evict existing pods.
+
+**Scope:** Verification is performed at startup, not before each ADD. An agent
+restart requires verification again, but a temporary API outage after verified
+startup does not stop allocation. Deletion/recreation while the same agent
+process stays running is not detected by a long-term Node watch. The gate
+does not fence allocations already in progress or repair existing stale pods.
 
 ### Managed bridge PodCIDR safety
 
@@ -715,7 +813,10 @@ its CNI configuration, and another CNI configuration may still be active.
 Disabling this conflist does not terminate existing workloads, disable other
 CNIs, or guarantee that the runtime stops creating sandboxes. The guard is a
 pre-write snapshot check, not continuous monitoring or atomic coordination with
-concurrent sandbox creation.
+concurrent sandbox creation. The IPAM socket additionally blocks new
+`unbounded-ipam` ADD requests while the managed guard is blocked, even if the
+runtime has cached the new conflist. Cached legacy host-local configurations
+and other IPAM plugins are not protected by that gate.
 
 ### CNI Plugin Chain
 
@@ -723,7 +824,9 @@ concurrent sandbox creation.
 flowchart LR
     A[Container Created] --> B[bridge plugin]
     B -->|Create veth pair| C[Attach to cbr0]
-    C -->|Assign IP| D[host-local IPAM]
+    C -->|Assign IP| D[unbounded-ipam]
+    D -->|Verified ranges over Unix protobuf| I[Local node agent]
+    D -->|Embedded allocator| J[host-local allocator]
     D --> E[portmap plugin]
     E -->|Configure hostPort| F[iptables rules]
     F --> G[loopback plugin]

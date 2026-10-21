@@ -36,7 +36,7 @@ const azureTestTag = `"azure-version"`
 func azureTestRequest(t *testing.T, key, version string) racersdk.Request {
 	t.Helper()
 
-	request, err := NewRequest("azure-store", "container", key, version)
+	request, err := NewRequest("container", key, version)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +146,7 @@ func TestAzureOriginBridge(t *testing.T) {
 						t.Errorf("unexpected method %s", r.Method)
 					}
 				}, nil)
-				origin := azureTestOrigin(t, client, OriginConfig{Namespace: "azure-store", MetadataTTL: 30 * time.Second})
+				origin := azureTestOrigin(t, client, OriginConfig{Bucket: "container", MetadataTTL: 30 * time.Second})
 				sdk := racersdktest.NewClient(t, origin)
 				request := azureTestRequest(t, "a/../exact%2F +雪", version)
 				before := time.Now()
@@ -180,7 +180,7 @@ func TestAzureOriginExactKeys(t *testing.T) {
 
 				azureTestHeaders(w.Header(), 0, "v+/%&other=value")
 			}, nil)
-			origin := azureTestOrigin(t, client, OriginConfig{Namespace: "azure-store"})
+			origin := azureTestOrigin(t, client, OriginConfig{Bucket: "container"})
 
 			_, body, err := origin(t.Context(), racersdk.OriginRequest{Request: azureTestRequest(t, key, "v+/%&other=value"), Head: true})
 			if err != nil || body != nil {
@@ -192,36 +192,39 @@ func TestAzureOriginExactKeys(t *testing.T) {
 
 func TestAzureOriginConfigAndScope(t *testing.T) {
 	client := azureTestClient(t, func(w http.ResponseWriter, _ *http.Request) { azureTestHeaders(w.Header(), 0, "") }, nil)
-	for _, config := range []OriginConfig{{}, {Namespace: "bad space"}, {Namespace: "azure-store", MetadataTTL: -1}, {Namespace: "azure-store", Buckets: []string{""}}, {Namespace: "azure-store", Buckets: []string{"https://evil"}}} {
+	for _, config := range []OriginConfig{{}, {Bucket: "bad space"}, {Bucket: "container", MetadataTTL: -1}, {Bucket: ".."}, {Bucket: "https://evil"}} {
 		_, err := NewAzureOrigin(client, config)
 		azureAssertError(t, err, racersdk.ErrInvalidRequest)
 	}
 
-	_, err := NewAzureOrigin(nil, OriginConfig{Namespace: "azure-store"})
+	_, err := NewAzureOrigin(nil, OriginConfig{Bucket: "container"})
 	azureAssertError(t, err, racersdk.ErrInvalidRequest)
 
-	buckets := []string{"container"}
-	origin := azureTestOrigin(t, client, OriginConfig{Namespace: "azure-store", Buckets: buckets})
-	buckets[0] = "changed"
+	origin := azureTestOrigin(t, client, OriginConfig{Bucket: "container"})
 	request := azureTestRequest(t, "key", "")
 
 	m, _, err := origin(t.Context(), racersdk.OriginRequest{Request: request, Head: true})
 	if err != nil || m.ExpiresAt.After(time.Now()) || m.ExpiresAt.Before(time.Now().Add(-time.Second)) {
-		t.Fatal("allowlist was not copied or zero TTL changed", m, err)
+		t.Fatal("zero TTL changed", m, err)
 	}
 
-	for _, mode := range []string{"namespace", "container", "hash", "noncanonical"} {
+	for _, mode := range []string{"container", "request-container", "hash", "noncanonical"} {
 		t.Run(mode, func(t *testing.T) {
 			client := azureTestClient(t, func(http.ResponseWriter, *http.Request) { t.Error("invalid request reached Azure") }, nil)
-			config := OriginConfig{Namespace: "azure-store"}
+			config := OriginConfig{Bucket: "container"}
 			request := azureTestRequest(t, "key", "")
 			want := racersdk.ErrForbidden
 
 			switch mode {
-			case "namespace":
-				config.Namespace = "other"
 			case "container":
-				config.Buckets = []string{"other"}
+				config.Bucket = "other"
+			case "request-container":
+				other, err := NewRequest("other", "key", "")
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				request = other
 			case "hash":
 				request.Key[0] ^= 1
 				want = racersdk.ErrInvalidRequest
@@ -273,7 +276,7 @@ func TestAzureOriginHeadValidation(t *testing.T) {
 				w.Header().Set(tc.header, tc.value)
 				w.WriteHeader(http.StatusOK)
 			}, nil)
-			sdk := racersdktest.NewClient(t, azureTestOrigin(t, client, OriginConfig{Namespace: "azure-store"}))
+			sdk := racersdktest.NewClient(t, azureTestOrigin(t, client, OriginConfig{Bucket: "container"}))
 			_, err := sdk.Stat(t.Context(), azureTestRequest(t, "key", "requested"))
 			azureAssertError(t, err, errInvalidAzureResponse)
 		})
@@ -350,7 +353,7 @@ func TestAzureOriginPageValidationAndCleanup(t *testing.T) {
 					return response, err
 				})
 			})
-			sdk := racersdktest.NewClient(t, azureTestOrigin(t, client, OriginConfig{Namespace: "azure-store"}))
+			sdk := racersdktest.NewClient(t, azureTestOrigin(t, client, OriginConfig{Bucket: "container"}))
 			got, err := azureTestRead(t, sdk, azureTestRequest(t, "key", "version"))
 
 			want := errInvalidAzureResponse
@@ -418,7 +421,7 @@ func TestAzureOriginHeaderDecodeBodyCleanup(t *testing.T) {
 						return response, err
 					})
 				})
-				origin := azureTestOrigin(t, client, OriginConfig{Namespace: "azure-store"})
+				origin := azureTestOrigin(t, client, OriginConfig{Bucket: "container"})
 
 				request := azureTestRequest(t, "key", "")
 				if bridge {
@@ -523,7 +526,7 @@ func TestAzureOriginPageBounds(t *testing.T) {
 					w.WriteHeader(http.StatusPartialContent)
 				}
 			}, nil)
-			origin := azureTestOrigin(t, client, OriginConfig{Namespace: "azure-store"})
+			origin := azureTestOrigin(t, client, OriginConfig{Bucket: "container"})
 
 			_, body, err := origin(t.Context(), racersdk.OriginRequest{Request: azureTestRequest(t, "key", ""), Offset: tc.offset, Length: tc.length})
 			if err != nil || body == nil {
@@ -577,7 +580,7 @@ func TestAzureOriginPinsAndUpstreamErrors(t *testing.T) {
 
 						azureTestHeaders(w.Header(), 5, "")
 					}, nil)
-					origin := azureTestOrigin(t, client, OriginConfig{Namespace: "azure-store"})
+					origin := azureTestOrigin(t, client, OriginConfig{Bucket: "container"})
 					_, body, err := origin(t.Context(), racersdk.OriginRequest{Request: azureTestRequest(t, "key", ""), Length: racersdk.PageSize, ETag: pin})
 
 					want := tc.want
@@ -603,7 +606,7 @@ func TestAzureOriginPinsAndUpstreamErrors(t *testing.T) {
 
 			azureTestHeaders(w.Header(), 5, "")
 		}, nil)
-		origin := azureTestOrigin(t, client, OriginConfig{Namespace: "azure-store"})
+		origin := azureTestOrigin(t, client, OriginConfig{Bucket: "container"})
 		_, body, err := origin(t.Context(), racersdk.OriginRequest{Request: azureTestRequest(t, "key", ""), Length: racersdk.PageSize, ETag: `"old"`})
 		azureAssertError(t, err, racersdk.ErrVersionMismatch)
 
@@ -659,6 +662,7 @@ func TestAzureOriginCancellation(t *testing.T) {
 	for _, method := range []string{http.MethodHead, http.MethodGet} {
 		t.Run(method, func(t *testing.T) {
 			entered, canceled := make(chan struct{}), make(chan struct{})
+			bodyReady := make(chan struct{})
 
 			var closes atomic.Int32
 
@@ -683,12 +687,14 @@ func TestAzureOriginCancellation(t *testing.T) {
 					response, err := client.Do(r)
 					if err == nil && r.Method == http.MethodGet {
 						response.Body = &azureTestBody{ReadCloser: response.Body, closes: &closes}
+
+						close(bodyReady)
 					}
 
 					return response, err
 				})
 			})
-			sdk := racersdktest.NewClient(t, azureTestOrigin(t, client, OriginConfig{Namespace: "azure-store"}))
+			sdk := racersdktest.NewClient(t, azureTestOrigin(t, client, OriginConfig{Bucket: "container"}))
 
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
@@ -717,6 +723,14 @@ func TestAzureOriginCancellation(t *testing.T) {
 			case <-entered:
 			case <-time.After(5 * time.Second):
 				t.Fatal("request did not start")
+			}
+
+			if method == http.MethodGet {
+				select {
+				case <-bodyReady:
+				case <-time.After(5 * time.Second):
+					t.Fatal("response body was not wrapped")
+				}
 			}
 
 			cancel()
@@ -781,7 +795,7 @@ func TestAzureOriginIdentityEncoding(t *testing.T) {
 			_, _ = io.WriteString(w, "hello")
 		}
 	}, nil)
-	sdk := racersdktest.NewClient(t, azureTestOrigin(t, client, OriginConfig{Namespace: "azure-store"}))
+	sdk := racersdktest.NewClient(t, azureTestOrigin(t, client, OriginConfig{Bucket: "container"}))
 
 	got, err := azureTestRead(t, sdk, azureTestRequest(t, "key", ""))
 	if err != nil || string(got) != "hello" {
@@ -832,7 +846,7 @@ func TestAzureOriginMultipage(t *testing.T) {
 		w.WriteHeader(http.StatusPartialContent)
 		_, _ = io.WriteString(w, "end")
 	}, nil)
-	sdk := racersdktest.NewClient(t, azureTestOrigin(t, client, OriginConfig{Namespace: "azure-store"}))
+	sdk := racersdktest.NewClient(t, azureTestOrigin(t, client, OriginConfig{Bucket: "container"}))
 
 	value, err := sdk.Get(t.Context(), azureTestRequest(t, "key", "version"))
 	if err != nil {
@@ -864,7 +878,7 @@ func TestAzureOriginPinnedBridge(t *testing.T) {
 			_, _ = io.WriteString(w, "hello")
 		}
 	}, nil)
-	sdk := racersdktest.NewClient(t, azureTestOrigin(t, client, OriginConfig{Namespace: "azure-store"}))
+	sdk := racersdktest.NewClient(t, azureTestOrigin(t, client, OriginConfig{Bucket: "container"}))
 
 	got, err := azureTestRead(t, sdk, azureTestRequest(t, "key", ""), racersdk.ReadOptions{ETag: azureTestTag})
 	if err != nil || string(got) != "hello" {

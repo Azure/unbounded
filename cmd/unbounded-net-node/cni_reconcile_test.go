@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"slices"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -17,6 +18,80 @@ import (
 	"github.com/Azure/unbounded/internal/net/healthcheck"
 	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
 )
+
+func TestDelegatedAssignmentReconcilesAfterEmptyBootstrap(t *testing.T) {
+	cfg := newCNISafetyTestConfig(t)
+	health := &nodeHealthState{}
+	health.markCNIUnmanaged()
+
+	state := &wireGuardState{
+		clientset:   fake.NewClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: cfg.NodeName}}),
+		nodeName:    cfg.NodeName,
+		healthState: health,
+	}
+
+	originalConfigure := configureWireGuardFunc
+
+	t.Cleanup(func() { configureWireGuardFunc = originalConfigure })
+
+	var configured [][]string
+
+	fail := false
+	configureWireGuardFunc = func(_ context.Context, _ *config, _ string, _ []meshPeerInfo, _ []gatewayPeerInfo, _ string, _, _, _ map[string]bool, _, _, _, _, _ map[string]string, _, _, _, _, _ map[string]int, _ []unboundednetnetlink.DesiredRoute, _ map[string]bool, current *wireGuardState, _ map[string]healthcheck.HealthCheckSettings) error {
+		configured = append(configured, slices.Clone(current.nodePodCIDRs))
+
+		if fail {
+			return errors.New("injected routing failure")
+		}
+
+		return nil
+	}
+
+	sites := newInformerWithObjects(toUnstructured(t, &unboundedv1alpha3.Site{
+		ObjectMeta: metav1.ObjectMeta{Name: "site-a"},
+	}))
+	empty := newInformerWithObjects()
+	reconcile := func() error {
+		return updateWireGuardFromSlices(t.Context(), nil, sites, empty, empty, empty, empty, empty, empty, cfg, "site-a", "private", "public", false, state)
+	}
+
+	if err := reconcile(); err != nil {
+		t.Fatal(err)
+	}
+
+	cidrs := []string{"10.244.3.0/24", "fd00:3::/64"}
+	health.setVerifiedIPAMAssignment(cidrs)
+
+	fail = true
+
+	if err := reconcile(); err == nil {
+		t.Fatal("routing failure was not reported")
+	}
+
+	if len(state.nodePodCIDRs) != 0 {
+		t.Fatalf("failed routing committed assignment: %v", state.nodePodCIDRs)
+	}
+
+	fail = false
+
+	if err := reconcile(); err != nil {
+		t.Fatal(err)
+	}
+
+	if !slices.Equal(state.nodePodCIDRs, cidrs) || len(configured) == 0 || !slices.Equal(configured[len(configured)-1], cidrs) {
+		t.Fatalf("delayed assignment not configured: state=%v configured=%v", state.nodePodCIDRs, configured)
+	}
+
+	count := len(configured)
+
+	if err := reconcile(); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(configured) != count {
+		t.Fatal("unchanged assignment unnecessarily reconfigured routing")
+	}
+}
 
 func TestCNIReconciliationDisablesAndRecoversWithoutMTUChange(t *testing.T) {
 	cfg := newCNISafetyTestConfig(t)

@@ -82,6 +82,10 @@ spec:
           volumeMounts:
             - name: cni-conf
               mountPath: /host/etc/cni/net.d
+            - name: cni-bin
+              mountPath: /host/opt/cni/bin
+            - name: ipam-socket
+              mountPath: /run/unbounded-net
             - name: wireguard
               mountPath: /host/etc/wireguard
             - name: iproute2
@@ -121,6 +125,10 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 5
       volumes:
+        - name: ipam-socket
+          hostPath:
+            path: /run/unbounded-net
+            type: DirectoryOrCreate
         - name: cni-bin
           hostPath:
             path: /opt/cni/bin

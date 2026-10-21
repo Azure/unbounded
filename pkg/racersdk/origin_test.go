@@ -1450,3 +1450,64 @@ func TestOwnedOriginPreservesReplacementAndLiveWitness(t *testing.T) {
 		t.Fatalf("foreign replacement accepted: %v", err)
 	}
 }
+
+const (
+	testCacheUIDOld = "00000000-0000-4000-8000-00000000000a"
+	testCacheUIDNew = "00000000-0000-4000-8000-00000000000b"
+)
+
+func TestOriginCacheUIDConfig(t *testing.T) {
+	for _, uid := range []string{"x", strings.ToUpper(testCacheUIDOld), testCacheUIDOld + "0", "00000000_0000-4000-8000-00000000000a"} {
+		_, err := OriginConfig{Cache: "test", CacheUID: uid}.limits()
+		assertIs(t, err, ErrInvalidRequest)
+	}
+
+	limits, err := OriginConfig{Cache: "test", CacheUID: testCacheUIDOld}.limits()
+	if err != nil || limits.cacheUID != testCacheUIDOld {
+		t.Fatal(limits.cacheUID, err)
+	}
+}
+
+// TestOriginCacheUIDRecreation simulates a ClusterCache deleted and recreated
+// under the same name while the old origin is still tearing down: the old
+// origin, bound to the old UID, must refuse requests for the new UID.
+func TestOriginCacheUIDRecreation(t *testing.T) {
+	var calls atomic.Int32
+
+	path, _, _ := startOrigin(t, func(l *originLimits) { l.cacheUID = testCacheUIDOld }, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) {
+		calls.Add(1)
+
+		return originMeta(0), nil, nil
+	})
+
+	for _, tc := range []struct {
+		name, fields string
+		status       int
+	}{
+		{"new cache UID", "Racer-Cache: " + testCacheUIDNew + "\r\n", http.StatusServiceUnavailable},
+		{"missing cache UID", "", http.StatusServiceUnavailable},
+		{"matching cache UID", "Racer-Cache: " + testCacheUIDOld + "\r\n", http.StatusOK},
+	} {
+		if got := originExchange(t, path, "HEAD", tc.fields).StatusCode; got != tc.status {
+			t.Fatalf("%s: status %d, want %d", tc.name, got, tc.status)
+		}
+	}
+
+	if calls.Load() != 1 {
+		t.Fatalf("origin called %d times, want 1", calls.Load())
+	}
+
+	if got := originExchange(t, path, "HEAD", "Racer-Cache: "+testCacheUIDOld+"\r\nRacer-Cache: "+testCacheUIDOld+"\r\n").StatusCode; got != http.StatusBadRequest {
+		t.Fatalf("duplicate Racer-Cache: status %d", got)
+	}
+}
+
+func TestOriginWithoutCacheUIDAcceptsAnyCache(t *testing.T) {
+	path, _, _ := startOrigin(t, nil, func(context.Context, OriginRequest) (Metadata, io.ReadCloser, error) { return originMeta(0), nil, nil })
+
+	for _, fields := range []string{"", "Racer-Cache: " + testCacheUIDNew + "\r\n"} {
+		if got := originExchange(t, path, "HEAD", fields).StatusCode; got != http.StatusOK {
+			t.Fatalf("status %d", got)
+		}
+	}
+}

@@ -53,16 +53,14 @@ Recommended DaemonSet split:
 
 1. Run origin-only loadgen containers using
    `--s3-origin --concurrency=0`. Run a `racer-object origin` container on every
-   eligible Racer origin node, with `--cache=racer-object --namespace=benchmark-v1
-   --bucket=benchmark --region=us-east-1 --path-style=true
+   eligible Racer origin node, with `--cache=racer-object --bucket=benchmark --region=us-east-1 --path-style=true
    --endpoint=http://127.0.0.1:8080` when colocated with the synthetic server.
    Mount the cache's origin socket directory only into racer-object origin.
    The AWS client still needs credentials: for this unauthenticated fixture,
    supply non-secret placeholder AWS credential environment values and set
    `AWS_EC2_METADATA_DISABLED=true`. Do not use real cloud credentials.
 2. Run another loadgen DaemonSet with a `racer-object sidecar` container:
-   `sidecar --cache=racer-object --namespace=benchmark-v1 --bucket=benchmark
-   --listen=127.0.0.1:8080`. Mount the cache's client socket directory only into
+   `sidecar --cache=racer-object --listen=127.0.0.1:8080`. Mount the cache's client socket directory only into
    the sidecar. The loadgen container needs no socket mounts or credentials.
    Without `--s3-origin`, S3 loadgen starts only its metrics/probe listener,
    leaving port 8080 free for the sidecar. Do not expose the sidecar with a Service
@@ -89,8 +87,8 @@ Existing `--profile=shuffle|zipf`, `--zipf-exponent`, `--concurrency-file`, node
 caps, `--interval`, `--retry-delay`, `--duration`, and `--diagnose-integrity` work
 unchanged. One operation is one full object GET; per-blob concurrency is fixed to
 one. S3 mode rejects OCI sizing/transport flags instead of silently ignoring them;
-use `--endpoint`, not `--target`, and configure the upstream namespace on
-racer-object, not loadgen.
+use `--endpoint`, not `--target`, and configure the upstream bucket on the
+racer-object origin, not loadgen.
 
 Metrics retain their existing names and the `kind="blob"` label. Successful
 operations appear in `racer_loadgen_pulls_total{result="success"}`; verified goodput
@@ -106,7 +104,7 @@ stops the metrics listener at completion, so scrape during the run.
 Verification consumes CPU, and synthetic origins spend CPU regenerating data;
 neither result represents persistent-storage performance. Restarting with the
 same seed does not make the cache cold. Unlike the digest-keyed UDS mode, S3 names
-stay stable across seed changes: use a new racer-object namespace for an isolated
+stay stable across seed changes: use a new ClusterCache for an isolated
 cold run to avoid metadata-TTL staleness. The local adapter integration test uses
 a noncaching SDK test daemon and does not establish real cache-hit behavior,
 cluster compatibility, or throughput. Size the sidecar and dataplane separately;

@@ -22,13 +22,12 @@ import (
 	"github.com/Azure/unbounded/internal/racer/workload"
 )
 
-const testAccountURL = "https://Account.blob.core.windows.net/"
+const testContainerURL = "https://Account.blob.core.windows.net/models"
 
 func originCache(name string, credential *racerv1.AzureCredential) *racerv1.ClusterCache {
 	cache := cacheObject(name)
 	cache.Spec.Origin = &racerv1.ObjectOrigin{
-		Buckets: []racerv1.BucketName{"models", "data"},
-		Azure:   &racerv1.AzureOrigin{AccountURL: testAccountURL, Credential: credential},
+		Azure: &racerv1.AzureOrigin{ContainerURL: testContainerURL, Credential: credential},
 	}
 
 	return cache
@@ -138,7 +137,7 @@ func TestOriginCredentialRendering(t *testing.T) {
 			tpl := ds.Spec.Template
 			require.Equal(t, originCacheValue("cache"), tpl.Labels[originCacheLabel])
 			require.Equal(t, ds.Spec.Selector.MatchLabels[originCacheLabel], tpl.Labels[originCacheLabel])
-			require.Equal(t, "https://account.blob.core.windows.net", tpl.Annotations[originIdentity])
+			require.NotContains(t, tpl.Annotations, "racer.unbounded-cloud.io/origin-identity")
 			require.NotEmpty(t, tpl.Annotations[originConfigHash])
 
 			if tc.podLabel {
@@ -160,8 +159,8 @@ func TestOriginCredentialRendering(t *testing.T) {
 			c := pod.Containers[0]
 			require.Equal(t, "mirror.test/unbounded/racer-object:v1", c.Image)
 			require.Equal(t, []string{
-				"origin", "--cache=cache", "--namespace=https://account.blob.core.windows.net", "--provider=azure",
-				"--account-url=" + testAccountURL, "--azure-credential=" + tc.mode, "--bucket=models", "--bucket=data",
+				"origin", "--cache=cache", "--cache-uid=" + string(cache.UID), "--provider=azure",
+				"--container-url=" + testContainerURL, "--azure-credential=" + tc.mode,
 				"--metadata-ttl=0s", "--request-timeout=1m30s", "--max-concurrent-requests=32",
 			}, c.Args)
 			require.Equal(t, tc.env, c.Env)
@@ -182,6 +181,29 @@ func TestOriginCredentialRendering(t *testing.T) {
 	}
 }
 
+func TestOriginCacheUIDBindsRecreatedCache(t *testing.T) {
+	old := originCache("cache", nil)
+	recreated := originCache("cache", nil)
+	require.NotEqual(t, old.UID, recreated.UID)
+
+	oldSpec, err := renderOrigin(old)
+	require.NoError(t, err)
+	newSpec, err := renderOrigin(recreated)
+	require.NoError(t, err)
+	require.Contains(t, oldSpec.args, "--cache-uid="+string(old.UID))
+	require.Contains(t, newSpec.args, "--cache-uid="+string(recreated.UID))
+
+	oldHash, err := oldSpec.hash()
+	require.NoError(t, err)
+	newHash, err := newSpec.hash()
+	require.NoError(t, err)
+	require.NotEqual(t, oldHash, newHash)
+
+	old.UID = ""
+	_, err = renderOrigin(old)
+	require.ErrorContains(t, err, "metadata.uid is required")
+}
+
 func TestOriginOptionalFlagsOmittedWhenUnset(t *testing.T) {
 	spec, err := renderOrigin(originCache("cache", nil))
 	require.NoError(t, err)
@@ -195,7 +217,9 @@ func TestOriginOptionalFlagsOmittedWhenUnset(t *testing.T) {
 
 func TestOriginConfigHashTracksCredentialIdentity(t *testing.T) {
 	wi := func(client, tenant string) string {
-		spec, err := renderOrigin(originCache("cache", &racerv1.AzureCredential{WorkloadIdentity: &racerv1.AzureWorkloadIdentityCredential{ClientID: client, TenantID: tenant}}))
+		cache := originCache("cache", &racerv1.AzureCredential{WorkloadIdentity: &racerv1.AzureWorkloadIdentityCredential{ClientID: client, TenantID: tenant}})
+		cache.UID = "00000000-0000-4000-8000-000000000001"
+		spec, err := renderOrigin(cache)
 		require.NoError(t, err)
 		require.Empty(t, spec.env)
 
@@ -304,8 +328,8 @@ func TestOriginInvalidCacheIsIsolated(t *testing.T) {
 	bad, _ := liveOrigin(t, env, "bad")
 
 	// The fake client does not run CEL, modeling a cache that bypassed admission.
-	updateCache(t, env, "bad", func(c *racerv1.ClusterCache) { c.Spec.Origin.Azure.AccountURL = "https://user@host/" })
-	updateCache(t, env, "good", func(c *racerv1.ClusterCache) { c.Spec.Origin.Buckets = append(c.Spec.Origin.Buckets, "more") })
+	updateCache(t, env, "bad", func(c *racerv1.ClusterCache) { c.Spec.Origin.Azure.ContainerURL = "https://user@host/models" })
+	updateCache(t, env, "good", func(c *racerv1.ClusterCache) { c.Spec.Origin.MetadataTTL = &metav1.Duration{Duration: 7 * time.Second} })
 
 	plan, result := planResult(t, env)
 	require.False(t, result.Ready)
@@ -324,7 +348,11 @@ func TestOriginInvalidCacheIsIsolated(t *testing.T) {
 	require.Equal(t, bad.Spec, kept.Spec)
 
 	good, _ := liveOrigin(t, env, "good")
-	require.Contains(t, good.Spec.Template.Spec.Containers[0].Args, "--bucket=more")
+	require.Contains(t, good.Spec.Template.Spec.Containers[0].Args, "--metadata-ttl=7s")
+}
+
+func containerURL(value string) func(*racerv1.ObjectOrigin) {
+	return func(o *racerv1.ObjectOrigin) { o.Azure.ContainerURL = value }
 }
 
 func TestRenderOriginRejectsInvalidSpecs(t *testing.T) {
@@ -348,11 +376,15 @@ func TestRenderOriginRejectsInvalidSpecs(t *testing.T) {
 			o.Azure.Credential = &racerv1.AzureCredential{WorkloadIdentity: &racerv1.AzureWorkloadIdentityCredential{}}
 		}, "clientID is required"},
 		{"default-http", func(o *racerv1.ObjectOrigin) {
-			o.Azure.AccountURL = "http://127.0.0.1:10000/devstoreaccount1"
+			o.Azure.ContainerURL = "http://127.0.0.1:10000/devstoreaccount1/models"
 			o.Azure.Credential = &racerv1.AzureCredential{Default: &racerv1.AzureDefaultCredential{}}
-		}, "accountURL"},
-		{"no-buckets", func(o *racerv1.ObjectOrigin) { o.Buckets = nil }, "at least one bucket"},
-		{"bad-bucket", func(o *racerv1.ObjectOrigin) { o.Buckets = []racerv1.BucketName{"a/b"} }, "buckets"},
+		}, "containerURL"},
+		{"empty-container-url", containerURL(""), "spec.origin.azure.containerURL"},
+		{"account-only", containerURL("https://account.blob.core.windows.net"), "spec.origin.azure.containerURL"},
+		{"trailing-slash", containerURL("https://account.blob.core.windows.net/models/"), "spec.origin.azure.containerURL"},
+		{"blob-path", containerURL("https://account.blob.core.windows.net/account/models/blob"), "spec.origin.azure.containerURL"},
+		{"bad-container", containerURL("https://account.blob.core.windows.net/a_b"), "spec.origin.azure.containerURL"},
+		{"long-container", containerURL("https://account.blob.core.windows.net/" + strings.Repeat("b", 64)), "spec.origin.azure.containerURL"},
 		{"negative-ttl", func(o *racerv1.ObjectOrigin) { o.MetadataTTL = &metav1.Duration{Duration: -time.Second} }, "metadataTTL"},
 		{"zero-timeout", func(o *racerv1.ObjectOrigin) { o.RequestTimeout = &metav1.Duration{} }, "requestTimeout"},
 		{"zero-requests", func(o *racerv1.ObjectOrigin) { o.MaxConcurrentRequests = ptr.To(int32(0)) }, "maxConcurrentRequests"},
@@ -391,7 +423,7 @@ func TestOriginMalformedSecretRefIsIsolated(t *testing.T) {
 
 	// The fake client does not enforce the CRD pattern, modeling a cache that bypassed admission.
 	updateCache(t, env, "bad", func(c *racerv1.ClusterCache) { secretRefName("bad/name")(c.Spec.Origin) })
-	updateCache(t, env, "good", func(c *racerv1.ClusterCache) { c.Spec.Origin.Buckets = append(c.Spec.Origin.Buckets, "more") })
+	updateCache(t, env, "good", func(c *racerv1.ClusterCache) { c.Spec.Origin.MetadataTTL = &metav1.Duration{Duration: 7 * time.Second} })
 
 	plan, result := planResult(t, env)
 	require.Equal(t, "OriginInvalid", result.Reason)
@@ -402,7 +434,7 @@ func TestOriginMalformedSecretRefIsIsolated(t *testing.T) {
 	persist(t, env, plan)
 
 	good, _ := liveOrigin(t, env, "good")
-	require.Contains(t, good.Spec.Template.Spec.Containers[0].Args, "--bucket=more")
+	require.Contains(t, good.Spec.Template.Spec.Containers[0].Args, "--metadata-ttl=7s")
 }
 
 func TestUnmanagedOriginIsNotAdopted(t *testing.T) {
@@ -707,4 +739,64 @@ func TestSecretWatchedMatchesReferencedCredentials(t *testing.T) {
 	require.True(t, match(secret(env.Namespace, "creds")))
 	require.False(t, match(secret("other", "creds")), "other namespace")
 	require.False(t, match(secret(env.Namespace, "unrelated")))
+}
+
+// kubeletExpand mirrors kubelet's $(VAR) expansion of container args: "$$"
+// becomes "$", and "$(NAME)" becomes the value of a defined variable.
+func kubeletExpand(in string, env map[string]string) string {
+	var out strings.Builder
+
+	for i := 0; i < len(in); i++ {
+		if in[i] != '$' || i+1 >= len(in) {
+			out.WriteByte(in[i])
+			continue
+		}
+
+		switch in[i+1] {
+		case '$':
+			out.WriteByte('$')
+
+			i++
+		case '(':
+			end := strings.IndexByte(in[i+2:], ')')
+			if end < 0 {
+				out.WriteByte(in[i])
+				continue
+			}
+
+			name := in[i+2 : i+2+end]
+			if v, ok := env[name]; ok {
+				out.WriteString(v)
+			} else {
+				out.WriteString(in[i : i+3+end])
+			}
+
+			i += 2 + end
+		default:
+			out.WriteByte(in[i])
+		}
+	}
+
+	return out.String()
+}
+
+func TestOriginEscapesContainerURLVariableReferences(t *testing.T) {
+	const url = "https://$(STORAGE_HOST)/models"
+
+	cache := originCache("cache", nil)
+	cache.Spec.Origin.Azure.ContainerURL = url
+
+	_, err := renderOrigin(cache)
+	require.ErrorContains(t, err, "spec.origin.azure.containerURL")
+
+	// Validation rejects the host, but the arg is still escaped as defense in
+	// depth: after kubelet expansion it must stay literal.
+	env := map[string]string{"STORAGE_HOST": "other.blob.core.windows.net"}
+	require.Equal(t, "--container-url="+url, kubeletExpand("--container-url="+escapeKubeArg(url), env))
+	require.Equal(t, "$$(A)$$$$", escapeKubeArg("$(A)$$"))
+	require.Equal(t, "$(A)$$", kubeletExpand(escapeKubeArg("$(A)$$"), map[string]string{"A": "x"}))
+
+	spec, err := renderOrigin(originCache("cache", nil))
+	require.NoError(t, err)
+	require.Contains(t, spec.args, "--container-url="+testContainerURL)
 }

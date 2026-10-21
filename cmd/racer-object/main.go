@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -32,22 +33,32 @@ import (
 	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
-type bucketsFlag []string
+// bucketFlag accepts exactly one value so a repeated --bucket fails instead
+// of silently replacing the first.
+type bucketFlag string
 
-func (b *bucketsFlag) String() string { return strings.Join(*b, ",") }
-func (b *bucketsFlag) Set(value string) error {
-	*b = append(*b, value)
+func (b *bucketFlag) String() string { return string(*b) }
+func (b *bucketFlag) Set(value string) error {
+	if *b != "" {
+		return errors.New("--bucket may be set only once")
+	}
+
+	*b = bucketFlag(value)
+
 	return nil
 }
+
+// cacheUIDPattern matches the canonical lowercase UUID form of a Kubernetes UID.
+var cacheUIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 type options struct {
 	mode            string
 	cache           string
-	namespace       string
-	buckets         bucketsFlag
+	cacheUID        string
+	bucket          bucketFlag
 	provider        string
 	api             string
-	accountURL      string
+	containerURL    string
 	azureCredential string
 	region          string
 	endpoint        string
@@ -113,14 +124,14 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 		helpErr = writeHelp(output, "Usage: racer-object "+o.mode+" [flags]\n"+defaults.String())
 	}
 	cache := fs.String("cache", "racer-object", "Racer cache name (ClusterCache)")
-	fs.StringVar(&o.namespace, "namespace", "", "Required stable upstream identity; use the same value in origin and sidecar")
-	fs.Var(&o.buckets, "bucket", "Allowed bucket/container (repeatable; omitted allows all buckets/containers)")
 	fs.StringVar(&o.debugListen, "debug-listen", "", "Optional pprof address (e.g. 127.0.0.1:6060); disabled when empty. Trusted diagnostic access only: nonloopback addresses such as :6060 expose unauthenticated profiles")
 
 	showVersion := fs.Bool("version", false, "Print version")
 	if o.mode == "origin" {
+		fs.StringVar(&o.cacheUID, "cache-uid", "", "Optional ClusterCache UID (lowercase UUID) this origin serves; when set, requests for any other or no cache UID are refused so a leftover origin cannot fill a recreated cache with the same name")
+		fs.Var(&o.bucket, "bucket", "S3 bucket served by this origin; required for s3 and rejected for azure. Requests for any other bucket are forbidden")
 		fs.StringVar(&o.provider, "provider", "s3", "Upstream provider: s3 or azure")
-		fs.StringVar(&o.accountURL, "account-url", "", "Azure account HTTP(S) URL; required for azure, without credentials or query")
+		fs.StringVar(&o.containerURL, "container-url", "", "Azure Blob container URL (https://ACCOUNT.blob.core.windows.net/CONTAINER); required for azure, without credentials or query. Requests for any other container are forbidden")
 		fs.StringVar(&o.azureCredential, "azure-credential", "default", "Azure credential: default or anonymous; default requires HTTPS and uses the Azure credential chain (AZURE_CLIENT_ID and related environment variables)")
 		fs.StringVar(&o.region, "region", "", "AWS region (defaults to AWS configuration and environment)")
 		fs.StringVar(&o.endpoint, "endpoint", "", "Optional HTTP(S) upstream origin, without a path or credentials")
@@ -160,14 +171,8 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 
 	closeResource(validationClient)
 
-	if _, err := racerobject.NewRequest(o.namespace, "validation", "validation", ""); err != nil {
-		return o, errors.New("--namespace must be a valid stable upstream identity")
-	}
-
-	for _, bucket := range o.buckets {
-		if _, err := racerobject.NewRequest(o.namespace, bucket, "validation", ""); err != nil {
-			return o, errors.New("invalid --bucket")
-		}
+	if o.mode == "origin" && o.cacheUID != "" && !cacheUIDPattern.MatchString(o.cacheUID) {
+		return o, errors.New("invalid --cache-uid")
 	}
 
 	if o.requestTimeout <= 0 {
@@ -179,7 +184,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 			return o, errors.New("--max-concurrent-requests must be between 1 and 65536")
 		}
 
-		if err := validateProviderOptions(o, fs); err != nil {
+		if err := validateProviderOptions(&o, fs); err != nil {
 			return o, err
 		}
 
@@ -328,7 +333,7 @@ func originHTTPClient(o options) *http.Client {
 
 func createOrigin(ctx context.Context, o options) (racersdk.Origin, error) {
 	originConfig := racerobject.OriginConfig{
-		Namespace: o.namespace, Buckets: o.buckets, MetadataTTL: o.metadataTTL,
+		Bucket: string(o.bucket), MetadataTTL: o.metadataTTL,
 	}
 	if o.provider == "azure" {
 		client, err := originAzureClient(o)
@@ -387,7 +392,7 @@ func runOrigin(ctx context.Context, o options) error {
 	}
 
 	err = racersdk.ServeOrigin(ctx, racersdk.OriginConfig{
-		Cache: o.cache, RecoverStaleSocket: true, MaxConcurrentRequests: o.maxRequests,
+		Cache: o.cache, CacheUID: o.cacheUID, RecoverStaleSocket: true, MaxConcurrentRequests: o.maxRequests,
 	}, origin)
 	if ctx.Err() != nil {
 		return nil
@@ -476,7 +481,7 @@ func runSidecar(ctx context.Context, o options) error {
 }
 
 func createSidecar(client *racersdk.Client, o options) (http.Handler, error) {
-	handler, err := racerobject.NewSidecar(client, racerobject.SidecarConfig{Namespace: o.namespace, Buckets: o.buckets, API: o.api})
+	handler, err := racerobject.NewSidecar(client, racerobject.SidecarConfig{API: o.api})
 	if err != nil {
 		return nil, errors.New("could not configure sidecar")
 	}

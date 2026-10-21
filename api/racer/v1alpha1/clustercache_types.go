@@ -11,10 +11,15 @@ import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 // Each DNS label is limited to 63 characters to match the wire contract;
 // Kubernetes metadata validation enforces DNS subdomain spelling.
 // The bounded regex checks label lengths without a costly CEL split/all loop.
+// Whether spec.origin is set is fixed at creation. Cache entries are keyed by
+// the ClusterCache UID, not by their source, so removing and re-adding origin,
+// or switching between a managed origin and a self-deployed one, would serve
+// entries fetched from a different source.
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster,shortName=ccache
 // +kubebuilder:validation:XValidation:rule="size(self.metadata.name) <= 82",message="name must fit the canonical Unix socket path"
 // +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[^.]{1,63}([.][^.]{1,63})*$')",message="each name label must be at most 63 characters"
+// +kubebuilder:validation:XValidation:rule="(has(self.spec) && has(self.spec.origin)) == (has(oldSelf.spec) && has(oldSelf.spec.origin))",message="spec.origin cannot be added or removed; create a new ClusterCache to change the origin"
 type ClusterCache struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -27,7 +32,8 @@ type ClusterCache struct {
 // ClusterCacheSpec configures optional cache features.
 type ClusterCacheSpec struct {
 	// Origin deploys a managed racer-object origin for this cache. The operator runs
-	// one origin pod per dataplane node and removes it when origin is unset.
+	// one origin pod per dataplane node. Origin can be set only at creation and
+	// cannot be removed later; leave it unset to deploy your own origin.
 	// +optional
 	Origin *ObjectOrigin `json:"origin,omitempty"`
 }
@@ -36,12 +42,6 @@ type ClusterCacheSpec struct {
 // Exactly one provider must be set. Only azure is supported today.
 // +kubebuilder:validation:XValidation:rule="has(self.azure)",message="azure is required"
 type ObjectOrigin struct {
-	// Buckets lists the buckets or containers the origin may read.
-	// +kubebuilder:validation:MinItems=1
-	// +kubebuilder:validation:MaxItems=64
-	// +listType=set
-	Buckets []BucketName `json:"buckets"`
-
 	// MetadataTTL bounds how long object metadata is reused before it is revalidated.
 	// It must not be negative. When unset, the racer-object default applies.
 	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="metadataTTL must not be negative"
@@ -61,31 +61,29 @@ type ObjectOrigin struct {
 	// +optional
 	MaxConcurrentRequests *int32 `json:"maxConcurrentRequests,omitempty"`
 
-	// Azure reads from Azure Blob Storage. Buckets name blob containers.
+	// Azure reads one Azure Blob Storage container.
 	// +optional
 	Azure *AzureOrigin `json:"azure,omitempty"`
 }
 
-// BucketName names an object storage bucket or blob container.
-// +kubebuilder:validation:MinLength=1
-// +kubebuilder:validation:MaxLength=255
-// +kubebuilder:validation:Pattern=`^[a-zA-Z0-9._-]+$`
-// +kubebuilder:validation:XValidation:rule="self != '.' && self != '..'",message="bucket must not be . or .."
-type BucketName string
-
-// AzureOrigin reads from one Azure Blob Storage account.
-// The account URL also forms the cache's upstream identity, so changing it
-// starts a new set of cache entries.
-// +kubebuilder:validation:XValidation:rule="!has(self.credential) || self.accountURL.startsWith('https://')",message="accountURL must use https when a credential is configured"
+// AzureOrigin reads one Azure Blob Storage container. Every pod attached to
+// the cache sees the container's whole keyspace. Cache entries do not record
+// the account or container, so the container URL is immutable: a different
+// source needs a new ClusterCache, which has a new UID and therefore an empty
+// cache.
+// +kubebuilder:validation:XValidation:rule="!has(self.credential) || self.containerURL.startsWith('https://')",message="containerURL must use https when a credential is configured"
 type AzureOrigin struct {
-	// AccountURL is the blob service endpoint, for example
-	// https://account.blob.core.windows.net. Azurite-style URLs may carry one
-	// account path segment.
+	// ContainerURL is the blob container URL, for example
+	// https://account.blob.core.windows.net/models. The last path segment is
+	// the container name. Azurite-style URLs may carry one account path
+	// segment before it, for example http://127.0.0.1:10000/account/models.
 	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=256
-	// +kubebuilder:validation:XValidation:rule="isURL(self) && url(self).getScheme() in ['http', 'https']",message="accountURL must be an http or https URL"
-	// +kubebuilder:validation:XValidation:rule="!self.contains('?') && !self.contains('#') && !self.contains('@')",message="accountURL must not contain credentials, a query, or a fragment"
-	AccountURL string `json:"accountURL"`
+	// +kubebuilder:validation:MaxLength=320
+	// +kubebuilder:validation:XValidation:rule="isURL(self) && url(self).getScheme() in ['http', 'https']",message="containerURL must be an http or https URL"
+	// +kubebuilder:validation:XValidation:rule="!self.contains('?') && !self.contains('#') && !self.contains('@')",message="containerURL must not contain credentials, a query, or a fragment"
+	// +kubebuilder:validation:XValidation:rule="self.matches('^https?://[]A-Za-z0-9.:[-]+(/[A-Za-z0-9_-]+)?/[a-z0-9]+(-[a-z0-9]+)*$') && self.substring(self.lastIndexOf('/') + 1).size() >= 3 && self.substring(self.lastIndexOf('/') + 1).size() <= 63",message="containerURL must be an account URL followed by one valid container name, such as https://account.blob.core.windows.net/models"
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="containerURL is immutable; create a new ClusterCache for a different container"
+	ContainerURL string `json:"containerURL"`
 
 	// Credential selects how the origin authenticates. When omitted, requests are anonymous.
 	// +optional

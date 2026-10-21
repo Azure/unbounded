@@ -75,6 +75,13 @@ type OriginConfig struct {
 	// /run/racer/<Cache>/origin/socket. The directory must already exist and
 	// its ancestors must not be symlinks.
 	Cache string
+	// CacheUID optionally binds the origin to one ClusterCache UID. Origin
+	// sockets are named by cache name, so a ClusterCache that is deleted and
+	// recreated under the same name reuses the path while an origin for the
+	// old UID may still be listening. When CacheUID is set, requests whose
+	// Racer-Cache header names a different or no UID get 503 Service
+	// Unavailable instead of being served. Empty accepts any cache UID.
+	CacheUID string
 	// MaxConcurrentRequests bounds concurrent content requests; Racer receives
 	// a retryable error beyond it. Zero means 64. Metadata requests have a
 	// small separate limit.
@@ -107,6 +114,7 @@ type originLimits struct {
 	idleTimeout       time.Duration
 	socketMode        os.FileMode
 	recoverStale      bool
+	cacheUID          string
 }
 
 func (c OriginConfig) limits() (originLimits, error) {
@@ -116,6 +124,10 @@ func (c OriginConfig) limits() (originLimits, error) {
 
 	if c.MaxConcurrentRequests < 0 {
 		return originLimits{}, invalid("origin config", errors.New("negative MaxConcurrentRequests"))
+	}
+
+	if c.CacheUID != "" && !validCacheUID(c.CacheUID) {
+		return originLimits{}, invalid("origin config", errors.New("CacheUID must be a lowercase UUID"))
 	}
 
 	l := originLimits{
@@ -128,6 +140,7 @@ func (c OriginConfig) limits() (originLimits, error) {
 		idleTimeout:       30 * time.Second,
 		socketMode:        0o600,
 		recoverStale:      c.RecoverStaleSocket,
+		cacheUID:          c.CacheUID,
 	}
 	if c.MaxConcurrentRequests != 0 {
 		l.maxRequests = c.MaxConcurrentRequests
@@ -322,6 +335,13 @@ func serveOperation(w http.ResponseWriter, r *http.Request, limits originLimits,
 
 	request := head.request
 	pinned := request.Pin != ""
+
+	// An origin left over from an earlier ClusterCache with the same name must
+	// not fill the new cache. 503 lets Racer retry until the new origin binds.
+	if limits.cacheUID != "" && request.CacheUID != limits.cacheUID {
+		writeOriginError(w, http.StatusServiceUnavailable, 0)
+		return
+	}
 
 	if request.Operation == wire.OperationHead {
 		slots = headSlots
@@ -1260,4 +1280,27 @@ func bindOriginSocket(path string, mode os.FileMode) (*net.UnixListener, error) 
 	}
 
 	return l, nil
+}
+
+// validCacheUID accepts the canonical lowercase UUID form Kubernetes uses for UIDs.
+func validCacheUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+
+	for i := range len(s) {
+		c := s[i]
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+				return false
+			}
+		}
+	}
+
+	return true
 }
