@@ -282,6 +282,19 @@ impl Links {
         }
     }
 
+    /// Record one RDMA transfer stage that began at `start` as a nanosecond
+    /// sum and a count, so a scrape can derive the mean stage latency.
+    pub fn record_stage(
+        &self,
+        count: crate::telemetry::Event,
+        sum: crate::telemetry::Event,
+        start: std::time::Instant,
+    ) {
+        let elapsed = uring_runtime::environment::now().saturating_duration_since(start);
+        self.record(sum, u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
+        self.record(count, 1);
+    }
+
     /// Count a peer transfer that planned RDMA but carried its page over HTTP.
     pub fn record_http_fallback(&self) {
         self.record(crate::telemetry::Event::RdmaHttpFallback, 1);
