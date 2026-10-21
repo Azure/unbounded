@@ -25,6 +25,8 @@ spec:
         value: "[]"
       - name: script-environment
         value: "{}"
+      - name: workload-policy
+        value: "{}"
       - name: mpi-payload-mode
         value: ""
       - name: expected-gpu-product-regex
@@ -80,6 +82,8 @@ spec:
           - "{{`{{workflow.parameters.tolerations}}`}}"
           - --script-environment
           - "{{`{{workflow.parameters.script-environment}}`}}"
+          - --workload-policy
+          - "{{`{{workflow.parameters.workload-policy}}`}}"
           - --gpu-resource-count
           - "{{`{{workflow.parameters.gpu-resource-count}}`}}"
           - "--privileged={{`{{workflow.parameters.privileged}}`}}"

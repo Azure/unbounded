@@ -75,6 +75,7 @@ The referenced WorkflowTemplate must accept these string parameters:
 | `runner-image` | Digest-pinned execution image |
 | `tolerations` | JSON-encoded toleration list |
 | `script-environment` | JSON-encoded, validated environment map |
+| `workload-policy` | JSON-encoded immutable participant-container resources, security context, and bounded volume policy |
 | `mpi-payload-mode` | Optional operator-defined execution mode |
 | `expected-gpu-product-regex` | Optional operator policy |
 | `expected-gpu-count` | Optional operator policy |
@@ -161,6 +162,7 @@ digest-pinned runner image. To use the included adapter, set
 backend:
   apiVersion: v1
   kind: Pod
+  queue: <optional-local-queue>
 ```
 
 or an explicit Kueue queue:
@@ -171,6 +173,59 @@ backend:
   kind: MPIJob
   queue: <local-queue>
 ```
+
+When a Pod backend supplies a queue, the adapter writes the standard
+`kueue.x-k8s.io/queue-name` label. MPIJob backends require a queue; Pod backends
+may omit it only when the operator intentionally runs them outside Kueue.
+
+Profiles may set `spec.workloadPolicy` when a diagnostic needs explicit
+participant-container policy. The controller validates and snapshots this
+policy into the immutable CertificationRun before reserving Nodes. The included
+adapter applies it to the ordinary Pod container or the MPIJob worker only; the
+unpinned MPI launcher does not receive participant resources, host devices, or
+extra mounts.
+
+```yaml
+workloadPolicy:
+  resources:
+    requests:
+      cpu: "8"
+      memory: 32Gi
+      ephemeral-storage: 20Gi
+    limits:
+      cpu: "8"
+      memory: 32Gi
+      ephemeral-storage: 40Gi
+  securityContext:
+    privileged: false
+    capabilities:
+      add: [IPC_LOCK]
+  workingDir: /opt/diagnostic
+  results:
+    sizeLimit: 2Gi
+  volumes:
+    - name: work
+      mountPath: /work
+      emptyDir:
+        sizeLimit: 16Gi
+    - name: host-proc
+      mountPath: /host/proc
+      readOnly: true
+      hostPath:
+        path: /proc
+        type: Directory
+```
+
+Each extra volume must select exactly one `hostPath`, `emptyDir`, or
+`persistentVolumeClaim` source. Names and mount paths must be unique;
+`scripts`, `results`, `/scripts`, and `/results` are reserved. Paths must be
+clean and absolute, resource quantities must be nonnegative, and limits cannot
+be below requests. The policy is bounded to 16 volumes and 16 KiB of serialized
+input. GPU requests and limits remain controlled by `gpu-resource-count`, which
+sets equal requests and limits on the participant container. Kubernetes
+admission and operator policy still decide whether a capability, host path,
+device, PVC, or privileged context is allowed; technical rendering is not
+authorization.
 
 `gpu-resource-count` remains an operator-supplied profile parameter. It may be
 zero for Pod diagnostics and must be positive for MPIJobs. The MPIJob policy is
@@ -184,6 +239,13 @@ parameters `backend-backoff-limit` and
 `BACKEND_BACKOFF_LIMIT` and `BACKEND_TTL_SECONDS_AFTER_FINISHED` in the validated
 script environment and remain explicit per-profile policy rather than cluster
 defaults.
+
+A `CertificationProfile` and `CertificationRun` each select one immutable
+script key and one backend. `purpose: FullCertification` and `stagePlan`
+describe evidence; they do not execute a multi-key suite. Operators that define
+a full suite must create one run per script and admit the next run only after
+the previous run is terminal and its backend cleanup has completed. The
+upstream controller does not synthesize a cross-run verdict.
 
 ## Results and evidence
 

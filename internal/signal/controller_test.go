@@ -34,6 +34,17 @@ func TestAdmissionCreatesImmutableSnapshotAndPreventsDuplicate(t *testing.T) {
 	node := readyNode("gpu-0", "example-gpu")
 	node.Labels[RequestLabel] = "gpu-smoke"
 	profile := testProfile("gpu-smoke", "example-gpu")
+	profile.Spec.WorkloadPolicy = signalv1.WorkloadPolicy{
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")},
+			Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("8")},
+		},
+		Volumes: []signalv1.WorkloadVolume{{
+			Name:      "work",
+			MountPath: "/work",
+			EmptyDir:  &corev1.EmptyDirVolumeSource{SizeLimit: quantity("8Gi")},
+		}},
+	}
 
 	const payload = "test payload\n"
 
@@ -73,6 +84,12 @@ func TestAdmissionCreatesImmutableSnapshotAndPreventsDuplicate(t *testing.T) {
 
 	if run.Spec.Purpose != signalv1.PurposeQuickCertification {
 		t.Fatalf("purpose = %q, want %q", run.Spec.Purpose, signalv1.PurposeQuickCertification)
+	}
+
+	if run.Spec.WorkloadPolicy.Resources.Limits.Cpu().String() != "8" ||
+		len(run.Spec.WorkloadPolicy.Volumes) != 1 ||
+		run.Spec.WorkloadPolicy.Volumes[0].EmptyDir.SizeLimit.String() != "8Gi" {
+		t.Fatalf("workload policy = %#v, want immutable profile policy", run.Spec.WorkloadPolicy)
 	}
 
 	if run.Spec.Parameters["observed-gpu-capacity"] != "8" ||
@@ -119,6 +136,7 @@ func TestAdmissionRejectsMutableRunnerImageBeforeReservation(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "scripts", Namespace: "signal"},
 		Data:       map[string]string{"payload.txt": "test payload\n"},
 	}
+
 	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, profile, source).Build()
 	reconciler := &AdmissionReconciler{Client: kube, Namespace: "signal", ScriptNamespace: "signal"}
 
@@ -137,6 +155,43 @@ func TestAdmissionRejectsMutableRunnerImageBeforeReservation(t *testing.T) {
 
 	if got.Annotations[ReservationLabel] != "" {
 		t.Fatalf("node was reserved after rejected profile: %#v", got.Annotations)
+	}
+}
+
+func TestAdmissionRejectsInvalidWorkloadPolicyBeforeReservation(t *testing.T) {
+	t.Parallel()
+
+	scheme := testScheme(t)
+	node := readyNode("gpu-0", "example-gpu")
+	node.Labels[RequestLabel] = "gpu-smoke"
+	profile := testProfile("gpu-smoke", "example-gpu")
+	profile.Spec.WorkloadPolicy.Volumes = []signalv1.WorkloadVolume{{
+		Name:      "replacement",
+		MountPath: "/results",
+		EmptyDir:  &corev1.EmptyDirVolumeSource{},
+	}}
+	source := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "scripts", Namespace: "signal"},
+		Data:       map[string]string{"payload.txt": "test payload\n"},
+	}
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, profile, source).Build()
+	reconciler := &AdmissionReconciler{Client: kube, Namespace: "signal", ScriptNamespace: "signal"}
+
+	_, err := reconciler.Reconcile(
+		context.Background(),
+		reconcile.Request{NamespacedName: client.ObjectKey{Name: node.Name}},
+	)
+	if err == nil || !strings.Contains(err.Error(), "reserved or existing mountPath") {
+		t.Fatalf("Reconcile error = %v", err)
+	}
+
+	var got corev1.Node
+	if err := kube.Get(context.Background(), client.ObjectKey{Name: node.Name}, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	if got.Annotations[ReservationLabel] != "" {
+		t.Fatalf("node was reserved after rejected workload policy: %#v", got.Annotations)
 	}
 }
 
@@ -552,6 +607,17 @@ func TestWorkflowPinsAttemptInputs(t *testing.T) {
 		Operator: corev1.TolerationOpExists,
 		Effect:   corev1.TaintEffectNoSchedule,
 	}}
+	run.Spec.WorkloadPolicy = signalv1.WorkloadPolicy{
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")},
+			Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("8")},
+		},
+		Volumes: []signalv1.WorkloadVolume{{
+			Name:      "work",
+			MountPath: "/work",
+			EmptyDir:  &corev1.EmptyDirVolumeSource{SizeLimit: quantity("8Gi")},
+		}},
+	}
 
 	workflow, err := buildWorkflow(run, 2)
 	if err != nil {
@@ -631,6 +697,18 @@ func TestWorkflowPinsAttemptInputs(t *testing.T) {
 
 	if len(tolerations) != 1 {
 		t.Fatalf("workflow tolerations = %#v, want one deduplicated GPU toleration", tolerations)
+	}
+
+	var policy signalv1.WorkloadPolicy
+	if err := json.Unmarshal([]byte(values["workload-policy"]), &policy); err != nil {
+		t.Fatalf("decode workload policy: %v", err)
+	}
+
+	if policy.Resources.Requests.Cpu().String() != "4" ||
+		policy.Resources.Limits.Cpu().String() != "8" ||
+		len(policy.Volumes) != 1 ||
+		policy.Volumes[0].EmptyDir.SizeLimit.String() != "8Gi" {
+		t.Fatalf("workflow workload policy = %#v", policy)
 	}
 }
 
@@ -1415,4 +1493,10 @@ func workflowArgument(workflow *unstructured.Unstructured, name string) string {
 
 func ptrTime(value metav1.Time) *metav1.Time {
 	return &value
+}
+
+func quantity(value string) *resource.Quantity {
+	result := resource.MustParse(value)
+
+	return &result
 }
