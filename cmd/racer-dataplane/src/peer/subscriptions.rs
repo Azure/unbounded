@@ -206,6 +206,16 @@ struct Reservation {
     deadline: u64,
 
     flights: Option<u16>,
+
+    /// Set when a newer ceiling, which the requester had already debited for
+    /// this request, was widened by one page on its account. Forfeited if the
+    /// request never selects.
+    covered_page: bool,
+
+    /// Bytes a newer ceiling was widened by on this request's account. A
+    /// completion charges at least this much, and a failure forfeits it, so
+    /// unused slack never outlives the ceiling that excluded it.
+    covered_bytes: u64,
 }
 
 struct Flight {
@@ -214,6 +224,9 @@ struct Flight {
     page: u64,
 
     reservation: Reservation,
+
+    /// The completion already charged the contract.
+    settled: bool,
 }
 
 impl Entry {
@@ -225,6 +238,53 @@ impl Entry {
             byte_budget: subscription.byte_budget,
             deadline,
             flights: subscription.flights,
+            covered_page: false,
+            covered_bytes: 0,
+        }
+    }
+
+    /// Forfeit what newer ceilings granted on account of a request that will
+    /// not consume it.
+    fn forfeit(&mut self, page: bool, bytes: u64) {
+        if page {
+            self.subscription.page_budget = self.subscription.page_budget.saturating_sub(1);
+        }
+        self.subscription.byte_budget = self.subscription.byte_budget.saturating_sub(bytes);
+    }
+
+    /// Apply a newer request's ceilings. The requester debits a full page and
+    /// `PAGE_BYTES + 16` bytes per selection when issuing it, so the newer
+    /// ceilings already exclude every earlier outstanding request. Widen them
+    /// by at most those reservations, never above the current budgets, and
+    /// record the widening on the outstanding requests. Each must charge or
+    /// forfeit its share, so the contract minus every recorded widening never
+    /// exceeds the newest ceiling.
+    fn apply_ceiling(&mut self, sequence: u64, page_budget: u32, byte_budget: u64) {
+        const RESERVE: u64 = crate::model::PAGE_BYTES + 16;
+        let older = |r: &&mut Reservation| r.sequence != sequence;
+        let pages = self.admitted.iter_mut().filter(older).count();
+        let flights = pages + self.pending.iter().filter(|f| !f.settled).count();
+        self.subscription.page_budget = self
+            .subscription
+            .page_budget
+            .min(page_budget.saturating_add(u32::try_from(pages).unwrap_or(u32::MAX)));
+        self.subscription.byte_budget = self
+            .subscription
+            .byte_budget
+            .min(byte_budget.saturating_add(RESERVE.saturating_mul(flights as u64)));
+        let mut pages = self.subscription.page_budget.saturating_sub(page_budget);
+        let mut bytes = self.subscription.byte_budget.saturating_sub(byte_budget);
+        let mut cover = |covered: &mut u64| {
+            *covered = bytes.min(RESERVE);
+            bytes -= *covered;
+        };
+        for r in self.admitted.iter_mut().filter(older) {
+            r.covered_page = pages > 0;
+            pages = pages.saturating_sub(1);
+            cover(&mut r.covered_bytes);
+        }
+        for flight in self.pending.iter_mut().filter(|f| !f.settled) {
+            cover(&mut flight.reservation.covered_bytes);
         }
     }
 
@@ -245,7 +305,8 @@ impl Entry {
             if oldest.sequence > reservation.sequence {
                 return Err(Error::Replay);
             }
-            self.admitted.swap_remove(index);
+            let oldest = self.admitted.swap_remove(index);
+            self.forfeit(oldest.covered_page, oldest.covered_bytes);
         }
         self.admitted.push(reservation);
         Ok(())
@@ -485,8 +546,11 @@ impl Subscriptions {
                 let shift = sequence - latest;
                 entry.seen = if shift >= 64 { 0 } else { entry.seen << shift } | 1;
                 entry.deadline = entry.deadline.min(deadline);
-                let page_budget = entry.subscription.page_budget.min(subscription.page_budget);
-                let byte_budget = entry.subscription.byte_budget.min(subscription.byte_budget);
+                entry.apply_ceiling(sequence, subscription.page_budget, subscription.byte_budget);
+                let (page_budget, byte_budget) = (
+                    entry.subscription.page_budget,
+                    entry.subscription.byte_budget,
+                );
                 entry.subscription = subscription;
                 entry.subscription.page_budget = page_budget;
                 entry.subscription.byte_budget = byte_budget;
@@ -526,8 +590,11 @@ impl Subscriptions {
     /// the replay window.
     fn release(&self, (key, sequence): &(EntryKey, u64)) {
         self.with_state(None, |state| {
-            if let Some(entry) = state.entries.get_mut(key) {
-                entry.admitted.retain(|r| r.sequence != *sequence);
+            if let Some(entry) = state.entries.get_mut(key)
+                && let Some(index) = entry.admitted.iter().position(|r| r.sequence == *sequence)
+            {
+                let r = entry.admitted.swap_remove(index);
+                entry.forfeit(r.covered_page, r.covered_bytes);
             }
         });
     }
@@ -592,10 +659,14 @@ impl Subscriptions {
             let entry = state.entries.get_mut(key).expect("admitted entry");
             entry.subscription.page_budget -= 1;
             entry.admitted.retain(|r| r.sequence != *sequence);
+            // The page debit above consumes any page a newer ceiling granted.
+            let mut reservation = reservation;
+            reservation.covered_page = false;
             entry.pending.push(Flight {
                 token,
                 page: number,
                 reservation,
+                settled: false,
             });
             let waiter = Waiter {
                 scheduler: self.clone(),
@@ -691,8 +762,13 @@ impl State {
 
     fn remove_pending(&mut self, token: u64) -> Option<Pending> {
         let pending = self.fanout.remove(token)?;
-        if let Some(entry) = self.entries.get_mut(&pending.owner) {
-            entry.pending.retain(|flight| flight.token != token);
+        if let Some(entry) = self.entries.get_mut(&pending.owner)
+            && let Some(index) = entry.pending.iter().position(|f| f.token == token)
+        {
+            let flight = entry.pending.swap_remove(index);
+            if !flight.settled {
+                entry.forfeit(false, flight.reservation.covered_bytes);
+            }
         }
         Some(pending)
     }
@@ -718,10 +794,11 @@ impl State {
                     .ok_or(Error::StaleFlight)?
                     .reservation;
                 let bytes = copy.ciphertext.bytes().len() as u64;
+                // Charge at least what newer ceilings set aside for this flight.
                 let contract = entry
                     .subscription
                     .byte_budget
-                    .checked_sub(bytes)
+                    .checked_sub(bytes.max(reservation.covered_bytes))
                     .ok_or(Error::Unavailable)?;
                 let remaining = reservation
                     .byte_budget
@@ -751,6 +828,12 @@ impl State {
                 self.completed_intervals = count;
                 entry.completed = completed;
                 entry.subscription.byte_budget = contract;
+                let flight = entry
+                    .pending
+                    .iter_mut()
+                    .find(|flight| flight.token == token)
+                    .expect("pending flight");
+                flight.settled = true;
                 Ok(Completion {
                     metadata: copy.metadata.clone(),
                     ciphertext: copy.ciphertext.clone(),
@@ -1554,6 +1637,93 @@ mod tests {
         assert_eq!(a.grant.flights, Some(2));
         assert_eq!(b.grant.flights, None);
         drop(other);
+    }
+
+    /// Requester-shaped ceilings: each request pre-debits one page and
+    /// `PAGE_BYTES + 16` bytes for every earlier issued selection.
+    fn ceiling(sequence: u64, pages: u32, reserves: u64) -> Subscription {
+        let mut sub = multi(1, sequence, 2);
+        sub.page_budget = pages;
+        sub.byte_budget = reserves * (crate::model::PAGE_BYTES + 16);
+        sub
+    }
+
+    fn contract(scheduler: &Subscriptions) -> (u32, u64) {
+        let state = scheduler.state.lock().unwrap();
+        let entry = state.entries.values().next().unwrap();
+        (
+            entry.subscription.page_budget,
+            entry.subscription.byte_budget,
+        )
+    }
+
+    #[test]
+    fn multi_flight_shrinking_ceilings_do_not_charge_outstanding_flights_twice() {
+        const RESERVE: u64 = crate::model::PAGE_BYTES + 16;
+        // Both newer ceilings arrive before the older selection completes.
+        let scheduler = Arc::new(Subscriptions::new(Default::default()).unwrap());
+        let (first_work, mut first) = leader(schedule(&scheduler, ceiling(0, 2, 2), "a"));
+        let (second_work, mut second) = leader(schedule(&scheduler, ceiling(1, 1, 1), "a"));
+        assert_eq!(contract(&scheduler), (0, 2 * RESERVE));
+        let _a = complete(first_work);
+        let _b = complete(second_work);
+        let a = first.try_result(2).unwrap().unwrap();
+        let b = second.try_result(2).unwrap().unwrap();
+        assert_eq!(a.grant.remaining_byte_budget, 2 * RESERVE - 19);
+        assert_eq!(b.grant.remaining_byte_budget, RESERVE - 19);
+        // The first completion is charged its full reservation, never refunded.
+        assert_eq!(contract(&scheduler), (0, RESERVE - 19));
+        drop((a, b));
+        // A request reusing an exhausted ceiling cannot obtain another page.
+        assert!(matches!(
+            schedule(&scheduler, ceiling(2, 1, 1), "a"),
+            Err(Error::Unavailable)
+        ));
+
+        // An older request admitted but not yet selected keeps its page.
+        let scheduler = Arc::new(Subscriptions::new(Default::default()).unwrap());
+        let admit = |sub| scheduler.admit(sub, MembershipVersion(1), NodeId("a".into()), 1000, 1);
+        let zero = admit(ceiling(0, 2, 2)).unwrap();
+        let one = admit(ceiling(1, 1, 1)).unwrap();
+        assert_eq!(contract(&scheduler), (2, 2 * RESERVE));
+        let one = leader(
+            scheduler
+                .select(&one, 1, |_| Some(true))
+                .map(|s| s.unwrap()),
+        );
+        let zero = leader(
+            scheduler
+                .select(&zero, 1, |_| Some(true))
+                .map(|s| s.unwrap()),
+        );
+        assert_eq!(contract(&scheduler).0, 0);
+        let (one_work, mut one_waiter) = one;
+        let (zero_work, mut zero_waiter) = zero;
+        let _a = complete(one_work);
+        let _b = complete(zero_work);
+        assert!(one_waiter.try_result(2).unwrap().is_some());
+        assert!(zero_waiter.try_result(2).unwrap().is_some());
+        assert_eq!(contract(&scheduler), (0, RESERVE - 19));
+    }
+
+    #[test]
+    fn multi_flight_unused_widening_is_forfeited() {
+        const RESERVE: u64 = crate::model::PAGE_BYTES + 16;
+        let scheduler = Arc::new(Subscriptions::new(Default::default()).unwrap());
+        // A failed outstanding flight forfeits the bytes set aside for it.
+        let (work, waiter) = leader(schedule(&scheduler, ceiling(0, 3, 3), "a"));
+        let admit = |sub| scheduler.admit(sub, MembershipVersion(1), NodeId("a".into()), 1000, 1);
+        let one = admit(ceiling(1, 2, 2)).unwrap();
+        assert_eq!(contract(&scheduler), (2, 3 * RESERVE));
+        drop((work, waiter));
+        assert_eq!(contract(&scheduler), (2, 2 * RESERVE));
+        // An admitted request that never selects forfeits its page and bytes,
+        // so the contract falls to the newest ceiling.
+        let two = admit(ceiling(2, 1, 1)).unwrap();
+        assert_eq!(contract(&scheduler), (2, 2 * RESERVE));
+        scheduler.release(&one);
+        assert_eq!(contract(&scheduler), (1, RESERVE));
+        drop(two);
     }
 
     #[test]
