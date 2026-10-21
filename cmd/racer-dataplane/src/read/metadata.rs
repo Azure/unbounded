@@ -520,7 +520,11 @@ impl MetadataService {
                 PeerResponse::Miss | PeerResponse::Unavailable => {
                     return Err(Error::Unavailable.into());
                 }
-                PeerResponse::Page { .. } | PeerResponse::Selected { .. } => {
+                PeerResponse::Page { .. }
+                | PeerResponse::Selected { .. }
+                | PeerResponse::Held { .. }
+                | PeerResponse::Warmed
+                | PeerResponse::Released => {
                     return Err(Error::CorruptRecord.into());
                 }
                 PeerResponse::StaleMembership => return Err(Error::IncompatibleMembership.into()),

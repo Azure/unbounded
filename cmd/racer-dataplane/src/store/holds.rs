@@ -13,10 +13,80 @@ use std::time::{Duration, Instant, SystemTime};
 
 pub const MAX_HOLD_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
+/// Sorted, deduplicated page numbers covered by one version's hold.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HoldPages(Vec<PageNumber>);
+
+impl HoldPages {
+    /// Pages `0..count`, for callers that hold a whole prefix of a version.
+    pub fn prefix(count: u64) -> Self {
+        Self((0..count).map(PageNumber).collect())
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn contains(&self, page: PageNumber) -> bool {
+        self.0.binary_search(&page).is_ok()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = PageNumber> + '_ {
+        self.0.iter().copied()
+    }
+
+    /// Append a page. Ascending input stays linear; anything else is re-sorted.
+    pub fn insert(&mut self, page: PageNumber) {
+        match self.0.last() {
+            Some(last) if *last >= page => {
+                if let Err(at) = self.0.binary_search(&page) {
+                    self.0.insert(at, page);
+                }
+            }
+            _ => self.0.push(page),
+        }
+    }
+
+    /// Sorted merge of two page sets.
+    pub fn union(&self, other: &Self) -> Self {
+        let mut merged = Vec::with_capacity(self.0.len() + other.0.len());
+        let (mut a, mut b) = (self.0.iter().peekable(), other.0.iter().peekable());
+        loop {
+            let next = match (a.peek(), b.peek()) {
+                (Some(x), Some(y)) if x < y => a.next(),
+                (Some(x), Some(y)) if x > y => b.next(),
+                (Some(_), Some(_)) => {
+                    b.next();
+                    a.next()
+                }
+                (Some(_), None) => a.next(),
+                (None, Some(_)) => b.next(),
+                (None, None) => break,
+            };
+            merged.extend(next.copied());
+        }
+        Self(merged)
+    }
+}
+
+impl FromIterator<PageNumber> for HoldPages {
+    fn from_iter<I: IntoIterator<Item = PageNumber>>(iter: I) -> Self {
+        let mut pages: Vec<_> = iter.into_iter().collect();
+        pages.sort_unstable();
+        pages.dedup();
+        Self(pages)
+    }
+}
+
 pub(super) struct Hold {
     pub until: SystemTime,
     pub monotonic: Instant,
-    pub pages: usize,
+    /// Pages this worker promised to retain. Capacity is charged per member.
+    pub pages: HoldPages,
     pub inflight: Rc<Cell<usize>>,
     pub active: Rc<Cell<usize>>,
     pub locations: HashMap<PageNumber, RecordLocation>,
@@ -30,6 +100,7 @@ impl Hold {
 
     pub fn unused(&self) -> usize {
         self.pages
+            .len()
             .saturating_sub(self.locations.len() + self.inflight.get())
     }
 }
