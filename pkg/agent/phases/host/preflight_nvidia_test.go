@@ -46,7 +46,7 @@ func TestCheckNvidiaDriverMissingDriverCollectsErrors(t *testing.T) {
 	assertHasNvidiaResult(t, results, preflight.SeverityError, "NVIDIA device nodes", "required NVIDIA device nodes are missing")
 	assertHasNvidiaResult(t, results, preflight.SeverityError, "NVIDIA driver libraries", "libcuda.so.1")
 	assertHasNvidiaResult(t, results, preflight.SeverityError, "NVIDIA driver libraries", "libnvidia-ml.so.1")
-	assertHasNvidiaResult(t, results, preflight.SeverityWarning, "NVIDIA diagnostic tooling", "nvidia-smi is not installed")
+	assertHasNvidiaResult(t, results, preflight.SeverityError, "NVIDIA diagnostic tooling", "nvidia-smi is not installed")
 }
 
 func TestCheckNvidiaDriverAvailable(t *testing.T) {
@@ -83,7 +83,7 @@ func TestCheckNvidiaDriverAvailable(t *testing.T) {
 	env.touch(nvml)
 	env.outputs["ldconfig"] = []byte(fmt.Sprintf("\tlibcuda.so.1 (libc6,%s) => %s\n\tlibnvidia-ml.so.1 (libc6,%s) => %s\n", nvidiaLdconfigArchTag(), cuda, nvidiaLdconfigArchTag(), nvml))
 	env.outputs["modinfo"] = []byte("580.159.03\n")
-	env.outputs["nvidia-smi"] = []byte("GPU 0: Tesla T4\n")
+	env.outputs["nvidia-smi"] = []byte("GPU 0: Tesla T4 (UUID: GPU-12345678-1234-1234-1234-123456789abc)\n")
 	env.outputs["systemctl list-unit-files nvidia-persistence-mode.service"] = []byte("nvidia-persistence-mode.service enabled enabled\n")
 	env.outputs["systemctl is-active nvidia-persistence-mode.service"] = []byte("active\n")
 	env.paths["modinfo"] = true
@@ -97,6 +97,19 @@ func TestCheckNvidiaDriverAvailable(t *testing.T) {
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
 	assert.Equal(t, checkNvidiaDriverName, results[0].Name)
 	assert.Contains(t, results[0].Message, "NVIDIA driver stack is available")
+}
+
+func TestCheckNvidiaDriverNoUsableGPUs(t *testing.T) {
+	t.Parallel()
+
+	env := newNvidiaPreflightTestEnv(t)
+	env.addNvidiaPCI("0001:00:00.0", "../../../bus/pci/drivers/nvidia")
+	env.paths["nvidia-smi"] = true
+	env.outputs["nvidia-smi"] = []byte("No devices found.\n")
+
+	results := checkNvidiaDriver(slog.New(slog.DiscardHandler), env.deps()).Check(context.Background())
+
+	assertHasNvidiaResult(t, results, preflight.SeverityError, "NVIDIA diagnostic tooling", "NVIDIA GPUs are not ready")
 }
 
 func assertHasNvidiaResult(t *testing.T, results []preflight.Result, severity preflight.Severity, target, message string) {

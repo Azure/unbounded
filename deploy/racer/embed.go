@@ -21,7 +21,7 @@ import (
 // trust, installation, and create-restriction state are written by the
 // operator directly, so those templates are excluded.
 //
-//go:embed config.yaml.tmpl controller.yaml.tmpl dataplane-config.yaml.tmpl controller-pdb.yaml.tmpl node-restriction.yaml.tmpl rbac.yaml.tmpl
+//go:embed config.yaml.tmpl controller.yaml.tmpl dataplane-config.yaml.tmpl controller-pdb.yaml.tmpl mutating-webhook.yaml.tmpl node-restriction.yaml.tmpl rbac.yaml.tmpl
 var sources embed.FS
 
 // Manifests exposes the embedded templates as rendered flat *.yaml names. It
@@ -68,6 +68,7 @@ func (manifestFS) Open(name string) (fs.File, error) {
 	var rendered bytes.Buffer
 	if err := tmpl.Execute(&rendered, map[string]string{
 		"ControllerImage": "ghcr.io/azure/racer-controller:" + version.Version,
+		"ObjectImage":     "ghcr.io/azure/racer-object:" + version.Version,
 	}); err != nil {
 		return nil, err
 	}

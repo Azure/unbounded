@@ -5,10 +5,8 @@ metadata:
 spec:
   template:
     spec:
-      securityContext:
-        runAsNonRoot: false
-        runAsUser: 0
-        runAsGroup: 0
+      # Inherits the base pod securityContext: runAsNonRoot with UID/GID 65532,
+      # the owner the racer-dataplane assigns to the origin directory.
       containers:
         - name: racer-loadgen
           # Replace all OCI arguments: generic blobs exclude image sizing flags.
@@ -35,10 +33,19 @@ spec:
             requests:
               memory: 256Mi
           volumeMounts:
-            - name: racer-sockets
-              mountPath: /run/racer/racer-loadgen
+            - name: racer-client
+              mountPath: /run/racer/racer-loadgen/client
+            - name: racer-origin
+              mountPath: /run/racer/racer-loadgen/origin
+      # The racer-dataplane creates both directories once it publishes the
+      # cache. Type Directory keeps the pod in ContainerCreating until then
+      # instead of creating root-owned directories the origin cannot use.
       volumes:
-        - name: racer-sockets
+        - name: racer-client
           hostPath:
-            path: /run/racer/racer-loadgen
-            type: DirectoryOrCreate
+            path: /run/racer/racer-loadgen/client
+            type: Directory
+        - name: racer-origin
+          hostPath:
+            path: /run/racer/racer-loadgen/origin
+            type: Directory

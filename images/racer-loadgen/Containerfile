@@ -44,9 +44,10 @@ ENV PATH="/unbounded/bin"
 
 WORKDIR /unbounded
 
-# UDS startup needs the default root-owned /run/racer layout and an origin
-# socket accessible to the root dataplane.
-USER 0:0
+# The racer-dataplane creates /run/racer/<cache>/origin owned by 65532:65532
+# with mode 0700, so the UDS origin runs as that user. The privileged
+# dataplane can still connect to the origin's mode 0600 socket.
+USER 65532:65532
 
 # 8080 = synthetic registry, 9090 = metrics and health
 EXPOSE 8080 9090

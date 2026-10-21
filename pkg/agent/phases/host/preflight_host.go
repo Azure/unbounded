@@ -369,15 +369,19 @@ func checkSystemdUnitActive(
 	serviceName string,
 ) preflight.Checker {
 	return simpleHostChecker{name: checkName, check: func(ctx context.Context) []preflight.Result {
-		out, err := deps.outputCmd(ctx, log, "systemctl", "is-active", unit)
+		// systemctl is-active exits non-zero for every state but active, an inactive
+		// or missing unit included, and its output is lost with the error. show
+		// exits 0 for those too, reporting a missing unit as inactive.
+		out, err := deps.outputCmd(ctx, log, "systemctl", "show", "--property=ActiveState", "--value", unit)
+		state := strings.TrimSpace(out)
 		log.Debug(
 			"checked host systemd unit state",
 			"unit", unit,
-			"state", strings.TrimSpace(out),
+			"state", state,
 			"error", err != nil,
 		)
 
-		if err != nil {
+		if err != nil || state == "" {
 			return preflight.ResultsWarning(
 				checkName,
 				unit,
@@ -386,7 +390,7 @@ func checkSystemdUnitActive(
 			)
 		}
 
-		if strings.TrimSpace(out) == "active" {
+		if state == "active" {
 			return preflight.ResultsWarning(
 				checkName,
 				unit,

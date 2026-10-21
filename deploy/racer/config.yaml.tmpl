@@ -12,6 +12,9 @@ data:
   RACER_HANDSHAKE_TIMEOUT: {{ .HandshakeTimeout | default "5s" | quote }}
   RACER_METRICS_ADDRESS: ":8080"
   RACER_PROBE_ADDRESS: ":8081"
+  RACER_WEBHOOK_ADDRESS: ":9443"
+  # Native sidecar image injected into opted-in pods by the admission webhook.
+  RACER_OBJECT_IMAGE: {{ .ObjectImage | default "ghcr.io/azure/racer-object:latest" | quote }}
   RACER_PEER_PORT: "8082"
   RACER_TLS_CERTIFICATE_FILE: "/etc/racer/tls/tls.crt"
   RACER_TLS_PRIVATE_KEY_FILE: "/etc/racer/tls/tls.key"

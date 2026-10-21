@@ -37,5 +37,10 @@ X-Meta-Source-Client = ["unbounded-kube/kubelet"]
 [plugins."io.containerd.transfer.v1.local"]
 max_concurrent_downloads = 6
 
+[plugins."io.containerd.image-verifier.v1.bindir"]
+bin_dir = "/opt/containerd/image-verifier/bin"
+max_verifiers = 10
+per_verifier_timeout = "10s"
+
 [metrics]
 address = "{{.MetricsAddress}}"

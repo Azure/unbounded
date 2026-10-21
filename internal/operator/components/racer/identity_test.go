@@ -107,6 +107,8 @@ func TestIdentityInterruptionBoundaries(t *testing.T) {
 							return before.Data["cluster"], true
 						case "POD_NAMESPACE":
 							return env.Namespace, true
+						case "RACER_OBJECT_IMAGE":
+							return "example.com/racer-object:test", true
 						}
 
 						return "", false

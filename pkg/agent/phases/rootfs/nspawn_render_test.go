@@ -251,6 +251,51 @@ func TestNSpawnConfig_AdditionalHostMounts(t *testing.T) {
 	require.Contains(t, buf.String(), "Bind=/var/lib/data:/data")
 }
 
+func TestNSpawnConfig_ImageVerifierMount(t *testing.T) {
+	t.Parallel()
+
+	machineDir := t.TempDir()
+	hostDir := t.TempDir()
+
+	const target = "/opt/containerd/image-verifier/bin"
+
+	targetPath := filepath.Join(machineDir, target)
+
+	cfg := config.AgentConfig{
+		MachineName: "machine-1",
+		NodeName:    "node-1",
+		AdditionalHostMounts: []config.AdditionalHostMount{{
+			Source: hostDir, Target: target, ReadOnly: true,
+		}},
+	}
+	data, err := json.Marshal(cfg)
+	require.NoError(t, err)
+
+	var decoded config.AgentConfig
+	require.NoError(t, json.Unmarshal(data, &decoded))
+	require.NoError(t, config.ValidateAdditionalHostMounts(decoded.AdditionalHostMounts))
+
+	log := slog.New(slog.DiscardHandler)
+	gs, err := goalstates.ResolveMachine(log, &decoded, "machine-1", nil)
+	require.NoError(t, err)
+	require.Equal(t, cfg.AdditionalHostMounts, gs.RootFS.AdditionalHostMounts)
+	require.Len(t, gs.RootFS.AdditionalHostMounts, 1)
+
+	gs.RootFS.MachineDir = machineDir
+	gs.RootFS.NSpawnConfigFile = filepath.Join(machineDir, "machine.nspawn")
+	gs.RootFS.ServiceOverrideFile = filepath.Join(machineDir, "override.conf")
+	gs.RootFS.ConfigRegenerationFile = filepath.Join(machineDir, "config-regeneration.service")
+	require.NoError(t, writeNSpawnConfigs(log, gs.RootFS))
+
+	rendered, err := os.ReadFile(gs.RootFS.NSpawnConfigFile)
+	require.NoError(t, err)
+	require.Contains(t, string(rendered), "BindReadOnly="+hostDir+":"+target+"\n")
+	require.NotContains(t, string(rendered), "\nBind="+hostDir+":")
+
+	_, err = os.Stat(targetPath)
+	require.ErrorIs(t, err, os.ErrNotExist, "config generation must leave mountpoint creation to nspawn")
+}
+
 func TestNSpawnConfig_NvidiaIMEXDevice(t *testing.T) {
 	t.Parallel()
 

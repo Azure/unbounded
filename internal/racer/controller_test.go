@@ -768,6 +768,8 @@ func startIntegrationManager(t *testing.T, rc *rest.Config, scheme *runtime.Sche
 
 	ip := fmt.Sprintf("127.0.0.%d", i+2)
 	cfg.ControlAddress, cfg.ProbeAddress = net.JoinHostPort(ip, port), unusedAddress(t)
+	// Both managers share one process, so each needs its own webhook listener.
+	cfg.WebhookAddress = unusedAddress(t)
 
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: cfg.Namespace, Name: fmt.Sprintf("controller-%d", i)}, Spec: corev1.PodSpec{ServiceAccountName: sa.Name, Containers: []corev1.Container{{Name: "controller", Image: "example.invalid/controller:test"}}}}
 	if err := c.Create(t.Context(), pod); err != nil {

@@ -116,6 +116,14 @@ func newScope(namespace string, buckets []string) (scope, error) {
 	return s, nil
 }
 
+// ValidateOriginScope reports whether an origin accepts namespace and buckets,
+// so callers that render origin flags can reject them before the origin starts.
+func ValidateOriginScope(namespace string, buckets []string) error {
+	_, err := newScope(namespace, buckets)
+
+	return err
+}
+
 func (s scope) allows(bucket string) bool {
 	if len(s.buckets) == 0 {
 		return true

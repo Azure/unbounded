@@ -90,7 +90,9 @@ func TestMediaLegacyServingAfterLiveLeaseChange(t *testing.T) {
 							}
 
 							w := firstBootRequest(h, "/"+path, source, "", forwarded)
-							if wantAllowed {
+							// Forwarded headers are ignored, so only the Machine's
+							// direct peer address can be served.
+							if wantAllowed && source == ip {
 								require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
 								if scenario == "released successor" && strings.HasSuffix(path, "grub.cfg") {
