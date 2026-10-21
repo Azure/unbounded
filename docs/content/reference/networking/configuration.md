@@ -224,6 +224,31 @@ hosts, which are not counted here. Existing larger operator-set values are
 preserved. Sizing is reapplied after an agent restart or host reboot; the agent
 does not write host `/etc/sysctl.d` files or restore lower values at shutdown.
 
+#### Neighbor table exhaustion warnings
+
+Before tuning, each reconciliation checks the host network namespace's actual
+IPv4 and IPv6 neighbor occupancy against that family's current `gc_thresh3`.
+Permanent, externally learned, externally validated, and loopback entries are
+excluded because they do not count toward the kernel's GC limit. Reaching or
+exceeding the limit produces a `neighborTableFullIPv4` or
+`neighborTableFullIPv6` warning: forced garbage collection may be needed before
+new neighbors can be allocated.
+
+The agent also watches per-CPU `table_fulls` counters in
+`/proc/net/stat/arp_cache` and `/proc/net/stat/ndisc_cache`. Increases indicate
+actual allocation failures at the GC hard limit and produce
+`neighborTableOverflowIPv4` or `neighborTableOverflowIPv6` warnings. These kernel
+counters also catch short-lived exhaustion between samples and failures caused
+by demand in other network namespaces. The initial sample establishes a
+baseline; historical failures are not repeatedly reported as new events.
+
+Warnings are logged and sent to the controller in both full and summary node
+status. An observed pressure or overflow warning remains visible for one minute
+after its last observation, even if automatic tuning raises the limit in the
+same cycle. Observation failures are reported separately as
+`neighborTableCheckFailed`, not as healthy or exhausted tables. Missing IPv6
+thresholds and unavailable proc counter files are skipped.
+
 #### Other scale-sensitive sysctls
 
 These require workload measurements, not a universal multiplier of node count,
