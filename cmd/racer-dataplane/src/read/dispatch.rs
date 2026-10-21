@@ -27,7 +27,7 @@ use crate::runtime::HashMap;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
 use crate::security::PeerOriginContext;
-use crate::store::holds::HoldPages;
+use crate::store::holds::{HoldEpoch, HoldPages};
 use sha2::Digest;
 use sha2::Sha256;
 use std::cell::RefCell;
@@ -83,7 +83,7 @@ pub struct WorkerDirectory {
 enum Work {
     Hold(ObjectVersion, HoldPages, std::time::SystemTime),
     /// Drop one holder from each page of this worker's hold for the version.
-    Release(ObjectVersion, HoldPages),
+    Release(ObjectVersion, HoldPages, HoldEpoch),
     Warm(
         PageId,
         crate::model::VersionMetadata,
@@ -122,7 +122,7 @@ enum Work {
     Peer(VerifiedRequest, std::sync::Arc<crate::topology::Membership>),
 }
 enum Value {
-    Held(bool, std::time::SystemTime),
+    Held(bool, std::time::SystemTime, HoldEpoch),
     Metadata(ObjectMetadata),
     Page(PageResult),
     Cached(Option<PageResult>),
@@ -484,7 +484,7 @@ impl WorkerDirectory {
                 .await?
                 .value?
             {
-                Value::Held(_created, expiry) => {
+                Value::Held(_created, expiry, _epoch) => {
                     fresh.push(mailbox.worker);
                     accepted = accepted.max(expiry);
                 }
@@ -509,9 +509,10 @@ impl WorkerDirectory {
         Ok(accepted)
     }
 
-    /// Drop one holder from `pages[worker]` on each listed local worker. Pages
-    /// whose last holder leaves become evictable. Workers absent from `pages`
-    /// are untouched. Pair with one `Work::Hold` per page set.
+    /// Drop one holder from `pages[worker]` on each listed local worker, under
+    /// the epoch that worker's `Work::Hold` returned. Pages whose last holder
+    /// leaves become evictable. Workers absent from `pages` are untouched.
+    /// Pair with one `Work::Hold` per page set.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "used by the per-read fetch job in a later change")
@@ -519,17 +520,17 @@ impl WorkerDirectory {
     pub(super) async fn release_hold_pages(
         &self,
         version: &ObjectVersion,
-        pages: &std::collections::BTreeMap<u16, HoldPages>,
+        pages: &std::collections::BTreeMap<u16, (HoldPages, HoldEpoch)>,
         scope: &RequestScope,
     ) -> Result<()> {
         scope.check()?;
-        for (worker, held) in pages {
+        for (worker, (held, epoch)) in pages {
             if held.is_empty() {
                 continue;
             }
             let receipt = self.submit(
                 WorkerId(*worker),
-                Work::Release(version.clone(), held.clone()),
+                Work::Release(version.clone(), held.clone(), *epoch),
                 scope,
                 None,
             )?;
@@ -545,13 +546,14 @@ impl WorkerDirectory {
     }
 
     /// Add one holder to `page` on its owning worker only, until `until`.
-    /// Pair every success with one `release_read_pages` of the same page.
+    /// Pair every success with one `release_read_pages` of the same page and
+    /// the returned epoch.
     pub(super) async fn hold_read_page(
         &self,
         page: &PageId,
         until: std::time::SystemTime,
         scope: &RequestScope,
-    ) -> Result<()> {
+    ) -> Result<HoldEpoch> {
         let owner = self.page_owner(page)?;
         let pages = std::iter::once(page.number).collect::<HoldPages>();
         let receipt = self.submit(
@@ -564,7 +566,7 @@ impl WorkerDirectory {
             .await?
             .value?
         {
-            Value::Held(..) => Ok(()),
+            Value::Held(_, _, epoch) => Ok(epoch),
             _ => Err(Error::StaleFlight),
         }
     }
@@ -575,21 +577,21 @@ impl WorkerDirectory {
     pub(super) fn release_read_pages(
         &self,
         version: &ObjectVersion,
-        pages: impl IntoIterator<Item = PageNumber>,
+        pages: impl IntoIterator<Item = (PageNumber, HoldEpoch)>,
         request: crate::model::RequestId,
     ) {
-        let mut owners: std::collections::BTreeMap<WorkerId, HoldPages> =
+        let mut owners: std::collections::BTreeMap<(WorkerId, HoldEpoch), HoldPages> =
             std::collections::BTreeMap::new();
-        for number in pages {
+        for (number, epoch) in pages {
             let page = PageId {
                 version: version.clone(),
                 number,
             };
             if let Ok(owner) = self.page_owner(&page) {
-                owners.entry(owner).or_default().insert(number);
+                owners.entry((owner, epoch)).or_default().insert(number);
             }
         }
-        for (owner, held) in owners {
+        for ((owner, epoch), held) in owners {
             if self.is_local(owner) {
                 if let Ok(local) = self.local() {
                     local
@@ -597,7 +599,7 @@ impl WorkerDirectory {
                         .dependencies
                         .writer
                         .index()
-                        .release_hold_pages(version, &held);
+                        .release_hold_pages(version, &held, epoch);
                 }
                 continue;
             }
@@ -610,9 +612,12 @@ impl WorkerDirectory {
             ) else {
                 continue;
             };
-            if let Ok(receipt) =
-                self.submit(owner, Work::Release(version.clone(), held), &scope, None)
-            {
+            if let Ok(receipt) = self.submit(
+                owner,
+                Work::Release(version.clone(), held, epoch),
+                &scope,
+                None,
+            ) {
                 permit.submit_detached(Box::pin(async move {
                     let _ = receipt.await;
                     Ok::<(), Error>(())
@@ -1069,7 +1074,7 @@ async fn execute(
     match work {
         Work::Hold(version, pages, until) => {
             let previous = local.fill.dependencies.writer.index().hold_expiry(&version);
-            local
+            let epoch = local
                 .fill
                 .dependencies
                 .writer
@@ -1078,15 +1083,16 @@ async fn execute(
             Ok(Value::Held(
                 previous.is_none(),
                 previous.map_or(until, |old| old.max(until)),
+                epoch,
             ))
         }
-        Work::Release(version, pages) => {
+        Work::Release(version, pages, epoch) => {
             local
                 .fill
                 .dependencies
                 .writer
                 .index()
-                .release_hold_pages(&version, &pages);
+                .release_hold_pages(&version, &pages, epoch);
             Ok(Value::Published)
         }
         Work::WarmLocal(page) => local.fill.warm_local(&page, scope).await.map(Value::Page),
@@ -1331,7 +1337,7 @@ mod tests {
                 .complete(
                     command.generation,
                     Completion {
-                        value: Ok(Value::Held(true, *until)),
+                        value: Ok(Value::Held(true, *until, HoldEpoch::default())),
                         budget: None,
                     },
                 )

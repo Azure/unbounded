@@ -13,6 +13,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 pub const MAX_HOLD_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
+/// Identity of one hold entry's lifetime on a worker. A version's hold gets a
+/// new epoch whenever its entry is created, including after expiry, whole
+/// release or restart, so a page release carrying an older epoch cannot drop a
+/// holder that a later reservation added. Epochs are process-local.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct HoldEpoch(u64);
+
 /// Sorted, deduplicated page numbers covered by one version's hold.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HoldPages(Vec<PageNumber>);
@@ -91,6 +98,8 @@ pub(super) struct Hold {
     /// `reserve_hold_pages` adds one per requested page and each
     /// `release_hold_pages` removes one. Not persisted: restored pages start at one.
     pub holders: HashMap<PageNumber, u32>,
+    /// Lifetime identity returned by reservation and required by page release.
+    pub epoch: HoldEpoch,
     pub inflight: Rc<Cell<usize>>,
     pub active: Rc<Cell<usize>>,
     pub locations: HashMap<PageNumber, RecordLocation>,
@@ -119,6 +128,8 @@ pub(super) struct Holds {
     pub segments: Option<Rc<Segments>>,
     pub free_reserve: usize,
     pub percent: usize,
+    /// Last epoch handed to a newly created entry.
+    pub last_epoch: u64,
 }
 
 impl Default for Holds {
@@ -128,11 +139,18 @@ impl Default for Holds {
             segments: None,
             free_reserve: 1,
             percent: 50,
+            last_epoch: 0,
         }
     }
 }
 
 impl Holds {
+    /// A fresh epoch for a newly created hold entry.
+    pub fn next_epoch(&mut self) -> HoldEpoch {
+        self.last_epoch += 1;
+        HoldEpoch(self.last_epoch)
+    }
+
     pub fn expire(&mut self) {
         self.entries
             .retain(|_, hold| hold.live() || hold.inflight.get() != 0 || hold.active.get() != 0);

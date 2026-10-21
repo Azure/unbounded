@@ -25,6 +25,7 @@ use crate::model::ResolvedRange;
 use crate::read::dispatch::WorkerMap;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
+use crate::store::holds::HoldEpoch;
 use flow_control::Window;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -496,7 +497,7 @@ enum Slot {
 /// A page fetched ahead of the in-memory window onto local disk.
 enum Spilling {
     /// Reserving this read's hold on the page's owning worker.
-    Holding(Operation<'static, ()>),
+    Holding(Operation<'static, HoldEpoch>),
     /// Filling the held page through the warm path, which persists it.
     Warming(Operation<'static, ()>),
     /// Published under this read's hold.
@@ -510,8 +511,9 @@ struct Spill {
     /// Set once a hold is refused; the read then keeps only its memory window.
     refused: bool,
     pages: BTreeMap<u64, Spilling>,
-    /// Pages this read holds; each owes exactly one release.
-    held: BTreeSet<u64>,
+    /// Pages this read holds and the hold epoch each was taken under; each owes
+    /// exactly one release under that epoch.
+    held: BTreeMap<u64, HoldEpoch>,
 }
 
 /// One outstanding provider selection and the window pages it covers.
@@ -671,7 +673,7 @@ impl RangeStream {
             limit,
             refused: false,
             pages: BTreeMap::new(),
-            held: BTreeSet::new(),
+            held: BTreeMap::new(),
         });
         Ok(())
     }
@@ -1162,8 +1164,8 @@ impl RangeStream {
             let version = self.metadata.version.clone();
             let request = self.scope.request;
             permit.submit_detached(Box::pin(async move {
-                if holding.await.is_ok() {
-                    directory.release_read_pages(&version, [PageNumber(number)], request);
+                if let Ok(epoch) = holding.await {
+                    directory.release_read_pages(&version, [(PageNumber(number), epoch)], request);
                 }
                 Ok::<(), Error>(())
             }));
@@ -1171,7 +1173,10 @@ impl RangeStream {
         if !spill.held.is_empty() {
             self.directory.release_read_pages(
                 &self.metadata.version,
-                spill.held.into_iter().map(PageNumber),
+                spill
+                    .held
+                    .into_iter()
+                    .map(|(number, epoch)| (PageNumber(number), epoch)),
                 self.scope.request,
             );
         }
@@ -1186,42 +1191,41 @@ impl RangeStream {
         let mut release = Vec::new();
         let mut warm = Vec::new();
         spill.pages.retain(|number, state| {
-            let result = match state {
-                Spilling::Holding(op) | Spilling::Warming(op) => match op.as_mut().poll(cx) {
-                    Poll::Pending => return true,
-                    Poll::Ready(result) => result,
-                },
-                Spilling::Spilled => return true,
-            };
-            changed = true;
-            match (&state, result) {
-                (Spilling::Holding(_), Ok(())) => {
-                    spill.held.insert(*number);
+            match state {
+                Spilling::Holding(op) => {
+                    let Poll::Ready(result) = op.as_mut().poll(cx) else {
+                        return true;
+                    };
+                    changed = true;
+                    let Ok(epoch) = result else {
+                        // Hold limits, a missing key or no disk: keep the memory window.
+                        spill.refused = true;
+                        return false;
+                    };
                     // The window reached the page while its hold was pending.
                     if *number < horizon {
-                        spill.held.remove(number);
-                        release.push(PageNumber(*number));
+                        release.push((PageNumber(*number), epoch));
                         return false;
                     }
+                    spill.held.insert(*number, epoch);
                     warm.push(*number);
                     true
                 }
-                // Hold limits, a missing key or no disk: keep the memory window.
-                (Spilling::Holding(_), Err(_)) => {
-                    spill.refused = true;
-                    false
-                }
-                (Spilling::Warming(_), Ok(())) => {
-                    *state = Spilling::Spilled;
-                    true
-                }
-                (_, Err(_)) => {
-                    if spill.held.remove(number) {
-                        release.push(PageNumber(*number));
+                Spilling::Warming(op) => {
+                    let Poll::Ready(result) = op.as_mut().poll(cx) else {
+                        return true;
+                    };
+                    changed = true;
+                    if result.is_ok() {
+                        *state = Spilling::Spilled;
+                        return true;
+                    }
+                    if let Some(epoch) = spill.held.remove(number) {
+                        release.push((PageNumber(*number), epoch));
                     }
                     false
                 }
-                (Spilling::Spilled, Ok(())) => true,
+                Spilling::Spilled => true,
             }
         });
         for number in warm {
@@ -1410,10 +1414,13 @@ impl RangeStream {
             .map_err(window_error)?;
         self.retained.insert(number, result.plaintext.clone());
         if let Some(spill) = self.spill.as_mut()
-            && spill.held.remove(&number.0)
+            && let Some(epoch) = spill.held.remove(&number.0)
         {
-            self.directory
-                .release_read_pages(&self.metadata.version, [number], self.scope.request);
+            self.directory.release_read_pages(
+                &self.metadata.version,
+                [(number, epoch)],
+                self.scope.request,
+            );
         }
         self.delivery.attach(result.plaintext, slice).map(Some)
     }

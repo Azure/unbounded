@@ -1620,7 +1620,14 @@ fn release_hold_pages_drops_one_holder_on_each_listed_worker() {
             });
         run(&mut reserve).unwrap();
     }
-    let release = std::collections::BTreeMap::from([(1, pages(&[0]))]);
+    let epoch = locals[1]
+        .fill
+        .dependencies
+        .writer
+        .index()
+        .hold_epoch(&version)
+        .unwrap();
+    let release = std::collections::BTreeMap::from([(1, (pages(&[0]), epoch))]);
     let page = |number| PageId {
         version: version.clone(),
         number: PageNumber(number),
