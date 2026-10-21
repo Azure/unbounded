@@ -83,7 +83,7 @@ pub struct WorkerDirectory {
 enum Work {
     Hold(ObjectVersion, HoldPages, std::time::SystemTime, HolderKind),
     /// Drop one holder from each page of this worker's hold for the version.
-    Release(ObjectVersion, HoldPages, HoldEpoch),
+    Release(ObjectVersion, HoldPages, HoldEpoch, HolderKind),
     Warm(
         PageId,
         crate::model::VersionMetadata,
@@ -512,7 +512,8 @@ impl WorkerDirectory {
     /// Drop one holder from `pages[worker]` on each listed local worker, under
     /// the epoch that worker's `Work::Hold` returned. Pages whose last holder
     /// leaves become evictable. Workers absent from `pages` are untouched.
-    /// Pair with one `Work::Hold` per page set.
+    /// Pair with one warm `Work::Hold` per page set, as [`Self::reserve_warm`]
+    /// takes; the release drops warm holders only.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "used by the per-read fetch job in a later change")
@@ -530,7 +531,7 @@ impl WorkerDirectory {
             }
             let receipt = self.submit(
                 WorkerId(*worker),
-                Work::Release(version.clone(), held.clone(), *epoch),
+                Work::Release(version.clone(), held.clone(), *epoch, HolderKind::Warm),
                 scope,
                 None,
             )?;
@@ -594,12 +595,12 @@ impl WorkerDirectory {
         for ((owner, epoch), held) in owners {
             if self.is_local(owner) {
                 if let Ok(local) = self.local() {
-                    local
-                        .fill
-                        .dependencies
-                        .writer
-                        .index()
-                        .release_hold_pages(version, &held, epoch);
+                    local.fill.dependencies.writer.index().release_hold_pages(
+                        version,
+                        &held,
+                        epoch,
+                        HolderKind::Reader,
+                    );
                 }
                 continue;
             }
@@ -614,7 +615,7 @@ impl WorkerDirectory {
             };
             if let Ok(receipt) = self.submit(
                 owner,
-                Work::Release(version.clone(), held, epoch),
+                Work::Release(version.clone(), held, epoch, HolderKind::Reader),
                 &scope,
                 None,
             ) {
@@ -1086,13 +1087,13 @@ async fn execute(
                 epoch,
             ))
         }
-        Work::Release(version, pages, epoch) => {
+        Work::Release(version, pages, epoch, kind) => {
             local
                 .fill
                 .dependencies
                 .writer
                 .index()
-                .release_hold_pages(&version, &pages, epoch);
+                .release_hold_pages(&version, &pages, epoch, kind);
             Ok(Value::Published)
         }
         Work::WarmLocal(page) => local.fill.warm_local(&page, scope).await.map(Value::Page),

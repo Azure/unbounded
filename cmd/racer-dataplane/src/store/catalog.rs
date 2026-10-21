@@ -236,7 +236,8 @@ impl Index {
 
     /// Like [`Self::reserve_hold_pages`], but the holders belong to a warm job:
     /// [`Self::release_hold`] drops them from unpublished pages, and expiry
-    /// drops the rest. Releasing them with [`Self::release_hold_pages`] also works.
+    /// drops the rest. Releasing them with [`Self::release_hold_pages`] also
+    /// works when it is given [`super::holds::HolderKind::Warm`].
     pub fn reserve_warm_hold_pages(
         &self,
         version: &ObjectVersion,
@@ -454,11 +455,18 @@ impl Index {
     /// release cannot drop a later reservation's holder. Releasing a
     /// page whose held write is still in flight is allowed; that write then
     /// publishes as an ordinary cached page.
+    ///
+    /// `kind` must match the reservation's kind. A warm release drops a warm
+    /// holder and a reader release drops a reader holder; a page with no
+    /// holder of that kind is skipped, so one kind's release never consumes
+    /// the other's holder, and later warm cleanup ([`Self::release_hold`])
+    /// removes only the warm holders that remain.
     pub fn release_hold_pages(
         &self,
         version: &ObjectVersion,
         pages: &super::holds::HoldPages,
         epoch: super::holds::HoldEpoch,
+        kind: super::holds::HolderKind,
     ) {
         let mut holds = self.holds.borrow_mut();
         let Some(hold) = holds.entries.get_mut(version) else {
@@ -471,8 +479,12 @@ impl Index {
                 .get_mut(&number)
                 .filter(|holder| holder.since <= epoch)
             {
+                match kind {
+                    super::holds::HolderKind::Warm if holder.warm != 0 => holder.warm -= 1,
+                    super::holds::HolderKind::Reader if holder.count > holder.warm => {}
+                    _ => continue,
+                }
                 holder.count -= 1;
-                holder.warm = holder.warm.min(holder.count);
                 if holder.count == 0 {
                     hold.holders.remove(&number);
                     hold.locations.remove(&number);
@@ -1364,6 +1376,7 @@ mod tests {
     use super::*;
     use crate::model::CacheKey;
     use crate::model::StrongEtag;
+    use crate::store::holds::HolderKind;
     use racer_control_wire::CacheId;
 
     fn segments(bytes: u64, count: usize) -> Segments {
@@ -1562,14 +1575,14 @@ mod tests {
         let other = descriptor("other", 17).version;
         assert_eq!(index.reserve_hold(&other, 2, until), Err(Error::Overloaded));
         // The read's release leaves the shared pages held by the warm.
-        index.release_hold_pages(&version, &page_set(&[0, 2]), epoch);
+        index.release_hold_pages(&version, &page_set(&[0, 2]), epoch, HolderKind::Reader);
         assert!(index.is_held(&at(0)));
         assert!(index.is_held(&at(2)));
         assert_eq!(index.hold_holders(&at(0)), 1);
         assert!(index.victim(&index.state.borrow()).is_none());
         // Releasing the last holder makes the published page evictable and
         // returns its capacity; unknown pages are ignored.
-        index.release_hold_pages(&version, &page_set(&[0, 1, 9]), epoch);
+        index.release_hold_pages(&version, &page_set(&[0, 1, 9]), epoch, HolderKind::Reader);
         assert!(!index.is_held(&at(0)));
         assert!(!index.is_held(&at(1)));
         assert_eq!(index.held_page_expiry(&at(0)), None);
@@ -1578,9 +1591,9 @@ mod tests {
         assert!(index.is_held(&at(2)));
         index.reserve_hold(&other, 2, until).unwrap();
         // The last page leaving removes the whole hold.
-        index.release_hold_pages(&version, &page_set(&[2]), epoch);
+        index.release_hold_pages(&version, &page_set(&[2]), epoch, HolderKind::Reader);
         assert_eq!(index.hold_expiry(&version), None);
-        index.release_hold_pages(&version, &page_set(&[2]), epoch);
+        index.release_hold_pages(&version, &page_set(&[2]), epoch, HolderKind::Reader);
         assert_eq!(index.hold_expiry(&version), None);
     }
 
@@ -1616,13 +1629,13 @@ mod tests {
         assert_ne!(replacement, original);
         assert_eq!(index.hold_holders(&page), 1);
         // The original read's delayed release must not consume that holder.
-        index.release_hold_pages(&version, &page_set(&[0]), original);
+        index.release_hold_pages(&version, &page_set(&[0]), original, HolderKind::Reader);
         assert_eq!(index.hold_holders(&page), 1);
         assert!(index.is_held(&page));
         assert_eq!(index.held_page_expiry(&page), Some(until));
         assert!(index.victim(&index.state.borrow()).is_none());
         // The replacement's own release still works.
-        index.release_hold_pages(&version, &page_set(&[0]), replacement);
+        index.release_hold_pages(&version, &page_set(&[0]), replacement, HolderKind::Reader);
         assert!(!index.is_held(&page));
         assert_eq!(index.hold_expiry(&version), None);
         assert_eq!(index.victim(&index.state.borrow()), Some(page.clone()));
@@ -1646,13 +1659,13 @@ mod tests {
         assert_eq!(index.hold_epoch(&version), Some(first));
         // Releasing the last page removes the entry; the next reservation is
         // a new lifetime and a repeated release of the first is ignored.
-        index.release_hold_pages(&version, &page_set(&[0]), first);
+        index.release_hold_pages(&version, &page_set(&[0]), first, HolderKind::Reader);
         assert_eq!(index.hold_epoch(&version), None);
         let second = index
             .reserve_hold_pages(&version, &page_set(&[0]), until)
             .unwrap();
         assert_ne!(second, first);
-        index.release_hold_pages(&version, &page_set(&[0]), first);
+        index.release_hold_pages(&version, &page_set(&[0]), first, HolderKind::Reader);
         assert_eq!(index.hold_holders(&page), 1);
         // A reservation into a live entry also takes a newer epoch, which
         // still releases pages that joined earlier.
@@ -1663,7 +1676,7 @@ mod tests {
             .unwrap();
         assert!(joined > second);
         assert_eq!(index.hold_epoch(&version), Some(joined));
-        index.release_hold_pages(&version, &page_set(&[0]), joined);
+        index.release_hold_pages(&version, &page_set(&[0]), joined, HolderKind::Reader);
         assert_eq!(index.hold_holders(&page), 0);
         // Whole release followed by re-reservation starts a new membership.
         index.release_hold(&version).unwrap();
@@ -1672,10 +1685,10 @@ mod tests {
             .reserve_hold_pages(&version, &page_set(&[1]), until)
             .unwrap();
         assert!(third > joined);
-        index.release_hold_pages(&version, &page_set(&[1]), second);
-        index.release_hold_pages(&version, &page_set(&[1]), joined);
+        index.release_hold_pages(&version, &page_set(&[1]), second, HolderKind::Reader);
+        index.release_hold_pages(&version, &page_set(&[1]), joined, HolderKind::Reader);
         assert!(index.is_held(&unpublished));
-        index.release_hold_pages(&version, &page_set(&[1]), third);
+        index.release_hold_pages(&version, &page_set(&[1]), third, HolderKind::Reader);
         assert!(!index.is_held(&unpublished));
     }
 
@@ -1715,7 +1728,7 @@ mod tests {
             "published pages keep holders"
         );
         assert_eq!(index.hold_unused(), 1, "the reader's page keeps its slot");
-        index.release_hold_pages(&version, &page_set(&[1]), reader);
+        index.release_hold_pages(&version, &page_set(&[1]), reader, HolderKind::Reader);
         assert!(!index.is_held(&at(1)));
         assert_eq!(index.hold_unused(), 0);
         assert!(index.is_held(&page));
@@ -1745,7 +1758,7 @@ mod tests {
             .unwrap();
         // Trim the unpublished page: warm cleanup, then the reader's release.
         index.release_hold(&version).unwrap();
-        index.release_hold_pages(&version, &page_set(&[1]), reader);
+        index.release_hold_pages(&version, &page_set(&[1]), reader, HolderKind::Reader);
         assert!(!index.is_held(&unpublished));
         assert!(
             index.is_held(&page),
@@ -1757,15 +1770,98 @@ mod tests {
             .unwrap();
         assert_eq!(index.hold_holders(&unpublished), 1);
         // Delayed releases from before the trim do not reach the new holder.
-        index.release_hold_pages(&version, &page_set(&[1]), reader);
-        index.release_hold_pages(&version, &page_set(&[1]), warm);
+        index.release_hold_pages(&version, &page_set(&[1]), reader, HolderKind::Reader);
+        index.release_hold_pages(&version, &page_set(&[1]), warm, HolderKind::Warm);
         assert!(index.is_held(&unpublished));
         assert_eq!(index.hold_holders(&unpublished), 1);
         assert_eq!(index.hold_unused(), 1);
-        // The published page joined before both epochs, so they still apply.
-        index.release_hold_pages(&version, &page_set(&[0]), reader);
+        // The published page joined before both epochs, so they still apply,
+        // but only to a holder of their own kind: page 0 has no reader holder.
+        index.release_hold_pages(&version, &page_set(&[0]), reader, HolderKind::Reader);
+        assert!(index.is_held(&page));
+        index.release_hold_pages(&version, &page_set(&[0]), warm, HolderKind::Warm);
         assert!(!index.is_held(&page));
         assert!(index.is_held(&unpublished));
+    }
+
+    /// Holds a published page 0 and an unpublished page 1 with one warm and
+    /// one reader holder each; returns the version, page 1 and both epochs.
+    fn mixed_holders(
+        index: &Rc<Index>,
+        segments: &Rc<Segments>,
+    ) -> (
+        ObjectVersion,
+        PageId,
+        crate::store::holds::HoldEpoch,
+        crate::store::holds::HoldEpoch,
+    ) {
+        let (page, entry) = indexed(descriptor("held", 2 * crate::model::PAGE_BYTES), 0);
+        drop(segments.append(1024).unwrap());
+        index.publish(page.clone(), entry).unwrap();
+        let version = page.version.clone();
+        let mut unpublished = page;
+        unpublished.number = crate::model::PageNumber(1);
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        let warm = index
+            .reserve_warm_hold_pages(&version, &page_set(&[0, 1]), until)
+            .unwrap();
+        let reader = index
+            .reserve_hold_pages(&version, &page_set(&[0, 1]), until)
+            .unwrap();
+        assert_eq!(index.hold_holders(&unpublished), 2);
+        (version, unpublished, warm, reader)
+    }
+
+    /// Releasing the warm holder of an unpublished page and then running warm
+    /// cleanup leaves the independent reader's holder and its capacity.
+    #[test]
+    fn warm_page_release_then_cleanup_keeps_the_reader_holder() {
+        let segments = Rc::new(segments(1024, 6));
+        let index = Rc::new(index(8));
+        index.set_page_capacity(6).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let (version, unpublished, warm, reader) = mixed_holders(&index, &segments);
+        index.release_hold_pages(&version, &page_set(&[1]), warm, HolderKind::Warm);
+        assert_eq!(index.hold_holders(&unpublished), 1);
+        // A repeated warm release finds no warm holder and leaves the reader's.
+        index.release_hold_pages(&version, &page_set(&[1]), warm, HolderKind::Warm);
+        assert_eq!(index.hold_holders(&unpublished), 1);
+        index.release_hold(&version).unwrap();
+        assert!(
+            index.is_held(&unpublished),
+            "the reader still holds the page"
+        );
+        assert_eq!(index.hold_holders(&unpublished), 1);
+        assert_eq!(index.hold_unused(), 1, "the reader's page keeps its slot");
+        index.release_hold_pages(&version, &page_set(&[1]), reader, HolderKind::Reader);
+        assert!(!index.is_held(&unpublished));
+        assert_eq!(index.hold_unused(), 0);
+    }
+
+    /// Releasing the reader holder of an unpublished page leaves the warm
+    /// holder for warm cleanup, and a repeated reader release cannot take it.
+    #[test]
+    fn reader_page_release_then_cleanup_drops_the_warm_holder() {
+        let segments = Rc::new(segments(1024, 6));
+        let index = Rc::new(index(8));
+        index.set_page_capacity(6).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let (version, unpublished, _warm, reader) = mixed_holders(&index, &segments);
+        index.release_hold_pages(&version, &page_set(&[1]), reader, HolderKind::Reader);
+        assert_eq!(index.hold_holders(&unpublished), 1);
+        index.release_hold_pages(&version, &page_set(&[1]), reader, HolderKind::Reader);
+        assert_eq!(
+            index.hold_holders(&unpublished),
+            1,
+            "a reader release cannot drop the warm holder"
+        );
+        assert_eq!(index.hold_unused(), 1);
+        index.release_hold(&version).unwrap();
+        assert!(
+            !index.is_held(&unpublished),
+            "warm cleanup drops the last holder"
+        );
+        assert_eq!(index.hold_unused(), 0);
     }
 
     #[test]
@@ -1790,9 +1886,9 @@ mod tests {
         assert!(!index.is_held(&unpublished));
         assert_eq!(index.hold_holders(&unpublished), 0);
         assert_eq!(index.hold_holders(&page), 2);
-        index.release_hold_pages(&page.version, &page_set(&[0, 1]), epoch);
+        index.release_hold_pages(&page.version, &page_set(&[0, 1]), epoch, HolderKind::Warm);
         assert!(index.is_held(&page));
-        index.release_hold_pages(&page.version, &page_set(&[0]), epoch);
+        index.release_hold_pages(&page.version, &page_set(&[0]), epoch, HolderKind::Warm);
         assert_eq!(index.hold_expiry(&page.version), None);
     }
 
@@ -1881,7 +1977,7 @@ mod tests {
         assert_eq!(index.hold_unused(), 2);
         let writing = index.reserve_page_for(&at(0), false).unwrap();
         assert_eq!(index.hold_unused(), 1);
-        index.release_hold_pages(&version, &page_set(&[0]), epoch);
+        index.release_hold_pages(&version, &page_set(&[0]), epoch, HolderKind::Reader);
         assert!(!index.is_held(&at(0)));
         assert_eq!(index.hold_unused(), 1, "page 1 keeps its reservation");
         assert_eq!(index.hold_epoch(&version), Some(epoch));
@@ -1896,7 +1992,7 @@ mod tests {
         drop((held, ordinary));
         assert_eq!(index.hold_unused(), 1);
         // The released page's write still owns the entry until it completes.
-        index.release_hold_pages(&version, &page_set(&[1]), epoch);
+        index.release_hold_pages(&version, &page_set(&[1]), epoch, HolderKind::Reader);
         assert_eq!(index.hold_epoch(&version), Some(epoch));
         assert_eq!(index.hold_unused(), 0);
         assert_eq!(index.release_hold(&version), Err(Error::Overloaded));
