@@ -7,10 +7,10 @@ description: "Racer resources, configuration, diagnostics, Go SDK, and RDMA requ
 {{< callout type="warning" >}}
 Racer is pre-release. Its APIs, flags, and on-disk formats may change without a
 migration path. Cached data is disposable; Racer is not durable storage. Start
-with the [racer-object guide]({{< relref "guides/racer-object" >}}).
+with the [Azure Blob cache guide]({{< relref "guides/azure-blob-cache" >}}).
 {{< /callout >}}
 
-See [Racer concepts]({{< relref "concepts/racer" >}}) and the [racer-object guide]({{< relref "guides/racer-object" >}}).
+See [Racer concepts]({{< relref "concepts/racer" >}}) and the [Azure Blob cache guide]({{< relref "guides/azure-blob-cache" >}}).
 
 ## ClusterCache
 

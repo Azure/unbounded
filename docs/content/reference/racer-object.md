@@ -7,18 +7,21 @@ description: "Flags, deployment requirements, supported requests, and the securi
 {{< callout type="warning" >}}
 Racer is pre-release. Its APIs, flags, and on-disk formats may change without a
 migration path. Cached data is disposable; Racer is not durable storage. Start
-with the [racer-object guide]({{< relref "guides/racer-object" >}}).
+with the [Azure Blob cache guide]({{< relref "guides/azure-blob-cache" >}}).
 {{< /callout >}}
 
 `racer-object` is a read-only object storage adapter for Racer. It reads from S3,
 S3-compatible stores, and Azure Blob Storage, and serves either an S3 or an Azure
 Blob API to applications. For a working setup, start with
-[Cache Object Storage with Racer]({{< relref "guides/racer-object" >}}).
+[Cache Azure Blob Storage with Racer]({{< relref "guides/azure-blob-cache" >}}).
 
 The binary has two commands:
 
-- `origin` runs on every eligible Racer node and reads the upstream store.
+- `origin` runs on every eligible Racer node and reads the upstream store. For
+  Azure Blob, the operator can run it from the ClusterCache. See
+  [Managed Azure origin]({{< relref "reference/racer" >}}#managed-azure-origin).
 - `sidecar` runs in the application pod and serves the read API on pod loopback.
+  A webhook adds it to labeled pods. See [Automatic Injection](#automatic-injection).
 
 The read path is application -> sidecar -> Racer -> origin -> upstream. Racer owns
 the cache. Neither command keeps a separate cache, and neither falls back to the
@@ -282,7 +285,7 @@ Annotations, all with the prefix `racer.unbounded-cloud.io/`:
 
 | Annotation | Default | Meaning |
 |------------|---------|---------|
-| `object-namespace` | none, required | Sets `--namespace`. Must match the origin. |
+| `object-namespace` | none, required | Sets `--namespace`. Must match the origin. For a managed Azure origin, use the normalized account URL. |
 | `object-buckets` | none, required | Comma-separated list. Each entry sets one `--bucket`. Must match the origin. |
 | `object-cache` | `racer-object` | Sets `--cache` and the socket mount path. |
 | `object-api` | flag default (`s3`) | Sets `--api`. `s3` or `azure`. |
