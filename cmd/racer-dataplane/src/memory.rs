@@ -506,6 +506,10 @@ impl BufferPool {
     /// Copy registered ciphertext into owned bytes under a fresh charge before
     /// retaining it; other storage is returned unchanged. Reserve before any
     /// cache borrow because admission may reclaim.
+    ///
+    /// Safety net: fills detach registered pages once with
+    /// [`Self::detach_registered`] before publishing, so this normally sees
+    /// already-detached pages.
     pub(crate) fn retainable(&self, ciphertext: CiphertextPage) -> Result<CiphertextPage> {
         if !ciphertext.is_registered() {
             return Ok(ciphertext);
@@ -515,14 +519,80 @@ impl BufferPool {
         {
             return Ok(copy);
         }
-        // Cover the length-unit padding so the copy lands in aligned storage.
+        // Cover the pooled size class so the copy lands in aligned storage.
         let length = ciphertext.bytes().len();
         let reservation = self.admission.reserve(
             Some(&ciphertext.envelope().page.version.object.cache),
             ResourceClass::Ciphertext,
-            padded_length(default_disk_alignment(), length).unwrap_or(length),
+            self.aligned_capacity(length).unwrap_or(length),
         )?;
-        ciphertext.rehome(reservation)
+        self.rehome_aligned(ciphertext, reservation)
+    }
+    /// Copy a registered RDMA page once into this worker's pooled aligned
+    /// storage and drop the registered owner, so the memory cache and the
+    /// store can share one disk-aligned page.
+    ///
+    /// Callers should check [`CiphertextPage::is_registered`] before reserving.
+    /// `reservation` must be a Ciphertext charge for the page's cache covering
+    /// [`Self::aligned_capacity`] of the ciphertext length; it is consumed in
+    /// every outcome. Other pages are returned unchanged and the reservation is
+    /// released. The registered buffer returns to its pool as soon as the last
+    /// clone of `page` is dropped, which is here when the caller passes the only
+    /// handle.
+    pub(crate) fn detach_registered(
+        &self,
+        page: CiphertextPage,
+        reservation: CiphertextCharge,
+    ) -> Result<CiphertextPage> {
+        if !page.is_registered() {
+            return Ok(page);
+        }
+        // An earlier retaining path already copied it out under this
+        // admission: share that copy and release `reservation`.
+        if let Some(copy) = page.retained_copy()
+            && self.admission.owns(copy.inner.reservation())
+            && copy.inner.reservation().key() == Some(&page.envelope().page.version.object.cache)
+        {
+            return Ok(copy);
+        }
+        self.copy_aligned(&page, reservation)
+    }
+    /// Rehome `page` under `reservation`, copying into this worker's pooled
+    /// aligned storage when the bytes cannot move in place and the
+    /// reservation covers the pooled capacity. Otherwise behaves like
+    /// [`CiphertextPage::rehome`].
+    pub(crate) fn rehome_aligned(
+        &self,
+        mut page: CiphertextPage,
+        reservation: CiphertextCharge,
+    ) -> Result<CiphertextPage> {
+        let length = page.bytes().len();
+        let exclusive = !page.is_registered() && Arc::get_mut(&mut page.inner).is_some();
+        if !exclusive
+            && reservation.key() == Some(&page.envelope().page.version.object.cache)
+            && self
+                .aligned_capacity(length)
+                .is_ok_and(|capacity| reservation.amount() >= capacity)
+        {
+            return self.copy_aligned(&page, reservation);
+        }
+        page.rehome(reservation)
+    }
+    /// Copy `page`'s bytes into a pooled aligned page, preserving its envelope,
+    /// known checksum, and provenance.
+    fn copy_aligned(
+        &self,
+        page: &CiphertextPage,
+        reservation: CiphertextCharge,
+    ) -> Result<CiphertextPage> {
+        let length = page.bytes().len();
+        let mut buffer = self.aligned_ciphertext(reservation, length)?;
+        buffer.as_mut_slice().copy_from_slice(page.bytes());
+        let mut copy =
+            self.aligned_ciphertext_page(buffer, page.envelope().clone(), page.cached_checksum())?;
+        copy.provenance = page.provenance;
+        page.record_copy_out(&copy);
+        Ok(copy)
     }
     pub(crate) fn slab_ciphertext(
         &self,
@@ -625,6 +695,21 @@ impl BufferPool {
         )
     }
 }
+thread_local! {
+    static REGISTERED_COPY_OUTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+/// Count one copy of registered RDMA ciphertext out of its pool buffer.
+fn note_registered_copy_out() {
+    REGISTERED_COPY_OUTS.with(|count| count.set(count.get().wrapping_add(1)));
+}
+/// Registered RDMA pages copied out of pool buffers on this thread.
+///
+/// Thread-local because copies run on the owning worker's I/O thread; not yet
+/// exported as a metric.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn registered_copy_outs() -> u64 {
+    REGISTERED_COPY_OUTS.with(std::cell::Cell::get)
+}
 /// Bytes from the start of `length` through the next length-unit boundary.
 fn padded_length(alignment: page_alloc::Alignment, length: usize) -> Result<usize> {
     let unit = alignment.length();
@@ -645,11 +730,6 @@ impl VerifiedPage {
     pub fn bytes(&self) -> &[u8] {
         &self.inner.bytes
     }
-}
-#[cfg(test)]
-thread_local! {
-    /// Copies of whole pages made by `CiphertextPage::rehome` on this thread.
-    pub(crate) static COPY_OUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl CiphertextPage {
@@ -710,14 +790,17 @@ impl CiphertextPage {
                 provenance: self.provenance,
             }
         };
-        #[cfg(test)]
-        COPY_OUTS.with(|count| count.set(count.get() + 1));
-        // Remember the first copy-out of a registered page so the next
-        // retaining path for the same admission shares it.
+        self.record_copy_out(&copy);
+        Ok(copy)
+    }
+    /// Count a copy of registered ciphertext and remember the first one so
+    /// the next retaining path for the same admission shares it. Other
+    /// storage is not a registered copy-out and is ignored.
+    pub(crate) fn record_copy_out(&self, copy: &Self) {
         if let CiphertextStorage::Registered { retained, .. } = &self.inner.storage {
+            note_registered_copy_out();
             let _ = retained.set(copy.clone());
         }
-        Ok(copy)
     }
     /// The owned copy an earlier retaining path made of this registered page.
     pub(crate) fn retained_copy(&self) -> Option<Self> {

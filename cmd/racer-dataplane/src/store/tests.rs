@@ -3163,7 +3163,7 @@ fn registered_page_cached_then_persisted_is_copied_out_once() {
     page.ciphertext = pool
         .registered_ciphertext(reservation, page.ciphertext.envelope().clone(), received)
         .unwrap();
-    let copies = || crate::memory::COPY_OUTS.with(std::cell::Cell::get);
+    let copies = crate::memory::registered_copy_outs;
     let before = copies();
     // The memory cache retains first, as `publish` runs before `persist_verified`.
     let cached = pool.retainable(page.ciphertext.clone()).unwrap();

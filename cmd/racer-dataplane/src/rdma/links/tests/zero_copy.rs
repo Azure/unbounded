@@ -125,12 +125,12 @@ fn retainable_and_rehome_copy_out_and_release_the_buffer() {
     assert!(!copy.is_registered());
     assert_ne!(copy.bytes().as_ptr(), pointer);
     assert_eq!(copy.bytes(), page.ciphertext.bytes());
-    // The registered charge is released; the aligned copy is charged for its
-    // zero-padded length.
+    // The registered charge is released; the pooled aligned copy is charged
+    // for its size class.
     let length = page.ciphertext.bytes().len();
     assert_eq!(
         admission.used(ResourceClass::Ciphertext),
-        used - length + length.next_multiple_of(4096),
+        used - length + pool.aligned_capacity(length).unwrap(),
         "charge moved"
     );
     assert!(copy.is_disk_aligned(crate::memory::default_disk_alignment()));
@@ -216,4 +216,127 @@ fn memory_cache_publish_copies_out_registered_ciphertext() {
     let cached = cache.get(&id).unwrap().unwrap();
     assert!(!cached.ciphertext.is_registered());
     assert_eq!(cached.ciphertext.bytes(), page.ciphertext.bytes());
+}
+
+/// Reserve the pooled aligned capacity for copying `page` out.
+fn aligned_charge(
+    pool: &BufferPool,
+    admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
+    page: &CiphertextPage,
+) -> flow_control::Charge<AdmissionPolicy> {
+    admission
+        .reserve(
+            Some(&page.envelope().page.version.object.cache),
+            ResourceClass::Ciphertext,
+            pool.aligned_capacity(page.bytes().len()).unwrap(),
+        )
+        .unwrap()
+}
+
+#[test]
+fn detach_registered_copies_once_into_the_pool_and_shares_with_the_cache() {
+    let (mut w, admission, page) = setup();
+    let pool = BufferPool::new(admission.clone());
+    let cache = MemoryCache::new(pool.clone(), crate::test_support::availability());
+    let baseline = admission.used(ResourceClass::Ciphertext);
+    let ciphertext = registered(&mut w, &admission, &page.ciphertext);
+    let checksum = page.ciphertext.checksum();
+    ciphertext.expected_checksum(checksum).unwrap();
+    let pointer = ciphertext.bytes().as_ptr();
+    let before = crate::memory::registered_copy_outs();
+    let charge = aligned_charge(&pool, &admission, &ciphertext);
+    let detached = pool.detach_registered(ciphertext, charge).unwrap();
+    assert_eq!(crate::memory::registered_copy_outs(), before + 1);
+    assert!(!detached.is_registered());
+    assert_ne!(detached.bytes().as_ptr(), pointer);
+    assert_eq!(detached.bytes(), page.ciphertext.bytes());
+    assert_eq!(detached.cached_checksum(), Some(checksum), "checksum kept");
+    assert!(detached.is_disk_aligned(crate::memory::default_disk_alignment()));
+    // The registered buffer was released by the copy-out.
+    pump!(w);
+    assert_eq!(owned(&w), Some(0));
+    assert_eq!(free(&w), Some(2));
+    // Publishing to memory and retaining for the store copy nothing more.
+    let mut result = page.clone();
+    result.ciphertext = detached.clone();
+    cache.publish(result.clone()).unwrap();
+    let retained = pool.retainable(result.ciphertext.clone()).unwrap();
+    let id = page.plaintext.page().clone();
+    let cached = cache.get(&id).unwrap().unwrap();
+    assert!(Arc::ptr_eq(&cached.ciphertext.inner, &detached.inner));
+    assert!(Arc::ptr_eq(&retained.inner, &detached.inner));
+    assert_eq!(crate::memory::registered_copy_outs(), before + 1);
+    // Non-registered pages pass through and release the reservation.
+    let charge = aligned_charge(&pool, &admission, &detached);
+    let same = pool.detach_registered(detached.clone(), charge).unwrap();
+    assert!(Arc::ptr_eq(&same.inner, &detached.inner));
+    drop((same, retained, cached, result, detached));
+    drop(cache);
+    pool.reclaim_idle_buffers();
+    assert_eq!(admission.used(ResourceClass::Ciphertext), baseline);
+}
+
+#[test]
+fn detach_registered_returns_the_buffer_to_the_worker_pool() {
+    let (mut w, admission, page) = setup();
+    let pool = BufferPool::new(admission.clone());
+    let ciphertext = registered(&mut w, &admission, &page.ciphertext);
+    let charge = aligned_charge(&pool, &admission, &ciphertext);
+    let detached = pool.detach_registered(ciphertext, charge).unwrap();
+    let idle = pool.aligned_stats();
+    drop(detached);
+    assert!(pool.aligned_stats() != idle, "the copy is pooled storage");
+    pump!(w);
+    assert_eq!(free(&w), Some(2));
+}
+
+#[test]
+fn detach_registered_refuses_short_charges_and_frees_the_buffer() {
+    let (mut w, admission, page) = setup();
+    let pool = BufferPool::new(admission.clone());
+    let baseline = admission.used(ResourceClass::Ciphertext);
+    let ciphertext = registered(&mut w, &admission, &page.ciphertext);
+    let before = crate::memory::registered_copy_outs();
+    let short = admission
+        .reserve(
+            Some(&page.metadata.version.object.cache),
+            ResourceClass::Ciphertext,
+            19,
+        )
+        .unwrap();
+    assert_eq!(
+        pool.detach_registered(ciphertext, short).err(),
+        Some(Error::InvalidConfiguration)
+    );
+    assert_eq!(crate::memory::registered_copy_outs(), before);
+    pump!(w);
+    assert_eq!(free(&w), Some(2));
+    assert_eq!(admission.used(ResourceClass::Ciphertext), baseline);
+}
+
+#[test]
+fn rehome_aligned_copies_shared_pages_into_the_pool() {
+    let (mut w, admission, page) = setup();
+    let pool = BufferPool::new(admission.clone());
+    let ciphertext = registered(&mut w, &admission, &page.ciphertext);
+    let before = crate::memory::registered_copy_outs();
+    let charge = aligned_charge(&pool, &admission, &ciphertext);
+    let moved = pool.rehome_aligned(ciphertext, charge).unwrap();
+    assert_eq!(crate::memory::registered_copy_outs(), before + 1);
+    assert!(moved.is_disk_aligned(crate::memory::default_disk_alignment()));
+    // A shared owned page copies too; an exclusive one moves in place.
+    let shared = page.ciphertext.clone();
+    let charge = aligned_charge(&pool, &admission, &shared);
+    let copy = pool.rehome_aligned(shared, charge).unwrap();
+    assert!(!Arc::ptr_eq(&copy.inner, &page.ciphertext.inner));
+    assert_eq!(copy.bytes(), page.ciphertext.bytes());
+    assert_eq!(crate::memory::registered_copy_outs(), before + 1);
+    let exclusive = copy;
+    let pointer = exclusive.bytes().as_ptr();
+    let charge = aligned_charge(&pool, &admission, &exclusive);
+    let same = pool.rehome_aligned(exclusive, charge).unwrap();
+    assert_eq!(same.bytes().as_ptr(), pointer);
+    drop((moved, same));
+    pump!(w);
+    assert_eq!(free(&w), Some(2));
 }
