@@ -578,7 +578,6 @@ impl State {
         limit: usize,
     ) -> Result<usize> {
         let offset = transfer_offset(offset)?;
-        let max_chunk = self.knobs.max_chunk;
         let file = self.file_mut(id)?;
         check_direct(
             file.flags,
@@ -586,6 +585,39 @@ impl State {
             buf.as_ptr(),
             buf.len(),
         )?;
+        self.file_write_checked(id, offset, buf, limit)
+    }
+
+    /// `pwritev` of already gathered bytes whose direct-I/O constraints the
+    /// caller checked per segment, as the kernel does for each iovec.
+    pub(crate) fn file_writev(
+        &mut self,
+        id: u64,
+        offset: u64,
+        segments: &[&[u8]],
+        buf: &[u8],
+        limit: usize,
+    ) -> Result<usize> {
+        let offset = transfer_offset(offset)?;
+        let file = self.file_mut(id)?;
+        let at = offset.unwrap_or(file.position);
+        let flags = file.flags;
+        for segment in segments {
+            check_direct(flags, at, segment.as_ptr(), segment.len())?;
+        }
+        self.file_write_checked(id, offset, buf, limit)
+    }
+
+    /// Write after transfer validation.
+    fn file_write_checked(
+        &mut self,
+        id: u64,
+        offset: Option<u64>,
+        buf: &[u8],
+        limit: usize,
+    ) -> Result<usize> {
+        let max_chunk = self.knobs.max_chunk;
+        let file = self.file_mut(id)?;
         let buf = &buf[..buf.len().min(limit).min(max_chunk)];
         if file.flags & libc::O_PATH != 0 || file.flags & libc::O_ACCMODE == libc::O_RDONLY {
             return Err(errno(libc::EBADF));

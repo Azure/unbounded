@@ -492,16 +492,19 @@ impl Owned {
                 // SAFETY: `push`'s contract keeps the iovec array valid for
                 // `count` entries.
                 let iovecs = unsafe { iovec_slice(*iovecs, *segments) }?;
-                let mut gathered = Vec::new();
+                let mut parts = Vec::with_capacity(iovecs.len());
                 for iov in iovecs {
                     // SAFETY: `push`'s contract keeps each segment valid.
-                    gathered.extend_from_slice(unsafe {
+                    parts.push(unsafe {
                         slice(iov.iov_base.cast::<u8>().cast_const(), iov.iov_len)
                     }?);
                 }
+                let gathered = parts.concat();
                 let buf = gathered.as_slice();
                 count(match state.resources.get(&id) {
-                    Some(Resource::File(_)) => state.file_write(id, *offset, buf, limit)?,
+                    Some(Resource::File(_)) => {
+                        state.file_writev(id, *offset, &parts, buf, limit)?
+                    }
                     Some(Resource::Pipe(_)) => state.pipe_write(id, buf, limit)?,
                     Some(Resource::Stream(_) | Resource::Datagram(_)) => {
                         state.send(id, buf, limit)?
