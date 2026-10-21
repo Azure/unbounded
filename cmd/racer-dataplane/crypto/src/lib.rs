@@ -274,9 +274,9 @@ pub mod identity {
     //! Run these gates from `cmd/racer-dataplane`:
     //!
     //! ```sh
-    //! timeout --signal=TERM --kill-after=10s 300s cargo test --locked -p racer-crypto
-    //! timeout --signal=TERM --kill-after=10s 300s cargo test --locked -p racer-crypto --features test-util
-    //! timeout --signal=TERM --kill-after=10s 300s cargo clippy --locked -p racer-crypto --all-targets --all-features --no-deps -- -D warnings
+    //! cargo test --locked -p racer-crypto
+    //! cargo test --locked -p racer-crypto --features test-util
+    //! cargo clippy --locked -p racer-crypto --all-targets --all-features --no-deps -- -D warnings
     //! ```
     //!
     //! The opt-in `test-util` feature exposes Ed25519 CA and node-certificate fixtures

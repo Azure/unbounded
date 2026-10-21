@@ -59,9 +59,9 @@ Capture a CPU profile during a representative steady workload through your
 trusted diagnostic connection, for example from a local listener:
 
 ```sh
-timeout --signal=TERM --kill-after=10s 45s curl --fail --max-time 40 \
+curl --fail --max-time 40 \
   -o racer-object-cpu.pprof 'http://127.0.0.1:6060/debug/pprof/profile?seconds=30'
-timeout --signal=TERM --kill-after=10s 60s go tool pprof -top racer-object-cpu.pprof
+go tool pprof -top racer-object-cpu.pprof
 ```
 
 Capture each process separately and retain the workload concurrency, object

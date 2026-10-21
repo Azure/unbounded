@@ -116,7 +116,7 @@ with Gantry's origin, but still permits only one origin owner per cache per node
 With `kubectl`, Python 3, and PyYAML installed, run from the repository root:
 
 ```sh
-timeout --signal=TERM --kill-after=10s 300s python3 deploy/racer-loadgen/direct/render_test.py
+python3 deploy/racer-loadgen/direct/render_test.py
 ```
 
 The checks render both variants locally and assert resource scope, UDS arguments,

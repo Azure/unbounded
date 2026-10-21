@@ -37,7 +37,6 @@ func TestRacerEnvtestCIContract(t *testing.T) {
 	require.Contains(t, run, "$(GOTEST) -race")
 	require.Contains(t, run, "-count=1")
 	require.Contains(t, run, "-timeout=5m")
-	require.Contains(t, run, "timeout --signal=TERM --kill-after=10s 300s")
 	require.Contains(t, run, `test -n "$(KUBEBUILDER_ASSETS)" ||`)
 	require.Contains(t, run, `KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)"`)
 
