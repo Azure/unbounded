@@ -730,7 +730,7 @@ fn raw_uds_client_empty_bootstrap_and_head_success_writer() {
                 } else if is_head {
                     b""
                 } else {
-                    b"Content-Length: 0\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\nRacer-Ordered: 1\r\n"
+                    b"Content-Length: 0\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\n"
                 },
             ))
             .unwrap();

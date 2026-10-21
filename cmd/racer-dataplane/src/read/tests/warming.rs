@@ -948,7 +948,11 @@ fn warm_cancel_keeps_get_gate_until_detached_origin_driver_fences() {
         1,
         "canceled driver still owns warm exclusion"
     );
-    assert_eq!(f.origin.calls.get(), 1, "no unordered outbound overlap");
+    assert_eq!(
+        f.origin.calls.get(),
+        1,
+        "no outbound overlap with the warm driver"
+    );
     f.origin.blocked_pages.borrow_mut().clear();
     let mut delivered = false;
     for _ in 0..1024 {

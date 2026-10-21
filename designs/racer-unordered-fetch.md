@@ -77,45 +77,67 @@ another read) that holds the same page.
 `read/range_stream.rs` replaces the `Scheduler`/`Demand` machinery and the
 ordered/unordered split with one job per read stream.
 
-State: a delivery cursor `next`, and a fetch window of pages
-`[next, next + W)` where `W = range_window_pages`. Each window page is one of
+State: a delivery cursor `next`, and a fetch window of pages starting at
+`next`. Each window page is one of `Probing` (memory lookup on its owner),
 `Missing`, `Fetching` (direct fill), `Selecting` (covered by an outstanding
-peer selection demand), `Ready` (pinned plaintext page in memory) or `Spilled`
-(published under this read's hold and re-read through the memory-then-disk
-warm path on delivery).
+peer selection) or `Ready` (page or error).
+
+Window size: at most `range_window_pages` (default 2, maximum 64). Each page
+takes its exact client credit (`Window::reserve`) when it enters the window and
+is marked issued on delivery. So the window is also limited by unreleased
+client credit, and window pages plus delivered, unreleased pages never exceed
+the client's credits. This keeps the existing plaintext floor
+(`(range_window_pages + 1) * PAGE_BYTES`) valid.
 
 Each poll:
 
-1. Probe memory on the owning worker for every window page that has not been
-   probed yet (`Work::Cached`). Hits become `Ready` immediately.
-2. Ensure the page at `next` has a direct fill in flight (the normal Fill path:
-   local disk, ranked peer, authorized origin). Start direct fills for up to
-   `P` further `Missing` pages.
-3. Send remaining `Missing` pages to peers as a selection demand. Up to `K`
-   selections may be in flight per read, possibly to different providers.
-   Selected pages are accepted on their owning worker as today, and every open
-   read of the same version whose window wants the page takes it (fan-out).
-4. Deliver `next` when it is `Ready` or `Spilled`, attaching it to the client
-   as today (`Delivery::attach`). Client credits and releases are unchanged.
+1. Refill the window. A page entering it reserves credit and starts a memory
+   probe (`cached_page`). Hits become `Ready`. A miss or a failed probe becomes
+   `Missing`.
+2. Start a direct fill (`Work::Fetch`: the warm hold first, then normal Fill)
+   for the head page, and for up to `DIRECT_AHEAD = 1` further `Missing`
+   page. The head is always filled directly; pages ahead are skipped when
+   another read of the version is already selecting or filling them.
+3. Send the remaining `Missing` pages to a peer as one selection demand, at
+   most `SELECTIONS = 1` per read. A node keeps at most one selection in
+   flight per version and provider (`Scheduler::contract` refuses a second
+   one with `Overloaded` until the first `Selection` drops). This becomes
+   several per provider once the peer allows several pending pages (section
+   4).
+4. Every selected page, and every directly filled page, is offered to all open
+   reads of the version whose window still wants it (fan-out).
+5. Deliver `next` when it is `Ready`, attaching it to the client as before
+   (`Delivery::attach`).
 
-Out-of-order arrivals beyond the in-memory budget spill:
+Errors: a failed direct fill stays in its slot, stops further admission and
+ends the stream when it reaches the head, as before. A failed selection,
+including its own child deadline, returns its pages to direct fills only. The
+stream's own cancellation and deadline are always fatal.
 
-- The read reserves a hold for those pages on their owning workers
-  (`reserve_warm`-style `Work::Hold` with a page set) and fills them through the
-  warm path (`Work::Warm`, which persists held).
-- On delivery a spilled page is read through `warmed_page`/`warm_local`
-  (memory first, then the held disk copy).
-- After delivery the read releases the page from its hold.
-- If the hold is refused (hold limits, or no disk), the read keeps fetching
-  ahead only within its in-memory window.
-
-Warm interaction: a read waits on the warm job only for the page it is about
-to fetch, not for a prefix. A warm page held locally is read from the warm
-hold; a remote-held warm page uses the normal fill path.
+Warm interaction: a direct fill waits on the warm job only for its own page.
+While a warm job runs for the version, reads start no selections. If a
+selection's head page is held by a remote warm owner, only that page is filled
+through the normal path.
 
 Warm admission no longer needs the node-wide `selecting` check
-(`Scheduler::admit_warm`), because reads no longer own an exclusive selection
-per version.
+(`Scheduler::admit_warm` is removed); warm calls `WarmRegistry::begin`.
+
+#### Spill (optional)
+
+`RACER_RANGE_SPILL_PAGES` (default 0, off; at most 1024) lets a read park
+pages beyond its window on local disk. For pages in
+`[window end, window end + range_spill_pages)`, with at most two in flight:
+
+- Reserve one holder on the page's owning worker only (`Work::Hold`, deadline
+  `min(60s, remaining request time)`).
+- Fill it through the warm path (`Work::Warm`), which persists it held.
+- When the window reaches the page, read it back from memory or the held disk
+  copy (`Work::WarmLocal`). If that fails, fetch it normally.
+- Release the holder (`Work::Release`) once after delivery, and every remaining
+  holder on cancel or drop. A hold still pending at that point is released
+  once its completion shows it applied. Hold expiry is the backstop.
+- If a hold is refused, the read keeps only its memory window.
+- No spill while a warm job covers the version.
 
 ### 4. Peer protocol: several pages in flight per subscription
 
@@ -151,10 +173,11 @@ SDK rejects out-of-order pages. Roll the dataplane before the SDK.
   set semantics.
 - Holds: refcounted reserve/release, release to zero makes the page
   evictable, warm hold unaffected by a read release, expiry still applies.
-- Read job: memory hits in the window are delivered without fetching earlier
+- Read job: memory hits in the window are ready without fetching earlier
   pages first; an out-of-order completion is buffered and delivered in order;
-  spill when the window exceeds memory; fallback when the hold is refused;
-  selection fan-out to multiple reads; cancellation releases holds and credits.
+  selection fan-out to multiple reads; a failed selection falls back to direct
+  fills; spill holds are released once each after delivery or cancel; a
+  refused hold falls back to the memory window.
 - Peer: multiple pending selections per subscription up to the granted
   limit; old-peer refusal falls back to one in flight; budgets and replay
   checks unchanged.

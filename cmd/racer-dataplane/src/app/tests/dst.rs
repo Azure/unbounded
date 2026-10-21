@@ -28,6 +28,8 @@ use uring_runtime::reactor::simulation::Simulation;
 const MAX_NODES: usize = 32;
 const MAX_TURNS: usize = 100_000;
 /// Subscription fields every simulated reader sends with its POST.
+// Keeps the removed Racer-Ordered header as a compatibility check: the
+// dataplane ignores it.
 const SUBSCRIPTION_FIELDS: &str = "Content-Length: 0\r\nRacer-Page-Credits: 64\r\nRacer-Byte-Credits: 1073741824\r\nRacer-Ordered: 1\r\n";
 
 /// The application owns this deterministic replay domain, not the generic runtime.
@@ -1191,7 +1193,7 @@ mod scenarios {
             client.end = client.size;
             // Match client credit to this small payload budget. Delivered leases no
             // longer occupy the independent server acquisition window.
-            client.request = format!("POST /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 2\r\nRacer-Byte-Credits: {}\r\nRacer-Ordered: 1\r\nIf-Match: {}\r\nRange: bytes=0-{}\r\nRacer-Metadata: dst opaque metadata\r\nAuthorization: Bearer dst-fixture\r\nConnection: close\r\n\r\n", key(1), 2 * PAGE_BYTES, client.tag, client.size - 1).into_bytes();
+            client.request = format!("POST /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 2\r\nRacer-Byte-Credits: {}\r\nIf-Match: {}\r\nRange: bytes=0-{}\r\nRacer-Metadata: dst opaque metadata\r\nAuthorization: Bearer dst-fixture\r\nConnection: close\r\n\r\n", key(1), 2 * PAGE_BYTES, client.tag, client.size - 1).into_bytes();
             harness.exchange(client, false);
         }
         assert_eq!(harness.coverage.success, 40);

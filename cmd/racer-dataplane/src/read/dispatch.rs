@@ -274,7 +274,7 @@ impl WorkerDirectory {
         budget: AcquisitionBudget,
     ) -> Result<Operation<'static, (Result<PageResult>, AcquisitionBudget)>> {
         // Always use the owned worker driver, even for local ingress. Detaching the
-        // stream must not release receiving exclusivity before accepted I/O fences.
+        // stream must not free the provider contract before accepted I/O fences.
         let owner = self.metadata_owner(&version.object)?;
         let receipt = self.submit(
             owner,
@@ -306,8 +306,8 @@ impl WorkerDirectory {
                 .await;
         }
         let receipt = self.submit(owner, Work::Selected(copy), scope, None)?;
-        // Cancellation notifies the owner, but selection exclusivity must survive
-        // until its accepted crypto and publication work actually completes.
+        // Cancellation notifies the owner, but the selection keeps its provider
+        // contract until its accepted crypto and publication work completes.
         let completion = std::future::poll_fn(|cx| receipt.poll_completion(cx)).await?;
         scope.check()?;
         match completion.value? {

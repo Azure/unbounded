@@ -344,7 +344,7 @@ fn get(client: &mut BufReader<UnixStream>, key: usize, verify: bool) -> std::io:
     use std::io::BufRead;
     write!(
         client.get_mut(),
-        "POST /v1/objects/{key:064x} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\nRacer-Ordered: 1\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nIf-Match: \"v1\"\r\nRange: bytes=0-16777215\r\nConnection: close\r\n\r\n"
+        "POST /v1/objects/{key:064x} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nIf-Match: \"v1\"\r\nRange: bytes=0-16777215\r\nConnection: close\r\n\r\n"
     )?;
     let mut head = String::new();
     loop {

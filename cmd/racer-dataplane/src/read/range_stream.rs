@@ -2116,6 +2116,35 @@ pub(super) mod tests {
         }
     }
     #[test]
+    fn active_warm_job_issues_no_selection_and_spill_stays_off_by_default() {
+        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 4);
+        let mut metadata = metadata();
+        metadata.length = 4 * PAGE_BYTES;
+        let mut stream = f.open(
+            &metadata,
+            ByteRange::From(0).resolve(metadata.length).unwrap(),
+            RequestScope::new(RequestId([2; 16]), Instant::now() + Duration::from_secs(60))
+                .unwrap(),
+        );
+        stream.configure_subscription(4, 4 * PAGE_BYTES).unwrap();
+        assert!(stream.spill.is_none());
+        for _ in 0..4 {
+            stream.inject(Slot::Missing { select: true });
+        }
+        let (job, _) = f.streams.directory.warm.begin(&metadata.version).unwrap();
+        let scope = stream.operation_scope();
+        // Each page waits for the warm job through its own direct fill.
+        assert_eq!(stream.start_selection(&scope), Ok(false));
+        assert!(stream.selections.is_empty());
+        assert!(
+            stream
+                .slots
+                .iter()
+                .all(|slot| matches!(slot, Slot::Missing { select: true }))
+        );
+        job.stop();
+    }
+    #[test]
     fn selection_demand_covers_only_selectable_holes_not_selected_elsewhere() {
         let f = Fixture::new(crate::test_support::cluster::config(false).limits, 8);
         let mut metadata = metadata();
@@ -2164,7 +2193,7 @@ pub(super) mod tests {
         );
     }
     #[test]
-    fn ordered_slices_cross_page_boundary_without_object_sized_plan() {
+    fn slices_cross_page_boundary_without_object_sized_plan() {
         let range = ByteRange::Closed {
             first: PAGE_BYTES - 2,
             last: PAGE_BYTES + 6,

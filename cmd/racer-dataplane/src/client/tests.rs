@@ -56,7 +56,7 @@ mod acquisition {
         worker.origin.set_version(metadata.clone());
         worker.origin.set_body(vec![b'x'; metadata.length as usize]);
         let mut socket = fixture.connect();
-        socket.write_all(&request("POST", "If-Match: \"v1\"\r\nRange: bytes=0-\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\nRacer-Ordered: 1\r\n")).unwrap();
+        socket.write_all(&request("POST", "If-Match: \"v1\"\r\nRange: bytes=0-\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\n")).unwrap();
         let mut raw = fixture.receive(&mut socket, false);
         let end = raw.windows(4).position(|part| part == b"\r\n\r\n").unwrap() + 4;
         let deadline = Instant::now() + Duration::from_secs(10);
