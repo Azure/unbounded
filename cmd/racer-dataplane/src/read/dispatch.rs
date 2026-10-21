@@ -27,7 +27,7 @@ use crate::runtime::HashMap;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
 use crate::security::PeerOriginContext;
-use crate::store::holds::{HoldEpoch, HoldPages};
+use crate::store::holds::{HoldEpoch, HoldPages, HolderKind};
 use sha2::Digest;
 use sha2::Sha256;
 use std::cell::RefCell;
@@ -81,7 +81,7 @@ pub struct WorkerDirectory {
 }
 
 enum Work {
-    Hold(ObjectVersion, HoldPages, std::time::SystemTime),
+    Hold(ObjectVersion, HoldPages, std::time::SystemTime, HolderKind),
     /// Drop one holder from each page of this worker's hold for the version.
     Release(ObjectVersion, HoldPages, HoldEpoch),
     Warm(
@@ -476,7 +476,7 @@ impl WorkerDirectory {
             let held = pages.get(&mailbox.worker.0).cloned().unwrap_or_default();
             let receipt = self.submit(
                 mailbox.worker,
-                Work::Hold(version.clone(), held, until),
+                Work::Hold(version.clone(), held, until, HolderKind::Warm),
                 scope,
                 None,
             )?;
@@ -497,7 +497,7 @@ impl WorkerDirectory {
                 let held = pages.get(&mailbox.worker.0).cloned().unwrap_or_default();
                 let receipt = self.submit(
                     mailbox.worker,
-                    Work::Hold(version.clone(), held, accepted),
+                    Work::Hold(version.clone(), held, accepted, HolderKind::Warm),
                     scope,
                     None,
                 )?;
@@ -558,7 +558,7 @@ impl WorkerDirectory {
         let pages = std::iter::once(page.number).collect::<HoldPages>();
         let receipt = self.submit(
             owner,
-            Work::Hold(page.version.clone(), pages, until),
+            Work::Hold(page.version.clone(), pages, until, HolderKind::Reader),
             scope,
             None,
         )?;
@@ -1072,14 +1072,14 @@ async fn execute(
 ) -> Result<Value> {
     scope.check()?;
     match work {
-        Work::Hold(version, pages, until) => {
+        Work::Hold(version, pages, until, kind) => {
             let previous = local.fill.dependencies.writer.index().hold_expiry(&version);
             let epoch = local
                 .fill
                 .dependencies
                 .writer
                 .index()
-                .reserve_hold_pages(&version, &pages, until)?;
+                .reserve_hold_kind(&version, &pages, until, kind)?;
             Ok(Value::Held(
                 previous.is_none(),
                 previous.map_or(until, |old| old.max(until)),
@@ -1329,7 +1329,7 @@ mod tests {
             queue.poll(&mut cx, 64);
             let command = mailbox.pop().expect("hold command");
             assert!(matches!(command.work, Work::Hold(..)));
-            let Work::Hold(_, _, until) = &command.work else {
+            let Work::Hold(_, _, until, _) = &command.work else {
                 unreachable!()
             };
             command

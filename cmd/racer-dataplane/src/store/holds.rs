@@ -13,10 +13,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 pub const MAX_HOLD_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-/// Identity of one hold entry's lifetime on a worker. A version's hold gets a
-/// new epoch whenever its entry is created, including after expiry, whole
-/// release or restart, so a page release carrying an older epoch cannot drop a
-/// holder that a later reservation added. Epochs are process-local.
+/// Identity of one reservation on a worker. Every holder-adding reservation and
+/// every restored page gets a fresh, increasing epoch, and each page remembers
+/// the epoch that added it to its hold ([`PageHolders::since`]). A page release
+/// only applies to pages whose `since` is not newer than the release's epoch,
+/// so a release taken before a page was trimmed and re-reserved (or before an
+/// expiry, whole release or restart) cannot drop a holder that the later
+/// reservation added. Epochs are process-local.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct HoldEpoch(u64);
 
@@ -89,16 +92,37 @@ impl FromIterator<PageNumber> for HoldPages {
     }
 }
 
+/// Holders of one member page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PageHolders {
+    /// All holders, including `warm`.
+    pub count: u32,
+    /// Holders added by warm jobs. Warm cleanup ([`super::catalog::Index::release_hold`])
+    /// drops only these from unpublished pages, so independent readers keep theirs.
+    pub warm: u32,
+    /// Epoch of the reservation that made this page a member.
+    pub since: HoldEpoch,
+}
+
+/// Who a reservation adds as a holder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HolderKind {
+    /// A reader that releases its pages individually.
+    Reader,
+    /// A warm job, released by warm cleanup and expiry.
+    Warm,
+}
+
 pub(super) struct Hold {
     pub until: SystemTime,
     pub monotonic: Instant,
     /// Pages this worker promised to retain. Capacity is charged per member.
     pub pages: HoldPages,
-    /// Holder count per member page; the keys are exactly `pages`. Each
-    /// `reserve_hold_pages` adds one per requested page and each
-    /// `release_hold_pages` removes one. Not persisted: restored pages start at one.
-    pub holders: HashMap<PageNumber, u32>,
-    /// Lifetime identity returned by reservation and required by page release.
+    /// Holders per member page; the keys are exactly `pages`. Each
+    /// reservation adds one per requested page and each `release_hold_pages`
+    /// removes one. Not persisted: restored pages start at one reader.
+    pub holders: HashMap<PageNumber, PageHolders>,
+    /// Epoch of the latest reservation into this entry.
     pub epoch: HoldEpoch,
     pub inflight: Rc<Cell<usize>>,
     pub active: Rc<Cell<usize>>,
@@ -106,9 +130,21 @@ pub(super) struct Hold {
 }
 
 impl Hold {
-    /// Counts of one for every page, used when no holder history is known.
-    pub fn single_holders(pages: &HoldPages) -> HashMap<PageNumber, u32> {
-        pages.iter().map(|page| (page, 1)).collect()
+    /// One reader for every page, used when no holder history is known.
+    pub fn single_holders(pages: &HoldPages, since: HoldEpoch) -> HashMap<PageNumber, PageHolders> {
+        pages
+            .iter()
+            .map(|page| {
+                (
+                    page,
+                    PageHolders {
+                        count: 1,
+                        warm: 0,
+                        since,
+                    },
+                )
+            })
+            .collect()
     }
 
     pub fn live(&self) -> bool {
@@ -145,7 +181,7 @@ impl Default for Holds {
 }
 
 impl Holds {
-    /// A fresh epoch for a newly created hold entry.
+    /// A fresh epoch for a reservation or restored entry.
     pub fn next_epoch(&mut self) -> HoldEpoch {
         self.last_epoch += 1;
         HoldEpoch(self.last_epoch)
