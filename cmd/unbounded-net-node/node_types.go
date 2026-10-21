@@ -135,12 +135,14 @@ type wireGuardState struct {
 	lastGatewayAdvertSummary gatewayAdvertSummary
 
 	// Node-level errors surfaced in node status for troubleshooting and health aggregation.
-	nodeErrors []NodeError
+	nodeErrors         []NodeError
+	neighborTableFulls [2]*uint64
 
 	// netlinkCache provides cached reads of links, addresses, and routes.
 	// When non-nil, read-path code uses the cache instead of direct netlink
 	// syscalls. Writes still go directly to netlink.
-	netlinkCache *unboundednetnetlink.NetlinkCache
+	netlinkCache    *unboundednetnetlink.NetlinkCache
+	neighborGCTuner *neighborGCTuner
 
 	// Link stats monitor for detecting incrementing error/drop counters.
 	linkStatsMonitor *linkStatsMonitor

@@ -143,6 +143,10 @@ node:
   tunnelIPFamily: IPv4
 ```
 
+For automatic, increase-only neighbor table sizing and other
+large-cluster sysctl considerations, see
+[large-cluster neighbor tables](../content/reference/networking/configuration.md#large-cluster-neighbor-tables).
+
 ## Controller Configuration
 
 ### Managed kube-proxy
