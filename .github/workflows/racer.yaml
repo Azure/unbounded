@@ -22,7 +22,8 @@ on:
 
 concurrency:
   group: racer-${{ github.ref }}
-  cancel-in-progress: true
+  # Let pushes finish so back-to-back merges still refresh the caches.
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 permissions:
   contents: read
