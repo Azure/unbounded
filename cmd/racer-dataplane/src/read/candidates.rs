@@ -617,6 +617,20 @@ impl CandidatePolicy {
                     flights,
                 })
             }
+            // A relay signs `Unavailable` when the next hop drops the
+            // exchange, which is how an older provider behind a relay refuses
+            // the field. Downgrade exactly as for a direct transport failure.
+            Some(_)
+                if requested.is_some()
+                    && matches!(response.response(), PeerResponse::Unavailable) =>
+            {
+                self.single_flight
+                    .borrow_mut()
+                    .insert(destination.clone(), uring_runtime::environment::now());
+                Ok(ProviderSelection::Refused {
+                    provider: destination.clone(),
+                })
+            }
             Some(_) => Ok(skipped()),
         }
     }
