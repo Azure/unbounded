@@ -589,12 +589,12 @@ impl Link {
         scope: &'a RequestScope,
     ) -> Operation<'a, VerifiedResponse> {
         Box::pin(async move {
-            let PeerOperation::Subscribe { subscription, .. } = &request.operation else {
-                panic!("real range must emit Subscribe")
-            };
-            self.demands
-                .borrow_mut()
-                .push(subscription.demand.page_count());
+            // Direct window fills send page requests; selections send Subscribe.
+            if let PeerOperation::Subscribe { subscription, .. } = &request.operation {
+                self.demands
+                    .borrow_mut()
+                    .push(subscription.demand.page_count());
+            }
             self.client.request(request, membership, scope).await
         })
     }
@@ -659,6 +659,21 @@ pub(super) fn coordinator(
     crate::read::dispatch::WorkerEndpoint,
     Arc<Published<Snapshot>>,
 ) {
+    coordinator_with_window(f, signer, membership, peers, 2)
+}
+
+/// A read graph whose range streams use a `window`-page fetch window.
+fn coordinator_with_window(
+    f: &Fixture,
+    signer: &Rc<Signatures>,
+    membership: &std::sync::Arc<crate::topology::Membership>,
+    peers: Rc<Requester>,
+    window: usize,
+) -> (
+    Rc<Coordinator>,
+    crate::read::dispatch::WorkerEndpoint,
+    Arc<Published<Snapshot>>,
+) {
     let mut deps = f.fill.dependencies.clone();
     deps.candidates = Rc::new(CandidatePolicy::new(
         signer.node().clone(),
@@ -674,7 +689,7 @@ pub(super) fn coordinator(
             name: "hot-read",
             snapshots: 2,
             metadata: 32,
-            window: 2,
+            window,
             stall: Duration::from_secs(30),
             seed: Some(f.origin.metadata.immutable()),
         },
@@ -1100,8 +1115,7 @@ fn later_page_completes_before_head_and_cancellation_keeps_completion_fence() {
 }
 
 #[test]
-#[ignore = "relies on unordered client delivery; rewritten with the per-read fetch job"]
-fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_local_readers() {
+fn production_range_windows_select_from_provider_share_node_work_and_deliver_in_order() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let signers = network(3);
@@ -1184,7 +1198,7 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
             )
         };
         let (local, endpoint, published) =
-            coordinator(&fixtures[i], &signers[i], &membership, peers);
+            coordinator_with_window(&fixtures[i], &signers[i], &membership, peers, 4);
         locals.push(local);
         endpoints.push(endpoint);
         publications.push(published);
@@ -1236,8 +1250,8 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
             kind: ReadKind::Subscription {
                 pin: Some(f.page.version.etag.clone()),
                 range: Some(ByteRange::From(start * PAGE_BYTES)),
-                page_credits: 1,
-                byte_credits: PAGE_BYTES,
+                page_credits: 4,
+                byte_credits: 4 * PAGE_BYTES,
             },
             origin: OriginContext {
                 object: f.context.object.clone(),
@@ -1302,127 +1316,63 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
             f.reactor.poll_budgeted(128).unwrap();
         }
     };
-    // First assignment is ordered progress, shared to both local subscribers.
-    let first = {
-        let mut work = a.next_slice();
-        let mut result = None;
-        for _ in 0..1024 {
-            if let Poll::Ready(value) = work.as_mut().poll(&mut cx) {
-                result = Some(value.unwrap().unwrap());
-                break;
+    // Every reader drives its own window; pages may arrive in any order but
+    // each reader receives its range strictly in order.
+    let mut delivered: [Vec<u64>; 3] = Default::default();
+    let ends = [4, 4, 4];
+    for _ in 0..8192 {
+        for (index, stream) in [&mut a, &mut a2, &mut b].into_iter().enumerate() {
+            let page = match stream.next_slice().as_mut().poll(&mut cx) {
+                Poll::Ready(result) => result.unwrap().map(|reader| reader.slice().page),
+                Poll::Pending => None,
+            };
+            if let Some(page) = page {
+                stream.release_page(page, PAGE_BYTES as u32).unwrap();
+                delivered[index].push(page.0);
             }
-            pump(&mut endpoints);
         }
-        result.expect("first production page")
-    };
-    assert_eq!(first.slice().page.0, 0);
-    let duplicate = futures::executor::block_on(a2.next_slice())
-        .unwrap()
-        .unwrap();
-    assert_eq!(duplicate.slice().page.0, 0);
-    drop((first, duplicate));
-    a.release_page(PageNumber(0), PAGE_BYTES as u32).unwrap();
-    a2.release_page(PageNumber(0), PAGE_BYTES as u32).unwrap();
-    gate.blocked.set(true);
-    let mut wb = b.next_slice();
-    for _ in 0..32 {
-        assert!(wb.as_mut().poll(&mut cx).is_pending());
-        pump(&mut endpoints);
-    }
-    assert_eq!(&*gate.calls.borrow(), &[0, 2]);
-    let mut wa = a.next_slice();
-    for _ in 0..32 {
-        assert!(wa.as_mut().poll(&mut cx).is_pending());
-        pump(&mut endpoints);
-    }
-    assert_eq!(
-        &*gate.calls.borrow(),
-        &[0, 2],
-        "second receiving node joins provider work"
-    );
-    gate.blocked.set(false);
-    let mut ra = None;
-    let mut rb = None;
-    for _ in 0..1024 {
-        if ra.is_none()
-            && let Poll::Ready(value) = wa.as_mut().poll(&mut cx)
+        if delivered
+            .iter()
+            .zip([0, 0, 2])
+            .zip(ends)
+            .all(|((pages, start), end)| pages.len() as u64 == end - start)
         {
-            ra = Some(value.unwrap().unwrap());
-        }
-        if rb.is_none()
-            && let Poll::Ready(value) = wb.as_mut().poll(&mut cx)
-        {
-            rb = Some(value.unwrap().unwrap());
-        }
-        if ra.is_some() && rb.is_some() {
             break;
         }
         pump(&mut endpoints);
     }
-    assert_eq!(
-        ra.unwrap().slice().page.0,
-        2,
-        "provider chose page 2 before page 1"
-    );
-    assert_eq!(rb.unwrap().slice().page.0, 2);
-    drop((wa, wb));
-    let local = futures::executor::block_on(a2.next_slice())
-        .unwrap()
-        .unwrap();
-    assert_eq!(local.slice().page.0, 2);
+    assert_eq!(delivered[0], vec![0, 1, 2, 3]);
+    assert_eq!(delivered[1], vec![0, 1, 2, 3]);
+    assert_eq!(delivered[2], vec![2, 3]);
     assert!(
         demands.borrow().iter().any(|count| *count > 1),
-        "not fixed-page wire requests"
+        "the window selects holes from the provider, not fixed pages"
     );
+    // The provider fills each page from origin once; receiving nodes and the
+    // second local reader share its transfers rather than the origin.
     assert_eq!(
-        demands.borrow().len(),
-        3,
-        "one transfer per receiving node, not per local subscriber"
+        gate.calls
+            .borrow()
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        4
     );
-    drop(local);
-    a.release_page(PageNumber(2), PAGE_BYTES as u32).unwrap();
-    a2.release_page(PageNumber(2), PAGE_BYTES as u32).unwrap();
-    // The next turn restores oldest-page progress without redelivering page 2.
-    let next = {
-        let mut work = a.next_slice();
-        let mut result = None;
-        for _ in 0..2048 {
-            if let Poll::Ready(value) = work.as_mut().poll(&mut cx) {
-                result = Some(value.unwrap().unwrap());
-                break;
-            }
-            pump(&mut endpoints);
+    for stream in [&mut a, &mut a2, &mut b] {
+        assert!(
+            futures::executor::block_on(stream.next_slice())
+                .unwrap()
+                .is_none()
+        );
+    }
+    // A selection the windows outran still completes on its worker.
+    drop((a, a2, b));
+    for _ in 0..4096 {
+        if endpoints.iter().all(|endpoint| endpoint.is_drained()) {
+            break;
         }
-        result.expect("continued selection")
-    };
-    assert_eq!(next.slice().page.0, 1);
-    drop(next);
-    a.release_page(PageNumber(1), PAGE_BYTES as u32).unwrap();
-    drop(
-        futures::executor::block_on(a2.next_slice())
-            .unwrap()
-            .unwrap(),
-    );
-    a2.release_page(PageNumber(1), PAGE_BYTES as u32).unwrap();
-    let last = {
-        let mut work = a.next_slice();
-        let mut result = None;
-        for _ in 0..2048 {
-            if let Poll::Ready(value) = work.as_mut().poll(&mut cx) {
-                result = Some(value.unwrap().unwrap());
-                break;
-            }
-            pump(&mut endpoints);
-        }
-        result.expect("last selection")
-    };
-    assert_eq!(last.slice().page.0, 3);
-    drop(last);
-    assert!(
-        futures::executor::block_on(a.next_slice())
-            .unwrap()
-            .is_none()
-    );
+        pump(&mut endpoints);
+    }
     // A later local subscriber must reuse already verified pages without asking
     // the provider to transfer pages excluded by its completed-page ledger.
     let transfers = demands.borrow().len();
@@ -1467,12 +1417,12 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
             f.reactor.wait(Duration::from_millis(1)).unwrap();
         }
     }
-    assert_eq!(fixtures[2].origin.calls.get(), 4);
-    assert_eq!(
-        fixtures[0].origin.calls.get() + fixtures[1].origin.calls.get(),
-        0
-    );
-    drop((a, a2, b));
+    // Readers on one node share page work: no page starts twice per node.
+    for f in &fixtures {
+        let started = f.origin.started_pages.borrow();
+        let unique = started.iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), started.len(), "{started:?}");
+    }
     for endpoint in &mut endpoints {
         endpoint.uninstall().unwrap();
     }

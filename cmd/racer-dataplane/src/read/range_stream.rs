@@ -51,8 +51,9 @@ struct Reader {
     version: ObjectVersion,
     /// Window pages that still accept a page from any selection.
     wants: BTreeSet<u64>,
-    /// Window pages covered by this reader's outstanding selections.
-    selecting: BTreeSet<u64>,
+    /// Window pages covered by this reader's outstanding selections or direct
+    /// fills. Other windows leave these pages to this reader's fan-out.
+    busy: BTreeSet<u64>,
     /// Selected pages offered to this reader, bounded by its window.
     offered: VecDeque<PageResult>,
     waker: Option<Waker>,
@@ -169,7 +170,7 @@ impl Scheduler {
             Reader {
                 version,
                 wants: BTreeSet::new(),
-                selecting: BTreeSet::new(),
+                busy: BTreeSet::new(),
                 offered: VecDeque::new(),
                 waker: None,
             },
@@ -192,7 +193,7 @@ impl Scheduler {
                     if &reader.version != version || !reader.wants.remove(&number) {
                         return None;
                     }
-                    reader.selecting.remove(&number);
+                    reader.busy.remove(&number);
                     reader.offered.push_back(page.clone());
                     reader.waker.take()
                 })
@@ -225,12 +226,12 @@ struct WindowLease {
 }
 
 impl WindowLease {
-    /// Publish the pages this window still wants and those it is selecting.
-    fn sync(&self, wants: BTreeSet<u64>, selecting: BTreeSet<u64>, waker: &Waker) {
+    /// Publish the pages this window still wants and those it is fetching.
+    fn sync(&self, wants: BTreeSet<u64>, busy: BTreeSet<u64>, waker: &Waker) {
         let mut state = self.scheduler.state.lock().unwrap();
         if let Some(reader) = state.readers.get_mut(&self.id) {
             reader.wants = wants;
-            reader.selecting = selecting;
+            reader.busy = busy;
             reader.waker = Some(waker.clone());
         }
     }
@@ -245,8 +246,14 @@ impl WindowLease {
             .unwrap_or_default()
     }
 
-    /// Pages that other windows of the same version are already selecting.
-    fn selecting_elsewhere(&self) -> BTreeSet<u64> {
+    /// Give a directly filled page to other windows of the version.
+    fn offer(&self, page: &PageResult) {
+        self.scheduler.offer(&page.metadata.version, page);
+    }
+
+    /// Pages that other windows of the same version are already selecting or
+    /// filling directly.
+    fn busy_elsewhere(&self) -> BTreeSet<u64> {
         let state = self.scheduler.state.lock().unwrap();
         let Some(version) = state.readers.get(&self.id).map(|r| &r.version) else {
             return BTreeSet::new();
@@ -255,7 +262,7 @@ impl WindowLease {
             .readers
             .iter()
             .filter(|(id, reader)| **id != self.id && &reader.version == version)
-            .flat_map(|(_, reader)| reader.selecting.iter().copied())
+            .flat_map(|(_, reader)| reader.busy.iter().copied())
             .collect()
     }
 }
@@ -662,6 +669,9 @@ impl RangeStream {
                 Slot::Fetching(fetch) => match fetch.as_mut().poll(cx) {
                     Poll::Pending => continue,
                     Poll::Ready(Ok((result, remaining))) => {
+                        if let (Ok(page), Some(lease)) = (&result, &self.lease) {
+                            lease.offer(page);
+                        }
                         Slot::Ready(self.budget.complete(remaining).and(result))
                     }
                     Poll::Ready(Err(error)) => Slot::Ready(Err(error)),
@@ -719,12 +729,10 @@ impl RangeStream {
                 }
                 Err(error) => Err(error),
             };
-            if let Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) = result {
-                return Err(error);
-            }
             // The selected page was already offered. Pages the provider did not
-            // send may be selected again; after a failure they are only filled
-            // directly.
+            // send may be selected again; after a failure, including the
+            // selection's own deadline, they are only filled directly. The
+            // stream's cancellation and deadline are checked by `step`.
             let select = result.is_ok();
             for number in pending.pages {
                 if let Some(slot) = self.slot_mut(number)
@@ -773,9 +781,20 @@ impl RangeStream {
             .skip(1)
             .filter(|slot| matches!(slot, Slot::Fetching(_)))
             .count();
+        // Pages another window is selecting or filling arrive through its
+        // fan-out. Only the head is always filled directly, so it never waits
+        // on another window; a concurrent fill of the same page joins the
+        // owner's flight instead of transferring it again.
+        let elsewhere = self
+            .lease
+            .as_ref()
+            .map(WindowLease::busy_elsewhere)
+            .unwrap_or_default();
         let mut index = 1;
         while ahead < DIRECT_AHEAD && index < self.slots.len() {
-            if matches!(self.slots[index], Slot::Missing { .. }) {
+            if matches!(self.slots[index], Slot::Missing { .. })
+                && !elsewhere.contains(&self.page_at(index))
+            {
                 if !self.start_fetch(index, scope)? {
                     return Ok(changed);
                 }
@@ -825,7 +844,7 @@ impl RangeStream {
         let Some(lease) = self.lease.as_ref() else {
             return Ok(false);
         };
-        let Some((demand, pages)) = self.selection_demand(&lease.selecting_elsewhere())? else {
+        let Some((demand, pages)) = self.selection_demand(&lease.busy_elsewhere())? else {
             return Ok(false);
         };
         let Some(child) = self.budget.next_page(self.pending())? else {
@@ -868,7 +887,7 @@ impl RangeStream {
     }
 
     /// The selectable holes of the window, excluding pages that another window
-    /// is selecting, as a canonical demand of at most the wire interval limit.
+    /// is selecting or filling, as a canonical demand of at most the wire interval limit.
     fn selection_demand(
         &self,
         elsewhere: &BTreeSet<u64>,
@@ -904,19 +923,22 @@ impl RangeStream {
         )))
     }
 
-    /// Publish this window's wanted and selecting pages for fan-out.
+    /// Publish this window's wanted and in-flight pages for fan-out.
     fn sync(&self, cx: &Context<'_>) {
         let Some(lease) = self.lease.as_ref() else {
             return;
         };
         let mut wants = BTreeSet::new();
-        let mut selecting = BTreeSet::new();
+        let mut busy = BTreeSet::new();
         for (index, slot) in self.slots.iter().enumerate() {
             let number = self.page_at(index);
             match slot {
                 Slot::Selecting => {
                     wants.insert(number);
-                    selecting.insert(number);
+                    busy.insert(number);
+                }
+                Slot::Fetching(_) => {
+                    busy.insert(number);
                 }
                 Slot::Probing(_) | Slot::Missing { .. } => {
                     wants.insert(number);
@@ -924,7 +946,7 @@ impl RangeStream {
                 _ => {}
             }
         }
-        lease.sync(wants, selecting, cx.waker());
+        lease.sync(wants, busy, cx.waker());
     }
 
     /// Only client HTTP delivery may release the initial operation deadline after
@@ -1788,7 +1810,7 @@ pub(super) mod tests {
             assert!(matches!(stream.slots[1], Slot::Selecting));
         }
         assert_eq!(
-            streams[0].lease.as_ref().unwrap().selecting_elsewhere(),
+            streams[0].lease.as_ref().unwrap().busy_elsewhere(),
             BTreeSet::from([1])
         );
         let demand = crate::peer::subscriptions::Demand::new(vec![
@@ -1824,17 +1846,19 @@ pub(super) mod tests {
     fn selection_failure_returns_pages_to_direct_fill_and_cancellation_is_fatal() {
         let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
         let metadata = metadata();
-        for (error, fatal) in [
-            (Error::Unavailable, false),
-            (Error::Overloaded, false),
-            (Error::Cancelled, true),
-            (Error::DeadlineExceeded, true),
+        for error in [
+            Error::Unavailable,
+            Error::Overloaded,
+            Error::Cancelled,
+            Error::DeadlineExceeded,
         ] {
+            let scope =
+                RequestScope::new(RequestId([3; 16]), Instant::now() + Duration::from_secs(60))
+                    .unwrap();
             let mut stream = f.open(
                 &metadata,
                 ByteRange::From(0).resolve(metadata.length).unwrap(),
-                RequestScope::new(RequestId([3; 16]), Instant::now() + Duration::from_secs(60))
-                    .unwrap(),
+                scope.clone(),
             );
             stream.configure_subscription(2, 2 * PAGE_BYTES).unwrap();
             stream.inject(Slot::Ready(Ok(page_result(&f.admission, &metadata, 0))));
@@ -1845,16 +1869,17 @@ pub(super) mod tests {
                 pages: BTreeSet::from([1]),
             });
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-            let result = stream.poll_selections(&mut cx);
-            if fatal {
-                assert_eq!(result, Err(error));
-                continue;
-            }
-            assert_eq!(result, Ok(true));
+            // A selection's own failure, even of its child deadline, is not
+            // the stream's.
+            assert_eq!(stream.poll_selections(&mut cx), Ok(true));
             assert!(stream.selections.is_empty());
             assert!(matches!(stream.slots[1], Slot::Missing { select: false }));
             // The page is no longer offered for selection, only for a direct fill.
             assert!(stream.selection_demand(&BTreeSet::new()).unwrap().is_none());
+            // Canceling the stream itself is fatal.
+            scope.cancel().unwrap();
+            stream.poll_prefetch(&mut cx);
+            assert_eq!(stream.error, Some(Error::Cancelled));
         }
     }
     #[test]
@@ -2106,8 +2131,7 @@ pub(super) mod tests {
             if capped {
                 assert_eq!(result, Err(Error::InvalidRequest));
             } else {
-                result
-                    .unwrap_or_else(|e| panic!("capped={capped} progressing={progressing}: {e:?}"));
+                result.unwrap();
             }
             reader.join().unwrap();
             // Dropping a capped response detaches waiters, but accepted worker
@@ -2346,7 +2370,7 @@ pub(super) mod tests {
             );
         }
         #[test]
-        fn dropped_window_is_removed_from_fanout_and_selecting_elsewhere() {
+        fn dropped_window_is_removed_from_fanout_and_busy_elsewhere() {
             let scheduler = Scheduler::new(2);
             let supplier = scheduler.open(version()).unwrap();
             let reader = scheduler.open(version()).unwrap();
@@ -2356,8 +2380,8 @@ pub(super) mod tests {
                 futures::task::noop_waker_ref(),
             );
             want(&reader, &[0, 800_000]);
-            assert_eq!(reader.selecting_elsewhere(), BTreeSet::from([800_000]));
-            assert!(supplier.selecting_elsewhere().is_empty());
+            assert_eq!(reader.busy_elsewhere(), BTreeSet::from([800_000]));
+            assert!(supplier.busy_elsewhere().is_empty());
             let selection = Selection::for_test(&scheduler, version(), demand(800_000, 800_001));
             selection.complete(page(&version(), 800_000)).unwrap();
             assert_eq!(offered(&supplier), vec![800_000]);
@@ -2368,7 +2392,7 @@ pub(super) mod tests {
                 futures::task::noop_waker_ref(),
             );
             drop(supplier);
-            assert!(reader.selecting_elsewhere().is_empty());
+            assert!(reader.busy_elsewhere().is_empty());
             assert_eq!(scheduler.state.lock().unwrap().readers.len(), 1);
             Selection::for_test(&scheduler, version(), demand(0, 1))
                 .complete(page(&version(), 0))
