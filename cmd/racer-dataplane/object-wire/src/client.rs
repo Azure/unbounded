@@ -27,8 +27,6 @@ pub enum ReadKind {
         page_credits: usize,
 
         byte_credits: u64,
-
-        ordered: bool,
     },
 }
 
@@ -97,7 +95,6 @@ impl RequestParser {
         let mut content_length = false;
         let mut page_credits = 2;
         let mut byte_credits = 2 * PAGE_BYTES;
-        let mut ordered = false;
         let mut max_age = None;
         for header in &head.headers {
             decoded_bytes = decoded_bytes
@@ -132,7 +129,6 @@ impl RequestParser {
                     | "authorization"
                     | "racer-page-credits"
                     | "racer-byte-credits"
-                    | "racer-ordered"
             ) && !seen.insert(name.clone())
             {
                 return Err(Error::InvalidRequest);
@@ -171,13 +167,6 @@ impl RequestParser {
                 "range" => range = Some(ByteRange::parse(value)?),
                 "racer-page-credits" => page_credits = decimal(value, 1, 64)? as usize,
                 "racer-byte-credits" => byte_credits = decimal(value, PAGE_BYTES, 64 * PAGE_BYTES)?,
-                "racer-ordered" => {
-                    ordered = match value {
-                        b"0" => false,
-                        b"1" => true,
-                        _ => return Err(Error::InvalidRequest),
-                    }
-                }
                 "racer-metadata" => {
                     validate_opaque(value)?;
                     metadata = Some(value);
@@ -212,7 +201,6 @@ impl RequestParser {
                 range,
                 page_credits,
                 byte_credits,
-                ordered,
             },
             "POST" => return Err(Error::InvalidRequest),
             _ => return Err(Error::MethodNotAllowed),

@@ -2027,7 +2027,6 @@ fn actual_uds_empty_bootstrap_and_canceled_success() {
                     range: None,
                     page_credits: 2,
                     byte_credits: 2 * PAGE_BYTES,
-                    ordered: false,
                 },
                 Ok(ReadResponse {
                     retain_until: None,
@@ -2273,7 +2272,6 @@ fn response_payload_validation_preserves_range_pin_and_empty_contracts() {
         range,
         page_credits: 1,
         byte_credits: PAGE_BYTES,
-        ordered: false,
     };
     let pinned = subscription(Some(range), Some(response.metadata.version.etag.clone()));
     assert_eq!(responses.validate(&pinned, &response), Ok(()));
@@ -3651,7 +3649,6 @@ mod parser_tests {
                     }),
                     page_credits: 2,
                     byte_credits: 2 * PAGE_BYTES,
-                    ordered: false,
                 },
             ),
             (
@@ -3665,7 +3662,6 @@ mod parser_tests {
                     range: Some(ByteRange::Suffix(0)),
                     page_credits: 2,
                     byte_credits: 2 * PAGE_BYTES,
-                    ordered: false,
                 },
             ),
             (
@@ -3679,7 +3675,6 @@ mod parser_tests {
                     range: Some(ByteRange::From(PAGE_BYTES)),
                     page_credits: 2,
                     byte_credits: 2 * PAGE_BYTES,
-                    ordered: false,
                 },
             ),
         ] {
@@ -3776,7 +3771,6 @@ mod parser_tests {
                 range: None,
                 page_credits: 2,
                 byte_credits: 2 * PAGE_BYTES,
-                ordered: false
             }
         );
         for name in ["Racer-Page-Credits", "Racer-Byte-Credits"] {
@@ -3801,7 +3795,7 @@ mod parser_tests {
         }
         for pages in [1, 64] {
             for bytes in [PAGE_BYTES, 64 * PAGE_BYTES] {
-                for ordered in ["0", "1"] {
+                for ordered in ["0", "1", "2", "01"] {
                     let parsed = parse(head(
                         "POST",
                         &[
@@ -3812,7 +3806,7 @@ mod parser_tests {
                     ))
                     .unwrap();
                     assert!(
-                        matches!(parsed.kind, ReadKind::Subscription { page_credits, byte_credits, ordered: actual, .. } if page_credits == pages && byte_credits == bytes && actual == (ordered == "1"))
+                        matches!(parsed.kind, ReadKind::Subscription { page_credits, byte_credits, .. } if page_credits == pages && byte_credits == bytes)
                     );
                 }
             }
@@ -3821,17 +3815,16 @@ mod parser_tests {
             ("Racer-Page-Credits", "65".into()),
             ("Racer-Byte-Credits", (PAGE_BYTES - 1).to_string()),
             ("Racer-Byte-Credits", (64 * PAGE_BYTES + 1).to_string()),
-            ("Racer-Ordered", "2".into()),
-            ("Racer-Ordered", "01".into()),
         ] {
             assert!(parse(head("POST", &[(name, value.as_bytes())])).is_err());
         }
+        // The removed Racer-Ordered header is ignored, so duplicates are not rejected.
         assert!(
             parse(head(
                 "POST",
                 &[("Racer-Ordered", b"0"), ("racer-ordered", b"1")]
             ))
-            .is_err()
+            .is_ok()
         );
         let mut missing = head("POST", &[]);
         missing.headers.retain(|h| h.name != "Content-Length");

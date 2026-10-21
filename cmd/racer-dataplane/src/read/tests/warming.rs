@@ -470,24 +470,20 @@ fn warm_head_detaches_and_real_gets_share_peer_pipeline_and_disk_completion() {
     assert_eq!(repeated.unwrap().retain_until, Some(until));
     drop(duplicate);
     let mut streams = Vec::new();
-    for ordered in [true, false] {
-        let read = futures::executor::block_on(
-            local.read(
-                ClientRequest {
-                    retain: None,
-                    origin: origin(),
-                    kind: ReadKind::Subscription {
-                        pin: Some(f.page.version.etag.clone()),
-                        range: Some(crate::model::ByteRange::From(2 * PAGE_BYTES)),
-                        page_credits: 1,
-                        byte_credits: PAGE_BYTES,
-                        ordered,
-                    },
+    for second in [false, true] {
+        let read = futures::executor::block_on(local.read(
+            ClientRequest {
+                retain: None,
+                origin: origin(),
+                kind: ReadKind::Subscription {
+                    pin: Some(f.page.version.etag.clone()),
+                    range: Some(crate::model::ByteRange::From(2 * PAGE_BYTES)),
+                    page_credits: 1,
+                    byte_credits: PAGE_BYTES,
                 },
-                &RequestScope::new(RequestId([82 + u8::from(ordered); 16]), f.scope.deadline.0)
-                    .unwrap(),
-            ),
-        )
+            },
+            &RequestScope::new(RequestId([82 + u8::from(second); 16]), f.scope.deadline.0).unwrap(),
+        ))
         .unwrap();
         let ReadPayload::Stream(stream) = read.payload else {
             panic!("body expected");
@@ -717,9 +713,9 @@ fn warm_partial_failure_releases_unused_hold_and_retries_without_refetching_disk
             .is_some()
     );
     f.origin.version_unavailable.set(false);
-    for ordered in [true, false] {
+    for second in [false, true] {
         let caller =
-            RequestScope::new(RequestId([90 + u8::from(ordered); 16]), f.scope.deadline.0).unwrap();
+            RequestScope::new(RequestId([90 + u8::from(second); 16]), f.scope.deadline.0).unwrap();
         let response = futures::executor::block_on(local.read(
             ClientRequest {
                 retain: None,
@@ -728,7 +724,6 @@ fn warm_partial_failure_releases_unused_hold_and_retries_without_refetching_disk
                     range: Some(crate::model::ByteRange::From(PAGE_BYTES)),
                     page_credits: 1,
                     byte_credits: PAGE_BYTES,
-                    ordered,
                 },
                 origin: OriginContext {
                     object: f.context.object.clone(),
@@ -935,7 +930,6 @@ fn warm_cancel_keeps_get_gate_until_detached_origin_driver_fences() {
                 range: None,
                 page_credits: 1,
                 byte_credits: PAGE_BYTES,
-                ordered: false,
             },
         },
         &caller,
