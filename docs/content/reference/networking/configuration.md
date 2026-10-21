@@ -190,15 +190,15 @@ At startup, each agent raises these IPv4 neighbor table thresholds as needed:
 
 | Sysctl | Minimum | For 2,000 nodes |
 |--------|---------|----------------|
-| `net.ipv4.neigh.default.gc_thresh1` | Expected nodes | 2000 |
-| `net.ipv4.neigh.default.gc_thresh2` | 110% of expected nodes, rounded up | 2200 |
-| `net.ipv4.neigh.default.gc_thresh3` | 120% of expected nodes, rounded up | 2400 |
+| `net.ipv4.neigh.default.gc_thresh1` | 110% of expected nodes, rounded up | 2200 |
+| `net.ipv4.neigh.default.gc_thresh2` | 120% of expected nodes, rounded up | 2400 |
+| `net.ipv4.neigh.default.gc_thresh3` | 130% of expected nodes, rounded up | 2600 |
 
 Existing higher values are never reduced. Higher lower thresholds also act as
 floors for the upper thresholds to keep them ordered. The agent raises the
 hard limit first and fails startup with an explicit error if a required sysctl
 cannot be read, parsed, or raised. Values must be integers from `0` through
-`1789569705`, so all thresholds fit Linux's signed 32-bit sysctl range.
+`1651910497`, so all thresholds fit Linux's signed 32-bit sysctl range.
 
 Despite the `default` path, Linux implements these as table-wide limits shared
 by **all interfaces**, including subsequently created ones. There is no

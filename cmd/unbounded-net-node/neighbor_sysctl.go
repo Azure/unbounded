@@ -13,7 +13,7 @@ import (
 	"k8s.io/klog/v2"
 )
 
-const maxExpectedNeighborNodes = math.MaxInt32 * 5 / 6
+const maxExpectedNeighborNodes = math.MaxInt32 * 10 / 13
 
 func neighborGCThresholds(expectedNodes int) ([3]int, error) {
 	if expectedNodes < 0 || expectedNodes > maxExpectedNeighborNodes {
@@ -22,7 +22,7 @@ func neighborGCThresholds(expectedNodes int) ([3]int, error) {
 
 	nodes := int64(expectedNodes)
 
-	return [3]int{expectedNodes, int((nodes*11 + 9) / 10), int((nodes*6 + 4) / 5)}, nil
+	return [3]int{int((nodes*11 + 9) / 10), int((nodes*12 + 9) / 10), int((nodes*13 + 9) / 10)}, nil
 }
 
 func applyNeighborGCThresholds(expectedNodes int, readFile func(string) ([]byte, error), writeFile func(string, []byte, os.FileMode) error) error {

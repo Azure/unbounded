@@ -20,13 +20,13 @@ func TestNeighborGCThresholds(t *testing.T) {
 		want  [3]int
 	}{
 		{0, [3]int{}},
-		{1, [3]int{1, 2, 2}},
-		{9, [3]int{9, 10, 11}},
-		{10, [3]int{10, 11, 12}},
-		{11, [3]int{11, 13, 14}},
-		{2000, [3]int{2000, 2200, 2400}},
-		{2001, [3]int{2001, 2202, 2402}},
-		{maxExpectedNeighborNodes, [3]int{1789569705, 1968526676, 2147483646}},
+		{1, [3]int{2, 2, 2}},
+		{9, [3]int{10, 11, 12}},
+		{10, [3]int{11, 12, 13}},
+		{11, [3]int{13, 14, 15}},
+		{2000, [3]int{2200, 2400, 2600}},
+		{2001, [3]int{2202, 2402, 2602}},
+		{maxExpectedNeighborNodes, [3]int{1817101547, 1982292597, 2147483647}},
 	} {
 		t.Run(strconv.Itoa(tc.nodes), func(t *testing.T) {
 			got, err := neighborGCThresholds(tc.nodes)
@@ -46,11 +46,11 @@ func TestApplyNeighborGCThresholds(t *testing.T) {
 		writes  []string
 	}{
 		{"disabled", 0, [3]int{128, 512, 1024}, [3]int{128, 512, 1024}, nil},
-		{"raise", 2000, [3]int{128, 512, 1024}, [3]int{2000, 2200, 2400}, []string{"gc_thresh3", "gc_thresh2", "gc_thresh1"}},
-		{"odd", 2001, [3]int{128, 512, 1024}, [3]int{2001, 2202, 2402}, []string{"gc_thresh3", "gc_thresh2", "gc_thresh1"}},
+		{"raise", 2000, [3]int{128, 512, 1024}, [3]int{2200, 2400, 2600}, []string{"gc_thresh3", "gc_thresh2", "gc_thresh1"}},
+		{"odd", 2001, [3]int{128, 512, 1024}, [3]int{2202, 2402, 2602}, []string{"gc_thresh3", "gc_thresh2", "gc_thresh1"}},
 		{"already higher", 2000, [3]int{4096, 8192, 16384}, [3]int{4096, 8192, 16384}, nil},
-		{"already equal", 2000, [3]int{2000, 2200, 2400}, [3]int{2000, 2200, 2400}, nil},
-		{"mixed", 2000, [3]int{128, 4096, 8192}, [3]int{2000, 4096, 8192}, []string{"gc_thresh1"}},
+		{"already equal", 2000, [3]int{2200, 2400, 2600}, [3]int{2200, 2400, 2600}, nil},
+		{"mixed", 2000, [3]int{128, 4096, 8192}, [3]int{2200, 4096, 8192}, []string{"gc_thresh1"}},
 		{"preserve ordering", 2000, [3]int{6000, 7000, 1024}, [3]int{6000, 7000, 7000}, []string{"gc_thresh3"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -177,7 +177,7 @@ func TestNodeExpectedNodesConfig(t *testing.T) {
 		{name: "unset", yaml: "node: {}"},
 		{name: "disabled", yaml: "node:\n  expectedNodes: 0"},
 		{name: "negative", yaml: "node:\n  expectedNodes: -1", invalid: true},
-		{name: "overflow", yaml: "node:\n  expectedNodes: 1789569706", invalid: true},
+		{name: "overflow", yaml: "node:\n  expectedNodes: 1651910498", invalid: true},
 		{name: "noninteger", yaml: "node:\n  expectedNodes: many", invalid: true},
 		{name: "invalid flag", yaml: "node: {}", flag: "-1", invalid: true},
 		{name: "flag disables", yaml: "node:\n  expectedNodes: 2000", flag: "0"},
