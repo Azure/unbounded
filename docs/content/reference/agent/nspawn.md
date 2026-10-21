@@ -158,8 +158,47 @@ by a host reboot. On GPU hosts, the post-start hook stops kubelet and containerd
 rewires the driver root and CDI state, then restores both services. Hook failures
 fail the nspawn start and are retried through systemd. On the host,
 `unbounded-agent-nspawn-lifecycle nspawn-lifecycle reconcile <machine>` triggers both
-steps by restarting the managed nspawn unit. Managed `NodeReboot` operations
-invoke the same reconcile flow.
+steps by restarting the managed nspawn unit, as does
+`systemctl restart systemd-nspawn@<machine>.service`, which also works without
+the helper. Managed `NodeReboot` operations invoke the same reconcile flow.
+
+An application that embeds the agent can run the hooks' phases another way,
+such as in a container, by setting `NSpawnLifecycle` in the agent config. Its
+`PreStartCommand` and `PostStartCommand` replace the helper's commands in the
+units. Each is a single systemd command that starts with its absolute path, in
+which `%i` is the machine's name. It must run its `nspawn-lifecycle`
+phase for that machine with the host's view of the filesystem, since the phases
+read host devices, `/etc/os-release`, and NVIDIA binaries and libraries, and
+write host unit files. It must fail when the phase fails. The agent then doesn't
+install the lifecycle helper:
+
+```json
+{
+  "NSpawnLifecycle": {
+    "PreStartCommand": "/usr/bin/systemctl start app-nspawn-pre-start@%i.service",
+    "PostStartCommand": "/usr/bin/systemctl start app-nspawn-post-start@%i.service"
+  }
+}
+```
+
+A unit that commands like these start runs its phase on every machine start
+only if:
+
+- it is a `Type=oneshot` unit without `RemainAfterExit=yes`, which would leave
+  it active, so that later starts do nothing;
+- it isn't ordered after the machine's units, or a target that waits for them,
+  such as `machines.target` or `multi-user.target`, which deadlocks the
+  machine's start. The pre-start unit has no start timeout, so it would wait
+  forever;
+- post-start finishes within the machine unit's start timeout.
+
+The agent doesn't remove a helper installed before. If a later config doesn't
+set `NSpawnLifecycle`, writing the machine's units reinstalls the helper first
+when it's missing, as a copy of the running agent's binary, which must then run
+on the host and implement `nspawn-lifecycle`. Pre-start, which writes them at
+every machine start, runs through the configured command, so the units that
+command starts must stay for as long as a machine's units may name them. An
+application that removes them must rewrite the machine's units when it starts.
 
 Each lifecycle refresh discovers NVIDIA devices and driver libraries from the
 current host. On a node provisioned with the NVIDIA-capable rootfs, complete GPU
@@ -191,7 +230,7 @@ The configuration is written to these files on the host before the machine boots
 | nspawn config | `/etc/systemd/nspawn/<MachineName>.nspawn` |
 | Service override | `/etc/systemd/system/systemd-nspawn@<MachineName>.service.d/override.conf` |
 | Config regeneration unit | `/etc/systemd/system/unbounded-agent-regenerate-config@<MachineName>.service` |
-| Rollback-stable lifecycle helper | `/opt/unbounded/agent/bin/unbounded-agent-nspawn-lifecycle` |
+| Rollback-stable lifecycle helper, unless `NSpawnLifecycle` is set | `/opt/unbounded/agent/bin/unbounded-agent-nspawn-lifecycle` |
 
 ### Containerd image verification
 
@@ -387,7 +426,7 @@ The container operates in the host's network namespace (`VirtualEthernet=no`):
 | `/etc/systemd/nspawn/<MachineName>.nspawn` | nspawn configuration file. |
 | `/etc/systemd/system/systemd-nspawn@<MachineName>.service.d/override.conf` | Systemd service override. |
 | `/etc/systemd/system/unbounded-agent-regenerate-config@<MachineName>.service` | Host-side retrying oneshot unit that regenerates host-side configuration before machine start. |
-| `/opt/unbounded/agent/bin/unbounded-agent-nspawn-lifecycle` | Lifecycle command binary retained across daemon binary rollback. On a host installed by a release before `/opt/unbounded/agent`, that directory is a link to `/usr/local` until the agent moves the files; see [Where the agent installs]({{< relref "guides/agent#where-the-agent-installs" >}}). |
+| `/opt/unbounded/agent/bin/unbounded-agent-nspawn-lifecycle` | Lifecycle command binary retained across daemon binary rollback, unless `NSpawnLifecycle` is set. On a host installed by a release before `/opt/unbounded/agent`, that directory is a link to `/usr/local` until the agent moves the files; see [Where the agent installs]({{< relref "guides/agent#where-the-agent-installs" >}}). |
 | `/run/host-nvidia/<index>/` | (Inside container) Read-only bind-mount of host NVIDIA library directories. |
 
 ## See Also
