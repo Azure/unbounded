@@ -2930,6 +2930,16 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::RdmaPagesReceived => "racer_rdma_pages_received_total",
             Self::RdmaReceivedBytes => "racer_rdma_received_bytes_total",
             Self::RdmaHttpFallback => "racer_rdma_http_fallback_total",
+            Self::RdmaGrantCount => "racer_rdma_grant_nanoseconds_count",
+            Self::RdmaGrantNs => "racer_rdma_grant_nanoseconds_sum",
+            Self::RdmaHeadCount => "racer_rdma_head_nanoseconds_count",
+            Self::RdmaHeadNs => "racer_rdma_head_nanoseconds_sum",
+            Self::RdmaArrivalCount => "racer_rdma_arrival_nanoseconds_count",
+            Self::RdmaArrivalNs => "racer_rdma_arrival_nanoseconds_sum",
+            Self::RdmaSendCount => "racer_rdma_send_nanoseconds_count",
+            Self::RdmaSendNs => "racer_rdma_send_nanoseconds_sum",
+            Self::RdmaServeCount => "racer_rdma_serve_nanoseconds_count",
+            Self::RdmaServeNs => "racer_rdma_serve_nanoseconds_sum",
 }
 metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::WarmTrackedJobs => "racer_warm_tracked_jobs",

@@ -31,6 +31,7 @@ use crate::rdma::TransportPlan;
 use crate::runtime::RequestScope;
 use crate::telemetry::BodyProgress;
 use crate::telemetry::Detail;
+use crate::telemetry::Event;
 use crate::telemetry::Failure;
 use crate::telemetry::Stage;
 use crate::telemetry::timestamp;
@@ -43,6 +44,7 @@ use racer_control_wire::CacheId;
 use racer_control_wire::MembershipVersion;
 use racer_control_wire::NodeId;
 use racer_control_wire::RailId;
+use racer_platform::environment::now;
 use racer_platform::reactor::IoBuffer;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -269,6 +271,13 @@ impl Transfers {
     /// the grant and fall back to the HTTP body (`designs/racer-rdma-sessions.md`,
     /// "Per-page protocol"). Every granted tag gets exactly one write or release
     /// unless the link breaks, which fences everything.
+    /// Record an RDMA transfer stage when native links exist.
+    fn record_rdma_stage(&self, count: Event, sum: Event, start: std::time::Instant) {
+        if let Some(links) = &self.links {
+            links.record_stage(count, sum, start);
+        }
+    }
+
     pub(super) async fn send_native(
         &self,
         connection: ConnectionLease,
@@ -281,6 +290,7 @@ impl Transfers {
         let Some(links) = &self.links else {
             return Ok((connection, false));
         };
+        let serving = now();
         let peer = accept.peer.node();
         let (PeerResponse::Page { ciphertext, .. } | PeerResponse::Selected { ciphertext, .. }) =
             &response.response
@@ -323,11 +333,15 @@ impl Transfers {
         binding.response = envelope_digest(&response.authentication)?;
         let previous = signed_digest(&accept.signed)?;
         // `Links::send` writes the page in place, or stages a copy without ODP.
+        let sending = now();
         let sent = links
             .send(peer, &grant, ciphertext, &native_scope(scope))
             .await;
         let sent = match sent {
-            Ok(sent) => sent,
+            Ok(sent) => {
+                links.record_stage(Event::RdmaSendCount, Event::RdmaSendNs, sending);
+                sent
+            }
             Err(error) => {
                 links.release(peer, &grant);
                 if !native_failure(error, scope) {
@@ -349,6 +363,7 @@ impl Transfers {
         let mut head = encode_envelope(&response.authentication, true, 0)?;
         attach(&mut head, &complete)?;
         let connection = self.io.send_head(connection, head, scope).await?.connection;
+        links.record_stage(Event::RdmaServeCount, Event::RdmaServeNs, serving);
         #[cfg(test)]
         self.native_completed.set(self.native_completed.get() + 1);
         Ok((connection, true))
@@ -1142,11 +1157,15 @@ impl Transfers {
                 timing.end(1);
             }
             // Native response verification requires an authenticated membership lease.
+            let granting = now();
             let native = if membership.is_some() {
                 self.accept_native(&request, plan, scope).await?
             } else {
                 None
             };
+            if native.is_some() {
+                self.record_rdma_stage(Event::RdmaGrantCount, Event::RdmaGrantNs, granting);
+            }
             if let TransportPlan::Rdma { rail } = plan
                 && membership.is_some()
                 && self
@@ -1163,6 +1182,7 @@ impl Transfers {
             if let Some(timing) = timing.as_deref_mut() {
                 timing.begin();
             }
+            let heading = now();
             let sent = observer.result(
                 Stage::PeerHead,
                 scope,
@@ -1175,6 +1195,9 @@ impl Transfers {
             )?;
             if let Some(timing) = timing.as_deref_mut() {
                 timing.end(2);
+            }
+            if native.is_some() {
+                self.record_rdma_stage(Event::RdmaHeadCount, Event::RdmaHeadNs, heading);
             }
             let control = detach(&mut received.value)?;
             let relay_context = if relay.is_some() {
@@ -1193,7 +1216,8 @@ impl Transfers {
             let (authentication, length) = decode_envelope(received.value, true)?;
             if let Some(control) = control {
                 let (binding, accept, peer, pending) = native.ok_or(Error::Unauthorized)?;
-                return self
+                let arriving = now();
+                let received = self
                     .receive_native(
                         received.connection,
                         authentication,
@@ -1208,6 +1232,10 @@ impl Transfers {
                     )
                     .await
                     .map(RelayResponse::Complete);
+                if received.is_ok() {
+                    self.record_rdma_stage(Event::RdmaArrivalCount, Event::RdmaArrivalNs, arriving);
+                }
+                return received;
             }
             if relay.is_some() {
                 received.connection.state_mut().relay.context = relay_context;
