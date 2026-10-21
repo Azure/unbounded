@@ -30,6 +30,7 @@ permissions:
 env:
   RUSTUP_TOOLCHAIN: "1.96.0"
   CARGO_TARGET_DIR: ${{ github.workspace }}/bin/racer-cargo
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 # Cache policy for every job below:
 #   - Only pushes save, so each job keeps one current entry instead of one per
@@ -64,8 +65,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             bin/racer-cargo
-          key: racer-lint-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-${{ hashFiles('cmd/racer-dataplane/**', '.github/workflows/racer.yaml') }}
-          restore-keys: racer-lint-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-
+          key: racerv2-lint-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-${{ hashFiles('cmd/racer-dataplane/**', '.github/workflows/racer.yaml') }}
+          restore-keys: racerv2-lint-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -142,15 +143,15 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             bin/racer-cargo
-          key: racer-test-${{ matrix.features }}-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-${{ hashFiles('cmd/racer-dataplane/**', '.github/workflows/racer.yaml') }}
-          restore-keys: racer-test-${{ matrix.features }}-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-
+          key: racerv2-test-${{ matrix.features }}-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-${{ hashFiles('cmd/racer-dataplane/**', '.github/workflows/racer.yaml') }}
+          restore-keys: racerv2-test-${{ matrix.features }}-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-
 
       # Building separately keeps compile and test time apart in the logs.
       - name: Build tests
         run: cargo test --locked --workspace $FEATURES --no-run
 
       - name: Test
-        run: cargo test --locked --workspace $FEATURES
+        run: RUSTC_BOOTSTRAP=1 cargo test --locked --workspace $FEATURES -- -Z unstable-options --report-time
 
       - name: TEMP cache size
         if: ${{ !cancelled() }}
@@ -198,8 +199,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             bin/racer-cargo
-          key: racer-feature-gates-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-${{ hashFiles('cmd/racer-dataplane/**', '.github/workflows/racer.yaml') }}
-          restore-keys: racer-feature-gates-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-
+          key: racerv2-feature-gates-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-${{ hashFiles('cmd/racer-dataplane/**', '.github/workflows/racer.yaml') }}
+          restore-keys: racerv2-feature-gates-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-
 
       - name: Runtime production real I/O (no simulation)
         env:
@@ -284,8 +285,8 @@ jobs:
             ~/.cargo/git
             ~/.cache/miri
             bin/racer-miri-cargo
-          key: racer-miri-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-${{ hashFiles('cmd/racer-dataplane/**', '.github/workflows/racer.yaml', 'hack/scripts/runtime-miri.py') }}
-          restore-keys: racer-miri-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-
+          key: racerv2-miri-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-${{ hashFiles('cmd/racer-dataplane/**', '.github/workflows/racer.yaml', 'hack/scripts/runtime-miri.py') }}
+          restore-keys: racerv2-miri-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('cmd/racer-dataplane/Cargo.lock') }}-
 
       - name: Prepare Miri sysroot
         run: cargo miri setup
@@ -335,10 +336,10 @@ jobs:
             ~/.cache/go-build
             bin/envtest
             bin/setup-envtest-*
-          key: racer-envtest-${{ runner.os }}-${{ runner.arch }}-go${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}
+          key: racerv2-envtest-${{ runner.os }}-${{ runner.arch }}-go${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}
           # Go's build cache is content-addressed and trims itself, so an older
           # entry is still a safe starting point after go.sum changes.
-          restore-keys: racer-envtest-${{ runner.os }}-${{ runner.arch }}-go${{ steps.go.outputs.go-version }}-
+          restore-keys: racerv2-envtest-${{ runner.os }}-${{ runner.arch }}-go${{ steps.go.outputs.go-version }}-
 
       - name: Provision envtest and run controller API-server race tests
         run: make racer-envtest-ci
