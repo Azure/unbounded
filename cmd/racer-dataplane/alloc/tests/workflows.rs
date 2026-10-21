@@ -1364,3 +1364,154 @@ fn partial_table_reclamation_changes_authority_without_erasing_storage() {
     assert_eq!(entries.removals.get(), 1);
     assert_eq!(segments.free_count(), 1);
 }
+
+/// Shared body with arbitrary bytes, for exercising vectored validation.
+#[cfg(feature = "simulation")]
+struct SharedBody(Rc<page_alloc::AlignedBuffer<()>>, std::ops::Range<usize>);
+
+// SAFETY: the Rc keeps the immutable allocation alive and unmoved; no alias
+// mutates it while the body is owned by a write.
+#[cfg(feature = "simulation")]
+unsafe impl racer_platform::reactor::SharedWriteBuffer for SharedBody {
+    type Error = Error;
+
+    fn write_bytes(&self) -> Result<&[u8], Error> {
+        Ok(&self.0.as_slice()[self.1.clone()])
+    }
+}
+
+/// Vectored writes land header then body, validate layout, and fail closed.
+#[cfg(feature = "simulation")]
+#[test]
+fn vectored_write_roundtrip_validation_and_faults() {
+    let sim = Simulation::new();
+    let _environment = sim.enter();
+    let slab = Slab::<()>::new(PathBuf::from("/virtual/vectored.dat"), 65536, 32768, 16384);
+    let segments = Segments::new(32768);
+    let unit = slab.open_configured(&segments).unwrap().length();
+    assert!(unit * 2 <= 16384);
+    let total = 2 * unit;
+    let reactor = Reactor::<TestScope, ()>::new(16, ());
+    let (lease, extent) = segments.append(total).unwrap();
+    let lease_again = || segments.lease(SegmentId(0), Generation(1)).unwrap();
+    let header = |len: usize| {
+        let mut h = slab.allocate(len, ()).unwrap();
+        h.as_mut_slice().fill(7);
+        h
+    };
+    let mut page = slab.allocate(total, ()).unwrap();
+    page.as_mut_slice().fill(9);
+    let page = Rc::new(page);
+    let body = |range| SharedBody(page.clone(), range);
+
+    let (h, b) = drive(
+        &reactor,
+        slab.write_vectored(
+            &reactor,
+            extent,
+            header(unit),
+            body(0..unit),
+            lease,
+            &TestScope,
+        ),
+    )
+    .unwrap();
+    assert_eq!(h.len(), unit);
+    drop((h, b));
+    assert_eq!(slab.writes_in_flight(), 0);
+    let read = drive(
+        &reactor,
+        slab.read(
+            &reactor,
+            extent,
+            slab.allocate(total, ()).unwrap(),
+            lease_again(),
+            &TestScope,
+        ),
+    )
+    .unwrap();
+    assert!(read.as_slice()[..unit].iter().all(|b| *b == 7));
+    assert!(read.as_slice()[unit..].iter().all(|b| *b == 9));
+    drop(read);
+
+    // Length sum mismatch, unaligned body length, unaligned body pointer.
+    for (h, range) in [(unit, 0..total), (unit, 0..unit - 1), (unit, 1..unit + 1)] {
+        let op = slab.write_vectored(
+            &reactor,
+            extent,
+            header(h),
+            body(range),
+            lease_again(),
+            &TestScope,
+        );
+        assert!(matches!(
+            drive(&reactor, op),
+            Err(TestError::Alloc(Error::InvalidConfiguration))
+        ));
+    }
+    // Foreign extent outside the lease.
+    let foreign = page_alloc::Extent::new(32768, total).unwrap();
+    let op = slab.write_vectored(
+        &reactor,
+        foreign,
+        header(unit),
+        body(0..unit),
+        lease_again(),
+        &TestScope,
+    );
+    assert!(drive(&reactor, op).is_err());
+    assert_eq!(slab.writes_in_flight(), 0);
+
+    // Short and failed completions surface as errors and release the fence.
+    sim.inject("writev", Fault::Short(512)).unwrap();
+    let op = slab.write_vectored(
+        &reactor,
+        extent,
+        header(unit),
+        body(0..unit),
+        lease_again(),
+        &TestScope,
+    );
+    assert!(matches!(
+        drive(&reactor, op),
+        Err(TestError::Alloc(Error::Io))
+    ));
+    assert_eq!(slab.writes_in_flight(), 0);
+    sim.inject("writev", Fault::Errno(libc::EIO)).unwrap();
+    let op = slab.write_vectored(
+        &reactor,
+        extent,
+        header(unit),
+        body(0..unit),
+        lease_again(),
+        &TestScope,
+    );
+    assert!(matches!(
+        drive(&reactor, op),
+        Err(TestError::Runtime(racer_platform::Error::Os(libc::EIO)))
+    ));
+    assert_eq!(slab.writes_in_flight(), 0);
+    assert_eq!(reactor.in_flight(), 0);
+    assert_eq!(Rc::strong_count(&page), 1);
+
+    // A held completion keeps the fence pending until it lands.
+    sim.inject("writev", Fault::HoldCompletion(4)).unwrap();
+    let mut op = slab.write_vectored(
+        &reactor,
+        extent,
+        header(unit),
+        body(0..unit),
+        lease_again(),
+        &TestScope,
+    );
+    assert!(poll(&mut op).is_pending());
+    assert_eq!(slab.writes_in_flight(), 1);
+    drop(op);
+    assert_eq!(slab.writes_in_flight(), 1);
+    assert!(Rc::strong_count(&page) > 1);
+    let mut fence = slab.fence_writes();
+    assert!(poll(&mut fence).is_pending());
+    drive(&reactor, fence).unwrap();
+    assert_eq!(slab.writes_in_flight(), 0);
+    assert_eq!(Rc::strong_count(&page), 1);
+}
