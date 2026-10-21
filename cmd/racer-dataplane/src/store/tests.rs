@@ -35,6 +35,12 @@ use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
 
+/// End of the real (unpadded) v2 header, including its digest.
+fn real_header_end(bytes: &[u8]) -> usize {
+    16 + super::header_fields_len(&mut super::Decoder(&bytes[16..])).unwrap()
+        + super::HEADER_DIGEST_BYTES
+}
+
 mod index_pressure {
     use super::*;
     fn fixture(capacity: usize) -> Fixture {
@@ -1472,15 +1478,8 @@ fn second_sight_delayed_sealed_write_keeps_publication_authority() {
     );
     let delayed = f.copy(2, 113);
     let id = delayed.ciphertext.envelope().page.clone();
-    let length = f
-        .store
-        .writer
-        .slabs()
-        .alignment()
-        .unwrap()
-        .extent(0, logical_length(&delayed).unwrap())
-        .unwrap()
-        .length();
+    let length =
+        crate::store::record_length(&delayed, f.store.writer.slabs().alignment().unwrap()).unwrap();
     drop(
         f.segments
             .append(f.segments.segment_bytes() as usize - length)
@@ -1755,7 +1754,7 @@ fn record_round_trip_preserves_ciphertext_zeroes_padding_and_rejects_torn_header
     for length in [3, crate::model::PAGE_BYTES as usize] {
         let page = f.copy(9, length);
         let disk = a
-            .extent(0, crate::store::logical_length(&page).unwrap())
+            .extent(0, crate::store::record_length(&page, a).unwrap())
             .unwrap();
         let reserve = f
             .admission
@@ -1944,12 +1943,7 @@ fn allocator_integration_reclaims_idle_charge_before_writer_admission_retry() {
     let page = f.copy(1, 64);
     let cache = &page.metadata.version.object.cache;
     let slab = f.store.writer.slabs();
-    let length = slab
-        .alignment()
-        .unwrap()
-        .extent(0, crate::store::logical_length(&page).unwrap())
-        .unwrap()
-        .length();
+    let length = crate::store::record_length(&page, slab.alignment().unwrap()).unwrap();
     let charge = f
         .admission
         .reserve(Some(cache), ResourceClass::Ciphertext, length)
@@ -2377,7 +2371,7 @@ fn other_format_version_and_unknown_cipher_records_are_cache_misses() {
         )
         .unwrap();
         let bytes = stored.bytes_mut().unwrap();
-        let header_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let header_len = real_header_end(bytes);
         let cipher_offset = header_len - 36;
         if other_version {
             // A well-formed record from another format version.
@@ -3269,18 +3263,19 @@ mod records {
             .collect()
     }
 
-    // Little-endian record header for `page(3, 0, "cache", "v1")` at
-    // generation 7, including the header digest and ciphertext. Bytes past the
-    // logical record are zero padding.
-    const GOLDEN_LOGICAL: &str = concat!(
-        "524352504147453101000000b900000007000000000000000300000000000000",
+    // Little-endian v2 record header for `page(3, 0, "cache", "v1")` at
+    // generation 7, including the header digest. The header is zero padded to
+    // 512 bytes, the ciphertext follows at offset 512, and bytes past the
+    // ciphertext are zero padding.
+    const GOLDEN_HEADER: &str = concat!(
+        "5243525041474531020000000002000007000000000000000300000000000000",
         "0000000000000000030000001300000001010101010101010101010101010101",
         "0202020202020202020202020202020202020202020202020303030303030303",
         "0303030303030303030303030303030303030303030303030500000004000000",
-        "6361636865227631227853ecbd5e15ca0c0000000001000000c49c9e3d747d13",
-        "105b9fa5b7cf40f7b7d36e745029bbc001738e28cfbaa6edaa02020202020202",
-        "020202020202020202020202",
+        "6361636865227631227853ecbd5e15ca0c0000000001000000f2ba12dc70a195",
+        "6526e93ce78625d77fac702d18ab8439512812f098a7e14afa",
     );
+    const GOLDEN_CIPHERTEXT: &str = "02020202020202020202020202020202020202";
 
     #[test]
     fn current_wire_bytes_and_reused_padding_across_page_and_alignment_boundaries() {
@@ -3322,7 +3317,12 @@ mod records {
                 logical,
                 128 + 16 + cache.len() + etag.len() + 2 + 32 + length + 16
             );
-            let extent = alignment.extent(offset, logical).unwrap();
+            let record = record_length(&page, alignment).unwrap();
+            let extent = alignment.extent(offset, record).unwrap();
+            assert_eq!(extent.length(), record);
+            let block = header_block_len(&page, alignment).unwrap();
+            assert_eq!(block % alignment.length(), 0);
+            assert_eq!(block + body_len(&page, alignment).unwrap(), record);
             let mut staging = buffer(&admission, alignment, extent.length());
             staging.bytes_mut().unwrap().fill(0xa5);
             let mut encoded =
@@ -3351,9 +3351,9 @@ mod records {
                 page.metadata.length -= 1;
             }
             inner.bytes.fill(0x6b);
-            let shortened_logical = logical - usize::from(length > 1);
             // At a rounding boundary, use a same-length replacement instead.
-            if alignment.extent(offset, shortened_logical).unwrap() != extent {
+            if record_length(&page, alignment).unwrap() != record {
+                let inner = Arc::get_mut(&mut page.ciphertext.inner).unwrap();
                 inner.bytes.push(0x6b);
                 inner.envelope.plaintext_length += 1;
                 inner.envelope.ciphertext_length += 1;
@@ -3476,7 +3476,7 @@ mod records {
                 &page,
                 Generation(7),
                 alignment,
-                buffer(&admission, alignment, 512),
+                buffer(&admission, alignment, 1024),
             )
             .unwrap();
             assert_eq!(
@@ -3498,7 +3498,7 @@ mod records {
                     Generation(0),
                     alignment,
                     1,
-                    buffer(&admission, alignment, 512)
+                    buffer(&admission, alignment, 1024)
                 )
                 .err(),
                 Some(Error::CorruptRecord)
@@ -3513,9 +3513,9 @@ mod records {
         let baseline = admission.used(ResourceClass::Ciphertext);
         let normal = Alignment::new(512, 512, 512).unwrap();
         for (alignment, offset, length, expected) in [
-            (normal, 1, 512, Error::InvalidConfiguration),
-            (normal, 0, 1024, Error::InvalidConfiguration),
-            (normal, u64::MAX - 511, 512, Error::CorruptRecord),
+            (normal, 1, 1024, Error::InvalidConfiguration),
+            (normal, 0, 1536, Error::InvalidConfiguration),
+            (normal, u64::MAX - 1023, 1024, Error::CorruptRecord),
             (
                 Alignment::new(512, 512, usize::MAX).unwrap(),
                 0,
@@ -3633,14 +3633,17 @@ mod records {
             &page,
             Generation(7),
             alignment,
-            buffer(&admission, alignment, 512),
+            buffer(&admission, alignment, 1024),
         )
         .unwrap();
         let bytes = encoded.buffer.bytes().unwrap();
-        let logical = logical_length(&page).unwrap();
-        assert_eq!(bytes[..logical], unhex(GOLDEN_LOGICAL));
-        assert!(bytes[logical..].iter().all(|&b| b == 0));
-        let parsed = parse_bytes(bytes, Extent::new(0, 512).unwrap()).unwrap();
+        let header = unhex(GOLDEN_HEADER);
+        let ciphertext = unhex(GOLDEN_CIPHERTEXT);
+        assert_eq!(bytes[..header.len()], header);
+        assert!(bytes[header.len()..512].iter().all(|&b| b == 0));
+        assert_eq!(bytes[512..512 + ciphertext.len()], ciphertext);
+        assert!(bytes[512 + ciphertext.len()..].iter().all(|&b| b == 0));
+        let parsed = parse_bytes(bytes, Extent::new(0, 1024).unwrap()).unwrap();
         assert_eq!(parsed.header.format_version, FORMAT_VERSION);
         assert_eq!(parsed.checksum, page.ciphertext.checksum());
     }
@@ -3655,7 +3658,7 @@ mod records {
             &page,
             Generation(7),
             alignment,
-            buffer(&admission, alignment, 512),
+            buffer(&admission, alignment, 1024),
         )
         .unwrap();
         let parsed = parse(&encoded.buffer, encoded.header.extent).unwrap();
@@ -3669,7 +3672,7 @@ mod records {
             .position(|w| w == b"text/plain")
             .unwrap();
         corrupted[start] = b'\r';
-        let end = u32::from_le_bytes(corrupted[12..16].try_into().unwrap()) as usize;
+        let end = real_header_end(&corrupted);
         let digest = Sha256::digest(&corrupted[..end - 32]);
         corrupted[end - 32..end].copy_from_slice(&digest);
         assert!(parse_bytes(&corrupted, encoded.header.extent).is_err());
@@ -3684,12 +3687,12 @@ mod records {
             &page,
             Generation(7),
             alignment,
-            buffer(&admission, alignment, 512),
+            buffer(&admission, alignment, 1024),
         )
         .unwrap();
         let original = encoded.buffer.bytes().unwrap();
         assert_eq!(&original[8..12], &FORMAT_VERSION.to_le_bytes());
-        let header_len = u32::from_le_bytes(original[12..16].try_into().unwrap()) as usize;
+        let header_len = real_header_end(original);
         let crc_offset = 128 + "cache".len() + "\"v1\"".len();
         assert_eq!(
             &original[crc_offset..crc_offset + 8],
@@ -3715,9 +3718,8 @@ mod records {
         // the framing hash and lengths have been recomputed by the producer.
         let mut missing_crc = original.to_vec();
         missing_crc.drain(crc_offset..crc_offset + 8);
-        missing_crc.resize(original.len(), 0);
+        missing_crc.splice(header_len - 8..header_len - 8, [0; 8]);
         let shorter_header = header_len - 8;
-        missing_crc[12..16].copy_from_slice(&(shorter_header as u32).to_le_bytes());
         let digest = Sha256::digest(&missing_crc[..shorter_header - 32]);
         missing_crc[shorter_header - 32..shorter_header].copy_from_slice(&digest);
         assert!(matches!(
@@ -3731,6 +3733,149 @@ mod records {
             parse_bytes(&damaged_crc, encoded.header.extent),
             Err(Error::CorruptRecord)
         ));
+    }
+
+    /// Encode `page(3, 0, "cache", etag)` at 512-byte alignment.
+    fn encoded_v2(
+        admission: &flow_control::Quotas<AdmissionPolicy>,
+        etag: &str,
+    ) -> (Vec<u8>, Extent) {
+        let page = page(admission, 3, 0, "cache", etag);
+        let alignment = Alignment::new(512, 512, 512).unwrap();
+        let length = record_length(&page, alignment).unwrap();
+        let encoded = encode(
+            &page,
+            Generation(7),
+            alignment,
+            buffer(admission, alignment, length),
+        )
+        .unwrap();
+        (
+            encoded.buffer.bytes().unwrap().to_vec(),
+            encoded.header.extent,
+        )
+    }
+
+    #[test]
+    fn v2_ciphertext_starts_at_aligned_header_block_across_boundaries() {
+        let admission = admission();
+        // The real header is 183 bytes plus the ETag length for "cache" IDs.
+        for unit in [512, 4096] {
+            let alignment = Alignment::new(unit, unit as u64, unit).unwrap();
+            for real in [512 - 1, 512, 512 + 1, 4096 - 1, 4096, 4096 + 1] {
+                let etag = "x".repeat(real - 183);
+                for content_type in [None, Some("text/plain")] {
+                    let mut page = page(&admission, 3, 0, "cache", &etag);
+                    page.metadata.content_type = content_type
+                        .map(|v| crate::model::ContentType::parse(v.as_bytes()).unwrap());
+                    let extra = content_type.map_or(0, str::len);
+                    let block = header_block_len(&page, alignment).unwrap();
+                    assert_eq!(block, (real + extra).next_multiple_of(unit));
+                    assert_eq!(body_len(&page, alignment).unwrap(), unit);
+                    let record = record_length(&page, alignment).unwrap();
+                    assert_eq!(record, block + unit);
+                    let mut staging = buffer(&admission, alignment, record);
+                    staging.bytes_mut().unwrap().fill(0xa5);
+                    let encoded =
+                        encode_at(&page, Generation(3), alignment, unit as u64, staging).unwrap();
+                    let bytes = encoded.buffer.bytes().unwrap();
+                    assert_eq!(real_header_end(bytes), real + extra);
+                    assert_eq!(
+                        u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize,
+                        block
+                    );
+                    assert!(bytes[real + extra..block].iter().all(|&b| b == 0));
+                    let parsed = parse(&encoded.buffer, encoded.header.extent).unwrap();
+                    assert_eq!(parsed.ciphertext, block..block + 19);
+                    assert_eq!(&bytes[parsed.ciphertext.clone()], page.ciphertext.bytes());
+                    assert!(bytes[block + 19..].iter().all(|&b| b == 0));
+                    assert_eq!(parsed.header.metadata, page.metadata.immutable());
+
+                    let mut header = vec![0xa5; block];
+                    write_header(&page, Generation(3), alignment, &mut header).unwrap();
+                    assert_eq!(header, bytes[..block]);
+                    let mut short = vec![0; block - 1];
+                    assert_eq!(
+                        write_header(&page, Generation(3), alignment, &mut short),
+                        Err(Error::InvalidConfiguration)
+                    );
+                }
+            }
+        }
+        admission.reclaim_buffers();
+    }
+
+    #[test]
+    fn v2_rejects_nonzero_padding_and_bad_header_lengths() {
+        let admission = admission();
+        let (original, extent) = encoded_v2(&admission, "v1");
+        let real = real_header_end(&original);
+        assert!(parse_bytes(&original, extent).is_ok());
+
+        for at in [real, 300, 511] {
+            let mut bytes = original.clone();
+            bytes[at] = 1;
+            assert_eq!(
+                parse_bytes(&bytes, extent).err(),
+                Some(Error::CorruptRecord),
+                "padding byte {at}"
+            );
+        }
+        // Misaligned, shorter than the real header, too large, and past the record.
+        for header_len in [513u32, 768, 256, real as u32, 0, 1024, 1536] {
+            let mut bytes = original.clone();
+            bytes[12..16].copy_from_slice(&header_len.to_le_bytes());
+            let digest = Sha256::digest(&bytes[..real - 32]);
+            bytes[real - 32..real].copy_from_slice(&digest);
+            assert_eq!(
+                parse_bytes(&bytes, extent).err(),
+                Some(Error::CorruptRecord),
+                "header_len {header_len}"
+            );
+        }
+        // A header block that leaves no room for the ciphertext.
+        let mut bytes = original.clone();
+        bytes[12..16].copy_from_slice(&1024u32.to_le_bytes());
+        let digest = Sha256::digest(&bytes[..real - 32]);
+        bytes[real - 32..real].copy_from_slice(&digest);
+        bytes.resize(1536, 0);
+        let moved: Vec<u8> = bytes[512..531].to_vec();
+        bytes[1024..1043].copy_from_slice(&moved);
+        bytes[512..531].fill(0);
+        assert!(parse_bytes(&bytes, Extent::new(0, 1536).unwrap()).is_ok());
+        assert_eq!(
+            parse_bytes(&bytes[..1024], Extent::new(0, 1024).unwrap()).err(),
+            Some(Error::CorruptRecord)
+        );
+        admission.reclaim_buffers();
+    }
+
+    #[test]
+    fn v1_layout_record_is_rejected() {
+        let admission = admission();
+        let (original, extent) = encoded_v2(&admission, "v1");
+        let real = real_header_end(&original);
+        // Rebuild the v1 layout: unpadded header, ciphertext right after it.
+        let mut bytes = vec![0; extent.length()];
+        bytes[..real].copy_from_slice(&original[..real]);
+        bytes[real..real + 19].copy_from_slice(&original[512..531]);
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&(real as u32).to_le_bytes());
+        let digest = Sha256::digest(&bytes[..real - 32]);
+        bytes[real - 32..real].copy_from_slice(&digest);
+        assert_eq!(
+            parse_bytes(&bytes, extent).err(),
+            Some(Error::CorruptRecord)
+        );
+        // Even claiming the current version, the unpadded header is rejected.
+        bytes[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        let digest = Sha256::digest(&bytes[..real - 32]);
+        bytes[real - 32..real].copy_from_slice(&digest);
+        assert_eq!(
+            parse_bytes(&bytes, extent).err(),
+            Some(Error::CorruptRecord)
+        );
+        admission.reclaim_buffers();
     }
 
     #[test]

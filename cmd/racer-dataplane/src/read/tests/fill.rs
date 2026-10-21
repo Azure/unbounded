@@ -156,13 +156,8 @@ fn owned_writeback_staging_reclaims_only_idle_memory_after_hard_quota_rejection(
             ResourceClass::DirtyCiphertext
         };
         let amount = if ciphertext {
-            deps.writer
-                .slabs()
-                .alignment()
+            crate::store::record_length(&incoming.copy(), deps.writer.slabs().alignment().unwrap())
                 .unwrap()
-                .extent(0, crate::store::logical_length(&incoming.copy()).unwrap())
-                .unwrap()
-                .length()
         } else {
             19
         };
@@ -318,14 +313,9 @@ fn optional_persistence_idle_memory_reclaim_is_bounded_and_stops_at_deficit() {
         ids.push(page.plaintext.page().clone());
         deps.memory.publish(page).unwrap();
     }
-    let staging = deps
-        .writer
-        .slabs()
-        .alignment()
-        .unwrap()
-        .extent(0, crate::store::logical_length(&incoming.copy()).unwrap())
-        .unwrap()
-        .length();
+    let staging =
+        crate::store::record_length(&incoming.copy(), deps.writer.slabs().alignment().unwrap())
+            .unwrap();
     let ceiling = admission.limit(ResourceClass::Ciphertext) / 2;
     let deficit = 256 * 19 + 1;
     let held = admission
@@ -439,13 +429,8 @@ fn optional_persistence_reclaims_completed_idle_slab_before_pressure_rejection()
         let page = crate::memory::tests::bundle_for(&f.fill.dependencies.admission, metadata);
         writer.retention().set_ownership(Rc::new(move |_| owned));
         let admission = &f.fill.dependencies.admission;
-        let staging = writer
-            .slabs()
-            .alignment()
-            .unwrap()
-            .extent(0, crate::store::logical_length(&page.copy()).unwrap())
-            .unwrap()
-            .length();
+        let staging =
+            crate::store::record_length(&page.copy(), writer.slabs().alignment().unwrap()).unwrap();
         let ceiling = if owned {
             admission.limit(ResourceClass::Ciphertext)
         } else {
