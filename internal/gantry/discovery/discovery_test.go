@@ -261,3 +261,66 @@ func ones(n int) string {
 
 	return string(b)
 }
+
+func TestHostStreamProvidersClosesWhenLookupBudgetEnds(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	host, err := New(ctx, Options{
+		ListenAddrs:    []string{"/ip4/127.0.0.1/tcp/0"},
+		ProtocolPrefix: "/gantry-stream-providers-test",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = host.Close() })
+
+	d := digest.MustParse("sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
+	providers, lookupErr := host.StreamProviders(ctx, d, 200*time.Millisecond)
+
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+
+	for {
+		select {
+		case provider, ok := <-providers:
+			if !ok {
+				if err := lookupErr(); err != nil {
+					t.Fatalf("lookup error = %v, want nil", err)
+				}
+
+				return
+			}
+
+			t.Fatalf("provider = %+v, want none from an isolated host", provider)
+		case <-deadline.C:
+			t.Fatal("provider stream did not close after its lookup budget")
+		}
+	}
+}
+
+func TestHostStreamProvidersReportsInvalidDigest(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	host, err := New(ctx, Options{
+		ListenAddrs:    []string{"/ip4/127.0.0.1/tcp/0"},
+		ProtocolPrefix: "/gantry-stream-providers-invalid-test",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = host.Close() })
+
+	providers, lookupErr := host.StreamProviders(ctx, digest.Digest{}, time.Second)
+
+	for provider := range providers {
+		t.Fatalf("provider = %+v, want none for an invalid digest", provider)
+	}
+
+	if lookupErr() == nil {
+		t.Fatal("lookup error = nil, want unsupported digest error")
+	}
+}

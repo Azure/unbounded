@@ -10,22 +10,24 @@ repository and the exact `go-libp2p-kad-dht v0.42.2` source selected by
 below are relative to that module.
 
 The `6h` validity, `3h` reprovide interval, `10m` maximum reprovide delay,
-in-memory sweeping provider, and bounded provider HEAD validation are
-implemented. Lookup expansion, explicit chair completion, cold-start deadlines,
-and unconditional eventual fallback remain proposed behavior. The timing
-values have not been validated by cluster measurements.
+in-memory sweeping provider, bounded provider HEAD validation, and the
+uncapped warm-path provider walk are implemented. Explicit chair completion,
+cold-start deadlines, and unconditional eventual fallback remain proposed
+behavior. The timing values have not been validated by cluster measurements.
 
 ## Implementation Status
 
 Implemented in the current change:
 
 - Section 1: configured provider validity and in-memory sweeping reprovide.
-- Section 3: request-scoped failed-provider exclusion during chair polling.
+- Section 2: an uncapped streaming provider walk on the warm path, with an
+   immediate origin failover when every advertised provider is unusable.
+- Section 3: request-scoped failed-provider exclusion during chair polling,
+   and one attempt per provider within a warm-path walk.
 - Section 5: bounded HEAD validation for chair polling and final
    direct-origin-fallback recheck.
 
-Sections 2, 4, 6, and 7 remain design proposals. Section 3 is not yet applied
-to ordinary warm-path GET retries.
+Sections 4, 6, and 7 remain design proposals.
 
 ## Summary
 
@@ -55,14 +57,19 @@ provider can serve the digest.
 
 ### Provider lookup is bounded and unordered
 
-Gantry calls the synchronous `FindProviders` API
-(`internal/gantry/discovery/discovery.go:459`). In
-`go-libp2p-kad-dht v0.42.2`, that API passes the DHT bucket size to
-`FindProvidersAsync` (`routing.go:492-500`). The default bucket size is 20
-(`amino/defaults.go:23-27`), so the first 20 unique providers collected satisfy
-the lookup. Provider sets are shuffled before the count is applied, but they
-are not ordered by publication time (`routing.go:536-626`,
+The synchronous `FindProviders` API in `go-libp2p-kad-dht v0.42.2` passes the
+DHT bucket size to `FindProvidersAsync` (`routing.go:492-500`). The default
+bucket size is 20 (`amino/defaults.go:23-27`), so the first 20 unique providers
+collected satisfy the lookup. When the local provider store already holds 20,
+the lookup returns them without querying the network (`routing.go:578`).
+Provider sets are shuffled before the count is applied, but they are not
+ordered by publication time (`routing.go:536-626`,
 `records/providers_manager.go:317-354`).
+
+Gantry's warm path no longer uses that API; it walks an uncapped stream
+(Section 2). Chair polling, the busy-path metadata HEAD, and the
+direct-origin-fallback recheck still call `FindProviders`, and Section 5's HEAD
+validation is what keeps their capped results from reporting false success.
 
 The provider response identifies peer IDs, addresses, and a connection hint.
 It does not expose a provider timestamp, sequence, or signed expiry that Gantry
@@ -71,9 +78,8 @@ and new provider identities coexist for the same digest because the storage
 key includes both the digest and provider peer ID
 (`records/providers_manager.go:277-284`).
 
-Gantry shuffles the returned candidates again before fetching, which
-distributes attempts within that result set but cannot introduce provider 21
-or later (`internal/gantry/mirror/mirror.go:2382`).
+Shuffling a capped result distributes attempts within that set but cannot
+introduce provider 21 or later.
 
 ### Provider records outlive departed nodes
 
@@ -185,9 +191,9 @@ The implementation must preserve these invariants:
    usable provider, not merely a provider record.
 7. Chair completion must not force every requester to fetch from one chair.
    Chairs are bounded initial seeds, not the permanent data plane.
-8. Warm discovery must expand past failed provider sets up to a configured
-   cluster-size ceiling before declaring a cold miss, subject to one hard warm
-   lookup deadline.
+8. Warm discovery must walk past failed providers instead of stopping at a
+   fixed result count. When providers are advertised but none can serve, the
+   request fails over to origin rather than declaring a cold miss.
 9. Cold-start has one hard end-to-end deadline. DHT results, chair retries,
    backup cohorts, and fallback gates must not extend it indefinitely.
 10. When that deadline expires without a usable provider, the request must
@@ -260,73 +266,54 @@ DHT peers during rollout. Mixed-version peers can also retain the old validity.
 The recovery state machine must remain correct when every returned candidate
 is stale.
 
-### 2. Expand warm discovery until usable or bounded exhaustion
+### 2. Walk every advertised provider before deciding
 
-Replace the synchronous 20-provider lookup with `FindProvidersAsync` and an
-explicit target count. The first round requests 20 candidates. If every new
-candidate fails, double the target and query again:
+Implemented. The warm path streams `FindProvidersAsync` with a count of zero
+(`StreamProviders` in `internal/gantry/discovery/discovery.go`). A zero count
+removes kad-dht's early stop, including the shortcut that answers from the
+local provider store once it holds a full batch, so a requester that stores
+only stale records for a digest still queries the closest peers. The existing
+2-second peer lookup budget bounds the DHT query; providers it finds stay
+queued, so slow fetch attempts do not truncate it.
+
+The mirror (`walkProviders` in `internal/gantry/mirror/mirror.go`) tries each
+provider the stream yields once, skipping this node and providers already in
+the stale, suspicious, or unavailable windows, and stops at the first that
+serves. The walk commits no response headers; a provider that answers commits
+them as it streams. When the walk ends without a serve, round 0 decides:
 
 ```text
-20, 40, 80, 160, ... min(next target, cluster-size ceiling)
+nothing advertised (no provider other than this node)
+    -> commit headers, then cold-start
+a provider answered busy (429) or accepted without sending bytes
+    -> commit headers, wait for a serve slot
+providers advertised, none usable
+    -> 503 without headers; fail-open containerd pulls from origin
 ```
 
-Each target is a cumulative result count for that lookup because libp2p
-provider lookup has no exclusion list or pagination cursor. A request-scoped
-set removes providers returned and tried in earlier rounds. Therefore a
-40-result round may contain the same failed 20, but only its previously unseen
-candidates are eligible for probing.
+The walk has no attempt cap: `WithPeerBudgets` treats `maxAttempts <= 0`,
+the production setting, as unlimited. Its wall-clock bound is the client.
+containerd waits 30 seconds for response headers (`ResponseHeaderTimeout` in
+its default registry transport) before moving to the next host, which is
+origin under the shipped `hosts.toml`.
 
-```text
-target = 20
-attempted = {}
+The doubling sequence considered earlier (`20, 40, 80, ...`) is unnecessary.
+A count of zero already yields every provider the closest peers report, and
+each peer's response is still limited by libp2p's message size
+(`handlers.go:195-233`). The walk still cannot prove that every provider record
+in the network was examined, which is why a stale-only result fails over
+rather than retrying.
 
-while warm lookup deadline has not expired:
-   candidates = FindProvidersAsync(digest, target)
-   candidates = candidates - self - suppressed - attempted
-   probe candidates with bounded concurrency
+A stale-only result deliberately skips cold-start. Cold-start deduplicates the
+first origin pull of a digest that nobody holds; a stale record does not
+establish that, and waiting on it held each request for the full
+re-discovery budget. A node that pulls from origin after the 503 announces the
+digest once containerd commits it, so later requesters find a usable provider.
 
-   if one candidate can serve the digest:
-      fetch from that provider
-      stop
-
-   attempted += candidates
-
-   if target == cluster-size ceiling:
-      break
-
-   target = min(target * 2, cluster-size ceiling)
-
-enter cold-start
-```
-
-Gantry does not maintain exact cluster membership. The ceiling must therefore
-come from an explicit configured cluster-size estimate. The current
-`chair_cluster_size_estimate` defaults to 100,000
-(`internal/gantry/config/config.go:484`), but the implementation should expose
-a lookup-specific name rather than silently coupling two policies.
-
-The requested count is an output ceiling, not a request to enumerate every
-provider or every cluster node. Each remote `GET_PROVIDERS` response stops when
-the next provider would exceed libp2p's message-size limit
-(`handlers.go:195-233`), and the protocol provides no pagination cursor.
-Kademlia lookup also terminates after its normal closest-peer convergence.
-Consequently, even a target equal to the cluster-size estimate cannot prove
-that every provider record was examined.
-
-The warm lookup also needs one wall-clock deadline. The cardinality ceiling
-alone is not a time bound: probing a large stale provider population could take
-longer than the caller can wait. The deadline is authoritative. If it expires
-before the target reaches the cluster-size ceiling, the request enters
-cold-start rather than continuing an unbounded warm search.
-
-Candidate probes need bounded concurrency so sequential dial time does not
-scale linearly with the number of stale records. The concurrency and lookup
-deadline must be measured and configurable. The existing expensive peer-body
-transfer limit remains separate from the cheaper availability-probe limit.
-
-Expansion improves the chance of discovering replacement providers hidden
-behind old records. It does not turn DHT lookup into a freshness guarantee, so
-bounded cold-start and origin fallback remain required.
+Attempts run one at a time. A not-found answer takes milliseconds; a dial to an
+unreachable address is capped by the 2-second transfer dial timeout and that
+address is then skipped for 30 seconds. Bounded concurrency remains an option
+if measurements show dial time dominating.
 
 ### 3. Carry failed candidates through the request
 
@@ -342,8 +329,8 @@ same chair identity and address to transition from unavailable to available
 without causing unrelated stale providers to be retried.
 
 Ordinary mirror GET failures continue to use the existing process-local stale,
-unavailable, and suspicious-provider caches. Applying one request-scoped set to
-the complete warm lookup and exponential expansion remains future work.
+unavailable, and suspicious-provider caches across requests. Within one
+warm-path walk, each provider is attempted at most once.
 
 ### 4. Make chair completion explicit
 
@@ -479,8 +466,8 @@ recheck.
 
 It improves the chance of finding a new provider but cannot guarantee one. A
 large replacement can leave more stale providers than any practical fixed
-candidate limit. Exponential expansion therefore ends at both a cluster-size
-ceiling and a wall-clock deadline, then moves to cold-start.
+candidate limit. The walk therefore ends by failing over to origin when no
+advertised provider is usable.
 
 ### Requester-local suppression alone
 
@@ -519,8 +506,8 @@ than dependency defaults.
 At minimum, add or retain measurements for:
 
 - DHT candidates returned, filtered, probed, and usable per lookup.
-- Warm lookup target and round count, including whether the target doubled or
-   reached the cluster-size ceiling.
+- Providers walked per request and whether the walk ended served, busy, or
+   with no usable provider.
 - Lookups where every returned provider was request-scoped stale or
   unavailable.
 - Unique provider identities observed across rediscovery rounds.
@@ -538,13 +525,13 @@ At minimum, add or retain measurements for:
 
 Unit and integration coverage must include:
 
-1. A warm lookup expands through `20, 40, 80, ...` and never probes the same
-   provider twice in one request.
-2. A usable provider outside the first 20 is found before cold-start.
-3. Reaching the configured cluster-size ceiling without a usable provider
-   enters cold-start.
-4. Expiring the warm lookup deadline before reaching the cardinality ceiling
-   enters cold-start.
+1. A warm walk never attempts the same provider twice in one request and
+   reaches a usable provider beyond the first 20.
+2. Advertised providers that are all unusable return 503 without committing
+   headers or starting cold-start.
+3. A busy provider among stale records commits headers and waits for a serve
+   slot.
+4. A lookup with no advertised provider commits headers before cold-start.
 5. Twenty stale providers do not make chair polling report success.
 6. Twenty stale providers do not make direct-origin-fallback recheck decline.
 7. A chair reporting `pulling` extends the wait without starting duplicate
@@ -553,8 +540,8 @@ Unit and integration coverage must include:
    provider record to appear in the first DHT result.
 9. A chair reporting neither pulling nor available allows
    `ErrColdStartExhausted` and the direct-origin-fallback gates to run.
-10. DHT errors, stale-only responses, chair RPC failures, chair turnover, and
-    exhausted backup cohorts all reach the same hard cold-start deadline.
+10. DHT errors, chair RPC failures, chair turnover, and exhausted backup
+    cohorts all reach the same hard cold-start deadline.
 11. Once the hard deadline expires, bootstrap, DHT health, stale records, and
     token exhaustion cannot return the request to indefinite discovery.
 12. A mandatory origin attempt starts before the bounded escape window ends
@@ -582,18 +569,16 @@ Unit and integration coverage must include:
 
 ## Open Questions
 
-1. What warm lookup deadline and probe concurrency give acceptable lookup cost
-   before cold-start?
-2. Should the warm lookup ceiling have a dedicated configuration value or reuse
-   the chair cluster-size estimate?
-3. Can a six-hour validity and three-hour reprovide interval sustain the
+1. Does sequential probing keep the warm walk well inside containerd's
+   header timeout, or does it need bounded concurrency?
+2. Can a six-hour validity and three-hour reprovide interval sustain the
    measured digest inventory and cluster size?
-4. What maximum random startup phase prevents synchronized restart bursts while
+3. What maximum random startup phase prevents synchronized restart bursts while
    keeping the worst-case refresh gap below provider validity?
-5. Should chair availability be represented by a new `please_pull` outcome or
+4. Should chair availability be represented by a new `please_pull` outcome or
    a separate status RPC?
-6. Must mixed-version agents share one DHT throughout rollout?
-7. What bounded escape window limits synchronized origin load while still
+5. Must mixed-version agents share one DHT throughout rollout?
+6. What bounded escape window limits synchronized origin load while still
    guaranteeing an origin attempt after cold-start expiry?
-8. What bounded policy should distribute requesters among available chair
+7. What bounded policy should distribute requesters among available chair
    seeds without increasing chair coordination fan-in?

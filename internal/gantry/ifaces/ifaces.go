@@ -355,6 +355,20 @@ type DHT interface {
 	Health() float64
 }
 
+// ProviderStreamer is implemented by DHTs that can yield every provider a
+// lookup finds instead of a fixed-size batch. FindProviders stops after a
+// small count, so stale records can fill the batch and hide usable providers;
+// the mirror walks a stream instead so it can skip past them.
+type ProviderStreamer interface {
+	// StreamProviders starts an uncapped provider lookup for d. The DHT query
+	// runs until it completes, lookupBudget elapses, or ctx ends. Providers it
+	// finds stay queued until read, so a slow reader neither stalls nor
+	// truncates the query. The channel closes once the query has ended and
+	// every queued provider was delivered, or as soon as ctx ends. The returned
+	// function reports a lookup failure and is valid after the channel closes.
+	StreamProviders(ctx context.Context, d digest.Digest, lookupBudget time.Duration) (<-chan Provider, func() error)
+}
+
 // ---------------------------------------------------------------------------
 // Coordinator: libp2p coordination RPC client (caller side).
 // Implemented by internal/coord .

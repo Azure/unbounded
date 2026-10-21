@@ -553,20 +553,101 @@ func (h *Host) FindProviders(ctx context.Context, d digest.Digest) ([]ifaces.Pro
 
 	out := make([]ifaces.Provider, 0, len(ais))
 	for _, ai := range ais {
-		addr := transferAddrWithPort(ai, h.transferPort)
-		if addr == "" {
-			continue
+		if provider, ok := h.transferProvider(ai); ok {
+			out = append(out, provider)
 		}
-		// Cache the addr info in the peerstore so subsequent dials don't
-		// require another DHT round-trip.
-		h.h.Peerstore().AddAddrs(ai.ID, ai.Addrs, peerstore.AddressTTL)
-		out = append(out, ifaces.Provider{
-			NodeID: ifaces.NodeID(ai.ID.String()),
-			Addr:   addr,
-		})
 	}
 
 	return out, nil
+}
+
+// StreamProviders implements ifaces.ProviderStreamer.
+func (h *Host) StreamProviders(ctx context.Context, d digest.Digest, lookupBudget time.Duration) (<-chan ifaces.Provider, func() error) {
+	out := make(chan ifaces.Provider)
+
+	c, err := DigestToCID(d)
+	if err != nil {
+		close(out)
+
+		return out, func() error { return err }
+	}
+
+	var (
+		lookupCtx    context.Context
+		cancelLookup context.CancelFunc
+	)
+
+	if lookupBudget > 0 {
+		lookupCtx, cancelLookup = context.WithTimeout(ctx, lookupBudget)
+	} else {
+		lookupCtx, cancelLookup = context.WithCancel(ctx)
+	}
+
+	// A count of zero disables kad-dht's early stop, including the shortcut
+	// that answers from this node's own provider store once it holds a full
+	// batch. Without that, a node storing only stale records for d never asks
+	// the rest of the network.
+	found := h.d.FindProvidersAsync(lookupCtx, c, 0)
+	start := time.Now()
+
+	go func() {
+		defer close(out)
+		defer cancelLookup()
+
+		var queue []ifaces.Provider
+
+		for found != nil || len(queue) > 0 {
+			var (
+				send chan<- ifaces.Provider
+				next ifaces.Provider
+			)
+
+			if len(queue) > 0 {
+				send = out
+				next = queue[0]
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case ai, ok := <-found:
+				if !ok {
+					found = nil
+
+					if h.monitor != nil {
+						h.monitor.ObserveLatency(time.Since(start))
+					}
+
+					continue
+				}
+
+				if provider, ok := h.transferProvider(ai); ok {
+					queue = append(queue, provider)
+				}
+			case send <- next:
+				queue = queue[1:]
+			}
+		}
+	}()
+
+	return out, func() error { return nil }
+}
+
+// transferProvider converts a DHT provider record into the transfer endpoint
+// the mirror dials. It reports false when the record has no usable IP.
+func (h *Host) transferProvider(ai peer.AddrInfo) (ifaces.Provider, bool) {
+	addr := transferAddrWithPort(ai, h.transferPort)
+	if addr == "" {
+		return ifaces.Provider{}, false
+	}
+	// Cache the addr info in the peerstore so subsequent dials don't
+	// require another DHT round-trip.
+	h.h.Peerstore().AddAddrs(ai.ID, ai.Addrs, peerstore.AddressTTL)
+
+	return ifaces.Provider{
+		NodeID: ifaces.NodeID(ai.ID.String()),
+		Addr:   addr,
+	}, true
 }
 
 // Health returns the geometric-mean health score (routing-table
