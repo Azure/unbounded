@@ -1271,6 +1271,31 @@ impl Fixture {
                 .unwrap(),
         }
     }
+    /// Like [`Self::copy`], but with the ciphertext sealed into this worker's
+    /// aligned pool, as AEAD output and TCP receives are.
+    fn aligned_copy(&self, number: u8, length: usize) -> CiphertextCopy {
+        let owned = self.copy(number, length);
+        let envelope = owned.ciphertext.envelope().clone();
+        let cache = &owned.metadata.version.object.cache;
+        let capacity = self.pool.aligned_capacity(length + 16).unwrap();
+        let reservation = self
+            .admission
+            .reserve(Some(cache), ResourceClass::Ciphertext, capacity)
+            .unwrap();
+        let mut buffer = self
+            .pool
+            .aligned_ciphertext(reservation, length + 16)
+            .unwrap();
+        buffer.as_mut_slice().fill(number);
+        let ciphertext = self
+            .pool
+            .aligned_ciphertext_page(buffer, envelope, None)
+            .unwrap();
+        CiphertextCopy {
+            metadata: owned.metadata,
+            ciphertext,
+        }
+    }
     fn enqueue(&self, copy: CiphertextCopy) -> Result<u64> {
         let dirty = self.admission.reserve(
             Some(&copy.metadata.version.object.cache),
@@ -4887,5 +4912,128 @@ mod checkpoint {
                 .unwrap()
                 .is_some()
         );
+    }
+}
+
+/// Ciphertext quota charged by enqueueing `page`, which is the staging reservation.
+fn enqueue_staging(f: &Fixture, page: CiphertextCopy) -> usize {
+    let before = f.admission.used(ResourceClass::Ciphertext);
+    f.enqueue(page).unwrap();
+    f.admission.used(ResourceClass::Ciphertext) - before
+}
+
+#[test]
+fn zero_copy_persist_stages_only_header_and_round_trips() {
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let alignment = f.store.writer.slabs().alignment().unwrap();
+    for length in [23, 4096, crate::model::PAGE_BYTES as usize] {
+        let number = (length % 251) as u8 + 1;
+        let page = f.aligned_copy(number, length);
+        assert!(zero_copy_body(&page, alignment).unwrap().is_some());
+        let header = header_block_len(&page, alignment).unwrap();
+        assert_eq!(staging_bytes(&page, alignment).unwrap(), header);
+        let id = page.ciphertext.envelope().page.clone();
+        let before = page.ciphertext.disk_body(alignment).unwrap().to_vec();
+        assert_eq!(enqueue_staging(&f, page.clone()), header);
+        let request = scope();
+        assert_eq!(
+            drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap(),
+            1
+        );
+        // The device write borrowed, and did not mutate, the shared page.
+        assert_eq!(page.ciphertext.disk_body(alignment).unwrap(), &before[..]);
+        let read = drive(&f.reactor, f.store.reader.read(&id, &request))
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.ciphertext.bytes(), page.ciphertext.bytes());
+        assert_eq!(read.ciphertext.envelope(), page.ciphertext.envelope());
+    }
+    assert_eq!(f.metrics.count(crate::telemetry::Event::PersistZeroCopy), 3);
+    assert_eq!(
+        f.metrics
+            .count(crate::telemetry::Event::PersistCopyFallback),
+        0
+    );
+    assert!(f.store.writer.is_idle());
+    assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
+}
+
+#[test]
+fn unaligned_page_persists_through_copy_fallback_with_full_staging() {
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let alignment = f.store.writer.slabs().alignment().unwrap();
+    let page = f.copy(9, 4096);
+    assert!(zero_copy_body(&page, alignment).unwrap().is_none());
+    let full = staging_capacity(record_length(&page, alignment).unwrap()).unwrap();
+    assert_eq!(staging_bytes(&page, alignment).unwrap(), full);
+    let id = page.ciphertext.envelope().page.clone();
+    assert_eq!(enqueue_staging(&f, page.clone()), full);
+    let request = scope();
+    assert_eq!(
+        drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap(),
+        1
+    );
+    let read = drive(&f.reactor, f.store.reader.read(&id, &request))
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.ciphertext.bytes(), page.ciphertext.bytes());
+    assert_eq!(f.metrics.count(crate::telemetry::Event::PersistZeroCopy), 0);
+    assert_eq!(
+        f.metrics
+            .count(crate::telemetry::Event::PersistCopyFallback),
+        1
+    );
+}
+
+#[test]
+fn zero_copy_body_serves_a_shorter_record_body_and_rejects_misfits() {
+    let f = Fixture::new();
+    let page = f.aligned_copy(4, 100);
+    let pool = f.pool.alignment();
+    let body = page.ciphertext.disk_body(pool).unwrap();
+    // A 512-byte device unit takes a unit-aligned prefix of the pool padding.
+    let device = Alignment::new(512, 512, 512).unwrap();
+    let prefix = disk_body_prefix(&page.ciphertext, device, 512).unwrap();
+    assert_eq!(prefix.as_ptr(), body.as_ptr());
+    assert_eq!(&prefix[..116], page.ciphertext.bytes());
+    assert!(prefix[116..].iter().all(|&b| b == 0));
+    // Lengths beyond the padding or off the device unit are refused.
+    assert!(disk_body_prefix(&page.ciphertext, device, body.len() + 512).is_none());
+    assert!(disk_body_prefix(&page.ciphertext, device, 100).is_none());
+    // Owned pages never expose a disk body.
+    assert!(disk_body_prefix(&f.copy(4, 100).ciphertext, device, 512).is_none());
+}
+
+#[test]
+fn zero_copy_write_failure_releases_charges_and_does_not_publish() {
+    use racer_platform::simulation::Fault;
+    use racer_platform::simulation::Simulation;
+    for fault in [Fault::Errno(libc::EIO), Fault::Short(512)] {
+        let simulation = Simulation::new();
+        let _environment = simulation.enter();
+        let f = Fixture::new();
+        let _ = drive(&f.reactor, f.store.open()).unwrap();
+        let alignment = f.store.writer.slabs().alignment().unwrap();
+        let page = f.aligned_copy(5, 4096);
+        let id = page.ciphertext.envelope().page.clone();
+        let before = page.ciphertext.disk_body(alignment).unwrap().to_vec();
+        let page_charge = f.admission.used(ResourceClass::Ciphertext);
+        f.enqueue(page.clone()).unwrap();
+        simulation.inject("writev", fault).unwrap();
+        let request = scope();
+        // Progress may absorb the device error; it must not publish.
+        let _ = drive(&f.reactor, f.store.writer.progress(1, &request));
+        assert!(f.store.writer.is_idle());
+        assert!(f.store.writer.index().lookup(&id).unwrap().is_none());
+        assert_eq!(f.metrics.count(crate::telemetry::Event::DiskPublication), 0);
+        assert_eq!(f.metrics.count(crate::telemetry::Event::PersistZeroCopy), 1);
+        assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
+        f.store.writer.slabs().reclaim_idle();
+        assert_eq!(f.admission.used(ResourceClass::Ciphertext), page_charge);
+        assert_eq!(page.ciphertext.disk_body(alignment).unwrap(), &before[..]);
     }
 }
