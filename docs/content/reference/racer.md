@@ -50,7 +50,9 @@ parent directories. Clients do not automatically bypass Racer to connect directl
 Set `spec.origin` to have the operator run a `racer-object origin` DaemonSet for
 the cache. Leave it unset to deploy your own origin, as described in the
 [racer-object reference](racer-object.md#deploying-the-origin). Do not do both
-for one cache. Removing `spec.origin` removes the managed origin.
+for one cache. Set or omit `spec.origin` when you create the cache: it cannot be
+added or removed later. To change the origin, create a new ClusterCache, which
+starts with an empty cache. Deleting the ClusterCache removes the managed origin.
 
 ```yaml
 apiVersion: racer.unbounded-cloud.io/v1alpha1
