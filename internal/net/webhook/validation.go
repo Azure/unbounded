@@ -608,7 +608,7 @@ func collectPodCIDRs(sites []unboundedv1alpha3.Site) ([]cidrEntry, error) {
 
 	for _, site := range sites {
 		for i, assignment := range site.Spec.PodCidrAssignments {
-			if !site.Spec.PodCIDRAssignmentEnabled(assignment) {
+			if assignment.AssignmentEnabled != nil && !*assignment.AssignmentEnabled {
 				continue
 			}
 
