@@ -37,7 +37,7 @@
 //! not regenerate them. Run from the repository root:
 //!
 //! ```sh
-//! timeout --signal=TERM --kill-after=10s 300s cargo test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p racer-control-wire
+//! cargo test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p racer-control-wire
 //! ```
 
 pub use codec::*;

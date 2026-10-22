@@ -88,6 +88,9 @@ gh run list --repo Azure/unbounded --workflow nightly.yaml --limit 5
 
 # CI on the commit you intend to release.
 gh run list --repo Azure/unbounded --workflow ci.yaml --branch main --limit 5
+
+# Racer (Rust, Miri, envtest) runs in its own workflow, so check it too.
+gh run list --repo Azure/unbounded --workflow racer.yaml --branch main --limit 5
 ```
 
 </details>
@@ -457,6 +460,9 @@ gh run list --repo Azure/unbounded --workflow nightly.yaml --limit 5
 
 # CI on the commit you intend to release.
 gh run list --repo Azure/unbounded --workflow ci.yaml --branch main --limit 5
+
+# Racer (Rust, Miri, envtest) runs in its own workflow, so check it too.
+gh run list --repo Azure/unbounded --workflow racer.yaml --branch main --limit 5
 ```
 
 </details>

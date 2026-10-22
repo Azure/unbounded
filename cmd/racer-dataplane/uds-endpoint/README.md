@@ -137,9 +137,9 @@ second panic during unwinding. Crash/umask cases run in isolated subprocesses,
 not through process-wide umask changes or fork inside parallel test workers.
 
 ```sh
-timeout --signal=TERM --kill-after=10s 300s env CARGO_BUILD_JOBS=2 cargo test -p uds-endpoint --all-features
-timeout --signal=TERM --kill-after=10s 300s env CARGO_BUILD_JOBS=2 cargo clippy -p uds-endpoint --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks
-timeout --signal=TERM --kill-after=10s 300s cargo fmt --all --check
+cargo test -p uds-endpoint --all-features
+cargo clippy -p uds-endpoint --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks
+cargo fmt --all --check
 ```
 
 The ignored `crash_state_driver` and `descriptor_limit_driver` tests are invoked

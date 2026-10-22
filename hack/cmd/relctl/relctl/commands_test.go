@@ -369,6 +369,7 @@ func TestPreflightBlocksOnARedNightly(t *testing.T) {
 	stub := &stubGitHub{runs: map[string][]stubRun{
 		"nightly.yaml": {{ID: 1, Status: "completed", Conclusion: "failure", CreatedAt: ago(time.Hour)}},
 		"ci.yaml":      {{ID: 2, Status: "completed", Conclusion: "success", HeadBranch: "main", CreatedAt: ago(time.Hour)}},
+		"racer.yaml":   {{ID: 3, Status: "completed", Conclusion: "success", HeadBranch: "main", CreatedAt: ago(time.Hour)}},
 	}}
 
 	out, _ := runCommand(t, stub, tagRepo(t), "preflight")
@@ -390,6 +391,7 @@ func TestPreflightBlocksOnAStaleNightly(t *testing.T) {
 	stub := &stubGitHub{runs: map[string][]stubRun{
 		"nightly.yaml": {{ID: 1, Status: "completed", Conclusion: "success", CreatedAt: ago(7 * 24 * time.Hour)}},
 		"ci.yaml":      {{ID: 2, Status: "completed", Conclusion: "success", HeadBranch: "main", CreatedAt: ago(time.Hour)}},
+		"racer.yaml":   {{ID: 3, Status: "completed", Conclusion: "success", HeadBranch: "main", CreatedAt: ago(time.Hour)}},
 	}}
 
 	out, _ := runCommand(t, stub, tagRepo(t), "preflight")
@@ -405,6 +407,7 @@ func TestPreflightPassesWhenEverythingIsGreen(t *testing.T) {
 	stub := &stubGitHub{runs: map[string][]stubRun{
 		"nightly.yaml": {{ID: 1, Status: "completed", Conclusion: "success", CreatedAt: ago(4 * time.Hour)}},
 		"ci.yaml":      {{ID: 2, Status: "completed", Conclusion: "success", HeadBranch: "main", CreatedAt: ago(time.Hour)}},
+		"racer.yaml":   {{ID: 3, Status: "completed", Conclusion: "success", HeadBranch: "main", CreatedAt: ago(time.Hour)}},
 	}}
 
 	out, err := runCommand(t, stub, tagRepo(t), "preflight")
@@ -428,6 +431,10 @@ func TestPreflightSaysTheNightlyIsIrrelevantOnAReleaseBranch(t *testing.T) {
 			ID: 2, Status: "completed", Conclusion: "success",
 			HeadBranch: "release-0.4", CreatedAt: ago(time.Hour),
 		}},
+		"racer.yaml": {{
+			ID: 3, Status: "completed", Conclusion: "success",
+			HeadBranch: "release-0.4", CreatedAt: ago(time.Hour),
+		}},
 	}}
 
 	out, err := runCommand(t, stub, tagRepo(t), "preflight", "--branch", "release-0.4")
@@ -437,6 +444,57 @@ func TestPreflightSaysTheNightlyIsIrrelevantOnAReleaseBranch(t *testing.T) {
 
 	if !strings.Contains(out, "says nothing about release-0.4") {
 		t.Errorf("output does not explain the nightly's scope:\n%s", out)
+	}
+}
+
+// TestPreflightBlocksOnRacer keeps a green CI run from hiding Racer, which
+// runs in its own workflow.
+func TestPreflightBlocksOnRacer(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		racer []stubRun
+		want  string
+	}{
+		{
+			name:  "failed",
+			racer: []stubRun{{ID: 3, Status: "completed", Conclusion: "failure", HeadBranch: "release-0.4", CreatedAt: ago(time.Hour)}},
+			want:  "Racer is failure on release-0.4",
+		},
+		{
+			name:  "in progress",
+			racer: []stubRun{{ID: 3, Status: "in_progress", HeadBranch: "release-0.4", CreatedAt: ago(time.Hour)}},
+			want:  "Racer is still running on release-0.4",
+		},
+		{
+			name: "missing",
+			want: "no Racer runs found for release-0.4",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			runs := map[string][]stubRun{
+				"ci.yaml": {{ID: 2, Status: "completed", Conclusion: "success", HeadBranch: "release-0.4", CreatedAt: ago(time.Hour)}},
+			}
+
+			if tt.racer != nil {
+				runs["racer.yaml"] = tt.racer
+			}
+
+			out, _ := runCommand(t, &stubGitHub{runs: runs}, tagRepo(t), "preflight", "--branch", "release-0.4")
+
+			if !strings.Contains(out, "NOT RELEASABLE") {
+				t.Errorf("Racer %s must block:\n%s", tt.name, out)
+			}
+
+			if !strings.Contains(out, tt.want) {
+				t.Errorf("output does not contain %q:\n%s", tt.want, out)
+			}
+		})
 	}
 }
 

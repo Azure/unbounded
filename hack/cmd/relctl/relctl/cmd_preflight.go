@@ -29,6 +29,7 @@ type preflightResult struct {
 	NightlyOK  bool     `json:"nightlyOk"`
 	NightlyAge string   `json:"nightlyAge,omitempty"`
 	CIOK       bool     `json:"ciOk"`
+	RacerOK    bool     `json:"racerOk"`
 	LiveTrains []string `json:"liveTrains,omitempty"`
 	Blockers   []string `json:"blockers,omitempty"`
 	Notes      []string `json:"notes,omitempty"`
@@ -42,7 +43,7 @@ func preflightCommand(opts *Options) *cobra.Command {
 		Short: "Check whether a branch is releasable",
 		Long: `Check whether a branch is releasable.
 
-Checks the nightly, CI on the branch, and whether a candidate train is already
+Checks the nightly, CI and Racer on the branch, and whether a candidate train is already
 in flight, and says RELEASABLE or NOT RELEASABLE with the reason.
 
 A red nightly is a release blocker until it is understood. It deploys the same
@@ -96,16 +97,16 @@ func runPreflight(ctx context.Context, out io.Writer, opts *Options, branch stri
 		return err
 	}
 
-	switch {
-	case len(ci) == 0:
-		result.Blockers = append(result.Blockers, "no CI runs found for "+branch)
-	case !ci[0].Done():
-		result.Blockers = append(result.Blockers, "CI is still running on "+branch)
-	case !ci[0].Succeeded():
-		result.Blockers = append(result.Blockers, "CI is "+ci[0].State()+" on "+branch)
-	default:
-		result.CIOK = true
+	result.CIOK = judgeWorkflow(ci, "CI", branch, &result)
+
+	// Racer's Rust, Miri, and envtest jobs live in their own workflow, so a
+	// green CI run says nothing about them.
+	racer, err := client.Runs(ctx, gh.ListRuns{Workflow: gh.WorkflowRacer, Branch: branch, Limit: 5})
+	if err != nil {
+		return err
 	}
+
+	result.RacerOK = judgeWorkflow(racer, "Racer", branch, &result)
 
 	// A train already in flight is not a blocker, but cutting past it strands
 	// it, so it belongs in the report. A failure to resolve is reported rather
@@ -133,6 +134,23 @@ func runPreflight(ctx context.Context, out io.Writer, opts *Options, branch stri
 	}
 
 	return writePreflightText(out, result)
+}
+
+// judgeWorkflow reports whether the latest run of a branch-gating workflow
+// succeeded, adding a blocker to result when it did not.
+func judgeWorkflow(runs []gh.Run, name, branch string, result *preflightResult) bool {
+	switch {
+	case len(runs) == 0:
+		result.Blockers = append(result.Blockers, "no "+name+" runs found for "+branch)
+	case !runs[0].Done():
+		result.Blockers = append(result.Blockers, name+" is still running on "+branch)
+	case !runs[0].Succeeded():
+		result.Blockers = append(result.Blockers, name+" is "+runs[0].State()+" on "+branch)
+	default:
+		return true
+	}
+
+	return false
 }
 
 // judgeNightly decides whether the nightly signal is good enough.
@@ -178,6 +196,7 @@ func writePreflightText(out io.Writer, result preflightResult) error {
 		{"Verdict:", verdict},
 		{"Nightly:", tick(result.NightlyOK) + nightlySuffix(result.NightlyAge)},
 		{"CI:", tick(result.CIOK)},
+		{"Racer:", tick(result.RacerOK)},
 	}
 
 	if len(result.LiveTrains) > 0 {

@@ -62,7 +62,7 @@ GROUPS = {
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("group", choices=[*GROUPS, "list"])
+    parser.add_argument("group", choices=[*GROUPS, "all", "list"])
     args = parser.parse_args()
     if args.group == "list":
         for group, tests in GROUPS.items():
@@ -70,13 +70,15 @@ def main():
         return 0
 
     root = Path(__file__).resolve().parents[2]
-    tests = GROUPS[args.group]
+    if args.group == "all":
+        tests = [test for group in GROUPS.values() for test in group]
+    else:
+        tests = GROUPS[args.group]
     command = [
-        "timeout", "--signal=TERM", "--kill-after=10s", "290s",
         "cargo", "+" + TOOLCHAIN, "miri", "test", "--locked",
         "--manifest-path", str(root / "cmd/racer-dataplane/Cargo.toml"),
         "--target-dir", os.environ.get("RUNTIME_MIRI_TARGET_DIR", str(root / "tmp/runtime-miri-target")),
-        "-p", "uring-runtime", "--no-default-features", "--lib", "-j", "2",
+        "-p", "uring-runtime", "--no-default-features", "--lib",
         "--", "--exact", "--test-threads=1", *tests,
     ]
     # Keep Miri's default isolation, aliasing, alignment, and leak checks enabled.

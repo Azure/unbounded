@@ -563,7 +563,7 @@ e2e-gantry: $(HELM) ## Run the kind-based Gantry e2e suite
 		$(GOTEST) -tags=e2e -count=1 -timeout=120m -v ./e2e/gantry
 
 e2e-racer: ## Run the kind-based Racer object caching e2e suite
-	timeout --signal=TERM --kill-after=30s 7200s $(GOTEST) -tags=e2e -count=1 -timeout=110m -v ./e2e/racer
+	$(GOTEST) -tags=e2e -count=1 -timeout=110m -v ./e2e/racer
 
 e2e-playpen: ## Run the kind-based playpen e2e suite
 	$(GOTEST) -tags=e2e ./e2e/playpen -v -timeout=10m
@@ -573,31 +573,31 @@ racer-controller: racer-server-test racer-controller-build ## Test and build the
 
 racer-controller-build: ## Build the Racer controller without lint/test
 	@mkdir -p bin
-	timeout --signal=TERM --kill-after=10s 300s $(GOBUILD) -trimpath -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-controller ./cmd/racer-controller
+	$(GOBUILD) -trimpath -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-controller ./cmd/racer-controller
 
 racer-server-test: ## Lint and race-test the Racer server
-	timeout --signal=TERM --kill-after=10s 300s $(GOLINT) ./api/racer/... ./internal/racer/... ./cmd/racer-controller/...
-	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m -race ./api/racer/... ./internal/racer/... ./cmd/racer-controller/...
+	$(GOLINT) ./api/racer/... ./internal/racer/... ./cmd/racer-controller/...
+	$(GOTEST) -timeout=5m -race ./api/racer/... ./internal/racer/... ./cmd/racer-controller/...
 
 racer-test: racer-server-test ## Check the Racer controller
 
 $(SETUP_ENVTEST):
 	@mkdir -p bin tmp/envtest-tools
-	TMPDIR="$(CURDIR)/tmp/envtest-tools" GOBIN="$(CURDIR)/bin" timeout --signal=TERM --kill-after=10s 300s $(GOCMD) install sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION)
+	TMPDIR="$(CURDIR)/tmp/envtest-tools" GOBIN="$(CURDIR)/bin" $(GOCMD) install sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION)
 	mv bin/setup-envtest "$(SETUP_ENVTEST)"
 
 racer-envtest-ci: $(SETUP_ENVTEST) ## Provision pinned local API-server assets and require Racer envtest
 	@mkdir -p tmp/racer-envtest
-	@assets=$$(TMPDIR="$(CURDIR)/tmp/racer-envtest" timeout --signal=TERM --kill-after=10s 300s "$(SETUP_ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(CURDIR)/bin/envtest" -p path) && \
+	@assets=$$(TMPDIR="$(CURDIR)/tmp/racer-envtest" "$(SETUP_ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(CURDIR)/bin/envtest" -p path) && \
 		$(MAKE) racer-envtest KUBEBUILDER_ASSETS="$$assets"
 
 racer-envtest: ## Run real API-server, manager election, TLS and crash-recovery tests
 	@test -n "$(KUBEBUILDER_ASSETS)" || { echo "Set KUBEBUILDER_ASSETS to repository-local envtest binaries"; exit 1; }
 	@mkdir -p tmp/racer-envtest
-	TMPDIR="$(CURDIR)/tmp/racer-envtest" KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)" timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -race ./api/racer/v1alpha1 ./internal/racer ./internal/racer/authority ./deploy/racer ./internal/operator/components/racer -run '^TestEnvtest' -count=1 -v -timeout=5m
+	TMPDIR="$(CURDIR)/tmp/racer-envtest" KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)" $(GOTEST) -race ./api/racer/v1alpha1 ./internal/racer ./internal/racer/authority ./deploy/racer ./internal/operator/components/racer -run '^TestEnvtest' -count=1 -v -timeout=5m
 
 racer-generate: ## Generate Racer deepcopy and CRD artifacts
-	timeout --signal=TERM --kill-after=10s 300s $(GOCMD) generate ./api/racer/v1alpha1
+	$(GOCMD) generate ./api/racer/v1alpha1
 
 RACER_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/racer-controller:$(VERSION_TAG)
 RACER_DATAPLANE_IMAGE ?= $(CONTAINER_REGISTRY)/racer-dataplane:$(VERSION_TAG)
@@ -627,10 +627,10 @@ racer-loadgen: racer-loadgen-test racer-loadgen-build ## Test and build the Race
 
 racer-loadgen-build: ## Build the Racer load generator without lint/test
 	@mkdir -p bin
-	timeout --signal=TERM --kill-after=10s 300s $(GOBUILD) -trimpath -o $(RACER_LOADGEN_BIN) $(RACER_LOADGEN_CMD)
+	$(GOBUILD) -trimpath -o $(RACER_LOADGEN_BIN) $(RACER_LOADGEN_CMD)
 
 racer-loadgen-test: ## Race-test racer-loadgen
-	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m -race $(RACER_LOADGEN_CMD)/...
+	$(GOTEST) -timeout=5m -race $(RACER_LOADGEN_CMD)/...
 
 image-racer-loadgen-local: ## Build the loadgen container image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
@@ -647,10 +647,10 @@ racer-object: racer-object-test racer-object-build ## Test and build racer-objec
 
 racer-object-build: ## Build racer-object without lint/test
 	@mkdir -p bin
-	timeout --signal=TERM --kill-after=10s 300s $(GOBUILD) -trimpath -ldflags '$(STAMP_LDFLAGS)' -o $(RACER_OBJECT_BIN) $(RACER_OBJECT_CMD)
+	$(GOBUILD) -trimpath -ldflags '$(STAMP_LDFLAGS)' -o $(RACER_OBJECT_BIN) $(RACER_OBJECT_CMD)
 
 racer-object-test: ## Race-test racer-object
-	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m -race $(RACER_OBJECT_CMD)/...
+	$(GOTEST) -timeout=5m -race $(RACER_OBJECT_CMD)/...
 
 image-racer-object-local: ## Build the racer-object container image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
