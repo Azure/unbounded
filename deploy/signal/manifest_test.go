@@ -62,6 +62,8 @@ func TestAdapterManifestIsGenericAndParticipantAware(t *testing.T) {
 		"participant-count",
 		"request-node-name",
 		"backend-resources",
+		"backend-evidence",
+		"/outputs/backend-evidence",
 		"cleanup-failure",
 		"/outputs/cleanup-failure",
 		"backend-api-version",
@@ -84,6 +86,28 @@ func TestAdapterManifestIsGenericAndParticipantAware(t *testing.T) {
 	} {
 		if strings.Contains(manifest, forbidden) {
 			t.Fatalf("adapter WorkflowTemplate contains downstream-specific value %q", forbidden)
+		}
+	}
+}
+
+func TestAdapterRBACAllowsBackendEvidenceCapture(t *testing.T) {
+	t.Parallel()
+
+	content, err := os.ReadFile("03-adapter-serviceaccount-rbac.yaml.tmpl")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	manifest := string(content)
+	for _, required := range []string{
+		`resources: ["pods"]`,
+		`resources: ["pods/log"]`,
+		`apiGroups: ["batch"]`,
+		`resources: ["jobs"]`,
+		`verbs: ["get", "list"]`,
+	} {
+		if !strings.Contains(manifest, required) {
+			t.Fatalf("adapter RBAC does not contain %q", required)
 		}
 	}
 }

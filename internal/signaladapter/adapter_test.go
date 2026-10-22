@@ -1297,6 +1297,8 @@ func TestResultCommandClearsReservedFilesAndReportsExitCode(t *testing.T) {
 
 	for _, required := range []string{
 		"rm -f /results/verdict /results/reason /results/measurements.txt",
+		`printf 'PROJECT_SIGNAL_RESULTS_V1 prepared\n'`,
+		`printf 'PROJECT_SIGNAL_RESULTS_V1 verdict=%s reason=%s measurements=%s\n'`,
 		`printf 'PROJECT_SIGNAL_RESULT_V2 %s %s %s %d\n'`,
 		`exit "$status"`,
 	} {

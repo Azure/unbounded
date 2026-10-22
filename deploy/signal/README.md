@@ -96,12 +96,31 @@ The Workflow must publish only these output parameters:
 | `reason` | 4 KiB | Bounded diagnostic reason |
 | `measurements` | 16 KiB | Bounded measurement summary |
 | `backend-resources` | 16 KiB | Optional JSON array of backend workload identities and covered participant indexes; required for a multi-Node `Pass` |
+| `backend-evidence` | 256 KiB | Required redacted pre-cleanup backend object, container state, and bounded current/previous log projection |
 
 Unexpected, duplicate, malformed, or oversized outputs are rejected and the
 run remains fail-closed. Each `backend-resources` entry must contain
 `apiVersion`, `kind`, `name`, `uid`, and the zero-based `participantIndexes`
 that the workload executed. `namespace` is optional. A multi-Node successful
 result must cover every admitted participant.
+
+Before foreground deletion, the adapter captures and writes a typed v1
+projection for every participant backend to the Argo output path. The
+projection includes Pod or MPIJob state and
+conditions, launcher Job conditions, participant container exit state and
+restart count, and bounded current and previous container log tails. Generated
+participant commands emit lifecycle markers for result-directory preparation
+and final verdict, reason, and measurements file presence. The projection
+records those markers without retaining the result payload itself.
+
+Each retained log tail is limited to 512 bytes and redacts bearer credentials,
+secret-like assignments, URL user information, private-key blocks, and complete
+result-marker payloads. Object reason and message fields are also bounded. If a
+required object or current log cannot be captured, a restarted container's
+previous log is unavailable, or the projection must omit content to fit the
+256 KiB output limit, `complete` is false and the run cannot pass. Capture and
+cleanup failures remain explicit, while an earlier backend execution failure
+continues to be the causal result reason.
 
 ## Multi-Node execution
 

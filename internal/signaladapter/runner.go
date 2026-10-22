@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -32,11 +31,12 @@ var (
 )
 
 type Runner struct {
-	Dynamic      dynamic.Interface
-	Kubernetes   kubernetes.Interface
-	PollInterval time.Duration
-	CleanupWait  time.Duration
-	ReadPodLog   func(context.Context, string, string, string, bool) (string, error)
+	Dynamic                dynamic.Interface
+	Kubernetes             kubernetes.Interface
+	PollInterval           time.Duration
+	CleanupWait            time.Duration
+	ReadPodLog             func(context.Context, string, string, string, bool) (string, error)
+	PersistBackendEvidence func(string) error
 }
 
 type createdResource struct {
@@ -184,6 +184,28 @@ func (r *Runner) Execute(ctx context.Context, config Config) (output AggregateOu
 		return AggregateOutput{}, err
 	}
 
+	captureContext, cancelCapture := context.WithTimeout(context.Background(), r.cleanupWait())
+	defer cancelCapture()
+
+	var evidenceComplete bool
+
+	output.BackendEvidence, evidenceComplete, err = r.captureBackendEvidence(
+		captureContext,
+		config,
+		created,
+	)
+	if err != nil {
+		return AggregateOutput{}, err
+	}
+
+	if !evidenceComplete {
+		recordEvidenceCaptureFailure(&output)
+	}
+
+	if err := r.persistEvidenceBeforeCleanup(&output); err != nil {
+		return AggregateOutput{}, err
+	}
+
 	cleanupContext, cancel := context.WithTimeout(context.Background(), r.cleanupWait())
 	defer cancel()
 
@@ -196,6 +218,28 @@ func (r *Runner) Execute(ctx context.Context, config Config) (output AggregateOu
 	created = nil
 
 	return output, nil
+}
+
+func (r *Runner) persistEvidenceBeforeCleanup(output *AggregateOutput) error {
+	if r.PersistBackendEvidence == nil {
+		return nil
+	}
+
+	if err := r.PersistBackendEvidence(output.BackendEvidence); err != nil {
+		var markErr error
+
+		output.BackendEvidence, markErr = markBackendEvidenceIncomplete(
+			output.BackendEvidence,
+			"persist backend evidence before cleanup: "+err.Error(),
+		)
+		if markErr != nil {
+			return markErr
+		}
+
+		recordEvidenceCaptureFailure(output)
+	}
+
+	return nil
 }
 
 func recordCleanupFailure(output *AggregateOutput) {
@@ -510,12 +554,27 @@ func (r *Runner) resultLogs(
 	containerName := "main"
 
 	if backend.resource.GetKind() == "MPIJob" {
+		jobs, err := r.Kubernetes.BatchV1().Jobs(config.Namespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			source := resultLogSourceFromError(fmt.Errorf("list MPIJob launcher Jobs: %w", err))
+
+			return resultLogSnapshot{
+				current:  source,
+				previous: resultLogSourceMetadataOnly("not-read"),
+			}
+		}
+
+		jobUIDs := make(map[types.UID]struct{})
+
+		for index := range jobs.Items {
+			job := &jobs.Items[index]
+			if ownedBy(job.OwnerReferences, backend.resource.GetUID()) {
+				jobUIDs[job.UID] = struct{}{}
+			}
+		}
+
 		pods, err := r.Kubernetes.CoreV1().Pods(config.Namespace).List(ctx, metav1.ListOptions{
-			LabelSelector: strings.Join([]string{
-				"signal.unbounded-cloud.io/run=" + config.RunName,
-				"signal.unbounded-cloud.io/participant-index=" +
-					strconv.FormatInt(int64(backend.participantIndex), 10),
-			}, ","),
+			LabelSelector: participantLabelSelector(config.RunName, backend.participantIndex),
 		})
 		if err != nil {
 			source := resultLogSourceFromError(fmt.Errorf("list MPIJob Pods: %w", err))
@@ -530,17 +589,11 @@ func (r *Runner) resultLogs(
 
 		for index := range pods.Items {
 			pod := &pods.Items[index]
-			if !ownedBy(pod.OwnerReferences, backend.resource.GetUID()) {
-				continue
-			}
+			if mpiPodRole(pod, backend.resource.GetUID(), jobUIDs) == "launcher" {
+				podName = pod.Name
+				containerName = "launcher"
 
-			for _, container := range pod.Spec.Containers {
-				if container.Name == "launcher" {
-					podName = pod.Name
-					containerName = container.Name
-
-					break
-				}
+				break
 			}
 		}
 

@@ -27,17 +27,18 @@ import (
 )
 
 const (
-	MaxParticipants        = 64
-	MaxReasonBytes         = 4 * 1024
-	MaxMeasurementsBytes   = 16 * 1024
-	MaxBackendOutputBytes  = 16 * 1024
-	MaxCleanupFailureBytes = 64
-	maxMPIWorkerReadyWait  = int64(30)
-	maxMPIWorkerSlots      = int64(1<<31 - 1)
-	mpiHostfilePath        = "/tmp/project-signal-hostfile"
-	mpiKnownHostsPath      = "/tmp/project-signal-known-hosts"
-	resultPrefix           = "PROJECT_SIGNAL_RESULT_V2 "
-	requiredTopologyKey    = "kueue.x-k8s.io/podset-required-topology"
+	MaxParticipants         = 64
+	MaxReasonBytes          = 4 * 1024
+	MaxMeasurementsBytes    = 16 * 1024
+	MaxBackendOutputBytes   = 16 * 1024
+	MaxBackendEvidenceBytes = 256 * 1024
+	MaxCleanupFailureBytes  = 64
+	maxMPIWorkerReadyWait   = int64(30)
+	maxMPIWorkerSlots       = int64(1<<31 - 1)
+	mpiHostfilePath         = "/tmp/project-signal-hostfile"
+	mpiKnownHostsPath       = "/tmp/project-signal-known-hosts"
+	resultPrefix            = "PROJECT_SIGNAL_RESULT_V2 "
+	requiredTopologyKey     = "kueue.x-k8s.io/podset-required-topology"
 )
 
 var runnerImagePattern = regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)
@@ -122,6 +123,7 @@ type AggregateOutput struct {
 	Measurements     string                              `json:"measurements"`
 	BackendResources []signalv1.BackendResourceReference `json:"-"`
 	BackendJSON      string                              `json:"backend-resources"`
+	BackendEvidence  string                              `json:"backend-evidence"`
 }
 
 func ParseParticipants(
@@ -729,6 +731,7 @@ set -u
 mkdir -p /results
 chmod 0755 /results
 rm -f /results/verdict /results/reason /results/measurements.txt
+printf 'PROJECT_SIGNAL_RESULTS_V1 prepared\n'
 set +e
 %s
 prelude_status=$?
@@ -752,6 +755,10 @@ measurements="$(encode_result_file /results/measurements.txt)"
 [[ -n "${verdict}" ]] || verdict=-
 [[ -n "${reason}" ]] || reason=-
 [[ -n "${measurements}" ]] || measurements=-
+printf 'PROJECT_SIGNAL_RESULTS_V1 verdict=%%s reason=%%s measurements=%%s\n' \
+  "$([[ -f /results/verdict ]] && printf present || printf missing)" \
+  "$([[ -f /results/reason ]] && printf present || printf missing)" \
+  "$([[ -f /results/measurements.txt ]] && printf present || printf missing)"
 printf '%s%%s %%s %%s %%d\n' "${verdict}" "${reason}" "${measurements}" "$status"
 exit "$status"
 `, prelude, strings.Join(quotedArguments, " "), resultPrefix),

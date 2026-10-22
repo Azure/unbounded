@@ -116,6 +116,17 @@ func run(ctx context.Context, cfg config) error {
 	runner := &signaladapter.Runner{
 		Dynamic:    dynamicClient,
 		Kubernetes: kubernetesClient,
+		PersistBackendEvidence: func(content string) error {
+			if err := signaladapter.ValidateBackendEvidence(content); err != nil {
+				return err
+			}
+
+			if err := os.MkdirAll(cfg.outputDirectory, 0o750); err != nil {
+				return fmt.Errorf("create output directory: %w", err)
+			}
+
+			return writeOutput(cfg.outputDirectory, "backend-evidence", content)
+		},
 	}
 
 	output, err := runner.Execute(ctx, cfg.Config)
@@ -138,6 +149,10 @@ func writeOutputs(directory string, output signaladapter.AggregateOutput) error 
 		)
 	}
 
+	if err := signaladapter.ValidateBackendEvidence(output.BackendEvidence); err != nil {
+		return err
+	}
+
 	if err := os.MkdirAll(directory, 0o750); err != nil {
 		return fmt.Errorf("create output directory: %w", err)
 	}
@@ -148,10 +163,11 @@ func writeOutputs(directory string, output signaladapter.AggregateOutput) error 
 		"cleanup-failure":   output.CleanupFailure,
 		"measurements":      output.Measurements,
 		"backend-resources": output.BackendJSON,
+		"backend-evidence":  output.BackendEvidence,
 	}
 	for name, value := range outputs {
-		if err := os.WriteFile(filepath.Join(directory, name), []byte(value), 0o600); err != nil {
-			return fmt.Errorf("write %s output: %w", name, err)
+		if err := writeOutput(directory, name, value); err != nil {
+			return err
 		}
 	}
 
@@ -161,6 +177,14 @@ func writeOutputs(directory string, output signaladapter.AggregateOutput) error 
 	}
 
 	fmt.Println(string(evidence))
+
+	return nil
+}
+
+func writeOutput(directory, name, value string) error {
+	if err := os.WriteFile(filepath.Join(directory, name), []byte(value), 0o600); err != nil {
+		return fmt.Errorf("write %s output: %w", name, err)
+	}
 
 	return nil
 }
