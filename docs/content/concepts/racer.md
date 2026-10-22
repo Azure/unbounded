@@ -79,7 +79,7 @@ and recreating it gives it a new cache identity.
 
 Optional `spec.priority` (0 to 1000, default 500) sets how a cache shares each
 node's capacity with other caches. It is a relative weight, not a quota. See
-[Priority]({{< relref "reference/racer#priority" >}}).
+[Priority]({{< relref "reference/racer" >}}#priority).
 
 ### Objects, Keys, and Versions
 
