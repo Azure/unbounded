@@ -4,10 +4,19 @@
 package signaladapter
 
 import (
+	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -312,7 +321,115 @@ func TestRenderMPIJobsPerParticipant(t *testing.T) {
 		if strings.Contains(string(launcherJSON), "nvidia.com/gpu") {
 			t.Fatalf("resource %d launcher requests GPUs: %s", index, launcherJSON)
 		}
+
+		if !strings.Contains(string(launcherJSON), "/etc/mpi/hostfile") ||
+			!strings.Contains(string(launcherJSON), `/dev/tcp/${host}/${port}`) ||
+			!strings.Contains(string(launcherJSON), "Project Signal MPI readiness timed out") {
+			t.Fatalf("resource %d launcher readiness fence missing: %s", index, launcherJSON)
+		}
 	}
+}
+
+func TestMPIWorkerReadinessTimeoutIsBoundedByBackendDeadline(t *testing.T) {
+	t.Parallel()
+
+	for _, backendDeadline := range []int64{2, 60, 121, 540} {
+		timeout := mpiWorkerReadinessTimeout(backendDeadline)
+		if timeout < 1 || timeout >= backendDeadline || timeout > maxMPIWorkerReadyWait {
+			t.Fatalf("mpiWorkerReadinessTimeout(%d) = %d", backendDeadline, timeout)
+		}
+	}
+}
+
+func TestMPIWorkerReadinessFenceWaitsForWorkers(t *testing.T) {
+	t.Parallel()
+
+	hostfile := filepath.Join(t.TempDir(), "hostfile")
+	port := unusedTCPPort(t)
+	ready := make(chan error, 1)
+
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+
+		if err := os.WriteFile(hostfile, []byte("127.0.0.1 slots=1\n"), 0o600); err != nil {
+			ready <- err
+
+			return
+		}
+
+		time.Sleep(1100 * time.Millisecond)
+
+		listener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+		if err != nil {
+			ready <- err
+
+			return
+		}
+		defer listener.Close()
+
+		connection, err := listener.Accept()
+		if err == nil {
+			err = connection.Close()
+		}
+
+		ready <- err
+	}()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
+	defer cancel()
+
+	command := exec.CommandContext(ctx, "/bin/bash", "-c", mpiWorkerReadinessScript(hostfile, port, 5))
+
+	var stderr bytes.Buffer
+
+	command.Stderr = &stderr
+
+	if err := command.Run(); err != nil {
+		t.Fatalf("readiness fence failed: %v stderr=%q", err, stderr.String())
+	}
+
+	if err := <-ready; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMPIWorkerReadinessFenceTimesOut(t *testing.T) {
+	t.Parallel()
+
+	hostfile := filepath.Join(t.TempDir(), "hostfile")
+	if err := os.WriteFile(hostfile, []byte("127.0.0.1 slots=1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	port := unusedTCPPort(t)
+	command := exec.Command("/bin/bash", "-c", mpiWorkerReadinessScript(hostfile, port, 2))
+
+	var stderr bytes.Buffer
+
+	command.Stderr = &stderr
+
+	err := command.Run()
+	if err == nil {
+		t.Fatal("readiness fence succeeded without a listening worker")
+	}
+
+	if !strings.Contains(stderr.String(), "timed out after 2s") ||
+		!strings.Contains(stderr.String(), hostfile) ||
+		!strings.Contains(stderr.String(), fmt.Sprintf("TCP/%d", port)) {
+		t.Fatalf("readiness timeout stderr = %q", stderr.String())
+	}
+}
+
+func unusedTCPPort(t *testing.T) int {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	return listener.Addr().(*net.TCPAddr).Port
 }
 
 func TestRenderMPIJobUsesExplicitLifecycleOverrides(t *testing.T) {
@@ -517,6 +634,18 @@ func TestValidateConfigRejectsKueueTopologyWithoutQueue(t *testing.T) {
 	if _, _, _, err := ValidateConfig(config); err == nil ||
 		!strings.Contains(err.Error(), "kueueTopology requires a queue") {
 		t.Fatalf("ValidateConfig topology error = %v", err)
+	}
+}
+
+func TestValidateConfigRejectsMPIWorkerReadinessWithoutTimeBudget(t *testing.T) {
+	t.Parallel()
+
+	config := testConfig()
+	config.BackendDeadlineSeconds = 1
+
+	if _, _, _, err := ValidateConfig(config); err == nil ||
+		!strings.Contains(err.Error(), "at least 2 for MPIJob worker readiness") {
+		t.Fatalf("ValidateConfig deadline error = %v", err)
 	}
 }
 

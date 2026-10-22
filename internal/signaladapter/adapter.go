@@ -32,6 +32,7 @@ const (
 	MaxMeasurementsBytes   = 16 * 1024
 	MaxBackendOutputBytes  = 16 * 1024
 	MaxCleanupFailureBytes = 64
+	maxMPIWorkerReadyWait  = int64(120)
 	resultPrefix           = "PROJECT_SIGNAL_RESULT_V2 "
 	requiredTopologyKey    = "kueue.x-k8s.io/podset-required-topology"
 )
@@ -252,6 +253,12 @@ func ValidateConfig(config Config) ([]signalv1.Participant, []corev1.Toleration,
 	case config.BackendKind == "MPIJob" && config.BackendAPIVersion == "kubeflow.org/v2beta1":
 		if config.Queue == "" {
 			return nil, nil, nil, errors.New("queue is required for MPIJob execution")
+		}
+
+		if config.BackendDeadlineSeconds < 2 {
+			return nil, nil, nil, errors.New(
+				"backend-active-deadline-seconds must be at least 2 for MPIJob worker readiness",
+			)
 		}
 	default:
 		return nil, nil, nil, fmt.Errorf(
@@ -682,6 +689,10 @@ func validateResult(result Result) error {
 }
 
 func resultCommand(arguments ...string) []string {
+	return resultCommandWithPrelude("", arguments...)
+}
+
+func resultCommandWithPrelude(prelude string, arguments ...string) []string {
 	quotedArguments := make([]string, len(arguments))
 	for index, argument := range arguments {
 		quotedArguments[index] = shellQuote(argument)
@@ -696,8 +707,14 @@ mkdir -p /results
 chmod 0755 /results
 rm -f /results/verdict /results/reason /results/measurements.txt
 set +e
-/bin/bash "/scripts/${PROJECT_SIGNAL_SCRIPT_KEY}" %s
-status=$?
+%s
+prelude_status=$?
+if [[ "${prelude_status}" -eq 0 ]]; then
+ /bin/bash "/scripts/${PROJECT_SIGNAL_SCRIPT_KEY}" %s
+ status=$?
+else
+ status="${prelude_status}"
+fi
 set -e
 encode_result_file() {
   if [[ -f "$1" ]]; then
@@ -714,8 +731,63 @@ measurements="$(encode_result_file /results/measurements.txt)"
 [[ -n "${measurements}" ]] || measurements=-
 printf '%s%%s %%s %%s %%d\n' "${verdict}" "${reason}" "${measurements}" "$status"
 exit "$status"
-`, strings.Join(quotedArguments, " "), resultPrefix),
+`, prelude, strings.Join(quotedArguments, " "), resultPrefix),
 	}
+}
+
+func mpiWorkerReadinessTimeout(backendDeadlineSeconds int64) int64 {
+	timeout := backendDeadlineSeconds - 1
+	if timeout > maxMPIWorkerReadyWait {
+		timeout = maxMPIWorkerReadyWait
+	}
+
+	return timeout
+}
+
+func mpiWorkerReadinessScript(hostfile string, port int, timeoutSeconds int64) string {
+	return fmt.Sprintf(`
+wait_for_mpi_workers() {
+  local hostfile=%s
+  local port=%d
+  local timeout_seconds=%d
+  local deadline=$((SECONDS + timeout_seconds))
+  local host ignored all_ready
+  local -a hosts
+  while (( SECONDS < deadline )); do
+    hosts=()
+    if [[ -r "${hostfile}" ]]; then
+      while IFS=$' \t' read -r host ignored; do
+        [[ -n "${host}" ]] || continue
+        if [[ ! "${host}" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+          printf 'Project Signal MPI readiness rejected invalid worker host %%q in %%s\n' "${host}" "${hostfile}" >&2
+          return 64
+        fi
+        hosts+=("${host}")
+      done < "${hostfile}"
+    fi
+    if (( ${#hosts[@]} > 0 )); then
+      all_ready=1
+      for host in "${hosts[@]}"; do
+        if exec 3<>"/dev/tcp/${host}/${port}" 2>/dev/null; then
+          exec 3>&-
+          exec 3<&-
+        else
+          all_ready=0
+          break
+        fi
+      done
+      if (( all_ready == 1 )); then
+        return 0
+      fi
+    fi
+    sleep 1
+  done
+  printf 'Project Signal MPI readiness timed out after %%ds waiting for every worker in %%s to resolve and accept TCP/%%d\n' \
+    "${timeout_seconds}" "${hostfile}" "${port}" >&2
+  return 124
+}
+wait_for_mpi_workers
+`, shellQuote(hostfile), port, timeoutSeconds)
 }
 
 func ordinaryPod(
@@ -784,6 +856,7 @@ func mpiJob(
 	jobName := resourceName(config.RunName, participant.Index)
 	launcherEnv := workloadEnvironment(config, participant, environment, false)
 	workerEnv := workloadEnvironment(config, participant, environment, true)
+	readinessTimeout := mpiWorkerReadinessTimeout(backendDeadlineSeconds)
 	worker := workloadContainer(
 		config,
 		policy,
@@ -824,9 +897,13 @@ func mpiJob(
 						nil,
 						nil,
 						corev1.Container{
-							Name:         "launcher",
-							Image:        config.RunnerImage,
-							Command:      resultCommand("mpi-launcher", strconv.FormatInt(gpuCount, 10)),
+							Name:  "launcher",
+							Image: config.RunnerImage,
+							Command: resultCommandWithPrelude(
+								mpiWorkerReadinessScript("/etc/mpi/hostfile", 22, readinessTimeout),
+								"mpi-launcher",
+								strconv.FormatInt(gpuCount, 10),
+							),
 							Env:          launcherEnv,
 							VolumeMounts: resultVolumeMounts(),
 						},
