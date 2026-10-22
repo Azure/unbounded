@@ -138,7 +138,7 @@ jobs:
   racer-block:
     name: Racer Block Device
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 35
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -156,8 +156,11 @@ jobs:
       # no result, exits nonzero, or skips for missing root, ublk, or io_uring.
       - name: Install VM tools
         run: |
-          timeout --signal=TERM --kill-after=10s 300s sudo apt-get update
-          timeout --signal=TERM --kill-after=10s 300s sudo apt-get install -y --no-install-recommends qemu-system-x86 busybox-static cpio zstd
+          # Ubuntu runner sources share this list; bypass the stalled Azure mirror.
+          printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' | timeout --signal=TERM --kill-after=10s 300s sudo tee /etc/apt/apt-mirrors.txt > /dev/null
+          apt_options=(-o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 -o Acquire::Retries=2)
+          timeout --signal=TERM --kill-after=10s 300s sudo apt-get "${apt_options[@]}" update
+          timeout --signal=TERM --kill-after=10s 300s sudo apt-get "${apt_options[@]}" install -y --no-install-recommends qemu-system-x86 busybox-static cpio zstd
 
       - name: Enable KVM
         # Optional: the harness falls back to TCG when /dev/kvm is unusable.
@@ -177,8 +180,10 @@ jobs:
           timeout --signal=TERM --kill-after=10s 300s go test -race -c -o bin/racer-block-tests/ublk.test ./internal/racerblock/ublk
           timeout --signal=TERM --kill-after=10s 300s go test -race -c -o bin/racer-block-tests/racerblock.test ./internal/racerblock
 
+      # Budget: up to 300s for the kernel download plus the harness's 600s VM
+      # limit and initramfs build.
       - name: Test ublk devices in a 6.8 VM
-        run: timeout --signal=TERM --kill-after=30s 1600s hack/scripts/racer-block-vm-test.sh run
+        run: timeout --signal=TERM --kill-after=30s 960s hack/scripts/racer-block-vm-test.sh run
 
   # ---------- Racer Rust workspace ----------
   # Lint, the two workspace feature sets, and the production gates run as
