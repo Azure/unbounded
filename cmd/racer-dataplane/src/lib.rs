@@ -12,6 +12,7 @@ pub mod client;
 pub mod config;
 pub mod control;
 pub mod error;
+pub mod hardware;
 pub mod http;
 pub mod memory;
 pub mod model;
