@@ -35,6 +35,8 @@ func TestAdmissionCreatesImmutableSnapshotAndPreventsDuplicate(t *testing.T) {
 	node := readyNode("gpu-0", "example-gpu")
 	node.Labels[RequestLabel] = "gpu-smoke"
 	profile := testProfile("gpu-smoke", "example-gpu")
+	profile.Spec.Script.RequiresRuntimeStage = true
+	profile.Spec.RuntimeStage = &signalv1.RuntimeStage{Name: "collective-bandwidth"}
 	profile.Spec.Backend.Queue = "certification"
 	profile.Spec.WorkloadPolicy = signalv1.WorkloadPolicy{
 		Resources: corev1.ResourceRequirements{
@@ -88,6 +90,14 @@ func TestAdmissionCreatesImmutableSnapshotAndPreventsDuplicate(t *testing.T) {
 		t.Fatalf("stage plan = %#v, want immutable profile plan", run.Spec.StagePlan)
 	}
 
+	if !run.Spec.Script.RequiresRuntimeStage ||
+		run.Spec.RuntimeStage == nil ||
+		run.Spec.RuntimeStage.Name != "collective-bandwidth" ||
+		run.Spec.BackendActiveDeadline.Duration != 9*time.Minute {
+		t.Fatalf("runtime contract = script %#v stage %#v backend deadline %s",
+			run.Spec.Script, run.Spec.RuntimeStage, run.Spec.BackendActiveDeadline.Duration)
+	}
+
 	if run.Spec.Purpose != signalv1.PurposeQuickCertification {
 		t.Fatalf("purpose = %q, want %q", run.Spec.Purpose, signalv1.PurposeQuickCertification)
 	}
@@ -130,6 +140,74 @@ func TestAdmissionCreatesImmutableSnapshotAndPreventsDuplicate(t *testing.T) {
 
 	if locked.Annotations[ReservationLabel] != run.Name {
 		t.Fatalf("reservation = %q, want %q", locked.Annotations[ReservationLabel], run.Name)
+	}
+}
+
+func TestAdmissionRejectsMissingRequiredRuntimeStageBeforeReservation(t *testing.T) {
+	t.Parallel()
+
+	scheme := testScheme(t)
+	node := readyNode("gpu-0", "example-gpu")
+	node.Labels[RequestLabel] = "gpu-smoke"
+	profile := testProfile("gpu-smoke", "example-gpu")
+	profile.Spec.Script.RequiresRuntimeStage = true
+	source := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "scripts", Namespace: "signal"},
+		Data:       map[string]string{"payload.txt": "test payload\n"},
+	}
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, profile, source).Build()
+	reconciler := &AdmissionReconciler{Client: kube, Namespace: "signal", ScriptNamespace: "signal"}
+
+	_, err := reconciler.Reconcile(
+		context.Background(),
+		reconcile.Request{NamespacedName: client.ObjectKey{Name: node.Name}},
+	)
+	if err == nil || !strings.Contains(err.Error(), "runtime stage is required") {
+		t.Fatalf("Reconcile error = %v", err)
+	}
+
+	var got corev1.Node
+	if err := kube.Get(context.Background(), client.ObjectKey{Name: node.Name}, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	if got.Annotations[ReservationLabel] != "" {
+		t.Fatalf("node was reserved after rejected runtime contract: %#v", got.Annotations)
+	}
+}
+
+func TestAdmissionRejectsInsufficientBackendDeadlineReserveBeforeReservation(t *testing.T) {
+	t.Parallel()
+
+	scheme := testScheme(t)
+	node := readyNode("gpu-0", "example-gpu")
+	node.Labels[RequestLabel] = "gpu-smoke"
+	profile := testProfile("gpu-smoke", "example-gpu")
+	profile.Spec.BackendActiveDeadline = metav1.Duration{
+		Duration: profile.Spec.Deadline.Duration - 59*time.Second,
+	}
+	source := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "scripts", Namespace: "signal"},
+		Data:       map[string]string{"payload.txt": "test payload\n"},
+	}
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, profile, source).Build()
+	reconciler := &AdmissionReconciler{Client: kube, Namespace: "signal", ScriptNamespace: "signal"}
+
+	_, err := reconciler.Reconcile(
+		context.Background(),
+		reconcile.Request{NamespacedName: client.ObjectKey{Name: node.Name}},
+	)
+	if err == nil || !strings.Contains(err.Error(), "leave at least 1m0s") {
+		t.Fatalf("Reconcile error = %v", err)
+	}
+
+	var got corev1.Node
+	if err := kube.Get(context.Background(), client.ObjectKey{Name: node.Name}, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	if got.Annotations[ReservationLabel] != "" {
+		t.Fatalf("node was reserved after rejected deadlines: %#v", got.Annotations)
 	}
 }
 
@@ -647,6 +725,8 @@ func TestWorkflowPinsAttemptInputs(t *testing.T) {
 		"health-mode":        "snapshot",
 		"mpi-payload-mode":   "script",
 	}
+	run.Spec.Script.RequiresRuntimeStage = true
+	run.Spec.RuntimeStage = &signalv1.RuntimeStage{Name: "collective-bandwidth"}
 	run.Spec.Tolerations = []corev1.Toleration{{
 		Key:      "nvidia.com/gpu",
 		Operator: corev1.TolerationOpExists,
@@ -681,6 +761,10 @@ func TestWorkflowPinsAttemptInputs(t *testing.T) {
 		t.Fatalf("workflow completion TTL = %d, want 21600", got)
 	}
 
+	if got, _, _ := unstructured.NestedInt64(workflow.Object, "spec", "activeDeadlineSeconds"); got != 600 {
+		t.Fatalf("workflow active deadline = %d, want outer deadline 600", got)
+	}
+
 	if got, _, _ := unstructured.NestedString(workflow.Object, "spec", "podGC", "deleteDelayDuration"); got != "2h" {
 		t.Fatalf("workflow pod GC delay = %q, want 2h", got)
 	}
@@ -703,6 +787,12 @@ func TestWorkflowPinsAttemptInputs(t *testing.T) {
 
 	if values["script-digest"] != run.Spec.Script.Digest || values["backend-kind"] != "MPIJob" || values["attempt"] != "2" {
 		t.Fatalf("workflow values = %#v", values)
+	}
+
+	if values["script-requires-runtime-stage"] != "true" ||
+		values["runtime-stage-name"] != "collective-bandwidth" ||
+		values["backend-active-deadline-seconds"] != "540" {
+		t.Fatalf("workflow runtime contract = %#v", values)
 	}
 
 	if values["participant-count"] != "1" || values["request-node-name"] != run.Spec.RequestNodeName {
@@ -1048,6 +1138,7 @@ func TestTerminalVerdictPersistsEvidenceAndCleanupReleasesNode(t *testing.T) {
 
 	scheme := testScheme(t)
 	run := testRun("run-pass")
+	run.Spec.RuntimeStage = &signalv1.RuntimeStage{Name: "collective-bandwidth"}
 	run.Spec.Backend.Queue = "certification"
 	run.Spec.WorkloadPolicy.KueueTopology = &signalv1.KueueTopologyPolicy{
 		RequiredLevel: corev1.LabelHostname,
@@ -1101,8 +1192,10 @@ func TestTerminalVerdictPersistsEvidenceAndCleanupReleasesNode(t *testing.T) {
 	}
 
 	var evidence struct {
-		Workflow       signalv1.WorkflowStatus `json:"workflow"`
-		WorkloadPolicy signalv1.WorkloadPolicy `json:"workloadPolicy"`
+		Workflow              signalv1.WorkflowStatus `json:"workflow"`
+		WorkloadPolicy        signalv1.WorkloadPolicy `json:"workloadPolicy"`
+		RuntimeStage          *signalv1.RuntimeStage  `json:"runtimeStage"`
+		BackendActiveDeadline metav1.Duration         `json:"backendActiveDeadline"`
 	}
 	if err := json.Unmarshal(store.data, &evidence); err != nil {
 		t.Fatalf("decode evidence: %v", err)
@@ -1115,6 +1208,12 @@ func TestTerminalVerdictPersistsEvidenceAndCleanupReleasesNode(t *testing.T) {
 
 	if !reflect.DeepEqual(evidence.WorkloadPolicy, run.Spec.WorkloadPolicy) {
 		t.Fatalf("evidence workload policy = %#v, want %#v", evidence.WorkloadPolicy, run.Spec.WorkloadPolicy)
+	}
+
+	if !reflect.DeepEqual(evidence.RuntimeStage, run.Spec.RuntimeStage) ||
+		evidence.BackendActiveDeadline != run.Spec.BackendActiveDeadline {
+		t.Fatalf("evidence runtime contract = stage %#v deadline %s",
+			evidence.RuntimeStage, evidence.BackendActiveDeadline.Duration)
 	}
 
 	if !got.Status.Cleanup.ReservationsReleased || !got.Status.Cleanup.SnapshotDeleted {
@@ -1468,15 +1567,16 @@ func testProfile(name, sku string) *signalv1.CertificationProfile {
 				}},
 				RequiredResources: corev1.ResourceList{corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("1")},
 			},
-			Script:       signalv1.ScriptReference{Name: "scripts", Key: "payload.txt"},
-			Workflow:     signalv1.WorkflowReference{Name: "gpu-cert"},
-			Backend:      signalv1.ExecutionBackend{APIVersion: "kubeflow.org/v2beta1", Kind: "MPIJob"},
-			RunnerImage:  "runner@sha256:" + strings.Repeat("a", 64),
-			Purpose:      signalv1.PurposeQuickCertification,
-			StagePlan:    []signalv1.CertificationStage{{ID: "workload", DisplayName: "Workload", Category: "compute", Required: true}},
-			EvidencePath: "signal/" + sku,
-			Deadline:     metav1.Duration{Duration: 10 * time.Minute},
-			MaxAttempts:  2,
+			Script:                signalv1.ScriptReference{Name: "scripts", Key: "payload.txt"},
+			Workflow:              signalv1.WorkflowReference{Name: "gpu-cert"},
+			Backend:               signalv1.ExecutionBackend{APIVersion: "kubeflow.org/v2beta1", Kind: "MPIJob"},
+			RunnerImage:           "runner@sha256:" + strings.Repeat("a", 64),
+			Purpose:               signalv1.PurposeQuickCertification,
+			StagePlan:             []signalv1.CertificationStage{{ID: "workload", DisplayName: "Workload", Category: "compute", Required: true}},
+			EvidencePath:          "signal/" + sku,
+			Deadline:              metav1.Duration{Duration: 10 * time.Minute},
+			BackendActiveDeadline: metav1.Duration{Duration: 9 * time.Minute},
+			MaxAttempts:           2,
 		},
 	}
 }
@@ -1490,16 +1590,17 @@ func testRun(name string) *signalv1.CertificationRun {
 			Finalizers: []string{RunFinalizer},
 		},
 		Spec: signalv1.CertificationRunSpec{
-			Profile:         signalv1.PinnedProfile{Name: "gpu-profile", UID: "profile-uid", Generation: 3},
-			Participants:    []signalv1.Participant{{NodeName: "gpu-0", NodeUID: "gpu-0-uid"}},
-			Script:          signalv1.ScriptSnapshot{ConfigMapName: name + "-scripts", Key: "payload.txt", Digest: digestString("test payload\n")},
-			Workflow:        signalv1.WorkflowReference{Name: "gpu-cert"},
-			Backend:         signalv1.ExecutionBackend{APIVersion: "kubeflow.org/v2beta1", Kind: "MPIJob"},
-			RunnerImage:     "runner@sha256:" + strings.Repeat("a", 64),
-			EvidencePath:    "signal/" + name + ".json",
-			Deadline:        metav1.Duration{Duration: 10 * time.Minute},
-			MaxAttempts:     2,
-			RequestNodeName: "gpu-0",
+			Profile:               signalv1.PinnedProfile{Name: "gpu-profile", UID: "profile-uid", Generation: 3},
+			Participants:          []signalv1.Participant{{NodeName: "gpu-0", NodeUID: "gpu-0-uid"}},
+			Script:                signalv1.ScriptSnapshot{ConfigMapName: name + "-scripts", Key: "payload.txt", Digest: digestString("test payload\n")},
+			Workflow:              signalv1.WorkflowReference{Name: "gpu-cert"},
+			Backend:               signalv1.ExecutionBackend{APIVersion: "kubeflow.org/v2beta1", Kind: "MPIJob"},
+			RunnerImage:           "runner@sha256:" + strings.Repeat("a", 64),
+			EvidencePath:          "signal/" + name + ".json",
+			Deadline:              metav1.Duration{Duration: 10 * time.Minute},
+			BackendActiveDeadline: metav1.Duration{Duration: 9 * time.Minute},
+			MaxAttempts:           2,
+			RequestNodeName:       "gpu-0",
 		},
 	}
 }

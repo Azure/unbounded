@@ -55,29 +55,32 @@ var reservedEnvironmentNames = map[string]struct{}{
 }
 
 type Config struct {
-	Namespace             string
-	WorkflowName          string
-	RunName               string
-	RunUID                types.UID
-	ParticipantsJSON      string
-	ParticipantCount      int
-	RequestNodeName       string
-	LegacyParticipants    string
-	ScriptConfigMap       string
-	ScriptKey             string
-	ScriptDigest          string
-	RunnerImage           string
-	BackendAPIVersion     string
-	BackendKind           string
-	Queue                 string
-	TolerationsJSON       string
-	ScriptEnvironmentJSON string
-	WorkloadPolicyJSON    string
-	GPUResourceCount      string
-	Privileged            bool
-	Attempt               int
-	BackoffLimit          int64
-	TTLSeconds            int64
+	Namespace              string
+	WorkflowName           string
+	RunName                string
+	RunUID                 types.UID
+	ParticipantsJSON       string
+	ParticipantCount       int
+	RequestNodeName        string
+	LegacyParticipants     string
+	ScriptConfigMap        string
+	ScriptKey              string
+	ScriptDigest           string
+	ScriptRequiresStage    bool
+	RuntimeStageName       string
+	RunnerImage            string
+	BackendAPIVersion      string
+	BackendKind            string
+	BackendDeadlineSeconds int64
+	Queue                  string
+	TolerationsJSON        string
+	ScriptEnvironmentJSON  string
+	WorkloadPolicyJSON     string
+	GPUResourceCount       string
+	Privileged             bool
+	Attempt                int
+	BackoffLimit           int64
+	TTLSeconds             int64
 }
 
 type Result struct {
@@ -229,6 +232,19 @@ func ValidateConfig(config Config) ([]signalv1.Participant, []corev1.Toleration,
 		)
 	}
 
+	var runtimeStage *signalv1.RuntimeStage
+	if config.RuntimeStageName != "" {
+		runtimeStage = &signalv1.RuntimeStage{Name: config.RuntimeStageName}
+	}
+
+	if err := signalv1.ValidateRuntimeStage(config.ScriptRequiresStage, runtimeStage); err != nil {
+		return nil, nil, nil, fmt.Errorf("runtime stage: %w", err)
+	}
+
+	if config.BackendDeadlineSeconds <= 0 {
+		return nil, nil, nil, errors.New("backend-active-deadline-seconds must be positive")
+	}
+
 	switch {
 	case config.BackendKind == "Pod" && config.BackendAPIVersion == "v1":
 	case config.BackendKind == "MPIJob" && config.BackendAPIVersion == "kubeflow.org/v2beta1":
@@ -341,7 +357,6 @@ func RenderResources(
 	tolerations []corev1.Toleration,
 	environment []corev1.EnvVar,
 	workflow metav1.OwnerReference,
-	activeDeadlineSeconds int64,
 ) ([]*unstructured.Unstructured, error) {
 	resources := make([]*unstructured.Unstructured, 0, len(participants))
 
@@ -399,7 +414,7 @@ func RenderResources(
 				environment,
 				policy,
 				workflow,
-				activeDeadlineSeconds,
+				config.BackendDeadlineSeconds,
 				gpuCount,
 			)
 		case "MPIJob":
@@ -410,7 +425,7 @@ func RenderResources(
 				environment,
 				policy,
 				workflow,
-				activeDeadlineSeconds,
+				config.BackendDeadlineSeconds,
 				gpuCount,
 			)
 		default:
@@ -703,7 +718,7 @@ func ordinaryPod(
 	environment []corev1.EnvVar,
 	policy signalv1.WorkloadPolicy,
 	workflow metav1.OwnerReference,
-	activeDeadlineSeconds int64,
+	backendDeadlineSeconds int64,
 	gpuCount int64,
 ) *corev1.Pod {
 	labels := resourceLabels(config, participant)
@@ -711,7 +726,7 @@ func ordinaryPod(
 		labels = withLabel(labels, "kueue.x-k8s.io/queue-name", config.Queue)
 	}
 
-	env := workloadEnvironment(config, participant, environment)
+	env := workloadEnvironment(config, participant, environment, true)
 	container := workloadContainer(
 		config,
 		policy,
@@ -737,7 +752,7 @@ func ordinaryPod(
 			RestartPolicy:                corev1.RestartPolicyNever,
 			NodeSelector:                 map[string]string{corev1.LabelHostname: participant.NodeName},
 			Tolerations:                  tolerations,
-			ActiveDeadlineSeconds:        &activeDeadlineSeconds,
+			ActiveDeadlineSeconds:        &backendDeadlineSeconds,
 			AutomountServiceAccountToken: ptr(false),
 			Containers:                   []corev1.Container{container},
 			Volumes:                      workloadVolumes(config.ScriptConfigMap, policy),
@@ -755,13 +770,13 @@ func mpiJob(
 	environment []corev1.EnvVar,
 	policy signalv1.WorkloadPolicy,
 	workflow metav1.OwnerReference,
-	activeDeadlineSeconds int64,
+	backendDeadlineSeconds int64,
 	gpuCount int64,
 ) *unstructured.Unstructured {
 	labels := resourceLabels(config, participant)
 	jobName := resourceName(config.RunName, participant.Index)
-	launcherEnv := workloadEnvironment(config, participant, environment)
-	workerEnv := workloadEnvironment(config, participant, environment)
+	launcherEnv := workloadEnvironment(config, participant, environment, false)
+	workerEnv := workloadEnvironment(config, participant, environment, true)
 	worker := workloadContainer(
 		config,
 		policy,
@@ -789,7 +804,7 @@ func mpiJob(
 			"runLauncherAsWorker":    false,
 			"slotsPerWorker":         gpuCount,
 			"runPolicy": map[string]any{
-				"activeDeadlineSeconds":   activeDeadlineSeconds,
+				"activeDeadlineSeconds":   backendDeadlineSeconds,
 				"backoffLimit":            config.BackoffLimit,
 				"cleanPodPolicy":          "All",
 				"ttlSecondsAfterFinished": config.TTLSeconds,
@@ -887,10 +902,11 @@ func workloadEnvironment(
 	config Config,
 	participant signalv1.Participant,
 	environment []corev1.EnvVar,
+	includeRuntimeStage bool,
 ) []corev1.EnvVar {
 	result := slices.Clone(environment)
 
-	return append(
+	result = append(
 		result,
 		corev1.EnvVar{Name: "PROJECT_SIGNAL_RUN_NAME", Value: config.RunName},
 		corev1.EnvVar{Name: "PROJECT_SIGNAL_RUN_UID", Value: string(config.RunUID)},
@@ -902,6 +918,15 @@ func workloadEnvironment(
 		corev1.EnvVar{Name: "PROJECT_SIGNAL_ATTEMPT", Value: strconv.Itoa(config.Attempt)},
 		corev1.EnvVar{Name: "PROJECT_SIGNAL_RESULTS_DIR", Value: "/results"},
 	)
+
+	if includeRuntimeStage && config.RuntimeStageName != "" {
+		result = append(result, corev1.EnvVar{
+			Name:  "PROJECT_SIGNAL_STAGE_NAME",
+			Value: config.RuntimeStageName,
+		})
+	}
+
+	return result
 }
 
 func resultVolumes(scriptConfigMap string) []corev1.Volume {

@@ -69,8 +69,11 @@ The referenced WorkflowTemplate must accept these string parameters:
 | `script-configmap` | Immutable run-owned ConfigMap |
 | `script-key` | Selected ConfigMap key |
 | `script-digest` | Algorithm-qualified SHA-256 of the selected script bytes (`sha256:<64 lowercase hex>`) |
+| `script-requires-runtime-stage` | Whether the selected script requires a runtime stage |
+| `runtime-stage-name` | Optional validated runtime stage name |
 | `backend-api-version` | Backend API version from the profile |
 | `backend-kind` | Backend kind from the profile |
+| `backend-active-deadline-seconds` | Participant backend deadline, shorter than the outer Workflow deadline |
 | `queue` | Optional backend queue |
 | `runner-image` | Digest-pinned execution image |
 | `tolerations` | JSON-encoded toleration list |
@@ -234,6 +237,26 @@ admission and operator policy still decide whether a capability, host path,
 device, PVC, or privileged context is allowed; technical rendering is not
 authorization.
 
+Stage-aware scripts declare `spec.script.requiresRuntimeStage: true` and require
+an explicit `spec.runtimeStage.name`. The name is a lowercase DNS label of at
+most 63 characters and is snapshotted into the immutable CertificationRun and
+evidence. The adapter exports it as `PROJECT_SIGNAL_STAGE_NAME` only to ordinary
+participant Pods and MPIJob workers. MPI launchers never receive it. Scripts
+that are not stage-aware leave both fields unset.
+
+Every profile sets two distinct deadlines:
+
+```yaml
+deadline: 20m
+backendActiveDeadline: 19m
+```
+
+`deadline` is the outer Workflow deadline for backend observation, result and
+evidence projection, and cleanup. `backendActiveDeadline` is rendered to the
+participant Pod or MPIJob `activeDeadlineSeconds`. It must be positive and
+leave at least 60 seconds before the outer deadline; the controller rejects an
+invalid ordering before reserving Nodes.
+
 `kueueTopology.requiredLevel` is an explicit Kueue Topology Aware Scheduling
 request. It must be a valid Kubernetes label key and requires a nonempty backend
 queue. The adapter writes
@@ -264,10 +287,11 @@ defaults.
 
 A `CertificationProfile` and `CertificationRun` each select one immutable
 script key and one backend. `purpose: FullCertification` and `stagePlan`
-describe evidence; they do not execute a multi-key suite. Operators that define
-a full suite must create one run per script and admit the next run only after
-the previous run is terminal and its backend cleanup has completed. The
-upstream controller does not synthesize a cross-run verdict.
+describe evidence and are distinct from the optional runtime stage passed to a
+single script; they do not execute a multi-key suite. Operators that define a
+full suite must create one run per script and admit the next run only after the
+previous run is terminal and its backend cleanup has completed. The upstream
+controller does not synthesize a cross-run verdict.
 
 ## Results and evidence
 

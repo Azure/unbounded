@@ -63,6 +63,8 @@ spec:
                 - apiVersion
                 - kind
                 type: object
+              backendActiveDeadline:
+                type: string
               deadline:
                 type: string
               evidencePath:
@@ -201,12 +203,24 @@ spec:
                 type: object
               runnerImage:
                 type: string
+              runtimeStage:
+                properties:
+                  name:
+                    maxLength: 63
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    type: string
+                required:
+                - name
+                type: object
               script:
                 properties:
                   key:
                     type: string
                   name:
                     type: string
+                  requiresRuntimeStage:
+                    type: boolean
                 required:
                 - key
                 - name
@@ -688,6 +702,7 @@ spec:
                 type: object
             required:
             - backend
+            - backendActiveDeadline
             - deadline
             - evidencePath
             - participants
@@ -695,6 +710,17 @@ spec:
             - script
             - workflow
             type: object
+            x-kubernetes-validations:
+            - message: backendActiveDeadline must be positive
+              rule: duration(self.backendActiveDeadline) > duration('0s')
+            - message: backendActiveDeadline must leave at least 60 seconds before
+                deadline
+              rule: duration(self.deadline) - duration(self.backendActiveDeadline)
+                >= duration('60s')
+            - message: runtimeStage is required when the script requires a runtime
+                stage
+              rule: '!has(self.script.requiresRuntimeStage) || !self.script.requiresRuntimeStage
+                || has(self.runtimeStage)'
           status:
             properties:
               conditions:

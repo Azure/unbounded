@@ -225,6 +225,15 @@ func (r *AdmissionReconciler) admitNodeWithTriggerLocked(
 		return fmt.Errorf("profile %s stage plan: %w", profile.Name, err)
 	}
 
+	if err := signalv1.ValidateRuntimeContract(
+		profile.Spec.Script.RequiresRuntimeStage,
+		profile.Spec.RuntimeStage,
+		profile.Spec.BackendActiveDeadline.Duration,
+		profile.Spec.Deadline.Duration,
+	); err != nil {
+		return fmt.Errorf("profile %s runtime contract: %w", profile.Name, err)
+	}
+
 	if !runnerImageDigestPattern.MatchString(profile.Spec.RunnerImage) {
 		return fmt.Errorf("profile %s runner image must use an immutable sha256 digest", profile.Name)
 	}
@@ -314,20 +323,27 @@ func (r *AdmissionReconciler) admitNodeWithTriggerLocked(
 				UID:        profile.UID,
 				Generation: profile.Generation,
 			},
-			Participants:    participants,
-			Script:          signalv1.ScriptSnapshot{ConfigMapName: snapshot.Name, Key: profile.Spec.Script.Key, Digest: scriptDigest},
-			Workflow:        profile.Spec.Workflow,
-			Backend:         profile.Spec.Backend,
-			RunnerImage:     profile.Spec.RunnerImage,
-			WorkloadPolicy:  *profile.Spec.WorkloadPolicy.DeepCopy(),
-			Purpose:         profile.Spec.Purpose,
-			StagePlan:       append([]signalv1.CertificationStage(nil), profile.Spec.StagePlan...),
-			Parameters:      parameters,
-			EvidencePath:    strings.Trim(profile.Spec.EvidencePath, "/") + "/" + runName + ".json",
-			Deadline:        profile.Spec.Deadline,
-			MaxAttempts:     maxAttempts,
-			Tolerations:     profile.Spec.Tolerations,
-			RequestNodeName: node.Name,
+			Participants: participants,
+			Script: signalv1.ScriptSnapshot{
+				ConfigMapName:        snapshot.Name,
+				Key:                  profile.Spec.Script.Key,
+				RequiresRuntimeStage: profile.Spec.Script.RequiresRuntimeStage,
+				Digest:               scriptDigest,
+			},
+			Workflow:              profile.Spec.Workflow,
+			Backend:               profile.Spec.Backend,
+			RunnerImage:           profile.Spec.RunnerImage,
+			WorkloadPolicy:        *profile.Spec.WorkloadPolicy.DeepCopy(),
+			Purpose:               profile.Spec.Purpose,
+			StagePlan:             append([]signalv1.CertificationStage(nil), profile.Spec.StagePlan...),
+			RuntimeStage:          copyRuntimeStage(profile.Spec.RuntimeStage),
+			Parameters:            parameters,
+			EvidencePath:          strings.Trim(profile.Spec.EvidencePath, "/") + "/" + runName + ".json",
+			Deadline:              profile.Spec.Deadline,
+			BackendActiveDeadline: profile.Spec.BackendActiveDeadline,
+			MaxAttempts:           maxAttempts,
+			Tolerations:           profile.Spec.Tolerations,
+			RequestNodeName:       node.Name,
 		},
 	}
 
@@ -845,8 +861,14 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 					map[string]any{"name": "script-configmap", "value": run.Spec.Script.ConfigMapName},
 					map[string]any{"name": "script-key", "value": run.Spec.Script.Key},
 					map[string]any{"name": "script-digest", "value": run.Spec.Script.Digest},
+					map[string]any{"name": "script-requires-runtime-stage", "value": fmt.Sprintf("%t", run.Spec.Script.RequiresRuntimeStage)},
+					map[string]any{"name": "runtime-stage-name", "value": runtimeStageName(run.Spec.RuntimeStage)},
 					map[string]any{"name": "backend-api-version", "value": run.Spec.Backend.APIVersion},
 					map[string]any{"name": "backend-kind", "value": run.Spec.Backend.Kind},
+					map[string]any{
+						"name":  "backend-active-deadline-seconds",
+						"value": fmt.Sprintf("%d", int64(run.Spec.BackendActiveDeadline.Seconds())),
+					},
 					map[string]any{"name": "queue", "value": run.Spec.Backend.Queue},
 					map[string]any{"name": "runner-image", "value": run.Spec.RunnerImage},
 					map[string]any{"name": "tolerations", "value": string(tolerationsJSON)},
@@ -1070,26 +1092,28 @@ func (r *RunReconciler) evidenceDocument(
 	}
 
 	doc := map[string]any{
-		"apiVersion":      "signal.unbounded-cloud.io/evidence/v1alpha1",
-		"runID":           string(run.UID),
-		"runName":         run.Name,
-		"profile":         run.Spec.Profile,
-		"participants":    run.Spec.Participants,
-		"workflow":        run.Status.Workflow,
-		"workflowOutputs": run.Status.Workflow.Outputs,
-		"backend":         run.Spec.Backend,
-		"runnerImage":     run.Spec.RunnerImage,
-		"workloadPolicy":  run.Spec.WorkloadPolicy,
-		"purpose":         run.Spec.Purpose,
-		"stagePlan":       run.Spec.StagePlan,
-		"parameters":      run.Spec.Parameters,
-		"scriptSnapshot":  run.Spec.Script,
-		"scriptContent":   snapshot.Data[run.Spec.Script.Key],
-		"executionState":  executionState,
-		"verdict":         verdict,
-		"reason":          reason,
-		"startedAt":       run.Status.StartedAt,
-		"finishedAt":      run.Status.FinishedAt.UTC().Format(time.RFC3339Nano),
+		"apiVersion":            "signal.unbounded-cloud.io/evidence/v1alpha1",
+		"runID":                 string(run.UID),
+		"runName":               run.Name,
+		"profile":               run.Spec.Profile,
+		"participants":          run.Spec.Participants,
+		"workflow":              run.Status.Workflow,
+		"workflowOutputs":       run.Status.Workflow.Outputs,
+		"backend":               run.Spec.Backend,
+		"runnerImage":           run.Spec.RunnerImage,
+		"workloadPolicy":        run.Spec.WorkloadPolicy,
+		"purpose":               run.Spec.Purpose,
+		"stagePlan":             run.Spec.StagePlan,
+		"runtimeStage":          run.Spec.RuntimeStage,
+		"backendActiveDeadline": run.Spec.BackendActiveDeadline,
+		"parameters":            run.Spec.Parameters,
+		"scriptSnapshot":        run.Spec.Script,
+		"scriptContent":         snapshot.Data[run.Spec.Script.Key],
+		"executionState":        executionState,
+		"verdict":               verdict,
+		"reason":                reason,
+		"startedAt":             run.Status.StartedAt,
+		"finishedAt":            run.Status.FinishedAt.UTC().Format(time.RFC3339Nano),
 	}
 
 	return json.MarshalIndent(doc, "", "  ")
@@ -1589,6 +1613,22 @@ func validateStagePlan(plan []signalv1.CertificationStage) error {
 	}
 
 	return nil
+}
+
+func copyRuntimeStage(stage *signalv1.RuntimeStage) *signalv1.RuntimeStage {
+	if stage == nil {
+		return nil
+	}
+
+	return &signalv1.RuntimeStage{Name: stage.Name}
+}
+
+func runtimeStageName(stage *signalv1.RuntimeStage) string {
+	if stage == nil {
+		return ""
+	}
+
+	return stage.Name
 }
 
 func AddToScheme(scheme *runtime.Scheme) error {
