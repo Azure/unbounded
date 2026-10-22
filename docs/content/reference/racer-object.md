@@ -44,7 +44,7 @@ from source with `make racer-object` (binary at `bin/racer-object`) or
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--cache` | `racer-object` | Racer ClusterCache name. Must match the socket mount paths. |
+| `--cache` | none, required | Racer ClusterCache name. Must match the socket mount paths. |
 | `--debug-listen` | empty | Optional pprof and `/healthz` address. Unauthenticated and unencrypted. Restrict access. |
 | `--version` | | Print version and exit. |
 
@@ -269,8 +269,9 @@ spec:
         app: racer-object-example
         racer.unbounded-cloud.io/object-sidecar: enabled
       annotations:
+        # Required: the ClusterCache to bind to.
+        racer.unbounded-cloud.io/object-cache: racer-object
         # Optional:
-        # racer.unbounded-cloud.io/object-cache: racer-object
         # racer.unbounded-cloud.io/object-api: azure
         # racer.unbounded-cloud.io/object-memory-limit: 256Mi
     spec:
@@ -284,7 +285,7 @@ Annotations, all with the prefix `racer.unbounded-cloud.io/`:
 
 | Annotation | Default | Meaning |
 |------------|---------|---------|
-| `object-cache` | `racer-object` | Sets `--cache` and the socket mount path. |
+| `object-cache` | none, required | ClusterCache name. Sets `--cache` and the socket mount path. |
 | `object-api` | flag default (`s3`) | Sets `--api`. `s3` or `azure`. |
 | `object-listen` | flag default (`127.0.0.1:8080`) | Sets `--listen`. Loopback IP literal and port. |
 | `object-cpu-request` | not set | Sidecar CPU request. |
@@ -292,8 +293,9 @@ Annotations, all with the prefix `racer.unbounded-cloud.io/`:
 | `object-memory-request` | not set | Sidecar memory request. |
 | `object-memory-limit` | not set | Sidecar memory limit. |
 
-An annotation that is present with an empty value is rejected. Values are checked
-with the same rules as the flags. The pod can read the whole bucket of its
+There is no default cache. The webhook denies an opted-in pod without
+`object-cache`. An annotation that is present with an empty value is rejected.
+Values are checked with the same rules as the flags. The pod can read the whole bucket of its
 ClusterCache. A pod that reads two buckets needs two ClusterCaches and two
 sidecars.
 
