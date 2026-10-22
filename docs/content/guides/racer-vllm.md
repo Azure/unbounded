@@ -62,19 +62,26 @@ spec:
     - name: vllm
       image: <your vLLM image with racer-vllm installed>
       command:
-        - vllm
-        - serve
-        - racer://models/llama/Llama-3.1-8B-Instruct
-        - --load-format
-        - racer
+        - sh
+        - -c
+        - |
+          racer-vllm-fetch racer://models/llama/Llama-3.1-8B-Instruct /models/llama &&
+          exec vllm serve /models/llama --load-format racer
+      volumeMounts:
+        - name: model-config
+          mountPath: /models
       resources:
         limits:
           nvidia.com/gpu: 1
+  volumes:
+    - name: model-config
+      emptyDir: {}
 ```
 
 The webhook mounts `/run/racer/models/client` read-only into the container and
 sets `RACER_SOCKET` to the socket in it. To limit the mount to some containers,
-add `racer.unbounded-cloud.io/client-containers: vllm`.
+add `racer.unbounded-cloud.io/client-containers: vllm`. The webhook does not
+change init containers, so run `racer-vllm-fetch` in the vLLM container.
 
 ## 3. Install racer-vllm
 
@@ -89,10 +96,17 @@ point. No other code change is needed.
 
 ## 4. Run
 
-Pass `--load-format racer` and a model path of the form
-`racer://<cache>/<bucket>/<prefix>`. The prefix is the directory that holds
-`model.safetensors.index.json` and the safetensors files. See the `racer-vllm`
-README for how it finds the model config and tokenizer.
+vLLM reads the model config and tokenizer before it loads weights, so loading
+takes two steps:
+
+1. `racer-vllm-fetch racer://<cache>/<bucket>/<prefix> <dir>` copies
+   `config.json`, the tokenizer files, and the safetensors index into `<dir>`.
+   It also writes `racer-model.json`, which records the `racer://` location.
+   The prefix is the directory that holds `model.safetensors.index.json` and
+   the safetensors files.
+2. `vllm serve <dir> --load-format racer` reads the weights through Racer.
+
+See the `racer-vllm` README for loader options such as `staging_bytes`.
 
 The first load fills the cache from the origin. Later loads on any node read
 from the cache.
