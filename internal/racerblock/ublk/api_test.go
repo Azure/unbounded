@@ -38,6 +38,23 @@ func largeDeviceIDs() []int {
 	return ids
 }
 
+// TestValidateDeviceIDKernelBound pins the kernel limit with literals so the
+// test does not depend on MaxDeviceID itself: the kernel rejects
+// id >= UBLK_MAX_UBLKS (1<<20).
+func TestValidateDeviceIDKernelBound(t *testing.T) {
+	if err := validateDeviceID(1<<20 - 1); err != nil {
+		t.Errorf("validateDeviceID(1<<20-1) = %v, want nil", err)
+	}
+
+	if err := validateDeviceID(1 << 20); err == nil {
+		t.Error("validateDeviceID(1<<20) = nil, want error")
+	}
+
+	if err := (Config{ID: 1 << 20, Size: 512}).Validate(); err == nil {
+		t.Error("Config{ID: 1<<20}.Validate() = nil, want error")
+	}
+}
+
 func TestValidateDeviceID(t *testing.T) {
 	for _, id := range []int{0, 1, MaxDeviceID} {
 		if err := validateDeviceID(id); err != nil {

@@ -21,7 +21,9 @@ const (
 	MaxQueues = 4096
 
 	// MaxDeviceID is the largest device ID that Start and Delete accept.
-	MaxDeviceID = 1 << 20
+	// The kernel rejects IDs at or above UBLK_MAX_UBLKS, which is
+	// 1<<MINORBITS (1<<20), so the largest valid ID is one less.
+	MaxDeviceID = 1<<20 - 1
 
 	// DefaultDepth is the per-queue depth used when Config.Depth is 0.
 	DefaultDepth = 128
