@@ -128,23 +128,6 @@ pub(crate) struct LinkId(pub u64);
 
 impl LinkId {
     /// First 8 bytes (big-endian) of
-    /// `SHA-256(domain || min(setups) || max(setups))`; symmetric in its arguments.
-    ///
-    /// Unused: the responder must name the link id before its QP endpoint
-    /// exists, so links use [`Self::for_setup`] (see the design's "Deviations").
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn derive(a: &[u8], b: &[u8]) -> Self {
-        let (low, high) = if a <= b { (a, b) } else { (b, a) };
-        let mut hash = Sha256::new();
-        hash.update(LINK_ID_DOMAIN);
-        hash.update(low);
-        hash.update(high);
-        Self(u64::from_be_bytes(hash.finalize()[..8].try_into().unwrap()))
-    }
-}
-
-impl LinkId {
-    /// First 8 bytes (big-endian) of
     /// `SHA-256(domain || initiator setup || responder nonce)`.
     ///
     /// The responder picks its nonce before it creates its QP, so both sides
@@ -264,23 +247,6 @@ mod tests {
             assert!(Setup::decode(&over.encode(), RailId(0)).is_err());
             assert!(Setup::new(RailId(0), [2; 32], 8, grants).is_err());
         }
-    }
-
-    #[test]
-    fn link_id_is_symmetric_and_input_sensitive() {
-        let a = setup(1, 1).encode();
-        let b = setup(1, 2).encode();
-        let c = setup(1, 3).encode();
-        assert_eq!(LinkId::derive(&a, &b), LinkId::derive(&b, &a));
-        assert_ne!(LinkId::derive(&a, &b), LinkId::derive(&a, &c));
-        assert_eq!(LinkId::derive(&a, &a), LinkId::derive(&a, &a));
-        // Known value guards the domain separator and ordering.
-        let mut hash = Sha256::new();
-        hash.update(b"racer-rdma-session-v2\0");
-        hash.update(&a);
-        hash.update(&b);
-        let expected = u64::from_be_bytes(hash.finalize()[..8].try_into().unwrap());
-        assert_eq!(LinkId::derive(&b, &a), LinkId(expected));
     }
 
     #[test]
