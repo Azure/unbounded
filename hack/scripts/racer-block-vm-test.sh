@@ -215,12 +215,15 @@ kernel_release() {
 	esac
 }
 
-# check_family VERSION fails unless VERSION is a GUEST_KERNEL generic kernel.
+# check_family VERSION fails unless VERSION is in the GUEST_KERNEL family:
+# exactly GUEST_KERNEL, or GUEST_KERNEL followed by ".", "-", or "+". Any
+# flavor suffix is allowed so local overrides such as 6.8.0-1017-azure work.
+# Downloads separately require an Ubuntu "-generic" image.
 check_family() {
 	case "$1" in
-	"$GUEST_KERNEL".*-generic) ;;
+	"$GUEST_KERNEL" | "$GUEST_KERNEL".* | "$GUEST_KERNEL"-* | "$GUEST_KERNEL"+*) ;;
 	*)
-		log "error: expected an Ubuntu $GUEST_KERNEL generic kernel, got '$1'"
+		log "error: expected a Linux $GUEST_KERNEL kernel, got '$1'"
 		return 1
 		;;
 	esac
@@ -592,27 +595,36 @@ self_test() {
 			rc=1
 		fi
 	done
-	if ! (GUEST_KERNEL=6.8 check_family 6.8.0-147-generic) 2>/dev/null ||
-		! (GUEST_KERNEL=7.0 check_family 7.0.0-14-generic) 2>/dev/null; then
-		log "self-test check_family: matching kernel rejected"
-		rc=1
-	fi
-	for got in 7.0.0-14-generic 6.8.0-147-azure 6.80.0-1-generic ""; do
+	for got in 6.8.0-147-generic 6.8.0-1017-azure 6.8.12 6.8.0 6.8 6.8-rc1 6.8.0+custom; do
+		if ! (GUEST_KERNEL=6.8 check_family "$got") 2>/dev/null; then
+			log "self-test check_family: '$got' rejected for 6.8"
+			rc=1
+		fi
+	done
+	for got in 7.0.0-38-generic 7.0.0-1003-azure 7.0.1; do
+		if ! (GUEST_KERNEL=7.0 check_family "$got") 2>/dev/null; then
+			log "self-test check_family: '$got' rejected for 7.0"
+			rc=1
+		fi
+	done
+	for got in 7.0.0-14-generic 6.80.0-1-generic 6.81 6.8foo 6.9.0-1-generic 16.8.0 v6.8.0 ""; do
 		if (GUEST_KERNEL=6.8 check_family "$got") 2>/dev/null; then
 			log "self-test check_family: '$got' accepted for 6.8"
 			rc=1
 		fi
 	done
-	if (GUEST_KERNEL=7.0 check_family 6.8.0-147-generic) 2>/dev/null; then
-		log "self-test check_family: 6.8 accepted for 7.0"
-		rc=1
-	fi
+	for got in 6.8.0-147-generic 7.00.1 7.01-generic 7.1.0-1-generic; do
+		if (GUEST_KERNEL=7.0 check_family "$got") 2>/dev/null; then
+			log "self-test check_family: '$got' accepted for 7.0"
+			rc=1
+		fi
+	done
 	# Overrides must match GUEST_KERNEL and are rejected before booting.
 	: >"$dir/vmlinuz"
 	mkdir -p "$dir/mods"
 	got="$( (GUEST_KERNEL=6.8 KERNEL_IMAGE="$dir/vmlinuz" KERNEL_MODULES="$dir/mods" \
 		KERNEL_VERSION=7.0.0-14-generic WORK_DIR="$dir/ovr" QEMU=true main run) 2>&1 || true)"
-	if ! grep -q 'expected an Ubuntu 6.8 generic kernel' <<<"$got"; then
+	if ! grep -q 'expected a Linux 6.8 kernel' <<<"$got"; then
 		log "self-test override: wrong family accepted"
 		rc=1
 	fi
@@ -633,6 +645,15 @@ self_test() {
 	}
 	if printf '%s\n' linux-image-7.0.0-38-generic | kernel_packages 7.0.0-38-generic >/dev/null 2>&1; then
 		log "self-test kernel_packages: missing modules accepted"
+		rc=1
+	fi
+
+	# A same-family custom override passes the family check. It then stops at
+	# the missing test binaries, before any VM boots.
+	got="$( (GUEST_KERNEL=6.8 KERNEL_IMAGE="$dir/vmlinuz" KERNEL_MODULES="$dir/mods" \
+		KERNEL_VERSION=6.8.0-1017-azure WORK_DIR="$dir/ovr" TEST_BIN_DIR="$dir/none" QEMU=true main run) 2>&1 || true)"
+	if grep -q 'expected a Linux' <<<"$got" || ! grep -q 'kernel module ublk_drv not found\|test binary' <<<"$got"; then
+		log "self-test override: same-family azure kernel not accepted: $got"
 		rc=1
 	fi
 
