@@ -5,12 +5,14 @@
 from __future__ import annotations
 
 import array
+import fcntl
 import os
 import socket
 import stat
 import threading
 from dataclasses import dataclass, field
 
+import racer
 from racer import _wire as wire
 
 
@@ -102,6 +104,8 @@ class FakeRacer:
 
     def _error(self, conn, status, size=None):
         h = [("Content-Length", "0")]
+        if status == 405:
+            h.append(("Allow", "HEAD, POST"))
         if status == 416:
             h.append(("Content-Range", f"bytes */{size}"))
         self._send(conn, status, h)
@@ -138,8 +142,22 @@ class FakeRacer:
         key, _, mode = tail.partition("/")
         if mode and (self.old or mode not in ("host-read", "gpu-read")):
             return self._error(conn, 400)
+        # Order follows the dataplane: RequestParser::parse
+        # (object-wire/src/client.rs), then direct::open_sink and
+        # HostSink::open (src/client/direct.rs), then the object read.
         if mode and method != "POST":
             return self._error(conn, 405)
+        if mode:
+            if headers.get("content-length") != "0":
+                return self._error(conn, 400)
+            try:
+                off = wire.decimal(headers.get("racer-destination-offset"))
+                length = wire.decimal(headers.get("racer-destination-length"))
+                alloc = wire.decimal(headers.get("racer-allocation-size")) if mode == "gpu-read" else None
+            except racer.RacerError:
+                return self._error(conn, 400)
+            if length == 0 or off + length > wire.MAX_WIRE_INTEGER or (alloc is not None and off + length > alloc):
+                return self._error(conn, 400)
         if fds and not mode:
             return self._error(conn, 400)
         if mode and len(fds) != 1:
@@ -148,8 +166,10 @@ class FakeRacer:
             return self._error(conn, self.gpu_status)
         if mode == "host-read" and self.host_status:
             return self._error(conn, self.host_status)
-        if mode == "host-read" and seen.fd_kind != "regular":
-            return self._error(conn, 400)
+        if mode == "host-read":
+            flags = fcntl.fcntl(fds[0], fcntl.F_GETFL)
+            if seen.fd_kind != "regular" or flags & os.O_ACCMODE == os.O_RDONLY or flags & os.O_APPEND:
+                return self._error(conn, 400)
         obj = self.objects.get(key)
         if obj is None:
             return self._error(conn, 404)
@@ -182,11 +202,7 @@ class FakeRacer:
             ("Connection", "close"),
         ]
         if mode:
-            off = int(headers["racer-destination-offset"])
-            length = int(headers["racer-destination-length"])
             if length < end - first:
-                return self._error(conn, 400)
-            if mode == "gpu-read" and off + length > int(headers["racer-allocation-size"]):
                 return self._error(conn, 400)
             self._send(
                 conn,
