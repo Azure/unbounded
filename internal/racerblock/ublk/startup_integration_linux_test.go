@@ -34,9 +34,10 @@ func ublkNodes(t *testing.T) []string {
 	return m
 }
 
-// startBounded runs Start in the background and fails the test if it
-// does not return within startupTimeout.
-func startBounded(t *testing.T) (*Device, error) {
+// startBounded runs Start with the given number of queues in the
+// background and fails the test if it does not return within
+// startupTimeout.
+func startBounded(t *testing.T, queues int) (*Device, error) {
 	t.Helper()
 
 	type result struct {
@@ -47,7 +48,7 @@ func startBounded(t *testing.T) (*Device, error) {
 	res := make(chan result, 1)
 
 	go func() {
-		d, err := Start(context.Background(), Config{ID: -1, Size: 1 << 20, Queues: 2, Depth: 4}, newPatternHandler(1<<20))
+		d, err := Start(context.Background(), Config{ID: -1, Size: 1 << 20, Queues: queues, Depth: 4}, newPatternHandler(1<<20))
 		res <- result{d, err}
 	}()
 
@@ -189,7 +190,7 @@ func TestIntegrationStartupFetchRejected(t *testing.T) {
 		t.Error("reached START_DEV with a rejected FETCH_REQ")
 	})
 
-	d, err := startBounded(t)
+	d, err := startBounded(t, 2)
 	if err == nil {
 		_ = d.Close()
 
@@ -228,7 +229,7 @@ func TestIntegrationStartupQueueFailsBeforeStartDev(t *testing.T) {
 
 	closes := recordRingCloses(t)
 
-	d, err := startBounded(t)
+	d, err := startBounded(t, 2)
 	if err == nil {
 		_ = d.Close()
 
@@ -245,7 +246,8 @@ func TestIntegrationStartupQueueFailsBeforeStartDev(t *testing.T) {
 
 // TestIntegrationStartupQueueFailsAtStartDev fails a ready queue after
 // the last startup check, just before START_DEV is sent, so START_DEV
-// runs with a failed queue. The queue must answer I/O, including a
+// runs with a failed queue. The device has a single queue so all
+// startup I/O, including a partition scan, reaches the failed one. The queue must answer I/O, including a
 // partition scan, until START_DEV returns, close its ring only after
 // that, and Start must return the recorded error.
 func TestIntegrationStartupQueueFailsAtStartDev(t *testing.T) {
@@ -263,7 +265,7 @@ func TestIntegrationStartupQueueFailsAtStartDev(t *testing.T) {
 
 	closes := recordRingCloses(t)
 
-	d, err := startBounded(t)
+	d, err := startBounded(t, 1)
 	if err == nil {
 		_ = d.Close()
 
@@ -274,7 +276,9 @@ func TestIntegrationStartupQueueFailsAtStartDev(t *testing.T) {
 		t.Fatalf("Start = %v, want %v", err, boom)
 	}
 
-	checkClosedSafely(t, closes(), holdResolved)
+	got := closes()
+	checkClosedSafely(t, got, holdResolved)
+	t.Logf("failed queue released its ring because: %v", got)
 	checkNoLeak(t, before)
 }
 
@@ -282,9 +286,11 @@ func TestIntegrationStartupQueueFailsAtStartDev(t *testing.T) {
 // before START_DEV and makes its EIO loop fail on entry, so the queue
 // takes the broken-ring path: it cannot answer I/O and must hold its
 // ring until startup resolves or GET_DEV_INFO and sysfs show the disk
-// published. On Linux 6.8 the synchronous partition scan inside
-// START_DEV can only finish once that probe lets the queue close its
-// ring, so Start returning at all proves the probe works there.
+// published. The device has a single queue, so no healthy queue can
+// serve the partition scan instead. On Linux 6.8 the scan runs inside
+// START_DEV and can only finish once that probe lets the queue close
+// its ring, so Start returning at all proves the probe works there.
+// Linux 7.0 scans asynchronously, so either reason is acceptable.
 func TestIntegrationStartupBrokenRingAtStartDev(t *testing.T) {
 	requireFaultVM(t)
 
@@ -302,7 +308,7 @@ func TestIntegrationStartupBrokenRingAtStartDev(t *testing.T) {
 
 	closes := recordRingCloses(t)
 
-	d, err := startBounded(t)
+	d, err := startBounded(t, 1)
 	if err == nil {
 		_ = d.Close()
 
