@@ -11,8 +11,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -80,6 +82,8 @@ var workflowOutputLimits = map[string]int{
 	"reason":            4 * 1024,
 	"verdict":           32,
 }
+
+const groupedCheckCount = 15
 
 var workflowGVK = schema.GroupVersionKind{
 	Group:   "argoproj.io",
@@ -223,33 +227,41 @@ func (r *AdmissionReconciler) admitNodeWithTriggerLocked(
 		return fmt.Errorf("get CertificationProfile %s: %w", profileName, err)
 	}
 
-	if err := validateStagePlan(profile.Spec.StagePlan); err != nil {
-		return fmt.Errorf("profile %s stage plan: %w", profile.Name, err)
+	checks := profileChecks(&profile)
+	if err := validateCheckPlan(checks, len(profile.Spec.Checks) == groupedCheckCount); err != nil {
+		return fmt.Errorf("profile %s checks: %w", profile.Name, err)
 	}
 
-	if err := signalv1.ValidateRuntimeContract(
-		profile.Spec.Script.RequiresRuntimeStage,
-		profile.Spec.RuntimeStage,
-		profile.Spec.BackendActiveDeadline.Duration,
-		profile.Spec.Deadline.Duration,
-	); err != nil {
-		return fmt.Errorf("profile %s runtime contract: %w", profile.Name, err)
+	if err := validateParticipantConstraints(&profile, checks); err != nil {
+		return fmt.Errorf("profile %s participant constraints: %w", profile.Name, err)
 	}
 
-	if !runnerImageDigestPattern.MatchString(profile.Spec.RunnerImage) {
-		return fmt.Errorf("profile %s runner image must use an immutable sha256 digest", profile.Name)
-	}
+	for index := range checks {
+		check := &checks[index]
+		if err := signalv1.ValidateRuntimeContract(
+			check.Script.RequiresRuntimeStage,
+			check.RuntimeStage,
+			check.BackendActiveDeadline.Duration,
+			profile.Spec.Deadline.Duration,
+		); err != nil {
+			return fmt.Errorf("profile %s check %s runtime contract: %w", profile.Name, check.ID, err)
+		}
 
-	if _, err := scriptEnvironment(profile.Spec.Parameters); err != nil {
-		return fmt.Errorf("profile %s parameters: %w", profile.Name, err)
-	}
+		if !runnerImageDigestPattern.MatchString(check.RunnerImage) {
+			return fmt.Errorf("profile %s check %s runner image must use an immutable sha256 digest", profile.Name, check.ID)
+		}
 
-	if err := signalworkload.Validate(profile.Spec.WorkloadPolicy); err != nil {
-		return fmt.Errorf("profile %s workload policy: %w", profile.Name, err)
-	}
+		if _, err := scriptEnvironment(check.Parameters); err != nil {
+			return fmt.Errorf("profile %s check %s parameters: %w", profile.Name, check.ID, err)
+		}
 
-	if profile.Spec.WorkloadPolicy.KueueTopology != nil && profile.Spec.Backend.Queue == "" {
-		return fmt.Errorf("profile %s workload policy kueueTopology requires a backend queue", profile.Name)
+		if err := signalworkload.Validate(check.WorkloadPolicy); err != nil {
+			return fmt.Errorf("profile %s check %s workload policy: %w", profile.Name, check.ID, err)
+		}
+
+		if check.WorkloadPolicy.KueueTopology != nil && check.Backend.Queue == "" {
+			return fmt.Errorf("profile %s check %s workload policy kueueTopology requires a backend queue", profile.Name, check.ID)
+		}
 	}
 
 	participants, err := r.selectParticipants(ctx, node, &profile)
@@ -271,11 +283,6 @@ func (r *AdmissionReconciler) admitNodeWithTriggerLocked(
 		}
 	}()
 
-	parameters := make(map[string]string, len(profile.Spec.Parameters)+2)
-	for key, value := range profile.Spec.Parameters {
-		parameters[key] = value
-	}
-
 	if len(participants) == 1 {
 		var participantNode corev1.Node
 
@@ -291,18 +298,20 @@ func (r *AdmissionReconciler) admitNodeWithTriggerLocked(
 		gpuResource := corev1.ResourceName("nvidia.com/gpu")
 		gpuCapacity := participantNode.Status.Capacity[gpuResource]
 		gpuAllocatable := participantNode.Status.Allocatable[gpuResource]
-		parameters["observed-gpu-capacity"] = gpuCapacity.String()
-		parameters["observed-gpu-allocatable"] = gpuAllocatable.String()
+
+		for index := range checks {
+			if checks[index].Parameters == nil {
+				checks[index].Parameters = map[string]string{}
+			}
+
+			checks[index].Parameters["observed-gpu-capacity"] = gpuCapacity.String()
+			checks[index].Parameters["observed-gpu-allocatable"] = gpuAllocatable.String()
+		}
 	}
 
-	snapshot, scriptDigest, err := r.createSnapshot(ctx, runName, &profile)
+	snapshot, checkSnapshots, err := r.createSnapshot(ctx, runName, checks)
 	if err != nil {
 		return err
-	}
-
-	maxAttempts := profile.Spec.MaxAttempts
-	if maxAttempts < 1 {
-		maxAttempts = DefaultMaxAttempts
 	}
 
 	run := &signalv1.CertificationRun{
@@ -325,28 +334,22 @@ func (r *AdmissionReconciler) admitNodeWithTriggerLocked(
 				UID:        profile.UID,
 				Generation: profile.Generation,
 			},
-			Participants: participants,
-			Script: signalv1.ScriptSnapshot{
-				ConfigMapName:        snapshot.Name,
-				Key:                  profile.Spec.Script.Key,
-				RequiresRuntimeStage: profile.Spec.Script.RequiresRuntimeStage,
-				Digest:               scriptDigest,
-			},
-			Workflow:              profile.Spec.Workflow,
-			Backend:               profile.Spec.Backend,
-			RunnerImage:           profile.Spec.RunnerImage,
-			WorkloadPolicy:        *profile.Spec.WorkloadPolicy.DeepCopy(),
-			Purpose:               profile.Spec.Purpose,
-			StagePlan:             append([]signalv1.CertificationStage(nil), profile.Spec.StagePlan...),
-			RuntimeStage:          copyRuntimeStage(profile.Spec.RuntimeStage),
-			Parameters:            parameters,
-			EvidencePath:          strings.Trim(profile.Spec.EvidencePath, "/") + "/" + runName + ".json",
-			Deadline:              profile.Spec.Deadline,
-			BackendActiveDeadline: profile.Spec.BackendActiveDeadline,
-			MaxAttempts:           maxAttempts,
-			Tolerations:           profile.Spec.Tolerations,
-			RequestNodeName:       node.Name,
+			Participants:        participants,
+			ParticipantRoles:    append([]signalv1.ParticipantRoleConstraint(nil), profile.Spec.ParticipantRoles...),
+			TopologyConstraints: append([]signalv1.ParticipantTopologyConstraint(nil), profile.Spec.TopologyConstraints...),
+			Checks:              checkSnapshots,
+			ExecutionPolicy:     profile.Spec.ExecutionPolicy,
+			Workflow:            profile.Spec.Workflow,
+			Purpose:             profile.Spec.Purpose,
+			EvidencePath:        strings.Trim(profile.Spec.EvidencePath, "/") + "/" + runName + ".json",
+			Deadline:            profile.Spec.Deadline,
+			Tolerations:         profile.Spec.Tolerations,
+			RequestNodeName:     node.Name,
 		},
+	}
+	if len(profile.Spec.Checks) != groupedCheckCount {
+		setLegacyRunAliases(&run.Spec)
+		run.Spec.StagePlan = append([]signalv1.CertificationStage(nil), profile.Spec.StagePlan...)
 	}
 
 	if err := r.Create(ctx, run); err != nil {
@@ -381,7 +384,7 @@ func (r *AdmissionReconciler) admitNodeWithTriggerLocked(
 
 	if r.Recorder != nil {
 		r.Recorder.Eventf(run, nil, corev1.EventTypeNormal, "CertificationAdmitted", "AdmitCertification",
-			"Created CertificationRun %s with immutable script digest %s", run.Name, scriptDigest)
+			"Created CertificationRun %s with %d immutable checks", run.Name, len(checkSnapshots))
 	}
 
 	return nil
@@ -434,14 +437,10 @@ func (r *AdmissionReconciler) selectParticipants(
 
 	sort.Slice(nodes.Items, func(i, j int) bool { return nodes.Items[i].Name < nodes.Items[j].Name })
 
-	selected := []signalv1.Participant{participantSnapshot(requestNode, 0)}
+	candidates := []corev1.Node{*requestNode.DeepCopy()}
 
 	for i := range nodes.Items {
 		candidate := &nodes.Items[i]
-
-		if int32(len(selected)) == count {
-			break
-		}
 
 		if candidate.Name == requestNode.Name ||
 			!selector.Matches(labels.Set(candidate.Labels)) ||
@@ -450,11 +449,27 @@ func (r *AdmissionReconciler) selectParticipants(
 			continue
 		}
 
-		selected = append(selected, participantSnapshot(candidate, int32(len(selected))))
+		candidates = append(candidates, *candidate.DeepCopy())
 	}
 
-	if int32(len(selected)) != count {
-		return nil, fmt.Errorf("profile %s requires %d eligible unlocked participants, found %d", profile.Name, count, len(selected))
+	if int32(len(candidates)) < count {
+		return nil, fmt.Errorf(
+			"profile %s requires %d eligible unlocked participants, found %d",
+			profile.Name,
+			count,
+			len(candidates),
+		)
+	}
+
+	selected, err := selectParticipantPlan(
+		candidates,
+		requestNode.Name,
+		count,
+		profile.Spec.ParticipantRoles,
+		profile.Spec.TopologyConstraints,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("profile %s participant constraints: %w", profile.Name, err)
 	}
 
 	return selected, nil
@@ -494,6 +509,376 @@ func participantSnapshot(node *corev1.Node, index int32) signalv1.Participant {
 		Capacity:    node.Status.Capacity.DeepCopy(),
 		Allocatable: node.Status.Allocatable.DeepCopy(),
 	}
+}
+
+func (r *AdmissionReconciler) assignParticipantRoles(
+	ctx context.Context,
+	participants []signalv1.Participant,
+	roles []signalv1.ParticipantRoleConstraint,
+	topology []signalv1.ParticipantTopologyConstraint,
+) error {
+	if len(roles) == 0 {
+		return nil
+	}
+
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
+	nodes := make([]corev1.Node, len(participants))
+	for index := range participants {
+		if err := reader.Get(ctx, client.ObjectKey{Name: participants[index].NodeName}, &nodes[index]); err != nil {
+			return fmt.Errorf("read participant %s for role assignment: %w", participants[index].NodeName, err)
+		}
+	}
+
+	assignments, err := solveParticipantRoles(nodes, "", int32(len(nodes)), roles, topology)
+	if err != nil {
+		return err
+	}
+
+	for index := range participants {
+		participants[index].Roles = assignments[index]
+	}
+
+	return nil
+}
+
+type participantRoleSlot struct {
+	name string
+}
+
+func selectParticipantPlan(
+	candidates []corev1.Node,
+	requestNodeName string,
+	count int32,
+	roles []signalv1.ParticipantRoleConstraint,
+	topology []signalv1.ParticipantTopologyConstraint,
+) ([]signalv1.Participant, error) {
+	assignments, err := solveParticipantRoles(
+		candidates,
+		requestNodeName,
+		count,
+		roles,
+		topology,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	selectedIndexes := make([]int, 0, count)
+	selected := make([]bool, len(candidates))
+
+	selectedIndexes = append(selectedIndexes, 0)
+	selected[0] = true
+
+	for index := range candidates {
+		if selected[index] || len(assignments[index]) == 0 {
+			continue
+		}
+
+		selectedIndexes = append(selectedIndexes, index)
+		selected[index] = true
+	}
+
+	for index := range candidates {
+		if int32(len(selectedIndexes)) == count {
+			break
+		}
+
+		if selected[index] {
+			continue
+		}
+
+		selectedIndexes = append(selectedIndexes, index)
+		selected[index] = true
+	}
+
+	if int32(len(selectedIndexes)) != count {
+		return nil, fmt.Errorf("participant plan selected %d participants, want %d", len(selectedIndexes), count)
+	}
+
+	participants := make([]signalv1.Participant, 0, count)
+	for _, candidateIndex := range selectedIndexes {
+		participant := participantSnapshot(&candidates[candidateIndex], int32(len(participants)))
+		participant.Roles = slices.Clone(assignments[candidateIndex])
+		participants = append(participants, participant)
+	}
+
+	return participants, nil
+}
+
+func solveParticipantRoles(
+	candidates []corev1.Node,
+	requestNodeName string,
+	participantCount int32,
+	roles []signalv1.ParticipantRoleConstraint,
+	topology []signalv1.ParticipantTopologyConstraint,
+) ([][]string, error) {
+	roleNames := make(map[string]struct{}, len(roles))
+	roleSelectors := make(map[string]labels.Selector, len(roles))
+	slots := make([]participantRoleSlot, 0, participantCount)
+
+	for roleIndex := range roles {
+		role := &roles[roleIndex]
+		if _, duplicate := roleNames[role.Name]; duplicate {
+			return nil, fmt.Errorf("duplicate participant role %q", role.Name)
+		}
+
+		selector, err := metav1.LabelSelectorAsSelector(&role.Selector)
+		if err != nil {
+			return nil, fmt.Errorf("role %s selector: %w", role.Name, err)
+		}
+
+		roleNames[role.Name] = struct{}{}
+		roleSelectors[role.Name] = selector
+
+		for range role.Count {
+			slots = append(slots, participantRoleSlot{name: role.Name})
+		}
+	}
+
+	if int32(len(slots)) > participantCount {
+		return nil, fmt.Errorf(
+			"participant roles require %d assignments but participant count is %d",
+			len(slots),
+			participantCount,
+		)
+	}
+
+	for index := range topology {
+		if _, exists := roleNames[topology[index].Role]; !exists {
+			return nil, fmt.Errorf("topology constraint references unknown role %q", topology[index].Role)
+		}
+	}
+
+	assignments := make([][]string, len(candidates))
+	assigned := make([]bool, len(candidates))
+	slotAssignments := make([]int, len(slots))
+	candidateOrders := make(map[string][]int, len(roles))
+
+	for role, selector := range roleSelectors {
+		candidateOrders[role] = roleCandidateOrder(candidates, selector, role, topology)
+	}
+
+	const maximumSearchStates = 1_000_000
+
+	searchStates := 0
+	searchExhausted := false
+
+	var search func(int) bool
+
+	search = func(slotIndex int) bool {
+		if searchExhausted {
+			return false
+		}
+
+		searchStates++
+		if searchStates > maximumSearchStates {
+			searchExhausted = true
+
+			return false
+		}
+
+		if slotIndex == len(slots) {
+			requestAssigned := requestNodeName == ""
+			assignedCount := int32(0)
+
+			for index := range candidates {
+				if len(assignments[index]) == 0 {
+					continue
+				}
+
+				assignedCount++
+
+				if candidates[index].Name == requestNodeName {
+					requestAssigned = true
+				}
+			}
+
+			if !requestAssigned && assignedCount >= participantCount {
+				return false
+			}
+
+			return participantTopologySatisfied(candidates, assignments, topology)
+		}
+
+		slot := &slots[slotIndex]
+
+		firstCandidate := 0
+		if slotIndex > 0 && slots[slotIndex-1].name == slot.name {
+			firstCandidate = slotAssignments[slotIndex-1] + 1
+		}
+
+		order := candidateOrders[slot.name]
+		for candidatePosition := firstCandidate; candidatePosition < len(order); candidatePosition++ {
+			candidateIndex := order[candidatePosition]
+			if assigned[candidateIndex] {
+				continue
+			}
+
+			assigned[candidateIndex] = true
+			assignments[candidateIndex] = []string{slot.name}
+			slotAssignments[slotIndex] = candidatePosition
+
+			roleComplete := slotIndex+1 == len(slots) || slots[slotIndex+1].name != slot.name
+			if (!roleComplete || participantRoleTopologySatisfied(
+				candidates,
+				assignments,
+				slot.name,
+				topology,
+			)) && search(slotIndex+1) {
+				return true
+			}
+
+			assignments[candidateIndex] = nil
+			assigned[candidateIndex] = false
+		}
+
+		return false
+	}
+
+	if !search(0) {
+		if searchExhausted {
+			return nil, fmt.Errorf("participant role search exceeded %d states", maximumSearchStates)
+		}
+
+		return nil, errors.New("eligible participants cannot satisfy role and topology constraints")
+	}
+
+	return assignments, nil
+}
+
+func roleCandidateOrder(
+	candidates []corev1.Node,
+	selector labels.Selector,
+	role string,
+	topology []signalv1.ParticipantTopologyConstraint,
+) []int {
+	constraints := make([]signalv1.ParticipantTopologyConstraint, 0)
+
+	for index := range topology {
+		if topology[index].Role == role {
+			constraints = append(constraints, topology[index])
+		}
+	}
+
+	if len(constraints) == 0 {
+		order := make([]int, 0, len(candidates))
+		for index := range candidates {
+			if selector.Matches(labels.Set(candidates[index].Labels)) {
+				order = append(order, index)
+			}
+		}
+
+		return order
+	}
+
+	groups := map[string][]int{}
+
+	for index := range candidates {
+		if !selector.Matches(labels.Set(candidates[index].Labels)) {
+			continue
+		}
+
+		values := make([]string, len(constraints))
+		valid := true
+
+		for constraintIndex := range constraints {
+			values[constraintIndex] = candidates[index].Labels[constraints[constraintIndex].LabelKey]
+			if values[constraintIndex] == "" {
+				valid = false
+
+				break
+			}
+		}
+
+		if valid {
+			key := strings.Join(values, "\x00")
+			groups[key] = append(groups[key], index)
+		}
+	}
+
+	keys := slices.Sorted(maps.Keys(groups))
+	order := make([]int, 0, len(candidates))
+
+	for offset := 0; ; offset++ {
+		added := false
+
+		for _, key := range keys {
+			if offset >= len(groups[key]) {
+				continue
+			}
+
+			order = append(order, groups[key][offset])
+			added = true
+		}
+
+		if !added {
+			return order
+		}
+	}
+}
+
+func participantRoleTopologySatisfied(
+	candidates []corev1.Node,
+	assignments [][]string,
+	role string,
+	topology []signalv1.ParticipantTopologyConstraint,
+) bool {
+	for index := range topology {
+		if topology[index].Role != role {
+			continue
+		}
+
+		if !participantTopologyConstraintSatisfied(candidates, assignments, &topology[index]) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func participantTopologySatisfied(
+	candidates []corev1.Node,
+	assignments [][]string,
+	topology []signalv1.ParticipantTopologyConstraint,
+) bool {
+	for constraintIndex := range topology {
+		if !participantTopologyConstraintSatisfied(
+			candidates,
+			assignments,
+			&topology[constraintIndex],
+		) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func participantTopologyConstraintSatisfied(
+	candidates []corev1.Node,
+	assignments [][]string,
+	constraint *signalv1.ParticipantTopologyConstraint,
+) bool {
+	values := map[string]struct{}{}
+
+	for participantIndex := range candidates {
+		if !slices.Contains(assignments[participantIndex], constraint.Role) {
+			continue
+		}
+
+		value := candidates[participantIndex].Labels[constraint.LabelKey]
+		if value == "" {
+			return false
+		}
+
+		values[value] = struct{}{}
+	}
+
+	return int32(len(values)) >= constraint.MinDistinctValues
 }
 
 func nodeEligible(node *corev1.Node, required corev1.ResourceList) bool {
@@ -604,19 +989,8 @@ func (r *AdmissionReconciler) releaseParticipants(ctx context.Context, participa
 func (r *AdmissionReconciler) createSnapshot(
 	ctx context.Context,
 	runName string,
-	profile *signalv1.CertificationProfile,
-) (*corev1.ConfigMap, string, error) {
-	var source corev1.ConfigMap
-	if err := r.Get(ctx, client.ObjectKey{Namespace: r.ScriptNamespace, Name: profile.Spec.Script.Name}, &source); err != nil {
-		return nil, "", fmt.Errorf("get source script ConfigMap: %w", err)
-	}
-
-	content, ok := source.Data[profile.Spec.Script.Key]
-	if !ok {
-		return nil, "", fmt.Errorf("source script ConfigMap %s has no key %s", source.Name, profile.Spec.Script.Key)
-	}
-
-	digest := digestString(content)
+	checks []signalv1.CertificationCheck,
+) (*corev1.ConfigMap, []signalv1.CertificationCheckSnapshot, error) {
 	immutable := true
 
 	snapshot := &corev1.ConfigMap{
@@ -626,16 +1000,74 @@ func (r *AdmissionReconciler) createSnapshot(
 			Labels:    map[string]string{SnapshotRunLabel: runName},
 		},
 		Immutable: &immutable,
-		Data: map[string]string{
-			profile.Spec.Script.Key: content,
-			"sha256":                digest,
-		},
-	}
-	if err := r.Create(ctx, snapshot); err != nil {
-		return nil, "", fmt.Errorf("create immutable script snapshot: %w", err)
+		Data:      map[string]string{},
 	}
 
-	return snapshot, digest, nil
+	checkSnapshots := make([]signalv1.CertificationCheckSnapshot, len(checks))
+	for index := range checks {
+		check := &checks[index]
+
+		var source corev1.ConfigMap
+		if err := r.Get(
+			ctx,
+			client.ObjectKey{Namespace: r.ScriptNamespace, Name: check.Script.Name},
+			&source,
+		); err != nil {
+			return nil, nil, fmt.Errorf("get source script ConfigMap for check %s: %w", check.ID, err)
+		}
+
+		content, ok := source.Data[check.Script.Key]
+		if !ok {
+			return nil, nil, fmt.Errorf(
+				"source script ConfigMap %s has no key %s for check %s",
+				source.Name,
+				check.Script.Key,
+				check.ID,
+			)
+		}
+
+		digest := digestString(content)
+		if check.Script.Digest != "" && digest != check.Script.Digest {
+			return nil, nil, fmt.Errorf(
+				"source script digest for check %s is %s, want %s",
+				check.ID,
+				digest,
+				check.Script.Digest,
+			)
+		}
+
+		key := fmt.Sprintf("%02d-%s", check.Order, sanitizeTaskName(string(check.ID)))
+		if len(checks) == 1 && check.ID == "legacy" {
+			key = check.Script.Key
+		}
+
+		snapshot.Data[key] = content
+		checkSnapshots[index] = signalv1.CertificationCheckSnapshot{
+			ID:    check.ID,
+			Order: check.Order,
+			Script: signalv1.ScriptSnapshot{
+				ConfigMapName:        snapshot.Name,
+				Key:                  key,
+				RequiresRuntimeStage: check.Script.RequiresRuntimeStage,
+				Digest:               digest,
+			},
+			RunnerImage:           check.RunnerImage,
+			Backend:               check.Backend,
+			WorkloadPolicy:        *check.WorkloadPolicy.DeepCopy(),
+			RuntimeStage:          copyRuntimeStage(check.RuntimeStage),
+			Parameters:            maps.Clone(check.Parameters),
+			BackendActiveDeadline: check.BackendActiveDeadline,
+			ResultBounds:          check.ResultBounds,
+			ParticipantPolicy:     check.ParticipantPolicy,
+			MaxAttempts:           check.MaxAttempts,
+		}
+	}
+
+	if err := r.Create(ctx, snapshot); err != nil {
+		return nil, nil, fmt.Errorf("create immutable script snapshot: %w", err)
+	}
+
+	return snapshot, checkSnapshots, nil
 }
 
 func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -652,7 +1084,14 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return r.cleanup(ctx, &run)
 	}
 
-	if run.Status.FinishedAt != nil {
+	if isGroupedRun(&run) && run.Status.Evidence.URI == "" {
+		result, recovered, err := r.resumeGroupedEvidence(ctx, &run)
+		if err != nil || recovered {
+			return result, err
+		}
+	}
+
+	if run.Status.FinishedAt != nil && !isGroupedRun(&run) {
 		return r.finish(
 			ctx,
 			&run,
@@ -681,6 +1120,16 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 
 	if err := reader.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: run.Status.Workflow.Name}, workflow); err != nil {
 		if apierrors.IsNotFound(err) {
+			if isGroupedRun(&run) {
+				workflow.SetName(run.Status.Workflow.Name)
+				workflow.Object["status"] = map[string]any{
+					"phase":   "Error",
+					"message": "workflow disappeared before terminal status",
+				}
+
+				return r.finishGrouped(ctx, &run, workflow, "Error")
+			}
+
 			return r.retryOrFinish(ctx, &run, "Error", "WorkflowMissing", "workflow disappeared before terminal status")
 		}
 
@@ -707,11 +1156,20 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			return ctrl.Result{}, err
 		}
 
-		if run.Status.Phase != signalv1.RunPhaseRunning || run.Status.Workflow.Phase != phase {
+		checkStatuses := run.Status.Checks
+		if isGroupedRun(&run) {
+			checkStatuses = runningCheckStatuses(workflow, &run)
+		}
+
+		if run.Status.Phase != signalv1.RunPhaseRunning ||
+			run.Status.Workflow.Phase != phase ||
+			!reflect.DeepEqual(run.Status.Checks, checkStatuses) {
 			before := run.DeepCopy()
 			run.Status.Phase = signalv1.RunPhaseRunning
 
 			run.Status.Workflow.Phase = phase
+
+			run.Status.Checks = checkStatuses
 			if run.Status.StartedAt == nil {
 				now := metav1.NewTime(r.now())
 				run.Status.StartedAt = &now
@@ -722,6 +1180,10 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	case "Succeeded":
+		if isGroupedRun(&run) {
+			return r.finishGrouped(ctx, &run, workflow, phase)
+		}
+
 		verdict := workflowParameter(workflow, "verdict")
 		reason := workflowParameter(workflow, "reason")
 
@@ -732,6 +1194,10 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 
 		return r.finish(ctx, &run, workflow, "Completed", verdict, reason)
 	case "Failed", "Error":
+		if isGroupedRun(&run) {
+			return r.finishGrouped(ctx, &run, workflow, phase)
+		}
+
 		return r.retryOrFinish(ctx, &run, phase, "Workflow"+phase, workflowMessage(workflow))
 	default:
 		return ctrl.Result{}, fmt.Errorf("unsupported Workflow phase %q", phase)
@@ -773,6 +1239,10 @@ func (r *RunReconciler) startAttempt(ctx context.Context, run *signalv1.Certific
 		Attempt: attempt,
 		Phase:   "Pending",
 	}
+	if isGroupedRun(run) {
+		run.Status.Checks = initialCheckStatuses(run.Spec.Checks)
+	}
+
 	if run.Status.StartedAt == nil {
 		now := metav1.NewTime(r.now())
 		run.Status.StartedAt = &now
@@ -791,6 +1261,151 @@ func (r *RunReconciler) startAttempt(ctx context.Context, run *signalv1.Certific
 }
 
 func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured.Unstructured, error) {
+	if !isGroupedRun(run) {
+		return buildLegacyWorkflow(run, attempt)
+	}
+
+	checks := runChecks(run)
+	if err := validateRunCheckPlan(checks, isGroupedRun(run)); err != nil {
+		return nil, err
+	}
+
+	tolerations := uniqueTolerations(append([]corev1.Toleration{{
+		Key:      "nvidia.com/gpu",
+		Operator: corev1.TolerationOpExists,
+		Effect:   corev1.TaintEffectNoSchedule,
+	}}, run.Spec.Tolerations...))
+
+	tolerationsJSON, err := json.Marshal(tolerations)
+	if err != nil {
+		return nil, fmt.Errorf("encode Workflow tolerations: %w", err)
+	}
+
+	name := fmt.Sprintf("%s-a%d", run.Name, attempt)
+	tasks := make([]any, 0, len(checks))
+
+	for index := range checks {
+		check := &checks[index]
+
+		checkParticipants, _, participantErr := participantsForCheck(
+			run.Spec.Participants,
+			check.ParticipantPolicy,
+		)
+		if participantErr != nil {
+			return nil, fmt.Errorf("check %s participants: %w", check.ID, participantErr)
+		}
+
+		participantNames := make([]string, 0, len(checkParticipants))
+		for participantIndex := range checkParticipants {
+			participantNames = append(participantNames, checkParticipants[participantIndex].NodeName)
+		}
+
+		participantsJSON, marshalErr := json.Marshal(checkParticipants)
+		if marshalErr != nil {
+			return nil, fmt.Errorf("encode check %s participants: %w", check.ID, marshalErr)
+		}
+
+		environment, environmentErr := scriptEnvironment(check.Parameters)
+		if environmentErr != nil {
+			return nil, fmt.Errorf("check %s: %w", check.ID, environmentErr)
+		}
+
+		environmentJSON, marshalErr := json.Marshal(environment)
+		if marshalErr != nil {
+			return nil, fmt.Errorf("encode check %s script environment: %w", check.ID, marshalErr)
+		}
+
+		workloadPolicyJSON, encodeErr := signalworkload.Encode(check.WorkloadPolicy)
+		if encodeErr != nil {
+			return nil, fmt.Errorf("encode check %s workload policy: %w", check.ID, encodeErr)
+		}
+
+		taskName := checkTaskName(check)
+		task := map[string]any{
+			"name": taskName,
+			"templateRef": map[string]any{
+				"name":     run.Spec.Workflow.Name,
+				"template": "certification",
+			},
+			"arguments": map[string]any{
+				"parameters": checkWorkflowParameters(
+					run,
+					check,
+					attempt,
+					checkParticipants,
+					participantNames,
+					string(participantsJSON),
+					string(tolerationsJSON),
+					string(environmentJSON),
+					workloadPolicyJSON,
+				),
+			},
+		}
+
+		if index > 0 {
+			previous := checkTaskName(&checks[index-1])
+			if run.Spec.ExecutionPolicy.OnFailure == signalv1.SuiteFailurePolicyContinue {
+				task["depends"] = previous + ".Completed"
+			} else {
+				task["depends"] = previous + ".Succeeded"
+				task["when"] = fmt.Sprintf(
+					"{{tasks.%s.outputs.parameters.verdict}} == Pass",
+					previous,
+				)
+			}
+		}
+
+		tasks = append(tasks, task)
+	}
+
+	workflow := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": workflowGVK.GroupVersion().String(),
+		"kind":       workflowGVK.Kind,
+		"metadata": map[string]any{
+			"name":      name,
+			"namespace": run.Namespace,
+			"labels": map[string]any{
+				SnapshotRunLabel: run.Name,
+			},
+		},
+		"spec": map[string]any{
+			"activeDeadlineSeconds": int64(run.Spec.Deadline.Seconds()),
+			"ttlStrategy": map[string]any{
+				"secondsAfterCompletion": int64(6 * time.Hour / time.Second),
+				"secondsAfterSuccess":    int64(6 * time.Hour / time.Second),
+				"secondsAfterFailure":    int64(6 * time.Hour / time.Second),
+			},
+			"podGC": map[string]any{
+				"strategy":            "OnWorkflowCompletion",
+				"deleteDelayDuration": "2h",
+			},
+			"entrypoint": "certification-suite",
+			"templates": []any{
+				map[string]any{
+					"name": "certification-suite",
+					"dag": map[string]any{
+						"failFast": false,
+						"tasks":    tasks,
+					},
+				},
+			},
+		},
+	}}
+	workflow.SetOwnerReferences([]metav1.OwnerReference{
+		*metav1.NewControllerRef(run, signalv1.GroupVersion.WithKind("CertificationRun")),
+	})
+
+	return workflow, nil
+}
+
+func buildLegacyWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured.Unstructured, error) {
+	checks := runChecks(run)
+	if len(checks) != 1 {
+		return nil, errors.New("legacy workflow requires exactly one check")
+	}
+
+	check := &checks[0]
+
 	participantNames := make([]string, 0, len(run.Spec.Participants))
 	for _, participant := range run.Spec.Participants {
 		participantNames = append(participantNames, participant.NodeName)
@@ -807,17 +1422,17 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 		return nil, fmt.Errorf("encode Workflow tolerations: %w", err)
 	}
 
-	scriptEnvironment, err := scriptEnvironment(run.Spec.Parameters)
+	environment, err := scriptEnvironment(check.Parameters)
 	if err != nil {
 		return nil, err
 	}
 
-	scriptEnvironmentJSON, err := json.Marshal(scriptEnvironment)
+	environmentJSON, err := json.Marshal(environment)
 	if err != nil {
 		return nil, fmt.Errorf("encode script environment: %w", err)
 	}
 
-	workloadPolicyJSON, err := signalworkload.Encode(run.Spec.WorkloadPolicy)
+	workloadPolicyJSON, err := signalworkload.Encode(check.WorkloadPolicy)
 	if err != nil {
 		return nil, fmt.Errorf("encode workload policy: %w", err)
 	}
@@ -853,38 +1468,17 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 				"name": run.Spec.Workflow.Name,
 			},
 			"arguments": map[string]any{
-				"parameters": []any{
-					map[string]any{"name": "run-name", "value": run.Name},
-					map[string]any{"name": "run-uid", "value": string(run.UID)},
-					map[string]any{"name": "participants", "value": strings.Join(participantNames, ",")},
-					map[string]any{"name": "participants-json", "value": string(participantsJSON)},
-					map[string]any{"name": "participant-count", "value": fmt.Sprintf("%d", len(run.Spec.Participants))},
-					map[string]any{"name": "request-node-name", "value": run.Spec.RequestNodeName},
-					map[string]any{"name": "script-configmap", "value": run.Spec.Script.ConfigMapName},
-					map[string]any{"name": "script-key", "value": run.Spec.Script.Key},
-					map[string]any{"name": "script-digest", "value": run.Spec.Script.Digest},
-					map[string]any{"name": "script-requires-runtime-stage", "value": fmt.Sprintf("%t", run.Spec.Script.RequiresRuntimeStage)},
-					map[string]any{"name": "runtime-stage-name", "value": runtimeStageName(run.Spec.RuntimeStage)},
-					map[string]any{"name": "backend-api-version", "value": run.Spec.Backend.APIVersion},
-					map[string]any{"name": "backend-kind", "value": run.Spec.Backend.Kind},
-					map[string]any{
-						"name":  "backend-active-deadline-seconds",
-						"value": fmt.Sprintf("%d", int64(run.Spec.BackendActiveDeadline.Seconds())),
-					},
-					map[string]any{"name": "queue", "value": run.Spec.Backend.Queue},
-					map[string]any{"name": "runner-image", "value": run.Spec.RunnerImage},
-					map[string]any{"name": "tolerations", "value": string(tolerationsJSON)},
-					map[string]any{"name": "script-environment", "value": string(scriptEnvironmentJSON)},
-					map[string]any{"name": "workload-policy", "value": workloadPolicyJSON},
-					map[string]any{"name": "mpi-payload-mode", "value": run.Spec.Parameters["mpi-payload-mode"]},
-					map[string]any{"name": "expected-gpu-product-regex", "value": run.Spec.Parameters["expected-gpu-product-regex"]},
-					map[string]any{"name": "expected-gpu-count", "value": run.Spec.Parameters["expected-gpu-count"]},
-					map[string]any{"name": "observed-gpu-capacity", "value": run.Spec.Parameters["observed-gpu-capacity"]},
-					map[string]any{"name": "observed-gpu-allocatable", "value": run.Spec.Parameters["observed-gpu-allocatable"]},
-					map[string]any{"name": "gpu-resource-count", "value": run.Spec.Parameters["gpu-resource-count"]},
-					map[string]any{"name": "privileged", "value": run.Spec.Parameters["privileged"]},
-					map[string]any{"name": "attempt", "value": fmt.Sprintf("%d", attempt)},
-				},
+				"parameters": checkWorkflowParameters(
+					run,
+					check,
+					attempt,
+					run.Spec.Participants,
+					participantNames,
+					string(participantsJSON),
+					string(tolerationsJSON),
+					string(environmentJSON),
+					workloadPolicyJSON,
+				),
 			},
 		},
 	}}
@@ -893,6 +1487,54 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 	})
 
 	return workflow, nil
+}
+
+func checkWorkflowParameters(
+	run *signalv1.CertificationRun,
+	check *signalv1.CertificationCheckSnapshot,
+	attempt int32,
+	participants []signalv1.Participant,
+	participantNames []string,
+	participantsJSON string,
+	tolerationsJSON string,
+	scriptEnvironmentJSON string,
+	workloadPolicyJSON string,
+) []any {
+	return []any{
+		map[string]any{"name": "run-name", "value": checkRunName(run.Name, check.ID)},
+		map[string]any{"name": "run-uid", "value": string(run.UID)},
+		map[string]any{"name": "participants", "value": strings.Join(participantNames, ",")},
+		map[string]any{"name": "participants-json", "value": participantsJSON},
+		map[string]any{"name": "participant-count", "value": fmt.Sprintf("%d", len(participants))},
+		map[string]any{"name": "request-node-name", "value": run.Spec.RequestNodeName},
+		map[string]any{"name": "script-configmap", "value": check.Script.ConfigMapName},
+		map[string]any{"name": "script-key", "value": check.Script.Key},
+		map[string]any{"name": "script-digest", "value": check.Script.Digest},
+		map[string]any{
+			"name":  "script-requires-runtime-stage",
+			"value": fmt.Sprintf("%t", check.Script.RequiresRuntimeStage),
+		},
+		map[string]any{"name": "runtime-stage-name", "value": runtimeStageName(check.RuntimeStage)},
+		map[string]any{"name": "backend-api-version", "value": check.Backend.APIVersion},
+		map[string]any{"name": "backend-kind", "value": check.Backend.Kind},
+		map[string]any{
+			"name":  "backend-active-deadline-seconds",
+			"value": fmt.Sprintf("%d", int64(check.BackendActiveDeadline.Seconds())),
+		},
+		map[string]any{"name": "queue", "value": check.Backend.Queue},
+		map[string]any{"name": "runner-image", "value": check.RunnerImage},
+		map[string]any{"name": "tolerations", "value": tolerationsJSON},
+		map[string]any{"name": "script-environment", "value": scriptEnvironmentJSON},
+		map[string]any{"name": "workload-policy", "value": workloadPolicyJSON},
+		map[string]any{"name": "mpi-payload-mode", "value": check.Parameters["mpi-payload-mode"]},
+		map[string]any{"name": "expected-gpu-product-regex", "value": check.Parameters["expected-gpu-product-regex"]},
+		map[string]any{"name": "expected-gpu-count", "value": check.Parameters["expected-gpu-count"]},
+		map[string]any{"name": "observed-gpu-capacity", "value": check.Parameters["observed-gpu-capacity"]},
+		map[string]any{"name": "observed-gpu-allocatable", "value": check.Parameters["observed-gpu-allocatable"]},
+		map[string]any{"name": "gpu-resource-count", "value": check.Parameters["gpu-resource-count"]},
+		map[string]any{"name": "privileged", "value": check.Parameters["privileged"]},
+		map[string]any{"name": "attempt", "value": fmt.Sprintf("%d", attempt)},
+	}
 }
 
 func validEnvironmentName(value string) bool {
@@ -955,11 +1597,561 @@ func (r *RunReconciler) retryOrFinish(
 	reason string,
 	message string,
 ) (ctrl.Result, error) {
-	if run.Status.Workflow.Attempt < run.Spec.MaxAttempts {
+	maxAttempts := run.Spec.MaxAttempts
+	if checks := runChecks(run); len(checks) == 1 {
+		maxAttempts = checks[0].MaxAttempts
+	}
+
+	if run.Status.Workflow.Attempt < maxAttempts {
 		return r.startAttempt(ctx, run, run.Status.Workflow.Attempt+1)
 	}
 
 	return r.finish(ctx, run, nil, executionState, "Inconclusive", reason+": "+message)
+}
+
+func (r *RunReconciler) finishGrouped(
+	ctx context.Context,
+	run *signalv1.CertificationRun,
+	workflow *unstructured.Unstructured,
+	workflowPhase string,
+) (ctrl.Result, error) {
+	checks, verdict, reason := terminalCheckStatuses(workflow, run)
+	executionState := "Completed"
+
+	if workflowPhase != "Succeeded" {
+		executionState = workflowPhase
+		verdict = "Inconclusive"
+
+		if reason == "" {
+			reason = "Workflow" + workflowPhase + ": " + workflowMessage(workflow)
+		}
+	}
+
+	evidenceRun := run.DeepCopy()
+	evidenceRun.Status.Checks = checks
+	evidenceRun.Status.ExecutionState = executionState
+	evidenceRun.Status.Verdict = verdict
+	evidenceRun.Status.Reason = reason
+	evidenceRun.Status.Workflow.Phase = workflowPhase
+
+	finishedAt := groupedFinishedAt(workflow, run)
+	evidenceRun.Status.FinishedAt = &finishedAt
+
+	evidence, err := r.evidenceDocument(
+		ctx,
+		evidenceRun,
+		executionState,
+		verdict,
+		reason,
+	)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	uri, digest, err := r.Evidence.Put(ctx, run.Spec.EvidencePath, evidence)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	before := run.DeepCopy()
+	run.Status = evidenceRun.Status
+	run.Status.Checks = compactCheckStatuses(checks)
+	run.Status.Evidence = signalv1.EvidenceStatus{URI: uri, Digest: digest}
+	run.Status.Phase = runPhaseForVerdict(verdict)
+
+	if err := r.Status().Patch(ctx, run, client.MergeFrom(before)); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := projectTerminal(ctx, r.Client, run); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{RequeueAfter: time.Millisecond}, nil
+}
+
+func (r *RunReconciler) resumeGroupedEvidence(
+	ctx context.Context,
+	run *signalv1.CertificationRun,
+) (ctrl.Result, bool, error) {
+	data, uri, digest, found, err := r.Evidence.Get(ctx, run.Spec.EvidencePath)
+	if err != nil || !found {
+		return ctrl.Result{}, false, err
+	}
+
+	var document struct {
+		RunID          string                  `json:"runID"`
+		RunName        string                  `json:"runName"`
+		Workflow       signalv1.WorkflowStatus `json:"workflow"`
+		CheckStatus    []signalv1.CheckStatus  `json:"checkStatus"`
+		ExecutionState string                  `json:"executionState"`
+		Verdict        string                  `json:"verdict"`
+		Reason         string                  `json:"reason"`
+		FinishedAt     string                  `json:"finishedAt"`
+	}
+	if err := json.Unmarshal(data, &document); err != nil {
+		return ctrl.Result{}, false, fmt.Errorf("decode persisted grouped evidence: %w", err)
+	}
+
+	if document.RunName != run.Name ||
+		(document.RunID != "" && run.UID != "" && document.RunID != string(run.UID)) {
+		return ctrl.Result{}, false, fmt.Errorf("persisted grouped evidence identity does not match run %s", run.Name)
+	}
+
+	if len(document.CheckStatus) != len(run.Spec.Checks) {
+		return ctrl.Result{}, false, fmt.Errorf(
+			"persisted grouped evidence contains %d check statuses, want %d",
+			len(document.CheckStatus),
+			len(run.Spec.Checks),
+		)
+	}
+
+	for index := range run.Spec.Checks {
+		if document.CheckStatus[index].ID != run.Spec.Checks[index].ID ||
+			document.CheckStatus[index].Order != run.Spec.Checks[index].Order {
+			return ctrl.Result{}, false, fmt.Errorf(
+				"persisted grouped evidence check %d identity does not match run",
+				index,
+			)
+		}
+	}
+
+	finishedAt, err := time.Parse(time.RFC3339Nano, document.FinishedAt)
+	if err != nil {
+		return ctrl.Result{}, false, fmt.Errorf("parse persisted grouped evidence finishedAt: %w", err)
+	}
+
+	before := run.DeepCopy()
+	run.Status.Checks = compactCheckStatuses(document.CheckStatus)
+	run.Status.ExecutionState = document.ExecutionState
+	run.Status.Verdict = document.Verdict
+	run.Status.Reason = document.Reason
+	run.Status.Workflow = document.Workflow
+	run.Status.Evidence = signalv1.EvidenceStatus{URI: uri, Digest: digest}
+	run.Status.Phase = runPhaseForVerdict(document.Verdict)
+
+	value := metav1.NewTime(finishedAt)
+	run.Status.FinishedAt = &value
+
+	if err := r.Status().Patch(ctx, run, client.MergeFrom(before)); err != nil {
+		return ctrl.Result{}, true, err
+	}
+
+	if err := projectTerminal(ctx, r.Client, run); err != nil {
+		return ctrl.Result{}, true, err
+	}
+
+	return ctrl.Result{RequeueAfter: time.Millisecond}, true, nil
+}
+
+func runPhaseForVerdict(verdict string) signalv1.RunPhase {
+	switch verdict {
+	case "Pass":
+		return signalv1.RunPhaseSucceeded
+	case "Fail":
+		return signalv1.RunPhaseFailed
+	default:
+		return signalv1.RunPhaseInconclusive
+	}
+}
+
+func groupedFinishedAt(
+	workflow *unstructured.Unstructured,
+	run *signalv1.CertificationRun,
+) metav1.Time {
+	if value, found, err := unstructured.NestedString(workflow.Object, "status", "finishedAt"); err == nil && found {
+		if parsed, parseErr := time.Parse(time.RFC3339, value); parseErr == nil {
+			return metav1.NewTime(parsed)
+		}
+	}
+
+	nodes, found, err := unstructured.NestedMap(workflow.Object, "status", "nodes")
+	if err == nil && found {
+		var latest time.Time
+
+		for index := range run.Spec.Checks {
+			node, count := exactCheckNode(nodes, workflow.GetName(), &run.Spec.Checks[index])
+			if count != 1 {
+				continue
+			}
+
+			parsed, parseErr := time.Parse(time.RFC3339, nodeString(node, "finishedAt"))
+			if parseErr == nil && parsed.After(latest) {
+				latest = parsed
+			}
+		}
+
+		if !latest.IsZero() {
+			return metav1.NewTime(latest)
+		}
+	}
+
+	if run.Status.StartedAt != nil {
+		return *run.Status.StartedAt.DeepCopy()
+	}
+
+	if !run.CreationTimestamp.IsZero() {
+		return run.CreationTimestamp
+	}
+
+	return metav1.NewTime(time.Unix(0, 0).UTC())
+}
+
+func initialCheckStatuses(checks []signalv1.CertificationCheckSnapshot) []signalv1.CheckStatus {
+	statuses := make([]signalv1.CheckStatus, len(checks))
+	for index := range checks {
+		statuses[index] = signalv1.CheckStatus{
+			ID:         checks[index].ID,
+			Order:      checks[index].Order,
+			Phase:      signalv1.CheckPhasePending,
+			Attempt:    1,
+			RetryCount: 0,
+		}
+	}
+
+	return statuses
+}
+
+func compactCheckStatuses(statuses []signalv1.CheckStatus) []signalv1.CheckStatus {
+	compacted := make([]signalv1.CheckStatus, len(statuses))
+	for index := range statuses {
+		compacted[index] = *statuses[index].DeepCopy()
+		compacted[index].BackendEvidence.Content = ""
+	}
+
+	return compacted
+}
+
+func contentDigest(content string) string {
+	sum := sha256.Sum256([]byte(content))
+
+	return fmt.Sprintf("sha256:%x", sum)
+}
+
+func runningCheckStatuses(
+	workflow *unstructured.Unstructured,
+	run *signalv1.CertificationRun,
+) []signalv1.CheckStatus {
+	statuses := initialCheckStatuses(run.Spec.Checks)
+
+	nodes, found, err := unstructured.NestedMap(workflow.Object, "status", "nodes")
+	if err != nil || !found {
+		return statuses
+	}
+
+	for index := range run.Spec.Checks {
+		node, count := exactCheckNode(nodes, workflow.GetName(), &run.Spec.Checks[index])
+		if count != 1 {
+			continue
+		}
+
+		statuses[index].WorkflowNodeName = nodeString(node, "name")
+		phase := nodeString(node, "phase")
+
+		switch phase {
+		case "Running":
+			statuses[index].Phase = signalv1.CheckPhaseRunning
+		case "Succeeded":
+			statuses[index].Phase = signalv1.CheckPhaseSucceeded
+		case "Failed", "Error":
+			statuses[index].Phase = signalv1.CheckPhaseInconclusive
+		case "Omitted", "Skipped":
+			statuses[index].Phase = signalv1.CheckPhaseSkipped
+			statuses[index].NotRun = true
+		}
+
+		setCheckTimes(&statuses[index], node)
+	}
+
+	return statuses
+}
+
+func terminalCheckStatuses(
+	workflow *unstructured.Unstructured,
+	run *signalv1.CertificationRun,
+) ([]signalv1.CheckStatus, string, string) {
+	statuses := initialCheckStatuses(run.Spec.Checks)
+
+	nodes, found, err := unstructured.NestedMap(workflow.Object, "status", "nodes")
+	if err != nil || !found {
+		for index := range statuses {
+			statuses[index].Phase = signalv1.CheckPhaseInconclusive
+			statuses[index].Verdict = "Inconclusive"
+			statuses[index].Reason = "WorkflowNodesUnavailable"
+			statuses[index].NotRun = true
+		}
+
+		return statuses, "Inconclusive", "workflow task nodes are missing or malformed"
+	}
+
+	aggregateVerdict := "Pass"
+	aggregateReason := "AllChecksPassed"
+	stoppedByPolicy := false
+
+	for index := range run.Spec.Checks {
+		check := &run.Spec.Checks[index]
+		status := &statuses[index]
+		node, count := exactCheckNode(nodes, workflow.GetName(), check)
+
+		if count != 1 {
+			status.Phase = signalv1.CheckPhaseInconclusive
+			status.Verdict = "Inconclusive"
+			status.Reason = "WorkflowTaskIdentityInvalid"
+			status.NotRun = true
+			aggregateVerdict = "Inconclusive"
+			aggregateReason = "workflow did not contain exactly one task node for every check"
+
+			continue
+		}
+
+		status.WorkflowNodeName = nodeString(node, "name")
+		setCheckTimes(status, node)
+
+		phase := nodeString(node, "phase")
+		switch phase {
+		case "Omitted", "Skipped":
+			status.Phase = signalv1.CheckPhaseSkipped
+			status.Verdict = "Inconclusive"
+			status.Reason = "NotRun"
+			status.NotRun = true
+
+			if run.Spec.ExecutionPolicy.OnFailure != signalv1.SuiteFailurePolicyStop || !stoppedByPolicy {
+				aggregateVerdict = "Inconclusive"
+				aggregateReason = "one or more checks were not run"
+			}
+
+			continue
+		case "Failed", "Error":
+			status.Phase = signalv1.CheckPhaseInconclusive
+			status.Verdict = "Inconclusive"
+			status.Reason = "WorkflowTask" + phase
+			aggregateVerdict = "Inconclusive"
+			aggregateReason = "one or more check tasks failed at the workflow boundary"
+			stoppedByPolicy = true
+
+			continue
+		case "Succeeded":
+		default:
+			status.Phase = signalv1.CheckPhaseInconclusive
+			status.Verdict = "Inconclusive"
+			status.Reason = "WorkflowTaskIncomplete"
+			status.NotRun = true
+			aggregateVerdict = "Inconclusive"
+			aggregateReason = "one or more check tasks were incomplete"
+			stoppedByPolicy = true
+
+			continue
+		}
+
+		outputs, outputErr := nodeWorkflowParameters(node, check.ResultBounds)
+		if outputErr != nil {
+			status.Phase = signalv1.CheckPhaseInconclusive
+			status.Verdict = "Inconclusive"
+			status.Reason = "OutputsRejected: " + outputErr.Error()
+			aggregateVerdict = "Inconclusive"
+			aggregateReason = "one or more check outputs were malformed or incomplete"
+			stoppedByPolicy = true
+
+			continue
+		}
+
+		status.Verdict = outputs["verdict"]
+		status.Reason = outputs["reason"]
+		status.Measurements = outputs["measurements"]
+
+		_, globalIndexes, participantErr := participantsForCheck(
+			run.Spec.Participants,
+			check.ParticipantPolicy,
+		)
+		if participantErr != nil {
+			status.Phase = signalv1.CheckPhaseInconclusive
+			status.Verdict = "Inconclusive"
+			status.Reason = "ParticipantPolicyInvalid: " + participantErr.Error()
+			aggregateVerdict = "Inconclusive"
+			aggregateReason = "one or more checks had invalid participant policy"
+			stoppedByPolicy = true
+
+			continue
+		}
+
+		normalizedEvidence, complete, evidenceErr := groupedBackendEvidenceForParticipants(
+			outputs["backend-evidence"],
+			globalIndexes,
+		)
+		if evidenceErr != nil {
+			status.Phase = signalv1.CheckPhaseInconclusive
+			status.Verdict = "Inconclusive"
+			status.Reason = "BackendEvidenceRejected: " + evidenceErr.Error()
+			aggregateVerdict = "Inconclusive"
+			aggregateReason = "one or more checks had invalid backend evidence"
+			stoppedByPolicy = true
+
+			continue
+		}
+
+		status.BackendEvidence = signalv1.BackendEvidenceStatus{
+			Version:  "v1",
+			Complete: complete,
+			Digest:   contentDigest(normalizedEvidence),
+			Content:  normalizedEvidence,
+		}
+
+		resources, resourceErr := backendResourceReferencesForParticipants(
+			outputs["backend-resources"],
+			globalIndexes,
+		)
+		if resourceErr != nil {
+			status.Phase = signalv1.CheckPhaseInconclusive
+			status.Verdict = "Inconclusive"
+			status.Reason = "BackendResourcesRejected: " + resourceErr.Error()
+			aggregateVerdict = "Inconclusive"
+			aggregateReason = "one or more checks had invalid backend identities"
+			stoppedByPolicy = true
+
+			continue
+		}
+
+		status.BackendResources = resources
+		status.Cleanup.Complete = outputs["cleanup-failure"] == ""
+		status.Cleanup.Reason = outputs["cleanup-failure"]
+
+		if !complete || !status.Cleanup.Complete || len(resources) == 0 {
+			status.Phase = signalv1.CheckPhaseInconclusive
+			status.Verdict = "Inconclusive"
+			status.Reason = "EvidenceOrCleanupIncomplete"
+			aggregateVerdict = "Inconclusive"
+			aggregateReason = "one or more checks lacked complete evidence, backend coverage, or cleanup"
+			stoppedByPolicy = true
+
+			continue
+		}
+
+		switch status.Verdict {
+		case "Pass":
+			status.Phase = signalv1.CheckPhaseSucceeded
+		case "Fail":
+			status.Phase = signalv1.CheckPhaseFailed
+			stoppedByPolicy = true
+
+			if aggregateVerdict == "Pass" {
+				aggregateVerdict = "Fail"
+				aggregateReason = "OneOrMoreChecksFailed"
+			}
+		case "Inconclusive":
+			status.Phase = signalv1.CheckPhaseInconclusive
+			aggregateVerdict = "Inconclusive"
+			aggregateReason = "one or more checks were inconclusive"
+			stoppedByPolicy = true
+		default:
+			status.Phase = signalv1.CheckPhaseInconclusive
+			status.Verdict = "Inconclusive"
+			status.Reason = "InvalidVerdict"
+			aggregateVerdict = "Inconclusive"
+			aggregateReason = "one or more checks returned an invalid verdict"
+			stoppedByPolicy = true
+		}
+	}
+
+	return statuses, aggregateVerdict, aggregateReason
+}
+
+func exactCheckNode(
+	nodes map[string]any,
+	workflowName string,
+	check *signalv1.CertificationCheckSnapshot,
+) (map[string]any, int) {
+	expected := workflowName + "." + checkTaskName(check)
+
+	var match map[string]any
+
+	count := 0
+
+	for _, raw := range nodes {
+		node, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		name, ok := node["name"].(string)
+		if ok && name == expected {
+			match = node
+			count++
+		}
+	}
+
+	return match, count
+}
+
+func nodeWorkflowParameters(
+	node map[string]any,
+	bounds signalv1.ResultBounds,
+) (map[string]string, error) {
+	outputs, ok := node["outputs"].(map[string]any)
+	if !ok {
+		return nil, errors.New("task outputs are missing or malformed")
+	}
+
+	parameters, ok := outputs["parameters"].([]any)
+	if !ok {
+		return nil, errors.New("task output parameters are missing or malformed")
+	}
+
+	limits := map[string]int{
+		"verdict":           workflowOutputLimits["verdict"],
+		"reason":            int(bounds.ReasonBytes),
+		"measurements":      int(bounds.MeasurementsBytes),
+		"backend-resources": int(bounds.BackendResourcesBytes),
+		"backend-evidence":  int(bounds.BackendEvidenceBytes),
+		"cleanup-failure":   workflowOutputLimits["cleanup-failure"],
+	}
+
+	decoded, err := decodeWorkflowParametersWithLimits(parameters, limits)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, required := range []string{
+		"verdict",
+		"reason",
+		"measurements",
+		"backend-resources",
+		"backend-evidence",
+		"cleanup-failure",
+	} {
+		if _, exists := decoded[required]; !exists {
+			return nil, fmt.Errorf("required parameter %q is missing", required)
+		}
+	}
+
+	return decoded, nil
+}
+
+func setCheckTimes(status *signalv1.CheckStatus, node map[string]any) {
+	started := nodeString(node, "startedAt")
+	finished := nodeString(node, "finishedAt")
+
+	if parsed, err := time.Parse(time.RFC3339, started); err == nil {
+		value := metav1.NewTime(parsed)
+		status.StartedAt = &value
+	}
+
+	if parsed, err := time.Parse(time.RFC3339, finished); err == nil {
+		value := metav1.NewTime(parsed)
+		status.FinishedAt = &value
+	}
+
+	if status.StartedAt != nil && status.FinishedAt != nil {
+		status.Duration = metav1.Duration{Duration: status.FinishedAt.Sub(status.StartedAt.Time)}
+	}
+}
+
+func nodeString(node map[string]any, key string) string {
+	value, ok := node[key].(string)
+	if !ok {
+		return ""
+	}
+
+	return value
 }
 
 func (r *RunReconciler) finish(
@@ -1100,34 +2292,94 @@ func (r *RunReconciler) evidenceDocument(
 	verdict string,
 	reason string,
 ) ([]byte, error) {
+	if !isGroupedRun(run) {
+		checks := runChecks(run)
+		if len(checks) != 1 {
+			return nil, errors.New("legacy run must contain one check")
+		}
+
+		check := &checks[0]
+
+		var snapshot corev1.ConfigMap
+		if err := r.Get(
+			ctx,
+			client.ObjectKey{Namespace: run.Namespace, Name: check.Script.ConfigMapName},
+			&snapshot,
+		); err != nil {
+			return nil, fmt.Errorf("read script snapshot for evidence: %w", err)
+		}
+
+		doc := map[string]any{
+			"apiVersion":            "signal.unbounded-cloud.io/evidence/v1alpha1",
+			"runID":                 string(run.UID),
+			"runName":               run.Name,
+			"profile":               run.Spec.Profile,
+			"participants":          run.Spec.Participants,
+			"workflow":              run.Status.Workflow,
+			"workflowOutputs":       run.Status.Workflow.Outputs,
+			"backend":               check.Backend,
+			"runnerImage":           check.RunnerImage,
+			"workloadPolicy":        check.WorkloadPolicy,
+			"purpose":               run.Spec.Purpose,
+			"stagePlan":             run.Spec.StagePlan,
+			"runtimeStage":          check.RuntimeStage,
+			"backendActiveDeadline": check.BackendActiveDeadline,
+			"parameters":            check.Parameters,
+			"scriptSnapshot":        check.Script,
+			"scriptContent":         snapshot.Data[check.Script.Key],
+			"executionState":        executionState,
+			"verdict":               verdict,
+			"reason":                reason,
+			"startedAt":             run.Status.StartedAt,
+			"finishedAt":            run.Status.FinishedAt.UTC().Format(time.RFC3339Nano),
+		}
+
+		return json.MarshalIndent(doc, "", "  ")
+	}
+
+	checks := runChecks(run)
+	if len(checks) == 0 {
+		return nil, errors.New("run has no certification checks")
+	}
+
 	var snapshot corev1.ConfigMap
-	if err := r.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.Script.ConfigMapName}, &snapshot); err != nil {
+	if err := r.Get(
+		ctx,
+		client.ObjectKey{Namespace: run.Namespace, Name: checks[0].Script.ConfigMapName},
+		&snapshot,
+	); err != nil {
 		return nil, fmt.Errorf("read script snapshot for evidence: %w", err)
 	}
 
+	scriptContents := make(map[string]string, len(checks))
+	for index := range checks {
+		content, exists := snapshot.Data[checks[index].Script.Key]
+		if !exists {
+			return nil, fmt.Errorf("script snapshot is missing check %s key %s", checks[index].ID, checks[index].Script.Key)
+		}
+
+		scriptContents[string(checks[index].ID)] = content
+	}
+
 	doc := map[string]any{
-		"apiVersion":            "signal.unbounded-cloud.io/evidence/v1alpha1",
-		"runID":                 string(run.UID),
-		"runName":               run.Name,
-		"profile":               run.Spec.Profile,
-		"participants":          run.Spec.Participants,
-		"workflow":              run.Status.Workflow,
-		"workflowOutputs":       run.Status.Workflow.Outputs,
-		"backend":               run.Spec.Backend,
-		"runnerImage":           run.Spec.RunnerImage,
-		"workloadPolicy":        run.Spec.WorkloadPolicy,
-		"purpose":               run.Spec.Purpose,
-		"stagePlan":             run.Spec.StagePlan,
-		"runtimeStage":          run.Spec.RuntimeStage,
-		"backendActiveDeadline": run.Spec.BackendActiveDeadline,
-		"parameters":            run.Spec.Parameters,
-		"scriptSnapshot":        run.Spec.Script,
-		"scriptContent":         snapshot.Data[run.Spec.Script.Key],
-		"executionState":        executionState,
-		"verdict":               verdict,
-		"reason":                reason,
-		"startedAt":             run.Status.StartedAt,
-		"finishedAt":            run.Status.FinishedAt.UTC().Format(time.RFC3339Nano),
+		"apiVersion":          "signal.unbounded-cloud.io/evidence/v1alpha1",
+		"runID":               string(run.UID),
+		"runName":             run.Name,
+		"profile":             run.Spec.Profile,
+		"participants":        run.Spec.Participants,
+		"participantRoles":    run.Spec.ParticipantRoles,
+		"topologyConstraints": run.Spec.TopologyConstraints,
+		"workflow":            run.Status.Workflow,
+		"checks":              checks,
+		"checkStatus":         run.Status.Checks,
+		"scriptContents":      scriptContents,
+		"executionPolicy":     run.Spec.ExecutionPolicy,
+		"purpose":             run.Spec.Purpose,
+		"executionState":      executionState,
+		"verdict":             verdict,
+		"reason":              reason,
+		"startedAt":           run.Status.StartedAt,
+		"finishedAt":          run.Status.FinishedAt.UTC().Format(time.RFC3339Nano),
 	}
 
 	return json.MarshalIndent(doc, "", "  ")
@@ -1222,6 +2474,25 @@ func backendResourceReferences(
 	return references, nil
 }
 
+func backendResourceReferencesForParticipants(
+	value string,
+	globalIndexes []int32,
+) ([]signalv1.BackendResourceReference, error) {
+	references, err := backendResourceReferences(value, len(globalIndexes))
+	if err != nil {
+		return nil, err
+	}
+
+	for referenceIndex := range references {
+		for participantIndex := range references[referenceIndex].ParticipantIndexes {
+			localIndex := references[referenceIndex].ParticipantIndexes[participantIndex]
+			references[referenceIndex].ParticipantIndexes[participantIndex] = globalIndexes[localIndex]
+		}
+	}
+
+	return references, nil
+}
+
 func workflowParameters(workflow *unstructured.Unstructured) (map[string]string, error) {
 	parameters, found, err := unstructured.NestedSlice(workflow.Object, "status", "outputs", "parameters")
 	if err != nil {
@@ -1236,6 +2507,10 @@ func workflowParameters(workflow *unstructured.Unstructured) (map[string]string,
 }
 
 func decodeWorkflowParameters(parameters []any) (map[string]string, error) {
+	return decodeWorkflowParametersWithLimits(parameters, workflowOutputLimits)
+}
+
+func decodeWorkflowParametersWithLimits(parameters []any, limits map[string]int) (map[string]string, error) {
 	outputs := make(map[string]string, len(parameters))
 	for _, raw := range parameters {
 		parameter, ok := raw.(map[string]any)
@@ -1250,7 +2525,7 @@ func decodeWorkflowParameters(parameters []any) (map[string]string, error) {
 			return nil, fmt.Errorf("parameter name and value must be strings")
 		}
 
-		limit, allowed := workflowOutputLimits[name]
+		limit, allowed := limits[name]
 		if !allowed {
 			return nil, fmt.Errorf("unexpected parameter %q", name)
 		}
@@ -1393,6 +2668,134 @@ func backendEvidenceComplete(content string, participantCount int) (bool, error)
 	return evidence.Complete, nil
 }
 
+func groupedBackendEvidenceComplete(content string, participantCount int) (bool, error) {
+	if content == "" {
+		return false, errors.New("backend-evidence is required")
+	}
+
+	var evidence struct {
+		Version      string `json:"version"`
+		Complete     bool   `json:"complete"`
+		CaptureError string `json:"captureError,omitempty"`
+		Participants []struct {
+			ParticipantIndex int `json:"participantIndex"`
+			Resource         struct {
+				APIVersion string    `json:"apiVersion"`
+				Kind       string    `json:"kind"`
+				Namespace  string    `json:"namespace,omitempty"`
+				Name       string    `json:"name"`
+				UID        types.UID `json:"uid"`
+			} `json:"resource"`
+			LauncherJob  any    `json:"launcherJob,omitempty"`
+			Pods         []any  `json:"pods"`
+			CaptureError string `json:"captureError,omitempty"`
+		} `json:"participants"`
+	}
+
+	decoder := json.NewDecoder(strings.NewReader(content))
+	if err := decoder.Decode(&evidence); err != nil {
+		return false, fmt.Errorf("decode backend-evidence: %w", err)
+	}
+
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return false, errors.New("backend-evidence contains trailing JSON values")
+	}
+
+	if evidence.Version != "v1" {
+		return false, fmt.Errorf("backend-evidence version %q is invalid", evidence.Version)
+	}
+
+	if len(evidence.Participants) != participantCount {
+		return false, fmt.Errorf(
+			"backend-evidence contains %d participants, want %d",
+			len(evidence.Participants),
+			participantCount,
+		)
+	}
+
+	seen := make([]bool, participantCount)
+
+	for index := range evidence.Participants {
+		participant := &evidence.Participants[index]
+		if participant.ParticipantIndex < 0 || participant.ParticipantIndex >= participantCount {
+			return false, fmt.Errorf(
+				"backend-evidence participant index %d is out of range",
+				participant.ParticipantIndex,
+			)
+		}
+
+		if seen[participant.ParticipantIndex] {
+			return false, fmt.Errorf(
+				"backend-evidence repeats participant index %d",
+				participant.ParticipantIndex,
+			)
+		}
+
+		seen[participant.ParticipantIndex] = true
+
+		if participant.Resource.APIVersion == "" ||
+			participant.Resource.Kind == "" ||
+			participant.Resource.Name == "" ||
+			participant.Resource.UID == "" {
+			return false, fmt.Errorf(
+				"backend-evidence participant %d has incomplete resource identity",
+				participant.ParticipantIndex,
+			)
+		}
+	}
+
+	return evidence.Complete, nil
+}
+
+func groupedBackendEvidenceForParticipants(
+	content string,
+	globalIndexes []int32,
+) (string, bool, error) {
+	complete, err := groupedBackendEvidenceComplete(content, len(globalIndexes))
+	if err != nil {
+		return "", false, err
+	}
+
+	var evidence map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(content), &evidence); err != nil {
+		return "", false, fmt.Errorf("decode backend-evidence for participant mapping: %w", err)
+	}
+
+	var participants []map[string]json.RawMessage
+	if err := json.Unmarshal(evidence["participants"], &participants); err != nil {
+		return "", false, fmt.Errorf("decode backend-evidence participants for mapping: %w", err)
+	}
+
+	for index := range participants {
+		var localIndex int
+		if err := json.Unmarshal(participants[index]["participantIndex"], &localIndex); err != nil {
+			return "", false, fmt.Errorf("decode backend-evidence participant index: %w", err)
+		}
+
+		mapped, err := json.Marshal(globalIndexes[localIndex])
+		if err != nil {
+			return "", false, fmt.Errorf("encode mapped backend-evidence participant index: %w", err)
+		}
+
+		participants[index]["participantIndex"] = mapped
+	}
+
+	mappedParticipants, err := json.Marshal(participants)
+	if err != nil {
+		return "", false, fmt.Errorf("encode mapped backend-evidence participants: %w", err)
+	}
+
+	evidence["participants"] = mappedParticipants
+
+	normalized, err := json.Marshal(evidence)
+	if err != nil {
+		return "", false, fmt.Errorf("encode mapped backend-evidence: %w", err)
+	}
+
+	return string(normalized), complete, nil
+}
+
 func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationRun) (ctrl.Result, error) {
 	stopped, err := r.ensureWorkflowStopped(ctx, run)
 	if err != nil {
@@ -1407,7 +2810,30 @@ func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationR
 	run.Status.Phase = signalv1.RunPhaseCancelled
 	run.Status.ExecutionState = "Interrupted"
 	run.Status.Verdict = "Inconclusive"
+
 	run.Status.Reason = "canceled by operator"
+	if isGroupedRun(run) {
+		statuses := run.Status.Checks
+		if len(statuses) != len(run.Spec.Checks) {
+			statuses = initialCheckStatuses(run.Spec.Checks)
+		}
+
+		for index := range statuses {
+			if statuses[index].Phase == signalv1.CheckPhaseSucceeded ||
+				statuses[index].Phase == signalv1.CheckPhaseFailed ||
+				statuses[index].Phase == signalv1.CheckPhaseInconclusive {
+				continue
+			}
+
+			statuses[index].Phase = signalv1.CheckPhaseSkipped
+			statuses[index].Verdict = "Inconclusive"
+			statuses[index].Reason = "Canceled"
+			statuses[index].NotRun = true
+		}
+
+		run.Status.Checks = statuses
+	}
+
 	now := metav1.NewTime(r.now())
 
 	run.Status.FinishedAt = &now
@@ -1430,7 +2856,14 @@ func (r *RunReconciler) cleanup(ctx context.Context, run *signalv1.Certification
 
 	deleted := false
 
-	snapshot := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: run.Spec.Script.ConfigMapName}}
+	checks := runChecks(run)
+	if len(checks) == 0 {
+		return ctrl.Result{}, errors.New("run has no certification checks")
+	}
+
+	snapshot := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: checks[0].Script.ConfigMapName},
+	}
 	if err := r.Delete(ctx, snapshot); err != nil && !apierrors.IsNotFound(err) {
 		return ctrl.Result{}, err
 	}
@@ -1711,6 +3144,397 @@ func validateStagePlan(plan []signalv1.CertificationStage) error {
 	}
 
 	return nil
+}
+
+func profileChecks(profile *signalv1.CertificationProfile) []signalv1.CertificationCheck {
+	if len(profile.Spec.Checks) > 0 {
+		checks := make([]signalv1.CertificationCheck, len(profile.Spec.Checks))
+		for index := range profile.Spec.Checks {
+			checks[index] = profile.Spec.Checks[index]
+			checks[index].WorkloadPolicy = *profile.Spec.Checks[index].WorkloadPolicy.DeepCopy()
+			checks[index].RuntimeStage = copyRuntimeStage(profile.Spec.Checks[index].RuntimeStage)
+			checks[index].Parameters = maps.Clone(profile.Spec.Checks[index].Parameters)
+			checks[index].ParticipantPolicy.RequiredRoles = slices.Clone(
+				profile.Spec.Checks[index].ParticipantPolicy.RequiredRoles,
+			)
+			checks[index].ParticipantPolicy.ExcludedRoles = slices.Clone(
+				profile.Spec.Checks[index].ParticipantPolicy.ExcludedRoles,
+			)
+		}
+
+		return checks
+	}
+
+	maxAttempts := profile.Spec.MaxAttempts
+	if maxAttempts < 1 {
+		maxAttempts = DefaultMaxAttempts
+	}
+
+	return []signalv1.CertificationCheck{{
+		ID:                    "legacy",
+		Order:                 0,
+		Script:                profile.Spec.Script,
+		RunnerImage:           profile.Spec.RunnerImage,
+		Backend:               profile.Spec.Backend,
+		WorkloadPolicy:        *profile.Spec.WorkloadPolicy.DeepCopy(),
+		RuntimeStage:          copyRuntimeStage(profile.Spec.RuntimeStage),
+		Parameters:            maps.Clone(profile.Spec.Parameters),
+		BackendActiveDeadline: profile.Spec.BackendActiveDeadline,
+		ResultBounds: signalv1.ResultBounds{
+			ReasonBytes:           int32(workflowOutputLimits["reason"]),
+			MeasurementsBytes:     int32(workflowOutputLimits["measurements"]),
+			BackendResourcesBytes: int32(workflowOutputLimits["backend-resources"]),
+			BackendEvidenceBytes:  64 * 1024,
+		},
+		MaxAttempts: maxAttempts,
+	}}
+}
+
+func runChecks(run *signalv1.CertificationRun) []signalv1.CertificationCheckSnapshot {
+	if len(run.Spec.Checks) > 0 {
+		return run.Spec.Checks
+	}
+
+	return []signalv1.CertificationCheckSnapshot{{
+		ID:    "legacy",
+		Order: 0,
+		Script: signalv1.ScriptSnapshot{
+			ConfigMapName:        run.Spec.Script.ConfigMapName,
+			Key:                  run.Spec.Script.Key,
+			RequiresRuntimeStage: run.Spec.Script.RequiresRuntimeStage,
+			Digest:               run.Spec.Script.Digest,
+		},
+		RunnerImage:           run.Spec.RunnerImage,
+		Backend:               run.Spec.Backend,
+		WorkloadPolicy:        run.Spec.WorkloadPolicy,
+		RuntimeStage:          run.Spec.RuntimeStage,
+		Parameters:            run.Spec.Parameters,
+		BackendActiveDeadline: run.Spec.BackendActiveDeadline,
+		ResultBounds: signalv1.ResultBounds{
+			ReasonBytes:           int32(workflowOutputLimits["reason"]),
+			MeasurementsBytes:     int32(workflowOutputLimits["measurements"]),
+			BackendResourcesBytes: int32(workflowOutputLimits["backend-resources"]),
+			BackendEvidenceBytes:  64 * 1024,
+		},
+		MaxAttempts: run.Spec.MaxAttempts,
+	}}
+}
+
+func isGroupedRun(run *signalv1.CertificationRun) bool {
+	return len(run.Spec.Checks) == groupedCheckCount
+}
+
+func validateCheckPlan(checks []signalv1.CertificationCheck, grouped bool) error {
+	if grouped && len(checks) != groupedCheckCount {
+		return fmt.Errorf("must contain exactly %d checks", groupedCheckCount)
+	}
+
+	seen := make(map[signalv1.CheckID]struct{}, len(checks))
+	for index := range checks {
+		check := &checks[index]
+		if check.ID == "" {
+			return fmt.Errorf("check %d has an empty ID", index)
+		}
+
+		if check.Order != int32(index) {
+			return fmt.Errorf("check %s order is %d, want %d", check.ID, check.Order, index)
+		}
+
+		if grouped && string(check.ID) != fmt.Sprintf("R%02d", index+1) {
+			return fmt.Errorf("check order %d must use ID R%02d", index, index+1)
+		}
+
+		if _, duplicate := seen[check.ID]; duplicate {
+			return fmt.Errorf("duplicate check ID %q", check.ID)
+		}
+
+		seen[check.ID] = struct{}{}
+
+		if grouped && check.MaxAttempts != 1 {
+			return fmt.Errorf("check %s maxAttempts must be exactly 1", check.ID)
+		}
+
+		if err := validateResultBounds(check.ID, check.ResultBounds); err != nil {
+			return err
+		}
+
+		if err := validateCheckParticipantPolicy(check.ID, check.ParticipantPolicy); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func validateRunCheckPlan(checks []signalv1.CertificationCheckSnapshot, grouped bool) error {
+	if grouped && len(checks) != groupedCheckCount {
+		return fmt.Errorf("run must contain exactly %d checks", groupedCheckCount)
+	}
+
+	seen := make(map[signalv1.CheckID]struct{}, len(checks))
+	for index := range checks {
+		check := &checks[index]
+		if check.ID == "" || check.Order != int32(index) {
+			return fmt.Errorf("run check %d has invalid identity or order", index)
+		}
+
+		if grouped && string(check.ID) != fmt.Sprintf("R%02d", index+1) {
+			return fmt.Errorf("run check order %d must use ID R%02d", index, index+1)
+		}
+
+		if _, duplicate := seen[check.ID]; duplicate {
+			return fmt.Errorf("run contains duplicate check ID %q", check.ID)
+		}
+
+		seen[check.ID] = struct{}{}
+
+		if grouped && check.MaxAttempts != 1 {
+			return fmt.Errorf("run check %s maxAttempts must be exactly 1", check.ID)
+		}
+
+		if err := validateResultBounds(check.ID, check.ResultBounds); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func validateResultBounds(id signalv1.CheckID, bounds signalv1.ResultBounds) error {
+	switch {
+	case bounds.ReasonBytes < 1 || bounds.ReasonBytes > int32(workflowOutputLimits["reason"]):
+		return fmt.Errorf("check %s reasonBytes must be between 1 and %d", id, workflowOutputLimits["reason"])
+	case bounds.MeasurementsBytes < 1 || bounds.MeasurementsBytes > int32(workflowOutputLimits["measurements"]):
+		return fmt.Errorf(
+			"check %s measurementsBytes must be between 1 and %d",
+			id,
+			workflowOutputLimits["measurements"],
+		)
+	case bounds.BackendResourcesBytes < 1 ||
+		bounds.BackendResourcesBytes > int32(workflowOutputLimits["backend-resources"]):
+		return fmt.Errorf(
+			"check %s backendResourcesBytes must be between 1 and %d",
+			id,
+			workflowOutputLimits["backend-resources"],
+		)
+	case bounds.BackendEvidenceBytes < 1 || bounds.BackendEvidenceBytes > 64*1024:
+		return fmt.Errorf("check %s backendEvidenceBytes must be between 1 and 65536", id)
+	}
+
+	return nil
+}
+
+func validateCheckParticipantPolicy(id signalv1.CheckID, policy signalv1.CheckParticipantPolicy) error {
+	required := make(map[string]struct{}, len(policy.RequiredRoles))
+	for _, role := range policy.RequiredRoles {
+		if role == "" {
+			return fmt.Errorf("check %s contains an empty required role", id)
+		}
+
+		if _, duplicate := required[role]; duplicate {
+			return fmt.Errorf("check %s repeats required role %q", id, role)
+		}
+
+		required[role] = struct{}{}
+	}
+
+	excluded := make(map[string]struct{}, len(policy.ExcludedRoles))
+	for _, role := range policy.ExcludedRoles {
+		if role == "" {
+			return fmt.Errorf("check %s contains an empty excluded role", id)
+		}
+
+		if _, duplicate := excluded[role]; duplicate {
+			return fmt.Errorf("check %s repeats excluded role %q", id, role)
+		}
+
+		if _, conflict := required[role]; conflict {
+			return fmt.Errorf("check %s both requires and excludes role %q", id, role)
+		}
+
+		excluded[role] = struct{}{}
+	}
+
+	return nil
+}
+
+func validateParticipantConstraints(
+	profile *signalv1.CertificationProfile,
+	checks []signalv1.CertificationCheck,
+) error {
+	roles := make(map[string]struct{}, len(profile.Spec.ParticipantRoles))
+
+	var assigned int32
+
+	for index := range profile.Spec.ParticipantRoles {
+		role := &profile.Spec.ParticipantRoles[index]
+		if role.Name == "" || role.Count < 1 {
+			return fmt.Errorf("participant role %d has invalid name or count", index)
+		}
+
+		if _, duplicate := roles[role.Name]; duplicate {
+			return fmt.Errorf("duplicate participant role %q", role.Name)
+		}
+
+		if _, err := metav1.LabelSelectorAsSelector(&role.Selector); err != nil {
+			return fmt.Errorf("participant role %s selector: %w", role.Name, err)
+		}
+
+		roles[role.Name] = struct{}{}
+		assigned += role.Count
+	}
+
+	if assigned > profile.Spec.Participants.Count {
+		return fmt.Errorf(
+			"participant roles require %d assignments but participant count is %d",
+			assigned,
+			profile.Spec.Participants.Count,
+		)
+	}
+
+	for index := range profile.Spec.TopologyConstraints {
+		constraint := &profile.Spec.TopologyConstraints[index]
+		if _, exists := roles[constraint.Role]; !exists {
+			return fmt.Errorf("topology constraint references unknown role %q", constraint.Role)
+		}
+
+		if constraint.LabelKey == "" || constraint.MinDistinctValues < 1 {
+			return fmt.Errorf("topology constraint %d has invalid label key or minimum", index)
+		}
+	}
+
+	for index := range checks {
+		for _, role := range append(
+			slices.Clone(checks[index].ParticipantPolicy.RequiredRoles),
+			checks[index].ParticipantPolicy.ExcludedRoles...,
+		) {
+			if _, exists := roles[role]; !exists {
+				return fmt.Errorf("check %s references unknown participant role %q", checks[index].ID, role)
+			}
+		}
+	}
+
+	return nil
+}
+
+func participantsForCheck(
+	participants []signalv1.Participant,
+	policy signalv1.CheckParticipantPolicy,
+) ([]signalv1.Participant, []int32, error) {
+	required := make(map[string]bool, len(policy.RequiredRoles))
+	for _, role := range policy.RequiredRoles {
+		required[role] = false
+	}
+
+	excluded := make(map[string]struct{}, len(policy.ExcludedRoles))
+	for _, role := range policy.ExcludedRoles {
+		excluded[role] = struct{}{}
+	}
+
+	selected := make([]signalv1.Participant, 0, len(participants))
+
+	globalIndexes := make([]int32, 0, len(participants))
+	for index := range participants {
+		participant := participants[index]
+		include := len(required) == 0
+
+		for _, role := range participant.Roles {
+			if _, blocked := excluded[role]; blocked {
+				include = false
+
+				break
+			}
+
+			if _, wanted := required[role]; wanted {
+				required[role] = true
+				include = true
+			}
+		}
+
+		if !include {
+			continue
+		}
+
+		globalIndexes = append(globalIndexes, participant.Index)
+		participant.Index = int32(len(selected))
+		selected = append(selected, participant)
+	}
+
+	if len(selected) == 0 {
+		return nil, nil, errors.New("participant policy selected no participants")
+	}
+
+	for role, present := range required {
+		if !present {
+			return nil, nil, fmt.Errorf("required role %q has no selected participant", role)
+		}
+	}
+
+	return selected, globalIndexes, nil
+}
+
+func setLegacyRunAliases(spec *signalv1.CertificationRunSpec) {
+	if len(spec.Checks) == 0 {
+		return
+	}
+
+	first := &spec.Checks[0]
+	spec.Script = signalv1.LegacyScriptSnapshot{
+		ConfigMapName:        first.Script.ConfigMapName,
+		Key:                  first.Script.Key,
+		RequiresRuntimeStage: first.Script.RequiresRuntimeStage,
+		Digest:               first.Script.Digest,
+	}
+	spec.Backend = first.Backend
+	spec.RunnerImage = first.RunnerImage
+	spec.WorkloadPolicy = first.WorkloadPolicy
+	spec.RuntimeStage = first.RuntimeStage
+	spec.Parameters = first.Parameters
+	spec.BackendActiveDeadline = first.BackendActiveDeadline
+	spec.MaxAttempts = first.MaxAttempts
+}
+
+func sanitizeTaskName(value string) string {
+	value = strings.ToLower(value)
+	value = strings.Map(func(character rune) rune {
+		if character >= 'a' && character <= 'z' ||
+			character >= '0' && character <= '9' ||
+			character == '-' {
+			return character
+		}
+
+		return '-'
+	}, value)
+
+	value = strings.Trim(value, "-")
+	if value == "" {
+		value = "check"
+	}
+
+	if len(value) > 48 {
+		value = strings.TrimRight(value[:48], "-")
+	}
+
+	return value
+}
+
+func checkTaskName(check *signalv1.CertificationCheckSnapshot) string {
+	return fmt.Sprintf("check-%02d-%s", check.Order, sanitizeTaskName(string(check.ID)))
+}
+
+func checkRunName(runName string, checkID signalv1.CheckID) string {
+	suffix := sanitizeTaskName(string(checkID))
+
+	candidate := runName + "-" + suffix
+	if len(candidate) <= 63 {
+		return candidate
+	}
+
+	sum := sha256.Sum256([]byte(candidate))
+	hash := hex.EncodeToString(sum[:4])
+	prefixLength := 63 - len(hash) - 1
+
+	return strings.TrimRight(candidate[:prefixLength], "-") + "-" + hash
 }
 
 func copyRuntimeStage(stage *signalv1.RuntimeStage) *signalv1.RuntimeStage {

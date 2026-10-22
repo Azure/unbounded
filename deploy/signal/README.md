@@ -10,27 +10,27 @@ or environment-specific queue configuration.
 ## Architecture
 
 ```text
-approved Node or recurring policy
+approved Node request
               |
               v
       CertificationProfile
               |
               v
- reserve Nodes and snapshot the selected ConfigMap key
+ reserve Nodes and snapshot the ordered 15-check script plan
               |
               v
  immutable CertificationRun input + SHA-256 digest
               |
               v
- operator-supplied or generic adapter WorkflowTemplate
+ one Argo Workflow with a serial, visible 15-task DAG
               |
               v
- typed result -> retained evidence -> Node projection -> cleanup
+ per-check typed results -> aggregate evidence -> Node projection -> cleanup
 ```
 
-The controller snapshots one selected script key from a source ConfigMap into
-a run-owned immutable ConfigMap. Updating the source affects only later runs.
-The controller does not contain or publish certification script bodies.
+The controller snapshots all 15 selected script keys into one run-owned
+immutable ConfigMap. Updating a source affects only later runs. The controller
+does not contain or publish certification script bodies.
 
 ## Prerequisites
 
@@ -96,7 +96,7 @@ The Workflow must publish only these output parameters:
 | `reason` | 4 KiB | Bounded diagnostic reason |
 | `measurements` | 16 KiB | Bounded measurement summary |
 | `backend-resources` | 16 KiB | Optional JSON array of backend workload identities and covered participant indexes; required for a multi-Node `Pass` |
-| `backend-evidence` | 256 KiB | Required redacted pre-cleanup backend object, container state, and bounded current/previous log projection |
+| `backend-evidence` | 64 KiB per check | Required redacted pre-cleanup backend object, container state, and bounded current/previous log projection |
 
 Unexpected, duplicate, malformed, or oversized outputs are rejected and the
 run remains fail-closed. Each `backend-resources` entry must contain
@@ -223,31 +223,50 @@ kubectl apply -f deploy/signal/rendered/
 ```
 
 The upstream manifests install no profiles. Operators must create a
-CertificationProfile that references their own script ConfigMap and
-digest-pinned runner image. To use the included adapter, set
-`spec.workflow.name: project-signal-participant-adapter` and select either:
+CertificationProfile with exactly 15 checks that reference operator-owned
+script ConfigMaps and digest-pinned runner images. To use the included adapter,
+set `spec.workflow.name: project-signal-participant-adapter`. Each
+`spec.checks[]` entry selects either:
 
 ```yaml
-backend:
-  apiVersion: v1
-  kind: Pod
-  queue: <optional-local-queue>
+checks:
+  - id: <stable-check-id>
+    order: 0
+    script:
+      name: <script-configmap>
+      key: <script-key>
+      digest: sha256:<approved-script-digest>
+    runnerImage: <runner-image>@sha256:<digest>
+    backend:
+      apiVersion: v1
+      kind: Pod
+      queue: <optional-local-queue>
+    backendActiveDeadline: 19m
+    resultBounds:
+      reasonBytes: 4096
+      measurementsBytes: 16384
+      backendResourcesBytes: 16384
+      backendEvidenceBytes: 65536
+    maxAttempts: 1
 ```
 
 or an explicit Kueue queue:
 
 ```yaml
-backend:
-  apiVersion: kubeflow.org/v2beta1
-  kind: MPIJob
-  queue: <local-queue>
+checks:
+  - id: <stable-check-id>
+    order: <0-14>
+    backend:
+      apiVersion: kubeflow.org/v2beta1
+      kind: MPIJob
+      queue: <local-queue>
 ```
 
 When a Pod backend supplies a queue, the adapter writes the standard
 `kueue.x-k8s.io/queue-name` label. MPIJob backends require a queue; Pod backends
 may omit it only when the operator intentionally runs them outside Kueue.
 
-Profiles may set `spec.workloadPolicy` when a diagnostic needs explicit
+Checks may set `spec.checks[].workloadPolicy` when a diagnostic needs explicit
 participant-container policy. The controller validates and snapshots this
 policy into the immutable CertificationRun before reserving Nodes. The included
 adapter applies it to the ordinary Pod container or the MPIJob worker only; the
@@ -299,9 +318,10 @@ admission and operator policy still decide whether a capability, host path,
 device, PVC, or privileged context is allowed; technical rendering is not
 authorization.
 
-Stage-aware scripts declare `spec.script.requiresRuntimeStage: true` and require
-an explicit `spec.runtimeStage.name`. The name is a lowercase DNS label of at
-most 63 characters and is snapshotted into the immutable CertificationRun and
+Stage-aware scripts declare
+`spec.checks[].script.requiresRuntimeStage: true` and require an explicit
+`spec.checks[].runtimeStage.name`. The name is a lowercase DNS label of at most
+63 characters and is snapshotted into the immutable CertificationRun and
 evidence. The adapter exports it as `PROJECT_SIGNAL_STAGE_NAME` only to ordinary
 participant Pods and MPIJob workers. MPI launchers never receive it. Scripts
 that are not stage-aware leave both fields unset.
@@ -310,14 +330,15 @@ Every profile sets two distinct deadlines:
 
 ```yaml
 deadline: 20m
-backendActiveDeadline: 19m
+checks:
+  - backendActiveDeadline: 19m
 ```
 
 `deadline` is the outer Workflow deadline for backend observation, result and
-evidence projection, and cleanup. `backendActiveDeadline` is rendered to the
-participant Pod or MPIJob `activeDeadlineSeconds`. It must be positive and
-leave at least 60 seconds before the outer deadline; the controller rejects an
-invalid ordering before reserving Nodes.
+evidence projection, and cleanup. Each check's `backendActiveDeadline` is
+rendered to its participant Pod or MPIJob `activeDeadlineSeconds`. It must be
+positive and leave at least 60 seconds before the outer deadline; the
+controller rejects an invalid ordering before reserving Nodes.
 
 `kueueTopology.requiredLevel` is an explicit Kueue Topology Aware Scheduling
 request. It must be a valid Kubernetes label key and requires a nonempty backend
@@ -347,13 +368,24 @@ parameters `backend-backoff-limit` and
 script environment and remain explicit per-profile policy rather than cluster
 defaults.
 
-A `CertificationProfile` and `CertificationRun` each select one immutable
-script key and one backend. `purpose: FullCertification` and `stagePlan`
-describe evidence and are distinct from the optional runtime stage passed to a
-single script; they do not execute a multi-key suite. Operators that define a
-full suite must create one run per script and admit the next run only after the
-previous run is terminal and its backend cleanup has completed. The upstream
-controller does not synthesize a cross-run verdict.
+A `CertificationProfile` defines exactly 15 ordered checks. Admission snapshots
+the complete plan and selected participants once into one immutable
+`CertificationRun`. Each check binds its script identity and digest, runner,
+backend, workload and topology policy, runtime inputs, deadline, result bounds,
+participant-role inclusion or exclusion, and `maxAttempts: 1`.
+
+The controller creates one Argo Workflow with an inline DAG entrypoint. Every
+task invokes the configured adapter `certification` template through
+`templateRef`; dependencies make execution serial and visible in
+`status.nodes`. `executionPolicy.onFailure` is immutable and is either `Stop`
+or `Continue`. A stopped task is recorded as skipped/not-run, never inferred as
+a diagnostic result. Grouped suites cannot enable recurring admission.
+
+Participant roles and topology constraints are generic typed policy. Profiles
+can, for example, bind one role to one participant, another role to three
+participants, require the latter to span at least two values of an operator
+chosen topology label, and exclude a role from a specific check without
+publishing environment-specific names or label values upstream.
 
 ## Results and evidence
 
@@ -365,16 +397,22 @@ executionState=Error,     verdict=Inconclusive, reason=<workflow reason>
 ```
 
 Ambiguous or incomplete workflow execution remains `Inconclusive`. The
-controller does not infer a successful result from partial evidence.
+controller identifies each check only by its deterministic DAG task-node name
+and rejects missing, duplicate, malformed, partial, or unexpected outputs. An
+aggregate `Pass` requires all 15 checks, exact participant and backend
+coverage, complete v1 backend evidence, and successful backend cleanup.
 If backend execution and cleanup both fail, `reason` retains the first causal
 backend failure and the bounded `cleanup-failure` Workflow output records
 `BackendCleanupFailed` separately. Cleanup failure always forces
 `executionState=Error` and `verdict=Inconclusive`, including after an otherwise
 successful diagnostic.
 
-Cluster-local evidence consists of CertificationRun status, the referenced
-Workflow and backend status, Events, pod logs, termination messages, and the
-SHA-256 digest of the controller's terminal evidence document.
+CertificationRun status retains bounded measurements, backend identities, and
+the SHA-256 digest and completeness of each check's backend-evidence v1
+document. Full backend-evidence content and script snapshots are retained only
+in the immutable terminal evidence artifact. Small artifacts use one
+ConfigMap; larger artifacts use an immutable manifest plus bounded immutable
+chunks so valid grouped evidence cannot exceed one Kubernetes object limit.
 
 ## Node metadata
 
@@ -406,8 +444,8 @@ kubectl -n project-signal patch certificationrun <run-name> \
   --type=merge -p '{"spec":{"cancel":true}}'
 ```
 
-Before removing the controller, disable recurring policies and wait for active
-runs to become terminal. Argo Workflows and any workload backend may be shared
+Before removing the controller, wait for active grouped runs to become
+terminal. Argo Workflows and any workload backend may be shared
 cluster services and must not be removed as part of Project Signal cleanup.
 
 ## Non-goals

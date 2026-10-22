@@ -35,10 +35,10 @@ func TestAdmissionCreatesImmutableSnapshotAndPreventsDuplicate(t *testing.T) {
 	node := readyNode("gpu-0", "example-gpu")
 	node.Labels[RequestLabel] = "gpu-smoke"
 	profile := testProfile("gpu-smoke", "example-gpu")
-	profile.Spec.Script.RequiresRuntimeStage = true
-	profile.Spec.RuntimeStage = &signalv1.RuntimeStage{Name: "collective-bandwidth"}
-	profile.Spec.Backend.Queue = "certification"
-	profile.Spec.WorkloadPolicy = signalv1.WorkloadPolicy{
+	profile.Spec.Checks[0].Script.RequiresRuntimeStage = true
+	profile.Spec.Checks[0].RuntimeStage = &signalv1.RuntimeStage{Name: "collective-bandwidth"}
+	profile.Spec.Checks[0].Backend.Queue = "certification"
+	profile.Spec.Checks[0].WorkloadPolicy = signalv1.WorkloadPolicy{
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")},
 			Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("8")},
@@ -82,38 +82,36 @@ func TestAdmissionCreatesImmutableSnapshotAndPreventsDuplicate(t *testing.T) {
 	}
 
 	run := runs.Items[0]
-	if run.Spec.Script.Digest != digestString(payload) {
-		t.Fatalf("script digest = %q", run.Spec.Script.Digest)
+
+	check := run.Spec.Checks[0]
+	if check.Script.Digest != digestString(payload) {
+		t.Fatalf("script digest = %q", check.Script.Digest)
 	}
 
-	if len(run.Spec.StagePlan) != 1 || run.Spec.StagePlan[0].ID != "workload" {
-		t.Fatalf("stage plan = %#v, want immutable profile plan", run.Spec.StagePlan)
-	}
-
-	if !run.Spec.Script.RequiresRuntimeStage ||
-		run.Spec.RuntimeStage == nil ||
-		run.Spec.RuntimeStage.Name != "collective-bandwidth" ||
-		run.Spec.BackendActiveDeadline.Duration != 9*time.Minute {
+	if !check.Script.RequiresRuntimeStage ||
+		check.RuntimeStage == nil ||
+		check.RuntimeStage.Name != "collective-bandwidth" ||
+		check.BackendActiveDeadline.Duration != 9*time.Minute {
 		t.Fatalf("runtime contract = script %#v stage %#v backend deadline %s",
-			run.Spec.Script, run.Spec.RuntimeStage, run.Spec.BackendActiveDeadline.Duration)
+			check.Script, check.RuntimeStage, check.BackendActiveDeadline.Duration)
 	}
 
 	if run.Spec.Purpose != signalv1.PurposeQuickCertification {
 		t.Fatalf("purpose = %q, want %q", run.Spec.Purpose, signalv1.PurposeQuickCertification)
 	}
 
-	if !run.Spec.WorkloadPolicy.HostNetwork ||
-		run.Spec.WorkloadPolicy.KueueTopology == nil ||
-		run.Spec.WorkloadPolicy.KueueTopology.RequiredLevel != corev1.LabelHostname ||
-		run.Spec.WorkloadPolicy.Resources.Limits.Cpu().String() != "8" ||
-		len(run.Spec.WorkloadPolicy.Volumes) != 1 ||
-		run.Spec.WorkloadPolicy.Volumes[0].EmptyDir.SizeLimit.String() != "8Gi" {
-		t.Fatalf("workload policy = %#v, want immutable profile policy", run.Spec.WorkloadPolicy)
+	if !check.WorkloadPolicy.HostNetwork ||
+		check.WorkloadPolicy.KueueTopology == nil ||
+		check.WorkloadPolicy.KueueTopology.RequiredLevel != corev1.LabelHostname ||
+		check.WorkloadPolicy.Resources.Limits.Cpu().String() != "8" ||
+		len(check.WorkloadPolicy.Volumes) != 1 ||
+		check.WorkloadPolicy.Volumes[0].EmptyDir.SizeLimit.String() != "8Gi" {
+		t.Fatalf("workload policy = %#v, want immutable profile policy", check.WorkloadPolicy)
 	}
 
-	if run.Spec.Parameters["observed-gpu-capacity"] != "8" ||
-		run.Spec.Parameters["observed-gpu-allocatable"] != "8" {
-		t.Fatalf("observed GPU inventory = %#v", run.Spec.Parameters)
+	if check.Parameters["observed-gpu-capacity"] != "8" ||
+		check.Parameters["observed-gpu-allocatable"] != "8" {
+		t.Fatalf("observed GPU inventory = %#v", check.Parameters)
 	}
 
 	if run.Annotations[RunTriggerAnnotation] != "manual" {
@@ -121,7 +119,7 @@ func TestAdmissionCreatesImmutableSnapshotAndPreventsDuplicate(t *testing.T) {
 	}
 
 	var snapshot corev1.ConfigMap
-	if err := kube.Get(context.Background(), client.ObjectKey{Namespace: "signal", Name: run.Spec.Script.ConfigMapName}, &snapshot); err != nil {
+	if err := kube.Get(context.Background(), client.ObjectKey{Namespace: "signal", Name: check.Script.ConfigMapName}, &snapshot); err != nil {
 		t.Fatalf("get snapshot: %v", err)
 	}
 
@@ -150,7 +148,7 @@ func TestAdmissionRejectsMissingRequiredRuntimeStageBeforeReservation(t *testing
 	node := readyNode("gpu-0", "example-gpu")
 	node.Labels[RequestLabel] = "gpu-smoke"
 	profile := testProfile("gpu-smoke", "example-gpu")
-	profile.Spec.Script.RequiresRuntimeStage = true
+	profile.Spec.Checks[0].Script.RequiresRuntimeStage = true
 	source := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: "scripts", Namespace: "signal"},
 		Data:       map[string]string{"payload.txt": "test payload\n"},
@@ -183,7 +181,7 @@ func TestAdmissionRejectsInsufficientBackendDeadlineReserveBeforeReservation(t *
 	node := readyNode("gpu-0", "example-gpu")
 	node.Labels[RequestLabel] = "gpu-smoke"
 	profile := testProfile("gpu-smoke", "example-gpu")
-	profile.Spec.BackendActiveDeadline = metav1.Duration{
+	profile.Spec.Checks[0].BackendActiveDeadline = metav1.Duration{
 		Duration: profile.Spec.Deadline.Duration - 59*time.Second,
 	}
 	source := &corev1.ConfigMap{
@@ -218,7 +216,7 @@ func TestAdmissionRejectsMutableRunnerImageBeforeReservation(t *testing.T) {
 	node := readyNode("gpu-0", "example-gpu")
 	node.Labels[RequestLabel] = "gpu-smoke"
 	profile := testProfile("gpu-smoke", "example-gpu")
-	profile.Spec.RunnerImage = "registry.example/runner:latest"
+	profile.Spec.Checks[0].RunnerImage = "registry.example/runner:latest"
 	source := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: "scripts", Namespace: "signal"},
 		Data:       map[string]string{"payload.txt": "test payload\n"},
@@ -252,7 +250,7 @@ func TestAdmissionRejectsInvalidWorkloadPolicyBeforeReservation(t *testing.T) {
 	node := readyNode("gpu-0", "example-gpu")
 	node.Labels[RequestLabel] = "gpu-smoke"
 	profile := testProfile("gpu-smoke", "example-gpu")
-	profile.Spec.WorkloadPolicy.Volumes = []signalv1.WorkloadVolume{{
+	profile.Spec.Checks[0].WorkloadPolicy.Volumes = []signalv1.WorkloadVolume{{
 		Name:      "replacement",
 		MountPath: "/results",
 		EmptyDir:  &corev1.EmptyDirVolumeSource{},
@@ -289,8 +287,8 @@ func TestAdmissionRejectsKueueTopologyWithoutQueueBeforeReservation(t *testing.T
 	node := readyNode("gpu-0", "example-gpu")
 	node.Labels[RequestLabel] = "gpu-smoke"
 	profile := testProfile("gpu-smoke", "example-gpu")
-	profile.Spec.Backend = signalv1.ExecutionBackend{APIVersion: "v1", Kind: "Pod"}
-	profile.Spec.WorkloadPolicy.KueueTopology = &signalv1.KueueTopologyPolicy{
+	profile.Spec.Checks[0].Backend = signalv1.ExecutionBackend{APIVersion: "v1", Kind: "Pod"}
+	profile.Spec.Checks[0].WorkloadPolicy.KueueTopology = &signalv1.KueueTopologyPolicy{
 		RequiredLevel: corev1.LabelHostname,
 	}
 	source := &corev1.ConfigMap{
@@ -720,19 +718,19 @@ func TestWorkflowPinsAttemptInputs(t *testing.T) {
 
 	run := testRun("run-1")
 	run.UID = types.UID("run-uid")
-	run.Spec.Parameters = map[string]string{
+	run.Spec.Checks[0].Parameters = map[string]string{
 		"expected-gpu-count": "8",
 		"health-mode":        "snapshot",
 		"mpi-payload-mode":   "script",
 	}
-	run.Spec.Script.RequiresRuntimeStage = true
-	run.Spec.RuntimeStage = &signalv1.RuntimeStage{Name: "collective-bandwidth"}
+	run.Spec.Checks[0].Script.RequiresRuntimeStage = true
+	run.Spec.Checks[0].RuntimeStage = &signalv1.RuntimeStage{Name: "collective-bandwidth"}
 	run.Spec.Tolerations = []corev1.Toleration{{
 		Key:      "nvidia.com/gpu",
 		Operator: corev1.TolerationOpExists,
 		Effect:   corev1.TaintEffectNoSchedule,
 	}}
-	run.Spec.WorkloadPolicy = signalv1.WorkloadPolicy{
+	run.Spec.Checks[0].WorkloadPolicy = signalv1.WorkloadPolicy{
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")},
 			Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("8")},
@@ -785,7 +783,9 @@ func TestWorkflowPinsAttemptInputs(t *testing.T) {
 		values[parameter["name"].(string)] = parameter["value"].(string)
 	}
 
-	if values["script-digest"] != run.Spec.Script.Digest || values["backend-kind"] != "MPIJob" || values["attempt"] != "2" {
+	if values["script-digest"] != run.Spec.Checks[0].Script.Digest ||
+		values["backend-kind"] != "MPIJob" ||
+		values["attempt"] != "2" {
 		t.Fatalf("workflow values = %#v", values)
 	}
 
@@ -810,7 +810,8 @@ func TestWorkflowPinsAttemptInputs(t *testing.T) {
 		t.Fatalf("workflow participants = %#v", participants)
 	}
 
-	if values["script-configmap"] != run.Spec.Script.ConfigMapName || values["script-configmap"] == "scripts" {
+	if values["script-configmap"] != run.Spec.Checks[0].Script.ConfigMapName ||
+		values["script-configmap"] == "scripts" {
 		t.Fatalf("workflow must mount the immutable snapshot, values = %#v", values)
 	}
 
@@ -858,7 +859,7 @@ func TestBuildWorkflowRejectsParameterThatCannotBecomeEnvironmentVariable(t *tes
 	t.Parallel()
 
 	run := testRun("run-invalid-parameter")
-	run.Spec.Parameters = map[string]string{"invalid.parameter": "value"}
+	run.Spec.Checks[0].Parameters = map[string]string{"invalid.parameter": "value"}
 
 	if _, err := buildWorkflow(run, 1); err == nil ||
 		!strings.Contains(err.Error(), "cannot be mapped to a script environment variable") {
@@ -1030,8 +1031,8 @@ func TestMultiNodePassWithoutBackendIdentityBecomesInconclusive(t *testing.T) {
 		StartedAt: ptrTime(metav1.NewTime(time.Unix(100, 0))),
 	}
 	snapshot := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: run.Spec.Script.ConfigMapName, Namespace: run.Namespace},
-		Data:       map[string]string{run.Spec.Script.Key: "test payload\n"},
+		ObjectMeta: metav1.ObjectMeta{Name: run.Spec.Checks[0].Script.ConfigMapName, Namespace: run.Namespace},
+		Data:       map[string]string{run.Spec.Checks[0].Script.Key: "test payload\n"},
 	}
 	workflow := workflowObject(run, "Succeeded", "Pass", "Healthy")
 	store := &memoryEvidenceStore{}
@@ -1073,8 +1074,8 @@ func TestMultiNodePassRetainsCoveredBackendIdentities(t *testing.T) {
 		StartedAt: ptrTime(metav1.NewTime(time.Unix(100, 0))),
 	}
 	snapshot := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: run.Spec.Script.ConfigMapName, Namespace: run.Namespace},
-		Data:       map[string]string{run.Spec.Script.Key: "test payload\n"},
+		ObjectMeta: metav1.ObjectMeta{Name: run.Spec.Checks[0].Script.ConfigMapName, Namespace: run.Namespace},
+		Data:       map[string]string{run.Spec.Checks[0].Script.Key: "test payload\n"},
 	}
 	workflow := workflowObject(run, "Succeeded", "Pass", "Healthy")
 
@@ -1282,8 +1283,8 @@ func TestTerminalVerdictUsesEntrypointOutputsWhenTopLevelAbsent(t *testing.T) {
 		StartedAt: ptrTime(metav1.NewTime(time.Unix(100, 0))),
 	}
 	snapshot := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: run.Spec.Script.ConfigMapName, Namespace: run.Namespace},
-		Data:       map[string]string{run.Spec.Script.Key: "test payload\n"},
+		ObjectMeta: metav1.ObjectMeta{Name: run.Spec.Checks[0].Script.ConfigMapName, Namespace: run.Namespace},
+		Data:       map[string]string{run.Spec.Checks[0].Script.Key: "test payload\n"},
 	}
 	workflow := workflowObject(run, "Succeeded", "Pass", "Healthy")
 
@@ -1354,9 +1355,9 @@ func TestTerminalVerdictPersistsEvidenceAndCleanupReleasesNode(t *testing.T) {
 
 	scheme := testScheme(t)
 	run := testRun("run-pass")
-	run.Spec.RuntimeStage = &signalv1.RuntimeStage{Name: "collective-bandwidth"}
-	run.Spec.Backend.Queue = "certification"
-	run.Spec.WorkloadPolicy.KueueTopology = &signalv1.KueueTopologyPolicy{
+	run.Spec.Checks[0].RuntimeStage = &signalv1.RuntimeStage{Name: "collective-bandwidth"}
+	run.Spec.Checks[0].Backend.Queue = "certification"
+	run.Spec.Checks[0].WorkloadPolicy.KueueTopology = &signalv1.KueueTopologyPolicy{
 		RequiredLevel: corev1.LabelHostname,
 	}
 	run.Status = signalv1.CertificationRunStatus{
@@ -1368,8 +1369,8 @@ func TestTerminalVerdictPersistsEvidenceAndCleanupReleasesNode(t *testing.T) {
 	node.Labels[RequestLabel] = run.Spec.Profile.Name
 	node.Annotations = map[string]string{ReservationLabel: run.Name}
 	snapshot := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: run.Spec.Script.ConfigMapName, Namespace: run.Namespace},
-		Data:       map[string]string{run.Spec.Script.Key: "test payload\n"},
+		ObjectMeta: metav1.ObjectMeta{Name: run.Spec.Checks[0].Script.ConfigMapName, Namespace: run.Namespace},
+		Data:       map[string]string{run.Spec.Checks[0].Script.Key: "test payload\n"},
 	}
 	workflow := workflowObject(run, "Succeeded", "Pass", "Healthy")
 	store := &memoryEvidenceStore{}
@@ -1427,12 +1428,16 @@ func TestTerminalVerdictPersistsEvidenceAndCleanupReleasesNode(t *testing.T) {
 		t.Fatalf("evidence workflow = %#v", evidence.Workflow)
 	}
 
-	if !reflect.DeepEqual(evidence.WorkloadPolicy, run.Spec.WorkloadPolicy) {
-		t.Fatalf("evidence workload policy = %#v, want %#v", evidence.WorkloadPolicy, run.Spec.WorkloadPolicy)
+	if !reflect.DeepEqual(evidence.WorkloadPolicy, run.Spec.Checks[0].WorkloadPolicy) {
+		t.Fatalf(
+			"evidence workload policy = %#v, want %#v",
+			evidence.WorkloadPolicy,
+			run.Spec.Checks[0].WorkloadPolicy,
+		)
 	}
 
-	if !reflect.DeepEqual(evidence.RuntimeStage, run.Spec.RuntimeStage) ||
-		evidence.BackendActiveDeadline != run.Spec.BackendActiveDeadline {
+	if !reflect.DeepEqual(evidence.RuntimeStage, run.Spec.Checks[0].RuntimeStage) ||
+		evidence.BackendActiveDeadline != run.Spec.Checks[0].BackendActiveDeadline {
 		t.Fatalf("evidence runtime contract = stage %#v deadline %s",
 			evidence.RuntimeStage, evidence.BackendActiveDeadline.Duration)
 	}
@@ -1474,8 +1479,8 @@ func TestTerminalFinalizationRetriesWithIdenticalEvidence(t *testing.T) {
 	node := readyNode("gpu-0", "A100")
 	node.Annotations = map[string]string{ReservationLabel: run.Name}
 	snapshot := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: run.Spec.Script.ConfigMapName, Namespace: run.Namespace},
-		Data:       map[string]string{run.Spec.Script.Key: "test payload\n"},
+		ObjectMeta: metav1.ObjectMeta{Name: run.Spec.Checks[0].Script.ConfigMapName, Namespace: run.Namespace},
+		Data:       map[string]string{run.Spec.Checks[0].Script.Key: "test payload\n"},
 	}
 	workflow := workflowObject(run, "Succeeded", "Pass", "Healthy")
 	statusPatches := 0
@@ -1639,7 +1644,7 @@ func TestWorkflowFailureRetriesWithoutSwitchingPinnedInputs(t *testing.T) {
 
 	scheme := testScheme(t)
 	run := testRun("run-retry")
-	run.Spec.MaxAttempts = 2
+	run.Spec.Checks[0].MaxAttempts = 2
 	run.Status = signalv1.CertificationRunStatus{
 		Phase:    signalv1.RunPhaseRunning,
 		Workflow: signalv1.WorkflowStatus{Name: "run-retry-a1", Attempt: 1},
@@ -1672,11 +1677,11 @@ func TestWorkflowFailureRetriesWithoutSwitchingPinnedInputs(t *testing.T) {
 		t.Fatalf("get retry workflow: %v", err)
 	}
 
-	if value := workflowArgument(&retry, "script-digest"); value != run.Spec.Script.Digest {
+	if value := workflowArgument(&retry, "script-digest"); value != run.Spec.Checks[0].Script.Digest {
 		t.Fatalf("retry script digest = %q", value)
 	}
 
-	if value := workflowArgument(&retry, "backend-kind"); value != run.Spec.Backend.Kind {
+	if value := workflowArgument(&retry, "backend-kind"); value != run.Spec.Checks[0].Backend.Kind {
 		t.Fatalf("retry backend = %q", value)
 	}
 }
@@ -1692,8 +1697,8 @@ func TestCanceledRunCleansUpDespiteCancelFlag(t *testing.T) {
 	node.Labels[RequestLabel] = run.Spec.Profile.Name
 	node.Annotations = map[string]string{ReservationLabel: run.Name}
 	snapshot := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: run.Spec.Script.ConfigMapName, Namespace: run.Namespace},
-		Data:       map[string]string{run.Spec.Script.Key: "test payload\n"},
+		ObjectMeta: metav1.ObjectMeta{Name: run.Spec.Checks[0].Script.ConfigMapName, Namespace: run.Namespace},
+		Data:       map[string]string{run.Spec.Checks[0].Script.Key: "test payload\n"},
 	}
 	kube := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -1726,6 +1731,14 @@ func (s *memoryEvidenceStore) Put(_ context.Context, path string, data []byte) (
 	return "memory://" + path, digestString(string(data)), nil
 }
 
+func (s *memoryEvidenceStore) Get(_ context.Context, path string) ([]byte, string, string, bool, error) {
+	if s.data == nil {
+		return nil, "", "", false, nil
+	}
+
+	return append([]byte(nil), s.data...), "memory://" + path, digestString(string(s.data)), true, nil
+}
+
 type immutableMemoryEvidenceStore struct {
 	data []byte
 	puts int
@@ -1740,6 +1753,14 @@ func (s *immutableMemoryEvidenceStore) Put(_ context.Context, path string, data 
 	s.data = append([]byte(nil), data...)
 
 	return "memory://" + path, digestString(string(data)), nil
+}
+
+func (s *immutableMemoryEvidenceStore) Get(_ context.Context, path string) ([]byte, string, string, bool, error) {
+	if s.data == nil {
+		return nil, "", "", false, nil
+	}
+
+	return append([]byte(nil), s.data...), "memory://" + path, digestString(string(s.data)), true, nil
 }
 
 func testScheme(t *testing.T) *runtime.Scheme {
@@ -1778,7 +1799,7 @@ func readyNode(name, sku string) *corev1.Node {
 }
 
 func testProfile(name, sku string) *signalv1.CertificationProfile {
-	return &signalv1.CertificationProfile{
+	profile := &signalv1.CertificationProfile{
 		ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(name + "-uid"), Generation: 3},
 		Spec: signalv1.CertificationProfileSpec{
 			Participants: signalv1.ParticipantPolicy{
@@ -1788,7 +1809,11 @@ func testProfile(name, sku string) *signalv1.CertificationProfile {
 				}},
 				RequiredResources: corev1.ResourceList{corev1.ResourceName("nvidia.com/gpu"): resource.MustParse("1")},
 			},
-			Script:                signalv1.ScriptReference{Name: "scripts", Key: "payload.txt"},
+			Script: signalv1.ScriptReference{
+				Name:   "scripts",
+				Key:    "payload.txt",
+				Digest: digestString("test payload\n"),
+			},
 			Workflow:              signalv1.WorkflowReference{Name: "gpu-cert"},
 			Backend:               signalv1.ExecutionBackend{APIVersion: "kubeflow.org/v2beta1", Kind: "MPIJob"},
 			RunnerImage:           "runner@sha256:" + strings.Repeat("a", 64),
@@ -1800,10 +1825,31 @@ func testProfile(name, sku string) *signalv1.CertificationProfile {
 			MaxAttempts:           2,
 		},
 	}
+
+	profile.Spec.Checks = []signalv1.CertificationCheck{{
+		ID:                    "legacy",
+		Order:                 0,
+		Script:                profile.Spec.Script,
+		RunnerImage:           profile.Spec.RunnerImage,
+		Backend:               profile.Spec.Backend,
+		WorkloadPolicy:        profile.Spec.WorkloadPolicy,
+		RuntimeStage:          profile.Spec.RuntimeStage,
+		Parameters:            profile.Spec.Parameters,
+		BackendActiveDeadline: profile.Spec.BackendActiveDeadline,
+		ResultBounds: signalv1.ResultBounds{
+			ReasonBytes:           4096,
+			MeasurementsBytes:     16384,
+			BackendResourcesBytes: 16384,
+			BackendEvidenceBytes:  65536,
+		},
+		MaxAttempts: profile.Spec.MaxAttempts,
+	}}
+
+	return profile
 }
 
 func testRun(name string) *signalv1.CertificationRun {
-	return &signalv1.CertificationRun{
+	run := &signalv1.CertificationRun{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       name,
 			Namespace:  "signal",
@@ -1813,7 +1859,7 @@ func testRun(name string) *signalv1.CertificationRun {
 		Spec: signalv1.CertificationRunSpec{
 			Profile:               signalv1.PinnedProfile{Name: "gpu-profile", UID: "profile-uid", Generation: 3},
 			Participants:          []signalv1.Participant{{NodeName: "gpu-0", NodeUID: "gpu-0-uid"}},
-			Script:                signalv1.ScriptSnapshot{ConfigMapName: name + "-scripts", Key: "payload.txt", Digest: digestString("test payload\n")},
+			Script:                signalv1.LegacyScriptSnapshot{ConfigMapName: name + "-scripts", Key: "payload.txt", Digest: digestString("test payload\n")},
 			Workflow:              signalv1.WorkflowReference{Name: "gpu-cert"},
 			Backend:               signalv1.ExecutionBackend{APIVersion: "kubeflow.org/v2beta1", Kind: "MPIJob"},
 			RunnerImage:           "runner@sha256:" + strings.Repeat("a", 64),
@@ -1824,6 +1870,27 @@ func testRun(name string) *signalv1.CertificationRun {
 			RequestNodeName:       "gpu-0",
 		},
 	}
+
+	run.Spec.Checks = []signalv1.CertificationCheckSnapshot{{
+		ID:                    "legacy",
+		Order:                 0,
+		Script:                signalv1.ScriptSnapshot(run.Spec.Script),
+		RunnerImage:           run.Spec.RunnerImage,
+		Backend:               run.Spec.Backend,
+		WorkloadPolicy:        run.Spec.WorkloadPolicy,
+		RuntimeStage:          run.Spec.RuntimeStage,
+		Parameters:            run.Spec.Parameters,
+		BackendActiveDeadline: run.Spec.BackendActiveDeadline,
+		ResultBounds: signalv1.ResultBounds{
+			ReasonBytes:           4096,
+			MeasurementsBytes:     16384,
+			BackendResourcesBytes: 16384,
+			BackendEvidenceBytes:  65536,
+		},
+		MaxAttempts: run.Spec.MaxAttempts,
+	}}
+
+	return run
 }
 
 func workflowObject(run *signalv1.CertificationRun, phase, verdict, reason string) *unstructured.Unstructured {
