@@ -1157,9 +1157,11 @@ func TestWorkflowParameterFallsBackToEntrypointNodeOutputs(t *testing.T) {
 	t.Parallel()
 
 	workflow := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"name": "run-a1"},
 		"status": map[string]any{
 			"nodes": map[string]any{
-				"root": map[string]any{
+				"run-a1": map[string]any{
+					"name": "run-a1",
 					"outputs": map[string]any{
 						"parameters": []any{map[string]any{"name": "verdict", "value": "Pass"}},
 					},
@@ -1170,6 +1172,165 @@ func TestWorkflowParameterFallsBackToEntrypointNodeOutputs(t *testing.T) {
 
 	if got := workflowParameter(workflow, "verdict"); got != "Pass" {
 		t.Fatalf("verdict = %q", got)
+	}
+}
+
+func TestWorkflowParametersPreferPresentTopLevelOutputs(t *testing.T) {
+	t.Parallel()
+
+	workflow := workflowWithEntrypointOutputs(
+		[]any{map[string]any{"name": "verdict", "value": "NodePass"}},
+	)
+	if err := unstructured.SetNestedSlice(
+		workflow.Object,
+		[]any{map[string]any{"name": "verdict", "value": "TopLevelPass"}},
+		"status",
+		"outputs",
+		"parameters",
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	outputs, err := workflowParameters(workflow)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if outputs["verdict"] != "TopLevelPass" {
+		t.Fatalf("verdict = %q", outputs["verdict"])
+	}
+}
+
+func TestWorkflowParametersFallBackToAuthoritativeEntrypoint(t *testing.T) {
+	t.Parallel()
+
+	workflow := workflowWithEntrypointOutputs(
+		[]any{
+			map[string]any{"name": "verdict", "value": "Pass"},
+			map[string]any{"name": "reason", "value": "Healthy"},
+		},
+	)
+
+	outputs, err := workflowParameters(workflow)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if outputs["verdict"] != "Pass" || outputs["reason"] != "Healthy" {
+		t.Fatalf("outputs = %#v", outputs)
+	}
+}
+
+func TestWorkflowParametersRejectInvalidEntrypointFallback(t *testing.T) {
+	t.Parallel()
+
+	for name, mutate := range map[string]func(*unstructured.Unstructured){
+		"missing entrypoint": func(workflow *unstructured.Unstructured) {
+			workflow.Object["status"].(map[string]any)["nodes"] = map[string]any{
+				"child": map[string]any{"name": "run-a1.child"},
+			}
+		},
+		"malformed entrypoint identity": func(workflow *unstructured.Unstructured) {
+			workflow.Object["status"].(map[string]any)["nodes"] = map[string]any{
+				"run-a1": map[string]any{"name": true},
+			}
+		},
+		"duplicate entrypoint": func(workflow *unstructured.Unstructured) {
+			nodes := workflow.Object["status"].(map[string]any)["nodes"].(map[string]any)
+			nodes["duplicate"] = map[string]any{
+				"name":    "run-a1",
+				"outputs": map[string]any{"parameters": []any{}},
+			}
+		},
+		"ambiguous entrypoint": func(workflow *unstructured.Unstructured) {
+			workflow.Object["status"].(map[string]any)["nodes"] = map[string]any{
+				"run-a1": map[string]any{"name": "run-a1.child"},
+				"other": map[string]any{
+					"name":    "run-a1",
+					"outputs": map[string]any{"parameters": []any{}},
+				},
+			}
+		},
+		"malformed outputs": func(workflow *unstructured.Unstructured) {
+			nodes := workflow.Object["status"].(map[string]any)["nodes"].(map[string]any)
+			nodes["run-a1"].(map[string]any)["outputs"] = map[string]any{
+				"parameters": "not-a-list",
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			workflow := workflowWithEntrypointOutputs([]any{})
+			mutate(workflow)
+
+			if _, err := workflowParameters(workflow); err == nil {
+				t.Fatal("workflowParameters accepted invalid entrypoint fallback")
+			}
+		})
+	}
+}
+
+func TestTerminalVerdictUsesEntrypointOutputsWhenTopLevelAbsent(t *testing.T) {
+	t.Parallel()
+
+	scheme := testScheme(t)
+	run := testRun("run-entrypoint-output")
+	run.Status = signalv1.CertificationRunStatus{
+		Phase:     signalv1.RunPhaseRunning,
+		Workflow:  signalv1.WorkflowStatus{Name: "run-entrypoint-output-a1", Attempt: 1},
+		StartedAt: ptrTime(metav1.NewTime(time.Unix(100, 0))),
+	}
+	snapshot := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: run.Spec.Script.ConfigMapName, Namespace: run.Namespace},
+		Data:       map[string]string{run.Spec.Script.Key: "test payload\n"},
+	}
+	workflow := workflowObject(run, "Succeeded", "Pass", "Healthy")
+
+	parameters, found, err := unstructured.NestedSlice(
+		workflow.Object,
+		"status",
+		"outputs",
+		"parameters",
+	)
+	if err != nil || !found {
+		t.Fatalf("read top-level outputs: found=%t, err=%v", found, err)
+	}
+
+	delete(workflow.Object["status"].(map[string]any), "outputs")
+	workflow.Object["status"].(map[string]any)["nodes"] = map[string]any{
+		workflow.GetName(): map[string]any{
+			"name": workflow.GetName(),
+			"outputs": map[string]any{
+				"parameters": parameters,
+			},
+		},
+	}
+
+	store := &memoryEvidenceStore{}
+	kube := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&signalv1.CertificationRun{}).
+		WithObjects(run, snapshot, workflow).
+		Build()
+	r := &RunReconciler{Client: kube, Evidence: store, Now: func() time.Time { return time.Unix(200, 0) }}
+
+	if _, err := r.Reconcile(
+		context.Background(),
+		reconcile.Request{NamespacedName: client.ObjectKeyFromObject(run)},
+	); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var got signalv1.CertificationRun
+	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(run), &got); err != nil {
+		t.Fatal(err)
+	}
+
+	if got.Status.Phase != signalv1.RunPhaseSucceeded ||
+		got.Status.Verdict != "Pass" ||
+		got.Status.Workflow.Outputs["reason"] != "Healthy" {
+		t.Fatalf("status = %#v", got.Status)
 	}
 }
 
@@ -1710,6 +1871,22 @@ func workflowObject(run *signalv1.CertificationRun, phase, verdict, reason strin
 	}}
 
 	return workflow
+}
+
+func workflowWithEntrypointOutputs(parameters []any) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"name": "run-a1"},
+		"status": map[string]any{
+			"nodes": map[string]any{
+				"run-a1": map[string]any{
+					"name": "run-a1",
+					"outputs": map[string]any{
+						"parameters": parameters,
+					},
+				},
+			},
+		},
+	}}
 }
 
 func workflowArgument(workflow *unstructured.Unstructured, name string) string {

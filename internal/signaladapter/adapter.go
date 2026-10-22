@@ -742,6 +742,16 @@ else
  status="${prelude_status}"
 fi
 set -e
+canonicalize_result_file() {
+  if [[ -f "$1" ]]; then
+    local value
+    value="$(<"$1")"
+    printf '%%s' "${value}" > "$1"
+  fi
+}
+canonicalize_result_file /results/verdict
+canonicalize_result_file /results/reason
+canonicalize_result_file /results/measurements.txt
 encode_result_file() {
   if [[ -f "$1" ]]; then
     base64 < "$1" | tr -d '\n'

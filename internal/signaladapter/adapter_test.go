@@ -1298,6 +1298,9 @@ func TestResultCommandClearsReservedFilesAndReportsExitCode(t *testing.T) {
 	for _, required := range []string{
 		"rm -f /results/verdict /results/reason /results/measurements.txt",
 		`printf 'PROJECT_SIGNAL_RESULTS_V1 prepared\n'`,
+		"canonicalize_result_file /results/verdict",
+		"canonicalize_result_file /results/reason",
+		"canonicalize_result_file /results/measurements.txt",
 		`printf 'PROJECT_SIGNAL_RESULTS_V1 verdict=%s reason=%s measurements=%s\n'`,
 		`printf 'PROJECT_SIGNAL_RESULT_V2 %s %s %s %d\n'`,
 		`exit "$status"`,
@@ -1313,6 +1316,67 @@ func TestResultCommandClearsReservedFilesAndReportsExitCode(t *testing.T) {
 	} {
 		if strings.Contains(command[2], forbidden) {
 			t.Fatalf("result command still contains fallback %q:\n%s", forbidden, command[2])
+		}
+	}
+}
+
+func TestResultCommandCanonicalizesTrailingNewlines(t *testing.T) {
+	t.Parallel()
+
+	directory := t.TempDir()
+	resultsDirectory := filepath.Join(directory, "results")
+
+	scriptsDirectory := filepath.Join(directory, "scripts")
+	if err := os.MkdirAll(scriptsDirectory, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	script := filepath.Join(scriptsDirectory, "diagnostic.sh")
+	if err := os.WriteFile(script, []byte(`#!/bin/bash
+printf 'Pass\n' > "${PROJECT_SIGNAL_RESULTS_DIR}/verdict"
+printf 'Healthy\n' > "${PROJECT_SIGNAL_RESULTS_DIR}/reason"
+printf 'temperature=42\n' > "${PROJECT_SIGNAL_RESULTS_DIR}/measurements.txt"
+`), 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	command := resultCommand()
+	commandText := strings.ReplaceAll(command[2], "/results", resultsDirectory)
+	commandText = strings.ReplaceAll(commandText, "/scripts", scriptsDirectory)
+	process := exec.Command(command[0], command[1], commandText)
+
+	process.Env = append(
+		os.Environ(),
+		"PROJECT_SIGNAL_SCRIPT_KEY=diagnostic.sh",
+		"PROJECT_SIGNAL_RESULTS_DIR="+resultsDirectory,
+	)
+
+	output, err := process.CombinedOutput()
+	if err != nil {
+		t.Fatalf("result command: %v\n%s", err, output)
+	}
+
+	result, err := ParseResultLog(string(output), 0)
+	if err != nil {
+		t.Fatalf("ParseResultLog: %v\n%s", err, output)
+	}
+
+	if result.Verdict != "Pass" || result.Reason != "Healthy" || result.Measurements != "temperature=42" {
+		t.Fatalf("result = %#v", result)
+	}
+
+	for name, want := range map[string]string{
+		"verdict":          "Pass",
+		"reason":           "Healthy",
+		"measurements.txt": "temperature=42",
+	} {
+		content, err := os.ReadFile(filepath.Join(resultsDirectory, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if string(content) != want {
+			t.Fatalf("%s = %q, want %q", name, content, want)
 		}
 	}
 }

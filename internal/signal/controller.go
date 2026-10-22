@@ -1225,13 +1225,17 @@ func backendResourceReferences(
 func workflowParameters(workflow *unstructured.Unstructured) (map[string]string, error) {
 	parameters, found, err := unstructured.NestedSlice(workflow.Object, "status", "outputs", "parameters")
 	if err != nil {
-		return nil, fmt.Errorf("read parameters: %w", err)
+		return nil, fmt.Errorf("read top-level parameters: %w", err)
 	}
 
-	if !found {
-		return nil, nil
+	if found {
+		return decodeWorkflowParameters(parameters)
 	}
 
+	return entrypointWorkflowParameters(workflow)
+}
+
+func decodeWorkflowParameters(parameters []any) (map[string]string, error) {
 	outputs := make(map[string]string, len(parameters))
 	for _, raw := range parameters {
 		parameter, ok := raw.(map[string]any)
@@ -1263,6 +1267,88 @@ func workflowParameters(workflow *unstructured.Unstructured) (map[string]string,
 	}
 
 	return outputs, nil
+}
+
+func entrypointWorkflowParameters(workflow *unstructured.Unstructured) (map[string]string, error) {
+	workflowName := workflow.GetName()
+	if workflowName == "" {
+		return nil, errors.New("workflow name is required to identify entrypoint outputs")
+	}
+
+	nodes, found, err := unstructured.NestedMap(workflow.Object, "status", "nodes")
+	if err != nil {
+		return nil, fmt.Errorf("read workflow nodes: %w", err)
+	}
+
+	if !found {
+		return nil, errors.New("top-level outputs are absent and workflow nodes are missing")
+	}
+
+	var entrypoint map[string]any
+
+	entrypointCount := 0
+	rootKeyMismatch := ""
+
+	for key, raw := range nodes {
+		node, ok := raw.(map[string]any)
+		if !ok {
+			if key == workflowName {
+				return nil, fmt.Errorf("entrypoint node %q is not an object", key)
+			}
+
+			continue
+		}
+
+		nodeName, nameOK := node["name"].(string)
+		if key == workflowName && !nameOK {
+			return nil, fmt.Errorf("entrypoint node %q requires a string name", key)
+		}
+
+		if key == workflowName && nodeName != workflowName {
+			rootKeyMismatch = nodeName
+		}
+
+		if nameOK && nodeName == workflowName {
+			entrypoint = node
+			entrypointCount++
+		}
+	}
+
+	if rootKeyMismatch != "" && entrypointCount > 0 {
+		return nil, fmt.Errorf(
+			"entrypoint identity is ambiguous: node key %q names %q while another node names the workflow",
+			workflowName,
+			rootKeyMismatch,
+		)
+	}
+
+	if rootKeyMismatch != "" {
+		return nil, fmt.Errorf(
+			"entrypoint node %q has mismatched name %q",
+			workflowName,
+			rootKeyMismatch,
+		)
+	}
+
+	if entrypointCount == 0 {
+		return nil, fmt.Errorf("entrypoint node named %q was not found", workflowName)
+	}
+
+	if entrypointCount > 1 {
+		return nil, fmt.Errorf("entrypoint node named %q is duplicated", workflowName)
+	}
+
+	outputs, ok := entrypoint["outputs"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("entrypoint node %q outputs are missing or malformed", workflowName)
+	}
+
+	parameters, ok := outputs["parameters"].([]any)
+	if !ok {
+		return nil, fmt.Errorf("entrypoint node %q parameters are missing or malformed", workflowName)
+	}
+
+	return decodeWorkflowParameters(parameters)
 }
 
 func backendEvidenceComplete(content string, participantCount int) (bool, error) {
@@ -1518,56 +1604,12 @@ func participantNodeUID(run *signalv1.CertificationRun, nodeName string) types.U
 }
 
 func workflowParameter(workflow *unstructured.Unstructured, name string) string {
-	parameters, _, err := unstructured.NestedSlice(workflow.Object, "status", "outputs", "parameters")
-	if err == nil {
-		if value := parameterValue(parameters, name); value != "" {
-			return value
-		}
-	}
-
-	nodes, _, err := unstructured.NestedMap(workflow.Object, "status", "nodes")
+	outputs, err := workflowParameters(workflow)
 	if err != nil {
 		return ""
 	}
 
-	for _, raw := range nodes {
-		node, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-
-		outputs, ok := node["outputs"].(map[string]any)
-		if !ok {
-			continue
-		}
-
-		parameters, ok := outputs["parameters"].([]any)
-		if ok {
-			if value := parameterValue(parameters, name); value != "" {
-				return value
-			}
-		}
-	}
-
-	return ""
-}
-
-func parameterValue(parameters []any, name string) string {
-	for _, raw := range parameters {
-		parameter, ok := raw.(map[string]any)
-		if !ok || parameter["name"] != name {
-			continue
-		}
-
-		value, ok := parameter["value"].(string)
-		if !ok {
-			return ""
-		}
-
-		return value
-	}
-
-	return ""
+	return outputs[name]
 }
 
 func workflowMessage(workflow *unstructured.Unstructured) string {
