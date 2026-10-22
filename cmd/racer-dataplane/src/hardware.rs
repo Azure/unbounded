@@ -1006,6 +1006,44 @@ mod tests {
     }
 
     #[test]
+    fn shared_context_is_not_copied_and_report_copy_is_charged() {
+        let f = Fixture::new();
+        let context = Arc::new(Context {
+            block_device_selector: Some("^nvme-".into()),
+            claimed_disks: (0..4)
+                .map(|i| ClaimedDisk {
+                    id: format!("nvme-disk-{i}"),
+                    dev: Some(format!("259:{i}")),
+                })
+                .collect(),
+        });
+        // Each request clones the pointer, so repeated requests share one context.
+        let request = Arc::clone(&context);
+        assert!(Arc::ptr_eq(&request, &context));
+        let snapshot = || Ok(crate::rdma::Inventory::default().snapshot().unwrap());
+        let ok = report_with_snapshot(&walk(), &f.sys(), &f.dev(), &request, snapshot()).unwrap();
+        assert_eq!(ok.racer.unwrap().claimed_disks.len(), 4);
+        assert_eq!(Arc::strong_count(&context), 2);
+
+        // A context larger than the walk budget still aborts as too large.
+        let big = Arc::new(Context {
+            block_device_selector: None,
+            claimed_disks: vec![
+                ClaimedDisk {
+                    id: "x".repeat(WORKING_BYTES),
+                    dev: None,
+                };
+                1
+            ],
+        });
+        let shared = Arc::clone(&big);
+        assert!(matches!(
+            report_with_snapshot(&walk(), &f.sys(), &f.dev(), &shared, snapshot()),
+            Err(Abort::TooLarge)
+        ));
+    }
+
+    #[test]
     fn json_shape_has_stable_keys() {
         let f = Fixture::new();
         block_tree(&f);

@@ -134,7 +134,9 @@ pub struct NodeState {
     inventory: Arc<crate::rdma::Inventory>,
 
     /// Startup-fixed selector and claimed disks for `/debug/hardware`.
-    hardware: crate::hardware::Context,
+    /// Shared via `Arc` so each request clones a pointer, not the disk list;
+    /// the report's own copy is still charged against the walk budget.
+    hardware: Arc<crate::hardware::Context>,
 
     send_crc: crate::telemetry::Samples,
 
@@ -298,13 +300,13 @@ impl Application {
                 std::num::NonZeroUsize::new(devices.checkpoint_bytes).ok_or(Error::Internal)?;
         }
         let node = Arc::get_mut(&mut self.node).ok_or(Error::Internal)?;
-        node.hardware = crate::hardware::Context {
+        node.hardware = Arc::new(crate::hardware::Context {
             block_device_selector: selector.clone(),
             claimed_disks: devices
                 .as_ref()
                 .map(devices::Plan::claimed_disks)
                 .unwrap_or_default(),
-        };
+        });
         node.devices = devices;
         Arc::get_mut(&mut self.config)
             .ok_or(Error::InvalidConfiguration)?
@@ -2351,7 +2353,7 @@ impl WorkerApplication {
             .hardware
             .set(Rc::new(move || -> crate::telemetry::HardwareJob {
                 // Capture the small Racer view here; the helper thread walks sysfs.
-                let context = node.hardware.clone();
+                let context = Arc::clone(&node.hardware);
                 let snapshot = node
                     .inventory
                     .snapshot()
