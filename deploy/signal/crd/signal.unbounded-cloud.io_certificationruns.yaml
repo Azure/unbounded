@@ -69,6 +69,8 @@ spec:
                 - apiVersion
                 - kind
                 type: object
+              backendActiveDeadline:
+                type: string
               cancel:
                 type: boolean
               deadline:
@@ -158,6 +160,16 @@ spec:
                 type: string
               runnerImage:
                 type: string
+              runtimeStage:
+                properties:
+                  name:
+                    maxLength: 63
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    type: string
+                required:
+                - name
+                type: object
               script:
                 properties:
                   configMapName:
@@ -169,6 +181,8 @@ spec:
                     type: string
                   key:
                     type: string
+                  requiresRuntimeStage:
+                    type: boolean
                 required:
                 - configMapName
                 - digest
@@ -654,6 +668,7 @@ spec:
                 type: object
             required:
             - backend
+            - backendActiveDeadline
             - deadline
             - evidencePath
             - maxAttempts
@@ -679,18 +694,32 @@ spec:
               rule: self.runnerImage == oldSelf.runnerImage
             - message: workloadPolicy is immutable
               rule: self.workloadPolicy == oldSelf.workloadPolicy
+            - message: runtimeStage is immutable
+              rule: self.runtimeStage == oldSelf.runtimeStage
             - message: parameters are immutable
               rule: self.parameters == oldSelf.parameters
             - message: evidencePath is immutable
               rule: self.evidencePath == oldSelf.evidencePath
             - message: deadline is immutable
               rule: self.deadline == oldSelf.deadline
+            - message: backendActiveDeadline is immutable
+              rule: self.backendActiveDeadline == oldSelf.backendActiveDeadline
             - message: maxAttempts is immutable
               rule: self.maxAttempts == oldSelf.maxAttempts
             - message: tolerations are immutable
               rule: self.tolerations == oldSelf.tolerations
             - message: requestNodeName is immutable
               rule: self.requestNodeName == oldSelf.requestNodeName
+            - message: backendActiveDeadline must be positive
+              rule: duration(self.backendActiveDeadline) > duration('0s')
+            - message: backendActiveDeadline must leave at least 60 seconds before
+                deadline
+              rule: duration(self.deadline) - duration(self.backendActiveDeadline)
+                >= duration('60s')
+            - message: runtimeStage is required when the script requires a runtime
+                stage
+              rule: '!has(self.script.requiresRuntimeStage) || !self.script.requiresRuntimeStage
+                || has(self.runtimeStage)'
           status:
             properties:
               cleanup:

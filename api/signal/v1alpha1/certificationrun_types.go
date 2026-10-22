@@ -56,8 +56,9 @@ type PinnedProfile struct {
 }
 
 type ScriptSnapshot struct {
-	ConfigMapName string `json:"configMapName"`
-	Key           string `json:"key"`
+	ConfigMapName        string `json:"configMapName"`
+	Key                  string `json:"key"`
+	RequiresRuntimeStage bool   `json:"requiresRuntimeStage,omitempty"`
 	// Digest is the algorithm-qualified SHA-256 digest of the selected script bytes.
 	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
 	Digest string `json:"digest"`
@@ -70,12 +71,17 @@ type ScriptSnapshot struct {
 // +kubebuilder:validation:XValidation:rule="self.backend == oldSelf.backend",message="backend is immutable"
 // +kubebuilder:validation:XValidation:rule="self.runnerImage == oldSelf.runnerImage",message="runnerImage is immutable"
 // +kubebuilder:validation:XValidation:rule="self.workloadPolicy == oldSelf.workloadPolicy",message="workloadPolicy is immutable"
+// +kubebuilder:validation:XValidation:rule="self.runtimeStage == oldSelf.runtimeStage",message="runtimeStage is immutable"
 // +kubebuilder:validation:XValidation:rule="self.parameters == oldSelf.parameters",message="parameters are immutable"
 // +kubebuilder:validation:XValidation:rule="self.evidencePath == oldSelf.evidencePath",message="evidencePath is immutable"
 // +kubebuilder:validation:XValidation:rule="self.deadline == oldSelf.deadline",message="deadline is immutable"
+// +kubebuilder:validation:XValidation:rule="self.backendActiveDeadline == oldSelf.backendActiveDeadline",message="backendActiveDeadline is immutable"
 // +kubebuilder:validation:XValidation:rule="self.maxAttempts == oldSelf.maxAttempts",message="maxAttempts is immutable"
 // +kubebuilder:validation:XValidation:rule="self.tolerations == oldSelf.tolerations",message="tolerations are immutable"
 // +kubebuilder:validation:XValidation:rule="self.requestNodeName == oldSelf.requestNodeName",message="requestNodeName is immutable"
+// +kubebuilder:validation:XValidation:rule="duration(self.backendActiveDeadline) > duration('0s')",message="backendActiveDeadline must be positive"
+// +kubebuilder:validation:XValidation:rule="duration(self.deadline) - duration(self.backendActiveDeadline) >= duration('60s')",message="backendActiveDeadline must leave at least 60 seconds before deadline"
+// +kubebuilder:validation:XValidation:rule="!has(self.script.requiresRuntimeStage) || !self.script.requiresRuntimeStage || has(self.runtimeStage)",message="runtimeStage is required when the script requires a runtime stage"
 type CertificationRunSpec struct {
 	Profile PinnedProfile `json:"profile"`
 	// +kubebuilder:validation:MinItems=1
@@ -90,14 +96,16 @@ type CertificationRunSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="purpose is immutable"
 	Purpose CertificationPurpose `json:"purpose,omitempty"`
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="stagePlan is immutable"
-	StagePlan       []CertificationStage `json:"stagePlan,omitempty"`
-	Parameters      map[string]string    `json:"parameters,omitempty"`
-	EvidencePath    string               `json:"evidencePath"`
-	Deadline        metav1.Duration      `json:"deadline"`
-	MaxAttempts     int32                `json:"maxAttempts"`
-	Tolerations     []corev1.Toleration  `json:"tolerations,omitempty"`
-	RequestNodeName string               `json:"requestNodeName"`
-	Cancel          bool                 `json:"cancel,omitempty"`
+	StagePlan             []CertificationStage `json:"stagePlan,omitempty"`
+	RuntimeStage          *RuntimeStage        `json:"runtimeStage,omitempty"`
+	Parameters            map[string]string    `json:"parameters,omitempty"`
+	EvidencePath          string               `json:"evidencePath"`
+	Deadline              metav1.Duration      `json:"deadline"`
+	BackendActiveDeadline metav1.Duration      `json:"backendActiveDeadline"`
+	MaxAttempts           int32                `json:"maxAttempts"`
+	Tolerations           []corev1.Toleration  `json:"tolerations,omitempty"`
+	RequestNodeName       string               `json:"requestNodeName"`
+	Cancel                bool                 `json:"cancel,omitempty"`
 }
 
 type WorkflowStatus struct {

@@ -62,9 +62,22 @@ func main() {
 		"",
 		"algorithm-qualified SHA-256 digest of the script bytes (sha256:<64 lowercase hex>)",
 	)
+	flags.BoolVar(
+		&cfg.ScriptRequiresStage,
+		"script-requires-runtime-stage",
+		false,
+		"Require a validated runtime stage name",
+	)
+	flags.StringVar(&cfg.RuntimeStageName, "runtime-stage-name", "", "Runtime stage name for participant containers")
 	flags.StringVar(&cfg.RunnerImage, "runner-image", "", "Digest-pinned runner image")
 	flags.StringVar(&cfg.BackendAPIVersion, "backend-api-version", "", "Backend API version")
 	flags.StringVar(&cfg.BackendKind, "backend-kind", "", "Backend kind")
+	flags.Int64Var(
+		&cfg.BackendDeadlineSeconds,
+		"backend-active-deadline-seconds",
+		0,
+		"Active deadline for participant backend workloads",
+	)
 	flags.StringVar(&cfg.Queue, "queue", "", "Kueue LocalQueue name")
 	flags.StringVar(&cfg.TolerationsJSON, "tolerations", "[]", "JSON-encoded Pod tolerations")
 	flags.StringVar(&cfg.ScriptEnvironmentJSON, "script-environment", "{}", "JSON-encoded script environment")

@@ -9,8 +9,9 @@ import (
 )
 
 type ScriptReference struct {
-	Name string `json:"name"`
-	Key  string `json:"key"`
+	Name                 string `json:"name"`
+	Key                  string `json:"key"`
+	RequiresRuntimeStage bool   `json:"requiresRuntimeStage,omitempty"`
 }
 
 type WorkflowReference struct {
@@ -35,6 +36,13 @@ type CertificationStage struct {
 	ExpectedDuration metav1.Duration `json:"expectedDuration,omitempty"`
 	Required         bool            `json:"required"`
 	Conditional      bool            `json:"conditional,omitempty"`
+}
+
+type RuntimeStage struct {
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	Name string `json:"name"`
 }
 
 type ExecutionBackend struct {
@@ -83,6 +91,9 @@ type WorkloadPolicy struct {
 	Volumes []WorkloadVolume `json:"volumes,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="duration(self.backendActiveDeadline) > duration('0s')",message="backendActiveDeadline must be positive"
+// +kubebuilder:validation:XValidation:rule="duration(self.deadline) - duration(self.backendActiveDeadline) >= duration('60s')",message="backendActiveDeadline must leave at least 60 seconds before deadline"
+// +kubebuilder:validation:XValidation:rule="!has(self.script.requiresRuntimeStage) || !self.script.requiresRuntimeStage || has(self.runtimeStage)",message="runtimeStage is required when the script requires a runtime stage"
 type CertificationProfileSpec struct {
 	Participants   ParticipantPolicy `json:"participants"`
 	Script         ScriptReference   `json:"script"`
@@ -91,14 +102,16 @@ type CertificationProfileSpec struct {
 	RunnerImage    string            `json:"runnerImage"`
 	WorkloadPolicy WorkloadPolicy    `json:"workloadPolicy,omitempty"`
 	// +kubebuilder:validation:Enum=FullCertification;QuickCertification;Preflight;TargetedVerification;Diagnostic
-	Purpose      CertificationPurpose `json:"purpose,omitempty"`
-	StagePlan    []CertificationStage `json:"stagePlan,omitempty"`
-	Parameters   map[string]string    `json:"parameters,omitempty"`
-	EvidencePath string               `json:"evidencePath"`
-	Deadline     metav1.Duration      `json:"deadline"`
-	MaxAttempts  int32                `json:"maxAttempts,omitempty"`
-	Tolerations  []corev1.Toleration  `json:"tolerations,omitempty"`
-	Recurring    *RecurringPolicy     `json:"recurring,omitempty"`
+	Purpose               CertificationPurpose `json:"purpose,omitempty"`
+	StagePlan             []CertificationStage `json:"stagePlan,omitempty"`
+	RuntimeStage          *RuntimeStage        `json:"runtimeStage,omitempty"`
+	Parameters            map[string]string    `json:"parameters,omitempty"`
+	EvidencePath          string               `json:"evidencePath"`
+	Deadline              metav1.Duration      `json:"deadline"`
+	BackendActiveDeadline metav1.Duration      `json:"backendActiveDeadline"`
+	MaxAttempts           int32                `json:"maxAttempts,omitempty"`
+	Tolerations           []corev1.Toleration  `json:"tolerations,omitempty"`
+	Recurring             *RecurringPolicy     `json:"recurring,omitempty"`
 }
 
 type RecurringPolicy struct {

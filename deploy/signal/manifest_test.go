@@ -64,7 +64,10 @@ func TestAdapterManifestIsGenericAndParticipantAware(t *testing.T) {
 		"backend-resources",
 		"backend-api-version",
 		"backend-kind",
+		"backend-active-deadline-seconds",
 		"queue",
+		"runtime-stage-name",
+		"script-requires-runtime-stage",
 		"workload-policy",
 	} {
 		if !strings.Contains(manifest, required) {
@@ -79,6 +82,34 @@ func TestAdapterManifestIsGenericAndParticipantAware(t *testing.T) {
 	} {
 		if strings.Contains(manifest, forbidden) {
 			t.Fatalf("adapter WorkflowTemplate contains downstream-specific value %q", forbidden)
+		}
+	}
+}
+
+func TestSignalCRDsExposeRuntimeStageAndDeadlineContract(t *testing.T) {
+	t.Parallel()
+
+	for _, path := range []string{
+		"crd/signal.unbounded-cloud.io_certificationprofiles.yaml",
+		"crd/signal.unbounded-cloud.io_certificationruns.yaml",
+	} {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		manifest := string(content)
+		for _, required := range []string{
+			"backendActiveDeadline:",
+			"runtimeStage:",
+			"requiresRuntimeStage:",
+			"backendActiveDeadline must leave at least 60 seconds before",
+			"runtimeStage is required when the script requires a runtime",
+			"maxLength: 63",
+		} {
+			if !strings.Contains(manifest, required) {
+				t.Fatalf("%s does not contain %q", path, required)
+			}
 		}
 	}
 }

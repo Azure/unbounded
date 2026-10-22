@@ -17,8 +17,13 @@ spec:
       - name: script-configmap
       - name: script-key
       - name: script-digest
+      - name: script-requires-runtime-stage
+        value: "false"
+      - name: runtime-stage-name
+        value: ""
       - name: backend-api-version
       - name: backend-kind
+      - name: backend-active-deadline-seconds
       - name: queue
       - name: runner-image
       - name: tolerations
@@ -70,12 +75,17 @@ spec:
           - "{{`{{workflow.parameters.script-key}}`}}"
           - --script-digest
           - "{{`{{workflow.parameters.script-digest}}`}}"
+          - "--script-requires-runtime-stage={{`{{workflow.parameters.script-requires-runtime-stage}}`}}"
+          - --runtime-stage-name
+          - "{{`{{workflow.parameters.runtime-stage-name}}`}}"
           - --runner-image
           - "{{`{{workflow.parameters.runner-image}}`}}"
           - --backend-api-version
           - "{{`{{workflow.parameters.backend-api-version}}`}}"
           - --backend-kind
           - "{{`{{workflow.parameters.backend-kind}}`}}"
+          - --backend-active-deadline-seconds
+          - "{{`{{workflow.parameters.backend-active-deadline-seconds}}`}}"
           - --queue
           - "{{`{{workflow.parameters.queue}}`}}"
           - --tolerations

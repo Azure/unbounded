@@ -32,7 +32,7 @@ func TestRenderOrdinaryPodsPerParticipant(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resources, err := RenderResources(config, participants, tolerations, environment, testWorkflowOwner(), 900)
+	resources, err := RenderResources(config, participants, tolerations, environment, testWorkflowOwner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,6 +85,11 @@ func TestRenderOrdinaryPodsPerParticipant(t *testing.T) {
 		if resource.GetAnnotations()[requiredTopologyKey] != "" {
 			t.Fatalf("resource %d unexpectedly requests Kueue topology", index)
 		}
+
+		activeDeadline, _, err := unstructured.NestedInt64(resource.Object, "spec", "activeDeadlineSeconds")
+		if err != nil || activeDeadline != config.BackendDeadlineSeconds {
+			t.Fatalf("resource %d active deadline = %d, err = %v", index, activeDeadline, err)
+		}
 	}
 }
 
@@ -101,10 +106,92 @@ func TestRenderOrdinaryPodWithKueueQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resources, err := RenderResources(config, participants, tolerations, environment, testWorkflowOwner(), 900)
+	resources, err := RenderResources(config, participants, tolerations, environment, testWorkflowOwner())
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	t.Run("runtime stage is participant only", func(t *testing.T) {
+		t.Parallel()
+
+		config := testConfig()
+		config.ScriptRequiresStage = true
+		config.RuntimeStageName = "collective-bandwidth"
+
+		participants, tolerations, environment, err := ValidateConfig(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		config.BackendAPIVersion = "v1"
+		config.BackendKind = "Pod"
+		config.Queue = ""
+
+		pods, err := RenderResources(config, participants, tolerations, environment, testWorkflowOwner())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		podJSON, err := json.Marshal(pods[0].Object)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var pod corev1.Pod
+		if err := json.Unmarshal(podJSON, &pod); err != nil {
+			t.Fatal(err)
+		}
+
+		if value := environmentValue(pod.Spec.Containers[0].Env, "PROJECT_SIGNAL_STAGE_NAME"); value != config.RuntimeStageName {
+			t.Fatalf("Pod runtime stage = %q", value)
+		}
+
+		config.BackendAPIVersion = "kubeflow.org/v2beta1"
+		config.BackendKind = "MPIJob"
+		config.Queue = "certification"
+
+		jobs, err := RenderResources(config, participants, tolerations, environment, testWorkflowOwner())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		launcher, _, err := unstructured.NestedSlice(
+			jobs[0].Object,
+			"spec",
+			"mpiReplicaSpecs",
+			"Launcher",
+			"template",
+			"spec",
+			"containers",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		worker, _, err := unstructured.NestedSlice(
+			jobs[0].Object,
+			"spec",
+			"mpiReplicaSpecs",
+			"Worker",
+			"template",
+			"spec",
+			"containers",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		launcherJSON, _ := json.Marshal(launcher)
+		workerJSON, _ := json.Marshal(worker)
+
+		if strings.Contains(string(launcherJSON), "PROJECT_SIGNAL_STAGE_NAME") {
+			t.Fatalf("MPI launcher received runtime stage: %s", launcherJSON)
+		}
+
+		if !strings.Contains(string(workerJSON), `"name":"PROJECT_SIGNAL_STAGE_NAME","value":"collective-bandwidth"`) {
+			t.Fatalf("MPI worker runtime stage missing: %s", workerJSON)
+		}
+	})
 
 	if queue := resources[0].GetLabels()["kueue.x-k8s.io/queue-name"]; queue != "certification" {
 		t.Fatalf("Pod queue label = %q", queue)
@@ -121,7 +208,7 @@ func TestRenderMPIJobsPerParticipant(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resources, err := RenderResources(config, participants, tolerations, environment, testWorkflowOwner(), 1200)
+	resources, err := RenderResources(config, participants, tolerations, environment, testWorkflowOwner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +237,7 @@ func TestRenderMPIJobsPerParticipant(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if activeDeadline != 1200 {
+		if activeDeadline != config.BackendDeadlineSeconds {
 			t.Fatalf("resource %d active deadline = %d", index, activeDeadline)
 		}
 
@@ -242,7 +329,7 @@ func TestRenderMPIJobUsesExplicitLifecycleOverrides(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resources, err := RenderResources(config, participants, tolerations, environment, testWorkflowOwner(), 1200)
+	resources, err := RenderResources(config, participants, tolerations, environment, testWorkflowOwner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -322,7 +409,7 @@ func TestRenderWorkloadPolicyOnParticipantContainers(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resources, err := RenderResources(config, participants, tolerations, environment, testWorkflowOwner(), 900)
+	resources, err := RenderResources(config, participants, tolerations, environment, testWorkflowOwner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,7 +461,7 @@ func TestMPIWorkloadPolicyDoesNotLeakOntoLauncher(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resources, err := RenderResources(config, participants, tolerations, environment, testWorkflowOwner(), 900)
+	resources, err := RenderResources(config, participants, tolerations, environment, testWorkflowOwner())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -450,7 +537,6 @@ func TestRenderRejectsGPUResourceInWorkloadPolicy(t *testing.T) {
 		tolerations,
 		environment,
 		testWorkflowOwner(),
-		900,
 	); err == nil || !strings.Contains(err.Error(), "gpu-resource-count") {
 		t.Fatalf("RenderResources error = %v", err)
 	}
@@ -528,6 +614,24 @@ func TestValidateConfigRequiresDigestAndMPIQueue(t *testing.T) {
 	config.Queue = ""
 	if _, _, _, err := ValidateConfig(config); err == nil || !strings.Contains(err.Error(), "queue is required") {
 		t.Fatalf("queue validation error = %v", err)
+	}
+}
+
+func TestValidateConfigRequiresDeclaredRuntimeStage(t *testing.T) {
+	t.Parallel()
+
+	config := testConfig()
+	config.ScriptRequiresStage = true
+
+	if _, _, _, err := ValidateConfig(config); err == nil ||
+		!strings.Contains(err.Error(), "runtime stage is required") {
+		t.Fatalf("ValidateConfig runtime stage error = %v", err)
+	}
+
+	config.RuntimeStageName = "Collective/Bandwidth"
+	if _, _, _, err := ValidateConfig(config); err == nil ||
+		!strings.Contains(err.Error(), "runtime stage name is invalid") {
+		t.Fatalf("ValidateConfig malformed stage error = %v", err)
 	}
 }
 
@@ -865,27 +969,28 @@ func testConfig() Config {
 	}
 
 	return Config{
-		Namespace:             "project-signal",
-		WorkflowName:          "run-example-a1",
-		RunName:               "run-example",
-		RunUID:                types.UID("run-uid"),
-		ParticipantsJSON:      string(participantsJSON),
-		ParticipantCount:      2,
-		RequestNodeName:       "node-a",
-		LegacyParticipants:    "node-a,node-b",
-		ScriptConfigMap:       "run-example-scripts",
-		ScriptKey:             "check.sh",
-		ScriptDigest:          "sha256:" + strings.Repeat("b", 64),
-		RunnerImage:           "example.invalid/runner@sha256:" + strings.Repeat("a", 64),
-		BackendAPIVersion:     "kubeflow.org/v2beta1",
-		BackendKind:           "MPIJob",
-		Queue:                 "certification",
-		TolerationsJSON:       `[{"key":"nvidia.com/gpu","operator":"Exists","effect":"NoSchedule"}]`,
-		ScriptEnvironmentJSON: `{"CHECK_MODE":"quick"}`,
-		GPUResourceCount:      "1",
-		Attempt:               1,
-		BackoffLimit:          0,
-		TTLSeconds:            3600,
+		Namespace:              "project-signal",
+		WorkflowName:           "run-example-a1",
+		RunName:                "run-example",
+		RunUID:                 types.UID("run-uid"),
+		ParticipantsJSON:       string(participantsJSON),
+		ParticipantCount:       2,
+		RequestNodeName:        "node-a",
+		LegacyParticipants:     "node-a,node-b",
+		ScriptConfigMap:        "run-example-scripts",
+		ScriptKey:              "check.sh",
+		ScriptDigest:           "sha256:" + strings.Repeat("b", 64),
+		RunnerImage:            "example.invalid/runner@sha256:" + strings.Repeat("a", 64),
+		BackendAPIVersion:      "kubeflow.org/v2beta1",
+		BackendKind:            "MPIJob",
+		BackendDeadlineSeconds: 540,
+		Queue:                  "certification",
+		TolerationsJSON:        `[{"key":"nvidia.com/gpu","operator":"Exists","effect":"NoSchedule"}]`,
+		ScriptEnvironmentJSON:  `{"CHECK_MODE":"quick"}`,
+		GPUResourceCount:       "1",
+		Attempt:                1,
+		BackoffLimit:           0,
+		TTLSeconds:             3600,
 	}
 }
 
@@ -894,6 +999,16 @@ func testParticipants() []signalv1.Participant {
 		{Index: 0, NodeName: "node-a", NodeUID: types.UID("uid-a")},
 		{Index: 1, NodeName: "node-b", NodeUID: types.UID("uid-b")},
 	}
+}
+
+func environmentValue(environment []corev1.EnvVar, name string) string {
+	for _, variable := range environment {
+		if variable.Name == name {
+			return variable.Value
+		}
+	}
+
+	return ""
 }
 
 func testBackendResources() []signalv1.BackendResourceReference {

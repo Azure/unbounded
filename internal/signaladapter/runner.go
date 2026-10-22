@@ -73,6 +73,15 @@ func (r *Runner) Execute(ctx context.Context, config Config) (output AggregateOu
 		return AggregateOutput{}, errors.New("owning Workflow requires a positive activeDeadlineSeconds")
 	}
 
+	if err := signalv1.ValidateRuntimeContract(
+		config.ScriptRequiresStage,
+		runtimeStage(config.RuntimeStageName),
+		time.Duration(config.BackendDeadlineSeconds)*time.Second,
+		time.Duration(activeDeadlineSeconds)*time.Second,
+	); err != nil {
+		return AggregateOutput{}, fmt.Errorf("validate backend and Workflow deadlines: %w", err)
+	}
+
 	executionContext, cancelExecution := context.WithTimeout(
 		ctx,
 		time.Duration(activeDeadlineSeconds)*time.Second,
@@ -94,7 +103,6 @@ func (r *Runner) Execute(ctx context.Context, config Config) (output AggregateOu
 		tolerations,
 		environment,
 		owner,
-		activeDeadlineSeconds,
 	)
 	if err != nil {
 		return AggregateOutput{}, err
@@ -176,6 +184,14 @@ func (r *Runner) Execute(ctx context.Context, config Config) (output AggregateOu
 	created = nil
 
 	return output, nil
+}
+
+func runtimeStage(name string) *signalv1.RuntimeStage {
+	if name == "" {
+		return nil
+	}
+
+	return &signalv1.RuntimeStage{Name: name}
 }
 
 func (r *Runner) waitForResult(ctx context.Context, config Config, backend createdResource) Result {
