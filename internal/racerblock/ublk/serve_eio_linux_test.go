@@ -223,3 +223,36 @@ func TestHoldUntilSafeBrokenEntryDoesNotReportServing(t *testing.T) {
 		t.Fatal("a queue that cannot serve reported that it serves")
 	}
 }
+
+// TestServeEIOSeesStopConsumedByDrain stops the queue just before its
+// EIO loop drains the eventfd, so drain consumes the stop's only wake.
+// serveEIO must still notice the stop instead of arming its poll and
+// waiting for a wake that never comes.
+func TestServeEIOSeesStopConsumedByDrain(t *testing.T) {
+	q := newEIOQueue(t)
+
+	var once atomic.Bool
+
+	testHooks.eioBeforeDrain = func(q *queue) {
+		if !once.Swap(true) {
+			q.stop()
+		}
+	}
+
+	t.Cleanup(func() { testHooks.eioBeforeDrain = nil })
+
+	res := make(chan error, 1)
+
+	go func() { res <- q.serveEIO() }()
+
+	select {
+	case err := <-res:
+		if err != nil {
+			t.Fatalf("serveEIO = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		// The goroutine stays blocked; wake it so the test can finish.
+		q.wake()
+		t.Fatal("serveEIO lost the stop wake and blocked")
+	}
+}
