@@ -232,11 +232,11 @@ func (q *queue) run(ready chan<- error) {
 	if err != nil && !q.localStop() {
 		q.failed.Store(true)
 		q.dev.fail(fmt.Errorf("ublk: queue %d: %w", q.id, err))
-		q.holdUntilSafe()
-	}
 
-	if testHooks.failedRingClose != nil && q.failed.Load() {
-		testHooks.failedRingClose(q, isClosed(q.dev.startDone))
+		reason := q.holdUntilSafe(err)
+		if testHooks.failedRingClose != nil {
+			testHooks.failedRingClose(q, reason)
+		}
 	}
 
 	if cerr := q.ring.close(); cerr != nil {
@@ -251,7 +251,9 @@ func (q *queue) serve(ready chan<- error) error {
 	ready <- err
 
 	if err != nil {
-		return err
+		// START_DEV is never sent without every queue ready, so no
+		// request can reach this queue.
+		return errServable{err}
 	}
 
 	live := q.depth
@@ -285,7 +287,8 @@ func (q *queue) serve(ready chan<- error) error {
 					continue
 				}
 
-				return fmt.Errorf("io command tag %d: %w", tag, syscall.Errno(-c.Res))
+				// The command completed, so no request is pending on it.
+				return errServable{fmt.Errorf("io command tag %d: %w", tag, syscall.Errno(-c.Res))}
 			}
 		}
 
@@ -294,7 +297,7 @@ func (q *queue) serve(ready chan<- error) error {
 		}
 
 		if f := q.fault.Load(); f != nil {
-			return *f
+			return errServable{*f}
 		}
 
 		if live == 0 {

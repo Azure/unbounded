@@ -168,10 +168,13 @@ var testHooks struct {
 	// START_DEV command is sent.
 	beforeStartCmd func(d *Device)
 	// failedRingClose runs when a failed queue is about to close its
-	// ring. resolved reports whether startup was resolved by then.
-	failedRingClose func(q *queue, resolved bool)
-	// live replaces the GET_DEV_INFO probe used by a broken queue.
-	live func() (bool, error)
+	// ring, with the reason it stopped holding it.
+	failedRingClose func(q *queue, reason string)
+	// published replaces the disk publication probe of a broken queue.
+	published func() (bool, error)
+	// serveEIO fails a held queue's EIO loop on entry to force the
+	// broken-ring path.
+	serveEIO func(q *queue) error
 }
 
 // launchQueues starts every queue thread and waits until each one has
