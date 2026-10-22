@@ -11,11 +11,13 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	kubernetesfake "k8s.io/client-go/kubernetes/fake"
 )
 
 func TestCompletedResultAcceptsVerdictAssociatedTerminalState(t *testing.T) {
@@ -89,6 +91,155 @@ func TestBackendCompletionResultFailsClosedWithoutValidResult(t *testing.T) {
 				t.Fatalf("backendCompletionResult() = %#v", result)
 			}
 		})
+	}
+}
+
+func TestBackendCompletionFromLogsRecoversPreviousResult(t *testing.T) {
+	t.Parallel()
+
+	logs := resultLogSnapshot{
+		current: resultLogSourceWithContent("launcher restarted\n", nil),
+		previous: resultLogSourceWithContent(
+			encodedResultRecord("Inconclusive", "DiagnosticUnavailable", "state=unknown", 2),
+			nil,
+		),
+	}
+
+	result, hardFailure := backendCompletionFromLogs(logs, 0, false)
+	if hardFailure ||
+		result.ExecutionState != "Succeeded" ||
+		result.Verdict != "Inconclusive" ||
+		result.Reason != "DiagnosticUnavailable" ||
+		result.ResultLog == nil ||
+		result.ResultLog.SelectedSource != "previous" ||
+		result.ResultLog.Current.Status != "missing" ||
+		result.ResultLog.Previous.Status != "valid" {
+		t.Fatalf("backendCompletionFromLogs() = %#v, hardFailure=%t", result, hardFailure)
+	}
+}
+
+func TestBackendCompletionFromLogsPrefersCurrentResult(t *testing.T) {
+	t.Parallel()
+
+	record := encodedResultRecord("Pass", "Healthy", "state=ready", 0)
+	logs := resultLogSnapshot{
+		current:  resultLogSourceWithContent(record, nil),
+		previous: resultLogSourceWithContent(record, nil),
+	}
+
+	result, hardFailure := backendCompletionFromLogs(logs, 0, true)
+	if hardFailure ||
+		result.ExecutionState != "Succeeded" ||
+		result.Verdict != "Pass" ||
+		result.ResultLog == nil ||
+		result.ResultLog.SelectedSource != "current" {
+		t.Fatalf("backendCompletionFromLogs() = %#v, hardFailure=%t", result, hardFailure)
+	}
+}
+
+func TestBackendCompletionFromLogsRejectsConflicts(t *testing.T) {
+	t.Parallel()
+
+	logs := resultLogSnapshot{
+		current: resultLogSourceWithContent(
+			encodedResultRecord("Pass", "Healthy", "state=ready", 0),
+			nil,
+		),
+		previous: resultLogSourceWithContent(
+			encodedResultRecord("Inconclusive", "DiagnosticUnavailable", "state=unknown", 2),
+			nil,
+		),
+	}
+
+	result, hardFailure := backendCompletionFromLogs(logs, 0, false)
+	if !hardFailure ||
+		result.ExecutionState != "Error" ||
+		result.Verdict != "Inconclusive" ||
+		!strings.Contains(result.Reason, "conflicting results") ||
+		result.ResultLog == nil ||
+		result.ResultLog.Current.Status != "valid" ||
+		result.ResultLog.Previous.Status != "valid" {
+		t.Fatalf("backendCompletionFromLogs() = %#v, hardFailure=%t", result, hardFailure)
+	}
+}
+
+func TestBackendCompletionFromLogsRejectsMalformedCurrentBeforePreviousFallback(t *testing.T) {
+	t.Parallel()
+
+	logs := resultLogSnapshot{
+		current: resultLogSourceWithContent(resultPrefix+"%%% bm90LXVzZWQ= - 2\n", nil),
+		previous: resultLogSourceWithContent(
+			encodedResultRecord("Inconclusive", "DiagnosticUnavailable", "state=unknown", 2),
+			nil,
+		),
+	}
+
+	result, hardFailure := backendCompletionFromLogs(logs, 0, false)
+	if !hardFailure ||
+		result.ExecutionState != "Error" ||
+		result.Reason != "BackendExecutionFailed" ||
+		result.ResultLog == nil ||
+		result.ResultLog.Current.Status != "invalid" {
+		t.Fatalf("backendCompletionFromLogs() = %#v, hardFailure=%t", result, hardFailure)
+	}
+}
+
+func TestResultLogsReadsCurrentAndPreviousLauncherLogs(t *testing.T) {
+	t.Parallel()
+
+	job := &unstructured.Unstructured{}
+	job.SetAPIVersion("kubeflow.org/v2beta1")
+	job.SetKind("MPIJob")
+	job.SetName("run-p0")
+	job.SetNamespace("project-signal")
+	job.SetUID("job-uid")
+
+	launcher := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "run-p0-launcher",
+			Namespace: "project-signal",
+			Labels: map[string]string{
+				"signal.unbounded-cloud.io/run":               "run",
+				"signal.unbounded-cloud.io/participant-index": "0",
+			},
+			OwnerReferences: []metav1.OwnerReference{{UID: "job-uid"}},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "launcher"}}},
+	}
+
+	var previousValues []bool
+
+	runner := &Runner{
+		Kubernetes: kubernetesfake.NewSimpleClientset(launcher),
+		ReadPodLog: func(
+			_ context.Context,
+			namespace, podName, containerName string,
+			previous bool,
+		) (string, error) {
+			if namespace != launcher.Namespace ||
+				podName != launcher.Name ||
+				containerName != "launcher" {
+				t.Fatalf("read log identity = %s/%s %s", namespace, podName, containerName)
+			}
+
+			previousValues = append(previousValues, previous)
+
+			return encodedResultRecord("Pass", "Healthy", "", 0), nil
+		},
+	}
+
+	logs := runner.resultLogs(
+		t.Context(),
+		Config{Namespace: "project-signal", RunName: "run"},
+		createdResource{resource: job, participantIndex: 0},
+		true,
+	)
+	if len(previousValues) != 2 || previousValues[0] || !previousValues[1] {
+		t.Fatalf("previous log reads = %#v", previousValues)
+	}
+
+	if logs.current.metadata.Status != "valid" || logs.previous.metadata.Status != "valid" {
+		t.Fatalf("result log metadata = %#v", logs)
 	}
 }
 

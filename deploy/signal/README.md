@@ -138,12 +138,30 @@ The MPI launcher also applies a compatibility fence for
 whose suspend/resume race is fixed upstream by
 [`kubeflow/mpi-operator#868`](https://github.com/kubeflow/mpi-operator/pull/868)
 at commit `3a1e56d8accd0d924703d79af3149e3fa8ba1b01`. Before invoking the diagnostic
-launcher command, it waits for every host in `/etc/mpi/hostfile` to resolve and
-complete a non-interactive SSH `/bin/true`. The wait is capped at 30 seconds
-total and is always at least one second shorter than `backendActiveDeadline`.
-Timeout emits an actionable stderr message naming the last unready host and
-fails closed without changing launcher placement, resources, or
-participant-only policy isolation.
+launcher command, the adapter writes `/tmp/project-signal-hostfile` from the
+operator's deterministic worker DNS contract
+`<mpijob>-worker-<index>.<mpijob>.<namespace>.svc` and the validated
+`slotsPerWorker`. It exports that file through
+`OMPI_MCA_orte_default_hostfile`, so an empty or stale operator-injected
+`/etc/mpi/hostfile` cannot control launcher behavior after resume.
+
+The launcher waits for every generated host to complete SSH `/bin/true` with
+`BatchMode=yes`, `ConnectTimeout=2`, `ConnectionAttempts=1`,
+`StrictHostKeyChecking=accept-new`, and a launcher-local
+`UserKnownHostsFile=/tmp/project-signal-known-hosts`. SSH stderr remains visible
+for diagnosis. The wait is capped at 30 seconds total and is always at least
+one second shorter than `backendActiveDeadline`; timeout exits 124 and names
+the last unready host. Launcher and worker replica restart policies are both
+`Never`, preserving the result prelude and marker.
+
+The adapter keeps the current launcher log primary and reads the previous
+container log defensively. A single valid previous result can recover a
+restarted launcher when the current log has no result, identical current and
+previous results select the current log, and conflicting results or a malformed
+current marker fail closed. Bounded current/previous availability, byte counts,
+parse status, and selected-source metadata are included in aggregate
+measurements before foreground backend cleanup. This preserves the first
+execution failure while keeping any cleanup failure separately visible.
 
 Other backend kinds remain operator-supplied and are not installed or granted
 permissions by the included adapter.

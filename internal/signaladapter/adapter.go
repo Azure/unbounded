@@ -33,6 +33,9 @@ const (
 	MaxBackendOutputBytes  = 16 * 1024
 	MaxCleanupFailureBytes = 64
 	maxMPIWorkerReadyWait  = int64(30)
+	maxMPIWorkerSlots      = int64(1<<31 - 1)
+	mpiHostfilePath        = "/tmp/project-signal-hostfile"
+	mpiKnownHostsPath      = "/tmp/project-signal-known-hosts"
 	resultPrefix           = "PROJECT_SIGNAL_RESULT_V2 "
 	requiredTopologyKey    = "kueue.x-k8s.io/podset-required-topology"
 )
@@ -86,12 +89,29 @@ type Config struct {
 }
 
 type Result struct {
-	ParticipantIndex int    `json:"participantIndex"`
-	ExecutionState   string `json:"executionState"`
-	Verdict          string `json:"verdict"`
-	Reason           string `json:"reason"`
-	Measurements     string `json:"measurements"`
-	ExitCode         int    `json:"-"`
+	ParticipantIndex int                `json:"participantIndex"`
+	ExecutionState   string             `json:"executionState"`
+	Verdict          string             `json:"verdict"`
+	Reason           string             `json:"reason"`
+	Measurements     string             `json:"measurements"`
+	ResultLog        *ResultLogMetadata `json:"resultLog,omitempty"`
+	ExitCode         int                `json:"-"`
+}
+
+type ResultLogSourceMetadata struct {
+	Status string `json:"status"`
+	Bytes  int    `json:"bytes,omitempty"`
+}
+
+type ResultLogMetadata struct {
+	Current        ResultLogSourceMetadata `json:"current"`
+	Previous       ResultLogSourceMetadata `json:"previous"`
+	SelectedSource string                  `json:"selectedSource,omitempty"`
+}
+
+type mpiWorkerHost struct {
+	Name  string
+	Slots int64
 }
 
 type AggregateOutput struct {
@@ -427,7 +447,7 @@ func RenderResources(
 				gpuCount,
 			)
 		case "MPIJob":
-			object = mpiJob(
+			object, err = mpiJob(
 				config,
 				participant,
 				tolerations,
@@ -437,6 +457,9 @@ func RenderResources(
 				config.BackendDeadlineSeconds,
 				gpuCount,
 			)
+			if err != nil {
+				return nil, fmt.Errorf("render MPIJob for participant %d: %w", participant.Index, err)
+			}
 		default:
 			return nil, fmt.Errorf("unsupported backend kind %q", config.BackendKind)
 		}
@@ -744,41 +767,89 @@ func mpiWorkerReadinessTimeout(backendDeadlineSeconds int64) int64 {
 	return timeout
 }
 
-func mpiWorkerReadinessScript(hostfile string, timeoutSeconds int64) string {
-	return fmt.Sprintf(`
+func mpiWorkerHosts(namespace, jobName string, workerCount, slots int64) ([]mpiWorkerHost, error) {
+	if workerCount < 1 || workerCount > MaxParticipants {
+		return nil, fmt.Errorf("MPI worker count must be between 1 and %d", MaxParticipants)
+	}
+
+	if slots < 1 || slots > maxMPIWorkerSlots {
+		return nil, fmt.Errorf("MPI worker slots must be between 1 and %d", maxMPIWorkerSlots)
+	}
+
+	for field, value := range map[string]string{
+		"namespace": namespace,
+		"job name":  jobName,
+	} {
+		if errors := validation.IsDNS1123Label(value); len(errors) > 0 {
+			return nil, fmt.Errorf("MPI %s %q is invalid: %s", field, value, strings.Join(errors, ", "))
+		}
+	}
+
+	hosts := make([]mpiWorkerHost, workerCount)
+	for index := range workerCount {
+		workerName := fmt.Sprintf("%s-worker-%d", jobName, index)
+		if errors := validation.IsDNS1123Label(workerName); len(errors) > 0 {
+			return nil, fmt.Errorf(
+				"generated MPI worker name %q is invalid: %s",
+				workerName,
+				strings.Join(errors, ", "),
+			)
+		}
+
+		name := fmt.Sprintf(
+			"%s.%s.%s.svc",
+			workerName,
+			jobName,
+			namespace,
+		)
+		if errors := validation.IsDNS1123Subdomain(name); len(errors) > 0 {
+			return nil, fmt.Errorf("generated MPI worker host %q is invalid: %s", name, strings.Join(errors, ", "))
+		}
+
+		hosts[index] = mpiWorkerHost{Name: name, Slots: slots}
+	}
+
+	return hosts, nil
+}
+
+func mpiLauncherPrelude(hostfile string, hosts []mpiWorkerHost, timeoutSeconds int64) string {
+	hostfileLines := make([]string, len(hosts))
+
+	hostArguments := make([]string, len(hosts))
+	for index, host := range hosts {
+		hostfileLines[index] = fmt.Sprintf("%s slots=%d", host.Name, host.Slots)
+		hostArguments[index] = shellQuote(host.Name)
+	}
+
+	return fmt.Sprintf(
+		`
+umask 077
+printf '%%s\n' %s > %s
+export OMPI_MCA_orte_default_hostfile=%s
 wait_for_mpi_workers() {
   local hostfile=%s
   local timeout_seconds=%d
   local deadline=$((SECONDS + timeout_seconds))
   local host all_ready last_unready remaining
-  local -a hosts
+  local -a hosts=(%s)
   while (( SECONDS < deadline )); do
-    hosts=()
-    if [[ -r "${hostfile}" ]]; then
-      while IFS= read -r host; do
-        if [[ ! "${host}" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
-          printf 'Project Signal MPI readiness rejected invalid worker host %%q in %%s\n' "${host}" "${hostfile}" >&2
-          return 64
-        fi
-        hosts+=("${host}")
-      done < <(/usr/bin/awk 'NF {print $1}' "${hostfile}")
-    fi
-    if (( ${#hosts[@]} > 0 )); then
-      all_ready=1
-      for host in "${hosts[@]}"; do
-        remaining=$((deadline - SECONDS))
-        if (( remaining < 1 )) || ! timeout "${remaining}s" ssh \
-          -o BatchMode=yes \
-          -o ConnectTimeout=2 \
-          -- "${host}" /bin/true </dev/null >/dev/null 2>&1; then
-          all_ready=0
-          last_unready="${host}"
-          break
-        fi
-      done
-      if (( all_ready == 1 )); then
-        return 0
+    all_ready=1
+    for host in "${hosts[@]}"; do
+      remaining=$((deadline - SECONDS))
+      if (( remaining < 1 )) || ! timeout "${remaining}s" ssh \
+        -o BatchMode=yes \
+        -o ConnectTimeout=2 \
+        -o ConnectionAttempts=1 \
+        -o StrictHostKeyChecking=accept-new \
+        -o UserKnownHostsFile=%s \
+        -- "${host}" /bin/true </dev/null >/dev/null; then
+        all_ready=0
+        last_unready="${host}"
+        break
       fi
+    done
+    if (( all_ready == 1 )); then
+      return 0
     fi
     sleep 1
   done
@@ -787,7 +858,15 @@ wait_for_mpi_workers() {
   return 124
 }
 wait_for_mpi_workers
-`, shellQuote(hostfile), timeoutSeconds)
+`,
+		strings.Join(quotedShellArguments(hostfileLines), " "),
+		shellQuote(hostfile),
+		shellQuote(hostfile),
+		shellQuote(hostfile),
+		timeoutSeconds,
+		strings.Join(hostArguments, " "),
+		shellQuote(mpiKnownHostsPath),
+	)
 }
 
 func ordinaryPod(
@@ -851,12 +930,18 @@ func mpiJob(
 	workflow metav1.OwnerReference,
 	backendDeadlineSeconds int64,
 	gpuCount int64,
-) *unstructured.Unstructured {
+) (*unstructured.Unstructured, error) {
 	labels := resourceLabels(config, participant)
-	jobName := resourceName(config.RunName, participant.Index)
+	jobName := resourceNameWithLimit(config.RunName, participant.Index, 63-len("-worker-0"))
 	launcherEnv := workloadEnvironment(config, participant, environment, false)
 	workerEnv := workloadEnvironment(config, participant, environment, true)
 	readinessTimeout := mpiWorkerReadinessTimeout(backendDeadlineSeconds)
+
+	workerHosts, err := mpiWorkerHosts(config.Namespace, jobName, 1, gpuCount)
+	if err != nil {
+		return nil, err
+	}
+
 	worker := workloadContainer(
 		config,
 		policy,
@@ -891,7 +976,8 @@ func mpiJob(
 			},
 			"mpiReplicaSpecs": map[string]any{
 				"Launcher": map[string]any{
-					"replicas": int64(1),
+					"replicas":      int64(1),
+					"restartPolicy": string(corev1.RestartPolicyNever),
 					"template": podTemplate(
 						labels,
 						nil,
@@ -900,7 +986,7 @@ func mpiJob(
 							Name:  "launcher",
 							Image: config.RunnerImage,
 							Command: resultCommandWithPrelude(
-								mpiWorkerReadinessScript("/etc/mpi/hostfile", readinessTimeout),
+								mpiLauncherPrelude(mpiHostfilePath, workerHosts, readinessTimeout),
 								"mpi-launcher",
 								strconv.FormatInt(gpuCount, 10),
 							),
@@ -911,7 +997,8 @@ func mpiJob(
 					),
 				},
 				"Worker": map[string]any{
-					"replicas": int64(1),
+					"replicas":      int64(1),
+					"restartPolicy": string(corev1.RestartPolicyNever),
 					"template": podTemplate(
 						labels,
 						map[string]string{corev1.LabelHostname: participant.NodeName},
@@ -925,7 +1012,7 @@ func mpiJob(
 		},
 	}
 
-	return &unstructured.Unstructured{Object: object}
+	return &unstructured.Unstructured{Object: object}, nil
 }
 
 func podTemplate(
@@ -1193,9 +1280,13 @@ func resourceLabels(config Config, participant signalv1.Participant) map[string]
 }
 
 func resourceName(runName string, participantIndex int32) string {
+	return resourceNameWithLimit(runName, participantIndex, 63)
+}
+
+func resourceNameWithLimit(runName string, participantIndex int32, maximumLength int) string {
 	suffix := fmt.Sprintf("-p%d", participantIndex)
 
-	maximumRunLength := 63 - len(suffix)
+	maximumRunLength := maximumLength - len(suffix)
 	if len(runName) > maximumRunLength {
 		runName = strings.TrimRight(runName[:maximumRunLength], "-.")
 	}
@@ -1231,6 +1322,15 @@ func ownerReferenceMap(reference metav1.OwnerReference) map[string]any {
 
 func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+func quotedShellArguments(values []string) []string {
+	quoted := make([]string, len(values))
+	for index, value := range values {
+		quoted[index] = shellQuote(value)
+	}
+
+	return quoted
 }
 
 func ptr[T any](value T) *T {
