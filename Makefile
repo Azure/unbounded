@@ -375,6 +375,8 @@ help: ## Show this help
 	@echo "  racer-loadgen-test                Race-test racer-loadgen"
 	@echo "  racer-object | racer-object-build  Build racer-object (with/without focused tests)"
 	@echo "  racer-object-test                 Race-test racer-object"
+	@echo "  racer-block | racer-block-build  Build racer-block (with/without focused tests)"
+	@echo "  racer-block-test                  Race-test racer-block"
 	@echo "  image-racer-controller-local      Build the racer-controller container image"
 	@echo "  image-racer-dataplane-local       Build the racer-dataplane container image"
 	@echo "  image-racer-loadgen-local         Build the loadgen container image"
@@ -660,6 +662,20 @@ image-racer-object-local: ## Build the racer-object container image locally (sin
 		-t racer-object:$(VERSION_TAG) -t $(RACER_OBJECT_IMAGE) \
 		-f ./images/racer-object/Containerfile .
 	$(call trivy-maybe,$(RACER_OBJECT_IMAGE))
+
+RACER_BLOCK_BIN=bin/racer-block
+RACER_BLOCK_CMD=./cmd/racer-block
+RACER_BLOCK_PKGS=$(RACER_BLOCK_CMD)/... ./internal/racerblock/...
+
+.PHONY: racer-block racer-block-build racer-block-test
+racer-block: racer-block-test racer-block-build ## Test and build racer-block
+
+racer-block-build: ## Build racer-block without lint/test
+	@mkdir -p bin
+	timeout --signal=TERM --kill-after=10s 300s $(GOBUILD) -trimpath -ldflags '$(STAMP_LDFLAGS)' -o $(RACER_BLOCK_BIN) $(RACER_BLOCK_CMD)
+
+racer-block-test: ## Race-test racer-block (privileged ublk tests skip unless run as root)
+	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m -race $(RACER_BLOCK_PKGS)
 
 build: machina-manifests token-refresher-manifests machine-ops-manifests playpen-manifests net-manifests unbounded-operator-manifests gantry-manifests ## Build all Go packages
 	$(GOBUILD) ./...
