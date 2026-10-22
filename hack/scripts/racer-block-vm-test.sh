@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Run the racer-block ublk device tests inside a disposable QEMU guest.
 #
@@ -16,19 +16,20 @@
 #
 # "run" expects the race-enabled test binaries in $TEST_BIN_DIR (default
 # bin/racer-block-tests): ublk.test and racerblock.test. The guest runs the
-# full ublk package and TestEndToEndDevice as root. The job fails unless the
-# guest reports a result for every suite, every suite exits zero, and no test
-# skipped because root, /dev/ublk-control, or io_uring was missing.
+# full ublk package and TestEndToEndDevice as root. The job fails unless QEMU
+# exits zero, every suite exits zero and prints PASS, every required test
+# prints PASS, and every skipped test is a manual-only test.
 #
 # Environment:
 #   TEST_BIN_DIR      test binaries (default bin/racer-block-tests)
 #   WORK_DIR          scratch output (default bin/racer-block-vm)
 #   KERNEL_PACKAGE    kernel meta package (default linux-image-generic)
-#   VM_TIMEOUT        seconds before QEMU is terminated (default 1500)
+#   VM_TIMEOUT        seconds before QEMU is terminated (default 600)
 #   VM_MEMORY         guest memory (default 4G)
 #   VM_CPUS           guest CPUs (default 2)
-#   VM_ACCEL          kvm, tcg, or auto (default auto)
-#   SUITE_TIMEOUT     guest watchdog seconds per suite (default 600)
+#   VM_ACCEL          kvm, tcg, or auto (default auto: KVM, else TCG)
+#   SUITE_TIMEOUT     guest watchdog seconds per suite (default 270)
+#   QEMU              QEMU binary (default qemu-system-x86_64)
 #   KERNEL_IMAGE      prebuilt kernel image; skips the apt download
 #   KERNEL_MODULES    directory searched for ublk_drv.ko* (with KERNEL_IMAGE)
 #   KERNEL_VERSION    expected guest uname -r (with KERNEL_IMAGE)
@@ -41,24 +42,55 @@ set -euo pipefail
 TEST_BIN_DIR="${TEST_BIN_DIR:-bin/racer-block-tests}"
 WORK_DIR="${WORK_DIR:-bin/racer-block-vm}"
 KERNEL_PACKAGE="${KERNEL_PACKAGE:-linux-image-generic}"
-VM_TIMEOUT="${VM_TIMEOUT:-1500}"
+VM_TIMEOUT="${VM_TIMEOUT:-600}"
 VM_MEMORY="${VM_MEMORY:-4G}"
 VM_CPUS="${VM_CPUS:-2}"
 VM_ACCEL="${VM_ACCEL:-auto}"
-SUITE_TIMEOUT="${SUITE_TIMEOUT:-600}"
+SUITE_TIMEOUT="${SUITE_TIMEOUT:-270}"
+QEMU="${QEMU:-qemu-system-x86_64}"
 KERNEL_IMAGE="${KERNEL_IMAGE:-}"
 KERNEL_MODULES="${KERNEL_MODULES:-}"
 KERNEL_VERSION="${KERNEL_VERSION:-}"
 
-# Each suite is "name|binary|arguments". Test timeouts stay below VM_TIMEOUT
-# so a hung test reports through the guest before the host kills QEMU.
+# Each suite is "name|binary|arguments". The 4m test timeout fires before the
+# 270s guest watchdog, which fires before the 600s host limit, so a hang is
+# reported by the innermost layer that can still report it.
 SUITES=(
-	"ublk|ublk.test|-test.timeout=8m -test.v"
-	"racerblock|racerblock.test|-test.timeout=8m -test.v -test.run=^TestEndToEndDevice\$"
+	"ublk|ublk.test|-test.timeout=4m -test.v"
+	"racerblock|racerblock.test|-test.timeout=4m -test.v -test.run=^TestEndToEndDevice\$"
 )
 
-# Skip messages that mean the environment, not the test, decided the outcome.
-FATAL_SKIP_PATTERN='RACER_BLOCK_TEST_VM|requires root|/dev/ublk-control unavailable|unavailable: .*(no such|not permitted|not supported|function not implemented)|io_uring unavailable'
+# Tests that must print "--- PASS" in each suite. A suite where these skip
+# fails even though the binary exits zero.
+# shellcheck disable=SC2034 # read through ${!required}
+REQUIRED_ublk=(
+	TestIntegrationDeleteFallbackClose
+	TestIntegrationDeleteFallbackExternalStop
+	TestIntegrationExternalDelete
+	TestIntegrationExternalStop
+	TestIntegrationReadOnlyDevice
+	TestIntegrationContextCancel
+	TestIntegrationFixedIDAndDelete
+	TestIntegrationStartValidation
+	TestIntegrationStartupFetchRejected
+	TestIntegrationStartupQueueFailsBeforeStartDev
+	TestIntegrationStartupQueueFailsAtStartDev
+	TestIntegrationStartupBrokenRingAtStartDev
+	TestCtrlPayloadUsesStablePage
+	TestURingNop
+)
+# shellcheck disable=SC2034 # read through ${!required}
+REQUIRED_racerblock=(
+	TestEndToEndDevice
+)
+
+# The only tests allowed to skip. They need manual setup (UBLK_TEST_FIO=1 or
+# UBLK_TEST_DELETE_IDS) and are not run by CI. Any other skip fails, which
+# covers a missing root, ublk, io_uring, or RACER_BLOCK_TEST_VM.
+ALLOWED_SKIPS='TestIntegrationDeleteIDs|TestIntegrationDeleteStale|TestIntegrationFio'
+
+# Go prints a skip reason before "--- SKIP", so these are matched anywhere.
+FATAL_SKIP_PATTERN='RACER_BLOCK_TEST_VM=1|requires root|/dev/ublk-control unavailable|io_uring unavailable'
 
 log() { echo "racer-block-vm: $*" >&2; }
 die() {
@@ -76,41 +108,67 @@ require_tools() {
 	fi
 }
 
-# check_results LOG prints a verdict and returns nonzero unless every suite
-# reported exit status 0 and no suite skipped for an environmental reason.
+# suite_section LOG NAME prints the output of one suite.
+suite_section() {
+	tr -d '\r' <"$1" | awk -v n="$2" '
+		$0 == "RACER_BLOCK_SUITE_START " n { on = 1; next }
+		on && index($0, "RACER_BLOCK_SUITE_RESULT " n " ") == 1 { exit }
+		on { print }'
+}
+
+# check_results LOG QEMU_STATUS prints a verdict and returns nonzero unless
+# QEMU exited zero and every suite fully passed.
 check_results() {
-	local console="$1" spec name status rc=0
+	local console="$1" qemu_status="${2:-0}" spec name status section test required rc=0
 	[[ -f "$console" ]] || {
 		log "error: console log $console missing"
 		return 1
 	}
-	if grep -qE 'Kernel panic|BUG: |Oops: |RACER_BLOCK_GUEST_FATAL' "$console"; then
-		log "error: guest reported a fatal error:"
-		grep -E 'Kernel panic|BUG: |Oops: |RACER_BLOCK_GUEST_FATAL' "$console" | head -n 20 >&2
+	if [[ "$qemu_status" != 0 ]]; then
+		log "error: QEMU exited $qemu_status"
 		rc=1
 	fi
-	if grep -E -A2 -e '--- SKIP' "$console" | grep -qE "$FATAL_SKIP_PATTERN"; then
-		log "error: tests skipped because the guest lacked root, ublk, or io_uring"
+	if tr -d '\r' <"$console" | grep -qE 'Kernel panic|BUG: |Oops: |RACER_BLOCK_GUEST_FATAL'; then
+		log "error: guest reported a fatal error:"
+		tr -d '\r' <"$console" | grep -E 'Kernel panic|BUG: |Oops: |RACER_BLOCK_GUEST_FATAL' | head -n 20 >&2
+		rc=1
+	fi
+	if tr -d '\r' <"$console" | grep -qE "$FATAL_SKIP_PATTERN"; then
+		log "error: a test reported missing root, ublk, io_uring, or RACER_BLOCK_TEST_VM:"
+		tr -d '\r' <"$console" | grep -E "$FATAL_SKIP_PATTERN" | head -n 20 >&2
+		rc=1
+	fi
+	if tr -d '\r' <"$console" | grep -E '^ *--- SKIP: ' |
+		grep -vE "^ *--- SKIP: ($ALLOWED_SKIPS)( |/)" | head -n 20 | grep . >&2; then
+		log "error: tests above skipped and are not manual-only"
 		rc=1
 	fi
 	for spec in "${SUITES[@]}"; do
 		name="${spec%%|*}"
-		status="$(sed -n "s/^RACER_BLOCK_SUITE_RESULT ${name} \([0-9][0-9]*\).*/\1/p" "$console" | tr -d '\r' | tail -n 1)"
+		status="$(tr -d '\r' <"$console" | sed -n "s/^RACER_BLOCK_SUITE_RESULT ${name} \([0-9][0-9]*\)$/\1/p" | tail -n 1)"
 		if [[ -z "$status" ]]; then
 			log "error: suite $name reported no result (guest crash or timeout)"
 			rc=1
+			continue
 		elif [[ "$status" != 0 ]]; then
 			log "error: suite $name exited $status"
 			rc=1
-		else
-			log "suite $name passed"
 		fi
+		section="$(suite_section "$console" "$name")"
+		if ! grep -qx 'PASS' <<<"$section"; then
+			log "error: suite $name did not print PASS"
+			rc=1
+		fi
+		required="REQUIRED_${name}[@]"
+		for test in "${!required}"; do
+			if ! grep -qE "^--- PASS: $test \(" <<<"$section"; then
+				log "error: suite $name: $test did not PASS"
+				rc=1
+			fi
+		done
+		((rc == 0)) && log "suite $name passed"
 	done
-	if ! grep -qE -- '^--- PASS: TestEndToEndDevice ' "$console"; then
-		log "error: TestEndToEndDevice did not report PASS"
-		rc=1
-	fi
-	if ! grep -q '^RACER_BLOCK_GUEST_DONE' "$console"; then
+	if ! tr -d '\r' <"$console" | grep -qx 'RACER_BLOCK_GUEST_DONE'; then
 		log "error: guest did not finish"
 		rc=1
 	fi
@@ -133,6 +191,7 @@ fetch_kernel() {
 	rm -rf "$pkgdir" "$root"
 	mkdir -p "$pkgdir" "$root"
 	(cd "$pkgdir" && timeout --signal=TERM --kill-after=10s 300s apt-get download \
+		-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
 		"linux-image-$version" "linux-modules-$version" "linux-modules-extra-$version")
 	local deb
 	for deb in "$pkgdir"/*.deb; do
@@ -242,14 +301,25 @@ EOF
 	(cd "$root" && find . -print0 | cpio --null -o -H newc --quiet) | gzip -1 >"$WORK_DIR/initramfs.cpio.gz"
 }
 
+# accel_arg prints the QEMU accelerator for VM_ACCEL. "auto" asks QEMU to try
+# KVM and fall back to TCG when KVM cannot start. kvm and tcg are strict.
+accel_arg() {
+	case "$1" in
+	auto) echo kvm:tcg ;;
+	kvm | tcg) echo "$1" ;;
+	*)
+		log "error: VM_ACCEL must be auto, kvm, or tcg, not '$1'"
+		return 1
+		;;
+	esac
+}
+
 run_vm() {
-	local version="$1" console="$WORK_DIR/console.log" accel="$VM_ACCEL" status=0
-	if [[ "$accel" == auto ]]; then
-		if [[ -r /dev/kvm && -w /dev/kvm ]]; then accel=kvm; else accel=tcg; fi
-	fi
+	local console="$WORK_DIR/console.log" accel status=0
+	accel="$(accel_arg "$VM_ACCEL")" || return 1
 	log "booting guest (accel=$accel, timeout=${VM_TIMEOUT}s)"
 	: >"$console"
-	timeout --signal=TERM --kill-after=10s "$VM_TIMEOUT" qemu-system-x86_64 \
+	timeout --signal=TERM --kill-after=10s "$VM_TIMEOUT" "$QEMU" \
 		-machine "q35,accel=$accel" -cpu max -smp "$VM_CPUS" -m "$VM_MEMORY" \
 		-kernel "$KERNEL_PATH" \
 		-initrd "$WORK_DIR/initramfs.cpio.gz" \
@@ -259,45 +329,114 @@ run_vm() {
 	if ((status == 124)); then
 		log "error: guest exceeded ${VM_TIMEOUT}s"
 	fi
-	# QEMU's exit status alone does not prove the tests ran, so judge the log.
-	check_results "$console" && ((status != 124))
+	# Both must hold: a clean QEMU exit does not prove the tests ran, and a
+	# complete log does not excuse a QEMU crash or kill.
+	check_results "$console" "$status"
+}
+
+# pass_log prints a realistic passing console log in go test -v format.
+pass_log() {
+	local t
+	echo 'RACER_BLOCK_GUEST_KERNEL 6.8.0-147-generic'
+	echo 'RACER_BLOCK_SUITE_START ublk'
+	for t in "${REQUIRED_ublk[@]}"; do
+		printf '=== RUN   %s\n--- PASS: %s (0.01s)\n' "$t" "$t"
+	done
+	printf '=== RUN   TestIntegrationDeleteIDs\n    integration_linux_test.go:450: UBLK_TEST_DELETE_IDS not set\n--- SKIP: TestIntegrationDeleteIDs (0.00s)\n'
+	printf '=== RUN   TestIntegrationFio\n    integration_linux_test.go:536: UBLK_TEST_FIO not set\n--- SKIP: TestIntegrationFio (0.00s)\n'
+	printf 'PASS\nRACER_BLOCK_SUITE_RESULT ublk 0\n'
+	echo 'RACER_BLOCK_SUITE_START racerblock'
+	printf '=== RUN   TestEndToEndDevice\n--- PASS: TestEndToEndDevice (0.20s)\nPASS\n'
+	printf 'RACER_BLOCK_SUITE_RESULT racerblock 0\nRACER_BLOCK_GUEST_DONE\n'
+}
+
+# skip_log TEST REASON replaces TEST's PASS with a realistic skip.
+skip_log() {
+	pass_log | awk -v t="$1" -v why="$2" '
+		$0 == "--- PASS: " t " (0.01s)" || $0 == "--- PASS: " t " (0.20s)" {
+			print "    x_test.go:41: " why; print "--- SKIP: " t " (0.00s)"; next }
+		{ print }'
 }
 
 self_test() {
-	local rc=0
+	local rc=0 got
 	dir="$(mktemp -d "${TMPDIR:-/tmp}/racer-block-vm-selftest.XXXXXX")"
 	trap 'rm -rf "$dir"' EXIT
 	expect() {
-		local want="$1" case="$2" got=0
-		check_results "$dir/$case.log" 2>/dev/null || got=1
+		local want="$1" case="$2" status="${3:-0}" got=0
+		check_results "$dir/$case.log" "$status" 2>/dev/null || got=1
 		if [[ "$got" != "$want" ]]; then
 			log "self-test $case: want $want got $got"
 			rc=1
 		fi
 	}
-	local pass='RACER_BLOCK_SUITE_RESULT ublk 0
---- PASS: TestEndToEndDevice (0.10s)
-RACER_BLOCK_SUITE_RESULT racerblock 0
-RACER_BLOCK_GUEST_DONE'
-	printf '%s\n' "$pass" >"$dir/pass.log"
+	pass_log >"$dir/pass.log"
 	expect 0 pass
-	printf '%s\n' "--- SKIP: TestIntegrationDeleteStale (0.00s)" "    x_test.go:450: UBLK_TEST_DELETE_IDS not set" "$pass" >"$dir/benign-skip.log"
-	expect 0 benign-skip
-	printf '%s\n' "--- SKIP: TestIntegration (0.00s)" "    x_test.go:45: /dev/ublk-control unavailable: no such file" "$pass" >"$dir/ublk-skip.log"
-	expect 1 ublk-skip
-	printf '%s\n' "--- SKIP: TestX (0.00s)" "    x_test.go:37: requires root" "$pass" >"$dir/root-skip.log"
+	pass_log | sed 's/$/\r/' >"$dir/crlf.log"
+	expect 0 crlf
+	expect 1 pass 1
+	expect 1 pass 124
+	expect 1 pass 137
+	skip_log TestIntegrationReadOnlyDevice "requires root" >"$dir/root-skip.log"
 	expect 1 root-skip
-	printf '%s\n' "--- SKIP: TestStartupFault (0.00s)" "    x_test.go:9: set RACER_BLOCK_TEST_VM=1 to run" "$pass" >"$dir/vm-skip.log"
+	skip_log TestIntegrationExternalStop "/dev/ublk-control unavailable: no such file or directory" >"$dir/ublk-skip.log"
+	expect 1 ublk-skip
+	skip_log TestURingNop "io_uring unavailable: operation not permitted" >"$dir/uring-skip.log"
+	expect 1 uring-skip
+	skip_log TestIntegrationStartupFetchRejected "startup fault tests need RACER_BLOCK_TEST_VM=1 in a disposable VM" >"$dir/vm-skip.log"
 	expect 1 vm-skip
-	printf '%s\n' 'RACER_BLOCK_SUITE_RESULT ublk 0' 'Kernel panic - not syncing: Fatal exception' >"$dir/panic.log"
-	expect 1 panic
-	printf '%s\n' 'RACER_BLOCK_SUITE_RESULT ublk 0' >"$dir/timeout.log"
-	expect 1 timeout
-	sed 's/racerblock 0/racerblock 1/' "$dir/pass.log" >"$dir/fail.log"
+	skip_log TestEndToEndDevice "requires root" >"$dir/e2e-skip.log"
+	expect 1 e2e-skip
+	skip_log TestIntegrationContextCancel "some new reason" >"$dir/unknown-skip.log"
+	expect 1 unknown-skip
+	pass_log | grep -v 'TestIntegrationStartupBrokenRingAtStartDev' >"$dir/missing-startup.log"
+	expect 1 missing-startup
+	pass_log | grep -vx 'PASS' >"$dir/no-pass.log"
+	expect 1 no-pass
+	pass_log | sed 's/^RACER_BLOCK_SUITE_RESULT racerblock 0$/RACER_BLOCK_SUITE_RESULT racerblock 1/' >"$dir/fail.log"
 	expect 1 fail
-	printf '%s\n' 'RACER_BLOCK_GUEST_FATAL /dev/ublk-control missing' 'RACER_BLOCK_GUEST_DONE' >"$dir/fatal.log"
+	pass_log | sed '/RACER_BLOCK_SUITE_START racerblock/,$d' >"$dir/timeout.log"
+	expect 1 timeout
+	{ pass_log; echo 'Kernel panic - not syncing: Fatal exception'; } >"$dir/panic.log"
+	expect 1 panic
+	printf '%s\n' 'RACER_BLOCK_GUEST_FATAL suite ublk hung for 270s' 'RACER_BLOCK_GUEST_DONE' >"$dir/fatal.log"
 	expect 1 fatal
 	expect 1 missing-log
+
+	# accel_arg: auto falls back inside QEMU, explicit values stay strict.
+	[[ "$(accel_arg auto)" == kvm:tcg && "$(accel_arg kvm)" == kvm && "$(accel_arg tcg)" == tcg ]] || {
+		log "self-test accel: wrong mapping"
+		rc=1
+	}
+	if accel_arg bogus 2>/dev/null; then
+		log "self-test accel: bogus value accepted"
+		rc=1
+	fi
+
+	# run_vm with a stub QEMU: a passing log must not hide a failing exit.
+	mkdir -p "$dir/work"
+	pass_log >"$dir/stub.out"
+	# shellcheck disable=SC2016 # expanded by the stub
+	printf '#!/bin/sh\ncat %q\nexit "${STUB_EXIT:-0}"\n' "$dir/stub.out" >"$dir/qemu"
+	chmod +x "$dir/qemu"
+	for got in 0 1; do
+		if (WORK_DIR="$dir/work" QEMU="$dir/qemu" KERNEL_PATH=none STUB_EXIT=$got run_vm >/dev/null 2>&1); then
+			[[ $got == 0 ]] || {
+				log "self-test run_vm: QEMU exit $got accepted"
+				rc=1
+			}
+		else
+			[[ $got != 0 ]] || {
+				log "self-test run_vm: clean run rejected"
+				rc=1
+			}
+		fi
+	done
+	if (WORK_DIR="$dir/work" QEMU="$dir/qemu" VM_ACCEL=bogus KERNEL_PATH=none run_vm >/dev/null 2>&1); then
+		log "self-test run_vm: bogus VM_ACCEL accepted"
+		rc=1
+	fi
+
 	if (PATH=/nonexistent require_tools qemu-system-x86_64) 2>/dev/null; then
 		log "self-test missing-tools: want failure"
 		rc=1
@@ -309,7 +448,7 @@ RACER_BLOCK_GUEST_DONE'
 main() {
 	case "${1:-}" in
 	run)
-		require_tools qemu-system-x86_64 busybox cpio gzip zstd ldd modinfo file timeout tee
+		require_tools "$QEMU" busybox cpio gzip zstd ldd modinfo file timeout tee
 		mkdir -p "$WORK_DIR"
 		local version
 		if [[ -n "$KERNEL_IMAGE" ]]; then
@@ -324,7 +463,7 @@ main() {
 			MODULES_DIR="$WORK_DIR/kernel-root/lib/modules/$version"
 		fi
 		build_initramfs "$version"
-		run_vm "$version"
+		run_vm
 		;;
 	self-test) self_test ;;
 	*) die "usage: $0 run|self-test" ;;
