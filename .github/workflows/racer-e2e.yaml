@@ -3,8 +3,9 @@
 
 name: racer e2e
 
-# Path filters cover Racer sources only. The suite also exercises the operator
-# install path, which the nightly schedule covers for unrelated operator changes.
+# Path filters cover Racer and the Gantry Racer backend. The suite also
+# exercises the operator install path, which the nightly schedule covers for
+# unrelated operator changes.
 on:
   pull_request:
     paths:
@@ -20,6 +21,11 @@ on:
       - images/racer-controller/**
       - images/racer-dataplane/**
       - images/racer-object/**
+      - cmd/gantry/**
+      - internal/gantry/**
+      - internal/operator/components/gantry/**
+      - deploy/gantry/**
+      - images/gantry/**
       - e2e/racer/**
       - go.mod
       - go.sum
@@ -45,6 +51,11 @@ on:
       - images/racer-controller/**
       - images/racer-dataplane/**
       - images/racer-object/**
+      - cmd/gantry/**
+      - internal/gantry/**
+      - internal/operator/components/gantry/**
+      - deploy/gantry/**
+      - images/gantry/**
       - e2e/racer/**
       - go.mod
       - go.sum

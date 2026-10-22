@@ -884,6 +884,11 @@ func getManageCniPluginFromCRDs(siteInformer cache.SharedIndexInformer, siteName
 	return true // Site not found, default to true
 }
 
+// siteHasUnmanagedCNI reports whether the site explicitly sets manageCniPlugin=false.
+func siteHasUnmanagedCNI(site *unboundedv1alpha3.Site) bool {
+	return site != nil && site.Spec.ManageCniPlugin != nil && !*site.Spec.ManageCniPlugin
+}
+
 func getSiteTunnelMTUFromCRDs(siteInformer cache.SharedIndexInformer, siteName string) int {
 	if siteName == "" {
 		return 0
@@ -1744,6 +1749,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 					LearnedRoutes:          learnedRoutes,
 					PodCIDRs:               gwNode.PodCIDRs,
 					SkipPodCIDRRoutes:      !manageCniPlugin && !cfg.ManageSameSitePodRoutes && !isGatewayNode && gwNode.SiteName == mySiteName,
+					UnmanagedCNISite:       siteHasUnmanagedCNI(siteMap[gwNode.SiteName]),
 				}, siteRouting.localCIDRs))
 			}
 		}
