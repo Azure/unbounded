@@ -1980,6 +1980,7 @@ fn cache(id: usize) -> CacheDefinition {
         id: CacheId("33333333-3333-4333-8333-333333333333".into()),
         client_socket,
         origin_socket,
+        priority: racer_control_wire::DEFAULT_PRIORITY,
     }
 }
 

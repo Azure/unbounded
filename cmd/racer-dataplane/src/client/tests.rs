@@ -961,6 +961,7 @@ fn definition() -> CacheDefinition {
         name: "example".into(),
         client_socket: "/run/racer/example/client/socket".into(),
         origin_socket: "/run/racer/example/origin/socket".into(),
+        priority: racer_control_wire::DEFAULT_PRIORITY,
     }
 }
 fn scope() -> RequestScope {

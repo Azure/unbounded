@@ -3066,6 +3066,7 @@ impl Fixture {
                     name: settings.name.into(),
                     client_socket,
                     origin_socket,
+                    priority: racer_control_wire::DEFAULT_PRIORITY,
                 }],
             })
             .unwrap();
@@ -3375,6 +3376,7 @@ fn adapter_client(
                 name: "fixture".into(),
                 client_socket,
                 origin_socket,
+                priority: racer_control_wire::DEFAULT_PRIORITY,
             }],
         })
         .unwrap();

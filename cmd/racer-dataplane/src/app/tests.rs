@@ -667,6 +667,7 @@ pub(super) fn definition() -> racer_control_wire::CacheDefinition {
         name: "app-lifecycle".into(),
         client_socket,
         origin_socket,
+        priority: racer_control_wire::DEFAULT_PRIORITY,
     }
 }
 
@@ -2437,6 +2438,7 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
         name: "keep".into(),
         client_socket: "/run/racer/keep/client/socket".into(),
         origin_socket: "/run/racer/keep/origin/socket".into(),
+        priority: racer_control_wire::DEFAULT_PRIORITY,
     };
     *fixture.publication.lock().unwrap() =
         Some(publication(&config, 1, vec![definition(), keep.clone()]));

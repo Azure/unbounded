@@ -249,6 +249,7 @@ impl SubscriptionFixture {
             name: "interop".into(),
             client_socket,
             origin_socket,
+            priority: racer_control_wire::DEFAULT_PRIORITY,
         };
         snapshots
             .apply(Publication {
