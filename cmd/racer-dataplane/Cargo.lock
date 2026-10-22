@@ -886,6 +886,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "racer-gpu"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "libc",
+ "racer-crypto",
+ "zeroize",
+]
+
+[[package]]
 name = "racer-object-wire"
 version = "0.1.0"
 dependencies = [
