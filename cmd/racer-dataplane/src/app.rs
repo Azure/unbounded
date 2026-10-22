@@ -1478,11 +1478,12 @@ impl WorkerApplication {
         Ok(())
     }
 
-    /// Advance demand sizing of the idle recycler and staging pools.
+    /// Advance demand sizing of the idle recycler, staging, and aligned pools.
     /// Each pool is O(1) until its observation window elapses.
     fn maintain_pools(&self, now: std::time::Instant) {
         self.runtime.admission.maintain_buffers(now);
         self.store.writer.maintain_staging(now);
+        self.memory.buffers().maintain_idle_buffers(now);
     }
 
     /// Sample memory pressure on the sampling worker, then apply any level
@@ -1580,10 +1581,11 @@ impl WorkerApplication {
         metrics.observe_memory(memory);
     }
 
-    /// Hold both idle pools at their minimum while memory is constrained.
+    /// Hold every idle pool at its minimum while memory is constrained.
     pub(crate) fn constrain_pools(&self, constrained: bool) {
         self.runtime.admission.constrain_buffers(constrained);
         self.store.writer.constrain_staging(constrained);
+        self.memory.buffers().constrain_idle_buffers(constrained);
     }
 
     /// Idle pool statistics as `(recycler, staging slab)`.
@@ -1593,6 +1595,12 @@ impl WorkerApplication {
             self.runtime.admission.buffer_pool_stats(),
             self.store.writer.staging_pool_stats(),
         )
+    }
+
+    /// Demand counters of this worker's aligned ciphertext pool.
+    #[cfg(test)]
+    pub(crate) fn aligned_pool_stats(&self) -> page_alloc::PoolStats {
+        self.memory.buffers().aligned_pool_stats()
     }
 
     /// Schedule placement progress or back off pinned capacity with a bounded warning rate.

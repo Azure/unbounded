@@ -38,6 +38,12 @@ pub(crate) fn default_disk_alignment() -> page_alloc::Alignment {
 /// fail on. Idle aligned storage is therefore unaccounted, so the budget is
 /// kept to a few pages per worker, and every path that reclaims the recycler
 /// ([`BufferPool::reclaim_idle_buffers`]) also empties this pool.
+///
+/// This is a ceiling, not a steady state: the pool's demand controller
+/// ([`page_alloc::PoolDemand`]) releases buffers that stay idle for a whole
+/// maintenance window, oldest first, so an idle worker's pool empties within a
+/// few windows of [`BufferPool::maintain_idle_buffers`] while continuous reuse
+/// keeps it full. Memory pressure constrains the pool to hold nothing.
 pub(crate) const ALIGNED_POOL_IDLE_PAGES: usize = 4;
 
 /// Accounting for aligned ciphertext storage.
@@ -356,6 +362,21 @@ impl BufferPool {
     #[cfg(test)]
     pub(crate) fn aligned_stats(&self) -> page_alloc::SharedPoolStats {
         self.aligned.stats()
+    }
+    /// Demand counters of this worker's aligned ciphertext pool.
+    #[cfg(test)]
+    pub(crate) fn aligned_pool_stats(&self) -> page_alloc::PoolStats {
+        self.aligned.pool_stats()
+    }
+    /// Advance demand sizing of the aligned pool, releasing storage that stayed
+    /// idle. O(1) until the observation window elapses; returns bytes freed.
+    pub(crate) fn maintain_idle_buffers(&self, now: std::time::Instant) -> usize {
+        self.aligned.maintain(now)
+    }
+    /// Refuse aligned returns and release idle storage at the next maintenance
+    /// while memory is constrained.
+    pub(crate) fn constrain_idle_buffers(&self, constrained: bool) {
+        self.aligned.set_constrained(constrained);
     }
     /// Release idle recycled storage: the flow-control recycler and this
     /// worker's aligned pool, dropping the admission charges both retain.
@@ -2589,6 +2610,52 @@ pub(crate) mod tests {
         // Releasing idle storage keeps admission untouched.
         pool.reclaim_idle_buffers();
         assert_eq!(pool.aligned_stats().idle_buffers, 0);
+    }
+
+    #[test]
+    fn aligned_pool_empties_when_idle_and_is_retained_while_reused() {
+        let admission = admission(8);
+        let pool = BufferPool::new(admission.clone());
+        let length = PAGE_BYTES as usize + 16;
+        let capacity = pool.aligned_capacity(length).unwrap();
+        let take = || {
+            let reservation = admission
+                .reserve(None, ResourceClass::Ciphertext, capacity)
+                .unwrap();
+            pool.aligned_ciphertext(reservation, length).unwrap()
+        };
+        let burst = |count: usize| {
+            let buffers: Vec<_> = (0..count).map(|_| take()).collect();
+            drop(buffers);
+        };
+        burst(ALIGNED_POOL_IDLE_PAGES);
+        assert_eq!(pool.aligned_stats().idle_buffers, ALIGNED_POOL_IDLE_PAGES);
+        let window = page_alloc::DEFAULT_WINDOW;
+        let start = std::time::Instant::now();
+        assert_eq!(pool.maintain_idle_buffers(start), 0);
+        // Active reuse every window keeps the pool full.
+        for turn in 1..=20 {
+            burst(ALIGNED_POOL_IDLE_PAGES);
+            assert_eq!(pool.maintain_idle_buffers(start + window * turn), 0);
+            assert_eq!(pool.aligned_stats().idle_buffers, ALIGNED_POOL_IDLE_PAGES);
+        }
+        // Once idle, a few windows release everything.
+        let mut now = start + window * 20;
+        for _ in 0..ALIGNED_POOL_IDLE_PAGES {
+            now += window;
+            pool.maintain_idle_buffers(now);
+        }
+        assert_eq!(pool.aligned_stats(), page_alloc::SharedPoolStats::default());
+        assert!(pool.aligned_pool_stats().trimmed >= ALIGNED_POOL_IDLE_PAGES as u64);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+
+        // Constrained pools refuse returns.
+        pool.constrain_idle_buffers(true);
+        burst(1);
+        assert_eq!(pool.aligned_stats().idle_buffers, 0);
+        pool.constrain_idle_buffers(false);
+        burst(1);
+        assert_eq!(pool.aligned_stats().idle_buffers, 1);
     }
 
     #[test]

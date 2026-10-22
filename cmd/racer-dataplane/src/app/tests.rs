@@ -4663,6 +4663,7 @@ fn shared_pressure_constrains_pools_and_releases_retained_buffers() {
     worker.poll_pressure(now);
     let (recycler, staging) = worker.pool_stats();
     assert!(recycler.constrained && staging.constrained);
+    assert!(worker.aligned_pool_stats().constrained);
     assert_eq!(recycler.bytes, 0);
     assert_eq!(staging.bytes, 0);
     assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
@@ -4681,6 +4682,7 @@ fn shared_pressure_constrains_pools_and_releases_retained_buffers() {
     worker.poll_pressure(now);
     let (recycler, staging) = worker.pool_stats();
     assert!(!recycler.constrained && !staging.constrained);
+    assert!(!worker.aligned_pool_stats().constrained);
     assert_eq!(
         worker
             .telemetry
@@ -4722,4 +4724,38 @@ fn sampling_worker_owns_the_monitor_and_others_do_not() {
     assert!(sampler.monitor.is_some() && sampler.shared.is_some() && sampler.samples_memory);
     let other = WorkerPressure::new(true, &shared, false);
     assert!(other.monitor.is_none() && other.shared.is_some() && !other.samples_memory);
+}
+
+#[test]
+fn maintain_pools_releases_idle_aligned_storage() {
+    use crate::admission::ResourceClass;
+    let worker = wake_test_worker();
+    let buffers = worker.memory.buffers();
+    let length = 4096;
+    let capacity = buffers.aligned_capacity(length).unwrap();
+    let take = || {
+        let reservation = worker
+            .runtime
+            .admission
+            .reserve(None, ResourceClass::Ciphertext, capacity)
+            .unwrap();
+        buffers.aligned_ciphertext(reservation, length).unwrap()
+    };
+    drop([take(), take()]);
+    assert_eq!(worker.aligned_pool_stats().entries, 2);
+    let window = page_alloc::DEFAULT_WINDOW;
+    let start = std::time::Instant::now();
+    worker.maintain_pools(start);
+    // Reuse within each window retains the storage.
+    for turn in 1..=3 {
+        drop([take(), take()]);
+        worker.maintain_pools(start + window * turn);
+        assert_eq!(worker.aligned_pool_stats().entries, 2);
+    }
+    // An idle worker releases it within a few windows.
+    for turn in 4..=6 {
+        worker.maintain_pools(start + window * turn);
+    }
+    let stats = worker.aligned_pool_stats();
+    assert_eq!((stats.entries, stats.bytes), (0, 0));
 }
