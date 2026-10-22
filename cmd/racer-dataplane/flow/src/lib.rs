@@ -264,6 +264,11 @@ pub struct Charge<P: Policy> {
     buffers: Weak<Buffers<P>>,
 
     stopped: Arc<AtomicBool>,
+
+    // Backing adopted from the recycler when this charge's admission needed the
+    // bytes that held it. Reusing it avoids unmapping and remapping a page.
+    // Boxed so charges without adopted backing grow by one pointer only.
+    spare: Option<Box<Mutex<Vec<u8>>>>,
 }
 
 impl<P: Policy> page_alloc::Charge for Charge<P> {
@@ -376,6 +381,7 @@ impl<P: Policy> SharedQuotas<P> {
             local: None,
             buffers: Weak::new(),
             stopped: self.stopped.clone(),
+            spare: None,
         })
     }
 }
@@ -432,6 +438,20 @@ impl<P: Policy> Charge<P> {
         if length > self.amount {
             return Err(Error::InvalidInput);
         }
+        if let Some(mut bytes) = self.take_spare(length) {
+            if let Some(pool) = self.buffers.upgrade() {
+                let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
+                let left = pool.entries.len();
+                pool.demand.record_hit(left);
+            }
+            if !self.class.requires_wipe() {
+                // Same zeroed-checkout contract as a pooled entry.
+                bytes.resize(bytes.capacity(), 0);
+                bytes.fill(0);
+            }
+            bytes.truncate(length);
+            return Ok(bytes);
+        }
         if let Some(pool) = self.buffers.upgrade() {
             let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
             let index = [true, false].into_iter().find_map(|same_class| {
@@ -471,6 +491,39 @@ impl<P: Policy> Charge<P> {
         let mut bytes = zeroed_payload(capacity)?;
         bytes.truncate(length);
         Ok(bytes)
+    }
+
+    /// Take adopted backing that fits `length` under the same rules as a pooled entry.
+    fn take_spare(&self, length: usize) -> Option<Vec<u8>> {
+        let mut spare = self
+            .spare
+            .as_ref()?
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let capacity = spare.capacity();
+        let fits = capacity >= length
+            && capacity <= self.amount
+            && (page_alloc::buffer_capacity(capacity) == page_alloc::buffer_capacity(length)
+                || capacity - length < 64 * 1024);
+        // An empty Vec left behind never fits again because length is nonzero.
+        if fits && length > 0 {
+            Some(std::mem::take(&mut *spare))
+        } else {
+            None
+        }
+    }
+
+    /// Drop adopted backing that this charge no longer admits in full.
+    fn trim_spare(&mut self) {
+        if let Some(spare) = &mut self.spare
+            && spare
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .capacity()
+                > self.amount
+        {
+            self.spare = None;
+        }
     }
 
     /// At most eight >=1MiB buffers, fewer while demand is low, within the
@@ -539,6 +592,7 @@ impl<P: Policy> Charge<P> {
     /// Move admission with a precloned key without touching either usage counter.
     fn transfer(&mut self, amount: usize, buffers: Weak<Buffers<P>>, key: Option<P::Key>) -> Self {
         self.amount -= amount;
+        self.trim_spare();
         Self {
             class: self.class,
             amount,
@@ -547,6 +601,7 @@ impl<P: Policy> Charge<P> {
             local: self.local.clone(),
             buffers,
             stopped: self.stopped.clone(),
+            spare: None,
         }
     }
 
@@ -554,6 +609,8 @@ impl<P: Policy> Charge<P> {
     fn release_to(&mut self, amount: usize) {
         let released = self.amount - amount;
         self.amount = amount;
+        // Unadmitted backing must not outlive the admission that covered it.
+        self.trim_spare();
         self.totals.counter(self.class).release(released);
         if let Some(local) = &self.local {
             local.counter(self.class).release(released);
@@ -820,26 +877,34 @@ impl<P: Policy> Quotas<P> {
                 ..
             })
         ) {
-            self.reclaim_buffers_for(
+            let adopted = self.reclaim_buffers_for(
                 key,
                 class,
                 amount,
                 result.as_ref().err().and_then(|e| e.rejection),
             );
-            return self.reserve_inner(key, class, amount, mode);
+            // Keep one reclaimed page-sized allocation for the new charge rather
+            // than unmapping it and mapping a fresh one for the same bytes.
+            let mut charge = self.reserve_inner(key, class, amount, mode)?;
+            if let Some(bytes) = adopted.filter(|bytes| bytes.capacity() <= charge.amount) {
+                charge.spare = Some(Box::new(Mutex::new(bytes)));
+            }
+            return Ok(charge);
         }
         result
     }
 
     /// Reclaim only the class causing pressure, stopping once its deficit is met.
     /// Key-table exhaustion is separate: release one idle key's entries, not all.
+    /// Returns one reclaimed allocation of the requested size class, if any, with
+    /// its admission released, so the caller can reuse it once admission succeeds.
     fn reclaim_buffers_for(
         &self,
         key: Option<&P::Key>,
         class: P::Class,
         amount: usize,
         rejection: Option<Rejection<P::Class>>,
-    ) {
+    ) -> Option<Vec<u8>> {
         let mut guard = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let buffers = &mut guard.entries;
         let mut removed = Vec::new();
@@ -895,7 +960,17 @@ impl<P: Policy> Quotas<P> {
         let left = buffers.len();
         guard.demand.record_trim(removed.len(), left);
         drop(guard);
+        let adopted = removed
+            .iter()
+            .position(|(bytes, charge)| {
+                charge.class.index() == class.index()
+                    && bytes.capacity() <= amount
+                    && page_alloc::buffer_capacity(bytes.capacity())
+                        == page_alloc::buffer_capacity(amount)
+            })
+            .map(|i| std::mem::take(&mut removed[i].0));
         drop(removed);
+        adopted
     }
 
     /// Perform one admission attempt and report its rejection before retrying.
@@ -940,6 +1015,7 @@ impl<P: Policy> Quotas<P> {
             local,
             buffers: Arc::downgrade(&self.buffers),
             stopped: self.stopped.clone(),
+            spare: None,
         };
         // Policy and key callbacks may stop admission. Drop the completed owner
         // to roll back both counters while preserving completion and drain work.
