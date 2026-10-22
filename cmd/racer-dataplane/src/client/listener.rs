@@ -591,8 +591,17 @@ impl ClientListeners {
             .admission
             .limit(crate::admission::ResourceClass::IngressConnection);
         // Reserve some acceptance opportunity even when all active readers wait.
-        let attempts = budget.saturating_sub(worked).min(count);
+        // A handoff acceptor drains backlogs with the remaining budget: every client
+        // transfer dials a new connection, so one accept per listener per turn caps
+        // the node's request rate. Local installs keep one accept per listener.
+        let attempts = if self.ingress.is_some() {
+            budget.saturating_sub(worked)
+        } else {
+            budget.saturating_sub(worked).min(count)
+        };
+        let mut backlog = false;
         for _ in 0..attempts {
+            backlog = false;
             if self
                 .admission
                 .used(crate::admission::ResourceClass::IngressConnection)
@@ -653,6 +662,7 @@ impl ClientListeners {
                                 listener.retired.clone(),
                             ),
                         )?;
+                        backlog = true;
                         worked += 1;
                         continue;
                     }
@@ -675,6 +685,11 @@ impl ClientListeners {
                 Err(error) => return Err(directory_error(error)),
             }
             worked += 1;
+        }
+        // The budget ran out after a handoff. Level-triggered readiness reports a
+        // remaining backlog, which no idle wait would otherwise announce.
+        if backlog && self.readiness.borrow_mut().has_ready(self)? {
+            cx.waker().wake_by_ref();
         }
         Ok(worked + cleaned)
     }
@@ -1110,6 +1125,17 @@ impl ReadyListeners {
             })
         })?;
         Ok(ready.and_then(|index| self.listeners[index].upgrade()))
+    }
+
+    /// Report a cached or currently ready listener without registering a wait.
+    fn has_ready(&mut self, owner: &ClientListeners) -> Result<bool> {
+        if self.generation != owner.generation.get() {
+            return Ok(true);
+        }
+        match &mut self.index {
+            Some(index) => index.has_ready(),
+            None => Ok(false),
+        }
     }
 }
 

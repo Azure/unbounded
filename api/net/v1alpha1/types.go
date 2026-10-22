@@ -36,7 +36,9 @@ const (
 // PodCidrAssignment defines a pod CIDR allocation rule for nodes in a site.
 // +k8s:deepcopy-gen=true
 type PodCidrAssignment struct {
-	// AssignmentEnabled controls whether this assignment is active. Defaults to true.
+	// AssignmentEnabled controls whether this assignment is active. When omitted,
+	// it inherits the Site's manageCniPlugin setting, which defaults to true.
+	// Explicit true or false overrides the inherited value.
 	// +optional
 	AssignmentEnabled *bool `json:"assignmentEnabled,omitempty"`
 

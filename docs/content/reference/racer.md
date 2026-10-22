@@ -7,10 +7,10 @@ description: "Racer resources, configuration, diagnostics, Go SDK, and RDMA requ
 {{< callout type="warning" >}}
 Racer is pre-release. Its APIs, flags, and on-disk formats may change without a
 migration path. Cached data is disposable; Racer is not durable storage. Start
-with the [racer-object guide]({{< relref "guides/racer-object" >}}).
+with the [Azure Blob cache guide]({{< relref "guides/azure-blob-cache" >}}).
 {{< /callout >}}
 
-See [Racer concepts]({{< relref "concepts/racer" >}}) and the [racer-object guide]({{< relref "guides/racer-object" >}}).
+See [Racer concepts]({{< relref "concepts/racer" >}}) and the [Azure Blob cache guide]({{< relref "guides/azure-blob-cache" >}}).
 
 ## ClusterCache
 
@@ -50,7 +50,9 @@ parent directories. Clients do not automatically bypass Racer to connect directl
 Set `spec.origin` to have the operator run a `racer-object origin` DaemonSet for
 the cache. Leave it unset to deploy your own origin, as described in the
 [racer-object reference](racer-object.md#deploying-the-origin). Do not do both
-for one cache. Removing `spec.origin` removes the managed origin.
+for one cache. Set or omit `spec.origin` when you create the cache: it cannot be
+added or removed later. To change the origin, create a new ClusterCache, which
+starts with an empty cache. Deleting the ClusterCache removes the managed origin.
 
 ```yaml
 apiVersion: racer.unbounded-cloud.io/v1alpha1
@@ -59,9 +61,8 @@ metadata:
   name: artifacts
 spec:
   origin:
-    buckets: [models]
     azure:
-      accountURL: https://account.blob.core.windows.net
+      containerURL: https://account.blob.core.windows.net/models
       credential:
         workloadIdentity:
           clientID: 00000000-0000-0000-0000-000000000000
@@ -69,11 +70,10 @@ spec:
 
 | Field | Meaning |
 |-------|---------|
-| `buckets` | Required. 1 to 64 blob container names the origin may read |
 | `metadataTTL` | Optional. How long object metadata is reused; not negative |
 | `requestTimeout` | Optional. Limit for each upstream request; positive |
 | `maxConcurrentRequests` | Optional. Upstream requests per origin pod, 1 to 65536 |
-| `azure.accountURL` | Required. Blob account URL; `http` or `https`, no credentials, query, or fragment |
+| `azure.containerURL` | Required. The one blob container the origin may read, as `<account URL>/<container>`, for example `https://account.blob.core.windows.net/models`. `http` or `https`, no credentials, query, fragment, or trailing slash. The container name follows Azure rules: 3 to 63 lowercase letters, digits, and single hyphens. Azurite-style URLs may include one account path segment. Immutable |
 | `azure.credential` | Optional. Omit for anonymous reads. Set exactly one of `default` or `workloadIdentity`; either requires `https` |
 | `azure.credential.default` | `DefaultAzureCredential`. Optional `clientID` for a user-assigned managed identity, or `secretRef` to a Secret in the operator namespace whose keys become environment variables |
 | `azure.credential.workloadIdentity` | Microsoft Entra Workload ID. Requires `clientID`, optional `tenantID`. The cluster must run the Azure Workload Identity webhook, and the identity must trust the origin ServiceAccount |
@@ -86,15 +86,14 @@ image pull secrets from the `racer-dataplane` DaemonSet, and waits until that
 DaemonSet exists. The origin runs as UID and GID 65532 and serves
 `/run/racer/<cache>/origin/socket`, which the dataplane creates.
 
-The origin's cache namespace is the account URL with a lowercase scheme and host,
-no default port, and no trailing slash, for example
-`https://account.blob.core.windows.net`. Sidecars must use the same values:
+Each ClusterCache maps to one container. You cannot change
+`azure.containerURL` after creation. To read a different source, create a new
+ClusterCache. It gets a new UID, so it starts with an empty cache. A pod that
+reads two containers needs two ClusterCaches and two sidecars.
 
-| Sidecar annotation | Value |
-|--------------------|-------|
-| `racer.unbounded-cloud.io/object-namespace` | The normalized account URL |
-| `racer.unbounded-cloud.io/object-cache` | The ClusterCache name |
-| `racer.unbounded-cloud.io/object-buckets` | A subset of `spec.origin.buckets` |
+Sidecars attach with `racer.unbounded-cloud.io/object-cache: <ClusterCache name>`.
+They can read any blob in the cache's container. The origin rejects requests
+for any other container with `403`.
 
 If the spec is not valid, the operator skips that origin and reports
 `OriginInvalid`. It reports `OriginPending` while the dataplane DaemonSet is
@@ -306,7 +305,7 @@ not to reads or origin requests.
 | `200` without `Racer-Retain-Until` | Metadata succeeded but retention was refused; do not assume warming started |
 | Non-success status | Metadata, version selection, or request processing failed |
 
-Admission reserves local capacity before returning the header. Filling continues
+Admission reserves capacity before returning the header. Filling continues
 asynchronously with a separate cancellation scope. The TTL starts at HEAD
 admission and runs during the fill, so a short TTL can expire before all pages
 load. Repeated requests for the same cache, key, and ETag share the job and can
@@ -314,23 +313,71 @@ extend, but never shorten, its hold. Admission can be refused because of job,
 storage, index, or request-context limits, shutdown, or a conflicting active
 read selection. A successful metadata response does not make these limits optional.
 
-Warm uses the normal page acquisition path, placement, and routing. Only the
-requesting node reserves hard holds; warm does not pin every owner or peer.
-Pages start in ascending order within a bounded pipeline. Both ordered and
-unordered local reads of that exact version follow the disk-publication frontier,
-including pages the warm job has not started. Reads remain pipelined: they need
-not wait for the whole object, but cannot move a later page ahead of the warm
-window or launch a competing acquisition. Their own deadlines and credits still
-apply. If the warm job fails or expires, waiting reads can use the normal fill
-path. A different ETag never joins the old job.
+Warm stores pages in the normal cache topology. Each page is held and stored by
+its **primary owner**, the first-ranked node for that page under the membership
+the requesting node used at admission. The requesting node holds only pages it
+is the primary owner of. Admission works like this:
+
+1. The requesting node finds the primary owner of every page.
+2. It reserves holds for its own pages, and sends one hold request to every
+   other primary owner. Each owner checks that it is the primary owner of at
+   least one page, then reserves holds for the pages it owns.
+3. Admission is all or nothing. If any owner refuses or cannot be reached, the
+   requesting node releases every hold it asked for and the HEAD response has
+   no `Racer-Retain-Until`.
+4. `Racer-Retain-Until` is the earliest expiry that any owner accepted. An owner
+   caps a hold at its own `RACER_WARM_MAX_TTL_SECS`.
+
+The warm job then asks each owner to fill its pages, in ascending page order
+within a bounded pipeline. A remote owner fills the page through its own normal
+path, writes it to its own disk under the hold, and replies with an
+acknowledgement only. No page bytes go back to the requesting node. Each fill
+request carries the admitted version's length and content type, and an owner
+that fetches a copy with different metadata refuses to store or acknowledge it,
+which fails the job. A busy or
+unreachable owner is retried up to 3 times. If a page still fails, the job
+stops and sends a best-effort release to every owner. Owners that do not get the
+release keep their holds until expiry.
+
+Owners track holds per requesting node and warm job (a lease), so several nodes
+can warm the same version on one owner. An owner frees unused hold capacity only
+after the last lease for that version is released or expires. A release never
+drops pages already written under a hold; they stay held until the hold expires.
+
+Lease entries are bounded. A repeated HEAD for the same requesting node and warm
+job extends its existing lease (never shortening it) instead of adding one. A
+new lease is refused as overloaded once the version has 64 live leases or the
+node has 64 times `RACER_WARM_MAX_JOBS` live leases; expired leases are pruned
+first, and existing leases are never affected by a refusal.
+
+Both ordered and unordered reads of that exact version on the requesting node
+follow the warm progress, including pages the warm job has not started. Reads
+remain pipelined: they need not wait for the whole object, but cannot move a
+later page ahead of the warm window or launch a competing acquisition. After a
+page is warm, a read of a page held on this node reads it from local disk. A
+read of a page held by another owner uses the normal fill path, which reaches
+that owner's held copy. Their own deadlines and credits still apply. If the warm
+job fails or expires, waiting reads use the normal fill path. A different ETag
+never joins the old job. Reads on other nodes do not wait for warm progress.
+
+Limits of primary-owner holds:
+
+- **Membership changes.** Holds are not moved when membership changes. If a
+  page gets a new primary owner, the old owner still holds its copy until
+  expiry, and reads may fill the page again from the new owner's path.
+- **Clock skew.** Hold expiry travels between nodes as a wall-clock time. Each
+  owner compares it with its own clock, so skew between nodes shifts the
+  actual expiry by the same amount.
+- **Mixed versions.** Older dataplanes do not support remote holds. A warm that
+  needs an older owner is refused.
 
 Retention is separate from freshness. An unpinned request still refreshes expired
 current-version metadata. Pin `Get` to the returned ETag to read the warmed version;
 retention does not force later unpinned reads to select it.
 
 Hard holds bypass second-sight and veto both page-index eviction and reclamation
-of a segment containing a held record. Admission charges **one whole segment per
-page**, including short pages and existing local copies. This is conservative
+of a segment containing a held record. Each owner charges **one whole segment per
+held page**, including short pages and existing local copies. This is conservative
 capacity accounting, not a dedicated warm tail or one-page physical layout.
 Existing local copies stay where they are and are not rewritten. The charge
 leaves room for the eviction veto even when records are fragmented across segments.
@@ -387,6 +434,18 @@ detached admission's decision or count it twice.
 | `racer_warm_wait_completed_total` | Registered waits satisfied by warm publication |
 | `racer_warm_wait_fallback_total` | Registered waits released to normal Fill after warm stopped |
 | `racer_warm_wait_failed_total` | Registered waits ended by error, cancellation, deadline, or abandonment |
+| `racer_warm_remote_hold_accepted_total` | Hold requests this node sent that a remote owner accepted |
+| `racer_warm_remote_hold_refused_total` | Hold requests this node sent that a remote owner refused or that failed |
+| `racer_warm_remote_fill_completed_total` | Pages a remote owner acknowledged as written under its hold |
+| `racer_warm_remote_fill_retried_total` | Remote page fills retried after a busy or unreachable owner |
+| `racer_warm_remote_fill_failed_total` | Remote page fills that failed and stopped the job |
+| `racer_warm_remote_release_sent_total` | Releases a remote owner acknowledged |
+| `racer_warm_remote_release_failed_total` | Releases that failed; that owner keeps its hold until expiry |
+| `racer_warm_owner_hold_accepted_total` | Hold requests this node accepted as primary owner |
+| `racer_warm_owner_hold_refused_total` | Hold requests this node refused, including when it owns none of the pages |
+| `racer_warm_owner_fill_completed_total` | Pages this node wrote to disk for a remote warm job |
+| `racer_warm_owner_fill_failed_total` | Remote warm fills this node refused or failed |
+| `racer_warm_owner_released_total` | Leases released by remote warm jobs |
 
 ### Second-sight disk retention
 

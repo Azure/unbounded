@@ -1705,6 +1705,18 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         if let Some(error) = failure {
             return Err(error);
         }
+        self.queue_cancellations(budget);
+        let mut state = self.state.borrow_mut();
+        let submitted = state.submit_pending();
+        if submitted.is_err() {
+            state.stopped = true;
+        }
+        submitted.map(|()| completed)
+    }
+
+    /// Queue ASYNC_CANCEL for up to `budget` in-flight operations whose scope was
+    /// cancelled, resuming the round-robin scan where the previous call stopped.
+    fn queue_cancellations(&self, budget: usize) {
         let mut state = self.state.borrow_mut();
         let count = budget.min(state.entries.len());
         for _ in 0..count {
@@ -1764,16 +1776,29 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                 }
             }
         }
-        let submitted = state.submit_pending();
-        if submitted.is_err() {
-            state.stopped = true;
-        }
-        submitted.map(|()| completed)
     }
 
     /// Sleep until a CQE/external wake, bounded by both duration and a 10ms timer
     /// fallback for producers that cannot yet attach the eventfd wake endpoint.
     pub fn wait(&self, duration: Duration) -> Result<()> {
+        // A scope cancelled during the service turn wakes nothing, and its
+        // fenced operation completes only after ASYNC_CANCEL. Queue those
+        // cancels now so their CQEs end the sleep instead of the timeout. A
+        // pending local wake skips the sleep, so the next poll_budgeted scans.
+        let local_pending = || {
+            self.state
+                .borrow()
+                .wake
+                .as_ref()
+                .is_some_and(|wake| wake.local.load(Ordering::Acquire))
+        };
+        if !duration.is_zero() && !local_pending() {
+            // Scope checks read the ambient clock, so scan in the reactor's
+            // captured environment exactly as poll_budgeted does.
+            let _environment = self.environment.enter();
+            let pending = self.state.borrow().entries.len();
+            self.queue_cancellations(pending);
+        }
         let mut state = self.state.borrow_mut();
         // Service polling can queue SQEs after poll_budgeted. Submit once before
         // sleeping so that work can produce the CQEs we wait for. Transient errors
@@ -3006,6 +3031,40 @@ pub mod ready_set {
             Ok(None)
         }
 
+        /// Report whether an index is cached or a registered descriptor is ready,
+        /// without waiting. Ready indices are cached for the next `next` call. An
+        /// outstanding idle wait owns the next wake, so this reports false.
+        pub fn has_ready(&mut self) -> Result<bool, E> {
+            if !self.ready.is_empty() {
+                return Ok(true);
+            }
+            if self.wait.is_some() {
+                return Ok(false);
+            }
+            let mut events = [libc::epoll_event { events: 0, u64: 0 }; 64];
+            // SAFETY: events is writable for the bounded requested event count.
+            let count = unsafe {
+                libc::epoll_wait(
+                    self.fd.as_raw_fd(),
+                    events.as_mut_ptr(),
+                    events.len() as i32,
+                    0,
+                )
+            };
+            if count < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    return Ok(true);
+                }
+                return Err(Error::Io.into());
+            }
+            self.ready.extend(
+                events[..count as usize]
+                    .iter()
+                    .map(|event| event.u64 as usize),
+            );
+            Ok(!self.ready.is_empty())
+        }
+
         /// Consume completed waits before propagating failure, preventing repolling.
         /// With no wait the caller can inspect the level-triggered index immediately.
         fn poll_wait(&mut self, cx: &mut Context<'_>) -> Result<Poll<()>, E> {
@@ -3109,6 +3168,31 @@ pub mod ready_set {
             set.next(&mut cx, 3, |_| panic!("ready")).unwrap();
             assert_eq!(set.ready.len(), 2);
             set.clear();
+            assert!(set.ready.is_empty());
+        }
+
+        #[test]
+        /// Probe level readiness without waiting, caching indices for `next`.
+        fn has_ready_caches_level_readiness_and_defers_to_an_idle_wait() {
+            let mut set = ReadySet::<Error>::new().unwrap();
+            let (mut reader, mut writer) = UnixStream::pair().unwrap();
+            reader.set_nonblocking(true).unwrap();
+            set.insert(reader.as_raw_fd(), 4).unwrap();
+            assert_eq!(set.has_ready(), Ok(false));
+            writer.write_all(b"x").unwrap();
+            assert_eq!(set.has_ready(), Ok(true));
+            assert_eq!(set.ready.len(), 1);
+            assert_eq!(set.has_ready(), Ok(true), "cached index is not refilled");
+            assert_eq!(set.ready.len(), 1);
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert_eq!(set.next(&mut cx, 1, |_| panic!("cached")), Ok(Some(4)));
+            reader.read_exact(&mut [0]).unwrap();
+            assert_eq!(
+                set.next(&mut cx, 1, |_| Box::pin(std::future::pending())),
+                Ok(None)
+            );
+            writer.write_all(b"x").unwrap();
+            assert_eq!(set.has_ready(), Ok(false), "the idle wait owns the wake");
             assert!(set.ready.is_empty());
         }
 

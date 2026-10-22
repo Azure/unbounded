@@ -36,7 +36,6 @@ const (
 	originAppName       = "racer-origin"
 	originCacheLabel    = "racer.unbounded-cloud.io/origin-cache"
 	originConfigHash    = "racer.unbounded-cloud.io/origin-config-hash"
-	originIdentity      = "racer.unbounded-cloud.io/origin-identity"
 	originMaxRequests   = 65536
 
 	workloadIdentityUse      = "azure.workload.identity/use"
@@ -64,7 +63,6 @@ func originLabels() map[string]string {
 
 // originSpec is the validated, rendered form of a ClusterCache origin.
 type originSpec struct {
-	identity      string
 	args          []string
 	env           []corev1.EnvVar
 	envFrom       []corev1.EnvFromSource
@@ -127,34 +125,18 @@ func renderOrigin(cache *racerv1.ClusterCache) (originSpec, error) {
 		}
 	}
 
-	if err := racerobject.ValidateAzureAccountURL(origin.Azure.AccountURL, credential); err != nil {
-		return originSpec{}, fmt.Errorf("spec.origin.azure.accountURL: %w", err)
+	if _, _, err := racerobject.ParseAzureContainerURL(origin.Azure.ContainerURL, credential); err != nil {
+		return originSpec{}, fmt.Errorf("spec.origin.azure.containerURL: %w", err)
 	}
 
-	identity, err := racerobject.AzureOriginIdentity(origin.Azure.AccountURL)
-	if err != nil {
-		return originSpec{}, fmt.Errorf("spec.origin.azure.accountURL: %w", err)
+	// The socket path is name-based, so bind the origin to this ClusterCache
+	// UID: an origin left from a deleted cache with the same name then refuses
+	// requests for the recreated one instead of filling it.
+	if cache.UID == "" {
+		return originSpec{}, errors.New("metadata.uid is required")
 	}
 
-	if len(origin.Buckets) == 0 {
-		return originSpec{}, errors.New("spec.origin.buckets must list at least one bucket")
-	}
-
-	buckets := make([]string, 0, len(origin.Buckets))
-	for _, bucket := range origin.Buckets {
-		buckets = append(buckets, string(bucket))
-	}
-
-	if err := racerobject.ValidateOriginScope(identity, buckets); err != nil {
-		return originSpec{}, fmt.Errorf("spec.origin.buckets: %w", err)
-	}
-
-	out.identity = identity
-	out.args = []string{"origin", "--cache=" + cache.Name, "--namespace=" + identity, "--provider=azure", "--account-url=" + origin.Azure.AccountURL, "--azure-credential=" + credential}
-
-	for _, bucket := range buckets {
-		out.args = append(out.args, "--bucket="+bucket)
-	}
+	out.args = []string{"origin", "--cache=" + cache.Name, "--cache-uid=" + string(cache.UID), "--provider=azure", "--container-url=" + escapeKubeArg(origin.Azure.ContainerURL), "--azure-credential=" + credential}
 
 	if origin.MetadataTTL != nil {
 		if origin.MetadataTTL.Duration < 0 {
@@ -361,7 +343,7 @@ func originDaemonSet(env *component.Env, cache *racerv1.ClusterCache, spec origi
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels:      podLabels,
-					Annotations: map[string]string{originConfigHash: hash, originIdentity: spec.identity},
+					Annotations: map[string]string{originConfigHash: hash},
 				},
 				Spec: corev1.PodSpec{
 					ServiceAccountName:            name,
@@ -560,4 +542,12 @@ func pruneOrigins(ctx context.Context, env *component.Env, plan *component.Plan,
 	}
 
 	return nil
+}
+
+// escapeKubeArg escapes "$" as "$$" so kubelet does not expand "$(NAME)"
+// references in a container argument. The origin imports the credential
+// Secret through envFrom, so an unescaped reference in a user-controlled value
+// would let the Secret silently rewrite the argument.
+func escapeKubeArg(value string) string {
+	return strings.ReplaceAll(value, "$", "$$")
 }

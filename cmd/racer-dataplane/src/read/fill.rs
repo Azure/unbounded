@@ -183,14 +183,23 @@ impl Fill {
         if version.object != context.object {
             return Err(Error::InvalidRequest);
         }
-        if let Some(page) = self
+        let demand = match self
             .dependencies
             .metadata_owner
             .warmed_page(&head, scope)
             .await?
         {
-            return Ok(page);
-        }
+            super::dispatch::Warmed::Local(page) => return Ok(*page),
+            super::dispatch::Warmed::Unwarmed => demand,
+            // Later demanded pages may still be ahead of the warm frontier, so
+            // the provider may only select the page that warm has published.
+            super::dispatch::Warmed::Remote => crate::peer::subscriptions::Demand::new(vec![
+                crate::peer::subscriptions::PageInterval {
+                    start: first.0,
+                    end: first.0.checked_add(1).ok_or(Error::InvalidRequest)?,
+                },
+            ])?,
+        };
         // A new or credit-starved subscriber can lag behind provider completion.
         // Reuse its verified local head before asking for another node transfer.
         // The stable page owner rechecks current cache/key admission.

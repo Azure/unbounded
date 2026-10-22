@@ -7,18 +7,21 @@ description: "Flags, deployment requirements, supported requests, and the securi
 {{< callout type="warning" >}}
 Racer is pre-release. Its APIs, flags, and on-disk formats may change without a
 migration path. Cached data is disposable; Racer is not durable storage. Start
-with the [racer-object guide]({{< relref "guides/racer-object" >}}).
+with the [Azure Blob cache guide]({{< relref "guides/azure-blob-cache" >}}).
 {{< /callout >}}
 
 `racer-object` is a read-only object storage adapter for Racer. It reads from S3,
 S3-compatible stores, and Azure Blob Storage, and serves either an S3 or an Azure
 Blob API to applications. For a working setup, start with
-[Cache Object Storage with Racer]({{< relref "guides/racer-object" >}}).
+[Cache Azure Blob Storage with Racer]({{< relref "guides/azure-blob-cache" >}}).
 
 The binary has two commands:
 
-- `origin` runs on every eligible Racer node and reads the upstream store.
+- `origin` runs on every eligible Racer node and reads the upstream store. For
+  Azure Blob, the operator can run it from the ClusterCache. See
+  [Managed Azure origin]({{< relref "reference/racer" >}}#managed-azure-origin).
 - `sidecar` runs in the application pod and serves the read API on pod loopback.
+  A webhook adds it to labeled pods. See [Automatic Injection](#automatic-injection).
 
 The read path is application -> sidecar -> Racer -> origin -> upstream. Racer owns
 the cache. Neither command keeps a separate cache, and neither falls back to the
@@ -42,8 +45,6 @@ from source with `make racer-object` (binary at `bin/racer-object`) or
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--cache` | `racer-object` | Racer ClusterCache name. Must match the socket mount paths. |
-| `--namespace` | none, required | Stable identifier for the upstream store. Not a Kubernetes namespace. |
-| `--bucket` | empty | Allowed bucket or Azure container. Repeatable. Empty allows all. |
 | `--debug-listen` | empty | Optional pprof and `/healthz` address. Unauthenticated and unencrypted. Restrict access. |
 | `--version` | | Print version and exit. |
 
@@ -51,19 +52,21 @@ from source with `make racer-object` (binary at `bin/racer-object`) or
 
 | Flag | Default | Meaning |
 |------|---------|---------|
+| `--cache-uid` | empty | Optional ClusterCache UID, as a lowercase UUID. When set, the origin answers `503` to requests whose `Racer-Cache` header names any other UID, so an origin left from a deleted ClusterCache cannot fill a recreated one with the same name. The operator always sets it. Empty accepts every cache UID. |
+| `--bucket` | empty | S3 only, required. The one bucket the origin serves. Requests for other buckets get `403`. |
 | `--provider` | `s3` | `s3` or `azure`. |
 | `--region` | empty | S3 only. Falls back to the AWS config chain. A region is required one way or the other. |
 | `--endpoint` | empty | S3 only. HTTP or HTTPS origin for an S3-compatible store. No path, query, fragment, or credentials. |
 | `--path-style` | `true` | S3 only. Set `false` for virtual-host addressing. |
-| `--account-url` | empty | Azure only, required. For example `https://ACCOUNT.blob.core.windows.net`. |
+| `--container-url` | empty | Azure only, required. The one container the origin serves, for example `https://ACCOUNT.blob.core.windows.net/CONTAINER`. Requests for other containers get `403`. |
 | `--azure-credential` | `default` | Azure only. `default` or `anonymous`. |
 | `--metadata-ttl` | `30s` | How long upstream metadata stays valid. Zero expires immediately. |
 | `--request-timeout` | `1m` | Upstream request timeout. Must be positive. |
 | `--max-concurrent-requests` | `512` | Page requests served to Racer at once, and the size of the idle upstream connection pool. Requests beyond the limit are rejected as overloaded. 1 to 65536. |
 
-S3 and Azure flags are mutually exclusive. Setting `--region`, `--endpoint`, or
-`--path-style` with `--provider=azure` is an error, and so is setting
-`--account-url` or `--azure-credential` with `--provider=s3`.
+S3 and Azure flags are mutually exclusive. Setting `--bucket`, `--region`,
+`--endpoint`, or `--path-style` with `--provider=azure` is an error, and so is
+setting `--container-url` or `--azure-credential` with `--provider=s3`.
 
 ### Sidecar Only
 
@@ -93,11 +96,11 @@ Grant the origin read access to the objects it serves, such as `s3:GetObject`, a
 
 ### Azure Blob
 
-Set `--provider=azure` and `--account-url`. Do not set the S3 flags or AWS
+Set `--provider=azure` and `--container-url`. Do not set the S3 flags or AWS
 environment variables. Only block blobs are served.
 
 `--azure-credential=default` uses `DefaultAzureCredential`, covering environment,
-workload identity, and managed identity. With it, `--account-url` must use HTTPS.
+workload identity, and managed identity. With it, `--container-url` must use HTTPS.
 Select a user-assigned identity with the `AZURE_CLIENT_ID` environment variable;
 there is no flag for it. One option is to read that variable from an optional
 Secret, for example `racer-object-azure`, with `envFrom`.
@@ -159,8 +162,9 @@ Requirements:
   including 0, do not work.
 - **Credentials.** Supply upstream credentials to the origin pods only. See
   [Upstream Providers](#upstream-providers).
-- **Arguments.** Set `--cache`, `--namespace`, and `--bucket` to match the
-  sidecars, plus the provider flags.
+- **Arguments.** Set `--cache` to match the sidecars, `--bucket` for S3
+  or `--container-url` for Azure, and the provider flags. Set `--cache-uid`
+  to the ClusterCache UID when you recreate caches under the same name.
 
 The essential parts of the S3 example:
 
@@ -194,7 +198,6 @@ spec:
           args:
             - origin
             - --cache=racer-object
-            - --namespace=example-store
             - --bucket=example-bucket
             - --region=us-east-1
           envFrom:
@@ -217,7 +220,7 @@ spec:
 ```
 
 For Azure Blob, replace the S3 arguments with `--provider=azure`,
-`--account-url`, and optionally `--azure-credential`, and replace `envFrom` with
+`--container-url`, and optionally `--azure-credential`, and replace `envFrom` with
 your Azure identity configuration.
 
 A running origin pod does not prove upstream access; only a real object read does.
@@ -266,9 +269,8 @@ spec:
         app: racer-object-example
         racer.unbounded-cloud.io/object-sidecar: enabled
       annotations:
-        racer.unbounded-cloud.io/object-namespace: example-store
-        racer.unbounded-cloud.io/object-buckets: example-bucket,other-bucket
         # Optional:
+        # racer.unbounded-cloud.io/object-cache: racer-object
         # racer.unbounded-cloud.io/object-api: azure
         # racer.unbounded-cloud.io/object-memory-limit: 256Mi
     spec:
@@ -282,8 +284,6 @@ Annotations, all with the prefix `racer.unbounded-cloud.io/`:
 
 | Annotation | Default | Meaning |
 |------------|---------|---------|
-| `object-namespace` | none, required | Sets `--namespace`. Must match the origin. |
-| `object-buckets` | none, required | Comma-separated list. Each entry sets one `--bucket`. Must match the origin. |
 | `object-cache` | `racer-object` | Sets `--cache` and the socket mount path. |
 | `object-api` | flag default (`s3`) | Sets `--api`. `s3` or `azure`. |
 | `object-listen` | flag default (`127.0.0.1:8080`) | Sets `--listen`. Loopback IP literal and port. |
@@ -293,8 +293,9 @@ Annotations, all with the prefix `racer.unbounded-cloud.io/`:
 | `object-memory-limit` | not set | Sidecar memory limit. |
 
 An annotation that is present with an empty value is rejected. Values are checked
-with the same rules as the flags; see [Cache Identity](#cache-identity) for
-namespace and bucket limits.
+with the same rules as the flags. The pod can read the whole bucket of its
+ClusterCache. A pod that reads two buckets needs two ClusterCaches and two
+sidecars.
 
 Choose a listener port that no other container in the pod uses. Set
 `object-listen` if the default port, `8080`, is already in use.
@@ -310,7 +311,7 @@ The webhook makes these changes to the pod:
 - Adds an init container named `racer-object` with `restartPolicy: Always`, placed
   first. It uses the `racer-object` image of the same release as
   `racer-controller`, and the args
-  `sidecar --cache=... --namespace=... --bucket=...` plus `--api` and `--listen`
+  `sidecar --cache=...` plus `--api` and `--listen`
   when set.
 - Sets the security context described below, with `RuntimeDefault` seccomp.
 - Adds the volume `racer-object-client`: hostPath `/run/racer/<cache>/client`,
@@ -329,7 +330,7 @@ nodes.
 When the webhook denies a pod, the reason appears in the error from
 `kubectl apply`, or for workloads in the ReplicaSet, StatefulSet, or Job events
 (`kubectl describe`). The message names the bad annotation, for example
-`annotation racer.unbounded-cloud.io/object-buckets is required`.
+`annotation racer.unbounded-cloud.io/object-api must be s3 or azure`.
 
 Other denial causes:
 
@@ -358,8 +359,7 @@ Requirements:
   `runAsNonRoot: true`, no privilege escalation, all capabilities dropped,
   `RuntimeDefault` seccomp, and a read-only root filesystem. The
   application containers can run as any user.
-- **Arguments.** Set `--cache`, `--namespace`, and `--bucket` to match the
-  origin. Add `--api=azure` if the application uses the Azure Blob API.
+- **Arguments.** Set `--cache` to match the origin. Add `--api=azure` if the application uses the Azure Blob API.
 - **No credentials.** Do not give the sidecar or the application upstream
   credentials.
 - **No probes or Services.** Do not add an HTTP readiness probe or expose the
@@ -390,8 +390,6 @@ spec:
       args:
         - sidecar
         - --cache=racer-object
-        - --namespace=example-store
-        - --bucket=example-bucket
         - --listen=127.0.0.1:8080
         # Add --api=azure for Azure Blob clients.
       securityContext:
@@ -420,16 +418,20 @@ container with `restartPolicy: Always` so it starts before the application.
 ## Cache Identity
 
 The cache key is the SHA-256 of canonical JSON holding the schema version,
-`--namespace`, bucket, key, and version ID. It does **not** include the region,
-endpoint, provider, or account URL.
+bucket, key, and version ID. It does **not** include the region, endpoint,
+provider, or account URL.
 
-That has one hard rule: change `--namespace` whenever you point the adapter at a
-different account, provider, or endpoint. Otherwise Racer can serve bytes cached
-from the old store. Do not reuse an old namespace for a different store in the
-same cache. Requests cannot select origin credentials or an upstream endpoint.
+Each cache serves one source. Do not point an existing cache at a different
+account, provider, or endpoint, or Racer can serve bytes cached from the old
+store. Create a new cache instead. A managed ClusterCache enforces this: its
+`azure.containerURL` cannot change, and a new ClusterCache gets a new UID
+and an empty cache. Requests cannot select origin credentials or an upstream
+endpoint.
 
-Limits: namespace up to 256 bytes of valid UTF-8 with no spaces or control
-characters, bucket up to 255 characters from `[a-zA-Z0-9._-]` and not `.` or `..`,
+The sidecar forwards any path-style request, `/<bucket>/<key>` for S3 or
+`/<container>/<blob>` for Azure. The origin rejects other buckets with `403`.
+
+Limits: bucket up to 255 characters from `[a-zA-Z0-9._-]` and not `.` or `..`,
 key 1 to 1024 bytes, version ID up to 1024 bytes, and 8 KiB for the whole
 canonical key.
 
@@ -505,7 +507,7 @@ Errors are XML bodies with a `Code` and `Message`. The Azure API also sets the
 | Status | S3 code | Azure code | Usual cause |
 |--------|---------|------------|-------------|
 | `400` | `InvalidArgument` | `InvalidInput` | A malformed path or range, including a listing request or a multi-range read. |
-| `403` | `AccessDenied` | `AuthorizationFailure` | Bucket not in `--bucket`, `--namespace` differs between origin and sidecar, or the origin cannot read the object. |
+| `403` | `AccessDenied` | `AuthorizationFailure` | Bucket is not the origin's `--bucket` or `--container-url` container, or the origin cannot read the object. |
 | `404` | `NoSuchKey` | `BlobNotFound` | No such object upstream. |
 | `405` | `MethodNotAllowed` | `UnsupportedHttpVerb` | Anything other than `GET` or `HEAD`. |
 | `412` | `PreconditionFailed` | `ConditionNotMet` | ETag mismatch, or the version is gone. |
@@ -533,8 +535,8 @@ Consequences:
   Origin-side checks cannot authorize a cache hit.
 - Separate trust domains with separate caches, namespaces, socket mount
   permissions, and upstream access policies.
-- A `--bucket` allowlist narrows what the adapter fetches. It is not a per-user
-  policy.
+- The origin's `--bucket` or `--container-url` limits what the adapter fetches.
+  Any pod attached to the cache can read the whole bucket or container. It is not a per-user policy.
 
 Keep credentials out of flags, images, and source control. Grant the origin only
 the object read permissions it needs, including version reads if you use them.

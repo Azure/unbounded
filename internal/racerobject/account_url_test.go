@@ -38,7 +38,7 @@ func TestAzureAccountURLValidation(t *testing.T) {
 		"https://::1", "https://[host]:80", "https://[::1%25eth0]:80", "https://host:80:90",
 		"https://host//", "https://host//account", "https://host/account//", "https://host/account/container", "https://host/.", "https://host/..",
 		"https://host/%2e%2e", "https://host/%2f", "https://host/account%2Fcontainer", "https://host/%61ccount", "https://host/%252f", "https://host/account%5ccontainer",
-		"https://host/account\\container", "https://host/account;param", "https://host/account name", "https://host/雪", "https://host/%00", "https://host/%zz",
+		"https://$(STORAGE_HOST)", "https://host$(X).net", "https://ho_st", "https://host/account\\container", "https://host/account;param", "https://host/account name", "https://host/雪", "https://host/%00", "https://host/%zz",
 	} {
 		for _, credential := range []string{"default", "anonymous"} {
 			err := ValidateAzureAccountURL(value, credential)
@@ -55,58 +55,36 @@ func TestAzureAccountURLRejectsUnknownCredential(t *testing.T) {
 	}
 }
 
-func TestAzureOriginIdentity(t *testing.T) {
-	for input, expected := range map[string]string{
-		"https://account.blob.core.windows.net":       "https://account.blob.core.windows.net",
-		"https://Account.Blob.Core.Windows.NET/":      "https://account.blob.core.windows.net",
-		"HTTPS://account.blob.core.windows.net:443":   "https://account.blob.core.windows.net",
-		"https://account.blob.core.windows.net:8443/": "https://account.blob.core.windows.net:8443",
-		"http://localhost:10000/devstoreaccount1":     "http://localhost:10000/devstoreaccount1",
-		"http://LOCALHOST:10000/devstoreaccount1/":    "http://localhost:10000/devstoreaccount1",
-		"http://127.0.0.1:80/DevStoreAccount1":        "http://127.0.0.1/DevStoreAccount1",
-		"https://[::1]:443/account":                   "https://[::1]/account",
-	} {
-		identity, err := AzureOriginIdentity(input)
-		if err != nil || identity != expected {
-			t.Errorf("AzureOriginIdentity(%q) = %q, %v; want %q", input, identity, err, expected)
-		}
-
-		if _, err := NewRequest(identity, "container", "key", ""); err != nil {
-			t.Errorf("identity %q is not a valid namespace: %v", identity, err)
-		}
-	}
-
-	if _, err := AzureOriginIdentity("://bad"); err == nil {
-		t.Error("accepted unparsable URL")
-	}
-}
-
-func TestValidateOriginScope(t *testing.T) {
+func TestValidateBucket(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		namespace string
-		buckets   []string
-		ok        bool
+		name   string
+		bucket string
+		ok     bool
 	}{
-		{name: "valid", namespace: "https://account.blob.core.windows.net", buckets: []string{"models", "data.v1", "a_b-c"}, ok: true},
-		{name: "no buckets", namespace: "https://account.blob.core.windows.net", ok: true},
-		{name: "empty namespace", namespace: "", buckets: []string{"models"}},
-		{name: "namespace with space", namespace: "a b", buckets: []string{"models"}},
-		{name: "namespace too long", namespace: strings.Repeat("a", 257), buckets: []string{"models"}},
-		{name: "dot bucket", namespace: "ns", buckets: []string{"."}},
-		{name: "dot dot bucket", namespace: "ns", buckets: []string{".."}},
-		{name: "slash bucket", namespace: "ns", buckets: []string{"a/b"}},
-		{name: "empty bucket", namespace: "ns", buckets: []string{""}},
-		{name: "long bucket", namespace: "ns", buckets: []string{strings.Repeat("b", 256)}},
+		{name: "simple", bucket: "models", ok: true},
+		{name: "dots", bucket: "data.v1", ok: true},
+		{name: "underscore and dash", bucket: "a_b-c", ok: true},
+		{name: "max length", bucket: strings.Repeat("b", 255), ok: true},
+		{name: "dot", bucket: "."},
+		{name: "dot dot", bucket: ".."},
+		{name: "slash", bucket: "a/b"},
+		{name: "space", bucket: "a b"},
+		{name: "url", bucket: "https://account.blob.core.windows.net"},
+		{name: "empty", bucket: ""},
+		{name: "too long", bucket: strings.Repeat("b", 256)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := ValidateOriginScope(tc.namespace, tc.buckets)
+			err := ValidateBucket(tc.bucket)
 			if tc.ok && err != nil {
 				t.Fatalf("rejected: %v", err)
 			}
 
 			if !tc.ok && err == nil {
-				t.Fatal("accepted invalid scope")
+				t.Fatal("accepted invalid bucket")
+			}
+
+			if _, reqErr := NewRequest(tc.bucket, "key", ""); (reqErr == nil) != tc.ok {
+				t.Fatalf("NewRequest bucket agreement: %v", reqErr)
 			}
 		})
 	}
