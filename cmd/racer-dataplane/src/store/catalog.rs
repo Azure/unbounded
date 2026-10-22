@@ -3022,4 +3022,39 @@ mod priority_tests {
         assert!(retention.over_share(&cache("a"), capacity));
         assert!(!retention.over_share(&cache("b"), capacity));
     }
+
+    /// Deterministic churn: both caches insert one new page per round into a
+    /// full index. Returns resident pages of ("a", "b") after `rounds`.
+    fn churn(index: &Rc<Index>, rounds: usize, start: usize) -> (u64, u64) {
+        for round in start..start + rounds {
+            for name in ["a", "b"] {
+                drop(index.reserve_page(true).unwrap());
+                publish(index, name, &format!("{round}"), 0);
+            }
+            assert_accounting(index);
+        }
+        let retention = index.retention();
+        (
+            retention.cache_payload_bytes(&cache("a")) / PAGE,
+            retention.cache_payload_bytes(&cache("b")) / PAGE,
+        )
+    }
+
+    #[test]
+    fn simulated_churn_converges_to_priority_ratio_and_follows_live_change() {
+        let index = index(100, &[("a", 900), ("b", 100)]);
+        let (a, b) = churn(&index, 500, 0);
+        assert_eq!(a + b, 100);
+        assert!((6 * b..=14 * b).contains(&a), "{a}:{b}");
+        // Live change: the ratio moves toward the new weights without restart.
+        index
+            .retention()
+            .weights()
+            .update(&[definition("a", 100), definition("b", 900)]);
+        let (a, b) = churn(&index, 500, 500);
+        assert!((6 * a..=14 * a).contains(&b), "{a}:{b}");
+        let even = self::index(100, &[("a", 500), ("b", 500)]);
+        let (a, b) = churn(&even, 500, 0);
+        assert!(a.abs_diff(b) <= 4, "{a}:{b}");
+    }
 }

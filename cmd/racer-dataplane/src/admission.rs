@@ -124,6 +124,48 @@ mod observer_tests {
         policy.set_observer(Observer::default());
         policy.set_observer(Observer::default());
     }
+
+    #[test]
+    fn memory_fair_limits_follow_live_priority_with_floor() {
+        let quotas = Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let class = ResourceClass::Plaintext;
+        let limit = quotas.limit(class);
+        let floor = quotas.policy().floor(class);
+        let a = CacheId("a".into());
+        let b = CacheId("b".into());
+        let definition = |id: &CacheId, priority| racer_control_wire::CacheDefinition {
+            id: id.clone(),
+            name: id.0.clone(),
+            client_socket: "/c".into(),
+            origin_socket: "/o".into(),
+            priority,
+        };
+        // Unknown caches use the default priority, so shares start equal.
+        assert_eq!(quotas.policy().weight(&a), 500);
+        let _ca = quotas.reserve(Some(&a), class, 1).unwrap();
+        let _cb = quotas.reserve(Some(&b), class, 1).unwrap();
+        assert_eq!(quotas.fair_limit(&a, class), quotas.fair_limit(&b, class));
+        assert!(
+            quotas
+                .policy()
+                .weights()
+                .update(&[definition(&a, 900), definition(&b, 100)])
+        );
+        quotas.reweigh();
+        assert_eq!(quotas.active_weight(), 1000);
+        assert_eq!(quotas.fair_limit(&a, class), (limit * 9 / 10).max(floor));
+        assert_eq!(quotas.fair_limit(&b, class), (limit / 10).max(floor));
+        // Priority 0 keeps only the floor.
+        quotas
+            .policy()
+            .weights()
+            .update(&[definition(&a, 1000), definition(&b, 0)]);
+        quotas.reweigh();
+        assert_eq!(quotas.fair_limit(&b, class), floor);
+        assert_eq!(quotas.fair_limit(&a, class), limit);
+    }
 }
 
 /// Translate exact synchronous operation facts into final Racer diagnostics.
