@@ -93,7 +93,8 @@ older.
 
 Segment reclamation works on whole segments, and a segment holds pages from many
 caches. Segment value weights under-share pages heavily, so segments that hold
-mostly over-share data are recycled first. Priority cannot remove only one
+mostly over-share data are recycled first. While no cache is over share, segment value
+is the plain retention score, as before. Priority cannot remove only one
 cache's bytes from a shared segment; under-share pages in a recycled segment are
 lost with it.
 
@@ -151,12 +152,21 @@ path.
 
 ## Observability
 
-New per-cache gauges, labeled by cache name (names to be confirmed):
+New per-cache gauges, labeled by cache name. Series exist only for caches in
+the published catalog:
 
 | Metric | Meaning |
 |--------|---------|
 | `racer_cache_disk_resident_bytes{cache}` | Indexed payload bytes for the cache, summed over workers |
 | `racer_cache_disk_share_bytes{cache}` | Fair-share bytes for the cache, summed over workers |
+
+The unlabeled counter `racer_retention_share_rejected_total` counts optional
+pages skipped by disk admission because their cache was over share.
+
+A worker's disk capacity for shares is the smaller of index entries times the
+page size and slab segments times the segment size. A cache whose share is the
+whole capacity (a single cache, or before any catalog is published) is never
+over share.
 
 A cache is over share on a worker when its resident bytes exceed its share on
 that worker. The node sums can hide per-worker differences.

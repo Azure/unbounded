@@ -574,7 +574,8 @@ Ownership refresh affects subsequent events only, never rewrites old counters.
 | `racer_disk_pending_payload_bytes` | Total logical payload bytes owned by pending writes, including submitted writes until cleanup |
 | `racer_disk_indexed_payload_bytes` | Total logical payload bytes in retained index mappings, including restored mappings |
 | `racer_cache_disk_resident_bytes{cache}` | Gauge of logical payload bytes in retained index mappings for one ClusterCache, summed over workers |
-| `racer_cache_disk_share_bytes{cache}` | Gauge of the ClusterCache's fair share of disk, summed over workers; see [Priority](#priority) |
+| `racer_cache_disk_share_bytes{cache}` | Gauge of the ClusterCache's fair share of disk, summed over workers. Only published ClusterCaches have series; see [Priority](#priority) |
+| `racer_retention_share_rejected_total` | Optional (non-owned) pages not written to disk because their ClusterCache was over its share and free segments were at the reserve |
 
 For per-disk utilization as a percentage, use:
 
