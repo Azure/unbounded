@@ -1,88 +1,84 @@
 <mxfile host="app.diagrams.net" version="24.7.17">
   <diagram id="capacity-architecture" name="Provider-independent autoscaling">
-    <mxGraphModel dx="1300" dy="1280" grid="1" gridSize="10" page="1" pageScale="1" pageWidth="1300" pageHeight="1280">
+    <mxGraphModel dx="1000" dy="1190" grid="1" gridSize="10" page="1" pageScale="1" pageWidth="1000" pageHeight="1190">
       <root>
         <mxCell id="0"/>
         <mxCell id="1" parent="0"/>
-        <mxCell id="title" value="Two autoscalers. One Unbounded capacity contract." style="text;html=1;align=left;fontSize=26;fontStyle=1;" vertex="1" parent="1">
-          <mxGeometry x="50" y="20" width="1200" height="50" as="geometry"/>
+        <mxCell id="title" value="Provider-independent autoscaling" style="text;html=0;align=left;fontSize=28;fontStyle=1;fontColor=#172b4d;" vertex="1" parent="1">
+          <mxGeometry x="40" y="15" width="920" height="40" as="geometry"/>
         </mxCell>
-        <mxCell id="cas" value="Cluster Autoscaler&#xa;Group-based scaling policy" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=18;spacing=10;" vertex="1" parent="1">
-          <mxGeometry x="70" y="110" width="320" height="80" as="geometry"/>
+        <mxCell id="subtitle" value="One discovery contract. One shared host lifecycle." style="text;html=0;align=left;fontSize=20;fontColor=#42526e;" vertex="1" parent="1">
+          <mxGeometry x="40" y="55" width="920" height="30" as="geometry"/>
         </mxCell>
-        <mxCell id="karpenter" value="Karpenter&#xa;Native NodePool / NodeClaim policy" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=18;spacing=10;" vertex="1" parent="1">
-          <mxGeometry x="900" y="110" width="320" height="80" as="geometry"/>
+        <mxCell id="class" value="MachineClass [shared discovery]&#xa;Provider-resolved offerings, overhead, price, and readiness" style="rounded=1;whiteSpace=wrap;html=0;fillColor=#e8f0fe;strokeColor=#5274b8;strokeWidth=2;fontSize=22;fontColor=#172b4d;" vertex="1" parent="1">
+          <mxGeometry x="170" y="110" width="660" height="100" as="geometry"/>
         </mxCell>
-        <mxCell id="cas-plugin" value="unbounded-cas-plugin&#xa;Same implementation for every provider" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=17;spacing=10;" vertex="1" parent="1">
-          <mxGeometry x="70" y="270" width="320" height="90" as="geometry"/>
+        <mxCell id="karpenter" value="Karpenter&#xa;NodePool / NodeClaim&#xa;unbounded-karp-plugin" style="rounded=1;whiteSpace=wrap;html=0;fillColor=#e6f3ed;strokeColor=#33825a;strokeWidth=2;fontSize=22;fontColor=#172b4d;" vertex="1" parent="1">
+          <mxGeometry x="40" y="285" width="420" height="115" as="geometry"/>
         </mxCell>
-        <mxCell id="karpenter-plugin" value="unbounded-karp-plugin&#xa;Same implementation for every provider" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=17;spacing=10;" vertex="1" parent="1">
-          <mxGeometry x="900" y="270" width="320" height="90" as="geometry"/>
+        <mxCell id="cas" value="Cluster Autoscaler [proposed]&#xa;Group-based demand&#xa;unbounded-cas-plugin" style="rounded=1;whiteSpace=wrap;html=0;fillColor=#fff4dc;strokeColor=#aa7625;strokeWidth=2;fontSize=22;fontColor=#172b4d;" vertex="1" parent="1">
+          <mxGeometry x="540" y="285" width="420" height="115" as="geometry"/>
         </mxCell>
-        <mxCell id="class" value="MachineClass [CR]&#xa;Provider-resolved configuration&#xa;Offerings, overhead, price, readiness" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=17;spacing=10;" vertex="1" parent="1">
-          <mxGeometry x="480" y="250" width="330" height="130" as="geometry"/>
+        <mxCell id="direct-note" value="Direct allocation&#xa;No MachinePool" style="text;html=0;align=left;fontSize=20;fontColor=#42526e;" vertex="1" parent="1">
+          <mxGeometry x="290" y="460" width="220" height="70" as="geometry"/>
         </mxCell>
-        <mxCell id="pool" value="MachinePool [CR]&#xa;Class + fixed shape&#xa;Target count and membership" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=17;spacing=10;" vertex="1" parent="1">
-          <mxGeometry x="70" y="460" width="320" height="100" as="geometry"/>
+        <mxCell id="pool" value="MachinePool + pool controller&#xa;Count and membership [proposed]" style="rounded=1;whiteSpace=wrap;html=0;fillColor=#fff4dc;strokeColor=#aa7625;strokeWidth=2;fontSize=22;fontColor=#172b4d;" vertex="1" parent="1">
+          <mxGeometry x="540" y="450" width="420" height="100" as="geometry"/>
         </mxCell>
-        <mxCell id="pool-controller" value="Shared pool controller&#xa;Durable resizing and allocation slots" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=17;spacing=10;" vertex="1" parent="1">
-          <mxGeometry x="70" y="650" width="320" height="90" as="geometry"/>
+        <mxCell id="allocation" value="MachineAllocation&#xa;One consumer UID, one capacity obligation" style="rounded=1;whiteSpace=wrap;html=0;fillColor=#e8f0fe;strokeColor=#5274b8;strokeWidth=2;fontSize=22;fontColor=#172b4d;" vertex="1" parent="1">
+          <mxGeometry x="190" y="620" width="620" height="100" as="geometry"/>
         </mxCell>
-        <mxCell id="allocation" value="MachineAllocation [CR]&#xa;Class + consumer UID&#xa;One capacity obligation until release" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=17;spacing=10;" vertex="1" parent="1">
-          <mxGeometry x="480" y="640" width="330" height="110" as="geometry"/>
+        <mxCell id="execution" value="Shared host lifecycle + MachineOperation&#xa;Freeze / fence / bind / recover&#xa;HostAllocate and HostRelease" style="rounded=1;whiteSpace=wrap;html=0;fillColor=#e8f0fe;strokeColor=#5274b8;strokeWidth=2;fontSize=22;fontColor=#172b4d;" vertex="1" parent="1">
+          <mxGeometry x="190" y="790" width="620" height="130" as="geometry"/>
         </mxCell>
-        <mxCell id="execution" value="Shared lifecycle + MachineOperation&#xa;Freeze / bind / recover / release&#xa;HostAllocate and HostRelease" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=17;spacing=10;" vertex="1" parent="1">
-          <mxGeometry x="480" y="840" width="330" height="110" as="geometry"/>
+        <mxCell id="azure" value="AzureVM adapter&#xa;Azure VM lifecycle&#xa;POC verified" style="rounded=1;whiteSpace=wrap;html=0;fillColor=#e6f3ed;strokeColor=#33825a;strokeWidth=2;fontSize=22;fontColor=#172b4d;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1010" width="280" height="110" as="geometry"/>
         </mxCell>
-        <mxCell id="provider" value="Provider adapter: ANS or inventory&#xa;Reserve / observe / release&#xa;Also publishes class observations" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=17;spacing=10;" vertex="1" parent="1">
-          <mxGeometry x="900" y="840" width="320" height="110" as="geometry"/>
+        <mxCell id="aws" value="AWSEC2 adapter&#xa;EC2 lifecycle&#xa;POC verified" style="rounded=1;whiteSpace=wrap;html=0;fillColor=#e6f3ed;strokeColor=#33825a;strokeWidth=2;fontSize=22;fontColor=#172b4d;" vertex="1" parent="1">
+          <mxGeometry x="360" y="1010" width="280" height="110" as="geometry"/>
         </mxCell>
-        <mxCell id="machine" value="Machine and Node bindings&#xa;external.machineRef keeps&#xa;the provider-owned host identity" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=17;spacing=10;" vertex="1" parent="1">
-          <mxGeometry x="480" y="1030" width="330" height="100" as="geometry"/>
+        <mxCell id="other" value="Other provider adapters&#xa;Cloud or existing inventory&#xa;Qualification pending" style="rounded=1;whiteSpace=wrap;html=0;fillColor=#fff4dc;strokeColor=#aa7625;strokeWidth=2;fontSize=20;fontColor=#172b4d;" vertex="1" parent="1">
+          <mxGeometry x="680" y="1010" width="280" height="110" as="geometry"/>
         </mxCell>
-        <mxCell id="direct-note" value="Karpenter bypasses MachinePool.&#xa;One NodeClaim UID maps to&#xa;one durable allocation." style="text;html=1;whiteSpace=wrap;align=left;fontSize=17;fontColor=#444444;spacing=5;" vertex="1" parent="1">
-          <mxGeometry x="700" y="450" width="310" height="100" as="geometry"/>
+        <mxCell id="key" value="Blue: shared contract. Green: POC-tested. Amber: proposed or unqualified.&#xa;Dashed arrows: discovery reads. Solid arrows: demand and lifecycle operations." style="text;html=0;align=left;fontSize=18;fontColor=#42526e;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1135" width="920" height="45" as="geometry"/>
         </mxCell>
-        <mxCell id="key" value="Blue: shared Unbounded model and code. Grey: autoscalers, providers, existing hosts.&#xa;Solid arrows: demand / execution. Dashed arrows: read normalized discovery. [CR]: Kubernetes resource." style="text;html=1;align=left;whiteSpace=wrap;fontSize=15;fontColor=#444444;" vertex="1" parent="1">
-          <mxGeometry x="50" y="1180" width="1200" height="60" as="geometry"/>
-        </mxCell>
-        <mxCell id="cas-contract" value="CAS contract" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=15;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="cas" target="cas-plugin">
+        <mxCell id="karpenter-discovery" value="read offerings" style="edgeStyle=orthogonalEdgeStyle;html=0;dashed=1;strokeColor=#5274b8;strokeWidth=2;fontSize=18;labelBackgroundColor=#ffffff;exitX=0.1212121212;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="class" target="karpenter">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
-        <mxCell id="karpenter-contract" value="CloudProvider contract" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=15;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="karpenter" target="karpenter-plugin">
+        <mxCell id="cas-discovery" value="read offerings" style="edgeStyle=orthogonalEdgeStyle;html=0;dashed=1;strokeColor=#5274b8;strokeWidth=2;fontSize=18;labelBackgroundColor=#ffffff;exitX=0.8787878788;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="class" target="cas">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
-        <mxCell id="cas-discovery" value="read" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;fontSize=15;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="cas-plugin" target="class">
+        <mxCell id="cas-target" style="edgeStyle=orthogonalEdgeStyle;html=0;strokeColor=#aa7625;strokeWidth=2;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="cas" target="pool">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
-        <mxCell id="karpenter-discovery" value="read" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;fontSize=15;labelBackgroundColor=#ffffff;exitX=0;exitY=0.5;entryX=1;entryY=0.5;" edge="1" parent="1" source="karpenter-plugin" target="class">
+        <mxCell id="karpenter-allocation" style="edgeStyle=orthogonalEdgeStyle;html=0;strokeColor=#33825a;strokeWidth=2;exitX=0.5;exitY=1;entryX=0.0967741935;entryY=0;" edge="1" parent="1" source="karpenter" target="allocation">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
-        <mxCell id="cas-target" value="resize / select retirement" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=15;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="cas-plugin" target="pool">
+        <mxCell id="pool-allocation" style="edgeStyle=orthogonalEdgeStyle;html=0;strokeColor=#aa7625;strokeWidth=2;exitX=0.5;exitY=1;entryX=0.9032258065;entryY=0;" edge="1" parent="1" source="pool" target="allocation">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
-        <mxCell id="pool-reconcile" value="reconcile" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=15;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="pool" target="pool-controller">
+        <mxCell id="allocation-execution" style="edgeStyle=orthogonalEdgeStyle;html=0;strokeColor=#5274b8;strokeWidth=2;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="allocation" target="execution">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
-        <mxCell id="pool-allocation" value="slots" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=15;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="pool-controller" target="allocation">
-          <mxGeometry relative="1" as="geometry"/>
-        </mxCell>
-        <mxCell id="karpenter-allocation" value="create / observe / release" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=15;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=1;entryY=0.5;" edge="1" parent="1" source="karpenter-plugin" target="allocation">
+        <mxCell id="execute-azure" style="edgeStyle=orthogonalEdgeStyle;html=0;strokeColor=#33825a;strokeWidth=2;exitX=0.25;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="execution" target="azure">
           <mxGeometry relative="1" as="geometry">
             <Array as="points">
-              <mxPoint x="1060" y="695"/>
-              <mxPoint x="850" y="695"/>
+              <mxPoint x="345" y="960"/>
+              <mxPoint x="180" y="960"/>
             </Array>
           </mxGeometry>
         </mxCell>
-        <mxCell id="allocation-execution" value="reconcile" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=15;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="allocation" target="execution">
+        <mxCell id="execute-aws" style="edgeStyle=orthogonalEdgeStyle;html=0;strokeColor=#33825a;strokeWidth=2;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="execution" target="aws">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
-        <mxCell id="provider-callbacks" value="SDK" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=15;labelBackgroundColor=#ffffff;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="execution" target="provider">
-          <mxGeometry relative="1" as="geometry"/>
-        </mxCell>
-        <mxCell id="execution-binding" value="UID-checked binding" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;fontSize=15;labelBackgroundColor=#ffffff;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="execution" target="machine">
-          <mxGeometry relative="1" as="geometry"/>
+        <mxCell id="execute-other" style="edgeStyle=orthogonalEdgeStyle;html=0;strokeColor=#aa7625;strokeWidth=2;exitX=0.75;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="execution" target="other">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="655" y="960"/>
+              <mxPoint x="820" y="960"/>
+            </Array>
+          </mxGeometry>
         </mxCell>
       </root>
     </mxGraphModel>
