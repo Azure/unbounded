@@ -141,7 +141,14 @@ func (b *Backend) prefetch(start, stop int64) {
 
 	var run []*chunk
 
-	for idx := start / b.chunkSize; idx*b.chunkSize < stop; idx++ {
+	// Bound the loop by the last chunk index, not idx*chunkSize < stop,
+	// which wraps past the final chunk of an object near math.MaxInt64.
+	if stop <= start {
+		b.mu.Unlock()
+		return
+	}
+
+	for idx, last := start/b.chunkSize, (stop-1)/b.chunkSize; idx <= last; idx++ {
 		if b.chunks[idx] != nil {
 			if len(run) > 0 {
 				jobs, run = append(jobs, run), nil
