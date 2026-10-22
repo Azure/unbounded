@@ -904,17 +904,19 @@ impl<P: Policy> Quotas<P> {
     /// weights and their total. Wakes the shared waiter so blocked admission
     /// can retry against changed shares. Safe to call at any time.
     pub fn reweigh(&self) {
+        // Upgrade owners only: key clones and policy callbacks may reenter
+        // the key map, so they must run after the borrow is released.
         let live: Vec<_> = self
             .keys
             .borrow()
-            .iter()
-            .filter_map(|(key, counts)| counts.upgrade().map(|counts| (key.clone(), counts)))
+            .values()
+            .filter_map(Weak::upgrade)
             .collect();
-        for (key, counts) in &live {
+        for counts in &live {
             let Some(retirement) = counts.retirement.as_ref() else {
                 continue;
             };
-            let next = self.key_weight(key);
+            let next = self.key_weight(&retirement.key);
             // The upgraded owner prevents concurrent retirement of this key.
             let previous = retirement.weight.swap(next, Ordering::AcqRel);
             self.active_weight.fetch_add(next, Ordering::AcqRel);
@@ -2998,6 +3000,104 @@ mod quota_tests {
     #[test]
     fn quota_key_clone_charge_reentry() {
         check_quota_key_clone(2);
+    }
+
+    /// A key clone that reserves keyed work during reweigh does not panic.
+    #[test]
+    fn reweigh_allows_reentrant_key_clone() {
+        thread_local! {
+            static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+        }
+
+        /// Run the one-shot hook after releasing its borrow.
+        fn fire() {
+            if let Some(action) = HOOK.with(|slot| slot.borrow_mut().take()) {
+                action();
+            }
+        }
+
+        /// A key whose clone runs a one-shot reentrant hook.
+        #[derive(Debug, Eq, PartialEq, Hash)]
+        struct Key(String);
+
+        impl Clone for Key {
+            /// Reenter admission from application clone code.
+            fn clone(&self) -> Self {
+                fire();
+                Self(self.0.clone())
+            }
+        }
+
+        /// Weighted policy over reentrant keys.
+        struct KeyPolicy(TestPolicy);
+
+        impl Policy for KeyPolicy {
+            type Class = Resource;
+
+            type Key = Key;
+
+            /// Delegate the aggregate ceiling.
+            fn limit(&self, class: Resource) -> usize {
+                self.0.limit(class)
+            }
+
+            /// Delegate the record ceiling.
+            fn max_keys(&self) -> usize {
+                self.0.max_keys()
+            }
+
+            /// This fixture has no admission waiter.
+            fn wakes(_: Resource) -> bool {
+                false
+            }
+
+            /// This fixture allocates no page backing.
+            fn covers(_: Resource) -> bool {
+                false
+            }
+
+            /// This fixture does not observe rejections.
+            fn rejected(&self, _: Rejection<Resource>) {}
+
+            /// Reenter admission, then delegate the configured weight.
+            fn weight(&self, key: &Key) -> u64 {
+                fire();
+                self.0.weight(&key.0)
+            }
+        }
+
+        let policy = TestPolicy::new(1000, 16);
+        policy
+            .weights
+            .lock()
+            .unwrap()
+            .extend([("a".to_owned(), 1), ("b".to_owned(), 1)]);
+        let quotas = Rc::new(Quotas::new(KeyPolicy(policy.clone())));
+        let a = quotas
+            .reserve(Some(&Key("a".into())), Resource::Other, 1)
+            .unwrap();
+        policy.weights.lock().unwrap().insert("a".into(), 3);
+        let held = Rc::new(RefCell::new(Vec::new()));
+        let nested = quotas.clone();
+        let nested_held = held.clone();
+        HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                nested_held.borrow_mut().push(
+                    nested
+                        .reserve(Some(&Key("b".into())), Resource::Other, 1)
+                        .unwrap(),
+                );
+            }));
+        });
+        quotas.reweigh();
+        HOOK.with(|slot| slot.borrow_mut().take());
+        // The hook fired inside reweigh and admitted "b" with weight 1.
+        assert_eq!(held.borrow().len(), 1);
+        assert_eq!(quotas.active_weight(), 4);
+        assert_eq!(quotas.fair_limit(&Key("a".into()), Resource::Other), 750);
+        held.borrow_mut().clear();
+        drop(a);
+        assert_eq!(quotas.active_weight(), 0);
     }
 
     /// Idle backing retains concurrent charges and reports pressure before retry.
