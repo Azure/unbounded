@@ -52,6 +52,31 @@ impl Weights {
             .unwrap_or(u64::from(DEFAULT_PRIORITY))
     }
 
+    /// Share denominator for a member set made of every published cache plus
+    /// `extra`. Entries of `extra` absent from the table count as additional
+    /// members with `DEFAULT_PRIORITY`; `extra` must not repeat a cache. Costs
+    /// one lookup per `extra` entry, independent of the published catalog size.
+    pub fn basis<'a>(&self, extra: impl IntoIterator<Item = &'a CacheId>) -> ShareBasis {
+        let table = self.0.read().unwrap_or_else(|e| e.into_inner());
+        let unknown = extra
+            .into_iter()
+            .filter(|cache| !table.weights.contains_key(*cache))
+            .count() as u64;
+        ShareBasis {
+            published: !table.weights.is_empty(),
+            total: table.total + unknown * u64::from(DEFAULT_PRIORITY),
+            members: table.weights.len() as u64 + unknown,
+        }
+    }
+
+    /// Fair share of `capacity` for one cache under `basis`, in O(1).
+    pub fn share_in(&self, basis: ShareBasis, capacity: u64, cache: &CacheId) -> u64 {
+        if !basis.published {
+            return capacity;
+        }
+        basis.share(capacity, self.weight(cache))
+    }
+
     /// Fair share of `capacity` for each cache in `caches`, in input order.
     /// `share = capacity * w / W`; all-zero `W` splits equally. Caches absent
     /// from the published table count with `DEFAULT_PRIORITY`. With no
@@ -61,36 +86,34 @@ impl Weights {
         capacity: u64,
         caches: impl IntoIterator<Item = &'a CacheId>,
     ) -> Vec<u64> {
-        let table = self.0.read().unwrap_or_else(|e| e.into_inner());
         let caches: Vec<_> = caches.into_iter().collect();
-        if table.weights.is_empty() {
-            return vec![capacity; caches.len()];
-        }
-        let unknown = caches
-            .iter()
-            .filter(|cache| !table.weights.contains_key(**cache))
-            .count() as u64;
-        let total = table.total + unknown * u64::from(DEFAULT_PRIORITY);
-        let members = table.weights.len() as u64 + unknown;
+        let basis = self.basis(caches.iter().copied());
         caches
             .iter()
-            .map(|cache| {
-                if total == 0 {
-                    return capacity / members.max(1);
-                }
-                let weight = table
-                    .weights
-                    .get(*cache)
-                    .copied()
-                    .unwrap_or(u64::from(DEFAULT_PRIORITY));
-                (u128::from(capacity) * u128::from(weight) / u128::from(total)) as u64
-            })
+            .map(|cache| self.share_in(basis, capacity, cache))
             .collect()
     }
 
     /// Fair share of `capacity` for one cache. See `shares`.
     pub fn share(&self, capacity: u64, cache: &CacheId) -> u64 {
         self.shares(capacity, [cache])[0]
+    }
+}
+
+/// Denominator of one share computation: summed weight and member count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShareBasis {
+    published: bool,
+    total: u64,
+    members: u64,
+}
+
+impl ShareBasis {
+    fn share(self, capacity: u64, weight: u64) -> u64 {
+        if self.total == 0 {
+            return capacity / self.members.max(1);
+        }
+        (u128::from(capacity) * u128::from(weight) / u128::from(self.total)) as u64
     }
 }
 
@@ -130,5 +153,35 @@ mod tests {
         assert_eq!(weights.share(u64::MAX, &a), u64::MAX);
         assert!(weights.update(&[]));
         assert_eq!(weights.share(10, &a), 10);
+    }
+
+    #[test]
+    fn basis_share_matches_batch_shares() {
+        let weights = Weights::default();
+        let ids: Vec<CacheId> = ["a", "b", "c", "d"].map(|n| CacheId(n.into())).to_vec();
+        let tables: [&[CacheDefinition]; 4] = [
+            &[],
+            &[cache("a", 900), cache("b", 100)],
+            &[cache("a", 0), cache("b", 0)],
+            &[cache("a", 3), cache("b", 0), cache("c", 7)],
+        ];
+        for table in tables {
+            weights.update(table);
+            for extra in [&ids[..0], &ids[..1], &ids[2..], &ids[..]] {
+                // `shares` over published plus extra is the reference.
+                let mut members = weights.caches();
+                let published = members.clone();
+                members.extend(extra.iter().filter(|c| !published.contains(c)).cloned());
+                let expected = weights.shares(1000, &members);
+                let basis = weights.basis(extra);
+                for (member, share) in members.iter().zip(expected) {
+                    assert_eq!(weights.share_in(basis, 1000, member), share);
+                }
+            }
+        }
+        weights.update(&[cache("a", 0)]);
+        let basis = weights.basis([&ids[1]]);
+        assert_eq!(weights.share_in(basis, 1000, &ids[0]), 0);
+        assert_eq!(weights.share_in(basis, 1000, &ids[1]), 1000);
     }
 }

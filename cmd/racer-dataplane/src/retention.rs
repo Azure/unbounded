@@ -2,11 +2,11 @@
 //! state; Bloom approximation applies ONLY to whether a page was seen previously.
 use crate::error::{Error, Result};
 use crate::model::PageId;
-use crate::priority::Weights;
-use crate::runtime::{HashMap, HashSet};
+use crate::priority::{ShareBasis, Weights};
+use crate::runtime::HashMap;
 use page_alloc::retention::{Heat, SecondSight};
 use racer_control_wire::CacheId;
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::rc::Rc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -84,13 +84,18 @@ pub(crate) type OwnershipPass = Rc<dyn Fn() -> Ownership>;
 /// Upper bound of `Scoring::score`: heat 0 to 3 plus 1 for ownership.
 pub(crate) const MAX_SCORE: u8 = 4;
 
-/// One eviction or ordering pass. Ownership, time, and the over-share set are
-/// pinned when the pass starts, so per-page ranking stays cheap and consistent.
+/// One eviction or ordering pass. Ownership and time are pinned when the pass
+/// starts. Over-share classification is computed lazily per candidate cache
+/// and memoized for the rest of the pass, so a pass never walks the published
+/// catalog: the share basis scans only caches holding resident payload.
 pub(crate) struct Scoring<'a> {
     retention: &'a Retention,
     ownership: Ownership,
     now: Instant,
-    over_share: HashSet<CacheId>,
+    capacity: u64,
+    basis: OnceCell<ShareBasis>,
+    classified: RefCell<HashMap<CacheId, bool>>,
+    any_over_share: OnceCell<bool>,
 }
 impl Scoring<'_> {
     pub(crate) fn score(&self, page: &PageId) -> u8 {
@@ -100,10 +105,31 @@ impl Scoring<'_> {
     /// Whether the cache's indexed payload exceeded its fair share of this
     /// worker's disk capacity when the pass started.
     pub(crate) fn over_share(&self, cache: &CacheId) -> bool {
-        self.over_share.contains(cache)
+        if let Some(over) = self.classified.borrow().get(cache) {
+            return *over;
+        }
+        let resident = self.retention.cache_payload_bytes(cache);
+        // A cache without resident payload is never over share; skip the basis.
+        let over = resident != 0 && self.classify(cache, resident);
+        self.classified.borrow_mut().insert(cache.clone(), over);
+        over
     }
+    fn classify(&self, cache: &CacheId, resident: u64) -> bool {
+        let basis = *self.basis.get_or_init(|| self.retention.share_basis());
+        let share = self
+            .retention
+            .weights
+            .borrow()
+            .share_in(basis, self.capacity, cache);
+        over_share(resident, share, self.capacity)
+    }
+    /// Whether any cache with resident payload is over share. Scans only the
+    /// resident caches, once per pass.
     pub(crate) fn any_over_share(&self) -> bool {
-        !self.over_share.is_empty()
+        *self.any_over_share.get_or_init(|| {
+            let used = self.retention.cache_bytes.borrow();
+            used.keys().any(|cache| self.over_share(cache))
+        })
     }
     /// Combined victim rank: under-share pages outrank every over-share page;
     /// the retention score orders pages within one class. Higher is kept longer.
@@ -124,8 +150,11 @@ impl CacheDisk {
     /// cache, or no published catalog) is never over share, even when the
     /// capacity estimate is below its actual residency.
     pub fn over_share(&self, capacity: u64) -> bool {
-        self.share_bytes < capacity && self.resident_bytes > self.share_bytes
+        over_share(self.resident_bytes, self.share_bytes, capacity)
     }
+}
+fn over_share(resident: u64, share: u64, capacity: u64) -> bool {
+    share < capacity && resident > share
 }
 #[derive(Default)]
 struct Counters {
@@ -209,18 +238,22 @@ impl Retention {
             Some(prepare) => prepare(),
             None => self.ownership.borrow().clone(),
         };
-        let over_share = self
-            .cache_disk(capacity)
-            .into_iter()
-            .filter(|cache| cache.over_share(capacity))
-            .map(|cache| cache.cache)
-            .collect();
         Scoring {
             retention: self,
             ownership,
             now,
-            over_share,
+            capacity,
+            basis: OnceCell::new(),
+            classified: RefCell::default(),
+            any_over_share: OnceCell::new(),
         }
+    }
+    /// Share basis over the published catalog plus every cache that still
+    /// holds indexed payload, matching the member set of `cache_disk`.
+    fn share_basis(&self) -> ShareBasis {
+        self.weights
+            .borrow()
+            .basis(self.cache_bytes.borrow().keys())
     }
     /// Indexed payload bytes currently charged to one cache.
     pub fn cache_payload_bytes(&self, cache: &CacheId) -> u64 {
@@ -228,15 +261,19 @@ impl Retention {
     }
     /// Whether one cache's indexed payload exceeds its share of `capacity`.
     pub fn over_share(&self, cache: &CacheId, capacity: u64) -> bool {
-        CacheDisk {
-            cache: cache.clone(),
-            resident_bytes: self.cache_payload_bytes(cache),
-            share_bytes: self.weights.borrow().share(capacity, cache),
-        }
-        .over_share(capacity)
+        let resident = self.cache_payload_bytes(cache);
+        resident != 0
+            && over_share(
+                resident,
+                self.weights
+                    .borrow()
+                    .share_in(self.share_basis(), capacity, cache),
+                capacity,
+            )
     }
     /// Resident bytes and shares for every published cache and every cache
-    /// that still holds indexed payload, sorted by cache id.
+    /// that still holds indexed payload, sorted by cache id. Telemetry only:
+    /// this walks and sorts the whole catalog.
     pub fn cache_disk(&self, capacity: u64) -> Vec<CacheDisk> {
         let used = self.cache_bytes.borrow();
         let weights = self.weights.borrow();
@@ -431,6 +468,54 @@ impl Retention {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    #[test]
+    fn lazy_scoring_classification_matches_telemetry_cache_disk() {
+        use racer_control_wire::CacheDefinition;
+        let clock = uring_runtime::environment::SimulationClock::new(52);
+        let _environment = clock.environment(0).enter();
+        let policy = Rc::new(Retention::new(4096, 1).unwrap());
+        let id = |n: &str| CacheId(n.into());
+        let def = |n: &str, priority: u16| CacheDefinition {
+            id: id(n),
+            name: n.into(),
+            client_socket: "/client".into(),
+            origin_socket: "/origin".into(),
+            priority,
+        };
+        // "u" holds payload but is unpublished; "e" is published but empty.
+        let _held = [
+            policy.indexed_payload(&id("a"), 600),
+            policy.indexed_payload(&id("b"), 300),
+            policy.indexed_payload(&id("u"), 400),
+        ];
+        let all = ["a", "b", "u", "e", "z"].map(id);
+        let tables: [Vec<CacheDefinition>; 5] = [
+            vec![],
+            vec![def("a", 900), def("b", 100), def("e", 500)],
+            vec![def("a", 0), def("b", 0), def("e", 0)],
+            vec![def("a", 1)],
+            vec![def("a", 1000), def("b", 1000), def("e", 0)],
+        ];
+        let now = uring_runtime::environment::now();
+        for table in &tables {
+            policy.weights().update(table);
+            for capacity in [0, 500, 1000, 1300, u64::MAX] {
+                let disk = policy.cache_disk(capacity);
+                let scoring = policy.scoring_at(now, capacity);
+                for cache in &all {
+                    let expected = disk
+                        .iter()
+                        .find(|d| &d.cache == cache)
+                        .is_some_and(|d| d.over_share(capacity));
+                    assert_eq!(scoring.over_share(cache), expected, "{cache:?} {capacity}");
+                    assert_eq!(policy.over_share(cache, capacity), expected);
+                }
+                let any = disk.iter().any(|d| d.over_share(capacity));
+                assert_eq!(scoring.any_over_share(), any);
+                assert_eq!(policy.scoring_at(now, capacity).any_over_share(), any);
+            }
+        }
+    }
     #[test]
     fn scoring_pass_pins_ownership_and_time_and_replacement_clears_factory() {
         let clock = uring_runtime::environment::SimulationClock::new(51);
