@@ -31,6 +31,7 @@ crate.
 | `src/link.rs` | Per-QP grants, writes, credits, timers, and completion handling |
 | `src/pool.rs` | Registered receive buffers and ownership states |
 | `src/channel.rs` | Bounded worker command queues and one-shot results |
+| `src/discovery.rs` | Stable port identities, port journal, and NUMA-aware worker selection |
 | `src/control.rs` | Fixed-size in-band control codec |
 | `src/ffi.rs` | Native resource ownership, bounds checks, and completion validation |
 | `native/verbs.c` | libibverbs adapter |

@@ -1045,7 +1045,8 @@ impl Owner {
             return;
         }
 
-        // Clients stage from these; withdraw them before counting holders.
+        // Clients read receive-pool state through these; withdraw them before
+        // checking that every device pool is idle.
         match self.shared.pools.try_write() {
             Ok(mut pools) => pools.clear(),
             Err(_) => return,
