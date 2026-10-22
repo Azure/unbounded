@@ -792,15 +792,17 @@ impl Owner {
                     .take()
                     .ok_or(Error::InvalidConfiguration)?,
             );
+            // Writes read caller memory in place; there is no copy path.
+            // Probe implicit ODP first so an unsupported device fails before
+            // the receive pool is allocated and registered.
+            let implicit =
+                NativeRegion::implicit(device.clone(), quota.clone()).ok_or(Error::Unavailable)?;
             let region = NativeRegion::with_access(
                 device.clone(),
                 count * config.buffer_len,
                 Access::PAGES,
                 quota.clone(),
             )?;
-            // Writes read caller memory in place; there is no copy path.
-            let implicit =
-                NativeRegion::implicit(device.clone(), quota.clone()).ok_or(Error::Unavailable)?;
             let pool = Pool::new(region, implicit, config.buffer_len, quota.clone())?;
             built.insert(selection.tag as u16, DeviceState { pool, device });
         }

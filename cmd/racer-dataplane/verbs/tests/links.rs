@@ -271,6 +271,15 @@ fn activation_requires_implicit_odp_and_releases_on_failure() {
     let activation = node.clients[0].activate(config(&node.charge));
     node.owner().poll_budgeted(4).unwrap();
     assert_eq!(ready(&activation).err(), Some(Error::Unavailable));
+    // The failed probe is the only registration: the receive pool is never
+    // registered on a device that lacks implicit ODP.
+    let registers: Vec<i64> = sim
+        .trace()
+        .iter()
+        .filter(|e| e.operation == Operation::Register)
+        .map(|e| e.result)
+        .collect();
+    assert_eq!(registers, [-1], "no receive MR before the failed probe");
     assert_eq!(node.charge.load(Ordering::Acquire), 0, "charge returned");
     assert_eq!(sim.live_resources(), 0, "nothing registered stays");
     assert_eq!(node.clients[0].buffers(7, BufferState::Free), None);
