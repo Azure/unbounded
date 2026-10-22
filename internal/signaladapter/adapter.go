@@ -32,7 +32,7 @@ const (
 	MaxMeasurementsBytes   = 16 * 1024
 	MaxBackendOutputBytes  = 16 * 1024
 	MaxCleanupFailureBytes = 64
-	maxMPIWorkerReadyWait  = int64(120)
+	maxMPIWorkerReadyWait  = int64(30)
 	resultPrefix           = "PROJECT_SIGNAL_RESULT_V2 "
 	requiredTopologyKey    = "kueue.x-k8s.io/podset-required-topology"
 )
@@ -744,35 +744,35 @@ func mpiWorkerReadinessTimeout(backendDeadlineSeconds int64) int64 {
 	return timeout
 }
 
-func mpiWorkerReadinessScript(hostfile string, port int, timeoutSeconds int64) string {
+func mpiWorkerReadinessScript(hostfile string, timeoutSeconds int64) string {
 	return fmt.Sprintf(`
 wait_for_mpi_workers() {
   local hostfile=%s
-  local port=%d
   local timeout_seconds=%d
   local deadline=$((SECONDS + timeout_seconds))
-  local host ignored all_ready
+  local host all_ready last_unready remaining
   local -a hosts
   while (( SECONDS < deadline )); do
     hosts=()
     if [[ -r "${hostfile}" ]]; then
-      while IFS=$' \t' read -r host ignored; do
-        [[ -n "${host}" ]] || continue
+      while IFS= read -r host; do
         if [[ ! "${host}" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
           printf 'Project Signal MPI readiness rejected invalid worker host %%q in %%s\n' "${host}" "${hostfile}" >&2
           return 64
         fi
         hosts+=("${host}")
-      done < "${hostfile}"
+      done < <(/usr/bin/awk 'NF {print $1}' "${hostfile}")
     fi
     if (( ${#hosts[@]} > 0 )); then
       all_ready=1
       for host in "${hosts[@]}"; do
-        if exec 3<>"/dev/tcp/${host}/${port}" 2>/dev/null; then
-          exec 3>&-
-          exec 3<&-
-        else
+        remaining=$((deadline - SECONDS))
+        if (( remaining < 1 )) || ! timeout "${remaining}s" ssh \
+          -o BatchMode=yes \
+          -o ConnectTimeout=2 \
+          -- "${host}" /bin/true </dev/null >/dev/null 2>&1; then
           all_ready=0
+          last_unready="${host}"
           break
         fi
       done
@@ -782,12 +782,12 @@ wait_for_mpi_workers() {
     fi
     sleep 1
   done
-  printf 'Project Signal MPI readiness timed out after %%ds waiting for every worker in %%s to resolve and accept TCP/%%d\n' \
-    "${timeout_seconds}" "${hostfile}" "${port}" >&2
+  printf 'Project Signal MPI readiness timed out after %%ds waiting for every worker in %%s to resolve and accept SSH/22; last unready host=%%s\n' \
+    "${timeout_seconds}" "${hostfile}" "${last_unready:-unknown}" >&2
   return 124
 }
 wait_for_mpi_workers
-`, shellQuote(hostfile), port, timeoutSeconds)
+`, shellQuote(hostfile), timeoutSeconds)
 }
 
 func ordinaryPod(
@@ -900,7 +900,7 @@ func mpiJob(
 							Name:  "launcher",
 							Image: config.RunnerImage,
 							Command: resultCommandWithPrelude(
-								mpiWorkerReadinessScript("/etc/mpi/hostfile", 22, readinessTimeout),
+								mpiWorkerReadinessScript("/etc/mpi/hostfile", readinessTimeout),
 								"mpi-launcher",
 								strconv.FormatInt(gpuCount, 10),
 							),
