@@ -349,7 +349,13 @@ fn rdma_devices(sys_root: &Path, errors: &mut Vec<String>) -> Vec<RdmaDevice> {
                     let number = port.parse::<u32>().ok()?;
                     let port = path.join("ports").join(port);
                     let mut netdevs = BTreeSet::new();
-                    netdevs.extend(text(&port.join("gid_attrs/ndevs/0")));
+                    // Every GID slot may name a netdev (for example a RoCE
+                    // VLAN interface absent from device/net). Unused slots
+                    // fail to read in sysfs and are skipped by `text`.
+                    let ndevs = port.join("gid_attrs/ndevs");
+                    for entry in list(&ndevs).unwrap_or_default() {
+                        netdevs.extend(text(&ndevs.join(entry)));
+                    }
                     for netdev in &pci_netdevs {
                         // dev_port is zero-based; keep netdevs without it.
                         let dev_port = number_at(&path.join("device/net").join(netdev));
@@ -628,6 +634,29 @@ mod tests {
         assert_eq!(port.phys_state.as_deref(), Some("Disabled"));
         assert_eq!(port.gid0, None);
         assert!(port.netdevs.is_empty());
+    }
+
+    #[test]
+    fn netdevs_include_nonzero_gid_entries() {
+        let f = Fixture::new();
+        fs::create_dir_all(f.sys().join("block")).unwrap();
+        rdma_tree(&f);
+        let port = "sys/class/infiniband/mlx5_0/ports/1";
+        // vlan100 appears only in a nonzero GID entry, not in device/net.
+        f.write(&format!("{port}/gid_attrs/ndevs/3"), "vlan100\n");
+        f.write(&format!("{port}/gid_attrs/ndevs/2"), "eth2\n");
+        // Unused slot: empty content is skipped.
+        f.write(&format!("{port}/gid_attrs/ndevs/7"), "");
+        f.write(&format!("{port}/gid_attrs/types/3"), "RoCE v2\n");
+        let report = discover(&f.sys(), &f.dev());
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let port = &report.rdma_devices[0].ports[0];
+        assert_eq!(port.netdevs, ["eth2", "vlan100"]);
+        assert_eq!(port.gid0_type.as_deref(), Some("RoCE v2"));
+        assert_eq!(
+            port.gid0.as_deref(),
+            Some("fe80:0000:0000:0000:0e42:a1ff:fe12:3456")
+        );
     }
 
     #[test]
