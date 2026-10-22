@@ -50,6 +50,10 @@ type Device struct {
 	startMu  sync.Mutex
 	starting bool
 	startErr error
+	// failErr is the first queue failure reported after startup. fail
+	// records it before scheduling teardown, so a Close or cancellation
+	// that wins the teardown race cannot hide it.
+	failErr error
 	// startDone is closed once startup is resolved: START_DEV has
 	// returned or will not be issued. A failed queue can release its ring
 	// when this closes or after it confirms that the disk is published.
@@ -327,6 +331,10 @@ func (d *Device) fail(err error) {
 
 		return
 	}
+
+	if d.failErr == nil {
+		d.failErr = err
+	}
 	d.startMu.Unlock()
 
 	d.stopAsync(err)
@@ -343,8 +351,9 @@ func (d *Device) teardown(cause error) {
 
 		// After an external STOP_DEV or DEL_DEV the kernel may report
 		// ENODEV for our own control commands; that is not a teardown
-		// failure.
-		external := errors.Is(cause, errStoppedExternally)
+		// failure. A recorded queue failure counts even when Close or
+		// cancellation started this teardown.
+		external := errors.Is(d.stopCause(cause), errStoppedExternally)
 		keep := func(err error) {
 			if err != nil && (!external || !errors.Is(err, syscall.ENODEV)) {
 				errs = append(errs, err)
@@ -426,6 +435,7 @@ func (d *Device) teardown(cause error) {
 
 		errs = append(errs, d.ctrl.close())
 
+		cause = d.stopCause(cause)
 		d.err = cause
 		d.closeErr = errors.Join(errs...)
 
@@ -436,6 +446,27 @@ func (d *Device) teardown(cause error) {
 		close(d.done)
 	})
 	<-d.done
+}
+
+// stopCause returns the cause to record for a teardown that was started
+// because of cause. A queue failure recorded by fail wins over a nil or
+// context cause, since Close or cancellation can start teardown before
+// the failure's own teardown runs. Call it after every queue has exited
+// so that late failures are included.
+func (d *Device) stopCause(cause error) error {
+	d.startMu.Lock()
+	failErr := d.failErr
+	d.startMu.Unlock()
+
+	if failErr == nil {
+		return cause
+	}
+
+	if cause == nil || errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) {
+		return failErr
+	}
+
+	return cause
 }
 
 // ID returns the kernel device id.
