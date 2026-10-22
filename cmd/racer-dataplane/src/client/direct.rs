@@ -17,6 +17,8 @@ use crate::error::Operation;
 use crate::error::Result;
 use crate::http::Delivery;
 use crate::http::ReaderLease;
+use crate::read::sealed::SealedPage;
+use crate::read::sealed::SealedTarget;
 use crate::runtime::RequestScope;
 use http1::connection::ReceivedDescriptors;
 pub use racer_object_wire::client::Destination;
@@ -32,15 +34,23 @@ pub const DIRECT_WINDOW_PAGES: usize = 4;
 
 /// One page handed to a [`DirectSink`].
 ///
-/// Today every page arrives as verified plaintext. A GPU backend that decrypts
-/// on the device will add a variant that carries the page identity and asks the
-/// sink to fetch ciphertext itself; the enum is non-exhaustive for that reason.
+/// Pages arrive as verified plaintext unless the sink asked for sealed pages
+/// with [`DirectSink::sealed_target`].
 #[non_exhaustive]
 pub enum DirectPage<'a> {
     /// Verified plaintext already in memory. [`ReaderLease::slice_bytes`] holds
     /// exactly the bytes to write; [`ReaderLease::page`] can be cloned to keep
     /// the page alive past this call.
     Plaintext(&'a ReaderLease),
+
+    /// A whole sealed page, for the sink to verify and decrypt. Only
+    /// `range`, a byte range of the page's plaintext, is written. A sink
+    /// must not write anything if verification fails, and must then return
+    /// [`Error::CorruptRecord`].
+    Sealed {
+        page: Box<SealedPage>,
+        range: std::ops::Range<u64>,
+    },
 }
 
 impl DirectPage<'_> {
@@ -48,6 +58,7 @@ impl DirectPage<'_> {
     pub fn len(&self) -> u64 {
         match self {
             Self::Plaintext(reader) => u64::from(reader.slice().length),
+            Self::Sealed { range, .. } => range.end.saturating_sub(range.start),
         }
     }
 
@@ -86,6 +97,13 @@ pub trait DirectSink {
 
     /// Wait for all work that touches the destination, then release it.
     fn finish<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()>;
+
+    /// Ask for sealed pages ([`DirectPage::Sealed`]) where the read path has
+    /// no plaintext in memory. Called after [`Self::ready`]. The default,
+    /// None, gets verified plaintext only.
+    fn sealed_target(&self) -> Option<SealedTarget> {
+        None
+    }
 }
 
 /// A GPU backend for `gpu-read`. Without one, `gpu-read` answers 501.
@@ -159,6 +177,8 @@ impl DirectSink for HostSink {
                         .write_slice_at(reader, self.file.clone(), destination_offset, scope)
                         .await
                 }
+                // Never requested: host sinks have no sealed target.
+                DirectPage::Sealed { .. } => Err(Error::Internal),
             }
         })
     }

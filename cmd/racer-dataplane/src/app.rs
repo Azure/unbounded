@@ -287,7 +287,7 @@ impl Application {
         )));
         self.node.inventory.update(self.discovered_nics.clone())?;
         Arc::get_mut(&mut self.node).ok_or(Error::Internal)?.gpu =
-            crate::gpu::GpuHelper::start(self.config.enable_gpu)?;
+            crate::gpu::GpuHelper::start(self.config.enable_gpu, self.config.gpu_staging_bytes)?;
         if self.config.enable_rdma {
             self.node.native.place(&plan)?;
             self.node

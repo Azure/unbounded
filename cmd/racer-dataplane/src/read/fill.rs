@@ -77,6 +77,18 @@ type LocalPlaintextKeys = std::cell::RefCell<
     std::collections::BTreeMap<PageId, Rc<std::cell::Cell<Option<racer_control_wire::KeyId>>>>,
 >;
 
+/// A host descriptor to hand to cuFile, or None for simulated descriptors.
+fn host_descriptor(
+    descriptor: &uring_runtime::reactor::descriptor::Descriptor,
+) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::AsFd;
+    #[cfg(test)]
+    if descriptor.as_sim().is_some() {
+        return None;
+    }
+    descriptor.as_fd().try_clone_to_owned().ok()
+}
+
 /// Optional writes may use half of the aggregate class budget, with a floor
 /// sufficient for one valid page when the configured budget can hold it. Owned
 /// usage counts against this conservative ceiling; quota admission remains the
@@ -886,6 +898,195 @@ impl Fill {
         {
             AcquiredPage::Plaintext(page) => Ok(page),
             AcquiredPage::Ciphertext(_) => Err(Error::CorruptRecord),
+        }
+    }
+
+    /// Acquire one page for direct GPU delivery: verified plaintext when the
+    /// CPU has it anyway, otherwise ciphertext for the GPU to verify and
+    /// decrypt. Network and disk copies keep the usual single-flight sharing,
+    /// memory publication and disk persistence; only the CPU decrypt and the
+    /// plaintext publication are skipped.
+    pub(crate) async fn acquire_sealed(
+        &self,
+        page: PageId,
+        membership: Arc<crate::topology::Membership>,
+        context: &OriginContext,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+        target: &super::sealed::SealedTarget,
+    ) -> Result<super::sealed::Fetched> {
+        use super::sealed::Fetched;
+        // Verified memory, and pages another reader already authenticates,
+        // keep the plaintext path: the bytes are on the CPU anyway.
+        if self.cached_page(&page, scope)?.is_some() {
+            return self
+                .acquire(page, membership, context, scope, budget)
+                .await
+                .map(Fetched::Page);
+        }
+        if target.helper.cufile()
+            && self
+                .dependencies
+                .writer
+                .copy_only(&page)
+                .ok()
+                .flatten()
+                .is_none()
+        {
+            match self.stage_from_disk(&page, scope, target).await {
+                Ok(Some(sealed)) => return Ok(Fetched::Sealed(sealed)),
+                Ok(None) => {}
+                Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => return Err(error),
+                // Any other failure reads the page through host memory.
+                Err(_) => {}
+            }
+        }
+        let acquired = self
+            .acquire_with_prefetch(
+                page.clone(),
+                membership.clone(),
+                context,
+                scope,
+                budget,
+                None,
+                false,
+                true,
+            )
+            .await?;
+        match acquired {
+            AcquiredPage::Plaintext(result) => Ok(Fetched::Page(result)),
+            AcquiredPage::Ciphertext(copy) => match self.seal(&page, copy) {
+                Ok(sealed) => Ok(Fetched::Sealed(sealed)),
+                // A key the GPU cannot use, or an AAD too long for it: the
+                // CPU authenticates the page as for a Get.
+                Err(_) => self
+                    .acquire(page, membership, context, scope, budget)
+                    .await
+                    .map(Fetched::Page),
+            },
+        }
+    }
+
+    /// Package host ciphertext for GPU verification.
+    fn seal(&self, page: &PageId, copy: UnverifiedPage) -> Result<Box<super::sealed::SealedPage>> {
+        validate_copy(&copy.copy, page)?;
+        let envelope = copy.copy.ciphertext.envelope().clone();
+        let sealed = Box::new(super::sealed::SealedPage {
+            metadata: copy.copy.metadata.clone(),
+            aad: crate::security::page_aad(&envelope)?,
+            key: self.dependencies.crypto.derive_page_key(&envelope)?,
+            expected_crc: copy.copy.ciphertext.cached_checksum(),
+            envelope,
+            source: super::sealed::SealedSource::Host(copy),
+        });
+        sealed.validate_for(page)?;
+        Ok(sealed)
+    }
+
+    /// Read a local v2 record's ciphertext straight into GPU staging with
+    /// cuFile. Only the header passes through host memory. None means the
+    /// page must be read through host memory: a miss, a v1 or unaligned
+    /// record, no free staging slot, or cuFile unavailable.
+    async fn stage_from_disk(
+        &self,
+        page: &PageId,
+        scope: &RequestScope,
+        target: &super::sealed::SealedTarget,
+    ) -> Result<Option<Box<super::sealed::SealedPage>>> {
+        if target.helper.free_slots(target.ordinal) == 0 {
+            target
+                .helper
+                .counters()
+                .exhausted
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(None);
+        }
+        let Some(record) = self
+            .dependencies
+            .disk
+            .direct_read(page, scope, |amount| {
+                self.reserve_with_reclamation(
+                    &page.version.object.cache,
+                    ResourceClass::Ciphertext,
+                    amount,
+                )
+            })
+            .await?
+        else {
+            return Ok(None);
+        };
+        if !record.ciphertext.aligned {
+            return Ok(None);
+        }
+        let Some(fd) = host_descriptor(&record.ciphertext.descriptor) else {
+            return Ok(None);
+        };
+        let envelope = record.envelope.clone();
+        if record.ciphertext.length != envelope.ciphertext_length as usize {
+            return Ok(None);
+        }
+        let aad = crate::security::page_aad(&envelope)?;
+        let key = self.dependencies.crypto.derive_page_key(&envelope)?;
+        let staged = target
+            .helper
+            .stage_file(
+                target.ordinal,
+                fd,
+                record.ciphertext.offset,
+                record.read_length as u64,
+                scope,
+            )
+            .await;
+        // The read finished (or was abandoned): the bytes may now be recycled.
+        let crate::store::DirectRecord {
+            token,
+            metadata,
+            checksum,
+            lease,
+            ..
+        } = record;
+        drop(lease);
+        let staged = match staged {
+            Ok(staged) => staged,
+            Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => return Err(error),
+            Err(_) => return Ok(None),
+        };
+        let sealed = Box::new(super::sealed::SealedPage {
+            metadata,
+            envelope,
+            aad,
+            key,
+            expected_crc: Some(checksum),
+            source: super::sealed::SealedSource::Staged { staged, token },
+        });
+        sealed.validate_for(page)?;
+        self.metrics.record(Event::DiskHit, 1);
+        Ok(Some(sealed))
+    }
+
+    /// Act on the GPU's verdict for a sealed page this worker supplied: a
+    /// rejected copy is dropped from memory and disk, as a failed CPU decrypt
+    /// would drop it; an authenticated network copy may now be persisted.
+    pub(crate) fn sealed_verdict(&self, report: super::sealed::SealedReport, passed: bool) {
+        let super::sealed::SealedReport { page, copy, token } = report;
+        if passed {
+            if let Some(copy) = copy
+                && copy.disk_token.is_none()
+            {
+                let observation = self.dependencies.writer.retention().owned_only(&page);
+                self.persist_copy(copy.copy, observation);
+            }
+            return;
+        }
+        self.metrics.record(Event::CorruptMiss, 1);
+        if let Some(copy) = &copy {
+            self.dependencies.memory.invalidate_ciphertext(copy);
+            if let Some(token) = &copy.disk_token {
+                let _ = self.dependencies.disk.invalidate(token);
+            }
+        }
+        if let Some(token) = &token {
+            let _ = self.dependencies.disk.invalidate(token);
         }
     }
 
@@ -2113,7 +2314,20 @@ impl Fill {
         if !observation.eligible() || result.validate_metadata().is_err() {
             return;
         }
-        let id = result.plaintext.page();
+        self.persist_copy(result.copy(), observation);
+    }
+
+    /// Queue an authenticated copy for disk under the reader's latched
+    /// retention decision. The caller must have authenticated the bytes.
+    fn persist_copy(
+        &self,
+        copy: crate::memory::CiphertextCopy,
+        observation: crate::retention::Observation,
+    ) {
+        if !observation.eligible() || copy.validate_metadata().is_err() {
+            return;
+        }
+        let id = &copy.ciphertext.envelope().page.clone();
         if self
             .dependencies
             .writer
@@ -2135,13 +2349,13 @@ impl Fill {
         {
             return;
         }
-        let cache = &result.metadata.version.object.cache;
+        let cache = &copy.metadata.version.object.cache.clone();
         let retention = self.dependencies.writer.retention();
         // Ownership is current here, but second-sight eligibility remains the
         // latched observation. Reclassification cannot self-promote Bloom state.
         let owned = retention.owned_only(id).eligible();
         let admission = &self.dependencies.admission;
-        let amount = result.ciphertext.bytes().len();
+        let amount = copy.ciphertext.bytes().len();
         // Optional pages of an over-share cache do not displace other caches'
         // data once free segments reach the reserve. Owned pages compete
         // through eviction instead.
@@ -2166,7 +2380,7 @@ impl Fill {
                 .reserve(Some(cache), ResourceClass::DirtyCiphertext, amount)
                 .map_err(Error::from)
         };
-        let page_charge = result
+        let page_charge = copy
             .ciphertext
             .inner
             .reservation()
@@ -2187,7 +2401,7 @@ impl Fill {
         let result = self
             .dependencies
             .writer
-            .enqueue_reclaiming(result.copy(), dirty, |amount| {
+            .enqueue_reclaiming(copy, dirty, |amount| {
                 // Ciphertext owns both the immutable page and its disk staging.
                 // The one-page floor includes BOTH, even on tiny slabs. The page
                 // term is the page's own Ciphertext charge, which for aligned

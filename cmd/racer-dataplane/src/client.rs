@@ -23,6 +23,7 @@ use crate::model::PageNumber;
 use crate::model::ResolvedRange;
 use crate::read::ReadPayload;
 use crate::read::ReadResponse;
+use crate::read::range_stream::DirectItem;
 use crate::read::range_stream::RangeStream;
 use crate::runtime::RequestScope;
 use crate::security::Authorization;
@@ -702,8 +703,13 @@ impl Responses {
             return Err(Error::InvalidRequest);
         }
         let mut first = if let ReadPayload::Stream(stream) = &mut response.payload {
-            match stream.next_slice().await {
-                Ok(Some(reader)) => Some(reader),
+            // A GPU sink that decrypts asks for sealed pages, so the CPU
+            // decrypts only pages it holds as plaintext anyway.
+            if let Some(target) = sink.sealed_target() {
+                stream.set_sealed(target)?;
+            }
+            match stream.next_direct().await {
+                Ok(Some(item)) => Some(item),
                 result => {
                     let error = result.err().unwrap_or(Error::BadGateway);
                     self.observer.record(
@@ -727,11 +733,11 @@ impl Responses {
             while sent < expected {
                 let mut progress_scope = scope.clone();
                 progress_scope.deadline.0 = uring_runtime::environment::now() + timeout;
-                let reader = match first.take() {
-                    Some(reader) => reader,
+                let item = match first.take() {
+                    Some(item) => item,
                     None => std::future::poll_fn(|cx| {
                         progress_scope.check()?;
-                        stream.next_slice().as_mut().poll(cx)
+                        stream.next_direct().as_mut().poll(cx)
                     })
                     .await
                     .inspect_err(|&error| {
@@ -745,7 +751,10 @@ impl Responses {
                     })?
                     .ok_or(Error::BadGateway)?,
                 };
-                let slice = reader.slice();
+                let slice = match &item {
+                    DirectItem::Plaintext(reader) => reader.slice(),
+                    DirectItem::Sealed(_, slice) => *slice,
+                };
                 if range.slice_at(slice.page)? != Some(slice)
                     || slice.length == 0
                     || u64::from(slice.length) > expected - sent
@@ -763,10 +772,29 @@ impl Responses {
                     .offset
                     .checked_add(offset - range.start())
                     .ok_or(Error::BadGateway)?;
+                // A plaintext lease must outlive the write that borrows it.
+                let reader;
                 {
-                    let mut write =
-                        sink.deliver(DirectPage::Plaintext(&reader), target, &progress_scope);
-                    std::future::poll_fn(|cx| {
+                    let (page, report) = match item {
+                        DirectItem::Plaintext(lease) => {
+                            reader = Some(lease);
+                            (DirectPage::Plaintext(reader.as_ref().unwrap()), None)
+                        }
+                        DirectItem::Sealed(sealed, _) => {
+                            reader = None;
+                            let report = sealed.report();
+                            let start = u64::from(slice.offset);
+                            (
+                                DirectPage::Sealed {
+                                    page: sealed,
+                                    range: start..start + u64::from(slice.length),
+                                },
+                                Some(report),
+                            )
+                        }
+                    };
+                    let mut write = sink.deliver(page, target, &progress_scope);
+                    let result = std::future::poll_fn(|cx| {
                         if let Poll::Ready(result) = write.as_mut().poll(cx) {
                             return Poll::Ready(result);
                         }
@@ -774,7 +802,19 @@ impl Responses {
                         stream.poll_prefetch(cx);
                         Poll::Pending
                     })
-                    .await?;
+                    .await;
+                    drop(write);
+                    if let Some(report) = report {
+                        // The owner drops a copy the GPU rejected, as it would
+                        // after a failed CPU decrypt, and may persist one it
+                        // accepted.
+                        match result {
+                            Ok(()) => stream.report_sealed(report, true),
+                            Err(Error::CorruptRecord) => stream.report_sealed(report, false),
+                            Err(_) => {}
+                        }
+                    }
+                    result?;
                 }
                 drop(reader);
                 // The page is written: no client credit gates its release.

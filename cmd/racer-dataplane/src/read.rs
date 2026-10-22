@@ -37,6 +37,7 @@ pub mod fill;
 pub mod flight;
 pub mod metadata;
 pub mod range_stream;
+pub mod sealed;
 pub mod warm;
 
 /// Metadata and its optional stream, with no independent range to disagree with it.

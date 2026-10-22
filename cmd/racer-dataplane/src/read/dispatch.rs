@@ -117,6 +117,16 @@ enum Work {
         std::sync::Arc<crate::topology::Membership>,
         PeerOriginContext,
     ),
+    /// One read window page for direct GPU delivery: like `Fetch`, but
+    /// ciphertext the GPU can verify is returned sealed.
+    FetchSealed(
+        PageId,
+        std::sync::Arc<crate::topology::Membership>,
+        PeerOriginContext,
+        super::sealed::SealedTarget,
+    ),
+    /// The GPU's verdict on a sealed page this worker supplied.
+    SealedVerdict(super::sealed::SealedReport, bool),
     Publish(VersionMetadata),
     Retained(ObjectVersion),
     Peer(VerifiedRequest, std::sync::Arc<crate::topology::Membership>),
@@ -125,6 +135,7 @@ enum Value {
     Held(bool, std::time::SystemTime, HoldEpoch),
     Metadata(ObjectMetadata),
     Page(PageResult),
+    Fetched(super::sealed::Fetched),
     Cached(Option<PageResult>),
     Published,
     Retained(Option<VersionMetadata>),
@@ -873,6 +884,72 @@ impl WorkerDirectory {
             Ok((value, budget))
         }))
     }
+    /// Like [`Self::start_page`], but ciphertext the GPU behind `target`
+    /// can verify comes back sealed instead of decrypted on the CPU.
+    pub(crate) fn start_page_sealed(
+        &self,
+        page: PageId,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        context: &OriginContext,
+        scope: &RequestScope,
+        budget: AcquisitionBudget,
+        target: super::sealed::SealedTarget,
+    ) -> Result<Operation<'static, (Result<super::sealed::Fetched>, AcquisitionBudget)>> {
+        if page.version.object != context.object {
+            return Err(Error::InvalidRequest);
+        }
+        let owner = self.page_owner(&page)?;
+        let receipt = self.submit(
+            owner,
+            Work::FetchSealed(page, membership, self.seal(context, scope)?, target),
+            scope,
+            Some(budget),
+        )?;
+        Ok(Box::pin(async move {
+            let completion = receipt.await?;
+            let budget = completion.budget.ok_or(Error::StaleFlight)?;
+            let value = completion.value.and_then(|value| match value {
+                Value::Fetched(value) => Ok(value),
+                _ => Err(Error::StaleFlight),
+            });
+            Ok((value, budget))
+        }))
+    }
+
+    /// Tell a sealed page's owner what the GPU decided, in the background.
+    pub(crate) fn report_sealed(
+        &self,
+        report: super::sealed::SealedReport,
+        passed: bool,
+        scope: &RequestScope,
+    ) {
+        let Ok(owner) = self.page_owner(&report.page) else {
+            return;
+        };
+        if self.is_local(owner) {
+            if let Ok(local) = self.local() {
+                local.fill.sealed_verdict(report, passed);
+            }
+            return;
+        }
+        let Ok(permit) = uring_runtime::drivers::reserve() else {
+            return;
+        };
+        // The request may already be ending; the verdict must still arrive.
+        let deadline = uring_runtime::environment::now() + std::time::Duration::from_secs(5);
+        let Ok(detached) = RequestScope::new(scope.request, deadline) else {
+            return;
+        };
+        if let Ok(receipt) =
+            self.submit(owner, Work::SealedVerdict(report, passed), &detached, None)
+        {
+            permit.submit_detached(Box::pin(async move {
+                let _ = receipt.await;
+                Ok::<(), Error>(())
+            }));
+        }
+    }
+
     pub fn publish_metadata<'a>(
         &'a self,
         metadata: VersionMetadata,
@@ -1228,6 +1305,30 @@ async fn execute(
                 )
                 .await
                 .map(Value::Page)
+        }
+        Work::FetchSealed(page, membership, envelope, target) => {
+            if let Warmed::Local(result) =
+                local.streams.directory().warmed_page(&page, scope).await?
+            {
+                return Ok(Value::Fetched(super::sealed::Fetched::Page(*result)));
+            }
+            let context = local.open_context(envelope)?;
+            local
+                .fill
+                .acquire_sealed(
+                    page,
+                    membership,
+                    &context,
+                    scope,
+                    budget.ok_or(Error::StaleFlight)?,
+                    &target,
+                )
+                .await
+                .map(Value::Fetched)
+        }
+        Work::SealedVerdict(report, passed) => {
+            local.fill.sealed_verdict(report, passed);
+            Ok(Value::Published)
         }
         Work::Publish(metadata) => {
             local.metadata.publish_version(metadata)?;

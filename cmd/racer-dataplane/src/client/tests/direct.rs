@@ -442,7 +442,9 @@ impl DirectSink for FakeSink {
         destination_offset: u64,
         _scope: &'a RequestScope,
     ) -> crate::error::Operation<'a, ()> {
-        let DirectPage::Plaintext(reader) = page;
+        let DirectPage::Plaintext(reader) = page else {
+            panic!("fake sink asks for plaintext only");
+        };
         let bytes = reader.slice_bytes().to_vec();
         let recorded = self.0.clone();
         Box::pin(async move {
