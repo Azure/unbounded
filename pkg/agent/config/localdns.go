@@ -17,7 +17,6 @@ import (
 const (
 	DefaultLocalDNSNodeListenerIP    = "169.254.10.10"
 	DefaultLocalDNSClusterListenerIP = "169.254.10.11"
-	DefaultLocalDNSMetricsPort       = "9253"
 	DefaultLocalDNSCPUMilliCores     = 2000
 	DefaultLocalDNSMemoryLimitMB     = 128
 )
