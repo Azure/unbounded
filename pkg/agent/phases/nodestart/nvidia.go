@@ -38,8 +38,8 @@ type setupNVIDIA struct {
 //     with the nspawn environment (e.g. mounting tmpfs over /proc paths, CUDA
 //     compat hooks on NVSwitch systems). Only create-symlinks and update-ldcache
 //     are retained.
-//  5. On Azure Linux, selects CDI runtime mode so UUID environment-variable
-//     requests from the device plugin resolve against the generated CDI spec.
+//  5. Selects CDI runtime mode so environment-variable requests from the
+//     device plugin resolve against the generated CDI spec.
 //
 // This task must run after StartNSpawnMachine (the machine must be booted and
 // the /run/host-nvidia/ bind mounts must be active) and before StartKubelet
@@ -84,10 +84,6 @@ func (s *setupNVIDIA) Do(ctx context.Context) error {
 }
 
 func (s *setupNVIDIA) configureContainerRuntime(ctx context.Context) error {
-	if !s.goalState.Nvidia.UseCDIRuntime {
-		return nil
-	}
-
 	if _, err := s.run(
 		ctx, s.log, s.goalState.MachineName,
 		goalstates.NvidiaCTKPath, "config",

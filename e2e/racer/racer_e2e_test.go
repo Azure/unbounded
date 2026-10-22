@@ -26,7 +26,10 @@ const (
 func TestObjectCacheFromAzureOrigin(t *testing.T) {
 	requireAzureEgress(t, containerURL+"/"+blobKey)
 
-	h := cluster(t)
+	h := newHarness(t)
+	h.setup()
+	h.buildImages()
+	h.install()
 
 	apis := []string{"s3", "azure"}
 
@@ -47,7 +50,15 @@ spec:
       containerURL: %s
 `, cacheName, containerURL))
 
-	h.installRacer()
+	// Cap dataplane threads for kind: automatic sizing scales with host cores.
+	// The operator seeds this ConfigMap once and preserves administrator edits,
+	// rolling the DaemonSet on change.
+	h.waitExists("configmap", "racer-dataplane-config", 5*time.Minute)
+	h.kubectl("-n", operatorNamespace, "patch", "configmap", "racer-dataplane-config", "--type=merge",
+		"-p", `{"data":{"RACER_MAX_THREADS":"2"}}`)
+
+	h.rollout("deployment", "racer-controller", 5*time.Minute)
+	h.rollout("daemonset", "racer-dataplane", 10*time.Minute)
 	h.rollout("daemonset", "racer-origin-"+cacheName, 5*time.Minute)
 	h.waitFor("sidecar injector webhook", 5*time.Minute, func() (bool, string) {
 		out, err := h.exec(time.Minute, nil, "kubectl", "get", "mutatingwebhookconfiguration",

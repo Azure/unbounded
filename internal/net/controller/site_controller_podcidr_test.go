@@ -30,6 +30,92 @@ import (
 
 const podCIDRTestNode = "node-a"
 
+func TestSyncNodeAssignmentDefaultsAndOverrides(t *testing.T) {
+	settings := []struct {
+		name  string
+		value *bool
+	}{
+		{"omitted", nil},
+		{"true", new(true)},
+		{"false", new(false)},
+	}
+	for _, manage := range settings {
+		for _, assignment := range settings {
+			for _, needsLabel := range []bool{false, true} {
+				t.Run(fmt.Sprintf("manage=%s/assignment=%s/needs-label=%v", manage.name, assignment.name, needsLabel), func(t *testing.T) {
+					h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
+					h.sites[0].Spec.NodeCidrs = []string{"10.0.0.0/16"}
+					h.sites[0].Spec.ManageCniPlugin = manage.value
+					h.sites[0].Spec.PodCidrAssignments[0].AssignmentEnabled = assignment.value
+					h.sc.sitesCache = h.sites
+					h.sc.updateAssignmentAllocators(h.sites)
+
+					h.cached.Status.Addresses = []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "10.0.0.5"}}
+					if !needsLabel {
+						h.cached.Labels = map[string]string{}
+						for _, key := range siteLabelKeys() {
+							h.cached.Labels[key] = "site-a"
+						}
+					}
+
+					if err := h.sc.syncNode(t.Context(), podCIDRTestNode); err != nil {
+						t.Fatal(err)
+					}
+
+					node, err := h.client.CoreV1().Nodes().Get(t.Context(), podCIDRTestNode, metav1.GetOptions{})
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					want := assignment.name == "true" || (assignment.name == "omitted" && manage.name != "false")
+					if want {
+						if len(node.Spec.PodCIDRs) != 1 || node.Spec.PodCIDRs[0] != "10.244.0.0/24" || len(h.patches) != 1 {
+							t.Fatalf("enabled assignment did not patch PodCIDRs: node=%+v patches=%d", node.Spec, len(h.patches))
+						}
+					} else {
+						wantPatches := 0
+						if needsLabel {
+							wantPatches = 1
+						}
+
+						if len(node.Spec.PodCIDRs) != 0 || len(h.patches) != wantPatches || h.sc.getAssignmentAllocator("site-a", 0) != nil || h.pending(podCIDRTestNode) != nil {
+							t.Fatalf("disabled assignment allocated or skipped labeling: node=%+v patches=%d", node.Spec, len(h.patches))
+						}
+					}
+
+					if needsLabel && !nodeSiteLabelsCurrent(node, "site-a") {
+						t.Fatal("assignment setting prevented site labeling")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestDisabledAssignmentReportsSiteLabelFailure(t *testing.T) {
+	h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
+	h.sites[0].Spec.ManageCniPlugin = new(false)
+	h.sc.sitesCache = h.sites
+	h.sc.updateAssignmentAllocators(h.sites)
+
+	expected := errors.New("site label patch failed")
+	h.failPatches(expected)
+
+	err := h.sc.assignPodCIDRsForNodeWithLabel(t.Context(), h.cached, h.sites, "site-a")
+	if !errors.Is(err, expected) || len(h.patches) != 1 {
+		t.Fatalf("site label failure not propagated: err=%v patches=%d", err, len(h.patches))
+	}
+
+	node, err := h.client.CoreV1().Nodes().Get(t.Context(), podCIDRTestNode, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(node.Spec.PodCIDRs) != 0 || len(node.Labels) != 0 || h.pending(podCIDRTestNode) != nil {
+		t.Fatal("failed label patch changed the Node or reserved PodCIDRs")
+	}
+}
+
 func TestAssignmentRejectsStaleSiteSnapshot(t *testing.T) {
 	for _, withLabel := range []bool{false, true} {
 		for _, change := range []string{"node-cidrs", "regex", "priority"} {

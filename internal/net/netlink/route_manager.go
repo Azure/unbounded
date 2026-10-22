@@ -66,7 +66,8 @@ type installedRouteState struct {
 	mtu          int
 	table        int
 	linkScope    bool
-	hasEncap     bool                      // true when route has lightweight tunnel encap
+	hasEncap     bool // true when route has lightweight tunnel encap
+	preferredSrc net.IP
 	peerNexthops map[string]DesiredNexthop // peerID -> nexthop info
 }
 
@@ -776,6 +777,7 @@ func (m *UnifiedRouteManager) buildInstalledState(dr DesiredRoute, active []Desi
 		table:        dr.Table,
 		linkScope:    isLinkScopeRoute(active),
 		hasEncap:     dr.Encap != nil,
+		preferredSrc: slices.Clone(m.preferredSrc(dr.Prefix)),
 		peerNexthops: peerNH,
 	}
 }
@@ -783,6 +785,10 @@ func (m *UnifiedRouteManager) buildInstalledState(dr DesiredRoute, active []Desi
 // routeNeedsUpdate returns true when the installed state differs from the
 // desired state plus the set of currently-active nexthops.
 func (m *UnifiedRouteManager) routeNeedsUpdate(installed *installedRouteState, desired DesiredRoute, activeNH []DesiredNexthop) bool {
+	if !ipEqual(installed.preferredSrc, m.preferredSrc(desired.Prefix)) {
+		return true
+	}
+
 	if installed.metric != desired.Metric || installed.mtu != desired.MTU {
 		return true
 	}

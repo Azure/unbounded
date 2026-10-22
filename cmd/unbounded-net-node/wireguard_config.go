@@ -272,6 +272,9 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 		return fmt.Errorf("failed to bring up WireGuard interface: %w", err)
 	}
 
+	// A delegated CNI can reset default.rp_filter after our init container.
+	disableRPFilter(iface)
+
 	// Accept forwarded traffic arriving on the mesh WG interface.
 	if state.forwardManager != nil {
 		state.forwardManager.EnsureInterface(iface)
@@ -476,6 +479,8 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 			klog.Errorf("Failed to bring up gateway interface %s: %v", gwIfaceName, err)
 			continue
 		}
+
+		disableRPFilter(gwIfaceName)
 
 		// Accept forwarded traffic arriving on the gateway WG interface.
 		if state.forwardManager != nil {

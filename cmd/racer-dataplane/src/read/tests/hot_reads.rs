@@ -555,6 +555,15 @@ mod duplex_release {
         for _ in 0..128 {
             pump(&mut endpoint);
         }
+        // A fixed pump count does not bound kernel completion latency. In eof mode the
+        // peer's SHUT_WR wakes the blocked send, and its EAGAIN retry can move to
+        // io-wq, where ASYNC_CANCEL completes asynchronously. Wait on the ring under
+        // a host watchdog until the abandoned write's fence drains.
+        let until = Instant::now() + Duration::from_secs(5);
+        while f.reactor.in_flight() != 0 && Instant::now() < until {
+            pump(&mut endpoint);
+            f.reactor.wait(Duration::from_millis(1)).unwrap();
+        }
         assert_eq!(
             f.reactor.in_flight(),
             0,

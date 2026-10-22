@@ -24,6 +24,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 
+	"github.com/Azure/unbounded/internal/net/ipam"
 	"github.com/Azure/unbounded/internal/version"
 )
 
@@ -78,6 +79,10 @@ func waitForPodCIDRsAndConfigure(ctx context.Context, clientset kubernetes.Inter
 
 		// Check if podCIDRs are already assigned
 		if len(node.Spec.PodCIDRs) > 0 {
+			if _, err := ipam.ConfigFromCIDRs(node.Spec.PodCIDRs); err != nil {
+				return nil, err
+			}
+
 			klog.V(4).Infof("Node %s has podCIDRs: %v", cfg.NodeName, node.Spec.PodCIDRs)
 
 			if err := guardedWriteCNIConfig(ctx, cfg, node.Spec.PodCIDRs, healthState); err != nil {
@@ -137,6 +142,11 @@ func waitForPodCIDRsAndConfigure(ctx context.Context, clientset kubernetes.Inter
 					}
 
 					if len(updatedNode.Spec.PodCIDRs) > 0 {
+						if _, err := ipam.ConfigFromCIDRs(updatedNode.Spec.PodCIDRs); err != nil {
+							watcher.Stop()
+							return nil, err
+						}
+
 						klog.Infof("Node %s podCIDRs assigned: %v", cfg.NodeName, updatedNode.Spec.PodCIDRs)
 						watcher.Stop()
 
@@ -204,10 +214,9 @@ func writeCNIConfigUnchecked(cfg *config, podCIDRs []string) error {
 }
 
 func doWriteCNIConfig(cfg *config, podCIDRs []string) error {
-	// Build IPAM ranges from podCIDRs
-	var ranges [][]IPRange
-	for _, cidr := range podCIDRs {
-		ranges = append(ranges, []IPRange{{Subnet: cidr}})
+	socketPath := cfg.IPAMSocketPath
+	if socketPath == ipam.DefaultSocketPath {
+		socketPath = ""
 	}
 
 	// Bridge MTU matches the configured WireGuard tunnel MTU (cfg.MTU is
@@ -229,8 +238,8 @@ func doWriteCNIConfig(cfg *config, podCIDRs []string) error {
 				HairpinMode:  true,
 				MTU:          bridgeMTU,
 				IPAM: &IPAMConfig{
-					Type:   "host-local",
-					Ranges: ranges,
+					Type:       "unbounded-ipam",
+					SocketPath: socketPath,
 				},
 			},
 			{

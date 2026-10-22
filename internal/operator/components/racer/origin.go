@@ -27,7 +27,6 @@ import (
 
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/operator/component"
-	"github.com/Azure/unbounded/internal/racer/workload"
 	"github.com/Azure/unbounded/internal/racerobject"
 )
 
@@ -258,7 +257,9 @@ func (m originMirror) clone() originMirror {
 // found is false while the dataplane DaemonSet does not exist yet: placement
 // overrides are applied after planning, so no safe placement is known and
 // callers must defer origins rather than guess one.
-// See workload.PlacementOf for why pod affinity rules are not copied.
+// Pod affinity and anti-affinity are not copied: they are relative to
+// dataplane Pods, and a rule such as hostname anti-affinity against
+// racer-dataplane would otherwise exclude origins from every dataplane node.
 func originPlacement(ctx context.Context, env *component.Env) (mirror originMirror, found bool, err error) {
 	ds := &appsv1.DaemonSet{}
 
@@ -273,10 +274,12 @@ func originPlacement(ctx context.Context, env *component.Env) (mirror originMirr
 
 	pod := ds.Spec.Template.Spec
 
-	placement := workload.PlacementOf(&pod)
-	mirror.affinity = placement.Affinity
-	mirror.nodeSelector = placement.NodeSelector
-	mirror.tolerations = placement.Tolerations
+	if pod.Affinity != nil && pod.Affinity.NodeAffinity != nil {
+		mirror.affinity = &corev1.Affinity{NodeAffinity: pod.Affinity.NodeAffinity.DeepCopy()}
+	}
+
+	mirror.nodeSelector = maps.Clone(pod.NodeSelector)
+	mirror.tolerations = slices.Clone(pod.Tolerations)
 	mirror.pullSecrets = slices.Clone(pod.ImagePullSecrets)
 
 	// Kubernetes adds ServiceAccount imagePullSecrets to admitted Pods, not

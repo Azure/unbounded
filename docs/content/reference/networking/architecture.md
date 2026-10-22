@@ -108,8 +108,9 @@ with the `manageCniPlugin` field.
 ### Configuring the Primary Site
 
 For the Site that maps to your existing cluster, set `manageCniPlugin: false`.
-This automatically disables pod CIDR assignment for that site regardless of the
-`assignmentEnabled` value on individual `podCidrAssignments` rules. The
+This disables pod CIDR assignment by default. An explicit
+`assignmentEnabled: true` on a `podCidrAssignments` rule still enables assignment
+without managing the existing CNI. The
 `podCidrAssignments` block is still required: it defines the CIDR ranges that the
 other sites and gateways use to route traffic back to the primary cluster's pods.
 
@@ -125,7 +126,7 @@ spec:
   # config or mesh same-site nodes, and pod CIDR assignment is disabled.
   manageCniPlugin: false
   podCidrAssignments:
-      # Pod CIDR assignment is disabled by manageCniPlugin: false, but the CIDR
+      # Omitted assignmentEnabled inherits false, but the CIDR
       # range is still declared so other sites can route to these pods.
     - cidrBlocks:
         - "10.244.0.0/16"
