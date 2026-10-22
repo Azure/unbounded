@@ -13,8 +13,7 @@
 //! - Dropping the [`Owner`] closes every queue and drops queued commands.
 //!   Commands own their [`Completer`]s, so their [`Op`]s resolve to
 //!   [`Error::Cancelled`]. Later sends fail with [`Error::Unavailable`].
-//! - Dropping a [`Worker`] keeps its queued commands for the owner, then the
-//!   owner sees the worker as gone through [`Owner::is_closed`].
+//! - Dropping a [`Worker`] keeps its queued commands for the owner to drain.
 //! - Dropping a [`Completer`] without completing resolves the [`Op`] to
 //!   [`Error::Cancelled`]. Dropping an [`Op`] makes [`Completer::complete`]
 //!   hand the value back so the owner can clean it up.
@@ -159,12 +158,6 @@ pub(crate) struct Owner<C> {
 }
 
 impl<C> Owner<C> {
-    /// Number of workers.
-    #[cfg_attr(not(test), allow(dead_code, reason = "used by tests and diagnostics"))]
-    pub(crate) fn workers(&self) -> usize {
-        self.channels.len()
-    }
-
     /// Hand up to `budget` queued commands to `handle` as
     /// `(worker index, command)`. Commands from one worker arrive in send
     /// order. Workers are visited round-robin, one command at a time.
@@ -172,7 +165,7 @@ impl<C> Owner<C> {
     /// Returns `Ready(n)` with `n > 0` if it handled anything, otherwise
     /// registers `cx` and returns `Pending`. Workers waiting for space are
     /// woken.
-    #[cfg_attr(not(test), allow(dead_code, reason = "used by tests and diagnostics"))]
+    #[cfg(test)]
     pub(crate) fn poll_drain(
         &mut self,
         cx: &mut Context<'_>,
@@ -199,8 +192,8 @@ impl<C> Owner<C> {
         self.waker.register(waker);
     }
 
-    /// Like [`Self::poll_drain`] without registering a waker. Returns how
-    /// many commands were handled.
+    /// Hand up to `budget` queued commands to `handle` without registering a
+    /// waker. Returns how many commands were handled.
     pub(crate) fn try_drain(&mut self, budget: usize, mut handle: impl FnMut(usize, C)) -> usize {
         self.drain(budget, &mut handle)
     }
@@ -243,7 +236,7 @@ impl<C> Owner<C> {
     }
 
     /// True once worker `index` is dropped and its queue is empty.
-    #[cfg_attr(not(test), allow(dead_code, reason = "used by tests and diagnostics"))]
+    #[cfg(test)]
     pub(crate) fn is_closed(&self, index: usize) -> bool {
         self.channels.get(index).is_none_or(|channel| {
             let queue = lock(&channel.queue);
@@ -469,7 +462,7 @@ mod tests {
         let (count, waker) = counter();
         let mut cx = Context::from_waker(&waker);
 
-        assert_eq!(owner.workers(), 1);
+        assert_eq!(owner.channels.len(), 1);
         assert!(op.poll(&mut cx).is_pending());
         assert!(workers[0].try_send(completer).is_ok());
 

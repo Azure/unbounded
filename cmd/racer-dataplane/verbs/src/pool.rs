@@ -118,12 +118,6 @@ unsafe impl Send for PoolShared {}
 unsafe impl Sync for PoolShared {}
 
 impl PoolShared {
-    /// Page buffer length.
-    #[cfg_attr(not(test), allow(dead_code, reason = "used by tests and diagnostics"))]
-    pub(crate) fn buffer_len(&self) -> usize {
-        self.buffer_len
-    }
-
     /// Number of page buffers.
     pub(crate) fn count(&self) -> usize {
         self.states.len()
@@ -180,14 +174,6 @@ impl PoolShared {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Buffer {
     index: u32,
-}
-
-impl Buffer {
-    /// Buffer index in the pool.
-    #[cfg_attr(not(test), allow(dead_code, reason = "used by tests and diagnostics"))]
-    pub(crate) fn index(&self) -> u32 {
-        self.index
-    }
 }
 
 /// The owner's side of one device's page buffers. Not `Send`.
@@ -464,10 +450,10 @@ mod tests {
         let (pool, charge) = pool(&sim, 2);
         let shared = pool.shared().clone();
         assert_eq!(shared.count(), 2);
-        assert_eq!(shared.buffer_len(), LEN);
+        assert_eq!(shared.buffer_len, LEN);
         assert_eq!(pool.region().length(), 2 * LEN + 100);
         let buffer = pool.take(BufferState::Binding).unwrap();
-        assert_eq!(buffer.index(), 0);
+        assert_eq!(buffer.index, 0);
         assert_eq!(pool.offset(&buffer), 0);
         assert_eq!(shared.state(0), BufferState::Binding);
         pool.set(&buffer, BufferState::Exposed);

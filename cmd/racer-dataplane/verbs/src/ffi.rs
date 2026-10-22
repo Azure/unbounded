@@ -1151,6 +1151,7 @@ impl NativeQueuePair {
     }
 
     /// The first completion that broke this QP, if any.
+    #[cfg(test)]
     pub(crate) fn failure(&self) -> Option<Failure> {
         self.failure.get()
     }

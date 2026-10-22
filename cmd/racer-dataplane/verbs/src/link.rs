@@ -20,8 +20,7 @@ use crate::{
     channel::{Completer, Op, op},
     control::{CONTROL_LEN, ControlKind, ControlMessage},
     ffi::{
-        Access, Failure, MemoryWindow, NativeDevice, NativeQueuePair, NativeRegion, WorkCompletion,
-        opcode,
+        Access, MemoryWindow, NativeDevice, NativeQueuePair, NativeRegion, WorkCompletion, opcode,
     },
     pool::{Buffer, BufferState, Pool, RegisteredPage},
 };
@@ -559,8 +558,8 @@ impl Link {
     }
 
     /// The first completion that broke the QP, if any.
-    #[cfg_attr(not(test), allow(dead_code, reason = "used by tests and diagnostics"))]
-    pub(crate) fn failure(&self) -> Option<Failure> {
+    #[cfg(test)]
+    pub(crate) fn failure(&self) -> Option<crate::ffi::Failure> {
         self.qp.failure()
     }
 
