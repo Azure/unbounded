@@ -414,10 +414,9 @@ func TestIntegrationFixedIDAndDelete(t *testing.T) {
 		t.Fatal("Delete of removed device succeeded")
 	}
 
-	if err := Delete(4000); err == nil {
-		t.Fatal("Delete of nonexistent device succeeded")
-	}
-
+	// Do not call Delete on a fixed id that this test did not create. Another
+	// process may own that device, and Delete would remove it. The Delete(id)
+	// call above covers a missing device.
 	if err := Delete(-1); err == nil {
 		t.Fatal("Delete(-1) succeeded")
 	}
