@@ -7,6 +7,9 @@ package ublk
 
 import (
 	"errors"
+	"log/slog"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -212,7 +215,7 @@ func TestHoldUntilSafeReturnsAfterStartup(t *testing.T) {
 	finished := make(chan struct{})
 
 	go func() {
-		q.holdUntilSafe()
+		q.holdUntilSafe(errServable{errors.New("x")})
 		close(finished)
 	}()
 
@@ -223,7 +226,7 @@ func TestHoldUntilSafeReturnsAfterStartup(t *testing.T) {
 	}
 }
 
-func TestWaitStartupOrLive(t *testing.T) {
+func TestWaitSafe(t *testing.T) {
 	never := func() (bool, error) { return false, nil }
 	noWarn := func(string, ...any) {}
 
@@ -235,18 +238,18 @@ func TestWaitStartupOrLive(t *testing.T) {
 			close(done)
 		}()
 
-		if got := waitStartupOrLive(done, never, time.Minute, noWarn); got != "resolved" {
-			t.Fatalf("got %q, want resolved", got)
+		if got := waitSafe(done, never, time.Minute, noWarn); got != holdResolved {
+			t.Fatalf("got %q, want %q", got, holdResolved)
 		}
 	})
 
-	t.Run("live", func(t *testing.T) {
+	t.Run("published", func(t *testing.T) {
 		var calls atomic.Int32
 
-		live := func() (bool, error) { return calls.Add(1) >= 3, nil }
+		probe := func() (bool, error) { return calls.Add(1) >= 3, nil }
 
-		if got := waitStartupOrLive(make(chan struct{}), live, time.Minute, noWarn); got != "live" {
-			t.Fatalf("got %q, want live", got)
+		if got := waitSafe(make(chan struct{}), probe, time.Minute, noWarn); got != holdPublished {
+			t.Fatalf("got %q, want %q", got, holdPublished)
 		}
 	})
 
@@ -256,7 +259,7 @@ func TestWaitStartupOrLive(t *testing.T) {
 
 		var calls atomic.Int32
 
-		live := func() (bool, error) {
+		probe := func() (bool, error) {
 			if calls.Add(1) == 3 {
 				close(done)
 			}
@@ -264,21 +267,171 @@ func TestWaitStartupOrLive(t *testing.T) {
 			return false, probeErr
 		}
 
-		if got := waitStartupOrLive(done, live, time.Minute, noWarn); got != "resolved" {
-			t.Fatalf("got %q, want resolved", got)
+		if got := waitSafe(done, probe, time.Minute, noWarn); got != holdResolved {
+			t.Fatalf("got %q, want %q", got, holdResolved)
+		}
+
+		if calls.Load() < 3 {
+			t.Fatalf("returned after %d probes, before startup resolved", calls.Load())
 		}
 	})
 
-	t.Run("timeout", func(t *testing.T) {
-		warned := false
-		warn := func(string, ...any) { warned = true }
+	t.Run("timeout warns and keeps holding", func(t *testing.T) {
+		done := make(chan struct{})
+		warned := make(chan struct{}, 4)
+		warn := func(string, ...any) { warned <- struct{}{} }
+		result := make(chan string, 1)
 
-		if got := waitStartupOrLive(make(chan struct{}), never, 30*time.Millisecond, warn); got != "timeout" {
-			t.Fatalf("got %q, want timeout", got)
+		go func() { result <- waitSafe(done, never, 20*time.Millisecond, warn) }()
+
+		select {
+		case <-warned:
+		case <-time.After(5 * time.Second):
+			t.Fatal("no warning after the warn interval")
 		}
 
-		if !warned {
-			t.Fatal("timeout was not logged")
+		select {
+		case got := <-result:
+			t.Fatalf("waitSafe released the ring after the warning: %q", got)
+		case <-time.After(100 * time.Millisecond):
+		}
+
+		if len(warned) != 0 {
+			t.Fatal("warned more than once")
+		}
+
+		close(done)
+
+		select {
+		case got := <-result:
+			if got != holdResolved {
+				t.Fatalf("got %q, want %q", got, holdResolved)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("waitSafe did not return after startup resolved")
 		}
 	})
+}
+
+func TestDiskPublished(t *testing.T) {
+	dir := t.TempDir()
+	present := filepath.Join(dir, "ublkb7")
+
+	if err := os.Mkdir(present, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	missing := filepath.Join(dir, "ublkb8")
+
+	for _, tc := range []struct {
+		name  string
+		state uint16
+		path  string
+		want  bool
+	}{
+		{"live and registered", ublkSDevLive, present, true},
+		{"live without block device", ublkSDevLive, missing, false},
+		{"registered but not live", 0, present, false},
+		{"neither", 0, missing, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := diskPublished(tc.state, tc.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if got != tc.want {
+				t.Fatalf("diskPublished = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("stat error is not published", func(t *testing.T) {
+		// A path through a regular file fails with ENOTDIR, not ENOENT.
+		file := filepath.Join(dir, "file")
+		if err := os.WriteFile(file, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		got, err := diskPublished(ublkSDevLive, filepath.Join(file, "x"))
+		if err == nil || got {
+			t.Fatalf("diskPublished = %v, %v, want false and an error", got, err)
+		}
+	})
+}
+
+// TestHoldUntilSafeBrokenWaitsForPublication checks that a failure which
+// may have lost a request skips the EIO loop and holds until the probe
+// reports the disk published, ignoring error and LIVE-only results.
+func TestHoldUntilSafeBrokenWaitsForPublication(t *testing.T) {
+	d, _, _ := newStartupDevice(t)
+	d.cfg.Logger = slog.New(slog.DiscardHandler)
+	q := &queue{dev: d}
+
+	var calls atomic.Int32
+
+	testHooks.published = func() (bool, error) {
+		switch calls.Add(1) {
+		case 1:
+			return false, errors.New("control device unavailable")
+		case 2, 3:
+			return false, nil // LIVE without a registered block device
+		default:
+			return true, nil
+		}
+	}
+	testHooks.serveEIO = func(*queue) error {
+		t.Error("EIO loop used after a failure that may have lost a request")
+		return nil
+	}
+
+	t.Cleanup(func() {
+		testHooks.published = nil
+		testHooks.serveEIO = nil
+	})
+
+	if got := q.holdUntilSafe(errors.New("commit failed")); got != holdPublished {
+		t.Fatalf("holdUntilSafe = %q, want %q", got, holdPublished)
+	}
+
+	if calls.Load() < 4 {
+		t.Fatalf("released after %d probes, before publication", calls.Load())
+	}
+
+	if isClosed(d.startDone) {
+		t.Fatal("startup unexpectedly resolved")
+	}
+}
+
+// TestHoldUntilSafeServableFallsBackWhenBroken checks that a servable
+// failure whose EIO loop fails takes the broken path and still waits
+// for publication.
+func TestHoldUntilSafeServableFallsBackWhenBroken(t *testing.T) {
+	d, _, _ := newStartupDevice(t)
+	d.cfg.Logger = slog.New(slog.DiscardHandler)
+	q := &queue{dev: d}
+
+	var (
+		eioCalls atomic.Int32
+		probes   atomic.Int32
+	)
+
+	testHooks.serveEIO = func(*queue) error {
+		eioCalls.Add(1)
+		return errors.New("ring broken")
+	}
+	testHooks.published = func() (bool, error) { return probes.Add(1) >= 2, nil }
+
+	t.Cleanup(func() {
+		testHooks.published = nil
+		testHooks.serveEIO = nil
+	})
+
+	if got := q.holdUntilSafe(errServable{errors.New("fault")}); got != holdPublished {
+		t.Fatalf("holdUntilSafe = %q, want %q", got, holdPublished)
+	}
+
+	if eioCalls.Load() != 1 || probes.Load() < 2 {
+		t.Fatalf("eio=%d probes=%d, want EIO attempt then probing", eioCalls.Load(), probes.Load())
+	}
 }
