@@ -5,8 +5,11 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"net"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -36,6 +39,24 @@ func fakeClient(objs ...client.Object) client.Client {
 		WithScheme(fakeScheme()).
 		WithObjects(objs...).
 		Build()
+}
+
+type flakyGetClient struct {
+	client.Client
+	errs  []error
+	calls int
+}
+
+func (c *flakyGetClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	c.calls++
+	if len(c.errs) > 0 {
+		err := c.errs[0]
+		c.errs = c.errs[1:]
+
+		return err
+	}
+
+	return c.Client.Get(ctx, key, obj, opts...)
 }
 
 // ---------------------------------------------------------------------------
@@ -181,4 +202,98 @@ func Test_registerMachine_Labels_Preserved(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, map[string]string{"env": "prod", "zone": "us-west"}, machine.Spec.Kubernetes.NodeLabels)
 	assert.Equal(t, []string{"gpu=true:NoSchedule"}, machine.Spec.Kubernetes.RegisterWithTaints)
+}
+
+func TestRegisterMachineWithRetryRetriesTransientNetworkFailure(t *testing.T) {
+	t.Parallel()
+
+	cfg := baseConfig()
+	existing := buildMachineCR(cfg)
+	c := &flakyGetClient{
+		Client: fakeClient(&existing),
+		errs: []error{
+			&net.DNSError{Err: "timeout", IsTimeout: true},
+		},
+	}
+
+	var delays []time.Duration
+
+	err := registerMachineWithRetry(t.Context(), discardLogger(), c, cfg, func(_ context.Context, delay time.Duration) error {
+		delays = append(delays, delay)
+
+		return nil
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, 2, c.calls)
+	assert.Equal(t, []time.Duration{daemonRegistrationRetryDelay}, delays)
+}
+
+func TestRegisterMachineWithRetryDoesNotRetryPermanentFailure(t *testing.T) {
+	t.Parallel()
+
+	cfg := baseConfig()
+	permanentErr := errors.New("forbidden")
+	c := &flakyGetClient{
+		Client: fakeClient(),
+		errs:   []error{permanentErr},
+	}
+
+	err := registerMachineWithRetry(t.Context(), discardLogger(), c, cfg, func(context.Context, time.Duration) error {
+		t.Fatal("wait called for permanent failure")
+
+		return nil
+	})
+
+	require.ErrorIs(t, err, permanentErr)
+	assert.Equal(t, 1, c.calls)
+}
+
+func TestRegisterMachineWithRetryStopsAfterBoundedAttempts(t *testing.T) {
+	t.Parallel()
+
+	cfg := baseConfig()
+	networkErr := &net.DNSError{Err: "timeout", IsTimeout: true}
+	c := &flakyGetClient{
+		Client: fakeClient(),
+		errs: []error{
+			networkErr,
+			networkErr,
+			networkErr,
+		},
+	}
+
+	var delays []time.Duration
+
+	err := registerMachineWithRetry(t.Context(), discardLogger(), c, cfg, func(_ context.Context, delay time.Duration) error {
+		delays = append(delays, delay)
+
+		return nil
+	})
+
+	require.ErrorIs(t, err, networkErr)
+	assert.Equal(t, daemonRegistrationMaxAttempts, c.calls)
+	assert.Equal(t, []time.Duration{
+		daemonRegistrationRetryDelay,
+		2 * daemonRegistrationRetryDelay,
+	}, delays)
+}
+
+func TestRegisterMachineWithRetryHonorsCancellation(t *testing.T) {
+	t.Parallel()
+
+	cfg := baseConfig()
+	c := &flakyGetClient{
+		Client: fakeClient(),
+		errs: []error{
+			&net.DNSError{Err: "timeout", IsTimeout: true},
+		},
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	err := registerMachineWithRetry(ctx, discardLogger(), c, cfg, waitForRegistrationRetry)
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, 1, c.calls)
 }
