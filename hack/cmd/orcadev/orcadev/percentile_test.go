@@ -8,22 +8,22 @@ import (
 	"time"
 )
 
-func TestPercentile(t *testing.T) {
+func TestPercentileSorted(t *testing.T) {
 	t.Parallel()
 
-	// Inputs are intentionally unsorted to exercise the in-place
-	// sort path.
+	// percentileSorted requires ascending input; computeLatencyStats is what
+	// sorts before calling it.
 	samples := func() []time.Duration {
 		return []time.Duration{
-			10 * time.Millisecond,
 			1 * time.Millisecond,
-			5 * time.Millisecond,
-			100 * time.Millisecond,
-			3 * time.Millisecond,
-			50 * time.Millisecond,
-			7 * time.Millisecond,
-			20 * time.Millisecond,
 			2 * time.Millisecond,
+			3 * time.Millisecond,
+			5 * time.Millisecond,
+			7 * time.Millisecond,
+			10 * time.Millisecond,
+			20 * time.Millisecond,
+			50 * time.Millisecond,
+			100 * time.Millisecond,
 			200 * time.Millisecond,
 		}
 	}
@@ -42,19 +42,19 @@ func TestPercentile(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := percentile(samples(), tt.v)
+			got := percentileSorted(samples(), tt.v)
 			if got != tt.want {
-				t.Errorf("percentile(%v) = %v want %v", tt.v, got, tt.want)
+				t.Errorf("percentileSorted(%v) = %v want %v", tt.v, got, tt.want)
 			}
 		})
 	}
 }
 
-func TestPercentile_Empty(t *testing.T) {
+func TestPercentileSorted_Empty(t *testing.T) {
 	t.Parallel()
 
-	if got := percentile([]time.Duration{}, 50); got != 0 {
-		t.Errorf("percentile on empty samples = %v want 0", got)
+	if got := percentileSorted([]time.Duration{}, 50); got != 0 {
+		t.Errorf("percentileSorted on empty samples = %v want 0", got)
 	}
 }
 
