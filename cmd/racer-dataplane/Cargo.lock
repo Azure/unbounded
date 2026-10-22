@@ -868,6 +868,7 @@ dependencies = [
  "prost",
  "racer-control-wire",
  "racer-crypto",
+ "racer-gpu",
  "racer-object-wire",
  "rcgen",
  "rdma-verbs",
