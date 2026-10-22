@@ -227,19 +227,20 @@ check_family() {
 }
 
 # apt_setup DIR RELEASE writes a private APT configuration under DIR that
-# reads only RELEASE from ARCHIVE_URL, verified with ARCHIVE_KEYRING.
+# reads only RELEASE from ARCHIVE_URL, verified with ARCHIVE_KEYRING. Every
+# step is checked so a failure returns nonzero even where errexit is off, such
+# as inside a command substitution or an "||" list.
 apt_setup() {
-	local dir="$1" release="$2" suite
-	rm -rf "$dir"
+	local dir="$1" release="$2" suite abs
+	rm -rf "$dir" || return 1
 	mkdir -p "$dir/etc/apt.conf.d" "$dir/etc/preferences.d" "$dir/etc/trusted.gpg.d" \
-		"$dir/etc/sources.list.d" "$dir/state/lists/partial" "$dir/cache/archives/partial"
-	: >"$dir/state/status"
-	local abs
-	abs="$(cd "$dir" && pwd)"
+		"$dir/etc/sources.list.d" "$dir/state/lists/partial" "$dir/cache/archives/partial" || return 1
+	: >"$dir/state/status" || return 1
+	abs="$(cd "$dir" && pwd)" || return 1
 	for suite in "$release" "$release-updates" "$release-security"; do
 		echo "deb [arch=amd64 signed-by=$ARCHIVE_KEYRING] $ARCHIVE_URL $suite main"
-	done >"$dir/etc/sources.list"
-	cat >"$dir/apt.conf" <<EOF
+	done >"$dir/etc/sources.list" || return 1
+	cat >"$dir/apt.conf" <<EOF || return 1
 Dir "/";
 Dir::Etc "$abs/etc";
 Dir::Etc::main "/dev/null";
@@ -286,8 +287,12 @@ fetch_kernel() {
 	require_tools apt-cache apt-get dpkg-deb
 	release="$(kernel_release "$GUEST_KERNEL")" || exit 1
 	[[ -r "$ARCHIVE_KEYRING" ]] || die "archive keyring $ARCHIVE_KEYRING not readable"
-	apt_setup "$aptdir" "$release"
-	APT_CONFIG="$(cd "$aptdir" && pwd)/apt.conf"
+	# main calls this inside $(...), where errexit is off, so check each step
+	# explicitly. Without a private config, apt-get would read the host's.
+	apt_setup "$aptdir" "$release" || die "cannot create private APT configuration in $aptdir"
+	APT_CONFIG="$(cd "$aptdir" && pwd)" || die "cannot resolve $aptdir"
+	APT_CONFIG+=/apt.conf
+	[[ -f "$APT_CONFIG" && -f "$aptdir/etc/sources.list" ]] || die "private APT configuration missing in $aptdir"
 	export APT_CONFIG
 	log "updating private APT lists for $release"
 	timeout --signal=TERM --kill-after=10s 300s apt-get -q update >&2 ||
@@ -645,6 +650,36 @@ deb [arch=amd64 signed-by=/k.gpg] http://a/ubuntu resolute-security main" ]]; th
 		log "self-test apt_setup: config reads host APT files or allows unsigned data"
 		rc=1
 	fi
+
+	# A failed private APT setup must stop fetch_kernel before any apt-get or
+	# apt-cache call, even inside the command substitution main uses, where
+	# errexit does not apply. Stubs record calls instead of touching APT.
+	mkdir -p "$dir/stub"
+	for got in apt-get apt-cache dpkg-deb; do
+		printf '#!/bin/sh\necho "%s $*" >>%q\nexit 1\n' "$got" "$dir/apt-calls" >"$dir/stub/$got"
+		chmod +x "$dir/stub/$got"
+	done
+	: >"$dir/keyring.gpg"
+	: >"$dir/not-a-dir"
+	for got in stub-fails mkdir-fails; do
+		rm -f "$dir/apt-calls"
+		(
+			PATH="$dir/stub:$PATH"
+			ARCHIVE_KEYRING="$dir/keyring.gpg"
+			work="$dir/fetch"
+			if [[ "$got" == stub-fails ]]; then
+				apt_setup() { return 1; }
+			else
+				work="$dir/not-a-dir"
+			fi
+			version="$(WORK_DIR="$work" fetch_kernel | tail -n 1)"
+			[[ -z "$version" ]] || exit 0
+		) >/dev/null 2>&1 || true
+		if [[ -e "$dir/apt-calls" ]]; then
+			log "self-test fetch_kernel $got: APT ran after setup failed: $(tr '\n' ';' <"$dir/apt-calls")"
+			rc=1
+		fi
+	done
 
 	if (PATH=/nonexistent require_tools qemu-system-x86_64) 2>/dev/null; then
 		log "self-test missing-tools: want failure"
