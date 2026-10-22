@@ -1161,8 +1161,10 @@ impl<P: Policy> Quotas<P> {
         let retirement_key = key.clone();
         let map_key = key.clone();
         let limit = self.policy.max_keys();
+        // Sample the weight while unborrowed: the policy may reenter Quotas.
+        let weight = self.key_weight(key);
         let mut keys = self.keys.borrow_mut();
-        // Either clone may have installed this key or filled the table.
+        // Either clone or the weight callback may have installed this key or filled the table.
         if let Some(counts) = keys.get(key).and_then(Weak::upgrade) {
             return Ok(counts);
         }
@@ -1171,7 +1173,6 @@ impl<P: Policy> Quotas<P> {
             drop(keys);
             return Err(self.report_rejection(Rejection::Keys { used, limit }));
         }
-        let weight = self.key_weight(key);
         let counts = Arc::new(Counters::keyed(
             P::Class::COUNT,
             retirement_key,
@@ -2314,6 +2315,87 @@ mod quota_tests {
         assert_eq!(quotas.active_weight(), 0);
         quotas.reweigh();
         assert_eq!(quotas.active_weight(), 0);
+    }
+
+    /// `Policy::weight` may reenter the authority while a new key activates.
+    #[test]
+    fn weight_callback_may_reenter_quotas() {
+        use std::{
+            cell::{Cell, RefCell},
+            rc::Weak as RcWeak,
+        };
+
+        /// Reenters fair-share queries and nested keyed admission from `weight`.
+        struct WeightPolicy {
+            quotas: RefCell<RcWeak<Quotas<WeightPolicy>>>,
+
+            nested: RefCell<Vec<Charge<WeightPolicy>>>,
+
+            reentered: Cell<bool>,
+        }
+
+        impl Policy for WeightPolicy {
+            type Class = Resource;
+
+            type Key = String;
+
+            /// Fixed aggregate ceiling.
+            fn limit(&self, _: Resource) -> usize {
+                100
+            }
+
+            /// Query and install other keys while the outer key activates.
+            fn weight(&self, key: &String) -> u64 {
+                if key == "outer" && !self.reentered.replace(true) {
+                    let quotas = self.quotas.borrow().upgrade().unwrap();
+                    let _ = quotas.fair_limit(&"outer".into(), Resource::Other);
+                    let nested = quotas
+                        .reserve(Some(&"nested".into()), Resource::Other, 1)
+                        .unwrap();
+                    self.nested.borrow_mut().push(nested);
+                }
+                if key == "outer" { 3 } else { 1 }
+            }
+
+            /// Room for both keys only.
+            fn max_keys(&self) -> usize {
+                2
+            }
+
+            /// No waiter is needed.
+            fn wakes(_: Resource) -> bool {
+                false
+            }
+
+            /// No page backing.
+            fn covers(_: Resource) -> bool {
+                false
+            }
+
+            /// Every admission must succeed.
+            fn rejected(&self, _: Rejection<Resource>) {
+                panic!("unexpected rejection");
+            }
+        }
+
+        let quotas = Rc::new(Quotas::new(WeightPolicy {
+            quotas: RefCell::default(),
+            nested: RefCell::default(),
+            reentered: Cell::default(),
+        }));
+        *quotas.policy.quotas.borrow_mut() = Rc::downgrade(&quotas);
+        let outer = quotas
+            .reserve(Some(&"outer".into()), Resource::Other, 1)
+            .unwrap();
+        assert_eq!(quotas.policy.nested.borrow().len(), 1);
+        assert_eq!(quotas.active_weight(), 4);
+        assert_eq!(quotas.used(Resource::Other), 2);
+        assert_eq!(quotas.fair_limit(&"outer".into(), Resource::Other), 75);
+        assert_eq!(quotas.fair_limit(&"nested".into(), Resource::Other), 25);
+        drop(outer);
+        quotas.policy.nested.borrow_mut().clear();
+        assert_eq!(quotas.active_weight(), 0);
+        assert_eq!(quotas.used(Resource::Other), 0);
     }
 
     /// Large limits and clamped weights do not overflow.
