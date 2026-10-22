@@ -159,10 +159,22 @@ racer-block device as slab storage, it would read its own cache through itself.
   racer-block on it, and compares device reads with the object bytes.
 
 The `Racer Block Device` CI job runs both device suites as root with the race
-detector. It requires the ublk kernel module, so missing support fails the job
-instead of skipping the tests.
+detector inside a QEMU guest. The guest boots the Ubuntu 24.04 generic 6.8
+kernel and loads `ublk_drv`, so a kernel bug cannot hang the runner. The job
+fails if a suite fails, hangs, or skips because root, ublk, or io_uring is
+missing. The guest sets `RACER_BLOCK_TEST_VM=1`, which enables tests that are
+unsafe on a shared host. Run the same check locally without root:
 
-Run the privileged tests as root:
+```
+go test -race -c -o bin/racer-block-tests/ublk.test ./internal/racerblock/ublk
+go test -race -c -o bin/racer-block-tests/racerblock.test ./internal/racerblock
+hack/scripts/racer-block-vm-test.sh run
+```
+
+The script needs `qemu-system-x86_64`, `busybox-static`, `cpio`, and `zstd`.
+It uses KVM when `/dev/kvm` is writable. See the script header for options.
+
+To run the tests directly on a host, as root:
 
 ```
 sudo modprobe ublk_drv
