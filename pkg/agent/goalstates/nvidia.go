@@ -138,11 +138,10 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 		return NvidiaHost{}, fmt.Errorf("unsupported architecture %q for NVIDIA library discovery", arch)
 	}
 
-	hostDistro, useCDIRuntime := detectNVIDIAHostOS()
+	useCDIRuntime := detectNVIDIAUseCDIRuntime()
 	initDeps := defaultNvidiaDeviceInitDeps()
-	initDeps.hostDistro = func() string { return hostDistro }
 
-	if err := initializeAzureLinuxNVIDIADevices(initDeps); err != nil {
+	if err := initializeNVIDIADevices(initDeps); err != nil {
 		return NvidiaHost{}, err
 	}
 
@@ -164,15 +163,13 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 	}, nil
 }
 
-func detectNVIDIAHostOS() (string, bool) {
+func detectNVIDIAUseCDIRuntime() bool {
 	data, err := os.ReadFile(hostOSReleasePath)
 	if err != nil {
-		return "", false
+		return false
 	}
 
-	values := osReleaseValues(data)
-
-	return hostDistroFromOSReleaseValues(values), useNVIDIACDIRuntime(values)
+	return useNVIDIACDIRuntime(osReleaseValues(data))
 }
 
 func useNVIDIACDIRuntime(osRelease map[string]string) bool {
@@ -196,7 +193,6 @@ const (
 )
 
 type nvidiaDeviceInitDeps struct {
-	hostDistro    func() string
 	pciDevicesDir string
 	deviceDir     string
 	readDir       func(string) ([]os.DirEntry, error)
@@ -208,7 +204,6 @@ type nvidiaDeviceInitDeps struct {
 
 func defaultNvidiaDeviceInitDeps() nvidiaDeviceInitDeps {
 	return nvidiaDeviceInitDeps{
-		hostDistro:    detectHostDistro,
 		pciDevicesDir: "/sys/bus/pci/devices",
 		deviceDir:     devDir,
 		readDir:       os.ReadDir,
@@ -225,21 +220,25 @@ func defaultNvidiaDeviceInitDeps() nvidiaDeviceInitDeps {
 	}
 }
 
-func initializeAzureLinuxNVIDIADevices(deps nvidiaDeviceInitDeps) error {
-	if deps.hostDistro() != hostDistroAzureLinux3 || !hasNVIDIADisplayHardware(deps) {
+func initializeNVIDIADevices(deps nvidiaDeviceInitDeps) error {
+	if !hasNVIDIADisplayHardware(deps) {
+		return nil
+	}
+
+	if validateNVIDIADeviceNodes(deps) == nil {
 		return nil
 	}
 
 	modprobe, err := deps.lookPath(nvidiaModprobeBinary)
 	if err != nil {
-		return fmt.Errorf("locate %s on Azure Linux NVIDIA host: %w", nvidiaModprobeBinary, err)
+		return fmt.Errorf("locate %s on NVIDIA host: %w", nvidiaModprobeBinary, err)
 	}
 
 	for _, args := range [][]string{{"-u", "-c0"}, {"-m"}} {
 		output, runErr := deps.runCommand(modprobe, args...)
 		if runErr != nil {
 			return fmt.Errorf(
-				"run %s %s on Azure Linux NVIDIA host: %w: %s",
+				"run %s %s on NVIDIA host: %w: %s",
 				modprobe,
 				strings.Join(args, " "),
 				runErr,
@@ -249,7 +248,7 @@ func initializeAzureLinuxNVIDIADevices(deps nvidiaDeviceInitDeps) error {
 	}
 
 	if err := validateNVIDIADeviceNodes(deps); err != nil {
-		return fmt.Errorf("validate Azure Linux NVIDIA device initialization: %w", err)
+		return fmt.Errorf("validate NVIDIA device initialization: %w", err)
 	}
 
 	return nil
