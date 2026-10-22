@@ -67,7 +67,7 @@ struct rdma_verbs_qp { struct ibv_qp *qp; struct ibv_cq *cq; };
 struct rdma_verbs_mr { struct ibv_mr *mr; void *bytes; size_t length; };
 
 /* ABI version. Rust refuses to load any other value. */
-uint32_t rdma_verbs_abi(void) { return 3; }
+uint32_t rdma_verbs_abi(void) { return 4; }
 
 /* Distinct from negative errno: cleanup leaked a resource. Rust must keep
  * the admission owner and adapter loaded. Stop before another resource leaks. */
@@ -311,23 +311,11 @@ int rdma_verbs_bind(struct rdma_verbs_qp *q, struct ibv_mw *mw, struct rdma_verb
     wr.bind_mw.bind_info.mw_access_flags = IBV_ACCESS_REMOTE_WRITE;
     return ibv_post_send(q->qp, &wr, &bad);
 }
-/* Post an invalidate of `key`, with IBV_SEND_FENCE. */
+/* Post a signaled LOCAL_INV of `key`. Not fenced. */
 int rdma_verbs_invalidate(struct rdma_verbs_qp *q, uint32_t key, uint64_t id) {
     struct ibv_send_wr wr = {0}, *bad = NULL;
     wr.wr_id = id; wr.opcode = IBV_WR_LOCAL_INV;
     wr.send_flags = IBV_SEND_SIGNALED; wr.invalidate_rkey = key;
-    return ibv_post_send(q->qp, &wr, &bad);
-}
-/* Post an RDMA write of the first `length` bytes of `m` to the peer's
- * `address`, using its window `key`. */
-int rdma_verbs_write(struct rdma_verbs_qp *q, struct rdma_verbs_mr *m, uint64_t address,
-                     uint32_t key, uint64_t id, uint32_t length) {
-    if (!length || length > m->length) return EINVAL;
-    struct ibv_sge sge = { .addr = (uintptr_t)m->bytes, .length = length, .lkey = m->mr->lkey };
-    struct ibv_send_wr wr = {0}, *bad = NULL;
-    wr.wr_id = id; wr.opcode = IBV_WR_RDMA_WRITE;
-    wr.send_flags = IBV_SEND_SIGNALED; wr.sg_list = &sge; wr.num_sge = 1;
-    wr.wr.rdma.remote_addr = address; wr.wr.rdma.rkey = key;
     return ibv_post_send(q->qp, &wr, &bad);
 }
 /* Post a signaled RDMA write with immediate of `length` bytes of `m` at

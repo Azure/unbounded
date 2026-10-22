@@ -31,7 +31,7 @@
 //! - A remote access error, RNR, or receive length error moves both QPs to the
 //!   error state. Any failed completion moves its own QP there. A QP in the
 //!   error state flushes every posted work request with `IBV_WC_WR_FLUSH_ERR`.
-//! - Until a QP is stopped (destroyed), plain RDMA writes through a live grant
+//! - Until a QP is stopped (destroyed), RDMA writes through its live grants
 //!   still land, even in the error state, so tests stay conservative about
 //!   late DMA.
 //! - Window keys are `index << 8 | generation`, like `ibv_inc_rkey`. A bind
@@ -120,8 +120,6 @@ pub enum Operation {
 
     Invalidate,
 
-    Write,
-
     WriteImm,
 
     Send,
@@ -137,7 +135,7 @@ pub enum Fault {
     /// Fail the call itself. Nothing changes.
     Reject,
 
-    /// Hold a Bind, Invalidate, or Write for this many polls.
+    /// Hold a send-queue request for this many polls.
     Delay(usize),
 
     /// Complete a send-queue request with this error status (nonzero).
@@ -341,16 +339,6 @@ enum Action {
         key: u32,
     },
 
-    Write {
-        region: u32,
-
-        address: u64,
-
-        key: u32,
-
-        length: u32,
-    },
-
     WriteImm {
         region: u32,
 
@@ -380,7 +368,6 @@ impl Action {
         match self {
             Self::Bind { .. } => Operation::Bind,
             Self::Invalidate { .. } => Operation::Invalidate,
-            Self::Write { .. } => Operation::Write,
             Self::WriteImm { .. } => Operation::WriteImm,
             Self::Send { .. } => Operation::Send,
         }
@@ -391,7 +378,7 @@ impl Action {
         match self {
             Self::Bind { .. } => 5,
             Self::Invalidate { .. } => 6,
-            Self::Write { .. } | Self::WriteImm { .. } => 1,
+            Self::WriteImm { .. } => 1,
             Self::Send { .. } => 0,
         }
     }
@@ -401,9 +388,7 @@ impl Action {
         match *self {
             Self::Bind { window, region, .. } => window == id || region == id,
             Self::Invalidate { key } => window_of(key) == id,
-            Self::Write { region, .. }
-            | Self::WriteImm { region, .. }
-            | Self::Send { region, .. } => region == id,
+            Self::WriteImm { region, .. } | Self::Send { region, .. } => region == id,
         }
     }
 }
@@ -470,11 +455,7 @@ impl Simulation {
     pub fn fault_on(&self, operation: Operation, qpn: Option<u32>, fault: Fault) {
         let send_queue = matches!(
             operation,
-            Operation::Bind
-                | Operation::Invalidate
-                | Operation::Write
-                | Operation::WriteImm
-                | Operation::Send
+            Operation::Bind | Operation::Invalidate | Operation::WriteImm | Operation::Send
         );
         let delivers = matches!(operation, Operation::WriteImm | Operation::Send);
         assert!(match fault {
@@ -563,7 +544,6 @@ pub(super) fn api() -> Rc<Api> {
         window_free,
         bind,
         invalidate,
-        write,
         write_imm,
         send,
         post_recv,
@@ -751,9 +731,6 @@ impl World {
                             Some(Resource::Window { grant: None, key: last, .. }) if *last != Some(key)
                         )
                         && self.region_fits(region, offset, length)
-                }
-                Action::Write { region, length, .. } => {
-                    self.device(region) == device && self.region_fits(region, 0, length)
                 }
                 Action::WriteImm {
                     region,
@@ -1050,17 +1027,6 @@ impl World {
                     return 0;
                 }
                 wc::REM_ACCESS_ERR
-            }
-            Action::Write {
-                region,
-                address,
-                key,
-                length,
-            } => {
-                let Some(data) = self.read(region, 0, length) else {
-                    return wc::LOC_PROT_ERR;
-                };
-                self.remote(qp, |world| world.place(qp, &data, address, key))
             }
             Action::WriteImm {
                 region,
@@ -1529,37 +1495,6 @@ unsafe extern "C" fn invalidate(qp: *mut c_void, key: u32, id: u64) -> c_int {
         .post(q.id, id, Action::Invalidate { key })
 }
 
-/// Queue a write. The remote key is checked when it completes.
-unsafe extern "C" fn write(
-    qp: *mut c_void,
-    region: *mut c_void,
-    address: u64,
-    key: u32,
-    id: u64,
-    length: u32,
-) -> c_int {
-    let (Some(q), Some(r)) = (unsafe { (handle(qp), handle(region)) }) else {
-        return -1;
-    };
-    if !Rc::ptr_eq(&q.sim.world, &r.sim.world) {
-        q.sim
-            .world
-            .borrow_mut()
-            .record(Operation::Write, q.id, Some(id), -1, false);
-        return -1;
-    }
-    q.sim.world.borrow_mut().post(
-        q.id,
-        id,
-        Action::Write {
-            region: r.id,
-            address,
-            key,
-            length,
-        },
-    )
-}
-
 /// The QP and region handles if both are non-null and share one fabric.
 /// Traces a rejection for a foreign region.
 unsafe fn qp_and_region<'a>(
@@ -1806,7 +1741,9 @@ mod tests {
             assert_eq!(stop(raw), -1);
             assert_eq!(bind(raw, raw, raw, 1, 2, 0, 3), -1);
             assert_eq!(invalidate(raw, 1, 2), -1);
-            assert_eq!(write(raw, raw, 1, 2, 3, 4), -1);
+            assert_eq!(write_imm(raw, raw, 0, 1, 2, 3, 4, 5), -1);
+            assert_eq!(send(raw, raw, 0, 1, 2), -1);
+            assert_eq!(post_recv(raw, raw, 0, 1, 2), -1);
             assert_eq!(poll(raw, &mut completion, 1), -1);
             assert_eq!(close(raw), -1);
             assert_eq!(qp_free(raw), -1);
@@ -1866,33 +1803,33 @@ mod tests {
     fn posts_reject_each_null_handle_without_side_effects() {
         let sim = Simulation::new();
         {
-            let (sender, receiver, source, target) = connected(&sim);
-            let (window, binding) = receiver.bind(target.clone()).unwrap();
-            receiver.progress().unwrap();
-            assert_eq!(binding.result(), Some(Ok(())));
-            let q = sender.raw.as_ptr();
+            let link = link(&sim, |_| {});
+            let (window, key) = grant(&link, wr(1), 4096, 17);
+            poke(&link.pages, 0, &[0xa5; 17]);
+            let q = link.a.raw.as_ptr();
             let w = window.raw.as_ptr();
-            let r = source.raw.as_ptr();
+            let r = link.pages.raw.as_ptr();
+            let address = link.pages.address() + 4096;
             let null = std::ptr::null_mut();
             let trace = sim.trace();
             let live = sim.live_resources();
             sim.fault(Operation::Bind, Fault::Reject);
-            sim.fault(Operation::Write, Fault::Reject);
+            sim.fault(Operation::WriteImm, Fault::Reject);
             unsafe {
                 for (q, w, r) in [(null, w, r), (q, null, r), (q, w, null)] {
-                    assert_eq!(bind(q, w, r, window.key, 100, 0, 17), -1);
+                    assert_eq!(bind(q, w, r, inc_rkey(key), 100, 4096, 17), -1);
                 }
                 for (q, r) in [(null, r), (q, null)] {
-                    assert_eq!(write(q, r, target.address(), window.key, 101, 17), -1);
+                    assert_eq!(write_imm(q, r, 0, 17, address, key, 0, 101), -1);
                 }
             }
             assert_eq!(sim.trace(), trace);
             assert_eq!(sim.live_resources(), live);
             assert_eq!(sim.pending_faults(), 2);
-            assert_eq!(sender.progress(), Ok(0));
-            receiver.stop().unwrap();
-            assert_eq!(source.copy_to().unwrap(), [0xa5; 17]);
-            assert_eq!(target.copy_to().unwrap(), [0; 17]);
+            assert_eq!(drain(&link.a).unwrap(), []);
+            stop_both(&link);
+            assert_eq!(peek(&link.pages, 0, 17), [0xa5; 17]);
+            assert_eq!(peek(&link.pages, 4096, 17), [0; 17]);
         }
         assert_eq!(sim.live_resources(), 0);
     }
@@ -2095,59 +2032,45 @@ mod tests {
         let sim = Simulation::new();
         let foreign = Simulation::new();
         {
-            let (sender, receiver, source, target) = connected(&sim);
-            let (_, _, foreign_region, _) = connected(&foreign);
-            let (w, binding) = receiver.bind(target.clone()).unwrap();
-            receiver.progress().unwrap();
-            assert_eq!(binding.result(), Some(Ok(())));
+            let link = link(&sim, |_| {});
+            let other = self::link(&foreign, |_| {});
+            let (w, key) = grant(&link, wr(1), 4096, 17);
+            poke(&link.pages, 0, &[0xa5; 17]);
             sim.take_trace();
             foreign.take_trace();
-            let q = sender.raw.as_ptr();
-            let qpn = sender.endpoint.qpn;
+            let q = link.a.raw.as_ptr();
+            let qpn = link.a.endpoint.qpn;
+            let target = link.pages.address() + 4096;
             unsafe {
                 for (region, key) in [
-                    (foreign_region.raw.as_ptr(), w.key),
-                    (source.raw.as_ptr(), w.key + 1),
+                    (other.pages.raw.as_ptr(), inc_rkey(key)),
+                    (link.pages.raw.as_ptr(), key + 0x100),
                 ] {
                     assert_eq!(bind(q, w.raw.as_ptr(), region, key, 41, 0, 17), -1);
                     events(&sim, &[(Operation::Bind, qpn, Some(41), -1, false)]);
                 }
                 assert_eq!(
-                    write(
-                        q,
-                        foreign_region.raw.as_ptr(),
-                        target.address(),
-                        w.key,
-                        42,
-                        17
-                    ),
+                    write_imm(q, other.pages.raw.as_ptr(), 0, 17, target, key, 0, 42),
                     -1
                 );
-                events(&sim, &[(Operation::Write, qpn, Some(42), -1, false)]);
+                events(&sim, &[(Operation::WriteImm, qpn, Some(42), -1, false)]);
                 assert_eq!(
-                    write(q, source.raw.as_ptr(), target.address(), w.key, 43, 33),
+                    write_imm(q, link.pages.raw.as_ptr(), 8190, 17, target, key, 0, 43),
                     -1
                 );
-                events(&sim, &[(Operation::Write, qpn, Some(43), -1, false)]);
+                events(&sim, &[(Operation::WriteImm, qpn, Some(43), -1, false)]);
                 assert_eq!(poll(q, std::ptr::null_mut(), 0), 0);
                 events(&sim, &[(Operation::Poll, qpn, None, 0, false)]);
                 // The failed write moves the QP to the error state, so the
                 // invalidate behind it is flushed rather than executed.
                 for (operation, id, status) in [
-                    (Operation::Write, 44, wc::REM_ACCESS_ERR),
+                    (Operation::WriteImm, 44, wc::REM_ACCESS_ERR),
                     (Operation::Invalidate, 45, wc::WR_FLUSH_ERR),
                 ] {
-                    let result = if operation == Operation::Write {
-                        write(
-                            q,
-                            source.raw.as_ptr(),
-                            target.address(),
-                            w.key + 100,
-                            id,
-                            17,
-                        )
+                    let result = if operation == Operation::WriteImm {
+                        write_imm(q, link.pages.raw.as_ptr(), 0, 17, target, key + 100, 0, id)
                     } else {
-                        invalidate(q, w.key + 100, id)
+                        invalidate(q, key + 100, id)
                     };
                     assert_eq!(result, 0);
                     events(&sim, &[(operation, qpn, Some(id), 0, false)]);
@@ -2168,38 +2091,13 @@ mod tests {
                 }
             }
             events(&foreign, &[]);
-            assert_eq!(source.copy_to().unwrap(), [0xa5; 17]);
-            receiver.stop().unwrap();
-            assert_eq!(target.copy_to().unwrap(), [0; 17]);
+            stop_both(&link);
+            stop_both(&other);
+            assert_eq!(peek(&link.pages, 0, 17), [0xa5; 17]);
+            assert_eq!(peek(&link.pages, 4096, 17), [0; 17]);
         }
         assert_eq!(sim.live_resources(), 0);
         assert_eq!(foreign.live_resources(), 0);
-    }
-
-    /// Build connected native peers with 17-byte transfers in 32-byte allocations.
-    fn connected(
-        sim: &Simulation,
-    ) -> (
-        Rc<NativeQueuePair>,
-        Rc<NativeQueuePair>,
-        Rc<NativeRegion>,
-        Rc<NativeRegion>,
-    ) {
-        let node = sim
-            .with_devices(vec![Device::new("sim0", [1; 16])])
-            .unwrap();
-        let _scope = node.enter();
-        let device = Rc::new(super::super::discover().unwrap().remove(0));
-        let sender = NativeQueuePair::new(device.clone()).unwrap();
-        let receiver = NativeQueuePair::new(device.clone()).unwrap();
-        sender.connect(receiver.endpoint).unwrap();
-        receiver.connect(sender.endpoint).unwrap();
-        let source = NativeRegion::new(device.clone(), 32, lifetime_tests::quota().0).unwrap();
-        let target = NativeRegion::new(device, 32, lifetime_tests::quota().0).unwrap();
-        source.resize(17).unwrap();
-        target.resize(17).unwrap();
-        source.copy_from(&[0xa5; 17]).unwrap();
-        (sender, receiver, source, target)
     }
 
     /// Two connected QPs on one device with explicit depths, a page region,
@@ -2212,6 +2110,20 @@ mod tests {
         pages: Rc<NativeRegion>,
 
         control: Rc<NativeRegion>,
+    }
+
+    impl Link {
+        /// Another unconnected QP on the link's device.
+        fn qp(&self) -> Rc<NativeQueuePair> {
+            NativeQueuePair::new_with_depth(
+                self.b.device.clone(),
+                GuardOwner::new(Arc::new(())),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                8,
+                4,
+            )
+            .unwrap()
+        }
     }
 
     /// A caller-chosen work request id.
@@ -2401,13 +2313,18 @@ mod tests {
     }
 
     #[test]
-    /// Writes outside the bound range, on another window's key, or with an
-    /// earlier generation of the same window are refused without writing.
+    /// Writes outside the bound range, on another window's key, with an
+    /// earlier generation of the same window, or from a QP the grant's QP is
+    /// not connected to are refused without writing.
     fn write_imm_respects_bound_range_and_key_generation() {
-        for case in 0..5 {
+        for case in 0..6 {
             let sim = Simulation::new();
             {
                 let link = link(&sim, |_| {});
+                // Connected to `b`, but `b` is not connected back to it.
+                let stranger = link.qp();
+                stranger.connect(link.b.endpoint).unwrap();
+                let writer = if case == 5 { &stranger } else { &link.a };
                 let (window, first) = grant(&link, wr(1), 4096, 100);
                 link.b.invalidate_window(wr(2), &window, first).unwrap();
                 drain(&link.b).unwrap();
@@ -2424,10 +2341,11 @@ mod tests {
                     1 => (base + 91, 10, second),
                     2 => (base, 10, first),
                     3 => (base, 10, second ^ 0x100),
-                    _ => (base + 90, 10, second),
+                    4 => (base + 90, 10, second),
+                    _ => (base, 10, second),
                 };
                 poke(&link.pages, 0, &[1; 10]);
-                link.a
+                writer
                     .write_imm(wr(5), &link.pages, 0, length, address, key, 0)
                     .unwrap();
                 if case == 4 {
@@ -2435,8 +2353,8 @@ mod tests {
                     assert_eq!(drain(&link.b).unwrap().len(), 1);
                     assert_eq!(peek(&link.pages, 4096 + 90, 10), [1; 10]);
                 } else {
-                    assert_eq!(drain(&link.a), Err(Error::Io));
-                    assert_eq!(link.a.failure().unwrap().status, status::REM_ACCESS_ERR);
+                    assert_eq!(drain(writer), Err(Error::Io));
+                    assert_eq!(writer.failure().unwrap().status, status::REM_ACCESS_ERR);
                     assert_eq!(drain(&link.b), Err(Error::Io));
                     assert_eq!(peek(&link.pages, 4095, 102), [0; 102]);
                 }
@@ -2808,177 +2726,97 @@ mod tests {
     }
 
     #[test]
-    /// Delayed writes require completion and invalidated keys reject subsequent DMA.
-    fn connected_copy_waits_for_completion_and_invalidation_revokes_key() {
+    /// A delayed write lands only when it completes, and an invalidated key
+    /// rejects the next write.
+    fn delayed_write_waits_for_completion_and_invalidation_revokes_key() {
         let sim = Simulation::new();
         {
-            let (sender, receiver, source, target) = connected(&sim);
-            let (window, bind) = receiver.bind(target.clone()).unwrap();
-            receiver.progress().unwrap();
-            assert_eq!(bind.result(), Some(Ok(())));
-            sim.fault(Operation::Write, Fault::Delay(2));
-            let write = sender
-                .write(source.clone(), target.address(), window.key)
+            let link = link(&sim, |_| {});
+            let (window, key) = grant(&link, wr(1), 4096, 17);
+            let address = link.pages.address() + 4096;
+            link.b.post_recv(wr(2), &link.control, 0, 64).unwrap();
+            poke(&link.pages, 0, &[0xa5; 17]);
+            sim.fault(Operation::WriteImm, Fault::Delay(2));
+            link.a
+                .write_imm(wr(3), &link.pages, 0, 17, address, key, 0)
                 .unwrap();
-            assert_eq!(sender.progress(), Ok(0));
-            assert_eq!(sender.progress(), Ok(0));
-            assert_eq!(write.result(), None);
-            assert_eq!(source.copy_to(), Err(Error::Unavailable));
-            assert_eq!(target.copy_to(), Err(Error::Unavailable));
-            assert_eq!(sender.progress(), Ok(1));
-            assert_eq!(write.result(), Some(Ok(())));
-            let invalidation = receiver.invalidate(window.clone()).unwrap();
-            receiver.progress().unwrap();
-            assert_eq!(invalidation.result(), Some(Ok(())));
-            // The key is revoked even before the stronger application stop fence.
-            let stale = sender.write(source, target.address(), window.key).unwrap();
-            assert_eq!(sender.progress(), Err(Error::Io));
-            assert_eq!(stale.result(), Some(Err(Error::Cancelled)));
-            receiver.stop().unwrap();
-            assert_eq!(target.copy_to().unwrap(), [0xa5; 17]);
+            assert_eq!(drain(&link.a).unwrap(), []);
+            assert_eq!(drain(&link.a).unwrap(), []);
+            assert_eq!(peek(&link.pages, 4096, 17), [0; 17]);
+            assert_eq!(drain(&link.a).unwrap().len(), 1);
+            assert_eq!(peek(&link.pages, 4096, 17), [0xa5; 17]);
+            assert_eq!(drain(&link.b).unwrap().len(), 1);
+            link.b.invalidate_window(wr(4), &window, key).unwrap();
+            assert_eq!(drain(&link.b).unwrap().len(), 1);
+            // The key is revoked even before the QP stop fence.
+            link.b.post_recv(wr(5), &link.control, 0, 64).unwrap();
+            poke(&link.pages, 0, &[0xff; 17]);
+            link.a
+                .write_imm(wr(6), &link.pages, 0, 17, address, key, 0)
+                .unwrap();
+            assert_eq!(drain(&link.a), Err(Error::Io));
+            stop_both(&link);
+            assert_eq!(peek(&link.pages, 4096, 17), [0xa5; 17]);
         }
         assert_eq!(sim.live_resources(), 0);
     }
 
     #[test]
-    /// Both completion orders retain the old grant until a successful terminal fence.
-    fn fallback_cannot_reuse_quarantined_region_in_either_completion_order() {
+    /// In both completion orders of a delayed write and a delayed
+    /// invalidate, a region granted again after the stop fence gets a fresh
+    /// key, and the old key cannot modify it.
+    fn regrant_after_fence_rejects_old_key_in_either_completion_order() {
         for remote_first in [false, true] {
             let sim = Simulation::new();
-            let (quota, charged) = lifetime_tests::quota();
             {
-                let (sender, receiver, source, _) = connected(&sim);
-                let target = NativeRegion::new(sender.device().clone(), 32, quota).unwrap();
-                target.resize(17).unwrap();
-                let (window, bind) = receiver.bind(target.clone()).unwrap();
-                assert_eq!(receiver.progress(), Ok(1));
-                assert_eq!(bind.result(), Some(Ok(())));
-                let fallback_sender = NativeQueuePair::new(sender.device().clone()).unwrap();
-                let fallback_receiver = NativeQueuePair::new(sender.device().clone()).unwrap();
-                fallback_sender.connect(fallback_receiver.endpoint).unwrap();
-                fallback_receiver.connect(fallback_sender.endpoint).unwrap();
-                sim.fault(Operation::Write, Fault::Delay(1));
-                let write = sender
-                    .write(source.clone(), target.address(), window.key)
+                let link = link(&sim, |_| {});
+                let (window, key) = grant(&link, wr(1), 4096, 17);
+                let address = link.pages.address() + 4096;
+                let (sender, receiver) = (link.qp(), link.qp());
+                sender.connect(receiver.endpoint).unwrap();
+                receiver.connect(sender.endpoint).unwrap();
+                link.b.post_recv(wr(2), &link.control, 0, 64).unwrap();
+                poke(&link.pages, 0, &[0xa5; 17]);
+                sim.fault(Operation::WriteImm, Fault::Delay(1));
+                link.a
+                    .write_imm(wr(3), &link.pages, 0, 17, address, key, 0)
                     .unwrap();
-                assert_eq!(sender.progress(), Ok(0));
-                // Revocation requested, but no remote fence has completed yet.
+                assert_eq!(drain(&link.a).unwrap(), []);
+                // Revocation requested, but not complete yet.
                 sim.fault(Operation::Invalidate, Fault::Delay(1));
-                let invalidation = receiver.invalidate(window.clone()).unwrap();
-                assert_eq!(receiver.progress(), Ok(0));
-                assert!(matches!(
-                    fallback_receiver.bind(target.clone()),
-                    Err(Error::InvalidRequest)
-                ));
-                assert_eq!(target.copy_to(), Err(Error::Unavailable));
+                link.b.invalidate_window(wr(4), &window, key).unwrap();
+                assert_eq!(drain(&link.b).unwrap(), []);
                 if remote_first {
-                    assert_eq!(receiver.progress(), Ok(1));
-                    assert_eq!(invalidation.result(), Some(Ok(())));
-                    assert_eq!(write.result(), None);
-                    assert_eq!(source.copy_to(), Err(Error::Unavailable));
+                    assert_eq!(drain(&link.b).unwrap().len(), 1);
+                    assert_eq!(drain(&link.a), Err(Error::Io));
                 } else {
-                    // A queued DMA can arrive after the invalidate request.
-                    assert_eq!(sender.progress(), Ok(1));
-                    assert_eq!(write.result(), Some(Ok(())));
-                    assert_eq!(source.copy_to().unwrap(), [0xa5; 17]);
-                    assert_eq!(invalidation.result(), None);
+                    // A queued write can land after the invalidate request.
+                    assert_eq!(drain(&link.a).unwrap().len(), 1);
+                    assert_eq!(drain(&link.b).unwrap().len(), 2);
                 }
-                assert_eq!(charged.get(), 1);
-                assert_eq!(target.copy_to(), Err(Error::Unavailable));
-                assert!(matches!(
-                    fallback_receiver.bind(target.clone()),
-                    Err(Error::InvalidRequest)
-                ));
-                if remote_first {
-                    assert_eq!(sender.progress(), Err(Error::Io));
-                    assert_eq!(write.result(), Some(Err(Error::Cancelled)));
-                } else {
-                    assert_eq!(receiver.progress(), Ok(1));
-                    assert_eq!(invalidation.result(), Some(Ok(())));
-                }
-                // Production requires the terminal QP fence even after invalidation.
-                assert_eq!(target.copy_to(), Err(Error::Unavailable));
-                receiver.stop().unwrap();
+                link.b.stop().unwrap();
                 let expected = if remote_first { [0; 17] } else { [0xa5; 17] };
-                assert_eq!(target.copy_to().unwrap(), expected);
-                let (fresh_window, fresh_bind) = fallback_receiver.bind(target.clone()).unwrap();
-                assert_ne!(fresh_window.key, window.key);
-                fallback_receiver.progress().unwrap();
-                assert_eq!(fresh_bind.result(), Some(Ok(())));
-                let stale = fallback_sender
-                    .write(source, target.address(), window.key)
+                assert_eq!(peek(&link.pages, 4096, 17), expected);
+                // Grant the same bytes again on a fresh pair.
+                let fresh = MemoryWindow::new(&receiver.device).unwrap();
+                let fresh_key = receiver
+                    .bind_window(wr(5), &fresh, &link.pages, 4096, 17)
                     .unwrap();
-                assert_eq!(fallback_sender.progress(), Err(Error::Io));
-                assert_eq!(stale.result(), Some(Err(Error::Cancelled)));
-                fallback_receiver.stop().unwrap();
+                assert_ne!(fresh_key, key);
+                assert_eq!(drain(&receiver).unwrap().len(), 1);
+                receiver.post_recv(wr(6), &link.control, 64, 64).unwrap();
+                poke(&link.pages, 0, &[0xff; 17]);
+                sender
+                    .write_imm(wr(7), &link.pages, 0, 17, address, key, 0)
+                    .unwrap();
+                assert_eq!(drain(&sender), Err(Error::Io));
+                receiver.stop().unwrap();
                 assert_eq!(
-                    target.copy_to().unwrap(),
+                    peek(&link.pages, 4096, 17),
                     expected,
-                    "old key cannot modify the reused destination"
+                    "old key cannot modify the regranted destination"
                 );
-                assert_eq!(charged.get(), 1);
-            }
-            assert_eq!(charged.get(), 0);
-            assert_eq!(sim.live_resources(), 0);
-        }
-    }
-
-    #[test]
-    /// Inclusive expiry blocks admission but failed fencing still permits late DMA.
-    fn expiry_is_inclusive_but_not_a_remote_fence_and_faults_are_ordered() {
-        use std::time::Duration;
-
-        use uring_runtime::environment::{SimulationClock, now};
-
-        for failed_stop in [false, true] {
-            let clock = SimulationClock::new(7);
-            let environment = clock.environment(0);
-            let _clock = environment.enter();
-            let sim = Simulation::new();
-            {
-                let (sender, receiver, source, target) = connected(&sim);
-                let (window, bind) = receiver.bind(target.clone()).unwrap();
-                receiver.progress().unwrap();
-                assert_eq!(bind.result(), Some(Ok(())));
-                receiver.expire_at(now() + Duration::from_secs(2));
-                clock.advance(Duration::from_secs(2) - Duration::from_nanos(1));
-                assert_eq!(receiver.progress(), Ok(0));
-                assert!(receiver.ready());
-                sim.fault(Operation::Invalidate, Fault::Delay(2));
-                let invalidation = receiver.invalidate(window.clone()).unwrap();
-                assert_eq!(receiver.progress(), Ok(0));
-                clock.advance(Duration::from_nanos(1));
-                if failed_stop {
-                    sim.fault_on(Operation::Stop, Some(receiver.endpoint.qpn), Fault::Reject);
-                    assert_eq!(receiver.progress(), Err(Error::Io));
-                    assert!(!receiver.ready());
-                    assert!(!receiver.stopped());
-                    assert_eq!(invalidation.result(), None);
-                    assert_eq!(target.copy_to(), Err(Error::Unavailable));
-                    assert!(matches!(
-                        receiver.invalidate(window.clone()),
-                        Err(Error::Unavailable)
-                    ));
-                    // Expiry blocks local admission, but a failed stop cannot revoke DMA.
-                    let late = sender
-                        .write(source.clone(), target.address(), window.key)
-                        .unwrap();
-                    assert_eq!(sender.progress(), Ok(1));
-                    assert_eq!(late.result(), Some(Ok(())));
-                    assert_eq!(target.copy_to(), Err(Error::Unavailable));
-                    assert_eq!(receiver.progress(), Err(Error::Cancelled));
-                } else {
-                    assert_eq!(receiver.progress(), Err(Error::DeadlineExceeded));
-                }
-                assert!(receiver.stopped());
-                assert_eq!(invalidation.result(), Some(Err(Error::Cancelled)));
-                assert_eq!(receiver.progress(), Ok(0));
-                let expected = if failed_stop { [0xa5; 17] } else { [0; 17] };
-                assert_eq!(target.copy_to().unwrap(), expected);
-                let stale = sender.write(source, target.address(), window.key).unwrap();
-                assert_eq!(sender.progress(), Err(Error::Io));
-                assert_eq!(stale.result(), Some(Err(Error::Cancelled)));
-                assert_eq!(target.copy_to().unwrap(), expected);
+                link.a.stop().unwrap();
             }
             assert_eq!(sim.pending_faults(), 0);
             assert_eq!(sim.live_resources(), 0);
@@ -2986,107 +2824,96 @@ mod tests {
     }
 
     #[test]
-    /// Invalid capabilities, ranges, and peer pairing cannot modify the destination.
-    fn wrong_key_address_length_and_peer_cannot_write() {
-        for case in 0..4 {
-            let sim = Simulation::new();
-            {
-                let (sender, receiver, source, target) = connected(&sim);
-                let (window, _) = receiver.bind(target.clone()).unwrap();
-                receiver.progress().unwrap();
-                let (address, key) = match case {
-                    0 => (target.address(), window.key + 100),
-                    1 => (target.address() - 1, window.key),
-                    2 => (target.address() + 1, window.key),
-                    _ => (target.address(), window.key),
-                };
-                let stranger = NativeQueuePair::new(sender.device().clone()).unwrap();
-                stranger.connect(receiver.endpoint).unwrap();
-                let writer = if case == 3 { &stranger } else { &sender };
-                writer.write(source, address, key).unwrap();
-                assert_eq!(writer.progress(), Err(Error::Io));
-                receiver.stop().unwrap();
-                assert_eq!(target.copy_to().unwrap(), [0; 17]);
-            }
-            assert_eq!(sim.live_resources(), 0);
-        }
-    }
-
-    #[test]
-    /// Failed invalidation and fencing retain remote access until fencing is retried.
+    /// A failed invalidation and a failed stop keep the grant live, so a late
+    /// write still lands, until the stop is retried.
     fn failed_invalidation_and_stop_keep_live_grant_until_retry() {
         let sim = Simulation::new();
         {
-            let (sender, receiver, source, target) = connected(&sim);
-            let (window, _) = receiver.bind(target.clone()).unwrap();
-            receiver.progress().unwrap();
-            sim.fault_on(
-                Operation::Invalidate,
-                Some(receiver.endpoint.qpn),
-                Fault::Completion(5),
+            let link = link(&sim, |_| {});
+            let (window, key) = grant(&link, wr(1), 4096, 17);
+            let qpn = Some(link.b.endpoint.qpn);
+            sim.fault_on(Operation::Invalidate, qpn, Fault::Completion(5));
+            link.b.invalidate_window(wr(2), &window, key).unwrap();
+            sim.fault_on(Operation::Stop, qpn, Fault::Reject);
+            assert_eq!(drain(&link.b), Err(Error::Io));
+            assert!(!link.b.ready() && !link.b.stopped());
+            // No new work while stopping.
+            assert_eq!(
+                link.b.invalidate_window(wr(3), &window, key),
+                Err(Error::Unavailable)
             );
-            let invalidation = receiver.invalidate(window.clone()).unwrap();
-            sim.fault_on(Operation::Stop, Some(receiver.endpoint.qpn), Fault::Reject);
-            assert_eq!(receiver.progress(), Err(Error::Io));
-            assert_eq!(invalidation.result(), None);
-            assert_eq!(target.copy_to(), Err(Error::Unavailable));
-            // Failed fencing must model a real late remote DMA, not merely an error.
-            let write = sender.write(source, target.address(), window.key).unwrap();
-            sender.progress().unwrap();
-            assert_eq!(write.result(), Some(Ok(())));
-            receiver.stop().unwrap();
-            assert_eq!(invalidation.result(), Some(Err(Error::Cancelled)));
-            assert_eq!(target.copy_to().unwrap(), [0xa5; 17]);
+            // Late DMA: the data lands. The receiver is in the error state,
+            // so the immediate finds no receive and the sender sees RNR.
+            poke(&link.pages, 0, &[0xa5; 17]);
+            let address = link.pages.address() + 4096;
+            link.a
+                .write_imm(wr(4), &link.pages, 0, 17, address, key, 0)
+                .unwrap();
+            assert_eq!(drain(&link.a), Err(Error::Io));
+            assert_eq!(link.a.failure().unwrap().status, status::RNR_RETRY_EXC_ERR);
+            // The next progress retries the stop.
+            assert_eq!(drain(&link.b), Err(Error::Cancelled));
+            assert!(link.b.stopped());
+            assert_eq!(peek(&link.pages, 4096, 17), [0xa5; 17]);
+            stop_both(&link);
         }
+        assert_eq!(sim.pending_faults(), 0);
         assert_eq!(sim.live_resources(), 0);
     }
 
     #[test]
-    /// Rejected posts leave the source idle and terminal fencing cancels delayed DMA.
-    fn stop_cancels_delayed_dma_and_post_rejection_keeps_source_reusable() {
+    /// A rejected post does not hold its source; stop cancels delayed DMA.
+    fn stop_cancels_delayed_dma_and_post_rejection_releases_source() {
         let sim = Simulation::new();
         {
-            let (sender, receiver, source, target) = connected(&sim);
-            let (window, _) = receiver.bind(target.clone()).unwrap();
-            receiver.progress().unwrap();
-            sim.fault(Operation::Write, Fault::Reject);
-            assert!(
-                sender
-                    .write(source.clone(), target.address(), window.key)
-                    .is_err()
+            let link = link(&sim, |_| {});
+            let (_window, key) = grant(&link, wr(1), 4096, 17);
+            let address = link.pages.address() + 4096;
+            link.b.post_recv(wr(2), &link.control, 0, 64).unwrap();
+            poke(&link.control, 512, &[0xa5; 17]);
+            let held = Rc::strong_count(&link.control);
+            sim.fault(Operation::WriteImm, Fault::Reject);
+            assert_eq!(
+                link.a
+                    .write_imm(wr(3), &link.control, 512, 17, address, key, 0),
+                Err(Error::Io)
             );
-            assert_eq!(source.copy_to().unwrap(), [0xa5; 17]);
-            sim.fault(Operation::Write, Fault::Delay(3));
-            let pending = sender.write(source, target.address(), window.key).unwrap();
-            sender.stop().unwrap();
-            assert_eq!(pending.result(), Some(Err(Error::Cancelled)));
-            assert_eq!(sender.progress(), Ok(0));
-            receiver.stop().unwrap();
-            assert_eq!(target.copy_to().unwrap(), [0; 17]);
+            assert_eq!(Rc::strong_count(&link.control), held);
+            sim.fault(Operation::WriteImm, Fault::Delay(3));
+            link.a
+                .write_imm(wr(3), &link.control, 512, 17, address, key, 0)
+                .unwrap();
+            assert_eq!(Rc::strong_count(&link.control), held + 1);
+            link.a.stop().unwrap();
+            assert_eq!(Rc::strong_count(&link.control), held);
+            assert_eq!(drain(&link.a).unwrap(), []);
+            link.b.stop().unwrap();
+            assert_eq!(peek(&link.pages, 4096, 17), [0; 17]);
         }
         assert_eq!(sim.live_resources(), 0);
     }
 
     #[test]
-    /// A poll error with failed fencing keeps source memory busy until a retry.
+    /// A poll error with a failed stop keeps the source held until a retry.
     fn polling_failure_retains_pending_source_until_stop_succeeds() {
         let sim = Simulation::new();
         {
-            let (sender, receiver, source, target) = connected(&sim);
-            let (window, _) = receiver.bind(target.clone()).unwrap();
-            receiver.progress().unwrap();
-            let pending = sender
-                .write(source.clone(), target.address(), window.key)
+            let link = link(&sim, |_| {});
+            let (_window, key) = grant(&link, wr(1), 4096, 17);
+            let held = Rc::strong_count(&link.control);
+            let address = link.pages.address() + 4096;
+            link.a
+                .write_imm(wr(2), &link.control, 0, 17, address, key, 0)
                 .unwrap();
-            sim.fault_on(Operation::Poll, Some(sender.endpoint.qpn), Fault::Reject);
-            sim.fault_on(Operation::Stop, Some(sender.endpoint.qpn), Fault::Reject);
-            assert_eq!(sender.progress(), Err(Error::Io));
-            assert_eq!(pending.result(), None);
-            assert_eq!(source.copy_to(), Err(Error::Unavailable));
-            sender.stop().unwrap();
-            assert_eq!(pending.result(), Some(Err(Error::Cancelled)));
-            receiver.stop().unwrap();
-            assert_eq!(target.copy_to().unwrap(), [0; 17]);
+            let qpn = Some(link.a.endpoint.qpn);
+            sim.fault_on(Operation::Poll, qpn, Fault::Reject);
+            sim.fault_on(Operation::Stop, qpn, Fault::Reject);
+            assert_eq!(drain(&link.a), Err(Error::Io));
+            assert_eq!(Rc::strong_count(&link.control), held + 1);
+            link.a.stop().unwrap();
+            assert_eq!(Rc::strong_count(&link.control), held);
+            link.b.stop().unwrap();
+            assert_eq!(peek(&link.pages, 4096, 17), [0; 17]);
         }
         assert_eq!(sim.live_resources(), 0);
     }
@@ -3139,7 +2966,9 @@ mod tests {
                 assert!(super::super::discover().unwrap().is_empty());
             }
             assert_eq!(super::super::discover().unwrap().len(), 1);
-            let region = NativeRegion::new(device, 32, lifetime_tests::quota().0).unwrap();
+            let region =
+                NativeRegion::with_access(device, 32, Access::PAGES, lifetime_tests::quota().0)
+                    .unwrap();
             let address = region.address();
             drop(scope);
             drop(region);

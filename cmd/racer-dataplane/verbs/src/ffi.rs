@@ -84,7 +84,7 @@ impl Endpoint {
 }
 
 /// One finished work request from the completion queue. Matches
-/// `struct rdma_verbs_wc` in C (ABI 2).
+/// `struct rdma_verbs_wc` in C.
 #[repr(C)]
 #[derive(Default, Clone, Copy, Debug, Eq, PartialEq)]
 struct Completion {
@@ -110,7 +110,7 @@ const WC_IMM: u32 = 1;
 
 /// Native adapter ABI version this crate speaks.
 #[cfg(all(feature = "native", target_os = "linux"))]
-const ABI_VERSION: u32 = 3;
+const ABI_VERSION: u32 = 4;
 
 /// Completion opcodes (`enum ibv_wc_opcode`), pinned by C static asserts.
 pub(crate) mod opcode {
@@ -266,11 +266,6 @@ native_api! {
     bind: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u32, u64, u64, u32) -> c_int,
 
     invalidate: unsafe extern "C" fn(*mut c_void, u32, u64) -> c_int,
-
-    /// Plain RDMA write. Links only write with immediate; the adapter and
-    /// simulator tests still drive this to check window and fence rules.
-    #[cfg_attr(not(test), allow(dead_code, reason = "only adapter tests post plain writes"))]
-    write: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u32, u64, u32) -> c_int,
 
     write_imm: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u32, u64, u32, u32, u64) -> c_int,
 
@@ -490,8 +485,8 @@ fn discover_with_api(
 
 /// A registered memory buffer (MR) the NIC can read and write.
 ///
-/// `busy` is set while the NIC may touch it. The CPU may not copy in or out
-/// while busy. Holds the node's guard and leaks it if deregister fails.
+/// Posts do not track which ranges the NIC may touch; their caller must.
+/// Holds the node's guard and leaks it if deregister fails.
 pub(crate) struct NativeRegion {
     device: Rc<NativeDevice>,
 
@@ -500,37 +495,13 @@ pub(crate) struct NativeRegion {
     /// Allocated size.
     length: usize,
 
-    /// Bytes in use for the current transfer.
-    used: Cell<usize>,
-
     quota: Option<Arc<GuardOwner>>,
-
-    busy: Cell<bool>,
 
     access: Access,
 }
 
 impl NativeRegion {
-    #[cfg(test)]
-    /// Allocate and register `length` bytes for the test harness:
-    /// [`Access::PAGES_REMOTE_WRITE`], at most `u32::MAX` bytes.
-    pub(crate) fn new(
-        device: Rc<NativeDevice>,
-        length: usize,
-        quota: Arc<GuardOwner>,
-    ) -> Result<Rc<Self>> {
-        if length > u32::MAX as usize {
-            return Err(Error::InvalidRange);
-        }
-        Self::with_access(device, length, Access::PAGES_REMOTE_WRITE, quota)
-    }
-
     /// Allocate and register `length` bytes with `access`.
-    ///
-    /// The `busy` flag, `resize`, and the copy helpers serve the test harness.
-    /// Ranged posts ([`NativeQueuePair::send`], [`NativeQueuePair::post_recv`],
-    /// [`NativeQueuePair::write_imm`], [`NativeQueuePair::bind_window`]) do not
-    /// track per-range ownership; their caller must.
     pub(crate) fn with_access(
         device: Rc<NativeDevice>,
         length: usize,
@@ -548,9 +519,7 @@ impl NativeRegion {
             device,
             raw,
             length,
-            used: Cell::new(length),
             quota: Some(quota),
-            busy: Cell::new(false),
             access,
         }))
     }
@@ -568,9 +537,7 @@ impl NativeRegion {
             device,
             raw,
             length: usize::MAX,
-            used: Cell::new(usize::MAX),
             quota: Some(quota),
-            busy: Cell::new(false),
             access: Access::IMPLICIT,
         }))
     }
@@ -604,47 +571,9 @@ impl NativeRegion {
         unsafe { (self.device.api.bytes)(self.raw.as_ptr()) as u64 }
     }
 
-    /// Bytes in use.
+    /// Registered size in bytes.
     pub(crate) fn length(&self) -> usize {
-        self.used.get()
-    }
-
-    #[cfg(test)]
-    /// Set bytes in use. Not while busy.
-    pub(crate) fn resize(&self, length: usize) -> Result<()> {
-        if self.busy.get() || length == 0 || length > self.length {
-            return Err(Error::InvalidRange);
-        }
-        self.used.set(length);
-        Ok(())
-    }
-
-    #[cfg(test)]
-    /// Copy into the buffer. Not while busy.
-    pub(crate) fn copy_from(&self, bytes: &[u8]) -> Result<()> {
-        if self.busy.get() || bytes.len() != self.length() {
-            return Err(Error::InvalidRequest);
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                (self.device.api.bytes)(self.raw.as_ptr()),
-                self.length(),
-            );
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    /// Copy the buffer out, for tests.
-    pub(crate) fn copy_to(&self) -> Result<Vec<u8>> {
-        if self.busy.get() {
-            return Err(Error::Unavailable);
-        }
-        Ok(unsafe {
-            std::slice::from_raw_parts((self.device.api.bytes)(self.raw.as_ptr()), self.length())
-        }
-        .to_vec())
+        self.length
     }
 }
 
@@ -655,33 +584,6 @@ impl Drop for NativeRegion {
             std::mem::forget(self.device.clone());
             self.quota.as_ref().unwrap().quarantine();
             std::mem::forget(self.quota.take());
-        }
-    }
-}
-
-/// A memory window (MW): lets one peer write into a region.
-pub(crate) struct Window {
-    device: Rc<NativeDevice>,
-
-    raw: NonNull<c_void>,
-
-    /// Remote key for the peer.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "only the test harness binds whole-region windows")
-    )]
-    pub(crate) key: u32,
-
-    region: Rc<NativeRegion>,
-}
-
-impl Drop for Window {
-    /// Free the window. On failure, leak the device and region.
-    fn drop(&mut self) {
-        if unsafe { (self.device.api.window_free)(self.raw.as_ptr()) } != 0 {
-            self.region.quota.as_ref().unwrap().quarantine();
-            std::mem::forget(self.device.clone());
-            std::mem::forget(self.region.clone());
         }
     }
 }
@@ -744,34 +646,9 @@ impl Drop for MemoryWindow {
     }
 }
 
-/// Caller-chosen work request ids must set at least one of these bits, so
-/// they never collide with the ids the test harness assigns from 1 upward.
-pub(crate) const CALLER_ID_MASK: u64 = 0xff << 56;
-
-/// Where a work request's result lands.
-#[derive(Default)]
-struct TicketState {
-    result: Cell<Option<Result<()>>>,
-}
-
-/// The result of one posted work request.
-#[derive(Clone)]
-pub(crate) struct Ticket(Rc<TicketState>);
-
-impl Ticket {
-    #[cfg(test)]
-    /// The result, or `None` if still in flight.
-    pub(crate) fn result(&self) -> Option<Result<()>> {
-        self.0.result.get()
-    }
-}
-
 /// A posted work request. Keeps its region and window alive until it
 /// completes or the QP stops.
 struct Pending {
-    /// Set for test-harness work; ranged posts report through `progress_with`.
-    ticket: Option<Ticket>,
-
     /// Expected completion opcode. Ignored for receives.
     opcode: u32,
 
@@ -781,29 +658,12 @@ struct Pending {
     /// Receive buffer length.
     length: u32,
 
-    /// Slot-path region; cleared from busy on finish.
-    region: Option<Rc<NativeRegion>>,
+    _region: Rc<NativeRegion>,
 
-    /// Ranged-post region, kept alive but not marked busy.
-    _hold: Option<Rc<NativeRegion>>,
-
-    _window: Option<Rc<Window>>,
-
-    _memory_window: Option<Rc<MemoryWindow>>,
+    _window: Option<Rc<MemoryWindow>>,
 }
 
 impl Pending {
-    /// Set the result and mark the region not busy.
-    fn finish(self, result: Result<()>) {
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-        if let Some(region) = &self.region {
-            region.busy.set(false);
-        }
-        if let Some(ticket) = &self.ticket {
-            ticket.0.result.set(Some(result));
-        }
-    }
-
     /// True if a successful completion `c` is what this work should produce.
     fn matches(&self, c: &Completion) -> bool {
         if c.status != 0 {
@@ -823,10 +683,10 @@ impl Pending {
 
 /// A queue pair (QP) and its completion queue.
 ///
-/// Tracks posted work (up to 32) and the bound window. [`Self::stop`] is the
-/// only way to be sure the NIC is done with its memory.
+/// Tracks posted work. [`Self::stop`] is the only way to be sure the NIC is
+/// done with its memory.
 pub(crate) struct NativeQueuePair {
-    /// Keeps every QP, CQ, and probe leak charged to its owner.
+    /// Keeps every QP and CQ leak charged to its owner.
     quota: Arc<GuardOwner>,
 
     /// Publishes successful DMA stop even when it occurs during destructor retry.
@@ -846,10 +706,6 @@ pub(crate) struct NativeQueuePair {
 
     connected: Cell<bool>,
 
-    /// Next work request ID.
-    #[cfg(test)]
-    next: Cell<u64>,
-
     /// Posted work by ID.
     pending: RefCell<BTreeMap<u64, Pending>>,
 
@@ -865,51 +721,28 @@ pub(crate) struct NativeQueuePair {
 
     /// The first completion that broke the QP.
     failure: Cell<Option<Failure>>,
-
-    /// Bound windows. They stay open until stop, even after the bind completes.
-    windows: RefCell<Vec<Rc<Window>>>,
-
-    #[cfg(test)]
-    expires: Cell<Option<std::time::Instant>>,
 }
 
 impl NativeQueuePair {
-    #[cfg(test)]
-    /// Create an independently charged QP for low-level tests.
-    pub(crate) fn new(device: Rc<NativeDevice>) -> Result<Rc<Self>> {
-        Self::new_charged(
-            device,
-            GuardOwner::new(Arc::new(())),
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        )
-    }
-
-    #[cfg(test)]
-    /// Create a test-harness QP with a charge and a random starting
-    /// PSN: 64 send WRs (32 tracked at once) and one receive WR.
-    pub(crate) fn new_charged(
+    /// Create a QP with `send_depth` send and `recv_depth` receive WRs, and
+    /// a CQ for both. Both depths must be nonzero.
+    pub(crate) fn new_with_depth(
         device: Rc<NativeDevice>,
         quota: Arc<GuardOwner>,
         stop_observer: Arc<std::sync::atomic::AtomicBool>,
+        send_depth: u32,
+        recv_depth: u32,
     ) -> Result<Rc<Self>> {
-        Self::create(device, quota, stop_observer, (64, 1), (32, 0))
-    }
-
-    /// Create the native QP with `depth` and track up to `capacity` WRs.
-    fn create(
-        device: Rc<NativeDevice>,
-        quota: Arc<GuardOwner>,
-        stop_observer: Arc<std::sync::atomic::AtomicBool>,
-        depth: (u32, u32),
-        capacity: (u32, u32),
-    ) -> Result<Rc<Self>> {
+        if send_depth == 0 || recv_depth == 0 || send_depth.checked_add(recv_depth).is_none() {
+            return Err(Error::InvalidConfiguration);
+        }
         let mut qpn = 0;
         let raw = NonNull::new(unsafe {
             (device.api.qp)(
                 device.raw.as_ptr(),
                 device.endpoint.port,
-                depth.0,
-                depth.1,
+                send_depth,
+                recv_depth,
                 &mut qpn,
             )
         });
@@ -950,17 +783,12 @@ impl NativeQueuePair {
             stopped: Cell::new(false),
             terminating: Cell::new(false),
             connected: Cell::new(false),
-            #[cfg(test)]
-            next: Cell::new(1),
             pending: RefCell::new(BTreeMap::new()),
-            send_capacity: capacity.0,
+            send_capacity: send_depth,
             sends: Cell::new(0),
-            recv_capacity: capacity.1,
+            recv_capacity: recv_depth,
             recvs: Cell::new(0),
             failure: Cell::new(None),
-            windows: RefCell::new(Vec::new()),
-            #[cfg(test)]
-            expires: Cell::new(None),
         }))
     }
 
@@ -982,12 +810,6 @@ impl NativeQueuePair {
         Ok(())
     }
 
-    #[cfg(test)]
-    /// The QP's device, for tests.
-    pub(crate) fn device(&self) -> &Rc<NativeDevice> {
-        &self.device
-    }
-
     /// True if connected and not stopping.
     pub(crate) fn ready(&self) -> bool {
         self.connected.get() && !self.stopped.get() && !self.terminating.get()
@@ -997,48 +819,6 @@ impl NativeQueuePair {
     /// True once stop succeeded.
     pub(crate) fn stopped(&self) -> bool {
         self.stopped.get()
-    }
-
-    #[cfg(test)]
-    /// Set a deadline for [`Self::progress`], for tests.
-    pub(crate) fn expire_at(&self, deadline: std::time::Instant) {
-        self.expires.set(Some(deadline));
-    }
-
-    #[cfg(test)]
-    /// Record a work request before posting it. Up to 32 at once.
-    fn reserve(
-        &self,
-        opcode: u32,
-        region: Option<Rc<NativeRegion>>,
-        window: Option<Rc<Window>>,
-    ) -> Result<(u64, Ticket)> {
-        if !self.ready() {
-            return Err(Error::Unavailable);
-        }
-        if self.sends.get() >= self.send_capacity {
-            return Err(Error::Overloaded);
-        }
-        let id = self.next.get();
-        if id & CALLER_ID_MASK != 0 {
-            return Err(Error::Overloaded);
-        }
-        self.next.set(id + 1);
-        let ticket = Ticket(Rc::new(TicketState::default()));
-        self.track(
-            id,
-            Pending {
-                ticket: Some(ticket.clone()),
-                opcode,
-                recv: false,
-                length: 0,
-                region,
-                _hold: None,
-                _window: window,
-                _memory_window: None,
-            },
-        );
-        Ok((id, ticket))
     }
 
     /// Add `pending` under `id` and count it against its queue.
@@ -1068,107 +848,17 @@ impl NativeQueuePair {
     /// drop the record.
     fn submitted(&self, id: u64, rc: i32) -> Result<()> {
         if rc != 0 {
-            if let Some(pending) = self.untrack(id) {
-                pending.finish(Err(Error::Io));
-            }
+            self.untrack(id);
             return Err(Error::Io);
         }
         Ok(())
     }
 
-    #[cfg(test)]
-    /// Open `region` to remote writes through a new window. One window at a
-    /// time. The region stays busy until the QP stops.
-    pub(crate) fn bind(&self, region: Rc<NativeRegion>) -> Result<(Rc<Window>, Ticket)> {
-        if !Rc::ptr_eq(&region.device, &self.device)
-            || region.busy.get()
-            || !self.windows.borrow().is_empty()
-        {
-            return Err(Error::InvalidRequest);
-        }
-        let mut key = 0;
-        let raw =
-            NonNull::new(unsafe { (self.device.api.window)(self.device.raw.as_ptr(), &mut key) })
-                .ok_or(Error::Unavailable)?;
-        let window = Rc::new(Window {
-            device: self.device.clone(),
-            raw,
-            key,
-            region: region.clone(),
-        });
-        let (id, ticket) = self.reserve(5, None, Some(window.clone()))?; // IBV_WC_BIND_MW
-        region.busy.set(true);
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-        self.windows.borrow_mut().push(window.clone());
-        let rc = unsafe {
-            (self.device.api.bind)(
-                self.raw.as_ptr(),
-                raw.as_ptr(),
-                region.raw.as_ptr(),
-                key,
-                id,
-                0,
-                region.length() as u32,
-            )
-        };
-        if let Err(error) = self.submitted(id, rc) {
-            self.stop()?;
-            return Err(error);
-        }
-        Ok((window, ticket))
-    }
-
-    #[cfg(test)]
-    /// Revoke `window`. The region stays busy until the QP stops.
-    pub(crate) fn invalidate(&self, window: Rc<Window>) -> Result<Ticket> {
-        if !self.windows.borrow().iter().any(|w| Rc::ptr_eq(w, &window)) {
-            return Err(Error::InvalidRequest);
-        }
-        let (id, ticket) = self.reserve(6, None, Some(window.clone()))?; // IBV_WC_LOCAL_INV
-        let rc = unsafe { (self.device.api.invalidate)(self.raw.as_ptr(), window.key, id) };
-        self.submitted(id, rc)?;
-        Ok(ticket)
-    }
-
-    #[cfg(test)]
-    /// Write `region` to the peer at `address` with `key`. The region is busy
-    /// until the write completes.
-    pub(crate) fn write(&self, region: Rc<NativeRegion>, address: u64, key: u32) -> Result<Ticket> {
-        if !Rc::ptr_eq(&region.device, &self.device)
-            || region.busy.get()
-            || address.checked_add(region.length as u64).is_none()
-        {
-            return Err(Error::InvalidRequest);
-        }
-        let (id, ticket) = self.reserve(1, Some(region.clone()), None)?; // IBV_WC_RDMA_WRITE
-        region.busy.set(true);
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-        let rc = unsafe {
-            (self.device.api.write)(
-                self.raw.as_ptr(),
-                region.raw.as_ptr(),
-                address,
-                key,
-                id,
-                region.length() as u32,
-            )
-        };
-        self.submitted(id, rc)?;
-        Ok(ticket)
-    }
-
-    #[cfg(test)]
-    /// Read up to 32 completions without blocking. Returns how many.
+    /// Read up to 32 completions without blocking and report each successful
+    /// completion to `sink` after its work is released. Returns how many.
     ///
-    /// Any failed or unexpected completion stops the QP and returns
-    /// [`Error::Io`].
-    pub(crate) fn progress(&self) -> Result<usize> {
-        self.progress_with(|_| {})
-    }
-
-    /// Like [`Self::progress`], and report each successful completion to
-    /// `sink` after its work is released. On a failed or unexpected
-    /// completion, [`Self::failure`] records it.
+    /// Any failed or unexpected completion stops the QP, records it in
+    /// [`Self::failure`], and returns [`Error::Io`].
     pub(crate) fn progress_with(&self, mut sink: impl FnMut(WorkCompletion)) -> Result<usize> {
         if self.stopped.get() {
             return Ok(0);
@@ -1176,15 +866,6 @@ impl NativeQueuePair {
         if self.terminating.get() {
             self.stop()?;
             return Err(Error::Cancelled);
-        }
-        #[cfg(test)]
-        if self
-            .expires
-            .get()
-            .is_some_and(|deadline| uring_runtime::environment::now() >= deadline)
-        {
-            self.stop()?;
-            return Err(Error::DeadlineExceeded);
         }
         let mut completions = [Completion::default(); 32];
         let n = unsafe { (self.device.api.poll)(self.raw.as_ptr(), completions.as_mut_ptr(), 32) };
@@ -1209,8 +890,8 @@ impl NativeQueuePair {
                 self.stop()?;
                 return Err(Error::Io);
             }
-            let pending = self.untrack(c.id).ok_or(Error::Io)?;
-            pending.finish(Ok(()));
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+            drop(self.untrack(c.id).ok_or(Error::Io)?);
             sink(WorkCompletion {
                 id: c.id,
                 opcode: c.opcode,
@@ -1222,7 +903,7 @@ impl NativeQueuePair {
     }
 
     /// Stop the QP for good. After success the NIC will not touch its memory
-    /// again: pending work is canceled and regions are no longer busy.
+    /// again, and pending work and its regions and windows are released.
     ///
     /// On failure nothing is released. Safe to retry.
     pub(crate) fn stop(&self) -> Result<()> {
@@ -1240,36 +921,8 @@ impl NativeQueuePair {
         let pending = std::mem::take(&mut *self.pending.borrow_mut());
         self.sends.set(0);
         self.recvs.set(0);
-        for (_, pending) in pending {
-            pending.finish(Err(Error::Cancelled));
-        }
-        for window in self.windows.borrow_mut().drain(..) {
-            window.region.busy.set(false);
-        }
+        drop(pending);
         Ok(())
-    }
-}
-
-impl NativeQueuePair {
-    /// Create a QP with `send_depth` send and `recv_depth` receive WRs, and
-    /// a CQ for both. Both depths must be nonzero.
-    pub(crate) fn new_with_depth(
-        device: Rc<NativeDevice>,
-        quota: Arc<GuardOwner>,
-        stop_observer: Arc<std::sync::atomic::AtomicBool>,
-        send_depth: u32,
-        recv_depth: u32,
-    ) -> Result<Rc<Self>> {
-        if send_depth == 0 || recv_depth == 0 || send_depth.checked_add(recv_depth).is_none() {
-            return Err(Error::InvalidConfiguration);
-        }
-        Self::create(
-            device,
-            quota,
-            stop_observer,
-            (send_depth, recv_depth),
-            (send_depth, recv_depth),
-        )
     }
 
     /// Validate and record a ranged post under the caller's `id`, then run
@@ -1286,8 +939,7 @@ impl NativeQueuePair {
         window: Option<Rc<MemoryWindow>>,
         post: impl FnOnce() -> c_int,
     ) -> Result<()> {
-        if id & CALLER_ID_MASK == 0
-            || (region.is_implicit() && (recv || opcode != opcode::RDMA_WRITE))
+        if (region.is_implicit() && (recv || opcode != opcode::RDMA_WRITE))
             || !Rc::ptr_eq(&region.device, &self.device)
             || !region.contains(offset, length)
             || self.pending.borrow().contains_key(&id)
@@ -1315,14 +967,11 @@ impl NativeQueuePair {
         self.track(
             id,
             Pending {
-                ticket: None,
                 opcode,
                 recv,
                 length,
-                region: None,
-                _hold: Some(region.clone()),
-                _window: None,
-                _memory_window: window,
+                _region: region.clone(),
+                _window: window,
             },
         );
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
@@ -1424,8 +1073,8 @@ impl NativeQueuePair {
         )
     }
 
-    /// Post a signaled bind of `window` over `length` bytes of `region` at
-    /// `offset`, with remote write access. Returns the window's new rkey.
+    /// Post a signaled, fenced bind of `window` over `length` bytes of
+    /// `region` at `offset`, with remote write access. Returns the window's new rkey.
     /// Completes with [`opcode::BIND_MW`]. The region must be registered
     /// with [`Access::PAGES`] (with or without remote write), and a window
     /// stays tied to the first region it is bound to.
@@ -1473,7 +1122,7 @@ impl NativeQueuePair {
         Ok(key)
     }
 
-    /// Post a signaled, fenced `LOCAL_INV` of `key` on `window`. Completes
+    /// Post a signaled `LOCAL_INV` of `key` on `window`. Not fenced. Completes
     /// with [`opcode::LOCAL_INV`].
     pub(crate) fn invalidate_window(
         &self,
@@ -1507,14 +1156,13 @@ impl NativeQueuePair {
 }
 
 impl Drop for NativeQueuePair {
-    /// Stop, then free. If stop fails, leak the QP's work, windows, and
-    /// device, since the NIC may still use them.
+    /// Stop, then free. If stop fails, leak the QP's work and device, since
+    /// the NIC may still use them.
     fn drop(&mut self) {
         if self.stop().is_err() {
             self.quota.quarantine();
             std::mem::forget(self.quota.clone());
             std::mem::forget(std::mem::take(self.pending.get_mut()));
-            std::mem::forget(std::mem::take(self.windows.get_mut()));
             std::mem::forget(self.device.clone());
             return;
         }
@@ -1536,7 +1184,8 @@ mod tests {
     #[test]
     #[ignore = "requires built C adapter on loader path; no RDMA hardware required"]
     fn required_native_adapter_loads_abi_and_symbols() {
-        let api = Api::load().expect("built native adapter must load with ABI 2 and all symbols");
+        let api = Api::load()
+            .expect("built native adapter must load with the current ABI and all symbols");
         assert!(api.library.is_some(), "must load C adapter, not simulation");
     }
 
@@ -1578,9 +1227,9 @@ pub(crate) mod lifetime_tests {
     use super::*;
 
     #[cfg(feature = "native")]
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    use std::{collections::VecDeque, time::Instant};
+    use std::collections::VecDeque;
 
     /// Scripted native failures, queued completions, and teardown observations.
     #[derive(Default)]
@@ -1595,7 +1244,7 @@ pub(crate) mod lifetime_tests {
 
         poll_fails: bool,
 
-        /// Native post calls that reached the adapter (ranged path and bind).
+        /// Native post calls that reached the adapter.
         posts: usize,
     }
 
@@ -1754,25 +1403,9 @@ pub(crate) mod lifetime_tests {
         post_result()
     }
 
-    /// Accept invalidation whose completion is injected separately.
+    /// Accept or reject an invalidation according to the fault script.
     unsafe extern "C" fn invalidate(_: *mut c_void, _: u32, _: u64) -> c_int {
-        0
-    }
-
-    /// Accept or synchronously reject a write according to the fault script.
-    unsafe extern "C" fn write(
-        _: *mut c_void,
-        _: *mut c_void,
-        _: u64,
-        _: u32,
-        _: u64,
-        _: u32,
-    ) -> c_int {
-        if FAULTS.with_borrow(|f| f.post_fails) {
-            5
-        } else {
-            0
-        }
+        post_result()
     }
 
     /// Drain injected completions unless polling is scripted to fail.
@@ -1819,7 +1452,6 @@ pub(crate) mod lifetime_tests {
             window_free,
             bind,
             invalidate,
-            write,
             write_imm,
             send,
             post_recv,
@@ -1840,10 +1472,17 @@ pub(crate) mod lifetime_tests {
                 link_layer: 1,
             },
         });
-        let qp = NativeQueuePair::new(device.clone()).unwrap();
+        let qp = NativeQueuePair::new_with_depth(
+            device.clone(),
+            GuardOwner::new(Arc::new(())),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            32,
+            4,
+        )
+        .unwrap();
         qp.connect(qp.endpoint).unwrap();
         let (quota, charged) = quota();
-        let region = NativeRegion::new(device, 32, quota).unwrap();
+        let region = NativeRegion::with_access(device, 32, Access::PAGES, quota).unwrap();
         (qp, region, charged)
     }
 
@@ -1863,14 +1502,14 @@ pub(crate) mod lifetime_tests {
     }
 
     #[test]
-    /// Dropping the waiter must not release memory still owned by native work.
-    fn canceled_waiter_retains_source_and_quota_until_terminal_fence() {
+    /// Dropping the caller's handle must not release memory still owned by
+    /// native work.
+    fn posted_write_retains_source_and_quota_until_terminal_fence() {
         let (qp, region, charged) = fixture();
-        let ticket = qp.write(region.clone(), 4096, 7).unwrap();
-        drop(ticket);
+        qp.write_imm(wr(1), &region, 0, 32, 4096, 7, 0).unwrap();
         drop(region);
         assert_eq!(charged.get(), 1);
-        assert_eq!(qp.progress().unwrap(), 0);
+        assert_eq!(drain(&qp).unwrap(), []);
         assert_eq!(charged.get(), 1);
         qp.stop().unwrap();
         assert_eq!(charged.get(), 0);
@@ -1879,26 +1518,22 @@ pub(crate) mod lifetime_tests {
     }
 
     #[test]
-    /// Failed fencing retains the grant and quota while late DMA remains possible.
+    /// Failed fencing keeps an in-flight bind's window and region charged
+    /// while late DMA remains possible. The window is freed before its region.
     fn failed_fence_quarantines_late_remote_writes_and_quota() {
         let (qp, region, charged) = fixture();
-        let (window, ticket) = qp.bind(region.clone()).unwrap();
-        complete(1, 0, 5);
-        qp.progress().unwrap();
-        assert_eq!(ticket.result(), Some(Ok(())));
-        // Bind completion permits remote DMA, not CPU reuse.
-        assert_eq!(region.copy_to(), Err(Error::Unavailable));
+        let window = MemoryWindow::new(&qp.device).unwrap();
+        qp.bind_window(wr(1), &window, &region, 0, 32).unwrap();
         FAULTS.with_borrow_mut(|f| f.stop_fails = true);
         assert_eq!(qp.stop(), Err(Error::Io));
         // Inject a late NIC write while the owner is quarantined.
         unsafe {
             *bytes(region.raw.as_ptr()) = 99;
         }
-        assert_eq!(region.copy_to(), Err(Error::Unavailable));
         drop(region);
         drop(window);
-        drop(ticket);
         assert_eq!(charged.get(), 1);
+        FAULTS.with_borrow(|f| assert!(!f.events.contains(&"mw")));
         FAULTS.with_borrow_mut(|f| f.stop_fails = false);
         qp.stop().unwrap();
         assert_eq!(charged.get(), 0);
@@ -1914,42 +1549,43 @@ pub(crate) mod lifetime_tests {
     fn cq_errors_and_unknown_ids_require_fence_before_release() {
         for mode in 0..3 {
             let (qp, region, charged) = fixture();
-            let ticket = qp.write(region.clone(), 4096, 7).unwrap();
+            qp.write_imm(wr(1), &region, 0, 32, 4096, 7, 0).unwrap();
             drop(region);
             FAULTS.with_borrow_mut(|f| {
                 f.stop_fails = true;
                 f.poll_fails = mode == 2;
             });
             if mode == 0 {
-                complete(1, 10, u32::MAX);
+                complete(wr(1), status::REM_ACCESS_ERR, u32::MAX);
             }
             if mode == 1 {
-                complete(99, 0, 1);
+                complete(wr(99), 0, opcode::RDMA_WRITE);
             }
-            assert_eq!(qp.progress(), Err(Error::Io));
-            assert_eq!(ticket.result(), None);
+            assert_eq!(drain(&qp), Err(Error::Io));
             assert_eq!(charged.get(), 1);
             FAULTS.with_borrow_mut(|f| f.stop_fails = false);
             qp.stop().unwrap();
-            assert_eq!(ticket.result(), Some(Err(Error::Cancelled)));
             assert_eq!(charged.get(), 0);
         }
     }
 
     #[test]
-    /// Immediate rejection and successful completion each restore source access.
+    /// A rejected post holds nothing; a posted one holds its region until
+    /// its completion.
     fn write_success_and_post_rejection_have_distinct_release_paths() {
         let (qp, region, charged) = fixture();
         FAULTS.with_borrow_mut(|f| f.post_fails = true);
-        assert!(qp.write(region.clone(), 4096, 7).is_err());
-        assert!(region.copy_from(&[4; 32]).is_ok());
+        assert_eq!(
+            qp.write_imm(wr(1), &region, 0, 32, 4096, 7, 0),
+            Err(Error::Io)
+        );
+        assert_eq!(Rc::strong_count(&region), 1);
         FAULTS.with_borrow_mut(|f| f.post_fails = false);
-        let ticket = qp.write(region.clone(), 4096, 7).unwrap();
-        assert!(region.copy_from(&[5; 32]).is_err());
-        complete(2, 0, 1);
-        qp.progress().unwrap();
-        assert_eq!(ticket.result(), Some(Ok(())));
-        assert_eq!(region.copy_to().unwrap(), [4; 32]);
+        qp.write_imm(wr(1), &region, 0, 32, 4096, 7, 0).unwrap();
+        assert_eq!(Rc::strong_count(&region), 2);
+        complete(wr(1), 0, opcode::RDMA_WRITE);
+        assert_eq!(drain(&qp).unwrap().len(), 1);
+        assert_eq!(Rc::strong_count(&region), 1);
         drop(region);
         assert_eq!(charged.get(), 0);
     }
@@ -1959,19 +1595,18 @@ pub(crate) mod lifetime_tests {
     fn reversed_completions_release_only_their_own_allocation() {
         let (qp, first, first_charge) = fixture();
         let (quota, second_charge) = quota();
-        let second = NativeRegion::new(qp.device.clone(), 32, quota).unwrap();
-        let one = qp.write(first.clone(), 4096, 7).unwrap();
-        let two = qp.write(second.clone(), 8192, 8).unwrap();
+        let second =
+            NativeRegion::with_access(qp.device.clone(), 32, Access::PAGES, quota).unwrap();
+        qp.write_imm(wr(1), &first, 0, 32, 4096, 7, 0).unwrap();
+        qp.write_imm(wr(2), &second, 0, 32, 8192, 8, 0).unwrap();
         drop(first);
         drop(second);
-        complete(2, 0, 1);
-        qp.progress().unwrap();
-        assert_eq!(one.result(), None);
-        assert_eq!(two.result(), Some(Ok(())));
+        complete(wr(2), 0, opcode::RDMA_WRITE);
+        drain(&qp).unwrap();
         assert_eq!(first_charge.get(), 1);
         assert_eq!(second_charge.get(), 0);
-        complete(1, 0, 1);
-        qp.progress().unwrap();
+        complete(wr(1), 0, opcode::RDMA_WRITE);
+        drain(&qp).unwrap();
         assert_eq!(first_charge.get(), 0);
     }
 
@@ -1979,10 +1614,10 @@ pub(crate) mod lifetime_tests {
     /// Destruction after an unrecoverable fence deliberately retains charged owners.
     fn unrecoverable_destroy_never_releases_quarantined_quota() {
         let (qp, region, charged) = fixture();
-        let (window, ticket) = qp.bind(region.clone()).unwrap();
+        let window = MemoryWindow::new(&qp.device).unwrap();
+        qp.bind_window(wr(1), &window, &region, 0, 32).unwrap();
         drop(region);
         drop(window);
-        drop(ticket);
         FAULTS.with_borrow_mut(|f| f.stop_fails = true);
         drop(qp);
         assert_eq!(charged.get(), 1);
@@ -1991,39 +1626,20 @@ pub(crate) mod lifetime_tests {
     }
 
     #[test]
-    /// Expiry fences idle grants and the work table rejects its thirty-third entry.
-    fn deadline_retires_idle_remote_grant_and_bounds_submission_table() {
-        let (qp, region, _) = fixture();
-        let (_window, _ticket) = qp.bind(region.clone()).unwrap();
-        qp.expire_at(Instant::now());
-        assert_eq!(qp.progress(), Err(Error::DeadlineExceeded));
-        assert!(!qp.ready());
-        assert!(region.copy_to().is_ok());
-        let (qp, region, _) = fixture();
-        for _ in 0..32 {
-            qp.reserve(1, None, None).unwrap();
-        }
-        assert!(matches!(qp.reserve(1, None, None), Err(Error::Overloaded)));
-        drop(region);
-    }
-
-    #[test]
-    /// Key revocation alone never permits CPU reuse of remotely writable memory.
-    fn invalidation_cqe_does_not_release_remote_buffer_before_terminal_fence() {
+    /// Key revocation alone never releases remotely writable memory: the
+    /// window holds its last region until the window is freed.
+    fn invalidation_cqe_does_not_release_remote_buffer() {
         let (qp, region, charged) = fixture();
-        let (window, bind) = qp.bind(region.clone()).unwrap();
-        complete(1, 0, 5);
-        qp.progress().unwrap();
-        assert_eq!(bind.result(), Some(Ok(())));
-        let invalidation = qp.invalidate(window.clone()).unwrap();
-        complete(2, 0, 6);
-        qp.progress().unwrap();
-        assert_eq!(invalidation.result(), Some(Ok(())));
-        assert_eq!(region.copy_to(), Err(Error::Unavailable));
+        let window = MemoryWindow::new(&qp.device).unwrap();
+        let key = qp.bind_window(wr(1), &window, &region, 0, 32).unwrap();
+        complete(wr(1), 0, opcode::BIND_MW);
+        qp.invalidate_window(wr(2), &window, key).unwrap();
+        complete(wr(2), 0, opcode::LOCAL_INV);
+        assert_eq!(drain(&qp).unwrap().len(), 2);
+        drop(region);
         assert_eq!(charged.get(), 1);
         qp.stop().unwrap();
-        assert!(region.copy_to().is_ok());
-        drop(region);
+        assert_eq!(charged.get(), 1);
         drop(window);
         assert_eq!(charged.get(), 0);
     }
@@ -2149,8 +1765,7 @@ pub(crate) mod lifetime_tests {
     /// Bad ids, ranges, regions, and full queues are refused before the adapter.
     fn ranged_posts_validate_before_reaching_the_adapter() {
         let (qp, region) = ranged_fixture(2, 1);
-        // Slot-path id space, zero length, past the end, and offset overflow.
-        assert_eq!(qp.send(1, &region, 0, 8), Err(Error::InvalidRequest));
+        // Zero length, past the end, and offset overflow.
         assert_eq!(qp.send(wr(1), &region, 0, 0), Err(Error::InvalidRequest));
         assert_eq!(qp.send(wr(1), &region, 250, 8), Err(Error::InvalidRequest));
         assert_eq!(
@@ -2372,7 +1987,8 @@ pub(crate) mod lifetime_tests {
     #[cfg(feature = "native")]
     #[test]
     #[ignore = "requires an active type-2B provider; exercises real loopback RC DMA"]
-    /// Real loopback DMA copies bytes and rejects a capability after invalidation.
+    /// Real loopback write with immediate lands through a bound window, and
+    /// an invalidated key rejects the next write.
     fn native_available_provider_write_bind_invalidate_and_fence() {
         let devices = super::discover().expect("native adapter unavailable");
         let name =
@@ -2383,54 +1999,66 @@ pub(crate) mod lifetime_tests {
                 .find(|d| d.name == name)
                 .expect("selected provider not active or no type-2B support"),
         );
-        let receiver = NativeQueuePair::new(device.clone()).unwrap();
-        let sender = NativeQueuePair::new(device.clone()).unwrap();
+        let qp = || {
+            NativeQueuePair::new_with_depth(
+                device.clone(),
+                quota().0,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                4,
+                4,
+            )
+            .unwrap()
+        };
+        let receiver = qp();
+        let sender = qp();
         receiver.connect(sender.endpoint).unwrap();
         sender.connect(receiver.endpoint).unwrap();
-        let destination = NativeRegion::new(device.clone(), 4096, quota().0).unwrap();
-        let source = NativeRegion::new(device.clone(), 4096, quota().0).unwrap();
-        source.copy_from(&vec![0xa5; 4096]).unwrap();
-        let (window, bind) = receiver.bind(destination.clone()).unwrap();
+        let region = |access| NativeRegion::with_access(device.clone(), 4096, access, quota().0);
+        let destination = region(Access::PAGES_REMOTE_WRITE).unwrap();
+        let source = region(Access::PAGES).unwrap();
+        let control = region(Access::CONTROL).unwrap();
+        unsafe { std::ptr::write_bytes(source.as_ptr(), 0xa5, 4096) };
 
-        /// Poll a real provider with a bounded completion deadline.
-        fn wait(qp: &NativeQueuePair, ticket: &Ticket) {
+        /// Poll a real provider until `id` completes or the QP breaks.
+        fn wait(qp: &NativeQueuePair, id: u64) -> Result<()> {
             let until = Instant::now() + Duration::from_secs(10);
-            while ticket.result().is_none() {
+            loop {
                 assert!(Instant::now() < until, "native CQ timeout");
-                qp.progress().unwrap();
+                let mut done = false;
+                qp.progress_with(|c| done |= c.id == id)?;
+                if done {
+                    return Ok(());
+                }
                 std::thread::sleep(Duration::from_millis(1));
             }
-            ticket.result().unwrap().unwrap();
         }
 
-        wait(&receiver, &bind);
-        let write = sender
-            .write(source, destination.address(), window.key)
+        let window = MemoryWindow::new(&device).unwrap();
+        let key = receiver
+            .bind_window(wr(1), &window, &destination, 0, 4096)
             .unwrap();
-        wait(&sender, &write);
-        let stale_key = window.key;
-        let inv = receiver.invalidate(window).unwrap();
-        wait(&receiver, &inv);
-        // A completed local invalidation must reject a subsequent write using the
-        // old capability. It still does not authorize CPU access before the fence.
-        assert_eq!(destination.copy_to(), Err(Error::Unavailable));
-        let stale = NativeRegion::new(device, 4096, quota().0).unwrap();
-        stale.copy_from(&vec![0xff; 4096]).unwrap();
-        let rejected = sender
-            .write(stale, destination.address(), stale_key)
+        wait(&receiver, wr(1)).unwrap();
+        receiver.post_recv(wr(2), &control, 0, 64).unwrap();
+        sender
+            .write_imm(wr(3), &source, 0, 4096, destination.address(), key, 7)
             .unwrap();
-        let until = Instant::now() + Duration::from_secs(10);
-        while rejected.result().is_none() {
-            assert!(Instant::now() < until, "stale-key completion timeout");
-            let _ = sender.progress();
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        wait(&sender, wr(3)).unwrap();
+        wait(&receiver, wr(2)).unwrap();
+        receiver.invalidate_window(wr(4), &window, key).unwrap();
+        wait(&receiver, wr(4)).unwrap();
+        // A completed invalidation rejects a write with the old key.
+        unsafe { std::ptr::write_bytes(source.as_ptr(), 0xff, 4096) };
+        receiver.post_recv(wr(5), &control, 0, 64).unwrap();
+        sender
+            .write_imm(wr(6), &source, 0, 4096, destination.address(), key, 8)
+            .unwrap();
         assert!(
-            rejected.result().unwrap().is_err(),
+            wait(&sender, wr(6)).is_err(),
             "invalidated rkey still allowed a write"
         );
         receiver.stop().unwrap();
         sender.stop().unwrap();
-        assert_eq!(destination.copy_to().unwrap(), vec![0xa5; 4096]);
+        let landed = unsafe { std::slice::from_raw_parts(destination.as_ptr(), 4096) };
+        assert_eq!(landed, [0xa5; 4096]);
     }
 }

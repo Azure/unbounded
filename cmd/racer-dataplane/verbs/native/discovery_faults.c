@@ -113,8 +113,9 @@ static void *test_calloc(size_t count, size_t size) {
 #define calloc test_calloc
 #include "verbs.c"
 
-/* Post one bind through a fake QP and return its send flags, or UINT_MAX if
- * the post failed or was not a bind. */
+/* Post one bind (`which` 0) or invalidate (`which` 1) through a fake QP and
+ * return its send flags, or UINT_MAX if the post failed or had the wrong
+ * opcode. */
 static unsigned posted_opcode, posted_flags;
 
 static int test_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_send_wr **bad) {
@@ -123,7 +124,7 @@ static int test_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_
     return 0;
 }
 
-unsigned rdma_test_bind_flags(void) {
+unsigned rdma_test_post_flags(unsigned which) {
     static struct ibv_context context;
     static struct ibv_qp qp;
     struct ibv_mr mr = {0};
@@ -133,7 +134,8 @@ unsigned rdma_test_bind_flags(void) {
     struct rdma_verbs_qp q = { .qp = &qp };
     struct rdma_verbs_mr m = { .mr = &mr, .bytes = (void *)4096, .length = 8192 };
     posted_opcode = UINT_MAX;
-    if (rdma_verbs_bind(&q, &mw, &m, 1, 2, 0, 4096) || posted_opcode != IBV_WR_BIND_MW)
+    int rc = which ? rdma_verbs_invalidate(&q, 1, 2) : rdma_verbs_bind(&q, &mw, &m, 1, 2, 0, 4096);
+    if (rc || posted_opcode != (which ? IBV_WR_LOCAL_INV : IBV_WR_BIND_MW))
         return UINT_MAX;
     return posted_flags;
 }

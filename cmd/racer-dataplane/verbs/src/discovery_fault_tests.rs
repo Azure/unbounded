@@ -10,7 +10,7 @@ static FAULTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[ignore = "requires discovery_faults.c adapter, not the production adapter"]
 fn internal_close_failures_keep_admission_and_adapter() {
     let _lock = FAULTS.lock().unwrap();
-    let api = Api::load().expect("load ABI 2 C fault adapter");
+    let api = Api::load().expect("load C fault adapter");
     let library = api.library.unwrap();
     let reset = unsafe { libc::dlsym(library.as_ptr(), c"rdma_test_reset".as_ptr()) };
     let count = unsafe { libc::dlsym(library.as_ptr(), c"rdma_test_count".as_ptr()) };
@@ -94,21 +94,23 @@ fn internal_close_failures_keep_admission_and_adapter() {
     }
 }
 
-/// A bind is fenced behind earlier work on its QP. Without the fence, mlx5
-/// can fail a bind queued behind a zero-copy write whose implicit ODP source
-/// page faults (`IBV_WC_MW_BIND_ERR`), breaking every link that both writes
-/// and grants.
+/// A bind is signaled and fenced behind earlier work on its QP. Without the
+/// fence, mlx5 can fail a bind queued behind a zero-copy write whose implicit
+/// ODP source page faults (`IBV_WC_MW_BIND_ERR`), breaking every link that
+/// both writes and grants. An invalidate is signaled only.
 #[test]
 #[ignore = "requires discovery_faults.c adapter, not the production adapter"]
 fn bind_is_signaled_and_fenced() {
     let _lock = FAULTS.lock().unwrap();
     let api = Api::load().expect("load C fault adapter");
     let library = api.library.unwrap();
-    let flags = unsafe { libc::dlsym(library.as_ptr(), c"rdma_test_bind_flags".as_ptr()) };
+    let flags = unsafe { libc::dlsym(library.as_ptr(), c"rdma_test_post_flags".as_ptr()) };
     assert!(!flags.is_null(), "must load C faults");
-    let flags: unsafe extern "C" fn() -> u32 = unsafe { std::mem::transmute(flags) };
+    let flags: unsafe extern "C" fn(u32) -> u32 = unsafe { std::mem::transmute(flags) };
     // IBV_SEND_FENCE | IBV_SEND_SIGNALED.
-    assert_eq!(unsafe { flags() }, 1 | 2);
+    assert_eq!(unsafe { flags(0) }, 1 | 2);
+    // IBV_SEND_SIGNALED.
+    assert_eq!(unsafe { flags(1) }, 2);
 }
 
 /// Check the real C open outcomes and retain only failed cleanup owners.
@@ -116,7 +118,7 @@ fn bind_is_signaled_and_fenced() {
 #[ignore = "requires discovery_faults.c adapter, not the production adapter"]
 fn open_cleanup_failures_keep_admission_and_adapter() {
     let _lock = FAULTS.lock().unwrap();
-    let api = Api::load().expect("load ABI 2 C fault adapter");
+    let api = Api::load().expect("load C fault adapter");
     let library = api.library.unwrap();
     let reset = unsafe { libc::dlsym(library.as_ptr(), c"rdma_test_reset".as_ptr()) };
     let count = unsafe { libc::dlsym(library.as_ptr(), c"rdma_test_count".as_ptr()) };
