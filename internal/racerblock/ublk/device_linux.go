@@ -71,6 +71,8 @@ type Device struct {
 
 // Start creates the device, starts serving it with h and returns once
 // /dev/ublkb<ID> exists. The device is torn down when ctx is canceled.
+// If ctx is canceled before Start returns, Start tears the device down and
+// returns ctx.Err().
 func Start(ctx context.Context, cfg Config, h Handler) (*Device, error) {
 	if h == nil {
 		return nil, errors.New("ublk: nil handler")
@@ -107,6 +109,14 @@ func Start(ctx context.Context, cfg Config, h Handler) (*Device, error) {
 	d.hctx, d.hcancel = context.WithCancel(ctx)
 
 	if err := d.runStartup(d.start); err != nil {
+		d.teardown(err)
+		return nil, err
+	}
+
+	// START_DEV can block on reads, such as a synchronous partition scan,
+	// that fail once ctx is canceled. Do not report a device as started
+	// when its context ended during startup.
+	if err := ctx.Err(); err != nil {
 		d.teardown(err)
 		return nil, err
 	}
