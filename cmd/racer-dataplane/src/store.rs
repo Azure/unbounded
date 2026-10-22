@@ -360,6 +360,16 @@ impl StoreWriter {
     pub fn retention(&self) -> Rc<crate::retention::Retention> {
         self.index.retention()
     }
+    /// One ranking pass over this worker's disk shares.
+    pub(crate) fn scoring<'a>(
+        &self,
+        retention: &'a crate::retention::Retention,
+    ) -> crate::retention::Scoring<'a> {
+        retention.scoring_at(
+            uring_runtime::environment::now(),
+            self.index.disk_capacity(),
+        )
+    }
     /// Install before read engines capture the shared policy.
     pub fn set_retention(&self, retention: Rc<crate::retention::Retention>) {
         self.index.set_retention(retention);
@@ -449,6 +459,34 @@ impl StoreWriter {
             })
             .collect();
         self.metrics.observe_disks(samples);
+    }
+    /// Sample per-cache resident bytes and fair shares for published caches.
+    pub(crate) fn observe_cache_disks(&self, caches: &[racer_control_wire::CacheDefinition]) {
+        let samples = self
+            .retention()
+            .cache_disk(self.index.disk_capacity())
+            .into_iter()
+            .filter_map(|usage| {
+                let cache = caches.iter().find(|cache| cache.id == usage.cache)?;
+                Some(crate::telemetry::CacheDiskUsage {
+                    cache: cache.name.as_str().into(),
+                    resident: usage.resident_bytes,
+                    share: usage.share_bytes,
+                })
+            })
+            .collect();
+        self.metrics.observe_cache_disks(samples);
+    }
+    /// Whether optional pages of `cache` should skip disk admission: the cache
+    /// is over its fair share and no free segment remains beyond the reserve.
+    pub(crate) fn over_share_under_pressure(&self, cache: &CacheId) -> bool {
+        let Some(reserve) = self.clock.borrow().as_ref().map(|clock| clock.reserve()) else {
+            return false;
+        };
+        self.segments.free_count() <= reserve
+            && self
+                .retention()
+                .over_share(cache, self.index.disk_capacity())
     }
     pub fn slabs(&self) -> &Rc<Slab<flow_control::Charge<AdmissionPolicy>>> {
         &self.slabs
@@ -671,6 +709,8 @@ impl StoreWriter {
         let full = self.pending.borrow().len() >= self.capacity.get();
         if full {
             let retention = self.retention();
+            let scoring = self.scoring(&retention);
+            // An over-share page never displaces an under-share page.
             let victim = self
                 .queue
                 .borrow()
@@ -678,12 +718,12 @@ impl StoreWriter {
                 .enumerate()
                 .take(QUEUE_RECLAIM_CANDIDATES)
                 .filter(|(_, page)| !self.protected_pending(page))
-                .min_by_key(|(_, page)| retention.score(page))
-                .map(|(position, page)| (position, page.clone(), retention.score(page)));
-            let Some((position, victim, score)) = victim else {
+                .map(|(position, page)| (position, page.clone(), scoring.rank(page)))
+                .min_by_key(|(_, _, rank)| *rank);
+            let Some((position, victim, rank)) = victim else {
                 return Err(Error::Overloaded);
             };
-            if !self.index.is_held(&id) && retention.score(&id) <= score {
+            if !self.index.is_held(&id) && scoring.rank(&id) <= rank {
                 return Err(Error::Overloaded);
             }
             self.queue.borrow_mut().remove(position);
@@ -835,9 +875,10 @@ impl StoreWriter {
         if (dirty_bytes == 0 && staging_bytes == 0) || !retention.is_owned(incoming) {
             return 0;
         }
+        let scoring = self.scoring(&retention);
         let mut queue = self.queue.borrow_mut();
         let mut pending = self.pending.borrow_mut();
-        let candidates: Vec<_> = queue
+        let mut candidates: Vec<_> = queue
             .iter()
             .take(QUEUE_RECLAIM_CANDIDATES)
             .filter(|id| {
@@ -848,6 +889,8 @@ impl StoreWriter {
             })
             .cloned()
             .collect();
+        // Release over-share pages first; the stable sort keeps queue order otherwise.
+        candidates.sort_by_cached_key(|id| !scoring.over_share(&id.version.object.cache));
         let (mut dirty_released, mut staging_released, mut removed) = (0usize, 0usize, 0usize);
         for id in candidates {
             if dirty_released >= dirty_bytes && staging_released >= staging_bytes {
@@ -876,6 +919,7 @@ impl StoreWriter {
         let mut removed = 0;
         let mut pending = self.pending.borrow_mut();
         let retention = self.retention();
+        let scoring = self.scoring(&retention);
         let mut queue = self.queue.borrow_mut();
         let mut candidates: Vec<_> = queue
             .iter()
@@ -883,9 +927,9 @@ impl StoreWriter {
             .filter(|id| cache.is_none_or(|cache| cache == &id.version.object.cache))
             .filter(|id| !self.index.is_held(id))
             .filter(|id| pending.get(*id).is_none_or(|dirty| dirty.hold.is_none()))
-            .map(|id| (retention.score(id), id.clone()))
+            .map(|id| (scoring.rank(id), id.clone()))
             .collect();
-        candidates.sort_by_key(|(score, _)| *score);
+        candidates.sort_by_key(|(rank, _)| *rank);
         for (_, id) in candidates {
             if released >= bytes {
                 break;
@@ -929,13 +973,14 @@ impl StoreWriter {
                 let position = {
                     let queue = self.queue.borrow();
                     let retention = self.retention();
+                    let scoring = self.scoring(&retention);
                     // Reverse the tie breaker to keep FIFO within equal value.
                     queue
                         .iter()
                         .enumerate()
                         .take(QUEUE_RECLAIM_CANDIDATES)
                         .max_by_key(|(position, id)| {
-                            (retention.score(id), std::cmp::Reverse(*position))
+                            (scoring.rank(id), std::cmp::Reverse(*position))
                         })
                         .map(|(position, _)| position)
                 };

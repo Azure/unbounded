@@ -2144,6 +2144,14 @@ impl Fill {
         let owned = retention.owned_only(id).eligible();
         let admission = &self.dependencies.admission;
         let amount = result.ciphertext.bytes().len();
+        // Optional pages of an over-share cache do not displace other caches'
+        // data once free segments reach the reserve. Owned pages compete
+        // through eviction instead.
+        if !owned && self.dependencies.writer.over_share_under_pressure(cache) {
+            retention.share_rejected();
+            retention.persistence_attempt(false);
+            return;
+        }
         if !owned
             && !optional_headroom(
                 admission.limit(ResourceClass::DirtyCiphertext),

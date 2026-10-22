@@ -1034,6 +1034,34 @@ mod retention_metric_tests {
     }
 
     #[test]
+    fn cache_disk_usage_sums_workers_by_name_and_drops_removed_caches() {
+        let workers = Metrics::for_workers(2).unwrap();
+        let mut output = String::new();
+        workers[0].write_cache_disks(&mut output).unwrap();
+        assert!(output.is_empty());
+        let sample = |cache: &str, resident, share| CacheDiskUsage {
+            cache: cache.into(),
+            resident,
+            share,
+        };
+        workers[0].observe_cache_disks(vec![sample("models", 900, 800), sample("logs", 50, 200)]);
+        workers[1].observe_cache_disks(vec![sample("models", 100, 800), sample("x\"\n", 1, 2)]);
+        workers[1].write_prometheus(&mut output).unwrap();
+        assert!(output.contains("# TYPE racer_cache_disk_resident_bytes gauge\n"));
+        assert!(output.contains("# TYPE racer_cache_disk_share_bytes gauge\n"));
+        assert!(output.contains("racer_cache_disk_resident_bytes{cache=\"models\"} 1000\n"));
+        assert!(output.contains("racer_cache_disk_share_bytes{cache=\"models\"} 1600\n"));
+        assert!(output.contains("racer_cache_disk_resident_bytes{cache=\"logs\"} 50\n"));
+        assert!(output.contains("racer_cache_disk_share_bytes{cache=\"x\\\"\\n\"} 2\n"));
+        workers[0].observe_cache_disks(vec![sample("models", 0, 1000)]);
+        workers[1].observe_cache_disks(vec![]);
+        output.clear();
+        workers[0].write_cache_disks(&mut output).unwrap();
+        assert!(!output.contains("logs"));
+        assert!(output.contains("racer_cache_disk_share_bytes{cache=\"models\"} 1000\n"));
+    }
+
+    #[test]
     fn disk_observability_aggregates_fixed_classes_and_replaces_gauges() {
         let workers = Metrics::for_workers(2).unwrap();
         for (i, worker) in workers.iter().enumerate() {
@@ -2987,6 +3015,7 @@ pub struct Metrics {
     disks: ::telemetry::SnapshotShards<Vec<DiskUsage>>,
 
     memory: Arc<MemoryShards>,
+    cache_disks: ::telemetry::SnapshotShards<Vec<CacheDiskUsage>>,
 
     shard: usize,
 }
@@ -3093,6 +3122,14 @@ fn write_pools(
 }
 
 #[derive(Clone)]
+/// One worker's indexed payload and fair disk share for a published cache.
+pub(crate) struct CacheDiskUsage {
+    pub cache: Arc<str>,
+    pub resident: u64,
+    pub share: u64,
+}
+
+#[derive(Clone)]
 /// One worker's assigned capacity and reserved record bytes on a backing disk.
 pub(crate) struct DiskUsage {
     pub disk: Arc<str>,
@@ -3111,7 +3148,7 @@ fn write_disk_label(out: &mut impl Write, disk: &str) -> std::fmt::Result {
     }
     Ok(())
 }
-const RETENTION_METRICS: [(&str, &str); 9] = [
+const RETENTION_METRICS: [(&str, &str); 10] = [
     ("racer_retention_observations_total", "counter"),
     ("racer_retention_qualified_total", "counter"),
     ("racer_retention_persistence_attempts_total", "counter"),
@@ -3121,6 +3158,11 @@ const RETENTION_METRICS: [(&str, &str); 9] = [
     ("racer_retention_heat_entries", "gauge"),
     ("racer_disk_pending_payload_bytes", "gauge"),
     ("racer_disk_indexed_payload_bytes", "gauge"),
+    ("racer_retention_share_rejected_total", "counter"),
+];
+const CACHE_DISK_METRICS: [&str; 2] = [
+    "racer_cache_disk_resident_bytes",
+    "racer_cache_disk_share_bytes",
 ];
 const HELD_METRICS: [(&str, &str); 3] = [
     ("racer_warm_held_pages", "gauge"),
@@ -3445,6 +3487,36 @@ impl Metrics {
         Ok(())
     }
 
+    /// Replace this worker's per-cache disk samples. Only published caches are
+    /// sampled, so a removed cache's series disappear on the next tick.
+    pub(crate) fn observe_cache_disks(&self, samples: Vec<CacheDiskUsage>) {
+        self.cache_disks.replace(self.shard, samples);
+    }
+
+    fn write_cache_disks(&self, out: &mut impl Write) -> std::fmt::Result {
+        let mut totals = std::collections::BTreeMap::<Arc<str>, (u64, u64)>::new();
+        for shard in self.cache_disks.snapshots() {
+            for sample in shard {
+                let total = totals.entry(sample.cache).or_default();
+                total.0 = total.0.saturating_add(sample.resident);
+                total.1 = total.1.saturating_add(sample.share);
+            }
+        }
+        if !totals.is_empty() {
+            for metric in CACHE_DISK_METRICS {
+                writeln!(out, "# TYPE {metric} gauge")?;
+            }
+        }
+        for (cache, (resident, share)) in totals {
+            for (metric, value) in CACHE_DISK_METRICS.into_iter().zip([resident, share]) {
+                write!(out, "{metric}{{cache=\"")?;
+                write_disk_label(out, &cache)?;
+                writeln!(out, "\"}} {value}")?;
+            }
+        }
+        Ok(())
+    }
+
     /// Sample on the owning worker's health tick, never on a request hot path.
     /// Diagnostics aggregate fixed-size copies without accessing worker-local Rc.
     pub(crate) fn observe_retention(&self, snapshot: crate::retention::Snapshot) {
@@ -3465,6 +3537,7 @@ impl Metrics {
                 snapshot.heat_entries as u64,
                 snapshot.pending_payload_bytes,
                 snapshot.indexed_payload_bytes,
+                snapshot.share_rejected,
             ]) {
                 *total = total.saturating_add(value);
             }
@@ -3621,6 +3694,7 @@ impl Metrics {
             staging: ::telemetry::SnapshotShards::new(count),
             process: ::telemetry::SnapshotShards::new(1),
         });
+        let cache_disks = ::telemetry::SnapshotShards::new(count);
         Ok(::telemetry::Metrics::shards(count)
             .into_iter()
             .enumerate()
@@ -3631,6 +3705,7 @@ impl Metrics {
                 held: held.clone(),
                 disks: disks.clone(),
                 memory: memory.clone(),
+                cache_disks: cache_disks.clone(),
                 shard,
             })
             .collect())
@@ -3693,6 +3768,7 @@ impl Metrics {
         self.write_disks(out)?;
         self.write_memory(out)?;
         self.write_worker_pools(out)?;
+        self.write_cache_disks(out)?;
         // Quota labels use runtime worker IDs. Read the authority's actual charge,
         // including pooled ciphertext capacity, without sampling on worker polls.
         // A stalled worker therefore remains observable from another worker.
@@ -4892,6 +4968,7 @@ pub(crate) mod tests {
                         qualified: u64::MAX,
                         persistence_attempts: u64::MAX,
                         persistence_accepted: u64::MAX,
+                        share_rejected: u64::MAX,
                         filter_set_bits: usize::MAX,
                         filter_bits: usize::MAX,
                         heat_entries: usize::MAX,

@@ -2,7 +2,10 @@
 //! state; Bloom approximation applies ONLY to whether a page was seen previously.
 use crate::error::{Error, Result};
 use crate::model::PageId;
+use crate::priority::Weights;
+use crate::runtime::{HashMap, HashSet};
 use page_alloc::retention::{Heat, SecondSight};
+use racer_control_wire::CacheId;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Mutex;
@@ -32,6 +35,8 @@ pub struct Snapshot {
     pub qualified: u64,
     pub persistence_attempts: u64,
     pub persistence_accepted: u64,
+    /// Optional pages skipped because their cache was over share under pressure.
+    pub share_rejected: u64,
     pub filter_set_bits: usize,
     pub filter_bits: usize,
     pub heat_entries: usize,
@@ -56,25 +61,70 @@ pub(crate) struct Payload {
     retention: Rc<Retention>,
     bytes: u64,
     indexed: bool,
+    /// Indexed payload is also charged to its cache for fair-share accounting.
+    cache: Option<CacheId>,
 }
 impl Drop for Payload {
     fn drop(&mut self) {
         let gauge = self.retention.payload_gauge(self.indexed);
         gauge.set(gauge.get() - self.bytes);
+        if let Some(cache) = &self.cache {
+            let mut caches = self.retention.cache_bytes.borrow_mut();
+            let used = caches.get_mut(cache).expect("charged cache payload");
+            *used -= self.bytes;
+            if *used == 0 {
+                caches.remove(cache);
+            }
+        }
     }
 }
 pub(crate) type Ownership = Rc<dyn Fn(&PageId) -> bool>;
 pub(crate) type OwnershipPass = Rc<dyn Fn() -> Ownership>;
 
+/// Upper bound of `Scoring::score`: heat 0 to 3 plus 1 for ownership.
+pub(crate) const MAX_SCORE: u8 = 4;
+
+/// One eviction or ordering pass. Ownership, time, and the over-share set are
+/// pinned when the pass starts, so per-page ranking stays cheap and consistent.
 pub(crate) struct Scoring<'a> {
     retention: &'a Retention,
     ownership: Ownership,
     now: Instant,
+    over_share: HashSet<CacheId>,
 }
 impl Scoring<'_> {
     pub(crate) fn score(&self, page: &PageId) -> u8 {
         self.retention
             .score_owned_at(page, self.now, (self.ownership)(page))
+    }
+    /// Whether the cache's indexed payload exceeded its fair share of this
+    /// worker's disk capacity when the pass started.
+    pub(crate) fn over_share(&self, cache: &CacheId) -> bool {
+        self.over_share.contains(cache)
+    }
+    pub(crate) fn any_over_share(&self) -> bool {
+        !self.over_share.is_empty()
+    }
+    /// Combined victim rank: under-share pages outrank every over-share page;
+    /// the retention score orders pages within one class. Higher is kept longer.
+    pub(crate) fn rank(&self, page: &PageId) -> u64 {
+        let under = !self.over_share(&page.version.object.cache);
+        (u64::from(under) << 8) | u64::from(self.score(page))
+    }
+}
+/// One cache's indexed payload and fair share on this worker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CacheDisk {
+    pub cache: CacheId,
+    pub resident_bytes: u64,
+    pub share_bytes: u64,
+}
+impl CacheDisk {
+    /// Above its share. A cache entitled to the whole capacity (the sole
+    /// cache, or no published catalog) is never over share, even when the
+    /// capacity estimate is below its actual residency.
+    pub fn over_share(&self, capacity: u64) -> bool {
+        self.share_bytes < capacity && self.resident_bytes > self.share_bytes
     }
 }
 #[derive(Default)]
@@ -83,6 +133,7 @@ struct Counters {
     qualified: AtomicU64,
     attempts: AtomicU64,
     accepted: AtomicU64,
+    share_rejected: AtomicU64,
 }
 pub struct Retention {
     state: RefCell<State>,
@@ -99,6 +150,13 @@ pub struct Retention {
     pending_payload_bytes: Cell<u64>,
 
     indexed_payload_bytes: Cell<u64>,
+
+    /// Indexed payload bytes per cache. Maintained by `Payload` owners, so
+    /// every index mapping removal path (eviction, replacement, cache removal,
+    /// restore) releases its charge exactly once.
+    cache_bytes: RefCell<HashMap<CacheId, u64>>,
+
+    weights: RefCell<Weights>,
 }
 struct State {
     history: SecondSight,
@@ -127,6 +185,8 @@ impl Retention {
             disk: Cell::new([DiskClassSnapshot::default(); 2]),
             pending_payload_bytes: Cell::new(0),
             indexed_payload_bytes: Cell::new(0),
+            cache_bytes: RefCell::default(),
+            weights: RefCell::default(),
         })
     }
     pub fn set_ownership(&self, classify: Ownership) {
@@ -136,16 +196,68 @@ impl Retention {
     pub(crate) fn set_ownership_pass(&self, prepare: OwnershipPass) {
         *self.ownership_pass.borrow_mut() = Some(prepare);
     }
-    pub(crate) fn scoring_at(&self, now: Instant) -> Scoring<'_> {
+    /// Share caches' disk capacity by the published priority weights.
+    pub fn set_weights(&self, weights: Weights) {
+        *self.weights.borrow_mut() = weights;
+    }
+    pub fn weights(&self) -> Weights {
+        self.weights.borrow().clone()
+    }
+    /// `capacity` is this worker's usable payload capacity in bytes.
+    pub(crate) fn scoring_at(&self, now: Instant, capacity: u64) -> Scoring<'_> {
         let ownership = match self.ownership_pass.borrow().as_ref() {
             Some(prepare) => prepare(),
             None => self.ownership.borrow().clone(),
         };
+        let over_share = self
+            .cache_disk(capacity)
+            .into_iter()
+            .filter(|cache| cache.over_share(capacity))
+            .map(|cache| cache.cache)
+            .collect();
         Scoring {
             retention: self,
             ownership,
             now,
+            over_share,
         }
+    }
+    /// Indexed payload bytes currently charged to one cache.
+    pub fn cache_payload_bytes(&self, cache: &CacheId) -> u64 {
+        self.cache_bytes.borrow().get(cache).copied().unwrap_or(0)
+    }
+    /// Whether one cache's indexed payload exceeds its share of `capacity`.
+    pub fn over_share(&self, cache: &CacheId, capacity: u64) -> bool {
+        CacheDisk {
+            cache: cache.clone(),
+            resident_bytes: self.cache_payload_bytes(cache),
+            share_bytes: self.weights.borrow().share(capacity, cache),
+        }
+        .over_share(capacity)
+    }
+    /// Resident bytes and shares for every published cache and every cache
+    /// that still holds indexed payload, sorted by cache id.
+    pub fn cache_disk(&self, capacity: u64) -> Vec<CacheDisk> {
+        let used = self.cache_bytes.borrow();
+        let weights = self.weights.borrow();
+        let mut caches: Vec<CacheId> = used.keys().cloned().collect();
+        caches.extend(
+            weights
+                .caches()
+                .into_iter()
+                .filter(|c| !used.contains_key(c)),
+        );
+        caches.sort_by(|a, b| a.0.cmp(&b.0));
+        let shares = weights.shares(capacity, &caches);
+        caches
+            .into_iter()
+            .zip(shares)
+            .map(|(cache, share_bytes)| CacheDisk {
+                resident_bytes: used.get(&cache).copied().unwrap_or(0),
+                cache,
+                share_bytes,
+            })
+            .collect()
     }
     /// Current cache-only classification; missing/stale ownership hints are false.
     /// Does not insert history, touch heat, or initiate a placement ranking.
@@ -226,6 +338,9 @@ impl Retention {
             .accepted
             .fetch_add(u64::from(accepted), Ordering::Relaxed);
     }
+    pub fn share_rejected(&self) {
+        self.counters.share_rejected.fetch_add(1, Ordering::Relaxed);
+    }
     fn payload_gauge(&self, indexed: bool) -> &Cell<u64> {
         if indexed {
             &self.indexed_payload_bytes
@@ -245,7 +360,19 @@ impl Retention {
             retention: self.clone(),
             bytes,
             indexed,
+            cache: None,
         }
+    }
+    /// Charge one index mapping's payload to the aggregate and its cache.
+    pub(crate) fn indexed_payload(self: &Rc<Self>, cache: &CacheId, bytes: u64) -> Payload {
+        let mut payload = self.payload(bytes, true);
+        *self
+            .cache_bytes
+            .borrow_mut()
+            .entry(cache.clone())
+            .or_default() += bytes;
+        payload.cache = Some(cache.clone());
+        payload
     }
     fn disk_event(&self, page: &PageId, update: impl FnOnce(&mut DiskClassSnapshot)) {
         let class = usize::from(self.is_owned(page));
@@ -289,6 +416,7 @@ impl Retention {
             qualified: self.counters.qualified.load(Ordering::Relaxed),
             persistence_attempts: self.counters.attempts.load(Ordering::Relaxed),
             persistence_accepted: self.counters.accepted.load(Ordering::Relaxed),
+            share_rejected: self.counters.share_rejected.load(Ordering::Relaxed),
             pending_payload_bytes: self.pending_payload_bytes.get(),
             indexed_payload_bytes: self.indexed_payload_bytes.get(),
             disk: self.disk.get(),
@@ -322,7 +450,7 @@ mod tests {
         policy.track(&page(0));
         policy.touch(&page(0));
         let now = uring_runtime::environment::now();
-        let scoring = policy.scoring_at(now);
+        let scoring = policy.scoring_at(now, u64::MAX);
         owned.set(false);
         for _ in 0..256 {
             assert_eq!(scoring.score(&page(0)), 2);
@@ -331,17 +459,17 @@ mod tests {
         assert_eq!(calls.get(), 1);
         assert_eq!(
             policy
-                .scoring_at(now + Duration::from_secs(60))
+                .scoring_at(now + Duration::from_secs(60), u64::MAX)
                 .score(&page(0)),
             0
         );
         assert_eq!(calls.get(), 2);
         policy.set_ownership(Rc::new(|_| true));
-        assert_eq!(policy.scoring_at(now).score(&page(1)), 1);
+        assert_eq!(policy.scoring_at(now, u64::MAX).score(&page(1)), 1);
         assert_eq!(calls.get(), 2);
         let disabled = Retention::configured(4096, 1, PERIOD, false).unwrap();
         disabled.set_ownership(Rc::new(|_| true));
-        assert_eq!(disabled.scoring_at(now).score(&page(0)), 0);
+        assert_eq!(disabled.scoring_at(now, u64::MAX).score(&page(0)), 0);
     }
     fn page(number: u64) -> PageId {
         PageId {

@@ -1354,6 +1354,10 @@ impl WorkerApplication {
             config.admission_period,
             config.admission_mode == crate::config::AdmissionMode::SecondSight,
         )?));
+        // Disk shares use the same priority table as memory flow control.
+        writer
+            .retention()
+            .set_weights(runtime.admission.policy().weights().clone());
         metrics.observe_retention(writer.retention().snapshot());
         Ok(Store {
             reader,
@@ -1432,6 +1436,12 @@ impl WorkerApplication {
             }
         }
         current_scope.check()?;
+        // Priority changes apply live: memory shares are recomputed now, disk
+        // shares on the next ranking pass.
+        let admission = &self.runtime.admission;
+        if admission.policy().weights().update(&snapshot.caches) {
+            admission.reweigh();
+        }
         self.caches = snapshot.caches.clone();
         self.snapshot_sequence = Some(snapshot.sequence);
         Ok(())
@@ -2410,6 +2420,7 @@ impl WorkerApplication {
             .metrics
             .observe_held(self.store.writer.index().held_snapshot());
         self.store.writer.observe_disks();
+        self.store.writer.observe_cache_disks(&self.caches);
         self.telemetry
             .metrics
             .observe_retention(self.store.writer.retention().snapshot());

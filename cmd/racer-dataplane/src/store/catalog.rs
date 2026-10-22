@@ -172,6 +172,21 @@ impl IndexSnapshot {
         Ok(())
     }
 }
+/// Upper bound of `page_value`.
+const MAX_PAGE_VALUE: u8 = 2 * crate::retention::MAX_SCORE + 1;
+
+/// Per-byte segment value of one page. While any cache is over share, every
+/// under-share page outvalues every over-share page, so segments dominated by
+/// over-share data recycle first; the retention score still orders pages within
+/// one class. With no cache over share this is the plain retention score.
+fn page_value(scoring: &crate::retention::Scoring<'_>, page: &PageId) -> u8 {
+    let score = scoring.score(page);
+    if !scoring.any_over_share() || scoring.over_share(&page.version.object.cache) {
+        score
+    } else {
+        score + crate::retention::MAX_SCORE + 1
+    }
+}
 impl Index {
     pub(super) fn bind_hold_segments(&self, segments: Rc<Segments>, free_reserve: usize) {
         let mut holds = self.holds.borrow_mut();
@@ -745,6 +760,20 @@ impl Index {
     pub fn metadata_capacity(&self) -> usize {
         self.metadata_capacity
     }
+    /// This worker's payload capacity for fair shares: the tighter of index
+    /// entries times a full page and slab segments times segment bytes. Either
+    /// one bounds how much payload the worker can keep resident. Segment space
+    /// is ignored until segments are bound.
+    pub fn disk_capacity(&self) -> u64 {
+        let pages = (self.page_capacity.get() as u64).saturating_mul(crate::model::PAGE_BYTES);
+        self.holds
+            .borrow()
+            .segments
+            .as_ref()
+            .map_or(pages, |segments| {
+                pages.min((segments.count() as u64).saturating_mul(segments.segment_bytes()))
+            })
+    }
     pub fn page_capacity(&self) -> usize {
         self.page_capacity.get()
     }
@@ -815,9 +844,10 @@ impl Index {
     /// never changed by retention, so checkpoint traversal remains monotonic.
     fn victim(&self, state: &State) -> Option<PageId> {
         let retention = self.retention();
-        let scoring = retention.scoring_at(uring_runtime::environment::now());
+        let scoring = retention.scoring_at(uring_runtime::environment::now(), self.disk_capacity());
+        // Over-share pages go first, then lower score; the index breaks ties by age.
         state.pages.victim_if(64, |page, _| {
-            (!self.is_held(page)).then(|| u64::from(scoring.score(page)))
+            (!self.is_held(page)).then(|| scoring.rank(page))
         })
     }
     /// Reserve one potential new mapping, optionally evicting a low-value mapping.
@@ -901,7 +931,10 @@ impl Index {
         }
         // Acquire first: replacement retains its existing heat without a gap.
         let mut resident = self.track(&page)?;
-        resident.payload = Some(self.retention().payload(payload_bytes, true));
+        resident.payload = Some(
+            self.retention()
+                .indexed_payload(&page.version.object.cache, payload_bytes),
+        );
         self.hold_published(&page, &entry.location)?;
         Self::remove_page(&mut state, &page);
         let version = state
@@ -1181,7 +1214,7 @@ impl Index {
         let retention = self.retention();
         self.segment_score_with(
             segment,
-            &retention.scoring_at(uring_runtime::environment::now()),
+            &retention.scoring_at(uring_runtime::environment::now(), self.disk_capacity()),
         )
     }
     fn segment_score_with(
@@ -1190,15 +1223,24 @@ impl Index {
         scoring: &crate::retention::Scoring<'_>,
     ) -> u64 {
         let state = self.state.borrow();
-        state
-            .pages
-            .segment_score(segment, 256, crate::model::PAGE_BYTES * 4, |page, entry| {
+        state.pages.segment_score(
+            segment,
+            256,
+            // Charge unseen mappings at the highest value they could have.
+            crate::model::PAGE_BYTES
+                * u64::from(if scoring.any_over_share() {
+                    MAX_PAGE_VALUE
+                } else {
+                    crate::retention::MAX_SCORE
+                }),
+            |page, entry| {
                 let bytes = entry
                     .metadata
                     .page_length(page)
                     .unwrap_or(crate::model::PAGE_BYTES as u32);
-                u64::from(bytes) * u64::from(scoring.score(page))
-            })
+                u64::from(bytes) * u64::from(page_value(scoring, page))
+            },
+        )
     }
     pub fn remove_cache(&self, cache: &racer_control_wire::CacheId) {
         self.holds
@@ -1358,7 +1400,7 @@ impl SegmentClock {
     pub fn reclaim_now(&self) -> Result<()> {
         let now = uring_runtime::environment::now();
         let retention = self.index.retention();
-        let scoring = retention.scoring_at(now);
+        let scoring = retention.scoring_at(now, self.index.disk_capacity());
         self.clock
             .reclaim_scored(
                 &*self.index,
@@ -2713,5 +2755,271 @@ mod tests {
         index.restore(snapshot).unwrap();
         assert!(index.current(&m.version.object).unwrap().is_none());
         assert_eq!(index.version(&m.version).unwrap(), Some(m));
+    }
+}
+
+#[cfg(test)]
+mod priority_tests {
+    use super::*;
+    use crate::model::{CacheKey, StrongEtag};
+    use page_alloc::SegmentEntries;
+    use racer_control_wire::{CacheDefinition, CacheId};
+
+    const PAGE: u64 = crate::model::PAGE_BYTES;
+
+    /// Cache ids are UUIDs; derive a stable one from a short test name.
+    fn cache(name: &str) -> CacheId {
+        let digit = (b'a' + name.as_bytes()[0] % 6) as char;
+        let d = digit.to_string().repeat(12);
+        CacheId(format!(
+            "{}-{}-4{}-8{}-{d}",
+            &d[..8],
+            &d[..4],
+            &d[..3],
+            &d[..3]
+        ))
+    }
+
+    fn definition(name: &str, priority: u16) -> CacheDefinition {
+        CacheDefinition {
+            id: cache(name),
+            name: name.into(),
+            client_socket: "/client".into(),
+            origin_socket: "/origin".into(),
+            priority,
+        }
+    }
+
+    fn index(pages: usize, weights: &[(&str, u16)]) -> Rc<Index> {
+        let index = Rc::new(Index::new(
+            WorkerId(0),
+            64,
+            crate::test_support::availability_for(
+                weights.iter().map(|(name, _)| cache(name)).collect(),
+            ),
+        ));
+        index.set_page_capacity(pages).unwrap();
+        let table = crate::priority::Weights::default();
+        table.update(
+            &weights
+                .iter()
+                .map(|(name, priority)| definition(name, *priority))
+                .collect::<Vec<_>>(),
+        );
+        index.retention().set_weights(table);
+        index
+    }
+
+    /// One full-size page of `cache` recorded in `segment`.
+    fn page(cache_name: &str, etag: &str, segment: u64) -> (PageId, IndexedPage) {
+        let metadata = VersionMetadata {
+            content_type: None,
+            version: ObjectVersion {
+                object: ObjectId {
+                    cache: cache(cache_name),
+                    key: CacheKey([0; 32]),
+                },
+                etag: StrongEtag::test_value(etag),
+            },
+            length: PAGE,
+        };
+        (
+            PageId {
+                version: metadata.version.clone(),
+                number: crate::model::PageNumber(0),
+            },
+            IndexedPage {
+                metadata,
+                key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
+                location: RecordLocation {
+                    segment: SegmentId(segment),
+                    generation: Generation(1),
+                    extent: Extent::new(segment * 4 * PAGE, 512).unwrap(),
+                },
+            },
+        )
+    }
+
+    fn publish(index: &Index, cache_name: &str, etag: &str, segment: u64) -> PageId {
+        let (page, entry) = page(cache_name, etag, segment);
+        index.publish(page.clone(), entry).unwrap();
+        page
+    }
+
+    /// Per-cache counters must equal a recomputation from live mappings.
+    fn assert_accounting(index: &Index) {
+        let mut expected = crate::runtime::HashMap::<CacheId, u64>::default();
+        for page in index.state.borrow().pages.keys() {
+            *expected
+                .entry(page.version.object.cache.clone())
+                .or_default() += PAGE;
+        }
+        let retention = index.retention();
+        for (cache, bytes) in &expected {
+            assert_eq!(retention.cache_payload_bytes(cache), *bytes, "{cache:?}");
+        }
+        let charged: u64 = retention
+            .cache_disk(u64::MAX)
+            .iter()
+            .map(|c| c.resident_bytes)
+            .sum();
+        assert_eq!(charged, expected.values().sum::<u64>());
+        assert_eq!(retention.snapshot().indexed_payload_bytes, charged);
+    }
+
+    fn segments(count: usize) -> Rc<Segments> {
+        let s = Segments::new(4 * PAGE);
+        s.configure(
+            4 * PAGE * count as u64,
+            count,
+            page_alloc::Alignment::new(512, 512, 512).unwrap(),
+        )
+        .unwrap();
+        Rc::new(s)
+    }
+
+    #[test]
+    fn accounting_tracks_publish_replace_evict_remove_and_restore() {
+        let index = index(4, &[("a", 500), ("b", 500)]);
+        let a0 = publish(&index, "a", "0", 0);
+        publish(&index, "b", "0", 0);
+        publish(&index, "b", "1", 0);
+        assert_accounting(&index);
+        assert_eq!(index.retention().cache_payload_bytes(&cache("a")), PAGE);
+        assert_eq!(index.retention().cache_payload_bytes(&cache("b")), 2 * PAGE);
+        // Replacement charges once.
+        let (_, entry) = page("a", "0", 1);
+        index.publish(a0, entry).unwrap();
+        assert_accounting(&index);
+        assert_eq!(index.retention().cache_payload_bytes(&cache("a")), PAGE);
+        // Index eviction releases the victim's charge.
+        publish(&index, "a", "1", 0);
+        drop(index.reserve_page(true).unwrap());
+        assert_accounting(&index);
+        assert_eq!(index.state.borrow().pages.len(), 3);
+        // Segment removal releases charges too.
+        index.remove_bounded(SegmentId(1), 8);
+        assert_accounting(&index);
+        let snapshot = index.snapshot().unwrap();
+        let before = index.retention().cache_disk(u64::MAX);
+        // Restore rebuilds accounting from recovered mappings.
+        index.restore(snapshot).unwrap();
+        assert_accounting(&index);
+        assert_eq!(index.retention().cache_disk(u64::MAX), before);
+        index.remove_cache(&cache("b"));
+        assert_accounting(&index);
+        assert_eq!(index.retention().cache_payload_bytes(&cache("b")), 0);
+    }
+
+    #[test]
+    fn index_victim_takes_over_share_cache_first_and_keeps_holds() {
+        // Capacity 4 pages: "a" (900) gets 3.6 pages, "b" (100) gets 0.4.
+        let index = index(4, &[("a", 900), ("b", 100)]);
+        let segments = segments(4);
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        drop(segments.append(4 * PAGE as usize).unwrap());
+        let a = [publish(&index, "a", "0", 0), publish(&index, "a", "1", 0)];
+        let b = [publish(&index, "b", "0", 0), publish(&index, "b", "1", 0)];
+        // Make the over-share cache hotter: score alone would evict "a".
+        for page in &b {
+            for _ in 0..8 {
+                index.retention().touch(page);
+            }
+        }
+        let victim = index.victim(&index.state.borrow()).unwrap();
+        assert_eq!(victim.version.object.cache, cache("b"));
+        // Holds still veto eviction even for over-share pages.
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        for page in &b {
+            index.reserve_hold(&page.version, 1, until).unwrap();
+        }
+        let victim = index.victim(&index.state.borrow()).unwrap();
+        assert!(a.contains(&victim));
+        // Equal priorities: neither cache is over share, so score decides.
+        let even = self::index(4, &[("a", 500), ("b", 500)]);
+        publish(&even, "a", "0", 0);
+        let hot = publish(&even, "b", "0", 0);
+        for _ in 0..8 {
+            even.retention().touch(&hot);
+        }
+        let victim = even.victim(&even.state.borrow()).unwrap();
+        assert_eq!(victim.version.object.cache, cache("a"));
+    }
+
+    #[test]
+    fn priority_zero_keeps_idle_space_but_goes_first_under_pressure() {
+        let index = index(4, &[("a", 1000), ("z", 0)]);
+        for n in 0..3 {
+            publish(&index, "z", &n.to_string(), 0);
+        }
+        // Idle capacity: priority 0 data is still cached.
+        assert_eq!(index.retention().cache_payload_bytes(&cache("z")), 3 * PAGE);
+        let hot = publish(&index, "a", "0", 0);
+        for _ in 0..8 {
+            index.retention().touch(&hot);
+        }
+        for n in 1..4 {
+            drop(index.reserve_page(true).unwrap());
+            publish(&index, "a", &n.to_string(), 0);
+            assert_accounting(&index);
+        }
+        assert_eq!(index.retention().cache_payload_bytes(&cache("z")), 0);
+        assert_eq!(index.retention().cache_payload_bytes(&cache("a")), 4 * PAGE);
+    }
+
+    #[test]
+    fn segment_reclaim_prefers_segment_dominated_by_over_share_pages() {
+        let segments = segments(2);
+        let index = index(8, &[("a", 900), ("b", 100)]);
+        let clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        drop(segments.append(4 * PAGE as usize).unwrap());
+        drop(segments.append(4 * PAGE as usize).unwrap());
+        let a: Vec<_> = (0..2)
+            .map(|n| publish(&index, "a", &n.to_string(), 0))
+            .collect();
+        let b: Vec<_> = (0..3)
+            .map(|n| publish(&index, "b", &n.to_string(), 1))
+            .collect();
+        for page in &b {
+            for _ in 0..8 {
+                index.retention().touch(page);
+            }
+        }
+        let retention = index.retention();
+        let scoring =
+            retention.scoring_at(uring_runtime::environment::now(), index.disk_capacity());
+        assert!(scoring.over_share(&cache("b")));
+        assert!(!scoring.over_share(&cache("a")));
+        assert!(
+            index.segment_score_with(SegmentId(1), &scoring)
+                < index.segment_score_with(SegmentId(0), &scoring)
+        );
+        drop(scoring);
+        clock.reclaim_now().unwrap();
+        for page in &a {
+            assert!(index.lookup(page).unwrap().is_some());
+        }
+        for page in &b {
+            assert!(index.lookup(page).unwrap().is_none());
+        }
+        assert_accounting(&index);
+    }
+
+    #[test]
+    fn live_priority_change_flips_over_share() {
+        let index = index(4, &[("a", 900), ("b", 100)]);
+        publish(&index, "a", "0", 0);
+        publish(&index, "b", "0", 0);
+        let retention = index.retention();
+        let capacity = index.disk_capacity();
+        assert!(retention.over_share(&cache("b"), capacity));
+        assert!(!retention.over_share(&cache("a"), capacity));
+        assert!(
+            retention
+                .weights()
+                .update(&[definition("a", 100), definition("b", 900)])
+        );
+        assert!(retention.over_share(&cache("a"), capacity));
+        assert!(!retention.over_share(&cache("b"), capacity));
     }
 }
