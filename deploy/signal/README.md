@@ -121,10 +121,14 @@ execution state, and foreground-deletes every created workload.
 The selected script is invoked with no arguments for a Pod backend,
 `mpi-launcher <gpu-count>` in an MPIJob launcher, and `mpi-worker` in its worker.
 Scripts write `verdict`, `reason`, and optional `measurements.txt` under
-`/results`. A nonzero process exit remains an execution error and cannot be
-converted into a diagnostic `Fail`. Missing results, partial backend execution,
-identity gaps, malformed output, deadline interruption, and cleanup failure are
-all `Inconclusive`.
+`/results`. The script exit code must match the result verdict: `Pass` exits 0,
+`Fail` exits 1, and `Inconclusive` exits 2. A valid bounded result remains
+authoritative when its verdict-associated exit code makes the backend Pod or
+MPIJob terminally unsuccessful. The adapter removes reserved result files
+before each invocation and rejects missing files, malformed values, stale or
+contradictory result/exit combinations, and any other exit code. Partial
+backend execution, identity gaps, deadline interruption, and cleanup failure
+also remain `Inconclusive`.
 
 Other backend kinds remain operator-supplied and are not installed or granted
 permissions by the included adapter.

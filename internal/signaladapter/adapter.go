@@ -28,9 +28,10 @@ import (
 
 const (
 	MaxParticipants       = 64
+	MaxReasonBytes        = 4 * 1024
 	MaxMeasurementsBytes  = 16 * 1024
 	MaxBackendOutputBytes = 16 * 1024
-	resultPrefix          = "PROJECT_SIGNAL_RESULT_V1 "
+	resultPrefix          = "PROJECT_SIGNAL_RESULT_V2 "
 	requiredTopologyKey   = "kueue.x-k8s.io/podset-required-topology"
 )
 
@@ -85,6 +86,7 @@ type Result struct {
 	Verdict          string `json:"verdict"`
 	Reason           string `json:"reason"`
 	Measurements     string `json:"measurements"`
+	ExitCode         int    `json:"-"`
 }
 
 type AggregateOutput struct {
@@ -491,6 +493,10 @@ func Aggregate(
 			return AggregateOutput{}, fmt.Errorf("results[%d] requires executionState and reason", index)
 		}
 
+		if len(result.Reason) > MaxReasonBytes {
+			return AggregateOutput{}, fmt.Errorf("results[%d].reason exceeds %d bytes", index, MaxReasonBytes)
+		}
+
 		switch result.Verdict {
 		case "Pass":
 		case "Fail":
@@ -573,12 +579,13 @@ func ParseResultLog(logContent string, participantIndex int) (Result, error) {
 		}
 
 		fields := strings.Fields(strings.TrimPrefix(line, resultPrefix))
-		if len(fields) != 3 {
-			return Result{}, errors.New("result record must contain verdict, reason, and measurements")
+		if len(fields) != 4 {
+			return Result{}, errors.New("result record must contain verdict, reason, measurements, and exit code")
 		}
 
-		values := make([]string, len(fields))
-		for fieldIndex, field := range fields {
+		values := make([]string, 3)
+
+		for fieldIndex, field := range fields[:3] {
 			if field == "-" {
 				continue
 			}
@@ -591,16 +598,65 @@ func ParseResultLog(logContent string, participantIndex int) (Result, error) {
 			values[fieldIndex] = string(decoded)
 		}
 
-		return Result{
+		exitCode, err := strconv.Atoi(fields[3])
+		if err != nil || exitCode < 0 || exitCode > 255 {
+			return Result{}, errors.New("result exit code must be an integer between 0 and 255")
+		}
+
+		result := Result{
 			ParticipantIndex: participantIndex,
 			ExecutionState:   "Succeeded",
 			Verdict:          values[0],
 			Reason:           values[1],
 			Measurements:     values[2],
-		}, nil
+			ExitCode:         exitCode,
+		}
+		if err := validateResult(result); err != nil {
+			return Result{}, err
+		}
+
+		return result, nil
 	}
 
 	return Result{}, errors.New("workload log does not contain a Project Signal result record")
+}
+
+func validateResult(result Result) error {
+	if result.Reason == "" {
+		return errors.New("result reason must not be empty")
+	}
+
+	if len(result.Reason) > MaxReasonBytes {
+		return fmt.Errorf("result reason exceeds %d bytes", MaxReasonBytes)
+	}
+
+	if len(result.Measurements) > MaxMeasurementsBytes {
+		return fmt.Errorf("result measurements exceeds %d bytes", MaxMeasurementsBytes)
+	}
+
+	var expectedExitCode int
+
+	switch result.Verdict {
+	case "Pass":
+		expectedExitCode = 0
+	case "Fail":
+		expectedExitCode = 1
+	case "Inconclusive":
+		expectedExitCode = 2
+	default:
+		return fmt.Errorf("result verdict %q is invalid", result.Verdict)
+	}
+
+	if result.ExitCode != expectedExitCode {
+		return fmt.Errorf(
+			"result verdict %s requires exit code %d, got %d",
+			result.Verdict,
+			expectedExitCode,
+			result.ExitCode,
+		)
+	}
+
+	return nil
 }
 
 func resultCommand(arguments ...string) []string {
@@ -616,25 +672,25 @@ func resultCommand(arguments ...string) []string {
 set -u
 mkdir -p /results
 chmod 0755 /results
-printf '%%s' Inconclusive > /results/verdict
-printf '%%s' ScriptDidNotProduceReason > /results/reason
-: > /results/measurements.txt
+rm -f /results/verdict /results/reason /results/measurements.txt
 set +e
 /bin/bash "/scripts/${PROJECT_SIGNAL_SCRIPT_KEY}" %s
 status=$?
 set -e
-if [[ $status -ne 0 ]]; then
-  [[ -s /results/verdict ]] || printf '%%s' Inconclusive > /results/verdict
-  [[ -s /results/reason ]] || printf 'ScriptExit%%d' "$status" > /results/reason
-  printf '\nscript_exit_code=%%d\n' "$status" >> /results/measurements.txt
-fi
-verdict="$(base64 < /results/verdict | tr -d '\n')"
-reason="$(base64 < /results/reason | tr -d '\n')"
-measurements="$(base64 < /results/measurements.txt | tr -d '\n')"
+encode_result_file() {
+  if [[ -f "$1" ]]; then
+    base64 < "$1" | tr -d '\n'
+  else
+    printf '%%s' -
+  fi
+}
+verdict="$(encode_result_file /results/verdict)"
+reason="$(encode_result_file /results/reason)"
+measurements="$(encode_result_file /results/measurements.txt)"
 [[ -n "${verdict}" ]] || verdict=-
 [[ -n "${reason}" ]] || reason=-
 [[ -n "${measurements}" ]] || measurements=-
-printf '%s%%s %%s %%s\n' "${verdict}" "${reason}" "${measurements}"
+printf '%s%%s %%s %%s %%d\n' "${verdict}" "${reason}" "${measurements}" "$status"
 exit "$status"
 `, strings.Join(quotedArguments, " "), resultPrefix),
 	}

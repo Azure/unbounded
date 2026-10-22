@@ -722,7 +722,7 @@ func TestParseResultLogUsesLastCompleteRecord(t *testing.T) {
 	logContent := "noise\n" + resultPrefix +
 		encode("Pass") + " " +
 		encode("Healthy") + " " +
-		encode("temperature=42") + "\n"
+		encode("temperature=42") + " 0\n"
 
 	result, err := ParseResultLog(logContent, 1)
 	if err != nil {
@@ -742,7 +742,7 @@ func TestParseResultLogAllowsEmptyMeasurements(t *testing.T) {
 	encode := func(value string) string {
 		return base64.StdEncoding.EncodeToString([]byte(value))
 	}
-	logContent := resultPrefix + encode("Pass") + " " + encode("Healthy") + " -\n"
+	logContent := resultPrefix + encode("Pass") + " " + encode("Healthy") + " - 0\n"
 
 	result, err := ParseResultLog(logContent, 0)
 	if err != nil {
@@ -751,6 +751,110 @@ func TestParseResultLogAllowsEmptyMeasurements(t *testing.T) {
 
 	if result.Measurements != "" {
 		t.Fatalf("measurements = %q", result.Measurements)
+	}
+}
+
+func TestParseResultLogAcceptsInconclusiveExitTwo(t *testing.T) {
+	t.Parallel()
+
+	encode := func(value string) string {
+		return base64.StdEncoding.EncodeToString([]byte(value))
+	}
+	logContent := resultPrefix +
+		encode("Inconclusive") + " " +
+		encode("DiagnosticUnavailable") + " " +
+		encode("device_state=unknown") + " 2\n"
+
+	result, err := ParseResultLog(logContent, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if result.ExecutionState != "Succeeded" ||
+		result.Verdict != "Inconclusive" ||
+		result.ExitCode != 2 {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestParseResultLogRejectsContradictoryVerdictExitCode(t *testing.T) {
+	t.Parallel()
+
+	encode := func(value string) string {
+		return base64.StdEncoding.EncodeToString([]byte(value))
+	}
+
+	for name, test := range map[string]struct {
+		verdict  string
+		exitCode string
+	}{
+		"Pass with diagnostic failure":         {verdict: "Pass", exitCode: "1"},
+		"Fail with successful process":         {verdict: "Fail", exitCode: "0"},
+		"Inconclusive with successful process": {verdict: "Inconclusive", exitCode: "0"},
+		"unexpected exit code":                 {verdict: "Inconclusive", exitCode: "3"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			logContent := resultPrefix +
+				encode(test.verdict) + " " +
+				encode("SyntheticReason") + " - " +
+				test.exitCode + "\n"
+			if _, err := ParseResultLog(logContent, 0); err == nil {
+				t.Fatal("ParseResultLog accepted contradictory result")
+			}
+		})
+	}
+}
+
+func TestParseResultLogRejectsMalformedAndMissingResults(t *testing.T) {
+	t.Parallel()
+
+	encode := func(value string) string {
+		return base64.StdEncoding.EncodeToString([]byte(value))
+	}
+
+	for name, logContent := range map[string]string{
+		"malformed verdict": resultPrefix + "%%% " + encode("Reason") + " - 2\n",
+		"missing verdict":   resultPrefix + "- " + encode("Reason") + " - 2\n",
+		"missing reason":    resultPrefix + encode("Inconclusive") + " - - 2\n",
+		"missing record":    "diagnostic output only\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if _, err := ParseResultLog(logContent, 0); err == nil {
+				t.Fatal("ParseResultLog accepted invalid result")
+			}
+		})
+	}
+}
+
+func TestResultCommandClearsReservedFilesAndReportsExitCode(t *testing.T) {
+	t.Parallel()
+
+	command := resultCommand()
+	if len(command) != 3 {
+		t.Fatalf("resultCommand() = %#v", command)
+	}
+
+	for _, required := range []string{
+		"rm -f /results/verdict /results/reason /results/measurements.txt",
+		`printf 'PROJECT_SIGNAL_RESULT_V2 %s %s %s %d\n'`,
+		`exit "$status"`,
+	} {
+		if !strings.Contains(command[2], required) {
+			t.Fatalf("result command does not contain %q:\n%s", required, command[2])
+		}
+	}
+
+	for _, forbidden := range []string{
+		"ScriptDidNotProduceReason",
+		"script_exit_code=",
+	} {
+		if strings.Contains(command[2], forbidden) {
+			t.Fatalf("result command still contains fallback %q:\n%s", forbidden, command[2])
+		}
 	}
 }
 

@@ -218,29 +218,18 @@ func (r *Runner) waitForResult(ctx context.Context, config Config, backend creat
 		}
 
 		if terminal {
-			if !succeeded {
-				return result
-			}
-
 			if capturedResult != nil {
-				return *capturedResult
+				return completedResult(*capturedResult, succeeded)
 			}
 
 			logContent, logErr := r.resultLog(ctx, config, backend)
-			if logErr != nil {
-				result.Reason = "BackendResultUnavailable: " + logErr.Error()
 
-				return result
-			}
-
-			parsed, parseErr := ParseResultLog(logContent, int(backend.participantIndex))
-			if parseErr != nil {
-				result.Reason = "BackendResultInvalid: " + parseErr.Error()
-
-				return result
-			}
-
-			return parsed
+			return backendCompletionResult(
+				logContent,
+				logErr,
+				int(backend.participantIndex),
+				succeeded,
+			)
 		}
 
 		select {
@@ -251,6 +240,52 @@ func (r *Runner) waitForResult(ctx context.Context, config Config, backend creat
 		case <-ticker.C:
 		}
 	}
+}
+
+func backendCompletionResult(
+	logContent string,
+	logErr error,
+	participantIndex int,
+	backendSucceeded bool,
+) Result {
+	result := Result{
+		ParticipantIndex: participantIndex,
+		ExecutionState:   "Error",
+		Verdict:          "Inconclusive",
+		Reason:           "BackendExecutionFailed",
+	}
+
+	if logErr != nil {
+		if backendSucceeded {
+			result.Reason = "BackendResultUnavailable: " + logErr.Error()
+		}
+
+		return result
+	}
+
+	parsed, err := ParseResultLog(logContent, participantIndex)
+	if err != nil {
+		if backendSucceeded {
+			result.Reason = "BackendResultInvalid: " + err.Error()
+		}
+
+		return result
+	}
+
+	return completedResult(parsed, backendSucceeded)
+}
+
+func completedResult(result Result, backendSucceeded bool) Result {
+	if (result.ExitCode == 0) != backendSucceeded {
+		return Result{
+			ParticipantIndex: result.ParticipantIndex,
+			ExecutionState:   "Error",
+			Verdict:          "Inconclusive",
+			Reason:           "BackendResultInvalid: result exit code contradicts backend terminal state",
+		}
+	}
+
+	return result
 }
 
 func backendState(resource *unstructured.Unstructured) (bool, bool, error) {
