@@ -44,10 +44,26 @@ pub use server::MAX_RESPONSE_BYTES;
 pub const CONTROL_SLOTS: usize = server::CONTROL_SLOTS + server::JSON_CONTROL_SLOTS;
 
 /// Prepaid diagnostic memory: transport buffers, the hardware producer's wait
-/// bookkeeping, and one bounded hardware JSON result held for the response.
+/// bookkeeping, and the `/debug/hardware` helper's peak footprint.
+///
+/// At most one helper exists at a time. Its peak is during encoding, when the
+/// discovered report (charged against `hardware::WORKING_BYTES` by
+/// `hardware::Walk`, which aborts with `response_too_large` when exhausted) is
+/// alive alongside the JSON buffer. The JSON buffer is allocated once with
+/// capacity `MAX_BODY_BYTES` (see `Bounded`), never grows, and becomes the
+/// result held for the response, so one `MAX_RESPONSE_BYTES` term covers both
+/// the encoding buffer and the held result. The report is dropped before the
+/// result is published.
 pub const RESERVED_BYTES: usize = server::RESERVED_BYTES
     + server::JSON_CONTROL_SLOTS * uring_runtime::reactor::SUBMISSION_BYTES
-    + server::MAX_RESPONSE_BYTES;
+    + server::MAX_RESPONSE_BYTES
+    + crate::hardware::WORKING_BYTES;
+
+const _: () = assert!(server::MAX_BODY_BYTES <= server::MAX_RESPONSE_BYTES);
+const _: () = assert!(
+    RESERVED_BYTES
+        >= server::RESERVED_BYTES + server::MAX_RESPONSE_BYTES + crate::hardware::WORKING_BYTES
+);
 
 /// Deadline for one `/debug/hardware` request, covering discovery and the response.
 pub(crate) const HARDWARE_DEADLINE: Duration = Duration::from_secs(5);
@@ -649,6 +665,9 @@ fn encode_report(
 }
 
 /// `io::Write` sink that refuses to grow past a fixed byte limit.
+///
+/// The buffer is allocated once with capacity `limit` so amortized growth can
+/// never exceed the limit charged in `RESERVED_BYTES`.
 struct Bounded {
     buffer: Vec<u8>,
     limit: usize,
@@ -658,7 +677,7 @@ struct Bounded {
 impl Bounded {
     fn new(limit: usize) -> Self {
         Self {
-            buffer: Vec::new(),
+            buffer: Vec::with_capacity(limit),
             limit,
             exceeded: false,
         }
@@ -698,6 +717,21 @@ mod encode_report_tests {
         assert!(writer.write_all(b"abcde").is_err());
         assert!(writer.exceeded);
         assert!(writer.buffer.is_empty());
+        assert_eq!(writer.buffer.capacity(), 4);
+    }
+
+    #[test]
+    fn reserved_bytes_charges_hardware_working_budget_and_result() {
+        assert_eq!(
+            RESERVED_BYTES,
+            server::RESERVED_BYTES
+                + server::JSON_CONTROL_SLOTS * uring_runtime::reactor::SUBMISSION_BYTES
+                + server::MAX_RESPONSE_BYTES
+                + crate::hardware::WORKING_BYTES
+        );
+        let report = crate::hardware::Report::default();
+        let body = encode_report(&report, server::MAX_BODY_BYTES).unwrap();
+        assert!(body.capacity() <= server::MAX_RESPONSE_BYTES);
     }
 
     #[test]
