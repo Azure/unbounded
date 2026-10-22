@@ -293,6 +293,141 @@ impl StoreReader {
                 .map(|(copy, _)| copy))
         })
     }
+
+    /// Locate a published v2 record's ciphertext on its device for a direct
+    /// (cuFile) read, reading and validating only the header through host
+    /// memory. Returns None on a miss, for v1 records, and for any record
+    /// this read path would also treat as a miss. The ciphertext checksum is
+    /// not verified here: the consumer must check
+    /// [`DirectRecord::checksum`] before trusting the bytes.
+    pub(crate) fn direct_read<'a>(
+        &'a self,
+        page: &'a PageId,
+        scope: &'a RequestScope,
+        reserve: impl Fn(usize) -> Result<flow_control::Charge<AdmissionPolicy>> + 'a,
+    ) -> Operation<'a, Option<DirectRecord>> {
+        Box::pin(async move {
+            scope.check()?;
+            let Some(entry) = self.metrics.lookup(
+                crate::telemetry::LookupTier::DiskIndex,
+                self.index.lookup(page),
+            )?
+            else {
+                return Ok(None);
+            };
+            let location = entry.location.clone();
+            let token = ReadToken {
+                page: page.clone(),
+                location: location.clone(),
+            };
+            if self
+                .segments
+                .validate(location.segment, location.generation, &location.extent)
+                .is_err()
+            {
+                self.invalidate(&token)?;
+                return Ok(None);
+            }
+            // One lease rides with the header read; the other keeps the
+            // generation alive until the caller's direct transfer completes.
+            let (Ok(read_lease), Ok(hold)) = (
+                self.segments.lease(location.segment, location.generation),
+                self.segments.lease(location.segment, location.generation),
+            ) else {
+                self.invalidate(&token)?;
+                return Ok(None);
+            };
+            let prefix = location.extent.length().min(MAX_HEADER_BYTES);
+            let Ok(prefix_extent) = Extent::new(location.extent.offset(), prefix) else {
+                return Ok(None);
+            };
+            let mut reserved = reserve(prefix);
+            if matches!(reserved, Err(Error::Overloaded)) {
+                self.slabs.reclaim_idle();
+                reserved = reserve(prefix);
+            }
+            let reservation = reserved?;
+            let Ok(buffer) = self.slabs.allocate(prefix, reservation) else {
+                return Ok(None);
+            };
+            let buffer = match self
+                .slabs
+                .read(&self.reactor, prefix_extent, buffer, read_lease, scope)
+                .await
+            {
+                Ok(buffer) => buffer,
+                Err(
+                    Error::Io | Error::Os(_) | Error::CorruptRecord | Error::InvalidConfiguration,
+                ) => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            let decoded = match parse_prefix(buffer.bytes()?, location.extent) {
+                Ok(decoded) => decoded,
+                // A short prefix of a valid v1 record, another version, or
+                // damage: the host read path classifies and reports it.
+                Err(_) => return Ok(None),
+            };
+            drop(buffer);
+            if decoded.header.envelope.page != *page
+                || decoded.header.generation != location.generation
+                || decoded.header.metadata != entry.metadata
+                || decoded.header.envelope.key_id != entry.key_id
+            {
+                self.corrupt_miss();
+                self.invalidate(&token)?;
+                return Ok(None);
+            }
+            if self.index.lookup(page)?.is_none_or(|current| {
+                current.location != location || current.key_id != entry.key_id
+            }) {
+                return Ok(None);
+            }
+            let Some(ciphertext) = direct_ciphertext(&self.slabs, &location, &hold, &decoded)?
+            else {
+                return Ok(None);
+            };
+            // cuFile reads whole 4 KiB blocks. v2 extents are 4 KiB multiples
+            // and the ciphertext ends the record, so rounding up stays inside it.
+            let rounded = ciphertext.length.next_multiple_of(CIPHERTEXT_ALIGNMENT);
+            let read_length = if decoded.ciphertext.start + rounded <= location.extent.length() {
+                rounded
+            } else {
+                ciphertext.length
+            };
+            self.clock.mark_read(location.segment)?;
+            self.index
+                .retention()
+                .disk_read(page, u64::from(entry.metadata.page_length(page)?));
+            Ok(Some(DirectRecord {
+                token,
+                metadata: entry.metadata.for_pin(),
+                envelope: decoded.header.envelope,
+                checksum: decoded.checksum,
+                ciphertext,
+                read_length,
+                lease: hold,
+            }))
+        })
+    }
+}
+
+/// A published v2 record located for a direct read by [`StoreReader::direct_read`].
+pub(crate) struct DirectRecord {
+    /// Invalidates exactly this mapping if the bytes fail verification.
+    pub token: ReadToken,
+    pub metadata: crate::model::ObjectMetadata,
+    pub envelope: PageEnvelope,
+    /// The stored CRC-64 of the sealed page (ciphertext and tag).
+    pub checksum: u64,
+    pub ciphertext: DirectCiphertext,
+    /// Bytes to transfer from `ciphertext.offset`: the ciphertext length
+    /// rounded up to whole 4 KiB blocks when the record holds them.
+    pub read_length: usize,
+    /// Keeps the segment generation, and so the bytes, from being recycled.
+    /// Hold it until the direct transfer completes.
+    pub lease: SegmentLease,
 }
 
 struct Dirty {
