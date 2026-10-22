@@ -114,26 +114,55 @@ func Run(ctx context.Context, cfg Config) error {
 		cfg.Ready(dev.Path())
 	}
 
+	runErr := waitAndClose(ctx, log, dev)
+
+	stats := b.Stats()
+	log.Info("device stopped", "path", dev.Path(), "stats", fmt.Sprintf("%+v", stats))
+
+	return runErr
+}
+
+// runningDevice is the part of *ublk.Device that waitAndClose uses.
+type runningDevice interface {
+	Path() string
+	Done() <-chan struct{}
+	Err() error
+	Close() error
+}
+
+// waitAndClose waits until ctx is canceled or dev stops, then closes dev.
+// The device stops itself with ctx.Err() when ctx is canceled, so ctx and
+// dev can both be done by the time this runs. A stop caused by that
+// cancellation is clean and returns nil. Any other stop cause, or a Close
+// error, is returned.
+func waitAndClose(ctx context.Context, log *slog.Logger, dev runningDevice) error {
 	var runErr error
 
 	select {
 	case <-ctx.Done():
-		log.Info("stopping device", "path", dev.Path())
+	case <-dev.Done():
+	}
+
+	select {
 	case <-dev.Done():
 		runErr = dev.Err()
-		if runErr == nil {
+		if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(runErr, ctxErr) {
+			runErr = nil
+		} else if runErr == nil && ctxErr == nil {
 			runErr = errors.New("racerblock: device stopped unexpectedly")
 		}
+	default:
+	}
 
+	if runErr != nil {
 		log.Error("device stopped", "path", dev.Path(), "err", runErr)
+	} else {
+		log.Info("stopping device", "path", dev.Path())
 	}
 
 	if err := dev.Close(); err != nil && runErr == nil {
 		runErr = fmt.Errorf("racerblock: stop device: %w", err)
 	}
-
-	stats := b.Stats()
-	log.Info("device stopped", "path", dev.Path(), "stats", fmt.Sprintf("%+v", stats))
 
 	return runErr
 }
