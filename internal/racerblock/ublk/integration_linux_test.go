@@ -315,11 +315,25 @@ func TestIntegrationReadOnlyDevice(t *testing.T) {
 	})
 }
 
-// blockingHandler blocks until ctx is canceled, to check that teardown
-// cancels in-flight handlers.
-type blockingHandler struct{ entered chan struct{} }
+// blockedReadOff is the offset of the user read that blockingHandler
+// blocks. Startup partition scans never read it.
+const blockedReadOff = 512 << 10
 
-func (b *blockingHandler) ReadAt(ctx context.Context, _ []byte, _ int64) error {
+// blockingHandler serves zeros until armed, then blocks reads at
+// blockedReadOff until ctx is canceled, to check that teardown cancels
+// in-flight handlers. Kernels that scan partitions synchronously inside
+// START_DEV issue reads before Start returns, so those must complete.
+type blockingHandler struct {
+	armed   atomic.Bool
+	entered chan struct{}
+}
+
+func (b *blockingHandler) ReadAt(ctx context.Context, p []byte, off int64) error {
+	if !b.armed.Load() || off != blockedReadOff {
+		clear(p)
+		return nil
+	}
+
 	select {
 	case b.entered <- struct{}{}:
 	default:
@@ -340,6 +354,8 @@ func TestIntegrationContextCancel(t *testing.T) {
 	d := startTestDevice(t, ctx, bh, Config{ID: -1, Size: 1 << 20, Queues: 1, Depth: 4})
 	path := d.Path()
 
+	bh.armed.Store(true)
+
 	readErr := make(chan error, 1)
 
 	go func() {
@@ -350,7 +366,7 @@ func TestIntegrationContextCancel(t *testing.T) {
 		}
 		defer unix.Close(fd)
 
-		_, err = unix.Pread(fd, alignedBuf(4096), 4096)
+		_, err = unix.Pread(fd, alignedBuf(4096), blockedReadOff)
 		readErr <- err
 	}()
 
