@@ -463,17 +463,116 @@ fn hardware(
         output.write_str("unavailable\n")?;
         return Ok(Response::Unavailable);
     };
-    let Ok(mut body) = serde_json::to_string_pretty(&read()) else {
-        output.write_str("unavailable\n")?;
-        return Ok(Response::Unavailable);
+    let body = match encode_report(&read(), ::telemetry::server::MAX_BODY_BYTES) {
+        Ok(body) => body,
+        Err(Encode::TooLarge) => {
+            output.write_str("response_too_large\n")?;
+            return Ok(Response::Unavailable);
+        }
+        Err(Encode::Failed) => {
+            output.write_str("unavailable\n")?;
+            return Ok(Response::Unavailable);
+        }
     };
-    body.push('\n');
-    if body.len() > ::telemetry::server::MAX_BODY_BYTES {
-        output.write_str("response_too_large\n")?;
-        return Ok(Response::Unavailable);
-    }
     output.write_str(&body)?;
     Ok(Response::Json)
+}
+
+/// Why a hardware report could not be encoded.
+#[derive(Debug, PartialEq, Eq)]
+enum Encode {
+    /// The pretty JSON plus trailing newline would exceed the byte limit.
+    TooLarge,
+    /// Serialization failed for another reason.
+    Failed,
+}
+
+/// Encode `report` as pretty JSON with a trailing newline, failing as soon as the output
+/// would exceed `limit` bytes so oversized reports never allocate the full body.
+fn encode_report(
+    report: &crate::hardware::Report,
+    limit: usize,
+) -> std::result::Result<String, Encode> {
+    let mut writer = Bounded::new(limit);
+    let result = serde_json::to_writer_pretty(&mut writer, report)
+        .map_err(|_| ())
+        .and_then(|()| std::io::Write::write_all(&mut writer, b"\n").map_err(|_| ()));
+    match result {
+        Ok(()) => String::from_utf8(writer.buffer).map_err(|_| Encode::Failed),
+        Err(()) if writer.exceeded => Err(Encode::TooLarge),
+        Err(()) => Err(Encode::Failed),
+    }
+}
+
+/// `io::Write` sink that refuses to grow past a fixed byte limit.
+struct Bounded {
+    buffer: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl Bounded {
+    fn new(limit: usize) -> Self {
+        Self {
+            buffer: Vec::new(),
+            limit,
+            exceeded: false,
+        }
+    }
+}
+
+impl std::io::Write for Bounded {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if data.len() > self.limit - self.buffer.len() {
+            self.exceeded = true;
+            return Err(std::io::ErrorKind::FileTooLarge.into());
+        }
+        self.buffer.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod encode_report_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    #[test]
+    fn bounded_writer_accepts_exact_limit_and_rejects_one_more() {
+        let mut writer = Bounded::new(4);
+        assert!(writer.write_all(b"abcd").is_ok());
+        assert_eq!(writer.buffer, b"abcd");
+        assert!(!writer.exceeded);
+        assert!(writer.write_all(b"e").is_err());
+        assert!(writer.exceeded);
+        assert_eq!(writer.buffer, b"abcd");
+        let mut writer = Bounded::new(4);
+        assert!(writer.write_all(b"abcde").is_err());
+        assert!(writer.exceeded);
+        assert!(writer.buffer.is_empty());
+    }
+
+    #[test]
+    fn encode_report_matches_pretty_json_and_enforces_limit() {
+        let report = crate::hardware::Report {
+            errors: vec!["x".into()],
+            ..Default::default()
+        };
+        let expected = serde_json::to_string_pretty(&report).unwrap() + "\n";
+        assert_eq!(
+            encode_report(&report, expected.len()).as_deref(),
+            Ok(expected.as_str())
+        );
+        assert_eq!(
+            encode_report(&report, expected.len() - 1),
+            Err(Encode::TooLarge)
+        );
+        assert_eq!(encode_report(&report, 0), Err(Encode::TooLarge));
+    }
 }
 
 #[cfg(test)]
