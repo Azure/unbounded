@@ -31,7 +31,7 @@
  * not constant time with respect to cache or shared-memory bank timing. The
  * kernels keep the S-box in shared memory, where only bank conflicts (not a
  * cache hierarchy shared with other tenants) can leak timing, and the key is a
- * per-page derived key. A bitsliced AES would remove this; see the README.
+ * per-page derived key. A bitsliced AES would remove this; it is future work.
  */
 #ifndef RACER_GCM_CORE_H
 #define RACER_GCM_CORE_H
