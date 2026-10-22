@@ -210,6 +210,7 @@ func TestHoldUntilSafeServesUntilStopped(t *testing.T) {
 func TestHoldUntilSafeBrokenEntryDoesNotReportServing(t *testing.T) {
 	q := newEIOQueue(t)
 	close(q.dev.startDone)
+	noRescue(t)
 
 	testHooks.serveEIO = func(*queue) error { return errors.New("ring broken") }
 

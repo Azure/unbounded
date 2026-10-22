@@ -38,9 +38,9 @@ type errServable struct{ error }
 
 func (e errServable) Unwrap() error { return e.error }
 
-// holdUntilSafe keeps a failed queue serving EIO until teardown stops it.
-// If it cannot serve, it holds the ring until closing it cannot race
-// START_DEV. A broken ring can still strand requests on Linux 7.0.
+// holdUntilSafe keeps a failed queue answering I/O with EIO until
+// teardown stops it. Only if it cannot, it holds the ring until closing
+// it cannot race START_DEV.
 //
 // On Linux 7.0, closing the ring cancels the queue's pending commands
 // but does not complete a request the kernel already handed to the
@@ -54,21 +54,36 @@ func (e errServable) Unwrap() error { return e.error }
 // (ublk_drv.c v7.0 2368-2370, 4452), so a failed queue can receive
 // requests after startup resolves.
 //
-// When err lost no request (errServable), the queue therefore answers
-// every request with EIO until teardown stops it after STOP_DEV, like a
-// healthy queue. Otherwise, or if that fails, the queue cannot answer
-// I/O and closes its ring once that cannot race START_DEV: before
-// START_DEV has published the disk, Linux 7.0's cancel path returns
-// early without marking the queue canceling (ublk_start_cancel), so I/O
-// that START_DEV later queues can reach a completed command. Once the
-// disk exists, cancel marks the queue canceling and aborts new I/O. See
-// waitSafe.
+// When err lost no request (errServable), the queue answers every
+// request with EIO on its own ring until teardown stops it after
+// STOP_DEV, like a healthy queue. Otherwise, or if that fails, a rescue
+// ring answers them instead, including any request already handed to
+// the queue; see rescue. Only if the rescue fails too does the queue
+// stop answering I/O. It then closes its ring once that cannot race
+// START_DEV: before START_DEV has published the disk, Linux 7.0's
+// cancel path returns early without marking the queue canceling
+// (ublk_start_cancel), so I/O that START_DEV later queues can reach a
+// completed command. Once the disk exists, cancel marks the queue
+// canceling and aborts new I/O. See waitSafe. On Linux 7.0 a request
+// already handed to such a queue still blocks STOP_DEV, so teardown
+// hangs; that needs the rescue ring itself to fail, for example
+// because io_uring_setup fails.
 func (q *queue) holdUntilSafe(err error) string {
 	if errors.As(err, new(errServable)) {
 		err = q.serveEIO()
 		if err == nil {
 			return holdStopped
 		}
+	}
+
+	rerr := q.rescue()
+	if rerr == nil {
+		return holdRescued
+	}
+
+	if l := q.dev.cfg.Logger; l != nil {
+		l.Error("ublk: failed queue cannot answer I/O; a request handed to it may block teardown",
+			"queue", q.id, "err", err, "rescueErr", rerr)
 	}
 
 	done := q.dev.startDone
@@ -105,9 +120,9 @@ func (q *queue) serveEIO() error {
 	}
 
 	// Teardown may now run STOP_DEV, which relies on this loop to answer
-	// I/O. If the loop fails later, the queue falls back to the broken
-	// path while STOP_DEV may already be waiting; that case has no fix
-	// short of serving, which a broken ring cannot do.
+	// I/O. If the loop fails later, STOP_DEV may already be waiting for
+	// a request this loop was handed, so holdUntilSafe falls back to a
+	// rescue ring that answers it.
 	q.markServing()
 
 	eio := -int32(syscall.EIO)
@@ -132,6 +147,10 @@ func (q *queue) serveEIO() error {
 
 			switch c.Res {
 			case 0:
+				if err := q.delivered(uint16(c.UserData), true); err != nil {
+					return err
+				}
+
 				if err := q.prepIO(uIOCommitAndFetchReq, uint16(c.UserData), eio); err != nil {
 					return err
 				}

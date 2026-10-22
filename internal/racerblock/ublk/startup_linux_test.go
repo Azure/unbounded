@@ -216,6 +216,8 @@ func TestHoldUntilSafeReturnsAfterStartup(t *testing.T) {
 
 	q := &queue{dev: d}
 
+	noRescue(t)
+
 	finished := make(chan string, 1)
 
 	go func() {
@@ -374,6 +376,8 @@ func TestHoldUntilSafeBrokenWaitsForPublication(t *testing.T) {
 	d.cfg.Logger = slog.New(slog.DiscardHandler)
 	q := &queue{dev: d}
 
+	noRescue(t)
+
 	var calls atomic.Int32
 
 	testHooks.published = func() (bool, error) {
@@ -416,6 +420,8 @@ func TestHoldUntilSafeServableFallsBackWhenBroken(t *testing.T) {
 	d, _, _ := newStartupDevice(t)
 	d.cfg.Logger = slog.New(slog.DiscardHandler)
 	q := &queue{dev: d}
+
+	noRescue(t)
 
 	var (
 		eioCalls atomic.Int32

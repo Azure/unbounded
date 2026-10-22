@@ -198,6 +198,18 @@ var testHooks struct {
 	// afterServe runs in the queue thread after serve returns err and
 	// before run decides whether the stop was local.
 	afterServe func(q *queue, err error)
+	// delivered runs when the kernel hands tag to a queue, in the
+	// normal loop (eio false) or the EIO loop (eio true). An error
+	// fails the queue with that request still unanswered.
+	delivered func(q *queue, tag uint16, eio bool) error
+	// rescue fails a queue's rescue on entry to force the broken-ring
+	// path.
+	rescue func(q *queue) error
+	// rescued runs once a rescue ring has submitted its first sweep.
+	rescued func(q *queue)
+	// beforeStop runs in teardown of a started device just before
+	// STOP_DEV is sent.
+	beforeStop func(d *Device)
 }
 
 // launchQueues starts every queue thread and waits until each one has
@@ -363,11 +375,11 @@ func (d *Device) teardown(cause error) {
 			}
 		}
 
-		// STOP_DEV waits for in-flight I/O. A failed queue that can
-		// still answer I/O with EIO serves until q.stop below, like a
-		// healthy queue. One that cannot closes its ring once that is
-		// safe, which makes the kernel abort new I/O; wait for that
-		// before STOP_DEV.
+		// STOP_DEV waits for in-flight I/O. A failed queue answers I/O
+		// with EIO, on its own ring or a rescue ring, until q.stop
+		// below, like a healthy queue. One that cannot closes its ring
+		// once that is safe, which makes the kernel abort new I/O; wait
+		// for that before STOP_DEV.
 		for _, q := range d.queues {
 			if q.running && q.failed.Load() {
 				select {
@@ -378,6 +390,10 @@ func (d *Device) teardown(cause error) {
 		}
 
 		if d.started {
+			if testHooks.beforeStop != nil {
+				testHooks.beforeStop(d)
+			}
+
 			keep(d.ctrl.stopDev(d.id))
 		}
 
