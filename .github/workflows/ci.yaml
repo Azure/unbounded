@@ -33,9 +33,10 @@ env:
 jobs:
   # ---------- Change scope ----------
   # Racer changes skip the jobs that cannot observe them. A change limited to
-  # Racer, its docs and NOTICE skips the frontend, BPF, orca and net image
-  # builds. A change limited to the Rust dataplane also skips the Go jobs,
-  # since no Go package builds it; racer.yaml tests it instead.
+  # Racer, docs/, designs/ and NOTICE skips the frontend, BPF, orca and net
+  # image builds. A change limited to the Rust dataplane and NOTICE also skips
+  # the Go jobs, since no Go package builds it; racer.yaml tests it instead.
+  # Changes to docs/ or designs/ keep the Go jobs, because Go tests read them.
   #
   # Skipped jobs pass required checks, so the gated jobs run unless an output
   # is exactly 'false' and use !cancelled() to run even if this job fails. An
@@ -83,7 +84,10 @@ jobs:
           racer=false
           while IFS= read -r path; do
             case "$path" in
-              docs/* | designs/* | NOTICE)
+              NOTICE)
+                ;;
+              docs/* | designs/*)
+                go=true
                 ;;
               cmd/racer-dataplane/* | images/racer-dataplane/* | hack/scripts/runtime-miri.py)
                 racer=true
