@@ -2577,7 +2577,11 @@ mod tests {
                             &b,
                             a.node(),
                             copy(&control),
-                            &[Phase::Fallback],
+                            &[if phase == Phase::Finish {
+                                Phase::Complete
+                            } else {
+                                Phase::Finish
+                            }],
                             &[9; 32],
                             0,
                             &scope
@@ -2599,7 +2603,7 @@ mod tests {
                     .sign(
                         &nodes[0],
                         nodes[1].node(),
-                        Phase::Fallback,
+                        Phase::Finish,
                         &[9; 32],
                         0,
                         vec![],
@@ -2619,9 +2623,9 @@ mod tests {
                 }
                 let previous = if mutation == 6 { [8; 32] } else { [9; 32] };
                 let phase = if mutation == 7 {
-                    Phase::Finish
+                    Phase::Complete
                 } else {
-                    Phase::Fallback
+                    Phase::Finish
                 };
                 let peer = if mutation == 8 {
                     nodes[2].node()
@@ -2634,7 +2638,7 @@ mod tests {
                         .is_err()
                 );
             }
-            let mut head = original.head(Phase::Fallback, &[9; 32], 0, vec![]).unwrap();
+            let mut head = original.head(Phase::Finish, &[9; 32], 0, vec![]).unwrap();
             p::push(&mut head, "racer-receiver", &nodes[1].node().0);
             p::push(&mut head, "racer-extra", 1);
             assert!(
@@ -2643,7 +2647,7 @@ mod tests {
                         &nodes[1],
                         nodes[0].node(),
                         nodes[0].sign(head).unwrap(),
-                        &[Phase::Fallback],
+                        &[Phase::Finish],
                         &[9; 32],
                         0,
                         &scope
@@ -2658,7 +2662,7 @@ mod tests {
                         &nodes[1],
                         nodes[0].node(),
                         control,
-                        &[Phase::Fallback],
+                        &[Phase::Finish],
                         &[9; 32],
                         0,
                         &scope,

@@ -32,8 +32,6 @@ pub enum Phase {
     Accept,
     /// Confirm native completion.
     Complete,
-    /// Request HTTP fallback.
-    Fallback,
     /// Finish with optional fallback body.
     Finish,
 }
@@ -43,7 +41,6 @@ impl Phase {
         match self {
             Self::Accept => "accept",
             Self::Complete => "complete",
-            Self::Fallback => "fallback",
             Self::Finish => "finish",
         }
     }

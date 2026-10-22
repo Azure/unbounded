@@ -505,12 +505,12 @@ fn control_chain_rejects_phase_previous_identity_and_extension_substitution() {
         .unwrap();
     for fault in 0..4 {
         let signed = binding
-            .sign(&n[0], n[1].node(), Phase::Fallback, &previous, 0, vec![])
+            .sign(&n[0], n[1].node(), Phase::Finish, &previous, 0, vec![])
             .unwrap();
         let allowed = if fault == 0 {
-            Phase::Finish
+            Phase::Complete
         } else {
-            Phase::Fallback
+            Phase::Finish
         };
         let from = if fault == 1 { n[2].node() } else { n[0].node() };
         let previous = if fault == 2 { [0; 32] } else { previous };
@@ -589,8 +589,12 @@ fn request_builders_supply_host_for_strict_http_codec() {
         deadline: 1,
         rail: racer_control_wire::RailId(1),
     };
-    for phase in [Phase::Fallback, Phase::Finish] {
-        let head = binding.head(phase, &[0; 32], 0, vec![]).unwrap();
+    let grant = vec![Header::new(
+        "racer-rdma-grant",
+        binary(&[7; 38]).into_bytes(),
+    )];
+    for (phase, extensions) in [(Phase::Accept, grant), (Phase::Finish, vec![])] {
+        let head = binding.head(phase, &[0; 32], 0, extensions).unwrap();
         assert_eq!(
             head.unique("host").unwrap(),
             (!phase.response()).then_some(b"".as_slice())
