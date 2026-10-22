@@ -6,6 +6,7 @@
 package racer
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -48,6 +49,7 @@ spec:
 `, cacheName, containerURL))
 
 	h.installRacer()
+	h.checkDataplaneHardware()
 	h.rollout("daemonset", "racer-origin-"+cacheName, 5*time.Minute)
 	h.waitFor("sidecar injector webhook", 5*time.Minute, func() (bool, string) {
 		out, err := h.exec(time.Minute, nil, "kubectl", "get", "mutatingwebhookconfiguration",
@@ -91,6 +93,66 @@ spec:
 
 // fetchPod returns a pod that reads the blob twice through the sidecar and
 // verifies its digest each time.
+// checkDataplaneHardware reads /debug/hardware from a racer-dataplane pod
+// through the API server pod proxy and checks the report shape. Kind nodes
+// always expose block devices, but RDMA devices are not expected.
+func (h *harness) checkDataplaneHardware() {
+	h.t.Helper()
+
+	pod := strings.TrimSpace(h.kubectl("-n", operatorNamespace, "get", "pods",
+		"-l", "app.kubernetes.io/name=racer-dataplane",
+		"-o", "jsonpath={.items[0].metadata.name}"))
+	if pod == "" {
+		h.t.Fatal("no racer-dataplane pod found")
+	}
+
+	port := strings.TrimSpace(h.kubectl("-n", operatorNamespace, "get", "pod", pod, "-o",
+		`jsonpath={.spec.containers[?(@.name=="dataplane")].ports[?(@.name=="diagnostics")].containerPort}`))
+	if port == "" {
+		h.t.Fatalf("pod %s has no diagnostics containerPort", pod)
+	}
+
+	path := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s:%s/proxy/debug/hardware", operatorNamespace, pod, port)
+
+	var report map[string]json.RawMessage
+
+	h.waitFor("dataplane /debug/hardware", 2*time.Minute, func() (bool, string) {
+		out, err := h.exec(time.Minute, nil, "kubectl", "get", "--raw", path)
+		if err != nil {
+			return false, out
+		}
+
+		report = nil
+		if err := json.Unmarshal([]byte(out), &report); err != nil {
+			return false, fmt.Sprintf("decode: %v: %s", err, out)
+		}
+
+		return true, ""
+	})
+
+	for _, key := range []string{"block_devices", "rdma_devices", "racer", "errors"} {
+		if _, ok := report[key]; !ok {
+			h.t.Fatalf("/debug/hardware is missing key %q", key)
+		}
+	}
+
+	var blockDevices []json.RawMessage
+	if err := json.Unmarshal(report["block_devices"], &blockDevices); err != nil {
+		h.t.Fatalf("block_devices is not an array: %v", err)
+	}
+
+	if len(blockDevices) == 0 {
+		h.t.Fatal("block_devices is empty")
+	}
+
+	var racer map[string]json.RawMessage
+	if err := json.Unmarshal(report["racer"], &racer); err != nil || racer == nil {
+		h.t.Fatalf("racer is not a JSON object: %v: %s", err, report["racer"])
+	}
+
+	h.t.Logf("/debug/hardware on %s reported %d block devices", pod, len(blockDevices))
+}
+
 func fetchPod(ns, api string) string {
 	url := fmt.Sprintf("http://127.0.0.1:8080/%s/%s", bucket, blobKey)
 	script := fmt.Sprintf(`set -eu
