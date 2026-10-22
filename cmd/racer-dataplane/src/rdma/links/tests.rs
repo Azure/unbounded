@@ -311,7 +311,7 @@ fn grant_and_completion_values_round_trip_and_reject_malformed() {
 }
 
 #[test]
-fn activation_without_two_buffers_settles_inactive() {
+fn activation_without_one_buffer_settles_inactive() {
     let sim = Simulation::new();
     let clock = SimulationClock::new(7);
     let environment = clock.environment(1);
@@ -319,19 +319,41 @@ fn activation_without_two_buffers_settles_inactive() {
     let _guard = environment.enter();
     let scope = scope();
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-    let result = std::pin::pin!(n.links.activate(
-        vec![mapping(1)],
-        &n.admission,
-        2 * BUFFER_LEN - 1,
-        &scope
-    ))
-    .poll(&mut cx);
+    let result =
+        std::pin::pin!(
+            n.links
+                .activate(vec![mapping(1)], &n.admission, BUFFER_LEN - 1, &scope)
+        )
+        .poll(&mut cx);
     assert_eq!(result, Poll::Ready(Err(Error::Unavailable)));
     assert!(n.links.node().settled());
     assert!(n.links.active().is_empty());
     assert!(!n.links.rail_ready(RAIL));
     assert_eq!(n.admission.used(ResourceClass::Registered), 0);
     n.owner.poll_budgeted(8).unwrap();
+}
+
+#[test]
+fn activation_with_one_buffer_funds_one_receive_buffer() {
+    let sim = Simulation::new();
+    let clock = SimulationClock::new(7);
+    let environment = clock.environment(1);
+    let mut a = node(&sim, 1, node_id(1), Some(&environment));
+    let mut b = node(&sim, 2, node_id(2), Some(&environment));
+    let _guard = environment.enter();
+    let scope = scope();
+    let rails = drive(
+        &mut a.owner,
+        &mut b.owner,
+        a.links
+            .activate(vec![mapping(1)], &a.admission, BUFFER_LEN, &scope),
+    )
+    .unwrap();
+    assert_eq!(rails.len(), 1);
+    assert!(a.links.node().settled());
+    assert!(a.links.rail_ready(RAIL));
+    assert_eq!(a.admission.used(ResourceClass::Registered), BUFFER_LEN);
+    assert_eq!(a.links.buffers(RAIL, BufferState::Free), Some(1));
 }
 
 #[test]
