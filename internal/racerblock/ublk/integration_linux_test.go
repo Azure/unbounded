@@ -520,3 +520,55 @@ func TestIntegrationDeleteStale(t *testing.T) {
 		}
 	}
 }
+
+type memHandler []byte
+
+func (m memHandler) ReadAt(_ context.Context, p []byte, off int64) error {
+	copy(p, m[off:])
+	return nil
+}
+
+// TestIntegrationFio is a manual throughput check against an in-memory
+// handler. It runs only when UBLK_TEST_FIO=1 and fio is installed.
+func TestIntegrationFio(t *testing.T) {
+	requireUblk(t)
+
+	if os.Getenv("UBLK_TEST_FIO") != "1" {
+		t.Skip("UBLK_TEST_FIO not set")
+	}
+
+	fio, err := exec.LookPath("fio")
+	if err != nil {
+		t.Skip("fio not installed")
+	}
+
+	mem := make(memHandler, 256<<20)
+	fillPattern(mem, 0)
+
+	d := startTestDevice(t, context.Background(), mem, Config{
+		ID: -1, Size: int64(len(mem)),
+		Logger: slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})),
+	})
+
+	jobs := [][]string{
+		{"--name=seq1m", "--rw=read", "--bs=1M", "--iodepth=32", "--numjobs=1"},
+		{"--name=rand4k", "--rw=randread", "--bs=4k", "--iodepth=64", "--numjobs=4", "--group_reporting"},
+	}
+	for _, j := range jobs {
+		args := append([]string{
+			"--filename=" + d.Path(), "--direct=1", "--ioengine=io_uring",
+			"--time_based", "--runtime=5",
+		}, j...)
+
+		out, err := exec.Command(fio, args...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("fio: %v\n%s", err, out)
+		}
+
+		for l := range strings.SplitSeq(string(out), "\n") {
+			if strings.Contains(l, "read: IOPS") || strings.Contains(l, "READ:") {
+				t.Log(strings.TrimSpace(l))
+			}
+		}
+	}
+}
