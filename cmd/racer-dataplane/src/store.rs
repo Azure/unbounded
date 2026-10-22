@@ -1503,14 +1503,21 @@ struct RecordLayout {
     /// `header_block` plus the unpadded ciphertext length.
     logical_bytes: usize,
 }
-/// Record unit: the extent granularity, so every in-record offset that is a
-/// multiple of it is both offset- and length-aligned on disk.
+/// Record unit: a multiple of the extent granularity, so every in-record
+/// offset that is a multiple of it is both offset- and length-aligned on disk.
+/// It is at least CIPHERTEXT_ALIGNMENT, so header blocks and record extents are
+/// 4 KiB multiples and ciphertext stays eligible for direct-to-GPU reads on
+/// devices with smaller sectors.
 fn record_unit(alignment: Alignment) -> Result<usize> {
     let unit = alignment.extent(0, 1)?.length();
     if !unit.is_multiple_of(MIN_RECORD_UNIT) {
         return Err(Error::InvalidConfiguration);
     }
-    Ok(unit)
+    if CIPHERTEXT_ALIGNMENT.is_multiple_of(unit) {
+        Ok(CIPHERTEXT_ALIGNMENT)
+    } else {
+        Ok(unit)
+    }
 }
 fn align_up(len: usize, unit: usize) -> Result<usize> {
     len.checked_next_multiple_of(unit)
@@ -1521,7 +1528,13 @@ fn layout(
     generation: Generation,
     alignment: Alignment,
 ) -> Result<RecordLayout> {
-    let unit = record_unit(alignment)?;
+    layout_with_unit(page, generation, record_unit(alignment)?)
+}
+fn layout_with_unit(
+    page: &CiphertextCopy,
+    generation: Generation,
+    unit: usize,
+) -> Result<RecordLayout> {
     let raw = raw_layout(page, generation)?;
     let header_block = align_up(raw, unit)?;
     if header_block > MAX_HEADER_BYTES {
@@ -1673,11 +1686,34 @@ pub fn encode_at(
     generation: Generation,
     alignment: Alignment,
     offset: u64,
-    mut buffer: AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
+    buffer: AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
 ) -> Result<EncodedRecord> {
     let layout = layout(page, generation, alignment)?;
+    encode_layout(page, generation, alignment, offset, buffer, layout)
+}
+/// Encode with the extent unit as the record unit, the layout written before
+/// the record unit had a 4 KiB floor. Readers must keep accepting it.
+#[cfg(test)]
+pub(crate) fn encode_unit_aligned_at(
+    page: &CiphertextCopy,
+    generation: Generation,
+    alignment: Alignment,
+    offset: u64,
+    buffer: AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
+) -> Result<EncodedRecord> {
+    let layout = layout_with_unit(page, generation, alignment.extent(0, 1)?.length())?;
+    encode_layout(page, generation, alignment, offset, buffer, layout)
+}
+fn encode_layout(
+    page: &CiphertextCopy,
+    generation: Generation,
+    alignment: Alignment,
+    offset: u64,
+    mut buffer: AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
+    layout: RecordLayout,
+) -> Result<EncodedRecord> {
     let logical_bytes = layout.logical_bytes;
-    let extent = alignment.extent(offset, logical_bytes)?;
+    let extent = alignment.extent(offset, layout.header_block + layout.body_bytes)?;
     if extent.length() != layout.header_block + layout.body_bytes {
         return Err(Error::InvalidConfiguration);
     }

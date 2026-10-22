@@ -201,14 +201,18 @@ Ciphertext reaches GPU staging memory owned by the dataplane in one of three way
 The store already writes format version 2 records (see
 `cmd/racer-dataplane/src/store.rs`): the header and its SHA-256 digest, then zero
 padding up to `header_len`, then the ciphertext, then zero padding up to the
-extent. `header_len` and the ciphertext body are rounded up to the record unit,
-which is the slab's direct-I/O extent unit. Readers treat other versions, including
-the old unpadded v1 layout, as cold misses.
+extent. `header_len` and the ciphertext body are rounded up to the record unit.
+Readers treat other versions, including the old unpadded v1 layout, as cold
+misses.
 
-cuFile needs the ciphertext to start on a 4 KiB boundary on the device. A record
-is eligible when its `header_len` is a multiple of 4 KiB, and its device offset is
-4 KiB aligned when the record unit is a multiple of 4 KiB and the segment's
-physical start is 4 KiB aligned. The dataplane does not assume this. It computes
+cuFile needs the ciphertext to start on a 4 KiB boundary on the device, so the
+writer uses a record unit of at least 4 KiB: the slab's direct-I/O extent unit,
+raised to 4 KiB when the extent unit is smaller. Readers still accept any
+`header_len` that is a multiple of 512 bytes, so records written with a smaller
+unit stay readable and are read through host memory. With 4 KiB record units,
+every record in a segment starts 4 KiB aligned relative to the segment, and the
+ciphertext is 4 KiB aligned on the device when the segment's physical start is
+too. The dataplane does not assume this. It computes
 the absolute offset for each read and falls back to host memory if the offset is
 not aligned.
 
