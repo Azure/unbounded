@@ -61,13 +61,5 @@ This does **not** yet prove CAS/MachinePool support, existing-inventory
 reservation, production scale, or the complete failure and recovery matrix.
 The [revised design](design.md) covers those remaining requirements.
 
-## Repeat it or inspect the evidence
-
-Use the [runbook's dual-cloud test and cleanup commands](../../hack/karpenter-poc/README.md#finite-dual-cloud-acceptance-and-safe-cleanup).
-The [accepted run record](../../hack/karpenter-poc/README.md#accepted-dual-cloud-run)
-contains exact identities, image pins, and milestones; its local JSONL is
-`tmp/karpenter-poc/aws/dual-acceptance-20261022T143255723461Z.jsonl`.
-
-The environment was retained for testing, with workloads scaled to zero.
-AKS system capacity, NAT gateways, storage, and other retained infrastructure
-still incur charges.
+Detailed logs and environment-specific reproduction instructions are retained
+locally, outside this design review.

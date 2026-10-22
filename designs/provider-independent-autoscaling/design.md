@@ -3,7 +3,7 @@
 | Field | Value |
 | --- | --- |
 | Status | Revised design for review, informed by a successful Azure/AWS Karpenter POC |
-| Scope | Provider-independent worker discovery, allocation, and release for one target cluster |
+| Scope | Provider-independent host operations and worker lifecycle, with optional autoscaling, for one target cluster |
 | Audience | Maintainers, provider authors, operators, and agents preparing an implementation plan |
 | Repository baseline | Local POC implementation on `8728a2e4099cbf6a1f8f4b898c324ed343073c76`; implementation changes are uncommitted |
 | Date | 2026-10-22 |
@@ -13,14 +13,14 @@
 - Sections 1-4 explain the problem, scope, current implementation, and resource lifetimes.
 - Sections 5-7 describe the contracts, examples, and component ownership.
 - Sections 8-13 cover launch, retirement, recovery, bootstrap, reporting, and scale.
-- Sections 14-16 describe the remaining CAS/provider work and verification gates.
+- Sections 14-16 define the provider SDK interface, remaining CAS/provider work,
+  and verification gates.
 - Section 17 lists decisions still needed before implementation planning.
   Section 18 explains the alternatives considered.
 
 For a short account of what ran and what it proved, read the
-[POC explainer](poc.md). Deployment identifiers, image pins, commands, evidence,
-and retirement instructions belong in the [POC runbook](../../hack/karpenter-poc/README.md),
-not in the architecture.
+[POC explainer](poc.md). Environment-specific deployment and reproduction
+instructions are retained locally, outside this design review.
 
 ## 1. Purpose and context
 
@@ -136,6 +136,7 @@ DRA, reservations, and specialized repair policies remain separate extensions.
 | Karpenter creates one allocation named from the NodeClaim UID. | `plugins/karpenter/internal/provider/provider.go:59-197` | Create retries refer to the same durable request. |
 | Karpenter Delete writes release intent; confirmed release is reported separately. | `plugins/karpenter/internal/provider/inventory.go:177-230` | Accepted deletion is not proof that infrastructure is gone. |
 | Retirement fences the Machine and revokes bootstrap before checking release authorization. | `internal/capacity/allocation_release.go:158-212`, `:247-309` | Deletion, fencing, and safe release are distinct. |
+| Allocation-backed Machines reject HostReplace, HostPowerOff, and HostPowerOn even if the provider registers them. | `internal/machineops/allocation.go:64-96` | Provider capability and permission to operate on a particular Machine are separate; broader support needs lifecycle review. |
 | A recorded allocate operation cannot be silently replaced. | `internal/capacity/allocation_controller.go:247-262`; `internal/machineops/allocation.go:250-268` | Losing the recorded journal requires recovery, not another launch. |
 | Providers record actual attached resources, including results from failed allocation. | `internal/machineops/providers/azurevm/capacity.go:659-795`; `internal/machineops/providers/awsec2/capacity.go:883-963` | Cleanup cannot be derived from a naming convention alone. |
 | Related-object indexes and selective class watches limit reconciliation fan-out. | `internal/capacity/indexes.go:16-101`; `internal/capacity/setup.go:187-249` | An offering refresh must not wake every healthy allocation. |
@@ -418,6 +419,8 @@ The POC hosts shared capacity reconciliation beside provider operations in
 Adapters return normalized results; they do not race the shared controller to
 patch allocation status. The Karpenter plugin is packaged with a compatible
 self-hosted controller, not a remote plugin protocol or managed AKS NAP extension.
+The provider-facing callback and registration interface is defined in
+[section 15.1](#151-provider-interface-host-operations-and-machine-lifecycle).
 
 ## 8. Launching capacity and deciding when it is usable
 
@@ -722,17 +725,219 @@ reuse the allocation lifecycle without changing the proven Karpenter contract.
 
 ## 15. Adopting providers and deploying changes
 
-### 15.1 What a provider must implement
+### 15.1 Provider interface: host operations and machine lifecycle
 
-The implemented SDK requires class resolution, pure allocation planning, and
-long-running HostAllocate/HostRelease registrations. A provider must supply
-truthful offerings, a usable pre-host locator, recoverable native identity,
-owned-resource evidence, explicit error classification, and confirmed release
-(`pkg/machineops/capacity.go:97-169`).
+A provider implements **one registration with two capability families**:
+operations on an existing host, and discovery/allocation/release of capacity.
+Both use `pkg/machineops`; there is no separate provider interface for CAS,
+Karpenter, or operator-managed demand.
 
-A reboot-only provider is not automatically autoscaling-capable. AzureVM and
-AWSEC2 are the qualified POC adapters for the tested configurations; the
-presence of other operation adapters does not extend that claim.
+The proposed contract extends the existing callback-registration SDK, rather
+than requiring a monolithic Go interface with unsupported methods. An adapter
+can implement callbacks as methods or functions. Registration declares exactly
+which operations the provider supports.
+
+| Capability | Provider implementation | Requirement |
+| --- | --- | --- |
+| Existing-host operations | Register supported `HostReboot`, `HostPowerOn`, `HostPowerOff`, and `HostReplace` kinds. | Optional per kind; host-operation-only providers remain valid. |
+| Class discovery | `ResolveClass` returns normalized, expiring offerings from provider configuration and authority. | Required for capacity lifecycle. |
+| Pre-host planning | `PlanAllocation` returns a deterministic host locator and image without remote calls or reservations. | Required for capacity lifecycle. |
+| Allocation | `BeginAllocate` and `PollAllocate`, registered as `HostAllocate`. | Required for capacity lifecycle; long-running. |
+| Release | `BeginRelease` and `PollRelease`, registered as `HostRelease`. | Required for capacity lifecycle; long-running. |
+| Replacement cleanup | Optional cleanup after the shared controller applies an operation result. | Not a substitute for `HostRelease`. |
+
+The capacity capability is an all-or-nothing bundle: discovery and planning
+plus both long-running allocation and release operations. A reboot-only
+provider must not advertise capacity; a capacity-only provider must not
+advertise unsupported power or replacement operations. The constructor and
+tests enforce the capacity bundle
+(`pkg/machineops/capacity.go:104-169`;
+`pkg/machineops/capacity_test.go:44-144`).
+
+#### Public callback signatures
+
+These are the SDK callback types used by the POC, proposed as the common
+provider boundary. The request/result types are summarized below; they are not
+autoscaler-specific.
+
+```go
+type ResolveClassFunc func(context.Context, ClassRequest) (ClassResolution, error)
+
+type PlanAllocationFunc func(context.Context, AllocationPlanRequest) (AllocationPlan, error)
+
+type ExecuteFunc func(context.Context, OperationRequest) (OperationResult, error)
+
+type BeginFunc func(context.Context, OperationRequest) (BeginResult, error)
+
+type PollFunc func(context.Context, OperationRequest, ProviderOperation) (PollResult, error)
+
+type CleanupFunc func(context.Context, OperationRequest, OperationResult) error
+```
+
+An existing-host operation chooses either one immediate `Execute` callback or
+a resumable `Begin`/`Poll` pair. `HostAllocate` and `HostRelease` always use
+Begin/Poll. Callback types and operation modes are defined in
+`pkg/machineops/provider.go:15-41`; discovery and planning types are in
+`pkg/machineops/capacity.go:87-95`.
+
+#### Example: one adapter supporting both families
+
+This registration sketch uses the existing SDK signatures. `Provider` and its
+callback bodies are adapter-owned and omitted here. It illustrates a provider
+that supports all four existing-host operations; providers register only the
+kinds they actually support. This example chooses Begin/Poll for each operation,
+but does not require rewriting existing immediate-operation adapters.
+
+```go
+func (p *Provider) Registration() (*machineops.Provider, error) {
+	return machineops.NewProvider(
+		"ExampleCloud",
+		machineops.WithCapacity(p.ResolveClass, p.PlanAllocation),
+		machineops.WithLongRunningOperation(
+			unboundedv1alpha3.OperationHostAllocate,
+			p.BeginAllocate,
+			p.PollAllocate,
+		),
+		machineops.WithLongRunningOperation(
+			unboundedv1alpha3.OperationHostRelease,
+			p.BeginRelease,
+			p.PollRelease,
+		),
+		machineops.WithLongRunningOperation(
+			unboundedv1alpha3.OperationHostReboot,
+			p.BeginReboot,
+			p.PollReboot,
+		),
+		machineops.WithLongRunningOperation(
+			unboundedv1alpha3.OperationHostPowerOn,
+			p.BeginPowerOn,
+			p.PollPowerOn,
+		),
+		machineops.WithLongRunningOperation(
+			unboundedv1alpha3.OperationHostPowerOff,
+			p.BeginPowerOff,
+			p.PollPowerOff,
+		),
+		machineops.WithLongRunningOperation(
+			unboundedv1alpha3.OperationHostReplace,
+			p.BeginReplace,
+			p.PollReplace,
+			machineops.RequiresReplaceUserData(),
+			machineops.WithCleanup(p.CleanupReplace),
+		),
+	)
+}
+```
+
+`machineops` is `github.com/Azure/unbounded/pkg/machineops`;
+`unboundedv1alpha3` is `github.com/Azure/unbounded/api/machina/v1alpha3`.
+The `Begin*` methods have the `BeginFunc` signature, the `Poll*` methods have
+the `PollFunc` signature, and `CleanupReplace` has the `CleanupFunc` signature.
+The registration binds method names to operation kinds; these method names
+are not a second interface enforced by the SDK.
+
+For immediate operations, use `WithImmediateOperation(kind, execute)`.
+`ReplaySafe()` is an explicit claim that repeating that immediate operation
+after interruption is safe; it must not be added simply to enable retries.
+`RequiresReplaceUserData()` requests shared bootstrap rendering for
+HostReplace. Providers using an existing provider-owned Machine CR can
+optionally declare its GroupKind with `WithProviderMachineKind`
+(`pkg/machineops/provider.go:47-68`, `:140-209`).
+
+#### Requests and results across the boundary
+
+| Type | Information and obligation |
+| --- | --- |
+| `ClassRequest` | Class name/UID, Site name, immutable provider configuration, and resolved auth. The provider interprets its own configuration. |
+| `ClassResolution` | Normalized offerings with correlated shape/topology, overhead, availability expiry, and optional price. No infrastructure allocation occurs here. |
+| `AllocationPlanRequest` | Allocation name/UID, planned Machine name, provider configuration, and selected offering. Planning is pure. |
+| `AllocationPlan` | `ProviderID` is the pre-host locator, not necessarily a native instance ID; `HostImage` identifies the launch image. |
+| `OperationRequest` | Machine name/UID/generation, operation name/UID/kind, provider locator/reference, image, parameters, and resolved auth. `Allocation` is set only for HostAllocate/HostRelease. |
+| `AllocationRequest` | Allocation and class identities, host name, frozen offering, and recorded owned resources. Provider configuration and credential-bearing user data are supplied for HostAllocate Begin, not for Poll or release. |
+| `BeginResult` | Nonempty `ProviderOperation.OperationID`, optional `ResumeToken`, safe status message, and optional `RequeueAfter`. The shared engine persists the handle. |
+| `PollResult` | `InProgress`, `Succeeded`, `Failed`, or `Canceled`, plus result, reason/message, and polling delay. Transient observation errors must not be reported as terminal failure or absence. |
+| `OperationResult` | Optional changed provider ID, cleanup identity, and allocation result. The shared controller applies the result. |
+| `AllocationResult` | Confirmed native resource ID, actual instance type/zone/image, and provably owned resources with native identities. A failed allocation may still report resources requiring release. |
+
+The full types are in `pkg/machineops/types.go:16-128` and
+`pkg/machineops/capacity.go:15-85`. The shared request builder supplies launch
+inputs only when needed (`internal/machineops/allocation.go:111-182`).
+Resume tokens and status messages must not contain credentials or user data.
+For capacity, providers must be able to observe and release accepted effects
+using persisted identity/handles and the frozen authority, without depending
+on a subsequently deleted class configuration.
+
+#### Required execution behavior
+
+1. **Replay the same intent.** Begin may repeat before its handle is persisted.
+   Use the stable operation UID and, for capacity ownership, the allocation UID.
+   Explain the backend's replay/lookup guarantees; a matching string alone is
+   not exactly-once execution.
+2. **Observe accepted work.** Poll resumes the saved operation. It must not
+   launch replacement capacity when a recorded host is absent or when discovery
+   changes. Observation uncertainty remains explicit.
+3. **Report complete effects.** Preserve native and child-resource identities,
+   including partial failures. Release succeeds only after the recorded effects
+   are gone or, for inventory, safely returned under the provider's contract.
+4. **Keep authority explicit.** Use the supplied credential context and frozen
+   allocation ownership. Do not log or persist bootstrap payloads or secret material.
+5. **Separate errors from outcomes.** For Begin/Poll, ordinary callback errors
+   are retried; `PermanentError` stops retries. Poll can report a terminal
+   failed outcome together with an allocation result for cleanup. Immediate
+   Execute errors currently fail the operation; they do not use the same retry
+   contract (`internal/machineops/controller.go:224-227`).
+6. **Bound work.** Honor context cancellation, use bounded API calls and shared
+   discovery caches, and return polling delays rather than waiting indefinitely
+   inside a reconciliation. Do not add account-wide scans per allocation.
+7. **Leave shared lifecycle to Unbounded.** Adapters do not independently
+   resize demand, drain Nodes, patch shared allocation status, or remove shared
+   finalizers. The same callbacks serve autoscalers and operator-managed demand.
+
+There is no generic `Cancel`, drift, or repair callback in the current contract.
+Consumer cancellation fences the allocation; the shared controller settles the
+original operation before release. A provider-observed `Canceled` outcome does
+not prove that partial resources are absent. Optional capabilities and stronger
+recovery guarantees remain subject to sections 10 and 17, not implied by these
+signatures (`internal/machineops/resumable.go:29-279`).
+
+#### Capability does not bypass lifecycle policy
+
+Registering an operation means the provider can execute it, not that it is safe
+for every Machine in every state. The shared lifecycle authorizes dispatch.
+In the POC, allocation-backed Machines reject HostReplace, HostPowerOff, and
+HostPowerOn even while active. A fence blocks further host operations except
+release and observation of an already accepted allocation
+(`internal/machineops/allocation.go:64-96`;
+`internal/machineops/controller.go:142-144`).
+
+Supporting power or replacement operations on those Machines needs an explicit
+policy for allocation identity, readiness, bootstrap, and old/new native-resource
+ownership. This is an open decision in R3, not functionality established by the
+combined registration example. Machines without an allocation keep their
+existing host-operation path.
+
+#### Connecting the registration to controllers
+
+Supply the same `[]*machineops.Provider` registrations to
+`machineops/controller.AddToManager` for MachineOperations and
+`machineops/controller.AddCapacityToManager` for MachineClass/MachineAllocation
+reconciliation. The latter selects registrations that declare capacity.
+Scope their provider, Site, credentials, configuration namespace, and consumer
+watch consistently; use one elected writer per scope
+(`pkg/machineops/controller/controller.go:27-84`, `:116-204`).
+
+The shared controllers own generic resource creation, snapshots, Machine/Node
+binding, fencing, and release authorization. The provider owns native effects
+and observations. A provider-specific host CR is an optional backend model,
+not a replacement for that shared ownership boundary.
+
+The AzureVM POC already combines existing-host operations and capacity in one
+registration (`internal/machineops/providers/azurevm/provider.go:39-96`;
+`internal/machineops/providers/azurevm/capacity.go:88-98`). The AWSEC2 POC
+registers capacity only; it does not implement host power or replacement
+operations (`internal/machineops/providers/awsec2/provider.go:18-39`).
+The accepted dual-cloud proof qualifies the tested allocation/release paths,
+not every registered host operation or every provider.
 
 ### 15.2 Inventory providers remain qualification work
 
@@ -790,8 +995,8 @@ offering in the same cluster:
 The [short POC explanation](poc.md) links the detailed record. The accepted
 JSONL is retained locally at
 `tmp/karpenter-poc/aws/dual-acceptance-20261022T143255723461Z.jsonl:19-68`.
-The earlier Azure-only proof and failed first dual-cloud attempt remain in the
-runbook. Cloud calls in the acceptance helper observe infrastructure; normal
+The earlier Azure-only proof and failed first dual-cloud attempt are also
+retained locally. Cloud calls in the acceptance helper observe infrastructure; normal
 Kubernetes lifecycle controllers perform release
 (`hack/karpenter-poc/dual-cloud-acceptance.py:595-860`).
 
@@ -839,6 +1044,9 @@ Define required capabilities, normalized topology/resources, price-age policy,
 timeouts, cleanup evidence, and supported runtime behavior. Decide how adapters
 advertise optional drift/repair/reservation features without plugin branches.
 Do not add a profile field merely to imply untested capabilities.
+Decide which registered host operations may run on allocation-backed Machines,
+and how power or replacement operations preserve the allocation contract.
+The POC restrictions in section 15.1 must not be removed without that policy.
 
 ### R4. What is the exact MachinePool resize API?
 
