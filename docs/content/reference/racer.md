@@ -354,6 +354,39 @@ Older dataplanes send pages out of order unless the client sends
 before SDKs. Older peers accept only one page request at a time from a node.
 The dataplane detects this and falls back to one request at a time for that peer.
 
+### Host reads
+
+A client on the node can ask the dataplane to write an object straight into a
+file it owns, such as a `memfd`, instead of streaming it over the socket:
+
+```
+POST /v1/objects/<key>/host-read HTTP/1.1
+Host: racer
+Content-Length: 0
+Range: bytes=<start>-<end>          optional
+If-Match: "<etag>"                  optional
+Racer-Destination-Offset: <offset>
+Racer-Destination-Length: <length>
+```
+
+- Send exactly one file descriptor with the request, as `SCM_RIGHTS` data on
+  the same `sendmsg` as the start of the request. It must be a regular file
+  opened for writing, without `O_APPEND`.
+- The bytes at object offset `o` go to file offset
+  `Racer-Destination-Offset + (o - range start)`.
+- The dataplane answers 400 if there is no descriptor, more than one, a
+  descriptor on any other request, a file that is not regular, or a length
+  smaller than the range. Range and version errors keep their usual statuses.
+- A success has `Racer-Delivery: host`. The body uses the normal frames, but
+  page frames carry no data: a page frame means that page is already in the
+  file. The last frame is the usual completion frame. The client sends no
+  credits.
+- If the read fails partway, the connection closes without the completion frame
+  and the file may hold partial data.
+
+`POST /v1/objects/<key>/gpu-read` is reserved for GPU memory. This dataplane
+answers it with 501.
+
 ### Warm and hard retention
 
 Send `HEAD` on the client socket with `Cache-Control: max-age=<seconds>` to request

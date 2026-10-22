@@ -4074,3 +4074,4 @@ fn handoff_acceptor_drains_backlog_and_wakes_only_while_one_remains() {
     }
     assert_eq!(worker.listeners.active_connections_for(&definition().id), 3);
 }
+mod direct;
