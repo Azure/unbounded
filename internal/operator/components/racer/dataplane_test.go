@@ -94,6 +94,9 @@ func TestClusterCacheDeploysDataplane(t *testing.T) {
 	require.Equal(t, marker.Data["cluster"], values["RACER_CLUSTER_ID"])
 	require.Equal(t, "https://racer-controller.custom-system.svc:8443", values["RACER_CONTROL_ENDPOINT"])
 	require.Equal(t, "[$(RACER_POD_IP)]:8082", values["RACER_PEER_LISTEN"])
+	require.Equal(t, "all", values["NVIDIA_VISIBLE_DEVICES"])
+	require.Equal(t, "compute,utility", values["NVIDIA_DRIVER_CAPABILITIES"])
+	require.NotContains(t, ds.Spec.Template.Annotations, "cdi.k8s.io/racer-dataplane")
 
 	var bootstrap *corev1.Volume
 
@@ -147,9 +150,11 @@ func TestDataplaneWorkloadInputsFromRacerConfig(t *testing.T) {
 	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, configName), cm))
 	cm.Data["RACER_HOST_NETWORK"] = "true"
 	cm.Data["RACER_DIAGNOSTICS_PORT"] = "9300"
+	cm.Data["RACER_DATAPLANE_NVIDIA"] = "cdi"
 	require.NoError(t, env.Client.Update(t.Context(), cm))
 	persist(t, env, planPass(t, env))
 
+	require.Equal(t, "nvidia.com/gpu=all", liveDataplane(t, env).Spec.Template.Annotations["cdi.k8s.io/racer-dataplane"])
 	pod := liveDataplane(t, env).Spec.Template.Spec
 	require.True(t, pod.HostNetwork)
 	require.Equal(t, corev1.DNSClusterFirstWithHostNet, pod.DNSPolicy)
@@ -159,6 +164,7 @@ func TestDataplaneWorkloadInputsFromRacerConfig(t *testing.T) {
 		{"RACER_POD_NETWORK_NODES", `["node-a"]`, "not supported"},
 		{"RACER_HOST_NETWORK", "yes", "RACER_HOST_NETWORK"},
 		{"RACER_DIAGNOSTICS_PORT", "80", "RACER_DIAGNOSTICS_PORT"},
+		{"RACER_DATAPLANE_NVIDIA", "auto", "RACER_DATAPLANE_NVIDIA"},
 	} {
 		t.Run(tc.key, func(t *testing.T) {
 			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, configName), cm))

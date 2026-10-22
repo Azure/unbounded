@@ -13,6 +13,11 @@ data:
   # RDMA requires the same nonempty Site and rail on both peers. NUMA is
   # autodetected; same-rail candidates prefer local, then unknown, then remote.
   RACER_ENABLE_RDMA: "auto"
+  # GPU reads need an image built with RACER_NATIVE_CUDA=true. auto turns GPU
+  # mode off when no usable GPU is found; true fails startup instead.
+  # RACER_ENABLE_GPU: "auto"
+  # Optional cap on ciphertext staging memory per GPU, in bytes.
+  # RACER_GPU_STAGING_BYTES: "268435456"
   # No thread cap by default: eligible physical cores, CPU quota, and resource budgets apply.
   # I/O shards share NUMA-local crypto threads at approximately 2:1, using leftovers:
   # eight eligible cores on one NUMA node give five I/O plus three crypto threads

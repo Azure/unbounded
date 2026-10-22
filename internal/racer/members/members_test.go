@@ -303,6 +303,8 @@ func TestWorkloadDataplaneEnvironment(t *testing.T) {
 				"RACER_IDENTITY_DIRECTORY":    "/var/lib/racer/identity/private",
 				"RACER_SLAB_DIRECTORY":        "/var/lib/racer/slabs",
 				"RACER_DEVICE_DIRECTORY":      "/host/dev",
+				"NVIDIA_VISIBLE_DEVICES":      "all",
+				"NVIDIA_DRIVER_CAPABILITIES":  "compute,utility",
 			}
 			if len(env) != len(expected) {
 				t.Fatalf("unexpected configuration: %v", env)
@@ -571,7 +573,7 @@ func TestWorkloadConfigIgnoresControllerRuntime(t *testing.T) {
 		}
 
 		switch key {
-		case "RACER_PEER_PORT", "RACER_HOST_NETWORK", "RACER_POD_NETWORK_NODES", "RACER_DIAGNOSTICS_PORT", "RACER_DATAPLANE_SERVICE_ACCOUNT", "RACER_DAEMONSET_NAME", "RACER_BOOTSTRAP_TRUST_CONFIGMAP":
+		case "RACER_PEER_PORT", "RACER_HOST_NETWORK", "RACER_POD_NETWORK_NODES", "RACER_DIAGNOSTICS_PORT", "RACER_DATAPLANE_SERVICE_ACCOUNT", "RACER_DAEMONSET_NAME", "RACER_BOOTSTRAP_TRUST_CONFIGMAP", "RACER_DATAPLANE_NVIDIA":
 			return "", false
 		default:
 			t.Errorf("workload parser requested runtime setting %s", key)
