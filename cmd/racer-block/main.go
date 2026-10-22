@@ -290,7 +290,9 @@ func readHeaderFile(path, flagName string) (value string, err error) {
 		}
 	}()
 
-	data, err := io.ReadAll(io.LimitReader(f, maxHeaderFileBytes+2))
+	// Read one byte past the longest accepted input (value plus CRLF) so any
+	// trailing content is detected instead of silently truncated.
+	data, err := io.ReadAll(io.LimitReader(f, maxHeaderFileBytes+3))
 	if err != nil {
 		return "", fmt.Errorf("%s: %w", flagName, err)
 	}
