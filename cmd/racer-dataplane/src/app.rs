@@ -2357,8 +2357,9 @@ impl WorkerApplication {
                     .snapshot()
                     .map_err(|error| format!("{error:?}"));
                 let device_directory = device_directory.clone();
-                Box::new(move || {
+                Box::new(move |walk| {
                     crate::hardware::report_with_snapshot(
+                        walk,
                         std::path::Path::new("/sys"),
                         &device_directory,
                         &context,

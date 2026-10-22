@@ -53,8 +53,14 @@ pub const RESERVED_BYTES: usize = server::RESERVED_BYTES
 pub(crate) const HARDWARE_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Owned, `Send` hardware discovery prepared on the control worker and run on a
-/// helper thread, so blocking sysfs reads never stall the worker.
-pub(crate) type HardwareJob = Box<dyn FnOnce() -> crate::hardware::Report + Send>;
+/// helper thread, so blocking sysfs reads never stall the worker. The job charges
+/// the walk's working budget and stops early once the request is cancelled.
+pub(crate) type HardwareJob = Box<
+    dyn FnOnce(
+            &crate::hardware::Walk,
+        ) -> std::result::Result<crate::hardware::Report, crate::hardware::Abort>
+        + Send,
+>;
 
 // Bounded diagnostics and HTTP endpoints, polled by an existing worker.
 
@@ -299,8 +305,9 @@ impl Handler for DiagnosticHandler<'_> {
 /// thread. At most one helper exists at a time: a request while the previous
 /// helper or its response is still alive gets 409 busy. The transport's own JSON
 /// slot is a second, worker-local bound. The worker never joins the helper, so a
-/// slow sysfs read cannot block it; on cancellation or deadline the helper
-/// finishes its bounded walk, skips encoding, and drops its result.
+/// slow sysfs read cannot block it; on cancellation or deadline the helper stops
+/// at its next read, skips encoding, and drops its result. Discovery that exceeds
+/// `hardware::WORKING_BYTES` stops early with 503 `response_too_large`.
 fn hardware_request(
     telemetry: &Telemetry,
 ) -> std::result::Result<server::BinaryResponse, server::BinaryError> {
@@ -323,7 +330,7 @@ fn hardware_request(
 /// State shared by one hardware helper thread and its response session.
 struct HardwareState {
     completion: std::os::fd::OwnedFd,
-    cancelled: std::sync::atomic::AtomicBool,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
     result: Mutex<Option<std::result::Result<Vec<u8>, server::BinaryError>>>,
 }
 
@@ -345,7 +352,7 @@ impl HardwareSession {
         let state = Arc::new(HardwareState {
             // SAFETY: raw is a new, successful eventfd descriptor.
             completion: unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) },
-            cancelled: std::sync::atomic::AtomicBool::new(false),
+            cancelled: Arc::default(),
             result: Mutex::new(None),
         });
         let helper = state.clone();
@@ -364,7 +371,17 @@ impl HardwareState {
         use std::os::fd::AsRawFd;
         use std::sync::atomic::Ordering;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let report = job();
+            let walk =
+                crate::hardware::Walk::new(self.cancelled.clone(), crate::hardware::WORKING_BYTES);
+            let report = match job(&walk) {
+                Ok(report) => report,
+                Err(crate::hardware::Abort::TooLarge) => {
+                    return Err(server::BinaryError::Unavailable("response_too_large"));
+                }
+                Err(crate::hardware::Abort::Cancelled) => {
+                    return Err(server::BinaryError::Unavailable("unavailable"));
+                }
+            };
             if self.cancelled.load(Ordering::Acquire) {
                 return Err(server::BinaryError::Unavailable("unavailable"));
             }
@@ -3806,7 +3823,9 @@ pub(crate) mod tests {
             assert!(
                 telemetry
                     .hardware
-                    .set(Rc::new(move || -> HardwareJob { Box::new(report) }))
+                    .set(Rc::new(move || -> HardwareJob {
+                        Box::new(move |_| Ok(report()))
+                    }))
                     .is_ok()
             );
         }
@@ -3862,6 +3881,59 @@ pub(crate) mod tests {
         }
 
         #[test]
+        fn hardware_budget_exhaustion_is_response_too_large() {
+            let telemetry = Telemetry::default();
+            assert!(
+                telemetry
+                    .hardware
+                    .set(Rc::new(|| -> HardwareJob {
+                        Box::new(|walk| {
+                            // The helper's walk carries exactly the fixed budget.
+                            assert_eq!(walk.remaining(), crate::hardware::WORKING_BYTES);
+                            walk.charge(crate::hardware::WORKING_BYTES + 1)?;
+                            Ok(crate::hardware::Report::default())
+                        })
+                    }))
+                    .is_ok()
+            );
+            let text = diagnostic_response(&telemetry, "/debug/hardware");
+            assert_response(
+                text.as_bytes(),
+                "503 Service Unavailable",
+                Some("response_too_large\n"),
+            );
+        }
+
+        #[test]
+        fn hardware_cancel_reaches_the_running_walk() {
+            use ::telemetry::server::BinarySession;
+            use std::sync::mpsc;
+            let (started, running) = mpsc::channel::<()>();
+            let (observed, seen) = mpsc::channel::<crate::hardware::Abort>();
+            let job: HardwareJob = Box::new(move |walk| {
+                let _ = started.send(());
+                let until = Instant::now() + Duration::from_secs(5);
+                let abort = loop {
+                    if let Err(abort) = walk.check() {
+                        break abort;
+                    }
+                    assert!(Instant::now() < until, "cancel never reached the walk");
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                let _ = observed.send(abort);
+                Err(abort)
+            });
+            let session = HardwareSession::start(job, ::telemetry::server::MAX_BODY_BYTES).unwrap();
+            running.recv_timeout(Duration::from_secs(5)).unwrap();
+            session.cancel();
+            assert_eq!(
+                seen.recv_timeout(Duration::from_secs(5)).unwrap(),
+                crate::hardware::Abort::Cancelled
+            );
+            assert!(session.result().is_none(), "cancelled result is discarded");
+        }
+
+        #[test]
         fn hardware_helper_panic_is_unavailable_and_releases_slot() {
             let telemetry = Telemetry::default();
             set_hardware(&telemetry, || panic!("synthetic discovery failure"));
@@ -3887,10 +3959,10 @@ pub(crate) mod tests {
                     .hardware
                     .set(Rc::new(move || -> HardwareJob {
                         let gate = job_gate.clone();
-                        Box::new(move || {
+                        Box::new(move |_| {
                             // Simulate a slow sysfs read until the test releases it.
                             let _ = gate.lock().unwrap().recv();
-                            crate::hardware::Report::default()
+                            Ok(crate::hardware::Report::default())
                         })
                     }))
                     .is_ok()
@@ -3953,10 +4025,10 @@ pub(crate) mod tests {
             use std::sync::mpsc;
             let (release, gate) = mpsc::channel::<()>();
             let (done, finished) = mpsc::channel::<()>();
-            let job: HardwareJob = Box::new(move || {
+            let job: HardwareJob = Box::new(move |_| {
                 let _ = gate.recv();
                 let _ = done.send(());
-                crate::hardware::Report::default()
+                Ok(crate::hardware::Report::default())
             });
             let session = HardwareSession::start(job, ::telemetry::server::MAX_BODY_BYTES).unwrap();
             let weak = Arc::downgrade(&session.state);
@@ -3975,7 +4047,7 @@ pub(crate) mod tests {
         #[test]
         fn hardware_session_publishes_then_signals() {
             use ::telemetry::server::BinarySession;
-            let job: HardwareJob = Box::new(crate::hardware::Report::default);
+            let job: HardwareJob = Box::new(|_| Ok(crate::hardware::Report::default()));
             let session = HardwareSession::start(job, ::telemetry::server::MAX_BODY_BYTES).unwrap();
             let fd = session.state.completion.try_clone().unwrap();
             let mut poll = libc::pollfd {
@@ -3990,7 +4062,7 @@ pub(crate) mod tests {
                 serde_json::to_string_pretty(&crate::hardware::Report::default()).unwrap() + "\n";
             assert_eq!(body, expected.as_bytes());
             assert!(session.result().is_none(), "result is taken once");
-            let tiny: HardwareJob = Box::new(crate::hardware::Report::default);
+            let tiny: HardwareJob = Box::new(|_| Ok(crate::hardware::Report::default()));
             let session = HardwareSession::start(tiny, 1).unwrap();
             // SAFETY: one valid pollfd for the duration of the call.
             poll.fd = std::os::fd::AsRawFd::as_raw_fd(&session.state.completion);

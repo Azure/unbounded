@@ -1,18 +1,120 @@
 //! Live block-device and RDMA topology report for `/debug/hardware`.
 //!
 //! Discovery reads sysfs attributes and `disk/by-id` symlinks only. It never
-//! opens a block device, holds no cache, and applies no entry caps; every call
-//! reflects the host at that moment. Missing or malformed individual values
-//! become `null`, while a section that cannot be listed records a message in
-//! `errors` and the rest of the report is still produced.
+//! opens a block device and holds no cache; every call reflects the host at that
+//! moment. Missing or malformed individual values become `null`, while a section
+//! that cannot be listed records a message in `errors` and the rest of the
+//! report is still produced.
+//!
+//! Every walk runs under a [`Walk`]: each retained allocation is charged to a
+//! fixed working-memory budget before it is kept, and the cancellation flag is
+//! checked before every read. Exhausting the budget aborts with
+//! [`Abort::TooLarge`] instead of materializing the full report first.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io;
+use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use serde::Serialize;
+
+/// Working-memory budget for one discovery.
+///
+/// The encoded response is capped at `MAX_BODY_BYTES` (about 64 KiB). The
+/// in-memory report is charged with per-entry overhead (string and vector
+/// headers, struct sizes) that pretty JSON does not carry, while JSON adds keys
+/// and indentation the structs do not, so the two are of similar magnitude. Four
+/// times the body bound leaves room for that overhead and for the by-id map,
+/// which is dropped before encoding, while still aborting long before a host
+/// whose report could never fit in one response exhausts memory. Defined here so
+/// the diagnostic memory reservation can charge it.
+pub const WORKING_BYTES: usize = 4 * ::telemetry::server::MAX_BODY_BYTES;
+
+/// Largest sysfs attribute read. Longer files are treated as malformed (`null`).
+pub const MAX_ATTRIBUTE_BYTES: usize = 4096;
+
+/// Charged per retained string, vector slot, or map node on top of its bytes.
+const ENTRY_OVERHEAD: usize = 64;
+
+/// Why discovery stopped before producing a report.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Abort {
+    /// The working-memory budget was exhausted.
+    TooLarge,
+    /// The request was cancelled or timed out.
+    Cancelled,
+}
+
+/// Cancellation flag and remaining working-memory budget for one discovery.
+pub struct Walk {
+    cancelled: Arc<AtomicBool>,
+    remaining: Cell<usize>,
+    reads: Cell<usize>,
+    #[cfg(test)]
+    cancel_after_reads: Option<usize>,
+}
+
+impl Walk {
+    /// A walk that may retain at most `budget` bytes and stops once `cancelled` is set.
+    pub fn new(cancelled: Arc<AtomicBool>, budget: usize) -> Self {
+        Self {
+            cancelled,
+            remaining: Cell::new(budget),
+            reads: Cell::new(0),
+            #[cfg(test)]
+            cancel_after_reads: None,
+        }
+    }
+
+    /// Fail if the request has been cancelled.
+    pub fn check(&self) -> Result<(), Abort> {
+        if self.cancelled.load(Ordering::Acquire) {
+            Err(Abort::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Charge `bytes` before retaining them; fails without charging on exhaustion.
+    pub fn charge(&self, bytes: usize) -> Result<(), Abort> {
+        self.check()?;
+        let remaining = self
+            .remaining
+            .get()
+            .checked_sub(bytes)
+            .ok_or(Abort::TooLarge)?;
+        self.remaining.set(remaining);
+        Ok(())
+    }
+
+    /// Bytes still available.
+    pub fn remaining(&self) -> usize {
+        self.remaining.get()
+    }
+
+    /// Charge one retained string.
+    fn charge_string(&self, value: &str) -> Result<(), Abort> {
+        self.charge(value.len().saturating_add(ENTRY_OVERHEAD))
+    }
+
+    /// Check cancellation before one filesystem read and count it.
+    fn read(&self) -> Result<(), Abort> {
+        self.check()?;
+        let reads = self.reads.get() + 1;
+        self.reads.set(reads);
+        #[cfg(test)]
+        if self.cancel_after_reads == Some(reads) {
+            self.cancelled.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+}
 
 /// Complete hardware report served as JSON.
 #[derive(Debug, Default, Serialize)]
@@ -115,12 +217,14 @@ pub struct Context {
 
 /// Build the full report, including Racer's selector, claimed disks, and rails.
 pub fn report(
+    walk: &Walk,
     sys_root: &Path,
     dev_root: &Path,
     context: &Context,
     inventory: &crate::rdma::Inventory,
-) -> Report {
+) -> Result<Report, Abort> {
     report_with_snapshot(
+        walk,
         sys_root,
         dev_root,
         context,
@@ -131,49 +235,72 @@ pub fn report(
 /// Build the full report from an already captured rails snapshot. The inputs are
 /// owned and `Send`, so a helper thread can run the sysfs walk off the I/O worker.
 pub fn report_with_snapshot(
+    walk: &Walk,
     sys_root: &Path,
     dev_root: &Path,
     context: &Context,
     snapshot: Result<crate::rdma::Snapshot, String>,
-) -> Report {
-    let mut report = discover(sys_root, dev_root);
+) -> Result<Report, Abort> {
+    let mut report = discover(walk, sys_root, dev_root)?;
     let rdma_rails = match snapshot {
-        Ok(snapshot) => Some(Rails {
-            generation: snapshot.generation,
-            rails: snapshot
-                .nics
-                .iter()
-                .map(|nic| Rail {
+        Ok(snapshot) => {
+            let mut rails = Vec::new();
+            for nic in &snapshot.nics {
+                walk.charge(std::mem::size_of::<Rail>())?;
+                let gid = nic.gid.as_ref().map(format_gid);
+                walk.charge_string(&nic.device)?;
+                if let Some(gid) = &gid {
+                    walk.charge_string(gid)?;
+                }
+                rails.push(Rail {
                     rail: nic.rail.0,
                     device: nic.device.clone(),
                     port: nic.port,
-                    gid: nic.gid.as_ref().map(format_gid),
+                    gid,
                     numa_node: nic.numa_node,
-                })
-                .collect(),
-        }),
+                });
+            }
+            Some(Rails {
+                generation: snapshot.generation,
+                rails,
+            })
+        }
         Err(error) => {
-            report
-                .errors
-                .push(format!("racer.rdma_rails: inventory snapshot: {error}"));
+            push_error(
+                walk,
+                &mut report.errors,
+                format!("racer.rdma_rails: inventory snapshot: {error}"),
+            )?;
             None
         }
     };
+    for value in context.block_device_selector.iter() {
+        walk.charge_string(value)?;
+    }
+    for disk in &context.claimed_disks {
+        walk.charge(std::mem::size_of::<ClaimedDisk>())?;
+        walk.charge_string(&disk.id)?;
+        if let Some(dev) = &disk.dev {
+            walk.charge_string(dev)?;
+        }
+    }
     report.racer = Some(Racer {
         block_device_selector: context.block_device_selector.clone(),
         claimed_disks: context.claimed_disks.clone(),
         rdma_rails,
     });
-    report
+    Ok(report)
 }
 
 /// Discover block and RDMA devices from sysfs (`sys_root`) and by-id links (`dev_root`).
-pub fn discover(sys_root: &Path, dev_root: &Path) -> Report {
+pub fn discover(walk: &Walk, sys_root: &Path, dev_root: &Path) -> Result<Report, Abort> {
     let mut report = Report::default();
-    let by_id = by_id_links(dev_root, &mut report.errors);
-    report.block_devices = block_devices(sys_root, &by_id, &mut report.errors);
-    report.rdma_devices = rdma_devices(sys_root, &mut report.errors);
-    report
+    let by_id = by_id_links(walk, dev_root, &mut report.errors)?;
+    report.block_devices = block_devices(walk, sys_root, &by_id, &mut report.errors)?;
+    // The map is dropped before encoding, but it was charged while it lived.
+    drop(by_id);
+    report.rdma_devices = rdma_devices(walk, sys_root, &mut report.errors)?;
+    Ok(report)
 }
 
 /// Format a device number as the `MAJ:MIN` text used by sysfs `dev` files.
@@ -191,135 +318,256 @@ pub fn format_gid(gid: &[u8; 16]) -> String {
         .join(":")
 }
 
-/// Record a fixed-form section failure.
-fn section_error(errors: &mut Vec<String>, section: &str, path: &Path, error: &io::Error) {
-    errors.push(format!("{section}: {}: {error}", path.display()));
+/// Charge and record one error message.
+fn push_error(walk: &Walk, errors: &mut Vec<String>, message: String) -> Result<(), Abort> {
+    walk.charge_string(&message)?;
+    errors.push(message);
+    Ok(())
 }
 
-/// Sorted entry names of a directory.
-fn list(path: &Path) -> io::Result<Vec<String>> {
-    let mut names = fs::read_dir(path)?
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .collect::<Vec<_>>();
+/// Record a fixed-form section failure.
+fn section_error(
+    walk: &Walk,
+    errors: &mut Vec<String>,
+    section: &str,
+    path: &Path,
+    error: &io::Error,
+) -> Result<(), Abort> {
+    push_error(
+        walk,
+        errors,
+        format!("{section}: {}: {error}", path.display()),
+    )
+}
+
+/// A directory listing failure.
+enum ListError {
+    Io(io::Error),
+    Abort(Abort),
+}
+
+impl From<Abort> for ListError {
+    fn from(abort: Abort) -> Self {
+        Self::Abort(abort)
+    }
+}
+
+/// Sorted names of the entries in a directory that `keep` accepts. Entries are
+/// read one at a time and each kept name is charged before it is retained.
+fn list(walk: &Walk, path: &Path, keep: impl Fn(&str) -> bool) -> Result<Vec<String>, ListError> {
+    walk.read()?;
+    let mut names = Vec::new();
+    for entry in fs::read_dir(path).map_err(ListError::Io)? {
+        walk.read()?;
+        let Ok(entry) = entry else { continue };
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if keep(&name) {
+            walk.charge_string(&name)?;
+            names.push(name);
+        }
+    }
     names.sort();
     Ok(names)
 }
 
-/// Trimmed attribute text, or `None` when absent, unreadable, or empty.
-fn text(path: &Path) -> Option<String> {
-    let value = fs::read_to_string(path).ok()?;
+/// Like [`list`] with every entry kept, but a missing or unlistable directory is empty.
+fn list_or_empty(walk: &Walk, path: &Path) -> Result<Vec<String>, Abort> {
+    match list(walk, path, |_| true) {
+        Ok(names) => Ok(names),
+        Err(ListError::Io(_)) => Ok(Vec::new()),
+        Err(ListError::Abort(abort)) => Err(abort),
+    }
+}
+
+/// Attribute text up to [`MAX_ATTRIBUTE_BYTES`], or `None` when absent,
+/// unreadable, oversized, or not UTF-8. Not charged; callers charge what they keep.
+fn raw(walk: &Walk, path: &Path) -> Result<Option<String>, Abort> {
+    walk.read()?;
+    let Ok(file) = fs::File::open(path) else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::with_capacity(256);
+    if file
+        .take(MAX_ATTRIBUTE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() > MAX_ATTRIBUTE_BYTES
+    {
+        return Ok(None);
+    }
+    Ok(String::from_utf8(bytes).ok())
+}
+
+/// Trimmed, charged attribute text, or `None` when absent, unreadable, or empty.
+fn text(walk: &Walk, path: &Path) -> Result<Option<String>, Abort> {
+    let Some(value) = raw(walk, path)? else {
+        return Ok(None);
+    };
     let value = value.trim();
-    (!value.is_empty()).then(|| value.to_owned())
+    if value.is_empty() {
+        return Ok(None);
+    }
+    walk.charge_string(value)?;
+    Ok(Some(value.to_owned()))
 }
 
 /// Unsigned decimal attribute.
-fn number(path: &Path) -> Option<u64> {
-    text(path)?.parse().ok()
+fn number(walk: &Walk, path: &Path) -> Result<Option<u64>, Abort> {
+    Ok(raw(walk, path)?.and_then(|value| value.trim().parse().ok()))
 }
 
 /// `0`/`1` attribute.
-fn flag(path: &Path) -> Option<bool> {
-    match text(path)?.as_str() {
-        "0" => Some(false),
-        "1" => Some(true),
+fn flag(walk: &Walk, path: &Path) -> Result<Option<bool>, Abort> {
+    Ok(match raw(walk, path)?.as_deref().map(str::trim) {
+        Some("0") => Some(false),
+        Some("1") => Some(true),
         _ => None,
-    }
+    })
 }
 
-/// Final path component of a symlink target.
-fn link_name(path: &Path) -> Option<String> {
-    fs::read_link(path)
-        .ok()?
-        .file_name()?
-        .to_str()
-        .map(str::to_owned)
+/// Final path component of a symlink target, charged.
+fn link_name(walk: &Walk, path: &Path) -> Result<Option<String>, Abort> {
+    walk.read()?;
+    let Some(name) = fs::read_link(path)
+        .ok()
+        .and_then(|target| target.file_name()?.to_str().map(str::to_owned))
+    else {
+        return Ok(None);
+    };
+    walk.charge_string(&name)?;
+    Ok(Some(name))
 }
 
 /// Map kernel device names to the `disk/by-id` link names that point at them.
-fn by_id_links(dev_root: &Path, errors: &mut Vec<String>) -> BTreeMap<String, Vec<String>> {
+fn by_id_links(
+    walk: &Walk,
+    dev_root: &Path,
+    errors: &mut Vec<String>,
+) -> Result<BTreeMap<String, Vec<String>>, Abort> {
     let directory = dev_root.join("disk/by-id");
     let mut links: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let names = match list(&directory) {
+    let names = match list(walk, &directory, |_| true) {
         Ok(names) => names,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return links,
-        Err(error) => {
-            section_error(errors, "by_id", &directory, &error);
-            return links;
+        Err(ListError::Abort(abort)) => return Err(abort),
+        Err(ListError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(links);
+        }
+        Err(ListError::Io(error)) => {
+            section_error(walk, errors, "by_id", &directory, &error)?;
+            return Ok(links);
         }
     };
     for name in names {
-        if let Some(target) = link_name(&directory.join(&name)) {
+        if let Some(target) = link_name(walk, &directory.join(&name))? {
+            // Map node and vector slot; the name itself was charged by `list`.
+            walk.charge(ENTRY_OVERHEAD)?;
             links.entry(target).or_default().push(name);
         }
     }
-    links
+    Ok(links)
+}
+
+/// Charged copy of the by-id names for one device.
+fn by_id_for(
+    walk: &Walk,
+    by_id: &BTreeMap<String, Vec<String>>,
+    name: &str,
+) -> Result<Vec<String>, Abort> {
+    let Some(names) = by_id.get(name) else {
+        return Ok(Vec::new());
+    };
+    for name in names {
+        walk.charge_string(name)?;
+    }
+    Ok(names.clone())
 }
 
 /// Enumerate every entry under `<sys>/block` without filtering.
 fn block_devices(
+    walk: &Walk,
     sys_root: &Path,
     by_id: &BTreeMap<String, Vec<String>>,
     errors: &mut Vec<String>,
-) -> Vec<BlockDevice> {
+) -> Result<Vec<BlockDevice>, Abort> {
     let root = sys_root.join("block");
-    let names = match list(&root) {
+    let names = match list(walk, &root, |_| true) {
         Ok(names) => names,
-        Err(error) => {
-            section_error(errors, "block_devices", &root, &error);
-            return Vec::new();
+        Err(ListError::Abort(abort)) => return Err(abort),
+        Err(ListError::Io(error)) => {
+            section_error(walk, errors, "block_devices", &root, &error)?;
+            return Ok(Vec::new());
         }
     };
-    names
-        .into_iter()
-        .map(|name| {
-            let path = root.join(&name);
-            let children = list(&path).unwrap_or_default();
-            let partitions = children
-                .iter()
-                .filter(|child| path.join(child).join("partition").is_file())
-                .map(|child| {
-                    let part = path.join(child);
-                    Partition {
-                        name: child.clone(),
-                        dev: text(&part.join("dev")),
-                        size_bytes: sectors(&part.join("size")),
-                        by_id: by_id.get(child).cloned().unwrap_or_default(),
-                    }
-                })
-                .collect();
-            BlockDevice {
-                dev: text(&path.join("dev")),
-                size_bytes: sectors(&path.join("size")),
-                logical_block_size: number(&path.join("queue/logical_block_size")),
-                physical_block_size: number(&path.join("queue/physical_block_size")),
-                rotational: flag(&path.join("queue/rotational")),
-                removable: flag(&path.join("removable")),
-                read_only: flag(&path.join("ro")),
-                model: text(&path.join("device/model")),
-                serial: text(&path.join("device/serial")),
-                wwid: text(&path.join("wwid")).or_else(|| text(&path.join("device/wwid"))),
-                by_id: by_id.get(&name).cloned().unwrap_or_default(),
-                partitions,
-                holders: list(&path.join("holders")).unwrap_or_default(),
-                name,
-            }
-        })
-        .collect()
+    let mut devices = Vec::new();
+    for name in names {
+        walk.charge(std::mem::size_of::<BlockDevice>())?;
+        let path = root.join(&name);
+        // Only partition children are retained; other entries are skipped
+        // unread and uncharged.
+        let children = match list(walk, &path, |child| {
+            path.join(child).join("partition").is_file()
+        }) {
+            Ok(children) => children,
+            Err(ListError::Abort(abort)) => return Err(abort),
+            Err(ListError::Io(_)) => Vec::new(),
+        };
+        let mut partitions = Vec::new();
+        for child in children {
+            walk.charge(std::mem::size_of::<Partition>())?;
+            let part = path.join(&child);
+            partitions.push(Partition {
+                dev: text(walk, &part.join("dev"))?,
+                size_bytes: sectors(walk, &part.join("size"))?,
+                by_id: by_id_for(walk, by_id, &child)?,
+                name: child,
+            });
+        }
+        let wwid = match text(walk, &path.join("wwid"))? {
+            Some(wwid) => Some(wwid),
+            None => text(walk, &path.join("device/wwid"))?,
+        };
+        devices.push(BlockDevice {
+            dev: text(walk, &path.join("dev"))?,
+            size_bytes: sectors(walk, &path.join("size"))?,
+            logical_block_size: number(walk, &path.join("queue/logical_block_size"))?,
+            physical_block_size: number(walk, &path.join("queue/physical_block_size"))?,
+            rotational: flag(walk, &path.join("queue/rotational"))?,
+            removable: flag(walk, &path.join("removable"))?,
+            read_only: flag(walk, &path.join("ro"))?,
+            model: text(walk, &path.join("device/model"))?,
+            serial: text(walk, &path.join("device/serial"))?,
+            wwid,
+            by_id: by_id_for(walk, by_id, &name)?,
+            partitions,
+            holders: list_or_empty(walk, &path.join("holders"))?,
+            name,
+        });
+    }
+    Ok(devices)
 }
 
 /// Sysfs `size` is always counted in 512-byte sectors.
-fn sectors(path: &Path) -> Option<u64> {
-    number(path)?.checked_mul(512)
+fn sectors(walk: &Walk, path: &Path) -> Result<Option<u64>, Abort> {
+    Ok(number(walk, path)?.and_then(|value| value.checked_mul(512)))
 }
 
 /// Strip the numeric prefix sysfs puts on port states, such as `4: ACTIVE`.
-fn state(path: &Path) -> Option<String> {
-    let value = text(path)?;
-    Some(match value.split_once(':') {
-        Some((_, name)) => name.trim().to_owned(),
+fn state(walk: &Walk, path: &Path) -> Result<Option<String>, Abort> {
+    let Some(value) = raw(walk, path)? else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    let value = match value.split_once(':') {
+        Some((_, name)) => name.trim(),
         None => value,
-    })
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    walk.charge_string(value)?;
+    Ok(Some(value.to_owned()))
 }
 
 /// Whether a name has the `DDDD:BB:DD.F` PCI address form.
@@ -336,76 +584,92 @@ fn is_pci_address(name: &str) -> bool {
 }
 
 /// Enumerate `<sys>/class/infiniband`; an absent class means no RDMA hardware.
-fn rdma_devices(sys_root: &Path, errors: &mut Vec<String>) -> Vec<RdmaDevice> {
+fn rdma_devices(
+    walk: &Walk,
+    sys_root: &Path,
+    errors: &mut Vec<String>,
+) -> Result<Vec<RdmaDevice>, Abort> {
     let root = sys_root.join("class/infiniband");
-    let names = match list(&root) {
+    let names = match list(walk, &root, |_| true) {
         Ok(names) => names,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Vec::new(),
-        Err(error) => {
-            section_error(errors, "rdma_devices", &root, &error);
-            return Vec::new();
+        Err(ListError::Abort(abort)) => return Err(abort),
+        Err(ListError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(Vec::new());
+        }
+        Err(ListError::Io(error)) => {
+            section_error(walk, errors, "rdma_devices", &root, &error)?;
+            return Ok(Vec::new());
         }
     };
-    names
-        .into_iter()
-        .map(|name| {
-            let path = root.join(&name);
-            let pci_address = fs::canonicalize(path.join("device"))
-                .ok()
-                .and_then(|target| target.file_name()?.to_str().map(str::to_owned))
-                .filter(|address| is_pci_address(address));
-            let numa_node = text(&path.join("device/numa_node"))
-                .and_then(|value| value.parse::<i64>().ok())
-                .and_then(|value| u32::try_from(value).ok());
-            let pci_netdevs = list(&path.join("device/net")).unwrap_or_default();
-            let mut ports = list(&path.join("ports"))
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|port| {
-                    let number = port.parse::<u32>().ok()?;
-                    let port = path.join("ports").join(port);
-                    let mut netdevs = BTreeSet::new();
-                    // Every GID slot may name a netdev (for example a RoCE
-                    // VLAN interface absent from device/net). Unused slots
-                    // fail to read in sysfs and are skipped by `text`.
-                    let ndevs = port.join("gid_attrs/ndevs");
-                    for entry in list(&ndevs).unwrap_or_default() {
-                        netdevs.extend(text(&ndevs.join(entry)));
+    let mut devices = Vec::new();
+    for name in names {
+        walk.charge(std::mem::size_of::<RdmaDevice>())?;
+        let path = root.join(&name);
+        walk.read()?;
+        let pci_address = fs::canonicalize(path.join("device"))
+            .ok()
+            .and_then(|target| target.file_name()?.to_str().map(str::to_owned))
+            .filter(|address| is_pci_address(address));
+        if let Some(address) = &pci_address {
+            walk.charge_string(address)?;
+        }
+        let numa_node = raw(walk, &path.join("device/numa_node"))?
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .and_then(|value| u32::try_from(value).ok());
+        let pci_netdevs = list_or_empty(walk, &path.join("device/net"))?;
+        let mut ports = Vec::new();
+        for port in list_or_empty(walk, &path.join("ports"))? {
+            let Ok(port_number) = port.parse::<u32>() else {
+                continue;
+            };
+            walk.charge(std::mem::size_of::<RdmaPort>())?;
+            let port = path.join("ports").join(port);
+            let mut netdevs = BTreeSet::new();
+            // Every GID slot may name a netdev (for example a RoCE VLAN
+            // interface absent from device/net). Unused slots fail to read in
+            // sysfs and are skipped by `text`.
+            let ndevs = port.join("gid_attrs/ndevs");
+            for entry in list_or_empty(walk, &ndevs)? {
+                if let Some(netdev) = raw(walk, &ndevs.join(entry))? {
+                    let netdev = netdev.trim();
+                    if !netdev.is_empty() && !netdevs.contains(netdev) {
+                        walk.charge_string(netdev)?;
+                        netdevs.insert(netdev.to_owned());
                     }
-                    for netdev in &pci_netdevs {
-                        // dev_port is zero-based; keep netdevs without it.
-                        let dev_port = number_at(&path.join("device/net").join(netdev));
-                        if dev_port.is_none_or(|dev_port| dev_port + 1 == u64::from(number)) {
-                            netdevs.insert(netdev.clone());
-                        }
-                    }
-                    Some(RdmaPort {
-                        port: number,
-                        state: state(&port.join("state")),
-                        phys_state: state(&port.join("phys_state")),
-                        link_layer: text(&port.join("link_layer")),
-                        rate: text(&port.join("rate")),
-                        gid0: text(&port.join("gids/0")),
-                        gid0_type: text(&port.join("gid_attrs/types/0")),
-                        netdevs: netdevs.into_iter().collect(),
-                    })
-                })
-                .collect::<Vec<_>>();
-            ports.sort_by_key(|port| port.port);
-            RdmaDevice {
-                node_guid: text(&path.join("node_guid")),
-                pci_address,
-                numa_node,
-                ports,
-                name,
+                }
             }
-        })
-        .collect()
-}
-
-/// The `dev_port` attribute of a network interface directory.
-fn number_at(netdev: &Path) -> Option<u64> {
-    number(&netdev.join("dev_port"))
+            for netdev in &pci_netdevs {
+                // dev_port is zero-based; keep netdevs without it.
+                let dev_port =
+                    number(walk, &path.join("device/net").join(netdev).join("dev_port"))?;
+                if dev_port.is_none_or(|dev_port| dev_port + 1 == u64::from(port_number))
+                    && !netdevs.contains(netdev)
+                {
+                    walk.charge_string(netdev)?;
+                    netdevs.insert(netdev.clone());
+                }
+            }
+            ports.push(RdmaPort {
+                port: port_number,
+                state: state(walk, &port.join("state"))?,
+                phys_state: state(walk, &port.join("phys_state"))?,
+                link_layer: text(walk, &port.join("link_layer"))?,
+                rate: text(walk, &port.join("rate"))?,
+                gid0: text(walk, &port.join("gids/0"))?,
+                gid0_type: text(walk, &port.join("gid_attrs/types/0"))?,
+                netdevs: netdevs.into_iter().collect(),
+            });
+        }
+        ports.sort_by_key(|port| port.port);
+        devices.push(RdmaDevice {
+            node_guid: text(walk, &path.join("node_guid"))?,
+            pci_address,
+            numa_node,
+            ports,
+            name,
+        });
+    }
+    Ok(devices)
 }
 
 #[cfg(test)]
@@ -413,6 +677,10 @@ mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
+
+    fn walk() -> Walk {
+        Walk::new(Arc::default(), WORKING_BYTES)
+    }
 
     struct Fixture(PathBuf);
 
@@ -536,7 +804,7 @@ mod tests {
     fn full_tree_reports_disks_partitions_holders_and_by_id() {
         let f = Fixture::new();
         block_tree(&f);
-        let report = discover(&f.sys(), &f.dev());
+        let report = discover(&walk(), &f.sys(), &f.dev()).unwrap();
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(
             report
@@ -571,7 +839,7 @@ mod tests {
     fn malformed_and_missing_values_become_null() {
         let f = Fixture::new();
         block_tree(&f);
-        let report = discover(&f.sys(), &f.dev());
+        let report = discover(&walk(), &f.sys(), &f.dev()).unwrap();
         let loop0 = &report.block_devices[0];
         assert_eq!(loop0.dev.as_deref(), Some("7:0"));
         assert_eq!(loop0.size_bytes, None);
@@ -587,7 +855,7 @@ mod tests {
     #[test]
     fn empty_tree_reports_block_error_but_no_rdma_or_by_id_error() {
         let f = Fixture::new();
-        let report = discover(&f.sys(), &f.dev());
+        let report = discover(&walk(), &f.sys(), &f.dev()).unwrap();
         assert!(report.block_devices.is_empty());
         assert!(report.rdma_devices.is_empty());
         assert_eq!(report.errors.len(), 1);
@@ -599,7 +867,7 @@ mod tests {
     fn present_block_dir_without_infiniband_is_clean() {
         let f = Fixture::new();
         fs::create_dir_all(f.sys().join("block")).unwrap();
-        let report = discover(&f.sys(), &f.dev());
+        let report = discover(&walk(), &f.sys(), &f.dev()).unwrap();
         assert!(report.errors.is_empty());
         assert!(report.block_devices.is_empty() && report.rdma_devices.is_empty());
     }
@@ -609,7 +877,7 @@ mod tests {
         let f = Fixture::new();
         fs::create_dir_all(f.sys().join("block")).unwrap();
         f.write("sys/class/infiniband", "not a directory");
-        let report = discover(&f.sys(), &f.dev());
+        let report = discover(&walk(), &f.sys(), &f.dev()).unwrap();
         assert_eq!(report.errors.len(), 1);
         assert!(report.errors[0].starts_with("rdma_devices: "));
     }
@@ -619,7 +887,7 @@ mod tests {
         let f = Fixture::new();
         fs::create_dir_all(f.sys().join("block")).unwrap();
         rdma_tree(&f);
-        let report = discover(&f.sys(), &f.dev());
+        let report = discover(&walk(), &f.sys(), &f.dev()).unwrap();
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         let [active, inactive] = &report.rdma_devices[..] else {
             panic!("two devices expected");
@@ -664,7 +932,7 @@ mod tests {
         // Unused slot: empty content is skipped.
         f.write(&format!("{port}/gid_attrs/ndevs/7"), "");
         f.write(&format!("{port}/gid_attrs/types/3"), "RoCE v2\n");
-        let report = discover(&f.sys(), &f.dev());
+        let report = discover(&walk(), &f.sys(), &f.dev()).unwrap();
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         let port = &report.rdma_devices[0].ports[0];
         assert_eq!(port.netdevs, ["eth2", "vlan100"]);
@@ -702,7 +970,7 @@ mod tests {
                 dev: Some("259:0".into()),
             }],
         };
-        let report = report(&f.sys(), &f.dev(), &context, &inventory);
+        let report = report(&walk(), &f.sys(), &f.dev(), &context, &inventory).unwrap();
         let value: serde_json::Value =
             serde_json::from_str(&serde_json::to_string_pretty(&report).unwrap()).unwrap();
         let keys = |v: &serde_json::Value| {
@@ -776,7 +1044,7 @@ mod tests {
             }])
             .unwrap();
         let f = Fixture::new();
-        let report = report(&f.sys(), &f.dev(), &Context::default(), &inventory);
+        let report = report(&walk(), &f.sys(), &f.dev(), &Context::default(), &inventory).unwrap();
         let rails = report.racer.unwrap().rdma_rails.unwrap();
         assert_eq!(rails.rails.len(), 1);
         assert_eq!(rails.rails[0].device, "mlx5_0");
@@ -791,7 +1059,129 @@ mod tests {
     #[test]
     #[ignore = "reads the live host sysfs"]
     fn live_host_report() {
-        let report = discover(Path::new("/sys"), Path::new("/dev"));
+        let walk = walk();
+        let report = discover(&walk, Path::new("/sys"), Path::new("/dev"))
+            .expect("live host fits WORKING_BYTES");
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        println!(
+            "charged {} of {WORKING_BYTES} working bytes",
+            WORKING_BYTES - walk.remaining()
+        );
+    }
+
+    /// Bytes a full fixture walk charges.
+    fn charged(f: &Fixture) -> usize {
+        let walk = walk();
+        discover(&walk, &f.sys(), &f.dev()).unwrap();
+        WORKING_BYTES - walk.remaining()
+    }
+
+    #[test]
+    fn exact_budget_fits_and_one_byte_less_is_too_large() {
+        let f = Fixture::new();
+        block_tree(&f);
+        rdma_tree(&f);
+        let needed = charged(&f);
+        assert!(needed > 0);
+        let exact = Walk::new(Arc::default(), needed);
+        let report = discover(&exact, &f.sys(), &f.dev()).unwrap();
+        assert_eq!(exact.remaining(), 0);
+        assert_eq!(report.block_devices.len(), 2);
+        assert_eq!(report.rdma_devices.len(), 2);
+        let short = Walk::new(Arc::default(), needed - 1);
+        assert_eq!(
+            discover(&short, &f.sys(), &f.dev()).unwrap_err(),
+            Abort::TooLarge
+        );
+    }
+
+    #[test]
+    fn budget_exhausted_mid_walk_stops_before_later_reads() {
+        let f = Fixture::new();
+        block_tree(&f);
+        rdma_tree(&f);
+        let full = walk();
+        discover(&full, &f.sys(), &f.dev()).unwrap();
+        let half = Walk::new(Arc::default(), (WORKING_BYTES - full.remaining()) / 2);
+        assert_eq!(
+            discover(&half, &f.sys(), &f.dev()).unwrap_err(),
+            Abort::TooLarge
+        );
+        assert!(half.reads.get() < full.reads.get());
+    }
+
+    #[test]
+    fn errors_are_charged() {
+        let f = Fixture::new();
+        let walk = Walk::new(Arc::default(), 8);
+        assert_eq!(
+            discover(&walk, &f.sys(), &f.dev()).unwrap_err(),
+            Abort::TooLarge
+        );
+    }
+
+    #[test]
+    fn many_entries_exceed_the_budget() {
+        let f = Fixture::new();
+        let directory = f.0.join("sys/block");
+        fs::create_dir_all(&directory).unwrap();
+        // Enough empty device directories that their names alone exceed the budget.
+        for i in 0..WORKING_BYTES / ENTRY_OVERHEAD + 1 {
+            fs::create_dir(directory.join(format!("d{i}"))).unwrap();
+        }
+        assert_eq!(
+            discover(&walk(), &f.sys(), &f.dev()).unwrap_err(),
+            Abort::TooLarge
+        );
+    }
+
+    #[test]
+    fn cancelled_before_walk_reads_nothing() {
+        let f = Fixture::new();
+        block_tree(&f);
+        let walk = walk();
+        walk.cancelled.store(true, Ordering::Release);
+        assert_eq!(
+            discover(&walk, &f.sys(), &f.dev()).unwrap_err(),
+            Abort::Cancelled
+        );
+        assert_eq!(walk.reads.get(), 0);
+        assert_eq!(walk.remaining(), WORKING_BYTES);
+    }
+
+    #[test]
+    fn cancelled_during_walk_stops_at_the_next_read() {
+        let f = Fixture::new();
+        block_tree(&f);
+        rdma_tree(&f);
+        let mut walk = walk();
+        walk.cancel_after_reads = Some(5);
+        assert_eq!(
+            discover(&walk, &f.sys(), &f.dev()).unwrap_err(),
+            Abort::Cancelled
+        );
+        assert_eq!(walk.reads.get(), 5, "no read after cancellation");
+    }
+
+    #[test]
+    fn oversized_attribute_is_null() {
+        let f = Fixture::new();
+        f.write("sys/block/sda/dev", "8:0\n");
+        f.write(
+            "sys/block/sda/device/model",
+            &"m".repeat(MAX_ATTRIBUTE_BYTES + 1),
+        );
+        f.write(
+            "sys/block/sda/device/serial",
+            &"s".repeat(MAX_ATTRIBUTE_BYTES),
+        );
+        let report = discover(&walk(), &f.sys(), &f.dev()).unwrap();
+        let disk = &report.block_devices[0];
+        assert_eq!(disk.dev.as_deref(), Some("8:0"));
+        assert_eq!(disk.model, None);
+        assert_eq!(
+            disk.serial.as_deref(),
+            Some("s".repeat(MAX_ATTRIBUTE_BYTES).as_str())
+        );
     }
 }
