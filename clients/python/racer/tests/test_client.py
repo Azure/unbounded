@@ -175,8 +175,11 @@ def test_destination_too_small(server):
     with racer.HostBuffer(100) as buf:
         # host-read answers 400, which looks like an old dataplane, so the
         # stream fallback reports the size mismatch.
+        c = client(server)
         with pytest.raises(racer.RacerError, match="smaller"):
-            client(server).read_into_host(req, buf)
+            c.read_into_host(req, buf)
+        # The refusal was about this read, not about host-read support.
+        assert c.mode_state(racer.HOST) is None
     out = bytearray(100)
     with pytest.raises(racer.RacerError):
         client(server).read_into_host(req, out)

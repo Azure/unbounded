@@ -352,15 +352,18 @@ class Client:
             conn.send_head(self._head_bytes(head))
             h = wire.parse_response_head(conn.read_head())
             wire.check_error_status(h)
-            if on_head:
-                on_head()
             meta, first, end = self._check_selection(h, offset, length, if_match)
             pages = wire.page_count(first, end)
             body = wire.decimal(h.get("content-length"))
             if body != end - first + wire.FRAME_SIZE * (pages + 1):
                 raise ProtocolError("bad Content-Length")
             if max_length is not None and end - first > max_length:
+                # An earlier direct mode may have refused this read with 400
+                # for the same reason; that refusal says nothing about support
+                # (designs/racer-gpudirect.md, Fallback), so do not confirm it.
                 raise RacerError("destination is smaller than the range")
+            if on_head:
+                on_head()
             seq = wire.Sequence(first, end)
             for _ in range(pages):
                 f = wire.decode_frame(conn.read_exact(wire.FRAME_SIZE))
@@ -426,13 +429,13 @@ class Client:
             conn.send_head(self._head_bytes(head), fd)
             h = wire.parse_response_head(conn.read_head())
             wire.check_error_status(h)
-            if on_head:
-                on_head()
             if h.get("racer-delivery") != mode:
                 raise ProtocolError("bad Racer-Delivery")
             meta, first, end = self._check_selection(h, offset, length, if_match)
             if end - first > dest_length:
                 raise ProtocolError("range is larger than the destination")
+            if on_head:
+                on_head()
             pages = wire.page_count(first, end)
             if wire.decimal(h.get("content-length")) != wire.FRAME_SIZE * (pages + 1):
                 raise ProtocolError("bad Content-Length")
