@@ -35,11 +35,51 @@ use uring_runtime::environment::Deadline;
 use uring_runtime::reactor::descriptor::Descriptor;
 
 pub use server::CONNECTION_TIMEOUT;
-pub use server::CONTROL_SLOTS;
 pub use server::MAX_CONNECTIONS;
 pub use server::MAX_REQUEST_BYTES;
 pub use server::MAX_RESPONSE_BYTES;
-pub use server::RESERVED_BYTES;
+
+/// Prepaid diagnostic submissions: the transport's connection slots plus the
+/// waits for one in-flight `/debug/hardware` producer, which is always attached.
+pub const CONTROL_SLOTS: usize = server::CONTROL_SLOTS + server::JSON_CONTROL_SLOTS;
+
+/// Prepaid diagnostic memory: transport buffers, the hardware producer's wait
+/// bookkeeping, and the `/debug/hardware` helper's peak footprint.
+///
+/// At most one helper exists at a time. Its peak is during encoding, when the
+/// discovered report (charged against `hardware::WORKING_BYTES` by
+/// `hardware::Walk`, which aborts with `response_too_large` when exhausted) is
+/// alive alongside the JSON buffer. The JSON buffer is allocated once with
+/// capacity `MAX_BODY_BYTES` (see `Bounded`), never grows, and becomes the
+/// result held for the response, so one `MAX_RESPONSE_BYTES` term covers both
+/// the encoding buffer and the held result. The report is dropped before the
+/// result is published. The detached discovery helper's thread stack
+/// (`HARDWARE_STACK_BYTES`) is charged too, since a blocked sysfs read can keep
+/// the helper alive after diagnostics teardown.
+pub const RESERVED_BYTES: usize = server::RESERVED_BYTES
+    + server::JSON_CONTROL_SLOTS * uring_runtime::reactor::SUBMISSION_BYTES
+    + server::MAX_RESPONSE_BYTES
+    + crate::hardware::WORKING_BYTES
+    + HARDWARE_STACK_BYTES;
+
+/// Stack size of the `/debug/hardware` discovery helper thread.
+const HARDWARE_STACK_BYTES: usize = 2 * 1024 * 1024;
+
+const _: () = assert!(server::MAX_BODY_BYTES <= server::MAX_RESPONSE_BYTES);
+const _: () = assert!(RESERVED_BYTES >= server::RESERVED_BYTES + HARDWARE_BYTES);
+
+/// Deadline for one `/debug/hardware` request, covering discovery and the response.
+pub(crate) const HARDWARE_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Owned, `Send` hardware discovery prepared on the control worker and run on a
+/// helper thread, so blocking sysfs reads never stall the worker. The job charges
+/// the walk's working budget and stops early once the request is cancelled.
+pub(crate) type HardwareJob = Box<
+    dyn FnOnce(
+            &crate::hardware::Walk,
+        ) -> std::result::Result<crate::hardware::Report, crate::hardware::Abort>
+        + Send,
+>;
 
 // Bounded diagnostics and HTTP endpoints, polled by an existing worker.
 
@@ -47,6 +87,11 @@ pub use server::RESERVED_BYTES;
 pub struct Telemetry {
     pub(crate) profiling: Option<Arc<crate::profiling::ProfilingController>>,
     pub(crate) membership: OnceCell<Rc<dyn Fn() -> Result<MembershipDiagnostic>>>,
+    /// Prepares live hardware discovery for `/debug/hardware`; installed on the
+    /// control worker only. The returned job runs on a helper thread.
+    pub(crate) hardware: OnceCell<Rc<dyn Fn() -> HardwareJob>>,
+    /// The current hardware helper, alive until both its thread and response finish.
+    hardware_active: std::cell::RefCell<std::sync::Weak<HardwareState>>,
     pub send_crc: crate::telemetry::Samples,
     pub failures: crate::telemetry::Failures,
     pub metrics: crate::telemetry::Metrics,
@@ -160,8 +205,20 @@ impl server::Scope for RequestScope {
 pub struct DiagnosticIo {
     reactor: Rc<Reactor>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+    /// `/debug/hardware` working set, helper stack, and result (`HARDWARE_BYTES` of
+    /// `RESERVED_BYTES`). Each helper and its session share this charge, so it is
+    /// returned only after this owner, every helper, and every response drop it.
+    hardware: HardwareCharge,
     server: Server,
 }
+
+/// Thread-safe hardware memory charge shared with detached discovery helpers.
+pub(crate) type HardwareCharge = Arc<flow_control::Charge<AdmissionPolicy>>;
+
+/// Portion of `RESERVED_BYTES` funding one hardware discovery, its helper
+/// stack, and its result.
+const HARDWARE_BYTES: usize =
+    server::MAX_RESPONSE_BYTES + crate::hardware::WORKING_BYTES + HARDWARE_STACK_BYTES;
 impl DiagnosticIo {
     /// Explicit startup acquisition, using the worker's already-budgeted reactor.
     /// Must run before ordinary request admission fills the memory quota.
@@ -191,7 +248,16 @@ impl DiagnosticIo {
         )?;
         let bookkeeping = memory.split(slots * uring_runtime::reactor::SUBMISSION_BYTES)?;
         let submissions = reactor.reserve_submissions(control, bookkeeping)?;
-        let mut server = Server::new(submissions.clone(), memory);
+        // The hardware report is always available, independent of pprof, with its
+        // own single in-flight slot so a running profile never makes it busy. Its
+        // working set and bounded result are split into a shared charge that the
+        // detached helper retains, so dropping this owner while a sysfs read is
+        // blocked cannot return memory the helper still uses.
+        let hardware = Arc::new(memory.split(HARDWARE_BYTES)?);
+        // Connection buffers also retain the shared charge through their fences,
+        // as they retain the rest of `memory`.
+        let mut server = Server::new(submissions.clone(), (memory, hardware.clone()))
+            .with_json(submissions.clone(), ());
         if binary {
             // The process-wide profiler budget includes the result allocation.
             server = server.with_binary(submissions, ());
@@ -199,6 +265,7 @@ impl DiagnosticIo {
         Ok(Self {
             reactor,
             admission,
+            hardware,
             server,
         })
     }
@@ -214,6 +281,7 @@ fn serve<'a>(
         let handler = DiagnosticHandler {
             telemetry,
             admission: &io.admission,
+            hardware: &io.hardware,
         };
         io.server
             .serve(&io.reactor, listener, &handler, scope)
@@ -224,6 +292,7 @@ fn serve<'a>(
 struct DiagnosticHandler<'a> {
     telemetry: &'a Telemetry,
     admission: &'a flow_control::Quotas<AdmissionPolicy>,
+    hardware: &'a HardwareCharge,
 }
 impl Handler for DiagnosticHandler<'_> {
     type Connection = ::telemetry::Lease;
@@ -260,7 +329,156 @@ impl Handler for DiagnosticHandler<'_> {
         {
             return Some(Err(server::BinaryError::Unavailable("stopping")));
         }
+        if path == "/debug/hardware" {
+            return Some(hardware_request(self.telemetry, self.hardware));
+        }
         profile_request(self.telemetry.profiling.as_ref(), path)
+    }
+}
+
+/// Start one `/debug/hardware` discovery on a helper thread.
+///
+/// The control worker only captures the tiny Racer view (selector, claimed disks,
+/// rails snapshot); the sysfs walk and JSON encoding run on a named, detached
+/// thread. At most one helper exists at a time: a request while the previous
+/// helper or its response is still alive gets 409 busy. The transport's own JSON
+/// slot is a second, worker-local bound. The worker never joins the helper, so a
+/// slow sysfs read cannot block it; on cancellation or deadline the helper stops
+/// at its next read, skips encoding, and drops its result. Discovery that exceeds
+/// `hardware::WORKING_BYTES` stops early with 503 `response_too_large`.
+fn hardware_request(
+    telemetry: &Telemetry,
+    charge: &HardwareCharge,
+) -> std::result::Result<server::BinaryResponse, server::BinaryError> {
+    telemetry.metrics.record(Event::DiagnosticHardware, 1);
+    let unavailable = server::BinaryError::Unavailable("unavailable");
+    let prepare = telemetry.hardware.get().ok_or(unavailable)?;
+    let mut active = telemetry.hardware_active.borrow_mut();
+    if active.strong_count() != 0 {
+        return Err(server::BinaryError::Busy);
+    }
+    let session = HardwareSession::start(prepare(), server::MAX_BODY_BYTES, charge.clone())?;
+    *active = Arc::downgrade(&session.state);
+    Ok(server::BinaryResponse {
+        kind: server::BinaryKind::Json,
+        duration: HARDWARE_DEADLINE,
+        session: Box::new(session),
+    })
+}
+
+/// State shared by one hardware helper thread and its response session.
+struct HardwareState {
+    completion: std::os::fd::OwnedFd,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    result: Mutex<Option<std::result::Result<Vec<u8>, server::BinaryError>>>,
+    /// Memory funding discovery and the result, held until the helper and the
+    /// response both finish, even if the diagnostics owner drops first.
+    _charge: HardwareCharge,
+}
+
+/// One live hardware discovery, polled through its eventfd. Drop cancels.
+struct HardwareSession {
+    state: Arc<HardwareState>,
+}
+
+impl HardwareSession {
+    /// Spawn the helper. `limit` bounds the encoded body.
+    fn start(
+        job: HardwareJob,
+        limit: usize,
+        charge: HardwareCharge,
+    ) -> std::result::Result<Self, server::BinaryError> {
+        use std::os::fd::FromRawFd;
+        let unavailable = server::BinaryError::Unavailable("unavailable");
+        // SAFETY: eventfd has no pointer arguments; ownership transfers only on success.
+        let raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if raw < 0 {
+            return Err(unavailable);
+        }
+        let state = Arc::new(HardwareState {
+            // SAFETY: raw is a new, successful eventfd descriptor.
+            completion: unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) },
+            cancelled: Arc::default(),
+            result: Mutex::new(None),
+            _charge: charge,
+        });
+        let helper = state.clone();
+        std::thread::Builder::new()
+            .name("racer-hardware".into())
+            .stack_size(HARDWARE_STACK_BYTES)
+            .spawn(move || helper.run(job, limit))
+            .map_err(|_| unavailable)?;
+        Ok(Self { state })
+    }
+}
+
+impl HardwareState {
+    /// Discover, encode unless cancelled, publish, then notify the worker.
+    fn run(&self, job: HardwareJob, limit: usize) {
+        use std::os::fd::AsRawFd;
+        use std::sync::atomic::Ordering;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let walk =
+                crate::hardware::Walk::new(self.cancelled.clone(), crate::hardware::WORKING_BYTES);
+            let report = match job(&walk) {
+                Ok(report) => report,
+                Err(crate::hardware::Abort::TooLarge) => {
+                    return Err(server::BinaryError::Unavailable("response_too_large"));
+                }
+                Err(crate::hardware::Abort::Cancelled) => {
+                    return Err(server::BinaryError::Unavailable("unavailable"));
+                }
+            };
+            if self.cancelled.load(Ordering::Acquire) {
+                return Err(server::BinaryError::Unavailable("unavailable"));
+            }
+            match encode_report(&report, limit) {
+                Ok(body) => Ok(body.into_bytes()),
+                Err(Encode::TooLarge) => {
+                    Err(server::BinaryError::Unavailable("response_too_large"))
+                }
+                Err(Encode::Failed) => Err(server::BinaryError::Unavailable("unavailable")),
+            }
+        }))
+        .unwrap_or(Err(server::BinaryError::Unavailable("unavailable")));
+        if self.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        *self.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+        let one = 1u64;
+        loop {
+            // SAFETY: the descriptor and eight-byte value remain live during write.
+            let n =
+                unsafe { libc::write(self.completion.as_raw_fd(), (&one as *const u64).cast(), 8) };
+            if n >= 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                break;
+            }
+        }
+    }
+}
+
+impl server::BinarySession for HardwareSession {
+    fn completion_fd(&self) -> std::result::Result<Descriptor, server::BinaryError> {
+        self.state
+            .completion
+            .try_clone()
+            .map(Into::into)
+            .map_err(|_| server::BinaryError::Unavailable("unavailable"))
+    }
+    /// Take the result once, without waiting for the helper or its mutex.
+    fn result(&self) -> Option<std::result::Result<Vec<u8>, server::BinaryError>> {
+        self.state.result.try_lock().ok()?.take()
+    }
+    fn cancel(&self) {
+        self.state
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Drop for HardwareSession {
+    fn drop(&mut self) {
+        server::BinarySession::cancel(self);
     }
 }
 
@@ -303,6 +521,7 @@ fn profile_request(
         let duration = duration?;
         let session = controller.start(duration).map_err(profile_error)?;
         Ok(server::BinaryResponse {
+            kind: server::BinaryKind::Profile,
             duration,
             session: Box::new(session),
         })
@@ -448,6 +667,127 @@ fn get(
         output.write_str(body)?;
     }
     Ok(response)
+}
+
+/// Why a hardware report could not be encoded.
+#[derive(Debug, PartialEq, Eq)]
+enum Encode {
+    /// The pretty JSON plus trailing newline would exceed the byte limit.
+    TooLarge,
+    /// Serialization failed for another reason.
+    Failed,
+}
+
+/// Encode `report` as pretty JSON with a trailing newline, failing as soon as the output
+/// would exceed `limit` bytes so oversized reports never allocate the full body.
+fn encode_report(
+    report: &crate::hardware::Report,
+    limit: usize,
+) -> std::result::Result<String, Encode> {
+    let mut writer = Bounded::new(limit);
+    let result = serde_json::to_writer_pretty(&mut writer, report)
+        .map_err(|_| ())
+        .and_then(|()| std::io::Write::write_all(&mut writer, b"\n").map_err(|_| ()));
+    match result {
+        Ok(()) => String::from_utf8(writer.buffer).map_err(|_| Encode::Failed),
+        Err(()) if writer.exceeded => Err(Encode::TooLarge),
+        Err(()) => Err(Encode::Failed),
+    }
+}
+
+/// `io::Write` sink that refuses to grow past a fixed byte limit.
+///
+/// The buffer is allocated once with capacity `limit` so amortized growth can
+/// never exceed the limit charged in `RESERVED_BYTES`.
+struct Bounded {
+    buffer: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl Bounded {
+    fn new(limit: usize) -> Self {
+        Self {
+            buffer: Vec::with_capacity(limit),
+            limit,
+            exceeded: false,
+        }
+    }
+}
+
+impl std::io::Write for Bounded {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if data.len() > self.limit - self.buffer.len() {
+            self.exceeded = true;
+            return Err(std::io::ErrorKind::FileTooLarge.into());
+        }
+        self.buffer.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod encode_report_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    #[test]
+    fn bounded_writer_accepts_exact_limit_and_rejects_one_more() {
+        let mut writer = Bounded::new(4);
+        assert!(writer.write_all(b"abcd").is_ok());
+        assert_eq!(writer.buffer, b"abcd");
+        assert!(!writer.exceeded);
+        assert!(writer.write_all(b"e").is_err());
+        assert!(writer.exceeded);
+        assert_eq!(writer.buffer, b"abcd");
+        let mut writer = Bounded::new(4);
+        assert!(writer.write_all(b"abcde").is_err());
+        assert!(writer.exceeded);
+        assert!(writer.buffer.is_empty());
+        assert_eq!(writer.buffer.capacity(), 4);
+    }
+
+    #[test]
+    fn reserved_bytes_charges_hardware_working_budget_and_result() {
+        assert_eq!(
+            RESERVED_BYTES,
+            server::RESERVED_BYTES
+                + server::JSON_CONTROL_SLOTS * uring_runtime::reactor::SUBMISSION_BYTES
+                + server::MAX_RESPONSE_BYTES
+                + crate::hardware::WORKING_BYTES
+                + HARDWARE_STACK_BYTES
+        );
+        assert_eq!(HARDWARE_STACK_BYTES, 2 * 1024 * 1024);
+        assert_eq!(
+            HARDWARE_BYTES,
+            server::MAX_RESPONSE_BYTES + crate::hardware::WORKING_BYTES + HARDWARE_STACK_BYTES
+        );
+        let report = crate::hardware::Report::default();
+        let body = encode_report(&report, server::MAX_BODY_BYTES).unwrap();
+        assert!(body.capacity() <= server::MAX_RESPONSE_BYTES);
+    }
+
+    #[test]
+    fn encode_report_matches_pretty_json_and_enforces_limit() {
+        let report = crate::hardware::Report {
+            errors: vec!["x".into()],
+            ..Default::default()
+        };
+        let expected = serde_json::to_string_pretty(&report).unwrap() + "\n";
+        assert_eq!(
+            encode_report(&report, expected.len()).as_deref(),
+            Ok(expected.as_str())
+        );
+        assert_eq!(
+            encode_report(&report, expected.len() - 1),
+            Err(Encode::TooLarge)
+        );
+        assert_eq!(encode_report(&report, 0), Err(Encode::TooLarge));
+    }
 }
 
 #[cfg(test)]
@@ -2965,6 +3305,7 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::FillEncryptNs => "racer_fill_encrypt_nanoseconds_sum",
             Self::FillChecksumCount => "racer_fill_checksum_nanoseconds_count",
             Self::FillChecksumNs => "racer_fill_checksum_nanoseconds_sum",
+            Self::DiagnosticHardware => "racer_diagnostic_hardware_total",
 }
 metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::WarmTrackedJobs => "racer_warm_tracked_jobs",
@@ -3526,6 +3867,356 @@ pub(crate) mod tests {
             assert!(!text.contains("synthetic"));
             finish(server, &scope, &reactor);
             text
+        }
+
+        /// A standalone hardware charge for sessions started without a server.
+        fn test_charge() -> HardwareCharge {
+            let admission = flow_control::Quotas::new(AdmissionPolicy::new(
+                crate::test_support::cluster::config(false).limits,
+            ));
+            Arc::new(
+                admission
+                    .reserve(None, ResourceClass::RequestContext, HARDWARE_BYTES)
+                    .unwrap(),
+            )
+        }
+
+        /// Exchange one GET without asserting the status.
+        fn diagnostic_response(telemetry: &Telemetry, path: &str) -> String {
+            let (_, reactor, io) = setup();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let scope = scope();
+            let mut server = telemetry.serve_listener_with_io(listener, io, &scope);
+            let request = format!("GET {path} HTTP/1.1\r\nHost: local\r\n\r\n");
+            let bytes = exchange_raw(address, request.as_bytes(), &mut server, &reactor);
+            finish(server, &scope, &reactor);
+            String::from_utf8(bytes).unwrap()
+        }
+
+        fn hardware_counter(telemetry: &Telemetry) -> bool {
+            let mut text = String::new();
+            telemetry.metrics.write_prometheus(&mut text).unwrap();
+            text.lines()
+                .any(|line| line == "racer_diagnostic_hardware_total 1")
+        }
+
+        /// Install a hardware job builder returning `report` from the helper thread.
+        fn set_hardware(telemetry: &Telemetry, report: fn() -> crate::hardware::Report) {
+            assert!(
+                telemetry
+                    .hardware
+                    .set(Rc::new(move || -> HardwareJob {
+                        Box::new(move |_| Ok(report()))
+                    }))
+                    .is_ok()
+            );
+        }
+
+        #[test]
+        fn hardware_endpoint_serves_json_and_counts_requests() {
+            let telemetry = Telemetry::default();
+            set_hardware(&telemetry, || crate::hardware::Report {
+                errors: vec!["rdma_devices: example".into()],
+                ..Default::default()
+            });
+            // `Telemetry::default()` has pprof disabled; hardware still works.
+            assert!(telemetry.profiling.is_none());
+            let text = diagnostic_text(&telemetry, "/debug/hardware");
+            let (head, body) = text.split_once("\r\n\r\n").unwrap();
+            assert!(head.contains("\r\nContent-Type: application/json\r\n"));
+            assert!(!head.contains("Content-Disposition"));
+            assert!(body.ends_with("}\n"));
+            let value: serde_json::Value = serde_json::from_str(body).unwrap();
+            for key in ["block_devices", "rdma_devices", "racer", "errors"] {
+                assert!(value.get(key).is_some(), "{key}");
+            }
+            assert_eq!(value["errors"][0], "rdma_devices: example");
+            assert!(hardware_counter(&telemetry));
+            // The finished helper released the single-flight slot.
+            assert_eq!(telemetry.hardware_active.borrow().strong_count(), 0);
+        }
+
+        #[test]
+        fn hardware_endpoint_unavailable_oversize_and_exact_path() {
+            let telemetry = Telemetry::default();
+            let text = diagnostic_response(&telemetry, "/debug/hardware");
+            assert_response(
+                text.as_bytes(),
+                "503 Service Unavailable",
+                Some("unavailable\n"),
+            );
+            assert!(hardware_counter(&telemetry));
+            let text = diagnostic_response(&telemetry, "/debug/hardware?x");
+            assert_response(text.as_bytes(), "404 Not Found", Some("not found\n"));
+            let text = diagnostic_response(&telemetry, "/debug/hardware/");
+            assert_response(text.as_bytes(), "404 Not Found", Some("not found\n"));
+            set_hardware(&telemetry, || crate::hardware::Report {
+                errors: vec!["x".repeat(::telemetry::server::MAX_BODY_BYTES)],
+                ..Default::default()
+            });
+            let text = diagnostic_response(&telemetry, "/debug/hardware");
+            assert_response(
+                text.as_bytes(),
+                "503 Service Unavailable",
+                Some("response_too_large\n"),
+            );
+        }
+
+        #[test]
+        fn hardware_budget_exhaustion_is_response_too_large() {
+            let telemetry = Telemetry::default();
+            assert!(
+                telemetry
+                    .hardware
+                    .set(Rc::new(|| -> HardwareJob {
+                        Box::new(|walk| {
+                            // The helper's walk carries exactly the fixed budget.
+                            assert_eq!(walk.remaining(), crate::hardware::WORKING_BYTES);
+                            walk.charge(crate::hardware::WORKING_BYTES + 1)?;
+                            Ok(crate::hardware::Report::default())
+                        })
+                    }))
+                    .is_ok()
+            );
+            let text = diagnostic_response(&telemetry, "/debug/hardware");
+            assert_response(
+                text.as_bytes(),
+                "503 Service Unavailable",
+                Some("response_too_large\n"),
+            );
+        }
+
+        #[test]
+        fn hardware_cancel_reaches_the_running_walk() {
+            use ::telemetry::server::BinarySession;
+            use std::sync::mpsc;
+            let (started, running) = mpsc::channel::<()>();
+            let (observed, seen) = mpsc::channel::<crate::hardware::Abort>();
+            let job: HardwareJob = Box::new(move |walk| {
+                let _ = started.send(());
+                let until = Instant::now() + Duration::from_secs(5);
+                let abort = loop {
+                    if let Err(abort) = walk.check() {
+                        break abort;
+                    }
+                    assert!(Instant::now() < until, "cancel never reached the walk");
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                let _ = observed.send(abort);
+                Err(abort)
+            });
+            let session =
+                HardwareSession::start(job, ::telemetry::server::MAX_BODY_BYTES, test_charge())
+                    .unwrap();
+            running.recv_timeout(Duration::from_secs(5)).unwrap();
+            session.cancel();
+            assert_eq!(
+                seen.recv_timeout(Duration::from_secs(5)).unwrap(),
+                crate::hardware::Abort::Cancelled
+            );
+            assert!(session.result().is_none(), "cancelled result is discarded");
+        }
+
+        #[test]
+        fn hardware_helper_panic_is_unavailable_and_releases_slot() {
+            let telemetry = Telemetry::default();
+            set_hardware(&telemetry, || panic!("synthetic discovery failure"));
+            for _ in 0..2 {
+                let text = diagnostic_response(&telemetry, "/debug/hardware");
+                assert_response(
+                    text.as_bytes(),
+                    "503 Service Unavailable",
+                    Some("unavailable\n"),
+                );
+            }
+        }
+
+        #[test]
+        fn hardware_discovery_runs_off_worker_and_is_single_flight() {
+            use std::sync::mpsc;
+            let telemetry = Telemetry::default();
+            let (release, gate) = mpsc::channel::<()>();
+            let gate = Arc::new(Mutex::new(gate));
+            let job_gate = gate.clone();
+            assert!(
+                telemetry
+                    .hardware
+                    .set(Rc::new(move || -> HardwareJob {
+                        let gate = job_gate.clone();
+                        Box::new(move |_| {
+                            // Simulate a slow sysfs read until the test releases it.
+                            let _ = gate.lock().unwrap().recv();
+                            Ok(crate::hardware::Report::default())
+                        })
+                    }))
+                    .is_ok()
+            );
+            let (_, reactor, io) = setup();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let scope = scope();
+            let mut server = telemetry.serve_listener_with_io(listener, io, &scope);
+            let mut slow = TcpStream::connect(address).unwrap();
+            slow.write_all(b"GET /debug/hardware HTTP/1.1\r\nHost: local\r\n\r\n")
+                .unwrap();
+            slow.set_nonblocking(true).unwrap();
+            let until = Instant::now() + Duration::from_secs(5);
+            while telemetry.hardware_active.borrow().strong_count() == 0 {
+                assert!(Instant::now() < until);
+                poll_server(&mut server, &reactor);
+            }
+            // The worker keeps serving health checks while discovery is blocked.
+            let bytes = exchange_raw(
+                address,
+                b"GET /healthz HTTP/1.1\r\nHost: local\r\n\r\n",
+                &mut server,
+                &reactor,
+            );
+            assert_response(&bytes, "200 OK", None);
+            // A concurrent discovery is refused rather than starting a second helper.
+            let bytes = exchange_raw(
+                address,
+                b"GET /debug/hardware HTTP/1.1\r\nHost: local\r\n\r\n",
+                &mut server,
+                &reactor,
+            );
+            assert_response(&bytes, "409 Conflict", Some("busy\n"));
+            release.send(()).unwrap();
+            let mut response = Vec::new();
+            loop {
+                assert!(Instant::now() < until, "hardware response stalled");
+                poll_server(&mut server, &reactor);
+                let mut bytes = [0; 512];
+                match slow.read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(count) => response.extend_from_slice(&bytes[..count]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => (),
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            assert_response(&response, "200 OK", None);
+            assert!(
+                std::str::from_utf8(&response)
+                    .unwrap()
+                    .contains("\r\nContent-Type: application/json\r\n")
+            );
+            finish(server, &scope, &reactor);
+            assert_eq!(telemetry.hardware_active.borrow().strong_count(), 0);
+        }
+
+        #[test]
+        fn hardware_cancelled_helper_finishes_detached_and_stays_busy_until_done() {
+            use std::sync::mpsc;
+            let (release, gate) = mpsc::channel::<()>();
+            let (done, finished) = mpsc::channel::<()>();
+            let job: HardwareJob = Box::new(move |_| {
+                let _ = gate.recv();
+                let _ = done.send(());
+                Ok(crate::hardware::Report::default())
+            });
+            let session =
+                HardwareSession::start(job, ::telemetry::server::MAX_BODY_BYTES, test_charge())
+                    .unwrap();
+            let weak = Arc::downgrade(&session.state);
+            // Dropping the session cancels without joining the blocked helper.
+            drop(session);
+            assert!(weak.strong_count() > 0, "helper still owns its state");
+            release.send(()).unwrap();
+            finished.recv_timeout(Duration::from_secs(5)).unwrap();
+            let until = Instant::now() + Duration::from_secs(5);
+            while weak.strong_count() > 0 {
+                assert!(Instant::now() < until);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        #[test]
+        fn hardware_charge_outlives_teardown_until_blocked_helper_finishes() {
+            use std::sync::mpsc;
+            let telemetry = Telemetry::default();
+            let (release, gate) = mpsc::channel::<()>();
+            let gate = Arc::new(Mutex::new(gate));
+            let job_gate = gate.clone();
+            assert!(
+                telemetry
+                    .hardware
+                    .set(Rc::new(move || -> HardwareJob {
+                        let gate = job_gate.clone();
+                        Box::new(move |_| {
+                            // A sysfs read that stays blocked across teardown.
+                            let _ = gate.lock().unwrap().recv();
+                            Ok(crate::hardware::Report::default())
+                        })
+                    }))
+                    .is_ok()
+            );
+            let (admission, reactor, io) = setup();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let scope = scope();
+            let mut server = telemetry.serve_listener_with_io(listener, io, &scope);
+            let mut slow = TcpStream::connect(address).unwrap();
+            slow.write_all(b"GET /debug/hardware HTTP/1.1\r\nHost: local\r\n\r\n")
+                .unwrap();
+            let until = Instant::now() + Duration::from_secs(5);
+            while telemetry.hardware_active.borrow().strong_count() == 0 {
+                assert!(Instant::now() < until);
+                poll_server(&mut server, &reactor);
+            }
+            // Tear down the session, the server, and the diagnostics owner while
+            // the helper is still blocked.
+            finish(server, &scope, &reactor);
+            drop(slow);
+            drop(reactor);
+            let class = ResourceClass::RequestContext;
+            assert!(
+                admission.used(class) >= HARDWARE_BYTES,
+                "blocked helper keeps its hardware charge after teardown"
+            );
+            assert!(
+                telemetry.hardware_active.borrow().strong_count() > 0,
+                "a later request stays busy while the charge is held"
+            );
+            release.send(()).unwrap();
+            while telemetry.hardware_active.borrow().strong_count() > 0 {
+                assert!(Instant::now() < until, "helper never finished");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(admission.used(class), 0, "helper returns the charge");
+        }
+
+        #[test]
+        fn hardware_session_publishes_then_signals() {
+            use ::telemetry::server::BinarySession;
+            let job: HardwareJob = Box::new(|_| Ok(crate::hardware::Report::default()));
+            let session =
+                HardwareSession::start(job, ::telemetry::server::MAX_BODY_BYTES, test_charge())
+                    .unwrap();
+            let fd = session.state.completion.try_clone().unwrap();
+            let mut poll = libc::pollfd {
+                fd: std::os::fd::AsRawFd::as_raw_fd(&fd),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd for the duration of the call.
+            assert_eq!(unsafe { libc::poll(&mut poll, 1, 5000) }, 1);
+            let body = session.result().unwrap().unwrap();
+            let expected =
+                serde_json::to_string_pretty(&crate::hardware::Report::default()).unwrap() + "\n";
+            assert_eq!(body, expected.as_bytes());
+            assert!(session.result().is_none(), "result is taken once");
+            let tiny: HardwareJob = Box::new(|_| Ok(crate::hardware::Report::default()));
+            let session = HardwareSession::start(tiny, 1, test_charge()).unwrap();
+            // SAFETY: one valid pollfd for the duration of the call.
+            poll.fd = std::os::fd::AsRawFd::as_raw_fd(&session.state.completion);
+            assert_eq!(unsafe { libc::poll(&mut poll, 1, 5000) }, 1);
+            assert_eq!(
+                session.result(),
+                Some(Err(::telemetry::server::BinaryError::Unavailable(
+                    "response_too_large"
+                )))
+            );
         }
 
         #[test]
@@ -4418,6 +5109,7 @@ pub(crate) mod tests {
                     profiling: enabled.then(|| crate::profiling::ProfilingController::new(true)),
                     ..Telemetry::default()
                 };
+                set_hardware(&telemetry, crate::hardware::Report::default);
                 reactor.init().unwrap();
                 let baseline = admission.used(ResourceClass::RequestContext);
                 telemetry
@@ -4487,6 +5179,19 @@ pub(crate) mod tests {
                     );
                     assert_response(&response, status, None);
                 }
+                // The hardware producer is attached whether or not pprof is.
+                let response = exchange_raw(
+                    address,
+                    b"GET /debug/hardware HTTP/1.1\r\nHost: local\r\n\r\n",
+                    &mut serving,
+                    &reactor,
+                );
+                assert_response(&response, "200 OK", None);
+                assert!(
+                    std::str::from_utf8(&response)
+                        .unwrap()
+                        .contains("\r\nContent-Type: application/json\r\n")
+                );
                 admission.stop();
                 let response = exchange_raw(
                     address,

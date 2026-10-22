@@ -133,6 +133,11 @@ pub struct NodeState {
     devices: Option<devices::Plan>,
     inventory: Arc<crate::rdma::Inventory>,
 
+    /// Startup-fixed selector and claimed disks for `/debug/hardware`.
+    /// Shared via `Arc` so each request clones a pointer, not the disk list;
+    /// the report's own copy is still charged against the walk budget.
+    hardware: Arc<crate::hardware::Context>,
+
     send_crc: crate::telemetry::Samples,
 
     profiling: std::sync::OnceLock<Arc<crate::profiling::ProfilingController>>,
@@ -206,6 +211,7 @@ impl NodeState {
             devices: None,
             peer_receive: Default::default(),
             inventory: Arc::new(crate::rdma::Inventory::default()),
+            hardware: Default::default(),
             send_crc: Default::default(),
             profiling: Default::default(),
             hedges: std::sync::OnceLock::new(),
@@ -293,7 +299,15 @@ impl Application {
                 .checkpoint_bytes =
                 std::num::NonZeroUsize::new(devices.checkpoint_bytes).ok_or(Error::Internal)?;
         }
-        Arc::get_mut(&mut self.node).ok_or(Error::Internal)?.devices = devices;
+        let node = Arc::get_mut(&mut self.node).ok_or(Error::Internal)?;
+        node.hardware = Arc::new(crate::hardware::Context {
+            block_device_selector: selector.clone(),
+            claimed_disks: devices
+                .as_ref()
+                .map(devices::Plan::claimed_disks)
+                .unwrap_or_default(),
+        });
+        node.devices = devices;
         Arc::get_mut(&mut self.config)
             .ok_or(Error::InvalidConfiguration)?
             .node = identity;
@@ -623,6 +637,9 @@ pub struct WorkerApplication {
     diagnostic_scope: Option<RequestScope>,
 
     diagnostics_address: std::net::SocketAddr,
+
+    /// Root holding `disk/by-id`, reported by `/debug/hardware`.
+    device_directory: std::path::PathBuf,
 
     listener_scope: Option<RequestScope>,
 
@@ -1100,6 +1117,7 @@ impl WorkerApplication {
             diagnostic_task: None,
             diagnostic_scope: None,
             diagnostics_address: config.diagnostics_listen,
+            device_directory: config.device_directory.clone(),
             listener_scope: None,
             task_scope: None,
             peer_address: config.peer_listen,
@@ -2327,6 +2345,29 @@ impl WorkerApplication {
                 node.observations
                     .membership_workers(&mut diagnostic, node.count)?;
                 Ok(diagnostic)
+            }))
+            .map_err(|_| Error::InvalidConfiguration)?;
+        let node = self.node.clone();
+        let device_directory = self.device_directory.clone();
+        self.telemetry
+            .hardware
+            .set(Rc::new(move || -> crate::telemetry::HardwareJob {
+                // Capture the small Racer view here; the helper thread walks sysfs.
+                let context = Arc::clone(&node.hardware);
+                let snapshot = node
+                    .inventory
+                    .snapshot()
+                    .map_err(|error| format!("{error:?}"));
+                let device_directory = device_directory.clone();
+                Box::new(move |walk| {
+                    crate::hardware::report_with_snapshot(
+                        walk,
+                        std::path::Path::new("/sys"),
+                        &device_directory,
+                        &context,
+                        snapshot,
+                    )
+                })
             }))
             .map_err(|_| Error::InvalidConfiguration)?;
         self.telemetry

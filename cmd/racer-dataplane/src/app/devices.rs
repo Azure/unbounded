@@ -47,6 +47,31 @@ pub struct Plan {
     pub checkpoint_bytes: usize,
 }
 
+impl Plan {
+    /// Distinct claimed devices by id, with `MAJ:MIN` from the already-open descriptor.
+    pub fn claimed_disks(&self) -> Vec<crate::hardware::ClaimedDisk> {
+        use std::os::unix::fs::MetadataExt;
+        let mut claimed = std::collections::BTreeMap::new();
+        for worker in &self.workers {
+            let mut start = 0;
+            for (group, count) in &worker.disk_groups {
+                let id = group.strip_prefix("device:").unwrap_or(group);
+                let dev = worker
+                    .placements
+                    .get(start)
+                    .and_then(|placement| placement.file.metadata().ok())
+                    .map(|metadata| crate::hardware::format_dev(metadata.rdev()));
+                claimed.entry(id.to_owned()).or_insert(dev);
+                start += count;
+            }
+        }
+        claimed
+            .into_iter()
+            .map(|(id, dev)| crate::hardware::ClaimedDisk { id, dev })
+            .collect()
+    }
+}
+
 pub fn discover(config: &Config, selector: Option<&str>, workers: usize) -> Option<Plan> {
     let selector = selector.filter(|s| !s.is_empty())?;
     let result = (|| {
@@ -1122,5 +1147,52 @@ mod tests {
         assert!(discover(&c, Some("missing"), 1).is_none());
         assert!(discover(&c, Some("cache"), 1).is_none());
         assert_eq!(fs::read(f.0.join("payload")).unwrap(), b"do not overwrite");
+    }
+
+    #[test]
+    fn claimed_disks_dedupe_ids_across_workers_and_report_rdev() {
+        let file = Arc::new(File::open("/dev/null").unwrap());
+        let worker = |groups: &[(&str, usize)]| WorkerDevices {
+            placements: (0..groups.iter().map(|g| g.1).sum::<usize>())
+                .map(|offset| Placement {
+                    file: file.clone(),
+                    offset: offset as u64,
+                })
+                .collect(),
+            disk_groups: groups.iter().map(|(id, n)| (Arc::from(*id), *n)).collect(),
+            alignment: Alignment::new(1, 1, 1).unwrap(),
+            digest: [0; 32],
+            page_entries: 0,
+        };
+        let plan = Plan {
+            workers: vec![
+                worker(&[("device:b", 2), ("device:a", 1)]),
+                worker(&[("device:a", 3)]),
+            ],
+            checkpoint_bytes: 0,
+        };
+        let claimed = plan.claimed_disks();
+        // /dev/null is character device 1:3 on Linux.
+        assert_eq!(
+            claimed,
+            vec![
+                crate::hardware::ClaimedDisk {
+                    id: "a".into(),
+                    dev: Some("1:3".into())
+                },
+                crate::hardware::ClaimedDisk {
+                    id: "b".into(),
+                    dev: Some("1:3".into())
+                },
+            ]
+        );
+        assert!(
+            Plan {
+                workers: vec![],
+                checkpoint_bytes: 0
+            }
+            .claimed_disks()
+            .is_empty()
+        );
     }
 }
