@@ -19,7 +19,7 @@ without copying the whole object to local disk first.
   instead of returning bytes from a newer version.
 - Random reads are fast after the first touch. Sequential reads are fast from
   the start.
-- No new third-party dependencies. The ublk binding is written in house on top
+- No new Go dependencies. The ublk binding is written in house on top
   of `golang.org/x/sys/unix`.
 - Run as a plain host process. No Kubernetes objects.
 
@@ -75,7 +75,16 @@ directly with `io_uring_setup`, `mmap`, and `io_uring_enter`.
   Any other error, or a handler panic, becomes `EIO`.
 
 If racer-block exits without cleanup, the device stays in the kernel. A new run
-with the same `--id` deletes the old device first.
+with the same `--id` stops and deletes that device first, even if it is still
+in use. Only choose an ID for a device you own. Without `--id`, the kernel
+chooses a free ID.
+
+A queue failure during startup must not release resources while `START_DEV`
+is still using them. A failed queue keeps its ring open and serves `EIO` until
+startup returns. If the ring cannot serve I/O, it waits for startup to return
+or for both the kernel state and sysfs to show that the disk is published.
+If neither happens, it logs a warning and keeps waiting rather than closing
+the ring while the kernel might still use it.
 
 ## Backend
 
@@ -123,7 +132,8 @@ sudo modprobe ublk_drv
 sudo racer-block --cache <cache-name> --key <64 hex> [--id 0]
 ```
 
-- racer-block needs root, or `CAP_SYS_ADMIN`, to use `/dev/ublk-control`.
+- Run as root, or with `CAP_SYS_ADMIN` and access to `/dev/ublk-control` and the
+  device's `/dev/ublkc<N>` node.
 - It needs access to `/run/racer/<cache>/client/socket` on the same host.
 - It prints the device path when the device is ready. `SIGINT` or `SIGTERM`
   stops and deletes the device.

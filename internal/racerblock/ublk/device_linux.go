@@ -51,8 +51,8 @@ type Device struct {
 	starting bool
 	startErr error
 	// startDone is closed once startup is resolved: START_DEV has
-	// returned or will not be issued. Failed queues keep their ring open
-	// until then.
+	// returned or will not be issued. A failed queue can release its ring
+	// when this closes or after it confirms that the disk is published.
 	startDone chan struct{}
 
 	// stopAsync runs teardown off the caller's goroutine. Tests replace
