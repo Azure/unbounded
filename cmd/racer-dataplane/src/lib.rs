@@ -18,6 +18,7 @@ pub mod memory;
 pub mod model;
 pub mod origin;
 pub mod peer;
+pub mod priority;
 pub mod profiling;
 pub mod rdma;
 pub mod read;

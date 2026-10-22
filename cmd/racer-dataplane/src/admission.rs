@@ -58,12 +58,16 @@ pub struct AdmissionPolicy {
     limits: Limits,
 
     observer: OnceLock<Observer>,
+
+    /// Published cache priorities. Clones share one table.
+    weights: crate::priority::Weights,
 }
 impl Clone for AdmissionPolicy {
     fn clone(&self) -> Self {
         Self {
             limits: self.limits.clone(),
             observer: self.observer.clone(),
+            weights: self.weights.clone(),
         }
     }
 }
@@ -72,7 +76,12 @@ impl AdmissionPolicy {
         Self {
             limits,
             observer: OnceLock::new(),
+            weights: crate::priority::Weights::default(),
         }
+    }
+    /// Shared priority table. Call `Quotas::reweigh` after updating it.
+    pub fn weights(&self) -> &crate::priority::Weights {
+        &self.weights
     }
     pub fn limits(&self) -> &Limits {
         &self.limits
@@ -187,6 +196,10 @@ impl Policy for AdmissionPolicy {
             ResourceClass::ControlProgress => self.limits.queue_entries.get(),
             ResourceClass::Relay => self.limits.relay_transfers.get(),
         }
+    }
+    /// A cache's keyed fair share follows its published priority.
+    fn weight(&self, key: &CacheId) -> u64 {
+        self.weights.weight(key)
     }
     fn floor(&self, class: ResourceClass) -> usize {
         match class {
