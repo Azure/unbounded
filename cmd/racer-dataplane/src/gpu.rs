@@ -537,6 +537,3 @@ impl Helper {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

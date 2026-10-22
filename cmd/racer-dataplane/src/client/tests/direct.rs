@@ -507,3 +507,5 @@ fn gpu_read_delivers_pages_through_the_backend_seam() {
     settle(&fixture);
     assert_eq!(memfd.open_copies(), 1);
 }
+
+mod gpu;
