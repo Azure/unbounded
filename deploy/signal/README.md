@@ -133,6 +133,17 @@ contradictory result/exit combinations, and any other exit code. Partial
 backend execution, identity gaps, deadline interruption, and cleanup failure
 also remain `Inconclusive`.
 
+The MPI launcher also applies a compatibility fence for
+[`kubeflow/mpi-operator#615`](https://github.com/kubeflow/mpi-operator/issues/615),
+whose suspend/resume race is fixed upstream by
+[`kubeflow/mpi-operator#868`](https://github.com/kubeflow/mpi-operator/pull/868)
+at commit `3a1e56d8accd0d924703d79af3149e3fa8ba1b01`. Before invoking the diagnostic
+launcher command, it waits for every host in `/etc/mpi/hostfile` to resolve and
+accept TCP port 22. The wait uses Bash only, is capped at 120 seconds, and is
+always at least one second shorter than `backendActiveDeadline`. Timeout emits
+a bounded, actionable stderr message and fails closed without changing
+launcher placement, resources, or participant-only policy isolation.
+
 Other backend kinds remain operator-supplied and are not installed or granted
 permissions by the included adapter.
 
