@@ -90,22 +90,30 @@ func TestFailAfterStartupTearsDown(t *testing.T) {
 }
 
 // TestEarlyQueueErrorDuringLaunch injects a failure from the first queue
-// thread before later queues launch, concurrently with the launch loop,
-// and checks every queue is launched and no teardown happens until
-// startup returns. Run with -race to check the startup fields.
+// thread while launchQueues, the real launch loop, is still launching
+// later queues. Every queue must be launched and no teardown may happen
+// until startup returns. Run with -race to check the startup fields.
 func TestEarlyQueueErrorDuringLaunch(t *testing.T) {
 	d, stops, mu := newStartupDevice(t)
 	for i := range 4 {
 		d.queues = append(d.queues, &queue{dev: d, id: i, exited: make(chan struct{})})
 	}
 
-	boom := errors.New("fetch failed")
+	boom := errors.New("queue died after fetch")
 
-	var wg sync.WaitGroup
+	var (
+		wg       sync.WaitGroup
+		launched int
+	)
 
-	launched := 0
 	d.launch = func(q *queue, ready chan<- error) {
 		launched++
+
+		if q.id == 0 {
+			// Fail synchronously so the error is recorded before the
+			// remaining queues launch.
+			d.fail(boom)
+		}
 
 		wg.Add(1)
 
@@ -113,27 +121,13 @@ func TestEarlyQueueErrorDuringLaunch(t *testing.T) {
 			defer wg.Done()
 			defer close(q.exited)
 
-			if q.id == 0 {
-				d.fail(boom)
-
-				ready <- boom
-
-				return
-			}
-
 			ready <- nil
 		}()
 	}
 
 	err := d.runStartup(func() error {
-		ready := make(chan error, len(d.queues))
-		for _, q := range d.queues {
-			q.running = true
-			d.launch(q, ready)
-		}
-
-		for range d.queues {
-			<-ready
+		if err := d.launchQueues(); err != nil {
+			return err
 		}
 
 		return d.startupErr()
@@ -160,5 +154,28 @@ func TestEarlyQueueErrorDuringLaunch(t *testing.T) {
 
 	if len(*stops) != 0 {
 		t.Fatalf("async teardown ran during startup: %v", *stops)
+	}
+}
+
+func TestLaunchQueuesJoinsFetchErrors(t *testing.T) {
+	d, _, _ := newStartupDevice(t)
+	for i := range 3 {
+		d.queues = append(d.queues, &queue{dev: d, id: i})
+	}
+
+	rejected := errors.New("FETCH_REQ rejected")
+	d.launch = func(q *queue, ready chan<- error) {
+		go func() {
+			if q.id == 1 {
+				ready <- rejected
+				return
+			}
+
+			ready <- nil
+		}()
+	}
+
+	if err := d.launchQueues(); !errors.Is(err, rejected) {
+		t.Fatalf("launchQueues = %v, want %v", err, rejected)
 	}
 }
