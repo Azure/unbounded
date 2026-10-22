@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -100,6 +101,7 @@ func setHooks(t *testing.T, fetchTag func(qid, tag int) int, beforeStartDev func
 		testHooks.beforeStartCmd = nil
 		testHooks.failedRingClose = nil
 		testHooks.serveEIO = nil
+		testHooks.eioAnswered = nil
 	})
 }
 
@@ -214,8 +216,8 @@ func TestIntegrationStartupFetchRejected(t *testing.T) {
 
 // TestIntegrationStartupQueueFailsBeforeStartDev fails a ready queue
 // through its real error path before the last startup check. Start must
-// skip START_DEV, and the failed queue must keep its ring until startup
-// is resolved.
+// skip START_DEV, and the failed queue must keep its ring until
+// teardown stops it.
 func TestIntegrationStartupQueueFailsBeforeStartDev(t *testing.T) {
 	requireFaultVM(t)
 
@@ -224,7 +226,7 @@ func TestIntegrationStartupQueueFailsBeforeStartDev(t *testing.T) {
 
 	setHooks(t, nil, func(d *Device) {
 		injectFault(d.queues[0], boom)
-		// The queue now holds its ring until startup resolves, so wait
+		// The queue now holds its ring until teardown stops it, so wait
 		// for the recorded error rather than for the queue to exit.
 		waitRecorded(t, d)
 	})
@@ -246,16 +248,17 @@ func TestIntegrationStartupQueueFailsBeforeStartDev(t *testing.T) {
 		t.Fatalf("Start = %v, want %v", err, boom)
 	}
 
-	checkClosedSafely(t, closes(), holdResolved)
+	checkClosedSafely(t, closes(), holdStopped)
 	checkNoLeak(t, before)
 }
 
 // TestIntegrationStartupQueueFailsAtStartDev fails a ready queue after
 // the last startup check, just before START_DEV is sent, so START_DEV
 // runs with a failed queue. The device has a single queue so all
-// startup I/O, including a partition scan, reaches the failed one. The queue must answer I/O, including a
-// partition scan, until START_DEV returns, close its ring only after
-// that, and Start must return the recorded error.
+// startup I/O, including a partition scan, reaches the failed one. The
+// queue must answer that I/O with EIO until teardown stops it, which is
+// after START_DEV and STOP_DEV return, and Start must return the
+// recorded error.
 func TestIntegrationStartupQueueFailsAtStartDev(t *testing.T) {
 	requireFaultVM(t)
 
@@ -283,7 +286,65 @@ func TestIntegrationStartupQueueFailsAtStartDev(t *testing.T) {
 	}
 
 	got := closes()
-	checkClosedSafely(t, got, holdResolved)
+	checkClosedSafely(t, got, holdStopped)
+	t.Logf("failed queue released its ring because: %v", got)
+	checkNoLeak(t, before)
+}
+
+// TestIntegrationStartupFailedQueueAnswersAfterStartup fails the only
+// queue just before START_DEV and pauses it after it prepares its first
+// EIO answer until startup resolves. Linux 7.0 scans partitions from a
+// work item, so START_DEV returns while that read waits on the paused
+// queue. The answer must still reach the kernel: a request left with
+// the queue is only aborted when the char device is released, and
+// teardown's STOP_DEV waits for it before that. Linux 6.8 scans inside
+// START_DEV, so there the pause ends after holdPause instead.
+func TestIntegrationStartupFailedQueueAnswersAfterStartup(t *testing.T) {
+	requireFaultVM(t)
+
+	const holdPause = time.Second
+
+	before := ublkNodes(t)
+	boom := errors.New("injected queue failure at START_DEV")
+
+	setHooks(t, nil, nil)
+
+	var paused atomic.Bool
+
+	testHooks.eioAnswered = func(q *queue) {
+		if paused.Swap(true) {
+			return
+		}
+
+		select {
+		case <-q.dev.startDone:
+		case <-time.After(holdPause):
+		}
+	}
+	testHooks.beforeStartCmd = func(d *Device) {
+		injectFault(d.queues[0], boom)
+		waitRecorded(t, d)
+	}
+
+	closes := recordRingCloses(t)
+
+	d, err := startBounded(t, 1)
+	if err == nil {
+		_ = d.Close()
+
+		t.Fatal("Start succeeded with a failed queue")
+	}
+
+	if !errors.Is(err, boom) {
+		t.Fatalf("Start = %v, want %v", err, boom)
+	}
+
+	if !paused.Load() {
+		t.Fatal("the failed queue answered no request")
+	}
+
+	got := closes()
+	checkClosedSafely(t, got, holdStopped)
 	t.Logf("failed queue released its ring because: %v", got)
 	checkNoLeak(t, before)
 }
