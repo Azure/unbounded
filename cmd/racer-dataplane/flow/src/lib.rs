@@ -459,11 +459,21 @@ impl<P: Policy> Charge<P> {
         }
         if let Some(pool) = self.buffers.upgrade() {
             let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
-            let index = [true, false].into_iter().find_map(|same_class| {
+            // Prefer slab slots for shared classes and private memory for the
+            // rest, then let shared classes take private memory. A non-shared
+            // class never takes a slab slot. Shared classes must still reuse
+            // private entries: without that, a heap fallback (no slab, or all
+            // slots busy) is never reused and stays charged until reclaim.
+            let tiers = [(true, true), (true, false), (false, true), (false, false)];
+            let index = tiers.into_iter().find_map(|(same_class, preferred)| {
                 pool.entries.iter().position(|(bytes, old)| {
+                    let slab = page_alloc::shared::contains(bytes.as_ptr());
                     (!same_class || old.class.index() == self.class.index())
-                        // Keep slab slots for shared classes and private memory for the rest.
-                        && page_alloc::shared::contains(bytes.as_ptr()) == self.class.shared()
+                        && if preferred {
+                            slab == self.class.shared()
+                        } else {
+                            !slab && self.class.shared()
+                        }
                         && bytes.capacity() >= length
                         && bytes.capacity() <= self.amount
                         // A tag-sized tail can straddle a class boundary. Only
@@ -1589,6 +1599,25 @@ mod quota_tests {
     }
 
     #[test]
+    fn shared_class_reuses_private_entries_without_a_slab() {
+        let size = 1 << 20;
+        let quotas = full_depth(Quotas::new(TestPolicy::new(64 * size, 1)));
+        assert!(!page_alloc::shared::installed());
+        let mut charge = quotas.reserve(None, Resource::Other, size).unwrap();
+        let bytes = charge.buffer(size).unwrap();
+        let first = bytes.as_ptr();
+        charge.recycle(bytes);
+        drop(charge);
+        assert_eq!(quotas.buffer_pool_stats().entries, 1);
+        // Heap fallback for a shared class must be reused, not left charged.
+        let charge = quotas.reserve(None, Resource::Other, size).unwrap();
+        let bytes = charge.buffer(size).unwrap();
+        assert_eq!(bytes.as_ptr(), first);
+        assert_eq!(quotas.buffer_pool_stats().entries, 0);
+        assert_eq!(quotas.used(Resource::Other), size);
+    }
+
+    #[test]
     fn recycler_target_grows_under_repeated_miss_and_reject() {
         let size = 1 << 20;
         let quotas = Quotas::new(TestPolicy::new(64 * size, 1));
@@ -1985,6 +2014,11 @@ mod quota_tests {
 
         fn requires_wipe(self) -> bool {
             !matches!(self, Self::Progress)
+        }
+
+        /// `Other` takes slab slots when a slab is installed; flow tests never install one.
+        fn shared(self) -> bool {
+            matches!(self, Self::Other)
         }
     }
 
