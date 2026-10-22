@@ -83,5 +83,6 @@ jobs:
         with:
           name: gantry-e2e-logs
           path: e2e/.artifacts/
+          include-hidden-files: true
           retention-days: 7
           if-no-files-found: ignore

@@ -252,14 +252,16 @@ Manifest requests come in two forms: by digest (`manifests/sha256:...`) and by t
 
 1. `containerd` requests `127.0.0.1:5000/v2/<image>/manifests/sha256:abc` (or a blob by digest).
 2. Agent checks the local containerd content store. **Miss.**
-3. Agent calls `dht.FindProviders(CID)` where CID derives from the OCI digest. **Hit**  -  returns peer multiaddrs.
+3. Agent calls `dht.StreamProviders(CID)` where CID derives from the OCI digest. **Hit** - streams peer multiaddrs without the synchronous API's provider-count limit.
 4. Agent picks the first reachable provider (ordered roughly by Kademlia proximity) and issues a single HTTP `GET` against that peer's `:5001` transfer endpoint (§4.4) with `Gantry-Mirrored: 1` and the requester's Basic/Bearer authorization when present. No `Range` header in v1. The peer ignores authorization on a local hit.
 5. Bytes stream through the agent to the requesting containerd. Gantry hashes the stream and records any mismatch, but containerd remains the final commit verifier because bytes have already been delivered by the time the final digest check completes.
 6. Gantry does **not** independently ingest the live mirror response into containerd. The requesting containerd commits the content; cdsub/advertiser reconciliation observes the later openable content and issues `DHT.Provide`.
 
-**v1 transfer policy (single-peer).** v1 ships single-peer fetch: one provider per blob, whole-blob GET. If the stream stalls (no bytes received for 10 s) or errors, the agent cancels and reissues against the next provider returned by `FindProviders`. After 3 providers fail in succession the agent gives up on the warm path and returns `5xx` to containerd, which falls through the mirror chain to origin (§7.1). Single-peer fetch is the simplest correct implementation and makes the v1 surface easy to reason about; the transfer-endpoint contract (§4.4) preserves `Range` support so v2 can add striping without a protocol change.
+**v1 transfer policy (single-peer).** v1 ships single-peer fetch: one provider per blob, whole-blob GET. The agent walks the providers an uncapped DHT lookup streams, tries each one at most once per request, and skips providers already known to be stale, unavailable, or suspicious. If a stream stalls or errors, the agent resumes from the next provider with a `Range` request. No response headers are sent until a provider answers, except to keep containerd waiting for a busy provider or for cold-start. When providers are advertised but none can serve, the agent returns `5xx` before sending headers, and containerd falls through the mirror chain to origin (§7.1). See `gantry-stale-dht-provider-recovery.md`. Single-peer fetch is the simplest correct implementation and makes the v1 surface easy to reason about; the transfer-endpoint contract (§4.4) preserves `Range` support so v2 can add striping without a protocol change.
 
 **v2 sketch (deferred).** Each blob is split into fixed-size chunks (proposed 4 MiB). Up to 4 providers issue `Range` requests in parallel; a chunk whose progress falls below 0.5× the median chunk-throughput is canceled and reissued against a different provider. Triggered for evaluation only if v1 cold-start convergence times for large layers (>1 GB) prove unacceptable in practice. See §8 open question on chunk-level granularity.
+
+**Busy providers must hold the digest.** The transfer endpoint opens content before checking its serve cap, so an absent digest returns `404`, not `429`, even under load. The mirror verifies a 429 with a bounded metadata HEAD to that same peer, without registry credentials, and commits waiting headers before walking slower later candidates. Origin metadata cannot confirm a busy peer. Partial lookup errors and unrelated peer failures do not override a freshly verified busy source; a later stale-only retry ends the waiting response rather than retaining an obsolete busy signal. Chair polling, metadata discovery, and the final origin-fallback recheck all use uncapped discovery under their existing lookup budgets. These changes do not add an end-to-end cold-start or busy-wait deadline.
 
 ### 5.1a Tag reference path
 
@@ -443,7 +445,7 @@ recent_failures[digest] = {
 ### 5.9 Node joins / leaves cluster
 
 - **Join:** the agent starts up, the Kubernetes informer reports the new node to all other agents within a few seconds, HRW rankings update naturally. The new node bootstraps its libp2p host using peers from the informer's existing pod list and joins the DHT.
-- **Leave:** existing provider records held by the departed node expire from the DHT (TTL, default 24h with 12h refresh). HRW rankings update on all surviving agents as the informer removes the departed node. If the departed node was a designated puller for an in-flight pull, the stall-detection path in §5.6 recovers.
+- **Leave:** existing provider records held by DHT peers expire after the configured 6h validity. Live providers refresh through the 3h sweeping-provider schedule. If the departed node was a designated puller for an in-flight pull, the stall-detection path in §5.6 recovers.
 
 ---
 
@@ -491,7 +493,7 @@ The `server = ...` directive causes containerd to attach `?ns=<registry>` to eve
 - **Transport:** TCP + QUIC. Noise for encryption.
 - **DHT mode:** Server mode on every agent (all agents serve queries). With 10k+ nodes, this is fine  -  Kademlia scales to this size comfortably (IPFS runs at much larger scale).
 - **Bootstrap:** the agent's Kubernetes informer provides a list of peer pod IPs. On startup the agent draws a random subset of **8** peer IPs and dials them in parallel. If fewer than **4** respond within 5 s, the agent draws another random subset of 8 from the remaining pool and retries. Total dials per startup are capped at **32**; after that the agent proceeds with whatever routing-table state it has and relies on lazy routing-table growth as DHT queries flow. The 8-peer subset is sized to populate multiple Kademlia buckets (bucket size 20 in `go-libp2p-kad-dht`) on a single round while remaining cheap; the cap prevents pathological retry on a freshly-rolled-out DaemonSet where no peer is yet ready  -  in that case the bootstrap-window suppression (§7.7) and NF5 jitter/rate-limit handle the genuinely-cold case.
-- **Provider record TTL:** 24h with 12h refresh (libp2p default). Dead nodes age out automatically.
+- **Provider record validity:** 6h with a 3h sweeping-provider interval and 10m maximum schedule delay. Dead providers stop refreshing and age out automatically.
 - **Identity persistence:** the libp2p private key is generated on first start and persisted to `hostPath`. Lost identity is not catastrophic  -  the agent rejoins with a new ID; old DHT records expire.
 
 ### 7.3 Cluster membership

@@ -51,6 +51,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/manifest"
 	"github.com/Azure/unbounded/internal/gantry/oci"
+	"github.com/Azure/unbounded/internal/gantry/providerprobe"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
 	"github.com/Azure/unbounded/internal/gantry/streamcopy"
 )
@@ -59,9 +60,9 @@ const providerFailureSweepInterval = time.Minute
 
 const authenticationChallengeTimeout = 2 * time.Second
 
-// busyMetadataTimeout bounds each metadata source used to flush early response
-// headers. Peer metadata is attempted first; the origin fallback gets a
-// separate budget so an unavailable DHT cannot consume it.
+// busyMetadataTimeout bounds the metadata request used to flush waiting
+// response headers. Busy providers must supply their own metadata; only a
+// confirmed empty lookup may use origin metadata before cold-start.
 const busyMetadataTimeout = 3 * time.Second
 
 type AuthenticationChallenger interface {
@@ -531,7 +532,8 @@ func WithDiscovery(d ifaces.DHT, peer ifaces.PeerDialer) Option {
 
 // WithPeerBudgets overrides the default peer-path budgets.
 // lookup ≤ 0 means "use default 2s"; fetch ≤ 0 means "use default 1h";
-// maxAttempts ≤ 0 means "use default 20".
+// maxAttempts ≤ 0 means no cap, so a round tries every usable provider the
+// lookup yields.
 func WithPeerBudgets(lookup, fetch time.Duration, maxAttempts int) Option {
 	return func(s *Server) {
 		s.peerLookupBudget = lookup
@@ -904,18 +906,18 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 		return
 	}
 
-	// 2. Peer fallback . If both DHT and PeerDialer are wired,
-	// try up to maxPeerAttempts providers from FindProviders. The result
-	// is tri-state per design the design doc's "v1 transfer policy":
+	// 2. Peer fallback. If both DHT and PeerDialer are wired, walk the
+	// providers a lookup yields, skipping known-bad ones, until one serves.
+	// See tryPeerFallback for the full contract:
 	// - served: bytes already written from a peer; we're done.
-	// - exhausted: DHT had providers but all maxAttempts failed (stall
-	// or error). Return 5xx so containerd's hosts.toml mirror chain
-	// promotes the request to origin directly. The agent does *not*
-	// do a direct origin pull here (direct-origin-fallback owns the controlled
-	// direct-origin path).
-	// - unused: DHT not wired, errored, or returned empty providers.
-	// Fall through to origin path; HRW probe
-	// replaces this leg for the cold-start case.
+	// - no usable provider: providers are advertised but none can serve.
+	// Return 5xx at once so containerd's hosts.toml mirror chain falls
+	// through to origin instead of waiting on stale records.
+	// - exhausted: peers or cold-start failed hard. Return 5xx; the agent
+	// does *not* do a direct origin pull here (direct-origin-fallback owns
+	// the controlled direct-origin path).
+	// - unused: DHT not wired or nothing usable came back. Fall through to
+	// the origin path.
 	if s.dht != nil && s.peer != nil {
 		switch s.tryPeerFallback(ctx, w, r, d, kind, upstream, repo, logger) {
 		case peerFallbackLocalHit:
@@ -936,6 +938,9 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 		case peerFallbackExhausted:
 			http.Error(w, "warm path exhausted", http.StatusServiceUnavailable)
 			return
+		case peerFallbackNoUsableProvider:
+			http.Error(w, "no usable peer provider", http.StatusServiceUnavailable)
+			return
 		case peerFallbackColdExhausted:
 			// the design doc direct-origin-fallback last-resort: only attempt a direct origin
 			// pull when the controller passes its gating sequence
@@ -947,7 +952,12 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, upstream, r
 				return
 			}
 
-			proceed, release, err := s.nf5.Allow(ctx, d, kind, 0)
+			proceed, release, err := s.nf5.Allow(ctx, ifaces.OriginRef{
+				Registry:   upstream,
+				Repository: repo,
+				Digest:     d,
+				Kind:       kind,
+			}, 0)
 			if release != nil {
 				defer release()
 			}
@@ -1529,6 +1539,12 @@ const (
 	// trusted-cluster-wide failure propagation, the mirror must
 	// return 5xx - direct-origin-fallback must NOT fire here.
 	peerFallbackExhausted
+	// peerFallbackNoUsableProvider means round 0 found advertised providers
+	// but none could serve: each was already known-bad or failed without a
+	// busy signal, and no response headers were sent. The caller returns 5xx
+	// at once so fail-open containerd pulls from origin instead of waiting on
+	// stale records. Cold-start and direct-origin-fallback do not fire.
+	peerFallbackNoUsableProvider
 	// peerFallbackColdExhausted means the cold-start cascade ran to
 	// its final ErrColdStartExhausted exit (no cache, no in-flight,
 	// no provider returned by HRW + DHT, both top-K and top-2K
@@ -1686,7 +1702,16 @@ func (s peerAttemptSummary) allStaleOrFiltered() bool {
 }
 
 func (s peerAttemptSummary) capacityConstrained() bool {
-	return s.attempted > 0 && (s.busy > 0 || s.noProgress > 0) &&
+	if s.attempted == 0 {
+		return false
+	}
+
+	// Busy attempts have already passed a content-specific metadata HEAD.
+	if s.busy > 0 {
+		return true
+	}
+
+	return s.noProgress > 0 &&
 		s.digestMismatch == 0 &&
 		s.authOrConfig == 0 &&
 		s.peerServerError == 0 &&
@@ -1709,18 +1734,18 @@ func (s peerAttemptSummary) retryableAfterPartial() bool {
 // re-runs a discovery round so it can pick up finisher-seeds that advertise
 // mid-swarm, turning a "fall to origin" cohort into a real peer cascade.
 //
-// Round 0 runs the full path including cold-start (please_pull), which
-// designates the closest-peer puller; its terminal result is the authoritative
-// origin-fallback decision returned if the swarm never delivers. Later rounds
-// suppress cold-start (so please_pull is not re-issued every iteration) and
-// exist only to catch a newly-advertised finisher. Result semantics remain
-// bounded when re-discovery is disabled (unused -> direct origin, exhausted ->
-// 503, cold-exhausted -> NF5). When re-discovery is enabled the metadata-only
-// origin HEAD result is flushed before round 0, because round 0's cold-start
-// leg can poll far longer than a fail-open containerd will wait for response
-// headers; such a request then resolves as served or partial rather than
-// reaching those terminal legs. Busy additionally honors Retry-After and
-// retries peers until progress or client cancellation.
+// No response headers are sent until a source is confirmed or the request has
+// to wait: a peer that answers sends them as it streams, a busy provider or an
+// empty lookup that starts cold-start commits them so containerd keeps
+// waiting. Round 0 runs the full path including cold-start (please_pull),
+// which designates the closest-peer puller. When round 0 finds only
+// providers that cannot serve, it returns peerFallbackNoUsableProvider at once
+// so fail-open containerd pulls from origin. Later rounds suppress cold-start
+// (so please_pull is not re-issued every iteration) and exist only to catch a
+// newly-advertised finisher. Result semantics remain bounded when re-discovery
+// is disabled (unused -> direct origin, exhausted -> 503, cold-exhausted ->
+// NF5). Busy additionally honors Retry-After and retries peers until progress
+// or client cancellation.
 func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, logger *slog.Logger) peerFallbackResult {
 	var stream *livePeerStream
 	if s.liveStreamThrough {
@@ -1734,26 +1759,13 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 
 	var retryAfter time.Duration
 
-	// Round 0's cold-start leg polls for the designated puller to finish, bounded
-	// by ResolveStall - 60s for a 1 GiB layer against the 30s response-header
-	// timeout fail-open containerd applies. Round 0 therefore routinely outlives
-	// the client, and anything flushed after it returns is already too late.
-	// Emit metadata up front so the client stays attached for the wait instead of
-	// bypassing Gantry to origin. A live peer is preferred; origin is the fallback.
-	// Gated on re-discovery being enabled so the budget <= 0 path below keeps
-	// returning firstResult untouched and its terminal legs reachable. A failed
-	// metadata lookup leaves headers unflushed.
-	if s.peerRediscoverBudget > 0 {
-		_ = s.beginBusyResponse(ctx, w, d, kind, upstream, repo, stream, logger)
-	}
-
 	firstResult := s.tryPeerFallbackRound(ctx, w, r, d, kind, upstream, repo, true, stream, &retryAfter, logger)
 	if firstResult == peerFallbackBusy {
-		if !s.beginBusyResponse(ctx, w, d, kind, upstream, repo, stream, logger) {
-			return peerFallbackExhausted
-		}
-
 		return s.retryBusyFallback(ctx, w, r, d, kind, upstream, repo, stream, backoff, retryAfter, logger)
+	}
+
+	if firstResult == peerFallbackNoUsableProvider {
+		return firstResult
 	}
 
 	budget := s.peerRediscoverBudget
@@ -1777,9 +1789,9 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 
 	// Round 0 did not serve, so the request is about to spend up to the whole
 	// re-discovery budget hunting for a provider. Any round that never reaches a
-	// peer is silent, so the headers flushed before round 0 are what keep the
-	// client attached; retry here only to cover a HEAD that failed then.
-	_ = s.beginBusyResponse(ctx, w, d, kind, upstream, repo, stream, logger)
+	// peer is silent, so committed headers are what keep the client attached;
+	// cold-start sent them already unless its metadata HEAD failed.
+	_ = s.beginColdStartResponse(ctx, w, d, kind, upstream, repo, stream, logger)
 
 	// Keep re-discovering. A seed that just finished advertises into the DHT,
 	// so a later FindProviders can hand us a provider even though round 0 fell
@@ -1816,10 +1828,6 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 		case peerFallbackLocalHit:
 			return peerFallbackLocalHit
 		case peerFallbackBusy:
-			if !s.beginBusyResponse(ctx, w, d, kind, upstream, repo, stream, logger) {
-				return peerFallbackExhausted
-			}
-
 			return s.retryBusyFallback(ctx, w, r, d, kind, upstream, repo, stream, backoff, retryAfter, logger)
 		}
 	}
@@ -1831,7 +1839,9 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 	return firstResult
 }
 
-func (s *Server) beginBusyResponse(ctx context.Context, w http.ResponseWriter, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, stream *livePeerStream, logger *slog.Logger) bool {
+// beginColdStartResponse uses origin metadata to keep containerd attached
+// while cold-start creates a source.
+func (s *Server) beginColdStartResponse(ctx context.Context, w http.ResponseWriter, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, stream *livePeerStream, logger *slog.Logger) bool {
 	if stream == nil || stream.started {
 		return true
 	}
@@ -1843,33 +1853,78 @@ func (s *Server) beginBusyResponse(ctx context.Context, w http.ResponseWriter, d
 		Kind:       kind,
 	}
 
-	size, contentType, ok := s.headFromPeers(ctx, pRef, logger)
-	if !ok {
-		// This HEAD only supplies size and content type for the early header
-		// flush. Bound it separately from peer metadata lookup so an
-		// unavailable DHT cannot consume the origin fallback's budget.
-		headCtx, cancel := context.WithTimeout(ctx, busyMetadataTimeout)
-		defer cancel()
+	headCtx, cancel := context.WithTimeout(ctx, busyMetadataTimeout)
+	defer cancel()
 
-		var err error
-
-		size, contentType, err = s.origin.Head(headCtx, pRef)
-		if err != nil {
-			logger.Debug("mirror: capacity metadata HEAD failed", slog.Any("err", err))
-
-			return false
-		}
+	size, contentType, err := s.origin.Head(headCtx, pRef)
+	if err != nil {
+		logger.Debug("mirror: cold-start metadata HEAD failed", slog.Any("err", err))
+		return false
 	}
 
 	if err := stream.begin(w, d, size, kind, contentType); err != nil {
-		logger.Warn("mirror: capacity response headers failed", slog.Any("err", err))
+		logger.Warn("mirror: cold-start response headers failed", slog.Any("err", err))
 
 		return false
 	}
 
-	logger.Debug("mirror: capacity response headers flushed", slog.Int64("size", size))
+	logger.Debug("mirror: cold-start response headers flushed", slog.Int64("size", size))
 
 	return true
+}
+
+func (s *Server) confirmBusyProvider(ctx context.Context, w http.ResponseWriter, ref ifaces.OriginRef, provider ifaces.Provider, stream *livePeerStream, logger *slog.Logger) peerFetchOutcomeKind {
+	metadataPeer, ok := s.peer.(ifaces.PeerMetadataDialer)
+	if !ok {
+		logger.Debug("mirror: busy provider does not support metadata HEAD", slog.String("peer", provider.Addr))
+		return peerFetchOutcomeProtocolError
+	}
+
+	metadataCtx, cancel := context.WithTimeout(ctx, busyMetadataTimeout)
+	defer cancel()
+
+	metadataCtx = registryauth.WithoutAuthorization(metadataCtx)
+	ref.Offset = 0
+
+	size, contentType, err := metadataPeer.HeadFromPeer(metadataCtx, provider.Addr, ref)
+	if err != nil {
+		outcome, label := classifyPeerFetchError(err)
+		if outcome == peerFetchOutcomeBusy {
+			outcome, label = peerFetchOutcomeProtocolError, "protocol_error"
+		}
+
+		if ctx.Err() == nil {
+			switch outcome {
+			case peerFetchOutcomeStaleProvider:
+				s.markProviderStale(ref.Digest, provider)
+			case peerFetchOutcomeUnavailable:
+				s.markProviderUnavailable(provider)
+			}
+		}
+
+		logger.Debug("mirror: busy provider metadata HEAD failed",
+			slog.String("peer", provider.Addr),
+			slog.String("outcome", label),
+			slog.Any("err", err),
+		)
+
+		return outcome
+	}
+
+	if stream != nil {
+		if err := stream.begin(w, ref.Digest, size, ref.Kind, contentType); err != nil {
+			logger.Warn("mirror: busy provider response headers failed",
+				slog.String("peer", provider.Addr),
+				slog.Any("err", err),
+			)
+
+			return peerFetchOutcomeProtocolError
+		}
+	}
+
+	logger.Debug("mirror: busy provider confirmed", slog.String("peer", provider.Addr), slog.Int64("size", size))
+
+	return peerFetchOutcomeBusy
 }
 
 func (s *Server) headFromPeers(ctx context.Context, ref ifaces.OriginRef, logger *slog.Logger) (int64, string, bool) {
@@ -1881,21 +1936,33 @@ func (s *Server) headFromPeers(ctx context.Context, ref ifaces.OriginRef, logger
 	metadataCtx, cancel := context.WithTimeout(ctx, busyMetadataTimeout)
 	defer cancel()
 
-	providers, err := s.dht.FindProviders(metadataCtx, ref.Digest)
-	if err != nil || len(providers) == 0 {
-		return 0, "", false
-	}
+	metadataCtx = registryauth.WithoutAuthorization(metadataCtx)
 
-	providers, _ = s.filterProvidersForDigest(ref.Digest, providers)
+	providers, lookupErr := providerprobe.Candidates(metadataCtx, s.dht, ref.Digest, busyMetadataTimeout)
+	attempted := providerprobe.Attempted{}
 
-	maxAttempts := s.maxPeerAttempts
-	if maxAttempts <= 0 {
-		maxAttempts = 20
-	}
+	defer func() {
+		cancel()
 
-	for index, provider := range providers {
-		if index >= maxAttempts || metadataCtx.Err() != nil {
-			break
+		for range providers {
+		}
+	}()
+
+	var summary peerAttemptSummary
+
+	for provider := range providers {
+		if metadataCtx.Err() != nil {
+			return 0, "", false
+		}
+
+		if _, seen := attempted[provider]; seen {
+			continue
+		}
+
+		attempted[provider] = struct{}{}
+
+		if s.skipProvider(ref.Digest, provider, time.Now(), &summary) {
+			continue
 		}
 
 		size, contentType, err := metadataPeer.HeadFromPeer(metadataCtx, provider.Addr, ref)
@@ -1925,6 +1992,10 @@ func (s *Server) headFromPeers(ctx context.Context, ref ifaces.OriginRef, logger
 			slog.String("outcome", label),
 			slog.Any("err", err),
 		)
+	}
+
+	if err := lookupErr(); err != nil {
+		logger.Debug("mirror: peer metadata lookup failed", slog.Any("err", err))
 	}
 
 	return 0, "", false
@@ -1958,9 +2029,8 @@ func (s *Server) retryBusyFallback(ctx context.Context, w http.ResponseWriter, r
 			return result
 		case peerFallbackBusy:
 		case peerFallbackUnused:
-			// A provider record may briefly disappear while the busy seed is
-			// refreshing it. Preserve the last proven capacity signal rather
-			// than converting a transient empty lookup into origin bypass.
+			// A record may briefly disappear while a busy seed refreshes it.
+			// A known-stale record instead returns NoUsableProvider below.
 		default:
 			// Hard peer, protocol, auth, or local failures retain fail-open
 			// behavior. Once headers are committed, terminate the incomplete
@@ -2005,9 +2075,15 @@ func jitteredBackoff(base time.Duration) time.Duration {
 // peer's body is digest-verified and committed to the local cache. In
 // live-stream-through mode, a successful peer fetch streams directly to the
 // caller and later inventory observation is used to confirm the local
-// containerd commit. When allowColdStart is false, the cold-start
-// (please_pull) legs are skipped so the re-discovery loop does not re-issue
-// please_pull on every round.
+// containerd commit.
+//
+// The pass walks every provider the lookup yields, skipping known-bad ones,
+// until one serves. With allowColdStart (round 0) it then decides what the
+// request does next: no advertised provider at all starts cold-start, while
+// advertised providers that all failed without a busy signal return
+// peerFallbackNoUsableProvider so the caller fails over to origin at once.
+// When allowColdStart is false the cold-start (please_pull) leg is skipped so
+// the re-discovery loop does not re-issue please_pull on every round.
 func (s *Server) tryPeerFallbackRound(ctx context.Context, w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, allowColdStart bool, stream *livePeerStream, retryAfter *time.Duration, logger *slog.Logger) peerFallbackResult {
 	// Cold-start may designate this process as the puller, populating the
 	// local store after serveDigest's initial cache miss. If this node was the
@@ -2024,50 +2100,23 @@ func (s *Server) tryPeerFallbackRound(ctx context.Context, w http.ResponseWriter
 		return s.serveLocalHit(ctx, w, r, d, kind, upstream, repo, logger)
 	}
 
-	lookupBudget := s.peerLookupBudget
-	if lookupBudget <= 0 {
-		lookupBudget = 2 * time.Second
+	walk := s.walkProviders(ctx, w, r, d, kind, upstream, repo, stream, retryAfter, logger)
+	if walk.served {
+		return peerFallbackServed
 	}
 
-	fetchBudget := s.peerFetchBudget
-	if fetchBudget <= 0 {
-		fetchBudget = time.Hour
-	}
+	summary := walk.summary
 
-	maxAttempts := s.maxPeerAttempts
-	if maxAttempts <= 0 {
-		maxAttempts = 20
-	}
+	if walk.lookupErr != nil {
+		logger.Debug("mirror: provider lookup error", slog.Any("err", walk.lookupErr))
 
-	lookupCtx, cancel := context.WithTimeout(ctx, lookupBudget)
-	lookupStart := time.Now()
-	providers, err := s.dht.FindProviders(lookupCtx, d)
-	lookupDur := time.Since(lookupStart)
-	lookupCtxErr := lookupCtx.Err()
-
-	cancel()
-
-	switch {
-	case err != nil:
-		outcome := "error"
-		if errors.Is(lookupCtxErr, context.DeadlineExceeded) {
-			outcome = "timeout"
+		if !allowColdStart && walk.discovered == 0 {
+			return peerFallbackExhausted
 		}
-
-		s.bumpDhtLookup(outcome, lookupDur)
-		logger.Debug("mirror: FindProviders error", slog.Any("err", err))
-	case len(providers) == 0:
-		s.bumpDhtLookup("miss", lookupDur)
-	default:
-		s.bumpDhtLookup("hit", lookupDur)
 	}
 
-	if err != nil || len(providers) == 0 {
+	if walk.discovered == 0 {
 		if !allowColdStart {
-			if err != nil {
-				return peerFallbackExhausted
-			}
-
 			// Re-discovery round: cold-start is suppressed. No providers
 			// this round; a finisher may advertise before the next round.
 			if recheckLocalAfterColdStart() {
@@ -2077,96 +2126,7 @@ func (s *Server) tryPeerFallbackRound(ctx context.Context, w http.ResponseWriter
 			return peerFallbackUnused
 		}
 
-		csProviders, res := s.resolveViaColdStart(ctx, d, kind, upstream, repo, err != nil, false, peerAttemptSummary{}, logger)
-
-		if recheckLocalAfterColdStart() {
-			return peerFallbackLocalHit
-		}
-
-		if res != peerFallbackUnused {
-			return res
-		}
-
-		if len(csProviders) == 0 {
-			return peerFallbackUnused
-		}
-
-		providers = csProviders
-	}
-
-	providers, summary := s.filterProvidersForDigest(d, providers)
-	if s.metrics.onStaleProviderFiltered != nil {
-		totalFiltered := summary.staleFiltered + summary.unavailableFiltered + summary.suspiciousFiltered + summary.selfFiltered
-		if totalFiltered > 0 {
-			s.metrics.onStaleProviderFiltered(totalFiltered)
-		}
-	}
-
-	if len(providers) == 0 {
-		// All DHT-returned providers were filtered out before we
-		// could try any of them. Distinct from "DHT returned zero"
-		// (counted as dht_lookup miss above) - this is "DHT had
-		// candidates but they were all dead". Falls through to
-		// cold-start the same as a true miss, but operators need to
-		// see the difference on the dashboard.
-		if s.metrics.onDhtStaleOnly != nil {
-			s.metrics.onDhtStaleOnly()
-		}
-
-		logger.Debug("mirror: DHT providers filtered",
-			slog.Int("stale_filtered", summary.staleFiltered),
-			slog.Int("unavailable_filtered", summary.unavailableFiltered),
-			slog.Int("suspicious_filtered", summary.suspiciousFiltered),
-			slog.Int("self_filtered", summary.selfFiltered),
-		)
-
-		if !allowColdStart {
-			// Re-discovery round: cold-start is suppressed.
-			if recheckLocalAfterColdStart() {
-				return peerFallbackLocalHit
-			}
-
-			return peerFallbackUnused
-		}
-
-		csProviders, res := s.resolveViaColdStart(ctx, d, kind, upstream, repo, false, true, summary, logger)
-
-		if recheckLocalAfterColdStart() {
-			return peerFallbackLocalHit
-		}
-
-		if res != peerFallbackUnused {
-			return res
-		}
-
-		if len(csProviders) == 0 {
-			return peerFallbackUnused
-		}
-
-		filtered, _ := s.filterProvidersForDigest(d, csProviders)
-		providers = filtered
-	}
-
-	tried := 0
-	for _, p := range providers {
-		if tried >= maxAttempts {
-			break
-		}
-
-		tried++
-		summary.attempted++
-		res := s.fetchOneProvider(ctx, w, r, d, kind, upstream, repo, p, fetchBudget, stream, logger)
-
-		summary = updatePeerSummary(summary, res.outcome)
-		*retryAfter = max(*retryAfter, res.retryAfter)
-
-		if res.served {
-			return peerFallbackServed
-		}
-
-		if stream != nil && !stream.started && res.outcome == peerFetchOutcomeBusy {
-			return peerFallbackBusy
-		}
+		return s.coldStartRound(ctx, w, r, d, kind, upstream, repo, walk.lookupErr != nil, stream, retryAfter, recheckLocalAfterColdStart, logger)
 	}
 
 	if summary.capacityConstrained() || (stream != nil && stream.offset() > 0 && summary.retryableAfterPartial()) {
@@ -2177,61 +2137,222 @@ func (s *Server) tryPeerFallbackRound(ctx context.Context, w http.ResponseWriter
 		return peerFallbackExhausted
 	}
 
-	if tried > 0 && allowColdStart {
-		allStale := summary.allStaleOrFiltered()
-		logger.Debug("mirror: peer providers exhausted, consulting cold-start",
-			slog.Int("attempted", summary.attempted),
-			slog.Int("stale", summary.stale),
-			slog.Int("unavailable", summary.unavailable),
-			slog.Int("digest_mismatch", summary.digestMismatch),
-			slog.Int("auth_or_config", summary.authOrConfig),
-			slog.Int("peer_server_error", summary.peerServerError),
-			slog.Int("protocol_error", summary.protocolError),
-			slog.Int("stall", summary.stall),
-			slog.Int("no_progress", summary.noProgress),
-			slog.Int("local_error", summary.localError),
-			slog.Bool("all_stale_or_filtered", allStale),
-		)
+	if !allowColdStart {
+		if summary.attempted == 0 {
+			if recheckLocalAfterColdStart() {
+				return peerFallbackLocalHit
+			}
 
-		csProviders, csResult := s.resolveViaColdStart(ctx, d, kind, upstream, repo, false, allStale, summary, logger)
-
-		if recheckLocalAfterColdStart() {
-			return peerFallbackLocalHit
+			// An old capacity signal must not keep a now-stale provider
+			// alive through repeated filtered-only lookups.
+			return peerFallbackNoUsableProvider
 		}
 
-		if csResult != peerFallbackUnused {
-			if summary.capacityConstrained() {
-				return peerFallbackBusy
-			}
+		return peerFallbackExhausted
+	}
 
-			return csResult
+	if stream != nil && stream.started {
+		// A peer committed response headers before failing, so an HTTP error
+		// can no longer be written. Let the caller keep the response alive.
+		return peerFallbackExhausted
+	}
+
+	logger.Debug("mirror: no usable peer provider, failing over to origin",
+		slog.Int("discovered", walk.discovered),
+		slog.Int("attempted", summary.attempted),
+		slog.Int("stale", summary.stale),
+		slog.Int("unavailable", summary.unavailable),
+		slog.Int("digest_mismatch", summary.digestMismatch),
+		slog.Int("auth_or_config", summary.authOrConfig),
+		slog.Int("peer_server_error", summary.peerServerError),
+		slog.Int("protocol_error", summary.protocolError),
+		slog.Int("stall", summary.stall),
+		slog.Int("local_error", summary.localError),
+		slog.Int("stale_filtered", summary.staleFiltered),
+		slog.Int("unavailable_filtered", summary.unavailableFiltered),
+		slog.Int("suspicious_filtered", summary.suspiciousFiltered),
+		slog.Bool("all_stale_or_filtered", summary.attempted == 0 || summary.allStaleOrFiltered()),
+	)
+
+	return peerFallbackNoUsableProvider
+}
+
+// coldStartRound handles a round-0 lookup that found no advertised provider.
+// Cold-start can poll for longer than containerd waits for response headers
+// while a chair pulls from origin, so headers are committed first whenever
+// re-discovery is enabled; with re-discovery disabled the terminal results
+// stay reachable as HTTP errors.
+func (s *Server) coldStartRound(ctx context.Context, w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, afterLookupErr bool, stream *livePeerStream, retryAfter *time.Duration, recheckLocal func() bool, logger *slog.Logger) peerFallbackResult {
+	if s.peerRediscoverBudget > 0 {
+		_ = s.beginColdStartResponse(ctx, w, d, kind, upstream, repo, stream, logger)
+	}
+
+	csProviders, res := s.resolveViaColdStart(ctx, d, kind, upstream, repo, afterLookupErr, false, peerAttemptSummary{}, logger)
+
+	if recheckLocal() {
+		return peerFallbackLocalHit
+	}
+
+	if res != peerFallbackUnused {
+		return res
+	}
+
+	if len(csProviders) == 0 {
+		return peerFallbackUnused
+	}
+
+	providers, summary := s.filterProvidersForDigest(d, csProviders)
+	fetchBudget := s.peerFetchBudgetOrDefault()
+
+	for _, p := range providers {
+		if s.maxPeerAttempts > 0 && summary.attempted >= s.maxPeerAttempts {
+			break
 		}
 
-		filteredCS, _ := s.filterProvidersForDigest(d, csProviders)
+		summary.attempted++
+		res := s.fetchOneProvider(ctx, w, r, d, kind, upstream, repo, p, fetchBudget, stream, logger)
 
-		for _, p := range filteredCS {
-			if tried >= maxAttempts*2 {
-				break
-			}
+		summary = updatePeerSummary(summary, res.outcome)
+		*retryAfter = max(*retryAfter, res.retryAfter)
 
-			tried++
-			summary.attempted++
-			res := s.fetchOneProvider(ctx, w, r, d, kind, upstream, repo, p, fetchBudget, stream, logger)
-
-			summary = updatePeerSummary(summary, res.outcome)
-			*retryAfter = max(*retryAfter, res.retryAfter)
-
-			if res.served {
-				return peerFallbackServed
-			}
+		if res.served {
+			return peerFallbackServed
 		}
 	}
 
-	if summary.capacityConstrained() {
+	if summary.capacityConstrained() || (stream != nil && stream.offset() > 0 && summary.retryableAfterPartial()) {
 		return peerFallbackBusy
 	}
 
 	return peerFallbackExhausted
+}
+
+// providerWalk is the outcome of walkProviders.
+type providerWalk struct {
+	served bool
+	// discovered counts distinct providers the lookup yielded, excluding
+	// this node. Zero means nothing advertises the digest.
+	discovered int
+	summary    peerAttemptSummary
+	lookupErr  error
+}
+
+// walkProviders tries each provider one lookup yields, once, skipping
+// known-bad ones, until one serves or the providers run out.
+func (s *Server) walkProviders(ctx context.Context, w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, stream *livePeerStream, retryAfter *time.Duration, logger *slog.Logger) providerWalk {
+	lookupBudget := s.peerLookupBudget
+	if lookupBudget <= 0 {
+		lookupBudget = 2 * time.Second
+	}
+
+	fetchBudget := s.peerFetchBudgetOrDefault()
+
+	walkCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	start := time.Now()
+	candidates, lookupErr := providerprobe.Candidates(walkCtx, s.dht, d, lookupBudget)
+
+	var (
+		walk      providerWalk
+		fetchTime time.Duration
+	)
+
+	seen := map[ifaces.Provider]struct{}{}
+
+	s.sweepProviderFailures(start)
+
+	for p := range candidates {
+		if _, dup := seen[p]; dup {
+			continue
+		}
+
+		seen[p] = struct{}{}
+
+		if !s.isSelfProvider(p) {
+			walk.discovered++
+		}
+
+		if s.skipProvider(d, p, time.Now(), &walk.summary) {
+			continue
+		}
+
+		if s.maxPeerAttempts > 0 && walk.summary.attempted >= s.maxPeerAttempts {
+			break
+		}
+
+		walk.summary.attempted++
+		fetchStart := time.Now()
+		res := s.fetchOneProvider(ctx, w, r, d, kind, upstream, repo, p, fetchBudget, stream, logger)
+		fetchTime += time.Since(fetchStart)
+
+		walk.summary = updatePeerSummary(walk.summary, res.outcome)
+		*retryAfter = max(*retryAfter, res.retryAfter)
+
+		if res.served {
+			walk.served = true
+			break
+		}
+	}
+
+	// Stop the lookup and wait for the stream to close so the lookup error
+	// is safe to read.
+	cancel()
+
+	for range candidates {
+	}
+
+	walk.lookupErr = lookupErr()
+	if walk.served {
+		// Stopping discovery after a successful fetch is not a lookup error.
+		walk.lookupErr = nil
+	}
+
+	lookupDur := time.Since(start) - fetchTime
+
+	switch {
+	case walk.lookupErr != nil:
+		outcome := "error"
+		if errors.Is(walk.lookupErr, context.DeadlineExceeded) {
+			outcome = "timeout"
+		}
+
+		s.bumpDhtLookup(outcome, lookupDur)
+	case walk.discovered == 0:
+		s.bumpDhtLookup("miss", lookupDur)
+	default:
+		s.bumpDhtLookup("hit", lookupDur)
+	}
+
+	filtered := walk.summary.staleFiltered + walk.summary.unavailableFiltered + walk.summary.suspiciousFiltered + walk.summary.selfFiltered
+	if s.metrics.onStaleProviderFiltered != nil && filtered > 0 {
+		s.metrics.onStaleProviderFiltered(filtered)
+	}
+
+	if walk.discovered > 0 && walk.summary.attempted == 0 {
+		// Distinct from a DHT miss: the DHT had candidates, but all were
+		// already known-bad before this pass could try any of them.
+		if s.metrics.onDhtStaleOnly != nil {
+			s.metrics.onDhtStaleOnly()
+		}
+
+		logger.Debug("mirror: DHT providers filtered",
+			slog.Int("stale_filtered", walk.summary.staleFiltered),
+			slog.Int("unavailable_filtered", walk.summary.unavailableFiltered),
+			slog.Int("suspicious_filtered", walk.summary.suspiciousFiltered),
+			slog.Int("self_filtered", walk.summary.selfFiltered),
+		)
+	}
+
+	return walk
+}
+
+func (s *Server) peerFetchBudgetOrDefault() time.Duration {
+	if s.peerFetchBudget > 0 {
+		return s.peerFetchBudget
+	}
+
+	return time.Hour
 }
 
 // fetchOneProvider streams one peer candidate. In default mode it writes
@@ -2290,6 +2411,10 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 			slog.String("outcome", label),
 			slog.Any("err", err),
 		)
+
+		if outcome == peerFetchOutcomeBusy {
+			outcome = s.confirmBusyProvider(pCtx, w, pRef, p, stream, logger)
+		}
 
 		return peerAttemptResult{outcome: outcome, retryAfter: retryAfter}
 	}
@@ -2514,24 +2639,7 @@ func (s *Server) filterProvidersForDigest(d digest.Digest, providers []ifaces.Pr
 	var summary peerAttemptSummary
 
 	for _, p := range providers {
-		if s.isSelfProvider(p) {
-			summary.selfFiltered++
-			continue
-		}
-
-		key := providerDigestKey{digest: d, nodeID: p.NodeID, addr: p.Addr}
-		if s.isProviderInWindow(s.staleProviders, key, now) {
-			summary.staleFiltered++
-			continue
-		}
-
-		if s.isProviderInWindow(s.suspiciousProviders, key, now) {
-			summary.suspiciousFiltered++
-			continue
-		}
-
-		if s.isUnavailablePeerInWindow(p.Addr, now) {
-			summary.unavailableFiltered++
+		if s.skipProvider(d, p, now, &summary) {
 			continue
 		}
 
@@ -2550,6 +2658,33 @@ func (s *Server) filterProvidersForDigest(d digest.Digest, providers []ifaces.Pr
 	})
 
 	return filtered, summary
+}
+
+// skipProvider reports whether p is this node or sits in a stale, suspicious,
+// or unavailable window for d, and counts the reason in summary.
+func (s *Server) skipProvider(d digest.Digest, p ifaces.Provider, now time.Time, summary *peerAttemptSummary) bool {
+	if s.isSelfProvider(p) {
+		summary.selfFiltered++
+		return true
+	}
+
+	key := providerDigestKey{digest: d, nodeID: p.NodeID, addr: p.Addr}
+	if s.isProviderInWindow(s.staleProviders, key, now) {
+		summary.staleFiltered++
+		return true
+	}
+
+	if s.isProviderInWindow(s.suspiciousProviders, key, now) {
+		summary.suspiciousFiltered++
+		return true
+	}
+
+	if s.isUnavailablePeerInWindow(p.Addr, now) {
+		summary.unavailableFiltered++
+		return true
+	}
+
+	return false
 }
 
 func (s *Server) isSelfProvider(p ifaces.Provider) bool {
