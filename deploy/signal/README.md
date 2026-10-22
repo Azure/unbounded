@@ -102,7 +102,11 @@ Unexpected, duplicate, malformed, or oversized outputs are rejected and the
 run remains fail-closed. Each `backend-resources` entry must contain
 `apiVersion`, `kind`, `name`, `uid`, and the zero-based `participantIndexes`
 that the workload executed. `namespace` is optional. A multi-Node successful
-result must cover every admitted participant.
+result must cover every admitted participant. The controller prefers present
+top-level Workflow outputs. When Argo leaves those outputs absent, it accepts
+outputs only from the unique Workflow entrypoint node whose name exactly
+matches the Workflow name; missing, malformed, duplicate, or ambiguous
+entrypoint identity and outputs fail closed.
 
 Before foreground deletion, the adapter captures and writes a typed v1
 projection for every participant backend to the Argo output path. The
@@ -155,10 +159,11 @@ Scripts write `verdict`, `reason`, and optional `measurements.txt` under
 `Fail` exits 1, and `Inconclusive` exits 2. A valid bounded result remains
 authoritative when its verdict-associated exit code makes the backend Pod or
 MPIJob terminally unsuccessful. The adapter removes reserved result files
-before each invocation and rejects missing files, malformed values, stale or
-contradictory result/exit combinations, and any other exit code. Partial
-backend execution, identity gaps, deadline interruption, and cleanup failure
-also remain `Inconclusive`.
+before each invocation and removes trailing newline bytes from repository-owned
+result files before encoding them. It rejects missing files, malformed values,
+stale or contradictory result/exit combinations, and any other exit code.
+Partial backend execution, identity gaps, deadline interruption, and cleanup
+failure also remain `Inconclusive`.
 
 The MPI launcher also applies a compatibility fence for
 [`kubeflow/mpi-operator#615`](https://github.com/kubeflow/mpi-operator/issues/615),
