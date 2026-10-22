@@ -536,7 +536,8 @@ func cacheChanges() predicate.Predicate {
 			return false
 		}
 
-		return x.UID == y.UID && x.Name == y.Name
+		// Priority is published in the catalog, so an edit must republish.
+		return x.UID == y.UID && x.Name == y.Name && x.Spec.EffectivePriority() == y.Spec.EffectivePriority()
 	})
 }
 

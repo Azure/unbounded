@@ -1621,6 +1621,14 @@ func regenerateRejections(t *testing.T) {
 		{"null NIC GID", "publication.json", `"port":1`, `"port":1,"gid":null`},
 		{"empty NIC GID", "publication.json", `"port":1`, `"port":1,"gid":""`},
 		{"uppercase NIC GID", "publication.json", `"port":1`, `"port":1,"gid":"ABCDEF0123456789abcdef0123456789"`},
+		{"missing cache priority", "publication.json", `,"priority":250`, ""},
+		{"null cache priority", "publication.json", `"priority":250`, `"priority":null`},
+		{"string cache priority", "publication.json", `"priority":250`, `"priority":"250"`},
+		{"negative cache priority", "publication.json", `"priority":250`, `"priority":-1`},
+		{"fractional cache priority", "publication.json", `"priority":250`, `"priority":250.5`},
+		{"exponent cache priority", "publication.json", `"priority":250`, `"priority":2.5e2`},
+		{"cache priority above maximum", "publication.json", `"priority":250`, `"priority":1001`},
+		{"overflow cache priority", "publication.json", `"priority":250`, `"priority":65536`},
 	} {
 		found := slices.ContainsFunc(rejections, func(rejection rejectionVector) bool { return rejection.Name == addition.name })
 		if !found {
@@ -1631,4 +1639,64 @@ func regenerateRejections(t *testing.T) {
 	b, err := json.MarshalIndent(rejections, "", "  ")
 	require.NoError(t, err)
 	writeSharedVector(t, "rejections.json", b)
+}
+
+func TestCachePriorityRoundTripRangeAndHashes(t *testing.T) {
+	base, err := DecodePublication(bytes.NewReader(fixture(t, "publication.json")))
+	require.NoError(t, err)
+	require.Equal(t, uint16(250), base.Caches[0].Priority)
+
+	baseHash, baseMembership, err := ContentHashes(base)
+	require.NoError(t, err)
+
+	for _, priority := range []uint16{0, DefaultCachePriority, MaxCachePriority} {
+		v := canonicalPublication(base)
+		v.Caches[0].Priority = priority
+		encoded, err := EncodePublication(v)
+		require.NoError(t, err)
+		require.Contains(t, string(encoded), fmt.Sprintf(`"priority":%d}`, priority))
+
+		decoded, err := DecodePublication(bytes.NewReader(encoded))
+		require.NoError(t, err)
+		require.Equal(t, priority, decoded.Caches[0].Priority)
+
+		content, membership, err := ContentHashes(v)
+		require.NoError(t, err)
+		require.NotEqual(t, baseHash, content, "priority must be part of content")
+		require.Equal(t, baseMembership, membership, "priority is not membership")
+	}
+
+	over := canonicalPublication(base)
+	over.Caches[0].Priority = MaxCachePriority + 1
+	_, err = EncodePublication(over)
+	require.ErrorIs(t, err, InvalidRequest)
+	_, _, err = ContentHashes(over)
+	require.ErrorIs(t, err, InvalidRequest)
+
+	raw := string(fixture(t, "publication.json"))
+	for _, bad := range []string{"", `,"priority":1001`, `,"priority":-1`, `,"priority":null`, `,"priority":"250"`, `,"priority":1.5`} {
+		_, err := DecodePublication(strings.NewReader(strings.Replace(raw, `,"priority":250`, bad, 1)))
+		require.ErrorIs(t, err, InvalidRequest, "priority %q", bad)
+	}
+}
+
+func TestDeltaCarriesCachePriorityChange(t *testing.T) {
+	base, err := DecodePublication(bytes.NewReader(fixture(t, "publication.json")))
+	require.NoError(t, err)
+
+	base.Sequence, base.MembershipVersion = 1, 1
+	next := canonicalPublication(base)
+	next.Sequence = 2
+	next.Caches[0].Priority = 900
+	encoded, err := EncodeDelta(base, next)
+	require.NoError(t, err)
+	require.Contains(t, string(encoded), `"priority":900`)
+
+	applied, err := ApplyDelta(base, bytes.NewReader(encoded))
+	require.NoError(t, err)
+	require.Equal(t, next, applied)
+
+	bad := strings.Replace(string(encoded), `"priority":900`, `"priority":1001`, 1)
+	_, err = ApplyDelta(base, strings.NewReader(bad))
+	require.ErrorIs(t, err, InvalidRequest)
 }

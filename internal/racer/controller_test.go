@@ -1708,6 +1708,8 @@ func TestCanonicalSocketPaths(t *testing.T) {
 
 func TestBuildCatalog(t *testing.T) {
 	caches := []racerv1.ClusterCache{catalogCache("cache-b", testOtherUID), catalogCache("cache-a", testNodeUID), catalogCache("cache-c", testDaemonSetUID)}
+	caches[0].Spec.Priority = ptr.To[int32](0)
+	caches[2].Spec.Priority = ptr.To(racerv1.MaxPriority)
 
 	original := make([]racerv1.ClusterCache, len(caches))
 	for i := range caches {
@@ -1717,9 +1719,9 @@ func TestBuildCatalog(t *testing.T) {
 	got, err := BuildCatalog(caches)
 
 	want := []wire.CacheDefinition{
-		{ID: testNodeUID, Name: "cache-a", ClientSocket: "/run/racer/cache-a/client/socket", OriginSocket: "/run/racer/cache-a/origin/socket"},
-		{ID: testOtherUID, Name: "cache-b", ClientSocket: "/run/racer/cache-b/client/socket", OriginSocket: "/run/racer/cache-b/origin/socket"},
-		{ID: wire.CacheID(testDaemonSetUID), Name: "cache-c", ClientSocket: "/run/racer/cache-c/client/socket", OriginSocket: "/run/racer/cache-c/origin/socket"},
+		{ID: testNodeUID, Name: "cache-a", ClientSocket: "/run/racer/cache-a/client/socket", OriginSocket: "/run/racer/cache-a/origin/socket", Priority: wire.DefaultCachePriority},
+		{ID: testOtherUID, Name: "cache-b", ClientSocket: "/run/racer/cache-b/client/socket", OriginSocket: "/run/racer/cache-b/origin/socket", Priority: 0},
+		{ID: wire.CacheID(testDaemonSetUID), Name: "cache-c", ClientSocket: "/run/racer/cache-c/client/socket", OriginSocket: "/run/racer/cache-c/origin/socket", Priority: wire.MaxCachePriority},
 	}
 	if err != nil || !reflect.DeepEqual(got, want) || !reflect.DeepEqual(caches, original) {
 		t.Fatalf("catalog: %#v, %v; inputs: %#v", got, err, caches)
@@ -1763,6 +1765,18 @@ func TestBuildCatalogRejectsWholeInvalidCandidate(t *testing.T) {
 		"duplicate name": catalogCache("cache-a", testOtherUID),
 		"unsafe name":    catalogCache("../cache", testOtherUID),
 		"long path":      catalogCache(strings.Repeat("a", 63)+"."+strings.Repeat("b", 19), testOtherUID),
+		"negative priority": func() racerv1.ClusterCache {
+			c := catalogCache("cache-b", testOtherUID)
+			c.Spec.Priority = ptr.To[int32](-1)
+
+			return c
+		}(),
+		"priority above maximum": func() racerv1.ClusterCache {
+			c := catalogCache("cache-b", testOtherUID)
+			c.Spec.Priority = ptr.To(racerv1.MaxPriority + 1)
+
+			return c
+		}(),
 	} {
 		t.Run(name, func(t *testing.T) {
 			got, err := BuildCatalog([]racerv1.ClusterCache{valid, invalid})

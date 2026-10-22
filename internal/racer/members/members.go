@@ -300,7 +300,8 @@ func (result *Result) reconcileNode(node *corev1.Node, input Input, accepted His
 	}
 }
 
-// BuildCatalog derives cache identities from UIDs and paths from names, sorted by UID.
+// BuildCatalog derives cache identities from UIDs, paths from names, and
+// priorities from spec.priority (DefaultPriority when unset), sorted by UID.
 // An invalid catalog never partially replaces the currently served publication.
 func BuildCatalog(caches []racerv1.ClusterCache) ([]wire.CacheDefinition, error) {
 	catalog := make([]wire.CacheDefinition, 0, len(caches))
@@ -318,8 +319,17 @@ func BuildCatalog(caches []racerv1.ClusterCache) ([]wire.CacheDefinition, error)
 			return nil, fmt.Errorf("cache socket paths: %w", err)
 		}
 
+		// The CRD bounds spec.priority; recheck so a skewed schema cannot publish
+		// a catalog that every subscriber would reject.
+		priority := cache.Spec.EffectivePriority()
+		if priority < racerv1.MinPriority || priority > racerv1.MaxPriority || priority > int32(wire.MaxCachePriority) {
+			return nil, fmt.Errorf("cache priority: %w", wire.InvalidRequest)
+		}
+
 		ids[id], names[cache.Name] = true, true
-		catalog = append(catalog, wire.CacheDefinition{ID: id, Name: cache.Name, ClientSocket: client, OriginSocket: origin})
+		catalog = append(catalog, wire.CacheDefinition{
+			ID: id, Name: cache.Name, ClientSocket: client, OriginSocket: origin, Priority: uint16(priority),
+		})
 	}
 
 	slices.SortFunc(catalog, func(a, b wire.CacheDefinition) int { return cmp.Compare(a.ID, b.ID) })
