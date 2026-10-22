@@ -137,7 +137,7 @@ func TestResolveNvidiaHostAzureLinuxInitializesDevicesBeforeDiscovery(t *testing
 		return nil, nil
 	}
 
-	require.NoError(t, initializeAzureLinuxNVIDIADevices(deps))
+	require.NoError(t, initializeNVIDIADevices(deps))
 	require.Equal(t, []string{
 		"/usr/bin/nvidia-modprobe -u -c0",
 		"/usr/bin/nvidia-modprobe -m",
@@ -148,7 +148,7 @@ func TestResolveNvidiaHostAzureLinuxInitializesDevicesBeforeDiscovery(t *testing
 	require.Contains(t, devices, filepath.Join(deviceDir, "nvidia0"))
 }
 
-func TestResolveNvidiaHostUbuntuDoesNotInitializeDevices(t *testing.T) {
+func TestResolveNvidiaHostUbuntuInitializesDevicesBeforeDiscovery(t *testing.T) {
 	root := t.TempDir()
 	pciDir := filepath.Join(root, "sys", "bus", "pci", "devices")
 	deviceDir := filepath.Join(root, "dev")
@@ -159,13 +159,68 @@ func TestResolveNvidiaHostUbuntuDoesNotInitializeDevices(t *testing.T) {
 
 	deps := testNvidiaDeviceInitDeps(pciDir, deviceDir)
 	deps.hostDistro = func() string { return hostDistroUbuntu2404 }
-	deps.runCommand = func(string, ...string) ([]byte, error) {
-		t.Fatal("Ubuntu discovery must not invoke nvidia-modprobe")
+	deps.lookPath = func(name string) (string, error) {
+		require.Equal(t, nvidiaModprobeBinary, name)
+		return "/usr/bin/nvidia-modprobe", nil
+	}
+
+	var commands []string
+
+	deps.runCommand = func(name string, args ...string) ([]byte, error) {
+		commands = append(commands, strings.Join(append([]string{name}, args...), " "))
+
+		switch strings.Join(args, " ") {
+		case "-u -c0":
+			for _, device := range []string{nvidiaControlDeviceName, nvidiaUVMDeviceName} {
+				require.NoError(t, os.WriteFile(filepath.Join(deviceDir, device), nil, 0o644))
+			}
+		case "-m":
+			require.NoError(t, os.WriteFile(filepath.Join(deviceDir, nvidiaModesetDeviceName), nil, 0o644))
+		default:
+			return nil, fmt.Errorf("unexpected arguments: %v", args)
+		}
+
 		return nil, nil
 	}
 
-	require.NoError(t, initializeAzureLinuxNVIDIADevices(deps))
-	require.Equal(t, []string{filepath.Join(deviceDir, "nvidia0")}, discoverNVIDIADevicesIn(deviceDir))
+	require.NoError(t, initializeNVIDIADevices(deps))
+	require.Equal(t, []string{
+		"/usr/bin/nvidia-modprobe -u -c0",
+		"/usr/bin/nvidia-modprobe -m",
+	}, commands)
+	require.ElementsMatch(t, []string{
+		filepath.Join(deviceDir, nvidiaControlDeviceName),
+		filepath.Join(deviceDir, nvidiaModesetDeviceName),
+		filepath.Join(deviceDir, nvidiaUVMDeviceName),
+		filepath.Join(deviceDir, "nvidia0"),
+	}, discoverNVIDIADevicesIn(deviceDir))
+}
+
+func TestResolveNvidiaHostCompleteDevicesDoNotInvokeNvidiaModprobe(t *testing.T) {
+	root := t.TempDir()
+	pciDir := filepath.Join(root, "sys", "bus", "pci", "devices")
+	deviceDir := filepath.Join(root, "dev")
+
+	addNVIDIAPCIDevice(t, pciDir)
+	require.NoError(t, os.MkdirAll(deviceDir, 0o755))
+
+	for _, device := range []string{
+		"nvidia0",
+		nvidiaControlDeviceName,
+		nvidiaUVMDeviceName,
+		nvidiaModesetDeviceName,
+	} {
+		require.NoError(t, os.WriteFile(filepath.Join(deviceDir, device), nil, 0o644))
+	}
+
+	deps := testNvidiaDeviceInitDeps(pciDir, deviceDir)
+	deps.hostDistro = func() string { return hostDistroUbuntu2404 }
+	deps.lookPath = func(string) (string, error) {
+		t.Fatal("complete NVIDIA device state must not invoke nvidia-modprobe")
+		return "", nil
+	}
+
+	require.NoError(t, initializeNVIDIADevices(deps))
 }
 
 func TestResolveNvidiaHostAzureLinuxWithoutNVIDIAHardwareIsUnchanged(t *testing.T) {
@@ -183,7 +238,7 @@ func TestResolveNvidiaHostAzureLinuxWithoutNVIDIAHardwareIsUnchanged(t *testing.
 		return nil, nil
 	}
 
-	require.NoError(t, initializeAzureLinuxNVIDIADevices(deps))
+	require.NoError(t, initializeNVIDIADevices(deps))
 	require.Empty(t, discoverNVIDIADevicesIn(deviceDir))
 }
 
@@ -208,7 +263,7 @@ func TestResolveNvidiaHostAzureLinuxFailsWhenNvidiaModprobeFails(t *testing.T) {
 		return nil, nil
 	}
 
-	err := initializeAzureLinuxNVIDIADevices(deps)
+	err := initializeNVIDIADevices(deps)
 	require.ErrorContains(t, err, "run /usr/bin/nvidia-modprobe -u -c0")
 	require.ErrorContains(t, err, "module initialization failed")
 }
@@ -230,7 +285,7 @@ func TestResolveNvidiaHostAzureLinuxValidatesModesetDevice(t *testing.T) {
 	deps.lookPath = func(string) (string, error) { return "/usr/bin/nvidia-modprobe", nil }
 	deps.runCommand = func(string, ...string) ([]byte, error) { return nil, nil }
 
-	err := initializeAzureLinuxNVIDIADevices(deps)
+	err := initializeNVIDIADevices(deps)
 	require.ErrorContains(t, err, "nvidia-modeset")
 }
 

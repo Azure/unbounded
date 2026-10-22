@@ -142,7 +142,7 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 	initDeps := defaultNvidiaDeviceInitDeps()
 	initDeps.hostDistro = func() string { return hostDistro }
 
-	if err := initializeAzureLinuxNVIDIADevices(initDeps); err != nil {
+	if err := initializeNVIDIADevices(initDeps); err != nil {
 		return NvidiaHost{}, err
 	}
 
@@ -225,21 +225,26 @@ func defaultNvidiaDeviceInitDeps() nvidiaDeviceInitDeps {
 	}
 }
 
-func initializeAzureLinuxNVIDIADevices(deps nvidiaDeviceInitDeps) error {
-	if deps.hostDistro() != hostDistroAzureLinux3 || !hasNVIDIADisplayHardware(deps) {
+func initializeNVIDIADevices(deps nvidiaDeviceInitDeps) error {
+	distro := deps.hostDistro()
+	if !supportedNVIDIAHostDistro(distro) || !hasNVIDIADisplayHardware(deps) {
+		return nil
+	}
+
+	if distro != hostDistroAzureLinux3 && validateNVIDIADeviceNodes(deps) == nil {
 		return nil
 	}
 
 	modprobe, err := deps.lookPath(nvidiaModprobeBinary)
 	if err != nil {
-		return fmt.Errorf("locate %s on Azure Linux NVIDIA host: %w", nvidiaModprobeBinary, err)
+		return fmt.Errorf("locate %s on NVIDIA host: %w", nvidiaModprobeBinary, err)
 	}
 
 	for _, args := range [][]string{{"-u", "-c0"}, {"-m"}} {
 		output, runErr := deps.runCommand(modprobe, args...)
 		if runErr != nil {
 			return fmt.Errorf(
-				"run %s %s on Azure Linux NVIDIA host: %w: %s",
+				"run %s %s on NVIDIA host: %w: %s",
 				modprobe,
 				strings.Join(args, " "),
 				runErr,
@@ -249,10 +254,19 @@ func initializeAzureLinuxNVIDIADevices(deps nvidiaDeviceInitDeps) error {
 	}
 
 	if err := validateNVIDIADeviceNodes(deps); err != nil {
-		return fmt.Errorf("validate Azure Linux NVIDIA device initialization: %w", err)
+		return fmt.Errorf("validate NVIDIA device initialization: %w", err)
 	}
 
 	return nil
+}
+
+func supportedNVIDIAHostDistro(distro string) bool {
+	switch distro {
+	case hostDistroUbuntu2404, hostDistroUbuntu2604, hostDistroAzureLinux3:
+		return true
+	default:
+		return false
+	}
 }
 
 func hasNVIDIADisplayHardware(deps nvidiaDeviceInitDeps) bool {

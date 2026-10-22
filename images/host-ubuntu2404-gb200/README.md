@@ -32,8 +32,10 @@ whether the later 580.178.04 Blackwell NVLink/GSP changes are involved.
 The image does not install a custom device-node wait service. Physical GB200
 boot evidence shows that Fabric Manager creates the NVSwitch control node and
 that the UVM nodes can materialize during the first successful driver health
-query. Consumers must run their driver health query before taking the
-authoritative device-node snapshot.
+query. Host preflight and nspawn configuration generation must materialize and
+validate these lazy nodes before taking the authoritative device-node snapshot;
+otherwise a reboot can leave the physical host CUDA-ready while omitting UVM
+from the nspawn device bindings.
 
 The image contains a GPT disk with an EFI partition, signed Ubuntu ARM64
 shim/GRUB binaries, and an ext4 root with at least 5 GiB additional space.
