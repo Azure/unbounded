@@ -274,35 +274,35 @@ mod tests {
         let eligible = vec![nic("a", 1), nic("b", 2), nic("c", 3)];
         // Budget funds two of three eligible rails: an unchanged refresh keeps links.
         let funded = vec![nic("a", 1), nic("b", 2)];
-        assert!(rails_compatible(eligible.clone(), &funded, 4 * BUFFER_LEN));
+        assert!(rails_compatible(eligible.clone(), &funded, 2 * BUFFER_LEN));
         // Full budget: all three rails must be active.
         assert!(rails_compatible(
             eligible.clone(),
             &eligible,
-            6 * BUFFER_LEN
+            3 * BUFFER_LEN
         ));
-        assert!(!rails_compatible(eligible.clone(), &funded, 6 * BUFFER_LEN));
+        assert!(!rails_compatible(eligible.clone(), &funded, 3 * BUFFER_LEN));
         // A real change in a funded rail re-activates.
         let mut moved = eligible.clone();
         moved[1].device = "z".into();
-        assert!(!rails_compatible(moved, &funded, 4 * BUFFER_LEN));
+        assert!(!rails_compatible(moved, &funded, 2 * BUFFER_LEN));
         let mut regid = eligible.clone();
         regid[0].gid = Some([2; 16]);
-        assert!(!rails_compatible(regid, &funded, 4 * BUFFER_LEN));
+        assert!(!rails_compatible(regid, &funded, 2 * BUFFER_LEN));
         // A rail removed from the snapshot re-activates.
         assert!(!rails_compatible(
             vec![nic("a", 1)],
             &funded,
-            4 * BUFFER_LEN
+            2 * BUFFER_LEN
         ));
         // Budget shrinking below the active set re-activates.
-        assert!(!rails_compatible(eligible.clone(), &funded, 2 * BUFFER_LEN));
-        // Budget funding nothing never matches active rails.
         assert!(!rails_compatible(eligible.clone(), &funded, BUFFER_LEN));
+        // Budget funding nothing never matches active rails.
+        assert!(!rails_compatible(eligible.clone(), &funded, BUFFER_LEN - 1));
         // Changes past the funded prefix do not tear down links.
         let mut tail = eligible;
         tail[2].device = "y".into();
-        assert!(rails_compatible(tail, &funded, 4 * BUFFER_LEN));
+        assert!(rails_compatible(tail, &funded, 2 * BUFFER_LEN));
     }
     use crate::admission::ResourceClass;
     use crate::security;
@@ -956,10 +956,10 @@ mod tests {
     }
 
     #[test]
-    fn native_preparation_funds_two_buffers_or_falls_back_to_http() {
+    fn native_preparation_funds_one_buffer_or_falls_back_to_http() {
         let mut limits = default_config(true).limits;
         let buffer = crate::rdma::BUFFER_LEN;
-        for (budget, funded) in [(buffer, false), (2 * buffer - 1, false), (2 * buffer, true)] {
+        for (budget, funded) in [(buffer - 1, false), (buffer, true), (2 * buffer, true)] {
             limits.registered_bytes = NonZeroUsize::new(budget).unwrap();
             let native = NativeNode::default();
             native

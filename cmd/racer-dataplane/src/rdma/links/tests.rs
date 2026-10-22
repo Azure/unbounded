@@ -311,7 +311,7 @@ fn grant_and_completion_values_round_trip_and_reject_malformed() {
 }
 
 #[test]
-fn activation_without_one_buffer_settles_inactive() {
+fn activation_without_a_buffer_settles_inactive() {
     let sim = Simulation::new();
     let clock = SimulationClock::new(7);
     let environment = clock.environment(1);
