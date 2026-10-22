@@ -29,6 +29,16 @@ notices:
     license:
       - name: MIT License
         link: https://github.com/TanStack/table/blob/HEAD/LICENSE
+  - dependency: aes
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2018-2024 The RustCrypto Project Developers
+      - Copyright (c) 2018 Artyom Pavlov
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/aes/0.9.3/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/aes/0.9.3/source/LICENSE-MIT
   - dependency: base64
     ecosystem: cargo
     copyright:
@@ -858,6 +868,21 @@ notices:
         link: https://docs.rs/crate/regex/1.13.1/source/LICENSE-APACHE
       - name: MIT License
         link: https://docs.rs/crate/regex/1.13.1/source/LICENSE-MIT
+  - dependency: ring
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2009 The Go Authors. All rights reserved.
+      - Copyright 2015 The Chromium Authors. All rights reserved.
+      - Copyright 2015-2025 Brian Smith.
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/ring/0.17.14/source/LICENSE-BoringSSL
+      - name: BSD 3-Clause License
+        link: https://docs.rs/crate/ring/0.17.14/source/LICENSE-BoringSSL
+      - name: ISC License
+        link: https://docs.rs/crate/ring/0.17.14/source/LICENSE-other-bits
+      - name: MIT License
+        link: https://docs.rs/crate/ring/0.17.14/source/src/polyfill/once_cell/LICENSE-MIT
   - dependency: rustls
     ecosystem: cargo
     copyright:
@@ -942,15 +967,6 @@ notices:
         link: https://docs.rs/crate/x509-parser/0.16.0/source/LICENSE-APACHE
       - name: MIT License
         link: https://docs.rs/crate/x509-parser/0.16.0/source/LICENSE-MIT
-  - dependency: xaes-256-gcm
-    ecosystem: cargo
-    copyright:
-      - Copyright (c) 2024-2026 The RustCrypto Project Developers
-    license:
-      - name: Apache License, Version 2.0
-        link: https://docs.rs/crate/xaes-256-gcm/0.1.0/source/LICENSE-APACHE
-      - name: MIT License
-        link: https://docs.rs/crate/xaes-256-gcm/0.1.0/source/LICENSE-MIT
   - dependency: zeroize
     ecosystem: cargo
     copyright:

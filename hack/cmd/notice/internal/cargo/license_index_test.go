@@ -191,3 +191,92 @@ func TestCollectorDevelopmentPathsRequireDeclaredMembers(t *testing.T) {
 		}
 	}
 }
+
+// Exact LICENSE text from ring 0.17.14, independent of the recognizer.
+const ringIndexFixture = `*ring* uses an "ISC" license, like BoringSSL used to use, for new code
+files. See LICENSE-other-bits for the text of that license.
+
+See LICENSE-BoringSSL for code that was sourced from BoringSSL under the
+Apache 2.0 license. Some code that was sourced from BoringSSL under the ISC
+license. In each case, the license info is at the top of the file.
+
+See src/polyfill/once_cell/LICENSE-APACHE and src/polyfill/once_cell/LICENSE-MIT
+for the license to code that was sourced from the once_cell project.
+`
+
+func ringFiles() map[string]string {
+	return map[string]string{
+		"LICENSE":                               ringIndexFixture,
+		"LICENSE-other-bits":                    iscFixture,
+		"LICENSE-BoringSSL":                     testutil.Apache2License(),
+		"src/polyfill/once_cell/LICENSE-APACHE": testutil.Apache2License(),
+		"src/polyfill/once_cell/LICENSE-MIT":    testutil.MITLicense("Copyright (c) 2026 Once Cell Owner"),
+	}
+}
+
+func writeRing(t *testing.T, home string, files map[string]string) {
+	t.Helper()
+
+	for name, text := range files {
+		testutil.WriteTree(t, home, map[string]string{"registry/src/index/foo-1.2.3/" + name: text})
+	}
+}
+
+func TestCollectorRingLicenseIndex(t *testing.T) {
+	root := workspaceFixture(t)
+	home := t.TempDir()
+	writeRing(t, home, ringFiles())
+
+	entries, err := New(home).Collect(root)
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+
+	entry := entries[0]
+
+	names := map[string]string{}
+	for _, item := range entry.License {
+		names[item.Name] = item.Link
+	}
+
+	for _, want := range []string{"ISC License", "Apache License, Version 2.0", "MIT License"} {
+		if _, ok := names[want]; !ok {
+			t.Fatalf("licenses = %v, want %s", entry.License, want)
+		}
+	}
+
+	if !strings.HasSuffix(names["MIT License"], "/source/src/polyfill/once_cell/LICENSE-MIT") {
+		t.Fatalf("MIT link = %q, want nested companion path", names["MIT License"])
+	}
+
+	for _, want := range []string{"Copyright (c) 2026 Example ISC Owner", "Copyright (c) 2026 Once Cell Owner"} {
+		if !slices.Contains(entry.Copyright, want) {
+			t.Fatalf("copyright = %v, want %q", entry.Copyright, want)
+		}
+	}
+}
+
+func TestCollectorRingLicenseIndexRejects(t *testing.T) {
+	for _, tc := range []struct{ name, index, missing string }{
+		{name: "appended restriction", index: ringIndexFixture + "Commercial use is forbidden.\n"},
+		{name: "prepended restriction", index: "Commercial use is forbidden.\n" + ringIndexFixture},
+		{name: "modified text", index: strings.Replace(ringIndexFixture, "ISC", "custom", 1)},
+		{name: "missing other-bits", index: ringIndexFixture, missing: "LICENSE-other-bits"},
+		{name: "missing BoringSSL", index: ringIndexFixture, missing: "LICENSE-BoringSSL"},
+		{name: "missing once_cell Apache", index: ringIndexFixture, missing: "src/polyfill/once_cell/LICENSE-APACHE"},
+		{name: "missing once_cell MIT", index: ringIndexFixture, missing: "src/polyfill/once_cell/LICENSE-MIT"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := workspaceFixture(t)
+			home := t.TempDir()
+			files := ringFiles()
+			files["LICENSE"] = tc.index
+			delete(files, tc.missing)
+			writeRing(t, home, files)
+
+			if _, err := New(home).Collect(root); err == nil || !strings.Contains(err.Error(), "classifying") {
+				t.Fatalf("Collect error = %v, want classification failure", err)
+			}
+		})
+	}
+}
