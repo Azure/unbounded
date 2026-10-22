@@ -163,6 +163,9 @@ spec:
                   configMapName:
                     type: string
                   digest:
+                    description: Digest is the algorithm-qualified SHA-256 digest
+                      of the selected script bytes.
+                    pattern: ^sha256:[0-9a-f]{64}$
                     type: string
                   key:
                     type: string
@@ -743,6 +746,9 @@ spec:
               evidence:
                 properties:
                   digest:
+                    description: Digest is the algorithm-qualified SHA-256 digest
+                      of the evidence bytes.
+                    pattern: ^sha256:[0-9a-f]{64}$
                     type: string
                   uri:
                     type: string

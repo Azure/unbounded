@@ -503,6 +503,44 @@ func TestValidateConfigRequiresDigestAndMPIQueue(t *testing.T) {
 	}
 }
 
+func TestValidateConfigAcceptsControllerScriptDigest(t *testing.T) {
+	t.Parallel()
+
+	config := testConfig()
+	config.ScriptDigest = "sha256:3c11c8ff7b1182a1215a3ee4a0512901116c45646669b08a46710795120601a8"
+
+	if _, _, _, err := ValidateConfig(config); err != nil {
+		t.Fatalf("ValidateConfig rejected controller script digest: %v", err)
+	}
+}
+
+func TestValidateConfigRejectsMalformedScriptDigest(t *testing.T) {
+	t.Parallel()
+
+	valid := "sha256:" + strings.Repeat("b", 64)
+	for name, digest := range map[string]string{
+		"bare hex":         strings.Repeat("b", 64),
+		"uppercase hex":    "sha256:" + strings.Repeat("B", 64),
+		"wrong algorithm":  "sha512:" + strings.Repeat("b", 64),
+		"short":            "sha256:" + strings.Repeat("b", 63),
+		"long":             "sha256:" + strings.Repeat("b", 65),
+		"leading space":    " " + valid,
+		"trailing newline": valid + "\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			config := testConfig()
+			config.ScriptDigest = digest
+
+			if _, _, _, err := ValidateConfig(config); err == nil ||
+				!strings.Contains(err.Error(), "algorithm-qualified SHA-256 digest") {
+				t.Fatalf("ValidateConfig script digest error = %v", err)
+			}
+		})
+	}
+}
+
 func TestValidateConfigRejectsReservedEnvironment(t *testing.T) {
 	t.Parallel()
 
@@ -705,7 +743,7 @@ func testConfig() Config {
 		LegacyParticipants:    "node-a,node-b",
 		ScriptConfigMap:       "run-example-scripts",
 		ScriptKey:             "check.sh",
-		ScriptDigest:          strings.Repeat("b", 64),
+		ScriptDigest:          "sha256:" + strings.Repeat("b", 64),
 		RunnerImage:           "example.invalid/runner@sha256:" + strings.Repeat("a", 64),
 		BackendAPIVersion:     "kubeflow.org/v2beta1",
 		BackendKind:           "MPIJob",

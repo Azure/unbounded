@@ -7,8 +7,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"net/url"
 	"strings"
@@ -46,8 +44,7 @@ func (s *KubernetesEvidenceStore) Put(ctx context.Context, path string, data []b
 		return "", "", fmt.Errorf("evidence path is required")
 	}
 
-	sum := sha256.Sum256(data)
-	digest := "sha256:" + hex.EncodeToString(sum[:])
+	digest := digestBytes(data)
 
 	compressed, err := compressEvidence(data)
 	if err != nil {

@@ -41,7 +41,7 @@ func TestNodeProjectionTransitionsAndRetainsTerminalSummary(t *testing.T) {
 	run.Status.ExecutionState = "Completed"
 	run.Status.Verdict = "Pass"
 	run.Status.Reason = "Healthy"
-	run.Status.Evidence.Digest = "sha256:evidence"
+	run.Status.Evidence.Digest = "sha256:" + strings.Repeat("e", 64)
 	run.Status.FinishedAt = ptrTime(metav1.NewTime(time.Date(2026, 10, 11, 5, 0, 0, 0, time.UTC)))
 
 	if err := projectTerminal(context.Background(), kube, run); err != nil {
@@ -102,7 +102,7 @@ func TestNodeProjectionDoesNotRegressAfterRestartOrOlderRetry(t *testing.T) {
 	newer := testRun("newer")
 	newer.Status.Phase = signalv1.RunPhaseSucceeded
 	newer.Status.FinishedAt = ptrTime(metav1.NewTime(time.Date(2026, 10, 11, 6, 0, 0, 0, time.UTC)))
-	newer.Status.Evidence.Digest = "sha256:newer"
+	newer.Status.Evidence.Digest = "sha256:" + strings.Repeat("a", 64)
 
 	if err := projectTerminal(context.Background(), kube, newer); err != nil {
 		t.Fatal(err)
@@ -111,7 +111,7 @@ func TestNodeProjectionDoesNotRegressAfterRestartOrOlderRetry(t *testing.T) {
 	older := testRun("older")
 	older.Status.Phase = signalv1.RunPhaseFailed
 	older.Status.FinishedAt = ptrTime(metav1.NewTime(time.Date(2026, 10, 11, 5, 0, 0, 0, time.UTC)))
-	older.Status.Evidence.Digest = "sha256:older"
+	older.Status.Evidence.Digest = "sha256:" + strings.Repeat("b", 64)
 
 	if err := projectTerminal(context.Background(), kube, older); err != nil {
 		t.Fatal(err)
@@ -124,7 +124,7 @@ func TestNodeProjectionDoesNotRegressAfterRestartOrOlderRetry(t *testing.T) {
 
 	if got.Labels[StateLabel] != "passed" ||
 		got.Annotations[LastRunAnnotation] != newer.Name ||
-		got.Annotations[EvidenceDigestAnnotation] != "sha256:newer" {
+		got.Annotations[EvidenceDigestAnnotation] != "sha256:"+strings.Repeat("a", 64) {
 		t.Fatalf("projection regressed: labels=%v annotations=%v", got.Labels, got.Annotations)
 	}
 }

@@ -33,10 +33,7 @@ const (
 	resultPrefix          = "PROJECT_SIGNAL_RESULT_V1 "
 )
 
-var (
-	runnerImagePattern  = regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)
-	scriptDigestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
-)
+var runnerImagePattern = regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)
 
 var reservedEnvironmentNames = map[string]struct{}{
 	"BASH_ENV":        {},
@@ -223,8 +220,10 @@ func ValidateConfig(config Config) ([]signalv1.Participant, []corev1.Toleration,
 		return nil, nil, nil, errors.New("runner-image must be an immutable sha256 digest reference")
 	}
 
-	if !scriptDigestPattern.MatchString(config.ScriptDigest) {
-		return nil, nil, nil, errors.New("script-digest must contain 64 lowercase hexadecimal characters")
+	if !signalv1.IsSHA256Digest(config.ScriptDigest) {
+		return nil, nil, nil, errors.New(
+			"script-digest must be an algorithm-qualified SHA-256 digest (sha256:<64 lowercase hexadecimal characters>)",
+		)
 	}
 
 	switch {

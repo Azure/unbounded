@@ -58,7 +58,9 @@ type PinnedProfile struct {
 type ScriptSnapshot struct {
 	ConfigMapName string `json:"configMapName"`
 	Key           string `json:"key"`
-	Digest        string `json:"digest"`
+	// Digest is the algorithm-qualified SHA-256 digest of the selected script bytes.
+	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
+	Digest string `json:"digest"`
 }
 
 // +kubebuilder:validation:XValidation:rule="self.profile == oldSelf.profile",message="profile is immutable"
@@ -109,7 +111,9 @@ type WorkflowStatus struct {
 }
 
 type EvidenceStatus struct {
-	URI    string `json:"uri,omitempty"`
+	URI string `json:"uri,omitempty"`
+	// Digest is the algorithm-qualified SHA-256 digest of the evidence bytes.
+	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
 	Digest string `json:"digest,omitempty"`
 }
 

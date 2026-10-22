@@ -83,6 +83,20 @@ func TestAdapterManifestIsGenericAndParticipantAware(t *testing.T) {
 	}
 }
 
+func TestCertificationRunCRDRequiresCanonicalDigests(t *testing.T) {
+	t.Parallel()
+
+	content, err := os.ReadFile("crd/signal.unbounded-cloud.io_certificationruns.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const digestPattern = "pattern: ^sha256:[0-9a-f]{64}$"
+	if count := strings.Count(string(content), digestPattern); count != 2 {
+		t.Fatalf("canonical digest patterns = %d, want 2", count)
+	}
+}
+
 func TestUpstreamDoesNotPublishCertificationPackage(t *testing.T) {
 	t.Parallel()
 
