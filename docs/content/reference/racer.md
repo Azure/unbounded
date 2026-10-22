@@ -202,6 +202,8 @@ Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
 | `RACER_CRYPTO_HELPERS` | Unset (automatic) | Exact helper count, from 1 through the exact I/O count; requires `RACER_IO_WORKERS` |
 | `RACER_ALLOW_SMT` | `false` | Use eligible physical cores by default; `true` opts into logical CPUs |
 | `RACER_ENABLE_RDMA` | `auto` | `auto`, `true`, or `false`; see [modes](#rdma) |
+| `RACER_ENABLE_GPU` | `auto` | `auto`, `true`, or `false`; see [GPU reads](#gpu-reads) |
+| `RACER_GPU_STAGING_BYTES` | Unset (dataplane default) | Cap on ciphertext staging memory per GPU, in bytes |
 | `RACER_SHARES` | `4` | Enrollment proposal; explicit Node `shares` wins |
 | `RACER_PLAINTEXT_BYTES` / `RACER_CIPHERTEXT_BYTES` | Unset: `67108864` (64 MiB) / `134217728` (128 MiB) per final I/O worker | Independent plaintext/ciphertext admission budgets; an explicit value is node-wide and divided among I/O workers |
 | `RACER_DIRTY_BYTES` | Unset: `167772160` (160 MiB) per final I/O worker | Dirty-data budget; an explicit value is node-wide |
@@ -677,6 +679,7 @@ also require matching Services, probes, network policy, and monitoring configura
 | `RACER_PEER_PORT` | `8082` | Managed dataplane peer listener and membership publication; 1024..65535 |
 | `RACER_DIAGNOSTICS_PORT` | Unset | Managed dataplane defaults to 9090, or 9091 if peer port is 9090; explicit port must be 1024..65535 and distinct |
 | `RACER_HOST_NETWORK` | `false` | Explicit Racer host-network opt-in; not implied by RDMA |
+| `RACER_DATAPLANE_NVIDIA` | `env` | NVIDIA driver library injection for the dataplane: `off`, `env`, or `cdi`; see [GPU reads](#gpu-reads) |
 | `RACER_POD_NETWORK_NODES` | Unset | Not supported by operator-managed installations; the controller only enrolls Pods of DaemonSet `racer-dataplane`, so a nonempty value fails reconciliation |
 | `RACER_SNAPSHOT_MAX_AGE` | `30s` | Maximum replicated snapshot age |
 | `RACER_CERTIFICATE_LIFETIME` | `24h` | Dataplane leaf lifetime; 2 minutes..24 hours |
@@ -932,6 +935,62 @@ for server limits, partial failures, and restart behavior.
 
 For tests, `github.com/Azure/unbounded/pkg/racersdk/racersdktest` runs a
 noncaching fake Racer. It does not test distributed or RDMA behavior.
+
+## Client socket mount
+
+Pods that talk to the dataplane socket directly, such as the Python client,
+opt in with a label. The admission webhook then mounts the cache's client
+directory read-only and tells the app where the socket is.
+
+| Key | Meaning |
+|-----|---------|
+| Label `racer.unbounded-cloud.io/client-socket: enabled` | Turns on the mount |
+| Annotation `racer.unbounded-cloud.io/client-cache` | ClusterCache name. Required |
+| Annotation `racer.unbounded-cloud.io/client-containers` | Optional comma-separated app container names. Default: every app container. Init containers are never changed |
+| Annotation `racer.unbounded-cloud.io/client-socket-injected` | Set by the webhook to the cache name; do not edit |
+
+Each selected container gets:
+
+- `/run/racer/<cache>/client` mounted read-only at the same path. A read-only
+  mount still allows `connect` and `sendmsg` on the socket.
+- `RACER_SOCKET=/run/racer/<cache>/client/socket`.
+
+The pod is placed on Linux nodes without the `exclude` label, like sidecar pods.
+The hostPath type is `Directory`, so the pod waits until the dataplane has
+created the cache directory. Host networking is allowed.
+
+This label works alone or with `object-sidecar`. When both name the same cache,
+the pod gets one shared volume. The webhook rejects the pod when the cache name
+is missing or invalid, when a listed container does not exist, or when a
+container already sets `RACER_SOCKET` or mounts that path.
+
+## GPU reads
+
+GPU reads let a client on the node read an object straight into its own NVIDIA
+GPU memory. They need:
+
+- A dataplane image built with `--build-arg RACER_NATIVE_CUDA=true`.
+- An NVIDIA node set up by the unbounded agent, which installs the NVIDIA
+  container runtime and a CDI spec.
+- `RACER_ENABLE_GPU` in `racer-dataplane-config`. `auto` turns GPU mode off
+  when no usable GPU is found. `true` makes startup fail instead. `false`
+  turns it off.
+
+The dataplane does not request `nvidia.com/gpu`. It is privileged, so it
+already sees `/dev/nvidia*`. It only needs the host driver libraries.
+`RACER_DATAPLANE_NVIDIA` in `racer-config` controls how it asks for them:
+
+| `RACER_DATAPLANE_NVIDIA` | Behavior |
+|--------------------------|----------|
+| `env` (default) | Sets `NVIDIA_VISIBLE_DEVICES=all` and `NVIDIA_DRIVER_CAPABILITIES=compute,utility` on the dataplane container. The NVIDIA runtime injects the libraries. Other runtimes ignore these variables, so nodes without NVIDIA are not affected |
+| `cdi` | Also adds the Pod annotation `cdi.k8s.io/racer-dataplane: nvidia.com/gpu=all`. containerd fails to create the container on any node that cannot resolve this CDI device, so use it only when every dataplane node has an NVIDIA CDI spec |
+| `off` | Adds nothing |
+
+On nodes set up by the unbounded agent, the NVIDIA runtime is the default
+containerd runtime and runs in CDI mode, so `env` is enough there. These env
+entries are operator wiring: workload overrides cannot change them.
+
+See [Load vLLM models from Racer]({{< relref "guides/racer-vllm" >}}).
 
 ## RDMA
 
