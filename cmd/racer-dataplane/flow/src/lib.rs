@@ -139,6 +139,13 @@ pub trait Policy: 'static {
         1
     }
 
+    /// Whether `weight` shapes this class's keyed share. Unweighted classes
+    /// split equally across active keys regardless of key weight, so
+    /// request-serving resources stay independent of retention priority.
+    fn weighted(_class: Self::Class) -> bool {
+        true
+    }
+
     /// Bound the number of retained key records.
     fn max_keys(&self) -> usize;
 
@@ -948,9 +955,12 @@ impl<P: Policy> Quotas<P> {
         include: bool,
     ) -> usize {
         let limit = self.limit(class);
-        share(limit, active, weight, total, include)
-            .max(self.policy.floor(class))
-            .min(limit)
+        let fair = if P::weighted(class) {
+            share(limit, active, weight, total, include)
+        } else {
+            limit / active.max(1)
+        };
+        fair.max(self.policy.floor(class)).min(limit)
     }
 
     /// Retry overload once after reclaiming relevant retained backing.
@@ -2146,6 +2156,11 @@ mod quota_tests {
             self.weights.lock().unwrap().get(key).copied().unwrap_or(1)
         }
 
+        /// Progress stays an equal split regardless of key weight.
+        fn weighted(class: Resource) -> bool {
+            !matches!(class, Resource::Progress)
+        }
+
         /// Return the fixture's key-record bound.
         fn max_keys(&self) -> usize {
             self.max_keys
@@ -2206,6 +2221,23 @@ mod quota_tests {
         // A new key's prospective limit includes its own weight.
         assert_eq!(quotas.fair_limit(&"c".into(), Resource::Other), 1);
         drop((a, b, more));
+    }
+
+    /// Unweighted classes split equally even when a key has weight 0.
+    #[test]
+    fn unweighted_classes_ignore_key_weight() {
+        let (quotas, _) = weighted(1000, &[("a", 1), ("z", 0)]);
+        let _a = quotas
+            .reserve(Some(&"a".into()), Resource::Progress, 500)
+            .unwrap();
+        assert_eq!(quotas.fair_limit(&"z".into(), Resource::Progress), 500);
+        let _z = quotas
+            .reserve(Some(&"z".into()), Resource::Progress, 500)
+            .unwrap();
+        assert_eq!(quotas.fair_limit(&"a".into(), Resource::Progress), 500);
+        // The weighted class still follows key weight.
+        assert_eq!(quotas.fair_limit(&"z".into(), Resource::Other), 1);
+        assert_eq!(quotas.fair_limit(&"a".into(), Resource::Other), 1000);
     }
 
     /// Weight 0 keeps only the floor; all-zero weights share equally.

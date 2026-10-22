@@ -62,7 +62,10 @@ spec:
 
 Each cache's fair share of a resource is `capacity * priority / sum of all
 priorities`. If every cache has priority 0, shares are equal. Shares apply to
-disk, the pending write queue, and memory flow control. Each I/O worker computes
+disk, the pending write queue, and page cache memory (plaintext and
+ciphertext). Request-serving resources such as request context, connections,
+and in-flight fetches are split equally between active caches regardless of
+priority, so a priority 0 cache can still serve requests. Each I/O worker computes
 shares on its own; pages are spread across workers by hash, so this is close to
 a node-wide share.
 

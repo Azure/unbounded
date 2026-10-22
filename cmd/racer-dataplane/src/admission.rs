@@ -166,6 +166,55 @@ mod observer_tests {
         assert_eq!(quotas.fair_limit(&b, class), floor);
         assert_eq!(quotas.fair_limit(&a, class), limit);
     }
+
+    #[test]
+    fn zero_priority_cache_can_reserve_request_context_beside_active_cache() {
+        let quotas = Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let a = CacheId("a".into());
+        let z = CacheId("z".into());
+        let definition = |id: &CacheId, priority| racer_control_wire::CacheDefinition {
+            id: id.clone(),
+            name: id.0.clone(),
+            client_socket: "/c".into(),
+            origin_socket: "/o".into(),
+            priority,
+        };
+        quotas
+            .policy()
+            .weights()
+            .update(&[definition(&a, 1000), definition(&z, 0)]);
+        quotas.reweigh();
+        let context = racer_object_wire::client::MAX_HEAD_BYTES;
+        let _active = quotas
+            .reserve(Some(&a), ResourceClass::RequestContext, context)
+            .unwrap();
+        let _page = quotas
+            .reserve(Some(&a), ResourceClass::Plaintext, PAGE_BYTES as usize)
+            .unwrap();
+        // The listener reserves a full head of context before reading a request.
+        let _zero = quotas
+            .reserve(Some(&z), ResourceClass::RequestContext, context)
+            .unwrap();
+        let limit = quotas.limit(ResourceClass::RequestContext);
+        assert_eq!(
+            quotas.fair_limit(&z, ResourceClass::RequestContext),
+            quotas.fair_limit(&a, ResourceClass::RequestContext)
+        );
+        assert_eq!(
+            quotas.fair_limit(&z, ResourceClass::RequestContext),
+            (limit / 2).max(1)
+        );
+        // Priority-0 page memory keeps its floor so the request can progress.
+        let _zero_page = quotas
+            .reserve(Some(&z), ResourceClass::Plaintext, PAGE_BYTES as usize)
+            .unwrap();
+        assert_eq!(
+            quotas.fair_limit(&z, ResourceClass::Plaintext),
+            quotas.policy().floor(ResourceClass::Plaintext)
+        );
+    }
 }
 
 /// Translate exact synchronous operation facts into final Racer diagnostics.
@@ -242,6 +291,14 @@ impl Policy for AdmissionPolicy {
     /// A cache's keyed fair share follows its published priority.
     fn weight(&self, key: &CacheId) -> u64 {
         self.weights.weight(key)
+    }
+    /// Priority shares only cached page memory. Request-serving classes keep
+    /// an equal split so a priority-0 cache can still serve requests.
+    fn weighted(class: ResourceClass) -> bool {
+        matches!(
+            class,
+            ResourceClass::Plaintext | ResourceClass::Ciphertext | ResourceClass::DirtyCiphertext
+        )
     }
     fn floor(&self, class: ResourceClass) -> usize {
         match class {

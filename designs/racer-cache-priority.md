@@ -116,6 +116,13 @@ cache_limit = clamp(limit * w / W, floor, limit)
 Priority 0 keeps only the floor allowance, so the cache can still make
 progress.
 
+Only page cache memory classes (plaintext, ciphertext, and dirty ciphertext)
+are weighted. Request-serving classes (request context, registered buffers,
+flights, waiters, connections, pipes, control progress, and relays) keep the
+equal split across active caches. Priority describes retention, not request
+service, and a priority 0 cache must still be able to reserve the full request
+context needed to read a request while a higher-priority cache is busy.
+
 ### Disk admission
 
 Optional (non-owned) pages are rejected when their cache is over share and the
