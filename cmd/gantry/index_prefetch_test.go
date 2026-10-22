@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
@@ -46,10 +47,19 @@ func (s prefetchProviderStub) FindProviders(context.Context, digest.Digest) ([]i
 	return out, nil
 }
 
-type prefetchOriginStub struct{ calls int }
+type prefetchOriginStub struct {
+	calls      atomic.Int64
+	beforePull func(context.Context, ifaces.OriginRef) error
+}
 
-func (s *prefetchOriginStub) Pull(_ context.Context, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
-	s.calls++
+func (s *prefetchOriginStub) Pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
+	s.calls.Add(1)
+
+	if s.beforePull != nil {
+		if err := s.beforePull(ctx, ref); err != nil {
+			return nil, 0, err
+		}
+	}
 
 	return io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("o"), 1<<20))), 1 << 20, nil
 }
@@ -129,10 +139,10 @@ func TestIndexPrefetchPrefersPeerAndSkipsOrigin(t *testing.T) {
 	})
 
 	d := prefetchDigest(t, "layer")
-	p.Prefetch(context.Background(), "reg", "repo", []manifest.TypedChild{{Digest: d, Kind: ifaces.KindBlob, Size: size}})
+	p.Prefetch(context.Background(), "reg", "repo", prefetchDigest(t, "manifest"), []manifest.TypedChild{{Digest: d, Kind: ifaces.KindBlob, Size: size}})
 
-	if origin.calls != 0 {
-		t.Errorf("origin.calls = %d, want 0 when a peer has the range", origin.calls)
+	if origin.calls.Load() != 0 {
+		t.Errorf("origin.calls = %d, want 0 when a peer has the range", origin.calls.Load())
 	}
 
 	head, _ := httprange.New(0, (64<<10)-1)
@@ -166,9 +176,9 @@ func TestIndexPrefetchFallsBackToOriginWhenNoPeerHasIt(t *testing.T) {
 	})
 
 	d := prefetchDigest(t, "cold")
-	p.Prefetch(context.Background(), "reg", "repo", []manifest.TypedChild{{Digest: d, Kind: ifaces.KindBlob, Size: 1 << 20}})
+	p.Prefetch(context.Background(), "reg", "repo", prefetchDigest(t, "manifest"), []manifest.TypedChild{{Digest: d, Kind: ifaces.KindBlob, Size: 1 << 20}})
 
-	if origin.calls == 0 {
+	if origin.calls.Load() == 0 {
 		t.Error("origin was never used even though no peer had the layer")
 	}
 

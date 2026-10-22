@@ -230,6 +230,13 @@ on demand with bounded, coalesced range reads. Compression dictionaries,
 compressed indexes, and other compression algorithms are rejected explicitly.
 The adapter does not download or decompress the entire layer to mount it.
 
+Gantry prefetches mount-critical head and tail regions when an ACR streaming
+manifest is served or committed by a background peer pull. Overlapping callbacks
+for the same registry, repository, and manifest share one bounded prefetch job.
+This also warms metadata when containerd reuses an already-cached manifest
+without requesting its body again. Prefetch completion logs report the manifest,
+duration, and number of cached regions; incomplete warmups are reported separately.
+
 AKS initially selects the `overlaybd` snapshotter on these nodes. Gantry keeps
 that native plugin registered, adds a distinct `gantry-overlaybd` proxy, and
 switches CRI image unpacking to the new proxy. The adapter uses a private

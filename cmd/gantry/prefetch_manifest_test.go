@@ -237,8 +237,8 @@ func TestLayerPrefetchAdapterDoesNotWarmIndexesForRegularManifest(t *testing.T) 
 
 	adapter.OnManifestServed(t.Context(), "registry.example.com", "team/app", testDigest(t, "e"))
 
-	if origin.calls != 0 {
-		t.Fatalf("regular manifest index origin calls = %d, want 0", origin.calls)
+	if origin.calls.Load() != 0 {
+		t.Fatalf("regular manifest index origin calls = %d, want 0", origin.calls.Load())
 	}
 
 	if len(resolver.children) == 0 {

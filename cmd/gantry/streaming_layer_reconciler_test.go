@@ -15,6 +15,8 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
+	"github.com/Azure/unbounded/internal/gantry/manifest"
+	"github.com/Azure/unbounded/internal/gantry/rangecache"
 )
 
 type streamingReconcileResolverStub struct {
@@ -181,6 +183,77 @@ func TestLayerPrefetchAdapterRoutesOnlyOverlayBDManifestToReconciler(t *testing.
 
 	if len(regularResolver.children) != 2 {
 		t.Fatalf("regular resolver children = %d, want existing config+layer path", len(regularResolver.children))
+	}
+}
+
+func TestPumpedManifestWarmsMountMetadataWithoutManifestGET(t *testing.T) {
+	body, err := os.ReadFile("testdata/acr-streaming-manifest.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	children, err := manifest.TypedChildren(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cache, err := rangecache.New(t.TempDir()+"/ranges", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = cache.Close() })
+
+	cached := make(chan digest.Digest, 2*len(children))
+	indexes := newIndexPrefetcher(indexPrefetchOptions{
+		Cache:      cache,
+		Origin:     &prefetchOriginStub{},
+		HeadBytes:  16,
+		TailBytes:  16,
+		MarkCached: func(d digest.Digest) { cached <- d },
+	})
+	store := fakes.NewCache()
+	resolver := &streamingReconcileResolverStub{store: store, completeAfter: 1}
+	reconciler := newStreamingLayerReconciler(streamingLayerReconcilerOptions{
+		Resolver: resolver,
+		Store:    store,
+		Interval: time.Millisecond,
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(func() {
+		cancel()
+		waitStreamingReconciler(t, reconciler)
+	})
+
+	adapter := &layerPrefetchAdapter{
+		cache:               &delayedManifestStore{body: string(body), ready: true},
+		indexes:             indexes,
+		streamingReconciler: reconciler,
+		logger:              slog.Default(),
+	}
+	adapter.OnStreamingManifestCommitted(ctx, "app.azurecr.io", "team/app", testDigest(t, "a"))
+
+	required := 0
+	for _, child := range children {
+		required += len(indexes.regions(child.Size))
+	}
+
+	deadline := time.After(2 * time.Second)
+
+	for range required {
+		select {
+		case <-cached:
+		case <-deadline:
+			t.Fatal("background-committed manifest did not warm mount metadata without a manifest GET")
+		}
+	}
+
+	for _, child := range children {
+		for _, region := range indexes.regions(child.Size) {
+			if !cache.Has(child.Digest, region) {
+				t.Fatalf("mount metadata missing for %s range %s", child.Digest, region.HeaderValue())
+			}
+		}
 	}
 }
 

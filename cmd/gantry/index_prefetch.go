@@ -23,13 +23,8 @@ type rangePeerFetcher interface {
 	FetchRangeFromPeer(ctx context.Context, peerAddr string, d digest.Digest, requested httprange.Range) (io.ReadCloser, int64, string, error)
 }
 
-// indexPrefetcher pulls the regions OverlayBD reads at mount time into the
-// range cache before containerd ever asks for them.
-//
-// Measured on a 1.08 GB layer: the only bytes a container needs are the head
-// and the last ~1 MB - about 0.13% of the image. Fetching them on demand makes
-// the first mount attempt fail, and the container then waits out kubelet's
-// CreateContainer backoff, which is what puts a ~130s floor under startup.
+// indexPrefetcher warms mount-critical head and tail regions in parallel so
+// container creation does not have to fetch each layer's metadata sequentially.
 type indexPrefetcher struct {
 	cache      *rangecache.Cache
 	dht        providerLookup
@@ -43,6 +38,15 @@ type indexPrefetcher struct {
 	concurrency int
 	maxJitter   time.Duration
 	budget      time.Duration
+
+	mu     sync.Mutex
+	active map[indexPrefetchKey]struct{}
+}
+
+type indexPrefetchKey struct {
+	registry   string
+	repository string
+	manifest   digest.Digest
 }
 
 type indexPrefetchOptions struct {
@@ -72,6 +76,7 @@ func newIndexPrefetcher(o indexPrefetchOptions) *indexPrefetcher {
 		concurrency: o.Concurrency,
 		maxJitter:   o.MaxJitter,
 		budget:      o.Budget,
+		active:      make(map[indexPrefetchKey]struct{}),
 	}
 
 	if p.logger == nil {
@@ -100,13 +105,27 @@ func newIndexPrefetcher(o indexPrefetchOptions) *indexPrefetcher {
 }
 
 // Prefetch warms the index regions for every sized layer in children.
-func (p *indexPrefetcher) Prefetch(ctx context.Context, registry, repository string, children []manifest.TypedChild) {
+func (p *indexPrefetcher) Prefetch(ctx context.Context, registry, repository string, manifestDigest digest.Digest, children []manifest.TypedChild) {
 	if p == nil || p.cache == nil || len(children) == 0 {
 		return
 	}
 
+	key := indexPrefetchKey{registry: registry, repository: repository, manifest: manifestDigest}
+	if !p.claim(key) {
+		return
+	}
+	defer p.release(key)
+
 	ctx, cancel := context.WithTimeout(ctx, p.budget)
 	defer cancel()
+
+	started := time.Now()
+	logger := p.logger.With(
+		slog.String("manifest", manifestDigest.String()),
+		slog.String("registry", registry),
+		slog.String("repository", repository),
+	)
+	logger.Info("index prefetch started", slog.Int("children", len(children)))
 
 	// Spread the fleet's first wave; 1000 nodes asking origin in the same
 	// instant is what produces 429s.
@@ -114,6 +133,11 @@ func (p *indexPrefetcher) Prefetch(ctx context.Context, registry, repository str
 		select {
 		case <-time.After(time.Duration(rand.Int63n(int64(p.maxJitter)))): //nolint:gosec // jitter, not security
 		case <-ctx.Done():
+			logger.Warn("index prefetch stopped before warmup",
+				slog.Duration("duration", time.Since(started)),
+				slog.Any("err", ctx.Err()),
+			)
+
 			return
 		}
 	}
@@ -144,6 +168,54 @@ func (p *indexPrefetcher) Prefetch(ctx context.Context, registry, repository str
 	}
 
 	wg.Wait()
+
+	required, cached := 0, 0
+
+	for _, child := range children {
+		for _, region := range p.regions(child.Size) {
+			required++
+
+			if p.cache.Has(child.Digest, region) {
+				cached++
+			}
+		}
+	}
+
+	if cached != required {
+		logger.Warn("index prefetch incomplete",
+			slog.Int("cached_regions", cached),
+			slog.Int("required_regions", required),
+			slog.Duration("duration", time.Since(started)),
+			slog.Any("err", ctx.Err()),
+		)
+
+		return
+	}
+
+	logger.Info("index prefetch completed",
+		slog.Int("cached_regions", cached),
+		slog.Duration("duration", time.Since(started)),
+	)
+}
+
+func (p *indexPrefetcher) claim(key indexPrefetchKey) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if _, active := p.active[key]; active {
+		return false
+	}
+
+	p.active[key] = struct{}{}
+
+	return true
+}
+
+func (p *indexPrefetcher) release(key indexPrefetchKey) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	delete(p.active, key)
 }
 
 func (p *indexPrefetcher) warm(ctx context.Context, registry, repository string, c manifest.TypedChild) {

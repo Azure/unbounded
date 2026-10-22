@@ -1772,8 +1772,8 @@ func (p *layerPrefetchAdapter) onManifestServed(baseCtx context.Context, registr
 
 	// Warm the mount-critical regions first. Everything below moves whole
 	// layers, which the container does not wait on.
-	if !streamingOnly && streamingManifest && p.indexes != nil {
-		go p.indexes.Prefetch(baseCtx, registry, repository, children)
+	if streamingManifest && p.indexes != nil {
+		go p.indexes.Prefetch(baseCtx, registry, repository, manifestDigest, children)
 	}
 
 	// Filter out digests already present locally; they don't need
