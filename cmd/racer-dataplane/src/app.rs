@@ -1483,6 +1483,9 @@ impl WorkerApplication {
     fn maintain_pools(&self, now: std::time::Instant) {
         self.runtime.admission.maintain_buffers(now);
         self.store.writer.maintain_staging(now);
+        // Expire idle cache entries first so their buffers reach the pools
+        // before those decay.
+        self.memory.expire_idle(now);
         self.memory.buffers().maintain_idle_buffers(now);
     }
 

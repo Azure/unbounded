@@ -4759,3 +4759,82 @@ fn maintain_pools_releases_idle_aligned_storage() {
     let stats = worker.aligned_pool_stats();
     assert_eq!((stats.entries, stats.bytes), (0, 0));
 }
+
+#[test]
+fn maintain_pools_expires_idle_cache_entries_then_their_aligned_storage() {
+    use crate::admission::ResourceClass;
+    use racer_control_wire as wire;
+    let config = crate::test_support::cluster::config(false);
+    let node = Arc::new(NodeState::default());
+    let (mut worker, _, _) = local_worker(&config, &node, 1);
+    let original = definition();
+    let current_scope = scope(Duration::from_secs(1)).unwrap();
+    worker
+        .snapshots
+        .apply(publication(&config, 1, vec![original.clone()]))
+        .unwrap();
+    worker.refresh_snapshot(&current_scope).unwrap();
+    let (_, _, roots) = crate::test_support::security::issued();
+    worker
+        .keys
+        .install(wire::KeyringBundle {
+            schema_version: wire::SCHEMA_VERSION,
+            cluster: config.cluster.clone(),
+            generation: wire::BundleGeneration(1),
+            peer_trust_roots: roots,
+            cache_keys: vec![wire::CacheEncryptionKey::new(
+                wire::CacheKeyRef {
+                    cache: original.id.clone(),
+                    id: crate::model::key_id_from_generation(1, 7).unwrap(),
+                    purpose: wire::CacheKeyPurpose::Page,
+                },
+                wire::CacheKeyState::Active,
+                zeroize::Zeroizing::new([19; 32]),
+            )],
+        })
+        .unwrap();
+    let mut page = page(&worker);
+    let page_id = page.plaintext.page().clone();
+    // Retain the ciphertext in this worker's aligned pool, as fills do.
+    let buffers = worker.memory.buffers();
+    let length = page.ciphertext.bytes().len();
+    let reservation = worker
+        .runtime
+        .admission
+        .reserve(
+            Some(&original.id),
+            ResourceClass::Ciphertext,
+            buffers.aligned_capacity(length).unwrap(),
+        )
+        .unwrap();
+    let shared = page.ciphertext.clone();
+    page.ciphertext = buffers.rehome_aligned(shared, reservation).unwrap();
+    worker.memory.publish(page).unwrap();
+    assert_eq!(worker.aligned_pool_stats().entries, 0);
+
+    let start = std::time::Instant::now();
+    let second = Duration::from_secs(1);
+    let mut now = start;
+    while now < start + crate::memory::CACHE_IDLE_TTL {
+        worker.maintain_pools(now);
+        now += second;
+    }
+    assert!(worker.memory.get(&page_id).unwrap().is_some());
+    // The hit renews the entry for another full TTL.
+    let renewed = now;
+    while now < renewed + crate::memory::CACHE_IDLE_TTL {
+        worker.maintain_pools(now);
+        assert_eq!(worker.aligned_pool_stats().entries, 0);
+        now += second;
+    }
+    worker.maintain_pools(now);
+    assert!(worker.memory.get(&page_id).unwrap().is_none());
+    // The released buffer is pooled, then decays once nothing reuses it.
+    assert_eq!(worker.aligned_pool_stats().entries, 1);
+    for _ in 0..6 {
+        now += page_alloc::DEFAULT_WINDOW;
+        worker.maintain_pools(now);
+    }
+    let stats = worker.aligned_pool_stats();
+    assert_eq!((stats.entries, stats.bytes), (0, 0));
+}
