@@ -162,8 +162,9 @@ The `Racer Block Device` CI job runs both device suites as root with the race
 detector inside a QEMU guest. The guest boots the Ubuntu 24.04 generic 6.8
 kernel and loads `ublk_drv`, so a kernel bug cannot hang the runner. The job
 fails if QEMU exits nonzero, a suite fails or hangs, a required test does not
-print PASS, or any test other than the manual fio and delete-ID tests skips. The guest sets `RACER_BLOCK_TEST_VM=1`, which enables tests that are
-unsafe on a shared host. Run the same check locally without root:
+print PASS, or any test other than the manual fio and delete-ID tests skips.
+The guest sets `RACER_BLOCK_TEST_VM=1`, which enables tests that are unsafe on
+a shared host. Run the same check locally without root:
 
 ```
 go test -race -c -o bin/racer-block-tests/ublk.test ./internal/racerblock/ublk
