@@ -8,7 +8,9 @@ package ublk
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // newStartupDevice returns a Device in the startup phase whose teardown
@@ -178,4 +180,105 @@ func TestLaunchQueuesJoinsFetchErrors(t *testing.T) {
 	if err := d.launchQueues(); !errors.Is(err, rejected) {
 		t.Fatalf("launchQueues = %v, want %v", err, rejected)
 	}
+}
+
+func TestRunStartupResolvesAfterStart(t *testing.T) {
+	d, _, _ := newStartupDevice(t)
+
+	err := d.runStartup(func() error {
+		if isClosed(d.startDone) {
+			t.Error("startup resolved while start was running")
+		}
+
+		d.fail(errors.New("queue died"))
+
+		return nil
+	})
+	if err == nil {
+		t.Fatal("runStartup lost the recorded error")
+	}
+
+	if !isClosed(d.startDone) {
+		t.Fatal("startup not resolved after start returned")
+	}
+}
+
+func TestHoldUntilSafeReturnsAfterStartup(t *testing.T) {
+	d, _, _ := newStartupDevice(t)
+	close(d.startDone)
+
+	q := &queue{dev: d}
+
+	finished := make(chan struct{})
+
+	go func() {
+		q.holdUntilSafe()
+		close(finished)
+	}()
+
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("holdUntilSafe blocked after startup was resolved")
+	}
+}
+
+func TestWaitStartupOrLive(t *testing.T) {
+	never := func() (bool, error) { return false, nil }
+	noWarn := func(string, ...any) {}
+
+	t.Run("resolved", func(t *testing.T) {
+		done := make(chan struct{})
+
+		go func() {
+			time.Sleep(20 * time.Millisecond)
+			close(done)
+		}()
+
+		if got := waitStartupOrLive(done, never, time.Minute, noWarn); got != "resolved" {
+			t.Fatalf("got %q, want resolved", got)
+		}
+	})
+
+	t.Run("live", func(t *testing.T) {
+		var calls atomic.Int32
+
+		live := func() (bool, error) { return calls.Add(1) >= 3, nil }
+
+		if got := waitStartupOrLive(make(chan struct{}), live, time.Minute, noWarn); got != "live" {
+			t.Fatalf("got %q, want live", got)
+		}
+	})
+
+	t.Run("probe errors do not end the wait early", func(t *testing.T) {
+		done := make(chan struct{})
+		probeErr := errors.New("GET_DEV_INFO failed")
+
+		var calls atomic.Int32
+
+		live := func() (bool, error) {
+			if calls.Add(1) == 3 {
+				close(done)
+			}
+
+			return false, probeErr
+		}
+
+		if got := waitStartupOrLive(done, live, time.Minute, noWarn); got != "resolved" {
+			t.Fatalf("got %q, want resolved", got)
+		}
+	})
+
+	t.Run("timeout", func(t *testing.T) {
+		warned := false
+		warn := func(string, ...any) { warned = true }
+
+		if got := waitStartupOrLive(make(chan struct{}), never, 30*time.Millisecond, warn); got != "timeout" {
+			t.Fatalf("got %q, want timeout", got)
+		}
+
+		if !warned {
+			t.Fatal("timeout was not logged")
+		}
+	})
 }
