@@ -176,19 +176,8 @@ pub(crate) fn world() -> World {
 
 /// Two activated nodes named `ids`, on the simulated clock if `simulated`,
 /// else on the real clock (for tests over real sockets).
-pub(crate) fn world_for(ids: [NodeId; 2], simulated: bool) -> World {
-    world_with(ids, simulated, true)
-}
-
-/// Two simulated nodes whose devices lack implicit on-demand paging, so
-/// every send copies.
-pub(crate) fn copy_world() -> World {
-    world_with([node_id(1), node_id(2)], true, false)
-}
-
-fn world_with([id_a, id_b]: [NodeId; 2], simulated: bool, odp: bool) -> World {
+pub(crate) fn world_for([id_a, id_b]: [NodeId; 2], simulated: bool) -> World {
     let sim = Simulation::new();
-    sim.implicit_odp(odp);
     let clock = SimulationClock::new(7);
     let environment = clock.environment(1);
     let a = node(&sim, 1, id_a, simulated.then_some(&environment));
@@ -603,71 +592,9 @@ fn drain_stops_setups_and_closes_the_node() {
 
 mod zero_copy;
 
-mod staged {
+/// Sender failures after the owner may have consumed the grant's tag.
+mod send_failures {
     use super::*;
-    use crate::security::CryptoClient;
-    use crate::security::CryptoPort;
-    use crate::security::PageCryptoEngine;
-    use std::num::NonZeroUsize;
-
-    /// A stager on `b`, whose crypto jobs `step` runs inline.
-    fn stager(w: World) -> (World, Rc<CryptoClient>, CryptoPort) {
-        let (io, port) =
-            crate::security::pair(crate::model::WorkerId(0), 1, NonZeroUsize::new(2).unwrap());
-        let crypto = Rc::new(CryptoClient::new(io));
-        let World {
-            _sim,
-            clock,
-            _environment,
-            a,
-            b,
-        } = w;
-        let links = Rc::into_inner(b.links)
-            .expect("unshared links")
-            .with_stager(crypto.clone());
-        let b = Node {
-            links: Rc::new(links),
-            ..b
-        };
-        (
-            World {
-                _sim,
-                clock,
-                _environment,
-                a,
-                b,
-            },
-            crypto,
-            port,
-        )
-    }
-
-    /// Run queued crypto jobs, reap them, and pump both owners.
-    fn step(w: &mut World, crypto: &CryptoClient, port: &mut CryptoPort) {
-        let mut cx = Context::from_waker(std::task::Waker::noop());
-        while let Poll::Ready(Ok(Some(job))) = port.poll_job(&mut cx) {
-            assert!(port.complete(PageCryptoEngine::process(job)).is_ok());
-        }
-        crypto.poll_budgeted(8).unwrap();
-        pump!(w);
-    }
-
-    fn run<T>(
-        w: &mut World,
-        crypto: &CryptoClient,
-        port: &mut CryptoPort,
-        future: impl Future<Output = T>,
-    ) -> T {
-        let mut future = std::pin::pin!(future);
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        for _ in 0..64 {
-            if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
-                return value;
-            }
-            step(w, crypto, port);
-        }
-        panic!("future did not finish");
-    }
 
     fn granted(w: &mut World, transfer: u8) -> (PendingReceive, AuthenticatedGrant) {
         let scope = scope();
@@ -690,114 +617,8 @@ mod staged {
     }
 
     #[test]
-    fn send_stages_on_the_crypto_thread_and_returns_the_buffer() {
-        let mut w = copy_world();
-        link_up(&mut w);
-        let (mut w, crypto, mut port) = stager(w);
-        for (transfer, byte) in [(3, 0x5a), (4, 0xa5)] {
-            let (pending, grant) = granted(&mut w, transfer);
-            let page = page(&w.b.admission.clone(), 35, byte);
-            let links = w.b.links.clone();
-            let scope = scope();
-            run(
-                &mut w,
-                &crypto,
-                &mut port,
-                links.send(&node_id(1), &grant, &page, &scope),
-            )
-            .unwrap();
-            assert_eq!(arrived(&mut w, &pending), vec![byte; 35]);
-        }
-        assert_eq!(w.b.links.staging.get(), (2, 0), "both copies staged");
-        pump!(w);
-        assert_eq!(w.b.links.buffers(RAIL, BufferState::Free), Some(2));
-    }
-
-    #[test]
-    fn exhausted_pool_leaves_the_copy_to_the_owner() {
-        let mut w = copy_world();
-        link_up(&mut w);
-        let (mut w, crypto, mut port) = stager(w);
-        let mut cx = Context::from_waker(std::task::Waker::noop());
-        let held: Vec<_> = (0..2)
-            .map(
-                |_| match w.b.links.client.send_buffer(RAIL.0, 35, &mut cx) {
-                    Poll::Ready(Ok(buffer)) => buffer,
-                    _ => panic!("free buffer"),
-                },
-            )
-            .collect();
-        let (pending, grant) = granted(&mut w, 3);
-        let page = page(&w.b.admission.clone(), 35, 0x5a);
-        let links = w.b.links.clone();
-        let scope = scope();
-        let to = node_id(1);
-        let mut send = std::pin::pin!(links.send(&to, &grant, &page, &scope));
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        assert!(send.as_mut().poll(&mut cx).is_pending());
-        assert_eq!(links.staging.get(), (0, 1), "no buffer: owner copies");
-        drop(held);
-        run(&mut w, &crypto, &mut port, send).unwrap();
-        assert_eq!(arrived(&mut w, &pending), vec![0x5a; 35]);
-        assert_eq!(crypto.outstanding(), 0, "no crypto job was queued");
-        pump!(w);
-        assert_eq!(w.b.links.buffers(RAIL, BufferState::Free), Some(2));
-    }
-
-    #[test]
-    fn stopped_stager_returns_the_buffer_and_falls_back() {
-        let mut w = copy_world();
-        link_up(&mut w);
-        let (mut w, crypto, port) = stager(w);
-        drop(port);
-        let (pending, grant) = granted(&mut w, 3);
-        let page = page(&w.b.admission.clone(), 35, 0x5a);
-        let links = w.b.links.clone();
-        let scope = scope();
-        drive!(w, links.send(&node_id(1), &grant, &page, &scope)).unwrap();
-        assert_eq!(arrived(&mut w, &pending), vec![0x5a; 35]);
-        assert_eq!(links.staging.get(), (0, 1));
-        drop(crypto);
-        pump!(w);
-        assert_eq!(w.b.links.buffers(RAIL, BufferState::Free), Some(2));
-    }
-
-    #[test]
-    fn cancelled_stage_returns_the_buffer_and_releases_nothing() {
-        let mut w = copy_world();
-        link_up(&mut w);
-        let (mut w, crypto, mut port) = stager(w);
-        let (pending, grant) = granted(&mut w, 3);
-        let page = page(&w.b.admission.clone(), 35, 0x5a);
-        let links = w.b.links.clone();
-        let scope = scope();
-        let to = node_id(1);
-        let mut send = std::pin::pin!(links.send(&to, &grant, &page, &scope));
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        assert!(send.as_mut().poll(&mut cx).is_pending());
-        assert_eq!(
-            links.buffers(RAIL, BufferState::Staging),
-            Some(1),
-            "the buffer rides the crypto job"
-        );
-        scope.cancel().unwrap();
-        assert_eq!(
-            run(&mut w, &crypto, &mut port, send).err(),
-            Some(Error::Cancelled)
-        );
-        pump!(w);
-        assert_eq!(w.b.links.buffers(RAIL, BufferState::Free), Some(2));
-        // The caller releases the grant on failure, as `send_native` does.
-        w.b.links.release(&node_id(1), &grant);
-        assert!(matches!(
-            drive!(w, poll_fn(|cx| pending.arrival.poll(cx))),
-            Ok(Arrival::Released)
-        ));
-    }
-
-    #[test]
     fn cancelled_after_the_write_lands_breaks_the_epoch() {
-        let mut w = copy_world();
+        let mut w = world();
         link_up(&mut w);
         let (pending, grant) = granted(&mut w, 3);
         let page = page(&w.b.admission.clone(), 35, 0x5a);
@@ -825,7 +646,7 @@ mod staged {
 
     #[test]
     fn unadmitted_release_breaks_the_epoch() {
-        let mut w = copy_world();
+        let mut w = world();
         link_up(&mut w);
         let (pending, grant) = granted(&mut w, 3);
         let to = node_id(1);
@@ -857,8 +678,8 @@ mod staged {
     }
 }
 
-/// Sender-side zero-copy: with implicit on-demand paging the page is written in
-/// place, no pool buffer is staged, and the metrics name the path taken.
+/// Sender side: the page is written in place through implicit on-demand
+/// paging, no pool buffer is used, and the metrics count it.
 mod send_in_place {
     use super::*;
     use crate::telemetry::{Event, Metrics};
@@ -908,17 +729,14 @@ mod send_in_place {
     }
 
     #[test]
-    fn odp_send_writes_the_page_in_place_and_counts_it() {
+    fn send_writes_the_page_in_place_and_counts_it() {
         let mut w = world();
         link_up(&mut w);
         let (mut w, _, mb) = metered(w);
-        assert!(w.b.links.zero_copy(RAIL));
         let page = page(&w.b.admission.clone(), 35, 0x5a);
         let received = transfer(&mut w, &page);
         assert_eq!(received, page.bytes());
-        assert_eq!(w.b.links.staging.get(), (0, 0), "nothing staged");
-        assert_eq!(mb.count(Event::RdmaPagesSentZeroCopy), 1);
-        assert_eq!(mb.count(Event::RdmaPagesSentCopy), 0);
+        assert_eq!(mb.count(Event::RdmaPagesSent), 1);
         assert_eq!(mb.count(Event::RdmaSentBytes), 35);
         pump!(w);
         assert_eq!(w.b.links.buffers(RAIL, BufferState::Free), Some(2));
@@ -966,42 +784,37 @@ mod send_in_place {
     }
 
     #[test]
-    fn without_odp_every_send_copies_and_counts_the_fallback() {
-        let mut w = copy_world();
-        link_up(&mut w);
-        let (mut w, _, mb) = metered(w);
-        assert!(!w.b.links.zero_copy(RAIL));
-        let page = page(&w.b.admission.clone(), 35, 0x5a);
-        let received = transfer(&mut w, &page);
-        assert_eq!(received, page.bytes());
-        assert_eq!(mb.count(Event::RdmaPagesSentZeroCopy), 0);
-        assert_eq!(mb.count(Event::RdmaPagesSentCopy), 1);
-        assert_eq!(mb.count(Event::RdmaSentBytes), 35);
-    }
-
-    #[test]
-    fn zero_copy_can_be_refused_by_configuration() {
+    /// Without implicit on-demand paging there is no RDMA send path: the
+    /// owner refuses activation, the registered charge returns, no rail is
+    /// ready, and pages keep using HTTP.
+    fn activation_without_odp_fails_and_releases_the_charge() {
         let sim = Simulation::new();
+        sim.implicit_odp(false);
         let clock = SimulationClock::new(7);
         let environment = clock.environment(1);
         let mut a = node(&sim, 1, node_id(1), Some(&environment));
         let mut b = node(&sim, 2, node_id(2), Some(&environment));
         let _guard = environment.enter();
-        a.links = Rc::new(
-            Rc::into_inner(a.links)
-                .expect("unshared links")
-                .with_zero_copy(false),
-        );
         let scope = scope();
         let admission = a.admission.clone();
-        drive(
-            &mut a.owner,
-            &mut b.owner,
-            a.links
-                .activate(vec![mapping(1)], &admission, 2 * BUFFER_LEN, &scope),
-        )
-        .unwrap();
-        assert!(!a.links.zero_copy(RAIL));
+        assert_eq!(
+            drive(
+                &mut a.owner,
+                &mut b.owner,
+                a.links
+                    .activate(vec![mapping(1)], &admission, 2 * BUFFER_LEN, &scope),
+            )
+            .err(),
+            Some(Error::Unavailable)
+        );
+        assert_eq!(admission.used(ResourceClass::Registered), 0);
+        assert!(!a.links.rail_ready(RAIL));
+        assert!(a.links.active().is_empty());
+        assert_eq!(a.links.buffers(RAIL, BufferState::Free), None);
+        assert!(
+            a.links.ready(&node_id(2), RAIL).is_none(),
+            "HTTP carries pages"
+        );
     }
 
     #[test]

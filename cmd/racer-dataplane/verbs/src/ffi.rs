@@ -157,8 +157,9 @@ impl Access {
     /// Control slots: `LOCAL_WRITE` only.
     pub(crate) const CONTROL: Self = Self(2);
 
-    /// Page buffers plus `REMOTE_WRITE` on the region itself. The
-    /// `mr_remote_write` escape hatch uses this.
+    /// Page buffers plus `REMOTE_WRITE` on the region itself. Tests only:
+    /// production grants remote access through memory windows alone.
+    #[cfg(test)]
     pub(crate) const PAGES_REMOTE_WRITE: Self = Self(1 | 4);
 
     /// Marks an implicit ODP region from `rdma_verbs_register_implicit`.

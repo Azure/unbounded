@@ -876,8 +876,6 @@ impl WorkerApplication {
                         limits.connections_per_neighbor.get(),
                         Some(reactor.clone()),
                     )
-                    .with_stager(runtime.crypto.clone())
-                    .with_zero_copy(config.rdma_zero_copy)
                     .with_metrics(metrics.clone()),
                 )
             })

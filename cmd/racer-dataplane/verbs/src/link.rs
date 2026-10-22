@@ -23,7 +23,7 @@ use crate::{
         Access, Failure, MemoryWindow, NativeDevice, NativeQueuePair, NativeRegion, WorkCompletion,
         opcode,
     },
-    pool::{Buffer, BufferState, Pool, RegisteredPage, SendBuffer},
+    pool::{Buffer, BufferState, Pool, RegisteredPage},
 };
 
 /// A link not `Ready` this long after creation breaks.
@@ -68,7 +68,7 @@ pub enum Arrival {
     Released,
 }
 
-/// Caller memory that a NIC may read in place for a [`Source::Bytes`] write.
+/// Caller memory that a NIC may read in place for a [`Source`] write.
 ///
 /// # Safety
 ///
@@ -93,7 +93,7 @@ pub enum Arrival {
 ///     }
 /// }
 ///
-/// let _ = rdma_verbs::Source::Bytes(std::sync::Arc::new(Shifting));
+/// let _ = rdma_verbs::Source::new(std::sync::Arc::new(Shifting));
 /// ```
 pub unsafe trait DirectBytes: Send + Sync + 'static {
     /// The bytes to write.
@@ -122,25 +122,22 @@ unsafe impl DirectBytes for &'static [u8] {
 }
 
 /// Bytes to write into a peer's grant.
-pub enum Source {
-    /// Caller memory. With an implicit on-demand paging region on the
-    /// link's device ([`crate::Client::zero_copy`]) the NIC reads it in place
-    /// and the owner holds the `Arc` until the write completes or the QP is
-    /// destroyed. Otherwise the owner copies into a free page buffer on its
-    /// thread.
-    Bytes(Arc<dyn DirectBytes>),
-
-    /// Already staged in a page buffer of the link's device.
-    Staged(SendBuffer),
-}
+///
+/// The NIC reads the caller's memory in place through the device's implicit
+/// on-demand paging region. The owner holds the `Arc` until the write
+/// completes or the QP is destroyed.
+#[derive(Clone)]
+pub struct Source(Arc<dyn DirectBytes>);
 
 impl Source {
+    /// Write `bytes` in place.
+    pub fn new(bytes: Arc<dyn DirectBytes>) -> Self {
+        Self(bytes)
+    }
+
     /// Length in bytes.
     pub fn len(&self) -> usize {
-        match self {
-            Self::Bytes(bytes) => (**bytes).bytes().len(),
-            Self::Staged(buffer) => buffer.len(),
-        }
+        self.0.bytes().len()
     }
 
     /// True if empty. Empty sources cannot be written.
@@ -151,10 +148,7 @@ impl Source {
 
 impl std::fmt::Debug for Source {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Bytes(_) => write!(f, "Bytes({})", self.len()),
-            Self::Staged(buffer) => write!(f, "Staged({buffer:?})"),
-        }
+        write!(f, "Source({})", self.len())
     }
 }
 
@@ -311,7 +305,7 @@ enum Outgoing {
     Write {
         tag: u32,
 
-        buffer: Payload,
+        source: Payload,
 
         len: u32,
 
@@ -351,29 +345,14 @@ impl Outgoing {
     }
 }
 
-/// What a queued or posted write reads from.
-enum Payload {
-    /// A pool page buffer in `Sending`.
-    Buffer(Buffer),
+/// Caller memory a queued or posted write reads through the device's
+/// implicit region. Held until the write completes or the QP is destroyed.
+/// `addr` is the start of the slice captured when the write was accepted;
+/// the posted length comes from the same slice.
+struct Payload {
+    bytes: Arc<dyn DirectBytes>,
 
-    /// Caller memory read through the device's implicit region. Held until
-    /// the write completes or the QP is destroyed. `addr` is the start of the
-    /// slice captured when the write was accepted; the posted length comes
-    /// from the same slice.
-    Direct {
-        bytes: Arc<dyn DirectBytes>,
-        addr: u64,
-    },
-}
-
-impl Payload {
-    /// Return the payload once the NIC no longer reads it.
-    fn release(self, pool: &Pool) {
-        match self {
-            Self::Buffer(buffer) => pool.release(buffer),
-            Self::Direct { .. } => {}
-        }
-    }
+    addr: u64,
 }
 
 /// Posted send-queue work.
@@ -387,7 +366,7 @@ enum InFlight {
     },
 
     Write {
-        buffer: Payload,
+        source: Payload,
 
         done: Completer<()>,
     },
@@ -454,7 +433,7 @@ pub(crate) struct Link {
     /// Buffers held until the QP is destroyed.
     quarantine: Vec<Buffer>,
 
-    /// Zero-copy sources of failed posted writes, held until the QP is
+    /// Sources of failed posted writes, held until the QP is
     /// destroyed: the NIC may still read them.
     held: Vec<Arc<dyn DirectBytes>>,
 
@@ -690,7 +669,6 @@ impl Link {
     /// until `deadline`. `done` resolves on the send completion.
     pub(crate) fn write(
         &mut self,
-        pool: &Pool,
         tag: u32,
         source: Source,
         deadline: Instant,
@@ -710,7 +688,7 @@ impl Link {
         self.last_used = now;
 
         if self.remote.contains_key(&tag) {
-            self.start_write(pool, tag, source, deadline, done);
+            self.start_write(tag, source, deadline, done);
         } else if self.waiting.contains_key(&tag) {
             let _ = done.complete(Err(Error::InvalidRequest));
         } else if self.waiting.len() >= 2 * self.limits.grants as usize {
@@ -727,67 +705,26 @@ impl Link {
         }
     }
 
-    /// Stage `source` and queue the write for the peer's grant `tag`.
-    fn start_write(
-        &mut self,
-        pool: &Pool,
-        tag: u32,
-        source: Source,
-        deadline: Instant,
-        done: Completer<()>,
-    ) {
+    /// Queue the write of `source` for the peer's grant `tag`.
+    fn start_write(&mut self, tag: u32, source: Source, deadline: Instant, done: Completer<()>) {
         let remote = self.remote[&tag];
         // Capture the caller's slice once: the NIC reads exactly this range,
         // so the length and the address must come from the same borrow.
-        let (len, addr) = match &source {
-            Source::Bytes(bytes) => {
-                let slice = (**bytes).bytes();
-                (slice.len(), slice.as_ptr() as u64)
-            }
-            Source::Staged(staged) => (staged.len(), 0),
-        };
+        let slice = source.0.bytes();
+        let (len, addr) = (slice.len(), slice.as_ptr() as u64);
 
         if len > remote.length as usize {
             let _ = done.complete(Err(Error::InvalidRange));
             return;
         }
 
-        let staged = match source {
-            Source::Bytes(bytes) if pool.implicit().is_some() => {
-                self.remote.remove(&tag);
-                self.outbox.push_back(Outgoing::Write {
-                    tag,
-                    buffer: Payload::Direct { bytes, addr },
-                    len: len as u32,
-                    remote,
-                    deadline,
-                    done,
-                });
-                return;
-            }
-            Source::Bytes(bytes) => {
-                let Some(mut staged) = pool.shared().stage(len) else {
-                    let _ = done.complete(Err(Error::Overloaded));
-                    return;
-                };
-                staged.bytes_mut().copy_from_slice((*bytes).bytes());
-                staged
-            }
-            Source::Staged(staged) => staged,
-        };
-
-        let (buffer, len) = match pool.send(staged) {
-            Ok(sent) => sent,
-            Err((error, _staged)) => {
-                let _ = done.complete(Err(error));
-                return;
-            }
-        };
-
         self.remote.remove(&tag);
         self.outbox.push_back(Outgoing::Write {
             tag,
-            buffer: Payload::Buffer(buffer),
+            source: Payload {
+                bytes: source.0,
+                addr,
+            },
             len: len as u32,
             remote,
             deadline,
@@ -869,7 +806,7 @@ impl Link {
 
         progressed.map_err(|_| Break::Error)?;
 
-        self.expire(pool, now)?;
+        self.expire(now)?;
 
         if self.phase == Phase::Ready && now >= self.last_used + self.limits.idle {
             self.close(now, CLOSE_GRACE);
@@ -921,8 +858,8 @@ impl Link {
                     let _ = done.complete(Ok(()));
                 }
             }
-            InFlight::Write { buffer, done } => {
-                buffer.release(pool);
+            InFlight::Write { source: _, done } => {
+                // Completed: the NIC no longer reads the source.
                 let _ = done.complete(Ok(()));
             }
             InFlight::Bind(tag) => {
@@ -1100,7 +1037,7 @@ impl Link {
                         source,
                         deadline,
                         done,
-                    }) => self.start_write(pool, tag, source, deadline, done),
+                    }) => self.start_write(tag, source, deadline, done),
                     Some(Waiting::Release { done }) => {
                         self.remote.remove(&tag);
                         self.outbox.push_back(Outgoing::Release {
@@ -1134,7 +1071,7 @@ impl Link {
     }
 
     /// Fail or break on passed deadlines.
-    fn expire(&mut self, pool: &Pool, now: Instant) -> std::result::Result<(), Break> {
+    fn expire(&mut self, now: Instant) -> std::result::Result<(), Break> {
         let mut cancelled = Vec::new();
 
         for (&tag, entry) in &mut self.grants {
@@ -1179,13 +1116,11 @@ impl Link {
             match outgoing {
                 Outgoing::Write {
                     tag,
-                    buffer,
                     remote,
                     deadline,
                     done,
                     ..
                 } if now >= deadline => {
-                    buffer.release(pool);
                     self.remote.insert(tag, remote);
                     let _ = done.complete(Err(Error::DeadlineExceeded));
                 }
@@ -1256,46 +1191,31 @@ impl Link {
             }
             Outgoing::Write {
                 tag,
-                buffer,
+                source,
                 len,
                 remote,
                 done,
                 ..
             } => {
-                let posted = match &buffer {
-                    Payload::Buffer(staged) => self.qp.write_imm(
-                        wr(WRITE, tag),
-                        pool.region(),
-                        pool.offset(staged),
-                        len,
-                        remote.addr,
-                        remote.rkey,
-                        tag,
-                    ),
-                    Payload::Direct { addr, .. } => match pool.implicit() {
-                        // The implicit region's offset is the virtual address.
-                        Some(implicit) => self.qp.write_imm(
-                            wr(WRITE, tag),
-                            implicit,
-                            *addr,
-                            len,
-                            remote.addr,
-                            remote.rkey,
-                            tag,
-                        ),
-                        None => Err(Error::Io),
-                    },
-                };
+                // The implicit region's offset is the virtual address.
+                let posted = self.qp.write_imm(
+                    wr(WRITE, tag),
+                    pool.implicit(),
+                    source.addr,
+                    len,
+                    remote.addr,
+                    remote.rkey,
+                    tag,
+                );
 
                 if let Err(error) = posted {
-                    // Nothing reached the NIC.
-                    buffer.release(pool);
+                    // Nothing reached the NIC: dropping the source is safe.
                     let _ = done.complete(Err(error));
                     return Err(error);
                 }
 
                 self.consume();
-                self.track(wr(WRITE, tag), InFlight::Write { buffer, done });
+                self.track(wr(WRITE, tag), InFlight::Write { source, done });
             }
             Outgoing::Grant(tag) => {
                 let entry = self.grants.get_mut(&tag).ok_or(Error::Io)?;
@@ -1478,11 +1398,8 @@ impl Link {
 
         for outgoing in self.outbox.drain(..) {
             match outgoing {
-                Outgoing::Write { buffer, done, .. } => {
-                    // Not posted: no NIC access, but keep buffers uniform.
-                    if let Payload::Buffer(buffer) = buffer {
-                        quarantine.push(buffer);
-                    }
+                Outgoing::Write { done, .. } => {
+                    // Not posted: no NIC access, so the source drops now.
                     let _ = done.complete(Err(Error::Unavailable));
                 }
                 Outgoing::Release { done, .. } => {
@@ -1494,11 +1411,8 @@ impl Link {
 
         for (_, inflight) in std::mem::take(&mut self.inflight) {
             match inflight {
-                InFlight::Write { buffer, done } => {
-                    match buffer {
-                        Payload::Buffer(buffer) => quarantine.push(buffer),
-                        Payload::Direct { bytes, .. } => self.held.push(bytes),
-                    }
+                InFlight::Write { source, done } => {
+                    self.held.push(source.bytes);
                     let _ = done.complete(Err(Error::Unavailable));
                 }
                 InFlight::Control {

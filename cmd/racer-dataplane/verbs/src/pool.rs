@@ -6,18 +6,20 @@
 //!
 //! The type system enforces who may touch the memory:
 //!
-//! - [`SendBuffer`] (`Staging`) gives `&mut [u8]` and [`RegisteredPage`]
-//!   (`Owned`) gives `&[u8]`. They are the only ways Rust code can see page
-//!   memory, and they exist only while no memory window covers the buffer and
-//!   no work request uses it.
+//! - [`RegisteredPage`] (`Owned`) gives `&[u8]`. It is the only way Rust
+//!   code can see page memory, and it exists only while no memory window
+//!   covers the buffer and no work request uses it.
 //! - Every other state is held by the owner thread as a [`Buffer`] token,
 //!   which has no slice or pointer API at all. The owner moves a token to
 //!   `Owned` only after the fence (receive completion, then a fenced
-//!   `LOCAL_INV` completion) and to `Staging` only from `Free`.
+//!   `LOCAL_INV` completion).
 //!
-//! Lifetime: [`RegisteredPage`] and [`SendBuffer`] hold an `Arc<PoolShared>`.
-//! [`Pool`] owns the region. When the pool is dropped while any page or send
-//! buffer is still alive, or while any buffer is `Leaked` or `Quarantined`,
+//! Page buffers only receive. Writes read caller memory in place through the
+//! device's implicit on-demand paging region, which every pool holds.
+//!
+//! Lifetime: [`RegisteredPage`] holds an `Arc<PoolShared>`. [`Pool`] owns
+//! the regions. When the pool is dropped while any page is still alive, or
+//! while any buffer is `Leaked` or `Quarantined`,
 //! the region is leaked on purpose (never deregistered) and the charge is
 //! quarantined, so the memory stays valid and counted for as long as anything
 //! may use it.
@@ -26,7 +28,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicU8, Ordering},
     },
     task::Waker,
 };
@@ -40,12 +42,6 @@ use crate::{Error, GuardOwner, Result, ffi::NativeRegion};
 pub enum BufferState {
     /// On the free list. No CPU or NIC access.
     Free,
-
-    /// Held by a [`SendBuffer`]: CPU writes, no NIC access.
-    Staging,
-
-    /// Owner posted a `WRITE_WITH_IMM` from it: NIC reads.
-    Sending,
 
     /// Owner posted a `BIND_MW` over it.
     Binding,
@@ -66,10 +62,8 @@ pub enum BufferState {
     Leaked,
 }
 
-const STATES: [BufferState; 9] = [
+const STATES: [BufferState; 7] = [
     BufferState::Free,
-    BufferState::Staging,
-    BufferState::Sending,
     BufferState::Binding,
     BufferState::Exposed,
     BufferState::Invalidating,
@@ -91,7 +85,7 @@ impl BufferState {
     fn owner_held(self) -> bool {
         matches!(
             self,
-            Self::Sending | Self::Binding | Self::Exposed | Self::Invalidating | Self::Quarantined
+            Self::Binding | Self::Exposed | Self::Invalidating | Self::Quarantined
         )
     }
 }
@@ -101,7 +95,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// State shared by the owner and every page or send buffer.
+/// State shared by the owner and every received page.
 pub(crate) struct PoolShared {
     /// Start of the registered memory. Valid while any `Arc` exists (see the
     /// module docs).
@@ -115,18 +109,11 @@ pub(crate) struct PoolShared {
 
     /// The owner, woken when a buffer returns.
     owner: AtomicWaker,
-
-    /// Clients waiting for a free buffer in [`PoolShared::poll_stage`].
-    waiters: Mutex<Vec<Waker>>,
-
-    /// The device has an implicit on-demand paging region, so the owner
-    /// writes [`crate::Source::Bytes`] straight from the caller's memory.
-    zero_copy: AtomicBool,
 }
 
-// SAFETY: `base` is only dereferenced through `RegisteredPage` and
-// `SendBuffer`, each of which exclusively holds one buffer index in a state
-// with no NIC access, and the memory outlives every `Arc<PoolShared>`.
+// SAFETY: `base` is only dereferenced through `RegisteredPage`, which
+// exclusively holds one buffer index in a state with no NIC access, and the
+// memory outlives every `Arc<PoolShared>`.
 unsafe impl Send for PoolShared {}
 unsafe impl Sync for PoolShared {}
 
@@ -135,11 +122,6 @@ impl PoolShared {
     #[cfg_attr(not(test), allow(dead_code, reason = "used by tests and diagnostics"))]
     pub(crate) fn buffer_len(&self) -> usize {
         self.buffer_len
-    }
-
-    /// True if [`crate::Source::Bytes`] writes go out without a copy.
-    pub(crate) fn zero_copy(&self) -> bool {
-        self.zero_copy.load(Ordering::Acquire)
     }
 
     /// Number of page buffers.
@@ -171,83 +153,11 @@ impl PoolShared {
         Some(index)
     }
 
-    /// Return buffer `index` to the free list and wake waiters.
+    /// Return buffer `index` to the free list and wake the owner.
     fn push(&self, index: u32) {
         self.set(index, BufferState::Free);
         lock(&self.free).push(index);
         self.owner.wake();
-        // Take the waiters in their own statement so the lock is released
-        // before any waker runs; a waker may reenter the pool.
-        let waiters = std::mem::take(&mut *lock(&self.waiters));
-        for waker in waiters {
-            waker.wake();
-        }
-    }
-
-    /// Take a free buffer as a [`SendBuffer`] of `len` bytes, from any
-    /// thread. `Pending` registers `waker` until a buffer returns.
-    pub(crate) fn poll_stage(
-        self: &Arc<Self>,
-        len: usize,
-        waker: &Waker,
-    ) -> Option<Result<SendBuffer>> {
-        if len == 0 || len > self.buffer_len {
-            return Some(Err(Error::InvalidRange));
-        }
-
-        if let Some(buffer) = self.stage(len) {
-            return Some(Ok(buffer));
-        }
-
-        // Clone before locking: the clone callback may reenter the pool.
-        // `will_wake` only compares pointers and runs no callback. An unused
-        // clone is returned and dropped after the lock is released, so the
-        // drop callback never runs under the lock either.
-        let clone = waker.clone();
-        let unused = {
-            let mut waiters = lock(&self.waiters);
-            // Repeated polls from one task register it once.
-            if waiters.iter().any(|w| w.will_wake(waker)) {
-                Some(clone)
-            } else {
-                waiters.push(clone);
-                None
-            }
-        };
-        drop(unused);
-
-        // A buffer may have returned between the first try and registering.
-        self.stage(len).map(Ok)
-    }
-
-    /// Take a free buffer as a [`SendBuffer`] of `len` bytes without
-    /// registering a waiter. `Ok(None)` when none is free.
-    pub(crate) fn try_stage(self: &Arc<Self>, len: usize) -> Result<Option<SendBuffer>> {
-        if len == 0 || len > self.buffer_len {
-            return Err(Error::InvalidRange);
-        }
-
-        Ok(self.stage(len))
-    }
-
-    #[cfg(test)]
-    fn waiter_count(&self) -> usize {
-        lock(&self.waiters).len()
-    }
-
-    /// Take a free buffer as a [`SendBuffer`] of `len` bytes, if any.
-    pub(crate) fn stage(self: &Arc<Self>, len: usize) -> Option<SendBuffer> {
-        if len == 0 || len > self.buffer_len {
-            return None;
-        }
-
-        let index = self.pop(BufferState::Staging)?;
-
-        Some(SendBuffer {
-            shared: self.clone(),
-            index,
-            len,
-        })
     }
 
     /// Register the owner's waker for returned buffers.
@@ -287,24 +197,27 @@ pub(crate) struct Pool {
     /// `None` only during drop.
     region: Option<Rc<NativeRegion>>,
 
-    /// The device's implicit on-demand paging region, if any: the local key
-    /// for zero-copy write sources.
+    /// The device's implicit on-demand paging region: the local key for
+    /// every write source. `None` only during drop.
     implicit: Option<Rc<NativeRegion>>,
 
     quota: Arc<GuardOwner>,
 }
 
 impl Pool {
-    /// Split `region` into `region.length() / buffer_len` page buffers.
+    /// Split `region` into `region.length() / buffer_len` receive buffers,
+    /// and write from caller memory through `implicit` (from
+    /// [`NativeRegion::implicit`]).
     ///
-    /// `buffer_len` must be nonzero and at most `u32::MAX`, and the region
-    /// must hold at least one buffer.
+    /// `buffer_len` must be nonzero and at most `u32::MAX`, the region must
+    /// hold at least one buffer, and `implicit` must be implicit.
     pub(crate) fn new(
         region: Rc<NativeRegion>,
+        implicit: Rc<NativeRegion>,
         buffer_len: usize,
         quota: Arc<GuardOwner>,
     ) -> Result<Self> {
-        if buffer_len == 0 || buffer_len > u32::MAX as usize {
+        if !implicit.is_implicit() || buffer_len == 0 || buffer_len > u32::MAX as usize {
             return Err(Error::InvalidConfiguration);
         }
 
@@ -328,16 +241,14 @@ impl Pool {
                 // Pop from the end, so reverse to hand out low indices first.
                 free: Mutex::new((0..count as u32).rev().collect()),
                 owner: AtomicWaker::new(),
-                waiters: Mutex::new(Vec::new()),
-                zero_copy: AtomicBool::new(false),
             }),
             region: Some(region),
-            implicit: None,
+            implicit: Some(implicit),
             quota,
         })
     }
 
-    /// State shared with page and send buffers.
+    /// State shared with received pages.
     pub(crate) fn shared(&self) -> &Arc<PoolShared> {
         &self.shared
     }
@@ -347,17 +258,9 @@ impl Pool {
         self.region.as_ref().unwrap()
     }
 
-    /// Use `implicit` (from [`NativeRegion::implicit`]) for zero-copy
-    /// [`crate::Source::Bytes`] writes.
-    pub(crate) fn set_implicit(&mut self, implicit: Rc<NativeRegion>) {
-        debug_assert!(implicit.is_implicit());
-        self.implicit = Some(implicit);
-        self.shared.zero_copy.store(true, Ordering::Release);
-    }
-
-    /// The implicit on-demand paging region, if the device has one.
-    pub(crate) fn implicit(&self) -> Option<&Rc<NativeRegion>> {
-        self.implicit.as_ref()
+    /// The implicit on-demand paging region that write sources go through.
+    pub(crate) fn implicit(&self) -> &Rc<NativeRegion> {
+        self.implicit.as_ref().unwrap()
     }
 
     /// Byte offset of `buffer` in the region.
@@ -375,28 +278,6 @@ impl Pool {
     pub(crate) fn set(&self, buffer: &Buffer, state: BufferState) {
         assert!(state.owner_held());
         self.shared.set(buffer.index, state);
-    }
-
-    /// Hand a send buffer to the owner for a posted write: `Staging` to
-    /// `Sending`. Returns the token and the staged length.
-    ///
-    /// Fails with [`Error::InvalidRequest`] if it belongs to another pool.
-    pub(crate) fn send(
-        &self,
-        staged: SendBuffer,
-    ) -> std::result::Result<(Buffer, usize), (Error, SendBuffer)> {
-        if !Arc::ptr_eq(&staged.shared, &self.shared) {
-            return Err((Error::InvalidRequest, staged));
-        }
-
-        let staged = std::mem::ManuallyDrop::new(staged);
-        let index = staged.index;
-        let len = staged.len;
-        // SAFETY: read once out of a `ManuallyDrop` that is never used again.
-        drop(unsafe { std::ptr::read(&staged.shared) });
-        self.shared.set(index, BufferState::Sending);
-
-        Ok((Buffer { index }, len))
     }
 
     /// Fence done (or nothing was ever exposed): return to `Free`.
@@ -428,7 +309,7 @@ impl Pool {
         self.shared.set(buffer.index, BufferState::Leaked);
     }
 
-    /// Page and send buffers still alive outside the owner.
+    /// Received pages still alive outside the owner.
     pub(crate) fn outstanding(&self) -> usize {
         Arc::strong_count(&self.shared) - 1
     }
@@ -499,67 +380,11 @@ impl Drop for RegisteredPage {
     }
 }
 
-/// A free page buffer staged for sending: CPU writes only, no NIC access.
-///
-/// `Send`. Dropping it returns the buffer to the pool.
-pub struct SendBuffer {
-    shared: Arc<PoolShared>,
-
-    index: u32,
-
-    len: usize,
-}
-
-impl SendBuffer {
-    /// The staged bytes (zeroed or stale content; callers fill them).
-    pub fn bytes_mut(&mut self) -> &mut [u8] {
-        // SAFETY: state `Staging`: this value exclusively holds the buffer
-        // and the NIC cannot access it.
-        unsafe { std::slice::from_raw_parts_mut(self.shared.ptr(self.index), self.len) }
-    }
-
-    /// Read back the staged bytes.
-    pub fn bytes(&self) -> &[u8] {
-        // SAFETY: as in `bytes_mut`.
-        unsafe { std::slice::from_raw_parts(self.shared.ptr(self.index), self.len) }
-    }
-
-    /// Shorten the staged length. Longer values are ignored.
-    pub fn truncate(&mut self, len: usize) {
-        self.len = self.len.min(len);
-    }
-
-    /// Staged length.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// True if nothing is staged. Empty buffers cannot be written.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
-
-impl std::fmt::Debug for SendBuffer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SendBuffer")
-            .field("index", &self.index)
-            .field("len", &self.len)
-            .finish()
-    }
-}
-
-impl Drop for SendBuffer {
-    fn drop(&mut self) {
-        self.shared.push(self.index);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
         sync::atomic::AtomicUsize,
-        task::{RawWaker, RawWakerVTable, Wake, Waker},
+        task::{Wake, Waker},
     };
 
     use super::*;
@@ -582,10 +407,15 @@ mod tests {
     fn pool(sim: &Simulation, count: usize) -> (Pool, lifetime_tests::QuotaObserver) {
         let device = device(sim);
         let (quota, observer) = lifetime_tests::quota();
-        let region =
-            NativeRegion::with_access(device, count * LEN + 100, Access::PAGES, quota.clone())
-                .unwrap();
-        (Pool::new(region, LEN, quota).unwrap(), observer)
+        let region = NativeRegion::with_access(
+            device.clone(),
+            count * LEN + 100,
+            Access::PAGES,
+            quota.clone(),
+        )
+        .unwrap();
+        let implicit = NativeRegion::implicit(device, quota.clone()).unwrap();
+        (Pool::new(region, implicit, LEN, quota).unwrap(), observer)
     }
 
     struct Count(AtomicUsize);
@@ -596,196 +426,34 @@ mod tests {
         }
     }
 
-    /// Reenters the pool from `wake`: stages a buffer (registering itself
-    /// again if none is free) and returns it immediately.
-    struct Reenter {
-        shared: Arc<PoolShared>,
-        wakes: AtomicUsize,
-    }
-
-    impl Wake for Reenter {
-        fn wake(self: Arc<Self>) {
-            self.wakes.fetch_add(1, Ordering::SeqCst);
-            let waker = Waker::from(self.clone());
-            let staged = self.shared.poll_stage(5, &waker);
-            assert!(matches!(staged, Some(Ok(_))), "the returned buffer is free");
-            // Dropping the staged buffer reenters `push` from inside a wake.
-        }
-    }
-
-    #[test]
-    /// A waker that reenters the pool from `wake` does not deadlock.
-    fn reentrant_wake_does_not_deadlock() {
-        let sim = Simulation::new();
-        let (pool, _charge) = pool(&sim, 1);
-        let shared = pool.shared().clone();
-        let held = shared.stage(5).unwrap();
-        let reenter = Arc::new(Reenter {
-            shared: shared.clone(),
-            wakes: AtomicUsize::new(0),
-        });
-        let waker = Waker::from(reenter.clone());
-        assert!(shared.poll_stage(5, &waker).is_none());
-        drop(held);
-        assert_eq!(reenter.wakes.load(Ordering::SeqCst), 1);
-        assert_eq!(shared.waiter_count(), 0);
-        assert_eq!(shared.count_in(BufferState::Free), 1);
-    }
-
-    /// Counts calls into a raw waker vtable whose clone, wake, and drop
-    /// callbacks all reenter the pool by taking the waiter lock.
-    struct RawReenter {
-        shared: Arc<PoolShared>,
-        clones: AtomicUsize,
-        drops: AtomicUsize,
-        wakes: AtomicUsize,
-    }
-
-    static RAW_REENTER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-        raw_reenter_clone,
-        raw_reenter_wake,
-        raw_reenter_wake_by_ref,
-        raw_reenter_drop,
-    );
-
-    unsafe fn raw_reenter_clone(data: *const ()) -> RawWaker {
-        // SAFETY: `data` came from `Arc::into_raw` and the waker holds a count.
-        let state = unsafe { &*data.cast::<RawReenter>() };
-        state.clones.fetch_add(1, Ordering::SeqCst);
-        let _ = state.shared.waiter_count();
-        // SAFETY: as above; the new waker owns the added count.
-        unsafe { Arc::increment_strong_count(data.cast::<RawReenter>()) };
-        RawWaker::new(data, &RAW_REENTER_VTABLE)
-    }
-
-    unsafe fn raw_reenter_wake(data: *const ()) {
-        // SAFETY: `data` is a live waker's pointer.
-        unsafe { raw_reenter_wake_by_ref(data) };
-        // SAFETY: `wake` consumes the waker.
-        unsafe { raw_reenter_drop(data) };
-    }
-
-    unsafe fn raw_reenter_wake_by_ref(data: *const ()) {
-        // SAFETY: `data` is a live waker's pointer.
-        let state = unsafe { &*data.cast::<RawReenter>() };
-        state.wakes.fetch_add(1, Ordering::SeqCst);
-        let _ = state.shared.waiter_count();
-    }
-
-    unsafe fn raw_reenter_drop(data: *const ()) {
-        // SAFETY: `data` came from `Arc::into_raw` and owns one count.
-        let state = unsafe { Arc::from_raw(data.cast::<RawReenter>()) };
-        state.drops.fetch_add(1, Ordering::SeqCst);
-        let _ = state.shared.waiter_count();
-    }
-
-    #[test]
-    /// Waker clone and drop callbacks that reenter the pool do not deadlock,
-    /// including the duplicate-registration path that drops an unused clone.
-    fn reentrant_clone_and_drop_do_not_deadlock() {
-        let sim = Simulation::new();
-        let (pool, _charge) = pool(&sim, 1);
-        let shared = pool.shared().clone();
-        let held = shared.stage(5).unwrap();
-        let state = Arc::new(RawReenter {
-            shared: shared.clone(),
-            clones: AtomicUsize::new(0),
-            drops: AtomicUsize::new(0),
-            wakes: AtomicUsize::new(0),
-        });
-        let data = Arc::into_raw(state.clone()).cast::<()>();
-        // SAFETY: the vtable upholds the `RawWaker` contract over an `Arc`.
-        let waker = unsafe { Waker::from_raw(RawWaker::new(data, &RAW_REENTER_VTABLE)) };
-        assert!(shared.poll_stage(5, &waker).is_none());
-        assert!(shared.poll_stage(5, &waker).is_none());
-        assert_eq!(shared.waiter_count(), 1);
-        assert_eq!(state.clones.load(Ordering::SeqCst), 2);
-        assert_eq!(
-            state.drops.load(Ordering::SeqCst),
-            1,
-            "unused clone dropped"
-        );
-        drop(held);
-        assert_eq!(state.wakes.load(Ordering::SeqCst), 1);
-        assert_eq!(state.drops.load(Ordering::SeqCst), 2);
-        drop(waker);
-        assert_eq!(state.drops.load(Ordering::SeqCst), 3);
-        assert_eq!(Arc::strong_count(&state), 1);
-    }
-
-    #[test]
-    /// Repeated polls from one task register a single waiter.
-    fn repeated_polls_register_once() {
-        let sim = Simulation::new();
-        let (pool, _charge) = pool(&sim, 1);
-        let shared = pool.shared().clone();
-        let held = shared.stage(5).unwrap();
-        let count = Arc::new(Count(AtomicUsize::new(0)));
-        let waker = Waker::from(count.clone());
-        for _ in 0..5 {
-            assert!(shared.poll_stage(5, &waker).is_none());
-        }
-        assert_eq!(shared.waiter_count(), 1);
-        drop(held);
-        assert_eq!(count.0.load(Ordering::SeqCst), 1);
-        assert_eq!(shared.waiter_count(), 0);
-    }
-
-    #[test]
-    /// Distinct tasks each register and each is woken.
-    fn distinct_tasks_are_all_woken() {
-        let sim = Simulation::new();
-        let (pool, _charge) = pool(&sim, 1);
-        let shared = pool.shared().clone();
-        let held = shared.stage(5).unwrap();
-        let first = Arc::new(Count(AtomicUsize::new(0)));
-        let second = Arc::new(Count(AtomicUsize::new(0)));
-        assert!(shared.poll_stage(5, &Waker::from(first.clone())).is_none());
-        assert!(shared.poll_stage(5, &Waker::from(second.clone())).is_none());
-        assert_eq!(shared.waiter_count(), 2);
-        drop(held);
-        assert_eq!(first.0.load(Ordering::SeqCst), 1);
-        assert_eq!(second.0.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    /// `try_stage` never registers a waiter.
-    fn try_stage_does_not_register() {
-        let sim = Simulation::new();
-        let (pool, _charge) = pool(&sim, 1);
-        let shared = pool.shared().clone();
-        assert!(matches!(shared.try_stage(0), Err(Error::InvalidRange)));
-        assert!(matches!(
-            shared.try_stage(LEN + 1),
-            Err(Error::InvalidRange)
-        ));
-        let held = shared.try_stage(5).unwrap().unwrap();
-        assert_eq!(held.len(), 5);
-        assert!(shared.try_stage(5).unwrap().is_none());
-        assert_eq!(shared.waiter_count(), 0);
-        drop(held);
-        assert!(shared.try_stage(5).unwrap().is_some());
-        assert_eq!(shared.waiter_count(), 0);
-    }
-
     #[test]
     /// Bad buffer lengths and regions too small for one buffer are refused.
     fn configuration_is_validated() {
         let sim = Simulation::new();
         let device = device(&sim);
         let (quota, _) = lifetime_tests::quota();
+        let implicit = || NativeRegion::implicit(device.clone(), quota.clone()).unwrap();
         let small =
             NativeRegion::with_access(device.clone(), LEN - 1, Access::PAGES, quota.clone())
                 .unwrap();
         assert_eq!(
-            Pool::new(small, LEN, quota.clone()).err(),
+            Pool::new(small, implicit(), LEN, quota.clone()).err(),
             Some(Error::InvalidConfiguration)
         );
-        let region = NativeRegion::with_access(device, LEN, Access::PAGES, quota.clone()).unwrap();
+        let region =
+            NativeRegion::with_access(device.clone(), LEN, Access::PAGES, quota.clone()).unwrap();
         assert_eq!(
-            Pool::new(region, 0, quota).err(),
+            Pool::new(region.clone(), implicit(), 0, quota.clone()).err(),
             Some(Error::InvalidConfiguration)
         );
+        // Writes need the implicit region; an ordinary region is refused.
+        let ordinary =
+            NativeRegion::with_access(device.clone(), LEN, Access::PAGES, quota.clone()).unwrap();
+        assert_eq!(
+            Pool::new(region, ordinary, LEN, quota.clone()).err(),
+            Some(Error::InvalidConfiguration)
+        );
+        drop(device);
         assert_eq!(sim.live_resources(), 0, "failed pools deregister");
     }
 
@@ -828,40 +496,8 @@ mod tests {
     }
 
     #[test]
-    /// The send path: Staging, Sending, Free; and released grants go Free.
-    fn send_and_release_transitions() {
-        let sim = Simulation::new();
-        let (pool, _charge) = pool(&sim, 2);
-        let shared = pool.shared().clone();
-        let mut staged = shared.stage(5).unwrap();
-        assert_eq!(shared.state(staged.index), BufferState::Staging);
-        staged.bytes_mut().copy_from_slice(b"hello");
-        staged.truncate(9);
-        assert_eq!(staged.len(), 5);
-        staged.truncate(4);
-        assert_eq!(staged.bytes(), b"hell");
-        assert!(!staged.is_empty());
-        let (buffer, len) = pool.send(staged).unwrap();
-        assert_eq!(len, 4);
-        assert_eq!(shared.state(buffer.index()), BufferState::Sending);
-        assert_eq!(pool.outstanding(), 1, "only the test's clone");
-        pool.release(buffer);
-        let granted = pool.take(BufferState::Binding).unwrap();
-        pool.release(granted);
-        assert_eq!(shared.count_in(BufferState::Free), 2);
-        // Bad staging lengths.
-        assert!(shared.stage(0).is_none());
-        assert!(shared.stage(LEN + 1).is_none());
-        let waker = Waker::from(Arc::new(Count(AtomicUsize::new(0))));
-        assert!(matches!(
-            shared.poll_stage(0, &waker),
-            Some(Err(Error::InvalidRange))
-        ));
-    }
-
-    #[test]
-    /// Exhaustion waits; a buffer dropped on another thread wakes waiters
-    /// and the owner and is reusable.
+    /// Exhaustion refuses; a page dropped on another thread wakes the owner
+    /// and its buffer is reusable.
     fn exhaustion_and_cross_thread_return() {
         let sim = Simulation::new();
         let (pool, _charge) = pool(&sim, 1);
@@ -871,34 +507,17 @@ mod tests {
         let buffer = pool.take(BufferState::Binding).unwrap();
         assert!(pool.take(BufferState::Binding).is_none());
         let page = pool.own(buffer, 3).unwrap();
-        let waiter = Arc::new(Count(AtomicUsize::new(0)));
-        assert!(shared.poll_stage(3, &Waker::from(waiter.clone())).is_none());
         std::thread::spawn(move || {
             assert_eq!(page.bytes(), [0; 3]);
             drop(page);
         })
         .join()
         .unwrap();
-        assert_eq!(waiter.0.load(Ordering::SeqCst), 1);
         assert_eq!(owner.0.load(Ordering::SeqCst), 1);
-        let staged = shared.poll_stage(3, &Waker::from(waiter)).unwrap().unwrap();
-        std::thread::spawn(move || drop(staged)).join().unwrap();
+        let buffer = pool.take(BufferState::Binding).unwrap();
+        pool.release(buffer);
         drop(shared);
         assert!(pool.idle());
-    }
-
-    #[test]
-    /// A send buffer from another pool is refused and returned intact.
-    fn foreign_send_buffer_is_refused() {
-        let sim = Simulation::new();
-        let (left, _a) = pool(&sim, 1);
-        let (right, _b) = pool(&sim, 1);
-        let staged = right.shared().stage(1).unwrap();
-        let (error, staged) = left.send(staged).unwrap_err();
-        assert_eq!(error, Error::InvalidRequest);
-        assert_eq!(right.shared().state(0), BufferState::Staging);
-        drop(staged);
-        assert!(right.idle() && left.idle());
     }
 
     #[test]
@@ -913,7 +532,7 @@ mod tests {
         assert_eq!(page.bytes(), [0; 4]);
         drop(page);
         assert_eq!(charge.get(), 1, "leaked region keeps the guard");
-        assert_eq!(sim.live_resources(), 2, "device and region stay");
+        assert_eq!(sim.live_resources(), 3, "device and both regions stay");
     }
 
     #[test]
@@ -934,7 +553,7 @@ mod tests {
             assert!(pool.outstanding() == 0 && !pool.idle());
             drop(pool);
             assert_eq!(charge.get(), 1);
-            assert_eq!(sim.live_resources(), 2);
+            assert_eq!(sim.live_resources(), 3);
         }
     }
 }

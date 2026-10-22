@@ -27,7 +27,7 @@ use crate::{
     channel::{self, Completer, Op, op},
     ffi::{self, Access, NativeDevice, NativeRegion},
     link::{self, Break, Epoch, Granted, Limits, Link, Phase, Role, Source},
-    pool::{BufferState, Pool, PoolShared, SendBuffer},
+    pool::{BufferState, Pool, PoolShared},
 };
 
 /// Commands each worker may queue before [`Error::Overloaded`].
@@ -113,7 +113,9 @@ pub struct NodeConfig {
     /// Runs on the owner thread with the discovered ports.
     pub selector: Box<LinkSelector>,
 
-    /// Registered bytes per selected device, split into page buffers.
+    /// Registered bytes per selected device, split into receive page
+    /// buffers. Every selected device must also support implicit on-demand
+    /// paging, which writes read caller memory through.
     pub pool_bytes: usize,
 
     /// Page buffer length (Racer: `MAX_CIPHERTEXT` rounded up to 4 KiB).
@@ -127,15 +129,6 @@ pub struct NodeConfig {
 
     /// A ready link with no grant, write, or release this long closes.
     pub idle: Duration,
-
-    /// Register page memory with remote write as well (provider escape
-    /// hatch, see "Least access").
-    pub mr_remote_write: bool,
-
-    /// Register one implicit on-demand paging region per device so
-    /// [`Source::Bytes`] writes go out without a copy. Devices without
-    /// implicit ODP fall back to copying; see [`Client::zero_copy`].
-    pub zero_copy: bool,
 
     /// Charged for every native object of this activation; leaks with any
     /// leaked object.
@@ -406,54 +399,6 @@ impl Client {
         }
     }
 
-    /// Take a free page buffer of `rail` to stage `len` bytes for
-    /// [`Source::Staged`]. `Pending` until one returns.
-    pub fn send_buffer(
-        &self,
-        rail: u16,
-        len: usize,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<SendBuffer>> {
-        let pool = match self.shared.pools.try_read() {
-            Ok(pools) => pools.get(&rail).cloned(),
-            Err(_) => return Poll::Pending,
-        };
-        let Some(pool) = pool else {
-            return Poll::Ready(Err(Error::Unavailable));
-        };
-
-        match pool.poll_stage(len, cx.waker()) {
-            Some(result) => Poll::Ready(result),
-            None => Poll::Pending,
-        }
-    }
-
-    /// Take a free page buffer of `rail` without waiting. `Ok(None)` when
-    /// none is free right now or the pool table is busy; registers no waker.
-    pub fn try_send_buffer(&self, rail: u16, len: usize) -> Result<Option<SendBuffer>> {
-        let pool = match self.shared.pools.try_read() {
-            Ok(pools) => pools.get(&rail).cloned(),
-            Err(_) => return Ok(None),
-        };
-        let Some(pool) = pool else {
-            return Err(Error::Unavailable);
-        };
-
-        pool.try_stage(len)
-    }
-
-    /// True if [`Source::Bytes`] writes on `rail` go out without a copy (the
-    /// device has an implicit on-demand paging region). `false` for an
-    /// unknown rail or while the pool table is busy.
-    pub fn zero_copy(&self, rail: u16) -> bool {
-        self.shared
-            .pools
-            .try_read()
-            .ok()
-            .and_then(|pools| pools.get(&rail).map(|pool| pool.zero_copy()))
-            .unwrap_or(false)
-    }
-
     /// Page buffers of `rail` in `state`, for diagnostics.
     pub fn buffers(&self, rail: u16, state: BufferState) -> Option<usize> {
         let pools = self.shared.pools.try_read().ok()?;
@@ -686,6 +631,9 @@ impl Owner {
         match command {
             Command::Activate(config, done) => {
                 let result = self.activate(config);
+                if result.is_err() {
+                    self.abandon_activation();
+                }
                 self.dirty = true;
                 let _ = done.complete(result);
             }
@@ -734,7 +682,7 @@ impl Owner {
                 deadline,
                 done,
             } => match self.ready(key, epoch) {
-                Some((link, pool)) => link.write(pool, tag, source, deadline, done, now),
+                Some((link, _)) => link.write(tag, source, deadline, done, now),
                 None => {
                     let _ = done.complete(Err(Error::Unavailable));
                 }
@@ -762,6 +710,23 @@ impl Owner {
             .filter(|link| link.epoch() == epoch)?;
         let device = self.devices.get(&key.rail)?;
         Some((link, &device.pool))
+    }
+
+    /// Release what a failed [`Self::activate`] built. Its devices and
+    /// regions are already dropped, so the charge returns unless a native
+    /// object leaked against it.
+    fn abandon_activation(&mut self) {
+        if self.settings.is_some() || !self.devices.is_empty() {
+            return;
+        }
+
+        if self
+            .quota
+            .take()
+            .is_some_and(|q| q.quarantined() || Arc::strong_count(&q) != 1)
+        {
+            self.leaked = true;
+        }
     }
 
     fn activate(&mut self, config: NodeConfig) -> Result<Vec<Selection>> {
@@ -818,11 +783,6 @@ impl Owner {
         }
 
         let mut devices: Vec<Option<NativeDevice>> = discovered.into_iter().map(Some).collect();
-        let access = if config.mr_remote_write {
-            Access::PAGES_REMOTE_WRITE
-        } else {
-            Access::PAGES
-        };
         let count = config.pool_bytes / config.buffer_len;
         let mut built = BTreeMap::new();
 
@@ -835,15 +795,13 @@ impl Owner {
             let region = NativeRegion::with_access(
                 device.clone(),
                 count * config.buffer_len,
-                access,
+                Access::PAGES,
                 quota.clone(),
             )?;
-            let mut pool = Pool::new(region, config.buffer_len, quota.clone())?;
-            if config.zero_copy
-                && let Some(implicit) = NativeRegion::implicit(device.clone(), quota.clone())
-            {
-                pool.set_implicit(implicit);
-            }
+            // Writes read caller memory in place; there is no copy path.
+            let implicit =
+                NativeRegion::implicit(device.clone(), quota.clone()).ok_or(Error::Unavailable)?;
+            let pool = Pool::new(region, implicit, config.buffer_len, quota.clone())?;
             built.insert(selection.tag as u16, DeviceState { pool, device });
         }
 

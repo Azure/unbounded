@@ -81,8 +81,6 @@ fn config(charge: &Arc<AtomicUsize>) -> NodeConfig {
         max_links: 2,
         grants_per_link: 2,
         idle: Duration::from_secs(120),
-        mr_remote_write: false,
-        zero_copy: false,
         guard: Arc::new(Charge(charge.clone())),
     }
 }
@@ -193,7 +191,7 @@ fn link_up(w: &mut World) -> (Epoch, Epoch) {
 }
 
 fn bytes(data: Vec<u8>) -> Source {
-    Source::Bytes(Arc::new(data))
+    Source::new(Arc::new(data))
 }
 
 fn page(arrival: rdma_verbs::Result<Arrival>) -> rdma_verbs::RegisteredPage {
@@ -245,23 +243,46 @@ fn pages_flow_both_ways_over_one_link() {
     }
     assert_eq!(w.a.clients[0].buffers(7, BufferState::Free), Some(BUFFERS));
     assert_eq!(w.b.clients[0].buffers(7, BufferState::Free), Some(BUFFERS));
-    // A staged send buffer from the client works too.
+    // A static source is written in place too, and no write takes a pool
+    // buffer: page buffers only receive.
+    static ZERO: &[u8] = b"zero";
     let deadline = now() + 5 * SECOND;
     let granted = w.b.clients[0].grant(TO_A, eb, [9; 16], 4, deadline);
     let granted = wait(&mut w, &granted).unwrap();
-    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-    let Poll::Ready(Ok(mut staged)) = w.a.clients[1].send_buffer(7, 4, &mut cx) else {
-        panic!("no send buffer");
-    };
-    staged.bytes_mut().copy_from_slice(b"zero");
-    assert!(matches!(
-        w.a.clients[1].send_buffer(9, 4, &mut cx),
-        Poll::Ready(Err(Error::Unavailable))
-    ));
-    let written = w.a.clients[1].write(TO_B, ea, granted.tag, Source::Staged(staged), deadline);
+    let source = Source::new(Arc::new(ZERO));
+    let written = w.a.clients[1].write(TO_B, ea, granted.tag, source, deadline);
+    assert_eq!(w.a.clients[0].buffers(7, BufferState::Free), Some(BUFFERS));
     assert_eq!(wait(&mut w, &written), Ok(()));
     assert_eq!(page(ready(&granted.arrival)).bytes(), b"zero");
     shutdown(w);
+}
+
+#[test]
+/// A device without implicit on-demand paging cannot send in place, and
+/// there is no copy path: activation fails, frees every native object, and
+/// returns the charge. Once the device supports it, activation succeeds.
+fn activation_requires_implicit_odp_and_releases_on_failure() {
+    let sim = Simulation::new();
+    let clock = SimulationClock::new(7);
+    let environment = clock.environment(1);
+    let mut node = node(&sim, 1, &environment);
+    let _guard = environment.enter();
+    sim.implicit_odp(false);
+    let activation = node.clients[0].activate(config(&node.charge));
+    node.owner().poll_budgeted(4).unwrap();
+    assert_eq!(ready(&activation).err(), Some(Error::Unavailable));
+    assert_eq!(node.charge.load(Ordering::Acquire), 0, "charge returned");
+    assert_eq!(sim.live_resources(), 0, "nothing registered stays");
+    assert_eq!(node.clients[0].buffers(7, BufferState::Free), None);
+    sim.implicit_odp(true);
+    let activation = node.clients[0].activate(config(&node.charge));
+    node.owner().poll_budgeted(4).unwrap();
+    assert_eq!(ready(&activation).unwrap()[0].tag, 7);
+    assert_eq!(node.clients[0].buffers(7, BufferState::Free), Some(BUFFERS));
+    node.clients[0].close();
+    node.owner().poll_budgeted(4).unwrap();
+    assert!(node.clients[0].drained());
+    assert_eq!(node.charge.load(Ordering::Acquire), 0);
 }
 
 #[test]
@@ -611,24 +632,27 @@ fn owner_hosted_by_with_native() {
 
 #[test]
 /// Drain and fence drive inner work alongside the native drain. The inner
-/// side holds a pool buffer (like a queued crypto Stage job) that it only
-/// returns while its own drain or fence runs; draining the native side first
-/// would wait forever.
+/// side holds a received page that it only returns while its own drain or
+/// fence runs; draining the native side first would wait forever.
 fn with_native_drives_inner_work_holding_buffers() {
     use uring_runtime::group::Service;
 
     for fence in [false, true] {
         let mut w = world();
-        let owner = w.a.owner.take().unwrap();
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        let Poll::Ready(Ok(staged)) = w.a.clients[1].send_buffer(7, 4, &mut cx) else {
-            panic!("no staged buffer");
-        };
+        let (ea, eb) = link_up(&mut w);
+        let deadline = now() + 5 * SECOND;
+        let granted = w.a.clients[0].grant(TO_B, ea, [1; 16], 4, deadline);
+        let granted = wait(&mut w, &granted).unwrap();
+        let written = w.b.clients[0].write(TO_A, eb, granted.tag, bytes(vec![2; 4]), deadline);
+        assert_eq!(wait(&mut w, &written), Ok(()));
+        let held = page(ready(&granted.arrival));
         assert_eq!(
             w.a.clients[1].buffers(7, BufferState::Free),
             Some(BUFFERS - 1)
         );
-        let holder = inner::Holder(Some(staged));
+        let owner = w.a.owner.take().unwrap();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let holder = inner::Holder(Some(held));
         let mut service = rdma_verbs::WithNative::with_host(holder, owner);
         service.register_driver(cx.waker());
         service.poll_budgeted(&mut cx, 8).unwrap();
@@ -695,8 +719,8 @@ mod inner {
 
     pub struct Inner;
 
-    /// Holds a buffer until its drain or fence runs, like a queued crypto job.
-    pub struct Holder(pub Option<rdma_verbs::SendBuffer>);
+    /// Holds a received page until its drain or fence runs.
+    pub struct Holder(pub Option<rdma_verbs::RegisteredPage>);
 
     impl Service<Scope> for Holder {
         fn waker(&self) -> Result<Waker, Failure> {

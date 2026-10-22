@@ -127,11 +127,6 @@ pub struct Config {
     /// multi-segment signed heads, so Nagle stalls every round on a delayed ACK.
     /// Defaults on; set false only to reproduce the pre-nodelay socket behavior.
     pub peer_tcp_nodelay: bool,
-    /// Send memory-resident pages over RDMA straight from their memory
-    /// through an implicit on-demand paging MR, without a staging copy.
-    /// Defaults on; devices without implicit ODP copy anyway. Set false to
-    /// force the copy path, for example to compare benchmarks.
-    pub rdma_zero_copy: bool,
     /// cgroup v2 memory-pressure monitoring and reclaim. Defaults on.
     pub memory_pressure: bool,
     pub pprof_enabled: bool,
@@ -245,7 +240,6 @@ impl Config {
             enable_rdma,
             opaque_relay: raw.opaque_relay.unwrap_or(false),
             peer_tcp_nodelay: raw.peer_tcp_nodelay.unwrap_or(true),
-            rdma_zero_copy: raw.rdma_zero_copy.unwrap_or(true),
             memory_pressure: raw.memory_pressure.unwrap_or(true),
             pprof_enabled: raw.pprof_enabled.unwrap_or(false),
             control_endpoint: raw.control_endpoint,
@@ -591,7 +585,6 @@ const ENV_NAMES: &[&str] = &[
     "ALLOW_SMT",
     "OPAQUE_RELAY",
     "PEER_TCP_NODELAY",
-    "RDMA_ZERO_COPY",
     "MEMORY_PRESSURE",
     "PPROF_ENABLED",
     "PEER_LISTEN",
@@ -666,7 +659,6 @@ struct RawConfig {
     allow_smt: Option<bool>,
     opaque_relay: Option<bool>,
     peer_tcp_nodelay: Option<bool>,
-    rdma_zero_copy: Option<bool>,
     memory_pressure: Option<bool>,
     pprof_enabled: Option<bool>,
     peer_listen: Option<String>,
@@ -958,8 +950,8 @@ mod tests {
             .iter()
             .map(|name| {
                 let value = match *name {
-                    "ALLOW_SMT" | "OPAQUE_RELAY" | "PEER_TCP_NODELAY" | "RDMA_ZERO_COPY"
-                    | "MEMORY_PRESSURE" | "PPROF_ENABLED" => "true",
+                    "ALLOW_SMT" | "OPAQUE_RELAY" | "PEER_TCP_NODELAY" | "MEMORY_PRESSURE"
+                    | "PPROF_ENABLED" => "true",
                     _ => "1",
                 };
                 ((*name).to_owned(), value.to_owned())
@@ -1789,11 +1781,6 @@ mod tests {
     #[test]
     fn peer_tcp_nodelay_requires_exact_boolean_and_defaults_on() {
         exact_boolean_default("RACER_PEER_TCP_NODELAY", |c| c.peer_tcp_nodelay, true);
-    }
-
-    #[test]
-    fn rdma_zero_copy_requires_exact_boolean_and_defaults_on() {
-        exact_boolean_default("RACER_RDMA_ZERO_COPY", |c| c.rdma_zero_copy, true);
     }
 
     #[test]

@@ -220,19 +220,8 @@ pub struct Links {
 
     draining: Cell<bool>,
 
-    /// This worker's crypto thread, which stages send copies.
-    stager: Option<Rc<crate::security::CryptoClient>>,
-
-    /// Ask the owner for implicit on-demand paging regions at activation, so
-    /// sends read pages in place (`RACER_RDMA_ZERO_COPY`).
-    zero_copy: bool,
-
     /// Transfer counters, so benchmarks can tell which path pages took.
     metrics: Option<crate::telemetry::Metrics>,
-
-    /// Sends staged on the crypto thread and sends left to the owner.
-    #[cfg(test)]
-    pub(crate) staging: Cell<(usize, usize)>,
 }
 
 impl Links {
@@ -255,22 +244,11 @@ impl Links {
             retry: reactor.map_or_else(NativeRetry::unattached, NativeRetry::new),
             tasks: RefCell::new(Vec::new()),
             draining: Cell::new(false),
-            stager: None,
-            zero_copy: true,
             metrics: None,
-            #[cfg(test)]
-            staging: Cell::new((0, 0)),
         }
     }
 
-    /// Request (default) or refuse zero-copy sends at activation. Without it,
-    /// or on devices without implicit on-demand paging, every send copies.
-    pub fn with_zero_copy(mut self, enabled: bool) -> Self {
-        self.zero_copy = enabled;
-        self
-    }
-
-    /// Count pages, bytes, and send paths in `metrics`.
+    /// Count pages and bytes in `metrics`.
     pub fn with_metrics(mut self, metrics: crate::telemetry::Metrics) -> Self {
         self.metrics = Some(metrics);
         self
@@ -298,19 +276,6 @@ impl Links {
     /// Count a peer transfer that planned RDMA but carried its page over HTTP.
     pub fn record_http_fallback(&self) {
         self.record(crate::telemetry::Event::RdmaHttpFallback, 1);
-    }
-
-    /// True if sends on `rail` read pages in place, without a copy.
-    pub fn zero_copy(&self, rail: RailId) -> bool {
-        self.client.zero_copy(rail.0)
-    }
-
-    /// Copy outgoing ciphertext into registered memory on `crypto`'s thread
-    /// instead of the shared owner thread (`designs/racer-rdma-sessions.md`,
-    /// "Zero-copy").
-    pub fn with_stager(mut self, crypto: Rc<crate::security::CryptoClient>) -> Self {
-        self.stager = Some(crypto);
-        self
     }
 
     /// The local node.
@@ -442,8 +407,6 @@ impl Links {
                     max_links: 2 * crate::topology::MAX_DEGREE,
                     grants_per_link: self.grants_per_link,
                     idle: LINK_IDLE,
-                    mr_remote_write: false,
-                    zero_copy: self.zero_copy,
                     guard,
                 }),
                 scope,
@@ -739,18 +702,10 @@ impl Links {
         if link != grant.link {
             return Err(Error::Unavailable);
         }
-        // With an implicit on-demand paging region the owner posts the write
-        // straight from the page and holds it until the completion: no copy.
-        // Otherwise copy once, on the crypto thread when a buffer is free.
-        let zero_copy = self.client.zero_copy(grant.rail.0);
-        let source = if zero_copy {
-            Source::Bytes(Arc::new(PageSource(page.clone())))
-        } else {
-            match self.stage(grant.rail, page, scope).await? {
-                Some(buffer) => Source::Staged(buffer),
-                None => Source::Bytes(Arc::new(PageSource(page.clone()))),
-            }
-        };
+        // The owner posts the write straight from the page through the
+        // device's implicit on-demand paging region and holds it until the
+        // completion, or until the QP is destroyed if the link breaks.
+        let source = Source::new(Arc::new(PageSource(page.clone())));
         let key = link_key(peer, grant.rail);
         let written = self
             .wait(
@@ -768,54 +723,11 @@ impl Links {
             }
             return Err(error);
         }
-        self.record(
-            if zero_copy {
-                crate::telemetry::Event::RdmaPagesSentZeroCopy
-            } else {
-                crate::telemetry::Event::RdmaPagesSentCopy
-            },
-            1,
-        );
+        self.record(crate::telemetry::Event::RdmaPagesSent, 1);
         self.record(crate::telemetry::Event::RdmaSentBytes, length as u64);
         Ok(NativeSent {
             value: completion_value(grant.link, grant.tag, length as u32, grant.transfer),
         })
-    }
-
-    /// Copy `page` into a free send buffer of `rail` on the crypto thread.
-    /// `None` leaves the copy to the owner (`Source::Bytes`): no stager, no free
-    /// buffer right now, or a stager failure other than the request's own
-    /// cancellation. A failed copy drops the buffer, which returns it to the
-    /// pool.
-    async fn stage(
-        &self,
-        rail: RailId,
-        page: &CiphertextPage,
-        scope: &RequestScope,
-    ) -> Result<Option<rdma_verbs::SendBuffer>> {
-        let Some(crypto) = &self.stager else {
-            return Ok(None);
-        };
-        // Never wait for a buffer here: the owner queues `Source::Bytes`
-        // writes itself, so take one only if it is free right now.
-        let staged = match self.client.try_send_buffer(rail.0, page.bytes().len()) {
-            Ok(Some(buffer)) => match crypto.stage(page.clone(), buffer, scope).await {
-                Ok(buffer) => Some(buffer),
-                Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => return Err(error),
-                Err(_) => None,
-            },
-            Ok(None) | Err(_) => None,
-        };
-        #[cfg(test)]
-        {
-            let (yes, no) = self.staging.get();
-            self.staging.set(if staged.is_some() {
-                (yes + 1, no)
-            } else {
-                (yes, no + 1)
-            });
-        }
-        Ok(staged)
     }
 
     /// Sender: decline the peer's grant if its link is still the granted one.

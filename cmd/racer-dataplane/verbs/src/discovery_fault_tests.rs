@@ -247,8 +247,6 @@ fn activate(
         max_links: 1,
         grants_per_link: 1,
         idle: std::time::Duration::from_secs(1),
-        mr_remote_write: false,
-        zero_copy: false,
         guard,
     });
     owner.poll_budgeted(2).unwrap();

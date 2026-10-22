@@ -26,15 +26,15 @@
 //!
 //! See `designs/racer-verbs.md`.
 //!
-//! # Zero-copy sends
+//! # Direct sends
 //!
-//! With [`NodeConfig::zero_copy`], each device also gets one implicit
-//! on-demand paging (ODP) MR over the whole address space. A
-//! [`Source::Bytes`] write then posts the caller's memory directly as its
-//! SGE; the owner holds the source `Arc` until the send completion, or until
-//! the QP is destroyed if the link breaks, and leaks it if destroy fails.
-//! Devices without implicit ODP for RC writes copy into a page buffer
-//! instead. [`Client::zero_copy`] reports which applies per rail.
+//! Each device gets one implicit on-demand paging (ODP) MR over the whole
+//! address space. A [`Source`] write posts the caller's memory directly as
+//! its SGE; the owner holds the source `Arc` until the send completion, or
+//! until the QP is destroyed if the link breaks, and leaks it if destroy
+//! fails. Page buffers only receive. Activation fails with
+//! [`Error::Unavailable`] if a selected device lacks implicit ODP, and
+//! releases everything it built.
 //!
 //! # Stopping is the only fence
 //!
@@ -77,7 +77,7 @@ pub use node::{
     BACKOFF_MAX, BACKOFF_MIN, BACKOFF_RESET, COMMAND_QUEUE, Client, LinkKey, LinkSelector,
     LinkState, NodeConfig, Opened, Owner, OwnerPort, SETUP_TIMEOUT, Setup, node,
 };
-pub use pool::{BufferState, RegisteredPage, SendBuffer};
+pub use pool::{BufferState, RegisteredPage};
 
 #[cfg(any(test, feature = "simulation"))]
 pub use ffi::simulation;

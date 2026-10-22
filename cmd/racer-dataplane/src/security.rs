@@ -357,8 +357,7 @@ impl PageCrypto {
                 CryptoOutput::Decrypted(page, _original_ciphertext) => Ok(page),
                 CryptoOutput::Encrypted(..)
                 | CryptoOutput::Checksummed(_)
-                | CryptoOutput::EnvelopeVerified(_)
-                | CryptoOutput::Staged(_) => Err(Error::CorruptRecord),
+                | CryptoOutput::EnvelopeVerified(_) => Err(Error::CorruptRecord),
             }
         })
     }
@@ -405,8 +404,7 @@ impl PageCrypto {
                 CryptoOutput::Encrypted(plaintext, ciphertext) => Ok((plaintext, ciphertext)),
                 CryptoOutput::Decrypted(..)
                 | CryptoOutput::Checksummed(_)
-                | CryptoOutput::EnvelopeVerified(_)
-                | CryptoOutput::Staged(_) => Err(Error::CorruptRecord),
+                | CryptoOutput::EnvelopeVerified(_) => Err(Error::CorruptRecord),
             }
         })
     }
@@ -450,15 +448,6 @@ impl PageCryptoEngine {
                     _key: key,
                 };
             }
-            CryptoInput::Stage { ciphertext, buffer } => {
-                let outcome = Self::stage(ciphertext, buffer, &scope);
-                permit.executed(measurement_start);
-                return CryptoCompletion {
-                    permit,
-                    outcome,
-                    _key: key,
-                };
-            }
             input => input,
         };
         let mut input = input;
@@ -492,30 +481,6 @@ impl PageCryptoEngine {
             outcome,
             _key: key,
         }
-    }
-
-    /// Copy cached ciphertext into a registered send buffer off the I/O and
-    /// verbs owner threads. Failure returns both owners; dropping the buffer
-    /// returns it to its pool.
-    fn stage(
-        ciphertext: CiphertextPage,
-        mut buffer: rdma_verbs::SendBuffer,
-        scope: &RequestScope,
-    ) -> CryptoOutcome {
-        let fail = |ciphertext, buffer, error| CryptoOutcome::Failed {
-            input: CryptoInput::Stage { ciphertext, buffer },
-            error,
-        };
-        if let Err(error) = scope.check() {
-            return fail(ciphertext, buffer, error);
-        }
-        let bytes = ciphertext.bytes();
-        if bytes.is_empty() || bytes.len() > buffer.len() {
-            return fail(ciphertext, buffer, Error::InvalidRange);
-        }
-        buffer.truncate(bytes.len());
-        buffer.bytes_mut().copy_from_slice(bytes);
-        CryptoOutcome::Completed(CryptoOutput::Staged(buffer))
     }
 
     /// Decrypt with one read of the ciphertext for both its CRC and the AEAD
@@ -602,7 +567,6 @@ impl PageCryptoEngine {
         key.require_purpose(KeyPurpose::Page)?;
         let (envelope, mut bytes) = match input {
             CryptoInput::VerifyEnvelope(_) => unreachable!("envelope handled above"),
-            CryptoInput::Stage { .. } => unreachable!("stage handled above"),
             CryptoInput::Checksum { .. } => unreachable!("checksum handled above"),
             CryptoInput::Encrypt {
                 page,
@@ -736,7 +700,6 @@ impl PageCryptoEngine {
     ) -> CryptoOutcome {
         match input {
             CryptoInput::VerifyEnvelope(_) => unreachable!("envelope handled above"),
-            CryptoInput::Stage { .. } => unreachable!("stage handled above"),
             CryptoInput::Checksum { ciphertext } => {
                 CryptoOutcome::Completed(CryptoOutput::Checksummed(ciphertext))
             }
@@ -1190,12 +1153,6 @@ pub enum CryptoInput {
         plaintext: PlaintextBuffer,
         ciphertext: EncryptOutput,
     },
-    /// Copy cached ciphertext into a registered RDMA send buffer
-    /// (`designs/racer-rdma-sessions.md`, "Zero-copy").
-    Stage {
-        ciphertext: CiphertextPage,
-        buffer: rdma_verbs::SendBuffer,
-    },
 }
 /// Where AEAD output is written.
 pub enum EncryptOutput {
@@ -1217,8 +1174,6 @@ pub enum CryptoOutput {
     /// retain it for peer copies/persistence after consuming the completion.
     Decrypted(VerifiedPage, CiphertextPage),
     Encrypted(VerifiedPage, CiphertextPage),
-    /// The filled send buffer, ready for `Source::Staged`.
-    Staged(rdma_verbs::SendBuffer),
 }
 /// Non-cloneable, pair-bound reservation of both submission and completion space.
 /// Only the I/O endpoint can mint it. Failed submission returns the entire job.
@@ -1386,13 +1341,11 @@ impl CryptoPermit {
         use uring_runtime::reactor::IoBuffer;
         self.measurement.checksum_only = matches!(
             input,
-            CryptoInput::Checksum { .. }
-                | CryptoInput::VerifyEnvelope(_)
-                | CryptoInput::Stage { .. }
+            CryptoInput::Checksum { .. } | CryptoInput::VerifyEnvelope(_)
         );
         self.measurement.decrypt = matches!(input, CryptoInput::Decrypt { .. });
         self.measurement.bytes = match &input {
-            CryptoInput::VerifyEnvelope(_) | CryptoInput::Stage { .. } => 0,
+            CryptoInput::VerifyEnvelope(_) => 0,
             CryptoInput::Encrypt { plaintext, .. } => {
                 plaintext.bytes().map_or(0, |b| b.len() as u64)
             }
@@ -1582,24 +1535,6 @@ impl CryptoClient {
         scope: &'a RequestScope,
     ) -> Operation<'a, CryptoOutput> {
         self.execute_inner(CryptoInput::VerifyEnvelope(job), None, scope, None)
-    }
-    /// Copy `ciphertext` into `buffer` on the paired crypto thread. Failure
-    /// drops the buffer, returning it to its pool.
-    pub(crate) fn stage<'a>(
-        &'a self,
-        ciphertext: CiphertextPage,
-        buffer: rdma_verbs::SendBuffer,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, rdma_verbs::SendBuffer> {
-        Box::pin(async move {
-            match self
-                .execute_inner(CryptoInput::Stage { ciphertext, buffer }, None, scope, None)
-                .await?
-            {
-                CryptoOutput::Staged(buffer) => Ok(buffer),
-                _ => Err(Error::CorruptRecord),
-            }
-        })
     }
     pub fn new(port: IoCryptoPort) -> Self {
         let executor = offload::Client::new(NonZeroUsize::new(port.queue.capacity()).unwrap());
