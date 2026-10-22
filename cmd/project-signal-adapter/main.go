@@ -56,7 +56,12 @@ func main() {
 	flags.StringVar(&cfg.LegacyParticipants, "participants", "", "Compatibility comma-separated Node names")
 	flags.StringVar(&cfg.ScriptConfigMap, "script-configmap", "", "Immutable script ConfigMap")
 	flags.StringVar(&cfg.ScriptKey, "script-key", "", "Script ConfigMap key")
-	flags.StringVar(&cfg.ScriptDigest, "script-digest", "", "SHA-256 digest of the script bytes")
+	flags.StringVar(
+		&cfg.ScriptDigest,
+		"script-digest",
+		"",
+		"algorithm-qualified SHA-256 digest of the script bytes (sha256:<64 lowercase hex>)",
+	)
 	flags.StringVar(&cfg.RunnerImage, "runner-image", "", "Digest-pinned runner image")
 	flags.StringVar(&cfg.BackendAPIVersion, "backend-api-version", "", "Backend API version")
 	flags.StringVar(&cfg.BackendKind, "backend-kind", "", "Backend kind")

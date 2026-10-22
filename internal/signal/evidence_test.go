@@ -8,7 +8,6 @@ import (
 	"compress/gzip"
 	"context"
 	"io"
-	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -41,8 +40,8 @@ func TestKubernetesEvidenceStoreReturnsQueryableRunURIAndDigest(t *testing.T) {
 		t.Fatalf("unexpected URI %q", uri)
 	}
 
-	if !strings.HasPrefix(digest, "sha256:") || len(digest) != len("sha256:")+64 {
-		t.Fatalf("unexpected digest %q", digest)
+	if digest != digestBytes(data) {
+		t.Fatalf("digest = %q, want %q", digest, digestBytes(data))
 	}
 
 	var evidence corev1.ConfigMap

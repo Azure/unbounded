@@ -68,7 +68,7 @@ The referenced WorkflowTemplate must accept these string parameters:
 | `request-node-name` | Node that triggered the grouped run |
 | `script-configmap` | Immutable run-owned ConfigMap |
 | `script-key` | Selected ConfigMap key |
-| `script-digest` | SHA-256 of the selected script bytes |
+| `script-digest` | Algorithm-qualified SHA-256 of the selected script bytes (`sha256:<64 lowercase hex>`) |
 | `backend-api-version` | Backend API version from the profile |
 | `backend-kind` | Backend kind from the profile |
 | `queue` | Optional backend queue |

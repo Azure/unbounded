@@ -1499,7 +1499,11 @@ func workflowMessage(workflow *unstructured.Unstructured) string {
 }
 
 func digestString(content string) string {
-	sum := sha256.Sum256([]byte(content))
+	return digestBytes([]byte(content))
+}
+
+func digestBytes(content []byte) string {
+	sum := sha256.Sum256(content)
 
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
