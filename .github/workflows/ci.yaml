@@ -31,9 +31,92 @@ env:
   CNI_PLUGINS_VERSION: v1.9.1
 
 jobs:
+  # ---------- Change scope ----------
+  # Racer changes skip the jobs that cannot observe them. A change limited to
+  # Racer, its docs and NOTICE skips the frontend, BPF, orca and net image
+  # builds. A change limited to the Rust dataplane also skips the Go jobs,
+  # since no Go package builds it; racer.yaml tests it instead.
+  #
+  # Skipped jobs pass required checks, so the gated jobs run unless an output
+  # is exactly 'false' and use !cancelled() to run even if this job fails. An
+  # unclassified change therefore runs everything rather than nothing.
+  changes:
+    name: Change Scope
+    runs-on: ubuntu-latest
+    outputs:
+      full: ${{ steps.scope.outputs.full }}
+      go: ${{ steps.scope.outputs.go }}
+    steps:
+      - name: Checkout
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+
+      - name: Classify changed files
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          MERGE_GROUP_BASE: ${{ github.event.merge_group.base_sha }}
+        run: |
+          set -euo pipefail
+
+          case "$EVENT" in
+            pull_request)
+              # The checked-out merge commit's first parent is the target branch.
+              base=HEAD^1
+              ;;
+            merge_group)
+              base="$MERGE_GROUP_BASE"
+              git fetch --no-tags --depth=1 origin "$base"
+              ;;
+            *)
+              echo "full=true" >> "$GITHUB_OUTPUT"
+              echo "go=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          files="$(git diff --name-only --no-renames "$base" HEAD)"
+          full=false
+          go=false
+          racer=false
+          while IFS= read -r path; do
+            case "$path" in
+              docs/* | designs/* | NOTICE)
+                ;;
+              cmd/racer-dataplane/* | images/racer-dataplane/* | hack/scripts/runtime-miri.py)
+                racer=true
+                ;;
+              api/racer/* | cmd/racer-*/* | internal/racer/* | internal/racerobject/* | \
+                internal/operator/components/racer/* | pkg/racersdk/* | deploy/racer/* | \
+                deploy/racer-*/* | images/racer-*/* | e2e/racer/* | .github/workflows/racer*.yaml)
+                racer=true
+                go=true
+                ;;
+              *)
+                echo "Outside Racer: $path"
+                full=true
+                ;;
+            esac
+          done <<< "$files"
+
+          if [ "$racer" = false ]; then
+            full=true
+          fi
+          if [ "$full" = true ]; then
+            go=true
+          fi
+
+          echo "full=$full go=$go"
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+          echo "go=$go" >> "$GITHUB_OUTPUT"
+
   # ---------- Frontend ----------
   frontend:
     name: Build Frontend
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.full != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -60,13 +143,15 @@ jobs:
   # ---------- Lint ----------
   lint:
     name: Lint
-    needs: [frontend]
+    needs: [changes, frontend]
+    if: ${{ !cancelled() && needs.changes.outputs.go != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download frontend dist
+        if: needs.frontend.result == 'success'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: frontend-dist
@@ -95,13 +180,15 @@ jobs:
   # ---------- Test ----------
   test:
     name: Test
-    needs: [frontend]
+    needs: [changes, frontend]
+    if: ${{ !cancelled() && needs.changes.outputs.go != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download frontend dist
+        if: needs.frontend.result == 'success'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: frontend-dist
@@ -141,13 +228,15 @@ jobs:
   # block is required.
   orca-inttest:
     name: Orca Integration Tests
-    needs: [frontend]
+    needs: [changes, frontend]
+    if: ${{ !cancelled() && needs.changes.outputs.full != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download frontend dist
+        if: needs.frontend.result == 'success'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: frontend-dist
@@ -165,13 +254,15 @@ jobs:
   # ---------- Build ----------
   build:
     name: Build
-    needs: [frontend]
+    needs: [changes, frontend]
+    if: ${{ !cancelled() && needs.changes.outputs.go != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download frontend dist
+        if: needs.frontend.result == 'success'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: frontend-dist
@@ -189,6 +280,8 @@ jobs:
   # ---------- Vulnerability Check ----------
   govulncheck:
     name: Vulnerability Check
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.go != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -206,6 +299,8 @@ jobs:
   # ---------- Verify Generated Files ----------
   verify-generated:
     name: Verify Generated Files
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.go != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -254,6 +349,8 @@ jobs:
   # bpf/clang-version and the references it documents.
   verify-bpf-binary:
     name: Verify BPF Binary
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.full != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -338,8 +435,15 @@ jobs:
   # ---------- Build Container Images ----------
   build-images:
     name: Build Images (${{ matrix.arch }})
-    needs: [frontend]
+    # This job always runs and gates its steps instead: a skipped matrix job
+    # reports one unexpanded check name, which leaves the required per-arch
+    # checks pending.
+    needs: [changes, frontend]
+    if: ${{ !cancelled() }}
     runs-on: ${{ matrix.runner }}
+    env:
+      NET_IMAGES: ${{ needs.changes.outputs.full != 'false' }}
+      RACER_IMAGES: ${{ needs.changes.outputs.go != 'false' }}
     strategy:
       fail-fast: true
       matrix:
@@ -355,23 +459,27 @@ jobs:
         run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
 
       - name: Checkout
+        if: env.RACER_IMAGES == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Download frontend dist
+        if: env.NET_IMAGES == 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: frontend-dist
           path: internal/net/html/dist
 
       - name: Cache CNI plugins
+        if: env.NET_IMAGES == 'true'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: resources
           key: cni-plugins-${{ matrix.arch }}-${{ env.CNI_PLUGINS_VERSION }}
 
       - name: Download CNI plugins
+        if: env.NET_IMAGES == 'true'
         run: |
           mkdir -p resources
           file="resources/cni-plugins-linux-${{ matrix.arch }}-${CNI_PLUGINS_VERSION}.tgz"
@@ -380,13 +488,16 @@ jobs:
           fi
 
       - name: Set up Docker Buildx
+        if: env.RACER_IMAGES == 'true'
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Compute Go version for Docker
+        if: env.NET_IMAGES == 'true'
         id: goversion
         run: echo "go_version=$(awk '/^go /{split($2,v,"."); print v[1]"."v[2]}' go.mod)" >> "$GITHUB_OUTPUT"
 
       - name: Build controller image
+        if: env.NET_IMAGES == 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
@@ -404,6 +515,7 @@ jobs:
           provenance: false
 
       - name: Build node image
+        if: env.NET_IMAGES == 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
@@ -421,6 +533,7 @@ jobs:
           provenance: false
 
       - name: Build racer-loadgen image
+        if: env.RACER_IMAGES == 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         timeout-minutes: 5
         with:
@@ -435,9 +548,11 @@ jobs:
           provenance: false
 
       - name: Smoke-test racer-loadgen entrypoint
+        if: env.RACER_IMAGES == 'true'
         run: docker run --rm --network=none racer-loadgen:ci --help
 
       - name: Build racer-object image
+        if: env.RACER_IMAGES == 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         timeout-minutes: 5
         with:
@@ -452,9 +567,11 @@ jobs:
           provenance: false
 
       - name: Smoke-test racer-object entrypoint
+        if: env.RACER_IMAGES == 'true'
         run: docker run --rm --network=none racer-object:ci --help
 
       - name: Verify OCI image layouts
+        if: env.NET_IMAGES == 'true'
         run: |
           set -euo pipefail
 
