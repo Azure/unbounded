@@ -92,6 +92,7 @@ func setHooks(t *testing.T, fetchTag func(qid, tag int) int, beforeStartDev func
 		testHooks.beforeStartDev = nil
 		testHooks.beforeStartCmd = nil
 		testHooks.failedRingClose = nil
+		testHooks.serveEIO = nil
 	})
 }
 
@@ -128,24 +129,24 @@ func waitRecorded(t *testing.T, d *Device) {
 	}
 }
 
-// recordRingCloses records, per failed queue, whether startup was
-// resolved when its ring was closed.
-func recordRingCloses(t *testing.T) func() []bool {
+// recordRingCloses records why each failed queue stopped holding its
+// ring.
+func recordRingCloses(t *testing.T) func() []string {
 	t.Helper()
 
 	var (
 		mu     sync.Mutex
-		closes []bool
+		closes []string
 	)
 
-	testHooks.failedRingClose = func(_ *queue, resolved bool) {
+	testHooks.failedRingClose = func(_ *queue, reason string) {
 		mu.Lock()
 
-		closes = append(closes, resolved)
+		closes = append(closes, reason)
 		mu.Unlock()
 	}
 
-	return func() []bool {
+	return func() []string {
 		mu.Lock()
 		defer mu.Unlock()
 
@@ -153,16 +154,18 @@ func recordRingCloses(t *testing.T) func() []bool {
 	}
 }
 
-func checkClosedAfterResolve(t *testing.T, closes []bool) {
+// checkClosedSafely checks that every failed queue closed its ring for
+// one of the allowed reasons.
+func checkClosedSafely(t *testing.T, closes []string, allowed ...string) {
 	t.Helper()
 
 	if len(closes) == 0 {
 		t.Fatal("failed queue never closed its ring")
 	}
 
-	for i, resolved := range closes {
-		if !resolved {
-			t.Errorf("failed queue ring %d closed before startup was resolved", i)
+	for i, reason := range closes {
+		if !slices.Contains(allowed, reason) {
+			t.Errorf("failed queue ring %d closed with reason %q, want one of %v", i, reason, allowed)
 		}
 	}
 }
@@ -236,7 +239,7 @@ func TestIntegrationStartupQueueFailsBeforeStartDev(t *testing.T) {
 		t.Fatalf("Start = %v, want %v", err, boom)
 	}
 
-	checkClosedAfterResolve(t, closes())
+	checkClosedSafely(t, closes(), holdResolved)
 	checkNoLeak(t, before)
 }
 
@@ -271,6 +274,47 @@ func TestIntegrationStartupQueueFailsAtStartDev(t *testing.T) {
 		t.Fatalf("Start = %v, want %v", err, boom)
 	}
 
-	checkClosedAfterResolve(t, closes())
+	checkClosedSafely(t, closes(), holdResolved)
+	checkNoLeak(t, before)
+}
+
+// TestIntegrationStartupBrokenRingAtStartDev fails a ready queue just
+// before START_DEV and makes its EIO loop fail on entry, so the queue
+// takes the broken-ring path: it cannot answer I/O and must hold its
+// ring until startup resolves or GET_DEV_INFO and sysfs show the disk
+// published. On Linux 6.8 the synchronous partition scan inside
+// START_DEV can only finish once that probe lets the queue close its
+// ring, so Start returning at all proves the probe works there.
+func TestIntegrationStartupBrokenRingAtStartDev(t *testing.T) {
+	requireFaultVM(t)
+
+	before := ublkNodes(t)
+	boom := errors.New("injected queue failure at START_DEV")
+	broken := errors.New("injected broken ring")
+
+	setHooks(t, nil, nil)
+
+	testHooks.serveEIO = func(*queue) error { return broken }
+	testHooks.beforeStartCmd = func(d *Device) {
+		injectFault(d.queues[0], boom)
+		waitRecorded(t, d)
+	}
+
+	closes := recordRingCloses(t)
+
+	d, err := startBounded(t)
+	if err == nil {
+		_ = d.Close()
+
+		t.Fatal("Start succeeded with a failed queue")
+	}
+
+	if !errors.Is(err, boom) {
+		t.Fatalf("Start = %v, want %v", err, boom)
+	}
+
+	got := closes()
+	checkClosedSafely(t, got, holdPublished, holdResolved)
+	t.Logf("failed queue released its ring because: %v", got)
 	checkNoLeak(t, before)
 }
