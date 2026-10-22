@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "racer-vllm"
+version = "0.1.0"
+description = "vLLM model loader that reads weights from a Racer cache"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = ["racer-client"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.entry-points."vllm.general_plugins"]
+racer = "racer_vllm:register"
+
+[project.scripts]
+racer-vllm-fetch = "racer_vllm.model:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
