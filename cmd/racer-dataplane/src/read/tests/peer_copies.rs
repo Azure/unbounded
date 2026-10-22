@@ -203,6 +203,7 @@ impl ScriptedPeers {
                             remaining_page_budget: subscription.page_budget - 1,
                             remaining_byte_budget: subscription.byte_budget
                                 - copy.ciphertext.bytes().len() as u64,
+                            flights: subscription.flights,
                         },
                         metadata: copy.metadata,
                         ciphertext: copy.ciphertext,
@@ -864,9 +865,14 @@ fn invalid_signed_selection_falls_back_without_resetting_acquisition_budget() {
                 crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
             ])
             .unwrap();
-            let mut work = Box::pin(f.fill.select_subscription(
+            let scheduler = crate::read::range_stream::Scheduler::new(1);
+            let selection = crate::read::range_stream::Selection::for_test(
+                &scheduler,
                 f.page.version.clone(),
                 demand,
+            );
+            let mut work = Box::pin(f.fill.select_subscription(
+                &selection,
                 f.membership.clone(),
                 &f.context,
                 &f.scope,
@@ -907,7 +913,7 @@ fn invalid_signed_selection_falls_back_without_resetting_acquisition_budget() {
 }
 
 #[test]
-fn subscription_behind_remote_warm_selects_only_published_pages() {
+fn subscription_behind_remote_warm_fills_only_the_published_head() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
@@ -934,9 +940,11 @@ fn subscription_behind_remote_warm_selects_only_published_pages() {
             end: 4,
         }])
         .unwrap();
+    let scheduler = crate::read::range_stream::Scheduler::new(1);
+    let selection =
+        crate::read::range_stream::Selection::for_test(&scheduler, f.page.version.clone(), demand);
     let mut work = Box::pin(f.fill.select_subscription(
-        f.page.version.clone(),
-        demand,
+        &selection,
         f.membership.clone(),
         &f.context,
         &f.scope,
@@ -948,7 +956,7 @@ fn subscription_behind_remote_warm_selects_only_published_pages() {
     }
     assert!(
         peers.calls.borrow().is_empty(),
-        "no page before the frontier"
+        "no page before warm completes it"
     );
     crate::read::warm::WarmRegistry::publish_through(&job, 1);
     let mut result = None;
@@ -974,15 +982,9 @@ fn subscription_behind_remote_warm_selects_only_published_pages() {
         b"abc"
     );
     assert_eq!(peers.calls.borrow().len(), 1);
-    assert_eq!(
-        *peers.demands.borrow(),
-        vec![
-            crate::peer::subscriptions::Demand::new(vec![
-                crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
-            ])
-            .unwrap()
-        ],
-        "the unpublished tail is not offered to the provider"
+    assert!(
+        peers.demands.borrow().is_empty(),
+        "no selection is offered while warm holds the head remotely"
     );
     assert_eq!(f.origin.calls.get(), 0);
     drop(job);

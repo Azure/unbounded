@@ -484,6 +484,13 @@ notices:
     license:
       - name: MIT License
         link: https://github.com/ipfs/go-cid/blob/v0.6.2/LICENSE
+  - dependency: github.com/ipfs/go-datastore
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2016 Juan Batiz-Benet
+    license:
+      - name: MIT License
+        link: https://github.com/ipfs/go-datastore/blob/v0.9.2/LICENSE
   - dependency: github.com/lib/pq
     ecosystem: go
     copyright:

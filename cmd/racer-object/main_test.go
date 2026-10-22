@@ -39,9 +39,12 @@ func TestHelpOutputFailure(t *testing.T) {
 	}
 }
 
+// testCacheArg names the cache in tests that do not exercise --cache itself.
+const testCacheArg = "--cache=test-cache"
+
 // modeArgs returns the minimal valid arguments for mode followed by extra.
 func modeArgs(mode string, extra ...string) []string {
-	args := []string{mode}
+	args := []string{mode, testCacheArg}
 	if mode == "origin" {
 		args = append(args, "--bucket=bucket")
 	}
@@ -57,7 +60,7 @@ func TestOptionsDefaults(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			if o.cache != "racer-object" || (mode == "origin") != (o.bucket == "bucket") {
+			if o.cache != "test-cache" || (mode == "origin") != (o.bucket == "bucket") {
 				t.Fatalf("unexpected shared defaults: %+v", o)
 			}
 
@@ -80,12 +83,12 @@ func TestOptionsDefaults(t *testing.T) {
 		t.Fatalf("flags not applied: %+v", o)
 	}
 
-	o, err = parseOptions([]string{"origin", "--bucket=bucket", "--max-concurrent-requests=1"}, io.Discard)
+	o, err = parseOptions([]string{"origin", testCacheArg, "--bucket=bucket", "--max-concurrent-requests=1"}, io.Discard)
 	if err != nil || o.maxRequests != 1 {
 		t.Fatalf("origin concurrency not applied: %+v, %v", o, err)
 	}
 
-	o, err = parseOptions([]string{"sidecar", "--max-connections=65536"}, io.Discard)
+	o, err = parseOptions([]string{"sidecar", testCacheArg, "--max-connections=65536"}, io.Discard)
 	if err != nil || o.maxConnections != 65536 {
 		t.Fatalf("sidecar connections not applied: %+v, %v", o, err)
 	}
@@ -101,17 +104,31 @@ func TestCacheFlag(t *testing.T) {
 				}
 			}
 
-			for _, name := range []string{"", "../bad", "Upper", strings.Repeat("a", 64), strings.Repeat("a", 63) + "." + strings.Repeat("b", 19)} {
+			for _, name := range []string{"../bad", "Upper", strings.Repeat("a", 64), strings.Repeat("a", 63) + "." + strings.Repeat("b", 19)} {
 				_, err := parseOptions(modeArgs(mode, "--cache="+name), io.Discard)
 				if err == nil || err.Error() != "invalid --cache" {
 					t.Fatalf("invalid cache %q: %v", name, err)
 				}
 			}
 
+			// There is no default cache, so omitting --cache or passing an
+			// empty value must fail rather than bind to an implicit cache.
+			for _, cacheArgs := range [][]string{nil, {"--cache="}} {
+				args := append([]string{mode}, cacheArgs...)
+				if mode == "origin" {
+					args = append(args, "--bucket=bucket")
+				}
+
+				_, err := parseOptions(args, io.Discard)
+				if err == nil || err.Error() != "--cache is required" {
+					t.Fatalf("missing cache %q: %v", args, err)
+				}
+			}
+
 			var output bytes.Buffer
 
 			_, err := parseOptions([]string{mode, "--help"}, &output)
-			if !errors.Is(err, flag.ErrHelp) || !strings.Contains(output.String(), "-cache") {
+			if !errors.Is(err, flag.ErrHelp) || !strings.Contains(output.String(), "-cache") || !strings.Contains(output.String(), "required") {
 				t.Fatalf("unexpected help: %q, %v", output.String(), err)
 			}
 		})
@@ -119,19 +136,19 @@ func TestCacheFlag(t *testing.T) {
 }
 
 func TestCacheUIDFlag(t *testing.T) {
-	o, err := parseOptions([]string{"origin", "--bucket=bucket"}, io.Discard)
+	o, err := parseOptions([]string{"origin", testCacheArg, "--bucket=bucket"}, io.Discard)
 	if err != nil || o.cacheUID != "" {
 		t.Fatalf("default cache UID: options=%+v err=%v", o, err)
 	}
 
 	const uid = "00000000-0000-4000-8000-00000000000a"
 
-	o, err = parseOptions([]string{"origin", "--bucket=bucket", "--cache-uid=" + uid}, io.Discard)
+	o, err = parseOptions([]string{"origin", testCacheArg, "--bucket=bucket", "--cache-uid=" + uid}, io.Discard)
 	if err != nil || o.cacheUID != uid {
 		t.Fatalf("cache UID: options=%+v err=%v", o, err)
 	}
 
-	_, err = parseOptions([]string{"origin", "--bucket=bucket", "--cache-uid=bad"}, io.Discard)
+	_, err = parseOptions([]string{"origin", testCacheArg, "--bucket=bucket", "--cache-uid=bad"}, io.Discard)
 	if err == nil || err.Error() != "invalid --cache-uid" {
 		t.Fatalf("invalid cache UID: %v", err)
 	}
@@ -141,33 +158,33 @@ func TestOptionsErrors(t *testing.T) {
 	for _, args := range [][]string{
 		nil,
 		{"unknown"},
-		{"origin"},
-		{"origin", "--bucket=has space"},
-		{"origin", "--bucket=a/b"},
-		{"origin", "--bucket=one", "--bucket=two"},
-		{"origin", "--bucket=bucket", "--namespace=store"},
-		{"sidecar", "--namespace=store"},
-		{"sidecar", "--bucket=bucket"},
-		{"sidecar", "--cache=../bad"},
-		{"origin", "--bucket="},
-		{"sidecar", "--bucket=../bad"},
-		{"origin", "--bucket=bucket", "--request-timeout=0"},
-		{"sidecar", "--request-timeout=-1s"},
-		{"origin", "--bucket=bucket", "--metadata-ttl=-1s"},
-		{"origin", "--bucket=bucket", "--metadata-ttl=bad"},
-		{"origin", "--bucket=bucket", "--listen=127.0.0.1:0"},
-		{"sidecar", "--region=us-east-1"},
-		{"sidecar", "extra"},
-		{"sidecar", "--listen=0.0.0.0:8080"},
-		{"origin", "--bucket=bucket", "--max-concurrent-requests=0"},
-		{"origin", "--bucket=bucket", "--max-concurrent-requests=65537"},
-		{"origin", "--bucket=bucket", "--max-connections=128"},
-		{"sidecar", "--max-connections=0"},
-		{"sidecar", "--max-connections=-1"},
-		{"sidecar", "--max-concurrent-requests=512"},
-		{"origin", "--bucket=bucket", "--cache-uid=not-a-uid"},
-		{"origin", "--bucket=bucket", "--cache-uid=00000000-0000-4000-8000-00000000000A"},
-		{"sidecar", "--cache-uid=00000000-0000-4000-8000-00000000000a"},
+		{"origin", testCacheArg},
+		{"origin", testCacheArg, "--bucket=has space"},
+		{"origin", testCacheArg, "--bucket=a/b"},
+		{"origin", testCacheArg, "--bucket=one", "--bucket=two"},
+		{"origin", testCacheArg, "--bucket=bucket", "--namespace=store"},
+		{"sidecar", testCacheArg, "--namespace=store"},
+		{"sidecar", testCacheArg, "--bucket=bucket"},
+		{"sidecar", testCacheArg, "--cache=../bad"},
+		{"origin", testCacheArg, "--bucket="},
+		{"sidecar", testCacheArg, "--bucket=../bad"},
+		{"origin", testCacheArg, "--bucket=bucket", "--request-timeout=0"},
+		{"sidecar", testCacheArg, "--request-timeout=-1s"},
+		{"origin", testCacheArg, "--bucket=bucket", "--metadata-ttl=-1s"},
+		{"origin", testCacheArg, "--bucket=bucket", "--metadata-ttl=bad"},
+		{"origin", testCacheArg, "--bucket=bucket", "--listen=127.0.0.1:0"},
+		{"sidecar", testCacheArg, "--region=us-east-1"},
+		{"sidecar", testCacheArg, "extra"},
+		{"sidecar", testCacheArg, "--listen=0.0.0.0:8080"},
+		{"origin", testCacheArg, "--bucket=bucket", "--max-concurrent-requests=0"},
+		{"origin", testCacheArg, "--bucket=bucket", "--max-concurrent-requests=65537"},
+		{"origin", testCacheArg, "--bucket=bucket", "--max-connections=128"},
+		{"sidecar", testCacheArg, "--max-connections=0"},
+		{"sidecar", testCacheArg, "--max-connections=-1"},
+		{"sidecar", testCacheArg, "--max-concurrent-requests=512"},
+		{"origin", testCacheArg, "--bucket=bucket", "--cache-uid=not-a-uid"},
+		{"origin", testCacheArg, "--bucket=bucket", "--cache-uid=00000000-0000-4000-8000-00000000000A"},
+		{"sidecar", testCacheArg, "--cache-uid=00000000-0000-4000-8000-00000000000a"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			if _, err := parseOptions(args, io.Discard); err == nil {
@@ -194,9 +211,9 @@ func TestHelpVersionAndRedaction(t *testing.T) {
 	}
 
 	for _, args := range [][]string{
-		{"origin", "--bucket=bucket", "--endpoint=https://private-token@upstream/"},
-		{"origin", "--bucket=bucket", "--request-timeout=private-token"},
-		{"sidecar", "--private-token"},
+		{"origin", testCacheArg, "--bucket=bucket", "--endpoint=https://private-token@upstream/"},
+		{"origin", testCacheArg, "--bucket=bucket", "--request-timeout=private-token"},
+		{"sidecar", testCacheArg, "--private-token"},
 	} {
 		var output bytes.Buffer
 
@@ -429,7 +446,7 @@ func TestCheckOriginDirectoryRejectsForeignLeaf(t *testing.T) {
 	}
 	defer parent.Close()
 
-	if err := checkOriginDirectory(parent, []string{"origin"}); !errors.Is(err, os.ErrPermission) {
+	if err := checkOriginDirectory(parent, []string{"origin", testCacheArg}); !errors.Is(err, os.ErrPermission) {
 		t.Fatalf("accepted origin directory owned by another user: %v", err)
 	}
 }
@@ -599,7 +616,7 @@ func TestSidecarListenerErrors(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if err := run(ctx, []string{"sidecar"}, io.Discard); err != nil {
+	if err := run(ctx, []string{"sidecar", testCacheArg}, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 }

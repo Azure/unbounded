@@ -56,7 +56,7 @@ mod acquisition {
         worker.origin.set_version(metadata.clone());
         worker.origin.set_body(vec![b'x'; metadata.length as usize]);
         let mut socket = fixture.connect();
-        socket.write_all(&request("POST", "If-Match: \"v1\"\r\nRange: bytes=0-\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\nRacer-Ordered: 1\r\n")).unwrap();
+        socket.write_all(&request("POST", "If-Match: \"v1\"\r\nRange: bytes=0-\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\n")).unwrap();
         let mut raw = fixture.receive(&mut socket, false);
         let end = raw.windows(4).position(|part| part == b"\r\n\r\n").unwrap() + 4;
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1245,11 +1245,24 @@ fn configured_timeout_bounds_idle_partial_headers_and_keepalive() {
             assert_no_head(&mut socket);
         }
         sleep_until(started + timeout + Duration::from_millis(20));
-        for _ in 0..64 {
+        // The expired budget closes the connection, but under load its timer
+        // and close completions can take more than a fixed number of pumps to
+        // be reaped. Wait for the close itself, bounded by wall-clock time.
+        let closed = Instant::now() + Duration::from_secs(5);
+        loop {
             fixture.pump(16);
+            if fixture.listeners.active_connections() == 0 {
+                match socket.read(&mut [0; 1]) {
+                    Ok(read) => {
+                        assert_eq!(read, 0, "{mode}");
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("{mode}: {error}"),
+                }
+            }
+            assert!(Instant::now() < closed, "{mode}: connection did not close");
         }
-        assert_eq!(fixture.listeners.active_connections(), 0, "{mode}");
-        assert_eq!(socket.read(&mut [0; 1]).unwrap(), 0, "{mode}");
         assert_eq!(fixture.completed_heads(), usize::from(mode == "keepalive"));
         assert_no_body_leases(&fixture);
     }
@@ -2033,7 +2046,6 @@ fn actual_uds_empty_bootstrap_and_canceled_success() {
                     range: None,
                     page_credits: 2,
                     byte_credits: 2 * PAGE_BYTES,
-                    ordered: false,
                 },
                 Ok(ReadResponse {
                     retain_until: None,
@@ -2279,7 +2291,6 @@ fn response_payload_validation_preserves_range_pin_and_empty_contracts() {
         range,
         page_credits: 1,
         byte_credits: PAGE_BYTES,
-        ordered: false,
     };
     let pinned = subscription(Some(range), Some(response.metadata.version.etag.clone()));
     assert_eq!(responses.validate(&pinned, &response), Ok(()));
@@ -3657,7 +3668,6 @@ mod parser_tests {
                     }),
                     page_credits: 2,
                     byte_credits: 2 * PAGE_BYTES,
-                    ordered: false,
                 },
             ),
             (
@@ -3671,7 +3681,6 @@ mod parser_tests {
                     range: Some(ByteRange::Suffix(0)),
                     page_credits: 2,
                     byte_credits: 2 * PAGE_BYTES,
-                    ordered: false,
                 },
             ),
             (
@@ -3685,7 +3694,6 @@ mod parser_tests {
                     range: Some(ByteRange::From(PAGE_BYTES)),
                     page_credits: 2,
                     byte_credits: 2 * PAGE_BYTES,
-                    ordered: false,
                 },
             ),
         ] {
@@ -3782,7 +3790,6 @@ mod parser_tests {
                 range: None,
                 page_credits: 2,
                 byte_credits: 2 * PAGE_BYTES,
-                ordered: false
             }
         );
         for name in ["Racer-Page-Credits", "Racer-Byte-Credits"] {
@@ -3807,7 +3814,7 @@ mod parser_tests {
         }
         for pages in [1, 64] {
             for bytes in [PAGE_BYTES, 64 * PAGE_BYTES] {
-                for ordered in ["0", "1"] {
+                for ordered in ["0", "1", "2", "01"] {
                     let parsed = parse(head(
                         "POST",
                         &[
@@ -3818,7 +3825,7 @@ mod parser_tests {
                     ))
                     .unwrap();
                     assert!(
-                        matches!(parsed.kind, ReadKind::Subscription { page_credits, byte_credits, ordered: actual, .. } if page_credits == pages && byte_credits == bytes && actual == (ordered == "1"))
+                        matches!(parsed.kind, ReadKind::Subscription { page_credits, byte_credits, .. } if page_credits == pages && byte_credits == bytes)
                     );
                 }
             }
@@ -3827,17 +3834,16 @@ mod parser_tests {
             ("Racer-Page-Credits", "65".into()),
             ("Racer-Byte-Credits", (PAGE_BYTES - 1).to_string()),
             ("Racer-Byte-Credits", (64 * PAGE_BYTES + 1).to_string()),
-            ("Racer-Ordered", "2".into()),
-            ("Racer-Ordered", "01".into()),
         ] {
             assert!(parse(head("POST", &[(name, value.as_bytes())])).is_err());
         }
+        // The removed Racer-Ordered header is ignored, so duplicates are not rejected.
         assert!(
             parse(head(
                 "POST",
                 &[("Racer-Ordered", b"0"), ("racer-ordered", b"1")]
             ))
-            .is_err()
+            .is_ok()
         );
         let mut missing = head("POST", &[]);
         missing.headers.retain(|h| h.name != "Content-Length");

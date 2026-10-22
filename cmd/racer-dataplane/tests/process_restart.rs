@@ -1050,7 +1050,7 @@ fn read_reply(stream: &mut impl Read) -> io::Result<Reply> {
 }
 fn write_request(socket: &mut UnixStream, pin: Option<&str>, start: u64, end: u64) {
     let pin = pin.map_or(String::new(), |pin| format!("If-Match: {pin}\r\n"));
-    write!(socket, "POST /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: {P}\r\nRacer-Ordered: 1\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\n{pin}Range: bytes={start}-{}\r\nConnection: close\r\n\r\n", "ab".repeat(32), end - 1).unwrap();
+    write!(socket, "POST /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: {P}\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\n{pin}Range: bytes={start}-{}\r\nConnection: close\r\n\r\n", "ab".repeat(32), end - 1).unwrap();
 }
 fn byte(offset: u64) -> u8 {
     ((offset * 31 + offset / P * 17) % 251) as u8

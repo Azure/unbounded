@@ -402,12 +402,14 @@ func TestMirror_PeerFallback_StaleProviderFilteredOnNextRequest(t *testing.T) {
 
 	defer func() { _ = resp2.Body.Close() }() //nolint:errcheck // best-effort body close
 
-	if resp2.StatusCode != http.StatusOK {
-		t.Fatalf("second status = %d, want 200 (stale provider should be filtered)", resp2.StatusCode)
+	// The filtered provider still advertises the digest, so the second
+	// request fails over the same way instead of Gantry pulling from origin.
+	if resp2.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("second status = %d, want 503 (stale provider filtered, containerd pulls from origin)", resp2.StatusCode)
 	}
 
-	if atomic.LoadInt32(originHits) != 1 {
-		t.Errorf("origin hits = %d, want 1", *originHits)
+	if atomic.LoadInt32(originHits) != 0 {
+		t.Errorf("origin hits = %d, want 0", *originHits)
 	}
 }
 

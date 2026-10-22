@@ -643,6 +643,11 @@ impl ReadWorker {
         }
     }
 
+    /// Whether every command submitted to this worker has completed.
+    pub fn is_drained(&self) -> bool {
+        self.endpoint.borrow().is_drained() && self.drivers.pending() == 0
+    }
+
     pub fn poll(&self, cx: &mut Context<'_>) {
         let _queue = self.drivers.enter();
         self.endpoint.borrow_mut().poll_budgeted(64).unwrap();

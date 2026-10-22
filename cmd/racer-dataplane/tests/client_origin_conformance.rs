@@ -200,7 +200,6 @@ fn raw_uds_exact_targets_methods_and_bodyless_framing() {
             range: None,
             page_credits: 2,
             byte_credits: 2 * P,
-            ordered: false
         }
     );
     reject(
@@ -256,7 +255,6 @@ fn raw_uds_all_singletons_reject_identical_case_insensitive_repeats() {
         ("Authorization", "opaque"),
         ("Racer-Page-Credits", "1"),
         ("Racer-Byte-Credits", "16777216"),
-        ("Racer-Ordered", "1"),
     ] {
         let fields = format!(
             "{name}: {value}\r\n{}: {value}\r\n",
@@ -709,7 +707,6 @@ fn raw_uds_client_empty_bootstrap_and_head_success_writer() {
                 range: None,
                 page_credits: 1,
                 byte_credits: P,
-                ordered: true,
             },
             0,
         ),
@@ -733,7 +730,7 @@ fn raw_uds_client_empty_bootstrap_and_head_success_writer() {
                 } else if is_head {
                     b""
                 } else {
-                    b"Content-Length: 0\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\nRacer-Ordered: 1\r\n"
+                    b"Content-Length: 0\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\n"
                 },
             ))
             .unwrap();
@@ -942,7 +939,6 @@ mod sdk {
                         range: None,
                         page_credits: 2,
                         byte_credits: 2 * P,
-                        ordered: true,
                     }
                 );
                 drop(parsed);
@@ -1174,7 +1170,6 @@ mod sdk {
                         },
                         page_credits: 2,
                         byte_credits: 2 * P,
-                        ordered: true,
                     }
                 );
                 send_subscription(

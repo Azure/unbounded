@@ -367,12 +367,14 @@ func buildColdStartMirror(t *testing.T, originBlobs map[digest.Digest][]byte, pr
 
 // TestMirror_PeerProvidersExhausted_ConsultsColdStart covers the stale-provider
 // invariant: a non-empty DHT provider set where every candidate is stale must
-// still flow into cold-start, independent of DHT health score.
+// fail over to origin at once with a 503. Cold-start does not run, because a
+// stale record is not evidence that nobody holds the digest, and waiting on it
+// is what kept fail-open containerd from reaching origin.
 func TestMirror_PeerProvidersExhausted_ConsultsColdStart(t *testing.T) {
 	body := []byte("the canonical bytes for this digest")
 	d := digestOf(body)
 
-	// Peer that has the blob (cold-start surfaces it on retry).
+	// Peer that has the blob; cold-start would surface it if consulted.
 	freshCache := fakes.NewCache()
 	freshCache.Put(d, body)
 	freshAddr := startPeerTransfer(t, freshCache)
@@ -398,17 +400,21 @@ func TestMirror_PeerProvidersExhausted_ConsultsColdStart(t *testing.T) {
 
 	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort body close
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusServiceUnavailable {
 		got, _ := io.ReadAll(resp.Body)
-		t.Fatalf("status = %d, body = %q; want 200 (cold-start should have surfaced fresh peer)", resp.StatusCode, got)
+		t.Fatalf("status = %d, body = %q; want 503 so containerd falls through to origin", resp.StatusCode, got)
+	}
+
+	if n := atomic.LoadInt32(&cs.calls); n != 0 {
+		t.Errorf("cold-start calls = %d, want 0 (stale-only providers must not start cold-start)", n)
 	}
 
 	if atomic.LoadInt32(originHits) != 0 {
-		t.Errorf("origin hits = %d, want 0 (cold-start returned fresh peer)", *originHits)
+		t.Errorf("origin hits = %d, want 0 (containerd, not Gantry, pulls from origin)", *originHits)
 	}
 
-	if atomic.LoadInt32(peerFetches) != 1 {
-		t.Errorf("peer hits = %d, want 1 (the fresh peer)", *peerFetches)
+	if atomic.LoadInt32(peerFetches) != 0 {
+		t.Errorf("peer hits = %d, want 0", *peerFetches)
 	}
 }
 
@@ -416,7 +422,7 @@ func TestMirror_PeerProvidersExhausted_ConsultsColdStart(t *testing.T) {
 // pins the narrower branch where DHT providers are filtered by the
 // local stale-provider cache before any fetch attempt. The required control
 // flow is: non-empty DHT -> all candidates filtered -> dhtStaleOnly metric ->
-// cold-start resolver. The stale peer must NOT be re-fetched on the second
+// 503 without cold-start. The stale peer must NOT be re-fetched on the second
 // request.
 func TestMirror_StaleOnlyFilteredProviders_ConsultsColdStartWithoutRefetch(t *testing.T) {
 	body := []byte("served-via-cold-start-after-prefilter")
@@ -454,48 +460,30 @@ func TestMirror_StaleOnlyFilteredProviders_ConsultsColdStartWithoutRefetch(t *te
 	srv := httptest.NewServer(m.Handler())
 	t.Cleanup(srv.Close)
 
-	first, err := http.Get(srv.URL + "/v2/r/blobs/" + d.String())
-	if err != nil {
-		t.Fatal(err)
-	}
+	for _, request := range []string{"first", "second"} {
+		resp, err := http.Get(srv.URL + "/v2/r/blobs/" + d.String())
+		if err != nil {
+			t.Fatal(err)
+		}
 
-	got, _ := io.ReadAll(first.Body)
-	first.Body.Close()
+		got, _ := io.ReadAll(resp.Body) //nolint:errcheck // best-effort in test
+		resp.Body.Close()
 
-	if first.StatusCode != http.StatusOK {
-		t.Fatalf("first status = %d, body = %q; want 200", first.StatusCode, got)
-	}
-
-	if string(got) != string(body) {
-		t.Fatalf("first body = %q, want %q", got, body)
-	}
-
-	second, err := http.Get(srv.URL + "/v2/r/blobs/" + d.String())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	got, _ = io.ReadAll(second.Body) //nolint:errcheck // best-effort in test
-	second.Body.Close()
-
-	if second.StatusCode != http.StatusOK {
-		t.Fatalf("second status = %d, body = %q; want 200", second.StatusCode, got)
-	}
-
-	if string(got) != string(body) {
-		t.Fatalf("second body = %q, want %q", got, body)
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("%s status = %d, body = %q; want 503", request, resp.StatusCode, got)
+		}
 	}
 
 	if calls := peerDialer.Calls(staleAddr); calls != 1 {
 		t.Fatalf("stale peer fetch calls = %d, want 1 (second request must filter stale peer before any fetch)", calls)
 	}
 
-	if calls := peerDialer.Calls(freshAddr); calls != 2 {
-		t.Fatalf("fresh peer fetch calls = %d, want 2 (cold-start provider should satisfy both requests)", calls)
+	if calls := peerDialer.Calls(freshAddr); calls != 0 {
+		t.Fatalf("fresh peer fetch calls = %d, want 0 (cold-start must not run)", calls)
 	}
 
-	if n := atomic.LoadInt32(&cs.calls); n != 2 {
-		t.Fatalf("cold-start invocations = %d, want 2", n)
+	if n := atomic.LoadInt32(&cs.calls); n != 0 {
+		t.Fatalf("cold-start invocations = %d, want 0", n)
 	}
 
 	if n := atomic.LoadInt32(&staleOnlyCount); n != 1 {

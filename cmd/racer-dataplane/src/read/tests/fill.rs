@@ -3939,13 +3939,12 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
                 seed: Some(original.metadata.immutable()),
             },
         );
-        for ordered in [false, true] {
+        for _ in 0..2 {
             let kind = ReadKind::Subscription {
                 pin: Some(f.page.version.etag.clone()),
                 range: Some(ByteRange::Closed { first: 0, last: 2 }),
                 page_credits: 1,
                 byte_credits: crate::model::PAGE_BYTES,
-                ordered,
             };
             let mut response = drive(
                 coordinator.read(

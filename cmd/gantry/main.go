@@ -48,6 +48,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/metrics"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	"github.com/Azure/unbounded/internal/gantry/negcache"
+	"github.com/Azure/unbounded/internal/gantry/providerprobe"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
 	"github.com/Azure/unbounded/internal/gantry/transfer"
 	"github.com/Azure/unbounded/internal/version"
@@ -453,6 +454,7 @@ func runAgent(args []string) error {
 		realResolver := coldstart.NewChairResolver(coldstart.ChairOptions{
 			Chairs:       chairCache,
 			Discovery:    disco,
+			PeerMetadata: peerClient,
 			Coord:        chairCoord,
 			LocalPull:    coordServer,
 			Inflight:     inflightMap,
@@ -522,19 +524,8 @@ func runAgent(args []string) error {
 				// let kubelet back off than thunder the origin.
 				return disco.Health() >= 0.3
 			},
-			Inflight: inflightMap,
-			Recheck: func(ctx context.Context, d digest.Digest) bool {
-				// Final post-jitter probe: did anyone publish a
-				// provider record while we slept? If so, direct-origin-fallback declines
-				// and the client retries through the warm path on its
-				// next attempt.
-				rcCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
-				defer cancel()
-
-				prov, err := disco.FindProviders(rcCtx, d)
-
-				return err == nil && len(prov) > 0
-			},
+			Inflight:   inflightMap,
+			Recheck:    newUsableProviderRecheck(disco, peerClient),
 			OnFallback: func() { p5.originFallbackTotal.Inc() },
 			OnDecline: func(reason string) {
 				p5.originFallbackDeclineTotal.WithLabelValues(reason).Inc()
@@ -939,6 +930,25 @@ func runAgent(args []string) error {
 	logger.Info("gantry stopped")
 
 	return nil
+}
+
+func newUsableProviderRecheck(dht ifaces.DHT, peer ifaces.PeerMetadataDialer) func(context.Context, ifaces.OriginRef) bool {
+	return func(ctx context.Context, ref ifaces.OriginRef) bool {
+		// Keep this final escape-valve check bounded. A provider record alone
+		// cannot suppress origin fallback; a peer must answer HEAD for ref.
+		recheckCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+
+		_, usable, err := providerprobe.FirstFromDiscovery(recheckCtx, dht, peer, ref, providerprobe.Attempted{}, 2*time.Second)
+		if err != nil {
+			slog.Debug("provider recheck lookup failed",
+				slog.String("digest", ref.Digest.String()),
+				slog.Any("err", err),
+			)
+		}
+
+		return usable
+	}
 }
 
 // loadAgentConfig merges YAML, env, and flags into a *config.Config. Two-
