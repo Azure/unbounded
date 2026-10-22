@@ -305,6 +305,7 @@ fn profile_request(
         let duration = duration?;
         let session = controller.start(duration).map_err(profile_error)?;
         Ok(server::BinaryResponse {
+            kind: server::BinaryKind::Profile,
             duration,
             session: Box::new(session),
         })
