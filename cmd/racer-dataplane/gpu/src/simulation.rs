@@ -730,13 +730,16 @@ unsafe extern "C" fn file(fd: c_int, out: ffi::Out) -> c_int {
         if !w.file_driver {
             return (code::EUNAVAILABLE, 0);
         }
-        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-        if fd < 0 || duplicate < 0 {
+        if fd < 0 || unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
             return (code::EINVAL, 0);
         }
+        // cuFile reads with its own alignment rules. Reopen the same file
+        // without O_DIRECT so host reads of any length and buffer work.
+        let Ok(reopened) = File::open(format!("/proc/self/fd/{fd}")) else {
+            return (code::EINVAL, 0);
+        };
         let handle = give(w, out);
-        w.files
-            .insert(handle, unsafe { File::from_raw_fd(duplicate) });
+        w.files.insert(handle, reopened);
         (code::OK, handle)
     })
 }
