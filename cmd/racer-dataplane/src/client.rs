@@ -41,8 +41,14 @@ use std::task::Poll;
 use std::time::Duration;
 use uring_runtime::reactor::IoBuffer;
 
+pub mod direct;
 pub mod listener;
 pub mod origin_directory;
+
+pub use direct::DIRECT_WINDOW_PAGES;
+use direct::DirectPage;
+use direct::DirectSink;
+use direct::GpuService;
 
 use racer_object_wire::client::MAX_HEAD_BYTES;
 pub use racer_object_wire::client::ReadKind;
@@ -115,6 +121,7 @@ async fn handle_read_result(
     scope: &RequestScope,
     observation: &mut crate::telemetry::RequestMetrics,
     timeout: Duration,
+    sink: Option<Box<dyn DirectSink>>,
 ) -> Result<Option<ConnectionLease>> {
     let response = match read_result {
         Ok(response) => response,
@@ -162,7 +169,19 @@ async fn handle_read_result(
         > 4;
     let mut watch = watch_room.then(|| responses.io.disconnected(&connection, &watch_scope));
     let mut poll_disconnect = !watch_room;
-    let mut send = if matches!(kind, ReadKind::Subscription { .. }) {
+    let mut send = if let Some(sink) = sink {
+        responses.send_direct(
+            connection,
+            response,
+            kind,
+            sink,
+            scope,
+            observation,
+            timeout,
+        )
+    } else if kind.direct().is_some() {
+        Box::pin(async { Err(Error::Internal) })
+    } else if matches!(kind, ReadKind::Subscription { .. }) {
         responses.send_subscription(connection, response, scope, observation, timeout)
     } else {
         responses.send_observed(connection, response, scope, observation)
@@ -225,6 +244,8 @@ pub struct Responses {
     io: Rc<HttpIo>,
 
     delivery: Rc<Delivery>,
+
+    gpu: Option<Rc<dyn GpuService>>,
 }
 
 /// Duplex subscription framing. Delivered leases stay pinned until exact release.
@@ -619,13 +640,188 @@ impl Responses {
         })
     }
 
+    /// Deliver a direct read: write each page through `sink`, then send its
+    /// payload-less page frame. The sink is finished before the kind 2 frame,
+    /// and on a best-effort basis when delivery fails.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn send_direct<'a>(
+        &'a self,
+        connection: ConnectionLease,
+        response: ReadResponse,
+        kind: &'a ReadKind,
+        mut sink: Box<dyn DirectSink>,
+        scope: &'a RequestScope,
+        observation: &'a mut crate::telemetry::RequestMetrics,
+        timeout: Duration,
+    ) -> Operation<'a, ConnectionLease> {
+        Box::pin(async move {
+            let result = self
+                .send_direct_inner(
+                    connection,
+                    response,
+                    kind,
+                    sink.as_mut(),
+                    scope,
+                    observation,
+                    timeout,
+                )
+                .await;
+            if result.is_err() {
+                // Give device work a short, independent bound to settle.
+                if let Ok(final_scope) = RequestScope::new(
+                    scope.request,
+                    uring_runtime::environment::now() + Duration::from_secs(1),
+                ) {
+                    let _ = sink.finish(&final_scope).await;
+                }
+            }
+            result
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_direct_inner(
+        &self,
+        mut connection: ConnectionLease,
+        mut response: ReadResponse,
+        kind: &ReadKind,
+        sink: &mut dyn DirectSink,
+        scope: &RequestScope,
+        observation: &mut crate::telemetry::RequestMetrics,
+        timeout: Duration,
+    ) -> Result<ConnectionLease> {
+        let delivery = kind.direct().ok_or(Error::Internal)?;
+        let destination = kind.destination().ok_or(Error::Internal)?;
+        let head = racer_object_wire::client::direct_head(
+            &response.metadata,
+            response.payload.range(),
+            delivery,
+        )?;
+        let expected = response.payload.range().map_or(0, |r| r.len());
+        if expected > destination.length {
+            return Err(Error::InvalidRequest);
+        }
+        let mut first = if let ReadPayload::Stream(stream) = &mut response.payload {
+            match stream.next_slice().await {
+                Ok(Some(reader)) => Some(reader),
+                result => {
+                    let error = result.err().unwrap_or(Error::BadGateway);
+                    self.observer.record(
+                        crate::telemetry::Failure::new(crate::telemetry::Stage::FirstSlice, error)
+                            .request(scope),
+                    );
+                    observation.fail(error);
+                    return self.send_error(connection, error, scope).await;
+                }
+            }
+        } else {
+            None
+        };
+        connection.poison();
+        connection = self.io.send_head(connection, head, scope).await?.connection;
+        let mut sent = 0;
+        let mut pages = 0;
+        if let ReadPayload::Stream(stream) = &mut response.payload {
+            let range = stream.range();
+            stream.enable_progress(timeout);
+            while sent < expected {
+                let mut progress_scope = scope.clone();
+                progress_scope.deadline.0 = uring_runtime::environment::now() + timeout;
+                let reader = match first.take() {
+                    Some(reader) => reader,
+                    None => std::future::poll_fn(|cx| {
+                        progress_scope.check()?;
+                        stream.next_slice().as_mut().poll(cx)
+                    })
+                    .await
+                    .inspect_err(|&error| {
+                        self.observer.record(
+                            crate::telemetry::Failure::new(
+                                crate::telemetry::Stage::NextSlice,
+                                error,
+                            )
+                            .request(scope),
+                        );
+                    })?
+                    .ok_or(Error::BadGateway)?,
+                };
+                let slice = reader.slice();
+                if range.slice_at(slice.page)? != Some(slice)
+                    || slice.length == 0
+                    || u64::from(slice.length) > expected - sent
+                {
+                    return Err(Error::BadGateway);
+                }
+                let offset = slice
+                    .page
+                    .0
+                    .checked_mul(PAGE_BYTES)
+                    .and_then(|n| n.checked_add(u64::from(slice.offset)))
+                    .ok_or(Error::BadGateway)?;
+                // The parser and validate bound offset + range length.
+                let target = destination
+                    .offset
+                    .checked_add(offset - range.start())
+                    .ok_or(Error::BadGateway)?;
+                {
+                    let mut write =
+                        sink.deliver(DirectPage::Plaintext(&reader), target, &progress_scope);
+                    std::future::poll_fn(|cx| {
+                        if let Poll::Ready(result) = write.as_mut().poll(cx) {
+                            return Poll::Ready(result);
+                        }
+                        // Keep the fetch window moving while the write runs.
+                        stream.poll_prefetch(cx);
+                        Poll::Pending
+                    })
+                    .await?;
+                }
+                drop(reader);
+                // The page is written: no client credit gates its release.
+                stream.release_page(slice.page, slice.length)?;
+                connection = send_frame(
+                    &self.io,
+                    connection,
+                    frame(1, slice.page.0, offset, slice.length),
+                    &progress_scope,
+                )
+                .await?;
+                sent += u64::from(slice.length);
+                pages += 1;
+            }
+        }
+        let mut final_scope = scope.clone();
+        final_scope.deadline.0 = uring_runtime::environment::now() + timeout;
+        sink.finish(&final_scope).await?;
+        connection =
+            send_frame(&self.io, connection, frame(2, pages, sent, 0), &final_scope).await?;
+        observation.success();
+        Ok(connection)
+    }
+
     /// Attach delivery resources with a no-op observer until configured.
     pub fn new(io: Rc<HttpIo>, delivery: Rc<Delivery>) -> Self {
         Self {
             io,
             delivery,
             observer: Observer::default(),
+            gpu: None,
         }
+    }
+
+    /// Serve `gpu-read` with this backend. Without one, `gpu-read` is 501.
+    pub fn with_gpu(mut self, gpu: Rc<dyn GpuService>) -> Self {
+        self.gpu = Some(gpu);
+        self
+    }
+
+    /// Check the descriptors that came with a request and open its sink.
+    pub(crate) fn open_sink(
+        &self,
+        kind: &ReadKind,
+        received: http1::connection::ReceivedDescriptors,
+    ) -> Result<Option<Box<dyn DirectSink>>> {
+        direct::open_sink(kind, received, &self.delivery, self.gpu.as_ref())
     }
 
     /// Route detailed delivery failures to the worker's observer.
@@ -684,6 +880,28 @@ impl Responses {
                     return Err(Error::BadGateway);
                 }
                 subscription_head(&response.metadata, response.payload.range())?;
+                return Ok(());
+            }
+            ReadKind::HostRead {
+                range, destination, ..
+            }
+            | ReadKind::GpuRead {
+                range, destination, ..
+            } => {
+                let expected = expected_subscription_range(*range, response.metadata.length)?;
+                if response.payload.range() != expected {
+                    return Err(Error::BadGateway);
+                }
+                // Reject before the 200 head: the window must hold the range.
+                if expected.map_or(0, |range| range.len()) > destination.length {
+                    return Err(Error::InvalidRequest);
+                }
+                let delivery = kind.direct().ok_or(Error::Internal)?;
+                racer_object_wire::client::direct_head(
+                    &response.metadata,
+                    response.payload.range(),
+                    delivery,
+                )?;
                 return Ok(());
             }
             ReadKind::Head | ReadKind::HeadPinned { .. } => {
@@ -769,6 +987,7 @@ fn header(name: &str, value: impl AsRef<[u8]>) -> Header {
 fn error_head(error: Error) -> Result<MessageHead> {
     let status = match error {
         Error::InvalidRequest | Error::InvalidRange => 400,
+        Error::NotImplemented => 501,
         Error::MethodNotAllowed => 405,
         Error::HeaderTooLarge => 431,
         Error::Unauthorized | Error::OriginRejected => 401,

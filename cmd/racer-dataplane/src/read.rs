@@ -16,6 +16,7 @@ use crate::model::ByteRange;
 use crate::model::MetadataSelector;
 use crate::model::ObjectId;
 use crate::model::ObjectMetadata;
+use crate::model::PAGE_BYTES;
 use crate::model::ResolvedRange;
 use crate::peer::forwarding::VerifiedRequest;
 use crate::peer::protocol::FetchMode;
@@ -169,7 +170,9 @@ impl Coordinator {
                 retain,
             } = request;
             let selector = match &kind {
-                ReadKind::Subscription { pin, .. } => pin
+                ReadKind::Subscription { pin, .. }
+                | ReadKind::HostRead { pin, .. }
+                | ReadKind::GpuRead { pin, .. } => pin
                     .clone()
                     .map_or(MetadataSelector::Fresh, MetadataSelector::Pinned),
                 ReadKind::Head => MetadataSelector::Fresh,
@@ -185,6 +188,19 @@ impl Coordinator {
                 )
                 .await?;
             validate_metadata(&metadata, &origin.object, &selector)?;
+            // Direct reads have no client credits. The dataplane paces them
+            // with a fixed window and releases each page after writing it.
+            let kind = match kind {
+                ReadKind::HostRead { range, .. } | ReadKind::GpuRead { range, .. } => {
+                    ReadKind::Subscription {
+                        pin: None,
+                        range,
+                        page_credits: crate::client::DIRECT_WINDOW_PAGES,
+                        byte_credits: crate::client::DIRECT_WINDOW_PAGES as u64 * PAGE_BYTES,
+                    }
+                }
+                kind => kind,
+            };
             match kind {
                 ReadKind::Subscription {
                     range,
@@ -244,6 +260,8 @@ impl Coordinator {
                         retain_until,
                     })
                 }
+                // Mapped to Subscription above.
+                ReadKind::HostRead { .. } | ReadKind::GpuRead { .. } => Err(Error::Internal),
             }
         })
     }

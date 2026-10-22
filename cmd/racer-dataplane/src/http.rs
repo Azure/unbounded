@@ -500,6 +500,15 @@ impl ReaderLease {
     pub fn remaining(&self) -> usize {
         self.slice.length as usize - self.sent
     }
+    /// The verified plaintext of this slice only.
+    pub fn slice_bytes(&self) -> &[u8] {
+        let start = self.slice.offset as usize;
+        &self.page.bytes()[start..start + self.slice.length as usize]
+    }
+    /// The verified page this slice pins.
+    pub fn page(&self) -> &VerifiedPage {
+        &self.page
+    }
 }
 struct DeliveryOwner(ReaderLease);
 impl http1::delivery::DirectOwner<HttpContext> for DeliveryOwner {
@@ -653,6 +662,40 @@ impl Delivery {
             .await?;
             connection.consume_sent(usize::try_from(length).map_err(|_| Error::InvalidRequest)?)?;
             Ok(connection)
+        })
+    }
+}
+impl Delivery {
+    /// Write the whole slice into `file` starting at `offset`, with positioned
+    /// io_uring writes from the shared page. Short writes continue where they
+    /// stopped; a zero-byte write is an I/O error. Never maps the file.
+    pub(crate) fn write_slice_at<'a>(
+        &'a self,
+        reader: &ReaderLease,
+        file: Rc<Descriptor>,
+        offset: u64,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, ()> {
+        let page = reader.page.clone();
+        let start = reader.slice.offset as usize;
+        let length = reader.slice.length as usize;
+        Box::pin(async move {
+            let mut written = 0;
+            while written < length {
+                let view = PageSendRange::new(page.clone(), start + written..start + length)?;
+                let position = offset
+                    .checked_add(written as u64)
+                    .ok_or(Error::InvalidRange)?;
+                let completed = self
+                    .reactor
+                    .write_shared_at(file.clone(), position, view, (), scope)
+                    .await?;
+                if completed.bytes == 0 || completed.bytes > length - written {
+                    return Err(Error::Io);
+                }
+                written += completed.bytes;
+            }
+            Ok(())
         })
     }
 }
