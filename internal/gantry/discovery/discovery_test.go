@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 	"github.com/multiformats/go-multiaddr"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
+	"github.com/Azure/unbounded/internal/gantry/ifaces"
 )
 
 func TestDigestToCID_Deterministic(t *testing.T) {
@@ -386,22 +389,54 @@ func TestTransferAddrWithPortSkipsLoopback(t *testing.T) {
 	tests := []struct {
 		name  string
 		addrs []string
-		want  string
+		want  []string
 	}{
 		{
 			name:  "IPv4 pod address after loopback",
 			addrs: []string{"/ip4/127.0.0.1/tcp/4001", "/ip4/10.245.17.155/tcp/4001"},
-			want:  "10.245.17.155:5001",
+			want:  []string{"10.245.17.155:5001"},
 		},
 		{
 			name:  "IPv6 pod address after loopback",
 			addrs: []string{"/ip6/::1/tcp/4001", "/ip6/fd00::42/tcp/4001"},
-			want:  "[fd00::42]:5001",
+			want:  []string{"[fd00::42]:5001"},
 		},
 		{
 			name:  "loopback only is unusable",
 			addrs: []string{"/ip4/127.0.0.1/tcp/4001", "/ip6/::1/tcp/4001"},
 		},
+		{
+			name: "old and current pod IPs remain separate",
+			addrs: []string{
+				"/ip4/10.65.56.20/tcp/4001",
+				"/ip4/10.65.56.191/tcp/4001",
+			},
+			want: []string{"10.65.56.20:5001", "10.65.56.191:5001"},
+		},
+		{
+			name: "deduplicate transports and preserve IP order",
+			addrs: []string{
+				"/ip4/10.65.56.20/tcp/4001",
+				"/ip4/10.65.56.20/udp/4001/quic-v1",
+				"/ip6/fd00::42/tcp/4001",
+				"/ip4/10.65.56.191/tcp/4002",
+				"/ip6/fd00::42/udp/4001/quic-v1",
+			},
+			want: []string{"10.65.56.20:5001", "[fd00::42]:5001", "10.65.56.191:5001"},
+		},
+		{
+			name: "unusable addresses do not hide later IPs",
+			addrs: []string{
+				"/ip4/0.0.0.0/tcp/4001",
+				"/ip6/::/tcp/4001",
+				"/ip4/169.254.1.1/tcp/4001",
+				"/ip6/fe80::1/tcp/4001",
+				"/dns4/provider.example/tcp/4001",
+				"/ip4/10.65.56.191/tcp/4001",
+			},
+			want: []string{"10.65.56.191:5001"},
+		},
+		{name: "no addresses"},
 	}
 
 	for _, tt := range tests {
@@ -411,8 +446,8 @@ func TestTransferAddrWithPortSkipsLoopback(t *testing.T) {
 				ai.Addrs = append(ai.Addrs, multiaddr.StringCast(addr))
 			}
 
-			if got := transferAddrWithPort(ai, 5001); got != tt.want {
-				t.Fatalf("transferAddrWithPort() = %q, want %q", got, tt.want)
+			if got := transferAddrsWithPort(ai, 5001); !slices.Equal(got, tt.want) {
+				t.Fatalf("transferAddrsWithPort() = %q, want %q", got, tt.want)
 			}
 		})
 	}
@@ -629,4 +664,110 @@ func TestHostStreamProvidersQueriesPastFullLocalProviderStore(t *testing.T) {
 	if !foundFresh || count < 22 {
 		t.Fatalf("uncapped lookup returned %d providers, found remote=%v; want all 21 local plus remote", count, foundFresh)
 	}
+}
+
+func TestHostProviderLookupsPreserveAllTransferAddresses(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	host, err := New(ctx, Options{
+		ListenAddrs:    []string{"/ip4/127.0.0.1/tcp/0"},
+		ProtocolPrefix: "/gantry-provider-address-test",
+		TransferPort:   6501,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = host.Close() })
+
+	private, _, err := crypto.GenerateEd25519Key(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := peer.IDFromPrivateKey(private)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	info := peer.AddrInfo{ID: id, Addrs: []multiaddr.Multiaddr{
+		multiaddr.StringCast("/ip4/127.0.0.1/tcp/4001"),
+		multiaddr.StringCast("/ip4/10.65.56.20/tcp/4001"),
+		multiaddr.StringCast("/ip4/10.65.56.20/udp/4001/quic-v1"),
+		multiaddr.StringCast("/ip4/10.65.56.191/tcp/4001"),
+		multiaddr.StringCast("/ip6/fd00::42/tcp/4001"),
+	}}
+	want := []ifaces.Provider{
+		{NodeID: ifaces.NodeID(id.String()), Addr: "10.65.56.20:6501"},
+		{NodeID: ifaces.NodeID(id.String()), Addr: "10.65.56.191:6501"},
+		{NodeID: ifaces.NodeID(id.String()), Addr: "[fd00::42]:6501"},
+	}
+
+	if got := host.transferProviders(info); !slices.Equal(got, want) {
+		t.Fatalf("transferProviders = %+v, want %+v", got, want)
+	}
+
+	if addresses := host.h.Peerstore().Addrs(id); len(addresses) != len(info.Addrs) {
+		t.Fatalf("cached %d addresses, want %d", len(addresses), len(info.Addrs))
+	}
+
+	d := digest.MustParse("sha256:abababababababababababababababababababababababababababababababab")
+
+	key, err := DigestToCID(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := host.d.ProviderStore().AddProvider(ctx, key.Hash(), info); err != nil {
+		t.Fatal(err)
+	}
+
+	compare := func(a, b ifaces.Provider) int { return strings.Compare(a.Addr, b.Addr) }
+	slices.SortFunc(want, compare)
+
+	t.Run("synchronous", func(t *testing.T) {
+		got, err := host.FindProviders(ctx, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		slices.SortFunc(got, compare)
+
+		if !slices.Equal(got, want) {
+			t.Fatalf("FindProviders = %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("streaming", func(t *testing.T) {
+		providers, lookupErr := host.StreamProviders(ctx, d, time.Second)
+
+		var got []ifaces.Provider
+		for provider := range providers {
+			got = append(got, provider)
+		}
+
+		if err := lookupErr(); err != nil {
+			t.Fatal(err)
+		}
+
+		slices.SortFunc(got, compare)
+
+		if !slices.Equal(got, want) {
+			t.Fatalf("StreamProviders = %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("unusable record", func(t *testing.T) {
+		host.h.Peerstore().ClearAddrs(id)
+
+		unusable := peer.AddrInfo{ID: id, Addrs: info.Addrs[:1]}
+		if got := host.transferProviders(unusable); len(got) != 0 {
+			t.Fatalf("loopback-only record yielded %+v", got)
+		}
+
+		if got := host.h.Peerstore().Addrs(id); len(got) != 0 {
+			t.Fatalf("unusable record cached %d addresses", len(got))
+		}
+	})
 }

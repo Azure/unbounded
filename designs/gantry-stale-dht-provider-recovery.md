@@ -85,6 +85,11 @@ discovery implementations without streaming support, such as legacy test
 doubles; the production discovery host always supports streaming.
 
 The provider response identifies peer IDs, addresses, and a connection hint.
+Gantry expands each returned peer into one candidate per distinct usable IP
+with the configured transfer port, in address order. TCP and QUIC multiaddrs
+for the same IP produce one candidate. Both synchronous and streaming lookups
+preserve these alternatives; this does not refresh addresses or change retry
+and fallback decisions.
 It does not expose a provider timestamp, sequence, or signed expiry that Gantry
 can use to prefer a new record (`pb/dht.proto:30-38`). Records from distinct old
 and new provider identities coexist for the same digest because the storage

@@ -557,11 +557,8 @@ func (h *Host) Withdraw(_ context.Context, d digest.Digest) error {
 
 // FindProviders implements ifaces.DHT. Returns providers whose multiaddrs
 // expose at least one IP-based transport (TCP or QUIC). Provider.NodeID is
-// the libp2p peer.ID as a string; Provider.Addr is the first IP-based
-// multiaddr's IP, suffixed with the conventional transfer port `:5001`.
-// coord layer will reconcile peer.ID with k8s NodeID using
-// Members; callers (the mirror miss path) only need a dialable
-// transfer URL.
+// the libp2p peer.ID as a string. Each distinct usable IP becomes a separate
+// candidate with the configured transfer port.
 func (h *Host) FindProviders(ctx context.Context, d digest.Digest) ([]ifaces.Provider, error) {
 	c, err := DigestToCID(d)
 	if err != nil {
@@ -587,9 +584,7 @@ func (h *Host) FindProviders(ctx context.Context, d digest.Digest) ([]ifaces.Pro
 
 	out := make([]ifaces.Provider, 0, len(ais))
 	for _, ai := range ais {
-		if provider, ok := h.transferProvider(ai); ok {
-			out = append(out, provider)
-		}
+		out = append(out, h.transferProviders(ai)...)
 	}
 
 	return out, err
@@ -662,9 +657,7 @@ func (h *Host) StreamProviders(ctx context.Context, d digest.Digest, lookupBudge
 					continue
 				}
 
-				if provider, ok := h.transferProvider(ai); ok {
-					queue = append(queue, provider)
-				}
+				queue = append(queue, h.transferProviders(ai)...)
 			case send <- next:
 				queue = queue[1:]
 			}
@@ -674,21 +667,25 @@ func (h *Host) StreamProviders(ctx context.Context, d digest.Digest, lookupBudge
 	return out, func() error { return lookupErr }
 }
 
-// transferProvider converts a DHT provider record into the transfer endpoint
-// the mirror dials. It reports false when the record has no usable IP.
-func (h *Host) transferProvider(ai peer.AddrInfo) (ifaces.Provider, bool) {
-	addr := transferAddrWithPort(ai, h.transferPort)
-	if addr == "" {
-		return ifaces.Provider{}, false
+// transferProviders preserves every distinct transfer endpoint for a peer.
+func (h *Host) transferProviders(ai peer.AddrInfo) []ifaces.Provider {
+	addresses := transferAddrsWithPort(ai, h.transferPort)
+	if len(addresses) == 0 {
+		return nil
 	}
 	// Cache the addr info in the peerstore so subsequent dials don't
 	// require another DHT round-trip.
 	h.h.Peerstore().AddAddrs(ai.ID, ai.Addrs, peerstore.AddressTTL)
 
-	return ifaces.Provider{
-		NodeID: ifaces.NodeID(ai.ID.String()),
-		Addr:   addr,
-	}, true
+	providers := make([]ifaces.Provider, 0, len(addresses))
+	for _, address := range addresses {
+		providers = append(providers, ifaces.Provider{
+			NodeID: ifaces.NodeID(ai.ID.String()),
+			Addr:   address,
+		})
+	}
+
+	return providers
 }
 
 // Health returns the geometric-mean health score (routing-table
@@ -924,11 +921,12 @@ func DigestToCID(d digest.Digest) (cid.Cid, error) {
 	return cid.NewCidV1(cid.Raw, mh), nil
 }
 
-// transferAddrWithPort extracts the dial address for the peer's transfer
-// endpoint by walking its multiaddrs for a remotely usable IPv4/IPv6
-// component and appending the configured port. Returns the empty string
-// if no usable IP-based multiaddr is present.
-func transferAddrWithPort(ai peer.AddrInfo, port int) string {
+// transferAddrsWithPort returns distinct usable IP endpoints in discovery order.
+func transferAddrsWithPort(ai peer.AddrInfo, port int) []string {
+	var addresses []string
+
+	seen := make(map[string]struct{}, len(ai.Addrs))
+
 	for _, ma := range ai.Addrs {
 		value, ok := extractIP(ma)
 		if !ok {
@@ -940,10 +938,16 @@ func transferAddrWithPort(ai peer.AddrInfo, port int) string {
 			continue
 		}
 
-		return net.JoinHostPort(value, strconv.Itoa(port))
+		address := net.JoinHostPort(value, strconv.Itoa(port))
+		if _, duplicate := seen[address]; duplicate {
+			continue
+		}
+
+		seen[address] = struct{}{}
+		addresses = append(addresses, address)
 	}
 
-	return ""
+	return addresses
 }
 
 func extractIP(ma multiaddr.Multiaddr) (string, bool) {
