@@ -12,10 +12,17 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
+
+// uCmdDelDevAsync is UBLK_U_CMD_DEL_DEV_ASYNC (Linux 6.9+). Unlike
+// DEL_DEV it does not wait for the char device to be released.
+var uCmdDelDevAsync = ior(0x14, uint32(unsafe.Sizeof(ctrlCmd{})))
 
 // nodeWaitTimeout bounds how long Start waits for device nodes to appear.
 const nodeWaitTimeout = 10 * time.Second
@@ -35,6 +42,7 @@ type Device struct {
 	workers sync.WaitGroup
 
 	started bool
+	closing atomic.Bool // set when teardown begins
 
 	once     sync.Once
 	done     chan struct{}
@@ -196,12 +204,21 @@ func (d *Device) teardown(cause error) {
 	d.once.Do(func() {
 		var errs []error
 
+		d.closing.Store(true)
 		d.hcancel()
 
-		if d.started {
-			if err := d.ctrl.stopDev(d.id); err != nil {
+		// After an external STOP_DEV or DEL_DEV the kernel may report
+		// ENODEV for our own control commands; that is not a teardown
+		// failure.
+		external := errors.Is(cause, errStoppedExternally)
+		keep := func(err error) {
+			if err != nil && (!external || !errors.Is(err, syscall.ENODEV)) {
 				errs = append(errs, err)
 			}
+		}
+
+		if d.started {
+			keep(d.ctrl.stopDev(d.id))
 		}
 
 		for _, q := range d.queues {
@@ -221,11 +238,6 @@ func (d *Device) teardown(cause error) {
 			errs = append(errs, q.release())
 		}
 
-		if d.charFd >= 0 {
-			errs = append(errs, unix.Close(d.charFd))
-			d.charFd = -1
-		}
-
 		if !d.started {
 			// Never live; STOP_DEV makes DEL_DEV safe. It may fail
 			// harmlessly when the device was never started.
@@ -234,7 +246,37 @@ func (d *Device) teardown(cause error) {
 			}
 		}
 
-		errs = append(errs, d.ctrl.delDev(d.id), d.ctrl.close())
+		// The kernel keeps the id allocated while the char device is
+		// open, so deleting before closing it can never hit another
+		// device that reused the id. Kernels without DEL_DEV_ASYNC fall
+		// back to DEL_DEV after the close, since DEL_DEV waits for it.
+		deleted := false
+
+		if d.charFd >= 0 {
+			res, err := d.ctrl.do(uCmdDelDevAsync, uint32(d.id), 0, nil, 0)
+			if err == nil {
+				err = resErr("DEL_DEV_ASYNC", res)
+			}
+
+			switch {
+			case err == nil:
+				deleted = true
+			case errors.Is(err, syscall.ENODEV):
+				// Already deleted by someone else.
+				deleted = true
+			default:
+				d.cfg.Logger.Debug("ublk: DEL_DEV_ASYNC failed, falling back to DEL_DEV", "id", d.id, "err", err)
+			}
+
+			errs = append(errs, unix.Close(d.charFd))
+			d.charFd = -1
+		}
+
+		if !deleted {
+			keep(d.ctrl.delDev(d.id))
+		}
+
+		errs = append(errs, d.ctrl.close())
 
 		d.err = cause
 		d.closeErr = errors.Join(errs...)
@@ -254,7 +296,8 @@ func (d *Device) ID() int { return d.id }
 // Path returns the block device path, "/dev/ublkb<ID>".
 func (d *Device) Path() string { return "/dev/ublkb" + strconv.Itoa(d.id) }
 
-// Done is closed when the device has stopped for any reason.
+// Done is closed when the device has stopped for any reason, including
+// another process stopping or deleting it.
 func (d *Device) Done() <-chan struct{} { return d.done }
 
 // Err reports why the device stopped. It is nil while running and after a

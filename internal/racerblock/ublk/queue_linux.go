@@ -20,6 +20,11 @@ import (
 // ublkIOResAbort is UBLK_IO_RES_ABORT (-ENODEV).
 const ublkIOResAbort = -19
 
+// errStoppedExternally reports that the kernel aborted every io command
+// while the device was not being torn down locally, for example because
+// another process issued STOP_DEV or DEL_DEV for it.
+var errStoppedExternally = fmt.Errorf("device stopped externally: %w", syscall.ENODEV)
+
 // pollUserData tags the eventfd poll completion; io commands use their tag.
 const pollUserData = 1 << 63
 
@@ -137,6 +142,11 @@ func (q *queue) wake() {
 	}
 }
 
+// localStop reports whether this process is tearing the queue down.
+func (q *queue) localStop() bool {
+	return q.stopping.Load() || q.dev.closing.Load()
+}
+
 // stop asks the queue thread to exit.
 func (q *queue) stop() {
 	q.stopping.Store(true)
@@ -223,7 +233,7 @@ func (q *queue) run(ready chan<- error) {
 
 	q.ring = nil
 
-	if err != nil && !q.stopping.Load() {
+	if err != nil && !q.localStop() {
 		q.dev.fail(fmt.Errorf("ublk: queue %d: %w", q.id, err))
 	}
 }
@@ -262,7 +272,7 @@ func (q *queue) serve(ready chan<- error) error {
 			case ublkIOResAbort:
 				live--
 			default:
-				if q.stopping.Load() {
+				if q.localStop() {
 					live--
 					continue
 				}
@@ -271,8 +281,16 @@ func (q *queue) serve(ready chan<- error) error {
 			}
 		}
 
-		if q.stopping.Load() || live == 0 {
+		if q.stopping.Load() {
 			return nil
+		}
+
+		if live == 0 {
+			if q.localStop() {
+				return nil
+			}
+
+			return errStoppedExternally
 		}
 
 		if err := q.drain(); err != nil {
