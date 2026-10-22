@@ -665,6 +665,14 @@ fn rdma_devices(
         let port_names = list_or_empty(walk, &path.join("ports"))?;
         // Upper bound: non-numeric entries are skipped.
         let mut ports = walk.vec::<RdmaPort>(port_names.len())?;
+        // dev_port numbers Ethernet ports within the PCI function and need not
+        // match RDMA port numbers, so only filter by it when the function is
+        // shared by several RDMA ports.
+        let single_port = port_names
+            .iter()
+            .filter(|port| port.parse::<u32>().is_ok())
+            .count()
+            == 1;
         for port in port_names {
             let Ok(port_number) = port.parse::<u32>() else {
                 continue;
@@ -686,8 +694,11 @@ fn rdma_devices(
             }
             for netdev in &pci_netdevs {
                 // dev_port is zero-based; keep netdevs without it.
-                let dev_port =
-                    number(walk, &path.join("device/net").join(netdev).join("dev_port"))?;
+                let dev_port = if single_port {
+                    None
+                } else {
+                    number(walk, &path.join("device/net").join(netdev).join("dev_port"))?
+                };
                 if dev_port.is_none_or(|dev_port| dev_port + 1 == u64::from(port_number))
                     && !netdevs.contains(netdev)
                 {
@@ -955,8 +966,8 @@ mod tests {
             Some("fe80:0000:0000:0000:0e42:a1ff:fe12:3456")
         );
         assert_eq!(port.gid0_type.as_deref(), Some("RoCE v2"));
-        // eth9 belongs to dev_port 1 (port 2), so it is excluded from port 1.
-        assert_eq!(port.netdevs, ["eth2"]);
+        // A single RDMA port owns every netdev of its PCI function.
+        assert_eq!(port.netdevs, ["eth2", "eth9"]);
         assert_eq!(inactive.name, "mlx5_1");
         assert_eq!(inactive.pci_address, None);
         assert_eq!(inactive.numa_node, None);
@@ -966,6 +977,45 @@ mod tests {
         assert_eq!(port.phys_state.as_deref(), Some("Disabled"));
         assert_eq!(port.gid0, None);
         assert!(port.netdevs.is_empty());
+    }
+
+    #[test]
+    fn single_port_keeps_netdev_with_unaligned_dev_port() {
+        let f = Fixture::new();
+        fs::create_dir_all(f.sys().join("block")).unwrap();
+        // Second PCI function: RDMA port 1, Ethernet dev_port 1, no GID mapping.
+        f.write(
+            "sys/devices/pci0000:40/0000:41:00.1/net/eth3/dev_port",
+            "1\n",
+        );
+        f.link(
+            "../../../devices/pci0000:40/0000:41:00.1",
+            "sys/class/infiniband/mlx5_2/device",
+        );
+        f.write("sys/class/infiniband/mlx5_2/ports/1/state", "4: ACTIVE\n");
+        let report = discover(&walk(), &f.sys(), &f.dev()).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let port = &report.rdma_devices[0].ports[0];
+        assert_eq!(port.port, 1);
+        assert_eq!(port.netdevs, ["eth3"]);
+    }
+
+    #[test]
+    fn multi_port_filters_netdevs_by_dev_port() {
+        let f = Fixture::new();
+        fs::create_dir_all(f.sys().join("block")).unwrap();
+        rdma_tree(&f);
+        let port2 = "sys/class/infiniband/mlx5_0/ports/2";
+        f.write(&format!("{port2}/state"), "1: DOWN\n");
+        let report = discover(&walk(), &f.sys(), &f.dev()).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let [port1, port2] = &report.rdma_devices[0].ports[..] else {
+            panic!("two ports expected");
+        };
+        // eth9 has dev_port 1, so it belongs to port 2 only.
+        assert_eq!(port1.netdevs, ["eth2"]);
+        assert_eq!(port2.port, 2);
+        assert_eq!(port2.netdevs, ["eth9"]);
     }
 
     #[test]
@@ -983,7 +1033,7 @@ mod tests {
         let report = discover(&walk(), &f.sys(), &f.dev()).unwrap();
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         let port = &report.rdma_devices[0].ports[0];
-        assert_eq!(port.netdevs, ["eth2", "vlan100"]);
+        assert_eq!(port.netdevs, ["eth2", "eth9", "vlan100"]);
         assert_eq!(port.gid0_type.as_deref(), Some("RoCE v2"));
         assert_eq!(
             port.gid0.as_deref(),
