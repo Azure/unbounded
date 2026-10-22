@@ -18,7 +18,7 @@ and examples used by development and benchmark tooling.
 | `chart/templates/serviceaccount.yaml` | `rendered/serviceaccount.yaml` | Namespace + ServiceAccount + Role + PriorityClass. |
 | `chart/templates/configmap.yaml` | `rendered/configmap.yaml` | Default `config.yaml` (mirrors `config.NewDefault()`). |
 | `chart/templates/rendezvous-leases.yaml` | `rendered/rendezvous-leases.yaml` | Fixed chair Lease set. |
-| `chart/templates/node-config.yaml` | Standalone chart only | Continuously reconciles containerd's default Gantry mirror route. |
+| `chart/templates/node-config.yaml` | Standalone chart only | Continuously reconciles containerd's Gantry mirror route. |
 | `examples/registry-secret.example.yaml.tmpl` | `rendered/examples/registry-secret.example.yaml` | Template Secret for upstream-registry credentials. |
 | `examples/networkpolicy.yaml.tmpl` | `rendered/examples/networkpolicy.yaml` | **Hardening overlay (NOT applied by default).** See [Hardening overlays](#hardening-overlays) below. |
 | `hosts.toml.template` | (not rendered) | containerd registry mirror config; one file per upstream registry under `/etc/containerd/certs.d/<host>/hosts.toml`. |
@@ -28,9 +28,9 @@ and examples used by development and benchmark tooling.
 - Operator-managed clusters use the manifests embedded in the
    `unbounded-operator` binary. The operator never runs Helm.
 - Clusters without the operator install the released OCI chart. The chart
-   continuously reconciles `/etc/containerd/certs.d/_default/hosts.toml` on
-   every selected node. Containerd must already be configured to read
-   `/etc/containerd/certs.d`; the chart does not edit or restart containerd.
+   continuously reconciles its route under `/etc/containerd/certs.d` on every
+   selected node. Containerd must already be configured to read that directory;
+   the chart does not edit or restart containerd.
 
 The paths are mutually exclusive. `PriorityClass/gantry-low` records the active
 manager, and both installers reject ownership by the other path.
@@ -166,11 +166,15 @@ the Gantry DaemonSet normally; the mirror activates when the pod starts
 listening on `127.0.0.1:5000`.
 
 Standalone Helm installations run `DaemonSet/gantry-containerd-config`. Its
-resident reconciler checks the default `hosts.toml` every five seconds and
-atomically restores the chart-owned payload when the file is missing or
-different, including after a node upgrade resets host configuration. Graceful
-shutdown removes the file only when it still matches the chart payload. Set
-`nodeConfig.enabled=false` when another node-management system owns this file.
+resident reconciler checks its `hosts.toml` files every five seconds and
+atomically restores chart-owned payloads when they are missing or different,
+including after a node upgrade resets host configuration. Graceful shutdown
+removes a file only when it still matches the chart payload. Set
+`nodeConfig.enabled=false` when another node-management system owns these files.
+
+The default profile owns `_default/hosts.toml`. Artifact Streaming instead owns
+one registry-specific `<registry-host>/hosts.toml` for each configured upstream,
+leaving AKS's `_default/hosts.toml` unchanged.
 
 Externally managed installations can instead drop a registry-specific
 `hosts.toml` at:
@@ -182,6 +186,225 @@ Externally managed installations can instead drop a registry-specific
 derived from `hosts.toml.template` (substitute `${REGISTRY_SERVER}`
 with the registry's `https://...` URL). containerd reloads `certs.d`
 on its own; no restart needed.
+
+## ACR Artifact Streaming
+
+This integration consumes the existing ACR OverlayBD v0.1.0 artifact contract
+without running the OverlayBD daemon or snapshotter. Enable it on Linux nodes
+that support NBD, ext4, EROFS when required by the image, and shared mount
+propagation.
+
+For a standalone Helm installation, enable the Gantry range endpoint and its
+host configurator together. Point Gantry's OCI upstream at the node-local AKS
+Artifact Streaming mirror and select only the streaming node pool:
+
+```yaml
+nodeSelector:
+   gantry-streaming: "true"
+
+gantry:
+   artifactStreaming:
+      enabled: true
+   upstreamRegistries:
+      - name: <registry>.azurecr.io
+        endpoint: http://127.0.0.1:8578?ns=<registry>.azurecr.io
+
+overlaybdConfig:
+   enabled: true
+   nodeSelector:
+      gantry-streaming: "true"
+```
+
+In this mode Gantry uses host networking so it can reach the loopback-only AKS
+mirror. Containerd resolves through Gantry on port 5000; Gantry forwards OCI
+requests to the AKS mirror on port 8578, preserving its `ns` query. The AKS
+mirror returns the OverlayBD manifest, which triggers Gantry's complete-layer
+chair pulls. The Gantry snapshotter reads sealed LSMT layers through the same
+Gantry listener under `/blobs/`, where the source order remains local, peer,
+then signed ACR origin.
+
+The adapter accepts raw LSMT, raw ZFile, and tar/PAX-wrapped
+`overlaybd.commit` payloads. ZFile metadata and CRC32C checksums are validated
+before exposing the image; LZ4 and Zstandard blocks are fetched and decompressed
+on demand with bounded, coalesced range reads. Compression dictionaries,
+compressed indexes, and other compression algorithms are rejected explicitly.
+The adapter does not download or decompress the entire layer to mount it.
+
+Gantry prefetches mount-critical head and tail regions when an ACR streaming
+manifest is served or committed by a background peer pull. Overlapping callbacks
+for the same registry, repository, and manifest share one bounded prefetch job.
+This also warms metadata when containerd reuses an already-cached manifest
+without requesting its body again. Prefetch completion logs report the manifest,
+duration, and number of cached regions; incomplete warmups are reported separately.
+
+AKS initially selects the `overlaybd` snapshotter on these nodes. Gantry keeps
+that native plugin registered, adds a distinct `gantry-overlaybd` proxy, and
+switches CRI image unpacking to the new proxy. The adapter uses a private
+in-process `overlayfs` snapshotter under its state directory for ordinary OCI
+layers; only layers with the complete ACR OverlayBD contract use NBD.
+The fallback must not call back into containerd's snapshot service: the proxy's
+garbage collector would otherwise see independently managed host snapshots.
+
+The registry-specific containerd file lists the AKS mirror after Gantry. If
+Gantry is unavailable, containerd continues through port 8578 with Artifact
+Streaming but without Gantry peer reuse.
+
+The adapter DaemonSet runs `gantry snapshotter` beside the host configurator.
+The snapshotter owns both its remote metadata and its ordinary-image fallback
+state under `/var/lib/gantry/snapshotter`; it does not mount the host containerd
+socket or reuse the host's snapshot metadata.
+When updating the adapter image, bootstrap its replacement with native
+`overlayfs` on each affected node, verify the new adapter is ready, and then
+restore `gantry-overlaybd` for CRI image unpacking. The adapter cannot prepare
+its own replacement container through its socket while that adapter is stopped;
+pre-pulling the replacement image alone does not remove this dependency.
+The configurator waits for `/artifact-streaming/readyz` and the host-visible
+snapshotter socket, loads the `nbd` module, and verifies device capacity. It
+then snapshots the current containerd configuration under
+`/var/lib/gantry/snapshotter-config`, enables `/etc/containerd/conf.d/*.toml`
+through structured TOML, and writes a last-wins drop-in that registers
+`proxy_plugins.gantry-overlaybd` and selects it for CRI image unpacking.
+Containerd restarts only when effective configuration changes. A second writer
+is never overwritten: if either managed file differs from the recorded bytes,
+apply or rollback preserves it and reports the conflict.
+
+For an operator-managed installation, opt in through every participating
+`Site` using the same selector. This path assumes `unbounded-agent` or another
+node manager already routes containerd through Gantry. Use the standalone Helm
+chart on stock AKS nodes so the registry-specific route is installed alongside
+the snapshotter configuration.
+
+```yaml
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: Site
+metadata:
+   name: <site-name>
+spec:
+   components:
+      gantry:
+         enabled: true
+         artifactStreaming:
+            enabled: true
+            nodeSelector:
+               kubernetes.azure.com/agentpool: <streaming-node-pool>
+```
+
+The operator rejects an empty selector, a Site that enables Artifact Streaming
+while disabling Gantry, or conflicting selectors across Sites.
+
+### Artifact Streaming rollback
+
+Drain workloads using active Gantry snapshotter devices before disabling the operator
+setting. The operator issues deletion of
+`DaemonSet/gantry-overlaybd-config` before applying the non-streaming Gantry
+DaemonSet, and the configurator's `preStop` restores the original host
+configuration when it still owns the current value. Kubernetes deletion and
+pod termination are asynchronous, which is why workloads must be drained
+before this transition.
+
+For standalone Helm, keep the Gantry endpoint available during restoration:
+
+```sh
+helm upgrade gantry oci://ghcr.io/azure/charts/gantry \
+   --reuse-values \
+   --set overlaybdConfig.enabled=false \
+   --set gantry.artifactStreaming.enabled=true \
+   --wait
+
+kubectl -n gantry-system wait --for=delete \
+   daemonset/gantry-overlaybd-config --timeout=5m
+```
+
+After the configurator is gone and streaming workloads are drained, disable
+`gantry.artifactStreaming.enabled`. If the host OverlayBD file was changed by
+another owner after Gantry configured it, rollback deliberately leaves that
+new value in place; inspect the configurator logs and resolve ownership before
+removing the saved state.
+
+### Artifact Streaming metrics
+
+Labels are bounded: `source` is `local`, `peer`, or `origin`; `outcome` is
+`success` or `error`; `reason` is `range` or `origin_url`.
+
+| Metric | Use |
+| --- | --- |
+| `gantry_streaming_requests_total{source,outcome}` | Which source served each range, and whether it succeeded. |
+| `gantry_streaming_bytes_total{source}` | Bytes per source; `origin` is ACR data-plane egress. |
+| `gantry_streaming_time_to_first_byte_seconds{source}` | Latency before the range body starts. |
+| `gantry_streaming_request_duration_seconds{source,outcome}` | End-to-end range duration. |
+| `gantry_streaming_rejected_total{reason}` | Requests refused before a source was chosen. |
+| `gantry_streaming_inflight{source}` | Range bodies currently streaming. |
+
+`/artifact-streaming/readyz` on the node-local mirror port reports endpoint
+readiness. It is loopback-only, so probe it from the node rather than Prometheus.
+
+### Artifact Streaming alerts
+
+These separate the failure domains that need different responses. Tune the
+thresholds against a real workload before paging on them.
+
+```yaml
+- alert: GantryStreamingErrors
+  expr: |
+    sum by (instance) (rate(gantry_streaming_requests_total{outcome="error"}[5m]))
+      / sum by (instance) (rate(gantry_streaming_requests_total[5m])) > 0.05
+  for: 10m
+  annotations:
+    summary: Gantry is failing OverlayBD range requests on {{ $labels.instance }}.
+
+- alert: GantryStreamingOriginFailing
+  expr: sum(rate(gantry_streaming_requests_total{source="origin",outcome="error"}[5m])) > 0
+  for: 10m
+  annotations:
+    summary: Signed-origin range reads are failing; suspect ACR or the host allowlist.
+
+- alert: GantryStreamingNoPeerReuse
+  expr: |
+    sum(rate(gantry_streaming_requests_total{source="peer",outcome="success"}[30m])) == 0
+      and sum(rate(gantry_streaming_requests_total{source="origin",outcome="success"}[30m])) > 0
+  for: 30m
+  annotations:
+    summary: Every range is coming from ACR; peer reuse is not happening.
+
+- alert: GantryStreamingRejectingOriginURLs
+  expr: sum(rate(gantry_streaming_rejected_total{reason="origin_url"}[5m])) > 0
+  for: 5m
+  annotations:
+    summary: Gantry refuses the OverlayBD origin URL; check the host suffix allowlist.
+```
+
+Origin reads are capped at 32 in flight per node. A sustained
+`gantry_streaming_inflight{source="origin"}` at that ceiling means ranges are
+queueing behind ACR rather than failing.
+
+### Artifact Streaming incident response
+
+| Symptom | Likely cause | Action |
+| --- | --- | --- |
+| Pods on streaming nodes stall on first read | Gantry agent or snapshotter unavailable on that node | Cordon the node, drain streaming workloads, then set `overlaybdConfig.enabled=false` to restore the previous containerd snapshotter. |
+| `GantryStreamingOriginFailing` while peers still serve | ACR data plane, or an expired SAS | Ranges backed by a complete peer keep working, so do not disable Gantry; it is the only thing still serving. Escalate to ACR. |
+| `GantryStreamingRejectingOriginURLs` | Allowlist does not cover the registry data endpoint | Add it to `gantry.artifactStreaming.allowedHostSuffixes` and roll the agent. |
+| Ranges return to `source="origin"` after a peer had served them | Provider record outlived the blob (containerd GC or eviction) | Expected. Gantry fails over within the same request and suppresses that provider for 3m. Investigate only if it persists, which points at containerd GC pressure. |
+| `/artifact-streaming/readyz` returns 503 | Agent still starting, or draining | The gate is sticky until startup completes. If it persists, check the containerd socket; containerd is Gantry's only content store. |
+| NBD device errors while Gantry is healthy | NBD capacity, kernel module, or mount propagation | Check the adapter DaemonSet and host `nbd` module state. Drain workloads before disabling `overlaybdConfig`. |
+
+### Artifact Streaming compatibility
+
+Gantry consumes ACR's existing OverlayBD artifact format but owns the runtime
+reader and snapshotter.
+
+| Component | Requirement | Owner |
+| --- | --- | --- |
+| Node pool | Created with Artifact Streaming enabled | AKS |
+| Registry | Premium ACR serving streaming artifacts | ACR |
+| Artifact contract | OverlayBD v0.1.0 annotations and sealed LSMT layers | ACR |
+| Kernel backend | `nbd`, ext4, and EROFS when selected by the image | Node image |
+| Snapshotter selection | CRI selects `gantry-overlaybd`; AKS's native `overlaybd` registration remains intact | Gantry |
+| containerd | Reads `/etc/containerd/certs.d`; Unbounded-managed nodes pin 2.1.8 | Unbounded / AKS |
+| Host config written | import for `/etc/containerd/conf.d/*.toml`, `proxy_plugins.gantry-overlaybd`, and the CRI snapshotter selection | Gantry |
+
+Every other containerd setting is preserved, and rollback restores the original
+main config and any pre-existing drop-in exactly.
 
 ## What to verify after rollout
 
@@ -196,6 +419,8 @@ on its own; no restart needed.
 | Advertiser reconciling | `gantry_advertise_reconcile_total` increases at the configured cadence |
 | Leases are being created on `please_pull` | `gantry_containerd_lease_created_total` increments during cold-start rollouts |
 | Origin fallback is rare | `p2p_origin_fallback_total` stays at ~0 |
+| Streaming endpoint is ready | `/artifact-streaming/readyz` returns 200 on port 5000 for enabled target nodes |
+| Streaming source transition | `gantry_streaming_requests_total{source="origin",outcome="success"}` serves cold ranges, then `source="peer"` increases after complete providers advertise |
 
 See `docs/detailed-design.md` §7.6 for the full metric catalog.
 

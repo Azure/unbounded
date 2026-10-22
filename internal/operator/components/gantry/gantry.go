@@ -19,6 +19,7 @@ package gantry
 import (
 	"context"
 	"fmt"
+	"maps"
 	"strconv"
 	"strings"
 
@@ -61,7 +62,12 @@ const (
 	// agentContainerName is the gantry agent's main container. Only this
 	// container carries the operator-managed image; the DaemonSet's busybox
 	// init container keeps its pinned public image.
-	agentContainerName = "gantry"
+	agentContainerName                = "gantry"
+	overlayBDConfigDaemonSetName      = "gantry-overlaybd-config"
+	overlayBDConfigContainerName      = "configure"
+	overlayBDSnapshotterContainerName = "snapshotter"
+	overlayBDConfigImageRepository    = "gantry-node-config"
+	artifactStreamingEnabledEnv       = "GANTRY_ARTIFACT_STREAMING_ENABLED"
 
 	// legacyNodeConfigName and legacyNodeConfigDaemonSetName were installed by
 	// older operator versions. The unbounded agent owns this host configuration.
@@ -78,8 +84,14 @@ const (
 var operatorManifestFiles = map[string]struct{}{
 	"configmap.yaml":         {},
 	"daemonset.yaml":         {},
+	"overlaybd-config.yaml":  {},
 	"rendezvous-leases.yaml": {},
 	"serviceaccount.yaml":    {},
+}
+
+type artifactStreamingConfig struct {
+	Enabled      bool
+	NodeSelector map[string]string
 }
 
 // Component reconciles the gantry cluster singleton.
@@ -119,6 +131,11 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 		}
 	}
 
+	artifactStreaming, err := resolveArtifactStreaming(sites)
+	if err != nil {
+		return nil, component.Result{}, err
+	}
+
 	installationManager, err := detectInstallationManager(ctx, env)
 	if err != nil {
 		return nil, component.Result{}, err
@@ -142,6 +159,13 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 	// the applies depend on those deletes, so a failure to remove the legacy
 	// DaemonSet does not race the replacement into the cluster alongside it.
 	legacy := legacyCleanupOperations(c.Name(), env.Namespace)
+	if !artifactStreaming.Enabled {
+		legacy = append(legacy, component.DeleteOperation(&appsv1.DaemonSet{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"},
+			ObjectMeta: metav1.ObjectMeta{Namespace: env.Namespace, Name: overlayBDConfigDaemonSetName},
+		}, c.Name(), ""))
+	}
+
 	plan.Add(legacy...)
 
 	legacyRefs := make([]component.ObjectRef, 0, len(legacy))
@@ -183,7 +207,17 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 		return nil, component.Result{}, err
 	}
 
-	objects, err := decodeManifests(env, applyMutator(env.Config.Image(imageRepository), configHash, racerPlacement))
+	if artifactStreaming.Enabled && racerRequested {
+		return nil, component.Result{}, fmt.Errorf("artifact streaming cannot be combined with the Racer backend selected by ClusterCache/%s", RacerCacheName)
+	}
+
+	objects, err := decodeManifests(env, applyMutator(
+		env.Config.Image(imageRepository),
+		env.Config.Image(overlayBDConfigImageRepository),
+		configHash,
+		artifactStreaming,
+		racerPlacement,
+	))
 	if err != nil {
 		return nil, component.Result{}, err
 	}
@@ -215,7 +249,7 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 			DependsOn: dependsOn,
 		}
 
-		if agent {
+		if agent || obj.GetKind() == "DaemonSet" && obj.GetName() == overlayBDConfigDaemonSetName {
 			op.Overridable = true
 		}
 
@@ -223,6 +257,40 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 	}
 
 	return plan, result, nil
+}
+
+func resolveArtifactStreaming(sites []unboundedv1alpha3.Site) (artifactStreamingConfig, error) {
+	var resolved artifactStreamingConfig
+
+	for index := range sites {
+		site := &sites[index]
+
+		gantry := site.Spec.Components.Gantry
+		if gantry == nil || gantry.ArtifactStreaming == nil || !gantry.ArtifactStreaming.Enabled {
+			continue
+		}
+
+		if !EnabledFor(site) {
+			return artifactStreamingConfig{}, fmt.Errorf("site/%s enables gantry artifactStreaming while gantry is disabled", site.Name)
+		}
+
+		selector := gantry.ArtifactStreaming.NodeSelector
+		if len(selector) == 0 {
+			return artifactStreamingConfig{}, fmt.Errorf("site/%s gantry artifactStreaming requires nodeSelector", site.Name)
+		}
+
+		if !resolved.Enabled {
+			resolved = artifactStreamingConfig{Enabled: true, NodeSelector: maps.Clone(selector)}
+
+			continue
+		}
+
+		if !maps.Equal(resolved.NodeSelector, selector) {
+			return artifactStreamingConfig{}, fmt.Errorf("site/%s gantry artifactStreaming nodeSelector conflicts with another Site", site.Name)
+		}
+	}
+
+	return resolved, nil
 }
 
 // SetupWatches reconciles Gantry on changes to its active resources and when
@@ -235,7 +303,7 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 		builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(configName, legacyNodeConfigName))))
 	// The racer-dataplane DaemonSet supplies the agent placement in Racer mode.
 	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(),
-		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(daemonSetName, legacyNodeConfigDaemonSetName, workload.DataplaneDaemonSetName))))
+		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(daemonSetName, legacyNodeConfigDaemonSetName, overlayBDConfigDaemonSetName, workload.DataplaneDaemonSetName))))
 	b.Watches(&coordinationv1.Lease{}, env.RequestSingleton(),
 		builder.WithPredicates(chairLeaseDeletePredicate(env.Namespace)))
 	b.Watches(&racerv1.ClusterCache{}, env.RequestSingleton(), builder.WithPredicates(racerCachePredicate()))
@@ -364,8 +432,12 @@ func legacyCleanupOperations(componentName, namespace string) []component.Operat
 // the config payload hash on its pod template so a config change rolls the
 // DaemonSet. Only the agent's own container is re-imaged. A non-nil
 // racerPlacement switches the agent to the Racer backend.
-func applyMutator(agentImage, configHash string, racerPlacement *workload.NodePlacement) func(*unstructured.Unstructured) error {
+func applyMutator(agentImage, overlayBDConfigImage, configHash string, artifactStreaming artifactStreamingConfig, racerPlacement *workload.NodePlacement) func(*unstructured.Unstructured) error {
 	return func(obj *unstructured.Unstructured) error {
+		if artifactStreaming.Enabled && racerPlacement != nil {
+			return fmt.Errorf("artifact streaming cannot be combined with the Racer backend")
+		}
+
 		if obj.GetKind() == component.CRDKind {
 			obj.Object = nil
 
@@ -383,6 +455,12 @@ func applyMutator(agentImage, configHash string, racerPlacement *workload.NodePl
 				return fmt.Errorf("set gantry agent image: %w", err)
 			}
 
+			if artifactStreaming.Enabled {
+				if err := setNamedContainerEnv(obj, agentContainerName, artifactStreamingEnabledEnv, "true"); err != nil {
+					return fmt.Errorf("enable gantry artifact streaming: %w", err)
+				}
+			}
+
 			if racerPlacement != nil {
 				if err := applyRacerMode(obj, racerPlacement); err != nil {
 					return fmt.Errorf("configure gantry Racer backend: %w", err)
@@ -392,8 +470,75 @@ func applyMutator(agentImage, configHash string, racerPlacement *workload.NodePl
 			return stampConfigHash(obj, configHashAnnotation, configHash)
 		}
 
+		if obj.GetKind() == "DaemonSet" && obj.GetName() == overlayBDConfigDaemonSetName {
+			if !artifactStreaming.Enabled {
+				obj.Object = nil
+
+				return nil
+			}
+
+			if err := component.SetNamedContainerImage(obj, overlayBDConfigContainerName, overlayBDConfigImage); err != nil {
+				return fmt.Errorf("set gantry OverlayBD configurator image: %w", err)
+			}
+
+			if err := component.SetNamedContainerImage(obj, overlayBDSnapshotterContainerName, agentImage); err != nil {
+				return fmt.Errorf("set gantry OverlayBD snapshotter image: %w", err)
+			}
+
+			selector := make(map[string]any, len(artifactStreaming.NodeSelector))
+			for key, value := range artifactStreaming.NodeSelector {
+				selector[key] = value
+			}
+
+			if err := unstructured.SetNestedMap(obj.Object, selector, "spec", "template", "spec", "nodeSelector"); err != nil {
+				return fmt.Errorf("set gantry OverlayBD configurator nodeSelector: %w", err)
+			}
+		}
+
 		return nil
 	}
+}
+
+func setNamedContainerEnv(obj *unstructured.Unstructured, containerName, name, value string) error {
+	containers, found, err := unstructured.NestedSlice(obj.Object, "spec", "template", "spec", "containers")
+	if err != nil {
+		return err
+	}
+
+	if !found {
+		return fmt.Errorf("containers not found")
+	}
+
+	for index, item := range containers {
+		container, ok := item.(map[string]any)
+		if !ok || container["name"] != containerName {
+			continue
+		}
+
+		env, _, err := unstructured.NestedSlice(container, "env")
+		if err != nil {
+			return err
+		}
+
+		for envIndex, entry := range env {
+			variable, ok := entry.(map[string]any)
+			if ok && variable["name"] == name {
+				variable["value"] = value
+				env[envIndex] = variable
+				container["env"] = env
+				containers[index] = container
+
+				return unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", "containers")
+			}
+		}
+
+		container["env"] = append(env, map[string]any{"name": name, "value": value})
+		containers[index] = container
+
+		return unstructured.SetNestedSlice(obj.Object, containers, "spec", "template", "spec", "containers")
+	}
+
+	return fmt.Errorf("container %q not found", containerName)
 }
 
 // stampConfigHash sets a config-hash annotation on a workload's pod template so a

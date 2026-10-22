@@ -43,6 +43,7 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
+	"github.com/Azure/unbounded/internal/gantry/httprange"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/manifest"
 	"github.com/Azure/unbounded/internal/gantry/oci"
@@ -65,7 +66,23 @@ type Server struct {
 	// channel means the server is at capacity and further blob GETs are
 	// shed with 429 so the requester re-discovers another provider.
 	serveSem chan struct{}
+	// rangeSem, when non-nil, admits small bounded ranges independently of
+	// serveSem so index reads are never queued behind bulk layer streams.
+	rangeSem chan struct{}
+	// ranges, when set, answers range requests for blobs this node has only
+	// partially fetched. Without it a peer cannot serve any part of a layer
+	// until it holds all of it, which is why a cold image has no peer source.
+	ranges RangeSource
 }
+
+// RangeSource serves byte ranges of blobs that are not present in full.
+type RangeSource interface {
+	OpenRange(ctx context.Context, d digest.Digest, requested httprange.Range) (io.ReadCloser, int64, error)
+}
+
+// fastRangeMaxBytes bounds the range lane. Anything larger is a bulk transfer
+// wearing a Range header and stays on the blob cap.
+const fastRangeMaxBytes = 1 << 20
 
 // Describer is an optional capability that callers (typically the
 // containerdstore.Store) may implement to surface cached media-type
@@ -137,6 +154,27 @@ func WithMaxConcurrentServes(n int) Option {
 		if n > 0 {
 			s.serveSem = make(chan struct{}, n)
 		}
+	}
+}
+
+// WithMaxConcurrentRangeServes caps concurrent serves of small, explicitly
+// bounded ranges separately from full-blob streams. Artifact Streaming issues
+// these for OverlayBD index reads: they are tiny and latency-critical, so the
+// per-stream bandwidth guard that WithMaxConcurrentServes exists to provide is
+// the wrong control for them. n <= 0 leaves small ranges on the blob cap.
+func WithMaxConcurrentRangeServes(n int) Option {
+	return func(s *Server) {
+		if n > 0 {
+			s.rangeSem = make(chan struct{}, n)
+		}
+	}
+}
+
+// WithRangeSource lets the server answer Range requests for blobs it holds
+// only partially, so cached OverlayBD index reads become peer-servable.
+func WithRangeSource(rs RangeSource) Option {
+	return func(s *Server) {
+		s.ranges = rs
 	}
 }
 
@@ -220,9 +258,10 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, d digest.Di
 	// Shed load on a saturated seed so the requester re-discovers another
 	// provider (the cascade) instead of queueing behind us. Only full
 	// blob-body GETs are capped: HEADs are cheap and manifests are small and
-	// needed for discovery/verification.
+	// needed for discovery/verification. Small bounded ranges take a separate
+	// class so they are not held behind bulk streams.
 	if r.Method == http.MethodGet && kind == ifaces.KindBlob {
-		release, ok := s.tryAcquireServe()
+		release, ok := s.tryAcquireServe(r.Header.Get("Range"))
 		if !ok {
 			w.Header().Set("Retry-After", "1")
 			http.Error(w, "peer serving at capacity", http.StatusTooManyRequests)
@@ -237,6 +276,10 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, d digest.Di
 	if err != nil {
 		var enf *ifaces.ErrNotFound
 		if errors.As(err, &enf) {
+			if s.serveCachedRange(w, r, d, kind) {
+				return
+			}
+
 			if s.metrics.onPeerMiss != nil {
 				s.metrics.onPeerMiss()
 			}
@@ -374,6 +417,52 @@ func (s *Server) bumpServe() {
 	}
 }
 
+// serveCachedRange answers an exact Range request from partially-held content.
+// It reports whether it wrote a response.
+func (s *Server) serveCachedRange(w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind) bool {
+	if s.ranges == nil || kind != ifaces.KindBlob {
+		return false
+	}
+
+	requested, err := httprange.ParseExact(r.Header.Get("Range"))
+	if err != nil {
+		return false
+	}
+
+	body, total, err := s.ranges.OpenRange(r.Context(), d, requested)
+	if err != nil {
+		return false
+	}
+
+	defer func() { _ = body.Close() }() //nolint:errcheck // best-effort close
+
+	w.Header().Set("Docker-Content-Digest", d.String())
+	w.Header().Set("Content-Type", contentTypeFor(kind, s.lookupMediaType(d), ""))
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", requested.Start, requested.End, total))
+	w.Header().Set("Content-Length", strconv.FormatInt(requested.Length(), 10))
+
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusPartialContent)
+		s.bumpServe()
+
+		return true
+	}
+
+	w.WriteHeader(http.StatusPartialContent)
+
+	written, err := streamcopy.CopyN(w, body, requested.Length())
+	s.bumpServeBytes(kind, written)
+
+	if err != nil {
+		s.logger.Debug("transfer: cached range copy failed", slog.Any("err", err))
+	}
+
+	s.bumpServe()
+
+	return true
+}
+
 func (s *Server) bumpServeBytes(kind ifaces.OriginRefKind, bytes int64) {
 	if bytes <= 0 || s.metrics.onPeerServeBytes == nil {
 		return
@@ -384,20 +473,53 @@ func (s *Server) bumpServeBytes(kind ifaces.OriginRefKind, bytes int64) {
 
 // tryAcquireServe reserves a serve slot without blocking. The returned release
 // func MUST be called when the serve completes. ok is false when the server is
-// already at its configured serve cap; callers should shed the request (429)
-// rather than block. When no cap is configured (serveSem nil), it always
-// succeeds with a no-op release.
-func (s *Server) tryAcquireServe() (release func(), ok bool) {
-	if s.serveSem == nil {
+// already at the cap for the request's class; callers should shed the request
+// (429) rather than block. When no cap applies, it always succeeds with a
+// no-op release.
+func (s *Server) tryAcquireServe(rangeHeader string) (release func(), ok bool) {
+	sem := s.serveSem
+	if s.rangeSem != nil && isFastRange(rangeHeader) {
+		sem = s.rangeSem
+	}
+
+	if sem == nil {
 		return func() {}, true
 	}
 
 	select {
-	case s.serveSem <- struct{}{}:
-		return func() { <-s.serveSem }, true
+	case sem <- struct{}{}:
+		return func() { <-sem }, true
 	default:
 		return nil, false
 	}
+}
+
+// isFastRange reports whether value is a single range with both bounds present
+// and a length within fastRangeMaxBytes. Open-ended and suffix forms are
+// excluded because their length is not knowable from the header alone, so an
+// unbounded transfer cannot claim the range lane.
+func isFastRange(value string) bool {
+	spec, found := strings.CutPrefix(strings.TrimSpace(value), "bytes=")
+	if !found || strings.Contains(spec, ",") {
+		return false
+	}
+
+	first, last, found := strings.Cut(strings.TrimSpace(spec), "-")
+	if !found {
+		return false
+	}
+
+	start, err := strconv.ParseInt(strings.TrimSpace(first), 10, 64)
+	if err != nil || start < 0 {
+		return false
+	}
+
+	end, err := strconv.ParseInt(strings.TrimSpace(last), 10, 64)
+	if err != nil || end < start {
+		return false
+	}
+
+	return end-start+1 <= fastRangeMaxBytes
 }
 
 // lookupMediaType returns the describer's cached mediaType for d, or

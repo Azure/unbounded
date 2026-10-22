@@ -149,7 +149,7 @@ func TestManagerVacatesChairAboveReducedTarget(t *testing.T) {
 
 func TestManagerClaimsAfterProportionalTargetIncreases(t *testing.T) {
 	client := fake.NewClientset()
-	store := NewStore(client.CoordinationV1().Leases("gantry-system"))
+	store := NewStore(client.CoordinationV1().Leases("gantry-system"), WithStoreClock(func() time.Time { return time.Unix(0, 0) }))
 
 	seed := Holder{PeerID: "seed", P2PAddrs: []string{"/ip4/10.0.0.1/tcp/4001"}, TransferAddr: "10.0.0.1:5001"}
 	if _, err := store.Claim(context.Background(), 0, seed, 0, time.Minute, false, time.Unix(0, 0)); err != nil {

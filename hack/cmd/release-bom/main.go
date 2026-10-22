@@ -29,6 +29,7 @@ const bomSchemaVersion = 2
 
 var releaseImageNames = []string{
 	"gantry",
+	"gantry-node-config",
 	"host-azurelinux3",
 	"host-azurelinux3-nvidia",
 	"host-ubuntu2404",

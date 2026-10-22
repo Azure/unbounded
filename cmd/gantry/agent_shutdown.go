@@ -20,6 +20,7 @@ import (
 type shutdownDeps struct {
 	logger         *slog.Logger
 	mirrorSrv      *mirror.Server
+	streamingSrv   interface{ Drain() }
 	transferStop   func(context.Context) error
 	mirrorStop     func(context.Context) error
 	cdsubSrc       cdsub.ImageSource
@@ -53,6 +54,10 @@ func gracefulShutdown(d shutdownDeps) {
 	defer cancelShutdown()
 
 	d.mirrorSrv.Drain()
+
+	if d.streamingSrv != nil {
+		d.streamingSrv.Drain()
+	}
 
 	if err := d.transferStop(shutdownCtx); err != nil {
 		d.logger.Warn("transfer shutdown error", slog.Any("err", err))

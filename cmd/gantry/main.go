@@ -7,6 +7,7 @@
 //
 //	gantry version print build information and exit
 //	gantry agent run the full agent (mirror + transfer + libp2p + ...)
+//	gantry snapshotter run the ACR OverlayBD compatibility snapshotter
 package main
 
 import (
@@ -48,7 +49,9 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/metrics"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	"github.com/Azure/unbounded/internal/gantry/negcache"
+	"github.com/Azure/unbounded/internal/gantry/rangecache"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
+	streamingapi "github.com/Azure/unbounded/internal/gantry/streaming"
 	"github.com/Azure/unbounded/internal/gantry/transfer"
 	"github.com/Azure/unbounded/internal/version"
 )
@@ -78,6 +81,8 @@ func run(args []string) error {
 		return nil
 	case "agent":
 		return runAgent(args[1:])
+	case "snapshotter":
+		return runSnapshotter(args[1:])
 	case "help", "-h", "-help", "--help":
 		return runHelp(args[1:])
 	default:
@@ -92,11 +97,24 @@ func printUsage(w *os.File) {
 
 Subcommands:
   agent      run the Gantry P2P agent
+	snapshotter run the ACR OverlayBD compatibility snapshotter
   version    print build information
-  help       print help for the agent subcommand`)
+	help       print help for a subcommand`)
 }
 
 func runHelp(args []string) error {
+	if len(args) == 1 && args[0] == "snapshotter" {
+		fs := buildSnapshotterFlagSet()
+		fs.SetOutput(os.Stdout)
+		_, _ = fmt.Fprintln(os.Stdout, "Usage: gantry snapshotter [flags]") //nolint:errcheck // best-effort write
+		_, _ = fmt.Fprintln(os.Stdout)                                      //nolint:errcheck // best-effort write
+		_, _ = fmt.Fprintln(os.Stdout, "Flags:")                            //nolint:errcheck // best-effort write
+
+		fs.PrintDefaults()
+
+		return nil
+	}
+
 	if len(args) == 0 || args[0] == "agent" {
 		fs, _ := buildAgentFlagSet(config.NewDefault())
 		fs.SetOutput(os.Stdout)
@@ -152,6 +170,7 @@ func runAgent(args []string) error {
 	reg.RegisterDefaultCollectors()
 	inst := newPhase1Metrics(reg)
 	p2 := newPhase2Metrics(reg)
+	streamingMetrics := newArtifactStreamingMetrics(reg)
 	layerProgress := newLayerProgressTracker(p2.layerCompletedAt, c.NodeName, time.Now)
 	p9 := newPhase9Metrics(reg)
 	// Storage mode info: emit a single time-series at 1 for the
@@ -202,6 +221,29 @@ func runAgent(args []string) error {
 			p2.peerFetchBytes.WithLabelValues(kind).Add(float64(bytes))
 		}),
 	)
+
+	// Ranges fetched for OverlayBD are kept so peers can be served from them.
+	// A cold image has no complete blob anywhere, so without this every node's
+	// index reads go to origin at once.
+	var rangeCache *rangecache.Cache
+
+	if c.ArtifactStreamingEnabled && c.RangeCacheDir != "" {
+		rangeCache, err = rangecache.New(c.RangeCacheDir, c.RangeCacheMaxBytes)
+		if err != nil {
+			logger.Warn("range cache disabled", slog.Any("err", err))
+
+			rangeCache = nil
+		} else {
+			defer func() { _ = rangeCache.Close() }() //nolint:errcheck // best-effort close
+
+			logger.Info("range cache ready",
+				slog.String("dir", c.RangeCacheDir),
+				slog.Int64("max_bytes", c.RangeCacheMaxBytes),
+				slog.Int64("max_range_bytes", c.MaxCachedRangeBytes),
+			)
+		}
+	}
+
 	transferOpts := []transfer.Option{
 		transfer.WithLogger(logger),
 		transfer.WithDescriber(cdstore),
@@ -214,6 +256,14 @@ func runAgent(args []string) error {
 		}),
 		transfer.WithMaxConcurrentServes(c.TransferMaxConcurrentServes),
 	}
+
+	if rangeCache != nil {
+		transferOpts = append(transferOpts,
+			transfer.WithMaxConcurrentRangeServes(c.TransferMaxConcurrentRangeServes),
+			transfer.WithRangeSource(rangeCache),
+		)
+	}
+
 	transferSrv := transfer.New(cstore, transferOpts...)
 
 	transferStop, err := transferSrv.ListenAndServe(c.TransferListen)
@@ -297,7 +347,18 @@ func runAgent(args []string) error {
 	// it returns 1.0.
 	p5 := newPhase5Metrics(reg, disco.Health, func() float64 { return float64(disco.ConnCount()) })
 
-	adv := advertise.New(containerdInv, disco,
+	advInv := advertise.Inventory(containerdInv)
+
+	if rangeCache != nil {
+		wrapped := rangeAwareInventory{inv: containerdInv, cache: rangeCache}
+		if open, ok := containerdInv.(advertise.Openable); ok {
+			wrapped.open = open
+		}
+
+		advInv = wrapped
+	}
+
+	adv := advertise.New(advInv, disco,
 		advertise.WithLogger(logger),
 		advertise.WithReconcileInterval(c.AdvertiseReconcileInterval),
 		advertise.WithMetrics(advertise.MetricsHooks{
@@ -363,6 +424,8 @@ func runAgent(args []string) error {
 	// advertise path flush before disco.Close fires.
 	pullerPumpGate := newPullerPumpGate()
 
+	var pumpedManifestAdapter atomic.Pointer[layerPrefetchAdapter]
+
 	leaseHooks := leaseMetricHooks{
 		onCreated:  func() { p9.containerdLeaseCreated.Inc() },
 		onReleased: func() { p9.containerdLeaseReleased.Inc() },
@@ -391,7 +454,60 @@ func runAgent(args []string) error {
 	}, originSuccessWithIngest, downstreamFailureWithIngest, leaseHooks, pumpMetricHooks{
 		OnQueueWait:    func(kind string, seconds float64) { inst.originPullQueueWait.WithLabelValues(kind).Observe(seconds) },
 		OnPullDuration: func(kind string, seconds float64) { inst.originPullDuration.WithLabelValues(kind).Observe(seconds) },
+		OnContentReady: func(contentCtx context.Context, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind) {
+			if kind != ifaces.KindManifest || !isACRRegistry(registry) {
+				return
+			}
+
+			if adapter := pumpedManifestAdapter.Load(); adapter != nil {
+				adapter.OnStreamingManifestCommitted(contentCtx, registry, repository, d)
+			}
+		},
 	})
+
+	layerSeedTotal := newLayerSeedMetric(reg)
+
+	var layerSeed *layerSeeder
+
+	if c.ArtifactStreamingEnabled {
+		// Origin is deliberately nil unless opted in: see LayerSeedOriginFallback.
+		var layerSeedOrigin ifaces.OriginPuller
+		if c.LayerSeedOriginFallback {
+			layerSeedOrigin = pullOriginClient
+		}
+
+		layerSeed = newLayerSeeder(layerSeederOptions{
+			Store:        cstore,
+			DHT:          disco,
+			Peer:         peerClient,
+			Origin:       layerSeedOrigin,
+			MarkPresent:  func(ctx context.Context, d digest.Digest) bool { return adv.Notify(ctx, d, true) },
+			Logger:       logger,
+			Concurrency:  c.LayerSeedConcurrency,
+			PeerPatience: c.LayerSeedPeerPatience,
+			Budget:       c.LayerSeedBudget,
+			OnOutcome:    func(outcome string) { layerSeedTotal.WithLabelValues(outcome).Inc() },
+		})
+	}
+
+	// Warms the head and trailing index of every layer so the first TCMU
+	// mount attempt succeeds instead of waiting out kubelet's backoff.
+	var indexPrefetch *indexPrefetcher
+
+	if c.ArtifactStreamingEnabled && rangeCache != nil {
+		indexPrefetch = newIndexPrefetcher(indexPrefetchOptions{
+			Cache:       rangeCache,
+			DHT:         disco,
+			Peer:        peerClient,
+			Origin:      pullOriginClient,
+			MarkCached:  func(d digest.Digest) { go adv.Notify(context.WithoutCancel(ctx), d, true) },
+			Logger:      logger,
+			HeadBytes:   c.IndexPrefetchHeadBytes,
+			TailBytes:   c.IndexPrefetchTailBytes,
+			Concurrency: c.IndexPrefetchConcurrency,
+			MaxJitter:   c.IndexPrefetchJitter,
+		})
+	}
 
 	coordOpts := []coord.Option{
 		coord.WithLogger(logger),
@@ -461,12 +577,15 @@ func runAgent(args []string) error {
 			InstallHolder: func(holder chairs.Holder) error {
 				return installChairHolder(disco.LibP2P().Peerstore(), holder)
 			},
-			Claimer:               chairManager,
-			Logger:                logger,
-			APITimeout:            c.ChairAPITimeout,
-			ChairCount:            c.ChairCount,
-			SeedCount:             c.ChairSeedCount,
-			TrustedFailureClasses: configuredFailureClasses(c.OriginFailureClassesTrustedClusterWide),
+			Claimer:                     chairManager,
+			Logger:                      logger,
+			APITimeout:                  c.ChairAPITimeout,
+			ChairCount:                  c.ChairCount,
+			SeedCount:                   c.ChairSeedCount,
+			PrefetchCoordinatorReplicas: c.PrefetchCoordinatorReplicas,
+			PrefetchMaxConcurrentGroups: c.PrefetchMaxConcurrentGroups,
+			PrefetchDispatchJitter:      c.PrefetchDispatchJitter,
+			TrustedFailureClasses:       configuredFailureClasses(c.OriginFailureClassesTrustedClusterWide),
 			OnSeedRecruit: func(kind string, selectable, contacted, accepted int) {
 				p3.coldStartSeedSelectable.WithLabelValues(kind).Observe(float64(selectable))
 				p3.coldStartSeedContacted.WithLabelValues(kind).Observe(float64(contacted))
@@ -478,9 +597,34 @@ func runAgent(args []string) error {
 			OnChairCall: func(kind, outcome string, seconds float64) {
 				p3.coldStartChairCallDur.WithLabelValues(kind, outcome).Observe(seconds)
 			},
+			OnPrefetchBatch: func(pullers, digests int) {
+				p3.prefetchBatchesTotal.Inc()
+				p3.prefetchDigestsTotal.Add(float64(digests))
+				p3.prefetchPullersPerBatch.Observe(float64(pullers))
+			},
+			OnPrefetchGroup: func(target, outcome string) {
+				p3.prefetchGroupsTotal.WithLabelValues(target, outcome).Inc()
+			},
 		})
 		coldStartResolver = coldStartAdapter{r: realResolver}
-		layerPrefetcher = newLayerPrefetcher(realResolver, cstore, logger, layerProgress.observeManifest)
+
+		var streamingReconciler *streamingLayerReconciler
+		if c.ArtifactStreamingEnabled {
+			streamingReconciler = newStreamingLayerReconciler(streamingLayerReconcilerOptions{
+				Resolver: realResolver,
+				Store:    cstore,
+				Seeder:   layerSeed,
+				Logger:   logger,
+			})
+		}
+
+		adapter := newLayerPrefetcher(realResolver, cstore, streamingReconciler, indexPrefetch, logger, layerProgress.observeManifest)
+
+		layerPrefetcher = adapter
+		if streamingReconciler != nil {
+			pumpedManifestAdapter.Store(adapter)
+		}
+
 		logger.Info("Lease-chair cold-start orchestrator wired",
 			slog.Int("chair_count", c.ChairCount),
 			slog.Int("seed_count", c.ChairSeedCount),
@@ -490,7 +634,7 @@ func runAgent(args []string) error {
 	}
 
 	if layerPrefetcher == nil {
-		layerPrefetcher = newLayerPrefetcher(nil, cstore, logger, layerProgress.observeManifest)
+		layerPrefetcher = newLayerPrefetcher(nil, cstore, nil, indexPrefetch, logger, layerProgress.observeManifest)
 	}
 
 	// - direct-origin-fallback direct-origin fallback controller (the design doc). Wired
@@ -663,12 +807,70 @@ func runAgent(args []string) error {
 		mirror.WithStartupReadinessGate(),
 	)
 
-	mirrorStop, err := mirrorSrv.ListenAndServe(c.MirrorListen)
+	var artifactStreamingSrv *streamingapi.Server
+
+	mirrorHandler := mirrorSrv.Handler()
+
+	if c.ArtifactStreamingEnabled {
+		urlPolicy := streamingapi.URLPolicy{AllowedHostSuffixes: c.ArtifactStreamingAllowedHostSuffixes}
+
+		streamingOpts := streamingapi.Options{
+			URLPolicy:              urlPolicy,
+			ResolveCanonicalOrigin: newCanonicalOriginResolver(c.UpstreamRegistries),
+			SelfPeerID:             ifaces.NodeID(disco.PeerID().String()),
+			StartupGated:           true,
+			Logger:                 logger,
+			Metrics: streamingapi.MetricsHooks{
+				OnRequest: func(source, outcome string, duration time.Duration, bytes int64) {
+					streamingMetrics.requests.WithLabelValues(source, outcome).Inc()
+					streamingMetrics.duration.WithLabelValues(source, outcome).Observe(duration.Seconds())
+
+					if bytes > 0 {
+						streamingMetrics.bytes.WithLabelValues(source).Add(float64(bytes))
+					}
+				},
+				OnFirstByte: func(source string, duration time.Duration) {
+					streamingMetrics.firstByte.WithLabelValues(source).Observe(duration.Seconds())
+				},
+				OnInflight: func(source string, delta int) {
+					streamingMetrics.inflight.WithLabelValues(source).Add(float64(delta))
+				},
+				OnReject: func(reason string) {
+					streamingMetrics.rejected.WithLabelValues(reason).Inc()
+				},
+			},
+		}
+
+		if rangeCache != nil {
+			streamingOpts.Cache = rangeCache
+			streamingOpts.MaxCachedRangeBytes = c.MaxCachedRangeBytes
+			streamingOpts.OnCached = func(d digest.Digest) {
+				// Announce once per digest; the reconcile pass keeps it alive.
+				if adv.IsAnnounced(d) {
+					return
+				}
+
+				go adv.Notify(context.WithoutCancel(ctx), d, true)
+			}
+		}
+
+		artifactStreamingSrv, err = streamingapi.NewServer(cdstore, disco, peerClient, streamingapi.NewOriginClient(urlPolicy), streamingOpts)
+		if err != nil {
+			return fmt.Errorf("artifact streaming server: %w", err)
+		}
+
+		mirrorHandler = routeNodeLocalHandlers(artifactStreamingSrv, mirrorHandler)
+	}
+
+	mirrorStop, err := mirrorSrv.ListenAndServeHandler(c.MirrorListen, mirrorHandler)
 	if err != nil {
 		return fmt.Errorf("mirror listen: %w", err)
 	}
 
-	logger.Info("mirror endpoint listening", slog.String("addr", c.MirrorListen))
+	logger.Info("mirror endpoint listening",
+		slog.String("addr", c.MirrorListen),
+		slog.Bool("artifact_streaming", artifactStreamingSrv != nil),
+	)
 
 	// /4 - cdsub event loop. cdsub no longer calls DHT.Provide
 	// directly in containerd mode; every event is routed through the
@@ -815,7 +1017,7 @@ func runAgent(args []string) error {
 			return "cache scan not complete", false
 		}
 
-		if chairManager != nil && !chairManager.Ready() {
+		if !c.ArtifactStreamingEnabled && chairManager != nil && !chairManager.Ready() {
 			return "no selectable Lease chair", false
 		}
 
@@ -881,6 +1083,11 @@ func runAgent(args []string) error {
 			case <-t.C:
 				if _, ok := readyCheck(); ok {
 					mirrorSrv.MarkReady()
+
+					if artifactStreamingSrv != nil {
+						artifactStreamingSrv.MarkReady()
+					}
+
 					logger.Info("mirror: startup gate released; /v2/ now serving")
 
 					return
@@ -926,6 +1133,7 @@ func runAgent(args []string) error {
 	gracefulShutdown(shutdownDeps{
 		logger:         logger,
 		mirrorSrv:      mirrorSrv,
+		streamingSrv:   artifactStreamingSrv,
 		transferStop:   transferStop,
 		mirrorStop:     mirrorStop,
 		cdsubSrc:       cdsubSrc,
@@ -1350,14 +1558,26 @@ func (a coldStartAdapter) Resolve(ctx context.Context, d digest.Digest, kind ifa
 // The implementation runs in a goroutine spawned by the mirror; it
 // MUST NOT panic. All errors are logged at DEBUG.
 type layerPrefetchAdapter struct {
-	resolver   manifestPrefetchResolver
-	cache      ifaces.LocalContentStore
-	logger     *slog.Logger
-	onManifest func(digest.Digest, []manifest.TypedChild)
+	resolver            manifestPrefetchResolver
+	cache               ifaces.LocalContentStore
+	streamingReconciler *streamingLayerReconciler
+	indexes             *indexPrefetcher
+	logger              *slog.Logger
+	onManifest          func(digest.Digest, []manifest.TypedChild)
 }
 
 type manifestPrefetchResolver interface {
 	PrefetchManifestChildren(ctx context.Context, manifestDigest digest.Digest, children []coldstart.ChildDigest, registry, repository string) error
+}
+
+type streamingManifestPrefetchResolver interface {
+	PrefetchStreamingManifestChildren(ctx context.Context, manifestDigest digest.Digest, children []coldstart.ChildDigest, registry, repository string) error
+}
+
+func isACRRegistry(registry string) bool {
+	host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(registry), "."))
+
+	return strings.HasSuffix(host, ".azurecr.io") && len(host) > len(".azurecr.io")
 }
 
 // maxManifestBytes caps the size of a manifest body the prefetcher
@@ -1419,14 +1639,18 @@ func advertiseOnCommit(ctx context.Context, adv *advertise.Advertiser, store ifa
 func newLayerPrefetcher(
 	r manifestPrefetchResolver,
 	cache ifaces.LocalContentStore,
+	streamingReconciler *streamingLayerReconciler,
+	indexes *indexPrefetcher,
 	logger *slog.Logger,
 	onManifest func(digest.Digest, []manifest.TypedChild),
-) mirror.LayerPrefetcher {
+) *layerPrefetchAdapter {
 	return &layerPrefetchAdapter{
-		resolver:   r,
-		cache:      cache,
-		logger:     logger.With(slog.String("subsystem", "prefetch")),
-		onManifest: onManifest,
+		resolver:            r,
+		cache:               cache,
+		streamingReconciler: streamingReconciler,
+		indexes:             indexes,
+		logger:              logger.With(slog.String("subsystem", "prefetch")),
+		onManifest:          onManifest,
 	}
 }
 
@@ -1467,14 +1691,27 @@ func (p *layerPrefetchAdapter) openManifest(ctx context.Context, d digest.Digest
 	return nil, lastErr
 }
 
-func (p *layerPrefetchAdapter) OnManifestServed(ctx context.Context, registry, repository string, manifestDigest digest.Digest) {
-	if p.resolver == nil && p.onManifest == nil {
+func (p *layerPrefetchAdapter) OnManifestServed(baseCtx context.Context, registry, repository string, manifestDigest digest.Digest) {
+	p.onManifestServed(baseCtx, registry, repository, manifestDigest, false)
+}
+
+func (p *layerPrefetchAdapter) OnStreamingManifestCommitted(baseCtx context.Context, registry, repository string, manifestDigest digest.Digest) {
+	p.onManifestServed(baseCtx, registry, repository, manifestDigest, true)
+}
+
+func (p *layerPrefetchAdapter) onManifestServed(baseCtx context.Context, registry, repository string, manifestDigest digest.Digest, streamingOnly bool) {
+	if streamingOnly {
+		if p.streamingReconciler == nil || !isACRRegistry(registry) {
+			return
+		}
+	} else if p.resolver == nil && p.onManifest == nil && p.streamingReconciler == nil {
 		return
 	}
 	// Use a fresh deadline so the prefetch survives the request
 	// context that just finished; cap at 30s so a stuck prefetch
-	// can't pin a goroutine forever.
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// can't pin a goroutine forever. Seeding moves whole layers, so it runs
+	// off baseCtx under its own budget.
+	ctx, cancel := context.WithTimeout(baseCtx, 30*time.Second)
 	defer cancel()
 
 	rc, err := p.openManifest(ctx, manifestDigest)
@@ -1519,13 +1756,24 @@ func (p *layerPrefetchAdapter) OnManifestServed(ctx context.Context, registry, r
 		return
 	}
 
-	if p.onManifest != nil {
+	streamingManifest := isACRRegistry(registry) && manifest.IsOverlayBDStreamingManifest(body) && p.streamingReconciler != nil
+	if streamingOnly && !streamingManifest {
+		return
+	}
+
+	if !streamingOnly && p.onManifest != nil {
 		p.onManifest(manifestDigest, children)
 	}
 
-	if len(children) == 0 || p.resolver == nil {
+	if len(children) == 0 {
 		// Image index or no children - nothing to fan out.
 		return
+	}
+
+	// Warm the mount-critical regions first. Everything below moves whole
+	// layers, which the container does not wait on.
+	if streamingManifest && p.indexes != nil {
+		go p.indexes.Prefetch(baseCtx, registry, repository, manifestDigest, children)
 	}
 
 	// Filter out digests already present locally; they don't need
@@ -1553,12 +1801,27 @@ func (p *layerPrefetchAdapter) OnManifestServed(ctx context.Context, registry, r
 		return
 	}
 
-	if err := p.resolver.PrefetchManifestChildren(ctx, manifestDigest, pending, registry, repository); err != nil {
-		p.logger.Debug("prefetch: PrefetchChildren reported errors",
-			slog.String("manifest", manifestDigest.String()),
-			slog.Int("children", len(pending)),
-			slog.Any("err", err),
-		)
+	if streamingManifest {
+		streamingLayers := make([]coldstart.ChildDigest, 0, len(pending))
+		for _, child := range pending {
+			if child.Kind == ifaces.KindBlob {
+				streamingLayers = append(streamingLayers, child)
+			}
+		}
+
+		p.streamingReconciler.Start(baseCtx, registry, repository, manifestDigest, streamingLayers)
+
+		return
+	}
+
+	if p.resolver != nil {
+		if err := p.resolver.PrefetchManifestChildren(ctx, manifestDigest, pending, registry, repository); err != nil {
+			p.logger.Debug("prefetch: PrefetchChildren reported errors",
+				slog.String("manifest", manifestDigest.String()),
+				slog.Int("children", len(pending)),
+				slog.Any("err", err),
+			)
+		}
 	}
 }
 
@@ -1665,6 +1928,7 @@ func (g *pullerPumpGate) Wait() {
 type pumpMetricHooks struct {
 	OnQueueWait    func(kind string, seconds float64)
 	OnPullDuration func(kind string, seconds float64)
+	OnContentReady func(context.Context, string, string, digest.Digest, ifaces.OriginRefKind)
 }
 
 // pullAdmissionMultiplier sets how many pulls a node accepts relative to the
@@ -1850,7 +2114,18 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 
 			pullStartedAt := time.Now()
 
-			runOriginPull(pullCtx, originClient, cstore, neg, lg, h, registry, repository, d, kind, originPullProgressTimeout, markPresent, onOriginSuccess, onDownstreamFailure, leaseHooks)
+			successHook := onOriginSuccess
+			if pumpHooks.OnContentReady != nil {
+				successHook = func(kindLabel string, bytes int64) {
+					if onOriginSuccess != nil {
+						onOriginSuccess(kindLabel, bytes)
+					}
+
+					pumpHooks.OnContentReady(pullCtx, registry, repository, d, kind)
+				}
+			}
+
+			runOriginPull(pullCtx, originClient, cstore, neg, lg, h, registry, repository, d, kind, originPullProgressTimeout, markPresent, successHook, onDownstreamFailure, leaseHooks)
 
 			if pumpHooks.OnPullDuration != nil {
 				pumpHooks.OnPullDuration(kind.MetricLabel(), time.Since(pullStartedAt).Seconds())

@@ -265,6 +265,7 @@ jobs:
   #                                     the netboot image from CONTAINER_REGISTRY
   #   - netboot                       : PXE artifact referenced by metalman
   #   - gantry                        : cluster-wide gantry DaemonSet
+  #   - gantry-node-config            : optional AKS OverlayBD configurator
   #   - orca                          : deployed separately by deploy-orca
   #   - racer-object                  : injected sidecars and per-ClusterCache
   #                                     origin DaemonSets from the racer component
@@ -297,6 +298,8 @@ jobs:
             file: images/racer-controller/Containerfile
           - name: racer-dataplane
             file: images/racer-dataplane/Containerfile
+          - name: gantry-node-config
+            file: images/gantry-node-config/Containerfile
           - name: racer-object
             file: images/racer-object/Containerfile
           - name: orca
