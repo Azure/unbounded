@@ -4,8 +4,9 @@
 #
 # Run the racer-block ublk device tests inside a disposable QEMU guest.
 #
-# The guest boots the Ubuntu 24.04 GA generic kernel (6.8, the minimum kernel
-# racer-block supports) with an initramfs built from busybox-static, the
+# The guest boots an Ubuntu generic kernel chosen by GUEST_KERNEL: 6.8 from
+# Ubuntu 24.04 (noble), the minimum racer-block supports, or 7.0 from Ubuntu
+# 26.04 (resolute). It uses an initramfs built from busybox-static, the
 # race-enabled test binaries, and their shared libraries. The host needs no
 # ublk support, no root, and no kernel module changes, and a kernel crash in
 # the guest cannot wedge the host.
@@ -22,8 +23,12 @@
 #
 # Environment:
 #   TEST_BIN_DIR      test binaries (default bin/racer-block-tests)
-#   WORK_DIR          scratch output (default bin/racer-block-vm)
+#   GUEST_KERNEL      guest kernel family: 6.8 or 7.0 (default 6.8)
+#   WORK_DIR          scratch output (default bin/racer-block-vm/$GUEST_KERNEL)
 #   KERNEL_PACKAGE    kernel meta package (default linux-image-generic)
+#   ARCHIVE_URL       Ubuntu archive (default http://archive.ubuntu.com/ubuntu)
+#   ARCHIVE_KEYRING   archive signing keys
+#                     (default /usr/share/keyrings/ubuntu-archive-keyring.gpg)
 #   VM_TIMEOUT        seconds before QEMU is terminated (default 600)
 #   VM_MEMORY         guest memory (default 4G)
 #   VM_CPUS           guest CPUs (default 2)
@@ -34,13 +39,21 @@
 #   KERNEL_MODULES    directory searched for ublk_drv.ko* (with KERNEL_IMAGE)
 #   KERNEL_VERSION    expected guest uname -r (with KERNEL_IMAGE)
 #
-# KERNEL_IMAGE, KERNEL_MODULES, and KERNEL_VERSION let a developer try another
-# kernel locally. CI uses the default Ubuntu 6.8 download.
+# The kernel packages are downloaded with a private APT configuration under
+# WORK_DIR that reads only the chosen release from ARCHIVE_URL and checks its
+# signature against ARCHIVE_KEYRING. Host APT settings and package state are
+# not read or changed, and nothing is installed.
+#
+# KERNEL_IMAGE, KERNEL_MODULES, and KERNEL_VERSION use a local kernel instead.
+# KERNEL_VERSION must still belong to GUEST_KERNEL.
 
 set -euo pipefail
 
 TEST_BIN_DIR="${TEST_BIN_DIR:-bin/racer-block-tests}"
-WORK_DIR="${WORK_DIR:-bin/racer-block-vm}"
+GUEST_KERNEL="${GUEST_KERNEL:-6.8}"
+WORK_DIR="${WORK_DIR:-bin/racer-block-vm/$GUEST_KERNEL}"
+ARCHIVE_URL="${ARCHIVE_URL:-http://archive.ubuntu.com/ubuntu}"
+ARCHIVE_KEYRING="${ARCHIVE_KEYRING:-/usr/share/keyrings/ubuntu-archive-keyring.gpg}"
 KERNEL_PACKAGE="${KERNEL_PACKAGE:-linux-image-generic}"
 VM_TIMEOUT="${VM_TIMEOUT:-600}"
 VM_MEMORY="${VM_MEMORY:-4G}"
@@ -189,29 +202,119 @@ check_results() {
 	return "$rc"
 }
 
-# fetch_kernel downloads and unpacks the kernel image and modules without
-# installing them, so the runner's own kernel and /boot are untouched.
-fetch_kernel() {
-	local pkgdir="$WORK_DIR/pkgs" root="$WORK_DIR/kernel-root" image version
-	require_tools apt-cache apt-get dpkg-deb
-	image="$(apt-cache depends "$KERNEL_PACKAGE" | sed -n 's/^ *Depends: \(linux-image-[0-9][^ ]*-generic\)$/\1/p' | head -n 1)"
-	[[ -n "$image" ]] || die "cannot resolve kernel image from $KERNEL_PACKAGE"
-	version="${image#linux-image-}"
-	case "$version" in
-	6.8.*) ;;
-	*) die "expected an Ubuntu 6.8 generic kernel, $KERNEL_PACKAGE resolved to $version" ;;
+# kernel_release FAMILY prints the Ubuntu release whose generic kernel is in
+# FAMILY.
+kernel_release() {
+	case "$1" in
+	6.8) echo noble ;;
+	7.0) echo resolute ;;
+	*)
+		log "error: GUEST_KERNEL must be 6.8 or 7.0, not '$1'"
+		return 1
+		;;
 	esac
-	log "using kernel $version"
+}
+
+# check_family VERSION fails unless VERSION is a GUEST_KERNEL generic kernel.
+check_family() {
+	case "$1" in
+	"$GUEST_KERNEL".*-generic) ;;
+	*)
+		log "error: expected an Ubuntu $GUEST_KERNEL generic kernel, got '$1'"
+		return 1
+		;;
+	esac
+}
+
+# apt_setup DIR RELEASE writes a private APT configuration under DIR that
+# reads only RELEASE from ARCHIVE_URL, verified with ARCHIVE_KEYRING.
+apt_setup() {
+	local dir="$1" release="$2" suite
+	rm -rf "$dir"
+	mkdir -p "$dir/etc/apt.conf.d" "$dir/etc/preferences.d" "$dir/etc/trusted.gpg.d" \
+		"$dir/etc/sources.list.d" "$dir/state/lists/partial" "$dir/cache/archives/partial"
+	: >"$dir/state/status"
+	local abs
+	abs="$(cd "$dir" && pwd)"
+	for suite in "$release" "$release-updates" "$release-security"; do
+		echo "deb [arch=amd64 signed-by=$ARCHIVE_KEYRING] $ARCHIVE_URL $suite main"
+	done >"$dir/etc/sources.list"
+	cat >"$dir/apt.conf" <<EOF
+Dir "/";
+Dir::Etc "$abs/etc";
+Dir::Etc::main "/dev/null";
+Dir::Etc::parts "$abs/etc/apt.conf.d";
+Dir::Etc::sourcelist "$abs/etc/sources.list";
+Dir::Etc::sourceparts "$abs/etc/sources.list.d";
+Dir::Etc::preferences "/dev/null";
+Dir::Etc::preferencesparts "$abs/etc/preferences.d";
+Dir::Etc::trusted "/dev/null";
+Dir::Etc::trustedparts "$abs/etc/trusted.gpg.d";
+Dir::State "$abs/state";
+Dir::State::status "$abs/state/status";
+Dir::Cache "$abs/cache";
+APT::Architecture "amd64";
+APT::Architectures { "amd64"; };
+APT::Get::AllowUnauthenticated "false";
+Acquire::AllowInsecureRepositories "false";
+Acquire::Languages "none";
+Acquire::Retries "3";
+Acquire::http::Timeout "30";
+Acquire::https::Timeout "30";
+Debug::NoLocking "true";
+EOF
+}
+
+# kernel_packages VERSION reads meta package dependencies on stdin and prints
+# the image and module packages for VERSION. It fails unless both the image
+# and the base modules package are present.
+kernel_packages() {
+	local deps
+	deps="$(grep -E "^linux-(image|modules|modules-extra)-${1//./\\.}\$" || true)"
+	if ! grep -qx "linux-image-$1" <<<"$deps" || ! grep -qx "linux-modules-$1" <<<"$deps"; then
+		log "error: kernel $1 meta package lacks linux-image or linux-modules"
+		return 1
+	fi
+	echo "$deps"
+}
+
+# fetch_kernel downloads and unpacks the kernel image and modules without
+# installing them, so the runner's own kernel, /boot, and APT are untouched.
+fetch_kernel() {
+	local pkgdir="$WORK_DIR/pkgs" root="$WORK_DIR/kernel-root" aptdir="$WORK_DIR/apt"
+	local release deps image version deb pkgs
+	require_tools apt-cache apt-get dpkg-deb
+	release="$(kernel_release "$GUEST_KERNEL")" || exit 1
+	[[ -r "$ARCHIVE_KEYRING" ]] || die "archive keyring $ARCHIVE_KEYRING not readable"
+	apt_setup "$aptdir" "$release"
+	APT_CONFIG="$(cd "$aptdir" && pwd)/apt.conf"
+	export APT_CONFIG
+	log "updating private APT lists for $release"
+	timeout --signal=TERM --kill-after=10s 300s apt-get -q update >&2 ||
+		die "apt-get update for $release failed"
+	deps="$(apt-cache depends "$KERNEL_PACKAGE" | sed -n 's/^ *Depends: \(linux-[^ ]*\)$/\1/p')"
+	image="$(grep -m 1 -E '^linux-image-[0-9][^ ]*-generic$' <<<"$deps" || true)"
+	[[ -n "$image" ]] || die "cannot resolve kernel image from $KERNEL_PACKAGE in $release"
+	version="${image#linux-image-}"
+	check_family "$version" || exit 1
+	# 6.8 ships ublk_drv in linux-modules-extra. 7.0 has no extra package and
+	# ships it in linux-modules. Take whichever the meta package depends on.
+	# noble's meta package reaches linux-modules through the image package.
+	deps+=$'\n'"$(apt-cache depends "$image" | sed -n 's/^ *Depends: \(linux-[^ ]*\)$/\1/p')"
+	pkgs="$(kernel_packages "$version" <<<"$deps")" || exit 1
+	mapfile -t pkgs <<<"$pkgs"
+	log "using kernel $version from $release"
 	rm -rf "$pkgdir" "$root"
 	mkdir -p "$pkgdir" "$root"
-	(cd "$pkgdir" && timeout --signal=TERM --kill-after=10s 300s apt-get download \
-		-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
-		"linux-image-$version" "linux-modules-$version" "linux-modules-extra-$version")
-	local deb
+	(cd "$pkgdir" && timeout --signal=TERM --kill-after=10s 300s apt-get -q download \
+		"${pkgs[@]}" >&2) ||
+		die "downloading kernel $version failed"
 	for deb in "$pkgdir"/*.deb; do
 		dpkg-deb -x "$deb" "$root"
 	done
 	[[ -f "$root/boot/vmlinuz-$version" ]] || die "vmlinuz-$version missing from packages"
+	[[ -d "$root/lib/modules/$version" || -d "$root/usr/lib/modules/$version" ]] ||
+		die "modules for $version missing from packages"
 	echo "$version"
 }
 
@@ -473,6 +576,76 @@ self_test() {
 		rc=1
 	fi
 
+	# Kernel family selection.
+	[[ "$(kernel_release 6.8)" == noble && "$(kernel_release 7.0)" == resolute ]] || {
+		log "self-test kernel_release: wrong mapping"
+		rc=1
+	}
+	for got in 6.9 7 "" 6.8.0 bogus; do
+		if kernel_release "$got" >/dev/null 2>&1; then
+			log "self-test kernel_release: '$got' accepted"
+			rc=1
+		fi
+	done
+	if ! (GUEST_KERNEL=6.8 check_family 6.8.0-147-generic) 2>/dev/null ||
+		! (GUEST_KERNEL=7.0 check_family 7.0.0-14-generic) 2>/dev/null; then
+		log "self-test check_family: matching kernel rejected"
+		rc=1
+	fi
+	for got in 7.0.0-14-generic 6.8.0-147-azure 6.80.0-1-generic ""; do
+		if (GUEST_KERNEL=6.8 check_family "$got") 2>/dev/null; then
+			log "self-test check_family: '$got' accepted for 6.8"
+			rc=1
+		fi
+	done
+	if (GUEST_KERNEL=7.0 check_family 6.8.0-147-generic) 2>/dev/null; then
+		log "self-test check_family: 6.8 accepted for 7.0"
+		rc=1
+	fi
+	# Overrides must match GUEST_KERNEL and are rejected before booting.
+	: >"$dir/vmlinuz"
+	mkdir -p "$dir/mods"
+	got="$( (GUEST_KERNEL=6.8 KERNEL_IMAGE="$dir/vmlinuz" KERNEL_MODULES="$dir/mods" \
+		KERNEL_VERSION=7.0.0-14-generic WORK_DIR="$dir/ovr" QEMU=true main run) 2>&1 || true)"
+	if ! grep -q 'expected an Ubuntu 6.8 generic kernel' <<<"$got"; then
+		log "self-test override: wrong family accepted"
+		rc=1
+	fi
+
+	# Package selection for 6.8 (with modules-extra) and 7.0 (without).
+	got="$(printf '%s\n' linux-image-6.8.0-1-generic linux-modules-6.8.0-1-generic \
+		linux-modules-extra-6.8.0-1-generic linux-firmware linux-image-6.8.0-10-generic |
+		kernel_packages 6.8.0-1-generic | tr '\n' ' ')"
+	[[ "$got" == "linux-image-6.8.0-1-generic linux-modules-6.8.0-1-generic linux-modules-extra-6.8.0-1-generic " ]] || {
+		log "self-test kernel_packages 6.8: got '$got'"
+		rc=1
+	}
+	got="$(printf '%s\n' linux-image-7.0.0-38-generic linux-modules-7.0.0-38-generic \
+		linux-main-modules-zfs-7.0.0-38-generic | kernel_packages 7.0.0-38-generic | tr '\n' ' ')"
+	[[ "$got" == "linux-image-7.0.0-38-generic linux-modules-7.0.0-38-generic " ]] || {
+		log "self-test kernel_packages 7.0: got '$got'"
+		rc=1
+	}
+	if printf '%s\n' linux-image-7.0.0-38-generic | kernel_packages 7.0.0-38-generic >/dev/null 2>&1; then
+		log "self-test kernel_packages: missing modules accepted"
+		rc=1
+	fi
+
+	# Private APT configuration: only the chosen release, signed, no host files.
+	(cd "$dir" && ARCHIVE_KEYRING=/k.gpg ARCHIVE_URL=http://a/ubuntu apt_setup apt resolute)
+	if [[ "$(cat "$dir/apt/etc/sources.list")" != "deb [arch=amd64 signed-by=/k.gpg] http://a/ubuntu resolute main
+deb [arch=amd64 signed-by=/k.gpg] http://a/ubuntu resolute-updates main
+deb [arch=amd64 signed-by=/k.gpg] http://a/ubuntu resolute-security main" ]]; then
+		log "self-test apt_setup: unexpected sources.list"
+		rc=1
+	fi
+	if grep -E '"/etc/|AllowUnauthenticated "true"|AllowInsecureRepositories "true"' "$dir/apt/apt.conf" >/dev/null ||
+		! grep -qF "Dir::State::status \"$dir/apt/state/status\";" "$dir/apt/apt.conf" ||
+		[[ -n "$(find "$dir/apt/etc" -type f ! -name sources.list)" ]]; then
+		log "self-test apt_setup: config reads host APT files or allows unsigned data"
+		rc=1
+	fi
+
 	if (PATH=/nonexistent require_tools qemu-system-x86_64) 2>/dev/null; then
 		log "self-test missing-tools: want failure"
 		rc=1
@@ -490,13 +663,17 @@ main() {
 		if [[ -n "$KERNEL_IMAGE" ]]; then
 			[[ -f "$KERNEL_IMAGE" && -d "$KERNEL_MODULES" && -n "$KERNEL_VERSION" ]] ||
 				die "KERNEL_IMAGE needs a KERNEL_MODULES directory and KERNEL_VERSION"
+			kernel_release "$GUEST_KERNEL" >/dev/null || exit 1
+			check_family "$KERNEL_VERSION" || exit 1
 			version="$KERNEL_VERSION"
 			KERNEL_PATH="$KERNEL_IMAGE"
 			MODULES_DIR="$KERNEL_MODULES"
 		else
 			version="$(fetch_kernel | tail -n 1)"
 			KERNEL_PATH="$WORK_DIR/kernel-root/boot/vmlinuz-$version"
+			# 7.0 installs modules under /usr/lib/modules, 6.8 under /lib/modules.
 			MODULES_DIR="$WORK_DIR/kernel-root/lib/modules/$version"
+			[[ -d "$MODULES_DIR" ]] || MODULES_DIR="$WORK_DIR/kernel-root/usr/lib/modules/$version"
 		fi
 		build_initramfs "$version"
 		run_vm
