@@ -71,8 +71,8 @@ type Device struct {
 
 // Start creates the device, starts serving it with h and returns once
 // /dev/ublkb<ID> exists. The device is torn down when ctx is canceled.
-// If ctx is canceled before Start returns, Start tears the device down and
-// returns ctx.Err().
+// Cancellation observed during startup is returned after the device is
+// torn down.
 func Start(ctx context.Context, cfg Config, h Handler) (*Device, error) {
 	if h == nil {
 		return nil, errors.New("ublk: nil handler")
