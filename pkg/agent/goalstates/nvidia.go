@@ -213,11 +213,14 @@ func useNVIDIACDIRuntime(osRelease map[string]string) bool {
 	id := normalizeOSReleaseID(osRelease["ID"])
 	versionID := osRelease["VERSION_ID"]
 
-	if (id == "azurelinux" || id == "azlinux") && strings.HasPrefix(versionID, "3") {
-		return true
+	switch id {
+	case "azurelinux", "azlinux":
+		return strings.HasPrefix(versionID, "3")
+	case "ubuntu":
+		return versionID == "24.04"
+	default:
+		return false
 	}
-
-	return id == "ubuntu" && versionID == "24.04"
 }
 
 const (
