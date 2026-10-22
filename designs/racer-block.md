@@ -62,7 +62,8 @@ no io_uring support in the standard library, so the binding sets up the rings
 directly with `io_uring_setup`, `mmap`, and `io_uring_enter`.
 
 - Control: `ADD_DEV`, `SET_PARAMS`, `START_DEV`, `STOP_DEV`, `DEL_DEV` on
-  `/dev/ublk-control`.
+  `/dev/ublk-control`. Shutdown uses `DEL_DEV_ASYNC` when the kernel supports it,
+  and falls back to `DEL_DEV` otherwise.
 - Data: one io_uring and one locked OS thread per queue. Each tag keeps one
   outstanding `FETCH_REQ` or `COMMIT_AND_FETCH_REQ`.
 - Parameters: logical block size 512, the device size rounded up to 512, the
@@ -126,6 +127,8 @@ sudo racer-block --cache <cache-name> --key <64 hex> [--id 0]
 - It needs access to `/run/racer/<cache>/client/socket` on the same host.
 - It prints the device path when the device is ready. `SIGINT` or `SIGTERM`
   stops and deletes the device.
+- If another process stops or deletes the device, racer-block cleans up and
+  exits with an error instead of waiting for a signal.
 - `--authorization-file` and `--metadata-file` set the opaque Racer
   `Authorization` and `Racer-Metadata` headers. They are only sent to the
   origin on a cache miss.
