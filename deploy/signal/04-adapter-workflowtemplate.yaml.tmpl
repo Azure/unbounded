@@ -5,7 +5,7 @@ metadata:
   namespace: {{ default "project-signal" .Namespace }}
 spec:
   serviceAccountName: project-signal-adapter
-  entrypoint: certification
+  entrypoint: certification-legacy
   arguments:
     parameters:
       - name: run-name
@@ -48,7 +48,116 @@ spec:
         value: "false"
       - name: attempt
   templates:
+    - name: certification-legacy
+      steps:
+        - - name: certification
+            template: certification
+            arguments:
+              parameters:
+                - name: run-name
+                  value: "{{`{{workflow.parameters.run-name}}`}}"
+                - name: run-uid
+                  value: "{{`{{workflow.parameters.run-uid}}`}}"
+                - name: participants
+                  value: "{{`{{workflow.parameters.participants}}`}}"
+                - name: participants-json
+                  value: "{{`{{workflow.parameters.participants-json}}`}}"
+                - name: participant-count
+                  value: "{{`{{workflow.parameters.participant-count}}`}}"
+                - name: request-node-name
+                  value: "{{`{{workflow.parameters.request-node-name}}`}}"
+                - name: script-configmap
+                  value: "{{`{{workflow.parameters.script-configmap}}`}}"
+                - name: script-key
+                  value: "{{`{{workflow.parameters.script-key}}`}}"
+                - name: script-digest
+                  value: "{{`{{workflow.parameters.script-digest}}`}}"
+                - name: script-requires-runtime-stage
+                  value: "{{`{{workflow.parameters.script-requires-runtime-stage}}`}}"
+                - name: runtime-stage-name
+                  value: "{{`{{workflow.parameters.runtime-stage-name}}`}}"
+                - name: backend-api-version
+                  value: "{{`{{workflow.parameters.backend-api-version}}`}}"
+                - name: backend-kind
+                  value: "{{`{{workflow.parameters.backend-kind}}`}}"
+                - name: backend-active-deadline-seconds
+                  value: "{{`{{workflow.parameters.backend-active-deadline-seconds}}`}}"
+                - name: queue
+                  value: "{{`{{workflow.parameters.queue}}`}}"
+                - name: runner-image
+                  value: "{{`{{workflow.parameters.runner-image}}`}}"
+                - name: tolerations
+                  value: "{{`{{workflow.parameters.tolerations}}`}}"
+                - name: script-environment
+                  value: "{{`{{workflow.parameters.script-environment}}`}}"
+                - name: workload-policy
+                  value: "{{`{{workflow.parameters.workload-policy}}`}}"
+                - name: mpi-payload-mode
+                  value: "{{`{{workflow.parameters.mpi-payload-mode}}`}}"
+                - name: expected-gpu-product-regex
+                  value: "{{`{{workflow.parameters.expected-gpu-product-regex}}`}}"
+                - name: expected-gpu-count
+                  value: "{{`{{workflow.parameters.expected-gpu-count}}`}}"
+                - name: observed-gpu-capacity
+                  value: "{{`{{workflow.parameters.observed-gpu-capacity}}`}}"
+                - name: observed-gpu-allocatable
+                  value: "{{`{{workflow.parameters.observed-gpu-allocatable}}`}}"
+                - name: gpu-resource-count
+                  value: "{{`{{workflow.parameters.gpu-resource-count}}`}}"
+                - name: privileged
+                  value: "{{`{{workflow.parameters.privileged}}`}}"
+                - name: attempt
+                  value: "{{`{{workflow.parameters.attempt}}`}}"
+      outputs:
+        parameters:
+          - name: verdict
+            valueFrom:
+              parameter: "{{`{{steps.certification.outputs.parameters.verdict}}`}}"
+          - name: reason
+            valueFrom:
+              parameter: "{{`{{steps.certification.outputs.parameters.reason}}`}}"
+          - name: cleanup-failure
+            valueFrom:
+              parameter: "{{`{{steps.certification.outputs.parameters.cleanup-failure}}`}}"
+          - name: measurements
+            valueFrom:
+              parameter: "{{`{{steps.certification.outputs.parameters.measurements}}`}}"
+          - name: backend-resources
+            valueFrom:
+              parameter: "{{`{{steps.certification.outputs.parameters.backend-resources}}`}}"
+          - name: backend-evidence
+            valueFrom:
+              parameter: "{{`{{steps.certification.outputs.parameters.backend-evidence}}`}}"
     - name: certification
+      inputs:
+        parameters:
+          - name: run-name
+          - name: run-uid
+          - name: participants
+          - name: participants-json
+          - name: participant-count
+          - name: request-node-name
+          - name: script-configmap
+          - name: script-key
+          - name: script-digest
+          - name: script-requires-runtime-stage
+          - name: runtime-stage-name
+          - name: backend-api-version
+          - name: backend-kind
+          - name: backend-active-deadline-seconds
+          - name: queue
+          - name: runner-image
+          - name: tolerations
+          - name: script-environment
+          - name: workload-policy
+          - name: mpi-payload-mode
+          - name: expected-gpu-product-regex
+          - name: expected-gpu-count
+          - name: observed-gpu-capacity
+          - name: observed-gpu-allocatable
+          - name: gpu-resource-count
+          - name: privileged
+          - name: attempt
       container:
         image: {{ default "example.invalid/project-signal-adapter@sha256:0000000000000000000000000000000000000000000000000000000000000000" .AdapterImage }}
         imagePullPolicy: IfNotPresent
@@ -58,47 +167,47 @@ spec:
           - --workflow-name
           - "$(WORKFLOW_NAME)"
           - --run-name
-          - "{{`{{workflow.parameters.run-name}}`}}"
+          - "{{`{{inputs.parameters.run-name}}`}}"
           - --run-uid
-          - "{{`{{workflow.parameters.run-uid}}`}}"
+          - "{{`{{inputs.parameters.run-uid}}`}}"
           - --participants
-          - "{{`{{workflow.parameters.participants}}`}}"
+          - "{{`{{inputs.parameters.participants}}`}}"
           - --participants-json
-          - "{{`{{workflow.parameters.participants-json}}`}}"
+          - "{{`{{inputs.parameters.participants-json}}`}}"
           - --participant-count
-          - "{{`{{workflow.parameters.participant-count}}`}}"
+          - "{{`{{inputs.parameters.participant-count}}`}}"
           - --request-node-name
-          - "{{`{{workflow.parameters.request-node-name}}`}}"
+          - "{{`{{inputs.parameters.request-node-name}}`}}"
           - --script-configmap
-          - "{{`{{workflow.parameters.script-configmap}}`}}"
+          - "{{`{{inputs.parameters.script-configmap}}`}}"
           - --script-key
-          - "{{`{{workflow.parameters.script-key}}`}}"
+          - "{{`{{inputs.parameters.script-key}}`}}"
           - --script-digest
-          - "{{`{{workflow.parameters.script-digest}}`}}"
-          - "--script-requires-runtime-stage={{`{{workflow.parameters.script-requires-runtime-stage}}`}}"
+          - "{{`{{inputs.parameters.script-digest}}`}}"
+          - "--script-requires-runtime-stage={{`{{inputs.parameters.script-requires-runtime-stage}}`}}"
           - --runtime-stage-name
-          - "{{`{{workflow.parameters.runtime-stage-name}}`}}"
+          - "{{`{{inputs.parameters.runtime-stage-name}}`}}"
           - --runner-image
-          - "{{`{{workflow.parameters.runner-image}}`}}"
+          - "{{`{{inputs.parameters.runner-image}}`}}"
           - --backend-api-version
-          - "{{`{{workflow.parameters.backend-api-version}}`}}"
+          - "{{`{{inputs.parameters.backend-api-version}}`}}"
           - --backend-kind
-          - "{{`{{workflow.parameters.backend-kind}}`}}"
+          - "{{`{{inputs.parameters.backend-kind}}`}}"
           - --backend-active-deadline-seconds
-          - "{{`{{workflow.parameters.backend-active-deadline-seconds}}`}}"
+          - "{{`{{inputs.parameters.backend-active-deadline-seconds}}`}}"
           - --queue
-          - "{{`{{workflow.parameters.queue}}`}}"
+          - "{{`{{inputs.parameters.queue}}`}}"
           - --tolerations
-          - "{{`{{workflow.parameters.tolerations}}`}}"
+          - "{{`{{inputs.parameters.tolerations}}`}}"
           - --script-environment
-          - "{{`{{workflow.parameters.script-environment}}`}}"
+          - "{{`{{inputs.parameters.script-environment}}`}}"
           - --workload-policy
-          - "{{`{{workflow.parameters.workload-policy}}`}}"
+          - "{{`{{inputs.parameters.workload-policy}}`}}"
           - --gpu-resource-count
-          - "{{`{{workflow.parameters.gpu-resource-count}}`}}"
-          - "--privileged={{`{{workflow.parameters.privileged}}`}}"
+          - "{{`{{inputs.parameters.gpu-resource-count}}`}}"
+          - "--privileged={{`{{inputs.parameters.privileged}}`}}"
           - --attempt
-          - "{{`{{workflow.parameters.attempt}}`}}"
+          - "{{`{{inputs.parameters.attempt}}`}}"
         env:
           - name: POD_NAMESPACE
             valueFrom:

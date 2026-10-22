@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -86,6 +87,50 @@ func TestAdapterManifestIsGenericAndParticipantAware(t *testing.T) {
 	} {
 		if strings.Contains(manifest, forbidden) {
 			t.Fatalf("adapter WorkflowTemplate contains downstream-specific value %q", forbidden)
+		}
+	}
+}
+
+func TestAdapterTemplateResolvesGroupedTaskArgumentsThroughInputs(t *testing.T) {
+	t.Parallel()
+
+	content, err := os.ReadFile("04-adapter-workflowtemplate.yaml.tmpl")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	manifest := string(content)
+	if !strings.Contains(manifest, "entrypoint: certification-legacy") {
+		t.Fatal("adapter WorkflowTemplate does not preserve the legacy workflow entrypoint")
+	}
+
+	const certificationMarker = "    - name: certification\n      inputs:\n"
+	certificationIndex := strings.LastIndex(manifest, certificationMarker)
+	if certificationIndex < 0 {
+		t.Fatal("adapter WorkflowTemplate does not declare certification template inputs")
+	}
+
+	certification := manifest[certificationIndex:]
+	if strings.Contains(certification, "workflow.parameters.") {
+		t.Fatal("grouped certification template references undeclared workflow parameters")
+	}
+
+	inputReference := regexp.MustCompile(`inputs\.parameters\.([a-z0-9-]+)`)
+	for _, match := range inputReference.FindAllStringSubmatch(certification, -1) {
+		declaration := "          - name: " + match[1]
+		if !strings.Contains(certification, declaration) {
+			t.Fatalf("certification template references undeclared input %q", match[1])
+		}
+	}
+
+	legacy := manifest[:certificationIndex]
+	for _, required := range []string{
+		"value: \"{{`{{workflow.parameters.run-name}}`}}\"",
+		"parameter: \"{{`{{steps.certification.outputs.parameters.verdict}}`}}\"",
+		"parameter: \"{{`{{steps.certification.outputs.parameters.backend-evidence}}`}}\"",
+	} {
+		if !strings.Contains(legacy, required) {
+			t.Fatalf("legacy adapter wrapper does not contain %q", required)
 		}
 	}
 }
