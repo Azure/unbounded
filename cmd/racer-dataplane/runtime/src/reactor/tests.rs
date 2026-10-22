@@ -505,7 +505,7 @@ mod completion {
     fn finish_releases_slot_and_waker_borrow_before_result_destruction() {
         /// Observe signal borrow availability while the completion result is destroyed.
         struct Probe {
-            signal: Rc<Signal>,
+            signal: Rc<dyn Delivery<Probe, Error>>,
 
             drops: Rc<Cell<usize>>,
         }
@@ -513,7 +513,14 @@ mod completion {
         impl Drop for Probe {
             /// Verify the notification borrow ended before this application callback.
             fn drop(&mut self) {
-                assert!(self.signal.waker.try_borrow_mut().unwrap().is_none());
+                assert!(
+                    self.signal
+                        .signal()
+                        .waker
+                        .try_borrow_mut()
+                        .unwrap()
+                        .is_none()
+                );
                 self.drops.set(self.drops.get() + 1);
             }
         }
@@ -521,7 +528,7 @@ mod completion {
             let Some(reactor) = kernel_reactor(1) else {
                 return;
             };
-            let signal = Rc::new(RefCell::new(None::<Rc<Signal>>));
+            let signal = Rc::new(RefCell::new(None::<Rc<dyn Delivery<Probe, Error>>>));
             let finish_signal = signal.clone();
             let drops = Rc::new(Cell::new(0));
             let finish_drops = drops.clone();
@@ -547,10 +554,10 @@ mod completion {
                     },
                 )
                 .unwrap();
-            *signal.borrow_mut() = Some(waiting.signal.clone());
+            *signal.borrow_mut() = Some(waiting.delivery.clone());
             let counter = Arc::new(Count::default());
-            *waiting.signal.waker.borrow_mut() = Some(Waker::from(counter.clone()));
-            let reply = waiting.reply.clone();
+            *waiting.delivery.signal().waker.borrow_mut() = Some(Waker::from(counter.clone()));
+            let reply = waiting.delivery.clone();
             let mut waiting = Some(waiting);
             if abandoned {
                 drop(waiting.take());
@@ -563,8 +570,8 @@ mod completion {
             }
             assert_eq!(drops.get(), usize::from(abandoned));
             assert_eq!(counter.0.load(Ordering::Relaxed), usize::from(!abandoned));
-            assert_eq!(reply.borrow().result.is_some(), !abandoned);
-            drop(reply.borrow_mut().result.take());
+            assert_eq!(reply.reply().borrow().result.is_some(), !abandoned);
+            drop(reply.reply().borrow_mut().result.take());
             assert_eq!(drops.get(), 1);
         }
     }
@@ -622,12 +629,7 @@ mod completion {
             reactor.state.borrow_mut().entries.insert(
                 IoId(1),
                 Entry {
-                    finish: Box::new(|_| None),
-                    signal: Rc::new(Signal {
-                        abandoned: Cell::new(false),
-                        waker: RefCell::new(None),
-                    }),
-                    scope: Rc::new(scope()),
+                    pending: synthetic(scope(), |_| None),
                     completion: CompletionState::Pending {
                         kind: CompletionKind::Value,
                         cancellation: CancellationFence::Pending,
@@ -689,12 +691,7 @@ mod completion {
         reactor.state.borrow_mut().entries.insert(
             IoId(1),
             Entry {
-                finish: Box::new(|_| None),
-                signal: Rc::new(Signal {
-                    abandoned: Cell::new(false),
-                    waker: RefCell::new(None),
-                }),
-                scope: Rc::new(scope()),
+                pending: synthetic(scope(), |_| None),
                 completion: CompletionState::new(CompletionKind::Value),
                 cancel_reason: None,
             },
@@ -791,35 +788,37 @@ mod completion {
                 buffer: Buffer(vec![0; 32], drops.clone()),
                 lease: Lease(drops.clone()),
             };
-            let signal = Rc::new(Signal {
-                abandoned: Cell::new(false),
-                waker: RefCell::new(None),
-            });
             let reservation: Rc<Charge> = Rc::new(Box::new(
                 reactor
                     .admission
                     .reserve(None, ResourceClass::RequestContext, 64)
                     .unwrap(),
             ));
-            let reply = Rc::new(RefCell::new(Reply::<(), Error> {
-                _slot: None,
-                result: None,
-                _reservation: reservation.clone(),
-            }));
+            let submitted = Rc::new(Submitted {
+                scope: scope(),
+                signal: Signal {
+                    abandoned: Cell::new(false),
+                    waker: RefCell::new(None),
+                },
+                reply: RefCell::new(Reply::<(), Error> {
+                    _slot: None,
+                    result: None,
+                    _reservation: Reservation::Shared(reservation.clone()),
+                }),
+                slot: Cell::new(None),
+                finish: Cell::new(Some(move |result: Result<KernelResult>| {
+                    drop((owned, reservation));
+                    assert!(matches!(result, Err(Error::Cancelled)));
+                    Ok(())
+                })),
+            });
             let waiting = Waiting {
-                reply: reply.clone(),
-                signal: signal.clone(),
+                delivery: submitted.clone(),
             };
             reactor.state.borrow_mut().entries.insert(
                 IoId(1),
                 Entry {
-                    finish: Box::new(move |result| {
-                        drop((owned, reservation));
-                        assert!(matches!(result, Err(Error::Cancelled)));
-                        None
-                    }),
-                    scope: Rc::new(scope()),
-                    signal,
+                    pending: submitted,
                     completion: CompletionState::Pending {
                         kind: CompletionKind::Value,
                         cancellation: CancellationFence::Pending,
@@ -828,7 +827,6 @@ mod completion {
                 },
             );
             drop(waiting);
-            drop(reply);
             assert_eq!(drops.get(), 0);
             let (first, second) = if cancel_first {
                 ((1 | CANCEL_BIT, 0), (1, -libc::ECANCELED))
@@ -871,14 +869,9 @@ mod completion {
         reactor.state.borrow_mut().entries.insert(
             IoId(1),
             Entry {
-                finish: Box::new(|result| {
+                pending: synthetic_abandoned(scope(), |result| {
                     assert!(matches!(result, Err(Error::Cancelled)));
                     None
-                }),
-                scope: Rc::new(scope()),
-                signal: Rc::new(Signal {
-                    abandoned: Cell::new(true),
-                    waker: RefCell::new(None),
                 }),
                 completion: CompletionState::Pending {
                     kind: CompletionKind::Descriptor,
@@ -923,15 +916,10 @@ mod completion {
             reactor.state.borrow_mut().entries.insert(
                 IoId(1),
                 Entry {
-                    finish: Box::new(move |result| {
+                    pending: synthetic(scope(), move |result| {
                         output.set(Some(result.and_then(KernelResult::value)));
                         drop(lease);
                         None
-                    }),
-                    scope: Rc::new(scope()),
-                    signal: Rc::new(Signal {
-                        abandoned: Cell::new(false),
-                        waker: RefCell::new(None),
                     }),
                     completion: CompletionState::new(CompletionKind::Value),
                     cancel_reason: None,
@@ -1321,6 +1309,46 @@ mod empty_submit_tests {
             assert_eq!(read_token(), (-1, 0));
             assert!(!endpoint.remote.load(Ordering::Acquire));
         }
+    }
+
+    #[test]
+    /// Ready completions end a wait without sleeping, and remain for poll_budgeted.
+    fn wait_skips_poll_when_completions_are_ready() {
+        let Some(reactor) = kernel_reactor(2) else {
+            return;
+        };
+        let scope = scope();
+        let raw = unsafe { libc::memfd_create(c"ready-wait".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(raw >= 0);
+        let fd = Rc::new(unsafe { Descriptor::from_raw_fd(raw) });
+        let mut write = reactor.write_at(fd, 0, buffer(b"ready"), (), &scope);
+        assert!(poll(&mut write).is_pending());
+        // Submit, then wait until the CQE is visible without reaping it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        reactor.wait(Duration::ZERO).unwrap();
+        while reactor
+            .state
+            .borrow_mut()
+            .ring
+            .as_mut()
+            .unwrap()
+            .completion()
+            .is_empty()
+        {
+            assert!(Instant::now() < deadline, "write never completed");
+            std::thread::yield_now();
+        }
+        let attempts = reactor.state.borrow().wait_attempts;
+        reactor.wait(MAX_WAIT).unwrap();
+        assert_eq!(reactor.state.borrow().wait_attempts, attempts);
+        assert_eq!(reactor.poll_budgeted(8).unwrap(), 1);
+        assert!(matches!(
+            poll(&mut write),
+            Poll::Ready(Ok(Completion { bytes: 5, .. }))
+        ));
+        // With nothing ready, the wait sleeps in ppoll again.
+        reactor.wait(Duration::from_millis(1)).unwrap();
+        assert_eq!(reactor.state.borrow().wait_attempts, attempts + 1);
     }
 
     #[test]
@@ -2266,6 +2294,60 @@ fn submission_classifies_transient_and_fatal_errors() {
     );
 }
 
+/// A synthetic submission whose callback produces its own notification.
+struct Synthetic<F> {
+    scope: RequestScope,
+
+    signal: Signal,
+
+    finish: Cell<Option<F>>,
+}
+
+impl<F: FnOnce(Result<KernelResult>) -> Option<Waker>> Pending<RequestScope> for Synthetic<F> {
+    /// Borrow the synthetic scope.
+    fn scope(&self) -> &RequestScope {
+        &self.scope
+    }
+
+    /// Borrow the synthetic signal.
+    fn signal(&self) -> &Signal {
+        &self.signal
+    }
+
+    /// Run the callback once.
+    fn finish(&self, result: Result<KernelResult>) -> Option<Waker> {
+        (self
+            .finish
+            .take()
+            .expect("synthetic submission finishes once"))(result)
+    }
+}
+
+/// Build a synthetic submission whose delivery is still awaited.
+fn synthetic(
+    scope: RequestScope,
+    finish: impl FnOnce(Result<KernelResult>) -> Option<Waker> + 'static,
+) -> Rc<dyn Pending<RequestScope>> {
+    Rc::new(Synthetic {
+        scope,
+        signal: Signal {
+            abandoned: Cell::new(false),
+            waker: RefCell::new(None),
+        },
+        finish: Cell::new(Some(finish)),
+    })
+}
+
+/// Build a synthetic submission whose waiting future was dropped.
+fn synthetic_abandoned(
+    scope: RequestScope,
+    finish: impl FnOnce(Result<KernelResult>) -> Option<Waker> + 'static,
+) -> Rc<dyn Pending<RequestScope>> {
+    let pending = synthetic(scope, finish);
+    pending.signal().abandoned.set(true);
+    pending
+}
+
 /// Build a nonzero queue ceiling for a regression's admitted operation count.
 fn limits(capacity: usize) -> Limits {
     Limits {
@@ -3017,15 +3099,25 @@ mod reentrancy_panics_and_shutdown {
             .entries
             .insert(IoId(1), entry(|_| None));
         let weak = Rc::downgrade(&reactor);
-        let signal = Rc::new(Signal {
-            abandoned: Cell::new(false),
-            waker: RefCell::new(None),
+        let delivery = Rc::new(Submitted {
+            scope: scope(),
+            signal: Signal {
+                abandoned: Cell::new(false),
+                waker: RefCell::new(None),
+            },
+            reply: RefCell::new(Reply::<(), Error> {
+                _slot: None,
+                result: None,
+                _reservation: Reservation::Owned(Box::new(())),
+            }),
+            slot: Cell::new(None),
+            finish: Cell::new(Some(|_: Result<KernelResult>| Ok::<(), Error>(()))),
         });
-        let observed = signal.clone();
+        let observed = delivery.clone();
         WAKER_CALLBACK.with(|probe| {
             *probe.borrow_mut() = Some(Box::new(move || {
                 assert!(weak.upgrade().unwrap().state.try_borrow_mut().is_ok());
-                assert!(observed.waker.try_borrow_mut().is_ok());
+                assert!(observed.signal.waker.try_borrow_mut().is_ok());
             }))
         });
         let waker = callback_waker();
@@ -3034,12 +3126,7 @@ mod reentrancy_panics_and_shutdown {
         assert!(fence.as_mut().poll(&mut cx).is_pending());
         assert!(fence.as_mut().poll(&mut cx).is_pending());
         drop(fence);
-        let reply = Rc::new(RefCell::new(Reply::<(), Error> {
-            _slot: None,
-            result: None,
-            _reservation: Rc::new(Box::new(())),
-        }));
-        let mut waiting = Waiting { reply, signal };
+        let mut waiting = Waiting { delivery };
         assert!(Pin::new(&mut waiting).poll(&mut cx).is_pending());
         assert!(Pin::new(&mut waiting).poll(&mut cx).is_pending());
         drop(waiting);
@@ -3054,12 +3141,7 @@ mod reentrancy_panics_and_shutdown {
         finish: impl FnOnce(Result<KernelResult>) -> Option<Waker> + 'static,
     ) -> Entry<RequestScope> {
         Entry {
-            finish: Box::new(finish),
-            signal: Rc::new(Signal {
-                abandoned: Cell::new(false),
-                waker: RefCell::new(None),
-            }),
-            scope: Rc::new(scope()),
+            pending: synthetic(scope(), finish),
             completion: CompletionState::new(CompletionKind::Value),
             cancel_reason: None,
         }
@@ -3240,10 +3322,13 @@ mod reentrancy_panics_and_shutdown {
         for id in 1..=3 {
             let mut pending = entry(|_| None);
             if id == 3 {
-                pending.scope = Rc::new(RequestScope {
-                    deadline: Deadline(Instant::now()),
-                    ..scope()
-                });
+                pending.pending = synthetic(
+                    RequestScope {
+                        deadline: Deadline(Instant::now()),
+                        ..scope()
+                    },
+                    |_| None,
+                );
             }
             reactor.state.borrow_mut().entries.insert(IoId(id), pending);
         }
@@ -3403,5 +3488,443 @@ mod reentrancy_panics_and_shutdown {
             reactor.poll_budgeted(1).unwrap();
         }
         assert!(matches!(poll(&mut receive), Poll::Ready(Ok(_))));
+    }
+}
+
+mod vectored {
+    //! Zero-copy vectored positioned writes on the host ring and in simulation.
+    use super::*;
+
+    /// Immutable body storage shared with other owners.
+    struct SharedBody(Rc<Vec<u8>>);
+
+    // SAFETY: no owner mutates or resizes the shared Vec, so its bytes are stable.
+    unsafe impl SendBuffer for SharedBody {
+        /// Runtime errors accepted by the test reactor's scope.
+        type Error = Error;
+
+        /// Borrow the shared bytes without copying them.
+        fn send_bytes(&self) -> Result<&[u8]> {
+            Ok(&self.0)
+        }
+    }
+
+    /// Body storage that rejects access before any submission.
+    struct RejectingBody;
+
+    // SAFETY: never yields a region.
+    unsafe impl SharedWriteBuffer for RejectingBody {
+        /// Runtime errors accepted by the test reactor's scope.
+        type Error = Error;
+
+        /// Refuse access like a body whose allocation was revoked.
+        fn write_bytes(&self) -> Result<&[u8]> {
+            Err(Error::Unavailable)
+        }
+    }
+
+    #[test]
+    /// Write header then shared body at an offset, returning both owners and the lease.
+    fn real_vectored_file_write_returns_owners_and_errors() {
+        let Some(reactor) = kernel_reactor(4) else {
+            return;
+        };
+        let scope = scope();
+        let baseline = reactor.admission.used(ResourceClass::RequestContext);
+        // Anonymous memory-backed regular file avoids filesystem fixture side effects.
+        let raw = unsafe { libc::memfd_create(c"vectored-test".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(raw >= 0);
+        let fd = Rc::new(unsafe { Descriptor::from_raw_fd(raw) });
+        let body = Rc::new(b"world".to_vec());
+        let header = buffer(b"hello ");
+        let header_ptr = header.0.as_ptr();
+        let written = drive(
+            &reactor,
+            reactor.write_vectored_at(fd.clone(), 2, header, SharedBody(body.clone()), 7u8, &scope),
+        )
+        .unwrap();
+        assert_eq!((written.bytes, written.lease), (11, 7));
+        assert_eq!(written.header.0.as_ptr(), header_ptr);
+        assert!(Rc::ptr_eq(&written.body.0, &body));
+        // An empty header still writes the body.
+        let written = drive(
+            &reactor,
+            reactor.write_vectored_at(fd.clone(), 0, buffer(b""), buffer(b"<>"), (), &scope),
+        )
+        .unwrap();
+        assert_eq!(written.bytes, 2);
+        let read = drive(
+            &reactor,
+            reactor.read_at(fd, 0, buffer(&[9; 16]), (), &scope),
+        )
+        .unwrap();
+        assert_eq!(read.bytes, 13);
+        assert_eq!(&read.buffer.0[..13], b"<>hello world");
+        // The read end of a pipe is not writable.
+        let mut pipe = [0; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let read_end = Rc::new(unsafe { Descriptor::from_raw_fd(pipe[0]) });
+        let _write_end = unsafe { Descriptor::from_raw_fd(pipe[1]) };
+        let drops = Rc::new(Cell::new(0));
+        let error = drive(
+            &reactor,
+            reactor.write_vectored_at(
+                read_end,
+                0,
+                Buffer(vec![1], drops.clone()),
+                Buffer(vec![2], drops.clone()),
+                Lease(drops.clone()),
+                &scope,
+            ),
+        )
+        .err();
+        assert_eq!(error, Some(Error::Os(libc::EBADF)));
+        assert_eq!(drops.get(), 3, "failed writes release every owner once");
+        assert_eq!(reactor.in_flight(), 0);
+        assert_eq!(
+            reactor.admission.used(ResourceClass::RequestContext),
+            baseline
+        );
+    }
+
+    #[test]
+    /// Reject sentinel offsets and inaccessible owners before publishing kernel work.
+    fn vectored_write_rejects_invalid_input_before_publication() {
+        let Some(reactor) = kernel_reactor(2) else {
+            return;
+        };
+        let request = scope();
+        let (fd, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let fd = Rc::new(Descriptor::from(fd));
+        for offset in [i64::MAX as u64 + 1, u64::MAX] {
+            let drops = Rc::new(Cell::new(0));
+            assert!(matches!(
+                drive(
+                    &reactor,
+                    reactor.write_vectored_at(
+                        fd.clone(),
+                        offset,
+                        Buffer(vec![0], drops.clone()),
+                        Buffer(vec![0], drops.clone()),
+                        Lease(drops.clone()),
+                        &request
+                    )
+                ),
+                Err(Error::InvalidInput)
+            ));
+            assert_eq!(drops.get(), 3);
+        }
+        assert!(matches!(
+            drive(
+                &reactor,
+                reactor.write_vectored_at(fd, 0, buffer(b"x"), RejectingBody, (), &request)
+            ),
+            Err(Error::Unavailable)
+        ));
+        assert_eq!(reactor.in_flight(), 0);
+    }
+
+    #[cfg(feature = "simulation")]
+    mod simulated {
+        use super::*;
+        use simulation::{Fault, Simulation};
+
+        /// Count accepted submissions of one operation kind in the simulation trace.
+        fn submissions(sim: &Simulation, name: &str) -> usize {
+            sim.trace()
+                .iter()
+                .filter(|event| event.operation == format!("submit:{name}"))
+                .count()
+        }
+
+        /// Open a fresh simulated regular file with extra open flags.
+        fn file(sim: &Simulation, name: &str, flags: i32) -> Rc<Descriptor> {
+            Rc::new(
+                sim.open(
+                    None,
+                    std::path::Path::new(name),
+                    libc::O_CREAT | libc::O_RDWR | flags,
+                )
+                .unwrap(),
+            )
+        }
+
+        #[test]
+        /// Gather both segments, retry zero progress, report short progress once,
+        /// and keep both owners and the lease until completion.
+        fn vectored_write_gathers_retries_and_reports_short_progress() {
+            for errno in [libc::EINTR, libc::EAGAIN] {
+                let sim = Simulation::new();
+                let _environment = sim.enter();
+                let reactor = Reactor::new(Rc::new(Admission::new(limits(1))));
+                let request = scope();
+                let file = file(&sim, "/vectored", 0);
+                let drops = Rc::new(Cell::new(0));
+                let written = drive(
+                    &reactor,
+                    reactor.write_vectored_at(
+                        file.clone(),
+                        1,
+                        Buffer(b"HD".to_vec(), drops.clone()),
+                        Buffer(b"body".to_vec(), drops.clone()),
+                        Lease(drops.clone()),
+                        &request,
+                    ),
+                )
+                .unwrap();
+                assert_eq!(written.bytes, 6);
+                assert_eq!(
+                    (&written.header.0[..], &written.body.0[..]),
+                    (&b"HD"[..], &b"body"[..])
+                );
+                drop(written);
+                assert_eq!(drops.get(), 3);
+
+                sim.inject("writev", Fault::Errno(errno)).unwrap();
+                sim.inject("writev", Fault::Short(3)).unwrap();
+                let drops = Rc::new(Cell::new(0));
+                let mut operation = reactor.write_vectored_at(
+                    file.clone(),
+                    0,
+                    Buffer(b"xy".to_vec(), drops.clone()),
+                    Buffer(b"zw".to_vec(), drops.clone()),
+                    Lease(drops.clone()),
+                    &request,
+                );
+                assert!(poll(&mut operation).is_pending());
+                for _ in 0..2 {
+                    reactor.poll_budgeted(1).unwrap();
+                }
+                assert_eq!(drops.get(), 0, "transient CQE retains owners before repoll");
+                let written = drive(&reactor, operation).unwrap();
+                assert_eq!(written.bytes, 3, "short progress crosses into the body");
+                assert_eq!(drops.get(), 0);
+                assert_eq!(submissions(&sim, "writev"), 3);
+                assert_eq!(
+                    submissions(&sim, "poll"),
+                    usize::from(errno == libc::EAGAIN)
+                );
+                drop(written);
+                assert_eq!(drops.get(), 3);
+                let read = drive(
+                    &reactor,
+                    reactor.read_at(file, 0, buffer(&[0; 7]), (), &request),
+                )
+                .unwrap();
+                assert_eq!(&read.buffer.0, b"xyzbody");
+                assert_eq!(reactor.in_flight(), 0);
+            }
+        }
+
+        #[test]
+        /// Surface device errors after releasing owners, and keep "write" faults
+        /// from matching vectored writes.
+        fn vectored_write_errors_release_owners_and_faults_are_distinct() {
+            let sim = Simulation::new();
+            let _environment = sim.enter();
+            let reactor = Reactor::new(Rc::new(Admission::new(limits(1))));
+            let request = scope();
+            let file = file(&sim, "/vectored-error", 0);
+            sim.inject("writev", Fault::Errno(libc::EIO)).unwrap();
+            let drops = Rc::new(Cell::new(0));
+            let result = drive(
+                &reactor,
+                reactor.write_vectored_at(
+                    file.clone(),
+                    0,
+                    Buffer(vec![1], drops.clone()),
+                    Buffer(vec![2], drops.clone()),
+                    Lease(drops.clone()),
+                    &request,
+                ),
+            );
+            assert!(matches!(result, Err(Error::Os(libc::EIO))));
+            assert_eq!(drops.get(), 3);
+            sim.inject("write", Fault::Errno(libc::EIO)).unwrap();
+            let written = drive(
+                &reactor,
+                reactor.write_vectored_at(
+                    file.clone(),
+                    0,
+                    buffer(b"a"),
+                    buffer(b"b"),
+                    (),
+                    &request,
+                ),
+            )
+            .unwrap();
+            assert_eq!(written.bytes, 2);
+            assert!(matches!(
+                drive(
+                    &reactor,
+                    reactor.write_at(file, 0, buffer(b"c"), (), &request)
+                ),
+                Err(Error::Os(libc::EIO))
+            ));
+            assert_eq!(reactor.in_flight(), 0);
+        }
+
+        /// A window of a larger allocation, used to place segments at chosen alignments.
+        struct Window {
+            storage: Vec<u8>,
+            start: usize,
+            len: usize,
+        }
+
+        impl Window {
+            /// Expose `len` bytes starting `skew` bytes past a 4096-byte boundary.
+            fn new(len: usize, skew: usize, fill: u8) -> Self {
+                let storage = vec![fill; len + skew + 4096];
+                let start = storage.as_ptr().align_offset(4096) + skew;
+                Self {
+                    storage,
+                    start,
+                    len,
+                }
+            }
+        }
+
+        // SAFETY: the private Vec is never resized, so the window is stable.
+        unsafe impl IoBuffer for Window {
+            /// Runtime errors accepted by the test reactor's scope.
+            type Error = Error;
+
+            /// Borrow the window immutably.
+            fn bytes(&self) -> Result<&[u8]> {
+                Ok(&self.storage[self.start..self.start + self.len])
+            }
+
+            /// Borrow the same window exclusively.
+            fn bytes_mut(&mut self) -> Result<&mut [u8]> {
+                Ok(&mut self.storage[self.start..self.start + self.len])
+            }
+        }
+
+        #[test]
+        /// Direct I/O checks alignment for each segment, not the gathered total.
+        fn vectored_direct_write_checks_every_segment() {
+            let sim = Simulation::new();
+            let _environment = sim.enter();
+            let reactor = Reactor::new(Rc::new(Admission::new(limits(1))));
+            let request = scope();
+            let file = file(&sim, "/vectored-direct", libc::O_DIRECT);
+            let written = drive(
+                &reactor,
+                reactor.write_vectored_at(
+                    file.clone(),
+                    4096,
+                    Window::new(4096, 0, b'h'),
+                    Window::new(8192, 0, b'b'),
+                    (),
+                    &request,
+                ),
+            )
+            .unwrap();
+            assert_eq!(written.bytes, 12288);
+            // Header length, body pointer, body length, then the shared offset.
+            for (offset, header, body) in [
+                (0, Window::new(2048, 0, 0), Window::new(6144, 0, 0)),
+                (0, Window::new(4096, 0, 0), Window::new(4096, 512, 0)),
+                (0, Window::new(4096, 0, 0), Window::new(4095, 0, 0)),
+                (512, Window::new(4096, 0, 0), Window::new(4096, 0, 0)),
+            ] {
+                assert!(matches!(
+                    drive(
+                        &reactor,
+                        reactor.write_vectored_at(file.clone(), offset, header, body, (), &request)
+                    ),
+                    Err(Error::Os(libc::EINVAL))
+                ));
+            }
+            let read = drive(
+                &reactor,
+                reactor.read_at(file, 4096, Window::new(12288, 0, 0), (), &request),
+            )
+            .unwrap();
+            let bytes = read.buffer.bytes().unwrap();
+            assert!(bytes[..4096].iter().all(|&b| b == b'h'));
+            assert!(bytes[4096..].iter().all(|&b| b == b'b'));
+            assert_eq!(reactor.in_flight(), 0);
+        }
+    }
+}
+
+mod table {
+    //! Ordered in-flight table: lookup, wraparound scans, and bounded tombstones.
+    use super::*;
+
+    /// Collect live identifiers from an iterator of entries.
+    fn ids<'a>(entries: impl Iterator<Item = (&'a IoId, &'a u32)>) -> Vec<u64> {
+        entries.map(|(id, _)| id.0).collect()
+    }
+
+    #[test]
+    /// Appends, out-of-order inserts, replacement, and removal keep identifier order.
+    fn inserts_and_removals_keep_order_and_count() {
+        let mut table = Table::default();
+        assert!(table.is_empty());
+        for id in [2, 4, 6] {
+            assert_eq!(table.insert(IoId(id), id as u32), None);
+        }
+        assert_eq!(table.insert(IoId(3), 3), None, "out of order insert");
+        assert_eq!(
+            table.insert(IoId(4), 40),
+            Some(4),
+            "replace keeps one entry"
+        );
+        assert_eq!(table.len(), 4);
+        assert_eq!(ids(table.iter()), [2, 3, 4, 6]);
+        assert_eq!(table.remove(&IoId(3)), Some(3));
+        assert_eq!(table.remove(&IoId(3)), None, "a removed entry is absent");
+        assert!(!table.contains_key(&IoId(3)));
+        assert_eq!(table.get_mut(&IoId(5)), None);
+        assert_eq!(table[&IoId(4)], 40);
+        // Reinsert into a tombstone left between live entries.
+        assert_eq!(table.insert(IoId(3), 30), None);
+        assert_eq!(ids(table.iter()), [2, 3, 4, 6]);
+        assert_eq!(table.first_key_value(), Some((&IoId(2), &2)));
+        for id in [2, 3, 4, 6] {
+            assert!(table.remove(&IoId(id)).is_some());
+        }
+        assert!(table.is_empty());
+        assert_eq!(table.slots.len(), 0, "an empty table keeps no tombstones");
+    }
+
+    #[test]
+    /// Scans start after the cursor and wrap to the beginning, skipping tombstones.
+    fn after_wraps_and_skips_removed_entries() {
+        let mut table = Table::default();
+        for id in 1..=6 {
+            table.insert(IoId(id), id as u32);
+        }
+        table.remove(&IoId(4));
+        assert_eq!(ids(table.after(IoId(3))), [5, 6, 1, 2, 3]);
+        assert_eq!(ids(table.after(IoId(4))), [5, 6, 1, 2, 3]);
+        assert_eq!(ids(table.after(IoId(0))), [1, 2, 3, 5, 6]);
+        assert_eq!(ids(table.after(IoId(9))), [1, 2, 3, 5, 6]);
+        assert_eq!(
+            ids(Table::<u32>::default().after(IoId(1))),
+            Vec::<u64>::new()
+        );
+    }
+
+    #[test]
+    /// One long-lived entry cannot make storage grow with later traffic.
+    fn long_lived_entry_keeps_storage_bounded() {
+        let mut table = Table::default();
+        table.insert(IoId(0), 0);
+        for id in 1..10_000 {
+            table.insert(IoId(id), id as u32);
+            let index = table.index_of(IoId(id)).unwrap();
+            assert_eq!(table.remove_at(index), id as u32);
+            assert!(table.slots.len() <= 2 * table.len() + 17);
+        }
+        assert_eq!(table.len(), 1);
+        assert_eq!(ids(table.iter()), [0]);
+        assert_eq!(table.remove(&IoId(0)), Some(0));
+        assert!(table.slots.is_empty());
     }
 }

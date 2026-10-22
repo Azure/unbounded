@@ -1,199 +1,259 @@
 # Racer RDMA verbs library (`rdma-verbs`)
 
-## Summary
-
-`rdma-verbs` lets Racer move bytes between nodes with one-sided RDMA writes.
-A receiver opens a memory window over one of its buffers and hands the peer an
-address and key. The sender writes into that window. There are no RDMA sends,
-receives, reads, or atomics.
-
-The crate has three parts:
-
-- `src/lib.rs`: the public API, the slot pool, and the native service.
-- `src/ffi.rs`: safe Rust wrappers around a small C adapter, plus the rules for
-  freeing (or leaking) NIC objects.
-- `native/verbs.c`: the C adapter that calls libibverbs.
-
-A simulated fabric (`src/simulation.rs`) replaces the C adapter in tests.
-
+Status: implemented. This file covers the verbs crate. Racer's signed setup
+and HTTP page protocol are in [racer-rdma-sessions.md](racer-rdma-sessions.md).
 Paths below are relative to `cmd/racer-dataplane/verbs/`.
 
-## Goals and non-goals
+## Contract
 
-Goals:
+The crate moves ciphertext over persistent, bidirectional RC queue pairs,
+one per peer and rail. It keeps libibverbs off I/O threads and never exposes
+a receive buffer to the CPU while the NIC may still write it.
 
-- Never let the CPU reuse or free memory that the NIC can still write.
-- Keep libibverbs off the I/O thread, so a slow NIC call cannot stall it.
-- Fixed, bounded resources that are allocated up front.
-- Fail closed. When cleanup fails, leak the resource and keep it counted.
-- Test every lifetime and failure path without RDMA hardware.
+A transfer has four steps:
 
-Non-goals:
+1. Bind a type 2 memory window over a free receive buffer and send a `Grant`.
+2. The peer writes with immediate, or sends an ordered `Release`.
+3. Observe the receive completion and invalidate the window.
+4. After successful invalidation, return `Arrival::Page` or free a released
+   buffer. Abnormal paths require successful QP destruction before reuse.
 
-- Authentication, peer admission, topology, retries, and timeouts. The caller
-  owns all of these.
-- A general verbs binding. The crate exposes only what Racer needs.
+Send sources are immutable and registered through implicit ODP. There is no
+copied-send mode, send-buffer pool, per-transfer QP API, or plain-write API.
+Peer authentication and the decision to use HTTP belong to Racer, not this
+crate.
 
-## Threads and slots
+## Source map
 
-There are two threads: the I/O thread and the native thread
-(`src/lib.rs:1-62`). All libibverbs calls run on the native thread. The I/O
-thread never touches RDMA objects or registered memory. The crate spawns no
-threads and runs no executor. Time and randomness come from the
-`uring-runtime` environment, so the same code runs in simulation.
+| File | Responsibility |
+|---|---|
+| `src/node.rs` | Owner, clients, activation, link table, backoff, shutdown |
+| `src/link.rs` | Per-QP grants, writes, credits, timers, and completion handling |
+| `src/pool.rs` | Registered receive buffers and ownership states |
+| `src/channel.rs` | Bounded worker command queues and one-shot results |
+| `src/discovery.rs` | Stable port identities, port journal, and NUMA-aware worker selection |
+| `src/control.rs` | Fixed-size in-band control codec |
+| `src/ffi.rs` | Native resource ownership, bounds checks, and completion validation |
+| `native/verbs.c` | libibverbs adapter |
+| `src/simulation.rs` | Deterministic fabric and fault injection |
+| `src/lib.rs` | Public exports and `WithNative` service wrapper |
 
-The threads share a fixed pool of 1 to 256 slots (`src/lib.rs:905-950`). A
-slot is one queue pair (QP) and one registered buffer. Each slot has a mailbox
-behind a mutex (`src/lib.rs:791-819`) and holds at most one pending command:
-connect, bind, write, or invalidate (`src/lib.rs:776-789`). Neither side waits
-on a mailbox lock; both use `try_lock` and retry on the next poll
-(`src/lib.rs:1796-1806`). Callers must therefore also poll on a timer.
+## Public API
 
-`NativeService::poll_budgeted` (`src/lib.rs:1317-1413`) does one step per
-budget unit: discover devices, build one slot, or service one slot. Budgets
-count steps, not time.
+`node(workers)` returns one `Client` per worker and an `OwnerPort`.
+`Owner::new` runs on the native thread and captures its environment.
+`WithNative::with_host` combines it with another service through `NativeHost`.
+Clients are `Send`; they contain shared handles, not native resources.
 
-Why this shape: libibverbs calls can block, and an I/O thread that stalls
-stops every connection. A fixed pool keeps memory and NIC usage bounded and
-lets the native side check every resource on shutdown.
+Each worker has a FIFO command queue with capacity 64. The owner drains them
+round-robin. `try_send` returns the command with `Overloaded` when full or
+`Unavailable` when the owner is gone; `poll_ready` waits for room. Dropping a
+worker keeps its queued commands. Dropping the owner drops queued commands,
+whose one-shot results become `Cancelled`.
 
-## Lifecycle
+`Op<T>` yields its result once. A second poll after completion returns
+`InvalidRequest`. If the caller abandons an operation, `Completer::complete`
+returns an unread value to the owner so it can release any acquired resources.
 
-1. `pair(slots)` returns an `IoPort` and a `NativePort`. The native side
-   creates a `NativeService`, which is not `Send` (`src/lib.rs:234-256`).
-2. `IoPort::activate` sends a `Configuration` (`src/lib.rs:206-221`): a port
-   selector, one admission guard per slot, and the buffer size per slot. The
-   selector runs on the native thread against discovered ports.
-3. The native side validates the plan (`src/lib.rs:1200-1254`), then builds
-   one slot per step (`src/lib.rs:1256-1315`). It spreads slots over the
-   selected ports, registers each buffer, creates each QP, and checks that the
-   device can create a memory window. No slot becomes ready until all are
-   built.
-4. A caller leases a ready slot on a port with `QueuePairHandle::poll_new`
-   (`src/lib.rs:531-579`). If none is free it gets `Overloaded`.
-5. Peers swap a 32-byte `Endpoint` over the caller's own channel
-   (`src/lib.rs:329-363`) and connect.
-6. The receiver binds a window over its region and sends the address and key
-   to the sender. The sender fills its region and writes.
-7. The caller stops the QP and waits for `poll_stopped` before it reads
-   received bytes. Dropping the handle returns the slot. The native side stops
-   the QP if needed and rebuilds the slot with a fresh QP.
+`Client::activate` returns selected rails asynchronously. Link operations are
+`open`, `accept`, `connect`, `grant`, `write`, and `release`. Local epochs
+prevent commands from acting on replacement links. `break_link` cannot be
+lost to a full command queue; it also has a shared break list. Link snapshots
+use a try-read lock, and a contended read reports `Idle`.
 
-Discovery only accepts devices that support type 2B memory windows, active
-ports, and GID index 0 (`native/verbs.c:53-88`).
+The owner polls commands, shared breaks, every link's completions and timers,
+pending destruction, and shutdown, then publishes snapshots. It needs regular
+polls even when no worker command is pending.
+
+## Page buffer pool
+
+Each selected device owns one page region, split into fixed-size receive
+buffers. Registration grants `LOCAL_WRITE | MW_BIND`, not broad remote-write
+access. A bound memory window grants remote write only to its selected range.
+Control regions use `LOCAL_WRITE` only.
+
+Each device also needs an implicit ODP region for local write sources. It is
+not a remote-write region and cannot be used for receives or memory windows.
+Activation fails when ODP is unsupported; it does not silently copy sources
+into the receive pool.
+
+`DirectBytes` is an unsafe trait: its slice must stay at the same address and
+length, with unchanged contents, for the entire shared owner's lifetime.
+The write captures that address and length once. The owner holds the source
+through completion or successful QP destruction, and leaks it if destruction
+cannot make DMA safe. Implementations include owned vectors, boxed slices,
+and static slices; arbitrary `AsRef<[u8]>` is not sufficient.
+
+The receive-buffer states are:
+
+| State | Owner | CPU access |
+|---|---|---|
+| `Free` | Pool | None |
+| `Binding` | Link posting `BIND_MW` | None |
+| `Exposed` | Link after posting `Grant` | None |
+| `Invalidating` | Link waiting for `LOCAL_INV` | None |
+| `Owned` | `RegisteredPage` | Immutable bytes |
+| `Quarantined` | Link awaiting QP destruction | None |
+| `Leaked` | Retained permanently | None |
+
+The normal receive path is:
+
+```text
+Free -> Binding -> Exposed -> Invalidating -> Owned -> Free
+```
+
+A released or abandoned page goes from `Invalidating` to `Free` without CPU
+access. An unexposed grant can be canceled after its bind completes. An
+exposed grant cannot be reclaimed merely by dropping its arrival operation;
+it needs an ordered receive and invalidate, or a link break.
+
+Only `RegisteredPage` exposes receive memory. Its drop can run on another
+thread and returns the buffer to the pool. Dropping a pool with held,
+quarantined, or leaked buffers keeps the region and charge alive rather than
+deregistering memory prematurely.
+
+## Links
+
+For a configured local grant limit `g`:
+
+```text
+recv_depth = 2 * g + 4
+send_depth = recv_depth + 2 * g + 4
+control_bytes = 64 * 2 * recv_depth
+```
+
+Each link owns its QP and CQ, its control region, and `g` memory windows.
+They are not preallocated as device-wide window or control pools. Receives
+are posted before connect. All send-queue work is signaled.
+
+On connect, the issued-grant cap becomes `min(local, peer)`. Incoming grants
+must fit the local advertised limit. A receiver also needs a free pool buffer;
+exhaustion returns `Overloaded`. Writes do not need local receive-pool space.
+
+Grant tags are nonzero 32-bit values and skip outstanding tags. Window rkeys
+advance their low-byte generation after a successful bind post. Generation
+values can wrap; they are not permanent identities. Racer's signed metadata
+also binds the link, tag, length, and transfer id.
+
+## Credits and queues
+
+Every `SEND` or `WRITE_WITH_IMM` consumes one peer receive credit. Data work
+(`Grant`, `Release`, and write) needs at least two credits, keeping one reserved
+for `Credit` or `Close`. Bind and invalidate need no receive credit.
+
+Each receive is reposted immediately and increases the credits owed to the
+peer. Control messages return owed credits. A standalone `Credit` is queued
+at half receive depth when no other control can return them, including when
+data is blocked on credits. `Credit`, `Close`, binds, and invalidates can pass
+blocked data in the outbox; data work keeps its order.
+
+A write or release whose grant has not arrived waits separately, with at most
+`2 * g` waiters. A release replaces a waiting write for that tag and cancels
+the write. A write larger than its grant fails without consuming the grant.
+Unposted work can expire and return its unused grant. An exposed receive
+grant that expires breaks the link instead.
+
+Credit overruns, excess or duplicate grants, invalid releases, unknown or
+duplicate immediates, bad lengths, malformed controls, and failed posts or
+completions break the link. QPs use `rnr_retry = 0`: a missing posted receive
+fails instead of hiding a credit bug behind retries.
+
+## Control messages
+
+Control messages are exactly 64 bytes in network byte order:
+
+| Offset | Bytes | Field |
+|---|---|---|
+| 0 | 1 | Version, currently 1 |
+| 1 | 1 | Kind: `Grant` = 1, `Release` = 2, `Credit` = 3, `Close` = 4 |
+| 2 | 2 | Reserved, zero |
+| 4 | 4 | Credits returned |
+| 8 | 8 | Signed-handshake link id, not the local epoch |
+| 16 | 4 | Tag |
+| 20 | 4 | Rkey, `Grant` only |
+| 24 | 8 | Remote address, `Grant` only |
+| 32 | 4 | Granted length, `Grant` only |
+| 36 | 4 | Reserved, zero |
+| 40 | 16 | Transfer id, `Grant` and `Release` |
+| 56 | 8 | Reserved, zero |
+
+The codec rejects wrong lengths, versions, kinds, reserved bytes, link ids,
+and fields that do not belong to a kind. Grants need a nonzero tag and a
+length within the pool's buffer size. Releases need a nonzero tag. Link state
+checks catch unknown and duplicate tags and incorrect transfer ids.
+
+The immediate contains only the grant tag. The signed HTTP response, outside
+this crate, remains the authoritative page outcome. There is no in-band
+`Complete`, `Done`, or receiver-driven `Abort` protocol.
+
+## Native ABI and completion checks
+
+The adapter ABI is version 4. Rust requires that version and the current
+symbols; there is no legacy ABI loader. The completion record is 32 bytes:
+
+```c
+struct rdma_verbs_wc {
+    uint64_t id;
+    uint32_t status, opcode;
+    uint32_t byte_len, imm;
+    uint32_t flags, vendor_err;
+};
+```
+
+On failure, `opcode` is `UINT32_MAX` and `byte_len`, `imm`, and `flags` are
+zero. The id, status, and vendor error remain available. Successful immediate
+values are converted between network and host byte order by the adapter.
+Static C assertions and Rust layout tests pin the record and opcode values.
+
+The adapter posts bind with `IBV_SEND_SIGNALED | IBV_SEND_FENCE` and local
+invalidate with `IBV_SEND_SIGNALED`. The normal ownership fence is the ordered
+receive followed by successful window invalidation, not a claim that
+`LOCAL_INV` carries the send-fence flag. The native fault test checks both
+sets of flags; it does not model ODP page faults or hardware ordering.
+
+Ranged operations validate nonempty ranges, arithmetic overflow, device and
+region ownership, access kind, queue capacity, and duplicate work ids before
+posting. Implicit regions are accepted only as write sources. Memory windows
+retain their bound region, and advance their rkey only after a successful
+post. The native adapter also checks ranges.
+
+The QP tracks send and receive work separately. Completions must match an
+outstanding id, opcode, and expected immediate and length rules. Racer uses
+the high byte of a work id for its kind and the low bits for its index.
+Unknown ids, failed statuses, or mismatches record the first failure and
+stop the QP; they never produce a successful page.
 
 ## Memory safety rules
 
-**Only a stopped QP is a fence.** Invalidating a window or timing out does not
-stop writes the NIC has already accepted (`src/lib.rs:31-38`,
-`src/lib.rs:654-666`). Stopping moves the QP to the error state and destroys
-it (`native/verbs.c:173-184`). Only after that succeeds does the crate treat
-the buffer as quiet. A bound region stays busy until then
-(`src/ffi.rs:722-760`, `src/ffi.rs:846-865`).
+Normal page transfers do not destroy QPs. Error, timeout, idle close, and
+shutdown do. A broken link quarantines buffers and retains direct sources
+until QP destruction succeeds. Destruction is retried while the owner runs.
+If the owner must drop resources that cannot be made safe, it leaks those
+resources and their admission guard. A leak prevents a later reopen.
 
-**The I/O thread only sees staging copies.** Writes from the I/O thread go to
-staging bytes in the mailbox. The native thread copies them into registered
-memory when it runs the write (`src/lib.rs:1568-1573`). Received bytes are
-copied out only after the QP stops (`src/lib.rs:1459-1468`), and
-`Region::poll_copy_to` fails before that (`src/lib.rs:450-458`). So a late
-remote write can never race with a CPU read.
+Ready links send `Close` during shutdown; other links break immediately.
+Draining waits for links, pending destruction, and held pages, then withdraws
+the pools. `WithNative` drives the inner service's drain or fence alongside
+the owner, holding the result until both finish. Native teardown ignores
+request deadlines because abandoning it could permit DMA into freed memory.
 
-**QPs are never reused.** After a lease ends, the native side clears the full
-buffer, zeroes the staging copy, and builds a new QP (`src/ffi.rs:423-432`,
-`src/lib.rs:1490-1531`). A new lease never sees old data or a QP with stale
-state. The buffer stays registered for the life of the pool, so there is no
-registration cost per lease.
+## Simulation and tests
 
-**Leak on failure.** If freeing a NIC object fails, the object is leaked on
-purpose along with everything it depends on (`src/ffi.rs:1-5`). This covers
-devices, regions, windows, QPs, and probe windows (`src/ffi.rs:261-272`,
-`447-456`, `470-479`, `581-587`, `651-663`, `868-886`). Freeing memory the NIC
-may still write is worse than leaking it.
+The simulator models posted receive queues, send and write-with-immediate
+delivery, range and rkey checks, revocation, queue errors, flushes, and resource
+cleanup. Write data can land before an RNR failure, keeping failure tests
+conservative about DMA. Work normally completes in post order; injected
+faults can reject calls, delay or fail completions, drop or reorder delivery,
+duplicate immediates, or alter reported lengths.
 
-**Leaks stay counted.** Each slot holds the caller's admission guard. When a
-resource leaks, its guard leaks too (`src/lib.rs:132-135`), so the leak keeps
-counting against the caller's limits. The crate wraps each guard in its own
-`Arc` (`src/lib.rs:1765-1794`). Its strong count then shows leaks no matter how
-many clones the caller holds. A leaked slot is never refilled
-(`src/lib.rs:1493-1497`).
+An implicit simulated region reads the direct source address, so tests check
+source ownership through completion, cancellation, and failed destruction.
+They also check unavailable ODP, both directions on one link, credit progress,
+grant limits, stale epochs, abandoned operations, cross-thread page return,
+shutdown, reopen, and leak accounting. The native fault adapter covers bind
+and invalidate flags and discovery cleanup failures.
 
-**Completions are checked.** Each QP allows at most 32 posted requests
-(`src/ffi.rs:682-708`). Any failed status, unknown request, or wrong opcode
-stops the QP and returns an error (`src/ffi.rs:799-840`). Starting PSNs are
-random (`src/ffi.rs:589-607`).
-
-**Least access.** QPs allow only remote writes (`native/verbs.c:119-172`).
-Windows grant remote write over exactly the bound length
-(`native/verbs.c:221-233`). Invalidation uses a fenced send
-(`native/verbs.c:234-240`).
-
-## Shutdown and reopen
-
-`IoPort::close` cancels all slots and returns at once
-(`src/lib.rs:1115-1124`). The native service then stops each QP. It marks the
-pool drained only when every resource is freed, nothing is quarantined, and
-the crate holds the only reference to every guard. `IoPort::reopen` returns
-`Overloaded` until then and bumps a generation so old device handles go stale
-(`src/lib.rs:1040-1069`).
-
-`WithNative` (`src/lib.rs:258-269`, `src/lib.rs:1663-1744`) joins the native
-service with a `uring-runtime` service. On drain it stops the NIC first and
-ignores scope deadlines (`src/lib.rs:1746-1763`), because the NIC must stop
-before any memory is freed.
-
-## Native adapter
-
-Rust does not link libibverbs. It loads `librdma_verbs.so.1` with `dlopen` and
-calls a few functions that take small, fixed structs (`native/verbs.c:1-10`).
-The libibverbs structs and inline helpers stay in C, built against the
-installed headers. This avoids copying large, version-specific structs into
-Rust.
-
-Because the link is dynamic, the compiler cannot check the ABI. Three checks
-stand in for it:
-
-- The adapter reports ABI version 1 and Rust refuses any other
-  (`native/verbs.c:51-52`, `src/ffi.rs:174-235`).
-- `_Static_assert`s in C (`native/verbs.c:37-44`) and a Rust test check the
-  same struct sizes, offsets, and opcode values.
-- CI builds the adapter and loads every symbol.
-
-Without the `native` feature, loading returns `Unavailable`
-(`src/ffi.rs:160-165`), so the crate builds on hosts without libibverbs.
-
-Discovery returns `INT_MIN` if closing a temporary context fails. This is
-distinct from a negative errno or port count. It stops on the first failed
-close, frees the device list, and leaves at most one context leaked. Rust
-quarantines and retains the discovery admission owner and adapter reference.
-Reopen stays blocked even when no ports were returned.
-
-Open returns `NULL` for a clean failure and `(void *)UINTPTR_MAX` if PD
-allocation fails and the context cannot close. The latter is not a handle.
-Rust charges an owner before each open, retains it and the adapter on this
-result, and stops opening ports. Previously opened devices close normally.
-
-## Simulation
-
-`src/simulation.rs` implements the same C functions as the adapter. The real
-`src/ffi.rs` wrappers run unchanged on top of it. It is deterministic, has one
-fabric per test thread, and can inject faults on any call. The `testing`
-module exposes slot state and can hold mailbox locks to force contention.
-
-## Testing
-
-`src/ffi.rs` tests inject failures into each free path and check that the
-object and its guard stay leaked. `tests/public_api.rs` covers the public
-API: port selection, reopen, guards across failed fences, copies only after
-stop, cleared buffers on reuse, contention, and empty plans.
-
-The `racer-verbs` CI job runs four feature sets: none, `simulation`,
-`native`, and both. Native runs install `libibverbs-dev`, build the adapter
-with `images/racer-dataplane/build-native.sh`, and load it. Each set runs
-fmt, check, clippy, and tests. Hosted runners have no RDMA hardware, so CI
-does not test real DMA or fencing. Tests that need a device stay ignored.
-
-Native CI also builds `native/discovery_faults.c`, which includes the production
-C adapter with controlled libibverbs calls. `src/discovery_fault_tests.rs`
-checks both internal discovery closes, failed-open cleanup, quarantine,
-library retention, and blocked reopen. The Rust simulator's `Close` fault only
-covers device handles returned after discovery, not these temporary contexts.
+CI builds the crate with no features, simulation, native, and both features.
+Simulation does not model provider ODP page faults or prove real-hardware
+ordering and throughput. Native transfer tests on target hardware remain
+necessary in addition to these gates.

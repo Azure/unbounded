@@ -20,9 +20,169 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
+/// Admission charge carried by every ciphertext allocation.
+pub(crate) type CiphertextCharge = flow_control::Charge<AdmissionPolicy>;
+
+/// Default direct-I/O alignment for ciphertext buffers when no store device
+/// reports its own: 4 KiB memory, offset, and length units.
+pub(crate) fn default_disk_alignment() -> page_alloc::Alignment {
+    page_alloc::Alignment::new(4096, 4096, 4096).expect("valid default alignment")
+}
+
+/// Idle full-page buffers each worker's aligned ciphertext pool may keep.
+///
+/// Unlike the flow-control recycler, whose idle `Vec`s keep their admission
+/// charge until reclaimed, aligned buffers release their Ciphertext charge as
+/// soon as they become idle (see [`PoolCharge`]): a retained charge would pin
+/// admission that unrelated reservations, which cannot reach this pool, then
+/// fail on. Idle aligned storage is therefore unaccounted, so the budget is
+/// kept to a few pages per worker, and every path that reclaims the recycler
+/// ([`BufferPool::reclaim_idle_buffers`]) also empties this pool.
+pub(crate) const ALIGNED_POOL_IDLE_PAGES: usize = 4;
+
+/// Accounting for aligned ciphertext storage.
+///
+/// Live buffers hold their Ciphertext reservation. When a page or unfrozen
+/// buffer is dropped, the reservation is released before the storage returns
+/// to its worker pool, so idle storage never holds admission.
+pub(crate) enum PoolCharge {
+    Held(CiphertextCharge),
+    /// Idle storage. `wipe` preserves the released charge's erase policy.
+    Released {
+        wipe: bool,
+    },
+}
+impl PoolCharge {
+    /// The live reservation, absent only while storage is going idle.
+    pub(crate) fn held(&self) -> Option<&CiphertextCharge> {
+        match self {
+            Self::Held(charge) => Some(charge),
+            Self::Released { .. } => None,
+        }
+    }
+    fn released(&self) -> Self {
+        Self::Released {
+            wipe: page_alloc::Charge::requires_wipe(self),
+        }
+    }
+}
+impl page_alloc::Charge for PoolCharge {
+    fn covers(&self, bytes: usize) -> bool {
+        match self {
+            Self::Held(charge) => charge.covers(bytes),
+            // Only applied to storage already accounted by its allocation.
+            Self::Released { .. } => true,
+        }
+    }
+    fn requires_wipe(&self) -> bool {
+        match self {
+            Self::Held(charge) => charge.requires_wipe(),
+            Self::Released { wipe } => *wipe,
+        }
+    }
+}
+
+/// Writable aligned ciphertext storage from one worker's pool. Dropping it
+/// unfrozen releases its reservation and returns the storage to that pool.
+pub struct CiphertextBuffer(Option<page_alloc::DetachedBuffer<PoolCharge>>);
+impl CiphertextBuffer {
+    fn inner(&self) -> &page_alloc::DetachedBuffer<PoolCharge> {
+        self.0.as_ref().expect("live ciphertext buffer")
+    }
+    /// Requested length in bytes.
+    pub fn len(&self) -> usize {
+        self.inner().len()
+    }
+    /// Always false: pools reject zero-length buffers.
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+    /// Allocation capacity the reservation covers.
+    pub fn capacity(&self) -> usize {
+        self.inner().capacity()
+    }
+    /// The Ciphertext reservation accounting for this storage.
+    pub(crate) fn charge(&self) -> &CiphertextCharge {
+        self.inner().charge().held().expect("held while live")
+    }
+    /// Bytes, which may hold stale ciphertext until fully written.
+    pub fn as_slice(&self) -> &[u8] {
+        self.inner().as_slice()
+    }
+    /// Exclusively borrow exactly the requested bytes.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.0
+            .as_mut()
+            .expect("live ciphertext buffer")
+            .as_mut_slice()
+    }
+    /// Zero the pad and freeze without copying.
+    fn freeze(mut self) -> AlignedBody {
+        AlignedBody(self.0.take().expect("live ciphertext buffer").freeze())
+    }
+}
+impl Drop for CiphertextBuffer {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.0.take() {
+            // Freezing only zero-fills the pad; the body's drop releases the
+            // reservation before the storage goes idle.
+            drop(AlignedBody(buffer.freeze()));
+        }
+    }
+}
+impl std::fmt::Debug for CiphertextBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CiphertextBuffer")
+            .field("length", &self.0.as_ref().map(|b| b.len()))
+            .finish_non_exhaustive()
+    }
+}
+// SAFETY: the detached allocation is exclusively owned, stable, and live
+// until Drop, and is only exposed through these borrows.
+unsafe impl uring_runtime::reactor::IoBuffer for CiphertextBuffer {
+    type Error = Error;
+    fn bytes(&self) -> Result<&[u8]> {
+        Ok(self.as_slice())
+    }
+    fn bytes_mut(&mut self) -> Result<&mut [u8]> {
+        Ok(self.as_mut_slice())
+    }
+}
+
+/// Frozen aligned ciphertext that releases its reservation before the storage
+/// returns to its worker pool.
+pub(crate) struct AlignedBody(page_alloc::FrozenBuffer<PoolCharge>);
+impl AlignedBody {
+    pub(crate) fn charge(&self) -> &CiphertextCharge {
+        self.0.charge().held().expect("held while live")
+    }
+    fn rebind(&mut self, charge: CiphertextCharge) -> Result<()> {
+        self.0.rebind(PoolCharge::Held(charge)).map_err(Into::into)
+    }
+}
+impl std::ops::Deref for AlignedBody {
+    type Target = page_alloc::FrozenBuffer<PoolCharge>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl Drop for AlignedBody {
+    fn drop(&mut self) {
+        let released = self.0.charge().released();
+        // Released covers any capacity, so rebinding cannot fail.
+        let _ = self.0.rebind(released);
+    }
+}
+
+/// Per-worker ciphertext and plaintext allocation front end.
+///
+/// Cloned handles share one [`page_alloc::WorkerBufferPool`], so aligned
+/// ciphertext buffers return to the worker that created them even when they are
+/// filled or dropped on a shared crypto thread.
 #[derive(Clone)]
 pub struct BufferPool {
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+    aligned: page_alloc::WorkerBufferPool<PoolCharge>,
 }
 /// Mutable staging buffer, not proof of authentication and not client-deliverable.
 /// Fixed-size owned backing stays at the same address when this owner moves.
@@ -93,6 +253,28 @@ pub(crate) enum CiphertextStorage {
         buffer: page_alloc::FrozenBuffer<flow_control::Charge<AdmissionPolicy>>,
         range: std::ops::Range<usize>,
     },
+    /// Ciphertext produced directly into direct-I/O aligned storage.
+    ///
+    /// Invariant, established by construction: the bytes start at offset 0 of
+    /// an allocation aligned to its pool's memory unit, and
+    /// `buffer.padded_slice()` holds the ciphertext followed only by zeros up
+    /// to a length-unit boundary. The store may write `padded_slice()`
+    /// directly; see [`CiphertextPage::disk_body`].
+    Aligned {
+        buffer: AlignedBody,
+        length: usize,
+    },
+    /// A received RDMA page still in registered pool memory. Request-scoped
+    /// only: retaining paths copy it out (see `retainable`) so pool buffers
+    /// are never pinned by caches or write queues. Dropping it on any thread
+    /// returns the buffer to the pool.
+    Registered {
+        page: rdma_verbs::RegisteredPage,
+        reservation: flow_control::Charge<AdmissionPolicy>,
+        /// The first copy-out, shared by every later retaining path (memory
+        /// cache, disk write queue) so a page is copied out at most once.
+        retained: std::sync::OnceLock<CiphertextPage>,
+    },
 }
 
 impl From<flow_control::ChargedBytes<AdmissionPolicy>> for CiphertextStorage {
@@ -106,12 +288,16 @@ impl CiphertextBytes {
         match &self.storage {
             CiphertextStorage::Owned(storage) => &storage.reservation,
             CiphertextStorage::Slab { buffer, .. } => buffer.charge(),
+            CiphertextStorage::Aligned { buffer, .. } => buffer.charge(),
+            CiphertextStorage::Registered { reservation, .. } => reservation,
         }
     }
     pub(crate) fn capacity(&self) -> usize {
         match &self.storage {
             CiphertextStorage::Owned(storage) => storage.bytes.capacity(),
             CiphertextStorage::Slab { buffer, .. } => buffer.capacity(),
+            CiphertextStorage::Aligned { buffer, .. } => buffer.capacity(),
+            CiphertextStorage::Registered { page, .. } => page.len(),
         }
     }
 }
@@ -124,7 +310,10 @@ impl std::ops::Deref for CiphertextBytes {
     fn deref(&self) -> &Self::Target {
         match &self.storage {
             CiphertextStorage::Owned(storage) => storage,
-            CiphertextStorage::Slab { .. } => panic!("slab ciphertext is immutable"),
+            CiphertextStorage::Slab { .. } | CiphertextStorage::Aligned { .. } => {
+                panic!("slab ciphertext is immutable")
+            }
+            CiphertextStorage::Registered { .. } => panic!("registered ciphertext is immutable"),
         }
     }
 }
@@ -135,13 +324,108 @@ impl std::ops::DerefMut for CiphertextBytes {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match &mut self.storage {
             CiphertextStorage::Owned(storage) => storage,
-            CiphertextStorage::Slab { .. } => panic!("slab ciphertext is immutable"),
+            CiphertextStorage::Slab { .. } | CiphertextStorage::Aligned { .. } => {
+                panic!("slab ciphertext is immutable")
+            }
+            CiphertextStorage::Registered { .. } => panic!("registered ciphertext is immutable"),
         }
     }
 }
 impl BufferPool {
+    /// Use the default 4 KiB disk alignment for aligned ciphertext.
     pub fn new(admission: Rc<flow_control::Quotas<AdmissionPolicy>>) -> Self {
-        Self { admission }
+        Self::with_alignment(admission, default_disk_alignment())
+    }
+    /// Create one worker's pools; `alignment` should match its store devices.
+    pub fn with_alignment(
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+        alignment: page_alloc::Alignment,
+    ) -> Self {
+        let budget = aligned_capacity(alignment, PAGE_BYTES as usize + 16)
+            .map_or(0, |page| page.saturating_mul(ALIGNED_POOL_IDLE_PAGES));
+        Self {
+            admission,
+            aligned: page_alloc::WorkerBufferPool::with_budget(alignment, budget),
+        }
+    }
+    /// Direct-I/O alignment of aligned ciphertext buffers from this worker.
+    pub(crate) fn alignment(&self) -> page_alloc::Alignment {
+        self.aligned.alignment()
+    }
+    /// Idle counters of this worker's aligned ciphertext pool.
+    #[cfg(test)]
+    pub(crate) fn aligned_stats(&self) -> page_alloc::SharedPoolStats {
+        self.aligned.stats()
+    }
+    /// Release idle recycled storage: the flow-control recycler and this
+    /// worker's aligned pool, dropping the admission charges both retain.
+    pub(crate) fn reclaim_idle_buffers(&self) {
+        self.admission.reclaim_buffers();
+        self.aligned.clear();
+    }
+    /// Admission a pooled aligned buffer of `length` bytes must be charged for.
+    pub(crate) fn aligned_capacity(&self, length: usize) -> Result<usize> {
+        aligned_capacity(self.alignment(), length)
+    }
+    /// Check out aligned ciphertext storage for exactly `length` bytes.
+    ///
+    /// The reservation must be a Ciphertext charge from this worker's admission
+    /// covering [`Self::aligned_capacity`]. Recycled storage is not re-zeroed;
+    /// the producer must overwrite all `length` bytes before freezing.
+    pub(crate) fn aligned_ciphertext(
+        &self,
+        reservation: CiphertextCharge,
+        length: usize,
+    ) -> Result<CiphertextBuffer> {
+        if length == 0 || length > PAGE_BYTES as usize + 16 || !self.admission.owns(&reservation) {
+            return Err(Error::InvalidConfiguration);
+        }
+        reservation.validate(ResourceClass::Ciphertext, self.aligned_capacity(length)?)?;
+        self.aligned
+            .take(length, PoolCharge::Held(reservation))
+            .map(|buffer| CiphertextBuffer(Some(buffer)))
+            .map_err(Into::into)
+    }
+    /// Check out aligned storage for AEAD output, replacing an exact-length
+    /// reservation with one covering the pooled capacity when needed.
+    ///
+    /// `Ok(Err(reservation))` hands the original reservation back when the
+    /// larger charge is refused, so the caller can fall back to unaligned
+    /// output. `Err` means allocation failed after the charge was consumed.
+    pub(crate) fn encryption_output(
+        &self,
+        reservation: CiphertextCharge,
+        length: usize,
+    ) -> Result<std::result::Result<CiphertextBuffer, CiphertextCharge>> {
+        let Ok(capacity) = self.aligned_capacity(length) else {
+            return Ok(Err(reservation));
+        };
+        if !self.admission.owns(&reservation)
+            || reservation
+                .validate(ResourceClass::Ciphertext, length)
+                .is_err()
+        {
+            return Ok(Err(reservation));
+        }
+        if reservation.amount() >= capacity {
+            return self.aligned_ciphertext(reservation, length).map(Ok);
+        }
+        let key = reservation.key().cloned();
+        let mut larger = self
+            .admission
+            .reserve(key.as_ref(), ResourceClass::Ciphertext, capacity);
+        if larger.is_err() {
+            // Idle pooled buffers may be what pins this worker's admission.
+            self.aligned.clear();
+            larger = self
+                .admission
+                .reserve(key.as_ref(), ResourceClass::Ciphertext, capacity);
+        }
+        let Ok(larger) = larger else {
+            return Ok(Err(reservation));
+        };
+        drop(reservation);
+        self.aligned_ciphertext(larger, length).map(Ok)
     }
     pub fn plaintext(
         &self,
@@ -188,6 +472,128 @@ impl BufferPool {
             }),
         })
     }
+    /// Wrap a received registered page without copying. The reservation
+    /// covers exactly the received length, the page's visible capacity.
+    pub(crate) fn registered_ciphertext(
+        &self,
+        reservation: flow_control::Charge<AdmissionPolicy>,
+        envelope: PageEnvelope,
+        page: rdma_verbs::RegisteredPage,
+    ) -> Result<CiphertextPage> {
+        envelope.validate()?;
+        if page.len() != envelope.ciphertext_length as usize {
+            return Err(Error::CorruptRecord);
+        }
+        self.validate_reservation(
+            &reservation,
+            ResourceClass::Ciphertext,
+            page.len(),
+            Some(&envelope.page.version.object.cache),
+        )?;
+        Ok(CiphertextPage {
+            provenance: None,
+            inner: Arc::new(CiphertextBytes {
+                checksum: std::sync::OnceLock::new(),
+                envelope,
+                storage: CiphertextStorage::Registered {
+                    page,
+                    reservation,
+                    retained: std::sync::OnceLock::new(),
+                },
+            }),
+        })
+    }
+    /// Copy registered ciphertext into owned bytes under a fresh charge before
+    /// retaining it; other storage is returned unchanged. Reserve before any
+    /// cache borrow because admission may reclaim.
+    ///
+    /// Safety net: fills detach registered pages once with
+    /// [`Self::detach_registered`] before publishing, so this normally sees
+    /// already-detached pages.
+    pub(crate) fn retainable(&self, ciphertext: CiphertextPage) -> Result<CiphertextPage> {
+        if !ciphertext.is_registered() {
+            return Ok(ciphertext);
+        }
+        if let Some(copy) = ciphertext.retained_copy()
+            && self.admission.owns(copy.inner.reservation())
+        {
+            return Ok(copy);
+        }
+        // Cover the pooled size class so the copy lands in aligned storage.
+        let length = ciphertext.bytes().len();
+        let reservation = self.admission.reserve(
+            Some(&ciphertext.envelope().page.version.object.cache),
+            ResourceClass::Ciphertext,
+            self.aligned_capacity(length).unwrap_or(length),
+        )?;
+        self.rehome_aligned(ciphertext, reservation)
+    }
+    /// Copy a registered RDMA page once into this worker's pooled aligned
+    /// storage and drop the registered owner, so the memory cache and the
+    /// store can share one disk-aligned page.
+    ///
+    /// Callers should check [`CiphertextPage::is_registered`] before reserving.
+    /// `reservation` must be a Ciphertext charge for the page's cache covering
+    /// [`Self::aligned_capacity`] of the ciphertext length; it is consumed in
+    /// every outcome. Other pages are returned unchanged and the reservation is
+    /// released. The registered buffer returns to its pool as soon as the last
+    /// clone of `page` is dropped, which is here when the caller passes the only
+    /// handle.
+    pub(crate) fn detach_registered(
+        &self,
+        page: CiphertextPage,
+        reservation: CiphertextCharge,
+    ) -> Result<CiphertextPage> {
+        if !page.is_registered() {
+            return Ok(page);
+        }
+        // An earlier retaining path already copied it out under this
+        // admission: share that copy and release `reservation`.
+        if let Some(copy) = page.retained_copy()
+            && self.admission.owns(copy.inner.reservation())
+            && copy.inner.reservation().key() == Some(&page.envelope().page.version.object.cache)
+        {
+            return Ok(copy);
+        }
+        self.copy_aligned(&page, reservation)
+    }
+    /// Rehome `page` under `reservation`, copying into this worker's pooled
+    /// aligned storage when the bytes cannot move in place and the
+    /// reservation covers the pooled capacity. Otherwise behaves like
+    /// [`CiphertextPage::rehome`].
+    pub(crate) fn rehome_aligned(
+        &self,
+        mut page: CiphertextPage,
+        reservation: CiphertextCharge,
+    ) -> Result<CiphertextPage> {
+        let length = page.bytes().len();
+        let exclusive = !page.is_registered() && Arc::get_mut(&mut page.inner).is_some();
+        if !exclusive
+            && reservation.key() == Some(&page.envelope().page.version.object.cache)
+            && self
+                .aligned_capacity(length)
+                .is_ok_and(|capacity| reservation.amount() >= capacity)
+        {
+            return self.copy_aligned(&page, reservation);
+        }
+        page.rehome(reservation)
+    }
+    /// Copy `page`'s bytes into a pooled aligned page, preserving its envelope,
+    /// known checksum, and provenance.
+    fn copy_aligned(
+        &self,
+        page: &CiphertextPage,
+        reservation: CiphertextCharge,
+    ) -> Result<CiphertextPage> {
+        let length = page.bytes().len();
+        let mut buffer = self.aligned_ciphertext(reservation, length)?;
+        buffer.as_mut_slice().copy_from_slice(page.bytes());
+        let mut copy =
+            self.aligned_ciphertext_page(buffer, page.envelope().clone(), page.cached_checksum())?;
+        copy.provenance = page.provenance;
+        page.record_copy_out(&copy);
+        Ok(copy)
+    }
     pub(crate) fn slab_ciphertext(
         &self,
         buffer: page_alloc::AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
@@ -218,11 +624,38 @@ impl BufferPool {
             }),
         })
     }
+    /// Freeze AEAD or receive output produced in this worker's aligned pool
+    /// into a disk-aligned page without copying.
+    ///
+    /// Mirrors [`Self::ciphertext`]: the length must equal the envelope's
+    /// ciphertext length, and the buffer's charge must be a Ciphertext
+    /// reservation from this admission for the page's cache covering the full
+    /// capacity. Freezing zero-fills the pad. A known `checksum` is cached
+    /// eagerly; it must be the CRC-64 of the ciphertext bytes.
+    pub(crate) fn aligned_ciphertext_page(
+        &self,
+        buffer: CiphertextBuffer,
+        envelope: PageEnvelope,
+        checksum: Option<u64>,
+    ) -> Result<CiphertextPage> {
+        envelope.validate()?;
+        let length = buffer.len();
+        if length != envelope.ciphertext_length as usize {
+            return Err(Error::CorruptRecord);
+        }
+        self.validate_reservation(
+            buffer.charge(),
+            ResourceClass::Ciphertext,
+            buffer.capacity(),
+            Some(&envelope.page.version.object.cache),
+        )?;
+        Ok(CiphertextPage::from_aligned(buffer, envelope, checksum))
+    }
     fn entry_limit(&self) -> usize {
         self.admission.policy().limits().metadata_entries.get()
     }
     fn reclaim_buffers(&self) {
-        self.admission.reclaim_buffers();
+        self.reclaim_idle_buffers();
     }
     fn validate_reservation(
         &self,
@@ -262,6 +695,36 @@ impl BufferPool {
         )
     }
 }
+#[cfg(test)]
+thread_local! {
+    static REGISTERED_COPY_OUTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+/// Count one copy of registered RDMA ciphertext out of its pool buffer.
+#[cfg(test)]
+fn note_registered_copy_out() {
+    REGISTERED_COPY_OUTS.with(|count| count.set(count.get().wrapping_add(1)));
+}
+/// Registered RDMA pages copied out of pool buffers on this thread.
+///
+/// Thread-local because copies run on the owning worker's I/O thread. Test
+/// instrumentation only.
+#[cfg(test)]
+pub(crate) fn registered_copy_outs() -> u64 {
+    REGISTERED_COPY_OUTS.with(std::cell::Cell::get)
+}
+/// Bytes from the start of `length` through the next length-unit boundary.
+fn padded_length(alignment: page_alloc::Alignment, length: usize) -> Result<usize> {
+    let unit = alignment.length();
+    length
+        .checked_next_multiple_of(unit)
+        .filter(|padded| length != 0 && *padded <= page_alloc::Alignment::MAX_TRANSFER_LENGTH)
+        .ok_or(Error::InvalidConfiguration)
+}
+/// Capacity of the pooled size class holding `length` padded bytes.
+fn aligned_capacity(alignment: page_alloc::Alignment, length: usize) -> Result<usize> {
+    page_alloc::buffer_capacity(padded_length(alignment, length)?)
+        .ok_or(Error::InvalidConfiguration)
+}
 impl VerifiedPage {
     pub fn page(&self) -> &PageId {
         &self.inner.page
@@ -270,6 +733,7 @@ impl VerifiedPage {
         &self.inner.bytes
     }
 }
+
 impl CiphertextPage {
     /// Rehome a completed receive before retaining it in another worker's cache.
     /// Admit the new charge first. Shared transport owners keep their original
@@ -282,23 +746,97 @@ impl CiphertextPage {
         if reservation.key() != Some(&self.envelope().page.version.object.cache) {
             return Err(Error::InvalidConfiguration);
         }
-        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+        // Registered pages always copy out: retaining them would pin pool buffers.
+        if !self.is_registered()
+            && let Some(inner) = Arc::get_mut(&mut self.inner)
+        {
             match &mut inner.storage {
                 CiphertextStorage::Owned(storage) => storage.reservation = reservation,
                 CiphertextStorage::Slab { buffer, .. } => buffer.rebind(reservation)?,
+                CiphertextStorage::Aligned { buffer, .. } => buffer.rebind(reservation)?,
+                CiphertextStorage::Registered { .. } => unreachable!(),
             }
             return Ok(self);
         }
-        let mut bytes = reservation.buffer(self.bytes().len())?;
-        bytes.copy_from_slice(self.bytes());
-        Ok(Self {
+        let length = self.bytes().len();
+        let alignment = default_disk_alignment();
+        // Prefer a zero-padded aligned copy the store can write without
+        // another copy; fall back to a Vec when the charge only covers the
+        // exact length.
+        let copy = if let Ok(padded) = padded_length(alignment, length)
+            && reservation.amount() >= padded
+        {
+            let mut buffer = alignment.allocate(padded, PoolCharge::Held(reservation))?;
+            // Fresh allocations are zeroed, so the pad past `length` stays zero.
+            buffer.as_mut_slice()[..length].copy_from_slice(self.bytes());
+            Self {
+                inner: Arc::new(CiphertextBytes {
+                    checksum: self.inner.checksum.clone(),
+                    envelope: self.envelope().clone(),
+                    storage: CiphertextStorage::Aligned {
+                        buffer: AlignedBody(buffer.freeze()?),
+                        length,
+                    },
+                }),
+                provenance: self.provenance,
+            }
+        } else {
+            let mut bytes = reservation.buffer(length)?;
+            bytes.copy_from_slice(self.bytes());
+            Self {
+                inner: Arc::new(CiphertextBytes {
+                    checksum: self.inner.checksum.clone(),
+                    envelope: self.envelope().clone(),
+                    storage: flow_control::ChargedBytes { bytes, reservation }.into(),
+                }),
+                provenance: self.provenance,
+            }
+        };
+        self.record_copy_out(&copy);
+        Ok(copy)
+    }
+    /// Count a copy of registered ciphertext and remember the first one so
+    /// the next retaining path for the same admission shares it. Other
+    /// storage is not a registered copy-out and is ignored.
+    pub(crate) fn record_copy_out(&self, copy: &Self) {
+        if let CiphertextStorage::Registered { retained, .. } = &self.inner.storage {
+            #[cfg(test)]
+            note_registered_copy_out();
+            let _ = retained.set(copy.clone());
+        }
+    }
+    /// The owned copy an earlier retaining path made of this registered page.
+    pub(crate) fn retained_copy(&self) -> Option<Self> {
+        match &self.inner.storage {
+            CiphertextStorage::Registered { retained, .. } => {
+                retained.get().cloned().map(|mut copy| {
+                    copy.provenance = self.provenance;
+                    copy
+                })
+            }
+            _ => None,
+        }
+    }
+    /// Freeze aligned output into a page. Callers have validated the length
+    /// against `envelope` and the buffer's Ciphertext charge; a `checksum`
+    /// must be the CRC-64 of the ciphertext.
+    pub(crate) fn from_aligned(
+        buffer: CiphertextBuffer,
+        envelope: PageEnvelope,
+        checksum: Option<u64>,
+    ) -> Self {
+        let length = buffer.len();
+        Self {
+            provenance: None,
             inner: Arc::new(CiphertextBytes {
-                checksum: self.inner.checksum.clone(),
-                envelope: self.envelope().clone(),
-                storage: flow_control::ChargedBytes { bytes, reservation }.into(),
+                checksum: checksum.map_or_else(std::sync::OnceLock::new, Into::into),
+                envelope,
+                storage: CiphertextStorage::Aligned {
+                    buffer: buffer.freeze(),
+                    length,
+                },
             }),
-            provenance: self.provenance,
-        })
+        }
     }
     pub fn checksum(&self) -> u64 {
         *self
@@ -311,7 +849,11 @@ impl CiphertextPage {
         self.inner.checksum.get().copied()
     }
     pub(crate) fn verify_checksum(&self) -> Result<()> {
-        let actual = racer_crypto::crc64(self.bytes());
+        self.verify_computed_checksum(racer_crypto::crc64(self.bytes()))
+    }
+    /// Verify a checksum the caller computed over exactly [`Self::bytes`],
+    /// with the same effect as [`Self::verify_checksum`].
+    pub(crate) fn verify_computed_checksum(&self, actual: u64) -> Result<()> {
         if self
             .inner
             .checksum
@@ -336,7 +878,35 @@ impl CiphertextPage {
         match &self.inner.storage {
             CiphertextStorage::Owned(storage) => &storage.bytes,
             CiphertextStorage::Slab { buffer, range } => &buffer.as_slice()[range.clone()],
+            CiphertextStorage::Aligned { buffer, length } => &buffer.as_slice()[..*length],
+            CiphertextStorage::Registered { page, .. } => page.bytes(),
         }
+    }
+    /// The zero-padded ciphertext body when it can be written to a device with
+    /// `alignment` without copying.
+    ///
+    /// Returns `Some` only for pages produced into aligned storage (AEAD output,
+    /// TCP receive, and aligned rehome copies) whose allocation address is a
+    /// multiple of `alignment.memory()` and whose padded length is a multiple
+    /// of `alignment.length()`. The slice starts with [`Self::bytes`] and is
+    /// followed only by zeros. Callers must copy when this returns `None`.
+    pub(crate) fn disk_body(&self, alignment: page_alloc::Alignment) -> Option<&[u8]> {
+        let CiphertextStorage::Aligned { buffer, .. } = &self.inner.storage else {
+            return None;
+        };
+        let padded = buffer.padded_slice();
+        ((padded.as_ptr() as usize).is_multiple_of(alignment.memory())
+            && padded.len().is_multiple_of(alignment.length()))
+        .then_some(padded)
+    }
+    /// Whether [`Self::disk_body`] is available for `alignment`.
+    #[cfg(test)]
+    pub(crate) fn is_disk_aligned(&self, alignment: page_alloc::Alignment) -> bool {
+        self.disk_body(alignment).is_some()
+    }
+    /// Whether the bytes still live in a registered RDMA pool buffer.
+    pub(crate) fn is_registered(&self) -> bool {
+        matches!(self.inner.storage, CiphertextStorage::Registered { .. })
     }
 }
 // SAFETY: shared ciphertext backing is immutable and retained by the owner.
@@ -521,7 +1091,7 @@ impl Entries {
 }
 /// Worker-local idle verified pages and original ciphertext; independent of disk clock.
 pub struct MemoryCache {
-    // BufferPool is only an admission handle; do not retain a second Rc layer.
+    // BufferPool holds only shared handles; do not retain a second Rc layer.
     pool: BufferPool,
     entries: RefCell<Entries>,
     ciphertext_entries: RefCell<BTreeMap<PageId, UnverifiedPage>>,
@@ -536,6 +1106,10 @@ pub(crate) struct PlaintextReclaim {
     through: u64,
 }
 impl MemoryCache {
+    /// This worker's allocation front end.
+    pub(crate) fn buffers(&self) -> &BufferPool {
+        &self.pool
+    }
     pub(crate) fn plaintext_reclaim(&self) -> PlaintextReclaim {
         PlaintextReclaim {
             after: 0,
@@ -642,7 +1216,7 @@ impl MemoryCache {
         }
         Ok(entries.get(page).cloned())
     }
-    pub(crate) fn publish_ciphertext(&self, page: UnverifiedPage) -> Result<()> {
+    pub(crate) fn publish_ciphertext(&self, mut page: UnverifiedPage) -> Result<()> {
         self.pool.validate_ciphertext(&page.copy)?;
         let id = &page.copy.ciphertext.envelope().page;
         if !self.availability.page(
@@ -651,6 +1225,11 @@ impl MemoryCache {
         ) {
             return Err(Error::MissingKey);
         }
+        if self.ciphertext_entries.borrow().contains_key(id) {
+            return Ok(());
+        }
+        page.copy.ciphertext = self.pool.retainable(page.copy.ciphertext)?;
+        let id = &page.copy.ciphertext.envelope().page;
         let mut entries = self.ciphertext_entries.borrow_mut();
         if entries.contains_key(id) {
             return Ok(());
@@ -664,8 +1243,13 @@ impl MemoryCache {
     pub(crate) fn invalidate_ciphertext(&self, page: &UnverifiedPage) {
         let id = &page.copy.ciphertext.envelope().page;
         let mut entries = self.ciphertext_entries.borrow_mut();
+        // A registered page was copied out on publish, so match its contents.
+        let registered = page.copy.ciphertext.is_registered();
         if entries.get(id).is_some_and(|entry| {
             Arc::ptr_eq(&entry.copy.ciphertext.inner, &page.copy.ciphertext.inner)
+                || (registered
+                    && entry.copy.ciphertext.envelope() == page.copy.ciphertext.envelope()
+                    && entry.copy.ciphertext.bytes() == page.copy.ciphertext.bytes())
         }) {
             entries.remove(id);
         }
@@ -675,7 +1259,18 @@ impl MemoryCache {
         self.pool.validate_page(&page)?;
         self.publish_validated(page)
     }
-    fn publish_validated(&self, page: PageResult) -> Result<()> {
+    fn publish_validated(&self, mut page: PageResult) -> Result<()> {
+        // Copy registered ciphertext out before retaining it; a duplicate is
+        // rejected or ignored below and keeps the original entry.
+        if page.ciphertext.is_registered()
+            && !self
+                .entries
+                .borrow()
+                .pages
+                .contains_key(page.plaintext.page())
+        {
+            page.ciphertext = self.pool.retainable(page.ciphertext)?;
+        }
         let id = page.plaintext.page();
         self.ciphertext_entries.borrow_mut().remove(id);
         if !self.availability.cache(&id.version.object.cache) {
@@ -1662,14 +2257,12 @@ pub(crate) mod tests {
         }
     }
 
-    pub(in crate::memory) fn admission(
-        entries: usize,
-    ) -> Rc<flow_control::Quotas<AdmissionPolicy>> {
+    pub(crate) fn admission(entries: usize) -> Rc<flow_control::Quotas<AdmissionPolicy>> {
         let mut limits = crate::test_support::cluster::config(false).limits;
         limits.metadata_entries = std::num::NonZeroUsize::new(entries).unwrap();
         Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)))
     }
-    pub(in crate::memory) fn bundle(
+    pub(crate) fn bundle(
         admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
         version: &str,
     ) -> PageResult {
@@ -1912,6 +2505,122 @@ pub(crate) mod tests {
             drop(moved);
             assert_eq!(target.used(ResourceClass::Ciphertext), 0);
         }
+    }
+
+    #[test]
+    fn aligned_pages_are_disk_aligned_validated_and_rehome_into_aligned_copies() {
+        let source = admission(8);
+        let target = admission(8);
+        let pool = BufferPool::new(source.clone());
+        let base = bundle(&source, "aligned");
+        let envelope = base.ciphertext.envelope().clone();
+        let cache = envelope.page.version.object.cache.clone();
+        let length = envelope.ciphertext_length as usize;
+        let capacity = pool.aligned_capacity(length).unwrap();
+        let alignment = default_disk_alignment();
+        let reserve = |quotas: &Rc<flow_control::Quotas<AdmissionPolicy>>, cache, amount| {
+            quotas
+                .reserve(Some(cache), ResourceClass::Ciphertext, amount)
+                .unwrap()
+        };
+        let fill = |amount| {
+            let mut buffer = pool
+                .aligned_ciphertext(reserve(&source, &cache, capacity), amount)
+                .unwrap();
+            buffer.as_mut_slice().fill(0xa5);
+            buffer
+        };
+        // The charge must cover the pooled size class, not just the length.
+        assert!(
+            pool.aligned_ciphertext(reserve(&source, &cache, length), length)
+                .is_err()
+        );
+        // Length and cache mismatches are rejected and storage returns idle.
+        assert!(matches!(
+            pool.aligned_ciphertext_page(fill(length - 1), envelope.clone(), None),
+            Err(Error::CorruptRecord)
+        ));
+        let wrong = CacheId("wrong".into());
+        let mut buffer = pool
+            .aligned_ciphertext(reserve(&source, &wrong, capacity), length)
+            .unwrap();
+        buffer.as_mut_slice().fill(1);
+        assert!(matches!(
+            pool.aligned_ciphertext_page(buffer, envelope.clone(), None),
+            Err(Error::InvalidConfiguration)
+        ));
+        assert_eq!(pool.aligned_stats().idle_buffers, 1);
+        assert_eq!(source.used(ResourceClass::Ciphertext), length);
+
+        let mut buffer = pool
+            .aligned_ciphertext(reserve(&source, &cache, capacity), length)
+            .unwrap();
+        assert_eq!(pool.aligned_stats().idle_buffers, 0, "storage is recycled");
+        buffer
+            .as_mut_slice()
+            .copy_from_slice(base.ciphertext.bytes());
+        let page = pool
+            .aligned_ciphertext_page(buffer, envelope.clone(), Some(7))
+            .unwrap();
+        assert_eq!(page.bytes(), base.ciphertext.bytes());
+        assert_eq!(page.cached_checksum(), Some(7));
+        let body = page.disk_body(alignment).unwrap();
+        assert_eq!(body.as_ptr(), page.bytes().as_ptr());
+        assert_eq!(body.len(), 4096);
+        assert!(body[length..].iter().all(|byte| *byte == 0));
+        // A device needing a larger unit gets no zero-copy body.
+        let stricter = page_alloc::Alignment::new(4096, 8192, 8192).unwrap();
+        assert!(!page.is_disk_aligned(stricter));
+        // Vec-backed pages always need a copy.
+        assert!(!base.ciphertext.is_disk_aligned(alignment));
+
+        // A shared page is copied into fresh aligned storage.
+        let retained = page.clone();
+        let moved = page.rehome(reserve(&target, &cache, capacity)).unwrap();
+        assert_ne!(moved.bytes().as_ptr(), retained.bytes().as_ptr());
+        assert_eq!(moved.bytes(), retained.bytes());
+        assert!(moved.is_disk_aligned(alignment));
+        assert!(target.owns(moved.inner.reservation()));
+        drop(retained);
+        assert_eq!(pool.aligned_stats().idle_buffers, 1);
+        assert_eq!(source.used(ResourceClass::Ciphertext), length);
+        drop(moved);
+        assert_eq!(target.used(ResourceClass::Ciphertext), 0);
+        // Releasing idle storage keeps admission untouched.
+        pool.reclaim_idle_buffers();
+        assert_eq!(pool.aligned_stats().idle_buffers, 0);
+    }
+
+    #[test]
+    fn encryption_output_upgrades_exact_charges_and_falls_back_when_refused() {
+        let source = admission(8);
+        let pool = BufferPool::new(source.clone());
+        let cache = CacheId("cache".into());
+        let length = PAGE_BYTES as usize + 16;
+        let capacity = pool.aligned_capacity(length).unwrap();
+        assert!(capacity > length);
+        let exact = source
+            .reserve(Some(&cache), ResourceClass::Ciphertext, length)
+            .unwrap();
+        let Ok(Ok(buffer)) = pool.encryption_output(exact, length) else {
+            panic!("aligned output");
+        };
+        assert_eq!(buffer.len(), length);
+        assert_eq!(buffer.charge().amount(), capacity);
+        assert_eq!(source.used(ResourceClass::Ciphertext), capacity);
+        drop(buffer);
+        assert_eq!(source.used(ResourceClass::Ciphertext), 0);
+        // A charge from another worker's admission is handed back unchanged.
+        let other = admission(8);
+        let foreign = other
+            .reserve(Some(&cache), ResourceClass::Ciphertext, length)
+            .unwrap();
+        let returned = pool
+            .encryption_output(foreign, length)
+            .unwrap()
+            .unwrap_err();
+        assert!(other.owns(&returned));
+        assert_eq!(returned.amount(), length);
     }
 
     #[test]
@@ -2255,7 +2964,7 @@ pub(crate) mod tests {
         use flow_control::Quotas;
         use std::task::Waker;
 
-        pub(in crate::memory) fn admission(pipes: usize) -> Rc<Quotas<AdmissionPolicy>> {
+        pub(crate) fn admission(pipes: usize) -> Rc<Quotas<AdmissionPolicy>> {
             let small = std::num::NonZeroUsize::new(8).unwrap();
             let bytes = std::num::NonZeroUsize::new(32 * 1024 * 1024).unwrap();
             Rc::new(Quotas::new(AdmissionPolicy::new(Limits {

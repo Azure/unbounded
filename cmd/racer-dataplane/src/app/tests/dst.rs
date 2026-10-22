@@ -579,8 +579,8 @@ mod faults {
 
         pub(super) fn crash_pending_write(&mut self) {
             self.update(7);
-            self.sim.inject("write", Fault::Delay(64)).unwrap();
-            *self.coverage.injected.entry("write".into()).or_default() += 1;
+            self.sim.inject("writev", Fault::Delay(64)).unwrap();
+            *self.coverage.injected.entry("writev".into()).or_default() += 1;
             let mut client = self.request(7, false, false);
             let mut completed = false;
             let mut victim = None;
@@ -711,7 +711,7 @@ mod faults {
             if self.native_rules.is_empty() {
                 for op in [
                     NativeOperation::Bind,
-                    NativeOperation::Write,
+                    NativeOperation::WriteImm,
                     NativeOperation::Invalidate,
                 ] {
                     for fault in [
@@ -741,6 +741,8 @@ mod faults {
             // The byte oracle remains independent of this injection-path selection.
             let warm = self.request_on(5, true, false, source);
             self.exchange(warm, false);
+            // Pages use HTTP until the persistent link is ready.
+            self.connect_links(receiver, source);
             self.fabric.fault(operation, fault);
             self.coverage.action("native-fault");
             let client = self.request_on(5, true, false, receiver);
@@ -755,6 +757,10 @@ mod faults {
                         NativeFault::Reject => "reject",
                         NativeFault::Delay(_) => "delay",
                         NativeFault::Completion(_) => "completion",
+                        NativeFault::Drop => "drop",
+                        NativeFault::Reorder => "reorder",
+                        NativeFault::DuplicateImmediate => "duplicate-immediate",
+                        NativeFault::ByteLength(_) => "byte-length",
                     }
                 ))
                 .or_default() += 1;
@@ -1315,10 +1321,10 @@ mod scenarios {
         assert!(harness.coverage.secondary_worker_turns > 0);
         assert!(harness.coverage.relay_turns > 0);
         // Exact deterministic count under injected pressure. Delivery mode,
-        // replica selection and the read window's memory probes change turn
-        // ordering, so this pins the default `spread` selection with the
-        // out-of-order fetch window.
-        assert_eq!(harness.coverage.success, 10, "opaque={opaque}");
+        // replica selection, receive charge sizes, and memory probes change turn
+        // ordering, so this pins the default `spread` selection with aligned TCP
+        // receive, which charges each body's whole pooled size class.
+        assert_eq!(harness.coverage.success, 8, "opaque={opaque}");
     }
 }
 mod traffic {
@@ -1407,7 +1413,7 @@ mod traffic {
             }
             if native {
                 counts.insert("native-writes".into(), self.native_writes);
-                for operation in ["Bind", "Write", "Invalidate"] {
+                for operation in ["Bind", "WriteImm", "Invalidate"] {
                     for fault in ["reject", "delay", "completion"] {
                         let rule = format!("{operation}:{fault}");
                         counts.insert(
@@ -1422,7 +1428,7 @@ mod traffic {
         pub(super) fn collect_native(&mut self, fabric: &rdma_verbs::simulation::Simulation) {
             for event in fabric.take_trace() {
                 self.native_writes += usize::from(
-                    event.operation == rdma_verbs::simulation::Operation::Write
+                    event.operation == rdma_verbs::simulation::Operation::WriteImm
                         && event.completion
                         && event.result == 0,
                 );
@@ -1605,9 +1611,9 @@ mod traffic {
                 }
                 Action::DelayedWrite => {
                     self.sim
-                        .inject("write", Fault::Delay(3 + self.rng.pick(8)))
+                        .inject("writev", Fault::Delay(3 + self.rng.pick(8)))
                         .unwrap();
-                    *self.coverage.injected.entry("write".into()).or_default() += 1;
+                    *self.coverage.injected.entry("writev".into()).or_default() += 1;
                     self.update(3);
                     let client = self.request(3, false, false);
                     self.exchange(client, false);
@@ -1654,8 +1660,8 @@ mod traffic {
                     self.coverage.action("old-pin");
                 }
                 Action::FailedDirtyWrite => {
-                    self.sim.inject("write", Fault::Errno(libc::EIO)).unwrap();
-                    *self.coverage.injected.entry("write".into()).or_default() += 1;
+                    self.sim.inject("writev", Fault::Errno(libc::EIO)).unwrap();
+                    *self.coverage.injected.entry("writev".into()).or_default() += 1;
                     self.update(4);
                     let client = self.request(4, false, false);
                     self.exchange(client, false);
@@ -2445,8 +2451,12 @@ impl Harness {
         lifecycle(&mut workers, &startup, Lifecycle::Start);
         self.persist_provisioning(id, &config, &workers);
         if self.native {
+            // Rails are node-wide: the owner's worker activates them for all.
             assert!(
-                workers.iter().all(|w| !w.app.actual_rails.is_empty()),
+                !workers[0].app.actual_rails.is_empty()
+                    && workers
+                        .iter()
+                        .all(|w| !w.app.links.as_ref().unwrap().active().is_empty()),
                 "native activation must not silently fall back"
             );
         }
@@ -2733,11 +2743,45 @@ impl Harness {
                     && n.app.clients.active_connections() == 0
                     && n.runtime.crypto.outstanding() == 0
                     && n.app.drivers.pending() == 0
+                    && n.app.links.as_ref().is_none_or(|links| links.setups() == 0)
             }) {
                 return;
             }
         }
         panic!("seed={} failed to settle: {:?}", self.seed, self.coverage);
+    }
+
+    /// Set up the persistent link from node `a` to node `b` and wait until
+    /// both ends are ready, waiting out any backoff.
+    fn connect_links(&mut self, a: usize, b: usize) {
+        let rail = racer_control_wire::RailId(0);
+        for _ in 0..64 {
+            let (local, peer) = (
+                self.nodes[a].config.node.clone(),
+                self.nodes[b].config.node.clone(),
+            );
+            let links = self.nodes[a].workers[0].app.links.clone().unwrap();
+            let remote = self.nodes[b].workers[0].app.links.clone().unwrap();
+            if links.ready(&peer, rail).is_some() && remote.ready(&local, rail).is_some() {
+                self.coverage.action("native-link");
+                return;
+            }
+            if let rdma_verbs::LinkState::Backoff(until) = links.state(&peer, rail) {
+                self.clock.advance(
+                    until.saturating_duration_since(uring_runtime::environment::now())
+                        + Duration::from_millis(1),
+                );
+            }
+            let endpoint =
+                crate::http::Endpoint::Peer(self.nodes[b].config.peer_listen.to_string());
+            self.nodes[a].workers[0]
+                .app
+                .peers
+                .transfers()
+                .ensure_link(&endpoint, &peer, rail);
+            self.settle();
+        }
+        panic!("seed={} link setup stalled", self.seed);
     }
 
     fn request(&mut self, object: usize, pinned: bool, head: bool) -> Client {
@@ -3168,7 +3212,7 @@ fn dst_native_faults_reach_warmed_peers_in_small_topologies() {
             harness.native_fault();
             assert_eq!(harness.fabric.pending_faults(), 0);
         }
-        // One complete rule bag covers Bind/Write/Invalidate x all three faults.
+        // One complete rule bag covers Bind/WriteImm/Invalidate x all three faults.
         assert!(harness.native_rules.is_empty());
         assert_eq!(harness.coverage.native_faults.len(), 9);
         assert!(harness.coverage.native_faults.values().all(|&n| n == 1));
@@ -3497,7 +3541,7 @@ fn dst_coverage_policy_and_aggregation() {
         bytes: 1,
         secondary_worker_turns: 1,
         origin_faults: BTreeMap::from([("credential-forbidden", 1)]),
-        native_faults: BTreeMap::from([("Write:delay".into(), 1)]),
+        native_faults: BTreeMap::from([("WriteImm:delay".into(), 1)]),
         ..Coverage::default()
     };
     let mut counts = BTreeMap::new();
@@ -3508,7 +3552,7 @@ fn dst_coverage_policy_and_aggregation() {
         "response-bytes",
         "secondary-worker-data-turns",
         "origin:credential-forbidden",
-        "native:Write:delay",
+        "native:WriteImm:delay",
     ] {
         assert!(missing.contains(&name), "{name}");
     }
@@ -3522,7 +3566,7 @@ fn dst_coverage_policy_and_aggregation() {
         "origin:credential-reject",
         "origin:credential-forbidden",
         "native:Bind:reject",
-        "native:Write:delay",
+        "native:WriteImm:delay",
     ] {
         assert!(!missing.contains(&name), "{name}");
     }

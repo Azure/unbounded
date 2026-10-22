@@ -111,6 +111,25 @@ impl DecryptSource {
         })
     }
 }
+/// Duration metrics for serial driver calls. Candidate calls are timed at their call sites.
+fn stage_events(stage: DriverStage) -> Option<(Event, Event)> {
+    match stage {
+        DriverStage::PlaintextReclaim => Some((
+            Event::FillPlaintextReclaimCount,
+            Event::FillPlaintextReclaimNs,
+        )),
+        DriverStage::PublishCall => Some((Event::FillPublishCount, Event::FillPublishNs)),
+        DriverStage::DecryptCall => Some((Event::FillDecryptCount, Event::FillDecryptNs)),
+        DriverStage::DiskReadCall => Some((Event::FillDiskReadCount, Event::FillDiskReadNs)),
+        DriverStage::OriginCall => Some((Event::FillOriginCount, Event::FillOriginNs)),
+        DriverStage::EncryptCall => Some((Event::FillEncryptCount, Event::FillEncryptNs)),
+        DriverStage::ChecksumCall => Some((Event::FillChecksumCount, Event::FillChecksumNs)),
+        DriverStage::Starting
+        | DriverStage::BetweenCalls
+        | DriverStage::CandidateCompositeCall
+        | DriverStage::WorkReturned => None,
+    }
+}
 impl Fill {
     pub(super) async fn warm_local(
         &self,
@@ -138,7 +157,25 @@ impl Fill {
             .diagnostic
             .as_ref()
             .map(|diagnostic| diagnostic.call(stage));
-        work.await
+        let start = uring_runtime::environment::now();
+        let result = work.await;
+        if let Some((count, sum)) = stage_events(stage) {
+            self.metrics.record_duration(count, sum, start);
+        }
+        result
+    }
+
+    /// Time one awaited step into a count and nanosecond sum pair.
+    async fn timed<T>(
+        &self,
+        count: Event,
+        sum: Event,
+        work: impl std::future::Future<Output = T>,
+    ) -> T {
+        let start = uring_runtime::environment::now();
+        let result = work.await;
+        self.metrics.record_duration(count, sum, start);
+        result
     }
 
     #[cfg(test)]
@@ -312,11 +349,14 @@ impl Fill {
                     self.reserve_with_reclamation(
                         &page.version.object.cache,
                         ResourceClass::Ciphertext,
-                        copy.ciphertext.inner.capacity(),
+                        self.selected_capacity(&copy.ciphertext),
                     )
                 },
             )?;
-            copy.ciphertext = copy.ciphertext.rehome(reservation)?;
+            copy.ciphertext = self
+                .dependencies
+                .buffers
+                .rehome_aligned(copy.ciphertext, reservation)?;
         }
         let reservation =
             self.observe_reservation(scope, &page, FillAdmissionSite::SelectedPlaintext, || {
@@ -873,7 +913,14 @@ impl Fill {
         let diagnostic_lifetime = DriverDiagnostic::lifetime(fill.diagnostic.clone());
         let flights = self.dependencies.flights.clone();
         let (send, mut receive) = futures::channel::oneshot::channel();
+        let submitted = uring_runtime::environment::now();
         driver_permit.submit_detached(Box::pin(async move {
+            fill.metrics.record_duration(
+                Event::FillDriverStartCount,
+                Event::FillDriverStartNs,
+                submitted,
+            );
+            let started = uring_runtime::environment::now();
             let _diagnostic_lifetime = diagnostic_lifetime;
             let mut work = Box::pin(async {
                 if let Some(copy) = ready {
@@ -951,6 +998,8 @@ impl Fill {
             })
             .await;
             fill.stage(DriverStage::WorkReturned);
+            fill.metrics
+                .record_duration(Event::FillDriverCount, Event::FillDriverNs, started);
             drop(work);
             operation.complete()?;
             match result {
@@ -1342,13 +1391,17 @@ impl Fill {
             return Ok(result);
         }
         let candidates = self
-            .call(
-                DriverStage::CandidateCompositeCall,
-                self.dependencies.candidates.candidates_scoped(
-                    membership,
-                    &page.version.object,
-                    page.number,
-                    scope,
+            .timed(
+                Event::FillCandidatesCount,
+                Event::FillCandidatesNs,
+                self.call(
+                    DriverStage::CandidateCompositeCall,
+                    self.dependencies.candidates.candidates_scoped(
+                        membership,
+                        &page.version.object,
+                        page.number,
+                        scope,
+                    ),
                 ),
             )
             .await?;
@@ -1370,40 +1423,55 @@ impl Fill {
             mode: FetchMode::Acquire,
         };
         let mut hedge_continuation = super::candidates::HedgeContinuation::default();
+        let hedge_start = uring_runtime::environment::now();
         if want_plaintext
             && let Some(result) = self
-                .call(
-                    DriverStage::CandidateCompositeCall,
-                    self.dependencies.candidates.hedge_page(
-                        &candidates,
-                        context,
-                        &operation,
-                        scope,
-                        budget,
-                        &self.dependencies.admission,
-                        &mut hedge_continuation,
-                        |response, child| {
-                            Box::pin(async move {
-                                let copy = response_copy(response.response(), page)?;
-                                if let Some(existing) =
-                                    self.retained_metadata(&page.version, &child).await?
-                                    && !existing.compatible(&copy.metadata.immutable())
-                                {
-                                    return Err(Error::CorruptRecord);
-                                }
-                                let result =
-                                    self.decrypt_response(page, response, None, &child).await?;
-                                // A sibling may publish while crypto runs. Recheck before
-                                // election, not only after a winner has canceled its peer.
-                                if let Some(existing) =
-                                    self.retained_metadata(&page.version, &child).await?
-                                    && !existing.compatible(&result.metadata.immutable())
-                                {
-                                    return Err(Error::CorruptRecord);
-                                }
-                                Ok(result)
-                            })
-                        },
+                .timed(
+                    Event::FillHedgeCount,
+                    Event::FillHedgeNs,
+                    self.call(
+                        DriverStage::CandidateCompositeCall,
+                        self.dependencies.candidates.hedge_page(
+                            &candidates,
+                            context,
+                            &operation,
+                            scope,
+                            budget,
+                            &self.dependencies.admission,
+                            &mut hedge_continuation,
+                            |response, child| {
+                                Box::pin(async move {
+                                    self.metrics.record_duration(
+                                        Event::FillPeerResponseCount,
+                                        Event::FillPeerResponseNs,
+                                        hedge_start,
+                                    );
+                                    let copy = response_copy(response.response(), page)?;
+                                    if let Some(existing) =
+                                        self.retained_metadata(&page.version, &child).await?
+                                        && !existing.compatible(&copy.metadata.immutable())
+                                    {
+                                        return Err(Error::CorruptRecord);
+                                    }
+                                    let result = self
+                                        .timed(
+                                            Event::FillPeerDecryptCount,
+                                            Event::FillPeerDecryptNs,
+                                            self.decrypt_response(page, response, None, &child),
+                                        )
+                                        .await?;
+                                    // A sibling may publish while crypto runs. Recheck before
+                                    // election, not only after a winner has canceled its peer.
+                                    if let Some(existing) =
+                                        self.retained_metadata(&page.version, &child).await?
+                                        && !existing.compatible(&result.metadata.immutable())
+                                    {
+                                        return Err(Error::CorruptRecord);
+                                    }
+                                    Ok(result)
+                                })
+                            },
+                        ),
                     ),
                 )
                 .await?
@@ -1610,6 +1678,56 @@ impl Fill {
             })
     }
 
+    /// Charge for rehoming selected ciphertext. Pages that must be copied
+    /// (registered or shared) are charged the pooled aligned size class so the
+    /// copy lands in this worker's pool; exclusive pages move in place under a
+    /// charge for their current capacity.
+    fn selected_capacity(&self, ciphertext: &crate::memory::CiphertextPage) -> usize {
+        let capacity = ciphertext.inner.capacity();
+        if !ciphertext.is_registered() && Arc::strong_count(&ciphertext.inner) == 1 {
+            return capacity;
+        }
+        self.dependencies
+            .buffers
+            .aligned_capacity(ciphertext.bytes().len())
+            .map_or(capacity, |aligned| aligned.max(capacity))
+    }
+
+    /// Copy an authenticated registered RDMA page once into pooled aligned
+    /// storage before it is published and persisted, so the memory cache and
+    /// the store share one page and the RDMA buffer returns to its pool.
+    ///
+    /// Copy-out admission is optional: when it is refused even after
+    /// reclamation, the registered page is kept and the memory cache and
+    /// store copy it out under their own admission as before.
+    fn detach_registered(
+        &self,
+        ciphertext: crate::memory::CiphertextPage,
+    ) -> crate::memory::CiphertextPage {
+        if !ciphertext.is_registered() {
+            return ciphertext;
+        }
+        let buffers = &self.dependencies.buffers;
+        let Ok(capacity) = buffers.aligned_capacity(ciphertext.bytes().len()) else {
+            return ciphertext;
+        };
+        let cache = ciphertext.envelope().page.version.object.cache.clone();
+        let Ok(reservation) =
+            self.reserve_with_reclamation(&cache, ResourceClass::Ciphertext, capacity)
+        else {
+            return ciphertext;
+        };
+        // Keep a handle so a failed copy falls back to the registered page.
+        let fallback = ciphertext.clone();
+        match buffers.detach_registered(ciphertext, reservation) {
+            Ok(detached) => {
+                drop(fallback);
+                detached
+            }
+            Err(_) => fallback,
+        }
+    }
+
     pub(super) async fn decrypt(
         &self,
         page: &PageId,
@@ -1633,7 +1751,7 @@ impl Fill {
             let result = PageResult {
                 metadata: copy.metadata,
                 plaintext,
-                ciphertext: copy.ciphertext,
+                ciphertext: self.detach_registered(copy.ciphertext),
             };
             result.validate_for(page)?;
             Ok(result)
@@ -1764,6 +1882,12 @@ impl Fill {
                 .reserve(Some(cache), ResourceClass::DirtyCiphertext, amount)
                 .map_err(Error::from)
         };
+        let page_charge = result
+            .ciphertext
+            .inner
+            .reservation()
+            .amount()
+            .max(PAGE_BYTES as usize + 16);
         let dirty = self.reserve_owned_persistence(
             id,
             ResourceClass::DirtyCiphertext,
@@ -1780,9 +1904,14 @@ impl Fill {
             .dependencies
             .writer
             .enqueue_reclaiming(result.copy(), dirty, |amount| {
-                // Ciphertext owns both the immutable page and exact padded disk
-                // staging. The one-page floor includes BOTH, even on tiny slabs.
-                let one_page = (PAGE_BYTES as usize + 16).saturating_add(amount);
+                // Ciphertext owns both the immutable page and its disk staging.
+                // The one-page floor includes BOTH, even on tiny slabs. The page
+                // term is the page's own Ciphertext charge, which for aligned
+                // pages covers the padded body pool class. `amount` is the
+                // staging request: only the padded header block when persist
+                // writes the aligned body in place, or the full padded record
+                // for the copy fallback, so the floor covers either path.
+                let one_page = page_charge.saturating_add(amount);
                 // Idle aligned buffers retain Ciphertext charges after completed
                 // writes. Release that backing before headroom rejection or any
                 // destructive queued-copy reclaim; this is one bounded pool.

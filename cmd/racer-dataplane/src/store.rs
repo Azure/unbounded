@@ -597,9 +597,9 @@ impl StoreWriter {
     /// map borrow may span it because it can release other unsubmitted copies.
     pub(crate) fn enqueue_reclaiming(
         &self,
-        page: CiphertextCopy,
+        mut page: CiphertextCopy,
         dirty: flow_control::Charge<AdmissionPolicy>,
-        reserve_staging: impl FnOnce(usize) -> Result<flow_control::Charge<AdmissionPolicy>>,
+        mut reserve_staging: impl FnMut(usize) -> Result<flow_control::Charge<AdmissionPolicy>>,
     ) -> Result<u64> {
         if self.closed.get() {
             return Err(Error::Unavailable);
@@ -644,8 +644,31 @@ impl StoreWriter {
             }
             return Ok(existing.ticket);
         }
-        let full = pending.len() >= self.capacity.get();
         drop(pending);
+        // The queue outlives the request: never pin a registered RDMA buffer.
+        // The copy-out uses completion admission like disk staging, because an
+        // accepted fill must still persist after request admission stops. It goes
+        // through the caller's callback so cached pages can be reclaimed first.
+        if let Some(copy) = page.ciphertext.retained_copy()
+            && self.admission.owns(copy.inner.reservation())
+            && copy.inner.reservation().key() == Some(&page.metadata.version.object.cache)
+        {
+            // An earlier retaining path (the memory cache) already copied it
+            // out under this admission: share that copy.
+            page.ciphertext = copy;
+        }
+        if page.ciphertext.is_registered() {
+            let length = page.ciphertext.bytes().len();
+            let reservation = reserve_staging(length)?;
+            reservation.validate(ResourceClass::Ciphertext, length)?;
+            if !self.admission.owns(&reservation)
+                || reservation.key() != Some(&page.metadata.version.object.cache)
+            {
+                return Err(Error::InvalidConfiguration);
+            }
+            page.ciphertext = page.ciphertext.rehome(reservation)?;
+        }
+        let full = self.pending.borrow().len() >= self.capacity.get();
         if full {
             let retention = self.retention();
             let victim = self
@@ -667,10 +690,11 @@ impl StoreWriter {
             self.pending.borrow_mut().remove(&victim);
             self.note_discard(1);
         }
-        // Reserve the full staging capacity before queue acceptance. Thus
-        // accepted dirty copies never wait for ciphertext holders to release memory.
-        let disk_bytes = self.slabs.alignment()?.extent(0, logical)?.length();
-        let capacity = staging_capacity(disk_bytes)?;
+        // Reserve the staging persist will need before queue acceptance. Thus
+        // accepted dirty copies never wait for ciphertext holders to release
+        // memory. Computed after any rehome above, so a registered page that
+        // became aligned only reserves its header block.
+        let capacity = staging_bytes(&page, self.slabs.alignment()?)?;
         let staging = reserve_staging(capacity)?;
         staging.validate(ResourceClass::Ciphertext, capacity)?;
         if !self.admission.owns(&staging) || staging.key() != Some(&id.version.object.cache) {
@@ -988,7 +1012,7 @@ impl StoreWriter {
             .index
             .reserve_page_for(id, self.clock.borrow().is_some())?;
         let alignment = self.slabs.alignment()?;
-        let disk_bytes = alignment.extent(0, logical_length(page)?)?.length();
+        let disk_bytes = record_length(page, alignment)?;
         let (staging, dirty, ticket) = {
             let mut pending = self.pending.borrow_mut();
             let entry = pending.get_mut(id).ok_or(Error::Unavailable)?;
@@ -1001,7 +1025,14 @@ impl StoreWriter {
         if !self.admission.owns(&staging) {
             return Err(Error::InvalidConfiguration);
         }
-        let mut buffer = self.slabs.allocate(disk_bytes, staging)?;
+        let zero_copy = zero_copy_body(page, alignment)?.is_some();
+        // Zero-copy pages stage only the header block; enqueue reserved exactly that.
+        let staged = if zero_copy {
+            header_block_len(page, alignment)?
+        } else {
+            disk_bytes
+        };
+        let mut buffer = self.slabs.allocate(staged, staging)?;
         buffer.retain(dirty);
         let (segment, extent) = match self.segments.append(disk_bytes).map_err(Error::from) {
             Ok(append) => append,
@@ -1020,17 +1051,37 @@ impl StoreWriter {
         };
         let _publication_guard = self.index.publishing(location.segment);
         let _publication_lease = self.segments.lease(location.segment, location.generation)?;
-        let encoded = encode_at(
-            page,
-            location.generation,
-            alignment,
-            location.extent.offset(),
-            buffer,
-        )?;
-        let _ = self
-            .slabs
-            .write(&self.reactor, extent, encoded.buffer, segment, scope)
-            .await?;
+        if zero_copy {
+            if extent.length() != disk_bytes {
+                return Err(Error::InvalidConfiguration);
+            }
+            write_header(page, location.generation, alignment, buffer.bytes_mut()?)?;
+            self.metrics
+                .record(crate::telemetry::Event::PersistZeroCopy, 1);
+            let body = DiskBody {
+                page: page.ciphertext.clone(),
+                alignment,
+                length: disk_bytes - header_block_len(page, alignment)?,
+            };
+            let _ = self
+                .slabs
+                .write_vectored(&self.reactor, extent, buffer, body, segment, scope)
+                .await?;
+        } else {
+            self.metrics
+                .record(crate::telemetry::Event::PersistCopyFallback, 1);
+            let encoded = encode_at(
+                page,
+                location.generation,
+                alignment,
+                location.extent.offset(),
+                buffer,
+            )?;
+            let _ = self
+                .slabs
+                .write(&self.reactor, extent, encoded.buffer, segment, scope)
+                .await?;
+        }
         if self.allowed(page)
             && self
                 .pending
@@ -1106,6 +1157,18 @@ impl StoreWriter {
     /// Idle, zeroized staging remains charged until reuse, pressure, or drain.
     pub fn retained_staging_bytes(&self) -> usize {
         self.slabs.idle_bytes()
+    }
+    /// Run idle staging demand maintenance; O(1) between windows.
+    pub fn maintain_staging(&self, now: std::time::Instant) -> usize {
+        self.slabs.maintain_idle(now)
+    }
+    /// Hold idle staging empty while memory is constrained.
+    pub fn constrain_staging(&self, constrained: bool) {
+        self.slabs.constrain_idle(constrained);
+    }
+    /// Idle staging size, demand target, and cumulative counters.
+    pub fn staging_pool_stats(&self) -> flow_control::PoolStats {
+        self.slabs.idle_pool_stats()
     }
     #[cfg(test)]
     fn reclaim_idle_buffer(&self) -> usize {
@@ -1225,11 +1288,75 @@ impl Drop for DirtyCleanup<'_> {
 }
 // Page record format version, stored after the magic. Readers treat any other
 // version as a cold miss.
-pub const FORMAT_VERSION: u32 = 1;
+//
+// Version 2 layout:
+// - `[0, real)`: header fields followed by a SHA-256 digest of the preceding
+//   header bytes. `real` is at most `MAX_RAW_HEADER_BYTES`.
+// - `[real, header_len)`: zero padding. `header_len` (stored at bytes 12..16)
+//   is `real` rounded up to the store's record unit, and the digest does not
+//   cover the padding; readers require it to be zero.
+// - `[header_len, header_len + ciphertext_length)`: ciphertext, so it starts at
+//   a disk-aligned offset and can be written from its own aligned buffer.
+// - The remainder up to the record extent is zero padding.
+pub const FORMAT_VERSION: u32 = 2;
 pub const MAX_ID_BYTES: usize = 4096;
 pub const MAX_ETAG_BYTES: usize = 8192;
-pub const MAX_HEADER_BYTES: usize = 16384;
+/// Upper bound on the unpadded header, including its digest.
+pub const MAX_RAW_HEADER_BYTES: usize = 16384;
+/// Upper bound on the padded header block that precedes the ciphertext.
+/// Record size budgets use this as the per-record overhead.
+pub const MAX_HEADER_BYTES: usize = MAX_RAW_HEADER_BYTES + 4096;
+/// Smallest record unit; every stored `header_len` is a multiple of it.
+const MIN_RECORD_UNIT: usize = 512;
 
+/// Ciphertext body that can be written in place, without a staging copy.
+///
+/// Returns the padded body when the page already lives in direct-I/O aligned
+/// storage whose padded length matches the record body for `alignment`.
+fn zero_copy_body(page: &CiphertextCopy, alignment: Alignment) -> Result<Option<&[u8]>> {
+    Ok(disk_body_prefix(
+        &page.ciphertext,
+        alignment,
+        body_len(page, alignment)?,
+    ))
+}
+/// The first `length` bytes of the aligned padded body: the ciphertext followed
+/// only by zeros. The pool may pad to a coarser unit than the device, so a
+/// longer padded body still serves a shorter unit-aligned record body.
+fn disk_body_prefix(
+    page: &crate::memory::CiphertextPage,
+    alignment: Alignment,
+    length: usize,
+) -> Option<&[u8]> {
+    page.disk_body(alignment)
+        .filter(|body| body.len() >= length && length.is_multiple_of(alignment.length()))
+        .map(|body| &body[..length])
+}
+/// Staging bytes reserved before queue acceptance and consumed by persist.
+///
+/// Zero-copy pages only need the padded header block because the page owns
+/// its aligned body; other pages need the full encoded record.
+pub(crate) fn staging_bytes(page: &CiphertextCopy, alignment: Alignment) -> Result<usize> {
+    if zero_copy_body(page, alignment)?.is_some() {
+        staging_capacity(header_block_len(page, alignment)?)
+    } else {
+        staging_capacity(record_length(page, alignment)?)
+    }
+}
+/// Immutable, Arc-held page body handed to a vectored device write.
+struct DiskBody {
+    page: crate::memory::CiphertextPage,
+    alignment: Alignment,
+    length: usize,
+}
+// SAFETY: the Arc-held ciphertext storage is never mutated after
+// construction, so the returned slice is stable while `self` is alive.
+unsafe impl uring_runtime::reactor::SharedWriteBuffer for DiskBody {
+    type Error = Error;
+    fn write_bytes(&self) -> Result<&[u8]> {
+        disk_body_prefix(&self.page, self.alignment, self.length).ok_or(Error::InvalidConfiguration)
+    }
+}
 /// Large records share capacity classes while their disk extents stay exact.
 fn staging_capacity(length: usize) -> Result<usize> {
     if length < 2 * 1024 * 1024 {
@@ -1259,10 +1386,52 @@ pub struct DecodedRecord {
     pub checksum: u64,
 }
 struct RecordLayout {
+    /// Unpadded header length, including the digest.
     header_bytes: usize,
+    /// Header length padded to the record unit; ciphertext starts here.
+    header_block: usize,
+    /// Ciphertext length padded to the record unit.
+    body_bytes: usize,
+    /// `header_block` plus the unpadded ciphertext length.
     logical_bytes: usize,
 }
-fn layout(page: &CiphertextCopy, generation: Generation) -> Result<RecordLayout> {
+/// Record unit: the extent granularity, so every in-record offset that is a
+/// multiple of it is both offset- and length-aligned on disk.
+fn record_unit(alignment: Alignment) -> Result<usize> {
+    let unit = alignment.extent(0, 1)?.length();
+    if !unit.is_multiple_of(MIN_RECORD_UNIT) {
+        return Err(Error::InvalidConfiguration);
+    }
+    Ok(unit)
+}
+fn align_up(len: usize, unit: usize) -> Result<usize> {
+    len.checked_next_multiple_of(unit)
+        .ok_or(Error::CorruptRecord)
+}
+fn layout(
+    page: &CiphertextCopy,
+    generation: Generation,
+    alignment: Alignment,
+) -> Result<RecordLayout> {
+    let unit = record_unit(alignment)?;
+    let raw = raw_layout(page, generation)?;
+    let header_block = align_up(raw, unit)?;
+    if header_block > MAX_HEADER_BYTES {
+        return Err(Error::InvalidConfiguration);
+    }
+    let ciphertext = page.ciphertext.bytes().len();
+    let body_bytes = align_up(ciphertext, unit)?;
+    Ok(RecordLayout {
+        header_bytes: raw,
+        header_block,
+        body_bytes,
+        logical_bytes: header_block
+            .checked_add(ciphertext)
+            .ok_or(Error::CorruptRecord)?,
+    })
+}
+/// Validate the page and return its unpadded header length.
+fn raw_layout(page: &CiphertextCopy, generation: Generation) -> Result<usize> {
     let envelope = page.ciphertext.envelope();
     let metadata = page.metadata.immutable();
     metadata.validate_page(envelope)?;
@@ -1292,15 +1461,50 @@ fn layout(page: &CiphertextCopy, generation: Generation) -> Result<RecordLayout>
             )
         })
         .and_then(|len| len.checked_add(HEADER_DIGEST_BYTES))
-        .filter(|&len| len <= MAX_HEADER_BYTES)
+        .filter(|&len| len <= MAX_RAW_HEADER_BYTES)
         .ok_or(Error::CorruptRecord)?;
-    let logical_bytes = header_bytes
-        .checked_add(page.ciphertext.bytes().len())
-        .ok_or(Error::CorruptRecord)?;
-    Ok(RecordLayout {
-        header_bytes,
-        logical_bytes,
-    })
+    Ok(header_bytes)
+}
+/// Padded header block length; the ciphertext starts at this record offset.
+pub(crate) fn header_block_len(page: &CiphertextCopy, alignment: Alignment) -> Result<usize> {
+    Ok(layout(page, Generation(1), alignment)?.header_block)
+}
+/// Ciphertext length padded to the record unit.
+pub(crate) fn body_len(page: &CiphertextCopy, alignment: Alignment) -> Result<usize> {
+    Ok(layout(page, Generation(1), alignment)?.body_bytes)
+}
+/// Full on-disk record length: header block plus padded ciphertext.
+pub fn record_length(page: &CiphertextCopy, alignment: Alignment) -> Result<usize> {
+    let layout = layout(page, Generation(1), alignment)?;
+    layout
+        .header_block
+        .checked_add(layout.body_bytes)
+        .ok_or(Error::CorruptRecord)
+}
+/// Write the header and its zero padding into `out`, which must be exactly
+/// `header_block_len(page, alignment)` bytes.
+pub(crate) fn write_header(
+    page: &CiphertextCopy,
+    generation: Generation,
+    alignment: Alignment,
+    out: &mut [u8],
+) -> Result<()> {
+    let layout = layout(page, generation, alignment)?;
+    write_header_layout(page, generation, &layout, out)
+}
+fn write_header_layout(
+    page: &CiphertextCopy,
+    generation: Generation,
+    layout: &RecordLayout,
+    out: &mut [u8],
+) -> Result<()> {
+    if out.len() != layout.header_block {
+        return Err(Error::InvalidConfiguration);
+    }
+    let header = header_bytes(page, generation, layout);
+    out[..header.len()].copy_from_slice(&header);
+    out[header.len()..].fill(0);
+    Ok(())
 }
 fn header_bytes(page: &CiphertextCopy, generation: Generation, layout: &RecordLayout) -> Vec<u8> {
     let envelope = page.ciphertext.envelope();
@@ -1309,7 +1513,7 @@ fn header_bytes(page: &CiphertextCopy, generation: Generation, layout: &RecordLa
     let mut out = Vec::with_capacity(layout.header_bytes);
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-    out.extend_from_slice(&(layout.header_bytes as u32).to_le_bytes());
+    out.extend_from_slice(&(layout.header_block as u32).to_le_bytes());
     out.extend_from_slice(&generation.0.to_le_bytes());
     out.extend_from_slice(&page.metadata.length.to_le_bytes());
     out.extend_from_slice(&envelope.page.number.0.to_le_bytes());
@@ -1340,8 +1544,13 @@ fn header_bytes(page: &CiphertextCopy, generation: Generation, layout: &RecordLa
     out.extend_from_slice(&digest);
     out
 }
+/// Unpadded header plus ciphertext length. This validates the page and bounds
+/// its size independent of disk alignment; use [`record_length`] for the
+/// on-disk size.
 pub fn logical_length(page: &CiphertextCopy) -> Result<usize> {
-    Ok(layout(page, Generation(1))?.logical_bytes)
+    raw_layout(page, Generation(1))?
+        .checked_add(page.ciphertext.bytes().len())
+        .ok_or(Error::CorruptRecord)
 }
 pub fn encode(
     page: &CiphertextCopy,
@@ -1358,14 +1567,16 @@ pub fn encode_at(
     offset: u64,
     mut buffer: AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
 ) -> Result<EncodedRecord> {
-    let layout = layout(page, generation)?;
+    let layout = layout(page, generation, alignment)?;
     let logical_bytes = layout.logical_bytes;
     let extent = alignment.extent(offset, logical_bytes)?;
+    if extent.length() != layout.header_block + layout.body_bytes {
+        return Err(Error::InvalidConfiguration);
+    }
     alignment.check(extent, &buffer)?;
-    let header = header_bytes(page, generation, &layout);
     let bytes = buffer.bytes_mut()?;
-    bytes[..header.len()].copy_from_slice(&header);
-    bytes[header.len()..logical_bytes].copy_from_slice(page.ciphertext.bytes());
+    write_header_layout(page, generation, &layout, &mut bytes[..layout.header_block])?;
+    bytes[layout.header_block..logical_bytes].copy_from_slice(page.ciphertext.bytes());
     bytes[logical_bytes..].fill(0);
     Ok(EncodedRecord {
         header: RecordHeader {
@@ -1398,14 +1609,25 @@ pub fn parse_bytes(bytes: &[u8], extent: Extent) -> Result<DecodedRecord> {
         return Err(Error::CorruptRecord);
     }
     let header_len = r.u32()? as usize;
-    if !(160..=MAX_HEADER_BYTES).contains(&header_len) || header_len > bytes.len() {
+    if !(MIN_RECORD_UNIT..=MAX_HEADER_BYTES).contains(&header_len)
+        || !header_len.is_multiple_of(MIN_RECORD_UNIT)
+        || header_len > bytes.len()
+    {
         return Err(Error::CorruptRecord);
     }
-    let digest = Sha256::digest(&bytes[..header_len - 32]);
-    if digest[..] != bytes[header_len - 32..header_len] {
+    // Fields are self-delimiting; the digest ends the real header.
+    let mut fields = Decoder(&bytes[16..header_len]);
+    let real = 16 + header_fields_len(&mut fields)? + HEADER_DIGEST_BYTES;
+    if real > header_len || real > MAX_RAW_HEADER_BYTES {
         return Err(Error::CorruptRecord);
     }
-    r.0 = &bytes[16..header_len - 32];
+    let digest = Sha256::digest(&bytes[..real - HEADER_DIGEST_BYTES]);
+    if digest[..] != bytes[real - HEADER_DIGEST_BYTES..real]
+        || bytes[real..header_len].iter().any(|&b| b != 0)
+    {
+        return Err(Error::CorruptRecord);
+    }
+    r.0 = &bytes[16..real - HEADER_DIGEST_BYTES];
     let generation = Generation(r.u64()?);
     let length = r.u64()?;
     let number = PageNumber(r.u64()?);
@@ -1475,6 +1697,30 @@ pub fn parse_bytes(bytes: &[u8], extent: Extent) -> Result<DecodedRecord> {
         ciphertext: header_len..logical_bytes,
         checksum,
     })
+}
+/// Length of the variable header fields after the 16-byte fixed prefix and
+/// before the digest, read without validating their contents.
+fn header_fields_len(r: &mut Decoder<'_>) -> Result<usize> {
+    let start = r.0.len();
+    r.take(8 + 8 + 8 + 4 + 4)?;
+    r.take(std::mem::size_of::<KeyId>())?;
+    r.take(std::mem::size_of::<Nonce>())?;
+    r.take(std::mem::size_of::<CacheKey>())?;
+    let cache_len = r.u32()? as usize;
+    let etag_len = r.u32()? as usize;
+    if cache_len > MAX_ID_BYTES || etag_len > MAX_ETAG_BYTES {
+        return Err(Error::CorruptRecord);
+    }
+    r.take(cache_len)?;
+    r.take(etag_len)?;
+    r.take(8)?;
+    let content_type_len = r.u32()? as usize;
+    if content_type_len > MAX_RAW_HEADER_BYTES {
+        return Err(Error::CorruptRecord);
+    }
+    r.take(content_type_len)?;
+    r.take(4)?;
+    Ok(start - r.0.len())
 }
 pub fn decode(
     buffer: &AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
