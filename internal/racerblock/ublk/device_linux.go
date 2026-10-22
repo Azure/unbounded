@@ -50,6 +50,10 @@ type Device struct {
 	startMu  sync.Mutex
 	starting bool
 	startErr error
+	// startDone is closed once startup is resolved: START_DEV has
+	// returned or will not be issued. Failed queues keep their ring open
+	// until then.
+	startDone chan struct{}
 
 	// stopAsync runs teardown off the caller's goroutine. Tests replace
 	// it to observe failures without a kernel device.
@@ -120,6 +124,7 @@ func (d *Device) init() {
 	d.stopAsync = func(err error) { go d.teardown(err) }
 	d.launch = func(q *queue, ready chan<- error) { go q.run(ready) }
 	d.starting = true
+	d.startDone = make(chan struct{})
 }
 
 // runStartup runs start while fail defers teardown to the caller, then
@@ -128,6 +133,8 @@ func (d *Device) init() {
 // exactly once and only after every queue has been launched.
 func (d *Device) runStartup(start func() error) error {
 	err := start()
+
+	close(d.startDone)
 
 	d.startMu.Lock()
 	d.starting = false
@@ -157,6 +164,14 @@ var testHooks struct {
 	// beforeStartDev runs after every queue is ready, just before the
 	// last check ahead of START_DEV.
 	beforeStartDev func(d *Device)
+	// beforeStartCmd runs after the last startup check, just before the
+	// START_DEV command is sent.
+	beforeStartCmd func(d *Device)
+	// failedRingClose runs when a failed queue is about to close its
+	// ring. resolved reports whether startup was resolved by then.
+	failedRingClose func(q *queue, resolved bool)
+	// live replaces the GET_DEV_INFO probe used by a broken queue.
+	live func() (bool, error)
 }
 
 // launchQueues starts every queue thread and waits until each one has
@@ -223,6 +238,10 @@ func (d *Device) start() error {
 	}
 
 	d.started = true
+
+	if testHooks.beforeStartCmd != nil {
+		testHooks.beforeStartCmd(d)
+	}
 
 	if err := d.ctrl.startDev(d.id); err != nil {
 		return err
@@ -310,6 +329,16 @@ func (d *Device) teardown(cause error) {
 		keep := func(err error) {
 			if err != nil && (!external || !errors.Is(err, syscall.ENODEV)) {
 				errs = append(errs, err)
+			}
+		}
+
+		// A failed queue closes its ring once startup is resolved, which
+		// makes the kernel abort its I/O. Wait for that before STOP_DEV,
+		// which waits for in-flight I/O and would otherwise depend on a
+		// queue that no longer serves.
+		for _, q := range d.queues {
+			if q.running && q.failed.Load() {
+				<-q.exited
 			}
 		}
 

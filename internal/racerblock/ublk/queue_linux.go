@@ -53,6 +53,7 @@ type queue struct {
 	running  bool // set before run starts; read after
 	stopping atomic.Bool
 	fault    atomic.Pointer[error] // test-injected queue error
+	failed   atomic.Bool           // run failed on its own
 	exited   chan struct{}
 }
 
@@ -228,15 +229,21 @@ func (q *queue) run(ready chan<- error) {
 
 	err := q.serve(ready)
 
+	if err != nil && !q.localStop() {
+		q.failed.Store(true)
+		q.dev.fail(fmt.Errorf("ublk: queue %d: %w", q.id, err))
+		q.holdUntilSafe()
+	}
+
+	if testHooks.failedRingClose != nil && q.failed.Load() {
+		testHooks.failedRingClose(q, isClosed(q.dev.startDone))
+	}
+
 	if cerr := q.ring.close(); cerr != nil {
 		q.dev.cfg.Logger.Warn("ublk: closing queue ring", "queue", q.id, "err", cerr)
 	}
 
 	q.ring = nil
-
-	if err != nil && !q.localStop() {
-		q.dev.fail(fmt.Errorf("ublk: queue %d: %w", q.id, err))
-	}
 }
 
 func (q *queue) serve(ready chan<- error) error {
