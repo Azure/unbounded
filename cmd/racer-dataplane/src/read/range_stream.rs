@@ -1729,6 +1729,70 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn sealed_pages_are_delivered_in_order_only_to_direct_readers() {
+        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+        let admission = &f.admission;
+        let mut metadata = metadata();
+        metadata.length = 2 * PAGE_BYTES;
+        let range = ByteRange::Closed {
+            first: 5,
+            last: PAGE_BYTES + 9,
+        }
+        .resolve(metadata.length)
+        .unwrap();
+        let scope = || {
+            RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(60)).unwrap()
+        };
+        let mut stream = f.open(&metadata, range, scope());
+        stream.configure_subscription(4, 4 * PAGE_BYTES).unwrap();
+        let first = crate::read::sealed::tests::sealed(&page_result(admission, &metadata, 0));
+        stream.inject(Slot::Sealed(Box::new(first)));
+        stream.inject(Slot::Ready(Ok(page_result(admission, &metadata, 1))));
+        match futures::executor::block_on(stream.next_direct()).unwrap() {
+            Some(DirectItem::Sealed(page, slice)) => {
+                assert_eq!(page.page().number, PageNumber(0));
+                assert_eq!(
+                    (slice.page, slice.offset, slice.length),
+                    (PageNumber(0), 5, PAGE_BYTES as u32 - 5)
+                );
+            }
+            _ => panic!("expected a sealed page"),
+        }
+        stream
+            .release_page(PageNumber(0), PAGE_BYTES as u32 - 5)
+            .unwrap();
+        match futures::executor::block_on(stream.next_direct()).unwrap() {
+            Some(DirectItem::Plaintext(reader)) => {
+                assert_eq!(reader.slice().page, PageNumber(1));
+                assert_eq!(reader.slice().length, 10);
+            }
+            _ => panic!("expected plaintext"),
+        }
+        assert!(
+            futures::executor::block_on(stream.next_direct())
+                .unwrap()
+                .is_none()
+        );
+
+        // A sealed page for another page number fails that page.
+        let mut stream = f.open(&metadata, range, scope());
+        stream.configure_subscription(4, 4 * PAGE_BYTES).unwrap();
+        let other = crate::read::sealed::tests::sealed(&page_result(admission, &metadata, 1));
+        stream.inject(Slot::Sealed(Box::new(other)));
+        assert!(futures::executor::block_on(stream.next_direct()).is_err());
+
+        // A Get stream never yields sealed pages.
+        let mut stream = f.open(&metadata, range, scope());
+        stream.configure_subscription(4, 4 * PAGE_BYTES).unwrap();
+        let first = crate::read::sealed::tests::sealed(&page_result(admission, &metadata, 0));
+        stream.inject(Slot::Sealed(Box::new(first)));
+        assert_eq!(
+            futures::executor::block_on(stream.next_slice()).err(),
+            Some(Error::Internal)
+        );
+    }
+
+    #[test]
     fn retained_boundary_slices_keep_full_plaintext_charged_until_exact_release() {
         let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
         let admission = &f.admission;

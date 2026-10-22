@@ -143,15 +143,16 @@ impl SealedPage {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::memory::CiphertextCopy;
 
-    fn sealed(result: &PageResult) -> SealedPage {
+    /// A host-sourced sealed page for `result`, with a fixed test key.
+    pub(crate) fn sealed(result: &PageResult) -> SealedPage {
         let envelope = result.ciphertext.envelope().clone();
         SealedPage {
             metadata: result.metadata.clone(),
-            aad: crate::security::page_aad(&envelope).unwrap(),
+            aad: crate::security::page_aad(&envelope).unwrap_or_default(),
             key: racer_crypto::xaes_derive(&[7; 32], &envelope.nonce.0),
             expected_crc: Some(result.ciphertext.checksum()),
             envelope,

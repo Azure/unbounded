@@ -241,3 +241,371 @@ fn gpu_mode_resolves_against_hardware() {
         );
     }
 }
+
+/// A helper on one simulated GPU with a staging cap, after `setup` runs on
+/// the fresh simulation.
+fn start_with(staging: u64, setup: fn(&Simulation)) -> Arc<GpuHelper> {
+    GpuHelper::start_with_staging(
+        GpuMode::Required,
+        staging,
+        Box::new(move || {
+            let simulation = Simulation::new(vec![SimDevice::new(0)]);
+            let environment = simulation.enter();
+            setup(&simulation);
+            SIM.with(|sim| *sim.borrow_mut() = Some((simulation, environment)));
+            racer_gpu::Gpu::load()
+        }),
+    )
+    .unwrap()
+    .unwrap()
+}
+
+fn page_id(number: u64) -> crate::model::PageId {
+    crate::model::PageId {
+        version: ObjectVersion {
+            object: ObjectId {
+                cache: definition().id,
+                key: CacheKey([0; 32]),
+            },
+            etag: StrongEtag::parse(b"\"v1\"").unwrap(),
+        },
+        number: crate::model::PageNumber(number),
+    }
+}
+
+fn worker(fixture: &Fixture) -> &crate::test_support::ReadWorker {
+    fixture.worker.as_ref().unwrap()
+}
+
+/// Calls to `operation` in the trace from `from` on.
+fn calls(helper: &GpuHelper, from: usize, operation: Operation) -> usize {
+    helper.run(move || {
+        sim().trace()[from..]
+            .iter()
+            .filter(|event| event.operation == operation)
+            .count()
+    })
+}
+
+fn trace_len(helper: &GpuHelper) -> usize {
+    helper.run(|| sim().trace().len())
+}
+
+fn counter(value: &std::sync::atomic::AtomicU64) -> u64 {
+    value.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Read `range` of the object into a fresh allocation at offset 64.
+fn gpu_read(
+    fixture: &Fixture,
+    helper: &GpuHelper,
+    range: Option<(u64, u64)>,
+    length: u64,
+) -> (String, Vec<(u8, u64, u64, u32)>, OwnedFd, u64) {
+    let size = (length + 64).next_multiple_of(GRANULE);
+    let allocation = allocate(helper, 0, size);
+    let header = range.map_or(String::new(), |(start, end)| {
+        format!("Range: bytes={start}-{end}\r\n")
+    });
+    let output = exchange(
+        fixture,
+        &direct_request("gpu-read", &fields(&header, 64, length, size)),
+        &[allocation.as_raw_fd()],
+    );
+    let (head, body) = split(&output);
+    let frames = frames(body);
+    settle(fixture);
+    (head, frames, allocation, size)
+}
+
+/// Fill the page cache with an ordinary read, then leave each page's
+/// ciphertext in memory, on disk, or both, and no plaintext.
+fn arrange(
+    fixture: &Fixture,
+    helper: &GpuHelper,
+    pages: u64,
+    length: u64,
+    memory: bool,
+    disk: bool,
+) {
+    let worker = worker(fixture);
+    worker.retain(true);
+    if disk {
+        worker.open_disk();
+    }
+    let (head, _, _, _) = gpu_read(fixture, helper, None, length);
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    let mut copies = Vec::new();
+    for number in 0..pages {
+        let result = worker.memory().get(&page_id(number)).unwrap().unwrap();
+        copies.push(result.copy());
+    }
+    worker.memory().remove_cache(&definition().id).unwrap();
+    for copy in copies {
+        if disk {
+            worker.persist(copy.clone());
+        }
+        if memory {
+            worker
+                .memory()
+                .publish_ciphertext(crate::memory::UnverifiedPage {
+                    copy,
+                    disk_token: None,
+                })
+                .unwrap();
+        }
+    }
+}
+
+/// Nothing is held: no imports, streams, leaks or staged slots.
+fn assert_idle(fixture: &Fixture, helper: &GpuHelper, slots: usize) {
+    settle(fixture);
+    assert_released(helper);
+    assert_eq!(helper.free_slots(0), slots);
+}
+
+fn body(length: usize) -> Vec<u8> {
+    (0..length).map(|i| (i * 7 % 251) as u8).collect()
+}
+
+/// Slots left for staged ciphertext with the default staging cap.
+fn default_slots() -> usize {
+    (crate::config::DEFAULT_GPU_STAGING_BYTES / crate::gpu::SLOT_BYTES) as usize - 2
+}
+
+#[test]
+fn gpu_read_memory_plaintext_hit_copies_plaintext() {
+    let helper = start(GpuMode::Required, 1).unwrap();
+    let data = body(5000);
+    let fixture = gpu_fixture(data.clone(), &helper);
+    worker(&fixture).retain(true);
+    let _ = gpu_read(&fixture, &helper, None, 5000);
+    let mark = trace_len(&helper);
+    let decrypts = worker(&fixture).cpu_decrypts();
+    let (head, frames, allocation, _) = gpu_read(&fixture, &helper, Some((10, 99)), 90);
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert_eq!(frames, [(1, 0, 10, 90), (2, 1, 90, 0)]);
+    assert_eq!(read_allocation(&allocation, 64, 90), &data[10..100]);
+    assert_eq!(calls(&helper, mark, Operation::Decrypt), 0);
+    assert_eq!(calls(&helper, mark, Operation::CopyH2d), 1);
+    assert_eq!(worker(&fixture).cpu_decrypts(), decrypts);
+    assert_eq!(counter(&helper.counters().decrypted), 0);
+    assert_idle(&fixture, &helper, default_slots());
+}
+
+#[test]
+fn gpu_read_retained_ciphertext_decrypts_part_of_a_page_on_the_gpu() {
+    let helper = start(GpuMode::Required, 1).unwrap();
+    let data = body(5000);
+    let fixture = gpu_fixture(data.clone(), &helper);
+    arrange(&fixture, &helper, 1, 5000, true, false);
+    let mark = trace_len(&helper);
+    let (head, frames, allocation, size) = gpu_read(&fixture, &helper, Some((100, 199)), 100);
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert_eq!(frames, [(1, 0, 100, 100), (2, 1, 100, 0)]);
+    // Only the window holds bytes, though the GPU decrypted the whole page.
+    let all = read_allocation(&allocation, 0, size as usize);
+    assert_eq!(&all[64..164], &data[100..200]);
+    assert!(all[..64].iter().chain(&all[164..]).all(|&b| b == 0));
+    assert_eq!(calls(&helper, mark, Operation::Decrypt), 1);
+    assert_eq!(calls(&helper, mark, Operation::CopyD2d), 1);
+    assert_eq!(worker(&fixture).cpu_decrypts(), 0);
+    assert_eq!(counter(&helper.counters().decrypted), 1);
+    assert_idle(&fixture, &helper, default_slots());
+}
+
+#[test]
+fn gpu_read_disk_pages_go_through_cufile_and_gpu_decrypt() {
+    let length = 2 * PAGE_BYTES as usize + 4099;
+    let helper = start(GpuMode::Required, 1).unwrap();
+    let data = body(length);
+    let fixture = gpu_fixture(data.clone(), &helper);
+    arrange(&fixture, &helper, 3, length as u64, false, true);
+    let mark = trace_len(&helper);
+    let (head, frames, allocation, _) = gpu_read(&fixture, &helper, None, length as u64);
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert_eq!(frames.len(), 4, "{frames:?}");
+    assert_eq!(frames[3], (2, 3, length as u64, 0));
+    assert!(read_allocation(&allocation, 64, length) == data);
+    assert_eq!(calls(&helper, mark, Operation::FileRead), 3);
+    assert_eq!(calls(&helper, mark, Operation::Decrypt), 3);
+    // Whole pages decrypt straight into the import.
+    assert_eq!(calls(&helper, mark, Operation::CopyD2d), 0);
+    assert_eq!(calls(&helper, mark, Operation::CopyH2d), 0);
+    assert_eq!(worker(&fixture).cpu_decrypts(), 0);
+    assert_eq!(counter(&helper.counters().staged), 3);
+    assert_eq!(counter(&helper.counters().decrypted), 3);
+    assert_idle(&fixture, &helper, default_slots());
+}
+
+#[test]
+fn gpu_read_tampered_disk_ciphertext_fails_and_drops_the_record() {
+    use std::os::unix::fs::FileExt;
+    let helper = start(GpuMode::Required, 1).unwrap();
+    let data = body(5000);
+    let fixture = gpu_fixture(data, &helper);
+    arrange(&fixture, &helper, 1, 5000, false, true);
+    let location = worker(&fixture).disk_location(&page_id(0)).unwrap();
+    let slab = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(worker(&fixture).slab_path())
+        .unwrap();
+    let mut record = vec![0; location.extent.length()];
+    slab.read_exact_at(&mut record, location.extent.offset())
+        .unwrap();
+    let decoded = crate::store::parse_bytes(&record, location.extent).unwrap();
+    let at = location.extent.offset() + decoded.ciphertext.start as u64 + 10;
+    let mut byte = [0];
+    slab.read_exact_at(&mut byte, at).unwrap();
+    slab.write_all_at(&[byte[0] ^ 1], at).unwrap();
+    slab.sync_all().unwrap();
+    let (head, frames, allocation, size) = gpu_read(&fixture, &helper, None, 5000);
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert!(frames.is_empty(), "{frames:?}");
+    assert!(
+        read_allocation(&allocation, 0, size as usize)
+            .iter()
+            .all(|&b| b == 0)
+    );
+    assert_eq!(counter(&helper.counters().rejected), 1);
+    // The owner dropped the record, as after a failed CPU decrypt.
+    assert!(worker(&fixture).disk_location(&page_id(0)).is_none());
+    assert_eq!(worker(&fixture).cpu_decrypts(), 0);
+    assert_idle(&fixture, &helper, default_slots());
+}
+
+/// Replace the retained ciphertext of page 0 with tampered bytes, keeping
+/// the original CRC (`keep_crc`) or the CRC of the tampered bytes.
+fn tamper_retained(fixture: &Fixture, keep_crc: bool) {
+    use crate::memory::CiphertextBytes;
+    use crate::memory::CiphertextPage;
+    let memory = worker(fixture).memory();
+    let copy = memory.unverified(&page_id(0)).unwrap().unwrap().copy;
+    let mut bytes = copy.ciphertext.bytes().to_vec();
+    bytes[3] ^= 0x40;
+    let crc = if keep_crc {
+        copy.ciphertext.checksum()
+    } else {
+        racer_crypto::crc64(&bytes)
+    };
+    let reservation = fixture
+        .listeners
+        .admission
+        .reserve(
+            Some(&definition().id),
+            crate::admission::ResourceClass::Ciphertext,
+            bytes.len(),
+        )
+        .unwrap();
+    let tampered = CiphertextPage {
+        provenance: None,
+        inner: Arc::new(CiphertextBytes {
+            checksum: std::sync::OnceLock::from(crc),
+            envelope: copy.ciphertext.envelope().clone(),
+            storage: flow_control::ChargedBytes { bytes, reservation }.into(),
+        }),
+    };
+    memory.remove_cache(&definition().id).unwrap();
+    memory
+        .publish_ciphertext(crate::memory::UnverifiedPage {
+            copy: crate::memory::CiphertextCopy {
+                metadata: copy.metadata,
+                ciphertext: tampered,
+            },
+            disk_token: None,
+        })
+        .unwrap();
+}
+
+#[test]
+fn gpu_read_crc_and_tag_mismatches_fail_without_writing() {
+    for keep_crc in [true, false] {
+        let helper = start(GpuMode::Required, 1).unwrap();
+        let fixture = gpu_fixture(body(5000), &helper);
+        arrange(&fixture, &helper, 1, 5000, true, false);
+        tamper_retained(&fixture, keep_crc);
+        let mark = trace_len(&helper);
+        let (head, frames, allocation, size) = gpu_read(&fixture, &helper, Some((0, 9)), 10);
+        assert!(head.starts_with("http/1.1 200"), "{head}");
+        assert!(frames.is_empty(), "{frames:?}");
+        assert_eq!(calls(&helper, mark, Operation::Decrypt), 1);
+        // A failed verdict copies nothing out of scratch.
+        assert_eq!(calls(&helper, mark, Operation::CopyD2d), 0);
+        assert!(
+            read_allocation(&allocation, 0, size as usize)
+                .iter()
+                .all(|&b| b == 0)
+        );
+        assert_eq!(counter(&helper.counters().rejected), 1);
+        // The rejected copy left memory.
+        assert!(
+            worker(&fixture)
+                .memory()
+                .unverified(&page_id(0))
+                .unwrap()
+                .is_none()
+        );
+        assert_idle(&fixture, &helper, default_slots());
+    }
+}
+
+#[test]
+fn gpu_read_without_free_staging_reads_disk_through_host_memory() {
+    // Room for the two scratch slots only.
+    let staging = (2 * crate::gpu::SLOT_BYTES).next_multiple_of(crate::config::GPU_STAGING_UNIT);
+    let helper = start_with(staging, |_| {});
+    let data = body(5000);
+    let fixture = gpu_fixture(data.clone(), &helper);
+    arrange(&fixture, &helper, 1, 5000, false, true);
+    let mark = trace_len(&helper);
+    let (head, frames, allocation, _) = gpu_read(&fixture, &helper, None, 5000);
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert_eq!(frames, [(1, 0, 0, 5000), (2, 1, 5000, 0)]);
+    assert_eq!(read_allocation(&allocation, 64, 5000), data);
+    assert_eq!(calls(&helper, mark, Operation::FileRead), 0);
+    assert_eq!(calls(&helper, mark, Operation::Decrypt), 1);
+    assert!(counter(&helper.counters().exhausted) >= 1);
+    assert_eq!(worker(&fixture).cpu_decrypts(), 0);
+    assert_idle(&fixture, &helper, 0);
+}
+
+#[test]
+fn gpu_read_falls_back_to_host_ciphertext_when_cufile_fails() {
+    let helper = start(GpuMode::Required, 1).unwrap();
+    let data = body(5000);
+    let fixture = gpu_fixture(data.clone(), &helper);
+    arrange(&fixture, &helper, 1, 5000, false, true);
+    helper.run(|| sim().fault(Operation::FileRead, -5));
+    let mark = trace_len(&helper);
+    let (head, frames, allocation, _) = gpu_read(&fixture, &helper, None, 5000);
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert_eq!(frames, [(1, 0, 0, 5000), (2, 1, 5000, 0)]);
+    assert_eq!(read_allocation(&allocation, 64, 5000), data);
+    assert_eq!(calls(&helper, mark, Operation::FileRead), 1);
+    assert_eq!(calls(&helper, mark, Operation::CopyH2d), 1);
+    assert_eq!(calls(&helper, mark, Operation::Decrypt), 1);
+    assert_eq!(counter(&helper.counters().file_failures), 1);
+    assert_eq!(worker(&fixture).cpu_decrypts(), 0);
+    assert_idle(&fixture, &helper, default_slots());
+}
+
+#[test]
+fn gpu_read_without_decrypt_kernels_decrypts_on_the_cpu() {
+    let helper = start_with(crate::config::DEFAULT_GPU_STAGING_BYTES, |simulation| {
+        simulation.disable_kernels()
+    });
+    assert!(!helper.decrypts(0));
+    let data = body(5000);
+    let fixture = gpu_fixture(data.clone(), &helper);
+    arrange(&fixture, &helper, 1, 5000, false, true);
+    let mark = trace_len(&helper);
+    let (head, frames, allocation, _) = gpu_read(&fixture, &helper, None, 5000);
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert_eq!(frames, [(1, 0, 0, 5000), (2, 1, 5000, 0)]);
+    assert_eq!(read_allocation(&allocation, 64, 5000), data);
+    assert_eq!(calls(&helper, mark, Operation::Decrypt), 0);
+    assert_eq!(calls(&helper, mark, Operation::FileRead), 0);
+    assert_eq!(worker(&fixture).cpu_decrypts(), 1);
+    assert_idle(&fixture, &helper, default_slots());
+}
