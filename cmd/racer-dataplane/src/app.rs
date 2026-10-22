@@ -131,6 +131,8 @@ pub struct Application {
 /// graph crosses a thread. Worker zero alone drives enrollment/control reloads.
 pub struct NodeState {
     devices: Option<devices::Plan>,
+    /// The process-wide GPU helper, when `gpu-read` is enabled.
+    gpu: Option<Arc<crate::gpu::GpuHelper>>,
     inventory: Arc<crate::rdma::Inventory>,
 
     /// Startup-fixed selector and claimed disks for `/debug/hardware`.
@@ -209,6 +211,7 @@ impl NodeState {
         Ok(Self {
             peer_admission,
             devices: None,
+            gpu: None,
             peer_receive: Default::default(),
             inventory: Arc::new(crate::rdma::Inventory::default()),
             hardware: Default::default(),
@@ -283,6 +286,8 @@ impl Application {
             self.config.limits.retained_snapshots.get(),
         )));
         self.node.inventory.update(self.discovered_nics.clone())?;
+        Arc::get_mut(&mut self.node).ok_or(Error::Internal)?.gpu =
+            crate::gpu::GpuHelper::start(self.config.enable_gpu)?;
         if self.config.enable_rdma {
             self.node.native.place(&plan)?;
             self.node
@@ -1196,10 +1201,12 @@ impl WorkerApplication {
             runtime.reactor.clone(),
             admission.clone(),
         ));
-        let responses = Rc::new(
-            Responses::new(io.clone(), delivery)
-                .with_observer(admission.policy().observer().clone()),
-        );
+        let mut responses = Responses::new(io.clone(), delivery)
+            .with_observer(admission.policy().observer().clone());
+        if let Some(gpu) = &node.gpu {
+            responses = responses.with_gpu(Rc::new(crate::gpu::GpuClient::new(gpu.clone())));
+        }
+        let responses = Rc::new(responses);
         let clients = ClientListeners::new(
             coordinator,
             RequestParser::new(config.limits.header_bytes.get()),

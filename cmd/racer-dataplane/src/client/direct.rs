@@ -67,6 +67,13 @@ impl DirectPage<'_> {
 /// disconnects; its `Drop` must then keep any resource that a device may still
 /// write rather than free it.
 pub trait DirectSink {
+    /// Finish any setup that can still fail the request with an error status,
+    /// such as importing a GPU allocation. Awaited once before the read starts
+    /// and before the response head is sent.
+    fn ready<'a>(&'a mut self, _scope: &'a RequestScope) -> Operation<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Write `page` at `destination_offset` in the client's destination. The
     /// caller guarantees the bytes fall inside the request's destination
     /// window. Resolve only when the bytes are visible to the client.

@@ -969,6 +969,13 @@ async fn serve_connection(
             let sink = responses.open_sink(&request.kind, received.descriptors)?;
             Ok((request, sink))
         });
+        let parsed = match parsed {
+            Ok((request, Some(mut sink))) => match sink.ready(scope).await {
+                Ok(()) => Ok((request, Some(sink))),
+                Err(error) => Err(error),
+            },
+            other => other,
+        };
         let (request, sink) = match parsed {
             Ok(parsed) => parsed,
             Err(error) => {
