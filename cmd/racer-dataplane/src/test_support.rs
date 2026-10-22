@@ -310,6 +310,8 @@ pub mod cluster {
             memory_pressure: true,
             pprof_enabled: false,
             enable_rdma,
+            enable_gpu: crate::config::GpuMode::Disabled,
+            gpu_staging_bytes: crate::config::DEFAULT_GPU_STAGING_BYTES,
             control_endpoint: "https://control.invalid".into(),
             peer_listen: "127.0.0.1:0".parse().unwrap(),
             diagnostics_listen: "127.0.0.1:0".parse().unwrap(),
