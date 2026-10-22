@@ -136,9 +136,17 @@ jobs:
 
   # ---------- Racer block device ----------
   racer-block:
-    name: Racer Block Device
+    name: Racer Block Device (Linux ${{ matrix.kernel }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 40
+    # 6.8 is the minimum supported kernel. 7.0 catches regressions in newer
+    # ublk drivers. Neither result hides the other.
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: ["6.8", "7.0"]
+    env:
+      GUEST_KERNEL: ${{ matrix.kernel }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -150,7 +158,8 @@ jobs:
           cache-dependency-path: go.sum
 
       # The device tests run as root inside a disposable QEMU guest booting the
-      # Ubuntu 24.04 generic 6.8 kernel, the minimum racer-block supports. The
+      # Ubuntu generic kernel for GUEST_KERNEL: 6.8 from 24.04 or 7.0 from 26.04,
+      # downloaded with signed private APT lists and never installed. The
       # runner's Azure kernel does not ship ublk_drv, and a kernel bug in the
       # guest cannot wedge the runner. The harness fails if any suite reports
       # no result, exits nonzero, or skips for missing root, ublk, or io_uring.
@@ -180,10 +189,10 @@ jobs:
           timeout --signal=TERM --kill-after=10s 300s go test -race -c -o bin/racer-block-tests/ublk.test ./internal/racerblock/ublk
           timeout --signal=TERM --kill-after=10s 300s go test -race -c -o bin/racer-block-tests/racerblock.test ./internal/racerblock
 
-      # Budget: up to 300s for the kernel download plus the harness's 600s VM
-      # limit and initramfs build.
-      - name: Test ublk devices in a 6.8 VM
-        run: timeout --signal=TERM --kill-after=30s 960s hack/scripts/racer-block-vm-test.sh run
+      # Budget: up to 300s each for the private APT update and the kernel
+      # download, plus the harness's 600s VM limit and initramfs build.
+      - name: Test ublk devices in a ${{ matrix.kernel }} VM
+        run: timeout --signal=TERM --kill-after=30s 1260s hack/scripts/racer-block-vm-test.sh run
 
   # ---------- Racer Rust workspace ----------
   # Lint, the two workspace feature sets, and the production gates run as
