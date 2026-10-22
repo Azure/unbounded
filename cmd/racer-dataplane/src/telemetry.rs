@@ -47,6 +47,8 @@ pub use server::RESERVED_BYTES;
 pub struct Telemetry {
     pub(crate) profiling: Option<Arc<crate::profiling::ProfilingController>>,
     pub(crate) membership: OnceCell<Rc<dyn Fn() -> Result<MembershipDiagnostic>>>,
+    /// Live hardware discovery for `/debug/hardware`; installed on the control worker only.
+    pub(crate) hardware: OnceCell<Rc<dyn Fn() -> crate::hardware::Report>>,
     pub send_crc: crate::telemetry::Samples,
     pub failures: crate::telemetry::Failures,
     pub metrics: crate::telemetry::Metrics,
@@ -401,6 +403,7 @@ fn get(
         }
         "/metrics" => (Response::Metrics, "", Event::DiagnosticMetrics),
         "/debug/membership" => (Response::Text, "", Event::DiagnosticMetrics),
+        "/debug/hardware" => return hardware(telemetry, output),
         "/debug/failures"
         | "/debug/aead"
         | "/debug/decrypt-failures"
@@ -448,6 +451,29 @@ fn get(
         output.write_str(body)?;
     }
     Ok(response)
+}
+
+/// Serve the live hardware report as pretty JSON, refusing bodies the transport cannot hold.
+fn hardware(
+    telemetry: &Telemetry,
+    output: &mut dyn Write,
+) -> std::result::Result<Response, std::fmt::Error> {
+    telemetry.metrics.record(Event::DiagnosticHardware, 1);
+    let Some(read) = telemetry.hardware.get() else {
+        output.write_str("unavailable\n")?;
+        return Ok(Response::Unavailable);
+    };
+    let Ok(mut body) = serde_json::to_string_pretty(&read()) else {
+        output.write_str("unavailable\n")?;
+        return Ok(Response::Unavailable);
+    };
+    body.push('\n');
+    if body.len() > ::telemetry::server::MAX_BODY_BYTES {
+        output.write_str("response_too_large\n")?;
+        return Ok(Response::Unavailable);
+    }
+    output.write_str(&body)?;
+    Ok(Response::Json)
 }
 
 #[cfg(test)]
@@ -2965,6 +2991,7 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::FillEncryptNs => "racer_fill_encrypt_nanoseconds_sum",
             Self::FillChecksumCount => "racer_fill_checksum_nanoseconds_count",
             Self::FillChecksumNs => "racer_fill_checksum_nanoseconds_sum",
+            Self::DiagnosticHardware => "racer_diagnostic_hardware_total",
 }
 metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::WarmTrackedJobs => "racer_warm_tracked_jobs",
@@ -3526,6 +3553,81 @@ pub(crate) mod tests {
             assert!(!text.contains("synthetic"));
             finish(server, &scope, &reactor);
             text
+        }
+
+        /// Exchange one GET without asserting the status.
+        fn diagnostic_response(telemetry: &Telemetry, path: &str) -> String {
+            let (_, reactor, io) = setup();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let scope = scope();
+            let mut server = telemetry.serve_listener_with_io(listener, io, &scope);
+            let request = format!("GET {path} HTTP/1.1\r\nHost: local\r\n\r\n");
+            let bytes = exchange_raw(address, request.as_bytes(), &mut server, &reactor);
+            finish(server, &scope, &reactor);
+            String::from_utf8(bytes).unwrap()
+        }
+
+        fn hardware_counter(telemetry: &Telemetry) -> bool {
+            let mut text = String::new();
+            telemetry.metrics.write_prometheus(&mut text).unwrap();
+            text.lines()
+                .any(|line| line == "racer_diagnostic_hardware_total 1")
+        }
+
+        #[test]
+        fn hardware_endpoint_serves_json_and_counts_requests() {
+            let telemetry = Telemetry::default();
+            assert!(
+                telemetry
+                    .hardware
+                    .set(Rc::new(|| crate::hardware::Report {
+                        errors: vec!["rdma_devices: example".into()],
+                        ..Default::default()
+                    }))
+                    .is_ok()
+            );
+            let text = diagnostic_text(&telemetry, "/debug/hardware");
+            let (head, body) = text.split_once("\r\n\r\n").unwrap();
+            assert!(head.contains("\r\nContent-Type: application/json\r\n"));
+            assert!(body.ends_with("}\n"));
+            let value: serde_json::Value = serde_json::from_str(body).unwrap();
+            for key in ["block_devices", "rdma_devices", "racer", "errors"] {
+                assert!(value.get(key).is_some(), "{key}");
+            }
+            assert_eq!(value["errors"][0], "rdma_devices: example");
+            assert!(hardware_counter(&telemetry));
+        }
+
+        #[test]
+        fn hardware_endpoint_unavailable_oversize_and_exact_path() {
+            let telemetry = Telemetry::default();
+            let text = diagnostic_response(&telemetry, "/debug/hardware");
+            assert_response(
+                text.as_bytes(),
+                "503 Service Unavailable",
+                Some("unavailable\n"),
+            );
+            assert!(hardware_counter(&telemetry));
+            let text = diagnostic_response(&telemetry, "/debug/hardware?x");
+            assert_response(text.as_bytes(), "404 Not Found", Some("not found\n"));
+            let text = diagnostic_response(&telemetry, "/debug/hardware/");
+            assert_response(text.as_bytes(), "404 Not Found", Some("not found\n"));
+            assert!(
+                telemetry
+                    .hardware
+                    .set(Rc::new(|| crate::hardware::Report {
+                        errors: vec!["x".repeat(::telemetry::server::MAX_BODY_BYTES)],
+                        ..Default::default()
+                    }))
+                    .is_ok()
+            );
+            let text = diagnostic_response(&telemetry, "/debug/hardware");
+            assert_response(
+                text.as_bytes(),
+                "503 Service Unavailable",
+                Some("response_too_large\n"),
+            );
         }
 
         #[test]
