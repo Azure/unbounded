@@ -312,6 +312,13 @@ notices:
     license:
       - name: Apache License, Version 2.0
         link: https://github.com/containerd/containerd/blob/v2.4.1/LICENSE
+  - dependency: github.com/containerd/continuity
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/containerd/continuity/blob/v0.5.0/LICENSE
   - dependency: github.com/containerd/errdefs
     ecosystem: go
     copyright:
@@ -354,6 +361,13 @@ notices:
     license:
       - name: Apache License, Version 2.0
         link: https://github.com/coreos/go-iptables/blob/v0.8.0/LICENSE
+  - dependency: github.com/distribution/reference
+    ecosystem: go
+    copyright:
+      - See LICENSE file
+    license:
+      - name: Apache License, Version 2.0
+        link: https://github.com/distribution/reference/blob/v0.6.0/LICENSE
   - dependency: github.com/dustin/go-humanize
     ecosystem: go
     copyright:
@@ -474,6 +488,22 @@ notices:
     license:
       - name: MIT License
         link: https://github.com/ipfs/go-cid/blob/v0.6.2/LICENSE
+  - dependency: github.com/klauspost/compress
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2012 The Go Authors. All rights reserved.
+      - Copyright (c) 2019 Klaus Post. All rights reserved.
+      - Copyright 2016-2017 The New York Times Company
+      - Copyright (c) 2015 Klaus Post
+      - Copyright (c) 2011 The Snappy-Go Authors. All rights reserved.
+      - Copyright 2016 The filepathx Authors
+    license:
+      - name: BSD 3-Clause License
+        link: https://github.com/klauspost/compress/blob/v1.20.0/LICENSE
+      - name: Apache License, Version 2.0
+        link: https://github.com/klauspost/compress/blob/v1.20.0/LICENSE
+      - name: MIT License
+        link: https://github.com/klauspost/compress/blob/v1.20.0/LICENSE
   - dependency: github.com/lib/pq
     ecosystem: go
     copyright:
@@ -556,6 +586,13 @@ notices:
     license:
       - name: MIT License
         link: https://github.com/pelletier/go-toml/blob/v2.4.3/LICENSE
+  - dependency: github.com/pierrec/lz4/v4
+    ecosystem: go
+    copyright:
+      - Copyright (c) 2015, Pierre Curto
+    license:
+      - name: BSD 3-Clause License
+        link: https://github.com/pierrec/lz4/blob/v4.1.28/LICENSE
   - dependency: github.com/pin/tftp/v3
     ecosystem: go
     copyright:

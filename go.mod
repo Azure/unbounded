@@ -73,9 +73,9 @@ require (
 	github.com/opencontainers/umoci v0.6.0
 	github.com/oracle/oci-go-sdk/v65 v65.126.1
 	github.com/pelletier/go-toml/v2 v2.4.3
+	github.com/pierrec/lz4/v4 v4.1.28
 	github.com/pin/tftp/v3 v3.2.0
 	github.com/pion/stun/v3 v3.1.7
-	github.com/pierrec/lz4/v4 v4.1.28
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/client_model v0.6.2
 	github.com/prometheus/common v0.70.1

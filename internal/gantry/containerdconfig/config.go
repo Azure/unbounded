@@ -322,6 +322,7 @@ func marshalDropIn(config []byte, address, snapshotterName string) ([]byte, erro
 	}
 
 	plugins := make(map[string]any, 1)
+
 	_, hasCRIImagesPlugin := source.Plugins["io.containerd.cri.v1.images"]
 	if hasCRIImagesPlugin || source.Version >= 3 {
 		plugins["io.containerd.cri.v1.images"] = map[string]any{
