@@ -265,6 +265,7 @@ impl Application {
         )?;
         self.config.admission_history_per_worker(plan.pairs.len())?;
         log_worker_plan("final", &plan);
+        install_shared_memory(&self.config);
         self.node = Arc::new(NodeState::with_peer_admission(
             plan.pairs.iter().map(|p| p.worker).collect(),
             self.limits.queue_entries.get(),
@@ -2990,6 +2991,31 @@ impl WorkerPressure {
             trims: Default::default(),
             samples_memory: sampler,
             next_memory_sample: racer_platform::environment::now(),
+        }
+    }
+}
+
+/// Size and map the shared plaintext slab before any worker allocates plaintext.
+///
+/// Every plaintext allocation is admitted against the node-wide plaintext limit,
+/// so the slab only needs that much plus headroom for delivery copies of pages
+/// that were allocated before installation or fell back to private memory.
+/// Failure leaves clients on inline delivery.
+fn install_shared_memory(config: &Config) {
+    if !config.client_shared_memory {
+        eprintln!("racer-dataplane: client shared memory disabled");
+        return;
+    }
+    let plaintext = config.limits.plaintext_bytes.get();
+    let headroom = (plaintext / 8).max(64 * page_alloc::shared::SLOT_BYTES);
+    let bytes = plaintext.saturating_add(headroom);
+    match page_alloc::shared::install(bytes) {
+        Ok(()) => eprintln!(
+            "racer-dataplane: client shared memory installed bytes={}",
+            page_alloc::shared::len()
+        ),
+        Err(error) => {
+            eprintln!("racer-dataplane: client shared memory unavailable error={error}")
         }
     }
 }

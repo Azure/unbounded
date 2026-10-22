@@ -37,6 +37,12 @@ type ClientConfig struct {
 	// Stat. Each lane has a bounded queue; calls fail with [ErrUnavailable] if
 	// it is full or the wait times out.
 	MaxConnections int
+	// InlineDelivery disables mapped delivery, for benchmarking and
+	// debugging. By default, on Linux, Racer lends the client read-only
+	// shared memory holding each page instead of writing page bytes into
+	// the socket, and the SDK copies or writes them out from there. With
+	// InlineDelivery, every page is sent through the socket.
+	InlineDelivery bool
 }
 
 // Internal limits. Stat and small-object reads have their own lanes so they
@@ -81,6 +87,8 @@ type Client struct {
 	path    string
 	limits  clientLimits
 	maxIdle int
+	inline  bool
+	maps    mappings
 
 	bulk, small, stat lane
 
@@ -131,6 +139,7 @@ func newClient(config ClientConfig, path string) (*Client, error) {
 		path:    path,
 		limits:  defaultClientLimits,
 		maxIdle: min(statIdleConnections, config.MaxConnections),
+		inline:  config.InlineDelivery,
 		bulk:    newLane(config.MaxConnections, bulkQueue),
 		small:   newLane(smallConnections, smallQueue),
 		stat:    newLane(config.MaxConnections, statQueue),
@@ -184,6 +193,9 @@ func (c *Client) Close() error {
 	for _, conn := range idle {
 		closeQuietly(conn)
 	}
+
+	// Objects still reading keep their mapping until they end.
+	c.maps.close()
 
 	return nil
 }
@@ -371,6 +383,7 @@ func (c *Client) Get(ctx context.Context, request Request, options ...ReadOption
 		Ordered:     true,
 		SmallObject: o.SmallObject,
 		Pin:         o.ETag,
+		Mapped:      mappedSupported && !c.inline,
 	}
 
 	head, err := wire.SubscriptionHead(r, subscription)
@@ -413,13 +426,21 @@ func (c *Client) open(ctx context.Context, head []byte, o wire.SubscriptionOptio
 		return nil, err
 	}
 
+	if o.Mapped {
+		receiveRights(conn)
+	}
+
 	// Closing the connection interrupts any blocked read or write when ctx
 	// ends, including a client Close.
 	stop := context.AfterFunc(ctx, func() { closeQuietly(conn) })
 
+	var held *mapping
+
 	fail := func(err error) (*Object, error) {
 		stop()
 		closeQuietly(conn)
+		conn.discardRights()
+		c.maps.release(held)
 
 		if ctx.Err() != nil {
 			return nil, contextError(op, ctx)
@@ -446,17 +467,36 @@ func (c *Client) open(ctx context.Context, head []byte, o wire.SubscriptionOptio
 		return fail(err)
 	}
 
+	if response.Mapped {
+		// Racer attaches the memory to the head, but accept it on any read
+		// before the first page frame.
+		held, err = takeMapping(&c.maps, conn, false)
+		if err != nil {
+			return fail(err)
+		}
+	} else {
+		conn.discardRights()
+	}
+
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		return fail(err)
 	}
 
+	seq := wire.NewSequence(response.First, response.End, true)
+	if response.Mapped {
+		seq = wire.NewMappedSequence(response.First, response.End, true)
+	}
+
 	return &Object{
+		maps:     &c.maps,
+		mapped:   response.Mapped,
+		mapping:  held,
 		ctx:      ctx,
 		stop:     stop,
 		conn:     conn,
 		timeout:  c.limits.bodyTimeout,
 		metadata: fromWireMetadata(response.Metadata),
-		seq:      wire.NewSequence(response.First, response.End, true),
+		seq:      seq,
 		first:    response.First,
 		end:      response.End,
 		pages:    response.Pages,
@@ -532,6 +572,7 @@ func (c *Client) bind(parent context.Context) (context.Context, func()) {
 type clientConn struct {
 	net.Conn
 	r         *bufio.Reader
+	rights    *rightsReader // nil unless the connection receives descriptors
 	expires   time.Time
 	idleSince time.Time
 }
@@ -572,6 +613,54 @@ func (c *Client) conn(ctx context.Context, op string, fresh bool) (*clientConn, 
 	age -= time.Duration(rand.Int64N(int64(age/4) + 1))
 
 	return &clientConn{Conn: nc, r: bufio.NewReader(nc), expires: now.Add(age)}, false, nil
+}
+
+// takeMapping maps the delivery memory received on conn so far and closes
+// every received descriptor. Without a descriptor it returns nil, or a
+// protocol error if require is set. More than one descriptor is a protocol
+// error.
+func takeMapping(maps *mappings, conn *clientConn, require bool) (*mapping, error) {
+	var (
+		fds []int
+		err error
+	)
+
+	if conn.rights != nil {
+		fds, err = conn.rights.take()
+	}
+
+	bad := func(reason string) error {
+		closeFDs(fds)
+		return failure(wire.ErrorProtocol, "get", errors.New(reason))
+	}
+
+	switch {
+	case err != nil:
+		return nil, bad("malformed descriptor message: " + err.Error())
+	case len(fds) > 1:
+		return nil, bad("more than one delivery descriptor")
+	case len(fds) == 0 && require:
+		return nil, bad("mapped delivery without a descriptor")
+	case len(fds) == 0:
+		return nil, nil
+	}
+
+	mp, err := maps.acquire(fds[0])
+	if err != nil {
+		return nil, failure(wire.ErrorProtocol, "get", err)
+	}
+
+	return mp, nil
+}
+
+// discardRights closes any descriptors received on conn.
+func (conn *clientConn) discardRights() {
+	if conn.rights == nil {
+		return
+	}
+
+	fds, _ := conn.rights.take() //nolint:errcheck // Discarding.
+	closeFDs(fds)
 }
 
 func (c *Client) recycle(conn *clientConn) {

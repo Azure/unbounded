@@ -45,6 +45,12 @@ wire cache identity (`CacheID`).
 Pod mounts grant access: expose only the needed cache/role. Origins need existing trusted
 parent directories. Clients do not automatically bypass Racer to connect directly to origins.
 
+By default the dataplane keeps decrypted pages in one shared memory region and passes a
+read-only handle to it over the client socket. SDK clients read page bytes from that
+region instead of the socket. Any process that can open the client socket can read every
+page in the region, not only the pages it asked for. Treat client socket access as access
+to all cached plaintext of that dataplane, or set `RACER_CLIENT_SHARED_MEMORY=false`.
+
 ### Managed Azure origin
 
 Set `spec.origin` to have the operator run a `racer-object origin` DaemonSet for
@@ -195,6 +201,7 @@ Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
 | `RACER_READER_STALL_TIMEOUT_MS` | `10000` | At least 1 ms and no greater than request timeout |
 | `RACER_SHUTDOWN_TIMEOUT_MS` | `30000` | 1..3,600,000 ms |
 | `RACER_MEMORY_PRESSURE` | `true` | Respond to cgroup v2 memory pressure; see [memory-pressure response](#memory-pressure-response); only the exact values `true` and `false` are accepted |
+| `RACER_CLIENT_SHARED_MEMORY` | `true` | Serve plaintext pages to clients from a shared read-only memory region (about 1.125x `RACER_PLAINTEXT_BYTES`, always resident once used); `false` sends page bytes over the socket; only the exact values `true` and `false` are accepted |
 
 Exact sizing requires both count settings. Their sum must fit `RACER_MAX_THREADS`;
 the cap is never raised implicitly. The first NUMA node in the normal placement

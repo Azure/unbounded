@@ -3,6 +3,11 @@
 use racer_dataplane::app::Application;
 use racer_dataplane::config::Config;
 
+/// Serves plaintext pages from the shared slab that clients map read-only.
+/// Every other allocation passes through to the system allocator.
+#[global_allocator]
+static ALLOCATOR: page_alloc::shared::SharedAllocator = page_alloc::shared::SharedAllocator::new();
+
 fn main() -> std::process::ExitCode {
     tune_allocator();
 

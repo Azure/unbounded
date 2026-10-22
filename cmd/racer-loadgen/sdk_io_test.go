@@ -160,3 +160,128 @@ func TestSyntheticOriginEmptyRangesAndMissingPin(t *testing.T) {
 	require.ErrorIs(t, err, racersdk.ErrVersionMismatch)
 	require.Nil(t, body)
 }
+
+// chunkedReader returns data in small reads, then ending.
+type chunkedReader struct {
+	data   []byte
+	ending error
+}
+
+func (r *chunkedReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, r.ending
+	}
+
+	n := copy(p[:min(len(p), 3)], r.data)
+	r.data = r.data[n:]
+
+	return n, nil
+}
+
+func TestReadBodyCopyUsesRead(t *testing.T) {
+	for _, ending := range []error{io.EOF, io.ErrUnexpectedEOF} {
+		t.Run(fmt.Sprint(ending), func(t *testing.T) {
+			opts := pullTestOptions("http://unused")
+			opts.Verify, opts.Consume = false, consumeCopy
+			p, metrics := pullTestNew(t, &syntheticImage{}, opts)
+
+			for range 2 {
+				body := &drainProbe{Reader: &chunkedReader{data: []byte("payload"), ending: ending}}
+				n, hash, err := p.readBody(body)
+
+				if ending == io.EOF {
+					require.NoError(t, err)
+				} else {
+					require.ErrorIs(t, err, ending)
+				}
+
+				require.Equal(t, int64(7), n)
+				require.Empty(t, hash)
+				require.Nil(t, body.destination, "copy must read every byte, not invoke WriteTo")
+			}
+
+			require.Equal(t, float64(14), testutil.ToFloat64(metrics.receivedBytes))
+			require.Zero(t, testutil.ToFloat64(metrics.verifiedBytes))
+		})
+	}
+}
+
+func TestReadBodyCopyBuffer(t *testing.T) {
+	opts := pullTestOptions("http://unused")
+	opts.Verify, opts.Consume = false, consumeCopy
+	p, _ := pullTestNew(t, &syntheticImage{}, opts)
+
+	var sizes []int
+
+	body := readFunc(func(b []byte) (int, error) {
+		sizes = append(sizes, len(b))
+		return 0, io.EOF
+	})
+	_, _, err := p.readBody(body)
+	require.NoError(t, err)
+	require.Equal(t, []int{copyBufferBytes}, sizes)
+}
+
+type readFunc func([]byte) (int, error)
+
+func (f readFunc) Read(b []byte) (int, error) { return f(b) }
+
+func TestReadBodyVerifyIgnoresConsume(t *testing.T) {
+	opts := pullTestOptions("http://unused")
+	opts.Consume = consumeCopy
+	p, _ := pullTestNew(t, &syntheticImage{}, opts)
+	n, hash, err := p.readBody(strings.NewReader("payload"))
+	require.NoError(t, err)
+	require.Equal(t, int64(7), n)
+	require.Equal(t, digest.FromString("payload").String(), hash)
+}
+
+func TestSDKCopyAcrossPages(t *testing.T) {
+	const size = racersdk.PageSize + 73
+
+	catalog, err := newBlobCatalog(t.Context(), "test/blob", "copy", 1, size)
+	require.NoError(t, err)
+	origin, _, err := syntheticOrigin(catalog, newMetrics(prometheus.NewRegistry()))
+	require.NoError(t, err)
+	client := racersdktest.NewClient(t, origin)
+	opts := pullTestOptions("http://unused")
+	opts.Verify, opts.Consume = false, consumeCopy
+	p, metrics := pullTestNew(t, &syntheticImage{}, opts)
+	p.acquire = udsAcquirer(client)
+	require.NoError(t, p.pullBatch(t.Context(), catalog.batches[0]))
+	require.Equal(t, float64(size), testutil.ToFloat64(metrics.receivedBytes))
+}
+
+func TestDeliveryOptions(t *testing.T) {
+	for _, test := range []struct {
+		args   []string
+		inline bool
+	}{
+		{nil, false},
+		{[]string{"--delivery=mapped"}, false},
+		{[]string{"--delivery=inline"}, true},
+	} {
+		t.Run(fmt.Sprint(test.args), func(t *testing.T) {
+			opts, err := parseOptions(append([]string{"--backend=uds", "--cache=test"}, test.args...), io.Discard)
+			require.NoError(t, err)
+			require.Equal(t, test.inline, sdkClientConfig(opts.pull, 1).InlineDelivery)
+		})
+	}
+
+	for _, mutate := range []func(*pullOptions){
+		func(o *pullOptions) { o.Delivery = "splice" },
+		func(o *pullOptions) { o.Consume = "hash" },
+	} {
+		opts := pullTestOptions("http://unused")
+		mutate(&opts)
+		_, err := newPuller(&syntheticImage{}, opts, pullTestMetrics())
+		require.Error(t, err)
+	}
+
+	opts := pullTestOptions("http://unused")
+	p, err := newPuller(&syntheticImage{}, opts, pullTestMetrics())
+	require.NoError(t, err)
+	require.Equal(t, deliveryMapped, p.opts.Delivery)
+	require.Equal(t, consumeDiscard, p.opts.Consume)
+	p.close()
+}

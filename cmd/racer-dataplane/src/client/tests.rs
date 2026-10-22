@@ -1094,6 +1094,7 @@ impl Fixture {
                     &scope,
                     &mut observation,
                     Duration::from_secs(5),
+                    false,
                 )
                 .await?;
                 Ok(())

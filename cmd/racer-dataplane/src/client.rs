@@ -80,8 +80,19 @@ impl RequestParser {
     /// must not have their value trimmed by the codec. Decoded fields cannot
     /// reconstruct wire length: unknown fields need not have a separator SP.
     pub fn parse(&self, cache: &CacheId, head: MessageHead) -> Result<ClientRequest> {
+        self.parse_with_delivery(cache, head)
+            .map(|(request, _)| request)
+    }
+
+    /// Parse a request and whether its subscription asked for mapped delivery.
+    pub fn parse_with_delivery(
+        &self,
+        cache: &CacheId,
+        head: MessageHead,
+    ) -> Result<(ClientRequest, bool)> {
         let request = self.wire.parse(&head)?;
-        Ok(ClientRequest {
+        let mapped = request.mapped;
+        let request = ClientRequest {
             retain: request.retain,
             kind: request.kind,
             origin: OriginContext {
@@ -98,7 +109,8 @@ impl RequestParser {
                     .map(Authorization::from_header)
                     .transpose()?,
             },
-        })
+        };
+        Ok((request, mapped))
     }
 }
 
@@ -115,6 +127,7 @@ async fn handle_read_result(
     scope: &RequestScope,
     observation: &mut crate::telemetry::RequestMetrics,
     timeout: Duration,
+    mapped: bool,
 ) -> Result<Option<ConnectionLease>> {
     let response = match read_result {
         Ok(response) => response,
@@ -163,7 +176,14 @@ async fn handle_read_result(
     let mut watch = watch_room.then(|| responses.io.disconnected(&connection, &watch_scope));
     let mut poll_disconnect = !watch_room;
     let mut send = if matches!(kind, ReadKind::Subscription { .. }) {
-        responses.send_subscription(connection, response, scope, observation, timeout)
+        responses.send_subscription(
+            connection,
+            response,
+            scope,
+            observation,
+            timeout,
+            mapped && page_alloc::shared::installed(),
+        )
     } else {
         responses.send_observed(connection, response, scope, observation)
     };
@@ -313,10 +333,103 @@ impl Releases {
 async fn send_frame(
     io: &HttpIo,
     connection: ConnectionLease,
-    bytes: [u8; 21],
+    bytes: &[u8],
     scope: &RequestScope,
 ) -> Result<ConnectionLease> {
-    Ok(io.write_body_bytes(connection, &bytes, scope).await?.lease)
+    Ok(io.write_body_bytes(connection, bytes, scope).await?.lease)
+}
+
+/// Page bytes a mapped client may read in place until it credits them.
+enum MappedPage {
+    /// The page's own plaintext, already in shared memory.
+    Shared(#[allow(dead_code)] crate::memory::VerifiedPage),
+    /// A shared-memory copy of plaintext that lived elsewhere.
+    Copied(#[allow(dead_code)] zeroize::Zeroizing<Vec<u8>>),
+}
+
+/// Consume releases until none are outstanding, the client closes, or the
+/// scope's deadline passes. Only malformed releases are errors.
+async fn drain_releases<L: Clone + 'static>(
+    io: &HttpIo,
+    socket: &Rc<racer_platform::reactor::descriptor::Descriptor>,
+    reservation: L,
+    releases: &mut Releases,
+    stream: &mut RangeStream,
+    outstanding: &mut BTreeMap<PageNumber, u32>,
+    scope: &RequestScope,
+) -> Result<()> {
+    let mut ready: Option<Operation<'_, u32>> = None;
+    std::future::poll_fn(|cx| {
+        loop {
+            match releases.poll(cx, socket, stream, outstanding, None) {
+                Ok(_) if outstanding.is_empty() => return Poll::Ready(Ok(())),
+                Ok(_) => {}
+                // The client closed: it no longer reads any page.
+                Err(Error::Io) => return Poll::Ready(Ok(())),
+                Err(error) => return Poll::Ready(Err(error)),
+            }
+            if ready.is_none() {
+                ready = Some(io.reactor().readiness_with_lease(
+                    socket.clone(),
+                    libc::POLLIN as u32,
+                    reservation.clone(),
+                    scope,
+                ));
+            }
+            match ready.as_mut().unwrap().as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(_)) => ready = None,
+                // Deadline or cancellation: stop waiting; the caller decides.
+                Poll::Ready(Err(_)) => return Poll::Ready(Ok(())),
+            }
+        }
+    })
+    .await
+}
+
+/// After a failed mapped delivery, half-close and wait (bounded) for the client
+/// to close, so pinned pages are not reused while it may still read them.
+async fn linger_until_closed<L: Clone + 'static>(
+    io: &HttpIo,
+    socket: Rc<racer_platform::reactor::descriptor::Descriptor>,
+    reservation: L,
+    scope: &RequestScope,
+    timeout: Duration,
+) {
+    // SAFETY: shutdown only changes socket state; the fd stays owned by `socket`.
+    unsafe {
+        libc::shutdown(std::os::fd::AsRawFd::as_raw_fd(&*socket), libc::SHUT_WR);
+    }
+    let Ok(linger) = RequestScope::new(scope.request, racer_platform::environment::now() + timeout)
+    else {
+        return;
+    };
+    let mut discard = [0u8; 256];
+    loop {
+        if linger.check().is_err() {
+            return;
+        }
+        match socket.try_recv(&mut discard) {
+            Ok(0) => return,
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        }
+        if io
+            .reactor()
+            .readiness_with_lease(
+                socket.clone(),
+                libc::POLLIN as u32,
+                reservation.clone(),
+                &linger,
+            )
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
 }
 
 /// Tag only an error returned by this branch.
@@ -381,8 +494,15 @@ impl Responses {
         Box::pin(async move {
             let metrics = crate::telemetry::Metrics::default();
             let mut observation = metrics.request()?;
-            self.send_subscription(connection, response, scope, &mut observation, timeout)
-                .await
+            self.send_subscription(
+                connection,
+                response,
+                scope,
+                &mut observation,
+                timeout,
+                false,
+            )
+            .await
         })
     }
 
@@ -394,228 +514,337 @@ impl Responses {
         scope: &'a RequestScope,
         observation: &'a mut crate::telemetry::RequestMetrics,
         timeout: Duration,
+        mapped: bool,
     ) -> Operation<'a, ConnectionLease> {
         Box::pin(async move {
-            let head = subscription_head(&response.metadata, response.payload.range())?;
-            let expected = response.payload.range().map_or(0, |r| r.len());
-            let mut first = if let ReadPayload::Stream(stream) = &mut response.payload {
-                match stream.next_slice().await {
-                    Ok(Some(reader)) => Some(reader),
-                    result => {
-                        let error = result.err().unwrap_or(Error::BadGateway);
-                        self.observer.record(
-                            crate::telemetry::Failure::new(
-                                crate::telemetry::Stage::FirstSlice,
-                                error,
-                            )
-                            .request(scope)
-                            .detail(
-                                crate::telemetry::Detail::ClientDelivery {
-                                    boundary: crate::telemetry::ClientBoundary::Stream,
-                                    sent: 0,
-                                    expected,
-                                },
-                            ),
-                        );
-                        observation.fail(error);
-                        return self.send_error(connection, error, scope).await;
-                    }
-                }
-            } else {
-                None
-            };
-            connection.poison();
-            connection = self.io.send_head(connection, head, scope).await?.connection;
-            let socket = connection.socket();
-            let reservation = connection.slot().cloned();
-            let mut releases = Releases {
-                bytes: [0; 12],
-                used: 0,
-                ahead: connection.take_read_ahead(),
-                provisional: false,
-            };
-            let mut outstanding = BTreeMap::new();
-            let mut sent = 0;
-            let mut pages = 0;
-            if let ReadPayload::Stream(stream) = &mut response.payload {
-                let range = stream.range();
-                stream.enable_progress(timeout);
-                while sent < expected {
-                    let mut progress_scope = scope.clone();
-                    progress_scope.deadline.0 = racer_platform::environment::now() + timeout;
-                    let reader = if let Some(reader) = first.take() {
-                        reader
-                    } else {
-                        // Pending acquisition and pipe admission live in the stream.
-                        // Drop only the borrowing future so duplex release_page can
-                        // update credits without discarding the pipe waiter's wake.
-                        let mut ready = None;
-                        let boundary =
-                            std::cell::Cell::new(crate::telemetry::ClientBoundary::Stream);
-                        std::future::poll_fn(|cx| {
-                            if let Err(error) = progress_scope.check() {
-                                return Poll::Ready(Err(boundary_error(
-                                    error,
-                                    &boundary,
-                                    crate::telemetry::ClientBoundary::Scope,
-                                )));
-                            }
-                            if let Err(error) =
-                                releases.poll(cx, &socket, stream, &mut outstanding, None)
-                            {
-                                return Poll::Ready(Err(boundary_error(
-                                    error,
-                                    &boundary,
-                                    crate::telemetry::ClientBoundary::ReleaseProcessing,
-                                )));
-                            }
-                            poll_slice_or_readiness(
-                                cx,
-                                |cx| {
-                                    observe_boundary(
-                                        stream.next_slice().as_mut().poll(cx),
-                                        &boundary,
-                                        crate::telemetry::ClientBoundary::Stream,
-                                    )
-                                },
-                                |cx| {
-                                    if ready.is_none() {
-                                        ready = Some(self.io.reactor().readiness_with_lease(
-                                            socket.clone(),
-                                            libc::POLLIN as u32,
-                                            reservation.clone(),
-                                            &progress_scope,
-                                        ));
-                                    }
-                                    let result = observe_boundary(
-                                        ready.as_mut().unwrap().as_mut().poll(cx),
-                                        &boundary,
-                                        crate::telemetry::ClientBoundary::ReleaseReadiness,
-                                    );
-                                    if result.is_ready() {
-                                        ready = None;
-                                    }
-                                    result
-                                },
-                            )
-                        })
-                        .await
-                        .inspect_err(|&error| {
+            // Mapped pages the client may still be reading, and the socket whose
+            // close tells us it stopped. Both outlive the delivery body.
+            let mut held: BTreeMap<PageNumber, MappedPage> = BTreeMap::new();
+            let mut linger = None;
+            let result: Result<ConnectionLease> = async {
+                let head = if mapped {
+                    racer_object_wire::client::mapped_subscription_head(
+                        &response.metadata,
+                        response.payload.range(),
+                    )?
+                } else {
+                    subscription_head(&response.metadata, response.payload.range())?
+                };
+                let expected = response.payload.range().map_or(0, |r| r.len());
+                let mut first = if let ReadPayload::Stream(stream) = &mut response.payload {
+                    match stream.next_slice().await {
+                        Ok(Some(reader)) => Some(reader),
+                        result => {
+                            let error = result.err().unwrap_or(Error::BadGateway);
                             self.observer.record(
                                 crate::telemetry::Failure::new(
-                                    crate::telemetry::Stage::NextSlice,
+                                    crate::telemetry::Stage::FirstSlice,
                                     error,
                                 )
                                 .request(scope)
                                 .detail(
                                     crate::telemetry::Detail::ClientDelivery {
-                                        boundary: boundary.get(),
-                                        sent,
+                                        boundary: crate::telemetry::ClientBoundary::Stream,
+                                        sent: 0,
                                         expected,
                                     },
                                 ),
                             );
-                        })?
-                        .ok_or(Error::BadGateway)?
-                    };
-                    let slice = reader.slice();
-                    if range.slice_at(slice.page)? != Some(slice)
-                        || reader.bytes_sent() != 0
-                        || slice.length == 0
-                        || u64::from(slice.length) > expected - sent
-                        || outstanding.contains_key(&slice.page)
-                    {
-                        return Err(Error::BadGateway);
+                            observation.fail(error);
+                            return self.send_error(connection, error, scope).await;
+                        }
                     }
-                    let offset = slice
-                        .page
-                        .0
-                        .checked_mul(PAGE_BYTES)
-                        .and_then(|n| n.checked_add(u64::from(slice.offset)))
-                        .ok_or(Error::BadGateway)?;
-                    // Acquisition owns no delivery pipe and continues even while
-                    // the page frame or payload is blocked on this socket.
-                    let final_send = crate::http::FinalSend::default();
-                    let mut write = Box::pin(async {
-                        let connection = send_frame(
-                            &self.io,
+                } else {
+                    None
+                };
+                connection.poison();
+                connection = if mapped {
+                    let memory = page_alloc::shared::readonly_fd().ok_or(Error::Overloaded)?;
+                    self.io
+                        .send_head_with_descriptor(
                             connection,
-                            frame(1, slice.page.0, offset, slice.length),
-                            &progress_scope,
+                            head,
+                            scope,
+                            std::os::fd::AsRawFd::as_raw_fd(&memory),
                         )
-                        .await?;
-                        self.delivery
-                            .finish_subscription(reader, connection, &progress_scope, &final_send)
-                            .await
-                    });
-                    let mut ready: Option<Operation<'_, u32>> = None;
-                    let result = std::future::poll_fn(|cx| {
-                        // A peer can see the final bytes before we observe their
-                        // CQE. Retain one exact provisional release, without
-                        // releasing credit or any I/O owner before full completion.
-                        if let Poll::Ready(result) = write.as_mut().poll(cx) {
-                            return Poll::Ready(result);
-                        }
-                        if let Err(error) = releases.poll(
-                            cx,
-                            &socket,
-                            stream,
-                            &mut outstanding,
-                            Some((slice, &final_send)),
-                        ) {
-                            return Poll::Ready(Err(error));
-                        }
-                        // No release can replenish credit until a previous page
-                        // has completed. Avoid consuming a reactor slot solely
-                        // to watch input when there is nothing releasable.
-                        if ready.is_none() && !outstanding.is_empty() {
-                            let reactor = self.io.reactor().clone();
-                            let socket = socket.clone();
-                            let reservation = reservation.clone();
-                            let mut receive_scope = scope.clone();
-                            receive_scope.deadline.0 = racer_platform::environment::now() + timeout;
-                            ready = Some(Box::pin(async move {
-                                reactor
-                                    .readiness_with_lease(
-                                        socket,
-                                        libc::POLLIN as u32,
-                                        reservation,
-                                        &receive_scope,
-                                    )
-                                    .await
-                            }));
-                        }
-                        if let Some(wait) = ready.as_mut()
-                            && let Poll::Ready(result) = wait.as_mut().poll(cx)
-                        {
-                            ready = None;
-                            // Payload delivery owns its progress-based stall
-                            // deadline. An idle release direction must not turn
-                            // that into an absolute page-duration limit.
-                            payload_readiness(result)?;
-                            cx.waker().wake_by_ref();
-                        }
-                        stream.poll_prefetch(cx);
-                        Poll::Pending
-                    })
-                    .await?;
-                    connection = result;
-                    if std::mem::take(&mut releases.provisional) {
-                        stream.release_page(slice.page, slice.length)?;
-                    } else {
-                        outstanding.insert(slice.page, slice.length);
-                    }
-                    sent += u64::from(slice.length);
-                    pages += 1;
+                        .await?
+                        .connection
+                } else {
+                    self.io.send_head(connection, head, scope).await?.connection
+                };
+                let socket = connection.socket();
+                let reservation = connection.slot().cloned();
+                if mapped {
+                    linger = Some((socket.clone(), reservation.clone()));
                 }
+                let mut releases = Releases {
+                    bytes: [0; 12],
+                    used: 0,
+                    ahead: connection.take_read_ahead(),
+                    provisional: false,
+                };
+                let mut outstanding = BTreeMap::new();
+                let mut sent = 0;
+                let mut pages = 0;
+                if let ReadPayload::Stream(stream) = &mut response.payload {
+                    let range = stream.range();
+                    stream.enable_progress(timeout);
+                    while sent < expected {
+                        held.retain(|page, _| outstanding.contains_key(page));
+                        let mut progress_scope = scope.clone();
+                        progress_scope.deadline.0 = racer_platform::environment::now() + timeout;
+                        let reader = if let Some(reader) = first.take() {
+                            reader
+                        } else {
+                            // Pending acquisition and pipe admission live in the stream.
+                            // Drop only the borrowing future so duplex release_page can
+                            // update credits without discarding the pipe waiter's wake.
+                            let mut ready = None;
+                            let boundary =
+                                std::cell::Cell::new(crate::telemetry::ClientBoundary::Stream);
+                            std::future::poll_fn(|cx| {
+                                if let Err(error) = progress_scope.check() {
+                                    return Poll::Ready(Err(boundary_error(
+                                        error,
+                                        &boundary,
+                                        crate::telemetry::ClientBoundary::Scope,
+                                    )));
+                                }
+                                if let Err(error) =
+                                    releases.poll(cx, &socket, stream, &mut outstanding, None)
+                                {
+                                    return Poll::Ready(Err(boundary_error(
+                                        error,
+                                        &boundary,
+                                        crate::telemetry::ClientBoundary::ReleaseProcessing,
+                                    )));
+                                }
+                                poll_slice_or_readiness(
+                                    cx,
+                                    |cx| {
+                                        observe_boundary(
+                                            stream.next_slice().as_mut().poll(cx),
+                                            &boundary,
+                                            crate::telemetry::ClientBoundary::Stream,
+                                        )
+                                    },
+                                    |cx| {
+                                        if ready.is_none() {
+                                            ready = Some(self.io.reactor().readiness_with_lease(
+                                                socket.clone(),
+                                                libc::POLLIN as u32,
+                                                reservation.clone(),
+                                                &progress_scope,
+                                            ));
+                                        }
+                                        let result = observe_boundary(
+                                            ready.as_mut().unwrap().as_mut().poll(cx),
+                                            &boundary,
+                                            crate::telemetry::ClientBoundary::ReleaseReadiness,
+                                        );
+                                        if result.is_ready() {
+                                            ready = None;
+                                        }
+                                        result
+                                    },
+                                )
+                            })
+                            .await
+                            .inspect_err(|&error| {
+                                self.observer.record(
+                                    crate::telemetry::Failure::new(
+                                        crate::telemetry::Stage::NextSlice,
+                                        error,
+                                    )
+                                    .request(scope)
+                                    .detail(
+                                        crate::telemetry::Detail::ClientDelivery {
+                                            boundary: boundary.get(),
+                                            sent,
+                                            expected,
+                                        },
+                                    ),
+                                );
+                            })?
+                            .ok_or(Error::BadGateway)?
+                        };
+                        let slice = reader.slice();
+                        if range.slice_at(slice.page)? != Some(slice)
+                            || reader.bytes_sent() != 0
+                            || slice.length == 0
+                            || u64::from(slice.length) > expected - sent
+                            || outstanding.contains_key(&slice.page)
+                        {
+                            return Err(Error::BadGateway);
+                        }
+                        let offset = slice
+                            .page
+                            .0
+                            .checked_mul(PAGE_BYTES)
+                            .and_then(|n| n.checked_add(u64::from(slice.offset)))
+                            .ok_or(Error::BadGateway)?;
+                        if mapped {
+                            // The client reads the bytes in place; pin them until its
+                            // credit (or close) says it stopped. Pages outside the
+                            // shared memory are copied into it once.
+                            let (memory, page) =
+                                match page_alloc::shared::offset_of(reader.payload()) {
+                                    Some(memory) => (memory, MappedPage::Shared(reader.page())),
+                                    None => {
+                                        let mut copy = page_alloc::shared::vec_with_capacity(
+                                            reader.payload().len(),
+                                        )
+                                        .ok_or(Error::Overloaded)?;
+                                        copy.extend_from_slice(reader.payload());
+                                        let memory = page_alloc::shared::offset_of(&copy)
+                                            .ok_or(Error::BadGateway)?;
+                                        self.delivery
+                                            .record(crate::telemetry::Event::ClientMappedCopies, 1);
+                                        (memory, MappedPage::Copied(zeroize::Zeroizing::new(copy)))
+                                    }
+                                };
+                            drop(reader);
+                            held.insert(slice.page, page);
+                            outstanding.insert(slice.page, slice.length);
+                            connection = send_frame(
+                                &self.io,
+                                connection,
+                                &racer_object_wire::client::mapped_frame(
+                                    slice.page.0,
+                                    offset,
+                                    slice.length,
+                                    memory,
+                                ),
+                                &progress_scope,
+                            )
+                            .await?;
+                            self.delivery
+                                .record(crate::telemetry::Event::ClientMappedPages, 1);
+                            sent += u64::from(slice.length);
+                            pages += 1;
+                            continue;
+                        }
+                        // Acquisition owns no delivery pipe and continues even while
+                        // the page frame or payload is blocked on this socket.
+                        let final_send = crate::http::FinalSend::default();
+                        let mut write = Box::pin(async {
+                            let connection = send_frame(
+                                &self.io,
+                                connection,
+                                &frame(1, slice.page.0, offset, slice.length),
+                                &progress_scope,
+                            )
+                            .await?;
+                            self.delivery
+                                .finish_subscription(
+                                    reader,
+                                    connection,
+                                    &progress_scope,
+                                    &final_send,
+                                )
+                                .await
+                        });
+                        let mut ready: Option<Operation<'_, u32>> = None;
+                        let result = std::future::poll_fn(|cx| {
+                            // A peer can see the final bytes before we observe their
+                            // CQE. Retain one exact provisional release, without
+                            // releasing credit or any I/O owner before full completion.
+                            if let Poll::Ready(result) = write.as_mut().poll(cx) {
+                                return Poll::Ready(result);
+                            }
+                            if let Err(error) = releases.poll(
+                                cx,
+                                &socket,
+                                stream,
+                                &mut outstanding,
+                                Some((slice, &final_send)),
+                            ) {
+                                return Poll::Ready(Err(error));
+                            }
+                            // No release can replenish credit until a previous page
+                            // has completed. Avoid consuming a reactor slot solely
+                            // to watch input when there is nothing releasable.
+                            if ready.is_none() && !outstanding.is_empty() {
+                                let reactor = self.io.reactor().clone();
+                                let socket = socket.clone();
+                                let reservation = reservation.clone();
+                                let mut receive_scope = scope.clone();
+                                receive_scope.deadline.0 =
+                                    racer_platform::environment::now() + timeout;
+                                ready = Some(Box::pin(async move {
+                                    reactor
+                                        .readiness_with_lease(
+                                            socket,
+                                            libc::POLLIN as u32,
+                                            reservation,
+                                            &receive_scope,
+                                        )
+                                        .await
+                                }));
+                            }
+                            if let Some(wait) = ready.as_mut()
+                                && let Poll::Ready(result) = wait.as_mut().poll(cx)
+                            {
+                                ready = None;
+                                // Payload delivery owns its progress-based stall
+                                // deadline. An idle release direction must not turn
+                                // that into an absolute page-duration limit.
+                                payload_readiness(result)?;
+                                cx.waker().wake_by_ref();
+                            }
+                            stream.poll_prefetch(cx);
+                            Poll::Pending
+                        })
+                        .await?;
+                        connection = result;
+                        if std::mem::take(&mut releases.provisional) {
+                            stream.release_page(slice.page, slice.length)?;
+                        } else {
+                            outstanding.insert(slice.page, slice.length);
+                        }
+                        sent += u64::from(slice.length);
+                        pages += 1;
+                    }
+                }
+                let mut final_scope = scope.clone();
+                final_scope.deadline.0 = racer_platform::environment::now() + timeout;
+                connection = send_frame(
+                    &self.io,
+                    connection,
+                    &frame(2, pages, sent, 0),
+                    &final_scope,
+                )
+                .await?;
+                if mapped && let ReadPayload::Stream(stream) = &mut response.payload {
+                    // Mapped bytes must stay put until the client credits them or
+                    // goes away, so wait (bounded) for every outstanding release.
+                    drain_releases(
+                        &self.io,
+                        &socket,
+                        reservation.clone(),
+                        &mut releases,
+                        stream,
+                        &mut outstanding,
+                        &final_scope,
+                    )
+                    .await?;
+                    held.clear();
+                }
+                // Completion closes the subscription without waiting for final releases.
+                observation.success();
+                Ok(connection)
             }
-            let mut final_scope = scope.clone();
-            final_scope.deadline.0 = racer_platform::environment::now() + timeout;
-            connection =
-                send_frame(&self.io, connection, frame(2, pages, sent, 0), &final_scope).await?;
-            // Completion closes the subscription without waiting for final releases.
-            observation.success();
-            Ok(connection)
+            .await;
+            if result.is_err()
+                && !held.is_empty()
+                && let Some((socket, reservation)) = linger
+            {
+                // The client may be reading a pinned page right now. Tell it to
+                // stop, then keep the bytes until it closes or the bound passes.
+                linger_until_closed(&self.io, socket, reservation, scope, timeout).await;
+            }
+            drop(held);
+            result
         })
     }
 

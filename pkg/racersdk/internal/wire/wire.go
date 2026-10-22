@@ -30,6 +30,15 @@ const (
 	CreditSize         = 12
 	PageFrame     byte = 1
 	CompleteFrame byte = 2
+	// MappedFrame is a page frame whose bytes live in the shared memory the
+	// server passed with the response head instead of following the frame.
+	MappedFrame byte = 3
+	// MappedFrameSize is a page frame plus its u64 memory offset.
+	MappedFrameSize = FrameSize + 8
+	// DeliveryHeader requests, and in a response confirms, mapped delivery.
+	DeliveryHeader = "Racer-Delivery"
+	// DeliveryMapped is the only defined DeliveryHeader value.
+	DeliveryMapped = "mapped"
 )
 
 // ErrorKind classifies wire failures. The SDK maps kinds to its public
@@ -1220,6 +1229,10 @@ type SubscriptionOptions struct {
 	Ordered, SmallObject bool
 	Pin                  string
 	Metadata             *Metadata
+	// Mapped requests mapped delivery: page bytes are read from a shared
+	// memory file passed with the response head. The server may decline and
+	// answer inline.
+	Mapped bool
 }
 
 // SubscriptionHead builds the client POST envelope after SDK option validation.
@@ -1245,6 +1258,10 @@ func SubscriptionHead(r Request, o SubscriptionOptions) ([]byte, error) {
 		b.WriteString("\r\n")
 	}
 
+	if o.Mapped {
+		b.WriteString(DeliveryHeader + ": " + DeliveryMapped + "\r\n")
+	}
+
 	for name, values := range RequestHeaders(r) {
 		fmt.Fprintf(&b, "%s: %s\r\n", name, values[0])
 	}
@@ -1258,6 +1275,8 @@ func SubscriptionHead(r Request, o SubscriptionOptions) ([]byte, error) {
 type SubscriptionResponse struct {
 	Metadata          Metadata
 	First, End, Pages uint64
+	// Mapped reports that the server accepted mapped delivery.
+	Mapped bool
 }
 
 func ParseSubscriptionResponse(head []byte, o SubscriptionOptions) (SubscriptionResponse, error) {
@@ -1319,8 +1338,23 @@ func ParseSubscriptionResponse(head []byte, o SubscriptionOptions) (Subscription
 		return result, err
 	}
 
+	mapped := false
+
+	if values, ok := h[DeliveryHeader]; ok {
+		// Only a requested, single, exact acceptance is valid.
+		if !o.Mapped || len(values) != 1 || values[0] != DeliveryMapped {
+			return result, bad
+		}
+
+		mapped = true
+	}
+
 	pages := PageCount(first, end)
-	if pages+1 > (math.MaxInt64-(end-first))/FrameSize || length != end-first+FrameSize*(pages+1) {
+	if mapped {
+		if pages > (math.MaxInt64-FrameSize)/MappedFrameSize || length != MappedFrameSize*pages+FrameSize {
+			return result, bad
+		}
+	} else if pages+1 > (math.MaxInt64-(end-first))/FrameSize || length != end-first+FrameSize*(pages+1) {
 		return result, bad
 	}
 
@@ -1328,7 +1362,7 @@ func ParseSubscriptionResponse(head []byte, o SubscriptionOptions) (Subscription
 		m = *o.Metadata
 	}
 
-	return SubscriptionResponse{Metadata: m, First: first, End: end, Pages: pages}, nil
+	return SubscriptionResponse{Metadata: m, First: first, End: end, Pages: pages, Mapped: mapped}, nil
 }
 
 // Subscription error envelopes intentionally have fewer restrictions than origin
@@ -1403,7 +1437,7 @@ func ParseSubscriptionRequest(r *http.Request) (SubscriptionRequest, error) {
 
 	for _, name := range []string{
 		"Content-Length", "If-Match", "Range", "Racer-Page-Credits", "Racer-Byte-Credits",
-		"Racer-Ordered", "Racer-Metadata", "Authorization",
+		"Racer-Ordered", "Racer-Metadata", "Authorization", DeliveryHeader,
 	} {
 		if len(r.Header.Values(name)) > 1 {
 			return s, bad
@@ -1427,6 +1461,9 @@ func ParseSubscriptionRequest(r *http.Request) (SubscriptionRequest, error) {
 	}
 
 	h.Del("Range")
+	// The fake peer always delivers inline, as a server that declines mapped
+	// delivery would.
+	h.Del(DeliveryHeader)
 
 	var raw bytes.Buffer
 	fmt.Fprintf(&raw, "HEAD %s%s HTTP/1.1\r\nHost: racer\r\n", ObjectPrefix, r.RequestURI[len(prefix):])
@@ -1560,10 +1597,13 @@ func (r *FrameReader) Read(p []byte) (int, error) {
 }
 
 // Frame describes a page payload or the terminal page/byte totals. Payload is external.
+// Memory is the offset of a MappedFrame's bytes in the shared mapping and is
+// zero for other kinds.
 type Frame struct {
 	Kind           byte
 	Number, Offset uint64
 	Length         uint32
+	Memory         uint64
 }
 
 func DecodeFrame(b [FrameSize]byte) Frame {
@@ -1577,6 +1617,25 @@ func (f Frame) Encode() [FrameSize]byte {
 	binary.BigEndian.PutUint64(b[1:9], f.Number)
 	binary.BigEndian.PutUint64(b[9:17], f.Offset)
 	binary.BigEndian.PutUint32(b[17:], f.Length)
+
+	return b
+}
+
+// DecodeMappedFrame decodes a MappedFrame header, including its memory offset.
+func DecodeMappedFrame(b [MappedFrameSize]byte) Frame {
+	f := DecodeFrame([FrameSize]byte(b[:FrameSize]))
+	f.Memory = binary.BigEndian.Uint64(b[FrameSize:])
+
+	return f
+}
+
+// EncodeMapped encodes f as a MappedFrame header with its memory offset.
+func (f Frame) EncodeMapped() [MappedFrameSize]byte {
+	var b [MappedFrameSize]byte
+
+	head := f.Encode()
+	copy(b[:], head[:])
+	binary.BigEndian.PutUint64(b[FrameSize:], f.Memory)
 
 	return b
 }
@@ -1613,12 +1672,21 @@ type pageInterval struct{ first, end uint64 }
 // Counts advance on accepted headers; callers must consume each payload before the next.
 type Sequence struct {
 	first, end, pages, delivered, bytes uint64
-	ordered, complete                   bool
+	ordered, complete, mapped           bool
 	intervals                           []pageInterval
 }
 
 func NewSequence(first, end uint64, ordered bool) *Sequence {
 	return &Sequence{first: first, end: end, pages: PageCount(first, end), ordered: ordered}
+}
+
+// NewMappedSequence validates a mapped delivery stream, whose pages must be
+// MappedFrame headers. PageFrame headers are rejected.
+func NewMappedSequence(first, end uint64, ordered bool) *Sequence {
+	s := NewSequence(first, end, ordered)
+	s.mapped = true
+
+	return s
 }
 
 // Intervals reports bounded tracking storage for diagnostics after a receive operation.
@@ -1656,7 +1724,12 @@ func (s *Sequence) Accept(f Frame, operation string) error {
 		return nil
 	}
 
-	if f.Kind != PageFrame || f.Length == 0 || f.Offset < s.first || f.Offset >= s.end || f.Number != f.Offset/PageSize {
+	page := PageFrame
+	if s.mapped {
+		page = MappedFrame
+	}
+
+	if f.Kind != page || f.Length == 0 || f.Offset < s.first || f.Offset >= s.end || f.Number != f.Offset/PageSize {
 		return bad
 	}
 

@@ -61,6 +61,9 @@ pub struct ClientRequest<'a> {
     pub metadata: Option<&'a [u8]>,
 
     pub authorization: Option<&'a [u8]>,
+
+    /// Subscription asked for page bytes through the shared plaintext mapping.
+    pub mapped: bool,
 }
 
 /// Bounded semantic parser. Raw HTTP framing must be checked before calling it.
@@ -98,6 +101,7 @@ impl RequestParser {
         let mut page_credits = 2;
         let mut byte_credits = 2 * PAGE_BYTES;
         let mut ordered = false;
+        let mut mapped = false;
         let mut max_age = None;
         for header in &head.headers {
             decoded_bytes = decoded_bytes
@@ -133,6 +137,7 @@ impl RequestParser {
                     | "racer-page-credits"
                     | "racer-byte-credits"
                     | "racer-ordered"
+                    | "racer-delivery"
             ) && !seen.insert(name.clone())
             {
                 return Err(Error::InvalidRequest);
@@ -178,6 +183,13 @@ impl RequestParser {
                         _ => return Err(Error::InvalidRequest),
                     }
                 }
+                "racer-delivery" => {
+                    mapped = match value {
+                        b"mapped" => true,
+                        b"inline" => false,
+                        _ => return Err(Error::InvalidRequest),
+                    }
+                }
                 "racer-metadata" => {
                     validate_opaque(value)?;
                     metadata = Some(value);
@@ -217,7 +229,9 @@ impl RequestParser {
             "POST" => return Err(Error::InvalidRequest),
             _ => return Err(Error::MethodNotAllowed),
         };
+        let mapped = mapped && matches!(kind, ReadKind::Subscription { .. });
         Ok(ClientRequest {
+            mapped,
             kind,
             retain: max_age
                 .filter(|&seconds| seconds != 0)
@@ -347,6 +361,56 @@ pub fn subscription_head(
         header("Connection", "close"),
     ]);
     Ok(head)
+}
+
+/// Encode a mapped subscription head: frames carry shared-memory offsets, not bytes.
+pub fn mapped_subscription_head(
+    metadata: &ObjectMetadata,
+    range: Option<ResolvedRange>,
+) -> Result<MessageHead> {
+    let mut head = subscription_head(metadata, range)?;
+    let pages = match range {
+        Some(range) => range.last_page().0 - range.first_page().0 + 1,
+        None => 0,
+    };
+    let length = pages
+        .checked_mul(MAPPED_FRAME_BYTES as u64)
+        .and_then(|n| n.checked_add(21))
+        .filter(|&n| n <= MAX_WIRE_INTEGER)
+        .ok_or(Error::BadGateway)?;
+    for header in &mut head.headers {
+        if header.name.eq_ignore_ascii_case("Content-Length") {
+            header.value = length.to_string().into_bytes();
+        }
+    }
+    head.headers
+        .push(self::header(DELIVERY_HEADER, DELIVERY_MAPPED));
+    Ok(head)
+}
+
+/// Response and request header naming the client delivery mode.
+pub const DELIVERY_HEADER: &str = "Racer-Delivery";
+
+/// Delivery value for page bytes read from the shared plaintext mapping.
+pub const DELIVERY_MAPPED: &str = "mapped";
+
+/// Frame kind whose bytes live in the shared plaintext mapping.
+pub const MAPPED_FRAME: u8 = 3;
+
+/// Mapped frame size: a page frame followed by a big-endian u64 mapping offset.
+pub const MAPPED_FRAME_BYTES: usize = 29;
+
+/// Encode a mapped page frame naming the mapping offset of the page bytes.
+pub fn mapped_frame(
+    number: u64,
+    offset: u64,
+    length: u32,
+    memory: u64,
+) -> [u8; MAPPED_FRAME_BYTES] {
+    let mut bytes = [0; MAPPED_FRAME_BYTES];
+    bytes[..21].copy_from_slice(&frame(MAPPED_FRAME, number, offset, length));
+    bytes[21..].copy_from_slice(&memory.to_be_bytes());
+    bytes
 }
 
 /// Encode the fixed-width page or completion frame without managing page leases.

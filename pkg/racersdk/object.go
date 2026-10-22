@@ -25,6 +25,10 @@ const copyBufferSize = 256 * 1024
 
 var copyBuffers = sync.Pool{New: func() any { return new([copyBufferSize]byte) }}
 
+// mappedBatch bounds each destination write of mapped page bytes, so every
+// write finishes well within the per-write timeout.
+const mappedBatch = 4 * 1024 * 1024
+
 // Object is an in-progress read returned by [Client.Get]. Consume it with
 // either [Object.Read] or [Object.WriteTo] and always call [Object.Close].
 //
@@ -65,6 +69,14 @@ type Object struct {
 	final      [1]byte
 	finalReady bool
 	completed  bool
+
+	// Mapped delivery. The reader owns mapping and page while busy; cleanup
+	// releases mapping after closing the connection.
+	maps    *mappings
+	mapped  bool
+	mapping *mapping
+	view    []byte // the current page's bytes in mapping, nil once credited
+	cursor  int    // next unread byte of view
 }
 
 // Metadata describes the version being read. Size is the whole object, not
@@ -74,8 +86,10 @@ func (o *Object) Metadata() Metadata { return o.metadata }
 // Read copies the next bytes of the object into p. It returns [io.EOF] once
 // the whole selected range has been read and verified complete.
 //
-// Every byte is copied from the kernel into p. Reads smaller than 4 KiB are
-// staged through an internal buffer and copied twice; use buffers of 32 KiB
+// With mapped delivery, the default on Linux, every byte is copied once from
+// memory Racer shares with the client into p. With inline delivery, every
+// byte is copied from the kernel into p, and reads smaller than 4 KiB are
+// staged through an internal buffer and copied twice. Use buffers of 32 KiB
 // or more for throughput.
 func (o *Object) Read(p []byte) (int, error) {
 	if err := o.begin(); err != nil {
@@ -99,10 +113,14 @@ func (o *Object) Read(p []byte) (int, error) {
 // endpoint: it wraps [os.ErrDeadlineExceeded] and matches neither
 // [ErrDestination] nor [ErrUnavailable].
 //
-// If w implements [io.ReaderFrom] and is backed by a file descriptor, such as
-// a [*net.TCPConn], an [*os.File], or an HTTP/1 [http.ResponseWriter], data moves
-// from Racer's socket to w inside the kernel with splice(2), with no copy into
-// process memory. Other writers receive data through a reused 256 KiB buffer.
+// With mapped delivery, the default on Linux, w.Write receives slices of
+// memory Racer shares with the client, with no copy in the SDK. w must not
+// retain them after Write returns. With inline delivery, if w implements
+// [io.ReaderFrom] and is backed by a file descriptor, such as a
+// [*net.TCPConn], an [*os.File], or an HTTP/1 [http.ResponseWriter], data
+// moves from Racer's socket to w inside the kernel with splice(2), with no
+// copy into process memory. Other writers receive data through a reused
+// 256 KiB buffer.
 //
 // When w supports SetWriteDeadline, directly or through an HTTP response
 // controller, WriteTo takes over w's write deadline for the whole call. It
@@ -225,6 +243,18 @@ func (o *Object) cleanupLocked() {
 	o.done = true
 	o.stop()
 	closeQuietly(o.conn)
+
+	// Racer may reuse uncredited memory once the connection is closed.
+	if o.conn != nil {
+		o.conn.discardRights()
+	}
+
+	o.view = nil
+	if o.maps != nil {
+		o.maps.release(o.mapping)
+	}
+
+	o.mapping = nil
 	o.cancel()
 	o.admitted()
 }
@@ -242,6 +272,22 @@ func (o *Object) read(p []byte) (int, error) {
 	}
 
 	n := int(min(int64(len(p)), o.remaining))
+
+	if o.mapped {
+		n = copy(p[:n], o.view[o.cursor:])
+
+		// Racer reuses the memory once the connection closes, and Close and
+		// cancellation end ctx before closing it. Bytes copied after that
+		// may be stale, so discard them.
+		if err := o.ctx.Err(); err != nil {
+			return 0, err
+		}
+
+		o.cursor += n
+		o.remaining -= int64(n)
+
+		return n, nil
+	}
 
 	if err := o.conn.SetReadDeadline(time.Now().Add(o.timeout)); err != nil {
 		return 0, err
@@ -312,6 +358,17 @@ func (o *Object) writeTo(w io.Writer) (int64, error) {
 			continue
 		}
 
+		if o.mapped {
+			n, err := o.writeMapped(dst)
+			written += n
+
+			if err != nil {
+				return written, err
+			}
+
+			continue
+		}
+
 		raw, unix := o.conn.Conn.(*net.UnixConn)
 		if o.conn.r.Buffered() == 0 && unix && dst.rf != nil {
 			n, err := o.splice(dst, raw)
@@ -335,6 +392,26 @@ func (o *Object) writeTo(w io.Writer) (int64, error) {
 			return written, err
 		}
 	}
+}
+
+// writeMapped writes one batch of the current mapped page to dst.
+func (o *Object) writeMapped(dst *destination) (int64, error) {
+	batch := int(min(o.remaining, mappedBatch))
+
+	n, err := dst.write(o.view[o.cursor : o.cursor+batch])
+	o.cursor += int(n)
+	o.remaining -= n
+
+	if err != nil {
+		return n, err
+	}
+
+	// See read: once ctx ends, the bytes just written may be stale.
+	if err := o.ctx.Err(); err != nil {
+		return n, err
+	}
+
+	return n, nil
 }
 
 // splice moves one batch from the socket to dst inside the kernel when
@@ -507,6 +584,9 @@ func (o *Object) advance() error {
 				continue
 			}
 
+			// Never touch a page's memory after returning its credit.
+			o.view = nil
+
 			if err := o.credit(o.page); err != nil {
 				return err
 			}
@@ -533,8 +613,17 @@ func (o *Object) advance() error {
 			return err
 		}
 
-		if f.Kind != wire.PageFrame || f.Length == 0 {
+		if f.Kind == wire.CompleteFrame || f.Length == 0 {
 			return failure(wire.ErrorProtocol, "read", errors.New("unexpected frame"))
+		}
+
+		if o.mapped {
+			view, err := o.mappedPage(f)
+			if err != nil {
+				return err
+			}
+
+			o.view, o.cursor = view, 0
 		}
 
 		o.delivered++
@@ -556,7 +645,11 @@ func (o *Object) advance() error {
 // Racer may wait for the final credit before sending completion, or send
 // completion without reading the credit, so both happen concurrently.
 func (o *Object) finishLastPage() error {
-	if err := o.readFull(o.final[:]); err != nil {
+	if o.mapped {
+		// Copy the final byte before the credit releases the memory.
+		o.final[0] = o.view[o.cursor]
+		o.view = nil
+	} else if err := o.readFull(o.final[:]); err != nil {
 		return err
 	}
 
@@ -585,17 +678,71 @@ func (o *Object) finishLastPage() error {
 }
 
 func (o *Object) readFrame() (wire.Frame, error) {
-	var raw [wire.FrameSize]byte
-	if err := o.readFull(raw[:]); err != nil {
+	var raw [wire.MappedFrameSize]byte
+	if err := o.readFull(raw[:wire.FrameSize]); err != nil {
 		return wire.Frame{}, err
 	}
 
-	f := wire.DecodeFrame(raw)
+	var f wire.Frame
+
+	if o.mapped && raw[0] == wire.MappedFrame {
+		if err := o.readFull(raw[wire.FrameSize:]); err != nil {
+			return wire.Frame{}, err
+		}
+
+		f = wire.DecodeMappedFrame(raw)
+	} else {
+		f = wire.DecodeFrame([wire.FrameSize]byte(raw[:wire.FrameSize]))
+	}
+
+	if o.mapped {
+		if err := o.checkRights(); err != nil {
+			return wire.Frame{}, err
+		}
+	}
+
 	if err := o.seq.Accept(f, "read"); err != nil {
 		return wire.Frame{}, err
 	}
 
 	return f, nil
+}
+
+// checkRights takes the delivery memory if it arrived after the head, and
+// rejects any further descriptor.
+func (o *Object) checkRights() error {
+	if o.mapping == nil {
+		mp, err := takeMapping(o.maps, o.conn, true)
+		if err != nil {
+			return err
+		}
+
+		o.mapping = mp
+
+		return nil
+	}
+
+	if o.conn.rights == nil {
+		return nil
+	}
+
+	fds, err := o.conn.rights.take()
+	if len(fds) != 0 || err != nil {
+		closeFDs(fds)
+		return failure(wire.ErrorProtocol, "read", errors.New("unexpected descriptor"))
+	}
+
+	return nil
+}
+
+// mappedPage returns the bytes of an accepted mapped page frame.
+func (o *Object) mappedPage(f wire.Frame) ([]byte, error) {
+	size := uint64(len(o.mapping.data))
+	if f.Memory > size || uint64(f.Length) > size-f.Memory {
+		return nil, failure(wire.ErrorProtocol, "read", errors.New("page outside delivery memory"))
+	}
+
+	return o.mapping.data[f.Memory : f.Memory+uint64(f.Length)], nil
 }
 
 func (o *Object) readComplete() error {

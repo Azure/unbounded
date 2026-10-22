@@ -139,6 +139,18 @@ Direct mode uses `pkg/racersdk` against
 `--metrics-listen` (default `:9090`). An operational Racer dataplane and cache
 configuration are prerequisites; loadgen does not start the dataplane.
 
+Direct mode asks Racer for mapped delivery by default (`--delivery=mapped`):
+Racer shares read-only memory holding each page with the client instead of
+writing page bytes into the socket. `--delivery=inline` sends every page through
+the socket, for comparison. Racer may decline mapped delivery and answer inline.
+`--delivery` requires `--backend=uds`.
+
+Without `--verify`, `--consume=discard` (the default) writes each body to
+`/dev/null`. With mapped delivery that never reads the page bytes, so it measures
+only the protocol. `--consume=copy` reads every body into a reused 1 MiB buffer
+per read, so the client touches every byte; use it for a fair comparison between
+delivery modes. `--verify` hashes every byte regardless of `--consume`.
+
 Unit tests use `pkg/racersdk/racersdktest.NewClient` with a noncaching local
 daemon and real SDK origin validation over temporary Unix sockets. The helper
 registers cleanup with the test. These tests are not evidence of real Racer

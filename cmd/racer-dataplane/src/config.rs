@@ -134,6 +134,11 @@ pub struct Config {
     pub rdma_zero_copy: bool,
     /// cgroup v2 memory-pressure monitoring and reclaim. Defaults on.
     pub memory_pressure: bool,
+    /// Serve plaintext from a sealed memfd slab and deliver pages to clients as
+    /// offsets into a read-only mapping instead of copying them into the socket.
+    /// Defaults on; clients still get inline bytes when they do not ask for it
+    /// or the binary lacks the shared allocator.
+    pub client_shared_memory: bool,
     pub pprof_enabled: bool,
     pub control_endpoint: String,
     pub peer_listen: std::net::SocketAddr,
@@ -247,6 +252,7 @@ impl Config {
             peer_tcp_nodelay: raw.peer_tcp_nodelay.unwrap_or(true),
             rdma_zero_copy: raw.rdma_zero_copy.unwrap_or(true),
             memory_pressure: raw.memory_pressure.unwrap_or(true),
+            client_shared_memory: raw.client_shared_memory.unwrap_or(true),
             pprof_enabled: raw.pprof_enabled.unwrap_or(false),
             control_endpoint: raw.control_endpoint,
             peer_listen: parse_listener_address(
@@ -593,6 +599,7 @@ const ENV_NAMES: &[&str] = &[
     "PEER_TCP_NODELAY",
     "RDMA_ZERO_COPY",
     "MEMORY_PRESSURE",
+    "CLIENT_SHARED_MEMORY",
     "PPROF_ENABLED",
     "PEER_LISTEN",
     "DIAGNOSTICS_LISTEN",
@@ -668,6 +675,7 @@ struct RawConfig {
     peer_tcp_nodelay: Option<bool>,
     rdma_zero_copy: Option<bool>,
     memory_pressure: Option<bool>,
+    client_shared_memory: Option<bool>,
     pprof_enabled: Option<bool>,
     peer_listen: Option<String>,
     diagnostics_listen: Option<String>,
@@ -958,8 +966,13 @@ mod tests {
             .iter()
             .map(|name| {
                 let value = match *name {
-                    "ALLOW_SMT" | "OPAQUE_RELAY" | "PEER_TCP_NODELAY" | "RDMA_ZERO_COPY"
-                    | "MEMORY_PRESSURE" | "PPROF_ENABLED" => "true",
+                    "ALLOW_SMT"
+                    | "OPAQUE_RELAY"
+                    | "PEER_TCP_NODELAY"
+                    | "RDMA_ZERO_COPY"
+                    | "MEMORY_PRESSURE"
+                    | "PPROF_ENABLED"
+                    | "CLIENT_SHARED_MEMORY" => "true",
                     _ => "1",
                 };
                 ((*name).to_owned(), value.to_owned())
@@ -1804,6 +1817,15 @@ mod tests {
     #[test]
     fn memory_pressure_requires_exact_boolean_and_defaults_on() {
         exact_boolean_default("RACER_MEMORY_PRESSURE", |c| c.memory_pressure, true);
+    }
+
+    #[test]
+    fn client_shared_memory_requires_exact_boolean_and_defaults_on() {
+        exact_boolean_default(
+            "RACER_CLIENT_SHARED_MEMORY",
+            |c| c.client_shared_memory,
+            true,
+        );
     }
 
     #[test]

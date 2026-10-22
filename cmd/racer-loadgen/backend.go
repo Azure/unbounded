@@ -58,7 +58,10 @@ func sdkClientConfig(opts pullOptions, capacity int) racersdk.ClientConfig {
 	// Never let the SDK's zero/default 64 silently cap the configured workload.
 	limit := max(1, capacity*opts.BlobConcurrency)
 
-	return racersdk.ClientConfig{Cache: opts.Cache, MaxConnections: limit}
+	return racersdk.ClientConfig{
+		Cache: opts.Cache, MaxConnections: limit,
+		InlineDelivery: opts.Delivery == deliveryInline,
+	}
 }
 
 func (p *puller) configureUDS(capacity int) error {

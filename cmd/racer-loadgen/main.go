@@ -80,6 +80,8 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	f.DurationVar(&opts.pull.Interval, "interval", 0, "Per-worker delay after successful pulls")
 	f.BoolVar(&opts.pull.Verify, "verify", false, "Verify SHA-256 for every downloaded object (copies bytes instead of the default no-copy drain)")
 	f.BoolVar(&opts.pull.DiagnoseIntegrity, "diagnose-integrity", false, "Compare deterministic bytes and retain bounded page hashes on integrity failure (requires verify)")
+	f.StringVar(&opts.pull.Delivery, "delivery", deliveryMapped, "How Racer delivers page bytes to the uds backend: mapped (shared memory) or inline (through the socket)")
+	f.StringVar(&opts.pull.Consume, "consume", consumeDiscard, "How unverified bodies are consumed: discard (write to /dev/null, which never reads mapped bytes) or copy (Read into a reused 1 MiB buffer, touching every byte)")
 	f.DurationVar(&opts.startDelay, "start-delay", 10*time.Second, "Delay after origin readiness before starting workers")
 	f.DurationVar(&opts.duration, "duration", 0, "Load phase duration; zero runs until signaled")
 
@@ -97,6 +99,23 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 
 	if opts.pull.Backend != "gantry" && opts.pull.Backend != "uds" && opts.pull.Backend != "s3" {
 		return opts, errors.New("backend must be gantry, uds, or s3")
+	}
+
+	// Flag defaults are never empty, so an empty value was set explicitly.
+	if opts.pull.Delivery == "" {
+		return opts, errors.New("delivery must be mapped or inline")
+	}
+
+	if opts.pull.Consume == "" {
+		return opts, errors.New("consume must be discard or copy")
+	}
+
+	if err := validateDeliveryOptions(&opts.pull); err != nil {
+		return opts, err
+	}
+
+	if seen["delivery"] && opts.pull.Backend != "uds" {
+		return opts, errors.New("delivery requires backend=uds")
 	}
 
 	if err := configureS3Options(&opts, seen); err != nil {

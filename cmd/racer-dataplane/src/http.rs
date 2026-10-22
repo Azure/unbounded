@@ -500,6 +500,15 @@ impl ReaderLease {
     pub fn remaining(&self) -> usize {
         self.slice.length as usize - self.sent
     }
+    /// Pin the page beyond this lease, e.g. while a client reads it in place.
+    pub(crate) fn page(&self) -> VerifiedPage {
+        self.page.clone()
+    }
+    /// The slice's bytes within the page.
+    pub(crate) fn payload(&self) -> &[u8] {
+        let start = self.slice.offset as usize;
+        &self.page.bytes()[start..start + self.slice.length as usize]
+    }
 }
 struct DeliveryOwner(ReaderLease);
 impl http1::delivery::DirectOwner<HttpContext> for DeliveryOwner {
@@ -562,6 +571,10 @@ impl http1::delivery::Observer<HttpContext> for DeliveryObserver<'_> {
     }
 }
 impl Delivery {
+    /// Count a delivery event on this worker's metrics.
+    pub(crate) fn record(&self, event: crate::telemetry::Event, amount: u64) {
+        self.metrics.record(event, amount);
+    }
     pub fn new(reactor: Rc<Reactor>, stall_timeout: Duration) -> Self {
         Self {
             metrics: crate::telemetry::Metrics::default(),

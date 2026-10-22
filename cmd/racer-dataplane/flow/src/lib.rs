@@ -110,6 +110,11 @@ pub trait Class: Copy + Send + Sync + 'static {
     fn requires_wipe(self) -> bool {
         true
     }
+
+    /// Whether fresh backing comes from the process-wide shared slab when it is installed.
+    fn shared(self) -> bool {
+        false
+    }
 }
 
 /// Application policy. Charges do not retain this value, so suitability and
@@ -457,6 +462,8 @@ impl<P: Policy> Charge<P> {
             let index = [true, false].into_iter().find_map(|same_class| {
                 pool.entries.iter().position(|(bytes, old)| {
                     (!same_class || old.class.index() == self.class.index())
+                        // Keep slab slots for shared classes and private memory for the rest.
+                        && page_alloc::shared::contains(bytes.as_ptr()) == self.class.shared()
                         && bytes.capacity() >= length
                         && bytes.capacity() <= self.amount
                         // A tag-sized tail can straddle a class boundary. Only
@@ -488,7 +495,15 @@ impl<P: Policy> Charge<P> {
         let capacity = page_alloc::buffer_capacity(length)
             .filter(|&n| length >= 1024 * 1024 && n <= self.amount)
             .unwrap_or(length);
-        let mut bytes = zeroed_payload(capacity)?;
+        let shared = self
+            .class
+            .shared()
+            .then(|| page_alloc::shared::zeroed_vec(capacity))
+            .flatten();
+        let mut bytes = match shared {
+            Some(bytes) => bytes,
+            None => zeroed_payload(capacity)?,
+        };
         bytes.truncate(length);
         Ok(bytes)
     }

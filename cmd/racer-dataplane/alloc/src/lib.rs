@@ -161,6 +161,7 @@ mod demand;
 pub mod index;
 pub mod retention;
 mod segments;
+pub mod shared;
 
 mod slab;
 

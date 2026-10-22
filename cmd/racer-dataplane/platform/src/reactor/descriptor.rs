@@ -215,6 +215,56 @@ impl Descriptor {
         })
     }
 
+    /// Like `try_send`, attaching one descriptor via `SCM_RIGHTS` to the first byte.
+    /// A short send still transfers the descriptor; the caller sends the rest.
+    pub fn try_send_with_descriptor(
+        &self,
+        bytes: &[u8],
+        descriptor: std::os::fd::RawFd,
+    ) -> std::io::Result<usize> {
+        #[cfg(feature = "simulation")]
+        if self.as_sim().is_some() {
+            return Err(std::io::ErrorKind::Unsupported.into());
+        }
+        if bytes.is_empty() {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        // u64 storage keeps the control buffer aligned for cmsghdr.
+        let mut control = [0u64; 4];
+        // SAFETY: CMSG_SPACE is a pure size computation.
+        let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) } as usize;
+        debug_assert!(space <= std::mem::size_of_val(&control));
+        let mut iov = libc::iovec {
+            iov_base: bytes.as_ptr().cast_mut().cast(),
+            iov_len: bytes.len(),
+        };
+        // SAFETY: zeroed msghdr is a valid empty message.
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = space as _;
+        // SAFETY: the control buffer holds one header plus an int payload.
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&message);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as _;
+            std::ptr::write_unaligned(libc::CMSG_DATA(header).cast::<libc::c_int>(), descriptor);
+        }
+        retry_interrupted(|| {
+            // SAFETY: message points at live iovec and control storage for this call;
+            // sendmsg only reads `bytes`.
+            count(unsafe {
+                libc::sendmsg(
+                    self.as_raw_fd(),
+                    &message,
+                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                )
+            })
+        })
+    }
+
     /// Receive without waiting; preserve EOF, short progress, and errno.
     /// Only zero-progress EINTR is retried, for at most four attempts.
     pub fn try_recv(&self, bytes: &mut [u8]) -> std::io::Result<usize> {

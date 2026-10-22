@@ -699,7 +699,19 @@ impl<C: Context> HttpIo<C> {
         head: MessageHead,
         scope: &'a C::Scope,
     ) -> Operation<'a, C, HeadCompletion<C, ()>> {
-        self.send_head_impl(connection, head, scope, false)
+        self.send_head_impl(connection, head, scope, false, None)
+    }
+
+    /// Send a head with one descriptor attached to its first byte via `SCM_RIGHTS`.
+    /// The socket must accept at least one byte immediately; a full socket fails.
+    pub fn send_head_with_descriptor<'a>(
+        &'a self,
+        connection: ConnectionLease<C>,
+        head: MessageHead,
+        scope: &'a C::Scope,
+        descriptor: std::os::fd::RawFd,
+    ) -> Operation<'a, C, HeadCompletion<C, ()>> {
+        self.send_head_impl(connection, head, scope, false, Some(descriptor))
     }
 
     /// Apply signing once and enforce any head-only exchange constraint before sending.
@@ -709,6 +721,7 @@ impl<C: Context> HttpIo<C> {
         head: MessageHead,
         scope: &'a C::Scope,
         bodyless_request: bool,
+        descriptor: Option<std::os::fd::RawFd>,
     ) -> Operation<'a, C, HeadCompletion<C, ()>> {
         Box::pin(async move {
             scope.check()?;
@@ -738,11 +751,22 @@ impl<C: Context> HttpIo<C> {
             let length_encoded = encoded.len();
             drop(encoded);
             drop(scratch);
+            // The descriptor rides on the first bytes; any remainder is ordinary.
+            let start = match descriptor {
+                Some(descriptor) => match connection
+                    .socket()
+                    .try_send_with_descriptor(&buffer.bytes[..length_encoded], descriptor)
+                {
+                    Ok(count) if count > 0 && count <= length_encoded => count,
+                    _ => return Err(racer_platform::Error::Io.into()),
+                },
+                None => 0,
+            };
             let completed = self
                 .send_owned(
                     connection,
                     buffer,
-                    0..length_encoded,
+                    start..length_encoded,
                     scope,
                     SendRange::checked,
                 )
@@ -994,7 +1018,7 @@ impl<C: Context> HttpIo<C> {
                 return Err(Error::Malformed.into());
             }
             let sent = self
-                .send_head_impl(connection, request, scope, true)
+                .send_head_impl(connection, request, scope, true, None)
                 .await?;
             let received = self.receive_head(sent.connection, scope).await?;
             if !matches!(received.value.start, StartLine::Response { .. }) {

@@ -278,6 +278,64 @@ fn response_heads_and_frame_vectors_are_exact() {
     ));
 }
 
+/// Mapped delivery is a subscription-only opt-in with its own exact framing.
+#[test]
+fn mapped_delivery_requests_heads_and_frames_are_exact() {
+    let parser = RequestParser::new(usize::MAX);
+    assert!(!parser.parse(&request()).unwrap().mapped);
+    for (value, mapped) in [("mapped", true), ("inline", false)] {
+        let mut head = request();
+        head.headers.push(Header::new("Racer-Delivery", value));
+        assert_eq!(parser.parse(&head).unwrap().mapped, mapped);
+    }
+    for value in ["Mapped", "memfd", ""] {
+        let mut head = request();
+        head.headers.push(Header::new("Racer-Delivery", value));
+        assert!(matches!(parser.parse(&head), Err(Error::InvalidRequest)));
+    }
+    let mut head = request();
+    head.headers.push(Header::new("Racer-Delivery", "mapped"));
+    head.headers.push(Header::new("racer-delivery", "mapped"));
+    assert!(matches!(parser.parse(&head), Err(Error::InvalidRequest)));
+    let mut head = request();
+    let StartLine::Request { method, .. } = &mut head.start else {
+        unreachable!()
+    };
+    *method = "HEAD".into();
+    head.headers.push(Header::new("Racer-Delivery", "mapped"));
+    assert!(!parser.parse(&head).unwrap().mapped);
+
+    let metadata = metadata(2 * PAGE_BYTES + 3);
+    let range = ByteRange::From(PAGE_BYTES - 1)
+        .resolve(metadata.length)
+        .unwrap();
+    let mapped = client::mapped_subscription_head(&metadata, Some(range)).unwrap();
+    assert_eq!(
+        mapped.unique("Content-Length").unwrap(),
+        Some(b"108".as_slice())
+    );
+    assert_eq!(
+        mapped.unique(client::DELIVERY_HEADER).unwrap(),
+        Some(client::DELIVERY_MAPPED.as_bytes())
+    );
+    let inline = client::subscription_head(&metadata, Some(range)).unwrap();
+    assert_eq!(inline.unique(client::DELIVERY_HEADER).unwrap(), None);
+    assert_eq!(
+        client::mapped_subscription_head(&self::metadata(0), None)
+            .unwrap()
+            .unique("Content-Length")
+            .unwrap(),
+        Some(b"21".as_slice())
+    );
+    assert_eq!(
+        client::mapped_frame(1, 2, 3, 0x0102),
+        [
+            3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 1, 2
+        ]
+    );
+    assert_eq!(client::MAPPED_FRAME_BYTES, 29);
+}
+
 /// Framing is validated before any status can serve as missing-object evidence.
 #[test]
 fn origin_error_framing_and_pinned_misses_keep_their_meanings() {

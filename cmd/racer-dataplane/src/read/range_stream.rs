@@ -1881,6 +1881,7 @@ pub(super) mod tests {
                         &scope,
                         &mut observation,
                         Duration::from_secs(30),
+                        false,
                     )
                     .await
                     .map(drop)
@@ -1924,6 +1925,238 @@ pub(super) mod tests {
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);
             assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
         }
+    }
+
+    #[test]
+    fn mapped_responses_name_shared_memory_and_pin_pages_until_credit() {
+        use crate::admission::ResourceClass;
+        use crate::client::Responses;
+        use crate::http::Codec;
+        use crate::model::RequestId;
+        use crate::read::ReadResponse;
+        use crate::runtime::Reactor;
+        use std::io::Read;
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::fd::FromRawFd;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+        crate::test_support::shared_memory();
+        let total = 4 * PAGE_BYTES + 17;
+        let range = ByteRange::From(PAGE_BYTES + 5).resolve(total).unwrap();
+        let clock = racer_platform::environment::SimulationClock::new(56);
+        let environment = clock.environment(0);
+        let _clock = environment.enter();
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        )));
+        let reactor = Rc::new(Reactor::new(admission.clone()));
+        let io = Rc::new(crate::http::new_io(
+            reactor.clone(),
+            Codec::new(32768),
+            admission.clone(),
+            i64::MAX as u64,
+        ));
+        let delivery = Rc::new(Delivery::new(reactor.clone(), Duration::from_secs(30)));
+        let mut metadata = metadata();
+        metadata.length = total;
+        metadata.version.object.cache = CacheId(crate::test_support::security::CACHE.into());
+        let (client_socket, origin_socket) =
+            racer_control_wire::canonical_socket_paths("mapped").unwrap();
+        let worker = crate::test_support::ReadWorker::new(
+            racer_control_wire::CacheDefinition {
+                id: metadata.version.object.cache.clone(),
+                name: "mapped".into(),
+                client_socket,
+                origin_socket,
+            },
+            metadata.clone(),
+            admission.clone(),
+            reactor.clone(),
+            delivery.clone(),
+            4,
+        );
+        let _queue = worker.drivers.enter();
+        let scope = RequestScope::new(
+            RequestId([8; 16]),
+            racer_platform::environment::now() + Duration::from_secs(60),
+        )
+        .unwrap();
+        let membership = worker.membership.clone();
+        let mut stream = worker
+            .streams
+            .open(
+                metadata.clone(),
+                range,
+                OriginContext {
+                    object: metadata.version.object.clone(),
+                    metadata: None,
+                    authorization: None,
+                },
+                membership,
+                scope.clone(),
+            )
+            .unwrap();
+        stream
+            .configure_subscription(4, 4 * PAGE_BYTES, true)
+            .unwrap();
+        let response = ReadResponse {
+            retain_until: None,
+            metadata,
+            payload: crate::read::ReadPayload::Stream(stream),
+        };
+        let responses = Responses::new(io.clone(), delivery);
+        let credited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_credited = credited.clone();
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let reader = std::thread::spawn(move || {
+            client
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .unwrap();
+            client
+                .write_all(b"GET / HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            // The descriptor rides on the first head byte.
+            let mut first = [0u8; 1];
+            let mut control = [0u64; 8];
+            let mut iov = libc::iovec {
+                iov_base: first.as_mut_ptr().cast(),
+                iov_len: 1,
+            };
+            // SAFETY: the message points at live buffers for this call.
+            let memory = unsafe {
+                let mut message: libc::msghdr = std::mem::zeroed();
+                message.msg_iov = &mut iov;
+                message.msg_iovlen = 1;
+                message.msg_control = control.as_mut_ptr().cast();
+                message.msg_controllen = std::mem::size_of_val(&control) as _;
+                assert_eq!(libc::recvmsg(client.as_raw_fd(), &mut message, 0), 1);
+                let header = libc::CMSG_FIRSTHDR(&message);
+                assert!(!header.is_null());
+                assert_eq!((*header).cmsg_type, libc::SCM_RIGHTS);
+                OwnedFd::from_raw_fd(std::ptr::read_unaligned(
+                    libc::CMSG_DATA(header).cast::<libc::c_int>(),
+                ))
+            };
+            let mut head = first.to_vec();
+            let mut byte = [0; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                assert_eq!(client.read(&mut byte).unwrap(), 1);
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8(head).unwrap();
+            assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+            assert!(head.contains("Racer-Delivery: mapped\r\n"), "{head}");
+            assert!(
+                head.contains(&format!("Content-Length: {}\r\n", 4 * 29 + 21)),
+                "{head}"
+            );
+            // SAFETY: fstat writes into the zeroed stat buffer.
+            let size = unsafe {
+                let mut stat: libc::stat = std::mem::zeroed();
+                assert_eq!(libc::fstat(memory.as_raw_fd(), &mut stat), 0);
+                stat.st_size as usize
+            };
+            // SAFETY: a fresh read-only shared mapping of the whole file.
+            let base = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    libc::PROT_READ,
+                    libc::MAP_SHARED,
+                    memory.as_raw_fd(),
+                    0,
+                )
+            };
+            assert_ne!(base, libc::MAP_FAILED);
+            // SAFETY: the read-only mapping is never written to the end of this thread.
+            let shared =
+                unsafe { std::slice::from_raw_parts(base.cast::<u8>().cast_const(), size) };
+            let mut pages = Vec::new();
+            for number in 1..=4u64 {
+                let (offset, length) = match number {
+                    1 => (PAGE_BYTES + 5, PAGE_BYTES - 5),
+                    4 => (4 * PAGE_BYTES, 17),
+                    _ => (number * PAGE_BYTES, PAGE_BYTES),
+                };
+                let mut frame = [0; 29];
+                client.read_exact(&mut frame).unwrap();
+                assert_eq!(frame[0], 3);
+                assert_eq!(u64::from_be_bytes(frame[1..9].try_into().unwrap()), number);
+                assert_eq!(u64::from_be_bytes(frame[9..17].try_into().unwrap()), offset);
+                assert_eq!(
+                    u32::from_be_bytes(frame[17..21].try_into().unwrap()),
+                    length as u32
+                );
+                let memory = u64::from_be_bytes(frame[21..].try_into().unwrap()) as usize;
+                let bytes = &shared[memory..memory + length as usize];
+                assert!(bytes.iter().all(|value| *value == number as u8));
+                pages.push((number, length as u32, bytes));
+            }
+            let mut frame = [0; 21];
+            client.read_exact(&mut frame).unwrap();
+            assert_eq!(frame[0], 2);
+            assert_eq!(u64::from_be_bytes(frame[1..9].try_into().unwrap()), 4);
+            // Uncredited pages stay intact after completion: the server waits.
+            std::thread::sleep(Duration::from_millis(200));
+            for (number, _, bytes) in &pages {
+                assert!(bytes.iter().all(|value| *value == *number as u8));
+            }
+            reader_credited.store(true, std::sync::atomic::Ordering::Release);
+            for (number, length, _) in &pages {
+                let mut credit = [0; 12];
+                credit[..8].copy_from_slice(&number.to_be_bytes());
+                credit[8..].copy_from_slice(&length.to_be_bytes());
+                client.write_all(&credit).unwrap();
+            }
+            drop(pages);
+            // SAFETY: unmaps exactly the mapping created above; no slices remain.
+            unsafe { libc::munmap(base, size) };
+        });
+        let work = async {
+            let connection = crate::http::from_accepted(server.into(), &admission)?;
+            let head = io.receive_head(connection, &scope).await?;
+            let metrics = crate::telemetry::Metrics::default();
+            let mut observation = metrics.request()?;
+            responses
+                .send_subscription(
+                    head.connection,
+                    response,
+                    &scope,
+                    &mut observation,
+                    Duration::from_secs(30),
+                    true,
+                )
+                .await
+                .map(drop)
+        };
+        let mut work = std::pin::pin!(work);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let result = loop {
+            if let Poll::Ready(result) = work.as_mut().poll(&mut cx) {
+                break result;
+            }
+            reactor.poll_budgeted(128).unwrap();
+            worker.poll(&mut cx);
+            reactor.wait(Duration::from_millis(1)).unwrap();
+        };
+        result.unwrap();
+        assert!(
+            credited.load(std::sync::atomic::Ordering::Acquire),
+            "mapped delivery returned before the client credited its pages"
+        );
+        reader.join().unwrap();
+        let drain_deadline = Instant::now() + Duration::from_secs(5);
+        while worker.drivers.pending() != 0 || reactor.in_flight() != 0 {
+            worker.poll(&mut cx);
+            reactor.poll_budgeted(128).unwrap();
+            reactor.wait(Duration::from_millis(1)).unwrap();
+            assert!(Instant::now() < drain_deadline, "read worker did not drain");
+        }
+        worker.poll(&mut cx);
+        admission.reclaim_buffers();
+        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
     }
 
     #[test]

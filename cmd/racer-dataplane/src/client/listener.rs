@@ -962,8 +962,11 @@ async fn serve_connection(
         let scope = new_scope(timeout, cancellation.clone())?;
         deadline.set(scope.deadline.0);
         let scope = &scope;
-        let request = match received.value.and_then(|head| parser.parse(cache, head)) {
-            Ok(request) => request,
+        let (request, mapped) = match received
+            .value
+            .and_then(|head| parser.parse_with_delivery(cache, head))
+        {
+            Ok(parsed) => parsed,
             Err(error) => {
                 observation.fail(error);
                 responses.send_error(connection, error, scope).await?;
@@ -1015,6 +1018,7 @@ async fn serve_connection(
             scope,
             &mut observation,
             timeout,
+            mapped,
         )
         .await?
         {

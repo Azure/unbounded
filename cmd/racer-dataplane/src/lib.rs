@@ -43,3 +43,10 @@ mod contention;
 
 #[cfg(test)]
 pub(crate) mod test_support;
+
+// Mapped client delivery needs the shared plaintext allocator; tests that
+// exercise it install the slab through `test_support::shared_memory`.
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOCATOR: page_alloc::shared::SharedAllocator =
+    page_alloc::shared::SharedAllocator::new();

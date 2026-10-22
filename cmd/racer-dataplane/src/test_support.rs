@@ -309,6 +309,7 @@ pub mod cluster {
             peer_tcp_nodelay: false,
             rdma_zero_copy: true,
             memory_pressure: true,
+            client_shared_memory: true,
             pprof_enabled: false,
             enable_rdma,
             control_endpoint: "https://control.invalid".into(),
@@ -902,4 +903,13 @@ pub(crate) mod security {
             );
         }
     }
+}
+
+/// Install the shared plaintext slab once for this test process.
+pub(crate) fn shared_memory() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        page_alloc::shared::install(64 * page_alloc::shared::SLOT_BYTES).unwrap();
+    });
+    assert!(page_alloc::shared::installed());
 }

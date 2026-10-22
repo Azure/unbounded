@@ -43,6 +43,42 @@ type pullOptions struct {
 	Interval          time.Duration
 	Verify            bool
 	DiagnoseIntegrity bool
+	// Delivery selects how Racer hands page bytes to the uds backend:
+	// deliveryMapped (default) or deliveryInline.
+	Delivery string
+	// Consume selects how unverified bodies are consumed: consumeDiscard
+	// (default) or consumeCopy.
+	Consume string
+}
+
+const (
+	deliveryMapped = "mapped"
+	deliveryInline = "inline"
+	consumeDiscard = "discard"
+	consumeCopy    = "copy"
+	// copyBufferBytes sizes the reused buffer of a consume=copy read.
+	copyBufferBytes = 1 << 20
+)
+
+// validateDeliveryOptions applies defaults and rejects unknown values.
+func validateDeliveryOptions(opts *pullOptions) error {
+	if opts.Delivery == "" {
+		opts.Delivery = deliveryMapped
+	}
+
+	if opts.Consume == "" {
+		opts.Consume = consumeDiscard
+	}
+
+	if opts.Delivery != deliveryMapped && opts.Delivery != deliveryInline {
+		return errors.New("delivery must be mapped or inline")
+	}
+
+	if opts.Consume != consumeDiscard && opts.Consume != consumeCopy {
+		return errors.New("consume must be discard or copy")
+	}
+
+	return nil
 }
 
 type puller struct {
@@ -58,6 +94,7 @@ type puller struct {
 	transport    *http.Transport
 	drains       *drainFiles
 	buffers      sync.Pool
+	copyBuffers  sync.Pool
 	failureLogs  failureLogs
 	expected     map[digest.Digest]blobSource
 	// Shared by workers; production uses the concurrency-safe package RNG.
@@ -79,6 +116,10 @@ func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*pu
 
 	if img == nil || metrics == nil {
 		return nil, errors.New("image and metrics are required")
+	}
+
+	if err := validateDeliveryOptions(&opts); err != nil {
+		return nil, err
 	}
 
 	if opts.Profile == "" {
@@ -144,6 +185,10 @@ func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*pu
 		},
 		buffers: sync.Pool{New: func() any {
 			buffer := make([]byte, 32*1024)
+			return &buffer
+		}},
+		copyBuffers: sync.Pool{New: func() any {
+			buffer := make([]byte, copyBufferBytes)
 			return &buffer
 		}},
 	}
@@ -419,6 +464,10 @@ func (p *puller) fetch(ctx context.Context, kind string, desc ocispec.Descriptor
 
 // readBody counts bytes even when Read returns data together with an error.
 func (p *puller) readBody(body io.Reader) (int64, string, error) {
+	if !p.opts.Verify && !p.opts.DiagnoseIntegrity && p.opts.Consume == consumeCopy {
+		return p.copyBody(body)
+	}
+
 	if !p.opts.Verify && !p.opts.DiagnoseIntegrity {
 		// Keep both the *os.File destination and Object source unwrapped so the
 		// SDK can splice. Each concurrent read borrows its own file; see drainFiles.
@@ -474,6 +523,35 @@ func (p *puller) readBody(body io.Reader) (int64, string, error) {
 	}
 
 	return total, "", nil
+}
+
+// copyBody reads body into a reused buffer so the client touches every byte,
+// unlike the discard drain, where mapped delivery writes shared memory to
+// /dev/null without reading it.
+func (p *puller) copyBody(body io.Reader) (int64, string, error) {
+	buffer, ok := p.copyBuffers.Get().(*[]byte)
+	if !ok {
+		return 0, "", errors.New("invalid copy buffer")
+	}
+	defer p.copyBuffers.Put(buffer)
+
+	var total int64
+
+	for {
+		n, err := body.Read(*buffer)
+		if n > 0 {
+			total += int64(n)
+			p.metrics.receivedBytes.Add(float64(n))
+		}
+
+		if err == io.EOF {
+			return total, "", nil
+		}
+
+		if err != nil {
+			return total, "", err
+		}
+	}
 }
 
 // sdkErrorStatus maps SDK sentinels to HTTP-style reporting codes. Context and

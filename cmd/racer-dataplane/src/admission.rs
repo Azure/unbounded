@@ -52,6 +52,11 @@ impl flow_control::Class for ResourceClass {
         // Keep every other class conservative, including mixed-use Registered.
         !matches!(self, Self::Ciphertext)
     }
+
+    fn shared(self) -> bool {
+        // Client delivery names plaintext pages by their offset in the shared slab.
+        matches!(self, Self::Plaintext)
+    }
 }
 
 pub struct AdmissionPolicy {

@@ -40,6 +40,7 @@ func TestParseOptionsDefaults(t *testing.T) {
 			Target: "http://127.0.0.1:5000", Namespace: "loadgen.invalid",
 			Concurrency: 64, BlobConcurrency: 4, Timeout: 2 * time.Minute,
 			RetryDelay: time.Second, Verify: false,
+			Delivery: deliveryMapped, Consume: consumeDiscard,
 		},
 	}, opts)
 }
@@ -52,7 +53,7 @@ func TestParseOptionsOverrides(t *testing.T) {
 		"--concurrency=0", "--blob-concurrency=3", "--pull-timeout=9s",
 		"--retry-delay=20ms", "--interval=30ms", "--verify=false", "--start-delay=0", "--duration=1m",
 		"--catalog-images=512", "--startup-timeout=4m",
-		"--profile=zipf", "--zipf-exponent=0.8",
+		"--profile=zipf", "--zipf-exponent=0.8", "--consume=copy",
 	}, io.Discard)
 	require.NoError(t, err)
 	require.Equal(t, options{
@@ -64,6 +65,7 @@ func TestParseOptionsOverrides(t *testing.T) {
 			Target: "https://mirror.example/base", Namespace: "registry.example:5000",
 			Concurrency: 0, BlobConcurrency: 3, Timeout: 9 * time.Second,
 			RetryDelay: 20 * time.Millisecond, Interval: 30 * time.Millisecond,
+			Delivery: deliveryMapped, Consume: consumeCopy,
 		},
 	}, opts)
 }
@@ -94,6 +96,11 @@ func TestParseOptionsInvalid(t *testing.T) {
 		{"nan exponent", []string{"--zipf-exponent=NaN"}, "finite and positive"},
 		{"infinite exponent", []string{"--zipf-exponent=+Inf"}, "finite and positive"},
 		{"negative infinite exponent", []string{"--zipf-exponent=-Inf"}, "finite and positive"},
+		{"unknown delivery", []string{"--backend=uds", "--cache=test", "--delivery=splice"}, "delivery must be"},
+		{"empty delivery", []string{"--backend=uds", "--cache=test", "--delivery="}, "delivery must be"},
+		{"delivery without uds", []string{"--delivery=inline"}, "delivery requires backend=uds"},
+		{"unknown consume", []string{"--consume=hash"}, "consume must be"},
+		{"empty consume", []string{"--consume="}, "consume must be"},
 		{"positional", []string{"image"}, "unexpected positional arguments"},
 		{"after separator", []string{"--", "image"}, "unexpected positional arguments"},
 	} {
@@ -118,6 +125,7 @@ func TestParseOptionsHelp(t *testing.T) {
 				"-concurrency", "zero serves only the origin", "-blob-concurrency",
 				"-pull-timeout", "-retry-delay", "-interval", "-verify", "-start-delay", "-duration",
 				"-catalog-images", "-startup-timeout", "-profile", "-zipf-exponent",
+				"-delivery", "-consume",
 			} {
 				require.Contains(t, output.String(), text)
 			}

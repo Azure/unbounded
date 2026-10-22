@@ -43,21 +43,32 @@
 //
 // An [Object] can be consumed in exactly two ways. Pick one per object.
 //
-// [Object.Read] copies. Each call copies bytes from the socket into your
-// buffer, so your code sees and owns the data: use it to hash, parse,
-// decompress, or transform the content. Copying costs CPU and memory
-// bandwidth proportional to the object size. Pass buffers of 32 KiB or more.
+// By default on Linux, Racer uses mapped delivery: it does not write page
+// bytes into the socket. Instead it passes the client a read-only shared
+// memory file once per connection and tells it where each page lives. The
+// SDK maps that memory, reuses the mapping across reads, and returns each
+// page to Racer once its bytes have been consumed. This works across pods
+// that share the socket, since they share a kernel. Set
+// [ClientConfig.InlineDelivery] to have every page written through the
+// socket instead. Racer may also decline mapped delivery and answer inline.
 //
-// [Object.WriteTo] does not copy. It forwards the object to a writer. When the
-// writer is backed by a file descriptor and implements [io.ReaderFrom], such
-// as an [*os.File], a [net.Conn], or the [http.ResponseWriter] of a
-// plain-text HTTP/1 server, the kernel moves the data from Racer's socket to the destination
-// with splice(2) and it never enters process memory. Other writers receive
-// data through a single reused 256 KiB buffer. Your code never sees the
-// bytes, so this is the right choice for proxies and anything that only
-// stores or forwards content. [io.Copy] uses WriteTo automatically when the
-// source is an Object, so io.Copy(dst, object) is the no-copy path; wrapping
-// the object in another reader, such as [io.TeeReader], switches to Read.
+// [Object.Read] copies. Each call copies bytes into your buffer, so your
+// code sees and owns the data: use it to hash, parse, decompress, or
+// transform the content. Copying costs CPU and memory bandwidth
+// proportional to the object size. Pass buffers of 32 KiB or more.
+//
+// [Object.WriteTo] does not copy in the SDK. It forwards the object to a
+// writer. With mapped delivery, the writer receives slices of the shared
+// memory directly. With inline delivery, when the writer is backed by a
+// file descriptor and implements [io.ReaderFrom], such as an [*os.File], a
+// [net.Conn], or the [http.ResponseWriter] of a plain-text HTTP/1 server,
+// the kernel moves the data from Racer's socket to the destination with
+// splice(2) and it never enters process memory; other writers receive data
+// through a single reused 256 KiB buffer. Your code never sees the bytes,
+// so this is the right choice for proxies and anything that only stores or
+// forwards content. [io.Copy] uses WriteTo automatically when the source is
+// an Object, so io.Copy(dst, object) is the no-copy path; wrapping the
+// object in another reader, such as [io.TeeReader], switches to Read.
 //
 // Both paths withhold the last byte until Racer confirms the whole range was
 // delivered intact. A read that is cut short therefore always ends in an
