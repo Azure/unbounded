@@ -66,7 +66,7 @@ func TestIntegrationStartCancelDuringStartup(t *testing.T) {
 
 		t.Cleanup(func() { _ = r.d.Close() })
 	case <-time.After(startupTimeout):
-		t.Fatal("neither a startup read nor Start returned")
+		abortHung(t, "neither a startup read nor Start returned")
 	}
 
 	cancel()
@@ -75,7 +75,7 @@ func TestIntegrationStartCancelDuringStartup(t *testing.T) {
 		select {
 		case r = <-res:
 		case <-time.After(startupTimeout):
-			t.Fatal("Start did not return after its context was canceled")
+			abortHung(t, "Start did not return after its context was canceled")
 		}
 
 		if r.err == nil {
@@ -91,7 +91,7 @@ func TestIntegrationStartCancelDuringStartup(t *testing.T) {
 		select {
 		case <-r.d.Done():
 		case <-time.After(startupTimeout):
-			t.Fatal("device did not stop after ctx cancel")
+			abortHung(t, "device did not stop after ctx cancel")
 		}
 
 		if !errors.Is(r.d.Err(), context.Canceled) {
@@ -138,7 +138,7 @@ func TestIntegrationStartCancelBeforeStartDev(t *testing.T) {
 			t.Fatalf("Start = %v, want context.Canceled", err)
 		}
 	case <-time.After(startupTimeout):
-		t.Fatal("Start did not return after its context was canceled")
+		abortHung(t, "Start did not return after its context was canceled")
 	}
 
 	checkNoLeak(t, before)

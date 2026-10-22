@@ -56,7 +56,7 @@ func startBounded(t *testing.T, queues int) (*Device, error) {
 	case r := <-res:
 		return r.d, r.err
 	case <-time.After(startupTimeout):
-		t.Fatal("Start did not return; START_DEV is likely waiting on a dead queue")
+		abortHung(t, "Start did not return; see the stacks for where it is blocked")
 		return nil, nil
 	}
 }
@@ -89,6 +89,12 @@ func setHooks(t *testing.T, fetchTag func(qid, tag int) int, beforeStartDev func
 	testHooks.beforeStartDev = beforeStartDev
 
 	t.Cleanup(func() {
+		// A hung device still runs queue goroutines that read the
+		// hooks; see abortHung.
+		if hung.Load() {
+			return
+		}
+
 		testHooks.fetchTag = nil
 		testHooks.beforeStartDev = nil
 		testHooks.beforeStartCmd = nil
