@@ -74,6 +74,7 @@ var reservedScriptEnvironmentNames = map[string]struct{}{
 
 var workflowOutputLimits = map[string]int{
 	"backend-resources": 16 * 1024,
+	"cleanup-failure":   64,
 	"measurements":      16 * 1024,
 	"reason":            4 * 1024,
 	"verdict":           32,

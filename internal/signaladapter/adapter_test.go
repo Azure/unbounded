@@ -730,7 +730,7 @@ func TestAggregateBackendFailurePrecedesDiagnosticFailure(t *testing.T) {
 
 	if output.ExecutionState != "Error" ||
 		output.Verdict != "Inconclusive" ||
-		output.Reason != "ParticipantCoverageIncomplete" {
+		output.Reason != "BackendFailed" {
 		t.Fatalf("output = %#v", output)
 	}
 }

@@ -131,6 +131,13 @@ func writeOutputs(directory string, output signaladapter.AggregateOutput) error 
 		return errors.New("output-directory is required")
 	}
 
+	if len(output.CleanupFailure) > signaladapter.MaxCleanupFailureBytes {
+		return fmt.Errorf(
+			"cleanup failure exceeds %d bytes",
+			signaladapter.MaxCleanupFailureBytes,
+		)
+	}
+
 	if err := os.MkdirAll(directory, 0o750); err != nil {
 		return fmt.Errorf("create output directory: %w", err)
 	}
@@ -138,6 +145,7 @@ func writeOutputs(directory string, output signaladapter.AggregateOutput) error 
 	outputs := map[string]string{
 		"verdict":           output.Verdict,
 		"reason":            output.Reason,
+		"cleanup-failure":   output.CleanupFailure,
 		"measurements":      output.Measurements,
 		"backend-resources": output.BackendJSON,
 	}

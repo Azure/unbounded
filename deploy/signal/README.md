@@ -304,6 +304,11 @@ executionState=Error,     verdict=Inconclusive, reason=<workflow reason>
 
 Ambiguous or incomplete workflow execution remains `Inconclusive`. The
 controller does not infer a successful result from partial evidence.
+If backend execution and cleanup both fail, `reason` retains the first causal
+backend failure and the bounded `cleanup-failure` Workflow output records
+`BackendCleanupFailed` separately. Cleanup failure always forces
+`executionState=Error` and `verdict=Inconclusive`, including after an otherwise
+successful diagnostic.
 
 Cluster-local evidence consists of CertificationRun status, the referenced
 Workflow and backend status, Events, pod logs, termination messages, and the

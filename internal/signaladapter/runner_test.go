@@ -92,6 +92,52 @@ func TestBackendCompletionResultFailsClosedWithoutValidResult(t *testing.T) {
 	}
 }
 
+func TestCleanupFailurePreservesExecutionFailure(t *testing.T) {
+	t.Parallel()
+
+	output, err := Aggregate(1, testBackendResources()[:1], []Result{{
+		ParticipantIndex: 0,
+		ExecutionState:   "Error",
+		Verdict:          "Inconclusive",
+		Reason:           "BackendExecutionFailed",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	recordCleanupFailure(&output)
+
+	if output.ExecutionState != "Error" ||
+		output.Verdict != "Inconclusive" ||
+		output.Reason != "BackendExecutionFailed" ||
+		output.CleanupFailure != "BackendCleanupFailed" {
+		t.Fatalf("output = %#v", output)
+	}
+}
+
+func TestCleanupFailurePreventsPass(t *testing.T) {
+	t.Parallel()
+
+	output, err := Aggregate(1, testBackendResources()[:1], []Result{{
+		ParticipantIndex: 0,
+		ExecutionState:   "Succeeded",
+		Verdict:          "Pass",
+		Reason:           "Healthy",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	recordCleanupFailure(&output)
+
+	if output.ExecutionState != "Error" ||
+		output.Verdict != "Inconclusive" ||
+		output.Reason != "BackendCleanupFailed" ||
+		output.CleanupFailure != "BackendCleanupFailed" {
+		t.Fatalf("output = %#v", output)
+	}
+}
+
 func TestCompletedResultRejectsTerminalStateMismatch(t *testing.T) {
 	t.Parallel()
 

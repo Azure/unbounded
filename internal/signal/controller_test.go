@@ -903,6 +903,9 @@ func TestWorkflowParametersRejectMalformedEvidence(t *testing.T) {
 		"oversized": {
 			map[string]any{"name": "measurements", "value": strings.Repeat("x", 16*1024+1)},
 		},
+		"oversized cleanup failure": {
+			map[string]any{"name": "cleanup-failure", "value": strings.Repeat("x", 65)},
+		},
 		"wrong type": {
 			map[string]any{"name": "verdict", "value": true},
 		},
