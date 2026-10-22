@@ -41,14 +41,22 @@ type queue struct {
 	depth  int
 	charFd int
 
-	ring  *uring
-	desc  []byte   // read-only mmap of the io descriptor array
-	bufs  [][]byte // per-tag anonymous mmap IO buffers
-	efd   int      // eventfd signaled by workers
-	pollP bool     // poll is armed (queue thread only)
+	ring *uring
+	// oldRing is the ring a rescue replaced. It stays open, and is
+	// never entered again, until the queue thread exits. See rescue.
+	oldRing *uring
+	desc    []byte   // read-only mmap of the io descriptor array
+	bufs    [][]byte // per-tag anonymous mmap IO buffers
+	efd     int      // eventfd signaled by workers
+	pollP   bool     // poll is armed (queue thread only)
 
 	mu      sync.Mutex
 	pending []completion
+
+	// busy marks tags whose request a handler goroutine is serving. The
+	// queue thread owns it. A rescue never answers a busy tag itself;
+	// the handler's result is committed through drain instead.
+	busy []bool
 
 	running  bool // set before run starts; read after
 	stopping atomic.Bool
@@ -70,6 +78,7 @@ func newQueue(d *Device, id int) (*queue, error) {
 		depth:   cfg.Depth,
 		charFd:  d.charFd,
 		efd:     -1,
+		busy:    make([]bool, cfg.Depth),
 		exited:  make(chan struct{}),
 		serving: make(chan struct{}),
 	}
@@ -112,6 +121,11 @@ func (q *queue) release() error {
 	if q.ring != nil {
 		errs = append(errs, q.ring.close())
 		q.ring = nil
+	}
+
+	if q.oldRing != nil {
+		errs = append(errs, q.oldRing.close())
+		q.oldRing = nil
 	}
 
 	for i, b := range q.bufs {
@@ -268,6 +282,14 @@ func (q *queue) run(ready chan<- error) {
 	}
 
 	q.ring = nil
+
+	if q.oldRing != nil {
+		if cerr := q.oldRing.close(); cerr != nil {
+			q.dev.cfg.Logger.Warn("ublk: closing replaced queue ring", "queue", q.id, "err", cerr)
+		}
+
+		q.oldRing = nil
+	}
 }
 
 func (q *queue) serve(ready chan<- error) error {
@@ -300,6 +322,10 @@ func (q *queue) serve(ready chan<- error) error {
 
 			switch c.Res {
 			case 0:
+				if err := q.delivered(tag, false); err != nil {
+					return err
+				}
+
 				if err := q.handle(tag); err != nil {
 					return err
 				}
@@ -417,12 +443,32 @@ func (q *queue) drain() error {
 	q.mu.Unlock()
 
 	for _, c := range done {
+		q.setBusy(c.tag, false)
+
 		if err := q.prepIO(uIOCommitAndFetchReq, c.tag, c.res); err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+// delivered runs the test hook for a request the kernel just handed to
+// the queue. An error leaves the request unanswered.
+func (q *queue) delivered(tag uint16, eio bool) error {
+	if testHooks.delivered != nil {
+		return testHooks.delivered(q, tag, eio)
+	}
+
+	return nil
+}
+
+// setBusy records whether a handler serves tag. Queues built without a
+// busy table, as in some tests, do not track it.
+func (q *queue) setBusy(tag uint16, busy bool) {
+	if int(tag) < len(q.busy) {
+		q.busy[tag] = busy
+	}
 }
 
 // handle processes a request the kernel delivered for tag.
@@ -446,6 +492,7 @@ func (q *queue) handle(tag uint16) error {
 	buf := q.bufs[tag][:n]
 	off := int64(d.StartSector) << 9 //nolint:gosec // sector counts fit in int64
 
+	q.setBusy(tag, true)
 	q.dev.workers.Add(1)
 
 	go func() {
