@@ -245,6 +245,7 @@ func TestGroupedWorkflowBuildsVisibleSerialDAG(t *testing.T) {
 		task := dagTasks[index].(map[string]any)
 		if index > 0 {
 			previous := dagTasks[index-1].(map[string]any)["name"].(string)
+
 			want := fmt.Sprintf(
 				"%[1]s.Succeeded || %[1]s.Failed || %[1]s.Errored || %[1]s.Skipped || %[1]s.Omitted",
 				previous,

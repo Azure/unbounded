@@ -105,6 +105,7 @@ func TestAdapterTemplateResolvesGroupedTaskArgumentsThroughInputs(t *testing.T) 
 	}
 
 	const certificationMarker = "    - name: certification\n      inputs:\n"
+
 	certificationIndex := strings.LastIndex(manifest, certificationMarker)
 	if certificationIndex < 0 {
 		t.Fatal("adapter WorkflowTemplate does not declare certification template inputs")
