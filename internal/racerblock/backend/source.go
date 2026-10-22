@@ -33,10 +33,11 @@ type MetadataReader interface {
 
 // FromClient adapts a racersdk.Client and a fixed request to a Source.
 //
-// Open uses [racersdk.ReadOptions.SmallObject] once a Stat or Warm through
-// this Source has reported an object no larger than [racersdk.PageSize].
-// SmallObject is a promise about the whole object, not the range, so it is
-// never set before the size is known.
+// Open uses [racersdk.ReadOptions.SmallObject] only when the most recent Stat
+// or Warm through this Source reported an object no larger than
+// [racersdk.PageSize] with the same ETag that Open requests. SmallObject is a
+// promise about the whole version, not the range, so it is never set for an
+// unpinned read or for a version whose size has not been observed.
 func FromClient(c *racersdk.Client, req racersdk.Request) Source {
 	return &clientSource{client: c, req: req}
 }
@@ -44,14 +45,32 @@ func FromClient(c *racersdk.Client, req racersdk.Request) Source {
 type clientSource struct {
 	client *racersdk.Client
 	req    racersdk.Request
-	// size is the last object size seen by Stat or Warm, or 0 if unknown.
-	size atomic.Int64
+	// last is the version most recently reported by Stat or Warm, or nil.
+	// The ETag and size are stored together so a concurrent refresh cannot
+	// pair one version's size with another version's ETag.
+	last atomic.Pointer[versionSize]
+}
+
+type versionSize struct {
+	etag string
+	size int64
+}
+
+func (s *clientSource) remember(md racersdk.Metadata) {
+	s.last.Store(&versionSize{etag: md.ETag, size: md.Size})
+}
+
+// smallObject reports whether etag names a version known to fit in one page.
+func (s *clientSource) smallObject(etag string) bool {
+	v := s.last.Load()
+
+	return etag != "" && v != nil && v.etag == etag && v.size > 0 && v.size <= racersdk.PageSize
 }
 
 func (s *clientSource) Stat(ctx context.Context) (racersdk.Metadata, error) {
 	md, err := s.client.Stat(ctx, s.req)
 	if err == nil {
-		s.size.Store(md.Size)
+		s.remember(md)
 	}
 
 	return md, err
@@ -60,19 +79,18 @@ func (s *clientSource) Stat(ctx context.Context) (racersdk.Metadata, error) {
 func (s *clientSource) Warm(ctx context.Context, ttl time.Duration, etag string) (racersdk.WarmResult, error) {
 	res, err := s.client.Warm(ctx, s.req, ttl, racersdk.WarmOptions{ETag: etag})
 	if err == nil {
-		s.size.Store(res.Metadata.Size)
+		s.remember(res.Metadata)
 	}
 
 	return res, err
 }
 
 func (s *clientSource) Open(ctx context.Context, offset, length int64, etag string) (io.ReadCloser, error) {
-	size := s.size.Load()
 	opts := racersdk.ReadOptions{
 		Offset:      offset,
 		Length:      length,
 		ETag:        etag,
-		SmallObject: size > 0 && size <= racersdk.PageSize,
+		SmallObject: s.smallObject(etag),
 	}
 
 	obj, err := s.client.Get(ctx, s.req, opts)
