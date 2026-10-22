@@ -42,6 +42,21 @@ type Device struct {
 	workers sync.WaitGroup
 
 	started bool
+
+	// startMu guards starting and startErr. While starting is set,
+	// fail only records the first error: Start owns teardown until it
+	// returns, so queue resources cannot be released while queues are
+	// still being launched or START_DEV is in flight.
+	startMu  sync.Mutex
+	starting bool
+	startErr error
+
+	// stopAsync runs teardown off the caller's goroutine. Tests replace
+	// it to observe failures without a kernel device.
+	stopAsync func(error)
+	// launch starts a queue thread. Tests replace it to inject errors.
+	launch func(q *queue, ready chan<- error)
+
 	closing atomic.Bool // set when teardown begins
 
 	once     sync.Once
@@ -84,9 +99,10 @@ func Start(ctx context.Context, cfg Config, h Handler) (*Device, error) {
 		charFd:  -1,
 		done:    make(chan struct{}),
 	}
+	d.init()
 	d.hctx, d.hcancel = context.WithCancel(ctx)
 
-	if err := d.start(); err != nil {
+	if err := d.runStartup(d.start); err != nil {
 		d.teardown(err)
 		return nil, err
 	}
@@ -97,6 +113,40 @@ func Start(ctx context.Context, cfg Config, h Handler) (*Device, error) {
 		"queues", cfg.Queues, "depth", cfg.Depth, "maxIOBytes", cfg.MaxIOBytes)
 
 	return d, nil
+}
+
+// init sets the default hooks and enters the startup phase.
+func (d *Device) init() {
+	d.stopAsync = func(err error) { go d.teardown(err) }
+	d.launch = func(q *queue, ready chan<- error) { go q.run(ready) }
+	d.starting = true
+}
+
+// runStartup runs start while fail defers teardown to the caller, then
+// leaves the startup phase. A queue error recorded during startup is
+// returned even when start itself succeeded, so the caller tears down
+// exactly once and only after every queue has been launched.
+func (d *Device) runStartup(start func() error) error {
+	err := start()
+
+	d.startMu.Lock()
+	d.starting = false
+	recorded := d.startErr
+	d.startMu.Unlock()
+
+	if err == nil {
+		err = recorded
+	}
+
+	return err
+}
+
+// startupErr returns the first queue error recorded during startup.
+func (d *Device) startupErr() error {
+	d.startMu.Lock()
+	defer d.startMu.Unlock()
+
+	return d.startErr
 }
 
 func (d *Device) start() error {
@@ -127,7 +177,7 @@ func (d *Device) start() error {
 	ready := make(chan error, len(d.queues))
 	for _, q := range d.queues {
 		q.running = true
-		go q.run(ready)
+		d.launch(q, ready)
 	}
 
 	var errs []error
@@ -140,6 +190,12 @@ func (d *Device) start() error {
 
 	if err := errors.Join(errs...); err != nil {
 		return fmt.Errorf("ublk: submit FETCH_REQ: %w", err)
+	}
+
+	// A queue may have failed after its FETCH_REQs were submitted; do
+	// not start a device that already has a dead queue.
+	if err := d.startupErr(); err != nil {
+		return err
 	}
 
 	d.started = true
@@ -193,9 +249,25 @@ func (d *Device) watch(ctx context.Context) {
 	}
 }
 
-// fail tears the device down asynchronously because of err.
+// fail tears the device down asynchronously because of err. During
+// startup it only records err; Start returns it and tears down after all
+// queues are launched, which avoids releasing a queue that is about to
+// run. fail never blocks, so a failing queue thread cannot deadlock
+// against Start waiting on START_DEV.
 func (d *Device) fail(err error) {
-	go d.teardown(err)
+	d.startMu.Lock()
+	if d.starting {
+		if d.startErr == nil {
+			d.startErr = err
+		}
+
+		d.startMu.Unlock()
+
+		return
+	}
+	d.startMu.Unlock()
+
+	d.stopAsync(err)
 }
 
 // teardown stops the device once and records cause. It blocks until the
