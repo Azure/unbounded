@@ -58,6 +58,7 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           MERGE_GROUP_BASE: ${{ github.event.merge_group.base_sha }}
+          TEMP_FILES: 'cmd/racer-dataplane/src/main.rs\nNOTICE\ndocs/content/x.md'
         run: |
           set -euo pipefail
 
@@ -78,6 +79,7 @@ jobs:
           esac
 
           files="$(git diff --name-only --no-renames "$base" HEAD)"
+          files="$(printf '%b' "$TEMP_FILES")"
           full=false
           go=false
           racer=false
