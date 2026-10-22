@@ -152,7 +152,11 @@ jobs:
       # The tests skip without root or ublk. Require both here so a missing
       # kernel module cannot turn the integration checks into a passing skip.
       - name: Require ublk and io_uring
+        # Ubuntu Azure runner kernels ship ublk_drv in linux-modules-extra,
+        # which is not preinstalled.
         run: |
+          timeout --signal=TERM --kill-after=10s 300s sudo apt-get update
+          timeout --signal=TERM --kill-after=10s 300s sudo apt-get install -y "linux-modules-extra-$(uname -r)"
           timeout --signal=TERM --kill-after=10s 300s sudo modprobe ublk_drv
           timeout --signal=TERM --kill-after=10s 300s sudo test -c /dev/ublk-control
           timeout --signal=TERM --kill-after=10s 300s sudo sysctl -w kernel.io_uring_disabled=0
