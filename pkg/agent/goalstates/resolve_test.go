@@ -676,6 +676,52 @@ func TestResolveMachine_InvalidAdditionalHostMount(t *testing.T) {
 	require.ErrorContains(t, err, "AdditionalHostMounts")
 }
 
+func TestResolveMachine_NSpawnLifecycle(t *testing.T) {
+	lifecycle := &config.NSpawnLifecycleConfig{
+		PreStartCommand:  "/usr/bin/systemctl start app-pre-start@%i.service",
+		PostStartCommand: "/usr/bin/systemctl start app-post-start@%i.service",
+	}
+	cfg := &config.AgentConfig{
+		MachineName:     "machine-1",
+		NodeName:        "configured-node",
+		NSpawnLifecycle: lifecycle,
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: "https://api.example.com",
+		},
+	}
+
+	got, err := ResolveMachine(discardLogger(), cfg, "kube1", nil)
+	require.NoError(t, err)
+	require.Equal(t, lifecycle, got.RootFS.NSpawnLifecycle)
+	require.NotSame(t, lifecycle, got.RootFS.NSpawnLifecycle)
+	require.False(t, got.RootFS.UsesLifecycleHelper())
+
+	cfg.NSpawnLifecycle = nil
+	got, err = ResolveMachine(discardLogger(), cfg, "kube1", nil)
+	require.NoError(t, err)
+	require.True(t, got.RootFS.UsesLifecycleHelper())
+}
+
+func TestResolveMachine_InvalidNSpawnLifecycle(t *testing.T) {
+	cfg := &config.AgentConfig{
+		MachineName:     "machine-1",
+		NodeName:        "configured-node",
+		NSpawnLifecycle: &config.NSpawnLifecycleConfig{PreStartCommand: "/usr/bin/true"},
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: "https://api.example.com",
+		},
+	}
+
+	_, err := ResolveMachine(discardLogger(), cfg, "kube1", nil)
+	require.ErrorContains(t, err, "NSpawnLifecycle.PostStartCommand")
+}
+
 // TestHostDistroIsImageManaged pins which hosts are treated as delivering their
 // OS content as an image. On such a host the agent validates that required
 // tools are present instead of trying to install them, so a host wrongly

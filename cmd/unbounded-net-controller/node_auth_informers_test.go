@@ -11,7 +11,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -62,12 +64,55 @@ func waitNodeAuthCondition(t *testing.T, condition func() bool) {
 	}
 }
 
+// trackNodeAuthWatches reports whether the fake tracker has registered a watch
+// for both informed resources. HasSynced only proves the initial List finished.
+// The fake tracker replays objects added between List and Watch but drops
+// deletions, so tests must not mutate objects until both watches exist.
+func trackNodeAuthWatches(client *k8sfake.Clientset) func() bool {
+	var (
+		mu      sync.Mutex
+		watched = map[string]bool{}
+	)
+
+	next := slices.Clone(client.WatchReactionChain)
+	client.PrependWatchReactor("*", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		for _, reactor := range next {
+			if !reactor.Handles(action) {
+				continue
+			}
+
+			handled, stream, err := reactor.React(action)
+			if !handled {
+				continue
+			}
+
+			if err == nil {
+				mu.Lock()
+				watched[action.GetResource().Resource] = true
+				mu.Unlock()
+			}
+
+			return true, stream, err
+		}
+
+		return false, nil, nil
+	})
+
+	return func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+
+		return watched["pods"] && watched["serviceaccounts"]
+	}
+}
+
 func startNodeAuthTestCaches(t *testing.T, client *k8sfake.Clientset) (*nodeAuthInformers, context.CancelFunc) {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
 
+	watching := trackNodeAuthWatches(client)
 	caches := newNodeAuthInformers(ctx, client, "unbounded-system", 0)
 	caches.start()
 	t.Cleanup(func() {
@@ -76,6 +121,7 @@ func startNodeAuthTestCaches(t *testing.T, client *k8sfake.Clientset) (*nodeAuth
 		caches.saFactory.Shutdown()
 	})
 	waitNodeAuthCondition(t, caches.ready)
+	waitNodeAuthCondition(t, watching)
 
 	return caches, cancel
 }
@@ -130,27 +176,7 @@ func TestNodeAuthInformersScopeAndLifecycle(t *testing.T) {
 	otherSA := sa.DeepCopy()
 	otherSA.Namespace = "other"
 	client := k8sfake.NewClientset(pod, sa, unlabeled, otherPod, otherSA)
-	podWatchStarted := make(chan struct{}, 1)
-	watchReactor := client.WatchReactionChain[0]
-	client.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, watch.Interface, error) {
-		handled, stream, err := watchReactor.React(action)
-		if handled && err == nil {
-			select {
-			case podWatchStarted <- struct{}{}:
-			default:
-			}
-		}
-
-		return handled, stream, err
-	})
 	caches, stop := startNodeAuthTestCaches(t, client)
-
-	// The fake tracker cannot replay deletions between the initial list and watch registration.
-	select {
-	case <-podWatchStarted:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Pod watch did not start")
-	}
 
 	if _, err := caches.pods.Lister().Pods(pod.Namespace).Get(pod.Name); err != nil {
 		t.Fatal(err)

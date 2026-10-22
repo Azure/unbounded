@@ -66,6 +66,11 @@ type AgentConfig struct {
 	// required.
 	AdditionalHostMounts []AdditionalHostMount `json:"AdditionalHostMounts,omitempty"`
 
+	// NSpawnLifecycle supplies the commands the machine's systemd hooks run
+	// before and after it starts, in place of the lifecycle helper, which the
+	// agent then does not install on the host. Nil runs the helper.
+	NSpawnLifecycle *NSpawnLifecycleConfig `json:"NSpawnLifecycle,omitempty"`
+
 	// OfflineArtifacts points to a complete offline binary artifact source.
 	// When set, it takes precedence over download overrides. Source is rendered
 	// as a strict Go template using the cluster Kubernetes version, then
@@ -92,6 +97,65 @@ func ValidateProvisioningFormat(format string) error {
 	default:
 		return fmt.Errorf("ProvisioningFormat must be %q or %q", ProvisioningFormatCloudInit, ProvisioningFormatIgnition)
 	}
+}
+
+// NSpawnLifecycleConfig supplies the nspawn lifecycle hooks' commands, for an
+// application that runs the agent's nspawn-lifecycle phases another way than
+// through the lifecycle helper, such as in a container. Each is a single systemd
+// command, as in ExecStart=, starting with the command's absolute path, in a
+// unit instance named after the machine, so %i expands to the machine's name.
+// Each must run its phase for that machine with the host's view of the
+// filesystem, and fail if the phase fails, as nspawn-lifecycle does.
+type NSpawnLifecycleConfig struct {
+	// PreStartCommand runs the pre-start phase, which regenerates the
+	// machine's host-side config before it starts.
+	PreStartCommand string `json:"PreStartCommand"`
+	// PostStartCommand runs the post-start phase once the machine has started.
+	PostStartCommand string `json:"PostStartCommand"`
+}
+
+// DeepCopy returns a copy of the lifecycle hook commands.
+func (l *NSpawnLifecycleConfig) DeepCopy() *NSpawnLifecycleConfig {
+	if l == nil {
+		return nil
+	}
+
+	out := *l
+
+	return &out
+}
+
+// ValidateNSpawnLifecycle checks that configured lifecycle hook commands are
+// present and safe to render into systemd units. Nil is valid.
+func ValidateNSpawnLifecycle(lifecycle *NSpawnLifecycleConfig) error {
+	if lifecycle == nil {
+		return nil
+	}
+
+	var errs []error
+
+	for _, hook := range []struct{ name, command string }{
+		{"PreStartCommand", lifecycle.PreStartCommand},
+		{"PostStartCommand", lifecycle.PostStartCommand},
+	} {
+		switch {
+		case strings.TrimSpace(hook.command) == "":
+			errs = append(errs, fmt.Errorf("NSpawnLifecycle.%s is required", hook.name))
+		case strings.IndexFunc(hook.command, unicode.IsControl) >= 0:
+			errs = append(errs, fmt.Errorf("NSpawnLifecycle.%s must not contain control characters", hook.name))
+		case !strings.HasPrefix(hook.command, "/"):
+			// This also rules out systemd's prefixes, such as "-", which ignores the
+			// command's failure.
+			errs = append(errs, fmt.Errorf("NSpawnLifecycle.%s must start with the command's absolute path", hook.name))
+		case slices.Contains(strings.Fields(hook.command), ";"):
+			// systemd starts another command, which may have a prefix, after a lone ";".
+			errs = append(errs, fmt.Errorf("NSpawnLifecycle.%s must be a single command, without a lone \";\"", hook.name))
+		case strings.HasSuffix(strings.TrimRightFunc(hook.command, unicode.IsSpace), `\`):
+			errs = append(errs, fmt.Errorf("NSpawnLifecycle.%s must not end in a backslash, which joins the unit's next line to it", hook.name))
+		}
+	}
+
+	return errors.Join(errs...)
 }
 
 // AgentOfflineArtifacts configures a complete offline source for binaries the
@@ -199,6 +263,8 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 		out.Gantry = &GantryConfig{Disabled: a.Gantry.Disabled}
 	}
 
+	out.NSpawnLifecycle = a.NSpawnLifecycle.DeepCopy()
+
 	out.LocalDNS = a.LocalDNS.DeepCopy()
 
 	out.OfflineArtifacts = a.OfflineArtifacts.DeepCopy()
@@ -235,6 +301,10 @@ func (a *AgentConfig) Validate() error {
 	}
 
 	if err := ValidateAdditionalHostMounts(a.AdditionalHostMounts); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := ValidateNSpawnLifecycle(a.NSpawnLifecycle); err != nil {
 		errs = append(errs, err)
 	}
 
