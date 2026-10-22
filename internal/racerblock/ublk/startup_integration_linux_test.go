@@ -102,6 +102,10 @@ func setHooks(t *testing.T, fetchTag func(qid, tag int) int, beforeStartDev func
 		testHooks.failedRingClose = nil
 		testHooks.serveEIO = nil
 		testHooks.eioAnswered = nil
+		testHooks.delivered = nil
+		testHooks.rescue = nil
+		testHooks.rescued = nil
+		testHooks.beforeStop = nil
 	})
 }
 
@@ -351,13 +355,17 @@ func TestIntegrationStartupFailedQueueAnswersAfterStartup(t *testing.T) {
 
 // TestIntegrationStartupBrokenRingAtStartDev fails a ready queue just
 // before START_DEV and makes its EIO loop fail on entry, so the queue
-// takes the broken-ring path: it cannot answer I/O and must hold its
-// ring until startup resolves or GET_DEV_INFO and sysfs show the disk
-// published. The device has a single queue, so no healthy queue can
-// serve the partition scan instead. On Linux 6.8 the scan runs inside
-// START_DEV and can only finish once that probe lets the queue close
-// its ring, so Start returning at all proves the probe works there.
-// Linux 7.0 scans asynchronously, so either reason is acceptable.
+// cannot answer I/O on its own ring. The device has a single queue, so
+// no healthy queue can serve the partition scan instead. The queue must
+// answer the scan through a rescue ring: Linux 6.8 scans inside
+// START_DEV, and Linux 7.0 scans from a work item whose read, once
+// handed to the queue, STOP_DEV would otherwise wait for forever. The
+// rescue keeps the original ring open until teardown stops the queue,
+// so no ring is closed before the disk is published. The broken-ring
+// fallback behind a failed rescue, and its publication probe, are
+// covered by TestHoldUntilSafeBrokenWaitsForPublication,
+// TestRescueFailureFallsBackToBrokenPath and
+// TestIntegrationPublishedProbe.
 func TestIntegrationStartupBrokenRingAtStartDev(t *testing.T) {
 	requireFaultVM(t)
 
@@ -387,7 +395,58 @@ func TestIntegrationStartupBrokenRingAtStartDev(t *testing.T) {
 	}
 
 	got := closes()
-	checkClosedSafely(t, got, holdPublished, holdResolved)
+	checkClosedSafely(t, got, holdRescued)
 	t.Logf("failed queue released its ring because: %v", got)
+	checkNoLeak(t, before)
+}
+
+// TestIntegrationPublishedProbe checks the publication probe that a
+// queue whose rescue failed relies on before it closes its ring: it
+// must not report a disk before START_DEV and must report it once Start
+// has returned.
+func TestIntegrationPublishedProbe(t *testing.T) {
+	requireFaultVM(t)
+
+	before := ublkNodes(t)
+
+	setHooks(t, nil, nil)
+
+	var early []bool
+
+	testHooks.beforeStartCmd = func(d *Device) {
+		probe, closeProbe := d.publishedProbe()
+		defer closeProbe()
+
+		ok, err := probe()
+		if err != nil {
+			t.Errorf("probe before START_DEV: %v", err)
+		}
+
+		early = append(early, ok)
+	}
+
+	d, err := startBounded(t, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	probe, closeProbe := d.publishedProbe()
+
+	ok, err := probe()
+
+	closeProbe()
+
+	if cerr := d.Close(); cerr != nil {
+		t.Error(cerr)
+	}
+
+	if err != nil || !ok {
+		t.Fatalf("probe after Start = %v, %v; want true", ok, err)
+	}
+
+	if len(early) != 1 || early[0] {
+		t.Fatalf("probe before START_DEV = %v, want one false", early)
+	}
+
 	checkNoLeak(t, before)
 }
