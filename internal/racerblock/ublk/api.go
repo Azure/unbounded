@@ -70,6 +70,15 @@ func validateDeviceID(id int) error {
 	return nil
 }
 
+// Validate reports whether Start would accept cfg, without touching the
+// kernel. Callers use it to reject a bad config before destructive steps
+// such as deleting an existing device.
+func (cfg Config) Validate() error {
+	_, err := cfg.withDefaults()
+
+	return err
+}
+
 // withDefaults validates cfg and returns a copy with defaults applied.
 func (cfg Config) withDefaults() (Config, error) {
 	if cfg.ID != -1 {
