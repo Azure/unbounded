@@ -8,12 +8,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -323,7 +320,8 @@ func TestRenderMPIJobsPerParticipant(t *testing.T) {
 		}
 
 		if !strings.Contains(string(launcherJSON), "/etc/mpi/hostfile") ||
-			!strings.Contains(string(launcherJSON), `/dev/tcp/${host}/${port}`) ||
+			!strings.Contains(string(launcherJSON), "BatchMode=yes") ||
+			!strings.Contains(string(launcherJSON), "/bin/true") ||
 			!strings.Contains(string(launcherJSON), "Project Signal MPI readiness timed out") {
 			t.Fatalf("resource %d launcher readiness fence missing: %s", index, launcherJSON)
 		}
@@ -344,14 +342,16 @@ func TestMPIWorkerReadinessTimeoutIsBoundedByBackendDeadline(t *testing.T) {
 func TestMPIWorkerReadinessFenceWaitsForWorkers(t *testing.T) {
 	t.Parallel()
 
-	hostfile := filepath.Join(t.TempDir(), "hostfile")
-	port := unusedTCPPort(t)
+	directory := t.TempDir()
+	hostfile := filepath.Join(directory, "hostfile")
+	readyFile := filepath.Join(directory, "ready")
+	binDirectory := fakeSSH(t, directory)
 	ready := make(chan error, 1)
 
 	go func() {
 		time.Sleep(100 * time.Millisecond)
 
-		if err := os.WriteFile(hostfile, []byte("127.0.0.1 slots=1\n"), 0o600); err != nil {
+		if err := os.WriteFile(hostfile, []byte("worker-0 slots=1\nworker-1 slots=1\n"), 0o600); err != nil {
 			ready <- err
 
 			return
@@ -359,26 +359,19 @@ func TestMPIWorkerReadinessFenceWaitsForWorkers(t *testing.T) {
 
 		time.Sleep(1100 * time.Millisecond)
 
-		listener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
-		if err != nil {
-			ready <- err
-
-			return
-		}
-		defer listener.Close()
-
-		connection, err := listener.Accept()
-		if err == nil {
-			err = connection.Close()
-		}
-
-		ready <- err
+		ready <- os.WriteFile(readyFile, nil, 0o600)
 	}()
 
 	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
 	defer cancel()
 
-	command := exec.CommandContext(ctx, "/bin/bash", "-c", mpiWorkerReadinessScript(hostfile, port, 5))
+	command := exec.CommandContext(ctx, "/bin/bash", "-c", mpiWorkerReadinessScript(hostfile, 5))
+
+	command.Env = append(
+		os.Environ(),
+		"PATH="+binDirectory+":"+os.Getenv("PATH"),
+		"PROJECT_SIGNAL_TEST_SSH_READY="+readyFile,
+	)
 
 	var stderr bytes.Buffer
 
@@ -396,13 +389,16 @@ func TestMPIWorkerReadinessFenceWaitsForWorkers(t *testing.T) {
 func TestMPIWorkerReadinessFenceTimesOut(t *testing.T) {
 	t.Parallel()
 
-	hostfile := filepath.Join(t.TempDir(), "hostfile")
-	if err := os.WriteFile(hostfile, []byte("127.0.0.1 slots=1\n"), 0o600); err != nil {
+	directory := t.TempDir()
+
+	hostfile := filepath.Join(directory, "hostfile")
+	if err := os.WriteFile(hostfile, []byte("worker-0 slots=1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	port := unusedTCPPort(t)
-	command := exec.Command("/bin/bash", "-c", mpiWorkerReadinessScript(hostfile, port, 2))
+	command := exec.Command("/bin/bash", "-c", mpiWorkerReadinessScript(hostfile, 2))
+
+	command.Env = append(os.Environ(), "PATH="+fakeSSH(t, directory)+":"+os.Getenv("PATH"))
 
 	var stderr bytes.Buffer
 
@@ -415,21 +411,30 @@ func TestMPIWorkerReadinessFenceTimesOut(t *testing.T) {
 
 	if !strings.Contains(stderr.String(), "timed out after 2s") ||
 		!strings.Contains(stderr.String(), hostfile) ||
-		!strings.Contains(stderr.String(), fmt.Sprintf("TCP/%d", port)) {
+		!strings.Contains(stderr.String(), "last unready host=worker-0") {
 		t.Fatalf("readiness timeout stderr = %q", stderr.String())
 	}
 }
 
-func unusedTCPPort(t *testing.T) int {
+func fakeSSH(t *testing.T, directory string) string {
 	t.Helper()
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
+	binDirectory := filepath.Join(directory, "bin")
+	if err := os.Mkdir(binDirectory, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
 
-	return listener.Addr().(*net.TCPAddr).Port
+	content := []byte(`#!/bin/bash
+if [[ -n "${PROJECT_SIGNAL_TEST_SSH_READY:-}" && -f "${PROJECT_SIGNAL_TEST_SSH_READY}" ]]; then
+  exit 0
+fi
+exit 255
+`)
+	if err := os.WriteFile(filepath.Join(binDirectory, "ssh"), content, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	return binDirectory
 }
 
 func TestRenderMPIJobUsesExplicitLifecycleOverrides(t *testing.T) {
