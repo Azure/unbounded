@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"path/filepath"
 	"strings"
 	"time"
@@ -367,7 +368,11 @@ func registerMachineWithRetry(
 			return nil
 		}
 
-		if !ociutil.RetryableNetworkError(err) || attempt == daemonRegistrationMaxAttempts {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		if !retryableMachineRegistrationError(err) || attempt == daemonRegistrationMaxAttempts {
 			return err
 		}
 
@@ -386,6 +391,16 @@ func registerMachineWithRetry(
 	}
 
 	return nil
+}
+
+func retryableMachineRegistrationError(err error) bool {
+	if ociutil.RetryableNetworkError(err) {
+		return true
+	}
+
+	var netErr net.Error
+
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func waitForRegistrationRetry(ctx context.Context, delay time.Duration) error {

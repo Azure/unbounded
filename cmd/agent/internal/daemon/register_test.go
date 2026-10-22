@@ -47,6 +47,13 @@ type flakyGetClient struct {
 	calls int
 }
 
+type deadlineNetworkError struct{}
+
+func (deadlineNetworkError) Error() string   { return "dial timeout" }
+func (deadlineNetworkError) Timeout() bool   { return true }
+func (deadlineNetworkError) Temporary() bool { return true }
+func (deadlineNetworkError) Unwrap() error   { return context.DeadlineExceeded }
+
 func (c *flakyGetClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 	c.calls++
 	if len(c.errs) > 0 {
@@ -212,7 +219,7 @@ func TestRegisterMachineWithRetryRetriesTransientNetworkFailure(t *testing.T) {
 	c := &flakyGetClient{
 		Client: fakeClient(&existing),
 		errs: []error{
-			&net.DNSError{Err: "timeout", IsTimeout: true},
+			deadlineNetworkError{},
 		},
 	}
 
