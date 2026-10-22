@@ -36,12 +36,26 @@ type Runner struct {
 	Kubernetes   kubernetes.Interface
 	PollInterval time.Duration
 	CleanupWait  time.Duration
+	ReadPodLog   func(context.Context, string, string, string, bool) (string, error)
 }
 
 type createdResource struct {
 	gvr              schema.GroupVersionResource
 	resource         *unstructured.Unstructured
 	participantIndex int32
+}
+
+const maxResultLogBytes = 64 * 1024
+
+type resultLogSource struct {
+	content  string
+	err      error
+	metadata ResultLogSourceMetadata
+}
+
+type resultLogSnapshot struct {
+	current  resultLogSource
+	previous resultLogSource
 }
 
 func (r *Runner) Execute(ctx context.Context, config Config) (output AggregateOutput, resultErr error) {
@@ -232,28 +246,39 @@ func (r *Runner) waitForResult(ctx context.Context, config Config, backend creat
 		}
 
 		if backend.resource.GetKind() == "MPIJob" && capturedResult == nil {
-			logContent, logErr := r.resultLog(ctx, config, backend)
-			if logErr == nil {
-				parsed, parseErr := ParseResultLog(logContent, int(backend.participantIndex))
+			current := r.resultLogs(ctx, config, backend, false).current
+			if current.err == nil {
+				parsed, parseErr := ParseResultLog(current.content, int(backend.participantIndex))
 				if parseErr == nil {
+					parsed.ResultLog = &ResultLogMetadata{
+						Current:        current.metadata,
+						Previous:       ResultLogSourceMetadata{Status: "not-read"},
+						SelectedSource: "current",
+					}
 					capturedResult = &parsed
 				}
 			}
 		}
 
 		if terminal {
-			if capturedResult != nil {
-				return completedResult(*capturedResult, succeeded)
-			}
+			logs := r.resultLogs(ctx, config, backend, backend.resource.GetKind() == "MPIJob")
 
-			logContent, logErr := r.resultLog(ctx, config, backend)
-
-			return backendCompletionResult(
-				logContent,
-				logErr,
+			completed, hardFailure := backendCompletionFromLogs(
+				logs,
 				int(backend.participantIndex),
 				succeeded,
 			)
+			if completed.ExecutionState == "Succeeded" || hardFailure || capturedResult == nil {
+				return completed
+			}
+
+			capturedResult.ResultLog = &ResultLogMetadata{
+				Current:        capturedResult.ResultLog.Current,
+				Previous:       logs.previous.metadata,
+				SelectedSource: "captured-current",
+			}
+
+			return completedResult(*capturedResult, succeeded)
 		}
 
 		select {
@@ -272,22 +297,46 @@ func backendCompletionResult(
 	participantIndex int,
 	backendSucceeded bool,
 ) Result {
+	return backendCompletionFromSource(
+		resultLogSource{
+			content: logContent,
+			err:     logErr,
+			metadata: resultLogSourceMetadata(
+				logContent,
+				logErr,
+			),
+		},
+		participantIndex,
+		backendSucceeded,
+	)
+}
+
+func backendCompletionFromSource(
+	source resultLogSource,
+	participantIndex int,
+	backendSucceeded bool,
+) Result {
 	result := Result{
 		ParticipantIndex: participantIndex,
 		ExecutionState:   "Error",
 		Verdict:          "Inconclusive",
 		Reason:           "BackendExecutionFailed",
+		ResultLog: &ResultLogMetadata{
+			Current:        source.metadata,
+			Previous:       ResultLogSourceMetadata{Status: "not-read"},
+			SelectedSource: "",
+		},
 	}
 
-	if logErr != nil {
+	if source.err != nil {
 		if backendSucceeded {
-			result.Reason = "BackendResultUnavailable: " + logErr.Error()
+			result.Reason = "BackendResultUnavailable: " + source.err.Error()
 		}
 
 		return result
 	}
 
-	parsed, err := ParseResultLog(logContent, participantIndex)
+	parsed, err := ParseResultLog(source.content, participantIndex)
 	if err != nil {
 		if backendSucceeded {
 			result.Reason = "BackendResultInvalid: " + err.Error()
@@ -296,7 +345,88 @@ func backendCompletionResult(
 		return result
 	}
 
+	parsed.ResultLog = result.ResultLog
+	parsed.ResultLog.SelectedSource = "current"
+
 	return completedResult(parsed, backendSucceeded)
+}
+
+func backendCompletionFromLogs(
+	logs resultLogSnapshot,
+	participantIndex int,
+	backendSucceeded bool,
+) (Result, bool) {
+	result := Result{
+		ParticipantIndex: participantIndex,
+		ExecutionState:   "Error",
+		Verdict:          "Inconclusive",
+		Reason:           "BackendExecutionFailed",
+		ResultLog: &ResultLogMetadata{
+			Current:  logs.current.metadata,
+			Previous: logs.previous.metadata,
+		},
+	}
+
+	current, currentErr := parseResultLogSource(logs.current, participantIndex)
+	previous, previousErr := parseResultLogSource(logs.previous, participantIndex)
+
+	if currentErr == nil {
+		if previousErr == nil && !sameResult(current, previous) {
+			result.Reason = "BackendResultInvalid: current and previous launcher logs contain conflicting results"
+
+			return result, true
+		}
+
+		current.ResultLog = result.ResultLog
+		current.ResultLog.SelectedSource = "current"
+
+		return completedResult(current, backendSucceeded), false
+	}
+
+	if logs.current.metadata.Status == "invalid" {
+		if backendSucceeded {
+			result.Reason = "BackendResultInvalid: " + currentErr.Error()
+		}
+
+		return result, true
+	}
+
+	if previousErr == nil {
+		previous.ResultLog = result.ResultLog
+		previous.ResultLog.SelectedSource = "previous"
+
+		return completedResult(previous, backendSucceeded), false
+	}
+
+	hardFailure := logs.previous.metadata.Status == "invalid"
+
+	if backendSucceeded {
+		switch {
+		case hardFailure:
+			result.Reason = "BackendResultInvalid: " + previousErr.Error()
+		case logs.current.err != nil:
+			result.Reason = "BackendResultUnavailable: " + logs.current.err.Error()
+		default:
+			result.Reason = "BackendResultInvalid: " + currentErr.Error()
+		}
+	}
+
+	return result, hardFailure
+}
+
+func parseResultLogSource(source resultLogSource, participantIndex int) (Result, error) {
+	if source.err != nil {
+		return Result{}, source.err
+	}
+
+	return ParseResultLog(source.content, participantIndex)
+}
+
+func sameResult(left, right Result) bool {
+	return left.Verdict == right.Verdict &&
+		left.Reason == right.Reason &&
+		left.Measurements == right.Measurements &&
+		left.ExitCode == right.ExitCode
 }
 
 func completedResult(result Result, backendSucceeded bool) Result {
@@ -306,6 +436,7 @@ func completedResult(result Result, backendSucceeded bool) Result {
 			ExecutionState:   "Error",
 			Verdict:          "Inconclusive",
 			Reason:           "BackendResultInvalid: result exit code contradicts backend terminal state",
+			ResultLog:        result.ResultLog,
 		}
 	}
 
@@ -369,11 +500,12 @@ func backendState(resource *unstructured.Unstructured) (bool, bool, error) {
 	}
 }
 
-func (r *Runner) resultLog(
+func (r *Runner) resultLogs(
 	ctx context.Context,
 	config Config,
 	backend createdResource,
-) (string, error) {
+	includePrevious bool,
+) resultLogSnapshot {
 	podName := backend.resource.GetName()
 	containerName := "main"
 
@@ -386,7 +518,12 @@ func (r *Runner) resultLog(
 			}, ","),
 		})
 		if err != nil {
-			return "", fmt.Errorf("list MPIJob Pods: %w", err)
+			source := resultLogSourceFromError(fmt.Errorf("list MPIJob Pods: %w", err))
+
+			return resultLogSnapshot{
+				current:  source,
+				previous: resultLogSourceMetadataOnly("not-read"),
+			}
 		}
 
 		podName = ""
@@ -408,18 +545,46 @@ func (r *Runner) resultLog(
 		}
 
 		if podName == "" {
-			return "", errors.New("MPIJob launcher Pod was not found")
+			source := resultLogSourceFromError(errors.New("MPIJob launcher Pod was not found"))
+
+			return resultLogSnapshot{
+				current:  source,
+				previous: resultLogSourceMetadataOnly("not-read"),
+			}
 		}
 	}
 
-	stream, err := r.Kubernetes.CoreV1().Pods(config.Namespace).
-		GetLogs(podName, &corev1.PodLogOptions{Container: containerName}).
+	currentContent, currentErr := r.readPodLog(ctx, config.Namespace, podName, containerName, false)
+	snapshot := resultLogSnapshot{
+		current:  resultLogSourceWithContent(currentContent, currentErr),
+		previous: resultLogSourceMetadataOnly("not-read"),
+	}
+
+	if includePrevious {
+		previousContent, previousErr := r.readPodLog(ctx, config.Namespace, podName, containerName, true)
+		snapshot.previous = resultLogSourceWithContent(previousContent, previousErr)
+	}
+
+	return snapshot
+}
+
+func (r *Runner) readPodLog(
+	ctx context.Context,
+	namespace, podName, containerName string,
+	previous bool,
+) (string, error) {
+	if r.ReadPodLog != nil {
+		return r.ReadPodLog(ctx, namespace, podName, containerName, previous)
+	}
+
+	stream, err := r.Kubernetes.CoreV1().Pods(namespace).
+		GetLogs(podName, &corev1.PodLogOptions{Container: containerName, Previous: previous}).
 		Stream(ctx)
 	if err != nil {
 		return "", fmt.Errorf("open result log: %w", err)
 	}
 
-	content, err := io.ReadAll(io.LimitReader(stream, 64*1024))
+	content, err := io.ReadAll(io.LimitReader(stream, maxResultLogBytes+1))
 	if err != nil {
 		closeErr := stream.Close()
 		if closeErr != nil {
@@ -436,7 +601,48 @@ func (r *Runner) resultLog(
 		return "", fmt.Errorf("close result log: %w", err)
 	}
 
+	if len(content) > maxResultLogBytes {
+		return "", fmt.Errorf("result log exceeds %d bytes", maxResultLogBytes)
+	}
+
 	return string(content), nil
+}
+
+func resultLogSourceWithContent(content string, err error) resultLogSource {
+	return resultLogSource{
+		content:  content,
+		err:      err,
+		metadata: resultLogSourceMetadata(content, err),
+	}
+}
+
+func resultLogSourceFromError(err error) resultLogSource {
+	return resultLogSourceWithContent("", err)
+}
+
+func resultLogSourceMetadataOnly(status string) resultLogSource {
+	return resultLogSource{metadata: ResultLogSourceMetadata{Status: status}}
+}
+
+func resultLogSourceMetadata(content string, err error) ResultLogSourceMetadata {
+	if err != nil {
+		return ResultLogSourceMetadata{Status: "unavailable"}
+	}
+
+	status := "missing"
+
+	if strings.Contains(content, resultPrefix) {
+		if _, parseErr := ParseResultLog(content, 0); parseErr != nil {
+			status = "invalid"
+		} else {
+			status = "valid"
+		}
+	}
+
+	return ResultLogSourceMetadata{
+		Status: status,
+		Bytes:  len(content),
+	}
 }
 
 func (r *Runner) cleanup(

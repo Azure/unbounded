@@ -8,6 +8,8 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -257,6 +259,21 @@ func TestRenderMPIJobsPerParticipant(t *testing.T) {
 		}
 
 		for _, replica := range []string{"Launcher", "Worker"} {
+			replicaRestartPolicy, _, err := unstructured.NestedString(
+				resource.Object,
+				"spec",
+				"mpiReplicaSpecs",
+				replica,
+				"restartPolicy",
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if replicaRestartPolicy != string(corev1.RestartPolicyNever) {
+				t.Fatalf("resource %d %s replica restart policy = %q", index, replica, replicaRestartPolicy)
+			}
+
 			restartPolicy, _, err := unstructured.NestedString(
 				resource.Object,
 				"spec",
@@ -319,11 +336,29 @@ func TestRenderMPIJobsPerParticipant(t *testing.T) {
 			t.Fatalf("resource %d launcher requests GPUs: %s", index, launcherJSON)
 		}
 
-		if !strings.Contains(string(launcherJSON), "/etc/mpi/hostfile") ||
+		if strings.Contains(string(launcherJSON), "/etc/mpi/hostfile") ||
+			!strings.Contains(string(launcherJSON), mpiHostfilePath) ||
+			!strings.Contains(string(launcherJSON), "OMPI_MCA_orte_default_hostfile") ||
 			!strings.Contains(string(launcherJSON), "BatchMode=yes") ||
+			!strings.Contains(string(launcherJSON), "ConnectionAttempts=1") ||
+			!strings.Contains(string(launcherJSON), "StrictHostKeyChecking=accept-new") ||
+			!strings.Contains(string(launcherJSON), "UserKnownHostsFile=") ||
+			!strings.Contains(string(launcherJSON), mpiKnownHostsPath) ||
 			!strings.Contains(string(launcherJSON), "/bin/true") ||
 			!strings.Contains(string(launcherJSON), "Project Signal MPI readiness timed out") {
 			t.Fatalf("resource %d launcher readiness fence missing: %s", index, launcherJSON)
+		}
+
+		jobName := resource.GetName()
+
+		expectedHost := fmt.Sprintf(
+			"%s-worker-0.%s.%s.svc",
+			jobName,
+			jobName,
+			config.Namespace,
+		)
+		if !strings.Contains(string(launcherJSON), expectedHost+" slots="+config.GPUResourceCount) {
+			t.Fatalf("resource %d launcher hostfile entry missing: %s", index, launcherJSON)
 		}
 	}
 }
@@ -345,19 +380,16 @@ func TestMPIWorkerReadinessFenceWaitsForWorkers(t *testing.T) {
 	directory := t.TempDir()
 	hostfile := filepath.Join(directory, "hostfile")
 	readyFile := filepath.Join(directory, "ready")
+	argumentsFile := filepath.Join(directory, "ssh-arguments")
 	binDirectory := fakeSSH(t, directory)
 	ready := make(chan error, 1)
+	hosts := []mpiWorkerHost{
+		{Name: "worker-0.job.namespace.svc", Slots: 2},
+		{Name: "worker-1.job.namespace.svc", Slots: 2},
+	}
 
 	go func() {
 		time.Sleep(100 * time.Millisecond)
-
-		if err := os.WriteFile(hostfile, []byte("worker-0 slots=1\nworker-1 slots=1\n"), 0o600); err != nil {
-			ready <- err
-
-			return
-		}
-
-		time.Sleep(1100 * time.Millisecond)
 
 		ready <- os.WriteFile(readyFile, nil, 0o600)
 	}()
@@ -365,12 +397,13 @@ func TestMPIWorkerReadinessFenceWaitsForWorkers(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
 	defer cancel()
 
-	command := exec.CommandContext(ctx, "/bin/bash", "-c", mpiWorkerReadinessScript(hostfile, 5))
+	command := exec.CommandContext(ctx, "/bin/bash", "-c", mpiLauncherPrelude(hostfile, hosts, 5))
 
 	command.Env = append(
 		os.Environ(),
 		"PATH="+binDirectory+":"+os.Getenv("PATH"),
 		"PROJECT_SIGNAL_TEST_SSH_READY="+readyFile,
+		"PROJECT_SIGNAL_TEST_SSH_ARGUMENTS="+argumentsFile,
 	)
 
 	var stderr bytes.Buffer
@@ -384,6 +417,33 @@ func TestMPIWorkerReadinessFenceWaitsForWorkers(t *testing.T) {
 	if err := <-ready; err != nil {
 		t.Fatal(err)
 	}
+
+	hostfileContent, err := os.ReadFile(hostfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(hostfileContent) != "worker-0.job.namespace.svc slots=2\nworker-1.job.namespace.svc slots=2\n" {
+		t.Fatalf("generated hostfile = %q", hostfileContent)
+	}
+
+	arguments, err := os.ReadFile(argumentsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, expected := range []string{
+		"-o BatchMode=yes",
+		"-o ConnectTimeout=2",
+		"-o ConnectionAttempts=1",
+		"-o StrictHostKeyChecking=accept-new",
+		"-o UserKnownHostsFile=" + mpiKnownHostsPath,
+		"worker-1.job.namespace.svc /bin/true",
+	} {
+		if !strings.Contains(string(arguments), expected) {
+			t.Fatalf("SSH arguments %q do not contain %q", arguments, expected)
+		}
+	}
 }
 
 func TestMPIWorkerReadinessFenceTimesOut(t *testing.T) {
@@ -392,11 +452,15 @@ func TestMPIWorkerReadinessFenceTimesOut(t *testing.T) {
 	directory := t.TempDir()
 
 	hostfile := filepath.Join(directory, "hostfile")
-	if err := os.WriteFile(hostfile, []byte("worker-0 slots=1\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	command := exec.Command("/bin/bash", "-c", mpiWorkerReadinessScript(hostfile, 2))
+	command := exec.Command(
+		"/bin/bash",
+		"-c",
+		mpiLauncherPrelude(
+			hostfile,
+			[]mpiWorkerHost{{Name: "worker-0.job.namespace.svc", Slots: 1}},
+			2,
+		),
+	)
 
 	command.Env = append(os.Environ(), "PATH="+fakeSSH(t, directory)+":"+os.Getenv("PATH"))
 
@@ -409,10 +473,106 @@ func TestMPIWorkerReadinessFenceTimesOut(t *testing.T) {
 		t.Fatal("readiness fence succeeded without a listening worker")
 	}
 
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) || exitError.ExitCode() != 124 {
+		t.Fatalf("readiness fence error = %v, want exit 124", err)
+	}
+
 	if !strings.Contains(stderr.String(), "timed out after 2s") ||
 		!strings.Contains(stderr.String(), hostfile) ||
-		!strings.Contains(stderr.String(), "last unready host=worker-0") {
+		!strings.Contains(stderr.String(), "last unready host=worker-0.job.namespace.svc") ||
+		!strings.Contains(stderr.String(), "simulated SSH connection failure") {
 		t.Fatalf("readiness timeout stderr = %q", stderr.String())
+	}
+}
+
+func TestMPILauncherPreludeIgnoresOperatorHostfile(t *testing.T) {
+	t.Parallel()
+
+	directory := t.TempDir()
+
+	operatorHostfile := filepath.Join(directory, "operator-hostfile")
+	if err := os.WriteFile(operatorHostfile, []byte("stale-worker slots=99\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	generatedHostfile := filepath.Join(directory, "generated-hostfile")
+	readyFile := filepath.Join(directory, "ready")
+	observedOpenMPIHostfile := filepath.Join(directory, "observed-openmpi-hostfile")
+
+	if err := os.WriteFile(readyFile, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	command := exec.Command(
+		"/bin/bash",
+		"-c",
+		mpiLauncherPrelude(
+			generatedHostfile,
+			[]mpiWorkerHost{{Name: "worker-0.job.namespace.svc", Slots: 4}},
+			2,
+		),
+	)
+
+	command.Env = append(
+		os.Environ(),
+		"PATH="+fakeSSH(t, directory)+":"+os.Getenv("PATH"),
+		"PROJECT_SIGNAL_TEST_SSH_READY="+readyFile,
+		"PROJECT_SIGNAL_TEST_OMPI_HOSTFILE_OUTPUT="+observedOpenMPIHostfile,
+		"OMPI_MCA_orte_default_hostfile="+operatorHostfile,
+	)
+
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("launcher prelude failed: %v output=%q", err, output)
+	}
+
+	content, err := os.ReadFile(generatedHostfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if strings.Contains(string(content), "stale-worker") ||
+		string(content) != "worker-0.job.namespace.svc slots=4\n" {
+		t.Fatalf("generated hostfile = %q", content)
+	}
+
+	observed, err := os.ReadFile(observedOpenMPIHostfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(observed) != generatedHostfile {
+		t.Fatalf("OpenMPI hostfile = %q, want %q", observed, generatedHostfile)
+	}
+}
+
+func TestMPIWorkerHostsRejectsInvalidInputs(t *testing.T) {
+	t.Parallel()
+
+	for name, test := range map[string]struct {
+		namespace   string
+		jobName     string
+		workerCount int64
+		slots       int64
+	}{
+		"zero workers":   {namespace: "namespace", jobName: "job", slots: 1},
+		"zero slots":     {namespace: "namespace", jobName: "job", workerCount: 1},
+		"invalid host":   {namespace: "namespace", jobName: "INVALID", workerCount: 1, slots: 1},
+		"too many hosts": {namespace: "namespace", jobName: "job", workerCount: MaxParticipants + 1, slots: 1},
+		"too many slots": {namespace: "namespace", jobName: "job", workerCount: 1, slots: maxMPIWorkerSlots + 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if _, err := mpiWorkerHosts(
+				test.namespace,
+				test.jobName,
+				test.workerCount,
+				test.slots,
+			); err == nil {
+				t.Fatal("mpiWorkerHosts accepted invalid input")
+			}
+		})
 	}
 }
 
@@ -425,11 +585,32 @@ func fakeSSH(t *testing.T, directory string) string {
 	}
 
 	content := []byte(`#!/bin/bash
-if [[ -n "${PROJECT_SIGNAL_TEST_SSH_READY:-}" && -f "${PROJECT_SIGNAL_TEST_SSH_READY}" ]]; then
-  exit 0
+	if [[ -n "${PROJECT_SIGNAL_TEST_SSH_ARGUMENTS:-}" ]]; then
+	  printf '%s\n' "$*" >> "${PROJECT_SIGNAL_TEST_SSH_ARGUMENTS}"
 fi
-exit 255
-`)
+	if [[ -n "${PROJECT_SIGNAL_TEST_OMPI_HOSTFILE_OUTPUT:-}" ]]; then
+	  printf '%s' "${OMPI_MCA_orte_default_hostfile:-}" > "${PROJECT_SIGNAL_TEST_OMPI_HOSTFILE_OUTPUT}"
+	fi
+	required=(
+	  "-o BatchMode=yes"
+	  "-o ConnectTimeout=2"
+	  "-o ConnectionAttempts=1"
+	  "-o StrictHostKeyChecking=accept-new"
+	  "-o UserKnownHostsFile=/tmp/project-signal-known-hosts"
+	)
+	arguments=" $* "
+	for option in "${required[@]}"; do
+	  if [[ "${arguments}" != *" ${option} "* ]]; then
+	    printf 'missing SSH option: %s\n' "${option}" >&2
+	    exit 255
+	  fi
+	done
+	if [[ -n "${PROJECT_SIGNAL_TEST_SSH_READY:-}" && -f "${PROJECT_SIGNAL_TEST_SSH_READY}" ]]; then
+	  exit 0
+	fi
+	printf 'simulated SSH connection failure for %s\n' "$*" >&2
+	exit 255
+	`)
 	if err := os.WriteFile(filepath.Join(binDirectory, "ssh"), content, 0o750); err != nil {
 		t.Fatal(err)
 	}
@@ -882,6 +1063,44 @@ func TestAggregateRetainsDiagnosticFailureWhenBackendsSucceed(t *testing.T) {
 
 	if output.Verdict != "Fail" || output.Reason != "ParticipantCertificationFailed" {
 		t.Fatalf("output = %#v", output)
+	}
+}
+
+func TestAggregateBoundsResultLogMetadataAtMaximumParticipants(t *testing.T) {
+	t.Parallel()
+
+	resources := make([]signalv1.BackendResourceReference, MaxParticipants)
+
+	results := make([]Result, MaxParticipants)
+	for index := range MaxParticipants {
+		resources[index] = signalv1.BackendResourceReference{
+			APIVersion:         "kubeflow.org/v2beta1",
+			Kind:               "MPIJob",
+			Namespace:          "project-signal",
+			Name:               fmt.Sprintf("run-p%d", index),
+			UID:                types.UID(fmt.Sprintf("uid-%d", index)),
+			ParticipantIndexes: []int32{int32(index)},
+		}
+		results[index] = Result{
+			ParticipantIndex: index,
+			ExecutionState:   "Succeeded",
+			Verdict:          "Pass",
+			Reason:           "Healthy",
+			ResultLog: &ResultLogMetadata{
+				Current:        ResultLogSourceMetadata{Status: "valid", Bytes: 128},
+				Previous:       ResultLogSourceMetadata{Status: "unavailable"},
+				SelectedSource: "current",
+			},
+		}
+	}
+
+	output, err := Aggregate(MaxParticipants, resources, results)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(output.Measurements) > MaxMeasurementsBytes {
+		t.Fatalf("measurements size = %d", len(output.Measurements))
 	}
 }
 
