@@ -57,7 +57,7 @@ func (b *Backend) noteAccess(off, end int64) {
 
 	for i := range ra.streams {
 		c := &ra.streams[i]
-		if c.used != 0 && off >= c.next-streamSlack && off <= c.next+streamSlack {
+		if c.used != 0 && off >= c.next-streamSlack && off-c.next <= streamSlack {
 			s = c
 			break
 		}

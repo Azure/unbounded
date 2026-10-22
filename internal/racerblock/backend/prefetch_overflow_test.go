@@ -101,3 +101,24 @@ func TestPrefetchBounds(t *testing.T) {
 		})
 	}
 }
+
+func TestStreamMatchNearMaxInt64(t *testing.T) {
+	const cs = MinChunkSize
+
+	f := newFake(math.MaxInt64 - 511)
+	cfg := testConfig()
+	cfg.ReadaheadMax = 4 * cs
+	b := mustOpen(t, f, cfg)
+
+	size := b.Size()
+
+	// Sequential reads within streamSlack of MaxInt64 must still be
+	// recognized as one stream and trigger read-ahead.
+	for off := size - streamSlack; off < size-cs; off += cs / 4 {
+		checkRead(t, b, off, cs/4)
+	}
+
+	if s := b.Stats(); s.ReadaheadFetches == 0 {
+		t.Fatalf("no read-ahead near MaxInt64: %+v", s)
+	}
+}
