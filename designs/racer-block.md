@@ -145,6 +145,10 @@ racer-block device as slab storage, it would read its own cache through itself.
 - End to end: a privileged test runs `racersdktest` as a fake Racer, starts
   racer-block on it, and compares device reads with the object bytes.
 
+The `Racer Block Device` CI job runs both device suites as root with the race
+detector. It requires the ublk kernel module, so missing support fails the job
+instead of skipping the tests.
+
 Run the privileged tests as root:
 
 ```
