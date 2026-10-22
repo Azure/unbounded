@@ -203,10 +203,6 @@ per-I/O budgets. They do not guarantee higher throughput; compare matched worklo
 before drawing a performance conclusion.
 
 Automatic sizing considers CPU affinity, quota, NUMA locality, and progress reserves.
-Node-wide budgets divide by final I/O worker count, not crypto thread count; tight budgets
-can reduce workers. File-backed storage grows with I/O workers; raw-device capacity is
-divided among them. Admission budgets are not RSS limits:
-allocator, TLS, and filesystem cache are additional. Invalid combinations fail validation.
 
 ### Raw-device storage
 
@@ -854,7 +850,6 @@ The Node annotation `racer.unbounded-cloud.io/rdma-nics` accepts at most 64 entr
 
 `port` is 1..255; `rail` is 0..65535. Optional `gid` is 32 lowercase hex digits;
 optional `numa_node` is `uint32`. Device/port pairs must be unique; NICs may share a rail.
-Workers prefer same-rail local, then unknown, then remote NUMA, spreading within the best tier.
 
 Absent administrator policy uses active MW2B-capable ports in PCI BDF/port order, reported
 during authenticated enrollment/renewal and published from `enrolled-rdma-nics`. Explicit
