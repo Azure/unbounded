@@ -122,6 +122,14 @@ previous log is unavailable, or the projection must omit content to fit the
 cleanup failures remain explicit, while an earlier backend execution failure
 continues to be the causal result reason.
 
+The adapter cannot observe or serialize its own state if the adapter container
+or Node terminates before this pre-cleanup write. In that boundary the
+`backend-evidence` output is missing and the controller rejects the Workflow
+outputs as Inconclusive; the backend cause remains unknown rather than being
+inferred. A termination after the write may leave the evidence file available
+to Argo, but collection still depends on the Workflow executor surviving long
+enough to publish output parameters.
+
 ## Multi-Node execution
 
 Participant admission is deterministic and atomic. The requesting Node is
