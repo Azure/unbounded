@@ -58,7 +58,7 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           MERGE_GROUP_BASE: ${{ github.event.merge_group.base_sha }}
-          TEMP_FILES: 'cmd/racer-dataplane/src/main.rs\nNOTICE\ndocs/content/x.md'
+          TEMP_FILES: 'internal/racer/server/handlers.go\ncmd/racer-dataplane/src/main.rs\nNOTICE'
         run: |
           set -euo pipefail
 
