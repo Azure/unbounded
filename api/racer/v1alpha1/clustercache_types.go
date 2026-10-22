@@ -36,6 +36,36 @@ type ClusterCacheSpec struct {
 	// cannot be removed later; leave it unset to deploy your own origin.
 	// +optional
 	Origin *ObjectOrigin `json:"origin,omitempty"`
+
+	// Priority is the relative weight used to share node cache capacity, both
+	// disk and memory, among ClusterCaches. Each cache's fair share is
+	// proportional to its priority divided by the sum of the priorities of all
+	// published caches. Caches that use more than their share are evicted
+	// first. A priority of 0 grants no guaranteed share, but the cache is
+	// still served best-effort while capacity is idle. When unset, the
+	// priority is 500. Priority may be changed at any time.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1000
+	// +optional
+	Priority *int32 `json:"priority,omitempty"`
+}
+
+const (
+	// MinPriority is the lowest allowed ClusterCache priority.
+	MinPriority int32 = 0
+	// MaxPriority is the highest allowed ClusterCache priority.
+	MaxPriority int32 = 1000
+	// DefaultPriority applies when spec.priority is unset.
+	DefaultPriority int32 = 500
+)
+
+// EffectivePriority returns spec.priority, or DefaultPriority when unset.
+func (s ClusterCacheSpec) EffectivePriority() int32 {
+	if s.Priority == nil {
+		return DefaultPriority
+	}
+
+	return *s.Priority
 }
 
 // ObjectOrigin configures a managed object storage origin.

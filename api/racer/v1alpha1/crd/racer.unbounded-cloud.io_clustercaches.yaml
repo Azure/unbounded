@@ -179,6 +179,19 @@ spec:
                 x-kubernetes-validations:
                 - message: azure is required
                   rule: has(self.azure)
+              priority:
+                description: |-
+                  Priority is the relative weight used to share node cache capacity, both
+                  disk and memory, among ClusterCaches. Each cache's fair share is
+                  proportional to its priority divided by the sum of the priorities of all
+                  published caches. Caches that use more than their share are evicted
+                  first. A priority of 0 grants no guaranteed share, but the cache is
+                  still served best-effort while capacity is idle. When unset, the
+                  priority is 500. Priority may be changed at any time.
+                format: int32
+                maximum: 1000
+                minimum: 0
+                type: integer
             type: object
         type: object
         x-kubernetes-validations:

@@ -317,3 +317,90 @@ func TestEnvtestClusterCacheOriginValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestEnvtestClusterCachePriorityValidation(t *testing.T) {
+	assets := os.Getenv("KUBEBUILDER_ASSETS")
+	if assets == "" {
+		t.Skip("set KUBEBUILDER_ASSETS for real API validation tests")
+	}
+
+	environment := &envtest.Environment{BinaryAssetsDirectory: assets, CRDDirectoryPaths: []string{"crd"}, ErrorIfCRDPathMissing: true}
+	rc, err := environment.Start()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, environment.Stop()) })
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, AddToScheme(scheme))
+	c, err := client.New(rc, client.Options{Scheme: scheme})
+	require.NoError(t, err)
+
+	n := 0
+	create := func(spec map[string]any) (string, error) {
+		n++
+		name := fmt.Sprintf("priority-%d", n)
+		obj := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": GroupVersion.String(),
+			"kind":       "ClusterCache",
+			"metadata":   map[string]any{"name": name},
+			"spec":       spec,
+		}}
+
+		return name, c.Create(t.Context(), obj)
+	}
+
+	for name, spec := range map[string]map[string]any{
+		"unset":   {},
+		"minimum": {"priority": int64(0)},
+		"default": {"priority": int64(500)},
+		"maximum": {"priority": int64(1000)},
+	} {
+		t.Run("accepts "+name, func(t *testing.T) {
+			_, err := create(spec)
+			require.NoError(t, err)
+		})
+	}
+
+	for name, priority := range map[string]int64{"negative": -1, "above maximum": 1001} {
+		t.Run("rejects "+name, func(t *testing.T) {
+			_, err := create(map[string]any{"priority": priority})
+			require.True(t, apierrors.IsInvalid(err), "%v", err)
+			require.ErrorContains(t, err, "spec.priority")
+		})
+	}
+
+	t.Run("unset stays unset", func(t *testing.T) {
+		name, err := create(map[string]any{})
+		require.NoError(t, err)
+
+		cache := &ClusterCache{}
+		require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: name}, cache))
+		require.Nil(t, cache.Spec.Priority)
+		require.Equal(t, DefaultPriority, cache.Spec.EffectivePriority())
+	})
+
+	t.Run("allows priority updates", func(t *testing.T) {
+		name, err := create(map[string]any{"priority": int64(100)})
+		require.NoError(t, err)
+
+		for _, priority := range []any{int64(900), int64(0), nil} {
+			obj := &unstructured.Unstructured{}
+			obj.SetGroupVersionKind(GroupVersion.WithKind("ClusterCache"))
+			require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: name}, obj))
+
+			if priority == nil {
+				unstructured.RemoveNestedField(obj.Object, "spec", "priority")
+			} else {
+				require.NoError(t, unstructured.SetNestedField(obj.Object, priority, "spec", "priority"))
+			}
+
+			require.NoError(t, c.Update(t.Context(), obj))
+		}
+
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(GroupVersion.WithKind("ClusterCache"))
+		require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: name}, obj))
+		require.NoError(t, unstructured.SetNestedField(obj.Object, int64(1001), "spec", "priority"))
+		err = c.Update(t.Context(), obj)
+		require.True(t, apierrors.IsInvalid(err), "%v", err)
+	})
+}
