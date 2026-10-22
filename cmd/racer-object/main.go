@@ -123,7 +123,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 
 		helpErr = writeHelp(output, "Usage: racer-object "+o.mode+" [flags]\n"+defaults.String())
 	}
-	cache := fs.String("cache", "racer-object", "Racer cache name (ClusterCache)")
+	cache := fs.String("cache", "", "Racer cache name (ClusterCache); required")
 	fs.StringVar(&o.debugListen, "debug-listen", "", "Optional pprof address (e.g. 127.0.0.1:6060); disabled when empty. Trusted diagnostic access only: nonloopback addresses such as :6060 expose unauthenticated profiles")
 
 	showVersion := fs.Bool("version", false, "Print version")
@@ -163,6 +163,9 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	}
 
 	o.cache = *cache
+	if o.cache == "" {
+		return o, errors.New("--cache is required")
+	}
 
 	validationClient, err := racersdk.NewClient(racersdk.ClientConfig{Cache: o.cache})
 	if err != nil {

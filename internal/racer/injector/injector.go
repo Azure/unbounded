@@ -45,8 +45,7 @@ const (
 	MemoryLimitAnnotation   = "racer.unbounded-cloud.io/object-memory-limit"
 	InjectedAnnotation      = "racer.unbounded-cloud.io/object-sidecar-injected"
 
-	defaultCache = "racer-object"
-	osLabel      = "kubernetes.io/os"
+	osLabel = "kubernetes.io/os"
 )
 
 // removedAnnotations were used to scope the sidecar before each ClusterCache
@@ -73,7 +72,8 @@ func (c Config) Validate() error {
 
 // Mutate injects the racer-object sidecar into pod in place. Pods without the
 // opt-in label, or that already contain a container named ContainerName, are
-// left unchanged. Invalid annotations return an error naming the annotation.
+// left unchanged. Opted-in pods must set CacheAnnotation. Missing or invalid
+// annotations return an error naming the annotation.
 func Mutate(pod *corev1.Pod, cfg Config) error {
 	if err := cfg.Validate(); err != nil {
 		return err
@@ -201,15 +201,18 @@ func parseAnnotations(a map[string]string) (sidecarSpec, error) {
 		}
 	}
 
-	s.cache = defaultCache
-
-	if v, ok := a[CacheAnnotation]; ok {
-		if err := validateCache(v); err != nil {
-			return s, fmt.Errorf("annotation %s has invalid cache name %q", CacheAnnotation, v)
-		}
-
-		s.cache = v
+	// There is no default cache: each pod names the ClusterCache it binds to,
+	// so a missing annotation cannot silently attach it to an unrelated cache.
+	v, ok := a[CacheAnnotation]
+	if !ok {
+		return s, fmt.Errorf("annotation %s is required and must name the ClusterCache to bind to", CacheAnnotation)
 	}
+
+	if err := validateCache(v); err != nil {
+		return s, fmt.Errorf("annotation %s has invalid cache name %q", CacheAnnotation, v)
+	}
+
+	s.cache = v
 
 	if v, ok := a[APIAnnotation]; ok {
 		if v != "s3" && v != "azure" {
