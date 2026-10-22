@@ -744,9 +744,12 @@ the reconcile context itself is terminal for that operation.
 | `/debug/pprof/profile?seconds=30` | Opt-in native CPU profile |
 
 `/debug/hardware` reads sysfs on every request. It never opens block devices.
+The read runs on a helper thread, so a slow read does not delay health checks.
 Values it cannot read are `null`, and section failures are listed in `errors`.
 It returns 503 `response_too_large` if the JSON does not fit in one response
-(about 64 KiB). In managed workloads, read it through the API server pod proxy.
+(about 64 KiB). Only one report is built at a time: a request made while another
+is still running returns 409 `busy`. A report that takes longer than 5 seconds
+closes the connection without a response. In managed workloads, read it through the API server pod proxy.
 This needs RBAC `get` on `pods/proxy`:
 
 ```sh

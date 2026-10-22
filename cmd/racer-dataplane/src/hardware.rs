@@ -120,8 +120,24 @@ pub fn report(
     context: &Context,
     inventory: &crate::rdma::Inventory,
 ) -> Report {
+    report_with_snapshot(
+        sys_root,
+        dev_root,
+        context,
+        inventory.snapshot().map_err(|error| format!("{error:?}")),
+    )
+}
+
+/// Build the full report from an already captured rails snapshot. The inputs are
+/// owned and `Send`, so a helper thread can run the sysfs walk off the I/O worker.
+pub fn report_with_snapshot(
+    sys_root: &Path,
+    dev_root: &Path,
+    context: &Context,
+    snapshot: Result<crate::rdma::Snapshot, String>,
+) -> Report {
     let mut report = discover(sys_root, dev_root);
-    let rdma_rails = match inventory.snapshot() {
+    let rdma_rails = match snapshot {
         Ok(snapshot) => Some(Rails {
             generation: snapshot.generation,
             rails: snapshot
@@ -139,7 +155,7 @@ pub fn report(
         Err(error) => {
             report
                 .errors
-                .push(format!("racer.rdma_rails: inventory snapshot: {error:?}"));
+                .push(format!("racer.rdma_rails: inventory snapshot: {error}"));
             None
         }
     };

@@ -2349,13 +2349,22 @@ impl WorkerApplication {
         let device_directory = self.device_directory.clone();
         self.telemetry
             .hardware
-            .set(Rc::new(move || {
-                crate::hardware::report(
-                    std::path::Path::new("/sys"),
-                    &device_directory,
-                    &node.hardware,
-                    &node.inventory,
-                )
+            .set(Rc::new(move || -> crate::telemetry::HardwareJob {
+                // Capture the small Racer view here; the helper thread walks sysfs.
+                let context = node.hardware.clone();
+                let snapshot = node
+                    .inventory
+                    .snapshot()
+                    .map_err(|error| format!("{error:?}"));
+                let device_directory = device_directory.clone();
+                Box::new(move || {
+                    crate::hardware::report_with_snapshot(
+                        std::path::Path::new("/sys"),
+                        &device_directory,
+                        &context,
+                        snapshot,
+                    )
+                })
             }))
             .map_err(|_| Error::InvalidConfiguration)?;
         self.telemetry
