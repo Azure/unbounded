@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"runtime"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -26,11 +25,24 @@ const erestartsys = 512
 // ublkFCmdIoctlEncode is UBLK_F_CMD_IOCTL_ENCODE.
 const ublkFCmdIoctlEncode = 1 << 6
 
+// ctrlPayloadSize is the size of the control payload page. It must hold the
+// largest payload, which is ublkParams.
+const ctrlPayloadSize = 4096
+
 // ctrl sends control commands over /dev/ublk-control.
+//
+// Command payloads live in payload, an anonymous mmap that the Go runtime
+// never moves or frees. The kernel gets its address as a plain integer, so
+// Go heap or stack memory is not safe there: stacks can move, and the GC
+// does not see the integer as a reference.
 type ctrl struct {
-	mu   sync.Mutex
-	fd   int
-	ring *uring
+	mu      sync.Mutex
+	fd      int
+	ring    *uring
+	payload []byte
+	// poisoned is set when a command was sent but its completion was not
+	// seen. The kernel may still use payload, so it is never unmapped.
+	poisoned bool
 }
 
 func openCtrl() (*ctrl, error) {
@@ -39,12 +51,23 @@ func openCtrl() (*ctrl, error) {
 		return nil, fmt.Errorf("ublk: open %s: %w", controlPath, err)
 	}
 
-	ring, err := newURing(4)
+	return newCtrl(fd)
+}
+
+// newCtrl sets up the ring and payload for an open control fd. It takes
+// ownership of fd and closes it on error.
+func newCtrl(fd int) (*ctrl, error) {
+	payload, err := unix.Mmap(-1, 0, ctrlPayloadSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANONYMOUS)
 	if err != nil {
-		return nil, errors.Join(fmt.Errorf("ublk: control ring: %w", err), unix.Close(fd))
+		return nil, errors.Join(fmt.Errorf("ublk: control payload: %w", err), unix.Close(fd))
 	}
 
-	return &ctrl{fd: fd, ring: ring}, nil
+	ring, err := newURing(4)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("ublk: control ring: %w", err), unix.Munmap(payload), unix.Close(fd))
+	}
+
+	return &ctrl{fd: fd, ring: ring, payload: payload}, nil
 }
 
 func (c *ctrl) close() error {
@@ -63,17 +86,49 @@ func (c *ctrl) close() error {
 		c.fd = -1
 	}
 
+	// If a command may still be in flight, keep the page mapped. Closing
+	// the ring does not wait for in-flight requests, and the kernel would
+	// write through the old address into whatever is mapped there next.
+	// This leaks one page, and only after a failed io_uring_enter.
+	if c.payload != nil && !c.poisoned {
+		errs = append(errs, unix.Munmap(c.payload))
+	}
+
+	c.payload = nil
+
 	return errors.Join(errs...)
 }
 
-// do sends one control command and returns the kernel result. buf, if
-// non-nil, is passed as the command's addr/len payload.
+// do sends one control command with no payload and returns the kernel
+// result. buf must be nil and bufLen must be 0. Use doPayload for commands
+// with a payload. The signature is kept for existing callers.
 func (c *ctrl) do(op, devID uint32, data uint64, buf unsafe.Pointer, bufLen int) (int32, error) {
+	if buf != nil || bufLen != 0 {
+		return 0, fmt.Errorf("ublk: control payload must use doPayload")
+	}
+
+	return c.doPayload(op, devID, data, nil, nil)
+}
+
+// doPayload sends one control command and returns the kernel result. in, if
+// non-empty, is copied into the payload page, which is passed as the
+// command's addr/len. After completion, the first len(out) bytes of the page
+// are copied to out. The payload size is max(len(in), len(out)).
+func (c *ctrl) doPayload(op, devID uint32, data uint64, in, out []byte) (int32, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if c.ring == nil {
 		return 0, fmt.Errorf("ublk: control channel closed")
+	}
+
+	if c.poisoned {
+		return 0, fmt.Errorf("ublk: control channel unusable after a failed command")
+	}
+
+	n := max(len(in), len(out))
+	if n > len(c.payload) {
+		return 0, fmt.Errorf("ublk: control payload too large: %d", n)
 	}
 
 	s := c.ring.getSQE()
@@ -91,22 +146,31 @@ func (c *ctrl) do(op, devID uint32, data uint64, buf unsafe.Pointer, bufLen int)
 	cmd.QueueID = 0xffff
 	cmd.Data = data
 
-	if buf != nil {
-		cmd.Addr = uint64(uintptr(buf))
-		cmd.Len = uint16(bufLen)
+	if n > 0 {
+		clear(c.payload[:n])
+		copy(c.payload, in)
+		cmd.Addr = uint64(uintptr(unsafe.Pointer(&c.payload[0])))
+		cmd.Len = uint16(n)
 	}
 
 	c.ring.flushSQ()
 
 	cq, err := c.ring.waitCQE()
-
-	runtime.KeepAlive(buf)
-
 	if err != nil {
+		// The SQE is published and may have been taken by the kernel, so
+		// its completion is unknown. Stop using the ring and the payload.
+		c.poisoned = true
 		return 0, err
 	}
 
+	copy(out, c.payload[:n])
+
 	return cq.Res, nil
+}
+
+// structBytes returns the bytes of *v. v must not contain Go pointers.
+func structBytes[T any](v *T) []byte {
+	return unsafe.Slice((*byte)(unsafe.Pointer(v)), unsafe.Sizeof(*v))
 }
 
 func resErr(name string, res int32) error {
@@ -126,7 +190,9 @@ func (c *ctrl) addDev(id int, cfg Config) (int, error) {
 		Flags:         ublkFCmdIoctlEncode,
 	}
 
-	res, err := c.do(uCmdAddDev, info.DevID, 0, unsafe.Pointer(&info), int(unsafe.Sizeof(info)))
+	b := structBytes(&info)
+
+	res, err := c.doPayload(uCmdAddDev, info.DevID, 0, b, b)
 	if err != nil {
 		return 0, err
 	}
@@ -141,7 +207,7 @@ func (c *ctrl) addDev(id int, cfg Config) (int, error) {
 func (c *ctrl) setParams(id int, cfg Config) error {
 	p := buildParams(cfg)
 
-	res, err := c.do(uCmdSetParams, uint32(id), 0, unsafe.Pointer(&p), int(unsafe.Sizeof(p)))
+	res, err := c.doPayload(uCmdSetParams, uint32(id), 0, structBytes(&p), nil)
 	if err != nil {
 		return err
 	}
