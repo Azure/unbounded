@@ -57,9 +57,13 @@ pub const RESERVED_BYTES: usize = (MAX_CONNECTIONS + 1) * (MAX_RESPONSE_BYTES + 
 pub const CONTROL_SLOTS: usize = MAX_CONNECTIONS + 1;
 
 /// Extra prepaid waits for one binary producer and its socket disconnect watch.
-/// Each attached producer kind ([`Server::with_binary`], [`Server::with_json`])
-/// needs its own set of these slots.
 pub const BINARY_CONTROL_SLOTS: usize = 2;
+/// Extra prepaid waits for one JSON producer. Its exchange holds at most two
+/// submissions at once (completion wait plus disconnect watch, or the send plus
+/// the watch's pending cancel) and never more than one on its own socket, whose
+/// [`CONTROL_SLOTS`] entry is idle while it waits. One extra slot therefore
+/// covers it, even with every other connection and a profile in flight.
+pub const JSON_CONTROL_SLOTS: usize = 1;
 /// One binary result, allocated only by the admitted producer.
 pub const MAX_BINARY_BYTES: usize = 16 * 1024 * 1024;
 /// Longest deadline a JSON producer may request; JSON reports are short-lived.
@@ -244,7 +248,7 @@ impl Server {
     }
 
     /// Reserve a separate single-session slot for [`BinaryKind::Json`] producers.
-    /// The caller prepays [`BINARY_CONTROL_SLOTS`] more submissions for it.
+    /// The caller prepays [`JSON_CONTROL_SLOTS`] more submissions for it.
     pub fn with_json<C: 'static>(mut self, submissions: Rc<SubmissionCapacity>, memory: C) -> Self {
         self.json = Some(Rc::new(BinaryResources {
             submissions,
@@ -864,6 +868,7 @@ mod tests {
     /// return the raw response. `setup` builds the owner from prepaid submissions.
     fn json_exchange(
         setup: impl Fn(Rc<SubmissionCapacity>) -> Server,
+        occupied: usize,
         busy: bool,
         duration: Duration,
         body: Vec<u8>,
@@ -882,13 +887,35 @@ mod tests {
         let reactor = Reactor::<TestScope, ()>::new(12, ());
         let owner = setup(
             reactor
-                .reserve_submissions(CONTROL_SLOTS + 2 * BINARY_CONTROL_SLOTS, ())
+                .reserve_submissions(
+                    CONTROL_SLOTS + BINARY_CONTROL_SLOTS + JSON_CONTROL_SLOTS,
+                    (),
+                )
                 .unwrap(),
         );
         let scope = TestScope {
             deadline: environment::now() + Duration::from_secs(100),
             cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
         };
+        let mut cx = Context::from_waker(Waker::noop());
+        // Hold prepaid slots as the accept, other connections, or a profile would.
+        let (idle, _idle_peer) = UnixStream::pair().unwrap();
+        idle.set_nonblocking(true).unwrap();
+        let idle = Rc::new(Descriptor::from(OwnedFd::from(idle)));
+        let mut holders: Vec<_> = (0..occupied)
+            .map(|_| {
+                reactor.readiness_reserved(
+                    idle.clone(),
+                    1,
+                    (),
+                    owner.resources.submissions.clone(),
+                    &scope,
+                )
+            })
+            .collect();
+        for holder in &mut holders {
+            assert!(holder.as_mut().poll(&mut cx).is_pending());
+        }
         let (completion, mut signal) = UnixStream::pair().unwrap();
         completion.set_nonblocking(true).unwrap();
         signal.write_all(&[1]).unwrap();
@@ -910,7 +937,6 @@ mod tests {
             &scope,
             Ok(response),
         ));
-        let mut cx = Context::from_waker(Waker::noop());
         let until = Instant::now() + Duration::from_secs(5);
         loop {
             if let Poll::Ready(result) = task.as_mut().poll(&mut cx) {
@@ -922,6 +948,7 @@ mod tests {
             reactor.wait(Duration::from_millis(1)).unwrap();
         }
         drop(task);
+        drop(holders);
         let mut drain = reactor.drain();
         loop {
             if let Poll::Ready(result) = drain.as_mut().poll(&mut cx) {
@@ -960,7 +987,7 @@ mod tests {
             owner.binary.as_ref().unwrap().active.set(true);
             owner
         };
-        let text = json_exchange(profiling, false, second, b"{}\n".to_vec());
+        let text = json_exchange(profiling, 0, false, second, b"{}\n".to_vec());
         assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
         assert!(text.contains("\r\nContent-Type: application/json\r\n"));
         assert!(text.contains("\r\nContent-Length: 3\r\n"));
@@ -968,22 +995,34 @@ mod tests {
         assert!(!text.contains("Content-Disposition"));
         assert!(text.ends_with("\r\n\r\n{}\n"));
 
+        // Prepaid capacity suffices with the accept, every other connection, and a
+        // profile each holding their slots: only the JSON socket's own idle slot and
+        // JSON_CONTROL_SLOTS remain.
+        let text = json_exchange(
+            both,
+            MAX_CONNECTIONS + BINARY_CONTROL_SLOTS,
+            false,
+            second,
+            b"{}\n".to_vec(),
+        );
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
+
         // The exact text body limit is accepted; one more byte is refused.
-        let text = json_exchange(both, false, second, vec![b' '; MAX_BODY_BYTES]);
+        let text = json_exchange(both, 0, false, second, vec![b' '; MAX_BODY_BYTES]);
         assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(text.contains(&format!("\r\nContent-Length: {MAX_BODY_BYTES}\r\n")));
-        let text = json_exchange(both, false, second, vec![b' '; MAX_BODY_BYTES + 1]);
+        let text = json_exchange(both, 0, false, second, vec![b' '; MAX_BODY_BYTES + 1]);
         assert!(text.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
         assert!(text.contains("\r\nContent-Type: text/plain; charset=utf-8\r\n"));
         assert!(text.ends_with("\r\n\r\nresponse_too_large\n"));
 
         // Deadlines are bounded by MAX_JSON_DEADLINE, not the profile range.
         for duration in [Duration::ZERO, MAX_JSON_DEADLINE + Duration::from_nanos(1)] {
-            let text = json_exchange(both, false, duration, b"{}\n".to_vec());
+            let text = json_exchange(both, 0, false, duration, b"{}\n".to_vec());
             assert!(text.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{text}");
         }
         for duration in [Duration::from_millis(500), MAX_JSON_DEADLINE] {
-            let text = json_exchange(both, false, duration, b"{}\n".to_vec());
+            let text = json_exchange(both, 0, false, duration, b"{}\n".to_vec());
             assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
         }
 
@@ -993,13 +1032,14 @@ mod tests {
             owner.json.as_ref().unwrap().active.set(true);
             owner
         };
-        let text = json_exchange(busy, true, second, b"{}\n".to_vec());
+        let text = json_exchange(busy, 0, true, second, b"{}\n".to_vec());
         assert!(text.starts_with("HTTP/1.1 409 Conflict\r\n"), "{text}");
         assert!(text.ends_with("\r\n\r\nbusy\n"));
 
         // Without JSON resources the producer is refused rather than borrowing the profile slot.
         let text = json_exchange(
             |submissions| Server::new(submissions.clone(), ()).with_binary(submissions, ()),
+            0,
             false,
             second,
             b"{}\n".to_vec(),
