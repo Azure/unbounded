@@ -60,7 +60,7 @@ func TestNodeProjectionTransitionsAndRetainsTerminalSummary(t *testing.T) {
 	if got.Annotations[LastRunAnnotation] != run.Name ||
 		got.Annotations[LastSuccessfulRunAnnotation] != run.Name ||
 		got.Annotations[EvidenceDigestAnnotation] != run.Status.Evidence.Digest ||
-		got.Annotations[ScriptDigestAnnotation] != run.Spec.Script.Digest {
+		got.Annotations[ScriptDigestAnnotation] != runScriptDigest(run) {
 		t.Fatalf("terminal annotations = %v", got.Annotations)
 	}
 }

@@ -81,7 +81,7 @@ func projectTerminal(ctx context.Context, kube client.Client, run *signalv1.Cert
 		node.Annotations[LastRunAnnotation] = boundedAnnotationValue(run.Name)
 		node.Annotations[LastRunAtAnnotation] = finishedAt
 		node.Annotations[EvidenceDigestAnnotation] = boundedAnnotationValue(run.Status.Evidence.Digest)
-		node.Annotations[ScriptDigestAnnotation] = boundedAnnotationValue(run.Spec.Script.Digest)
+		node.Annotations[ScriptDigestAnnotation] = boundedAnnotationValue(runScriptDigest(run))
 
 		switch run.Status.Phase {
 		case signalv1.RunPhaseSucceeded:
@@ -102,6 +102,22 @@ func projectTerminal(ctx context.Context, kube client.Client, run *signalv1.Cert
 
 		return nil
 	})
+}
+
+func runScriptDigest(run *signalv1.CertificationRun) string {
+	if len(run.Spec.Checks) == 0 {
+		return run.Spec.Script.Digest
+	}
+
+	hash := sha256.New()
+	for index := range run.Spec.Checks {
+		_, _ = hash.Write([]byte(run.Spec.Checks[index].ID))
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write([]byte(run.Spec.Checks[index].Script.Digest))
+		_, _ = hash.Write([]byte{0})
+	}
+
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil))
 }
 
 func projectRecurring(

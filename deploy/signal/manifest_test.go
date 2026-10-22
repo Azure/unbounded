@@ -112,7 +112,7 @@ func TestAdapterRBACAllowsBackendEvidenceCapture(t *testing.T) {
 	}
 }
 
-func TestSignalCRDsExposeRuntimeStageAndDeadlineContract(t *testing.T) {
+func TestSignalCRDsExposeGroupedRuntimeAndDeadlineContract(t *testing.T) {
 	t.Parallel()
 
 	for _, path := range []string{
@@ -126,21 +126,50 @@ func TestSignalCRDsExposeRuntimeStageAndDeadlineContract(t *testing.T) {
 
 		manifest := string(content)
 		for _, required := range []string{
+			"checks:",
+			"maxItems: 15",
+			"minItems: 15",
+			"executionPolicy:",
+			"participantRoles:",
+			"topologyConstraints:",
+			"resultBounds:",
 			"backendActiveDeadline:",
 			"runtimeStage:",
 			"requiresRuntimeStage:",
-			"backendActiveDeadline must leave at least 60 seconds before",
+			"every backendActiveDeadline must leave at least 60 seconds",
 			"runtimeStage is required when the script requires a runtime",
+			"maxAttempts must be exactly 1",
+			"checks must contain unique IDs",
 			"maxLength: 63",
 		} {
 			if !strings.Contains(manifest, required) {
 				t.Fatalf("%s does not contain %q", path, required)
 			}
+
+			profileContent, err := os.ReadFile("crd/signal.unbounded-cloud.io_certificationprofiles.yaml")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if !strings.Contains(string(profileContent), "recurring certification is not supported for grouped suites") {
+				t.Fatal("CertificationProfile CRD does not reject grouped recurrence")
+			}
+
+			runContent, err := os.ReadFile("crd/signal.unbounded-cloud.io_certificationruns.yaml")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			for _, required := range []string{"backendEvidence:", "workflowNodeName:", "retryCount:", "notRun:"} {
+				if !strings.Contains(string(runContent), required) {
+					t.Fatalf("CertificationRun CRD does not contain per-check status field %q", required)
+				}
+			}
 		}
 	}
 }
 
-func TestCertificationRunCRDUsesPresenceAwareOptionalImmutability(t *testing.T) {
+func TestCertificationRunCRDMakesGroupedSnapshotImmutable(t *testing.T) {
 	t.Parallel()
 
 	content, err := os.ReadFile("crd/signal.unbounded-cloud.io_certificationruns.yaml")
@@ -149,24 +178,19 @@ func TestCertificationRunCRDUsesPresenceAwareOptionalImmutability(t *testing.T) 
 	}
 
 	manifest := string(content)
-	optionalImmutableFields := []string{
-		"workloadPolicy",
-		"runtimeStage",
-		"parameters",
-		"purpose",
-		"stagePlan",
-		"tolerations",
+	requiredRules := []string{
+		"checks are immutable",
+		"participants are immutable",
+		"participantRoles are immutable",
+		"topologyConstraints are immutable",
+		"executionPolicy is immutable",
+		"workflow is immutable",
 	}
 
-	for _, field := range optionalImmutableFields {
-		rule := "has(self." + field + ") == has(oldSelf." + field + ")"
+	for _, rule := range requiredRules {
 		if !strings.Contains(manifest, rule) {
-			t.Fatalf("CertificationRun CRD does not contain presence-aware rule %q", rule)
+			t.Fatalf("CertificationRun CRD does not contain rule %q", rule)
 		}
-	}
-
-	if strings.Contains(manifest, "rule: self.runtimeStage == oldSelf.runtimeStage") {
-		t.Fatal("CertificationRun CRD still dereferences an omitted runtimeStage")
 	}
 }
 
@@ -179,8 +203,8 @@ func TestCertificationRunCRDRequiresCanonicalDigests(t *testing.T) {
 	}
 
 	const digestPattern = "pattern: ^sha256:[0-9a-f]{64}$"
-	if count := strings.Count(string(content), digestPattern); count != 2 {
-		t.Fatalf("canonical digest patterns = %d, want 2", count)
+	if count := strings.Count(string(content), digestPattern); count != 3 {
+		t.Fatalf("canonical digest patterns = %d, want 3", count)
 	}
 }
 
