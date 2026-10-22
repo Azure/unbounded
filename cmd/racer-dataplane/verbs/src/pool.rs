@@ -11,7 +11,7 @@
 //!   covers the buffer and no work request uses it.
 //! - Every other state is held by the owner thread as a [`Buffer`] token,
 //!   which has no slice or pointer API at all. The owner moves a token to
-//!   `Owned` only after the fence (receive completion, then a fenced
+//!   `Owned` only after the fence (receive completion, then a signaled
 //!   `LOCAL_INV` completion).
 //!
 //! Page buffers only receive. Writes read caller memory in place through the
@@ -49,7 +49,7 @@ pub enum BufferState {
     /// The window's rkey was sent in a `Grant`: the peer may write.
     Exposed,
 
-    /// Owner posted the fenced `LOCAL_INV`: the peer may write until its CQE.
+    /// Owner posted a signaled `LOCAL_INV`: the peer may write until its CQE.
     Invalidating,
 
     /// Held by a [`RegisteredPage`]: CPU reads, no NIC access.

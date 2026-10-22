@@ -5,7 +5,7 @@
 `page-alloc` is the storage layer under the Racer dataplane. It lives in
 `cmd/racer-dataplane/alloc/`. It gives one worker thread three things:
 
-1. Memory buffers that are aligned for direct I/O and wiped before reuse.
+1. Memory buffers aligned for direct I/O, with caller-selected wiping rules.
 2. A table of fixed-size segments in a sparse cache file or caller-opened files
    or devices, with leases that stop reuse while I/O still points at a segment.
 3. Async read and write of that storage through the `uring-runtime` reactor.
@@ -19,7 +19,8 @@ tells the crate how to remove entries when a segment is evicted.
 Goals:
 
 - Never reuse disk space or memory while the kernel may still read or write it.
-- Keep every allocation and reuse decision on one worker, with no locks.
+- Keep disk allocation and I/O authority on one worker.
+- Let immutable buffers cross threads without moving their storage.
 - Bound the work done by each reclaim call, so the hot path never stalls.
 - Fail with an error instead of wrapping counters or truncating files.
 
@@ -32,29 +33,37 @@ Non-goals:
 
 ## Threading model
 
-Live allocation and I/O authority is worker-local. `Segments` and `Slab` use
-`Rc`-owned state and are neither `Send` nor `Sync`
-(see `Segments` in `alloc/src/segments.rs` and `Slab` in `alloc/src/slab.rs`).
-Buffers, leases, freeze guards, and the reclamation clock have the same restriction
-(see `AlignedBuffer` in `alloc/src/lib.rs` and `SegmentLease`, `FreezeGuard`, and
-`SegmentClock` in `alloc/src/segments.rs`).
-Value types such as `Alignment` and `SegmentId`, and startup inputs such as
-`DevicePlacement`, are `Send + Sync` (see their declarations in `alloc/src/lib.rs`,
-`alloc/src/segments.rs`, and `alloc/src/slab.rs`, respectively). Each worker owns its
-storage ranges, segment table, and buffer pool; live allocation and I/O authority
-cannot move to another worker.
+Disk allocation and I/O authority is worker-local. `Segments`, `Slab`,
+`SegmentLease`, `FreezeGuard`, `SegmentClock`, and `AlignedBuffer` use
+worker-local state and cannot move to another worker. See `alloc/src/segments.rs`,
+`alloc/src/slab.rs`, and `alloc/src/lib.rs`.
+
+`WorkerBufferPool` is a separate, mutex-protected pool. Its `DetachedBuffer`
+can move to a crypto thread for filling. Freezing produces a `FrozenBuffer`
+with immutable bytes; it can be shared across threads when its charge allows
+it. Dropping either buffer returns storage to its original pool, if that pool
+still exists. Freezing an `AlignedBuffer` instead detaches it from the
+worker-local slab pool and rejects retained `Rc` guards. This does not transfer
+disk allocation or I/O authority.
 
 ## Buffers
 
-`AlignedBuffer` is a heap allocation from `alloc_zeroed` with the alignment that
-the file needs (see `Alignment::allocate` in `alloc/src/lib.rs`). Lengths are
+Buffers have the alignment that the file needs (see `Alignment::allocate` and
+`allocate_zeroed` in `alloc/src/lib.rs`). On Linux, allocations of at least
+2 MiB use anonymous mappings aligned to at least 2 MiB, with a huge-page hint.
+Smaller allocations and other targets use `alloc_zeroed`. Lengths are
 padded to the least common multiple of the offset and length units, so the next
 record also starts aligned.
 A single buffer is at most 1 GiB (see `Alignment::extent` and
 `Alignment::MAX_TRANSFER_LENGTH` in `alloc/src/lib.rs`).
 
 Each buffer holds a caller-supplied `Charge`, so the caller can account for
-memory against its own budget. The slab keeps a small list of idle buffers,
+memory against its own budget. The charge must cover the backing capacity,
+not just the requested bytes.
+
+### Worker-local slab pool
+
+The slab keeps a small list of idle buffers,
 oldest first, grouped in 64 KiB size classes and bounded by 128 MiB. After
 checking charge coverage, allocation reuses an idle buffer of the same size
 class and leaves mismatches pooled (see `Slab::allocate` in
@@ -69,19 +78,40 @@ are refused. `Slab::maintain_idle` runs one observation window (1 s) at a time:
 when allocations missed and returns were refused for depth, the target grows by
 half the misses (at least 1); entries that stayed unused for the whole window
 are halved, oldest first; after 10 miss-free windows the target drops by 1.
-`Slab::constrain_idle` holds the pool empty under memory pressure. The flow
+`Slab::constrain_idle` refuses returns and trims to the minimum depth, which
+defaults to zero. The flow
 recycler (`Quotas::maintain_buffers` in `flow/src/lib.rs`) uses the same
 controller and also retains at most half of each class limit. Workers drive
-both from `poll_services`.
+both from `poll_services`. Idle slab buffers keep their admission charges.
 
-Each buffer tracks whether it is still all zeros. Any mutable access, including
-handing it to the kernel for a read, marks it dirty. On drop, a dirty buffer is
-wiped in full, including padding, with `explicit_bzero` (or `zeroize` where that
-is not available) before it is pooled or freed (see `Allocation::as_mut_slice`,
-`Allocation::wipe`, and the `IoBuffer` implementation for `AlignedBuffer` in
-`alloc/src/lib.rs`).
-Clean buffers skip the wipe. This keeps old page data from leaking into the
-next request without paying for a wipe on every allocation.
+### Cross-thread buffer pool
+
+`WorkerBufferPool` groups storage into 64 KiB capacity classes. It keeps at
+most eight idle buffers per class and a caller-set byte budget, 128 MiB by
+default. It reuses the most recently returned buffer in a matching class.
+This pool does not use `PoolDemand`; `clear` frees its idle storage. Wiping
+and charge destructors run outside the mutex.
+
+Racer uses this pool for aligned ciphertext. Its `PoolCharge` releases live
+ciphertext admission before parking idle storage, so Racer sets a separate
+idle budget of four maximum-page capacity classes (`src/memory.rs`). A new
+checkout must bring a charge covering the full capacity. Encryption and HTTP
+receive can fill this storage, and a frozen page can be sent or written to
+disk without another body allocation.
+
+### Wiping and padding
+
+Mutable access marks an allocation dirty. If `Charge::requires_wipe` is true,
+drop securely wipes the full dirty allocation, including padding, before
+pooling or freeing it. Clean allocations skip the wipe. See
+`Allocation::wipe` and the buffer `Drop` implementations in `alloc/src/lib.rs`.
+
+The worker-local slab pool also clears non-secret storage before reuse, using
+`MADV_DONTNEED` for mappings when possible and zero filling otherwise. The
+cross-thread pool deliberately does not clear non-secret storage. Its producers
+must overwrite every requested byte. `DetachedBuffer::freeze` clears only the
+padding up to the direct-I/O length unit. This rule allows ciphertext reuse
+without weakening plaintext wiping.
 
 ## Segments
 
@@ -192,6 +222,13 @@ until the kernel reports completion, even if the caller drops the future or
 cancels. So the memory and the segment both stay reserved until the kernel is
 done with them. Short reads and writes are returned as errors.
 
+`write_vectored` writes an exclusive aligned header followed by a shared,
+immutable body in one positioned `writev`. Both addresses and lengths must
+meet direct-I/O alignment, and their lengths must sum to the extent length.
+The reactor holds both buffers, the lease, and the write fence until completion,
+including after cancellation. A short write is an error. Racer uses this to
+write an aligned ciphertext body without copying it into the header buffer.
+
 Any lease, including one from `Segments::lease`, allows reads and writes within
 its captured used prefix, not just the latest append. It does not grant exclusive
 record ownership. The trusted caller must write only reserved extents it owns,
@@ -211,6 +248,9 @@ change, so the same workflow tests run in both modes.
 
 - Unit tests cover padding math, wipe and reuse rules, lease and generation
   checks, reclaim limits, the eviction veto, restore, and file security checks.
+- Shared-pool tests cover cross-thread return, charge coverage, idle limits,
+  stale non-secret bytes, zero padding, and secure wiping. Demand-controller
+  tests cover growth, decay, and pressure constraints.
 - `alloc/tests/dst.rs` is a deterministic simulation test suite. One generator
   drives appends, simulated I/O with injected faults, leases, freezes,
   snapshots, historical and edited restores, reclaim, and restart. After every
@@ -219,7 +259,8 @@ change, so the same workflow tests run in both modes.
   failure, reclaim bounds, and charge accounting. Fixed regression traces, a
   restore cross-product, and seeded sequences all run through the same runner.
 - `alloc/tests/workflows.rs` covers short I/O, dropped and canceled reads and
-  writes, startup failures, and confirms that reuse does not erase disk bytes.
+  writes, vectored body lifetimes, startup failures, and confirms that reuse
+  does not erase disk bytes.
 - CI checks and tests the production and simulation builds as separate
   commands, so feature unification cannot hide one from the other. The
   production run sets `PAGE_ALLOC_REQUIRE_REAL_IO=1`, so a host without
