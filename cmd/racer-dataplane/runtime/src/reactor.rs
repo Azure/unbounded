@@ -318,7 +318,7 @@ struct State<S: Scope> {
 
     ring_reservation: Option<Charge>,
 
-    entries: BTreeMap<IoId, Entry<S>>,
+    entries: Table<Entry<S>>,
 
     next: u64,
 
@@ -921,7 +921,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                 #[cfg(test)]
                 completions: Default::default(),
                 ring_reservation: None,
-                entries: BTreeMap::new(),
+                entries: Table::default(),
                 next: 1,
                 scan_after: IoId(0),
                 stopped: false,
@@ -1995,8 +1995,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             let after = state.scan_after;
             let next = state
                 .entries
-                .range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
-                .chain(state.entries.range(..=after))
+                .after(after)
                 .take(count)
                 .map(|(id, entry)| (*id, entry.pending.clone(), None));
             batch.extend(next);
@@ -2358,18 +2357,168 @@ impl<S: Scope> State<S> {
     ) -> Result<Option<FencedEntry<S>>> {
         let id = IoId(tag & !CANCEL_BIT);
         // One lookup serves both the fence update and the owner's removal.
-        let std::collections::btree_map::Entry::Occupied(mut slot) = self.entries.entry(id) else {
-            return Err(Error::Io);
-        };
-        let Some(original) = slot
-            .get_mut()
+        let index = self.entries.index_of(id).ok_or(Error::Io)?;
+        let Some(original) = self
+            .entries
+            .at_mut(index)
             .completion
             .complete(tag & CANCEL_BIT != 0, result.into())?
         else {
             return Ok(None);
         };
-        let entry = slot.remove();
+        let entry = self.entries.remove_at(index);
         Ok(Some(FencedEntry { entry, original }))
+    }
+}
+
+/// In-flight entries ordered by their monotonic identifiers.
+///
+/// Identifiers are allocated in increasing order, so inserts append and the
+/// slots stay sorted for binary search. Removal leaves a tombstone that is
+/// trimmed from either end or compacted once tombstones outnumber live
+/// entries, which bounds the storage by the live count even when one old
+/// entry outlives many newer ones.
+struct Table<V> {
+    slots: std::collections::VecDeque<(IoId, Option<V>)>,
+
+    live: usize,
+}
+
+impl<V> Default for Table<V> {
+    /// Create an empty table.
+    fn default() -> Self {
+        Self {
+            slots: std::collections::VecDeque::new(),
+            live: 0,
+        }
+    }
+}
+
+impl<V> Table<V> {
+    /// Count live entries.
+    fn len(&self) -> usize {
+        self.live
+    }
+
+    /// Whether no entry is live.
+    fn is_empty(&self) -> bool {
+        self.live == 0
+    }
+
+    /// Find the slot holding a live entry for `id`.
+    fn index_of(&self, id: IoId) -> Option<usize> {
+        let index = self.slots.binary_search_by_key(&id, |(key, _)| *key).ok()?;
+        self.slots[index].1.is_some().then_some(index)
+    }
+
+    /// Borrow the live entry at a slot returned by [`Self::index_of`].
+    fn at_mut(&mut self, index: usize) -> &mut V {
+        self.slots[index].1.as_mut().expect("live table slot")
+    }
+
+    /// Borrow a live entry.
+    fn get(&self, id: &IoId) -> Option<&V> {
+        self.index_of(*id)
+            .and_then(|index| self.slots[index].1.as_ref())
+    }
+
+    /// Mutably borrow a live entry.
+    fn get_mut(&mut self, id: &IoId) -> Option<&mut V> {
+        let index = self.index_of(*id)?;
+        self.slots[index].1.as_mut()
+    }
+
+    /// Whether `id` is live.
+    fn contains_key(&self, id: &IoId) -> bool {
+        self.index_of(*id).is_some()
+    }
+
+    /// Insert or replace an entry, returning any replaced value.
+    fn insert(&mut self, id: IoId, value: V) -> Option<V> {
+        if self.slots.back().is_none_or(|(last, _)| *last < id) {
+            self.slots.push_back((id, Some(value)));
+            self.live += 1;
+            return None;
+        }
+        match self.slots.binary_search_by_key(&id, |(key, _)| *key) {
+            Ok(index) => {
+                let old = self.slots[index].1.replace(value);
+                if old.is_none() {
+                    self.live += 1;
+                }
+                old
+            }
+            Err(index) => {
+                self.slots.insert(index, (id, Some(value)));
+                self.live += 1;
+                None
+            }
+        }
+    }
+
+    /// Remove a live entry.
+    fn remove(&mut self, id: &IoId) -> Option<V> {
+        let index = self.index_of(*id)?;
+        Some(self.remove_at(index))
+    }
+
+    /// Remove the live entry at a slot returned by [`Self::index_of`].
+    fn remove_at(&mut self, index: usize) -> V {
+        let value = self.slots[index].1.take().expect("live table slot");
+        self.live -= 1;
+        while self.slots.front().is_some_and(|(_, value)| value.is_none()) {
+            self.slots.pop_front();
+        }
+        while self.slots.back().is_some_and(|(_, value)| value.is_none()) {
+            self.slots.pop_back();
+        }
+        if self.slots.len() > 2 * self.live + 16 {
+            self.slots.retain(|(_, value)| value.is_some());
+        }
+        value
+    }
+
+    /// Iterate live entries in identifier order.
+    fn iter(&self) -> impl Iterator<Item = (&IoId, &V)> {
+        self.slots
+            .iter()
+            .filter_map(|(id, value)| value.as_ref().map(|value| (id, value)))
+    }
+
+    /// Iterate live identifiers in order.
+    #[cfg(all(test, feature = "simulation"))]
+    fn keys(&self) -> impl Iterator<Item = &IoId> {
+        self.iter().map(|(id, _)| id)
+    }
+
+    /// Iterate live entries in identifier order.
+    #[cfg(test)]
+    fn values(&self) -> impl Iterator<Item = &V> {
+        self.iter().map(|(_, value)| value)
+    }
+
+    /// The live entry with the smallest identifier.
+    #[cfg(test)]
+    fn first_key_value(&self) -> Option<(&IoId, &V)> {
+        self.iter().next()
+    }
+
+    /// Iterate live entries after `id`, then wrap around to those at or before it.
+    fn after(&self, id: IoId) -> impl Iterator<Item = (&IoId, &V)> {
+        let split = self.slots.partition_point(|(key, _)| *key <= id);
+        self.slots
+            .range(split..)
+            .chain(self.slots.range(..split))
+            .filter_map(|(id, value)| value.as_ref().map(|value| (id, value)))
+    }
+}
+
+impl<V> std::ops::Index<&IoId> for Table<V> {
+    type Output = V;
+
+    /// Borrow a live entry, panicking if it is absent.
+    fn index(&self, id: &IoId) -> &V {
+        self.get(id).expect("live table entry")
     }
 }
 

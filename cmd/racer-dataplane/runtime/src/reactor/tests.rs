@@ -3851,3 +3851,80 @@ mod vectored {
         }
     }
 }
+
+mod table {
+    //! Ordered in-flight table: lookup, wraparound scans, and bounded tombstones.
+    use super::*;
+
+    /// Collect live identifiers from an iterator of entries.
+    fn ids<'a>(entries: impl Iterator<Item = (&'a IoId, &'a u32)>) -> Vec<u64> {
+        entries.map(|(id, _)| id.0).collect()
+    }
+
+    #[test]
+    /// Appends, out-of-order inserts, replacement, and removal keep identifier order.
+    fn inserts_and_removals_keep_order_and_count() {
+        let mut table = Table::default();
+        assert!(table.is_empty());
+        for id in [2, 4, 6] {
+            assert_eq!(table.insert(IoId(id), id as u32), None);
+        }
+        assert_eq!(table.insert(IoId(3), 3), None, "out of order insert");
+        assert_eq!(
+            table.insert(IoId(4), 40),
+            Some(4),
+            "replace keeps one entry"
+        );
+        assert_eq!(table.len(), 4);
+        assert_eq!(ids(table.iter()), [2, 3, 4, 6]);
+        assert_eq!(table.remove(&IoId(3)), Some(3));
+        assert_eq!(table.remove(&IoId(3)), None, "a removed entry is absent");
+        assert!(!table.contains_key(&IoId(3)));
+        assert_eq!(table.get_mut(&IoId(5)), None);
+        assert_eq!(table[&IoId(4)], 40);
+        // Reinsert into a tombstone left between live entries.
+        assert_eq!(table.insert(IoId(3), 30), None);
+        assert_eq!(ids(table.iter()), [2, 3, 4, 6]);
+        assert_eq!(table.first_key_value(), Some((&IoId(2), &2)));
+        for id in [2, 3, 4, 6] {
+            assert!(table.remove(&IoId(id)).is_some());
+        }
+        assert!(table.is_empty());
+        assert_eq!(table.slots.len(), 0, "an empty table keeps no tombstones");
+    }
+
+    #[test]
+    /// Scans start after the cursor and wrap to the beginning, skipping tombstones.
+    fn after_wraps_and_skips_removed_entries() {
+        let mut table = Table::default();
+        for id in 1..=6 {
+            table.insert(IoId(id), id as u32);
+        }
+        table.remove(&IoId(4));
+        assert_eq!(ids(table.after(IoId(3))), [5, 6, 1, 2, 3]);
+        assert_eq!(ids(table.after(IoId(4))), [5, 6, 1, 2, 3]);
+        assert_eq!(ids(table.after(IoId(0))), [1, 2, 3, 5, 6]);
+        assert_eq!(ids(table.after(IoId(9))), [1, 2, 3, 5, 6]);
+        assert_eq!(
+            ids(Table::<u32>::default().after(IoId(1))),
+            Vec::<u64>::new()
+        );
+    }
+
+    #[test]
+    /// One long-lived entry cannot make storage grow with later traffic.
+    fn long_lived_entry_keeps_storage_bounded() {
+        let mut table = Table::default();
+        table.insert(IoId(0), 0);
+        for id in 1..10_000 {
+            table.insert(IoId(id), id as u32);
+            let index = table.index_of(IoId(id)).unwrap();
+            assert_eq!(table.remove_at(index), id as u32);
+            assert!(table.slots.len() <= 2 * table.len() + 17);
+        }
+        assert_eq!(table.len(), 1);
+        assert_eq!(ids(table.iter()), [0]);
+        assert_eq!(table.remove(&IoId(0)), Some(0));
+        assert!(table.slots.is_empty());
+    }
+}
