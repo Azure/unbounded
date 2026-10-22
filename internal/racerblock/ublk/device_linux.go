@@ -319,10 +319,11 @@ func (d *Device) Close() error {
 }
 
 // Delete makes a best-effort attempt to stop and delete device id, for
-// example one left behind by a crashed process.
+// example one left behind by a crashed process. It rejects an id outside
+// [0, MaxDeviceID] before opening the control device.
 func Delete(id int) error {
-	if id < 0 {
-		return fmt.Errorf("ublk: invalid device id %d", id)
+	if err := validateDeviceID(id); err != nil {
+		return err
 	}
 
 	c, err := openCtrl()

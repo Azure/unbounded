@@ -20,6 +20,9 @@ const (
 	// MaxQueues is UBLK_MAX_NR_QUEUES.
 	MaxQueues = 4096
 
+	// MaxDeviceID is the largest device ID that Start and Delete accept.
+	MaxDeviceID = 1 << 20
+
 	// DefaultDepth is the per-queue depth used when Config.Depth is 0.
 	DefaultDepth = 128
 
@@ -56,10 +59,23 @@ type Config struct {
 	Logger     *slog.Logger // nil -> slog.Default()
 }
 
+// validateDeviceID reports an error unless id is a fixed device ID in
+// [0, MaxDeviceID]. Callers check this before sending any control command,
+// because those commands truncate the ID to 32 bits.
+func validateDeviceID(id int) error {
+	if id < 0 || id > MaxDeviceID {
+		return fmt.Errorf("ublk: invalid device id %d", id)
+	}
+
+	return nil
+}
+
 // withDefaults validates cfg and returns a copy with defaults applied.
 func (cfg Config) withDefaults() (Config, error) {
-	if cfg.ID < -1 || cfg.ID > 1<<20 {
-		return cfg, fmt.Errorf("ublk: invalid device id %d", cfg.ID)
+	if cfg.ID != -1 {
+		if err := validateDeviceID(cfg.ID); err != nil {
+			return cfg, err
+		}
 	}
 
 	if cfg.Size <= 0 || cfg.Size%sectorSize != 0 {

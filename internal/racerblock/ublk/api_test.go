@@ -6,7 +6,9 @@ package ublk
 import (
 	"context"
 	"errors"
+	"math"
 	"runtime"
+	"strconv"
 	"syscall"
 	"testing"
 )
@@ -22,6 +24,51 @@ func TestConfigDefaults(t *testing.T) {
 	}
 }
 
+// largeDeviceIDs returns out-of-range IDs, including ones that truncate to a
+// valid uint32 ID on 64-bit platforms.
+func largeDeviceIDs() []int {
+	ids := []int{-2, MaxDeviceID + 1, math.MaxInt32, math.MinInt}
+
+	if strconv.IntSize == 64 {
+		// Computed at run time so the file still compiles where int is 32 bits.
+		shift := 32
+		ids = append(ids, 1<<shift, 1<<shift+1, math.MaxInt)
+	}
+
+	return ids
+}
+
+func TestValidateDeviceID(t *testing.T) {
+	for _, id := range []int{0, 1, MaxDeviceID} {
+		if err := validateDeviceID(id); err != nil {
+			t.Errorf("validateDeviceID(%d) = %v", id, err)
+		}
+
+		if _, err := (Config{ID: id, Size: 512}).withDefaults(); err != nil {
+			t.Errorf("Config{ID: %d} = %v", id, err)
+		}
+	}
+
+	// -1 asks the kernel to choose, so Config accepts it but Delete does not.
+	if err := validateDeviceID(-1); err == nil {
+		t.Error("validateDeviceID(-1) succeeded")
+	}
+
+	if _, err := (Config{ID: -1, Size: 512}).withDefaults(); err != nil {
+		t.Errorf("Config{ID: -1} = %v", err)
+	}
+
+	for _, id := range largeDeviceIDs() {
+		if err := validateDeviceID(id); err == nil {
+			t.Errorf("validateDeviceID(%d) succeeded", id)
+		}
+
+		if _, err := (Config{ID: id, Size: 512}).withDefaults(); err == nil {
+			t.Errorf("Config{ID: %d} succeeded", id)
+		}
+	}
+}
+
 func TestConfigValidation(t *testing.T) {
 	ok := Config{ID: -1, Size: 512}
 	cases := map[string]func(c *Config){
@@ -29,6 +76,7 @@ func TestConfigValidation(t *testing.T) {
 		"negative size":    func(c *Config) { c.Size = -512 },
 		"unaligned size":   func(c *Config) { c.Size = 1000 },
 		"bad id":           func(c *Config) { c.ID = -2 },
+		"id above max":     func(c *Config) { c.ID = MaxDeviceID + 1 },
 		"negative queues":  func(c *Config) { c.Queues = -1 },
 		"too many queues":  func(c *Config) { c.Queues = MaxQueues + 1 },
 		"negative depth":   func(c *Config) { c.Depth = -1 },
