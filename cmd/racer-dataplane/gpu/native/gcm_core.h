@@ -209,13 +209,16 @@ GCM_FN void gcm_aes256_encrypt(const uint8_t *sbox, const uint8_t *rk, const uin
     for (int i = 0; i < 16; ++i) out[i] = s[i];
 }
 
+/* Entry `i` of the reflected CRC-64/XZ byte table. */
+GCM_FN uint64_t gcm_crc64_entry(unsigned i) {
+    uint64_t c = i;
+    for (int k = 0; k < 8; ++k) c = (c & 1) ? (c >> 1) ^ GCM_CRC64_POLY : c >> 1;
+    return c;
+}
+
 /* Reflected CRC-64/XZ byte table. */
 GCM_FN void gcm_crc64_table(uint64_t table[256]) {
-    for (unsigned i = 0; i < 256; ++i) {
-        uint64_t c = i;
-        for (int k = 0; k < 8; ++k) c = (c & 1) ? (c >> 1) ^ GCM_CRC64_POLY : c >> 1;
-        table[i] = c;
-    }
+    for (unsigned i = 0; i < 256; ++i) table[i] = gcm_crc64_entry(i);
 }
 
 /* Complete CRC-64/XZ (init and xorout all ones) of `n` bytes. */
