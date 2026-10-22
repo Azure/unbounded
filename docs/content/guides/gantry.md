@@ -49,15 +49,15 @@ metadata, while whole-layer distribution can continue in the background.
 
 The 1,000-node, 40 GiB/40-layer results are:
 
-| Pod-start latency | Gantry full-image pull, three-run mean | Gantry + Artifact Streaming, three completed runs | Observed reduction |
+| Pod-start latency | Gantry full-image pull, three-run mean | Gantry + Artifact Streaming, five-run mean | Observed reduction |
 | --- | ---: | ---: | ---: |
-| P50 | 636.100s | **7.667s** | **98.8%** |
-| P95 | 712.667s | **18.667s** | **97.4%** |
-| P100 | 803.933s | **54.667s** | **93.2%** |
+| P50 | 636.100s | **8.000s** | **98.7%** |
+| P95 | 712.667s | **20.200s** | **97.2%** |
+| P100 | 803.933s | **49.000s** | **93.9%** |
 
-Every streaming run completed **1,000/1,000 pods** with a fresh random payload.
-Values are means of per-run percentiles, not pooled percentiles. The October 22,
-2026 streaming series is preliminary: three of five repeats are complete.
+All five streaming runs on October 22, 2026 completed **1,000/1,000 pods** each
+with a fresh random payload. Values are means of per-run percentiles, not
+pooled percentiles; the maximum across all 5,000 pods was **67 seconds**.
 The full-image and streaming cohorts are historical, unpaired measurements,
 not a controlled A/B test. Streaming times measure startup, not a complete
 payload download or read; shared base layers may already be cached.

@@ -83,32 +83,36 @@ snapshotter mounts an OverlayBD image and fetches required ranges on demand.
 Gantry's peer distribution still supplies content, and background whole-layer
 pulls can continue after the application starts.
 
-### Preliminary 1,000-node results
+### Completed 1,000-node results
 
-The following are the first three completed repeats of a five-run series on
-October 22, 2026. All repeats use the metadata-prefetch fix in
+The following five independent repeats completed on October 22, 2026, with
+**5,000/5,000 pods successful**. All repeats use the metadata-prefetch fix in
 [`0daace8e`](https://github.com/Azure/unbounded/commit/0daace8edbd7274b89b1da3b1db4246cce02c75c).
-The remaining repeats are still running; they are not included in these values.
 
 | Run | Completed pods | P50 | P95 | P99 | Maximum |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | 1 | 1,000/1,000 | 6s | 17s | 23s | 31s |
 | 2 | 1,000/1,000 | 8s | 20s | 26s | 67s |
 | 3 | 1,000/1,000 | 9s | 19s | 25s | 66s |
+| 4 | 1,000/1,000 | 8s | 21s | 31s | 37s |
+| 5 | 1,000/1,000 | 9s | 24s | 29s | 44s |
+| **Pooled** | **5,000/5,000** | **8s** | **20s** | **27s** | **67s** |
 
 The source run IDs, in table order, are
 `run-20261022-134210-00126be4`,
-`run-20261022-141505-74e06e78`, and
-`run-20261022-144935-d1394183`.
+`run-20261022-141505-74e06e78`,
+`run-20261022-144935-d1394183`,
+`run-20261022-152034-32fffd66`, and
+`run-20261022-155448-dc77a7b2`.
 
 For context, the mean of these per-run percentiles compares with the historical
 full-image Gantry chair-design cohort as follows:
 
-| Metric | Historical full-image Gantry, three-run mean | Gantry with Artifact Streaming, three completed repeats | Observed difference |
+| Metric | Historical full-image Gantry, three-run mean | Gantry with Artifact Streaming, five-run mean | Observed difference |
 | --- | ---: | ---: | ---: |
-| Per-run P50 mean | 636.100s | 7.667s | 98.8% lower |
-| Per-run P95 mean | 712.667s | 18.667s | 97.4% lower |
-| Per-run P100 mean | 803.933s | 54.667s | 93.2% lower |
+| Per-run P50 mean | 636.100s | 8.000s | 98.7% lower |
+| Per-run P95 mean | 712.667s | 20.200s | 97.2% lower |
+| Per-run P100 mean | 803.933s | 49.000s | 93.9% lower |
 
 Values are means of per-run percentiles, not pooled percentiles. This historical
 comparison uses separate clusters and run sets, not a controlled A/B experiment;
@@ -134,9 +138,9 @@ Interpret these results with the following limits:
 - Previous benchmark payload images were cleared; every repeat used a distinct
   payload and converted image. Shared base layers and filesystem pages may
   remain warm.
-- Submissions spanned 54-60 seconds. Each latency starts at that pod's own
+- Submissions spanned 54-62 seconds. Each latency starts at that pod's own
   creation timestamp. First submission to last container completion took
-  94-98 seconds, including `sleep 15`.
+  94-108 seconds, including `sleep 15`.
 - The historical cohort used AKS audit records; streaming used runtime
   timestamps from Kubernetes pod status.
 - `sleep 15` does not read the random payload files. These are startup numbers,
