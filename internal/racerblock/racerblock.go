@@ -38,6 +38,9 @@ type Config struct {
 	Logger *slog.Logger
 }
 
+// deleteDevice is ublk.Delete; tests replace it to observe replacement.
+var deleteDevice = ublk.Delete
+
 // DeviceSize returns the block device size for an object of objectSize bytes.
 // The size is rounded up to a whole sector; the backend fills the tail with
 // zeros.
@@ -87,8 +90,14 @@ func Run(ctx context.Context, cfg Config) error {
 
 	cfg.Device.Size = size
 
+	// Validate before ReplaceExisting deletes a working device, so a config
+	// that Start would reject cannot destroy the device it meant to replace.
+	if err := cfg.Device.Validate(); err != nil {
+		return fmt.Errorf("racerblock: invalid device config: %w", err)
+	}
+
 	if cfg.ReplaceExisting && cfg.Device.ID >= 0 {
-		if err := ublk.Delete(cfg.Device.ID); err != nil && !errors.Is(err, syscall.ENODEV) {
+		if err := deleteDevice(cfg.Device.ID); err != nil && !errors.Is(err, syscall.ENODEV) {
 			return fmt.Errorf("racerblock: delete existing device %d: %w", cfg.Device.ID, err)
 		}
 	}

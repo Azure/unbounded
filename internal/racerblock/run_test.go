@@ -7,10 +7,12 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Azure/unbounded/internal/racerblock/backend"
+	"github.com/Azure/unbounded/internal/racerblock/ublk"
 	"github.com/Azure/unbounded/pkg/racersdk"
 	"github.com/Azure/unbounded/pkg/racersdk/racersdktest"
 )
@@ -123,6 +125,50 @@ func TestRunOpenErrors(t *testing.T) {
 
 			if ready {
 				t.Fatal("Ready called after a failed open")
+			}
+		})
+	}
+}
+
+// TestRunReplaceExistingRejectsInvalidConfigBeforeDelete checks that a
+// device config Start would reject fails before the existing device is
+// deleted.
+func TestRunReplaceExistingRejectsInvalidConfigBeforeDelete(t *testing.T) {
+	deleted := false
+	orig := deleteDevice
+	deleteDevice = func(int) error {
+		deleted = true
+
+		return nil
+	}
+
+	t.Cleanup(func() { deleteDevice = orig })
+
+	client := racersdktest.NewClient(t, patternOrigin(1<<20))
+
+	tests := []struct {
+		name string
+		dev  ublk.Config
+	}{
+		{name: "unaligned max io bytes", dev: ublk.Config{ID: 7, MaxIOBytes: 4097}},
+		{name: "device id out of range", dev: ublk.Config{ID: ublk.MaxDeviceID + 1}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			deleted = false
+
+			err := Run(t.Context(), Config{
+				Source:          backend.FromClient(client, racersdk.Request{Key: testKey}),
+				Device:          tt.dev,
+				ReplaceExisting: true,
+			})
+			if err == nil || !strings.Contains(err.Error(), "invalid device config") {
+				t.Fatalf("Run error = %v, want invalid device config", err)
+			}
+
+			if deleted {
+				t.Fatal("existing device deleted despite invalid config")
 			}
 		})
 	}

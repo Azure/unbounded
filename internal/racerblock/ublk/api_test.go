@@ -170,3 +170,19 @@ func TestServeRead(t *testing.T) {
 		t.Fatalf("zero errno: %d", r)
 	}
 }
+
+// TestConfigValidateMatchesWithDefaults checks that Validate rejects the
+// configs Start rejects and accepts valid ones.
+func TestConfigValidateMatchesWithDefaults(t *testing.T) {
+	if err := (Config{ID: 7, Size: 512, MaxIOBytes: 4097}).Validate(); err == nil {
+		t.Fatal("Validate accepted unaligned MaxIOBytes")
+	}
+
+	if err := (Config{ID: MaxDeviceID + 1, Size: 512}).Validate(); err == nil {
+		t.Fatal("Validate accepted out-of-range ID")
+	}
+
+	if err := (Config{ID: 7, Size: 512}).Validate(); err != nil {
+		t.Fatalf("Validate rejected valid config: %v", err)
+	}
+}
