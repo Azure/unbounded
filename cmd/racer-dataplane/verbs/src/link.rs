@@ -512,6 +512,16 @@ impl Link {
         self.phase
     }
 
+    /// True while the NIC owes this link a completion we must poll for: a
+    /// posted work request, an exposed grant the peer may write, or queued
+    /// sends. Completions do not wake the owner, so it polls until false.
+    pub(crate) fn expects_completions(&self) -> bool {
+        !self.inflight.is_empty()
+            || !self.grants.is_empty()
+            || !self.waiting.is_empty()
+            || !self.outbox.is_empty()
+    }
+
     pub(crate) fn link_id(&self) -> u64 {
         self.link_id
     }

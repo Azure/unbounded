@@ -589,6 +589,104 @@ fn worker_drop() {
 }
 
 #[test]
+/// The owner expects completions only while a transfer is in flight: from
+/// the grant until its arrival is reported, and from a write until its send
+/// completes. An idle ready link does not keep the host awake.
+fn owner_expects_completions_only_while_transfers_are_in_flight() {
+    let mut w = world();
+    let (ea, eb) = link_up(&mut w);
+    pump(&mut w);
+    assert!(
+        !w.a.owner().expects_completions(),
+        "idle link keeps a awake"
+    );
+    assert!(
+        !w.b.owner().expects_completions(),
+        "idle link keeps b awake"
+    );
+    let deadline = now() + 5 * SECOND;
+    let granted = w.a.clients[0].grant(TO_B, ea, [1; 16], 10, deadline);
+    w.a.owner().poll_budgeted(8).unwrap();
+    assert!(w.a.owner().expects_completions(), "grant in flight");
+    let granted = wait(&mut w, &granted).unwrap();
+    let written = w.b.clients[0].write(TO_A, eb, granted.tag, bytes(vec![5; 10]), deadline);
+    w.b.owner().poll_budgeted(8).unwrap();
+    assert!(w.b.owner().expects_completions(), "write in flight");
+    assert_eq!(wait(&mut w, &written), Ok(()));
+    assert_eq!(page(ready(&granted.arrival)).bytes(), [5; 10]);
+    pump(&mut w);
+    assert!(
+        !w.a.owner().expects_completions(),
+        "a still awake after arrival"
+    );
+    assert!(
+        !w.b.owner().expects_completions(),
+        "b still awake after send"
+    );
+    shutdown(w);
+}
+
+#[test]
+/// `WithNative` gives the native side a command budget of its own and wakes
+/// the driver while the native side expects completions.
+fn with_native_keeps_driver_awake_for_completions() {
+    use std::{sync::Arc, task::Wake};
+
+    use racer_platform::group::Service;
+
+    struct Count(AtomicUsize);
+
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    struct Host {
+        budgets: Vec<usize>,
+
+        expects: bool,
+    }
+
+    impl rdma_verbs::NativeHost for Host {
+        fn register_driver(&self, _: &std::task::Waker) {}
+
+        fn poll_budgeted(&mut self, budget: usize) -> rdma_verbs::Result<()> {
+            self.budgets.push(budget);
+            Ok(())
+        }
+
+        fn close(&self) {}
+
+        fn drained(&self) -> bool {
+            true
+        }
+
+        fn expects_completions(&self) -> bool {
+            self.expects
+        }
+    }
+
+    let count = Arc::new(Count(AtomicUsize::new(0)));
+    let waker = std::task::Waker::from(count.clone());
+    let mut cx = Context::from_waker(&waker);
+    let host = Host {
+        budgets: Vec::new(),
+        expects: false,
+    };
+    let mut service = rdma_verbs::WithNative::with_host(inner::Inner, host);
+    service.poll(&mut cx, 1).unwrap();
+    assert_eq!(count.0.load(Ordering::Acquire), 0, "idle native side woke");
+    service.native_mut().expects = true;
+    service.poll(&mut cx, 1000).unwrap();
+    assert_eq!(count.0.load(Ordering::Acquire), 1, "busy native side slept");
+    assert_eq!(
+        service.native_mut().budgets,
+        [rdma_verbs::NATIVE_COMMAND_BUDGET, 1000]
+    );
+}
+
+#[test]
 /// The owner can be hosted by `WithNative` and drained by its fence.
 fn owner_hosted_by_with_native() {
     use racer_platform::group::Service;

@@ -676,6 +676,12 @@ impl Owner {
         Ok(())
     }
 
+    /// True while a link waits for a completion. The caller should poll
+    /// again without sleeping: completions never wake the owner.
+    pub fn expects_completions(&self) -> bool {
+        self.links.values().any(Link::expects_completions)
+    }
+
     fn handle(&mut self, command: Command, now: Instant) {
         if self.closing {
             // Dropping the command fails its op with `Cancelled`; say why.
@@ -1251,6 +1257,10 @@ impl crate::NativeHost for Owner {
 
     fn drained(&self) -> bool {
         Owner::drained(self)
+    }
+
+    fn expects_completions(&self) -> bool {
+        Owner::expects_completions(self)
     }
 }
 

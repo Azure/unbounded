@@ -176,7 +176,9 @@ pub struct Selection {
 
 /// A `uring-runtime` service with a [`NativeHost`] attached.
 ///
-/// - Poll: polls both with the same budget.
+/// - Poll: polls the inner service with the given budget and the native side
+///   with at least [`NATIVE_COMMAND_BUDGET`]. Wakes the driver again while
+///   the native side expects completions, so the host does not park on them.
 /// - Stop admission: only the inner service. Native work keeps going.
 /// - Drain and fence: close the native side, then drive it and the inner
 ///   drain or fence together until both finish. The native side always
@@ -204,7 +206,18 @@ pub trait NativeHost {
 
     /// True once shutdown finished.
     fn drained(&self) -> bool;
+
+    /// True while the native side must be polled again soon because work it
+    /// started finishes without a wakeup, such as NIC completions.
+    fn expects_completions(&self) -> bool {
+        false
+    }
 }
+
+/// Commands the native side handles per poll, at least. The host's budget
+/// sizes its own jobs, which can be much longer than a native command; one
+/// command per pass would queue commands behind those jobs.
+pub const NATIVE_COMMAND_BUDGET: usize = 64;
 
 impl Endpoint {
     /// Size of the wire encoding.
@@ -261,6 +274,11 @@ impl<T, N: NativeHost> WithNative<T, N> {
     pub fn with_host(inner: T, native: N) -> Self {
         Self { inner, native }
     }
+
+    /// The native host.
+    pub fn native_mut(&mut self) -> &mut N {
+        &mut self.native
+    }
 }
 
 impl<S: Scope, T: Service<S>, N: NativeHost> Service<S> for WithNative<T, N>
@@ -294,10 +312,17 @@ where
         }))
     }
 
-    /// Poll the inner service, then the native side, each with `budget`.
+    /// Poll the inner service with `budget`, then the native side with at
+    /// least [`NATIVE_COMMAND_BUDGET`]. While the native side expects
+    /// completions, wake the driver so it polls again instead of parking.
     fn poll(&mut self, cx: &mut Context<'_>, budget: usize) -> std::result::Result<(), S::Error> {
         self.inner.poll(cx, budget)?;
-        self.native.poll_budgeted(budget).map_err(Into::into)
+        let native = budget.max(NATIVE_COMMAND_BUDGET);
+        self.native.poll_budgeted(native)?;
+        if self.native.expects_completions() {
+            cx.waker().wake_by_ref();
+        }
+        Ok(())
     }
 
     /// Pass through to the inner service.
