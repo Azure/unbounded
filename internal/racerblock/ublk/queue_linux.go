@@ -1,0 +1,366 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+//go:build linux
+
+package ublk
+
+import (
+	"errors"
+	"fmt"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
+)
+
+// ublkIOResAbort is UBLK_IO_RES_ABORT (-ENODEV).
+const ublkIOResAbort = -19
+
+// pollUserData tags the eventfd poll completion; io commands use their tag.
+const pollUserData = 1 << 63
+
+// completion is a finished handler call waiting to be committed.
+type completion struct {
+	tag uint16
+	res int32
+}
+
+// queue serves one ublk hardware queue.
+type queue struct {
+	dev    *Device
+	id     int
+	depth  int
+	charFd int
+
+	ring  *uring
+	desc  []byte   // read-only mmap of the io descriptor array
+	bufs  [][]byte // per-tag anonymous mmap IO buffers
+	efd   int      // eventfd signaled by workers
+	pollP bool     // poll is armed (queue thread only)
+
+	mu      sync.Mutex
+	pending []completion
+
+	running  bool // set before run starts; read after
+	stopping atomic.Bool
+	exited   chan struct{}
+}
+
+func newQueue(d *Device, id int) (*queue, error) {
+	cfg := d.cfg
+	q := &queue{
+		dev:    d,
+		id:     id,
+		depth:  cfg.Depth,
+		charFd: d.charFd,
+		efd:    -1,
+		exited: make(chan struct{}),
+	}
+
+	var err error
+
+	q.ring, err = newURing(uint32(cfg.Depth + 1))
+	if err != nil {
+		return q.failNew(fmt.Errorf("ublk: queue %d ring: %w", id, err))
+	}
+
+	page := unix.Getpagesize()
+	sz := descArraySize(cfg.Depth, page)
+
+	q.desc, err = unix.Mmap(d.charFd, descArrayOffset(id, page), sz, unix.PROT_READ, unix.MAP_SHARED|unix.MAP_POPULATE)
+	if err != nil {
+		return q.failNew(fmt.Errorf("ublk: queue %d mmap descriptors: %w", id, err))
+	}
+
+	q.bufs = make([][]byte, cfg.Depth)
+	for t := range q.bufs {
+		q.bufs[t], err = unix.Mmap(-1, 0, cfg.MaxIOBytes, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANONYMOUS)
+		if err != nil {
+			return q.failNew(fmt.Errorf("ublk: queue %d mmap io buffer: %w", id, err))
+		}
+	}
+
+	q.efd, err = unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
+	if err != nil {
+		return q.failNew(fmt.Errorf("ublk: queue %d eventfd: %w", id, err))
+	}
+
+	return q, nil
+}
+
+// release frees queue resources. The ring must not be in use.
+func (q *queue) release() error {
+	var errs []error
+
+	if q.ring != nil {
+		errs = append(errs, q.ring.close())
+		q.ring = nil
+	}
+
+	for i, b := range q.bufs {
+		if b != nil {
+			errs = append(errs, unix.Munmap(b))
+			q.bufs[i] = nil
+		}
+	}
+
+	if q.desc != nil {
+		errs = append(errs, unix.Munmap(q.desc))
+		q.desc = nil
+	}
+
+	if q.efd >= 0 {
+		errs = append(errs, unix.Close(q.efd))
+		q.efd = -1
+	}
+
+	return errors.Join(errs...)
+}
+
+// failNew releases a partially built queue and returns err.
+func (q *queue) failNew(err error) (*queue, error) {
+	return nil, errors.Join(err, q.release())
+}
+
+// wake interrupts the queue thread.
+func (q *queue) wake() {
+	var one [8]byte
+
+	*(*uint64)(unsafe.Pointer(&one[0])) = 1
+	// EAGAIN means the counter is saturated, so the queue is already awake.
+	if _, err := unix.Write(q.efd, one[:]); err != nil && !errors.Is(err, unix.EAGAIN) {
+		q.dev.cfg.Logger.Warn("ublk: eventfd write failed", "queue", q.id, "err", err)
+	}
+}
+
+// stop asks the queue thread to exit.
+func (q *queue) stop() {
+	q.stopping.Store(true)
+	q.wake()
+}
+
+// complete is called by workers to hand a result back to the queue thread.
+func (q *queue) complete(tag uint16, res int32) {
+	q.mu.Lock()
+	q.pending = append(q.pending, completion{tag: tag, res: res})
+	q.mu.Unlock()
+	q.wake()
+}
+
+func (q *queue) descAt(tag uint16) ioDesc {
+	return *(*ioDesc)(unsafe.Pointer(&q.desc[int(tag)*ioDescSize]))
+}
+
+// sqe returns a free SQE, flushing the ring to the kernel if it is full.
+func (q *queue) sqe() (*sqe, error) {
+	if s := q.ring.getSQE(); s != nil {
+		return s, nil
+	}
+
+	if err := q.ring.submitAndWait(0); err != nil {
+		return nil, err
+	}
+
+	if s := q.ring.getSQE(); s != nil {
+		return s, nil
+	}
+
+	return nil, errRingFull
+}
+
+func (q *queue) prepIO(op uint32, tag uint16, res int32) error {
+	s, err := q.sqe()
+	if err != nil {
+		return err
+	}
+
+	s.Opcode = ioringOpURingCmd
+	s.Fd = int32(q.charFd)
+	s.Off = uint64(op)
+	s.UserData = uint64(tag)
+
+	cmd := (*ioCmd)(unsafe.Pointer(&cmdArea(s)[0]))
+	cmd.QID = uint16(q.id)
+	cmd.Tag = tag
+	cmd.Result = res
+	cmd.Addr = uint64(uintptr(unsafe.Pointer(&q.bufs[tag][0])))
+
+	return nil
+}
+
+func (q *queue) armPoll() error {
+	s, err := q.sqe()
+	if err != nil {
+		return err
+	}
+
+	s.Opcode = ioringOpPollAdd
+	s.Fd = int32(q.efd)
+	s.OpFlags = unix.POLLIN
+	s.UserData = pollUserData
+	q.pollP = true
+
+	return nil
+}
+
+// run is the queue thread. ready receives the result of the initial
+// FETCH_REQ submission. The ring is closed when run returns.
+func (q *queue) run(ready chan<- error) {
+	runtime.LockOSThread()
+	// The thread is intentionally never unlocked: it exits with the
+	// goroutine so the kernel sees the queue daemon task go away.
+	defer close(q.exited)
+
+	err := q.serve(ready)
+
+	if cerr := q.ring.close(); cerr != nil {
+		q.dev.cfg.Logger.Warn("ublk: closing queue ring", "queue", q.id, "err", cerr)
+	}
+
+	q.ring = nil
+
+	if err != nil && !q.stopping.Load() {
+		q.dev.fail(fmt.Errorf("ublk: queue %d: %w", q.id, err))
+	}
+}
+
+func (q *queue) serve(ready chan<- error) error {
+	err := q.fetchAll()
+	ready <- err
+
+	if err != nil {
+		return err
+	}
+
+	live := q.depth
+
+	for {
+		for {
+			c, ok := q.ring.peekCQE()
+			if !ok {
+				break
+			}
+
+			q.ring.advanceCQ()
+
+			if c.UserData == pollUserData {
+				q.pollP = false
+				continue
+			}
+
+			tag := uint16(c.UserData)
+
+			switch c.Res {
+			case 0:
+				if err := q.handle(tag); err != nil {
+					return err
+				}
+			case ublkIOResAbort:
+				live--
+			default:
+				if q.stopping.Load() {
+					live--
+					continue
+				}
+
+				return fmt.Errorf("io command tag %d: %w", tag, syscall.Errno(-c.Res))
+			}
+		}
+
+		if q.stopping.Load() || live == 0 {
+			return nil
+		}
+
+		if err := q.drain(); err != nil {
+			return err
+		}
+
+		if !q.pollP {
+			if err := q.armPoll(); err != nil {
+				return err
+			}
+		}
+
+		if err := q.ring.submitAndWait(1); err != nil {
+			return err
+		}
+	}
+}
+
+func (q *queue) fetchAll() error {
+	for t := range q.depth {
+		if err := q.prepIO(uIOFetchReq, uint16(t), -1); err != nil {
+			return err
+		}
+	}
+
+	if err := q.armPoll(); err != nil {
+		return err
+	}
+
+	return q.ring.submitAndWait(0)
+}
+
+// drain resets the eventfd and commits finished handler results.
+func (q *queue) drain() error {
+	var b [8]byte
+
+	// EAGAIN just means nothing was signaled since the last drain.
+	if _, err := unix.Read(q.efd, b[:]); err != nil && !errors.Is(err, unix.EAGAIN) {
+		return fmt.Errorf("eventfd read: %w", err)
+	}
+
+	q.mu.Lock()
+	done := q.pending
+	q.pending = nil
+	q.mu.Unlock()
+
+	for _, c := range done {
+		if err := q.prepIO(uIOCommitAndFetchReq, c.tag, c.res); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// handle processes a request the kernel delivered for tag.
+func (q *queue) handle(tag uint16) error {
+	if int(tag) >= q.depth {
+		return fmt.Errorf("kernel returned out-of-range tag %d", tag)
+	}
+
+	d := q.descAt(tag)
+
+	action, res := dispatch(d.OpFlags)
+	if action == actionComplete {
+		return q.prepIO(uIOCommitAndFetchReq, tag, res)
+	}
+
+	n := int(d.NrSectors) << 9
+	if n > len(q.bufs[tag]) {
+		return q.prepIO(uIOCommitAndFetchReq, tag, -int32(syscall.EIO))
+	}
+
+	buf := q.bufs[tag][:n]
+	off := int64(d.StartSector) << 9 //nolint:gosec // sector counts fit in int64
+
+	q.dev.workers.Add(1)
+
+	go func() {
+		defer q.dev.workers.Done()
+
+		res, err := serveRead(q.dev.hctx, q.dev.handler, buf, off)
+		if err != nil && q.dev.hctx.Err() == nil {
+			q.dev.cfg.Logger.Debug("ublk read failed", "dev", q.dev.id, "queue", q.id, "off", off, "len", n, "err", err)
+		}
+
+		q.complete(tag, res)
+	}()
+
+	return nil
+}
