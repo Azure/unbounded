@@ -55,7 +55,7 @@ impl NativeNode {
         limits: &Limits,
     ) -> Result<()> {
         // Insufficient optional native capacity uses HTTP without inventing quota.
-        if buffer_count(limits) < 2 {
+        if buffer_count(limits) == 0 {
             return Ok(());
         }
         let workers: Vec<_> = workers.collect();
@@ -330,12 +330,13 @@ mod tests {
         assert_eq!(select(true).len(), 3);
         assert!(select(false).is_empty());
         // Budget funds every rail: all activate.
-        assert_eq!(funded_devices(6 * BUFFER_LEN, 3), 3);
+        // One receive buffer per device suffices.
+        assert_eq!(funded_devices(3 * BUFFER_LEN, 3), 3);
         assert_eq!(funded_devices(usize::MAX, 3), 3);
         // Budget funds only some rails: only those activate.
-        assert_eq!(funded_devices(4 * BUFFER_LEN, 3), 2);
-        assert_eq!(funded_devices(2 * BUFFER_LEN, 3), 1);
-        assert_eq!(funded_devices(BUFFER_LEN, 3), 0);
+        assert_eq!(funded_devices(3 * BUFFER_LEN - 1, 3), 2);
+        assert_eq!(funded_devices(BUFFER_LEN, 3), 1);
+        assert_eq!(funded_devices(BUFFER_LEN - 1, 3), 0);
     }
 
     #[test]
@@ -878,7 +879,7 @@ mod tests {
     }
 
     #[test]
-    fn native_worker_sizing_requires_two_node_wide_buffers() {
+    fn native_worker_sizing_requires_one_node_wide_buffer() {
         let mut config = default_config(true);
         config
             .scale_limits(four_pair_plan(&config).pairs.len())
@@ -896,7 +897,7 @@ mod tests {
             let mut plan = four_pair_plan(&config);
             let result = size_workers(&config.limits, &mut plan, true);
             assert_eq!(plan.pairs.len(), 5, "budget={budget}");
-            if expected < 2 {
+            if expected == 0 {
                 assert!(
                     matches!(result, Err(Error::InvalidConfiguration)),
                     "budget={budget}"

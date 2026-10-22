@@ -2599,7 +2599,7 @@ fn partition_limits_with_cause(
         ),
         (
             "registered_bytes",
-            rdma && native::buffer_count(&limits) < 2,
+            rdma && native::buffer_count(&limits) == 0,
         ),
         (
             "request_context_bytes",

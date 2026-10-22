@@ -49,9 +49,10 @@ pub fn buffer_count(registered_bytes: usize) -> usize {
 }
 
 /// RDMA devices a node-wide registered budget funds out of `devices`.
-/// Each device needs one send and one receive buffer at least.
+/// Page buffers only receive (sends read pages in place), so each device
+/// needs one buffer at least.
 pub fn funded_devices(registered_bytes: usize, devices: usize) -> usize {
-    (buffer_count(registered_bytes) / 2).min(devices)
+    buffer_count(registered_bytes).min(devices)
 }
 
 /// Truncate `publication` to the prefix a node-wide registered budget funds.
