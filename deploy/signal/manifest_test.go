@@ -62,6 +62,8 @@ func TestAdapterManifestIsGenericAndParticipantAware(t *testing.T) {
 		"participant-count",
 		"request-node-name",
 		"backend-resources",
+		"cleanup-failure",
+		"/outputs/cleanup-failure",
 		"backend-api-version",
 		"backend-kind",
 		"backend-active-deadline-seconds",

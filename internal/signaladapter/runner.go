@@ -174,9 +174,7 @@ func (r *Runner) Execute(ctx context.Context, config Config) (output AggregateOu
 	defer cancel()
 
 	if err := r.cleanup(cleanupContext, config.Namespace, created); err != nil {
-		output.ExecutionState = "Error"
-		output.Verdict = "Inconclusive"
-		output.Reason = "BackendCleanupFailed"
+		recordCleanupFailure(&output)
 
 		return output, nil
 	}
@@ -184,6 +182,16 @@ func (r *Runner) Execute(ctx context.Context, config Config) (output AggregateOu
 	created = nil
 
 	return output, nil
+}
+
+func recordCleanupFailure(output *AggregateOutput) {
+	output.ExecutionState = "Error"
+	output.Verdict = "Inconclusive"
+	output.CleanupFailure = "BackendCleanupFailed"
+
+	if output.Reason == "" || output.Reason == "AllParticipantsPassed" {
+		output.Reason = output.CleanupFailure
+	}
 }
 
 func runtimeStage(name string) *signalv1.RuntimeStage {

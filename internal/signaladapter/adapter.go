@@ -27,12 +27,13 @@ import (
 )
 
 const (
-	MaxParticipants       = 64
-	MaxReasonBytes        = 4 * 1024
-	MaxMeasurementsBytes  = 16 * 1024
-	MaxBackendOutputBytes = 16 * 1024
-	resultPrefix          = "PROJECT_SIGNAL_RESULT_V2 "
-	requiredTopologyKey   = "kueue.x-k8s.io/podset-required-topology"
+	MaxParticipants        = 64
+	MaxReasonBytes         = 4 * 1024
+	MaxMeasurementsBytes   = 16 * 1024
+	MaxBackendOutputBytes  = 16 * 1024
+	MaxCleanupFailureBytes = 64
+	resultPrefix           = "PROJECT_SIGNAL_RESULT_V2 "
+	requiredTopologyKey    = "kueue.x-k8s.io/podset-required-topology"
 )
 
 var runnerImagePattern = regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)
@@ -96,6 +97,7 @@ type AggregateOutput struct {
 	ExecutionState   string                              `json:"executionState"`
 	Verdict          string                              `json:"verdict"`
 	Reason           string                              `json:"reason"`
+	CleanupFailure   string                              `json:"cleanupFailure,omitempty"`
 	Measurements     string                              `json:"measurements"`
 	BackendResources []signalv1.BackendResourceReference `json:"-"`
 	BackendJSON      string                              `json:"backend-resources"`
@@ -490,6 +492,7 @@ func Aggregate(
 	ordered := make([]Result, participantCount)
 	seen := make([]bool, participantCount)
 	executionFailed := false
+	executionFailureReason := ""
 	diagnosticFailed := false
 	allPassed := true
 
@@ -525,6 +528,10 @@ func Aggregate(
 
 		if result.ExecutionState != "Succeeded" {
 			executionFailed = true
+
+			if executionFailureReason == "" {
+				executionFailureReason = result.Reason
+			}
 		}
 
 		if len(result.Measurements) > MaxMeasurementsBytes {
@@ -573,7 +580,7 @@ func Aggregate(
 	switch {
 	case executionFailed:
 		output.ExecutionState = "Error"
-		output.Reason = "ParticipantCoverageIncomplete"
+		output.Reason = executionFailureReason
 	case diagnosticFailed:
 		output.Verdict = "Fail"
 		output.Reason = "ParticipantCertificationFailed"
