@@ -262,7 +262,7 @@ func initializeNVIDIADevices(deps nvidiaDeviceInitDeps) error {
 
 func supportedNVIDIAHostDistro(distro string) bool {
 	switch distro {
-	case hostDistroUbuntu2404, hostDistroUbuntu2604, hostDistroAzureLinux3:
+	case hostDistroUbuntu2404, hostDistroAzureLinux3:
 		return true
 	default:
 		return false

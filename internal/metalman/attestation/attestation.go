@@ -24,15 +24,19 @@ import (
 	"strings"
 
 	"github.com/google/go-tpm/tpm2"
-	corev1 "k8s.io/api/core/v1"
+	authenticationv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/utils/ptr"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/internal/unbounded"
 )
 
 const (
+	BootstrapSAName = "metalman-bootstrap"
+
 	// maxRequestBodySize limits attestation request bodies to 1 MiB.
 	maxRequestBodySize = 1 << 20
 )
@@ -42,9 +46,8 @@ type Handler struct {
 	ClusterCA      []byte // PEM-encoded cluster CA certificate
 	LookupNodeByIP func(ctx context.Context, ip string) (*v1alpha3.Machine, error)
 	// LookupMachine takes precedence over LookupNodeByIP when set.
-	LookupMachine         func(r *http.Request) (*v1alpha3.Machine, error)
-	ResolveBootstrapToken func(ctx context.Context, machine *v1alpha3.Machine) (string, error)
-	StatusUpdater         StatusUpdater
+	LookupMachine func(r *http.Request) (*v1alpha3.Machine, error)
+	StatusUpdater StatusUpdater
 }
 
 // StatusUpdater updates the status subresource of a Machine.
@@ -271,9 +274,18 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 	binary.BigEndian.PutUint16(encryptedSecret[:2], uint16(len(encSecret)))
 	copy(encryptedSecret[2:], encSecret)
 
-	bootstrapToken, err := h.bootstrapToken(ctx, node)
+	// Create a short-lived bootstrap token.
+	tokenRequest := &authenticationv1.TokenRequest{
+		Spec: authenticationv1.TokenRequestSpec{
+			ExpirationSeconds: ptr.To(int64(3600)),
+		},
+	}
+
+	tokenResp, err := h.Clientset.CoreV1().ServiceAccounts(unbounded.SystemNamespace()).CreateToken(
+		ctx, BootstrapSAName, tokenRequest, metav1.CreateOptions{},
+	)
 	if err != nil {
-		log.Error("attest: resolving bootstrap token", "err", err)
+		log.Error("attest: creating SA token", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 
 		return
@@ -304,9 +316,9 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	encryptedToken := gcm.Seal(nil, gcmNonce, []byte(bootstrapToken), nil)
+	encryptedToken := gcm.Seal(nil, gcmNonce, []byte(tokenResp.Status.Token), nil)
 
-	tokenHash := sha256.Sum256([]byte(bootstrapToken))
+	tokenHash := sha256.Sum256([]byte(tokenResp.Status.Token))
 	log.Info("attest: issued encrypted bootstrap token", "tokenID", fmt.Sprintf("%x", tokenHash[:8]))
 
 	resp := AttestResponse{
@@ -322,46 +334,6 @@ func (h *Handler) Attest(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		log.Error("attest: writing response", "err", err)
 	}
-}
-
-func (h *Handler) bootstrapToken(ctx context.Context, machine *v1alpha3.Machine) (string, error) {
-	if h.ResolveBootstrapToken != nil {
-		return h.ResolveBootstrapToken(ctx, machine)
-	}
-
-	if h.Clientset == nil {
-		return "", fmt.Errorf("kubernetes client is required")
-	}
-
-	if machine.Spec.Kubernetes == nil || machine.Spec.Kubernetes.BootstrapTokenRef == nil {
-		return "", fmt.Errorf("machine %s spec.kubernetes.bootstrapTokenRef.name is required", machine.Name)
-	}
-
-	secretName := strings.TrimSpace(machine.Spec.Kubernetes.BootstrapTokenRef.Name)
-	if secretName == "" {
-		return "", fmt.Errorf("machine %s spec.kubernetes.bootstrapTokenRef.name is required", machine.Name)
-	}
-
-	secret, err := h.Clientset.CoreV1().Secrets(metav1.NamespaceSystem).Get(ctx, secretName, metav1.GetOptions{})
-	if err != nil {
-		return "", fmt.Errorf("get bootstrap token secret %s: %w", secretName, err)
-	}
-
-	if secret.Type != corev1.SecretTypeBootstrapToken {
-		return "", fmt.Errorf("secret %s has type %q, expected %q", secretName, secret.Type, corev1.SecretTypeBootstrapToken)
-	}
-
-	tokenID := strings.TrimSpace(string(secret.Data["token-id"]))
-	if tokenID == "" {
-		return "", fmt.Errorf("secret %s has no token-id", secretName)
-	}
-
-	tokenSecret := strings.TrimSpace(string(secret.Data["token-secret"]))
-	if tokenSecret == "" {
-		return "", fmt.Errorf("secret %s has no token-secret", secretName)
-	}
-
-	return tokenID + "." + tokenSecret, nil
 }
 
 // publicKeysEqual compares two crypto.PublicKey values structurally.

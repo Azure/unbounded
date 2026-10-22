@@ -195,27 +195,6 @@ func TestHTTPServer_ServeFiles(t *testing.T) {
 	}
 }
 
-func TestArtifactResponseWriterTracksTransfer(t *testing.T) {
-	recorder := httptest.NewRecorder()
-	writer := &artifactResponseWriter{ResponseWriter: recorder}
-
-	writer.Header().Set("Content-Length", "7")
-	writer.WriteHeader(http.StatusPartialContent)
-
-	n, err := writer.Write([]byte("payload"))
-	require.NoError(t, err)
-	require.Equal(t, 7, n)
-	require.Equal(t, int64(7), writer.bytes)
-	require.Equal(t, http.StatusPartialContent, writer.transferStatus())
-	require.NoError(t, writer.writeErr)
-}
-
-func TestArtifactTransferTimeout(t *testing.T) {
-	require.Equal(t, 30*time.Minute, artifactTransferTimeout("disk.img.gz"))
-	require.Equal(t, 5*time.Minute, artifactTransferTimeout("vmlinuz"))
-	require.Equal(t, 5*time.Minute, artifactTransferTimeout("initrd"))
-}
-
 func TestHTTPServer_HTTPBootLoaderRequiresActiveInstallOperation(t *testing.T) {
 	cache := setupOCICache(t, "ghcr.io/test/image:v1", "httpboot123", map[string][]byte{
 		"metadata.yaml": []byte("dhcpBootImageName: shimx64.efi\nhttpBootPath: shimx64.efi\n"),

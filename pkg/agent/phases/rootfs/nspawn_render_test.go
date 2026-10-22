@@ -351,7 +351,8 @@ func TestServiceOverride_NVIDIAReconcilesOnEveryStart(t *testing.T) {
 
 	var buf bytes.Buffer
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&buf, "service-override.conf", data))
-	require.Contains(t, buf.String(), "ExecStartPost=-/opt/unbounded/agent/bin/unbounded-agent-nspawn-lifecycle nspawn-lifecycle post-start kube1")
+	require.Contains(t, buf.String(), "ExecStartPost=/opt/unbounded/agent/bin/unbounded-agent-nspawn-lifecycle nspawn-lifecycle post-start kube1")
+	require.NotContains(t, buf.String(), "ExecStartPost=-")
 	require.NotContains(t, buf.String(), "if [ ! -x")
 }
 

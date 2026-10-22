@@ -21,13 +21,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/google/go-tpm/tpm2"
 	"github.com/stretchr/testify/require"
+	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	clienttesting "k8s.io/client-go/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakecr "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -169,105 +172,26 @@ func testHandler(t *testing.T, objects ...client.Object) *Handler {
 	ns := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{Name: unbounded.SystemNamespace()},
 	}
-	clientset := fake.NewClientset(ns)
+	sa := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "metalman-bootstrap",
+			Namespace: unbounded.SystemNamespace(),
+		},
+	}
+	clientset := fake.NewClientset(ns, sa)
+	clientset.PrependReactor("create", "serviceaccounts/token", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		return true, &authenticationv1.TokenRequest{
+			Status: authenticationv1.TokenRequestStatus{
+				Token:               "fake-bootstrap-token-for-testing",
+				ExpirationTimestamp: metav1.NewTime(time.Now().Add(time.Hour)),
+			},
+		}, nil
+	})
 
 	return &Handler{
 		Clientset:      clientset,
 		LookupNodeByIP: testLookupByIP(crClient),
-		ResolveBootstrapToken: func(context.Context, *v1alpha3.Machine) (string, error) {
-			return "fake-bootstrap-token-for-testing", nil
-		},
-		StatusUpdater: &testStatusUpdater{client: crClient},
-	}
-}
-
-func TestBootstrapTokenUsesMachineSecret(t *testing.T) {
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "bootstrap-token-test", Namespace: metav1.NamespaceSystem},
-		Type:       corev1.SecretTypeBootstrapToken,
-		Data: map[string][]byte{
-			"token-id":     []byte("abc123"),
-			"token-secret": []byte("0123456789abcdef"),
-		},
-	}
-	handler := &Handler{Clientset: fake.NewClientset(secret)}
-	machine := &v1alpha3.Machine{
-		ObjectMeta: metav1.ObjectMeta{Name: "machine-1"},
-		Spec: v1alpha3.MachineSpec{Kubernetes: &v1alpha3.KubernetesSpec{
-			BootstrapTokenRef: &v1alpha3.LocalObjectReference{Name: secret.Name},
-		}},
-	}
-
-	token, err := handler.bootstrapToken(t.Context(), machine)
-	require.NoError(t, err)
-	require.Equal(t, "abc123.0123456789abcdef", token)
-}
-
-func TestBootstrapTokenRequiresMachineReference(t *testing.T) {
-	handler := &Handler{Clientset: fake.NewClientset()}
-	machine := &v1alpha3.Machine{ObjectMeta: metav1.ObjectMeta{Name: "machine-1"}}
-
-	_, err := handler.bootstrapToken(t.Context(), machine)
-	require.ErrorContains(t, err, "spec.kubernetes.bootstrapTokenRef.name is required")
-}
-
-func TestBootstrapTokenRejectsWrongSecretType(t *testing.T) {
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "bootstrap-token-test", Namespace: metav1.NamespaceSystem},
-		Type:       corev1.SecretTypeOpaque,
-	}
-	handler := &Handler{Clientset: fake.NewClientset(secret)}
-	machine := &v1alpha3.Machine{
-		ObjectMeta: metav1.ObjectMeta{Name: "machine-1"},
-		Spec: v1alpha3.MachineSpec{Kubernetes: &v1alpha3.KubernetesSpec{
-			BootstrapTokenRef: &v1alpha3.LocalObjectReference{Name: secret.Name},
-		}},
-	}
-
-	_, err := handler.bootstrapToken(t.Context(), machine)
-	require.ErrorContains(t, err, "expected \"bootstrap.kubernetes.io/token\"")
-}
-
-func TestBootstrapTokenRequiresTokenFields(t *testing.T) {
-	tests := []struct {
-		name      string
-		data      map[string][]byte
-		wantError string
-	}{
-		{
-			name: "missing token ID",
-			data: map[string][]byte{
-				"token-secret": []byte("0123456789abcdef"),
-			},
-			wantError: "has no token-id",
-		},
-		{
-			name: "missing token secret",
-			data: map[string][]byte{
-				"token-id": []byte("abc123"),
-			},
-			wantError: "has no token-secret",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			secret := &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Name: "bootstrap-token-test", Namespace: metav1.NamespaceSystem},
-				Type:       corev1.SecretTypeBootstrapToken,
-				Data:       tt.data,
-			}
-			handler := &Handler{Clientset: fake.NewClientset(secret)}
-			machine := &v1alpha3.Machine{
-				ObjectMeta: metav1.ObjectMeta{Name: "machine-1"},
-				Spec: v1alpha3.MachineSpec{Kubernetes: &v1alpha3.KubernetesSpec{
-					BootstrapTokenRef: &v1alpha3.LocalObjectReference{Name: secret.Name},
-				}},
-			}
-
-			_, err := handler.bootstrapToken(t.Context(), machine)
-			require.ErrorContains(t, err, tt.wantError)
-		})
+		StatusUpdater:  &testStatusUpdater{client: crClient},
 	}
 }
 

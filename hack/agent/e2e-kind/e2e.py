@@ -5602,8 +5602,7 @@ def _daemon_unit_runs(binary_dir: str) -> None:
         "/etc/systemd/system/systemd-nspawn@*.service.d/override.conf'")
     for want in (f"ExecStart={binary_dir}/unbounded-agent-current daemon",
                  f"ExecStart={binary_dir}/unbounded-agent-daemon-recovery.sh",
-                 f"ExecStartPost=-{binary_dir}/unbounded-agent-nspawn-lifecycle "
-                 "nspawn-lifecycle post-start"):
+                 f"={binary_dir}/unbounded-agent-nspawn-lifecycle nspawn-lifecycle post-start"):
         if want not in units:
             die(f"the agent's units do not run {want!r}:\n{units}")
 

@@ -5,10 +5,8 @@ package nodestart
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
-	"time"
 
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -36,7 +34,7 @@ func ReconcileNVIDIA(log *slog.Logger, goalState *goalstates.NodeStart) phases.T
 
 func (r *reconcileNVIDIA) Name() string { return "reconcile-nvidia" }
 
-func (r *reconcileNVIDIA) Do(ctx context.Context) (retErr error) {
+func (r *reconcileNVIDIA) Do(ctx context.Context) error {
 	if !r.goalState.Nvidia.Required {
 		r.log.Info("no NVIDIA devices discovered; skipping NVIDIA rewiring", "machine", r.goalState.MachineName)
 
@@ -46,19 +44,6 @@ func (r *reconcileNVIDIA) Do(ctx context.Context) (retErr error) {
 	if err := r.stopService(ctx, goalstates.SystemdUnitKubelet); err != nil {
 		return err
 	}
-
-	defer func() {
-		if retErr == nil {
-			return
-		}
-
-		restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
-		defer cancel()
-
-		if err := r.restoreServices(restoreCtx); err != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("restore node services after NVIDIA reconciliation failure: %w", err))
-		}
-	}()
 
 	if err := r.stopService(ctx, goalstates.SystemdUnitContainerd); err != nil {
 		return err
@@ -76,21 +61,6 @@ func (r *reconcileNVIDIA) Do(ctx context.Context) (retErr error) {
 	}
 
 	return nil
-}
-
-func (r *reconcileNVIDIA) restoreServices(ctx context.Context) error {
-	var restoreErr error
-
-	for _, task := range []phases.Task{
-		StartContainerd(r.log, r.goalState),
-		StartKubelet(r.log, r.goalState),
-	} {
-		if err := r.execute(ctx, r.log, task); err != nil {
-			restoreErr = errors.Join(restoreErr, fmt.Errorf("%s: %w", task.Name(), err))
-		}
-	}
-
-	return restoreErr
 }
 
 func (r *reconcileNVIDIA) stopService(ctx context.Context, service string) error {

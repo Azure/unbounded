@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 
@@ -100,58 +99,6 @@ func TestCheckNvidiaDriverAvailable(t *testing.T) {
 	assert.Contains(t, results[0].Message, "NVIDIA driver stack is available")
 }
 
-func TestCheckNvidiaDriverRefreshesNodesAfterHealthQuery(t *testing.T) {
-	t.Parallel()
-
-	env := newNvidiaPreflightTestEnv(t)
-	env.addNvidiaPCI("0001:00:00.0", "../../../bus/pci/drivers/nvidia")
-
-	for _, module := range nvidiaRequiredModules {
-		env.mkdir(filepath.Join(env.moduleDir, module))
-	}
-
-	for _, name := range []string{"nvidiactl", "nvidia0"} {
-		env.touch(filepath.Join(env.devDir, name))
-	}
-
-	libDir := filepath.Join(env.root, "lib", "x86_64-linux-gnu")
-	env.mkdir(libDir)
-
-	cuda := filepath.Join(libDir, "libcuda.so.1")
-	nvml := filepath.Join(libDir, "libnvidia-ml.so.1")
-
-	env.touch(cuda)
-	env.touch(nvml)
-
-	env.outputs["ldconfig"] = []byte(fmt.Sprintf(
-		"\tlibcuda.so.1 (libc6,%s) => %s\n\tlibnvidia-ml.so.1 (libc6,%s) => %s\n",
-		nvidiaLdconfigArchTag(),
-		cuda,
-		nvidiaLdconfigArchTag(),
-		nvml,
-	))
-	env.outputs["modinfo"] = []byte("580.167.08\n")
-	env.outputs["nvidia-smi"] = []byte("GPU 0: NVIDIA GB200\n")
-	env.paths["ldconfig"] = true
-	env.paths["modinfo"] = true
-	env.paths["nvidia-smi"] = true
-	env.beforeCommand = func(name string, args ...string) {
-		if name != "nvidia-smi" || !slices.Equal(args, []string{"-L"}) {
-			return
-		}
-
-		env.touch(filepath.Join(env.devDir, "nvidia-uvm"))
-		env.touch(filepath.Join(env.devDir, "nvidia-uvm-tools"))
-	}
-
-	results := checkNvidiaDriver(slog.New(slog.DiscardHandler), env.deps()).Check(context.Background())
-
-	for _, result := range results {
-		assert.NotContains(t, result.Message, "required NVIDIA device nodes are missing")
-		assert.NotContains(t, result.Message, "NVIDIA UVM tools device node is missing")
-	}
-}
-
 func assertHasNvidiaResult(t *testing.T, results []preflight.Result, severity preflight.Severity, target, message string) {
 	t.Helper()
 
@@ -165,13 +112,12 @@ func assertHasNvidiaResult(t *testing.T, results []preflight.Result, severity pr
 }
 
 type nvidiaPreflightTestEnv struct {
-	root          string
-	pciDir        string
-	devDir        string
-	moduleDir     string
-	paths         map[string]bool
-	outputs       map[string][]byte
-	beforeCommand func(string, ...string)
+	root      string
+	pciDir    string
+	devDir    string
+	moduleDir string
+	paths     map[string]bool
+	outputs   map[string][]byte
 }
 
 func newNvidiaPreflightTestEnv(t *testing.T) *nvidiaPreflightTestEnv {
@@ -210,10 +156,6 @@ func (e *nvidiaPreflightTestEnv) deps() nvidiaDriverDeps {
 			return "", errors.New("not found")
 		},
 		outputCmd: func(_ context.Context, name string, args ...string) ([]byte, error) {
-			if e.beforeCommand != nil {
-				e.beforeCommand(filepath.Base(name), args...)
-			}
-
 			key := strings.Join(append([]string{filepath.Base(name)}, args...), " ")
 			if out, ok := e.outputs[key]; ok {
 				return out, nil

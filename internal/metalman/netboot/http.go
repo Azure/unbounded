@@ -13,9 +13,7 @@ import (
 	"net"
 	"net/http"
 	"path"
-	"strconv"
 	"strings"
-	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -41,51 +39,6 @@ type HTTPServer struct {
 	FileResolver
 	StatusRecorder StatusRecorder
 	Media          *MediaProvider
-}
-
-type artifactResponseWriter struct {
-	http.ResponseWriter
-	bytes      int64
-	statusCode int
-	writeErr   error
-}
-
-func (w *artifactResponseWriter) WriteHeader(statusCode int) {
-	if w.statusCode == 0 {
-		w.statusCode = statusCode
-	}
-
-	w.ResponseWriter.WriteHeader(statusCode)
-}
-
-func (w *artifactResponseWriter) Write(p []byte) (int, error) {
-	if w.statusCode == 0 {
-		w.statusCode = http.StatusOK
-	}
-
-	n, err := w.ResponseWriter.Write(p)
-	w.bytes += int64(n)
-	if err != nil && w.writeErr == nil {
-		w.writeErr = err
-	}
-
-	return n, err
-}
-
-func (w *artifactResponseWriter) transferStatus() int {
-	if w.statusCode == 0 {
-		return http.StatusOK
-	}
-
-	return w.statusCode
-}
-
-func artifactTransferTimeout(path string) time.Duration {
-	if path == "disk.img.gz" {
-		return 30 * time.Minute
-	}
-
-	return 5 * time.Minute
 }
 
 type StatusRecorder interface {
@@ -223,34 +176,12 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 
 				log.Info("serving boot media artifact", "ref", ref, "range", r.Header.Get("Range"))
 
-				transfer := &artifactResponseWriter{ResponseWriter: w}
-				startedAt := time.Now()
-				timeout := artifactTransferTimeout(path)
-				deadlineSet := http.NewResponseController(w).SetWriteDeadline(startedAt.Add(timeout)) == nil
-				defer func() {
-					contentLength, err := strconv.ParseInt(transfer.Header().Get("Content-Length"), 10, 64)
-					if err != nil {
-						contentLength = -1
-					}
-					log.Info(
-						"boot media artifact transfer complete",
-						"status", transfer.transferStatus(),
-						"bytes", transfer.bytes,
-						"contentLength", contentLength,
-						"complete", contentLength >= 0 && transfer.bytes == contentLength,
-						"duration", time.Since(startedAt),
-						"timeout", timeout,
-						"deadlineSet", deadlineSet,
-						"writeError", transfer.writeErr,
-					)
-				}()
-
 				if resolved.DiskPath != "" {
 					// GRUB's gzip arm64 kernel loader needs HTTP Range support.
 					// ServeFile preserves it for hybrid ISO boots.
-					http.ServeFile(transfer, r, resolved.DiskPath)
+					http.ServeFile(w, r, resolved.DiskPath)
 				} else {
-					transfer.Write(resolved.Data) //nolint:errcheck // Logged by the transfer recorder.
+					w.Write(resolved.Data) //nolint:errcheck // Best-effort response.
 				}
 
 				return
