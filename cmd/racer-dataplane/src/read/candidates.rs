@@ -3150,7 +3150,6 @@ pub(super) mod tests {
                 Transfers::new(
                     http,
                     io,
-                    None,
                     admission.clone(),
                     Rc::new(SecurityCodec::new(admission.clone(), buffers)),
                     signatures.clone(),

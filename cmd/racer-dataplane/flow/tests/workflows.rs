@@ -590,7 +590,10 @@ mod quota_tests {
     #[test]
     fn full_recycler_and_stopped_recycler_do_not_consume_charge() {
         let size = 1 << 20;
-        let quotas = Quotas::new(TestPolicy::new(10 * size, 1));
+        // Full depth needs a warmed demand target and a class limit of twice
+        // the retained bytes.
+        let quotas = Quotas::new(TestPolicy::new(16 * size, 1))
+            .with_buffer_demand(flow_control::PoolDemand::new().with_target(8));
         for _ in 0..8 {
             let mut retained = quotas.reserve(None, Resource::Silent, size).unwrap();
             retained.recycle(vec![0xa7; size]);

@@ -28,7 +28,7 @@ use std::{
 };
 use uring_runtime::{
     Budget, Operation, Scope,
-    reactor::{Reactor, descriptor::Descriptor},
+    reactor::{Reactor, SharedWriteBuffer, descriptor::Descriptor},
 };
 
 /// One logical segment's range on a caller-opened device.
@@ -224,8 +224,29 @@ impl<C: Charge> Slab<C> {
 
     /// Release only idle memory, returning its size without touching live I/O.
     pub fn reclaim_idle(&self) -> usize {
-        let idle = std::mem::take(&mut self.idle_buffer.borrow_mut().entries);
+        let idle = self.idle_buffer.borrow_mut().take_all();
         idle.iter().map(|b| b.allocation().layout.size()).sum()
+    }
+
+    /// Run demand maintenance at `now`, freeing idle entries the controller
+    /// releases oldest first. Returns released bytes; O(1) between windows.
+    pub fn maintain_idle(&self, now: std::time::Instant) -> usize {
+        let Ok(mut pool) = self.idle_buffer.try_borrow_mut() else {
+            return 0;
+        };
+        let released = pool.maintain(now);
+        drop(pool);
+        released.iter().map(|b| b.allocation().layout.size()).sum()
+    }
+
+    /// Hold the idle pool at its minimum depth and refuse returns while constrained.
+    pub fn constrain_idle(&self, constrained: bool) {
+        self.idle_buffer.borrow_mut().set_constrained(constrained);
+    }
+
+    /// Current idle pool size, target, and cumulative counters.
+    pub fn idle_pool_stats(&self) -> crate::PoolStats {
+        self.idle_buffer.borrow().stats()
     }
 
     /// Wait for accepted writes to release their runtime completion fences.
@@ -492,10 +513,24 @@ impl<C: Charge> Slab<C> {
         buffer: &AlignedBuffer<C>,
         lease: &SegmentLease,
     ) -> Result<(Rc<Descriptor>, Extent)> {
+        self.locate(extent, lease, |alignment, extent| {
+            alignment.check(extent, buffer)
+        })
+    }
+
+    /// Validate a request's lease and extent, resolving its physical destination.
+    /// `check` validates the transfer memory against both the logical and the
+    /// physical extent with the slab's alignment.
+    fn locate(
+        &self,
+        extent: Extent,
+        lease: &SegmentLease,
+        check: impl Fn(Alignment, Extent) -> Result<()>,
+    ) -> Result<(Rc<Descriptor>, Extent)> {
         let opened = self.opened.borrow();
         let slab = opened.as_ref().ok_or(Error::Unavailable)?;
         let table = slab.table.as_ref().ok_or(Error::Unavailable)?;
-        slab.geometry.alignment().check(extent, buffer)?;
+        check(slab.geometry.alignment(), extent)?;
         if !table.matches(&lease.table_identity()) {
             return Err(Error::Stale);
         }
@@ -547,7 +582,7 @@ impl<C: Charge> Slab<C> {
                 {
                     return Err(Error::Corrupt);
                 }
-                slab.geometry.alignment().check(physical, buffer)?;
+                check(slab.geometry.alignment(), physical)?;
                 Ok((placement.file.clone(), physical))
             }
         }
@@ -617,6 +652,45 @@ impl<C: Charge> Slab<C> {
         })
     }
 
+    /// Write one checked extent from an exclusive header and a shared body.
+    ///
+    /// The extent receives `header || body` in a single positioned vectored
+    /// write. Both regions must start on the memory alignment unit and have
+    /// lengths that are multiples of the length unit, and their lengths must
+    /// sum to the extent length. Fencing, lease ownership, and the caller
+    /// obligations match [`Self::write`]. A short or failed completion is an
+    /// error and drops both owners after completion; success returns them.
+    pub fn write_vectored<'a, S: Scope, B: Budget, T: SharedWriteBuffer>(
+        &'a self,
+        reactor: &'a Reactor<S, B>,
+        extent: Extent,
+        header: AlignedBuffer<C>,
+        body: T,
+        lease: SegmentLease,
+        scope: &'a S,
+    ) -> Operation<'a, (AlignedBuffer<C>, T), S::Error>
+    where
+        S::Error: From<Error> + From<T::Error>,
+    {
+        Box::pin(async move {
+            let (file, extent) = {
+                let body = body.write_bytes()?;
+                let header = header.as_slice();
+                self.locate(extent, &lease, |alignment, extent| {
+                    check_vectored(alignment, extent, header, body)
+                })?
+            };
+            let fence = self.writes.acquire()?;
+            let completion = reactor
+                .write_vectored_at(file, extent.offset(), header, body, (lease, fence), scope)
+                .await?;
+            if completion.bytes != extent.length() {
+                return Err(Error::Io.into());
+            }
+            Ok((completion.header, completion.body))
+        })
+    }
+
     /// Reuse charged capacity in the same size class without discarding mismatches.
     pub fn allocate(&self, length: usize, charge: C) -> Result<AlignedBuffer<C>> {
         let alignment = self.alignment()?;
@@ -668,6 +742,23 @@ impl<C: Charge> Slab<C> {
         *current = Rc::new(file);
         Ok(())
     }
+}
+
+/// Check that two regions can form one direct-I/O transfer for `extent`.
+fn check_vectored(alignment: Alignment, extent: Extent, header: &[u8], body: &[u8]) -> Result<()> {
+    let aligned = |region: &[u8]| {
+        (region.as_ptr() as usize).is_multiple_of(alignment.memory())
+            && region.len().is_multiple_of(alignment.length())
+    };
+    if !aligned(header)
+        || !aligned(body)
+        || !extent.offset().is_multiple_of(alignment.offset())
+        || !extent.length().is_multiple_of(alignment.length())
+        || header.len().checked_add(body.len()) != Some(extent.length())
+    {
+        return Err(Error::InvalidConfiguration);
+    }
+    Ok(())
 }
 
 /// Backing and geometry own their binding; a closed slab cannot retain authority.
@@ -1007,6 +1098,31 @@ fn open_private_file(path: &Path) -> Result<File> {
 mod tests {
     use super::*;
     use crate::{Generation, SegmentId};
+
+    /// Vectored layout accepts only aligned regions that exactly fill the extent.
+    #[test]
+    fn vectored_layout_rules() {
+        let alignment = Alignment::new(512, 512, 512).unwrap();
+        let storage = alignment.allocate(4096, ()).unwrap();
+        let bytes = storage.as_slice();
+        let extent = Extent::new(4096, 2048).unwrap();
+        let ok = |h: &[u8], b: &[u8], e| check_vectored(alignment, e, h, b).is_ok();
+        assert!(ok(&bytes[..512], &bytes[512..2048], extent));
+        assert!(ok(&bytes[..0], &bytes[..2048], extent));
+        // Header length, header pointer, body length, body pointer.
+        assert!(!ok(&bytes[..100], &bytes[512..2460], extent));
+        assert!(!ok(&bytes[1..513], &bytes[512..2048], extent));
+        assert!(!ok(&bytes[..512], &bytes[512..2000], extent));
+        assert!(!ok(&bytes[..512], &bytes[513..2049], extent));
+        // Sum mismatch and unaligned extent offset.
+        assert!(!ok(&bytes[..512], &bytes[512..1024], extent));
+        let shifted = Extent::new(4097, 2048).unwrap();
+        assert!(!ok(&bytes[..512], &bytes[512..2048], shifted));
+        assert_eq!(
+            check_vectored(alignment, extent, &bytes[..512], &bytes[..512]),
+            Err(Error::InvalidConfiguration)
+        );
+    }
 
     /// Counts retained bytes independently of buffer pooling.
     struct CountingCharge {

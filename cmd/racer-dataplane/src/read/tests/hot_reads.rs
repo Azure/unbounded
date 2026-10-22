@@ -1262,7 +1262,6 @@ fn production_range_windows(old_provider: bool) -> Vec<Rc<LinkStats>> {
             let transfers = Rc::new(crate::peer::transport::Transfers::new(
                 Rc::new(crate::http::new_pool(reactor, admission.clone(), 4)),
                 io,
-                None,
                 admission,
                 codec,
                 signers[i].clone(),

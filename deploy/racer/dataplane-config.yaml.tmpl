@@ -50,6 +50,15 @@ data:
   # and registered 96 MiB (native RDMA only) per worker. Setting a key below
   # makes it an authoritative node-wide value that is divided across workers;
   # startup fails if it cannot fund at least half of the planned I/O workers.
+  # Each worker needs roughly 115 MiB of these byte budgets at minimum
+  # (plaintext and ciphertext about 48 MiB each, dirty 16 MiB, plus request
+  # context) with the default range window of two pages.
+  # Budgets are admission ceilings, not reservations: resident memory grows
+  # toward them under load. Unset defaults therefore scale with core count.
+  # To bound memory, cap total threads with RACER_MAX_THREADS, or set
+  # RACER_IO_WORKERS with RACER_CRYPTO_HELPERS, or set explicit node-wide
+  # values below. RACER_METADATA_ENTRIES above is set explicitly, so it is a
+  # node-wide total, not the per-worker default of 4096.
   # RACER_PLAINTEXT_BYTES: "268435456"
   # RACER_CIPHERTEXT_BYTES: "268435456"
   # RACER_DIRTY_BYTES: "134217728"
@@ -68,7 +77,8 @@ data:
   # Charge one whole segment per page to protect hard holds under fragmentation.
   # Existing local copies are not rewritten. Free-segment reserves still apply.
   RACER_RETAINED_SEGMENT_PERCENT: "50"
-  # File slab size is per worker; byte admission budgets above are node-wide.
+  # File slab size is per worker. Byte admission budgets above are node-wide
+  # only when set explicitly; unset ones are per-worker defaults scaled up.
   # Optional Node annotation racer.unbounded-cloud.io/block-devices selects raw
   # devices by regex on /host/dev/disk/by-id basenames. Use ^ and $ anchors.
   # The 1 KiB selector must compile in Go and Rust. Invalid/no usable matches

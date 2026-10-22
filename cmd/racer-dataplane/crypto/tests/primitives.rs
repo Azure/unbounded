@@ -1,6 +1,8 @@
 //! Public-API workflows, standard vectors, rejection checks, and CRC reference tests.
 
-use racer_crypto::{SigningKey, TAG_LEN, VerifyingKey, crc64, ct_eq, hmac_sha256, open, seal};
+use racer_crypto::{
+    SigningKey, TAG_LEN, VerifyingKey, copy_prefix_crc64, crc64, ct_eq, hmac_sha256, open, seal,
+};
 
 /// The identity module keeps its public types and classified errors beside primitives.
 #[test]
@@ -74,7 +76,7 @@ fn exchange_records_with_reusable_caller_buffers() {
         assert_eq!(&send[..3], &previous_send[..3]);
         assert_eq!(&send[sealed_end..], &previous_send[sealed_end..]);
 
-        // A rejected record must not destroy an earlier result in reused output.
+        // A rejected record zeroes only its selected output slice.
         assert!(
             open(
                 &key,
@@ -85,7 +87,9 @@ fn exchange_records_with_reusable_caller_buffers() {
             )
             .is_err()
         );
-        assert_eq!(receive, previous_receive);
+        assert!(receive[5..opened_end].iter().all(|byte| *byte == 0));
+        assert_eq!(&receive[..5], &previous_receive[..5]);
+        assert_eq!(&receive[opened_end..], &previous_receive[opened_end..]);
 
         // Retry the original record into that same buffer without resetting it.
         let transmitted = send;
@@ -211,7 +215,7 @@ fn xaes_all_nonce_bytes_and_cross_cipher_rejection() {
         nonce[i] ^= 1;
         let mut out = [0xa5; 5];
         assert!(open(&[7; 32], &nonce, b"aad", &ciphertext, &mut out).is_err());
-        assert_eq!(out, [0xa5; 5]);
+        assert_eq!(out, [0; 5]);
         let mut changed = [0; 21];
         seal(&[7; 32], &nonce, b"aad", b"hello", &mut changed).unwrap();
         assert_ne!(changed, ciphertext);
@@ -220,7 +224,7 @@ fn xaes_all_nonce_bytes_and_cross_cipher_rejection() {
     racer_crypto::seal_credentials(&[7; 32], &[2; 24], b"aad", b"hello", &mut old).unwrap();
     let mut out = [0xa5; 5];
     assert!(open(&[7; 32], &[2; 24], b"aad", &old, &mut out).is_err());
-    assert_eq!(out, [0xa5; 5]);
+    assert_eq!(out, [0; 5]);
 }
 
 /// Round-trip empty and boundary-sized messages and reject their modified tags.
@@ -240,14 +244,14 @@ fn aead_empty_and_block_boundaries() {
             sealed[length] ^= 1;
             opened.fill(0xa5);
             assert!(open(&[7; 32], &[2; 24], aad, &sealed, &mut opened).is_err());
-            assert_eq!(opened, vec![0xa5; length]);
+            assert_eq!(opened, vec![0; length]);
         }
     }
 }
 
-/// Reject changes to ciphertext, tag, key, nonce, or AAD without touching output.
+/// Reject changes to ciphertext, tag, key, nonce, or AAD and zero the output.
 #[test]
-fn aead_tampering_never_writes_output() {
+fn aead_tampering_zeroes_output() {
     let plaintext = b"immutable input and output on authentication failure";
     let key = [7; 32];
     let nonce = [2; 24];
@@ -269,7 +273,7 @@ fn aead_tampering_never_writes_output() {
         let retained = input.clone();
         let mut output = vec![0xa5; plaintext.len()];
         assert!(open(&key, &nonce, &aad, &input, &mut output).is_err());
-        assert_eq!(output, vec![0xa5; plaintext.len()], "fault={fault}");
+        assert_eq!(output, vec![0; plaintext.len()], "fault={fault}");
         assert_eq!(input, retained, "fault={fault}");
     }
 }
@@ -603,6 +607,31 @@ fn random_bytes(length: usize) -> Vec<u8> {
         .collect()
 }
 
+/// Fused copy and checksum copies exactly the prefix and sums all of the input,
+/// across chunk boundaries, empty prefixes, and tails.
+#[test]
+fn copy_prefix_crc64_copies_prefix_and_sums_whole_input() {
+    let chunk = 128 * 1024;
+    for (length, prefix) in [
+        (0, 0),
+        (19, 0),
+        (19, 3),
+        (19, 19),
+        (chunk - 1, chunk - 17),
+        (chunk + TAG_LEN, chunk),
+        (3 * chunk + 5 + TAG_LEN, 3 * chunk + 5),
+    ] {
+        let input = random_bytes(length);
+        let mut out = vec![0xa5; prefix];
+        let checksum = copy_prefix_crc64(&input, &mut out).unwrap();
+        assert_eq!(checksum, crc64(&input), "length={length} prefix={prefix}");
+        assert_eq!(out, input[..prefix], "length={length} prefix={prefix}");
+    }
+    let mut long = vec![0xa5; 20];
+    assert!(copy_prefix_crc64(&[1; 19], &mut long).is_err());
+    assert!(long.iter().all(|byte| *byte == 0xa5));
+}
+
 /// Require dispatched and table-based CRC implementations to match the oracle.
 fn assert_equivalent(bytes: &[u8]) {
     let expected = reference(bytes);
@@ -885,7 +914,7 @@ mod identity_workflows {
                 page.open_page(&cache, page.id(), &nonce, b"aad", &actual, &mut out),
                 Err(Error::CorruptRecord),
             );
-            assert_eq!(&out, b"abc");
+            assert_eq!(out, [0; 3]);
         }
     }
 
@@ -933,7 +962,32 @@ mod identity_workflows {
             page.open_page(&cache, page.id(), &[1; 24], b"bad", &sealed, &mut out),
             Err(Error::CorruptRecord)
         );
-        assert_eq!(out, [42; 3]);
+        assert_eq!(out, [0; 3]);
+
+        // In-place open takes the body already copied out and the tag apart.
+        let (body, tag) = sealed.split_at(3);
+        let mut inout = [0; 3];
+        inout.copy_from_slice(body);
+        page.open_page_in_place(&cache, page.id(), &[1; 24], b"aad", &mut inout, tag)
+            .unwrap();
+        assert_eq!(&inout, b"abc");
+        inout.copy_from_slice(body);
+        assert_eq!(
+            page.open_page_in_place(&cache, credentials.id(), &[1; 24], b"aad", &mut inout, tag),
+            Err(Error::MissingKey)
+        );
+        assert_eq!(inout, body);
+        assert_eq!(
+            page.open_page_in_place(&cache, page.id(), &[1; 24], b"bad", &mut inout, tag),
+            Err(Error::CorruptRecord)
+        );
+        assert_eq!(inout, [0; 3]);
+        inout.copy_from_slice(body);
+        assert_eq!(
+            page.open_page_in_place(&cache, page.id(), &[1; 24], b"aad", &mut inout, &tag[1..]),
+            Err(Error::CorruptRecord)
+        );
+        assert_eq!(inout, [0; 3]);
         let original = sealed;
         assert_eq!(
             credentials.seal_page(&cache, &[1; 24], b"aad", b"abc", &mut sealed),
@@ -1203,4 +1257,94 @@ mod identity_workflows {
         let cert = params.signed_by(&key, &ca, &ca_key).unwrap();
         (pending, vec![cert.der().to_vec()], vec![ca.der().to_vec()])
     }
+}
+
+/// Deterministic xorshift filler so oracle tests are reproducible.
+fn fill_random(state: &mut u64, bytes: &mut [u8]) {
+    for byte in bytes {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *byte = *state as u8;
+    }
+}
+
+/// The ring-backed page cipher is byte-identical to the RustCrypto XAES oracle.
+#[test]
+fn xaes_matches_reference_oracle_in_both_directions() {
+    use xaes_256_gcm::{
+        Xaes256Gcm,
+        aead::{AeadInOut, KeyInit, inout::InOutBuf},
+    };
+    let mut state = 0x9e37_79b9_7f4a_7c15;
+    for (round, length) in [0, 1, 15, 16, 17, 4095, (1 << 20) + 3]
+        .into_iter()
+        .enumerate()
+    {
+        let mut key = [0; 32];
+        let mut nonce = [0; 24];
+        let mut aad = vec![0; round * 7];
+        let mut plaintext = vec![0; length];
+        fill_random(&mut state, &mut key);
+        fill_random(&mut state, &mut nonce);
+        fill_random(&mut state, &mut aad);
+        fill_random(&mut state, &mut plaintext);
+        let oracle = Xaes256Gcm::new((&key).into());
+
+        let mut ours = vec![0xa5; length + TAG_LEN];
+        seal(&key, &nonce, &aad, &plaintext, &mut ours).unwrap();
+        let mut reference = plaintext.clone();
+        let tag = oracle
+            .encrypt_inout_detached((&nonce).into(), &aad, InOutBuf::from(&mut reference[..]))
+            .unwrap();
+        reference.extend_from_slice(&tag);
+        assert_eq!(ours, reference, "length={length}");
+
+        // Reference ciphertext opens with ours, and ours opens with the reference.
+        let mut opened = vec![0xa5; length];
+        open(&key, &nonce, &aad, &reference, &mut opened).unwrap();
+        assert_eq!(opened, plaintext);
+        let (body, tag) = ours.split_at_mut(length);
+        oracle
+            .decrypt_inout_detached(
+                (&nonce).into(),
+                &aad,
+                InOutBuf::from(&mut body[..]),
+                (&*tag).try_into().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(body, &plaintext[..]);
+    }
+}
+
+/// Every tamper class fails and wipes a previously filled output buffer.
+#[test]
+fn xaes_tamper_zeroes_output_and_length_errors_do_not() {
+    let mut state = 7;
+    let mut plaintext = vec![0; 4097];
+    fill_random(&mut state, &mut plaintext);
+    let (key, nonce, aad) = ([9; 32], *b"ABCDEFGHIJKLMNOPQRSTUVWX", b"page aad");
+    let mut sealed = vec![0; plaintext.len() + TAG_LEN];
+    seal(&key, &nonce, aad, &plaintext, &mut sealed).unwrap();
+    for fault in 0..5 {
+        let mut input = sealed.clone();
+        let mut nonce = nonce;
+        let mut aad = *aad;
+        match fault {
+            0 => input[100] ^= 0x10,
+            1 => input[plaintext.len() + 3] ^= 1,
+            2 => aad[2] ^= 1,
+            3 => nonce[3] ^= 1,
+            _ => nonce[20] ^= 1,
+        }
+        let mut out = vec![0xa5; plaintext.len()];
+        assert!(open(&key, &nonce, &aad, &input, &mut out).is_err());
+        assert!(out.iter().all(|byte| *byte == 0), "fault={fault}");
+    }
+    let mut short = vec![0xa5; plaintext.len() - 1];
+    assert!(open(&key, &nonce, aad, &sealed, &mut short).is_err());
+    assert!(short.iter().all(|byte| *byte == 0xa5));
+    let mut long = vec![0xa5; plaintext.len() + TAG_LEN + 1];
+    assert!(seal(&key, &nonce, aad, &plaintext, &mut long).is_err());
+    assert!(long.iter().all(|byte| *byte == 0xa5));
 }

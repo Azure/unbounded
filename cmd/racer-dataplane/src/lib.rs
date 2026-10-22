@@ -36,6 +36,8 @@ mod subscription_interop;
 #[doc(hidden)]
 pub use subscription_interop::go_sdk_subscription_server as run_subscription_interop_fixture;
 
+pub(crate) mod pressure;
+
 #[cfg(test)]
 mod contention;
 

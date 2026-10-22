@@ -529,7 +529,6 @@ impl Rig {
         let transfers = Rc::new(Transfers::new(
             http.clone(),
             io.clone(),
-            None,
             admission.clone(),
             Rc::new(racer_dataplane::peer::protocol::SecurityCodec::new(
                 admission.clone(),
@@ -1161,6 +1160,33 @@ fn bootstrap_preserves_active_reader_and_inflight_admission_until_cancellation()
         rig.admission.used(ResourceClass::Ciphertext),
         rig.writer.retained_staging_bytes()
     );
+}
+
+#[test]
+fn idle_staging_is_sized_by_demand_and_released_when_constrained() {
+    let rig = Rig::new(113, true, 1);
+    check(&rig.bootstrap(0xab), 1, 0, 113, 113);
+    rig.flush();
+    let retained = rig.writer.retained_staging_bytes();
+    assert!(retained > 0, "writeback must leave idle staging");
+    let stats = rig.writer.staging_pool_stats();
+    assert_eq!(stats.bytes, retained);
+    assert!(stats.entries <= stats.target && stats.target <= stats.max_depth);
+    let start = std::time::Instant::now();
+    assert_eq!(rig.writer.maintain_staging(start), 0);
+    let charged = rig.admission.used(ResourceClass::Ciphertext);
+    rig.writer.constrain_staging(true);
+    assert_eq!(rig.writer.maintain_staging(start), retained);
+    assert_eq!(rig.writer.retained_staging_bytes(), 0);
+    assert_eq!(
+        rig.admission.used(ResourceClass::Ciphertext),
+        charged - retained
+    );
+    let stats = rig.writer.staging_pool_stats();
+    assert!(stats.constrained);
+    assert!(stats.trimmed >= 1);
+    rig.writer.constrain_staging(false);
+    assert!(!rig.writer.staging_pool_stats().constrained);
 }
 
 #[test]

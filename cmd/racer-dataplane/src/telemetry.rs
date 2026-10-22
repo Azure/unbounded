@@ -2646,7 +2646,110 @@ pub struct Metrics {
 
     disks: ::telemetry::SnapshotShards<Vec<DiskUsage>>,
 
+    memory: Arc<MemoryShards>,
+
     shard: usize,
+}
+
+/// Memory telemetry shared by every worker's handle, behind one pointer.
+struct MemoryShards {
+    staging: ::telemetry::SnapshotShards<Option<(WorkerId, flow_control::PoolStats)>>,
+
+    // One node-wide slot written by the sampling worker.
+    process: ::telemetry::SnapshotShards<ProcessMemory>,
+}
+
+/// Process and cgroup memory signals from the most recent sample.
+/// Absent fields are omitted from the exposition.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct ProcessMemory {
+    pub resident: Option<u64>,
+    pub cgroup_current: Option<u64>,
+    pub cgroup_limit: Option<u64>,
+    pub pressure_some_avg10: Option<f64>,
+}
+
+impl From<&crate::pressure::MemorySample> for ProcessMemory {
+    fn from(sample: &crate::pressure::MemorySample) -> Self {
+        Self {
+            resident: sample.resident,
+            cgroup_current: sample.current,
+            cgroup_limit: sample.limit,
+            pressure_some_avg10: sample.some_avg10,
+        }
+    }
+}
+
+/// Snake-case `class` label values for every admission class, in index order.
+const ADMISSION_CLASSES: [(crate::admission::ResourceClass, &str); 15] = {
+    use crate::admission::ResourceClass as C;
+    [
+        (C::Plaintext, "plaintext"),
+        (C::Ciphertext, "ciphertext"),
+        (C::DirtyCiphertext, "dirty_ciphertext"),
+        (C::Registered, "registered"),
+        (C::RequestContext, "request_context"),
+        (C::Flight, "flight"),
+        (C::Waiter, "waiter"),
+        (C::Connection, "connection"),
+        (C::Pipe, "pipe"),
+        (C::ControlProgress, "control_progress"),
+        (C::Relay, "relay"),
+        (C::IngressConnection, "ingress_connection"),
+        (C::OutboundConnection, "outbound_connection"),
+        (C::ControlConnection, "control_connection"),
+        (
+            C::OrdinaryOutboundConnection,
+            "ordinary_outbound_connection",
+        ),
+    ]
+};
+
+/// Node-wide idle pool series: name suffix, Prometheus kind, and value.
+fn pool_series(stats: &flow_control::PoolStats) -> [(&'static str, &'static str, u64); 7] {
+    [
+        ("entries", "gauge", stats.entries as u64),
+        ("bytes", "gauge", stats.bytes as u64),
+        ("target", "gauge", stats.target as u64),
+        ("hits_total", "counter", stats.hits),
+        ("misses_total", "counter", stats.misses),
+        ("rejects_total", "counter", stats.rejects),
+        ("trimmed_total", "counter", stats.trimmed),
+    ]
+}
+
+/// Write node-wide sums as `racer_{family}_*` and only retained bytes per
+/// worker as `racer_worker_{family}_bytes{worker="N"}`. Per-worker breakdowns of
+/// every series would not fit the bounded diagnostic response on large nodes.
+fn write_pools(
+    out: &mut impl Write,
+    family: &str,
+    samples: &[(WorkerId, flow_control::PoolStats)],
+) -> std::fmt::Result {
+    if samples.is_empty() {
+        return Ok(());
+    }
+    let mut totals = [0u64; 7];
+    for (_, stats) in samples {
+        for (total, (_, _, value)) in totals.iter_mut().zip(pool_series(stats)) {
+            *total = total.saturating_add(value);
+        }
+    }
+    for ((suffix, kind, _), total) in pool_series(&Default::default()).into_iter().zip(totals) {
+        writeln!(
+            out,
+            "# TYPE racer_{family}_{suffix} {kind}\nracer_{family}_{suffix} {total}"
+        )?;
+    }
+    writeln!(out, "# TYPE racer_worker_{family}_bytes gauge")?;
+    for (worker, stats) in samples {
+        writeln!(
+            out,
+            "racer_worker_{family}_bytes{{worker=\"{}\"}} {}",
+            worker.0, stats.bytes
+        )?;
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -2748,6 +2851,8 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::OriginFill => "racer_origin_fills_total",
             Self::DirtyDiscard => "racer_dirty_discards_total",
             Self::DiskPublication => "racer_disk_publications_total",
+            Self::PersistZeroCopy => "racer_persist_zero_copy_total",
+            Self::PersistCopyFallback => "racer_persist_copy_fallback_total",
             Self::Overload => "racer_overloads_total",
             Self::CorruptMiss => "racer_corrupt_misses_total",
             Self::DiagnosticAccepted => "racer_diagnostic_accepted_total",
@@ -2817,6 +2922,49 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::CryptoDecryptFailureCorruptAead => "racer_crypto_decrypt_failure_corrupt_aead_total",
             Self::CryptoDecryptFailureCorruptUnclassified => "racer_crypto_decrypt_failure_corrupt_unclassified_total",
             Self::CryptoDecryptFailureOther => "racer_crypto_decrypt_failure_other_total",
+            Self::MemoryPressureTransitions => "racer_memory_pressure_transitions_total",
+            Self::AllocatorTrims => "racer_allocator_trims_total",
+            Self::RdmaPagesSent => "racer_rdma_pages_sent_total",
+            Self::RdmaSentBytes => "racer_rdma_sent_bytes_total",
+            Self::RdmaPagesReceived => "racer_rdma_pages_received_total",
+            Self::RdmaReceivedBytes => "racer_rdma_received_bytes_total",
+            Self::RdmaHttpFallback => "racer_rdma_http_fallback_total",
+            Self::RdmaGrantCount => "racer_rdma_grant_nanoseconds_count",
+            Self::RdmaGrantNs => "racer_rdma_grant_nanoseconds_sum",
+            Self::RdmaHeadCount => "racer_rdma_head_nanoseconds_count",
+            Self::RdmaHeadNs => "racer_rdma_head_nanoseconds_sum",
+            Self::RdmaArrivalCount => "racer_rdma_arrival_nanoseconds_count",
+            Self::RdmaArrivalNs => "racer_rdma_arrival_nanoseconds_sum",
+            Self::RdmaSendCount => "racer_rdma_send_nanoseconds_count",
+            Self::RdmaSendNs => "racer_rdma_send_nanoseconds_sum",
+            Self::RdmaServeCount => "racer_rdma_serve_nanoseconds_count",
+            Self::RdmaServeNs => "racer_rdma_serve_nanoseconds_sum",
+            Self::FillDriverStartCount => "racer_fill_driver_start_nanoseconds_count",
+            Self::FillDriverStartNs => "racer_fill_driver_start_nanoseconds_sum",
+            Self::FillDriverCount => "racer_fill_driver_nanoseconds_count",
+            Self::FillDriverNs => "racer_fill_driver_nanoseconds_sum",
+            Self::FillCandidatesCount => "racer_fill_candidates_nanoseconds_count",
+            Self::FillCandidatesNs => "racer_fill_candidates_nanoseconds_sum",
+            Self::FillPlaintextReclaimCount => "racer_fill_plaintext_reclaim_nanoseconds_count",
+            Self::FillPlaintextReclaimNs => "racer_fill_plaintext_reclaim_nanoseconds_sum",
+            Self::FillPeerResponseCount => "racer_fill_peer_response_nanoseconds_count",
+            Self::FillPeerResponseNs => "racer_fill_peer_response_nanoseconds_sum",
+            Self::FillPeerDecryptCount => "racer_fill_peer_decrypt_nanoseconds_count",
+            Self::FillPeerDecryptNs => "racer_fill_peer_decrypt_nanoseconds_sum",
+            Self::FillHedgeCount => "racer_fill_hedge_nanoseconds_count",
+            Self::FillHedgeNs => "racer_fill_hedge_nanoseconds_sum",
+            Self::FillPublishCount => "racer_fill_publish_nanoseconds_count",
+            Self::FillPublishNs => "racer_fill_publish_nanoseconds_sum",
+            Self::FillDecryptCount => "racer_fill_decrypt_nanoseconds_count",
+            Self::FillDecryptNs => "racer_fill_decrypt_nanoseconds_sum",
+            Self::FillDiskReadCount => "racer_fill_disk_read_nanoseconds_count",
+            Self::FillDiskReadNs => "racer_fill_disk_read_nanoseconds_sum",
+            Self::FillOriginCount => "racer_fill_origin_nanoseconds_count",
+            Self::FillOriginNs => "racer_fill_origin_nanoseconds_sum",
+            Self::FillEncryptCount => "racer_fill_encrypt_nanoseconds_count",
+            Self::FillEncryptNs => "racer_fill_encrypt_nanoseconds_sum",
+            Self::FillChecksumCount => "racer_fill_checksum_nanoseconds_count",
+            Self::FillChecksumNs => "racer_fill_checksum_nanoseconds_sum",
 }
 metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::WarmTrackedJobs => "racer_warm_tracked_jobs",
@@ -2836,6 +2984,7 @@ metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::SegmentTailBytes => "racer_segment_tail_bytes",
             Self::DiskPageEntries => "racer_disk_page_index_capacity",
             Self::CheckpointSequence => "racer_checkpoint_sequence",
+            Self::MemoryPressureLevel => "racer_memory_pressure_level",
 }
 /// One nonempty intermediate HTTP relay_body call, after sending its response head.
 /// Success credits the entire ciphertext body only after both HTTP finish checks.
@@ -3004,6 +3153,73 @@ impl Metrics {
             completed: false,
         })
     }
+    /// Replace this worker's slab staging pool statistics from its health tick.
+    pub(crate) fn observe_staging_pool(&self, worker: WorkerId, stats: flow_control::PoolStats) {
+        self.memory
+            .staging
+            .replace(self.shard, Some((worker, stats)));
+    }
+
+    /// Replace the node-wide process and cgroup memory sample.
+    pub(crate) fn observe_memory(&self, memory: ProcessMemory) {
+        self.memory.process.replace(0, memory);
+    }
+
+    fn write_memory(&self, out: &mut impl Write) -> std::fmt::Result {
+        let Some(memory) = self.memory.process.snapshots().next() else {
+            return Ok(());
+        };
+        for (name, value) in [
+            ("racer_process_resident_bytes", memory.resident),
+            ("racer_cgroup_memory_current_bytes", memory.cgroup_current),
+            ("racer_cgroup_memory_limit_bytes", memory.cgroup_limit),
+        ] {
+            if let Some(value) = value {
+                writeln!(out, "# TYPE {name} gauge\n{name} {value}")?;
+            }
+        }
+        if let Some(avg10) = memory.pressure_some_avg10.filter(|v| v.is_finite()) {
+            let name = "racer_cgroup_memory_pressure_some_avg10";
+            writeln!(out, "# TYPE {name} gauge\n{name} {avg10}")?;
+        }
+        Ok(())
+    }
+
+    /// Write node-wide admission for every class, plus recycler and staging pools.
+    fn write_worker_pools(&self, out: &mut impl Write) -> std::fmt::Result {
+        let installed: Vec<_> = self
+            .admission
+            .iter()
+            .filter_map(|shard| shard.get())
+            .collect();
+        if !installed.is_empty() {
+            for (name, used) in [
+                ("racer_admission_used", true),
+                ("racer_admission_limit", false),
+            ] {
+                writeln!(out, "# TYPE {name} gauge")?;
+                for (class, label) in ADMISSION_CLASSES {
+                    let total = installed.iter().fold(0u64, |total, (_, usage)| {
+                        let value = if used {
+                            usage.used(class)
+                        } else {
+                            usage.limit(class)
+                        };
+                        total.saturating_add(value as u64)
+                    });
+                    writeln!(out, "{name}{{class=\"{label}\"}} {total}")?;
+                }
+            }
+        }
+        let recycler: Vec<_> = installed
+            .iter()
+            .map(|(worker, usage)| (*worker, usage.buffer_pool_stats()))
+            .collect();
+        write_pools(out, "recycler", &recycler)?;
+        let staging: Vec<_> = self.memory.staging.snapshots().flatten().collect();
+        write_pools(out, "staging_pool", &staging)
+    }
+
     /// Install once during worker assembly, not on the admission hot path.
     pub(crate) fn observe_admission(
         &self,
@@ -3060,6 +3276,10 @@ impl Metrics {
         let retention = ::telemetry::SnapshotShards::new(count);
         let held = ::telemetry::SnapshotShards::new(count);
         let disks = ::telemetry::SnapshotShards::new(count);
+        let memory = Arc::new(MemoryShards {
+            staging: ::telemetry::SnapshotShards::new(count),
+            process: ::telemetry::SnapshotShards::new(1),
+        });
         Ok(::telemetry::Metrics::shards(count)
             .into_iter()
             .enumerate()
@@ -3069,6 +3289,7 @@ impl Metrics {
                 retention: retention.clone(),
                 held: held.clone(),
                 disks: disks.clone(),
+                memory: memory.clone(),
                 shard,
             })
             .collect())
@@ -3087,6 +3308,12 @@ impl Metrics {
     /// Saturate instead of wrapping a long-lived Prometheus counter.
     pub fn record(&self, event: Event, amount: u64) {
         self.core.add(event, amount);
+    }
+    /// Add one observation of the time since `start` to a count and nanosecond sum pair.
+    pub fn record_duration(&self, count: Event, sum: Event, start: std::time::Instant) {
+        let elapsed = uring_runtime::environment::now().saturating_duration_since(start);
+        self.record(sum, u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
+        self.record(count, 1);
     }
     pub(crate) fn writer_shard(&self) -> usize {
         self.shard
@@ -3123,6 +3350,8 @@ impl Metrics {
         self.write_retention(out)?;
         self.write_held(out)?;
         self.write_disks(out)?;
+        self.write_memory(out)?;
+        self.write_worker_pools(out)?;
         // Quota labels use runtime worker IDs. Read the authority's actual charge,
         // including pooled ciphertext capacity, without sampling on worker polls.
         // A stalled worker therefore remains observable from another worker.
@@ -3953,6 +4182,20 @@ pub(crate) mod tests {
                     metrics
                         .observe_admission(WorkerId(u16::MAX - index as u16), admission.shared())
                         .unwrap();
+                    metrics.observe_staging_pool(
+                        WorkerId(u16::MAX - index as u16),
+                        flow_control::PoolStats {
+                            entries: usize::MAX,
+                            bytes: usize::MAX,
+                            target: usize::MAX,
+                            max_depth: usize::MAX,
+                            hits: u64::MAX,
+                            misses: u64::MAX,
+                            rejects: u64::MAX,
+                            trimmed: u64::MAX,
+                            constrained: true,
+                        },
+                    );
                     metrics.observe_retention(crate::retention::Snapshot {
                         observations: u64::MAX,
                         qualified: u64::MAX,
@@ -4001,7 +4244,21 @@ pub(crate) mod tests {
             for event in crate::telemetry::EVENTS {
                 telemetry.metrics.record(event, u64::MAX);
             }
+            telemetry.metrics.observe_memory(ProcessMemory {
+                resident: Some(u64::MAX),
+                cgroup_current: Some(u64::MAX),
+                cgroup_limit: Some(u64::MAX),
+                pressure_some_avg10: Some(100.0),
+            });
             let text = diagnostic_text(&telemetry, "/metrics");
+            for name in [
+                "racer_admission_used{class=\"ordinary_outbound_connection\"}",
+                "racer_staging_pool_trimmed_total ",
+                "racer_worker_staging_pool_bytes{worker=\"65535\"}",
+                "racer_cgroup_memory_pressure_some_avg10 100\n",
+            ] {
+                assert!(text.contains(name), "{name}");
+            }
             assert!(text.len() < MAX_RESPONSE_BYTES);
             for (name, kind) in crate::telemetry::RETENTION_METRICS
                 .into_iter()
@@ -4042,7 +4299,7 @@ pub(crate) mod tests {
                 text.lines()
                     .filter(|line| line.contains("{worker="))
                     .count(),
-                4 * 64
+                6 * 64
             );
             struct Small(usize);
             impl std::fmt::Write for Small {
@@ -4978,16 +5235,32 @@ pub(crate) mod tests {
             std::thread::spawn(move || drop((relay, ciphertext)))
                 .join()
                 .unwrap();
+            // Recycler stats come from the live authority and reset once it exits;
+            // quota charges must still match the idle scrape.
+            let quotas = |text: &str| {
+                text.lines()
+                    .filter(|line| !line.contains("recycler_"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
             assert_eq!(
-                scrape(),
-                idle,
+                quotas(&scrape()),
+                quotas(&idle),
                 "final release remains visible after owner exit"
             );
             assert_eq!(
                 idle.lines()
-                    .filter(|line| line.contains("{worker="))
+                    .filter(|line| line.starts_with("racer_worker_relay_")
+                        || line.starts_with("racer_worker_ciphertext_"))
                     .count(),
                 8
+            );
+            // Four compatibility series and retained recycler bytes per worker.
+            assert_eq!(
+                idle.lines()
+                    .filter(|line| line.contains("{worker="))
+                    .count(),
+                2 * (4 + 1)
             );
             assert!(!idle.contains("request="));
         }
@@ -5014,6 +5287,171 @@ pub(crate) mod tests {
             output.clear();
             metrics.write_prometheus(&mut output).unwrap();
             assert!(output.contains("racer_worker_ciphertext_used_bytes{worker=\"0\"} 0\n"));
+        }
+
+        #[test]
+        fn admission_classes_cover_every_class_in_index_order() {
+            use flow_control::Class;
+            assert_eq!(ADMISSION_CLASSES.len(), ResourceClass::COUNT);
+            for (index, (class, label)) in ADMISSION_CLASSES.iter().enumerate() {
+                assert_eq!(class.index(), index);
+                assert!(label.chars().all(|c| c.is_ascii_lowercase() || c == '_'));
+            }
+        }
+
+        #[test]
+        fn admission_and_pool_series_sum_workers_and_label_retained_bytes() {
+            let metrics = Metrics::for_workers(2).unwrap();
+            let mut output = String::new();
+            metrics[0].write_prometheus(&mut output).unwrap();
+            // Nothing installed: no admission, pool, or process memory series.
+            for absent in [
+                "racer_admission_used",
+                "racer_recycler_entries",
+                "racer_staging_pool_entries",
+                "racer_process_resident_bytes",
+            ] {
+                assert!(!output.contains(absent), "{absent}");
+            }
+            let quotas: Vec<_> = (0..2)
+                .map(|_| {
+                    flow_control::Quotas::new(AdmissionPolicy::new(
+                        crate::test_support::cluster::config(false).limits,
+                    ))
+                })
+                .collect();
+            for (index, (metrics, admission)) in metrics.iter().zip(&quotas).enumerate() {
+                metrics
+                    .observe_admission(WorkerId(3 + index as u16), admission.shared())
+                    .unwrap();
+            }
+            let mut reservation = quotas[0]
+                .reserve(None, ResourceClass::Ciphertext, 1 << 20)
+                .unwrap();
+            let bytes = reservation.buffer(1 << 20).unwrap();
+            reservation.recycle(bytes);
+            drop(reservation);
+            let _relay = quotas[1].reserve(None, ResourceClass::Relay, 1).unwrap();
+            let recycler = quotas[0].buffer_pool_stats();
+            assert!(recycler.bytes >= 1 << 20, "recycled buffer is retained");
+            let staging = |entries, bytes, counter| flow_control::PoolStats {
+                entries,
+                bytes,
+                target: 3,
+                max_depth: 8,
+                hits: counter,
+                misses: counter + 1,
+                rejects: counter + 2,
+                trimmed: counter + 3,
+                constrained: false,
+            };
+            metrics[0].observe_staging_pool(WorkerId(3), staging(2, 4096, 5));
+            metrics[1].observe_staging_pool(WorkerId(4), staging(1, 1024, 10));
+            output.clear();
+            metrics[1].write_prometheus(&mut output).unwrap();
+            let sum = |class| quotas.iter().map(|q| q.limit(class)).sum::<usize>();
+            let ciphertext_used = quotas[0].used(ResourceClass::Ciphertext);
+            for expected in [
+                "# TYPE racer_admission_used gauge\n".to_string(),
+                "# TYPE racer_admission_limit gauge\n".to_string(),
+                format!("racer_admission_used{{class=\"ciphertext\"}} {ciphertext_used}\n"),
+                "racer_admission_used{class=\"relay\"} 1\n".to_string(),
+                "racer_admission_used{class=\"plaintext\"} 0\n".to_string(),
+                format!(
+                    "racer_admission_limit{{class=\"relay\"}} {}\n",
+                    sum(ResourceClass::Relay)
+                ),
+                format!(
+                    "racer_admission_limit{{class=\"plaintext\"}} {}\n",
+                    sum(ResourceClass::Plaintext)
+                ),
+                format!("racer_recycler_entries {}\n", recycler.entries),
+                format!("racer_recycler_bytes {}\n", recycler.bytes),
+                "# TYPE racer_recycler_hits_total counter\n".to_string(),
+                format!(
+                    "racer_worker_recycler_bytes{{worker=\"3\"}} {}\n",
+                    recycler.bytes
+                ),
+                "racer_worker_recycler_bytes{worker=\"4\"} 0\n".to_string(),
+                "# TYPE racer_staging_pool_entries gauge\nracer_staging_pool_entries 3\n"
+                    .to_string(),
+                "racer_staging_pool_bytes 5120\n".to_string(),
+                "racer_staging_pool_target 6\n".to_string(),
+                "# TYPE racer_staging_pool_hits_total counter\nracer_staging_pool_hits_total 15\n"
+                    .to_string(),
+                "racer_staging_pool_misses_total 17\n".to_string(),
+                "racer_staging_pool_rejects_total 19\n".to_string(),
+                "racer_staging_pool_trimmed_total 21\n".to_string(),
+                "# TYPE racer_worker_staging_pool_bytes gauge\n".to_string(),
+                "racer_worker_staging_pool_bytes{worker=\"3\"} 4096\n".to_string(),
+                "racer_worker_staging_pool_bytes{worker=\"4\"} 1024\n".to_string(),
+                // Compatibility series remain per worker.
+                "racer_worker_relay_used{worker=\"4\"} 1\n".to_string(),
+            ] {
+                assert!(
+                    output.contains(&expected),
+                    "missing {expected:?} in {output}"
+                );
+            }
+            assert_eq!(
+                output
+                    .lines()
+                    .filter(|l| l.starts_with("racer_admission_used{"))
+                    .count(),
+                <ResourceClass as flow_control::Class>::COUNT
+            );
+            // Each TYPE line appears exactly once.
+            let types: Vec<_> = output
+                .lines()
+                .filter(|l| l.starts_with("# TYPE "))
+                .collect();
+            let unique: std::collections::BTreeSet<_> = types.iter().collect();
+            assert_eq!(types.len(), unique.len());
+        }
+
+        #[test]
+        fn process_memory_series_omit_absent_signals() {
+            let metrics = Metrics::default();
+            metrics.observe_memory(ProcessMemory {
+                resident: Some(4096),
+                ..Default::default()
+            });
+            let mut output = String::new();
+            metrics.write_prometheus(&mut output).unwrap();
+            assert!(output.contains(
+                "# TYPE racer_process_resident_bytes gauge\nracer_process_resident_bytes 4096\n"
+            ));
+            assert!(!output.contains("racer_cgroup_memory"));
+            metrics.observe_memory(ProcessMemory {
+                resident: Some(1),
+                cgroup_current: Some(800),
+                cgroup_limit: Some(1000),
+                pressure_some_avg10: Some(12.5),
+            });
+            metrics.set_gauge(Gauge::MemoryPressureLevel, 2);
+            metrics.record(Event::MemoryPressureTransitions, 3);
+            metrics.record(Event::AllocatorTrims, 1);
+            output.clear();
+            metrics.write_prometheus(&mut output).unwrap();
+            for expected in [
+                "racer_cgroup_memory_current_bytes 800\n",
+                "racer_cgroup_memory_limit_bytes 1000\n",
+                "racer_cgroup_memory_pressure_some_avg10 12.5\n",
+                "# TYPE racer_memory_pressure_level gauge\nracer_memory_pressure_level 2\n",
+                "# TYPE racer_memory_pressure_transitions_total counter\nracer_memory_pressure_transitions_total 3\n",
+                "# TYPE racer_allocator_trims_total counter\nracer_allocator_trims_total 1\n",
+            ] {
+                assert!(output.contains(expected), "missing {expected:?}");
+            }
+            // Non-finite PSI is not exported.
+            metrics.observe_memory(ProcessMemory {
+                pressure_some_avg10: Some(f64::NAN),
+                ..Default::default()
+            });
+            output.clear();
+            metrics.write_prometheus(&mut output).unwrap();
+            assert!(!output.contains("racer_cgroup_memory_pressure_some_avg10"));
+            assert!(!output.contains("racer_process_resident_bytes"));
         }
 
         #[test]

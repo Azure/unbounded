@@ -526,6 +526,16 @@ pub(super) enum Op {
 
         len: usize,
     },
+    /// A positioned vectored write; segments are gathered at execution time.
+    Writev {
+        fd: Rc<Descriptor>,
+
+        offset: u64,
+
+        iovecs: *const libc::iovec,
+
+        count: usize,
+    },
     Poll {
         fd: Rc<Descriptor>,
 
@@ -787,6 +797,7 @@ impl Op {
                 operation: BufferOperation::Read(_) | BufferOperation::Write(_),
                 ..
             }
+            | Self::Writev { fd, .. }
             | Self::Stat { fd, .. }
             | Self::Sync(fd) => file_path(fd).into_iter().collect(),
             Self::Open {
@@ -819,6 +830,7 @@ impl Op {
                 BufferOperation::Recv => "recv",
                 BufferOperation::Send => "send",
             },
+            Self::Writev { .. } => "writev",
             Self::Poll { .. } => "poll",
             Self::Accept(_) => "accept",
             Self::Connect { .. } => "connect",
@@ -875,6 +887,34 @@ impl Op {
                         fd.send(unsafe { std::slice::from_raw_parts(*ptr, len) })
                     }
                 }?;
+                Ok(KernelResult::Value(n as i32))
+            }
+            Self::Writev {
+                fd,
+                offset,
+                iovecs,
+                count,
+            } => {
+                let fd = sim.handle(fd)?;
+                let (_, flags) = fd.node()?;
+                // SAFETY: the production entry pins the iovec array and every
+                // segment it names through both completion fences.
+                let iovecs = unsafe { std::slice::from_raw_parts(*iovecs, *count) };
+                // The kernel checks direct-I/O alignment for every segment.
+                for iov in iovecs {
+                    check_direct(flags, *offset, iov.iov_base.cast(), iov.iov_len)?;
+                }
+                let mut remaining = limit.min(i32::MAX as usize);
+                let mut gathered = Vec::new();
+                for iov in iovecs {
+                    let len = iov.iov_len.min(remaining);
+                    // SAFETY: as above; vectored writes only read their segments.
+                    gathered.extend_from_slice(unsafe {
+                        std::slice::from_raw_parts(iov.iov_base.cast::<u8>(), len)
+                    });
+                    remaining -= len;
+                }
+                let n = fd.file_write(*offset, &gathered)?;
                 Ok(KernelResult::Value(n as i32))
             }
             Self::Poll { fd, interest } => {

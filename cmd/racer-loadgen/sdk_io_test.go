@@ -41,7 +41,8 @@ func TestReadBodyDrainPreservesWriterTo(t *testing.T) {
 			opts := pullTestOptions("http://unused")
 			opts.Verify = false
 			p, metrics := pullTestNew(t, &syntheticImage{}, opts)
-			destination := p.devNull
+
+			var destination io.Writer
 
 			for range 2 {
 				body := &drainProbe{Reader: strings.NewReader("payload"), err: ending}
@@ -49,7 +50,13 @@ func TestReadBodyDrainPreservesWriterTo(t *testing.T) {
 				require.ErrorIs(t, err, ending)
 				require.Equal(t, int64(7), n)
 				require.Empty(t, hash)
-				require.Same(t, destination, body.destination)
+				require.IsType(t, &os.File{}, body.destination, "the SDK splices only into an unwrapped *os.File")
+
+				if destination != nil {
+					require.Same(t, destination, body.destination, "sequential reads reuse the idle drain file")
+				}
+
+				destination = body.destination
 			}
 
 			require.Equal(t, float64(14), testutil.ToFloat64(metrics.receivedBytes))
@@ -72,8 +79,12 @@ func TestReadBodyVerifiedUsesRead(t *testing.T) {
 func TestPullerClosesDrainDestination(t *testing.T) {
 	p, err := newPuller(&syntheticImage{}, pullTestOptions("http://unused"), pullTestMetrics())
 	require.NoError(t, err)
+	idle, err := p.drains.get()
+	require.NoError(t, err)
+	p.drains.put(idle)
 	p.close()
-	_, err = p.devNull.Write([]byte("x"))
+
+	_, err = idle.Write([]byte("x"))
 	require.ErrorIs(t, err, os.ErrClosed)
 }
 

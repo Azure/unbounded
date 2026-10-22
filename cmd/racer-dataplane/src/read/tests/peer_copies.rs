@@ -2779,3 +2779,160 @@ fn replica_selection_orders_first_acquire_and_non_primary_owner_fills() {
         drop(endpoints);
     }
 }
+
+/// Wrap `copy`'s ciphertext as a received registered RDMA page on `f`'s pool.
+fn registered_copy(
+    f: &Fixture,
+    w: &mut crate::rdma::links::tests::World,
+    copy: &CiphertextCopy,
+    bytes: Vec<u8>,
+) -> CiphertextCopy {
+    let sent = crate::rdma::links::tests::page_with(
+        &w.b.admission,
+        copy.ciphertext.envelope().clone(),
+        bytes,
+    );
+    let received = crate::rdma::links::tests::receive_registered(w, &sent);
+    let admission = &f.fill.dependencies.admission;
+    let reservation = admission
+        .reserve(
+            Some(&f.context.object.cache),
+            ResourceClass::Ciphertext,
+            received.len(),
+        )
+        .unwrap();
+    let ciphertext = crate::memory::BufferPool::new(admission.clone())
+        .registered_ciphertext(reservation, copy.ciphertext.envelope().clone(), received)
+        .unwrap();
+    assert!(ciphertext.is_registered());
+    CiphertextCopy {
+        metadata: copy.metadata.clone(),
+        ciphertext,
+    }
+}
+
+fn free_buffers(w: &crate::rdma::links::tests::World) -> Option<usize> {
+    w.a.links
+        .buffers(racer_control_wire::RailId(7), rdma_verbs::BufferState::Free)
+}
+
+#[test]
+fn registered_ciphertext_decrypts_in_place_and_persists_a_copy() {
+    let mut f = fixture_with(3, None);
+    let mut w = crate::rdma::links::tests::world_for(
+        [
+            crate::rdma::links::tests::node_id(1),
+            crate::rdma::links::tests::node_id(2),
+        ],
+        false,
+    );
+    crate::rdma::links::tests::link_up(&mut w);
+    let good = encrypted_copy(&mut f);
+    // Tampered page-backed ciphertext fails authentication and frees the buffer.
+    let mut tampered = good.ciphertext.bytes().to_vec();
+    tampered[0] ^= 1;
+    let bad = registered_copy(&f, &mut w, &good, tampered);
+    let reservation = f.fill.reserve_bootstrap(&f.context.object.cache).unwrap();
+    let decrypted = drive(
+        f.fill
+            .decrypt(&f.page, bad, reservation, &f.scope, DecryptSource::Peer),
+        &mut f.engine,
+        &f.crypto,
+    );
+    assert_eq!(decrypted.err(), Some(Error::CorruptRecord));
+    crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
+    assert_eq!(free_buffers(&w), Some(2));
+    // Page-backed ciphertext decrypts in place, then is copied out once into
+    // pooled aligned storage so the cache and write queue share one page.
+    let copy = registered_copy(&f, &mut w, &good, good.ciphertext.bytes().to_vec());
+    let reservation = f.fill.reserve_bootstrap(&f.context.object.cache).unwrap();
+    let copies = crate::memory::registered_copy_outs();
+    let result = drive(
+        f.fill
+            .decrypt(&f.page, copy, reservation, &f.scope, DecryptSource::Peer),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    assert_eq!(result.plaintext.bytes(), b"abc");
+    assert!(!result.ciphertext.is_registered());
+    assert!(
+        result
+            .ciphertext
+            .is_disk_aligned(crate::memory::default_disk_alignment())
+    );
+    assert_eq!(crate::memory::registered_copy_outs(), copies + 1);
+    crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
+    assert_eq!(free_buffers(&w), Some(2), "released right after copy-out");
+    // Retaining for memory and the store copies nothing more.
+    let admission = &f.fill.dependencies.admission;
+    let dirty = admission
+        .reserve(
+            Some(&f.context.object.cache),
+            ResourceClass::DirtyCiphertext,
+            19,
+        )
+        .unwrap();
+    f.fill
+        .dependencies
+        .writer
+        .enqueue(result.copy(), dirty)
+        .unwrap();
+    assert_eq!(f.fill.dependencies.writer.pending_count(), 1);
+    f.fill.dependencies.memory.publish(result.clone()).unwrap();
+    let cached = f.fill.dependencies.memory.get(&f.page).unwrap().unwrap();
+    assert!(std::sync::Arc::ptr_eq(
+        &cached.ciphertext.inner,
+        &result.ciphertext.inner
+    ));
+    assert_eq!(crate::memory::registered_copy_outs(), copies + 1);
+    drop(result);
+    crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
+    assert_eq!(
+        free_buffers(&w),
+        Some(2),
+        "the queue does not pin the buffer"
+    );
+}
+
+#[test]
+fn registered_copy_out_refused_by_admission_keeps_the_registered_page() {
+    let mut f = fixture_with(3, None);
+    let mut w = crate::rdma::links::tests::world_for(
+        [
+            crate::rdma::links::tests::node_id(1),
+            crate::rdma::links::tests::node_id(2),
+        ],
+        false,
+    );
+    crate::rdma::links::tests::link_up(&mut w);
+    let good = encrypted_copy(&mut f);
+    let copy = registered_copy(&f, &mut w, &good, good.ciphertext.bytes().to_vec());
+    let reservation = f.fill.reserve_bootstrap(&f.context.object.cache).unwrap();
+    // Exhaust ciphertext admission so the optional copy-out is refused.
+    let admission = f.fill.dependencies.admission.clone();
+    let cache = f.context.object.cache.clone();
+    let mut held = Vec::new();
+    for amount in [65536, 4096, 1] {
+        while let Ok(charge) = admission.reserve(Some(&cache), ResourceClass::Ciphertext, amount) {
+            held.push(charge);
+        }
+    }
+    let used = admission.used(ResourceClass::Ciphertext);
+    let copies = crate::memory::registered_copy_outs();
+    let result = drive(
+        f.fill
+            .decrypt(&f.page, copy, reservation, &f.scope, DecryptSource::Peer),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    assert_eq!(result.plaintext.bytes(), b"abc");
+    assert!(result.ciphertext.is_registered(), "falls back as before");
+    assert_eq!(crate::memory::registered_copy_outs(), copies);
+    assert_eq!(admission.used(ResourceClass::Ciphertext), used, "no leak");
+    drop(result);
+    drop(held);
+    crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
+    assert_eq!(free_buffers(&w), Some(2));
+}

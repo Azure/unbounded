@@ -927,6 +927,29 @@ impl SecurityCodec {
     pub fn new(admission: Rc<flow_control::Quotas<AdmissionPolicy>>, buffers: BufferPool) -> Self {
         Self { admission, buffers }
     }
+    /// The receiving worker's allocation front end.
+    pub(crate) fn buffers(&self) -> &BufferPool {
+        &self.buffers
+    }
+}
+
+/// A received response body and the admission that charged its staging.
+pub(crate) enum ResponseBody {
+    /// Vector staging. Without a reservation, the decoder charges the page.
+    Owned {
+        bytes: Vec<u8>,
+        reservation: Option<flow_control::Charge<AdmissionPolicy>>,
+    },
+    /// Aligned staging from the receiving worker's pool, already charged.
+    Aligned(crate::memory::CiphertextBuffer),
+}
+impl ResponseBody {
+    fn len(&self) -> usize {
+        match self {
+            Self::Owned { bytes, .. } => bytes.len(),
+            Self::Aligned(buffer) => buffer.len(),
+        }
+    }
 }
 fn bytes(head: &MessageHead, name: &str) -> Result<Vec<u8>> {
     decode_binary(field(head, name)?.as_bytes())
@@ -1271,6 +1294,22 @@ impl SecurityCodec {
         reservation: Option<flow_control::Charge<AdmissionPolicy>>,
         scope: &RequestScope,
     ) -> Result<SignedResponse> {
+        self.response_body(
+            authentication,
+            ResponseBody::Owned {
+                bytes: body,
+                reservation,
+            },
+            scope,
+        )
+    }
+    /// Decode a response, keeping an aligned body in place as the page.
+    pub(crate) fn response_body(
+        &self,
+        authentication: ForwardedHead,
+        body: ResponseBody,
+        scope: &RequestScope,
+    ) -> Result<SignedResponse> {
         scope.check()?;
         let head = &authentication.original.head;
         let outcome = field(head, "racer-outcome")?;
@@ -1282,23 +1321,41 @@ impl SecurityCodec {
                 if body.len() != envelope.ciphertext_length as usize {
                     return Err(Error::InvalidRequest);
                 }
-                let reservation = match reservation {
-                    Some(reservation) => {
-                        reservation.validate(ResourceClass::Ciphertext, body.capacity())?;
-                        if !self.admission.owns(&reservation)
+                let ciphertext = match body {
+                    ResponseBody::Owned {
+                        bytes: body,
+                        reservation,
+                    } => {
+                        let reservation = match reservation {
+                            Some(reservation) => {
+                                reservation.validate(ResourceClass::Ciphertext, body.capacity())?;
+                                if !self.admission.owns(&reservation)
+                                    || reservation.key() != Some(&metadata.version.object.cache)
+                                {
+                                    return Err(Error::InvalidRequest);
+                                }
+                                reservation
+                            }
+                            None => self.admission.reserve(
+                                Some(&metadata.version.object.cache),
+                                ResourceClass::Ciphertext,
+                                body.capacity(),
+                            )?,
+                        };
+                        self.buffers.ciphertext(reservation, envelope, body)?
+                    }
+                    ResponseBody::Aligned(buffer) => {
+                        let reservation = buffer.charge();
+                        reservation.validate(ResourceClass::Ciphertext, buffer.capacity())?;
+                        if !self.admission.owns(reservation)
                             || reservation.key() != Some(&metadata.version.object.cache)
                         {
                             return Err(Error::InvalidRequest);
                         }
-                        reservation
+                        self.buffers
+                            .aligned_ciphertext_page(buffer, envelope, None)?
                     }
-                    None => self.admission.reserve(
-                        Some(&metadata.version.object.cache),
-                        ResourceClass::Ciphertext,
-                        body.capacity(),
-                    )?,
                 };
-                let ciphertext = self.buffers.ciphertext(reservation, envelope, body)?;
                 if outcome == "selected" {
                     PeerResponse::Selected {
                         metadata,
@@ -1321,7 +1378,7 @@ impl SecurityCodec {
                 }
             }
             outcome => {
-                if !body.is_empty() {
+                if body.len() != 0 {
                     return Err(Error::InvalidRequest);
                 }
                 bodyless_response(head, outcome)?
@@ -1729,6 +1786,111 @@ pub(crate) mod tests {
                 }
                 assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
                 assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+                assert_eq!(foreign.used(ResourceClass::Ciphertext), 0);
+            }
+        }
+        #[test]
+        fn received_aligned_body_becomes_disk_aligned_page_and_rejects_mismatches() {
+            let signers = crate::peer::tests::signers();
+            let cache = CacheId("cccccccc-1111-4111-8111-111111111111".into());
+            let limits = crate::test_support::cluster::config(false).limits;
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+                limits.clone(),
+            )));
+            let foreign = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
+            let buffers = BufferPool::new(admission.clone());
+            let foreign_buffers = BufferPool::new(foreign.clone());
+            let codec = SecurityCodec::new(admission.clone(), buffers.clone());
+            let metadata = ObjectMetadata {
+                content_type: None,
+                version: ObjectVersion {
+                    object: ObjectId {
+                        cache: cache.clone(),
+                        key: CacheKey([3; 32]),
+                    },
+                    etag: StrongEtag::test_value("v1"),
+                },
+                length: 3,
+                expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
+            };
+            let page = buffers
+                .ciphertext(
+                    admission
+                        .reserve(Some(&cache), ResourceClass::Ciphertext, 19)
+                        .unwrap(),
+                    PageEnvelope {
+                        cipher: crate::model::PageCipher::Xaes256Gcm,
+                        page: PageId {
+                            version: metadata.version.clone(),
+                            number: PageNumber(0),
+                        },
+                        key_id: KeyId([1; 16]),
+                        nonce: Nonce([2; 24]),
+                        plaintext_length: 3,
+                        ciphertext_length: 19,
+                    },
+                    vec![9; 19],
+                )
+                .unwrap();
+            let response = PeerResponse::Page {
+                metadata,
+                ciphertext: page,
+            };
+            let mut head = response_head(
+                &response,
+                &[3; 32],
+                &[signers[0].node().clone(), signers[2].node().clone()],
+            )
+            .unwrap();
+            push(&mut head, "racer-receiver", &signers[0].node().0);
+            let original = std::sync::Arc::new(signers[2].sign(head).unwrap());
+            drop(response);
+            let scope = RequestScope::new(
+                RequestId([1; 16]),
+                uring_runtime::environment::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+            let alignment = crate::memory::default_disk_alignment();
+            let capacity = buffers.aligned_capacity(19).unwrap();
+            for case in 0..4 {
+                let (pool, quotas, key, length) = match case {
+                    1 => (&foreign_buffers, &foreign, cache.clone(), 19),
+                    2 => (&buffers, &admission, CacheId("other".into()), 19),
+                    3 => (&buffers, &admission, cache.clone(), 18),
+                    _ => (&buffers, &admission, cache.clone(), 19),
+                };
+                let mut body = pool
+                    .aligned_ciphertext(
+                        quotas
+                            .reserve(Some(&key), ResourceClass::Ciphertext, capacity)
+                            .unwrap(),
+                        length,
+                    )
+                    .unwrap();
+                body.as_mut_slice().fill(9);
+                let auth = ForwardedHead {
+                    original: original.clone(),
+                    hops: vec![],
+                };
+                let result = codec.response_body(auth, ResponseBody::Aligned(body), &scope);
+                if case == 0 {
+                    let result = result.unwrap();
+                    assert_eq!(admission.used(ResourceClass::Ciphertext), capacity);
+                    let PeerResponse::Page { ciphertext, .. } = result.response else {
+                        panic!("page required")
+                    };
+                    assert_eq!(ciphertext.bytes(), &[9; 19]);
+                    let disk = ciphertext.disk_body(alignment).expect("aligned page");
+                    assert_eq!(disk.len(), 4096);
+                    assert!(disk[19..].iter().all(|byte| *byte == 0));
+                    drop(ciphertext);
+                } else {
+                    assert!(
+                        matches!(result, Err(Error::InvalidRequest)),
+                        "mismatched aligned body accepted: {case}"
+                    );
+                }
+                assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
                 assert_eq!(foreign.used(ResourceClass::Ciphertext), 0);
             }
         }
