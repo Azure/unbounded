@@ -295,13 +295,11 @@ fn counter(value: &std::sync::atomic::AtomicU64) -> u64 {
     value.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// A response head, its frames, the allocation and its size.
+type Read = (String, Vec<(u8, u64, u64, u32)>, OwnedFd, u64);
+
 /// Read `range` of the object into a fresh allocation at offset 64.
-fn gpu_read(
-    fixture: &Fixture,
-    helper: &GpuHelper,
-    range: Option<(u64, u64)>,
-    length: u64,
-) -> (String, Vec<(u8, u64, u64, u32)>, OwnedFd, u64) {
+fn gpu_read(fixture: &Fixture, helper: &GpuHelper, range: Option<(u64, u64)>, length: u64) -> Read {
     let size = (length + 64).next_multiple_of(GRANULE);
     let allocation = allocate(helper, 0, size);
     let header = range.map_or(String::new(), |(start, end)| {

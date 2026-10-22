@@ -40,6 +40,7 @@ impl SealedTarget {
 }
 
 /// One fetched window page in sealed mode.
+#[allow(clippy::large_enum_variant)] // Pages move unboxed through the mailbox, as `Value::Page` does.
 pub enum Fetched {
     /// Verified plaintext.
     Page(PageResult),
@@ -49,6 +50,7 @@ pub enum Fetched {
 }
 
 /// Where a sealed page's ciphertext is.
+#[allow(clippy::large_enum_variant)] // Always inside a boxed SealedPage.
 pub enum SealedSource {
     /// Ciphertext and tag in host memory: retained, pending, read from disk
     /// through the slab, or received from a peer.
