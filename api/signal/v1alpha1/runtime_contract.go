@@ -16,8 +16,7 @@ const MinimumBackendDeadlineReserve = time.Minute
 func ValidateRuntimeContract(
 	scriptRequiresStage bool,
 	stage *RuntimeStage,
-	backendDeadline time.Duration,
-	outerDeadline time.Duration,
+	backendDeadline, outerDeadline time.Duration,
 ) error {
 	if err := ValidateRuntimeStage(scriptRequiresStage, stage); err != nil {
 		return err
@@ -40,7 +39,7 @@ func ValidateRuntimeStage(scriptRequiresStage bool, stage *RuntimeStage) error {
 	return nil
 }
 
-func ValidateExecutionDeadlines(backendDeadline time.Duration, outerDeadline time.Duration) error {
+func ValidateExecutionDeadlines(backendDeadline, outerDeadline time.Duration) error {
 	if backendDeadline <= 0 {
 		return errors.New("backend active deadline must be positive")
 	}
