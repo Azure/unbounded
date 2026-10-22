@@ -117,8 +117,16 @@ Clients try modes in order: GPU, then host, then stream.
   `recv`.
 - A new dataplane without a usable GPU answers `gpu-read` with 501.
 
-A client treats 400, 404, 405 and 501 on its first attempt at a mode as "mode
-not supported" and remembers that for the socket path until the process exits.
+A client remembers an unsupported mode for the socket path until the process
+exits:
+
+- 501 marks the mode unsupported at once.
+- 400, 404 and 405 can also mean a bad request, so the client falls back for
+  that read but marks the mode unsupported only when a later mode then
+  succeeds.
+
+A `host-read` refused because the destination is too small falls back to stream
+for that read only.
 
 ### Security
 
@@ -200,9 +208,13 @@ cuFile. v1 records are read through host memory.
 - The dataplane pod is privileged, so it already sees `/dev/nvidia*`.
 - CUDA needs the host driver's user-space libraries. The dataplane asks the
   NVIDIA runtime to inject them without requesting `nvidia.com/gpu`:
-  `NVIDIA_VISIBLE_DEVICES=all`, `NVIDIA_DRIVER_CAPABILITIES=compute,utility`,
-  and the CDI annotation for `nvidia.com/gpu=all`. This relies on the CDI setup
-  the unbounded agent does on NVIDIA nodes. On other nodes GPU mode stays off.
+  `NVIDIA_VISIBLE_DEVICES=all` and
+  `NVIDIA_DRIVER_CAPABILITIES=compute,utility`. The operator knob
+  `RACER_DATAPLANE_NVIDIA=off|env|cdi` (default `env`) controls this. `cdi`
+  also adds the CDI annotation for `nvidia.com/gpu=all`. It is opt-in because
+  containerd fails pod creation when a CDI device cannot be resolved, which
+  would break the DaemonSet on nodes without NVIDIA GPUs. On other nodes the
+  environment variables are ignored and GPU mode stays off.
 - The image gains a `RACER_NATIVE_CUDA` build argument that builds the shim and
   the `cuda` feature.
 - The injector gains a label that mounts the client socket directory into app
