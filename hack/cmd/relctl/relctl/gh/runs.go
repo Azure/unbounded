@@ -20,6 +20,7 @@ const (
 	WorkflowBranch  = "create-release-branch.yaml"
 	WorkflowNightly = "nightly.yaml"
 	WorkflowCI      = "ci.yaml"
+	WorkflowRacer   = "racer.yaml"
 )
 
 // Run is one workflow run, reduced to what relctl reports on.
