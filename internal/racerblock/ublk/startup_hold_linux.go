@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"os"
 	"strconv"
-	"sync"
 	"syscall"
 	"time"
 )
@@ -20,6 +19,7 @@ const ublkSDevLive = 1
 
 // Reasons a failed queue stopped holding its ring.
 const (
+	holdStopped   = "stopped"   // served EIO until the device was stopped
 	holdResolved  = "resolved"  // startup resolved
 	holdPublished = "published" // disk LIVE and registered with the block layer
 )
@@ -39,33 +39,41 @@ type errServable struct{ error }
 func (e errServable) Unwrap() error { return e.error }
 
 // holdUntilSafe keeps a failed queue's ring open until closing it cannot
-// race START_DEV, and returns why it stopped holding.
+// strand a request or race START_DEV, and returns why it stopped
+// holding.
 //
-// Closing the ring cancels the queue's commands. Before START_DEV has
-// published the disk, Linux 7.0's cancel path returns early without
-// marking the queue canceling (ublk_start_cancel), so I/O that START_DEV
-// later queues, such as the async partition scan, can reach a completed
-// command. Once the disk exists, cancel marks the queue canceling and
-// aborts its I/O, so the ring can be closed. Linux 6.8 scans partitions
-// synchronously inside START_DEV, so a held queue must keep answering
-// I/O or START_DEV never returns.
+// On Linux 7.0, closing the ring cancels the queue's pending commands
+// but does not complete a request the kernel already handed to the
+// queue. Such requests are only aborted when the char device is
+// released (ublk_ch_release_work_fn, ublk_drv.c v7.0 2474-2476), and
+// teardown keeps it open until after STOP_DEV, whose del_gendisk
+// waits for them (genhd.c v7.0 710). Linux 6.8 aborted them from the
+// cancel path (ublk_abort_requests, ublk_drv.c v6.8 1451). Linux 7.0
+// also scans partitions from a work item that holds the disk's
+// open_mutex and may still be reading after START_DEV returns
+// (ublk_drv.c v7.0 2368-2370, 4452), so a failed queue can receive
+// requests after startup resolves.
 //
-// When err lost no request (errServable), the queue answers every
-// request with EIO until startup is resolved. Otherwise, or if that
-// fails, a request may be stuck on this queue and the queue waits until
-// startup is resolved or the disk is positively published; see
+// When err lost no request (errServable), the queue therefore answers
+// every request with EIO until teardown stops it after STOP_DEV, like a
+// healthy queue. Otherwise, or if that fails, the queue cannot answer
+// I/O and closes its ring once that cannot race START_DEV: before
+// START_DEV has published the disk, Linux 7.0's cancel path returns
+// early without marking the queue canceling (ublk_start_cancel), so I/O
+// that START_DEV later queues can reach a completed command. Once the
+// disk exists, cancel marks the queue canceling and aborts new I/O. See
 // waitSafe.
 func (q *queue) holdUntilSafe(err error) string {
+	if errors.As(err, new(errServable)) {
+		err = q.serveEIO()
+		if err == nil {
+			return holdStopped
+		}
+	}
+
 	done := q.dev.startDone
 	if isClosed(done) {
 		return holdResolved
-	}
-
-	if errors.As(err, new(errServable)) {
-		err = q.holdServing(done)
-		if err == nil {
-			return holdResolved
-		}
 	}
 
 	q.dev.cfg.Logger.Warn("ublk: failed queue cannot serve during startup", "queue", q.id, "err", err)
@@ -76,41 +84,31 @@ func (q *queue) holdUntilSafe(err error) string {
 	return waitSafe(done, probe, brokenHoldWarnAfter, q.dev.cfg.Logger.Warn)
 }
 
-// holdServing runs serveEIO and wakes it when done is closed.
-func (q *queue) holdServing(done <-chan struct{}) error {
-	stop := make(chan struct{})
-
-	var wg sync.WaitGroup
-
-	wg.Add(1)
-
-	go func() {
-		defer wg.Done()
-
-		select {
-		case <-done:
-			q.wake()
-		case <-stop:
+// markServing tells teardown that the queue answers I/O until stopped.
+func (q *queue) markServing() {
+	q.servingOnce.Do(func() {
+		if q.serving != nil {
+			close(q.serving)
 		}
-	}()
-
-	err := q.serveEIO(done)
-
-	close(stop)
-	wg.Wait()
-
-	return err
+	})
 }
 
-// serveEIO answers every request with EIO until done is closed or the
-// queue is stopped. It returns an error if the ring stops working or a
-// request may have been lost.
-func (q *queue) serveEIO(done <-chan struct{}) error {
+// serveEIO answers every request with EIO until the queue is stopped.
+// It submits every prepared answer before it returns, so no request is
+// left with the queue. It returns an error if the ring stops working or
+// a request may have been lost.
+func (q *queue) serveEIO() error {
 	if testHooks.serveEIO != nil {
 		if err := testHooks.serveEIO(q); err != nil {
 			return err
 		}
 	}
+
+	// Teardown may now run STOP_DEV, which relies on this loop to answer
+	// I/O. If the loop fails later, the queue falls back to the broken
+	// path while STOP_DEV may already be waiting; that case has no fix
+	// short of serving, which a broken ring cannot do.
+	q.markServing()
 
 	eio := -int32(syscall.EIO)
 
@@ -137,20 +135,24 @@ func (q *queue) serveEIO(done <-chan struct{}) error {
 				if err := q.prepIO(uIOCommitAndFetchReq, uint16(c.UserData), eio); err != nil {
 					return err
 				}
+
+				if testHooks.eioAnswered != nil {
+					testHooks.eioAnswered(q)
+				}
 			case ublkIOResAbort:
 			default:
 				return fmt.Errorf("io command tag %d: %w", c.UserData, syscall.Errno(-c.Res))
 			}
 		}
 
-		if isClosed(done) || q.stopping.Load() {
-			return nil
-		}
-
 		// Handler results that were already in flight are committed as
 		// they are; the queue is failing either way.
 		if err := q.drain(); err != nil {
 			return err
+		}
+
+		if q.stopping.Load() {
+			return q.ring.submitAndWait(0)
 		}
 
 		if !q.pollP {

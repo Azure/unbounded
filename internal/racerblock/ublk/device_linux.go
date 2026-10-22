@@ -185,6 +185,9 @@ var testHooks struct {
 	// serveEIO fails a held queue's EIO loop on entry to force the
 	// broken-ring path.
 	serveEIO func(q *queue) error
+	// eioAnswered runs after a held queue has prepared, but not yet
+	// submitted, an EIO answer to a request.
+	eioAnswered func(q *queue)
 }
 
 // launchQueues starts every queue thread and waits until each one has
@@ -345,13 +348,17 @@ func (d *Device) teardown(cause error) {
 			}
 		}
 
-		// A failed queue closes its ring once startup is resolved, which
-		// makes the kernel abort its I/O. Wait for that before STOP_DEV,
-		// which waits for in-flight I/O and would otherwise depend on a
-		// queue that no longer serves.
+		// STOP_DEV waits for in-flight I/O. A failed queue that can
+		// still answer I/O with EIO serves until q.stop below, like a
+		// healthy queue. One that cannot closes its ring once that is
+		// safe, which makes the kernel abort new I/O; wait for that
+		// before STOP_DEV.
 		for _, q := range d.queues {
 			if q.running && q.failed.Load() {
-				<-q.exited
+				select {
+				case <-q.exited:
+				case <-q.serving:
+				}
 			}
 		}
 

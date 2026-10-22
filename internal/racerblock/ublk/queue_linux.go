@@ -55,17 +55,23 @@ type queue struct {
 	fault    atomic.Pointer[error] // test-injected queue error
 	failed   atomic.Bool           // run failed on its own
 	exited   chan struct{}
+
+	// serving is closed when a failed queue answers I/O with EIO until
+	// it is stopped, so teardown need not wait for it to exit first.
+	serving     chan struct{}
+	servingOnce sync.Once
 }
 
 func newQueue(d *Device, id int) (*queue, error) {
 	cfg := d.cfg
 	q := &queue{
-		dev:    d,
-		id:     id,
-		depth:  cfg.Depth,
-		charFd: d.charFd,
-		efd:    -1,
-		exited: make(chan struct{}),
+		dev:     d,
+		id:      id,
+		depth:   cfg.Depth,
+		charFd:  d.charFd,
+		efd:     -1,
+		exited:  make(chan struct{}),
+		serving: make(chan struct{}),
 	}
 
 	var err error

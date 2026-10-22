@@ -206,21 +206,27 @@ func TestRunStartupResolvesAfterStart(t *testing.T) {
 	}
 }
 
+// TestHoldUntilSafeReturnsAfterStartup checks that a queue that cannot
+// serve does not hold its ring once startup is resolved. A servable
+// failure instead serves until stopped; see
+// TestHoldUntilSafeServesUntilStopped.
 func TestHoldUntilSafeReturnsAfterStartup(t *testing.T) {
 	d, _, _ := newStartupDevice(t)
 	close(d.startDone)
 
 	q := &queue{dev: d}
 
-	finished := make(chan struct{})
+	finished := make(chan string, 1)
 
 	go func() {
-		q.holdUntilSafe(errServable{errors.New("x")})
-		close(finished)
+		finished <- q.holdUntilSafe(errors.New("x"))
 	}()
 
 	select {
-	case <-finished:
+	case got := <-finished:
+		if got != holdResolved {
+			t.Fatalf("holdUntilSafe = %q, want %q", got, holdResolved)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("holdUntilSafe blocked after startup was resolved")
 	}
