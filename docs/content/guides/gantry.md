@@ -20,9 +20,11 @@ new content from the origin, and nodes that finish a pull become providers for
 other nodes.
 
 Gantry runs as a DaemonSet and uses each node's existing containerd content
-store. It does not introduce a separate image cache or a central metadata
-service. Peer discovery uses libp2p and a distributed hash table (DHT), and
-containerd continues to verify every content digest before using it.
+store for complete blobs. Artifact Streaming additionally uses a bounded cache
+of partial byte ranges; neither path needs a central metadata service. Peer
+discovery uses libp2p and a distributed hash table (DHT). Containerd verifies
+complete OCI content digests, while streamed OverlayBD reads validate range
+framing and any checksums carried by ZFile layers.
 
 After the node-level mirror configuration is installed, Gantry is transparent
 to workloads. Pods continue to use normal OCI image references,
@@ -38,13 +40,38 @@ all 1,000 pods.
 See [Gantry Performance at Scale](/guides/gantry-benchmark/) for raw run values,
 methodology, calculations, and limitations.
 
+### Artifact Streaming startup
+
+ACR Artifact Streaming removes the requirement to download and unpack the
+entire image before starting a container. Gantry serves the required image
+ranges from local content, peers, or origin and prefetches mount-critical
+metadata, while whole-layer distribution can continue in the background.
+
+The 1,000-node, 40 GiB/40-layer results are:
+
+| Pod-start latency | Gantry full-image pull, three-run mean | Gantry + Artifact Streaming, three completed runs | Observed reduction |
+| --- | ---: | ---: | ---: |
+| P50 | 636.100s | **7.667s** | **98.8%** |
+| P95 | 712.667s | **18.667s** | **97.4%** |
+| P100 | 803.933s | **54.667s** | **93.2%** |
+
+Every streaming run completed **1,000/1,000 pods** with a fresh random payload.
+Values are means of per-run percentiles, not pooled percentiles. The October 22,
+2026 streaming series is preliminary: three of five repeats are complete.
+The full-image and streaming cohorts are historical, unpaired measurements,
+not a controlled A/B test. Streaming times measure startup, not a complete
+payload download or read; shared base layers may already be cached.
+
+See the [Artifact Streaming benchmark details](/guides/gantry-benchmark/#artifact-streaming-startup-benchmarks)
+for individual runs, the metadata-prefetch optimization, and measurement limits.
+
 ## Design principles
 
 | Principle | Behavior |
 | --- | --- |
 | Transparent to workloads | Pods keep their normal image references, pull policies, and credentials. |
 | Decentralized | There is no central Gantry content server or cluster-wide catalog. |
-| No separate cache | Gantry reads and writes the containerd content store already used by kubelet. |
+| Reuse node storage | Complete blobs use containerd's content store; Artifact Streaming also caches bounded partial ranges. |
 | Digest addressed | Discovery and transfer operate on immutable OCI digests rather than tags. |
 | Horizontally supplied | A node that completes a pull can immediately serve the same content to other nodes. |
 | Registry fallback | Retriable mirror responses let containerd continue through its configured registry host chain. |

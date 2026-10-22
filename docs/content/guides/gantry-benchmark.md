@@ -75,7 +75,94 @@ traffic as the customer-visible source-registry measurement.
 Across the three Gantry runs, P95 stayed within a 3.6-second band while every
 run completed all 1,000 pods.
 
+## Artifact Streaming startup benchmarks
+
+ACR Artifact Streaming changes the startup critical path. Instead of waiting
+for all image layers to be downloaded, verified, and unpacked, the Gantry
+snapshotter mounts an OverlayBD image and fetches required ranges on demand.
+Gantry's peer distribution still supplies content, and background whole-layer
+pulls can continue after the application starts.
+
+### Preliminary 1,000-node results
+
+The following are the first three completed repeats of a five-run series on
+October 22, 2026. All repeats use the metadata-prefetch fix in
+[`0daace8e`](https://github.com/Azure/unbounded/commit/0daace8edbd7274b89b1da3b1db4246cce02c75c).
+The remaining repeats are still running; they are not included in these values.
+
+| Run | Completed pods | P50 | P95 | P99 | Maximum |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1,000/1,000 | 6s | 17s | 23s | 31s |
+| 2 | 1,000/1,000 | 8s | 20s | 26s | 67s |
+| 3 | 1,000/1,000 | 9s | 19s | 25s | 66s |
+
+The source run IDs, in table order, are
+`run-20261022-134210-00126be4`,
+`run-20261022-141505-74e06e78`, and
+`run-20261022-144935-d1394183`.
+
+For context, the mean of these per-run percentiles compares with the historical
+full-image Gantry chair-design cohort as follows:
+
+| Metric | Historical full-image Gantry, three-run mean | Gantry with Artifact Streaming, three completed repeats | Observed difference |
+| --- | ---: | ---: | ---: |
+| Per-run P50 mean | 636.100s | 7.667s | 98.8% lower |
+| Per-run P95 mean | 712.667s | 18.667s | 97.4% lower |
+| Per-run P100 mean | 803.933s | 54.667s | 93.2% lower |
+
+Values are means of per-run percentiles, not pooled percentiles. This historical
+comparison uses separate clusters and run sets, not a controlled A/B experiment;
+runtime, pacing, cache, and telemetry differences can also affect the result.
+
+### Streaming workload and measurement
+
+| Item | Configuration |
+| --- | --- |
+| Workers | 1,000 AKS `Standard_D8s_v3` nodes in Canada Central |
+| Platform | Linux/amd64, Kubernetes 1.35 |
+| Payload | Fresh random 40 GiB payload in 40 layers per run, plus the base image |
+| Runtime image | Digest-pinned ACR Artifact Streaming conversion |
+| Workload | One explicitly node-pinned pod per worker, `imagePullPolicy: Always`, `sh -c "sleep 15"` |
+| Startup latency | Pod `creationTimestamp` to the container's runtime `startedAt` |
+| Resolution and percentiles | Kubernetes timestamps at one-second resolution; nearest-rank percentiles |
+| Telemetry | Kubernetes pod states and timestamps; Prometheus bypassed |
+
+The workload follows the
+[benchmark pull workload](https://github.com/Azure/unbounded/blob/0daace8edbd7274b89b1da3b1db4246cce02c75c/hack/cmd/gantry-benchmark/job.go).
+Interpret these results with the following limits:
+
+- Previous benchmark payload images were cleared; every repeat used a distinct
+  payload and converted image. Shared base layers and filesystem pages may
+  remain warm.
+- Submissions spanned 54-60 seconds. Each latency starts at that pod's own
+  creation timestamp. First submission to last container completion took
+  94-98 seconds, including `sleep 15`.
+- The historical cohort used AKS audit records; streaming used runtime
+  timestamps from Kubernetes pod status.
+- `sleep 15` does not read the random payload files. These are startup numbers,
+  not full-image download times or a prediction for an application that scans
+  the entire image.
+- Origin bytes, peer bytes, and throughput were not measured for this series.
+  The earlier origin-traffic reductions do not apply to this streaming cohort.
+
+### Avoiding serial metadata stalls
+
+An earlier streaming trial had a 228-second maximum: image pull took 1.13
+seconds, but `CreateContainer` spent 225.76 seconds loading metadata serially.
+Background-committed manifests now trigger bounded, deduplicated head/tail
+prefetch as well as whole-layer reconciliation, even when containerd reuses
+the manifest without a new GET.
+
+A separate fresh-payload validation reduced the maximum to 41 seconds and the
+previously slow worker to 15 seconds, with 1,000/1,000 pods successful. Its P95
+and P99 were higher, so this demonstrated an extreme-outlier improvement, not
+a uniform improvement at every percentile. The table above records the next
+repeats with the fix enabled.
+
 ## Benchmark method
+
+This section describes the historical full-image cohorts, rather than the
+streaming method above.
 
 | Item | Configuration or source |
 | --- | --- |
