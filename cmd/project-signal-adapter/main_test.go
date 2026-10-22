@@ -17,18 +17,20 @@ func TestWriteOutputsProjectsCleanupFailure(t *testing.T) {
 	directory := t.TempDir()
 
 	output := signaladapter.AggregateOutput{
-		ExecutionState: "Error",
-		Verdict:        "Inconclusive",
-		Reason:         "BackendExecutionFailed",
-		CleanupFailure: "BackendCleanupFailed",
+		ExecutionState:  "Error",
+		Verdict:         "Inconclusive",
+		Reason:          "BackendExecutionFailed",
+		CleanupFailure:  "BackendCleanupFailed",
+		BackendEvidence: `{"version":"v1","complete":true,"participants":[{}]}`,
 	}
 	if err := writeOutputs(directory, output); err != nil {
 		t.Fatal(err)
 	}
 
 	for name, want := range map[string]string{
-		"reason":          "BackendExecutionFailed",
-		"cleanup-failure": "BackendCleanupFailed",
+		"reason":           "BackendExecutionFailed",
+		"cleanup-failure":  "BackendCleanupFailed",
+		"backend-evidence": `{"version":"v1","complete":true,"participants":[{}]}`,
 	} {
 		got, err := os.ReadFile(filepath.Join(directory, name))
 		if err != nil {
@@ -49,5 +51,16 @@ func TestWriteOutputsRejectsOversizedCleanupFailure(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("writeOutputs accepted oversized cleanup failure")
+	}
+}
+
+func TestWriteOutputsRejectsMalformedBackendEvidence(t *testing.T) {
+	t.Parallel()
+
+	err := writeOutputs(t.TempDir(), signaladapter.AggregateOutput{
+		BackendEvidence: `{"version":"v1","complete":true}`,
+	})
+	if err == nil {
+		t.Fatal("writeOutputs accepted malformed backend evidence")
 	}
 }

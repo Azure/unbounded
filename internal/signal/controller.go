@@ -74,6 +74,7 @@ var reservedScriptEnvironmentNames = map[string]struct{}{
 
 var workflowOutputLimits = map[string]int{
 	"backend-resources": 16 * 1024,
+	"backend-evidence":  256 * 1024,
 	"cleanup-failure":   64,
 	"measurements":      16 * 1024,
 	"reason":            4 * 1024,
@@ -983,6 +984,18 @@ func (r *RunReconciler) finish(
 			} else {
 				run.Status.Workflow.Outputs = outputs
 
+				evidenceComplete, evidenceErr := backendEvidenceComplete(
+					outputs["backend-evidence"],
+					len(run.Spec.Participants),
+				)
+				if evidenceErr != nil {
+					run.Status.Verdict = "Inconclusive"
+					finalReason = "workflow backend evidence rejected: " + evidenceErr.Error()
+				} else if run.Status.Verdict == "Pass" && !evidenceComplete {
+					run.Status.Verdict = "Inconclusive"
+					finalReason = "workflow backend evidence capture was incomplete"
+				}
+
 				backendResources, backendErr := backendResourceReferences(
 					outputs["backend-resources"],
 					len(run.Spec.Participants),
@@ -1250,6 +1263,48 @@ func workflowParameters(workflow *unstructured.Unstructured) (map[string]string,
 	}
 
 	return outputs, nil
+}
+
+func backendEvidenceComplete(content string, participantCount int) (bool, error) {
+	if content == "" {
+		return false, errors.New("backend-evidence is required")
+	}
+
+	var evidence struct {
+		Version      string `json:"version"`
+		Complete     bool   `json:"complete"`
+		Participants []any  `json:"participants"`
+	}
+
+	decoder := json.NewDecoder(strings.NewReader(content))
+	decoder.DisallowUnknownFields()
+
+	if err := decoder.Decode(&evidence); err != nil {
+		return false, fmt.Errorf("decode backend-evidence: %w", err)
+	}
+
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return false, errors.New("backend-evidence contains trailing JSON values")
+		}
+
+		return false, fmt.Errorf("decode trailing backend-evidence value: %w", err)
+	}
+
+	if evidence.Version != "v1" {
+		return false, fmt.Errorf("backend-evidence version %q is invalid", evidence.Version)
+	}
+
+	if len(evidence.Participants) != participantCount {
+		return false, fmt.Errorf(
+			"backend-evidence contains %d participants, want %d",
+			len(evidence.Participants),
+			participantCount,
+		)
+	}
+
+	return evidence.Complete, nil
 }
 
 func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationRun) (ctrl.Result, error) {

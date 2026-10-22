@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -202,15 +203,23 @@ func TestResultLogsReadsCurrentAndPreviousLauncherLogs(t *testing.T) {
 				"signal.unbounded-cloud.io/run":               "run",
 				"signal.unbounded-cloud.io/participant-index": "0",
 			},
-			OwnerReferences: []metav1.OwnerReference{{UID: "job-uid"}},
+			OwnerReferences: []metav1.OwnerReference{{UID: "launcher-job-uid"}},
 		},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "launcher"}}},
+	}
+	launcherJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "run-p0-launcher",
+			Namespace:       "project-signal",
+			UID:             "launcher-job-uid",
+			OwnerReferences: []metav1.OwnerReference{{UID: "job-uid"}},
+		},
 	}
 
 	var previousValues []bool
 
 	runner := &Runner{
-		Kubernetes: kubernetesfake.NewSimpleClientset(launcher),
+		Kubernetes: kubernetesfake.NewSimpleClientset(launcher, launcherJob),
 		ReadPodLog: func(
 			_ context.Context,
 			namespace, podName, containerName string,

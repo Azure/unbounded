@@ -906,6 +906,9 @@ func TestWorkflowParametersRejectMalformedEvidence(t *testing.T) {
 		"oversized cleanup failure": {
 			map[string]any{"name": "cleanup-failure", "value": strings.Repeat("x", 65)},
 		},
+		"oversized backend evidence": {
+			map[string]any{"name": "backend-evidence", "value": strings.Repeat("x", 256*1024+1)},
+		},
 		"wrong type": {
 			map[string]any{"name": "verdict", "value": true},
 		},
@@ -923,6 +926,55 @@ func TestWorkflowParametersRejectMalformedEvidence(t *testing.T) {
 
 			if _, err := workflowParameters(workflow); err == nil {
 				t.Fatal("workflowParameters succeeded")
+			}
+		})
+	}
+}
+
+func TestBackendEvidenceCompleteValidation(t *testing.T) {
+	t.Parallel()
+
+	for name, test := range map[string]struct {
+		content string
+		count   int
+		want    bool
+		wantErr bool
+	}{
+		"complete": {
+			content: `{"version":"v1","complete":true,"participants":[{}]}`,
+			count:   1,
+			want:    true,
+		},
+		"incomplete": {
+			content: `{"version":"v1","complete":false,"participants":[{}]}`,
+			count:   1,
+		},
+		"missing": {
+			count:   1,
+			wantErr: true,
+		},
+		"wrong count": {
+			content: `{"version":"v1","complete":true,"participants":[{},{}]}`,
+			count:   1,
+			wantErr: true,
+		},
+		"malformed": {
+			content: `{"version":"v1","complete":true,"participants":`,
+			count:   1,
+			wantErr: true,
+		},
+		"unknown version": {
+			content: `{"version":"v2","complete":true,"participants":[{}]}`,
+			count:   1,
+			wantErr: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := backendEvidenceComplete(test.content, test.count)
+			if (err != nil) != test.wantErr || got != test.want {
+				t.Fatalf("backendEvidenceComplete() = %t, %v", got, err)
 			}
 		})
 	}
@@ -1190,6 +1242,10 @@ func TestTerminalVerdictPersistsEvidenceAndCleanupReleasesNode(t *testing.T) {
 		t.Fatalf("retained workflow outputs = %#v", got.Status.Workflow.Outputs)
 	}
 
+	if got.Status.Workflow.Outputs["backend-evidence"] == "" {
+		t.Fatalf("backend evidence was not retained: %#v", got.Status.Workflow.Outputs)
+	}
+
 	if got.Status.Evidence.URI == "" || len(store.data) == 0 {
 		t.Fatal("evidence was not persisted")
 	}
@@ -1205,7 +1261,8 @@ func TestTerminalVerdictPersistsEvidenceAndCleanupReleasesNode(t *testing.T) {
 	}
 
 	if evidence.Workflow.Phase != "Succeeded" ||
-		evidence.Workflow.Outputs["measurements"] != "checked=14" {
+		evidence.Workflow.Outputs["measurements"] != "checked=14" ||
+		evidence.Workflow.Outputs["backend-evidence"] != got.Status.Workflow.Outputs["backend-evidence"] {
 		t.Fatalf("evidence workflow = %#v", evidence.Workflow)
 	}
 
@@ -1612,6 +1669,16 @@ func workflowObject(run *signalv1.CertificationRun, phase, verdict, reason strin
 	const workflowUID = "workflow-uid"
 
 	run.Status.Workflow.UID = workflowUID
+
+	backendEvidence, err := json.Marshal(map[string]any{
+		"version":      "v1",
+		"complete":     true,
+		"participants": make([]map[string]any, len(run.Spec.Participants)),
+	})
+	if err != nil {
+		panic(err)
+	}
+
 	workflow := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": workflowGVK.GroupVersion().String(),
 		"kind":       workflowGVK.Kind,
@@ -1637,6 +1704,7 @@ func workflowObject(run *signalv1.CertificationRun, phase, verdict, reason strin
 				map[string]any{"name": "verdict", "value": verdict},
 				map[string]any{"name": "reason", "value": reason},
 				map[string]any{"name": "measurements", "value": "checked=14"},
+				map[string]any{"name": "backend-evidence", "value": string(backendEvidence)},
 			}},
 		},
 	}}
