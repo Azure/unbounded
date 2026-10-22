@@ -321,6 +321,25 @@ pub struct HeadCompletion<C: Context, T> {
     pub _decoded: Option<C::Charge>,
 }
 
+/// Descriptors passed with `SCM_RIGHTS` while a request head was read.
+#[derive(Debug, Default)]
+pub struct ReceivedDescriptors {
+    /// Received descriptors, close-on-exec, in arrival order.
+    pub descriptors: Vec<std::os::fd::OwnedFd>,
+
+    /// Some ancillary data was truncated (`MSG_CTRUNC`) and its descriptors lost.
+    pub truncated: bool,
+}
+
+/// A decoded request head and the descriptors that arrived with it.
+pub struct RequestHead {
+    /// Admitted request head.
+    pub head: MessageHead,
+
+    /// Descriptors received while reading this head.
+    pub descriptors: ReceivedDescriptors,
+}
+
 /// Fixed admitted storage, zeroized before release or single-buffer reuse.
 pub struct OwnedBuffer<C: Context> {
     bytes: Vec<u8>,
@@ -557,7 +576,7 @@ impl<C: Context> HttpIo<C> {
     ) -> Operation<'a, C, HeadCompletion<C, MessageHead>> {
         Box::pin(async move {
             let completed = self
-                .receive_head_outcome(connection, scope, header_limit, false)
+                .receive_head_outcome(connection, scope, header_limit, false, None)
                 .await?;
             Ok(HeadCompletion {
                 connection: completed.connection,
@@ -576,7 +595,33 @@ impl<C: Context> HttpIo<C> {
         scope: &'a C::Scope,
         header_limit: usize,
     ) -> Operation<'a, C, HeadCompletion<C, Result<C, MessageHead>>> {
-        self.receive_head_outcome(connection, scope, header_limit, true)
+        self.receive_head_outcome(connection, scope, header_limit, true, None)
+    }
+
+    /// Like [`Self::receive_request_head_limited`], but read with `recvmsg` and
+    /// keep any `SCM_RIGHTS` descriptors that arrived while reading the head.
+    /// Descriptors that came with a rejected head are closed. The caller owns
+    /// the returned descriptors and must close any the request does not claim.
+    pub fn receive_request_head_with_descriptors<'a>(
+        &'a self,
+        connection: ConnectionLease<C>,
+        scope: &'a C::Scope,
+        header_limit: usize,
+    ) -> Operation<'a, C, HeadCompletion<C, Result<C, RequestHead>>> {
+        Box::pin(async move {
+            let sink = Rc::new(RefCell::new(ReceivedDescriptors::default()));
+            let completed = self
+                .receive_head_outcome(connection, scope, header_limit, true, Some(sink.clone()))
+                .await?;
+            let descriptors = std::mem::take(&mut *sink.borrow_mut());
+            Ok(HeadCompletion {
+                connection: completed.connection,
+                value: completed
+                    .value
+                    .map(|head| RequestHead { head, descriptors }),
+                _decoded: completed._decoded,
+            })
+        })
     }
 
     /// Decode and admit a head without allowing hooks to change wire framing.
@@ -586,6 +631,7 @@ impl<C: Context> HttpIo<C> {
         scope: &'a C::Scope,
         header_limit: usize,
         request_only: bool,
+        ancillary: Option<Rc<RefCell<ReceivedDescriptors>>>,
     ) -> Operation<'a, C, HeadCompletion<C, Result<C, MessageHead>>> {
         Box::pin(async move {
             scope.check()?;
@@ -670,15 +716,25 @@ impl<C: Context> HttpIo<C> {
                     buffer = larger;
                 }
                 let end = buffer.bytes.len();
-                let completed = self
-                    .reactor
-                    .recv(
-                        connection.socket(),
-                        BufferRange::new::<C::Error>(buffer, used..end)?,
-                        connection,
-                        scope,
-                    )
-                    .await?;
+                let range = BufferRange::new::<C::Error>(buffer, used..end)?;
+                let completed = if let Some(sink) = &ancillary {
+                    let received = self
+                        .reactor
+                        .recv_msg(connection.socket(), range, connection, scope)
+                        .await?;
+                    let mut sink = sink.borrow_mut();
+                    sink.truncated |= received.truncated;
+                    sink.descriptors.extend(received.descriptors);
+                    Completion {
+                        buffer: received.buffer,
+                        bytes: received.bytes,
+                        lease: received.lease,
+                    }
+                } else {
+                    self.reactor
+                        .recv(connection.socket(), range, connection, scope)
+                        .await?
+                };
                 if completed.bytes == 0 || completed.bytes > end - used {
                     return Err(uring_runtime::Error::Io.into());
                 }

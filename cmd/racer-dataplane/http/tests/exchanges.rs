@@ -685,3 +685,86 @@ fn response_on_request_only_connection_can_be_rejected_but_never_reused() {
     assert!(!response.connection.is_reusable());
     assert_eq!(io.reactor().in_flight(), 0);
 }
+
+/// Send `bytes` with `fds` as one `SCM_RIGHTS` message on a raw stream.
+fn send_with_fds(socket: &UnixStream, bytes: &[u8], fds: &[std::os::fd::RawFd]) {
+    use std::os::fd::AsRawFd;
+    let payload = std::mem::size_of_val(fds);
+    let space = unsafe { libc::CMSG_SPACE(payload as u32) } as usize;
+    let mut control = vec![0u64; space.div_ceil(8)];
+    let mut iov = libc::iovec {
+        iov_base: bytes.as_ptr().cast_mut().cast(),
+        iov_len: bytes.len(),
+    };
+    let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
+    header.msg_iov = &mut iov;
+    header.msg_iovlen = 1;
+    header.msg_control = control.as_mut_ptr().cast();
+    header.msg_controllen = space as _;
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&header);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(payload as u32) as _;
+        std::ptr::copy_nonoverlapping(fds.as_ptr().cast::<u8>(), libc::CMSG_DATA(cmsg), payload);
+    }
+    let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &header, 0) };
+    assert_eq!(sent, bytes.len() as isize);
+}
+
+/// Descriptors sent with any part of a request head are returned with it, and
+/// a rejected head closes them.
+#[test]
+fn request_heads_collect_passed_descriptors() {
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let io = io();
+    for malformed in [false, true] {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let server = ConnectionLease::from_reserved(server.into(), (), ()).unwrap();
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let mut read = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let first: &[u8] = if malformed {
+            b"BAD\r\n"
+        } else {
+            b"POST /x HTTP/1.1\r\n"
+        };
+        send_with_fds(&client, first, &[write.as_raw_fd(), write.as_raw_fd()]);
+        drop(write);
+        client.write_all(b"Content-Length: 0\r\n\r\n").unwrap();
+        let received = drive(
+            &io,
+            io.receive_request_head_with_descriptors(server, &RequestScope, 128),
+        )
+        .unwrap();
+        let mut byte = [0];
+        if malformed {
+            assert!(received.value.is_err());
+        } else {
+            let head = received.value.unwrap();
+            assert!(matches!(head.head.start, StartLine::Request { .. }));
+            assert!(!head.descriptors.truncated);
+            assert_eq!(head.descriptors.descriptors.len(), 2);
+            drop(head);
+        }
+        // Every copy is closed: the pipe reports EOF.
+        assert_eq!(read.read(&mut byte).unwrap(), 0);
+    }
+    // A plain head reports no descriptors.
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let server = ConnectionLease::from_reserved(server.into(), (), ()).unwrap();
+    client
+        .write_all(b"POST /x HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+        .unwrap();
+    let head = drive(
+        &io,
+        io.receive_request_head_with_descriptors(server, &RequestScope, 128),
+    )
+    .unwrap()
+    .value
+    .unwrap();
+    assert!(head.descriptors.descriptors.is_empty());
+    assert!(!head.descriptors.truncated);
+}
