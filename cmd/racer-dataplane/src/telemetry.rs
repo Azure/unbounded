@@ -53,11 +53,17 @@ pub const CONTROL_SLOTS: usize = server::CONTROL_SLOTS + server::JSON_CONTROL_SL
 /// capacity `MAX_BODY_BYTES` (see `Bounded`), never grows, and becomes the
 /// result held for the response, so one `MAX_RESPONSE_BYTES` term covers both
 /// the encoding buffer and the held result. The report is dropped before the
-/// result is published.
+/// result is published. The detached discovery helper's thread stack
+/// (`HARDWARE_STACK_BYTES`) is charged too, since a blocked sysfs read can keep
+/// the helper alive after diagnostics teardown.
 pub const RESERVED_BYTES: usize = server::RESERVED_BYTES
     + server::JSON_CONTROL_SLOTS * uring_runtime::reactor::SUBMISSION_BYTES
     + server::MAX_RESPONSE_BYTES
-    + crate::hardware::WORKING_BYTES;
+    + crate::hardware::WORKING_BYTES
+    + HARDWARE_STACK_BYTES;
+
+/// Stack size of the `/debug/hardware` discovery helper thread.
+const HARDWARE_STACK_BYTES: usize = 2 * 1024 * 1024;
 
 const _: () = assert!(server::MAX_BODY_BYTES <= server::MAX_RESPONSE_BYTES);
 const _: () = assert!(RESERVED_BYTES >= server::RESERVED_BYTES + HARDWARE_BYTES);
@@ -199,7 +205,7 @@ impl server::Scope for RequestScope {
 pub struct DiagnosticIo {
     reactor: Rc<Reactor>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
-    /// `/debug/hardware` working set and result (`HARDWARE_BYTES` of
+    /// `/debug/hardware` working set, helper stack, and result (`HARDWARE_BYTES` of
     /// `RESERVED_BYTES`). Each helper and its session share this charge, so it is
     /// returned only after this owner, every helper, and every response drop it.
     hardware: HardwareCharge,
@@ -209,8 +215,10 @@ pub struct DiagnosticIo {
 /// Thread-safe hardware memory charge shared with detached discovery helpers.
 pub(crate) type HardwareCharge = Arc<flow_control::Charge<AdmissionPolicy>>;
 
-/// Portion of `RESERVED_BYTES` funding one hardware discovery and its result.
-const HARDWARE_BYTES: usize = server::MAX_RESPONSE_BYTES + crate::hardware::WORKING_BYTES;
+/// Portion of `RESERVED_BYTES` funding one hardware discovery, its helper
+/// stack, and its result.
+const HARDWARE_BYTES: usize =
+    server::MAX_RESPONSE_BYTES + crate::hardware::WORKING_BYTES + HARDWARE_STACK_BYTES;
 impl DiagnosticIo {
     /// Explicit startup acquisition, using the worker's already-budgeted reactor.
     /// Must run before ordinary request admission fills the memory quota.
@@ -397,7 +405,7 @@ impl HardwareSession {
         let helper = state.clone();
         std::thread::Builder::new()
             .name("racer-hardware".into())
-            .stack_size(2 * 1024 * 1024)
+            .stack_size(HARDWARE_STACK_BYTES)
             .spawn(move || helper.run(job, limit))
             .map_err(|_| unavailable)?;
         Ok(Self { state })
@@ -751,6 +759,12 @@ mod encode_report_tests {
                 + server::JSON_CONTROL_SLOTS * uring_runtime::reactor::SUBMISSION_BYTES
                 + server::MAX_RESPONSE_BYTES
                 + crate::hardware::WORKING_BYTES
+                + HARDWARE_STACK_BYTES
+        );
+        assert_eq!(HARDWARE_STACK_BYTES, 2 * 1024 * 1024);
+        assert_eq!(
+            HARDWARE_BYTES,
+            server::MAX_RESPONSE_BYTES + crate::hardware::WORKING_BYTES + HARDWARE_STACK_BYTES
         );
         let report = crate::hardware::Report::default();
         let body = encode_report(&report, server::MAX_BODY_BYTES).unwrap();
