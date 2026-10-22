@@ -40,6 +40,12 @@ pub const MAX_REQUEST_BYTES: usize = 1024;
 /// Fixed buffer capacity shared by request parsing and response formatting.
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
+/// Bytes at the front of each response buffer reserved for the status line and headers.
+const HEAD_BYTES: usize = 256;
+
+/// Largest body a handler can write into a synchronous response.
+pub const MAX_BODY_BYTES: usize = MAX_RESPONSE_BYTES - HEAD_BYTES;
+
 /// Maximum lifetime of an exchange, further limited by the caller's deadline.
 pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -90,6 +96,9 @@ pub enum Response {
 
     /// Send the handler's text with the Prometheus exposition content type.
     Metrics,
+
+    /// Send the handler's text as `application/json` with a successful status.
+    Json,
 
     /// Discard handler output and send the fixed not-found body.
     NotFound,
@@ -660,7 +669,8 @@ fn respond(
     route: Route<'_>,
     bytes: &mut [u8],
 ) -> Result<usize, fmt::Error> {
-    const HEAD: usize = 256;
+    const HEAD: usize = HEAD_BYTES;
+    const JSON: &str = "application/json";
     const TEXT: &str = "text/plain; charset=utf-8";
     const METRICS: &str = "text/plain; version=0.0.4; charset=utf-8";
     if bytes.len() < HEAD {
@@ -675,6 +685,7 @@ fn respond(
         Route::Get(path) => match handler.get(path, &mut output)? {
             Response::Text => ("200 OK", TEXT, None),
             Response::Metrics => ("200 OK", METRICS, None),
+            Response::Json => ("200 OK", JSON, None),
             Response::Unavailable => ("503 Service Unavailable", TEXT, None),
             Response::NotFound => ("404 Not Found", TEXT, Some("not found\n")),
         },
@@ -1152,6 +1163,16 @@ mod tests {
                     out.write_str("example_total 1\n")?;
                     Ok(Response::Metrics)
                 }
+                "/json" => {
+                    out.write_str("{}\n")?;
+                    Ok(Response::Json)
+                }
+                "/body" => {
+                    for _ in 0..MAX_BODY_BYTES {
+                        out.write_char('x')?;
+                    }
+                    Ok(Response::Text)
+                }
                 "/ready" => {
                     out.write_str("not ready\n")?;
                     Ok(Response::Unavailable)
@@ -1216,57 +1237,58 @@ mod tests {
     #[test]
     fn precise_wire_formats_redaction_and_output_bounds() {
         let handler = Routes::default();
-        for (route, status, body, metrics, allow) in [
-            (Route::Get("/live"), "200 OK", "ok\n", false, false),
+        for (route, status, body, kind, allow) in [
+            (Route::Get("/live"), "200 OK", "ok\n", 0, false),
             (
                 Route::Get("/stats"),
                 "200 OK",
                 "example_total 1\n",
-                true,
+                1,
                 false,
             ),
+            (Route::Get("/json"), "200 OK", "{}\n", 2, false),
             (
                 Route::Get("/ready"),
                 "503 Service Unavailable",
                 "not ready\n",
-                false,
+                0,
                 false,
             ),
             (
                 Route::Get("/secret"),
                 "404 Not Found",
                 "not found\n",
-                false,
+                0,
                 false,
             ),
             (
                 Route::Method,
                 "405 Method Not Allowed",
                 "method not allowed\n",
-                false,
+                0,
                 true,
             ),
             (
                 Route::BadRequest,
                 "400 Bad Request",
                 "bad request\n",
-                false,
+                0,
                 false,
             ),
             (
                 Route::TooLarge,
                 "431 Request Header Fields Too Large",
                 "headers too large\n",
-                false,
+                0,
                 false,
             ),
         ] {
             let mut bytes = vec![0; MAX_RESPONSE_BYTES];
             let used = respond(&handler, route, &mut bytes).unwrap();
-            let content_type = if metrics {
-                "text/plain; version=0.0.4; charset=utf-8"
-            } else {
-                "text/plain; charset=utf-8"
+            let content_type = match kind {
+                1 => "text/plain; version=0.0.4; charset=utf-8",
+                2 => "application/json",
+                _ => "text/plain; charset=utf-8",
             };
             let allow = if allow { "Allow: GET\r\n" } else { "" };
             assert_eq!(
@@ -1279,6 +1301,10 @@ mod tests {
             assert!(!bytes.windows(6).any(|w| w == b"secret"));
         }
         assert_eq!(*handler.0.borrow(), vec![Event::Rejected; 4]);
+        let mut bytes = vec![0; MAX_RESPONSE_BYTES];
+        let used = respond(&handler, Route::Get("/body"), &mut bytes).unwrap();
+        assert!(used <= MAX_RESPONSE_BYTES);
+        assert!(bytes[..used].ends_with(&[b'x'; MAX_BODY_BYTES]));
         for size in [0, 255, 256, 257] {
             assert!(respond(&handler, Route::Get("/live"), &mut vec![0; size]).is_err());
         }
