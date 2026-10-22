@@ -149,6 +149,42 @@ func (d *Device) startupErr() error {
 	return d.startErr
 }
 
+// testHooks injects faults into the real startup path. Production code
+// never sets them.
+var testHooks struct {
+	// fetchTag overrides the tag of a queue's initial FETCH_REQ.
+	fetchTag func(qid, tag int) int
+	// beforeStartDev runs after every queue is ready, just before the
+	// last check ahead of START_DEV.
+	beforeStartDev func(d *Device)
+}
+
+// launchQueues starts every queue thread and waits until each one has
+// either been accepted by the kernel for all of its FETCH_REQs or failed.
+// START_DEV waits, uninterruptibly from Go's point of view, until every
+// queue is ready, so it must not be issued unless all of them are.
+func (d *Device) launchQueues() error {
+	ready := make(chan error, len(d.queues))
+	for _, q := range d.queues {
+		q.running = true
+		d.launch(q, ready)
+	}
+
+	var errs []error
+
+	for range d.queues {
+		if err := <-ready; err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	if err := errors.Join(errs...); err != nil {
+		return fmt.Errorf("ublk: submit FETCH_REQ: %w", err)
+	}
+
+	return nil
+}
+
 func (d *Device) start() error {
 	if err := d.ctrl.setParams(d.id, d.cfg); err != nil {
 		return err
@@ -172,28 +208,16 @@ func (d *Device) start() error {
 		d.queues = append(d.queues, q)
 	}
 
-	// Every queue must have all of its FETCH_REQs submitted before
-	// START_DEV, which waits for them.
-	ready := make(chan error, len(d.queues))
-	for _, q := range d.queues {
-		q.running = true
-		d.launch(q, ready)
+	if err := d.launchQueues(); err != nil {
+		return err
 	}
 
-	var errs []error
-
-	for range d.queues {
-		if err := <-ready; err != nil {
-			errs = append(errs, err)
-		}
+	if testHooks.beforeStartDev != nil {
+		testHooks.beforeStartDev(d)
 	}
 
-	if err := errors.Join(errs...); err != nil {
-		return fmt.Errorf("ublk: submit FETCH_REQ: %w", err)
-	}
-
-	// A queue may have failed after its FETCH_REQs were submitted; do
-	// not start a device that already has a dead queue.
+	// A queue may have failed after it became ready; do not start a
+	// device that already has a dead queue.
 	if err := d.startupErr(); err != nil {
 		return err
 	}

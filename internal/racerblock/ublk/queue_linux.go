@@ -52,6 +52,7 @@ type queue struct {
 
 	running  bool // set before run starts; read after
 	stopping atomic.Bool
+	fault    atomic.Pointer[error] // test-injected queue error
 	exited   chan struct{}
 }
 
@@ -285,6 +286,10 @@ func (q *queue) serve(ready chan<- error) error {
 			return nil
 		}
 
+		if f := q.fault.Load(); f != nil {
+			return *f
+		}
+
 		if live == 0 {
 			if q.localStop() {
 				return nil
@@ -309,9 +314,21 @@ func (q *queue) serve(ready chan<- error) error {
 	}
 }
 
+// fetchAll submits a FETCH_REQ for every tag and reports whether the
+// kernel accepted all of them. An accepted FETCH_REQ stays pending until
+// an I/O arrives, while a rejected one completes with an error during
+// submission. Without DEFER_TASKRUN, io_uring_enter posts such inline
+// completions before it returns, so any rejection is already in the CQ
+// here. A rejected tag leaves the queue not ready and START_DEV would
+// wait for it forever, so it must be reported now.
 func (q *queue) fetchAll() error {
 	for t := range q.depth {
-		if err := q.prepIO(uIOFetchReq, uint16(t), -1); err != nil {
+		tag := t
+		if testHooks.fetchTag != nil {
+			tag = testHooks.fetchTag(q.id, t)
+		}
+
+		if err := q.prepIO(uIOFetchReq, uint16(tag), -1); err != nil {
 			return err
 		}
 	}
@@ -320,7 +337,35 @@ func (q *queue) fetchAll() error {
 		return err
 	}
 
-	return q.ring.submitAndWait(0)
+	if err := q.ring.submitAndWait(0); err != nil {
+		return err
+	}
+
+	return q.checkFetched()
+}
+
+// checkFetched consumes completions posted while submitting FETCH_REQs.
+// Only the eventfd poll may complete successfully this early.
+func (q *queue) checkFetched() error {
+	for {
+		c, ok := q.ring.peekCQE()
+		if !ok {
+			return nil
+		}
+
+		q.ring.advanceCQ()
+
+		if c.UserData == pollUserData {
+			q.pollP = false
+			continue
+		}
+
+		if c.Res < 0 {
+			return fmt.Errorf("FETCH_REQ tag %d: %w", c.UserData, syscall.Errno(-c.Res))
+		}
+
+		return fmt.Errorf("FETCH_REQ tag %d: unexpected early completion %d", c.UserData, c.Res)
+	}
 }
 
 // drain resets the eventfd and commits finished handler results.
