@@ -161,8 +161,8 @@ racer-block device as slab storage, it would read its own cache through itself.
 The `Racer Block Device` CI job runs both device suites as root with the race
 detector inside a QEMU guest. The guest boots the Ubuntu 24.04 generic 6.8
 kernel and loads `ublk_drv`, so a kernel bug cannot hang the runner. The job
-fails if a suite fails, hangs, or skips because root, ublk, or io_uring is
-missing. The guest sets `RACER_BLOCK_TEST_VM=1`, which enables tests that are
+fails if QEMU exits nonzero, a suite fails or hangs, a required test does not
+print PASS, or any test other than the manual fio and delete-ID tests skips. The guest sets `RACER_BLOCK_TEST_VM=1`, which enables tests that are
 unsafe on a shared host. Run the same check locally without root:
 
 ```
@@ -172,7 +172,10 @@ hack/scripts/racer-block-vm-test.sh run
 ```
 
 The script needs `qemu-system-x86_64`, `busybox-static`, `cpio`, and `zstd`.
-It uses KVM when `/dev/kvm` is writable. See the script header for options.
+It uses KVM when QEMU can start it and TCG otherwise. Tests time out at 4
+minutes, each suite at 270 seconds in the guest, and the VM at 600 seconds.
+`hack/scripts/racer-block-vm-test.sh self-test` checks the result parsing
+without booting a VM. See the script header for options.
 
 To run the tests directly on a host, as root:
 
