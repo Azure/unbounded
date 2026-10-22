@@ -125,7 +125,7 @@ func TestHeadHeadersPreservesOtherSemantics(t *testing.T) {
 }
 
 func TestHeadHeadersPreservesCreditPadding(t *testing.T) {
-	for _, field := range []string{"Racer-Page-Credits", "Racer-Byte-Credits", "Racer-Ordered"} {
+	for _, field := range []string{"Racer-Page-Credits", "Racer-Byte-Credits"} {
 		for _, value := range []string{" 1", "\t1", "1 ", "1\t"} {
 			head := rawRequest("HEAD", strings.ToLower(field)+": "+value+"\r\n")
 			if err := ValidateRawHead(head, false); err != nil {

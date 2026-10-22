@@ -17,6 +17,9 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, SystemTime};
 
+/// Largest per-read spill horizon; spilled pages compete with warm holds.
+pub const MAX_RANGE_SPILL_PAGES: usize = 1024;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     pub max_ttl: Duration,
@@ -24,6 +27,9 @@ pub struct Config {
     pub max_jobs: usize,
     pub window: usize,
     pub retained_percent: usize,
+    /// Pages a read may fetch ahead of its in-memory window and park on local
+    /// disk under its own short hold. Zero disables read spill.
+    pub range_spill_pages: usize,
 }
 
 impl Default for Config {
@@ -34,6 +40,7 @@ impl Default for Config {
             max_jobs: 16,
             window: 2,
             retained_percent: 50,
+            range_spill_pages: 0,
         }
     }
 }
@@ -47,6 +54,7 @@ impl Config {
             || !(1..=1024).contains(&self.max_jobs)
             || !(1..=64).contains(&self.window)
             || !(1..=100).contains(&self.retained_percent)
+            || self.range_spill_pages > MAX_RANGE_SPILL_PAGES
         {
             return Err(Error::InvalidConfiguration);
         }
@@ -61,10 +69,39 @@ struct Progress {
     admissions: usize,
     running: bool,
     until: Option<SystemTime>,
-    frontier: u64,
+    /// Pages verified in the current revision, in any order.
+    completed: Completed,
     stopped: bool,
-    waiters: BTreeMap<u64, (Waker, std::time::Instant)>,
+    /// Waiter id to its waker, deadline and awaited page number.
+    waiters: BTreeMap<u64, (Waker, std::time::Instant, u64)>,
     sequence: u64,
+}
+
+/// Bitset of completed page numbers. It grows on demand, so jobs need not know
+/// the page count up front.
+#[derive(Default)]
+struct Completed(Vec<u64>);
+
+impl Completed {
+    fn contains(&self, page: u64) -> bool {
+        usize::try_from(page / 64)
+            .ok()
+            .and_then(|word| self.0.get(word))
+            .is_some_and(|word| word >> (page % 64) & 1 == 1)
+    }
+
+    fn insert(&mut self, page: u64) -> Result<()> {
+        let word = usize::try_from(page / 64).map_err(|_| Error::Overloaded)?;
+        if word >= self.0.len() {
+            self.0.resize(word + 1, 0);
+        }
+        self.0[word] |= 1 << (page % 64);
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
 }
 
 pub(crate) struct Job {
@@ -328,10 +365,19 @@ impl WarmRegistry {
         Ok(job)
     }
 
-    /// Publishes the first `frontier` pages of a test job.
+    /// Publishes pages `0..count` of a test job.
     #[cfg(test)]
-    pub(crate) fn publish_through(job: &Job, frontier: u64) {
-        job.update(|progress| progress.frontier = frontier);
+    pub(crate) fn publish_through(job: &Job, count: u64) {
+        for page in 0..count {
+            Self::publish(job, page);
+        }
+    }
+
+    /// Publishes one page of a test job in its current revision.
+    #[cfg(test)]
+    pub(crate) fn publish(job: &Job, page: u64) {
+        let revision = job.progress.lock().unwrap().revision;
+        job.complete(page, revision).unwrap();
     }
 
     /// Pages a remote primary owner holds are not stored on this node.
@@ -468,16 +514,9 @@ impl WarmRegistry {
         }
     }
 
-    #[cfg(test)]
+    /// Admit or join the warm job for `version`. Reads never own the version
+    /// exclusively, so admission does not depend on active provider selections.
     pub(super) fn begin(&self, version: &ObjectVersion) -> Result<(Arc<Job>, bool)> {
-        self.begin_selected(version, false)
-    }
-
-    pub(super) fn begin_selected(
-        &self,
-        version: &ObjectVersion,
-        selecting: bool,
-    ) -> Result<(Arc<Job>, bool)> {
         use std::sync::atomic::Ordering;
         if self.draining.load(Ordering::Acquire) {
             return Err(Error::Unavailable);
@@ -509,9 +548,6 @@ impl WarmRegistry {
             previous_until = progress.until;
             lease = Some(job.lease);
         }
-        if selecting {
-            return Err(Error::Overloaded);
-        }
         if (!jobs.contains_key(version) && jobs.len() >= config.max_jobs)
             || self
                 .releases
@@ -541,7 +577,7 @@ impl WarmRegistry {
                 admissions: 1,
                 running: true,
                 until: None,
-                frontier: 0,
+                completed: Completed::default(),
                 stopped: false,
                 waiters: BTreeMap::new(),
                 sequence: 0,
@@ -589,8 +625,8 @@ impl WarmRegistry {
                 progress
                     .waiters
                     .values()
-                    .filter(|(_, deadline)| *deadline <= now || remove)
-                    .map(|(waker, _)| waker.clone()),
+                    .filter(|(_, deadline, _)| *deadline <= now || remove)
+                    .map(|(waker, _, _)| waker.clone()),
             );
             !remove
         });
@@ -690,12 +726,34 @@ impl Job {
             progress
                 .waiters
                 .values()
-                .map(|(waker, _)| waker.clone())
+                .map(|(waker, _, _)| waker.clone())
                 .collect::<Vec<_>>()
         };
         for waker in wake {
             waker.wake();
         }
+    }
+
+    /// Marks `page` complete if `revision` is still current and wakes only the
+    /// waiters for that page. Earlier pages may still be pending.
+    fn complete(&self, page: u64, revision: u64) -> Result<()> {
+        let wake = {
+            let mut progress = self.progress.lock().unwrap();
+            if progress.revision != revision {
+                return Ok(());
+            }
+            progress.completed.insert(page)?;
+            progress
+                .waiters
+                .values()
+                .filter(|(_, _, number)| *number == page)
+                .map(|(waker, _, _)| waker.clone())
+                .collect::<Vec<_>>()
+        };
+        for waker in wake {
+            waker.wake();
+        }
+        Ok(())
     }
     pub(super) fn stop(&self) {
         self.update(|progress| {
@@ -729,7 +787,7 @@ impl Waiter {
         {
             return Poll::Ready(Ok(false));
         }
-        if number < progress.frontier {
+        if progress.completed.contains(number) {
             return Poll::Ready(Ok(true));
         }
         let id = match self.id {
@@ -746,7 +804,7 @@ impl Waiter {
         };
         progress
             .waiters
-            .insert(id, (cx.waker().clone(), self.deadline));
+            .insert(id, (cx.waker().clone(), self.deadline, number));
         Poll::Pending
     }
 }
@@ -839,9 +897,7 @@ pub(crate) async fn admit(
         .checked_add(ttl.min(config.max_ttl))
         .ok_or(Error::InvalidRequest)?;
     let permit = uring_runtime::drivers::reserve()?;
-    let (job, fresh) = directory
-        .subscriptions
-        .admit_warm(&metadata.version, &directory.warm)?;
+    let (job, fresh) = directory.warm.begin(&metadata.version)?;
     let (send, receive) = futures::channel::oneshot::channel();
     permit.submit_detached(Box::pin(async move {
         let mut guard = JobGuard {
@@ -878,11 +934,11 @@ pub(crate) async fn admit(
         let target = old.map_or(until, |old| old.max(until));
         let pages = metadata.length.div_ceil(PAGE_BYTES);
         // Every reservation pass can cross expiry on an untouched owner. Hide
-        // the old frontier before yielding and reverify all pages afterward.
+        // old completions before yielding and reverify all pages afterward.
         let revision = {
             let mut progress = job.progress.lock().unwrap();
             progress.revision = progress.revision.checked_add(1).ok_or(Error::Overloaded)?;
-            progress.frontier = 0;
+            progress.completed.clear();
             progress.revision
         };
         let reservation_scope = if fresh {
@@ -1015,9 +1071,10 @@ async fn run(
     window: usize,
     mut revision: u64,
 ) -> Result<()> {
-    use futures::{StreamExt, stream::FuturesOrdered};
+    use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
     let count = metadata.length.div_ceil(PAGE_BYTES);
-    let mut pending = FuturesOrdered::new();
+    // Pages complete in any order; the window bounds pages in flight.
+    let mut pending = FuturesUnordered::new();
     let mut next = 0;
     let mut failure = None;
     loop {
@@ -1049,20 +1106,16 @@ async fn run(
                 version: metadata.version.clone(),
                 number: PageNumber(next),
             };
-            pending.push_back(warm_one(
-                directory,
-                job,
-                plan,
-                page,
-                metadata.immutable(),
-                context,
-            ));
+            pending.push(
+                warm_one(directory, job, plan, page, metadata.immutable(), context)
+                    .map(move |result| (next, result)),
+            );
             next += 1;
         }
         if failure.is_some() {
             let _ = job.scope.cancel();
         }
-        let Some(result) = pending.next().await else {
+        let Some((number, result)) = pending.next().await else {
             if let Some(error) = failure {
                 return Err(error);
             }
@@ -1084,7 +1137,7 @@ async fn run(
             }
             if progress.revision != revision {
                 revision = progress.revision;
-                progress.frontier = 0;
+                progress.completed.clear();
                 next = 0;
                 continue;
             }
@@ -1092,11 +1145,11 @@ async fn run(
             return Ok(());
         };
         match result {
-            Ok(()) if failure.is_none() => job.update(|progress| {
-                if progress.revision == revision {
-                    progress.frontier += 1;
+            Ok(()) if failure.is_none() => {
+                if let Err(error) = job.complete(number, revision) {
+                    failure.get_or_insert(error);
                 }
-            }),
+            }
             Err(error) => {
                 failure.get_or_insert(error);
             }
@@ -1574,7 +1627,7 @@ pub(crate) async fn serve(
                     .await?;
                 // Never publish or acknowledge a same-ETag copy whose immutable
                 // metadata disagrees with the requester's admitted HEAD; a later
-                // read would reject it, so the frontier must not advance.
+                // read would reject it, so the page must not complete.
                 if !expected.compatible(&acquired.metadata.immutable()) {
                     return Err(Error::VersionUnavailable);
                 }
@@ -1920,7 +1973,7 @@ mod tests {
             futures::executor::block_on(registry.wait(&page, &scope)),
             Err(Error::Overloaded)
         );
-        job.update(|p| p.frontier = 1);
+        WarmRegistry::publish(&job, 0);
         assert_eq!(
             waiting.as_mut().poll(&mut cx),
             Poll::Ready(Ok(WarmWait::Local))
@@ -2434,7 +2487,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_completed_job_cannot_replace_active_provider_selection() {
+    fn warm_admission_is_not_refused_while_reads_select() {
         let registry = WarmRegistry::new(4);
         let version = version("a");
         let (job, _) = registry.begin(&version).unwrap();
@@ -2444,23 +2497,15 @@ mod tests {
             p.until = Some(SystemTime::UNIX_EPOCH);
         });
         let scheduler = super::super::range_stream::Scheduler::new(4);
-        let range = crate::model::ByteRange::From(0).resolve(3).unwrap();
-        let mut demand = scheduler
-            .register(version.clone(), range, 1, PAGE_BYTES, false)
-            .unwrap();
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        let Poll::Ready(Ok(super::super::range_stream::Next::Select(selection))) =
-            demand.poll_next(&mut cx)
-        else {
-            panic!("selection");
-        };
-        assert!(matches!(
-            scheduler.admit_warm(&version, &registry),
-            Err(Error::Overloaded)
-        ));
-        assert_eq!(registry.snapshot().0, 0);
+        let demand = crate::peer::subscriptions::Demand::new(vec![
+            crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
+        ])
+        .unwrap();
+        let selection =
+            super::super::range_stream::Selection::for_test(&scheduler, version.clone(), demand);
+        // Reads hold no exclusive selection, so an expired job is replaced.
+        assert!(registry.begin(&version).unwrap().1);
         drop(selection);
-        assert!(scheduler.admit_warm(&version, &registry).unwrap().1);
     }
 
     #[test]
@@ -2502,7 +2547,7 @@ mod tests {
     }
 
     #[test]
-    fn future_pages_wait_for_disk_frontier_and_cleanup_on_drop() {
+    fn future_pages_wait_for_their_own_completion_and_cleanup_on_drop() {
         let registry = WarmRegistry::new(2);
         let version = version("a");
         let (job, fresh) = registry.begin(&version).unwrap();
@@ -2521,16 +2566,129 @@ mod tests {
         let mut waiting = Box::pin(registry.wait(&page, &scope));
         assert!(waiting.as_mut().poll(&mut cx).is_pending());
         assert_eq!(registry.snapshot(), (1, 1));
-        job.update(|progress| progress.frontier = 7);
-        assert!(wakes.count() > 0);
+        // Completing every earlier page is not enough, and does not wake.
+        WarmRegistry::publish_through(&job, 7);
+        assert_eq!(wakes.count(), 0);
         assert!(waiting.as_mut().poll(&mut cx).is_pending());
-        job.update(|progress| progress.frontier = 8);
+        WarmRegistry::publish(&job, 7);
+        assert!(wakes.count() > 0);
         assert_eq!(
             waiting.as_mut().poll(&mut cx),
             Poll::Ready(Ok(WarmWait::Local))
         );
         drop(waiting);
         assert_eq!(registry.snapshot(), (1, 0));
+    }
+
+    #[test]
+    fn out_of_order_completion_wakes_only_that_pages_waiters() {
+        let registry = WarmRegistry::new(4);
+        let version = version("a");
+        let (job, _) = registry.begin(&version).unwrap();
+        let scope = scope();
+        let page = |number| PageId {
+            version: version.clone(),
+            number: PageNumber(number),
+        };
+        let early = Arc::new(crate::test_support::WakeCounter::default());
+        let late = Arc::new(crate::test_support::WakeCounter::default());
+        let early_waker = Waker::from(early.clone());
+        let late_waker = Waker::from(late.clone());
+        let mut early_cx = Context::from_waker(&early_waker);
+        let mut late_cx = Context::from_waker(&late_waker);
+        let first = page(0);
+        let third = page(2);
+        let mut waiting_first = Box::pin(registry.wait(&first, &scope));
+        let mut waiting_third = Box::pin(registry.wait(&third, &scope));
+        assert!(waiting_first.as_mut().poll(&mut early_cx).is_pending());
+        assert!(waiting_third.as_mut().poll(&mut late_cx).is_pending());
+        // Page 2 completes while pages 0 and 1 are still pending.
+        WarmRegistry::publish(&job, 2);
+        assert_eq!(early.count(), 0);
+        assert!(late.count() > 0);
+        assert_eq!(
+            waiting_third.as_mut().poll(&mut late_cx),
+            Poll::Ready(Ok(WarmWait::Local))
+        );
+        assert!(waiting_first.as_mut().poll(&mut early_cx).is_pending());
+        // A page already complete resolves immediately for a new waiter.
+        assert_eq!(
+            futures::executor::block_on(registry.wait(&third, &scope)),
+            Ok(WarmWait::Local)
+        );
+        WarmRegistry::publish(&job, 0);
+        assert!(early.count() > 0);
+        assert_eq!(
+            waiting_first.as_mut().poll(&mut early_cx),
+            Poll::Ready(Ok(WarmWait::Local))
+        );
+    }
+
+    #[test]
+    fn revision_change_clears_completed_pages() {
+        let registry = WarmRegistry::new(4);
+        let version = version("a");
+        let (job, _) = registry.begin(&version).unwrap();
+        let scope = scope();
+        let page = PageId {
+            version,
+            number: PageNumber(3),
+        };
+        let old = job.progress.lock().unwrap().revision;
+        job.complete(3, old).unwrap();
+        assert_eq!(
+            futures::executor::block_on(registry.wait(&page, &scope)),
+            Ok(WarmWait::Local)
+        );
+        job.update(|progress| {
+            progress.revision += 1;
+            progress.completed.clear();
+        });
+        let waker = Waker::from(Arc::new(crate::test_support::WakeCounter::default()));
+        let mut cx = Context::from_waker(&waker);
+        let mut waiting = Box::pin(registry.wait(&page, &scope));
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        // A completion from the old revision is discarded.
+        job.complete(3, old).unwrap();
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        WarmRegistry::publish(&job, 3);
+        assert_eq!(
+            waiting.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(WarmWait::Local))
+        );
+    }
+
+    #[test]
+    fn stop_and_expiry_resolve_out_of_order_waiters_unwarmed() {
+        let registry = WarmRegistry::new(4);
+        let scope = scope();
+        for expire in [false, true] {
+            let version = version(if expire { "expire" } else { "stop" });
+            let (job, _) = registry.begin(&version).unwrap();
+            WarmRegistry::publish(&job, 1);
+            let page = PageId {
+                version,
+                number: PageNumber(0),
+            };
+            let wakes = Arc::new(crate::test_support::WakeCounter::default());
+            let waker = Waker::from(wakes.clone());
+            let mut cx = Context::from_waker(&waker);
+            let mut waiting = Box::pin(registry.wait(&page, &scope));
+            assert!(waiting.as_mut().poll(&mut cx).is_pending());
+            if expire {
+                job.update(|progress| {
+                    progress.running = false;
+                    progress.until = Some(SystemTime::UNIX_EPOCH);
+                });
+            } else {
+                job.stop();
+            }
+            assert!(wakes.count() > 0);
+            assert_eq!(
+                waiting.as_mut().poll(&mut cx),
+                Poll::Ready(Ok(WarmWait::Unwarmed))
+            );
+        }
     }
 
     #[test]
@@ -2638,6 +2796,10 @@ mod tests {
             },
             Config {
                 retained_percent: 101,
+                ..Default::default()
+            },
+            Config {
+                range_spill_pages: MAX_RANGE_SPILL_PAGES + 1,
                 ..Default::default()
             },
             Config {

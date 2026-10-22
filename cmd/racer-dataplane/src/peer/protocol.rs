@@ -477,6 +477,11 @@ pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
             );
             push(&mut head, "racer-page-budget", subscription.page_budget);
             push(&mut head, "racer-byte-budget", subscription.byte_budget);
+            // Optional, so the single-flight request stays byte-identical to the
+            // encoding older providers accept. They refuse a request carrying it.
+            if let Some(flights) = subscription.flights {
+                push(&mut head, SUBSCRIPTION_FLIGHTS, flights);
+            }
             let mut intervals = Vec::new();
             for interval in subscription.demand.intervals() {
                 intervals.extend_from_slice(&interval.start.to_be_bytes());
@@ -809,6 +814,9 @@ pub(crate) fn grant_fields(
     push(head, "racer-grant-deadline", grant.deadline);
     push(head, "racer-page-budget", grant.remaining_page_budget);
     push(head, "racer-byte-budget", grant.remaining_byte_budget);
+    if let Some(flights) = grant.flights {
+        push(head, SUBSCRIPTION_FLIGHTS, flights);
+    }
     Ok(())
 }
 fn page_fields(
@@ -983,7 +991,23 @@ pub(crate) fn grant(head: &MessageHead) -> Result<super::subscriptions::Transfer
             .try_into()
             .map_err(|_| Error::InvalidRequest)?,
         remaining_byte_budget: number(head, "racer-byte-budget")?,
+        flights: subscription_flights(head)?,
     })
+}
+
+/// Header carrying `Subscription::flights` and `TransferGrant::flights`.
+pub(crate) const SUBSCRIPTION_FLIGHTS: &str = "racer-subscription-flights";
+
+/// Decode the optional flight count, refusing zero and values above the cap.
+pub(crate) fn subscription_flights(head: &MessageHead) -> Result<Option<u16>> {
+    use super::subscriptions::MAX_SUBSCRIPTION_FLIGHTS;
+    if head.unique(SUBSCRIPTION_FLIGHTS)?.is_none() {
+        return Ok(None);
+    }
+    match u16::try_from(number(head, SUBSCRIPTION_FLIGHTS)?) {
+        Ok(flights) if (1..=MAX_SUBSCRIPTION_FLIGHTS).contains(&flights) => Ok(Some(flights)),
+        _ => Err(Error::InvalidRequest),
+    }
 }
 fn metadata(head: &MessageHead) -> Result<ObjectMetadata> {
     let content_type = match head.unique("racer-metadata-version")? {
@@ -1154,6 +1178,7 @@ impl SecurityCodec {
                         .try_into()
                         .map_err(|_| Error::InvalidRequest)?,
                     byte_budget: number(head, "racer-byte-budget")?,
+                    flights: subscription_flights(head)?,
                 },
                 mode,
             },
@@ -1417,6 +1442,7 @@ pub(crate) mod tests {
             deadline: 7,
             remaining_page_budget: 4,
             remaining_byte_budget: 80,
+            flights: None,
         };
         let prefix = vec![
             ("racer-kind", "response"),
@@ -2615,6 +2641,26 @@ pub(crate) mod tests {
             assert_eq!(encode_deadline(decoded).unwrap(), encoded);
             assert!(decoded.0 <= deadline.0);
             assert_eq!(MAX_HEAD, MAX_SIGNED_HEAD);
+        }
+    }
+
+    #[test]
+    fn subscription_flights_are_optional_and_bounded() {
+        let head = |value: Option<&str>| {
+            let mut head = MessageHead {
+                start: StartLine::Response { status: 200 },
+                headers: Vec::new(),
+            };
+            if let Some(value) = value {
+                push(&mut head, SUBSCRIPTION_FLIGHTS, value);
+            }
+            head
+        };
+        assert_eq!(subscription_flights(&head(None)).unwrap(), None);
+        assert_eq!(subscription_flights(&head(Some("1"))).unwrap(), Some(1));
+        assert_eq!(subscription_flights(&head(Some("64"))).unwrap(), Some(64));
+        for bad in ["0", "65", "70000", "01", "x"] {
+            assert!(subscription_flights(&head(Some(bad))).is_err(), "{bad}");
         }
     }
 }

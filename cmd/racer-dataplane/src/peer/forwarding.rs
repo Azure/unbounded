@@ -890,6 +890,13 @@ fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()>
         {
             return Err(Error::Unauthorized);
         }
+        // A granted flight count answers exactly a request that asked for one,
+        // and never exceeds what was asked.
+        let granted = protocol::subscription_flights(response)?;
+        let requested = protocol::subscription_flights(request)?;
+        if granted.is_some() != requested.is_some() || granted > requested {
+            return Err(Error::Unauthorized);
+        }
         return Ok(());
     }
     if outcome == "not-found"

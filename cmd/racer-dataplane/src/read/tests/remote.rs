@@ -550,7 +550,6 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
                                     range: None,
                                     page_credits: 1,
                                     byte_credits: crate::model::PAGE_BYTES,
-                                    ordered: false,
                                 }
                             } else {
                                 ReadKind::Head

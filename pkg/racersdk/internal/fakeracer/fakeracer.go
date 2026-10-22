@@ -225,7 +225,7 @@ func streamPages(ctx context.Context, w *bufio.Writer, transport http.RoundTripp
 
 	snapshot := response.Metadata
 	buffer := make([]byte, 256*1024)
-	sequence := wire.NewSequence(s.First, end, true)
+	sequence := wire.NewSequence(s.First, end)
 
 	for first := s.First; first < end; {
 		number := first / wire.PageSize
