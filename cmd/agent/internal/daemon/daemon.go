@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"path/filepath"
 	"strings"
 	"time"
@@ -24,7 +23,6 @@ import (
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	netv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
-	"github.com/Azure/unbounded/internal/ociutil"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/daemoncred"
@@ -39,9 +37,6 @@ const (
 	// installationLockWaitTimeout bounds how long daemon startup waits for the
 	// launching bootstrap or activation to release installation ownership.
 	installationLockWaitTimeout = 30 * time.Second
-
-	daemonRegistrationMaxAttempts = 3
-	daemonRegistrationRetryDelay  = 2 * time.Second
 
 	// DeferredExitCode is returned when the daemon has no work because an
 	// installation owns the host. It is not a failure, and the daemon unit
@@ -168,7 +163,7 @@ func run(ctx context.Context, log *slog.Logger, opts runOptions) error {
 	// Ensure a Machine CR exists before blocking. In dynamic environments
 	// (manual-bootstrap, cloud-init) a Machine CR may not have been
 	// pre-created by machina.
-	if err := registerMachineWithRetry(ctx, log, kubeClient, active.Config, waitForRegistrationRetry); err != nil {
+	if err := registerMachine(ctx, log, kubeClient, active.Config); err != nil {
 		return fmt.Errorf("register machine: %w", err)
 	}
 
@@ -349,70 +344,6 @@ func registerMachine(ctx context.Context, log *slog.Logger, c client.Client, cfg
 	)
 
 	return reportProvisioningFormat(ctx, c, cfg)
-}
-
-type registrationRetryWaitFunc func(context.Context, time.Duration) error
-
-func registerMachineWithRetry(
-	ctx context.Context,
-	log *slog.Logger,
-	c client.Client,
-	cfg *provision.AgentConfig,
-	wait registrationRetryWaitFunc,
-) error {
-	delay := daemonRegistrationRetryDelay
-
-	for attempt := 1; attempt <= daemonRegistrationMaxAttempts; attempt++ {
-		err := registerMachine(ctx, log, c, cfg)
-		if err == nil {
-			return nil
-		}
-
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-
-		if !retryableMachineRegistrationError(err) || attempt == daemonRegistrationMaxAttempts {
-			return err
-		}
-
-		log.Warn("Machine registration hit a transient network failure; retrying",
-			"attempt", attempt,
-			"max_attempts", daemonRegistrationMaxAttempts,
-			"retry_after", delay,
-			"error", err,
-		)
-
-		if err := wait(ctx, delay); err != nil {
-			return err
-		}
-
-		delay *= 2
-	}
-
-	return nil
-}
-
-func retryableMachineRegistrationError(err error) bool {
-	if ociutil.RetryableNetworkError(err) {
-		return true
-	}
-
-	var netErr net.Error
-
-	return errors.As(err, &netErr) && netErr.Timeout()
-}
-
-func waitForRegistrationRetry(ctx context.Context, delay time.Duration) error {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
 }
 
 // Report only explicit installation observations, using existing status
