@@ -169,12 +169,21 @@ fn exchange(fixture: &Fixture, request: &[u8], fds: &[RawFd]) -> Vec<u8> {
     fixture.receive(&mut socket, true)
 }
 
-/// Pump until the connection and its descriptors are gone.
+/// Pump until the connection and its descriptors are gone. Completions can
+/// arrive late on a loaded host, so wait on a deadline, not a pump count.
 fn settle(fixture: &Fixture) {
-    for _ in 0..64 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        fixture.pump(16);
+        if fixture.listeners.active_connections() == 0 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "connection did not close");
+        std::thread::yield_now();
+    }
+    for _ in 0..8 {
         fixture.pump(16);
     }
-    assert_eq!(fixture.listeners.active_connections(), 0);
 }
 
 #[test]
