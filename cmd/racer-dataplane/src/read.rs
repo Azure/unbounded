@@ -190,7 +190,6 @@ impl Coordinator {
                     range,
                     page_credits,
                     byte_credits,
-                    ordered,
                     ..
                 } => {
                     if metadata.length == 0 && range.is_none() {
@@ -209,7 +208,7 @@ impl Coordinator {
                         membership,
                         scope.clone(),
                     )?;
-                    body.configure_subscription(page_credits, byte_credits, ordered)?;
+                    body.configure_subscription(page_credits, byte_credits)?;
                     Ok(ReadResponse {
                         retain_until: None,
                         metadata,

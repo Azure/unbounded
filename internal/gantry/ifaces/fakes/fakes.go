@@ -320,6 +320,8 @@ type DHT struct {
 	provideCall  map[string]int
 	withdrawCall map[string]int
 	findErr      error
+	findCalls    int
+	streamCalls  int
 }
 
 func NewDHT() *DHT {
@@ -405,6 +407,8 @@ func (d *DHT) FindProviders(_ context.Context, dg digest.Digest) ([]ifaces.Provi
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	d.findCalls++
+
 	if d.findErr != nil {
 		return nil, d.findErr
 	}
@@ -414,6 +418,45 @@ func (d *DHT) FindProviders(_ context.Context, dg digest.Digest) ([]ifaces.Provi
 	copy(out, src)
 
 	return out, nil
+}
+
+// StreamProviders implements ifaces.ProviderStreamer over the same injected
+// providers as FindProviders, without a result cap.
+func (d *DHT) StreamProviders(ctx context.Context, dg digest.Digest, _ time.Duration) (<-chan ifaces.Provider, func() error) {
+	d.mu.Lock()
+	d.streamCalls++
+	findErr := d.findErr
+	providers := append([]ifaces.Provider(nil), d.providers[dg.String()]...)
+	d.mu.Unlock()
+
+	out := make(chan ifaces.Provider)
+
+	go func() {
+		defer close(out)
+
+		if findErr != nil {
+			return
+		}
+
+		for _, provider := range providers {
+			select {
+			case out <- provider:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return out, func() error { return findErr }
+}
+
+// LookupCalls returns how many FindProviders and StreamProviders calls the
+// fake has served.
+func (d *DHT) LookupCalls() (find, stream int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return d.findCalls, d.streamCalls
 }
 
 // ---------------------------------------------------------------------------

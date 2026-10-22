@@ -23,12 +23,17 @@ import (
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
-const testImage = "example.com/racer-object:v1"
+const (
+	testImage = "example.com/racer-object:v1"
+	testCache = "test-cache"
+)
 
 var testCfg = Config{Image: testImage}
 
+// newPod returns an opted-in pod that names testCache. Entries in annotations
+// override the defaults; the value "<delete>" removes the key.
 func newPod(annotations map[string]string) *corev1.Pod {
-	a := map[string]string{}
+	a := map[string]string{CacheAnnotation: testCache}
 
 	for k, v := range annotations {
 		if v == "<delete>" {
@@ -70,7 +75,7 @@ func TestMutateSuccess(t *testing.T) {
 		wantArgs  []string
 		wantCache string
 	}{
-		{"minimal", nil, []string{"sidecar", "--cache=racer-object"}, "racer-object"},
+		{"minimal", nil, []string{"sidecar", "--cache=" + testCache}, testCache},
 		{"cache only", map[string]string{CacheAnnotation: "shared"}, []string{"sidecar", "--cache=shared"}, "shared"},
 		{
 			"full s3",
@@ -81,8 +86,8 @@ func TestMutateSuccess(t *testing.T) {
 		{
 			"full azure ipv6",
 			map[string]string{APIAnnotation: "azure", ListenAnnotation: "[::1]:8081"},
-			[]string{"sidecar", "--cache=racer-object", "--api=azure", "--listen=[::1]:8081"},
-			"racer-object",
+			[]string{"sidecar", "--cache=" + testCache, "--api=azure", "--listen=[::1]:8081"},
+			testCache,
 		},
 	}
 	for _, tt := range tests {
@@ -161,6 +166,8 @@ func TestMutateErrors(t *testing.T) {
 		{name: "cache slash", anno: map[string]string{CacheAnnotation: "a/b"}, want: CacheAnnotation},
 		{name: "cache uppercase", anno: map[string]string{CacheAnnotation: "Abc"}, want: CacheAnnotation},
 		{name: "cache empty", anno: map[string]string{CacheAnnotation: ""}, want: CacheAnnotation},
+		{name: "cache missing", anno: map[string]string{CacheAnnotation: "<delete>"}, want: CacheAnnotation},
+		{name: "cache missing with other annotations", anno: map[string]string{CacheAnnotation: "<delete>", APIAnnotation: "s3"}, want: CacheAnnotation},
 		{
 			name: "volume collision", want: VolumeName,
 			modify: func(p *corev1.Pod) { p.Spec.Volumes = []corev1.Volume{{Name: VolumeName}} },
@@ -510,6 +517,10 @@ func TestMutateNoop(t *testing.T) {
 			p.Spec.Containers = append(p.Spec.Containers, corev1.Container{Name: ContainerName})
 		},
 		"unlabeled invalid": func(p *corev1.Pod) { p.Labels = nil; p.Annotations = nil },
+		"existing init without cache": func(p *corev1.Pod) {
+			p.Annotations = nil
+			p.Spec.InitContainers = []corev1.Container{{Name: ContainerName}}
+		},
 	}
 	for name, modify := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -596,6 +607,20 @@ func TestHandler(t *testing.T) {
 
 		resp := h.Handle(ctx, request(t, admissionv1.Create, b))
 		if resp.Allowed || !strings.Contains(resp.Result.Message, APIAnnotation) {
+			t.Fatalf("resp = %+v", resp)
+		}
+	})
+
+	t.Run("missing cache denied", func(t *testing.T) {
+		bad := newPod(map[string]string{CacheAnnotation: "<delete>"})
+
+		b, err := json.Marshal(bad)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		resp := h.Handle(ctx, request(t, admissionv1.Create, b))
+		if resp.Allowed || len(resp.Patches) != 0 || !strings.Contains(resp.Result.Message, CacheAnnotation) {
 			t.Fatalf("resp = %+v", resp)
 		}
 	})

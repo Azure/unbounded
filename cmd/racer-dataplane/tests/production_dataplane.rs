@@ -1386,7 +1386,7 @@ fn request(method: &str, fields: &str) -> String {
 
 fn subscription_request(fields: &str) -> String {
     format!(
-        "POST /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nRacer-Ordered: 1\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: {P}\r\n{fields}\r\n",
+        "POST /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: {P}\r\n{fields}\r\n",
         "ab".repeat(32)
     )
 }

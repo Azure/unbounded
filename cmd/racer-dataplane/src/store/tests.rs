@@ -402,6 +402,7 @@ fn hard_hold_checkpoint_roundtrip_restores_only_live_disk_reservations() {
     let index = f.store.writer.index();
     let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
     index.reserve_hold(&id.version, 1, until).unwrap();
+    let before = index.hold_epoch(&id.version).unwrap();
     drive(&f.reactor, f.store.writer.persist_held(copy, &scope())).unwrap();
     let shard = futures::executor::block_on(f.store.checkpoint.snapshot_shard()).unwrap();
     f.store.checkpoint.finish_snapshot();
@@ -419,6 +420,28 @@ fn hard_hold_checkpoint_roundtrip_restores_only_live_disk_reservations() {
     )
     .unwrap();
     assert_eq!(index.hold_expiry(&id.version), Some(until));
+    // Holder identities are not persisted: a restored page has one holder.
+    assert_eq!(index.hold_holders(&id), 1);
+    // A restored hold is a new lifetime: releases issued before the restore
+    // cannot reach it, while its own epoch still releases the page.
+    let restored = index.hold_epoch(&id.version).unwrap();
+    assert_ne!(restored, before);
+    let page = std::iter::once(id.number).collect();
+    index.release_hold_pages(
+        &id.version,
+        &page,
+        before,
+        crate::store::holds::HolderKind::Reader,
+    );
+    assert_eq!(index.hold_holders(&id), 1);
+    index.release_hold_pages(
+        &id.version,
+        &page,
+        restored,
+        crate::store::holds::HolderKind::Reader,
+    );
+    assert_eq!(index.hold_holders(&id), 0);
+    assert_eq!(index.hold_expiry(&id.version), None);
     let mut image = checkpoint::decode(&bytes).unwrap();
     for segment in &mut image.shards[0].segments {
         for (_, deadline) in &mut segment.retained_records {
