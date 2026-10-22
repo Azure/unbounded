@@ -25,6 +25,10 @@
 #   -i, --image <image>       OS image (default: Ubuntu2204)
 #   -u, --admin-user <user>   Admin username (default: azureuser)
 #
+# Setup Options:
+#   --gds                     Also install the GPUDirect Storage kernel module
+#                             (nvidia-fs). Open kernel module SKUs only.
+#
 # Delete Options:
 #   -y, --yes                 Skip confirmation prompt
 #
@@ -54,6 +58,7 @@ VM_SIZE="Standard_NC6s_v3"
 IMAGE="Ubuntu2204"
 ADMIN_USER="azureuser"
 SKIP_CONFIRM=false
+GDS=false
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -80,12 +85,17 @@ Create Options:
   -i, --image <image>       OS image (default: Ubuntu2204)
   -u, --admin-user <user>   Admin username (default: azureuser)
 
+Setup Options:
+  --gds                     Also install the GPUDirect Storage kernel module
+                            (nvidia-fs). Open kernel module SKUs only.
+
 Delete Options:
   -y, --yes                 Skip confirmation prompt
 
 Examples:
   gpu-vm.sh create
   gpu-vm.sh setup-nvidia
+  gpu-vm.sh setup-nvidia --size Standard_ND96isr_H100_v5 --gds
   gpu-vm.sh create --size Standard_NC24ads_A100_v4 --location eastus2
   gpu-vm.sh delete -y
 EOF
@@ -166,7 +176,15 @@ cmd_setup-nvidia() {
     echo "==> Installing NVIDIA drivers on VM '${VM_NAME}'"
     echo "    VM SKU:          ${VM_SIZE}"
     echo "    Resource Group:  ${RESOURCE_GROUP}"
+    echo "    GDS:             ${GDS}"
     echo ""
+
+    # Use name=value so az does not parse "--gds" as its own option. For
+    # Linux scripts the values are passed to the script positionally.
+    local params=("sku=${VM_SIZE}")
+    if [[ "${GDS}" == true ]]; then
+        params+=("gds=--gds")
+    fi
 
     echo "==> Uploading and executing driver install script..."
     local result
@@ -176,7 +194,7 @@ cmd_setup-nvidia() {
         --name "${VM_NAME}" \
         --command-id RunShellScript \
         --scripts @"${driver_script}" \
-        --parameters "${VM_SIZE}" \
+        --parameters "${params[@]}" \
         --output json)
 
     local stdout stderr
@@ -191,6 +209,10 @@ cmd_setup-nvidia() {
     echo "==> Driver installation initiated. The VM will reboot automatically."
     echo "    After reboot, SSH into the VM and verify with:"
     echo "      ls -la /dev/nvidia*"
+    if [[ "${GDS}" == true ]]; then
+        echo "      lsmod | grep nvidia_fs"
+        echo "      ls -la /dev/nvidia-fs*"
+    fi
 }
 
 # --------------------------------------------------------------------------- #
@@ -244,6 +266,7 @@ while [[ $# -gt 0 ]]; do
         -i|--image)          IMAGE="$2"; shift 2 ;;
         -u|--admin-user)     ADMIN_USER="$2"; shift 2 ;;
         -y|--yes)            SKIP_CONFIRM=true; shift ;;
+        --gds)               GDS=true; shift ;;
         -h|--help)           usage ;;
         *)                   die "Unknown option: $1" ;;
     esac

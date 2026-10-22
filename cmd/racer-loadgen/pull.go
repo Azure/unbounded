@@ -15,7 +15,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -57,7 +56,7 @@ type puller struct {
 	metrics      *loadMetrics
 	client       *http.Client
 	transport    *http.Transport
-	devNull      *os.File
+	drains       *drainFiles
 	buffers      sync.Pool
 	failureLogs  failureLogs
 	expected     map[digest.Digest]blobSource
@@ -157,10 +156,10 @@ func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*pu
 		}
 	}
 
-	p.devNull, err = os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	p.drains, err = newDrainFiles()
 	if err != nil {
 		p.close()
-		return nil, fmt.Errorf("open drain destination: %w", err)
+		return nil, err
 	}
 
 	return p, nil
@@ -169,10 +168,8 @@ func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*pu
 func (p *puller) close() {
 	p.transport.CloseIdleConnections()
 
-	if p.devNull != nil {
-		if err := p.devNull.Close(); err != nil {
-			slog.Warn("close drain destination", "error", err)
-		}
+	if p.drains != nil {
+		p.drains.close()
 	}
 
 	if p.closeBackend != nil {
@@ -424,8 +421,14 @@ func (p *puller) fetch(ctx context.Context, kind string, desc ocispec.Descriptor
 func (p *puller) readBody(body io.Reader) (int64, string, error) {
 	if !p.opts.Verify && !p.opts.DiagnoseIntegrity {
 		// Keep both the *os.File destination and Object source unwrapped so the
-		// SDK can splice. The file is opened once per puller and shared by workers.
-		n, err := io.Copy(p.devNull, body)
+		// SDK can splice. Each concurrent read borrows its own file; see drainFiles.
+		devNull, err := p.drains.get()
+		if err != nil {
+			return 0, "", err
+		}
+
+		n, err := io.Copy(devNull, body)
+		p.drains.put(devNull)
 		p.metrics.receivedBytes.Add(float64(n))
 
 		return n, "", err

@@ -47,6 +47,14 @@ type fakeNodeOperator struct {
 	stopCalled bool
 	stopErr    error
 
+	bootID    string
+	bootIDErr error
+
+	rebootCalls int
+	rebootErr   error
+	// rebootDuring runs inside RebootHost, to simulate the daemon stopping.
+	rebootDuring func()
+
 	repaveActive *ActiveMachine
 	repaveConfig *provision.UnboundedAgentConfig
 	repaveErr    error
@@ -105,6 +113,19 @@ func (op *fakeNodeOperator) StopDaemon(context.Context, *slog.Logger) error {
 	op.stopCalled = true
 
 	return op.stopErr
+}
+
+func (op *fakeNodeOperator) BootID() (string, error) {
+	return op.bootID, op.bootIDErr
+}
+
+func (op *fakeNodeOperator) RebootHost(context.Context, *slog.Logger) error {
+	op.rebootCalls++
+	if op.rebootDuring != nil {
+		op.rebootDuring()
+	}
+
+	return op.rebootErr
 }
 
 func (op *fakeNodeOperator) RepaveNode(
@@ -184,11 +205,7 @@ func newTestMachinaMachineOperationReconcilerWithLockPath(
 		c,
 		"test-machine",
 		"test-node",
-		daemon.MachineOperationHandlers{
-			v1alpha3.OperationNodeReboot:   target.reconcileNodeReboot,
-			v1alpha3.OperationAgentUpgrade: target.reconcileAgentUpgrade,
-			v1alpha3.OperationAgentReset:   target.reconcileAgentReset,
-		},
+		target.handlers(),
 	)
 	require.NoError(t, err)
 

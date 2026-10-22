@@ -70,13 +70,15 @@ resources:
     limits:
       cpu: "8"
       memory: 8Gi
+  # gantry init loads the full gantry binary. Its working set on a cold node is
+  # about 46Mi, and a limit close to that makes it thrash instead of exiting.
   init:
     requests:
       cpu: 10m
-      memory: 16Mi
+      memory: 64Mi
     limits:
       cpu: 100m
-      memory: 32Mi
+      memory: 128Mi
   nodeConfig:
     requests:
       cpu: 5m

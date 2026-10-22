@@ -102,6 +102,7 @@ func TestArtifactStreamingManifestPullTransitionsOriginToPeer(t *testing.T) {
 	resolver := coldstart.NewChairResolver(coldstart.ChairOptions{
 		Chairs:       &artifactStreamingChairSnapshot{snapshot: chairs.Snapshot{Epoch: epoch, Chairs: []chairs.Chair{chair}}},
 		Discovery:    dht,
+		PeerMetadata: transfer.NewClient(),
 		Coord:        coordinator,
 		Inflight:     inflight.New(inflight.DefaultStalls(), nil),
 		SelfPeerID:   "requester",

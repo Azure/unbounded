@@ -152,6 +152,10 @@ unbounded-owned per-site DaemonSets.
 - Deleting a Site deletes or stops updating its managed kube-proxy DaemonSet.
 - Changing a Site's pod CIDR assignment updates the corresponding DaemonSet and
   rolls kube-proxy for that site.
+- Reconciliation compares controller-owned DaemonSet fields from the informer
+  cache first. It only reads the live object when the cached fields differ and
+  only writes after the live fields are rechecked. API server defaults are
+  normalized before deciding that an update is needed.
 - If a provider later starts covering an unbounded node, the controller removes
   the managed marker label, and the unbounded-owned kube-proxy pod drains from
   that node.

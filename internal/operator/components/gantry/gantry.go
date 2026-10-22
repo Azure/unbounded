@@ -9,6 +9,11 @@
 //
 // The unbounded agent manages the per-node containerd wiring, so the operator
 // installs only the Gantry workload and its Kubernetes configuration.
+//
+// When ClusterCache/gantry exists, the operator switches an installation it
+// reconciles to the Racer backend: Gantry then serves registry content
+// through Racer and runs only where the Racer dataplane runs. The cache never
+// installs Gantry by itself.
 package gantry
 
 import (
@@ -32,8 +37,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	gantrymanifests "github.com/Azure/unbounded/deploy/gantry"
 	"github.com/Azure/unbounded/internal/operator/component"
+	"github.com/Azure/unbounded/internal/racer/workload"
 )
 
 const (
@@ -52,10 +59,13 @@ const (
 	// the other components.
 	imageRepository = "gantry"
 
-	// agentContainerName is the gantry agent's main container. Only this
-	// container carries the operator-managed image; the DaemonSet's busybox
-	// init container keeps its pinned public image.
+	// agentContainerName and initContainerName are the gantry agent's main
+	// container and the init container that prepares its identity directory.
+	// Both run the gantry image, so only they carry the operator-managed image;
+	// any other container in the DaemonSet, such as one added by a workload
+	// override, keeps its own image.
 	agentContainerName                = "gantry"
+	initContainerName                 = "gantry-init"
 	overlayBDConfigDaemonSetName      = "gantry-overlaybd-config"
 	overlayBDConfigContainerName      = "configure"
 	overlayBDSnapshotterContainerName = "snapshotter"
@@ -193,17 +203,43 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 		dependsOn = append(dependsOn, configOp.Ref())
 	}
 
+	// ClusterCache/gantry only reconfigures a Gantry installation the operator
+	// already reconciles; it never installs Gantry on its own.
+	racerRequested, racerConflict, racerPlacement, err := racerMode(ctx, env)
+	if err != nil {
+		return nil, component.Result{}, err
+	}
+
+	if artifactStreaming.Enabled && racerRequested {
+		return nil, component.Result{}, fmt.Errorf("artifact streaming cannot be combined with the Racer backend selected by ClusterCache/%s", RacerCacheName)
+	}
+
 	objects, err := decodeManifests(env, applyMutator(
 		env.Config.Image(imageRepository),
 		env.Config.Image(overlayBDConfigImageRepository),
 		configHash,
 		artifactStreaming,
+		racerPlacement,
 	))
 	if err != nil {
 		return nil, component.Result{}, err
 	}
 
+	result := component.Reconciled()
+	if racerConflict {
+		// The agent is still applied, in default mode.
+		result = racerOriginConflict()
+	}
+
 	for _, obj := range objects {
+		agent := obj.GetKind() == "DaemonSet" && obj.GetName() == daemonSetName
+		if agent && racerRequested && racerPlacement == nil {
+			// Leave the agent as it is until the dataplane placement is known.
+			result = racerPending()
+
+			continue
+		}
+
 		kind := component.OpApply
 		if obj.GetKind() == "Lease" && strings.HasPrefix(obj.GetName(), "gantry-chair-") {
 			kind = component.OpCreateIfAbsent
@@ -216,14 +252,14 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 			DependsOn: dependsOn,
 		}
 
-		if obj.GetKind() == "DaemonSet" && (obj.GetName() == daemonSetName || obj.GetName() == overlayBDConfigDaemonSetName) {
+		if agent || obj.GetKind() == "DaemonSet" && obj.GetName() == overlayBDConfigDaemonSetName {
 			op.Overridable = true
 		}
 
 		plan.Add(op)
 	}
 
-	return plan, component.Reconciled(), nil
+	return plan, result, nil
 }
 
 func resolveArtifactStreaming(sites []unboundedv1alpha3.Site) (artifactStreamingConfig, error) {
@@ -268,10 +304,12 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	// ConfigMap edit.
 	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(),
 		builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(configName, legacyNodeConfigName))))
+	// The racer DaemonSet supplies the agent placement in Racer mode.
 	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(),
-		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(daemonSetName, legacyNodeConfigDaemonSetName, overlayBDConfigDaemonSetName))))
+		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(daemonSetName, legacyNodeConfigDaemonSetName, overlayBDConfigDaemonSetName, workload.DataplaneDaemonSetName))))
 	b.Watches(&coordinationv1.Lease{}, env.RequestSingleton(),
 		builder.WithPredicates(chairLeaseDeletePredicate(env.Namespace)))
+	b.Watches(&racerv1.ClusterCache{}, env.RequestSingleton(), builder.WithPredicates(racerCachePredicate()))
 	b.Watches(&schedulingv1.PriorityClass{}, env.RequestSingleton(),
 		builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
 			return obj.GetName() == priorityClassName
@@ -395,9 +433,14 @@ func legacyCleanupOperations(componentName, namespace string) []component.Operat
 // applyMutator skips CRDs and the separately reconciled gantry-config ConfigMap,
 // stamps the operator-derived agent image onto the agent DaemonSet, and stamps
 // the config payload hash on its pod template so a config change rolls the
-// DaemonSet. Only the agent's own container is re-imaged.
-func applyMutator(agentImage, overlayBDConfigImage, configHash string, artifactStreaming artifactStreamingConfig) func(*unstructured.Unstructured) error {
+// DaemonSet. Only the agent and its init container are re-imaged. A non-nil
+// racerPlacement switches the agent to the Racer backend.
+func applyMutator(agentImage, overlayBDConfigImage, configHash string, artifactStreaming artifactStreamingConfig, racerPlacement *workload.NodePlacement) func(*unstructured.Unstructured) error {
 	return func(obj *unstructured.Unstructured) error {
+		if artifactStreaming.Enabled && racerPlacement != nil {
+			return fmt.Errorf("artifact streaming cannot be combined with the Racer backend")
+		}
+
 		if obj.GetKind() == component.CRDKind {
 			obj.Object = nil
 
@@ -411,13 +454,21 @@ func applyMutator(agentImage, overlayBDConfigImage, configHash string, artifactS
 		}
 
 		if obj.GetKind() == "DaemonSet" && obj.GetName() == daemonSetName {
-			if err := component.SetNamedContainerImage(obj, agentContainerName, agentImage); err != nil {
-				return fmt.Errorf("set gantry agent image: %w", err)
+			for _, name := range []string{initContainerName, agentContainerName} {
+				if err := component.SetNamedContainerImage(obj, name, agentImage); err != nil {
+					return fmt.Errorf("set gantry %s image: %w", name, err)
+				}
 			}
 
 			if artifactStreaming.Enabled {
 				if err := setNamedContainerEnv(obj, agentContainerName, artifactStreamingEnabledEnv, "true"); err != nil {
 					return fmt.Errorf("enable gantry artifact streaming: %w", err)
+				}
+			}
+
+			if racerPlacement != nil {
+				if err := applyRacerMode(obj, racerPlacement); err != nil {
+					return fmt.Errorf("configure gantry Racer backend: %w", err)
 				}
 			}
 

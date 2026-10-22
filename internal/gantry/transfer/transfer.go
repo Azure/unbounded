@@ -255,23 +255,6 @@ func (s *Server) handleV2(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind) {
-	// Shed load on a saturated seed so the requester re-discovers another
-	// provider (the cascade) instead of queueing behind us. Only full
-	// blob-body GETs are capped: HEADs are cheap and manifests are small and
-	// needed for discovery/verification. Small bounded ranges take a separate
-	// class so they are not held behind bulk streams.
-	if r.Method == http.MethodGet && kind == ifaces.KindBlob {
-		release, ok := s.tryAcquireServe(r.Header.Get("Range"))
-		if !ok {
-			w.Header().Set("Retry-After", "1")
-			http.Error(w, "peer serving at capacity", http.StatusTooManyRequests)
-
-			return
-		}
-
-		defer release()
-	}
-
 	rc, size, err := s.openBlob(r.Context(), d)
 	if err != nil {
 		var enf *ifaces.ErrNotFound
@@ -316,6 +299,21 @@ func (s *Server) serveDigest(w http.ResponseWriter, r *http.Request, d digest.Di
 	}
 
 	defer func() { _ = rc.Close() }() //nolint:errcheck // best-effort close
+
+	// A 429 must mean this digest is present but cannot be served yet.
+	// Checking admission before opening content would turn a stale provider
+	// into a false capacity signal and keep its requesters waiting.
+	if r.Method == http.MethodGet && kind == ifaces.KindBlob {
+		release, ok := s.tryAcquireServe(r.Header.Get("Range"))
+		if !ok {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "peer serving at capacity", http.StatusTooManyRequests)
+
+			return
+		}
+
+		defer release()
+	}
 
 	contentReader := io.Reader(rc)
 	mediaTypeHint := s.lookupMediaType(d)

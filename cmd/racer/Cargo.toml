@@ -1,0 +1,91 @@
+[workspace]
+members = [".", "runtime", "alloc", "crypto", "verbs", "gpu", "http", "topology", "telemetry", "flow", "control-wire", "controlplane", "uds-endpoint", "wire-codec", "peer-wire", "object-wire", "cluster-control", "admission", "core", "sim"]
+resolver = "3"
+
+[package]
+name = "racer"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Racer node-local read-through cache dataplane"
+
+[features]
+default = []
+# Enables the separately loaded native verbs adapter; unavailable hardware uses HTTP.
+rdma = ["rdma-verbs/native"]
+# Enables the separately loaded CUDA shim (libracer_gpu_cuda.so.1); without a GPU, gpu-read is unavailable.
+cuda = ["racer-gpu/native"]
+# Test-only Go SDK launcher; keeps crate-private fixture assembly out of default builds.
+subscription-interop = []
+
+[[test]]
+name = "subscription_interop"
+path = "tests/subscription_interop.rs"
+required-features = ["subscription-interop"]
+
+[dependencies]
+controlplane = { path = "controlplane" }
+peer-wire = { path = "peer-wire" }
+racer-object-wire = { path = "object-wire" }
+racer-core = { path = "core" }
+envy = { version = "0.4.2", default-features = false }
+uds-endpoint = { path = "uds-endpoint" }
+wire-codec = { path = "wire-codec", features = ["rest"] }
+racer-control-wire = { path = "control-wire" }
+racer-cluster-control = { path = "cluster-control" }
+flow-control = { path = "flow" }
+topology = { path = "topology" }
+telemetry = { path = "telemetry" }
+http1 = { path = "http" }
+racer-crypto = { path = "crypto" }
+rdma-verbs = { path = "verbs" }
+racer-gpu = { path = "gpu" }
+page-alloc = { path = "alloc" }
+uring-runtime = { path = "runtime" }
+base64 = "0.22"
+futures = "0.3"
+getrandom = "0.2"
+io-uring = "0.7"
+libc = "0.2"
+prost = "0.14.4"
+regex = "1"
+rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+x509-parser = { version = "0.16", features = ["verify"] }
+zeroize = "1"
+
+[dev-dependencies]
+peer-wire = { path = "peer-wire", features = ["test-util"] }
+racer-object-wire = { path = "object-wire", features = ["test-util"] }
+racer-crypto = { path = "crypto", features = ["test-util"] }
+uds-endpoint = { path = "uds-endpoint", features = ["test-util", "simulation"] }
+flow-control = { path = "flow", features = ["simulation"] }
+wire-codec = { path = "wire-codec", features = ["simulation"] }
+rdma-verbs = { path = "verbs", features = ["simulation"] }
+racer-gpu = { path = "gpu", features = ["simulation"] }
+http1 = { path = "http", features = ["test-util"] }
+page-alloc = { path = "alloc", features = ["simulation"] }
+uring-runtime = { path = "runtime", features = ["simulation", "test-util"] }
+
+# Keep source locations and inline frames for Parca.
+#
+# The hot path crosses crate boundaries on every operation (racer ->
+# uring-runtime -> flow-control -> page-alloc -> http1), so cross-crate inlining
+# is load bearing. `panic = "abort"` is deliberately absent: `catch_unwind` is
+# relied upon by the worker group and the reactor completion loop.
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 1
+
+# Full-page crypto and exhaustive topology checks dominate unoptimized test runs.
+# Keep debug assertions, overflow checks, and debug info while optimizing hot loops.
+[profile.test]
+opt-level = 1
+
+[profile.test.package."*"]
+opt-level = 3

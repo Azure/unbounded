@@ -310,10 +310,19 @@ encapsulation overhead, GENEVE adds 58 bytes, VXLAN adds 50 bytes, and IPIP
 adds 20 bytes. With the default value of `0`, the node agent looks up the
 actual route to each peer, subtracts the selected encapsulation overhead, and
 uses the lowest applicable Site, peering, assignment, or pool `tunnelMTU`.
-The node agent treats Sites and GatewayPools as a topology graph connected by
-SitePeerings, SiteGatewayPoolAssignments, and GatewayPoolPeerings. The lowest
-`tunnelMTU` anywhere in the local site's connected topology is applied
-site-wide, including downstream multi-hop gateway paths.
+Forwarding-path scopes constrain the node. Direct mesh peers
+use both endpoint Sites and their enabled `SitePeering`; worker-to-gateway
+paths use assignments that target the worker's own Site and the selected
+GatewayPool; gateway-to-gateway paths also use the governing
+`GatewayPoolPeering`. Direct-mesh components additionally share the lowest
+configured Site or enabled mesh-peering MTU in the component. Shared pod and
+tunnel interfaces make this necessary even without transitive routing: if A
+meshes with B at 1200 and C at 1400, A's pod interfaces use 1200, so C must also
+use 1200 when sending to A. This propagates only an MTU constraint, not routes
+between B and C. Disabled and `meshNodes: false` peerings, missing Sites, and
+disconnected components do not contribute. Gateway assignments and pool
+peerings do not join direct-mesh components; their limits still follow actual
+gateway paths.
 
 For example, a WireGuard peer reached through a 1500-byte Ethernet route gets
 an automatic MTU of `1420`.
@@ -330,7 +339,8 @@ an automatic MTU of `1420`.
 - The controller reads `node.mtu` from the shared configmap and compares it
   against every node's `tunnel-mtu` annotation. Mismatches are reported as
   warnings on the status page and in the controller logs.
-- The CNI MTU is the lowest effective peer or connected-topology MTU. At
+- The CNI MTU is the lowest effective MTU among actual mesh and gateway peers
+  and the configured direct-mesh component cap. At
   startup and whenever that value changes, the node agent updates the CNI
   bridge and both endpoints of existing pod veth pairs.
 - Forwarded TCP SYN packets on every interface are MSS-clamped to the

@@ -844,8 +844,14 @@ func (m *Manager) observe(ctx context.Context, snapshot Snapshot) {
 	connected := 0
 
 	if m.opts.Connect != nil {
+		now := m.opts.Now()
+
 		addresses := make([]string, 0, len(snapshot.Chairs))
 		for _, chair := range snapshot.Chairs {
+			if !chair.Occupied() || chair.Expired(now) {
+				continue
+			}
+
 			addresses = append(addresses, chair.Holder.P2PAddrs...)
 		}
 

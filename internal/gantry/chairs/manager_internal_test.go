@@ -6,6 +6,7 @@ package chairs
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -624,5 +625,226 @@ func TestManagerRetriesBootstrapAfterHealthDrops(t *testing.T) {
 
 	if connectCalls < 2 {
 		t.Fatalf("bootstrap connect attempts = %d, want retry after health dropped", connectCalls)
+	}
+}
+
+func TestManagerBootstrapOmitsExpiredHolderAddresses(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	addresses := []string{"/ip4/10.0.0.1/tcp/4001", "/ip4/10.0.0.1/udp/4001/quic-v1"}
+	holder := Holder{PeerID: "peer", P2PAddrs: addresses}
+	live := Chair{
+		ID:              1,
+		Holder:          Holder{PeerID: "live", P2PAddrs: []string{"/ip4/10.0.0.2/tcp/4001"}},
+		AssignmentEpoch: 1,
+		RenewTime:       now,
+		LeaseDuration:   time.Minute,
+	}
+
+	tests := []struct {
+		name      string
+		holder    Holder
+		renewedAt time.Time
+		want      []string
+	}{
+		{
+			name:      "fresh without transfer address",
+			holder:    holder,
+			renewedAt: now.Add(-time.Minute + time.Nanosecond),
+			want:      addresses,
+		},
+		{
+			name:      "at expiration",
+			holder:    holder,
+			renewedAt: now.Add(-time.Minute),
+		},
+		{
+			name:      "past expiration",
+			holder:    holder,
+			renewedAt: now.Add(-time.Minute - time.Nanosecond),
+		},
+		{
+			name:      "expired for weeks",
+			holder:    holder,
+			renewedAt: now.Add(-35 * 24 * time.Hour),
+		},
+		{
+			name:   "missing renewal timestamp",
+			holder: holder,
+		},
+		{
+			name:      "unoccupied with leftover addresses",
+			holder:    Holder{P2PAddrs: addresses},
+			renewedAt: now,
+		},
+		{
+			name:      "occupied without addresses",
+			holder:    Holder{PeerID: holder.PeerID},
+			renewedAt: now,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got []string
+
+			connectCalls := 0
+
+			manager := NewManager(ManagerOptions{
+				Store: NewStore(fake.NewClientset().CoordinationV1().Leases("gantry-system")),
+				Self:  Holder{PeerID: "self"},
+				Now:   func() time.Time { return now },
+				Connect: func(_ context.Context, addresses []string) int {
+					got = slices.Clone(addresses)
+					connectCalls++
+
+					return 0
+				},
+			})
+
+			manager.observe(context.Background(), Snapshot{
+				Epoch: 1,
+				Chairs: []Chair{
+					live,
+					{
+						ID:              0,
+						Holder:          tt.holder,
+						AssignmentEpoch: 1,
+						RenewTime:       tt.renewedAt,
+						LeaseDuration:   time.Minute,
+					},
+				},
+			})
+
+			if connectCalls != 1 {
+				t.Fatalf("Connect calls = %d, want 1", connectCalls)
+			}
+
+			want := slices.Concat(live.Holder.P2PAddrs, tt.want)
+			if !slices.Equal(got, want) {
+				t.Fatalf("bootstrap addresses = %v, want %v", got, want)
+			}
+
+			if count := len(manager.opts.Cache.Peek().Chairs); count != 2 {
+				t.Fatalf("cached chairs = %d, want 2 even when excluded from bootstrap", count)
+			}
+		})
+	}
+}
+
+func TestManagerBootstrapResumesAfterLeaseRenewal(t *testing.T) {
+	ctx := context.Background()
+	clock := time.Unix(1_000_000, 0)
+	store := NewStore(fake.NewClientset().CoordinationV1().Leases("gantry-system"))
+	holder := Holder{PeerID: "peer", P2PAddrs: []string{"/ip4/10.0.0.1/tcp/4001"}}
+
+	if _, err := store.Claim(ctx, 0, holder, CurrentEpoch(clock, time.Hour), time.Minute, false, clock); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+
+	var got []string
+
+	manager := NewManager(ManagerOptions{
+		Store:          store,
+		Self:           Holder{PeerID: "self"},
+		Now:            func() time.Time { return clock },
+		RotationPeriod: time.Hour,
+		Connect: func(_ context.Context, addresses []string) int {
+			got = slices.Clone(addresses)
+
+			return len(addresses)
+		},
+	})
+	refresh := func(want []string) {
+		t.Helper()
+
+		if err := manager.Initialize(ctx); err != nil {
+			t.Fatalf("Initialize: %v", err)
+		}
+
+		if !slices.Equal(got, want) {
+			t.Fatalf("bootstrap addresses at %s = %v, want %v", clock, got, want)
+		}
+	}
+
+	refresh(holder.P2PAddrs)
+
+	clock = clock.Add(time.Minute)
+
+	refresh(nil)
+
+	clock = clock.Add(35 * 24 * time.Hour)
+
+	refresh(nil)
+
+	holder.P2PAddrs = []string{"/ip4/10.0.0.2/tcp/4001"}
+
+	returning := NewManager(ManagerOptions{
+		Store:          store,
+		Self:           holder,
+		Now:            func() time.Time { return clock },
+		LeaseDuration:  time.Minute,
+		RotationPeriod: time.Hour,
+	})
+	if err := returning.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize returning holder: %v", err)
+	}
+
+	returning.maintain(ctx)
+	refresh(holder.P2PAddrs)
+}
+
+func TestManagerBootstrapFilteringPreservesLongExpiredChairReclamation(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(10_000_000, 0)
+	departedAt := now.Add(-35 * 24 * time.Hour)
+	store := NewStore(fake.NewClientset().CoordinationV1().Leases("gantry-system"))
+	departed := Holder{PeerID: "departed", P2PAddrs: []string{"/ip4/10.0.0.1/tcp/4001"}}
+
+	old, err := store.Claim(ctx, 0, departed, CurrentEpoch(departedAt, time.Hour), time.Minute, false, departedAt)
+	if err != nil {
+		t.Fatalf("Claim departed holder: %v", err)
+	}
+
+	self := Holder{PeerID: "replacement", P2PAddrs: []string{"/ip4/10.0.0.2/tcp/4001"}}
+
+	var dialed []string
+
+	manager := NewManager(ManagerOptions{
+		Store:               store,
+		Self:                self,
+		Now:                 func() time.Time { return now },
+		ChairCount:          1,
+		ClaimInitialDivisor: 1,
+		ClaimJitter:         time.Nanosecond,
+		LeaseDuration:       time.Minute,
+		RotationPeriod:      time.Hour,
+		Connect: func(_ context.Context, addresses []string) int {
+			dialed = append(dialed, addresses...)
+
+			return 0
+		},
+	})
+	if err := manager.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	manager.attemptClaim(ctx)
+
+	if len(dialed) != 0 {
+		t.Fatalf("expired bootstrap addresses = %v, want none", dialed)
+	}
+
+	claimed, ok := manager.Held()
+	if !ok || claimed.ID != old.ID || claimed.Holder.PeerID != self.PeerID {
+		t.Fatalf("replacement did not reclaim old chair: %+v, held=%t", claimed, ok)
+	}
+
+	persisted, err := store.Get(ctx, old.ID)
+	if err != nil {
+		t.Fatalf("Get reclaimed chair: %v", err)
+	}
+
+	if persisted.Generation != old.Generation+1 || persisted.Expired(now) || !slices.Equal(persisted.Holder.P2PAddrs, self.P2PAddrs) {
+		t.Fatalf("reclaimed chair did not publish fresh ownership and addresses: %+v", persisted)
 	}
 }

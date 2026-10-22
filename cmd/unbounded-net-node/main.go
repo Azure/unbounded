@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -18,8 +19,8 @@ import (
 	"github.com/spf13/pflag"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
@@ -698,7 +699,7 @@ func applyNodeRuntimeConfig(cmd *cobra.Command, cfg *config) error {
 	return nil
 }
 
-func run(cfg *config) error {
+func run(cfg *config) (resultErr error) {
 	klog.Infof("unbounded-net-node version=%s commit=%s built=%s", version.Version, version.GitCommit, version.BuildTime)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -812,6 +813,46 @@ func run(cfg *config) error {
 
 	klog.Info("Node annotated with WireGuard public key")
 
+	informerFactory := newNodeDynamicInformerFactory(dynamicClient, cfg.InformerResyncPeriod)
+	sliceInformer := informerFactory.ForResource(siteNodeSliceGVR).Informer()
+	siteInformer := informerFactory.ForResource(siteGVR).Informer()
+	sitePeeringInformer := informerFactory.ForResource(sitePeeringGVR).Informer()
+	assignmentInformer := informerFactory.ForResource(siteGatewayPoolAssignmentGVR).Informer()
+
+	gatewayInformers := newGatewayInformerLifecycle(dynamicClient, cfg.InformerResyncPeriod)
+	defer gatewayInformers.close()
+
+	healthState.informersSynced = []cache.InformerSynced{
+		sliceInformer.HasSynced,
+		siteInformer.HasSynced,
+		sitePeeringInformer.HasSynced,
+		assignmentInformer.HasSynced,
+	}
+	healthState.gatewayInformersReady = gatewayInformers.readiness
+
+	if cfg.HealthPort > 0 {
+		go startHealthServer(cfg.HealthPort, healthState)
+	}
+
+	adoptedAssignment, err := waitForNodeAssignment(ctx, clientset, cfg.NodeName)
+	if err != nil {
+		if err == context.Canceled {
+			return nil
+		}
+
+		return fmt.Errorf("wait for Node assignment: %w", err)
+	}
+
+	klog.Infof("Adopting effective Site %q and GatewayPool %q", adoptedAssignment.site, adoptedAssignment.gatewayPool)
+
+	ctx, startupWatch := startStartupAssignmentWatch(ctx, clientset, cfg.NodeName, adoptedAssignment)
+	defer startupWatch.stop()
+	defer func() {
+		if cause := context.Cause(ctx); cause != nil && cause != context.Canceled {
+			resultErr = cause
+		}
+	}()
+
 	// Detect and annotate the node's maximum tunnel MTU so the controller
 	// can validate that the configured MTU is compatible across all nodes.
 	if detectedMTU := unboundednetnetlink.DetectDefaultRouteMTU(); detectedMTU > 0 {
@@ -833,28 +874,19 @@ func run(cfg *config) error {
 		klog.Warningf("WARNING: preferredPublicNetworkEncapsulation is set to %q -- traffic over public networks will be sent UNENCRYPTED", cfg.PreferredPublicEncap)
 	}
 
-	// Create informers early - before any CRD-based lookups
-	// This allows us to use the informer cache for all CRD operations
-	informerFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynamicClient, cfg.InformerResyncPeriod)
-	sliceInformer := informerFactory.ForResource(siteNodeSliceGVR).Informer()
-	siteInformer := informerFactory.ForResource(siteGVR).Informer()
-	gatewayPoolInformer := informerFactory.ForResource(gatewayPoolGVR).Informer()
-	gatewayNodeInformer := informerFactory.ForResource(gatewayNodeGVR).Informer()
-	sitePeeringInformer := informerFactory.ForResource(sitePeeringGVR).Informer()
-	assignmentInformer := informerFactory.ForResource(siteGatewayPoolAssignmentGVR).Informer()
-	poolPeeringInformer := informerFactory.ForResource(gatewayPoolPeeringGVR).Informer()
-
 	// Start the informers
 	informerFactory.Start(ctx.Done())
 
 	// Wait for caches to sync
 	klog.Info("Waiting for informer caches to sync")
 
-	if !cache.WaitForCacheSync(ctx.Done(), sliceInformer.HasSynced, siteInformer.HasSynced, gatewayPoolInformer.HasSynced, gatewayNodeInformer.HasSynced, sitePeeringInformer.HasSynced, assignmentInformer.HasSynced, poolPeeringInformer.HasSynced) {
+	if !cache.WaitForCacheSync(ctx.Done(), sliceInformer.HasSynced, siteInformer.HasSynced, sitePeeringInformer.HasSynced, assignmentInformer.HasSynced) {
 		return fmt.Errorf("failed to sync informer caches")
 	}
 
 	klog.Info("Informer caches synced")
+
+	gatewayInformers.setRequired(gatewayCachesRequired(adoptedAssignment, adoptedAssignment.site, assignmentInformer))
 
 	// Start the netlink cache (read-only network state snapshot).
 	netlinkCache := unboundednetnetlink.NewNetlinkCache(cfg.NetlinkResyncPeriod)
@@ -862,42 +894,18 @@ func run(cfg *config) error {
 		klog.Fatalf("Failed to start netlink cache: %v", err)
 	}
 
-	// Create shared health state for health server
-	healthState.informersSynced = []cache.InformerSynced{
-		sliceInformer.HasSynced,
-		siteInformer.HasSynced,
-		gatewayPoolInformer.HasSynced,
-		gatewayNodeInformer.HasSynced,
-		sitePeeringInformer.HasSynced,
-		assignmentInformer.HasSynced,
-		poolPeeringInformer.HasSynced,
-	}
-
-	// Start health server if enabled (readiness should not wait on site membership)
-	if cfg.HealthPort > 0 {
-		go startHealthServer(cfg.HealthPort, healthState)
-	}
-
-	// Check if this node is a gateway node by checking the informer cache
-	isGatewayNode := isGatewayNodeFromCRDs(gatewayPoolInformer, pubKey)
+	isGatewayNode := adoptedAssignment.gatewayPool != ""
 	if isGatewayNode {
-		klog.Info("Node is a gateway node (found in GatewayPool status)")
+		klog.Infof("Node is assigned to GatewayPool %q", adoptedAssignment.gatewayPool)
 	}
 
-	// Wait for this node to appear in a SiteNodeSlice or GatewayPool
-	// This ensures the site controller has processed this node before we continue
-	mySiteName, err := waitForSiteMembership(ctx, sliceInformer, gatewayPoolInformer, pubKey)
-	if err != nil {
-		if err == context.Canceled {
-			return nil
-		}
+	mySiteName := adoptedAssignment.site
 
+	manageCniPlugin, siteTunnelMTU, err := adoptedSiteCNISettings(siteInformer, mySiteName)
+	if err != nil {
 		return err
 	}
 
-	// Check if this node's site has manageCniPlugin enabled using the informer cache
-	manageCniPlugin := getManageCniPluginFromCRDs(siteInformer, mySiteName)
-	siteTunnelMTU := getSiteTunnelMTUFromCRDs(siteInformer, mySiteName)
 	healthState.setBootstrapSnapshot(cfg.NodeName, mySiteName, pubKey, nil, isGatewayNode)
 
 	initialCNIConfigMTU := resolveInitialCNIConfigMTU(cfg.MTU, siteTunnelMTU, unboundednetnetlink.DetectDefaultRouteMTU())
@@ -923,10 +931,14 @@ func run(cfg *config) error {
 		cniCfg := *cfg
 		cniCfg.MTU = initialCNIConfigMTU
 
-		nodePodCIDRs, err = waitForPodCIDRsAndConfigure(ctx, clientset, &cniCfg, healthState)
+		nodePodCIDRs, err = waitForAdoptedNodePodCIDRsAndConfigure(ctx, clientset, &cniCfg, healthState, adoptedAssignment)
 		if err != nil {
-			if err == context.Canceled {
+			if errors.Is(err, context.Canceled) {
 				return nil
+			}
+
+			if errors.Is(err, errAssignmentChanged) {
+				klog.Errorf("Node assignment changed during CNI bootstrap; exiting for a fresh adoption: %v", err)
 			}
 
 			return err
@@ -937,6 +949,7 @@ func run(cfg *config) error {
 		}
 	} else {
 		klog.Info("manageCniPlugin is false for this site - skipping CNI configuration")
+
 		// Still need to get the node's podCIDRs for WireGuard gateway IP calculation
 		node, err := clientset.CoreV1().Nodes().Get(ctx, cfg.NodeName, metav1.GetOptions{})
 		if err != nil {
@@ -956,5 +969,13 @@ func run(cfg *config) error {
 	// After CNI is configured (or skipped), watch Site CRD for WireGuard peers
 	// Pass the node's podCIDRs so routes can be configured with preferred source IPs
 	// Also pass the informers so they can be reused (already synced)
-	return watchSiteAndConfigureWireGuard(ctx, clientset, dynamicClient, cfg, pubKey, nodePodCIDRs, manageCniPlugin, initialCNIConfigMTU, healthState, netlinkCache, siteInformer, sliceInformer, gatewayPoolInformer, gatewayNodeInformer, sitePeeringInformer, assignmentInformer, poolPeeringInformer)
+	podName := os.Getenv("POD_NAME")
+	podNamespace := os.Getenv("POD_NAMESPACE")
+
+	podUID := types.UID(os.Getenv("POD_UID"))
+	if podName == "" || podNamespace == "" || podUID == "" {
+		return fmt.Errorf("POD_NAME, POD_NAMESPACE, and POD_UID are required for effective assignment acknowledgment")
+	}
+
+	return watchSiteAndConfigureWireGuard(ctx, clientset, dynamicClient, cfg, pubKey, nodePodCIDRs, manageCniPlugin, initialCNIConfigMTU, healthState, netlinkCache, adoptedAssignment, podNamespace, podName, podUID, startupWatch, siteInformer, sliceInformer, sitePeeringInformer, assignmentInformer, gatewayInformers)
 }

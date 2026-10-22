@@ -50,7 +50,7 @@ EOF
 
 | Field | Set it to |
 |-------|-----------|
-| `metadata.name` | Keep `racer-object`. It is the default cache name for pods. |
+| `metadata.name` | Any name. Pods name it in the `racer.unbounded-cloud.io/object-cache` annotation. This guide uses `racer-object`. |
 | `spec.origin.azure.containerURL` | The one container pods may read, such as `https://ACCOUNT.blob.core.windows.net/CONTAINER`. You cannot change it later. |
 
 You also cannot remove `spec.origin` later. To read another container or
@@ -59,13 +59,19 @@ account, create another ClusterCache.
 Wait for the cache to start:
 
 ```bash
-kubectl -n unbounded-system rollout status deployment/racer-controller --timeout=5m
-kubectl -n unbounded-system rollout status daemonset/racer-dataplane --timeout=5m
+kubectl -n unbounded-system rollout status daemonset/racer --timeout=5m
 kubectl -n unbounded-system rollout status daemonset/racer-origin-racer-object --timeout=5m
 ```
 
 If a command reports that the workload does not exist, wait a few seconds and
 run it again.
+
+Racer elects its control seats from the dataplane pods. There is no separate
+controller Deployment to wait for. To inspect the election, run:
+
+```bash
+kubectl -n unbounded-system get leases -l racer.unbounded-cloud.io/control=true
+```
 
 ### Private Containers
 
@@ -128,7 +134,7 @@ For all fields, see
 
 ## 2. Deploy an Application
 
-To use the cache, add one label and one annotation to your pod:
+To use the cache, add one label and two annotations to your pod:
 
 ```bash
 kubectl create namespace racer-object-example
@@ -140,6 +146,7 @@ metadata:
   labels:
     racer.unbounded-cloud.io/object-sidecar: enabled
   annotations:
+    racer.unbounded-cloud.io/object-cache: racer-object
     racer.unbounded-cloud.io/object-api: azure
 spec:
   containers:
@@ -151,10 +158,8 @@ EOF
 
 | Annotation | Set it to |
 |------------|-----------|
+| `object-cache` | The ClusterCache name from step 1. Required. |
 | `object-api` | `azure`, so pods use the Azure Blob API. |
-
-The pod uses the `racer-object` cache by default. To use another cache, set
-`racer.unbounded-cloud.io/object-cache` to its name.
 
 For a Deployment, StatefulSet, or Job, put the label and annotations on the pod
 template. Changes apply only to new pods, so restart existing workloads after you

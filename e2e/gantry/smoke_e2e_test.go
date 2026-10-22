@@ -68,17 +68,28 @@ func TestSmoke_DaemonSetBecomesReadyAndPullThrough(t *testing.T) {
 	workers := h.workerNodes(ctx)
 
 	advertiseBefore := h.metricSum(ctx, "gantry_advertise_total")
-	peerHitBefore := h.metricSum(ctx, "p2p_peer_fetch_total", `outcome="hit"`)
 
 	h.deletePod(ctx, "gantry-e2e-first")
 	h.applyPullPod(ctx, "gantry-e2e-first", workers[0])
 	h.waitForPodReady(ctx, "gantry-e2e-first")
 	h.waitForMetricIncrease(ctx, "gantry_advertise_total", advertiseBefore)
 
+	// The e2e config has eight chairs and eight nodes, so every node is a
+	// seed and the first pull's cold start also copies each blob into
+	// workers[1]'s containerd under a Gantry lease. Kubelet on workers[1]
+	// would then find every blob locally and never ask the mirror, leaving
+	// the peer-hit assertion to depend on whether the first requester
+	// happened to read a remote seed before its own local copy finished.
+	// Evict that copy so the second pull has to fetch from a peer.
+	h.evictImageFromNode(ctx, workers[1])
+
+	secondGantryPod := h.gantryPodOnNode(ctx, workers[1])
+	peerHitBefore := h.metricSumOnPod(ctx, secondGantryPod, "p2p_peer_fetch_total", `outcome="hit"`)
+
 	h.deletePod(ctx, "gantry-e2e-second")
 	h.applyPullPod(ctx, "gantry-e2e-second", workers[1])
 	h.waitForPodReady(ctx, "gantry-e2e-second")
-	h.waitForMetricIncrease(ctx, "p2p_peer_fetch_total", peerHitBefore, `outcome="hit"`)
+	h.waitForMetricIncreaseOnPod(ctx, secondGantryPod, "p2p_peer_fetch_total", peerHitBefore, `outcome="hit"`)
 }
 
 // TestE2E_ColdStartDesignatedOriginPuller proves the per-digest Lease-chair
@@ -193,7 +204,8 @@ func TestE2E_ColdStartDesignatedOriginPuller(t *testing.T) {
 //     longer carries meaning post-classification).
 //   - Verify gantry_stale_provider_filtered_total increased (the
 //     stale-provider memoization fired on at least one digest).
-//   - Verify p2p_origin_pull_total increments (fallback succeeded).
+//   - Verify recovery succeeds through Gantry or containerd's direct-origin
+//     fallback; the latter is intentionally absent from Gantry's origin counter.
 //   - Verify the pod becomes ready.
 func TestE2E_EvictionRecovery(t *testing.T) {
 	h := newHarness(t)
@@ -243,15 +255,16 @@ func TestE2E_EvictionRecovery(t *testing.T) {
 
 	h.deletePod(ctx, "gantry-e2e-evict-pull")
 	h.applyPullPod(ctx, "gantry-e2e-evict-pull", workers[1])
-	// The production config keeps rediscovering peer seeds for up to 5m before
-	// returning round 0's origin-fallback decision. Wait beyond that budget.
+	// Stale-only discovery returns 503 before headers so containerd can use
+	// the configured origin host. A genuine empty lookup can still seed.
 	h.waitForPodReadyTimeout(ctx, "gantry-e2e-evict-pull", "600s")
 
-	// Assert: origin fallback worked.
+	// Readiness proves recovery after all seeds were evicted. Do not require
+	// a Gantry origin pull: containerd owns the stale-only failover and its
+	// direct registry requests are not counted by p2p_origin_pull_total.
 	originPullAfter := h.metricSum(ctx, "p2p_origin_pull_total")
 	if originPullAfter <= originPullBefore {
-		h.dumpDiagnostics(ctx)
-		t.Fatalf("expected fallback to origin after eviction, but p2p_origin_pull_total did not increase (before=%.0f after=%.0f)",
+		t.Logf("recovered without a Gantry-owned origin pull; containerd direct fallback is allowed (before=%.0f after=%.0f)",
 			originPullBefore, originPullAfter)
 	}
 

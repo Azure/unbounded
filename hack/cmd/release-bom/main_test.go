@@ -10,7 +10,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
+
+	"sigs.k8s.io/yaml"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
@@ -168,5 +171,49 @@ func TestWriteBOMCreatesOutputDirectory(t *testing.T) {
 
 	if got.SchemaVersion != want.SchemaVersion || got.Release != want.Release {
 		t.Fatalf("BOM = %#v, want %#v", got, want)
+	}
+}
+
+// TestReleaseBOMCoversReleaseWorkflowImages fails when release.yaml builds and
+// signs an image matrix entry that the BOM does not list. An image missing
+// from the BOM is never digest-pinned or signature-checked by
+// hack/release/verify-release-artifacts.sh.
+func TestReleaseBOMCoversReleaseWorkflowImages(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", ".github", "workflows", "release.yaml"))
+	if err != nil {
+		t.Fatalf("read release workflow: %v", err)
+	}
+
+	var workflow struct {
+		Jobs map[string]struct {
+			Strategy struct {
+				Matrix struct {
+					Component []struct {
+						Name string `json:"name"`
+					} `json:"component"`
+				} `json:"matrix"`
+			} `json:"strategy"`
+		} `json:"jobs"`
+	}
+	if err := yaml.Unmarshal(raw, &workflow); err != nil {
+		t.Fatalf("parse release workflow: %v", err)
+	}
+
+	jobs := []string{"component-images", "netboot-image"}
+	for _, job := range jobs {
+		components := workflow.Jobs[job].Strategy.Matrix.Component
+		if len(components) == 0 {
+			t.Fatalf("release workflow job %q has no component matrix", job)
+		}
+
+		for _, component := range components {
+			if !slices.Contains(releaseImageNames, component.Name) {
+				t.Errorf("release workflow job %q builds %q, which releaseImageNames does not list", job, component.Name)
+			}
+		}
+	}
+
+	if !slices.Contains(releaseImageNames, "racer-vllm") {
+		t.Error("releaseImageNames must list the amd64-only racer-vllm image")
 	}
 }

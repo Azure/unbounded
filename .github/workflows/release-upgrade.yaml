@@ -1148,6 +1148,46 @@ jobs:
             echo "- Artifact signatures and BOM: verified"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # Build docs from the release tag after publishing the latest release.
+  docs:
+    needs: [resolve, publish, publish-forced]
+    if: >
+      !cancelled() &&
+      needs.resolve.result == 'success' &&
+      needs.resolve.outputs.latest == 'true' &&
+      (needs.publish.result == 'success' || needs.publish-forced.result == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+
+      - name: Install Hugo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y hugo
+
+      - name: Build docs
+        run: hugo --minify
+        working-directory: docs
+
+      - name: Build search index
+        run: npx --yes pagefind --site public
+        working-directory: docs
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: docs/public
+
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
 
   # ---------------------------------------------------------------------------
   # CUSTOMIZE: Teams notification (NOT YET ENABLED)

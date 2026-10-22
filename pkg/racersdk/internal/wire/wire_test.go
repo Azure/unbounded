@@ -554,46 +554,57 @@ func TestSubscriptionHeadRoundTrip(t *testing.T) {
 	r := Request{Operation: OperationHead, Pin: `"v"`, AdapterMetadata: "opaque\xff", Authorization: "Bearer secret"}
 
 	for _, length := range []uint64{0, 7} {
-		for _, ordered := range []bool{false, true} {
-			o := SubscriptionOptions{Offset: 3, Length: length, PageCredits: 2, ByteCredits: 2 * PageSize, Ordered: ordered}
+		o := SubscriptionOptions{Offset: 3, Length: length, PageCredits: 2, ByteCredits: 2 * PageSize}
 
-			head, err := SubscriptionHead(r, o)
-			if err != nil {
-				t.Fatal(err)
+		head, err := SubscriptionHead(r, o)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(head)))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		parsed, err := ParseSubscriptionRequest(req)
+		if err != nil || parsed.Request != r || parsed.First != 3 || !parsed.Ranged || parsed.PageCredits != 2 || parsed.ByteCredits != 2*PageSize {
+			t.Fatal("request round trip", parsed, err)
+		}
+
+		end := uint64(math.MaxInt64)
+		if length != 0 {
+			end = 3 + length
+		}
+
+		if parsed.End != end {
+			t.Fatal("range end")
+		}
+
+		if bytes.Contains(bytes.ToLower(head), []byte("racer-ordered")) {
+			t.Fatal("subscription head sends Racer-Ordered")
+		}
+
+		// Like the real server, the fake ignores the removed Racer-Ordered header.
+		legacy := req.Clone(t.Context())
+		legacy.Header.Add("Racer-Ordered", "bad")
+		legacy.Header.Add("Racer-Ordered", "1")
+
+		if got, err := ParseSubscriptionRequest(legacy); err != nil || got != parsed {
+			t.Fatal("legacy Racer-Ordered header changed parsing", got, err)
+		}
+
+		for _, field := range []string{"Racer-Page-Credits", "Racer-Byte-Credits"} {
+			bad := req.Clone(t.Context())
+			bad.Header.Set(field, "bad")
+
+			if _, err := ParseSubscriptionRequest(bad); err == nil {
+				t.Fatal("accepted malformed credit", field)
 			}
 
-			req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(head)))
-			if err != nil {
-				t.Fatal(err)
-			}
+			bad.Header.Add(field, "1")
 
-			parsed, err := ParseSubscriptionRequest(req)
-			if err != nil || parsed.Request != r || parsed.First != 3 || !parsed.Ranged || parsed.Ordered != ordered || parsed.PageCredits != 2 || parsed.ByteCredits != 2*PageSize {
-				t.Fatal("request round trip", parsed, err)
-			}
-
-			end := uint64(math.MaxInt64)
-			if length != 0 {
-				end = 3 + length
-			}
-
-			if parsed.End != end {
-				t.Fatal("range end")
-			}
-
-			for _, field := range []string{"Racer-Page-Credits", "Racer-Byte-Credits", "Racer-Ordered"} {
-				bad := req.Clone(t.Context())
-				bad.Header.Set(field, "bad")
-
-				if _, err := ParseSubscriptionRequest(bad); err == nil {
-					t.Fatal("accepted malformed credit", field)
-				}
-
-				bad.Header.Add(field, "1")
-
-				if _, err := ParseSubscriptionRequest(bad); err == nil {
-					t.Fatal("accepted duplicate credit", field)
-				}
+			if _, err := ParseSubscriptionRequest(bad); err == nil {
+				t.Fatal("accepted duplicate credit", field)
 			}
 		}
 	}
@@ -884,42 +895,40 @@ func TestSequence(t *testing.T) {
 	b := Frame{Kind: PageFrame, Number: 1, Offset: PageSize, Length: 3}
 	complete := Frame{Kind: CompleteFrame, Number: 2, Offset: 5}
 
-	for _, ordered := range []bool{false, true} {
-		s := NewSequence(first, end, ordered)
-
-		frames := []Frame{a, b, complete}
-		if !ordered {
-			frames[0], frames[1] = b, a
-		}
-
-		for _, f := range frames {
-			if err := s.Accept(f, "subscription frame"); err != nil {
-				t.Fatal(err)
-			}
-		}
-
-		if s.Accept(complete, "subscription frame") == nil {
-			t.Fatal("accepted frame after completion")
+	s := NewSequence(first, end)
+	for _, f := range []Frame{a, b, complete} {
+		if err := s.Accept(f, "subscription frame"); err != nil {
+			t.Fatal(err)
 		}
 	}
 
+	if s.Accept(complete, "subscription frame") == nil {
+		t.Fatal("accepted frame after completion")
+	}
+
+	// The server always delivers in page order, so out-of-order frames are rejected.
+	s = NewSequence(first, end)
+	if s.Accept(b, "subscription frame") == nil {
+		t.Fatal("accepted out-of-order frame")
+	}
+
 	for _, f := range []Frame{b, complete, {Kind: 3}, {Kind: PageFrame, Offset: first, Length: 1}, {Kind: PageFrame, Offset: first + 1, Length: 2}, {Kind: PageFrame, Number: 1, Offset: first, Length: 2}} {
-		if NewSequence(first, end, true).Accept(f, "subscription frame") == nil {
+		if NewSequence(first, end).Accept(f, "subscription frame") == nil {
 			t.Fatal("accepted malformed frame", f)
 		}
 	}
 
-	s := NewSequence(first, end, false)
+	s = NewSequence(first, end)
 	if s.Accept(a, "subscription frame") != nil || s.Accept(a, "subscription frame") == nil {
 		t.Fatal("duplicate page")
 	}
 
-	if err := NewSequence(0, 0, true).Accept(Frame{Kind: CompleteFrame}, "subscription complete"); err != nil {
+	if err := NewSequence(0, 0).Accept(Frame{Kind: CompleteFrame}, "subscription complete"); err != nil {
 		t.Fatal("empty completion", err)
 	}
 
 	for _, f := range []Frame{{Kind: CompleteFrame, Number: 1}, {Kind: CompleteFrame, Offset: 1}, {Kind: CompleteFrame, Length: 1}} {
-		if NewSequence(0, 0, true).Accept(f, "subscription complete") == nil {
+		if NewSequence(0, 0).Accept(f, "subscription complete") == nil {
 			t.Fatal("invalid empty completion")
 		}
 	}
@@ -1159,7 +1168,7 @@ func TestWriterFailures(t *testing.T) {
 		}
 	}
 
-	s := NewSequence(0, 0, true)
+	s := NewSequence(0, 0)
 
 	w := &failingWriter{failAt: 1, err: cause}
 	if err := s.Write(w, Frame{Kind: CompleteFrame}); !errors.Is(err, cause) {

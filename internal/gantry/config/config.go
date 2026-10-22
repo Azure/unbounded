@@ -66,6 +66,11 @@ type Config struct {
 	RacerMaxConnections           int `yaml:"racer_max_connections"`
 	RacerOriginConcurrentRequests int `yaml:"racer_origin_concurrent_requests"`
 
+	// RacerRetryBudget bounds the total backoff one mirror request may spend
+	// retrying transient Racer failures, including resuming a response body
+	// after a mid-stream failure. Zero disables retries; negative is invalid.
+	RacerRetryBudget time.Duration `yaml:"racer_retry_budget"`
+
 	// ---------- Listeners ----------
 
 	// MirrorListen is the loopback address for containerd's mirror endpoint
@@ -157,6 +162,10 @@ type Config struct {
 	// Libp2pConnManagerGrace is the minimum age a connection must reach
 	// before it becomes a trim candidate.
 	Libp2pConnManagerGrace time.Duration `yaml:"libp2p_conn_manager_grace"`
+
+	DHTProviderValidity  time.Duration `yaml:"dht_provider_validity"`
+	DHTReprovideInterval time.Duration `yaml:"dht_reprovide_interval"`
+	DHTMaxReprovideDelay time.Duration `yaml:"dht_max_reprovide_delay"`
 
 	// ChairListen binds the HTTPS listener that serves cold-start please_pull.
 	// Keeping the RPC off libp2p puts it on a connection pool the libp2p
@@ -557,6 +566,7 @@ func NewDefault() *Config {
 		RacerEnabled:                  false,
 		RacerMaxConnections:           64,
 		RacerOriginConcurrentRequests: 64,
+		RacerRetryBudget:              30 * time.Second,
 		MirrorListen:                  "127.0.0.1:5000",
 		MirrorBindAllowNonLoopback:    false,
 		ArtifactStreamingEnabled:      false,
@@ -569,11 +579,14 @@ func NewDefault() *Config {
 		MetricsListen:          "0.0.0.0:9095",
 		PprofListen:            "",
 		Libp2pListen:           nil,
-		Libp2pIdentityPath:     "/var/lib/gantry/libp2p.key",
+		Libp2pIdentityPath:     "/var/lib/gantry/libp2p/libp2p.key",
 		Libp2pConnManagerHigh:  900,
 		Libp2pConnManagerLow:   600,
 		Libp2pConnManagerGrace: time.Minute,
 		ChairListen:            "0.0.0.0:5002",
+		DHTProviderValidity:    6 * time.Hour,
+		DHTReprovideInterval:   3 * time.Hour,
+		DHTMaxReprovideDelay:   10 * time.Minute,
 
 		NodeName:          "",
 		MembersKubeconfig: "",
@@ -785,6 +798,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setBool("RACER_ENABLED", &c.RacerEnabled)
 	setInt("RACER_MAX_CONNECTIONS", &c.RacerMaxConnections)
 	setInt("RACER_ORIGIN_CONCURRENT_REQUESTS", &c.RacerOriginConcurrentRequests)
+	setDur("RACER_RETRY_BUDGET", &c.RacerRetryBudget)
 	setStr("MIRROR_LISTEN", &c.MirrorListen)
 	setBool("MIRROR_BIND_ALLOW_NON_LOOPBACK", &c.MirrorBindAllowNonLoopback)
 	setBool("ARTIFACT_STREAMING_ENABLED", &c.ArtifactStreamingEnabled)
@@ -795,6 +809,9 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setInt("LIBP2P_CONN_MANAGER_HIGH", &c.Libp2pConnManagerHigh)
 	setInt("LIBP2P_CONN_MANAGER_LOW", &c.Libp2pConnManagerLow)
 	setDur("LIBP2P_CONN_MANAGER_GRACE", &c.Libp2pConnManagerGrace)
+	setDur("DHT_PROVIDER_VALIDITY", &c.DHTProviderValidity)
+	setDur("DHT_REPROVIDE_INTERVAL", &c.DHTReprovideInterval)
+	setDur("DHT_MAX_REPROVIDE_DELAY", &c.DHTMaxReprovideDelay)
 	setStr("CHAIR_LISTEN", &c.ChairListen)
 
 	setStr("NODE_NAME", &c.NodeName)
@@ -894,6 +911,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.RacerMaxConnections, "racer-max-connections", c.RacerMaxConnections, "Racer bulk connection and live value limit (0 uses 64)")
 	fs.IntVar(&c.RacerOriginConcurrentRequests, "racer-origin-concurrent-requests", c.RacerOriginConcurrentRequests, "Racer origin concurrent GET callback and body limit (0 uses 64)")
+	fs.DurationVar(&c.RacerRetryBudget, "racer-retry-budget", c.RacerRetryBudget, "Total backoff per mirror request for retrying transient Racer failures (0 disables retries)")
 	fs.StringVar(&c.MirrorListen, "mirror-listen", c.MirrorListen, "address for the containerd-facing mirror endpoint (loopback)")
 	fs.BoolVar(&c.MirrorBindAllowNonLoopback, "mirror-bind-allow-non-loopback", c.MirrorBindAllowNonLoopback, "opt in to a non-loopback mirror bind (e.g. when using hostPort + hostIP=127.0.0.1 in Kubernetes)")
 	fs.BoolVar(&c.ArtifactStreamingEnabled, "artifact-streaming-enabled", c.ArtifactStreamingEnabled, "enable the node-local OverlayBD /blobs/ range endpoint")
@@ -904,6 +922,9 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.Libp2pConnManagerHigh, "libp2p-conn-manager-high", c.Libp2pConnManagerHigh, "libp2p connection count above which idle connections are trimmed")
 	fs.IntVar(&c.Libp2pConnManagerLow, "libp2p-conn-manager-low", c.Libp2pConnManagerLow, "libp2p connection count that trimming settles at")
 	fs.DurationVar(&c.Libp2pConnManagerGrace, "libp2p-conn-manager-grace", c.Libp2pConnManagerGrace, "minimum connection age before it becomes a trim candidate")
+	fs.DurationVar(&c.DHTProviderValidity, "dht-provider-validity", c.DHTProviderValidity, "time a DHT peer serves a provider record after its last publication")
+	fs.DurationVar(&c.DHTReprovideInterval, "dht-reprovide-interval", c.DHTReprovideInterval, "interval over which the sweeping provider refreshes all local content")
+	fs.DurationVar(&c.DHTMaxReprovideDelay, "dht-max-reprovide-delay", c.DHTMaxReprovideDelay, "maximum delay beyond the scheduled reprovide interval")
 	fs.StringVar(&c.ChairListen, "chair-listen", c.ChairListen, "address for the HTTPS cold-start please_pull endpoint")
 
 	fs.StringVar(&c.NodeName, "node-name", c.NodeName, "legacy no-op Kubernetes node name")
@@ -1039,6 +1060,10 @@ func Load(args []string, env func(string) string, configPath string) (*Config, *
 // otherwise returns a joined error listing every problem found.
 func (c *Config) Validate() error {
 	var errs []error
+
+	if c.RacerEnabled && c.ArtifactStreamingEnabled {
+		errs = append(errs, errors.New("artifact_streaming_enabled cannot be combined with GANTRY_RACER_ENABLED; Artifact Streaming requires the containerd backend"))
+	}
 
 	mustAddr := func(field, val string) {
 		if val == "" {
@@ -1220,6 +1245,10 @@ func (c *Config) Validate() error {
 			}
 		}
 
+		if c.RacerRetryBudget < 0 {
+			errs = append(errs, fmt.Errorf("racer_retry_budget: must be >= 0 (zero disables retries), got %v", c.RacerRetryBudget))
+		}
+
 		return errors.Join(errs...)
 	}
 
@@ -1285,6 +1314,22 @@ func (c *Config) Validate() error {
 
 	if c.Libp2pConnManagerGrace < 0 {
 		errs = append(errs, fmt.Errorf("libp2p_conn_manager_grace: must be >= 0, got %v", c.Libp2pConnManagerGrace))
+	}
+
+	if c.DHTProviderValidity <= 0 {
+		errs = append(errs, fmt.Errorf("dht_provider_validity: must be > 0, got %v", c.DHTProviderValidity))
+	}
+
+	if c.DHTReprovideInterval <= 0 {
+		errs = append(errs, fmt.Errorf("dht_reprovide_interval: must be > 0, got %v", c.DHTReprovideInterval))
+	}
+
+	if c.DHTMaxReprovideDelay <= 0 {
+		errs = append(errs, fmt.Errorf("dht_max_reprovide_delay: must be > 0, got %v", c.DHTMaxReprovideDelay))
+	}
+
+	if c.DHTReprovideInterval+c.DHTMaxReprovideDelay >= c.DHTProviderValidity {
+		errs = append(errs, fmt.Errorf("dht reprovide interval plus maximum delay must be less than provider validity: %v + %v >= %v", c.DHTReprovideInterval, c.DHTMaxReprovideDelay, c.DHTProviderValidity))
 	}
 
 	if c.ChairListen == "" {

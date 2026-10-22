@@ -4,7 +4,7 @@
 # Build stage
 # Pin the builder to BUILDPLATFORM so the Go toolchain runs natively on the
 # host even when targeting a foreign TARGETPLATFORM.
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.27.2-trixie AS builder
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.27.3-trixie AS builder
 
 RUN apt-get update && apt-get install -y \
     build-essential \
@@ -53,7 +53,7 @@ WORKDIR /unbounded
 
 # The sidecar needs no root: Racer client sockets are mode 0666 and access is
 # controlled by which hostPath directory the pod mounts. Origin mode also runs
-# as 65532: the racer-dataplane creates /run/racer/<cache>/origin owned by
+# as 65532: the racer creates /run/racer/<cache>/origin owned by
 # 65532:65532 with mode 0700, and the origin requires owning that directory.
 USER 65532:65532
 

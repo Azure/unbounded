@@ -51,7 +51,12 @@ func (s *nodeStatusServer) collectRouteSummary(peers []routeplan.Peer, localSite
 		}
 	}()
 
-	actx := buildAnnotationContext(s.siteInformer, s.sliceInformer, s.gatewayPoolInformer, s.sitePeeringInformer)
+	gatewayPoolInformer := s.gatewayPoolInformer
+	if s.gatewayInformers != nil {
+		gatewayPoolInformer = s.gatewayInformers.snapshot().pools
+	}
+
+	actx := buildAnnotationContext(s.siteInformer, s.sliceInformer, gatewayPoolInformer, s.sitePeeringInformer)
 	for i := range peers {
 		peers[i].SitePeered = sitesAreDirectlyPeered(strings.TrimSpace(localSite), peers[i].SiteName, actx.directSitePeerings)
 	}

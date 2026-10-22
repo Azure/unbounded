@@ -24,8 +24,9 @@ type cniBridgeLinkManager interface {
 }
 
 var (
-	ensureCNIBridgeMTUFunc    = ensureCNIBridgeMTU
-	newCNIBridgeLinkManagerFn = func(bridgeName string) cniBridgeLinkManager {
+	ensureCNIBridgeMTUFunc     = ensureCNIBridgeMTU
+	verifyActiveTunnelMTUsFunc = verifyActiveTunnelMTUs
+	newCNIBridgeLinkManagerFn  = func(bridgeName string) cniBridgeLinkManager {
 		return unboundednetnetlink.NewLinkManager(bridgeName)
 	}
 )
@@ -153,11 +154,22 @@ func resolveCNIConfigMTU(configuredMTU, siteMTU int, meshPeers []meshPeerInfo, g
 	return resolveInitialCNIConfigMTU(configuredMTU, siteMTU, underlayMTU)
 }
 
+func localGatewayPoolTunnelMTU(localPools []string, poolMTUs map[string]int) int {
+	result := 0
+	for _, pool := range localPools {
+		result = resolveTunnelMTU(result, poolMTUs[pool])
+	}
+
+	return result
+}
+
 func resolvePeerTunnelMTUs(
 	cfg *config,
 	meshPeers []meshPeerInfo,
 	gatewayPeers []gatewayPeerInfo,
 	mySiteName string,
+	isGatewayNode bool,
+	localScopeMTU int,
 	peeredSites, networkPeeredSites map[string]bool,
 	siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs,
 	assignmentPoolTunnelMTUs, poolTunnelMTUs map[string]int,
@@ -166,9 +178,9 @@ func resolvePeerTunnelMTUs(
 	for i := range meshPeers {
 		underlayIP := selectUnderlayIP(meshPeers[i].InternalIPs, cfg.TunnelIPFamily)
 		autoMTU := detectEncapsulatedRouteMTU(cfg, underlayIP, meshPeers[i].TunnelProtocol, cache)
-		meshPeers[i].TunnelMTU = resolveTunnelMTU(cfg.MTU, autoMTU,
+		meshPeers[i].TunnelMTU = resolveTunnelMTU(cfg.MTU, autoMTU, localScopeMTU,
 			resolveMeshPeerTunnelMTU(0, meshPeers[i], mySiteName,
-				siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs))
+				siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs, isGatewayNode))
 	}
 
 	for i := range gatewayPeers {
@@ -178,7 +190,13 @@ func resolvePeerTunnelMTUs(
 		}
 
 		autoMTU := detectEncapsulatedRouteMTU(cfg, underlayIP, gatewayPeers[i].TunnelProtocol, cache)
-		gatewayPeers[i].TunnelMTU = resolveTunnelMTU(cfg.MTU, autoMTU,
+
+		firstHopPeeringMTU := 0
+		if !isGatewayNode && gatewayPeers[i].SiteName != mySiteName {
+			firstHopPeeringMTU = peeringSiteTunnelMTUs[gatewayPeers[i].SiteName]
+		}
+
+		gatewayPeers[i].TunnelMTU = resolveTunnelMTU(cfg.MTU, autoMTU, localScopeMTU, firstHopPeeringMTU,
 			resolveGatewayPeerTunnelMTU(0, mySiteName, gatewayPeers[i],
 				siteTunnelMTUs, assignmentPoolTunnelMTUs, poolTunnelMTUs))
 	}

@@ -74,7 +74,7 @@ def main():
     command = [
         "timeout", "--signal=TERM", "--kill-after=10s", "290s",
         "cargo", "+" + TOOLCHAIN, "miri", "test", "--locked",
-        "--manifest-path", str(root / "cmd/racer-dataplane/Cargo.toml"),
+        "--manifest-path", str(root / "cmd/racer/Cargo.toml"),
         "--target-dir", os.environ.get("RUNTIME_MIRI_TARGET_DIR", str(root / "tmp/runtime-miri-target")),
         "-p", "uring-runtime", "--no-default-features", "--lib", "-j", "2",
         "--", "--exact", "--test-threads=1", *tests,

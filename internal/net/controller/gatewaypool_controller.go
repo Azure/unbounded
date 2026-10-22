@@ -7,12 +7,14 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
@@ -58,6 +61,8 @@ const (
 	// nodes for gateway-to-gateway peering.  Each gateway node gets a unique
 	// port starting from this value.
 	gatewayWireguardPortBase int32 = 51821
+
+	gatewayAssignmentsQueueKey = "\x00gateway-assignments"
 )
 
 // GatewayPoolController manages GatewayPool status based on node selector matches.
@@ -120,6 +125,7 @@ func NewGatewayPoolController(
 	if _, err := nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			gc.enqueuePoolsForNodes(obj.(*corev1.Node)) //nolint:errcheck
+			gc.workqueue.Add(gatewayAssignmentsQueueKey)
 		},
 		UpdateFunc: func(old, new interface{}) {
 			oldNode := old.(*corev1.Node) //nolint:errcheck
@@ -134,6 +140,7 @@ func NewGatewayPoolController(
 				nodeAnnotationChanged(oldNode, newNode, WireGuardPortAnnotation) ||
 				!stringSlicesEqual(oldNode.Spec.PodCIDRs, newNode.Spec.PodCIDRs) {
 				gc.enqueuePoolsForNodes(oldNode, newNode)
+				gc.workqueue.Add(gatewayAssignmentsQueueKey)
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
@@ -143,6 +150,7 @@ func NewGatewayPoolController(
 			}
 
 			gc.enqueuePoolsForNodes(node)
+			gc.workqueue.Add(gatewayAssignmentsQueueKey)
 		},
 	}); err != nil {
 		return nil, fmt.Errorf("failed to add node event handler: %w", err)
@@ -152,12 +160,14 @@ func NewGatewayPoolController(
 	if _, err := gatewayPoolInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			gc.enqueuePool(obj)
+			gc.workqueue.Add(gatewayAssignmentsQueueKey)
 		},
 		UpdateFunc: func(old, new interface{}) {
 			gc.enqueuePool(new)
+			gc.workqueue.Add(gatewayAssignmentsQueueKey)
 		},
 		DeleteFunc: func(obj interface{}) {
-			// Nothing to clean up
+			gc.workqueue.Add(gatewayAssignmentsQueueKey)
 		},
 	}); err != nil {
 		return nil, fmt.Errorf("failed to add gateway pool event handler: %w", err)
@@ -205,6 +215,7 @@ func (gc *GatewayPoolController) Run(ctx context.Context, workers int) error {
 
 	// Rebuild the gateway port allocator from existing pool statuses
 	gc.seedGatewayPorts()
+	gc.workqueue.Add(gatewayAssignmentsQueueKey)
 
 	klog.Info("Starting GatewayPool workers")
 
@@ -232,7 +243,14 @@ func (gc *GatewayPoolController) processNextWorkItem(ctx context.Context) bool {
 	defer gc.workqueue.Done(key)
 
 	start := time.Now()
-	err := gc.syncPool(ctx, key)
+
+	var err error
+	if key == gatewayAssignmentsQueueKey {
+		err = gc.reconcileNodeGatewayPoolAssignments(ctx)
+	} else {
+		err = gc.syncPool(ctx, key)
+	}
+
 	duration := time.Since(start).Seconds()
 	reconciliationDuration.WithLabelValues("GatewayPools").Observe(duration)
 
@@ -246,7 +264,13 @@ func (gc *GatewayPoolController) processNextWorkItem(ctx context.Context) bool {
 	reconciliationErrors.WithLabelValues("GatewayPools").Inc()
 	reconciliationTotal.WithLabelValues("GatewayPools", "error").Inc()
 	workqueueRetries.WithLabelValues("GatewayPools").Inc()
-	utilruntime.HandleError(fmt.Errorf("error syncing gateway pool %s: %v", key, err))
+
+	if key == gatewayAssignmentsQueueKey {
+		utilruntime.HandleError(fmt.Errorf("error syncing node gateway pool assignments: %v", err))
+	} else {
+		utilruntime.HandleError(fmt.Errorf("error syncing gateway pool %s: %v", key, err))
+	}
+
 	gc.workqueue.AddRateLimited(key)
 
 	return true
@@ -791,6 +815,102 @@ func (gc *GatewayPoolController) preferredGatewayPoolForNode(node *corev1.Node, 
 	}
 
 	return eligible[0], true
+}
+
+func (gc *GatewayPoolController) reconcileNodeGatewayPoolAssignments(ctx context.Context) error {
+	gc.updatePoolsCache()
+
+	nodes, err := gc.nodeLister.List(labels.Everything())
+	if err != nil {
+		return fmt.Errorf("list nodes: %w", err)
+	}
+
+	now := time.Now()
+
+	var assignmentErrors []error
+
+	for _, node := range nodes {
+		if err := gc.reconcileNodeGatewayPoolAssignment(ctx, node, now); err != nil {
+			assignmentErrors = append(assignmentErrors, err)
+		}
+	}
+
+	return stderrors.Join(assignmentErrors...)
+}
+
+func (gc *GatewayPoolController) reconcileNodeGatewayPoolAssignment(ctx context.Context, node *corev1.Node, now time.Time) error {
+	desired, _ := gc.preferredGatewayPoolForNode(node, now)
+	if desired != "" {
+		if problems := validation.IsValidLabelValue(desired); len(problems) != 0 {
+			return fmt.Errorf("GatewayPool %q cannot be assigned to Node %q because its raw name is not a valid Kubernetes label value: %s", desired, node.Name, strings.Join(problems, "; "))
+		}
+	}
+
+	current := ""
+	if node.Labels != nil {
+		current = node.Labels[unboundednetv1alpha1.GatewayPoolLabelKey]
+	}
+
+	hasPort := node.Annotations != nil && node.Annotations[WireGuardPortAnnotation] != ""
+	if current == desired && (desired != "" || !hasPort) {
+		return nil
+	}
+
+	if node.UID == "" || node.ResourceVersion == "" {
+		return fmt.Errorf("cannot patch GatewayPool assignment on Node %q without cached UID and resourceVersion", node.Name)
+	}
+
+	patchOperations := []map[string]interface{}{
+		{"op": "test", "path": "/metadata/uid", "value": string(node.UID)},
+		{"op": "test", "path": "/metadata/resourceVersion", "value": node.ResourceVersion},
+	}
+
+	if desired == "" {
+		if current != "" {
+			patchOperations = append(patchOperations, map[string]interface{}{
+				"op":   "remove",
+				"path": "/metadata/labels/" + escapeJSONPointer(unboundednetv1alpha1.GatewayPoolLabelKey),
+			})
+		}
+
+		if hasPort {
+			patchOperations = append(patchOperations, map[string]interface{}{
+				"op":   "remove",
+				"path": "/metadata/annotations/" + escapeJSONPointer(WireGuardPortAnnotation),
+			})
+		}
+	} else if len(node.Labels) == 0 {
+		patchOperations = append(patchOperations, map[string]interface{}{
+			"op":   "add",
+			"path": "/metadata/labels",
+			"value": map[string]string{
+				unboundednetv1alpha1.GatewayPoolLabelKey: desired,
+			},
+		})
+	} else {
+		patchOperations = append(patchOperations, map[string]interface{}{
+			"op":    "add",
+			"path":  "/metadata/labels/" + escapeJSONPointer(unboundednetv1alpha1.GatewayPoolLabelKey),
+			"value": desired,
+		})
+	}
+
+	patch, err := json.Marshal(patchOperations)
+	if err != nil {
+		return fmt.Errorf("marshal GatewayPool assignment patch for Node %q: %w", node.Name, err)
+	}
+
+	if _, err := gc.clientset.CoreV1().Nodes().Patch(ctx, node.Name, types.JSONPatchType, patch, metav1.PatchOptions{}); err != nil {
+		return fmt.Errorf(
+			"patch GatewayPool assignment on Node %q from cached UID %q and resourceVersion %q; retry after informer refresh: %w",
+			node.Name,
+			node.UID,
+			node.ResourceVersion,
+			err,
+		)
+	}
+
+	return nil
 }
 
 // getNodeExternalIPs returns the external IPs of a node.

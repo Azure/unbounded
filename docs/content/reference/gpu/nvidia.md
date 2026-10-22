@@ -122,6 +122,54 @@ The image does **not** include NVIDIA kernel drivers or userspace libraries.
 Those are forwarded from the host at boot time via the bind-mount mechanism
 described above.
 
+## GPUDirect Storage and GPUDirect RDMA
+
+The agent bind-mounts `/dev/nvidia-fs*` into the machine when the host has
+them, the same as other NVIDIA device nodes. It does not install or load the
+modules that create them.
+
+Both features need the NVIDIA **open** kernel module. GPUDirect Storage and
+dma-buf export of CUDA memory do not work with the proprietary flavor, and the
+open flavor supports Turing and later GPUs only.
+
+- **GPUDirect RDMA (dma-buf).** Needs the open kernel module, Linux 5.12 or
+  later, and rdma-core 34 or later. No extra module is needed. The Azure Linux
+  NVIDIA host image (`host-azurelinux3-nvidia`) installs `cuda-open-hwe`,
+  which is the open flavor.
+- **GPUDirect Storage.** On local NVMe with ext4 or xfs, prefer the kernel's
+  PCI P2PDMA path: Linux 6.2 or later, the open driver, and cuFile 1.13
+  (CUDA 12.8) or later. It needs no `nvidia-fs`. The `nvidia-fs` path to local
+  NVMe also needs NVMe patches from MLNX_OFED or DOCA. The Azure Linux host
+  images do not install `nvidia-fs`; its repository has no package for it.
+  cuFile uses P2PDMA only when asked: for Racer, set
+  `RACER_GPU_PCI_P2PDMA=true` in `racer-settings`.
+
+On Ubuntu Azure VMs, `hack/agent/azure-gpu-vm/install-nvidia-drivers.sh`
+installs `nvidia-fs` when you pass `--gds`:
+
+```bash
+./hack/agent/azure-gpu-vm/gpu-vm.sh setup-nvidia --size Standard_ND96isr_H100_v5 --gds
+# or, on the VM:
+sudo ./install-nvidia-drivers.sh Standard_ND96isr_H100_v5 --gds
+```
+
+The option installs `nvidia-fs-dkms` from NVIDIA's CUDA apt repository and
+writes `/etc/modules-load.d/nvidia-fs.conf`. An apt pin keeps the driver on
+Ubuntu's packages. It fails for SKUs that use the proprietary driver and when
+Secure Boot is enabled, because the DKMS module is unsigned. After the reboot,
+check the module:
+
+```bash
+lsmod | grep nvidia_fs
+ls -la /dev/nvidia-fs*
+cat /proc/driver/nvidia-fs/stats
+```
+
+The agent lists device nodes when it writes the machine configuration, so load
+`nvidia-fs` before that. The modules-load.d entry loads it at boot. A module
+loaded later on a running node is not visible in the machine or the Racer
+dataplane Pod until the configuration is written again and they restart.
+
 ## Troubleshooting
 
 ### CUDA error 802 (`SYSTEM_DRIVER_MISMATCH`)

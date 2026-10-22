@@ -4,6 +4,7 @@
 package netlink
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -50,6 +51,7 @@ type GatewayPolicyManager struct {
 
 	// Track which interfaces have been configured
 	configuredIfaces map[string]int // interface name -> table number
+	pendingCleanup   map[string]bool
 
 	// Track if the global OUTPUT rule has been added
 	outputRuleAdded bool
@@ -177,8 +179,7 @@ func (m *GatewayPolicyManager) deleteIPRulesByMarkSet(tableNum int, marks map[ui
 
 		r := rule
 		if err := netlinkRuleDel(&r); err != nil {
-			klog.V(4).Infof("Failed deleting %s ip rule mark=%d table=%d: %v", familyName, rule.Mark, rule.Table, err)
-			continue
+			return fmt.Errorf("delete %s ip rule mark=%d table=%d: %w", familyName, rule.Mark, rule.Table, err)
 		}
 
 		klog.V(2).Infof("Deleted %s ip rule mark=%d table=%d", familyName, rule.Mark, rule.Table)
@@ -289,17 +290,46 @@ func (m *GatewayPolicyManager) ConfigureInterface(ifaceName string, tableNum int
 
 	// Check if already configured with the same table number
 	if existingTable, exists := m.configuredIfaces[ifaceName]; exists {
-		if existingTable == tableNum {
+		if existingTable == tableNum && !m.pendingCleanup[ifaceName] {
 			klog.V(3).Infof("Gateway policy routing already configured for %s (table %d)", ifaceName, tableNum)
 			return nil
 		}
 		// Table number changed, need to reconfigure
 		klog.V(2).Infof("Gateway %s table number changed from %d to %d, reconfiguring", ifaceName, existingTable, tableNum)
-		m.removeInterfaceRulesLocked(ifaceName, existingTable)
+
+		if err := m.removeInterfaceRulesLocked(ifaceName, existingTable); err != nil {
+			return err
+		}
+
+		delete(m.configuredIfaces, ifaceName)
 	}
 
 	klog.V(2).Infof("Configuring gateway policy routing for %s (table %d)", ifaceName, tableNum)
 
+	if m.configuredIfaces == nil {
+		m.configuredIfaces = make(map[string]int)
+	}
+
+	if m.pendingCleanup == nil {
+		m.pendingCleanup = make(map[string]bool)
+	}
+
+	m.configuredIfaces[ifaceName] = tableNum
+	m.pendingCleanup[ifaceName] = true
+
+	if err := ensureGatewayInterfacePolicy(m, ifaceName, tableNum); err != nil {
+		return err
+	}
+
+	delete(m.pendingCleanup, ifaceName)
+	klog.Infof("Gateway policy routing configured for %s (table %d)", ifaceName, tableNum)
+
+	return nil
+}
+
+var ensureGatewayInterfacePolicy = (*GatewayPolicyManager).ensureInterfacePolicyLocked
+
+func (m *GatewayPolicyManager) ensureInterfacePolicyLocked(ifaceName string, tableNum int) error {
 	// 1. Add route table entry if not exists
 	if err := EnsureRtTablesEntry(tableNum, ifaceName); err != nil {
 		return fmt.Errorf("failed to ensure route table for %s: %w", ifaceName, err)
@@ -328,9 +358,6 @@ func (m *GatewayPolicyManager) ConfigureInterface(ifaceName string, tableNum int
 
 		m.outputRuleAdded = true
 	}
-
-	m.configuredIfaces[ifaceName] = tableNum
-	klog.Infof("Gateway policy routing configured for %s (table %d)", ifaceName, tableNum)
 
 	return nil
 }
@@ -529,30 +556,42 @@ func (m *GatewayPolicyManager) ensureIPRule(tableNum int) error {
 }
 
 // RemoveInterface removes policy routing configuration for an interface
+var discoverGatewayInterfaceTable = (*GatewayPolicyManager).findInterfaceTableNumLocked
+
 func (m *GatewayPolicyManager) RemoveInterface(ifaceName string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if err := m.cleanupLegacyOutputSourceRulesLocked(); err != nil {
-		klog.Warningf("Failed cleaning legacy gateway output source rules: %v", err)
+		return err
 	}
 
 	if err := m.cleanupOutboundPinningRulesLocked(); err != nil {
-		klog.Warningf("Failed cleaning legacy gateway outbound pinning rules: %v", err)
+		return err
 	}
 
 	tableNum, exists := m.configuredIfaces[ifaceName]
 	if !exists {
 		var discovered bool
 
-		tableNum, discovered = m.findInterfaceTableNumLocked(ifaceName)
+		tableNum, discovered = discoverGatewayInterfaceTable(m, ifaceName)
 		if !discovered {
 			return nil
 		}
+
+		if m.configuredIfaces == nil {
+			m.configuredIfaces = make(map[string]int)
+		}
+
+		m.configuredIfaces[ifaceName] = tableNum
 	}
 
-	m.removeInterfaceRulesLocked(ifaceName, tableNum)
+	if err := m.removeInterfaceRulesLocked(ifaceName, tableNum); err != nil {
+		return err
+	}
+
 	delete(m.configuredIfaces, ifaceName)
+	delete(m.pendingCleanup, ifaceName)
 
 	return nil
 }
@@ -564,6 +603,19 @@ func (m *GatewayPolicyManager) ReconcileExpectedInterfaces(expected map[string]i
 	defer m.mu.Unlock()
 
 	klog.V(4).Infof("Reconciling gateway policy expected interfaces: %s", formatExpectedGatewayPolicyTables(expected))
+
+	for iface, tableNum := range m.configuredIfaces {
+		if _, keep := expected[iface]; keep {
+			continue
+		}
+
+		if err := m.removeInterfaceRulesLocked(iface, tableNum); err != nil {
+			return err
+		}
+
+		delete(m.configuredIfaces, iface)
+		delete(m.pendingCleanup, iface)
+	}
 
 	if err := m.cleanupLegacyOutputSourceRulesLocked(); err != nil {
 		return err
@@ -591,8 +643,16 @@ func (m *GatewayPolicyManager) ReconcileExpectedInterfaces(expected map[string]i
 	return nil
 }
 
+var flushGatewayRouteTable = FlushRouteTable
+
 // removeInterfaceRulesLocked removes rules for an interface (must hold lock)
-func (m *GatewayPolicyManager) removeInterfaceRulesLocked(ifaceName string, tableNum int) {
+func (m *GatewayPolicyManager) removeInterfaceRulesLocked(ifaceName string, tableNum int) error {
+	if m.pendingCleanup == nil {
+		m.pendingCleanup = make(map[string]bool)
+	}
+
+	m.pendingCleanup[ifaceName] = true
+
 	ingressMark, err := m.gatewayPolicyIngressMark(tableNum)
 	if err != nil {
 		klog.V(3).Infof("Continuing gateway policy cleanup for %s despite mark derivation failure for table %d: %v", ifaceName, tableNum, err)
@@ -605,28 +665,28 @@ func (m *GatewayPolicyManager) removeInterfaceRulesLocked(ifaceName string, tabl
 	legacyMarkRule := []string{"-i", ifaceName, "-m", "comment", "--comment", commentPrefix + ": gateway policy mark ingress", "-j", "MARK", "--set-mark", ingressMarkStr}
 	legacySaveRule := []string{"-i", ifaceName, "-m", "comment", "--comment", commentPrefix + ": gateway policy save connmark", "-j", "CONNMARK", "--save-mark"}
 
-	if err := m.ipt4.Delete(mangleTable, gatewayPolicyPreroutingChain, setConnmarkRule...); err != nil {
-		klog.V(4).Infof("Failed to delete IPv4 ingress connmark set rule for %s: %v", ifaceName, err)
-	}
+	var cleanupErr error
 
-	if err := m.ipt4.Delete(mangleTable, gatewayPolicyPreroutingChain, legacyMarkRule...); err != nil {
-		klog.V(4).Infof("Failed to delete legacy IPv4 mark rule for %s: %v", ifaceName, err)
-	}
+	for _, ipt := range []*iptables.IPTables{m.ipt4, m.ipt6} {
+		if ipt == nil {
+			continue
+		}
 
-	if err := m.ipt4.Delete(mangleTable, gatewayPolicyPreroutingChain, legacySaveRule...); err != nil {
-		klog.V(4).Infof("Failed to delete legacy IPv4 save connmark rule for %s: %v", ifaceName, err)
-	}
+		exists, err := ipt.ChainExists(mangleTable, gatewayPolicyPreroutingChain)
+		if err != nil {
+			cleanupErr = errors.Join(cleanupErr, err)
+			continue
+		}
 
-	if err := m.ipt6.Delete(mangleTable, gatewayPolicyPreroutingChain, setConnmarkRule...); err != nil {
-		klog.V(4).Infof("Failed to delete IPv6 ingress connmark set rule for %s: %v", ifaceName, err)
-	}
+		if !exists {
+			continue
+		}
 
-	if err := m.ipt6.Delete(mangleTable, gatewayPolicyPreroutingChain, legacyMarkRule...); err != nil {
-		klog.V(4).Infof("Failed to delete legacy IPv6 mark rule for %s: %v", ifaceName, err)
-	}
-
-	if err := m.ipt6.Delete(mangleTable, gatewayPolicyPreroutingChain, legacySaveRule...); err != nil {
-		klog.V(4).Infof("Failed to delete legacy IPv6 save connmark rule for %s: %v", ifaceName, err)
+		for _, rule := range [][]string{setConnmarkRule, legacyMarkRule, legacySaveRule} {
+			if err := ipt.DeleteIfExists(mangleTable, gatewayPolicyPreroutingChain, rule...); err != nil {
+				cleanupErr = errors.Join(cleanupErr, err)
+			}
+		}
 	}
 
 	// Remove ip rules (current and legacy marks) by matching against actual listed rules.
@@ -636,22 +696,29 @@ func (m *GatewayPolicyManager) removeInterfaceRulesLocked(ifaceName string, tabl
 	}
 
 	if err := m.deleteIPRulesByMarkSet(tableNum, marks, netlink.FAMILY_V4, "IPv4"); err != nil {
-		klog.V(4).Infof("Failed deleting IPv4 ip rules for %s table=%d: %v", ifaceName, tableNum, err)
+		cleanupErr = errors.Join(cleanupErr, err)
 	}
 
 	if err := m.deleteIPRulesByMarkSet(tableNum, marks, netlink.FAMILY_V6, "IPv6"); err != nil {
-		klog.V(4).Infof("Failed deleting IPv6 ip rules for %s table=%d: %v", ifaceName, tableNum, err)
+		cleanupErr = errors.Join(cleanupErr, err)
 	}
 
-	if err := FlushRouteTable(tableNum); err != nil {
-		klog.V(3).Infof("Failed to remove routes for table %d (%s): %v", tableNum, ifaceName, err)
+	if err := flushGatewayRouteTable(tableNum); err != nil {
+		cleanupErr = errors.Join(cleanupErr, err)
+	}
+
+	if cleanupErr != nil {
+		return fmt.Errorf("remove policy routing for %s table=%d: %w", ifaceName, tableNum, cleanupErr)
 	}
 
 	if err := m.removeRouteTableEntry(tableNum); err != nil {
-		klog.V(3).Infof("Failed to remove rt_tables entry for table %d (%s): %v", tableNum, ifaceName, err)
+		return fmt.Errorf("remove rt_tables entry for %s table=%d: %w", ifaceName, tableNum, err)
 	}
 
 	klog.V(2).Infof("Removed policy routing rules for %s (table %d)", ifaceName, tableNum)
+	delete(m.pendingCleanup, ifaceName)
+
+	return nil
 }
 
 // Cleanup removes all gateway policy iptables rules/chains managed by this manager.
@@ -718,7 +785,11 @@ func (m *GatewayPolicyManager) pruneStaleInterfacesLocked() error {
 		}
 
 		klog.V(2).Infof("Removing stale gateway policy rules for missing interface %s (table %d)", iface, tableNum)
-		m.removeInterfaceRulesLocked(iface, tableNum)
+
+		if err := m.removeInterfaceRulesLocked(iface, tableNum); err != nil {
+			return err
+		}
+
 		delete(m.configuredIfaces, iface)
 	}
 
@@ -1111,14 +1182,18 @@ func (m *GatewayPolicyManager) cleanupStaleIPRulesLocked(expected map[string]int
 				continue
 			}
 
-			r := rule
-			if err := netlinkRuleDel(&r); err != nil {
-				klog.V(4).Infof("Failed deleting stale %s ip rule mark=%d table=%d: %v", familyName, rule.Mark, rule.Table, err)
-				continue
+			if err := flushGatewayRouteTable(tableNum); err != nil {
+				return fmt.Errorf("flush stale gateway table %d: %w", tableNum, err)
 			}
 
-			_ = FlushRouteTable(tableNum)         //nolint:errcheck
-			_ = m.removeRouteTableEntry(tableNum) //nolint:errcheck
+			if err := m.removeRouteTableEntry(tableNum); err != nil {
+				return err
+			}
+
+			r := rule
+			if err := netlinkRuleDel(&r); err != nil {
+				return fmt.Errorf("delete stale %s ip rule mark=%d table=%d: %w", familyName, rule.Mark, rule.Table, err)
+			}
 
 			klog.V(2).Infof("Removed stale %s ip rule mark=%d table=%d", familyName, rule.Mark, rule.Table)
 		}

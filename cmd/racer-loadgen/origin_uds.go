@@ -142,9 +142,9 @@ func (b *originBlobBody) Close() error {
 	return nil
 }
 
-// originUID is the UID/GID the loadgen origin runs as. The racer-dataplane
+// originUID is the UID/GID the loadgen origin runs as. The racer
 // creates /run/racer/<cache>/origin owned by this user with mode 0700
-// (ORIGIN_UID in cmd/racer-dataplane/src/client/origin_directory.rs).
+// (ORIGIN_UID in cmd/racer/src/client/origin_directory.rs).
 const originUID = 65532
 
 // checkOriginDirectory creates nothing and changes nothing. It refuses
@@ -161,7 +161,7 @@ func checkOriginDirectory(root, cache string) error {
 
 		info, err := os.Lstat(path)
 		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("origin directory %s does not exist: racer-dataplane creates it owned by UID/GID %d "+
+			return fmt.Errorf("origin directory %s does not exist: racer creates it owned by UID/GID %d "+
 				"with mode 0700; run the origin as UID %d and mount that directory", path, originUID, originUID)
 		}
 

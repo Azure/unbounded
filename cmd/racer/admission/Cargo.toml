@@ -1,0 +1,12 @@
+[package]
+name = "racer-admission"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Racer object sidecar mutating admission webhook logic"
+
+[dependencies]
+base64 = "0.22"
+serde = "1"
+serde_json = "1"

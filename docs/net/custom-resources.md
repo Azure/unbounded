@@ -381,6 +381,8 @@ flowchart TD
     W -->|Yes| OK[Included in Pool Status]
 ```
 
+A node that matches the `nodeSelector` of any GatewayPool is left out of SiteNodeSlices, even when a SitePeering with `meshNodes: true` covers its Site. Other nodes can reach it only as a gateway peer of the pool it is assigned to. A node that matches several pools is assigned to the first one by name. A selector that matches every node of a Site therefore leaves the Site with no SiteNodeSlices and no mesh peers. Select gateway nodes with a dedicated label, such as `unbounded-cloud.io/unbounded-net-gateway: "true"`.
+
 ### Gateway Peer IP Resolution
 
 When connecting to a gateway peer, the node agent resolves the endpoint IP:
@@ -481,11 +483,24 @@ status:
 | `spec.gatewayPool` | `string` | Yes | GatewayPool this node belongs to. |
 | `spec.site` | `string` | No | Site name (derived from node labels). |
 | `status.lastUpdated` | `string` | - | Read-only. Last heartbeat timestamp. |
+| `status.forwardingMTU` | `integer` | No | Effective local forwarding MTU in bytes, published after successful dataplane reconciliation. |
 | `status.routes` | `map[string]GatewayNodeRoute` | - | Read-only. Route advertisements keyed by CIDR. |
 | `status.routes[].type` | `string` | - | Route source type: `NodeCidr`, `PodCidr`, or `RoutedCidr`. |
 | `status.routes[].source` | `GatewayNodePathHop` | - | Originating object for this route (`type` + `name`). |
 | `status.routes[].intermediateHops` | `[]GatewayNodePathHop` | - | Additional path objects between source and destination. |
 | `status.routes[].paths` | `[][]GatewayNodePathHop` | - | Full end-to-end paths. Each item is an ordered hop sequence from origin to local advertiser (max 100). |
+
+Workers apply `status.forwardingMTU` from their next-hop gateway and candidate
+gateways in intermediate pools on accepted paths. This includes shared-interface
+limits even when a worker does not use the route that imposed the limit.
+Gateways do not consume other gateways' published MTUs, avoiding feedback that
+could prevent a previous minimum from increasing.
+
+Install the updated GatewayPoolNode CRD before upgrading agents so the API server
+preserves this optional field. Older gateways without the field retain
+topology-derived MTU handling; the additional shared-interface protection requires
+the updated gateway agent and CRD. Gateway peers whose GatewayPoolNode object is
+missing are not used as route destinations.
 
 ---
 

@@ -368,7 +368,6 @@ func (c *Client) Get(ctx context.Context, request Request, options ...ReadOption
 		Length:      uint64(o.Length),
 		PageCredits: pageCredits,
 		ByteCredits: pageCredits * PageSize,
-		Ordered:     true,
 		SmallObject: o.SmallObject,
 		Pin:         o.ETag,
 	}
@@ -456,7 +455,7 @@ func (c *Client) open(ctx context.Context, head []byte, o wire.SubscriptionOptio
 		conn:     conn,
 		timeout:  c.limits.bodyTimeout,
 		metadata: fromWireMetadata(response.Metadata),
-		seq:      wire.NewSequence(response.First, response.End, true),
+		seq:      wire.NewSequence(response.First, response.End),
 		first:    response.First,
 		end:      response.End,
 		pages:    response.Pages,

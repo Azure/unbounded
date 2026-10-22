@@ -34,7 +34,7 @@ name.
 
 Unbounded releases publish the image as `ghcr.io/azure/racer-object:vX.Y.Z`; use
 the same [release](https://github.com/Azure/unbounded/releases) tag as your
-operator's `racer-controller` and `racer-dataplane` images. Contributors can build
+operator's `racer` image. Contributors can build
 from source with `make racer-object` (binary at `bin/racer-object`) or
 `make image-racer-object-local`.
 
@@ -44,7 +44,7 @@ from source with `make racer-object` (binary at `bin/racer-object`) or
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--cache` | `racer-object` | Racer ClusterCache name. Must match the socket mount paths. |
+| `--cache` | none, required | Racer ClusterCache name. Must match the socket mount paths. |
 | `--debug-listen` | empty | Optional pprof and `/healthz` address. Unauthenticated and unencrypted. Restrict access. |
 | `--version` | | Print version and exit. |
 
@@ -238,15 +238,16 @@ so the pod's namespace must allow hostPath volumes under Pod Security Admission.
 
 ### Automatic Injection
 
-`racer-controller` runs a mutating admission webhook that adds the sidecar to
-opted-in pods. The unbounded operator installs the
-`MutatingWebhookConfiguration` named `racer-object-sidecar-injector` and manages
-its CA bundle. The webhook:
+Elected control seats in `racer` run a mutating admission webhook that
+adds the sidecar to opted-in pods. The unbounded operator installs the
+`MutatingWebhookConfiguration` named `racer-object-sidecar-injector`. The elected
+primary maintains its CA bundle and the `racer-webhook` Service's endpoints.
+The webhook:
 
 - Handles only pod `CREATE`. Existing pods are not changed.
 - Matches only pods with the label
   `racer.unbounded-cloud.io/object-sidecar: enabled`.
-- Skips the racer-controller namespace.
+- Skips the Racer installation namespace.
 - Skips pods that already have a container named `racer-object`.
 - Uses `failurePolicy: Fail`. If the webhook is down or an annotation is invalid,
   the pod is not created.
@@ -269,8 +270,9 @@ spec:
         app: racer-object-example
         racer.unbounded-cloud.io/object-sidecar: enabled
       annotations:
+        # Required: the ClusterCache to bind to.
+        racer.unbounded-cloud.io/object-cache: racer-object
         # Optional:
-        # racer.unbounded-cloud.io/object-cache: racer-object
         # racer.unbounded-cloud.io/object-api: azure
         # racer.unbounded-cloud.io/object-memory-limit: 256Mi
     spec:
@@ -284,7 +286,7 @@ Annotations, all with the prefix `racer.unbounded-cloud.io/`:
 
 | Annotation | Default | Meaning |
 |------------|---------|---------|
-| `object-cache` | `racer-object` | Sets `--cache` and the socket mount path. |
+| `object-cache` | none, required | ClusterCache name. Sets `--cache` and the socket mount path. |
 | `object-api` | flag default (`s3`) | Sets `--api`. `s3` or `azure`. |
 | `object-listen` | flag default (`127.0.0.1:8080`) | Sets `--listen`. Loopback IP literal and port. |
 | `object-cpu-request` | not set | Sidecar CPU request. |
@@ -292,8 +294,9 @@ Annotations, all with the prefix `racer.unbounded-cloud.io/`:
 | `object-memory-request` | not set | Sidecar memory request. |
 | `object-memory-limit` | not set | Sidecar memory limit. |
 
-An annotation that is present with an empty value is rejected. Values are checked
-with the same rules as the flags. The pod can read the whole bucket of its
+There is no default cache. The webhook denies an opted-in pod without
+`object-cache`. An annotation that is present with an empty value is rejected.
+Values are checked with the same rules as the flags. The pod can read the whole bucket of its
 ClusterCache. A pod that reads two buckets needs two ClusterCaches and two
 sidecars.
 
@@ -310,7 +313,7 @@ The webhook makes these changes to the pod:
 
 - Adds an init container named `racer-object` with `restartPolicy: Always`, placed
   first. It uses the `racer-object` image of the same release as
-  `racer-controller`, and the args
+  `racer`, and the args
   `sidecar --cache=...` plus `--api` and `--listen`
   when set.
 - Sets the security context described below, with `RuntimeDefault` seccomp.
@@ -341,7 +344,7 @@ Other denial causes:
   be reachable by other host-network workloads on the node.
 
 If the pod is created without a sidecar, check that the label is on the pod (not
-only on the Deployment), that the pod is not in the racer-controller namespace,
+only on the Deployment), that the pod is not in the Racer installation namespace,
 and that no container is already named `racer-object`.
 
 ### Manual Pod Spec

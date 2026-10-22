@@ -181,7 +181,7 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to ghcr.io
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -269,6 +269,7 @@ jobs:
   #   - orca                          : deployed separately by deploy-orca
   #   - racer-object                  : injected sidecars and per-ClusterCache
   #                                     origin DaemonSets from the racer component
+  #   - racer-vllm                    : vLLM with the Racer loader; not deployed
   #
   # machine-ops-controller is omitted on purpose: the operator synthesizes
   # metalman per Site instead, so machine-ops is never rolled out here.
@@ -294,14 +295,15 @@ jobs:
             file: images/unbounded-operator/Containerfile
           - name: gantry
             file: images/gantry/Containerfile
-          - name: racer-controller
-            file: images/racer-controller/Containerfile
-          - name: racer-dataplane
-            file: images/racer-dataplane/Containerfile
           - name: gantry-node-config
             file: images/gantry-node-config/Containerfile
+          - name: racer
+            file: images/racer/Containerfile
           - name: racer-object
             file: images/racer-object/Containerfile
+          - name: racer-vllm
+            file: images/racer-vllm/Containerfile
+            large: true
           - name: orca
             file: images/orca/Containerfile
           - name: inventory-aggregator
@@ -321,10 +323,18 @@ jobs:
       - name: Normalize container registry to lowercase
         run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
 
+      - name: Free disk space for large images
+        # The vLLM base image alone is larger than a hosted runner's free disk.
+        if: matrix.component.large
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to ghcr.io
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}

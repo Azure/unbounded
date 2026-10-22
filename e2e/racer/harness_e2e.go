@@ -3,13 +3,15 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package racer holds the kind-based end-to-end suite for Racer object
-// caching: the operator installs Racer from a ClusterCache with an Azure
-// origin, and workloads read public blobs through the injected racer-object
-// sidecar.
+// Package racer holds the kind-based end-to-end suite for Racer: the operator
+// installs Racer from ClusterCaches, workloads read public Azure blobs through
+// the injected racer-object sidecar, and Gantry serves registry content
+// through its Racer backend.
 //
 // The harness shells out to kind, kubectl, docker, and make so the suite
-// exercises the same artifacts and install path an operator would use.
+// exercises the same artifacts and install path an operator would use. Every
+// test shares one kind cluster, created by the first test that needs it and
+// deleted after the last.
 //
 // Environment knobs:
 //
@@ -31,6 +33,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -50,6 +54,74 @@ type harness struct {
 	kubeconfig   string
 	registryPort string
 	keep         bool
+}
+
+// shared is the cluster every test uses. sharedTried and sharedRunning record
+// whether setup was attempted and whether it finished, so later tests fail
+// fast instead of retrying a broken setup.
+var (
+	sharedMu      sync.Mutex
+	shared        *harness
+	sharedTried   bool
+	sharedRunning bool
+)
+
+// teardownShared deletes the shared cluster unless setup never ran or
+// RACER_E2E_KEEP is set. TestMain calls it after every test has run.
+func teardownShared() {
+	sharedMu.Lock()
+	h, tried := shared, sharedTried
+	sharedMu.Unlock()
+
+	if tried && h != nil && !h.keep {
+		h.forTest(nil).teardown()
+	}
+}
+
+// cluster returns a harness bound to t for the shared cluster, creating the
+// cluster, building and pushing images, and installing the operator on first
+// use.
+func cluster(t *testing.T) *harness {
+	t.Helper()
+
+	sharedMu.Lock()
+	defer sharedMu.Unlock()
+
+	if sharedRunning {
+		return shared.forTest(t)
+	}
+
+	if sharedTried {
+		t.Fatal("shared kind cluster setup failed in an earlier test")
+	}
+
+	sharedTried = true
+	shared = newHarness(t)
+	shared.setup()
+	shared.buildImages()
+	shared.install()
+
+	sharedRunning = true
+
+	return shared.forTest(t)
+}
+
+// forTest returns a copy of h that reports to t. A nil t logs to stderr.
+func (h *harness) forTest(t *testing.T) *harness {
+	c := *h
+	c.t = t
+
+	return &c
+}
+
+func (h *harness) logf(format string, args ...any) {
+	if h.t == nil {
+		fmt.Fprintf(os.Stderr, format+"\n", args...)
+		return
+	}
+
+	h.t.Helper()
+	h.t.Logf(format, args...)
 }
 
 func newHarness(t *testing.T) *harness {
@@ -112,7 +184,7 @@ func (h *harness) exec(timeout time.Duration, stdin []byte, name string, args ..
 
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = h.repoRoot
-	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
+	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
 	cmd.WaitDelay = 10 * time.Second
 
 	cmd.Env = append(os.Environ(), "KUBECONFIG="+h.kubeconfig)
@@ -138,7 +210,7 @@ func (h *harness) exec(timeout time.Duration, stdin []byte, name string, args ..
 // try runs a best-effort command and logs, rather than fails on, errors.
 func (h *harness) try(timeout time.Duration, name string, args ...string) {
 	if out, err := h.exec(timeout, nil, name, args...); err != nil {
-		h.t.Logf("ignoring error from %s %s: %v\n%s", name, strings.Join(args, " "), err, out)
+		h.logf("ignoring error from %s %s: %v\n%s", name, strings.Join(args, " "), err, out)
 	}
 }
 
@@ -183,7 +255,7 @@ func requireAzureEgress(t *testing.T, url string) {
 	t.Skipf("skipping: Azure blob egress unavailable (set CI=1 to fail instead): %v", err)
 }
 
-// setup creates the local registry and kind cluster and registers cleanup.
+// setup creates the local registry and kind cluster.
 func (h *harness) setup() {
 	h.t.Helper()
 
@@ -193,11 +265,8 @@ func (h *harness) setup() {
 		}
 	}
 
+	// Start clean; TestMain deletes the cluster after the run.
 	h.teardown()
-
-	if !h.keep {
-		h.t.Cleanup(h.teardown)
-	}
 
 	h.run(2*time.Minute, "docker", "run", "-d", "--name", registryContainer,
 		"-p", "127.0.0.1:"+h.registryPort+":5000", "registry:2")
@@ -210,6 +279,8 @@ containerdConfigPatches:
     config_path = "/etc/containerd/certs.d"
 nodes:
 - role: control-plane
+- role: worker
+- role: worker
 - role: worker
 `
 
@@ -241,8 +312,8 @@ func (h *harness) teardown() {
 	h.try(time.Minute, "docker", "rm", "-f", registryContainer)
 }
 
-// buildImages builds and pushes every operator-managed Racer image plus the
-// operator, all tagged with the operator version so component references
+// buildImages builds and pushes every operator-managed Racer image, Gantry,
+// and the operator, all tagged with the operator version so component references
 // resolve to them.
 func (h *harness) buildImages() {
 	h.t.Helper()
@@ -251,9 +322,9 @@ func (h *harness) buildImages() {
 
 	images := []image{
 		{"image-unbounded-operator-local", "unbounded-operator"},
-		{"image-racer-controller-local", "racer-controller"},
 		{"image-racer-object-local", "racer-object"},
-		{"image-racer-dataplane-local", "racer-dataplane"},
+		{"image-racer-local", "racer"},
+		{"image-gantry-local", "gantry"},
 	}
 
 	skipAll := os.Getenv("RACER_E2E_SKIP_BUILD") == "1"
@@ -262,7 +333,7 @@ func (h *harness) buildImages() {
 	for _, img := range images {
 		ref := h.imageRegistry() + "/" + img.repo + ":" + imageTag
 
-		if !skipAll && (!skipDataplane || img.repo != "racer-dataplane") {
+		if !skipAll && (!skipDataplane || img.repo != "racer") {
 			h.t.Logf("building %s", ref)
 			h.run(60*time.Minute, "make", img.target, "CONTAINER_ENGINE=docker", "TRIVY=",
 				"VERSION="+imageTag, "CONTAINER_REGISTRY="+h.imageRegistry())
@@ -284,6 +355,30 @@ func (h *harness) install() {
 		"--image-registry", h.imageRegistry(),
 		"--operator-image", "unbounded-operator:"+imageTag,
 		"--wait", "--timeout", "5m")
+}
+
+// installRacer waits for the operator to install Racer after a ClusterCache
+// is created, caps the dataplane threads for kind, waits for the
+// racer DaemonSet to roll out, and waits for its embedded control
+// plane to elect a primary. It is safe to call more than once.
+func (h *harness) installRacer() {
+	h.t.Helper()
+
+	// Automatic sizing scales with host cores. The operator seeds this
+	// ConfigMap once and preserves administrator edits, rolling the DaemonSet
+	// on change.
+	h.waitExists("configmap", "racer-settings", 5*time.Minute)
+	h.kubectl("-n", operatorNamespace, "patch", "configmap", "racer-settings", "--type=merge",
+		"-p", `{"data":{"RACER_MAX_THREADS":"3"}}`)
+
+	// The embedded control plane needs a dedicated thread, so 3 is the floor.
+	h.rollout("daemonset", "racer", 10*time.Minute)
+	h.waitFor("racer-primary lease held by a live seat", 5*time.Minute, func() (bool, string) {
+		v := h.controlView()
+		_, ok := v.primarySeat()
+
+		return ok, v.String()
+	})
 }
 
 // waitFor polls until fn returns true or the deadline passes.
@@ -338,9 +433,15 @@ func (h *harness) dumpDiagnostics(namespaces ...string) {
 		{"get", "events", "-A", "--sort-by=.lastTimestamp"},
 		{"-n", operatorNamespace, "get", "ds,deploy,cm", "-o", "wide"},
 		{"-n", operatorNamespace, "logs", "deploy/unbounded-operator", "--tail=200"},
-		{"-n", operatorNamespace, "logs", "deploy/racer-controller", "--all-containers", "--tail=200"},
-		{"-n", operatorNamespace, "logs", "-l", "app.kubernetes.io/name=racer-dataplane", "--all-containers", "--tail=200", "--prefix"},
+		{"-n", operatorNamespace, "get", "leases", "-o", "wide"},
+		{"-n", operatorNamespace, "get", "endpointslices", "-o", "wide"},
+		// Metadata only: racer-state holds key material and must not be logged.
+		{"-n", operatorNamespace, "get", "secret", racerStateSecret, "-o", "jsonpath={.metadata.uid} {.metadata.resourceVersion}"},
+		{"-n", operatorNamespace, "logs", "-l", "app.kubernetes.io/name=racer", "--all-containers", "--tail=200", "--prefix"},
 		{"-n", operatorNamespace, "logs", "-l", "app.kubernetes.io/name=racer-origin", "--all-containers", "--tail=200", "--prefix"},
+		{"get", "sites", "-o", "yaml"},
+		{"-n", operatorNamespace, "get", "ds/gantry", "cm/gantry-config", "-o", "yaml"},
+		{"-n", operatorNamespace, "logs", "-l", "app.kubernetes.io/name=gantry", "--all-containers", "--tail=200", "--prefix"},
 	}
 	for _, ns := range namespaces {
 		cmds = append(cmds,

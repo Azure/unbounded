@@ -265,7 +265,7 @@ func (r *MachineOperationReconciler) operationRequest(
 		OperationName:     op.Name,
 		OperationUID:      op.UID,
 		ProviderID:        providerID,
-		Operation:         op.Spec.OperationKind,
+		Operation:         op.Spec.OperationKind.Canonical(),
 		Parameters:        op.Spec.Parameters,
 		Auth:              auth,
 	}
@@ -379,7 +379,14 @@ func shouldExecuteOperation(op *unboundedv1alpha3.MachineOperation, operation *p
 	return operation.ReplaySafe() && op.Status.Phase == unboundedv1alpha3.OperationPhaseInProgress
 }
 
+// isHostOperation reports whether an out-of-band provider is expected to
+// execute operation. HostOSReboot is executed by the in-host agent, so a
+// provider that does not register it must ignore rather than fail it.
 func isHostOperation(operation unboundedv1alpha3.OperationKind) bool {
+	if operation == unboundedv1alpha3.OperationHostOSReboot {
+		return false
+	}
+
 	return strings.HasPrefix(string(operation), "Host")
 }
 

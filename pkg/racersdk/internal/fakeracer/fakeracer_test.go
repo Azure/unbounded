@@ -397,7 +397,7 @@ func TestSubscriptionPages(t *testing.T) {
 			}
 
 			end := min(test.end, test.size)
-			sequence := wire.NewSequence(test.first, end, true)
+			sequence := wire.NewSequence(test.first, end)
 			reader := bytes.NewReader(data)
 
 			for {

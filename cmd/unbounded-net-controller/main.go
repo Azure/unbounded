@@ -727,6 +727,21 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 			}()
 		}
 
+		nodeAssignmentCtrl, err := controller.NewNodeAssignmentController(
+			clientset,
+			informerFactory.Core().V1().Nodes(),
+			nodeAuthCaches.pods,
+		)
+		if err != nil {
+			klog.Errorf("Failed to create Node assignment controller: %v", err)
+		} else {
+			go func() {
+				if err := nodeAssignmentCtrl.Run(ctx, 2); err != nil {
+					klog.Errorf("Node assignment controller error: %v", err)
+				}
+			}()
+		}
+
 		// Create and start peering aggregation controller
 		peeringAggCtrl, err := controller.NewPeeringAggregationController(dynamicClient, dynamicInformerFactory)
 		if err != nil {

@@ -16,6 +16,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -111,6 +112,28 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 		if isManagedWorkload(obj) {
 			op.Overridable = true
 			op.DependsOn = dependsOn
+		}
+
+		if obj.GetKind() == "Role" && obj.GetNamespace() == env.Namespace {
+			policy := ""
+
+			switch obj.GetName() {
+			case controllerName:
+				policy = "unbounded-net-node-pod-delete-restriction"
+			case nodeName:
+				policy = "unbounded-net-effective-assignment-ownership"
+			}
+
+			if policy != "" {
+				// These grants rely on admission to constrain namespace-wide
+				// Pod verbs. Failed policy installation must block the grant.
+				for _, kind := range []string{"ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"} {
+					op.DependsOn = append(op.DependsOn, component.ObjectRef{
+						GVK:  schema.GroupVersionKind{Group: "admissionregistration.k8s.io", Version: "v1", Kind: kind},
+						Name: policy,
+					})
+				}
+			}
 		}
 
 		plan.Add(op)

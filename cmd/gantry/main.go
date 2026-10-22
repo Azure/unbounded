@@ -5,9 +5,10 @@
 //
 // Subcommands:
 //
-//	gantry version print build information and exit
-//	gantry agent run the full agent (mirror + transfer + libp2p + ...)
+//	gantry agent       run the full agent (mirror + transfer + libp2p + ...)
+//	gantry init        prepare the libp2p identity directory
 //	gantry snapshotter run the ACR OverlayBD compatibility snapshotter
+//	gantry version     print build information and exit
 package main
 
 import (
@@ -49,6 +50,7 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/metrics"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	"github.com/Azure/unbounded/internal/gantry/negcache"
+	"github.com/Azure/unbounded/internal/gantry/providerprobe"
 	"github.com/Azure/unbounded/internal/gantry/rangecache"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
 	streamingapi "github.com/Azure/unbounded/internal/gantry/streaming"
@@ -57,7 +59,7 @@ import (
 )
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	if err := newCmdRoot(runAgent, prepareAgentRuntime).Execute(); err != nil {
 		if !errors.Is(err, flag.ErrHelp) {
 			fmt.Fprintln(os.Stderr, err)
 		}
@@ -66,73 +68,9 @@ func main() {
 	}
 }
 
-func run(args []string) error {
-	if len(args) == 0 {
-		printUsage(os.Stderr)
-		return errors.New("gantry: subcommand required")
-	}
-
-	switch args[0] {
-	case "version", "-version", "--version":
-		fmt.Printf("gantry %s %s/%s (go %s, commit %s, built %s)\n",
-			version.Version, runtime.GOOS, runtime.GOARCH, runtime.Version(),
-			version.GitCommit, version.BuildTime)
-
-		return nil
-	case "agent":
-		return runAgent(args[1:])
-	case "snapshotter":
-		return runSnapshotter(args[1:])
-	case "help", "-h", "-help", "--help":
-		return runHelp(args[1:])
-	default:
-		printUsage(os.Stderr)
-		return fmt.Errorf("gantry: unknown subcommand %q", args[0])
-	}
-}
-
-func printUsage(w *os.File) {
-	//nolint:errcheck // best-effort write
-	_, _ = fmt.Fprintln(w, `Usage: gantry <subcommand> [flags]
-
-Subcommands:
-  agent      run the Gantry P2P agent
-	snapshotter run the ACR OverlayBD compatibility snapshotter
-  version    print build information
-	help       print help for a subcommand`)
-}
-
-func runHelp(args []string) error {
-	if len(args) == 1 && args[0] == "snapshotter" {
-		fs := buildSnapshotterFlagSet()
-		fs.SetOutput(os.Stdout)
-		_, _ = fmt.Fprintln(os.Stdout, "Usage: gantry snapshotter [flags]") //nolint:errcheck // best-effort write
-		_, _ = fmt.Fprintln(os.Stdout)                                      //nolint:errcheck // best-effort write
-		_, _ = fmt.Fprintln(os.Stdout, "Flags:")                            //nolint:errcheck // best-effort write
-
-		fs.PrintDefaults()
-
-		return nil
-	}
-
-	if len(args) == 0 || args[0] == "agent" {
-		fs, _ := buildAgentFlagSet(config.NewDefault())
-		fs.SetOutput(os.Stdout)
-		_, _ = fmt.Fprintln(os.Stdout, "Usage: gantry agent [flags]") //nolint:errcheck // best-effort write
-		_, _ = fmt.Fprintln(os.Stdout)                                //nolint:errcheck // best-effort write
-		_, _ = fmt.Fprintln(os.Stdout, "Flags:")                      //nolint:errcheck // best-effort write
-
-		fs.PrintDefaults()
-
-		return nil
-	}
-
-	return fmt.Errorf("gantry help: unknown topic %q", args[0])
-}
-
 // buildAgentFlagSet constructs the `gantry agent` flag set bound to c. The
 // returned *string is the --config flag's value (read before re-parsing
-// with the file-derived defaults). Exposed for runHelp.
+// with the file-derived defaults). Also used for the agent's help text.
 func buildAgentFlagSet(c *config.Config) (*flag.FlagSet, *string) {
 	fs := flag.NewFlagSet("agent", flag.ContinueOnError)
 	configPath := fs.String("config", "", "path to YAML config file")
@@ -569,6 +507,7 @@ func runAgent(args []string) error {
 		realResolver := coldstart.NewChairResolver(coldstart.ChairOptions{
 			Chairs:       chairCache,
 			Discovery:    disco,
+			PeerMetadata: peerClient,
 			Coord:        chairCoord,
 			LocalPull:    coordServer,
 			Inflight:     inflightMap,
@@ -666,19 +605,8 @@ func runAgent(args []string) error {
 				// let kubelet back off than thunder the origin.
 				return disco.Health() >= 0.3
 			},
-			Inflight: inflightMap,
-			Recheck: func(ctx context.Context, d digest.Digest) bool {
-				// Final post-jitter probe: did anyone publish a
-				// provider record while we slept? If so, direct-origin-fallback declines
-				// and the client retries through the warm path on its
-				// next attempt.
-				rcCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
-				defer cancel()
-
-				prov, err := disco.FindProviders(rcCtx, d)
-
-				return err == nil && len(prov) > 0
-			},
+			Inflight:   inflightMap,
+			Recheck:    newUsableProviderRecheck(disco, peerClient),
 			OnFallback: func() { p5.originFallbackTotal.Inc() },
 			OnDecline: func(reason string) {
 				p5.originFallbackDeclineTotal.WithLabelValues(reason).Inc()
@@ -1147,6 +1075,25 @@ func runAgent(args []string) error {
 	logger.Info("gantry stopped")
 
 	return nil
+}
+
+func newUsableProviderRecheck(dht ifaces.DHT, peer ifaces.PeerMetadataDialer) func(context.Context, ifaces.OriginRef) bool {
+	return func(ctx context.Context, ref ifaces.OriginRef) bool {
+		// Keep this final escape-valve check bounded. A provider record alone
+		// cannot suppress origin fallback; a peer must answer HEAD for ref.
+		recheckCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+
+		_, usable, err := providerprobe.FirstFromDiscovery(recheckCtx, dht, peer, ref, providerprobe.Attempted{}, 2*time.Second)
+		if err != nil {
+			slog.Debug("provider recheck lookup failed",
+				slog.String("digest", ref.Digest.String()),
+				slog.Any("err", err),
+			)
+		}
+
+		return usable
+	}
 }
 
 // loadAgentConfig merges YAML, env, and flags into a *config.Config. Two-

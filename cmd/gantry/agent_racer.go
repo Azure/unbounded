@@ -85,7 +85,7 @@ func serveRacerAgent(ctx context.Context, c *config.Config, logger *slog.Logger,
 	// Always install the handler, even without a client, so unavailable requests
 	// retain Racer correlation headers and rate-limited failure diagnostics.
 	mirrorSrv := mirror.New(c, nil, originClient,
-		mirror.WithContentBackend(racer.NewHandler(deps.client, originClient, logger)), mirror.WithLogger(logger), mirror.WithStartupReadinessGate())
+		mirror.WithContentBackend(racer.NewHandler(deps.client, originClient, logger, racer.WithRetryBudget(c.RacerRetryBudget), racer.WithRetryObserver(telemetry.MirrorRetry))), mirror.WithLogger(logger), mirror.WithStartupReadinessGate())
 
 	var (
 		ready   atomic.Bool

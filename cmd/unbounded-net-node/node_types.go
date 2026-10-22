@@ -29,12 +29,16 @@ type wireGuardState struct {
 	siteRouting      siteRoutingConfig
 	manageCniPlugin  bool // Whether this node's site manages CNI plugin and full podCIDR mesh routes
 	cniMTU           int  // Last MTU written to the managed CNI configuration
+	appliedFabricMTU int  // Last attempted fabric MTU, including writes before a failed reconciliation.
 	cniConfigWritten bool // Whether this process has written the managed CNI configuration
+	dataplaneDirty   bool // A failed programming attempt must not take the unchanged-state fast path.
 	mu               sync.Mutex
 
 	// Kubernetes client for tainting nodes
 	clientset kubernetes.Interface
 	nodeName  string
+
+	adoptedAssignment nodeAssignment
 
 	// Netlink managers for the main intra-site WireGuard mesh interface
 	linkManager      *unboundednetnetlink.LinkManager
@@ -93,10 +97,10 @@ type wireGuardState struct {
 	gatewaySiteNames               map[string]string                          // interface name -> gateway site name
 
 	// Gateway node state
-	isGatewayNode       bool      // Whether this node is a gateway node
-	myGatewayPort       int32     // This node's assigned gateway WireGuard port (0 if not a gateway)
-	localGatewayPools   []string  // Gateway pools this node belongs to
-	gatewayTaintApplied sync.Once // Ensures gateway taint is applied only once
+	isGatewayNode       bool     // Whether this node is a gateway node
+	myGatewayPort       int32    // This node's assigned gateway WireGuard port (0 if not a gateway)
+	localGatewayPools   []string // Gateway pools this node belongs to
+	gatewayTaintApplied bool     // Whether the gateway taint has been applied successfully
 
 	// Masquerade manager for iptables rules
 	masqueradeManager *unboundednetnetlink.MasqueradeManager
@@ -195,6 +199,7 @@ type gatewayPeerInfo struct {
 	UnmanagedCNISite       bool     // Gateway's Site has manageCniPlugin=false, so it never gets a podCIDR
 	TunnelProtocol         string   // Resolved tunnel protocol for this peer (WireGuard or GENEVE)
 	TunnelMTU              int      // Effective MTU after route, encapsulation, and CRD limits
+	TransitTunnelMTU       int      // MTU imposed by an actual downstream GatewayPoolPeering path
 }
 
 // meshPeerInfo contains information about a peer on the main mesh interface.

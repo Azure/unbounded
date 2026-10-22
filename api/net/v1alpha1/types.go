@@ -19,6 +19,18 @@ const (
 	// and read intentionally until then.
 	SiteLabelKey = "net.unbounded-cloud.io/site"
 
+	// GatewayPoolLabelKey identifies the single GatewayPool assignment adopted
+	// by the node agent. An absent label means the node is a worker.
+	GatewayPoolLabelKey = "net.unbounded-cloud.io/gateway-pool"
+
+	// EffectiveSiteAnnotation records the Site adopted by a node-agent Pod.
+	EffectiveSiteAnnotation = "net.unbounded-cloud.io/effective-site"
+
+	// EffectiveGatewayPoolAnnotation records the GatewayPool adopted by a
+	// node-agent Pod. A present empty value means the worker role; an absent
+	// key means acknowledgment is pending.
+	EffectiveGatewayPoolAnnotation = "net.unbounded-cloud.io/effective-gateway-pool"
+
 	// NodeDiscoveredPublicIPAnnotation contains the translated source IP
 	// discovered by the node agent. It does not prove that the WireGuard port is
 	// reachable through symmetric NAT or CGNAT.
@@ -327,6 +339,15 @@ type GatewayNodeSpec struct {
 // GatewayNodeStatus defines the advertised routes and lease heartbeat for a gateway node.
 // +k8s:deepcopy-gen=true
 type GatewayNodeStatus struct {
+	// ForwardingMTU is the effective local forwarding MTU after a successful
+	// dataplane reconciliation. Workers use this cap for accepted gateway paths.
+	// Gateways do not consume it, avoiding feedback between advertised minima.
+	// Absent values identify agents that have not published a forwarding limit.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	ForwardingMTU *int32 `json:"forwardingMTU,omitempty"`
+
 	// LastUpdated is the heartbeat timestamp updated by the node agent.
 	// +optional
 	LastUpdated metav1.Time `json:"lastUpdated,omitempty"`

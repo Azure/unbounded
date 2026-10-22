@@ -6,11 +6,15 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -90,9 +94,57 @@ func TestGatewayPoolPeeringProtocolResolution(t *testing.T) {
 	}
 }
 
+func TestPinnedGatewayPoolWaitsForPublishedIdentity(t *testing.T) {
+	fixture := newPoolPeeringProtocolFixture(t, true)
+	fixture.state.isGatewayNode = true
+	fixture.state.adoptedAssignment = nodeAssignment{
+		site:        "local",
+		gatewayPool: "not-ready",
+		nodeUID:     "node-uid",
+	}
+
+	err := fixture.update()
+	if err == nil || !strings.Contains(err.Error(), "has not published this node identity and settings yet") {
+		t.Fatalf("error = %v", err)
+	}
+
+	if fixture.configureCalls != 0 {
+		t.Fatalf("configuration ran before assigned GatewayPool readiness: %d calls", fixture.configureCalls)
+	}
+}
+
+func TestPinnedGatewayPoolAcknowledgmentWaitsForTaint(t *testing.T) {
+	fixture := newPoolPeeringProtocolFixture(t, true)
+	fixture.state.isGatewayNode = true
+	fixture.state.adoptedAssignment = nodeAssignment{
+		site:        "local",
+		gatewayPool: "local-a",
+		nodeUID:     "node-uid",
+	}
+	client := fixture.state.clientset.(*fake.Clientset)
+	client.PrependReactor("patch", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("taint denied")
+	})
+
+	err := fixture.update()
+	if err == nil || !strings.Contains(err.Error(), "taint gateway node") {
+		t.Fatalf("error = %v", err)
+	}
+
+	if fixture.state.gatewayTaintApplied {
+		t.Fatal("failed taint was recorded as applied")
+	}
+
+	if fixture.configureCalls != 0 {
+		t.Fatalf("configuration ran before gateway taint adoption: %d calls", fixture.configureCalls)
+	}
+}
+
 type poolPeeringProtocolFixture struct {
 	peerings       cache.SharedIndexInformer
 	pools          cache.SharedIndexInformer
+	nodes          cache.SharedIndexInformer
+	assignments    cache.SharedIndexInformer
 	state          *wireGuardState
 	update         func() error
 	configureCalls int
@@ -173,11 +225,16 @@ func newPoolPeeringProtocolFixture(t *testing.T, gateway bool) *poolPeeringProto
 			TunnelProtocol: new(unboundednetv1alpha1.TunnelProtocolNone),
 		},
 	}))
+	f.assignments = assignmentInformer
 	empty := newInformerWithObjects()
+	gatewayNodes := newInformerWithObjects(toUnstructured(t, &unboundednetv1alpha1.GatewayPoolNode{
+		ObjectMeta: metav1.ObjectMeta{Name: "remote"},
+	}))
+	f.nodes = gatewayNodes
 	cfg := &config{NodeName: "self", WireGuardPort: 51820, WireGuardInterfacePrefix: "gpp-test-wg", MTU: 576, PreferredPrivateEncap: "WireGuard"}
 	f.update = func() error {
 		return updateWireGuardFromSlices(context.Background(), nil, siteInformer, empty, f.pools,
-			empty, empty, assignmentInformer, f.peerings, cfg, siteName, "priv", "pub-self", true, f.state)
+			gatewayNodes, empty, assignmentInformer, f.peerings, cfg, siteName, "priv", "pub-self", true, f.state)
 	}
 
 	original := configureWireGuardFunc
@@ -222,6 +279,44 @@ func (f *poolPeeringProtocolFixture) checkGateway(t *testing.T, protocol, overri
 		if peer.TunnelProtocol != "None" {
 			t.Fatalf("cross-pool override leaked to same-pool mesh peer: %+v", peer)
 		}
+	}
+}
+
+func TestGatewayAssignmentMTUDoesNotLeakFromWorkerAssignments(t *testing.T) {
+	f := newPoolPeeringProtocolFixture(t, true)
+	f.state.adoptedAssignment = nodeAssignment{site: "local", gatewayPool: "local-a"}
+	sites := newInformerWithObjects(
+		toUnstructured(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "local"}}),
+		toUnstructured(t, &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "site-b"}}),
+	)
+	assignments := newInformerWithObjects(
+		toUnstructured(t, &unboundednetv1alpha1.SiteGatewayPoolAssignment{
+			ObjectMeta: metav1.ObjectMeta{Name: "worker-only"},
+			Spec: unboundednetv1alpha1.SiteGatewayPoolAssignmentSpec{
+				Sites: []string{"local", "site-b"}, GatewayPools: []string{"remote-pool"}, TunnelMTU: ptrInt32(1100),
+			},
+		}),
+		toUnstructured(t, &unboundednetv1alpha1.SiteGatewayPoolAssignment{
+			ObjectMeta: metav1.ObjectMeta{Name: "gateway-facing"},
+			Spec: unboundednetv1alpha1.SiteGatewayPoolAssignmentSpec{
+				Sites: []string{"site-b"}, GatewayPools: []string{"local-a"}, TunnelMTU: ptrInt32(1400),
+			},
+		}),
+	)
+	empty := newInformerWithObjects()
+
+	cfg := &config{NodeName: "self", WireGuardPort: 51820, WireGuardInterfacePrefix: "gpp-test-wg", MTU: 576}
+	if err := updateWireGuardFromSlices(t.Context(), nil, sites, empty, f.pools, empty, empty, assignments, empty,
+		cfg, "local", "priv", "pub-self", true, f.state); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := f.state.assignmentSiteTunnelMTUs["site-b"]; got != 1400 {
+		t.Fatalf("gateway-to-Site cap=%d, want 1400, ignoring worker assignment via unrelated pool", got)
+	}
+
+	if got := f.state.assignmentPoolTunnelMTUs["remote-pool"]; got != 0 {
+		t.Fatalf("worker-side pool cap leaked into gateway path: %d", got)
 	}
 }
 
@@ -369,6 +464,84 @@ func TestGatewayPoolPeeringProtocolConflictsAndScope(t *testing.T) {
 
 		f.checkGateway(t, "None", "")
 	})
+}
+
+func TestPublishedForwardingMTUWorkerOnly(t *testing.T) {
+	for _, gateway := range []bool{false, true} {
+		t.Run(fmt.Sprintf("gateway=%v", gateway), func(t *testing.T) {
+			f := newPoolPeeringProtocolFixture(t, gateway)
+			f.putPeering(t, "connect", "local-a", nil, true)
+
+			node := &unboundednetv1alpha1.GatewayPoolNode{
+				ObjectMeta: metav1.ObjectMeta{Name: "remote"},
+				Status:     unboundednetv1alpha1.GatewayNodeStatus{ForwardingMTU: ptrInt32(500)},
+			}
+			if err := f.nodes.GetStore().Update(toUnstructured(t, node)); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := f.update(); err != nil {
+				t.Fatal(err)
+			}
+
+			want := 500
+			if gateway {
+				want = 0
+			}
+
+			if len(f.gateways) != 1 || f.gateways[0].TransitTunnelMTU != want {
+				t.Fatalf("gateway=%v consumed published cap unexpectedly: %+v", gateway, f.gateways)
+			}
+		})
+	}
+}
+
+func TestGatewayPolicyFailureRetriesAfterAssignmentReactivation(t *testing.T) {
+	f := newPoolPeeringProtocolFixture(t, false)
+	f.putPeering(t, "connect", "local-a", nil, true)
+
+	if err := f.update(); err != nil {
+		t.Fatal(err)
+	}
+
+	assignment, exists, err := f.assignments.GetStore().GetByKey("local-to-remote")
+	if err != nil || !exists {
+		t.Fatalf("assignment exists=%v err=%v", exists, err)
+	}
+
+	if err := f.assignments.GetStore().Delete(assignment); err != nil {
+		t.Fatal(err)
+	}
+
+	f.configureErr = errors.New("policy table flush failed")
+	if err := f.update(); !errors.Is(err, f.configureErr) {
+		t.Fatalf("cleanup error=%v", err)
+	}
+
+	if !f.state.dataplaneDirty || len(f.state.gatewayPeers) != 1 {
+		t.Fatal("failed cleanup was not retained as incomplete programming")
+	}
+
+	if err := f.assignments.GetStore().Add(assignment); err != nil {
+		t.Fatal(err)
+	}
+
+	f.configureErr = nil
+	if err := f.update(); err != nil {
+		t.Fatal(err)
+	}
+
+	if f.configureCalls != 3 || len(f.gateways) != 1 || f.state.dataplaneDirty {
+		t.Fatalf("reactivated assignment skipped policy repair: calls=%d peers=%v dirty=%v", f.configureCalls, f.gateways, f.state.dataplaneDirty)
+	}
+
+	if err := f.update(); err != nil {
+		t.Fatal(err)
+	}
+
+	if f.configureCalls != 3 {
+		t.Fatal("successful repair did not restore no-op reconciliation")
+	}
 }
 
 func TestGatewayPoolPeeringProtocolFailureRetries(t *testing.T) {
