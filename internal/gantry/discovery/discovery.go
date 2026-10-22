@@ -45,8 +45,13 @@ import (
 	"time"
 
 	"github.com/ipfs/go-cid"
+	"github.com/ipfs/go-datastore"
+	dssync "github.com/ipfs/go-datastore/sync"
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
+	"github.com/libp2p/go-libp2p-kad-dht/provider"
+	"github.com/libp2p/go-libp2p-kad-dht/provider/keystore"
+	"github.com/libp2p/go-libp2p-kad-dht/records"
 	"github.com/libp2p/go-libp2p/core/connmgr"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
@@ -118,6 +123,10 @@ type Options struct {
 	// ConnManagerGrace is the minimum age a connection must reach before it
 	// becomes a trim candidate. Zero uses DefaultConnManagerGrace.
 	ConnManagerGrace time.Duration
+
+	ProviderValidity  time.Duration
+	ReprovideInterval time.Duration
+	MaxReprovideDelay time.Duration
 }
 
 // Connection-manager defaults. go-libp2p's own defaults (160/192) are sized
@@ -128,9 +137,12 @@ type Options struct {
 // plus peers with an in-flight transfer. That grows logarithmically in
 // cluster size, so these values do not scale with the fleet.
 const (
-	DefaultConnManagerHigh  = 900
-	DefaultConnManagerLow   = 600
-	DefaultConnManagerGrace = time.Minute
+	DefaultConnManagerHigh   = 900
+	DefaultConnManagerLow    = 600
+	DefaultConnManagerGrace  = time.Minute
+	DefaultProviderValidity  = 6 * time.Hour
+	DefaultReprovideInterval = 3 * time.Hour
+	DefaultMaxReprovideDelay = 10 * time.Minute
 )
 
 // DefaultTransferPort is the conventional peer-transfer port used when
@@ -149,23 +161,28 @@ func FromConfig(c *config.Config) Options {
 	}
 
 	return Options{
-		IdentityPath:     c.Libp2pIdentityPath,
-		ListenAddrs:      c.Libp2pListen,
-		BootstrapPeers:   c.Libp2pBootstrapPeers,
-		ProtocolPrefix:   "/gantry",
-		SelfTestPeriod:   60 * time.Second,
-		TransferPort:     port,
-		ConnManagerHigh:  c.Libp2pConnManagerHigh,
-		ConnManagerLow:   c.Libp2pConnManagerLow,
-		ConnManagerGrace: c.Libp2pConnManagerGrace,
+		IdentityPath:      c.Libp2pIdentityPath,
+		ListenAddrs:       c.Libp2pListen,
+		BootstrapPeers:    c.Libp2pBootstrapPeers,
+		ProtocolPrefix:    "/gantry",
+		SelfTestPeriod:    60 * time.Second,
+		TransferPort:      port,
+		ConnManagerHigh:   c.Libp2pConnManagerHigh,
+		ConnManagerLow:    c.Libp2pConnManagerLow,
+		ConnManagerGrace:  c.Libp2pConnManagerGrace,
+		ProviderValidity:  c.DHTProviderValidity,
+		ReprovideInterval: c.DHTReprovideInterval,
+		MaxReprovideDelay: c.DHTMaxReprovideDelay,
 	}
 }
 
 // Host wraps a libp2p host + kad-dht and implements ifaces.DHT.
 type Host struct {
-	logger *slog.Logger
-	h      host.Host
-	d      *dht.IpfsDHT
+	logger       *slog.Logger
+	h            host.Host
+	d            *dht.IpfsDHT
+	provider     *provider.SweepingProvider
+	providerKeys keystore.Keystore
 
 	// transferPort is the conventional peer-transfer port suffixed to
 	// FindProviders results' IP. Captured from Options at New so
@@ -295,7 +312,15 @@ func New(ctx context.Context, opts Options) (*Host, error) {
 		return nil, fmt.Errorf("discovery: libp2p new: %w", err)
 	}
 
-	dhtOpts := []dht.Option{dht.Mode(dht.ModeServer)}
+	providerValidity := opts.ProviderValidity
+	if providerValidity <= 0 {
+		providerValidity = DefaultProviderValidity
+	}
+
+	dhtOpts := []dht.Option{
+		dht.Mode(dht.ModeServer),
+		dht.ProviderManagerOpts(records.ProvideValidity(providerValidity)),
+	}
 	if opts.ProtocolPrefix != "" {
 		dhtOpts = append(dhtOpts, dht.ProtocolPrefix(protocol.ID(opts.ProtocolPrefix)))
 	}
@@ -312,7 +337,21 @@ func New(ctx context.Context, opts Options) (*Host, error) {
 		logger.Warn("dht bootstrap kickoff returned err", slog.Any("err", err))
 	}
 
-	host := &Host{logger: logger, h: h, d: d}
+	reprovider, providerKeys, err := newSweepingProvider(d, opts)
+	if err != nil {
+		_ = d.Close() //nolint:errcheck // best-effort constructor rollback
+		_ = h.Close() //nolint:errcheck // best-effort constructor rollback
+
+		return nil, fmt.Errorf("discovery: sweeping provider: %w", err)
+	}
+
+	host := &Host{
+		logger:       logger,
+		h:            h,
+		d:            d,
+		provider:     reprovider,
+		providerKeys: providerKeys,
+	}
 
 	host.transferPort = opts.TransferPort
 	if host.transferPort == 0 {
@@ -346,6 +385,44 @@ func New(ctx context.Context, opts Options) (*Host, error) {
 	return host, nil
 }
 
+func newSweepingProvider(d *dht.IpfsDHT, opts Options) (*provider.SweepingProvider, keystore.Keystore, error) {
+	reprovideInterval := opts.ReprovideInterval
+	if reprovideInterval <= 0 {
+		reprovideInterval = DefaultReprovideInterval
+	}
+
+	maxReprovideDelay := opts.MaxReprovideDelay
+	if maxReprovideDelay <= 0 {
+		maxReprovideDelay = DefaultMaxReprovideDelay
+	}
+
+	keys, err := keystore.NewKeystore(dssync.MutexWrap(datastore.NewMapDatastore()))
+	if err != nil {
+		return nil, nil, err
+	}
+
+	reprovider, err := provider.New(
+		provider.WithKeystore(keys),
+		// Every registered key has already been published synchronously.
+		provider.WithSkipBootstrapReprovide(true),
+		provider.WithHost(d.Host()),
+		provider.WithReplicationFactor(d.BucketSize()),
+		provider.WithSelfAddrs(d.FilteredAddrs),
+		provider.WithRouter(d),
+		provider.WithAddLocalRecord(func(ctx context.Context, h multihash.Multihash) error {
+			return d.Provide(ctx, cid.NewCidV1(cid.Raw, h), false)
+		}),
+		provider.WithMessageSender(d.MessageSender()),
+		provider.WithReprovideInterval(reprovideInterval),
+		provider.WithMaxReprovideDelay(maxReprovideDelay),
+	)
+	if err != nil {
+		return nil, nil, errors.Join(err, keys.Close())
+	}
+
+	return reprovider, keys, nil
+}
+
 // Close tears down the DHT and libp2p host. Safe to call multiple times.
 func (h *Host) Close() error {
 	var err error
@@ -361,12 +438,24 @@ func (h *Host) Close() error {
 			<-h.selfTestDone
 		}
 
-		if cerr := h.d.Close(); cerr != nil {
-			err = cerr
+		if h.provider != nil {
+			if cerr := h.provider.Close(); cerr != nil {
+				err = errors.Join(err, cerr)
+			}
 		}
 
-		if cerr := h.h.Close(); cerr != nil && err == nil {
-			err = cerr
+		if h.providerKeys != nil {
+			if cerr := h.providerKeys.Close(); cerr != nil {
+				err = errors.Join(err, cerr)
+			}
+		}
+
+		if cerr := h.d.Close(); cerr != nil {
+			err = errors.Join(err, cerr)
+		}
+
+		if cerr := h.h.Close(); cerr != nil {
+			err = errors.Join(err, cerr)
 		}
 	})
 
@@ -434,28 +523,42 @@ func (h *Host) Provide(ctx context.Context, d digest.Digest) error {
 		return err
 	}
 
-	return h.d.Provide(ctx, c, true)
+	if err := h.d.Provide(ctx, c, true); err != nil {
+		return err
+	}
+
+	if h.provider == nil {
+		return nil
+	}
+
+	// Finish registration after a successful publication, even if the caller
+	// cancels, so the advertiser can track every key retained by the sweeper.
+	if _, err := h.providerKeys.Put(context.WithoutCancel(ctx), c.Hash()); err != nil {
+		return err
+	}
+
+	return h.provider.AddToSchedule(c.Hash())
 }
 
-// Withdraw implements ifaces.DHT. libp2p kad-dht has no protocol-level
-// withdraw - provider records expire at the 24 h TTL. The advertiser
-// achieves the same effect by simply not re-calling Provide for
-// withdrawn digests on its next refresh tick, so this hook exists
-// purely as a cooperation point for the interface contract and is a
-// no-op today. Future work may emit a libp2p custom protocol message
-// to peers in the routing table to evict the stale record sooner, but
-// the plan explicitly accepts TTL drainage as adequate.
-func (h *Host) Withdraw(_ context.Context, _ digest.Digest) error {
-	return nil
+// Withdraw stops periodic reprovide. Existing remote records drain through
+// provider validity because libp2p kad-dht has no protocol-level withdrawal.
+func (h *Host) Withdraw(_ context.Context, d digest.Digest) error {
+	if h.provider == nil {
+		return nil
+	}
+
+	c, err := DigestToCID(d)
+	if err != nil {
+		return err
+	}
+
+	return h.provider.StopProviding(c.Hash())
 }
 
 // FindProviders implements ifaces.DHT. Returns providers whose multiaddrs
 // expose at least one IP-based transport (TCP or QUIC). Provider.NodeID is
-// the libp2p peer.ID as a string; Provider.Addr is the first IP-based
-// multiaddr's IP, suffixed with the conventional transfer port `:5001`.
-// coord layer will reconcile peer.ID with k8s NodeID using
-// Members; callers (the mirror miss path) only need a dialable
-// transfer URL.
+// the libp2p peer.ID as a string. Each distinct usable IP becomes a separate
+// candidate with the configured transfer port.
 func (h *Host) FindProviders(ctx context.Context, d digest.Digest) ([]ifaces.Provider, error) {
 	c, err := DigestToCID(d)
 	if err != nil {
@@ -467,30 +570,122 @@ func (h *Host) FindProviders(ctx context.Context, d digest.Digest) ([]ifaces.Pro
 	start := time.Now()
 
 	ais, err := h.d.FindProviders(ctx, c)
+	if err == nil {
+		err = ctx.Err()
+	}
+
 	if h.monitor != nil && err == nil {
 		h.monitor.ObserveLatency(time.Since(start))
 	}
 
-	if err != nil {
+	if err != nil && len(ais) == 0 {
 		return nil, err
 	}
 
 	out := make([]ifaces.Provider, 0, len(ais))
 	for _, ai := range ais {
-		addr := transferAddrWithPort(ai, h.transferPort)
-		if addr == "" {
-			continue
+		out = append(out, h.transferProviders(ai)...)
+	}
+
+	return out, err
+}
+
+// StreamProviders implements ifaces.ProviderStreamer.
+func (h *Host) StreamProviders(ctx context.Context, d digest.Digest, lookupBudget time.Duration) (<-chan ifaces.Provider, func() error) {
+	out := make(chan ifaces.Provider)
+
+	c, err := DigestToCID(d)
+	if err != nil {
+		close(out)
+
+		return out, func() error { return err }
+	}
+
+	var (
+		lookupCtx    context.Context
+		cancelLookup context.CancelFunc
+	)
+
+	if lookupBudget > 0 {
+		lookupCtx, cancelLookup = context.WithTimeout(ctx, lookupBudget)
+	} else {
+		lookupCtx, cancelLookup = context.WithCancel(ctx)
+	}
+
+	// A count of zero disables kad-dht's early stop, including the shortcut
+	// that answers from this node's own provider store once it holds a full
+	// batch. Without that, a node storing only stale records for d never asks
+	// the rest of the network.
+	found := h.d.FindProvidersAsync(lookupCtx, c, 0)
+	start := time.Now()
+
+	var lookupErr error
+
+	go func() {
+		defer close(out)
+		defer cancelLookup()
+
+		var queue []ifaces.Provider
+
+		for found != nil || len(queue) > 0 {
+			var (
+				send chan<- ifaces.Provider
+				next ifaces.Provider
+			)
+
+			if len(queue) > 0 {
+				send = out
+				next = queue[0]
+			}
+
+			select {
+			case <-ctx.Done():
+				if found != nil {
+					lookupErr = lookupCtx.Err()
+				}
+
+				return
+			case ai, ok := <-found:
+				if !ok {
+					lookupErr = lookupCtx.Err()
+					found = nil
+
+					if h.monitor != nil && lookupErr == nil {
+						h.monitor.ObserveLatency(time.Since(start))
+					}
+
+					continue
+				}
+
+				queue = append(queue, h.transferProviders(ai)...)
+			case send <- next:
+				queue = queue[1:]
+			}
 		}
-		// Cache the addr info in the peerstore so subsequent dials don't
-		// require another DHT round-trip.
-		h.h.Peerstore().AddAddrs(ai.ID, ai.Addrs, peerstore.AddressTTL)
-		out = append(out, ifaces.Provider{
+	}()
+
+	return out, func() error { return lookupErr }
+}
+
+// transferProviders preserves every distinct transfer endpoint for a peer.
+func (h *Host) transferProviders(ai peer.AddrInfo) []ifaces.Provider {
+	addresses := transferAddrsWithPort(ai, h.transferPort)
+	if len(addresses) == 0 {
+		return nil
+	}
+	// Cache the addr info in the peerstore so subsequent dials don't
+	// require another DHT round-trip.
+	h.h.Peerstore().AddAddrs(ai.ID, ai.Addrs, peerstore.AddressTTL)
+
+	providers := make([]ifaces.Provider, 0, len(addresses))
+	for _, address := range addresses {
+		providers = append(providers, ifaces.Provider{
 			NodeID: ifaces.NodeID(ai.ID.String()),
-			Addr:   addr,
+			Addr:   address,
 		})
 	}
 
-	return out, nil
+	return providers
 }
 
 // Health returns the geometric-mean health score (routing-table
@@ -726,11 +921,12 @@ func DigestToCID(d digest.Digest) (cid.Cid, error) {
 	return cid.NewCidV1(cid.Raw, mh), nil
 }
 
-// transferAddrWithPort extracts the dial address for the peer's transfer
-// endpoint by walking its multiaddrs for a remotely usable IPv4/IPv6
-// component and appending the configured port. Returns the empty string
-// if no usable IP-based multiaddr is present.
-func transferAddrWithPort(ai peer.AddrInfo, port int) string {
+// transferAddrsWithPort returns distinct usable IP endpoints in discovery order.
+func transferAddrsWithPort(ai peer.AddrInfo, port int) []string {
+	var addresses []string
+
+	seen := make(map[string]struct{}, len(ai.Addrs))
+
 	for _, ma := range ai.Addrs {
 		value, ok := extractIP(ma)
 		if !ok {
@@ -742,10 +938,16 @@ func transferAddrWithPort(ai peer.AddrInfo, port int) string {
 			continue
 		}
 
-		return net.JoinHostPort(value, strconv.Itoa(port))
+		address := net.JoinHostPort(value, strconv.Itoa(port))
+		if _, duplicate := seen[address]; duplicate {
+			continue
+		}
+
+		seen[address] = struct{}{}
+		addresses = append(addresses, address)
 	}
 
-	return ""
+	return addresses
 }
 
 func extractIP(ma multiaddr.Multiaddr) (string, bool) {

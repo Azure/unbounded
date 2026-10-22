@@ -191,6 +191,68 @@ func TestContainerdResumesInterruptedGantryBodyWithoutOriginReplay(t *testing.T)
 	}
 }
 
+func TestContainerdFallsBackWhenGantryFindsOnlyStaleProviders(t *testing.T) {
+	body := []byte("containerd fetched these bytes directly after stale-provider failover")
+	d := digestOf(body)
+	dht := fakes.NewDHT()
+	dht.Inject(d, staleProviders(25)...)
+
+	coldStart := &stubColdStart{}
+	gantry, counts := newWalkMirror(t, body, dht, newCountingPeerDialer(), coldStart)
+
+	var directHits atomic.Int64
+
+	direct := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/blobs/"+d.String()) {
+			http.NotFound(w, r)
+			return
+		}
+
+		directHits.Add(1)
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		_, _ = w.Write(body)
+	}))
+	defer direct.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resolver := docker.NewResolver(docker.ResolverOptions{
+		Hosts: func(string) ([]docker.RegistryHost, error) {
+			return []docker.RegistryHost{
+				containerdRegistryHost(t, gantry),
+				containerdRegistryHost(t, direct),
+			}, nil
+		},
+	})
+
+	fetcher, err := resolver.Fetcher(ctx, "reg.example.com/repo/image:latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := fetcher.Fetch(ctx, ocispec.Descriptor{
+		Digest: containerddigest.Digest(d.String()), Size: int64(len(body)), MediaType: ocispec.MediaTypeImageLayer,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	got, err := io.ReadAll(reader)
+	if err != nil || string(got) != string(body) {
+		t.Fatalf("body = %q, error = %v; want origin body", got, err)
+	}
+
+	if directHits.Load() != 1 {
+		t.Fatalf("direct-origin hits = %d, want 1", directHits.Load())
+	}
+
+	if counts.heads.Load() != 0 || counts.gets.Load() != 0 || atomic.LoadInt32(&coldStart.calls) != 0 {
+		t.Fatal("stale-only failover must be containerd-owned, without Gantry origin traffic or cold-start")
+	}
+}
+
 func TestContainerdFallsBackAfterPreHeaderGantryFailure(t *testing.T) {
 	const layerSize = int64(1 << 20)
 

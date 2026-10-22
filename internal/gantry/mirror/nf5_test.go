@@ -45,6 +45,15 @@ func nf5Digest(t *testing.T, b byte) digest.Digest {
 	return d
 }
 
+func nf5Ref(t *testing.T, b byte, kind ifaces.OriginRefKind) ifaces.OriginRef {
+	return ifaces.OriginRef{
+		Registry:   "registry.example.com",
+		Repository: "repo/image",
+		Digest:     nf5Digest(t, b),
+		Kind:       kind,
+	}
+}
+
 // TestNF5_DeclinesInBootstrapWindow asserts the bootstrap-window
 // suppression: direct-origin-fallback must not fire while the local DHT is still
 // converging.
@@ -60,7 +69,7 @@ func TestNF5_DeclinesInBootstrapWindow(t *testing.T) {
 		OnDecline:     func(r string) { declineReason = r },
 	})
 
-	proceed, _, err := ctrl.Allow(context.Background(), nf5Digest(t, 'a'), ifaces.KindBlob, 0)
+	proceed, _, err := ctrl.Allow(context.Background(), nf5Ref(t, 'a', ifaces.KindBlob), 0)
 	if err != nil {
 		t.Fatalf("Allow err = %v", err)
 	}
@@ -87,7 +96,7 @@ func TestNF5_DeclinesWhenUnhealthy(t *testing.T) {
 		OnDecline:     func(r string) { declineReason = r },
 	})
 
-	proceed, _, _ := ctrl.Allow(context.Background(), nf5Digest(t, 'b'), ifaces.KindManifest, 0)
+	proceed, _, _ := ctrl.Allow(context.Background(), nf5Ref(t, 'b', ifaces.KindManifest), 0)
 	if proceed {
 		t.Fatalf("Allow proceed = true; want false (unhealthy)")
 	}
@@ -109,10 +118,10 @@ func TestNF5_DeclinesOnInflightCollision(t *testing.T) {
 		OnFallback:    func() {},
 	})
 
-	d := nf5Digest(t, 'c')
+	ref := nf5Ref(t, 'c', ifaces.KindBlob)
 
 	// First call grabs the in-flight slot.
-	proceed1, release1, err := ctrl.Allow(context.Background(), d, ifaces.KindBlob, 0)
+	proceed1, release1, err := ctrl.Allow(context.Background(), ref, 0)
 	if err != nil || !proceed1 {
 		t.Fatalf("first Allow: proceed=%v err=%v; want true/nil", proceed1, err)
 	}
@@ -129,7 +138,7 @@ func TestNF5_DeclinesOnInflightCollision(t *testing.T) {
 		OnDecline:     func(r string) { declineReason = r },
 	})
 
-	proceed2, _, _ := ctrl2.Allow(context.Background(), d, ifaces.KindBlob, 0)
+	proceed2, _, _ := ctrl2.Allow(context.Background(), ref, 0)
 	if proceed2 {
 		t.Fatalf("second Allow: proceed=true; want false (in_flight)")
 	}
@@ -172,7 +181,7 @@ func TestNF5_TokenBucketExhausts(t *testing.T) {
 
 	// Burn 2 tokens (distinct digests so dedup doesn't intervene).
 	for i, b := range []byte{'d', 'e'} {
-		_, release, _ := ctrl.Allow(context.Background(), nf5Digest(t, b), ifaces.KindBlob, 0)
+		_, release, _ := ctrl.Allow(context.Background(), nf5Ref(t, b, ifaces.KindBlob), 0)
 		if release == nil {
 			t.Fatalf("call #%d: expected release fn, got nil", i)
 		}
@@ -180,7 +189,7 @@ func TestNF5_TokenBucketExhausts(t *testing.T) {
 		release()
 	}
 	// Third call: empty bucket -> decline.
-	proceed, _, _ := ctrl.Allow(context.Background(), nf5Digest(t, 'f'), ifaces.KindBlob, 0)
+	proceed, _, _ := ctrl.Allow(context.Background(), nf5Ref(t, 'f', ifaces.KindBlob), 0)
 	if proceed {
 		t.Fatalf("3rd call: proceed=true; want false (rate_limited)")
 	}
@@ -206,7 +215,7 @@ func TestNF5_TokenBucketExhausts(t *testing.T) {
 	// Advance clock 30s -> 30s × 2/60 = 1 token replenished.
 	clock = clock.Add(30 * time.Second)
 
-	proceed, release, _ := ctrl.Allow(context.Background(), nf5Digest(t, '0'), ifaces.KindBlob, 0)
+	proceed, release, _ := ctrl.Allow(context.Background(), nf5Ref(t, '0', ifaces.KindBlob), 0)
 	if !proceed {
 		t.Fatalf("after 30s refill: proceed=false; want true")
 	}
@@ -222,7 +231,7 @@ func TestNF5_DeclinesAfterRecheckHit(t *testing.T) {
 		InBootstrap:   func() bool { return false },
 		HealthyEnough: func() bool { return true },
 		ClusterSize:   func() int { return 1 }, // no jitter - recheck still runs
-		Recheck:       func(context.Context, digest.Digest) bool { return true },
+		Recheck:       func(context.Context, ifaces.OriginRef) bool { return true },
 		OnFallback:    func() { t.Fatalf("NF5 must not fire when recheck hits") },
 	})
 
@@ -233,13 +242,13 @@ func TestNF5_DeclinesAfterRecheckHit(t *testing.T) {
 		InBootstrap:   func() bool { return false },
 		HealthyEnough: func() bool { return true },
 		ClusterSize:   func() int { return 1 },
-		Recheck:       func(context.Context, digest.Digest) bool { return true },
+		Recheck:       func(context.Context, ifaces.OriginRef) bool { return true },
 		OnFallback:    func() { t.Fatalf("NF5 must not fire when recheck hits") },
 		OnDecline:     func(r string) { reason = r },
 	})
 	_ = ctrl // first ctrl uses no decline hook //nolint:errcheck // best-effort
 
-	proceed, _, _ := ctrl2.Allow(context.Background(), nf5Digest(t, '1'), ifaces.KindBlob, 0)
+	proceed, _, _ := ctrl2.Allow(context.Background(), nf5Ref(t, '1', ifaces.KindBlob), 0)
 	if proceed {
 		t.Fatalf("proceed=true; want false (recheck_hit)")
 	}
@@ -260,11 +269,11 @@ func TestNF5_ProceedsWhenGatesPass(t *testing.T) {
 		InBootstrap:   func() bool { return false },
 		HealthyEnough: func() bool { return true },
 		ClusterSize:   func() int { return 1 }, // no jitter
-		Recheck:       func(context.Context, digest.Digest) bool { return false },
+		Recheck:       func(context.Context, ifaces.OriginRef) bool { return false },
 		OnFallback:    func() { fallbacks++ },
 	})
 
-	proceed, release, err := ctrl.Allow(context.Background(), nf5Digest(t, '2'), ifaces.KindBlob, 0)
+	proceed, release, err := ctrl.Allow(context.Background(), nf5Ref(t, '2', ifaces.KindBlob), 0)
 	if err != nil {
 		t.Fatalf("Allow err = %v", err)
 	}
@@ -300,7 +309,7 @@ func TestNF5_ContextCancelledDuringJitter(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel immediately
 
-	proceed, _, err := ctrl.Allow(ctx, nf5Digest(t, '3'), ifaces.KindBlob, 0)
+	proceed, _, err := ctrl.Allow(ctx, nf5Ref(t, '3', ifaces.KindBlob), 0)
 	if proceed {
 		t.Fatalf("proceed=true; want false (ctx canceled)")
 	}
