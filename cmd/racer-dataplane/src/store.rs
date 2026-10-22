@@ -1351,6 +1351,10 @@ pub const MAX_RAW_HEADER_BYTES: usize = 16384;
 pub const MAX_HEADER_BYTES: usize = MAX_RAW_HEADER_BYTES + 4096;
 /// Smallest record unit; every stored `header_len` is a multiple of it.
 const MIN_RECORD_UNIT: usize = 512;
+/// Ciphertext alignment that cuFile needs for direct-to-GPU reads. A record
+/// whose ciphertext starts at a multiple of this on the device can be read
+/// straight into GPU memory; others are read through host memory.
+pub const CIPHERTEXT_ALIGNMENT: usize = 4096;
 
 /// Ciphertext body that can be written in place, without a staging copy.
 ///
@@ -1427,6 +1431,67 @@ pub struct DecodedRecord {
     pub header: RecordHeader,
     pub ciphertext: std::ops::Range<usize>,
     pub checksum: u64,
+}
+impl DecodedRecord {
+    /// Ciphertext byte range relative to the record start, if the record's
+    /// header block places the ciphertext at a CIPHERTEXT_ALIGNMENT boundary
+    /// and so supports direct-to-GPU reads.
+    pub fn direct_range(&self) -> Option<std::ops::Range<u64>> {
+        (self.header.format_version == FORMAT_VERSION
+            && self.ciphertext.start.is_multiple_of(CIPHERTEXT_ALIGNMENT))
+        .then_some(self.ciphertext.start as u64..self.ciphertext.end as u64)
+    }
+}
+/// Where a published record's ciphertext lives on its backing file or device.
+/// Returned only when the header block is a multiple of CIPHERTEXT_ALIGNMENT.
+/// The descriptor is the worker-local O_DIRECT
+/// descriptor the slab reads through, suitable for registration with cuFile.
+pub struct DirectCiphertext {
+    pub descriptor: Rc<uring_runtime::reactor::descriptor::Descriptor>,
+    /// Absolute byte offset of the first ciphertext byte on `descriptor`.
+    pub offset: u64,
+    /// Ciphertext length in bytes, including the AEAD tag.
+    pub length: usize,
+    /// Whether `offset` is a multiple of CIPHERTEXT_ALIGNMENT. This holds for
+    /// every such record whose physical start is 4 KiB aligned. See
+    /// `direct_ciphertext` for when that is guaranteed.
+    pub aligned: bool,
+}
+/// Translate a parsed record into its absolute on-device ciphertext location.
+///
+/// Returns Ok(None) when the record's header block is not a multiple of
+/// CIPHERTEXT_ALIGNMENT; such records must be read through host memory.
+/// `lease` must be the lease for `location` and must stay alive until any
+/// direct transfer completes. Record extents and header blocks are multiples
+/// of the record unit, so the ciphertext is 4 KiB aligned on disk whenever the
+/// record unit is a multiple of 4 KiB and the segment's physical start is 4 KiB
+/// aligned. `aligned` reports the actual result rather than assuming it.
+pub fn direct_ciphertext(
+    slabs: &Slab<flow_control::Charge<AdmissionPolicy>>,
+    location: &catalog::RecordLocation,
+    lease: &SegmentLease,
+    record: &DecodedRecord,
+) -> Result<Option<DirectCiphertext>> {
+    if record.header.extent != location.extent
+        || lease.id() != location.segment
+        || lease.generation() != location.generation
+    {
+        return Err(Error::CorruptRecord);
+    }
+    let Some(range) = record.direct_range() else {
+        return Ok(None);
+    };
+    let (descriptor, physical) = slabs.locate(location.extent, lease)?;
+    let offset = physical
+        .offset()
+        .checked_add(range.start)
+        .ok_or(Error::CorruptRecord)?;
+    Ok(Some(DirectCiphertext {
+        descriptor,
+        offset,
+        length: (range.end - range.start) as usize,
+        aligned: offset.is_multiple_of(CIPHERTEXT_ALIGNMENT as u64),
+    }))
 }
 struct RecordLayout {
     /// Unpadded header length, including the digest.
@@ -1639,10 +1704,26 @@ pub fn parse(
 ) -> Result<DecodedRecord> {
     parse_bytes(buffer.bytes()?, extent)
 }
+/// Parse and validate a whole record of `extent`'s length.
 pub fn parse_bytes(bytes: &[u8], extent: Extent) -> Result<DecodedRecord> {
     if bytes.len() != extent.length() {
         return Err(Error::CorruptRecord);
     }
+    parse_header(bytes, extent)
+}
+/// Parse and validate a record header from a prefix of the record at `extent`,
+/// without touching the ciphertext. The prefix must cover the whole header
+/// block; reading min(MAX_HEADER_BYTES, extent length) bytes always does. This
+/// lets a direct-to-GPU reader validate framing through host memory and then
+/// transfer only `DecodedRecord::ciphertext`. The ciphertext checksum is not
+/// verified here.
+pub fn parse_prefix(prefix: &[u8], extent: Extent) -> Result<DecodedRecord> {
+    if prefix.len() > extent.length() {
+        return Err(Error::CorruptRecord);
+    }
+    parse_header(prefix, extent)
+}
+fn parse_header(bytes: &[u8], extent: Extent) -> Result<DecodedRecord> {
     let mut r = Decoder(bytes);
     if r.take(8)? != MAGIC {
         return Err(Error::CorruptRecord);
@@ -1725,7 +1806,7 @@ pub fn parse_bytes(bytes: &[u8], extent: Extent) -> Result<DecodedRecord> {
     let logical_bytes = header_len
         .checked_add(ciphertext_length as usize)
         .ok_or(Error::CorruptRecord)?;
-    if logical_bytes > bytes.len() {
+    if logical_bytes > extent.length() {
         return Err(Error::CorruptRecord);
     }
     Ok(DecodedRecord {

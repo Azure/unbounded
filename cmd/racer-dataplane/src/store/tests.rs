@@ -3943,6 +3943,42 @@ mod records {
     }
 
     #[test]
+    fn prefix_parse_and_direct_range_follow_header_block_alignment() {
+        let admission = admission();
+        for unit in [512, 4096] {
+            let alignment = Alignment::new(unit, unit as u64, unit).unwrap();
+            let page = page(&admission, 3, 0, "cache", "v1");
+            let length = record_length(&page, alignment).unwrap();
+            let encoded = encode(
+                &page,
+                Generation(7),
+                alignment,
+                buffer(&admission, alignment, length),
+            )
+            .unwrap();
+            let bytes = encoded.buffer.bytes().unwrap();
+            let extent = encoded.header.extent;
+            let full = parse_bytes(bytes, extent).unwrap();
+            let block = header_block_len(&page, alignment).unwrap();
+            let prefix = parse_prefix(&bytes[..block], extent).unwrap();
+            assert_eq!(prefix.ciphertext, full.ciphertext);
+            assert_eq!(prefix.header.metadata, full.header.metadata);
+            assert!(parse_prefix(&bytes[..block - 1], extent).is_err());
+            let mut long = bytes.to_vec();
+            long.push(0);
+            assert!(parse_prefix(&long, extent).is_err());
+            // Only a 4 KiB header block is eligible for direct reads.
+            let direct = full.direct_range();
+            if unit == 4096 {
+                assert_eq!(direct, Some(4096..4096 + 19));
+            } else {
+                assert_eq!(direct, None);
+            }
+        }
+        admission.reclaim_buffers();
+    }
+
+    #[test]
     fn malformed_frames_are_rejected_without_unbounded_allocations() {
         for len in [1, 16, 512] {
             let bytes = vec![0; len];

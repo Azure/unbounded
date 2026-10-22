@@ -190,7 +190,7 @@ dataplane's GPU memory and are wiped after use.
 Ciphertext reaches GPU staging memory owned by the dataplane in one of three ways:
 
 - **Memory, origin or HTTP peer:** one host-to-GPU copy.
-- **Local disk:** cuFile reads it straight from NVMe (layout v2 only, below).
+- **Local disk:** cuFile reads it straight from NVMe (aligned records only, below).
 - **RDMA peer:** the NIC writes it into GPU memory registered with
   `ibv_reg_dmabuf_mr`. The dma-buf comes from `cuMemGetHandleForAddressRange`.
 
@@ -198,10 +198,19 @@ Ciphertext reaches GPU staging memory owned by the dataplane in one of three way
 
 ### Disk layout v2
 
-v1 records put the ciphertext right after a variable-length header, so it is not
-aligned. v2 pads the header so the ciphertext starts on a 4 KiB boundary inside
-the record. The dataplane writes v2 and still reads v1. Only v2 records can use
-cuFile. v1 records are read through host memory.
+The store already writes format version 2 records (see
+`cmd/racer-dataplane/src/store.rs`): the header and its SHA-256 digest, then zero
+padding up to `header_len`, then the ciphertext, then zero padding up to the
+extent. `header_len` and the ciphertext body are rounded up to the record unit,
+which is the slab's direct-I/O extent unit. Readers treat other versions, including
+the old unpadded v1 layout, as cold misses.
+
+cuFile needs the ciphertext to start on a 4 KiB boundary on the device. A record
+is eligible when its `header_len` is a multiple of 4 KiB, and its device offset is
+4 KiB aligned when the record unit is a multiple of 4 KiB and the segment's
+physical start is 4 KiB aligned. The dataplane does not assume this. It computes
+the absolute offset for each read and falls back to host memory if the offset is
+not aligned.
 
 ## Deployment
 
@@ -241,7 +250,7 @@ rule (`internal/racerobject/racerobject.go`).
 ## Testing
 
 - Rust simulation tests: descriptor handling, writes that would leave the
-  window, disconnect during a write, counted leaks, v1 and v2 records.
+  window, disconnect during a write, counted leaks, aligned and unaligned records.
 - A CPU test that compiles the GPU AES-GCM header as C and compares it with the
   `crypto` crate.
 - CI builds and loads the CUDA shim.
@@ -252,5 +261,5 @@ rule (`internal/racerobject/racerobject.go`).
 
 1. Descriptor passing, `host-read`, the Python client and the vLLM plugin.
 2. GPU discovery, the `gpu` crate, GPU decryption and `gpu-read`.
-3. Disk layout v2 and cuFile reads.
+3. Aligned disk records and cuFile reads.
 4. GPUDirect RDMA from peers.
