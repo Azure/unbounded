@@ -203,7 +203,7 @@ Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
 | `RACER_ALLOW_SMT` | `false` | Use eligible physical cores by default; `true` opts into logical CPUs |
 | `RACER_ENABLE_RDMA` | `auto` | `auto`, `true`, or `false`; see [modes](#rdma) |
 | `RACER_ENABLE_GPU` | `auto` | `auto`, `true`, or `false`; see [GPU reads](#gpu-reads) |
-| `RACER_GPU_STAGING_BYTES` | Unset (dataplane default) | Cap on ciphertext staging memory per GPU, in bytes |
+| `RACER_GPU_STAGING_BYTES` | `268435456` (256 MiB) | Cap on ciphertext staging memory per GPU, in bytes. Must be a nonzero multiple of 2 MiB. Not used yet |
 | `RACER_SHARES` | `4` | Enrollment proposal; explicit Node `shares` wins |
 | `RACER_PLAINTEXT_BYTES` / `RACER_CIPHERTEXT_BYTES` | Unset: `67108864` (64 MiB) / `134217728` (128 MiB) per final I/O worker | Independent plaintext/ciphertext admission budgets; an explicit value is node-wide and divided among I/O workers |
 | `RACER_DIRTY_BYTES` | Unset: `167772160` (160 MiB) per final I/O worker | Dirty-data budget; an explicit value is node-wide |
@@ -384,8 +384,19 @@ Racer-Destination-Length: <length>
 - If the read fails partway, the connection closes without the completion frame
   and the file may hold partial data.
 
-`POST /v1/objects/<key>/gpu-read` is reserved for GPU memory. This dataplane
-answers it with 501.
+`POST /v1/objects/<key>/gpu-read` writes into GPU memory. It works like
+`host-read`, with these differences:
+
+- The descriptor comes from `cuMemExportToShareableHandle` with the POSIX file
+  descriptor handle type. `Racer-Allocation-Size` is required and must be the
+  size passed to `cuMemCreate`.
+- The answer is 501 when GPU mode is off or the memory is on a GPU the
+  dataplane did not find. It is 400 when the size does not match the memory or
+  the window does not fit in it.
+- A success has `Racer-Delivery: gpu`. A page frame means the GPU copy of that
+  page is complete.
+- When the read ends for any reason, the dataplane waits for its GPU work,
+  then releases the memory. See [GPU reads](#gpu-reads).
 
 ### Warm and hard retention
 
@@ -1006,8 +1017,13 @@ GPU memory. They need:
 - An NVIDIA node set up by the unbounded agent, which installs the NVIDIA
   container runtime and a CDI spec.
 - `RACER_ENABLE_GPU` in `racer-dataplane-config`. `auto` turns GPU mode off
-  when no usable GPU is found. `true` makes startup fail instead. `false`
-  turns it off.
+  when no usable GPU is found, or when the image was built without CUDA. `true`
+  makes startup fail instead. `false` turns it off.
+
+At startup the dataplane logs each GPU it finds: ordinal, UUID, PCI address,
+NUMA node, compute mode, and whether it can use it. It skips GPUs in
+`EXCLUSIVE_PROCESS` or `PROHIBITED` mode. One helper thread does all GPU work
+for the process. At most 256 GPU reads run at once; more get 503.
 
 The dataplane does not request `nvidia.com/gpu`. It is privileged, so it
 already sees `/dev/nvidia*`. It only needs the host driver libraries.
