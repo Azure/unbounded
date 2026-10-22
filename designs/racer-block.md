@@ -68,37 +68,52 @@ directly with `io_uring_setup`, `mmap`, and `io_uring_enter`.
 - Parameters: logical block size 512, the device size rounded up to 512, the
   read-only attribute, and a maximum I/O size (default 1 MiB).
 - Defaults: `min(NumCPU, 4)` queues and a depth of 128.
-- Operations: `READ` is served. `FLUSH` succeeds. `WRITE`, `DISCARD`, and
-  `WRITE_ZEROES` fail with `EROFS`. Others fail with `EOPNOTSUPP`.
+- Operations: `READ` is served. `FLUSH` succeeds. `WRITE` fails with `EROFS`.
+  All others, such as `DISCARD` and `WRITE_ZEROES`, fail with `EOPNOTSUPP`.
+- Errors: a handler error that is a `syscall.Errno` is passed to the kernel.
+  Any other error, or a handler panic, becomes `EIO`.
 
 If racer-block exits without cleanup, the device stays in the kernel. A new run
 with the same `--id` deletes the old device first.
 
 ## Backend
 
-- Start: `Stat` the object, or check the `--etag` the user gave. The device
-  size and ETag are fixed from this point on.
+- Start: `Stat` the object. With `--etag`, the backend also checks that Racer
+  can still serve that version. With `--warm-ttl`, it uses `Warm` instead of
+  `Stat`. The device size and ETag are fixed from this point on.
 - Chunk size: power of two from 64 KiB to 16 MiB. Default 4 MiB. 16 MiB matches
   the Racer page size, so one chunk never spans two Racer pages when the chunk
   size divides 16 MiB.
-- Cache: LRU of chunks. Default 1 GiB. Chunks being read are pinned.
-- Readahead: when reads are sequential, the backend fetches the next chunks in
-  the background. The window doubles on each sequential hit up to
-  `--readahead-max` (default 64 MiB) and resets on a random read.
+- Fetches: one `Get` per run of adjacent missing chunks. A request that needs a
+  chunk already being fetched waits for that fetch.
+- Cache: LRU of chunks. Default 1 GiB. It must hold at least 4 chunks plus the
+  readahead window. Chunks being read are pinned and never evicted. If the
+  cache is full of pinned chunks, a demand read goes over the budget instead
+  of waiting, and readahead is skipped.
+- Readahead: the backend tracks up to 8 sequential streams. After 2 reads in a
+  row on a stream, it fetches the next chunks in the background. The window
+  starts at 2 chunks and doubles up to `--readahead-max` (default 64 MiB). A
+  negative value turns readahead off.
 - Tail: if the object size is not a multiple of 512, the last sector is filled
   with zeros past the end of the object.
-- Retries: `ErrUnavailable` and short reads are retried with backoff, up to 5
-  attempts. `ErrNotFound`, `ErrVersionMismatch`, `ErrUnauthorized`, and
-  `ErrForbidden` are not retried and fail the read with `EIO`.
+- Retries: `ErrUnavailable`, short reads, and protocol errors are retried, up
+  to 5 attempts. Backoff starts at 25 ms and doubles up to 1 s, with jitter. A
+  retry starts at the first chunk not yet complete, and progress resets the
+  count. `ErrNotFound`, `ErrVersionMismatch`, `ErrUnauthorized`,
+  `ErrForbidden`, `ErrInvalidRequest`, and `ErrRangeNotSatisfiable` are not
+  retried. A failed read returns `EIO` to the kernel.
 - Warm (optional): with `--warm-ttl`, racer-block asks Racer to retain the
   pinned version and refreshes the request at about half the TTL.
 
 ## Connections
 
 Each `Get` opens a new socket connection, sends one HTTP request, and closes
-the connection when done. This is the client protocol today. racer-block sets
-the SDK `MaxConnections` from the queue count and depth, so many chunk fetches
-can run at once.
+the connection when done. This is the client protocol today.
+
+`--max-connections` sets the SDK `MaxConnections`. The default is
+`min(queues * depth, 128)`. The backend shares fetches per chunk, so it needs
+far fewer connections than there are block requests in flight. The cap also
+stays near the dataplane limit, `RACER_CLIENT_CONNECTIONS` (64 per worker).
 
 ## Operations
 
@@ -130,6 +145,18 @@ racer-block device as slab storage, it would read its own cache through itself.
 - End to end: a privileged test runs `racersdktest` as a fake Racer, starts
   racer-block on it, and compares device reads with the object bytes.
 
+Run the privileged tests as root:
+
+```
+sudo modprobe ublk_drv
+go test -c -o tmp/racerblock.test ./internal/racerblock
+sudo tmp/racerblock.test -test.run EndToEnd -test.v
+go test -c -o tmp/ublk.test ./internal/racerblock/ublk
+sudo UBLK_TEST_FIO=1 tmp/ublk.test -test.v
+```
+
+`UBLK_TEST_FIO=1` also runs `fio` against the device when `fio` is installed.
+
 ## Follow-ups
 
 - The SDK uses 2 page credits and 32 MiB byte credits for every read. Large
@@ -141,3 +168,5 @@ racer-block device as slab storage, it would read its own cache through itself.
 - Zero-copy: read from the socket straight into the ublk I/O buffer instead of
   the chunk cache, for reads that bypass the cache.
 - A CSI node plugin or DaemonSet to run racer-block in Kubernetes.
+- The backend has no stall timeout per fetch attempt. It relies on the SDK
+  read timeouts.
