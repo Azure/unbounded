@@ -3928,3 +3928,200 @@ mod table {
         assert!(table.slots.is_empty());
     }
 }
+
+mod message {
+    //! `RecvMsg` descriptor passing and positioned shared-buffer writes.
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+
+    /// Send `bytes` with `fds` as one `SCM_RIGHTS` message.
+    fn send_with_fds(socket: &UnixStream, bytes: &[u8], fds: &[RawFd]) {
+        let payload = std::mem::size_of_val(fds);
+        let space = unsafe { libc::CMSG_SPACE(payload as u32) } as usize;
+        let mut control = vec![0u64; space.div_ceil(8)];
+        let mut iov = libc::iovec {
+            iov_base: bytes.as_ptr().cast_mut().cast(),
+            iov_len: bytes.len(),
+        };
+        let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
+        header.msg_iov = &mut iov;
+        header.msg_iovlen = 1;
+        if !fds.is_empty() {
+            header.msg_control = control.as_mut_ptr().cast();
+            header.msg_controllen = space as _;
+            unsafe {
+                let cmsg = libc::CMSG_FIRSTHDR(&header);
+                (*cmsg).cmsg_level = libc::SOL_SOCKET;
+                (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+                (*cmsg).cmsg_len = libc::CMSG_LEN(payload as u32) as _;
+                std::ptr::copy_nonoverlapping(
+                    fds.as_ptr().cast::<u8>(),
+                    libc::CMSG_DATA(cmsg),
+                    payload,
+                );
+            }
+        }
+        let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &header, 0) };
+        assert_eq!(
+            sent,
+            bytes.len() as isize,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    fn pipe() -> (std::fs::File, OwnedFd) {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        unsafe {
+            (
+                std::fs::File::from_raw_fd(fds[0]),
+                OwnedFd::from_raw_fd(fds[1]),
+            )
+        }
+    }
+
+    fn memfd() -> std::fs::File {
+        let fd = unsafe { libc::memfd_create(c"racer-test".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        unsafe { std::fs::File::from_raw_fd(fd) }
+    }
+
+    fn cloexec(fd: &OwnedFd) -> bool {
+        unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) & libc::FD_CLOEXEC != 0 }
+    }
+
+    #[test]
+    /// One descriptor arrives owned and close-on-exec with its bytes.
+    fn receives_one_descriptor_with_bytes() {
+        let Some(reactor) = kernel_reactor(4) else {
+            return;
+        };
+        let request = scope();
+        let (socket, peer) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let mut file = memfd();
+        send_with_fds(&peer, b"head", &[file.as_raw_fd()]);
+        let drops = Rc::new(Cell::new(0));
+        let completed = drive(
+            &reactor,
+            reactor.recv_msg(
+                Rc::new(Descriptor::from(socket)),
+                Buffer(vec![0; 16], drops.clone()),
+                Lease(drops.clone()),
+                &request,
+            ),
+        )
+        .unwrap();
+        assert_eq!(completed.bytes, 4);
+        assert_eq!(&completed.buffer.0[..4], b"head");
+        assert!(!completed.truncated);
+        assert_eq!(completed.descriptors.len(), 1);
+        assert!(cloexec(&completed.descriptors[0]));
+        let mut received = std::fs::File::from(completed.descriptors.into_iter().next().unwrap());
+        received.write_all(b"shared").unwrap();
+        let mut output = String::new();
+        use std::io::Seek;
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        file.read_to_string(&mut output).unwrap();
+        assert_eq!(output, "shared");
+    }
+
+    #[test]
+    /// Plain bytes report no descriptors; too many descriptors set truncation.
+    fn plain_bytes_and_truncated_control_data() {
+        let Some(reactor) = kernel_reactor(4) else {
+            return;
+        };
+        let request = scope();
+        let (socket, peer) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let socket = Rc::new(Descriptor::from(socket));
+        (&peer).write_all(b"x").unwrap();
+        let completed = drive(
+            &reactor,
+            reactor.recv_msg(socket.clone(), buffer(&[0; 4]), (), &request),
+        )
+        .unwrap();
+        assert_eq!(completed.bytes, 1);
+        assert!(completed.descriptors.is_empty());
+        assert!(!completed.truncated);
+
+        let (mut read, write) = pipe();
+        let many = vec![write.as_raw_fd(); MAX_RECEIVED_DESCRIPTORS + 1];
+        send_with_fds(&peer, b"y", &many);
+        drop(write);
+        let completed = drive(
+            &reactor,
+            reactor.recv_msg(socket, buffer(&[0; 4]), (), &request),
+        )
+        .unwrap();
+        assert_eq!(completed.bytes, 1);
+        assert!(completed.truncated);
+        assert!(completed.descriptors.len() <= MAX_RECEIVED_DESCRIPTORS);
+        drop(completed);
+        // Every copy of the write end is closed: no descriptor leaked.
+        let mut byte = [0];
+        assert_eq!(read.read(&mut byte).unwrap(), 0);
+    }
+
+    #[test]
+    /// A wait dropped before its CQE still closes the delivered descriptor.
+    fn abandoned_receive_closes_descriptors() {
+        let Some(reactor) = kernel_reactor(4) else {
+            return;
+        };
+        let request = scope();
+        let (socket, peer) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let drops = Rc::new(Cell::new(0));
+        let mut receive = reactor.recv_msg(
+            Rc::new(Descriptor::from(socket)),
+            Buffer(vec![0; 4], drops.clone()),
+            Lease(drops.clone()),
+            &request,
+        );
+        assert!(poll(&mut receive).is_pending());
+        reactor.wait(Duration::ZERO).unwrap();
+        drop(receive);
+        let (mut read, write) = pipe();
+        send_with_fds(&peer, b"z", &[write.as_raw_fd()]);
+        drop(write);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while drops.get() != 2 {
+            assert!(Instant::now() < deadline, "abandoned receive never fenced");
+            reactor.poll_budgeted(8).unwrap();
+            reactor.wait(Duration::from_millis(1)).unwrap();
+        }
+        let mut byte = [0];
+        assert_eq!(read.read(&mut byte).unwrap(), 0);
+    }
+
+    #[test]
+    /// Positioned shared writes land at their offset and reject huge offsets.
+    fn shared_write_at_offset() {
+        let Some(reactor) = kernel_reactor(4) else {
+            return;
+        };
+        let request = scope();
+        let mut file = memfd();
+        let fd = Rc::new(Descriptor::from(OwnedFd::from(file.try_clone().unwrap())));
+        let completed = drive(
+            &reactor,
+            reactor.write_shared_at(fd.clone(), 3, buffer(b"abc"), (), &request),
+        )
+        .unwrap();
+        assert_eq!(completed.bytes, 3);
+        let mut output = Vec::new();
+        file.read_to_end(&mut output).unwrap();
+        assert_eq!(output, b"\0\0\0abc");
+        assert!(matches!(
+            drive(
+                &reactor,
+                reactor.write_shared_at(fd, i64::MAX as u64 + 1, buffer(b"a"), (), &request),
+            ),
+            Err(Error::InvalidInput)
+        ));
+    }
+}
