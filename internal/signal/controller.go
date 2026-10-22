@@ -1345,7 +1345,10 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 		if index > 0 {
 			previous := checkTaskName(&checks[index-1])
 			if run.Spec.ExecutionPolicy.OnFailure == signalv1.SuiteFailurePolicyContinue {
-				task["depends"] = previous + ".Completed"
+				task["depends"] = fmt.Sprintf(
+					"%[1]s.Succeeded || %[1]s.Failed || %[1]s.Errored || %[1]s.Skipped || %[1]s.Omitted",
+					previous,
+				)
 			} else {
 				task["depends"] = previous + ".Succeeded"
 				task["when"] = fmt.Sprintf(
