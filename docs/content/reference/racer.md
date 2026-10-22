@@ -163,9 +163,8 @@ Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
 | `RACER_SHARES` | `4` | Enrollment proposal; explicit Node `shares` wins |
 | `RACER_PLAINTEXT_BYTES` / `RACER_CIPHERTEXT_BYTES` | Unset: `67108864` (64 MiB) / `134217728` (128 MiB) per final I/O worker | Independent plaintext/ciphertext admission budgets; an explicit value is node-wide and divided among I/O workers |
 | `RACER_DIRTY_BYTES` | Unset: `167772160` (160 MiB) per final I/O worker | Dirty-data budget; an explicit value is node-wide |
-| `RACER_REGISTERED_BYTES` | Unset: `100663296` (96 MiB) per final I/O worker | Native RDMA page-buffer budget when enabled. One node-wide pool, never divided among workers, split evenly across selected RDMA devices; an explicit value is the node total |
+| `RACER_REGISTERED_BYTES` | Unset: `100663296` (96 MiB) per final I/O worker | Native RDMA memory budget when enabled; an explicit value is node-wide |
 | `RACER_REQUEST_CONTEXT_BYTES` | Unset: `33554432` (32 MiB) per final I/O worker | Request-context budget; an explicit value is node-wide |
-| `RACER_METADATA_ENTRIES` | Unset: `4096` per final I/O worker; managed ConfigMap sets `4096` | Catalog entries; an explicit value (including the managed default) is node-wide and divided among I/O workers; at most 1,048,576 |
 | `RACER_DISK_PAGE_ENTRIES` | `65536` | Node-wide disk page-index budget in file mode; configured value at most 1,048,576; device mode can raise it as described below |
 | `RACER_ADMISSION_MODE` | `second-sight` | Disk retention policy: `disabled` or `second-sight`; does not disable request resource admission |
 | `RACER_ADMISSION_HISTORY_BYTES` | `4194304` (4 MiB) | Node-wide Bloom history budget; 32 bytes..512 MiB, divided among final I/O workers, requiring at least 32 bytes per worker |
@@ -176,9 +175,6 @@ Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
 | `RACER_WARM_WINDOW_PAGES` | `2` | Maximum in-flight pages per warm job; 1..64 |
 | `RACER_RETAINED_SEGMENT_PERCENT` | `50` | Per-worker hard-hold cap as a percentage of segment count and page-index capacity; 1..100; free-segment reserve still applies |
 | `RACER_CHECKPOINT_BYTES` | `67108864` (64 MiB) | Node-wide checkpoint working-set budget; at most 512 MiB; device mode can raise it as described below |
-| `RACER_PLACEMENT_CACHE_BYTES` | Unset: `16777216` (16 MiB) per final I/O worker | Placement capacity estimate; an explicit value is node-wide and divided among I/O workers; 1,024 bytes..512 MiB, with at least 1,024 bytes per worker |
-| `RACER_CACHED_PATHS` | Unset: `128` per final I/O worker | Retained path-query entry budget; an explicit value is node-wide and divided among I/O workers; 1..1,048,576 |
-| `RACER_PATH_CACHE_BYTES` | Unset: `8388608` (8 MiB) per final I/O worker | Accounted path-cache allocation budget; an explicit value is node-wide and divided among I/O workers; 1 byte..512 MiB, independent of entry count |
 | `RACER_ACTIVE_PATH_SEARCHES` | `8` | **Per I/O worker** distinct unfinished path-search limit; 1..64, independent of cache size |
 | `RACER_SLAB_BYTES` | `1073741824` (1 GiB) | **Per I/O worker** file-backed slab geometry; positive multiple of segment size; does not limit device-mode capacity |
 | `RACER_SEGMENT_BYTES` | `67108864` (64 MiB) | Per-worker segment size; must fit a page plus storage overhead |
@@ -186,15 +182,13 @@ Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
 | `RACER_SLAB_DIRECTORY` | `/var/lib/racer/slabs` | Slab files and checkpoints; still required and writable in device mode |
 | `RACER_DEVICE_DIRECTORY` | `/host/dev` | Device root; scan its `disk/by-id` directory; explicitly wired by managed workloads |
 | `RACER_DEVICE_BUSY_WAIT_SECS` | `120` | Startup bound for retrying selected devices whose exclusive open is busy (`EBUSY`); all busy devices share one deadline; 0..3,600 seconds, `0` skips busy devices immediately |
-| `RACER_CLIENT_CONNECTIONS` | Unset: `64` per final I/O worker | Connection admission budget; an explicit value is node-wide and partitioned among workers |
-| `RACER_CONNECTIONS_PER_NEIGHBOR` | `2` | Per-worker neighbor connection cap; at most 1024. Also sets the in-flight RDMA page grants per link |
+| `RACER_CONNECTIONS_PER_NEIGHBOR` | `2` | Per-worker neighbor connection cap; at most 1024 |
 | `RACER_ORIGIN_CONNECTIONS_PER_CACHE` | `32` | Per-cache, per-worker origin cap, independent of peer cap; at most 1024 and configured client connections (the default is lowered to fit), further clamped to the worker's outbound connection admission (a quarter of client connections). When that admission is at least 2, one slot is reserved for origin metadata requests across all caches, so page and peer connections use at most one fewer |
 | `RACER_PEER_INFLIGHT_MAX` / `RACER_PEER_PER_NEIGHBOR_MAX` | `256` / `32` | Node-wide peer-exchange admission caps |
 | `RACER_REPLICA_SELECTION` | `spread` | Which page owner a non-owner asks first. `spread`: direct neighbors first, then a per-node hash spreads pages across all owners. `primary`: always the first-ranked owner |
 | `RACER_REQUEST_TIMEOUT_MS` / `RACER_PEER_ATTEMPT_TIMEOUT_MS` | Each `30000` | Independent request / local peer-exchange deadlines; 1..86,400,000 ms |
 | `RACER_READER_STALL_TIMEOUT_MS` | `10000` | At least 1 ms and no greater than request timeout |
 | `RACER_SHUTDOWN_TIMEOUT_MS` | `30000` | 1..3,600,000 ms |
-| `RACER_MEMORY_PRESSURE` | `true` | Respond to cgroup v2 memory pressure; see [memory-pressure response](#memory-pressure-response); only the exact values `true` and `false` are accepted |
 
 Exact sizing requires both count settings. Their sum must fit `RACER_MAX_THREADS`;
 the cap is never raised implicitly. The first NUMA node in the normal placement
@@ -213,91 +207,6 @@ Node-wide budgets divide by final I/O worker count, not crypto thread count; tig
 can reduce workers. File-backed storage grows with I/O workers; raw-device capacity is
 divided among them. Admission budgets are not RSS limits:
 allocator, TLS, and filesystem cache are additional. Invalid combinations fail validation.
-
-### Memory footprint
-
-Byte settings such as `RACER_PLAINTEXT_BYTES` are admission budgets. They cap how
-much memory requests may hold at once; they do not reserve memory and are not
-resident set size (RSS) limits. RSS grows toward the budgets under load, and
-catalog, page-index, checkpoint, allocator, and TLS memory come on top.
-
-Budgets that are unset default to a per-worker amount and are multiplied by the
-final I/O worker count, so a larger node gets a larger dataplane. A value set
-explicitly is a node-wide total and is divided among workers. Each worker needs
-roughly 115 MiB of plaintext, ciphertext, dirty, and request-context budget at
-minimum; startup fails rather than drop below half of the planned workers. To
-bound memory on a large node, cap threads with `RACER_MAX_THREADS`, fix the split
-with `RACER_IO_WORKERS` and `RACER_CRYPTO_HELPERS`, or set explicit node-wide budgets.
-
-The managed DaemonSet requests `1Gi` of memory for the `dataplane` container and
-sets no memory limit, because a fixed limit would be too small for nodes with many
-workers and could cause OOM kills. To add a limit or change the request, use a
-[workload override](#operator-managed-dataplane) that sets the container's
-`resources`. Size any limit from the worker count and budgets above.
-
-On glibc builds the dataplane sets the malloc mmap threshold to 1 MiB at startup,
-before workers start. Large buffers, such as 16 MiB pages, are then mapped
-individually and returned to the kernel when freed, instead of staying in heap
-arenas. To choose a different threshold, set `MALLOC_MMAP_THRESHOLD_` in the
-container environment; the dataplane then leaves glibc's value unchanged.
-
-#### Idle buffer pools
-
-Each I/O worker keeps two small pools of idle buffers so that steady traffic reuses
-memory instead of allocating it: a recycler for released admission buffers and a
-pool of zeroed disk staging buffers. Both are sized by demand rather than held at a
-fixed depth. A pool starts with a target of 2 entries and is reviewed once per
-second. When a window had both allocations that missed the pool and returns the
-pool refused because it was full, the target grows. Each window releases half of
-the entries that sat unused for the whole window. After 10 consecutive windows
-without a miss, the target shrinks by one entry. A pool never holds more than 8
-entries or 128 MiB, and the recycler never retains more than half of any one
-admission class limit. Retained idle buffers still count against admission.
-
-#### Memory-pressure response
-
-Unless `RACER_MEMORY_PRESSURE=false`, one worker samples the dataplane's cgroup v2
-memory state once per second: `memory.current`, the lower of `memory.high` and
-`memory.max`, and the `some avg10` value from `memory.pressure`. If none of these
-files can be read, it treats the level as normal and retries every 30 seconds.
-The level is the more severe of two signals, each with hysteresis:
-
-| Level | Usage of the lower limit | PSI `some avg10` |
-|-------|--------------------------|------------------|
-| Elevated | Enter at 80%, leave below 70% | Enter at 10, leave below 5 |
-| Critical | Enter at 90%, leave below 85% | Enter at 40, leave below 20 |
-
-The managed DaemonSet sets no memory limit, so usage applies only when you add
-one; PSI applies either way. Every worker reacts to the shared level:
-
-- **Elevated**: idle buffer pools are held empty and refuse returns, retained
-  recycler and staging buffers are freed, and idle origin and peer HTTP connections
-  are closed. The sampling worker also asks glibc to return free heap memory to the
-  kernel, then repeats this at most every 10 seconds while pressure lasts.
-- **Critical**: everything above, and each worker also evicts idle memory-cache
-  entries every 100 ms, one bounded batch of at most 256 candidates. Entries in use
-  by readers or queued disk writes are never evicted.
-- **Normal**: the pools resume demand sizing. Evicted entries refill on demand.
-
-Queued disk writes are never dropped to relieve memory pressure.
-
-#### Memory metrics
-
-| Metric | Meaning |
-|--------|---------|
-| `racer_admission_used{class}` / `racer_admission_limit{class}` | Admission charge and limit for every resource class, summed over workers, including retained idle buffers |
-| `racer_recycler_entries`, `_bytes`, `_target` | Idle admission buffers retained, and the demand target, summed over workers |
-| `racer_recycler_hits_total`, `_misses_total`, `_rejects_total`, `_trimmed_total` | Reuses, allocations that missed, refused returns, and released entries |
-| `racer_staging_pool_*` | The same series for the disk staging pools, updated every 100 ms |
-| `racer_worker_recycler_bytes{worker}` / `racer_worker_staging_pool_bytes{worker}` | Retained idle bytes per worker |
-| `racer_process_resident_bytes` | Process resident set size, sampled at most once per second |
-| `racer_cgroup_memory_current_bytes` / `racer_cgroup_memory_limit_bytes` | cgroup usage and the lower of `memory.high` and `memory.max`; omitted when unavailable |
-| `racer_cgroup_memory_pressure_some_avg10` | PSI `some avg10` percentage; omitted when unavailable |
-| `racer_memory_pressure_level` | `0` normal, `1` elevated, `2` critical |
-| `racer_memory_pressure_transitions_total` / `racer_allocator_trims_total` | Level changes and heap trims |
-
-The `racer_worker_relay_*` and `racer_worker_ciphertext_*` series remain for
-compatibility.
 
 ### Raw-device storage
 
@@ -937,23 +846,6 @@ change placement; in-flight snapshots mean label changes are not immediate revoc
 | `false` | Disable native RDMA |
 
 Release images include native verbs support; discovery/provider failures retain HTTP.
-
-Each node keeps one long-lived, two-way RC connection (link) per peer and rail. The
-first page to a peer sets the link up in the background with a signed
-`POST /racer/v1/rdma/link` over an authenticated peer HTTP connection. If both nodes
-start a setup at once, the lower NodeId wins. Pages use HTTP until the link is ready,
-and again if a link breaks. Idle links close after 120 seconds.
-
-Per page, the receiver grants one registered page buffer in its signed request. The
-sender writes the page with an RDMA write with immediate, then sends a signed
-completion in place of the HTTP body. If the sender cannot use the grant before
-writing, it releases it and sends the page over HTTP. Received pages stay in
-registered memory for the request; anything kept longer, such as cached pages, is
-copied out. Senders usually copy pages into registered memory on the worker's crypto thread.
-
-Page buffers are registered for local access only. Peers write through memory
-windows (type 2B) bound per grant and invalidated after use.
-
 The Node annotation `racer.unbounded-cloud.io/rdma-nics` accepts at most 64 entries:
 
 ```json
