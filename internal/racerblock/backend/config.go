@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/Azure/unbounded/pkg/racersdk"
@@ -79,7 +80,15 @@ func (c Config) normalize() (Config, error) {
 		c.ReadaheadMax = max(c.ReadaheadMax/c.ChunkSize, 1) * c.ChunkSize
 	}
 
-	if need := MinCacheChunks*c.ChunkSize + c.ReadaheadMax; c.CacheBytes < need {
+	// MinCacheChunks*ChunkSize is small, but adding ReadaheadMax can
+	// overflow, so compare by subtraction first.
+	base := MinCacheChunks * c.ChunkSize
+	if c.ReadaheadMax > math.MaxInt64-base {
+		return c, fmt.Errorf("cache bytes %d must be at least %d chunks of %d plus read-ahead %d, which overflows int64",
+			c.CacheBytes, MinCacheChunks, c.ChunkSize, c.ReadaheadMax)
+	}
+
+	if need := base + c.ReadaheadMax; c.CacheBytes < need {
 		return c, fmt.Errorf("cache bytes %d must be at least %d (%d chunks of %d plus read-ahead %d)",
 			c.CacheBytes, need, MinCacheChunks, c.ChunkSize, c.ReadaheadMax)
 	}

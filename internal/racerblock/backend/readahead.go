@@ -95,18 +95,35 @@ func (b *Backend) noteAccess(off, end int64) {
 	// joins the read-ahead fetch instead of opening its own.
 	s.raEnd = max(s.raEnd, s.next/cs*cs)
 
-	var start, stop int64
-	if s.raEnd < b.size && s.raEnd-s.next <= s.window/2 {
-		start, stop = s.raEnd, min(s.raEnd+s.window, b.size)
-		s.raEnd = stop
-		s.window = min(2*s.window, maxWindow)
-	}
+	start, stop := s.advance(b.size, maxWindow)
 
 	ra.mu.Unlock()
 
 	if stop > start {
 		b.prefetch(start, stop)
 	}
+}
+
+// advance returns the next read-ahead range [start, stop) for an object of
+// size bytes, or an empty range when none is due, and grows the window up to
+// maxWindow. It never computes a value past size or maxWindow, so it cannot
+// overflow int64 near the maximum object size.
+func (s *stream) advance(size, maxWindow int64) (start, stop int64) {
+	if s.raEnd >= size || s.raEnd-s.next > s.window/2 {
+		return 0, 0
+	}
+
+	start = s.raEnd
+	stop = start + min(s.window, size-start)
+	s.raEnd = stop
+
+	if s.window > maxWindow/2 {
+		s.window = maxWindow
+	} else {
+		s.window *= 2
+	}
+
+	return start, stop
 }
 
 // prefetch starts background fetches for the missing chunks in [start, stop).
