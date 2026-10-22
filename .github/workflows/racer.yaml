@@ -323,10 +323,14 @@ jobs:
             ~/.cache/go-build
             bin/envtest
             bin/setup-envtest-*
-          key: racer-envtest-${{ runner.os }}-${{ runner.arch }}-go${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}
+          key: racer-envtest-${{ runner.os }}-${{ runner.arch }}-go${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}-${{ hashFiles('**/*.go') }}
+          # The key hashes the Go sources, so a push that changes Go code saves
+          # fresh race-instrumented builds and a push that does not still hits.
           # Go's build cache is content-addressed and trims itself, so an older
-          # entry is still a safe starting point after go.sum changes.
-          restore-keys: racer-envtest-${{ runner.os }}-${{ runner.arch }}-go${{ steps.go.outputs.go-version }}-
+          # entry is always a safe starting point.
+          restore-keys: |
+            racer-envtest-${{ runner.os }}-${{ runner.arch }}-go${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}-
+            racer-envtest-${{ runner.os }}-${{ runner.arch }}-go${{ steps.go.outputs.go-version }}-
 
       - name: Provision envtest and run controller API-server race tests
         run: make racer-envtest-ci
