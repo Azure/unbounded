@@ -8,8 +8,10 @@ package ublk
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -88,7 +90,81 @@ func setHooks(t *testing.T, fetchTag func(qid, tag int) int, beforeStartDev func
 	t.Cleanup(func() {
 		testHooks.fetchTag = nil
 		testHooks.beforeStartDev = nil
+		testHooks.beforeStartCmd = nil
+		testHooks.failedRingClose = nil
 	})
+}
+
+// requireFaultVM skips startup fault tests unless RACER_BLOCK_TEST_VM=1.
+// Killing a queue around START_DEV has oopsed Linux 7.0 hosts, so these
+// tests only run in a disposable VM.
+func requireFaultVM(t *testing.T) {
+	t.Helper()
+	requireUblk(t)
+
+	if os.Getenv("RACER_BLOCK_TEST_VM") != "1" {
+		t.Skip("startup fault tests need RACER_BLOCK_TEST_VM=1 in a disposable VM")
+	}
+}
+
+// injectFault makes q fail through its real error path.
+func injectFault(q *queue, err error) {
+	q.fault.Store(&err)
+	q.wake()
+}
+
+// waitRecorded waits until a queue error has been recorded for startup.
+func waitRecorded(t *testing.T, d *Device) {
+	t.Helper()
+
+	deadline := time.Now().Add(startupTimeout)
+	for d.startupErr() == nil {
+		if time.Now().After(deadline) {
+			t.Error("queue failure was not recorded")
+			return
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// recordRingCloses records, per failed queue, whether startup was
+// resolved when its ring was closed.
+func recordRingCloses(t *testing.T) func() []bool {
+	t.Helper()
+
+	var (
+		mu     sync.Mutex
+		closes []bool
+	)
+
+	testHooks.failedRingClose = func(_ *queue, resolved bool) {
+		mu.Lock()
+
+		closes = append(closes, resolved)
+		mu.Unlock()
+	}
+
+	return func() []bool {
+		mu.Lock()
+		defer mu.Unlock()
+
+		return slices.Clone(closes)
+	}
+}
+
+func checkClosedAfterResolve(t *testing.T, closes []bool) {
+	t.Helper()
+
+	if len(closes) == 0 {
+		t.Fatal("failed queue never closed its ring")
+	}
+
+	for i, resolved := range closes {
+		if !resolved {
+			t.Errorf("failed queue ring %d closed before startup was resolved", i)
+		}
+	}
 }
 
 // TestIntegrationStartupFetchRejected makes the kernel reject one
@@ -96,7 +172,7 @@ func setHooks(t *testing.T, fetchTag func(qid, tag int) int, beforeStartDev func
 // never becomes ready. Start must fail instead of issuing START_DEV,
 // which would otherwise wait for that queue forever.
 func TestIntegrationStartupFetchRejected(t *testing.T) {
-	requireUblk(t)
+	requireFaultVM(t)
 
 	before := ublkNodes(t)
 
@@ -126,21 +202,28 @@ func TestIntegrationStartupFetchRejected(t *testing.T) {
 	checkNoLeak(t, before)
 }
 
-// TestIntegrationStartupQueueFailsBeforeStartDev kills a ready queue
-// thread through its real error path and waits for it to exit before
-// START_DEV would be issued.
+// TestIntegrationStartupQueueFailsBeforeStartDev fails a ready queue
+// through its real error path before the last startup check. Start must
+// skip START_DEV, and the failed queue must keep its ring until startup
+// is resolved.
 func TestIntegrationStartupQueueFailsBeforeStartDev(t *testing.T) {
-	requireUblk(t)
+	requireFaultVM(t)
 
 	before := ublkNodes(t)
 	boom := errors.New("injected queue failure")
 
 	setHooks(t, nil, func(d *Device) {
-		q := d.queues[0]
-		q.fault.Store(&boom)
-		q.wake()
-		<-q.exited
+		injectFault(d.queues[0], boom)
+		// The queue now holds its ring until startup resolves, so wait
+		// for the recorded error rather than for the queue to exit.
+		waitRecorded(t, d)
 	})
+
+	testHooks.beforeStartCmd = func(*Device) {
+		t.Error("START_DEV issued after a queue failed")
+	}
+
+	closes := recordRingCloses(t)
 
 	d, err := startBounded(t)
 	if err == nil {
@@ -153,5 +236,41 @@ func TestIntegrationStartupQueueFailsBeforeStartDev(t *testing.T) {
 		t.Fatalf("Start = %v, want %v", err, boom)
 	}
 
+	checkClosedAfterResolve(t, closes())
+	checkNoLeak(t, before)
+}
+
+// TestIntegrationStartupQueueFailsAtStartDev fails a ready queue after
+// the last startup check, just before START_DEV is sent, so START_DEV
+// runs with a failed queue. The queue must answer I/O, including a
+// partition scan, until START_DEV returns, close its ring only after
+// that, and Start must return the recorded error.
+func TestIntegrationStartupQueueFailsAtStartDev(t *testing.T) {
+	requireFaultVM(t)
+
+	before := ublkNodes(t)
+	boom := errors.New("injected queue failure at START_DEV")
+
+	setHooks(t, nil, nil)
+
+	testHooks.beforeStartCmd = func(d *Device) {
+		injectFault(d.queues[0], boom)
+		waitRecorded(t, d)
+	}
+
+	closes := recordRingCloses(t)
+
+	d, err := startBounded(t)
+	if err == nil {
+		_ = d.Close()
+
+		t.Fatal("Start succeeded with a failed queue")
+	}
+
+	if !errors.Is(err, boom) {
+		t.Fatalf("Start = %v, want %v", err, boom)
+	}
+
+	checkClosedAfterResolve(t, closes())
 	checkNoLeak(t, before)
 }
