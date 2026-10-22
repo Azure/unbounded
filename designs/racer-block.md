@@ -80,11 +80,18 @@ in use. Only choose an ID for a device you own. Without `--id`, the kernel
 chooses a free ID.
 
 A queue failure during startup must not release resources while `START_DEV`
-is still using them. A failed queue keeps its ring open and serves `EIO` until
-startup returns. If the ring cannot serve I/O, it waits for startup to return
-or for both the kernel state and sysfs to show that the disk is published.
-If neither happens, it logs a warning and keeps waiting rather than closing
-the ring while the kernel might still use it.
+is still using them. A failed queue keeps its ring open and answers `EIO`
+while the device stops. For a started device, it keeps serving until
+`STOP_DEV` returns. This also finishes partition-scan reads that arrive after
+`START_DEV` returns. If the ring cannot serve I/O, it waits for startup to
+return or for both the kernel state and sysfs to show that the disk is
+published. If neither happens, it logs a warning and keeps waiting rather
+than closing the ring while the kernel might still use it.
+
+Cleanup is not bounded if the ring itself breaks. On Linux 7.0, requests
+already handed to the server can keep `STOP_DEV` waiting even after the ring
+closes. Closing the char device first and then deleting by ID could delete
+a different device if the ID was reused, so racer-block does not do that.
 
 ## Backend
 
@@ -135,8 +142,8 @@ sudo racer-block --cache <cache-name> --key <64 hex> [--id 0]
 - Run as root, or with `CAP_SYS_ADMIN` and access to `/dev/ublk-control` and the
   device's `/dev/ublkc<N>` node.
 - It needs access to `/run/racer/<cache>/client/socket` on the same host.
-- It prints the device path when the device is ready. `SIGINT` or `SIGTERM`
-  stops and deletes the device.
+- It prints the device path when the device is ready. In normal operation,
+  `SIGINT` or `SIGTERM` stops and deletes the device.
 - If another process stops or deletes the device, racer-block cleans up and
   exits with an error instead of waiting for a signal.
 - `--authorization-file` and `--metadata-file` set the opaque Racer

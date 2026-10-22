@@ -38,9 +38,9 @@ type errServable struct{ error }
 
 func (e errServable) Unwrap() error { return e.error }
 
-// holdUntilSafe keeps a failed queue's ring open until closing it cannot
-// strand a request or race START_DEV, and returns why it stopped
-// holding.
+// holdUntilSafe keeps a failed queue serving EIO until teardown stops it.
+// If it cannot serve, it holds the ring until closing it cannot race
+// START_DEV. A broken ring can still strand requests on Linux 7.0.
 //
 // On Linux 7.0, closing the ring cancels the queue's pending commands
 // but does not complete a request the kernel already handed to the

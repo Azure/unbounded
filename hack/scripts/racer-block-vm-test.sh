@@ -78,7 +78,14 @@ REQUIRED_ublk=(
 	TestIntegrationStartupFetchRejected
 	TestIntegrationStartupQueueFailsBeforeStartDev
 	TestIntegrationStartupQueueFailsAtStartDev
+	TestIntegrationStartupFailedQueueAnswersAfterStartup
 	TestIntegrationStartupBrokenRingAtStartDev
+	TestServeEIOServesAfterStartup
+	TestServeEIOSubmitsAnswerBeforeStopping
+	TestServeEIOSeesStopConsumedByDrain
+	TestCloseWinsTeardownKeepsFailure
+	TestCancelWinsTeardownKeepsFailure
+	TestLateFailureDuringTeardownKept
 	TestCtrlPayloadUsesStablePage
 	TestURingNop
 )
