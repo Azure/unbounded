@@ -197,4 +197,30 @@ func TestReadHeaderFile(t *testing.T) {
 	if _, err := readHeaderFile(write("long", exact+"a"), "--x"); err == nil {
 		t.Fatal("oversized value accepted")
 	}
+
+	for name, content := range map[string]string{
+		"exact-plain": exact,
+		"exact-crlf":  exact + "\r\n",
+	} {
+		if got, err := readHeaderFile(write(name, content), "--x"); err != nil || got != exact {
+			t.Fatalf("%s: len %d, %v", name, len(got), err)
+		}
+	}
+
+	for name, content := range map[string]string{
+		"crlf-extra":   exact + "\r\nx",
+		"crlf-lf":      exact + "\r\n\n",
+		"crlf-cr":      exact + "\r\n\r",
+		"crlf-crlf":    exact + "\r\n\r\n",
+		"lf-lf":        exact + "\n\n",
+		"cr-cr":        exact + "\r\r",
+		"crlf-extra-2": exact + "\r\nxyz",
+	} {
+		for _, flag := range []string{"--authorization-file", "--metadata-file"} {
+			_, err := readHeaderFile(write(name, content), flag)
+			if err == nil || !strings.HasPrefix(err.Error(), flag+":") {
+				t.Fatalf("%s %s: err = %v", name, flag, err)
+			}
+		}
+	}
 }
