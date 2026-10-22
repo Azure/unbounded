@@ -17,6 +17,8 @@ type fakeDevice struct {
 	err      error
 	closeErr error
 	closed   int
+	// onClose, if set, runs at the start of Close, before Close returns.
+	onClose func(d *fakeDevice)
 }
 
 func newFakeDevice(stopped bool, err error) *fakeDevice {
@@ -30,7 +32,20 @@ func newFakeDevice(stopped bool, err error) *fakeDevice {
 
 func (d *fakeDevice) Path() string          { return "/dev/ublkb0" }
 func (d *fakeDevice) Done() <-chan struct{} { return d.done }
-func (d *fakeDevice) Close() error          { d.closed++; return d.closeErr }
+func (d *fakeDevice) Close() error {
+	d.closed++
+	if d.onClose != nil {
+		d.onClose(d)
+	}
+
+	select {
+	case <-d.done:
+	default:
+		close(d.done)
+	}
+
+	return d.closeErr
+}
 
 func (d *fakeDevice) Err() error {
 	select {
@@ -63,6 +78,7 @@ func TestWaitAndClose(t *testing.T) {
 		{name: "device failure", stopped: true, devErr: errDevice, wantIs: errDevice},
 		{name: "device failure wins over close error", stopped: true, devErr: errDevice, closeErr: errClose, wantIs: errDevice},
 		{name: "device stopped without cause", stopped: true},
+		{name: "cancel and joined ctx and device failure", cancel: true, stopped: true, devErr: errors.Join(context.Canceled, errDevice), wantIs: errDevice},
 		{name: "device stopped with ctx error but ctx live", stopped: true, devErr: context.Canceled, wantIs: context.Canceled},
 	}
 
@@ -112,6 +128,42 @@ func TestWaitAndCloseDeadline(t *testing.T) {
 	<-ctx.Done()
 
 	dev := newFakeDevice(true, context.DeadlineExceeded)
+	if err := waitAndClose(ctx, slog.New(slog.NewTextHandler(io.Discard, nil)), dev); err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+}
+
+// TestWaitAndCloseFailureVisibleDuringClose covers a teardown for an
+// unrelated failure that is already running when ctx is canceled: Done is
+// not closed yet, and the cause only becomes visible once Close returns.
+func TestWaitAndCloseFailureVisibleDuringClose(t *testing.T) {
+	errDevice := errors.New("queue failed")
+	errClose := errors.New("delete failed")
+
+	for _, closeErr := range []error{nil, errClose} {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		dev := newFakeDevice(false, nil)
+		dev.closeErr = closeErr
+		dev.onClose = func(d *fakeDevice) { d.err = errDevice }
+
+		err := waitAndClose(ctx, slog.New(slog.NewTextHandler(io.Discard, nil)), dev)
+		if !errors.Is(err, errDevice) {
+			t.Fatalf("closeErr %v: err = %v, want %v", closeErr, err, errDevice)
+		}
+	}
+}
+
+// TestWaitAndCloseCancelDuringClose covers cancellation teardown that
+// finishes while Close runs: the ctx cause is still a clean stop.
+func TestWaitAndCloseCancelDuringClose(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	dev := newFakeDevice(false, nil)
+	dev.onClose = func(d *fakeDevice) { d.err = ctx.Err() }
+
 	if err := waitAndClose(ctx, slog.New(slog.NewTextHandler(io.Discard, nil)), dev); err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}

@@ -132,36 +132,47 @@ type runningDevice interface {
 
 // waitAndClose waits until ctx is canceled or dev stops, then closes dev.
 // The device stops itself with ctx.Err() when ctx is canceled, so ctx and
-// dev can both be done by the time this runs. A stop caused by that
-// cancellation is clean and returns nil. Any other stop cause, or a Close
-// error, is returned.
+// dev can both be done by the time this runs. The stop cause is read after
+// Close, which waits for any teardown already in progress, so a failure
+// that races with cancellation is not lost. Only a cause that is exactly
+// ctx.Err() counts as a clean stop. Any other cause, including one that
+// joins ctx.Err() with another error, is returned ahead of a Close error.
 func waitAndClose(ctx context.Context, log *slog.Logger, dev runningDevice) error {
-	var runErr error
-
 	select {
 	case <-ctx.Done():
 	case <-dev.Done():
 	}
 
+	// A device that stopped on its own before Close with no cause and no
+	// cancellation is unexpected. A nil cause after our own Close is not.
+	var stoppedFirst bool
+
 	select {
 	case <-dev.Done():
-		runErr = dev.Err()
-		if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(runErr, ctxErr) {
-			runErr = nil
-		} else if runErr == nil && ctxErr == nil {
-			runErr = errors.New("racerblock: device stopped unexpectedly")
-		}
+		stoppedFirst = true
 	default:
+	}
+
+	log.Info("stopping device", "path", dev.Path())
+
+	closeErr := dev.Close()
+
+	ctxErr := ctx.Err()
+	runErr := dev.Err()
+
+	switch {
+	case ctxErr != nil && runErr == ctxErr: //nolint:errorlint // The device records ctx.Err() itself; a wrapped or joined error is a different cause.
+		runErr = nil
+	case runErr == nil && stoppedFirst && ctxErr == nil:
+		runErr = errors.New("racerblock: device stopped unexpectedly")
 	}
 
 	if runErr != nil {
 		log.Error("device stopped", "path", dev.Path(), "err", runErr)
-	} else {
-		log.Info("stopping device", "path", dev.Path())
 	}
 
-	if err := dev.Close(); err != nil && runErr == nil {
-		runErr = fmt.Errorf("racerblock: stop device: %w", err)
+	if closeErr != nil && runErr == nil {
+		runErr = fmt.Errorf("racerblock: stop device: %w", closeErr)
 	}
 
 	return runErr
