@@ -42,6 +42,9 @@ pub const MAX_ATTRIBUTE_BYTES: usize = 4096;
 /// Charged per retained string, vector slot, or map node on top of its bytes.
 const ENTRY_OVERHEAD: usize = 64;
 
+/// Slots added the first time [`Walk::push`] grows an empty vector.
+const MIN_GROWTH: usize = 4;
+
 /// Why discovery stopped before producing a report.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Abort {
@@ -98,9 +101,47 @@ impl Walk {
         self.remaining.get()
     }
 
-    /// Charge one retained string.
+    /// Charge one string about to be copied from `value`; `to_owned` on a
+    /// `str` allocates exactly `value.len()` bytes.
     fn charge_string(&self, value: &str) -> Result<(), Abort> {
         self.charge(value.len().saturating_add(ENTRY_OVERHEAD))
+    }
+
+    /// Charge an already built string by its allocated capacity, which may
+    /// exceed its length (for example after `format!`).
+    fn charge_owned(&self, value: &String) -> Result<(), Abort> {
+        self.charge(value.capacity().saturating_add(ENTRY_OVERHEAD))
+    }
+
+    /// Charge `slots` elements of `T` with checked arithmetic.
+    fn charge_slots<T>(&self, slots: usize) -> Result<(), Abort> {
+        self.charge(
+            slots
+                .checked_mul(std::mem::size_of::<T>())
+                .ok_or(Abort::TooLarge)?,
+        )
+    }
+
+    /// An empty vector with room for exactly `slots` elements, charged before
+    /// it is allocated.
+    fn vec<T>(&self, slots: usize) -> Result<Vec<T>, Abort> {
+        self.charge_slots::<T>(slots)?;
+        let mut vec = Vec::new();
+        vec.reserve_exact(slots);
+        Ok(vec)
+    }
+
+    /// Push onto a vector of unknown final length. When it is full, the new
+    /// slots are charged before they are allocated, so every allocated slot,
+    /// used or spare, has been charged.
+    fn push<T>(&self, vec: &mut Vec<T>, item: T) -> Result<(), Abort> {
+        if vec.len() == vec.capacity() {
+            let extra = vec.capacity().max(MIN_GROWTH);
+            self.charge_slots::<T>(extra)?;
+            vec.reserve_exact(extra);
+        }
+        vec.push(item);
+        Ok(())
     }
 
     /// Check cancellation before one filesystem read and count it.
@@ -244,13 +285,12 @@ pub fn report_with_snapshot(
     let mut report = discover(walk, sys_root, dev_root)?;
     let rdma_rails = match snapshot {
         Ok(snapshot) => {
-            let mut rails = Vec::new();
+            let mut rails = walk.vec::<Rail>(snapshot.nics.len())?;
             for nic in &snapshot.nics {
-                walk.charge(std::mem::size_of::<Rail>())?;
                 let gid = nic.gid.as_ref().map(format_gid);
                 walk.charge_string(&nic.device)?;
                 if let Some(gid) = &gid {
-                    walk.charge_string(gid)?;
+                    walk.charge_owned(gid)?;
                 }
                 rails.push(Rail {
                     rail: nic.rail.0,
@@ -277,8 +317,9 @@ pub fn report_with_snapshot(
     for value in context.block_device_selector.iter() {
         walk.charge_string(value)?;
     }
+    // `Vec::clone` allocates exactly `len` slots.
+    walk.charge_slots::<ClaimedDisk>(context.claimed_disks.len())?;
     for disk in &context.claimed_disks {
-        walk.charge(std::mem::size_of::<ClaimedDisk>())?;
         walk.charge_string(&disk.id)?;
         if let Some(dev) = &disk.dev {
             walk.charge_string(dev)?;
@@ -320,9 +361,8 @@ pub fn format_gid(gid: &[u8; 16]) -> String {
 
 /// Charge and record one error message.
 fn push_error(walk: &Walk, errors: &mut Vec<String>, message: String) -> Result<(), Abort> {
-    walk.charge_string(&message)?;
-    errors.push(message);
-    Ok(())
+    walk.charge_owned(&message)?;
+    walk.push(errors, message)
 }
 
 /// Record a fixed-form section failure.
@@ -364,8 +404,8 @@ fn list(walk: &Walk, path: &Path, keep: impl Fn(&str) -> bool) -> Result<Vec<Str
             continue;
         };
         if keep(&name) {
-            walk.charge_string(&name)?;
-            names.push(name);
+            walk.charge_owned(&name)?;
+            walk.push(&mut names, name)?;
         }
     }
     names.sort();
@@ -388,16 +428,22 @@ fn raw(walk: &Walk, path: &Path) -> Result<Option<String>, Abort> {
     let Ok(file) = fs::File::open(path) else {
         return Ok(None);
     };
-    let mut bytes = Vec::with_capacity(256);
-    if file
-        .take(MAX_ATTRIBUTE_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .is_err()
-        || bytes.len() > MAX_ATTRIBUTE_BYTES
-    {
-        return Ok(None);
+    // Read into a fixed stack buffer so no heap buffer grows past what is kept.
+    let mut buffer = [0u8; MAX_ATTRIBUTE_BYTES + 1];
+    let mut file = file.take(MAX_ATTRIBUTE_BYTES as u64 + 1);
+    let mut len = 0;
+    loop {
+        match file.read(&mut buffer[len..]) {
+            Ok(0) => break,
+            Ok(n) => len += n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return Ok(None),
+        }
+        if len > MAX_ATTRIBUTE_BYTES {
+            return Ok(None);
+        }
     }
-    Ok(String::from_utf8(bytes).ok())
+    Ok(std::str::from_utf8(&buffer[..len]).ok().map(str::to_owned))
 }
 
 /// Trimmed, charged attribute text, or `None` when absent, unreadable, or empty.
@@ -461,9 +507,9 @@ fn by_id_links(
     };
     for name in names {
         if let Some(target) = link_name(walk, &directory.join(&name))? {
-            // Map node and vector slot; the name itself was charged by `list`.
+            // Map node; vector slots are charged by `push` and the name by `list`.
             walk.charge(ENTRY_OVERHEAD)?;
-            links.entry(target).or_default().push(name);
+            walk.push(links.entry(target).or_default(), name)?;
         }
     }
     Ok(links)
@@ -478,10 +524,12 @@ fn by_id_for(
     let Some(names) = by_id.get(name) else {
         return Ok(Vec::new());
     };
+    let mut copy = walk.vec::<String>(names.len())?;
     for name in names {
         walk.charge_string(name)?;
+        copy.push(name.clone());
     }
-    Ok(names.clone())
+    Ok(copy)
 }
 
 /// Enumerate every entry under `<sys>/block` without filtering.
@@ -500,9 +548,8 @@ fn block_devices(
             return Ok(Vec::new());
         }
     };
-    let mut devices = Vec::new();
+    let mut devices = walk.vec::<BlockDevice>(names.len())?;
     for name in names {
-        walk.charge(std::mem::size_of::<BlockDevice>())?;
         let path = root.join(&name);
         // Only partition children are retained; other entries are skipped
         // unread and uncharged.
@@ -513,9 +560,8 @@ fn block_devices(
             Err(ListError::Abort(abort)) => return Err(abort),
             Err(ListError::Io(_)) => Vec::new(),
         };
-        let mut partitions = Vec::new();
+        let mut partitions = walk.vec::<Partition>(children.len())?;
         for child in children {
-            walk.charge(std::mem::size_of::<Partition>())?;
             let part = path.join(&child);
             partitions.push(Partition {
                 dev: text(walk, &part.join("dev"))?,
@@ -601,9 +647,8 @@ fn rdma_devices(
             return Ok(Vec::new());
         }
     };
-    let mut devices = Vec::new();
+    let mut devices = walk.vec::<RdmaDevice>(names.len())?;
     for name in names {
-        walk.charge(std::mem::size_of::<RdmaDevice>())?;
         let path = root.join(&name);
         walk.read()?;
         let pci_address = fs::canonicalize(path.join("device"))
@@ -617,12 +662,13 @@ fn rdma_devices(
             .and_then(|value| value.trim().parse::<i64>().ok())
             .and_then(|value| u32::try_from(value).ok());
         let pci_netdevs = list_or_empty(walk, &path.join("device/net"))?;
-        let mut ports = Vec::new();
-        for port in list_or_empty(walk, &path.join("ports"))? {
+        let port_names = list_or_empty(walk, &path.join("ports"))?;
+        // Upper bound: non-numeric entries are skipped.
+        let mut ports = walk.vec::<RdmaPort>(port_names.len())?;
+        for port in port_names {
             let Ok(port_number) = port.parse::<u32>() else {
                 continue;
             };
-            walk.charge(std::mem::size_of::<RdmaPort>())?;
             let port = path.join("ports").join(port);
             let mut netdevs = BTreeSet::new();
             // Every GID slot may name a netdev (for example a RoCE VLAN
@@ -649,6 +695,8 @@ fn rdma_devices(
                     netdevs.insert(netdev.clone());
                 }
             }
+            let mut netdev_list = walk.vec::<String>(netdevs.len())?;
+            netdev_list.extend(netdevs);
             ports.push(RdmaPort {
                 port: port_number,
                 state: state(walk, &port.join("state"))?,
@@ -657,7 +705,7 @@ fn rdma_devices(
                 rate: text(walk, &port.join("rate"))?,
                 gid0: text(walk, &port.join("gids/0"))?,
                 gid0_type: text(walk, &port.join("gid_attrs/types/0"))?,
-                netdevs: netdevs.into_iter().collect(),
+                netdevs: netdev_list,
             });
         }
         ports.sort_by_key(|port| port.port);
@@ -1093,6 +1141,86 @@ mod tests {
             discover(&short, &f.sys(), &f.dev()).unwrap_err(),
             Abort::TooLarge
         );
+    }
+
+    #[test]
+    fn vec_charges_exact_capacity_before_allocating() {
+        let slots = 3;
+        let bytes = slots * std::mem::size_of::<BlockDevice>();
+        let exact = Walk::new(Arc::default(), bytes);
+        let vec = exact.vec::<BlockDevice>(slots).unwrap();
+        assert_eq!(vec.capacity(), slots);
+        assert_eq!(exact.remaining(), 0);
+        let short = Walk::new(Arc::default(), bytes - 1);
+        assert_eq!(
+            short.vec::<BlockDevice>(slots).unwrap_err(),
+            Abort::TooLarge
+        );
+        assert_eq!(short.remaining(), bytes - 1, "nothing charged on failure");
+        let overflow = Walk::new(Arc::default(), WORKING_BYTES);
+        assert_eq!(
+            overflow.vec::<BlockDevice>(usize::MAX).unwrap_err(),
+            Abort::TooLarge
+        );
+        assert_eq!(overflow.remaining(), WORKING_BYTES);
+    }
+
+    #[test]
+    fn push_charges_each_growth_before_allocating() {
+        let slot = std::mem::size_of::<String>();
+        // First growth adds MIN_GROWTH slots, the second doubles to 2 * MIN_GROWTH.
+        let budget = 2 * MIN_GROWTH * slot;
+        let walk = Walk::new(Arc::default(), budget);
+        let mut vec = Vec::new();
+        walk.push(&mut vec, String::new()).unwrap();
+        assert_eq!(vec.capacity(), MIN_GROWTH);
+        assert_eq!(walk.remaining(), budget - MIN_GROWTH * slot);
+        for _ in 1..MIN_GROWTH {
+            walk.push(&mut vec, String::new()).unwrap();
+        }
+        assert_eq!(vec.capacity(), MIN_GROWTH, "no growth until full");
+        walk.push(&mut vec, String::new()).unwrap();
+        assert_eq!(vec.capacity(), 2 * MIN_GROWTH);
+        assert_eq!(walk.remaining(), 0);
+        for _ in MIN_GROWTH + 1..2 * MIN_GROWTH {
+            walk.push(&mut vec, String::new()).unwrap();
+        }
+        assert_eq!(
+            walk.push(&mut vec, String::new()).unwrap_err(),
+            Abort::TooLarge
+        );
+        assert_eq!(vec.capacity(), 2 * MIN_GROWTH, "not grown on failure");
+
+        let short = Walk::new(Arc::default(), MIN_GROWTH * slot - 1);
+        let mut vec = Vec::new();
+        assert_eq!(
+            short.push(&mut vec, String::new()).unwrap_err(),
+            Abort::TooLarge
+        );
+        assert_eq!(vec.capacity(), 0);
+    }
+
+    #[test]
+    fn walk_vectors_are_allocated_at_their_charged_capacity() {
+        let f = Fixture::new();
+        block_tree(&f);
+        rdma_tree(&f);
+        let report = discover(&walk(), &f.sys(), &f.dev()).unwrap();
+        assert_eq!(report.block_devices.capacity(), report.block_devices.len());
+        for disk in &report.block_devices {
+            assert_eq!(disk.partitions.capacity(), disk.partitions.len());
+            assert_eq!(disk.by_id.capacity(), disk.by_id.len());
+            for part in &disk.partitions {
+                assert_eq!(part.by_id.capacity(), part.by_id.len());
+            }
+        }
+        assert_eq!(report.rdma_devices.capacity(), report.rdma_devices.len());
+        for device in &report.rdma_devices {
+            assert!(device.ports.capacity() >= device.ports.len());
+            for port in &device.ports {
+                assert_eq!(port.netdevs.capacity(), port.netdevs.len());
+            }
+        }
     }
 
     #[test]
