@@ -353,7 +353,7 @@ impl BufferPool {
         self.aligned.alignment()
     }
     /// Idle counters of this worker's aligned ciphertext pool.
-    #[cfg_attr(not(test), allow(dead_code))] // Observed by tests; not yet exported.
+    #[cfg(test)]
     pub(crate) fn aligned_stats(&self) -> page_alloc::SharedPoolStats {
         self.aligned.stats()
     }
@@ -695,18 +695,20 @@ impl BufferPool {
         )
     }
 }
+#[cfg(test)]
 thread_local! {
     static REGISTERED_COPY_OUTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 /// Count one copy of registered RDMA ciphertext out of its pool buffer.
+#[cfg(test)]
 fn note_registered_copy_out() {
     REGISTERED_COPY_OUTS.with(|count| count.set(count.get().wrapping_add(1)));
 }
 /// Registered RDMA pages copied out of pool buffers on this thread.
 ///
-/// Thread-local because copies run on the owning worker's I/O thread; not yet
-/// exported as a metric.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Thread-local because copies run on the owning worker's I/O thread. Test
+/// instrumentation only.
+#[cfg(test)]
 pub(crate) fn registered_copy_outs() -> u64 {
     REGISTERED_COPY_OUTS.with(std::cell::Cell::get)
 }
@@ -798,6 +800,7 @@ impl CiphertextPage {
     /// storage is not a registered copy-out and is ignored.
     pub(crate) fn record_copy_out(&self, copy: &Self) {
         if let CiphertextStorage::Registered { retained, .. } = &self.inner.storage {
+            #[cfg(test)]
             note_registered_copy_out();
             let _ = retained.set(copy.clone());
         }
