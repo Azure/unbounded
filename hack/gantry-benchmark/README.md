@@ -270,6 +270,15 @@ machine-readable live push byte percentage, so the view reports that limitation
 instead of estimating it. Use `operator-vm-status` for a single snapshot.
 Override the refresh cadence with `WATCH_INTERVAL_SECONDS` (default 30).
 
+The same targets also detect benchmark batch workers. When the standard
+lifecycle is inactive, the watcher follows the active batch's progress and
+actual operator log. After the batch finishes, it retains the latest completed
+batch view unless a newer standard lifecycle has run. Multiple active batches
+are reported as an error rather than displaying an arbitrary worker.
+Batch log output is bounded to fit Azure Run Command's response limit.
+The watcher retries temporary "Run Command is in progress" conflicts; other
+Azure errors remain failures.
+
 For the Gantry pull phase, use the dedicated live monitor from the workstation:
 
 ```bash
