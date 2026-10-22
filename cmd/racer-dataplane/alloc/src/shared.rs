@@ -12,6 +12,10 @@
 //! [`System`] untouched. Deallocation recognizes slab pointers by address, so a
 //! slab-backed `Vec` can be dropped, wiped, pooled, or zeroized like any other.
 //!
+//! On hosts with several NUMA nodes the slots are split into one range per
+//! node, each bound to its node. A thread takes slots from its own node's range
+//! first, so decrypt writes and client reads stay local.
+//!
 //! A binary opts in by declaring `SharedAllocator` as its global allocator and
 //! calling [`install`]. Without both, [`zeroed_vec`] returns `None` and callers
 //! fall back to private allocations.
@@ -47,7 +51,11 @@ static PROBED: AtomicBool = AtomicBool::new(false);
 static SLOTS: Mutex<Slots> = Mutex::new(Slots {
     free: Vec::new(),
     dirty: Vec::new(),
+    per_node: 0,
 });
+
+/// Slab partition for each CPU, set at install. Empty means one partition.
+static CPU_PARTITION: OnceLock<Vec<u16>> = OnceLock::new();
 
 /// Descriptors and size for the installed slab.
 static MEMORY: OnceLock<Memory> = OnceLock::new();
@@ -58,10 +66,20 @@ thread_local! {
 }
 
 struct Slots {
-    /// Free slot indices, used as a stack so recently used slots stay warm.
-    free: Vec<u32>,
+    /// Free slot indices per NUMA partition, used as stacks so recently used
+    /// slots stay warm. Partition `p` owns slots `p * per_node ..`, and the last
+    /// partition also owns the remainder.
+    free: Vec<Vec<u32>>,
     /// Whether a slot may hold nonzero bytes. Fresh memfd slots read as zero.
     dirty: Vec<bool>,
+    /// Slots per partition.
+    per_node: usize,
+}
+
+impl Slots {
+    fn partition(&self, index: usize) -> usize {
+        (index / self.per_node.max(1)).min(self.free.len().saturating_sub(1))
+    }
 }
 
 struct Memory {
@@ -135,17 +153,36 @@ fn take_slot(layout: Layout) -> Option<(*mut u8, bool)> {
     if base == 0 {
         return None;
     }
+    let local = local_partition();
     let mut slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
-    let index = slots.free.pop()? as usize;
+    let partitions = slots.free.len();
+    let index =
+        (0..partitions).find_map(|step| slots.free[(local + step) % partitions].pop())? as usize;
     let dirty = std::mem::replace(&mut slots.dirty[index], true);
     Some(((base + index * SLOT_BYTES) as *mut u8, dirty))
 }
 
+/// Partition of the NUMA node running this thread. Dataplane threads are pinned,
+/// so the slot stays local to the thread that fills and later reads it.
+fn local_partition() -> usize {
+    let Some(table) = CPU_PARTITION.get() else {
+        return 0;
+    };
+    // SAFETY: sched_getcpu has no preconditions.
+    let cpu = unsafe { libc::sched_getcpu() };
+    usize::try_from(cpu)
+        .ok()
+        .and_then(|cpu| table.get(cpu))
+        .map_or(0, |&partition| usize::from(partition))
+}
+
 fn release_slot(index: usize) {
     let mut slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    let partition = slots.partition(index);
+    let free = &mut slots.free[partition];
     // Capacity was reserved for every slot at install; this never allocates.
-    debug_assert!(slots.free.len() < slots.free.capacity());
-    slots.free.push(index as u32);
+    debug_assert!(free.len() < free.capacity());
+    free.push(index as u32);
 }
 
 // SAFETY: slab slots are disjoint, page-aligned ranges of a live mapping that is
@@ -299,11 +336,57 @@ pub fn install(bytes: usize) -> Result<(), InstallError> {
         return Err(os("seal memfd")(error));
     }
 
+    // Split slots across NUMA nodes so each thread fills memory on its own node.
+    let nodes = numa_nodes();
+    let partitions = if nodes.len() > 1 && count >= nodes.len() {
+        nodes.len()
+    } else {
+        1
+    };
+    let per_node = count / partitions;
+    let mut table = Vec::new();
+    if partitions > 1 {
+        for (partition, (node, cpus)) in nodes.iter().enumerate() {
+            let first = partition * per_node;
+            let slots = if partition + 1 == partitions {
+                count - first
+            } else {
+                per_node
+            };
+            // SAFETY: the range lies inside the mapping created above.
+            bind_node(
+                unsafe { base.cast::<u8>().add(first * SLOT_BYTES) },
+                slots * SLOT_BYTES,
+                *node,
+            );
+            for &cpu in cpus {
+                if table.len() <= cpu {
+                    table.resize(cpu + 1, 0);
+                }
+                table[cpu] = partition as u16;
+            }
+        }
+    }
     {
         let mut slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
-        slots.free = Vec::with_capacity(count);
-        slots.free.extend((0..count as u32).rev());
+        slots.per_node = per_node;
+        slots.free = (0..partitions)
+            .map(|partition| {
+                let first = partition * per_node;
+                let last = if partition + 1 == partitions {
+                    count
+                } else {
+                    first + per_node
+                };
+                let mut free = Vec::with_capacity(last - first);
+                free.extend((first as u32..last as u32).rev());
+                free
+            })
+            .collect();
         slots.dirty = vec![false; count];
+    }
+    if partitions > 1 {
+        let _ = CPU_PARTITION.set(table);
     }
     if MEMORY
         .set(Memory {
@@ -320,6 +403,59 @@ pub fn install(bytes: usize) -> Result<(), InstallError> {
     END.store(base as usize + len, Ordering::Release);
     BASE.store(base as usize, Ordering::Release);
     Ok(())
+}
+
+/// Online NUMA nodes and their CPUs, from sysfs. Empty when unknown.
+fn numa_nodes() -> Vec<(usize, Vec<usize>)> {
+    let Ok(online) = std::fs::read_to_string("/sys/devices/system/node/online") else {
+        return Vec::new();
+    };
+    parse_list(&online)
+        .into_iter()
+        .filter_map(|node| {
+            let path = format!("/sys/devices/system/node/node{node}/cpulist");
+            let cpus = parse_list(&std::fs::read_to_string(path).ok()?);
+            (!cpus.is_empty()).then_some((node, cpus))
+        })
+        .collect()
+}
+
+/// Parse a kernel list such as `0-63,128-191`. Malformed parts are skipped.
+fn parse_list(text: &str) -> Vec<usize> {
+    let mut values = Vec::new();
+    for part in text.trim().split(',').filter(|part| !part.is_empty()) {
+        let (first, last) = part.split_once('-').unwrap_or((part, part));
+        if let (Ok(first), Ok(last)) = (first.parse::<usize>(), last.parse::<usize>())
+            && first <= last
+            && last < 1 << 16
+        {
+            values.extend(first..=last);
+        }
+    }
+    values
+}
+
+/// Prefer `node` for pages of `[start, start + len)`. Best effort: without the
+/// policy, pages land on whichever node first touches them.
+fn bind_node(start: *mut u8, len: usize, node: usize) {
+    const MPOL_PREFERRED: libc::c_long = 1;
+    let mut mask = [0u64; 16];
+    let Some(word) = mask.get_mut(node / 64) else {
+        return;
+    };
+    *word |= 1 << (node % 64);
+    // SAFETY: the range is a live mapping and the mask outlives the call.
+    unsafe {
+        libc::syscall(
+            libc::SYS_mbind,
+            start,
+            len,
+            MPOL_PREFERRED,
+            mask.as_ptr(),
+            (mask.len() * 64) as libc::c_ulong,
+            0 as libc::c_uint,
+        );
+    }
 }
 
 /// Whether the slab is installed.
@@ -339,7 +475,13 @@ pub fn len() -> usize {
 
 /// Number of free slots, or zero before [`install`].
 pub fn free_slots() -> usize {
-    SLOTS.lock().unwrap_or_else(|e| e.into_inner()).free.len()
+    SLOTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .free
+        .iter()
+        .map(Vec::len)
+        .sum()
 }
 
 /// Whether `pointer` lies inside the slab.
@@ -411,5 +553,24 @@ mod tests {
         assert!(readonly_fd().is_none());
         assert!(offset_of(&[0u8; 4]).is_none());
         assert!(!contains(std::ptr::null()));
+    }
+
+    #[test]
+    fn kernel_lists_parse_ranges_and_skip_garbage() {
+        assert_eq!(parse_list("0-2,5\n"), vec![0, 1, 2, 5]);
+        assert_eq!(parse_list("3"), vec![3]);
+        assert_eq!(parse_list(""), Vec::<usize>::new());
+        assert_eq!(parse_list("4-2,x,7-8"), vec![7, 8]);
+    }
+
+    #[test]
+    fn last_partition_owns_the_remainder() {
+        let slots = Slots {
+            free: vec![Vec::new(), Vec::new()],
+            dirty: Vec::new(),
+            per_node: 2,
+        };
+        let partitions: Vec<_> = (0..5).map(|index| slots.partition(index)).collect();
+        assert_eq!(partitions, vec![0, 0, 1, 1, 1]);
     }
 }
