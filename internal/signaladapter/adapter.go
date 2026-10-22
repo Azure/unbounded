@@ -31,6 +31,7 @@ const (
 	MaxMeasurementsBytes  = 16 * 1024
 	MaxBackendOutputBytes = 16 * 1024
 	resultPrefix          = "PROJECT_SIGNAL_RESULT_V1 "
+	requiredTopologyKey   = "kueue.x-k8s.io/podset-required-topology"
 )
 
 var runnerImagePattern = regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)
@@ -258,8 +259,13 @@ func ValidateConfig(config Config) ([]signalv1.Participant, []corev1.Toleration,
 		return nil, nil, nil, errors.New("attempt must be positive")
 	}
 
-	if _, err := signalworkload.Decode(config.WorkloadPolicyJSON); err != nil {
+	policy, err := signalworkload.Decode(config.WorkloadPolicyJSON)
+	if err != nil {
 		return nil, nil, nil, err
+	}
+
+	if policy.KueueTopology != nil && config.Queue == "" {
+		return nil, nil, nil, errors.New("workload policy kueueTopology requires a queue")
 	}
 
 	participants, err := ParseParticipants(
@@ -668,6 +674,7 @@ func ordinaryPod(
 			Name:            resourceName(config.RunName, participant.Index),
 			Namespace:       config.Namespace,
 			Labels:          labels,
+			Annotations:     workloadAnnotations(policy),
 			OwnerReferences: []metav1.OwnerReference{workflow},
 		},
 		Spec: corev1.PodSpec{
@@ -780,7 +787,10 @@ func podTemplate(
 	}
 
 	template := corev1.PodTemplateSpec{
-		ObjectMeta: metav1.ObjectMeta{Labels: labels},
+		ObjectMeta: metav1.ObjectMeta{
+			Labels:      labels,
+			Annotations: workloadAnnotations(policy),
+		},
 		Spec: corev1.PodSpec{
 			RestartPolicy:                corev1.RestartPolicyNever,
 			NodeSelector:                 nodeSelector,
@@ -798,6 +808,14 @@ func podTemplate(
 	}
 
 	return content
+}
+
+func workloadAnnotations(policy signalv1.WorkloadPolicy) map[string]string {
+	if policy.KueueTopology == nil {
+		return nil
+	}
+
+	return map[string]string{requiredTopologyKey: policy.KueueTopology.RequiredLevel}
 }
 
 func applyPodPolicy(spec *corev1.PodSpec, policy signalv1.WorkloadPolicy) {

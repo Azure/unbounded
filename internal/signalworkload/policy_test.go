@@ -39,7 +39,10 @@ func TestPolicyRoundTripPreservesBoundedExecutionSettings(t *testing.T) {
 		},
 		WorkingDir:  "/opt/diagnostic",
 		HostNetwork: true,
-		Results:     &corev1.EmptyDirVolumeSource{SizeLimit: quantity("2Gi")},
+		KueueTopology: &signalv1.KueueTopologyPolicy{
+			RequiredLevel: corev1.LabelHostname,
+		},
+		Results: &corev1.EmptyDirVolumeSource{SizeLimit: quantity("2Gi")},
 		Volumes: []signalv1.WorkloadVolume{
 			{
 				Name:      "host-proc",
@@ -72,6 +75,8 @@ func TestPolicyRoundTripPreservesBoundedExecutionSettings(t *testing.T) {
 
 	if got.WorkingDir != policy.WorkingDir ||
 		!got.HostNetwork ||
+		got.KueueTopology == nil ||
+		got.KueueTopology.RequiredLevel != corev1.LabelHostname ||
 		got.Resources.Limits.Cpu().Cmp(*policy.Resources.Limits.Cpu()) != 0 ||
 		len(got.Volumes) != 3 ||
 		got.Volumes[0].HostPath.Path != "/proc" ||
@@ -119,6 +124,12 @@ func TestValidateRejectsUnsafeOrAmbiguousPolicy(t *testing.T) {
 				Drop: []corev1.Capability{"SYS_ADMIN"},
 			}},
 		},
+		"empty topology level": {
+			KueueTopology: &signalv1.KueueTopologyPolicy{},
+		},
+		"invalid topology level": {
+			KueueTopology: &signalv1.KueueTopologyPolicy{RequiredLevel: "not a label key"},
+		},
 	}
 
 	for name, policy := range tests {
@@ -153,6 +164,24 @@ func TestDecodeRejectsMalformedHostNetworkPolicy(t *testing.T) {
 
 			if _, err := Decode(content); err == nil {
 				t.Fatal("Decode accepted malformed host network policy")
+			}
+		})
+	}
+}
+
+func TestDecodeRejectsMalformedKueueTopologyPolicy(t *testing.T) {
+	t.Parallel()
+
+	for name, content := range map[string]string{
+		"wrong type":    `{"kueueTopology":"kubernetes.io/hostname"}`,
+		"unknown field": `{"kueueTopology":{"requiredTopology":"kubernetes.io/hostname"}}`,
+		"empty object":  `{"kueueTopology":{}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if _, err := Decode(content); err == nil {
+				t.Fatal("Decode accepted malformed Kueue topology policy")
 			}
 		})
 	}

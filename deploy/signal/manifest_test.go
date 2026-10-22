@@ -97,6 +97,32 @@ func TestCertificationRunCRDRequiresCanonicalDigests(t *testing.T) {
 	}
 }
 
+func TestSignalCRDsExposeBoundedKueueTopologyPolicy(t *testing.T) {
+	t.Parallel()
+
+	for _, path := range []string{
+		"crd/signal.unbounded-cloud.io_certificationprofiles.yaml",
+		"crd/signal.unbounded-cloud.io_certificationruns.yaml",
+	} {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		manifest := string(content)
+		for _, required := range []string{
+			"kueueTopology:",
+			"requiredLevel:",
+			"maxLength: 316",
+			"minLength: 1",
+		} {
+			if !strings.Contains(manifest, required) {
+				t.Fatalf("%s does not contain %q", path, required)
+			}
+		}
+	}
+}
+
 func TestUpstreamDoesNotPublishCertificationPackage(t *testing.T) {
 	t.Parallel()
 
