@@ -1040,6 +1040,10 @@ func Load(args []string, env func(string) string, configPath string) (*Config, *
 func (c *Config) Validate() error {
 	var errs []error
 
+	if c.RacerEnabled && c.ArtifactStreamingEnabled {
+		errs = append(errs, errors.New("artifact_streaming_enabled cannot be combined with GANTRY_RACER_ENABLED; Artifact Streaming requires the containerd backend"))
+	}
+
 	mustAddr := func(field, val string) {
 		if val == "" {
 			errs = append(errs, fmt.Errorf("%s: required", field))

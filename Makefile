@@ -587,7 +587,7 @@ e2e-gantry: $(HELM) $(KIND) ## Run the kind-based Gantry e2e suite
 	exec env CONTAINER_ENGINE="$(CONTAINER_ENGINE)" KIND_EXPERIMENTAL_PROVIDER="$(CONTAINER_ENGINE)" PATH="$(CURDIR)/bin:$$PATH" \
 		$(GOTEST) -tags=e2e -count=1 -timeout=120m -run '$(GANTRY_E2E_RUN)' -v ./e2e/gantry
 
-e2e-racer: ## Run the kind-based Racer object caching e2e suite
+e2e-racer: ## Run the kind-based Racer e2e suite (object caching and the Gantry Racer backend)
 	timeout --signal=TERM --kill-after=30s 7200s $(GOTEST) -tags=e2e -count=1 -timeout=110m -v ./e2e/racer
 
 e2e-playpen: ## Run the kind-based playpen e2e suite

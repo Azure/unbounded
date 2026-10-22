@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
@@ -31,7 +32,7 @@ func testScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 
 	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{appsv1.AddToScheme, corev1.AddToScheme, schedulingv1.AddToScheme, unboundedv1alpha3.AddToScheme} {
+	for _, add := range []func(*runtime.Scheme) error{appsv1.AddToScheme, corev1.AddToScheme, schedulingv1.AddToScheme, unboundedv1alpha3.AddToScheme, racerv1.AddToScheme} {
 		if err := add(scheme); err != nil {
 			t.Fatalf("add to scheme: %v", err)
 		}
@@ -188,7 +189,7 @@ func TestApplyMutatorStampsDaemonSetAndSkipsConfig(t *testing.T) {
 		}},
 	}}
 
-	if err := applyMutator("ghcr.io/azure/gantry:test", "ghcr.io/azure/gantry-node-config:test", "gantry-hash", artifactStreamingConfig{})(ds); err != nil {
+	if err := applyMutator("ghcr.io/azure/gantry:test", "ghcr.io/azure/gantry-node-config:test", "gantry-hash", artifactStreamingConfig{}, nil)(ds); err != nil {
 		t.Fatalf("applyMutator: %v", err)
 	}
 
@@ -200,7 +201,7 @@ func TestApplyMutatorStampsDaemonSetAndSkipsConfig(t *testing.T) {
 	config := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": configName},
 	}}
-	if err := applyMutator("ghcr.io/azure/gantry:test", "ghcr.io/azure/gantry-node-config:test", "gantry-hash", artifactStreamingConfig{})(config); err != nil || config.Object != nil {
+	if err := applyMutator("ghcr.io/azure/gantry:test", "ghcr.io/azure/gantry-node-config:test", "gantry-hash", artifactStreamingConfig{}, nil)(config); err != nil || config.Object != nil {
 		t.Fatalf("gantry ConfigMap was not skipped: err=%v object=%#v", err, config.Object)
 	}
 }
@@ -254,7 +255,7 @@ func TestApplyMutatorImagesOnlyAgentContainer(t *testing.T) {
 		}},
 	}}
 
-	if err := applyMutator(derived, "ghcr.io/azure/gantry-node-config:v1.2.3", "h", artifactStreamingConfig{})(agent); err != nil {
+	if err := applyMutator(derived, "ghcr.io/azure/gantry-node-config:v1.2.3", "h", artifactStreamingConfig{}, nil)(agent); err != nil {
 		t.Fatalf("applyMutator: %v", err)
 	}
 
@@ -281,7 +282,7 @@ func TestApplyMutatorImagesOnlyAgentContainer(t *testing.T) {
 		}},
 	}}
 
-	if err := applyMutator(derived, "ghcr.io/azure/gantry-node-config:v1.2.3", "h", artifactStreamingConfig{})(nodeDS); err != nil {
+	if err := applyMutator(derived, "ghcr.io/azure/gantry-node-config:v1.2.3", "h", artifactStreamingConfig{}, nil)(nodeDS); err != nil {
 		t.Fatalf("applyMutator node-config: %v", err)
 	}
 
@@ -322,7 +323,7 @@ func TestApplyMutatorEnablesArtifactStreaming(t *testing.T) {
 		}},
 	}}
 
-	mutate := applyMutator("gantry:test", "gantry-node-config:test", "hash", artifact)
+	mutate := applyMutator("gantry:test", "gantry-node-config:test", "hash", artifact, nil)
 	if err := mutate(agent); err != nil {
 		t.Fatal(err)
 	}
