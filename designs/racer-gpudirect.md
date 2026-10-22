@@ -196,6 +196,45 @@ Ciphertext reaches GPU staging memory owned by the dataplane in one of three way
 
 `RACER_GPU_STAGING_BYTES` caps the dataplane's ciphertext staging memory per GPU.
 
+How the implementation works today, where it adds to or differs from the plan
+above:
+
+- The read path asks for sealed pages only for `gpu-read`
+  (`RangeStream::set_sealed`, `Fill::acquire_sealed`). Pages that are verified
+  plaintext in memory, origin fills (the CPU encrypts them, so it has the
+  plaintext), and pages another reader already decrypted are still delivered
+  as plaintext and copied host to GPU. So are pages that a peer selection fans
+  out to the read window, and pages whose key cannot be derived or whose AAD is
+  longer than the kernel accepts (4 KiB).
+- The XAES key derivation runs on the page's owning I/O thread
+  (`PageCrypto::derive_page_key`), not on the crypto worker. It is three AES
+  blocks.
+- Disk records read through host memory keep the CPU CRC check of the
+  existing fill path; the GPU checks the CRC again. Records read with cuFile
+  are checked only on the GPU, against the CRC in the record header.
+- Each GPU has one staging buffer of 16 MiB + 4 KiB slots, allocated on first
+  use. Two slots are scratch for the helper's current job: host ciphertext,
+  and the plaintext of a page the range covers only in part. The GPU decrypts
+  the whole page there (the tag covers all of it), the helper checks the
+  verdict, then copies only the requested bytes into the client's window. A
+  whole page decrypts straight into the window. The scratch plaintext is not
+  wiped; it is dataplane-owned GPU memory that is never read back to the host.
+- The other slots hold cuFile reads. The page's owning worker reads the record
+  header through host memory (`StoreReader::direct_read`), holds the segment
+  lease, and asks the GPU helper to read the ciphertext into a free slot. When
+  no slot is free, cuFile fails, or the record is v1, unaligned, or on a
+  simulated descriptor, the worker reads the page through host memory instead.
+  A cuFile driver or registration failure turns cuFile off until restart.
+- At startup the helper runs a zero-length decrypt on each GPU. A GPU whose
+  shim has no decrypt kernels, or a staging cap smaller than the two scratch
+  slots, gets plaintext pages only.
+- When the GPU rejects a page (CRC or tag), the read fails without a page frame
+  and the page's owner drops that copy from memory and disk, as it does after a
+  failed CPU decrypt. When it accepts a page that came from a peer, the owner
+  may persist it, as it does after a CPU decrypt.
+- RDMA peers do not yet write into GPU staging: an RDMA page lands in host
+  memory and takes one host-to-GPU copy.
+
 ### Disk layout v2
 
 The store already writes format version 2 records (see
