@@ -189,7 +189,8 @@ pub(crate) struct WorkCompletion {
     pub(crate) imm: Option<u32>,
 }
 
-/// The first failed completion that broke a QP.
+/// The first failed completion that broke a QP. Recorded only for tests.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Failure {
     /// Work request id of the failed completion.
@@ -721,6 +722,7 @@ pub(crate) struct NativeQueuePair {
     recvs: Cell<u32>,
 
     /// The first completion that broke the QP.
+    #[cfg(test)]
     failure: Cell<Option<Failure>>,
 }
 
@@ -789,6 +791,7 @@ impl NativeQueuePair {
             sends: Cell::new(0),
             recv_capacity: recv_depth,
             recvs: Cell::new(0),
+            #[cfg(test)]
             failure: Cell::new(None),
         }))
     }
@@ -858,8 +861,8 @@ impl NativeQueuePair {
     /// Read up to 32 completions without blocking and report each successful
     /// completion to `sink` after its work is released. Returns how many.
     ///
-    /// Any failed or unexpected completion stops the QP, records it in
-    /// [`Self::failure`], and returns [`Error::Io`].
+    /// Any failed or unexpected completion stops the QP and returns
+    /// [`Error::Io`]. Tests can read the first one through `failure`.
     pub(crate) fn progress_with(&self, mut sink: impl FnMut(WorkCompletion)) -> Result<usize> {
         if self.stopped.get() {
             return Ok(0);
@@ -881,6 +884,7 @@ impl NativeQueuePair {
                 .get(&c.id)
                 .is_some_and(|p| p.matches(c));
             if !valid {
+                #[cfg(test)]
                 if self.failure.get().is_none() {
                     self.failure.set(Some(Failure {
                         id: c.id,
