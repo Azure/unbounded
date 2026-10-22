@@ -4840,3 +4840,29 @@ fn maintain_pools_expires_idle_cache_entries_then_their_aligned_storage() {
     let stats = worker.aligned_pool_stats();
     assert_eq!((stats.entries, stats.bytes), (0, 0));
 }
+
+#[test]
+fn snapshot_refresh_applies_priority_live_and_reweighs_memory() {
+    let config = crate::test_support::cluster::config(false);
+    let node = Arc::new(NodeState::default());
+    let (mut worker, _, _) = local_worker(&config, &node, 1);
+    let mut cache = definition();
+    let current_scope = scope(Duration::from_secs(1)).unwrap();
+    let admission = worker.runtime.admission.clone();
+    let class = crate::admission::ResourceClass::Plaintext;
+    let _charge = admission.reserve(Some(&cache.id), class, 1).unwrap();
+    for (sequence, priority) in [(1, 500), (2, 0), (3, 1000)] {
+        cache.priority = priority;
+        worker
+            .snapshots
+            .apply(publication(&config, sequence, vec![cache.clone()]))
+            .unwrap();
+        worker.refresh_snapshot(&current_scope).unwrap();
+        assert_eq!(admission.active_weight(), u64::from(priority));
+        // Disk retention shares the same live table.
+        assert_eq!(
+            worker.store.writer.retention().weights().weight(&cache.id),
+            u64::from(priority)
+        );
+    }
+}
