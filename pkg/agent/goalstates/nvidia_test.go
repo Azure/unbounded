@@ -104,7 +104,7 @@ func TestDiscoverNVIDIADevicesBindsCapabilityDirectories(t *testing.T) {
 	require.NotContains(t, devices, nonChannel)
 }
 
-func TestResolveNvidiaHostAzureLinuxInitializesDevicesBeforeDiscovery(t *testing.T) {
+func TestInitializeNVIDIADevicesMaterializesMissingDeviceNodes(t *testing.T) {
 	root := t.TempDir()
 	pciDir := filepath.Join(root, "sys", "bus", "pci", "devices")
 	deviceDir := filepath.Join(root, "dev")
@@ -115,7 +115,6 @@ func TestResolveNvidiaHostAzureLinuxInitializesDevicesBeforeDiscovery(t *testing
 	var commands []string
 
 	deps := testNvidiaDeviceInitDeps(pciDir, deviceDir)
-	deps.hostDistro = func() string { return hostDistroAzureLinux3 }
 	deps.lookPath = func(name string) (string, error) {
 		require.Equal(t, nvidiaModprobeBinary, name)
 		return "/usr/bin/nvidia-modprobe", nil
@@ -148,7 +147,7 @@ func TestResolveNvidiaHostAzureLinuxInitializesDevicesBeforeDiscovery(t *testing
 	require.Contains(t, devices, filepath.Join(deviceDir, "nvidia0"))
 }
 
-func TestResolveNvidiaHostUbuntuInitializesDevicesBeforeDiscovery(t *testing.T) {
+func TestInitializeNVIDIADevicesCompletesPartialDeviceSet(t *testing.T) {
 	root := t.TempDir()
 	pciDir := filepath.Join(root, "sys", "bus", "pci", "devices")
 	deviceDir := filepath.Join(root, "dev")
@@ -158,7 +157,6 @@ func TestResolveNvidiaHostUbuntuInitializesDevicesBeforeDiscovery(t *testing.T) 
 	require.NoError(t, os.WriteFile(filepath.Join(deviceDir, "nvidia0"), nil, 0o644))
 
 	deps := testNvidiaDeviceInitDeps(pciDir, deviceDir)
-	deps.hostDistro = func() string { return hostDistroUbuntu2404 }
 	deps.lookPath = func(name string) (string, error) {
 		require.Equal(t, nvidiaModprobeBinary, name)
 		return "/usr/bin/nvidia-modprobe", nil
@@ -196,7 +194,7 @@ func TestResolveNvidiaHostUbuntuInitializesDevicesBeforeDiscovery(t *testing.T) 
 	}, discoverNVIDIADevicesIn(deviceDir))
 }
 
-func TestResolveNvidiaHostCompleteDevicesDoNotInvokeNvidiaModprobe(t *testing.T) {
+func TestInitializeNVIDIADevicesSkipsCompleteDeviceSet(t *testing.T) {
 	root := t.TempDir()
 	pciDir := filepath.Join(root, "sys", "bus", "pci", "devices")
 	deviceDir := filepath.Join(root, "dev")
@@ -214,7 +212,6 @@ func TestResolveNvidiaHostCompleteDevicesDoNotInvokeNvidiaModprobe(t *testing.T)
 	}
 
 	deps := testNvidiaDeviceInitDeps(pciDir, deviceDir)
-	deps.hostDistro = func() string { return hostDistroUbuntu2404 }
 	deps.lookPath = func(string) (string, error) {
 		t.Fatal("complete NVIDIA device state must not invoke nvidia-modprobe")
 		return "", nil
@@ -223,7 +220,7 @@ func TestResolveNvidiaHostCompleteDevicesDoNotInvokeNvidiaModprobe(t *testing.T)
 	require.NoError(t, initializeNVIDIADevices(deps))
 }
 
-func TestResolveNvidiaHostAzureLinuxWithoutNVIDIAHardwareIsUnchanged(t *testing.T) {
+func TestInitializeNVIDIADevicesWithoutNVIDIAHardwareIsUnchanged(t *testing.T) {
 	root := t.TempDir()
 	pciDir := filepath.Join(root, "sys", "bus", "pci", "devices")
 	deviceDir := filepath.Join(root, "dev")
@@ -232,7 +229,6 @@ func TestResolveNvidiaHostAzureLinuxWithoutNVIDIAHardwareIsUnchanged(t *testing.
 	require.NoError(t, os.MkdirAll(deviceDir, 0o755))
 
 	deps := testNvidiaDeviceInitDeps(pciDir, deviceDir)
-	deps.hostDistro = func() string { return hostDistroAzureLinux3 }
 	deps.runCommand = func(string, ...string) ([]byte, error) {
 		t.Fatal("non-NVIDIA hosts must not invoke nvidia-modprobe")
 		return nil, nil
@@ -242,7 +238,7 @@ func TestResolveNvidiaHostAzureLinuxWithoutNVIDIAHardwareIsUnchanged(t *testing.
 	require.Empty(t, discoverNVIDIADevicesIn(deviceDir))
 }
 
-func TestResolveNvidiaHostAzureLinuxFailsWhenNvidiaModprobeFails(t *testing.T) {
+func TestInitializeNVIDIADevicesFailsWhenNvidiaModprobeFails(t *testing.T) {
 	root := t.TempDir()
 	pciDir := filepath.Join(root, "sys", "bus", "pci", "devices")
 	deviceDir := filepath.Join(root, "dev")
@@ -251,7 +247,6 @@ func TestResolveNvidiaHostAzureLinuxFailsWhenNvidiaModprobeFails(t *testing.T) {
 	require.NoError(t, os.MkdirAll(deviceDir, 0o755))
 
 	deps := testNvidiaDeviceInitDeps(pciDir, deviceDir)
-	deps.hostDistro = func() string { return hostDistroAzureLinux3 }
 	deps.lookPath = func(string) (string, error) { return "/usr/bin/nvidia-modprobe", nil }
 	deps.runCommand = func(_ string, args ...string) ([]byte, error) {
 		if slices.Equal(args, []string{"-u", "-c0"}) {
@@ -268,7 +263,7 @@ func TestResolveNvidiaHostAzureLinuxFailsWhenNvidiaModprobeFails(t *testing.T) {
 	require.ErrorContains(t, err, "module initialization failed")
 }
 
-func TestResolveNvidiaHostAzureLinuxValidatesModesetDevice(t *testing.T) {
+func TestInitializeNVIDIADevicesValidatesModesetDevice(t *testing.T) {
 	root := t.TempDir()
 	pciDir := filepath.Join(root, "sys", "bus", "pci", "devices")
 	deviceDir := filepath.Join(root, "dev")
@@ -281,7 +276,6 @@ func TestResolveNvidiaHostAzureLinuxValidatesModesetDevice(t *testing.T) {
 	}
 
 	deps := testNvidiaDeviceInitDeps(pciDir, deviceDir)
-	deps.hostDistro = func() string { return hostDistroAzureLinux3 }
 	deps.lookPath = func(string) (string, error) { return "/usr/bin/nvidia-modprobe", nil }
 	deps.runCommand = func(string, ...string) ([]byte, error) { return nil, nil }
 
@@ -291,7 +285,6 @@ func TestResolveNvidiaHostAzureLinuxValidatesModesetDevice(t *testing.T) {
 
 func testNvidiaDeviceInitDeps(pciDir, deviceDir string) nvidiaDeviceInitDeps {
 	return nvidiaDeviceInitDeps{
-		hostDistro:    func() string { return "" },
 		pciDevicesDir: pciDir,
 		deviceDir:     deviceDir,
 		readDir:       os.ReadDir,

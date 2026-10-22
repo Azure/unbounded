@@ -138,9 +138,8 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 		return NvidiaHost{}, fmt.Errorf("unsupported architecture %q for NVIDIA library discovery", arch)
 	}
 
-	hostDistro, useCDIRuntime := detectNVIDIAHostOS()
+	useCDIRuntime := detectNVIDIAUseCDIRuntime()
 	initDeps := defaultNvidiaDeviceInitDeps()
-	initDeps.hostDistro = func() string { return hostDistro }
 
 	if err := initializeNVIDIADevices(initDeps); err != nil {
 		return NvidiaHost{}, err
@@ -164,15 +163,13 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 	}, nil
 }
 
-func detectNVIDIAHostOS() (string, bool) {
+func detectNVIDIAUseCDIRuntime() bool {
 	data, err := os.ReadFile(hostOSReleasePath)
 	if err != nil {
-		return "", false
+		return false
 	}
 
-	values := osReleaseValues(data)
-
-	return hostDistroFromOSReleaseValues(values), useNVIDIACDIRuntime(values)
+	return useNVIDIACDIRuntime(osReleaseValues(data))
 }
 
 func useNVIDIACDIRuntime(osRelease map[string]string) bool {
@@ -196,7 +193,6 @@ const (
 )
 
 type nvidiaDeviceInitDeps struct {
-	hostDistro    func() string
 	pciDevicesDir string
 	deviceDir     string
 	readDir       func(string) ([]os.DirEntry, error)
@@ -208,7 +204,6 @@ type nvidiaDeviceInitDeps struct {
 
 func defaultNvidiaDeviceInitDeps() nvidiaDeviceInitDeps {
 	return nvidiaDeviceInitDeps{
-		hostDistro:    detectHostDistro,
 		pciDevicesDir: "/sys/bus/pci/devices",
 		deviceDir:     devDir,
 		readDir:       os.ReadDir,
@@ -226,12 +221,11 @@ func defaultNvidiaDeviceInitDeps() nvidiaDeviceInitDeps {
 }
 
 func initializeNVIDIADevices(deps nvidiaDeviceInitDeps) error {
-	distro := deps.hostDistro()
-	if !supportedNVIDIAHostDistro(distro) || !hasNVIDIADisplayHardware(deps) {
+	if !hasNVIDIADisplayHardware(deps) {
 		return nil
 	}
 
-	if distro != hostDistroAzureLinux3 && validateNVIDIADeviceNodes(deps) == nil {
+	if validateNVIDIADeviceNodes(deps) == nil {
 		return nil
 	}
 
@@ -258,15 +252,6 @@ func initializeNVIDIADevices(deps nvidiaDeviceInitDeps) error {
 	}
 
 	return nil
-}
-
-func supportedNVIDIAHostDistro(distro string) bool {
-	switch distro {
-	case hostDistroUbuntu2404, hostDistroAzureLinux3:
-		return true
-	default:
-		return false
-	}
 }
 
 func hasNVIDIADisplayHardware(deps nvidiaDeviceInitDeps) bool {
