@@ -188,6 +188,9 @@ var testHooks struct {
 	// eioAnswered runs after a held queue has prepared, but not yet
 	// submitted, an EIO answer to a request.
 	eioAnswered func(q *queue)
+	// eioBeforeDrain runs in a held queue's EIO loop just before it
+	// drains the eventfd.
+	eioBeforeDrain func(q *queue)
 }
 
 // launchQueues starts every queue thread and waits until each one has

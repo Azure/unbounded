@@ -145,12 +145,20 @@ func (q *queue) serveEIO() error {
 			}
 		}
 
+		if testHooks.eioBeforeDrain != nil {
+			testHooks.eioBeforeDrain(q)
+		}
+
 		// Handler results that were already in flight are committed as
 		// they are; the queue is failing either way.
 		if err := q.drain(); err != nil {
 			return err
 		}
 
+		// Check for stop only after drain has cleared the eventfd. A
+		// stop that drain consumed is seen here, and a later one wakes
+		// the poll armed below. Checking before drain could lose the
+		// only wake and block in submitAndWait.
 		if q.stopping.Load() {
 			return q.ring.submitAndWait(0)
 		}
