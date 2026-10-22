@@ -165,9 +165,10 @@ racer-block device as slab storage, it would read its own cache through itself.
 - End to end: a privileged test runs `racersdktest` as a fake Racer, starts
   racer-block on it, and compares device reads with the object bytes.
 
-The `Racer Block Device` CI job runs both device suites as root with the race
-detector inside a QEMU guest. The guest boots the Ubuntu 24.04 generic 6.8
-kernel and loads `ublk_drv`, so a kernel bug cannot hang the runner. The job
+The `Racer Block Device` CI jobs run both device suites as root with the race
+detector inside a QEMU guest, once per guest kernel: the Ubuntu 24.04 generic
+6.8 kernel, the minimum supported, and the Ubuntu 26.04 generic 7.0 kernel.
+The guest loads `ublk_drv`, so a kernel bug cannot hang the runner. Each job
 fails if QEMU exits nonzero, a suite fails or hangs, a required test does not
 print PASS, or any test other than the manual fio and delete-ID tests skips.
 The guest sets `RACER_BLOCK_TEST_VM=1`, which enables tests that are unsafe on
@@ -176,8 +177,13 @@ a shared host. Run the same check locally without root:
 ```
 go test -race -c -o bin/racer-block-tests/ublk.test ./internal/racerblock/ublk
 go test -race -c -o bin/racer-block-tests/racerblock.test ./internal/racerblock
-hack/scripts/racer-block-vm-test.sh run
+GUEST_KERNEL=6.8 hack/scripts/racer-block-vm-test.sh run
+GUEST_KERNEL=7.0 hack/scripts/racer-block-vm-test.sh run
 ```
+
+The kernel packages come from the Ubuntu archive through a private APT
+configuration under `bin/racer-block-vm/<kernel>`. APT checks them against
+the Ubuntu archive keyring. Host APT is not changed and nothing is installed.
 
 The script needs `qemu-system-x86_64`, `busybox-static`, `cpio`, and `zstd`.
 It uses KVM when QEMU can start it and TCG otherwise. Tests time out at 4
