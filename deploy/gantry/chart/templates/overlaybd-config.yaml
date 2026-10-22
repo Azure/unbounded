@@ -45,7 +45,6 @@ spec:
             - --address={{ .Values.overlaybdConfig.address }}
             - --gantry-endpoint={{ .Values.overlaybdConfig.gantryEndpoint }}
             - --nbd-devices={{ .Values.overlaybdConfig.nbdDeviceGlob }}
-            - --containerd-address={{ .Values.overlaybdConfig.containerdAddress }}
             - --fallback-snapshotter={{ .Values.overlaybdConfig.fallbackSnapshotter }}
           resources:
             {{- toYaml .Values.resources.overlaybdSnapshotter | nindent 12 }}
@@ -70,9 +69,6 @@ spec:
               mountPath: /run/gantry-overlaybd
             - name: host-dev
               mountPath: /dev
-            - name: containerd-runtime
-              mountPath: {{ dir .Values.overlaybdConfig.containerdAddress }}
-              readOnly: true
         - name: configure
           image: {{ include "gantry.overlaybdConfigImage" . }}
           imagePullPolicy: {{ .Values.overlaybdConfig.image.pullPolicy }}
@@ -123,9 +119,5 @@ spec:
         - name: host-dev
           hostPath:
             path: /dev
-            type: Directory
-        - name: containerd-runtime
-          hostPath:
-            path: {{ dir .Values.overlaybdConfig.containerdAddress }}
             type: Directory
 {{- end }}

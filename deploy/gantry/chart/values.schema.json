@@ -203,7 +203,6 @@
         "address",
         "gantryEndpoint",
         "snapshotterRoot",
-        "containerdAddress",
         "fallbackSnapshotter",
         "nbdDeviceGlob",
         "nbdMaxDevices",
@@ -228,13 +227,9 @@
           "type": "string",
           "pattern": "^/"
         },
-        "containerdAddress": {
-          "type": "string",
-          "pattern": "^/"
-        },
         "fallbackSnapshotter": {
           "type": "string",
-          "minLength": 1
+          "enum": ["overlayfs"]
         },
         "nbdDeviceGlob": {
           "type": "string",

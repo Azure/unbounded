@@ -223,20 +223,34 @@ chair pulls. The Gantry snapshotter reads sealed LSMT layers through the same
 Gantry listener under `/blobs/`, where the source order remains local, peer,
 then signed ACR origin.
 
+The adapter accepts raw LSMT, raw ZFile, and tar/PAX-wrapped
+`overlaybd.commit` payloads. ZFile metadata and CRC32C checksums are validated
+before exposing the image; LZ4 and Zstandard blocks are fetched and decompressed
+on demand with bounded, coalesced range reads. Compression dictionaries,
+compressed indexes, and other compression algorithms are rejected explicitly.
+The adapter does not download or decompress the entire layer to mount it.
+
 AKS initially selects the `overlaybd` snapshotter on these nodes. Gantry keeps
 that native plugin registered, adds a distinct `gantry-overlaybd` proxy, and
-switches CRI image unpacking to the new proxy. The adapter delegates ordinary
-OCI layers to containerd's built-in `overlayfs` snapshotter; only layers with
-the complete ACR OverlayBD contract use NBD.
+switches CRI image unpacking to the new proxy. The adapter uses a private
+in-process `overlayfs` snapshotter under its state directory for ordinary OCI
+layers; only layers with the complete ACR OverlayBD contract use NBD.
+The fallback must not call back into containerd's snapshot service: the proxy's
+garbage collector would otherwise see independently managed host snapshots.
 
 The registry-specific containerd file lists the AKS mirror after Gantry. If
 Gantry is unavailable, containerd continues through port 8578 with Artifact
 Streaming but without Gantry peer reuse.
 
 The adapter DaemonSet runs `gantry snapshotter` beside the host configurator.
-The snapshotter container mounts the host containerd runtime directory
-read-only for the ordinary-image fallback, so containerd can recreate its
-socket without leaving the adapter bound to the old inode.
+The snapshotter owns both its remote metadata and its ordinary-image fallback
+state under `/var/lib/gantry/snapshotter`; it does not mount the host containerd
+socket or reuse the host's snapshot metadata.
+When updating the adapter image, bootstrap its replacement with native
+`overlayfs` on each affected node, verify the new adapter is ready, and then
+restore `gantry-overlaybd` for CRI image unpacking. The adapter cannot prepare
+its own replacement container through its socket while that adapter is stopped;
+pre-pulling the replacement image alone does not remove this dependency.
 The configurator waits for `/artifact-streaming/readyz` and the host-visible
 snapshotter socket, loads the `nbd` module, and verifies device capacity. It
 then snapshots the current containerd configuration under

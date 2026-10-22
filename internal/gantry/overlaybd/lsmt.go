@@ -44,8 +44,17 @@ type LSMTLayer struct {
 
 // OpenLSMTLayer validates and opens one complete ACR-produced OverlayBD layer.
 func OpenLSMTLayer(reader io.ReaderAt, size int64) (*LSMTLayer, error) {
-	if reader == nil || size < 2*headerSize {
+	if reader == nil || size < 512 {
 		return nil, fmt.Errorf("overlaybd LSMT: invalid layer size %d", size)
+	}
+
+	reader, size, err := openLayerPayload(reader, size)
+	if err != nil {
+		return nil, err
+	}
+
+	if size < 2*headerSize {
+		return nil, fmt.Errorf("overlaybd LSMT: invalid payload size %d", size)
 	}
 
 	header := make([]byte, headerSize)

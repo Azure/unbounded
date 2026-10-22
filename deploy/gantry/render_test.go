@@ -228,15 +228,14 @@ func TestOverlayBDConfiguratorEnabled(t *testing.T) {
 	}
 
 	foundBidirectional := false
-	foundContainerdRuntimeMount := false
 
 	for _, volumeMount := range containers[0].VolumeMounts {
 		if volumeMount.Name == "snapshotter-state" && volumeMount.MountPropagation == "Bidirectional" {
 			foundBidirectional = true
 		}
 
-		if volumeMount.Name == "containerd-runtime" && volumeMount.MountPath == "/run/containerd" && volumeMount.ReadOnly {
-			foundContainerdRuntimeMount = true
+		if volumeMount.Name == "containerd-runtime" {
+			t.Fatal("snapshotter must not access the host snapshot service")
 		}
 	}
 
@@ -244,20 +243,10 @@ func TestOverlayBDConfiguratorEnabled(t *testing.T) {
 		t.Fatal("snapshotter state mount is not bidirectionally propagated")
 	}
 
-	if !foundContainerdRuntimeMount {
-		t.Fatal("snapshotter does not have the read-only containerd runtime directory mount")
-	}
-
-	foundContainerdRuntimeVolume := false
-
 	for _, volume := range daemonSet.Spec.Template.Spec.Volumes {
-		if volume.Name == "containerd-runtime" && volume.HostPath.Path == "/run/containerd" && volume.HostPath.Type == "Directory" {
-			foundContainerdRuntimeVolume = true
+		if volume.Name == "containerd-runtime" {
+			t.Fatal("snapshotter must not mount the host containerd runtime directory")
 		}
-	}
-
-	if !foundContainerdRuntimeVolume {
-		t.Fatal("snapshotter does not use the containerd runtime directory hostPath")
 	}
 }
 

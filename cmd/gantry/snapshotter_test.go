@@ -18,6 +18,13 @@ func TestRunSnapshotterRejectsSelfFallback(t *testing.T) {
 	}
 }
 
+func TestRunSnapshotterRejectsUnsupportedFallback(t *testing.T) {
+	err := runSnapshotter([]string{"--fallback-snapshotter=native"})
+	if err == nil || !strings.Contains(err.Error(), "unsupported local fallback") {
+		t.Fatalf("runSnapshotter() error = %v", err)
+	}
+}
+
 func TestListenSnapshotterReplacesStaleSocket(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "snapshotter.sock")
 

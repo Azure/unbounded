@@ -200,6 +200,70 @@ func TestSnapshotterInjectedFallback(t *testing.T) {
 	}
 }
 
+func TestSnapshotterLocalFallbackOwnership(t *testing.T) {
+	ctx := namespaces.WithNamespace(context.Background(), "k8s.io")
+	root := t.TempDir()
+
+	host, err := overlaysnapshotter.NewSnapshotter(filepath.Join(root, "host-overlayfs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = host.Close() })
+
+	if _, err := host.Prepare(ctx, "host-container", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	adapterRoot := filepath.Join(root, "adapter")
+
+	adapter, err := NewSnapshotter(adapterRoot, &recordingMounter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = adapter.Close() })
+
+	mounts, err := adapter.Prepare(ctx, "extract", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	localRoot := filepath.Join(adapterRoot, "local")
+	for _, mount := range mounts {
+		relative, err := filepath.Rel(localRoot, mount.Source)
+		if err != nil || !filepath.IsLocal(relative) {
+			t.Fatalf("ordinary layer mount %q is outside private fallback %q: %v", mount.Source, localRoot, err)
+		}
+	}
+
+	if err := adapter.Commit(ctx, "layer", "extract"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := adapter.Walk(ctx, func(_ context.Context, info snapshots.Info) error {
+		if info.Name != "layer" {
+			t.Errorf("proxy garbage collector can see unrelated snapshot %q", info.Name)
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := adapter.Remove(ctx, "layer"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := adapter.Cleanup(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := host.Mounts(ctx, "host-container"); err != nil {
+		t.Fatalf("host snapshot was affected by proxy garbage collection: %v", err)
+	}
+}
+
 func TestForwardNamespace(t *testing.T) {
 	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(namespaces.GRPCHeader, "k8s.io"))
 	forwarded := forwardNamespace(ctx)

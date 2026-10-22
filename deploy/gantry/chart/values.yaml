@@ -45,7 +45,6 @@ overlaybdConfig:
   address: /run/gantry-overlaybd/gantry-overlaybd.sock
   gantryEndpoint: http://127.0.0.1:5000/blobs
   snapshotterRoot: /var/lib/gantry/snapshotter
-  containerdAddress: /run/containerd/containerd.sock
   fallbackSnapshotter: overlayfs
   nbdDeviceGlob: /dev/nbd*
   nbdMaxDevices: "1024"

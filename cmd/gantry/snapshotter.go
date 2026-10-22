@@ -17,7 +17,6 @@ import (
 	"time"
 
 	snapshotsapi "github.com/containerd/containerd/api/services/snapshots/v1"
-	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/contrib/snapshotservice"
 	"google.golang.org/grpc"
 
@@ -29,7 +28,6 @@ type snapshotterOptions struct {
 	address    string
 	endpoint   string
 	deviceGlob string
-	containerd string
 	fallback   string
 }
 
@@ -46,8 +44,7 @@ func bindSnapshotterFlags(fs *flag.FlagSet, options *snapshotterOptions) {
 	fs.StringVar(&options.address, "address", "/run/gantry-overlaybd/gantry-overlaybd.sock", "snapshotter Unix socket")
 	fs.StringVar(&options.endpoint, "gantry-endpoint", "http://127.0.0.1:5000/blobs", "Gantry exact-range endpoint")
 	fs.StringVar(&options.deviceGlob, "nbd-devices", "/dev/nbd*", "Linux NBD device glob")
-	fs.StringVar(&options.containerd, "containerd-address", "/run/containerd/containerd.sock", "containerd Unix socket for ordinary OCI layers")
-	fs.StringVar(&options.fallback, "fallback-snapshotter", "overlayfs", "containerd snapshotter for ordinary OCI layers")
+	fs.StringVar(&options.fallback, "fallback-snapshotter", "overlayfs", "private local snapshotter for ordinary OCI layers (overlayfs)")
 }
 
 func runSnapshotter(args []string) (returnErr error) {
@@ -67,35 +64,23 @@ func runSnapshotter(args []string) (returnErr error) {
 		return errors.New("gantry snapshotter: fallback snapshotter cannot be gantry-overlaybd")
 	}
 
+	if options.fallback != "overlayfs" {
+		return fmt.Errorf("gantry snapshotter: unsupported local fallback snapshotter %q", options.fallback)
+	}
+
 	mounter, err := gantryoverlaybd.NewNBDMounter(options.endpoint, &http.Client{Timeout: 2 * time.Minute}, options.deviceGlob)
 	if err != nil {
 		return err
 	}
 
-	containerdClient, err := containerd.New(options.containerd, containerd.WithTimeout(10*time.Second))
+	// The proxy's garbage collector must only see snapshots owned by this proxy,
+	// never the host snapshot service's independently managed snapshots.
+	snapshotter, err := gantryoverlaybd.NewSnapshotter(options.root, mounter)
 	if err != nil {
-		return fmt.Errorf("gantry snapshotter: connect to containerd: %w", err)
-	}
-
-	probeContext, cancelProbe := context.WithTimeout(context.Background(), 10*time.Second)
-	_, probeErr := containerdClient.Version(probeContext)
-
-	cancelProbe()
-
-	if probeErr != nil {
-		return errors.Join(fmt.Errorf("gantry snapshotter: probe containerd: %w", probeErr), containerdClient.Close())
-	}
-
-	snapshotter, err := gantryoverlaybd.NewSnapshotterWithFallback(
-		options.root,
-		mounter,
-		containerdClient.SnapshotService(options.fallback),
-	)
-	if err != nil {
-		return errors.Join(err, containerdClient.Close())
+		return err
 	}
 	defer func() {
-		returnErr = errors.Join(returnErr, snapshotter.Close(), containerdClient.Close())
+		returnErr = errors.Join(returnErr, snapshotter.Close())
 	}()
 
 	if err := snapshotter.Cleanup(context.Background()); err != nil {

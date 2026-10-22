@@ -559,7 +559,6 @@ overlaybdConfig.enabled
 overlaybdConfig.nodeSelector
 overlaybdConfig.address
 overlaybdConfig.snapshotterRoot
-overlaybdConfig.containerdAddress
 overlaybdConfig.fallbackSnapshotter
 overlaybdConfig.nbdMaxDevices
 overlaybdConfig.nbdMinDevices
