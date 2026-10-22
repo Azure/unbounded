@@ -54,11 +54,10 @@ full sequence is:
    `/etc/cdi/nvidia.yaml`. Most CDI hooks are disabled to avoid interference
    with the nspawn environment.
 5. **containerd runtime configuration.** Writes a containerd drop-in that
-   enables CDI support and registers the `nvidia` runtime class. On Azure
-   Linux 3 and Ubuntu 24.04 hosts, the agent also selects the toolkit's CDI
-   runtime mode so the device plugin's default environment-variable request
-   resolves against the generated driver-root CDI specification. Other hosts
-   retain the toolkit's automatic runtime mode.
+   enables CDI support and registers the `nvidia` runtime class. After
+   successfully generating the host-derived CDI specification, the agent
+   selects the toolkit's CDI runtime mode so the device plugin's default
+   environment-variable request resolves against that specification.
 6. **kubelet GPU advertisement.** Once kubelet starts and a user-deployed
    NVIDIA device plugin is running, GPUs are registered as `nvidia.com/gpu`
    extended resources on the node.
@@ -90,11 +89,13 @@ copied libraries and their SONAME aliases. When the host provides
 version-compatible `nvidia-smi` to GPU containers. The binary is useful for
 diagnostics and monitoring but is not required for compute-only CUDA access.
 
-On Azure Linux 3 and Ubuntu 24.04, toolkit `auto` mode can interpret the device
-plugin's environment-variable request as legacy injection. That bypasses the
-generated driver-root CDI edits, including the `nvidia-smi` mount. The agent
-therefore selects CDI runtime mode on those hosts so the generated specification
-is the authoritative injection contract.
+Toolkit `auto` mode can interpret the device plugin's environment-variable
+request as legacy injection. That bypasses the generated driver-root CDI edits,
+including the `nvidia-smi` mount. Every NVIDIA nspawn node uses the prepared
+driver root as its injection contract, so the agent selects CDI runtime mode
+after generating the specification. If either generation or runtime
+configuration fails, node startup stops rather than continuing with a mismatched
+injection path.
 
 ## Architecture Support
 

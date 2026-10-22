@@ -51,10 +51,6 @@ type NvidiaHost struct {
 	// was provisioned. Discovery refreshes must preserve this value.
 	Required bool
 
-	// UseCDIRuntime selects CDI injection when the host's NVIDIA runtime must
-	// consume the generated driver-root CDI specification.
-	UseCDIRuntime bool
-
 	// GPUDevicePaths lists NVIDIA GPU device paths discovered on the host
 	// (e.g. /dev/nvidia0, /dev/nvidiactl, /dev/nvidia-caps,
 	// /dev/nvidia-caps-imex-channels, /dev/dri/*).
@@ -141,18 +137,12 @@ func ResolveNvidiaHost(arch string) (NvidiaHost, error) {
 }
 
 func resolveNvidiaHostWithReadiness(arch string, requireReadiness bool) (NvidiaHost, error) {
-	hostDistro, useCDIRuntime := detectNVIDIAHostOS()
-	initDeps := defaultNvidiaDeviceInitDeps()
-	initDeps.hostDistro = func() string { return hostDistro }
-
-	return resolveNvidiaHost(arch, initDeps, nvidiaHostOptions{
-		useCDIRuntime:    useCDIRuntime,
+	return resolveNvidiaHost(arch, defaultNvidiaDeviceInitDeps(), nvidiaHostOptions{
 		requireReadiness: requireReadiness,
 	})
 }
 
 type nvidiaHostOptions struct {
-	useCDIRuntime    bool
 	requireReadiness bool
 }
 
@@ -180,7 +170,6 @@ func resolveNvidiaHost(arch string, initDeps nvidiaDeviceInitDeps, opts nvidiaHo
 	libraries := resolveNVIDIALibraries(archInfo)
 
 	return NvidiaHost{
-		UseCDIRuntime:     opts.useCDIRuntime,
 		GPUDevicePaths:    devices,
 		ContainerLibDir:   archInfo.libDir,
 		LibMappings:       libraries.libMappings,
@@ -192,35 +181,6 @@ func resolveNvidiaHost(arch string, initDeps nvidiaDeviceInitDeps, opts nvidiaHo
 		NvidiaIMEXCtlPath: discoverNVIDIABinary("nvidia-imex-ctl"),
 		DriverVersion:     libraries.driverVersion,
 	}, nil
-}
-
-func detectNVIDIAHostOS() (string, bool) {
-	data, err := os.ReadFile(hostOSReleasePath)
-	if err != nil {
-		return "", false
-	}
-
-	values := osReleaseValues(data)
-
-	return hostDistroFromOSReleaseValues(values), useNVIDIACDIRuntime(values)
-}
-
-func useNVIDIACDIRuntime(osRelease map[string]string) bool {
-	if isAzureContainerLinux(osRelease) {
-		return false
-	}
-
-	id := normalizeOSReleaseID(osRelease["ID"])
-	versionID := osRelease["VERSION_ID"]
-
-	switch id {
-	case "azurelinux", "azlinux":
-		return strings.HasPrefix(versionID, "3")
-	case "ubuntu":
-		return versionID == "24.04"
-	default:
-		return false
-	}
 }
 
 const (
