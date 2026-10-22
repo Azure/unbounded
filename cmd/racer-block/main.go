@@ -222,8 +222,8 @@ func (o *options) validate(key string) error {
 		return errors.New("invalid --key: want 64 lowercase hex characters")
 	}
 
-	if o.id < -1 {
-		return errors.New("--id must be -1 or a device ID")
+	if o.id < -1 || o.id > ublk.MaxDeviceID {
+		return fmt.Errorf("--id must be -1 or a device ID in [0, %d]", ublk.MaxDeviceID)
 	}
 
 	if o.queues < 0 || o.queues > maxQueues {

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -75,6 +76,8 @@ func TestParseOptionsErrors(t *testing.T) {
 		{"bad key", []string{"--cache", "blobs", "--key", "abc"}, "invalid --key"},
 		{"upper key", []string{"--cache", "blobs", "--key", strings.ToUpper(testKey)}, "invalid --key"},
 		{"bad id", append(base, "--id", "-2"), "--id"},
+		{"id above max", append(base, "--id", strconv.Itoa(ublk.MaxDeviceID+1)), "--id"},
+		{"id 2^32", append(base, "--id", "4294967296"), "id"},
 		{"queues", append(base, "--queues", "65"), "--queues"},
 		{"negative queues", append(base, "--queues", "-1"), "--queues"},
 		{"depth", append(base, "--depth", "4097"), "--depth"},
@@ -95,6 +98,15 @@ func TestParseOptionsErrors(t *testing.T) {
 				t.Fatalf("err = %v, want containing %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestParseOptionsIDBounds(t *testing.T) {
+	for _, id := range []int{-1, 0, ublk.MaxDeviceID} {
+		o, err := parseOptions([]string{"--cache", "blobs", "--key", testKey, "--id", strconv.Itoa(id)}, &bytes.Buffer{})
+		if err != nil || o.id != id {
+			t.Fatalf("--id %d: id = %d, err = %v", id, o.id, err)
+		}
 	}
 }
 
