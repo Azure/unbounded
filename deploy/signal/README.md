@@ -187,6 +187,8 @@ extra mounts.
 
 ```yaml
 workloadPolicy:
+  kueueTopology:
+    requiredLevel: kubernetes.io/hostname
   resources:
     requests:
       cpu: "8"
@@ -227,6 +229,14 @@ sets equal requests and limits on the participant container. Kubernetes
 admission and operator policy still decide whether a capability, host path,
 device, PVC, or privileged context is allowed; technical rendering is not
 authorization.
+
+`kueueTopology.requiredLevel` is an explicit Kueue Topology Aware Scheduling
+request. It must be a valid Kubernetes label key and requires a nonempty backend
+queue. The adapter writes
+`kueue.x-k8s.io/podset-required-topology: <requiredLevel>` on ordinary
+participant Pods and MPIJob worker Pod templates only. It never annotates the
+unpinned MPI launcher, does not accept arbitrary annotations, and does not
+choose a topology level when the field is omitted.
 
 `hostNetwork: true` is an explicit participant policy for diagnostics that must
 observe the selected Node's network namespace, such as physical NIC inventory.

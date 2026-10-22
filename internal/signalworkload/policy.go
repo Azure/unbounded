@@ -79,6 +79,15 @@ func Validate(policy signalv1.WorkloadPolicy) error {
 		return err
 	}
 
+	if policy.KueueTopology != nil {
+		if errors := validation.IsQualifiedName(policy.KueueTopology.RequiredLevel); len(errors) > 0 {
+			return fmt.Errorf(
+				"workload policy kueueTopology requiredLevel is invalid: %s",
+				strings.Join(errors, ", "),
+			)
+		}
+	}
+
 	if policy.WorkingDir != "" {
 		if err := validateAbsolutePath("workingDir", policy.WorkingDir); err != nil {
 			return err

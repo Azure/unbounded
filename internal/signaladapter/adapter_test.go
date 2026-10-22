@@ -81,6 +81,10 @@ func TestRenderOrdinaryPodsPerParticipant(t *testing.T) {
 		if hostNetwork {
 			t.Fatalf("resource %d unexpectedly uses the host network", index)
 		}
+
+		if resource.GetAnnotations()[requiredTopologyKey] != "" {
+			t.Fatalf("resource %d unexpectedly requests Kueue topology", index)
+		}
 	}
 }
 
@@ -281,8 +285,11 @@ func TestRenderWorkloadPolicyOnParticipantContainers(t *testing.T) {
 			},
 		},
 		HostNetwork: true,
-		WorkingDir:  "/opt/diagnostic",
-		Results:     &corev1.EmptyDirVolumeSource{SizeLimit: quantity("2Gi")},
+		KueueTopology: &signalv1.KueueTopologyPolicy{
+			RequiredLevel: corev1.LabelHostname,
+		},
+		WorkingDir: "/opt/diagnostic",
+		Results:    &corev1.EmptyDirVolumeSource{SizeLimit: quantity("2Gi")},
 		Volumes: []signalv1.WorkloadVolume{
 			{
 				Name:      "host-proc",
@@ -306,7 +313,7 @@ func TestRenderWorkloadPolicyOnParticipantContainers(t *testing.T) {
 	config := testConfig()
 	config.BackendAPIVersion = "v1"
 	config.BackendKind = "Pod"
-	config.Queue = ""
+	config.Queue = "certification"
 	config.GPUResourceCount = "8"
 	config.WorkloadPolicyJSON = string(policyJSON)
 
@@ -330,6 +337,7 @@ func TestRenderWorkloadPolicyOnParticipantContainers(t *testing.T) {
 	gpuLimit := container.Resources.Limits[corev1.ResourceName("nvidia.com/gpu")]
 	if !pod.Spec.HostNetwork ||
 		pod.Spec.DNSPolicy != corev1.DNSClusterFirstWithHostNet ||
+		pod.Annotations[requiredTopologyKey] != corev1.LabelHostname ||
 		container.WorkingDir != "/opt/diagnostic" ||
 		container.Resources.Requests.Cpu().String() != "8" ||
 		container.Resources.Limits.Memory().String() != "32Gi" ||
@@ -354,6 +362,7 @@ func TestMPIWorkloadPolicyDoesNotLeakOntoLauncher(t *testing.T) {
 
 	policyJSON := `{
 			"hostNetwork":true,
+			"kueueTopology":{"requiredLevel":"kubernetes.io/hostname"},
 			"resources":{"requests":{"cpu":"4"},"limits":{"cpu":"4"}},
 			"volumes":[{"name":"host-device","mountPath":"/dev/infiniband","hostPath":{"path":"/dev/infiniband"}}]
 		}`
@@ -386,11 +395,14 @@ func TestMPIWorkloadPolicyDoesNotLeakOntoLauncher(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	launcher := job.Spec.MPIReplicaSpecs["Launcher"].Template.Spec
-	worker := job.Spec.MPIReplicaSpecs["Worker"].Template.Spec
+	launcherTemplate := job.Spec.MPIReplicaSpecs["Launcher"].Template
+	workerTemplate := job.Spec.MPIReplicaSpecs["Worker"].Template
+	launcher := launcherTemplate.Spec
+	worker := workerTemplate.Spec
 
 	if launcher.HostNetwork ||
 		launcher.DNSPolicy == corev1.DNSClusterFirstWithHostNet ||
+		launcherTemplate.Annotations[requiredTopologyKey] != "" ||
 		len(launcher.Volumes) != 2 ||
 		len(launcher.Containers[0].VolumeMounts) != 2 {
 		t.Fatalf("launcher received participant policy: %#v", launcher)
@@ -398,10 +410,26 @@ func TestMPIWorkloadPolicyDoesNotLeakOntoLauncher(t *testing.T) {
 
 	if !worker.HostNetwork ||
 		worker.DNSPolicy != corev1.DNSClusterFirstWithHostNet ||
+		workerTemplate.Annotations[requiredTopologyKey] != corev1.LabelHostname ||
 		len(worker.Volumes) != 3 ||
 		worker.Volumes[2].HostPath.Path != "/dev/infiniband" ||
 		worker.Containers[0].Resources.Requests.Cpu().String() != "4" {
 		t.Fatalf("worker policy = %#v", worker)
+	}
+}
+
+func TestValidateConfigRejectsKueueTopologyWithoutQueue(t *testing.T) {
+	t.Parallel()
+
+	config := testConfig()
+	config.BackendAPIVersion = "v1"
+	config.BackendKind = "Pod"
+	config.Queue = ""
+	config.WorkloadPolicyJSON = `{"kueueTopology":{"requiredLevel":"kubernetes.io/hostname"}}`
+
+	if _, _, _, err := ValidateConfig(config); err == nil ||
+		!strings.Contains(err.Error(), "kueueTopology requires a queue") {
+		t.Fatalf("ValidateConfig topology error = %v", err)
 	}
 }
 

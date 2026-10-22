@@ -63,10 +63,20 @@ type WorkloadVolume struct {
 	PersistentVolumeClaim *corev1.PersistentVolumeClaimVolumeSource `json:"persistentVolumeClaim,omitempty"`
 }
 
+type KueueTopologyPolicy struct {
+	// RequiredLevel is the Node label key for the minimum topology domain in which
+	// Kueue must place the participant PodSet.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=316
+	// +kubebuilder:validation:Pattern=`^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$`
+	RequiredLevel string `json:"requiredLevel"`
+}
+
 type WorkloadPolicy struct {
 	Resources       corev1.ResourceRequirements  `json:"resources,omitempty"`
 	SecurityContext *corev1.SecurityContext      `json:"securityContext,omitempty"`
 	HostNetwork     bool                         `json:"hostNetwork,omitempty"`
+	KueueTopology   *KueueTopologyPolicy         `json:"kueueTopology,omitempty"`
 	WorkingDir      string                       `json:"workingDir,omitempty"`
 	Results         *corev1.EmptyDirVolumeSource `json:"results,omitempty"`
 	// +kubebuilder:validation:MaxItems=16

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -34,12 +35,16 @@ func TestAdmissionCreatesImmutableSnapshotAndPreventsDuplicate(t *testing.T) {
 	node := readyNode("gpu-0", "example-gpu")
 	node.Labels[RequestLabel] = "gpu-smoke"
 	profile := testProfile("gpu-smoke", "example-gpu")
+	profile.Spec.Backend.Queue = "certification"
 	profile.Spec.WorkloadPolicy = signalv1.WorkloadPolicy{
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")},
 			Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("8")},
 		},
 		HostNetwork: true,
+		KueueTopology: &signalv1.KueueTopologyPolicy{
+			RequiredLevel: corev1.LabelHostname,
+		},
 		Volumes: []signalv1.WorkloadVolume{{
 			Name:      "work",
 			MountPath: "/work",
@@ -88,6 +93,8 @@ func TestAdmissionCreatesImmutableSnapshotAndPreventsDuplicate(t *testing.T) {
 	}
 
 	if !run.Spec.WorkloadPolicy.HostNetwork ||
+		run.Spec.WorkloadPolicy.KueueTopology == nil ||
+		run.Spec.WorkloadPolicy.KueueTopology.RequiredLevel != corev1.LabelHostname ||
 		run.Spec.WorkloadPolicy.Resources.Limits.Cpu().String() != "8" ||
 		len(run.Spec.WorkloadPolicy.Volumes) != 1 ||
 		run.Spec.WorkloadPolicy.Volumes[0].EmptyDir.SizeLimit.String() != "8Gi" {
@@ -194,6 +201,42 @@ func TestAdmissionRejectsInvalidWorkloadPolicyBeforeReservation(t *testing.T) {
 
 	if got.Annotations[ReservationLabel] != "" {
 		t.Fatalf("node was reserved after rejected workload policy: %#v", got.Annotations)
+	}
+}
+
+func TestAdmissionRejectsKueueTopologyWithoutQueueBeforeReservation(t *testing.T) {
+	t.Parallel()
+
+	scheme := testScheme(t)
+	node := readyNode("gpu-0", "example-gpu")
+	node.Labels[RequestLabel] = "gpu-smoke"
+	profile := testProfile("gpu-smoke", "example-gpu")
+	profile.Spec.Backend = signalv1.ExecutionBackend{APIVersion: "v1", Kind: "Pod"}
+	profile.Spec.WorkloadPolicy.KueueTopology = &signalv1.KueueTopologyPolicy{
+		RequiredLevel: corev1.LabelHostname,
+	}
+	source := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "scripts", Namespace: "signal"},
+		Data:       map[string]string{"payload.txt": "test payload\n"},
+	}
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(node, profile, source).Build()
+	reconciler := &AdmissionReconciler{Client: kube, Namespace: "signal", ScriptNamespace: "signal"}
+
+	_, err := reconciler.Reconcile(
+		context.Background(),
+		reconcile.Request{NamespacedName: client.ObjectKey{Name: node.Name}},
+	)
+	if err == nil || !strings.Contains(err.Error(), "kueueTopology requires a backend queue") {
+		t.Fatalf("Reconcile error = %v", err)
+	}
+
+	var got corev1.Node
+	if err := kube.Get(context.Background(), client.ObjectKey{Name: node.Name}, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	if got.Annotations[ReservationLabel] != "" {
+		t.Fatalf("node was reserved after rejected topology policy: %#v", got.Annotations)
 	}
 }
 
@@ -615,6 +658,9 @@ func TestWorkflowPinsAttemptInputs(t *testing.T) {
 			Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("8")},
 		},
 		HostNetwork: true,
+		KueueTopology: &signalv1.KueueTopologyPolicy{
+			RequiredLevel: corev1.LabelHostname,
+		},
 		Volumes: []signalv1.WorkloadVolume{{
 			Name:      "work",
 			MountPath: "/work",
@@ -708,6 +754,8 @@ func TestWorkflowPinsAttemptInputs(t *testing.T) {
 	}
 
 	if !policy.HostNetwork ||
+		policy.KueueTopology == nil ||
+		policy.KueueTopology.RequiredLevel != corev1.LabelHostname ||
 		policy.Resources.Requests.Cpu().String() != "4" ||
 		policy.Resources.Limits.Cpu().String() != "8" ||
 		len(policy.Volumes) != 1 ||
@@ -1000,6 +1048,10 @@ func TestTerminalVerdictPersistsEvidenceAndCleanupReleasesNode(t *testing.T) {
 
 	scheme := testScheme(t)
 	run := testRun("run-pass")
+	run.Spec.Backend.Queue = "certification"
+	run.Spec.WorkloadPolicy.KueueTopology = &signalv1.KueueTopologyPolicy{
+		RequiredLevel: corev1.LabelHostname,
+	}
 	run.Status = signalv1.CertificationRunStatus{
 		Phase:     signalv1.RunPhaseRunning,
 		Workflow:  signalv1.WorkflowStatus{Name: "run-pass-a1", Attempt: 1},
@@ -1049,7 +1101,8 @@ func TestTerminalVerdictPersistsEvidenceAndCleanupReleasesNode(t *testing.T) {
 	}
 
 	var evidence struct {
-		Workflow signalv1.WorkflowStatus `json:"workflow"`
+		Workflow       signalv1.WorkflowStatus `json:"workflow"`
+		WorkloadPolicy signalv1.WorkloadPolicy `json:"workloadPolicy"`
 	}
 	if err := json.Unmarshal(store.data, &evidence); err != nil {
 		t.Fatalf("decode evidence: %v", err)
@@ -1058,6 +1111,10 @@ func TestTerminalVerdictPersistsEvidenceAndCleanupReleasesNode(t *testing.T) {
 	if evidence.Workflow.Phase != "Succeeded" ||
 		evidence.Workflow.Outputs["measurements"] != "checked=14" {
 		t.Fatalf("evidence workflow = %#v", evidence.Workflow)
+	}
+
+	if !reflect.DeepEqual(evidence.WorkloadPolicy, run.Spec.WorkloadPolicy) {
+		t.Fatalf("evidence workload policy = %#v, want %#v", evidence.WorkloadPolicy, run.Spec.WorkloadPolicy)
 	}
 
 	if !got.Status.Cleanup.ReservationsReleased || !got.Status.Cleanup.SnapshotDeleted {

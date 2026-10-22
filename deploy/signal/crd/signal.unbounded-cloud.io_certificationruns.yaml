@@ -251,6 +251,19 @@ spec:
                 properties:
                   hostNetwork:
                     type: boolean
+                  kueueTopology:
+                    properties:
+                      requiredLevel:
+                        description: |-
+                          RequiredLevel is the Node label key for the minimum topology domain in which
+                          Kueue must place the participant PodSet.
+                        maxLength: 316
+                        minLength: 1
+                        pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                        type: string
+                    required:
+                    - requiredLevel
+                    type: object
                   resources:
                     description: ResourceRequirements describes the compute resource
                       requirements.

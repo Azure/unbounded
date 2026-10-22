@@ -237,6 +237,10 @@ func (r *AdmissionReconciler) admitNodeWithTriggerLocked(
 		return fmt.Errorf("profile %s workload policy: %w", profile.Name, err)
 	}
 
+	if profile.Spec.WorkloadPolicy.KueueTopology != nil && profile.Spec.Backend.Queue == "" {
+		return fmt.Errorf("profile %s workload policy kueueTopology requires a backend queue", profile.Name)
+	}
+
 	participants, err := r.selectParticipants(ctx, node, &profile)
 	if err != nil {
 		return err
@@ -1075,6 +1079,7 @@ func (r *RunReconciler) evidenceDocument(
 		"workflowOutputs": run.Status.Workflow.Outputs,
 		"backend":         run.Spec.Backend,
 		"runnerImage":     run.Spec.RunnerImage,
+		"workloadPolicy":  run.Spec.WorkloadPolicy,
 		"purpose":         run.Spec.Purpose,
 		"stagePlan":       run.Spec.StagePlan,
 		"parameters":      run.Spec.Parameters,
