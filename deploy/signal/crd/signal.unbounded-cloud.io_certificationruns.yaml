@@ -153,9 +153,6 @@ spec:
                 - TargetedVerification
                 - Diagnostic
                 type: string
-                x-kubernetes-validations:
-                - message: purpose is immutable
-                  rule: self == oldSelf
               requestNodeName:
                 type: string
               runnerImage:
@@ -212,9 +209,6 @@ spec:
                   - required
                   type: object
                 type: array
-                x-kubernetes-validations:
-                - message: stagePlan is immutable
-                  rule: self == oldSelf
               tolerations:
                 items:
                   description: |-
@@ -693,11 +687,20 @@ spec:
             - message: runnerImage is immutable
               rule: self.runnerImage == oldSelf.runnerImage
             - message: workloadPolicy is immutable
-              rule: self.workloadPolicy == oldSelf.workloadPolicy
+              rule: has(self.workloadPolicy) == has(oldSelf.workloadPolicy) && (!has(self.workloadPolicy)
+                || self.workloadPolicy == oldSelf.workloadPolicy)
             - message: runtimeStage is immutable
-              rule: self.runtimeStage == oldSelf.runtimeStage
+              rule: has(self.runtimeStage) == has(oldSelf.runtimeStage) && (!has(self.runtimeStage)
+                || self.runtimeStage == oldSelf.runtimeStage)
             - message: parameters are immutable
-              rule: self.parameters == oldSelf.parameters
+              rule: has(self.parameters) == has(oldSelf.parameters) && (!has(self.parameters)
+                || self.parameters == oldSelf.parameters)
+            - message: purpose is immutable
+              rule: has(self.purpose) == has(oldSelf.purpose) && (!has(self.purpose)
+                || self.purpose == oldSelf.purpose)
+            - message: stagePlan is immutable
+              rule: has(self.stagePlan) == has(oldSelf.stagePlan) && (!has(self.stagePlan)
+                || self.stagePlan == oldSelf.stagePlan)
             - message: evidencePath is immutable
               rule: self.evidencePath == oldSelf.evidencePath
             - message: deadline is immutable
@@ -707,7 +710,8 @@ spec:
             - message: maxAttempts is immutable
               rule: self.maxAttempts == oldSelf.maxAttempts
             - message: tolerations are immutable
-              rule: self.tolerations == oldSelf.tolerations
+              rule: has(self.tolerations) == has(oldSelf.tolerations) && (!has(self.tolerations)
+                || self.tolerations == oldSelf.tolerations)
             - message: requestNodeName is immutable
               rule: self.requestNodeName == oldSelf.requestNodeName
             - message: backendActiveDeadline must be positive

@@ -114,6 +114,36 @@ func TestSignalCRDsExposeRuntimeStageAndDeadlineContract(t *testing.T) {
 	}
 }
 
+func TestCertificationRunCRDUsesPresenceAwareOptionalImmutability(t *testing.T) {
+	t.Parallel()
+
+	content, err := os.ReadFile("crd/signal.unbounded-cloud.io_certificationruns.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	manifest := string(content)
+	optionalImmutableFields := []string{
+		"workloadPolicy",
+		"runtimeStage",
+		"parameters",
+		"purpose",
+		"stagePlan",
+		"tolerations",
+	}
+
+	for _, field := range optionalImmutableFields {
+		rule := "has(self." + field + ") == has(oldSelf." + field + ")"
+		if !strings.Contains(manifest, rule) {
+			t.Fatalf("CertificationRun CRD does not contain presence-aware rule %q", rule)
+		}
+	}
+
+	if strings.Contains(manifest, "rule: self.runtimeStage == oldSelf.runtimeStage") {
+		t.Fatal("CertificationRun CRD still dereferences an omitted runtimeStage")
+	}
+}
+
 func TestCertificationRunCRDRequiresCanonicalDigests(t *testing.T) {
 	t.Parallel()
 

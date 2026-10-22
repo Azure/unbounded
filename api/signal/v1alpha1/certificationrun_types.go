@@ -70,14 +70,16 @@ type ScriptSnapshot struct {
 // +kubebuilder:validation:XValidation:rule="self.workflow == oldSelf.workflow",message="workflow is immutable"
 // +kubebuilder:validation:XValidation:rule="self.backend == oldSelf.backend",message="backend is immutable"
 // +kubebuilder:validation:XValidation:rule="self.runnerImage == oldSelf.runnerImage",message="runnerImage is immutable"
-// +kubebuilder:validation:XValidation:rule="self.workloadPolicy == oldSelf.workloadPolicy",message="workloadPolicy is immutable"
-// +kubebuilder:validation:XValidation:rule="self.runtimeStage == oldSelf.runtimeStage",message="runtimeStage is immutable"
-// +kubebuilder:validation:XValidation:rule="self.parameters == oldSelf.parameters",message="parameters are immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.workloadPolicy) == has(oldSelf.workloadPolicy) && (!has(self.workloadPolicy) || self.workloadPolicy == oldSelf.workloadPolicy)",message="workloadPolicy is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.runtimeStage) == has(oldSelf.runtimeStage) && (!has(self.runtimeStage) || self.runtimeStage == oldSelf.runtimeStage)",message="runtimeStage is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.parameters) == has(oldSelf.parameters) && (!has(self.parameters) || self.parameters == oldSelf.parameters)",message="parameters are immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.purpose) == has(oldSelf.purpose) && (!has(self.purpose) || self.purpose == oldSelf.purpose)",message="purpose is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.stagePlan) == has(oldSelf.stagePlan) && (!has(self.stagePlan) || self.stagePlan == oldSelf.stagePlan)",message="stagePlan is immutable"
 // +kubebuilder:validation:XValidation:rule="self.evidencePath == oldSelf.evidencePath",message="evidencePath is immutable"
 // +kubebuilder:validation:XValidation:rule="self.deadline == oldSelf.deadline",message="deadline is immutable"
 // +kubebuilder:validation:XValidation:rule="self.backendActiveDeadline == oldSelf.backendActiveDeadline",message="backendActiveDeadline is immutable"
 // +kubebuilder:validation:XValidation:rule="self.maxAttempts == oldSelf.maxAttempts",message="maxAttempts is immutable"
-// +kubebuilder:validation:XValidation:rule="self.tolerations == oldSelf.tolerations",message="tolerations are immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.tolerations) == has(oldSelf.tolerations) && (!has(self.tolerations) || self.tolerations == oldSelf.tolerations)",message="tolerations are immutable"
 // +kubebuilder:validation:XValidation:rule="self.requestNodeName == oldSelf.requestNodeName",message="requestNodeName is immutable"
 // +kubebuilder:validation:XValidation:rule="duration(self.backendActiveDeadline) > duration('0s')",message="backendActiveDeadline must be positive"
 // +kubebuilder:validation:XValidation:rule="duration(self.deadline) - duration(self.backendActiveDeadline) >= duration('60s')",message="backendActiveDeadline must leave at least 60 seconds before deadline"
@@ -93,9 +95,7 @@ type CertificationRunSpec struct {
 	RunnerImage    string            `json:"runnerImage"`
 	WorkloadPolicy WorkloadPolicy    `json:"workloadPolicy,omitempty"`
 	// +kubebuilder:validation:Enum=FullCertification;QuickCertification;Preflight;TargetedVerification;Diagnostic
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="purpose is immutable"
-	Purpose CertificationPurpose `json:"purpose,omitempty"`
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="stagePlan is immutable"
+	Purpose               CertificationPurpose `json:"purpose,omitempty"`
 	StagePlan             []CertificationStage `json:"stagePlan,omitempty"`
 	RuntimeStage          *RuntimeStage        `json:"runtimeStage,omitempty"`
 	Parameters            map[string]string    `json:"parameters,omitempty"`

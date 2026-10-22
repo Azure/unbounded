@@ -244,7 +244,7 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests project-signal-controller project-signal-controller-build project-signal-adapter project-signal-adapter-build signal-manifests image-project-signal-controller-local image-project-signal-adapter-local metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen e2e-racer gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
+.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests project-signal-controller project-signal-controller-build project-signal-adapter project-signal-adapter-build signal-envtest signal-envtest-ci signal-manifests image-project-signal-controller-local image-project-signal-adapter-local metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen e2e-racer gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests gantry-chart-lint gantry-chart-package release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
@@ -305,6 +305,7 @@ help: ## Show this help
 	@echo "  machine-ops-controller           Build machine-ops-controller"
 	@echo "  project-signal-controller        Build Project Signal controller"
 	@echo "  project-signal-adapter           Build Project Signal participant adapter"
+	@echo "  signal-envtest-ci                Provision and run Project Signal API-server tests"
 	@echo "  signal-manifests                 Render Project Signal manifests"
 	@echo "  metalman | metalman-build        Build metalman controller (with/without lint/test)"
 	@echo "  unbounded-operator | unbounded-operator-build  Build the top-level Site operator"
@@ -614,6 +615,16 @@ racer-envtest: ## Run real API-server, manager election, TLS and crash-recovery 
 	@test -n "$(KUBEBUILDER_ASSETS)" || { echo "Set KUBEBUILDER_ASSETS to repository-local envtest binaries"; exit 1; }
 	@mkdir -p tmp/racer-envtest
 	TMPDIR="$(CURDIR)/tmp/racer-envtest" KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)" timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -race ./api/racer/v1alpha1 ./internal/racer ./internal/racer/authority ./deploy/racer ./internal/operator/components/racer -run '^TestEnvtest' -count=1 -v -timeout=5m
+
+signal-envtest-ci: $(SETUP_ENVTEST) ## Provision pinned local API-server assets and require Project Signal envtest
+	@mkdir -p tmp/signal-envtest
+	@assets=$$(TMPDIR="$(CURDIR)/tmp/signal-envtest" timeout --signal=TERM --kill-after=10s 300s "$(SETUP_ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(CURDIR)/bin/envtest" -p path) && \
+		$(MAKE) signal-envtest KUBEBUILDER_ASSETS="$$assets"
+
+signal-envtest: ## Run Project Signal API-server validation tests
+	@test -n "$(KUBEBUILDER_ASSETS)" || { echo "Set KUBEBUILDER_ASSETS to repository-local envtest binaries"; exit 1; }
+	@mkdir -p tmp/signal-envtest
+	TMPDIR="$(CURDIR)/tmp/signal-envtest" KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)" timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -race ./api/signal/v1alpha1 -run '^TestEnvtest' -count=1 -v -timeout=5m
 
 racer-generate: ## Generate Racer deepcopy and CRD artifacts
 	timeout --signal=TERM --kill-after=10s 300s $(GOCMD) generate ./api/racer/v1alpha1
