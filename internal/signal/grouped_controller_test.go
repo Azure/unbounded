@@ -224,6 +224,20 @@ func TestGroupedWorkflowBuildsVisibleSerialDAG(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	serviceAccountName, found, err := unstructured.NestedString(
+		workflow.Object,
+		"spec",
+		"serviceAccountName",
+	)
+	if err != nil || !found || serviceAccountName != adapterServiceAccountName {
+		t.Fatalf(
+			"service account: found=%t value=%q err=%v",
+			found,
+			serviceAccountName,
+			err,
+		)
+	}
+
 	tasks, found, err := unstructured.NestedSlice(
 		workflow.Object,
 		"spec",

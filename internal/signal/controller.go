@@ -83,7 +83,10 @@ var workflowOutputLimits = map[string]int{
 	"verdict":           32,
 }
 
-const groupedCheckCount = 15
+const (
+	groupedCheckCount         = 15
+	adapterServiceAccountName = "project-signal-adapter"
+)
 
 var workflowGVK = schema.GroupVersionKind{
 	Group:   "argoproj.io",
@@ -1373,6 +1376,7 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 		},
 		"spec": map[string]any{
 			"activeDeadlineSeconds": int64(run.Spec.Deadline.Seconds()),
+			"serviceAccountName":    adapterServiceAccountName,
 			"ttlStrategy": map[string]any{
 				"secondsAfterCompletion": int64(6 * time.Hour / time.Second),
 				"secondsAfterSuccess":    int64(6 * time.Hour / time.Second),
