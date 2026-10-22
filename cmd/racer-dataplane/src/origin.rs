@@ -404,8 +404,12 @@ fn response_error(error: Error) -> Error {
 }
 
 /// Context is copied only into this operation's outbound HTTP head, never the pool.
+///
+/// Racer-Cache carries the ClusterCache UID. Origin sockets are named by cache
+/// name, so after a ClusterCache is deleted and recreated an origin for the old
+/// UID can still be listening; a UID-bound origin refuses mismatched requests.
 fn request(context: &OriginContext, method: &str) -> Result<MessageHead> {
-    racer_object_wire::origin::request(
+    let mut head = racer_object_wire::origin::request(
         &context.object.key,
         method,
         context.metadata.as_ref().map(|value| value.as_header()),
@@ -413,8 +417,12 @@ fn request(context: &OriginContext, method: &str) -> Result<MessageHead> {
             .authorization
             .as_ref()
             .map(|value| value.expose_for_origin()),
-    )
-    .map_err(Into::into)
+    )?;
+    head.headers.push(Header::new(
+        "Racer-Cache",
+        context.object.cache.0.as_bytes(),
+    ));
+    Ok(head)
 }
 
 #[cfg(test)]

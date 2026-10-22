@@ -215,7 +215,7 @@ func dataplanePod(c Config) corev1.PodSpec {
 		PreemptionPolicy:              ptr.To(corev1.PreemptLowerPriority),
 		TerminationGracePeriodSeconds: ptr.To(int64(30)),
 		SecurityContext:               &corev1.PodSecurityContext{RunAsUser: ptr.To(int64(0))},
-		Affinity:                      dataplaneAffinity(),
+		Affinity:                      DataplaneAffinity(),
 		Containers:                    []corev1.Container{dataplaneContainer(c)},
 		Volumes:                       dataplaneVolumes(c),
 	}
@@ -241,7 +241,9 @@ func diagnosticsPort(c Config) int32 {
 	return diagnosticsPort
 }
 
-func dataplaneAffinity() *corev1.Affinity {
+// DataplaneAffinity is the default node affinity of dataplane Pods. Workloads
+// that must share nodes with the dataplane reuse it.
+func DataplaneAffinity() *corev1.Affinity {
 	return &corev1.Affinity{
 		NodeAffinity: &corev1.NodeAffinity{
 			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{

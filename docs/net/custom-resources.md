@@ -65,7 +65,7 @@ status:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `assignmentEnabled` | `*bool` | No | Enables this assignment (default: `true`). Disabled assignments are ignored. |
+| `assignmentEnabled` | `*bool` | No | Enables this assignment. When omitted, inherits `manageCniPlugin` (default: `true`). Explicit `true` or `false` overrides that default. |
 | `cidrBlocks` | `[]string` | No | CIDR pools to allocate from (IPv4 and/or IPv6). |
 | `nodeBlockSizes.ipv4` | `int` | No | IPv4 subnet size for node allocations (default: `/24` when IPv4 pools exist). |
 | `nodeBlockSizes.ipv6` | `int` | No | IPv6 subnet size for node allocations (default: first IPv6 pool prefix + 16). |
@@ -91,10 +91,10 @@ The node agent reads this field only at startup. Restart the node agents after c
 
 | Value | CNI Config | Same-Site WireGuard Peers | Pod CIDR Assignment | Gateway WireGuard Links |
 |-------|------------|---------------------------|---------------------|------------------------|
-| `true` (default) | Written | Created | Enabled | Created |
-| `false` | **Not written** | **Not created** | **Disabled** | Created |
+| `true` (default) | Written | Created | Enabled by default | Created |
+| `false` | **Not written** | **Not created** | Disabled by default | Created |
 
-When `manageCniPlugin` is `false`, pod CIDR assignment by the controller is disabled even if `assignmentEnabled: true` is set on individual `podCidrAssignments` rules. The `podCidrAssignments` entries are still required because their CIDR blocks define the pod address ranges used for inter-site routing.
+When `manageCniPlugin` is `false`, omitted `assignmentEnabled` values resolve to `false`. Set `assignmentEnabled: true` on an individual `podCidrAssignments` rule to have the controller allocate Node PodCIDRs while an external CNI manages networking. Explicit `false` disables a rule regardless of `manageCniPlugin`. Omitted values are resolved dynamically, not persisted, so they follow later changes to `manageCniPlugin`. Existing explicit values remain unchanged. The `podCidrAssignments` entries are still required because their CIDR blocks define the pod address ranges used for inter-site routing.
 
 **Use `manageCniPlugin: false` when:**
 - Using an external CNI plugin (e.g., Cilium, Calico) for intra-site networking

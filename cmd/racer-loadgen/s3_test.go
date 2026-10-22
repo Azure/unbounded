@@ -175,11 +175,11 @@ func TestS3DirectAndRacerObject(t *testing.T) {
 		Credentials: aws.AnonymousCredentials{}, HTTPClient: originServer.Client(),
 		ResponseChecksumValidation: aws.ResponseChecksumValidationWhenRequired,
 	})
-	origin, err := racerobject.NewOrigin(client, racerobject.OriginConfig{Namespace: "s3-test", Buckets: []string{"benchmark"}, MetadataTTL: time.Minute})
+	origin, err := racerobject.NewOrigin(client, racerobject.OriginConfig{Bucket: "benchmark", MetadataTTL: time.Minute})
 	require.NoError(t, err)
 	sdk := racersdktest.NewClient(t, origin)
 
-	handler, err := racerobject.NewSidecar(sdk, racerobject.SidecarConfig{Namespace: "s3-test", Buckets: []string{"benchmark"}})
+	handler, err := racerobject.NewSidecar(sdk, racerobject.SidecarConfig{})
 	require.NoError(t, err)
 
 	sidecar := httptest.NewServer(handler)

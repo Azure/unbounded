@@ -18,6 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/Azure/unbounded/internal/provision"
+	"github.com/Azure/unbounded/pkg/agent/preflight"
 )
 
 func preflightConfig(apiServer string) provision.UnboundedAgentConfig {
@@ -153,4 +154,106 @@ func TestPreflightTextOutputIncludesOK(t *testing.T) {
 
 	require.NoError(t, h.execute(context.Background()))
 	assert.Contains(t, out.String(), "[OK kubernetes-artifacts]")
+}
+
+type preflightResultChecker struct {
+	result preflight.Result
+}
+
+func (c preflightResultChecker) Name() string { return c.result.Name }
+
+func (c preflightResultChecker) Check(context.Context) []preflight.Result {
+	return []preflight.Result{c.result}
+}
+
+func TestPreflightCLIReportsNVIDIAReadinessFailure(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		output     string
+		ignore     bool
+		otherError bool
+	}{
+		{name: "JSON failure", output: "json"},
+		{name: "JSON ignored", output: "json", ignore: true},
+		{name: "text failure", output: "text"},
+		{name: "text ignored", output: "text", ignore: true},
+		{name: "unrelated failure remains fatal", output: "json", ignore: true, otherError: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := preflightTestServer(t)
+			t.Cleanup(srv.Close)
+			path := writeConfigFile(t, preflightConfig(srv.URL))
+
+			var out bytes.Buffer
+
+			other := preflight.OK("other-check", "host", "other diagnostics ran")
+			if tt.otherError {
+				other = preflight.Error("other-check", "host", "unrelated failure")
+			}
+
+			h := &preflightHandler{
+				cmdCtx: &CommandContext{LogFormat: "text"},
+				writer: &out,
+				checks: []preflight.Checker{
+					preflightResultChecker{result: preflight.Error("nvidia-driver", "NVIDIA diagnostic tooling",
+						"NVIDIA GPUs are not ready: nvidia-smi did not report valid NVIDIA GPU enumeration")},
+					preflightResultChecker{result: other},
+				},
+			}
+
+			args := []string{"--config", path, "--output", tt.output}
+			if tt.ignore {
+				args = append(args, "--ignore-preflight-errors=nvidia-driver")
+			}
+
+			cmd := h.command()
+			cmd.SetArgs(args)
+			cmd.SetOut(&out)
+			cmd.SetErr(&out)
+			cmd.SilenceErrors = true
+			cmd.SilenceUsage = true
+
+			err := cmd.ExecuteContext(context.Background())
+			if tt.ignore && !tt.otherError {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+
+			if tt.output == "json" {
+				var report preflight.Report
+
+				require.NoError(t, json.Unmarshal(out.Bytes(), &report))
+				require.Len(t, report.Checks, 2)
+
+				if tt.ignore && !tt.otherError {
+					require.Equal(t, "ok", report.Status)
+				} else {
+					require.Equal(t, "failed", report.Status)
+				}
+
+				gpu := report.Checks[0]
+				require.Equal(t, "nvidia-driver", gpu.Name)
+				require.Equal(t, "NVIDIA diagnostic tooling", gpu.Target)
+				require.Equal(t, tt.ignore, gpu.Ignored)
+
+				if tt.ignore {
+					require.Equal(t, preflight.SeverityWarning, gpu.Severity)
+				} else {
+					require.Equal(t, preflight.SeverityError, gpu.Severity)
+				}
+
+				require.Equal(t, "other-check", report.Checks[1].Name)
+			} else {
+				require.Contains(t, out.String(), "nvidia-driver")
+				require.Contains(t, out.String(), "other diagnostics ran")
+
+				if tt.ignore {
+					require.Contains(t, out.String(), "[WARNING nvidia-driver]")
+				} else {
+					require.Contains(t, out.String(), "[ERROR nvidia-driver]")
+				}
+			}
+		})
+	}
 }

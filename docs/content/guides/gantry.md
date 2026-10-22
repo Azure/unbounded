@@ -410,7 +410,7 @@ metrics:
 {{< callout type="warning" >}}
 Racer is pre-release. Its APIs, flags, and on-disk formats may change without a
 migration path. Cached data is disposable; Racer is not durable storage. Start
-with the [racer-object guide]({{< relref "guides/racer-object" >}}).
+with the [Azure Blob cache guide]({{< relref "guides/azure-blob-cache" >}}).
 {{< /callout >}}
 
 The installation and distribution flow above describe Gantry's default containerd

@@ -80,11 +80,29 @@ func (p *MediaProvider) liveFirstBootOwner(ctx context.Context, ip string) (*med
 				return nil, true, fmt.Errorf("media machine identity or site ownership changed")
 			}
 
+			pinMediaNodeName(&machine, b.NodeName)
 			found = &mediaOwner{machine: &machine, op: op, index: j}
 		}
 	}
 
 	return found, found != nil, nil
+}
+
+// pinMediaNodeName makes the in-memory Machine report the node name frozen
+// when the replacement captured its boot media, so the agent config, the
+// bootstrap credential binding, and replacement completion all use the same
+// name even if spec.kubernetes.nodeRef changes mid-replacement. Only the
+// returned copy is changed; callers write status, never spec.
+func pinMediaNodeName(machine *v1alpha3.Machine, nodeName string) {
+	if nodeName == "" || machine.NodeName() == nodeName {
+		return
+	}
+
+	if machine.Spec.Kubernetes == nil {
+		machine.Spec.Kubernetes = &v1alpha3.KubernetesSpec{}
+	}
+
+	machine.Spec.Kubernetes.NodeRef = &v1alpha3.LocalObjectReference{Name: nodeName}
 }
 
 // LookupAttestationMachine uses direct-peer media ownership before legacy IP lookup.

@@ -4,6 +4,7 @@
 package goalstates
 
 import (
+	"fmt"
 	"log/slog"
 	"os"
 	"testing"
@@ -39,7 +40,7 @@ func TestResolveMachineUsesCurrentNVIDIAHostDiscovery(t *testing.T) {
 	t.Run("complete GPU discovery enables NVIDIA", func(t *testing.T) {
 		gs, err := resolveMachine(
 			discardLogger(), &config.AgentConfig{}, NSpawnMachineKube1, nil,
-			func(string) (NvidiaHost, error) { return completeResolvedNVIDIA(), nil },
+			func(string) (NvidiaHost, error) { return completeResolvedNVIDIA(), nil }, true,
 		)
 		require.NoError(t, err)
 		require.True(t, gs.RootFS.Nvidia.Required)
@@ -50,7 +51,7 @@ func TestResolveMachineUsesCurrentNVIDIAHostDiscovery(t *testing.T) {
 	t.Run("empty discovery produces CPU state", func(t *testing.T) {
 		gs, err := resolveMachine(
 			discardLogger(), &config.AgentConfig{}, NSpawnMachineKube1, nil,
-			func(string) (NvidiaHost, error) { return NvidiaHost{}, nil },
+			func(string) (NvidiaHost, error) { return NvidiaHost{}, nil }, true,
 		)
 		require.NoError(t, err)
 		require.False(t, gs.RootFS.Nvidia.Required)
@@ -62,9 +63,20 @@ func TestResolveMachineUsesCurrentNVIDIAHostDiscovery(t *testing.T) {
 			discardLogger(), &config.AgentConfig{}, NSpawnMachineKube1, nil,
 			func(string) (NvidiaHost, error) {
 				return NvidiaHost{GPUDevicePaths: []string{"/dev/nvidia0"}}, nil
-			},
+			}, true,
 		)
 		require.ErrorIs(t, err, ErrNVIDIAStateUnavailable)
+	})
+
+	t.Run("unusable GPUs prevent worker goal resolution", func(t *testing.T) {
+		gs, err := resolveMachine(
+			discardLogger(), &config.AgentConfig{}, NSpawnMachineKube1, nil,
+			func(string) (NvidiaHost, error) {
+				return NvidiaHost{}, fmt.Errorf("%w: nvidia-smi did not report valid NVIDIA GPU enumeration", ErrNVIDIAStateUnavailable)
+			}, true,
+		)
+		require.ErrorIs(t, err, ErrNVIDIAStateUnavailable)
+		require.Nil(t, gs)
 	})
 }
 
@@ -74,6 +86,21 @@ func completeResolvedNVIDIA() NvidiaHost {
 		LibMappings:    []NvidiaLibMapping{{HostPath: "/host/libcuda.so.1"}},
 		DriverVersion:  "580.1",
 	}
+}
+
+func TestResolveMachineForPreflightPreservesIncompleteNVIDIA(t *testing.T) {
+	t.Parallel()
+
+	gs, err := resolveMachine(
+		discardLogger(), &config.AgentConfig{}, NSpawnMachineKube1, nil,
+		func(string) (NvidiaHost, error) {
+			return NvidiaHost{GPUDevicePaths: []string{"/dev/nvidia0"}}, nil
+		}, false,
+	)
+	require.NoError(t, err)
+	require.True(t, gs.RootFS.Nvidia.Required)
+	require.Equal(t, []string{"/dev/nvidia0"}, gs.RootFS.Nvidia.GPUDevicePaths)
+	require.True(t, gs.NodeStart.Nvidia.Required)
 }
 
 func TestResolveOCIImage_ConfigImageTakesPrecedence(t *testing.T) {
@@ -647,6 +674,52 @@ func TestResolveMachine_InvalidAdditionalHostMount(t *testing.T) {
 
 	_, err := ResolveMachine(discardLogger(), cfg, "kube1", nil)
 	require.ErrorContains(t, err, "AdditionalHostMounts")
+}
+
+func TestResolveMachine_NSpawnLifecycle(t *testing.T) {
+	lifecycle := &config.NSpawnLifecycleConfig{
+		PreStartCommand:  "/usr/bin/systemctl start app-pre-start@%i.service",
+		PostStartCommand: "/usr/bin/systemctl start app-post-start@%i.service",
+	}
+	cfg := &config.AgentConfig{
+		MachineName:     "machine-1",
+		NodeName:        "configured-node",
+		NSpawnLifecycle: lifecycle,
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: "https://api.example.com",
+		},
+	}
+
+	got, err := ResolveMachine(discardLogger(), cfg, "kube1", nil)
+	require.NoError(t, err)
+	require.Equal(t, lifecycle, got.RootFS.NSpawnLifecycle)
+	require.NotSame(t, lifecycle, got.RootFS.NSpawnLifecycle)
+	require.False(t, got.RootFS.UsesLifecycleHelper())
+
+	cfg.NSpawnLifecycle = nil
+	got, err = ResolveMachine(discardLogger(), cfg, "kube1", nil)
+	require.NoError(t, err)
+	require.True(t, got.RootFS.UsesLifecycleHelper())
+}
+
+func TestResolveMachine_InvalidNSpawnLifecycle(t *testing.T) {
+	cfg := &config.AgentConfig{
+		MachineName:     "machine-1",
+		NodeName:        "configured-node",
+		NSpawnLifecycle: &config.NSpawnLifecycleConfig{PreStartCommand: "/usr/bin/true"},
+		Cluster: config.AgentClusterConfig{
+			CaCertBase64: "Y2EtYnl0ZXM=",
+		},
+		Kubelet: config.AgentKubeletConfig{
+			ApiServer: "https://api.example.com",
+		},
+	}
+
+	_, err := ResolveMachine(discardLogger(), cfg, "kube1", nil)
+	require.ErrorContains(t, err, "NSpawnLifecycle.PostStartCommand")
 }
 
 // TestHostDistroIsImageManaged pins which hosts are treated as delivering their

@@ -6,16 +6,24 @@ package metalman
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strings"
 
+	admissionv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	machinamanifests "github.com/Azure/unbounded/deploy/machina"
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
@@ -40,28 +48,16 @@ func (Component) Enabled(site *unboundedv1alpha3.Site) bool {
 	return unboundedv1alpha3.ComponentEnabled(&site.Spec.Components.Metalman.SiteComponentSpec)
 }
 
-// Plan deploys the per-site metalman PXE controller and its RBAC.
+// Plan deploys the per-site metalman PXE controller.
 //
-// The support RBAC ships in the machina manifest set and is identical for every
-// Site, so it carries a shared key and the executor writes it once per pass
-// rather than once per Site.
+// The shared support RBAC, the admission restriction, and the bootstrap grant
+// are planned once per pass by BootstrapComponent, not here. Planning them per
+// Site verified the live restriction once per Site, so two Sites in one pass
+// could reach different verdicts and plan the same shared object both ways.
+// The Deployment still depends on the restriction, which the cluster component
+// adds to the same merged plan.
 func (c Component) Plan(_ context.Context, env *component.Env, site *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
-	support, err := env.DecodeManifestFS(machinamanifests.Manifests, mutateSupportObject)
-	if err != nil {
-		return nil, component.Result{}, err
-	}
-
 	plan := component.NewPlan()
-
-	for _, obj := range support {
-		plan.Add(component.Operation{
-			Kind:      component.OpApply,
-			Object:    obj,
-			Component: c.Name(),
-			Site:      site.Name,
-			SharedKey: sharedSupportKey(obj),
-		})
-	}
 
 	plan.Add(component.Operation{
 		Kind:        component.OpApply,
@@ -69,16 +65,189 @@ func (c Component) Plan(_ context.Context, env *component.Env, site *unboundedv1
 		Component:   c.Name(),
 		Site:        site.Name,
 		Overridable: true,
+		DependsOn:   restrictionRefs(),
 	})
 
 	return plan, component.Reconciled(), nil
 }
 
+// restrictionRefs returns the refs of the admission policy and binding that
+// restrict the bootstrap ServiceAccount. Both share one name.
+func restrictionRefs() []component.ObjectRef {
+	group := admissionv1.SchemeGroupVersion
+
+	return []component.ObjectRef{
+		{GVK: group.WithKind("ValidatingAdmissionPolicy"), Name: BootstrapRestrictionPolicyName},
+		{GVK: group.WithKind("ValidatingAdmissionPolicyBinding"), Name: BootstrapRestrictionPolicyName},
+	}
+}
+
+// BootstrapMachineBindingName is the ClusterRoleBinding that grants the
+// metalman-bootstrap ServiceAccount write access to Machine status. It must not
+// be applied until the admission policy restricting that access is in place.
+const BootstrapMachineBindingName = "metalman:bootstrap-machine"
+
+// addSupportOps adds the shared support RBAC, the admission restriction, and
+// the stale RBAC deletes to plan, and returns the admission refs that anything
+// relying on the restriction must depend on. BootstrapComponent calls it once
+// per pass, so the live restriction is verified once and every shared object
+// has exactly one planned operation.
+//
+// The live restriction is verified first. An apply cannot remove fields that
+// another field manager added, and the executor skips applies whose desired
+// fields already match, so a live policy or binding with extra matching
+// constraints would otherwise be reported as applied. When the restriction
+// cannot be verified, including when it is missing and about to be created,
+// the bootstrap grant is deleted rather than applied, and drifted specs are
+// replaced in full. The grant returns on a later pass once
+// the live restriction matches.
+//
+// A verification that could not complete, such as a failed live read, is
+// returned as an error after the fail-closed operations are added. Callers
+// return the plan with a failed Result rather than a planning error: a
+// planning error discards the plan, which would drop the revocation, and a
+// successful Result would leave no retry when the pass writes nothing that
+// fires a watch.
+func addSupportOps(ctx context.Context, env *component.Env, plan *component.Plan, support []*unstructured.Unstructured, componentName, site string) ([]component.ObjectRef, error) {
+	// The executor ranks RBAC and Deployments ahead of admission policies, so
+	// without an explicit dependency the bootstrap grant and the token-minting
+	// Deployment would go live before the policy that restricts them, and stay
+	// live if the policy failed to apply.
+	restriction := admissionRefs(support)
+	repairs, verified, verifyErr := verifyRestriction(ctx, env, support)
+
+	for _, obj := range support {
+		if repair, ok := repairs[component.RefOf(obj)]; ok {
+			repair.Component, repair.Site, repair.SharedKey = componentName, site, sharedSupportKey(obj)
+			plan.Add(repair)
+
+			continue
+		}
+
+		op := component.Operation{
+			Kind:      component.OpApply,
+			Object:    obj,
+			Component: componentName,
+			Site:      site,
+			SharedKey: sharedSupportKey(obj),
+		}
+		if obj.GetKind() == "ClusterRoleBinding" && obj.GetName() == BootstrapMachineBindingName {
+			if !verified {
+				op = component.DeleteOperation(obj.DeepCopy(), componentName, site)
+				op.SharedKey = sharedSupportKey(obj)
+				plan.Add(op)
+
+				continue
+			}
+
+			// An earlier release may already have installed the grant, so
+			// skipping the apply is not enough: revoke it until the
+			// restriction is back.
+			op.DependsOn = restriction
+			op.RevokeOnDependencyFailure = true
+		}
+
+		plan.Add(op)
+	}
+
+	// Remove RBAC that earlier releases installed and that is now unsafe to
+	// keep. Deletes are idempotent, so they run on every pass.
+	for _, op := range staleSupportDeletes(componentName, site) {
+		plan.Add(op)
+	}
+
+	return restriction, verifyErr
+}
+
+// verifyRestriction compares the live admission policy and binding with the
+// desired support objects. It returns merge patch repairs, keyed by object,
+// that replace a drifted spec in full, and whether the grant may be applied in
+// this pass. A missing object, drift, a terminating object, or a failed read
+// withholds the grant. A missing object is not granted alongside its create:
+// the executor compares applies against the cached client, so while the cache
+// still holds a deleted object the create is skipped as already applied and
+// the grant would go live without its restriction. The create event of each
+// admission object re-runs the plan, which grants once both read back live.
+//
+// Missing, terminating, and drifted objects are expected states that the
+// admission object watches re-trigger on. A verification that could not run
+// at all is also returned as an error, because nothing else retries it.
+func verifyRestriction(ctx context.Context, env *component.Env, support []*unstructured.Unstructured) (map[component.ObjectRef]component.Operation, bool, error) {
+	repairs := map[component.ObjectRef]component.Operation{}
+	verified := true
+
+	var errs []error
+
+	reader := env.LiveReader()
+	if reader == nil {
+		return repairs, false, errors.New("verifying metalman bootstrap restriction: no reader configured")
+	}
+
+	for _, obj := range support {
+		var expected, current client.Object
+
+		switch obj.GetKind() {
+		case "ValidatingAdmissionPolicy":
+			expected, current = &admissionv1.ValidatingAdmissionPolicy{}, &admissionv1.ValidatingAdmissionPolicy{}
+		case "ValidatingAdmissionPolicyBinding":
+			expected, current = &admissionv1.ValidatingAdmissionPolicyBinding{}, &admissionv1.ValidatingAdmissionPolicyBinding{}
+		default:
+			continue
+		}
+
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, expected); err != nil {
+			verified = false
+
+			errs = append(errs, fmt.Errorf("verifying metalman bootstrap restriction: decode %s %s: %w", obj.GetKind(), obj.GetName(), err))
+
+			continue
+		}
+
+		err := reader.Get(ctx, client.ObjectKeyFromObject(expected), current)
+
+		switch {
+		case err != nil && !apierrors.IsNotFound(err):
+			verified = false
+
+			errs = append(errs, fmt.Errorf("verifying metalman bootstrap restriction: get %s %s: %w", obj.GetKind(), obj.GetName(), err))
+		case err != nil, current.GetDeletionTimestamp() != nil:
+			verified = false
+		case !equality.Semantic.DeepEqual(component.EffectiveAdmissionSpec(expected), component.EffectiveAdmissionSpec(current)):
+			verified = false
+			base := component.ToUnstructured(current)
+			base.SetGroupVersionKind(obj.GroupVersionKind())
+			desired := base.DeepCopy()
+			// The merge patch is computed against the live object, so fields
+			// absent from the desired spec are sent as null and removed.
+			desired.Object["spec"] = obj.DeepCopy().Object["spec"]
+			repairs[component.RefOf(obj)] = component.Operation{Kind: component.OpMergePatch, Base: base, Object: desired}
+		}
+	}
+
+	return repairs, verified, errors.Join(errs...)
+}
+
+// admissionRefs returns the refs of the admission policy objects in support.
+func admissionRefs(support []*unstructured.Unstructured) []component.ObjectRef {
+	var refs []component.ObjectRef
+
+	for _, obj := range support {
+		switch obj.GetKind() {
+		case "ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding":
+			refs = append(refs, component.RefOf(obj))
+		}
+	}
+
+	return refs
+}
+
 // CleanupPlan removes the per-site metalman Deployment. The shared metalman
-// RBAC is left in place; it is harmless when unreferenced and may still be used
-// by other sites.
+// RBAC is kept because other Sites may use it, and bootstrap tokens minted
+// earlier stay valid after the Deployment is gone, so BootstrapComponent keeps
+// planning the restriction, the restricted grant, and the stale RBAC deletes.
 func (c Component) CleanupPlan(_ context.Context, env *component.Env, site *unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
 	plan := component.NewPlan()
+
 	plan.Add(component.DeleteOperation(&appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{Name: DeploymentName(site.Name), Namespace: env.Namespace},
@@ -87,8 +256,28 @@ func (c Component) CleanupPlan(_ context.Context, env *component.Env, site *unbo
 	return plan, component.Disabled("component disabled"), nil
 }
 
-// sharedSupportKey identifies a support object across Sites. The objects are
-// byte-identical for every Site, so the key is just their identity.
+// StaleAutoApproveBindingName is the ClusterRoleBinding that earlier releases
+// installed to let kube-controller-manager auto-approve kubelet client
+// certificates for any node requested with a metalman-bootstrap token. Metalman
+// now approves those requests only for the attested Machine, so the binding
+// must be removed on upgrade.
+const StaleAutoApproveBindingName = "metalman:node-autoapprove-bootstrap"
+
+// staleSupportDeletes returns delete operations for shared metalman RBAC that
+// is no longer shipped.
+func staleSupportDeletes(componentName, site string) []component.Operation {
+	op := component.DeleteOperation(&rbacv1.ClusterRoleBinding{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRoleBinding"},
+		ObjectMeta: metav1.ObjectMeta{Name: StaleAutoApproveBindingName},
+	}, componentName, site)
+	op.SharedKey = sharedSupportKey(op.Object)
+
+	return []component.Operation{op}
+}
+
+// sharedSupportKey identifies a support object. Only BootstrapComponent plans
+// these objects, so the key guards against another planner emitting a
+// conflicting operation on them rather than deduplicating across Sites.
 func sharedSupportKey(obj *unstructured.Unstructured) string {
 	return "metalman/support/" + component.RefOf(obj).String()
 }
@@ -108,11 +297,16 @@ func DeploymentName(site string) string { return "metalman-controller-" + site }
 // exactly the objects the metalman component owns and applies.
 const SupportObjectNameSubstring = "metalman"
 
-// IsSupportObject reports whether obj is the metalman RBAC that ships in the
-// machina manifests. The machina component skips these; the metalman component
-// applies them.
+// IsSupportObject reports whether obj is the metalman RBAC or admission policy
+// that ships in the machina manifests. The machina component skips these; the
+// metalman component applies them.
 func IsSupportObject(obj *unstructured.Unstructured) bool {
-	return component.IsRBACObject(obj, SupportObjectNameSubstring)
+	switch obj.GetKind() {
+	case "ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding":
+		return strings.Contains(obj.GetName(), SupportObjectNameSubstring)
+	default:
+		return component.IsRBACObject(obj, SupportObjectNameSubstring)
+	}
 }
 
 // mutateSupportObject keeps only the metalman RBAC objects from the machina

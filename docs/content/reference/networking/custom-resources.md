@@ -57,7 +57,7 @@ spec:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `assignmentEnabled` | `*bool` | No | Enables this assignment (default: `true`). |
+| `assignmentEnabled` | `*bool` | No | Enables this assignment. When omitted, inherits `manageCniPlugin` (default: `true`). Explicit `true` or `false` overrides that default. |
 | `cidrBlocks` | `[]string` | No | CIDR pools to allocate from (IPv4 and/or IPv6). |
 | `nodeBlockSizes.ipv4` | `int` | No | IPv4 subnet size for node allocations (default: `/24`). |
 | `nodeBlockSizes.ipv6` | `int` | No | IPv6 subnet size for node allocations (default: pool prefix + 16). |
@@ -80,6 +80,12 @@ spec:
 
 Set to `false` when using an external CNI plugin (e.g., Cilium, Calico) for
 intra-site networking while unbounded-net handles only cross-site routing.
+
+With `manageCniPlugin: false`, omitted `assignmentEnabled` values resolve to
+`false`. Set `podCidrAssignments[].assignmentEnabled: true` to allocate Node
+PodCIDRs without managing the external CNI. Explicit `false` always disables a
+rule. Inherited values are not persisted and follow changes to `manageCniPlugin`;
+existing explicit values remain unchanged.
 
 ### Admission Validation
 

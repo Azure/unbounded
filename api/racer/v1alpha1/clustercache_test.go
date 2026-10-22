@@ -41,3 +41,29 @@ func TestClusterCacheRegistrationAndJSON(t *testing.T) {
 	listCopy.Items[0].Labels["test"] = "list-copy"
 	require.Equal(t, "original", list.Items[0].Labels["test"])
 }
+
+func TestClusterCacheOriginJSONAndDeepCopy(t *testing.T) {
+	cache := &ClusterCache{
+		ObjectMeta: metav1.ObjectMeta{Name: "cache"},
+		Spec: ClusterCacheSpec{Origin: &ObjectOrigin{
+			Azure: &AzureOrigin{
+				ContainerURL: "https://account.blob.core.windows.net/models",
+				Credential:   &AzureCredential{Default: &AzureDefaultCredential{SecretRef: &SecretReference{Name: "azure"}}},
+			},
+		}},
+	}
+
+	data, err := json.Marshal(cache)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"metadata":{"name":"cache"},"spec":{"origin":{"azure":{"containerURL":"https://account.blob.core.windows.net/models","credential":{"default":{"secretRef":{"name":"azure"}}}}}}}`, string(data))
+
+	decoded := &ClusterCache{}
+	require.NoError(t, json.Unmarshal(data, decoded))
+	require.Equal(t, cache, decoded)
+
+	copy := cache.DeepCopy()
+	copy.Spec.Origin.Azure.ContainerURL = "copy"
+	copy.Spec.Origin.Azure.Credential.Default.SecretRef.Name = "copy"
+	require.Equal(t, "https://account.blob.core.windows.net/models", cache.Spec.Origin.Azure.ContainerURL)
+	require.Equal(t, "azure", cache.Spec.Origin.Azure.Credential.Default.SecretRef.Name)
+}

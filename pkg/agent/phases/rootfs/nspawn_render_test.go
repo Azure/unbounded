@@ -5,7 +5,9 @@ package rootfs
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -251,6 +253,51 @@ func TestNSpawnConfig_AdditionalHostMounts(t *testing.T) {
 	require.Contains(t, buf.String(), "Bind=/var/lib/data:/data")
 }
 
+func TestNSpawnConfig_ImageVerifierMount(t *testing.T) {
+	t.Parallel()
+
+	machineDir := t.TempDir()
+	hostDir := t.TempDir()
+
+	const target = "/opt/containerd/image-verifier/bin"
+
+	targetPath := filepath.Join(machineDir, target)
+
+	cfg := config.AgentConfig{
+		MachineName: "machine-1",
+		NodeName:    "node-1",
+		AdditionalHostMounts: []config.AdditionalHostMount{{
+			Source: hostDir, Target: target, ReadOnly: true,
+		}},
+	}
+	data, err := json.Marshal(cfg)
+	require.NoError(t, err)
+
+	var decoded config.AgentConfig
+	require.NoError(t, json.Unmarshal(data, &decoded))
+	require.NoError(t, config.ValidateAdditionalHostMounts(decoded.AdditionalHostMounts))
+
+	log := slog.New(slog.DiscardHandler)
+	gs, err := goalstates.ResolveMachine(log, &decoded, "machine-1", nil)
+	require.NoError(t, err)
+	require.Equal(t, cfg.AdditionalHostMounts, gs.RootFS.AdditionalHostMounts)
+	require.Len(t, gs.RootFS.AdditionalHostMounts, 1)
+
+	gs.RootFS.MachineDir = machineDir
+	gs.RootFS.NSpawnConfigFile = filepath.Join(machineDir, "machine.nspawn")
+	gs.RootFS.ServiceOverrideFile = filepath.Join(machineDir, "override.conf")
+	gs.RootFS.ConfigRegenerationFile = filepath.Join(machineDir, "config-regeneration.service")
+	require.NoError(t, writeNSpawnConfigs(log, gs.RootFS))
+
+	rendered, err := os.ReadFile(gs.RootFS.NSpawnConfigFile)
+	require.NoError(t, err)
+	require.Contains(t, string(rendered), "BindReadOnly="+hostDir+":"+target+"\n")
+	require.NotContains(t, string(rendered), "\nBind="+hostDir+":")
+
+	_, err = os.Stat(targetPath)
+	require.ErrorIs(t, err, os.ErrNotExist, "config generation must leave mountpoint creation to nspawn")
+}
+
 func TestNSpawnConfig_NvidiaIMEXDevice(t *testing.T) {
 	t.Parallel()
 
@@ -364,6 +411,158 @@ func TestServiceOverride_CPUNodesRunCommonPostStartHook(t *testing.T) {
 	require.Contains(t, buf.String(), "nspawn-lifecycle post-start")
 }
 
+func TestNSpawnLifecycleCommands(t *testing.T) {
+	t.Parallel()
+
+	helperPreStart, helperPostStart := nspawnLifecycleCommands(&goalstates.RootFS{}, "kube2")
+	require.Regexp(t, `^/\S+/unbounded-agent-nspawn-lifecycle nspawn-lifecycle pre-start kube2$`, helperPreStart)
+	require.Regexp(t, `^/\S+/unbounded-agent-nspawn-lifecycle nspawn-lifecycle post-start kube2$`, helperPostStart)
+
+	preStart, postStart := nspawnLifecycleCommands(&goalstates.RootFS{
+		NSpawnLifecycle: &config.NSpawnLifecycleConfig{
+			PreStartCommand:  "/usr/bin/systemctl start app-pre-start@%i.service",
+			PostStartCommand: "/usr/bin/systemctl start app-post-start@%i.service",
+		},
+	}, "kube2")
+	require.Equal(t, "/usr/bin/systemctl start app-pre-start@%i.service", preStart)
+	require.Equal(t, "/usr/bin/systemctl start app-post-start@%i.service", postStart)
+}
+
+func TestWriteNSpawnConfigs_ConfiguredLifecycleCommands(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	goalState := &goalstates.RootFS{
+		MachineDir:             filepath.Join(dir, "machines", "kube1"),
+		NSpawnConfigFile:       filepath.Join(dir, "kube1.nspawn"),
+		ServiceOverrideFile:    filepath.Join(dir, "override.conf"),
+		ConfigRegenerationFile: filepath.Join(dir, "unbounded-agent-regenerate-config@kube1.service"),
+		NSpawnLifecycle: &config.NSpawnLifecycleConfig{
+			PreStartCommand:  "/usr/bin/systemctl start app-pre-start@%i.service",
+			PostStartCommand: "/usr/bin/systemctl start app-post-start@%i.service",
+		},
+	}
+	require.NoError(t, writeNSpawnConfigs(slog.New(slog.DiscardHandler), goalState))
+
+	override, err := os.ReadFile(goalState.ServiceOverrideFile)
+	require.NoError(t, err)
+	require.Contains(t, string(override), "\nExecStartPost=/usr/bin/systemctl start app-post-start@%i.service\n")
+	require.NotContains(t, string(override), "unbounded-agent-nspawn-lifecycle")
+	require.Contains(t, string(override), "Requires=unbounded-agent-regenerate-config@kube1.service")
+
+	unit, err := os.ReadFile(goalState.ConfigRegenerationFile)
+	require.NoError(t, err)
+	require.Contains(t, string(unit), "\nExecStart=/usr/bin/systemctl start app-pre-start@%i.service\n")
+	require.NotContains(t, string(unit), "unbounded-agent-nspawn-lifecycle")
+}
+
+func TestWriteNSpawnConfigs_RejectsInvalidLifecycleCommands(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	goalState := &goalstates.RootFS{
+		MachineDir:             filepath.Join(dir, "machines", "kube1"),
+		NSpawnConfigFile:       filepath.Join(dir, "kube1.nspawn"),
+		ServiceOverrideFile:    filepath.Join(dir, "override.conf"),
+		ConfigRegenerationFile: filepath.Join(dir, "unbounded-agent-regenerate-config@kube1.service"),
+		NSpawnLifecycle: &config.NSpawnLifecycleConfig{
+			PreStartCommand: "/usr/bin/systemctl start app-pre-start@%i.service",
+		},
+	}
+	require.ErrorContains(t, writeNSpawnConfigs(slog.New(slog.DiscardHandler), goalState), "NSpawnLifecycle.PostStartCommand")
+	require.NoFileExists(t, goalState.ServiceOverrideFile)
+	require.NoFileExists(t, goalState.ConfigRegenerationFile)
+}
+
+// fakeTask is a phases.Task that runs do.
+type fakeTask struct {
+	name string
+	do   func(context.Context) error
+}
+
+func (f *fakeTask) Name() string { return f.name }
+
+func (f *fakeTask) Do(ctx context.Context) error { return f.do(ctx) }
+
+func TestEnsureNSpawnConfig_RepairsHelperBeforeWriting(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		repairErr error
+	}{
+		"the repair runs before the files are written": {},
+		"a failed repair writes no files":              {repairErr: errors.New("copy failed")},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			goalState := &goalstates.RootFS{
+				MachineDir:             filepath.Join(dir, "machines", "kube1"),
+				NSpawnConfigFile:       filepath.Join(dir, "kube1.nspawn"),
+				ServiceOverrideFile:    filepath.Join(dir, "override.conf"),
+				ConfigRegenerationFile: filepath.Join(dir, "unbounded-agent-regenerate-config@kube1.service"),
+			}
+			task, ok := EnsureNSpawnConfig(slog.New(slog.DiscardHandler), goalState).(*ensureNSpawnConfig)
+			require.True(t, ok)
+
+			var filesAtRepair []string
+
+			task.repairHelper = &fakeTask{name: "repair-nspawn-lifecycle-helper", do: func(context.Context) error {
+				for _, path := range []string{goalState.NSpawnConfigFile, goalState.ServiceOverrideFile, goalState.ConfigRegenerationFile} {
+					if _, err := os.Stat(path); err == nil {
+						filesAtRepair = append(filesAtRepair, path)
+					}
+				}
+
+				return tc.repairErr
+			}}
+
+			err := task.Do(context.Background())
+
+			require.Empty(t, filesAtRepair, "files written before the helper was repaired")
+
+			if tc.repairErr != nil {
+				require.ErrorIs(t, err, tc.repairErr)
+				require.NoFileExists(t, goalState.ServiceOverrideFile)
+				require.NoFileExists(t, goalState.ConfigRegenerationFile)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.FileExists(t, goalState.ServiceOverrideFile)
+			require.FileExists(t, goalState.ConfigRegenerationFile)
+		})
+	}
+}
+
+func TestEnsureNSpawnConfig_RepairsTheHelperItsHooksRun(t *testing.T) {
+	t.Parallel()
+
+	for name, lifecycle := range map[string]*config.NSpawnLifecycleConfig{
+		"hooks run the helper": nil,
+		"hooks run configured commands": {
+			PreStartCommand:  "/usr/bin/systemctl start app-pre-start@%i.service",
+			PostStartCommand: "/usr/bin/systemctl start app-post-start@%i.service",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			task, ok := EnsureNSpawnConfig(slog.New(slog.DiscardHandler), &goalstates.RootFS{NSpawnLifecycle: lifecycle}).(*ensureNSpawnConfig)
+			require.True(t, ok)
+
+			repair, ok := task.repairHelper.(*ensureNSpawnLifecycleHelper)
+			require.True(t, ok)
+			require.Equal(t, "repair-nspawn-lifecycle-helper", repair.Name())
+			require.True(t, repair.onlyIfMissing)
+			require.Equal(t, lifecycle != nil, repair.skip)
+		})
+	}
+}
+
 func defaultNSpawnTemplateData(machineName string) nspawnTemplateData {
 	return nspawnTemplateData{
 		MachineName:                  machineName,
@@ -371,7 +570,8 @@ func defaultNSpawnTemplateData(machineName string) nspawnTemplateData {
 		ContainerImageArchiveDir:     goalstates.ContainerImageArchiveDir,
 		ContainerImageArchiveHostDir: goalstates.ContainerImageArchiveHostDir,
 		ConfigRegenerationUnit:       goalstates.ConfigRegenerationUnit(machineName),
-		AgentBinaryPath:              "/opt/unbounded/agent/bin/unbounded-agent-nspawn-lifecycle",
+		PreStartCommand:              "/opt/unbounded/agent/bin/unbounded-agent-nspawn-lifecycle nspawn-lifecycle pre-start " + machineName,
+		PostStartCommand:             "/opt/unbounded/agent/bin/unbounded-agent-nspawn-lifecycle nspawn-lifecycle post-start " + machineName,
 	}
 }
 

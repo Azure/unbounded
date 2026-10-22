@@ -268,6 +268,7 @@ impl LocalPageService for Coordinator {
     ) -> Operation<'a, PeerResponse> {
         Box::pin(async move {
             scope.check()?;
+            let requester = verified.origin().node().clone();
             let request = verified.into_signed().request;
             crate::peer::check_membership(&request, &membership)?;
             if request.route.request != scope.request
@@ -281,6 +282,7 @@ impl LocalPageService for Coordinator {
                 PeerOperation::Bootstrap { object, .. } => object,
                 PeerOperation::Page { page, .. } => &page.version.object,
                 PeerOperation::Metadata { object, .. } => object,
+                PeerOperation::Warm { version, .. } => &version.object,
             };
             if object != &request.origin.object {
                 return Err(Error::InvalidRequest);
@@ -407,6 +409,26 @@ impl LocalPageService for Coordinator {
                                 validate_metadata(&metadata, &object, &selector)?;
                                 Ok(PeerResponse::Metadata(metadata))
                             }),
+                        PeerOperation::Warm {
+                            version,
+                            lease,
+                            action,
+                        } => {
+                            warm::serve(
+                                self,
+                                warm::Lease {
+                                    requester,
+                                    version,
+                                    lease,
+                                },
+                                action,
+                                membership,
+                                &context,
+                                &effective,
+                                &mut budget,
+                            )
+                            .await
+                        }
                         _ => Err(Error::InvalidRequest),
                     }
                 }

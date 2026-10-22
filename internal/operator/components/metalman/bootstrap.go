@@ -1,0 +1,201 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+package metalman
+
+import (
+	"context"
+	"fmt"
+
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+
+	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	machinamanifests "github.com/Azure/unbounded/deploy/machina"
+	"github.com/Azure/unbounded/internal/operator/component"
+)
+
+// BootstrapServiceAccountName is the ServiceAccount whose tokens metalman hands
+// to booting machines.
+const BootstrapServiceAccountName = "metalman-bootstrap"
+
+// BootstrapRestrictionPolicyName names both the ValidatingAdmissionPolicy that
+// restricts metalman bootstrap tokens and its binding.
+const BootstrapRestrictionPolicyName = "metalman-bootstrap-machine-restriction"
+
+// BootstrapComponent reconciles the shared metalman bootstrap support set:
+// the support RBAC, the admission restriction, the restricted bootstrap grant,
+// and the stale RBAC deletes.
+//
+// It is cluster scoped so the set is planned exactly once per pass. The
+// reconciler plans a per-Site component once for each Site, and each plan
+// would verify the live restriction separately, so one pass could plan the
+// same shared grant as both an apply and a delete. The executor rejects such
+// conflicts before writing anything, which would also drop the revocation and
+// the stale auto-approval delete.
+//
+// It also covers the zero-Site case. With no Sites the machina component
+// filters the support objects out of its own manifests, so an upgrade after
+// the last Site was deleted would otherwise leave the old unrestricted grant
+// and the legacy auto-approval binding in place while previously minted
+// bootstrap tokens are still valid.
+type BootstrapComponent struct{}
+
+// NewBootstrap returns the cluster-scoped metalman bootstrap component.
+func NewBootstrap() component.ClusterComponent { return BootstrapComponent{} }
+
+// Name implements component.ClusterComponent.
+func (BootstrapComponent) Name() string { return "metalman-bootstrap" }
+
+// ConditionType implements component.ClusterComponent.
+func (BootstrapComponent) ConditionType() string { return "MetalmanBootstrapReady" }
+
+// bootstrapWatch is one watch SetupWatches registers. It is separated from the
+// builder so tests can check the wiring without a running manager.
+type bootstrapWatch struct {
+	object    client.Object
+	predicate predicate.Predicate
+}
+
+// bootstrapWatches lists the objects whose events must re-run the plan. No
+// Site event follows changes to these cluster-wide objects, so the
+// bootstrap ServiceAccount and bindings (including their initial create events
+// when the cache syncs) and admission policy deletion or drift must each
+// enqueue the singleton request themselves.
+func bootstrapWatches(env *component.Env) []bootstrapWatch {
+	named := func(namespace string, names ...string) predicate.Predicate {
+		return predicate.NewPredicateFuncs(func(obj client.Object) bool {
+			if obj.GetNamespace() != namespace {
+				return false
+			}
+
+			for _, name := range names {
+				if obj.GetName() == name {
+					return true
+				}
+			}
+
+			return false
+		})
+	}
+
+	policy := named("", BootstrapRestrictionPolicyName)
+	// The policy objects carry a generation, so ignore status-only updates.
+	policyDrift := predicate.And(policy, predicate.Predicate(predicate.GenerationChangedPredicate{}))
+
+	return []bootstrapWatch{
+		{&corev1.ServiceAccount{}, named(env.Namespace, BootstrapServiceAccountName)},
+		{&rbacv1.ClusterRoleBinding{}, named("", BootstrapMachineBindingName, StaleAutoApproveBindingName)},
+		{&admissionregistrationv1.ValidatingAdmissionPolicy{}, policyDrift},
+		{&admissionregistrationv1.ValidatingAdmissionPolicyBinding{}, policyDrift},
+	}
+}
+
+// SetupWatches implements component.WatchProvider. Only object metadata is
+// cached, since every event just re-runs Plan, which reads live state.
+func (BootstrapComponent) SetupWatches(b *builder.Builder, env *component.Env) {
+	for _, w := range bootstrapWatches(env) {
+		b.Watches(w.object, env.RequestSingleton(), builder.WithPredicates(w.predicate), builder.OnlyMetadata)
+	}
+}
+
+// Plan plans the shared support set once for the pass.
+//
+// While any Site exists the set is always planned, whether or not a Site
+// enables metalman, because bootstrap tokens minted earlier outlive the
+// Deployment that handed them out.
+//
+// With zero Sites the set is planned only when metalman bootstrap resources
+// are already live: the metalman-bootstrap ServiceAccount, the
+// metalman:bootstrap-machine binding, or the stale
+// metalman:node-autoapprove-bootstrap binding. Any of them means a previous
+// release installed metalman bootstrap access that may still be exercised by
+// unexpired tokens. A cluster that never ran metalman has none of them and is
+// left untouched, so the operator does not install metalman RBAC or admission
+// policy there. Once applied, the ServiceAccount and binding stay present, so
+// the trigger is stable across passes and does not churn.
+func (c BootstrapComponent) Plan(ctx context.Context, env *component.Env, sites []unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
+	plan := component.NewPlan()
+
+	if len(sites) == 0 {
+		present, err := bootstrapResourcesPresent(ctx, env)
+		if err != nil {
+			return revokeBindingsPlan(c.Name()), component.Failed(err), nil
+		}
+
+		if !present {
+			return plan, component.NoSites("no metalman bootstrap resources present"), nil
+		}
+	}
+
+	support, err := env.DecodeManifestFS(machinamanifests.Manifests, mutateSupportObject)
+	if err != nil {
+		return revokeBindingsPlan(c.Name()), component.Failed(err), nil
+	}
+
+	if _, verifyErr := addSupportOps(ctx, env, plan, support, c.Name(), ""); verifyErr != nil {
+		return plan, component.Failed(verifyErr), nil
+	}
+
+	if len(sites) == 0 {
+		return plan, component.NoSites("metalman bootstrap access restricted while no Sites exist"), nil
+	}
+
+	return plan, component.Reconciled(), nil
+}
+
+// revokeBindingsPlan returns the fail-closed plan used when the bootstrap
+// support objects cannot be planned: it deletes the bootstrap grant and the
+// stale auto-approve binding. Callers return it with a failed Result rather
+// than a planning error, because a planning error discards the plan and would
+// leave both bindings in place. Deleting an absent binding succeeds.
+func revokeBindingsPlan(componentName string) *component.Plan {
+	plan := component.NewPlan()
+
+	grant := component.DeleteOperation(&rbacv1.ClusterRoleBinding{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRoleBinding"},
+		ObjectMeta: metav1.ObjectMeta{Name: BootstrapMachineBindingName},
+	}, componentName, "")
+	grant.SharedKey = sharedSupportKey(grant.Object)
+
+	plan.Add(grant)
+	plan.Add(staleSupportDeletes(componentName, "")...)
+
+	return plan
+}
+
+// bootstrapResourcesPresent reports whether any metalman bootstrap resource
+// from an earlier release is live. It reads the apiserver directly because the
+// answer decides whether security-relevant objects are written.
+func bootstrapResourcesPresent(ctx context.Context, env *component.Env) (bool, error) {
+	reader := env.LiveReader()
+
+	checks := []struct {
+		key types.NamespacedName
+		obj client.Object
+	}{
+		{types.NamespacedName{Namespace: env.Namespace, Name: BootstrapServiceAccountName}, &corev1.ServiceAccount{}},
+		{types.NamespacedName{Name: BootstrapMachineBindingName}, &rbacv1.ClusterRoleBinding{}},
+		{types.NamespacedName{Name: StaleAutoApproveBindingName}, &rbacv1.ClusterRoleBinding{}},
+	}
+
+	for _, check := range checks {
+		err := reader.Get(ctx, check.key, check.obj)
+		if err == nil {
+			return true, nil
+		}
+
+		if !apierrors.IsNotFound(err) {
+			return false, fmt.Errorf("checking for metalman bootstrap resource %s: %w", check.key, err)
+		}
+	}
+
+	return false, nil
+}

@@ -121,6 +121,7 @@ func initialize(t *testing.T, env *component.Env) racercore.Config {
 		return value, ok
 	})
 	require.NoError(t, err)
+	require.Equal(t, env.Config.Image(objectImageName), cfg.ObjectImage)
 	require.NoError(t, racercore.Assemble(cfg, env.Client, env.APIReader).Recover(t.Context(), env.Client))
 
 	return cfg
@@ -192,7 +193,7 @@ func TestLifecycleWithoutSites(t *testing.T) {
 	require.Empty(t, container.Args)
 	require.Equal(t, "/readyz", container.ReadinessProbe.HTTPGet.Path)
 	require.Equal(t, "/healthz", container.LivenessProbe.HTTPGet.Path)
-	require.Equal(t, []corev1.ContainerPort{{Name: "https", ContainerPort: 8443}, {Name: "probes", ContainerPort: 8081}, {Name: "metrics", ContainerPort: 8080}}, container.Ports)
+	require.Equal(t, []corev1.ContainerPort{{Name: "https", ContainerPort: 8443}, {Name: "probes", ContainerPort: 8081}, {Name: "metrics", ContainerPort: 8080}, {Name: "webhook", ContainerPort: 9443, Protocol: corev1.ProtocolTCP}}, container.Ports)
 	require.Equal(t, []corev1.KeyToPath{{Key: "tls.crt", Path: "tls.crt"}, {Key: "tls.key", Path: "tls.key"}, {Key: caBundleKey, Path: "ca.crt"}}, pod.Volumes[0].Secret.Items)
 	token := pod.Volumes[1].Projected.Sources[0].ServiceAccountToken
 	require.Equal(t, racercore.ReplicationAudience, token.Audience)
@@ -510,4 +511,28 @@ func TestInactiveAtEveryInstallationBoundary(t *testing.T) {
 			require.Zero(t, planPass(t, env).Len())
 		})
 	}
+}
+
+func TestClusterCachePredicate(t *testing.T) {
+	t.Parallel()
+
+	p := clusterCachePredicate()
+	cache := func(gen int64, deleting bool, labels map[string]string) *racerv1.ClusterCache {
+		c := &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "c", Generation: gen, Labels: labels}}
+
+		if deleting {
+			now := metav1.Now()
+			c.DeletionTimestamp = &now
+			c.Finalizers = []string{"example.com/hold"}
+		}
+
+		return c
+	}
+
+	require.True(t, p.Create(event.CreateEvent{Object: cache(1, false, nil)}))
+	require.True(t, p.Delete(event.DeleteEvent{Object: cache(1, false, nil)}))
+	require.True(t, p.Update(event.UpdateEvent{ObjectOld: cache(1, false, nil), ObjectNew: cache(2, false, nil)}), "generation change")
+	require.True(t, p.Update(event.UpdateEvent{ObjectOld: cache(1, false, nil), ObjectNew: cache(1, true, nil)}), "deletion timestamp set")
+	require.False(t, p.Update(event.UpdateEvent{ObjectOld: cache(1, false, nil), ObjectNew: cache(1, false, map[string]string{"a": "b"})}), "label-only update")
+	require.False(t, p.Update(event.UpdateEvent{ObjectOld: cache(1, true, nil), ObjectNew: cache(1, true, map[string]string{"a": "b"})}), "already terminating")
 }

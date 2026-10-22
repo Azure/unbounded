@@ -39,15 +39,25 @@ func TestHelpOutputFailure(t *testing.T) {
 	}
 }
 
+// modeArgs returns the minimal valid arguments for mode followed by extra.
+func modeArgs(mode string, extra ...string) []string {
+	args := []string{mode}
+	if mode == "origin" {
+		args = append(args, "--bucket=bucket")
+	}
+
+	return append(args, extra...)
+}
+
 func TestOptionsDefaults(t *testing.T) {
 	for _, mode := range []string{"origin", "sidecar"} {
 		t.Run(mode, func(t *testing.T) {
-			o, err := parseOptions([]string{mode, "--namespace", "store"}, io.Discard)
+			o, err := parseOptions(modeArgs(mode), io.Discard)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			if o.cache != "racer-object" || o.namespace != "store" || len(o.buckets) != 0 {
+			if o.cache != "racer-object" || (mode == "origin") != (o.bucket == "bucket") {
 				t.Fatalf("unexpected shared defaults: %+v", o)
 			}
 
@@ -61,21 +71,21 @@ func TestOptionsDefaults(t *testing.T) {
 		})
 	}
 
-	o, err := parseOptions([]string{"origin", "--namespace=store", "--bucket=one", "--bucket=two", "--cache=custom", "--metadata-ttl=0", "--path-style=false", "--region=us-west-2", "--endpoint=https://s3.example/", "--request-timeout=2s"}, io.Discard)
+	o, err := parseOptions([]string{"origin", "--bucket=one", "--cache=custom", "--metadata-ttl=0", "--path-style=false", "--region=us-west-2", "--endpoint=https://s3.example/", "--request-timeout=2s"}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if strings.Join(o.buckets, ",") != "one,two" || o.cache != "custom" || o.metadataTTL != 0 || o.pathStyle || o.region != "us-west-2" || o.requestTimeout != 2*time.Second {
+	if o.bucket != "one" || o.cache != "custom" || o.metadataTTL != 0 || o.pathStyle || o.region != "us-west-2" || o.requestTimeout != 2*time.Second {
 		t.Fatalf("flags not applied: %+v", o)
 	}
 
-	o, err = parseOptions([]string{"origin", "--namespace=store", "--max-concurrent-requests=1"}, io.Discard)
+	o, err = parseOptions([]string{"origin", "--bucket=bucket", "--max-concurrent-requests=1"}, io.Discard)
 	if err != nil || o.maxRequests != 1 {
 		t.Fatalf("origin concurrency not applied: %+v, %v", o, err)
 	}
 
-	o, err = parseOptions([]string{"sidecar", "--namespace=store", "--max-connections=65536"}, io.Discard)
+	o, err = parseOptions([]string{"sidecar", "--max-connections=65536"}, io.Discard)
 	if err != nil || o.maxConnections != 65536 {
 		t.Fatalf("sidecar connections not applied: %+v, %v", o, err)
 	}
@@ -85,14 +95,14 @@ func TestCacheFlag(t *testing.T) {
 	for _, mode := range []string{"origin", "sidecar"} {
 		t.Run(mode, func(t *testing.T) {
 			for _, name := range []string{"custom", "a-b.c0", strings.Repeat("a", 63) + "." + strings.Repeat("b", 18)} {
-				o, err := parseOptions([]string{mode, "--namespace=store", "--cache=" + name}, io.Discard)
+				o, err := parseOptions(modeArgs(mode, "--cache="+name), io.Discard)
 				if err != nil || o.cache != name {
 					t.Fatalf("valid cache %q: options=%+v err=%v", name, o, err)
 				}
 			}
 
 			for _, name := range []string{"", "../bad", "Upper", strings.Repeat("a", 64), strings.Repeat("a", 63) + "." + strings.Repeat("b", 19)} {
-				_, err := parseOptions([]string{mode, "--namespace=store", "--cache=" + name}, io.Discard)
+				_, err := parseOptions(modeArgs(mode, "--cache="+name), io.Discard)
 				if err == nil || err.Error() != "invalid --cache" {
 					t.Fatalf("invalid cache %q: %v", name, err)
 				}
@@ -108,30 +118,56 @@ func TestCacheFlag(t *testing.T) {
 	}
 }
 
+func TestCacheUIDFlag(t *testing.T) {
+	o, err := parseOptions([]string{"origin", "--bucket=bucket"}, io.Discard)
+	if err != nil || o.cacheUID != "" {
+		t.Fatalf("default cache UID: options=%+v err=%v", o, err)
+	}
+
+	const uid = "00000000-0000-4000-8000-00000000000a"
+
+	o, err = parseOptions([]string{"origin", "--bucket=bucket", "--cache-uid=" + uid}, io.Discard)
+	if err != nil || o.cacheUID != uid {
+		t.Fatalf("cache UID: options=%+v err=%v", o, err)
+	}
+
+	_, err = parseOptions([]string{"origin", "--bucket=bucket", "--cache-uid=bad"}, io.Discard)
+	if err == nil || err.Error() != "invalid --cache-uid" {
+		t.Fatalf("invalid cache UID: %v", err)
+	}
+}
+
 func TestOptionsErrors(t *testing.T) {
 	for _, args := range [][]string{
 		nil,
 		{"unknown"},
 		{"origin"},
-		{"sidecar"},
-		{"origin", "--namespace=has space"},
-		{"sidecar", "--namespace=store", "--cache=../bad"},
-		{"origin", "--namespace=store", "--bucket="},
-		{"sidecar", "--namespace=store", "--bucket=../bad"},
-		{"origin", "--namespace=store", "--request-timeout=0"},
-		{"sidecar", "--namespace=store", "--request-timeout=-1s"},
-		{"origin", "--namespace=store", "--metadata-ttl=-1s"},
-		{"origin", "--namespace=store", "--metadata-ttl=bad"},
-		{"origin", "--namespace=store", "--listen=127.0.0.1:0"},
-		{"sidecar", "--namespace=store", "--region=us-east-1"},
-		{"sidecar", "--namespace=store", "extra"},
-		{"sidecar", "--namespace=store", "--listen=0.0.0.0:8080"},
-		{"origin", "--namespace=store", "--max-concurrent-requests=0"},
-		{"origin", "--namespace=store", "--max-concurrent-requests=65537"},
-		{"origin", "--namespace=store", "--max-connections=128"},
-		{"sidecar", "--namespace=store", "--max-connections=0"},
-		{"sidecar", "--namespace=store", "--max-connections=-1"},
-		{"sidecar", "--namespace=store", "--max-concurrent-requests=512"},
+		{"origin", "--bucket=has space"},
+		{"origin", "--bucket=a/b"},
+		{"origin", "--bucket=one", "--bucket=two"},
+		{"origin", "--bucket=bucket", "--namespace=store"},
+		{"sidecar", "--namespace=store"},
+		{"sidecar", "--bucket=bucket"},
+		{"sidecar", "--cache=../bad"},
+		{"origin", "--bucket="},
+		{"sidecar", "--bucket=../bad"},
+		{"origin", "--bucket=bucket", "--request-timeout=0"},
+		{"sidecar", "--request-timeout=-1s"},
+		{"origin", "--bucket=bucket", "--metadata-ttl=-1s"},
+		{"origin", "--bucket=bucket", "--metadata-ttl=bad"},
+		{"origin", "--bucket=bucket", "--listen=127.0.0.1:0"},
+		{"sidecar", "--region=us-east-1"},
+		{"sidecar", "extra"},
+		{"sidecar", "--listen=0.0.0.0:8080"},
+		{"origin", "--bucket=bucket", "--max-concurrent-requests=0"},
+		{"origin", "--bucket=bucket", "--max-concurrent-requests=65537"},
+		{"origin", "--bucket=bucket", "--max-connections=128"},
+		{"sidecar", "--max-connections=0"},
+		{"sidecar", "--max-connections=-1"},
+		{"sidecar", "--max-concurrent-requests=512"},
+		{"origin", "--bucket=bucket", "--cache-uid=not-a-uid"},
+		{"origin", "--bucket=bucket", "--cache-uid=00000000-0000-4000-8000-00000000000A"},
+		{"sidecar", "--cache-uid=00000000-0000-4000-8000-00000000000a"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			if _, err := parseOptions(args, io.Discard); err == nil {
@@ -158,9 +194,9 @@ func TestHelpVersionAndRedaction(t *testing.T) {
 	}
 
 	for _, args := range [][]string{
-		{"origin", "--namespace=store", "--endpoint=https://private-token@upstream/"},
-		{"origin", "--namespace=store", "--request-timeout=private-token"},
-		{"sidecar", "--namespace=store", "--private-token"},
+		{"origin", "--bucket=bucket", "--endpoint=https://private-token@upstream/"},
+		{"origin", "--bucket=bucket", "--request-timeout=private-token"},
+		{"sidecar", "--private-token"},
 	} {
 		var output bytes.Buffer
 
@@ -266,9 +302,77 @@ func TestAWSRegionAndCredentialChain(t *testing.T) {
 	}
 }
 
-func TestPrepareOriginDirectory(t *testing.T) {
-	for _, scenario := range []string{"create", "existing", "symlink", "writable", "file", "traversal"} {
-		t.Run(scenario, func(t *testing.T) {
+func TestCheckOriginDirectory(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		setup   func(t *testing.T, cache string) []string
+		missing bool
+		ok      bool
+	}{
+		{name: "existing", ok: true, setup: func(t *testing.T, cache string) []string {
+			mkdir(t, cache, 0o755)
+			mkdir(t, filepath.Join(cache, "origin"), 0o700)
+
+			return []string{"cache", "origin"}
+		}},
+		{name: "missing leaf", missing: true, setup: func(t *testing.T, cache string) []string {
+			mkdir(t, cache, 0o755)
+
+			return []string{"cache", "origin"}
+		}},
+		{name: "missing parent", missing: true, setup: func(t *testing.T, cache string) []string {
+			return []string{"cache", "origin"}
+		}},
+		{name: "writable leaf", setup: func(t *testing.T, cache string) []string {
+			mkdir(t, cache, 0o755)
+			mkdir(t, filepath.Join(cache, "origin"), 0o777)
+
+			return []string{"cache", "origin"}
+		}},
+		{name: "writable parent", setup: func(t *testing.T, cache string) []string {
+			mkdir(t, cache, 0o777)
+			mkdir(t, filepath.Join(cache, "origin"), 0o700)
+
+			return []string{"cache", "origin"}
+		}},
+		{name: "symlink leaf", setup: func(t *testing.T, cache string) []string {
+			mkdir(t, cache, 0o755)
+
+			target := t.TempDir()
+			if err := os.Chmod(target, 0o700); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := os.Symlink(target, filepath.Join(cache, "origin")); err != nil {
+				t.Fatal(err)
+			}
+
+			return []string{"cache", "origin"}
+		}},
+		{name: "symlink parent", setup: func(t *testing.T, cache string) []string {
+			target := t.TempDir()
+			mkdir(t, filepath.Join(target, "origin"), 0o700)
+
+			if err := os.Symlink(target, cache); err != nil {
+				t.Fatal(err)
+			}
+
+			return []string{"cache", "origin"}
+		}},
+		{name: "file leaf", setup: func(t *testing.T, cache string) []string {
+			mkdir(t, cache, 0o755)
+
+			if err := os.WriteFile(filepath.Join(cache, "origin"), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			return []string{"cache", "origin"}
+		}},
+		{name: "traversal", setup: func(t *testing.T, cache string) []string {
+			return []string{"..", "escape"}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			if err := os.Chmod(dir, 0o700); err != nil {
 				t.Fatal(err)
@@ -280,61 +384,65 @@ func TestPrepareOriginDirectory(t *testing.T) {
 			}
 			defer parent.Close()
 
-			path := filepath.Join(dir, "cache")
-			parts := []string{"cache", "origin"}
+			cache := filepath.Join(dir, "cache")
+			parts := tc.setup(t, cache)
 
-			switch scenario {
-			case "existing", "writable":
-				if err := os.Mkdir(path, 0o700); err != nil {
-					t.Fatal(err)
-				}
+			before, _ := os.Lstat(cache)
 
-				if scenario == "writable" {
-					if err := os.Chmod(path, 0o777); err != nil {
-						t.Fatal(err)
-					}
-				}
-			case "symlink":
-				if err := os.Symlink(t.TempDir(), path); err != nil {
-					t.Fatal(err)
-				}
-			case "file":
-				if err := os.WriteFile(path, nil, 0o600); err != nil {
-					t.Fatal(err)
-				}
-			case "traversal":
-				parts = []string{"..", "escape"}
+			err = checkOriginDirectory(parent, parts)
+			if tc.ok != (err == nil) {
+				t.Fatalf("ok=%v, err=%v", tc.ok, err)
 			}
 
-			err = prepareOriginDirectory(parent, parts)
-			if scenario != "create" && scenario != "existing" {
-				if err == nil {
-					t.Fatal("accepted unsafe directory")
-				}
-
-				return
+			if tc.missing != errors.Is(err, errOriginDirectoryMissing) {
+				t.Fatalf("missing=%v, err=%v", tc.missing, err)
 			}
 
-			if err != nil {
-				t.Fatal(err)
+			// The origin never creates or repairs directories.
+			after, _ := os.Lstat(cache)
+			if (before == nil) != (after == nil) || (before != nil && before.Mode() != after.Mode()) {
+				t.Fatal("changed the directory tree")
 			}
 
-			if err := prepareOriginDirectory(parent, parts); err != nil {
-				t.Fatal("not idempotent", err)
-			}
-
-			info, err := os.Stat(filepath.Join(path, "origin"))
-			if err != nil || !info.IsDir() || info.Mode().Perm()&0o022 != 0 {
-				t.Fatal("unsafe created directory")
-			}
-
-			if scenario == "existing" {
-				info, err := os.Stat(path)
-				if err != nil || info.Mode().Perm() != 0o700 {
-					t.Fatal("changed existing permissions")
-				}
+			if _, statErr := os.Lstat(filepath.Join(cache, "origin")); tc.missing && !os.IsNotExist(statErr) {
+				t.Fatal("created the origin directory")
 			}
 		})
+	}
+}
+
+func TestCheckOriginDirectoryRejectsForeignLeaf(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root to chown")
+	}
+
+	dir := t.TempDir()
+	mkdir(t, filepath.Join(dir, "origin"), 0o700)
+
+	if err := os.Chown(filepath.Join(dir, "origin"), originUID, originUID); err != nil {
+		t.Fatal(err)
+	}
+
+	parent, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+
+	if err := checkOriginDirectory(parent, []string{"origin"}); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("accepted origin directory owned by another user: %v", err)
+	}
+}
+
+func mkdir(t *testing.T, path string, mode os.FileMode) {
+	t.Helper()
+
+	if err := os.Mkdir(path, mode); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -378,7 +486,7 @@ func TestSidecarLoopbackAndShutdown(t *testing.T) {
 	}
 	defer client.Close()
 
-	handler, err := racerobject.NewSidecar(client, racerobject.SidecarConfig{Namespace: "store"})
+	handler, err := racerobject.NewSidecar(client, racerobject.SidecarConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -491,7 +599,7 @@ func TestSidecarListenerErrors(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if err := run(ctx, []string{"sidecar", "--namespace=store"}, io.Discard); err != nil {
+	if err := run(ctx, []string{"sidecar"}, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -529,7 +637,7 @@ func TestSidecarShutdownReleasesSDKStream(t *testing.T) {
 		return metadata, body, nil
 	})
 
-	handler, err := racerobject.NewSidecar(client, racerobject.SidecarConfig{Namespace: "store"})
+	handler, err := racerobject.NewSidecar(client, racerobject.SidecarConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}

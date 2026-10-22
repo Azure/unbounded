@@ -597,7 +597,7 @@ func singletonHeader(name string) bool {
 	switch name {
 	case "host", "content-length", "content-type", "content-range", "etag", "if-match", "range",
 		"racer-expires-at", "racer-retain-until", "racer-content-type", "racer-metadata", "authorization", "racer-object-length",
-		"racer-range-start", "racer-range-end", "racer-page-credits", "racer-byte-credits", "racer-ordered":
+		"racer-cache", "racer-range-start", "racer-range-end", "racer-page-credits", "racer-byte-credits", "racer-ordered":
 		return true
 	default:
 		return false
@@ -659,6 +659,9 @@ type Request struct {
 	RetainSeconds                  uint64
 	Range                          Range
 	AdapterMetadata, Authorization string `json:"-"`
+	// CacheUID is the Racer-Cache header: the ClusterCache UID the dataplane
+	// expects the origin to serve. Empty when the header is absent.
+	CacheUID string `json:"-"`
 }
 
 // Format redacts request data using the SDK's diagnostic convention.
@@ -756,6 +759,7 @@ func requestFields(h http.Header) (Request, error) {
 		{"Racer-Metadata", &result.AdapterMetadata, ValidateOpaque},
 		{"Authorization", &result.Authorization, ValidateOpaque},
 		{"If-Match", &result.Pin, ValidateETag},
+		{"Racer-Cache", &result.CacheUID, ValidateOpaque},
 	} {
 		if values, ok := h[field.name]; ok {
 			*field.dest = values[0]

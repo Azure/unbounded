@@ -227,6 +227,14 @@ func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, 
 
 			agentConfig := provision.BuildAgentConfig(provision.BuildAgentConfigParams{
 				Machine: node,
+				// Pin the kubelet node name to the Machine instead of letting the
+				// host pick one from its hostname. The machina CSR approver only
+				// approves bootstrap kubelet client certs whose CN is
+				// system:node:<status.bootstrap.nodeName>, which attestation
+				// records from the same Machine view. For virtual-media first
+				// boot, the media owner lookup pins NodeName() to the name the
+				// replacement captured, so config, approval, and completion agree.
+				NodeName: node.NodeName(),
 				Cluster: provision.ClusterEndpoint{
 					APIServer:    ci.ApiserverURL,
 					CACertBase64: ci.CACertBase64,

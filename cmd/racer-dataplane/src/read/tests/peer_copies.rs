@@ -46,6 +46,8 @@ struct ScriptedPeers {
     calls: RefCell<Vec<(NodeId, bool, u32, u8, Instant)>>,
 
     local_deadlines: RefCell<Vec<(Instant, Instant)>>,
+
+    demands: RefCell<Vec<crate::peer::subscriptions::Demand>>,
 }
 impl ScriptedPeers {
     fn requester(self: &Rc<Self>) -> Rc<Requester> {
@@ -84,6 +86,9 @@ impl ScriptedPeers {
             assert_eq!(overall, request.origin.scope().deadline.0);
             self.local_deadlines.borrow_mut().push((overall, share));
             let destination = request.route.destination.clone();
+            if let PeerOperation::Subscribe { subscription, .. } = &request.operation {
+                self.demands.borrow_mut().push(subscription.demand.clone());
+            }
             self.calls.borrow_mut().push((
                 destination.clone(),
                 matches!(
@@ -256,6 +261,7 @@ fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Ve
         replies: RefCell::new(VecDeque::new()),
         calls: RefCell::new(Vec::new()),
         local_deadlines: RefCell::new(Vec::new()),
+        demands: RefCell::new(Vec::new()),
     });
     let mut dependencies = f.fill.dependencies.clone();
     dependencies.candidates = Rc::new(CandidatePolicy::new(
@@ -898,6 +904,88 @@ fn invalid_signed_selection_falls_back_without_resetting_acquisition_budget() {
             endpoint.uninstall().unwrap();
         }
     }
+}
+
+#[test]
+fn subscription_behind_remote_warm_selects_only_published_pages() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let (peers, ordered) = install_peers(&mut f, None);
+    peers
+        .replies
+        .borrow_mut()
+        .push_back((ordered[0].clone(), Reply::Copy(encrypted_copy(&mut f))));
+    let signers = network(4);
+    let (_local, mut endpoint, _published) =
+        super::hot_reads::coordinator(&f, &signers[peers.local], &f.membership, peers.requester());
+    let job = f
+        .fill
+        .dependencies
+        .metadata_owner
+        .warm
+        .begin_remote(&f.page.version, node(peers.local), f.membership.clone(), 4)
+        .unwrap();
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
+    // Page 0 starts a demand whose tail [1, 4) warm has not reached yet.
+    let demand =
+        crate::peer::subscriptions::Demand::new(vec![crate::peer::subscriptions::PageInterval {
+            start: 0,
+            end: 4,
+        }])
+        .unwrap();
+    let mut work = Box::pin(f.fill.select_subscription(
+        f.page.version.clone(),
+        demand,
+        f.membership.clone(),
+        &f.context,
+        &f.scope,
+        &mut budget,
+    ));
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    for _ in 0..64 {
+        assert!(work.as_mut().poll(&mut cx).is_pending());
+    }
+    assert!(
+        peers.calls.borrow().is_empty(),
+        "no page before the frontier"
+    );
+    crate::read::warm::WarmRegistry::publish_through(&job, 1);
+    let mut result = None;
+    for _ in 0..4096 {
+        if let Poll::Ready(value) = work.as_mut().poll(&mut cx) {
+            result = Some(value);
+            break;
+        }
+        endpoint.poll(&mut cx, 64).unwrap();
+        uring_runtime::drivers::poll(&mut cx, 64);
+        uring_runtime::group::Service::poll_budgeted(
+            &mut f.engine,
+            &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
+            64,
+        )
+        .unwrap();
+        f.crypto.poll_budgeted(64).unwrap();
+        f.reactor.poll_budgeted(64).unwrap();
+    }
+    drop(work);
+    assert_eq!(
+        result.expect("published page").unwrap().plaintext.bytes(),
+        b"abc"
+    );
+    assert_eq!(peers.calls.borrow().len(), 1);
+    assert_eq!(
+        *peers.demands.borrow(),
+        vec![
+            crate::peer::subscriptions::Demand::new(vec![
+                crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
+            ])
+            .unwrap()
+        ],
+        "the unpublished tail is not offered to the provider"
+    );
+    assert_eq!(f.origin.calls.get(), 0);
+    drop(job);
 }
 
 #[test]

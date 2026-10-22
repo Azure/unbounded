@@ -47,6 +47,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	machinav1 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
@@ -255,6 +256,8 @@ func TestRuntimeConfigDoesNotReadWorkloadOnlySettings(t *testing.T) {
 		switch key {
 		case "RACER_CLUSTER_ID":
 			return "11111111-1111-1111-1111-111111111111", true
+		case "RACER_OBJECT_IMAGE":
+			return "example.com/racer-object:test", true
 		case "RACER_CONTROL_URL", "RACER_DATAPLANE_IMAGE", "RACER_BOOTSTRAP_TRUST_CONFIGMAP":
 			t.Errorf("runtime requested workload-only setting %s", key)
 			return "invalid", true
@@ -314,6 +317,7 @@ func TestConfigDurationsUseProvidedLookup(t *testing.T) {
 		"RACER_ROTATION_INTERVAL":    "5m",
 		"RACER_ROTATION_PREPARE_FOR": "1m",
 		"RACER_ROTATION_RETAIN_FOR":  "2m",
+		"RACER_OBJECT_IMAGE":         "example.com/racer-object:test",
 	}
 	for name := range values {
 		t.Setenv(name, "invalid-process-value")
@@ -347,7 +351,7 @@ func TestConfigDurationsUseProvidedLookup(t *testing.T) {
 }
 
 func TestReplicationConfigDefaultsAndOverrides(t *testing.T) {
-	values := map[string]string{"RACER_CLUSTER_ID": string(testConfig(t).Cluster), "POD_NAMESPACE": "controllers"}
+	values := map[string]string{"RACER_CLUSTER_ID": string(testConfig(t).Cluster), "POD_NAMESPACE": "controllers", "RACER_OBJECT_IMAGE": "example.com/racer-object:test"}
 	lookup := func(key string) (string, bool) { value, ok := values[key]; return value, ok }
 
 	cfg, err := ConfigFromLookup(lookup)
@@ -897,6 +901,7 @@ func TestWorkloadDefaultsAgreeWithController(t *testing.T) {
 	values := map[string]string{
 		"RACER_CLUSTER_ID":  "11111111-1111-1111-1111-111111111111",
 		"RACER_CONTROL_URL": "https://controller:8443", "RACER_DATAPLANE_IMAGE": "racer:test",
+		"RACER_OBJECT_IMAGE": "example.com/racer-object:test",
 	}
 	lookup := func(key string) (string, bool) { value, ok := values[key]; return value, ok }
 
@@ -1112,6 +1117,7 @@ func testConfig(t *testing.T) Config {
 	t.Helper()
 	t.Setenv("RACER_CLUSTER_ID", testOtherUID)
 	t.Setenv("POD_NAMESPACE", "racer")
+	t.Setenv("RACER_OBJECT_IMAGE", "example.com/racer-object:test")
 
 	cfg, err := LoadConfig()
 	if err != nil {
@@ -1557,4 +1563,52 @@ func holdFixtureGate(t *testing.T, f *servingFixture) func() {
 	<-entered
 
 	return func() { close(release); <-done }
+}
+
+func TestWebhookConfiguration(t *testing.T) {
+	values := map[string]string{"RACER_CLUSTER_ID": testOtherUID, "RACER_OBJECT_IMAGE": "example.com/racer-object:test"}
+	lookup := func(key string) (string, bool) { value, ok := values[key]; return value, ok }
+
+	cfg, err := ConfigFromLookup(lookup)
+	require.NoError(t, err)
+	require.Equal(t, ":9443", cfg.WebhookAddress)
+	require.Equal(t, "example.com/racer-object:test", cfg.ObjectImage)
+
+	options := managerOptions(cfg, runtime.NewScheme())
+	server, ok := options.WebhookServer.(*webhook.DefaultServer)
+	require.True(t, ok)
+	require.Equal(t, webhook.Options{Port: 9443, CertDir: "/etc/racer/tls", CertName: "tls.crt", KeyName: "tls.key"}, server.Options)
+	require.False(t, server.NeedLeaderElection())
+
+	values["RACER_WEBHOOK_ADDRESS"] = "127.0.0.1:10443"
+	cfg, err = ConfigFromLookup(lookup)
+	require.NoError(t, err)
+
+	server = managerOptions(cfg, runtime.NewScheme()).WebhookServer.(*webhook.DefaultServer)
+	require.Equal(t, "127.0.0.1", server.Options.Host)
+	require.Equal(t, 10443, server.Options.Port)
+
+	for _, address := range []string{"", "9443", ":0", ":65536", ":https", "host:-1"} {
+		values["RACER_WEBHOOK_ADDRESS"] = address
+		_, err = ConfigFromLookup(lookup)
+		require.ErrorContains(t, err, "WebhookAddress", address)
+	}
+
+	values["RACER_WEBHOOK_ADDRESS"] = ":9443"
+
+	for _, image := range []string{"", "  "} {
+		values["RACER_OBJECT_IMAGE"] = image
+		_, err = ConfigFromLookup(lookup)
+		require.ErrorContains(t, err, "ObjectImage")
+	}
+
+	delete(values, "RACER_OBJECT_IMAGE")
+
+	_, err = ConfigFromLookup(lookup)
+	require.ErrorContains(t, err, "ObjectImage")
+
+	values["RACER_OBJECT_IMAGE"] = "example.com/racer-object:test"
+	values["RACER_TLS_PRIVATE_KEY_FILE"] = "/other/tls.key"
+	_, err = ConfigFromLookup(lookup)
+	require.ErrorContains(t, err, "share a directory")
 }
