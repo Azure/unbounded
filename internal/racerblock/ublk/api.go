@@ -20,7 +20,9 @@ const (
 	// MaxQueues is UBLK_MAX_NR_QUEUES.
 	MaxQueues = 4096
 
-	defaultDepth      = 128
+	// DefaultDepth is the per-queue depth used when Config.Depth is 0.
+	DefaultDepth = 128
+
 	defaultMaxQueues  = 4
 	defaultMaxIOBytes = 1 << 20
 	sectorSize        = 512
@@ -29,6 +31,11 @@ const (
 	// (UBLK_IO_BUF_BITS = 25, i.e. 32 MiB).
 	maxIOBytesLimit = 1 << 25
 )
+
+// DefaultQueues returns the queue count used when Config.Queues is 0.
+func DefaultQueues() int {
+	return min(runtime.NumCPU(), defaultMaxQueues)
+}
 
 // Handler serves device reads. ReadAt must fill all of p with device bytes
 // starting at off. It may block. It is called concurrently from worker
@@ -60,7 +67,7 @@ func (cfg Config) withDefaults() (Config, error) {
 	}
 
 	if cfg.Queues == 0 {
-		cfg.Queues = min(runtime.NumCPU(), defaultMaxQueues)
+		cfg.Queues = DefaultQueues()
 	}
 
 	if cfg.Queues < 0 || cfg.Queues > MaxQueues {
@@ -68,7 +75,7 @@ func (cfg Config) withDefaults() (Config, error) {
 	}
 
 	if cfg.Depth == 0 {
-		cfg.Depth = defaultDepth
+		cfg.Depth = DefaultDepth
 	}
 
 	if cfg.Depth < 0 || cfg.Depth > MaxQueueDepth {
