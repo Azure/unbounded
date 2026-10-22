@@ -12,7 +12,7 @@
 //! There is one persistent, bidirectional RC queue pair (QP) per (peer, rail)
 //! and one node-wide pool of registered page buffers per rail.
 //!
-//! 1. Call [`node`] to get one [`Client`] per I/O worker and an [`OwnerPort`].
+//! 1. Call [`node()`] to get one [`Client`] per I/O worker and an [`OwnerPort`].
 //! 2. On the native thread, build the [`Owner`] and poll it, or host it in a
 //!    `uring-runtime` service with [`WithNative::with_host`].
 //! 3. Call [`Client::activate`] with a [`NodeConfig`]. The owner finds RDMA

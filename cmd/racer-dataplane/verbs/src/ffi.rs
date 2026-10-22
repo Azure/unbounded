@@ -196,7 +196,7 @@ pub(crate) struct Failure {
     /// Work request id of the failed completion.
     pub(crate) id: u64,
 
-    /// Verbs status, for example [`status::RNR_RETRY_EXC_ERR`]. 0 means the
+    /// Verbs status, for example `IBV_WC_RNR_RETRY_EXC_ERR`. 0 means the
     /// completion succeeded but did not match any posted work.
     pub(crate) status: u32,
 
