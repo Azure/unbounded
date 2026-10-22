@@ -449,24 +449,27 @@ func (d *Device) teardown(cause error) {
 }
 
 // stopCause returns the cause to record for a teardown that was started
-// because of cause. A queue failure recorded by fail wins over a nil or
-// context cause, since Close or cancellation can start teardown before
-// the failure's own teardown runs. Call it after every queue has exited
-// so that late failures are included.
+// because of cause. Close or cancellation can start teardown before the
+// teardown that fail scheduled runs, so the first queue failure recorded
+// by fail replaces a nil cause or an exact context.Canceled or
+// context.DeadlineExceeded from watch. Any other cause that differs from
+// the recorded failure is joined after it, so neither is lost. Call it
+// after every queue has exited so late failures are included.
 func (d *Device) stopCause(cause error) error {
 	d.startMu.Lock()
 	failErr := d.failErr
 	d.startMu.Unlock()
 
-	if failErr == nil {
+	switch {
+	case failErr == nil:
 		return cause
-	}
-
-	if cause == nil || errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) {
+	case cause == nil, cause == context.Canceled, cause == context.DeadlineExceeded: //nolint:errorlint // watch passes ctx.Err() unwrapped
 		return failErr
+	case errors.Is(cause, failErr):
+		return cause
+	default:
+		return errors.Join(failErr, cause)
 	}
-
-	return cause
 }
 
 // ID returns the kernel device id.
