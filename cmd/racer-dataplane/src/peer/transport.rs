@@ -266,11 +266,6 @@ impl Transfers {
         )
     }
 
-    /// Sender side of one page: write into the receiver's signed grant with
-    /// immediate, then send one signed response head, `Complete`, or release
-    /// the grant and fall back to the HTTP body (`designs/racer-rdma-sessions.md`,
-    /// "Per-page protocol"). Every granted tag gets exactly one write or release
-    /// unless the link breaks, which fences everything.
     /// Record an RDMA transfer stage when native links exist.
     fn record_rdma_stage(&self, count: Event, sum: Event, start: std::time::Instant) {
         if let Some(links) = &self.links {
@@ -278,6 +273,11 @@ impl Transfers {
         }
     }
 
+    /// Sender side of one page: write into the receiver's signed grant with
+    /// immediate, then send one signed response head, `Complete`, or release
+    /// the grant and fall back to the HTTP body (`designs/racer-rdma-sessions.md`,
+    /// "Per-page protocol"). Every granted tag gets exactly one write or release
+    /// unless the link breaks, which fences everything.
     pub(super) async fn send_native(
         &self,
         connection: ConnectionLease,

@@ -887,7 +887,6 @@ impl CiphertextPage {
     /// multiple of `alignment.memory()` and whose padded length is a multiple
     /// of `alignment.length()`. The slice starts with [`Self::bytes`] and is
     /// followed only by zeros. Callers must copy when this returns `None`.
-    #[allow(dead_code)] // Consumed by the store's zero-copy write path.
     pub(crate) fn disk_body(&self, alignment: page_alloc::Alignment) -> Option<&[u8]> {
         let CiphertextStorage::Aligned { buffer, .. } = &self.inner.storage else {
             return None;
@@ -898,7 +897,7 @@ impl CiphertextPage {
         .then_some(padded)
     }
     /// Whether [`Self::disk_body`] is available for `alignment`.
-    #[allow(dead_code)] // Consumed by the store's zero-copy write path.
+    #[cfg(test)]
     pub(crate) fn is_disk_aligned(&self, alignment: page_alloc::Alignment) -> bool {
         self.disk_body(alignment).is_some()
     }
