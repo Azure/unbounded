@@ -1110,14 +1110,116 @@ impl Entries {
             .collect()
     }
 }
+/// Unverified original ciphertext keyed by page, with a monotonic touch tick
+/// per entry so idle expiry can find the least recently touched entries.
+/// Reads go through `Deref`; every mutation goes through these methods so the
+/// tick index never drifts from the entries.
+#[derive(Default)]
+struct CiphertextEntries {
+    pages: BTreeMap<PageId, UnverifiedPage>,
+    ticks: HashMap<PageId, u64>,
+    order: BTreeMap<u64, PageId>,
+    clock: u64,
+}
+impl std::ops::Deref for CiphertextEntries {
+    type Target = BTreeMap<PageId, UnverifiedPage>;
+    fn deref(&self) -> &Self::Target {
+        &self.pages
+    }
+}
+impl CiphertextEntries {
+    fn touch(&mut self, id: &PageId) {
+        if !self.pages.contains_key(id) {
+            return;
+        }
+        // Wrapping is unreachable in practice (2^64 touches); saturating keeps
+        // the index consistent even then, at worst making order ambiguous.
+        self.clock = self.clock.saturating_add(1);
+        if let Some(old) = self.ticks.insert(id.clone(), self.clock) {
+            self.order.remove(&old);
+        }
+        self.order.insert(self.clock, id.clone());
+    }
+    fn insert(&mut self, id: PageId, page: UnverifiedPage) {
+        self.pages.insert(id.clone(), page);
+        self.touch(&id);
+    }
+    fn remove(&mut self, id: &PageId) -> Option<UnverifiedPage> {
+        let page = self.pages.remove(id)?;
+        if let Some(tick) = self.ticks.remove(id) {
+            self.order.remove(&tick);
+        }
+        Some(page)
+    }
+    fn retain(&mut self, mut keep: impl FnMut(&PageId) -> bool) {
+        let removed: Vec<_> = self.pages.keys().filter(|id| !keep(id)).cloned().collect();
+        for id in removed {
+            self.remove(&id);
+        }
+    }
+}
+
+/// Entries nobody inserted or hit for this long are released by
+/// [`MemoryCache::expire_idle`], so a worker that served a burst does not keep
+/// its cached pages (and their pooled buffers) forever. Busy workers keep hot
+/// pages because every hit renews them.
+pub(crate) const CACHE_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Minimum spacing of the clock checkpoints that map wall time to LRU ticks.
+const CACHE_EXPIRY_CHECKPOINT: std::time::Duration = std::time::Duration::from_secs(1);
+/// Upper bound of entries examined per class by one `expire_idle` call.
+pub(crate) const CACHE_EXPIRY_BATCH: usize = 32;
+
+/// Time-to-tick checkpoints and resumable expiry cursors. Between checkpoints
+/// with no pass in progress, `expire_idle` does constant work.
+#[derive(Default)]
+struct Expiry {
+    /// `(time, plaintext clock, ciphertext clock)`, oldest first. The front is
+    /// kept as the newest checkpoint at least `CACHE_IDLE_TTL` old.
+    checkpoints: std::collections::VecDeque<(std::time::Instant, u64, u64)>,
+    /// Last examined tick of an in-progress pass; `None` when no pass is due.
+    plaintext: Option<u64>,
+    ciphertext: Option<u64>,
+}
+impl Expiry {
+    /// Record a checkpoint at most once per interval and return the tick
+    /// cutoffs, if any checkpoint is at least `CACHE_IDLE_TTL` old.
+    fn advance(
+        &mut self,
+        now: std::time::Instant,
+        plaintext: u64,
+        ciphertext: u64,
+    ) -> Option<(u64, u64)> {
+        if self
+            .checkpoints
+            .back()
+            .is_none_or(|(at, _, _)| now.saturating_duration_since(*at) >= CACHE_EXPIRY_CHECKPOINT)
+        {
+            self.checkpoints.push_back((now, plaintext, ciphertext));
+            // Each new checkpoint may move the cutoff: start a fresh pass that
+            // also revisits entries that were busy last time.
+            self.plaintext = Some(0);
+            self.ciphertext = Some(0);
+        }
+        let old = |at: &std::time::Instant| now.saturating_duration_since(*at) >= CACHE_IDLE_TTL;
+        while self.checkpoints.get(1).is_some_and(|(at, _, _)| old(at)) {
+            self.checkpoints.pop_front();
+        }
+        self.checkpoints
+            .front()
+            .filter(|(at, _, _)| old(at))
+            .map(|(_, plaintext, ciphertext)| (*plaintext, *ciphertext))
+    }
+}
+
 /// Worker-local idle verified pages and original ciphertext; independent of disk clock.
 pub struct MemoryCache {
     // BufferPool holds only shared handles; do not retain a second Rc layer.
     pool: BufferPool,
     entries: RefCell<Entries>,
-    ciphertext_entries: RefCell<BTreeMap<PageId, UnverifiedPage>>,
+    ciphertext_entries: RefCell<CiphertextEntries>,
     ciphertext_cursor: RefCell<Option<PageId>>,
     availability: Rc<crate::control::Availability>,
+    expiry: RefCell<Expiry>,
 }
 
 /// One bounded view of the LRU clock. Touches and insertions after this cut are
@@ -1190,9 +1292,10 @@ impl MemoryCache {
         Self {
             pool,
             entries: RefCell::new(Entries::default()),
-            ciphertext_entries: RefCell::new(BTreeMap::new()),
+            ciphertext_entries: RefCell::new(CiphertextEntries::default()),
             ciphertext_cursor: RefCell::new(None),
             availability,
+            expiry: RefCell::new(Expiry::default()),
         }
     }
     fn available(&self, page: &PageResult) -> bool {
@@ -1235,6 +1338,7 @@ impl MemoryCache {
         }) {
             entries.remove(page);
         }
+        entries.touch(page);
         Ok(entries.get(page).cloned())
     }
     pub(crate) fn publish_ciphertext(&self, mut page: UnverifiedPage) -> Result<()> {
@@ -1437,7 +1541,7 @@ impl MemoryCache {
     pub(crate) fn remove_cache(&self, cache: &CacheId) -> Result<()> {
         self.ciphertext_entries
             .borrow_mut()
-            .retain(|id, _| &id.version.object.cache != cache);
+            .retain(|id| &id.version.object.cache != cache);
         let mut entries = self.entries.borrow_mut();
         let removed: Vec<_> = entries
             .pages
@@ -1449,6 +1553,65 @@ impl MemoryCache {
             entries.remove(&id);
         }
         Ok(())
+    }
+    /// Release entries not inserted or hit for at least `CACHE_IDLE_TTL`,
+    /// skipping any still referenced elsewhere (retried on the next pass).
+    /// Examines at most `CACHE_EXPIRY_BATCH` entries per class per call and
+    /// returns the number of entries released. Freed buffers return to the
+    /// pools, whose own maintenance decays them.
+    pub(crate) fn expire_idle(&self, now: std::time::Instant) -> usize {
+        let mut expiry = self.expiry.borrow_mut();
+        let plaintext_clock = self.entries.borrow().clock;
+        let ciphertext_clock = self.ciphertext_entries.borrow().clock;
+        let Some((plaintext_cutoff, ciphertext_cutoff)) =
+            expiry.advance(now, plaintext_clock, ciphertext_clock)
+        else {
+            return 0;
+        };
+        let mut released = 0;
+        if let Some(after) = expiry.plaintext {
+            let mut entries = self.entries.borrow_mut();
+            let selected: Vec<_> = entries
+                .lru
+                .range((
+                    std::ops::Bound::Excluded(after),
+                    std::ops::Bound::Included(plaintext_cutoff),
+                ))
+                .take(CACHE_EXPIRY_BATCH)
+                .map(|(tick, id)| (*tick, id.clone()))
+                .collect();
+            expiry.plaintext = (selected.len() == CACHE_EXPIRY_BATCH)
+                .then(|| selected.last().map(|(tick, _)| *tick))
+                .flatten();
+            for (_, id) in selected {
+                if idle(&entries.pages[&id].1) {
+                    entries.remove(&id);
+                    released += 1;
+                }
+            }
+        }
+        if let Some(after) = expiry.ciphertext {
+            let mut entries = self.ciphertext_entries.borrow_mut();
+            let selected: Vec<_> = entries
+                .order
+                .range((
+                    std::ops::Bound::Excluded(after),
+                    std::ops::Bound::Included(ciphertext_cutoff),
+                ))
+                .take(CACHE_EXPIRY_BATCH)
+                .map(|(tick, id)| (*tick, id.clone()))
+                .collect();
+            expiry.ciphertext = (selected.len() == CACHE_EXPIRY_BATCH)
+                .then(|| selected.last().map(|(tick, _)| *tick))
+                .flatten();
+            for (_, id) in selected {
+                if Arc::strong_count(&entries[&id].copy.ciphertext.inner) == 1 {
+                    entries.remove(&id);
+                    released += 1;
+                }
+            }
+        }
+        released
     }
     fn reclaim_ciphertext(&self, cache: Option<&CacheId>, bytes: usize) -> usize {
         let mut entries = self.ciphertext_entries.borrow_mut();
@@ -1776,6 +1939,127 @@ pub(crate) mod tests {
                 assert_eq!(cache.entries.borrow().reclaim_after, 3);
                 assert!(cache.entries.borrow().pages.contains_key(&c));
                 drop(held);
+            }
+
+            /// Run `expire_idle` once per checkpoint interval up to `until`.
+            fn expire_through(
+                cache: &MemoryCache,
+                start: std::time::Instant,
+                until: std::time::Duration,
+            ) -> usize {
+                let mut released = 0;
+                let mut at = std::time::Duration::ZERO;
+                while at <= until {
+                    released += cache.expire_idle(start + at);
+                    at += CACHE_EXPIRY_CHECKPOINT;
+                }
+                released
+            }
+
+            #[test]
+            fn expire_idle_releases_untouched_entries_and_keeps_recent_hits() {
+                let admission = admission(8);
+                let cache = MemoryCache::new(
+                    BufferPool::new(admission.clone()),
+                    crate::test_support::availability(),
+                );
+                let start = std::time::Instant::now();
+                let cold = publish(&cache, &admission, "cold");
+                let hot = publish(&cache, &admission, "hot");
+                let cipher = publish_ciphertext(&cache, &admission, "cipher");
+                let touched = publish_ciphertext(&cache, &admission, "touched");
+                // Nothing is old enough yet.
+                assert_eq!(expire_through(&cache, start, CACHE_IDLE_TTL / 2), 0);
+                // Hits halfway through renew both classes.
+                assert!(cache.get(&hot).unwrap().is_some());
+                assert!(cache.unverified(&touched).unwrap().is_some());
+                let half = start + CACHE_IDLE_TTL / 2;
+                assert_eq!(expire_through(&cache, half, CACHE_IDLE_TTL / 2), 2);
+                assert!(!cache.entries.borrow().pages.contains_key(&cold));
+                assert!(cache.entries.borrow().pages.contains_key(&hot));
+                assert!(!cache.ciphertext_entries.borrow().contains_key(&cipher));
+                assert!(cache.ciphertext_entries.borrow().contains_key(&touched));
+                // Without further hits the renewed entries expire one TTL later.
+                assert_eq!(
+                    expire_through(&cache, start + CACHE_IDLE_TTL, CACHE_IDLE_TTL),
+                    2
+                );
+                assert_eq!(cache.entries.borrow().len(), 0);
+                assert_eq!(cache.ciphertext_entries.borrow().len(), 0);
+                let entries = cache.ciphertext_entries.borrow();
+                assert!(entries.order.is_empty() && entries.ticks.is_empty());
+                drop(entries);
+                assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+            }
+
+            #[test]
+            fn expire_idle_skips_entries_in_use_until_released() {
+                let admission = admission(8);
+                let cache = MemoryCache::new(
+                    BufferPool::new(admission.clone()),
+                    crate::test_support::availability(),
+                );
+                let start = std::time::Instant::now();
+                let page = publish(&cache, &admission, "page");
+                let cipher = publish_ciphertext(&cache, &admission, "cipher");
+                let held = cache.entries.borrow().pages[&page].1.ciphertext.clone();
+                let held_cipher = cache.ciphertext_entries.borrow()[&cipher]
+                    .copy
+                    .ciphertext
+                    .clone();
+                assert_eq!(expire_through(&cache, start, CACHE_IDLE_TTL * 2), 0);
+                assert_eq!(cache.entries.borrow().len(), 1);
+                assert_eq!(cache.ciphertext_entries.borrow().len(), 1);
+                drop((held, held_cipher));
+                // The next checkpoint pass revisits and releases them.
+                let later = start + CACHE_IDLE_TTL * 2 + CACHE_EXPIRY_CHECKPOINT;
+                assert_eq!(cache.expire_idle(later), 2);
+                assert_eq!(cache.entries.borrow().len(), 0);
+                assert_eq!(cache.ciphertext_entries.borrow().len(), 0);
+            }
+
+            #[test]
+            fn expire_idle_bounds_work_per_call() {
+                let count = CACHE_EXPIRY_BATCH * 2 + 3;
+                let admission = admission(count * 2 + 8);
+                let cache = MemoryCache::new(
+                    BufferPool::new(admission.clone()),
+                    crate::test_support::availability(),
+                );
+                for n in 0..count {
+                    publish(&cache, &admission, &format!("p{n:03}"));
+                    publish_ciphertext(&cache, &admission, &format!("c{n:03}"));
+                }
+                let start = std::time::Instant::now();
+                assert_eq!(cache.expire_idle(start), 0);
+                let expired = start + CACHE_IDLE_TTL;
+                assert_eq!(cache.expire_idle(expired), CACHE_EXPIRY_BATCH * 2);
+                assert_eq!(cache.expire_idle(expired), CACHE_EXPIRY_BATCH * 2);
+                assert_eq!(cache.expire_idle(expired), 6);
+                // The pass is finished: further calls in this interval do no work.
+                assert_eq!(cache.expire_idle(expired), 0);
+                assert_eq!(cache.expiry.borrow().plaintext, None);
+                assert_eq!(cache.expiry.borrow().ciphertext, None);
+                assert_eq!(cache.entries.borrow().len(), 0);
+                assert_eq!(cache.ciphertext_entries.borrow().len(), 0);
+            }
+
+            #[test]
+            fn expiry_checkpoints_stay_bounded() {
+                let admission = admission(8);
+                let cache = MemoryCache::new(
+                    BufferPool::new(admission.clone()),
+                    crate::test_support::availability(),
+                );
+                let start = std::time::Instant::now();
+                expire_through(&cache, start, CACHE_IDLE_TTL * 10);
+                // Calls within one interval do not add checkpoints.
+                for _ in 0..10 {
+                    cache.expire_idle(start + CACHE_IDLE_TTL * 10);
+                }
+                let limit =
+                    (CACHE_IDLE_TTL.as_secs() / CACHE_EXPIRY_CHECKPOINT.as_secs()) as usize + 2;
+                assert!(cache.expiry.borrow().checkpoints.len() <= limit);
             }
 
             #[test]
