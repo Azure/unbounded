@@ -72,6 +72,9 @@ REQUIRED_ublk=(
 	TestIntegrationContextCancel
 	TestIntegrationFixedIDAndDelete
 	TestIntegrationStartValidation
+	TestIntegrationDeleteStale
+	TestIntegrationStartCancelDuringStartup
+	TestIntegrationStartCancelBeforeStartDev
 	TestIntegrationStartupFetchRejected
 	TestIntegrationStartupQueueFailsBeforeStartDev
 	TestIntegrationStartupQueueFailsAtStartDev
@@ -87,7 +90,7 @@ REQUIRED_racerblock=(
 # The only tests allowed to skip. They need manual setup (UBLK_TEST_FIO=1 or
 # UBLK_TEST_DELETE_IDS) and are not run by CI. Any other skip fails, which
 # covers a missing root, ublk, io_uring, or RACER_BLOCK_TEST_VM.
-ALLOWED_SKIPS='TestIntegrationDeleteIDs|TestIntegrationDeleteStale|TestIntegrationFio'
+ALLOWED_SKIPS='TestIntegrationDeleteIDs|TestIntegrationFio'
 
 # Go prints a skip reason before "--- SKIP", so these are matched anywhere.
 FATAL_SKIP_PATTERN='RACER_BLOCK_TEST_VM=1|requires root|/dev/ublk-control unavailable|io_uring unavailable'
@@ -108,18 +111,18 @@ require_tools() {
 	fi
 }
 
-# suite_section LOG NAME prints the output of one suite.
+# suite_section TEXT NAME prints the output of one suite.
 suite_section() {
-	tr -d '\r' <"$1" | awk -v n="$2" '
+	awk -v n="$2" '
 		$0 == "RACER_BLOCK_SUITE_START " n { on = 1; next }
 		on && index($0, "RACER_BLOCK_SUITE_RESULT " n " ") == 1 { exit }
-		on { print }'
+		on { print }' <<<"$1"
 }
 
 # check_results LOG QEMU_STATUS prints a verdict and returns nonzero unless
 # QEMU exited zero and every suite fully passed.
 check_results() {
-	local console="$1" qemu_status="${2:-0}" spec name status section test required rc=0
+	local console="$1" qemu_status="${2:-0}" spec name status section test required text bad rc=0
 	[[ -f "$console" ]] || {
 		log "error: console log $console missing"
 		return 1
@@ -128,24 +131,28 @@ check_results() {
 		log "error: QEMU exited $qemu_status"
 		rc=1
 	fi
-	if tr -d '\r' <"$console" | grep -qE 'Kernel panic|BUG: |Oops: |RACER_BLOCK_GUEST_FATAL'; then
+	# Read the log once. Searching a variable avoids pipelines where an early
+	# exit (grep -q, head) makes pipefail report SIGPIPE instead of the match.
+	text="$(tr -d '\r' <"$console")"
+	if grep -qE 'Kernel panic|BUG: |Oops: |RACER_BLOCK_GUEST_FATAL' <<<"$text"; then
 		log "error: guest reported a fatal error:"
-		tr -d '\r' <"$console" | grep -E 'Kernel panic|BUG: |Oops: |RACER_BLOCK_GUEST_FATAL' | head -n 20 >&2
+		grep -m 20 -E 'Kernel panic|BUG: |Oops: |RACER_BLOCK_GUEST_FATAL' <<<"$text" >&2
 		rc=1
 	fi
-	if tr -d '\r' <"$console" | grep -qE "$FATAL_SKIP_PATTERN"; then
+	if grep -qE "$FATAL_SKIP_PATTERN" <<<"$text"; then
 		log "error: a test reported missing root, ublk, io_uring, or RACER_BLOCK_TEST_VM:"
-		tr -d '\r' <"$console" | grep -E "$FATAL_SKIP_PATTERN" | head -n 20 >&2
+		grep -m 20 -E "$FATAL_SKIP_PATTERN" <<<"$text" >&2
 		rc=1
 	fi
-	if tr -d '\r' <"$console" | grep -E '^ *--- SKIP: ' |
-		grep -vE "^ *--- SKIP: ($ALLOWED_SKIPS)( |/)" | head -n 20 | grep . >&2; then
+	bad="$(grep -E '^ *--- SKIP: ' <<<"$text" | grep -vE "^ *--- SKIP: ($ALLOWED_SKIPS)( |/)" || true)"
+	if [[ -n "$bad" ]]; then
+		grep -m 20 . <<<"$bad" >&2
 		log "error: tests above skipped and are not manual-only"
 		rc=1
 	fi
 	for spec in "${SUITES[@]}"; do
 		name="${spec%%|*}"
-		status="$(tr -d '\r' <"$console" | sed -n "s/^RACER_BLOCK_SUITE_RESULT ${name} \([0-9][0-9]*\)$/\1/p" | tail -n 1)"
+		status="$(sed -n "s/^RACER_BLOCK_SUITE_RESULT ${name} \([0-9][0-9]*\)$/\1/p" <<<"$text" | tail -n 1)"
 		if [[ -z "$status" ]]; then
 			log "error: suite $name reported no result (guest crash or timeout)"
 			rc=1
@@ -154,7 +161,7 @@ check_results() {
 			log "error: suite $name exited $status"
 			rc=1
 		fi
-		section="$(suite_section "$console" "$name")"
+		section="$(suite_section "$text" "$name")"
 		if ! grep -qx 'PASS' <<<"$section"; then
 			log "error: suite $name did not print PASS"
 			rc=1
@@ -168,7 +175,7 @@ check_results() {
 		done
 		((rc == 0)) && log "suite $name passed"
 	done
-	if ! tr -d '\r' <"$console" | grep -qx 'RACER_BLOCK_GUEST_DONE'; then
+	if ! grep -qx 'RACER_BLOCK_GUEST_DONE' <<<"$text"; then
 		log "error: guest did not finish"
 		rc=1
 	fi
@@ -389,6 +396,28 @@ self_test() {
 	expect 1 e2e-skip
 	skip_log TestIntegrationContextCancel "some new reason" >"$dir/unknown-skip.log"
 	expect 1 unknown-skip
+	skip_log TestIntegrationDeleteStale "/dev/ublk-control unavailable: no such file or directory" |
+		grep -v 'ublk-control unavailable' >"$dir/stale-skip.log"
+	expect 1 stale-skip
+	# Large logs: an early fatal marker or skip followed by over 1 MiB of
+	# passing output must still be found.
+	{
+		echo 'RACER_BLOCK_GUEST_FATAL early'
+		awk 'BEGIN { for (i = 0; i < 30000; i++) print "    integration_linux_test.go:1: passing output line padding" }'
+		pass_log
+	} >"$dir/large-fatal.log"
+	expect 1 large-fatal
+	{
+		printf -- '--- SKIP: TestSomethingNew (0.00s)\n'
+		awk 'BEGIN { for (i = 0; i < 30000; i++) print "    integration_linux_test.go:1: passing output line padding" }'
+		pass_log
+	} >"$dir/large-skip.log"
+	expect 1 large-skip
+	{
+		awk 'BEGIN { for (i = 0; i < 30000; i++) print "    integration_linux_test.go:1: passing output line padding" }'
+		pass_log
+	} >"$dir/large-pass.log"
+	expect 0 large-pass
 	pass_log | grep -v 'TestIntegrationStartupBrokenRingAtStartDev' >"$dir/missing-startup.log"
 	expect 1 missing-startup
 	pass_log | grep -vx 'PASS' >"$dir/no-pass.log"
