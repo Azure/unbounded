@@ -315,8 +315,8 @@ func TestIntegrationReadOnlyDevice(t *testing.T) {
 	})
 }
 
-// blockedReadOff is the offset of the user read that blockingHandler
-// blocks. Startup partition scans never read it.
+// blockedReadOff keeps the blocked test read away from the start and end
+// of the zero-filled test device.
 const blockedReadOff = 512 << 10
 
 // blockingHandler serves zeros until armed, then blocks reads at
