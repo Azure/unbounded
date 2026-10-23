@@ -139,7 +139,8 @@ pub trait Policy: 'static {
 
     /// Return the relative fair-share weight of a key. A key's share of a
     /// class is `limit * weight / sum(weights of active keys)`, still bounded
-    /// below by `floor`. Weight 0 grants no guaranteed share beyond the floor.
+    /// below by `floor` and, for weighted classes, by `progress` capped at the
+    /// equal split. Weight 0 grants no guaranteed share beyond those bounds.
     /// When every active weight is 0, active keys share equally. Values above
     /// `u32::MAX` are clamped. Weights are sampled when a key becomes active
     /// and again on each `Quotas::reweigh`.

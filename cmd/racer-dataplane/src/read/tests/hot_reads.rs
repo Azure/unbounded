@@ -1056,7 +1056,7 @@ fn zero_priority_read_beside_active_cache_progresses_while_first_page_is_held() 
         pump_worker(endpoint, &mut f.engine, &f.crypto, &f.reactor);
     };
     let mut held = Vec::new();
-    // Hold every delivered page: the head plus its read-ahead must all succeed.
+    // Keep one delivered page held while the next one arrives; each page must succeed.
     for number in 0..4 {
         let mut reader = None;
         for _ in 0..2048 {

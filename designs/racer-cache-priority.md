@@ -113,16 +113,18 @@ Plaintext and ciphertext flow control give each cache a fair limit. The equal
 split is replaced by:
 
 ```
-cache_limit = clamp(limit * w / W, floor, limit)
+equal = limit / active_caches
+cache_limit = clamp(max(limit * w / W, min(progress, equal)), floor, limit)
 ```
 
-Priority 0 keeps only the floor allowance, so the cache can still make
-progress.
+Plaintext and ciphertext are also request working memory. `progress` is one
+range window plus one page, the same amount config validation requires of the
+whole budget (dirty ciphertext has none). So priority 0 keeps
+`min(progress, equal)`, or the floor if that is larger.
 
-Plaintext and ciphertext are also request working memory. Weights never cut a
-cache below its request allowance: one range window plus one page, the same
-amount config validation requires of the whole budget. This allowance is
-capped at the equal split across active caches.
+This does not promise that every read makes progress. With many active caches
+or a small total budget, the equal split can be smaller than `progress`, and a
+read can still be rejected with Overloaded.
 
 Only page cache memory classes (plaintext, ciphertext, and dirty ciphertext)
 are weighted. Request-serving classes (request context, registered buffers,
