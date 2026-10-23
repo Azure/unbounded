@@ -3577,9 +3577,9 @@ pub mod descriptor {
 
         /// Wait up to 5s for a full peer close.
         ///
-        /// Other tests spawn processes. A child briefly holds copies of every
-        /// descriptor until exec closes them, so dropping a test socket may not
-        /// close it at once.
+        /// Other tests spawn processes. A new child holds copies of the parent's
+        /// descriptors until exec, which closes those marked close-on-exec. So
+        /// dropping a test socket may not close it at once.
         pub(super) fn eventually_disconnected(fd: &Descriptor) -> bool {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
@@ -3603,7 +3603,23 @@ pub mod descriptor {
             assert!(!fd.peer_disconnected());
             assert!(!fd.peer_read_closed());
             drop(copy);
-            assert!(fd.peer_disconnected());
+            assert!(eventually_disconnected(&fd));
+        }
+
+        #[test]
+        /// Wait through a peer copy that another thread closes later.
+        fn eventually_disconnected_waits_for_late_peer_copy_close() {
+            let (left, right) = std::os::unix::net::UnixStream::pair().unwrap();
+            let fd = Descriptor::from(left);
+            let copy = right.try_clone().unwrap();
+            drop(right);
+            assert!(!fd.peer_disconnected());
+            let closer = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                drop(copy);
+            });
+            assert!(eventually_disconnected(&fd));
+            closer.join().unwrap();
         }
 
         #[cfg(feature = "simulation")]
