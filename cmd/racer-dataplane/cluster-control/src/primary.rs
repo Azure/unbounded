@@ -145,6 +145,25 @@ struct Term_ {
     publish: Signal,
     seat_observer: RefCell<Observer>,
     webhook_retired: RetiredTrust,
+    /// After a commit: (committed sequence, replaced sequence, grace end).
+    /// Seats still at the replaced sequence count as ready until then.
+    ready_floor: Cell<Option<(u64, u64, Instant)>>,
+}
+
+/// How long after a commit seats still READY at the replaced sequence count
+/// as ready. Covers seats' rate-limited READY updates and pass debouncing so
+/// discovery and the webhook EndpointSlice do not briefly empty.
+const READY_FLOOR_GRACE: Duration = limits::LEASE_RENEW;
+
+/// The replaced sequence still accepted as ready, if the stored floor is for
+/// the sequence currently served and its grace has not ended.
+pub(crate) fn ready_floor(
+    stored: Option<(u64, u64, Instant)>,
+    current: Option<u64>,
+    now: Instant,
+) -> Option<u64> {
+    let (committed, previous, until) = stored?;
+    (current == Some(committed) && now < until).then_some(previous)
 }
 
 async fn lead(shared: &Rc<Shared>, seat: &Rc<Seat>, object: Value, started: Instant) {
@@ -167,6 +186,7 @@ async fn lead(shared: &Rc<Shared>, seat: &Rc<Seat>, object: Value, started: Inst
         publish: Signal::default(),
         seat_observer: RefCell::new(Observer::default()),
         webhook_retired: RefCell::new(BTreeMap::new()),
+        ready_floor: Cell::new(None),
     });
     // Held for the whole term: shutdown waits until the loop exits and the
     // release PUT below completes, even if the seat is cleared first.
@@ -711,7 +731,7 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
                 install_record(shared, c, read_started)?;
                 install_image(shared, image);
             }
-            update_discovery(t, &live, desired, eligible, None).await;
+            update_discovery(t, &live, desired, eligible).await;
             return Ok(());
         }
         if let Some(c) = &current {
@@ -744,10 +764,14 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
             Ok(_) => {
                 // Seats learn the new record after this pass, so a seat
                 // still at the sequence this commit replaced keeps serving.
-                let floor = current.as_ref().map(|c| c.sequence);
+                t.ready_floor.set(
+                    current
+                        .as_ref()
+                        .map(|c| (next.sequence, c.sequence, started + READY_FLOOR_GRACE)),
+                );
                 install_record(shared, next, started)?;
                 install_image(shared, image);
-                update_discovery(t, &live, desired, eligible, floor).await;
+                update_discovery(t, &live, desired, eligible).await;
                 return Ok(());
             }
             Err(KubeError::Conflict) if attempts < 3 => continue,
@@ -776,10 +800,10 @@ async fn update_discovery(
     live: &BTreeMap<usize, LeaseObservation>,
     desired: usize,
     eligible: usize,
-    previous: Option<u64>,
 ) {
     let shared = &t.shared;
     let sequence = shared.serving.borrow().record.as_ref().map(|r| r.sequence);
+    let previous = ready_floor(t.ready_floor.get(), sequence, Instant::now());
     let width = desired.max(live.keys().next_back().map_or(0, |i| i + 1));
     let nodes: Vec<String> = (0..width)
         .map(|i| {
@@ -1060,6 +1084,17 @@ pub async fn reconcile_webhook(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ready_floor_grace() {
+        use super::ready_floor;
+        let now = std::time::Instant::now();
+        let later = now + std::time::Duration::from_secs(5);
+        assert_eq!(ready_floor(Some((7, 6, later)), Some(7), now), Some(6));
+        assert_eq!(ready_floor(Some((7, 6, now)), Some(7), later), None);
+        assert_eq!(ready_floor(Some((7, 6, later)), Some(8), now), None);
+        assert_eq!(ready_floor(None, Some(7), now), None);
+    }
+
     use super::*;
 
     #[test]
