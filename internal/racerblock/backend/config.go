@@ -45,8 +45,8 @@ type Config struct {
 	ReadaheadMax int64
 	// WarmTTL, when positive, warms the object at Open and refreshes the
 	// retention until Close. Renewals happen at half the time left on the
-	// latest deadline Racer granted, and at most every WarmTTL/2. Zero
-	// disables warming.
+	// latest deadline Racer granted, but no later than WarmTTL/2 after the
+	// last response, and never closer than 1 ms apart. Zero disables warming.
 	WarmTTL time.Duration
 	// MaxAttempts bounds attempts for retryable fetch errors. Zero means 5.
 	MaxAttempts int
