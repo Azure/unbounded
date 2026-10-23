@@ -354,6 +354,9 @@ func dataplaneEnvironment(c Config) []corev1.EnvVar {
 		// This is only a bind address, never an authority for node identity.
 		// Define it before the listeners so kubelet expands either IP family.
 		fieldEnv("RACER_POD_IP", "status.podIP"),
+		// Every Pod IP. The webhook also serves the other family, since the
+		// racer-webhook Service primary family need not match status.podIP.
+		fieldEnv("RACER_POD_IPS", "status.podIPs"),
 		{Name: "RACER_PEER_LISTEN", Value: listen(int32(c.PeerPort))},
 		{Name: "RACER_DIAGNOSTICS_LISTEN", Value: listen(c.diagnosticsPort())},
 		{Name: "RACER_CONTROL_LISTEN", Value: listen(ControlPort)},

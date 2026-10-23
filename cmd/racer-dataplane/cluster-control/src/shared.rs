@@ -175,6 +175,7 @@ pub(crate) mod tests {
             seats: crate::SeatPolicy::Auto,
             control_listen: "127.0.0.2:0".parse().unwrap(),
             webhook_listen: "127.0.0.2:0".parse().unwrap(),
+            webhook_alternate: None,
             object_image: None,
             api_server: String::new(),
             api_ca: Default::default(),

@@ -166,6 +166,7 @@ impl FakeCluster {
             seats: SeatPolicy::Auto,
             control_listen: format!("127.0.0.{}:0", i + 1).parse().unwrap(),
             webhook_listen: format!("127.0.0.{}:0", i + 1).parse().unwrap(),
+            webhook_alternate: None,
             object_image: Some("example.com/racer-object:1".into()),
             api_server: self.kube.server.clone(),
             api_ca: self.kube.ca.clone(),

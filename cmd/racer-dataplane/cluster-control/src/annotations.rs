@@ -27,6 +27,10 @@ pub const WEBHOOK_ENDPOINT_SLICE: &str = "racer-webhook";
 /// Lease annotation: control API URL, `https://<pod-ip>:<port>`.
 pub const ENDPOINT: &str = "racer.unbounded-cloud.io/endpoint";
 
+/// Lease annotation: comma-separated IPs serving the webhook, at most one
+/// per address family. Absent on older seats; the [`ENDPOINT`] IP is used.
+pub const WEBHOOK_ADDRESSES: &str = "racer.unbounded-cloud.io/webhook-addresses";
+
 /// Lease annotation: base64 DER self-signed control serving certificate.
 pub const SERVING_CERTIFICATE: &str = "racer.unbounded-cloud.io/serving-certificate";
 

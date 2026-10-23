@@ -217,6 +217,10 @@ fn my_seat_annotations(shared: &Shared, seat: &Seat) -> BTreeMap<&'static str, O
     let mut a = BTreeMap::new();
     a.insert(annotations::ENDPOINT, Some(endpoint_url(shared)));
     a.insert(
+        annotations::WEBHOOK_ADDRESSES,
+        Some(webhook_addresses(shared)),
+    );
+    a.insert(
         annotations::SERVING_CERTIFICATE,
         Some(STANDARD.encode(&control.ca_der)),
     );
@@ -250,6 +254,16 @@ pub fn endpoint_url(shared: &Shared) -> String {
         "https://{}",
         SocketAddr::new(shared.config.pod_ip, shared.config.control_listen.port())
     )
+}
+
+/// IPs serving the webhook: the Pod IP and, on a dual-stack Pod, the Pod
+/// IP of the other family. The webhook certificate is verified by Service
+/// DNS name, so neither needs an IP SAN.
+pub fn webhook_addresses(shared: &Shared) -> String {
+    let c = &shared.config;
+    let mut ips = vec![c.pod_ip.to_string()];
+    ips.extend(c.webhook_alternate.map(|ip| ip.to_string()));
+    ips.join(",")
 }
 
 fn webhook_names(ns: &str) -> Vec<String> {

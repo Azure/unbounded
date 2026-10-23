@@ -53,6 +53,13 @@ pub struct Config {
 
     pub webhook_listen: SocketAddr,
 
+    /// Pod IP of the other address family, from `RACER_POD_IPS`, served on
+    /// the webhook port too. A dual-stack Pod's `status.podIP` family need
+    /// not match the primary family of the `racer-webhook` Service, which
+    /// is the only family the API server reaches through its ClusterIP.
+    /// Set only when the webhook listens on `pod_ip`.
+    pub webhook_alternate: Option<IpAddr>,
+
     /// Image injected as the object sidecar. Webhook serving is off when unset.
     pub object_image: Option<String>,
 
@@ -100,6 +107,18 @@ impl Config {
         let pod_ip: IpAddr = need("RACER_POD_IP")?
             .parse()
             .map_err(|_| Error::InvalidConfiguration)?;
+        let mut pod_ips = Vec::new();
+        for v in get("RACER_POD_IPS").unwrap_or_default().split(',') {
+            if !v.is_empty() {
+                pod_ips.push(
+                    v.parse::<IpAddr>()
+                        .map_err(|_| Error::InvalidConfiguration)?,
+                );
+            }
+        }
+        if !pod_ips.is_empty() && !pod_ips.contains(&pod_ip) {
+            return Err(Error::InvalidConfiguration);
+        }
         let seats = match get("RACER_CONTROL_SEATS").as_deref() {
             None | Some("") | Some("auto") => SeatPolicy::Auto,
             Some(v) => match v.parse::<usize>() {
@@ -152,6 +171,15 @@ impl Config {
             .filter(|p| *p != 0)
             .ok_or(Error::InvalidConfiguration)?;
         let sa = "/var/run/secrets/kubernetes.io/serviceaccount";
+        let webhook_listen = address("RACER_WEBHOOK_LISTEN", ":9443")?;
+        let webhook_alternate = (webhook_listen.ip() == pod_ip)
+            .then(|| {
+                pod_ips
+                    .iter()
+                    .copied()
+                    .find(|ip| ip.is_ipv6() != pod_ip.is_ipv6())
+            })
+            .flatten();
         let config = Self {
             namespace,
             pod_name,
@@ -160,7 +188,8 @@ impl Config {
             pod_ip,
             seats,
             control_listen: address("RACER_CONTROL_LISTEN", ":8443")?,
-            webhook_listen: address("RACER_WEBHOOK_LISTEN", ":9443")?,
+            webhook_listen,
+            webhook_alternate,
             object_image: get("RACER_OBJECT_IMAGE").filter(|v| !v.is_empty()),
             api_server,
             api_ca: get("RACER_API_CA").map_or_else(|| format!("{sa}/ca.crt").into(), Into::into),
@@ -280,6 +309,34 @@ mod tests {
             let ip: IpAddr = ip.parse().unwrap();
             assert_eq!(c.control_listen, SocketAddr::new(ip, 8443));
             assert_eq!(c.webhook_listen, SocketAddr::new(ip, 9443));
+        }
+    }
+
+    #[test]
+    fn webhook_also_serves_the_other_pod_ip_family() {
+        let webhook = "[10.0.0.5]:9443";
+        let c = |ips: &str, listen: &str| {
+            parse(&env(&[
+                ("RACER_POD_IPS", ips),
+                ("RACER_WEBHOOK_LISTEN", listen),
+            ]))
+        };
+        let alt = |ips, listen| c(ips, listen).unwrap().unwrap().webhook_alternate;
+        assert_eq!(
+            alt("10.0.0.5,fd00::5", webhook),
+            Some("fd00::5".parse().unwrap())
+        );
+        assert_eq!(
+            alt("fd00::5,10.0.0.5", webhook),
+            Some("fd00::5".parse().unwrap())
+        );
+        // Single stack, absent, or not listening on the Pod IP: none.
+        assert_eq!(alt("10.0.0.5", webhook), None);
+        assert_eq!(alt("", webhook), None);
+        assert_eq!(alt("10.0.0.5,fd00::5", "127.0.0.1:9443"), None);
+        // Malformed, or not including status.podIP: rejected.
+        for bad in ["10.0.0.5,nope", "10.0.0.6,fd00::5"] {
+            assert_eq!(c(bad, webhook).unwrap_err(), Error::InvalidConfiguration);
         }
     }
 
