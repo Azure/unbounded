@@ -163,6 +163,11 @@ impl CandidateWalk {
         }
     }
 
+    /// Whether the walk stopped because a probe could not be funded.
+    pub fn funding_stopped(&self) -> bool {
+        self.funding
+    }
+
     /// Evidence collected so far, in probe order.
     pub fn evidence(&self) -> &[ProbeOutcome] {
         &self.evidence

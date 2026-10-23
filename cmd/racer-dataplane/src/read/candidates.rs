@@ -77,6 +77,10 @@ pub struct OriginAuthority {
 }
 pub use racer_core::read::candidates::{ProbeOutcome, ReplicaSelection};
 pub(crate) use racer_core::read::candidates::{VisitOrder, replica_score, visit_order};
+use racer_core::read::walk::{
+    CandidateWalk, Continuation, End as WalkEnd, Mode as WalkMode, Outcome as WalkOutcome,
+    RemainingEnd, RemainingWalk, RouteMode, Step, WalkConfig,
+};
 
 pub struct CandidatePolicy {
     hedge: Option<Arc<Hedges>>,
@@ -204,23 +208,22 @@ impl CandidatePolicy {
         let (object, page) = operation_identity(operation);
         let order = self.visit_order(candidates, object, page);
         let (first, second) = (order.get(0).unwrap_or(0), order.get(1).unwrap_or(0));
-        let eligible = matches!(operation, PeerOperation::Page { .. })
-            && !self.is_candidate(candidates)
-            && candidates.ordered.len() >= 2
-            // A pinned direct exchange carries one link, so its receiver
-            // cannot probe predecessors. Only rank 0 can serve as hedge primary.
-            && first == 0
-            && candidates.ordered[first] != candidates.ordered[second]
-            // Preserve ONE cold fallback: primary(2) + duplicate(1) + the second
-            // visited owner at rank r (sender + r probes + origin = r + 2), with
-            // links 1+1+8. Additional candidates are attempted only when the
-            // original remainder funds them.
-            && budget.remaining_attempts() >= 3 + second as u32 + 2
-            && budget.remaining_links() >= 10
-            && [first, second].iter().all(|rank| {
-                self.peers
-                    .direct_hedge_available(&candidates.membership, &candidates.ordered[*rank])
-            });
+        // A pinned direct exchange carries one link, so its receiver cannot
+        // probe predecessors; racer-core keeps one cold fallback fundable.
+        let eligible = racer_core::read::walk::hedge_eligible(racer_core::read::walk::HedgeFacts {
+            page_operation: matches!(operation, PeerOperation::Page { .. }),
+            is_candidate: self.is_candidate(candidates),
+            owners: candidates.ordered.len(),
+            first,
+            second,
+            distinct: candidates.ordered.len() >= 2
+                && candidates.ordered[first] != candidates.ordered[second],
+            remaining_attempts: budget.remaining_attempts(),
+            remaining_links: budget.remaining_links(),
+        }) && [first, second].iter().all(|rank| {
+            self.peers
+                .direct_hedge_available(&candidates.membership, &candidates.ordered[*rank])
+        });
         if !eligible {
             hedges.suppressed();
             return Ok(None);
@@ -242,8 +245,8 @@ impl CandidatePolicy {
         };
         // Pinned direct exchanges consume exactly one link each. Reserve the
         // remaining original links for serial candidates or one epoch refresh.
-        let mut secondary_budget = budget.partition(1, 1)?;
-        let mut primary_budget = budget.partition(2, 1)?;
+        let (mut secondary_budget, mut primary_budget) =
+            racer_core::read::walk::hedge_budgets(budget)?;
         let primary_scope =
             RequestScope::new(scope.request, scope.deadline.0.min(budget.deadline()))?;
         let secondary_scope = RequestScope::new(scope.request, primary_scope.deadline.0)?;
@@ -338,16 +341,12 @@ impl CandidatePolicy {
         check_budget(scope, budget)?;
         match result {
             Ok(result) => Ok(Some(result)),
-            Err(
-                Error::Unavailable
-                | Error::Io
-                | Error::Os(_)
-                | Error::Overloaded
-                | Error::CorruptRecord
-                | Error::MissingKey
-                | Error::InvalidRequest
-                | Error::HeaderTooLarge,
-            ) => Ok(None),
+            Err(error)
+                if racer_core::read::Error::try_from(error)
+                    .is_ok_and(racer_core::read::walk::hedge_fallback) =>
+            {
+                Ok(None)
+            }
             Err(error) => Err(error),
         }
     }
@@ -948,118 +947,55 @@ impl CandidatePolicy {
                 .ordered
                 .iter()
                 .position(|node| node == &self.node);
-            let mut evidence = Vec::new();
-            let mut saw_transient = false;
-            let mut saw_version = false;
-            let count = rank.unwrap_or(candidates.ordered.len());
-            // Owners probe predecessors in canonical order. A non-owner may
-            // visit owners out of rank order; `canonical` is the destination's
-            // authoritative rank and `index` its position in the visit.
-            let order = if rank.is_some() {
-                VisitOrder::canonical(count)
-            } else {
-                self.visit_order(&candidates, object, page)
-            };
-            for (index, canonical) in order.ranks().enumerate() {
-                let destination = &candidates.ordered[canonical];
-                if continuation.primary_consumed && index == 0 {
-                    let outcome = continuation
-                        .primary_outcome
-                        .unwrap_or(ProbeOutcome::Unreachable);
-                    saw_version |= outcome == ProbeOutcome::VersionUnavailable;
-                    saw_transient |= matches!(
-                        outcome,
-                        ProbeOutcome::Unreachable
-                            | ProbeOutcome::Overloaded
-                            | ProbeOutcome::UnusableCopy
-                    );
-                    continue;
-                }
-                // With only the sender attempt left, a page Acquire would carry
-                // zero remote credits and reject before checking disk/pending copies.
-                // Spend the same last route on local copies, never new acquisition.
-                // This unpartitioned serial branch grants ceil((attempts - 1) /
-                // opportunities), which is zero exactly when attempts == 1.
-                let copy_only = rank.is_some()
-                    || (!continuation.bounded_routes
-                        && budget.remaining_attempts() == 1
-                        && matches!(operation, PeerOperation::Page { .. }));
-                let mode = if copy_only {
-                    FetchMode::CopyOnly
+            // racer-core owns the visit order, funding, and evidence rules;
+            // this loop performs the exchanges it plans.
+            let mut walk = CandidateWalk::new(WalkConfig {
+                rank,
+                owners: candidates.ordered.len(),
+                order: if rank.is_some() {
+                    VisitOrder::canonical(0)
                 } else {
-                    FetchMode::Acquire
+                    self.visit_order(&candidates, object, page)
+                },
+                page_operation: matches!(operation, PeerOperation::Page { .. }),
+                continuation: Continuation {
+                    primary_consumed: continuation.primary_consumed,
+                    primary_outcome: continuation.primary_outcome,
+                    bounded_routes: continuation.bounded_routes,
+                },
+            });
+            let end = loop {
+                let probe = match walk.next(budget)? {
+                    Step::Probe(probe) => probe,
+                    Step::End(end) => break end,
                 };
-                let mut bounded = if rank.is_some()
-                    && budget.remaining_links() < (count - index) as u8 * budget.route_links()
-                {
-                    // Receiver CopyOnly predecessor probes share the inherited
-                    // route pool; the first must not consume every link after
-                    // an incoming eight-link envelope selected failure routing.
-                    let remaining = (count - index) as u8;
-                    Some(budget.partition(1, (budget.remaining_links() / remaining).min(4))?)
-                } else if continuation.bounded_routes
-                    || (rank.is_none()
-                        && !copy_only
-                        && canonical > index
-                        && budget.remaining_attempts() >= canonical as u32 + 2
-                        && budget.remaining_links() >= 8)
-                {
-                    // Fund by the destination's canonical rank: it probes all
-                    // of its predecessors, wherever it falls in this visit.
-                    // An owner visited ahead of its canonical turn takes the
-                    // funded failure route when affordable, so its predecessor
-                    // probes are not starved of links on the shared route.
-                    let attempts = if rank.is_some() {
-                        1
-                    } else {
-                        canonical as u32 + 2
-                    };
-                    let links = if rank.is_some() { 4 } else { 8 };
-                    if budget.remaining_attempts() < attempts || budget.remaining_links() < links {
-                        // Never send an Acquire whose receiving coordinator cannot
-                        // probe its predecessors and still exercise origin authority.
-                        saw_transient = true;
-                        trail.site = CandidateSite::Funding;
-                        break;
-                    }
-                    let mut child = budget.partition(attempts, links)?;
-                    // Receiver needs incoming link plus all predecessor routes.
-                    // A rank2 cold fill cannot execute with a four-link envelope.
-                    if rank.is_none() {
-                        child.note_route_failure();
-                    }
-                    Some(child)
-                } else {
-                    None
-                };
-                let funded = continuation.bounded_routes || (rank.is_none() && bounded.is_some());
-                let request_budget = bounded.as_mut().unwrap_or(&mut *budget);
+                let copy_only = probe.mode == WalkMode::CopyOnly;
                 let response = self
                     .request_traced(
                         &candidates.membership,
-                        destination,
+                        &candidates.ordered[probe.canonical],
                         context,
                         &operation,
-                        mode,
+                        if copy_only {
+                            FetchMode::CopyOnly
+                        } else {
+                            FetchMode::Acquire
+                        },
                         scope,
-                        request_budget,
-                        // Remaining opportunities in visiting order, including
-                        // this one; owners also reserve a share for origin.
-                        (count - index + usize::from(rank.is_some())) as u32,
-                        if funded {
+                        walk.request_budget(budget),
+                        probe.remaining_opportunities,
+                        if probe.route == RouteMode::FundedRoute {
                             RequestMode::FundedRoute
                         } else {
                             RequestMode::SharedRoute
                         },
-                        Some((trail, canonical as u8)),
+                        Some((trail, probe.canonical as u8)),
                     )
                     .await;
-                if let Some(bounded) = bounded {
-                    budget.reunite(bounded)?;
-                }
-                match response {
+                let outcome = match response {
                     Ok(response) => {
                         if matches!(response.response(), PeerResponse::StaleMembership) {
+                            walk.complete(budget, WalkOutcome::StaleMembership)?;
                             let next = self
                                 .refresh_candidates(&candidates, object, page, scope, retried)
                                 .await?;
@@ -1082,68 +1018,70 @@ impl CandidatePolicy {
                                 )
                                 .await;
                         }
+                        // Validation never spends credits, so returning the
+                        // child budget afterward is equivalent to before.
                         let validated =
                             validated_copy(response, &operation, !copy_only, &mut validate).await;
                         note_validation(trail, &validated);
-                        match validated? {
-                            Ok(copy) => return Ok(CandidateResolution::Copy(copy)),
-                            Err(outcome) => {
-                                saw_version |= outcome == ProbeOutcome::VersionUnavailable;
-                                saw_transient |= matches!(
-                                    outcome,
-                                    ProbeOutcome::Unreachable
-                                        | ProbeOutcome::Overloaded
-                                        | ProbeOutcome::UnusableCopy
-                                );
-                                evidence.push(outcome);
-                                if matches!(
-                                    outcome,
-                                    ProbeOutcome::Unreachable | ProbeOutcome::Overloaded
-                                ) {
-                                    budget.note_route_failure();
-                                }
+                        match validated {
+                            Ok(Ok(copy)) => {
+                                walk.complete(budget, WalkOutcome::Copy)?;
+                                return Ok(CandidateResolution::Copy(copy));
+                            }
+                            Ok(Err(outcome)) => WalkOutcome::Probe(outcome),
+                            Err(error) => {
+                                walk.abandon(budget)?;
+                                return Err(error);
                             }
                         }
                     }
-                    Err(Error::Unavailable | Error::Io | Error::Os(_)) => {
-                        evidence.push(ProbeOutcome::Unreachable);
-                        saw_transient = true;
-                        budget.note_route_failure();
-                    }
-                    Err(Error::Overloaded) => {
-                        evidence.push(ProbeOutcome::Overloaded);
-                        saw_transient = true;
-                        budget.note_route_failure();
-                    }
-                    Err(error) => return Err(error),
-                }
+                    Err(error) => match racer_core::read::Error::try_from(error)
+                        .ok()
+                        .and_then(racer_core::read::walk::transport_outcome)
+                    {
+                        Some(outcome) => WalkOutcome::Transport(outcome),
+                        None => {
+                            walk.abandon(budget)?;
+                            return Err(error);
+                        }
+                    },
+                };
+                walk.complete(budget, outcome)?;
+            };
+            if walk.funding_stopped() {
+                trail.site = CandidateSite::Funding;
             }
             check_budget(scope, budget)?;
-            if let Some(rank) = rank {
-                Ok(CandidateResolution::Origin(OriginAuthority {
-                    diagnostic: trail.clone(),
-                    membership: candidates.membership,
-                    node: self.node.clone(),
-                    object: object.clone(),
-                    page,
-                    predecessor_evidence: evidence,
-                    rank,
-                }))
-            } else if saw_version && !saw_transient {
-                Err(Error::VersionUnavailable)
-            } else {
-                if !matches!(trail.site, CandidateSite::Funding) {
-                    trail.site = CandidateSite::Exhausted;
+            match end {
+                WalkEnd::Origin { rank, evidence } => {
+                    Ok(CandidateResolution::Origin(OriginAuthority {
+                        diagnostic: trail.clone(),
+                        membership: candidates.membership,
+                        node: self.node.clone(),
+                        object: object.clone(),
+                        page,
+                        predecessor_evidence: evidence,
+                        rank,
+                    }))
                 }
-                self.observer.record(
-                    Failure::new(Stage::CandidateExhausted, Error::Unavailable)
-                        .request(scope)
-                        .detail(Detail::Budget {
-                            attempts: budget.remaining_attempts(),
-                            links: budget.remaining_links(),
-                        }),
-                );
-                Err(Error::Unavailable)
+                WalkEnd::VersionUnavailable => Err(Error::VersionUnavailable),
+                WalkEnd::Exhausted { funding } => {
+                    if !funding {
+                        trail.site = CandidateSite::Exhausted;
+                    }
+                    self.observer.record(
+                        Failure::new(Stage::CandidateExhausted, Error::Unavailable)
+                            .request(scope)
+                            .detail(Detail::Budget {
+                                attempts: budget.remaining_attempts(),
+                                links: budget.remaining_links(),
+                            }),
+                    );
+                    Err(Error::Unavailable)
+                }
+                WalkEnd::Copy | WalkEnd::StaleMembership => {
+                    unreachable!("handled while probing")
+                }
             }
         })
     }
@@ -1184,20 +1122,24 @@ impl CandidatePolicy {
                     .iter()
                     .position(|node| node == &self.node)
                     .ok_or(Error::Unauthorized)?;
-                let mut transient = false;
-                for (index, destination) in candidates.ordered.iter().enumerate().skip(rank + 1) {
-                    match self
+                let mut walk = RemainingWalk::new(rank, candidates.ordered.len());
+                let end = loop {
+                    let probe = match walk.next_probe() {
+                        Ok(probe) => probe,
+                        Err(end) => break end,
+                    };
+                    let outcome = match self
                         .request_traced(
                             &candidates.membership,
-                            destination,
+                            &candidates.ordered[probe.canonical],
                             context,
                             operation,
                             FetchMode::CopyOnly,
                             scope,
                             budget,
-                            (candidates.ordered.len() - index) as u32,
+                            probe.remaining_opportunities,
                             RequestMode::SharedRoute,
-                            Some((&mut trail, index as u8)),
+                            Some((&mut trail, probe.index as u8)),
                         )
                         .await
                     {
@@ -1207,26 +1149,23 @@ impl CandidatePolicy {
                             note_validation(&mut trail, &validated);
                             match validated? {
                                 Ok(copy) => return Ok(Some(copy)),
-                                Err(
-                                    ProbeOutcome::Unreachable
-                                    | ProbeOutcome::Overloaded
-                                    | ProbeOutcome::UnusableCopy,
-                                ) => transient = true,
-                                Err(_) => {}
+                                Err(outcome) => WalkOutcome::Probe(outcome),
                             }
                         }
-                        Err(Error::Unavailable | Error::Overloaded | Error::Io | Error::Os(_)) => {
-                            transient = true;
-                            budget.note_route_failure();
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
+                        Err(error) => match racer_core::read::Error::try_from(error)
+                            .ok()
+                            .and_then(racer_core::read::walk::transport_outcome)
+                        {
+                            Some(outcome) => WalkOutcome::Transport(outcome),
+                            None => return Err(error),
+                        },
+                    };
+                    walk.complete(budget, outcome);
+                };
                 check_budget(scope, budget)?;
-                if transient {
-                    Err(Error::Unavailable)
-                } else {
-                    Ok(None)
+                match end {
+                    RemainingEnd::Unavailable => Err(Error::Unavailable),
+                    RemainingEnd::None | RemainingEnd::Copy => Ok(None),
                 }
             }
             .await;
@@ -1439,72 +1378,48 @@ impl CandidatePolicy {
         };
         let result = async {
             check_budget(scope, budget)?;
-            // Reserve the complete permitted route before sending. Lost responses cannot
-            // refund an unknown number of forwarded links. No retry gets fresh credits.
-            let links = budget.route_links();
-            if links == 0 {
-                return Err(Error::HopBudgetExhausted);
-            }
+            // racer-core reserves the complete route and remote credits before
+            // sending and derives the share, local cap, and body budget. Lost
+            // responses cannot refund forwarded links; no retry gets fresh credits.
             let now = uring_runtime::environment::now();
-            let overall = budget.begin_peer_attempt(now, scope.deadline.0, links)?;
-            // Share bounds idle fallback. A separate nonrenewable local cap bounds
-            // every exchange, even when no alternative is affordable.
-            // Sign the original hard ceiling before sending; it never renews.
-            let deadline = now + (overall - now) / remaining_opportunities.max(1);
-            let attempt_end = now
-                + self
-                    .attempt_timeout
-                    .min(if matches!(request_mode, RequestMode::DirectHedge) {
-                        (overall - now) / 3
+            let plan = racer_core::read::walk::plan_attempt(
+                budget,
+                racer_core::read::walk::AttemptInputs {
+                    now,
+                    caller_deadline: scope.deadline.0,
+                    remaining_opportunities,
+                    route: match request_mode {
+                        RequestMode::SharedRoute => RouteMode::SharedRoute,
+                        RequestMode::FundedRoute => RouteMode::FundedRoute,
+                        RequestMode::DirectHedge => RouteMode::DirectHedge,
+                    },
+                    mode: if matches!(mode, FetchMode::Acquire) {
+                        WalkMode::Acquire
                     } else {
-                        overall - now
-                    });
+                        WalkMode::CopyOnly
+                    },
+                    attempt_timeout: self.attempt_timeout,
+                    failure_links: crate::topology::FAILURE_LINKS,
+                },
+            )?;
+            let links = plan.links;
+            let overall = plan.overall;
+            let attempt_end = plan.attempt_end;
+            let attempts = plan.remote_attempts;
             // The local exchange may time out before the signed contract. Shortening
             // the latter per attempt would make a later update renew provider authority.
             let signed_deadline = overall;
             if trail.is_some() {
                 facts.overall = crate::telemetry::timestamp(overall);
-                facts.share = crate::telemetry::timestamp(deadline);
+                facts.share = crate::telemetry::timestamp(plan.share);
                 facts.cap = crate::telemetry::timestamp(attempt_end);
             }
             // A clone shares cancellation: timing it out would cancel the caller too.
             let mut attempt_scope = RequestScope::new(scope.request, overall)?;
-            attempt_scope.set_candidate_idle((deadline - now).min(attempt_end - now))?;
+            attempt_scope.set_candidate_idle(plan.idle)?;
             attempt_scope.set_candidate_total(attempt_end)?;
-            attempt_scope.body_deadlines = Some((overall, deadline));
-            let attempts = if matches!(mode, FetchMode::Acquire) {
-                // Reserve remote acquisition credits from the same original call.
-                // Without a signed response receipt unused remote credits stay spent.
-                let credits = if matches!(request_mode, RequestMode::FundedRoute) {
-                    budget.remaining_attempts()
-                } else {
-                    budget
-                        .remaining_attempts()
-                        .div_ceil(remaining_opportunities.max(1))
-                };
-                budget.partition(credits, 0)?.remaining_attempts()
-            } else {
-                0
-            };
-            let mut complete_by = attempt_end;
-            if remaining_opportunities > 1
-                && budget.remaining_attempts() > 0
-                && budget.remaining_links() >= crate::topology::FAILURE_LINKS
-            {
-                // Reserve at most half the original post-share interval for fallback,
-                // including subscription/fixed-page fallback. The local cap may be tighter.
-                let reserve = (deadline - now).min((overall - deadline) / 2);
-                if !reserve.is_zero() {
-                    complete_by = complete_by.min(overall - reserve);
-                }
-            }
-            // Observe actual known-length body progress, not checkout/head latency.
-            // Even a last candidate should not occupy the whole budget if its measured
-            // rate cannot finish in time. Healthy bodies may exceed the idle share.
-            let observation = (deadline - now)
-                .min((attempt_end - now) / 3)
-                .max(std::time::Duration::from_nanos(1));
-            attempt_scope.set_candidate_body_budget(observation, complete_by)?;
+            attempt_scope.body_deadlines = Some((overall, plan.share));
+            attempt_scope.set_candidate_body_budget(plan.observation, plan.complete_by)?;
             let mut bytes = [0; 16];
             uring_runtime::environment::fill_random(&mut bytes).map_err(|_| Error::Unavailable)?;
             let attempt = AttemptId(bytes);
