@@ -67,6 +67,8 @@ class FakeRacer:
             c.connect(self.path)
             c.close()
         except OSError:
+            # The connect only wakes the accept loop; if it fails, the
+            # server is already gone or stopping, so there is nothing to do.
             pass
         self._thread.join(5)
         self.sock.close()
