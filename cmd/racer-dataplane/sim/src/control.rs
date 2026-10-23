@@ -242,6 +242,40 @@ struct Seat {
     waiters: Vec<(u32, u32)>,
 }
 
+/// A Pod lifecycle change, for a co-stepped data plane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Life {
+    /// The Pod process crashed (its disk survives).
+    Crashed,
+    /// The Pod process restarted.
+    Restarted,
+    /// The Pod and its Node were removed from the cluster.
+    Removed,
+}
+
+/// Changes since the last [`ControlSim::drain`], recorded only when
+/// [`ControlSim::record_changes`] is on.
+#[derive(Debug, Default)]
+pub struct Changes {
+    /// Newly committed membership versions with their member Pods.
+    pub memberships: Vec<(u64, Vec<u32>)>,
+    /// `(pod, membership version)` applied by its client (0 on restart).
+    pub applied: Vec<(u32, u64)>,
+    pub lives: Vec<(u32, Life)>,
+}
+
+impl Changes {
+    pub fn is_empty(&self) -> bool {
+        self.memberships.is_empty() && self.applied.is_empty() && self.lives.is_empty()
+    }
+}
+
+/// Pod index of a published member: the model names Node `i` with the UID
+/// `{i:08x}-0000-...` (`step::cluster` `uuid`).
+fn member_pod(node: &str) -> Option<u32> {
+    u32::from_str_radix(node.get(..8)?, 16).ok()
+}
+
 /// Control plane plus clients on one deterministic timeline.
 pub struct ControlSim {
     pub settings: Settings,
@@ -273,6 +307,8 @@ pub struct ControlSim {
     qps_count: u64,
     enrolled: u32,
     live_clients: u32,
+    record: bool,
+    changes: Changes,
     pub metrics: Metrics,
     pub invariants: Invariants,
 }
@@ -341,6 +377,8 @@ impl ControlSim {
             qps_count: 0,
             enrolled: 0,
             live_clients: 0,
+            record: false,
+            changes: Changes::default(),
             metrics: Metrics::default(),
             invariants: Invariants::default(),
             settings,
@@ -381,6 +419,22 @@ impl ControlSim {
         let delay = self.rng.next_u64() % spread;
         self.engine.after(delay, Ev::Enroll(c, 0));
         c
+    }
+
+    /// Record membership commits, applied versions and Pod lifecycle
+    /// changes for [`Self::drain`].
+    pub fn record_changes(&mut self) {
+        self.record = true;
+    }
+
+    /// Take the changes recorded since the last call.
+    pub fn drain(&mut self) -> Changes {
+        std::mem::take(&mut self.changes)
+    }
+
+    /// Whether changes are waiting for [`Self::drain`].
+    pub fn has_changes(&self) -> bool {
+        !self.changes.is_empty()
     }
 
     /// Membership version the client on `node` has applied (0 before its
@@ -522,6 +576,20 @@ impl ControlSim {
                 } else {
                     self.metrics.incr("ctl_membership_versions");
                 }
+                if self.record && last.is_none_or(|(_, _, m)| m != mv) {
+                    match self.cp.image().filter(|i| i.record.sequence == seq) {
+                        Some(i) => {
+                            let pods = i
+                                .publication
+                                .members
+                                .iter()
+                                .filter_map(|m| member_pod(&m.node.0))
+                                .collect();
+                            self.changes.memberships.push((mv, pods));
+                        }
+                        None => self.metrics.incr("ctl_membership_without_image"),
+                    }
+                }
                 self.metrics.incr("ctl_sequences");
                 let bytes = r.publication_bytes;
                 self.metrics.add("ctl_publication_bytes", bytes);
@@ -647,6 +715,9 @@ impl ControlSim {
                 if !self.cp.alive(p) && self.state[p as usize] != State::Gone {
                     self.cp.restart(p);
                     self.metrics.incr("ctl_restarts");
+                    if self.record {
+                        self.changes.lives.push((p, Life::Restarted));
+                    }
                 }
             }
             Ev::Check => {
@@ -828,6 +899,9 @@ impl ControlSim {
         }
         self.applied_seq[c as usize] = seq;
         self.applied_mv[c as usize] = mv;
+        if self.record && mv != old_mv {
+            self.changes.applied.push((c, mv));
+        }
         self.attempts[c as usize] = 0;
         // Lag from the commit, or from the client's start if it joined
         // (or restarted) after the commit.
@@ -934,6 +1008,9 @@ impl ControlSim {
     fn crash(&mut self, p: u32, restart_after_ns: Option<Nanos>) {
         self.cp.crash(p);
         self.metrics.incr("ctl_crashes");
+        if self.record {
+            self.changes.lives.push((p, Life::Crashed));
+        }
         self.drop_client(p);
         self.state[p as usize] = State::Idle;
         if let Some(d) = restart_after_ns {
@@ -948,6 +1025,9 @@ impl ControlSim {
     fn remove(&mut self, p: u32) {
         self.cp.remove_pod(p);
         self.drop_client(p);
+        if self.record {
+            self.changes.lives.push((p, Life::Removed));
+        }
         self.state[p as usize] = State::Gone;
         self.metrics.incr("ctl_pods_removed");
     }
@@ -969,6 +1049,9 @@ impl ControlSim {
         self.seat[c] = NO_SEAT;
         self.attempts[c] = 0;
         // A restarted process starts with no applied snapshot.
+        if self.record && self.applied_mv[c] != 0 {
+            self.changes.applied.push((p, 0));
+        }
         self.applied_seq[c] = 0;
         self.applied_mv[c] = 0;
     }
