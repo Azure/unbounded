@@ -86,6 +86,7 @@ pub struct SealedPage {
 }
 
 /// What a page's owning worker needs to act on the GPU's verdict.
+#[derive(Clone)]
 pub struct SealedReport {
     pub(crate) page: PageId,
 

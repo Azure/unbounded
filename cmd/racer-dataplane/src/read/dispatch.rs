@@ -62,6 +62,37 @@ thread_local! {
 struct Mailbox {
     worker: WorkerId,
     inner: Arc<Handoff>,
+    /// Failed GPU verdicts the mailbox could not carry. The owning endpoint
+    /// applies them on its next poll so a corrupt copy is never left eligible.
+    failed_verdicts: std::sync::Mutex<Vec<super::sealed::SealedReport>>,
+}
+
+/// Bound on retained failed verdicts per worker. Each entry is one failed GPU
+/// verification; beyond this the owner is far behind and the oldest are kept.
+const FAILED_VERDICT_LIMIT: usize = 4096;
+
+impl Mailbox {
+    /// Retain a failed verdict for the owner. Returns false only when full.
+    fn retain_failed_verdict(&self, report: super::sealed::SealedReport) -> bool {
+        let mut pending = self
+            .failed_verdicts
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if pending.len() >= FAILED_VERDICT_LIMIT {
+            return false;
+        }
+        pending.push(report);
+        true
+    }
+
+    fn take_failed_verdicts(&self) -> Vec<super::sealed::SealedReport> {
+        std::mem::take(
+            &mut *self
+                .failed_verdicts
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+        )
+    }
 }
 impl std::ops::Deref for Mailbox {
     type Target = Handoff;
@@ -376,6 +407,7 @@ impl WorkerDirectory {
                     Arc::new(Mailbox {
                         worker,
                         inner: Arc::new(Handoff::new(capacity).expect("validated capacity")),
+                        failed_verdicts: std::sync::Mutex::new(Vec::new()),
                     })
                 })
                 .collect(),
@@ -932,21 +964,35 @@ impl WorkerDirectory {
             }
             return;
         }
+        // A failed verdict must reach the owner, or the corrupt copy stays
+        // eligible. When the driver queue or mailbox cannot take it, retain
+        // it on the owner's mailbox for the owner's next poll.
+        let retain = |report: super::sealed::SealedReport| {
+            if !passed && let Ok(mailbox) = self.mailbox(owner) {
+                mailbox.retain_failed_verdict(report);
+            }
+        };
         let Ok(permit) = uring_runtime::drivers::reserve() else {
+            retain(report);
             return;
         };
         // The request may already be ending; the verdict must still arrive.
         let deadline = uring_runtime::environment::now() + std::time::Duration::from_secs(5);
         let Ok(detached) = RequestScope::new(scope.request, deadline) else {
+            retain(report);
             return;
         };
-        if let Ok(receipt) =
-            self.submit(owner, Work::SealedVerdict(report, passed), &detached, None)
-        {
-            permit.submit_detached(Box::pin(async move {
+        let kept = (!passed).then(|| report.clone());
+        match self.submit(owner, Work::SealedVerdict(report, passed), &detached, None) {
+            Ok(receipt) => permit.submit_detached(Box::pin(async move {
                 let _ = receipt.await;
                 Ok::<(), Error>(())
-            }));
+            })),
+            Err(_) => {
+                if let Some(report) = kept {
+                    retain(report);
+                }
+            }
         }
     }
 
@@ -1072,6 +1118,12 @@ impl WorkerEndpoint {
         self.directory.simulation_crash();
         self.active.simulation_crash();
     }
+    /// Apply failed GPU verdicts other workers could not send through the mailbox.
+    fn apply_failed_verdicts(&self) {
+        for report in self.mailbox.take_failed_verdicts() {
+            self.local.fill.sealed_verdict(report, false);
+        }
+    }
     pub fn stop_admission(&self) {
         self.directory.warm.stop();
         self.mailbox.stop_admission();
@@ -1084,6 +1136,7 @@ impl WorkerEndpoint {
     pub fn drain<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
         self.stop_admission();
         Box::pin(std::future::poll_fn(move |cx| {
+            self.apply_failed_verdicts();
             self.directory.warm.poll_releases(
                 self.mailbox.worker,
                 self.local.fill.dependencies.writer.index(),
@@ -1104,6 +1157,7 @@ impl WorkerEndpoint {
     }
     /// Register a reactor waker and execute at most `work_budget` command/poll steps.
     pub fn poll(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
+        self.apply_failed_verdicts();
         self.directory.warm.poll_deadlines();
         self.directory.warm.poll_releases(
             self.mailbox.worker,
@@ -1561,6 +1615,104 @@ mod tests {
             assert_eq!(directory.warm.snapshot().1, 0);
         }
         job.stop();
+    }
+    /// A page owned by `worker` in the two-worker test map.
+    fn page_owned_by(directory: &WorkerDirectory, worker: WorkerId) -> PageId {
+        (0..1024)
+            .map(|number| PageId {
+                version: version(),
+                number: crate::model::PageNumber(number),
+            })
+            .find(|page| directory.page_owner(page).unwrap() == worker)
+            .unwrap()
+    }
+    fn failed_report(page: PageId) -> super::super::sealed::SealedReport {
+        super::super::sealed::SealedReport {
+            page,
+            copy: None,
+            token: None,
+        }
+    }
+    /// Deliver retained verdicts through the owner's endpoint and count them.
+    fn applied_by_owner(directory: &Arc<WorkerDirectory>) -> u64 {
+        let (owner, _fixture) = crate::read::tests::admission_coordinator();
+        let before = owner
+            .fill
+            .metrics
+            .count(crate::telemetry::Event::CorruptMiss);
+        let mut endpoint = directory.install(WorkerId(1), owner.clone()).unwrap();
+        endpoint.poll_budgeted(0).unwrap();
+        let applied = owner
+            .fill
+            .metrics
+            .count(crate::telemetry::Event::CorruptMiss)
+            - before;
+        drop(endpoint);
+        applied
+    }
+    #[test]
+    fn failed_sealed_verdict_survives_full_driver_queue() {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1));
+        let _queue = queue.enter();
+        let workers = vec![WorkerId(0), WorkerId(1)];
+        let directory = Arc::new(
+            WorkerDirectory::new(
+                Arc::new(WorkerMap::new(workers.clone()).unwrap()),
+                workers,
+                4,
+            )
+            .unwrap(),
+        );
+        let page = page_owned_by(&directory, WorkerId(1));
+        let full = uring_runtime::drivers::reserve().unwrap();
+        {
+            let (local, _fixture) = crate::read::tests::admission_coordinator();
+            let _local = directory.simulation_scope(Some((WorkerId(0), local)));
+            directory.report_sealed(failed_report(page.clone()), false, &scope());
+            // A passing verdict is only a persistence hint and is not retained.
+            directory.report_sealed(failed_report(page), true, &scope());
+        }
+        drop(full);
+        assert_eq!(applied_by_owner(&directory), 1);
+        assert!(directory.mailboxes[1].take_failed_verdicts().is_empty());
+    }
+    #[test]
+    fn failed_sealed_verdict_survives_full_mailbox() {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(64));
+        let _queue = queue.enter();
+        let workers = vec![WorkerId(0), WorkerId(1)];
+        let directory = Arc::new(
+            WorkerDirectory::new(
+                Arc::new(WorkerMap::new(workers.clone()).unwrap()),
+                workers,
+                1,
+            )
+            .unwrap(),
+        );
+        directory.mailboxes[1].install().unwrap();
+        let page = page_owned_by(&directory, WorkerId(1));
+        {
+            let (local, _fixture) = crate::read::tests::admission_coordinator();
+            let _local = directory.simulation_scope(Some((WorkerId(0), local)));
+            // The first verdict takes the only mailbox slot; the second is retained.
+            directory.report_sealed(failed_report(page.clone()), false, &scope());
+            assert_eq!(directory.mailboxes[1].outstanding(), 1);
+            directory.report_sealed(failed_report(page), false, &scope());
+        }
+        assert_eq!(directory.mailboxes[1].take_failed_verdicts().len(), 1);
+    }
+    #[test]
+    fn failed_sealed_verdicts_are_bounded() {
+        let directory = directory(1);
+        let page = page_owned_by(&directory, WorkerId(1));
+        for _ in 0..FAILED_VERDICT_LIMIT {
+            assert!(directory.mailboxes[1].retain_failed_verdict(failed_report(page.clone())));
+        }
+        assert!(!directory.mailboxes[1].retain_failed_verdict(failed_report(page)));
+        assert_eq!(
+            directory.mailboxes[1].take_failed_verdicts().len(),
+            FAILED_VERDICT_LIMIT
+        );
     }
     #[test]
     fn canonical_order_rejects_empty_and_duplicate_identities() {
