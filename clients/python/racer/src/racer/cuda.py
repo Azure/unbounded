@@ -344,7 +344,10 @@ class GpuAllocation:
         try:
             self.close()
         except Exception:
-            pass
+            # Finalizers must never raise, and during interpreter shutdown the
+            # CUDA library or module globals may already be gone. Callers that
+            # need to observe free errors should call close() explicitly.
+            return
 
 
 class HostRegistration:
