@@ -38,25 +38,11 @@ func TestObjectCacheFromAzureOrigin(t *testing.T) {
 
 	t.Cleanup(func() { h.dumpDiagnostics(namespaces...) })
 
-	h.apply(fmt.Sprintf(`apiVersion: racer.unbounded-cloud.io/v1alpha1
-kind: ClusterCache
-metadata:
-  name: %s
-spec:
-  origin:
-    azure:
-      containerURL: %s
-`, cacheName, containerURL))
-
+	h.applyCache()
 	h.installRacer()
 	h.checkDataplaneHardware()
 	h.rollout("daemonset", "racer-origin-"+cacheName, 5*time.Minute)
-	h.waitFor("sidecar injector webhook", 5*time.Minute, func() (bool, string) {
-		out, err := h.exec(time.Minute, nil, "kubectl", "get", "mutatingwebhookconfiguration",
-			"racer-object-sidecar-injector", "-o", "jsonpath={.webhooks[0].clientConfig.caBundle}")
-
-		return err == nil && strings.TrimSpace(out) != "", out
-	})
+	h.waitWebhook()
 
 	for i, api := range apis {
 		ns := namespaces[i]
@@ -67,27 +53,7 @@ spec:
 	for i, api := range apis {
 		ns := namespaces[i]
 		t.Logf("verifying %s API fetches in %s", api, ns)
-		h.waitFor("fetch pod in "+ns+" to succeed", 5*time.Minute, func() (bool, string) {
-			out, _ := h.exec(time.Minute, nil, "kubectl", "-n", ns, "get", "pod", "fetch", "-o", "jsonpath={.status.phase}")
-
-			phase := strings.TrimSpace(out)
-			if phase == "Failed" {
-				t.Fatalf("fetch pod in %s failed", ns)
-			}
-
-			return phase == "Succeeded", "phase=" + phase
-		})
-
-		injected := h.kubectl("-n", ns, "get", "pod", "fetch", "-o",
-			`jsonpath={.metadata.annotations.racer\.unbounded-cloud\.io/object-sidecar-injected} {.spec.initContainers[*].name}`)
-		if !strings.Contains(injected, "racer-object") {
-			t.Fatalf("racer-object sidecar not injected: %q", injected)
-		}
-
-		logs := h.kubectl("-n", ns, "logs", "fetch", "-c", "app")
-		if got := strings.Count(logs, "sha256-ok"); got != 2 {
-			t.Fatalf("want 2 verified fetches, got %d; logs:\n%s", got, logs)
-		}
+		h.waitFetch(ns)
 	}
 }
 
@@ -182,4 +148,46 @@ spec:
     image: curlimages/curl:8.11.1
     command: ["sh", "-c", %[4]q]
 `, ns, cacheName, api, script)
+}
+
+// applyCache creates the ClusterCache with an anonymous Azure origin. It is
+// idempotent so every test can call it.
+func (h *harness) applyCache() {
+	h.t.Helper()
+	h.apply(fmt.Sprintf(`apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: ClusterCache
+metadata:
+  name: %s
+spec:
+  origin:
+    azure:
+      containerURL: %s
+`, cacheName, containerURL))
+}
+
+// waitFetch waits for the fetch pod in ns to succeed, then checks the sidecar
+// was injected and both fetches verified.
+func (h *harness) waitFetch(ns string) {
+	h.t.Helper()
+	h.waitFor("fetch pod in "+ns+" to succeed", 5*time.Minute, func() (bool, string) {
+		out, _ := h.exec(time.Minute, nil, "kubectl", "-n", ns, "get", "pod", "fetch", "-o", "jsonpath={.status.phase}")
+
+		phase := strings.TrimSpace(out)
+		if phase == "Failed" {
+			h.t.Fatalf("fetch pod in %s failed", ns)
+		}
+
+		return phase == "Succeeded", "phase=" + phase
+	})
+
+	injected := h.kubectl("-n", ns, "get", "pod", "fetch", "-o",
+		`jsonpath={.metadata.annotations.racer\.unbounded-cloud\.io/object-sidecar-injected} {.spec.initContainers[*].name}`)
+	if !strings.Contains(injected, "racer-object") {
+		h.t.Fatalf("racer-object sidecar not injected: %q", injected)
+	}
+
+	logs := h.kubectl("-n", ns, "logs", "fetch", "-c", "app")
+	if got := strings.Count(logs, "sha256-ok"); got != 2 {
+		h.t.Fatalf("want 2 verified fetches, got %d; logs:\n%s", got, logs)
+	}
 }

@@ -51,7 +51,7 @@ kubectl -n unbounded-system patch configmap racer-dataplane-config \
 ```
 
 The dataplane gets the NVIDIA driver libraries without requesting a GPU. This
-is on by default (`RACER_DATAPLANE_NVIDIA: env` in `racer-config`). See
+is on by default (`RACER_DATAPLANE_NVIDIA: env` in `racer-dataplane-config`). See
 [GPU reads]({{< relref "reference/racer" >}}#gpu-reads).
 
 ## 2. Deploy vLLM
