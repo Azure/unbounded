@@ -293,8 +293,6 @@ jobs:
             file: images/unbounded-operator/Containerfile
           - name: gantry
             file: images/gantry/Containerfile
-          - name: racer-controller
-            file: images/racer-controller/Containerfile
           - name: racer-dataplane
             file: images/racer-dataplane/Containerfile
           - name: racer-object

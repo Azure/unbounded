@@ -1,0 +1,375 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Admission limits for writes by the racer-dataplane ServiceAccount. RBAC
+# selects which objects it may write; these policies limit what each write may
+# change. The caller Pod comes from the bound token's
+# authentication.kubernetes.io/pod-name and pod-uid extras, which kubelet
+# projected tokens always carry. A request without them is denied.
+#
+# Admission has no clock, so Lease expiry is enforced by the runtime, not
+# here. These policies only stop a Pod from writing on behalf of another Pod.
+{{- $user := printf "system:serviceaccount:%s:racer-dataplane" (.Namespace | default "unbounded-system") | toJson }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: racer-dataplane-pod-report
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: racer-dataplane
+      expression: request.userInfo.username == {{ $user }}
+  variables:
+    - name: extra
+      expression: "has(request.userInfo.extra) ? request.userInfo.extra : {}"
+    - name: podName
+      expression: >-
+        'authentication.kubernetes.io/pod-name' in variables.extra && size(variables.extra['authentication.kubernetes.io/pod-name']) == 1 ?
+        variables.extra['authentication.kubernetes.io/pod-name'][0] : ''
+    - name: podUID
+      expression: >-
+        'authentication.kubernetes.io/pod-uid' in variables.extra && size(variables.extra['authentication.kubernetes.io/pod-uid']) == 1 ?
+        variables.extra['authentication.kubernetes.io/pod-uid'][0] : ''
+    - name: annotations
+      expression: "has(object.metadata.annotations) ? object.metadata.annotations : {}"
+    - name: oldAnnotations
+      expression: "has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}"
+  validations:
+    - expression: >-
+        variables.podName != '' && variables.podUID != '' &&
+        object.metadata.name == variables.podName && object.metadata.uid == variables.podUID
+      message: A Racer Pod may only update itself
+      reason: Forbidden
+    # Spec and status are compared whole.
+    - expression: >-
+        dyn(object).all(k, k == 'metadata' || (k in dyn(oldObject) && dyn(object)[k] == dyn(oldObject)[k])) &&
+        dyn(oldObject).all(k, k == 'metadata' || (k in dyn(object) && dyn(oldObject)[k] == dyn(object)[k]))
+      message: A Racer Pod may not change fields outside metadata
+      reason: Forbidden
+    # Labels, owner references, finalizers and every other metadata field are
+    # fixed. The API server maintains managedFields and resourceVersion.
+    - expression: >-
+        dyn(object.metadata).all(k, k in ['annotations', 'managedFields', 'resourceVersion'] ||
+          (k in dyn(oldObject.metadata) && dyn(object.metadata)[k] == dyn(oldObject.metadata)[k])) &&
+        dyn(oldObject.metadata).all(k, k in ['annotations', 'managedFields', 'resourceVersion'] ||
+          (k in dyn(object.metadata) && dyn(oldObject.metadata)[k] == dyn(object.metadata)[k]))
+      message: A Racer Pod may not change other metadata
+      reason: Forbidden
+    - expression: >-
+        variables.annotations.all(k, k == 'racer.unbounded-cloud.io/report' ||
+          (k in variables.oldAnnotations && variables.annotations[k] == variables.oldAnnotations[k])) &&
+        variables.oldAnnotations.all(k, k == 'racer.unbounded-cloud.io/report' ||
+          (k in variables.annotations && variables.oldAnnotations[k] == variables.annotations[k]))
+      message: A Racer Pod may only change its racer.unbounded-cloud.io/report annotation
+      reason: Forbidden
+    - expression: >-
+        !('racer.unbounded-cloud.io/report' in variables.annotations) ||
+        size(bytes(variables.annotations['racer.unbounded-cloud.io/report'])) <= 32768
+      message: The Racer report annotation is limited to 32768 UTF-8 bytes
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: racer-dataplane-pod-report
+spec:
+  policyName: racer-dataplane-pod-report
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: racer-dataplane-lease
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["coordination.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["leases"]
+  matchConditions:
+    - name: racer-dataplane
+      expression: request.userInfo.username == {{ $user }}
+  variables:
+    - name: extra
+      expression: "has(request.userInfo.extra) ? request.userInfo.extra : {}"
+    - name: podName
+      expression: >-
+        'authentication.kubernetes.io/pod-name' in variables.extra && size(variables.extra['authentication.kubernetes.io/pod-name']) == 1 ?
+        variables.extra['authentication.kubernetes.io/pod-name'][0] : ''
+    - name: podUID
+      expression: >-
+        'authentication.kubernetes.io/pod-uid' in variables.extra && size(variables.extra['authentication.kubernetes.io/pod-uid']) == 1 ?
+        variables.extra['authentication.kubernetes.io/pod-uid'][0] : ''
+    - name: nodeName
+      expression: >-
+        'authentication.kubernetes.io/node-name' in variables.extra && size(variables.extra['authentication.kubernetes.io/node-name']) == 1 ?
+        variables.extra['authentication.kubernetes.io/node-name'][0] : ''
+    - name: annotations
+      expression: "has(object.metadata.annotations) ? object.metadata.annotations : {}"
+    - name: oldAnnotations
+      expression: "has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}"
+    - name: holder
+      expression: "has(object.spec.holderIdentity) ? object.spec.holderIdentity : ''"
+    - name: oldHolder
+      expression: "has(oldObject.spec.holderIdentity) ? oldObject.spec.holderIdentity : ''"
+    - name: holderUID
+      expression: "'racer.unbounded-cloud.io/holder-uid' in variables.annotations ? variables.annotations['racer.unbounded-cloud.io/holder-uid'] : ''"
+    - name: oldHolderUID
+      expression: "'racer.unbounded-cloud.io/holder-uid' in variables.oldAnnotations ? variables.oldAnnotations['racer.unbounded-cloud.io/holder-uid'] : ''"
+    - name: oldMine
+      expression: "variables.oldHolder != '' && variables.oldHolder == variables.podName && variables.oldHolderUID == variables.podUID"
+    # The runtime stamps a new acquireTime on every claim and keeps it on
+    # renewal, so an unchanged acquireTime marks a renewal of the same term.
+    - name: renewing
+      expression: >-
+        variables.oldMine &&
+        (has(object.spec.acquireTime) ? (has(oldObject.spec.acquireTime) && object.spec.acquireTime == oldObject.spec.acquireTime) : !has(oldObject.spec.acquireTime))
+    - name: nonce
+      expression: "'racer.unbounded-cloud.io/holder-nonce' in variables.annotations ? variables.annotations['racer.unbounded-cloud.io/holder-nonce'] : ''"
+    - name: oldNonce
+      expression: "'racer.unbounded-cloud.io/holder-nonce' in variables.oldAnnotations ? variables.oldAnnotations['racer.unbounded-cloud.io/holder-nonce'] : ''"
+    - name: transitions
+      expression: "has(object.spec.leaseTransitions) ? object.spec.leaseTransitions : 0"
+    - name: oldTransitions
+      expression: "has(oldObject.spec.leaseTransitions) ? oldObject.spec.leaseTransitions : 0"
+  validations:
+    - expression: "variables.podName != '' && variables.podUID != ''"
+      message: Racer Lease writes require a Pod-bound token
+      reason: Forbidden
+    - expression: >-
+        dyn(object.metadata).all(k, k in ['annotations', 'managedFields', 'resourceVersion'] ||
+          (k in dyn(oldObject.metadata) && dyn(object.metadata)[k] == dyn(oldObject.metadata)[k])) &&
+        dyn(oldObject.metadata).all(k, k in ['annotations', 'managedFields', 'resourceVersion'] ||
+          (k in dyn(object.metadata) && dyn(oldObject.metadata)[k] == dyn(object.metadata)[k]))
+      message: A Racer Pod may not change Lease labels or other metadata
+      reason: Forbidden
+    - expression: >-
+        variables.annotations.all(k, k.startsWith('racer.unbounded-cloud.io/') ||
+          (k in variables.oldAnnotations && variables.annotations[k] == variables.oldAnnotations[k])) &&
+        variables.oldAnnotations.all(k, k.startsWith('racer.unbounded-cloud.io/') ||
+          (k in variables.annotations && variables.oldAnnotations[k] == variables.annotations[k]))
+      message: A Racer Pod may only change racer.unbounded-cloud.io/ Lease annotations
+      reason: Forbidden
+    # A held Lease always names the caller: spec.holderIdentity is the Pod
+    # name and the holder-uid annotation is the Pod UID.
+    - expression: >-
+        variables.holder == '' ||
+        (variables.holder == variables.podName && variables.holderUID == variables.podUID &&
+         (variables.nodeName == '' || !('racer.unbounded-cloud.io/holder-node' in variables.annotations) ||
+          variables.annotations['racer.unbounded-cloud.io/holder-node'] == variables.nodeName))
+      message: A Racer Pod may only hold a Lease as itself
+      reason: Forbidden
+    # Only the holder may release a Lease or change an unheld Lease. Released
+    # and unheld Leases may drop Racer annotations but not add or change them,
+    # so no Pod can publish an endpoint without holding the Lease.
+    - expression: >-
+        variables.holder != '' || variables.oldMine ||
+        (variables.oldHolder == '' && variables.annotations.all(k, !k.startsWith('racer.unbounded-cloud.io/') ||
+          (k in variables.oldAnnotations && variables.annotations[k] == variables.oldAnnotations[k])))
+      message: A Racer Pod may only release its own Lease
+      reason: Forbidden
+    # Each acquisition starts a new term with a new acquireTime and a higher
+    # spec.leaseTransitions. A restarted container of the same Pod, or the
+    # same process after its Lease went stale, reacquires that way. Renewal
+    # keeps acquireTime, the term, and the holder nonce.
+    - expression: >-
+        variables.holder == '' ||
+        (variables.renewing ? variables.transitions == variables.oldTransitions : variables.transitions > variables.oldTransitions)
+      message: Acquiring a Racer Lease must increase spec.leaseTransitions, and renewing it must not change it
+      reason: Forbidden
+    - expression: "variables.holder == '' || !variables.renewing || variables.nonce == variables.oldNonce"
+      message: Renewing a Racer Lease must not change the holder nonce
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: racer-dataplane-lease
+spec:
+  policyName: racer-dataplane-lease
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: racer-dataplane-state
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["secrets"]
+  matchConditions:
+    - name: racer-dataplane
+      expression: request.userInfo.username == {{ $user }}
+  variables:
+    - name: annotations
+      expression: "has(object.metadata.annotations) ? object.metadata.annotations : {}"
+    - name: oldAnnotations
+      expression: "has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}"
+    - name: data
+      expression: "has(object.data) ? object.data : {}"
+    - name: oldData
+      expression: "has(oldObject.data) ? oldObject.data : {}"
+    - name: initialized
+      expression: "'racer.unbounded-cloud.io/initialized' in variables.annotations"
+    - name: oldInitialized
+      expression: "'racer.unbounded-cloud.io/initialized' in variables.oldAnnotations"
+  validations:
+    - expression: object.metadata.name == 'racer-state'
+      message: Racer may only write the racer-state Secret
+      reason: Forbidden
+    - expression: >-
+        dyn(object).all(k, k in ['metadata', 'data'] || (k in dyn(oldObject) && dyn(object)[k] == dyn(oldObject)[k])) &&
+        dyn(oldObject).all(k, k in ['metadata', 'data'] || (k in dyn(object) && dyn(oldObject)[k] == dyn(object)[k]))
+      message: Racer may not change the racer-state type or immutability
+      reason: Forbidden
+    - expression: >-
+        dyn(object.metadata).all(k, k in ['annotations', 'managedFields', 'resourceVersion'] ||
+          (k in dyn(oldObject.metadata) && dyn(object.metadata)[k] == dyn(oldObject.metadata)[k])) &&
+        dyn(oldObject.metadata).all(k, k in ['annotations', 'managedFields', 'resourceVersion'] ||
+          (k in dyn(object.metadata) && dyn(oldObject.metadata)[k] == dyn(object.metadata)[k]))
+      message: Racer may not change racer-state labels or other metadata
+      reason: Forbidden
+    - expression: >-
+        variables.annotations.all(k, k.startsWith('racer.unbounded-cloud.io/') ||
+          (k in variables.oldAnnotations && variables.annotations[k] == variables.oldAnnotations[k])) &&
+        variables.oldAnnotations.all(k, k.startsWith('racer.unbounded-cloud.io/') ||
+          (k in variables.annotations && variables.oldAnnotations[k] == variables.annotations[k]))
+      message: Racer may only change racer.unbounded-cloud.io/ annotations on racer-state
+      reason: Forbidden
+    - expression: "variables.data.all(k, k in ['cluster', 'state'])"
+      message: racer-state may only hold the cluster and state keys
+      reason: Forbidden
+    # Initialization binds the state to this Secret's UID, once. Admission
+    # cannot decode Secret data, so the cluster-id annotation carries the UID
+    # in plain text and the runtime keeps data.cluster equal to it.
+    - expression: >-
+        !variables.initialized ||
+        ('cluster' in variables.data && 'state' in variables.data &&
+         'racer.unbounded-cloud.io/cluster-id' in variables.annotations &&
+         variables.annotations['racer.unbounded-cloud.io/cluster-id'] == object.metadata.uid)
+      message: Initialized racer-state must carry its own UID as cluster-id, and cluster and state data
+      reason: Forbidden
+    - expression: >-
+        !variables.oldInitialized ||
+        (variables.initialized &&
+         variables.annotations['racer.unbounded-cloud.io/initialized'] == variables.oldAnnotations['racer.unbounded-cloud.io/initialized'] &&
+         variables.annotations['racer.unbounded-cloud.io/cluster-id'] == variables.oldAnnotations['racer.unbounded-cloud.io/cluster-id'] &&
+         'cluster' in variables.data && variables.data['cluster'] == variables.oldData['cluster'])
+      message: Initialized racer-state may not be reset or rebound
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: racer-dataplane-state
+spec:
+  policyName: racer-dataplane-state
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: racer-dataplane-webhook-configuration
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["admissionregistration.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["mutatingwebhookconfigurations"]
+  matchConditions:
+    - name: racer-dataplane
+      expression: request.userInfo.username == {{ $user }}
+  variables:
+    - name: oldHooks
+      expression: "has(oldObject.webhooks) ? oldObject.webhooks : []"
+    - name: hooks
+      expression: "has(object.webhooks) ? object.webhooks : []"
+  validations:
+    - expression: >-
+        dyn(object.metadata).all(k, k in ['managedFields', 'resourceVersion', 'generation'] ||
+          (k in dyn(oldObject.metadata) && dyn(object.metadata)[k] == dyn(oldObject.metadata)[k])) &&
+        dyn(oldObject.metadata).all(k, k in ['managedFields', 'resourceVersion', 'generation'] ||
+          (k in dyn(object.metadata) && dyn(oldObject.metadata)[k] == dyn(object.metadata)[k]))
+      message: Racer may not change webhook configuration metadata
+      reason: Forbidden
+    # Every webhook keeps its name and every field except clientConfig.caBundle.
+    - expression: >-
+        size(variables.hooks) == size(variables.oldHooks) &&
+        variables.oldHooks.all(o, variables.hooks.exists_one(n, n.name == o.name &&
+          dyn(n).all(k, k == 'clientConfig' || (k in dyn(o) && dyn(n)[k] == dyn(o)[k])) &&
+          dyn(o).all(k, k == 'clientConfig' || k in dyn(n)) &&
+          dyn(n.clientConfig).all(k, k == 'caBundle' || (k in dyn(o.clientConfig) && dyn(n.clientConfig)[k] == dyn(o.clientConfig)[k])) &&
+          dyn(o.clientConfig).all(k, k == 'caBundle' || k in dyn(n.clientConfig))))
+      message: Racer may only change webhook caBundle
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: racer-dataplane-webhook-configuration
+spec:
+  policyName: racer-dataplane-webhook-configuration
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: racer-dataplane-webhook-endpoints
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["discovery.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["endpointslices"]
+  matchConditions:
+    - name: racer-dataplane
+      expression: request.userInfo.username == {{ $user }}
+  validations:
+    - expression: object.metadata.name == 'racer-webhook'
+      message: Racer may only write the racer-webhook EndpointSlice
+      reason: Forbidden
+    - expression: >-
+        dyn(object).all(k, k in ['metadata', 'endpoints'] || (k in dyn(oldObject) && dyn(object)[k] == dyn(oldObject)[k])) &&
+        dyn(oldObject).all(k, k in ['metadata', 'endpoints'] || (k in dyn(object) && dyn(oldObject)[k] == dyn(object)[k]))
+      message: Racer may not change the EndpointSlice address type or ports
+      reason: Forbidden
+    - expression: >-
+        dyn(object.metadata).all(k, k in ['managedFields', 'resourceVersion', 'generation'] ||
+          (k in dyn(oldObject.metadata) && dyn(object.metadata)[k] == dyn(oldObject.metadata)[k])) &&
+        dyn(oldObject.metadata).all(k, k in ['managedFields', 'resourceVersion', 'generation'] ||
+          (k in dyn(object.metadata) && dyn(oldObject.metadata)[k] == dyn(object.metadata)[k]))
+      message: Racer may not change EndpointSlice metadata
+      reason: Forbidden
+    # Endpoints may only name dataplane Pods in this namespace, one per seat.
+    - expression: >-
+        !has(object.endpoints) ||
+        (size(object.endpoints) <= 16 && object.endpoints.all(e,
+          has(e.targetRef) && has(e.targetRef.kind) && e.targetRef.kind == 'Pod' &&
+          has(e.targetRef.namespace) && e.targetRef.namespace == object.metadata.namespace &&
+          has(e.targetRef.name) && e.targetRef.name.startsWith('racer-dataplane-') && has(e.targetRef.uid)))
+      message: Racer webhook endpoints must reference up to 16 racer-dataplane Pods in its namespace
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: racer-dataplane-webhook-endpoints
+spec:
+  policyName: racer-dataplane-webhook-endpoints
+  validationActions: [Deny]

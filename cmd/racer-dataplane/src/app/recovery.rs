@@ -243,6 +243,7 @@ impl WorkerApplication {
                     self.store
                         .checkpoint
                         .publish_async(
+                            self.keys.cluster().clone(),
                             shards,
                             self.runtime.reactor.clone(),
                             deadline.clone(),
@@ -362,6 +363,7 @@ impl WorkerApplication {
             };
             drop(cut);
             match self.store.checkpoint.publish_async(
+                self.keys.cluster().clone(),
                 shards,
                 self.runtime.reactor.clone(),
                 scope(self.timeout)?,
@@ -556,6 +558,10 @@ fn validate_candidate(
     keys: &Keyring,
     caches: &[racer_control_wire::CacheDefinition],
 ) -> Option<CheckpointImage> {
+    // Key and cache IDs can repeat across clusters, so a foreign cut is only a stale hint.
+    if &image.cluster != keys.cluster() {
+        return None;
+    }
     let ids: HashSet<_> = image.shards.iter().map(|s| s.worker).collect();
     if ids.len() != image.shards.len() || ids != geometry.keys().copied().collect() {
         return None;
@@ -825,6 +831,7 @@ mod tests {
     fn image(sequence: u64, ids: &[WorkerId]) -> CheckpointImage {
         CheckpointImage {
             version: CHECKPOINT_VERSION,
+            cluster: crate::store::checkpoint::test_cluster(),
             sequence,
             shards: ids
                 .iter()
@@ -1201,6 +1208,97 @@ mod tests {
         assert!(index.version(&metadata.version).unwrap().is_none());
     }
 
+    /// A cut from another cluster is skipped even when its cache UID and key ID
+    /// both match a key leased by the local keyring. Key IDs carry a random
+    /// suffix, so such a match is unlikely but possible. Only the cluster binds
+    /// a cut to the keys that wrote it.
+    #[test]
+    fn foreign_cluster_cut_with_matching_cache_and_key_id_is_skipped() {
+        use crate::model::VersionMetadata;
+        use crate::model::*;
+        use crate::store::catalog::IndexedPage;
+        use crate::store::catalog::RecordLocation;
+        use crate::store::checkpoint;
+        let node = NodeState::new(vec![WorkerId(0)], 16).unwrap();
+        let keys = crate::test_support::security::keys();
+        let caches = caches();
+        let g = geometry();
+        let geometry = [(WorkerId(0), g)].into_iter().collect();
+        let mut cut = image(5, &[WorkerId(0)]);
+        let segments = Segments::new(g.segment_bytes);
+        segments
+            .configure(
+                g.slab_bytes,
+                g.segment_count as usize,
+                g.alignment().unwrap(),
+            )
+            .unwrap();
+        let append = segments.append(4096).unwrap();
+        let metadata = VersionMetadata {
+            content_type: None,
+            version: ObjectVersion {
+                object: ObjectId {
+                    cache: caches[0].id.clone(),
+                    key: CacheKey([0; 32]),
+                },
+                etag: StrongEtag::test_value("page"),
+            },
+            length: 3,
+        };
+        let key_id = crate::model::key_id_from_generation(1, 1).unwrap();
+        assert!(
+            keys.lease(Some(&caches[0].id), key_id, KeyPurpose::Page)
+                .is_ok()
+        );
+        cut.shards[0].index.entries.push((
+            PageId {
+                version: metadata.version.clone(),
+                number: PageNumber(0),
+            },
+            IndexedPage {
+                location: RecordLocation {
+                    segment: append.0.id(),
+                    generation: append.0.generation(),
+                    extent: append.1,
+                },
+                metadata,
+                key_id,
+            },
+        ));
+        drop(append);
+        cut.shards[0].segments = segments.snapshot();
+        let same = checkpoint::encode(&cut).unwrap();
+        let mut foreign_cut = checkpoint::decode(&same).unwrap();
+        foreign_cut.cluster =
+            racer_control_wire::ClusterId("44444444-4444-4444-8444-444444444444".into());
+        foreign_cut.sequence = 6;
+        let foreign = checkpoint::encode(&foreign_cut).unwrap();
+        let decode = |bytes: &[u8]| checkpoint::decode(bytes).unwrap();
+        let select_one = |candidates: Vec<CheckpointImage>| {
+            select(
+                candidates,
+                &geometry,
+                &node.workers,
+                (16, 16),
+                &keys,
+                &caches,
+            )
+        };
+
+        // Same-cluster restart keeps the page.
+        let restarted = select_one(vec![decode(&same)]).unwrap();
+        assert_eq!(restarted.cluster, *keys.cluster());
+        assert_eq!(restarted.shards[0].index.entries.len(), 1);
+
+        // A foreign cut alone gives a cold cache, not a startup error.
+        assert!(select_one(vec![decode(&foreign)]).is_none());
+
+        // A newer foreign cut falls back to the older same-cluster cut.
+        let selected = select_one(vec![decode(&foreign), decode(&same)]).unwrap();
+        assert_eq!(selected.sequence, 5);
+        assert_eq!(selected.shards[0].index.entries.len(), 1);
+    }
+
     #[test]
     fn ownership_and_capacity_are_checked_on_every_worker() {
         use crate::model::CacheKey;
@@ -1269,6 +1367,7 @@ mod tests {
             app.store.checkpoint.finish_snapshot();
             let bytes = crate::store::checkpoint::encode(&CheckpointImage {
                 version: CHECKPOINT_VERSION,
+                cluster: config.cluster.clone(),
                 sequence: 9,
                 shards: vec![shard],
             })

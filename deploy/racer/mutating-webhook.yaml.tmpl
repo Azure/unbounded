@@ -1,7 +1,10 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 # Injects the racer-object native sidecar into pods labeled
-# racer.unbounded-cloud.io/object-sidecar=enabled. The operator fills caBundle.
+# racer.unbounded-cloud.io/object-sidecar=enabled.
+# The operator never sets caBundle: the Racer primary publishes it and the
+# racer-webhook endpoints. Until then, opted-in Pod creation fails closed. The
+# operator namespace is excluded so the dataplane itself can always start.
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingWebhookConfiguration
 metadata:
@@ -11,7 +14,7 @@ webhooks:
     admissionReviewVersions: ["v1"]
     clientConfig:
       service:
-        name: racer-controller
+        name: racer-webhook
         namespace: {{ .Namespace | default "unbounded-system" }}
         path: /mutate-racer-object-sidecar
         port: 9443

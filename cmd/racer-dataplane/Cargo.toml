@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "runtime", "alloc", "crypto", "verbs", "http", "topology", "telemetry", "flow", "control-wire", "controlplane", "uds-endpoint", "wire-codec", "peer-wire", "object-wire"]
+members = [".", "runtime", "alloc", "crypto", "verbs", "http", "topology", "telemetry", "flow", "control-wire", "controlplane", "uds-endpoint", "wire-codec", "peer-wire", "object-wire", "cluster-control", "admission"]
 resolver = "3"
 
 [package]
@@ -30,6 +30,7 @@ envy = { version = "0.4.2", default-features = false }
 uds-endpoint = { path = "uds-endpoint" }
 wire-codec = { path = "wire-codec", features = ["rest"] }
 racer-control-wire = { path = "control-wire" }
+racer-cluster-control = { path = "cluster-control" }
 flow-control = { path = "flow" }
 topology = { path = "topology" }
 telemetry = { path = "telemetry" }

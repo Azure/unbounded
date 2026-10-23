@@ -289,9 +289,34 @@ impl Application {
                 .native
                 .prepare(plan.pairs.iter().map(|p| p.worker), &self.limits)?;
         }
-        let signals = SignalGuard::install()?;
-        let scope = scope(self.config.request_timeout)?;
-        let (identity, selector) = bootstrap(&self.config, &self.node, &self.limits, &scope)?;
+        // Shares handlers the entry point may already hold across cluster bootstrap;
+        // a stop requested before this point stays pending.
+        let signals = StopSignals::install()?;
+        if self.config.managed() && self.config.managed_control.is_none() {
+            // Managed mode has no static endpoint; startup must attach control first.
+            return Err(Error::InvalidConfiguration);
+        }
+        let (identity, enrolled_selector) = if self.config.managed() {
+            // Election and enrollment outlive any data request deadline; keep the
+            // embedded control alive and retry bounded attempts until stopped.
+            retry_enrollment(
+                || {
+                    let attempt = scope(MANAGED_ENROLLMENT_ATTEMPT)?;
+                    bootstrap(&self.config, &self.node, &self.limits, &attempt)
+                },
+                || STOP_REQUESTED.load(Ordering::Relaxed),
+                MANAGED_ENROLLMENT_PACE,
+            )?
+        } else {
+            let scope = scope(self.config.request_timeout)?;
+            bootstrap(&self.config, &self.node, &self.limits, &scope)?
+        };
+        let selector = self
+            .config
+            .managed_control
+            .as_ref()
+            .and_then(|managed| managed.block_devices.clone())
+            .or(enrolled_selector);
         let devices = devices::discover(&self.config, selector.as_deref(), plan.pairs.len());
         if let Some(devices) = &devices {
             Arc::get_mut(&mut self.config)
@@ -313,11 +338,82 @@ impl Application {
             .node = identity;
         self.prepare_workers()?;
         let mut workers = WorkerGroup::new(plan);
-        let result = workers.run(&self);
+        let result = if self.config.managed() {
+            workers.run_with_startup(&self, MANAGED_STARTUP)
+        } else {
+            workers.run(&self)
+        };
         if signals.requested() && result == Err(Error::Cancelled) {
             Ok(())
         } else {
             result
+        }
+    }
+}
+
+/// Budget for one managed enrollment attempt, independent of data request deadlines.
+const MANAGED_ENROLLMENT_ATTEMPT: Duration = Duration::from_secs(60);
+
+/// Managed worker startup waits on election and the first publication until
+/// stopped; each control turn inside it stays bounded by [`CONTROL_TURN`].
+const MANAGED_STARTUP: Duration = Duration::from_secs(365 * 24 * 3600);
+
+/// Bound for one startup control turn (enrollment attempt or publication poll).
+const CONTROL_TURN: Duration = Duration::from_secs(racer_control_wire::POLL_WAIT.as_secs() + 30);
+
+/// A fresh scope for one control turn, never outliving `startup`.
+///
+/// The turn owns its own cancellation so its expiry never cancels startup.
+fn control_turn(startup: &RequestScope, limit: Duration) -> Result<RequestScope> {
+    let mut turn = scope(limit)?;
+    if startup.deadline.0 < turn.deadline.0 {
+        turn.deadline = startup.deadline;
+    }
+    Ok(turn)
+}
+
+/// Least time between managed enrollment attempts.
+const MANAGED_ENROLLMENT_PACE: Duration = Duration::from_secs(1);
+
+/// Repeat `attempt` while it fails transiently, pacing attempts and honoring `stop`.
+///
+/// Each attempt fully fences its own reactor before returning. Permanent errors
+/// (identity, cluster binding, configuration) are returned without retry.
+fn retry_enrollment<T>(
+    mut attempt: impl FnMut() -> Result<T>,
+    stop: impl Fn() -> bool,
+    pace: Duration,
+) -> Result<T> {
+    let mut attempts = 0u64;
+    loop {
+        if stop() {
+            return Err(Error::Cancelled);
+        }
+        let started = std::time::Instant::now();
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(error) if crate::control::transient(error) && !stop() => {
+                attempts += 1;
+                eprintln!(
+                    "racer-dataplane: stage=enrollment state=retrying attempt={attempts} error={error}"
+                );
+            }
+            Err(error) if stop() && crate::control::transient(error) => {
+                return Err(Error::Cancelled);
+            }
+            Err(error) => return Err(error),
+        }
+        // Sleep in short slices so a stop request is observed promptly.
+        let resume = started + pace;
+        while std::time::Instant::now() < resume {
+            if stop() {
+                return Err(Error::Cancelled);
+            }
+            std::thread::sleep(
+                resume
+                    .saturating_duration_since(std::time::Instant::now())
+                    .min(Duration::from_millis(50)),
+            );
         }
     }
 }
@@ -337,7 +433,9 @@ async fn start_control(
     startup: &RequestScope,
 ) -> Result<racer_crypto::enrollment::LocalSigningIdentity> {
     loop {
-        match control.start(startup).await {
+        startup.check()?;
+        let turn = control_turn(startup, CONTROL_TURN)?;
+        match control.start(&turn).await {
             Ok(identity) => return Ok(identity),
             Err(error) if transient(error) => {
                 startup.check()?;
@@ -486,6 +584,30 @@ fn bootstrap(
     result.and_then(|identity| shutdown_result.map(|()| identity))
 }
 
+/// End `operation` with `Cancelled` as soon as a process stop is requested.
+///
+/// The lifecycle driver re-polls startup periodically, so a stop request is
+/// observed promptly even while the operation waits on a long control turn.
+/// Dropping the operation leaves reactor and CQE fencing to normal teardown.
+async fn stoppable<T>(operation: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    stoppable_by(&STOP_REQUESTED, operation).await
+}
+
+/// [`stoppable`] with an explicit stop flag.
+async fn stoppable_by<T>(
+    stop: &AtomicBool,
+    operation: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let mut operation = std::pin::pin!(operation);
+    std::future::poll_fn(|cx| {
+        if stop.load(Ordering::Relaxed) {
+            return Poll::Ready(Err(Error::Cancelled));
+        }
+        operation.as_mut().poll(cx)
+    })
+    .await
+}
+
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Record a process stop request using only a signal-safe atomic store.
@@ -493,47 +615,82 @@ extern "C" fn request_stop(_: libc::c_int) {
     STOP_REQUESTED.store(true, Ordering::Relaxed);
 }
 
-/// Restore the original process signal handlers when application ownership ends.
-struct SignalGuard {
+/// Installed handler state shared by every live [`StopSignals`] guard.
+struct Installed {
+    guards: usize,
     previous: Vec<(libc::c_int, libc::sigaction)>,
 }
 
-impl SignalGuard {
-    /// Install stop handlers while retaining each previous process handler.
-    fn install() -> Result<Self> {
-        STOP_REQUESTED.store(false, Ordering::Relaxed);
-        let mut guard = Self {
-            previous: Vec::new(),
-        };
-        for signal in [libc::SIGINT, libc::SIGTERM] {
-            // SAFETY: initialized sigaction records and a signal-safe atomic handler.
-            unsafe {
-                let mut action: libc::sigaction = std::mem::zeroed();
-                action.sa_sigaction = request_stop as *const () as usize;
-                libc::sigemptyset(&mut action.sa_mask);
-                let mut previous = std::mem::zeroed();
-                if libc::sigaction(signal, &action, &mut previous) != 0 {
-                    return Err(Error::Io);
+// SAFETY: sigaction records are plain process-global handler descriptions.
+unsafe impl Send for Installed {}
+
+static INSTALLED: Mutex<Installed> = Mutex::new(Installed {
+    guards: 0,
+    previous: Vec::new(),
+});
+
+/// Process SIGINT/SIGTERM stop handlers, shared across startup phases.
+///
+/// The first live guard installs the handlers and clears any stale stop request;
+/// nested guards (for example the one taken by [`Application::run`] while the
+/// entry point already holds one across cluster bootstrap) only share them and
+/// never clear a pending stop. The last guard dropped restores the original
+/// process handlers.
+pub struct StopSignals(());
+
+impl StopSignals {
+    /// Install, or share already installed, stop handlers.
+    pub fn install() -> Result<Self> {
+        let mut installed = INSTALLED.lock().map_err(|_| Error::Internal)?;
+        if installed.guards == 0 {
+            STOP_REQUESTED.store(false, Ordering::Relaxed);
+            let mut previous = Vec::new();
+            for signal in [libc::SIGINT, libc::SIGTERM] {
+                // SAFETY: initialized sigaction records and a signal-safe atomic handler.
+                unsafe {
+                    let mut action: libc::sigaction = std::mem::zeroed();
+                    action.sa_sigaction = request_stop as *const () as usize;
+                    libc::sigemptyset(&mut action.sa_mask);
+                    let mut old = std::mem::zeroed();
+                    if libc::sigaction(signal, &action, &mut old) != 0 {
+                        restore(&previous);
+                        return Err(Error::Io);
+                    }
+                    previous.push((signal, old));
                 }
-                guard.previous.push((signal, previous));
             }
+            installed.previous = previous;
         }
-        Ok(guard)
+        installed.guards += 1;
+        Ok(Self(()))
     }
 
     /// Check whether a handled process signal requested shutdown.
-    fn requested(&self) -> bool {
+    pub fn requested(&self) -> bool {
         STOP_REQUESTED.load(Ordering::Relaxed)
     }
 }
 
-impl Drop for SignalGuard {
+impl Drop for StopSignals {
     fn drop(&mut self) {
-        for (signal, previous) in self.previous.iter().rev() {
-            // SAFETY: restore the exact process handlers saved during installation.
-            unsafe {
-                libc::sigaction(*signal, previous, std::ptr::null_mut());
-            }
+        let mut installed = match INSTALLED.lock() {
+            Ok(installed) => installed,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        installed.guards = installed.guards.saturating_sub(1);
+        if installed.guards == 0 {
+            let previous = std::mem::take(&mut installed.previous);
+            restore(&previous);
+        }
+    }
+}
+
+/// Restore saved process handlers in reverse installation order.
+fn restore(previous: &[(libc::c_int, libc::sigaction)]) {
+    for (signal, previous) in previous.iter().rev() {
+        // SAFETY: restore the exact process handlers saved during installation.
+        unsafe {
+            libc::sigaction(*signal, previous, std::ptr::null_mut());
         }
     }
 }
@@ -1229,14 +1386,21 @@ impl WorkerApplication {
         let enrollment = Rc::new(Enrollment::new(
             config.cluster.clone(),
             config.service_account_token.clone(),
-            config.identity_directory.clone(),
+            config
+                .enrollment_directory
+                .clone()
+                .unwrap_or_else(|| config.identity_directory.clone()),
             io.clone(),
         ));
         let secrets = BundleInstaller::new(keys.clone());
         let control = Rc::new(Session::new(
             ControlEndpoint {
-                url: config.control_endpoint.clone(),
+                url: config.control_endpoint.clone().unwrap_or_default(),
                 trust_bundle: config.trust_bundle.clone(),
+                discovered: config
+                    .managed_control
+                    .as_ref()
+                    .map(|managed| managed.endpoints.clone()),
             },
             enrollment,
             rails,
@@ -1245,6 +1409,9 @@ impl WorkerApplication {
             secrets,
             snapshots,
         ));
+        if let Some(managed) = &config.managed_control {
+            control.set_report(managed.report.clone());
+        }
         control
             .attach_io(io)
             .expect("valid static feed configuration");
@@ -2457,7 +2624,7 @@ impl WorkerApplication {
     pub fn start<'a>(&'a mut self, startup: &'a RequestScope) -> Operation<'a, ()> {
         let environment = self.environment.clone();
         let drivers = self.drivers.clone();
-        Box::pin(environment.scope(drivers.scope(async move {
+        Box::pin(environment.scope(drivers.scope(stoppable(async move {
             startup.check()?;
             if self.started || self.stopping {
                 return Err(Error::InvalidConfiguration);
@@ -2485,7 +2652,7 @@ impl WorkerApplication {
             self.started = true;
             self.observe_health()?;
             Ok(())
-        })))
+        }))))
     }
 
     /// Open storage and publish the effective disk capacity metrics.
@@ -2520,7 +2687,8 @@ impl WorkerApplication {
             // Accept a complete compatible first snapshot before any listener.
             while self.snapshots.current().is_err() {
                 startup.check()?;
-                let mut progress = control.progress(startup);
+                let turn = control_turn(startup, CONTROL_TURN)?;
+                let mut progress = control.progress(&turn);
                 let result = std::future::poll_fn(|cx| {
                     self.poll_keyring(cx)?;
                     self.poll_cache_preparation(cx)?;
@@ -2796,6 +2964,144 @@ mod lifecycle_policy_tests {
     //! Listener completion and control retry classification remain independent.
 
     use super::*;
+
+    #[test]
+    fn enrollment_retries_past_attempt_deadline_until_success() {
+        let attempts = std::cell::Cell::new(0u32);
+        let result = retry_enrollment(
+            || {
+                attempts.set(attempts.get() + 1);
+                // Each attempt runs under its own deadline that expires first.
+                let attempt = scope(Duration::from_millis(1))?;
+                std::thread::sleep(Duration::from_millis(2));
+                if attempts.get() < 4 {
+                    attempt.check()?;
+                    unreachable!("attempt deadline elapsed");
+                }
+                Ok(7)
+            },
+            || false,
+            Duration::ZERO,
+        );
+        assert_eq!(result, Ok(7));
+        assert_eq!(attempts.get(), 4);
+        // Transient control unavailability is also retried.
+        let seen = std::cell::Cell::new(0);
+        let result = retry_enrollment(
+            || {
+                seen.set(seen.get() + 1);
+                match seen.get() {
+                    1 => Err(Error::Unavailable),
+                    2 => Err(Error::Overloaded),
+                    3 => Err(Error::Io),
+                    _ => Ok(()),
+                }
+            },
+            || false,
+            Duration::ZERO,
+        );
+        assert_eq!((result, seen.get()), (Ok(()), 4));
+    }
+
+    #[test]
+    fn control_turns_are_bounded_and_never_outlive_startup() {
+        let long = scope(MANAGED_STARTUP).unwrap();
+        let turn = control_turn(&long, CONTROL_TURN).unwrap();
+        let now = uring_runtime::environment::now();
+        assert!(turn.deadline.0 <= now + CONTROL_TURN);
+        assert!(turn.deadline.0 > now + racer_control_wire::POLL_WAIT);
+        // Expiry of a turn must not cancel startup.
+        let _ = turn.cancel();
+        assert_eq!(long.check(), Ok(()));
+        let short = scope(Duration::from_millis(5)).unwrap();
+        let turn = control_turn(&short, CONTROL_TURN).unwrap();
+        assert_eq!(turn.deadline.0, short.deadline.0);
+        // Managed startup outlives the fixed lifecycle policy.
+        assert!(MANAGED_STARTUP > crate::worker::LIFECYCLE_TIMEOUT * 100);
+    }
+
+    #[test]
+    fn stoppable_startup_ends_promptly_and_passes_results() {
+        let stop = AtomicBool::new(false);
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut pending = Box::pin(stoppable_by(&stop, std::future::pending::<Result<()>>()));
+        assert!(pending.as_mut().poll(&mut cx).is_pending());
+        stop.store(true, Ordering::Relaxed);
+        assert_eq!(
+            pending.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Cancelled))
+        );
+        let clear = AtomicBool::new(false);
+        let mut done = Box::pin(stoppable_by(&clear, async {
+            Err::<(), _>(Error::Unauthorized)
+        }));
+        assert_eq!(
+            done.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn enrollment_permanent_errors_are_not_retried() {
+        for permanent in [
+            Error::NodeIdentityChanged,
+            Error::Unauthorized,
+            Error::InvalidConfiguration,
+            Error::Internal,
+        ] {
+            let calls = std::cell::Cell::new(0);
+            let result: Result<()> = retry_enrollment(
+                || {
+                    calls.set(calls.get() + 1);
+                    Err(permanent)
+                },
+                || false,
+                Duration::ZERO,
+            );
+            assert_eq!((result, calls.get()), (Err(permanent), 1));
+        }
+    }
+
+    #[test]
+    fn enrollment_stop_is_prompt() {
+        // Stop before any attempt.
+        let result: Result<()> = retry_enrollment(|| unreachable!(), || true, Duration::ZERO);
+        assert_eq!(result, Err(Error::Cancelled));
+        // Stop during a long pace is observed within a short slice.
+        let begun = std::time::Instant::now();
+        let calls = std::cell::Cell::new(0);
+        let result: Result<()> = retry_enrollment(
+            || {
+                calls.set(calls.get() + 1);
+                Err(Error::DeadlineExceeded)
+            },
+            || begun.elapsed() > Duration::from_millis(100),
+            Duration::from_secs(3600),
+        );
+        assert_eq!((result, calls.get()), (Err(Error::Cancelled), 1));
+        assert!(begun.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn enrollment_budget_is_independent_of_request_timeout() {
+        let config = Config::from_lookup(|name| {
+            Ok(match name {
+                "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
+                "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
+                "RACER_REQUEST_TIMEOUT_MS" => Some("1".into()),
+                "RACER_READER_STALL_TIMEOUT_MS" => Some("1".into()),
+                "RACER_ENABLE_RDMA" => Some("false".into()),
+                _ => None,
+            })
+        });
+        assert_eq!(
+            config.expect("config").request_timeout,
+            Duration::from_millis(1)
+        );
+        assert!(MANAGED_ENROLLMENT_ATTEMPT >= Duration::from_secs(60));
+        assert!(MANAGED_ENROLLMENT_PACE > Duration::ZERO);
+    }
 
     #[test]
     fn exact_sizing_rejects_unfunded_workers_without_reduction() {

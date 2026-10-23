@@ -85,7 +85,12 @@ mod index_pressure {
         assert_eq!(after[1], before[1]);
         assert_eq!(f.store.writer.discarded_count(), 0);
         let image = futures::executor::block_on(f.store.checkpoint.snapshot_shard()).unwrap();
-        futures::executor::block_on(f.store.checkpoint.publish(vec![image])).unwrap();
+        futures::executor::block_on(
+            f.store
+                .checkpoint
+                .publish(crate::store::checkpoint::test_cluster(), vec![image]),
+        )
+        .unwrap();
         f.store.checkpoint.finish_snapshot();
         let loaded = futures::executor::block_on(
             f.store
@@ -414,6 +419,7 @@ fn hard_hold_checkpoint_roundtrip_restores_only_live_disk_reservations() {
     f.store.checkpoint.finish_snapshot();
     let bytes = checkpoint::encode(&checkpoint::CheckpointImage {
         version: checkpoint::CHECKPOINT_VERSION,
+        cluster: crate::store::checkpoint::test_cluster(),
         sequence: 1,
         shards: vec![shard],
     })
@@ -548,6 +554,7 @@ fn hard_hold_checkpoint_fences_warm_owned_publication_and_restores_veto() {
     f.store.checkpoint.finish_snapshot();
     let encoded = crate::store::checkpoint::encode(&crate::store::checkpoint::CheckpointImage {
         version: crate::store::checkpoint::CHECKPOINT_VERSION,
+        cluster: crate::store::checkpoint::test_cluster(),
         sequence: 1,
         shards: vec![shard],
     })
@@ -1657,6 +1664,7 @@ fn checkpoint_exact_budget_matches_full_snapshot_with_holds() {
     let bytes = |shard| {
         encode(&CheckpointImage {
             version: CHECKPOINT_VERSION,
+            cluster: crate::store::checkpoint::test_cluster(),
             sequence: 1,
             shards: vec![shard],
         })
@@ -1664,7 +1672,7 @@ fn checkpoint_exact_budget_matches_full_snapshot_with_holds() {
     };
     let full = bytes(full);
     assert_eq!(bytes(incremental), full);
-    assert_eq!(full.len(), budget + 32 + 4 + 32);
+    assert_eq!(full.len(), budget + 32 + 36 + 4 + 32);
     f.store.checkpoint.finish_snapshot();
     assert!(!f.store.writer.paused.get());
     drop(f.segments.freeze().unwrap());
@@ -1689,7 +1697,15 @@ fn incremental_checkpoint_budget_thaws_and_async_publication_roundtrips() {
     let task = f
         .store
         .checkpoint
-        .publish_async(vec![shard], f.reactor.clone(), scope(), 7, 1, 1024 * 1024)
+        .publish_async(
+            crate::store::checkpoint::test_cluster(),
+            vec![shard],
+            f.reactor.clone(),
+            scope(),
+            7,
+            1,
+            1024 * 1024,
+        )
         .unwrap();
     drive(&f.reactor, task).unwrap();
     f.store.checkpoint.finish_snapshot();
@@ -2267,7 +2283,13 @@ fn persistence_pressure_and_restart_preserve_only_live_pages() {
         assert!(live.iter().filter(|&&present| present).count() <= capacity);
         assert!(live.last().copied().unwrap());
         let image = drive(&f.reactor, f.store.checkpoint.snapshot_shard()).unwrap();
-        drive(&f.reactor, f.store.checkpoint.publish(vec![image])).unwrap();
+        drive(
+            &f.reactor,
+            f.store
+                .checkpoint
+                .publish(crate::store::checkpoint::test_cluster(), vec![image]),
+        )
+        .unwrap();
         f.store.checkpoint.finish_snapshot();
         assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
 
@@ -2328,7 +2350,12 @@ fn real_direct_slab_roundtrip_checkpoint_and_corruption_miss() {
     assert_eq!(read.ciphertext.bytes(), page.ciphertext.bytes());
     assert_eq!(read.ciphertext.envelope(), page.ciphertext.envelope());
     let image = futures::executor::block_on(f.store.checkpoint.snapshot_shard()).unwrap();
-    futures::executor::block_on(f.store.checkpoint.publish(vec![image])).unwrap();
+    futures::executor::block_on(
+        f.store
+            .checkpoint
+            .publish(crate::store::checkpoint::test_cluster(), vec![image]),
+    )
+    .unwrap();
     f.store.checkpoint.finish_snapshot();
     let loaded = futures::executor::block_on(f.store.recovery.load(alignment))
         .unwrap()
@@ -4004,7 +4031,15 @@ mod checkpoint {
         assert_eq!(
             block_on(
                 checkpoint
-                    .publish_async(vec![shard()], reactor.clone(), scope, 3, 0, 1024 * 1024)
+                    .publish_async(
+                        crate::store::checkpoint::test_cluster(),
+                        vec![shard()],
+                        reactor.clone(),
+                        scope,
+                        3,
+                        0,
+                        1024 * 1024
+                    )
                     .unwrap()
             ),
             Err(Error::Cancelled)
@@ -4056,7 +4091,15 @@ mod checkpoint {
             fs::write(directory.0.join(slot), b"recoverable cut").unwrap();
         }
         let mut abandoned = checkpoint
-            .publish_async(vec![shard()], reactor.clone(), scope(), 3, 0, 1024 * 1024)
+            .publish_async(
+                crate::store::checkpoint::test_cluster(),
+                vec![shard()],
+                reactor.clone(),
+                scope(),
+                3,
+                0,
+                1024 * 1024,
+            )
             .unwrap();
         // Encoding yields before the first file submission. Stop at the submission
         // without reaping its completion, so abandonment exercises the actual fence.
@@ -4231,6 +4274,7 @@ mod checkpoint {
     fn image(sequence: u64) -> CheckpointImage {
         CheckpointImage {
             version: CHECKPOINT_VERSION,
+            cluster: crate::store::checkpoint::test_cluster(),
             sequence,
             shards: vec![shard()],
         }
@@ -4259,13 +4303,13 @@ mod checkpoint {
         // Even a checksum-valid geometry may not inflate isolated validation tables
         // beyond the encoded segment count.
         let mut malformed = bytes.clone();
-        malformed[54..62].copy_from_slice(&1_000_000u64.to_le_bytes());
+        malformed[90..98].copy_from_slice(&1_000_000u64.to_le_bytes());
         resign(&mut malformed);
         assert!(matches!(
             recovery_memory(&malformed, usize::MAX),
             Err(Error::CorruptRecord)
         ));
-        for length in 0..68 {
+        for length in 0..104 {
             assert!(decode_with_budget(&bytes[..length], 1).is_err());
         }
     }
@@ -4309,6 +4353,90 @@ mod checkpoint {
                 .sequence,
             2
         );
+    }
+
+    /// Rebuild a v2 image as the v1 layout: no cluster field, version 1.
+    fn legacy_v1(v2: &[u8]) -> Vec<u8> {
+        use sha2::Digest;
+        let body = &v2[..v2.len() - 32];
+        let mut v1 = body[..32].to_vec();
+        v1.extend_from_slice(&body[32 + 36..]);
+        v1[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let length = (v1.len() + 32) as u64;
+        v1[24..32].copy_from_slice(&length.to_le_bytes());
+        let digest = sha2::Sha256::digest(&v1);
+        v1.extend_from_slice(&digest);
+        v1
+    }
+
+    #[test]
+    fn cluster_round_trips_and_binds_the_digest() {
+        let original = image(3);
+        let bytes = encode(&original).unwrap();
+        assert_eq!(CHECKPOINT_VERSION, 2);
+        assert_eq!(&bytes[32..68], original.cluster.0.as_bytes());
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.cluster, original.cluster);
+        assert_eq!(encode(&decoded).unwrap(), bytes);
+        // Editing the cluster without the digest is corruption.
+        let mut edited = bytes.clone();
+        edited[32] = b'4';
+        assert!(decode(&edited).is_err());
+    }
+
+    #[test]
+    fn invalid_cluster_is_rejected_on_encode_and_decode() {
+        for bad in [
+            "",
+            "not-a-uuid",
+            "11111111-1111-4111-8111-11111111111",
+            "11111111-1111-4111-8111-1111111111111",
+            "AAAAAAAA-1111-4111-8111-111111111111",
+            "11111111x1111-4111-8111-111111111111",
+        ] {
+            let mut cut = image(1);
+            cut.cluster = racer_control_wire::ClusterId(bad.into());
+            assert!(encode(&cut).is_err(), "{bad}");
+        }
+        // Same-length invalid bytes with a valid digest still fail to decode.
+        use sha2::Digest;
+        let bytes = encode(&image(1)).unwrap();
+        let mut body = bytes[..bytes.len() - 32].to_vec();
+        body[32..68].copy_from_slice(b"AAAAAAAA-1111-4111-8111-111111111111");
+        let digest = sha2::Sha256::digest(&body);
+        body.extend_from_slice(&digest);
+        assert!(decode(&body).is_err());
+        body[32] = 0xff;
+        let len = body.len();
+        let digest = sha2::Sha256::digest(&body[..len - 32]);
+        body[len - 32..].copy_from_slice(&digest);
+        assert!(decode(&body).is_err());
+    }
+
+    #[test]
+    fn legacy_v1_checkpoint_is_a_disposable_cold_start() {
+        use crate::store::checkpoint::candidates;
+        let directory = Directory::new();
+        let v1 = legacy_v1(&encode(&image(7)).unwrap());
+        assert!(decode(&v1).is_err());
+        assert!(recovery_memory(&v1, usize::MAX).is_err());
+        // Only v1 on disk: no candidate and no error, so recovery starts cold.
+        fs::write(directory.0.join("checkpoint.0"), &v1).unwrap();
+        assert!(
+            candidates(&directory.0, MAX_CHECKPOINT_BYTES)
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        // A v2 slot next to a newer v1 slot is still used. The v1 file is left
+        // in place and is replaced by the next publication.
+        fs::write(directory.0.join("checkpoint.1"), encode(&image(2)).unwrap()).unwrap();
+        let found: Vec<_> = candidates(&directory.0, MAX_CHECKPOINT_BYTES)
+            .unwrap()
+            .map(|(_, image)| image.sequence)
+            .collect();
+        assert_eq!(found, vec![2]);
+        assert!(directory.0.join("checkpoint.0").exists());
     }
 
     #[test]
@@ -4432,6 +4560,7 @@ mod checkpoint {
         let (index, segments) = state(8);
         let image = CheckpointImage {
             version: CHECKPOINT_VERSION,
+            cluster: crate::store::checkpoint::test_cluster(),
             sequence: 1,
             shards: vec![ShardImage {
                 worker: WorkerId(0),
@@ -4441,34 +4570,34 @@ mod checkpoint {
             }],
         };
         let bytes = checkpoint_format::encode(&image).unwrap();
-        assert_eq!(bytes.len(), 220);
-        let digest: String = bytes[188..]
+        assert_eq!(bytes.len(), 256);
+        let digest: String = bytes[224..]
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
         assert_eq!(
             digest,
-            "a5d7c2c881f46d3839ebae21db2a1617779fa6a1673a488c55ac29286641718e"
+            "0a8d0b1b2ee0e087578382b7d98f70a95220ad3e3a9b4c5839bd4d994000e7b3"
         );
     }
 
     #[test]
     fn populated_cut_has_stable_current_binary_vector() {
         let bytes = checkpoint_format::encode(&image(7)).unwrap();
-        // image(7) layout: header 32 + shard count 4 + worker 2 + geometry 80
+        // image(7) layout: header 32 + cluster UUID 36 + shard count 4 + worker 2 + geometry 80
         // + segment count 4 + two segments 58 + page count 4 + descriptor 92
         // (36-byte cache, 32-byte key, 4-byte quoted ETag, length 8, three
         // string lengths 12) + page fields 56 (page number, key ID, segment,
         // generation, extent offset and length) + descriptor count 4 + the
-        // standalone "empty" descriptor 95 = 431 body bytes, then the digest.
-        assert_eq!(bytes.len(), 463);
-        let digest: String = bytes[431..]
+        // standalone "empty" descriptor 95 = 467 body bytes, then the digest.
+        assert_eq!(bytes.len(), 499);
+        let digest: String = bytes[467..]
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
         assert_eq!(
             digest,
-            "e7169d41349dfb5f3b9fc55abc47268d1d6a7b4272261e4e1e423c65a9b40c61"
+            "b8d46e4aa27e93ec10d3df93a60687b0772d7d14926a77fb5b883b8990e5b34a"
         );
         let decoded = checkpoint_format::decode(&bytes).unwrap();
         assert_eq!(decoded.shards[0].index.entries.len(), 1);
@@ -4655,8 +4784,10 @@ mod checkpoint {
                 .unwrap()
                 .is_none()
         );
-        block_on(checkpointer.publish(vec![shard()])).unwrap();
-        block_on(checkpointer.publish(vec![shard()])).unwrap();
+        block_on(checkpointer.publish(crate::store::checkpoint::test_cluster(), vec![shard()]))
+            .unwrap();
+        block_on(checkpointer.publish(crate::store::checkpoint::test_cluster(), vec![shard()]))
+            .unwrap();
         let load = || {
             block_on(recovery.load(geometry().alignment().unwrap()))
                 .unwrap()
@@ -4671,7 +4802,8 @@ mod checkpoint {
         .unwrap();
         fs::write(directory.0.join("slab.0"), b"payload must not be scanned").unwrap();
         assert_eq!(load().sequence, 1);
-        block_on(checkpointer.publish(vec![shard()])).unwrap();
+        block_on(checkpointer.publish(crate::store::checkpoint::test_cluster(), vec![shard()]))
+            .unwrap();
         assert_eq!(load().sequence, 2);
         assert_eq!(
             fs::read(directory.0.join("slab.0")).unwrap(),
@@ -4901,10 +5033,14 @@ mod checkpoint {
         assert!(block_on(checkpointer.snapshot_shard()).is_err());
         assert!(segments.append(4096).is_ok());
 
-        block_on(checkpointer.publish(vec![shard()])).unwrap();
+        block_on(checkpointer.publish(crate::store::checkpoint::test_cluster(), vec![shard()]))
+            .unwrap();
         // Force rename to fail while leaving the previously published slot readable.
         fs::create_dir(directory.0.join("checkpoint.1")).unwrap();
-        assert!(block_on(checkpointer.publish(vec![shard()])).is_err());
+        assert!(
+            block_on(checkpointer.publish(crate::store::checkpoint::test_cluster(), vec![shard()]))
+                .is_err()
+        );
         let recovery = Recovery::new(directory.0.clone(), index, segments);
         let recovered = block_on(recovery.load(geometry().alignment().unwrap()))
             .unwrap()

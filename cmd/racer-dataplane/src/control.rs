@@ -59,6 +59,7 @@ use wire_codec::rest;
 #[cfg(test)]
 use wire_codec::rest::Response;
 
+pub mod managed;
 pub mod publication;
 pub mod rails;
 pub mod session;
@@ -76,6 +77,28 @@ pub struct ControlEndpoint {
 
     /// Deployment-provided trust, independent of rotating peer trust roots.
     pub trust_bundle: PathBuf,
+
+    /// Elected, certificate-pinned endpoints that replace `url` and
+    /// `trust_bundle` in managed mode. Discovery refreshes the shared set.
+    pub discovered: Option<rest::DiscoveredEndpoints>,
+}
+
+/// Report this node's shares and RDMA rails to the embedded cluster control.
+///
+/// Called from the control reactor; implementations must only enqueue work.
+pub type Report = Arc<dyn Fn(u32, Vec<wire::RailMapping>) + Send + Sync>;
+
+/// Managed-mode bindings from the embedded cluster-control service.
+#[derive(Clone)]
+pub struct Managed {
+    /// Elected endpoints refreshed by discovery; read on every connection checkout.
+    pub endpoints: rest::DiscoveredEndpoints,
+
+    /// Background Pod report of shares and discovered rails.
+    pub report: Report,
+
+    /// Device selector from control bootstrap; preferred over the enrollment copy.
+    pub block_devices: Option<String>,
 }
 
 /// Reject overlapping owner-local operations without retaining a borrow.
@@ -552,7 +575,7 @@ pub(crate) mod tests {
             use racer_crypto::identity::KeyPurpose;
             let publication = racer_control_wire::decode_publication(include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/../../internal/racer/wire/testdata/publication.json"
+                "/control-wire/testdata/publication.json"
             )))
             .unwrap();
             let keys = Rc::new(Keyring::new(
@@ -564,7 +587,7 @@ pub(crate) mod tests {
             let (ca, _) = testing::ca();
             let mut bundle = wire::decode_bundle(include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/../../internal/racer/wire/testdata/bundle.json"
+                "/control-wire/testdata/bundle.json"
             )))
             .unwrap();
             bundle.generation = BundleGeneration(2);
@@ -632,7 +655,7 @@ pub(crate) mod tests {
                 d.0.join("epoch-a/bundle.json"),
                 include_bytes!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
-                    "/../../internal/racer/wire/testdata/bundle.json"
+                    "/control-wire/testdata/bundle.json"
                 )),
             )
             .unwrap();
@@ -686,6 +709,7 @@ pub(crate) mod tests {
                 ControlEndpoint {
                     url: "https://localhost".into(),
                     trust_bundle: d.0.join("trust"),
+                    discovered: None,
                 },
                 Rc::new(Enrollment::new(
                     cluster.clone(),
@@ -809,10 +833,7 @@ pub(crate) mod tests {
 
         #[test]
         fn application_roundtrips_preserve_exact_wire_records() {
-            const ROOT: &str = concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../internal/racer/wire/testdata/"
-            );
+            const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/control-wire/testdata/");
             for name in [
                 "publication.json",
                 "bootstrap-request.json",
@@ -881,7 +902,7 @@ pub(crate) mod tests {
         fn replacement_definitions_and_socket_paths_are_validated() {
             let mut defs = decode_publication(include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/../../internal/racer/wire/testdata/publication.json"
+                "/control-wire/testdata/publication.json"
             )))
             .unwrap()
             .caches;
@@ -1130,7 +1151,7 @@ pub(crate) mod tests {
         fn publication(sequence: u64) -> Publication {
             let mut p = decode_publication(include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/../../internal/racer/wire/testdata/publication.json"
+                "/control-wire/testdata/publication.json"
             )))
             .unwrap();
             p.sequence.0 = sequence;
@@ -1485,6 +1506,7 @@ pub(crate) mod tests {
             let endpoint = ControlEndpoint {
                 url: format!("https://{}", listener.local_addr().unwrap()),
                 trust_bundle: trust,
+                discovered: None,
             };
             let server = std::thread::spawn(move || {
                 for group in groups {
@@ -1619,6 +1641,7 @@ pub(crate) mod tests {
                 let transport = session::transport(&ControlEndpoint {
                     url: "https://localhost".into(),
                     trust_bundle: trust,
+                    discovered: None,
                 });
                 let mut driver = ReactorControlIo::new(reactor.clone());
                 driver.connect_probe = Some(io.clone());
@@ -1736,6 +1759,7 @@ pub(crate) mod tests {
             let transport = session::transport(&ControlEndpoint {
                 url: format!("https://127.0.0.1:{port}"),
                 trust_bundle: trust,
+                discovered: None,
             });
             transport.attach_io(Rc::new(ReactorControlIo::new(r.clone())));
             let scope = testing::scope();
@@ -1868,6 +1892,7 @@ pub(crate) mod tests {
             let endpoint = ControlEndpoint {
                 url: format!("https://{}", listener.local_addr().unwrap()),
                 trust_bundle: trust,
+                discovered: None,
             };
             // Digest syntax is generated by the typed codec now, but this public
             // REST boundary must still reject injected headers before HTTP writes.

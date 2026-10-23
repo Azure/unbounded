@@ -470,6 +470,12 @@ impl RotationServer {
         }
     }
 
+    /// Loopback port accepting fixture connections; unused by private lib tests.
+    #[allow(dead_code)]
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
     /// Select certificates for subsequent connections.
     pub fn rotate(&self, config: Arc<rustls::ServerConfig>) {
         *self.config.lock().unwrap() = config;

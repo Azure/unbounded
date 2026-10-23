@@ -356,6 +356,7 @@ fn disposable_loop_devices_read_only_bind_restart() {
         &reactor,
         checkpoint
             .publish_async(
+                crate::store::checkpoint::test_cluster(),
                 vec![image],
                 reactor.clone(),
                 scope.clone(),
