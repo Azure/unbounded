@@ -220,14 +220,24 @@ func TestIntegrationDeleteFallbackExternalStop(t *testing.T) {
 	rec.check(t)
 }
 
-// TestIntegrationDeleteFallbackCancelFirst cancels each DEL_DEV as soon as
-// it is submitted, so the kernel may cancel it before dispatch. Either
-// way teardown must finish and remove the device with the fd held.
+// TestIntegrationDeleteFallbackCancelFirst cancels the first DEL_DEV as
+// soon as it is submitted, so the kernel may cancel it before dispatch.
+// Later cancels use the production pause, as skipping every pause can
+// cancel each resend before an io-wq worker picks it up and exhaust the
+// retry limit. Either way teardown must finish and remove the device with
+// the fd held.
 func TestIntegrationDeleteFallbackCancelFirst(t *testing.T) {
 	requireUblk(t)
 	withoutDelDevAsync(t)
 
-	testHooks.pinnedDelPause = func(int) {}
+	// Runs only on the teardown goroutine; read after Close returns.
+	pauses := 0
+	testHooks.pinnedDelPause = func(round int) {
+		pauses++
+		if pauses > 1 {
+			pinnedDelSleep(round)
+		}
+	}
 
 	t.Cleanup(func() { testHooks.pinnedDelPause = nil })
 
@@ -237,6 +247,10 @@ func TestIntegrationDeleteFallbackCancelFirst(t *testing.T) {
 
 	if err := closeWithin(d, 30*time.Second); err != nil {
 		t.Fatal(err)
+	}
+
+	if pauses == 0 {
+		t.Fatal("pinned DEL_DEV never reached a cancel opportunity")
 	}
 
 	checkFallback(t, d, logs)
