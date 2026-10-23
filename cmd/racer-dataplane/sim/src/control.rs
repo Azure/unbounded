@@ -974,7 +974,8 @@ impl ControlSim {
     }
 
     /// Convergence: once faults have healed for `converge_ns`, every live
-    /// client must have applied every sequence committed `converge_ns` ago.
+    /// client that started at least [`Self::bound`] ago must have applied
+    /// every sequence committed `converge_ns` ago.
     fn check(&mut self, now: Nanos) {
         let current = self.commits.last().map_or(0, |c| c.1);
         let mut behind = Vec::new();
@@ -986,7 +987,8 @@ impl ControlSim {
         for b in behind {
             self.metrics.observe("ctl_sequences_behind", b);
         }
-        let bound = self.bound();
+        let bound = self.settings.converge_ns;
+        let enrolling = self.bound();
         if now < self.settled_ns.saturating_add(bound) {
             return;
         }
@@ -1003,7 +1005,7 @@ impl ControlSim {
             if self.state[c] == State::Gone || !self.cp.alive(c as u32) {
                 continue;
             }
-            if self.started_ns[c] + bound > now {
+            if self.started_ns[c] + enrolling > now {
                 continue;
             }
             let applied = self.applied_seq[c];
@@ -1017,9 +1019,10 @@ impl ControlSim {
         }
     }
 
-    /// Convergence bound: `converge_ns` plus the time the API rate limit
-    /// needs for every client's enrollment calls (an enrollment storm is a
-    /// fault that heals only when the limit lets everyone through).
+    /// Convergence bound for a client since it started: `converge_ns` plus
+    /// the time the API rate limit needs for every client's enrollment
+    /// calls (an enrollment storm heals only when the limit lets everyone
+    /// through). Healed faults use `converge_ns` alone.
     pub fn bound(&self) -> Nanos {
         let calls = f64::from(self.settings.pods) * API_CALLS_PER_ENROLLMENT as f64;
         self.settings.converge_ns + (calls / self.settings.api_qps * 1e9) as Nanos
@@ -1244,6 +1247,15 @@ mod tests {
         assert_eq!(counter(r, "ctl_dual_primary"), 0);
     }
 
+    fn checks(r: &Value, name: &str) -> u64 {
+        r["invariants"]["invariants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == name)
+            .map_or(0, |i| i["checks"].as_u64().unwrap())
+    }
+
     #[test]
     fn enrollment_storm_enrolls_everyone() {
         let r = quick("enrollment-storm", 300, 300, 1);
@@ -1300,6 +1312,7 @@ mod tests {
                 >= 2
         );
         assert!(counter(&r, "ctl_crashes") >= 3);
+        assert!(checks(&r, "ctl_client_converges") > 0);
     }
 
     #[test]
@@ -1319,6 +1332,7 @@ mod tests {
             r["metrics"]["counters"]
         );
         assert!(counter(&r, "ctl_full_replies") > 0);
+        assert!(checks(&r, "ctl_client_converges") > 0);
     }
 
     #[test]
@@ -1326,13 +1340,8 @@ mod tests {
         let r = quick("lagging", 300, 900, 1);
         assert_clean(&r);
         assert!(counter(&r, "ctl_unreachable") > 0);
-        let conv = r["invariants"]["invariants"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|i| i["name"] == "ctl_client_converges")
-            .expect("convergence checked");
-        assert!(conv["checks"].as_u64().unwrap() > 0);
+        assert!(checks(&r, "ctl_client_converges") > 0);
+        assert!(counter(&r, "ctl_full_fallbacks") > 0);
     }
 
     #[test]
