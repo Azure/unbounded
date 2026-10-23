@@ -137,54 +137,69 @@ class FakeRacer:
 
     def _dispatch(self, conn, method, target, headers, fds, seen, rest):
         if headers.get("host") != "racer" or not target.startswith(wire.OBJECT_PREFIX):
-            return self._error(conn, 400)
+            self._error(conn, 400)
+            return
         tail = target[len(wire.OBJECT_PREFIX) :]
         key, _, mode = tail.partition("/")
         if mode and (self.old or mode not in ("host-read", "gpu-read")):
-            return self._error(conn, 400)
+            self._error(conn, 400)
+            return
         # Order follows the dataplane: RequestParser::parse
         # (object-wire/src/client.rs), then direct::open_sink and
         # HostSink::open (src/client/direct.rs), then the object read.
         if mode and method != "POST":
-            return self._error(conn, 405)
+            self._error(conn, 405)
+            return
         if mode:
             if headers.get("content-length") != "0":
-                return self._error(conn, 400)
+                self._error(conn, 400)
+                return
             try:
                 off = wire.decimal(headers.get("racer-destination-offset"))
                 length = wire.decimal(headers.get("racer-destination-length"))
                 alloc = wire.decimal(headers.get("racer-allocation-size")) if mode == "gpu-read" else None
             except racer.RacerError:
-                return self._error(conn, 400)
+                self._error(conn, 400)
+                return
             if length == 0 or off + length > wire.MAX_WIRE_INTEGER or (alloc is not None and off + length > alloc):
-                return self._error(conn, 400)
+                self._error(conn, 400)
+                return
         if fds and not mode:
-            return self._error(conn, 400)
+            self._error(conn, 400)
+            return
         if mode and len(fds) != 1:
-            return self._error(conn, 400)
+            self._error(conn, 400)
+            return
         if mode == "gpu-read" and self.gpu_status != 200:
-            return self._error(conn, self.gpu_status)
+            self._error(conn, self.gpu_status)
+            return
         if mode == "host-read" and self.host_status:
-            return self._error(conn, self.host_status)
+            self._error(conn, self.host_status)
+            return
         if mode == "host-read":
             flags = fcntl.fcntl(fds[0], fcntl.F_GETFL)
             if seen.fd_kind != "regular" or flags & os.O_ACCMODE == os.O_RDONLY or flags & os.O_APPEND:
-                return self._error(conn, 400)
+                self._error(conn, 400)
+                return
         obj = self.objects.get(key)
         if obj is None:
-            return self._error(conn, 404)
+            self._error(conn, 404)
+            return
         if "if-match" in headers and headers["if-match"] != obj.etag:
-            return self._error(conn, 412)
+            self._error(conn, 412)
+            return
         meta = [("ETag", obj.etag), ("Racer-Expires-At", str(obj.expires_ms))]
         if obj.content_type:
             meta.append(("Racer-Content-Type", obj.content_type))
         size = len(obj.data)
         if method == "HEAD":
-            return self._send(
+            self._send(
                 conn, 200, meta + [("Content-Length", str(size)), ("Content-Type", "application/octet-stream")]
             )
+            return
         if method != "POST":
-            return self._error(conn, 405)
+            self._error(conn, 405)
+            return
         first, end = 0, size
         if "range" in headers:
             spec = headers["range"][len("bytes=") :]
@@ -192,7 +207,8 @@ class FakeRacer:
             first = int(a)
             end = min(size, int(b) + 1) if b else size
             if first >= size and size > 0 or first > size:
-                return self._error(conn, 416, size)
+                self._error(conn, 416, size)
+                return
         pages = wire.page_count(first, end)
         sel = meta + [
             ("Content-Type", "application/octet-stream"),
@@ -203,7 +219,8 @@ class FakeRacer:
         ]
         if mode:
             if length < end - first:
-                return self._error(conn, 400)
+                self._error(conn, 400)
+                return
             self._send(
                 conn,
                 200,
