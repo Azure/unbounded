@@ -885,6 +885,8 @@ struct Helper {
     /// Reads the reader threads finished, so their files can be released.
     done: mpsc::Receiver<FileDone>,
     readers: Vec<std::thread::JoinHandle<()>>,
+    /// Opens the cuFile driver ahead of the first sealed page.
+    opener: Option<std::thread::JoinHandle<()>>,
     requests: HashMap<u64, Request>,
     /// RDMA landing buffers by GPU. Never freed: a NIC may hold a
     /// registration over them.
@@ -922,6 +924,7 @@ fn helper_main(
                     readers.push(thread);
                 }
             }
+            let opener = open_cufile(&gpu, &state.cufile);
             let _ = ready.send(Ok((usable, decrypt)));
             Helper {
                 gpu,
@@ -933,6 +936,7 @@ fn helper_main(
                 reads: (!readers.is_empty()).then_some(reads),
                 done,
                 readers,
+                opener,
                 requests: HashMap::new(),
                 landing: HashMap::new(),
                 state,
@@ -953,6 +957,9 @@ fn helper_main(
     for reader in std::mem::take(&mut helper.readers) {
         let _ = reader.join();
     }
+    if let Some(opener) = helper.opener.take() {
+        let _ = opener.join();
+    }
     helper.finish_reads();
     // Release what is left, stream first.
     let ids: Vec<u64> = helper.requests.keys().copied().collect();
@@ -963,6 +970,29 @@ fn helper_main(
     for (_, buffer) in helper.landing.drain() {
         std::mem::forget(buffer);
     }
+}
+
+/// Open the cuFile driver on its own thread. Opening probes every GPU and can
+/// take most of a second, so doing it at startup keeps that time out of the
+/// first sealed page. A failed open turns cuFile off, as a failed stage does.
+fn open_cufile(
+    gpu: &racer_gpu::Gpu,
+    cufile: &Arc<AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    if !cufile.load(Ordering::Relaxed) {
+        return None;
+    }
+    let (reader, cufile) = (gpu.file_reader(), cufile.clone());
+    std::thread::Builder::new()
+        .name("racer-gpu-cufile".into())
+        .spawn(move || {
+            if let Err(error) = reader.open_driver()
+                && cufile.swap(false, Ordering::Relaxed)
+            {
+                eprintln!("racer-dataplane: stage=gpu state=cufile-disabled reason={error}");
+            }
+        })
+        .ok()
 }
 
 /// Queue a zero-length decrypt to learn whether the shim has working decrypt
@@ -1563,6 +1593,14 @@ pub(crate) mod testing {
 
     /// A required-mode helper on simulated GPUs with these NUMA nodes.
     pub(crate) fn helper(numa: &[Option<u32>]) -> Arc<GpuHelper> {
+        helper_with(numa, |_| {})
+    }
+
+    /// A helper whose simulation `setup` prepares before the backend loads.
+    pub(crate) fn helper_with(
+        numa: &[Option<u32>],
+        setup: impl FnOnce(&racer_gpu::simulation::Simulation) + Send + 'static,
+    ) -> Arc<GpuHelper> {
         let devices: Vec<racer_gpu::simulation::SimDevice> = numa
             .iter()
             .enumerate()
@@ -1576,6 +1614,7 @@ pub(crate) mod testing {
             GpuMode::Required,
             Box::new(move || {
                 let simulation = racer_gpu::simulation::Simulation::new(devices);
+                setup(&simulation);
                 let environment = simulation.enter();
                 SIM.with(|sim| *sim.borrow_mut() = Some((simulation, environment)));
                 racer_gpu::Gpu::load()
@@ -1821,6 +1860,39 @@ mod tests {
         assert_eq!(operations(&helper, Operation::FileFree), 1);
         assert_eq!(helper.run(|| simulation().live().files), 1);
         assert_eq!(helper.counters().staged.load(Ordering::Relaxed), 2);
+    }
+
+    /// Wait for the helper's background work to reach `done`.
+    fn eventually(mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    /// The cuFile driver opens at startup, before any sealed page asks for it.
+    fn cufile_driver_opens_at_startup() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None]);
+        eventually(|| operations(&helper, Operation::FileOpen) == 1);
+        assert!(helper.cufile());
+        let fd = slab(&[3; 4096]);
+        stage(&helper, &fd, 0, 4096).unwrap();
+        assert_eq!(helper.counters().staged.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    /// A driver that fails to open at startup turns cuFile off before any
+    /// sealed page asks for it.
+    fn cufile_driver_open_failure_turns_cufile_off() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper_with(&[None], |simulation| {
+            simulation.fault(Operation::FileOpen, -5)
+        });
+        eventually(|| !helper.cufile());
+        assert_eq!(helper.counters().staged.load(Ordering::Relaxed), 0);
     }
 
     #[test]

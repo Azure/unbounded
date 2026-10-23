@@ -47,7 +47,7 @@ pub use ffi::{MAX_AAD, MAX_DECRYPT, flag};
 use ffi::{Out, RawDecrypt, RawDevice, RawVerdict, Shared};
 use std::{
     cell::{Cell, RefCell},
-    ffi::c_void,
+    ffi::{c_int, c_void},
     ops::Range,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     ptr::NonNull,
@@ -280,6 +280,7 @@ impl Gpu {
     /// and the objects the reads name.
     pub fn file_reader(&self) -> FileReader {
         FileReader {
+            file_open: self.shared.api.file_open,
             file_read: self.shared.api.file_read,
             last_driver_error: self.shared.api.last_driver_error,
             #[cfg(any(test, feature = "simulation"))]
@@ -291,6 +292,8 @@ impl Gpu {
 /// Runs cuFile reads off the helper thread. Cheap to clone.
 #[derive(Clone)]
 pub struct FileReader {
+    file_open: unsafe extern "C" fn() -> c_int,
+
     file_read: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u64, u64) -> i64,
 
     last_driver_error: unsafe extern "C" fn() -> i32,
@@ -301,13 +304,19 @@ pub struct FileReader {
 }
 
 impl FileReader {
+    /// Open the cuFile driver, as [`Gpu::open_file`] does on first use.
+    /// Opening probes every GPU and can take most of a second, so callers
+    /// may do it ahead of time on another thread. A failed open is final.
+    pub fn open_driver(&self) -> Result<()> {
+        #[cfg(any(test, feature = "simulation"))]
+        let _environment = self.enter();
+        ffi::check(unsafe { (self.file_open)() }, self.last_driver_error)
+    }
+
     /// Run `read` and wait for it. Errors are those of [`GpuFile::read`].
     pub fn read(&self, read: FileRead) -> Result<()> {
         #[cfg(any(test, feature = "simulation"))]
-        let _environment = match (&self.simulation, simulation::current()) {
-            (Some(simulation), None) => Some(simulation.enter()),
-            _ => None,
-        };
+        let _environment = self.enter();
         let n = unsafe {
             (self.file_read)(
                 read.file.as_ptr(),
@@ -324,6 +333,15 @@ impl FileReader {
             return Err(Error::Io);
         }
         Ok(())
+    }
+
+    /// Enter the backend's simulation if this thread is not in one.
+    #[cfg(any(test, feature = "simulation"))]
+    fn enter(&self) -> Option<simulation::Environment> {
+        match (&self.simulation, simulation::current()) {
+            (Some(simulation), None) => Some(simulation.enter()),
+            _ => None,
+        }
     }
 }
 
