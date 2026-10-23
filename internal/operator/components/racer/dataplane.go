@@ -8,9 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strconv"
 
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/utils/ptr"
@@ -18,7 +19,6 @@ import (
 
 	manifests "github.com/Azure/unbounded/deploy/racer"
 	"github.com/Azure/unbounded/internal/operator/component"
-	"github.com/Azure/unbounded/internal/racer/wire"
 	"github.com/Azure/unbounded/internal/racer/workload"
 )
 
@@ -26,151 +26,162 @@ const (
 	dataplaneName          = workload.DataplaneDaemonSetName
 	dataplaneConfigName    = "racer-dataplane-config"
 	dataplaneImageName     = "racer-dataplane"
-	dataplaneContainerName = "dataplane"
+	objectImageName        = "racer-object"
+	dataplaneContainerName = workload.ContainerName
 	dataplaneConfigHash    = "unbounded-cloud.io/racer-dataplane-config-hash"
+
+	// minThreads covers one I/O worker, one crypto helper, and the
+	// dedicated control plane thread.
+	minThreads = 3
 )
 
-// dataplaneObjects lists the dataplane resources the operator owns. They are
-// installation evidence like the controller manifests: a standalone copy is
-// never adopted.
-func dataplaneObjects(env *component.Env) []client.Object {
-	return []client.Object{
-		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: dataplaneName, Namespace: env.Namespace}},
-		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: dataplaneConfigName, Namespace: env.Namespace}},
-		&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: dataplaneName, Namespace: env.Namespace}},
-	}
-}
-
-// controlURL is the in-cluster HTTPS origin of the controller Service.
-func controlURL(env *component.Env) string {
-	return "https://" + controllerName + "." + env.Namespace + ".svc:8443"
-}
-
-// dataplaneWorkloadConfig combines operator-owned identity and wiring with the
-// workload inputs administrators may tune in racer-config.
-func dataplaneWorkloadConfig(env *component.Env, marker, config *corev1.ConfigMap) (workload.Config, error) {
-	owned := map[string]string{
-		"POD_NAMESPACE":                   env.Namespace,
-		"RACER_CLUSTER_ID":                marker.Data["cluster"],
-		"RACER_CONTROL_URL":               controlURL(env),
-		"RACER_DATAPLANE_IMAGE":           env.Config.Image(dataplaneImageName),
-		"RACER_BOOTSTRAP_TRUST_CONFIGMAP": trustName,
-		"RACER_DATAPLANE_SERVICE_ACCOUNT": dataplaneName,
-		"RACER_DAEMONSET_NAME":            dataplaneName,
+// planDataplaneConfig creates racer-dataplane-config with defaults when it is
+// absent and otherwise reads it. Every key is administrator payload; its
+// hash rolls the DaemonSet.
+func planDataplaneConfig(ctx context.Context, env *component.Env, plan *component.Plan) (*corev1.ConfigMap, error) {
+	decoded, err := env.DecodeManifestFiles(manifests.Manifests, []string{"dataplane-config.yaml"}, nil)
+	if err != nil {
+		return nil, err
 	}
 
-	cfg, err := workload.ConfigFromLookup(func(key string) (string, bool) {
-		if value, ok := owned[key]; ok {
-			return value, true
+	if len(decoded) != 1 {
+		return nil, errors.New("racer dataplane config manifest must contain one object")
+	}
+
+	config := &corev1.ConfigMap{}
+
+	err = env.LiveReader().Get(ctx, client.ObjectKeyFromObject(decoded[0]), config)
+	if apierrors.IsNotFound(err) {
+		if err := env.Scheme.Convert(decoded[0], config, nil); err != nil {
+			return nil, err
 		}
 
-		value, ok := config.Data[key]
+		config.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"}
+		markManaged(config)
 
-		return value, ok
-	})
+		plan.Add(component.Operation{Kind: component.OpCreateIfAbsent, Object: component.ToUnstructured(config), Component: name})
+
+		return config, nil
+	}
+
 	if err != nil {
-		return workload.Config{}, fmt.Errorf("racer dataplane workload configuration: %w", err)
+		return nil, err
 	}
 
-	// The controller authenticates only Pods controlled by the single
-	// configured DaemonSet, so a pod-network split cannot enroll.
-	if len(cfg.PodNetworkNodes) != 0 {
-		return workload.Config{}, fmt.Errorf("RACER_POD_NETWORK_NODES is not supported by managed installations: %w", wire.InvalidRequest)
+	config.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("ConfigMap"))
+
+	if err := validateAdoptable(ctx, env, config); err != nil {
+		return nil, err
 	}
 
-	return cfg, nil
+	if value, ok := config.Data[workload.ControlSeatsKey]; ok && value != "auto" {
+		// The runtime accepts only the canonical decimal form, so reject
+		// leading zeros, signs, and whitespace before Pods roll.
+		seats, err := strconv.ParseUint(value, 10, 8)
+		if err != nil || strconv.FormatUint(seats, 10) != value || seats < 1 || seats > workload.MaxControlSeats {
+			return nil, fmt.Errorf("ConfigMap %s %s must be auto or an integer from 1 to %d", dataplaneConfigName, workload.ControlSeatsKey, workload.MaxControlSeats)
+		}
+	}
+
+	if value, ok := config.Data["RACER_MAX_THREADS"]; ok {
+		threads, err := strconv.ParseUint(value, 10, 64)
+		if err != nil || threads < minThreads {
+			return nil, fmt.Errorf("ConfigMap %s RACER_MAX_THREADS must be an integer of at least %d, including the control plane thread", dataplaneConfigName, minThreads)
+		}
+	}
+
+	return config, nil
 }
 
-// planDataplane adds the dataplane ServiceAccount, tuning ConfigMap, and
-// DaemonSet. The DaemonSet waits for every earlier runtime operation, including
-// the bootstrap trust ConfigMap it mounts.
-func planDataplane(ctx context.Context, env *component.Env, plan *component.Plan, marker, config *corev1.ConfigMap) error {
-	cfg, err := dataplaneWorkloadConfig(env, marker, config)
-	if err != nil {
-		return err
-	}
-
+// planDataplane adds the dataplane ServiceAccount and DaemonSet. Both record
+// the racer-state UID they run on. The DaemonSet waits for every listed
+// dependency, which includes its RBAC bindings.
+func planDataplane(ctx context.Context, env *component.Env, plan *component.Plan, config *corev1.ConfigMap, stateUID string, dependencies []component.ObjectRef) error {
 	account := &corev1.ServiceAccount{
 		TypeMeta:                     metav1.TypeMeta{APIVersion: "v1", Kind: "ServiceAccount"},
-		ObjectMeta:                   metav1.ObjectMeta{Name: dataplaneName, Namespace: env.Namespace},
+		ObjectMeta:                   metav1.ObjectMeta{Name: dataplaneName, Namespace: env.Namespace, Annotations: map[string]string{stateUIDAnnotation: stateUID}},
 		AutomountServiceAccountToken: ptr.To(false),
 	}
 
-	op, err := ownedRuntimeOperation(ctx, env, component.Operation{Kind: component.OpApply, Object: component.ToUnstructured(account), Component: name}, marker.UID)
+	op, err := ownedOperation(ctx, env, component.Operation{Kind: component.OpApply, Object: component.ToUnstructured(account), Component: name})
 	if err != nil {
 		return err
 	}
 
 	plan.Add(op)
 
-	decoded, err := env.DecodeManifestFiles(manifests.Manifests, []string{"dataplane-config.yaml"}, nil)
+	cfg := workload.DefaultConfig(env.Namespace, env.Config.Image(dataplaneImageName), env.Config.Image(objectImageName))
+
+	ds, err := workload.DaemonSet(cfg)
 	if err != nil {
 		return err
 	}
 
-	if len(decoded) != 1 {
-		return fmt.Errorf("racer dataplane config manifest must contain one object")
+	ds.Annotations = map[string]string{stateUIDAnnotation: stateUID}
+	if ds.Spec.Template.Annotations == nil {
+		ds.Spec.Template.Annotations = map[string]string{}
 	}
 
-	defaults := &corev1.ConfigMap{}
-	if err := env.Scheme.Convert(decoded[0], defaults, nil); err != nil {
-		return err
-	}
+	ds.Spec.Template.Annotations[dataplaneConfigHash] = component.ConfigMapPayloadHash(config)
 
-	bindRuntime(defaults, marker.UID)
+	container := &ds.Spec.Template.Spec.Containers[0]
+	// Explicit env wiring wins over these imports.
+	container.EnvFrom = []corev1.EnvFromSource{{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: dataplaneConfigName}}}}
 
-	// Every key is administrator payload; the operator only creates defaults.
-	tuning, err := preservedConfig(ctx, env, plan, defaults, nil)
+	op, err = ownedOperation(ctx, env, component.Operation{
+		Kind: component.OpApply, Object: component.ToUnstructured(ds), Component: name,
+		Overridable: true, ValidateOverride: ValidateDataplaneOverride,
+		DependsOn: append(append([]component.ObjectRef(nil), dependencies...), op.Ref()),
+	})
 	if err != nil {
 		return err
 	}
 
-	daemonSets, err := workload.DesiredDaemonSets(cfg)
-	if err != nil {
-		return err
-	}
-
-	var dependencies []component.ObjectRef
-	for _, dependency := range plan.Operations {
-		dependencies = append(dependencies, dependency.Ref())
-	}
-
-	hash := component.ConfigMapPayloadHash(tuning)
-
-	for _, ds := range daemonSets {
-		for i := range ds.Spec.Template.Spec.Containers {
-			container := &ds.Spec.Template.Spec.Containers[i]
-			if container.Name == dataplaneContainerName {
-				// Explicit env wiring wins over these imports.
-				container.EnvFrom = []corev1.EnvFromSource{{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: dataplaneConfigName}}}}
-			}
-		}
-
-		if ds.Spec.Template.Annotations == nil {
-			ds.Spec.Template.Annotations = map[string]string{}
-		}
-
-		ds.Spec.Template.Annotations[dataplaneConfigHash] = hash
-
-		op := component.Operation{
-			Kind: component.OpApply, Object: component.ToUnstructured(ds), Component: name,
-			Overridable: true, ValidateOverride: ValidateDataplaneOverride,
-			DependsOn: append([]component.ObjectRef(nil), dependencies...),
-		}
-
-		op, err = ownedRuntimeOperation(ctx, env, op, marker.UID)
-		if err != nil {
-			return err
-		}
-
-		plan.Add(op)
-	}
+	plan.Add(op)
 
 	return nil
 }
 
+// recordedStateUID returns the racer-state UID an existing installation runs
+// on, or empty when no managed dataplane object records one. The retired
+// controller's DaemonSet records none, so migration starts a new identity.
+func recordedStateUID(ctx context.Context, env *component.Env) (string, error) {
+	var uid string
+
+	for _, obj := range []client.Object{&corev1.ServiceAccount{}, &unstructured.Unstructured{Object: map[string]any{"apiVersion": "apps/v1", "kind": "DaemonSet"}}} {
+		err := env.LiveReader().Get(ctx, objectKey(env, dataplaneName), obj)
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+
+		if err != nil {
+			return "", err
+		}
+
+		// A terminating object still records the identity its Pods may be
+		// running on, so it keeps failing closed until it is gone.
+		if obj.GetUID() == "" || (obj.GetAnnotations()[managerAnnotation] != component.FieldOwner && obj.GetLabels()[managerLabel] != component.FieldOwner) {
+			continue
+		}
+
+		recorded := obj.GetAnnotations()[stateUIDAnnotation]
+		if recorded == "" {
+			continue
+		}
+
+		if uid != "" && uid != recorded {
+			return "", fmt.Errorf("racer dataplane ServiceAccount and DaemonSet record different racer-state UIDs")
+		}
+
+		uid = recorded
+	}
+
+	return uid, nil
+}
+
 // ValidateDataplaneOverride permits scheduling, rollout, resource, and extra
-// environment tuning, but keeps identity and trust wiring canonical.
+// environment tuning, but keeps identity, credentials, and runtime wiring
+// canonical.
 func ValidateDataplaneOverride(original, candidate *unstructured.Unstructured) error {
 	container := func(ds *unstructured.Unstructured) (map[string]any, int) {
 		var found map[string]any
@@ -197,11 +208,13 @@ func ValidateDataplaneOverride(original, candidate *unstructured.Unstructured) e
 
 	after, afterCount := container(candidate)
 	if beforeCount != 1 || afterCount != 1 {
-		return errors.New("racer DaemonSet must retain exactly one canonical dataplane container")
+		return fmt.Errorf("racer DaemonSet must retain exactly one canonical dataplane container; tune ConfigMap %s instead", dataplaneConfigName)
 	}
 
-	if !reflect.DeepEqual(before["envFrom"], after["envFrom"]) {
-		return errors.New("racer DaemonSet container dataplane envFrom must match the canonical configuration; tune ConfigMap racer-dataplane-config instead")
+	for _, field := range []string{"envFrom", "volumeMounts"} {
+		if !reflect.DeepEqual(before[field], after[field]) {
+			return fmt.Errorf("racer DaemonSet container dataplane %s must match the canonical configuration; tune ConfigMap %s instead", field, dataplaneConfigName)
+		}
 	}
 
 	containerEnv := func(c map[string]any) ([]any, error) {
@@ -226,9 +239,21 @@ func ValidateDataplaneOverride(original, candidate *unstructured.Unstructured) e
 	afterEnv := map[string]any{}
 
 	for _, entry := range afterEnvs {
-		if e, ok := entry.(map[string]any); ok {
-			afterEnv[fmt.Sprint(e["name"])] = e
+		e, ok := entry.(map[string]any)
+		if !ok {
+			continue
 		}
+
+		envName := fmt.Sprint(e["name"])
+		if _, dup := afterEnv[envName]; dup {
+			return fmt.Errorf("racer DaemonSet container dataplane env %s is set more than once; tune ConfigMap %s instead", envName, dataplaneConfigName)
+		}
+
+		if envName == workload.ControlSeatsKey {
+			return fmt.Errorf("racer DaemonSet container dataplane env %s would shadow ConfigMap %s; tune it there instead", envName, dataplaneConfigName)
+		}
+
+		afterEnv[envName] = e
 	}
 
 	beforeEnvs, err := containerEnv(before)
@@ -243,11 +268,11 @@ func ValidateDataplaneOverride(original, candidate *unstructured.Unstructured) e
 		}
 
 		if !reflect.DeepEqual(afterEnv[fmt.Sprint(e["name"])], e) {
-			return fmt.Errorf("racer DaemonSet container dataplane env %v is operator-owned wiring and cannot be overridden", e["name"])
+			return fmt.Errorf("racer DaemonSet container dataplane env %v is operator-owned wiring and cannot be overridden; tune ConfigMap %s instead", e["name"], dataplaneConfigName)
 		}
 	}
 
-	for _, field := range []string{"serviceAccountName", "volumes"} {
+	for _, field := range []string{"serviceAccountName", "automountServiceAccountToken", "volumes"} {
 		beforeValue, _, err := unstructured.NestedFieldNoCopy(original.Object, "spec", "template", "spec", field)
 		if err != nil {
 			return fmt.Errorf("reading canonical racer DaemonSet pod %s: %w", field, err)
@@ -259,7 +284,7 @@ func ValidateDataplaneOverride(original, candidate *unstructured.Unstructured) e
 		}
 
 		if !reflect.DeepEqual(beforeValue, afterValue) {
-			return fmt.Errorf("racer DaemonSet pod %s is operator-owned wiring and cannot be overridden", field)
+			return fmt.Errorf("racer DaemonSet pod %s is operator-owned wiring and cannot be overridden; tune ConfigMap %s instead", field, dataplaneConfigName)
 		}
 	}
 

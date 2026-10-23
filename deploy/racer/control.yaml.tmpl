@@ -1,0 +1,48 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Control objects the operator creates once and the Racer runtime owns after
+# that. The operator creates the Secret and Leases only when absent and never
+# updates or deletes them. The labels below are fixed by admission and mark
+# operator ownership.
+{{- $ns := .Namespace | default "unbounded-system" }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: racer-webhook
+  namespace: {{ $ns }}
+spec:
+  # No selector: the Racer primary lists ready seats in the racer-webhook
+  # EndpointSlice.
+  ports:
+    - name: webhook
+      port: 9443
+      targetPort: 9443
+      protocol: TCP
+---
+# Empty durable state. Its UID is the cluster ID. The runtime initializes it
+# once and refuses to run on missing, wiped, or corrupt state afterward.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: racer-state
+  namespace: {{ $ns }}
+  labels:
+    unbounded-cloud.io/racer-manager: unbounded-operator
+type: Opaque
+{{- $leases := list "racer-primary" }}
+{{- range $seat := until 16 }}
+{{- $leases = append $leases (printf "racer-seat-%d" $seat) }}
+{{- end }}
+{{- range $name := $leases }}
+---
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: {{ $name }}
+  namespace: {{ $ns }}
+  labels:
+    racer.unbounded-cloud.io/control: "true"
+    unbounded-cloud.io/racer-manager: unbounded-operator
+spec: {}
+{{- end }}

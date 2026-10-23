@@ -1,23 +1,22 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package racer provisions the Racer controller and dataplane on demand from ClusterCaches.
+// Package racer installs the Racer dataplane on demand from ClusterCaches.
+// Every dataplane Pod runs the Racer control plane, so the operator only
+// installs static objects: the DaemonSet, its identity, RBAC, admission
+// policies, the webhook configuration, and empty runtime state. It holds no
+// keys, certificates, or authority state.
 package racer
 
 import (
 	"context"
-	"encoding/base64"
-	"fmt"
 	"strings"
 	"time"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -27,343 +26,176 @@ import (
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	manifests "github.com/Azure/unbounded/deploy/racer"
 	"github.com/Azure/unbounded/internal/operator/component"
-	racercore "github.com/Azure/unbounded/internal/racer"
 )
 
 const (
-	name              = "racer"
-	controllerName    = "racer-controller"
-	claimName         = "racer-operator-installation"
-	markerName        = "racer-installation"
-	versionName       = "racer-version"
-	configName        = "racer-config"
-	objectImageName   = "racer-object"
-	tlsName           = "racer-controller-tls"
-	trustName         = "racer-bootstrap-trust"
-	webhookName       = "racer-object-sidecar-injector"
-	managerAnnotation = "unbounded-cloud.io/racer-manager"
-	claimAnnotation   = "unbounded-cloud.io/racer-operator-claim-uid"
-	// Authority protocol key, not operator ownership metadata.
-	installationAnnotation = "racer.unbounded-cloud.io/installation-uid"
+	name                = "racer"
+	webhookConfigName   = "racer-object-sidecar-injector"
+	pendingRequeue      = 5 * time.Second
+	reasonMigrating     = "MigratingController"
+	reasonGuards        = "AdmissionGuardUnavailable"
+	reasonInitializing  = "Initializing"
+	reasonOriginInvalid = "OriginInvalid"
+	reasonOriginPending = "OriginPending"
 )
 
-// Component owns the Racer controller and dataplane workloads and their inputs.
+// Component owns the Racer dataplane workloads and their inputs.
 type Component struct{}
 
 func New() component.ClusterComponent   { return Component{} }
 func (Component) Name() string          { return name }
 func (Component) ConditionType() string { return "RacerReady" }
 
-func pending() component.Result {
-	return component.NotReadyAfter("Initializing", "waiting for Racer installation", 5*time.Second)
-}
-
 func objectKey(env *component.Env, name string) client.ObjectKey {
 	return client.ObjectKey{Namespace: env.Namespace, Name: name}
 }
 
-func add(plan *component.Plan, kind component.OpKind, obj client.Object) {
-	plan.Add(component.Operation{Kind: kind, Object: component.ToUnstructured(obj), Component: name})
-}
-
-// Plan only reads state. With no caches it maintains established TLS, but does
-// not repair workloads or recreate credentials. No cache or Site owns identity.
+// Plan reads state. Without ClusterCaches an existing installation is retained
+// and not repaired or removed, but guard containment still runs: missing or
+// drifted admission policies revoke the dataplane bindings.
 func (Component) Plan(ctx context.Context, env *component.Env, _ []machinav1.Site) (*component.Plan, component.Result, error) {
-	return planAt(ctx, env, time.Now())
-}
-
-func planAt(ctx context.Context, env *component.Env, now time.Time) (*component.Plan, component.Result, error) {
-	// Maintain only bound, established TLS before unrelated admission, cache,
-	// or durable-state checks. This cannot initialize identity or repair workloads.
-	tlsPlan, _, tlsErr := planRetainedTLS(ctx, env, now)
-	guardPlan, stop, guardErr := planGuardContainment(ctx, env)
-	guardResult := component.NotReadyAfter("AdmissionGuardUnavailable", "waiting for Racer admission guards and permission containment", 5*time.Second)
-
-	if stop && guardErr == nil {
-		// Containment must not wait for TLS writes to succeed. These operations
-		// have no dependencies on each other and never grant new permissions.
-		if tlsErr == nil {
-			for _, op := range tlsPlan.Operations {
-				op.FailureDomain = "retained-tls"
-				guardPlan.Add(op)
-			}
-		}
-
-		return guardPlan, guardResult, nil
-	}
-
-	if tlsErr != nil {
-		return nil, component.Result{}, tlsErr
-	}
-
-	if tlsPlan.Len() != 0 && tlsPlan.Operations[0].Object.GetName() == tlsName {
-		return tlsPlan, component.NotReadyAfter("TLSMaintenance", "updating Racer serving TLS and trust", 5*time.Second), nil
-	}
-
-	plan, result, err := guardPlan, guardResult, guardErr
-	if err == nil {
-		plan, result, err = planRuntimeAt(ctx, env, now)
-	}
-
-	if tlsPlan.Len() != 0 && err != nil {
-		// Before the first runtime deployment there may be no trust to repair.
-		// Keep startup errors visible rather than starting a new publication.
-		if tlsPlan.Operations[0].Kind == component.OpCreateIfAbsent {
-			if readErr := env.LiveReader().Get(ctx, objectKey(env, controllerName), &appsv1.Deployment{}); readErr != nil {
-				return plan, result, err
-			}
-		}
-
-		return tlsPlan, component.NotReadyAfter("TLSMaintenance", "updating Racer serving trust before runtime repair", 5*time.Second), nil
-	}
-
-	return plan, result, err
-}
-
-func planRuntimeAt(ctx context.Context, env *component.Env, now time.Time) (*component.Plan, component.Result, error) {
 	caches := &racerv1.ClusterCacheList{}
 	if err := env.LiveReader().List(ctx, caches, client.Limit(1)); err != nil {
 		return nil, component.Result{}, err
 	}
 
-	plan := component.NewPlan()
-
 	if len(caches.Items) == 0 {
-		return planRetainedTLS(ctx, env, now)
-	}
-
-	marker, err := planIdentity(ctx, env, plan)
-	if err != nil {
-		return nil, component.Result{}, err
-	}
-
-	if marker == nil {
-		return plan, pending(), nil
-	}
-
-	fresh := marker.Data["state"] == "fresh" && !ptr.Deref(marker.Immutable, false)
-
-	consumed := marker.Data["state"] == "consumed" && ptr.Deref(marker.Immutable, false)
-	if !fresh && !consumed {
-		return nil, component.Result{}, fmt.Errorf("invalid Racer installation state")
-	}
-
-	if fresh {
-		version := &corev1.ConfigMap{}
-
-		err := env.LiveReader().Get(ctx, objectKey(env, versionName), version)
-		if !apierrors.IsNotFound(err) {
-			// The execution phase finishes the staged startup commitment.
-			if err != nil || marker.Data["initialization_protocol"] != "staged-v1" || version.Annotations["racer.unbounded-cloud.io/initialization"] != "staged-v1" || version.Annotations[installationAnnotation] != string(marker.UID) {
-				return nil, component.Result{}, fmt.Errorf("fresh Racer marker requires absent or bound staged version state (read: %v)", err)
-			}
+		// A retained installation keeps its grants, so its admission guards
+		// are still enforced: missing or drifted policies revoke the bindings
+		// and are restored. Nothing else is repaired or installed.
+		policies, err := decodePolicies(env)
+		if err != nil {
+			return nil, component.Result{}, err
 		}
+
+		containment, err := planContainment(ctx, env, policies)
+		if err != nil {
+			return nil, component.Result{}, err
+		}
+
+		if containment != nil {
+			return containment, component.NotReadyAfter(reasonGuards, "revoking Racer dataplane permissions until its admission policies are restored", pendingRequeue), nil
+		}
+
+		return component.NewPlan(), component.ReconciledAfter("no ClusterCache; existing Racer resources retained with admission guards enforced", time.Hour), nil
 	}
 
-	secret, err := planTLSAt(ctx, env, plan, marker.UID, fresh, now)
+	plan, done, err := planLegacy(ctx, env)
 	if err != nil {
 		return nil, component.Result{}, err
 	}
 
-	if secret == nil {
-		return plan, pending(), nil
+	if !done {
+		return plan, component.NotReadyAfter(reasonMigrating, "waiting for the retired racer-controller to stop", pendingRequeue), nil
 	}
 
-	invalid, waiting, err := runtimePlan(ctx, env, plan, marker, secret)
+	policies, err := decodePolicies(env)
 	if err != nil {
 		return nil, component.Result{}, err
 	}
 
-	bootstrap, needed, err := planBootstrap(ctx, env, plan, marker)
+	containment, err := planContainment(ctx, env, policies)
 	if err != nil {
 		return nil, component.Result{}, err
 	}
 
-	if needed {
-		return bootstrap, pending(), nil
+	if containment != nil {
+		plan.Merge(containment)
+		return plan, component.NotReadyAfter(reasonGuards, "restoring Racer admission policies before granting dataplane permissions", pendingRequeue), nil
 	}
 
-	if len(invalid) != 0 {
-		return plan, component.NotReadyAfter("OriginInvalid", "Racer origins not reconciled for ClusterCache "+strings.Join(invalid, "; "), time.Minute), nil
-	}
-
-	if waiting {
-		return plan, component.NotReadyAfter("OriginPending", "Racer origins wait for the racer-dataplane DaemonSet placement", 30*time.Second), nil
-	}
-
-	return plan, component.ReconciledAfter("Racer controller installation reconciled", time.Hour), nil
+	return planInstall(ctx, env, plan, policies)
 }
 
-func decodeRuntimeManifests(env *component.Env) ([]*unstructured.Unstructured, error) {
-	return env.DecodeManifestFiles(manifests.Manifests, []string{"node-restriction.yaml", "rbac.yaml", "config.yaml", "controller-pdb.yaml", "controller.yaml", "mutating-webhook.yaml"}, nil)
-}
+func planInstall(ctx context.Context, env *component.Env, plan *component.Plan, policies []*unstructured.Unstructured) (*component.Plan, component.Result, error) {
+	var guards []component.ObjectRef
 
-func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, marker *corev1.ConfigMap, secret *corev1.Secret) (invalid []string, waiting bool, err error) {
-	objects, err := decodeRuntimeManifests(env)
-	if err != nil {
-		return nil, false, err
+	for _, policy := range policies {
+		op, err := ownedOperation(ctx, env, component.Operation{Kind: component.OpApply, Object: policy, Component: name})
+		if err != nil {
+			return nil, component.Result{}, err
+		}
+
+		guards = append(guards, op.Ref())
+		plan.Add(op)
 	}
 
-	var (
-		configHash    string
-		runtimeConfig *corev1.ConfigMap
-		prerequisites []component.ObjectRef
-	)
+	objects, err := env.DecodeManifestFiles(manifests.Manifests, []string{"rbac.yaml", "mutating-webhook.yaml"}, nil)
+	if err != nil {
+		return nil, component.Result{}, err
+	}
+
+	var bindings []component.ObjectRef
 
 	for _, obj := range objects {
-		switch obj.GetKind() {
-		case "ConfigMap":
-			values := map[string]string{
-				"RACER_CLUSTER_ID":                  marker.Data["cluster"],
-				"RACER_INSTALLATION_CONFIGMAP_NAME": markerName,
-				"RACER_VERSION_CONFIGMAP_NAME":      versionName,
-				"RACER_CREDENTIALS_SECRET_NAME":     credentialsName,
-				"RACER_DAEMONSET_NAME":              "racer-dataplane",
-				"RACER_DATAPLANE_SERVICE_ACCOUNT":   "racer-dataplane",
-				"RACER_CONTROLLER_SERVICE_ACCOUNT":  controllerName,
-				"RACER_REPLICATION_TOKEN_FILE":      "/var/run/secrets/racer-controller/token",
-				"RACER_REPLICATION_TRUST_FILE":      "/etc/racer/tls/ca.crt",
-				"RACER_REPLICATION_SERVER_NAME":     controllerName + "." + env.Namespace + ".svc",
-				"RACER_REPLICATION_PORT":            "8443",
-				"RACER_OBJECT_IMAGE":                env.Config.Image(objectImageName),
-			}
-			for key, value := range values {
-				if err := unstructured.SetNestedField(obj.Object, value, "data", key); err != nil {
-					return nil, false, err
-				}
-			}
-
-			cm := &corev1.ConfigMap{}
-			if err := env.Scheme.Convert(obj, cm, nil); err != nil {
-				return nil, false, err
-			}
-
-			bindRuntime(cm, marker.UID)
-
-			cm, err = preservedConfig(ctx, env, plan, cm, values)
-			if err != nil {
-				return nil, false, err
-			}
-
-			configHash = component.ConfigMapPayloadHash(cm)
-			runtimeConfig = cm
-
-			_, err = racercore.ConfigFromLookup(func(key string) (string, bool) {
-				if key == "POD_NAMESPACE" {
-					return env.Namespace, true
-				}
-
-				value, ok := cm.Data[key]
-
-				return value, ok
-			})
-			if err != nil {
-				return nil, false, err
-			}
-
-			prerequisites = append(prerequisites, component.RefOf(component.ToUnstructured(cm)))
-
-			continue
-		case "MutatingWebhookConfiguration":
-			// Publish the same roots as the bootstrap trust so CA rotation and
-			// cross-signing also reach the API server's webhook client.
-			if err := setWebhookCABundle(obj, servingRoots(secret)); err != nil {
-				return nil, false, err
-			}
-		case "Deployment":
-			if err := component.SetNamedContainerImage(obj, "controller", env.Config.Image(controllerName)); err != nil {
-				return nil, false, err
-			}
-
-			if err := unstructured.SetNestedStringMap(obj.Object, map[string]string{"unbounded-cloud.io/racer-config-hash": configHash}, "spec", "template", "metadata", "annotations"); err != nil {
-				return nil, false, err
-			}
+		op := component.Operation{Kind: component.OpApply, Object: obj, Component: name}
+		if kind := obj.GetKind(); kind == "RoleBinding" || kind == "ClusterRoleBinding" {
+			// Grant only after every policy is written, and revoke if one fails.
+			op.DependsOn = guards
+			op.RevokeOnDependencyFailure = true
 		}
 
-		op := component.Operation{Kind: component.OpApply, Object: obj, Component: name, Overridable: obj.GetKind() == "Deployment"}
-		if obj.GetKind() == "Deployment" {
-			op.ValidateOverride = ValidateOverride
-			// Security and configuration must succeed before startup consumes identity.
-			for _, dependency := range plan.Operations {
-				op.DependsOn = append(op.DependsOn, dependency.Ref())
-			}
-		}
-
-		if obj.GetKind() == "ValidatingAdmissionPolicy" || obj.GetKind() == "ValidatingAdmissionPolicyBinding" {
-			prerequisites = append(prerequisites, op.Ref())
-		} else if obj.GetKind() == "RoleBinding" || obj.GetKind() == "ClusterRoleBinding" || obj.GetKind() == "Deployment" {
-			op.DependsOn = append(op.DependsOn, prerequisites...)
-		}
-
-		op, err = ownedRuntimeOperation(ctx, env, op, marker.UID)
+		op, err = ownedOperation(ctx, env, op)
 		if err != nil {
-			return nil, false, err
+			return nil, component.Result{}, err
+		}
+
+		if op.DependsOn != nil {
+			bindings = append(bindings, op.Ref())
 		}
 
 		plan.Add(op)
 	}
 
-	trust := &corev1.ConfigMap{
-		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
-		ObjectMeta: metav1.ObjectMeta{Name: trustName, Namespace: env.Namespace},
-		Data:       map[string]string{"ca.crt": string(servingRoots(secret))},
-	}
-
-	op, err := ownedRuntimeOperation(ctx, env, component.Operation{Kind: component.OpApply, Object: component.ToUnstructured(trust), Component: name}, marker.UID)
+	recorded, err := recordedStateUID(ctx, env)
 	if err != nil {
-		return nil, false, err
+		return nil, component.Result{}, err
 	}
 
-	plan.Add(op)
-
-	if runtimeConfig == nil {
-		return nil, false, fmt.Errorf("racer runtime manifests contain no %s", configName)
-	}
-
-	if err := planDataplane(ctx, env, plan, marker, runtimeConfig); err != nil {
-		return nil, false, err
-	}
-
-	return planOrigins(ctx, env, plan, marker)
-}
-
-func setWebhookCABundle(obj *unstructured.Unstructured, roots []byte) error {
-	webhooks, found, err := unstructured.NestedSlice(obj.Object, "webhooks")
+	state, err := planControl(ctx, env, plan, recorded)
 	if err != nil {
-		return err
+		return nil, component.Result{}, err
 	}
 
-	if !found || len(webhooks) == 0 {
-		return fmt.Errorf("racer webhook configuration %s has no webhooks", obj.GetName())
+	config, err := planDataplaneConfig(ctx, env, plan)
+	if err != nil {
+		return nil, component.Result{}, err
 	}
 
-	bundle := base64.StdEncoding.EncodeToString(roots)
-
-	for i, webhook := range webhooks {
-		entry, ok := webhook.(map[string]any)
-		if !ok {
-			return fmt.Errorf("racer webhook configuration %s has malformed webhook %d", obj.GetName(), i)
-		}
-
-		if err := unstructured.SetNestedField(entry, bundle, "clientConfig", "caBundle"); err != nil {
-			return err
-		}
-
-		webhooks[i] = entry
+	if state.uid == "" {
+		// The DaemonSet records the state UID, so it waits for the Secret.
+		return plan, component.NotReadyAfter(reasonInitializing, "creating Racer control state", pendingRequeue), nil
 	}
 
-	return unstructured.SetNestedSlice(obj.Object, webhooks, "webhooks")
+	if err := planDataplane(ctx, env, plan, config, state.uid, bindings); err != nil {
+		return nil, component.Result{}, err
+	}
+
+	invalid, waiting, err := planOrigins(ctx, env, plan)
+	if err != nil {
+		return nil, component.Result{}, err
+	}
+
+	if len(invalid) != 0 {
+		return plan, component.NotReadyAfter(reasonOriginInvalid, "Racer origins not reconciled for ClusterCache "+strings.Join(invalid, "; "), time.Minute), nil
+	}
+
+	if waiting {
+		return plan, component.NotReadyAfter(reasonOriginPending, "Racer origins wait for the racer-dataplane DaemonSet placement", 30*time.Second), nil
+	}
+
+	return plan, component.ReconciledAfter("Racer dataplane installation reconciled", time.Hour), nil
 }
 
 func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	b.Watches(&admissionv1.ValidatingAdmissionPolicy{}, env.RequestSingleton(), builder.WithPredicates(guardPredicate()))
 	b.Watches(&admissionv1.ValidatingAdmissionPolicyBinding{}, env.RequestSingleton(), builder.WithPredicates(guardPredicate()))
-	b.Watches(&admissionv1.MutatingWebhookConfiguration{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool { return obj.GetName() == webhookName })))
+	b.Watches(&admissionv1.MutatingWebhookConfiguration{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool { return obj.GetName() == webhookConfigName })))
 	b.Watches(&racerv1.ClusterCache{}, env.RequestSingleton(), builder.WithPredicates(clusterCachePredicate()))
-	b.Watches(&appsv1.Deployment{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(controllerName))))
+	b.Watches(&appsv1.Deployment{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(legacyController))))
 	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(runtimeWorkload(env))))
 	b.Watches(&corev1.ServiceAccount{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(runtimeWorkload(env))))
-	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(), builder.WithPredicates(startupConfigPredicate(env)))
+	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(dataplaneConfigName))))
 	b.Watches(&corev1.Secret{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(secretWatched(env))))
 }
 
@@ -374,14 +206,14 @@ func runtimeWorkload(env *component.Env) func(client.Object) bool {
 	return func(obj client.Object) bool { return dataplane(obj) || origin(obj) }
 }
 
-// secretWatched matches the TLS Secret and every Secret in the operator
+// secretWatched matches racer-state and every Secret in the operator
 // namespace that a ClusterCache origin reads its credentials from, so a
 // rotated credential rolls the origin Pods.
 func secretWatched(env *component.Env) func(client.Object) bool {
-	tls := env.InNamespaceNamed(tlsName)
+	state := env.InNamespaceNamed(stateName)
 
 	return func(obj client.Object) bool {
-		if tls(obj) {
+		if state(obj) {
 			return true
 		}
 
@@ -403,21 +235,6 @@ func secretWatched(env *component.Env) func(client.Object) bool {
 
 		return false
 	}
-}
-
-func startupConfigPredicate(env *component.Env) predicate.Predicate {
-	// Counter updates do not require workload reconciliation.
-	version := env.InNamespaceNamed(versionName)
-
-	return predicate.Or(
-		env.ManagedConfigPredicate(env.InNamespaceNamed(claimName, markerName, configName, trustName, dataplaneConfigName)),
-		predicate.Funcs{
-			CreateFunc:  func(e event.CreateEvent) bool { return version(e.Object) },
-			DeleteFunc:  func(e event.DeleteEvent) bool { return version(e.Object) },
-			UpdateFunc:  func(event.UpdateEvent) bool { return false },
-			GenericFunc: func(event.GenericEvent) bool { return false },
-		},
-	)
 }
 
 // clusterCachePredicate passes spec changes and the transition into
