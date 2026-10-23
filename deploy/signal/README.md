@@ -165,10 +165,12 @@ The participant group is a certification boundary, not one distributed process
 group. The included adapter creates one independently pinned backend workload
 per participant. Ordinary diagnostics use one Pod per participant. MPI
 diagnostics use one MPIJob per participant with one launcher and one GPU worker;
-only the worker is pinned to the participant Node and receives the configured
-GPU limit. The adapter propagates the Workflow active deadline, uses the
-profile's queue, records API-assigned workload UIDs, reads the final typed result
-from bounded workload logs, aggregates diagnostic state separately from backend
+ordinary Pods and MPI workers use required Node affinity on the immutable
+`metadata.name` field to bind to the exact admitted Node without bypassing
+scheduler admission. Only the worker receives the configured GPU limit. The
+adapter propagates the Workflow active deadline, applies the profile's optional
+queue, records API-assigned workload UIDs, reads the final typed result from
+bounded workload logs, aggregates diagnostic state separately from backend
 execution state, and foreground-deletes every created workload.
 
 The selected script is invoked with no arguments for a Pod backend,
@@ -269,7 +271,7 @@ checks:
     maxAttempts: 1
 ```
 
-or an explicit Kueue queue:
+or an MPIJob backend, optionally submitted through a Kueue queue:
 
 ```yaml
 checks:
@@ -281,9 +283,10 @@ checks:
       queue: <local-queue>
 ```
 
-When a Pod backend supplies a queue, the adapter writes the standard
-`kueue.x-k8s.io/queue-name` label. MPIJob backends require a queue; Pod backends
-may omit it only when the operator intentionally runs them outside Kueue.
+When either backend supplies a queue, the adapter writes the standard
+`kueue.x-k8s.io/queue-name` label. Pod and MPIJob backends may both omit it for
+standalone execution without Kueue. A `kueueTopology` policy still requires an
+explicit queue.
 
 Checks may set `spec.checks[].workloadPolicy` when a diagnostic needs explicit
 participant-container policy. The controller validates and snapshots this
@@ -399,6 +402,12 @@ task invokes the configured adapter `certification` template through
 `status.nodes`. `executionPolicy.onFailure` is immutable and is either `Stop`
 or `Continue`. A stopped task is recorded as skipped/not-run, never inferred as
 a diagnostic result.
+
+Before creating the Workflow, the controller durably records its deterministic
+name and attempt in CertificationRun status. Once that creation intent exists,
+a missing Workflow terminates the Run as Inconclusive and is never recreated.
+This fail-closed fence prevents a controller outage plus Workflow TTL cleanup
+from executing the one-time certification suite twice.
 
 Participant roles and topology constraints are generic typed policy. Profiles
 can, for example, bind one role to one participant, another role to three

@@ -1082,9 +1082,18 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return ctrl.Result{}, err
 	}
 
-	if run.Status.Workflow.UID == "" ||
-		string(workflow.GetUID()) != run.Status.Workflow.UID ||
-		!metav1.IsControlledBy(workflow, &run) {
+	if !metav1.IsControlledBy(workflow, &run) {
+		return ctrl.Result{}, fmt.Errorf(
+			"workflow %s identity or ownership changed; refusing concurrent retry",
+			workflow.GetName(),
+		)
+	}
+
+	if run.Status.Workflow.UID == "" {
+		return r.recordWorkflowStarted(ctx, &run, workflow, run.Status.Workflow.Attempt)
+	}
+
+	if string(workflow.GetUID()) != run.Status.Workflow.UID {
 		return ctrl.Result{}, fmt.Errorf(
 			"workflow %s identity or ownership changed; refusing concurrent retry",
 			workflow.GetName(),
@@ -1145,6 +1154,18 @@ func (r *RunReconciler) startAttempt(ctx context.Context, run *signalv1.Certific
 		return ctrl.Result{RequeueAfter: time.Millisecond}, r.Status().Patch(ctx, run, client.MergeFrom(before))
 	}
 
+	before := run.DeepCopy()
+	run.Status.Workflow = signalv1.WorkflowStatus{
+		Name:    workflow.GetName(),
+		Attempt: attempt,
+		Phase:   "Creating",
+	}
+	run.Status.Checks = initialCheckStatuses(run.Spec.Checks)
+
+	if err := r.Status().Patch(ctx, run, client.MergeFrom(before)); err != nil {
+		return ctrl.Result{}, fmt.Errorf("record Workflow creation intent: %w", err)
+	}
+
 	if err := r.Create(ctx, workflow); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
 			return ctrl.Result{}, fmt.Errorf("create Workflow attempt %d: %w", attempt, err)
@@ -1164,6 +1185,15 @@ func (r *RunReconciler) startAttempt(ctx context.Context, run *signalv1.Certific
 		workflow = existing
 	}
 
+	return r.recordWorkflowStarted(ctx, run, workflow, attempt)
+}
+
+func (r *RunReconciler) recordWorkflowStarted(
+	ctx context.Context,
+	run *signalv1.CertificationRun,
+	workflow *unstructured.Unstructured,
+	attempt int32,
+) (ctrl.Result, error) {
 	before := run.DeepCopy()
 	run.Status.Phase = signalv1.RunPhaseRunning
 	run.Status.ExecutionState = "Running"

@@ -258,10 +258,6 @@ func ValidateConfig(config Config) ([]signalv1.Participant, []corev1.Toleration,
 	switch {
 	case config.BackendKind == "Pod" && config.BackendAPIVersion == "v1":
 	case config.BackendKind == "MPIJob" && config.BackendAPIVersion == "kubeflow.org/v2beta1":
-		if config.Queue == "" {
-			return nil, nil, nil, errors.New("queue is required for MPIJob execution")
-		}
-
 		if config.BackendDeadlineSeconds < 2 {
 			return nil, nil, nil, errors.New(
 				"backend-active-deadline-seconds must be at least 2 for MPIJob worker readiness",
@@ -912,7 +908,7 @@ func ordinaryPod(
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy:                corev1.RestartPolicyNever,
-			NodeSelector:                 map[string]string{corev1.LabelHostname: participant.NodeName},
+			Affinity:                     participantNodeAffinity(participant.NodeName),
 			Tolerations:                  tolerations,
 			ActiveDeadlineSeconds:        &backendDeadlineSeconds,
 			AutomountServiceAccountToken: ptr(false),
@@ -936,6 +932,10 @@ func mpiJob(
 	gpuCount int64,
 ) (*unstructured.Unstructured, error) {
 	labels := resourceLabels(config, participant)
+	if config.Queue != "" {
+		labels = withLabel(labels, "kueue.x-k8s.io/queue-name", config.Queue)
+	}
+
 	jobName := resourceNameWithLimit(config.RunName, participant.Index, 63-len("-worker-0"))
 	launcherEnv := workloadEnvironment(config, participant, environment, false)
 	workerEnv := workloadEnvironment(config, participant, environment, true)
@@ -964,7 +964,7 @@ func mpiJob(
 		"metadata": map[string]any{
 			"name":            jobName,
 			"namespace":       config.Namespace,
-			"labels":          stringMapAny(withLabel(labels, "kueue.x-k8s.io/queue-name", config.Queue)),
+			"labels":          stringMapAny(labels),
 			"ownerReferences": []any{ownerReferenceMap(workflow)},
 		},
 		"spec": map[string]any{
@@ -984,7 +984,7 @@ func mpiJob(
 					"restartPolicy": string(corev1.RestartPolicyNever),
 					"template": podTemplate(
 						labels,
-						nil,
+						"",
 						nil,
 						corev1.Container{
 							Name:  "launcher",
@@ -1005,7 +1005,7 @@ func mpiJob(
 					"restartPolicy": string(corev1.RestartPolicyNever),
 					"template": podTemplate(
 						labels,
-						map[string]string{corev1.LabelHostname: participant.NodeName},
+						participant.NodeName,
 						tolerations,
 						worker,
 						config.ScriptConfigMap,
@@ -1021,7 +1021,7 @@ func mpiJob(
 
 func podTemplate(
 	labels map[string]string,
-	nodeSelector map[string]string,
+	nodeName string,
 	tolerations []corev1.Toleration,
 	container corev1.Container,
 	scriptConfigMap string,
@@ -1039,7 +1039,7 @@ func podTemplate(
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy:                corev1.RestartPolicyNever,
-			NodeSelector:                 nodeSelector,
+			Affinity:                     participantNodeAffinity(nodeName),
 			Tolerations:                  tolerations,
 			AutomountServiceAccountToken: ptr(false),
 			Containers:                   []corev1.Container{container},
@@ -1054,6 +1054,26 @@ func podTemplate(
 	}
 
 	return content
+}
+
+func participantNodeAffinity(nodeName string) *corev1.Affinity {
+	if nodeName == "" {
+		return nil
+	}
+
+	return &corev1.Affinity{
+		NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+					MatchFields: []corev1.NodeSelectorRequirement{{
+						Key:      "metadata.name",
+						Operator: corev1.NodeSelectorOpIn,
+						Values:   []string{nodeName},
+					}},
+				}},
+			},
+		},
+	}
 }
 
 func workloadAnnotations(policy signalv1.WorkloadPolicy) map[string]string {
