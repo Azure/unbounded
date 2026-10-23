@@ -483,3 +483,24 @@ func TestReleaseClosesUnusedSpareRingOnce(t *testing.T) {
 		t.Fatal("release left a ring")
 	}
 }
+
+// TestQueueRingHoldsEveryCompletion checks the bound harvestOld relies
+// on: a queue ring's completion queue holds one completion per tag plus
+// the eventfd poll, for every supported depth.
+func TestQueueRingHoldsEveryCompletion(t *testing.T) {
+	for _, depth := range []int{1, 2, 3, 4, 31, 64, 127, MaxQueueDepth} {
+		r := newTestRing(t, queueRingEntries(depth))
+
+		if got := r.cqMask + 1; got < uint32(depth+1) {
+			t.Errorf("depth %d: completion queue holds %d, want at least %d", depth, got, depth+1)
+		}
+
+		if r.sqEntries < uint32(depth+1) {
+			t.Errorf("depth %d: submission queue holds %d, want at least %d", depth, r.sqEntries, depth+1)
+		}
+
+		if err := r.close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
