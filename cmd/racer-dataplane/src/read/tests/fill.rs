@@ -5713,6 +5713,69 @@ fn local_plaintext_probe_job_retains_flight_charge_after_cancellation() {
 }
 
 #[test]
+fn canceled_acquisition_led_local_plaintext_retains_flight_until_job_completes() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let metrics = retained_ciphertext_only(&mut f);
+    let admission = f.fill.dependencies.admission.clone();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let mut acquisition = f.fill.acquire(
+        f.page.clone(),
+        f.membership.clone(),
+        &f.context,
+        &f.scope,
+        &mut budget,
+    );
+    // Submit the shared decrypt without running the crypto service.
+    for _ in 0..16 {
+        if !f.fill.local_plaintext.is_empty() {
+            break;
+        }
+        uring_runtime::drivers::poll(&mut cx, 64);
+        assert!(acquisition.as_mut().poll(&mut cx).is_pending());
+    }
+    assert_eq!(f.fill.local_plaintext.len(), 1, "acquisition leads");
+    assert_eq!(admission.used(ResourceClass::Flight), 1);
+    f.scope.cancel().unwrap();
+    let mut early = None;
+    for _ in 0..16 {
+        uring_runtime::drivers::poll(&mut cx, 64);
+        if early.is_none()
+            && let std::task::Poll::Ready(result) = acquisition.as_mut().poll(&mut cx)
+        {
+            early = Some(result);
+        }
+    }
+    // The pending shared job still runs under the acquisition's operation, so
+    // its fence and Flight credit stay held.
+    assert_eq!(f.fill.local_plaintext.len(), 1, "shared job still pending");
+    assert_eq!(
+        admission.used(ResourceClass::Flight),
+        1,
+        "canceled acquisition keeps its Flight credit while the job runs"
+    );
+    let result = match early {
+        Some(result) => result,
+        None => drive(acquisition, &mut f.engine, &f.crypto),
+    };
+    assert!(result.is_err(), "canceled acquisition reports its error");
+    // Let the shared job finish through a fresh joiner.
+    let fresh = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+    let joined = drive(f.fill.warm_local(&f.page, &fresh), &mut f.engine, &f.crypto);
+    if let Ok(page) = &joined {
+        assert_eq!(page.plaintext.bytes(), b"abc");
+    }
+    drop(joined);
+    for _ in 0..16 {
+        uring_runtime::drivers::poll(&mut cx, 64);
+    }
+    assert!(metrics.count(Event::PageDecrypt) <= 1);
+    assert_local_plaintext_idle(&f);
+}
+
+#[test]
 fn local_plaintext_probe_respects_exhausted_flight_quota() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();

@@ -165,7 +165,8 @@ impl Fill {
     /// A `probe` caller owns its own Waiter charge, and a probe that starts the
     /// job reserves a Flight charge retained by the detached driver until the
     /// job completes. An elected acquisition already holds both through its
-    /// flight registration and awaits the job inside its retained operation.
+    /// flight registration and awaits the job inside its retained operation,
+    /// staying attached through cancellation until the job completes.
     /// New followers recheck current cache and source-key admission; callers
     /// admitted earlier keep their completion rights.
     async fn local_plaintext_copy(
@@ -247,9 +248,18 @@ impl Fill {
         };
         std::future::poll_fn(|cx| {
             cancellation.register(cx.waker());
-            scope.check()?;
+            // A probe-led job owns its own Flight charge, so a probe may
+            // detach. An acquisition-led job has no charge of its own and
+            // relies on the acquisition's retained operation, so acquisition
+            // callers stay attached until the job completes and only then
+            // report cancellation or deadline expiry.
+            if probe {
+                scope.check()?;
+            }
             uring_runtime::drivers::poll(cx, 64);
-            std::pin::Pin::new(&mut receive).poll(cx)
+            let result = std::task::ready!(std::pin::Pin::new(&mut receive).poll(cx));
+            scope.check()?;
+            std::task::Poll::Ready(result)
         })
         .await
     }
