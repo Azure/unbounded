@@ -42,14 +42,14 @@ class HostBuffer:
     def pinned(self) -> bool:
         return self._pinned is not None
 
-    def pin(self) -> bool:
-        """Register the mapping with CUDA. Returns False when CUDA is missing."""
+    def pin(self, device: int = 0) -> bool:
+        """Register the mapping with CUDA in ``device``'s context. Returns False when CUDA is missing."""
         if self._pinned is not None:
             return True
         from . import cuda
 
         try:
-            self._pinned = cuda.host_register(self.view)
+            self._pinned = cuda.host_register(self.view, device)
         except cuda.CudaUnavailable:
             return False
         return True

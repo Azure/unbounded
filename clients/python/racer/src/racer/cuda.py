@@ -37,6 +37,7 @@ cuDevicePrimaryCtxRelease_v2.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import logging
 import os
@@ -186,6 +187,16 @@ def ensure_context(device: int = 0) -> None:
     _check("cuCtxGetCurrent", lib.cuCtxGetCurrent(ctypes.byref(cur)))
     if cur.value:
         return
+    _check("cuCtxSetCurrent", lib.cuCtxSetCurrent(_primary_context(device)))
+
+
+def _primary_context(device: int) -> ctypes.c_void_p:
+    """Return the device's primary context, retained once per process.
+
+    The retain is never released: torch shares the same primary context and
+    the cached handle stays valid for the life of the process.
+    """
+    lib = _load()
     with _lock:
         ctx = _contexts.get(device)
         if ctx is None:
@@ -194,7 +205,34 @@ def ensure_context(device: int = 0) -> None:
             ctx = ctypes.c_void_p()
             _check("cuDevicePrimaryCtxRetain", lib.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), dev.value))
             _contexts[device] = ctx
+    return ctx
+
+
+@contextlib.contextmanager
+def bound_context(device: int):
+    """Make ``device``'s primary context current, restoring the previous one after.
+
+    Worker threads do not inherit a context from the thread that created an
+    allocation, and an unrelated current context (for example another
+    device's) is wrong for driver calls on this device's memory, so callers
+    bind explicitly instead of relying on thread history. Uses
+    cuCtxGetCurrent/cuCtxSetCurrent
+    (https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__CTX.html).
+    """
+    lib = _load()
+    ctx = _primary_context(device)
+    prev = ctypes.c_void_p()
+    _check("cuCtxGetCurrent", lib.cuCtxGetCurrent(ctypes.byref(prev)))
+    if prev.value == ctx.value:
+        yield
+        return
     _check("cuCtxSetCurrent", lib.cuCtxSetCurrent(ctx))
+    try:
+        yield
+    finally:
+        rc = lib.cuCtxSetCurrent(prev)
+        if rc != 0:
+            log.warning("racer: restoring the CUDA context failed with CUresult %d", rc)
 
 
 def _address(buf) -> tuple[int, object]:
@@ -243,7 +281,6 @@ class GpuAllocation:
         if size <= 0:
             raise RacerError("size must be positive")
         lib = _load()
-        ensure_context(device)
         g = granularity(device)
         self.device = device
         self.requested = size
@@ -254,23 +291,24 @@ class GpuAllocation:
         self._mapped = False
         prop = _allocation_prop(device)
         handle = CUmemGenericAllocationHandle()
-        try:
-            _check("cuMemCreate", lib.cuMemCreate(ctypes.byref(handle), self.size, ctypes.byref(prop), 0))
-            self._handle = handle.value
-            ptr = CUdeviceptr()
-            _check("cuMemAddressReserve", lib.cuMemAddressReserve(ctypes.byref(ptr), self.size, g, 0, 0))
-            self.ptr = ptr.value
-            self._reserved = True
-            _check("cuMemMap", lib.cuMemMap(self.ptr, self.size, 0, self._handle, 0))
-            self._mapped = True
-            desc = CUmemAccessDesc()
-            desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE
-            desc.location.id = device
-            desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE
-            _check("cuMemSetAccess", lib.cuMemSetAccess(self.ptr, self.size, ctypes.byref(desc), 1))
-        except BaseException:
-            self.close()
-            raise
+        with bound_context(device):
+            try:
+                _check("cuMemCreate", lib.cuMemCreate(ctypes.byref(handle), self.size, ctypes.byref(prop), 0))
+                self._handle = handle.value
+                ptr = CUdeviceptr()
+                _check("cuMemAddressReserve", lib.cuMemAddressReserve(ctypes.byref(ptr), self.size, g, 0, 0))
+                self.ptr = ptr.value
+                self._reserved = True
+                _check("cuMemMap", lib.cuMemMap(self.ptr, self.size, 0, self._handle, 0))
+                self._mapped = True
+                desc = CUmemAccessDesc()
+                desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE
+                desc.location.id = device
+                desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+                _check("cuMemSetAccess", lib.cuMemSetAccess(self.ptr, self.size, ctypes.byref(desc), 1))
+            except BaseException:
+                self.close()
+                raise
 
     def export_fd(self) -> int:
         """Return a new POSIX file descriptor for the allocation. The caller closes it."""
@@ -290,7 +328,8 @@ class GpuAllocation:
             return
         addr, keep = _address(mv)
         try:
-            _check("cuMemcpyHtoD_v2", _load().cuMemcpyHtoD_v2(self.ptr + offset, addr, len(mv)))
+            with bound_context(self.device):
+                _check("cuMemcpyHtoD_v2", _load().cuMemcpyHtoD_v2(self.ptr + offset, addr, len(mv)))
         finally:
             del keep
 
@@ -300,7 +339,8 @@ class GpuAllocation:
             raise RacerError("copy outside the allocation")
         addr, keep = _address(mv)
         try:
-            _check("cuMemcpyDtoH_v2", _load().cuMemcpyDtoH_v2(addr, self.ptr + offset, len(mv)))
+            with bound_context(self.device):
+                _check("cuMemcpyDtoH_v2", _load().cuMemcpyDtoH_v2(addr, self.ptr + offset, len(mv)))
         finally:
             del keep
 
@@ -364,16 +404,20 @@ class HostRegistration:
             self._keep = None
 
 
-def host_register(buf) -> HostRegistration:
-    """Page-lock a writable host buffer with cuMemHostRegister."""
+def host_register(buf, device: int = 0) -> HostRegistration:
+    """Page-lock a writable host buffer with cuMemHostRegister.
+
+    The registration is made in ``device``'s primary context (PORTABLE makes
+    it usable from every context); pass the device the buffer will feed.
+    """
     lib = _load()
-    ensure_context(0)
     mv = memoryview(buf).cast("B")
     if mv.readonly:
         raise RacerError("buffer must be writable")
     arr = (ctypes.c_char * len(mv)).from_buffer(mv)
     addr = ctypes.addressof(arr)
-    _check("cuMemHostRegister_v2", lib.cuMemHostRegister_v2(addr, len(mv), CU_MEMHOSTREGISTER_PORTABLE))
+    with bound_context(device):
+        _check("cuMemHostRegister_v2", lib.cuMemHostRegister_v2(addr, len(mv), CU_MEMHOSTREGISTER_PORTABLE))
     # Drop the export so the owner can still close its mapping after unregistering.
     del arr
     mv.release()

@@ -41,6 +41,15 @@ _mode_lock = threading.Lock()
 _mode_state: dict[str, dict[str, str]] = {}
 
 
+def _dest_device(dest) -> int | None:
+    """Return the CUDA device ordinal of a read destination, if it has one."""
+    device = getattr(dest, "device", None)
+    if isinstance(device, int) and not isinstance(device, bool):
+        return device
+    index = getattr(device, "index", None)
+    return index if isinstance(index, int) else None
+
+
 def socket_path_for(cache: str | None = None, socket_path: str | None = None) -> str:
     """Resolve the client socket path.
 
@@ -199,7 +208,7 @@ class Client:
 
     # Staging pool ----------------------------------------------------------
 
-    def _take_staging(self):
+    def _take_staging(self, device: int | None = None):
         from .host import HostBuffer
 
         with self._pool_lock:
@@ -207,7 +216,7 @@ class Client:
                 return self._pool.pop()
         buf = HostBuffer(self.staging_bytes, "racer-staging")
         if self.pin_staging:
-            buf.pin()
+            buf.pin(0 if device is None else device)
         return buf
 
     def _give_staging(self, buf) -> None:
@@ -627,7 +636,7 @@ class Client:
         return self._run_modes(attempts)
 
     def _gpu_via_host(self, request, dest, dest_offset, window, offset, length, if_match, on_page, ok) -> ReadResult:
-        staging = self._take_staging()
+        staging = self._take_staging(_dest_device(dest))
         try:
             chunk = staging.size
             if length:
@@ -668,7 +677,7 @@ class Client:
             self._give_staging(staging)
 
     def _gpu_via_stream(self, request, dest, dest_offset, window, offset, length, if_match, on_page, ok) -> ReadResult:
-        staging = self._take_staging()
+        staging = self._take_staging(_dest_device(dest))
         try:
 
             def write(o: int, piece: memoryview) -> None:
