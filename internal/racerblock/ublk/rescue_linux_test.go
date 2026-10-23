@@ -486,7 +486,7 @@ func TestReleaseClosesUnusedSpareRingOnce(t *testing.T) {
 
 // TestQueueRingHoldsEveryCompletion checks the bound harvestOld relies
 // on: a queue ring's completion queue holds one completion per tag plus
-// the eventfd poll, for every supported depth.
+// the eventfd poll, across small queues and the maximum supported depth.
 func TestQueueRingHoldsEveryCompletion(t *testing.T) {
 	for _, depth := range []int{1, 2, 3, 4, 31, 64, 127, MaxQueueDepth} {
 		r := newTestRing(t, queueRingEntries(depth))

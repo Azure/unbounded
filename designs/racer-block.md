@@ -37,7 +37,7 @@ without copying the whole object to local disk first.
 | --- | --- |
 | `cmd/racer-block` | Flags, logging, signal handling. Thin `main`. |
 | `internal/racerblock` | `Run`: joins the backend and the ublk device, and owns their life cycle. |
-| `internal/racerblock/ublk` | Minimal ublk server: control commands on `/dev/ublk-control` and one io_uring per queue on `/dev/ublkc<N>`. |
+| `internal/racerblock/ublk` | Minimal Linux ublk server over io_uring. |
 | `internal/racerblock/backend` | Chunk cache, readahead, retries, and ETag pinning over `pkg/racersdk`. |
 
 ## How a read flows
@@ -64,8 +64,9 @@ directly with `io_uring_setup`, `mmap`, and `io_uring_enter`.
 - Control: `ADD_DEV`, `SET_PARAMS`, `START_DEV`, `STOP_DEV`, `DEL_DEV` on
   `/dev/ublk-control`. Shutdown uses `DEL_DEV_ASYNC` when the kernel supports it,
   and falls back to `DEL_DEV` otherwise.
-- Data: one io_uring and one locked OS thread per queue. Each tag keeps one
-  outstanding `FETCH_REQ` or `COMMIT_AND_FETCH_REQ`.
+- Data: one active io_uring, one reserved rescue ring, and one locked OS thread
+  per queue. Each tag keeps one outstanding `FETCH_REQ` or
+  `COMMIT_AND_FETCH_REQ`.
 - Parameters: logical block size 512, the device size rounded up to 512, the
   read-only attribute, and a maximum I/O size (default 1 MiB).
 - Defaults: `min(NumCPU, 4)` queues and a depth of 128.
@@ -83,15 +84,19 @@ A queue failure during startup must not release resources while `START_DEV`
 is still using them. A failed queue keeps its ring open and answers `EIO`
 while the device stops. For a started device, it keeps serving until
 `STOP_DEV` returns. This also finishes partition-scan reads that arrive after
-`START_DEV` returns. If the ring cannot serve I/O, it waits for startup to
-return or for both the kernel state and sysfs to show that the disk is
-published. If neither happens, it logs a warning and keeps waiting rather
-than closing the ring while the kernel might still use it.
+`START_DEV` returns.
 
-Cleanup is not bounded if the ring itself breaks. On Linux 7.0, requests
-already handed to the server can keep `STOP_DEV` waiting even after the ring
-closes. Closing the char device first and then deleting by ID could delete
-a different device if the ID was reused, so racer-block does not do that.
+Each queue reserves a rescue ring before startup, so recovery does not need
+to allocate a new kernel ring after a failure. If the active ring cannot
+serve I/O, the same queue thread uses the spare to finish requests while
+keeping the old ring, buffers, and char device open. This includes requests
+already handed to the old ring, which would otherwise strand `STOP_DEV` on
+Linux 7.0. Startup fails if a spare ring cannot be reserved.
+
+If both rings fail, the queue waits for startup to return or for both the
+kernel state and sysfs to show that the disk is published before closing a
+ring. If neither happens, it logs a warning and keeps waiting. Cleanup can
+still block if neither ring can finish requests already handed to the server.
 
 ## Backend
 
