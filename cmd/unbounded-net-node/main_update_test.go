@@ -891,6 +891,26 @@ func TestUpdateWireGuardFromSlices_UnmanagedSiteGatewayWithoutPodCIDRIsTunnelRea
 			},
 		}),
 	)
+	gatewayNodeInformer := newInformerWithObjects(
+		toUnstructured(t, &unboundednetv1alpha1.GatewayPoolNode{
+			ObjectMeta: metav1.ObjectMeta{Name: "gw-unmanaged"},
+			Status: unboundednetv1alpha1.GatewayNodeStatus{
+				LastUpdated: metav1.Now(),
+				Routes: map[string]unboundednetv1alpha1.GatewayNodeRoute{
+					"10.224.0.0/16": {
+						Type: "RoutedCidr",
+						Paths: [][]unboundednetv1alpha1.GatewayNodePathHop{{
+							{Type: "Site", Name: "cluster"},
+							{Type: "GatewayPool", Name: "pool-cluster"},
+						}},
+					},
+				},
+			},
+		}),
+		toUnstructured(t, &unboundednetv1alpha1.GatewayPoolNode{
+			ObjectMeta: metav1.ObjectMeta{Name: "gw-managed-pending"},
+		}),
+	)
 
 	state := &wireGuardState{
 		clientset: fake.NewClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-flex"}}),
@@ -908,7 +928,7 @@ func TestUpdateWireGuardFromSlices_UnmanagedSiteGatewayWithoutPodCIDRIsTunnelRea
 
 	defer func() { configureWireGuardFunc = origConfigure }()
 
-	if err := updateWireGuardFromSlices(context.Background(), nil, siteInformer, sliceInformer, gatewayPoolInformer, newInformerWithObjects(), newInformerWithObjects(), assignmentInformer, newInformerWithObjects(), cfg, mySiteName, "priv", myPubKey, true, state); err != nil {
+	if err := updateWireGuardFromSlices(context.Background(), nil, siteInformer, sliceInformer, gatewayPoolInformer, gatewayNodeInformer, newInformerWithObjects(), assignmentInformer, newInformerWithObjects(), cfg, mySiteName, "priv", myPubKey, true, state); err != nil {
 		t.Fatalf("updateWireGuardFromSlices() error = %v", err)
 	}
 
