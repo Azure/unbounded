@@ -273,7 +273,7 @@ impl LandedCiphertext {
     }
 
     /// Byte offset in the landing buffer.
-    fn offset(&self) -> u64 {
+    pub(crate) fn offset(&self) -> u64 {
         self.offset
     }
 }

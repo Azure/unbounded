@@ -871,7 +871,7 @@ fn assign_landing_prefers_numa_then_any() {
 }
 
 /// Register a simulated GPU's landing buffer on `a`'s rail.
-fn attach_landing(w: &mut World, helper: &Arc<crate::gpu::GpuHelper>, bytes: u64) {
+pub(crate) fn attach_landing(w: &mut World, helper: &Arc<crate::gpu::GpuHelper>, bytes: u64) {
     w.a.links.node().set_gpu_landing(helper.clone(), bytes);
     let rails = w.a.links.active();
     let scope = scope();

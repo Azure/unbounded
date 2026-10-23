@@ -1968,6 +1968,8 @@ mod tests {
             receiver_site: Option<&'static str>,
             /// The sender's link breaks before it writes.
             sender_down: bool,
+            /// The receiver grants a slot of a simulated GPU's landing buffer.
+            landing: bool,
         }
 
         struct PageOutcome {
@@ -1975,6 +1977,8 @@ mod tests {
             result: Result<Vec<u8>>,
             /// The received ciphertext was still in registered memory.
             registered: bool,
+            /// The page landed in the GPU landing buffer.
+            landed: bool,
             /// Free buffers while the response was still held.
             held: (Option<usize>, Option<usize>),
             sent: Result<bool>,
@@ -2141,17 +2145,27 @@ mod tests {
             };
             let sender_membership = page_membership(&signers, case.sender_site);
             let receiver_membership = page_membership(&signers, case.receiver_site);
+            let gpu = case.landing.then(|| {
+                let helper = crate::gpu::testing::helper(&[None]);
+                let bytes = (crate::rdma::BUFFER_LEN as u64)
+                    .next_multiple_of(crate::config::GPU_STAGING_UNIT);
+                crate::rdma::links::tests::attach_landing(&mut w, &helper, bytes);
+                assert_eq!(w.a.links.landing_ordinal(RailId(7)), Some(0));
+                helper
+            });
             // The receiver grants in-band and names the grant in its signed Accept.
-            let pending = crate::rdma::links::tests::drive(
-                &mut w.a.owner,
-                &mut w.b.owner,
-                receiver.links.as_ref().unwrap().grant(
-                    signers[2].node(),
-                    RailId(7),
-                    binding.transfer,
-                    &scope,
-                ),
-            )
+            let links = receiver.links.as_ref().unwrap();
+            let pending = crate::rdma::links::tests::drive(&mut w.a.owner, &mut w.b.owner, async {
+                if case.landing {
+                    links
+                        .grant_landing(signers[2].node(), RailId(7), binding.transfer, 0, &scope)
+                        .await
+                } else {
+                    links
+                        .grant(signers[2].node(), RailId(7), binding.transfer, &scope)
+                        .await
+                }
+            })
             .unwrap();
             let accept = binding
                 .sign(
@@ -2207,10 +2221,11 @@ mod tests {
                         return receiver
                             .wire
                             .1
-                            .response(auth, body.bytes()?.to_vec(), &scope);
+                            .response(auth, body.bytes()?.to_vec(), &scope)
+                            .map(RelayResponse::Complete);
                     };
                     receiver
-                        .receive_native(
+                        .receive_native_into(
                             received.connection,
                             auth,
                             binding.clone(),
@@ -2291,17 +2306,40 @@ mod tests {
             let held = free(&w);
             let registered = matches!(
                 &result,
-                Ok(SignedResponse { response: PeerResponse::Page { ciphertext, .. }, .. })
-                    if ciphertext.is_registered()
+                Ok(RelayResponse::Complete(SignedResponse {
+                    response: PeerResponse::Page { ciphertext, .. },
+                    ..
+                })) if ciphertext.is_registered()
             );
-            let result = result.map(|response| match &response.response {
-                PeerResponse::Page { ciphertext, .. } => ciphertext.bytes().to_vec(),
+            let landed = matches!(&result, Ok(RelayResponse::Landed(_)));
+            let result = result.map(|response| match response {
+                RelayResponse::Complete(SignedResponse {
+                    response: PeerResponse::Page { ciphertext, .. },
+                    ..
+                }) => ciphertext.bytes().to_vec(),
+                RelayResponse::Landed(landed) => {
+                    // Read what the NIC wrote, through the landing dma-buf.
+                    use std::os::unix::fs::FileExt;
+                    assert_eq!(landed.envelope.ciphertext_length, 144);
+                    let buffer = w.a.links.node().landing(RailId(7)).unwrap();
+                    let file = std::fs::File::from(
+                        rdma_verbs::DmabufMemory::fd(&*buffer)
+                            .try_clone_to_owned()
+                            .unwrap(),
+                    );
+                    let mut bytes = vec![0; landed.landed.len() as usize];
+                    file.read_exact_at(&mut bytes, landed.landed.offset())
+                        .unwrap();
+                    bytes
+                }
                 _ => panic!("expected page"),
             });
+            drop(gpu);
             crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
             PageOutcome {
                 result,
                 registered,
+                landed,
                 held,
                 sent,
                 completed: sender.native_completed.get(),
@@ -2340,6 +2378,48 @@ mod tests {
                     assert_eq!(outcome.free, (Some(2), Some(2)));
                 }
             }
+        }
+
+        #[test]
+        /// A landing grant over a ready link: the sender writes into the
+        /// receiver's GPU landing buffer, the receiver checks the signed head
+        /// for exactly this page and returns it as landed, and no host buffer
+        /// is used on the receiver.
+        fn simulated_landing_grant_lands_the_page_in_gpu_memory() {
+            for reverse in [false, true] {
+                let outcome = page_roundtrip(PageCase {
+                    reverse,
+                    landing: true,
+                    ..PageCase::default()
+                });
+                assert_eq!(page_bytes(&outcome.result), vec![0x5a; 144]);
+                assert!(outcome.landed && !outcome.registered);
+                assert_eq!(outcome.sent, Ok(true));
+                assert_eq!(
+                    (outcome.completed, outcome.fallbacks, outcome.completions),
+                    (1, 0, 1)
+                );
+                // No host receive buffer was used.
+                assert_eq!(outcome.held, (Some(2), Some(2)));
+                assert_eq!(outcome.free, (Some(2), Some(2)));
+            }
+        }
+
+        #[test]
+        /// The sender may still answer a landing grant over HTTP (here its
+        /// link is down): the page arrives in host memory as usual.
+        fn simulated_landing_grant_falls_back_to_http() {
+            let outcome = page_roundtrip(PageCase {
+                landing: true,
+                sender_down: true,
+                ..PageCase::default()
+            });
+            assert_eq!(page_bytes(&outcome.result), vec![0x5a; 144]);
+            assert!(!outcome.landed);
+            assert_eq!(
+                (outcome.completed, outcome.fallbacks, outcome.completions),
+                (0, 1, 0)
+            );
         }
 
         #[test]
