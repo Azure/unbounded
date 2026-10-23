@@ -1,0 +1,171 @@
+//! Node knobs: cache capacities, flight and relay limits, timeouts and the
+//! membership publication model.
+//!
+//! Capacities default far below production (see the design doc, section
+//! "Node integration") so 50,000 nodes fit the memory budget; the decision
+//! code is the same at any capacity. Flight, waiter and relay limits and the
+//! fill quotas default to the production per-worker values in
+//! `src/config.rs` (`flights` 64, `waiters_per_flight` 64,
+//! `relay_transfers` 16, plaintext 64 MiB, ciphertext 128 MiB, dirty
+//! 160 MiB).
+
+use serde_json::Value;
+
+use crate::engine::{MILLIS, Nanos, SECONDS};
+
+const MIB: u64 = 1 << 20;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NodeConfig {
+    /// Phantom placement cache entries per worker (production: about
+    /// 16,384 from a 16 MiB budget).
+    pub placement_entries: u32,
+    /// Route cache entries per node (production `cached_paths` 128).
+    pub path_entries: u32,
+    /// Route cache byte budget per node (production 8 MiB).
+    pub path_bytes: u64,
+    /// Concurrent route searches per node (production 8).
+    pub active_searches: u32,
+    pub flights: u32,
+    pub waiters_per_flight: u32,
+    pub relay_transfers: u32,
+    pub plaintext_bytes: u64,
+    pub ciphertext_bytes: u64,
+    pub dirty_bytes: u64,
+    /// Pages per disk segment.
+    pub pages_per_segment: u32,
+    /// Second-sight history bytes per node.
+    pub history_bytes: u32,
+    /// Membership changes are batched and published at this period.
+    pub membership_batch_ns: Nanos,
+    /// Each node adopts a publication after a per-node lag in
+    /// `0..=membership_lag_ns` (must not exceed the batch period).
+    pub membership_lag_ns: Nanos,
+    /// Old membership versions a node can still resolve (production
+    /// `retained_snapshots` 2).
+    pub retained_versions: u64,
+    /// Per-attempt peer timeout (`attempt_timeout`).
+    pub attempt_timeout_ns: Nanos,
+    /// Client read deadline per page.
+    pub read_timeout_ns: Nanos,
+    /// Time to detect a refused or partitioned link.
+    pub connect_timeout_ns: Nanos,
+    /// Request scope at a serving peer.
+    pub serve_timeout_ns: Nanos,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            placement_entries: 256,
+            path_entries: 128,
+            path_bytes: 256 << 10,
+            active_searches: 8,
+            flights: 64,
+            waiters_per_flight: 64,
+            relay_transfers: 16,
+            plaintext_bytes: 64 * MIB,
+            ciphertext_bytes: 128 * MIB,
+            dirty_bytes: 160 * MIB,
+            pages_per_segment: 8,
+            history_bytes: 2048,
+            membership_batch_ns: 250 * MILLIS,
+            membership_lag_ns: 100 * MILLIS,
+            retained_versions: 2,
+            attempt_timeout_ns: 2 * SECONDS,
+            read_timeout_ns: 10 * SECONDS,
+            connect_timeout_ns: 100 * MILLIS,
+            serve_timeout_ns: 5 * SECONDS,
+        }
+    }
+}
+
+impl NodeConfig {
+    pub fn apply_json(&mut self, value: &Value) -> Result<(), String> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| format!("node: expected an object, got {value}"))?;
+        for (key, v) in obj {
+            let n = v
+                .as_u64()
+                .ok_or_else(|| format!("node.{key}: expected a non-negative integer, got {v}"))?;
+            let small = || u32::try_from(n).map_err(|_| format!("node.{key}: out of range"));
+            match key.as_str() {
+                "placement_entries" => self.placement_entries = small()?,
+                "path_entries" => self.path_entries = small()?,
+                "path_bytes" => self.path_bytes = n,
+                "active_searches" => self.active_searches = small()?,
+                "flights" => self.flights = small()?,
+                "waiters_per_flight" => self.waiters_per_flight = small()?,
+                "relay_transfers" => self.relay_transfers = small()?,
+                "plaintext_bytes" => self.plaintext_bytes = n,
+                "ciphertext_bytes" => self.ciphertext_bytes = n,
+                "dirty_bytes" => self.dirty_bytes = n,
+                "pages_per_segment" => self.pages_per_segment = small()?,
+                "history_bytes" => self.history_bytes = small()?,
+                "membership_batch_ns" => self.membership_batch_ns = n,
+                "membership_lag_ns" => self.membership_lag_ns = n,
+                "retained_versions" => self.retained_versions = n,
+                "attempt_timeout_ns" => self.attempt_timeout_ns = n,
+                "read_timeout_ns" => self.read_timeout_ns = n,
+                "connect_timeout_ns" => self.connect_timeout_ns = n,
+                "serve_timeout_ns" => self.serve_timeout_ns = n,
+                _ => return Err(format!("unknown key node.{key}")),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.flights == 0 || self.waiters_per_flight == 0 || self.relay_transfers == 0 {
+            return Err(
+                "node: flights, waiters_per_flight and relay_transfers must be nonzero".into(),
+            );
+        }
+        if self.pages_per_segment == 0 || self.history_bytes == 0 {
+            return Err("node: pages_per_segment and history_bytes must be nonzero".into());
+        }
+        if self.membership_batch_ns == 0 || self.membership_lag_ns > self.membership_batch_ns {
+            return Err(
+                "node: membership_lag_ns must not exceed a nonzero membership_batch_ns".into(),
+            );
+        }
+        if self.attempt_timeout_ns == 0 || self.read_timeout_ns == 0 || self.serve_timeout_ns == 0 {
+            return Err("node: timeouts must be nonzero".into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn overrides_and_validation() {
+        let mut c = NodeConfig::default();
+        c.validate().unwrap();
+        c.apply_json(&json!({"placement_entries": 9, "membership_lag_ns": 5}))
+            .unwrap();
+        assert_eq!((c.placement_entries, c.membership_lag_ns), (9, 5));
+        for bad in [
+            json!([]),
+            json!({"nope": 1}),
+            json!({"flights": -1}),
+            json!({"flights": 1u64 << 40}),
+        ] {
+            assert!(NodeConfig::default().apply_json(&bad).is_err(), "{bad}");
+        }
+        let lagging = NodeConfig {
+            membership_lag_ns: 2 * SECONDS,
+            ..NodeConfig::default()
+        };
+        assert!(lagging.validate().is_err());
+        let no_flights = NodeConfig {
+            flights: 0,
+            ..NodeConfig::default()
+        };
+        assert!(no_flights.validate().is_err());
+    }
+}

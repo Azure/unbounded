@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use crate::engine::{MICROS, MILLIS, Nanos, SECONDS};
 use crate::faults::Fault;
+use crate::node::NodeConfig;
 use crate::resources::OriginErrors;
 use crate::workload::{Churn, Storm};
 
@@ -89,6 +90,8 @@ pub struct Config {
     pub storms: Vec<Storm>,
     pub churn: Vec<Churn>,
     pub faults: Vec<Fault>,
+    /// Real node logic knobs (`"node"` object in JSON).
+    pub node: NodeConfig,
 }
 
 impl Default for Config {
@@ -126,6 +129,7 @@ impl Default for Config {
             storms: Vec::new(),
             churn: Vec::new(),
             faults: Vec::new(),
+            node: NodeConfig::default(),
         }
     }
 }
@@ -213,6 +217,7 @@ impl Config {
                 "storms" => self.storms = list(k, v, Storm::from_json)?,
                 "churn" => self.churn = list(k, v, Churn::from_json)?,
                 "faults" => self.faults = list(k, v, Fault::from_json)?,
+                "node" => self.node.apply_json(v)?,
                 _ => return Err(format!("unknown config key {key:?}")),
             }
         }
@@ -236,7 +241,7 @@ impl Config {
         if self.range_fraction > 1.0 {
             return Err("range_fraction must be at most 1".into());
         }
-        Ok(())
+        self.node.validate()
     }
 }
 

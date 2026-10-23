@@ -961,6 +961,7 @@ dependencies = [
  "racer-cluster-control",
  "racer-control-wire",
  "racer-core",
+ "racer-object-wire",
  "serde_json",
  "topology",
 ]

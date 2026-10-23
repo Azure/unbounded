@@ -20,6 +20,7 @@ pub mod control;
 pub mod engine;
 pub mod faults;
 pub mod logic;
+pub mod node;
 pub mod report;
 pub mod resources;
 pub mod scenario;
