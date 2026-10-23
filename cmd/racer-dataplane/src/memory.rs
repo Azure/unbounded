@@ -1103,197 +1103,82 @@ impl CachedPage {
 }
 
 /// Most entries one bounded reclaim pass examines, per cache or overall.
-const RECLAIM_SCAN: usize = 256;
+#[cfg(test)]
+const RECLAIM_SCAN: usize = racer_core::cache::lru::RECLAIM_WINDOW;
 /// Most caches one global reclaim checks for over-share bytes. The window
 /// rotates and resumes after the last examined cache. When every call
 /// examines a full window, each cache with retained entries is checked within
 /// `ceil(caches / PRESSURE_WINDOW)` global reclaims; calls that end early
 /// advance by fewer caches but never skip one.
-pub(crate) const PRESSURE_WINDOW: usize = 8;
+pub(crate) const PRESSURE_WINDOW: usize = racer_core::cache::lru::PRESSURE_WINDOW;
 
-/// One cache's entries in touch order, with its own resumable reclaim cursor.
-#[derive(Default)]
-struct Lane {
-    order: BTreeMap<u64, PageId>,
-    after: u64,
-}
-/// Per-cache touch order. Each insert, touch, and remove costs
-/// O(log caches + log entries); nothing here walks all caches or entries.
-#[derive(Default)]
-struct Lanes(BTreeMap<CacheId, Lane>);
-impl Lanes {
-    fn insert(&mut self, tick: u64, id: &PageId) {
-        self.0
-            .entry(id.version.object.cache.clone())
-            .or_default()
-            .order
-            .insert(tick, id.clone());
-    }
-    fn remove(&mut self, tick: u64, id: &PageId) {
-        let cache = &id.version.object.cache;
-        let Some(lane) = self.0.get_mut(cache) else {
-            return;
-        };
-        lane.order.remove(&tick);
-        if lane.order.is_empty() {
-            self.0.remove(cache);
-        }
-    }
-    /// Up to `RECLAIM_SCAN` of one cache's entries, oldest first after its cursor.
-    fn candidates(&self, cache: &CacheId) -> Vec<(u64, PageId)> {
-        let Some(lane) = self.0.get(cache) else {
-            return Vec::new();
-        };
-        lane.order
-            .range((
-                std::ops::Bound::Excluded(lane.after),
-                std::ops::Bound::Unbounded,
-            ))
-            .chain(lane.order.range(..=lane.after))
-            .take(RECLAIM_SCAN)
-            .map(|(tick, id)| (*tick, id.clone()))
-            .collect()
-    }
-    fn advance(&mut self, cache: &CacheId, tick: u64) {
-        if let Some(lane) = self.0.get_mut(cache) {
-            lane.after = tick;
-        }
-    }
-    /// Up to `PRESSURE_WINDOW` caches after `cursor`, wrapping.
-    fn window(&self, cursor: Option<&CacheId>) -> Vec<CacheId> {
-        let keys: Box<dyn Iterator<Item = &CacheId>> = match cursor {
-            Some(cursor) => Box::new(
-                self.0
-                    .range::<CacheId, _>((
-                        std::ops::Bound::Excluded(cursor),
-                        std::ops::Bound::Unbounded,
-                    ))
-                    .chain(self.0.range::<CacheId, _>(..=cursor))
-                    .map(|(cache, _)| cache),
-            ),
-            None => Box::new(self.0.keys()),
-        };
-        keys.take(PRESSURE_WINDOW).cloned().collect()
+/// Memory cache lanes: one per cache, so one cache's entries are reclaimed
+/// without scanning the others.
+struct ByCache;
+impl racer_core::cache::lru::Grouping<PageId> for ByCache {
+    type Id = CacheId;
+    fn group(key: &PageId) -> Option<CacheId> {
+        Some(key.version.object.cache.clone())
     }
 }
 
+/// Verified pages in tick order plus a per-version page set. The recency
+/// index and its reclamation rules live in [`racer_core::cache::lru`], which
+/// the simulator drives with payload-free values.
 #[derive(Default)]
 struct Entries {
-    pages: HashMap<PageId, (u64, CachedPage)>,
-    lru: BTreeMap<u64, PageId>,
-    lanes: Lanes,
+    lru: racer_core::cache::lru::TickLru<PageId, CachedPage, std::hash::RandomState, ByCache>,
     versions: HashMap<ObjectVersion, HashSet<PageId>>,
-    clock: u64,
-    reclaim_after: u64,
+}
+impl std::ops::Deref for Entries {
+    type Target =
+        racer_core::cache::lru::TickLru<PageId, CachedPage, std::hash::RandomState, ByCache>;
+    fn deref(&self) -> &Self::Target {
+        &self.lru
+    }
+}
+impl std::ops::DerefMut for Entries {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.lru
+    }
 }
 impl Entries {
-    fn len(&self) -> usize {
-        self.pages.len()
-    }
     fn remove(&mut self, id: &PageId) -> Option<CachedPage> {
-        let (tick, page) = self.pages.remove(id)?;
-        self.lru.remove(&tick);
-        self.lanes.remove(tick, id);
+        let page = self.lru.remove(id)?;
+        self.forget_version(id);
+        Some(page)
+    }
+    /// Drop `id` from its version's page set after the LRU removed it.
+    fn forget_version(&mut self, id: &PageId) {
         if let Some(pages) = self.versions.get_mut(&id.version) {
             pages.remove(id);
             if pages.is_empty() {
                 self.versions.remove(&id.version);
             }
         }
-        Some(page)
     }
     fn insert(&mut self, page: PageResult) -> Result<()> {
-        self.clock = self.clock.checked_add(1).ok_or(Error::Overloaded)?;
         let id = page.plaintext.page().clone();
         let page = CachedPage::new(page);
-        self.lru.insert(self.clock, id.clone());
-        self.lanes.insert(self.clock, &id);
+        self.lru
+            .insert(id.clone(), page)
+            .map_err(|_| Error::Overloaded)?;
         self.versions
             .entry(id.version.clone())
             .or_default()
-            .insert(id.clone());
-        self.pages.insert(id, (self.clock, page));
+            .insert(id);
         Ok(())
     }
     /// Move `page` to the most recently used tick.
     fn touch(&mut self, page: &PageId) -> Result<()> {
-        let Some((old, _)) = self.pages.get(page) else {
-            return Ok(());
-        };
-        let old = *old;
-        self.clock = self.clock.checked_add(1).ok_or(Error::Overloaded)?;
-        let tick = self.clock;
-        self.lru.remove(&old);
-        self.lru.insert(tick, page.clone());
-        self.lanes.remove(old, page);
-        self.lanes.insert(tick, page);
-        self.pages.get_mut(page).unwrap().0 = tick;
-        Ok(())
-    }
-    fn candidates(&self) -> Vec<(u64, PageId)> {
-        self.lru
-            .range((
-                std::ops::Bound::Excluded(self.reclaim_after),
-                std::ops::Bound::Unbounded,
-            ))
-            .chain(self.lru.range(..=self.reclaim_after))
-            .take(RECLAIM_SCAN)
-            .map(|(tick, id)| (*tick, id.clone()))
-            .collect()
+        self.lru.touch(page).map_err(|_| Error::Overloaded)
     }
 }
 /// Unverified original ciphertext keyed by page, with a monotonic touch tick
 /// per entry so idle expiry can find the least recently touched entries.
-/// Reads go through `Deref`; every mutation goes through these methods so the
-/// tick index never drifts from the entries.
-#[derive(Default)]
-struct CiphertextEntries {
-    pages: BTreeMap<PageId, UnverifiedPage>,
-    ticks: HashMap<PageId, u64>,
-    order: BTreeMap<u64, PageId>,
-    lanes: Lanes,
-    clock: u64,
-}
-impl std::ops::Deref for CiphertextEntries {
-    type Target = BTreeMap<PageId, UnverifiedPage>;
-    fn deref(&self) -> &Self::Target {
-        &self.pages
-    }
-}
-impl CiphertextEntries {
-    fn touch(&mut self, id: &PageId) {
-        if !self.pages.contains_key(id) {
-            return;
-        }
-        // Wrapping is unreachable in practice (2^64 touches); saturating keeps
-        // the index consistent even then, at worst making order ambiguous.
-        self.clock = self.clock.saturating_add(1);
-        if let Some(old) = self.ticks.insert(id.clone(), self.clock) {
-            self.order.remove(&old);
-            self.lanes.remove(old, id);
-        }
-        self.order.insert(self.clock, id.clone());
-        self.lanes.insert(self.clock, id);
-    }
-    fn insert(&mut self, id: PageId, page: UnverifiedPage) {
-        self.pages.insert(id.clone(), page);
-        self.touch(&id);
-    }
-    fn remove(&mut self, id: &PageId) -> Option<UnverifiedPage> {
-        let page = self.pages.remove(id)?;
-        if let Some(tick) = self.ticks.remove(id) {
-            self.order.remove(&tick);
-            self.lanes.remove(tick, id);
-        }
-        Some(page)
-    }
-    fn retain(&mut self, mut keep: impl FnMut(&PageId) -> bool) {
-        let removed: Vec<_> = self.pages.keys().filter(|id| !keep(id)).cloned().collect();
-        for id in removed {
-            self.remove(&id);
-        }
-    }
-}
+use racer_core::cache::lru::Visit;
+type CiphertextEntries =
+    racer_core::cache::lru::OrderedLru<PageId, UnverifiedPage, std::hash::RandomState, ByCache>;
 
 /// Entries nobody inserted or hit for this long are released by
 /// [`MemoryCache::expire_idle`], so a worker that served a burst does not keep
@@ -1553,14 +1438,7 @@ impl MemoryCache {
             return Ok(());
         }
         if entries.len() + self.ciphertext_entries.borrow().len() >= self.pool.entry_limit() {
-            let id = entries
-                .candidates()
-                .into_iter()
-                .find_map(|(tick, id)| {
-                    entries.reclaim_after = tick;
-                    idle(&entries.pages[&id].1).then_some(id)
-                })
-                .ok_or(Error::Overloaded)?;
+            let id = entries.victim(idle).ok_or(Error::Overloaded)?;
             entries.remove(&id);
         }
         entries.insert(page)
@@ -1599,18 +1477,20 @@ impl MemoryCache {
     pub fn evict_idle(&self, bytes: usize) -> Result<usize> {
         let mut released = self.reclaim_ciphertext(None, bytes);
         let mut entries = self.entries.borrow_mut();
-        let candidates = entries.candidates();
-        for (tick, id) in candidates {
+        let mut versions = Vec::new();
+        entries.lru.reclaim(|id, entry| {
             if released >= bytes {
-                break;
+                return Visit::Stop;
             }
-            entries.reclaim_after = tick;
-            let entry = &entries.pages[&id].1;
             if !idle(entry) {
-                continue;
+                return Visit::Skip;
             }
             released = released.saturating_add(entry.ciphertext.inner.reservation().amount());
-            entries.remove(&id);
+            versions.push(id.clone());
+            Visit::Remove
+        });
+        for id in versions {
+            entries.forget_version(&id);
         }
         self.pool.reclaim_buffers();
         Ok(released)
@@ -1630,25 +1510,27 @@ impl MemoryCache {
         }
         let mut released = self.reclaim_ciphertext(cache, bytes);
         let mut entries = self.entries.borrow_mut();
-        let candidates = entries.candidates();
-        for (tick, id) in candidates {
+        let mut versions = Vec::new();
+        entries.lru.reclaim(|id, entry| {
             if released >= bytes {
-                break;
+                return Visit::Stop;
             }
-            entries.reclaim_after = tick;
-            let entry = &entries.pages[&id].1;
             if cache.is_some_and(|cache| cache != &entry.metadata.version.object.cache) {
-                continue;
+                return Visit::Skip;
             }
-            released = released.saturating_add(release_queued(&id, &entry.ciphertext));
+            released = released.saturating_add(release_queued(id, &entry.ciphertext));
             if released >= bytes {
-                break;
+                return Visit::Last;
             }
             if !idle(entry) {
-                continue;
+                return Visit::Skip;
             }
             released = released.saturating_add(entry.ciphertext.inner.reservation().amount());
-            entries.remove(&id);
+            versions.push(id.clone());
+            Visit::Remove
+        });
+        for id in versions {
+            entries.forget_version(&id);
         }
         released
     }
@@ -1685,18 +1567,8 @@ impl MemoryCache {
         let mut released = 0;
         if let Some(after) = expiry.verified {
             let mut entries = self.entries.borrow_mut();
-            let selected: Vec<_> = entries
-                .lru
-                .range((
-                    std::ops::Bound::Excluded(after),
-                    std::ops::Bound::Included(verified_cutoff),
-                ))
-                .take(CACHE_EXPIRY_BATCH)
-                .map(|(tick, id)| (*tick, id.clone()))
-                .collect();
-            expiry.verified = (selected.len() == CACHE_EXPIRY_BATCH)
-                .then(|| selected.last().map(|(tick, _)| *tick))
-                .flatten();
+            let (selected, next) = entries.expiring(after, verified_cutoff, CACHE_EXPIRY_BATCH);
+            expiry.verified = next;
             for (_, id) in selected {
                 if idle(&entries.pages[&id].1) {
                     entries.remove(&id);
@@ -1706,18 +1578,8 @@ impl MemoryCache {
         }
         if let Some(after) = expiry.ciphertext {
             let mut entries = self.ciphertext_entries.borrow_mut();
-            let selected: Vec<_> = entries
-                .order
-                .range((
-                    std::ops::Bound::Excluded(after),
-                    std::ops::Bound::Included(ciphertext_cutoff),
-                ))
-                .take(CACHE_EXPIRY_BATCH)
-                .map(|(tick, id)| (*tick, id.clone()))
-                .collect();
-            expiry.ciphertext = (selected.len() == CACHE_EXPIRY_BATCH)
-                .then(|| selected.last().map(|(tick, _)| *tick))
-                .flatten();
+            let (selected, next) = entries.expiring(after, ciphertext_cutoff, CACHE_EXPIRY_BATCH);
+            expiry.ciphertext = next;
             for (_, id) in selected {
                 if Arc::strong_count(&entries[&id].copy.ciphertext.inner) == 1 {
                     entries.remove(&id);
@@ -2148,7 +2010,9 @@ pub(crate) mod tests {
 
                 fn resident(cache: &MemoryCache, owner: &str) -> usize {
                     let owner = id(owner);
-                    let count = |lanes: &Lanes| lanes.0.get(&owner).map_or(0, |l| l.order.len());
+                    let count = |lanes: &racer_core::cache::lru::Lanes<CacheId, PageId>| {
+                        lanes.0.get(&owner).map_or(0, |l| l.order.len())
+                    };
                     count(&cache.entries.borrow().lanes)
                         + count(&cache.ciphertext_entries.borrow().lanes)
                 }
@@ -2163,12 +2027,12 @@ pub(crate) mod tests {
                         for (tick, page) in &lane.order {
                             assert_eq!(&page.version.object.cache, owner);
                             assert_eq!(entries.pages[page].0, *tick);
-                            assert_eq!(entries.lru[tick], *page);
+                            assert_eq!(entries.lru.lru[tick], *page);
                             lane_entries += 1;
                         }
                     }
                     assert_eq!(lane_entries, entries.pages.len());
-                    assert_eq!(entries.lru.len(), entries.pages.len());
+                    assert_eq!(entries.lru.lru.len(), entries.pages.len());
                     let ciphertext = cache.ciphertext_entries.borrow();
                     let mut lane_entries = 0;
                     for (owner, lane) in &ciphertext.lanes.0 {
