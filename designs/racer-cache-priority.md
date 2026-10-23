@@ -76,12 +76,12 @@ is **under share**.
 
 Rules:
 
-- Under pressure, over-share caches lose data first.
+- Under pressure, eviction prefers over-share candidates within bounded scans.
 - Within the same class (over or under share), the existing retention score
   (heat 0 to 3, plus 1 if this node is the placement owner) decides, then age.
 - Hard holds (warm and spill) are never evicted, as today.
-- Priority 0 means no guaranteed share. The cache is always over share, so it
-  is evicted first, but it is still cached when capacity is idle.
+- Against positive-priority competitors, priority 0 has no weighted share but
+  can use idle capacity. Working-memory floors and allowances still apply.
 
 ## Per-tier mechanics
 
@@ -116,8 +116,8 @@ lost with it.
 When the queue is full, replacement ranks by `(under_share, score)`. An
 unheld over-share page never displaces an under-share page, either through
 replacement or through reclaim of optional writes for an owned page's quota.
-A held incoming page keeps its existing exemption, and queued held writes
-remain protected as victims. Write order uses the same ranking.
+A held incoming page keeps its existing exemption. Queued held writes cannot
+be evicted. Write order uses the same ranking.
 
 ### Memory
 
@@ -225,9 +225,9 @@ that worker. The node sums can hide per-worker differences.
 - Wire: encode and decode with `priority`; strict decode rejects a missing field.
 - Share math: weighted shares, all-zero equal split, single cache, and removal.
 - Accounting: publish, evict, cache removal, and checkpoint rebuild.
-- Each tier: over-share victims are chosen before under-share ones; score and
-  age still order within a class; holds are never evicted; an unheld over-share page
-  never displaces an under-share page in the queue; memory limits follow
+- Each tier: bounded scans prefer over-share victims; score and age still order
+  within a class; holds are never evicted; an unheld over-share page never
+  displaces an under-share page in the queue; memory limits follow
   weights with floor and max; non-owned admission is rejected only when over
   share and free segments are at the reserve.
 - Deterministic simulation: two caches with priorities 900 and 100 under steady
