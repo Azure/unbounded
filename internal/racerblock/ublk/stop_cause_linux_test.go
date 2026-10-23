@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"testing"
 )
 
@@ -239,8 +238,10 @@ func TestCloseWinsTeardownKeepsFailure(t *testing.T) {
 	<-scheduled
 
 	closeErr := d.Close()
-	if closeErr == nil || !strings.Contains(closeErr.Error(), "control channel closed") {
-		t.Fatalf("Close = %v, want fixture control channel error", closeErr)
+	// The fixture never opened a char device, so teardown leaves the
+	// id alone and reports that.
+	if !errors.Is(closeErr, errUnpinnedLeft) {
+		t.Fatalf("Close = %v, want fixture device left in place", closeErr)
 	}
 
 	if err := d.Err(); !errors.Is(err, queueErr) {

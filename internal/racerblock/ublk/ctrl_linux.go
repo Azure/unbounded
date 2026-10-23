@@ -123,6 +123,10 @@ func (c *ctrl) do(op, devID uint32, data uint64, buf unsafe.Pointer, bufLen int)
 // command's addr/len. After completion, the first len(out) bytes of the page
 // are copied to out. The payload size is max(len(in), len(out)).
 func (c *ctrl) doPayload(op, devID uint32, data uint64, in, out []byte) (int32, error) {
+	if testHooks.ctrlSent != nil {
+		testHooks.ctrlSent(op, devID)
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 

@@ -113,16 +113,14 @@ func Start(ctx context.Context, cfg Config, h Handler) (*Device, error) {
 	d.hctx, d.hcancel = context.WithCancel(ctx)
 
 	if err := d.runStartup(d.start); err != nil {
-		d.teardown(err)
-		return nil, err
+		return nil, d.abortStart(err)
 	}
 
 	// START_DEV can block on reads, such as a synchronous partition scan,
 	// that fail once ctx is canceled. Do not report a device as started
 	// when its context ended during startup.
 	if err := ctx.Err(); err != nil {
-		d.teardown(err)
-		return nil, err
+		return nil, d.abortStart(err)
 	}
 
 	go d.watch(ctx)
@@ -131,6 +129,26 @@ func Start(ctx context.Context, cfg Config, h Handler) (*Device, error) {
 		"queues", cfg.Queues, "depth", cfg.Depth, "maxIOBytes", cfg.MaxIOBytes)
 
 	return d, nil
+}
+
+// errUnpinnedLeft marks a device that startup added but whose char device
+// it never opened. Without that open nothing stops another process from
+// deleting the id and adding a new device under it, so teardown sends no
+// command by id and leaves the device for manual cleanup.
+var errUnpinnedLeft = errors.New("ublk: device left in place because its char device was never opened; " +
+	"verify it is ours before deleting it")
+
+// abortStart tears down a device whose startup failed and returns err.
+// When teardown left the device in place because it could not delete it
+// safely, that is joined to err so the caller learns of it.
+func (d *Device) abortStart(err error) error {
+	d.teardown(err)
+
+	if errors.Is(d.closeErr, errUnpinnedLeft) {
+		return errors.Join(err, d.closeErr)
+	}
+
+	return err
 }
 
 // init sets the default hooks and enters the startup phase.
@@ -217,6 +235,8 @@ var testHooks struct {
 	beforeStop func(d *Device)
 	// pinnedDelPause replaces the pause before a pinned DEL_DEV cancel.
 	pinnedDelPause func(round int)
+	// ctrlSent observes every control command before it is sent.
+	ctrlSent func(op, devID uint32)
 	// pinnedDelDone runs in teardown after a pinned DEL_DEV returns and
 	// before the char device is closed.
 	pinnedDelDone func(d *Device, err error)
@@ -425,7 +445,7 @@ func (d *Device) teardown(cause error) {
 			errs = append(errs, q.release())
 		}
 
-		if !d.started {
+		if !d.started && d.charFd >= 0 {
 			// Never live; STOP_DEV makes DEL_DEV safe. It may fail
 			// harmlessly when the device was never started.
 			if err := d.ctrl.stopDev(d.id); err != nil {
@@ -478,8 +498,9 @@ func (d *Device) teardown(cause error) {
 			}
 		} else {
 			// The char device was never opened, so nothing pins the
-			// id and DEL_DEV cannot block on it.
-			keep(d.ctrl.delDev(d.id))
+			// id: it may already belong to another device. Send
+			// nothing by id and report the device for manual cleanup.
+			errs = append(errs, fmt.Errorf("ublk: device %d: %w", d.id, errUnpinnedLeft))
 		}
 
 		errs = append(errs, d.ctrl.close())
