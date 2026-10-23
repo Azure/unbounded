@@ -1,0 +1,16 @@
+[package]
+name = "racer-core"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Sans-IO Racer decision logic shared by the dataplane and the simulator"
+
+[lib]
+name = "racer_core"
+
+[dependencies]
+topology = { path = "../topology" }
+racer-object-wire = { path = "../object-wire" }
+racer-control-wire = { path = "../control-wire" }
+flow-control = { path = "../flow" }

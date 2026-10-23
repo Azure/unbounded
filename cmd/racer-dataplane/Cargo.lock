@@ -859,6 +859,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "racer-core"
+version = "0.1.0"
+dependencies = [
+ "flow-control",
+ "racer-control-wire",
+ "racer-object-wire",
+ "topology",
+]
+
+[[package]]
 name = "racer-crypto"
 version = "0.1.0"
 dependencies = [
