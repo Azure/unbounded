@@ -509,31 +509,6 @@ fn live_seats(t: &Term_, s: &SeatSnapshot) -> BTreeMap<usize, LeaseObservation> 
         .collect()
 }
 
-/// Clear expired seat Leases so Pods see the vacancy.
-async fn release_expired(t: &Term_, s: &SeatSnapshot) {
-    let now = Instant::now();
-    for (o, v) in s.holders.values() {
-        if o.spec.holder.is_some() && t.seat_observer.borrow().expired(o, now) {
-            let a: BTreeMap<&str, Option<String>> = [
-                annotations::ENDPOINT,
-                annotations::SERVING_CERTIFICATE,
-                annotations::WEBHOOK_CERTIFICATE,
-                annotations::ISSUER_CERTIFICATE,
-                annotations::READY,
-                annotations::HOLDER_UID,
-                annotations::HOLDER_NODE,
-                annotations::HOLDER_NONCE,
-                annotations::CLUSTER_ID,
-            ]
-            .into_iter()
-            .map(|k| (k, None))
-            .collect();
-            let body = lease::with(v, &election::release(&o.spec), &a);
-            let _ = lease::put(&t.shared.lease_api, &t.shared.config.namespace, &body).await;
-        }
-    }
-}
-
 fn record_of(r: Option<&StateRecord>) -> Record {
     r.map(|r| Record {
         sequence: r.sequence,
@@ -552,7 +527,6 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
         inv.nodes_synced && inv.pods_synced && inv.caches_synced
     };
     let seats = read_seats(t).await;
-    release_expired(t, &seats).await;
     let live = live_seats(t, &seats);
     *shared.seat_holders.borrow_mut() = live
         .iter()
