@@ -88,9 +88,6 @@ impl Drop for Payload {
 pub(crate) type Ownership = Rc<dyn Fn(&PageId) -> bool>;
 pub(crate) type OwnershipPass = Rc<dyn Fn() -> Ownership>;
 
-/// Upper bound of `Scoring::score`: heat 0 to 3 plus 1 for ownership.
-pub(crate) const MAX_SCORE: u8 = 4;
-
 /// One eviction or ordering pass. Ownership and time are pinned when the pass
 /// starts. Over-share classification is computed lazily per candidate cache
 /// and memoized for the rest of the pass, so a pass never walks the published

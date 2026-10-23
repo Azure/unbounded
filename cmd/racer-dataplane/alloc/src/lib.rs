@@ -169,7 +169,7 @@ pub use demand::{
     DEFAULT_WINDOW, PoolDemand, PoolStats,
 };
 pub use segments::{
-    FreezeGuard, Generation, SegmentClock, SegmentEntries, SegmentId, SegmentLease,
+    FreezeGuard, Generation, PhantomEntries, SegmentClock, SegmentEntries, SegmentId, SegmentLease,
     SegmentSnapshot, SegmentState, Segments,
 };
 pub use slab::{DevicePlacement, Slab};

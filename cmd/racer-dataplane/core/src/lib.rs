@@ -7,4 +7,5 @@
 //! spawns threads, or reads OS randomness. `tests/purity.rs` and
 //! `clippy.toml` enforce this.
 
+pub mod cache;
 pub mod time;

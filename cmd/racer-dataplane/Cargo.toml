@@ -35,6 +35,7 @@ racer-control-wire = { path = "control-wire" }
 racer-cluster-control = { path = "cluster-control" }
 flow-control = { path = "flow" }
 topology = { path = "topology" }
+racer-core = { path = "core" }
 telemetry = { path = "telemetry" }
 http1 = { path = "http" }
 racer-crypto = { path = "crypto" }

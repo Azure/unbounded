@@ -911,6 +911,7 @@ dependencies = [
  "prost",
  "racer-cluster-control",
  "racer-control-wire",
+ "racer-core",
  "racer-crypto",
  "racer-gpu",
  "racer-object-wire",
