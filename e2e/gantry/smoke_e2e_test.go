@@ -78,9 +78,10 @@ func TestSmoke_DaemonSetBecomesReadyAndPullThrough(t *testing.T) {
 	// The e2e ConfigMap makes every kind node a chair and keeps eight seeds
 	// per digest, so the first cold pull also seeds workers[1]. Its pull would
 	// then be served from its own store and never touch a peer. Let the seed
-	// pulls on workers[1] finish, then evict its copy; the other seeds still
-	// hold the image, so the second pull can only succeed locally through a
-	// peer fetch.
+	// pulls on workers[1] finish, then evict its copy so the second pull has
+	// to fetch the content again while the other seeds still hold it. Origin
+	// fallback remains possible, so readiness alone proves nothing; the
+	// peer-hit assertion on workers[1]'s own Gantry pod is what proves reuse.
 	requesterPod := h.gantryPodOnNode(ctx, workers[1])
 	h.waitForInFlightPullsDrained(ctx, requesterPod)
 	t.Logf("after first pull: cluster peer hits=%.0f, %s please_pull started=%.0f",
