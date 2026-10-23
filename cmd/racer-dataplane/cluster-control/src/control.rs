@@ -13,6 +13,7 @@ use crate::{
 use serde_json::json;
 use std::{
     cell::RefCell,
+    net::SocketAddr,
     num::NonZeroU32,
     rc::Rc,
     sync::{
@@ -122,44 +123,54 @@ fn run(
     endpoints: DiscoveredEndpoints,
     ready: std::sync::mpsc::SyncSender<Result<Notifier, Error>>,
 ) {
-    let setup = || -> Result<(Executor, Rc<Shared>, Listener, Listener), Error> {
-        let executor = Executor::new(MAX_TASKS).map_err(|_| Error::Io)?;
-        let kube = KubeConfig {
-            server: config.api_server.clone(),
-            ca: config.api_ca.clone(),
-            token: config.api_token.clone(),
+    #[allow(clippy::type_complexity)]
+    let setup =
+        || -> Result<(Executor, Rc<Shared>, Listener, Listener, Option<Listener>), Error> {
+            let executor = Executor::new(MAX_TASKS).map_err(|_| Error::Io)?;
+            let kube = KubeConfig {
+                server: config.api_server.clone(),
+                ca: config.api_ca.clone(),
+                token: config.api_token.clone(),
+            };
+            let lease_api =
+                Rc::new(Kube::new(kube.clone()).map_err(|_| Error::InvalidConfiguration)?);
+            let api = Rc::new(Kube::new(kube).map_err(|_| Error::InvalidConfiguration)?);
+            let control = Listener::bind(config.control_listen).map_err(|_| Error::Io)?;
+            let webhook = Listener::bind(config.webhook_listen).map_err(|_| Error::Io)?;
+            // Port 0 binds an ephemeral port; advertise the real one.
+            let mut config = config;
+            config.control_listen = control.local_addr().map_err(|_| Error::Io)?;
+            config.webhook_listen = webhook.local_addr().map_err(|_| Error::Io)?;
+            // Serve the webhook on the other Pod IP family on the same port, so
+            // either family of the racer-webhook Service can reach it.
+            let webhook_alternate = config
+                .webhook_alternate
+                .map(|ip| Listener::bind(SocketAddr::new(ip, config.webhook_listen.port())))
+                .transpose()
+                .map_err(|_| Error::Io)?;
+            let mut nonce = [0u8; 8];
+            getrandom::getrandom(&mut nonce).map_err(|_| Error::Io)?;
+            let nonce: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+            let shared = Rc::new(Shared {
+                identity: format!("{}/{nonce}", config.pod_name),
+                nonce,
+                config,
+                cluster: RefCell::new(String::new()),
+                lease_api,
+                api,
+                seat: RefCell::new(None),
+                serving: RefCell::new(Serving::default()),
+                changed: Signal::default(),
+                verifier: DynamicClientVerifier::new(),
+                seat_holders: RefCell::new(Default::default()),
+                is_primary: Default::default(),
+                primary: RefCell::new(Default::default()),
+                stopping: Default::default(),
+                last_error: Default::default(),
+            });
+            Ok((executor, shared, control, webhook, webhook_alternate))
         };
-        let lease_api = Rc::new(Kube::new(kube.clone()).map_err(|_| Error::InvalidConfiguration)?);
-        let api = Rc::new(Kube::new(kube).map_err(|_| Error::InvalidConfiguration)?);
-        let control = Listener::bind(config.control_listen).map_err(|_| Error::Io)?;
-        let webhook = Listener::bind(config.webhook_listen).map_err(|_| Error::Io)?;
-        // Port 0 binds an ephemeral port; advertise the real one.
-        let mut config = config;
-        config.control_listen = control.local_addr().map_err(|_| Error::Io)?;
-        config.webhook_listen = webhook.local_addr().map_err(|_| Error::Io)?;
-        let mut nonce = [0u8; 8];
-        getrandom::getrandom(&mut nonce).map_err(|_| Error::Io)?;
-        let nonce: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
-        let shared = Rc::new(Shared {
-            identity: format!("{}/{nonce}", config.pod_name),
-            nonce,
-            config,
-            cluster: RefCell::new(String::new()),
-            lease_api,
-            api,
-            seat: RefCell::new(None),
-            serving: RefCell::new(Serving::default()),
-            changed: Signal::default(),
-            verifier: DynamicClientVerifier::new(),
-            seat_holders: RefCell::new(Default::default()),
-            is_primary: Default::default(),
-            primary: RefCell::new(Default::default()),
-            stopping: Default::default(),
-            last_error: Default::default(),
-        });
-        Ok((executor, shared, control, webhook))
-    };
-    let (mut executor, shared, control, webhook) = match setup() {
+    let (mut executor, shared, control, webhook, webhook_alternate) = match setup() {
         Ok(v) => v,
         Err(e) => {
             let _ = ready.send(Err(e));
@@ -186,6 +197,9 @@ fn run(
             exec::spawn(seat::lottery(shared.clone(), primary_changed.clone()))?;
             exec::spawn(server::Server::new(shared.clone()).run(control))?;
             exec::spawn(server::run_webhook(shared.clone(), webhook))?;
+            if let Some(listener) = webhook_alternate {
+                exec::spawn(server::run_webhook(shared.clone(), listener))?;
+            }
             exec::spawn(reporter(shared.clone(), outer.clone(), report_signal))?;
             Ok(())
         }

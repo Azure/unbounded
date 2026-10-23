@@ -27,6 +27,7 @@ use serde_json::{Value, json};
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
+    net::IpAddr,
     rc::Rc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -808,7 +809,7 @@ async fn update_discovery(
             Some(WebhookSeat {
                 pod: o.spec.holder.clone()?,
                 uid: o.annotations.get(annotations::HOLDER_UID)?.clone(),
-                ip: ip.to_string(),
+                ips: webhook_ips(o.annotations.get(annotations::WEBHOOK_ADDRESSES), ip),
                 ca: STANDARD
                     .decode(o.annotations.get(annotations::WEBHOOK_CERTIFICATE)?)
                     .ok()?,
@@ -827,12 +828,30 @@ async fn update_discovery(
     .await;
 }
 
+/// Webhook IPs a seat published, one per family, falling back to its
+/// endpoint IP when the annotation is absent or malformed.
+pub(crate) fn webhook_ips(published: Option<&String>, endpoint: IpAddr) -> Vec<IpAddr> {
+    let parsed: Option<Vec<IpAddr>> =
+        published.and_then(|v| v.split(',').map(|s| s.parse().ok()).collect());
+    match parsed {
+        Some(ips)
+            if !ips.is_empty()
+                && ips.len() <= 2
+                && !(ips.len() == 2 && ips[0].is_ipv6() == ips[1].is_ipv6()) =>
+        {
+            ips
+        }
+        _ => vec![endpoint],
+    }
+}
+
 /// A ready seat serving the webhook.
 #[derive(Clone, Debug)]
 pub struct WebhookSeat {
     pub pod: String,
     pub uid: String,
-    pub ip: String,
+    /// At most one IP per address family.
+    pub ips: Vec<IpAddr>,
     pub ca: Vec<u8>,
 }
 
@@ -933,15 +952,17 @@ pub async fn reconcile_webhook(
     let slice_path = paths::endpoint_slice(&shared.config.namespace);
     match shared.api.get(&slice_path).await {
         Ok(mut slice) => {
-            // Keep the precreated address family; skip seats of the other family.
+            // The address type is immutable and follows the Service primary
+            // family, the family of its ClusterIP. Publish each seat's IP of
+            // that family; a seat without one cannot be reached and is skipped.
             let v6 = slice["addressType"].as_str() == Some("IPv6");
             let endpoints: Vec<Value> = seats
                 .iter()
-                .filter(|s| s.ip.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_ipv6() == v6))
+                .filter_map(|s| Some((s, s.ips.iter().find(|ip| ip.is_ipv6() == v6)?)))
                 .take(annotations::MAX_SEATS)
-                .map(|s| {
+                .map(|(s, ip)| {
                     json!({
-                        "addresses": [s.ip],
+                        "addresses": [ip.to_string()],
                         "conditions": {"ready": true},
                         "targetRef": {"kind": "Pod", "namespace": shared.config.namespace, "name": s.pod, "uid": s.uid},
                     })
@@ -1002,7 +1023,7 @@ mod tests {
             let seat = |n: u8, ip: &str| WebhookSeat {
                 pod: format!("racer-dataplane-{n}"),
                 uid: format!("u{n}"),
-                ip: ip.into(),
+                ips: vec![ip.parse().unwrap()],
                 ca: keyring::tests::root(1),
             };
             let a = seat(1, "10.0.0.1");
@@ -1091,7 +1112,7 @@ mod tests {
             let seat = WebhookSeat {
                 pod: "racer-dataplane-1".into(),
                 uid: "u1".into(),
-                ip: "10.0.0.1".into(),
+                ips: vec!["10.0.0.1".parse().unwrap()],
                 ca: keyring::tests::root(1),
             };
             let checks = Cell::new(0);
@@ -1118,6 +1139,63 @@ mod tests {
                 "authority must be rechecked after the read, before adding trust",
             );
         });
+    }
+
+    #[test]
+    fn webhook_endpoints_use_the_slice_family_of_dual_stack_seats() {
+        crate::kube::fake::run(|api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            let mwc = paths::webhook_configuration();
+            let slice = paths::endpoint_slice(&shared.config.namespace);
+            api.put_object(&mwc, json!({"metadata":{"name":"racer-object-sidecar-injector"},"webhooks":[{"name":"a.racer","clientConfig":{"service":{"name":"racer-webhook"}}}]}));
+            // IPv6-primary Service; status.podIP of the seats is IPv4.
+            api.put_object(&slice, json!({"metadata":{"name":"racer-webhook"},"addressType":"IPv6","ports":[{"port":9443}],"endpoints":[]}));
+            let seat = |n: u8, published: Option<&str>| WebhookSeat {
+                pod: format!("racer-dataplane-{n}"),
+                uid: format!("u{n}"),
+                ips: webhook_ips(
+                    published.map(str::to_owned).as_ref(),
+                    format!("10.0.0.{n}").parse().unwrap(),
+                ),
+                ca: keyring::tests::root(1),
+            };
+            let seats = [
+                seat(1, Some("10.0.0.1,fd00::1")),
+                // An older seat publishes no webhook addresses.
+                seat(2, None),
+            ];
+            reconcile_webhook(
+                &shared,
+                &seats,
+                &RetiredTrust::default(),
+                Instant::now(),
+                &|| true,
+            )
+            .await
+            .unwrap();
+            let eps = api.object(&slice).unwrap()["endpoints"].clone();
+            assert_eq!(eps.as_array().unwrap().len(), 1);
+            assert_eq!(eps[0]["addresses"], json!(["fd00::1"]));
+            assert_eq!(eps[0]["targetRef"]["name"], "racer-dataplane-1");
+        });
+    }
+
+    #[test]
+    fn webhook_ips_are_one_per_family_with_endpoint_fallback() {
+        let endpoint: IpAddr = "10.0.0.1".parse().unwrap();
+        let ips = |v: Option<&str>| webhook_ips(v.map(str::to_owned).as_ref(), endpoint);
+        let p = |v: &str| v.parse::<IpAddr>().unwrap();
+        assert_eq!(ips(Some("10.0.0.1,fd00::1")), [p("10.0.0.1"), p("fd00::1")]);
+        assert_eq!(ips(Some("fd00::1")), [p("fd00::1")]);
+        for bad in [
+            None,
+            Some(""),
+            Some("x"),
+            Some("10.0.0.1,10.0.0.2"),
+            Some("10.0.0.1,fd00::1,fd00::2"),
+        ] {
+            assert_eq!(ips(bad), [endpoint], "{bad:?}");
+        }
     }
 
     #[test]

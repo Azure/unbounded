@@ -99,8 +99,11 @@ func planControl(ctx context.Context, env *component.Env, plan *component.Plan, 
 
 // planEndpointSlice creates the empty racer-webhook EndpointSlice. A slice
 // holds one address family, and the address type is immutable, so it follows
-// the primary family of the selector-less Service, which is also the family
-// of status.podIP that seats publish. It waits for the Service to exist.
+// the primary family of the selector-less Service: the family of its
+// ClusterIP, which the API server dials for the webhook. That family may
+// differ from status.podIP, for example on dual-stack hostNetwork Pods, so
+// seats serve the webhook on each Pod IP family and the primary publishes the
+// one matching this slice. It waits for the Service to exist.
 func planEndpointSlice(ctx context.Context, env *component.Env, plan *component.Plan) error {
 	current := &discoveryv1.EndpointSlice{}
 

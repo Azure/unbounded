@@ -1500,6 +1500,49 @@ mod tests {
         });
     }
 
+    /// A dual-stack Pod whose `status.podIP` is IPv4 behind an IPv6-primary
+    /// Service: the seat publishes both Pod IPs, the primary picks the IPv6
+    /// one for the IPv6 EndpointSlice, and the API server reaches the
+    /// webhook there over TLS, trusting the published webhook CA and
+    /// verifying the Service DNS name.
+    #[test]
+    fn webhook_serves_the_service_family_when_pod_ip_family_differs() {
+        fake::run(|_, kube| async move {
+            let mut shared = crate::shared::tests::shared(kube);
+            Rc::get_mut(&mut shared).unwrap().config.webhook_alternate =
+                Some("::1".parse().unwrap());
+            let seat = crate::seat::new_seat(&shared, 0).unwrap();
+            let ca = seat.webhook.borrow().ca_der.clone();
+            *shared.seat.borrow_mut() = Some(Rc::new(seat));
+            let published = crate::seat::webhook_addresses(&shared);
+            assert_eq!(published, "127.0.0.2,::1");
+            let ips = crate::primary::webhook_ips(Some(&published), POD_IP.parse().unwrap());
+            let v6 = *ips.iter().find(|ip| ip.is_ipv6()).unwrap();
+            let listener = Listener::bind(std::net::SocketAddr::new(v6, 0)).unwrap();
+            let address = listener.local_addr().unwrap();
+            exec::spawn(run_webhook(shared.clone(), listener)).unwrap();
+            let mut roots = rustls::RootCertStore::empty();
+            roots
+                .add(rustls::pki_types::CertificateDer::from(ca))
+                .unwrap();
+            let tls = Arc::new(
+                rustls::ClientConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+            );
+            let name = ServerName::try_from("racer-webhook.racer-system.svc").unwrap();
+            let tcp = Tcp::connect(address).await.unwrap();
+            let mut conn = Conn::new(TlsStream::client(tcp, tls, name).await.unwrap());
+            conn.tls.write_all(&post_head("/other", 0)).await.unwrap();
+            assert_eq!(response(&mut conn).await.0, 404);
+            shared.stopping.set(true);
+        });
+    }
+
     #[test]
     fn webhook_body_permit_is_held_across_read() {
         fake::run(|_, kube| async move {

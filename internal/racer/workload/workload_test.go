@@ -48,6 +48,7 @@ func TestDaemonSetRuntimeContract(t *testing.T) {
 	for name, path := range map[string]string{
 		"RACER_NAMESPACE": "metadata.namespace", "RACER_POD_NAME": "metadata.name", "RACER_POD_UID": "metadata.uid",
 		"RACER_NODE_NAME": "spec.nodeName", "RACER_POD_IP": "status.podIP",
+		"RACER_POD_IPS": "status.podIPs",
 	} {
 		if e := env[name]; e.ValueFrom == nil || e.ValueFrom.FieldRef == nil || e.ValueFrom.FieldRef.FieldPath != path {
 			t.Fatalf("%s = %+v, want downward %s", name, e, path)
