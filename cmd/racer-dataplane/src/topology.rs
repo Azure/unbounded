@@ -49,13 +49,7 @@ impl Default for LinkHealth {
         Self::new(MAX_DEGREE)
     }
 }
-#[derive(Clone, Copy, Debug)]
-pub enum LinkOutcome {
-    Success,
-    Timeout,
-    Refused,
-    ProtocolFailure,
-}
+pub use racer_core::peer::hop::LinkOutcome;
 impl LinkHealth {
     pub fn acquire(&self, node: &NodeId) -> Result<LinkProbe<'_>> {
         self.inner
@@ -70,13 +64,9 @@ impl LinkHealth {
     ) -> Result<T> {
         let _probe = self.acquire(endpoint)?;
         let result = operation.await;
-        let outcome = match &result {
-            Err(Error::Io | Error::Os(_) | Error::Unavailable) => Some(LinkOutcome::Refused),
-            Err(Error::DeadlineExceeded) => Some(LinkOutcome::Timeout),
-            Err(Error::BadGateway | Error::CorruptRecord) => Some(LinkOutcome::ProtocolFailure),
-            Err(Error::Cancelled | Error::Overloaded) => None,
-            _ => Some(LinkOutcome::Success),
-        };
+        let outcome = racer_core::peer::hop::operation_link_outcome(
+            result.as_ref().map(|_| ()).map_err(Error::fault),
+        );
         if let Some(outcome) = outcome {
             let _ = self.observe(endpoint, outcome);
         }
@@ -510,6 +500,30 @@ impl From<racer_core::route::RouteFault> for Error {
             RouteFault::DeadlineExceeded => Self::DeadlineExceeded,
             RouteFault::HopBudgetExhausted => Self::HopBudgetExhausted,
             RouteFault::Invalid => Self::InvalidRequest,
+        }
+    }
+}
+impl Error {
+    /// The failure class the sans-IO peer decisions (`racer_core::peer`) read.
+    pub fn fault(&self) -> racer_core::peer::Fault {
+        use racer_core::peer::Fault;
+        match self {
+            Self::Overloaded => Fault::Overloaded,
+            Self::Unavailable => Fault::Unavailable,
+            Self::Io => Fault::Io,
+            Self::Os(_) => Fault::Os,
+            Self::DeadlineExceeded => Fault::DeadlineExceeded,
+            Self::BadGateway => Fault::BadGateway,
+            Self::CorruptRecord => Fault::CorruptRecord,
+            Self::Cancelled => Fault::Cancelled,
+            Self::HopBudgetExhausted => Fault::HopBudgetExhausted,
+            Self::IncompatibleMembership => Fault::IncompatibleMembership,
+            Self::NotFound => Fault::NotFound,
+            Self::VersionUnavailable => Fault::VersionUnavailable,
+            Self::Unauthorized => Fault::Unauthorized,
+            Self::OriginForbidden => Fault::OriginForbidden,
+            Self::MissingKey => Fault::MissingKey,
+            _ => Fault::Other,
         }
     }
 }

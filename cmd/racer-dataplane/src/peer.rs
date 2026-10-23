@@ -1015,34 +1015,28 @@ impl Requester {
                 Ok(response) => self.verify_exchange(response, &binding, &scope).await,
                 Err(error) => Err(error),
             };
-            use crate::topology::LinkOutcome;
-            let outcome = match &response {
-                Ok(transport::RelayResponse::Complete(_) | transport::RelayResponse::Landed(_)) => {
-                    Some(LinkOutcome::Success)
-                }
-                Err(_) if permit.is_none() && socket_failure.get() => Some(LinkOutcome::Refused),
-                // Unavailable/deadline/protocol errors can arise locally or at a
-                // downstream node. Do not blame an immediate peer without evidence.
-                _ => None,
+            use racer_core::peer::hop;
+            let exchange = match &response {
+                Ok(transport::RelayResponse::Complete(response)) => hop::Exchange::Complete {
+                    overloaded: matches!(response.response, protocol::PeerResponse::Overloaded),
+                },
+                // A landed page was verified by the transport, like a complete response.
+                Ok(transport::RelayResponse::Landed(_)) => hop::Exchange::Complete { overloaded: false },
+                Ok(_) => hop::Exchange::Streaming,
+                Err(error) => hop::Exchange::Failed {
+                    fault: error.fault(),
+                    socket_failure: socket_failure.get(),
+                },
             };
-            if let Some(outcome) = outcome {
+            // Unavailable/deadline/protocol errors can arise locally or at a
+            // downstream node. Do not blame an immediate peer without evidence.
+            if let Some(outcome) = hop::exchange_link_outcome(exchange, permit.is_some()) {
                 health.observe(&next, outcome)?;
             }
             if let Some(permit) = permit {
-                permit.observe(match &response {
-                    // A downstream overload is not attributable to the immediate
-                    // peer. It also must not increase its admission or recover a probe.
-                    Ok(transport::RelayResponse::Complete(response))
-                        if matches!(response.response, protocol::PeerResponse::Overloaded) =>
-                    {
-                        Outcome::Neutral
-                    }
-                    Ok(
-                        transport::RelayResponse::Complete(_) | transport::RelayResponse::Landed(_),
-                    ) => Outcome::Verified,
-                    Err(Error::Overloaded) => Outcome::LocalPressure,
-                    _ => Outcome::Neutral,
-                });
+                // A downstream overload is not attributable to the immediate
+                // peer. It also must not increase its admission or recover a probe.
+                permit.observe(hop::exchange_admission_outcome(exchange));
             }
             drop(membership);
             response

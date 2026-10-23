@@ -879,6 +879,7 @@ fn response_hop_head(
     peer_wire::forwarding::response_hop_head(original, previous, request, path, index)
         .map_err(Into::into)
 }
+use racer_core::peer::validity;
 fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()> {
     let outcome = field(response, "racer-outcome")?;
     if outcome == "selected" {
@@ -898,17 +899,35 @@ fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()>
         }
         let receivers = protocol::decode_nodes(field(request, "racer-route-visited")?.as_bytes())?;
         if !crate::peer::protocol::demand(request)?.contains(number(response, "racer-page")?)
-            || number(response, "racer-grant-membership")?
-                != number(request, "racer-route-membership")?
-            || receivers.first() != Some(&node_field(response, "racer-grant-receiver")?)
-            || number(response, "racer-grant-deadline")? > number(request, "racer-route-deadline")?
-            || number(response, "racer-grant-deadline")?
-                <= protocol::millis(uring_runtime::environment::wall_now())?
-            || number(response, "racer-page-budget")?.checked_add(1)
-                != Some(number(request, "racer-page-budget")?)
-            || number(response, "racer-byte-budget")?
-                .checked_add(number(response, "racer-ciphertext-length")?)
-                != Some(number(request, "racer-byte-budget")?)
+            || !validity::grant_membership_ok(
+                number(response, "racer-grant-membership")?,
+                number(request, "racer-route-membership")?,
+            )
+            || !validity::grant_receiver_ok(
+                &receivers,
+                &node_field(response, "racer-grant-receiver")?,
+            )
+            || !validity::grant_deadline_ok(
+                number(response, "racer-grant-deadline")?,
+                number(request, "racer-route-deadline")?,
+                // Read the clock only when the route bound holds, as before.
+                if number(response, "racer-grant-deadline")?
+                    > number(request, "racer-route-deadline")?
+                {
+                    u64::MAX
+                } else {
+                    protocol::millis(uring_runtime::environment::wall_now())?
+                },
+            )
+            || !validity::page_budget_ok(
+                number(response, "racer-page-budget")?,
+                number(request, "racer-page-budget")?,
+            )
+            || !validity::byte_budget_ok(
+                number(response, "racer-byte-budget")?,
+                number(response, "racer-ciphertext-length")?,
+                number(request, "racer-byte-budget")?,
+            )
         {
             return Err(Error::Unauthorized);
         }
@@ -916,33 +935,32 @@ fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()>
         // and never exceeds what was asked.
         let granted = protocol::subscription_flights(response)?;
         let requested = protocol::subscription_flights(request)?;
-        if granted.is_some() != requested.is_some() || granted > requested {
+        if !validity::flights_ok(granted, requested) {
             return Err(Error::Unauthorized);
         }
         return Ok(());
     }
     if outcome == "not-found"
-        && (!matches!(
-            field(request, "racer-operation")?.as_str(),
-            "metadata" | "bootstrap"
-        ) || field(request, "racer-mode")? != "acquire"
-            || field(request, "racer-selector")? != "fresh")
+        && !validity::not_found_ok(
+            &field(request, "racer-operation")?,
+            &field(request, "racer-mode")?,
+            &field(request, "racer-selector")?,
+        )
     {
         return Err(Error::Unauthorized);
     }
-    if let Some(action) = match outcome.as_str() {
-        "held" => Some("hold"),
-        "warmed" => Some("fill"),
-        "released" => Some("release"),
-        _ => None,
-    } {
+    let typed = validity::Outcome::from_wire(&outcome);
+    if let Some(action) = typed.warm_action() {
         if field(request, "racer-operation")? != "warm"
             || field(request, "racer-warm-action")? != action
         {
             return Err(Error::Unauthorized);
         }
-        if outcome == "held"
-            && number(response, "racer-warm-until")? > number(request, "racer-warm-until")?
+        if typed == validity::Outcome::Held
+            && !validity::hold_ok(
+                number(response, "racer-warm-until")?,
+                number(request, "racer-warm-until")?,
+            )
         {
             // An owner may shorten a hold to its own TTL cap, never extend the ask.
             // Longer pre-existing holds are reported as the requested expiry.
@@ -950,7 +968,7 @@ fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()>
         }
         return Ok(());
     }
-    if outcome != "page" && outcome != "metadata" && outcome != "bootstrap" {
+    if !typed.echoes_operation() {
         return Ok(());
     }
     if field(request, "racer-operation")? != outcome {
@@ -972,8 +990,9 @@ fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()>
     if outcome == "bootstrap" {
         let length = protocol::number(response, "racer-length")?;
         let present = protocol::number(response, "racer-page-present")?;
-        if present != u64::from(length != 0)
-            || (present == 1 && protocol::number(response, "racer-page")? != 0)
+        if !validity::bootstrap_presence_ok(length, present)
+            || (present == 1
+                && !validity::bootstrap_page_ok(present, protocol::number(response, "racer-page")?))
         {
             return Err(Error::Unauthorized);
         }
@@ -987,17 +1006,12 @@ fn response_authority(
     request: &MessageHead,
     signer: &NodeId,
 ) -> Result<()> {
-    if matches!(
-        field(response, "racer-outcome")?.as_str(),
-        "page"
-            | "metadata"
-            | "bootstrap"
-            | "selected"
-            | "not-found"
-            | "held"
-            | "warmed"
-            | "released"
-    ) && signer != &node_field(request, "racer-route-destination")?
+    let outcome = validity::Outcome::from_wire(&field(response, "racer-outcome")?);
+    if outcome.asserts_success()
+        && !validity::authority_ok(
+            outcome,
+            signer == &node_field(request, "racer-route-destination")?,
+        )
     {
         return Err(Error::Unauthorized);
     }

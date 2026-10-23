@@ -419,11 +419,12 @@ impl PeerServer {
                 .relay
                 .network
                 .membership(request.request().route.membership);
+            let hop = self.decide_hop(&request, membership.is_ok());
             let response = match &membership {
                 Ok(membership)
                     if admitted.is_none()
                         && self.opaque_relay()
-                        && request.request().route.destination != self.relay.network.local =>
+                        && matches!(hop, racer_core::peer::hop::Hop::Relay(_)) =>
                 {
                     let network = &self.relay.network;
                     let previous = request
@@ -523,21 +524,20 @@ impl PeerServer {
                         Ok((super::transport::RelayResponse::Landed(_), _)) => {
                             return Err(Error::Internal);
                         }
-                        Err(Error::Overloaded) => self
-                            .forwarding
-                            .sign_response(&binding, PeerResponse::Overloaded)?,
-                        Err(
-                            Error::Unavailable
-                            | Error::Io
-                            | Error::Os(_)
-                            | Error::HopBudgetExhausted
-                            | Error::IncompatibleMembership,
-                        ) => {
-                            request_scope.check()?;
-                            self.forwarding
-                                .sign_response(&binding, PeerResponse::Unavailable)?
+                        Err(error) => {
+                            use racer_core::peer::hop::{self, RelayFailure};
+                            match hop::relay_failure(error.fault()) {
+                                RelayFailure::Respond(response) => self
+                                    .forwarding
+                                    .sign_response(&binding, peer_response(response))?,
+                                RelayFailure::RespondIfLive(response) => {
+                                    request_scope.check()?;
+                                    self.forwarding
+                                        .sign_response(&binding, peer_response(response))?
+                                }
+                                RelayFailure::Propagate => return Err(error),
+                            }
                         }
-                        Err(error) => return Err(error),
                     }
                 }
                 Ok(membership) => {
@@ -552,11 +552,11 @@ impl PeerServer {
                             &received.connection,
                             &request_scope,
                             &exchange,
-                            self.dispatch_verified(request, membership.clone(), &exchange),
+                            self.dispatch_verified(request, membership.clone(), hop, &exchange),
                         )
                         .await?
                     } else {
-                        self.dispatch_verified(request, membership.clone(), &request_scope)
+                        self.dispatch_verified(request, membership.clone(), hop, &request_scope)
                             .await?
                     }
                 }
@@ -680,25 +680,48 @@ impl PeerServer {
                 .network
                 .membership(request.request().route.membership);
             let membership = match membership {
-                Ok(membership) => membership,
-                Err(Error::IncompatibleMembership) => {
-                    return self
-                        .forwarding
-                        .sign_response(request.binding(), PeerResponse::StaleMembership);
-                }
+                Ok(membership) => Some(membership),
+                Err(Error::IncompatibleMembership) => None,
                 Err(error) => return Err(error),
             };
-            self.dispatch_verified(request, membership, scope).await
+            let hop = self.decide_hop(&request, membership.is_some());
+            let Some(membership) = membership else {
+                return self
+                    .forwarding
+                    .sign_response(request.binding(), PeerResponse::StaleMembership);
+            };
+            self.dispatch_verified(request, membership, hop, scope)
+                .await
         })
+    }
+
+    /// What this node does with a verified request (`racer_core::peer::hop`).
+    fn decide_hop(
+        &self,
+        request: &VerifiedRequest,
+        membership_known: bool,
+    ) -> racer_core::peer::hop::Hop {
+        let route = &request.request().route;
+        racer_core::peer::hop::decide_hop(
+            &self.relay.network.local,
+            racer_core::peer::hop::HopRoute {
+                visited: &route.visited,
+                destination: &route.destination,
+                links: route.remaining_links,
+            },
+            membership_known,
+        )
     }
 
     fn dispatch_verified<'a>(
         &'a self,
         request: VerifiedRequest,
         membership: std::sync::Arc<crate::topology::Membership>,
+        hop: racer_core::peer::hop::Hop,
         scope: &'a RequestScope,
     ) -> Operation<'a, SignedResponse> {
         Box::pin(async move {
+            use racer_core::peer::hop::{self, Hop, RelayFailure};
             let scope = super::request_scope(request.request(), scope)?;
             let network = &self.relay.network;
             let previous = request
@@ -707,7 +730,7 @@ impl PeerServer {
                 .unwrap_or(request.origin())
                 .node();
             network.endpoint(&membership, previous)?;
-            if request.request().route.destination != network.local {
+            if let Hop::Relay(_) = hop {
                 let binding = request.binding().clone();
                 let result = self.relay.forward(request, membership, &scope).await;
                 let result = self.admission.policy().observer().result(
@@ -715,23 +738,20 @@ impl PeerServer {
                     &scope,
                     result,
                 );
-                return match result {
-                    Ok(response) => Ok(response),
-                    Err(Error::Overloaded) => self
+                let error = match result {
+                    Ok(response) => return Ok(response),
+                    Err(error) => error,
+                };
+                return match hop::relay_failure(error.fault()) {
+                    RelayFailure::Respond(response) => self
                         .forwarding
-                        .sign_response(&binding, PeerResponse::Overloaded),
-                    Err(
-                        Error::Unavailable
-                        | Error::Io
-                        | Error::Os(_)
-                        | Error::HopBudgetExhausted
-                        | Error::IncompatibleMembership,
-                    ) => {
+                        .sign_response(&binding, peer_response(response)),
+                    RelayFailure::RespondIfLive(response) => {
                         scope.check()?;
                         self.forwarding
-                            .sign_response(&binding, PeerResponse::Unavailable)
+                            .sign_response(&binding, peer_response(response))
                     }
-                    Err(error) => Err(error),
+                    RelayFailure::Propagate => Err(error),
                 };
             }
             let binding = request.binding().clone();
@@ -741,12 +761,14 @@ impl PeerServer {
                 .map_err(Error::from);
             let _reservation = match reservation {
                 Ok(reservation) => reservation,
-                Err(Error::Overloaded) => {
-                    return self
-                        .forwarding
-                        .sign_response(&binding, PeerResponse::Overloaded);
+                Err(error) => {
+                    return match hop::waiter_failure(error.fault()) {
+                        Some(response) => self
+                            .forwarding
+                            .sign_response(&binding, peer_response(response)),
+                        None => Err(error),
+                    };
                 }
-                Err(error) => return Err(error),
             };
             let result = self.serve_selected(request, membership, &scope).await;
             let result = self.admission.policy().observer().result(
@@ -756,19 +778,10 @@ impl PeerServer {
             );
             let response = match result {
                 Ok(response) => response,
-                Err(Error::NotFound) => PeerResponse::NotFound,
-                Err(Error::VersionUnavailable) => PeerResponse::VersionUnavailable,
-                Err(Error::Overloaded) => PeerResponse::Overloaded,
-                Err(Error::Unauthorized) => PeerResponse::OriginRejected,
-                Err(Error::OriginForbidden) => PeerResponse::OriginForbidden,
-                Err(
-                    Error::Unavailable
-                    | Error::Io
-                    | Error::Os(_)
-                    | Error::MissingKey
-                    | Error::CorruptRecord,
-                ) => PeerResponse::Unavailable,
-                Err(error) => return Err(error),
+                Err(error) => match hop::serve_failure(error.fault()) {
+                    Some(response) => peer_response(response),
+                    None => return Err(error),
+                },
             };
             scope.check()?;
             self.forwarding.sign_response(&binding, response)
@@ -1708,5 +1721,19 @@ mod tests {
                 drop(admitted);
             }
         }
+    }
+}
+
+/// Signed response for a failure class chosen by `racer_core::peer::hop`.
+fn peer_response(response: racer_core::peer::hop::Response) -> PeerResponse {
+    use racer_core::peer::hop::Response;
+    match response {
+        Response::Overloaded => PeerResponse::Overloaded,
+        Response::Unavailable => PeerResponse::Unavailable,
+        Response::NotFound => PeerResponse::NotFound,
+        Response::VersionUnavailable => PeerResponse::VersionUnavailable,
+        Response::OriginRejected => PeerResponse::OriginRejected,
+        Response::OriginForbidden => PeerResponse::OriginForbidden,
+        Response::StaleMembership => PeerResponse::StaleMembership,
     }
 }
