@@ -699,7 +699,7 @@ impl StoreWriter {
         if full {
             let retention = self.retention();
             let scoring = self.scoring(&retention);
-            // An over-share page never displaces an under-share page.
+            // An unheld over-share page never displaces an under-share page.
             let victim = self
                 .queue
                 .borrow()

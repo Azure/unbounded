@@ -114,8 +114,10 @@ lost with it.
 ### Pending write queue
 
 When the queue is full, replacement ranks by `(under_share, score)`. An
-over-share page never displaces an under-share page. Write order uses the same
-ranking.
+unheld over-share page never displaces an under-share page, either through
+replacement or through reclaim of optional writes for an owned page's quota.
+A held incoming page keeps its existing exemption, and queued held writes
+remain protected as victims. Write order uses the same ranking.
 
 ### Memory
 
@@ -224,7 +226,7 @@ that worker. The node sums can hide per-worker differences.
 - Share math: weighted shares, all-zero equal split, single cache, and removal.
 - Accounting: publish, evict, cache removal, and checkpoint rebuild.
 - Each tier: over-share victims are chosen before under-share ones; score and
-  age still order within a class; holds are never evicted; an over-share page
+  age still order within a class; holds are never evicted; an unheld over-share page
   never displaces an under-share page in the queue; memory limits follow
   weights with floor and max; non-owned admission is rejected only when over
   share and free segments are at the reserve.
