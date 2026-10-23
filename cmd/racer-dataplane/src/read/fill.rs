@@ -423,12 +423,12 @@ impl Fill {
             else {
                 return false;
             };
-            let released =
-                self.dependencies
-                    .memory
-                    .reclaim_idle(class, owner.as_ref(), bytes, |page| {
-                        self.dependencies.writer.discard_idle_copy(page)
-                    });
+            let released = self.dependencies.memory.reclaim_idle(
+                class,
+                owner.as_ref(),
+                bytes,
+                |page, ciphertext| self.dependencies.writer.discard_idle_copy(page, ciphertext),
+            );
             if released < bytes && matches!(class, ResourceClass::Ciphertext) {
                 self.dependencies
                     .writer
@@ -466,7 +466,9 @@ impl Fill {
         let admission = &self.dependencies.admission;
         let cache = &page.version.object.cache;
         let amount = PAGE_BYTES as usize;
-        let mut cursor = self.dependencies.memory.plaintext_reclaim();
+        // The memory cache retains no plaintext, so nothing local can be
+        // reclaimed. Retry once after a yield, which lets completed readers
+        // drop their plaintext.
         let mut exhausted = false;
         loop {
             scope.check()?;
@@ -495,15 +497,9 @@ impl Fill {
                 );
                 return result;
             }
-            let (owner, bytes) = deficit.unwrap();
-            exhausted = self.dependencies.memory.reclaim_plaintext_quantum(
-                &mut cursor,
-                owner.as_ref(),
-                bytes,
-                |page| self.dependencies.writer.discard_idle_copy(page),
-            );
-            // Always yield between scan quanta and the next reservation, including
-            // the final retry. Cancellation never extends the original allowance.
+            exhausted = true;
+            // Always yield before the retry. Cancellation never extends the
+            // original allowance.
             uring_runtime::drivers::yield_now().await;
         }
     }
@@ -771,8 +767,10 @@ impl Fill {
             if page.version.object != context.object {
                 return Err(Error::InvalidRequest);
             }
-            // Verified memory is already deliverable. Optional cold ownership
-            // ranking must not introduce a yield/deadline failure before it.
+            // Plaintext another reader still holds is already deliverable.
+            // Optional cold ownership ranking must not introduce a
+            // yield/deadline failure before it. Cached ciphertext without live
+            // plaintext is decrypted by the elected flight below.
             let interest = crate::retention::Interest::default();
             if let Some(result) = self
                 .metrics
@@ -882,11 +880,25 @@ impl Fill {
     ) -> Result<()> {
         use std::future::Future;
 
-        let ready = self.dependencies.flights.ciphertext_for(&leader)?;
-        let ready = ready.or(self.metrics.lookup(
-            LookupTier::Ciphertext,
-            self.dependencies.memory.unverified(page),
-        )?);
+        let ready = match self.dependencies.flights.ciphertext_for(&leader)? {
+            Some(ready) => Some(ready),
+            // Cached pages retain only ciphertext. Decrypting it here keeps
+            // concurrent local readers coalesced on this flight.
+            None => {
+                let cached = self.metrics.lookup(
+                    LookupTier::Ciphertext,
+                    self.dependencies.memory.unverified(page),
+                )?;
+                // Disk-sourced copies already counted their disk hit.
+                if cached
+                    .as_ref()
+                    .is_some_and(|cached| cached.disk_token.is_none())
+                {
+                    self.metrics.record(Event::MemoryHit, 1);
+                }
+                cached
+            }
+        };
         let driver_permit = uring_runtime::drivers::reserve().map_err(Error::from)?;
         let acquisition = waiter.acquisition(&leader)?;
         // The driver stays on this owner. Admit an independent zeroizing context
@@ -1250,10 +1262,22 @@ impl Fill {
         scope.check()?;
         // Pending copies already own ciphertext. Disk owns a separate complete
         // staging/decoded bundle; neither source needs speculative network bytes.
-        let local = self.metrics.lookup(
+        // The memory cache retains only ciphertext, so a page whose plaintext
+        // was released is decrypted from memory before trying disk.
+        let mut cached = None;
+        let local = match self.metrics.lookup(
             LookupTier::Pending,
             self.dependencies.writer.copy_only(page),
-        )?;
+        )? {
+            Some(copy) => Some(copy),
+            None => {
+                cached = self.metrics.lookup(
+                    LookupTier::Ciphertext,
+                    self.dependencies.memory.unverified(page),
+                )?;
+                cached.as_ref().map(|cached| cached.copy.clone())
+            }
+        };
         let (local, token) = match local {
             Some(copy) => (Some(copy), None),
             None => {
@@ -1348,6 +1372,9 @@ impl Fill {
                     }
                     if let Some(token) = &token {
                         self.dependencies.disk.invalidate(token)?;
+                    }
+                    if let Some(cached) = &cached {
+                        self.dependencies.memory.invalidate_ciphertext(cached);
                     }
                 }
                 Err(error) => return Err(error),
@@ -1948,7 +1975,7 @@ impl Fill {
         if deficit != 0 {
             self.dependencies
                 .memory
-                .reclaim_idle(class, None, deficit, |_| 0);
+                .reclaim_idle(class, None, deficit, |_, _| 0);
             // Evicted payloads may have returned backing to the recycler rather
             // than releasing their charges. Drop those idle allocations too.
             admission.reclaim_buffers();
@@ -1988,7 +2015,7 @@ impl Fill {
                     // entry idle. Only unleased cache allocations may disappear.
                     self.dependencies
                         .memory
-                        .reclaim_idle(class, cache.as_ref(), bytes, |_| 0);
+                        .reclaim_idle(class, cache.as_ref(), bytes, |_, _| 0);
                     result = reserve();
                 }
                 result

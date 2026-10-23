@@ -528,6 +528,8 @@ impl Config {
         }
         // Keep one page of acquisition progress beyond a full range window. The
         // ciphertext margin also fits one maximum unpadded storage record.
+        // Plaintext covers only in-flight decrypts and pages held by range
+        // streams; the memory cache retains ciphertext alone.
         let window = limits.range_window_pages.get() as u64;
         let plaintext = (window + 1)
             .checked_mul(PAGE_BYTES)

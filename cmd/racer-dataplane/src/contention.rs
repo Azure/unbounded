@@ -1203,6 +1203,20 @@ mod fidelity {
         assert_eq!(occupancy(real), expected, "production: {label}");
     }
 
+    /// Like [`checkpoint`] where production intentionally differs from the
+    /// abstract bundle model: the memory cache retains ciphertext only and
+    /// holds plaintext weakly, so plaintext never pins cached ciphertext.
+    fn checkpoint_split(
+        label: &str,
+        model: &flow_control::Quotas<AdmissionPolicy>,
+        real: &flow_control::Quotas<AdmissionPolicy>,
+        abstract_expected: [usize; 3],
+        production_expected: [usize; 3],
+    ) {
+        assert_eq!(occupancy(model), abstract_expected, "abstract: {label}");
+        assert_eq!(occupancy(real), production_expected, "production: {label}");
+    }
+
     #[test]
     fn duplicate_owners_match_full_page_occupancy_until_each_last_owner() {
         assert_eq!((PLAIN, CIPHER), (16 * 1024 * 1024, 16 * 1024 * 1024 + 16));
@@ -1216,6 +1230,9 @@ mod fidelity {
         let retained = MetadataOwners::reserve(&model, &cache);
         let page = allocated_page(&real, &cache, "v1", PLAIN);
         let id = page.plaintext.page().clone();
+        // The request that decrypted the page still holds its plaintext; the
+        // cache itself retains only the ciphertext and a weak plaintext handle.
+        let delivered = page.plaintext.clone();
         memory.publish(page).unwrap();
         assert!(retained.bundle.idle(), "published bundle has no readers");
         checkpoint("publish", &model, &real, [PLAIN, CIPHER, 0]);
@@ -1249,9 +1266,21 @@ mod fidelity {
         checkpoint("readers released", &model, &real, [PLAIN, CIPHER, 0]);
         let plain_owner = retained.bundle.plain.clone();
         let plain = memory.get(&id).unwrap().unwrap().plaintext;
+        assert!(
+            Arc::ptr_eq(&plain.inner, &delivered.inner),
+            "live plaintext is shared"
+        );
         assert!(!retained.bundle.idle());
-        assert_eq!(memory.evict_idle(usize::MAX), Ok(0));
-        checkpoint("plaintext-only reader", &model, &real, [PLAIN, CIPHER, 0]);
+        // A plaintext reader does not pin the cached ciphertext in production.
+        assert_eq!(memory.evict_idle(usize::MAX), Ok(CIPHER));
+        checkpoint_split(
+            "plaintext-only reader",
+            &model,
+            &real,
+            [PLAIN, CIPHER, 0],
+            [PLAIN, 0, 0],
+        );
+        drop(delivered);
 
         // Lookup removal is not a completion fence, memory/cache.rs:148-180.
         let last_plain = plain_owner.clone();
@@ -1325,11 +1354,16 @@ mod fidelity {
                 ids.push(page.plaintext.page().clone());
                 memory.publish(page).unwrap();
             }
-            checkpoint(
+            // Production retains only ciphertext; its plaintext column stays
+            // zero once publishers drop their plaintext.
+            let cipher = matches!(class, ResourceClass::Ciphertext);
+            let production = |expected: [usize; 3]| [0, expected[1], expected[2]];
+            checkpoint_split(
                 "three retained final pages",
                 &model.workers[0].admission,
                 &real,
                 [3 * PLAIN, 3 * CIPHER, 0],
+                production([3 * PLAIN, 3 * CIPHER, 0]),
             );
             let amount = if matches!(class, ResourceClass::Plaintext) {
                 PLAIN
@@ -1338,10 +1372,12 @@ mod fidelity {
             };
             assert_eq!(model.report.evictions, 0);
             assert!(model.workers[0].cache.values().all(Bundle::idle));
-            for (admission, a) in [
+            let admissions = [
                 (&model.workers[0].admission, &CacheId("0".into())),
                 (real.as_ref(), &a),
-            ] {
+            ];
+            // Production plaintext is not cache-held, so it has no deficit.
+            for (admission, a) in &admissions[..if cipher { 2 } else { 1 }] {
                 assert!(matches!(
                     admission.reserve(Some(a), class, amount),
                     Err(flow_control::Error::Overloaded)
@@ -1349,14 +1385,15 @@ mod fidelity {
                 // Local deficit takes precedence over global spare room,
                 // runtime/admission.rs:149-156. Evicting B cannot remedy A's share.
                 let (owner, deficit) = admission.reclamation(a, class, amount).unwrap();
-                assert_eq!(owner, Some(a.clone()));
+                assert_eq!(owner, Some((*a).clone()));
                 assert!(deficit > 0 && deficit <= amount);
             }
-            checkpoint(
+            checkpoint_split(
                 "failed reservation is unchanged",
                 &model.workers[0].admission,
                 &real,
                 [3 * PLAIN, 3 * CIPHER, 0],
+                production([3 * PLAIN, 3 * CIPHER, 0]),
             );
             // Either kind of external owner must prevent reserve_page from evicting
             // A's pages, even though B is idle and global capacity remains available.
@@ -1371,16 +1408,11 @@ mod fidelity {
                     }
                 })
                 .collect();
+            // Production readers of cached pages hold ciphertext; plaintext
+            // they decrypt is their own and never pins the cache entry.
             let reads: Vec<_> = ids[1..]
                 .iter()
-                .map(|id| {
-                    let page = memory.get(id).unwrap().unwrap();
-                    if matches!(class, ResourceClass::Plaintext) {
-                        (Some(page.plaintext), None)
-                    } else {
-                        (None, Some(page.ciphertext))
-                    }
-                })
+                .map(|id| memory.ciphertext(id).unwrap().unwrap())
                 .collect();
             assert!(model.workers[0].cache[&keys[0]].idle());
             assert!(
@@ -1389,7 +1421,7 @@ mod fidelity {
                     .all(|key| !model.workers[0].cache[key].idle())
             );
             assert!(model.reserve_page(0, 0, class, amount).is_none());
-            assert_eq!(memory.reclaim_idle(class, Some(&a), amount, |_| 0), 0);
+            assert_eq!(memory.reclaim_idle(class, Some(&a), amount, |_, _| 0), 0);
             assert_eq!(model.report.evictions, 0);
             assert_eq!(
                 model.workers[0].lru.iter().copied().collect::<Vec<_>>(),
@@ -1397,11 +1429,12 @@ mod fidelity {
             );
             assert_eq!(model.workers[0].cache.len(), 3);
             assert_eq!(model.directory.len(), 3);
-            checkpoint(
+            checkpoint_split(
                 "busy requesting-cache pages survive",
                 &model.workers[0].admission,
                 &real,
                 [3 * PLAIN, 3 * CIPHER, 0],
+                production([3 * PLAIN, 3 * CIPHER, 0]),
             );
             drop((pins, reads));
             assert!(model.workers[0].cache.values().all(Bundle::idle));
@@ -1409,11 +1442,22 @@ mod fidelity {
             let model_next = model
                 .reserve_page(0, 0, class, amount)
                 .expect("reclaim and retry must admit one page");
-            assert_eq!(memory.reclaim_idle(class, Some(&a), amount, |_| 0), amount);
-            assert_eq!(occupancy(&real), [2 * PLAIN, 2 * CIPHER, 0]);
-            assert!(memory.get(&ids[1]).unwrap().is_none());
-            assert!(memory.get(&ids[0]).unwrap().is_some());
-            assert!(memory.get(&ids[2]).unwrap().is_some());
+            let real_retained = if cipher {
+                assert_eq!(
+                    memory.reclaim_idle(class, Some(&a), amount, |_, _| 0),
+                    amount
+                );
+                assert!(memory.ciphertext(&ids[1]).unwrap().is_none());
+                2
+            } else {
+                // Plaintext pressure cannot be relieved by the cache.
+                assert_eq!(memory.reclaim_idle(class, Some(&a), amount, |_, _| 0), 0);
+                assert!(memory.ciphertext(&ids[1]).unwrap().is_some());
+                3
+            };
+            assert_eq!(occupancy(&real), [0, real_retained * CIPHER, 0]);
+            assert!(memory.ciphertext(&ids[0]).unwrap().is_some());
+            assert!(memory.ciphertext(&ids[2]).unwrap().is_some());
             assert_eq!(model.report.evictions, 1);
             assert!(!model.workers[0].cache.contains_key(&keys[1]));
             assert_eq!(model.workers[0].cache.len(), 2);
@@ -1436,19 +1480,26 @@ mod fidelity {
             } else {
                 [2 * PLAIN, 3 * CIPHER, 0]
             };
-            checkpoint(
+            let production_next = if cipher {
+                [0, 3 * CIPHER, 0]
+            } else {
+                [PLAIN, 3 * CIPHER, 0]
+            };
+            checkpoint_split(
                 "retry admitted",
                 &model.workers[0].admission,
                 &real,
                 expected,
+                production_next,
             );
             drop((model_next, real_next));
             assert!(model.workers[0].cache.values().all(Bundle::idle));
-            checkpoint(
+            checkpoint_split(
                 "only oldest requesting-cache bundle reclaimed",
                 &model.workers[0].admission,
                 &real,
                 [2 * PLAIN, 2 * CIPHER, 0],
+                [0, real_retained * CIPHER, 0],
             );
             for key in [keys[0], keys[2]] {
                 model.evict(0, key);
@@ -1457,7 +1508,7 @@ mod fidelity {
             assert!(model.workers[0].lru.is_empty());
             assert!(model.directory.is_empty());
             assert_eq!(model.report.evictions, 3);
-            assert_eq!(memory.evict_idle(usize::MAX), Ok(2 * (PLAIN + CIPHER)));
+            assert_eq!(memory.evict_idle(usize::MAX), Ok(real_retained * CIPHER));
             checkpoint("drained", &model.workers[0].admission, &real, [0, 0, 0]);
         }
     }
@@ -1530,6 +1581,9 @@ mod fidelity {
             .unwrap();
         let old = allocated_page(&real, &cache, "old", 3);
         let old_id = old.plaintext.page().clone();
+        // The cache retains only ciphertext; an earlier reader still holds the
+        // old page's plaintext, mirroring the model's retained bundle.
+        let old_plaintext = old.plaintext.clone();
         memory.publish(old).unwrap();
         assert!(old_model.bundle.idle());
         let mut next_model = MetadataOwners::reserve(&model, &cache);
@@ -1683,8 +1737,15 @@ mod fidelity {
         assert!(next_model.bundle.idle());
         drop(fill);
         assert_eq!(uring_runtime::drivers::pending(), 0);
-        drop((old_model, next_model, model_dirty, real_dirty));
-        assert_eq!(memory.evict_idle(usize::MAX), Ok(44));
+        drop((
+            old_model,
+            next_model,
+            model_dirty,
+            real_dirty,
+            old_plaintext,
+        ));
+        // Only the two retained ciphertexts are cache bytes.
+        assert_eq!(memory.evict_idle(usize::MAX), Ok(38));
         checkpoint("dirty and page owners drained", &model, &real, [0, 0, 0]);
         assert!(CLASSES.iter().all(|class| real.used(*class) == 0));
     }

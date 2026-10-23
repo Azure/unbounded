@@ -180,7 +180,10 @@ fn owned_writeback_staging_reclaims_only_idle_memory_after_hard_quota_rejection(
         let reclaimed = owned && !live && ciphertext;
         // Optional writes already scan idle memory against their lower ceiling,
         // but cannot gain enough headroom from this one tiny entry.
-        assert_eq!(deps.memory.get(&id).unwrap().is_none(), !live && ciphertext);
+        assert_eq!(
+            deps.memory.ciphertext(&id).unwrap().is_none(),
+            !live && ciphertext
+        );
         assert_eq!(deps.writer.pending_count(), usize::from(reclaimed));
         assert_eq!(deps.writer.discarded_count(), 0);
         assert_eq!(incoming.plaintext.bytes(), &[1; 3]);
@@ -287,7 +290,7 @@ fn optional_persistence_recycler_pressure_does_not_evict_memory_unnecessarily() 
     f.fill.observe_verified(&incoming, &f.scope);
     assert_eq!(deps.writer.pending_count(), 1);
     assert_eq!(admission.retained_buffer_bytes(), 0);
-    assert!(deps.memory.get(&id).unwrap().is_some());
+    assert!(deps.memory.ciphertext(&id).unwrap().is_some());
     assert!(admission.used(ResourceClass::Ciphertext) <= ceiling);
     assert_eq!(deps.writer.discarded_count(), 0);
     drop(held);
@@ -342,7 +345,7 @@ fn optional_persistence_idle_memory_reclaim_is_bounded_and_stops_at_deficit() {
     );
     assert_eq!(
         ids.iter()
-            .filter(|id| deps.memory.get(id).unwrap().is_some())
+            .filter(|id| deps.memory.ciphertext(id).unwrap().is_some())
             .count(),
         44
     );
@@ -352,7 +355,7 @@ fn optional_persistence_idle_memory_reclaim_is_bounded_and_stops_at_deficit() {
     assert_eq!(deps.writer.retention().snapshot().persistence_accepted, 1);
     assert_eq!(
         ids.iter()
-            .filter(|id| deps.memory.get(id).unwrap().is_some())
+            .filter(|id| deps.memory.ciphertext(id).unwrap().is_some())
             .count(),
         43
     );
@@ -403,8 +406,13 @@ fn optional_persistence_idle_reclaim_preserves_active_and_queued_owners() {
     assert_eq!(deps.writer.queued_count(), 1);
     assert_eq!(deps.writer.discarded_count(), 0);
     assert!(deps.writer.copy_only(&queued_id).unwrap().is_some());
-    assert!(deps.memory.get(&queued_id).unwrap().is_some());
-    assert!(deps.memory.get(active.plaintext.page()).unwrap().is_some());
+    assert!(deps.memory.ciphertext(&queued_id).unwrap().is_some());
+    assert!(
+        deps.memory
+            .ciphertext(active.plaintext.page())
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(active.plaintext.bytes(), &[1; 3]);
     assert_eq!(incoming.plaintext.bytes(), &[1; 3]);
     assert_eq!(
@@ -1368,30 +1376,20 @@ fn idle_tiny_prefix_must_not_hide_reclaimable_full_page() {
     let pressure = admission
         .reserve(None, ResourceClass::Plaintext, 828_901_886)
         .unwrap();
-    assert_eq!(admission.used(ResourceClass::Plaintext), 846_203_390);
+    // Cached pages retain only ciphertext, so neither the tiny prefix nor the
+    // large page charges plaintext and nothing must be reclaimed to admit.
+    // Released backing may sit in the recycler until reclaimed.
+    admission.reclaim_buffers();
+    assert_eq!(admission.used(ResourceClass::Plaintext), 828_901_886);
     let mut reserve = Box::pin(f.fill.reserve_network_plaintext(&f.scope, &f.page));
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-    assert!(reserve.as_mut().poll(&mut cx).is_pending());
-    assert!(reserve.as_mut().poll(&mut cx).is_pending());
-    {
-        // Match the captured final failure exactly, then prove the capacity was
-        // available in an idle entry beyond the two visited batches.
-        assert_eq!(admission.used(ResourceClass::Plaintext), 845_679_102);
-        assert_eq!(
-            admission.limit(ResourceClass::Plaintext) - admission.used(ResourceClass::Plaintext),
-            13_314_357
-        );
-        for id in &tiny {
-            assert!(cache.get(id).unwrap().is_none());
-        }
-        assert_eq!(pressure.amount(), 828_901_886);
-    }
-    assert!(reserve.as_mut().poll(&mut cx).is_pending());
     let Poll::Ready(Ok(result)) = reserve.as_mut().poll(&mut cx) else {
-        panic!("one catalog cycle must reclaim the idle large page");
+        panic!("released plaintext must admit without a reclaim cycle");
     };
     assert_eq!(result.amount(), PAGE_BYTES as usize);
-    assert!(cache.get(large.as_ref().unwrap()).unwrap().is_none());
+    for id in tiny.iter().chain(large.as_ref()) {
+        assert!(cache.ciphertext(id).unwrap().is_some());
+    }
     assert_eq!(pressure.amount(), 828_901_886);
     assert_eq!(f.origin.calls.get(), 0);
 }
@@ -1447,8 +1445,8 @@ fn cooperative_reclaim_bounds_busy_cycle_and_preserves_cancellation() {
                 Poll::Ready(Err(error)) if error == expected
             ));
         } else {
-            assert!(reserve.as_mut().poll(&mut cx).is_pending());
-            assert!(reserve.as_mut().poll(&mut cx).is_pending());
+            // Live readers hold all plaintext and the cache holds none, so
+            // the single post-yield retry fails without scanning.
             assert!(matches!(
                 reserve.as_mut().poll(&mut cx),
                 Poll::Ready(Err(Error::Overloaded))
@@ -1502,37 +1500,31 @@ fn cooperative_reclaim_fair_share_keeps_other_cache_and_live_ciphertext() {
         .unwrap();
     let result = futures::executor::block_on(f.fill.reserve_network_plaintext(&f.scope, &f.page));
     assert!(matches!(result, Err(Error::Overloaded)));
-    assert!(cache.get(&foreign_id).unwrap().is_some());
-    assert!(cache.get(&f.page).unwrap().is_some());
+    assert!(cache.ciphertext(&foreign_id).unwrap().is_some());
+    assert!(cache.ciphertext(&f.page).unwrap().is_some());
     assert_eq!(ciphertext.bytes(), &[2; 19]);
 }
 
+/// The memory cache retains no plaintext, so plaintext reclamation is a
+/// no-op that never evicts cached ciphertext or invokes the queued-copy callback.
 #[test]
-fn cooperative_reclaim_clock_cut_ignores_new_touches_and_other_cursors() {
+fn cooperative_plaintext_reclaim_keeps_cached_ciphertext() {
     let f = fixture();
     let admission = &f.fill.dependencies.admission;
     let cache = &f.fill.dependencies.memory;
     let first = crate::memory::tests::bundle_for(admission, f.origin.metadata.immutable());
     let id = first.plaintext.page().clone();
     cache.publish(first).unwrap();
-    let mut scan = cache.plaintext_reclaim();
-    // A fresh lookup moves this entry beyond the captured upper tick.
-    drop(cache.get(&id).unwrap());
-    let mut descriptor = f.origin.metadata.immutable();
-    descriptor.version.etag = StrongEtag::test_value("new");
-    cache
-        .publish(crate::memory::tests::bundle_for(admission, descriptor))
-        .unwrap();
-    assert!(cache.reclaim_plaintext_quantum(&mut scan, None, 1, |_| 0));
-    assert!(cache.get(&id).unwrap().is_some());
-    let mut scan = cache.plaintext_reclaim();
-    assert_eq!(
-        cache.reclaim_idle(ResourceClass::Plaintext, None, 1, |_| 0),
-        3
-    );
-    assert!(cache.reclaim_plaintext_quantum(&mut scan, None, usize::MAX, |_| 0));
     admission.reclaim_buffers();
     assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+    assert_eq!(
+        cache.reclaim_idle(ResourceClass::Plaintext, None, usize::MAX, |_, _| {
+            panic!("plaintext reclaim must not release queued copies")
+        }),
+        0
+    );
+    assert!(cache.get(&id).unwrap().is_none());
+    assert!(cache.ciphertext(&id).unwrap().is_some());
 }
 
 #[test]
@@ -1882,14 +1874,15 @@ mod metadata {
             panic!("page")
         };
         assert_eq!(first.envelope().page.version, first_metadata.version);
-        let first_bytes = f
-            .fill
-            .dependencies
-            .memory
-            .get(&first.envelope().page)
-            .unwrap()
-            .unwrap();
+        // The cache keeps only ciphertext; a local read decrypts it again.
+        let first_bytes = drive(
+            f.fill.warm_local(&first.envelope().page, &f.scope),
+            &mut f.engine,
+            &f.crypto,
+        )
+        .unwrap();
         assert_eq!(first_bytes.plaintext.bytes(), &[1; 3]);
+        assert_eq!(first_bytes.ciphertext.bytes(), first.bytes());
         assert_eq!(adapter.count(RequestKind::InitialGet), 2);
         let mut metadata = f.origin.metadata.clone();
         metadata.version.etag = StrongEtag::test_value("v2");
@@ -1916,13 +1909,12 @@ mod metadata {
             panic!("page")
         };
         assert_eq!(second.envelope().page.version, second_metadata.version);
-        let second_bytes = f
-            .fill
-            .dependencies
-            .memory
-            .get(&second.envelope().page)
-            .unwrap()
-            .unwrap();
+        let second_bytes = drive(
+            f.fill.warm_local(&second.envelope().page, &f.scope),
+            &mut f.engine,
+            &f.crypto,
+        )
+        .unwrap();
         assert_eq!(second_bytes.plaintext.bytes(), &[2; 3]);
         assert_eq!(second_metadata.version.etag, StrongEtag::test_value("v2"));
         assert_eq!(first_bytes.plaintext.bytes(), &[1; 3]);
@@ -2027,7 +2019,14 @@ mod metadata {
                 index.publish_version(cached.metadata.immutable()).unwrap();
                 assert_eq!(index.evict_metadata(1).unwrap(), 1);
                 assert!(index.version(&f.page.version).unwrap().is_none());
-                assert!(f.fill.dependencies.memory.get(&f.page).unwrap().is_some());
+                assert!(
+                    f.fill
+                        .dependencies
+                        .memory
+                        .ciphertext(&f.page)
+                        .unwrap()
+                        .is_some()
+                );
                 let mut fresh = cached.metadata.clone();
                 fresh.content_type = fresh_type.map(|v| ContentType::parse(v.as_bytes()).unwrap());
                 fresh.expires_at = ExpiresAt::from_unix_millis(1_900_000_000_000).unwrap();
@@ -2428,10 +2427,19 @@ mod pressure {
                 pages as usize,
                 "byte capacity must not permanently block idle-cache misses"
             );
-            assert!(
-                f.fill.dependencies.memory.get(&f.page).unwrap().is_some(),
-                "independent reader protected its cached page"
-            );
+            // Only a held ciphertext owner protects the cached page; pinned
+            // plaintext alone is the reader's own and does not.
+            if hold_bundle {
+                assert!(
+                    f.fill
+                        .dependencies
+                        .memory
+                        .ciphertext(&f.page)
+                        .unwrap()
+                        .is_some(),
+                    "independent reader protected its cached page"
+                );
+            }
             drop((pinned, bundle));
             f.fill.dependencies.writer.discard_unsubmitted();
             f.fill.dependencies.memory.evict_idle(usize::MAX).unwrap();
@@ -2490,14 +2498,11 @@ mod pressure {
         );
         assert_eq!(adapter.count(RequestKind::InitialGet), 1);
         assert_eq!(adapter.count(RequestKind::Head), 0);
-        assert_eq!(dependencies.writer.discarded_count(), 1);
-        assert_eq!(dependencies.writer.pending_count(), 0);
-        assert!(dependencies.memory.get(&f.page).unwrap().is_none());
-        assert_eq!(dependencies.admission.used(ResourceClass::Ciphertext), 0);
-        assert_eq!(
-            dependencies.admission.used(ResourceClass::DirtyCiphertext),
-            0
-        );
+        // The cached page holds no plaintext, so the one-page plaintext budget
+        // admits the bootstrap without discarding queued work or evicting.
+        assert_eq!(dependencies.writer.discarded_count(), 0);
+        assert_eq!(dependencies.writer.pending_count(), 1);
+        assert!(dependencies.memory.ciphertext(&f.page).unwrap().is_some());
         // The empty reply releases the bootstrap plaintext reservation after I/O.
         assert_eq!(dependencies.admission.used(ResourceClass::Plaintext), 0);
     }
@@ -2596,7 +2601,7 @@ mod pressure {
                 let mut readers = Vec::new();
                 for n in 0..busy_count {
                     let id = retained_page(&f, cache, &format!("busy-{n}"), class, amount, false);
-                    readers.push(deps.memory.get(&id).unwrap().unwrap());
+                    readers.push(deps.memory.ciphertext(&id).unwrap().unwrap());
                 }
                 let tail =
                     idle_tail.then(|| retained_page(&f, cache, "idle-tail", class, amount, false));
@@ -2612,19 +2617,27 @@ mod pressure {
                         .reserve(Some(cache), class, amount)
                         .map_err(Into::into)
                 });
-                if busy_count == 256 && idle_tail {
+                // The cache holds no plaintext, so plaintext pressure can never
+                // be relieved by evicting cached pages.
+                let cipher = matches!(class, ResourceClass::Ciphertext);
+                if busy_count == 256 && idle_tail && cipher {
                     assert!(
                         result.is_ok(),
                         "idle tail beyond first scan must admit: {class:?}, {:?}",
                         result.as_ref().err()
                     );
-                    assert!(deps.memory.get(tail.as_ref().unwrap()).unwrap().is_none());
+                    assert!(
+                        deps.memory
+                            .ciphertext(tail.as_ref().unwrap())
+                            .unwrap()
+                            .is_none()
+                    );
                 } else {
                     assert!(matches!(result, Err(Error::Overloaded)));
                     if let Some(tail) = &tail {
                         assert!(
-                            deps.memory.get(tail).unwrap().is_some(),
-                            "must not scan beyond existing two-pass bound"
+                            deps.memory.ciphertext(tail).unwrap().is_some(),
+                            "must not scan beyond existing two-pass bound or evict for plaintext"
                         );
                     }
                 }
@@ -2634,9 +2647,13 @@ mod pressure {
                     "initial admission plus two bounded scans"
                 );
                 for reader in &readers {
-                    assert_eq!(reader.plaintext.bytes(), &[1; 3]);
                     assert_eq!(reader.ciphertext.bytes(), &[2; 19]);
-                    assert!(deps.memory.get(reader.plaintext.page()).unwrap().is_some());
+                    assert!(
+                        deps.memory
+                            .ciphertext(&reader.ciphertext.envelope().page)
+                            .unwrap()
+                            .is_some()
+                    );
                 }
                 assert_eq!(deps.writer.discarded_count(), 0);
             }
@@ -2670,14 +2687,16 @@ mod pressure {
                 .reserve_with_reclamation(cache, class, amount)
                 .unwrap();
             let deps = &f.fill.dependencies;
-            assert!(deps.memory.get(&first).unwrap().is_none());
+            // Cached pages hold no plaintext: plaintext admission never evicts
+            // them or discards their queued writes.
+            assert_eq!(deps.memory.ciphertext(&first).unwrap().is_none(), !queued);
             for page in [&other, &second, &third] {
-                assert!(deps.memory.get(page).unwrap().is_some());
+                assert!(deps.memory.ciphertext(page).unwrap().is_some());
                 if queued {
                     assert!(deps.writer.copy_only(page).unwrap().is_some());
                 }
             }
-            assert_eq!(deps.writer.discarded_count(), u64::from(queued));
+            assert_eq!(deps.writer.discarded_count(), 0);
             drop(reservation);
         }
     }
@@ -2701,16 +2720,26 @@ mod pressure {
             .fill
             .reserve_with_reclamation(cache, ResourceClass::Plaintext, 6)
             .unwrap();
-        assert!(f.fill.dependencies.memory.get(&first).unwrap().is_none());
-        assert!(f.fill.dependencies.memory.get(&second).unwrap().is_none());
-        assert!(f.fill.dependencies.memory.get(&third).unwrap().is_some());
-        // A full-page deficit cannot be remedied by the remaining short idle page.
+        // Cached pages charge no plaintext, so the small reservation fits
+        // without evicting any of them.
+        assert_eq!(
+            admission.used(ResourceClass::Plaintext),
+            admission.limit(ResourceClass::Plaintext) - 3
+        );
+        // A full-page deficit cannot be remedied by evicting cached pages.
         assert!(matches!(
             f.fill.reserve_bootstrap(cache),
             Err(Error::Overloaded)
         ));
         for page in [&first, &second, &third] {
-            assert!(f.fill.dependencies.memory.get(page).unwrap().is_none());
+            assert!(
+                f.fill
+                    .dependencies
+                    .memory
+                    .ciphertext(page)
+                    .unwrap()
+                    .is_some()
+            );
         }
     }
 
@@ -2746,7 +2775,7 @@ mod pressure {
         assert_eq!(result.plaintext.bytes(), b"abc");
         assert_eq!(f.origin.calls.get(), 1);
         assert!(deps.writer.copy_only(&f.page).unwrap().is_none());
-        assert!(deps.memory.get(&page).unwrap().is_some());
+        assert!(deps.memory.ciphertext(&page).unwrap().is_some());
         assert!(deps.writer.copy_only(&page).unwrap().is_some());
         assert_eq!(deps.writer.discarded_count(), 0);
     }
@@ -2758,7 +2787,7 @@ mod pressure {
         let first = retained_page(&f, cache, "first", ResourceClass::Plaintext, 3, true);
         let second = retained_page(&f, cache, "second", ResourceClass::Plaintext, 3, true);
         let deps = &f.fill.dependencies;
-        let plaintext = deps.memory.get(&first).unwrap().unwrap().plaintext;
+        let plaintext = deps.memory.ciphertext(&first).unwrap().unwrap();
         let ciphertext = deps.memory.ciphertext(&second).unwrap().unwrap();
         let _pressure = deps
             .admission
@@ -2774,7 +2803,7 @@ mod pressure {
         ));
         assert_eq!(deps.writer.discarded_count(), 0);
         assert_eq!(deps.writer.pending_count(), 2);
-        assert_eq!(plaintext.bytes(), &[1; 3]);
+        assert_eq!(plaintext.ciphertext.bytes(), &[2; 19]);
         assert_eq!(ciphertext.ciphertext.bytes(), &[2; 19]);
         drop((plaintext, ciphertext));
         assert!(matches!(
@@ -2782,8 +2811,8 @@ mod pressure {
                 .reserve_with_reclamation(cache, ResourceClass::Plaintext, usize::MAX),
             Err(Error::Overloaded)
         ));
-        assert!(deps.memory.get(&first).unwrap().is_some());
-        assert!(deps.memory.get(&second).unwrap().is_some());
+        assert!(deps.memory.ciphertext(&first).unwrap().is_some());
+        assert!(deps.memory.ciphertext(&second).unwrap().is_some());
         assert_eq!(deps.writer.discarded_count(), 0);
     }
 
@@ -2810,8 +2839,8 @@ mod pressure {
         assert_eq!(deps.writer.discarded_count(), 1);
         assert!(deps.writer.copy_only(&first).unwrap().is_none());
         assert!(deps.writer.copy_only(&second).unwrap().is_some());
-        assert!(deps.memory.get(&first).unwrap().is_some());
-        assert!(deps.memory.get(&second).unwrap().is_some());
+        assert!(deps.memory.ciphertext(&first).unwrap().is_some());
+        assert!(deps.memory.ciphertext(&second).unwrap().is_some());
     }
 }
 pub(super) use crate::admission::ResourceClass;
@@ -3607,7 +3636,7 @@ fn selected_owner_reclaims_foreign_receive_charges_across_full_pages() {
                 .fill
                 .dependencies
                 .memory
-                .get(&page)
+                .ciphertext(&page)
                 .unwrap()
                 .is_some()
         );
@@ -3874,7 +3903,14 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
             .lease(Some(&f.context.object.cache), old_key, KeyPurpose::Page)
             .is_err()
     );
-    assert!(f.fill.dependencies.memory.get(&f.page).unwrap().is_none());
+    assert!(
+        f.fill
+            .dependencies
+            .memory
+            .ciphertext(&f.page)
+            .unwrap()
+            .is_none()
+    );
     assert!(
         f.fill
             .dependencies
@@ -4159,14 +4195,21 @@ fn ciphertext_origin_fill_retains_verified_publication_without_a_plaintext_waite
         &retained.ciphertext.inner,
         &copy.ciphertext.inner
     ));
-    assert!(
-        f.fill
-            .dependencies
-            .memory
-            .unverified(&f.page)
-            .unwrap()
-            .is_none()
-    );
+    // The verified entry is the one cached ciphertext; a later local reader
+    // decrypts it from memory once no owner holds the plaintext.
+    let cached = f
+        .fill
+        .dependencies
+        .memory
+        .unverified(&f.page)
+        .unwrap()
+        .unwrap();
+    assert!(cached.disk_token.is_none());
+    assert!(Arc::ptr_eq(
+        &cached.copy.ciphertext.inner,
+        &copy.ciphertext.inner
+    ));
+    drop(cached);
     assert!(f.fill.local_copies.is_empty());
     assert!(matches!(
         flights.join_copy(&f.page, &f.scope).unwrap(),

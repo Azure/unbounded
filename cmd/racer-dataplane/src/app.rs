@@ -1367,9 +1367,10 @@ impl WorkerApplication {
                 let Some((owner, bytes)) = admission.reclamation(cache, class, amount) else {
                     break;
                 };
-                let released = memory.reclaim_idle(class, owner.as_ref(), bytes, |page| {
-                    writer.discard_idle_copy(page)
-                });
+                let released =
+                    memory.reclaim_idle(class, owner.as_ref(), bytes, |page, ciphertext| {
+                        writer.discard_idle_copy(page, ciphertext)
+                    });
                 if released < bytes {
                     writer.reclaim_ciphertext(owner.as_ref(), bytes - released);
                 }
@@ -1544,7 +1545,8 @@ impl WorkerApplication {
     }
 
     /// While Critical, release a bounded number of idle memory-cache quanta.
-    /// Entries still referenced by readers or queued writes are never evicted.
+    /// The cache holds only ciphertext; entries whose ciphertext is still
+    /// referenced by readers or queued writes are never evicted.
     fn reclaim_cache_under_pressure(&self) {
         let level = self.pressure.responder.level();
         let quanta = crate::pressure::pressure_actions(level).reclaim_cache_quanta;
@@ -1553,10 +1555,10 @@ impl WorkerApplication {
         }
         for _ in 0..quanta {
             let released = self.memory.reclaim_idle(
-                crate::admission::ResourceClass::Plaintext,
+                crate::admission::ResourceClass::Ciphertext,
                 None,
                 usize::MAX,
-                |_| 0,
+                |_, _| 0,
             );
             if released == 0 {
                 break;

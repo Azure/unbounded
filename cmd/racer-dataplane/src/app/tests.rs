@@ -1695,8 +1695,9 @@ fn snapshot_refresh_retries_canceled_publication_and_applies_skipped_removal() {
     let index = worker.store.writer.index().clone();
     index.publish_version(metadata.clone()).unwrap();
     worker.memory.publish(page).unwrap();
-    assert!(worker.memory.get(&page_id).unwrap().is_some());
-    assert_eq!(retained_plaintext.strong_count(), 1);
+    assert!(worker.memory.ciphertext(&page_id).unwrap().is_some());
+    // The cache retains only ciphertext; published plaintext is released.
+    assert_eq!(retained_plaintext.strong_count(), 0);
     assert_eq!(retained_ciphertext.strong_count(), 1);
     assert_eq!(index.snapshot_metadata(), vec![metadata.clone()]);
 
@@ -1711,7 +1712,6 @@ fn snapshot_refresh_retries_canceled_publication_and_applies_skipped_removal() {
         .snapshots
         .apply(publication(&config, 3, vec![replacement.clone()]))
         .unwrap();
-    assert_eq!(retained_plaintext.strong_count(), 1);
     assert_eq!(retained_ciphertext.strong_count(), 1);
     assert_eq!(index.snapshot_metadata(), vec![metadata]);
     let canceled = scope(Duration::from_secs(1)).unwrap();
@@ -1727,7 +1727,7 @@ fn snapshot_refresh_retries_canceled_publication_and_applies_skipped_removal() {
     assert_eq!(worker.caches, vec![replacement]);
     assert_eq!(worker.snapshot_sequence, Some(wire::PublicationSequence(3)));
     worker.refresh_snapshot(&canceled).unwrap();
-    assert!(worker.memory.get(&page_id).unwrap().is_none());
+    assert!(worker.memory.ciphertext(&page_id).unwrap().is_none());
     assert!(index.snapshot_metadata().is_empty());
     assert!(worker.peer_task.is_none());
     assert!(worker.prepared_listeners.borrow().is_none());
@@ -4819,7 +4819,7 @@ fn maintain_pools_expires_idle_cache_entries_then_their_aligned_storage() {
         worker.maintain_pools(now);
         now += second;
     }
-    assert!(worker.memory.get(&page_id).unwrap().is_some());
+    assert!(worker.memory.ciphertext(&page_id).unwrap().is_some());
     // The hit renews the entry for another full TTL.
     let renewed = now;
     while now < renewed + crate::memory::CACHE_IDLE_TTL {
@@ -4828,7 +4828,7 @@ fn maintain_pools_expires_idle_cache_entries_then_their_aligned_storage() {
         now += second;
     }
     worker.maintain_pools(now);
-    assert!(worker.memory.get(&page_id).unwrap().is_none());
+    assert!(worker.memory.ciphertext(&page_id).unwrap().is_none());
     // The released buffer is pooled, then decays once nothing reuses it.
     assert_eq!(worker.aligned_pool_stats().entries, 1);
     for _ in 0..6 {
