@@ -203,3 +203,55 @@ With the stand-ins, a 2 s caches-only run at 50,000 nodes processes about 6M eve
 with 180 MiB peak RSS; the empty substrate accounts about 2.6 KiB per node. The stand-in owner check re-ranks
 at the owner and retries when membership changed in flight, so `only_owner_hits_origin` holds by
 construction until real placement replaces it.
+
+## Cache track (phases 4 and 5)
+
+The phantom caches reuse the production CLOCK, LRU, and admission code. Only
+the storage of each entry changes, through a type parameter whose default
+keeps production unchanged.
+
+- Placement: `topology::Placement<R: Rankings = Scored>`. `Phantom` keeps a
+  cursor and the CLOCK bit per entry (`PhantomEntry`, 8 bytes) and reads
+  results from a memo shared by every clone, keyed by (membership identity,
+  slot). The memo runs the real scoring and the real incremental update once
+  per key. `Phantom::forget` drops old memberships; a forgotten predecessor
+  makes `updated` return `None`, which forces a full rescore, not a wrong
+  answer. Equivalence test:
+  `placement::tests::phantom_matches_scored_on_seeded_workloads_with_churn`.
+- Routes: `topology::Paths<S: Searches = Exhaustive>`. `SharedRoutes` runs the
+  real search once per `PathKey` (which includes the graph identity),
+  records its step count and result, and replays both, so hits, misses,
+  evictions, byte charges, admission, and polls per search are identical.
+  Cached results are one shared `Rc` across nodes. Equivalence test:
+  `paths::tests::shared_routes_match_exhaustive_on_seeded_workloads`.
+- Disk: `page_alloc::PhantomEntries<K>` implements `SegmentEntries` with a
+  page index and page lengths but no data, removing mappings in publication
+  order like the catalog. Segment value moved to
+  `racer_core::cache::segment` (`SCAN_BUDGET`, `unseen_value`, `page_value`,
+  `segment_value`); the catalog calls it, and `catalog::SegmentClock::reclaim_at`
+  takes an explicit `now`. Equivalence test:
+  `store::catalog::tests::phantom_segment_entries_match_catalog_reclamation`.
+- Memory: the verified and unverified recency indexes moved to
+  `racer_core::cache::lru` as `TickLru<K, V, H>` and `OrderedLru<K, V, H>`,
+  with the admission victim, bounded reclamation pass (`Visit`), and idle
+  expiry batching. `src/memory.rs` stores `CachedPage` and `UnverifiedPage`
+  in them; the simulator stores payload-free values and passes a seeded
+  hasher.
+
+Measured per-entry heap cost (counting allocator tests in
+`topology/tests/phantom_memory.rs`, `alloc/tests/phantom_memory.rs`,
+`core/tests/lru_memory.rs`):
+
+| Structure | Bytes per entry | At production defaults, per worker |
+| --- | --- | --- |
+| Phantom placement entry | 99 | 1.6 MiB (16 MiB budget, 16,384 entries) |
+| Replayed route entry | 199 | about 1 MiB (8 MiB charge budget, about 5,100 entries) |
+| Phantom segment mapping (`u64` key) | 121 | depends on disk pages |
+| `TickLru<u64, u32>` / `OrderedLru<u64, u32>` | 67 / 82 | depends on memory pages |
+
+Production defaults therefore cost about 2.6 MiB per worker for placement and
+routes alone, well over the 640 KiB per node target at 50,000 nodes. Full
+scale runs must scale the placement and path cache budgets down (the
+decision logic is identical at any capacity) or accept fewer nodes. The
+shared memos grow with distinct (membership, slot) and route keys and must be
+pruned with `forget` on membership changes.
