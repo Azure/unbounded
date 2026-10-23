@@ -191,7 +191,7 @@ Ciphertext reaches GPU staging memory owned by the dataplane in one of three way
 
 - **Memory, origin or HTTP peer:** one host-to-GPU copy.
 - **Local disk:** cuFile reads it straight from NVMe (aligned records only, below).
-- **RDMA peer:** the NIC writes it into GPU memory registered with
+- **RDMA peer:** the NIC writes it into a GPU landing buffer registered with
   `ibv_reg_dmabuf_mr`. The dma-buf comes from `cuMemGetHandleForAddressRange`.
 
 `RACER_GPU_STAGING_BYTES` caps the dataplane's ciphertext staging memory per GPU.
@@ -232,8 +232,62 @@ above:
   and the page's owner drops that copy from memory and disk, as it does after a
   failed CPU decrypt. When it accepts a page that came from a peer, the owner
   may persist it, as it does after a CPU decrypt.
-- RDMA peers do not yet write into GPU staging: an RDMA page lands in host
-  memory and takes one host-to-GPU copy.
+- RDMA peers write `gpu-read` pages straight into GPU memory (GPUDirect RDMA
+  landing), described below. Other RDMA pages land in host memory and take
+  one host-to-GPU copy when a GPU read needs them.
+
+### GPUDirect RDMA landing
+
+When GPU decryption and RDMA are both on, each GPU can get one landing
+buffer: GPU memory separate from the staging buffer, sized by
+`RACER_GPU_LANDING_BYTES` (default 256 MiB per GPU, 0 turns landing off).
+The GPU helper allocates it once, exports it once as a dma-buf, and keeps it
+until the process exits. At each RDMA activation, every rail is matched with
+at most one GPU, and every GPU with at most one rail: a GPU on the rail's
+NUMA node first, then any free GPU (`assign_landing` in
+`src/rdma/links.rs`). PCI distance is not used; only NUMA nodes are known on
+both sides. The rail registers the landing buffer as its `rdma_verbs` device
+pool, so the buffer is split into page-sized slots. If allocation, export, or
+registration fails, the rail stays host-only.
+
+A `gpu-read` page then takes this path (`Fill::land_from_peer`):
+
+1. If this node is not a candidate for the page, has no local copy, and has
+   a landing buffer on the request's GPU, it sends one CopyOnly request to the
+   first provider in visit order, carrying the GPU ordinal.
+2. When the hop is RDMA and the rail's landing buffer is on that GPU, the
+   receiver grants a landing slot instead of a host buffer. If no slot is
+   free, it grants host memory as usual.
+3. The sender writes the ciphertext into the slot. After the usual fence, the
+   receiver checks the signed completion and that the signed response head
+   describes exactly this page (`landed_response_head`), and the requester
+   verifies the signature chain against its request binding.
+4. The page becomes a sealed page whose ciphertext is in the landing slot.
+   The GPU checks the tag (there is no CRC: no host bytes were seen) and
+   decrypts into the client's allocation.
+
+A landed page is used once. It does not join or create a single flight, is
+not published to memory, and is not persisted, because there are no host
+bytes to share. The slot is held until the GPU job finishes. If the provider
+answers with a host page (no free slot, or HTTP), that page is used once in
+the same way, so it is not fetched twice. A miss, any failure, or a landing
+buffer on another GPU falls back to the usual path. Host-only nodes and
+non-GPU reads do not change. Relays never ask for landing.
+
+`racer_rdma_pages_landed_total` counts pages that landed, and the GPU
+helper's `landed` counter counts landed pages it decrypted. A landed page the
+GPU rejects fails the read like any other sealed page; there is no host copy
+to drop.
+
+The GPU memory used for landing is not charged to the host admission
+budget. It is bounded by `RACER_GPU_LANDING_BYTES` per GPU.
+
+Not covered yet: there is no end-to-end `gpu-read` test across two whole
+dataplanes, because the test harness has no two-node fixture with simulated
+RDMA and a simulated GPU on the client socket. Tests cover each layer
+instead: verbs device pools, landing grants over two simulated nodes, the
+peer transport over a simulated link, the fill path with a scripted
+provider, and GPU decryption from a landing buffer.
 
 ### Disk layout v2
 
@@ -305,4 +359,4 @@ rule (`internal/racerobject/racerobject.go`).
 1. Descriptor passing, `host-read`, the Python client and the vLLM plugin.
 2. GPU discovery, the `gpu` crate, GPU decryption and `gpu-read`.
 3. Aligned disk records and cuFile reads.
-4. GPUDirect RDMA from peers.
+4. GPUDirect RDMA from peers (landing for `gpu-read`, described above).

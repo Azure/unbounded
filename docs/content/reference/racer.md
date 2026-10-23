@@ -204,6 +204,7 @@ Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
 | `RACER_ENABLE_RDMA` | `auto` | `auto`, `true`, or `false`; see [modes](#rdma) |
 | `RACER_ENABLE_GPU` | `auto` | `auto`, `true`, or `false`; see [GPU reads](#gpu-reads) |
 | `RACER_GPU_STAGING_BYTES` | `268435456` (256 MiB) | Cap on ciphertext staging memory per GPU, in bytes. Must be a nonzero multiple of 2 MiB. Below about 34 MiB the GPU does not decrypt and the CPU does; see [GPU reads](#gpu-reads) |
+| `RACER_GPU_LANDING_BYTES` | `268435456` (256 MiB) | GPU memory per GPU that peers' NICs write GPU-read pages into over RDMA, in bytes. A multiple of 2 MiB; `0` turns it off. Below one page slot (16 MiB plus 4 KiB) it is off; see [GPU reads](#gpu-reads) |
 | `RACER_SHARES` | `4` | Enrollment proposal; explicit Node `shares` wins |
 | `RACER_PLAINTEXT_BYTES` / `RACER_CIPHERTEXT_BYTES` | Unset: `67108864` (64 MiB) / `134217728` (128 MiB) per final I/O worker | Independent plaintext/ciphertext admission budgets; an explicit value is node-wide and divided among I/O workers |
 | `RACER_DIRTY_BYTES` | Unset: `167772160` (160 MiB) per final I/O worker | Dirty-data budget; an explicit value is node-wide |
@@ -1036,8 +1037,22 @@ Where the bytes come from decides who decrypts them:
 - A page on local disk is read straight from the disk into GPU memory with
   cuFile when it can be. Otherwise the CPU reads it and copies it to the GPU.
 
+- With RDMA on, a page from a peer can be written by the peer's NIC straight
+  into GPU memory on this node (GPUDirect RDMA). See below.
+
 If the GPU finds a damaged page, the read fails and the dataplane drops that
 copy from memory or disk, as it does when the CPU finds one.
+
+When both GPU reads and RDMA are on, each GPU can get a landing buffer of
+`RACER_GPU_LANDING_BYTES`, split into page slots. Each RDMA rail gets at most
+one GPU's landing buffer, preferring a GPU on the rail's NUMA node. A GPU
+read that needs a page from a peer over that rail, on that GPU, asks the peer
+to write the encrypted page into a free slot. The GPU then checks and
+decrypts it. Such a page is used only by that read: it is not kept in memory,
+written to disk, or shared with other reads. When no slot is free, the GPUs
+do not match, or anything fails, the page comes through host memory as
+before. The dataplane logs `stage=gpu-landing` lines at RDMA activation, and
+`racer_rdma_pages_landed_total` counts pages that landed in GPU memory.
 
 `RACER_GPU_STAGING_BYTES` is the GPU memory the dataplane keeps on each GPU for
 encrypted pages. It is split into slots of one page (16 MiB plus 4 KiB). Two

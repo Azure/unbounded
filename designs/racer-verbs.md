@@ -112,6 +112,35 @@ thread and returns the buffer to the pool. Dropping a pool with held,
 quarantined, or leaked buffers keeps the region and charge alive rather than
 deregistering memory prematurely.
 
+## Device page pools
+
+A rail can also hold one device pool: caller memory that the NIC reaches
+through a Linux dma-buf, such as GPU memory. The caller passes an owner that
+implements `DmabufMemory` (descriptor, offset, length, and the NIC address of
+the first byte) to `Client::attach_device`, once per rail per round, after
+activation. The owner thread registers it with `ibv_reg_dmabuf_mr`
+(`LOCAL_WRITE | MW_BIND`) and splits it into buffers of the node's buffer
+length. The crate does not depend on any GPU library.
+
+`Client::grant_device` grants a device buffer. It uses the same states, the
+same window bind, and the same fence as a host grant: the arrival resolves
+only after the peer's write completion and a successful `LOCAL_INV`, so the
+peer can no longer write the buffer. The arrival is `Arrival::Device` with a
+`DevicePage`, which names the memory owner, the offset, and the length, and
+holds the buffer until it is dropped. A device grant fails with `Unavailable`
+when the rail has no device pool and `Overloaded` when no device buffer is
+free; it never falls back to host memory. A window stays tied to the region
+it first binds, so a link makes device windows on first use and keeps them
+apart from host windows, at most one per concurrent grant.
+
+The CPU never maps or copies device memory. `DevicePage` has no byte API, the
+region reports a null pointer, and sends, writes, and receives that name a
+device region are rejected in Rust, in the C adapter, and in the simulation.
+If deregistration fails, the region leaks with its memory owner and the node
+guard, so the memory is never freed while the NIC might write it. The
+simulation maps a memfd in place of the dma-buf (`MemfdMemory`), and traces
+and faults the registration as `Operation::RegisterDmabuf`.
+
 ## Links
 
 For a configured local grant limit `g`:
@@ -188,7 +217,8 @@ this crate, remains the authoritative page outcome. There is no in-band
 
 ## Native ABI and completion checks
 
-The adapter ABI is version 4. Rust requires that version and the current
+The adapter ABI is version 5. Version 5 added `rdma_verbs_register_dmabuf`
+and the rule that send, write, and receive posts reject dma-buf regions. Rust requires that version and the current
 symbols; there is no legacy ABI loader. The completion record is 32 bytes:
 
 ```c
