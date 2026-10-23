@@ -136,16 +136,6 @@ func run(ctx context.Context, cfg config) error {
 		return fmt.Errorf("register run reconciler: %w", err)
 	}
 
-	recurring := &projectsignal.RecurringReconciler{
-		Client:    mgr.GetClient(),
-		Reader:    mgr.GetAPIReader(),
-		Namespace: cfg.namespace,
-		Admission: admission,
-	}
-	if err := recurring.SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("register recurring reconciler: %w", err)
-	}
-
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		return err
 	}

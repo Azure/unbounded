@@ -67,8 +67,6 @@ type Config struct {
 	RunUID                 types.UID
 	ParticipantsJSON       string
 	ParticipantCount       int
-	RequestNodeName        string
-	LegacyParticipants     string
 	ScriptConfigMap        string
 	ScriptKey              string
 	ScriptDigest           string
@@ -129,45 +127,31 @@ type AggregateOutput struct {
 func ParseParticipants(
 	participantsJSON string,
 	participantCount int,
-	requestNodeName string,
-	legacyParticipants string,
 ) ([]signalv1.Participant, error) {
 	if participantCount < 1 || participantCount > MaxParticipants {
 		return nil, fmt.Errorf("participant-count must be between 1 and %d", MaxParticipants)
 	}
 
+	if strings.TrimSpace(participantsJSON) == "" {
+		return nil, errors.New("participants-json is required")
+	}
+
 	var participants []signalv1.Participant
 
-	if strings.TrimSpace(participantsJSON) != "" {
-		decoder := json.NewDecoder(strings.NewReader(participantsJSON))
-		decoder.DisallowUnknownFields()
+	decoder := json.NewDecoder(strings.NewReader(participantsJSON))
+	decoder.DisallowUnknownFields()
 
-		if err := decoder.Decode(&participants); err != nil {
-			return nil, fmt.Errorf("decode participants-json: %w", err)
+	if err := decoder.Decode(&participants); err != nil {
+		return nil, fmt.Errorf("decode participants-json: %w", err)
+	}
+
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, errors.New("participants-json contains trailing values")
 		}
 
-		var trailing any
-		if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-			if err == nil {
-				return nil, errors.New("participants-json contains trailing values")
-			}
-
-			return nil, fmt.Errorf("decode trailing participants-json value: %w", err)
-		}
-	} else {
-		nodeName := requestNodeName
-		if nodeName == "" {
-			names := strings.Split(legacyParticipants, ",")
-			if len(names) > 0 {
-				nodeName = strings.TrimSpace(names[0])
-			}
-		}
-
-		if nodeName == "" {
-			return nil, errors.New("participants-json or a compatibility Node name is required")
-		}
-
-		participants = []signalv1.Participant{{Index: 0, NodeName: nodeName}}
+		return nil, fmt.Errorf("decode trailing participants-json value: %w", err)
 	}
 
 	if len(participants) != participantCount {
@@ -320,8 +304,6 @@ func ValidateConfig(config Config) ([]signalv1.Participant, []corev1.Toleration,
 	participants, err := ParseParticipants(
 		config.ParticipantsJSON,
 		config.ParticipantCount,
-		config.RequestNodeName,
-		config.LegacyParticipants,
 	)
 	if err != nil {
 		return nil, nil, nil, err

@@ -335,66 +335,6 @@ func (r *Runner) waitForResult(ctx context.Context, config Config, backend creat
 	}
 }
 
-func backendCompletionResult(
-	logContent string,
-	logErr error,
-	participantIndex int,
-	backendSucceeded bool,
-) Result {
-	return backendCompletionFromSource(
-		resultLogSource{
-			content: logContent,
-			err:     logErr,
-			metadata: resultLogSourceMetadata(
-				logContent,
-				logErr,
-			),
-		},
-		participantIndex,
-		backendSucceeded,
-	)
-}
-
-func backendCompletionFromSource(
-	source resultLogSource,
-	participantIndex int,
-	backendSucceeded bool,
-) Result {
-	result := Result{
-		ParticipantIndex: participantIndex,
-		ExecutionState:   "Error",
-		Verdict:          "Inconclusive",
-		Reason:           "BackendExecutionFailed",
-		ResultLog: &ResultLogMetadata{
-			Current:        source.metadata,
-			Previous:       ResultLogSourceMetadata{Status: "not-read"},
-			SelectedSource: "",
-		},
-	}
-
-	if source.err != nil {
-		if backendSucceeded {
-			result.Reason = "BackendResultUnavailable: " + source.err.Error()
-		}
-
-		return result
-	}
-
-	parsed, err := ParseResultLog(source.content, participantIndex)
-	if err != nil {
-		if backendSucceeded {
-			result.Reason = "BackendResultInvalid: " + err.Error()
-		}
-
-		return result
-	}
-
-	parsed.ResultLog = result.ResultLog
-	parsed.ResultLog.SelectedSource = "current"
-
-	return completedResult(parsed, backendSucceeded)
-}
-
 func backendCompletionFromLogs(
 	logs resultLogSnapshot,
 	participantIndex int,

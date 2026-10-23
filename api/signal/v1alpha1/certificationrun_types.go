@@ -66,13 +66,6 @@ type ScriptSnapshot struct {
 	Digest string `json:"digest"`
 }
 
-type LegacyScriptSnapshot struct {
-	ConfigMapName        string `json:"configMapName,omitempty"`
-	Key                  string `json:"key,omitempty"`
-	RequiresRuntimeStage bool   `json:"requiresRuntimeStage,omitempty"`
-	Digest               string `json:"digest,omitempty"`
-}
-
 // +kubebuilder:validation:XValidation:rule="self.maxAttempts == 1",message="maxAttempts must be exactly 1"
 // +kubebuilder:validation:XValidation:rule="duration(self.backendActiveDeadline) > duration('0s')",message="backendActiveDeadline must be positive"
 // +kubebuilder:validation:XValidation:rule="!has(self.script.requiresRuntimeStage) || !self.script.requiresRuntimeStage || has(self.runtimeStage)",message="runtimeStage is required when the script requires a runtime stage"
@@ -133,18 +126,6 @@ type CertificationRunSpec struct {
 	Tolerations     []corev1.Toleration  `json:"tolerations,omitempty"`
 	RequestNodeName string               `json:"requestNodeName"`
 	Cancel          bool                 `json:"cancel,omitempty"`
-
-	// Deprecated Go-only aliases retained for unit fixtures. They are not part
-	// of the v1alpha1 wire contract.
-	Script                LegacyScriptSnapshot `json:"-"`
-	Backend               ExecutionBackend     `json:"-"`
-	RunnerImage           string               `json:"-"`
-	WorkloadPolicy        WorkloadPolicy       `json:"-"`
-	StagePlan             []CertificationStage `json:"-"`
-	RuntimeStage          *RuntimeStage        `json:"-"`
-	Parameters            map[string]string    `json:"-"`
-	BackendActiveDeadline metav1.Duration      `json:"-"`
-	MaxAttempts           int32                `json:"-"`
 }
 
 type WorkflowStatus struct {
