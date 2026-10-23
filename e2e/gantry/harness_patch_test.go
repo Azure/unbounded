@@ -31,6 +31,26 @@ func TestResolveContainerEngine(t *testing.T) {
 	}
 }
 
+func TestResolveClusterName(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  string
+		want string
+	}{
+		{name: "default", want: defaultCluster},
+		{name: "blank", env: "  ", want: defaultCluster},
+		{name: "override", env: " gantry-e2e-mine ", want: "gantry-e2e-mine"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("GANTRY_E2E_CLUSTER", tc.env)
+
+			if got := resolveClusterName(); got != tc.want {
+				t.Fatalf("resolveClusterName() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestPatchDaemonSetForE2E_TargetsGantryContainerOnly is the
 // regression test for the twelfth-review finding: the harness's
 // previous strings.Replace(..., 1) on the bare "imagePullPolicy:
