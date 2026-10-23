@@ -342,6 +342,21 @@ pub struct NodeWorld {
     writes: HashMap<u64, SimCharge, Fixed>,
     origin_per_page: HashMap<u64, u32, Fixed>,
     publish_scheduled: bool,
+    profile: Profile,
+}
+
+/// Host wall time spent in the real topology code, for the report only
+/// (never feeds simulated time or decisions).
+#[derive(Debug, Default)]
+struct Profile {
+    rank_ns: u64,
+    route_ns: u64,
+    publish_ns: u64,
+}
+
+#[allow(clippy::disallowed_methods)] // Profiling only; see `Profile`.
+fn wall_clock() -> Instant {
+    Instant::now()
 }
 
 impl NodeWorld {
@@ -351,8 +366,7 @@ impl NodeWorld {
         let origin = Origin::new(&config, streams.stream(Role::Origin, 0));
         let n = config.nodes;
         // Instants are only used as offsets from this base, so runs replay.
-        #[allow(clippy::disallowed_methods)]
-        let base = Instant::now();
+        let base = wall_clock();
         let shared = Shared {
             phantom: Phantom::new(),
             routes: SharedRoutes::new(),
@@ -411,6 +425,7 @@ impl NodeWorld {
             writes: HashMap::default(),
             origin_per_page: HashMap::default(),
             publish_scheduled: false,
+            profile: Profile::default(),
             config,
         };
         world.schedule_initial(&streams);
@@ -558,7 +573,9 @@ impl NodeWorld {
     fn publish(&mut self) {
         self.publish_scheduled = false;
         let now = self.now();
+        let started = wall_clock();
         let dropped = self.versions.publish(now);
+        self.profile.publish_ns += started.elapsed().as_nanos() as u64;
         self.metrics.incr("membership_publications");
         if dropped {
             self.shared.phantom.forget(&self.versions.identities());
@@ -1081,7 +1098,9 @@ impl NodeWorld {
         let key = page.to_be_bytes();
         let placement: &Placement<Phantom> =
             &self.nodes[node as usize].workers[w as usize].placement;
+        let started = wall_clock();
         let (owners, polls) = drive(placement.rank_async(members, &key));
+        self.profile.rank_ns += started.elapsed().as_nanos() as u64;
         self.metrics.add("ranking_polls", polls);
         let costs = self.fabric.costs;
         self.fabric
@@ -1370,7 +1389,9 @@ impl NodeWorld {
             blocked: &blocked,
             seed: &seed,
         };
+        let started = wall_clock();
         let (route, polls) = drive(n.paths.route(&*members, query));
+        self.profile.route_ns += started.elapsed().as_nanos() as u64;
         let worker = (m.probe % u64::from(self.fabric.workers)) as u8;
         if polls > 1 {
             self.metrics.add("route_search_polls", polls - 1);
@@ -2150,6 +2171,11 @@ impl NodeWorld {
                 "route_memo_entries": self.shared.routes.memo_len(),
             },
             "invariants": self.invariants.to_json(),
+            "profile_wall_ms": {
+                "placement_ranking": self.profile.rank_ns / 1_000_000,
+                "route_search": self.profile.route_ns / 1_000_000,
+                "membership_build": self.profile.publish_ns / 1_000_000,
+            },
             "memory": {
                 "components": memory.iter().map(|(k, v)| ((*k).to_owned(), json!(v))).collect::<serde_json::Map<_, _>>(),
                 "accounted_bytes": total,
