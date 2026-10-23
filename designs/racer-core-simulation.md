@@ -117,34 +117,6 @@ The simulator reports peak RSS and the size of each component so this table can 
 - Each processed event feeds a running trace hash. Two runs with the same inputs must give the same
   hash. A test checks this for the smoke scenario.
 
-3. A requester that adopted a newer membership than its destination fails the read. The
-   destination cannot resolve the newer version and answers `StaleMembership`; the requester then
-   refreshes, but its latest version is not newer than the one it used, so `refresh_candidates`
-   returns `IncompatibleMembership` (`cmd/racer-dataplane/src/read/candidates.rs:1203-1204`,
-   `racer_core::read::walk::refresh_allowed` at `core/src/read/walk.rs:430-437`). That error is not
-   `recoverable` (`core/src/read/policy.rs:9-22`), so the walk does not try the next owner. In the
-   `churn` scenario (seed 1, 1 s, `request_rate` 2, 256 objects) this fails 812 of about 13k page
-   reads at 5,000 nodes and 6,939 of about 60k at 50,000 nodes, while nodes adopt each publication
-   within 100 ms. No invariant is relaxed; this is reported as a behavior to review.
-
-4. A cold page can reach the origin once per owner, up to 3 times, with no concurrency at all. The
-   rank 0 owner never asks later owners (`CandidateWalk::new` sets the walk length to the rank,
-   `core/src/read/walk.rs:146`), and readers probe owners in spread order (`visit_order`), so a
-   later owner may fetch first (after rank 0 answers a copy-only miss) and rank 0 fetches again
-   when a reader asks it. In `node::tests::single_reader_then_storm_reuses_copies` (64 nodes,
-   seed 7) one reader and then 64 readers cause 33 origin requests for 16 pages. The simulator
-   bounds origin requests per page by `REPLICAS` in tests, not 1.
-
-5. Under heavy overload a page read fails with `HopBudgetExhausted`, which is not `recoverable`.
-   Each probe charges its route links up front (`plan_attempt`, `core/src/read/walk.rs:478`), and
-   after a failed route each probe charges 8. With the page budget of 16 links (`PAGE_LINKS`,
-   `core/src/read/range.rs:24`) two `Overloaded` relays use it up; the next `plan_attempt` returns
-   `HopBudgetExhausted` (`walk.rs:481`), `transport_outcome` does not map it (`walk.rs:420`), so the
-   walk is abandoned with that error instead of ending as `Exhausted` (`Unavailable`). Production
-   does the same (`src/read/candidates.rs:1037-1045`). In the `storm` scenario at 50,000 nodes
-   (seed 1, 1 s, `request_rate` 2) 99,562 page reads fail this way while relays reject 1.25M
-   transfers on the `Relay` quota (16 per worker).
-
 ## Invariants
 
 Checked during every run:
@@ -219,6 +191,34 @@ Verified against the code at the start of this work.
    (`cmd/racer-dataplane/src/topology.rs:536`, `:552`) are called only by tests. They use the search form, where
    `visited` excludes the sender, while the signed wire form includes it (`racer_core::route`). The two
    conventions are inconsistent; a future caller must pick the right one.
+
+3. A requester that adopted a newer membership than its destination fails the read. The
+   destination cannot resolve the newer version and answers `StaleMembership`; the requester then
+   refreshes, but its latest version is not newer than the one it used, so `refresh_candidates`
+   returns `IncompatibleMembership` (`cmd/racer-dataplane/src/read/candidates.rs:1203-1204`,
+   `racer_core::read::walk::refresh_allowed` at `core/src/read/walk.rs:430-437`). That error is not
+   `recoverable` (`core/src/read/policy.rs:9-22`), so the walk does not try the next owner. In the
+   `churn` scenario (seed 1, 1 s, `request_rate` 2, 256 objects) this fails 812 of about 13k page
+   reads at 5,000 nodes and 6,939 of about 60k at 50,000 nodes, while nodes adopt each publication
+   within 100 ms. No invariant is relaxed; this is reported as a behavior to review.
+
+4. A cold page can reach the origin once per owner, up to 3 times, with no concurrency at all. The
+   rank 0 owner never asks later owners (`CandidateWalk::new` sets the walk length to the rank,
+   `core/src/read/walk.rs:146`), and readers probe owners in spread order (`visit_order`), so a
+   later owner may fetch first (after rank 0 answers a copy-only miss) and rank 0 fetches again
+   when a reader asks it. In `node::tests::single_reader_then_storm_reuses_copies` (64 nodes,
+   seed 7) one reader and then 64 readers cause 33 origin requests for 16 pages. The simulator
+   bounds origin requests per page by `REPLICAS` in tests, not 1.
+
+5. Under heavy overload a page read fails with `HopBudgetExhausted`, which is not `recoverable`.
+   Each probe charges its route links up front (`plan_attempt`, `core/src/read/walk.rs:478`), and
+   after a failed route each probe charges 8. With the page budget of 16 links (`PAGE_LINKS`,
+   `core/src/read/range.rs:24`) two `Overloaded` relays use it up; the next `plan_attempt` returns
+   `HopBudgetExhausted` (`walk.rs:481`), `transport_outcome` does not map it (`walk.rs:420`), so the
+   walk is abandoned with that error instead of ending as `Exhausted` (`Unavailable`). Production
+   does the same (`src/read/candidates.rs:1037-1045`). In the `storm` scenario at 50,000 nodes
+   (seed 1, 1 s, `request_rate` 2) 99,562 page reads fail this way while relays reject 1.25M
+   transfers on the `Relay` quota (16 per worker).
 
 ## Simulator engine (racer-sim substrate)
 
