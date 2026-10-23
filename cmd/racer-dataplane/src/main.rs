@@ -34,9 +34,8 @@ impl ClusterControl for Embedded {
                 cluster: bootstrap.cluster,
                 block_devices: bootstrap.block_devices,
             }),
-            Err(
-                racer_cluster_control::Error::Unavailable | racer_cluster_control::Error::Timeout,
-            ) => Err(BootstrapError::Retry),
+            Err(racer_cluster_control::Error::Unavailable) => Err(BootstrapError::Retry),
+            Err(racer_cluster_control::Error::Timeout) => Err(BootstrapError::Pending),
             Err(error) => {
                 eprintln!("racer-dataplane: stage=cluster-bootstrap control error={error}");
                 Err(BootstrapError::Fatal)

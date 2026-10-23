@@ -44,8 +44,11 @@ pub struct Bootstrapped {
 /// Whether bootstrap may still succeed on a later attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BootstrapError {
-    /// Not ready yet; retry.
+    /// Not ready yet; retry after the retry floor.
     Retry,
+
+    /// The requested wait elapsed with no outcome yet; keep waiting.
+    Pending,
 
     /// Stopped or invalid; startup must fail.
     Fatal,
@@ -57,11 +60,14 @@ const BOOTSTRAP_WAIT: Duration = Duration::from_secs(30);
 /// Least time between bootstrap attempts, so a fast `Retry` cannot spin.
 const BOOTSTRAP_RETRY_FLOOR: Duration = Duration::from_secs(1);
 
+/// Longest single wait on control before `stop` is checked again.
+const BOOTSTRAP_POLL: Duration = Duration::from_millis(100);
+
 /// Reserve the control thread, wait for bootstrap, and bind `config` to its result.
 ///
 /// Waits without a deadline while control reports retryable progress, because
 /// enrollment cannot start before cluster state exists. `stop` is checked
-/// between attempts so shutdown remains bounded by one attempt.
+/// at least every [`BOOTSTRAP_POLL`], so shutdown is not held by a full wait.
 pub fn start(
     config: &mut Config,
     control: std::sync::Arc<dyn ClusterControl>,
@@ -83,11 +89,34 @@ fn start_with(
             return Err(Error::Cancelled);
         }
         let started = std::time::Instant::now();
-        match control.bootstrap(BOOTSTRAP_WAIT) {
+        // One logical attempt waits up to BOOTSTRAP_WAIT in short slices so a stop
+        // request ends it within one poll; control itself is never restarted.
+        let outcome = loop {
+            let slice = BOOTSTRAP_POLL.min(BOOTSTRAP_WAIT.saturating_sub(started.elapsed()));
+            match control.bootstrap(slice) {
+                Err(BootstrapError::Pending) if started.elapsed() < BOOTSTRAP_WAIT => {
+                    if stop() {
+                        return Err(Error::Cancelled);
+                    }
+                }
+                Err(BootstrapError::Pending) => break Err(BootstrapError::Retry),
+                outcome => break outcome,
+            }
+        };
+        match outcome {
             Ok(bootstrapped) => break bootstrapped,
-            Err(BootstrapError::Retry) => {
+            Err(BootstrapError::Retry | BootstrapError::Pending) => {
                 eprintln!("racer-dataplane: stage=cluster-bootstrap state=waiting");
-                std::thread::sleep(floor.saturating_sub(started.elapsed()));
+                let resume = started + floor;
+                while let Some(left) = resume.checked_duration_since(std::time::Instant::now()) {
+                    if left.is_zero() {
+                        break;
+                    }
+                    if stop() {
+                        return Err(Error::Cancelled);
+                    }
+                    std::thread::sleep(left.min(BOOTSTRAP_POLL));
+                }
             }
             Err(BootstrapError::Fatal) => {
                 eprintln!("racer-dataplane: stage=cluster-bootstrap fatal error=control stopped");
