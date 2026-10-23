@@ -368,3 +368,32 @@ def test_load_weights_closes_iterator_before_client(server, uri, monkeypatch, tm
     else:
         inst.load_weights(Model(), mc)
     assert events == ["weights closed", "client closed"]
+
+
+def test_iter_weights_releases_dedicated_when_consumed(server, uri):
+    import gc
+    import weakref
+
+    setup_model(server, uri)
+    c = racer.Client(socket_path=server.path, staging_bytes=4096)
+    refs = []
+
+    class _WeakBackend(_FencingBackend):
+        def new_dedicated(self, size):
+            t = self.Target(size)
+            refs.append(weakref.ref(t))
+            return t
+
+    b = _WeakBackend()
+    gen = iter_weights(c, uri, b, staging_bytes=400, depth=2)
+    for name, _ in gen:
+        if name == "w3":
+            break
+    assert len(refs) == 1 and refs[0]() is not None
+    target_id = id(refs[0]())
+    # Resuming past w3 fences the dedicated target and drops it.
+    next(gen, None)
+    assert target_id in b.waited
+    gc.collect()
+    assert refs[0]() is None
+    gen.close()

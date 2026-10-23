@@ -69,7 +69,9 @@ def iter_weights(
     queued GPU work that reads it has finished. Every staging and dedicated
     target is fenced with done() and wait() before the pipeline drops its
     reference, including on early close or error, so external allocations
-    are never released while queued GPU work may still read them.
+    are never released while queued GPU work may still read them. Dedicated
+    targets are fenced and dropped as soon as the consumer resumes past
+    them, so oversized tensors do not accumulate in GPU memory.
     """
     if depth < 1:
         raise ValueError("depth must be at least 1")
@@ -97,8 +99,6 @@ def iter_weights(
             inflight.append((pool.submit(read, req, etag, chunk, target), chunk))
         return True
 
-    # Dedicated targets the consumer has moved past; fenced at the end.
-    retired: list = []
     active = None
     try:
         while fill():
@@ -110,7 +110,10 @@ def iter_weights(
             active = None
             backend.done(target)
             if chunk.dedicated:
-                retired.append(target)
+                # Fence and drop now so oversized targets do not accumulate;
+                # tensors the consumer kept hold their own storage reference.
+                backend.wait(target)
+                del target
             else:
                 free.append(target)
     finally:
@@ -119,10 +122,11 @@ def iter_weights(
         pool.shutdown(wait=True)
         if active is not None:
             backend.done(active)
-            retired.append(active)
+            backend.wait(active)
+            active = None
         # Reads have stopped; fence consumer GPU work before release. Targets
         # still in flight were fenced by read() and the consumer never saw them.
-        for target in retired + free:
+        for target in free:
             backend.wait(target)
 
 
