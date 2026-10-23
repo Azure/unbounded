@@ -61,20 +61,16 @@ def make_loader_class(base):
         def download_model(self, model_config) -> None:
             # Nothing to download; check the weights are reachable.
             uri, client = self._client(model_config)
-            try:
+            with client:
                 weight_files(client, uri)
-            finally:
-                client.close()
 
         def load_weights(self, model, model_config) -> None:
             uri, client = self._client(model_config)
             s = self.settings
-            try:
+            with client:
                 backend = TorchBackend(clone=s["clone"], use_vmm=s["use_vmm"])
                 weights = iter_weights(client, uri, backend, s["staging_bytes"], s["concurrency"])
                 loaded = model.load_weights(weights)
-            finally:
-                client.close()
             if loaded is not None and getattr(model_config, "quantization", None) is None:
                 missing = {n for n, _ in model.named_parameters()} - set(loaded)
                 if missing:
