@@ -157,7 +157,8 @@ A new crate, `cmd/racer-dataplane/gpu`, follows the `verbs` pattern:
 
 - A small C shim, `libracer_gpu_cuda.so.1`, wraps the CUDA driver API, NVML and
   cuFile. Racer loads it with `dlopen` and checks `racer_gpu_abi()`.
-- Calls run on the native helper thread, never on I/O threads.
+- Calls run on the native helper thread, never on I/O threads. The one
+  exception is cuFile reads, which run on four reader threads (below).
 - A simulation backend backs tests without GPUs. It can inject failures.
 - The Cargo feature is `cuda`. Without it, GPU mode is unavailable.
 
@@ -224,10 +225,17 @@ above:
   wiped; it is dataplane-owned GPU memory that is never read back to the host.
 - The other slots hold cuFile reads. The page's owning worker reads the record
   header through host memory (`StoreReader::direct_read`), holds the segment
-  lease, and asks the GPU helper to read the ciphertext into a free slot. When
-  no slot is free, cuFile fails, or the record is v1, unaligned, or on a
-  simulated descriptor, the worker reads the page through host memory instead.
-  A cuFile driver or registration failure turns cuFile off until restart.
+  lease, and asks the GPU helper to read the ciphertext into a free slot. The
+  helper registers the file with cuFile once and hands the read to one of four
+  reader threads, so several reads run at once while the helper decrypts. In a
+  test on one NVMe drive, one thread reached about 5 GiB/s and two or more
+  reached the drive's limit of about 6 GiB/s. When no slot is free, cuFile
+  fails, or the record is v1, unaligned, or on a simulated descriptor, the
+  worker reads the page through host memory instead.
+- The helper opens the cuFile driver on another thread at startup. Opening it
+  probes every GPU and can take most of a second, which would otherwise delay
+  the first disk read. A cuFile driver or registration failure turns cuFile off
+  until restart. A failed read only drops that file's registration.
 - At startup the helper runs a zero-length decrypt on each GPU. A GPU whose
   shim has no decrypt kernels, or a staging cap smaller than the two scratch
   slots, gets plaintext pages only.

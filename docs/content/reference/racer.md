@@ -1024,7 +1024,7 @@ GPU memory. They need:
 At startup the dataplane logs each GPU it finds: ordinal, UUID, PCI address,
 NUMA node, compute mode, and whether it can use it. It skips GPUs in
 `EXCLUSIVE_PROCESS` or `PROHIBITED` mode. One helper thread does all GPU work
-for the process. At most 256 GPU reads run at once; more get 503.
+for the process, except cuFile disk reads, which run on four reader threads. At most 256 GPU reads run at once; more get 503.
 
 Where the bytes come from decides who decrypts them:
 
