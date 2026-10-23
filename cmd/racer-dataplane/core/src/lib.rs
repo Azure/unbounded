@@ -8,5 +8,6 @@
 //! `clippy.toml` enforce this.
 
 pub mod cache;
+pub mod peer;
 pub mod route;
 pub mod time;
