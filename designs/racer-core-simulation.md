@@ -178,7 +178,14 @@ Verified against the code at the start of this work.
 
 ## Known issues
 
-None yet.
+1. Long poll delivery is bounded by write slots, not connections. When a publication lands, every
+   waiting snapshot poll on a seat wakes, but each must take one of `MAX_WRITES` (64) slots after the
+   wait (`cluster-control/src/server.rs`, `Server::snapshot`, `write_slot()?` after `wait_until`);
+   the rest answer 429 and retry. At 50k Pods over 16 seats (about 3125 polls per seat) the
+   control model (`step::cluster`, `fifty_thousand_pods_cold_start`) counts about 4.5M 429 replies
+   during a 300 s cold start and a worst client lag of about 4.1 s. Each wake also costs O(W^2) waker
+   comparisons (`step::cost::notify`). The `limits.rs` comment now says so; the behavior is
+   unchanged.
 
 ## Simulator engine (racer-sim substrate)
 
@@ -255,3 +262,28 @@ scale runs must scale the placement and path cache budgets down (the
 decision logic is identical at any capacity) or accept fewer nodes. The
 shared memos grow with distinct (membership, slot) and route keys and must be
 pruned with `forget` on membership changes.
+
+## Track ctl: control plane steps
+
+Phase 0 (`cluster-control`): `election::now_micro(wall)` takes the wall time, so the "pure" header
+holds. `entropy::{Entropy, OsEntropy, Seeded, Failing}`; `keyring::plan_with(.., rng)` and
+`new_key(rng, ..)` take it, and `Shared::rng` feeds seat jitter, claim delay salts, and primary
+contention waits. Production passes `OsEntropy`.
+
+Phase 12 (`cluster-control/src/step/`, public as `racer_cluster_control::step`): `lottery::Lottery`
+(plan, begin, observe, won), `renew::SeatRenew` (decide, put_ok, put_failed, conflict),
+`contend::Contend`, `follower` (read classification, admit, need_image, `Follower`),
+`primary::{plan_pass, discovery, Inventory}`, and `admission` (`Gate`, `check_ahead`, `body_for`,
+`SeatAdmission`). `seat.rs`, `primary.rs`, `server.rs`, `exec::Slots`, and `Image::for_base` call
+them, so there is one copy of each rule. Steps return decisions rather than `Vec<Effect>`; the I/O
+between decisions stays in the async tasks. Deviation: the lottery draws the candidate index
+before its sleep rather than after; with OS entropy this is indistinguishable.
+
+Phase 13: `apiserver::Store` is the plain-value API server (CAS, watches with fan-out and a bounded
+log, compaction, faults, `Admission`/`TokenBucket` for 429s and latency); `kube::fake` wraps it with
+TLS. `controlplane::Host::preparing()` returns `Preparing::Thread` by default or `Inline` for a
+simulated host; time in `controlplane` still comes from `uring_runtime::environment::now()`, which
+the runtime's `simulation` feature already controls. `step::cost` models notify and write rounds.
+`step::cluster::ControlPlane` simulates N Pods (enrollment lottery, seats, primary failover,
+follower image copies, client long polls) from the real steps with typed Leases; 50k Pods for 300
+simulated seconds takes about 66 s in release, dominated by `plan_pass` at 50k members.
