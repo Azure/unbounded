@@ -950,6 +950,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "racer-sim"
+version = "0.1.0"
+dependencies = [
+ "flow-control",
+ "page-alloc",
+ "racer-core",
+ "serde_json",
+ "topology",
+]
+
+[[package]]
 name = "rand_core"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -367,6 +367,7 @@ help: ## Show this help
 	@echo "Racer:"
 	@echo "  racer-test                       Test the Rust Racer workspace and Go Racer API and wire contracts"
 	@echo "  racer-gpu-test                   Build the CUDA shim with kernels and run GPU hardware tests"
+	@echo "  racer-sim                        Run the Racer simulator (ARGS='--scenario smoke --nodes 16')"
 	@echo "  racer-envtest                    Run Racer API-server tests with KUBEBUILDER_ASSETS"
 	@echo "  racer-envtest-ci                 Provision pinned assets and run Racer API-server tests"
 	@echo "  racer-generate                   Generate Racer deepcopy and CRD artifacts"
@@ -609,6 +610,12 @@ racer-python-dist: ## Build sdists and wheels for racer-client and racer-vllm in
 	rm -rf tmp/racer-python-dist
 	timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/python" -m build -o tmp/racer-python-dist clients/python/racer
 	timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/python" -m build -o tmp/racer-python-dist clients/python/racer-vllm
+
+RACER_SIM_TIMEOUT ?= 7200s
+
+.PHONY: racer-sim
+racer-sim: ## Run the Racer discrete-event simulator; pass options with ARGS='--nodes 50000 --seed 1'
+	timeout --signal=TERM --kill-after=10s $(RACER_SIM_TIMEOUT) cargo run --release --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p racer-sim -- $(ARGS)
 
 $(SETUP_ENVTEST):
 	@mkdir -p bin tmp/envtest-tools
