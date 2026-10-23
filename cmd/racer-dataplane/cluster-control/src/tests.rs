@@ -785,6 +785,50 @@ fn ready_single(cluster: &FakeCluster) -> crate::Handle {
     h
 }
 
+/// An operator deletes and recreates the primary Lease (new UID, transitions
+/// reset). The term on the new Lease takes over the state record instead of
+/// failing closed on a record stamped by the dead Lease.
+#[test]
+fn recreated_primary_lease_takes_over_state() {
+    let cluster = FakeCluster::start(1);
+    let h = ready_single(&cluster);
+    assert!(wait_for(Duration::from_secs(30), || h
+        .diagnostics()
+        .sequence
+        >= 1));
+    let before = record_of(&cluster);
+    let path = format!(
+        "/apis/coordination.k8s.io/v1/namespaces/{NS}/leases/{}",
+        annotations::PRIMARY_LEASE
+    );
+    cluster.inspect(async |k| {
+        let (status, _) = k.call("DELETE", &path, None, b"", 1 << 20).await.unwrap();
+        assert_eq!(status, 200);
+        k.post(
+            &format!("/apis/coordination.k8s.io/v1/namespaces/{NS}/leases"),
+            &json!({"metadata":{"name":annotations::PRIMARY_LEASE,"namespace":NS},"spec":{}}),
+        )
+        .await
+        .unwrap();
+    });
+    let live = cluster
+        .inspect(async |k| str_at(&k.get(&path).await.unwrap(), &["metadata", "uid"]).to_owned());
+    assert_ne!(before["term"]["lease_uid"].as_str(), Some(live.as_str()));
+    let mut timeline = Timeline::default();
+    assert!(
+        wait_for(Duration::from_secs(90), || {
+            timeline.sample(&cluster, &[&h]);
+            record_of(&cluster)["term"]["lease_uid"].as_str() == Some(live.as_str())
+                && h.diagnostics().ready
+                && matches!(h.diagnostics().role, crate::Role::Primary(_))
+        }),
+        "{timeline}"
+    );
+    let after = record_of(&cluster);
+    assert!(after["sequence"].as_u64() >= before["sequence"].as_u64());
+    assert!(after["keyring"]["generation"].as_u64() >= before["keyring"]["generation"].as_u64());
+}
+
 fn holders(cluster: &FakeCluster) -> (String, String) {
     let seat = annotations::seat_lease(0);
     cluster.inspect(async |k| {

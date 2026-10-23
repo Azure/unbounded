@@ -315,6 +315,28 @@ async fn renew(t: Rc<Term_>) {
     }
 }
 
+/// The live primary Lease UID, read only when `current` was stamped under
+/// another Lease, so a term on a recreated Lease can take the record over.
+/// Read after `current`: a UID read before it could predate the record.
+async fn live_lease_uid(
+    t: &Term_,
+    current: Option<&StateRecord>,
+) -> Result<Option<String>, StateError> {
+    let ours = t.writer.borrow().term().lease_uid.clone();
+    if current.is_none_or(|c| c.term.lease_uid == ours) {
+        return Ok(None);
+    }
+    let ns = &t.shared.config.namespace;
+    match lease::get(&t.shared.lease_api, ns, annotations::PRIMARY_LEASE).await {
+        Ok(v) => Ok(Some(lease::observe(&v).uid)),
+        // Missing Lease: no UID is live, so the record is not ours to take.
+        Err(KubeError::NotFound) => Ok(None),
+        // Transient (non-fatal, like a failed Secret read): retry later
+        // rather than fence on an unknown answer.
+        Err(_) => Err(StateError::TooLarge),
+    }
+}
+
 /// Whether `o` is still the Lease term `term` held by `identity`.
 pub(crate) fn same_term(o: &LeaseObservation, identity: &str, term: &Term) -> bool {
     lease::holder_key(o).as_deref() == Some(identity)
@@ -569,7 +591,10 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
         attempts += 1;
         let read_started = Instant::now();
         let (secret, current) = read_state(shared).await?;
-        t.writer.borrow_mut().observe(current.as_ref())?;
+        let live_uid = live_lease_uid(t, current.as_ref()).await?;
+        t.writer
+            .borrow_mut()
+            .observe(current.as_ref(), live_uid.as_deref())?;
         let cluster = shared.cluster.borrow().clone();
         let previous_image = shared.serving.borrow().image.clone();
         let previous_record = record_of(current.as_ref());
