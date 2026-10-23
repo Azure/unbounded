@@ -746,14 +746,14 @@ impl RangeStream {
             self.slots.push_back(Slot::Probing(match spilled {
                 // Holding pages stay with the spill state until the hold
                 // completes, so the hold is released exactly once.
-                None => Box::pin(async move { directory.cached_page(page, &scope).await }),
+                None => Box::pin(async move { directory.local_page(page, &scope).await }),
                 Some(Spilling::Holding(holding)) => {
                     self.spill
                         .as_mut()
                         .unwrap()
                         .pages
                         .insert(number.0, Spilling::Holding(holding));
-                    Box::pin(async move { directory.cached_page(page, &scope).await })
+                    Box::pin(async move { directory.local_page(page, &scope).await })
                 }
                 // A spilled page is read back from memory or its held disk copy.
                 // If that fails the page is fetched normally.

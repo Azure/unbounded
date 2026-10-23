@@ -306,7 +306,7 @@ impl Fill {
         if let Some(result) = self
             .dependencies
             .metadata_owner
-            .cached_page(head, scope)
+            .local_page(head, scope)
             .await?
         {
             return Ok(result);
