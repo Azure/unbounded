@@ -94,14 +94,10 @@ const minWarmDelay = time.Millisecond
 
 // nextWarm returns the delay before the next warm renewal.
 //
-// While retainUntil is in the future, the delay is half the time left, capped
-// at WarmTTL/2, so a renewal happens before the grant runs out even when
-// Racer granted much less than WarmTTL. Without a valid grant, because Racer
-// refused retention, the grant expired, or no renewal has succeeded yet, the
-// delay is WarmTTL/2. The delay is never below minWarmDelay. Only when less
-// than 2*minWarmDelay is left can that floor put the renewal at or after the
-// deadline. Halving the time left means at most about log2(left/minWarmDelay)
-// retries before a grant expires, even if every retry fails.
+// With a valid grant, the delay is half the smaller of the time left and
+// WarmTTL. Without one, it is WarmTTL/2. The minWarmDelay floor prevents a
+// busy loop; with less than 2*minWarmDelay left, it can schedule at or after
+// expiry.
 func nextWarm(now, retainUntil time.Time, ttl time.Duration) time.Duration {
 	d := ttl / 2
 	if left := retainUntil.Sub(now); !retainUntil.IsZero() && left > 0 {
