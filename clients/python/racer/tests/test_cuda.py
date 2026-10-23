@@ -165,6 +165,32 @@ def test_host_register_restores_context_on_error(fake):
     assert lib.current == 100
 
 
+def test_failed_pin_releases_exports_and_closes_memfd(fake):
+    import os
+
+    from racer import HostBuffer
+
+    fake(fail="cuMemHostRegister_v2")
+    with pytest.raises(cuda.CudaError) as ei:
+        with HostBuffer(4096) as b:
+            fd = b._fd
+            b.pin(0)
+    assert "cuMemHostRegister_v2" in str(ei.value)
+    assert b._map.closed
+    with pytest.raises(OSError):
+        os.fstat(fd)
+
+
+def test_host_register_releases_export_on_failure(fake):
+    import mmap
+
+    fake(fail="cuMemHostRegister_v2")
+    m = mmap.mmap(-1, 4096)
+    with pytest.raises(cuda.CudaError):
+        cuda.host_register(m, 0)
+    m.close()
+
+
 def test_staging_pinned_for_destination_device(fake, tmp_path):
     from racer.client import Client
 

@@ -412,13 +412,18 @@ def host_register(buf, device: int = 0) -> HostRegistration:
     """
     lib = _load()
     mv = memoryview(buf).cast("B")
-    if mv.readonly:
-        raise RacerError("buffer must be writable")
-    arr = (ctypes.c_char * len(mv)).from_buffer(mv)
-    addr = ctypes.addressof(arr)
-    with bound_context(device):
-        _check("cuMemHostRegister_v2", lib.cuMemHostRegister_v2(addr, len(mv), CU_MEMHOSTREGISTER_PORTABLE))
-    # Drop the export so the owner can still close its mapping after unregistering.
-    del arr
-    mv.release()
+    arr = None
+    try:
+        if mv.readonly:
+            raise RacerError("buffer must be writable")
+        n = len(mv)
+        arr = (ctypes.c_char * n).from_buffer(mv)
+        addr = ctypes.addressof(arr)
+        with bound_context(device):
+            _check("cuMemHostRegister_v2", lib.cuMemHostRegister_v2(addr, n, CU_MEMHOSTREGISTER_PORTABLE))
+    finally:
+        # Drop the ctypes export and the view even on failure, so a traceback
+        # that references this frame cannot keep the owner's mapping exported.
+        arr = None
+        mv.release()
     return HostRegistration(addr, None)

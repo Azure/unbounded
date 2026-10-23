@@ -59,10 +59,12 @@ class HostBuffer:
             self._pinned.close()
             self._pinned = None
         if self._fd >= 0:
-            self.view.release()
-            self._map.close()
-            os.close(self._fd)
-            self._fd = -1
+            fd, self._fd = self._fd, -1
+            try:
+                self.view.release()
+                self._map.close()
+            finally:
+                os.close(fd)
 
     def __enter__(self) -> "HostBuffer":
         return self
