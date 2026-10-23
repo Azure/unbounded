@@ -206,35 +206,8 @@ pub struct SeatCaller {
     pub expires: u64,
 }
 
-impl SeatCaller {
-    /// Reauthorize without API calls, for example after a long poll: the
-    /// token has not expired, this process is still primary, and the same Pod
-    /// name and UID still hold a live seat.
-    #[allow(
-        dead_code,
-        reason = "the replica route adopts this when server.rs is integrated; remove then"
-    )]
-    pub fn still_authorized(&self, shared: &Shared, now: u64) -> Result<(), ProtocolFailure> {
-        if self.expires <= now {
-            return Err(ProtocolFailure::Unauthenticated);
-        }
-        if !shared.is_primary.get() {
-            return Err(ProtocolFailure::Unavailable);
-        }
-        if !shared
-            .seat_holders
-            .borrow()
-            .values()
-            .any(|h| h.pod_uid == self.pod_uid && h.pod_name == self.pod_name)
-        {
-            return Err(ProtocolFailure::Forbidden);
-        }
-        Ok(())
-    }
-}
-
 /// Authorize a seat holder calling the primary's replica endpoint and return
-/// its identity for [`SeatCaller::still_authorized`].
+/// its identity.
 pub async fn authorize_seat_caller(
     shared: &Shared,
     header: Option<&str>,
@@ -450,23 +423,6 @@ pub(crate) mod tests {
                 ("p", "pu", 1000)
             );
             assert_eq!(authorize_seat(&shared, Some(&header), 1).await, Ok(1000));
-            assert_eq!(c.still_authorized(&shared, 999), Ok(()));
-            assert_eq!(
-                c.still_authorized(&shared, 1000),
-                Err(ProtocolFailure::Unauthenticated)
-            );
-            // Seat taken over by a new Pod with the same name.
-            shared.seat_holders.borrow_mut().insert(1, holder("pu2"));
-            assert_eq!(
-                c.still_authorized(&shared, 2),
-                Err(ProtocolFailure::Forbidden)
-            );
-            shared.seat_holders.borrow_mut().insert(1, holder("pu"));
-            shared.is_primary.set(false);
-            assert_eq!(
-                c.still_authorized(&shared, 2),
-                Err(ProtocolFailure::Unavailable)
-            );
         });
     }
 }
