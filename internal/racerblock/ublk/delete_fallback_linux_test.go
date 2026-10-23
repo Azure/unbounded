@@ -57,15 +57,18 @@ func withoutDelDevAsync(t *testing.T) {
 
 // pinnedDelRecord is what teardown saw when its pinned DEL_DEV returned.
 type pinnedDelRecord struct {
-	calls  int
-	err    error
+	calls int
+	err   error
+	// rdev is the char device number seen while the device was running.
+	rdev   uint64
 	fdOpen bool
 	sameID bool
 }
 
 // recordPinnedDel checks, at the moment the pinned DEL_DEV returns, that
-// the char device fd is still open and still refers to this device's char
-// device, so the id stayed pinned for the whole DEL_DEV.
+// the char device fd is still open and still refers to the same char
+// device number recorded by pin, so the id stayed pinned for the whole
+// DEL_DEV.
 func recordPinnedDel(t *testing.T) *pinnedDelRecord {
 	t.Helper()
 
@@ -77,14 +80,31 @@ func recordPinnedDel(t *testing.T) *pinnedDelRecord {
 		var st unix.Stat_t
 
 		rec.fdOpen = d.charFd >= 0 && unix.Fstat(d.charFd, &st) == nil
-		// The node is gone after removal; compare the device number
-		// with the char major and the minor, which is the id.
-		rec.sameID = rec.fdOpen && st.Mode&unix.S_IFMT == unix.S_IFCHR && int(unix.Minor(st.Rdev)) == d.ID()
+		// The node is gone after removal, so compare the fd's full
+		// device number (major and minor) with the one pin recorded.
+		rec.sameID = rec.fdOpen && st.Mode&unix.S_IFMT == unix.S_IFCHR && rec.rdev != 0 && st.Rdev == rec.rdev
 	}
 
 	t.Cleanup(func() { testHooks.pinnedDelDone = nil })
 
 	return rec
+}
+
+// pin records the running device's char device number, whose minor must
+// be the device id.
+func (r *pinnedDelRecord) pin(t *testing.T, d *Device) {
+	t.Helper()
+
+	var st unix.Stat_t
+	if err := unix.Fstat(d.charFd, &st); err != nil {
+		t.Fatalf("fstat char device: %v", err)
+	}
+
+	if st.Mode&unix.S_IFMT != unix.S_IFCHR || int(unix.Minor(st.Rdev)) != d.ID() {
+		t.Fatalf("char fd is not /dev/ublkc%d: mode %#o rdev %#x", d.ID(), st.Mode, st.Rdev)
+	}
+
+	r.rdev = st.Rdev
 }
 
 func (r *pinnedDelRecord) check(t *testing.T) {
@@ -135,6 +155,7 @@ func TestIntegrationDeleteFallbackClose(t *testing.T) {
 
 	rec := recordPinnedDel(t)
 	d, logs := startFallbackDevice(t)
+	rec.pin(t, d)
 
 	select {
 	case <-d.Done():
@@ -179,6 +200,7 @@ func TestIntegrationDeleteFallbackExternalStop(t *testing.T) {
 
 	rec := recordPinnedDel(t)
 	d, logs := startFallbackDevice(t)
+	rec.pin(t, d)
 
 	c, err := openCtrl()
 	if err != nil {
@@ -211,6 +233,7 @@ func TestIntegrationDeleteFallbackCancelFirst(t *testing.T) {
 
 	rec := recordPinnedDel(t)
 	d, logs := startFallbackDevice(t)
+	rec.pin(t, d)
 
 	if err := closeWithin(d, 30*time.Second); err != nil {
 		t.Fatal(err)
@@ -231,6 +254,7 @@ func TestIntegrationDeleteFallbackExternalDelete(t *testing.T) {
 
 	rec := recordPinnedDel(t)
 	d, logs := startFallbackDevice(t)
+	rec.pin(t, d)
 
 	delErr := make(chan error, 1)
 
