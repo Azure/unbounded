@@ -1196,9 +1196,12 @@ impl Expiry {
         {
             self.checkpoints.push_back((now, plaintext, ciphertext));
             // Each new checkpoint may move the cutoff: start a fresh pass that
-            // also revisits entries that were busy last time.
-            self.plaintext = Some(0);
-            self.ciphertext = Some(0);
+            // also revisits entries that were busy last time. An unfinished
+            // pass keeps its cursor so a long busy prefix cannot starve later
+            // entries; it adopts the newer cutoff, which is safe because a
+            // touched entry moves to a tick above every aged checkpoint.
+            self.plaintext.get_or_insert(0);
+            self.ciphertext.get_or_insert(0);
         }
         let old = |at: &std::time::Instant| now.saturating_duration_since(*at) >= CACHE_IDLE_TTL;
         while self.checkpoints.get(1).is_some_and(|(at, _, _)| old(at)) {
@@ -2042,6 +2045,45 @@ pub(crate) mod tests {
                 assert_eq!(cache.expiry.borrow().ciphertext, None);
                 assert_eq!(cache.entries.borrow().len(), 0);
                 assert_eq!(cache.ciphertext_entries.borrow().len(), 0);
+            }
+
+            #[test]
+            fn expire_idle_resumes_past_busy_prefix_across_checkpoints() {
+                let busy = CACHE_EXPIRY_BATCH + 1;
+                let idle = 3;
+                let admission = admission((busy + idle) * 2 + 8);
+                let cache = MemoryCache::new(
+                    BufferPool::new(admission.clone()),
+                    crate::test_support::availability(),
+                );
+                let mut held = Vec::new();
+                for n in 0..busy {
+                    let page = publish(&cache, &admission, &format!("p{n:03}"));
+                    let cipher = publish_ciphertext(&cache, &admission, &format!("c{n:03}"));
+                    held.push(cache.entries.borrow().pages[&page].1.ciphertext.clone());
+                    held.push(
+                        cache.ciphertext_entries.borrow()[&cipher]
+                            .copy
+                            .ciphertext
+                            .clone(),
+                    );
+                }
+                for n in busy..busy + idle {
+                    publish(&cache, &admission, &format!("p{n:03}"));
+                    publish_ciphertext(&cache, &admission, &format!("c{n:03}"));
+                }
+                let start = std::time::Instant::now();
+                assert_eq!(cache.expire_idle(start), 0);
+                // One call per checkpoint: each call starts a new interval.
+                let mut released = 0;
+                for step in 0..4u32 {
+                    released +=
+                        cache.expire_idle(start + CACHE_IDLE_TTL + CACHE_EXPIRY_CHECKPOINT * step);
+                }
+                assert_eq!(released, idle * 2);
+                assert_eq!(cache.entries.borrow().len(), busy);
+                assert_eq!(cache.ciphertext_entries.borrow().len(), busy);
+                drop(held);
             }
 
             #[test]
