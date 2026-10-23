@@ -796,3 +796,33 @@ fn rdma_link_request_and_response_roundtrip_and_reject_substitution() {
     let signed = n[0].sign(extra).unwrap();
     assert!(RdmaLink::verify(&n[1], None, signed, false).is_err());
 }
+
+#[test]
+fn route_state_accepts_eight_links_and_rejects_nine() {
+    use crate::forwarding::RouteState;
+    let route = |links: u64, visited: usize| {
+        let mut h = head();
+        push(&mut h, "racer-route-membership", 1);
+        push_binary(&mut h, "racer-route-request", &[1; 16]);
+        push_binary(&mut h, "racer-route-attempt", &[2; 16]);
+        push(&mut h, "racer-route-destination", node(20).0);
+        let nodes_list: Vec<_> = (0..visited).map(node).collect();
+        push(&mut h, "racer-route-visited", nodes(&nodes_list).unwrap());
+        push(&mut h, "racer-route-links", links);
+        push(&mut h, "racer-route-attempts", 1);
+        push(&mut h, "racer-route-deadline", 100);
+        RouteState::from_head(&h)
+    };
+    // Eight links: the origin alone in `visited` with eight to spend, or eight
+    // nodes already visited with the final link left.
+    assert!(route(8, 1).is_ok());
+    assert!(route(1, 8).is_ok());
+    // Nine links, however split, and links beyond the per-route cap.
+    for (links, visited) in [(9, 1), (8, 2), (1, 9), (2, 8)] {
+        assert_eq!(
+            route(links, visited).err(),
+            Some(Error::HopBudgetExhausted),
+            "{links} links, {visited} visited"
+        );
+    }
+}

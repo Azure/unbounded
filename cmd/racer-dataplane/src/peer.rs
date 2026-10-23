@@ -286,15 +286,11 @@ pub(crate) fn search_budget(
     route: &crate::topology::RouteBudget,
     local: &NodeId,
 ) -> Result<crate::topology::RouteBudget> {
+    let (keep, remaining_links) =
+        racer_core::route::search_budget(&route.visited, route.remaining_links, local)?;
     let mut budget = route.clone();
-    if budget.visited.last() == Some(local) {
-        budget.visited.pop();
-    } else {
-        budget.remaining_links = budget
-            .remaining_links
-            .checked_sub(1)
-            .ok_or(Error::HopBudgetExhausted)?;
-    }
+    budget.visited.truncate(keep);
+    budget.remaining_links = remaining_links;
     Ok(budget)
 }
 /// Opaque bounded transit with recorded reverse-path responses, never a page cache.
@@ -363,7 +359,13 @@ impl Relay {
             check_membership(request.request(), &membership)?;
             let network = &self.network;
             let budget = &request.request().route;
-            if budget.destination == network.local || budget.visited.contains(&network.local) {
+            let remaining_links = racer_core::route::relay(
+                &budget.visited,
+                &budget.destination,
+                budget.remaining_links,
+                &network.local,
+            );
+            if remaining_links == Err(racer_core::route::RouteFault::Invalid) {
                 return Err(Error::InvalidRequest);
             }
             let reservation = match relay.as_ref() {
@@ -385,10 +387,7 @@ impl Relay {
             let binding = request.binding().clone();
             let mut visited = budget.visited.clone();
             visited.push(network.local.clone());
-            let remaining_links = budget
-                .remaining_links
-                .checked_sub(1)
-                .ok_or(Error::HopBudgetExhausted)?;
+            let remaining_links = remaining_links?;
             let outbound_budget = crate::topology::RouteBudget {
                 membership: budget.membership,
                 request: budget.request,

@@ -1161,7 +1161,7 @@ fn route(head: &MessageHead) -> Result<RouteBudget> {
         .try_into()
         .map_err(|_| Error::InvalidRequest)?;
     let visited = decode_nodes(field(head, "racer-route-visited")?.as_bytes())?;
-    if remaining_links as usize + visited.len() > 9 {
+    if !racer_core::route::within_wire(visited.len(), u64::from(remaining_links)) {
         return Err(Error::HopBudgetExhausted);
     }
     Ok(RouteBudget {

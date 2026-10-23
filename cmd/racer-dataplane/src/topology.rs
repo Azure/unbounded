@@ -503,21 +503,34 @@ pub struct RouteBudget {
     pub remaining_attempts: u32,
     pub deadline: Deadline,
 }
+impl From<racer_core::route::RouteFault> for Error {
+    fn from(fault: racer_core::route::RouteFault) -> Self {
+        use racer_core::route::RouteFault;
+        match fault {
+            RouteFault::DeadlineExceeded => Self::DeadlineExceeded,
+            RouteFault::HopBudgetExhausted => Self::HopBudgetExhausted,
+            RouteFault::Invalid => Self::InvalidRequest,
+        }
+    }
+}
 pub const NORMAL_LINKS: u8 = 4;
 pub const FAILURE_LINKS: u8 = 8;
 impl RouteBudget {
-    /// `visited` contains prior senders, excluding the current recipient.
+    /// Search form: `visited` contains prior senders, excluding `from`. See
+    /// `racer_core::route` for the wire form the origin signs.
     pub fn forwarded(&self, from: &NodeId, next: &NodeId) -> Result<Self> {
-        self.validate_at(from, uring_runtime::environment::now())?;
-        if self.remaining_links == 0 {
-            return Err(Error::HopBudgetExhausted);
-        }
-        if next == from || self.visited.contains(next) {
-            return Err(Error::InvalidRequest);
-        }
+        let remaining_links = racer_core::route::forward(
+            &self.visited,
+            from,
+            next,
+            &self.destination,
+            self.remaining_links,
+            self.deadline.0,
+            uring_runtime::environment::now(),
+        )?;
         let mut forwarded = self.clone();
         forwarded.visited.push(from.clone());
-        forwarded.remaining_links -= 1;
+        forwarded.remaining_links = remaining_links;
         Ok(forwarded)
     }
     /// Authentication verifies this monotonic relationship between signed hops.
@@ -537,25 +550,15 @@ impl RouteBudget {
         forwarded.validate_at(next, uring_runtime::environment::now())
     }
     fn validate_at(&self, from: &NodeId, now: Instant) -> Result<()> {
-        if now >= self.deadline.0 {
-            return Err(Error::DeadlineExceeded);
-        }
-        if self.visited.len() > usize::from(FAILURE_LINKS)
-            || self.visited.len() + usize::from(self.remaining_links) > usize::from(FAILURE_LINKS)
-        {
-            return Err(Error::HopBudgetExhausted);
-        }
-        if self.visited.contains(from)
-            || self.visited.contains(&self.destination)
-            || self
-                .visited
-                .iter()
-                .enumerate()
-                .any(|(i, node)| self.visited[..i].contains(node))
-        {
-            return Err(Error::InvalidRequest);
-        }
-        Ok(())
+        racer_core::route::validate(
+            &self.visited,
+            from,
+            &self.destination,
+            self.remaining_links,
+            self.deadline.0,
+            now,
+        )
+        .map_err(Into::into)
     }
 }
 

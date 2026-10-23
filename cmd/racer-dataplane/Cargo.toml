@@ -34,6 +34,7 @@ wire-codec = { path = "wire-codec", features = ["rest"] }
 racer-control-wire = { path = "control-wire" }
 racer-cluster-control = { path = "cluster-control" }
 flow-control = { path = "flow" }
+racer-core = { path = "core" }
 topology = { path = "topology" }
 racer-core = { path = "core" }
 telemetry = { path = "telemetry" }

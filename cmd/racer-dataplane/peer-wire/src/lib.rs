@@ -501,8 +501,8 @@ fn decode_chain(mut bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
 pub const VERSION: &str = "1";
 /// Current exchange target.
 pub const REQUEST_TARGET: &str = "/racer/peer/v1/exchange";
-/// Maximum carried hop count.
-pub const MAX_HOPS: usize = 8;
+/// Maximum carried hop count (links on one route), shared with `racer_core::route`.
+pub const MAX_HOPS: usize = racer_core::route::MAX_LINKS as usize;
 /// Maximum retained signed HTTP head.
 pub const MAX_SIGNED_HEAD: usize = MAX_HEAD;
 /// Maximum expanded envelope and its outer authentication head.

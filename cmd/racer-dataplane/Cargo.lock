@@ -710,6 +710,7 @@ dependencies = [
  "base64",
  "http1",
  "racer-control-wire",
+ "racer-core",
  "racer-crypto",
  "racer-object-wire",
  "sha2",
