@@ -7,8 +7,11 @@
 pub mod budget;
 pub mod candidates;
 pub mod error;
+pub mod fill;
+pub mod flight;
 pub mod policy;
 pub mod response;
+pub mod serve;
 pub mod walk;
 pub mod worker;
 

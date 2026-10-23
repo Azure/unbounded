@@ -89,6 +89,7 @@ fn host_descriptor(
     descriptor.as_fd().try_clone_to_owned().ok()
 }
 
+use racer_core::read::fill::LeaderSource;
 pub(super) use racer_core::read::policy::optional_headroom;
 #[derive(Clone)]
 pub struct Fill {
@@ -1431,20 +1432,27 @@ impl Fill {
         use std::future::Future;
 
         let mut shared_local = false;
-        let ready = match self.dependencies.flights.ciphertext_for(&leader)? {
-            Some(ready) => Some(ready),
-            // Cached pages retain only ciphertext. A plaintext acquisition
-            // decrypts it through the shared local plaintext job, so range
-            // probes and warm readers of the same page share one reservation
-            // and one decrypt in either arrival order.
-            None if plaintext
-                && (self.local_plaintext.get(page).is_some()
-                    || self.dependencies.memory.unverified(page)?.is_some()) =>
-            {
+        let retained = self.dependencies.flights.ciphertext_for(&leader)?;
+        // racer-core orders the local sources. Cached pages retain only
+        // ciphertext; a plaintext acquisition decrypts it through the shared
+        // local plaintext job, so range probes and warm readers of the same
+        // page share one reservation and one decrypt in either arrival order.
+        let local_job = || self.local_plaintext.get(page).is_some();
+        let unverified =
+            || -> Result<bool> { Ok(self.dependencies.memory.unverified(page)?.is_some()) };
+        let source = racer_core::read::fill::leader_source(
+            retained.is_some(),
+            plaintext,
+            plaintext && local_job(),
+            plaintext && !local_job() && retained.is_none() && unverified()?,
+        );
+        let ready = match source {
+            LeaderSource::Retained => retained,
+            LeaderSource::SharedLocal => {
                 shared_local = true;
                 None
             }
-            None => {
+            LeaderSource::Cached => {
                 let cached = self.metrics.lookup(
                     LookupTier::Ciphertext,
                     self.dependencies.memory.unverified(page),
@@ -1595,21 +1603,26 @@ impl Fill {
                     }
                     if let AcquiredPage::Ciphertext(copy) = &result {
                         match fill.dependencies.memory.publish_ciphertext(copy.clone()) {
-                            Ok(())
-                            | Err(Error::Overloaded | Error::MissingKey | Error::Unavailable) => {}
+                            Ok(()) => {}
+                            Err(error)
+                                if racer_core::read::Error::try_from(error).is_ok_and(
+                                    racer_core::read::fill::ciphertext_publish_tolerated,
+                                ) => {}
                             Err(error) => return Err(error),
                         }
                     }
                     let _ = flights.publish_acquired(leader, result);
                 }
-                Err(Error::OriginRejected) => {
-                    let _ = flights.fail(leader, AcquisitionFailure::OriginRejected);
-                }
-                Err(Error::OriginForbidden) => {
-                    let _ = flights.fail(leader, AcquisitionFailure::OriginForbidden);
-                }
                 Err(error) => {
-                    let _ = flights.fail(leader, AcquisitionFailure::Terminal(error));
+                    use racer_core::read::fill::FailureKind;
+                    let failure = match racer_core::read::Error::try_from(error)
+                        .map(racer_core::read::fill::acquisition_failure)
+                    {
+                        Ok(FailureKind::OriginRejected) => AcquisitionFailure::OriginRejected,
+                        Ok(FailureKind::OriginForbidden) => AcquisitionFailure::OriginForbidden,
+                        _ => AcquisitionFailure::Terminal(error),
+                    };
+                    let _ = flights.fail(leader, failure);
                 }
             }
             let _ = send.send(owned_budget);

@@ -291,28 +291,58 @@ impl LocalPageService for Coordinator {
                 return Err(Error::Unauthorized);
             }
             let object = match &request.operation {
-                PeerOperation::Subscribe { .. } => return Err(Error::InvalidRequest),
-                PeerOperation::Bootstrap { object, .. } => object,
-                PeerOperation::Page { page, .. } => &page.version.object,
-                PeerOperation::Metadata { object, .. } => object,
-                PeerOperation::Warm { version, .. } => &version.object,
+                PeerOperation::Subscribe { .. } => None,
+                PeerOperation::Bootstrap { object, .. } => Some(object),
+                PeerOperation::Page { page, .. } => Some(&page.version.object),
+                PeerOperation::Metadata { object, .. } => Some(object),
+                PeerOperation::Warm { version, .. } => Some(&version.object),
             };
-            if object != &request.origin.object {
-                return Err(Error::InvalidRequest);
+            let object_matches = object.is_some_and(|object| object == &request.origin.object);
+            use racer_core::read::serve::{ServeAction, ServeFacts, serve_action};
+            let facts = |cache_available| ServeFacts {
+                operation: candidates::operation_kind(&request.operation),
+                copy_only: matches!(
+                    request.operation,
+                    PeerOperation::Bootstrap {
+                        mode: FetchMode::CopyOnly,
+                        ..
+                    } | PeerOperation::Page {
+                        mode: FetchMode::CopyOnly,
+                        ..
+                    } | PeerOperation::Metadata {
+                        mode: FetchMode::CopyOnly,
+                        ..
+                    } | PeerOperation::Subscribe {
+                        mode: FetchMode::CopyOnly,
+                        ..
+                    }
+                ),
+                object_matches,
+                cache_available,
+            };
+            // racer-core dispatches. Malformed requests are rejected before
+            // consulting cache availability.
+            if let ServeAction::Reject(error) = serve_action(facts(true)) {
+                return Err(error.into());
             }
-            if !self
+            let object = object.ok_or(Error::InvalidRequest)?;
+            let cache_available = self
                 .snapshots
                 .current()?
                 .ok_or(Error::Unavailable)?
                 .caches
                 .iter()
                 .any(|c| c.id == object.cache)
-                || !self.availability.metadata(&object.cache)
-            {
+                && self.availability.metadata(&object.cache);
+            let action = serve_action(facts(cache_available));
+            if action == ServeAction::Miss {
                 return Ok(PeerResponse::Miss);
             }
             let mut effective = scope.clone();
-            effective.deadline.0 = effective.deadline.0.min(request.route.deadline.0);
+            effective.deadline.0 = racer_core::read::serve::serve_deadline(
+                effective.deadline.0,
+                request.route.deadline.0,
+            );
             effective.check()?;
             // Copy-only never opens credentials and never invokes acquisition.
             // The ingress lease is still retained while serving those bytes.
@@ -370,6 +400,7 @@ impl LocalPageService for Coordinator {
                         })
                 }
                 operation => {
+                    debug_assert_eq!(action, ServeAction::Acquire);
                     let mut budget = inherited_budget(&request.route, &effective)?;
                     let context = self.open_context(request.origin)?;
                     match operation {

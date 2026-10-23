@@ -755,6 +755,15 @@ impl Flights {
         Ok(())
     }
 
+    /// Bounds shared with the racer-core join gates.
+    fn core_limits(&self) -> racer_core::read::flight::FlightLimits {
+        racer_core::read::flight::FlightLimits {
+            entries: self.limits.entries,
+            waiters_per_flight: self.limits.waiters_per_flight,
+            generations_per_flight: self.limits.generations_per_flight,
+        }
+    }
+
     fn update<T>(&self, f: impl FnOnce(&mut Table, &mut Vec<Waker>) -> T) -> T {
         coalesce::flight::update(&self.table, f)
     }
@@ -849,7 +858,12 @@ impl Flights {
                     gate = crate::telemetry::JoinGate::ExistingFailed;
                     return Err(error);
                 }
-                if entry.waiters.len() >= self.limits.waiters_per_flight {
+                if racer_core::read::flight::waiter_cap_gate(
+                    entry.waiters.len(),
+                    &self.core_limits(),
+                )
+                .is_err()
+                {
                     gate = crate::telemetry::JoinGate::WaiterCap;
                     occupancy = (
                         Some(entry.waiters.len()),
@@ -858,14 +872,12 @@ impl Flights {
                     return Err(Error::Overloaded);
                 }
             }
-            if uring_runtime::environment::now() >= budget.deadline() {
-                return Err(Error::DeadlineExceeded);
-            }
-            if budget.remaining_attempts() == 0
-                && table.get(&page).is_none_or(|e| e.partial.is_none())
-            {
-                return Err(Error::Unavailable);
-            }
+            racer_core::read::flight::join_budget_gate(
+                uring_runtime::environment::now(),
+                budget.deadline(),
+                budget.remaining_attempts(),
+                table.get(&page).is_some_and(|e| e.partial.is_some()),
+            )?;
             let cancellation = scope.cancellation.subscribe()?;
             let (reservation, detail) =
                 crate::admission::capture_rejection(&self.admission, || {
@@ -885,7 +897,9 @@ impl Flights {
                 Error::Overloaded
             })?;
             if !table.contains_key(&page) {
-                if table.len() >= self.limits.entries {
+                if racer_core::read::flight::entry_cap_gate(table.len(), &self.core_limits())
+                    .is_err()
+                {
                     gate = crate::telemetry::JoinGate::EntryCap;
                     occupancy = (Some(table.len()), Some(self.limits.entries));
                     return Err(Error::Overloaded);
