@@ -307,63 +307,20 @@ pub struct PeerRequest {
     pub route: RouteBudget,
 }
 /// Unsigned local result. Transport must sign it against the admitted request.
-pub enum PeerResponse {
-    Selected {
-        metadata: ObjectMetadata,
-        ciphertext: CiphertextPage,
-        grant: super::subscriptions::TransferGrant,
-    },
-    Bootstrap {
-        metadata: ObjectMetadata,
-        page_zero: Option<CiphertextPage>,
-    },
-    Page {
-        metadata: ObjectMetadata,
-        ciphertext: CiphertextPage,
-    },
-    Metadata(ObjectMetadata),
-    Miss,
-    /// Authoritative origin absence, only for fresh metadata Acquire.
-    NotFound,
-    VersionUnavailable,
-    Unavailable,
-    Overloaded,
-    OriginRejected,
-    OriginForbidden,
-    /// Authenticated peer no longer retains the requested routing epoch.
-    StaleMembership,
-    /// Warm holds accepted until this wall-clock time (millisecond precision).
-    Held {
-        until: SystemTime,
-    },
-    /// The requested warm page is published on the owner's disk under its hold.
-    Warmed,
-    /// The warm lease is gone. Unused capacity is freed after the last lease.
-    Released,
-}
-impl PeerResponse {
-    /// Payload-free shape used by racer-core decisions.
-    pub fn kind(&self) -> racer_core::read::candidates::ResponseKind {
-        use racer_core::read::candidates::ResponseKind;
-        match self {
-            Self::Selected { .. } => ResponseKind::Selected,
-            Self::Bootstrap { .. } => ResponseKind::Bootstrap,
-            Self::Page { .. } => ResponseKind::Page,
-            Self::Metadata(_) => ResponseKind::Metadata,
-            Self::Miss => ResponseKind::Miss,
-            Self::NotFound => ResponseKind::NotFound,
-            Self::VersionUnavailable => ResponseKind::VersionUnavailable,
-            Self::Unavailable => ResponseKind::Unavailable,
-            Self::Overloaded => ResponseKind::Overloaded,
-            Self::OriginRejected => ResponseKind::OriginRejected,
-            Self::OriginForbidden => ResponseKind::OriginForbidden,
-            Self::StaleMembership => ResponseKind::StaleMembership,
-            Self::Held { .. } => ResponseKind::Held,
-            Self::Warmed => ResponseKind::Warmed,
-            Self::Released => ResponseKind::Released,
-        }
+/// The payload-generic shape and its `kind` live in racer-core.
+pub type PeerResponse =
+    racer_core::read::response::PeerResponse<CiphertextPage, super::subscriptions::TransferGrant>;
+
+impl racer_core::read::response::Payload for CiphertextPage {
+    fn len(&self) -> usize {
+        self.bytes().len()
+    }
+
+    fn page_id(&self) -> &PageId {
+        &self.envelope().page
     }
 }
+
 /// Owned, unverified wire input/output. The original and all forwarding signatures
 /// travel with the operation, including opaque encrypted origin credentials.
 /// Verification must check that the operation and effective route agree with the
