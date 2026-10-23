@@ -462,20 +462,9 @@ impl StoreWriter {
     }
     /// Sample per-cache resident bytes and fair shares for published caches.
     pub(crate) fn observe_cache_disks(&self, caches: &[racer_control_wire::CacheDefinition]) {
-        let samples = self
-            .retention()
-            .cache_disk(self.index.disk_capacity())
-            .into_iter()
-            .filter_map(|usage| {
-                let cache = caches.iter().find(|cache| cache.id == usage.cache)?;
-                Some(crate::telemetry::CacheDiskUsage {
-                    cache: cache.name.as_str().into(),
-                    resident: usage.resident_bytes,
-                    share: usage.share_bytes,
-                })
-            })
-            .collect();
-        self.metrics.observe_cache_disks(samples);
+        let usage = self.retention().cache_disk(self.index.disk_capacity());
+        self.metrics
+            .observe_cache_disks(cache_disk_samples(caches, usage));
     }
     /// Whether optional pages of `cache` should skip disk admission: the cache
     /// is over its fair share and no free segment remains beyond the reserve.
@@ -1811,5 +1800,30 @@ impl<'a> Decoder<'a> {
     }
 }
 
+/// Label per-cache disk usage with published cache names.
+///
+/// Builds one id-to-name map per sample so the join stays linear in the
+/// catalog size and the usage list. Usage for caches that are no longer
+/// published is dropped.
+fn cache_disk_samples(
+    caches: &[racer_control_wire::CacheDefinition],
+    usage: Vec<crate::retention::CacheDisk>,
+) -> Vec<crate::telemetry::CacheDiskUsage> {
+    let names: std::collections::HashMap<&CacheId, &str> = caches
+        .iter()
+        .map(|cache| (&cache.id, cache.name.as_str()))
+        .collect();
+    usage
+        .into_iter()
+        .filter_map(|usage| {
+            let name = names.get(&usage.cache)?;
+            Some(crate::telemetry::CacheDiskUsage {
+                cache: (*name).into(),
+                resident: usage.resident_bytes,
+                share: usage.share_bytes,
+            })
+        })
+        .collect()
+}
 #[cfg(test)]
 mod tests;

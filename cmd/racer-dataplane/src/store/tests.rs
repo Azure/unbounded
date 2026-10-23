@@ -5189,3 +5189,79 @@ fn optional_admission_pressure_requires_over_share_and_reserved_free_segments() 
     assert!(writer.over_share_under_pressure(&over));
     assert!(!writer.over_share_under_pressure(&under));
 }
+
+fn cache_definition(id: &str, name: &str) -> racer_control_wire::CacheDefinition {
+    racer_control_wire::CacheDefinition {
+        id: CacheId(id.into()),
+        name: name.into(),
+        client_socket: "/c".into(),
+        origin_socket: "/o".into(),
+        priority: 1,
+    }
+}
+
+fn cache_disk(id: &str, resident: u64, share: u64) -> crate::retention::CacheDisk {
+    crate::retention::CacheDisk {
+        cache: CacheId(id.into()),
+        resident_bytes: resident,
+        share_bytes: share,
+    }
+}
+
+#[test]
+fn cache_disk_samples_label_by_name_and_drop_unpublished_caches() {
+    let caches = [
+        cache_definition("uid-b", "logs"),
+        cache_definition("uid-a", "models"),
+        cache_definition("uid-c", "empty"),
+    ];
+    let samples = super::cache_disk_samples(
+        &caches,
+        vec![
+            cache_disk("uid-a", 900, 800),
+            cache_disk("uid-b", 50, 200),
+            cache_disk("uid-c", 0, 300),
+            cache_disk("uid-removed", 70, 0),
+        ],
+    );
+    let got: Vec<_> = samples
+        .iter()
+        .map(|s| (s.cache.to_string(), s.resident, s.share))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("models".to_string(), 900, 800),
+            ("logs".to_string(), 50, 200),
+            ("empty".to_string(), 0, 300),
+        ]
+    );
+}
+
+#[test]
+fn cache_disk_samples_handle_empty_inputs() {
+    assert!(super::cache_disk_samples(&[], vec![cache_disk("uid-a", 1, 2)]).is_empty());
+    assert!(super::cache_disk_samples(&[cache_definition("uid-a", "a")], vec![]).is_empty());
+}
+
+#[test]
+fn cache_disk_samples_scale_to_large_catalogs() {
+    // A linear catalog search per sample would make 50 million id compares
+    // here; the map join keeps this to one pass over each input.
+    const CACHES: usize = 10_000;
+    let caches: Vec<_> = (0..CACHES)
+        .map(|i| cache_definition(&format!("uid-{i:05}"), &format!("cache-{i}")))
+        .collect();
+    let usage: Vec<_> = (0..CACHES)
+        .rev()
+        .map(|i| cache_disk(&format!("uid-{i:05}"), i as u64, 1))
+        .collect();
+    let started = std::time::Instant::now();
+    let samples = super::cache_disk_samples(&caches, usage);
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert_eq!(samples.len(), CACHES);
+    for (sample, i) in samples.iter().zip((0..CACHES).rev()) {
+        assert_eq!(&*sample.cache, format!("cache-{i}"));
+        assert_eq!(sample.resident, i as u64);
+    }
+}
