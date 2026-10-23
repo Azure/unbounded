@@ -141,7 +141,7 @@ fn failure_and_retry_semantics() {
 }
 
 #[test]
-fn cancelled_leader_is_revoked_and_follower_takes_over() {
+fn canceled_leader_is_revoked_and_follower_takes_over() {
     let now = Instant::now();
     let deadline = now + Duration::from_secs(10);
     let mut t = table(FlightLimits::default(), now);

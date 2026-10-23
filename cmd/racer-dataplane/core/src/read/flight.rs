@@ -310,7 +310,7 @@ impl<C: Clone, P: Clone, O, S: BuildHasher> PageFlights<C, P, O, S> {
         Ok(())
     }
 
-    /// Cancel waiter `id`; a cancelled leader is revoked on the next refresh.
+    /// Cancel waiter `id`; a canceled leader is revoked on the next refresh.
     pub fn cancel(&mut self, page: &PageId, id: u64, wakes: &mut Vec<Token>) {
         if let Some(flight) = self.flights.get_mut(page) {
             flight.state.cancel(id, Error::Cancelled);

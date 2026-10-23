@@ -313,3 +313,61 @@ simulated seconds takes about 66 s in release, dominated by `plan_pass` at 50k m
   `cancel_work`, `cancel_waiter`, or `release`.
 - Clocks: `LinkHealth::acquire_at` and `AdaptivePeers::with_clock` take time explicitly; the existing
   constructors and methods pass the runtime clock.
+
+## Read path in racer-core
+
+`racer_core::read` holds the read-path decisions. The dataplane calls them; there is no second
+copy of these rules.
+
+- `budget`: `AcquisitionBudget` (re-exported as `racer_dataplane::read::flight::AcquisitionBudget`)
+  and `inherited_budget`. It returns `racer_core::read::Error`. The dataplane converts it with `?`
+  (`From`), and `TryFrom<dataplane Error>` goes the other way. Some tests compare results directly,
+  so they now expect the core error.
+- `candidates`: `visit_order`, `replica_score`, and `ProbeOutcome`. `classify` works on a
+  payload-free `ResponseKind`/`OperationKind` and calls back to validate the payload. Also
+  `origin_miss_error` and `validate_origin_authority`.
+- `walk`: `CandidateWalk` is the sans-IO walk for one membership epoch (visit order, copy-only
+  rule, funded and partitioned routes, evidence, `End`). `RemainingWalk` is the walk after a 412.
+  `plan_attempt` holds the arithmetic from `request_traced`. The module also has the hedge rules
+  (`hedge_eligible`, `hedge_budgets`, `hedge_fallback`), `transport_outcome`, and
+  `refresh_allowed`. Production `resolve_epoch_traced`, `remaining_validated_copy`,
+  `request_traced`, and `hedge_page` drive these.
+- `response`: `PeerResponse<P, G>` is generic over payload and grant, and `Payload` has
+  `PhantomPage` for the simulator. The dataplane's `PeerResponse` is an alias with `CiphertextPage`
+  and `TransferGrant`.
+- `flight`: `PageFlights` is a sans-IO singleflight with `Token` wakes, an admission trait, and a
+  seedable hasher. Its join gates (`join_budget_gate`, `waiter_cap_gate`, `entry_cap_gate`) are the
+  ones production `Flights::join_prepared` uses. Transitions run in
+  `flow_control::coalesce::flight::state::State`. That type is now generic over its wake target
+  (default `Waker`), so production and the simulator share the engine.
+- `fill`: the `FillPlan` state machine (local, hedge, walk, origin, remaining copy, publish).
+  Production uses `leader_source`, `acquisition_failure`, and `ciphertext_publish_tolerated`.
+- `serve`: `serve_action` and `serve_deadline` from `Coordinator::serve_peer`. `policy` has
+  `peer_error`, `recoverable`, `optional_headroom`, the retention eligibility and score rules, and
+  `persist`.
+- `metadata`: the sans-IO `MetadataCohorts` (`MAX_WAITERS`, `MAX_REFRESH_ATTEMPTS`),
+  `RefreshPurpose`, and `refresh_settlement`. `range`: `direct_fills`, `may_select`, `share`,
+  `selection_demand`, `PageBudget`, `DIRECT_AHEAD`, and `SELECTIONS`.
+- `worker`: `WorkerMap::select`.
+
+Phase 0 changes outside racer-core:
+
+- `RequestScope` has `check_at`, `candidate_progress_at`, and `candidate_body_progress_at`.
+- `Retention` has `observe_at`, `track_at`, `touch_at`, `score_at`, `configured_at`, and
+  `snapshot_at`.
+- `flow_control::Adaptive<K, O, C: Clock = fn() -> Instant>` adds `with_clock`.
+- `SecondSight<S>` and `Heat<K, S>` have `with_hasher` constructors.
+
+Three production paths did not move fully onto a state machine. The async code has too many
+resource fences (driver permits, quota charges, oneshot handoffs) to drive from a plain step
+function. For each, the sans-IO version has its own tests, and production calls the shared rules:
+
+- Production `Flights` keeps its async table and calls the core gates and the shared `State`.
+- Production `Fill` calls the `fill` helpers rather than driving `FillPlan`.
+- Production `MetadataService` keeps `flow_control::coalesce::Table` and uses the core constants
+  and `refresh_settlement`. `MetadataCohorts` reproduces the `coalesce::Table` election rules,
+  with a deterministic wake order.
+
+`request_traced` now reserves remote credits (`plan_attempt`) before it builds the attempt scope,
+where it used to reserve them after. These can only fail in different order if `Cancellation::new`
+fails.
