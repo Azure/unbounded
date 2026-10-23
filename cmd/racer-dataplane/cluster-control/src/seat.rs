@@ -37,6 +37,13 @@ pub const FOLLOW_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_COLD_WINDOW: u64 = 600;
 
 impl PrimaryView {
+    /// Whether `node` holds a seat that is kept. A seat at or beyond
+    /// `desired` is being shrunk away (possibly ours, just released), so it
+    /// does not make the Node seated.
+    pub fn node_seated(&self, node: &str) -> bool {
+        self.seat_nodes.iter().take(self.desired).any(|n| n == node)
+    }
+
     /// Whether the primary Lease looks held and renewed.
     pub fn live(&self, changed_at: Option<Instant>, now: Instant) -> bool {
         self.holder.is_some()
@@ -351,11 +358,7 @@ pub async fn lottery(shared: Rc<Shared>, primary_changed: Rc<RefCell<(String, Op
         let view = shared.primary.borrow().clone();
         let live = view.live(primary_changed.borrow().1, now);
         let (candidates, window) = if live {
-            if view
-                .seat_nodes
-                .iter()
-                .any(|n| *n == shared.config.node_name)
-            {
+            if view.node_seated(&shared.config.node_name) {
                 (Vec::new(), 0)
             } else {
                 let v: Vec<usize> = (0..view.desired)
@@ -475,10 +478,24 @@ pub fn serving_rotation_due(identity: &ServingIdentity, index: usize, now: Syste
     identity.not_after < now + remaining
 }
 
+/// Whether the ready annotation in `object` differs from what this seat would
+/// write now.
+fn ready_changed(shared: &Shared, seat: &Seat, object: &serde_json::Value) -> bool {
+    let written = lease::observe(object)
+        .annotations
+        .get(annotations::READY)
+        .cloned();
+    my_seat_annotations(shared, seat)
+        .remove(annotations::READY)
+        .flatten()
+        != written
+}
+
 /// Renew the seat Lease until it is lost, shrunk away, or the runtime stops.
 pub async fn seat_task(shared: Rc<Shared>, seat: Rc<Seat>, mut object: serde_json::Value) {
     let ns = shared.config.namespace.clone();
     let mut next = Instant::now() + limits::LEASE_RENEW;
+    let mut last_put = Instant::now();
     loop {
         let generation = shared.changed.generation();
         let _ = exec::deadline(next, shared.changed.changed(generation)).await;
@@ -513,14 +530,22 @@ pub async fn seat_task(shared: Rc<Shared>, seat: Rc<Seat>, mut object: serde_jso
             return;
         }
         if now < next {
-            // Woken by a change; refresh annotations only at renew time.
-            continue;
+            // Woken by a change; refresh annotations only at renew time,
+            // except readiness, which the primary needs to publish us. That
+            // is written early, at most once a second so failures cannot spin.
+            if ready_changed(&shared, &seat, &object) {
+                next = next.min(last_put + Duration::from_secs(1));
+            }
+            if now < next {
+                continue;
+            }
         }
         rotate(&shared, &seat);
         let obs = lease::observe(&object);
         let spec = election::renew(&obs.spec, &election::now_micro());
         let body = lease::with(&object, &spec, &my_seat_annotations(&shared, &seat));
         let started = Instant::now();
+        last_put = started;
         match exec::timeout(
             limits::LEASE_RENEW,
             lease::put(&shared.lease_api, &ns, &body),
@@ -853,6 +878,21 @@ mod tests {
             election::seat_to_claim(&views, 3, "other-node", "new-pod/nonce"),
             None
         );
+    }
+
+    #[test]
+    fn node_seated_ignores_seats_being_shrunk_away() {
+        let view = PrimaryView {
+            desired: 2,
+            seat_nodes: vec!["a".into(), String::new(), "b".into()],
+            ..Default::default()
+        };
+        assert!(view.node_seated("a"));
+        // Seat 2 is beyond desired: its Node may claim a kept seat.
+        assert!(!view.node_seated("b"));
+        assert!(!view.node_seated("c"));
+        let none = PrimaryView { desired: 0, ..view };
+        assert!(!none.node_seated("a"));
     }
 
     #[test]
