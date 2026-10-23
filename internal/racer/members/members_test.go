@@ -172,6 +172,11 @@ func assertWorkloadVolumes(t *testing.T, pod corev1.PodSpec, cfg Config) {
 		t.Fatal("private keys share disposable storage")
 	}
 
+	wantUdev := &corev1.HostPathVolumeSource{Path: "/run/udev", Type: ptr.To(corev1.HostPathDirectoryOrCreate)}
+	if !reflect.DeepEqual(volumes["udev"].HostPath, wantUdev) {
+		t.Fatal("cuFile needs the host udev database")
+	}
+
 	wantDevices := &corev1.HostPathVolumeSource{Path: "/dev", Type: ptr.To(corev1.HostPathDirectory)}
 	if !reflect.DeepEqual(volumes["devices"].HostPath, wantDevices) {
 		t.Fatal("block device discovery requires the existing host /dev directory")
@@ -201,9 +206,10 @@ func assertWorkloadMounts(t *testing.T, container corev1.Container) {
 		"sockets":    {Name: "sockets", MountPath: "/run/racer"},
 		"infiniband": {Name: "infiniband", MountPath: "/dev/infiniband", ReadOnly: true},
 		"devices":    {Name: "devices", MountPath: "/host/dev", ReadOnly: true},
+		"udev":       {Name: "udev", MountPath: "/run/udev", ReadOnly: true},
 	}
 	if !reflect.DeepEqual(mounts, wantMounts) {
-		t.Fatal("mounts must retain token, controller trust, private identity, slabs, sockets, RDMA devices and host devices only")
+		t.Fatal("mounts must retain token, controller trust, private identity, slabs, sockets, RDMA devices, host devices and udev only")
 	}
 }
 
@@ -252,7 +258,7 @@ func TestWorkloadNativeRDMAAccess(t *testing.T) {
 				Path: "/dev/infiniband", Type: ptr.To(corev1.HostPathDirectoryOrCreate),
 			}}}
 
-			if len(pod.Volumes) != 7 {
+			if len(pod.Volumes) != 8 {
 				t.Fatalf("unexpected volumes: %v", pod.Volumes)
 			}
 

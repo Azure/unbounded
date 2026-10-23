@@ -364,11 +364,32 @@ func dataplaneVolumes(c Config) []corev1.Volume {
 		volumes = append(volumes, corev1.Volume{Name: mount.name, VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: mount.path, Type: ptr.To(corev1.HostPathDirectoryOrCreate)}}})
 	}
 
+	// cuFile reads the filesystem type of each slab device from the udev
+	// database and refuses files it cannot classify.
+	if c.nvidiaMode() != NVIDIAOff {
+		volumes = append(volumes, corev1.Volume{Name: "udev", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/run/udev", Type: ptr.To(corev1.HostPathDirectoryOrCreate)}}})
+	}
+
 	return volumes
 }
 
 func dataplaneContainer(c Config) corev1.Container {
 	diagnosticsPort := diagnosticsPort(c)
+
+	mounts := []corev1.VolumeMount{
+		{Name: "token", MountPath: "/var/run/racer-token", ReadOnly: true},
+		{Name: "bootstrap", MountPath: "/etc/racer/bootstrap", ReadOnly: true},
+		{Name: "identity", MountPath: "/var/lib/racer/identity"},
+		{Name: "slabs", MountPath: "/var/lib/racer/slabs"},
+		{Name: "sockets", MountPath: "/run/racer"},
+		// Protect directory entries, not device I/O or the host
+		// from this privileged container.
+		{Name: "infiniband", MountPath: "/dev/infiniband", ReadOnly: true},
+		{Name: "devices", MountPath: "/host/dev", ReadOnly: true},
+	}
+	if c.nvidiaMode() != NVIDIAOff {
+		mounts = append(mounts, corev1.VolumeMount{Name: "udev", MountPath: "/run/udev", ReadOnly: true})
+	}
 
 	return corev1.Container{
 		Name:                     "dataplane",
@@ -395,17 +416,7 @@ func dataplaneContainer(c Config) corev1.Container {
 			// implies escalation and all capabilities; do not claim otherwise.
 			Privileged: ptr.To(true), AllowPrivilegeEscalation: ptr.To(true), ReadOnlyRootFilesystem: ptr.To(true),
 		},
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: "token", MountPath: "/var/run/racer-token", ReadOnly: true},
-			{Name: "bootstrap", MountPath: "/etc/racer/bootstrap", ReadOnly: true},
-			{Name: "identity", MountPath: "/var/lib/racer/identity"},
-			{Name: "slabs", MountPath: "/var/lib/racer/slabs"},
-			{Name: "sockets", MountPath: "/run/racer"},
-			// Protect directory entries, not device I/O or the host
-			// from this privileged container.
-			{Name: "infiniband", MountPath: "/dev/infiniband", ReadOnly: true},
-			{Name: "devices", MountPath: "/host/dev", ReadOnly: true},
-		},
+		VolumeMounts: mounts,
 	}
 }
 

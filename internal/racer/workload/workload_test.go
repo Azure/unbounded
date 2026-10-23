@@ -86,6 +86,27 @@ func TestNVIDIAInjectionModes(t *testing.T) {
 				t.Fatalf("CDI annotation = %q (present %v), want present %v", value, hasCDI, tc.wantCDI)
 			}
 
+			// cuFile classifies slab devices through the host udev database.
+			hasUdevVolume := false
+
+			for _, volume := range template.Spec.Volumes {
+				if volume.Name == "udev" {
+					hasUdevVolume = volume.HostPath != nil && volume.HostPath.Path == "/run/udev"
+				}
+			}
+
+			hasUdevMount := false
+
+			for _, mount := range container.VolumeMounts {
+				if mount.Name == "udev" {
+					hasUdevMount = mount.MountPath == "/run/udev" && mount.ReadOnly
+				}
+			}
+
+			if hasUdevVolume != tc.wantEnv || hasUdevMount != tc.wantEnv {
+				t.Fatalf("udev volume/mount = %v/%v, want %v", hasUdevVolume, hasUdevMount, tc.wantEnv)
+			}
+
 			// GPU libraries must never come from a GPU resource request.
 			for _, list := range []corev1.ResourceList{container.Resources.Requests, container.Resources.Limits} {
 				if _, ok := list["nvidia.com/gpu"]; ok {

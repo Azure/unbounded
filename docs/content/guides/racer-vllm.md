@@ -34,8 +34,13 @@ podman build --build-arg RACER_NATIVE_CUDA=true \
 
 The CUDA image also installs NVIDIA's cuFile library (`libcufile-12-9`) for
 GPUDirect Storage reads, because the NVIDIA container runtime injects only the
-driver libraries. cuFile uses its packaged default configuration; without
-GPUDirect Storage support on the host, disk reads fall back to host memory.
+driver libraries. cuFile uses its packaged default configuration, except that
+Racer turns off cuFile's compatibility mode: without GPUDirect Storage
+(`nvidia-fs` or PCIe P2PDMA) on the host, disk reads use Racer's own host
+memory path instead of cuFile's slower POSIX fallback. Set
+`CUFILE_ALLOW_COMPAT_MODE=true` on the dataplane to keep cuFile's fallback.
+cuFile reads the filesystem type from udev, so the dataplane mounts the host's
+`/run/udev` read-only.
 
 GPU mode is `auto` by default. To make the dataplane fail when it finds no GPU,
 set it to `true`:
