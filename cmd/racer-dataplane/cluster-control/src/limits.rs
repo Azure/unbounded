@@ -122,8 +122,36 @@ pub const MAX_ADMISSION_BYTES: usize = 3 * 1024 * 1024;
 /// Maximum bearer token length.
 pub const MAX_TOKEN_BYTES: usize = 16 * 1024;
 
-/// Maximum Pod report annotation length.
-pub const MAX_REPORT_BYTES: usize = 4096;
+/// Longest RDMA device name discovery can report: the kernel's
+/// `IB_DEVICE_NAME_MAX` (64) less its NUL terminator. The wire itself does not
+/// bound device names; a longer name only fits while the whole report does.
+pub const MAX_REPORT_DEVICE_BYTES: usize = 63;
+
+/// Largest canonical report for the wire maximum NIC inventory.
+///
+/// The worst case NIC has a device name of [`MAX_REPORT_DEVICE_BYTES`] control
+/// characters, each escaped by JSON as `\u00XX` (6 bytes; other UTF-8 is not
+/// escaped and costs at most its byte length), and every optional and numeric
+/// field at its widest:
+/// `{"device":"..","port":255,"rail":65535,"gid":"<32 hex>","numa_node":4294967295}`.
+/// The report holds the wire maximum of 64 (`normalize_rails`) of them in
+/// `{"shares":4294967295,"rdma_nics":[..]}`.
+pub const MAX_REPORT_INVENTORY_BYTES: usize = {
+    const NIC: usize = r#"{"device":"","port":255,"rail":65535,"gid":"","numa_node":4294967295}"#
+        .len()
+        + MAX_REPORT_DEVICE_BYTES * 6
+        + 32;
+    const RAILS: usize = 64;
+    r#"{"shares":4294967295,"rdma_nics":[]}"#.len() + RAILS * NIC + (RAILS - 1)
+};
+
+/// Maximum Pod report annotation length. It is the inventory bound rounded up
+/// to 32 KiB, well below the 256 KiB Kubernetes limit on all annotations of
+/// an object. `deploy/racer/policies.yaml.tmpl` enforces the same value.
+pub const MAX_REPORT_BYTES: usize = 32 * 1024;
+
+const _: () = assert!(MAX_REPORT_INVENTORY_BYTES <= MAX_REPORT_BYTES);
+const _: () = assert!(MAX_REPORT_BYTES <= 256 * 1024 / 4);
 
 /// Members per seat when seats are automatic.
 pub const MEMBERS_PER_SEAT: usize = 2048;
