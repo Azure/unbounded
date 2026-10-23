@@ -311,3 +311,60 @@ def test_iter_weights_fences_on_exception(server, uri):
     with pytest.raises(RuntimeError):
         gen.throw(RuntimeError("consumer failed"))
     b.assert_fenced()
+
+
+@pytest.mark.parametrize("mode", ["raise", "early"])
+def test_load_weights_closes_iterator_before_client(server, uri, monkeypatch, tmp_path, mode):
+    registry = install_fake_vllm(monkeypatch)
+    loader.register()
+    setup_model(server, uri)
+    model.fetch(uri, str(tmp_path / "m"), client=racer.Client(socket_path=server.path))
+    monkeypatch.setenv("RACER_SOCKET", server.path)
+    monkeypatch.setattr(loader, "TorchBackend", lambda **kw: MemoryBackend())
+    events = []
+    real_iter = loader.iter_weights
+
+    def tracking_iter(*a, **kw):
+        try:
+            yield from real_iter(*a, **kw)
+        finally:
+            events.append("weights closed")
+
+    monkeypatch.setattr(loader, "iter_weights", tracking_iter)
+    real_client_for = loader.client_for
+
+    def tracking_client_for(*a, **kw):
+        c = real_client_for(*a, **kw)
+        inner_exit = c.__exit__
+
+        class Wrap:
+            def __getattr__(self, n):
+                return getattr(c, n)
+
+            def __enter__(self):
+                c.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                events.append("client closed")
+                return inner_exit(*exc)
+
+        return Wrap()
+
+    monkeypatch.setattr(loader, "client_for", tracking_client_for)
+    inst = registry["racer"](types.SimpleNamespace(model_loader_extra_config={"staging_bytes": 400}))
+    mc = types.SimpleNamespace(model=str(tmp_path / "m"), quantization=None)
+
+    class Model:
+        def load_weights(self, weights):
+            next(weights)
+            if mode == "raise":
+                raise RuntimeError("boom")
+            return None
+
+    if mode == "raise":
+        with pytest.raises(RuntimeError, match="boom"):
+            inst.load_weights(Model(), mc)
+    else:
+        inst.load_weights(Model(), mc)
+    assert events == ["weights closed", "client closed"]
