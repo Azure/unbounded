@@ -73,6 +73,13 @@ type queue struct {
 	servingOnce sync.Once
 }
 
+// queueRingEntries is the size of a queue's ring: one io command per tag
+// and the eventfd poll. The queue never has more in flight, which
+// harvestOld relies on.
+func queueRingEntries(depth int) uint32 {
+	return uint32(depth + 1) //nolint:gosec // depth is at most MaxQueueDepth
+}
+
 func newQueue(d *Device, id int) (*queue, error) {
 	cfg := d.cfg
 	q := &queue{
@@ -88,7 +95,7 @@ func newQueue(d *Device, id int) (*queue, error) {
 
 	var err error
 
-	q.ring, err = newURing(uint32(cfg.Depth + 1))
+	q.ring, err = newURing(queueRingEntries(cfg.Depth))
 	if err != nil {
 		return q.failNew(fmt.Errorf("ublk: queue %d ring: %w", id, err))
 	}

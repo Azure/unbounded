@@ -43,41 +43,42 @@ func newRescueRing(q *queue) (*uring, error) {
 	return newURing(rescueRingEntries(q.depth))
 }
 
-// rescue answers every request the queue owns, or will be handed, with
-// EIO through a fresh io_uring, until the queue is stopped. It is used
-// when the queue's ring can no longer answer I/O and a request may
-// already have been handed to this process. It returns nil once the
-// queue was stopped, or an error if the rescue ring could not be set up
-// or stopped working.
+// rescue answers every request the queue owns, or is handed later,
+// with EIO through the queue's spare ring until the queue is stopped.
+// It is used when the queue's own ring can no longer answer I/O and
+// a request may already have been handed to this process. It returns
+// nil once the queue is stopped, or an error if there is no spare
+// ring or the spare ring stops working.
 //
-// Linux 7.0 does not complete a request that was handed to the server
-// when the server's ring is closed (ublk_cancel_cmd skips owned ios,
-// ublk_drv.c v7.0 2662-2700); only releasing the char device aborts it
-// (ublk_ch_release_work_fn 2474-2476). STOP_DEV's del_gendisk waits for
-// it, so without an answer teardown blocks while the char device is
-// open. Committing it from another ring is allowed: COMMIT_AND_FETCH_REQ
-// only requires the calling task to be the one that fetched the tag and
-// the io to be owned by the server (ublk_ch_uring_cmd_local, v7.0
-// 3312-3328, 3342-3357), and Linux 6.8 requires the same daemon task and
-// an io that is not active and is owned (__ublk_ch_uring_cmd, v6.8
-// 1722-1734, 1779-1803). Neither checks which ring the command came from. The queue thread
+// Why it is needed: on Linux 7.0, closing the server's ring does not
+// complete a request already handed to the server. ublk_cancel_cmd
+// skips owned ios (ublk_drv.c v7.0 2662-2700); only releasing the char
+// device aborts them (ublk_ch_release_work_fn, 2474-2476). STOP_DEV's
+// del_gendisk waits for such a request, so without an answer teardown
+// blocks while the char device is open.
+//
+// Why another ring may answer: COMMIT_AND_FETCH_REQ checks only that
+// the caller is the task that fetched the tag and that the server owns
+// the io (ublk_ch_uring_cmd_local, v7.0 3312-3328 and 3342-3357).
+// Linux 6.8 checks the same daemon task and an io that is owned and
+// not active (__ublk_ch_uring_cmd, v6.8 1722-1734 and 1779-1803).
+// Neither checks which ring the command came from. The queue goroutine
 // is locked to its OS thread, so it is that task.
 //
-// The rescue therefore commits EIO for every tag that no handler is
-// serving. The kernel rejects a commit for a tag it did not hand out
-// (-EBUSY or -EINVAL on both versions, same lines) before touching the
-// io, so the
-// sweep needs no record of which tags are owned. Handler results are
-// still committed through drain.
+// The rescue commits EIO for every tag that no handler is serving. For
+// a tag the kernel did not hand out, both versions reject the commit
+// with -EBUSY or -EINVAL before touching the io, so the sweep needs no
+// record of which tags are owned. Handler results are still committed
+// through drain.
 //
 // The replaced ring stays open and is never entered again. Closing it
-// would cancel its commands; on Linux 6.8 that aborts owned requests
-// (ublk_abort_queue, v6.8 1403-1423) but leaves them marked owned, so a
-// later commit would complete an already completed request. Keeping it
-// open also keeps the startup guard in waitSafe intact: no ring is
-// closed before teardown stops the queue. Requests the kernel hands to
-// the old ring's fetch commands are read from its completion queue,
-// which needs no system call, and answered through the rescue ring.
+// would cancel its commands. On Linux 6.8 that aborts owned requests
+// but leaves them marked owned (ublk_abort_queue, v6.8 1403-1423), so
+// a later commit would complete a request twice. Keeping it open also
+// keeps the startup guard in waitSafe intact: no ring is closed before
+// teardown stops the queue. Requests the kernel hands to the old
+// ring's fetch commands are read from its completion queue and
+// answered through the rescue ring; see harvestOld.
 func (q *queue) rescue() error {
 	if testHooks.rescue != nil {
 		if err := testHooks.rescue(q); err != nil {
@@ -198,9 +199,20 @@ func (q *queue) rescue() error {
 }
 
 // harvestOld answers, through the rescue ring, every request the kernel
-// handed to the replaced ring. It only reads the replaced ring's shared
-// completion queue. That queue holds twice as many entries as the ring
-// has commands (IORING_SETUP default), so it cannot overflow.
+// handed to the replaced ring. It only reads that ring's shared
+// completion queue and never enters the ring.
+//
+// That is enough only if the completion queue never overflows: the
+// kernel keeps overflowed completions aside and moves them back on a
+// later io_uring_enter, which the rescue never makes on this ring. The
+// queue has at most one io command per tag that it submitted and has
+// not reaped: fetchAll submits one per tag, and a tag gets its next
+// command only after the queue reaped the previous one's completion
+// (handle and drain in serve, serveEIO). The eventfd poll adds one. So
+// at most depth+1 completions can be waiting, and the ring is set up
+// for queueRingEntries(depth) = depth+1 commands with a completion
+// queue at least that large; TestQueueRingHoldsEveryCompletion checks
+// that. Rescue commits go to the rescue ring, which it does enter.
 func (q *queue) harvestOld(res int32) error {
 	if q.oldRing == nil {
 		return nil
