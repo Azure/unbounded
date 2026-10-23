@@ -31,7 +31,7 @@ const (
 	MaxReasonBytes          = 4 * 1024
 	MaxMeasurementsBytes    = 16 * 1024
 	MaxBackendOutputBytes   = 16 * 1024
-	MaxBackendEvidenceBytes = 256 * 1024
+	MaxBackendEvidenceBytes = 64 * 1024
 	MaxCleanupFailureBytes  = 64
 	maxMPIWorkerReadyWait   = int64(30)
 	maxMPIWorkerSlots       = int64(1<<31 - 1)
@@ -85,6 +85,7 @@ type Config struct {
 	Attempt                int
 	BackoffLimit           int64
 	TTLSeconds             int64
+	BackendEvidenceBytes   int
 }
 
 type Result struct {
@@ -290,6 +291,10 @@ func ValidateConfig(config Config) ([]signalv1.Participant, []corev1.Toleration,
 
 	if config.Attempt < 1 {
 		return nil, nil, nil, errors.New("attempt must be positive")
+	}
+
+	if config.BackendEvidenceBytes < 0 || config.BackendEvidenceBytes > MaxBackendEvidenceBytes {
+		return nil, nil, nil, fmt.Errorf("backend-evidence-bytes must be between 1 and %d when set", MaxBackendEvidenceBytes)
 	}
 
 	policy, err := signalworkload.Decode(config.WorkloadPolicyJSON)

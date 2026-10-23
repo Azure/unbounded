@@ -21,7 +21,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	machinav1 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
 	projectsignal "github.com/Azure/unbounded/internal/signal"
 	"github.com/Azure/unbounded/internal/version"
@@ -83,10 +82,6 @@ func run(ctx context.Context, cfg config) error {
 		return err
 	}
 
-	if err := machinav1.AddToScheme(scheme); err != nil {
-		return err
-	}
-
 	watchedNamespaces := map[string]cache.Config{cfg.namespace: {}}
 	watchedNamespaces[cfg.scriptNamespace] = cache.Config{}
 
@@ -127,7 +122,6 @@ func run(ctx context.Context, cfg config) error {
 	runs := &projectsignal.RunReconciler{
 		Client:            mgr.GetClient(),
 		APIReader:         mgr.GetAPIReader(),
-		Namespace:         cfg.namespace,
 		Evidence:          evidence,
 		MaxConcurrentRuns: cfg.maxConcurrentRuns,
 		Recorder:          mgr.GetEventRecorder(controllerName),
