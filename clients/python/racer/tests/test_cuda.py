@@ -179,3 +179,56 @@ def test_staging_pinned_for_destination_device(fake, tmp_path):
         assert ("register", 103) in lib.calls
     finally:
         buf.close()
+
+
+def _stub_torch(monkeypatch):
+    import sys
+    import types
+
+    torch = types.ModuleType("torch")
+    torch.uint8 = "uint8"
+    monkeypatch.setitem(sys.modules, "torch", torch)
+
+
+class _StubTensor:
+    def __init__(self, index):
+        self.dtype = "uint8"
+        self.device = type("Dev", (), {"type": "cuda", "index": index})()
+
+    def dim(self):
+        return 1
+
+    def is_contiguous(self):
+        return True
+
+    def numel(self):
+        return 16
+
+
+def test_tensor_target_exposes_device(monkeypatch):
+    from racer.client import _dest_device
+    from racer.tensors import TensorTarget
+
+    _stub_torch(monkeypatch)
+    assert TensorTarget(_StubTensor(3)).device == 3
+    assert _dest_device(TensorTarget(_StubTensor(3))) == 3
+    assert _dest_device(TensorTarget(_StubTensor(None))) is None
+
+
+def test_tensor_target_staging_on_tensor_device(fake, monkeypatch):
+    import threading
+
+    from racer.client import Client, _dest_device
+    from racer.tensors import TensorTarget
+
+    _stub_torch(monkeypatch)
+    lib = fake(current=0)
+    c = Client.__new__(Client)
+    c._pool, c.staging_bytes, c.pin_staging = [], 4096, True
+    c._pool_lock = threading.Lock()
+    buf = c._take_staging(_dest_device(TensorTarget(_StubTensor(3))))
+    try:
+        assert ("register", 103) in lib.calls
+        assert ("register", 100) not in lib.calls
+    finally:
+        buf.close()

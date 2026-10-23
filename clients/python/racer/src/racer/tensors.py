@@ -42,6 +42,10 @@ class TensorTarget:
             raise ValueError("tensor must be a contiguous 1-D uint8 tensor")
         self.tensor = tensor
         self.size = tensor.numel()
+        # CUDA ordinal of the tensor, so host and stream staging pins memory
+        # on this GPU rather than device 0.
+        index = getattr(tensor.device, "index", None)
+        self.device = index if isinstance(index, int) else None
 
     def export_fd(self) -> int:
         raise NotImplementedError("torch memory cannot be exported")
