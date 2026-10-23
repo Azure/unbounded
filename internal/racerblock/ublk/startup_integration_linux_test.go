@@ -106,6 +106,8 @@ func setHooks(t *testing.T, fetchTag func(qid, tag int) int, beforeStartDev func
 		testHooks.rescue = nil
 		testHooks.rescued = nil
 		testHooks.beforeStop = nil
+		testHooks.spareRing = nil
+		testHooks.uringSetup = nil
 	})
 }
 

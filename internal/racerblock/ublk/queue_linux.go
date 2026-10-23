@@ -42,6 +42,9 @@ type queue struct {
 	charFd int
 
 	ring *uring
+	// spare is the rescue ring, set up with the queue so a rescue never
+	// needs a new kernel resource after a failure. A rescue takes it.
+	spare *uring
 	// oldRing is the ring a rescue replaced. It stays open, and is
 	// never entered again, until the queue thread exits. See rescue.
 	oldRing *uring
@@ -90,6 +93,11 @@ func newQueue(d *Device, id int) (*queue, error) {
 		return q.failNew(fmt.Errorf("ublk: queue %d ring: %w", id, err))
 	}
 
+	q.spare, err = newRescueRing(q)
+	if err != nil {
+		return q.failNew(fmt.Errorf("ublk: queue %d rescue ring: %w", id, err))
+	}
+
 	page := unix.Getpagesize()
 	sz := descArraySize(cfg.Depth, page)
 
@@ -126,6 +134,11 @@ func (q *queue) release() error {
 	if q.oldRing != nil {
 		errs = append(errs, q.oldRing.close())
 		q.oldRing = nil
+	}
+
+	if q.spare != nil {
+		errs = append(errs, q.spare.close())
+		q.spare = nil
 	}
 
 	for i, b := range q.bufs {
