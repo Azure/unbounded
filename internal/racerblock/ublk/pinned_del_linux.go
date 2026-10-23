@@ -258,6 +258,11 @@ func (p ctrlPinnedDelRing) pause(round int) {
 		return
 	}
 
+	pinnedDelSleep(round)
+}
+
+// pinnedDelSleep is the production pause before a pinned DEL_DEV cancel.
+func pinnedDelSleep(round int) {
 	time.Sleep(min(time.Millisecond<<min(round, 8), 200*time.Millisecond))
 }
 
