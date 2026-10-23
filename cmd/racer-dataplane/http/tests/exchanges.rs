@@ -768,3 +768,44 @@ fn request_heads_collect_passed_descriptors() {
     assert!(head.descriptors.descriptors.is_empty());
     assert!(!head.descriptors.truncated);
 }
+
+/// Descriptors retained across all fragments of one head are capped; excess
+/// descriptors are closed immediately and the head is marked truncated.
+#[test]
+fn request_head_descriptors_are_capped_across_fragments() {
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let io = io();
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let server = ConnectionLease::from_reserved(server.into(), (), ()).unwrap();
+    let mut fds = [0; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let mut read = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+    let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    let fragments = http1::connection::MAX_HEAD_DESCRIPTORS + 4;
+    send_with_fds(&client, b"POST /x HTTP/1.1\r\n", &[write.as_raw_fd()]);
+    for _ in 1..fragments {
+        send_with_fds(
+            &client,
+            b"X: y\r\n",
+            &[write.as_raw_fd(), write.as_raw_fd()],
+        );
+    }
+    drop(write);
+    client.write_all(b"Content-Length: 0\r\n\r\n").unwrap();
+    let head = drive(
+        &io,
+        io.receive_request_head_with_descriptors(server, &RequestScope, 4096),
+    )
+    .unwrap()
+    .value
+    .unwrap();
+    assert!(head.descriptors.truncated);
+    assert_eq!(
+        head.descriptors.descriptors.len(),
+        http1::connection::MAX_HEAD_DESCRIPTORS
+    );
+    drop(head);
+    let mut byte = [0];
+    assert_eq!(read.read(&mut byte).unwrap(), 0);
+}

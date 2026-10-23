@@ -321,6 +321,10 @@ pub struct HeadCompletion<C: Context, T> {
     pub _decoded: Option<C::Charge>,
 }
 
+/// Most descriptors retained across one request head. Excess descriptors are
+/// closed on arrival and the head is marked truncated.
+pub const MAX_HEAD_DESCRIPTORS: usize = 8;
+
 /// Descriptors passed with `SCM_RIGHTS` while a request head was read.
 #[derive(Debug, Default)]
 pub struct ReceivedDescriptors {
@@ -724,7 +728,15 @@ impl<C: Context> HttpIo<C> {
                         .await?;
                     let mut sink = sink.borrow_mut();
                     sink.truncated |= received.truncated;
-                    sink.descriptors.extend(received.descriptors);
+                    for descriptor in received.descriptors {
+                        if sink.descriptors.len() < MAX_HEAD_DESCRIPTORS {
+                            sink.descriptors.push(descriptor);
+                        } else {
+                            // Over the aggregate cap: close now and reject the head.
+                            drop(descriptor);
+                            sink.truncated = true;
+                        }
+                    }
                     Completion {
                         buffer: received.buffer,
                         bytes: received.bytes,
