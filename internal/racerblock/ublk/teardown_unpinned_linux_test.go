@@ -16,9 +16,9 @@ import (
 
 // TestStartFailureWithoutCharFdSendsNothingByID drives the real startup
 // failure wiring (runStartup, abortStart, teardown) for a device whose
-// char device was never opened, as when SET_PARAMS or the open of
-// /dev/ublkc<ID> fails. Nothing pins the id then, so teardown must not
-// send STOP_DEV or DEL_DEV by id, which could hit another device that
+// char device was never opened, as when opening /dev/ublkc<ID> fails.
+// Nothing pins the id then, so teardown must not send STOP_DEV or DEL_DEV
+// by id, which could hit another device that
 // reused it. The error must keep the startup cause and name the device
 // left for manual cleanup. The control channel has no fds, so no command
 // could reach the kernel even if one were sent.

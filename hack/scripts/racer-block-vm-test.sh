@@ -90,6 +90,11 @@ REQUIRED_ublk=(
 	TestIntegrationFixedIDAndDelete
 	TestIntegrationStartValidation
 	TestIntegrationStartRejectsReusedID
+	TestStartFailureWithoutCharFdSendsNothingByID
+	TestTeardownWithCharFdStillDeletes
+	TestStartVerifiesCookieBeforeMutating
+	TestStartRejectsUnverifiedDevice
+	TestNewCookieNonzero
 	TestIntegrationDeleteStale
 	TestIntegrationStartCancelDuringStartup
 	TestIntegrationStartCancelBeforeStartDev

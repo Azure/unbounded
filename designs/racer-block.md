@@ -61,8 +61,8 @@ The kernel ublk interface uses io_uring `URING_CMD` with 128-byte SQEs. Go has
 no io_uring support in the standard library, so the binding sets up the rings
 directly with `io_uring_setup`, `mmap`, and `io_uring_enter`.
 
-- Control: `ADD_DEV`, `SET_PARAMS`, `START_DEV`, `STOP_DEV`, `DEL_DEV` on
-  `/dev/ublk-control`. Shutdown uses `DEL_DEV_ASYNC` when the kernel supports it,
+- Control: `ADD_DEV`, `GET_DEV_INFO`, `SET_PARAMS`, `START_DEV`, `STOP_DEV`, and
+  `DEL_DEV` on `/dev/ublk-control`. Shutdown uses `DEL_DEV_ASYNC` when the kernel supports it,
   and falls back to `DEL_DEV` otherwise.
 - Data: one active io_uring, one reserved rescue ring, and one locked OS thread
   per queue. Each tag keeps one outstanding `FETCH_REQ` or
@@ -75,8 +75,18 @@ directly with `io_uring_setup`, `mmap`, and `io_uring_enter`.
 - Errors: a handler error that is a `syscall.Errno` is passed to the kernel.
   Any other error, or a handler panic, becomes `EIO`.
 
-Both delete paths keep the char device open until removal is confirmed, so
-another device cannot reuse its ID while deletion is pending. On kernels
+Startup puts a random nonzero cookie in `ublksrv_flags` with `ADD_DEV`. It
+opens the char device and reads the cookie back with `GET_DEV_INFO` before
+setting parameters or starting the device. The open handle holds the ID,
+and the cookie detects deletion and ID reuse before that open. It is not
+authentication against a hostile privileged process.
+
+If startup cannot open or verify the char device, it sends no stop or delete
+command by ID. The startup error identifies the device for manual ownership
+checks before cleanup, rather than risking deletion of a replacement.
+
+Both delete paths keep the verified char device open until removal is confirmed.
+Another device cannot reuse its ID while deletion is pending. On kernels
 without `DEL_DEV_ASYNC`, an io_uring cancel interrupts the delete's final
 ID-release wait. The delete completion is still checked before closing the
 char device. If a control completion is unknown, cleanup reports an error and
