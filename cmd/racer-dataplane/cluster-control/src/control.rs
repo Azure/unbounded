@@ -159,6 +159,7 @@ fn run(
                 lease_api,
                 api,
                 seat: RefCell::new(None),
+                issuer: RefCell::new(None),
                 serving: RefCell::new(Serving::default()),
                 changed: Signal::default(),
                 verifier: DynamicClientVerifier::new(),

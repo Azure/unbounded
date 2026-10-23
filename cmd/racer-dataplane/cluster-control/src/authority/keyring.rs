@@ -6,7 +6,8 @@
 //! `prepare_for`. Caches are never evicted to make room. Every change gets a
 //! new bundle generation; exhausted generations fail.
 //!
-//! Each seat has its own issuer root. A root is kept while its seat offers it,
+//! Each seat offers an issuer root, reused across claims by the same Pod. A
+//! root is kept while a seat offers it,
 //! and for one Lease duration plus one certificate lifetime after that, capped
 //! at its NotAfter. A removed root is listed as retired until its NotAfter so a
 //! stale Lease annotation can never add it back.

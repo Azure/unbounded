@@ -18,9 +18,10 @@ use crate::{
     lease, limits,
     pki::{self, SeatIssuer, ServingIdentity},
     server,
-    shared::{PrimaryView, Seat, Shared},
+    shared::{CachedIssuer, PrimaryView, Seat, Shared},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
+use racer_control_wire as wire;
 use std::{
     cell::RefCell,
     collections::BTreeMap,
@@ -237,6 +238,11 @@ fn my_seat_annotations(shared: &Shared, seat: &Seat) -> BTreeMap<&'static str, O
     );
     let pending = seat.pending.borrow();
     let offered = pending.as_ref().map_or(issuer.der(), |p| p.der());
+    if let Some(c) = shared.issuer.borrow_mut().as_mut()
+        && Rc::ptr_eq(&c.issuer, &issuer)
+    {
+        c.offered = SystemTime::now();
+    }
     a.insert(
         annotations::ISSUER_CERTIFICATE,
         Some(STANDARD.encode(offered)),
@@ -281,12 +287,47 @@ fn webhook_names(ns: &str) -> Vec<String> {
     ]
 }
 
-/// Build fresh seat material.
+/// Whether a cached issuer may be offered by a new claim at `now`.
+///
+/// The keyring keeps a root at most one Lease duration plus one certificate
+/// lifetime after its last offer and then retires it for good, so a root not
+/// offered for a certificate lifetime is replaced. A root with less than half
+/// its lifetime left is replaced too, well before the keyring refuses it.
+pub fn issuer_reusable(cached: &CachedIssuer, cluster: &str, now: SystemTime) -> bool {
+    cached.cluster == cluster
+        && cached.issuer.not_after() >= now + pki::ROOT_LIFETIME / 2
+        && now
+            .duration_since(cached.offered)
+            .is_ok_and(|idle| idle < wire::CERTIFICATE_LIFETIME)
+}
+
+/// The issuer for a new claim: the cached one when reusable, else a new one.
+/// One issuer per process keeps the number of keyring roots bounded by the
+/// number of Pods instead of the number of claims.
+fn seat_issuer(shared: &Shared, now: SystemTime) -> Result<Rc<SeatIssuer>, Error> {
+    let cluster = shared.cluster.borrow().clone();
+    let mut cache = shared.issuer.borrow_mut();
+    if let Some(c) = cache.as_ref()
+        && issuer_reusable(c, &cluster, now)
+    {
+        return Ok(c.issuer.clone());
+    }
+    let issuer = Rc::new(
+        SeatIssuer::generate(&cluster, now, pki::ROOT_LIFETIME).map_err(|_| Error::Unavailable)?,
+    );
+    *cache = Some(CachedIssuer {
+        cluster,
+        issuer: issuer.clone(),
+        offered: now,
+    });
+    Ok(issuer)
+}
+
+/// Build seat material. The issuer is shared with earlier seats of this
+/// process, see [`seat_issuer`]; serving identities are always fresh.
 pub fn new_seat(shared: &Shared, index: usize) -> Result<Seat, Error> {
     let now = SystemTime::now();
-    let cluster = shared.cluster.borrow().clone();
-    let issuer =
-        SeatIssuer::generate(&cluster, now, pki::ROOT_LIFETIME).map_err(|_| Error::Unavailable)?;
+    let issuer = seat_issuer(shared, now)?;
     let control = Rc::new(
         ServingIdentity::pinned(
             &[shared.config.pod_ip],
@@ -443,7 +484,7 @@ fn rotate(shared: &Shared, seat: &Seat) {
     if seat.issuer.borrow().should_rotate(now) && seat.pending.borrow().is_none() {
         let cluster = shared.cluster.borrow().clone();
         if let Ok(p) = SeatIssuer::generate(&cluster, now, pki::ROOT_LIFETIME) {
-            *seat.pending.borrow_mut() = Some(p);
+            *seat.pending.borrow_mut() = Some(Rc::new(p));
         }
     }
     // Switch issuers only after the new root is committed.
@@ -456,6 +497,12 @@ fn rotate(shared: &Shared, seat: &Seat) {
         }
     };
     if committed && let Some(p) = seat.pending.borrow_mut().take() {
+        // Later claims of this process reuse the rotated issuer.
+        *shared.issuer.borrow_mut() = Some(CachedIssuer {
+            cluster: shared.cluster.borrow().clone(),
+            issuer: p.clone(),
+            offered: now,
+        });
         *seat.issuer.borrow_mut() = p;
     }
 }
@@ -820,6 +867,113 @@ async fn fetch_image(shared: &Shared) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        authority::keyring::{self, Durable, MAX_ROOTS, Offer},
+        kube::fake,
+    };
+
+    fn unix(t: SystemTime) -> u64 {
+        t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+    }
+
+    /// Plan the keyring with one offer of `der` at `now`.
+    fn offer(d: &Durable, der: &[u8], seat: usize, now: SystemTime) -> Durable {
+        let offers = [Offer {
+            der: der.to_vec(),
+            seat: seat as u8,
+            holder: "p1".into(),
+        }];
+        let p = keyring::plan(&keyring::tests::policy(), d, &[], &offers, unix(now)).unwrap();
+        assert_eq!(p.refused_roots, 0);
+        p.durable
+    }
+
+    #[test]
+    fn reclaims_reuse_the_issuer_root() {
+        fake::run(|_, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            let first = new_seat(&shared, 0).unwrap();
+            let der = first.issuer.borrow().der().to_vec();
+            let mut d = offer(&Durable::default(), &der, 0, SystemTime::now());
+            drop(first);
+            // Reclaim of the same and of another index offers the same root.
+            for index in [0, 3] {
+                let seat = new_seat(&shared, index).unwrap();
+                assert_eq!(seat.issuer.borrow().der(), der.as_slice());
+                // The cached issuer is the one in use.
+                assert!(Rc::ptr_eq(
+                    &shared.issuer.borrow().as_ref().unwrap().issuer,
+                    &seat.issuer.borrow()
+                ));
+                d = offer(&d, seat.issuer.borrow().der(), index, SystemTime::now());
+            }
+            assert_eq!(d.roots.len(), 1);
+            assert!(d.root_committed(&der));
+        });
+    }
+
+    #[test]
+    fn issuer_is_replaced_near_expiry_idle_or_on_cluster_change() {
+        let now = SystemTime::now();
+        let cluster = "c1c1c1c1-0000-4000-8000-000000000001";
+        let cached = |at: SystemTime, offered: SystemTime| CachedIssuer {
+            cluster: cluster.into(),
+            issuer: Rc::new(SeatIssuer::generate(cluster, at, pki::ROOT_LIFETIME).unwrap()),
+            offered,
+        };
+        let fresh = cached(now, now);
+        assert!(issuer_reusable(&fresh, cluster, now));
+        assert!(!issuer_reusable(
+            &fresh,
+            "c2c2c2c2-0000-4000-8000-000000000002",
+            now
+        ));
+        // Less than half the root lifetime left.
+        let old = cached(now - pki::ROOT_LIFETIME / 2 - Duration::from_secs(60), now);
+        assert!(!issuer_reusable(&old, cluster, now));
+        // Not offered for a certificate lifetime: the keyring may retire it.
+        let idle = cached(now, now - wire::CERTIFICATE_LIFETIME);
+        assert!(!issuer_reusable(&idle, cluster, now));
+
+        fake::run(|_, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            let der = new_seat(&shared, 0).unwrap().issuer.borrow().der().to_vec();
+            shared.issuer.borrow_mut().as_mut().unwrap().issuer = Rc::new(
+                SeatIssuer::generate(
+                    &shared.cluster.borrow(),
+                    SystemTime::now() - pki::ROOT_LIFETIME,
+                    pki::ROOT_LIFETIME + Duration::from_secs(3600),
+                )
+                .unwrap(),
+            );
+            let seat = new_seat(&shared, 0).unwrap();
+            let renewed = seat.issuer.borrow().der().to_vec();
+            assert_ne!(renewed, der);
+            assert!(issuer_reusable(
+                shared.issuer.borrow().as_ref().unwrap(),
+                &shared.cluster.borrow(),
+                SystemTime::now()
+            ));
+        });
+    }
+
+    #[test]
+    fn claim_churn_does_not_exhaust_roots() {
+        fake::run(|_, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            let mut d = Durable::default();
+            let start = SystemTime::now();
+            for i in 0..(MAX_ROOTS * 3) {
+                let seat = new_seat(&shared, i % annotations::MAX_SEATS).unwrap();
+                // Offered while held, as the Lease annotation would.
+                let _ = my_seat_annotations(&shared, &seat);
+                let at = start + Duration::from_secs(60 * i as u64);
+                d = offer(&d, seat.issuer.borrow().der(), seat.index, at);
+                assert!(d.root_committed(seat.issuer.borrow().der()));
+            }
+            assert_eq!(d.roots.len(), 1);
+        });
+    }
 
     fn observed_seat(index: usize, node: &str) -> LeaseObservation {
         LeaseObservation {

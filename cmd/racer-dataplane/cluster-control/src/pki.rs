@@ -89,6 +89,10 @@ impl SeatIssuer {
         self.cert.der()
     }
 
+    pub fn not_after(&self) -> SystemTime {
+        self.not_after
+    }
+
     /// Only issue while every new certificate gets its full lifetime.
     pub fn can_issue(&self, now: SystemTime) -> bool {
         self.not_after >= now + wire::CERTIFICATE_LIFETIME + SKEW
