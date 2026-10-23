@@ -268,6 +268,25 @@ impl Drop for Api {
     }
 }
 
+/// Map a shim result code to an error. `last_driver_error` must be the
+/// calling thread's view of the shim, since the driver error is per thread.
+pub(crate) fn check(rc: c_int, last_driver_error: unsafe extern "C" fn() -> i32) -> Result<()> {
+    match rc {
+        code::OK => Ok(()),
+        code::EINVAL => Err(Error::InvalidRequest),
+        code::ERANGE => Err(Error::InvalidRange),
+        code::EUNAVAILABLE => Err(Error::Unavailable),
+        code::EDEVICE => Err(Error::WrongDevice),
+        code::EDRIVER => Err(Error::Driver(unsafe { last_driver_error() })),
+        code::ENOMEM => Err(Error::OutOfMemory),
+        code::ENOKERNEL => Err(Error::KernelUnavailable),
+        code::EIO => Err(Error::Io),
+        code::EBUSY => Err(Error::Busy),
+        code::ELEAKED => Err(Error::Leaked),
+        _ => Err(Error::Driver(rc)),
+    }
+}
+
 /// The loaded backend and the leak counter every object shares.
 pub(crate) struct Shared {
     pub(crate) api: Rc<Api>,
@@ -278,23 +297,10 @@ pub(crate) struct Shared {
 impl Shared {
     /// Map a shim result code to an error.
     pub(crate) fn check(&self, rc: c_int) -> Result<()> {
-        match rc {
-            code::OK => Ok(()),
-            code::EINVAL => Err(Error::InvalidRequest),
-            code::ERANGE => Err(Error::InvalidRange),
-            code::EUNAVAILABLE => Err(Error::Unavailable),
-            code::EDEVICE => Err(Error::WrongDevice),
-            code::EDRIVER => Err(Error::Driver(unsafe { (self.api.last_driver_error)() })),
-            code::ENOMEM => Err(Error::OutOfMemory),
-            code::ENOKERNEL => Err(Error::KernelUnavailable),
-            code::EIO => Err(Error::Io),
-            code::EBUSY => Err(Error::Busy),
-            code::ELEAKED => {
-                self.leaks.set(self.leaks.get() + 1);
-                Err(Error::Leaked)
-            }
-            _ => Err(Error::Driver(rc)),
+        if rc == code::ELEAKED {
+            self.leaks.set(self.leaks.get() + 1);
         }
+        check(rc, self.api.last_driver_error)
     }
 
     /// Count a leaked resource and keep the library loaded for good.

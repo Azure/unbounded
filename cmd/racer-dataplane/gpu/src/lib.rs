@@ -3,7 +3,10 @@
 //! Every CUDA, NVML and cuFile call goes through a small C shim,
 //! `libracer_gpu_cuda.so.1` (`native/gpu_cuda.c`), loaded with `dlopen` and
 //! checked with `racer_gpu_abi()`. All types here are `!Send`: build and use
-//! them on the dataplane's native helper thread, never on I/O threads.
+//! them on the dataplane's native helper thread, never on I/O threads. The
+//! one exception is [`FileReader`], which runs cuFile reads that
+//! [`GpuFile::detach`] prepared on other threads, so slow disk reads do not
+//! hold up the helper.
 //!
 //! # Basics
 //!
@@ -271,7 +274,76 @@ impl Gpu {
     pub fn leaked(&self) -> u64 {
         self.shared.leaks.get()
     }
+
+    /// A handle that runs [`FileRead`]s on any thread. It does not keep the
+    /// backend loaded: drop every reader thread's work before this [`Gpu`]
+    /// and the objects the reads name.
+    pub fn file_reader(&self) -> FileReader {
+        FileReader {
+            file_read: self.shared.api.file_read,
+            last_driver_error: self.shared.api.last_driver_error,
+            #[cfg(any(test, feature = "simulation"))]
+            simulation: simulation::current(),
+        }
+    }
 }
+
+/// Runs cuFile reads off the helper thread. Cheap to clone.
+#[derive(Clone)]
+pub struct FileReader {
+    file_read: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u64, u64) -> i64,
+
+    last_driver_error: unsafe extern "C" fn() -> i32,
+
+    /// The simulation the backend was loaded in, entered on reader threads.
+    #[cfg(any(test, feature = "simulation"))]
+    simulation: Option<simulation::Simulation>,
+}
+
+impl FileReader {
+    /// Run `read` and wait for it. Errors are those of [`GpuFile::read`].
+    pub fn read(&self, read: FileRead) -> Result<()> {
+        #[cfg(any(test, feature = "simulation"))]
+        let _environment = match (&self.simulation, simulation::current()) {
+            (Some(simulation), None) => Some(simulation.enter()),
+            _ => None,
+        };
+        let n = unsafe {
+            (self.file_read)(
+                read.file.as_ptr(),
+                read.staging.as_ptr(),
+                read.offset,
+                read.file_offset,
+                read.length,
+            )
+        };
+        if n < 0 {
+            return ffi::check(n as i32, self.last_driver_error);
+        }
+        if n as u64 != read.length {
+            return Err(Error::Io);
+        }
+        Ok(())
+    }
+}
+
+/// A cuFile read made by [`GpuFile::detach`], to run with [`FileReader::read`].
+#[derive(Debug)]
+pub struct FileRead {
+    file: NonNull<c_void>,
+
+    staging: NonNull<c_void>,
+
+    offset: u64,
+
+    file_offset: u64,
+
+    length: u64,
+}
+
+// SAFETY: the shim's cuFile read is thread safe. `GpuFile::detach` makes the
+// caller keep the file and staging buffer alive until the read is done.
+unsafe impl Send for FileRead {}
 
 /// A retained primary context. Clones share it; it is released when the last
 /// clone and every object made from it are gone.
@@ -867,6 +939,36 @@ impl GpuFile {
             return Err(Error::Io);
         }
         Ok(())
+    }
+
+    /// Prepare a read of `length` bytes at `file_offset` into staging at
+    /// `offset`, to run on another thread with [`FileReader::read`]. Unlike
+    /// [`GpuFile::read`], streams may use other parts of the staging buffer
+    /// meanwhile.
+    ///
+    /// # Safety
+    ///
+    /// Until the read returns, the caller must keep this file, `staging` and
+    /// the [`Gpu`] alive, and must not let anything else touch
+    /// `[offset, offset + length)` of `staging`.
+    pub unsafe fn detach(
+        &self,
+        staging: &StagingBuffer,
+        offset: u64,
+        file_offset: u64,
+        length: u64,
+    ) -> Result<FileRead> {
+        let end = offset.checked_add(length).ok_or(Error::InvalidRange)?;
+        if length == 0 || end > staging.size() {
+            return Err(Error::InvalidRange);
+        }
+        Ok(FileRead {
+            file: self.raw,
+            staging: staging.0.raw,
+            offset,
+            file_offset,
+            length,
+        })
     }
 }
 

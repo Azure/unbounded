@@ -30,6 +30,7 @@ use std::{
         unix::fs::{FileExt, MetadataExt},
     },
     rc::Rc,
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 /// Granularity imports must be a multiple of. Real GPUs use 2 MiB; smaller
@@ -130,7 +131,7 @@ pub struct Live {
 /// A simulated set of GPUs, shared by clones. Deterministic.
 #[derive(Clone)]
 pub struct Simulation {
-    world: Rc<RefCell<World>>,
+    world: Arc<Mutex<World>>,
 }
 
 /// Scope guard from [`Simulation::enter`]. Restores the previous one on drop.
@@ -174,6 +175,9 @@ struct Mapped {
     pointer: std::ptr::NonNull<u8>,
     length: usize,
 }
+
+// SAFETY: the mapping is owned and only reached through the world's lock.
+unsafe impl Send for Mapped {}
 
 impl Mapped {
     /// A zeroed shared mapping of `length` bytes, or None.
@@ -269,10 +273,18 @@ struct World {
 }
 
 impl Simulation {
+    /// The world, locked. A panic on another thread does not poison it for
+    /// the rest of a test.
+    fn world(&self) -> MutexGuard<'_, World> {
+        self.world
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// GPUs that discovery will report, in ordinal order.
     pub fn new(devices: Vec<SimDevice>) -> Self {
         Self {
-            world: Rc::new(RefCell::new(World {
+            world: Arc::new(Mutex::new(World {
                 devices,
                 next: 0x1000,
                 ..World::default()
@@ -294,8 +306,7 @@ impl Simulation {
         let file = unsafe { File::from_raw_fd(fd) };
         file.set_len(size).expect("size memfd");
         let meta = file.metadata().expect("stat memfd");
-        self.world
-            .borrow_mut()
+        self.world()
             .allocations
             .insert((meta.dev(), meta.ino()), ordinal);
         file.into()
@@ -304,22 +315,22 @@ impl Simulation {
     /// Fail the next call to `operation` with `code` (a `gpu_cuda.h` code;
     /// `-5` is a driver error). Nothing changes.
     pub fn fault(&self, operation: Operation, code: c_int) {
-        self.world.borrow_mut().faults.push_back((operation, code));
+        self.world().faults.push_back((operation, code));
     }
 
     /// Behave like a shim built without decrypt kernels.
     pub fn disable_kernels(&self) {
-        self.world.borrow_mut().no_kernels = true;
+        self.world().no_kernels = true;
     }
 
     /// Every call so far.
     pub fn trace(&self) -> Vec<Event> {
-        self.world.borrow().trace.clone()
+        self.world().trace.clone()
     }
 
     /// Live resources.
     pub fn live(&self) -> Live {
-        let world = self.world.borrow();
+        let world = self.world();
         let (mut imports, mut staging) = (0, 0);
         for buffer in world.buffers.values() {
             match buffer.memory {
@@ -350,7 +361,7 @@ fn with<R: Into<i64> + Copy + From<i32>>(
     let Some(simulation) = current() else {
         return R::from(code::EUNAVAILABLE);
     };
-    let mut world = simulation.world.borrow_mut();
+    let mut world = simulation.world();
     let fault = world
         .faults
         .iter()
@@ -391,7 +402,7 @@ fn span(size: u64, offset: u64, length: u64) -> bool {
 }
 
 unsafe extern "C" fn last_driver_error() -> i32 {
-    current().map_or(0, |s| s.world.borrow().last_error)
+    current().map_or(0, |s| s.world().last_error)
 }
 
 unsafe extern "C" fn init() -> c_int {

@@ -397,6 +397,68 @@ fn cufile_reads_into_staging() {
 }
 
 #[test]
+/// Detached cuFile reads run on other threads, while a stream uses the same
+/// staging buffer, and report errors like a direct read.
+fn detached_cufile_reads_run_on_other_threads() {
+    let sim = simulation();
+    let _env = sim.enter();
+    let gpu = Gpu::load().unwrap();
+    let ctx = gpu.context(0).unwrap();
+    let staging = ctx.staging(8192).unwrap();
+    staging.register_cufile().unwrap();
+    let data: Vec<u8> = (0..10000u32).map(|i| (i * 7) as u8).collect();
+    let file = gpu.open_file(file_with(&data)).unwrap();
+    let reader = gpu.file_reader();
+
+    // A queued copy into the first page does not block a read of the second.
+    let stream = ctx.stream().unwrap();
+    stream
+        .copy_from_host(Destination::Staging(&staging), 0, [1])
+        .unwrap();
+    let reads = [(4096, 0, 1000), (6000, 5000, 2000)].map(|(offset, file_offset, length)| {
+        unsafe { file.detach(&staging, offset, file_offset, length) }.unwrap()
+    });
+    let threads = reads.map(|read| {
+        let reader = reader.clone();
+        std::thread::spawn(move || reader.read(read))
+    });
+    for thread in threads {
+        thread.join().unwrap().unwrap();
+    }
+    stream.synchronize().unwrap();
+    let mut out = vec![0; 1000];
+    stream.read_staging(&staging, 4096, &mut out).unwrap();
+    assert_eq!(out, &data[..1000]);
+    let mut out = vec![0; 2000];
+    stream.read_staging(&staging, 6000, &mut out).unwrap();
+    assert_eq!(out, &data[5000..7000]);
+
+    // Bounds are checked up front; I/O and driver errors come from the read.
+    assert_eq!(
+        unsafe { file.detach(&staging, 8000, 0, 200) }.err(),
+        Some(Error::InvalidRange)
+    );
+    assert_eq!(
+        unsafe { file.detach(&staging, 0, 0, 0) }.err(),
+        Some(Error::InvalidRange)
+    );
+    let short = unsafe { file.detach(&staging, 0, 9990, 100) }.unwrap();
+    let thread = std::thread::spawn({
+        let reader = reader.clone();
+        move || reader.read(short)
+    });
+    assert_eq!(thread.join().unwrap(), Err(Error::Io));
+    sim.fault(Operation::FileRead, -5);
+    let faulted = unsafe { file.detach(&staging, 0, 0, 100) }.unwrap();
+    let thread = std::thread::spawn(move || reader.read(faulted));
+    assert!(matches!(thread.join().unwrap(), Err(Error::Driver(_))));
+    drop(file);
+    drop(staging);
+    assert_eq!(sim.live().files, 0);
+    assert_eq!(gpu.leaked(), 0);
+}
+
+#[test]
 /// dma-buf export checks page alignment and bounds.
 fn dma_buf_export_checks_alignment() {
     let sim = simulation();
