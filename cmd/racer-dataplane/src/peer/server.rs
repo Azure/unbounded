@@ -940,6 +940,20 @@ fn header_scope(
     );
     Ok(header)
 }
+/// Signed response for a failure class chosen by `racer_core::peer::hop`.
+fn peer_response(response: racer_core::peer::hop::Response) -> PeerResponse {
+    use racer_core::peer::hop::Response;
+    match response {
+        Response::Overloaded => PeerResponse::Overloaded,
+        Response::Unavailable => PeerResponse::Unavailable,
+        Response::NotFound => PeerResponse::NotFound,
+        Response::VersionUnavailable => PeerResponse::VersionUnavailable,
+        Response::OriginRejected => PeerResponse::OriginRejected,
+        Response::OriginForbidden => PeerResponse::OriginForbidden,
+        Response::StaleMembership => PeerResponse::StaleMembership,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1721,19 +1735,5 @@ mod tests {
                 drop(admitted);
             }
         }
-    }
-}
-
-/// Signed response for a failure class chosen by `racer_core::peer::hop`.
-fn peer_response(response: racer_core::peer::hop::Response) -> PeerResponse {
-    use racer_core::peer::hop::Response;
-    match response {
-        Response::Overloaded => PeerResponse::Overloaded,
-        Response::Unavailable => PeerResponse::Unavailable,
-        Response::NotFound => PeerResponse::NotFound,
-        Response::VersionUnavailable => PeerResponse::VersionUnavailable,
-        Response::OriginRejected => PeerResponse::OriginRejected,
-        Response::OriginForbidden => PeerResponse::OriginForbidden,
-        Response::StaleMembership => PeerResponse::StaleMembership,
     }
 }
