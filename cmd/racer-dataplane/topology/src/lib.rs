@@ -133,7 +133,10 @@ mod placement;
 
 pub use paths::{PathQuery, Paths};
 
-pub use placement::{Maintenance, Placement, REPLICAS, SLOT_BITS, SLOT_COUNT, slot};
+pub use placement::{
+    Maintenance, Phantom, PhantomEntry, Placement, REPLICAS, Ranking, RankingEntry, Rankings,
+    SLOT_BITS, SLOT_COUNT, Scored, slot,
+};
 
 use sha2::Digest;
 
