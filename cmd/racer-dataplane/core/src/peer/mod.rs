@@ -8,7 +8,7 @@
 //! - [`subscriptions`]: the token-based subscription scheduler.
 
 pub mod hop;
-// SUBS
+pub mod subscriptions;
 pub mod validity;
 
 /// Failure classes the peer decisions distinguish.
