@@ -865,6 +865,11 @@ impl StoreWriter {
             return 0;
         }
         let scoring = self.scoring(&retention);
+        // Mirror the full-queue rule in `enqueue`: an unheld over-share page
+        // never displaces an under-share page, so it may only take over-share
+        // victims. A held incoming page is exempt there too.
+        let over_share_only =
+            !self.index.is_held(incoming) && scoring.over_share(&incoming.version.object.cache);
         let mut queue = self.queue.borrow_mut();
         let mut pending = self.pending.borrow_mut();
         let mut candidates: Vec<_> = queue
@@ -872,6 +877,7 @@ impl StoreWriter {
             .take(QUEUE_RECLAIM_CANDIDATES)
             .filter(|id| {
                 cache.is_none_or(|cache| cache == &id.version.object.cache)
+                    && (!over_share_only || scoring.over_share(&id.version.object.cache))
                     && !retention.is_owned(id)
                     && !self.index.is_held(id)
                     && pending.get(*id).is_none_or(|dirty| dirty.hold.is_none())

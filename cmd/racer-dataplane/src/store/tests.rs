@@ -5265,3 +5265,89 @@ fn cache_disk_samples_scale_to_large_catalogs() {
         assert_eq!(sample.resident, i as u64);
     }
 }
+
+/// Owned reservation reclaim follows the full-queue share rule: an unheld
+/// over-share incoming page only takes over-share optional writes. Held or
+/// under-share incoming pages may take any optional write, and the share
+/// classification is current, so a live reweight changes eligibility.
+#[test]
+fn owned_reclaim_never_lets_unheld_over_share_page_take_under_share_write() {
+    let (f, over, under) = over_share_fixture();
+    let writer = &f.store.writer;
+    let incoming = f
+        .copy_in(over.clone(), 9, 113)
+        .ciphertext
+        .envelope()
+        .page
+        .clone();
+    let owner = incoming.clone();
+    writer
+        .retention()
+        .set_ownership(Rc::new(move |page| page == &owner));
+    let kept = f.copy_in(under.clone(), 1, 113);
+    let kept_id = kept.ciphertext.envelope().page.clone();
+    f.enqueue(kept).unwrap();
+    let dirty = f.admission.used(ResourceClass::DirtyCiphertext);
+    // Failure: the only optional write is under share, so nothing is freed.
+    assert_eq!(
+        writer.reclaim_optional_for_owned(&incoming, None, usize::MAX, usize::MAX),
+        0
+    );
+    assert!(writer.copy_only(&kept_id).unwrap().is_some());
+    assert_eq!(writer.discarded_count(), 0);
+    assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), dirty);
+    // Success: an over-share optional write is replaced, the under-share one stays.
+    let victim = f.copy_in(over.clone(), 2, 113);
+    let victim_id = victim.ciphertext.envelope().page.clone();
+    f.enqueue(victim).unwrap();
+    assert_eq!(
+        writer.reclaim_optional_for_owned(&incoming, None, usize::MAX, usize::MAX),
+        1
+    );
+    assert!(writer.copy_only(&victim_id).unwrap().is_none());
+    assert!(writer.copy_only(&kept_id).unwrap().is_some());
+    assert_eq!(writer.discarded_count(), 1);
+    assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), dirty);
+    // A held incoming page is exempt, as in the full-queue path.
+    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+    writer
+        .index()
+        .reserve_hold(&incoming.version, 1, until)
+        .unwrap();
+    assert_eq!(writer.reclaim_optional_for_owned(&incoming, None, 1, 0), 1);
+    assert!(writer.copy_only(&kept_id).unwrap().is_none());
+    assert_eq!(writer.pending_count(), 0);
+    // Live reweight: once the incoming cache is under share, it may take an
+    // under-share optional write without being held.
+    let unheld = f
+        .copy_in(over.clone(), 10, 113)
+        .ciphertext
+        .envelope()
+        .page
+        .clone();
+    let owner = unheld.clone();
+    writer
+        .retention()
+        .set_ownership(Rc::new(move |page| page == &owner));
+    let other = f.copy_in(under.clone(), 3, 113);
+    let other_id = other.ciphertext.envelope().page.clone();
+    f.enqueue(other).unwrap();
+    assert_eq!(writer.reclaim_optional_for_owned(&unheld, None, 1, 0), 0);
+    let definition = |id: &CacheId, priority| racer_control_wire::CacheDefinition {
+        id: id.clone(),
+        name: id.0.clone(),
+        client_socket: "/c".into(),
+        origin_socket: "/o".into(),
+        priority,
+    };
+    writer
+        .retention()
+        .weights()
+        .update(&[definition(&over, 1000), definition(&under, 1)]);
+    let capacity = writer.index().disk_capacity();
+    assert!(!writer.retention().over_share(&over, capacity));
+    assert_eq!(writer.reclaim_optional_for_owned(&unheld, None, 1, 0), 1);
+    assert!(writer.copy_only(&other_id).unwrap().is_none());
+    assert_eq!(writer.pending_count(), 0);
+    assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
+}
