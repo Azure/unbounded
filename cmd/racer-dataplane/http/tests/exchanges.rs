@@ -809,3 +809,89 @@ fn request_head_descriptors_are_capped_across_fragments() {
     let mut byte = [0];
     assert_eq!(read.read(&mut byte).unwrap(), 0);
 }
+
+/// Open a pipe; return its read end and an owned write end.
+fn descriptor_probe() -> (std::fs::File, std::os::fd::OwnedFd) {
+    use std::os::fd::FromRawFd;
+    let mut fds = [0; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    unsafe {
+        (
+            std::fs::File::from_raw_fd(fds[0]),
+            std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+        )
+    }
+}
+
+/// Receive two pipelined heads; the descriptor goes only with the second.
+fn pipelined_heads(second: &[&[u8]]) {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    let io = io();
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let server = ConnectionLease::from_reserved(server.into(), (), ()).unwrap();
+    let (mut read, write) = descriptor_probe();
+    client.write_all(b"HEAD /a HTTP/1.1\r\n\r\n").unwrap();
+    send_with_fds(&client, second[0], &[write.as_raw_fd()]);
+    drop(write);
+    for part in &second[1..] {
+        client.write_all(part).unwrap();
+    }
+    let first = drive(
+        &io,
+        io.receive_request_head_with_descriptors(server, &RequestScope, 4096),
+    )
+    .unwrap();
+    let head = first.value.unwrap();
+    assert!(head.descriptors.descriptors.is_empty());
+    assert!(!head.descriptors.truncated);
+    let connection = first.connection;
+    let second = drive(
+        &io,
+        io.receive_request_head_with_descriptors(connection, &RequestScope, 4096),
+    )
+    .unwrap();
+    let head = second.value.unwrap();
+    assert!(matches!(head.head.start, StartLine::Request { .. }));
+    assert_eq!(head.descriptors.descriptors.len(), 1);
+    assert!(!head.descriptors.truncated);
+    drop(head);
+    drop(second.connection);
+    let mut byte = [0];
+    assert_eq!(read.read(&mut byte).unwrap(), 0);
+}
+
+/// A plain head and a descriptor-bearing head read by one `recvmsg`.
+#[test]
+fn pipelined_head_descriptors_attach_to_their_own_head() {
+    pipelined_heads(&[b"POST /b HTTP/1.1\r\nContent-Length: 0\r\n\r\n"]);
+}
+
+/// The descriptor-bearing skb carries only part of the second head.
+#[test]
+fn pipelined_fragmented_head_keeps_its_descriptors() {
+    pipelined_heads(&[b"POST /b HTTP/1.1\r\n", b"Content-Length: 0\r\n\r\n"]);
+}
+
+/// Descriptors carried with read-ahead close when the connection drops.
+#[test]
+fn carried_head_descriptors_close_with_the_connection() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    let io = io();
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let server = ConnectionLease::from_reserved(server.into(), (), ()).unwrap();
+    let (mut read, write) = descriptor_probe();
+    client.write_all(b"HEAD /a HTTP/1.1\r\n\r\n").unwrap();
+    send_with_fds(&client, b"POST /b HTTP/1.1\r\n", &[write.as_raw_fd()]);
+    drop(write);
+    let first = drive(
+        &io,
+        io.receive_request_head_with_descriptors(server, &RequestScope, 4096),
+    )
+    .unwrap();
+    assert!(first.value.unwrap().descriptors.descriptors.is_empty());
+    drop(first.connection);
+    let mut byte = [0];
+    assert_eq!(read.read(&mut byte).unwrap(), 0);
+}

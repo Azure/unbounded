@@ -300,6 +300,10 @@ pub struct ConnectionLease<C: Context> {
 
     read_ahead: Option<(OwnedBuffer<C>, Range<usize>)>,
 
+    /// Descriptors from the receive that produced `read_ahead`. They belong to
+    /// a later request head that starts inside those bytes.
+    ahead_descriptors: ReceivedDescriptors,
+
     rx_remaining: Option<u64>,
 
     tx_remaining: Option<u64>,
@@ -333,6 +337,27 @@ pub struct ReceivedDescriptors {
 
     /// Some ancillary data was truncated (`MSG_CTRUNC`) and its descriptors lost.
     pub truncated: bool,
+}
+
+impl ReceivedDescriptors {
+    /// Whether any descriptor or truncation was recorded.
+    fn has_any(&self) -> bool {
+        self.truncated || !self.descriptors.is_empty()
+    }
+
+    /// Move `other` into `self`, closing descriptors beyond the head cap.
+    fn absorb(&mut self, other: ReceivedDescriptors) {
+        self.truncated |= other.truncated;
+        for descriptor in other.descriptors {
+            if self.descriptors.len() < MAX_HEAD_DESCRIPTORS {
+                self.descriptors.push(descriptor);
+            } else {
+                // Over the aggregate cap: close now and reject the head.
+                drop(descriptor);
+                self.truncated = true;
+            }
+        }
+    }
 }
 
 /// A decoded request head and the descriptors that arrived with it.
@@ -648,6 +673,20 @@ impl<C: Context> HttpIo<C> {
             let mut buffer = self.buffer(codec.header_limit().min(4096.max(ahead_length)))?;
             let mut used = 0;
             let mut scan = HeadScan::default();
+            // Descriptors of the most recent receive (or of the carried
+            // read-ahead). Linux unix_stream_read_generic (net/unix/af_unix.c)
+            // may merge several skbs into one recvmsg but stops right after an
+            // skb carrying SCM_RIGHTS (`if (scm.fp) break;`). A client sends a
+            // head's descriptors with the start of that head, so descriptors
+            // returned by one receive belong to the last head starting in its
+            // bytes. Earlier chunks always belong to the current head; the
+            // last chunk does too unless bytes remain after this head ends.
+            let mut last = std::mem::take(&mut connection.ahead_descriptors);
+            if ancillary.is_none() && last.has_any() {
+                // The caller does not accept descriptors: close and reject.
+                drop(last);
+                return Ok(rejected_head(connection, Error::Malformed));
+            }
             if let Some((ahead, range)) = connection.read_ahead.take() {
                 if range.len() > buffer.bytes.len() {
                     return Ok(rejected_head(connection, Error::HeadTooLarge));
@@ -697,6 +736,11 @@ impl<C: Context> HttpIo<C> {
                     buffer.bytes[..end].zeroize();
                     if used > end {
                         connection.read_ahead = Some((buffer, end..used));
+                        // A later head starts in the last chunk; keep its
+                        // descriptors for that head.
+                        connection.ahead_descriptors = std::mem::take(&mut last);
+                    } else if let Some(sink) = &ancillary {
+                        sink.borrow_mut().absorb(std::mem::take(&mut last));
                     }
                     let head = connection.state_mut().admit(head)?;
                     // Admission may remove authentication fields, but it must not
@@ -726,15 +770,17 @@ impl<C: Context> HttpIo<C> {
                         .reactor
                         .recv_msg(connection.socket(), range, connection, scope)
                         .await?;
+                    // The previous chunk did not complete this head, so its
+                    // descriptors belong to it.
                     let mut sink = sink.borrow_mut();
-                    sink.truncated |= received.truncated;
+                    sink.absorb(std::mem::take(&mut last));
+                    last.truncated = received.truncated;
                     for descriptor in received.descriptors {
-                        if sink.descriptors.len() < MAX_HEAD_DESCRIPTORS {
-                            sink.descriptors.push(descriptor);
+                        if last.descriptors.len() < MAX_HEAD_DESCRIPTORS {
+                            last.descriptors.push(descriptor);
                         } else {
-                            // Over the aggregate cap: close now and reject the head.
                             drop(descriptor);
-                            sink.truncated = true;
+                            last.truncated = true;
                         }
                     }
                     Completion {
@@ -1112,6 +1158,7 @@ impl<C: Context> ConnectionLease<C> {
             pool,
             reusable: false,
             read_ahead: None,
+            ahead_descriptors: ReceivedDescriptors::default(),
             rx_remaining: None,
             tx_remaining: None,
             request_is_head: false,
@@ -1158,6 +1205,12 @@ impl<C: Context> ConnectionLease<C> {
     pub fn next_round(&mut self) -> Result<C, ()> {
         if self.rx_remaining != Some(0) || self.tx_remaining != Some(0) || self.read_ahead.is_some()
         {
+            return Err(Error::Malformed.into());
+        }
+        if self.ahead_descriptors.has_any() {
+            // Carried descriptors without the bytes of their head: close them.
+            self.ahead_descriptors = ReceivedDescriptors::default();
+            self.poison();
             return Err(Error::Malformed.into());
         }
         self.reusable = false;
@@ -2108,6 +2161,7 @@ fn rejected_head<C: Context>(
 ) -> HeadCompletion<C, Result<C, MessageHead>> {
     connection.poison();
     connection.read_ahead = None;
+    connection.ahead_descriptors = ReceivedDescriptors::default();
     connection.rx_remaining = None;
     connection.request_is_head = false;
     HeadCompletion {

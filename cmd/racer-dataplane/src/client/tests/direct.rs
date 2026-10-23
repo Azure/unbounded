@@ -511,3 +511,34 @@ fn gpu_read_delivers_pages_through_the_backend_seam() {
 }
 
 mod gpu;
+
+/// A plain HEAD pipelined ahead of a host-read on one connection: one receive
+/// can return both heads with the host-read's descriptor. The descriptor must
+/// not be attached to the HEAD, so the HEAD is served. The http layer rejects
+/// pipelining at exchange completion, so the connection then closes without
+/// serving the host-read and closes its carried descriptor.
+#[test]
+fn pipelined_head_then_host_read_serves_the_head_and_closes_the_descriptor() {
+    let fixture = direct_fixture(b"hello".to_vec(), None);
+    let mut memfd = Memfd::new();
+    memfd.file.write_all(&[b'.'; 8]).unwrap();
+    let mut socket = fixture.connect();
+    socket.write_all(&request("HEAD", "")).unwrap();
+    send_with_fds(
+        &socket,
+        &direct_request(
+            "host-read",
+            "Racer-Destination-Offset: 0\r\nRacer-Destination-Length: 5\r\n",
+        ),
+        &[memfd.file.as_raw_fd()],
+    );
+    let output = fixture.receive(&mut socket, true);
+    let (head, rest) = split(&output);
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert!(head.contains("content-length: 5\r\n"), "{head}");
+    assert!(rest.is_empty(), "pipelined request is not served");
+    assert_eq!(memfd.contents(), b"........");
+    settle(&fixture);
+    assert_eq!(memfd.open_copies(), 1, "dataplane closed its copy");
+    assert_no_body_leases(&fixture);
+}
