@@ -461,12 +461,18 @@ func (q *queue) drain() error {
 	q.pending = nil
 	q.mu.Unlock()
 
-	for _, c := range done {
-		q.setBusy(c.tag, false)
-
+	for i, c := range done {
 		if err := q.prepIO(uIOCommitAndFetchReq, c.tag, c.res); err != nil {
+			// Put back every result not yet prepared, and keep its tag
+			// busy, so a rescue commits it instead of losing it.
+			q.mu.Lock()
+			q.pending = append(done[i:], q.pending...)
+			q.mu.Unlock()
+
 			return err
 		}
+
+		q.setBusy(c.tag, false)
 	}
 
 	return nil
