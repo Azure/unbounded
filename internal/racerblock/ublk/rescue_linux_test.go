@@ -32,11 +32,12 @@ type preparedIO struct {
 	res int32
 }
 
-// prepared returns the io commands prepared on r since its last submit.
+// prepared returns the io commands prepared on r that the kernel has
+// not consumed.
 func prepared(r *uring) []preparedIO {
 	var out []preparedIO
 
-	for i := atomic.LoadUint32(r.sqTail); i != r.sqLocalTail; i++ {
+	for i := atomic.LoadUint32(r.sqHead); i != r.sqLocalTail; i++ {
 		idx := i & r.sqMask
 		s := (*sqe)(unsafe.Pointer(&r.sqes[int(idx)*sqe128Size]))
 
@@ -299,5 +300,77 @@ func TestRescueDuringTeardownSkipsStoppedQueue(t *testing.T) {
 
 	if q.oldRing != nil || isClosed(q.serving) {
 		t.Fatal("stopped queue was rescued")
+	}
+}
+
+// TestDrainKeepsCompletionsAfterPrepFailure fills a tiny ring and makes
+// its submission fail, so drain fails partway through several finished
+// handler results. Every result it could not prepare must stay pending
+// with its tag still busy, so a rescue commits the real result through
+// drain instead of losing it, and the sweep must not answer those tags.
+func TestDrainKeepsCompletionsAfterPrepFailure(t *testing.T) {
+	q := newEIOQueue(t)
+	q.busy = make([]bool, q.depth)
+
+	// A two-entry ring holds two commits; the third needs a submit,
+	// which fails on a bad fd.
+	small := newTestRing(t, 2)
+	fd := small.fd
+	small.fd = -1
+
+	t.Cleanup(func() { small.fd = fd })
+
+	q.ring = small
+
+	for tag := range uint16(q.depth) {
+		q.busy[tag] = true
+		q.complete(tag, int32(100+tag))
+	}
+
+	if err := q.drain(); err == nil {
+		t.Fatal("drain succeeded on a ring that cannot submit")
+	}
+
+	var committed []uint16
+	for _, p := range prepared(small) {
+		committed = append(committed, p.tag)
+	}
+
+	if want := []uint16{0, 1}; !slices.Equal(committed, want) {
+		t.Fatalf("committed %v before the failure, want %v", committed, want)
+	}
+
+	for tag := range uint16(q.depth) {
+		want := !slices.Contains(committed, tag)
+		if q.busy[tag] != want {
+			t.Errorf("tag %d busy = %v, want %v", tag, q.busy[tag], want)
+		}
+	}
+
+	// A rescue now sweeps and drains on a working ring.
+	q.ring = newTestRing(t, uint32(2*q.depth+2))
+
+	if err := q.sweep(-int32(syscall.EIO)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := q.drain(); err != nil {
+		t.Fatal(err)
+	}
+
+	results := map[uint16][]int32{}
+	for _, p := range prepared(q.ring) {
+		results[p.tag] = append(results[p.tag], p.res)
+	}
+
+	for tag := range uint16(q.depth) {
+		want := []int32{-int32(syscall.EIO)}
+		if !slices.Contains(committed, tag) {
+			want = []int32{int32(100 + tag)}
+		}
+
+		if !slices.Equal(results[tag], want) {
+			t.Errorf("tag %d committed %v by the rescue, want %v", tag, results[tag], want)
+		}
 	}
 }
