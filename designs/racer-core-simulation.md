@@ -187,6 +187,11 @@ Verified against the code at the start of this work.
    comparisons (`step::cost::notify`). The `limits.rs` comment now says so; the behavior is
    unchanged.
 
+2. `RouteBudget::forwarded` and `RouteBudget::validate_forwarded`
+   (`cmd/racer-dataplane/src/topology.rs:536`, `:552`) are called only by tests. They use the search form, where
+   `visited` excludes the sender, while the signed wire form includes it (`racer_core::route`). The two
+   conventions are inconsistent; a future caller must pick the right one.
+
 ## Simulator engine (racer-sim substrate)
 
 `cmd/racer-dataplane/sim` provides the substrate the extracted logic plugs into:
@@ -287,3 +292,24 @@ the runtime's `simulation` feature already controls. `step::cost` models notify 
 `step::cluster::ControlPlane` simulates N Pods (enrollment lottery, seats, primary failover,
 follower image copies, client long polls) from the real steps with typed Leases; 50k Pods for 300
 simulated seconds takes about 66 s in release, dominated by `plan_pass` at 50k members.
+
+## Track: peer
+
+- Route budget: `racer_core::route` is the single rule for both forms. The hop limit is 8 links and is enforced.
+  On the wire `visited` includes the sender, so the check `visited + links <= 9` is exactly 8 links; it is not
+  tightened further.
+- Per-hop decisions: `racer_core::peer::hop::decide_hop` returns `StaleMembership`, `Serve`, or
+  `Relay(RelayPlan)`. The failure tables (`relay_failure`, `serve_failure`, `waiter_failure`,
+  `operation_link_outcome`, `exchange_link_outcome`, `exchange_admission_outcome`) take the core `Fault`; the
+  dataplane maps its `Error` with `Error::fault`. `Server::dispatch`, the opaque HTTP relay path,
+  `dispatch_verified`, `Requester::exchange`, and `LinkHealth::run` call them.
+- Response validity: `racer_core::peer::validity` holds the typed rules (authority, not-found, grant membership,
+  receiver, deadline, page and byte budgets, flights, hold, bootstrap). `response_matches` and
+  `response_authority` parse headers and call them in the same short-circuit order.
+- Subscriptions: `racer_core::peer::subscriptions::Scheduler` is the token-based scheduler. Every transition is
+  a method (`admit`, `release`, `select`, `complete`, `cancel_work`, `take_work`, `poll`, `cancel_waiter`,
+  `advance`); methods with `now_ms` expire first; `take_wakes` returns the tokens a transition readied. The
+  dataplane wrapper owns the mutex, the `Arc` handles, and a token-to-`Waker` map; handle `Drop` calls
+  `cancel_work`, `cancel_waiter`, or `release`.
+- Clocks: `LinkHealth::acquire_at` and `AdaptivePeers::with_clock` take time explicitly; the existing
+  constructors and methods pass the runtime clock.
