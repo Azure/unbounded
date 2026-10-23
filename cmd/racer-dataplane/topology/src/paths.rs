@@ -46,7 +46,15 @@ pub struct PathQuery<'a> {
 /// Finds routes and caches the results.
 ///
 /// Use one per worker thread. It does no I/O and has no timers.
-pub struct Paths {
+///
+/// `S` decides how searches run. The default, [`Exhaustive`], searches the
+/// graph. [`SharedRoutes`] replays searches from a memo shared by many
+/// `Paths`, for simulation: each `Paths` keeps only its own LRU of keys and
+/// in-flight counters, while hits, misses, evictions, admission limits, and
+/// the number of polls per search stay identical.
+pub struct Paths<S: Searches = Exhaustive> {
+    searches: S,
+
     cache_entries: usize,
 
     cache_bytes: usize,
@@ -55,7 +63,125 @@ pub struct Paths {
 
     cache: RefCell<PathCache>,
 
-    inflight: RefCell<BTreeMap<PathKey, Rc<RefCell<SharedSearch>>>>,
+    inflight: RefCell<BTreeMap<PathKey, Rc<RefCell<SharedSearch<S>>>>>,
+}
+
+/// How [`Paths`] runs one route search.
+pub trait Searches {
+    /// State of one running search.
+    type Search;
+
+    /// Start a search for `key` on `membership`'s graph.
+    fn start<M: Member>(&self, membership: &Membership<M>, key: &PathKey) -> Self::Search;
+
+    /// Do one bounded step. Returns true when the search is done.
+    fn step(&self, search: &mut Self::Search) -> bool;
+
+    /// Routes found by a finished search.
+    ///
+    /// # Errors
+    /// Returns [`Error::Unreachable`] when no route fits.
+    fn finish(&self, search: &Self::Search) -> Result<Alternatives>;
+}
+
+/// Default [`Searches`]: run the real bidirectional search.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Exhaustive;
+
+impl Searches for Exhaustive {
+    type Search = EqualCostSearch;
+
+    #[inline]
+    fn start<M: Member>(&self, membership: &Membership<M>, key: &PathKey) -> EqualCostSearch {
+        EqualCostSearch::new(membership.graph(), key)
+    }
+
+    #[inline]
+    fn step(&self, search: &mut EqualCostSearch) -> bool {
+        let step = search.step(SEARCH_QUANTUM);
+        debug_assert!(
+            step.expansions <= SEARCH_QUANTUM && step.edges <= step.expansions * MAX_DEGREE
+        );
+        step.done
+    }
+
+    #[inline]
+    fn finish(&self, search: &EqualCostSearch) -> Result<Alternatives> {
+        search.finish().map(Rc::new)
+    }
+}
+
+/// Simulation [`Searches`]: replay results from a shared memo.
+///
+/// The first search for a key runs the real search to completion and records
+/// how many steps it took and its result. Later searches for the same key, by
+/// any `Paths` sharing this memo, count down the same number of steps and
+/// return the same shared result. Keys include the graph identity, so a memo
+/// entry never outlives its meaning. [`SharedRoutes::forget`] bounds memory.
+#[derive(Clone, Default)]
+pub struct SharedRoutes {
+    memo: Rc<RefCell<RouteMemo>>,
+}
+
+/// Steps and result of each memoized search.
+type RouteMemo = std::collections::HashMap<PathKey, (usize, Result<Alternatives>)>;
+
+/// One replayed search: steps left and the shared result.
+pub struct ReplayedSearch {
+    remaining: usize,
+
+    result: Result<Alternatives>,
+}
+
+impl SharedRoutes {
+    /// Create an empty shared memo.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of memoized searches.
+    #[must_use]
+    pub fn memo_len(&self) -> usize {
+        self.memo.borrow().len()
+    }
+
+    /// Drop memoized searches for every graph except `keep` (topology
+    /// identities).
+    pub fn forget(&self, keep: &[[u8; 32]]) {
+        self.memo
+            .borrow_mut()
+            .retain(|key, _| keep.contains(&key.membership));
+    }
+}
+
+impl Searches for SharedRoutes {
+    type Search = ReplayedSearch;
+
+    fn start<M: Member>(&self, membership: &Membership<M>, key: &PathKey) -> ReplayedSearch {
+        let mut memo = self.memo.borrow_mut();
+        let (steps, result) = memo.entry(key.clone()).or_insert_with(|| {
+            let mut search = Exhaustive.start(membership, key);
+            let mut steps = 1;
+            while !Exhaustive.step(&mut search) {
+                steps += 1;
+            }
+            (steps, Exhaustive.finish(&search))
+        });
+        ReplayedSearch {
+            remaining: *steps,
+            result: result.clone(),
+        }
+    }
+
+    fn step(&self, search: &mut ReplayedSearch) -> bool {
+        search.remaining -= 1;
+        search.remaining == 0
+    }
+
+    fn finish(&self, search: &ReplayedSearch) -> Result<Alternatives> {
+        search.result.clone()
+    }
 }
 
 /// Most nodes one poll may expand before yielding.
@@ -69,8 +195,8 @@ type Result<T> = std::result::Result<T, Error>;
 
 /// Cache key for a search. Weights and seed are left out on purpose, so
 /// requests that differ only in those share one search.
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
-struct PathKey {
+#[derive(Clone, Eq, Hash, PartialEq, Ord, PartialOrd)]
+pub struct PathKey {
     membership: [u8; 32],
 
     from: usize,
@@ -127,7 +253,7 @@ impl PathKey {
 }
 
 /// Candidate routes, one per usable first hop.
-type Alternatives = Rc<Vec<Vec<usize>>>;
+pub type Alternatives = Rc<Vec<Vec<usize>>>;
 
 /// LRU cache of search results, limited by entry count and bytes.
 #[derive(Default)]
@@ -251,18 +377,18 @@ impl PathCache {
 }
 
 /// A search that several callers may be waiting on.
-enum SharedSearch {
-    Working(Box<EqualCostSearch>),
+enum SharedSearch<S: Searches> {
+    Working(Box<S::Search>),
 
     Done(Result<Alternatives>),
 }
 
-impl SharedSearch {
+impl<S: Searches> SharedSearch<S> {
     /// Run one small step. When done, cache the result and share it with
     /// every waiter.
     fn poll(
         &mut self,
-        paths: &Paths,
+        paths: &Paths<S>,
         key: &PathKey,
         cx: &std::task::Context<'_>,
     ) -> Poll<Result<Alternatives>> {
@@ -270,16 +396,12 @@ impl SharedSearch {
             Self::Working(search) => search,
             Self::Done(result) => return Poll::Ready(result.clone()),
         };
-        let step = search.step(SEARCH_QUANTUM);
-        debug_assert!(
-            step.expansions <= SEARCH_QUANTUM && step.edges <= step.expansions * MAX_DEGREE
-        );
-        if !step.done {
+        if !paths.searches.step(search) {
             // Every waiter drives progress; no leader or unbounded waker list.
             cx.waker().wake_by_ref();
             return Poll::Pending;
         }
-        let result = search.finish().map(Rc::new);
+        let result = paths.searches.finish(search);
         if let Ok(alternatives) = &result {
             paths.store(key.clone(), Rc::clone(alternatives));
         }
@@ -290,15 +412,15 @@ impl SharedSearch {
 }
 
 /// One caller's hold on a running search.
-struct SearchAdmission<'a> {
-    paths: &'a Paths,
+struct SearchAdmission<'a, S: Searches> {
+    paths: &'a Paths<S>,
 
     key: PathKey,
 
-    shared: Rc<RefCell<SharedSearch>>,
+    shared: Rc<RefCell<SharedSearch<S>>>,
 }
 
-impl Drop for SearchAdmission<'_> {
+impl<S: Searches> Drop for SearchAdmission<'_, S> {
     /// If this is the last caller waiting, cancel the search.
     fn drop(&mut self) {
         let mut inflight = self.paths.inflight.borrow_mut();
@@ -329,7 +451,21 @@ impl Paths {
     /// memory limit. A result too big for the cache is not cached.
     #[must_use]
     pub fn with_limits(cache_entries: usize, cache_bytes: usize, active_searches: usize) -> Self {
+        Self::with_searches(cache_entries, cache_bytes, active_searches, Exhaustive)
+    }
+}
+
+impl<S: Searches> Paths<S> {
+    /// Like [`Paths::with_limits`], with a chosen [`Searches`] strategy.
+    #[must_use]
+    pub fn with_searches(
+        cache_entries: usize,
+        cache_bytes: usize,
+        active_searches: usize,
+        searches: S,
+    ) -> Self {
         Self {
+            searches,
             cache_entries,
             cache_bytes,
             search_limit: active_searches,
@@ -395,7 +531,7 @@ impl Paths {
                     return Err(Error::Overloaded);
                 }
                 let shared = Rc::new(RefCell::new(SharedSearch::Working(Box::new(
-                    EqualCostSearch::new(membership.graph(), &key),
+                    self.searches.start(membership, &key),
                 ))));
                 inflight.insert(key.clone(), Rc::clone(&shared));
                 shared
@@ -522,7 +658,7 @@ impl EqualCostWave {
 /// It tracks which first hops lead to each node. It finishes the whole layer
 /// where the sides meet, so every shortest first hop is found, not just the
 /// first one by ID. It keeps one route per first hop, not every route.
-struct EqualCostSearch {
+pub struct EqualCostSearch {
     graph: Arc<Vec<Vec<usize>>>,
 
     key: PathKey,
@@ -1770,5 +1906,120 @@ mod tests {
                 assert_eq!(search.finish(), Err(Error::Unreachable));
             }
         }
+    }
+
+    /// Replayed searches make the same decisions as real ones: results,
+    /// cache contents and bytes, admission, and polls per search.
+    #[test]
+    fn shared_routes_match_exhaustive_on_seeded_workloads() {
+        type Pending<'a> = std::pin::Pin<Box<dyn Future<Output = Result<Vec<usize>>> + 'a>>;
+        let generations: Vec<_> = [3000, 3001, 2900].into_iter().map(membership).collect();
+        let shared = SharedRoutes::new();
+        for seed in 1..=5u64 {
+            let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let mut draw = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let entries = usize::try_from(seed).unwrap() * 3;
+            let bytes = 4096 * usize::try_from(seed).unwrap();
+            let real = Paths::with_limits(entries, bytes, 3);
+            let replay = Paths::with_searches(entries, bytes, 3, shared.clone());
+            let seeds: Vec<[u8; 1]> = (0..4).map(|i| [i]).collect();
+            let visited = [7usize, 8];
+            let mut held: Vec<(Pending<'_>, Pending<'_>)> = Vec::new();
+            let mut cx = Context::from_waker(noop_waker_ref());
+            let mut pended = 0;
+            for step in 0..2000 {
+                let value = draw();
+                let members = &generations[usize::try_from(value % 3).unwrap()];
+                let count = members.members().len() as u64;
+                let from = usize::try_from((value >> 8) % 4).unwrap();
+                let to = usize::try_from((value >> 16) % count).unwrap();
+                let query = PathQuery {
+                    from,
+                    to,
+                    links: 1 + u8::try_from((value >> 24) % 8).unwrap(),
+                    visited: if value & (1 << 40) != 0 && to > 8 {
+                        &visited
+                    } else {
+                        &[]
+                    },
+                    blocked: &[],
+                    seed: &seeds[usize::try_from((value >> 32) % 4).unwrap()],
+                };
+                if value % 4 == 0 && !held.is_empty() {
+                    let index = usize::try_from(value >> 44).unwrap() % held.len();
+                    let (a, b) = &mut held[index];
+                    let (x, y) = (a.as_mut().poll(&mut cx), b.as_mut().poll(&mut cx));
+                    assert_eq!(x, y, "seed {seed} step {step}");
+                    if x.is_ready() || value & (1 << 50) != 0 {
+                        drop(held.swap_remove(index));
+                    }
+                } else {
+                    let mut a: Pending<'_> = Box::pin(real.route(members, query));
+                    let mut b: Pending<'_> = Box::pin(replay.route(members, query));
+                    let (x, y) = (a.as_mut().poll(&mut cx), b.as_mut().poll(&mut cx));
+                    assert_eq!(x, y, "seed {seed} step {step}");
+                    if x.is_pending() {
+                        pended += 1;
+                        held.push((a, b));
+                    }
+                }
+                assert_eq!(real.cached_entries(), replay.cached_entries());
+                assert_eq!(real.cached_bytes(), replay.cached_bytes());
+                assert_eq!(real.active_searches(), replay.active_searches());
+            }
+            drop(held);
+            assert!(pended > 0);
+            assert_eq!(real.active_searches(), 0);
+            assert_eq!(replay.active_searches(), 0);
+        }
+        assert!(shared.memo_len() > 0);
+        let keep = generations[0].topology_identity();
+        shared.forget(&[keep]);
+        assert!(shared.memo_len() > 0);
+        shared.forget(&[]);
+        assert_eq!(shared.memo_len(), 0);
+    }
+
+    /// Many replaying `Paths` share one result allocation.
+    #[test]
+    fn shared_routes_share_results_across_nodes() {
+        let members = membership(500);
+        let shared = SharedRoutes::new();
+        let nodes: Vec<_> = (0..20)
+            .map(|_| Paths::with_searches(8, 1 << 20, 2, shared.clone()))
+            .collect();
+        for node in &nodes {
+            assert_eq!(
+                block_on(node.route(&members, query(0, 250, 8))),
+                block_on(Paths::new(0).route(&members, query(0, 250, 8)))
+            );
+        }
+        assert_eq!(shared.memo_len(), 1);
+        let first = nodes[0]
+            .cache
+            .borrow()
+            .entries
+            .values()
+            .next()
+            .unwrap()
+            .alternatives
+            .clone();
+        for node in &nodes {
+            let cache = node.cache.borrow();
+            assert!(Rc::ptr_eq(
+                &cache.entries.values().next().unwrap().alternatives,
+                &first
+            ));
+        }
+        assert!(std::mem::size_of::<ReplayedSearch>() <= 32);
+        assert_eq!(
+            block_on(nodes[0].route(&members, query(0, 250, 0))),
+            Err(Error::Unreachable)
+        );
     }
 }

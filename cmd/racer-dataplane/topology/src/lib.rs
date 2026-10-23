@@ -131,7 +131,10 @@ mod paths;
 /// Choosing which members store a key.
 mod placement;
 
-pub use paths::{PathQuery, Paths};
+pub use paths::{
+    Alternatives, EqualCostSearch, Exhaustive, PathKey, PathQuery, Paths, ReplayedSearch, Searches,
+    SharedRoutes,
+};
 
 pub use placement::{
     Maintenance, Phantom, PhantomEntry, Placement, REPLICAS, Ranking, RankingEntry, Rankings,
