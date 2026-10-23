@@ -4,10 +4,12 @@
 package authn
 
 import (
+	"bufio"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -79,7 +81,12 @@ func newOIDCTestIssuer(t *testing.T) *oidcTestIssuer {
 				select {
 				case <-gate.release:
 				case <-r.Context().Done():
-					return
+					// Abort without writing a response. Returning normally
+					// would send an empty 200, which the client transport
+					// can still accept if it arrives while the canceled
+					// caller is tearing down the connection (the TLS
+					// close_notify reaches the server before the TCP close).
+					panic(http.ErrAbortHandler)
 				}
 			}
 
@@ -630,6 +637,56 @@ func TestOIDCConstructorCancellation(t *testing.T) {
 	}
 
 	issuer.assertRequests(t, 2)
+}
+
+// TestOIDCTestIssuerCanceledRefreshSendsNoResponse pins the fixture contract
+// that TestOIDCConstructorCancellation relies on: once a gated JWKS request is
+// canceled, the issuer must not answer it. CloseWrite sends TLS close_notify,
+// which ends the server request context, while the read side stays open to
+// observe anything the handler writes afterward.
+func TestOIDCTestIssuerCanceledRefreshSendsNoResponse(t *testing.T) {
+	issuer := newOIDCTestIssuer(t)
+	gate := issuer.blockRefresh(t)
+
+	transport, ok := issuer.server.Client().Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("unexpected test client transport %T", issuer.server.Client().Transport)
+	}
+
+	conn, err := tls.Dial("tcp", issuer.server.Listener.Addr().String(), transport.TLSClientConfig.Clone())
+	if err != nil {
+		t.Fatalf("dial issuer: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := fmt.Fprintf(conn, "GET /keys HTTP/1.1\r\nHost: %s\r\n\r\n", issuer.server.Listener.Addr()); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	select {
+	case <-gate.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("JWKS request did not reach the refresh gate")
+	}
+
+	if err := conn.CloseWrite(); err != nil {
+		t.Fatalf("send close_notify: %v", err)
+	}
+
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err == nil {
+		_ = resp.Body.Close()
+		t.Fatalf("canceled JWKS request received response %s", resp.Status)
+	}
+
+	var netErr interface{ Timeout() bool }
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		t.Fatalf("issuer neither responded nor closed the connection: %v", err)
+	}
 }
 
 func TestOIDCRefreshOutlivesInitializationContext(t *testing.T) {
