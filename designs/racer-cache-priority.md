@@ -89,7 +89,10 @@ Rules:
 
 Page-index eviction ranks victims by the tuple `(under_share, score, age)`.
 Over-share pages are taken before any under-share page, then lower score, then
-older.
+older. Each eviction first scans over-share caches through a per-cache age
+order, splitting a 64-page budget across them, so older under-share pages
+cannot hide them. Only if that finds no unheld page does it scan 64 pages of
+the global order.
 
 Segment reclamation works on whole segments, and a segment holds pages from many
 caches. Segment value weights under-share pages heavily, so segments that hold

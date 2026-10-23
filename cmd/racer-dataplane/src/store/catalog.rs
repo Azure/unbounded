@@ -15,6 +15,7 @@ use page_alloc::Extent;
 use page_alloc::Generation;
 use page_alloc::SegmentId;
 use page_alloc::Segments;
+use racer_control_wire::CacheId;
 use racer_control_wire::KeyId;
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -58,10 +59,10 @@ pub struct Index {
 }
 /// Production mappings use randomized hashing, as did the original catalog.
 #[cfg(not(test))]
-type Pages = page_alloc::index::PageIndex<PageId, IndexedPage>;
+type Pages = page_alloc::index::PageIndex<PageId, IndexedPage, std::hash::RandomState, CacheId>;
 /// Simulation keeps its deterministic hash state across the extraction boundary.
 #[cfg(test)]
-type Pages = page_alloc::index::PageIndex<PageId, IndexedPage, crate::runtime::HashState>;
+type Pages = page_alloc::index::PageIndex<PageId, IndexedPage, crate::runtime::HashState, CacheId>;
 
 #[derive(Default)]
 struct State {
@@ -840,15 +841,38 @@ impl Index {
             payload: None,
         })
     }
-    /// Scan at most 64 candidates with a separate cursor. Publication ordering is
-    /// never changed by retention, so checkpoint traversal remains monotonic.
+    /// Pick one victim with bounded work and separate cursors. Publication
+    /// ordering is never changed by retention, so checkpoint traversal remains
+    /// monotonic.
+    ///
+    /// Over-share caches are scanned first through their own per-cache order,
+    /// so a full window of under-share pages cannot hide them. The 64-candidate
+    /// budget is split across over-share caches, at least one each. Only when
+    /// that finds no unheld page does the global window rank all caches.
     fn victim(&self, state: &State) -> Option<PageId> {
+        const BUDGET: usize = 64;
         let retention = self.retention();
         let scoring = retention.scoring_at(uring_runtime::environment::now(), self.disk_capacity());
+        let eligible =
+            |page: &PageId, _: &IndexedPage| (!self.is_held(page)).then(|| scoring.rank(page));
+        // One classification per cache with mappings, memoized by the pass.
+        let over: Vec<&CacheId> = state
+            .pages
+            .groups()
+            .filter(|cache| scoring.over_share(cache))
+            .collect();
+        if !over.is_empty() {
+            let per_cache = (BUDGET / over.len()).max(1);
+            if let Some(victim) =
+                state
+                    .pages
+                    .victim_in_groups(over.iter().copied(), per_cache, eligible)
+            {
+                return Some(victim);
+            }
+        }
         // Over-share pages go first, then lower score; the index breaks ties by age.
-        state.pages.victim_if(64, |page, _| {
-            (!self.is_held(page)).then(|| scoring.rank(page))
-        })
+        state.pages.victim_if(BUDGET, eligible)
     }
     /// Reserve one potential new mapping, optionally evicting a low-value mapping.
     /// Replacement writes also reserve: concurrent invalidation may remove the old
@@ -943,9 +967,10 @@ impl Index {
             .or_insert((entry.metadata.clone(), 0));
         version.1 += 1;
         let segment = entry.location.segment;
+        let cache = page.version.object.cache.clone();
         state
             .pages
-            .insert(page, entry, segment)
+            .insert_in(page, entry, segment, cache)
             .expect("preflighted publication age");
         state.residents.insert(resident.page.clone(), resident);
         Ok(())
@@ -2944,6 +2969,113 @@ mod priority_tests {
         }
         let victim = even.victim(&even.state.borrow()).unwrap();
         assert_eq!(victim.version.object.cache, cache("a"));
+    }
+
+    /// 64 older under-share pages fill the global window ahead of one newer
+    /// over-share page. The index holds 65 mappings.
+    fn window_hides_over_share(index: &Index) -> (Vec<PageId>, PageId) {
+        let a = (0..64)
+            .map(|n| publish(index, "a", &n.to_string(), 0))
+            .collect();
+        let z = publish(index, "z", "0", 0);
+        assert!(
+            index
+                .retention()
+                .over_share(&cache("z"), index.disk_capacity())
+        );
+        assert!(
+            !index
+                .retention()
+                .over_share(&cache("a"), index.disk_capacity())
+        );
+        (a, z)
+    }
+
+    #[test]
+    fn index_victim_finds_over_share_page_beyond_global_window() {
+        let index = index(65, &[("a", 1000), ("z", 0)]);
+        let (a, z) = window_hides_over_share(&index);
+        // Make every under-share page cold and the over-share page hot.
+        for _ in 0..8 {
+            index.retention().touch(&z);
+        }
+        assert_eq!(index.victim(&index.state.borrow()), Some(z));
+        drop(index.reserve_page(true).unwrap());
+        assert_accounting(&index);
+        assert_eq!(index.retention().cache_payload_bytes(&cache("z")), 0);
+        assert_eq!(
+            index.retention().cache_payload_bytes(&cache("a")),
+            64 * PAGE
+        );
+        // Nothing is over share any more: the global window decides.
+        let victim = index.victim(&index.state.borrow()).unwrap();
+        assert!(a.contains(&victim));
+    }
+
+    #[test]
+    fn index_victim_beyond_window_falls_back_when_over_share_is_held() {
+        let index = index(65, &[("a", 1000), ("z", 0)]);
+        let segments = segments(17);
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        drop(segments.append(4 * PAGE as usize).unwrap());
+        let (a, z) = window_hides_over_share(&index);
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        index.reserve_hold(&z.version, 1, until).unwrap();
+        // A held over-share page is never taken; an under-share page is.
+        let victim = index.victim(&index.state.borrow()).unwrap();
+        assert!(a.contains(&victim));
+        assert_ne!(victim, z);
+    }
+
+    #[test]
+    fn index_victim_beyond_window_takes_unavailable_over_share_cache() {
+        let index = index(65, &[("a", 1000), ("z", 0)]);
+        let (_, z) = window_hides_over_share(&index);
+        // "z" leaves the publication: its pages stay indexed but unreadable.
+        let mut index = Rc::into_inner(index).unwrap();
+        index.availability = crate::test_support::availability_for(vec![cache("a")]);
+        assert!(index.lookup(&z).unwrap().is_none());
+        assert_eq!(index.victim(&index.state.borrow()), Some(z));
+    }
+
+    #[test]
+    fn index_victim_beyond_window_follows_live_reweight() {
+        let index = index(65, &[("a", 1000), ("z", 0)]);
+        let (a, z) = window_hides_over_share(&index);
+        assert_eq!(index.victim(&index.state.borrow()), Some(z.clone()));
+        // Reweight without republishing: "a" is now over share and "z" is not.
+        let weights = index.retention().weights();
+        weights.update(&[definition("a", 0), definition("z", 1000)]);
+        let victim = index.victim(&index.state.borrow()).unwrap();
+        assert!(a.contains(&victim));
+        // Restore: the next decision sees the old weights again.
+        weights.update(&[definition("a", 1000), definition("z", 0)]);
+        assert_eq!(index.victim(&index.state.borrow()), Some(z));
+    }
+
+    #[test]
+    fn index_victim_splits_budget_across_over_share_caches() {
+        // A 16-page disk with 110 mappings: both caches are over share.
+        let index = index(200, &[("a", 500), ("b", 500)]);
+        let segments = segments(4);
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let a: Vec<_> = (0..100)
+            .map(|n| publish(&index, "a", &n.to_string(), 0))
+            .collect();
+        let b: Vec<_> = (0..10)
+            .map(|n| publish(&index, "b", &n.to_string(), 0))
+            .collect();
+        let capacity = index.disk_capacity();
+        assert_eq!(capacity, 16 * PAGE);
+        assert!(index.retention().over_share(&cache("a"), capacity));
+        assert!(index.retention().over_share(&cache("b"), capacity));
+        // The global window holds only hot "a" pages; "b" is cold.
+        for page in &a {
+            for _ in 0..8 {
+                index.retention().touch(page);
+            }
+        }
+        assert_eq!(index.victim(&index.state.borrow()), Some(b[0].clone()));
     }
 
     #[test]
