@@ -911,6 +911,7 @@ impl Requester {
     ) -> Operation<'a, transport::RelayResponse> {
         self.exchange_inner_mode(request, membership, relay, scope, false, None, None)
     }
+    #[allow(clippy::too_many_arguments)] // Keep transport, routing, and landing inputs explicit.
     fn exchange_inner_mode<'a>(
         &'a self,
         request: SignedRequest,

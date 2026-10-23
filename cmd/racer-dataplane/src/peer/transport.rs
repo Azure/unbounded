@@ -560,49 +560,14 @@ impl Transfers {
         let read = self.io.read_body_exact(connection, buffer, scope).await?;
         Ok((read.lease, read.buffer))
     }
-    /// Receiver: read the sender's one signed outcome. `Complete` means the page
-    /// is in the granted window; anything after that is `Io`, because the HTTP
-    /// body was never sent. `Finish` carries the HTTP body.
-    #[cfg(test)]
+    /// Receiver: read the sender's one signed outcome. `Complete` means the
+    /// page is in the granted window; anything after that is `Io`, because
+    /// the HTTP body was never sent. `Finish` carries the HTTP body. A landing
+    /// grant ([`Self::accept_native`] with a GPU) whose page the sender wrote
+    /// comes back as [`RelayResponse::Landed`]; any other page as
+    /// [`RelayResponse::Complete`].
     #[allow(clippy::too_many_arguments)] // Preserve explicit authenticated transfer inputs.
     pub(super) async fn receive_native(
-        &self,
-        connection: ConnectionLease,
-        authentication: ForwardedHead,
-        binding: Binding,
-        accept: SignedHead,
-        peer: NodeId,
-        control: SignedHead,
-        pending: PendingReceive,
-        membership: &std::sync::Arc<crate::topology::Membership>,
-        length: usize,
-        scope: &RequestScope,
-    ) -> Result<SignedResponse> {
-        match self
-            .receive_native_into(
-                connection,
-                authentication,
-                binding,
-                accept,
-                peer,
-                control,
-                pending,
-                membership,
-                length,
-                scope,
-            )
-            .await?
-        {
-            RelayResponse::Complete(response) => Ok(response),
-            _ => Err(Error::Internal),
-        }
-    }
-
-    /// Like [`Self::receive_native`], but a landing grant
-    /// ([`Self::accept_native`] with a GPU) whose page the sender wrote
-    /// comes back as [`RelayResponse::Landed`].
-    #[allow(clippy::too_many_arguments)] // Preserve explicit authenticated transfer inputs.
-    pub(super) async fn receive_native_into(
         &self,
         connection: ConnectionLease,
         authentication: ForwardedHead,
@@ -1353,7 +1318,7 @@ impl Transfers {
                 let (binding, accept, peer, pending) = native.ok_or(Error::Unauthorized)?;
                 let arriving = now();
                 let received = self
-                    .receive_native_into(
+                    .receive_native(
                         received.connection,
                         authentication,
                         binding,
@@ -2225,7 +2190,7 @@ mod tests {
                             .map(RelayResponse::Complete);
                     };
                     receiver
-                        .receive_native_into(
+                        .receive_native(
                             received.connection,
                             auth,
                             binding.clone(),
