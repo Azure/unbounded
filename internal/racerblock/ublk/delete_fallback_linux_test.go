@@ -243,9 +243,9 @@ func TestIntegrationDeleteFallbackCancelFirst(t *testing.T) {
 	rec.check(t)
 }
 
-// TestIntegrationDeleteFallbackExternalDelete has another process delete
-// the device with a synchronous DEL_DEV, which blocks until this process
-// releases the char device. Teardown's own pinned DEL_DEV finds it already
+// TestIntegrationDeleteFallbackExternalDelete deletes the device with a
+// synchronous DEL_DEV on a separate control channel, which blocks until the
+// device releases its char device. Teardown's own pinned DEL_DEV finds it already
 // marked deleted, is interrupted, and only then closes the fd, which lets
 // the external DEL_DEV return.
 func TestIntegrationDeleteFallbackExternalDelete(t *testing.T) {
@@ -256,19 +256,17 @@ func TestIntegrationDeleteFallbackExternalDelete(t *testing.T) {
 	d, logs := startFallbackDevice(t)
 	rec.pin(t, d)
 
-	delErr := make(chan error, 1)
-
-	go func() { delErr <- Delete(d.ID()) }()
+	delErr := directDelete(t, d.ID())
 
 	waitStopped(t, d)
 
 	select {
 	case err := <-delErr:
 		if err != nil {
-			t.Fatalf("external Delete: %v", err)
+			t.Fatalf("external DEL_DEV: %v", err)
 		}
 	case <-time.After(30 * time.Second):
-		t.Fatal("external Delete did not return")
+		t.Fatal("external DEL_DEV did not return")
 	}
 
 	checkFallback(t, d, logs)
