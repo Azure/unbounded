@@ -268,6 +268,12 @@ async fn bootstrap(shared: Rc<Shared>, outer: Arc<Outer>) {
             if initialized && !seat::state_markers_match(&secret, &uid) {
                 return Err(Error::InvalidState);
             }
+            // The installation records the racer-state UID it runs on in the
+            // DaemonSet and ServiceAccount. A replaced Secret must not become
+            // a new cluster identity, even on a fresh Node, so this gate runs
+            // before the cluster ID is set, and so before any seat election
+            // or state initialization.
+            bound_to_installation(&shared, &uid).await?;
             let node = shared
                 .lease_api
                 .get(&paths::node(&shared.config.node_name))
@@ -300,6 +306,33 @@ async fn bootstrap(shared: Rc<Shared>, outer: Arc<Outer>) {
             }
         }
     }
+}
+
+/// Annotation on the dataplane DaemonSet and ServiceAccount recording the
+/// racer-state Secret UID the installation runs on.
+pub(crate) const STATE_UID: &str = "unbounded-cloud.io/racer-state-uid";
+
+/// Require the live DaemonSet and ServiceAccount to record `uid`. Missing,
+/// terminating, unannotated, or mismatched objects fail closed; transient API
+/// errors retry.
+async fn bound_to_installation(shared: &Shared, uid: &str) -> Result<(), Error> {
+    let ns = &shared.config.namespace;
+    for path in [
+        paths::daemonset(ns, &shared.config.daemonset),
+        paths::service_account(ns, &shared.config.service_account),
+    ] {
+        let obj = match shared.lease_api.get(&path).await {
+            Ok(obj) => obj,
+            Err(crate::kube::KubeError::NotFound) => return Err(Error::InvalidState),
+            Err(e) => return Err(e.into()),
+        };
+        if !str_at(&obj, &["metadata", "deletionTimestamp"]).is_empty()
+            || str_at(&obj, &["metadata", "annotations", STATE_UID]) != uid
+        {
+            return Err(Error::InvalidState);
+        }
+    }
+    Ok(())
 }
 
 /// Patch this Pod's report annotation whenever a new report arrives.

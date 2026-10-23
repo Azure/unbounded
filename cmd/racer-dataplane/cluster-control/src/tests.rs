@@ -66,11 +66,11 @@ fn seed(api: &fake::FakeApi, pods: usize) {
     }
     api.put_object(
         &format!("/apis/apps/v1/namespaces/{NS}/daemonsets/racer-dataplane"),
-        json!({"metadata":{"name":"racer-dataplane","uid":DS_UID}}),
+        json!({"metadata":{"name":"racer-dataplane","uid":DS_UID,"annotations":{crate::control::STATE_UID:SECRET_UID}}}),
     );
     api.put_object(
         &format!("/api/v1/namespaces/{NS}/serviceaccounts/racer-dataplane"),
-        json!({"metadata":{"name":"racer-dataplane","uid":SA_UID}}),
+        json!({"metadata":{"name":"racer-dataplane","uid":SA_UID,"annotations":{crate::control::STATE_UID:SECRET_UID}}}),
     );
     for i in 1..=pods {
         api.put_object(
@@ -121,6 +121,11 @@ struct FakeCluster {
 
 impl FakeCluster {
     fn start(pods: usize) -> Self {
+        Self::start_with(pods, |_| {})
+    }
+
+    /// Start with `setup` applied to the seeded API.
+    fn start_with(pods: usize, setup: impl FnOnce(&fake::FakeApi) + Send + 'static) -> Self {
         let dir = fake::scratch();
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -131,6 +136,7 @@ impl FakeCluster {
             ex.block_on(async move {
                 let api = fake::FakeApi::new();
                 seed(&api, pods);
+                setup(&api);
                 api.count_into(r);
                 tx.send(fake::serve(api, &d.join("api"))).unwrap();
                 while !s.load(Ordering::SeqCst) {
@@ -597,6 +603,71 @@ fn record_of(cluster: &FakeCluster) -> Value {
             .unwrap(),
     )
     .unwrap()
+}
+
+/// A fresh Node with no local files must not adopt a racer-state Secret the
+/// installation did not record: bootstrap fails closed before any seat is
+/// taken or state is initialized.
+#[test]
+fn bootstrap_requires_the_installation_state_binding() {
+    const REPLACED: &str = "c1c1c1c1-0000-4000-8000-0000000000ff";
+    let ds = format!("/apis/apps/v1/namespaces/{NS}/daemonsets/racer-dataplane");
+    let sa = format!("/api/v1/namespaces/{NS}/serviceaccounts/racer-dataplane");
+    let state = format!("/api/v1/namespaces/{NS}/secrets/racer-state");
+    type Mutate = fn(&mut Value, &mut Value, &mut Value);
+    let cases: [(&str, Mutate); 6] = [
+        ("replaced secret", |s, _, _| {
+            s["metadata"]["uid"] = REPLACED.into()
+        }),
+        ("unannotated daemonset", |_, d, _| {
+            d["metadata"]["annotations"] = json!({})
+        }),
+        ("mismatched service account", |_, _, a| {
+            a["metadata"]["annotations"][crate::control::STATE_UID] = REPLACED.into()
+        }),
+        ("terminating daemonset", |_, d, _| {
+            d["metadata"]["deletionTimestamp"] = "2026-01-01T00:00:00Z".into()
+        }),
+        ("missing daemonset", |_, d, _| *d = Value::Null),
+        ("missing service account", |_, _, a| *a = Value::Null),
+    ];
+    for (name, mutate) in cases {
+        let (st, ds, sa) = (state.clone(), ds.clone(), sa.clone());
+        let cluster = FakeCluster::start_with(1, move |api| {
+            let mut s = api.object(&st).unwrap();
+            let mut d = api.object(&ds).unwrap();
+            let mut a = api.object(&sa).unwrap();
+            mutate(&mut s, &mut d, &mut a);
+            for (path, obj) in [(&st, s), (&ds, d), (&sa, a)] {
+                if obj.is_null() {
+                    api.delete_object(path);
+                } else {
+                    api.put_object(path, obj);
+                }
+            }
+        });
+        let h = crate::start(cluster.config(1)).unwrap();
+        assert!(
+            matches!(
+                h.bootstrap(Duration::from_secs(20)),
+                Err(crate::Error::InvalidState)
+            ),
+            "{name}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(h.diagnostics().role, crate::Role::Member, "{name}");
+        let secret = cluster.inspect(async |k| k.get(&state).await.unwrap());
+        assert!(secret["data"].get("state").is_none(), "{name}");
+        assert!(
+            str_at(
+                &secret,
+                &["metadata", "annotations", annotations::INITIALIZED]
+            )
+            .is_empty(),
+            "{name}"
+        );
+        drop(h);
+    }
 }
 
 #[test]
