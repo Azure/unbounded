@@ -48,6 +48,15 @@ notices:
         link: https://docs.rs/crate/base64/0.22.1/source/LICENSE-APACHE
       - name: MIT License
         link: https://docs.rs/crate/base64/0.22.1/source/LICENSE-MIT
+  - dependency: cc
+    ecosystem: cargo
+    copyright:
+      - Copyright (c) 2014 Alex Crichton
+    license:
+      - name: Apache License, Version 2.0
+        link: https://docs.rs/crate/cc/1.5.1/source/LICENSE-APACHE
+      - name: MIT License
+        link: https://docs.rs/crate/cc/1.5.1/source/LICENSE-MIT
   - dependency: chacha20poly1305
     ecosystem: cargo
     copyright:
