@@ -3554,3 +3554,57 @@ mod adaptive {
         assert_eq!(metrics.gauge(Gauge::PeerExchanges), 0);
     }
 }
+mod explicit_clock {
+    //! Adaptive admission and link circuits read only the time they are given.
+    use crate::peer::AdaptivePeers;
+    use crate::peer::Outcome;
+    use crate::telemetry::Metrics;
+    use crate::topology::LinkHealth;
+    use crate::topology::LinkOutcome;
+    use racer_control_wire::NodeId;
+    use std::sync::OnceLock;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    static OFFSET_MS: AtomicU64 = AtomicU64::new(0);
+
+    fn clock() -> Instant {
+        *BASE.get_or_init(Instant::now) + Duration::from_millis(OFFSET_MS.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn adaptive_peers_back_off_on_the_supplied_clock() {
+        let peers =
+            AdaptivePeers::with_clock(Default::default(), Metrics::default(), clock).unwrap();
+        let node = NodeId("b".into());
+        let permit = peers.acquire(&node).unwrap();
+        permit.observe(Outcome::PeerFailure);
+        drop(permit);
+        assert!(
+            !peers.available(&node),
+            "backoff holds while time stands still"
+        );
+        assert!(peers.acquire(&node).is_err());
+        OFFSET_MS.fetch_add(250, Ordering::SeqCst);
+        assert!(
+            peers.acquire(&node).is_ok(),
+            "a probe is admitted after backoff"
+        );
+    }
+
+    #[test]
+    fn link_health_acquires_at_the_supplied_time() {
+        let health = LinkHealth::new(1);
+        let node = NodeId("b".into());
+        let start = Instant::now();
+        health
+            .observe_at(&node, LinkOutcome::Refused, start)
+            .unwrap();
+        assert!(health.acquire_at(&node, start).is_err());
+        let later = start + Duration::from_secs(3600);
+        drop(health.acquire_at(&node, later).unwrap());
+    }
+}

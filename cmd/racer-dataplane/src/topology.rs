@@ -52,9 +52,10 @@ impl Default for LinkHealth {
 pub use racer_core::peer::hop::LinkOutcome;
 impl LinkHealth {
     pub fn acquire(&self, node: &NodeId) -> Result<LinkProbe<'_>> {
-        self.inner
-            .acquire(node, uring_runtime::environment::now())
-            .map_err(Into::into)
+        self.acquire_at(node, uring_runtime::environment::now())
+    }
+    pub fn acquire_at(&self, node: &NodeId, now: Instant) -> Result<LinkProbe<'_>> {
+        self.inner.acquire(node, now).map_err(Into::into)
     }
     /// Application misses and credential rejection do not open transport circuits.
     pub async fn run<T>(

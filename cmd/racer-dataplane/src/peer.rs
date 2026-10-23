@@ -167,6 +167,16 @@ impl AdaptivePeers {
         self.inner.hedge_available(node)
     }
     pub(crate) fn new(config: Config, metrics: Metrics) -> Result<Arc<Self>> {
+        Self::with_clock(config, metrics, now)
+    }
+    /// As `new`, reading time from `clock` instead of the runtime clock. A
+    /// simulator passes its virtual clock; `new` passes the runtime clock, so
+    /// production pays nothing for the parameter.
+    pub(crate) fn with_clock(
+        config: Config,
+        metrics: Metrics,
+        clock: fn() -> std::time::Instant,
+    ) -> Result<Arc<Self>> {
         config.validate()?;
         Ok(Arc::new(Self {
             shard: metrics.writer_shard(),
@@ -180,7 +190,7 @@ impl AdaptivePeers {
                     retire_after: Duration::from_secs(60),
                 },
                 AdmissionObserver(metrics),
-                now,
+                clock,
             )?,
         }))
     }
