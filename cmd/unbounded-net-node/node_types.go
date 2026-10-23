@@ -29,7 +29,9 @@ type wireGuardState struct {
 	siteRouting      siteRoutingConfig
 	manageCniPlugin  bool // Whether this node's site manages CNI plugin and full podCIDR mesh routes
 	cniMTU           int  // Last MTU written to the managed CNI configuration
+	appliedFabricMTU int  // Last attempted fabric MTU, including writes before a failed reconciliation.
 	cniConfigWritten bool // Whether this process has written the managed CNI configuration
+	dataplaneDirty   bool // A failed programming attempt must not take the unchanged-state fast path.
 	mu               sync.Mutex
 
 	// Kubernetes client for tainting nodes
@@ -197,6 +199,7 @@ type gatewayPeerInfo struct {
 	UnmanagedCNISite       bool     // Gateway's Site has manageCniPlugin=false, so it never gets a podCIDR
 	TunnelProtocol         string   // Resolved tunnel protocol for this peer (WireGuard or GENEVE)
 	TunnelMTU              int      // Effective MTU after route, encapsulation, and CRD limits
+	TransitTunnelMTU       int      // MTU imposed by an actual downstream GatewayPoolPeering path
 }
 
 // meshPeerInfo contains information about a peer on the main mesh interface.

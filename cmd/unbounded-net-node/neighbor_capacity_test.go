@@ -432,6 +432,10 @@ func TestAutomaticNeighborSizingReconcilesWithoutPeerChanges(t *testing.T) {
 		t.Fatalf("sysctl failure not surfaced: %v", err)
 	}
 
+	if configureCalls != 1 || !state.dataplaneDirty {
+		t.Fatalf("sizing failure did not defer peer programming and fence the retry: calls=%d dirty=%v", configureCalls, state.dataplaneDirty)
+	}
+
 	check([3]int{2, 2, 2})
 
 	tuner.writeFile = write
@@ -442,8 +446,8 @@ func TestAutomaticNeighborSizingReconcilesWithoutPeerChanges(t *testing.T) {
 
 	check([3]int{4, 4, 4})
 
-	if configureCalls != 1 {
-		t.Fatalf("route-only updates unnecessarily reconfigured peers: calls=%d", configureCalls)
+	if configureCalls != 2 || state.dataplaneDirty {
+		t.Fatalf("failed reconciliation was not repaired: calls=%d dirty=%v", configureCalls, state.dataplaneDirty)
 	}
 
 	onLink = false
@@ -453,6 +457,10 @@ func TestAutomaticNeighborSizingReconcilesWithoutPeerChanges(t *testing.T) {
 	}
 
 	check([3]int{4, 4, 4})
+
+	if configureCalls != 2 {
+		t.Fatalf("successful route-only update unnecessarily reconfigured peers: calls=%d", configureCalls)
+	}
 
 	onLink = true
 
@@ -469,7 +477,7 @@ func TestAutomaticNeighborSizingReconcilesWithoutPeerChanges(t *testing.T) {
 		t.Fatalf("new peer sizing failure not surfaced: %v", err)
 	}
 
-	if configureCalls != 1 {
+	if configureCalls != 2 {
 		t.Fatalf("peer configuration ran after sizing failure: calls=%d", configureCalls)
 	}
 
