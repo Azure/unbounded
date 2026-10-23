@@ -5476,3 +5476,63 @@ fn cached_memory_copy_authentication_failure_keeps_disk_record() {
     );
     assert_eq!(f.origin.calls.get(), 0);
 }
+
+#[test]
+fn concurrent_warm_local_after_plaintext_release_shares_one_decrypt() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let original = acquire(&mut f, &mut budget).unwrap();
+    drop(original);
+    assert!(f.fill.dependencies.memory.get(&f.page).unwrap().is_none());
+    let origin_calls = f.origin.calls.get();
+    let metrics = Metrics::default();
+    f.fill.metrics = metrics.clone();
+    let mut first = Box::pin(f.fill.warm_local(&f.page, &f.scope));
+    let mut second = Box::pin(f.fill.warm_local(&f.page, &f.scope));
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(first.as_mut().poll(&mut cx).is_pending());
+    assert!(second.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.fill.local_plaintext.len(), 1, "one local decrypt flight");
+    let (first, second) = drive(
+        futures::future::join(first, second),
+        &mut f.engine,
+        &f.crypto,
+    );
+    let (first, second) = (first.unwrap(), second.unwrap());
+    assert_eq!(first.plaintext.bytes(), b"abc");
+    assert_eq!(second.plaintext.bytes(), b"abc");
+    assert_eq!(metrics.count(Event::PageDecrypt), 1, "one shared decrypt");
+    assert_eq!(f.origin.calls.get(), origin_calls, "never contacts origin");
+    assert!(f.fill.local_plaintext.is_empty());
+    assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Flight), 0);
+    assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Waiter), 0);
+}
+
+#[test]
+fn concurrent_warm_local_without_local_copy_fails_together_without_acquisition() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let metrics = Metrics::default();
+    f.fill.metrics = metrics.clone();
+    let first = f.fill.warm_local(&f.page, &f.scope);
+    let second = f.fill.warm_local(&f.page, &f.scope);
+    let (first, second) = drive(
+        futures::future::join(first, second),
+        &mut f.engine,
+        &f.crypto,
+    );
+    assert!(matches!(first, Err(Error::Unavailable)));
+    assert!(matches!(second, Err(Error::Unavailable)));
+    assert_eq!(metrics.count(Event::PageDecrypt), 0);
+    assert_eq!(f.origin.calls.get(), 0, "never starts acquisition");
+    assert!(f.fill.local_plaintext.is_empty());
+    assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Flight), 0);
+    assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Waiter), 0);
+    assert_eq!(
+        f.fill.dependencies.admission.used(ResourceClass::Plaintext),
+        0
+    );
+}

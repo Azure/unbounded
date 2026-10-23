@@ -67,6 +67,9 @@ pub struct FillDependencies {
     pub metadata_owner: Arc<super::dispatch::WorkerDirectory>,
 }
 type LocalCopies = flow_control::coalesce::shared::Table<PageId, Result<Option<UnverifiedPage>>>;
+/// Local-only plaintext recovery keyed by page: one decrypt of a local copy is
+/// shared by every concurrent warm reader, and none of them may start acquisition.
+type LocalPlaintext = flow_control::coalesce::shared::Table<PageId, Result<Option<PageResult>>>;
 
 /// Optional writes may use half of the aggregate class budget, with a floor
 /// sufficient for one valid page when the configured budget can hold it. Owned
@@ -81,6 +84,7 @@ pub struct Fill {
     pub(super) dependencies: FillDependencies,
     pub(super) metrics: Metrics,
     pub(super) local_copies: Rc<LocalCopies>,
+    pub(super) local_plaintext: Rc<LocalPlaintext>,
 
     diagnostic: Option<DriverDiagnostic>,
     fence_acquisition: bool,
@@ -139,10 +143,66 @@ impl Fill {
         if let Some(result) = self.cached_page(page, scope)? {
             return Ok(result);
         }
-        match self.acquire_local_copy(page, scope, true).await? {
-            Some(AcquiredPage::Plaintext(result)) => Ok(result),
-            _ => Err(Error::Unavailable),
+        match self.local_plaintext_copy(page, scope).await? {
+            Some(result) => Ok(result),
+            None => Err(Error::Unavailable),
         }
+    }
+
+    /// Coalesce local-only decrypts so concurrent warm readers reserve and
+    /// decrypt one plaintext. A detached worker driver owns the shared work, so
+    /// one caller's cancellation never fails another caller. The driver only
+    /// reads pending, cached, or disk copies; it never contacts peers or origin.
+    async fn local_plaintext_copy(
+        &self,
+        page: &PageId,
+        scope: &RequestScope,
+    ) -> Result<Option<PageResult>> {
+        use std::future::Future;
+        scope.check()?;
+        let _waiter = self.dependencies.admission.reserve(
+            Some(&page.version.object.cache),
+            ResourceClass::Waiter,
+            1,
+        )?;
+        let cancellation = scope.cancellation.subscribe()?;
+        let mut receive = if let Some(existing) = self.local_plaintext.get(page) {
+            existing
+        } else {
+            let permit = uring_runtime::drivers::reserve().map_err(Error::from)?;
+            let owned_scope = RequestScope::new(scope.request, scope.deadline.0)?;
+            let (receive, completion) = self
+                .local_plaintext
+                .start(page.clone(), Err(Error::Unavailable));
+            if let Some(completion) = completion {
+                let mut fill = self.clone();
+                fill.diagnostic = None;
+                let page = page.clone();
+                permit.submit_detached(Box::pin(async move {
+                    let result = match fill.cached_page(&page, &owned_scope) {
+                        Ok(Some(result)) => Ok(Some(result)),
+                        Ok(None) => fill
+                            .acquire_local_copy(&page, &owned_scope, true)
+                            .await
+                            .map(|acquired| match acquired {
+                                Some(AcquiredPage::Plaintext(result)) => Some(result),
+                                _ => None,
+                            }),
+                        Err(error) => Err(error),
+                    };
+                    completion.finish(result);
+                    Ok::<_, Error>(())
+                }));
+            }
+            receive
+        };
+        std::future::poll_fn(|cx| {
+            cancellation.register(cx.waker());
+            scope.check()?;
+            uring_runtime::drivers::poll(cx, 64);
+            std::pin::Pin::new(&mut receive).poll(cx)
+        })
+        .await
     }
     /// Mark this detached driver's call boundary, if it owns a diagnostic generation.
     fn stage(&self, stage: DriverStage) {
@@ -611,6 +671,7 @@ impl Fill {
             dependencies,
             metrics: Metrics::default(),
             local_copies: Rc::new(LocalCopies::default()),
+            local_plaintext: Rc::new(LocalPlaintext::default()),
             diagnostic: None,
             fence_acquisition: false,
         }
