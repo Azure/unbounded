@@ -141,6 +141,23 @@ def install_fake_vllm(monkeypatch):
     return registry
 
 
+def test_register_is_idempotent(monkeypatch):
+    install_fake_vllm(monkeypatch)
+    ml = sys.modules["vllm.model_executor.model_loader"]
+    inner = ml.register_model_loader
+    calls = []
+
+    def counting(name):
+        calls.append(name)
+        return inner(name)
+
+    ml.register_model_loader = counting
+    loader.register()
+    loader.register()
+    assert calls == ["racer"]
+    assert loader._registered is True
+
+
 def test_register_and_load(server, uri, monkeypatch, tmp_path):
     registry = install_fake_vllm(monkeypatch)
     loader.register()
