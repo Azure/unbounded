@@ -215,6 +215,11 @@ var testHooks struct {
 	// beforeStop runs in teardown of a started device just before
 	// STOP_DEV is sent.
 	beforeStop func(d *Device)
+	// pinnedDelPause replaces the pause before a pinned DEL_DEV cancel.
+	pinnedDelPause func(round int)
+	// pinnedDelDone runs in teardown after a pinned DEL_DEV returns and
+	// before the char device is closed.
+	pinnedDelDone func(d *Device, err error)
 }
 
 // launchQueues starts every queue thread and waits until each one has
@@ -430,30 +435,49 @@ func (d *Device) teardown(cause error) {
 		// The kernel keeps the id allocated while the char device is
 		// open, so deleting before closing it can never hit another
 		// device that reused the id. Kernels without DEL_DEV_ASYNC fall
-		// back to DEL_DEV after the close, since DEL_DEV waits for it.
-		deleted := false
-
+		// back to a pinned DEL_DEV, still before the close; see
+		// pinnedDel. Nothing is ever sent by id after the close.
 		if d.charFd >= 0 {
 			res, err := d.ctrl.do(uCmdDelDevAsync, uint32(d.id), 0, nil, 0)
 			if err == nil {
 				err = resErr("DEL_DEV_ASYNC", res)
 			}
 
+			closeFd := true
+
 			switch {
 			case err == nil:
-				deleted = true
 			case errors.Is(err, syscall.ENODEV):
 				// Already deleted by someone else.
-				deleted = true
+			case d.ctrl.isPoisoned():
+				// DEL_DEV_ASYNC may still be in flight. Keep the char
+				// device open so it cannot reach a reused id.
+				errs = append(errs, err)
+				closeFd = false
 			default:
 				d.cfg.Logger.Debug("ublk: DEL_DEV_ASYNC failed, falling back to DEL_DEV", "id", d.id, "err", err)
+
+				err = d.ctrl.delDevPinned(d.id)
+				if testHooks.pinnedDelDone != nil {
+					testHooks.pinnedDelDone(d, err)
+				}
+
+				if errors.Is(err, errPinnedDelUnknown) {
+					// DEL_DEV may still be running; closing now would let
+					// it wait for and then race a reused id. Leak the fd.
+					closeFd = false
+				}
+
+				keep(err)
 			}
 
-			errs = append(errs, unix.Close(d.charFd))
-			d.charFd = -1
-		}
-
-		if !deleted {
+			if closeFd {
+				errs = append(errs, unix.Close(d.charFd))
+				d.charFd = -1
+			}
+		} else {
+			// The char device was never opened, so nothing pins the
+			// id and DEL_DEV cannot block on it.
 			keep(d.ctrl.delDev(d.id))
 		}
 
