@@ -643,6 +643,16 @@ int racer_gpu_file_open(void) {
             goto out;
         }
         RACER_CUFILE_FUNCTIONS(X_LOAD)
+        /* Without nvidia-fs or P2PDMA, cuFile's compatibility mode does a
+         * POSIX read into a bounce buffer and a copy on this helper thread,
+         * so every GPU job waits behind the disk. Racer's own host path does
+         * that work on I/O threads. Turn it off unless the operator chose a
+         * value with CUFILE_ALLOW_COMPAT_MODE; cuFileDriverOpen then fails
+         * without GPUDirect Storage and Racer uses its host path. */
+        cuFileSetParameterBool_fn set_bool =
+            (cuFileSetParameterBool_fn)dlsym(table.lib, "cuFileSetParameterBool");
+        if (set_bool && !getenv("CUFILE_ALLOW_COMPAT_MODE"))
+            set_bool(CUFILE_PARAM_PROPERTIES_ALLOW_COMPAT_MODE, false);
         if (file_error(table.cuFileDriverOpen())) {
             dlclose(table.lib);
             rc = RACER_GPU_EUNAVAILABLE;

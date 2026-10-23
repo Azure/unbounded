@@ -18,6 +18,7 @@
 #ifndef RACER_GPU_CUDA_PRIVATE_H
 #define RACER_GPU_CUDA_PRIVATE_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
@@ -174,6 +175,10 @@ typedef struct {
 _Static_assert(sizeof(CUfileError_t) == 8, "CUfileError_t layout");
 _Static_assert(sizeof(CUfileDescr_t) == 24, "CUfileDescr_t layout");
 _Static_assert(offsetof(CUfileDescr_t, handle) == 8, "CUfileDescr_t layout");
+
+/* cuFileSetParameterBool (cuFile 1.10+); resolved optionally. */
+#define CUFILE_PARAM_PROPERTIES_ALLOW_COMPAT_MODE 1
+typedef CUfileError_t (*cuFileSetParameterBool_fn)(int param, bool value);
 
 #define RACER_CUFILE_FUNCTIONS(X) \
     X(cuFileDriverOpen, "cuFileDriverOpen", CUfileError_t, (void)) \
