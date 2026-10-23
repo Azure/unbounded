@@ -96,6 +96,13 @@ type NvidiaHost struct {
 	// provide versioned library names when a host installation exposes only
 	// unversioned or SONAME aliases through ldconfig.
 	DriverVersion string
+
+	// UdevDataDir is the host udev runtime directory (/run/udev), when GPU
+	// devices are present and the directory exists. It is bind-mounted
+	// read-only into the nspawn container so GPU workloads that resolve block
+	// device properties through the udev database, such as GPUDirect Storage
+	// (cuFile), can identify the host's storage devices.
+	UdevDataDir string
 }
 
 // NvidiaLibMapping maps a host NVIDIA library to its corresponding paths
@@ -180,6 +187,7 @@ func resolveNvidiaHost(arch string, initDeps nvidiaDeviceInitDeps, opts nvidiaHo
 		NvidiaIMEXPath:    discoverNVIDIABinary("nvidia-imex"),
 		NvidiaIMEXCtlPath: discoverNVIDIABinary("nvidia-imex-ctl"),
 		DriverVersion:     libraries.driverVersion,
+		UdevDataDir:       nvidiaUdevDataDir(devices, initDeps.udevDataDir),
 	}, nil
 }
 
@@ -190,12 +198,25 @@ const (
 	nvidiaControlDeviceName = "nvidiactl"
 	nvidiaUVMDeviceName     = "nvidia-uvm"
 	nvidiaModesetDeviceName = "nvidia-modeset"
+	udevDataDir             = "/run/udev"
 )
+
+// nvidiaUdevDataDir returns dir when NVIDIA devices were discovered and dir
+// exists on the host, or an empty string otherwise. nspawn fails to start a
+// machine whose bind-mount source is missing, so absent paths are dropped.
+func nvidiaUdevDataDir(devices []string, dir string) string {
+	if len(devices) == 0 || dir == "" {
+		return ""
+	}
+
+	return discoverExistingDevicePath(dir)
+}
 
 type nvidiaDeviceInitDeps struct {
 	hostDistro    func() string
 	pciDevicesDir string
 	deviceDir     string
+	udevDataDir   string
 	readDir       func(string) ([]os.DirEntry, error)
 	readFile      func(string) ([]byte, error)
 	isCharDevice  func(string) bool
@@ -209,6 +230,7 @@ func defaultNvidiaDeviceInitDeps() nvidiaDeviceInitDeps {
 		hostDistro:    detectHostDistro,
 		pciDevicesDir: "/sys/bus/pci/devices",
 		deviceDir:     devDir,
+		udevDataDir:   udevDataDir,
 		readDir:       os.ReadDir,
 		readFile:      os.ReadFile,
 		isCharDevice: func(path string) bool {

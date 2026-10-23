@@ -117,6 +117,49 @@ func TestResolveNvidiaHostForPreflightDefersReadiness(t *testing.T) {
 	require.Contains(t, host.GPUDevicePaths, filepath.Join(deviceDir, "nvidia0"))
 }
 
+func TestResolveNvidiaHostUdevDataDir(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		gpu        bool
+		udevExists bool
+		want       bool
+	}{
+		"gpu with udev":    {gpu: true, udevExists: true, want: true},
+		"gpu without udev": {gpu: true},
+		"no gpu":           {udevExists: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			root := t.TempDir()
+			udevDir := filepath.Join(root, "run", "udev")
+			deviceDir := filepath.Join(root, "dev")
+			require.NoError(t, os.MkdirAll(deviceDir, 0o755))
+
+			if tc.gpu {
+				require.NoError(t, os.WriteFile(filepath.Join(deviceDir, "nvidia0"), nil, 0o644))
+			}
+
+			if tc.udevExists {
+				require.NoError(t, os.MkdirAll(udevDir, 0o755))
+			}
+
+			deps := testNvidiaDeviceInitDeps(filepath.Join(root, "pci"), deviceDir)
+			deps.udevDataDir = udevDir
+
+			host, err := resolveNvidiaHost("amd64", deps, nvidiaHostOptions{})
+			require.NoError(t, err)
+
+			if tc.want {
+				require.Equal(t, udevDir, host.UdevDataDir)
+			} else {
+				require.Empty(t, host.UdevDataDir)
+			}
+		})
+	}
+}
+
 func TestDiscoverNVIDIADevicesBindsCapabilityDirectories(t *testing.T) {
 	t.Parallel()
 

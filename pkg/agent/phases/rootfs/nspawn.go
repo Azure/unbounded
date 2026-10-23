@@ -138,6 +138,7 @@ type nspawnTemplateData struct {
 	NvidiaLibDirMounts     []goalstates.NvidiaLibDirMount
 	NvidiaI386LibDirMounts []goalstates.NvidiaLibDirMount
 	NvidiaBinDir           string
+	NvidiaUdevDataDir      string
 	AMDGPUDevicePaths      []string
 	AMDSysFSPaths          []string
 	ConfigRegenerationUnit string
@@ -184,6 +185,7 @@ func writeNSpawnConfigs(log *slog.Logger, goalState *goalstates.RootFS) error {
 		NvidiaLibDirMounts:           goalState.Nvidia.LibDirMounts,
 		NvidiaI386LibDirMounts:       goalState.Nvidia.I386LibDirMounts,
 		NvidiaBinDir:                 nvidiaHostBinDir(goalState.Nvidia),
+		NvidiaUdevDataDir:            goalState.Nvidia.UdevDataDir,
 		AMDGPUDevicePaths:            amdGPUDevicePaths,
 		AMDSysFSPaths:                goalState.AMD.SysFSPaths,
 		ConfigRegenerationUnit:       goalstates.ConfigRegenerationUnit(machineName),

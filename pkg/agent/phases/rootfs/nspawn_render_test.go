@@ -189,6 +189,31 @@ func TestNSpawnConfig_NVIDIAModesetDevice(t *testing.T) {
 	require.Contains(t, overrideBuf.String(), "DeviceAllow="+modeset+" rwm")
 }
 
+func TestNSpawnConfig_NVIDIAGPUDirectStorage(t *testing.T) {
+	t.Parallel()
+
+	const nvidiaFS = "/dev/nvidia-fs0"
+
+	data := defaultNSpawnTemplateData("kube1")
+	data.NvidiaDeviceTargets = nvidiaNSpawnDeviceTargets([]string{"/dev/nvidia0", nvidiaFS})
+	data.NvidiaUdevDataDir = "/run/udev"
+
+	var nspawnBuf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
+	require.Contains(t, nspawnBuf.String(), "Bind="+nvidiaFS+"\n")
+	require.Contains(t, nspawnBuf.String(), "BindReadOnly=/run/udev\n")
+
+	var overrideBuf bytes.Buffer
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", data))
+	require.Contains(t, overrideBuf.String(), "DeviceAllow="+nvidiaFS+" rwm")
+
+	data.NvidiaUdevDataDir = ""
+
+	nspawnBuf.Reset()
+	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
+	require.NotContains(t, nspawnBuf.String(), "/run/udev")
+}
+
 func TestServiceOverride_AMDGPUDevices(t *testing.T) {
 	t.Parallel()
 
