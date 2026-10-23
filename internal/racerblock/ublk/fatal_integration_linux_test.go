@@ -258,3 +258,97 @@ func TestIntegrationFatalRingDuringStopDev(t *testing.T) {
 
 	checkNoLeak(t, before)
 }
+
+// TestIntegrationFatalRingDuringTeardown fails a healthy queue's ring
+// after Close began, while the queue owns a read and STOP_DEV is seen
+// waiting for it in del_gendisk. The error arrives after teardown
+// marked the device closing, so it is not a startup or runtime failure,
+// but the queue must still answer the read through a rescue ring so
+// STOP_DEV and Close finish.
+func TestIntegrationFatalRingDuringTeardown(t *testing.T) {
+	requireFaultVM(t)
+
+	before := ublkNodes(t)
+	boom := errors.New("injected ring failure during teardown")
+
+	setHooks(t, nil, nil)
+
+	var armed, fired atomic.Bool
+
+	tearing := make(chan struct{})
+	delivered := make(chan struct{})
+	sawStop := make(chan bool, 1)
+
+	testHooks.beforeStop = func(*Device) {
+		armed.Store(true)
+		close(tearing)
+		<-delivered
+	}
+	testHooks.delivered = func(q *queue, _ uint16, eio bool) error {
+		if eio || !armed.Load() || fired.Swap(true) {
+			return nil
+		}
+
+		if !q.dev.closing.Load() {
+			t.Error("request delivered before teardown began")
+		}
+
+		close(delivered)
+
+		deadline := time.Now().Add(fatalTimeout)
+		for !inDelGendisk() && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+
+		sawStop <- inDelGendisk()
+
+		return boom
+	}
+
+	d, err := startBounded(t, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fd, err := unix.Open(d.Path(), unix.O_RDONLY|unix.O_DIRECT|unix.O_CLOEXEC, 0)
+	if err != nil {
+		_ = d.Close()
+
+		t.Fatal(err)
+	}
+
+	closed := make(chan error, 1)
+
+	go func() { closed <- d.Close() }()
+
+	waitSignal(t, tearing, "teardown never reached STOP_DEV")
+
+	res := readAsync(t, fd)
+
+	waitSignal(t, delivered, "no request was handed to the queue during teardown")
+	waitEIO(t, res)
+
+	if err := unix.Close(fd); err != nil {
+		t.Error(err)
+	}
+
+	select {
+	case ok := <-sawStop:
+		if !ok {
+			t.Error("STOP_DEV was never seen waiting in del_gendisk")
+		}
+	case <-time.After(fatalTimeout):
+		abortHung(t, "the ring was never failed")
+	}
+
+	select {
+	case err := <-closed:
+		// Whether the late error is reported is decided by the queue
+		// error recording, not by this test.
+		t.Logf("Close = %v", err)
+	case <-time.After(fatalTimeout):
+		abortHung(t, "Close blocked after a ring failure during teardown")
+	}
+
+	checkNoLeak(t, before)
+}
