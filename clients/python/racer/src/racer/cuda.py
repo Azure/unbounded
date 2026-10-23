@@ -424,6 +424,7 @@ def host_register(buf, device: int = 0) -> HostRegistration:
     finally:
         # Drop the ctypes export and the view even on failure, so a traceback
         # that references this frame cannot keep the owner's mapping exported.
-        arr = None
+        # The ctypes array holds an export of mv, so it must go before release.
+        del arr
         mv.release()
     return HostRegistration(addr, None)
