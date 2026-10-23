@@ -908,7 +908,7 @@ func ordinaryPod(
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy:                corev1.RestartPolicyNever,
-			Affinity:                     participantNodeAffinity(participant.NodeName),
+			Affinity:                     participantNodeAffinity(participant.NodeName, participant.NodeUID),
 			Tolerations:                  tolerations,
 			ActiveDeadlineSeconds:        &backendDeadlineSeconds,
 			AutomountServiceAccountToken: ptr(false),
@@ -985,6 +985,7 @@ func mpiJob(
 					"template": podTemplate(
 						labels,
 						"",
+						"",
 						nil,
 						corev1.Container{
 							Name:  "launcher",
@@ -1006,6 +1007,7 @@ func mpiJob(
 					"template": podTemplate(
 						labels,
 						participant.NodeName,
+						participant.NodeUID,
 						tolerations,
 						worker,
 						config.ScriptConfigMap,
@@ -1022,6 +1024,7 @@ func mpiJob(
 func podTemplate(
 	labels map[string]string,
 	nodeName string,
+	nodeUID types.UID,
 	tolerations []corev1.Toleration,
 	container corev1.Container,
 	scriptConfigMap string,
@@ -1039,7 +1042,7 @@ func podTemplate(
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy:                corev1.RestartPolicyNever,
-			Affinity:                     participantNodeAffinity(nodeName),
+			Affinity:                     participantNodeAffinity(nodeName, nodeUID),
 			Tolerations:                  tolerations,
 			AutomountServiceAccountToken: ptr(false),
 			Containers:                   []corev1.Container{container},
@@ -1056,7 +1059,7 @@ func podTemplate(
 	return content
 }
 
-func participantNodeAffinity(nodeName string) *corev1.Affinity {
+func participantNodeAffinity(nodeName string, nodeUID types.UID) *corev1.Affinity {
 	if nodeName == "" {
 		return nil
 	}
@@ -1069,6 +1072,11 @@ func participantNodeAffinity(nodeName string) *corev1.Affinity {
 						Key:      "metadata.name",
 						Operator: corev1.NodeSelectorOpIn,
 						Values:   []string{nodeName},
+					}},
+					MatchExpressions: []corev1.NodeSelectorRequirement{{
+						Key:      signalv1.ReservationNodeUIDLabel,
+						Operator: corev1.NodeSelectorOpIn,
+						Values:   []string{string(nodeUID)},
 					}},
 				}},
 			},

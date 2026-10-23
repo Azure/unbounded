@@ -85,8 +85,9 @@ var workflowOutputLimits = map[string]int{
 }
 
 const (
-	groupedCheckCount         = 15
-	adapterServiceAccountName = "project-signal-adapter"
+	groupedCheckCount          = 15
+	adapterServiceAccountName  = "project-signal-adapter"
+	maximumWorkflowOutputBytes = 768 * 1024
 )
 
 var workflowGVK = schema.GroupVersionKind{
@@ -439,7 +440,8 @@ func (r *AdmissionReconciler) selectParticipants(
 		if candidate.Name == requestNode.Name ||
 			!selector.Matches(labels.Set(candidate.Labels)) ||
 			!nodeEligible(candidate, profile.Spec.Participants.RequiredResources) ||
-			candidate.Annotations[ReservationLabel] != "" {
+			candidate.Annotations[ReservationLabel] != "" ||
+			candidate.Labels[signalv1.ReservationNodeUIDLabel] != "" {
 			continue
 		}
 
@@ -891,12 +893,25 @@ func (r *AdmissionReconciler) reserveParticipants(ctx context.Context, participa
 			)
 		}
 
+		if value := node.Labels[signalv1.ReservationNodeUIDLabel]; value != "" {
+			return errors.Join(
+				fmt.Errorf("participant %s has stale reservation identity %s", participant.NodeName, value),
+				r.releaseParticipants(context.WithoutCancel(ctx), reserved, runName),
+			)
+		}
+
 		before := node.DeepCopy()
 		if node.Annotations == nil {
 			node.Annotations = map[string]string{}
 		}
 
+		if node.Labels == nil {
+			node.Labels = map[string]string{}
+		}
+
 		node.Annotations[ReservationLabel] = runName
+		node.Labels[signalv1.ReservationNodeUIDLabel] = string(participant.NodeUID)
+
 		if err := r.Patch(
 			ctx,
 			&node,
@@ -935,8 +950,20 @@ func (r *AdmissionReconciler) releaseParticipants(ctx context.Context, participa
 			continue
 		}
 
+		if value := node.Labels[signalv1.ReservationNodeUIDLabel]; value != "" && value != string(participant.NodeUID) {
+			errs = append(errs, fmt.Errorf(
+				"participant %s reservation identity changed from %s to %s",
+				participant.NodeName,
+				participant.NodeUID,
+				value,
+			))
+
+			continue
+		}
+
 		before := node.DeepCopy()
 		delete(node.Annotations, ReservationLabel)
+		delete(node.Labels, signalv1.ReservationNodeUIDLabel)
 
 		if err := r.Patch(ctx, &node, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
 			errs = append(errs, err)
@@ -1510,6 +1537,7 @@ func (r *RunReconciler) finishGrouped(
 	evidenceRun.Status.ExecutionState = executionState
 	evidenceRun.Status.Verdict = verdict
 	evidenceRun.Status.Reason = reason
+	evidenceRun.Status.Phase = runPhaseForVerdict(verdict)
 	evidenceRun.Status.Workflow.Phase = workflowPhase
 
 	finishedAt := groupedFinishedAt(workflow, run)
@@ -1565,6 +1593,7 @@ func (r *RunReconciler) resumeGroupedEvidence(
 		ExecutionState string                  `json:"executionState"`
 		Verdict        string                  `json:"verdict"`
 		Reason         string                  `json:"reason"`
+		Phase          signalv1.RunPhase       `json:"phase"`
 		FinishedAt     string                  `json:"finishedAt"`
 	}
 	if err := json.Unmarshal(data, &document); err != nil {
@@ -1611,7 +1640,16 @@ func (r *RunReconciler) resumeGroupedEvidence(
 	run.Status.Reason = document.Reason
 	run.Status.Workflow = document.Workflow
 	run.Status.Evidence = signalv1.EvidenceStatus{URI: uri, Digest: digest}
-	run.Status.Phase = runPhaseForVerdict(document.Verdict)
+
+	if document.Phase == "" {
+		run.Status.Phase = runPhaseForVerdict(document.Verdict)
+	} else {
+		if !document.Phase.Terminal() {
+			return ctrl.Result{}, false, fmt.Errorf("persisted evidence contains nonterminal phase %q", document.Phase)
+		}
+
+		run.Status.Phase = document.Phase
+	}
 
 	value := metav1.NewTime(finishedAt)
 	run.Status.FinishedAt = &value
@@ -2110,6 +2148,7 @@ func (r *RunReconciler) evidenceDocument(
 		"executionState":      executionState,
 		"verdict":             verdict,
 		"reason":              reason,
+		"phase":               run.Status.Phase,
 		"startedAt":           run.Status.StartedAt,
 		"finishedAt":          run.Status.FinishedAt.UTC().Format(time.RFC3339Nano),
 	}
@@ -2456,14 +2495,14 @@ func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationR
 		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
-	before := run.DeepCopy()
-	run.Status.Phase = signalv1.RunPhaseCancelled
-	run.Status.ExecutionState = "Interrupted"
-	run.Status.Verdict = "Inconclusive"
+	evidenceRun := run.DeepCopy()
+	evidenceRun.Status.Phase = signalv1.RunPhaseCancelled
+	evidenceRun.Status.ExecutionState = "Interrupted"
+	evidenceRun.Status.Verdict = "Inconclusive"
+	evidenceRun.Status.Reason = "canceled by operator"
+	evidenceRun.Status.Workflow.Phase = "Canceled"
 
-	run.Status.Reason = "canceled by operator"
-
-	statuses := run.Status.Checks
+	statuses := evidenceRun.Status.Checks
 	if len(statuses) != len(run.Spec.Checks) {
 		statuses = initialCheckStatuses(run.Spec.Checks)
 	}
@@ -2481,11 +2520,31 @@ func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationR
 		statuses[index].NotRun = true
 	}
 
-	run.Status.Checks = statuses
+	evidenceRun.Status.Checks = statuses
 
 	now := metav1.NewTime(r.now())
+	evidenceRun.Status.FinishedAt = &now
 
-	run.Status.FinishedAt = &now
+	evidence, err := r.evidenceDocument(
+		ctx,
+		evidenceRun,
+		evidenceRun.Status.ExecutionState,
+		evidenceRun.Status.Verdict,
+		evidenceRun.Status.Reason,
+	)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	uri, digest, err := r.Evidence.Put(ctx, run.Spec.EvidencePath, evidence)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	before := run.DeepCopy()
+	run.Status = evidenceRun.Status
+	run.Status.Evidence = signalv1.EvidenceStatus{URI: uri, Digest: digest}
+
 	if err := r.Status().Patch(ctx, run, client.MergeFrom(before)); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -2624,8 +2683,18 @@ func (r *RunReconciler) releaseRunReservations(ctx context.Context, run *signalv
 			continue
 		}
 
+		if value := node.Labels[signalv1.ReservationNodeUIDLabel]; value != "" && value != string(participant.NodeUID) {
+			return false, fmt.Errorf(
+				"participant %s reservation identity changed from %s to %s",
+				participant.NodeName,
+				participant.NodeUID,
+				value,
+			)
+		}
+
 		before := node.DeepCopy()
 		delete(node.Annotations, ReservationLabel)
+		delete(node.Labels, signalv1.ReservationNodeUIDLabel)
 
 		if err := r.Patch(ctx, &node, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
 			return false, err
@@ -2922,7 +2991,11 @@ func validateCheckPlan(checks []signalv1.CertificationCheck) error {
 		return fmt.Errorf("must contain exactly %d checks", groupedCheckCount)
 	}
 
-	seen := make(map[signalv1.CheckID]struct{}, len(checks))
+	var (
+		seen        = make(map[signalv1.CheckID]struct{}, len(checks))
+		outputBytes int64
+	)
+
 	for index := range checks {
 		check := &checks[index]
 		if check.ID == "" {
@@ -2951,9 +3024,19 @@ func validateCheckPlan(checks []signalv1.CertificationCheck) error {
 			return err
 		}
 
+		outputBytes += workflowOutputBytes(check.ResultBounds)
+
 		if err := validateCheckParticipantPolicy(check.ID, check.ParticipantPolicy); err != nil {
 			return err
 		}
+	}
+
+	if outputBytes > maximumWorkflowOutputBytes {
+		return fmt.Errorf(
+			"aggregate check output budget is %d bytes, maximum is %d",
+			outputBytes,
+			maximumWorkflowOutputBytes,
+		)
 	}
 
 	return nil
@@ -2964,7 +3047,11 @@ func validateRunCheckPlan(checks []signalv1.CertificationCheckSnapshot) error {
 		return fmt.Errorf("run must contain exactly %d checks", groupedCheckCount)
 	}
 
-	seen := make(map[signalv1.CheckID]struct{}, len(checks))
+	var (
+		seen        = make(map[signalv1.CheckID]struct{}, len(checks))
+		outputBytes int64
+	)
+
 	for index := range checks {
 		check := &checks[index]
 		if check.ID == "" || check.Order != int32(index) {
@@ -2988,9 +3075,30 @@ func validateRunCheckPlan(checks []signalv1.CertificationCheckSnapshot) error {
 		if err := validateResultBounds(check.ID, check.ResultBounds); err != nil {
 			return err
 		}
+
+		outputBytes += workflowOutputBytes(check.ResultBounds)
+	}
+
+	if outputBytes > maximumWorkflowOutputBytes {
+		return fmt.Errorf(
+			"run aggregate check output budget is %d bytes, maximum is %d",
+			outputBytes,
+			maximumWorkflowOutputBytes,
+		)
 	}
 
 	return nil
+}
+
+func workflowOutputBytes(bounds signalv1.ResultBounds) int64 {
+	return int64(
+		workflowOutputLimits["verdict"]+
+			workflowOutputLimits["cleanup-failure"],
+	) +
+		int64(bounds.ReasonBytes) +
+		int64(bounds.MeasurementsBytes) +
+		int64(bounds.BackendResourcesBytes) +
+		int64(bounds.BackendEvidenceBytes)
 }
 
 func validateResultBounds(id signalv1.CheckID, bounds signalv1.ResultBounds) error {

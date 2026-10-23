@@ -12,6 +12,8 @@ import (
 type RunPhase string
 
 const (
+	ReservationNodeUIDLabel = "signal.unbounded-cloud.io/reserved-node-uid"
+
 	RunPhasePending      RunPhase = "Pending"
 	RunPhaseRunning      RunPhase = "Running"
 	RunPhaseSucceeded    RunPhase = "Succeeded"
@@ -129,13 +131,10 @@ type CertificationRunSpec struct {
 }
 
 type WorkflowStatus struct {
-	Name    string            `json:"name,omitempty"`
-	UID     string            `json:"uid,omitempty"`
-	Attempt int32             `json:"attempt,omitempty"`
-	Phase   string            `json:"phase,omitempty"`
-	Outputs map[string]string `json:"outputs,omitempty"`
-	// +kubebuilder:validation:MaxItems=64
-	BackendResources []BackendResourceReference `json:"backendResources,omitempty"`
+	Name    string `json:"name,omitempty"`
+	UID     string `json:"uid,omitempty"`
+	Attempt int32  `json:"attempt,omitempty"`
+	Phase   string `json:"phase,omitempty"`
 }
 
 type EvidenceStatus struct {

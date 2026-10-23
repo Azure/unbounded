@@ -149,9 +149,10 @@ releasing Node reservations. This also covers adapter crashes, cancellation,
 and a controller crash between Workflow creation and status persistence.
 The six-hour Workflow TTL is a fallback, not the normal evidence-retention
 mechanism; immutable terminal evidence remains available after Workflow cleanup.
-The controller's namespace-scoped backend patch/delete and owner-finalizer
-permissions allow Kubernetes' owner-reference admission checks to authorize
-blocking deletion fences. It does not receive backend workload creation rights.
+The controller's namespace-scoped backend patch and owner-finalizer permissions
+allow Kubernetes' owner-reference admission checks to authorize blocking
+deletion fences. It does not receive backend workload creation or deletion
+rights.
 
 ## Multi-Node execution
 
@@ -166,12 +167,14 @@ group. The included adapter creates one independently pinned backend workload
 per participant. Ordinary diagnostics use one Pod per participant. MPI
 diagnostics use one MPIJob per participant with one launcher and one GPU worker;
 ordinary Pods and MPI workers use required Node affinity on the immutable
-`metadata.name` field to bind to the exact admitted Node without bypassing
-scheduler admission. Only the worker receives the configured GPU limit. The
-adapter propagates the Workflow active deadline, applies the profile's optional
-queue, records API-assigned workload UIDs, reads the final typed result from
-bounded workload logs, aggregates diagnostic state separately from backend
-execution state, and foreground-deletes every created workload.
+`metadata.name` field and a controller-owned reservation label containing the
+admitted Node UID. This binds execution to the exact admitted Node without
+bypassing scheduler admission or accepting a replacement Node that reuses its
+name. Only the worker receives the configured GPU limit. The adapter propagates
+the Workflow active deadline, applies the profile's optional queue, records
+API-assigned workload UIDs, reads the final typed result from bounded workload
+logs, aggregates diagnostic state separately from backend execution state, and
+foreground-deletes every created workload.
 
 The selected script is invoked with no arguments for a Pod backend,
 `mpi-launcher <gpu-count>` in an MPIJob launcher, and `mpi-worker` in its worker.
@@ -361,6 +364,11 @@ evidence projection, and cleanup. Each check's `backendActiveDeadline` is
 rendered to its participant Pod or MPIJob `activeDeadlineSeconds`. It must be
 positive and leave at least 60 seconds before the outer deadline; the
 controller rejects an invalid ordering before reserving Nodes.
+
+The sum of all 15 checks' declared verdict, reason, measurements, backend
+resource, backend evidence, and cleanup output bounds cannot exceed 768 KiB.
+The controller rejects larger plans before reserving Nodes so valid per-check
+bounds cannot collectively exceed a safe Argo Workflow status budget.
 
 `kueueTopology.requiredLevel` is an explicit Kueue Topology Aware Scheduling
 request. It must be a valid Kubernetes label key and requires a nonempty backend
