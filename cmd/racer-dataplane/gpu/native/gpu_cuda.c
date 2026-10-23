@@ -631,14 +631,21 @@ static int file_error(CUfileError_t e) {
     return RACER_GPU_EDRIVER;
 }
 
+/* Set once cuFile fails to load or open. Opening the driver probes every GPU
+ * for P2PDMA, which can take most of a second, so a failure is not retried. */
+static int cf_failed;
+
 int racer_gpu_file_open(void) {
     int rc = RACER_GPU_OK;
     pthread_mutex_lock(&load_lock);
-    if (!cf.opened) {
+    if (cf_failed) {
+        rc = RACER_GPU_EUNAVAILABLE;
+    } else if (!cf.opened) {
         struct cufile_table table;
         memset(&table, 0, sizeof(table));
         table.lib = dlopen("libcufile.so.0", RTLD_NOW | RTLD_LOCAL);
         if (!table.lib) {
+            cf_failed = 1;
             rc = RACER_GPU_EUNAVAILABLE;
             goto out;
         }
@@ -655,6 +662,7 @@ int racer_gpu_file_open(void) {
             set_bool(CUFILE_PARAM_PROPERTIES_ALLOW_COMPAT_MODE, false);
         if (file_error(table.cuFileDriverOpen())) {
             dlclose(table.lib);
+            cf_failed = 1;
             rc = RACER_GPU_EUNAVAILABLE;
             goto out;
         }
@@ -664,6 +672,7 @@ int racer_gpu_file_open(void) {
         goto out;
     missing:
         dlclose(table.lib);
+        cf_failed = 1;
         rc = RACER_GPU_EUNAVAILABLE;
     }
 out:
