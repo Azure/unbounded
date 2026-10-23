@@ -100,8 +100,10 @@ The Workflow must publish only these output parameters:
 Unexpected, duplicate, malformed, or oversized outputs are rejected and the
 run remains fail-closed. Each `backend-resources` entry must contain
 `apiVersion`, `kind`, `name`, `uid`, and the zero-based `participantIndexes`
-that the workload executed. `namespace` is optional. A multi-Node successful
-result must cover every admitted participant. The controller reads outputs only
+that the workload executed. `namespace` is optional and defaults to the
+CertificationRun namespace; an explicitly different namespace is rejected.
+A multi-Node successful result must cover every admitted participant.
+The controller reads outputs only
 from each check's unique deterministic DAG task node. Missing, malformed,
 duplicate, or ambiguous task identity and outputs fail closed. Operator script
 parameters, including GPU expectations and observed inventory, are carried in

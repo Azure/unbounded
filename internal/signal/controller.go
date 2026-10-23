@@ -1855,6 +1855,7 @@ func terminalCheckStatuses(
 		resources, resourceErr := backendResourceReferencesForParticipants(
 			outputs["backend-resources"],
 			globalIndexes,
+			run.Namespace,
 		)
 		if resourceErr != nil {
 			status.Phase = signalv1.CheckPhaseInconclusive
@@ -2089,6 +2090,7 @@ func (r *RunReconciler) evidenceDocument(
 func backendResourceReferences(
 	value string,
 	participantCount int,
+	namespace string,
 ) ([]signalv1.BackendResourceReference, error) {
 	if participantCount < 1 || participantCount > 64 {
 		return nil, fmt.Errorf("participant count must be between 1 and 64")
@@ -2122,6 +2124,14 @@ func backendResourceReferences(
 		reference := &references[index]
 		if reference.APIVersion == "" || reference.Kind == "" || reference.Name == "" || reference.UID == "" {
 			return nil, fmt.Errorf("backend-resources[%d] has an incomplete identity", index)
+		}
+
+		if reference.Namespace == "" {
+			reference.Namespace = namespace
+		}
+
+		if reference.Namespace != namespace {
+			return nil, fmt.Errorf("backend-resources[%d] namespace does not match the Run namespace", index)
 		}
 
 		identity := strings.Join([]string{
@@ -2178,8 +2188,9 @@ func backendResourceReferences(
 func backendResourceReferencesForParticipants(
 	value string,
 	globalIndexes []int32,
+	namespace string,
 ) ([]signalv1.BackendResourceReference, error) {
-	references, err := backendResourceReferences(value, len(globalIndexes))
+	references, err := backendResourceReferences(value, len(globalIndexes), namespace)
 	if err != nil {
 		return nil, err
 	}
@@ -2356,7 +2367,7 @@ func groupedBackendEvidenceForParticipants(
 	backend signalv1.ExecutionBackend,
 	namespace string,
 ) (string, bool, error) {
-	references, err := backendResourceReferences(resources, len(globalIndexes))
+	references, err := backendResourceReferences(resources, len(globalIndexes), namespace)
 	if err != nil {
 		return "", false, err
 	}
