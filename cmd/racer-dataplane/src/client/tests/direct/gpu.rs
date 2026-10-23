@@ -3,6 +3,7 @@ use super::*;
 use crate::config::GpuMode;
 use crate::gpu::GpuClient;
 use crate::gpu::GpuHelper;
+use crate::telemetry::Event;
 use racer_gpu::simulation::Environment;
 use racer_gpu::simulation::Live;
 use racer_gpu::simulation::Operation;
@@ -433,6 +434,8 @@ fn gpu_read_disk_pages_go_through_cufile_and_gpu_decrypt() {
     assert_eq!(worker(&fixture).cpu_decrypts(), 0);
     assert_eq!(counter(&helper.counters().staged), 3);
     assert_eq!(counter(&helper.counters().decrypted), 3);
+    assert_eq!(worker(&fixture).metric(Event::GpuDirectDiskRead), 3);
+    assert!(worker(&fixture).metric(Event::GpuDirectDiskReadBytes) >= length as u64);
     assert_idle(&fixture, &helper, default_slots());
 }
 
@@ -584,6 +587,8 @@ fn gpu_read_falls_back_to_host_ciphertext_when_cufile_fails() {
     assert_eq!(calls(&helper, mark, Operation::CopyH2d), 1);
     assert_eq!(calls(&helper, mark, Operation::Decrypt), 1);
     assert_eq!(counter(&helper.counters().file_failures), 1);
+    assert_eq!(worker(&fixture).metric(Event::GpuDirectDiskRead), 0);
+    assert_eq!(worker(&fixture).metric(Event::GpuDirectDiskReadBytes), 0);
     assert_eq!(worker(&fixture).cpu_decrypts(), 0);
     assert_idle(&fixture, &helper, default_slots());
 }

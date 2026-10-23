@@ -1036,6 +1036,12 @@ Where the bytes come from decides who decrypts them:
   pages from peers. The CPU does not decrypt them.
 - A page on local disk is read straight from the disk into GPU memory with
   cuFile when it can be. Otherwise the CPU reads it and copies it to the GPU.
+  This needs GPUDirect Storage on the host (`nvidia-fs`, or PCIe P2PDMA).
+  `racer_gpu_direct_disk_reads_total` and
+  `racer_gpu_direct_disk_read_bytes_total` count these reads. After a cuFile
+  driver or registration failure the dataplane logs
+  `stage=gpu state=cufile-disabled` and reads through host memory until it
+  restarts.
 
 - With RDMA on, a page from a peer can be written by the peer's NIC straight
   into GPU memory on this node (GPUDirect RDMA). See below.

@@ -607,19 +607,22 @@ impl ReadWorker {
             buffers.clone(),
         );
         let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
-        let fill = Rc::new(Fill::new(FillDependencies {
-            memory: memory.clone(),
-            buffers,
-            disk,
-            writer: writer.clone(),
-            origin: client.clone(),
-            candidates: candidates.clone(),
-            flights: Rc::new(Flights::new(admission.clone(), availability.clone())),
-            crypto: Rc::new(PageCrypto::new(keys, crypto.clone())),
-            credentials: credentials.clone(),
-            admission,
-            metadata_owner: directory.clone(),
-        }));
+        let fill = Rc::new(
+            Fill::new(FillDependencies {
+                memory: memory.clone(),
+                buffers,
+                disk,
+                writer: writer.clone(),
+                origin: client.clone(),
+                candidates: candidates.clone(),
+                flights: Rc::new(Flights::new(admission.clone(), availability.clone())),
+                crypto: Rc::new(PageCrypto::new(keys, crypto.clone())),
+                credentials: credentials.clone(),
+                admission,
+                metadata_owner: directory.clone(),
+            })
+            .with_metrics(metrics.clone()),
+        );
         let metadata = Rc::new(MetadataService::new(
             candidates,
             client,
@@ -677,6 +680,11 @@ impl ReadWorker {
     pub fn cpu_decrypts(&self) -> u64 {
         self.metrics
             .count(crate::telemetry::Event::CryptoDecryptStarted)
+    }
+
+    /// This worker's count of `event`.
+    pub fn metric(&self, event: crate::telemetry::Event) -> u64 {
+        self.metrics.count(event)
     }
 
     /// Open this worker's slab so pages can be written to and read from disk.

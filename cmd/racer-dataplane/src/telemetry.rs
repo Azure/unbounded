@@ -3349,6 +3349,8 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::FillChecksumCount => "racer_fill_checksum_nanoseconds_count",
             Self::FillChecksumNs => "racer_fill_checksum_nanoseconds_sum",
             Self::DiagnosticHardware => "racer_diagnostic_hardware_total",
+            Self::GpuDirectDiskRead => "racer_gpu_direct_disk_reads_total",
+            Self::GpuDirectDiskReadBytes => "racer_gpu_direct_disk_read_bytes_total",
 }
 metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::WarmTrackedJobs => "racer_warm_tracked_jobs",

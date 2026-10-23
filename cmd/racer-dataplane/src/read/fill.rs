@@ -1144,13 +1144,14 @@ impl Fill {
         }
         let aad = crate::security::page_aad(&envelope)?;
         let key = self.dependencies.crypto.derive_page_key(&envelope)?;
+        let read_length = record.read_length;
         let staged = target
             .helper
             .stage_file(
                 target.ordinal,
                 fd,
                 record.ciphertext.offset,
-                record.read_length as u64,
+                read_length as u64,
                 scope,
             )
             .await;
@@ -1178,6 +1179,9 @@ impl Fill {
         });
         sealed.validate_for(page)?;
         self.metrics.record(Event::DiskHit, 1);
+        self.metrics.record(Event::GpuDirectDiskRead, 1);
+        self.metrics
+            .record(Event::GpuDirectDiskReadBytes, read_length as u64);
         Ok(Some(sealed))
     }
 
