@@ -135,6 +135,10 @@ pub trait Source<H: Host> {
 
     /// Release idle transport state during shutdown.
     fn close(&self);
+
+    /// Try another control seat next, after a response the feed rejected,
+    /// such as an older cursor from a stale seat. Default: no effect.
+    fn demote(&self) {}
 }
 
 /// REST client with application-owned authentication and structured error checks.
@@ -244,6 +248,11 @@ impl<H: Host, A: Credentials<H>> Source<H> for Client<H, A> {
     fn close(&self) {
         self.transport.close_idle();
     }
+
+    /// Move the next request away from the seat that served the last response.
+    fn demote(&self) {
+        self.transport.demote();
+    }
 }
 
 /// A long-poll route and its last complete document, including unaccepted state.
@@ -288,7 +297,26 @@ impl<C: Codec> Feed<C> {
 
     /// Fetch after the retained cursor, then try full decode, delta, and at most
     /// one cursor-free full retry under the original scope. Errors retain the base.
+    ///
+    /// A failure while the scope is still live demotes the seat that served it,
+    /// so a live seat with stale state cannot hold the feed.
     pub async fn fetch<H, S>(
+        &self,
+        source: &S,
+        scope: &H::Scope,
+    ) -> Result<Option<Arc<C::Document>>, FetchError<C::Error>>
+    where
+        H: Host<Error = C::Error>,
+        S: Source<H>,
+    {
+        let result = self.fetch_once::<H, S>(source, scope).await;
+        if result.is_err() && scope.check().is_ok() {
+            source.demote();
+        }
+        result
+    }
+
+    async fn fetch_once<H, S>(
         &self,
         source: &S,
         scope: &H::Scope,

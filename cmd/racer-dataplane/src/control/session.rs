@@ -28,6 +28,9 @@ pub struct Session {
 
     shares: std::num::NonZeroU32,
 
+    /// Managed-mode report sink and the last rails it accepted.
+    report: RefCell<Option<(super::Report, Option<Vec<wire::RailMapping>>)>>,
+
     endpoint: ControlEndpoint,
 
     enrollment_transport: rest::Transport<ReactorControlIo>,
@@ -176,6 +179,10 @@ impl controlplane::feed::Source<ReactorControlIo> for PublicationSource {
 
     fn close(&self) {
         self.client.close();
+    }
+
+    fn demote(&self) {
+        self.client.demote();
     }
 }
 
@@ -391,6 +398,7 @@ impl Session {
         Self {
             rails,
             shares,
+            report: RefCell::new(None),
             endpoint,
             enrollment_transport,
             block_devices: RefCell::new(None),
@@ -474,6 +482,22 @@ impl Session {
             schedule(),
         )?);
         Ok(())
+    }
+
+    /// Report shares and rails to managed cluster control whenever rails change.
+    pub fn set_report(&self, report: super::Report) {
+        *self.report.borrow_mut() = Some((report, None));
+    }
+
+    /// Forward persisted rails once per distinct value; the sink only enqueues.
+    fn report_rails(&self, nics: &[wire::RailMapping]) {
+        let mut slot = self.report.borrow_mut();
+        if let Some((report, last)) = slot.as_mut()
+            && last.as_deref() != Some(nics)
+        {
+            report(self.shares.get(), nics.to_vec());
+            *last = Some(nics.to_vec());
+        }
     }
 
     /// Local rollout belongs to PublicationTarget, never to the feed mechanism.
@@ -598,6 +622,7 @@ impl Session {
         }
         self.auth.enrollment.load_identity(scope).await?;
         let nics = self.rails.persist(scope).await?;
+        self.report_rails(&nics);
         let request = self
             .auth
             .enrollment
@@ -795,6 +820,7 @@ impl Session {
         {
             let result = async {
                 let nics = self.rails.persist(scope).await?;
+                self.report_rails(&nics);
                 let request = self
                     .auth
                     .enrollment
@@ -913,14 +939,19 @@ pub(super) fn validate_response(response: &rest::Response) -> Result<()> {
     Err(error)
 }
 
-/// Separate REST pool per feed and for issuance, all with deployment-provided trust.
+/// Separate REST pool per feed and for issuance. Managed pools follow the shared
+/// discovered set; standalone pools reread deployment-provided trust.
 pub(super) fn transport(endpoint: &ControlEndpoint) -> rest::Transport<ReactorControlIo> {
-    rest::Transport::new(rest::Config {
+    let transport = rest::Transport::new(rest::Config {
         url: endpoint.url.clone(),
         trust_bundle: endpoint.trust_bundle.clone(),
         max_trust_bundle: wire::MAX_BUNDLE_BYTES,
         max_error_body: wire::MAX_ENROLLMENT_BYTES,
-    })
+    });
+    if let Some(discovered) = &endpoint.discovered {
+        transport.set_endpoints(discovered.clone());
+    }
+    transport
 }
 
 /// Generic feed progress remains responsive during held polls and remote backoff.
@@ -1047,7 +1078,7 @@ pub(super) mod tests {
     fn document(sequence: u64) -> wire::Publication {
         let mut p = wire::decode_publication(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../internal/racer/wire/testdata/publication.json"
+            "/control-wire/testdata/publication.json"
         )))
         .unwrap();
         p.sequence.0 = sequence;
@@ -1066,6 +1097,7 @@ pub(super) mod tests {
             ControlEndpoint {
                 url: "https://localhost".into(),
                 trust_bundle: "missing".into(),
+                discovered: None,
             },
             Rc::new(Enrollment::new(
                 p.cluster.clone(),
@@ -1256,7 +1288,7 @@ pub(super) mod tests {
             if seed {
                 let bundle = wire::decode_bundle(include_bytes!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
-                    "/../../internal/racer/wire/testdata/bundle.json"
+                    "/control-wire/testdata/bundle.json"
                 )))
                 .unwrap();
                 feed.restore(Some(Arc::new(bundle)));
@@ -1408,5 +1440,29 @@ pub(super) mod tests {
         );
         assert!(Arc::ptr_eq(&held, &session.snapshots.current().unwrap()));
         drive(&clock, sync.shutdown(&scope)).unwrap();
+    }
+
+    /// Managed reports carry configured shares and are sent only when rails change.
+    #[test]
+    fn managed_report_forwards_distinct_rails_only() {
+        let session = session();
+        session.report_rails(&[]);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        session.set_report(Arc::new(move |shares, rails| {
+            sink.lock().unwrap().push((shares, rails))
+        }));
+        let rail = wire::RailMapping {
+            rail: wire::RailId(0),
+            device: "mlx5_0".into(),
+            port: 1,
+            gid: None,
+            numa_node: Some(0),
+        };
+        session.report_rails(&[]);
+        session.report_rails(&[]);
+        session.report_rails(std::slice::from_ref(&rail));
+        session.report_rails(std::slice::from_ref(&rail));
+        assert_eq!(*seen.lock().unwrap(), vec![(4, vec![]), (4, vec![rail])]);
     }
 }

@@ -813,6 +813,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "racer-admission"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "racer-cluster-control"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "futures",
+ "getrandom",
+ "httparse",
+ "libc",
+ "racer-admission",
+ "racer-control-wire",
+ "racer-crypto",
+ "rcgen",
+ "regex",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sha2",
+ "wire-codec",
+ "x509-parser",
+ "zeroize",
+]
+
+[[package]]
 name = "racer-control-wire"
 version = "0.1.0"
 dependencies = [
@@ -866,6 +899,7 @@ dependencies = [
  "page-alloc",
  "peer-wire",
  "prost",
+ "racer-cluster-control",
  "racer-control-wire",
  "racer-crypto",
  "racer-gpu",

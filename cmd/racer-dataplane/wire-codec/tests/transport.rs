@@ -10,7 +10,9 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use wire_codec::rest::{Error as RestError, Method, Operation, Transport};
+use wire_codec::rest::{
+    DiscoveredEndpoint, DiscoveredEndpoints, Error as RestError, Method, Operation, Transport,
+};
 
 #[path = "support/mod.rs"]
 /// Loopback I/O, identities, and join-on-drop servers shared with private tests.
@@ -219,4 +221,148 @@ fn tls_fixture(trailing: bool) {
         assert_eq!(second.body, b"{}");
     }
     server.join().unwrap();
+}
+
+/// Self-signed serving certificate with the given IP SAN and validity window.
+fn pinned_server(ip: &str, expired: bool) -> (Vec<u8>, Arc<rustls::ServerConfig>) {
+    let mut params = rcgen::CertificateParams::new(vec![ip.into()]).unwrap();
+    params.is_ca = rcgen::IsCa::ExplicitNoCa;
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+    if expired {
+        params.not_before = (std::time::SystemTime::now() - Duration::from_secs(7200)).into();
+        params.not_after = (std::time::SystemTime::now() - Duration::from_secs(3600)).into();
+    }
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let cert = params.self_signed(&key).unwrap();
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![cert.der().clone()],
+        rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+    )
+    .unwrap();
+    (cert.der().to_vec(), Arc::new(config))
+}
+
+/// Discovered endpoint for a loopback port with an explicit pin and generation.
+fn discovered(port: u16, certificate: &[u8], generation: &str) -> DiscoveredEndpoint {
+    DiscoveredEndpoint {
+        url: format!("https://127.0.0.1:{port}"),
+        certificate: certificate.to_vec(),
+        generation: generation.into(),
+    }
+}
+
+/// Transport reading only the shared discovered set; the static trust file is absent.
+fn discovered_transport(
+    endpoints: Vec<DiscoveredEndpoint>,
+) -> (ControlTransport, DiscoveredEndpoints) {
+    let transport = ControlTransport::new(testing::config(
+        "https://static.invalid".into(),
+        "/nonexistent/trust.pem".into(),
+    ));
+    transport.attach_io(Rc::new(FixtureIo));
+    let shared = Arc::new(std::sync::RwLock::new(endpoints));
+    transport.set_endpoints(shared.clone());
+    (transport, shared)
+}
+
+/// A port with no listener, used as a dead seat.
+fn dead_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Every ranking order reaches the one live seat; an empty set is unavailable.
+#[test]
+fn discovered_endpoints_fail_over_to_live_seat() {
+    let (pin, config) = pinned_server("127.0.0.1", false);
+    let server = RotationServer::new(config);
+    let (dead_pin, _) = pinned_server("127.0.0.1", false);
+    let (transport, shared) = discovered_transport(vec![
+        discovered(dead_port(), &dead_pin, "a"),
+        discovered(server.port(), &pin, "b"),
+        discovered(dead_port(), &dead_pin, "c"),
+    ]);
+    for _ in 0..8 {
+        rotation_request(&transport, None).unwrap();
+    }
+    shared.write().unwrap().clear();
+    assert!(matches!(
+        rotation_request(&transport, None),
+        Err(Error::Transport(RestError::Unavailable))
+    ));
+}
+
+/// Wrong pins, wrong names, and expired pins never authenticate the server.
+#[test]
+fn discovered_pin_requires_exact_valid_certificate() {
+    let (pin, config) = pinned_server("127.0.0.1", false);
+    let server = RotationServer::new(config);
+    let (other, _) = pinned_server("127.0.0.1", false);
+    let (wrong_name, wrong_name_config) = pinned_server("10.0.0.1", false);
+    let (expired, expired_config) = pinned_server("127.0.0.1", true);
+    let (transport, shared) = discovered_transport(vec![discovered(server.port(), &other, "a")]);
+    assert!(matches!(
+        rotation_request(&transport, None),
+        Err(Error::Transport(RestError::Unavailable))
+    ));
+    for (certificate, config) in [(wrong_name, wrong_name_config), (expired, expired_config)] {
+        server.rotate(config);
+        *shared.write().unwrap() = vec![discovered(server.port(), &certificate, "a")];
+        assert!(matches!(
+            rotation_request(&transport, None),
+            Err(Error::Transport(RestError::Unavailable))
+        ));
+    }
+    // A mismatched seat is skipped in favor of a correctly pinned one.
+    let (good_pin, good_config) = pinned_server("127.0.0.1", false);
+    let good = RotationServer::new(good_config);
+    *shared.write().unwrap() = vec![
+        discovered(server.port(), &other, "a"),
+        discovered(good.port(), &good_pin, "b"),
+    ];
+    for _ in 0..4 {
+        rotation_request(&transport, None).unwrap();
+    }
+    drop(pin);
+}
+
+/// Pooled authenticated TLS is reused only while its endpoint generation is current.
+#[test]
+fn discovered_generation_change_fences_pooled_connection() {
+    let (pin, config) = pinned_server("127.0.0.1", false);
+    let server = RotationServer::new(config);
+    let (ca, ca_key) = testing::ca();
+    let identity = TestIdentity::new(&ca, &ca_key);
+    let (transport, shared) = discovered_transport(vec![discovered(server.port(), &pin, "g1")]);
+    let first = rotation_request(&transport, Some(&identity)).unwrap();
+    assert_eq!(
+        rotation_request(&transport, Some(&identity)).unwrap(),
+        first
+    );
+    *shared.write().unwrap() = vec![discovered(server.port(), &pin, "g2")];
+    let renewed = rotation_request(&transport, Some(&identity)).unwrap();
+    assert_ne!(renewed, first);
+    assert_eq!(
+        rotation_request(&transport, Some(&identity)).unwrap(),
+        renewed
+    );
+    // Replacing the shared set object also discards pooled state.
+    transport.set_endpoints(Arc::new(std::sync::RwLock::new(vec![discovered(
+        server.port(),
+        &pin,
+        "g2",
+    )])));
+    assert_ne!(
+        rotation_request(&transport, Some(&identity)).unwrap(),
+        renewed
+    );
 }

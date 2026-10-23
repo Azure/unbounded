@@ -27,3 +27,7 @@ rcgen = { version = "0.13", features = ["pem", "ring"] }
 [[test]]
 name = "transport"
 required-features = ["rest"]
+
+[[test]]
+name = "failover"
+required-features = ["rest"]
