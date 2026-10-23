@@ -144,9 +144,10 @@ func Start(ctx context.Context, cfg Config, h Handler) (*Device, error) {
 }
 
 // errUnpinnedLeft marks a device that startup added but whose char device
-// it never opened, or opened but could not verify as its own. Without that open nothing stops another process from
-// deleting the id and adding a new device under it, so teardown sends no
-// command by id and leaves the device for manual cleanup.
+// it never opened, or opened but could not verify as its own. Without a
+// verified open nothing stops another process from deleting the id and
+// adding a new device under it, so teardown sends no command by id and
+// leaves the device for manual cleanup.
 var errUnpinnedLeft = errors.New("ublk: device left in place because startup never pinned and verified its char device; " +
 	"verify it is ours before deleting it")
 
@@ -359,8 +360,9 @@ func newCookie() (uint64, error) {
 // reused, then checks through query that the device holding the id is
 // the one this Device added. Another process may have deleted ours and
 // added a new device under the id before the open. Only after a match is
-// charFd set, so no command by id is sent unless the pinned device is
-// ours; on any failure the fd is closed.
+// charFd set, so no mutating command by id is sent unless the pinned
+// device is ours; query itself is by id but changes nothing. On any
+// failure the fd is closed.
 func (d *Device) pinOwned(open func(string) (int, error), query func(int) (uint64, error)) error {
 	fd, err := open("/dev/ublkc" + strconv.Itoa(d.id))
 	if err != nil {

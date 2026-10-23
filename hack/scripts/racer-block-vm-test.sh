@@ -89,6 +89,7 @@ REQUIRED_ublk=(
 	TestIntegrationContextCancel
 	TestIntegrationFixedIDAndDelete
 	TestIntegrationStartValidation
+	TestIntegrationStartRejectsReusedID
 	TestIntegrationDeleteStale
 	TestIntegrationStartCancelDuringStartup
 	TestIntegrationStartCancelBeforeStartDev
