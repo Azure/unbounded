@@ -36,6 +36,7 @@ struct Inner {
     requests: RefCell<Vec<(String, String)>>,
     pub(crate) uids: Cell<u64>,
     counter: RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>>,
+    put_delay: RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicU64>>>,
 }
 
 impl FakeApi {
@@ -51,12 +52,30 @@ impl FakeApi {
             requests: RefCell::new(Vec::new()),
             uids: Cell::new(1),
             counter: RefCell::new(None),
+            put_delay: RefCell::new(None),
         }))
     }
 
     /// Count every request in `counter`, readable from other threads.
     pub fn count_into(&self, counter: std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         *self.0.counter.borrow_mut() = Some(counter);
+    }
+
+    /// Hold each PUT until it is `delay_ms` old, re-read while waiting;
+    /// `u64::MAX` hangs PUTs as a stuck API server would.
+    pub fn delay_puts(&self, delay_ms: std::sync::Arc<std::sync::atomic::AtomicU64>) {
+        *self.0.put_delay.borrow_mut() = Some(delay_ms);
+    }
+
+    fn put_delay(&self, method: &str) -> std::time::Duration {
+        let ms = self
+            .0
+            .put_delay
+            .borrow()
+            .as_ref()
+            .filter(|_| method == "PUT")
+            .map_or(0, |d| d.load(std::sync::atomic::Ordering::SeqCst));
+        std::time::Duration::from_millis(ms)
     }
 
     fn bump(&self) -> u64 {
@@ -413,6 +432,10 @@ pub fn serve(api: FakeApi, dir: &std::path::Path) -> KubeConfig {
                     {
                         api.serve_watch(&mut conn, path, query.unwrap()).await;
                         return;
+                    }
+                    let received = std::time::Instant::now();
+                    while received.elapsed() < api.put_delay(&head.method) {
+                        exec::sleep(std::time::Duration::from_millis(20)).await;
                     }
                     let (status, value) = api.handle(&head.method, &head.target, &body);
                     let body = serde_json::to_vec(&value).unwrap();

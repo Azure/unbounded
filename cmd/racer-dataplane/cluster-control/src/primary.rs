@@ -168,6 +168,9 @@ async fn lead(shared: &Rc<Shared>, seat: &Rc<Seat>, object: Value, started: Inst
         seat_observer: RefCell::new(Observer::default()),
         webhook_retired: RefCell::new(BTreeMap::new()),
     });
+    // Held for the whole term: shutdown waits until the loop exits and the
+    // release PUT below completes, even if the seat is cleared first.
+    let _releasing = shared.releasing();
     shared.is_primary.set(true);
     shared.changed.notify();
     let _ = exec::spawn(renew(t.clone()));
@@ -177,7 +180,10 @@ async fn lead(shared: &Rc<Shared>, seat: &Rc<Seat>, object: Value, started: Inst
     let mut next = Instant::now();
     while t.alive.get() && seat_mine(shared, seat) && !shared.stopping.get() {
         let generation = t.changed.generation();
-        let _ = exec::deadline(next, t.changed.changed(generation)).await;
+        let _ = exec::deadline(next, wake(shared, seat, &t.changed, generation)).await;
+        if shared.stopping.get() || !seat_mine(shared, seat) {
+            break;
+        }
         exec::sleep(DEBOUNCE).await;
         if !t.alive.get() {
             break;
@@ -217,6 +223,22 @@ async fn lead(shared: &Rc<Shared>, seat: &Rc<Seat>, object: Value, started: Inst
             ),
         )
         .await;
+    }
+}
+
+/// Wait for `changed` past `generation`, or for shutdown or loss of `seat`,
+/// so the term ends promptly and releases the Lease.
+async fn wake(shared: &Shared, seat: &Rc<Seat>, changed: &Signal, generation: u64) {
+    loop {
+        let outer = shared.changed.generation();
+        if shared.stopping.get() || !seat_mine(shared, seat) {
+            return;
+        }
+        let ours = std::pin::pin!(changed.changed(generation));
+        let theirs = std::pin::pin!(shared.changed.changed(outer));
+        if let futures::future::Either::Left(_) = futures::future::select(ours, theirs).await {
+            return;
+        }
     }
 }
 

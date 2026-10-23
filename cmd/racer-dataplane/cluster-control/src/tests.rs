@@ -17,7 +17,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -767,6 +767,70 @@ fn bootstrap_requires_the_installation_state_binding() {
         );
         drop(h);
     }
+}
+
+/// Start one Pod holding seat 0 and the primary Lease, wait until ready.
+fn ready_single(cluster: &FakeCluster) -> crate::Handle {
+    let mut config = cluster.config(1);
+    config.seats = SeatPolicy::Fixed(1);
+    let h = crate::start(config).unwrap();
+    let mut timeline = Timeline::default();
+    assert!(
+        wait_for(Duration::from_secs(30), || {
+            timeline.sample(cluster, &[&h]);
+            h.diagnostics().ready && matches!(h.diagnostics().role, crate::Role::Primary(0))
+        }),
+        "{timeline}"
+    );
+    h
+}
+
+fn holders(cluster: &FakeCluster) -> (String, String) {
+    let seat = annotations::seat_lease(0);
+    cluster.inspect(async |k| {
+        (
+            lease_summary(k, &seat).await.0,
+            lease_summary(k, annotations::PRIMARY_LEASE).await.0,
+        )
+    })
+}
+
+#[test]
+fn shutdown_releases_seat_and_primary_leases() {
+    let delay = Arc::new(AtomicU64::new(0));
+    let d = delay.clone();
+    let cluster = FakeCluster::start_with(1, move |api| api.delay_puts(d));
+    let h = ready_single(&cluster);
+    assert_eq!(holders(&cluster), ("p1".into(), "p1".into()));
+    // Slow releases: a shutdown that does not wait for them returns first.
+    delay.store(500, Ordering::SeqCst);
+    let stopping = Instant::now();
+    h.shutdown();
+    let took = stopping.elapsed();
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    // Released before the control thread exited, not left to expire.
+    assert_eq!(
+        holders(&cluster),
+        (String::new(), String::new()),
+        "{took:?}"
+    );
+}
+
+#[test]
+fn shutdown_is_bounded_when_releases_hang() {
+    let delay = Arc::new(AtomicU64::new(0));
+    let d = delay.clone();
+    let cluster = FakeCluster::start_with(1, move |api| api.delay_puts(d));
+    let h = ready_single(&cluster);
+    delay.store(u64::MAX, Ordering::SeqCst);
+    let stopping = Instant::now();
+    h.shutdown();
+    let took = stopping.elapsed();
+    assert!(took < Duration::from_secs(8), "{took:?}");
+    assert!(
+        took >= Duration::from_secs(4),
+        "did not wait for releases: {took:?}"
+    );
 }
 
 #[test]
