@@ -1,0 +1,56 @@
+#!/bin/bash
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+set -euo pipefail
+
+readonly users=(
+  bcho
+  cchildress
+  chokevin
+  imiller31
+  jveski
+  jwilder
+  phealy
+  plombardi89
+  qike-ms
+  vpatelsj
+)
+
+for user in "${users[@]}"; do
+  if ! id "$user" >/dev/null 2>&1; then
+    useradd --create-home --user-group --shell /bin/bash "$user"
+  fi
+
+  home=$(getent passwd "$user" | cut -d: -f6)
+  if [[ "$home" != "/home/$user" ]]; then
+    echo "refusing unexpected home for $user: $home" >&2
+    exit 1
+  fi
+
+  usermod --lock --shell /bin/bash "$user"
+  install -d -m 0700 -o "$user" -g "$user" "$home/.ssh"
+done
+
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+failed=0
+
+for user in "${users[@]}"; do
+  output="$tmpdir/$user"
+  if ! timeout 30s ssh-import-id -o "$output" "gh:$user"; then
+    echo "failed to import GitHub SSH keys for $user" >&2
+    failed=1
+    continue
+  fi
+  if ! grep -Eq '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-[^ ]+) ' "$output"; then
+    echo "GitHub publishes no usable SSH keys for $user" >&2
+    failed=1
+    continue
+  fi
+
+  install -m 0600 -o "$user" -g "$user" \
+    "$output" "/home/$user/.ssh/authorized_keys"
+done
+
+exit "$failed"

@@ -75,6 +75,8 @@ jobs:
 
           if [[ -n "$INPUT_PLATFORMS" ]]; then
             platforms="$INPUT_PLATFORMS"
+          elif [[ "$name" == "host-ubuntu2404-gb200-hillsboro" ]]; then
+            platforms="linux/arm64"
           else
             platforms="linux/amd64,linux/arm64"
           fi

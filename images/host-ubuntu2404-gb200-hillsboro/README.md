@@ -1,0 +1,63 @@
+# Hillsboro Ubuntu 24.04 GB200 Metalman host image
+
+This ARM64-only image is a Hillsboro access-policy derivative of the proven
+GB200 machine image. It copies the source disk by immutable OCI digest and
+changes only the installed root filesystem. The generic
+`images/host-ubuntu2404` image and the Azure Linux netboot installer remain
+unchanged.
+
+The build adds all members in the verified 2026-10-23
+`Azure/unbounded-dev` snapshot as same-named local users. Passwords are locked,
+passwordless sudo is defined in a reviewed sudoers file, and a cloud-init final
+hook refreshes each user's `authorized_keys` with `ssh-import-id gh:<user>` on
+every repave. No SSH keys are embedded in the image.
+
+The snapshot includes `bcho`, who published no GitHub SSH keys when it was
+verified. The producer intentionally keeps that account in policy and labels
+the image as qualification-blocked. Do not activate a built image until every
+listed member publishes at least one usable GitHub SSH key and the blocker is
+re-reviewed.
+
+## Build
+
+The default base is the digest that successfully repaved the GB200 Ubuntu host
+on 2026-10-21. The build uses `debugfs` against an extracted ext4 partition; it
+does not use a privileged mount, contact GitHub APIs, publish an image, or
+touch a Machine:
+
+```bash
+docker buildx build \
+  --platform linux/arm64 \
+  --load \
+  -t localhost/unbounded/host-ubuntu2404-gb200-hillsboro:test \
+  -f images/host-ubuntu2404-gb200-hillsboro/Containerfile .
+```
+
+The OCI artifact retains `/disk/disk.img.gz`. The build fails if the source
+disk lacks cloud-init, account-management tools, or sudo validation; contains
+an `administrator`, `unbounded`, or `unbounded-metal` account; contains a
+password hash or captured user SSH credential; or cannot be generalized. The
+producer verifies and extracts the pinned Ubuntu `ssh-import-id` package into
+the disk before capture. It clears cloud-init state and machine-id and removes
+SSH host keys before recompressing the disk.
+
+## Metalman activation
+
+After separately publishing and reviewing an immutable digest, replace only
+the machine-image field:
+
+```yaml
+spec:
+  host:
+    netboot:
+      image: ghcr.io/azure/host-ubuntu2404-gb200-hillsboro@sha256:<digest>
+      netbootImage: <existing-azure-linux-netboot-image>
+```
+
+For a legacy Machine, replace `spec.pxe.image` instead and leave
+`spec.pxe.netbootImage` unchanged.
+
+Updating the image reference alone is non-destructive. Metalman uses the new
+disk only during a later, separately authorized `HostReplace`. Do not create a
+`HostReplace`, reboot a host, or otherwise activate this image as part of the
+build or publication step.
