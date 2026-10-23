@@ -29,8 +29,8 @@ type Config struct {
 	// Device configures the ublk device. Size is ignored and set from the
 	// object size rounded up to SectorSize.
 	Device ublk.Config
-	// ReplaceExisting deletes a device left behind with the same Device.ID
-	// before starting. It has no effect when Device.ID is negative.
+	// ReplaceExisting stops and deletes any device with the same Device.ID,
+	// even if it is in use. It has no effect when Device.ID is negative.
 	ReplaceExisting bool
 	// Ready is called once with the block device path after the device starts.
 	Ready func(path string)
@@ -57,8 +57,8 @@ func DeviceSize(objectSize int64) (int64, error) {
 }
 
 // Run opens the object, starts the device, and serves it until ctx is
-// canceled or the device stops. It stops and deletes the device before it
-// returns. Cancellation of ctx is a clean stop and returns nil.
+// canceled or the device stops. It attempts cleanup before returning.
+// After startup, cancellation without a device or cleanup failure returns nil.
 func Run(ctx context.Context, cfg Config) error {
 	if cfg.Source == nil {
 		return errors.New("racerblock: Source is required")
