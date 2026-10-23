@@ -107,9 +107,9 @@ fn run() -> std::result::Result<(), (&'static str, Error)> {
         None => failure,
     };
     let application = Application::assemble(config).map_err(|error| report(("assemble", error)))?;
-    let result = application.run().map_err(|error| report(("run", error)));
-    drop(signals);
-    result
+    // Reverse scope order drops control before `signals`, so handlers stay
+    // installed until embedded control has shut down.
+    application.run().map_err(|error| report(("run", error)))
 }
 
 /// Log payload-free embedded control state for a fatal lifecycle failure.

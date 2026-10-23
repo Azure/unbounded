@@ -97,11 +97,11 @@ fn binary_exits_cleanly_on_signal_during_bootstrap() {
         let ca = params.self_signed(&key).unwrap();
         std::fs::write(root.join("ca.crt"), ca.pem()).unwrap();
         std::fs::write(root.join("token"), "token").unwrap();
-        // Reserve then release a loopback port so the API is unreachable.
-        let api = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
+        // Held as the API server: its first accepted connection shows startup
+        // passed handler installation and embedded control is running.
+        let api_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        api_listener.set_nonblocking(true).unwrap();
+        let api = api_listener.local_addr().unwrap();
         let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_racer-dataplane"));
         for (key, _) in std::env::vars_os() {
             let key_bytes = key.as_encoded_bytes();
@@ -129,9 +129,28 @@ fn binary_exits_cleanly_on_signal_during_bootstrap() {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped());
         let mut child = command.spawn().unwrap();
-        // Handlers are installed right after configuration loads; give startup
-        // time to reach the bootstrap wait before signaling.
-        std::thread::sleep(Duration::from_secs(2));
+        let waiting = Instant::now();
+        loop {
+            match api_listener.accept() {
+                Ok((connection, _)) => {
+                    drop(connection);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("accept: {error}"),
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("exited before contacting the API: {status:?}");
+            }
+            if waiting.elapsed() > Duration::from_secs(20) {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("no API connection");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Later attempts are refused, keeping bootstrap unavailable.
+        drop(api_listener);
         assert!(child.try_wait().unwrap().is_none(), "still bootstrapping");
         // SAFETY: signal only the spawned child.
         unsafe { libc::kill(child.id() as libc::pid_t, signal) };
@@ -142,6 +161,7 @@ fn binary_exits_cleanly_on_signal_during_bootstrap() {
             }
             if signaled.elapsed() > Duration::from_secs(20) {
                 child.kill().unwrap();
+                child.wait().unwrap();
                 panic!("no exit after signal {signal}");
             }
             std::thread::sleep(Duration::from_millis(20));
