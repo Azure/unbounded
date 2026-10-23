@@ -495,8 +495,16 @@ pub enum Requester {
                 bool,
             ) -> Operation<'static, VerifiedResponse>,
         >,
+        /// Test-only GPU landing: the landing GPU, and a script that returns
+        /// a landed page for a request or None to answer it as a plain request.
+        #[cfg(test)]
+        landing: Option<(i32, ScriptedLanding)>,
     },
 }
+
+/// A scripted landed page for one request, or None.
+#[cfg(test)]
+pub(crate) type ScriptedLanding = Box<dyn Fn(&PeerRequest) -> Option<transport::LandedResponse>>;
 impl Requester {
     #[cfg(any(test, feature = "subscription-interop"))]
     pub(crate) fn scripted<T: 'static>(
@@ -532,7 +540,25 @@ impl Requester {
                     }
                 })
             }),
+            #[cfg(test)]
+            landing: None,
         })
+    }
+
+    /// Test-only: let a scripted requester land pages on GPU `ordinal`.
+    #[cfg(test)]
+    pub(crate) fn with_scripted_landing(
+        self: Rc<Self>,
+        ordinal: i32,
+        land: ScriptedLanding,
+    ) -> Rc<Self> {
+        let mut requester = Rc::try_unwrap(self)
+            .ok()
+            .expect("unshared scripted requester");
+        if let Self::Scripted { landing, .. } = &mut requester {
+            *landing = Some((ordinal, land));
+        }
+        Rc::new(requester)
     }
     pub fn new(
         paths: Rc<Paths>,
@@ -746,8 +772,18 @@ impl Requester {
             }
             #[cfg(any(test, feature = "subscription-interop"))]
             Self::Scripted {
-                request: script, ..
+                request: script,
+                #[cfg(test)]
+                landing,
+                ..
             } => {
+                #[cfg(test)]
+                if let Some((own, land)) = landing
+                    && *own == ordinal
+                    && let Some(landed) = land(&request)
+                {
+                    return Box::pin(async move { Ok(Delivered::Landed(Box::new(landed))) });
+                }
                 let response = script(request, membership, scope.clone(), false);
                 Box::pin(async move { response.await.map(Delivered::Response) })
             }
@@ -758,6 +794,11 @@ impl Requester {
     pub(crate) fn landing_ready(&self, ordinal: i32) -> bool {
         match self {
             Self::Network { transfers, .. } => transfers.landing_ready(ordinal),
+            #[cfg(test)]
+            Self::Scripted {
+                landing: Some((own, _)),
+                ..
+            } => *own == ordinal,
             #[cfg(any(test, feature = "subscription-interop"))]
             Self::Scripted { .. } => false,
         }
