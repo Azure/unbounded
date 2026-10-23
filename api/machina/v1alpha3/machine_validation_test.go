@@ -49,6 +49,22 @@ func TestMachineProviderOwnershipSchema(t *testing.T) {
 	assertSchemaValidations(t, azureSchema, map[string]string{
 		"self.resourceID == oldSelf.resourceID": "resourceID is immutable",
 	})
+
+	cloudInitSchema := hostSchema.Properties["netboot"].Properties["cloudInit"]
+	assertSchemaValidations(t, cloudInitSchema, map[string]string{
+		"!(has(self.userDataConfigMapRef) && has(self.userDataSecretRef))": "userDataConfigMapRef and userDataSecretRef are mutually exclusive",
+	})
+
+	secretRefSchema := cloudInitSchema.Properties["userDataSecretRef"]
+	for _, field := range []string{"name", "namespace", "key"} {
+		if _, ok := secretRefSchema.Properties[field]; !ok {
+			t.Errorf("userDataSecretRef schema is missing property %q", field)
+		}
+
+		if !containsString(secretRefSchema.Required, field) {
+			t.Errorf("userDataSecretRef schema does not require %q", field)
+		}
+	}
 }
 
 func assertSchemaValidations(t *testing.T, schema apiextensionsv1.JSONSchemaProps, want map[string]string) {
@@ -70,4 +86,14 @@ func assertSchemaValidations(t *testing.T, schema apiextensionsv1.JSONSchemaProp
 	for rule := range want {
 		t.Errorf("schema is missing validation %q", rule)
 	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+
+	return false
 }

@@ -457,7 +457,7 @@ type PXESpec struct {
 	// +optional
 	Redfish *RedfishSpec `json:"redfish,omitempty"`
 
-	// CloudInit contains optional cloud-init customization for PXE-booted
+	// CloudInit contains optional cloud-init customization for network-booted
 	// machines.
 	// +optional
 	CloudInit *CloudInitSpec `json:"cloudInit,omitempty"`
@@ -498,11 +498,12 @@ func (p *PXESpec) TargetBootProtocol() string {
 	return p.BootProtocol
 }
 
-// CloudInitSpec defines cloud-init customization for PXE-booted machines.
+// CloudInitSpec defines cloud-init customization for network-booted machines.
 // Cloud-init merges vendor-data (managed by unbounded-kube) with user-data
 // (managed by the cluster operator). This spec controls the user-data
 // portion, allowing operators to configure SSH keys, install packages,
 // and perform other host-level customization.
+// +kubebuilder:validation:XValidation:rule="!(has(self.userDataConfigMapRef) && has(self.userDataSecretRef))",message="userDataConfigMapRef and userDataSecretRef are mutually exclusive"
 type CloudInitSpec struct {
 	// UserDataConfigMapRef references a ConfigMap containing custom
 	// cloud-init user-data. The referenced key (default "user-data")
@@ -510,6 +511,12 @@ type CloudInitSpec struct {
 	// #cloud-config YAML document).
 	// +optional
 	UserDataConfigMapRef *ConfigMapKeySelector `json:"userDataConfigMapRef,omitempty"`
+
+	// UserDataSecretRef references a Secret containing custom cloud-init
+	// user-data. Use this source when the user-data contains credentials or
+	// other sensitive values.
+	// +optional
+	UserDataSecretRef *CloudInitSecretKeySelector `json:"userDataSecretRef,omitempty"`
 }
 
 // ConfigMapKeySelector selects a key from a ConfigMap.
@@ -523,6 +530,24 @@ type ConfigMapKeySelector struct {
 	// Key within the ConfigMap.
 	// +kubebuilder:default=user-data
 	Key string `json:"key,omitempty"`
+}
+
+// CloudInitSecretKeySelector selects a key from a Secret containing cloud-init user-data.
+type CloudInitSecretKeySelector struct {
+	// Name of the Secret.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// Namespace of the Secret.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Namespace string `json:"namespace"`
+
+	// Key within the Secret.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Key string `json:"key"`
 }
 
 // KubernetesSpec defines Kubernetes-specific configuration for a Machine.

@@ -106,9 +106,10 @@ For PXE-provisioned machines, the `Machine` resource includes:
   omitted, the installer selects a disk automatically.
 - **`spec.pxe.redfish`** -- Optional BMC connection details (endpoint, username,
   password secret) for remote power management.
-- **`spec.pxe.cloudInit`** -- Optional cloud-init customization. References a
-  ConfigMap containing user-data that is merged with the vendor-data managed by
-  Unbounded.
+- **`spec.host.netboot.cloudInit`** -- Optional cloud-init customization.
+  References either a ConfigMap for non-sensitive user-data or a Secret for
+  credential-bearing user-data. Metalman merges it with the vendor-data managed
+  by Unbounded.
 
 ### Site Isolation
 

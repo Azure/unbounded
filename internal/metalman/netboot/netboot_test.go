@@ -1582,6 +1582,104 @@ func TestResolveFileByPath_UserDataFromConfigMap(t *testing.T) {
 	}
 }
 
+func TestResolveFileByPath_UserDataFromSecret(t *testing.T) {
+	const customUserData = "#cloud-config\nusers:\n  - name: operator\n"
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cloud-init-user-data",
+			Namespace: "unbounded-system",
+		},
+		Data: map[string][]byte{
+			"user-data": []byte(customUserData),
+		},
+	}
+	node := machineWithUserDataSecretRef("cloud-init-user-data", "unbounded-system", "user-data")
+	resolver := FileResolver{
+		Reader: fake.NewClientBuilder().
+			WithScheme(newScheme(t)).
+			WithObjects(secret).
+			Build(),
+	}
+
+	resolved, err := resolver.ResolveFileByPath(t.Context(), userDataPath, node, "")
+	require.NoError(t, err)
+	require.Equal(t, customUserData, string(resolved.Data))
+}
+
+func TestResolveFileByPath_UserDataSecretMissing(t *testing.T) {
+	node := machineWithUserDataSecretRef("missing", "unbounded-system", "user-data")
+	resolver := FileResolver{
+		Reader: fake.NewClientBuilder().
+			WithScheme(newScheme(t)).
+			Build(),
+	}
+
+	_, err := resolver.ResolveFileByPath(t.Context(), userDataPath, node, "")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), `getting Secret unbounded-system/missing`)
+}
+
+func TestResolveFileByPath_UserDataSecretKeyMissingDoesNotLeakData(t *testing.T) {
+	const sensitiveData = "do-not-leak-this-secret"
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cloud-init-user-data",
+			Namespace: "unbounded-system",
+		},
+		Data: map[string][]byte{
+			"other-key": []byte(sensitiveData),
+		},
+	}
+	node := machineWithUserDataSecretRef("cloud-init-user-data", "unbounded-system", "user-data")
+	resolver := FileResolver{
+		Reader: fake.NewClientBuilder().
+			WithScheme(newScheme(t)).
+			WithObjects(secret).
+			Build(),
+	}
+
+	_, err := resolver.ResolveFileByPath(t.Context(), userDataPath, node, "")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), `key "user-data" not found in Secret unbounded-system/cloud-init-user-data`)
+	require.NotContains(t, err.Error(), sensitiveData)
+}
+
+func TestResolveFileByPath_UserDataRefsConflict(t *testing.T) {
+	node := machineWithUserDataSecretRef("cloud-init-user-data", "unbounded-system", "user-data")
+	node.Spec.Netboot().CloudInit.UserDataConfigMapRef = &v1alpha3.ConfigMapKeySelector{
+		Name:      "cloud-init-user-data",
+		Namespace: "unbounded-system",
+	}
+	resolver := FileResolver{
+		Reader: fake.NewClientBuilder().
+			WithScheme(newScheme(t)).
+			Build(),
+	}
+
+	_, err := resolver.ResolveFileByPath(t.Context(), userDataPath, node, "")
+	require.EqualError(t, err, "resolving user-data: userDataConfigMapRef and userDataSecretRef are mutually exclusive")
+}
+
+func machineWithUserDataSecretRef(name, namespace, key string) *v1alpha3.Machine {
+	return &v1alpha3.Machine{
+		Spec: v1alpha3.MachineSpec{
+			Host: &v1alpha3.HostSpec{
+				Netboot: &v1alpha3.PXESpec{
+					CloudInit: &v1alpha3.CloudInitSpec{
+						UserDataSecretRef: &v1alpha3.CloudInitSecretKeySelector{
+							Name:      name,
+							Namespace: namespace,
+							Key:       key,
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
 func TestResolveFileByPath_UserDataFallsBackToDefault(t *testing.T) {
 	cache := setupOCICache(t, "ghcr.io/test/image:v1", "fblud123", map[string][]byte{
 		"vmlinuz": []byte("kernel"),

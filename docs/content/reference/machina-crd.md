@@ -69,11 +69,15 @@ top-level `spec.pxe` remains a deprecated fallback for existing Machines.
 | `host.netboot.redfish.username` | string | Yes | - | Redfish username. |
 | `host.netboot.redfish.deviceID` | string | No | `"1"` | Redfish system device ID. |
 | `host.netboot.redfish.passwordRef` | SecretKeySelector | Yes | - | Secret containing the Redfish password. |
-| `host.netboot.cloudInit` | CloudInitSpec | No | - | Optional cloud-init customization for PXE-booted machines. |
+| `host.netboot.cloudInit` | CloudInitSpec | No | - | Optional cloud-init customization for network-booted machines. ConfigMap and Secret user-data sources are mutually exclusive. |
 | `host.netboot.cloudInit.userDataConfigMapRef` | ConfigMapKeySelector | No | - | Reference to a ConfigMap containing custom cloud-init user-data. |
 | `host.netboot.cloudInit.userDataConfigMapRef.name` | string | Yes | - | ConfigMap name. |
 | `host.netboot.cloudInit.userDataConfigMapRef.namespace` | string | Yes | - | ConfigMap namespace. |
 | `host.netboot.cloudInit.userDataConfigMapRef.key` | string | No | `"user-data"` | Key within the ConfigMap. |
+| `host.netboot.cloudInit.userDataSecretRef` | CloudInitSecretKeySelector | No | - | Reference to a Secret containing credential-bearing cloud-init user-data. |
+| `host.netboot.cloudInit.userDataSecretRef.name` | string | Yes | - | Secret name. |
+| `host.netboot.cloudInit.userDataSecretRef.namespace` | string | Yes | - | Secret namespace. |
+| `host.netboot.cloudInit.userDataSecretRef.key` | string | Yes | - | Key within the Secret. |
 
 ### spec.kubernetes
 

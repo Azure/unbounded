@@ -394,7 +394,7 @@ spec:
                         type: string
                       cloudInit:
                         description: |-
-                          CloudInit contains optional cloud-init customization for PXE-booted
+                          CloudInit contains optional cloud-init customization for network-booted
                           machines.
                         properties:
                           userDataConfigMapRef:
@@ -418,7 +418,34 @@ spec:
                             - name
                             - namespace
                             type: object
+                          userDataSecretRef:
+                            description: |-
+                              UserDataSecretRef references a Secret containing custom cloud-init
+                              user-data. Use this source when the user-data contains credentials or
+                              other sensitive values.
+                            properties:
+                              key:
+                                description: Key within the Secret.
+                                minLength: 1
+                                type: string
+                              name:
+                                description: Name of the Secret.
+                                minLength: 1
+                                type: string
+                              namespace:
+                                description: Namespace of the Secret.
+                                minLength: 1
+                                type: string
+                            required:
+                            - key
+                            - name
+                            - namespace
+                            type: object
                         type: object
+                        x-kubernetes-validations:
+                        - message: userDataConfigMapRef and userDataSecretRef are
+                            mutually exclusive
+                          rule: '!(has(self.userDataConfigMapRef) && has(self.userDataSecretRef))'
                       dhcpLeases:
                         description: |-
                           DHCPLeases defines static IPv4 provisioning network settings. PXE boot
@@ -671,7 +698,7 @@ spec:
                     type: string
                   cloudInit:
                     description: |-
-                      CloudInit contains optional cloud-init customization for PXE-booted
+                      CloudInit contains optional cloud-init customization for network-booted
                       machines.
                     properties:
                       userDataConfigMapRef:
@@ -695,7 +722,34 @@ spec:
                         - name
                         - namespace
                         type: object
+                      userDataSecretRef:
+                        description: |-
+                          UserDataSecretRef references a Secret containing custom cloud-init
+                          user-data. Use this source when the user-data contains credentials or
+                          other sensitive values.
+                        properties:
+                          key:
+                            description: Key within the Secret.
+                            minLength: 1
+                            type: string
+                          name:
+                            description: Name of the Secret.
+                            minLength: 1
+                            type: string
+                          namespace:
+                            description: Namespace of the Secret.
+                            minLength: 1
+                            type: string
+                        required:
+                        - key
+                        - name
+                        - namespace
+                        type: object
                     type: object
+                    x-kubernetes-validations:
+                    - message: userDataConfigMapRef and userDataSecretRef are mutually
+                        exclusive
+                      rule: '!(has(self.userDataConfigMapRef) && has(self.userDataSecretRef))'
                   dhcpLeases:
                     description: |-
                       DHCPLeases defines static IPv4 provisioning network settings. PXE boot

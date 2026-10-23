@@ -131,7 +131,7 @@ Store BMC passwords in a Secret referenced by `passwordRef`. See the [CRD Refere
 
 ## Cloud-Init Customization
 
-Cloud-init on PXE-booted machines uses two data sources that are merged at boot:
+Cloud-init on network-booted machines uses two data sources that are merged at boot:
 
 - **Vendor-data** (managed by Unbounded) -- Contains the agent configuration, bootstrap scripts, and system defaults required for the node to join the cluster. This is not user-editable.
 - **User-data** (managed by the cluster operator) -- Optional customization such as SSH keys, additional packages, or host-level configuration.
@@ -162,23 +162,61 @@ kind: Machine
 metadata:
   name: server-01
 spec:
-  pxe:
-    image: ghcr.io/azure/host-ubuntu2404:v1
-    dhcpLeases:
-    - ipv4: "10.10.0.50"
-      mac: "aa:bb:cc:dd:ee:ff"
-      subnetMask: "255.255.255.0"
-      gateway: "10.10.0.1"
-      dns: ["8.8.8.8"]
-    cloudInit:
-      userDataConfigMapRef:
-        name: my-cloud-init
-        namespace: unbounded-system
+  host:
+    netboot:
+      image: ghcr.io/azure/host-ubuntu2404:v1
+      dhcpLeases:
+      - ipv4: "10.10.0.50"
+        mac: "aa:bb:cc:dd:ee:ff"
+        subnetMask: "255.255.255.0"
+        gateway: "10.10.0.1"
+        dns: ["8.8.8.8"]
+      cloudInit:
+        userDataConfigMapRef:
+          name: my-cloud-init
+          namespace: unbounded-system
 ```
 
 The `key` field defaults to `user-data` but can be overridden to select a different key from the ConfigMap. Both `data` and `binaryData` entries are supported.
 
 If the referenced ConfigMap does not exist, metalman falls back to the default minimal cloud-config. If the ConfigMap exists but the referenced key is not found, metalman returns an error and the machine will not receive user-data.
+
+When user-data contains credentials or other sensitive values, store it in a
+Secret instead of a ConfigMap:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: my-cloud-init
+  namespace: unbounded-system
+type: Opaque
+stringData:
+  user-data: |
+    #cloud-config
+    users:
+      - name: operator
+        passwd: ...
+---
+apiVersion: unbounded-cloud.io/v1alpha3
+kind: Machine
+metadata:
+  name: server-01
+spec:
+  host:
+    netboot:
+      image: ghcr.io/azure/host-ubuntu2404:v1
+      cloudInit:
+        userDataSecretRef:
+          name: my-cloud-init
+          namespace: unbounded-system
+          key: user-data
+```
+
+`userDataConfigMapRef` and `userDataSecretRef` are mutually exclusive. Secret
+references require `name`, `namespace`, and `key`. Metalman fails closed when
+the Secret or key is missing and does not include Secret contents in errors or
+logs.
 
 ## Boot Flow
 

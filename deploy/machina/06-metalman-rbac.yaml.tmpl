@@ -126,7 +126,7 @@ rules:
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["machineoperations/status"]
     verbs: ["get", "update", "patch"]
-  # Secrets (Redfish passwords)
+  # Secrets (Redfish passwords and cloud-init user-data)
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "watch"]

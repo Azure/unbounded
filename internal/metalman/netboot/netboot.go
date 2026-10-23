@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -182,7 +183,7 @@ func (f *FileResolver) LookupNodeByIP(ctx context.Context, ip string) (*v1alpha3
 const userDataPath = "cloud-init/user-data"
 
 // defaultUserData is the minimal cloud-config returned when no custom
-// user-data ConfigMap is configured on the Machine.
+// user-data source is configured on the Machine.
 const defaultUserData = "#cloud-config\n"
 
 func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node *v1alpha3.Machine, imageRef string) (*ResolvedFile, error) {
@@ -191,8 +192,8 @@ func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node 
 
 func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, node *v1alpha3.Machine, imageRef, requestIP string) (*ResolvedFile, error) {
 	if path == userDataPath && node != nil {
-		if data, ok, err := f.resolveUserDataFromConfigMap(ctx, node); err != nil {
-			return nil, fmt.Errorf("resolving user-data from ConfigMap: %w", err)
+		if data, ok, err := f.resolveUserData(ctx, node); err != nil {
+			return nil, fmt.Errorf("resolving user-data: %w", err)
 		} else if ok {
 			return &ResolvedFile{Data: data, ContentType: "text/plain"}, nil
 		}
@@ -275,13 +276,45 @@ func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, 
 	return &ResolvedFile{DiskPath: diskPath}, nil
 }
 
-func (f *FileResolver) resolveUserDataFromConfigMap(ctx context.Context, node *v1alpha3.Machine) ([]byte, bool, error) {
-	if node.Spec.Netboot() == nil || node.Spec.Netboot().CloudInit == nil || node.Spec.Netboot().CloudInit.UserDataConfigMapRef == nil {
+func (f *FileResolver) resolveUserData(ctx context.Context, node *v1alpha3.Machine) ([]byte, bool, error) {
+	if node.Spec.Netboot() == nil || node.Spec.Netboot().CloudInit == nil {
 		return nil, false, nil
 	}
 
-	ref := node.Spec.Netboot().CloudInit.UserDataConfigMapRef
+	cloudInit := node.Spec.Netboot().CloudInit
+	if cloudInit.UserDataConfigMapRef != nil && cloudInit.UserDataSecretRef != nil {
+		return nil, false, errors.New("userDataConfigMapRef and userDataSecretRef are mutually exclusive")
+	}
 
+	if cloudInit.UserDataSecretRef != nil {
+		return f.resolveUserDataFromSecret(ctx, cloudInit.UserDataSecretRef)
+	}
+
+	if cloudInit.UserDataConfigMapRef == nil {
+		return nil, false, nil
+	}
+
+	return f.resolveUserDataFromConfigMap(ctx, cloudInit.UserDataConfigMapRef)
+}
+
+func (f *FileResolver) resolveUserDataFromSecret(ctx context.Context, ref *v1alpha3.CloudInitSecretKeySelector) ([]byte, bool, error) {
+	var secret corev1.Secret
+	if err := f.Reader.Get(ctx, client.ObjectKey{
+		Namespace: ref.Namespace,
+		Name:      ref.Name,
+	}, &secret); err != nil {
+		return nil, false, fmt.Errorf("getting Secret %s/%s: %w", ref.Namespace, ref.Name, err)
+	}
+
+	data, ok := secret.Data[ref.Key]
+	if !ok {
+		return nil, false, fmt.Errorf("key %q not found in Secret %s/%s", ref.Key, ref.Namespace, ref.Name)
+	}
+
+	return data, true, nil
+}
+
+func (f *FileResolver) resolveUserDataFromConfigMap(ctx context.Context, ref *v1alpha3.ConfigMapKeySelector) ([]byte, bool, error) {
 	var cm corev1.ConfigMap
 	if err := f.Reader.Get(ctx, client.ObjectKey{
 		Namespace: ref.Namespace,
