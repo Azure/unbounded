@@ -317,18 +317,12 @@ fn cold_start_elects_commits_serves_and_fails_closed() {
 
     // Both Pods take seats on distinct Nodes; one becomes primary; both get
     // ready and are published as endpoints.
-    assert!(
-        wait_for(Duration::from_secs(60), || h1
-            .endpoints()
-            .read()
-            .unwrap()
-            .len()
-            == 2
-            && h2.endpoints().read().unwrap().len() == 2),
-        "{:?} {:?}",
-        h1.diagnostics(),
-        h2.diagnostics()
-    );
+    let mut timeline = Timeline::default();
+    let ok = wait_for(Duration::from_secs(60), || {
+        timeline.sample(&cluster, &[&h1, &h2]);
+        h1.endpoints().read().unwrap().len() == 2 && h2.endpoints().read().unwrap().len() == 2
+    });
+    assert!(ok, "{timeline}");
     let roles = [h1.diagnostics().role, h2.diagnostics().role];
     assert_eq!(
         roles
@@ -590,6 +584,110 @@ fn cold_start_elects_commits_serves_and_fails_closed() {
         "runtime must never recreate state"
     );
     drop(h1);
+}
+
+/// Lease name, holder, ready sequence, and published endpoint count. Only
+/// discovery metadata: no tokens or key material.
+async fn lease_summary(k: &Kube, name: &str) -> (String, String, usize) {
+    let v = k
+        .get(&format!(
+            "/apis/coordination.k8s.io/v1/namespaces/{NS}/leases/{name}"
+        ))
+        .await
+        .unwrap_or_default();
+    let endpoints = str_at(&v, &["metadata", "annotations", annotations::ENDPOINTS]);
+    (
+        str_at(&v, &["spec", "holderIdentity"]).to_owned(),
+        str_at(&v, &["metadata", "annotations", annotations::READY]).to_owned(),
+        crate::seat::parse_endpoints(Some(&endpoints.to_owned())).len(),
+    )
+}
+
+/// Timestamped changes of roles, readiness, and discovery Leases, reported
+/// when convergence fails so the slow hop is visible.
+#[derive(Default)]
+struct Timeline {
+    start: Option<Instant>,
+    last: String,
+    lines: Vec<String>,
+}
+
+impl Timeline {
+    fn sample(&mut self, cluster: &FakeCluster, handles: &[&crate::Handle]) {
+        let start = *self.start.get_or_insert_with(Instant::now);
+        let mut now = String::new();
+        for h in handles {
+            let d = h.diagnostics();
+            now += &format!(
+                "{:?}/ready={}/endpoints={} ",
+                d.role,
+                d.ready,
+                h.endpoints().read().unwrap().len()
+            );
+        }
+        now += &cluster.inspect(async |k| {
+            let mut s = String::new();
+            let names = (0..3)
+                .map(annotations::seat_lease)
+                .chain([annotations::PRIMARY_LEASE.to_owned()]);
+            for name in names {
+                let (holder, ready, endpoints) = lease_summary(k, &name).await;
+                s += &format!("{name}:{holder}/r{ready}/e{endpoints} ");
+            }
+            s
+        });
+        if now != self.last {
+            self.lines
+                .push(format!("{:.1}s {now}", start.elapsed().as_secs_f64()));
+            self.last = now;
+        }
+    }
+}
+
+impl std::fmt::Display for Timeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.lines.join("\n"))
+    }
+}
+
+/// A seat that becomes ready writes that to its Lease right away, and the
+/// primary publishes it within one reconcile period instead of waiting for
+/// the next seat renewal and then the next primary renewal.
+#[test]
+fn readiness_is_published_without_waiting_for_renewals() {
+    let cluster = FakeCluster::start(1);
+    let mut config = cluster.config(1);
+    config.seats = SeatPolicy::Fixed(1);
+    let h = crate::start(config).unwrap();
+    let mut timeline = Timeline::default();
+    assert!(
+        wait_for(Duration::from_secs(30), || {
+            timeline.sample(&cluster, &[&h]);
+            h.diagnostics().ready
+        }),
+        "{timeline}"
+    );
+    let ready = Instant::now();
+    let seat = annotations::seat_lease(0);
+    let written =
+        |cluster: &FakeCluster| cluster.inspect(async |k| lease_summary(k, &seat).await.1 == "1");
+    assert!(
+        wait_for(Duration::from_secs(3), || {
+            timeline.sample(&cluster, &[&h]);
+            written(&cluster)
+        }),
+        "ready not written before the seat renewal:\n{timeline}"
+    );
+    // One reconcile period plus debounce and slack, short of the
+    // renewal-paced path (seat renewal, then reconcile, then primary renewal).
+    let budget = crate::limits::LEASE_RENEW + Duration::from_secs(5);
+    assert!(
+        wait_for(budget.saturating_sub(ready.elapsed()), || {
+            timeline.sample(&cluster, &[&h]);
+            h.endpoints().read().unwrap().len() == 1
+        }),
+        "endpoint not published within {budget:?} of ready:\n{timeline}"
+    );
 }
 
 fn record_of(cluster: &FakeCluster) -> Value {
