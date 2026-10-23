@@ -99,8 +99,8 @@ func (r servingRunnable) Start(ctx context.Context) error {
 	return a.Server.Start(ctx)
 }
 
-// Start runs mgr and returns only after the HTTPS listener and its
-// connections are closed, including after an unintended leadership loss.
+// Start runs mgr and waits for the HTTPS serving runnable, including its
+// bounded shutdown after leadership loss, before returning.
 func (a *Application) Start(ctx context.Context, mgr ctrl.Manager) error {
 	err := mgr.Start(ctx)
 
