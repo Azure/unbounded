@@ -689,7 +689,7 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
                 install_record(shared, c, read_started)?;
                 install_image(shared, image);
             }
-            update_discovery(t, &live, desired, eligible).await;
+            update_discovery(t, &live, desired, eligible, None).await;
             return Ok(());
         }
         if let Some(c) = &current {
@@ -720,9 +720,12 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
             .await
         {
             Ok(_) => {
+                // Seats learn the new record after this pass, so a seat
+                // still at the sequence this commit replaced keeps serving.
+                let floor = current.as_ref().map(|c| c.sequence);
                 install_record(shared, next, started)?;
                 install_image(shared, image);
-                update_discovery(t, &live, desired, eligible).await;
+                update_discovery(t, &live, desired, eligible, floor).await;
                 return Ok(());
             }
             Err(KubeError::Conflict) if attempts < 3 => continue,
@@ -751,14 +754,10 @@ async fn update_discovery(
     live: &BTreeMap<usize, LeaseObservation>,
     desired: usize,
     eligible: usize,
+    previous: Option<u64>,
 ) {
     let shared = &t.shared;
-    let sequence = shared
-        .serving
-        .borrow()
-        .record
-        .as_ref()
-        .map(|r| r.sequence.to_string());
+    let sequence = shared.serving.borrow().record.as_ref().map(|r| r.sequence);
     let width = desired.max(live.keys().next_back().map_or(0, |i| i + 1));
     let nodes: Vec<String> = (0..width)
         .map(|i| {
@@ -770,7 +769,11 @@ async fn update_discovery(
     let ready: Vec<(usize, &LeaseObservation)> = live
         .iter()
         .filter(|(_, o)| {
-            sequence.is_some() && o.annotations.get(annotations::READY) == sequence.as_ref()
+            seat_ready(
+                o.annotations.get(annotations::READY).map(String::as_str),
+                sequence,
+                previous,
+            )
         })
         .map(|(i, o)| (*i, o))
         .collect();
@@ -838,6 +841,19 @@ async fn update_discovery(
         &fresh,
     )
     .await;
+}
+
+/// Whether a seat's READY sequence counts as serving. A seat at the current
+/// sequence is ready; right after a commit, a seat still at the sequence the
+/// commit replaced also stays ready, since seats only learn new records after
+/// the commit and a stale-by-one seat serves a consistent older snapshot
+/// (clients ahead of it get Unavailable and retry elsewhere). Missing,
+/// malformed, older, or newer-than-current READY values are not ready.
+pub(crate) fn seat_ready(ready: Option<&str>, current: Option<u64>, previous: Option<u64>) -> bool {
+    let (Some(current), Some(seat)) = (current, ready.and_then(|r| r.parse::<u64>().ok())) else {
+        return false;
+    };
+    seat <= current && seat >= previous.unwrap_or(current).min(current)
 }
 
 /// Webhook IPs a seat published, one per family, falling back to its
@@ -1241,5 +1257,32 @@ mod tests {
             !same_term(&o("l1", 4, "01"), "p1/00", &term),
             "other process"
         );
+    }
+}
+
+#[cfg(test)]
+mod seat_ready_tests {
+    use super::seat_ready;
+
+    #[test]
+    fn current_sequence_is_ready() {
+        assert!(seat_ready(Some("5"), Some(5), None));
+        assert!(!seat_ready(Some("4"), Some(5), None));
+    }
+
+    #[test]
+    fn seats_lagging_a_fresh_commit_stay_ready() {
+        assert!(seat_ready(Some("4"), Some(5), Some(4)));
+        assert!(seat_ready(Some("5"), Some(5), Some(4)));
+        assert!(!seat_ready(Some("3"), Some(5), Some(4)));
+    }
+
+    #[test]
+    fn missing_malformed_or_future_ready_is_excluded() {
+        assert!(!seat_ready(None, Some(5), Some(4)));
+        assert!(!seat_ready(Some(""), Some(5), Some(4)));
+        assert!(!seat_ready(Some("x"), Some(5), Some(4)));
+        assert!(!seat_ready(Some("6"), Some(5), Some(4)));
+        assert!(!seat_ready(Some("5"), None, Some(4)));
     }
 }
