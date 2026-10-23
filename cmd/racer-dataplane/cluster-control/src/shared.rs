@@ -102,6 +102,9 @@ pub struct Shared {
     /// Per-process nonce, hex.
     pub nonce: String,
     pub stopping: Cell<bool>,
+    /// Lease release PUTs in flight. Shutdown waits for these, bounded by
+    /// its grace period, so held Leases are freed rather than left to expire.
+    pub releasing: Cell<usize>,
     pub last_error: Cell<Option<crate::Error>>,
 }
 
@@ -163,11 +166,27 @@ impl Shared {
         self.serving.borrow().roots.clone()
     }
 
+    /// Count a Lease release in flight until the guard drops.
+    pub fn releasing(self: &Rc<Self>) -> Releasing {
+        self.releasing.set(self.releasing.get() + 1);
+        Releasing(self.clone())
+    }
+
     /// Drop the seat and stop serving.
     pub fn lose_seat(&self) {
         *self.seat.borrow_mut() = None;
         self.is_primary.set(false);
         self.changed.notify();
+    }
+}
+
+/// In-flight Lease release; see [`Shared::releasing`].
+pub struct Releasing(Rc<Shared>);
+
+impl Drop for Releasing {
+    fn drop(&mut self) {
+        self.0.releasing.set(self.0.releasing.get() - 1);
+        self.0.changed.notify();
     }
 }
 
@@ -213,6 +232,7 @@ pub(crate) mod tests {
             is_primary: Cell::new(false),
             primary: RefCell::new(PrimaryView::default()),
             stopping: Cell::new(false),
+            releasing: Cell::new(0),
             last_error: Cell::new(None),
         })
     }

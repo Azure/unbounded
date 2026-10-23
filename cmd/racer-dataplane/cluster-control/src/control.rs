@@ -167,6 +167,7 @@ fn run(
                 is_primary: Default::default(),
                 primary: RefCell::new(Default::default()),
                 stopping: Default::default(),
+                releasing: Default::default(),
                 last_error: Default::default(),
             });
             Ok((executor, shared, control, webhook, webhook_alternate))
@@ -225,7 +226,9 @@ fn run(
                 stop_at = Some(Instant::now() + Duration::from_secs(5));
             }
             // Give seat tasks a bounded chance to release Leases.
-            return shared.seat.borrow().is_none() && !shared.is_primary.get()
+            return shared.seat.borrow().is_none()
+                && !shared.is_primary.get()
+                && shared.releasing.get() == 0
                 || stop_at.is_some_and(|t| Instant::now() >= t);
         }
         false

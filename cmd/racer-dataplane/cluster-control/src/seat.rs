@@ -568,6 +568,8 @@ pub async fn seat_task(shared: Rc<Shared>, seat: Rc<Seat>, mut object: serde_jso
                 .into_keys()
                 .map(|k| (k, None))
                 .collect();
+            // Held across the clear so shutdown waits for the PUT.
+            let _releasing = shared.releasing();
             shared.lose_seat();
             let _ = exec::timeout(
                 limits::API_TIMEOUT,
