@@ -80,9 +80,9 @@ type Device struct {
 }
 
 // Start creates the device, starts serving it with h and returns once
-// /dev/ublkb<ID> exists. The device is torn down when ctx is canceled.
-// Cancellation observed during startup is returned after the device is
-// torn down.
+// /dev/ublkb<ID> exists. Cancellation starts teardown. Cancellation observed
+// during startup is returned after cleanup is attempted. If device ownership
+// cannot be verified, the error calls for a manual check before deletion.
 func Start(ctx context.Context, cfg Config, h Handler) (*Device, error) {
 	if h == nil {
 		return nil, errors.New("ublk: nil handler")
@@ -152,8 +152,7 @@ var errUnpinnedLeft = errors.New("ublk: device left in place because startup nev
 	"verify it is ours before deleting it")
 
 // abortStart tears down a device whose startup failed and returns err.
-// When teardown left the device in place because it could not delete it
-// safely, that is joined to err so the caller learns of it.
+// If ownership was not verified, the manual-cleanup error is joined to err.
 func (d *Device) abortStart(err error) error {
 	d.teardown(err)
 
