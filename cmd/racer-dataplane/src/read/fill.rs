@@ -941,6 +941,16 @@ impl Fill {
                 Err(_) => {}
             }
         }
+        match self
+            .land_from_peer(&page, membership.clone(), context, scope, budget, target)
+            .await
+        {
+            Ok(Some(fetched)) => return Ok(fetched),
+            Ok(None) => {}
+            Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => return Err(error),
+            // Any other failure takes the usual path through host memory.
+            Err(_) => {}
+        }
         let acquired = self
             .acquire_with_prefetch(
                 page.clone(),
@@ -965,6 +975,113 @@ impl Fill {
                     .map(Fetched::Page),
             },
         }
+    }
+
+    /// Fetch a page from a peer straight into a GPU landing buffer (GPUDirect
+    /// RDMA). This is a private fetch for one sealed read: it does not join
+    /// or create a shared single flight, and a landed page is never published
+    /// to memory or persisted, because there are no host bytes to share.
+    ///
+    /// Only the first provider in visit order is asked, with one CopyOnly
+    /// request. None means use the usual path: no landing buffer on the
+    /// request's GPU, a local copy exists, this node owns the page, or the
+    /// provider missed or failed. A page the provider sent to host memory
+    /// instead (no free landing slot, or HTTP) is used privately in the same
+    /// way, so it is not fetched twice.
+    async fn land_from_peer(
+        &self,
+        page: &PageId,
+        membership: Arc<crate::topology::Membership>,
+        context: &OriginContext,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+        target: &super::sealed::SealedTarget,
+    ) -> Result<Option<super::sealed::Fetched>> {
+        let resolver = &self.dependencies.candidates;
+        if !resolver.landing_ready(target.ordinal)
+            || self
+                .dependencies
+                .writer
+                .copy_only(page)
+                .ok()
+                .flatten()
+                .is_some()
+        {
+            return Ok(None);
+        }
+        if let Some(local) = self.acquire_local_copy(page, scope, false).await? {
+            return Ok(Some(match local {
+                AcquiredPage::Plaintext(result) => super::sealed::Fetched::Page(result),
+                AcquiredPage::Ciphertext(copy) => match self.seal(page, copy) {
+                    Ok(sealed) => super::sealed::Fetched::Sealed(sealed),
+                    Err(_) => return Ok(None),
+                },
+            }));
+        }
+        let candidates = resolver
+            .candidates_scoped(membership.clone(), &page.version.object, page.number, scope)
+            .await?;
+        if resolver.is_candidate(&candidates) {
+            return Ok(None);
+        }
+        let order = resolver.visit_order(&candidates, &page.version.object, page.number);
+        let Some(first) = order.ranks().next() else {
+            return Ok(None);
+        };
+        let destination = candidates.ordered[first].clone();
+        let delivered = resolver
+            .request_landing(
+                &membership,
+                &destination,
+                context,
+                page,
+                scope,
+                budget,
+                target.ordinal,
+            )
+            .await?;
+        let landed = match delivered {
+            crate::peer::Delivered::Landed(landed) => landed,
+            // The provider sent the page to host memory (no free landing
+            // slot, or HTTP): use it privately rather than fetch it again.
+            crate::peer::Delivered::Response(response) => {
+                let Ok(copy) = response_copy(response.response(), page) else {
+                    return Ok(None);
+                };
+                return Ok(self
+                    .seal(
+                        page,
+                        UnverifiedPage {
+                            copy,
+                            disk_token: None,
+                        },
+                    )
+                    .ok()
+                    .map(super::sealed::Fetched::Sealed));
+            }
+        };
+        let crate::peer::transport::LandedResponse {
+            metadata,
+            envelope,
+            landed,
+            ..
+        } = *landed;
+        if landed.ordinal() != target.ordinal || envelope.page != *page {
+            return Ok(None);
+        }
+        metadata.immutable().validate_page(&envelope)?;
+        let sealed = Box::new(super::sealed::SealedPage {
+            aad: crate::security::page_aad(&envelope)?,
+            key: self.dependencies.crypto.derive_page_key(&envelope)?,
+            // No host bytes to checksum: the GPU checks the AEAD tag.
+            expected_crc: None,
+            metadata,
+            envelope,
+            source: super::sealed::SealedSource::Landed(landed),
+        });
+        sealed.validate_for(page)?;
+        self.metrics.record(Event::PeerHit, 1);
+        Ok(Some(super::sealed::Fetched::Sealed(sealed)))
     }
 
     /// Package host ciphertext for GPU verification.

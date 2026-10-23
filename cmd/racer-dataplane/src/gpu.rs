@@ -222,8 +222,11 @@ impl rdma_verbs::DmabufMemory for GpuLanding {
 /// Peer ciphertext that a NIC wrote into a GPU landing buffer. Holds the
 /// RDMA device page, so the slot is not reused until this is dropped.
 pub struct LandedCiphertext {
-    page: rdma_verbs::DevicePage,
+    /// Holds the slot. `None` only for test pages written without a NIC.
+    _page: Option<rdma_verbs::DevicePage>,
     ordinal: i32,
+    offset: u64,
+    length: u64,
 }
 
 impl LandedCiphertext {
@@ -234,9 +237,24 @@ impl LandedCiphertext {
             return Err(Error::Internal);
         }
         Ok(Self {
-            page,
             ordinal: landing.ordinal,
+            offset: page.offset(),
+            length: page.len() as u64,
+            _page: Some(page),
         })
+    }
+
+    /// Bytes at `offset` of `landing`, written there by a test in place of
+    /// a NIC.
+    #[cfg(test)]
+    pub(crate) fn for_test(landing: &GpuLanding, offset: u64, length: u64) -> Self {
+        assert!(offset + length <= landing.length);
+        Self {
+            _page: None,
+            ordinal: landing.ordinal,
+            offset,
+            length,
+        }
     }
 
     /// The GPU the bytes are on.
@@ -246,17 +264,17 @@ impl LandedCiphertext {
 
     /// Bytes that landed.
     pub fn len(&self) -> u64 {
-        self.page.len() as u64
+        self.length
     }
 
     /// Never true: landed ciphertext always holds a tag.
     pub fn is_empty(&self) -> bool {
-        self.page.is_empty()
+        self.length == 0
     }
 
     /// Byte offset in the landing buffer.
     fn offset(&self) -> u64 {
-        self.page.offset()
+        self.offset
     }
 }
 
@@ -1270,6 +1288,80 @@ pub(crate) mod testing {
         SIM.with(|sim| sim.borrow().as_ref().unwrap().0.clone())
     }
 
+    /// A test scope with a few seconds on the real clock.
+    fn scope() -> RequestScope {
+        RequestScope::new(
+            crate::model::RequestId([1; 16]),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap()
+    }
+
+    /// GPU `ordinal`'s landing buffer of `length` bytes, blocking.
+    pub(crate) fn landing(
+        helper: &GpuHelper,
+        ordinal: i32,
+        length: u64,
+    ) -> Result<Arc<GpuLanding>> {
+        futures::executor::block_on(helper.landing(ordinal, length, &scope()))
+    }
+
+    /// Write `bytes` at `at` into a landing buffer through its dma-buf, as
+    /// a NIC would.
+    pub(crate) fn nic_write(landing: &GpuLanding, at: u64, bytes: &[u8]) {
+        use std::os::unix::fs::FileExt;
+        let file = std::fs::File::from(landing.fd.try_clone().unwrap());
+        file.write_all_at(bytes, at).unwrap();
+    }
+
+    /// Import a fresh allocation on GPU `ordinal` as request `id`.
+    pub(crate) fn import(helper: &GpuHelper, id: u64, ordinal: i32) -> OwnedFd {
+        let size = racer_gpu::simulation::GRANULARITY;
+        let fd = helper.run(move || simulation().allocate(ordinal, size));
+        let (reply, answer) = oneshot::channel();
+        helper
+            .send(Job::Import {
+                id,
+                fd: fd.try_clone().unwrap(),
+                allocation_size: size,
+                window: 0..size,
+                reply,
+            })
+            .unwrap();
+        assert_eq!(futures::executor::block_on(answer).unwrap(), Ok(ordinal));
+        fd
+    }
+
+    /// Verify and decrypt `page`'s `range` into request `id` at offset 0.
+    pub(crate) fn write(
+        helper: &GpuHelper,
+        id: u64,
+        page: Box<SealedPage>,
+        range: Range<u64>,
+    ) -> Result<()> {
+        let (reply, answer) = oneshot::channel();
+        helper
+            .send(Job::Write {
+                id,
+                offset: 0,
+                work: Work::Sealed(Sealed { page, range }),
+                reply,
+            })
+            .unwrap();
+        futures::executor::block_on(answer).unwrap().1
+    }
+
+    /// Host-to-device copies the GPU has made so far.
+    pub(crate) fn host_copies(helper: &GpuHelper) -> usize {
+        helper.run(|| {
+            simulation()
+                .trace()
+                .iter()
+                .filter(|event| event.operation == racer_gpu::simulation::Operation::CopyH2d)
+                .count()
+        })
+    }
+
     /// A required-mode helper on simulated GPUs with these NUMA nodes.
     pub(crate) fn helper(numa: &[Option<u32>]) -> Arc<GpuHelper> {
         let devices: Vec<racer_gpu::simulation::SimDevice> = numa
@@ -1292,5 +1384,157 @@ pub(crate) mod testing {
         )
         .unwrap()
         .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! RDMA landing buffers on simulated GPUs: allocation, reuse, and
+    //! decrypting ciphertext a NIC wrote straight into GPU memory.
+    use super::testing::*;
+    use super::*;
+    use crate::model::*;
+    use rdma_verbs::DmabufMemory;
+
+    const LENGTH: u64 = 2 * SLOT_BYTES;
+
+    fn metadata(length: u64) -> ObjectMetadata {
+        ObjectMetadata {
+            content_type: None,
+            version: ObjectVersion {
+                object: ObjectId {
+                    cache: racer_control_wire::CacheId(
+                        "00000000-0000-4000-8000-000000000001".into(),
+                    ),
+                    key: CacheKey([0; 32]),
+                },
+                etag: StrongEtag::test_value("v1"),
+            },
+            length,
+            expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
+        }
+    }
+
+    /// A sealed page whose real ciphertext a NIC wrote at `at` in `landing`.
+    fn landed(landing: &GpuLanding, at: u64, plaintext: &[u8], tamper: bool) -> Box<SealedPage> {
+        let metadata = metadata(plaintext.len() as u64);
+        let envelope = PageEnvelope {
+            cipher: PageCipher::Xaes256Gcm,
+            page: PageId {
+                version: metadata.version.clone(),
+                number: PageNumber(0),
+            },
+            key_id: key_id_from_generation(1, 1).unwrap(),
+            nonce: Nonce([2; 24]),
+            plaintext_length: plaintext.len() as u32,
+            ciphertext_length: plaintext.len() as u32 + 16,
+        };
+        let aad = crate::security::page_aad(&envelope).unwrap();
+        let mut sealed = vec![0; plaintext.len() + 16];
+        racer_crypto::seal(&[7; 32], &envelope.nonce.0, &aad, plaintext, &mut sealed).unwrap();
+        if tamper {
+            sealed[3] ^= 1;
+        }
+        nic_write(landing, at, &sealed);
+        let page = Box::new(SealedPage {
+            metadata,
+            aad,
+            key: racer_crypto::xaes_derive(&[7; 32], &envelope.nonce.0),
+            expected_crc: None,
+            source: SealedSource::Landed(LandedCiphertext::for_test(
+                landing,
+                at,
+                sealed.len() as u64,
+            )),
+            envelope,
+        });
+        page.validate_for(&page.envelope.page.clone()).unwrap();
+        page
+    }
+
+    #[test]
+    /// One landing buffer per GPU, made once and reused; each GPU gets its
+    /// own NIC address range; bad sizes and non-decrypting GPUs are refused.
+    fn landing_buffers_are_per_gpu_and_reused() {
+        let helper = helper(&[Some(0), Some(1)]);
+        let first = landing(&helper, 0, LENGTH).unwrap();
+        assert!(Arc::ptr_eq(&first, &landing(&helper, 0, LENGTH).unwrap()));
+        let second = landing(&helper, 1, LENGTH).unwrap();
+        assert_eq!((first.ordinal(), second.ordinal()), (0, 1));
+        assert_eq!((first.offset(), first.length()), (0, LENGTH as usize));
+        assert_ne!(first.iova(), second.iova());
+        assert_eq!(landing(&helper, 2, LENGTH).err(), Some(Error::Unavailable));
+        assert_eq!(landing(&helper, 0, 0).err(), Some(Error::Unavailable));
+        assert_eq!(landing(&helper, 0, 4095).err(), Some(Error::Unavailable));
+        assert_eq!(helper.run(|| simulation().live().staging), 2);
+        assert_eq!(helper.leaked(), 0);
+    }
+
+    #[test]
+    /// Allocation or export failures are reported and can be retried.
+    fn landing_fails_when_allocation_or_export_fails() {
+        let helper = helper(&[None]);
+        helper.run(|| simulation().fault(racer_gpu::simulation::Operation::Staging, -4));
+        assert_eq!(landing(&helper, 0, LENGTH).err(), Some(Error::Overloaded));
+        helper.run(|| simulation().fault(racer_gpu::simulation::Operation::Dmabuf, -5));
+        assert_eq!(landing(&helper, 0, LENGTH).err(), Some(Error::Unavailable));
+        assert!(landing(&helper, 0, LENGTH).is_ok());
+    }
+
+    #[test]
+    /// Landed ciphertext decrypts on the GPU with no host-to-device copy of
+    /// the ciphertext, whole or in part.
+    fn landed_ciphertext_decrypts_on_the_gpu_without_a_host_copy() {
+        let helper = helper(&[None]);
+        let buffer = landing(&helper, 0, LENGTH).unwrap();
+        let plaintext: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
+        let fd = import(&helper, 1, 0);
+        let before = host_copies(&helper);
+        write(
+            &helper,
+            1,
+            landed(&buffer, SLOT_BYTES, &plaintext, false),
+            0..5000,
+        )
+        .unwrap();
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, 5000),
+            plaintext
+        );
+        assert_eq!(host_copies(&helper), before, "no host copy");
+        assert_eq!(helper.counters().landed.load(Ordering::Relaxed), 1);
+        let fd = import(&helper, 2, 0);
+        write(&helper, 2, landed(&buffer, 0, &plaintext, false), 10..20).unwrap();
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, 10),
+            plaintext[10..20]
+        );
+        assert_eq!(helper.counters().landed.load(Ordering::Relaxed), 2);
+        assert_eq!(helper.leaked(), 0);
+    }
+
+    #[test]
+    /// A tampered landed page is rejected before anything is written; a page
+    /// on another GPU's landing buffer is refused.
+    fn tampered_or_misplaced_landed_ciphertext_is_rejected() {
+        let helper = helper(&[None, None]);
+        let near = landing(&helper, 0, LENGTH).unwrap();
+        let far = landing(&helper, 1, LENGTH).unwrap();
+        let plaintext = vec![5; 100];
+        let fd = import(&helper, 1, 0);
+        assert_eq!(
+            write(&helper, 1, landed(&near, 0, &plaintext, true), 0..100),
+            Err(Error::CorruptRecord)
+        );
+        assert_eq!(
+            racer_gpu::simulation::read_allocation(&fd, 0, 100),
+            vec![0; 100]
+        );
+        assert_eq!(helper.counters().rejected.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            write(&helper, 1, landed(&far, 0, &plaintext, false), 0..100),
+            Err(Error::Internal)
+        );
+        assert_eq!(helper.counters().landed.load(Ordering::Relaxed), 0);
     }
 }

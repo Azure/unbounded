@@ -9,6 +9,7 @@ use crate::model::AttemptId;
 use crate::model::MetadataSelector;
 use crate::model::ObjectId;
 use crate::model::PageNumber;
+use crate::peer::Delivered;
 use crate::peer::Requester;
 use crate::peer::forwarding::VerifiedResponse;
 use crate::peer::protocol::FetchMode;
@@ -1426,6 +1427,82 @@ impl CandidatePolicy {
         request_mode: RequestMode,
         trail: Option<(&mut CandidateTrail, u8)>,
     ) -> Result<VerifiedResponse> {
+        match self
+            .request_delivered(
+                membership,
+                destination,
+                context,
+                operation,
+                mode,
+                scope,
+                budget,
+                remaining_opportunities,
+                request_mode,
+                trail,
+                None,
+            )
+            .await?
+        {
+            Delivered::Response(response) => Ok(response),
+            Delivered::Landed(_) => Err(Error::Internal),
+        }
+    }
+
+    /// One CopyOnly page request for a `gpu-read` on GPU `ordinal`: the page
+    /// may land in a GPU landing buffer (see [`Requester::request_landing`]).
+    /// The caller sends it to one provider only.
+    #[allow(clippy::too_many_arguments)] // Same route inputs as a plain request.
+    pub(crate) async fn request_landing(
+        &self,
+        membership: &std::sync::Arc<crate::topology::Membership>,
+        destination: &NodeId,
+        context: &OriginContext,
+        page: &crate::model::PageId,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+        ordinal: i32,
+    ) -> Result<Delivered> {
+        let operation = PeerOperation::Page {
+            page: page.clone(),
+            mode: FetchMode::CopyOnly,
+        };
+        self.request_delivered(
+            membership,
+            destination,
+            context,
+            &operation,
+            FetchMode::CopyOnly,
+            scope,
+            budget,
+            2,
+            RequestMode::SharedRoute,
+            None,
+            Some(ordinal),
+        )
+        .await
+    }
+
+    /// Whether this node can land peer pages on GPU `ordinal`.
+    pub(crate) fn landing_ready(&self, ordinal: i32) -> bool {
+        self.peers.landing_ready(ordinal)
+    }
+
+    /// Request a peer copy, optionally into a GPU landing buffer.
+    #[allow(clippy::too_many_arguments)] // Keep the optional borrowed trace separate from route state.
+    async fn request_delivered(
+        &self,
+        membership: &std::sync::Arc<crate::topology::Membership>,
+        destination: &NodeId,
+        context: &OriginContext,
+        operation: &PeerOperation,
+        mode: FetchMode,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+        remaining_opportunities: u32,
+        request_mode: RequestMode,
+        trail: Option<(&mut CandidateTrail, u8)>,
+        landing: Option<i32>,
+    ) -> Result<Delivered> {
         let mut remote = [b'?'; 36];
         if trail.is_some() && racer_crypto::identity::canonical_uuid(&destination.0) {
             remote.copy_from_slice(destination.0.as_bytes());
@@ -1547,12 +1624,18 @@ impl CandidatePolicy {
                 },
             };
             let registration = scope.cancellation.subscribe()?;
-            let mut exchange = if matches!(request_mode, RequestMode::DirectHedge) {
+            let mut exchange: Operation<'_, Delivered> = if let Some(ordinal) = landing {
                 self.peers
-                    .request_direct(request, membership.clone(), &attempt_scope)
+                    .request_landing(request, membership.clone(), ordinal, &attempt_scope)
             } else {
-                self.peers
-                    .request(request, membership.clone(), &attempt_scope)
+                let exchange = if matches!(request_mode, RequestMode::DirectHedge) {
+                    self.peers
+                        .request_direct(request, membership.clone(), &attempt_scope)
+                } else {
+                    self.peers
+                        .request(request, membership.clone(), &attempt_scope)
+                };
+                Box::pin(async move { exchange.await.map(Delivered::Response) })
             };
             let mut stopped = None;
             facts.site = CandidateSite::Exchange;
@@ -1573,7 +1656,8 @@ impl CandidatePolicy {
             .await;
             facts.raw = Some(match &response {
                 Err(error) => CandidateOutcome::Error(*error),
-                Ok(response) => match response.response() {
+                Ok(Delivered::Landed(_)) => CandidateOutcome::Success,
+                Ok(Delivered::Response(response)) => match response.response() {
                     PeerResponse::Miss => CandidateOutcome::Miss,
                     PeerResponse::Unavailable => {
                         CandidateOutcome::ResponseError(Error::Unavailable)
@@ -1605,7 +1689,8 @@ impl CandidatePolicy {
                             links: budget.remaining_links(),
                         }),
                 ),
-                Ok(response) => {
+                Ok(Delivered::Landed(_)) => {}
+                Ok(Delivered::Response(response)) => {
                     let error = match response.response() {
                         PeerResponse::Overloaded => Some(Error::Overloaded),
                         PeerResponse::Unavailable => Some(Error::Unavailable),
