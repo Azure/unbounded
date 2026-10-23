@@ -1375,6 +1375,11 @@ impl Fill {
                     }
                     if let Some(cached) = &cached {
                         self.dependencies.memory.invalidate_ciphertext(cached);
+                        // A cached copy may have been read from disk; drop the
+                        // rejected disk record too so it cannot be served again.
+                        if let Some(token) = &cached.disk_token {
+                            self.dependencies.disk.invalidate(token)?;
+                        }
                     }
                 }
                 Err(error) => return Err(error),

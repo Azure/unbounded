@@ -5377,3 +5377,102 @@ fn canceled_supplier_retains_crypto_fence_before_replacement_origin_work() {
     assert_eq!(f.fill.metrics.gauge(Gauge::ActiveFills), 0);
     assert_eq!(f.fill.metrics.count(Event::OriginFill), 1);
 }
+
+/// Publish a tampered copy of the on-disk page to the memory cache, optionally
+/// carrying the disk invalidation token, and attempt a plaintext local read.
+fn cached_tampered_copy_local_read(with_token: bool) -> Fixture {
+    let mut f = cold_disk_fixture();
+    let (disk, token) = drive_disk(
+        &f,
+        f.fill.dependencies.disk.read_with_token(&f.page, &f.scope),
+    )
+    .unwrap()
+    .unwrap();
+    let mut bytes = disk.ciphertext.bytes().to_vec();
+    bytes[0] ^= 1;
+    let charge = f
+        .fill
+        .dependencies
+        .admission
+        .reserve(
+            Some(&f.context.object.cache),
+            ResourceClass::Ciphertext,
+            bytes.len(),
+        )
+        .unwrap();
+    let copy = crate::memory::CiphertextCopy {
+        metadata: disk.metadata.clone(),
+        ciphertext: f
+            .fill
+            .dependencies
+            .buffers
+            .ciphertext(charge, disk.ciphertext.envelope().clone(), bytes)
+            .unwrap(),
+    };
+    drop(disk);
+    f.fill
+        .dependencies
+        .memory
+        .publish_ciphertext(UnverifiedPage {
+            copy,
+            disk_token: with_token.then_some(token),
+        })
+        .unwrap();
+    let result = drive(
+        f.fill.acquire_local_copy(&f.page, &f.scope, true),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    assert!(
+        result.is_none(),
+        "a tampered cached copy must not be served"
+    );
+    assert!(
+        f.fill
+            .dependencies
+            .memory
+            .ciphertext(&f.page)
+            .unwrap()
+            .is_none(),
+        "the rejected memory entry must be removed"
+    );
+    assert_eq!(f.fill.metrics.count(Event::CorruptMiss), 1);
+    f
+}
+
+#[test]
+fn cached_disk_copy_authentication_failure_invalidates_disk_record() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let f = cached_tampered_copy_local_read(true);
+    assert!(
+        f.fill
+            .dependencies
+            .writer
+            .index()
+            .lookup(&f.page)
+            .unwrap()
+            .is_none(),
+        "the rejected disk record must not stay indexed"
+    );
+    assert_eq!(f.origin.calls.get(), 0);
+}
+
+#[test]
+fn cached_memory_copy_authentication_failure_keeps_disk_record() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let f = cached_tampered_copy_local_read(false);
+    // Without a token the cached copy is not tied to the disk record.
+    assert!(
+        f.fill
+            .dependencies
+            .writer
+            .index()
+            .lookup(&f.page)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(f.origin.calls.get(), 0);
+}
