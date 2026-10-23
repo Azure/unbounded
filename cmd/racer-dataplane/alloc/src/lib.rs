@@ -1012,11 +1012,45 @@ struct Idle<C: Charge>(Allocation<C>);
 // exclusively owned, and have no outstanding I/O. The charge moves with it.
 unsafe impl<C: Charge + Send> Send for Idle<C> {}
 
+/// Idle entries and demand state for one size class.
+struct SharedClass<C: Charge> {
+    // Most recently returned last.
+    entries: Vec<Idle<C>>,
+    demand: PoolDemand,
+}
+
+impl<C: Charge> SharedClass<C> {
+    fn new(constrained: bool) -> Self {
+        let mut demand = PoolDemand::new()
+            .with_bounds(0, SHARED_POOL_CLASS_DEPTH)
+            .with_target(SHARED_POOL_CLASS_DEPTH);
+        demand.set_constrained(constrained);
+        Self {
+            entries: Vec::new(),
+            demand,
+        }
+    }
+}
+
 struct SharedPoolState<C: Charge> {
-    // Keyed by buffer_capacity size class; most recently returned last.
-    classes: std::collections::BTreeMap<usize, Vec<Idle<C>>>,
+    // Keyed by buffer_capacity size class. Each class sizes, admits, tracks
+    // hits, and trims against its own depth, so mixed-size reuse in one class
+    // never makes another class look idle.
+    classes: std::collections::BTreeMap<usize, SharedClass<C>>,
     bytes: usize,
     count: usize,
+    constrained: bool,
+    // Cumulative counters of classes dropped after decaying to empty.
+    retired: PoolStats,
+}
+
+impl<C: Charge> SharedPoolState<C> {
+    fn class(&mut self, capacity: usize) -> &mut SharedClass<C> {
+        let constrained = self.constrained;
+        self.classes
+            .entry(capacity)
+            .or_insert_with(|| SharedClass::new(constrained))
+    }
 }
 
 /// Shared state behind [`WorkerBufferPool`] handles and origin links.
@@ -1065,13 +1099,23 @@ fn give_back<C: Charge>(origin: &SyncWeak<SharedPool<C>>, mut allocation: Alloca
             .bytes
             .checked_add(capacity)
             .is_some_and(|b| b <= pool.budget);
-        let class = state.classes.entry(capacity).or_default();
-        if room && class.len() < SHARED_POOL_CLASS_DEPTH {
-            class.push(Idle(allocation));
+        let (bytes, budget) = (state.bytes, pool.budget);
+        // Demand is tracked per size class, like the fixed depth it replaces,
+        // so a busy pool keeps today's capacity across classes.
+        let class = state.class(capacity);
+        let depth = class.entries.len();
+        let admitted = room
+            && depth < SHARED_POOL_CLASS_DEPTH
+            && class.demand.admit(depth, bytes, capacity, budget);
+        if admitted {
+            class.entries.push(Idle(allocation));
             state.bytes += capacity;
             state.count += 1;
             None
         } else {
+            if !room || depth >= SHARED_POOL_CLASS_DEPTH {
+                class.demand.record_reject();
+            }
             Some(allocation)
         }
     };
@@ -1086,6 +1130,13 @@ fn give_back<C: Charge>(origin: &SyncWeak<SharedPool<C>>, mut allocation: Alloca
 /// buffers keep their previous charge until the next checkout replaces it.
 /// The pool keeps at most [`SHARED_POOL_CLASS_DEPTH`] idle buffers per 64 KiB
 /// size class and at most `budget` idle bytes; excess storage is freed.
+///
+/// Each size class has its own [`PoolDemand`] controller sizing its depth. It
+/// starts at [`SHARED_POOL_CLASS_DEPTH`], so a fresh or busy class retains as
+/// much as a fixed-depth pool would. [`Self::maintain`] releases entries that
+/// stayed idle in their class for a whole window, oldest return first, and a
+/// class target decays after sustained miss-free windows, so an idle class
+/// eventually empties.
 pub struct WorkerBufferPool<C: Charge> {
     inner: Arc<SharedPool<C>>,
 }
@@ -1124,6 +1175,8 @@ impl<C: Charge> WorkerBufferPool<C> {
                     classes: std::collections::BTreeMap::new(),
                     bytes: 0,
                     count: 0,
+                    constrained: false,
+                    retired: PoolStats::default(),
                 }),
             }),
         }
@@ -1144,15 +1197,97 @@ impl<C: Charge> WorkerBufferPool<C> {
         }
     }
 
+    /// Idle counters combined with demand controller state.
+    ///
+    /// Counters are summed across size classes. `target` is the largest
+    /// per-class target, or [`SHARED_POOL_CLASS_DEPTH`] when no class is
+    /// tracked, since a new class starts there; `max_depth` is the per-class
+    /// bound.
+    #[must_use]
+    pub fn pool_stats(&self) -> PoolStats {
+        let state = self.inner.lock();
+        let mut stats = PoolStats {
+            entries: state.count,
+            bytes: state.bytes,
+            target: 0,
+            max_depth: SHARED_POOL_CLASS_DEPTH,
+            constrained: state.constrained,
+            ..state.retired
+        };
+        let mut target = None;
+        for class in state.classes.values() {
+            let c = class.demand.stats(0, 0);
+            stats.hits += c.hits;
+            stats.misses += c.misses;
+            stats.rejects += c.rejects;
+            stats.trimmed += c.trimmed;
+            target = Some(target.unwrap_or(0).max(c.target));
+        }
+        stats.target = target.unwrap_or(SHARED_POOL_CLASS_DEPTH);
+        stats
+    }
+
     /// Free every idle buffer. Storage is freed after the lock is released.
     pub fn clear(&self) {
         let idle = {
             let mut state = self.inner.lock();
+            let mut idle = Vec::with_capacity(state.count);
+            for class in state.classes.values_mut() {
+                class.demand.record_trim(class.entries.len(), 0);
+                idle.append(&mut class.entries);
+            }
             state.bytes = 0;
             state.count = 0;
-            std::mem::take(&mut state.classes)
+            idle
         };
         drop(idle);
+    }
+
+    /// Run demand maintenance at `now` and return the idle bytes released.
+    ///
+    /// Work is proportional to the number of tracked size classes; at a window
+    /// boundary each class controller picks how many of its entries to release
+    /// and that class's oldest returns go first. Empty classes whose target
+    /// decayed to zero are dropped. Storage is freed after the lock is released.
+    pub fn maintain(&self, now: std::time::Instant) -> usize {
+        let freed = {
+            let mut state = self.inner.lock();
+            let mut freed = Vec::new();
+            let mut retired = state.retired;
+            let mut released_bytes = 0;
+            state.classes.retain(|capacity, class| {
+                let release = class.demand.tick(now, class.entries.len());
+                let release = release.min(class.entries.len());
+                freed.extend(class.entries.drain(..release));
+                released_bytes += release * capacity;
+                let keep = !class.entries.is_empty() || class.demand.target() > 0;
+                if !keep {
+                    let c = class.demand.stats(0, 0);
+                    retired.hits += c.hits;
+                    retired.misses += c.misses;
+                    retired.rejects += c.rejects;
+                    retired.trimmed += c.trimmed;
+                }
+                keep
+            });
+            state.retired = retired;
+            state.bytes -= released_bytes;
+            state.count -= freed.len();
+            freed
+        };
+        let bytes = freed.iter().map(|Idle(a)| a.layout.size()).sum();
+        drop(freed);
+        bytes
+    }
+
+    /// Hold the pool empty and refuse returns while `constrained`; the next
+    /// [`Self::maintain`] releases every idle entry.
+    pub fn set_constrained(&self, constrained: bool) {
+        let mut state = self.inner.lock();
+        state.constrained = constrained;
+        for class in state.classes.values_mut() {
+            class.demand.set_constrained(constrained);
+        }
     }
 
     /// Check out writable storage for `length` bytes.
@@ -1175,10 +1310,15 @@ impl<C: Charge> WorkerBufferPool<C> {
         }
         let reused = {
             let mut state = self.inner.lock();
-            let idle = state.classes.get_mut(&capacity).and_then(Vec::pop);
+            let class = state.class(capacity);
+            let idle = class.entries.pop();
             if idle.is_some() {
+                let len = class.entries.len();
+                class.demand.record_hit(len);
                 state.bytes -= capacity;
                 state.count -= 1;
+            } else {
+                class.demand.record_miss();
             }
             idle
         };
@@ -2047,6 +2187,7 @@ mod geometry_tests {
 #[cfg(test)]
 mod shared_pool_tests {
     use super::*;
+    use std::time::Instant;
 
     /// Charge whose wipe requirement and coverage are configurable.
     struct Secret {
@@ -2284,5 +2425,208 @@ mod shared_pool_tests {
         assert_eq!(frozen.padded_slice().len(), frozen.as_slice().len());
         drop(frozen);
         assert_eq!(pool.stats(), SharedPoolStats::default());
+    }
+
+    const KIB64: usize = 64 * 1024;
+
+    /// Fill the pool with one idle buffer per listed length, returned in order.
+    fn park(pool: &WorkerBufferPool<Secret>, lengths: &[usize]) -> Vec<*const u8> {
+        let buffers: Vec<_> = lengths
+            .iter()
+            .map(|&length| pool.take(length, plain()).unwrap())
+            .collect();
+        let pointers = buffers.iter().map(|b| b.as_slice().as_ptr()).collect();
+        for buffer in buffers {
+            drop(buffer);
+        }
+        pointers
+    }
+
+    #[test]
+    fn fresh_pool_retains_full_class_depth() {
+        let pool = WorkerBufferPool::new(alignment());
+        park(&pool, &[4096; SHARED_POOL_CLASS_DEPTH + 1]);
+        let stats = pool.pool_stats();
+        assert_eq!(stats.entries, SHARED_POOL_CLASS_DEPTH);
+        assert_eq!(stats.target, SHARED_POOL_CLASS_DEPTH);
+        assert_eq!(stats.max_depth, SHARED_POOL_CLASS_DEPTH);
+        assert_eq!(stats.misses, SHARED_POOL_CLASS_DEPTH as u64 + 1);
+        assert_eq!(stats.rejects, 1);
+    }
+
+    #[test]
+    fn maintain_releases_idle_entries_over_windows() {
+        let pool = WorkerBufferPool::new(alignment());
+        park(&pool, &[4096; 4]);
+        let start = Instant::now();
+        assert_eq!(pool.maintain(start), 0, "first tick starts the window");
+        assert_eq!(pool.maintain(start + DEFAULT_WINDOW / 2), 0);
+        let mut now = start;
+        let mut windows = 0;
+        while pool.stats().idle_buffers > 0 {
+            now += DEFAULT_WINDOW;
+            windows += 1;
+            assert!(pool.maintain(now) > 0, "every idle window releases");
+            assert!(windows < 10);
+        }
+        assert_eq!(pool.stats(), SharedPoolStats::default());
+        assert_eq!(pool.pool_stats().trimmed, 4);
+    }
+
+    #[test]
+    fn maintain_releases_oldest_returns_first_within_each_class() {
+        let pool = WorkerBufferPool::new(alignment());
+        // Returned in order: 64 KiB, 128 KiB, 64 KiB, 128 KiB.
+        let pointers = park(&pool, &[4096, 2 * KIB64, 4096, 2 * KIB64]);
+        let start = Instant::now();
+        pool.maintain(start);
+        assert_eq!(pool.maintain(start + DEFAULT_WINDOW), 2 * KIB64 + KIB64);
+        // The two newest remain: index 2 (64 KiB) and index 3 (128 KiB).
+        assert_eq!(pool.pool_stats().entries, 2);
+        assert_eq!(
+            pool.take(4096, plain()).unwrap().as_slice().as_ptr(),
+            pointers[2]
+        );
+        assert_eq!(
+            pool.take(2 * KIB64, plain()).unwrap().as_slice().as_ptr(),
+            pointers[3]
+        );
+    }
+
+    #[test]
+    fn busy_reuse_keeps_entries() {
+        let pool = WorkerBufferPool::new(alignment());
+        park(&pool, &[4096; 4]);
+        let start = Instant::now();
+        pool.maintain(start);
+        for window in 1..=30 {
+            // Each window drains the pool to zero and refills it.
+            park(&pool, &[4096; 4]);
+            assert_eq!(pool.maintain(start + DEFAULT_WINDOW * window), 0);
+            assert_eq!(pool.stats().idle_buffers, 4);
+        }
+        let stats = pool.pool_stats();
+        assert_eq!(stats.misses, 4);
+        assert_eq!(stats.trimmed, 0);
+    }
+
+    #[test]
+    fn sustained_mixed_class_reuse_keeps_full_depth_in_each_class() {
+        let pool = WorkerBufferPool::new(alignment());
+        let lengths: Vec<usize> = [4096; SHARED_POOL_CLASS_DEPTH]
+            .into_iter()
+            .chain([2 * KIB64; SHARED_POOL_CLASS_DEPTH])
+            .collect();
+        park(&pool, &lengths);
+        let start = Instant::now();
+        pool.maintain(start);
+        for window in 1..=30 {
+            park(&pool, &lengths);
+            assert_eq!(pool.maintain(start + DEFAULT_WINDOW * window), 0);
+            assert_eq!(pool.stats().idle_buffers, 2 * SHARED_POOL_CLASS_DEPTH);
+        }
+        let stats = pool.pool_stats();
+        assert_eq!(stats.misses, 2 * SHARED_POOL_CLASS_DEPTH as u64);
+        assert_eq!((stats.trimmed, stats.rejects), (0, 0));
+    }
+
+    #[test]
+    fn separate_single_class_reuse_is_not_trimmed() {
+        let pool = WorkerBufferPool::new(alignment());
+        park(&pool, &[4096, 2 * KIB64]);
+        let start = Instant::now();
+        pool.maintain(start);
+        for window in 1..=30 {
+            // Each class drains to zero on its own while the other stays parked.
+            park(&pool, &[4096]);
+            park(&pool, &[2 * KIB64]);
+            assert_eq!(pool.maintain(start + DEFAULT_WINDOW * window), 0);
+            assert_eq!(pool.stats().idle_buffers, 2);
+        }
+        let stats = pool.pool_stats();
+        assert_eq!((stats.misses, stats.trimmed), (2, 0));
+    }
+
+    #[test]
+    fn idle_class_decays_and_is_dropped_while_busy_class_stays() {
+        let pool = WorkerBufferPool::new(alignment());
+        park(&pool, &[4096, 2 * KIB64]);
+        let start = Instant::now();
+        pool.maintain(start);
+        let mut window = 0;
+        while pool.inner.lock().classes.contains_key(&(2 * KIB64)) {
+            window += 1;
+            assert!(window < 200, "idle class never decayed");
+            park(&pool, &[4096]);
+            pool.maintain(start + DEFAULT_WINDOW * window);
+        }
+        assert!(pool.inner.lock().classes.contains_key(&KIB64));
+        let stats = pool.pool_stats();
+        assert_eq!(stats.trimmed, 1, "only the idle 128 KiB buffer is trimmed");
+    }
+
+    #[test]
+    fn constrained_refuses_returns_and_maintain_releases_all() {
+        let pool = WorkerBufferPool::new(alignment());
+        park(&pool, &[4096, 2 * KIB64]);
+        pool.set_constrained(true);
+        assert!(pool.pool_stats().constrained);
+        assert_eq!(pool.maintain(Instant::now()), 3 * KIB64);
+        park(&pool, &[4096]);
+        assert_eq!(pool.stats(), SharedPoolStats::default());
+        pool.set_constrained(false);
+        park(&pool, &[4096]);
+        assert_eq!(pool.stats().idle_buffers, 1);
+    }
+
+    #[test]
+    fn clear_records_trim() {
+        let pool = WorkerBufferPool::new(alignment());
+        park(&pool, &[4096; 3]);
+        pool.clear();
+        let stats = pool.pool_stats();
+        assert_eq!((stats.entries, stats.bytes, stats.trimmed), (0, 0, 3));
+    }
+
+    /// Charge whose destructor proves the pool lock is not held.
+    struct Probe {
+        pool: Arc<std::sync::OnceLock<SyncWeak<SharedPool<Probe>>>>,
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Charge for Probe {
+        fn covers(&self, _bytes: usize) -> bool {
+            true
+        }
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            if let Some(pool) = self.pool.get().and_then(SyncWeak::upgrade) {
+                assert!(pool.state.try_lock().is_ok(), "freed under the pool lock");
+            }
+            self.drops
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn maintain_frees_outside_the_lock() {
+        let pool = WorkerBufferPool::new(alignment());
+        let link = Arc::new(std::sync::OnceLock::new());
+        link.set(Arc::downgrade(&pool.inner)).unwrap();
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe = || Probe {
+            pool: Arc::clone(&link),
+            drops: Arc::clone(&drops),
+        };
+        let buffers = [
+            pool.take(4096, probe()).unwrap(),
+            pool.take(4096, probe()).unwrap(),
+        ];
+        drop(buffers);
+        pool.set_constrained(true);
+        assert_eq!(pool.maintain(Instant::now()), 2 * KIB64);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 }

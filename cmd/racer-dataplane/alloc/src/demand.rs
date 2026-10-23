@@ -57,6 +57,7 @@ pub struct PoolDemand {
     decay_windows: u32,
     window_start: Option<Instant>,
     misses: u64,
+    hits: u64,
     rejects_full: u64,
     low_water: Option<usize>,
     idle_windows: u32,
@@ -85,6 +86,7 @@ impl PoolDemand {
             decay_windows: DEFAULT_DECAY_WINDOWS,
             window_start: None,
             misses: 0,
+            hits: 0,
             rejects_full: 0,
             low_water: None,
             idle_windows: 0,
@@ -146,6 +148,7 @@ impl PoolDemand {
 
     /// Record a checkout served from the pool, leaving `len_after` entries.
     pub fn record_hit(&mut self, len_after: usize) {
+        self.hits += 1;
         self.hits_total += 1;
         self.observe_len(len_after);
     }
@@ -218,12 +221,15 @@ impl PoolDemand {
                 .max(1);
             self.target = self.target.saturating_add(step).min(self.max_depth);
             self.idle_windows = 0;
-        } else if self.misses == 0 {
+        } else if self.misses == 0 && !self.fully_used(len) {
             self.idle_windows += 1;
             if self.idle_windows >= self.decay_windows {
                 self.target = self.target.saturating_sub(1).max(self.min_depth);
                 self.idle_windows = 0;
             }
+        } else if self.misses == 0 {
+            // Every entry was checked out during the window: nothing sat idle,
+            // so the target holds without counting toward decay.
         } else {
             self.idle_windows = 0;
         }
@@ -237,8 +243,14 @@ impl PoolDemand {
         release
     }
 
+    /// Whether the window served checkouts and drained the pool at some point.
+    fn fully_used(&self, len: usize) -> bool {
+        self.hits > 0 && self.low_water.unwrap_or(len).min(len) == 0
+    }
+
     fn reset_window(&mut self, len: usize) {
         self.misses = 0;
+        self.hits = 0;
         self.rejects_full = 0;
         self.low_water = Some(len);
     }
@@ -350,6 +362,24 @@ mod tests {
         demand.tick(start, 2);
         demand.record_hit(0);
         assert_eq!(demand.tick(start + W, 2), 0);
+    }
+
+    #[test]
+    fn fully_used_windows_do_not_decay() {
+        let mut demand = PoolDemand::new().with_bounds(0, 8).with_target(8);
+        let start = Instant::now();
+        demand.tick(start, 8);
+        for window in 1..=(DEFAULT_DECAY_WINDOWS * 3) {
+            demand.record_hit(0);
+            assert_eq!(demand.tick(start + W * window, 8), 0);
+        }
+        assert_eq!(demand.target(), 8);
+        // Windows with no checkouts still decay.
+        let base = start + W * (DEFAULT_DECAY_WINDOWS * 3);
+        for window in 1..=DEFAULT_DECAY_WINDOWS {
+            demand.tick(base + W * window, 0);
+        }
+        assert_eq!(demand.target(), 7);
     }
 
     #[test]

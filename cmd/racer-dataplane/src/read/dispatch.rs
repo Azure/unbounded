@@ -667,6 +667,26 @@ impl WorkerDirectory {
         }
     }
 
+    /// Read a page this node holds without any network transfer: live
+    /// plaintext first, then one coalesced decrypt of pending, cached, or disk
+    /// ciphertext. The memory cache retains only ciphertext, so a plaintext
+    /// miss alone must not send the page to a peer or origin transfer.
+    /// Returns `None` when no local copy exists.
+    pub(crate) async fn local_page(
+        &self,
+        page: PageId,
+        scope: &RequestScope,
+    ) -> Result<Option<PageResult>> {
+        if let Some(result) = self.cached_page(page.clone(), scope).await? {
+            return Ok(Some(result));
+        }
+        match self.held_page(page, scope).await {
+            Ok(page) => Ok(Some(page)),
+            Err(Error::Unavailable) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub(super) async fn warm_page(
         &self,
         page: PageId,

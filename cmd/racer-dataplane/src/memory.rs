@@ -1,5 +1,7 @@
 //! Distinct accounting and lifetimes for plaintext, ciphertext, pipes, and kernel I/O.
 //! Cache lookups retain the original encrypted page and immutable version metadata.
+//! The memory cache never owns plaintext: local hits decrypt cached ciphertext
+//! unless a reader still holds the page's plaintext, which is then shared.
 //! Eviction releases idle leases; retirement hides entries without revoking owners.
 
 use crate::admission::AdmissionPolicy;
@@ -38,6 +40,12 @@ pub(crate) fn default_disk_alignment() -> page_alloc::Alignment {
 /// fail on. Idle aligned storage is therefore unaccounted, so the budget is
 /// kept to a few pages per worker, and every path that reclaims the recycler
 /// ([`BufferPool::reclaim_idle_buffers`]) also empties this pool.
+///
+/// This is a ceiling, not a steady state: the pool's demand controller
+/// ([`page_alloc::PoolDemand`]) releases buffers that stay idle for a whole
+/// maintenance window, oldest first, so an idle worker's pool empties within a
+/// few windows of [`BufferPool::maintain_idle_buffers`] while continuous reuse
+/// keeps it full. Memory pressure constrains the pool to hold nothing.
 pub(crate) const ALIGNED_POOL_IDLE_PAGES: usize = 4;
 
 /// Accounting for aligned ciphertext storage.
@@ -356,6 +364,21 @@ impl BufferPool {
     #[cfg(test)]
     pub(crate) fn aligned_stats(&self) -> page_alloc::SharedPoolStats {
         self.aligned.stats()
+    }
+    /// Demand counters of this worker's aligned ciphertext pool.
+    #[cfg(test)]
+    pub(crate) fn aligned_pool_stats(&self) -> page_alloc::PoolStats {
+        self.aligned.pool_stats()
+    }
+    /// Advance demand sizing of the aligned pool, releasing storage that stayed
+    /// idle. O(1) until the observation window elapses; returns bytes freed.
+    pub(crate) fn maintain_idle_buffers(&self, now: std::time::Instant) -> usize {
+        self.aligned.maintain(now)
+    }
+    /// Refuse aligned returns and release idle storage at the next maintenance
+    /// while memory is constrained.
+    pub(crate) fn constrain_idle_buffers(&self, constrained: bool) {
+        self.aligned.set_constrained(constrained);
     }
     /// Release idle recycled storage: the flow-control recycler and this
     /// worker's aligned pool, dropping the admission charges both retain.
@@ -1043,9 +1066,45 @@ fn validate_association(
     Ok(())
 }
 
+/// One authenticated page retained only as its original ciphertext.
+///
+/// The cache never owns plaintext. `plaintext` is a weak handle to the last
+/// authenticated plaintext for this page; it upgrades only while a request or
+/// stream still holds that buffer, letting a concurrent reader share it
+/// without a second decrypt. It never keeps plaintext or its charge alive.
+pub(crate) struct CachedPage {
+    pub(crate) metadata: ObjectMetadata,
+    pub(crate) ciphertext: CiphertextPage,
+    plaintext: std::sync::Weak<VerifiedBytes>,
+}
+impl CachedPage {
+    fn new(page: PageResult) -> Self {
+        Self {
+            plaintext: Arc::downgrade(&page.plaintext.inner),
+            metadata: page.metadata,
+            ciphertext: page.ciphertext,
+        }
+    }
+    /// The verified bundle, if some other owner still holds its plaintext.
+    fn live(&self) -> Option<PageResult> {
+        let inner = self.plaintext.upgrade()?;
+        Some(PageResult {
+            metadata: self.metadata.clone(),
+            plaintext: VerifiedPage { inner },
+            ciphertext: self.ciphertext.clone(),
+        })
+    }
+    pub(crate) fn copy(&self) -> CiphertextCopy {
+        CiphertextCopy {
+            metadata: self.metadata.clone(),
+            ciphertext: self.ciphertext.clone(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct Entries {
-    pages: HashMap<PageId, (u64, PageResult)>,
+    pages: HashMap<PageId, (u64, CachedPage)>,
     lru: BTreeMap<u64, PageId>,
     versions: HashMap<ObjectVersion, HashSet<PageId>>,
     clock: u64,
@@ -1055,7 +1114,7 @@ impl Entries {
     fn len(&self) -> usize {
         self.pages.len()
     }
-    fn remove(&mut self, id: &PageId) -> Option<PageResult> {
+    fn remove(&mut self, id: &PageId) -> Option<CachedPage> {
         let (tick, page) = self.pages.remove(id)?;
         self.lru.remove(&tick);
         if let Some(pages) = self.versions.get_mut(&id.version) {
@@ -1069,12 +1128,26 @@ impl Entries {
     fn insert(&mut self, page: PageResult) -> Result<()> {
         self.clock = self.clock.checked_add(1).ok_or(Error::Overloaded)?;
         let id = page.plaintext.page().clone();
+        let page = CachedPage::new(page);
         self.lru.insert(self.clock, id.clone());
         self.versions
             .entry(id.version.clone())
             .or_default()
             .insert(id.clone());
         self.pages.insert(id, (self.clock, page));
+        Ok(())
+    }
+    /// Move `page` to the most recently used tick.
+    fn touch(&mut self, page: &PageId) -> Result<()> {
+        let Some((old, _)) = self.pages.get(page) else {
+            return Ok(());
+        };
+        let old = *old;
+        self.clock = self.clock.checked_add(1).ok_or(Error::Overloaded)?;
+        let tick = self.clock;
+        self.lru.remove(&old);
+        self.lru.insert(tick, page.clone());
+        self.pages.get_mut(page).unwrap().0 = tick;
         Ok(())
     }
     fn candidates(&self) -> Vec<(u64, PageId)> {
@@ -1089,122 +1162,184 @@ impl Entries {
             .collect()
     }
 }
-/// Worker-local idle verified pages and original ciphertext; independent of disk clock.
+/// Unverified original ciphertext keyed by page, with a monotonic touch tick
+/// per entry so idle expiry can find the least recently touched entries.
+/// Reads go through `Deref`; every mutation goes through these methods so the
+/// tick index never drifts from the entries.
+#[derive(Default)]
+struct CiphertextEntries {
+    pages: BTreeMap<PageId, UnverifiedPage>,
+    ticks: HashMap<PageId, u64>,
+    order: BTreeMap<u64, PageId>,
+    clock: u64,
+}
+impl std::ops::Deref for CiphertextEntries {
+    type Target = BTreeMap<PageId, UnverifiedPage>;
+    fn deref(&self) -> &Self::Target {
+        &self.pages
+    }
+}
+impl CiphertextEntries {
+    fn touch(&mut self, id: &PageId) {
+        if !self.pages.contains_key(id) {
+            return;
+        }
+        // Wrapping is unreachable in practice (2^64 touches); saturating keeps
+        // the index consistent even then, at worst making order ambiguous.
+        self.clock = self.clock.saturating_add(1);
+        if let Some(old) = self.ticks.insert(id.clone(), self.clock) {
+            self.order.remove(&old);
+        }
+        self.order.insert(self.clock, id.clone());
+    }
+    fn insert(&mut self, id: PageId, page: UnverifiedPage) {
+        self.pages.insert(id.clone(), page);
+        self.touch(&id);
+    }
+    fn remove(&mut self, id: &PageId) -> Option<UnverifiedPage> {
+        let page = self.pages.remove(id)?;
+        if let Some(tick) = self.ticks.remove(id) {
+            self.order.remove(&tick);
+        }
+        Some(page)
+    }
+    fn retain(&mut self, mut keep: impl FnMut(&PageId) -> bool) {
+        let removed: Vec<_> = self.pages.keys().filter(|id| !keep(id)).cloned().collect();
+        for id in removed {
+            self.remove(&id);
+        }
+    }
+}
+
+/// Entries nobody inserted or hit for this long are released by
+/// [`MemoryCache::expire_idle`], so a worker that served a burst does not keep
+/// its cached pages (and their pooled buffers) forever. Busy workers keep hot
+/// pages because every hit renews them.
+pub(crate) const CACHE_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Minimum spacing of the clock checkpoints that map wall time to LRU ticks.
+const CACHE_EXPIRY_CHECKPOINT: std::time::Duration = std::time::Duration::from_secs(1);
+/// Upper bound of entries examined per class by one `expire_idle` call.
+pub(crate) const CACHE_EXPIRY_BATCH: usize = 32;
+
+/// Time-to-tick checkpoints and resumable expiry cursors. Between checkpoints
+/// with no pass in progress, `expire_idle` does constant work.
+#[derive(Default)]
+struct Expiry {
+    /// `(time, verified clock, unverified clock)`, oldest first. The front is
+    /// kept as the newest checkpoint at least `CACHE_IDLE_TTL` old.
+    checkpoints: std::collections::VecDeque<(std::time::Instant, u64, u64)>,
+    /// Last examined tick of an in-progress pass; `None` when no pass is due.
+    verified: Option<u64>,
+    ciphertext: Option<u64>,
+}
+impl Expiry {
+    /// Record a checkpoint at most once per interval and return the tick
+    /// cutoffs, if any checkpoint is at least `CACHE_IDLE_TTL` old.
+    fn advance(
+        &mut self,
+        now: std::time::Instant,
+        verified: u64,
+        ciphertext: u64,
+    ) -> Option<(u64, u64)> {
+        if self
+            .checkpoints
+            .back()
+            .is_none_or(|(at, _, _)| now.saturating_duration_since(*at) >= CACHE_EXPIRY_CHECKPOINT)
+        {
+            self.checkpoints.push_back((now, verified, ciphertext));
+            // Each new checkpoint may move the cutoff: start a fresh pass that
+            // also revisits entries that were busy last time. An unfinished
+            // pass keeps its cursor so a long busy prefix cannot starve later
+            // entries; it adopts the newer cutoff, which is safe because a
+            // touched entry moves to a tick above every aged checkpoint.
+            self.verified.get_or_insert(0);
+            self.ciphertext.get_or_insert(0);
+        }
+        let old = |at: &std::time::Instant| now.saturating_duration_since(*at) >= CACHE_IDLE_TTL;
+        while self.checkpoints.get(1).is_some_and(|(at, _, _)| old(at)) {
+            self.checkpoints.pop_front();
+        }
+        self.checkpoints
+            .front()
+            .filter(|(at, _, _)| old(at))
+            .map(|(_, verified, ciphertext)| (*verified, *ciphertext))
+    }
+}
+
+/// Worker-local original ciphertext, both authenticated (with a weak handle to
+/// any live plaintext) and not yet authenticated; independent of disk clock.
+/// Plaintext is never retained here: a local hit decrypts the cached ciphertext
+/// unless another owner still holds the page's plaintext.
 pub struct MemoryCache {
     // BufferPool holds only shared handles; do not retain a second Rc layer.
     pool: BufferPool,
     entries: RefCell<Entries>,
-    ciphertext_entries: RefCell<BTreeMap<PageId, UnverifiedPage>>,
+    ciphertext_entries: RefCell<CiphertextEntries>,
     ciphertext_cursor: RefCell<Option<PageId>>,
     availability: Rc<crate::control::Availability>,
+    expiry: RefCell<Expiry>,
 }
 
-/// One bounded view of the LRU clock. Touches and insertions after this cut are
-/// not chased; another reclaimer cannot move this operation's cursor.
-pub(crate) struct PlaintextReclaim {
-    after: u64,
-    through: u64,
-}
 impl MemoryCache {
     /// This worker's allocation front end.
     pub(crate) fn buffers(&self) -> &BufferPool {
         &self.pool
     }
-    pub(crate) fn plaintext_reclaim(&self) -> PlaintextReclaim {
-        PlaintextReclaim {
-            after: 0,
-            through: self.entries.borrow().clock,
-        }
-    }
-
-    /// Visit at most 256 entries from the initial clock cut. Return whether that
-    /// cut is exhausted, preserving both plaintext and ciphertext live owners.
-    pub(crate) fn reclaim_plaintext_quantum(
-        &self,
-        cursor: &mut PlaintextReclaim,
-        cache: Option<&CacheId>,
-        bytes: usize,
-        mut release_queued: impl FnMut(&PageResult) -> usize,
-    ) -> bool {
-        let mut entries = self.entries.borrow_mut();
-        let selected: Vec<_> = entries
-            .lru
-            .range((
-                std::ops::Bound::Excluded(cursor.after),
-                std::ops::Bound::Included(cursor.through),
-            ))
-            .take(256)
-            .map(|(tick, id)| (*tick, id.clone()))
-            .collect();
-        let mut released = 0usize;
-        for (tick, id) in selected {
-            cursor.after = tick;
-            let entry = &entries.pages[&id].1;
-            if cache.is_some_and(|cache| cache != &entry.metadata.version.object.cache)
-                || Arc::strong_count(&entry.plaintext.inner) != 1
-            {
-                continue;
-            }
-            release_queued(entry);
-            if !idle(entry) {
-                continue;
-            }
-            released = released.saturating_add(entry.plaintext.inner.reservation.amount());
-            entries.remove(&id);
-            if released >= bytes {
-                break;
-            }
-        }
-        entries
-            .lru
-            .range((
-                std::ops::Bound::Excluded(cursor.after),
-                std::ops::Bound::Included(cursor.through),
-            ))
-            .next()
-            .is_none()
-    }
-
     pub fn new(pool: BufferPool, availability: Rc<crate::control::Availability>) -> Self {
         Self {
             pool,
             entries: RefCell::new(Entries::default()),
-            ciphertext_entries: RefCell::new(BTreeMap::new()),
+            ciphertext_entries: RefCell::new(CiphertextEntries::default()),
             ciphertext_cursor: RefCell::new(None),
             availability,
+            expiry: RefCell::new(Expiry::default()),
         }
     }
-    fn available(&self, page: &PageResult) -> bool {
+    fn available(&self, page: &CachedPage) -> bool {
         self.availability.page(
             &page.metadata.version.object.cache,
             page.ciphertext.envelope().key_id,
         )
     }
-    pub fn get(&self, page: &PageId) -> Result<Option<PageResult>> {
+    /// The authenticated cached page, touched, after dropping it if its cache
+    /// or key is no longer admitted.
+    fn verified(&self, page: &PageId) -> Result<Option<std::cell::RefMut<'_, Entries>>> {
         let mut entries = self.entries.borrow_mut();
-        let Some((tick, entry)) = entries.pages.get(page) else {
+        let Some((_, entry)) = entries.pages.get(page) else {
             return Ok(None);
         };
         if !self.available(entry) {
             entries.remove(page);
             return Ok(None);
         }
-        let old = *tick;
-        let result = entry.clone();
-        entries.clock = entries.clock.checked_add(1).ok_or(Error::Overloaded)?;
-        let tick = entries.clock;
-        entries.lru.remove(&old);
-        entries.lru.insert(tick, page.clone());
-        entries.pages.get_mut(page).unwrap().0 = tick;
-        Ok(Some(result))
+        entries.touch(page)?;
+        Ok(Some(entries))
     }
-    pub(crate) fn ciphertext(&self, page: &PageId) -> Result<Option<CiphertextCopy>> {
-        if let Some(entry) = self.get(page)? {
-            return Ok(Some(entry.copy()));
+    /// A verified page whose plaintext some other owner still holds. A cached
+    /// page whose plaintext was released is a miss here; callers decrypt it
+    /// from [`Self::unverified`] instead.
+    pub fn get(&self, page: &PageId) -> Result<Option<PageResult>> {
+        Ok(self
+            .verified(page)?
+            .and_then(|entries| entries.pages[page].1.live()))
+    }
+    /// Original ciphertext for peers and disk, authenticated or not.
+    pub fn ciphertext(&self, page: &PageId) -> Result<Option<CiphertextCopy>> {
+        if let Some(entries) = self.verified(page)? {
+            return Ok(Some(entries.pages[page].1.copy()));
         }
         Ok(self.unverified(page)?.map(|entry| entry.copy))
     }
+    /// Cached ciphertext a local reader must authenticate and decrypt. An
+    /// authenticated page is returned too, so a plaintext miss in
+    /// [`Self::get`] decrypts from memory rather than refetching.
     pub(crate) fn unverified(&self, page: &PageId) -> Result<Option<UnverifiedPage>> {
+        if let Some(entries) = self.verified(page)? {
+            return Ok(Some(UnverifiedPage {
+                copy: entries.pages[page].1.copy(),
+                disk_token: None,
+            }));
+        }
         let mut entries = self.ciphertext_entries.borrow_mut();
         if entries.get(page).is_some_and(|entry| {
             !self.availability.page(
@@ -1214,6 +1349,7 @@ impl MemoryCache {
         }) {
             entries.remove(page);
         }
+        entries.touch(page);
         Ok(entries.get(page).cloned())
     }
     pub(crate) fn publish_ciphertext(&self, mut page: UnverifiedPage) -> Result<()> {
@@ -1225,7 +1361,11 @@ impl MemoryCache {
         ) {
             return Err(Error::MissingKey);
         }
-        if self.ciphertext_entries.borrow().contains_key(id) {
+        // A verified entry already owns this page's ciphertext. Retaining a
+        // second copy would pin it and keep it from ever going idle.
+        if self.entries.borrow().pages.contains_key(id)
+            || self.ciphertext_entries.borrow().contains_key(id)
+        {
             return Ok(());
         }
         page.copy.ciphertext = self.pool.retainable(page.copy.ciphertext)?;
@@ -1242,15 +1382,30 @@ impl MemoryCache {
     }
     pub(crate) fn invalidate_ciphertext(&self, page: &UnverifiedPage) {
         let id = &page.copy.ciphertext.envelope().page;
-        let mut entries = self.ciphertext_entries.borrow_mut();
         // A registered page was copied out on publish, so match its contents.
         let registered = page.copy.ciphertext.is_registered();
-        if entries.get(id).is_some_and(|entry| {
-            Arc::ptr_eq(&entry.copy.ciphertext.inner, &page.copy.ciphertext.inner)
+        let matches = |cached: &CiphertextPage| {
+            Arc::ptr_eq(&cached.inner, &page.copy.ciphertext.inner)
                 || (registered
-                    && entry.copy.ciphertext.envelope() == page.copy.ciphertext.envelope()
-                    && entry.copy.ciphertext.bytes() == page.copy.ciphertext.bytes())
-        }) {
+                    && cached.envelope() == page.copy.ciphertext.envelope()
+                    && cached.bytes() == page.copy.ciphertext.bytes())
+        };
+        let mut entries = self.ciphertext_entries.borrow_mut();
+        if entries
+            .get(id)
+            .is_some_and(|entry| matches(&entry.copy.ciphertext))
+        {
+            entries.remove(id);
+        }
+        drop(entries);
+        // Cached authenticated ciphertext that later fails to decrypt (memory
+        // corruption or a revoked key) must not be served again.
+        let mut entries = self.entries.borrow_mut();
+        if entries
+            .pages
+            .get(id)
+            .is_some_and(|(_, entry)| matches(&entry.ciphertext))
+        {
             entries.remove(id);
         }
     }
@@ -1276,7 +1431,10 @@ impl MemoryCache {
         if !self.availability.cache(&id.version.object.cache) {
             return Err(Error::Unavailable);
         }
-        if !self.available(&page) {
+        if !self.availability.page(
+            &page.metadata.version.object.cache,
+            page.ciphertext.envelope().key_id,
+        ) {
             return Err(Error::MissingKey);
         }
         let mut entries = self.entries.borrow_mut();
@@ -1293,9 +1451,15 @@ impl MemoryCache {
         {
             return Err(Error::CorruptRecord);
         }
-        if let Some((_, entry)) = entries.pages.get(id) {
-            if entry.plaintext.bytes() != page.plaintext.bytes() {
-                return Err(Error::CorruptRecord);
+        if let Some((_, entry)) = entries.pages.get_mut(id) {
+            match entry.plaintext.upgrade() {
+                Some(live) if live.bytes != page.plaintext.inner.bytes => {
+                    return Err(Error::CorruptRecord);
+                }
+                Some(_) => {}
+                // Remember the newly decrypted plaintext so concurrent readers
+                // can share it while it lives.
+                None => entry.plaintext = Arc::downgrade(&page.plaintext.inner),
             }
             // A duplicate fill must not replace the original nonce/ciphertext
             // or turn its historical deadline into renewed freshness.
@@ -1343,7 +1507,8 @@ impl MemoryCache {
             .map(|entry| entry.copy.metadata.immutable()))
     }
     /// Return released admission bytes, including any reserved final-page slack.
-    /// Busy plaintext OR ciphertext protects the complete retained bundle.
+    /// Busy ciphertext protects a retained page; live plaintext does not, since
+    /// the cache holds it only weakly.
     pub fn evict_idle(&self, bytes: usize) -> Result<usize> {
         let mut released = self.reclaim_ciphertext(None, bytes);
         let mut entries = self.entries.borrow_mut();
@@ -1357,31 +1522,26 @@ impl MemoryCache {
             if !idle(entry) {
                 continue;
             }
-            released = released
-                .saturating_add(entry.plaintext.inner.reservation.amount())
-                .saturating_add(entry.ciphertext.inner.reservation().amount());
+            released = released.saturating_add(entry.ciphertext.inner.reservation().amount());
             entries.remove(&id);
         }
         self.pool.reclaim_buffers();
         Ok(released)
     }
-    /// One bounded LRU pass, counting only the exhausted class. The callback may
-    /// release a queued writer's sole extra ciphertext reference, never a reader.
+    /// One bounded LRU pass over ciphertext. The callback may release a queued
+    /// writer's sole extra ciphertext reference, never a reader. The cache
+    /// holds no plaintext, so plaintext pressure releases nothing here.
     pub(crate) fn reclaim_idle(
         &self,
         class: ResourceClass,
         cache: Option<&CacheId>,
         bytes: usize,
-        mut release_queued: impl FnMut(&PageResult) -> usize,
+        mut release_queued: impl FnMut(&PageId, &CiphertextPage) -> usize,
     ) -> usize {
-        if !matches!(class, ResourceClass::Plaintext | ResourceClass::Ciphertext) {
+        if !matches!(class, ResourceClass::Ciphertext) {
             return 0;
         }
-        let mut released = if matches!(class, ResourceClass::Ciphertext) {
-            self.reclaim_ciphertext(cache, bytes)
-        } else {
-            0
-        };
+        let mut released = self.reclaim_ciphertext(cache, bytes);
         let mut entries = self.entries.borrow_mut();
         let candidates = entries.candidates();
         for (tick, id) in candidates {
@@ -1390,25 +1550,17 @@ impl MemoryCache {
             }
             entries.reclaim_after = tick;
             let entry = &entries.pages[&id].1;
-            if cache.is_some_and(|cache| cache != &entry.metadata.version.object.cache)
-                || Arc::strong_count(&entry.plaintext.inner) != 1
-            {
+            if cache.is_some_and(|cache| cache != &entry.metadata.version.object.cache) {
                 continue;
             }
-            let staging = release_queued(entry);
-            if matches!(class, ResourceClass::Ciphertext) {
-                released = released.saturating_add(staging);
-            }
+            released = released.saturating_add(release_queued(&id, &entry.ciphertext));
             if released >= bytes {
                 break;
             }
             if !idle(entry) {
                 continue;
             }
-            released = released.saturating_add(match class {
-                ResourceClass::Plaintext => entry.plaintext.inner.reservation.amount(),
-                _ => entry.ciphertext.inner.reservation().amount(),
-            });
+            released = released.saturating_add(entry.ciphertext.inner.reservation().amount());
             entries.remove(&id);
         }
         released
@@ -1416,7 +1568,7 @@ impl MemoryCache {
     pub(crate) fn remove_cache(&self, cache: &CacheId) -> Result<()> {
         self.ciphertext_entries
             .borrow_mut()
-            .retain(|id, _| &id.version.object.cache != cache);
+            .retain(|id| &id.version.object.cache != cache);
         let mut entries = self.entries.borrow_mut();
         let removed: Vec<_> = entries
             .pages
@@ -1428,6 +1580,65 @@ impl MemoryCache {
             entries.remove(&id);
         }
         Ok(())
+    }
+    /// Release entries not inserted or hit for at least `CACHE_IDLE_TTL`,
+    /// skipping any still referenced elsewhere (retried on the next pass).
+    /// Examines at most `CACHE_EXPIRY_BATCH` entries per class per call and
+    /// returns the number of entries released. Freed buffers return to the
+    /// pools, whose own maintenance decays them.
+    pub(crate) fn expire_idle(&self, now: std::time::Instant) -> usize {
+        let mut expiry = self.expiry.borrow_mut();
+        let verified_clock = self.entries.borrow().clock;
+        let ciphertext_clock = self.ciphertext_entries.borrow().clock;
+        let Some((verified_cutoff, ciphertext_cutoff)) =
+            expiry.advance(now, verified_clock, ciphertext_clock)
+        else {
+            return 0;
+        };
+        let mut released = 0;
+        if let Some(after) = expiry.verified {
+            let mut entries = self.entries.borrow_mut();
+            let selected: Vec<_> = entries
+                .lru
+                .range((
+                    std::ops::Bound::Excluded(after),
+                    std::ops::Bound::Included(verified_cutoff),
+                ))
+                .take(CACHE_EXPIRY_BATCH)
+                .map(|(tick, id)| (*tick, id.clone()))
+                .collect();
+            expiry.verified = (selected.len() == CACHE_EXPIRY_BATCH)
+                .then(|| selected.last().map(|(tick, _)| *tick))
+                .flatten();
+            for (_, id) in selected {
+                if idle(&entries.pages[&id].1) {
+                    entries.remove(&id);
+                    released += 1;
+                }
+            }
+        }
+        if let Some(after) = expiry.ciphertext {
+            let mut entries = self.ciphertext_entries.borrow_mut();
+            let selected: Vec<_> = entries
+                .order
+                .range((
+                    std::ops::Bound::Excluded(after),
+                    std::ops::Bound::Included(ciphertext_cutoff),
+                ))
+                .take(CACHE_EXPIRY_BATCH)
+                .map(|(tick, id)| (*tick, id.clone()))
+                .collect();
+            expiry.ciphertext = (selected.len() == CACHE_EXPIRY_BATCH)
+                .then(|| selected.last().map(|(tick, _)| *tick))
+                .flatten();
+            for (_, id) in selected {
+                if Arc::strong_count(&entries[&id].copy.ciphertext.inner) == 1 {
+                    entries.remove(&id);
+                    released += 1;
+                }
+            }
+        }
+        released
     }
     fn reclaim_ciphertext(&self, cache: Option<&CacheId>, bytes: usize) -> usize {
         let mut entries = self.ciphertext_entries.borrow_mut();
@@ -1465,9 +1676,9 @@ impl MemoryCache {
         released
     }
 }
-fn idle(entry: &PageResult) -> bool {
-    Arc::strong_count(&entry.plaintext.inner) == 1
-        && Arc::strong_count(&entry.ciphertext.inner) == 1
+/// No owner outside the cache shares the retained ciphertext.
+fn idle(entry: &CachedPage) -> bool {
+    Arc::strong_count(&entry.ciphertext.inner) == 1
 }
 
 #[cfg(test)]
@@ -1543,7 +1754,7 @@ pub(crate) mod tests {
                         version: metadata.version.clone(),
                         number: PageNumber(0),
                     };
-                    if let Some(found) = cache.get(&page).unwrap() {
+                    if let Some(found) = cache.ciphertext(&page).unwrap() {
                         drop(found);
                         hits += usize::from(request >= WARMUP);
                     } else {
@@ -1555,8 +1766,12 @@ pub(crate) mod tests {
                                 Ok(charge) => charge,
                                 Err(flow_control::Error::Overloaded) => {
                                     assert!(
-                                        cache.reclaim_idle(class, Some(&cache_id), amount, |_| 0)
-                                            >= amount
+                                        cache.reclaim_idle(
+                                            class,
+                                            Some(&cache_id),
+                                            amount,
+                                            |_, _| 0
+                                        ) >= amount
                                     );
                                     reclaims += usize::from(request >= WARMUP);
                                     admission.reserve(Some(&cache_id), class, amount).unwrap()
@@ -1598,12 +1813,12 @@ pub(crate) mod tests {
                     }
                     let entries = cache.entries.borrow();
                     assert!(entries.len() <= 51);
-                    assert_eq!(admission.used(ResourceClass::Plaintext), entries.len() * 8);
+                    // Plaintext is released once the publisher drops it.
+                    assert_eq!(admission.used(ResourceClass::Plaintext), 0);
                     assert_eq!(
                         admission.used(ResourceClass::Ciphertext),
                         entries.len() * 24
                     );
-                    assert!(admission.used(ResourceClass::Plaintext) <= 408);
                     assert!(admission.used(ResourceClass::Ciphertext) <= 1224);
                 }
                 assert_eq!(hits + refills, MEASURE);
@@ -1661,7 +1876,7 @@ pub(crate) mod tests {
                     let b = publish(&cache, &admission, "b");
                     let c = publish(&cache, &admission, "c");
                     if !capacity {
-                        assert_eq!(cache.evict_idle(1), Ok(22));
+                        assert_eq!(cache.evict_idle(1), Ok(19));
                     }
                     let d = publish(&cache, &admission, "d");
                     assert!(!cache.entries.borrow().pages.contains_key(&a));
@@ -1669,7 +1884,7 @@ pub(crate) mod tests {
                     if capacity {
                         publish(&cache, &admission, "e");
                     } else {
-                        assert_eq!(cache.evict_idle(1), Ok(22));
+                        assert_eq!(cache.evict_idle(1), Ok(19));
                     }
                     let entries = cache.entries.borrow();
                     assert!(!entries.pages.contains_key(&b));
@@ -1692,7 +1907,9 @@ pub(crate) mod tests {
                     assert_eq!(cache.evict_idle(0), Ok(0));
                     for class in [ResourceClass::Plaintext, ResourceClass::Ciphertext] {
                         assert_eq!(
-                            cache.reclaim_idle(class, None, 0, |_| panic!("zero target callback")),
+                            cache.reclaim_idle(class, None, 0, |_, _| panic!(
+                                "zero target callback"
+                            )),
                             0
                         );
                     }
@@ -1702,7 +1919,7 @@ pub(crate) mod tests {
                         assert_eq!(cache.evict_idle(1), Ok(19));
                     } else {
                         assert_eq!(
-                            cache.reclaim_idle(ResourceClass::Ciphertext, None, 1, |_| panic!(
+                            cache.reclaim_idle(ResourceClass::Ciphertext, None, 1, |_, _| panic!(
                                 "target already met"
                             )),
                             19
@@ -1723,10 +1940,18 @@ pub(crate) mod tests {
                 );
                 let a = publish(&cache, &admission, "a");
                 let b = publish(&cache, &admission, "b");
-                let held = cache.entries.borrow().pages[&a].1.plaintext.clone();
+                let held = cache.entries.borrow().pages[&a].1.ciphertext.clone();
+                // The cache holds no plaintext, so plaintext pressure is a no-op.
                 assert_eq!(
-                    cache.reclaim_idle(ResourceClass::Plaintext, None, 1, |_| 0),
-                    3
+                    cache.reclaim_idle(ResourceClass::Plaintext, None, 1, |_, _| panic!(
+                        "plaintext callback"
+                    )),
+                    0
+                );
+                assert_eq!(cache.entries.borrow().reclaim_after, 0);
+                assert_eq!(
+                    cache.reclaim_idle(ResourceClass::Ciphertext, None, 1, |_, _| 0),
+                    19
                 );
                 assert_eq!(cache.entries.borrow().reclaim_after, 2);
                 assert!(cache.entries.borrow().pages.contains_key(&a));
@@ -1734,7 +1959,7 @@ pub(crate) mod tests {
                 let c = publish(&cache, &admission, "c");
                 let wrong = CacheId("wrong".into());
                 assert_eq!(
-                    cache.reclaim_idle(ResourceClass::Plaintext, Some(&wrong), 1, |_| panic!(
+                    cache.reclaim_idle(ResourceClass::Ciphertext, Some(&wrong), 1, |_, _| panic!(
                         "wrong cache callback"
                     )),
                     0
@@ -1745,8 +1970,8 @@ pub(crate) mod tests {
                     .unwrap();
                 let mut staging = Some(staging);
                 assert_eq!(
-                    cache.reclaim_idle(ResourceClass::Ciphertext, None, 1, |page| {
-                        assert_eq!(page.plaintext.page(), &c);
+                    cache.reclaim_idle(ResourceClass::Ciphertext, None, 1, |page, _| {
+                        assert_eq!(page, &c);
                         drop(staging.take().unwrap());
                         1
                     }),
@@ -1755,6 +1980,204 @@ pub(crate) mod tests {
                 assert_eq!(cache.entries.borrow().reclaim_after, 3);
                 assert!(cache.entries.borrow().pages.contains_key(&c));
                 drop(held);
+            }
+
+            /// Run `expire_idle` once per checkpoint interval up to `until`.
+            fn expire_through(
+                cache: &MemoryCache,
+                start: std::time::Instant,
+                until: std::time::Duration,
+            ) -> usize {
+                let mut released = 0;
+                let mut at = std::time::Duration::ZERO;
+                while at <= until {
+                    released += cache.expire_idle(start + at);
+                    at += CACHE_EXPIRY_CHECKPOINT;
+                }
+                released
+            }
+
+            #[test]
+            fn expire_idle_releases_untouched_entries_and_keeps_recent_hits() {
+                let admission = admission(8);
+                let cache = MemoryCache::new(
+                    BufferPool::new(admission.clone()),
+                    crate::test_support::availability(),
+                );
+                let start = std::time::Instant::now();
+                let cold = publish(&cache, &admission, "cold");
+                let hot = publish(&cache, &admission, "hot");
+                let cipher = publish_ciphertext(&cache, &admission, "cipher");
+                let touched = publish_ciphertext(&cache, &admission, "touched");
+                // Nothing is old enough yet.
+                assert_eq!(expire_through(&cache, start, CACHE_IDLE_TTL / 2), 0);
+                // Hits halfway through renew both classes.
+                assert!(cache.ciphertext(&hot).unwrap().is_some());
+                assert!(cache.unverified(&touched).unwrap().is_some());
+                let half = start + CACHE_IDLE_TTL / 2;
+                assert_eq!(expire_through(&cache, half, CACHE_IDLE_TTL / 2), 2);
+                assert!(!cache.entries.borrow().pages.contains_key(&cold));
+                assert!(cache.entries.borrow().pages.contains_key(&hot));
+                assert!(!cache.ciphertext_entries.borrow().contains_key(&cipher));
+                assert!(cache.ciphertext_entries.borrow().contains_key(&touched));
+                // Without further hits the renewed entries expire one TTL later.
+                assert_eq!(
+                    expire_through(&cache, start + CACHE_IDLE_TTL, CACHE_IDLE_TTL),
+                    2
+                );
+                assert_eq!(cache.entries.borrow().len(), 0);
+                assert_eq!(cache.ciphertext_entries.borrow().len(), 0);
+                let entries = cache.ciphertext_entries.borrow();
+                assert!(entries.order.is_empty() && entries.ticks.is_empty());
+                drop(entries);
+                assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+            }
+
+            #[test]
+            fn republishing_verified_ciphertext_does_not_pin_it() {
+                let admission = admission(8);
+                let cache = MemoryCache::new(
+                    BufferPool::new(admission.clone()),
+                    crate::test_support::availability(),
+                );
+                let start = std::time::Instant::now();
+                let page = publish(&cache, &admission, "page");
+                // A ciphertext acquisition after the plaintext was released
+                // returns the verified entry, which a fill republishes.
+                let copy = cache.unverified(&page).unwrap().unwrap();
+                cache.publish_ciphertext(copy.clone()).unwrap();
+                assert!(cache.ciphertext_entries.borrow().is_empty());
+                assert_eq!(cache.entries.borrow().len(), 1);
+                // Still held externally, so not idle yet.
+                assert_eq!(expire_through(&cache, start, CACHE_IDLE_TTL * 2), 0);
+                drop(copy);
+                let later = start + CACHE_IDLE_TTL * 2 + CACHE_EXPIRY_CHECKPOINT;
+                assert_eq!(cache.expire_idle(later), 1);
+                assert_eq!(cache.entries.borrow().len(), 0);
+                assert!(cache.ciphertext_entries.borrow().is_empty());
+            }
+
+            #[test]
+            fn publish_ciphertext_still_caches_pages_without_verified_entry() {
+                let admission = admission(8);
+                let cache = MemoryCache::new(
+                    BufferPool::new(admission.clone()),
+                    crate::test_support::availability(),
+                );
+                let verified = publish(&cache, &admission, "verified");
+                let other = publish_ciphertext(&cache, &admission, "other");
+                assert!(cache.entries.borrow().pages.contains_key(&verified));
+                assert!(!cache.entries.borrow().pages.contains_key(&other));
+                assert!(cache.ciphertext_entries.borrow().contains_key(&other));
+            }
+
+            #[test]
+            fn expire_idle_skips_entries_in_use_until_released() {
+                let admission = admission(8);
+                let cache = MemoryCache::new(
+                    BufferPool::new(admission.clone()),
+                    crate::test_support::availability(),
+                );
+                let start = std::time::Instant::now();
+                let page = publish(&cache, &admission, "page");
+                let cipher = publish_ciphertext(&cache, &admission, "cipher");
+                let held = cache.entries.borrow().pages[&page].1.ciphertext.clone();
+                let held_cipher = cache.ciphertext_entries.borrow()[&cipher]
+                    .copy
+                    .ciphertext
+                    .clone();
+                assert_eq!(expire_through(&cache, start, CACHE_IDLE_TTL * 2), 0);
+                assert_eq!(cache.entries.borrow().len(), 1);
+                assert_eq!(cache.ciphertext_entries.borrow().len(), 1);
+                drop((held, held_cipher));
+                // The next checkpoint pass revisits and releases them.
+                let later = start + CACHE_IDLE_TTL * 2 + CACHE_EXPIRY_CHECKPOINT;
+                assert_eq!(cache.expire_idle(later), 2);
+                assert_eq!(cache.entries.borrow().len(), 0);
+                assert_eq!(cache.ciphertext_entries.borrow().len(), 0);
+            }
+
+            #[test]
+            fn expire_idle_bounds_work_per_call() {
+                let count = CACHE_EXPIRY_BATCH * 2 + 3;
+                let admission = admission(count * 2 + 8);
+                let cache = MemoryCache::new(
+                    BufferPool::new(admission.clone()),
+                    crate::test_support::availability(),
+                );
+                for n in 0..count {
+                    publish(&cache, &admission, &format!("p{n:03}"));
+                    publish_ciphertext(&cache, &admission, &format!("c{n:03}"));
+                }
+                let start = std::time::Instant::now();
+                assert_eq!(cache.expire_idle(start), 0);
+                let expired = start + CACHE_IDLE_TTL;
+                assert_eq!(cache.expire_idle(expired), CACHE_EXPIRY_BATCH * 2);
+                assert_eq!(cache.expire_idle(expired), CACHE_EXPIRY_BATCH * 2);
+                assert_eq!(cache.expire_idle(expired), 6);
+                // The pass is finished: further calls in this interval do no work.
+                assert_eq!(cache.expire_idle(expired), 0);
+                assert_eq!(cache.expiry.borrow().verified, None);
+                assert_eq!(cache.expiry.borrow().ciphertext, None);
+                assert_eq!(cache.entries.borrow().len(), 0);
+                assert_eq!(cache.ciphertext_entries.borrow().len(), 0);
+            }
+
+            #[test]
+            fn expire_idle_resumes_past_busy_prefix_across_checkpoints() {
+                let busy = CACHE_EXPIRY_BATCH + 1;
+                let idle = 3;
+                let admission = admission((busy + idle) * 2 + 8);
+                let cache = MemoryCache::new(
+                    BufferPool::new(admission.clone()),
+                    crate::test_support::availability(),
+                );
+                let mut held = Vec::new();
+                for n in 0..busy {
+                    let page = publish(&cache, &admission, &format!("p{n:03}"));
+                    let cipher = publish_ciphertext(&cache, &admission, &format!("c{n:03}"));
+                    held.push(cache.entries.borrow().pages[&page].1.ciphertext.clone());
+                    held.push(
+                        cache.ciphertext_entries.borrow()[&cipher]
+                            .copy
+                            .ciphertext
+                            .clone(),
+                    );
+                }
+                for n in busy..busy + idle {
+                    publish(&cache, &admission, &format!("p{n:03}"));
+                    publish_ciphertext(&cache, &admission, &format!("c{n:03}"));
+                }
+                let start = std::time::Instant::now();
+                assert_eq!(cache.expire_idle(start), 0);
+                // One call per checkpoint: each call starts a new interval.
+                let mut released = 0;
+                for step in 0..4u32 {
+                    released +=
+                        cache.expire_idle(start + CACHE_IDLE_TTL + CACHE_EXPIRY_CHECKPOINT * step);
+                }
+                assert_eq!(released, idle * 2);
+                assert_eq!(cache.entries.borrow().len(), busy);
+                assert_eq!(cache.ciphertext_entries.borrow().len(), busy);
+                drop(held);
+            }
+
+            #[test]
+            fn expiry_checkpoints_stay_bounded() {
+                let admission = admission(8);
+                let cache = MemoryCache::new(
+                    BufferPool::new(admission.clone()),
+                    crate::test_support::availability(),
+                );
+                let start = std::time::Instant::now();
+                expire_through(&cache, start, CACHE_IDLE_TTL * 10);
+                // Calls within one interval do not add checkpoints.
+                for _ in 0..10 {
+                    cache.expire_idle(start + CACHE_IDLE_TTL * 10);
+                }
+                let limit =
+                    (CACHE_IDLE_TTL.as_secs() / CACHE_EXPIRY_CHECKPOINT.as_secs()) as usize + 2;
+                assert!(cache.expiry.borrow().checkpoints.len() <= limit);
             }
 
             #[test]
@@ -1835,17 +2258,17 @@ pub(crate) mod tests {
                 );
                 assert_eq!(cache.entries.borrow().reclaim_after, u64::MAX);
                 assert_eq!(
-                    cache.reclaim_idle(ResourceClass::Plaintext, None, 1, |_| 0),
-                    3
+                    cache.reclaim_idle(ResourceClass::Ciphertext, None, 1, |_, _| 0),
+                    19
                 );
                 assert_eq!(cache.entries.borrow().reclaim_after, u64::MAX - 1);
                 assert_eq!(
-                    cache.reclaim_idle(ResourceClass::Plaintext, None, 1, |_| 0),
-                    3
+                    cache.reclaim_idle(ResourceClass::Ciphertext, None, 1, |_, _| 0),
+                    19
                 );
                 assert_eq!(cache.entries.borrow().reclaim_after, u64::MAX);
                 assert_eq!(
-                    cache.reclaim_idle(ResourceClass::Plaintext, None, 1, |_| 0),
+                    cache.reclaim_idle(ResourceClass::Ciphertext, None, 1, |_, _| 0),
                     0
                 );
                 assert_eq!(cache.entries.borrow().reclaim_after, u64::MAX);
@@ -1869,11 +2292,16 @@ pub(crate) mod tests {
                     ids.push(page.plaintext.page().clone());
                     cache.publish(page).unwrap();
                 }
-                let charge = match class {
-                    ResourceClass::Plaintext => 3,
-                    ResourceClass::Ciphertext => 19,
-                    _ => unreachable!(),
-                };
+                // Published plaintext is not retained, so plaintext pressure
+                // finds nothing to release and leaves every entry in place.
+                assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+                if matches!(class, ResourceClass::Plaintext) {
+                    assert_eq!(cache.reclaim_idle(class, None, usize::MAX, |_, _| 0), 0);
+                    assert_eq!(cache.entries.borrow().len(), 3);
+                    assert_eq!(cache.entries.borrow().reclaim_after, 0);
+                    return;
+                }
+                let charge = 19;
                 assert!(
                     cache
                         .entries
@@ -1882,14 +2310,13 @@ pub(crate) mod tests {
                         .values()
                         .all(|(_, page)| idle(page))
                 );
-                assert_eq!(cache.reclaim_idle(class, None, 1, |_| 0), charge);
+                assert_eq!(cache.reclaim_idle(class, None, 1, |_, _| 0), charge);
                 {
                     let entries = cache.entries.borrow();
                     assert!(!entries.pages.contains_key(&ids[0]), "first victim is A");
                     assert!(entries.pages.contains_key(&ids[1]), "B remains idle");
                     assert!(entries.pages.contains_key(&ids[2]), "C remains idle");
                 }
-                assert_eq!(admission.used(ResourceClass::Plaintext), 6);
                 assert_eq!(admission.used(ResourceClass::Ciphertext), 38);
 
                 let expected = match change {
@@ -1901,7 +2328,7 @@ pub(crate) mod tests {
                         vec![false, false, true, true]
                     }
                     Change::Touch => {
-                        drop(cache.get(&ids[1]).unwrap().unwrap());
+                        drop(cache.ciphertext(&ids[1]).unwrap().unwrap());
                         vec![false, true, false]
                     }
                 };
@@ -1913,7 +2340,7 @@ pub(crate) mod tests {
                         .values()
                         .all(|(_, page)| idle(page))
                 );
-                assert_eq!(cache.reclaim_idle(class, None, 1, |_| 0), charge);
+                assert_eq!(cache.reclaim_idle(class, None, 1, |_, _| 0), charge);
                 let entries = cache.entries.borrow();
                 let present: Vec<_> = ids
                     .iter()
@@ -1987,9 +2414,101 @@ pub(crate) mod tests {
             cache.invalidate_ciphertext(&unverified);
             assert!(cache.unverified(&id).unwrap().is_none());
             cache.publish_ciphertext(unverified).unwrap();
+            let plaintext = first.plaintext.clone();
             cache.publish(first).unwrap();
-            assert!(cache.unverified(&id).unwrap().is_none());
+            assert!(cache.ciphertext_entries.borrow().get(&id).is_none());
             assert!(cache.get(&id).unwrap().is_some());
+            // Without a live plaintext the verified ciphertext is still
+            // available for a local decrypt.
+            drop(plaintext);
+            assert!(cache.get(&id).unwrap().is_none());
+            assert!(cache.unverified(&id).unwrap().is_some());
+        }
+        #[test]
+        fn publication_retains_ciphertext_and_only_a_weak_plaintext_handle() {
+            let admission = admission(8);
+            let cache = MemoryCache::new(
+                BufferPool::new(admission.clone()),
+                crate::test_support::availability(),
+            );
+            let page = bundle(&admission, "v1");
+            let id = page.plaintext.page().clone();
+            let ciphertext = page.ciphertext.clone();
+            let held = page.plaintext.clone();
+            cache.publish(page).unwrap();
+            // A live reader's plaintext is shared without another copy.
+            let shared = cache.get(&id).unwrap().unwrap();
+            assert!(Arc::ptr_eq(&shared.plaintext.inner, &held.inner));
+            assert!(Arc::ptr_eq(&shared.ciphertext.inner, &ciphertext.inner));
+            drop((shared, held));
+            // The cache alone keeps no plaintext or plaintext charge.
+            assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+            assert!(cache.get(&id).unwrap().is_none());
+            // Local readers decrypt the verified ciphertext; peers copy it.
+            let local = cache.unverified(&id).unwrap().unwrap();
+            assert!(local.disk_token.is_none());
+            assert!(Arc::ptr_eq(&local.copy.ciphertext.inner, &ciphertext.inner));
+            let peer = cache.ciphertext(&id).unwrap().unwrap();
+            assert!(Arc::ptr_eq(&peer.ciphertext.inner, &ciphertext.inner));
+            assert!(cache.metadata(&id.version).unwrap().is_some());
+            drop((local, peer));
+            // A fresh decrypt relinks the weak handle but keeps the original
+            // ciphertext and its single charge.
+            let decrypted = bundle(&admission, "v1");
+            let relinked = decrypted.plaintext.clone();
+            cache.publish(decrypted).unwrap();
+            let shared = cache.get(&id).unwrap().unwrap();
+            assert!(Arc::ptr_eq(&shared.plaintext.inner, &relinked.inner));
+            assert!(Arc::ptr_eq(&shared.ciphertext.inner, &ciphertext.inner));
+            drop((shared, relinked, ciphertext));
+            assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+            assert_eq!(cache.entries.borrow().len(), 1);
+        }
+        #[test]
+        fn failed_decrypt_of_verified_ciphertext_invalidates_the_entry() {
+            let admission = admission(8);
+            let cache = MemoryCache::new(
+                BufferPool::new(admission.clone()),
+                crate::test_support::availability(),
+            );
+            let page = bundle(&admission, "v1");
+            let id = page.plaintext.page().clone();
+            cache.publish(page).unwrap();
+            let local = cache.unverified(&id).unwrap().unwrap();
+            // A different allocation with equal bytes is not this entry.
+            cache.invalidate_ciphertext(&UnverifiedPage {
+                copy: bundle(&admission, "v1").copy(),
+                disk_token: None,
+            });
+            assert!(cache.ciphertext(&id).unwrap().is_some());
+            cache.invalidate_ciphertext(&local);
+            assert!(cache.ciphertext(&id).unwrap().is_none());
+            assert!(cache.unverified(&id).unwrap().is_none());
+            drop(local);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+        }
+        #[test]
+        fn expiry_releases_verified_ciphertext_while_a_reader_holds_plaintext() {
+            let admission = admission(8);
+            let cache = MemoryCache::new(
+                BufferPool::new(admission.clone()),
+                crate::test_support::availability(),
+            );
+            let page = bundle(&admission, "v1");
+            let id = page.plaintext.page().clone();
+            let held = page.plaintext.clone();
+            cache.publish(page).unwrap();
+            let start = std::time::Instant::now();
+            assert_eq!(cache.expire_idle(start), 0);
+            // Held plaintext is the reader's; it does not pin the entry.
+            assert_eq!(cache.expire_idle(start + CACHE_IDLE_TTL), 1);
+            assert!(cache.ciphertext(&id).unwrap().is_none());
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+            assert_eq!(held.bytes(), &[1; 3]);
+            drop(held);
+            assert_eq!(admission.used(ResourceClass::Plaintext), 0);
         }
         #[test]
         fn bounded_reclamation_advances_past_a_busy_prefix() {
@@ -2009,21 +2528,26 @@ pub(crate) mod tests {
                 cache.publish(page).unwrap();
             }
             assert_eq!(cache.evict_idle(1), Ok(0));
-            assert_eq!(cache.evict_idle(1), Ok(22));
-            assert!(cache.get(&ids[256]).unwrap().is_none());
-            assert!(cache.get(&ids[257]).unwrap().is_some());
+            assert_eq!(cache.evict_idle(1), Ok(19));
+            assert!(cache.ciphertext(&ids[256]).unwrap().is_none());
+            assert!(cache.ciphertext(&ids[257]).unwrap().is_some());
+            assert!(
+                cache.get(&ids[257]).unwrap().is_none(),
+                "plaintext released"
+            );
             for reader in &busy {
                 assert_eq!(reader.plaintext.bytes(), &[1; 3]);
                 assert!(cache.get(reader.plaintext.page()).unwrap().is_some());
             }
-            assert_eq!(admission.used(ResourceClass::Plaintext), 299 * 3);
+            // Only the readers' live plaintext stays charged.
+            assert_eq!(admission.used(ResourceClass::Plaintext), 256 * 3);
             assert_eq!(admission.used(ResourceClass::Ciphertext), 299 * 19);
             drop(busy);
             for _ in 0..3 {
                 cache.evict_idle(usize::MAX).unwrap();
             }
             for id in ids {
-                assert!(cache.get(&id).unwrap().is_none());
+                assert!(cache.ciphertext(&id).unwrap().is_none());
             }
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);
             assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
@@ -2037,15 +2561,18 @@ pub(crate) mod tests {
             );
             let page = bundle(&admission, "v1");
             let id = page.plaintext.page().clone();
+            let plaintext = page.plaintext.clone();
             cache.publish(page).unwrap();
             let copy = cache.ciphertext(&id).unwrap().unwrap();
             assert_eq!(cache.evict_idle(usize::MAX), Ok(0));
             drop(copy);
-            let plaintext = cache.get(&id).unwrap().unwrap().plaintext;
-            assert_eq!(cache.evict_idle(usize::MAX), Ok(0));
-            drop(plaintext);
+            // Live plaintext is shared but does not pin the entry, and its
+            // charge is never counted as cache bytes.
+            assert!(cache.get(&id).unwrap().is_some());
             assert_eq!(cache.evict_idle(0), Ok(0));
-            assert_eq!(cache.evict_idle(1), Ok(22));
+            assert_eq!(cache.evict_idle(1), Ok(19));
+            assert_eq!(admission.used(ResourceClass::Plaintext), 3);
+            drop(plaintext);
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);
             assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
             assert!(cache.get(&id).unwrap().is_none());
@@ -2096,8 +2623,9 @@ pub(crate) mod tests {
             let second_id = second.plaintext.page().clone();
             cache.publish(first).unwrap();
             cache.publish(second).unwrap();
-            let busy = cache.get(&first_id).unwrap().unwrap();
-            let also_busy = cache.get(&second_id).unwrap().unwrap();
+            // Readers of cached ciphertext keep entries busy.
+            let busy = cache.ciphertext(&first_id).unwrap().unwrap();
+            let also_busy = cache.ciphertext(&second_id).unwrap().unwrap();
             assert_eq!(
                 cache.publish(bundle(&admission, "v3")),
                 Err(Error::Overloaded)
@@ -2106,16 +2634,16 @@ pub(crate) mod tests {
             let third = bundle(&admission, "v3");
             let third_id = third.plaintext.page().clone();
             cache.publish(third).unwrap();
-            assert!(cache.get(&second_id).unwrap().is_none());
-            assert!(cache.get(&first_id).unwrap().is_some());
+            assert!(cache.ciphertext(&second_id).unwrap().is_none());
+            assert!(cache.ciphertext(&first_id).unwrap().is_some());
             drop(busy);
             let fourth = bundle(&admission, "v4");
             let fourth_id = fourth.plaintext.page().clone();
             cache.publish(fourth).unwrap();
-            assert!(cache.get(&first_id).unwrap().is_some());
-            assert!(cache.get(&third_id).unwrap().is_none());
-            assert!(cache.get(&fourth_id).unwrap().is_some());
-            assert_eq!(admission.used(ResourceClass::Plaintext), 6);
+            assert!(cache.ciphertext(&first_id).unwrap().is_some());
+            assert!(cache.ciphertext(&third_id).unwrap().is_none());
+            assert!(cache.ciphertext(&fourth_id).unwrap().is_some());
+            assert_eq!(admission.used(ResourceClass::Plaintext), 0);
             assert_eq!(admission.used(ResourceClass::Ciphertext), 38);
         }
         #[test]
@@ -2152,6 +2680,8 @@ pub(crate) mod tests {
             );
             let original = bundle(&admission, "v1");
             let id = original.plaintext.page().clone();
+            // Conflicts are detectable only against live plaintext.
+            let held = original.plaintext.clone();
             cache.publish(original).unwrap();
             let mut conflicting = bundle(&admission, "v1");
             Arc::get_mut(&mut conflicting.plaintext.inner)
@@ -2166,6 +2696,8 @@ pub(crate) mod tests {
             assert!(cache.get(&rejected_id).unwrap().is_none());
             assert_eq!(admission.used(ResourceClass::Plaintext), 3);
             assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+            drop(held);
+            assert_eq!(admission.used(ResourceClass::Plaintext), 0);
         }
         #[test]
         fn eviction_is_cache_scoped_and_preserves_live_leases() {
@@ -2185,15 +2717,15 @@ pub(crate) mod tests {
             cache.publish(page.clone()).unwrap();
             cache.publish(other).unwrap();
             cache.remove_cache(&id.version.object.cache).unwrap();
-            assert!(cache.get(&id).unwrap().is_none());
-            assert!(cache.get(&other_id).unwrap().is_some());
+            assert!(cache.ciphertext(&id).unwrap().is_none());
+            assert!(cache.ciphertext(&other_id).unwrap().is_some());
             assert_eq!(page.plaintext.bytes(), &[1; 3]);
-            assert_eq!(admission.used(ResourceClass::Plaintext), 6);
-            drop(page);
             assert_eq!(admission.used(ResourceClass::Plaintext), 3);
+            drop(page);
+            assert_eq!(admission.used(ResourceClass::Plaintext), 0);
             let lease = cache.ciphertext(&other_id).unwrap().unwrap();
             cache.remove_cache(&other_id.version.object.cache).unwrap();
-            assert!(cache.get(&other_id).unwrap().is_none());
+            assert!(cache.ciphertext(&other_id).unwrap().is_none());
             assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
             drop(lease);
             assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
@@ -2589,6 +3121,52 @@ pub(crate) mod tests {
         // Releasing idle storage keeps admission untouched.
         pool.reclaim_idle_buffers();
         assert_eq!(pool.aligned_stats().idle_buffers, 0);
+    }
+
+    #[test]
+    fn aligned_pool_empties_when_idle_and_is_retained_while_reused() {
+        let admission = admission(8);
+        let pool = BufferPool::new(admission.clone());
+        let length = PAGE_BYTES as usize + 16;
+        let capacity = pool.aligned_capacity(length).unwrap();
+        let take = || {
+            let reservation = admission
+                .reserve(None, ResourceClass::Ciphertext, capacity)
+                .unwrap();
+            pool.aligned_ciphertext(reservation, length).unwrap()
+        };
+        let burst = |count: usize| {
+            let buffers: Vec<_> = (0..count).map(|_| take()).collect();
+            drop(buffers);
+        };
+        burst(ALIGNED_POOL_IDLE_PAGES);
+        assert_eq!(pool.aligned_stats().idle_buffers, ALIGNED_POOL_IDLE_PAGES);
+        let window = page_alloc::DEFAULT_WINDOW;
+        let start = std::time::Instant::now();
+        assert_eq!(pool.maintain_idle_buffers(start), 0);
+        // Active reuse every window keeps the pool full.
+        for turn in 1..=20 {
+            burst(ALIGNED_POOL_IDLE_PAGES);
+            assert_eq!(pool.maintain_idle_buffers(start + window * turn), 0);
+            assert_eq!(pool.aligned_stats().idle_buffers, ALIGNED_POOL_IDLE_PAGES);
+        }
+        // Once idle, a few windows release everything.
+        let mut now = start + window * 20;
+        for _ in 0..ALIGNED_POOL_IDLE_PAGES {
+            now += window;
+            pool.maintain_idle_buffers(now);
+        }
+        assert_eq!(pool.aligned_stats(), page_alloc::SharedPoolStats::default());
+        assert!(pool.aligned_pool_stats().trimmed >= ALIGNED_POOL_IDLE_PAGES as u64);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+
+        // Constrained pools refuse returns.
+        pool.constrain_idle_buffers(true);
+        burst(1);
+        assert_eq!(pool.aligned_stats().idle_buffers, 0);
+        pool.constrain_idle_buffers(false);
+        burst(1);
+        assert_eq!(pool.aligned_stats().idle_buffers, 1);
     }
 
     #[test]
