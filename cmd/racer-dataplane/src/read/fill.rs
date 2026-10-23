@@ -629,17 +629,15 @@ impl Fill {
             else {
                 return false;
             };
-            let released = self.dependencies.memory.reclaim_idle(
+            // Global pressure takes over-share caches' idle bytes first.
+            self.dependencies.memory.reclaim(
                 class,
                 owner.as_ref(),
                 bytes,
+                |cache| self.dependencies.admission.excess(cache, class),
                 |page, ciphertext| self.dependencies.writer.discard_idle_copy(page, ciphertext),
+                |cache, bytes| self.dependencies.writer.reclaim_ciphertext(cache, bytes),
             );
-            if released < bytes && matches!(class, ResourceClass::Ciphertext) {
-                self.dependencies
-                    .writer
-                    .reclaim_ciphertext(owner.as_ref(), bytes - released);
-            }
             true
         })
     }
@@ -2270,11 +2268,17 @@ impl Fill {
                     ) else {
                         break;
                     };
-                    // A zero callback never discards queued writes to make a cache
-                    // entry idle. Only unleased cache allocations may disappear.
-                    self.dependencies
-                        .memory
-                        .reclaim_idle(class, cache.as_ref(), bytes, |_, _| 0);
+                    // Zero callbacks never discard queued writes to make a cache
+                    // entry idle. Only unleased cache allocations may disappear,
+                    // over-share caches first under global pressure.
+                    self.dependencies.memory.reclaim(
+                        class,
+                        cache.as_ref(),
+                        bytes,
+                        |cache| self.dependencies.admission.excess(cache, class),
+                        |_, _| 0,
+                        |_, _| 0,
+                    );
                     result = reserve();
                 }
                 result

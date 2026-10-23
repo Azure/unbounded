@@ -755,7 +755,9 @@ impl<P: Policy> Quotas<P> {
     }
 
     /// A keyed fair-share deficit must be reclaimed from that key. Global
-    /// pressure can use any idle key; impossible requests have no byte remedy.
+    /// pressure returns no key; callers should first reclaim from keys with
+    /// [`Self::excess`], then from any idle key. Impossible requests have no
+    /// byte remedy.
     pub fn reclamation(
         &self,
         key: &P::Key,
@@ -787,6 +789,20 @@ impl<P: Policy> Quotas<P> {
         let headroom = self.limit(class).checked_sub(amount)?;
         let deficit = self.used(class).saturating_sub(headroom);
         (deficit != 0).then_some((None, deficit))
+    }
+
+    /// Bytes `key` holds above its current weighted fair share, or zero when
+    /// the key is inactive or within its share. One map lookup, so callers may
+    /// ask about a few candidate keys on each reclaim without walking all keys.
+    pub fn excess(&self, key: &P::Key, class: P::Class) -> usize {
+        // Release the lookup borrow before policy callbacks, as in `reclamation`.
+        let Some(local) = self.keys.borrow().get(key).and_then(Weak::upgrade) else {
+            return 0;
+        };
+        local
+            .counter(class)
+            .used()
+            .saturating_sub(self.fair_limit_for(class, &local))
     }
 
     /// Admit nonzero keyed or aggregate-only work under ordinary policy.
@@ -2329,6 +2345,35 @@ mod quota_tests {
         assert_eq!(quotas.active_weight(), 0);
         quotas.reweigh();
         assert_eq!(quotas.active_weight(), 0);
+    }
+
+    /// Excess follows live reweigh and is zero for inactive or retired keys.
+    #[test]
+    fn excess_follows_reweigh_and_retirement() {
+        let (quotas, policy) = weighted(100, &[("low", 1), ("high", 1)]);
+        assert_eq!(quotas.excess(&"low".into(), Resource::Payload), 0);
+        let low = quotas
+            .reserve(Some(&"low".into()), Resource::Payload, 50)
+            .unwrap();
+        let high = quotas
+            .reserve(Some(&"high".into()), Resource::Payload, 20)
+            .unwrap();
+        // Equal weights: both keys are within a share of 50.
+        assert_eq!(quotas.excess(&"low".into(), Resource::Payload), 0);
+        assert_eq!(quotas.excess(&"high".into(), Resource::Payload), 0);
+        policy.weights.lock().unwrap().insert("low".into(), 100);
+        policy.weights.lock().unwrap().insert("high".into(), 900);
+        // Not applied until reweigh.
+        assert_eq!(quotas.excess(&"low".into(), Resource::Payload), 0);
+        quotas.reweigh();
+        assert_eq!(quotas.excess(&"low".into(), Resource::Payload), 40);
+        assert_eq!(quotas.excess(&"high".into(), Resource::Payload), 0);
+        // Other classes keep their own counters.
+        assert_eq!(quotas.excess(&"low".into(), Resource::Other), 0);
+        drop(low);
+        assert_eq!(quotas.excess(&"low".into(), Resource::Payload), 0);
+        drop(high);
+        assert_eq!(quotas.excess(&"high".into(), Resource::Payload), 0);
     }
 
     /// `Policy::weight` may reenter the authority while a new key activates.

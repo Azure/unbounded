@@ -1389,13 +1389,15 @@ impl WorkerApplication {
                 let Some((owner, bytes)) = admission.reclamation(cache, class, amount) else {
                     break;
                 };
-                let released =
-                    memory.reclaim_idle(class, owner.as_ref(), bytes, |page, ciphertext| {
-                        writer.discard_idle_copy(page, ciphertext)
-                    });
-                if released < bytes {
-                    writer.reclaim_ciphertext(owner.as_ref(), bytes - released);
-                }
+                // Global pressure takes over-share caches' idle bytes first.
+                memory.reclaim(
+                    class,
+                    owner.as_ref(),
+                    bytes,
+                    |cache| admission.excess(cache, class),
+                    |page, ciphertext| writer.discard_idle_copy(page, ciphertext),
+                    |cache, bytes| writer.reclaim_ciphertext(cache, bytes),
+                );
                 memory.buffers().reclaim_idle_buffers();
             }
         }
