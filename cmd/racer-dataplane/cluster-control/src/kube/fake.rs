@@ -239,6 +239,13 @@ impl FakeApi {
                 }
                 (200, self.put_object(path, current))
             }
+            "DELETE" => match self.object(path) {
+                Some(o) => {
+                    self.delete_object(path);
+                    (200, o)
+                }
+                None => (404, json!({"code":404})),
+            },
             _ => (405, json!({})),
         }
     }

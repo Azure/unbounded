@@ -124,9 +124,25 @@ pub fn encode(r: &StateRecord) -> Result<Vec<u8>, StateError> {
 }
 
 /// Check that `term` may write over `current`.
-pub fn authorize_write(current: Option<&StateRecord>, term: &Term) -> Result<(), StateError> {
+///
+/// Transitions reset when the Lease is recreated, so term ordering only
+/// holds within one Lease UID. A record stamped under another UID may be
+/// taken over only when `live_lease_uid` (read from the API after the
+/// record) is this term's UID: the stamped Lease is then gone, and its
+/// holder can no longer renew. The rule is asymmetric: once the live term
+/// stamps the record, the old holder reads a foreign UID while the live
+/// UID is not its own, so it is fenced and cannot take the record back.
+/// Counters stay monotonic because takeover stamps on top of `current`.
+pub fn authorize_write(
+    current: Option<&StateRecord>,
+    term: &Term,
+    live_lease_uid: Option<&str>,
+) -> Result<(), StateError> {
     let Some(c) = current else { return Ok(()) };
     if c.term.lease_uid != term.lease_uid {
+        if live_lease_uid == Some(term.lease_uid.as_str()) {
+            return Ok(());
+        }
         return Err(StateError::LeaseReplaced);
     }
     if c.term.transitions > term.transitions
@@ -171,11 +187,17 @@ impl Writer {
     }
 
     /// Feed every record read from the API. A newer term fences for good.
-    pub fn observe(&mut self, current: Option<&StateRecord>) -> Result<(), StateError> {
+    /// `live_lease_uid` is the UID of the primary Lease read after `current`,
+    /// if known; see [`authorize_write`] for the takeover rule.
+    pub fn observe(
+        &mut self,
+        current: Option<&StateRecord>,
+        live_lease_uid: Option<&str>,
+    ) -> Result<(), StateError> {
         if self.fenced {
             return Err(StateError::StaleTerm);
         }
-        if let Err(e) = authorize_write(current, &self.term) {
+        if let Err(e) = authorize_write(current, &self.term, live_lease_uid) {
             self.fenced = true;
             return Err(e);
         }
@@ -327,36 +349,75 @@ mod tests {
     #[test]
     fn fencing() {
         let r = record();
-        assert_eq!(authorize_write(None, &term(1, "a")), Ok(()));
-        assert_eq!(authorize_write(Some(&r), &term(1, "pod/aa")), Ok(()));
-        assert_eq!(authorize_write(Some(&r), &term(2, "other/bb")), Ok(()));
+        assert_eq!(authorize_write(None, &term(1, "a"), None), Ok(()));
+        assert_eq!(authorize_write(Some(&r), &term(1, "pod/aa"), None), Ok(()));
         assert_eq!(
-            authorize_write(Some(&r), &term(0, "pod/aa")),
+            authorize_write(Some(&r), &term(2, "other/bb"), None),
+            Ok(())
+        );
+        assert_eq!(
+            authorize_write(Some(&r), &term(0, "pod/aa"), None),
             Err(StateError::StaleTerm)
         );
         // Same transitions, other process of the same Pod.
         assert_eq!(
-            authorize_write(Some(&r), &term(1, "pod/bb")),
+            authorize_write(Some(&r), &term(1, "pod/bb"), None),
             Err(StateError::StaleTerm)
         );
         let mut replaced = term(5, "pod/aa");
         replaced.lease_uid = "lease-2".into();
         assert_eq!(
-            authorize_write(Some(&r), &replaced),
+            authorize_write(Some(&r), &replaced, None),
             Err(StateError::LeaseReplaced)
+        );
+        // The stamped Lease is still live: the other UID is dead.
+        assert_eq!(
+            authorize_write(Some(&r), &replaced, Some("lease-1")),
+            Err(StateError::LeaseReplaced)
+        );
+        // Recreated Lease: the live term takes over, even at lower transitions.
+        let mut fresh = term(0, "other/bb");
+        fresh.lease_uid = "lease-2".into();
+        assert_eq!(authorize_write(Some(&r), &fresh, Some("lease-2")), Ok(()));
+    }
+
+    #[test]
+    fn live_lease_takes_over_and_dead_lease_is_fenced() {
+        let mut new_term = term(0, "other/bb");
+        new_term.lease_uid = "lease-2".into();
+        let mut newer = Writer::new(new_term.clone());
+        assert!(newer.observe(Some(&record()), Some("lease-2")).is_ok());
+        let stamped = newer.stamp(record(), UID, "q", 9);
+        assert_eq!(check_monotonic(&record(), &stamped), Ok(()));
+        // Later reads of its own record need no live UID.
+        assert!(newer.observe(Some(&stamped), None).is_ok());
+        // The old holder sees the new UID, which is not its own live UID.
+        let mut old = Writer::new(term(1, "pod/aa"));
+        assert_eq!(
+            old.observe(Some(&stamped), Some("lease-2")),
+            Err(StateError::LeaseReplaced)
+        );
+        assert!(!old.may_write());
+        // Even with a stale view claiming its Lease is live, it stays fenced.
+        assert_eq!(
+            old.observe(Some(&record()), Some("lease-1")),
+            Err(StateError::StaleTerm)
         );
     }
 
     #[test]
     fn old_writer_never_retries_after_replacement() {
         let mut old = Writer::new(term(1, "pod/aa"));
-        assert!(old.observe(Some(&record())).is_ok());
+        assert!(old.observe(Some(&record()), None).is_ok());
         let mut newer = record();
         newer.term = term(2, "other/bb");
-        assert_eq!(old.observe(Some(&newer)), Err(StateError::StaleTerm));
+        assert_eq!(old.observe(Some(&newer), None), Err(StateError::StaleTerm));
         assert!(!old.may_write());
         // Even if the old record shows up again, the writer stays fenced.
-        assert_eq!(old.observe(Some(&record())), Err(StateError::StaleTerm));
+        assert_eq!(
+            old.observe(Some(&record()), None),
+            Err(StateError::StaleTerm)
+        );
         let stamped = Writer::new(term(2, "other/bb")).stamp(record(), UID, "q", 9);
         assert_eq!(stamped.term.transitions, 2);
         assert_eq!(stamped.writer_pod_uid, "q");

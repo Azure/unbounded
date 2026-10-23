@@ -41,7 +41,10 @@ The primary's term binds the primary Lease UID, its transition number, and the
 holder identity. Acquiring the Lease alone does not authorize publication: the
 primary must first commit its term with a resourceVersion compare-and-swap.
 Every subsequent commit checks that term. An old writer must stop on a lost
-term, not reload and overwrite its successor's state.
+term, not reload and overwrite its successor's state. Transition numbers restart
+when the Lease is recreated, so they are compared only within one Lease UID. A
+term may take over state stamped under another UID only when its own UID is the
+live Lease UID, read after the state; a writer whose Lease is gone is fenced.
 
 Publication sequence, membership version, and keyring generation never decrease.
 The same version never names different content. Only committed content is
