@@ -1252,3 +1252,45 @@ impl Helper {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod testing {
+    //! A GPU helper on simulated GPUs, for tests outside the client socket.
+    use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// The simulation, on the GPU helper thread only.
+        static SIM: RefCell<Option<(racer_gpu::simulation::Simulation, racer_gpu::simulation::Environment)>> =
+            const { RefCell::new(None) };
+    }
+
+    /// The helper thread's simulation. Call through [`GpuHelper::run`].
+    pub(crate) fn simulation() -> racer_gpu::simulation::Simulation {
+        SIM.with(|sim| sim.borrow().as_ref().unwrap().0.clone())
+    }
+
+    /// A required-mode helper on simulated GPUs with these NUMA nodes.
+    pub(crate) fn helper(numa: &[Option<u32>]) -> Arc<GpuHelper> {
+        let devices: Vec<racer_gpu::simulation::SimDevice> = numa
+            .iter()
+            .enumerate()
+            .map(|(ordinal, node)| {
+                let mut device = racer_gpu::simulation::SimDevice::new(ordinal as u8);
+                device.numa_node = *node;
+                device
+            })
+            .collect();
+        GpuHelper::start_with(
+            GpuMode::Required,
+            Box::new(move || {
+                let simulation = racer_gpu::simulation::Simulation::new(devices);
+                let environment = simulation.enter();
+                SIM.with(|sim| *sim.borrow_mut() = Some((simulation, environment)));
+                racer_gpu::Gpu::load()
+            }),
+        )
+        .unwrap()
+        .unwrap()
+    }
+}

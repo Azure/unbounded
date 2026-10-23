@@ -3310,6 +3310,7 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::RdmaSentBytes => "racer_rdma_sent_bytes_total",
             Self::RdmaPagesReceived => "racer_rdma_pages_received_total",
             Self::RdmaReceivedBytes => "racer_rdma_received_bytes_total",
+            Self::RdmaPagesLanded => "racer_rdma_pages_landed_total",
             Self::RdmaHttpFallback => "racer_rdma_http_fallback_total",
             Self::RdmaGrantCount => "racer_rdma_grant_nanoseconds_count",
             Self::RdmaGrantNs => "racer_rdma_grant_nanoseconds_sum",

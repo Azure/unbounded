@@ -847,3 +847,151 @@ mod send_in_place {
         assert_eq!(ma.count(Event::RdmaHttpFallback), 1);
     }
 }
+
+#[test]
+/// Rails take a free GPU on their NUMA node first, then any free GPU; each
+/// GPU serves one rail at most.
+fn assign_landing_prefers_numa_then_any() {
+    let rails = [
+        (RailId(1), Some(1)),
+        (RailId(2), Some(0)),
+        (RailId(3), None),
+        (RailId(4), Some(0)),
+    ];
+    let gpus = [(0, Some(0)), (1, Some(1)), (2, None)];
+    assert_eq!(
+        assign_landing(&rails, &gpus),
+        [(RailId(1), 1), (RailId(2), 0), (RailId(3), 2)]
+    );
+    assert_eq!(assign_landing(&rails, &[]), []);
+    assert_eq!(
+        assign_landing(&[(RailId(9), Some(3))], &[(5, Some(1))]),
+        [(RailId(9), 5)]
+    );
+}
+
+/// Register a simulated GPU's landing buffer on `a`'s rail.
+fn attach_landing(w: &mut World, helper: &Arc<crate::gpu::GpuHelper>, bytes: u64) {
+    w.a.links.node().set_gpu_landing(helper.clone(), bytes);
+    let rails = w.a.links.active();
+    let scope = scope();
+    // The GPU helper answers from its own thread: poll with short sleeps.
+    let mut future = std::pin::pin!(w.a.links.attach_landings(&rails, &scope));
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    for _ in 0..5000 {
+        if future.as_mut().poll(&mut cx).is_ready() {
+            return;
+        }
+        pump(&mut w.a.owner, &mut w.b.owner);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("landing attach did not finish");
+}
+
+#[test]
+/// A landing grant takes a slot of the GPU landing buffer: the peer's write
+/// lands in GPU memory, the CPU path never sees it, and the slot is held
+/// until the landed page drops. A landing grant for another GPU, or with no
+/// free slot, is refused so the caller grants host memory instead.
+fn landing_grant_receives_into_gpu_memory() {
+    use std::os::unix::fs::FileExt;
+    let helper = crate::gpu::testing::helper(&[None]);
+    let mut w = world();
+    let link = link_up(&mut w);
+    // One slot only.
+    let bytes = (BUFFER_LEN as u64).next_multiple_of(crate::config::GPU_STAGING_UNIT);
+    attach_landing(&mut w, &helper, bytes);
+    assert_eq!(w.a.links.landing_ordinal(RAIL), Some(0));
+    assert_eq!(w.b.links.landing_ordinal(RAIL), None);
+    let (a, b) = (node_id(1), node_id(2));
+    let scope = scope();
+    assert_eq!(
+        drive!(
+            w,
+            w.a.links
+                .grant_landing(&b, RAIL, TransferId([3; 16]), 1, &scope)
+        )
+        .err(),
+        Some(Error::Unavailable),
+        "landing buffer is on another GPU"
+    );
+    let pending = drive!(
+        w,
+        w.a.links
+            .grant_landing(&b, RAIL, TransferId([3; 16]), 0, &scope)
+    )
+    .unwrap();
+    assert!(pending.is_landing());
+    assert_eq!(pending.link(), link);
+    assert!(
+        drive!(
+            w,
+            w.a.links
+                .grant_landing(&b, RAIL, TransferId([4; 16]), 0, &scope)
+        )
+        .is_err(),
+        "the only slot is taken"
+    );
+    let header = STANDARD.decode(pending.header_value()).unwrap();
+    let grant = AuthenticatedGrant::decode(&header, RAIL, TransferId([3; 16])).unwrap();
+    let page = page(&w.b.admission.clone(), 35, 0x6b);
+    drive!(w, w.b.links.send(&a, &grant, &page, &scope)).unwrap();
+    let device = match drive!(w, poll_fn(|cx| pending.arrival.poll(cx))).unwrap() {
+        Arrival::Device(page) => page,
+        _ => panic!("expected a device page"),
+    };
+    // The bytes are in the GPU buffer, read here through its dma-buf.
+    let landing = w.a.links.node().landing(RAIL).unwrap();
+    let mut bytes = [0; 35];
+    let file = std::fs::File::from(
+        rdma_verbs::DmabufMemory::fd(&*landing)
+            .try_clone_to_owned()
+            .unwrap(),
+    );
+    file.read_exact_at(&mut bytes, device.offset()).unwrap();
+    assert_eq!(bytes, [0x6b; 35]);
+    let landed = crate::gpu::LandedCiphertext::new(&landing, device).unwrap();
+    assert_eq!((landed.ordinal(), landed.len()), (0, 35));
+    // The host pool was not used.
+    assert_eq!(w.a.links.buffers(RAIL, BufferState::Free), Some(2));
+    drop(landed);
+    pump!(w);
+    let again = drive!(
+        w,
+        w.a.links
+            .grant_landing(&b, RAIL, TransferId([5; 16]), 0, &scope)
+    )
+    .unwrap();
+    let header = STANDARD.decode(again.header_value()).unwrap();
+    let grant = AuthenticatedGrant::decode(&header, RAIL, TransferId([5; 16])).unwrap();
+    w.b.links.release(&a, &grant);
+    assert!(matches!(
+        drive!(w, poll_fn(|cx| again.arrival.poll(cx))),
+        Ok(Arrival::Released)
+    ));
+    // Closing the node forgets the landing buffer for the next round.
+    w.a.links.close();
+    assert_eq!(w.a.links.landing_ordinal(RAIL), None);
+}
+
+#[test]
+/// No usable landing: too little memory, no GPU, or a failed registration
+/// leaves the rail host-only.
+fn landing_failures_leave_rails_host_only() {
+    let helper = crate::gpu::testing::helper(&[None]);
+    let mut w = world();
+    attach_landing(&mut w, &helper, (BUFFER_LEN as u64) / 2);
+    assert_eq!(w.a.links.landing_ordinal(RAIL), None);
+    attach_landing(&mut w, &helper, 0);
+    assert_eq!(w.a.links.landing_ordinal(RAIL), None);
+    w._sim.fault(
+        rdma_verbs::simulation::Operation::RegisterDmabuf,
+        rdma_verbs::simulation::Fault::Reject,
+    );
+    let bytes = (BUFFER_LEN as u64).next_multiple_of(crate::config::GPU_STAGING_UNIT);
+    attach_landing(&mut w, &helper, bytes);
+    assert_eq!(w.a.links.landing_ordinal(RAIL), None);
+    // Registration works on the next try, reusing the same GPU buffer.
+    attach_landing(&mut w, &helper, bytes);
+    assert_eq!(w.a.links.landing_ordinal(RAIL), Some(0));
+}

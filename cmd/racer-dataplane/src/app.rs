@@ -288,6 +288,17 @@ impl Application {
         self.node.inventory.update(self.discovered_nics.clone())?;
         Arc::get_mut(&mut self.node).ok_or(Error::Internal)?.gpu =
             crate::gpu::GpuHelper::start(self.config.enable_gpu, self.config.gpu_staging_bytes)?;
+        // GPU decrypt and RDMA together: peers' NICs may write gpu-read pages
+        // straight into GPU landing buffers (GPUDirect RDMA). Activation
+        // registers them per rail and leaves a rail host-only on any failure.
+        if self.config.enable_rdma
+            && let Some(gpu) = &self.node.gpu
+        {
+            self.node
+                .native
+                .link_node()
+                .set_gpu_landing(gpu.clone(), self.config.gpu_landing_bytes);
+        }
         if self.config.enable_rdma {
             self.node.native.place(&plan)?;
             self.node
