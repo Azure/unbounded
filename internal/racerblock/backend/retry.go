@@ -88,11 +88,35 @@ func (l *logLimiter) allow(key string) bool {
 	return true
 }
 
-// refreshWarm renews Racer retention about every WarmTTL/2 until Close.
-func (b *Backend) refreshWarm() {
-	interval := max(b.cfg.WarmTTL/2, time.Millisecond)
+// minWarmRetry is the shortest delay between warm renewals, so that a grant
+// close to expiry or a run of failures never makes the loop spin.
+const minWarmRetry = time.Second
 
-	t := time.NewTicker(interval)
+// nextWarm returns the delay before the next warm renewal.
+//
+// While retainUntil is in the future, the delay is half the time left, so a
+// renewal happens well before the grant runs out even when Racer granted less
+// than WarmTTL. Without a valid grant, because Racer refused retention, the
+// grant expired, or no renewal has succeeded yet, the delay falls back to
+// WarmTTL/2. Either way the delay is at most WarmTTL/2 and at least
+// min(minWarmRetry, WarmTTL/2), and never below 1 ms.
+func nextWarm(now, retainUntil time.Time, ttl time.Duration) time.Duration {
+	d := ttl / 2
+	if left := retainUntil.Sub(now); !retainUntil.IsZero() && left > 0 {
+		d = min(d, left/2)
+	}
+
+	return max(d, min(minWarmRetry, ttl/2), time.Millisecond)
+}
+
+// refreshWarm renews Racer retention until Close. retainUntil is the
+// deadline granted at Open, or zero if Racer refused retention. Each renewal
+// is scheduled from the latest deadline Racer has granted and from the time
+// the previous response arrived, see nextWarm. A refused (zero) or already
+// expired grant, or an error, does not replace a previous deadline that is
+// still in the future, since Racer keeps an existing hold until it expires.
+func (b *Backend) refreshWarm(retainUntil time.Time) {
+	t := time.NewTimer(nextWarm(time.Now(), retainUntil, b.cfg.WarmTTL))
 	defer t.Stop()
 
 	for {
@@ -102,18 +126,39 @@ func (b *Backend) refreshWarm() {
 		case <-t.C:
 		}
 
-		_, err := b.src.Warm(b.ctx, b.cfg.WarmTTL, b.etag)
-		if err == nil || b.ctx.Err() != nil {
-			continue
+		res, err := b.src.Warm(b.ctx, b.cfg.WarmTTL, b.etag)
+		if b.ctx.Err() != nil {
+			return
 		}
 
-		if b.limiter.allow("warm: " + err.Error()) {
-			level := slog.LevelWarn
-			if !retryable(err) {
-				level = slog.LevelError
-			}
+		now := time.Now()
 
-			b.log.Log(b.ctx, level, "racer warm refresh failed", "etag", b.etag, "error", err)
+		switch {
+		case err != nil:
+			b.logWarmError(err)
+		case res.RetainUntil.After(retainUntil):
+			retainUntil = res.RetainUntil
+		case res.RetainUntil.IsZero() && b.limiter.allow("warm: refused"):
+			b.log.Warn("racer refused warm retention", "etag", b.etag)
 		}
+
+		if !retainUntil.After(now) {
+			retainUntil = time.Time{}
+		}
+
+		t.Reset(nextWarm(now, retainUntil, b.cfg.WarmTTL))
 	}
+}
+
+func (b *Backend) logWarmError(err error) {
+	if !b.limiter.allow("warm: " + err.Error()) {
+		return
+	}
+
+	level := slog.LevelWarn
+	if !retryable(err) {
+		level = slog.LevelError
+	}
+
+	b.log.Log(b.ctx, level, "racer warm refresh failed", "etag", b.etag, "error", err)
 }

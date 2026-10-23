@@ -21,6 +21,7 @@ import (
 	"math"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Azure/unbounded/pkg/racersdk"
 )
@@ -109,7 +110,7 @@ func Open(ctx context.Context, src Source, cfg Config) (*Backend, error) {
 		return nil, fmt.Errorf("racerblock backend: config: %w", err)
 	}
 
-	md, err := pin(ctx, src, cfg)
+	md, retainUntil, err := pin(ctx, src, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("racerblock backend: open: %w", err)
 	}
@@ -141,43 +142,46 @@ func Open(ctx context.Context, src Source, cfg Config) (*Backend, error) {
 	b.limiter.last = make(map[string]int64)
 
 	if cfg.WarmTTL > 0 {
-		b.wg.Go(b.refreshWarm)
+		b.wg.Go(func() { b.refreshWarm(retainUntil) })
 	}
 
 	return b, nil
 }
 
-func pin(ctx context.Context, src Source, cfg Config) (racersdk.Metadata, error) {
+// pin returns the pinned metadata and, with WarmTTL > 0, the retention
+// deadline Racer granted at Open. A zero deadline means Racer refused to
+// retain the object.
+func pin(ctx context.Context, src Source, cfg Config) (racersdk.Metadata, time.Time, error) {
 	if cfg.WarmTTL > 0 {
 		res, err := src.Warm(ctx, cfg.WarmTTL, cfg.ETag)
 		if err != nil {
-			return racersdk.Metadata{}, fmt.Errorf("warm: %w", err)
+			return racersdk.Metadata{}, time.Time{}, fmt.Errorf("warm: %w", err)
 		}
 
-		return res.Metadata, nil
+		return res.Metadata, res.RetainUntil, nil
 	}
 
 	md, err := src.Stat(ctx)
 	if err != nil {
-		return racersdk.Metadata{}, fmt.Errorf("stat: %w", err)
+		return racersdk.Metadata{}, time.Time{}, fmt.Errorf("stat: %w", err)
 	}
 
 	if cfg.ETag == "" || md.ETag == cfg.ETag {
-		return md, nil
+		return md, time.Time{}, nil
 	}
 
 	r, err := src.Open(ctx, 0, 1, cfg.ETag)
 	if err != nil {
-		return racersdk.Metadata{}, fmt.Errorf("verify pinned ETag %q: %w", cfg.ETag, err)
+		return racersdk.Metadata{}, time.Time{}, fmt.Errorf("verify pinned ETag %q: %w", cfg.ETag, err)
 	}
 	defer r.Close() //nolint:errcheck // Only the metadata matters.
 
 	mr, ok := r.(MetadataReader)
 	if !ok {
-		return racersdk.Metadata{}, fmt.Errorf("verify pinned ETag %q: source does not report metadata", cfg.ETag)
+		return racersdk.Metadata{}, time.Time{}, fmt.Errorf("verify pinned ETag %q: source does not report metadata", cfg.ETag)
 	}
 
-	return mr.Metadata(), nil
+	return mr.Metadata(), time.Time{}, nil
 }
 
 // Size returns the object length.
