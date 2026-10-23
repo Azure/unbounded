@@ -37,13 +37,17 @@ type ClusterCacheSpec struct {
 	// +optional
 	Origin *ObjectOrigin `json:"origin,omitempty"`
 
-	// Priority is the relative weight used to share node cache capacity, both
-	// disk and memory, among ClusterCaches. Each cache's fair share is
-	// proportional to its priority divided by the sum of the priorities of all
-	// published caches. Caches that use more than their share are evicted
-	// first. A priority of 0 grants no guaranteed share, but the cache is
-	// still served best-effort while capacity is idle. When unset, the
-	// priority is 500. Priority may be changed at any time.
+	// Priority is the relative weight used to share node cache capacity among
+	// ClusterCaches. Disk shares are weighted across published caches, plus any
+	// unpublished caches that still hold data on the node, which count at the
+	// default weight. Memory shares are weighted across caches that are
+	// actively using memory, and each cache also gets a bounded working
+	// allowance from shared memory. Eviction prefers data from caches that use
+	// more than their share, within bounded scans. A priority of 0 gets no
+	// weighted share while caches with positive priority compete, but it keeps
+	// its working allowance. If every counted cache has priority 0, they share
+	// equally. When unset, the priority is 500. Priority may be changed at any
+	// time.
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=1000
 	// +optional
