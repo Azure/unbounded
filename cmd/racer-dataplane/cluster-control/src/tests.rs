@@ -699,3 +699,83 @@ fn start_and_shutdown_are_bounded_without_an_api() {
     assert!(crate::start(config).is_err());
     assert!(started.elapsed() < Duration::from_secs(5));
 }
+
+/// `start` binds the webhook on both Pod IP families at one port, and each
+/// serves the seat's published webhook certificate under the Service DNS
+/// name, as the API server verifies it.
+#[test]
+fn start_serves_the_webhook_on_both_pod_ip_families() {
+    let cluster = FakeCluster::start(1);
+    let mut config = cluster.config(1);
+    // Ephemeral ports differ per bind; use one port free on both families.
+    let port = loop {
+        let v4 = std::net::TcpListener::bind("127.0.0.2:0").unwrap();
+        let port = v4.local_addr().unwrap().port();
+        if std::net::TcpListener::bind(("::1", port)).is_ok() {
+            break port;
+        }
+    };
+    config.webhook_listen = std::net::SocketAddr::new(config.pod_ip, port);
+    config.webhook_alternate = Some("::1".parse().unwrap());
+    let h = crate::start(config).unwrap();
+    h.bootstrap(Duration::from_secs(20)).unwrap();
+    let mut published = None;
+    assert!(
+        wait_for(Duration::from_secs(60), || {
+            published = cluster.inspect(async |k| {
+                for seat in 0..annotations::MAX_SEATS {
+                    let path = format!(
+                        "/apis/coordination.k8s.io/v1/namespaces/{NS}/leases/{}",
+                        annotations::seat_lease(seat)
+                    );
+                    let Ok(lease) = k.get(&path).await else {
+                        continue;
+                    };
+                    let a = &lease["metadata"]["annotations"];
+                    if let (Some(ips), Some(ca)) = (
+                        a[annotations::WEBHOOK_ADDRESSES].as_str(),
+                        a[annotations::WEBHOOK_CERTIFICATE].as_str(),
+                    ) {
+                        return Some((ips.to_owned(), STANDARD.decode(ca).unwrap()));
+                    }
+                }
+                None
+            });
+            published.is_some()
+        }),
+        "{:?}",
+        h.diagnostics()
+    );
+    let (ips, ca) = published.unwrap();
+    assert_eq!(ips, "127.0.0.2,::1");
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(ca))
+        .unwrap();
+    let tls = Arc::new(
+        rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth(),
+    );
+    for ip in ips.split(',') {
+        let address = std::net::SocketAddr::new(ip.parse().unwrap(), port);
+        let tls = tls.clone();
+        let status = Executor::new(64).unwrap().block_on(async move {
+            let name =
+                rustls::pki_types::ServerName::try_from(format!("racer-webhook.{NS}.svc")).unwrap();
+            let tcp = Tcp::connect(address).await.unwrap();
+            let mut conn = Conn::new(TlsStream::client(tcp, tls, name).await.unwrap());
+            conn.tls
+                .write_all(&http::request("POST", "x", "/other", &[], b""))
+                .await
+                .unwrap();
+            conn.read_head(false, 4096).await.unwrap().unwrap().status
+        });
+        assert_eq!(status, 404, "{address}");
+    }
+    h.shutdown();
+}

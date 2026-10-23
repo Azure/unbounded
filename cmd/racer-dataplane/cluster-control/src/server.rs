@@ -772,18 +772,8 @@ pub fn block_devices(annotations: &std::collections::BTreeMap<String, String>) -
 /// [`racer_admission::MAX_REQUEST_BYTES`].
 const MAX_ADMISSION_BODIES: usize = 8;
 
-/// Serve the object sidecar admission webhook.
-pub async fn run_webhook(shared: Rc<Shared>, listener: Listener) {
-    run_webhook_with(
-        shared,
-        listener,
-        MAX_ADMISSION_BODIES,
-        limits::IDLE_TIMEOUT,
-        limits::IO_TIMEOUT,
-    )
-    .await
-}
-
+/// One webhook listener with its own budget, for tests.
+#[cfg(test)]
 pub(crate) async fn run_webhook_with(
     shared: Rc<Shared>,
     listener: Listener,
@@ -791,8 +781,57 @@ pub(crate) async fn run_webhook_with(
     idle: Duration,
     io: Duration,
 ) {
-    let slots = Slots::new(limits::MAX_WEBHOOK_CONNECTIONS);
-    let bodies = Slots::new(bodies);
+    let budget = WebhookBudget::new(limits::MAX_WEBHOOK_CONNECTIONS, bodies);
+    serve_webhook(shared, listener, budget, idle, io).await
+}
+
+/// Webhook connection and admission body slots. One budget is shared by
+/// every webhook listener, so serving more than one Pod IP family never
+/// raises the bounds that [`limits`] reserves descriptors and memory for.
+#[derive(Clone)]
+pub(crate) struct WebhookBudget {
+    connections: Slots,
+    bodies: Slots,
+}
+
+impl WebhookBudget {
+    pub(crate) fn new(connections: usize, bodies: usize) -> Self {
+        Self {
+            connections: Slots::new(connections),
+            bodies: Slots::new(bodies),
+        }
+    }
+}
+
+/// Serve the webhook on each listener under one shared budget.
+pub fn spawn_webhooks(
+    shared: &Rc<Shared>,
+    listeners: impl IntoIterator<Item = Listener>,
+) -> Result<(), crate::Error> {
+    let budget = WebhookBudget::new(limits::MAX_WEBHOOK_CONNECTIONS, MAX_ADMISSION_BODIES);
+    for listener in listeners {
+        exec::spawn(serve_webhook(
+            shared.clone(),
+            listener,
+            budget.clone(),
+            limits::IDLE_TIMEOUT,
+            limits::IO_TIMEOUT,
+        ))?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn serve_webhook(
+    shared: Rc<Shared>,
+    listener: Listener,
+    budget: WebhookBudget,
+    idle: Duration,
+    io: Duration,
+) {
+    let WebhookBudget {
+        connections: slots,
+        bodies,
+    } = budget;
     while !shared.stopping.get() {
         let Ok((tcp, _)) = listener.accept().await else {
             exec::sleep(Duration::from_millis(100)).await;
@@ -1520,7 +1559,7 @@ mod tests {
             let v6 = *ips.iter().find(|ip| ip.is_ipv6()).unwrap();
             let listener = Listener::bind(std::net::SocketAddr::new(v6, 0)).unwrap();
             let address = listener.local_addr().unwrap();
-            exec::spawn(run_webhook(shared.clone(), listener)).unwrap();
+            spawn_webhooks(&shared, [listener]).unwrap();
             let mut roots = rustls::RootCertStore::empty();
             roots
                 .add(rustls::pki_types::CertificateDer::from(ca))
@@ -1539,6 +1578,74 @@ mod tests {
             let mut conn = Conn::new(TlsStream::client(tcp, tls, name).await.unwrap());
             conn.tls.write_all(&post_head("/other", 0)).await.unwrap();
             assert_eq!(response(&mut conn).await.0, 404);
+            shared.stopping.set(true);
+        });
+    }
+
+    /// Bind one listener per family, all drawing on `budget`.
+    fn dual_stack_webhooks(
+        shared: &Rc<Shared>,
+        budget: &WebhookBudget,
+    ) -> [std::net::SocketAddr; 2] {
+        [POD_IP, "::1"].map(|ip| {
+            let ip: std::net::IpAddr = ip.parse().unwrap();
+            let listener = Listener::bind(std::net::SocketAddr::new(ip, 0)).unwrap();
+            let address = listener.local_addr().unwrap();
+            exec::spawn(serve_webhook(
+                shared.clone(),
+                listener,
+                budget.clone(),
+                Duration::from_secs(5),
+                Duration::from_millis(800),
+            ))
+            .unwrap();
+            address
+        })
+    }
+
+    /// A connection on one family uses the only connection slot of the
+    /// shared budget; the other family gets none until it is released.
+    #[test]
+    fn webhook_connections_are_capped_across_families() {
+        fake::run(|_, kube| async move {
+            let (shared, pin) = seated(kube);
+            let [v4, v6] = dual_stack_webhooks(&shared, &WebhookBudget::new(1, 1));
+            let held = connect(v4, &pin).await.unwrap();
+            exec::sleep(Duration::from_millis(100)).await;
+            let refused = connect(v6, &pin).await;
+            assert!(refused.is_err() || closed_without_reply(&mut refused.unwrap()).await);
+            drop(held);
+            exec::sleep(Duration::from_millis(100)).await;
+            let mut c = connect(v6, &pin).await.unwrap();
+            c.tls.write_all(&post_head("/other", 0)).await.unwrap();
+            assert_eq!(response(&mut c).await.0, 404);
+            shared.stopping.set(true);
+        });
+    }
+
+    /// An IPv4 request holds the only body permit through its read; a
+    /// complete IPv6 request is refused instead of buffered.
+    #[test]
+    fn webhook_body_permits_are_shared_across_families() {
+        fake::run(|_, kube| async move {
+            let (shared, pin) = seated(kube);
+            let [v4, v6] = dual_stack_webhooks(&shared, &WebhookBudget::new(4, 1));
+            let mut a = connect(v4, &pin).await.unwrap();
+            a.tls
+                .write_all(&post_head(racer_admission::PATH, 100))
+                .await
+                .unwrap();
+            exec::sleep(Duration::from_millis(100)).await;
+            let mut req = post_head(racer_admission::PATH, 2);
+            req.extend_from_slice(b"{}");
+            let mut b = connect(v6, &pin).await.unwrap();
+            b.tls.write_all(&req).await.unwrap();
+            assert_eq!(response(&mut b).await.0, 429);
+            assert!(closed_without_reply(&mut a).await);
+            // The permit returns to the shared budget.
+            let mut c = connect(v6, &pin).await.unwrap();
+            c.tls.write_all(&req).await.unwrap();
+            assert_ne!(response(&mut c).await.0, 429);
             shared.stopping.set(true);
         });
     }

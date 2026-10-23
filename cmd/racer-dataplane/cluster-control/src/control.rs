@@ -196,10 +196,8 @@ fn run(
             ))?;
             exec::spawn(seat::lottery(shared.clone(), primary_changed.clone()))?;
             exec::spawn(server::Server::new(shared.clone()).run(control))?;
-            exec::spawn(server::run_webhook(shared.clone(), webhook))?;
-            if let Some(listener) = webhook_alternate {
-                exec::spawn(server::run_webhook(shared.clone(), listener))?;
-            }
+            // One budget across both Pod IP families.
+            server::spawn_webhooks(&shared, std::iter::once(webhook).chain(webhook_alternate))?;
             exec::spawn(reporter(shared.clone(), outer.clone(), report_signal))?;
             Ok(())
         }

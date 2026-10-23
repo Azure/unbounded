@@ -116,7 +116,12 @@ impl Config {
                 );
             }
         }
-        if !pod_ips.is_empty() && !pod_ips.contains(&pod_ip) {
+        // Kubernetes reports at most one Pod IP per family, primary first.
+        if !pod_ips.is_empty()
+            && (pod_ips[0] != pod_ip
+                || pod_ips.len() > 2
+                || (pod_ips.len() == 2 && pod_ips[0].is_ipv6() == pod_ips[1].is_ipv6()))
+        {
             return Err(Error::InvalidConfiguration);
         }
         let seats = match get("RACER_CONTROL_SEATS").as_deref() {
@@ -326,16 +331,19 @@ mod tests {
             alt("10.0.0.5,fd00::5", webhook),
             Some("fd00::5".parse().unwrap())
         );
-        assert_eq!(
-            alt("fd00::5,10.0.0.5", webhook),
-            Some("fd00::5".parse().unwrap())
-        );
         // Single stack, absent, or not listening on the Pod IP: none.
         assert_eq!(alt("10.0.0.5", webhook), None);
         assert_eq!(alt("", webhook), None);
         assert_eq!(alt("10.0.0.5,fd00::5", "127.0.0.1:9443"), None);
-        // Malformed, or not including status.podIP: rejected.
-        for bad in ["10.0.0.5,nope", "10.0.0.6,fd00::5"] {
+        // Malformed, not led by status.podIP, duplicate, or same family: rejected.
+        for bad in [
+            "10.0.0.5,nope",
+            "10.0.0.6,fd00::5",
+            "fd00::5,10.0.0.5",
+            "10.0.0.5,10.0.0.5",
+            "10.0.0.5,10.0.0.6",
+            "10.0.0.5,fd00::5,fd00::6",
+        ] {
             assert_eq!(c(bad, webhook).unwrap_err(), Error::InvalidConfiguration);
         }
     }
