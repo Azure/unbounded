@@ -119,8 +119,7 @@ func TestOriginCredentialRendering(t *testing.T) {
 			require.Equal(t, owner, ds.OwnerReferences)
 			require.Equal(t, owner, sa.OwnerReferences)
 			require.Equal(t, component.FieldOwner, ds.Annotations[managerAnnotation])
-			require.NotEmpty(t, ds.Annotations[runtimeInstallationAnnotation])
-			require.Equal(t, ds.Annotations[runtimeInstallationAnnotation], sa.Annotations[runtimeInstallationAnnotation])
+			require.Equal(t, component.FieldOwner, sa.Annotations[managerAnnotation])
 			require.False(t, *sa.AutomountServiceAccountToken)
 			require.Equal(t, originAppName, ds.Labels["app.kubernetes.io/component"])
 			require.Equal(t, originAppName, sa.Labels["app.kubernetes.io/component"])
@@ -270,11 +269,11 @@ func TestOriginMultipleCachesAndPruning(t *testing.T) {
 	b, _ := liveOrigin(t, env, "b")
 	require.NotEqual(t, a.Spec.Selector.MatchLabels[originCacheLabel], b.Spec.Selector.MatchLabels[originCacheLabel])
 
-	// An origin of another installation is never pruned.
+	// An origin the operator does not manage is never pruned.
 	foreign := &appsv1.DaemonSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: originName("gone"), Namespace: env.Namespace, Labels: originLabels(),
-			Annotations: map[string]string{managerAnnotation: component.FieldOwner, runtimeInstallationAnnotation: "other"},
+			Annotations: map[string]string{managerAnnotation: "someone-else"},
 		},
 	}
 	require.NoError(t, env.Client.Create(t.Context(), foreign))
@@ -735,7 +734,7 @@ func TestSecretWatchedMatchesReferencedCredentials(t *testing.T) {
 		return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}
 	}
 
-	require.True(t, match(secret(env.Namespace, tlsName)))
+	require.True(t, match(secret(env.Namespace, stateName)))
 	require.True(t, match(secret(env.Namespace, "creds")))
 	require.False(t, match(secret("other", "creds")), "other namespace")
 	require.False(t, match(secret(env.Namespace, "unrelated")))

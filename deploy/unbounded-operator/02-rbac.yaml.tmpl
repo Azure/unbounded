@@ -15,7 +15,8 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: ["policy"]
     resources: ["poddisruptionbudgets"]
-    verbs: ["get", "list", "watch", "create", "patch", "update"]
+    # delete removes the retired racer-controller PDB during migration.
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
   - apiGroups: ["unbounded-cloud.io"]
     resources: ["sites"]
     verbs: ["get", "list", "watch", "create"]
@@ -65,6 +66,11 @@ rules:
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["get"]
+  # Racer creates its empty racer-webhook EndpointSlice once. The Racer
+  # runtime fills it; the operator never updates it.
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["create"]
   - apiGroups: ["apps"]
     resources: ["deployments", "daemonsets"]
     verbs: ["get", "list", "watch", "create", "patch", "update", "delete", "deletecollection"]
@@ -90,6 +96,10 @@ rules:
   - apiGroups: ["admissionregistration.k8s.io"]
     resources: ["validatingwebhookconfigurations", "mutatingwebhookconfigurations", "validatingadmissionpolicies", "validatingadmissionpolicybindings"]
     verbs: ["get", "list", "watch", "create", "patch", "update"]
+  # Removes the retired racer-controller admission policies during migration.
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["validatingadmissionpolicies", "validatingadmissionpolicybindings"]
+    verbs: ["delete"]
   - apiGroups: ["apiregistration.k8s.io"]
     resources: ["apiservices"]
     verbs: ["get", "list", "watch", "create", "patch", "update"]

@@ -6,72 +6,50 @@ package racer
 import (
 	"context"
 	"errors"
+	"strings"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
-	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
-	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	manifests "github.com/Azure/unbounded/deploy/racer"
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
-var guardNames = []string{"racer-node-write-restriction"}
+func decodePolicies(env *component.Env) ([]*unstructured.Unstructured, error) {
+	return env.DecodeManifestFiles(manifests.Manifests, []string{"policies.yaml"}, nil)
+}
 
 func guardPredicate() predicate.Predicate {
 	return predicate.NewPredicateFuncs(func(obj client.Object) bool {
-		for _, name := range guardNames {
-			if obj.GetName() == name {
-				return true
-			}
-		}
-
-		return false
+		return strings.HasPrefix(obj.GetName(), "racer-dataplane-")
 	})
 }
 
-// This is eventual containment, not continuous enforcement. Privileged guard
-// writers remain trusted. Revoke both grants in a separate pass before any
-// repair, even without caches. Keep workloads and durable identity intact;
-// removing these bindings contains their API writes without destroying state.
-// Secret and ConfigMap writes are bounded by RBAC, not an admission guard.
-func planGuardContainment(ctx context.Context, env *component.Env) (*component.Plan, bool, error) {
-	claim := &corev1.ConfigMap{}
-	if err := env.LiveReader().Get(ctx, objectKey(env, claimName), claim); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil, false, nil
-		}
-
-		return nil, false, err
+// dataplaneBindings are the grants the admission policies restrict.
+func dataplaneBindings(env *component.Env) []client.Object {
+	return []client.Object{
+		&rbacv1.RoleBinding{TypeMeta: metav1.TypeMeta{APIVersion: rbacv1.SchemeGroupVersion.String(), Kind: "RoleBinding"}, ObjectMeta: metav1.ObjectMeta{Name: dataplaneName, Namespace: env.Namespace}},
+		&rbacv1.ClusterRoleBinding{TypeMeta: metav1.TypeMeta{APIVersion: rbacv1.SchemeGroupVersion.String(), Kind: "ClusterRoleBinding"}, ObjectMeta: metav1.ObjectMeta{Name: dataplaneName}},
 	}
+}
 
-	if claim.Data["state"] != "consumed" {
-		return nil, false, nil
-	}
+// planContainment returns a plan that revokes the dataplane grants when any
+// admission policy or binding is missing, terminating, or differs from the
+// manifest. It reapplies the policies in the same pass; the grants return on
+// a later pass that reads every policy intact. With no grant to revoke it
+// returns nil, and normal planning orders the policies before the bindings. The executor additionally
+// revokes the grants whenever a policy write fails (RevokeOnDependencyFailure).
+// Containment never touches workloads or runtime state.
+func planContainment(ctx context.Context, env *component.Env, policies []*unstructured.Unstructured) (*component.Plan, error) {
+	healthy := true
 
-	marker, err := claimedMarker(ctx, env, claim)
-	if err != nil {
-		return nil, false, err
-	}
-
-	guards, err := env.DecodeManifestFiles(manifests.Manifests, []string{"node-restriction.yaml"}, nil)
-	if err != nil {
-		return nil, false, err
-	}
-
-	var (
-		unhealthy, terminating bool
-		readErr                error
-	)
-
-	repairs := component.NewPlan()
-
-	for _, guard := range guards {
+	for _, guard := range policies {
 		var expected, current client.Object
 
 		switch guard.GetKind() {
@@ -80,108 +58,78 @@ func planGuardContainment(ctx context.Context, env *component.Env) (*component.P
 		case "ValidatingAdmissionPolicyBinding":
 			expected, current = &admissionv1.ValidatingAdmissionPolicyBinding{}, &admissionv1.ValidatingAdmissionPolicyBinding{}
 		default:
-			return nil, false, errors.New("unexpected admission guard kind")
+			return nil, errors.New("unexpected racer admission guard kind " + guard.GetKind())
 		}
 
 		if err := env.Scheme.Convert(guard, expected, nil); err != nil {
-			return nil, false, err
+			return nil, err
 		}
 
 		err := env.LiveReader().Get(ctx, client.ObjectKeyFromObject(expected), current)
+
 		switch {
 		case apierrors.IsNotFound(err):
-			unhealthy = true
+			healthy = false
 		case err != nil:
-			readErr = errors.Join(readErr, err)
+			return nil, err
 		case current.GetDeletionTimestamp() != nil:
-			unhealthy, terminating = true, true
-		// Compare only specs with API defaults normalized, so persisted defaults do
-		// not cause repeated revocation. Manifest decoding also retargets CEL identity.
+			healthy = false
+		// Compare specs with API defaults normalized so persisted defaults do
+		// not cause repeated revocation.
 		case !equality.Semantic.DeepEqual(component.EffectiveAdmissionSpec(expected), component.EffectiveAdmissionSpec(current)):
-			unhealthy = true
-
-			if err := validateRuntimeOwner(current, marker.UID); err != nil {
-				readErr = errors.Join(readErr, err)
-				continue
-			}
-
-			base := component.ToUnstructured(current)
-			base.SetGroupVersionKind(guard.GroupVersionKind())
-			desired := base.DeepCopy()
-			desired.Object["spec"] = guard.DeepCopy().Object["spec"]
-			repairs.Add(component.Operation{Kind: component.OpMergePatch, Base: base, Object: desired, Component: name})
+			healthy = false
 		}
 	}
 
-	if !unhealthy {
-		return nil, false, readErr
+	if healthy {
+		return nil, nil
 	}
 
-	bindings := []client.Object{
-		&rbacv1.RoleBinding{TypeMeta: metav1.TypeMeta{APIVersion: rbacv1.SchemeGroupVersion.String(), Kind: "RoleBinding"}, ObjectMeta: metav1.ObjectMeta{Name: controllerName, Namespace: env.Namespace}},
-		&rbacv1.ClusterRoleBinding{TypeMeta: metav1.TypeMeta{APIVersion: rbacv1.SchemeGroupVersion.String(), Kind: "ClusterRoleBinding"}, ObjectMeta: metav1.ObjectMeta{Name: controllerName}},
-	}
-	exists := false
+	plan := component.NewPlan()
 
-	for i, obj := range bindings {
+	for _, obj := range dataplaneBindings(env) {
 		current, ok := obj.DeepCopyObject().(client.Object)
 		if !ok {
-			return nil, false, errors.New("binding copy is not a client object")
+			return nil, errors.New("binding copy is not a client object")
 		}
 
 		err := env.LiveReader().Get(ctx, client.ObjectKeyFromObject(obj), current)
-		if err == nil {
-			if err := validateRuntimeOwner(current, marker.UID); err != nil {
-				readErr = errors.Join(readErr, err)
-				continue
-			}
-
-			current.GetObjectKind().SetGroupVersionKind(obj.GetObjectKind().GroupVersionKind())
-			bindings[i] = current
-			exists = true
-		} else if !apierrors.IsNotFound(err) {
-			readErr = errors.Join(readErr, err)
-		}
-	}
-
-	if exists {
-		plan := component.NewPlan()
-
-		for _, obj := range bindings {
-			if obj.GetUID() == "" {
-				continue
-			}
-
-			add(plan, component.OpDelete, obj)
+		if apierrors.IsNotFound(err) {
+			continue
 		}
 
-		// Revoke each verified grant even if another cannot be touched. The next
-		// pass reports remaining errors before any repair or regrant.
-		return plan, true, nil
-	}
-
-	if readErr != nil {
-		return nil, false, readErr
-	}
-
-	if terminating {
-		return component.NewPlan(), true, nil
-	}
-
-	if repairs.Len() > 0 {
-		caches := &racerv1.ClusterCacheList{}
-		if err := env.LiveReader().List(ctx, caches, client.Limit(1)); err != nil {
-			return nil, false, err
+		if err != nil {
+			return nil, err
 		}
 
-		if len(caches.Items) > 0 {
-			// Remove added fields too, then verify live integrity on the next pass.
-			// Applying an omitted field cannot remove another manager's value.
-			return repairs, true, nil
+		// A binding someone else manages is not ours to remove.
+		ok, err = adoptable(ctx, env, current)
+		if err != nil {
+			return nil, err
 		}
+
+		if !ok {
+			continue
+		}
+
+		current.GetObjectKind().SetGroupVersionKind(obj.GetObjectKind().GroupVersionKind())
+		plan.Add(component.Operation{Kind: component.OpDelete, Object: component.ToUnstructured(current), Component: name})
 	}
 
-	// Only a later live read proving both grants absent permits normal planning.
-	// Retained installations do not regrant until caches activate them again.
-	return nil, false, nil
+	if plan.Len() == 0 {
+		// Nothing is granted, so normal planning may write the policies
+		// before the bindings.
+		return nil, nil
+	}
+
+	for _, guard := range policies {
+		op, err := ownedOperation(ctx, env, component.Operation{Kind: component.OpApply, Object: guard.DeepCopy(), Component: name, FailureDomain: "racer-guards"})
+		if err != nil {
+			return nil, err
+		}
+
+		plan.Add(op)
+	}
+
+	return plan, nil
 }
