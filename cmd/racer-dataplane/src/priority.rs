@@ -12,6 +12,8 @@ use std::sync::{Arc, RwLock};
 struct Table {
     weights: HashMap<CacheId, u64>,
     total: u64,
+    /// Bumped on every effective `update`, so derived counts can detect staleness.
+    generation: u64,
 }
 
 /// Cache id to weight. An empty table means no catalog was published yet; then
@@ -33,6 +35,7 @@ impl Weights {
         }
         table.total = next.values().sum();
         table.weights = next;
+        table.generation += 1;
         true
     }
 
@@ -69,6 +72,37 @@ impl Weights {
         }
     }
 
+    /// Count the entries of `extra` absent from the published table, stamped
+    /// with the table generation. Costs one lookup per `extra` entry.
+    pub fn unpublished<'a>(&self, extra: impl IntoIterator<Item = &'a CacheId>) -> Unpublished {
+        let table = self.0.read().unwrap_or_else(|e| e.into_inner());
+        Unpublished {
+            generation: table.generation,
+            count: extra
+                .into_iter()
+                .filter(|cache| !table.weights.contains_key(*cache))
+                .count() as u64,
+        }
+    }
+
+    /// Whether `cache` is published, or `None` when the table changed since
+    /// `generation`. Lets a holder of `Unpublished` adjust its count in O(1).
+    pub fn published_at(&self, cache: &CacheId, generation: u64) -> Option<bool> {
+        let table = self.0.read().unwrap_or_else(|e| e.into_inner());
+        (table.generation == generation).then(|| table.weights.contains_key(cache))
+    }
+
+    /// Basis from a previously counted `Unpublished`, in O(1). `None` when the
+    /// table changed since the count was taken; recount with `unpublished`.
+    pub fn basis_from(&self, unpublished: Unpublished) -> Option<ShareBasis> {
+        let table = self.0.read().unwrap_or_else(|e| e.into_inner());
+        (table.generation == unpublished.generation).then(|| ShareBasis {
+            published: !table.weights.is_empty(),
+            total: table.total + unpublished.count * u64::from(DEFAULT_PRIORITY),
+            members: table.weights.len() as u64 + unpublished.count,
+        })
+    }
+
     /// Fair share of `capacity` for one cache under `basis`, in O(1).
     pub fn share_in(&self, basis: ShareBasis, capacity: u64, cache: &CacheId) -> u64 {
         if !basis.published {
@@ -98,6 +132,14 @@ impl Weights {
     pub fn share(&self, capacity: u64, cache: &CacheId) -> u64 {
         self.shares(capacity, [cache])[0]
     }
+}
+
+/// Number of member caches absent from the published table, valid for one
+/// table generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Unpublished {
+    pub generation: u64,
+    pub count: u64,
 }
 
 /// Denominator of one share computation: summed weight and member count.
@@ -183,5 +225,30 @@ mod tests {
         let basis = weights.basis([&ids[1]]);
         assert_eq!(weights.share_in(basis, 1000, &ids[0]), 0);
         assert_eq!(weights.share_in(basis, 1000, &ids[1]), 1000);
+    }
+
+    #[test]
+    fn basis_from_tracks_generation_and_matches_basis() {
+        let weights = Weights::default();
+        let ids: Vec<CacheId> = ["a", "b", "c"].map(|n| CacheId(n.into())).to_vec();
+        let empty = weights.unpublished(&ids);
+        assert_eq!(empty.count, 3);
+        assert_eq!(weights.basis_from(empty), Some(weights.basis(&ids)));
+        assert_eq!(weights.published_at(&ids[0], empty.generation), Some(false));
+        assert!(weights.update(&[cache("a", 900), cache("b", 100)]));
+        // Stale counts are refused rather than silently reused.
+        assert_eq!(weights.basis_from(empty), None);
+        assert_eq!(weights.published_at(&ids[0], empty.generation), None);
+        let fresh = weights.unpublished(&ids);
+        assert_eq!(fresh.count, 1);
+        assert_eq!(weights.basis_from(fresh), Some(weights.basis(&ids)));
+        assert_eq!(weights.published_at(&ids[0], fresh.generation), Some(true));
+        assert_eq!(weights.published_at(&ids[2], fresh.generation), Some(false));
+        // An identical update is not a change and keeps counts valid.
+        assert!(!weights.update(&[cache("a", 900), cache("b", 100)]));
+        assert_eq!(weights.basis_from(fresh), Some(weights.basis(&ids)));
+        // A priority-only change still invalidates.
+        assert!(weights.update(&[cache("a", 1), cache("b", 100)]));
+        assert_eq!(weights.basis_from(fresh), None);
     }
 }

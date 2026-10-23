@@ -2,7 +2,7 @@
 //! state; Bloom approximation applies ONLY to whether a page was seen previously.
 use crate::error::{Error, Result};
 use crate::model::PageId;
-use crate::priority::{ShareBasis, Weights};
+use crate::priority::{ShareBasis, Unpublished, Weights};
 use crate::runtime::HashMap;
 use page_alloc::retention::{Heat, SecondSight};
 use racer_control_wire::CacheId;
@@ -74,6 +74,8 @@ impl Drop for Payload {
             *used -= self.bytes;
             if *used == 0 {
                 caches.remove(cache);
+                drop(caches);
+                self.retention.member_changed(cache, false);
             }
         }
     }
@@ -87,7 +89,8 @@ pub(crate) const MAX_SCORE: u8 = 4;
 /// One eviction or ordering pass. Ownership and time are pinned when the pass
 /// starts. Over-share classification is computed lazily per candidate cache
 /// and memoized for the rest of the pass, so a pass never walks the published
-/// catalog: the share basis scans only caches holding resident payload.
+/// catalog: the share basis is O(1) between catalog changes, and a catalog
+/// change triggers one recount over caches holding resident payload.
 pub(crate) struct Scoring<'a> {
     retention: &'a Retention,
     ownership: Ownership,
@@ -186,6 +189,14 @@ pub struct Retention {
     cache_bytes: RefCell<HashMap<CacheId, u64>>,
 
     weights: RefCell<Weights>,
+
+    /// Resident caches absent from the published table. Adjusted in O(1) when
+    /// a cache gains or loses its last resident byte; recounted over
+    /// `cache_bytes` only after the table changes or is replaced.
+    unpublished: Cell<Option<Unpublished>>,
+
+    /// Full recounts of `unpublished`, for complexity regression tests.
+    basis_scans: Cell<u64>,
 }
 struct State {
     history: SecondSight,
@@ -216,6 +227,8 @@ impl Retention {
             indexed_payload_bytes: Cell::new(0),
             cache_bytes: RefCell::default(),
             weights: RefCell::default(),
+            unpublished: Cell::new(None),
+            basis_scans: Cell::new(0),
         })
     }
     pub fn set_ownership(&self, classify: Ownership) {
@@ -228,6 +241,7 @@ impl Retention {
     /// Share caches' disk capacity by the published priority weights.
     pub fn set_weights(&self, weights: Weights) {
         *self.weights.borrow_mut() = weights;
+        self.unpublished.set(None);
     }
     pub fn weights(&self) -> Weights {
         self.weights.borrow().clone()
@@ -250,10 +264,42 @@ impl Retention {
     }
     /// Share basis over the published catalog plus every cache that still
     /// holds indexed payload, matching the member set of `cache_disk`.
+    /// O(1) unless the published table changed since the last call.
     fn share_basis(&self) -> ShareBasis {
-        self.weights
+        let weights = self.weights.borrow();
+        if let Some(basis) = self.unpublished.get().and_then(|u| weights.basis_from(u)) {
+            return basis;
+        }
+        loop {
+            self.basis_scans.set(self.basis_scans.get() + 1);
+            let counted = weights.unpublished(self.cache_bytes.borrow().keys());
+            self.unpublished.set(Some(counted));
+            // A concurrent catalog update between the count and here recounts.
+            if let Some(basis) = weights.basis_from(counted) {
+                return basis;
+            }
+        }
+    }
+    /// Adjust the unpublished count when `cache` joins or leaves the resident
+    /// set. A stale count is dropped and recounted lazily.
+    fn member_changed(&self, cache: &CacheId, joined: bool) {
+        let Some(mut counted) = self.unpublished.get() else {
+            return;
+        };
+        match self
+            .weights
             .borrow()
-            .basis(self.cache_bytes.borrow().keys())
+            .published_at(cache, counted.generation)
+        {
+            Some(true) => {}
+            Some(false) if joined => counted.count += 1,
+            Some(false) => counted.count -= 1,
+            None => {
+                self.unpublished.set(None);
+                return;
+            }
+        }
+        self.unpublished.set(Some(counted));
     }
     /// Indexed payload bytes currently charged to one cache.
     pub fn cache_payload_bytes(&self, cache: &CacheId) -> u64 {
@@ -403,11 +449,15 @@ impl Retention {
     /// Charge one index mapping's payload to the aggregate and its cache.
     pub(crate) fn indexed_payload(self: &Rc<Self>, cache: &CacheId, bytes: u64) -> Payload {
         let mut payload = self.payload(bytes, true);
-        *self
-            .cache_bytes
-            .borrow_mut()
-            .entry(cache.clone())
-            .or_default() += bytes;
+        let joined = {
+            let mut caches = self.cache_bytes.borrow_mut();
+            let joined = !caches.contains_key(cache);
+            *caches.entry(cache.clone()).or_default() += bytes;
+            joined
+        };
+        if joined {
+            self.member_changed(cache, true);
+        }
         payload.cache = Some(cache.clone());
         payload
     }
@@ -515,6 +565,98 @@ mod tests {
                 assert_eq!(policy.scoring_at(now, capacity).any_over_share(), any);
             }
         }
+    }
+    #[test]
+    fn share_basis_is_incremental_across_passes_and_membership_changes() {
+        use racer_control_wire::CacheDefinition;
+        let clock = uring_runtime::environment::SimulationClock::new(53);
+        let _environment = clock.environment(0).enter();
+        let policy = Rc::new(Retention::new(4096, 1).unwrap());
+        let id = |n: &str| CacheId(n.into());
+        let def = |n: &str, priority: u16| CacheDefinition {
+            id: id(n),
+            name: n.into(),
+            client_socket: "/client".into(),
+            origin_socket: "/origin".into(),
+            priority,
+        };
+        // Reference: a fresh full count over the current resident set.
+        let check = |policy: &Retention| {
+            let expected = policy.weights().basis(policy.cache_bytes.borrow().keys());
+            assert_eq!(policy.share_basis(), expected);
+        };
+        let now = uring_runtime::environment::now();
+        // Many resident caches, all published: passes must not rescan.
+        let names: Vec<String> = (0..64).map(|n| format!("c{n}")).collect();
+        let held: Vec<_> = names
+            .iter()
+            .map(|n| policy.indexed_payload(&id(n), 10))
+            .collect();
+        let table: Vec<_> = names.iter().map(|n| def(n, 10)).collect();
+        policy.weights().update(&table);
+        check(&policy);
+        let scans = policy.basis_scans.get();
+        for _ in 0..1000 {
+            let scoring = policy.scoring_at(now, 100);
+            assert!(scoring.any_over_share());
+            assert!(policy.over_share(&id("c0"), 100));
+        }
+        assert_eq!(
+            policy.basis_scans.get(),
+            scans,
+            "steady state must not rescan"
+        );
+        // Add, drop, re-add an unpublished cache: tracked without rescans.
+        let u = policy.indexed_payload(&id("u"), 5);
+        check(&policy);
+        let second = policy.indexed_payload(&id("u"), 5);
+        check(&policy);
+        drop(u);
+        check(&policy);
+        drop(second);
+        check(&policy);
+        let u = policy.indexed_payload(&id("u"), 5);
+        check(&policy);
+        // Published cache leaving and rejoining does not move the count.
+        drop(held);
+        check(&policy);
+        let back = policy.indexed_payload(&id("c1"), 10);
+        check(&policy);
+        assert_eq!(
+            policy.basis_scans.get(),
+            scans,
+            "membership changes are O(1)"
+        );
+        // Catalog update: exactly one recount, then incremental again.
+        policy.weights().update(&[def("u", 1)]);
+        check(&policy);
+        assert_eq!(policy.basis_scans.get(), scans + 1);
+        drop(u);
+        check(&policy);
+        drop(back);
+        check(&policy);
+        // Unchanged update keeps the count; a published cache removed by the
+        // catalog while resident is counted as unpublished after recount.
+        let c1 = policy.indexed_payload(&id("c1"), 10);
+        policy.weights().update(&[def("u", 1)]);
+        check(&policy);
+        assert_eq!(policy.basis_scans.get(), scans + 1);
+        policy.weights().update(&[]);
+        check(&policy);
+        // Membership change with a stale count is dropped, then recounted.
+        policy.weights().update(&[def("c1", 3)]);
+        let u = policy.indexed_payload(&id("u"), 1);
+        check(&policy);
+        drop(c1);
+        drop(u);
+        check(&policy);
+        // Replacing the table handle invalidates even at equal generation.
+        let other = Weights::default();
+        other.update(&[def("x", 1)]);
+        let _y = policy.indexed_payload(&id("y"), 1);
+        check(&policy);
+        policy.set_weights(other);
+        check(&policy);
     }
     #[test]
     fn scoring_pass_pins_ownership_and_time_and_replacement_clears_factory() {
