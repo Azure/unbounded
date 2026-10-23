@@ -1,40 +1,26 @@
 //! In-memory Kubernetes API server for tests.
 //!
-//! It stores JSON objects by path and supports GET, list, PUT with
-//! resourceVersion CAS, POST, merge PATCH, JSON PATCH (add, replace, remove,
-//! test), watch, `metadata.name` field selectors, and fault injection.
+//! It serves a plain-value [`crate::apiserver::Store`] (GET, list, PUT with
+//! resourceVersion CAS, POST, merge and JSON PATCH, watch, field selectors,
+//! fault injection) over TLS on loopback.
 
 use super::{Kube, KubeConfig};
 use crate::{
+    apiserver::{Store, field_name},
     exec::{self, Executor, Listener, Signal},
     http::{self, Conn, TlsStream},
-    kube::str_at,
 };
 use serde_json::{Value, json};
-use std::{
-    cell::{Cell, RefCell},
-    collections::BTreeMap,
-    future::Future,
-    rc::Rc,
-    sync::Arc,
-};
+use std::{cell::RefCell, future::Future, rc::Rc, sync::Arc};
 
-type Hook = Box<dyn Fn(&str, &Value) -> Option<(u16, Value)>>;
-
-/// Shared fake server state.
+/// Shared fake server state: a [`Store`] plus wakeups and test hooks.
 #[derive(Clone)]
 pub struct FakeApi(Rc<Inner>);
 
 struct Inner {
-    objects: RefCell<BTreeMap<String, Value>>,
-    log: RefCell<Vec<(u64, String, String, Value)>>,
-    version: Cell<u64>,
-    compacted: Cell<u64>,
+    store: RefCell<Store>,
     changed: Signal,
-    post_hook: RefCell<Option<Hook>>,
-    fail_next: RefCell<Vec<u16>>,
     requests: RefCell<Vec<(String, String)>>,
-    pub(crate) uids: Cell<u64>,
     counter: RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>>,
     put_delay: RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicU64>>>,
 }
@@ -42,15 +28,9 @@ struct Inner {
 impl FakeApi {
     pub fn new() -> Self {
         Self(Rc::new(Inner {
-            objects: RefCell::new(BTreeMap::new()),
-            log: RefCell::new(Vec::new()),
-            version: Cell::new(10),
-            compacted: Cell::new(0),
+            store: RefCell::new(Store::new()),
             changed: Signal::default(),
-            post_hook: RefCell::new(None),
-            fail_next: RefCell::new(Vec::new()),
             requests: RefCell::new(Vec::new()),
-            uids: Cell::new(1),
             counter: RefCell::new(None),
             put_delay: RefCell::new(None),
         }))
@@ -78,85 +58,43 @@ impl FakeApi {
         std::time::Duration::from_millis(ms)
     }
 
-    fn bump(&self) -> u64 {
-        let v = self.0.version.get() + 1;
-        self.0.version.set(v);
-        v
-    }
-
     /// Store an object, set its resourceVersion and a UID if missing.
-    pub fn put_object(&self, path: &str, mut object: Value) -> Value {
-        let v = self.bump();
-        let existed = self.0.objects.borrow().contains_key(path);
-        object["metadata"]["resourceVersion"] = v.to_string().into();
-        if str_at(&object, &["metadata", "uid"]).is_empty() {
-            let n = self.0.uids.get();
-            self.0.uids.set(n + 1);
-            object["metadata"]["uid"] = format!("00000000-0000-4000-8000-{n:012x}").into();
-        }
-        if str_at(&object, &["metadata", "name"]).is_empty() {
-            object["metadata"]["name"] = path.rsplit('/').next().unwrap_or_default().into();
-        }
-        self.0
-            .objects
-            .borrow_mut()
-            .insert(path.into(), object.clone());
-        let kind = if existed { "MODIFIED" } else { "ADDED" };
-        self.0
-            .log
-            .borrow_mut()
-            .push((v, path.into(), kind.into(), object.clone()));
+    pub fn put_object(&self, path: &str, object: Value) -> Value {
+        let o = self.0.store.borrow_mut().put_object(path, object);
         self.0.changed.notify();
-        object
+        o
     }
 
     #[allow(dead_code)]
     pub fn delete_object(&self, path: &str) {
-        if let Some(o) = self.0.objects.borrow_mut().remove(path) {
-            let v = self.bump();
-            self.0
-                .log
-                .borrow_mut()
-                .push((v, path.into(), "DELETED".into(), o));
+        if self.0.store.borrow_mut().delete_object(path).is_some() {
             self.0.changed.notify();
         }
     }
 
     pub fn object(&self, path: &str) -> Option<Value> {
-        self.0.objects.borrow().get(path).cloned()
+        self.0.store.borrow().object(path).cloned()
     }
 
     /// Forget watch history so older resourceVersions get 410.
     pub fn compact(&self) {
-        self.0.compacted.set(self.0.version.get());
+        self.0.store.borrow_mut().compact();
     }
 
     /// Handle POSTs, for example TokenReview.
     pub fn on_post(&self, hook: impl Fn(&str, &Value) -> Option<(u16, Value)> + 'static) {
-        *self.0.post_hook.borrow_mut() = Some(Box::new(hook));
+        self.0.store.borrow_mut().on_post(hook);
     }
 
     /// Fail the next requests with these statuses.
     #[allow(dead_code)]
     pub fn fail_next(&self, statuses: &[u16]) {
-        self.0.fail_next.borrow_mut().extend_from_slice(statuses);
+        self.0.store.borrow_mut().fail_next(statuses);
     }
 
     /// Requests seen, as (method, target).
     pub fn requests(&self) -> Vec<(String, String)> {
         self.0.requests.borrow().clone()
-    }
-
-    fn list(&self, collection: &str, name: Option<&str>) -> Vec<Value> {
-        let prefix = format!("{collection}/");
-        self.0
-            .objects
-            .borrow()
-            .iter()
-            .filter(|(k, _)| k.starts_with(&prefix) && !k[prefix.len()..].contains('/'))
-            .filter(|(_, v)| name.is_none_or(|n| str_at(v, &["metadata", "name"]) == n))
-            .map(|(_, v)| v.clone())
-            .collect()
     }
 
     fn handle(&self, method: &str, target: &str, body: &[u8]) -> (u16, Value) {
@@ -167,91 +105,11 @@ impl FakeApi {
         if let Some(c) = self.0.counter.borrow().as_ref() {
             c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
-        if let Some(s) = {
-            let mut f = self.0.fail_next.borrow_mut();
-            (!f.is_empty()).then(|| f.remove(0))
-        } {
-            return (s, json!({"kind":"Status","code":s}));
+        let (status, value, _) = self.0.store.borrow_mut().handle(method, target, body, 0);
+        if (200..300).contains(&status) && method != "GET" {
+            self.0.changed.notify();
         }
-        let (path, query) = http::split_target(target);
-        let name = field_name(query.unwrap_or(""));
-        let request: Value = if body.is_empty() {
-            Value::Null
-        } else {
-            match serde_json::from_slice(body) {
-                Ok(v) => v,
-                Err(_) => return (400, json!({})),
-            }
-        };
-        match method {
-            "GET" => {
-                if let Some(o) = self.object(path) {
-                    return (200, o);
-                }
-                let items = self.list(path, name.as_deref());
-                if items.is_empty() && !self.is_collection(path) {
-                    return (404, json!({"code":404}));
-                }
-                (
-                    200,
-                    json!({"metadata":{"resourceVersion":self.0.version.get().to_string()},"items":items}),
-                )
-            }
-            "PUT" => {
-                let Some(current) = self.object(path) else {
-                    return (404, json!({}));
-                };
-                let rv = str_at(&request, &["metadata", "resourceVersion"]);
-                if rv != str_at(&current, &["metadata", "resourceVersion"]) {
-                    return (409, json!({"code":409}));
-                }
-                let mut next = request.clone();
-                next["metadata"]["uid"] = current["metadata"]["uid"].clone();
-                (200, self.put_object(path, next))
-            }
-            "POST" => {
-                if let Some(r) = self
-                    .0
-                    .post_hook
-                    .borrow()
-                    .as_ref()
-                    .and_then(|h| h(path, &request))
-                {
-                    return r;
-                }
-                let name = str_at(&request, &["metadata", "name"]).to_owned();
-                let full = format!("{path}/{name}");
-                if name.is_empty() || self.object(&full).is_some() {
-                    return (409, json!({}));
-                }
-                (201, self.put_object(&full, request))
-            }
-            "PATCH" => {
-                let Some(mut current) = self.object(path) else {
-                    return (404, json!({}));
-                };
-                if request.is_array() {
-                    if let Err(s) = json_patch(&mut current, &request) {
-                        return (s, json!({}));
-                    }
-                } else {
-                    merge(&mut current, &request);
-                }
-                (200, self.put_object(path, current))
-            }
-            "DELETE" => match self.object(path) {
-                Some(o) => {
-                    self.delete_object(path);
-                    (200, o)
-                }
-                None => (404, json!({"code":404})),
-            },
-            _ => (405, json!({})),
-        }
-    }
-
-    fn is_collection(&self, path: &str) -> bool {
-        path.ends_with('s')
+        (status, value)
     }
 
     async fn serve_watch(&self, conn: &mut Conn, path: &str, query: &str) {
@@ -273,116 +131,39 @@ impl FakeApi {
             out.extend(b"\r\n");
             out
         };
-        if from < self.0.compacted.get() {
-            let _ = conn
-                .tls
-                .write_all(&send(
-                    json!({"type":"ERROR","object":{"kind":"Status","code":410}}),
-                ))
-                .await;
-            let _ = conn.tls.write_all(b"0\r\n\r\n").await;
-            return;
-        }
         let mut seen = from;
-        let prefix = format!("{path}/");
         loop {
             let generation = self.0.changed.generation();
-            let events: Vec<_> = self
+            let events = self
                 .0
-                .log
+                .store
                 .borrow()
-                .iter()
-                .filter(|(v, p, _, o)| {
-                    *v > seen
-                        && p.starts_with(&prefix)
-                        && name
-                            .as_deref()
-                            .is_none_or(|n| str_at(o, &["metadata", "name"]) == n)
-                })
-                .cloned()
-                .collect();
-            for (v, _, kind, object) in events {
-                seen = v;
+                .events_since(path, name.as_deref(), seen);
+            let Ok(events) = events else {
+                let _ = conn
+                    .tls
+                    .write_all(&send(
+                        json!({"type":"ERROR","object":{"kind":"Status","code":410}}),
+                    ))
+                    .await;
+                let _ = conn.tls.write_all(b"0\r\n\r\n").await;
+                return;
+            };
+            for e in events {
+                seen = e.version;
                 if conn
                     .tls
-                    .write_all(&send(json!({"type":kind,"object":object})))
+                    .write_all(&send(json!({"type":e.kind.as_str(),"object":e.object})))
                     .await
                     .is_err()
                 {
                     return;
                 }
             }
-            seen = seen.max(self.0.version.get());
+            seen = seen.max(self.0.store.borrow().version());
             self.0.changed.changed(generation).await;
         }
     }
-}
-
-fn field_name(query: &str) -> Option<String> {
-    query
-        .split('&')
-        .find_map(|kv| {
-            kv.strip_prefix("fieldSelector=metadata.name%3D")
-                .or_else(|| kv.strip_prefix("fieldSelector=metadata.name="))
-        })
-        .map(str::to_owned)
-}
-
-/// RFC 7386 merge patch.
-pub fn merge(target: &mut Value, patch: &Value) {
-    if let Value::Object(p) = patch {
-        if !target.is_object() {
-            *target = json!({});
-        }
-        let t = target.as_object_mut().unwrap();
-        for (k, v) in p {
-            if v.is_null() {
-                t.remove(k);
-            } else {
-                merge(t.entry(k.clone()).or_insert(Value::Null), v);
-            }
-        }
-    } else {
-        *target = patch.clone();
-    }
-}
-
-fn json_patch(target: &mut Value, ops: &Value) -> Result<(), u16> {
-    for op in ops.as_array().ok_or(400u16)? {
-        let path = op["path"].as_str().ok_or(400u16)?;
-        let pointer = path.to_owned();
-        match op["op"].as_str().ok_or(400u16)? {
-            "test" => {
-                if target.pointer(&pointer) != Some(&op["value"]) {
-                    return Err(422);
-                }
-            }
-            "replace" => *target.pointer_mut(&pointer).ok_or(422u16)? = op["value"].clone(),
-            "add" => {
-                let (parent, key) = pointer.rsplit_once('/').ok_or(400u16)?;
-                let key = key.replace("~1", "/").replace("~0", "~");
-                let p = target.pointer_mut(parent).ok_or(422u16)?;
-                match p {
-                    Value::Object(m) => {
-                        m.insert(key, op["value"].clone());
-                    }
-                    Value::Array(a) if key == "-" => a.push(op["value"].clone()),
-                    _ => return Err(422),
-                }
-            }
-            "remove" => {
-                let (parent, key) = pointer.rsplit_once('/').ok_or(400u16)?;
-                let key = key.replace("~1", "/").replace("~0", "~");
-                target
-                    .pointer_mut(parent)
-                    .and_then(Value::as_object_mut)
-                    .and_then(|m| m.remove(&key))
-                    .ok_or(422u16)?;
-            }
-            _ => return Err(400),
-        }
-    }
-    Ok(())
 }
 
 /// Serve the fake API on loopback and return client settings for it.

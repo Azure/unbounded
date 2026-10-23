@@ -37,6 +37,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod annotations;
+pub mod apiserver;
 mod auth;
 mod authority;
 mod config;
