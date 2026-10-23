@@ -7,7 +7,7 @@ pub mod feed;
 pub mod published;
 pub mod rollout;
 
-pub use feed::{Client, Codec, Credentials, FailureClass, Feed, Host, Sync, Target};
+pub use feed::{Client, Codec, Credentials, FailureClass, Feed, Host, Preparing, Sync, Target};
 pub use published::{Generation, Published, Retention};
 pub use rollout::Rollout;
 
