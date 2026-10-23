@@ -1458,7 +1458,7 @@ Apply ServiceAccount/unbounded-system/unbounded-net-kube-proxy
 Apply ClusterRole/unbounded-net-controller
 Apply ClusterRoleBinding/unbounded-net-kube-proxy
 Apply ClusterRoleBinding/unbounded-net-controller
-Apply Role/unbounded-system/unbounded-net-controller
+Apply Role/unbounded-system/unbounded-net-controller [after ValidatingAdmissionPolicy/unbounded-net-node-pod-delete-restriction ValidatingAdmissionPolicyBinding/unbounded-net-node-pod-delete-restriction]
 Apply RoleBinding/unbounded-system/unbounded-net-controller
 Apply Role/kube-system/unbounded-net-controller
 Apply RoleBinding/kube-system/unbounded-net-controller
@@ -1471,12 +1471,20 @@ Apply ValidatingAdmissionPolicy/unbounded-net-create-restriction
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-create-restriction
 Apply ValidatingAdmissionPolicy/unbounded-net-node-field-restriction
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-node-field-restriction
+Apply ValidatingAdmissionPolicy/unbounded-net-gateway-pool-name
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-gateway-pool-name
 Apply ValidatingAdmissionPolicy/unbounded-net-public-ip-annotation-ownership
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-public-ip-annotation-ownership
+Apply ValidatingAdmissionPolicy/unbounded-net-effective-assignment-ownership
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-effective-assignment-ownership
+Apply ValidatingAdmissionPolicy/unbounded-net-node-pod-delete-restriction
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-node-pod-delete-restriction
 Apply ClusterRole/unbounded-net-status-viewer
 Apply ServiceAccount/unbounded-system/unbounded-net-node
 Apply ClusterRole/unbounded-net-node
 Apply ClusterRoleBinding/unbounded-net-node
+Apply Role/unbounded-system/unbounded-net-node [after ValidatingAdmissionPolicy/unbounded-net-effective-assignment-ownership ValidatingAdmissionPolicyBinding/unbounded-net-effective-assignment-ownership]
+Apply RoleBinding/unbounded-system/unbounded-net-node
 Apply DaemonSet/unbounded-system/unbounded-net-node [overridable] [after ConfigMap/unbounded-system/unbounded-net-config]
 `
 
@@ -1511,7 +1519,7 @@ Apply ServiceAccount/unbounded-system/unbounded-net-kube-proxy
 Apply ClusterRole/unbounded-net-controller
 Apply ClusterRoleBinding/unbounded-net-kube-proxy
 Apply ClusterRoleBinding/unbounded-net-controller
-Apply Role/unbounded-system/unbounded-net-controller
+Apply Role/unbounded-system/unbounded-net-controller [after ValidatingAdmissionPolicy/unbounded-net-node-pod-delete-restriction ValidatingAdmissionPolicyBinding/unbounded-net-node-pod-delete-restriction]
 Apply RoleBinding/unbounded-system/unbounded-net-controller
 Apply Role/kube-system/unbounded-net-controller
 Apply RoleBinding/kube-system/unbounded-net-controller
@@ -1521,12 +1529,20 @@ Apply ValidatingAdmissionPolicy/unbounded-net-create-restriction
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-create-restriction
 Apply ValidatingAdmissionPolicy/unbounded-net-node-field-restriction
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-node-field-restriction
+Apply ValidatingAdmissionPolicy/unbounded-net-gateway-pool-name
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-gateway-pool-name
 Apply ValidatingAdmissionPolicy/unbounded-net-public-ip-annotation-ownership
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-public-ip-annotation-ownership
+Apply ValidatingAdmissionPolicy/unbounded-net-effective-assignment-ownership
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-effective-assignment-ownership
+Apply ValidatingAdmissionPolicy/unbounded-net-node-pod-delete-restriction
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-node-pod-delete-restriction
 Apply ClusterRole/unbounded-net-status-viewer
 Apply ServiceAccount/unbounded-system/unbounded-net-node
 Apply ClusterRole/unbounded-net-node
 Apply ClusterRoleBinding/unbounded-net-node
+Apply Role/unbounded-system/unbounded-net-node [after ValidatingAdmissionPolicy/unbounded-net-effective-assignment-ownership ValidatingAdmissionPolicyBinding/unbounded-net-effective-assignment-ownership]
+Apply RoleBinding/unbounded-system/unbounded-net-node
 Apply DaemonSet/unbounded-system/unbounded-net-node [overridable] [after ConfigMap/unbounded-system/unbounded-net-config]
 `
 
@@ -1552,6 +1568,66 @@ Apply DaemonSet/unbounded-system/unbounded-net-node [overridable] [after ConfigM
 // own, and it is the half of the problem the backend gate does not solve:
 // ordering says "after the apply returned", the gate says "after it is
 // serving".
+func TestPodPermissionGrantsRequirePolicies(t *testing.T) {
+	for _, policy := range []string{"unbounded-net-effective-assignment-ownership", "unbounded-net-node-pod-delete-restriction"} {
+		for _, kind := range []string{"ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"} {
+			t.Run(kind+"/"+policy, func(t *testing.T) {
+				env := testEnv(t, servingObjects()...)
+				applied := map[string]bool{}
+				failure := errors.New("policy installation failed")
+				env.Client = interceptor.NewClient(fake.NewClientBuilder().WithScheme(newNetTestScheme(t)).WithObjects(servingObjects()...).Build(), interceptor.Funcs{
+					Apply: func(_ context.Context, _ client.WithWatch, obj runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+						object := obj.(interface {
+							GetName() string
+							GetKind() string
+							GetNamespace() string
+						})
+						key := object.GetKind() + "/" + object.GetName()
+						applied[object.GetKind()+"/"+object.GetNamespace()+"/"+object.GetName()] = true
+
+						if key == kind+"/"+policy {
+							return failure
+						}
+
+						return nil
+					},
+				})
+
+				plan, _, err := (Component{}).Plan(t.Context(), env, site())
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				result, err := env.Execute(t.Context(), plan)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				role := controllerName
+				if policy == "unbounded-net-effective-assignment-ownership" {
+					role = nodeName
+				}
+
+				if applied["Role/"+env.Namespace+"/"+role] {
+					t.Fatal("expanded Role applied despite failed restricting policy or binding")
+				}
+
+				found := false
+
+				for _, op := range result.Results {
+					if errors.Is(op.Err, failure) {
+						found = true
+					}
+				}
+
+				if !found {
+					t.Fatal("policy installation failure was not surfaced")
+				}
+			})
+		}
+	}
+}
+
 func TestExecutionOrderGolden(t *testing.T) {
 	env := testEnv(t, servingObjects()...)
 
@@ -1565,7 +1641,6 @@ Apply ServiceAccount/unbounded-system/unbounded-net-kube-proxy
 Apply ClusterRole/unbounded-net-controller
 Apply ClusterRoleBinding/unbounded-net-kube-proxy
 Apply ClusterRoleBinding/unbounded-net-controller
-Apply Role/unbounded-system/unbounded-net-controller
 Apply RoleBinding/unbounded-system/unbounded-net-controller
 Apply Role/kube-system/unbounded-net-controller
 Apply RoleBinding/kube-system/unbounded-net-controller
@@ -1573,6 +1648,7 @@ Apply ClusterRole/unbounded-net-status-viewer
 Apply ServiceAccount/unbounded-system/unbounded-net-node
 Apply ClusterRole/unbounded-net-node
 Apply ClusterRoleBinding/unbounded-net-node
+Apply RoleBinding/unbounded-system/unbounded-net-node
 CreateIfAbsent ConfigMap/unbounded-system/unbounded-net-config
 Apply Service/unbounded-system/unbounded-net-controller
 Apply Deployment/unbounded-system/unbounded-net-controller
@@ -1584,8 +1660,16 @@ Apply ValidatingAdmissionPolicy/unbounded-net-create-restriction
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-create-restriction
 Apply ValidatingAdmissionPolicy/unbounded-net-node-field-restriction
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-node-field-restriction
+Apply ValidatingAdmissionPolicy/unbounded-net-gateway-pool-name
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-gateway-pool-name
 Apply ValidatingAdmissionPolicy/unbounded-net-public-ip-annotation-ownership
 Apply ValidatingAdmissionPolicyBinding/unbounded-net-public-ip-annotation-ownership
+Apply ValidatingAdmissionPolicy/unbounded-net-effective-assignment-ownership
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-effective-assignment-ownership
+Apply Role/unbounded-system/unbounded-net-node
+Apply ValidatingAdmissionPolicy/unbounded-net-node-pod-delete-restriction
+Apply ValidatingAdmissionPolicyBinding/unbounded-net-node-pod-delete-restriction
+Apply Role/unbounded-system/unbounded-net-controller
 `
 
 	got, err := plan.ExecutionOrder()

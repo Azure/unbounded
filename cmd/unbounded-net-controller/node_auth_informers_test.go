@@ -26,6 +26,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/Azure/unbounded/internal/net/authn"
+	netcontroller "github.com/Azure/unbounded/internal/net/controller"
 )
 
 func nodeAuthObjects() (*corev1.Pod, *corev1.ServiceAccount, *authn.KubernetesServiceAccountIdentity) {
@@ -180,6 +181,11 @@ func TestNodeAuthInformersScopeAndLifecycle(t *testing.T) {
 
 	if _, err := caches.pods.Lister().Pods(pod.Namespace).Get(pod.Name); err != nil {
 		t.Fatal(err)
+	}
+
+	indexed, err := caches.pods.Informer().GetIndexer().ByIndex(netcontroller.NodeAgentPodNodeNameIndex, pod.Spec.NodeName)
+	if err != nil || len(indexed) != 1 || indexed[0].(*corev1.Pod).UID != pod.UID {
+		t.Fatalf("node-agent Pods indexed by Node = %#v, err=%v", indexed, err)
 	}
 
 	if _, err := caches.serviceAccounts.Lister().ServiceAccounts(sa.Namespace).Get(sa.Name); err != nil {
