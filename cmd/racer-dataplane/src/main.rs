@@ -4,7 +4,7 @@
 //! its own bounded thread, and the dataplane waits for its bootstrap before any
 //! worker is assembled. Standalone fixtures set a static endpoint instead.
 
-use racer_dataplane::app::Application;
+use racer_dataplane::app::{Application, StopSignals};
 use racer_dataplane::config::Config;
 use racer_dataplane::control::managed::{BootstrapError, Bootstrapped, ClusterControl};
 use racer_dataplane::error::Error;
@@ -58,6 +58,9 @@ impl ClusterControl for Embedded {
 
 fn run() -> std::result::Result<(), (&'static str, Error)> {
     let mut config = Config::from_env().map_err(|error| ("config", error))?;
+    // Held across cluster bootstrap and the application so SIGTERM/SIGINT stop a
+    // managed bootstrap wait; the application shares, never resets, this state.
+    let signals = StopSignals::install().map_err(|error| ("signals", error))?;
     let control = racer_cluster_control::Config::from_env().map_err(|error| {
         eprintln!("racer-dataplane: stage=cluster-control-config error={error}");
         ("cluster-control-config", Error::InvalidConfiguration)
@@ -73,8 +76,18 @@ fn run() -> std::result::Result<(), (&'static str, Error)> {
             })?;
             let concrete = Arc::new(Embedded(handle));
             let embedded: Arc<dyn ClusterControl> = concrete.clone();
-            racer_dataplane::control::managed::start(&mut config, embedded, &|| false)
-                .map_err(|error| fatal(&concrete, ("cluster-bootstrap", error)))?;
+            match racer_dataplane::control::managed::start(&mut config, embedded, &|| {
+                signals.requested()
+            }) {
+                Ok(()) => {}
+                // A requested stop during bootstrap is a clean exit; dropping the
+                // handle stops embedded control boundedly.
+                Err(Error::Cancelled) if signals.requested() => {
+                    eprintln!("racer-dataplane: stage=cluster-bootstrap stopped by signal");
+                    return Ok(());
+                }
+                Err(error) => return Err(fatal(&concrete, ("cluster-bootstrap", error))),
+            }
             Some(concrete)
         }
         (Some(_), false) => {
@@ -95,7 +108,9 @@ fn run() -> std::result::Result<(), (&'static str, Error)> {
         None => failure,
     };
     let application = Application::assemble(config).map_err(|error| report(("assemble", error)))?;
-    application.run().map_err(|error| report(("run", error)))
+    let result = application.run().map_err(|error| report(("run", error)));
+    drop(signals);
+    result
 }
 
 /// Log payload-free embedded control state for a fatal lifecycle failure.
