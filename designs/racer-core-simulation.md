@@ -179,3 +179,27 @@ Verified against the code at the start of this work.
 ## Known issues
 
 None yet.
+
+## Simulator engine (racer-sim substrate)
+
+`cmd/racer-dataplane/sim` provides the substrate the extracted logic plugs into:
+
+- `engine`: `Engine<E>` event queue ordered by `(time_ns, seq)`, `Streams` (one `SplitMix64` per role and
+  index, so adding a role never shifts another role's sequence), and an order-sensitive `TraceHash`.
+- `resources`: FIFO servers reserved at issue time (no per-chunk events). `Fabric::transfer` relays 1 MiB
+  chunks cut-through over multi-hop routes; per-node disk read/write, CPU per worker, crypto helper, slow-node
+  multiplier; `RttMatrix` per site pair; `Origin` with per-cache concurrency slots, a shared bandwidth FIFO,
+  fixed latency and injected 412/403/5xx.
+- `workload`, `faults`, `config`: Poisson, Zipf, range reads, cold-start storms, churn; partitions,
+  crash/restart (disk survives), slow nodes, origin error windows; every knob overridable with `--config`.
+- `report`: fixed-memory log-bucket histograms, counters, `Invariants` (named checks, capped violation log,
+  relaxed invariants with a reason), `MemoryUsage::approximate_bytes`, peak RSS from `VmHWM`.
+- `logic::NodeLogic`: owner, route, tier lookup/insert and crash hooks. `StandIn` (hash ownership,
+  direct or one-relay routes, direct-mapped tiers) is a placeholder; the module docs list where phantom
+  `Placement`, `Paths`, memory LRU and `SegmentClock` plug in. `scenario::World` holds the fixed caches-only
+  read flow (owner fetch with per-page singleflight) that the `racer-core` walk and fill plan replace.
+
+With the stand-ins, a 2 s caches-only run at 50,000 nodes processes about 6M events in about 8 s (release)
+with 180 MiB peak RSS; the empty substrate accounts about 2.6 KiB per node. The stand-in owner check re-ranks
+at the owner and retries when membership changed in flight, so `only_owner_hits_origin` holds by
+construction until real placement replaces it.
