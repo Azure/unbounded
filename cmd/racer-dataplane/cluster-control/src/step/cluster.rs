@@ -299,6 +299,50 @@ impl ControlPlane {
             .count()
     }
 
+    /// Committed state record, if any.
+    pub fn record(&self) -> Option<&StateRecord> {
+        self.record.as_ref()
+    }
+
+    /// Image prepared by the primary for the committed record, if any.
+    pub fn image(&self) -> Option<&Image> {
+        self.image.as_ref()
+    }
+
+    /// Sequence seat `index` last served to its clients, while its holder
+    /// is alive and still holds the seat.
+    pub fn seat_served(&self, index: usize) -> Option<u64> {
+        let s = self.seats.get(index)?;
+        let h = s.holder?;
+        let p = &self.pods[h as usize];
+        (p.alive && p.seat == Some(index as u8)).then_some(s.served)?
+    }
+
+    /// Model time at which `sequence` was committed.
+    pub fn commit_ns(&self, sequence: u64) -> Option<u64> {
+        self.commit_at.get(&sequence).copied()
+    }
+
+    /// Number of Pods ever added (live or not).
+    pub fn pod_count(&self) -> u32 {
+        self.pods.len() as u32
+    }
+
+    /// Whether Pod `pod` is running.
+    pub fn alive(&self, pod: u32) -> bool {
+        self.pods.get(pod as usize).is_some_and(|p| p.alive)
+    }
+
+    /// Remove a Node and its Pod (cluster shrink): crash the Pod and delete
+    /// its objects, so the next primary pass drops the member.
+    pub fn remove_pod(&mut self, pod: u32) {
+        if self.alive(pod) {
+            self.crash(pod);
+        }
+        self.inventory.nodes.remove(&format!("n{pod}"));
+        self.inventory.pods.remove(&uuid(u64::from(pod), 1));
+    }
+
     /// Crash a Pod. Its Leases are left to expire. Its Node and Pod objects
     /// stay, as after a process restart; call [`ControlPlane::restart`] to
     /// bring it back with fresh process state.
@@ -868,6 +912,29 @@ mod tests {
         let t = cp.now_ns();
         cp.advance_to(t + 60_000_000_000);
         assert!(cp.approximate_bytes() > 0);
+    }
+
+    #[test]
+    fn accessors_and_removal() {
+        let mut cp = run(30, 240, 5);
+        let seq = cp.sequence().unwrap();
+        assert_eq!(cp.record().map(|r| r.sequence), Some(seq));
+        assert_eq!(cp.image().map(|i| i.record.sequence), Some(seq));
+        assert!(cp.commit_ns(seq).is_some_and(|t| t <= cp.now_ns()));
+        let served: Vec<_> = (0..annotations::MAX_SEATS)
+            .filter_map(|i| cp.seat_served(i))
+            .collect();
+        assert_eq!(served.len(), cp.ready_seats(), "{served:?}");
+        assert_eq!(cp.pod_count(), 30);
+        let mv = cp.record().unwrap().membership_version;
+        let victim = (0..30).find(|p| Some(*p) != cp.primary_pod()).unwrap();
+        cp.remove_pod(victim);
+        cp.remove_pod(victim);
+        assert!(!cp.alive(victim));
+        let t = cp.now_ns();
+        cp.advance_to(t + 60_000_000_000);
+        assert!(cp.record().unwrap().membership_version > mv);
+        assert_eq!(cp.seat_served(99), None);
     }
 
     /// 50k Pods cold start. Run with `--ignored --release`.
