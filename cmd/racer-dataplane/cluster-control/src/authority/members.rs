@@ -407,6 +407,29 @@ mod tests {
     }
 
     #[test]
+    fn maximum_report_preserved_in_membership() {
+        let a = node(1);
+        let report = rails::tests::max_report();
+        let mut p = pod("n1", "10.0.0.1", "2024-01-01T00:00:00Z", "a");
+        p.annotations.insert(
+            annotations::REPORT.into(),
+            rails::encode_report(&report).unwrap(),
+        );
+        let r = reconcile(
+            std::slice::from_ref(&a),
+            &by_node(vec![p]),
+            &own(),
+            1,
+            &History::new(),
+        )
+        .unwrap();
+        assert!(r.diagnostics.iter().all(|d| d.field != "report"));
+        let m = &r.members[&a.uid];
+        assert_eq!(m.shares, report.shares);
+        assert_eq!(m.rails, report.rdma_nics);
+    }
+
+    #[test]
     fn history_survives_gaps_and_bad_input() {
         let a = node(1);
         let p = pod("n1", "10.0.0.1", "t1", "a");

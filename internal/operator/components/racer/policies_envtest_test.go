@@ -6,6 +6,7 @@ package racer
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -175,8 +176,12 @@ func TestEnvtestRacerAdmissionAndRBAC(t *testing.T) {
 		denied(t, update(t, f, a.client, pod, func(p *corev1.Pod) {
 			p.OwnerReferences = []metav1.OwnerReference{{APIVersion: "v1", Kind: "ConfigMap", Name: "x", UID: "x"}}
 		}))
+		// Matches MAX_REPORT_BYTES in cmd/racer-dataplane/cluster-control/src/limits.rs.
+		const maxReport = 32 * 1024
+		require.NoError(t, f.annotatePod(ctx, a.client, a.pod, "racer.unbounded-cloud.io/report", strings.Repeat("r", maxReport)))
+		denied(t, f.annotatePod(ctx, a.client, a.pod, "racer.unbounded-cloud.io/report", strings.Repeat("r", maxReport+1)))
 		denied(t, update(t, f, a.client, pod, func(p *corev1.Pod) {
-			p.Annotations["racer.unbounded-cloud.io/report"] = string(make([]byte, 4097))
+			p.Annotations["racer.unbounded-cloud.io/report"] = strings.Repeat("r", maxReport+1)
 		}))
 		denied(t, a.client.Delete(ctx, b.pod))
 		denied(t, a.client.Create(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "extra", Namespace: ns}, Spec: b.pod.Spec}))
