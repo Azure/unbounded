@@ -35,6 +35,18 @@ class Backend:
     def tensor(self, target, rel: int, info: TensorInfo, staged: bool):
         raise NotImplementedError
 
+    def new_joined(self, info: TensorInfo):
+        """Memory for a tensor that is split across chunks."""
+        raise NotImplementedError
+
+    def copy_part(self, joined, offset: int, target, rel: int, length: int) -> None:
+        """Copy length bytes at rel in target to offset in joined."""
+        raise NotImplementedError
+
+    def joined_tensor(self, joined, info: TensorInfo):
+        """Return the tensor once every part has been copied into joined."""
+        raise NotImplementedError
+
     def done(self, target) -> None:
         """The consumer is finished with every tensor from target."""
 
@@ -42,7 +54,7 @@ class Backend:
         """Block until work queued by the consumer on target has finished."""
 
 
-def _file_chunks(client: racer.Client, uri: ModelURI, staging_bytes: int):
+def _file_chunks(client: racer.Client, uri: ModelURI, staging_bytes: int, page_bytes: int):
     for name in weight_files(client, uri):
         req = uri.request(name)
         meta = client.stat(req)
@@ -50,7 +62,7 @@ def _file_chunks(client: racer.Client, uri: ModelURI, staging_bytes: int):
         n = header_length(prefix)
         header = parse_header(client.read(req, 8, n, if_match=meta.etag), meta.size)
         log.debug("racer: %s has %d tensors", name, len(header.tensors))
-        for chunk in plan_chunks(header.tensors, staging_bytes):
+        for chunk in plan_chunks(header.tensors, staging_bytes, page_bytes):
             yield req, meta.etag, chunk
 
 
@@ -60,6 +72,7 @@ def iter_weights(
     backend: Backend,
     staging_bytes: int = DEFAULT_STAGING_BYTES,
     depth: int = DEFAULT_DEPTH,
+    page_bytes: int = racer.PAGE_SIZE,
 ) -> Iterator[tuple]:
     """Yield (name, tensor) for every tensor in the model.
 
@@ -72,11 +85,17 @@ def iter_weights(
     are never released while queued GPU work may still read them. Dedicated
     targets are fenced and dropped as soon as the consumer resumes past
     them, so oversized tensors do not accumulate in GPU memory.
+
+    Chunks end on Racer page boundaries (page_bytes) where they can, so
+    neighboring chunks do not both read the boundary page. A tensor that
+    crosses a boundary is copied out of each chunk into memory from
+    backend.new_joined() and yielded with the chunk that holds its last byte.
     """
     if depth < 1:
         raise ValueError("depth must be at least 1")
     free = [backend.new_staging(staging_bytes) for _ in range(depth)]
-    chunks = _file_chunks(client, uri, staging_bytes)
+    chunks = _file_chunks(client, uri, staging_bytes, page_bytes)
+    joined: dict = {}
     inflight: collections.deque = collections.deque()
     pool = ThreadPoolExecutor(max_workers=depth, thread_name_prefix="racer-read")
 
@@ -107,6 +126,14 @@ def iter_weights(
             active = target
             for t in chunk.tensors:
                 yield t.name, backend.tensor(target, t.start - chunk.start, t, not chunk.dedicated)
+            for part in chunk.parts:
+                t = part.tensor
+                if part.offset == 0:
+                    joined[t.name] = backend.new_joined(t)
+                rel = t.start + part.offset - chunk.start
+                backend.copy_part(joined[t.name], part.offset, target, rel, part.length)
+                if part.last:
+                    yield t.name, backend.joined_tensor(joined.pop(t.name), t)
             active = None
             backend.done(target)
             if chunk.dedicated:
@@ -149,6 +176,15 @@ class MemoryBackend(Backend):
 
     def tensor(self, target, rel, info, staged):
         return bytes(target.buf[rel : rel + info.nbytes])
+
+    def new_joined(self, info):
+        return bytearray(info.nbytes)
+
+    def copy_part(self, joined, offset, target, rel, length):
+        joined[offset : offset + length] = target.buf[rel : rel + length]
+
+    def joined_tensor(self, joined, info):
+        return bytes(joined)
 
 
 TORCH_DTYPES = {
@@ -229,6 +265,18 @@ class TorchBackend(Backend):
         elif staged and self.clone:
             raw = raw.clone()
         return raw.view(dtype).view(info.shape)
+
+    def new_joined(self, info):
+        return self.torch.empty(info.nbytes, dtype=self.torch.uint8, device=f"cuda:{self.device}")
+
+    def copy_part(self, joined, offset, target, rel, length):
+        # Queued before done(target), so the staging buffer is not reused
+        # until the copy has finished.
+        joined[offset : offset + length].copy_(self._flat[id(target)][rel : rel + length])
+
+    def joined_tensor(self, joined, info):
+        dtype = getattr(self.torch, TORCH_DTYPES[info.dtype])
+        return joined.view(dtype).view(info.shape)
 
     def done(self, target):
         # Record on the target device's stream; the calling thread's current

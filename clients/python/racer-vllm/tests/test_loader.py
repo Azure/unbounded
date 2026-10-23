@@ -105,6 +105,32 @@ def test_iter_weights(server, uri, depth):
     assert 900 in sizes
 
 
+@pytest.mark.parametrize("depth", [1, 2, 3])
+def test_iter_weights_reads_each_page_once(server, uri, depth):
+    setup_model(server, uri)
+    c = racer.Client(socket_path=server.path, staging_bytes=4096)
+    b = _FencingBackend()
+    got = dict(iter_weights(c, uri, b, staging_bytes=400, depth=depth, page_bytes=64))
+    assert got == {"w1": b"\1" * 300, "w2": b"\2" * 50, "w3": b"\3" * 900, "w4": b"\0" * 8}
+    b.assert_fenced()
+    # Staged weight reads (not the two header reads, not the dedicated w3 read)
+    # never share a page.
+    pages = {}
+    reads = 0
+    for s in server.seen:
+        if s.method == "POST" and "range" in s.headers:
+            first, last = (int(x) for x in s.headers["range"][len("bytes=") :].split("-"))
+            if first in (0, 8) or last + 1 - first == 900:
+                continue
+            reads += 1
+            mine = set(range(first // 64, last // 64 + 1))
+            assert not mine & pages.setdefault(s.target, set()), (s.target, first, last)
+            pages[s.target] |= mine
+    assert reads >= 2
+
+
+class _Param:
+    pass
 class _Param:
     pass
 

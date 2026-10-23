@@ -119,28 +119,57 @@ def parse_header(raw: bytes, file_size: int | None = None) -> Header:
     return Header(data_start, tensors, metadata)
 
 
+@dataclass(frozen=True)
+class Part:
+    """Bytes [offset, offset + length) of a tensor that spans several chunks."""
+
+    tensor: TensorInfo
+    offset: int
+    length: int
+
+    @property
+    def last(self) -> bool:
+        return self.offset + self.length == self.tensor.nbytes
+
+
 @dataclass
 class Chunk:
     """A contiguous file range read with one request."""
 
     start: int
     end: int
-    tensors: list
+    tensors: list  # tensors that lie wholly inside the chunk
     dedicated: bool = False  # larger than the staging buffer
+    parts: list = field(default_factory=list)  # Parts of tensors split across chunks
 
     @property
     def length(self) -> int:
         return self.end - self.start
 
 
-def plan_chunks(tensors: list, staging_bytes: int) -> list:
+def plan_chunks(tensors: list, staging_bytes: int, page_bytes: int = 0) -> list:
     """Group sorted tensors into ranges of at most staging_bytes.
 
     A tensor bigger than staging_bytes gets its own dedicated chunk. Zero-size
     tensors join the current chunk and need no bytes.
+
+    With page_bytes no larger than staging_bytes, a chunk that would end in
+    the middle of a page ends on the page boundary instead, and the tensor that
+    crosses the boundary is split into Parts read by consecutive chunks. Without
+    this, both chunks read the boundary page.
     """
+    paged = 0 < page_bytes <= staging_bytes
     chunks: list = []
     cur: Chunk | None = None
+    limit = 0
+
+    def open_chunk(start: int) -> Chunk:
+        nonlocal limit
+        limit = start + staging_bytes
+        if paged:
+            limit -= limit % page_bytes
+        return Chunk(start, start, [])
+
     for t in tensors:
         if t.nbytes > staging_bytes:
             if cur is not None:
@@ -148,13 +177,23 @@ def plan_chunks(tensors: list, staging_bytes: int) -> list:
                 cur = None
             chunks.append(Chunk(t.start, t.end, [t], dedicated=True))
             continue
-        if cur is not None and t.end - cur.start <= staging_bytes:
+        if cur is not None and t.end > limit and (t.start >= limit or not paged):
+            chunks.append(cur)
+            cur = None
+        if cur is None:
+            cur = open_chunk(t.start)
+        if t.end <= limit:
             cur.tensors.append(t)
             cur.end = max(cur.end, t.end)
             continue
-        if cur is not None:
+        pos = t.start
+        while t.end > limit:
+            cur.parts.append(Part(t, pos - t.start, limit - pos))
+            cur.end = pos = limit
             chunks.append(cur)
-        cur = Chunk(t.start, t.end, [t])
+            cur = open_chunk(pos)
+        cur.parts.append(Part(t, pos - t.start, t.end - pos))
+        cur.end = t.end
     if cur is not None:
         chunks.append(cur)
     return chunks

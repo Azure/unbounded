@@ -21,12 +21,14 @@ from .errors import (
     UnsatisfiableRange,
     VersionUnavailable,
 )
+from ._wire import PAGE_SIZE
 from .host import HostBuffer
 from .keys import Request, canonical_json, object_key, object_request
 
 __all__ = [
     "GPU",
     "HOST",
+    "PAGE_SIZE",
     "STREAM",
     "Client",
     "HostBuffer",
