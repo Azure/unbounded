@@ -116,6 +116,11 @@ cache_limit = clamp(limit * w / W, floor, limit)
 Priority 0 keeps only the floor allowance, so the cache can still make
 progress.
 
+Plaintext and ciphertext are also request working memory. Weights never cut a
+cache below its request allowance: one range window plus one page, the same
+amount config validation requires of the whole budget. This allowance is
+capped at the equal split across active caches.
+
 Only page cache memory classes (plaintext, ciphertext, and dirty ciphertext)
 are weighted. Request-serving classes (request context, registered buffers,
 flights, waiters, connections, pipes, control progress, and relays) keep the

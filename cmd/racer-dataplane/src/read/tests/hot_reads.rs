@@ -988,6 +988,119 @@ fn fetch_window_is_not_an_unreleased_credit_ceiling() {
 }
 
 #[test]
+fn zero_priority_read_beside_active_cache_progresses_while_first_page_is_held() {
+    use crate::admission::ResourceClass;
+    use flow_control::Policy;
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let signers = network(1);
+    // Production sizes stream and admission windows from the same setting.
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    limits.range_window_pages = std::num::NonZeroUsize::new(2).unwrap();
+    limits.plaintext_bytes = std::num::NonZeroUsize::new(8 * PAGE_BYTES as usize).unwrap();
+    let mut f = fixture_with(3 * PAGE_BYTES + 7, Some(limits));
+    f.reactor.init().unwrap();
+    let admission = f.fill.dependencies.admission.clone();
+    let cold = f.page.version.object.cache.clone();
+    let hot = racer_control_wire::CacheId("hot".into());
+    let definition =
+        |id: &racer_control_wire::CacheId, priority| racer_control_wire::CacheDefinition {
+            id: id.clone(),
+            name: id.0.clone(),
+            client_socket: "/c".into(),
+            origin_socket: "/o".into(),
+            priority,
+        };
+    admission
+        .policy()
+        .weights()
+        .update(&[definition(&hot, 1000), definition(&cold, 0)]);
+    admission.reweigh();
+    // An active positive-priority cache leaves the read only its request-progress allowance.
+    let _hot = admission
+        .reserve(Some(&hot), ResourceClass::Plaintext, 1)
+        .unwrap();
+    assert_eq!(
+        admission.fair_limit(&cold, ResourceClass::Plaintext),
+        admission.policy().progress(ResourceClass::Plaintext)
+    );
+    let membership = local_membership(&signers[0]);
+    let (local, mut endpoint, _publication) =
+        coordinator(&f, &signers[0], &membership, NoPeer::requester());
+    let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+    let mut stream = match futures::executor::block_on(local.read(
+        ClientRequest {
+            retain: None,
+            kind: ReadKind::Subscription {
+                pin: Some(f.page.version.etag.clone()),
+                range: Some(ByteRange::From(0)),
+                page_credits: 4,
+                byte_credits: 4 * PAGE_BYTES,
+            },
+            origin: OriginContext {
+                object: f.context.object.clone(),
+                metadata: None,
+                authorization: None,
+            },
+        },
+        &scope,
+    ))
+    .unwrap()
+    .payload
+    {
+        crate::read::ReadPayload::Stream(stream) => stream,
+        crate::read::ReadPayload::Empty => panic!("expected a nonempty read stream"),
+    };
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut pump = |endpoint: &mut crate::read::dispatch::WorkerEndpoint| {
+        pump_worker(endpoint, &mut f.engine, &f.crypto, &f.reactor);
+    };
+    let mut held = Vec::new();
+    // Hold every delivered page: the head plus its read-ahead must all succeed.
+    for number in 0..4 {
+        let mut reader = None;
+        for _ in 0..2048 {
+            if let Poll::Ready(result) = stream.next_slice().as_mut().poll(&mut cx) {
+                reader = Some(result);
+                break;
+            }
+            pump(&mut endpoint);
+        }
+        let reader = reader
+            .expect("page delivery stalled")
+            .unwrap_or_else(|error| {
+                panic!(
+                    "page {number} failed: {error:?} plaintext={} ciphertext={} cfair={} pfair={}",
+                    admission.used(ResourceClass::Plaintext),
+                    admission.used(ResourceClass::Ciphertext),
+                    admission.fair_limit(&cold, ResourceClass::Ciphertext),
+                    admission.fair_limit(&cold, ResourceClass::Plaintext),
+                )
+            })
+            .expect("page before end of range");
+        assert_eq!(reader.slice().page, PageNumber(number));
+        held.push(reader.slice());
+        drop(reader);
+        // Release all but the most recent page, keeping one page held while
+        // the next window is fetched.
+        if held.len() > 1 {
+            let slice = held.remove(0);
+            stream.release_page(slice.page, slice.length).unwrap();
+        }
+    }
+    assert!(
+        admission.used(ResourceClass::Plaintext)
+            <= admission.policy().progress(ResourceClass::Plaintext) + 1
+    );
+    futures::executor::block_on(stream.cancel()).unwrap();
+    drop(stream);
+    for _ in 0..128 {
+        pump(&mut endpoint);
+    }
+    endpoint.uninstall().unwrap();
+}
+
+#[test]
 fn later_page_completes_before_head_and_cancellation_keeps_completion_fence() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();

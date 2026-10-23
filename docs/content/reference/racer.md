@@ -65,7 +65,9 @@ priorities`. If every cache has priority 0, shares are equal. Shares apply to
 disk, the pending write queue, and page cache memory (plaintext and
 ciphertext). Request-serving resources such as request context, connections,
 and in-flight fetches are split equally between active caches regardless of
-priority, so a priority 0 cache can still serve requests. Each I/O worker computes
+priority, so a priority 0 cache can still serve requests. Page cache memory
+shares also never drop below what one read needs (`RACER_RANGE_WINDOW_PAGES`
+plus one page), capped at an equal split. Each I/O worker computes
 shares on its own; pages are spread across workers by hash, so this is close to
 a node-wide share.
 
