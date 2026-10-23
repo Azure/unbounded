@@ -79,6 +79,8 @@ SUITES=(
 REQUIRED_ublk=(
 	TestIntegrationDeleteFallbackClose
 	TestIntegrationDeleteFallbackExternalStop
+	TestIntegrationDeleteFallbackCancelFirst
+	TestIntegrationDeleteFallbackExternalDelete
 	TestIntegrationExternalDelete
 	TestIntegrationExternalStop
 	TestIntegrationReadOnlyDevice
