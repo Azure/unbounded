@@ -81,6 +81,8 @@ REQUIRED_ublk=(
 	TestIntegrationDeleteFallbackExternalStop
 	TestIntegrationDeleteFallbackCancelFirst
 	TestIntegrationDeleteFallbackExternalDelete
+	TestTeardownPoisonedCtrlKeepsCharFd
+	TestTeardownClosedCtrlReleasesCharFd
 	TestIntegrationExternalDelete
 	TestIntegrationExternalStop
 	TestIntegrationReadOnlyDevice
