@@ -741,10 +741,6 @@ spec:
               purpose:
                 enum:
                 - FullCertification
-                - QuickCertification
-                - Preflight
-                - TargetedVerification
-                - Diagnostic
                 type: string
               requestNodeName:
                 type: string

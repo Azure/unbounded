@@ -5,6 +5,7 @@ package signaladapter
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -58,7 +59,7 @@ type resultLogSnapshot struct {
 	previous resultLogSource
 }
 
-func (r *Runner) Execute(ctx context.Context, config Config) (output AggregateOutput, resultErr error) {
+func (r *Runner) Execute(ctx context.Context, config Config) (AggregateOutput, error) {
 	if r.Dynamic == nil || r.Kubernetes == nil {
 		return AggregateOutput{}, errors.New("kubernetes clients are required")
 	}
@@ -123,20 +124,23 @@ func (r *Runner) Execute(ctx context.Context, config Config) (output AggregateOu
 	}
 
 	created := make([]createdResource, 0, len(resources))
-	defer func() {
-		if len(created) == 0 {
-			return
+	references := make([]signalv1.BackendResourceReference, 0, len(resources))
+	finishBackendFailure := func(cause error) (AggregateOutput, error) {
+		output, err := r.backendFailureOutput(config, len(participants), created, references, cause)
+		if err != nil {
+			return AggregateOutput{}, err
 		}
 
 		cleanupContext, cancel := context.WithTimeout(context.Background(), r.cleanupWait())
 		defer cancel()
 
 		if err := r.cleanup(cleanupContext, config.Namespace, created); err != nil {
-			resultErr = errors.Join(resultErr, fmt.Errorf("cleanup after adapter exit: %w", err))
+			recordCleanupFailure(&output)
 		}
-	}()
 
-	references := make([]signalv1.BackendResourceReference, 0, len(resources))
+		return output, nil
+	}
+
 	for index, resource := range resources {
 		gvr := podGVR
 		if resource.GetKind() == "MPIJob" {
@@ -146,6 +150,10 @@ func (r *Runner) Execute(ctx context.Context, config Config) (output AggregateOu
 		createdObject, createErr := r.Dynamic.Resource(gvr).Namespace(config.Namespace).
 			Create(executionContext, resource, metav1.CreateOptions{})
 		if createErr != nil {
+			if len(created) > 0 {
+				return finishBackendFailure(fmt.Errorf("create participant %d %s: %w", index, resource.GetKind(), createErr))
+			}
+
 			return AggregateOutput{}, fmt.Errorf("create participant %d %s: %w", index, resource.GetKind(), createErr)
 		}
 
@@ -157,7 +165,17 @@ func (r *Runner) Execute(ctx context.Context, config Config) (output AggregateOu
 
 		reference, referenceErr := BackendResource(createdObject, int32(index))
 		if referenceErr != nil {
-			return AggregateOutput{}, fmt.Errorf("record participant %d backend identity: %w", index, referenceErr)
+			fallbackReference, identityErr := backendResourceIdentity(createdObject, int32(index))
+			if identityErr != nil {
+				return AggregateOutput{}, errors.Join(
+					fmt.Errorf("record participant %d backend identity: %w", index, referenceErr),
+					identityErr,
+				)
+			}
+
+			references = append(references, fallbackReference)
+
+			return finishBackendFailure(fmt.Errorf("record participant %d backend identity: %w", index, referenceErr))
 		}
 
 		references = append(references, reference)
@@ -179,9 +197,9 @@ func (r *Runner) Execute(ctx context.Context, config Config) (output AggregateOu
 
 	waitGroup.Wait()
 
-	output, err = Aggregate(len(participants), references, results)
+	output, err := Aggregate(len(participants), references, results)
 	if err != nil {
-		return AggregateOutput{}, err
+		return finishBackendFailure(fmt.Errorf("aggregate participant results: %w", err))
 	}
 
 	captureContext, cancelCapture := context.WithTimeout(context.Background(), r.cleanupWait())
@@ -195,7 +213,7 @@ func (r *Runner) Execute(ctx context.Context, config Config) (output AggregateOu
 		created,
 	)
 	if err != nil {
-		return AggregateOutput{}, err
+		return finishBackendFailure(fmt.Errorf("capture backend evidence: %w", err))
 	}
 
 	if !evidenceComplete {
@@ -203,7 +221,7 @@ func (r *Runner) Execute(ctx context.Context, config Config) (output AggregateOu
 	}
 
 	if err := r.persistEvidenceBeforeCleanup(&output, config.BackendEvidenceBytes); err != nil {
-		return AggregateOutput{}, err
+		return finishBackendFailure(fmt.Errorf("persist backend evidence: %w", err))
 	}
 
 	cleanupContext, cancel := context.WithTimeout(context.Background(), r.cleanupWait())
@@ -215,7 +233,68 @@ func (r *Runner) Execute(ctx context.Context, config Config) (output AggregateOu
 		return output, nil
 	}
 
-	created = nil
+	return output, nil
+}
+
+func (r *Runner) backendFailureOutput(
+	config Config,
+	participantCount int,
+	created []createdResource,
+	references []signalv1.BackendResourceReference,
+	cause error,
+) (AggregateOutput, error) {
+	captureContext, cancelCapture := context.WithTimeout(context.Background(), r.cleanupWait())
+	defer cancelCapture()
+
+	evidence, _, err := r.captureBackendEvidence(
+		captureContext,
+		config,
+		created,
+	)
+	if err != nil {
+		return AggregateOutput{}, fmt.Errorf("capture partial backend evidence: %w", err)
+	}
+
+	backendJSON, err := json.Marshal(references)
+	if err != nil {
+		return AggregateOutput{}, fmt.Errorf("encode partial backend resources: %w", err)
+	}
+
+	reason := boundedRedactedText(cause.Error(), maxEvidenceTextBytes)
+
+	results := make([]Result, participantCount)
+	for index := range results {
+		results[index] = Result{
+			ParticipantIndex: index,
+			ExecutionState:   "Error",
+			Verdict:          "Inconclusive",
+			Reason:           "BackendSetupFailed",
+		}
+	}
+
+	measurements, err := json.Marshal(map[string]any{
+		"participantCount": participantCount,
+		"createdBackends":  len(created),
+		"error":            reason,
+		"results":          results,
+	})
+	if err != nil {
+		return AggregateOutput{}, fmt.Errorf("encode partial backend measurements: %w", err)
+	}
+
+	output := AggregateOutput{
+		ExecutionState:   "Error",
+		Verdict:          "Inconclusive",
+		Reason:           "BackendSetupFailed",
+		Measurements:     string(measurements),
+		BackendResources: references,
+		BackendJSON:      string(backendJSON),
+		BackendEvidence:  evidence,
+	}
+
+	if err := r.persistEvidenceBeforeCleanup(&output, config.BackendEvidenceBytes); err != nil {
+		return AggregateOutput{}, err
+	}
 
 	return output, nil
 }
@@ -234,10 +313,15 @@ func (r *Runner) persistEvidenceBeforeCleanup(output *AggregateOutput, limit int
 			limit,
 		)
 		if markErr != nil {
-			return markErr
+			return errors.Join(
+				fmt.Errorf("persist backend evidence before cleanup: %w", err),
+				markErr,
+			)
 		}
 
 		recordEvidenceCaptureFailure(output)
+
+		return fmt.Errorf("persist backend evidence before cleanup: %w", err)
 	}
 
 	return nil

@@ -24,11 +24,7 @@ type WorkflowReference struct {
 type CertificationPurpose string
 
 const (
-	PurposeFullCertification    CertificationPurpose = "FullCertification"
-	PurposeQuickCertification   CertificationPurpose = "QuickCertification"
-	PurposePreflight            CertificationPurpose = "Preflight"
-	PurposeTargetedVerification CertificationPurpose = "TargetedVerification"
-	PurposeDiagnostic           CertificationPurpose = "Diagnostic"
+	PurposeFullCertification CertificationPurpose = "FullCertification"
 )
 
 type CheckID string
@@ -180,7 +176,7 @@ type CertificationProfileSpec struct {
 	// +kubebuilder:validation:MaxItems=15
 	Checks          []CertificationCheck `json:"checks"`
 	ExecutionPolicy SuiteExecutionPolicy `json:"executionPolicy"`
-	// +kubebuilder:validation:Enum=FullCertification;QuickCertification;Preflight;TargetedVerification;Diagnostic
+	// +kubebuilder:validation:Enum=FullCertification
 	Purpose      CertificationPurpose `json:"purpose,omitempty"`
 	EvidencePath string               `json:"evidencePath"`
 	Deadline     metav1.Duration      `json:"deadline"`

@@ -143,6 +143,13 @@ sufficient. Log collection requests the latest 64 lines, retains at most 64 KiB
 for result parsing, and projects redacted tails of at most 512 bytes into evidence.
 Earlier log content is intentionally outside this bounded result contract.
 
+After the adapter creates its first backend, every later setup or aggregation
+failure is reported as an Inconclusive output with bounded partial backend
+identity and typed evidence. The adapter persists that evidence before
+foreground cleanup; missing participant coverage can never produce a passing
+result. If the Argo output write fails, cleanup is blocked and the backends
+remain available rather than destroying the only remaining audit state.
+
 After durable terminal evidence is recorded, the controller foreground-deletes
 the Workflow and waits for owned backend descendants to be removed before
 releasing Node reservations. This also covers adapter crashes, cancellation,
@@ -174,7 +181,8 @@ name. Only the worker receives the configured GPU limit. The adapter propagates
 the Workflow active deadline, applies the profile's optional queue, records
 API-assigned workload UIDs, reads the final typed result from bounded workload
 logs, aggregates diagnostic state separately from backend execution state, and
-foreground-deletes every created workload.
+foreground-deletes every created workload only after its evidence output is
+durable.
 
 The selected script is invoked with no arguments for a Pod backend,
 `mpi-launcher <gpu-count>` in an MPIJob launcher, and `mpi-worker` in its worker.
@@ -369,6 +377,10 @@ The sum of all 15 checks' declared verdict, reason, measurements, backend
 resource, backend evidence, and cleanup output bounds cannot exceed 768 KiB.
 The controller rejects larger plans before reserving Nodes so valid per-check
 bounds cannot collectively exceed a safe Argo Workflow status budget.
+Each reason, measurements, backend-resource, and backend-evidence bound must
+also fit the mandatory partial-failure envelope for the check's selected
+participant count. Every accepted plan can therefore report a bounded partial
+setup failure.
 
 `kueueTopology.requiredLevel` is an explicit Kueue Topology Aware Scheduling
 request. It must be a valid Kubernetes label key and requires a nonempty backend
@@ -403,6 +415,9 @@ the complete plan and selected participants once into one immutable
 `CertificationRun`. Each check binds its script identity and digest, runner,
 backend, workload and topology policy, runtime inputs, deadline, result bounds,
 participant-role inclusion or exclusion, and `maxAttempts: 1`.
+The only supported purpose is `FullCertification`; diagnostic, preflight, and
+targeted modes are intentionally outside this one-time Node join contract and
+cannot project production eligibility.
 
 The controller creates one Argo Workflow with an inline DAG entrypoint. Every
 task invokes the configured adapter `certification` template through
@@ -416,6 +431,11 @@ name and attempt in CertificationRun status. Once that creation intent exists,
 a missing Workflow terminates the Run as Inconclusive and is never recreated.
 This fail-closed fence prevents a controller outage plus Workflow TTL cleanup
 from executing the one-time certification suite twice.
+
+Admission also remains fail-closed until every selected Node has received the
+pending projection. The Run is retained as the durable owner while a failed
+Node patch is retried; its Workflow cannot start until admission is marked
+ready.
 
 Participant roles and topology constraints are generic typed policy. Profiles
 can, for example, bind one role to one participant, another role to three
