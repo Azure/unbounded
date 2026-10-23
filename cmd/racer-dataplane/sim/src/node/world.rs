@@ -361,6 +361,19 @@ fn wall_clock() -> Instant {
 
 impl NodeWorld {
     pub fn new(config: Config, seed: u64) -> Self {
+        Self::build(config, seed, false)
+    }
+
+    /// Combined mode: membership versions come from the control plane
+    /// ([`Self::commit_membership`]) and each node adopts the version its
+    /// control client applied ([`Self::apply_membership`]). No node is
+    /// enrolled until its client applies a version; until then it neither
+    /// reads nor accepts peer links.
+    pub fn new_combined(config: Config, seed: u64) -> Self {
+        Self::build(config, seed, true)
+    }
+
+    fn build(config: Config, seed: u64, combined: bool) -> Self {
         let streams = Streams::new(seed);
         let fabric = Fabric::new(&config, &mut streams.stream(Role::Topology, 0));
         let origin = Origin::new(&config, streams.stream(Role::Origin, 0));
@@ -395,11 +408,15 @@ impl NodeWorld {
             origin,
             metrics: Metrics::default(),
             invariants: Invariants::default(),
-            versions: Versions::new(
-                n,
-                node_config.membership_lag_ns,
-                node_config.retained_versions,
-            ),
+            versions: if combined {
+                Versions::external(n, node_config.retained_versions)
+            } else {
+                Versions::new(
+                    n,
+                    node_config.membership_lag_ns,
+                    node_config.retained_versions,
+                )
+            },
             partitions: Partitions::from_faults(&config.faults),
             ids: Ids::new(n, config.workers.max(1), config.pages_per_object),
             shared,
@@ -494,13 +511,58 @@ impl NodeWorld {
     }
 
     pub fn run(&mut self, end: Nanos) {
-        while let Some(event) = self.engine.pop_until(end) {
-            let now = self.engine.now();
-            let (tag, a, b) = event.tag();
-            self.engine.trace.record(now, tag, a, b);
-            self.handle(event);
-        }
+        while self.step(end) {}
         self.engine.finish(end);
+    }
+
+    /// Process the next event at or before `end`. Returns false when none.
+    pub fn step(&mut self, end: Nanos) -> bool {
+        let Some(event) = self.engine.pop_until(end) else {
+            return false;
+        };
+        let now = self.engine.now();
+        let (tag, a, b) = event.tag();
+        self.engine.trace.record(now, tag, a, b);
+        self.handle(event);
+        true
+    }
+
+    /// Combined mode: the control plane committed membership `number` with
+    /// `members` (node ids) at `now`. Prunes versions no live node needs.
+    pub fn commit_membership(&mut self, number: u64, members: Vec<u32>, now: Nanos) {
+        let started = wall_clock();
+        let added = self.versions.commit(number, members, now);
+        self.profile.publish_ns += started.elapsed().as_nanos() as u64;
+        if !added {
+            return;
+        }
+        self.metrics.incr("membership_publications");
+        self.engine.trace.record(now, 15, number, 0);
+        self.prune_versions();
+    }
+
+    /// Combined mode: `node`'s control client applied `number` (0 when the
+    /// client restarted and has no snapshot yet).
+    pub fn apply_membership(&mut self, node: u32, number: u64) {
+        if self.valid(node) {
+            self.versions.apply(node, number);
+        }
+    }
+
+    /// Combined mode: drop versions no live node can resolve.
+    pub fn prune_versions(&mut self) {
+        let nodes = &self.nodes;
+        if self.versions.prune(|n| nodes[n as usize].down) {
+            self.shared.phantom.forget(&self.versions.identities());
+            self.shared
+                .routes
+                .forget(&self.versions.topology_identities());
+        }
+    }
+
+    /// Whether `node` is crashed or removed.
+    pub fn is_down(&self, node: u32) -> bool {
+        self.nodes.get(node as usize).is_none_or(|n| n.down)
     }
 
     fn now(&self) -> Nanos {
@@ -665,6 +727,10 @@ impl NodeWorld {
         if self.nodes[node as usize].down {
             return;
         }
+        if !self.versions.enrolled(node) {
+            self.metrics.incr("reads_skipped_not_enrolled");
+            return;
+        }
         if !self.versions.is_live(node) {
             self.metrics.incr("reads_skipped_not_member");
             return;
@@ -766,6 +832,10 @@ impl NodeWorld {
         let n = &self.nodes[node as usize];
         if n.down || n.incarnation != r.incarnation {
             self.metrics.incr("reads_lost_to_crash");
+            return;
+        }
+        if !self.versions.enrolled(node) {
+            self.metrics.incr("reads_skipped_not_enrolled");
             return;
         }
         self.adopt(node);
@@ -1435,6 +1505,7 @@ impl NodeWorld {
         drop(probe);
         let site = |x: u32| self.fabric.site[x as usize];
         let up = !self.nodes[next as usize].down
+            && self.versions.enrolled(next)
             && !self.partitions.blocked(now, site(holder), site(next));
         let n = &mut self.nodes[holder as usize];
         if up {
@@ -1500,7 +1571,7 @@ impl NodeWorld {
             return;
         };
         let at = m.at;
-        if self.nodes[at as usize].down {
+        if self.nodes[at as usize].down || !self.versions.enrolled(at) {
             self.metrics.incr("messages_lost_to_crash");
             self.msgs.remove(&mid);
             return;
@@ -1822,7 +1893,7 @@ impl NodeWorld {
         if !ok {
             return self.fail_walk(id, Error::Unauthorized);
         }
-        if version < self.versions.latest().number {
+        if version < self.versions.latest_number() {
             self.metrics.incr("origin_on_older_membership");
         }
         let fill = self.fills.get_mut(&id).expect("present");
@@ -2165,7 +2236,7 @@ impl NodeWorld {
             },
             "rejections": self.rejections(),
             "membership": {
-                "latest_version": self.versions.latest().number,
+                "latest_version": self.versions.latest_number(),
                 "publications": c("membership_publications"),
                 "placement_memo_entries": self.shared.phantom.memo_len(),
                 "route_memo_entries": self.shared.routes.memo_len(),

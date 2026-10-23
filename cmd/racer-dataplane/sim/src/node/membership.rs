@@ -67,6 +67,10 @@ pub struct Versions {
     dirty: bool,
     lag: Nanos,
     retained: u64,
+    /// Combined mode: the version each node's control client has applied
+    /// (0 before its first snapshot). `None` in standalone mode, where
+    /// adoption follows the synthetic per-node lag.
+    external: Option<Vec<u64>>,
 }
 
 impl Versions {
@@ -85,6 +89,108 @@ impl Versions {
             dirty: false,
             lag,
             retained,
+            external: None,
+        }
+    }
+
+    /// Combined mode: no version until the control plane commits one, and
+    /// every node adopts only what its control client applied
+    /// ([`Self::commit`], [`Self::apply`]).
+    pub fn external(nodes: u32, retained: u64) -> Self {
+        Self {
+            live: vec![false; nodes as usize],
+            history: VecDeque::new(),
+            dirty: false,
+            lag: 0,
+            retained,
+            external: Some(vec![0; nodes as usize]),
+        }
+    }
+
+    pub fn is_external(&self) -> bool {
+        self.external.is_some()
+    }
+
+    /// Combined mode: record the committed membership `number` with
+    /// `members` (node ids). Returns false (and changes nothing) when
+    /// `number` is not newer than the latest known version.
+    pub fn commit(&mut self, number: u64, mut members: Vec<u32>, now: Nanos) -> bool {
+        if self.history.back().is_some_and(|v| v.number >= number) {
+            return false;
+        }
+        members.sort_unstable();
+        members.dedup();
+        members.retain(|n| (*n as usize) < self.live.len());
+        self.live.iter_mut().for_each(|l| *l = false);
+        for n in &members {
+            self.live[*n as usize] = true;
+        }
+        let list: Vec<SimMember> = members.into_iter().map(SimMember::new).collect();
+        let next = match self.history.back() {
+            Some(prev) => Members::new_with_predecessor(list, &prev.members),
+            None => Members::new(list),
+        }
+        .expect("valid ids");
+        self.history.push_back(Version {
+            number,
+            published: now,
+            members: Rc::new(next),
+        });
+        true
+    }
+
+    /// Combined mode: `node`'s control client applied `number` (0 after
+    /// a crash). Versions never committed here are ignored.
+    pub fn apply(&mut self, node: u32, number: u64) {
+        if number != 0 && self.get(number).is_none() {
+            return;
+        }
+        if let Some(slot) = self
+            .external
+            .as_mut()
+            .and_then(|e| e.get_mut(node as usize))
+        {
+            *slot = number;
+        }
+    }
+
+    /// Combined mode: drop versions no live node can resolve any more (older
+    /// than the oldest applied version minus `retained`), keeping the latest.
+    /// `down` reports crashed nodes, whose applied version does not count.
+    /// Returns whether anything was dropped.
+    pub fn prune(&mut self, down: impl Fn(u32) -> bool) -> bool {
+        let Some(external) = &self.external else {
+            return false;
+        };
+        let Some(latest) = self.history.back().map(|v| v.number) else {
+            return false;
+        };
+        let oldest = external
+            .iter()
+            .enumerate()
+            .filter(|(n, v)| **v > 0 && !down(*n as u32))
+            .map(|(_, v)| *v)
+            .min()
+            .unwrap_or(latest);
+        let mut dropped = false;
+        while self.history.len() > 1
+            && self
+                .history
+                .get(self.retained as usize + 1)
+                .is_some_and(|v| v.number <= oldest)
+        {
+            self.history.pop_front();
+            dropped = true;
+        }
+        dropped
+    }
+
+    /// Whether `node` has a membership to work with: always in standalone
+    /// mode; in combined mode once its control client applied a version.
+    pub fn enrolled(&self, node: u32) -> bool {
+        match &self.external {
+            None => true,
+            Some(e) => e.get(node as usize).is_some_and(|v| *v > 0),
         }
     }
 
@@ -144,9 +250,18 @@ impl Versions {
         self.history.back().expect("at least one version")
     }
 
+    /// Latest version number, 0 before any (combined mode).
+    pub fn latest_number(&self) -> u64 {
+        self.history.back().map_or(0, |v| v.number)
+    }
+
     pub fn get(&self, number: u64) -> Option<&Version> {
-        let first = self.history.front()?.number;
-        self.history.get(number.checked_sub(first)? as usize)
+        // Numbers are increasing but may skip in combined mode.
+        let i = self
+            .history
+            .binary_search_by_key(&number, |v| v.number)
+            .ok()?;
+        self.history.get(i)
     }
 
     /// Per-node adoption lag for `version` (version 1 has none).
@@ -159,6 +274,12 @@ impl Versions {
 
     /// Newest version `node` has adopted at `now`.
     pub fn adopted(&self, node: u32, now: Nanos) -> &Version {
+        if let Some(e) = &self.external {
+            let applied = e.get(node as usize).copied().unwrap_or(0);
+            return self
+                .get(applied)
+                .unwrap_or_else(|| self.history.front().expect("nonempty"));
+        }
         self.history
             .iter()
             .rev()
@@ -169,8 +290,22 @@ impl Versions {
     /// Whether `node` can resolve `version` at `now` (its adopted version or
     /// one of the `retained` before it).
     pub fn known(&self, node: u32, version: u64, now: Nanos) -> bool {
+        if !self.enrolled(node) {
+            return false;
+        }
         let adopted = self.adopted(node, now).number;
-        version <= adopted && adopted - version <= self.retained && self.get(version).is_some()
+        let retained = match &self.external {
+            // Count retained versions, not numbers (numbers may skip).
+            Some(_) => {
+                let lo = self.history.partition_point(|v| v.number < version);
+                let hi = self.history.partition_point(|v| v.number < adopted);
+                return version <= adopted
+                    && (hi - lo) as u64 <= self.retained
+                    && self.get(version).is_some();
+            }
+            None => self.retained,
+        };
+        version <= adopted && adopted - version <= retained && self.get(version).is_some()
     }
 
     /// Membership identities to keep in shared placement memos.
@@ -188,6 +323,7 @@ impl Versions {
 
     pub fn approximate_bytes(&self) -> usize {
         self.live.capacity()
+            + self.external.as_ref().map_or(0, |e| e.capacity() * 8)
             + self
                 .history
                 .iter()
@@ -199,6 +335,44 @@ impl Versions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_versions_follow_the_control_plane() {
+        let mut v = Versions::external(6, 1);
+        assert_eq!(v.latest_number(), 0);
+        assert!(!v.enrolled(0));
+        assert!(!v.known(0, 1, 0));
+        assert!(v.commit(3, vec![0, 1, 2, 9], 10));
+        assert!(!v.commit(3, vec![0], 11), "not newer");
+        assert_eq!(
+            v.latest().members.members().len(),
+            3,
+            "out of range dropped"
+        );
+        assert!(v.is_live(2) && !v.is_live(3));
+        v.apply(0, 3);
+        v.apply(1, 7); // never committed: ignored
+        assert!(v.enrolled(0) && !v.enrolled(1));
+        assert_eq!(v.adopted(0, 0).number, 3);
+        assert!(v.commit(5, vec![0, 1, 2, 3], 20));
+        assert!(v.commit(8, vec![0, 1, 3], 30));
+        v.apply(1, 8);
+        // Node 0 is at 3: it resolves 3 only; node 1 resolves 8 and 5.
+        assert!(v.known(0, 3, 0) && !v.known(0, 5, 0));
+        assert!(v.known(1, 5, 0) && v.known(1, 8, 0));
+        assert!(!v.known(1, 3, 0), "older than retained");
+        assert!(!v.prune(|_| false), "node 0 still needs 3");
+        v.apply(0, 8);
+        assert!(v.prune(|_| false));
+        assert!(v.get(3).is_none());
+        assert!(v.get(5).is_some(), "retained before the oldest applied");
+        // A crashed node does not pin old versions.
+        v.apply(2, 5);
+        assert!(!v.prune(|n| n == 2));
+        assert!(v.get(5).is_some() && v.get(8).is_some());
+        v.apply(0, 0);
+        assert!(!v.enrolled(0));
+    }
 
     #[test]
     fn publish_adopt_and_resolve() {
