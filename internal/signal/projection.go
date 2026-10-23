@@ -12,7 +12,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -25,17 +24,14 @@ const (
 	EligibilityLabel = "signal.unbounded-cloud.io/eligibility"
 	ProfileLabel     = "signal.unbounded-cloud.io/profile"
 
-	ProfileNameAnnotation        = "signal.unbounded-cloud.io/profile-name"
-	ProfileGenerationAnnotation  = "signal.unbounded-cloud.io/profile-generation"
-	LastRunAnnotation            = "signal.unbounded-cloud.io/last-run"
-	LastRunAtAnnotation          = "signal.unbounded-cloud.io/last-run-at"
-	LastSuccessfulRunAnnotation  = "signal.unbounded-cloud.io/last-successful-run"
-	LastSuccessfulAtAnnotation   = "signal.unbounded-cloud.io/last-successful-at"
-	EvidenceDigestAnnotation     = "signal.unbounded-cloud.io/evidence-digest"
-	ScriptDigestAnnotation       = "signal.unbounded-cloud.io/script-digest"
-	NextDueAtAnnotation          = "signal.unbounded-cloud.io/next-due-at"
-	RecurringReasonAnnotation    = "signal.unbounded-cloud.io/recurring-reason"
-	RecurringSuspendedAnnotation = "signal.unbounded-cloud.io/recurring-suspended"
+	ProfileNameAnnotation       = "signal.unbounded-cloud.io/profile-name"
+	ProfileGenerationAnnotation = "signal.unbounded-cloud.io/profile-generation"
+	LastRunAnnotation           = "signal.unbounded-cloud.io/last-run"
+	LastRunAtAnnotation         = "signal.unbounded-cloud.io/last-run-at"
+	LastSuccessfulRunAnnotation = "signal.unbounded-cloud.io/last-successful-run"
+	LastSuccessfulAtAnnotation  = "signal.unbounded-cloud.io/last-successful-at"
+	EvidenceDigestAnnotation    = "signal.unbounded-cloud.io/evidence-digest"
+	ScriptDigestAnnotation      = "signal.unbounded-cloud.io/script-digest"
 
 	maxProjectionAnnotationValue = 1024
 )
@@ -105,10 +101,6 @@ func projectTerminal(ctx context.Context, kube client.Client, run *signalv1.Cert
 }
 
 func runScriptDigest(run *signalv1.CertificationRun) string {
-	if len(run.Spec.Checks) == 0 {
-		return run.Spec.Script.Digest
-	}
-
 	hash := sha256.New()
 	for index := range run.Spec.Checks {
 		_, _ = hash.Write([]byte(run.Spec.Checks[index].ID))
@@ -118,49 +110,6 @@ func runScriptDigest(run *signalv1.CertificationRun) string {
 	}
 
 	return "sha256:" + hex.EncodeToString(hash.Sum(nil))
-}
-
-func projectRecurring(
-	ctx context.Context,
-	kube client.Client,
-	profile *signalv1.CertificationProfile,
-	status signalv1.RecurringNodeStatus,
-) error {
-	participant := signalv1.Participant{NodeName: status.NodeName}
-	pinned := signalv1.PinnedProfile{Name: profile.Name, UID: profile.UID, Generation: profile.Generation}
-
-	return projectParticipants(ctx, kube, []signalv1.Participant{participant}, func(node *corev1.Node) error {
-		selectedProfile := node.Annotations[ProfileNameAnnotation]
-
-		active := node.Labels[StateLabel] == "pending" || node.Labels[StateLabel] == "testing"
-		if active && selectedProfile != profile.Name {
-			return nil
-		}
-
-		if status.LastSuccessfulAt != nil &&
-			!projectionTimeAfter(node.Annotations[LastSuccessfulAtAnnotation], status.LastSuccessfulAt.Time) {
-			setProfileProjection(node, pinned)
-		} else {
-			return nil
-		}
-
-		setOrDeleteAnnotation(node, NextDueAtAnnotation, formatMetaTime(status.NextDueAt))
-		setOrDeleteAnnotation(node, RecurringReasonAnnotation, status.Reason)
-		node.Annotations[RecurringSuspendedAnnotation] = strconv.FormatBool(status.Suspended)
-
-		if status.LastSuccessfulAt != nil &&
-			!projectionTimeAfter(node.Annotations[LastSuccessfulAtAnnotation], status.LastSuccessfulAt.Time) {
-			node.Annotations[LastSuccessfulRunAnnotation] = boundedAnnotationValue(status.LastSuccessfulRun)
-			node.Annotations[LastSuccessfulAtAnnotation] = status.LastSuccessfulAt.UTC().Format(time.RFC3339)
-
-			if node.Labels[StateLabel] == "" {
-				node.Labels[StateLabel] = "passed"
-				node.Labels[EligibilityLabel] = "production"
-			}
-		}
-
-		return nil
-	})
 }
 
 func projectParticipants(
@@ -244,22 +193,4 @@ func projectionTimeAfter(value string, candidate time.Time) bool {
 	}
 
 	return existing.After(candidate)
-}
-
-func setOrDeleteAnnotation(node *corev1.Node, key, value string) {
-	if value == "" {
-		delete(node.Annotations, key)
-
-		return
-	}
-
-	node.Annotations[key] = boundedAnnotationValue(value)
-}
-
-func formatMetaTime(value *metav1.Time) string {
-	if value == nil {
-		return ""
-	}
-
-	return value.UTC().Format(time.RFC3339)
 }

@@ -52,8 +52,6 @@ func main() {
 	flags.Var(uidValue{target: &cfg.RunUID}, "run-uid", "CertificationRun UID")
 	flags.StringVar(&cfg.ParticipantsJSON, "participants-json", "", "Ordered participant snapshot JSON")
 	flags.IntVar(&cfg.ParticipantCount, "participant-count", 0, "Declared participant count")
-	flags.StringVar(&cfg.RequestNodeName, "request-node-name", "", "Compatibility request Node name")
-	flags.StringVar(&cfg.LegacyParticipants, "participants", "", "Compatibility comma-separated Node names")
 	flags.StringVar(&cfg.ScriptConfigMap, "script-configmap", "", "Immutable script ConfigMap")
 	flags.StringVar(&cfg.ScriptKey, "script-key", "", "Script ConfigMap key")
 	flags.StringVar(

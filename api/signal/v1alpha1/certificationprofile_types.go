@@ -31,16 +31,6 @@ const (
 	PurposeDiagnostic           CertificationPurpose = "Diagnostic"
 )
 
-type CertificationStage struct {
-	ID               string          `json:"id"`
-	DisplayName      string          `json:"displayName"`
-	Category         string          `json:"category"`
-	Description      string          `json:"description,omitempty"`
-	ExpectedDuration metav1.Duration `json:"expectedDuration,omitempty"`
-	Required         bool            `json:"required"`
-	Conditional      bool            `json:"conditional,omitempty"`
-}
-
 type CheckID string
 
 type ResultBounds struct {
@@ -179,7 +169,6 @@ type WorkloadPolicy struct {
 // +kubebuilder:validation:XValidation:rule="self.checks.map(c, c.order) == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]",message="checks must use immutable contiguous order 0 through 14"
 // +kubebuilder:validation:XValidation:rule="self.checks.map(c, c.id) == ['R01', 'R02', 'R03', 'R04', 'R05', 'R06', 'R07', 'R08', 'R09', 'R10', 'R11', 'R12', 'R13', 'R14', 'R15']",message="checks must use ordered IDs R01 through R15"
 // +kubebuilder:validation:XValidation:rule="self.checks.all(c, duration(self.deadline) - duration(c.backendActiveDeadline) >= duration('60s'))",message="every backendActiveDeadline must leave at least 60 seconds before deadline"
-// +kubebuilder:validation:XValidation:rule="!has(self.recurring) || !self.recurring.enabled",message="recurring certification is not supported for grouped suites"
 type CertificationProfileSpec struct {
 	Participants ParticipantPolicy `json:"participants"`
 	// +kubebuilder:validation:MaxItems=16
@@ -196,67 +185,17 @@ type CertificationProfileSpec struct {
 	EvidencePath string               `json:"evidencePath"`
 	Deadline     metav1.Duration      `json:"deadline"`
 	Tolerations  []corev1.Toleration  `json:"tolerations,omitempty"`
-	Recurring    *RecurringPolicy     `json:"recurring,omitempty"`
-
-	// Deprecated Go-only aliases retained for unit fixtures. They are not part
-	// of the v1alpha1 wire contract.
-	Script                ScriptReference      `json:"-"`
-	Backend               ExecutionBackend     `json:"-"`
-	RunnerImage           string               `json:"-"`
-	WorkloadPolicy        WorkloadPolicy       `json:"-"`
-	StagePlan             []CertificationStage `json:"-"`
-	RuntimeStage          *RuntimeStage        `json:"-"`
-	Parameters            map[string]string    `json:"-"`
-	BackendActiveDeadline metav1.Duration      `json:"-"`
-	MaxAttempts           int32                `json:"-"`
-}
-
-type RecurringPolicy struct {
-	Enabled                       bool            `json:"enabled"`
-	NodeNames                     []string        `json:"nodeNames"`
-	MinIdleDuration               metav1.Duration `json:"minIdleDuration"`
-	ValidFor                      metav1.Duration `json:"validFor"`
-	NotBefore                     *metav1.Time    `json:"notBefore,omitempty"`
-	ExpiresAt                     metav1.Time     `json:"expiresAt"`
-	EvaluationInterval            metav1.Duration `json:"evaluationInterval,omitempty"`
-	FailureBackoff                metav1.Duration `json:"failureBackoff"`
-	MaxConsecutiveFailures        int32           `json:"maxConsecutiveFailures"`
-	MaxConcurrent                 int32           `json:"maxConcurrent"`
-	FailureDomainLabel            string          `json:"failureDomainLabel,omitempty"`
-	MaxConcurrentPerFailureDomain int32           `json:"maxConcurrentPerFailureDomain,omitempty"`
-	ExclusiveProfiles             []string        `json:"exclusiveProfiles,omitempty"`
-}
-
-type RecurringNodeStatus struct {
-	NodeName            string       `json:"nodeName"`
-	IdleSince           *metav1.Time `json:"idleSince,omitempty"`
-	LastEvaluatedAt     *metav1.Time `json:"lastEvaluatedAt,omitempty"`
-	LastSuccessfulRun   string       `json:"lastSuccessfulRun,omitempty"`
-	LastSuccessfulAt    *metav1.Time `json:"lastSuccessfulAt,omitempty"`
-	NextDueAt           *metav1.Time `json:"nextDueAt,omitempty"`
-	ConsecutiveFailures int32        `json:"consecutiveFailures,omitempty"`
-	Suspended           bool         `json:"suspended,omitempty"`
-	Reason              string       `json:"reason,omitempty"`
-}
-
-type CertificationProfileStatus struct {
-	ObservedGeneration int64                 `json:"observedGeneration,omitempty"`
-	Nodes              []RecurringNodeStatus `json:"nodes,omitempty"`
-	Conditions         []metav1.Condition    `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster,shortName=certprofile
-// +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Checks",type=integer,JSONPath=`.spec.checks.size()`
 // +kubebuilder:printcolumn:name="Participants",type=integer,JSONPath=`.spec.participants.count`
-// +kubebuilder:printcolumn:name="Recurring",type=boolean,JSONPath=`.spec.recurring.enabled`
 type CertificationProfile struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   CertificationProfileSpec   `json:"spec"`
-	Status CertificationProfileStatus `json:"status,omitempty"`
+	Spec CertificationProfileSpec `json:"spec"`
 }
 
 // +kubebuilder:object:root=true

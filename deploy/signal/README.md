@@ -62,10 +62,8 @@ The referenced WorkflowTemplate must accept these string parameters:
 | --- | --- |
 | `run-name` | CertificationRun name |
 | `run-uid` | CertificationRun UID |
-| `participants` | Comma-separated admitted Node names retained for compatibility |
 | `participants-json` | Ordered JSON array of participant indexes, Node names, immutable UIDs, capacity, and allocatable resources |
 | `participant-count` | Number of atomically admitted participants |
-| `request-node-name` | Node that triggered the grouped run |
 | `script-configmap` | Immutable run-owned ConfigMap |
 | `script-key` | Selected ConfigMap key |
 | `script-digest` | Algorithm-qualified SHA-256 of the selected script bytes (`sha256:<64 lowercase hex>`) |
@@ -379,7 +377,7 @@ task invokes the configured adapter `certification` template through
 `templateRef`; dependencies make execution serial and visible in
 `status.nodes`. `executionPolicy.onFailure` is immutable and is either `Stop`
 or `Continue`. A stopped task is recorded as skipped/not-run, never inferred as
-a diagnostic result. Grouped suites cannot enable recurring admission.
+a diagnostic result.
 
 Participant roles and topology constraints are generic typed policy. Profiles
 can, for example, bind one role to one participant, another role to three
