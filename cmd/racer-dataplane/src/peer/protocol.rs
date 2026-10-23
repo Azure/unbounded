@@ -341,6 +341,29 @@ pub enum PeerResponse {
     /// The warm lease is gone. Unused capacity is freed after the last lease.
     Released,
 }
+impl PeerResponse {
+    /// Payload-free shape used by racer-core decisions.
+    pub fn kind(&self) -> racer_core::read::candidates::ResponseKind {
+        use racer_core::read::candidates::ResponseKind;
+        match self {
+            Self::Selected { .. } => ResponseKind::Selected,
+            Self::Bootstrap { .. } => ResponseKind::Bootstrap,
+            Self::Page { .. } => ResponseKind::Page,
+            Self::Metadata(_) => ResponseKind::Metadata,
+            Self::Miss => ResponseKind::Miss,
+            Self::NotFound => ResponseKind::NotFound,
+            Self::VersionUnavailable => ResponseKind::VersionUnavailable,
+            Self::Unavailable => ResponseKind::Unavailable,
+            Self::Overloaded => ResponseKind::Overloaded,
+            Self::OriginRejected => ResponseKind::OriginRejected,
+            Self::OriginForbidden => ResponseKind::OriginForbidden,
+            Self::StaleMembership => ResponseKind::StaleMembership,
+            Self::Held { .. } => ResponseKind::Held,
+            Self::Warmed => ResponseKind::Warmed,
+            Self::Released => ResponseKind::Released,
+        }
+    }
+}
 /// Owned, unverified wire input/output. The original and all forwarding signatures
 /// travel with the operation, including opaque encrypted origin credentials.
 /// Verification must check that the operation and effective route agree with the

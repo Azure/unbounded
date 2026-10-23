@@ -89,14 +89,7 @@ fn host_descriptor(
     descriptor.as_fd().try_clone_to_owned().ok()
 }
 
-/// Optional writes may use half of the aggregate class budget, with a floor
-/// sufficient for one valid page when the configured budget can hold it. Owned
-/// usage counts against this conservative ceiling; quota admission remains the
-/// authority for per-cache fairness and all completion-owned allocations.
-pub(super) fn optional_headroom(limit: usize, used: usize, amount: usize, one_page: usize) -> bool {
-    let ceiling = limit.min((limit / 2).max(one_page));
-    amount <= ceiling && used <= ceiling - amount
-}
+pub(super) use racer_core::read::policy::optional_headroom;
 #[derive(Clone)]
 pub struct Fill {
     pub(super) dependencies: FillDependencies,
@@ -2583,7 +2576,7 @@ impl Fill {
         let admission = &self.dependencies.admission;
         let class = ResourceClass::Ciphertext;
         let limit = admission.limit(class);
-        let ceiling = limit.min((limit / 2).max(one_page));
+        let ceiling = racer_core::read::policy::optional_ceiling(limit, one_page);
         if amount > ceiling {
             return false;
         }

@@ -468,7 +468,10 @@ impl RangeBudget {
                 if _pending && (attempts == 0 || links < 4) {
                     return Ok(None);
                 }
-                budget.partition(attempts, links).map(Some)
+                budget
+                    .partition(attempts, links)
+                    .map(Some)
+                    .map_err(Into::into)
             }
         }
     }
@@ -476,7 +479,7 @@ impl RangeBudget {
         match self {
             Self::ClientPages { .. } | Self::ProgressingPages { .. } => Ok(()),
             #[cfg(test)]
-            Self::Shared(budget) => budget.reunite(_remaining),
+            Self::Shared(budget) => Ok(budget.reunite(_remaining)?),
         }
     }
 }
@@ -2094,7 +2097,7 @@ pub(super) mod tests {
             }
             assert_eq!(
                 remote.begin_attempt(Instant::now(), deadline),
-                Err(Error::Unavailable)
+                Err(racer_core::read::Error::Unavailable)
             );
             budget.complete(page).unwrap();
         }
@@ -2104,13 +2107,16 @@ pub(super) mod tests {
         }
         assert_eq!(
             page.begin_attempt(Instant::now(), deadline),
-            Err(Error::Unavailable)
+            Err(racer_core::read::Error::Unavailable)
         );
         page.charge_links(16).unwrap();
-        assert_eq!(page.charge_links(1), Err(Error::HopBudgetExhausted));
+        assert_eq!(
+            page.charge_links(1),
+            Err(racer_core::read::Error::HopBudgetExhausted)
+        );
         assert_eq!(
             page.begin_attempt(deadline, deadline),
-            Err(Error::DeadlineExceeded)
+            Err(racer_core::read::Error::DeadlineExceeded)
         );
         let mut expired = RangeBudget::ClientPages {
             deadline: Instant::now(),
@@ -2134,9 +2140,12 @@ pub(super) mod tests {
         assert_eq!(next.deadline(), deadline);
         assert_eq!(
             next.begin_attempt(Instant::now(), deadline),
-            Err(Error::Unavailable)
+            Err(racer_core::read::Error::Unavailable)
         );
-        assert_eq!(next.charge_links(1), Err(Error::HopBudgetExhausted));
+        assert_eq!(
+            next.charge_links(1),
+            Err(racer_core::read::Error::HopBudgetExhausted)
+        );
     }
     #[test]
     fn pending_client_window_never_restarts_failed_pages_and_honors_original_deadline() {
@@ -2165,7 +2174,9 @@ pub(super) mod tests {
                 let gate = gate.clone();
                 stream.inject(Slot::Fetching(Box::pin(async move {
                     for _ in 0..8 {
-                        budget.begin_attempt(Instant::now(), budget.deadline())?;
+                        budget
+                            .begin_attempt(Instant::now(), budget.deadline())
+                            .map_err(Error::from)?;
                         attempts.set(attempts.get() + 1);
                     }
                     poll_fn(|_| {
@@ -2178,7 +2189,8 @@ pub(super) mod tests {
                     .await;
                     let result = budget
                         .begin_attempt(Instant::now(), budget.deadline())
-                        .map(|_| unreachable!("same page received fresh retry credits"));
+                        .map(|_| unreachable!("same page received fresh retry credits"))
+                        .map_err(Error::from);
                     Ok((result, budget))
                 })));
             }
@@ -3035,7 +3047,7 @@ pub(super) mod tests {
             }
             assert_eq!(
                 page.begin_attempt(uring_runtime::environment::now(), deadline),
-                Err(Error::Unavailable)
+                Err(racer_core::read::Error::Unavailable)
             );
             clock.advance(Duration::from_millis(20));
             assert_eq!(page.deadline(), deadline);
@@ -3046,7 +3058,7 @@ pub(super) mod tests {
         clock.advance(timeout);
         assert_eq!(
             stalled.begin_attempt(uring_runtime::environment::now(), stalled.deadline()),
-            Err(Error::DeadlineExceeded)
+            Err(racer_core::read::Error::DeadlineExceeded)
         );
     }
 

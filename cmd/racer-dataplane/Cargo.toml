@@ -28,6 +28,7 @@ required-features = ["subscription-interop"]
 controlplane = { path = "controlplane" }
 peer-wire = { path = "peer-wire" }
 racer-object-wire = { path = "object-wire" }
+racer-core = { path = "core" }
 envy = { version = "0.4.2", default-features = false }
 uds-endpoint = { path = "uds-endpoint" }
 wire-codec = { path = "wire-codec", features = ["rest"] }

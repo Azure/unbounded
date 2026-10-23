@@ -142,7 +142,7 @@ fn remote_budget_charges_final_incoming_link_and_never_restores_attempts() {
     assert_eq!(budget.remaining_links(), 0);
     assert_eq!(
         budget.begin_attempt(now, scope.deadline.0),
-        Err(Error::Unavailable)
+        Err(racer_core::read::Error::Unavailable)
     );
     route.remaining_links = 8;
     route.remaining_attempts = 3;
@@ -1646,15 +1646,27 @@ mod flight {
     #[test]
     fn link_refund_is_bounded_and_transfers_do_not_duplicate_refund_rights() {
         let mut original = budget();
-        assert_eq!(original.refund_links(1), Err(Error::InvalidRequest));
+        assert_eq!(
+            original.refund_links(1),
+            Err(racer_core::read::Error::InvalidRequest)
+        );
         original.charge_links(6).unwrap();
         let mut child = original.partition(1, 1).unwrap();
-        assert_eq!(child.refund_links(1), Err(Error::InvalidRequest));
+        assert_eq!(
+            child.refund_links(1),
+            Err(racer_core::read::Error::InvalidRequest)
+        );
         let mut moved = original.transfer();
-        assert_eq!(original.refund_links(1), Err(Error::InvalidRequest));
+        assert_eq!(
+            original.refund_links(1),
+            Err(racer_core::read::Error::InvalidRequest)
+        );
         moved.refund_links(2).unwrap();
         assert_eq!(moved.remaining_links(), 3);
-        assert_eq!(moved.refund_links(5), Err(Error::InvalidRequest));
+        assert_eq!(
+            moved.refund_links(5),
+            Err(racer_core::read::Error::InvalidRequest)
+        );
         assert_eq!(moved.remaining_links(), 3);
     }
 
@@ -1664,7 +1676,7 @@ mod flight {
         let deadline = original.deadline();
         assert!(matches!(
             original.partition(2, 9),
-            Err(Error::HopBudgetExhausted)
+            Err(racer_core::read::Error::HopBudgetExhausted)
         ));
         assert_eq!(original.remaining_attempts(), 3);
         let mut child = original.partition(2, 5).unwrap();
@@ -1674,7 +1686,7 @@ mod flight {
         );
         assert_eq!(
             child.begin_peer_attempt(Instant::now(), deadline, 6),
-            Err(Error::HopBudgetExhausted)
+            Err(racer_core::read::Error::HopBudgetExhausted)
         );
         assert_eq!(child.remaining_attempts(), 2);
         assert_eq!(
@@ -1865,12 +1877,24 @@ mod flight {
         let mut original = budget();
         original.charge_links(6).unwrap();
         let mut child = original.partition(1, 2).unwrap();
-        assert_eq!(child.refund_links(1), Err(Error::InvalidRequest));
+        assert_eq!(
+            child.refund_links(1),
+            Err(racer_core::read::Error::InvalidRequest)
+        );
         let mut moved = original.transfer();
-        assert_eq!(original.refund_links(1), Err(Error::InvalidRequest));
-        assert_eq!(moved.refund_links(7), Err(Error::InvalidRequest));
+        assert_eq!(
+            original.refund_links(1),
+            Err(racer_core::read::Error::InvalidRequest)
+        );
+        assert_eq!(
+            moved.refund_links(7),
+            Err(racer_core::read::Error::InvalidRequest)
+        );
         moved.refund_links(6).unwrap();
-        assert_eq!(moved.refund_links(1), Err(Error::InvalidRequest));
+        assert_eq!(
+            moved.refund_links(1),
+            Err(racer_core::read::Error::InvalidRequest)
+        );
         assert_eq!(moved.remaining_links() + child.remaining_links(), 8);
     }
 
@@ -1991,11 +2015,20 @@ mod flight {
         let mut budget = AcquisitionBudget::new(original, 2, 4);
         assert_eq!(budget.begin_attempt(now, later), Ok(original));
         assert_eq!(budget.charge_links(3), Ok(()));
-        assert_eq!(budget.charge_links(2), Err(Error::HopBudgetExhausted));
+        assert_eq!(
+            budget.charge_links(2),
+            Err(racer_core::read::Error::HopBudgetExhausted)
+        );
         assert_eq!(budget.charge_links(1), Ok(()));
         assert_eq!(budget.begin_attempt(now, later), Ok(original));
-        assert_eq!(budget.begin_attempt(now, later), Err(Error::Unavailable));
-        assert_eq!(budget.charge_links(1), Err(Error::HopBudgetExhausted));
+        assert_eq!(
+            budget.begin_attempt(now, later),
+            Err(racer_core::read::Error::Unavailable)
+        );
+        assert_eq!(
+            budget.charge_links(1),
+            Err(racer_core::read::Error::HopBudgetExhausted)
+        );
     }
 
     #[test]
@@ -2005,17 +2038,20 @@ mod flight {
         let mut first = AcquisitionBudget::new(deadline, 1, 0);
         let mut remaining = AcquisitionBudget::new(deadline, 1, 4);
         assert_eq!(first.begin_attempt(now, deadline), Ok(deadline));
-        assert_eq!(first.begin_attempt(now, deadline), Err(Error::Unavailable));
+        assert_eq!(
+            first.begin_attempt(now, deadline),
+            Err(racer_core::read::Error::Unavailable)
+        );
         assert_eq!(
             remaining.begin_attempt(now, now),
-            Err(Error::DeadlineExceeded)
+            Err(racer_core::read::Error::DeadlineExceeded)
         );
         // Expiry checks and failed charges do not consume unrelated credits.
         assert_eq!(remaining.begin_attempt(now, deadline), Ok(deadline));
         assert_eq!(remaining.charge_links(4), Ok(()));
         assert_eq!(
             first.begin_attempt(deadline, deadline),
-            Err(Error::DeadlineExceeded)
+            Err(racer_core::read::Error::DeadlineExceeded)
         );
     }
 }

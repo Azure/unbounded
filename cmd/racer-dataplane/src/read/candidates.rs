@@ -75,98 +75,8 @@ pub struct OriginAuthority {
     predecessor_evidence: Vec<ProbeOutcome>,
     rank: usize,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProbeOutcome {
-    CopyMiss,
-    Unreachable,
-    Overloaded,
-    VersionUnavailable,
-    /// An authenticated response carried a copy that could not be used locally.
-    UnusableCopy,
-}
-/// How a non-owner requester orders its remote attempts across a page's
-/// ranked owners. Placement, rank, and origin authority are unchanged: this only
-/// chooses which owner receives the first Acquire.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ReplicaSelection {
-    /// Visit owners in canonical rank order, so every remote read of a page
-    /// lands on the primary owner first.
-    Primary,
-    /// Visit owners that are direct overlay neighbors before owners that need
-    /// a relay hop. Among equally preferred owners, a rendezvous hash of the
-    /// requester and page picks a stable order, so one requester keeps using
-    /// the same replica for a page while different requesters spread the
-    /// load across all replicas.
-    #[default]
-    Spread,
-}
-
-/// Canonical ranks in the order a non-owner requester visits them. At most
-/// three owners exist; `ordered` itself stays the authoritative rank order.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct VisitOrder {
-    ranks: [u8; 3],
-    len: u8,
-}
-
-impl VisitOrder {
-    /// The identity order over the first `len` (at most three) ranks.
-    pub(crate) fn canonical(len: usize) -> Self {
-        Self {
-            ranks: [0, 1, 2],
-            len: len.min(3) as u8,
-        }
-    }
-
-    /// Canonical ranks in visiting order.
-    pub(crate) fn ranks(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
-        self.ranks[..usize::from(self.len)]
-            .iter()
-            .map(|rank| usize::from(*rank))
-    }
-
-    /// The canonical rank visited at `index`, if any.
-    pub(crate) fn get(&self, index: usize) -> Option<usize> {
-        self.ranks[..usize::from(self.len)]
-            .get(index)
-            .map(|rank| usize::from(*rank))
-    }
-}
-
-/// Order `len` canonical ranks for a non-owner requester. `Primary` returns the
-/// canonical order. `Spread` visits ranks for which `neighbor` holds first, then
-/// orders each group by descending `score` (ties keep canonical order).
-pub(crate) fn visit_order(
-    selection: ReplicaSelection,
-    len: usize,
-    neighbor: impl Fn(usize) -> bool,
-    score: impl Fn(usize) -> u64,
-) -> VisitOrder {
-    let mut order = VisitOrder::canonical(len);
-    if selection == ReplicaSelection::Primary || order.len < 2 {
-        return order;
-    }
-    let mut keys = [(false, 0u64); 3];
-    for (rank, key) in keys.iter_mut().enumerate().take(usize::from(order.len)) {
-        *key = (!neighbor(rank), u64::MAX - score(rank));
-    }
-    order.ranks[..usize::from(order.len)].sort_by_key(|rank| (keys[usize::from(*rank)], *rank));
-    order
-}
-
-/// Rendezvous weight of one owner for one requester and page. Stable within a
-/// process; it only spreads load, so it never needs to agree across nodes.
-fn replica_score(requester: &NodeId, object: &ObjectId, page: PageNumber, owner: &NodeId) -> u64 {
-    use std::hash::Hash;
-    use std::hash::Hasher;
-    let mut hasher = std::hash::DefaultHasher::new();
-    requester.0.hash(&mut hasher);
-    object.cache.0.hash(&mut hasher);
-    object.key.0.hash(&mut hasher);
-    page.0.hash(&mut hasher);
-    owner.0.hash(&mut hasher);
-    hasher.finish()
-}
+pub use racer_core::read::candidates::{ProbeOutcome, ReplicaSelection};
+pub(crate) use racer_core::read::candidates::{VisitOrder, replica_score, visit_order};
 
 pub struct CandidatePolicy {
     hedge: Option<Arc<Hedges>>,
@@ -1735,16 +1645,7 @@ impl CandidatePolicy {
     }
 
     pub fn origin_miss_error(&self, authority: &OriginAuthority) -> Error {
-        if authority.predecessor_evidence.iter().any(|outcome| {
-            matches!(
-                outcome,
-                ProbeOutcome::Unreachable | ProbeOutcome::Overloaded | ProbeOutcome::UnusableCopy
-            )
-        }) {
-            Error::Unavailable
-        } else {
-            Error::VersionUnavailable
-        }
+        racer_core::read::candidates::origin_miss_error(&authority.predecessor_evidence).into()
     }
     pub(super) fn final_origin_miss(
         &self,
@@ -1891,11 +1792,11 @@ async fn validated_copy<'a, T>(
         Ok(copy) => Ok(Ok(copy)),
         // Only page content validation is recoverable here. Transport/security
         // errors never enter this helper, and Unauthorized remains terminal.
-        Err(Error::CorruptRecord | Error::MissingKey)
-            if matches!(
-                operation,
-                PeerOperation::Page { .. } | PeerOperation::Bootstrap { .. }
-            ) =>
+        Err(error)
+            if racer_core::read::Error::try_from(error).is_ok_and(|error| {
+                racer_core::read::candidates::unusable_copy(error, operation_kind(operation))
+                    .is_some()
+            }) =>
         {
             Ok(Err(ProbeOutcome::UnusableCopy))
         }
@@ -1904,18 +1805,18 @@ async fn validated_copy<'a, T>(
 }
 impl OriginAuthority {
     pub fn validate(&self, object: &ObjectId, page: PageNumber) -> Result<()> {
-        if object != &self.object || page != self.page {
-            return Err(Error::Unauthorized);
-        }
-        // Private construction follows a recomputed ranking under this immutable
-        // membership. Validation need not rehash the entire cluster on each write.
-        if self.rank >= 3
-            || self.predecessor_evidence.len() != self.rank
-            || self.membership.member(&self.node).is_err()
-        {
-            return Err(Error::Unauthorized);
-        }
-        Ok(())
+        racer_core::read::candidates::validate_origin_authority(
+            racer_core::read::candidates::AuthorityFacts {
+                object: &self.object,
+                page: self.page,
+                rank: self.rank,
+                predecessor_evidence: self.predecessor_evidence.len(),
+                member: self.membership.member(&self.node).is_ok(),
+            },
+            object,
+            page,
+        )
+        .map_err(Error::from)
     }
 }
 
@@ -1978,92 +1879,101 @@ fn copy_operation(operation: &PeerOperation, mode: FetchMode) -> PeerOperation {
         },
     }
 }
+/// Payload-free shape of `operation` for racer-core classification.
+pub(crate) fn operation_kind(
+    operation: &PeerOperation,
+) -> racer_core::read::candidates::OperationKind {
+    use racer_core::read::candidates::OperationKind;
+    match operation {
+        PeerOperation::Subscribe { .. } => OperationKind::Subscribe,
+        PeerOperation::Page { .. } => OperationKind::Page,
+        PeerOperation::Metadata { selector, .. } => OperationKind::Metadata {
+            fresh: matches!(selector, MetadataSelector::Fresh),
+        },
+        PeerOperation::Bootstrap { .. } => OperationKind::Bootstrap,
+        PeerOperation::Warm { .. } => OperationKind::Warm,
+    }
+}
+
 // `acquire` describes the actual probe, which may be CopyOnly even when the
 // caller's operation requests acquisition (predecessors and remaining copies).
+// racer-core owns the outcome table; this supplies payload identity checks.
 fn classify(
     response: &PeerResponse,
     operation: &PeerOperation,
     acquire: bool,
 ) -> Result<Option<ProbeOutcome>> {
-    match response {
-        PeerResponse::Selected {
-            metadata,
-            ciphertext,
-            grant,
-        } => match operation {
-            PeerOperation::Subscribe { subscription, .. }
-                if grant.page.version == subscription.version
-                    && subscription.demand.contains(grant.page.number.0)
-                    && ciphertext.envelope().page == grant.page
-                    && metadata.version == subscription.version =>
-            {
-                metadata.immutable().validate_page(ciphertext.envelope())?;
-                Ok(None)
-            }
-            _ => Err(Error::CorruptRecord),
-        },
-        PeerResponse::Miss => Ok(Some(ProbeOutcome::CopyMiss)),
-        PeerResponse::NotFound => match operation {
-            PeerOperation::Bootstrap { .. } if acquire => Err(Error::NotFound),
-            PeerOperation::Metadata {
-                selector: MetadataSelector::Fresh,
-                ..
-            } if acquire => Err(Error::NotFound),
-            _ => Err(Error::Unauthorized),
-        },
-        PeerResponse::VersionUnavailable => Ok(Some(ProbeOutcome::VersionUnavailable)),
-        PeerResponse::Unavailable => Ok(Some(ProbeOutcome::Unreachable)),
-        PeerResponse::Overloaded => Ok(Some(ProbeOutcome::Overloaded)),
-        PeerResponse::OriginRejected => Err(Error::OriginRejected),
-        PeerResponse::OriginForbidden => Err(Error::OriginForbidden),
-        PeerResponse::StaleMembership => Err(Error::IncompatibleMembership),
-        // Warm acknowledgements never answer a candidate data probe.
-        PeerResponse::Held { .. } | PeerResponse::Warmed | PeerResponse::Released => {
-            Err(Error::CorruptRecord)
+    racer_core::read::candidates::classify(
+        response.kind(),
+        operation_kind(operation),
+        acquire,
+        || validate_payload(response, operation),
+    )
+}
+
+/// Payload identity and content checks for a response whose kind answers the
+/// operation's kind. Mismatches are corrupt records.
+fn validate_payload(response: &PeerResponse, operation: &PeerOperation) -> Result<()> {
+    match (response, operation) {
+        (
+            PeerResponse::Selected {
+                metadata,
+                ciphertext,
+                grant,
+            },
+            PeerOperation::Subscribe { subscription, .. },
+        ) if grant.page.version == subscription.version
+            && subscription.demand.contains(grant.page.number.0)
+            && ciphertext.envelope().page == grant.page
+            && metadata.version == subscription.version =>
+        {
+            metadata
+                .immutable()
+                .validate_page(ciphertext.envelope())
+                .map_err(Error::from)
         }
-        PeerResponse::Bootstrap {
-            metadata,
-            page_zero,
-        } => match operation {
-            PeerOperation::Bootstrap { object, .. } if &metadata.version.object == object => {
-                if let Some(page) = page_zero {
-                    metadata.immutable().validate_page(page.envelope())?;
-                    if page.envelope().page.number.0 != 0 {
-                        return Err(Error::CorruptRecord);
-                    }
-                }
-                if page_zero.is_some() != (metadata.length != 0) {
+        (
+            PeerResponse::Bootstrap {
+                metadata,
+                page_zero,
+            },
+            PeerOperation::Bootstrap { object, .. },
+        ) if &metadata.version.object == object => {
+            if let Some(page) = page_zero {
+                metadata.immutable().validate_page(page.envelope())?;
+                if page.envelope().page.number.0 != 0 {
                     return Err(Error::CorruptRecord);
                 }
-                Ok(None)
             }
-            _ => Err(Error::CorruptRecord),
-        },
-        PeerResponse::Page {
-            metadata,
-            ciphertext,
-        } => match operation {
-            PeerOperation::Page { page, .. }
-                if &ciphertext.envelope().page == page && metadata.version == page.version =>
-            {
-                metadata.immutable().validate_page(ciphertext.envelope())?;
-                Ok(None)
+            if page_zero.is_some() != (metadata.length != 0) {
+                return Err(Error::CorruptRecord);
             }
-            _ => Err(Error::CorruptRecord),
-        },
-        PeerResponse::Metadata(metadata) => match operation {
+            Ok(())
+        }
+        (
+            PeerResponse::Page {
+                metadata,
+                ciphertext,
+            },
+            PeerOperation::Page { page, .. },
+        ) if &ciphertext.envelope().page == page && metadata.version == page.version => metadata
+            .immutable()
+            .validate_page(ciphertext.envelope())
+            .map_err(Error::from),
+        (
+            PeerResponse::Metadata(metadata),
             PeerOperation::Metadata {
                 object, selector, ..
-            } if &metadata.version.object == object => {
-                if let MetadataSelector::Pinned(etag) = selector
-                    && &metadata.version.etag != etag
-                {
-                    return Err(Error::CorruptRecord);
-                }
-                Ok(None)
+            },
+        ) if &metadata.version.object == object => {
+            if let MetadataSelector::Pinned(etag) = selector
+                && &metadata.version.etag != etag
+            {
+                return Err(Error::CorruptRecord);
             }
-            _ => Err(Error::CorruptRecord),
-        },
+            Ok(())
+        }
+        _ => Err(Error::CorruptRecord),
     }
 }
 
@@ -2221,13 +2131,7 @@ pub(crate) async fn race(
     .await
 }
 fn recoverable(error: Error) -> bool {
-    matches!(
-        error,
-        Error::Unavailable | Error::Io | Error::Os(_) | Error::Overloaded | Error::CorruptRecord | Error::MissingKey | Error::Cancelled
-    // Malformed framing is local to that contender, not authority to
-    // cancel another independently authenticated usable page.
-    | Error::InvalidRequest | Error::HeaderTooLarge
-    )
+    racer_core::read::Error::try_from(error).is_ok_and(racer_core::read::policy::recoverable)
 }
 
 #[cfg(test)]

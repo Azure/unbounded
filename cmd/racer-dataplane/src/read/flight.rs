@@ -325,161 +325,12 @@ impl FlightOperation {
     }
 }
 
-/// Original acquisition budget, owned by one metadata/bootstrap operation or
-/// page acquisition. Client range progress admits distinct pages with separate
-/// bounded allowances under the same deadline. Retry never reconstructs an
-/// acquisition budget from defaults. Fanout must partition credits;
-/// route attempts must charge actual forwarded links here as well as on the wire.
-/// No Clone: a replacement caller uses its own remaining credits, not fresh ones.
+/// Original acquisition budget; the rule lives in racer-core.
 /// ```compile_fail
 /// use racer_dataplane::read::flight::AcquisitionBudget;
 /// fn duplicate(budget: AcquisitionBudget) { let _other = budget.clone(); }
 /// ```
-pub struct AcquisitionBudget {
-    deadline: Instant,
-    attempts: u32,
-    links: u8,
-    charged_links: u16,
-    failed_route: bool,
-}
-impl AcquisitionBudget {
-    pub fn new(deadline: Instant, attempts: u32, links: u8) -> Self {
-        Self {
-            deadline,
-            attempts,
-            links,
-            charged_links: 0,
-            failed_route: false,
-        }
-    }
-
-    /// Pure budget validation/debit. The driver also checks original cancellation
-    /// and candidate authority before I/O. Return the tighter original deadline.
-    pub fn begin_attempt(&mut self, now: Instant, caller_deadline: Instant) -> Result<Instant> {
-        let deadline = self.deadline.min(caller_deadline);
-        if now >= deadline {
-            return Err(Error::DeadlineExceeded);
-        }
-        self.attempts = self.attempts.checked_sub(1).ok_or(Error::Unavailable)?;
-        Ok(deadline)
-    }
-
-    pub fn charge_links(&mut self, links: u8) -> Result<()> {
-        self.links = self
-            .links
-            .checked_sub(links)
-            .ok_or(Error::HopBudgetExhausted)?;
-        self.charged_links = self.charged_links.saturating_add(u16::from(links));
-        Ok(())
-    }
-
-    /// Reconcile unused links only after a verified completed route. Refunds
-    /// cannot exceed prior debits; failed exchanges must retain their full debit.
-    pub fn refund_links(&mut self, links: u8) -> Result<()> {
-        let charged = self
-            .charged_links
-            .checked_sub(u16::from(links))
-            .ok_or(Error::InvalidRequest)?;
-        let available = self.links.checked_add(links).ok_or(Error::InvalidRequest)?;
-        self.charged_links = charged;
-        self.links = available;
-        Ok(())
-    }
-
-    pub fn deadline(&self) -> Instant {
-        self.deadline
-    }
-    pub fn remaining_attempts(&self) -> u32 {
-        self.attempts
-    }
-    pub fn remaining_links(&self) -> u8 {
-        self.links
-    }
-
-    /// Both normal and failure ceilings draw from credits allocated by ingress.
-    /// Observing failure changes the per-attempt ceiling, never adds credits.
-    pub fn route_links(&self) -> u8 {
-        self.links.min(if self.failed_route { 8 } else { 4 })
-    }
-    pub fn note_route_failure(&mut self) {
-        self.failed_route = true;
-    }
-
-    /// Consume an owned child's unused credits exactly once. Do not reconstruct a
-    /// default budget or refund uncertain work after a lost remote response.
-    pub fn reunite(&mut self, child: Self) -> Result<()> {
-        let attempts = self
-            .attempts
-            .checked_add(child.attempts)
-            .ok_or(Error::InvalidRequest)?;
-        let links = self
-            .links
-            .checked_add(child.links)
-            .ok_or(Error::InvalidRequest)?;
-        self.deadline = self.deadline.min(child.deadline);
-        self.attempts = attempts;
-        self.links = links;
-        self.failed_route |= child.failed_route;
-        Ok(())
-    }
-
-    /// Move credits into an independently owned worker/range child. Failure is
-    /// atomic; neither fanout nor a worker transfer can mint original credits.
-    pub fn partition(&mut self, attempts: u32, links: u8) -> Result<Self> {
-        let remaining_attempts = self
-            .attempts
-            .checked_sub(attempts)
-            .ok_or(Error::Unavailable)?;
-        let remaining_links = self
-            .links
-            .checked_sub(links)
-            .ok_or(Error::HopBudgetExhausted)?;
-        self.attempts = remaining_attempts;
-        self.links = remaining_links;
-        let mut child = Self::new(self.deadline, attempts, links);
-        child.failed_route = self.failed_route;
-        Ok(child)
-    }
-
-    pub fn transfer(&mut self) -> Self {
-        let attempts = std::mem::take(&mut self.attempts);
-        let links = std::mem::take(&mut self.links);
-        Self {
-            deadline: self.deadline,
-            attempts,
-            links,
-            charged_links: std::mem::take(&mut self.charged_links),
-            failed_route: self.failed_route,
-        }
-    }
-
-    /// Atomically debit a peer route's attempt and all forwarded links before I/O.
-    pub fn begin_peer_attempt(
-        &mut self,
-        now: Instant,
-        caller_deadline: Instant,
-        links: u8,
-    ) -> Result<Instant> {
-        if links == 0 {
-            return Err(Error::InvalidRequest);
-        }
-        let deadline = self.deadline.min(caller_deadline);
-        if now >= deadline {
-            return Err(Error::DeadlineExceeded);
-        }
-        if self.attempts == 0 {
-            return Err(Error::Unavailable);
-        }
-        let remaining = self
-            .links
-            .checked_sub(links)
-            .ok_or(Error::HopBudgetExhausted)?;
-        self.attempts -= 1;
-        self.links = remaining;
-        self.charged_links = self.charged_links.saturating_add(u16::from(links));
-        Ok(deadline)
-    }
-}
+pub use racer_core::read::AcquisitionBudget;
 
 /// Includes table identity to reject tokens from another worker/table, plus entry
 /// incarnation and acquisition generation to fence remove/rejoin and retry races.
@@ -675,10 +526,10 @@ impl AcquisitionWaiter<'_> {
                     return Poll::Ready(Ok(AcquisitionEvent::Failed(error)));
                 }
                 if matches!(entry.state.phase, Phase::RetryPending) && !waiter.issued {
-                    if uring_runtime::environment::now() >= self.budget.deadline
-                        || (self.budget.attempts == 0 && entry.state.partial.is_none())
+                    if uring_runtime::environment::now() >= self.budget.deadline()
+                        || (self.budget.remaining_attempts() == 0 && entry.state.partial.is_none())
                     {
-                        let error = if self.budget.attempts == 0 {
+                        let error = if self.budget.remaining_attempts() == 0 {
                             Error::Unavailable
                         } else {
                             Error::DeadlineExceeded
@@ -938,10 +789,10 @@ impl Flights {
             return Err(Error::Cancelled);
         }
         if !self.table.borrow().contains_key(&page) {
-            if uring_runtime::environment::now() >= budget.deadline {
+            if uring_runtime::environment::now() >= budget.deadline() {
                 return Err(Error::DeadlineExceeded);
             }
-            if budget.attempts == 0 {
+            if budget.remaining_attempts() == 0 {
                 return Err(Error::Unavailable);
             }
             if !self.waiting.is_empty() {
@@ -1007,10 +858,12 @@ impl Flights {
                     return Err(Error::Overloaded);
                 }
             }
-            if uring_runtime::environment::now() >= budget.deadline {
+            if uring_runtime::environment::now() >= budget.deadline() {
                 return Err(Error::DeadlineExceeded);
             }
-            if budget.attempts == 0 && table.get(&page).is_none_or(|e| e.partial.is_none()) {
+            if budget.remaining_attempts() == 0
+                && table.get(&page).is_none_or(|e| e.partial.is_none())
+            {
                 return Err(Error::Unavailable);
             }
             let cancellation = scope.cancellation.subscribe()?;
@@ -1078,7 +931,7 @@ impl Flights {
                 id,
                 WaiterRecord {
                     scope: scope.clone(),
-                    budget_deadline: budget.deadline,
+                    budget_deadline: budget.deadline(),
                     _reservation: reservation,
                 },
                 true,
@@ -1139,10 +992,10 @@ impl Flights {
             return Err(Error::Cancelled);
         }
         self.admit_join(&page, None)?;
-        if uring_runtime::environment::now() >= budget.deadline {
+        if uring_runtime::environment::now() >= budget.deadline() {
             return Err(Error::DeadlineExceeded);
         }
-        if budget.attempts == 0 {
+        if budget.remaining_attempts() == 0 {
             return Err(Error::Unavailable);
         }
         if self.waiting.is_empty()
@@ -1155,7 +1008,7 @@ impl Flights {
             return self.join(page, membership, context, scope, budget);
         }
         let cutoff = uring_runtime::environment::now() + std::time::Duration::from_millis(100);
-        let deadline = cutoff.min(scope.deadline.0).min(budget.deadline);
+        let deadline = cutoff.min(scope.deadline.0).min(budget.deadline());
         let (reservation, detail) = crate::admission::capture_rejection(&self.admission, || {
             self.admission
                 .reserve(Some(&page.version.object.cache), ResourceClass::Waiter, 1)
@@ -1193,7 +1046,7 @@ impl Flights {
                 return Poll::Ready(Err(error));
             }
             let now = uring_runtime::environment::now();
-            if now >= budget.deadline {
+            if now >= budget.deadline() {
                 reason = crate::telemetry::WaitGate::BudgetDeadline;
                 return Poll::Ready(Err(Error::DeadlineExceeded));
             }
@@ -1210,7 +1063,7 @@ impl Flights {
             if self.table.borrow().contains_key(&page) {
                 return Poll::Ready(Ok(None));
             }
-            if budget.attempts == 0 {
+            if budget.remaining_attempts() == 0 {
                 return Poll::Ready(Err(Error::Unavailable));
             }
             if ticket.is_none() {

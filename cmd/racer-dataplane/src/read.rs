@@ -94,21 +94,14 @@ pub(crate) fn inherited_budget(
     scope: &RequestScope,
 ) -> Result<AcquisitionBudget> {
     scope.check()?;
-    if route.remaining_links > 8 || route.remaining_links == 0 || route.visited.is_empty() {
-        return Err(Error::HopBudgetExhausted);
-    }
-    let mut budget = AcquisitionBudget::new(
-        scope.deadline.0.min(route.deadline.0),
+    racer_core::read::budget::inherited_budget(
+        scope.deadline.0,
+        route.deadline.0,
         route.remaining_attempts,
-        route
-            .remaining_links
-            .checked_sub(1)
-            .ok_or(Error::HopBudgetExhausted)?,
-    );
-    if route.remaining_links > 4 {
-        budget.note_route_failure();
-    }
-    Ok(budget)
+        route.remaining_links,
+        route.visited.len(),
+    )
+    .map_err(Error::from)
 }
 
 impl Coordinator {
@@ -511,17 +504,19 @@ fn resolve_range(range: ByteRange, length: u64) -> Result<ResolvedRange> {
 
 /// Translate expected acquisition failures without masking internal peer errors.
 fn peer_error(error: Error) -> Result<PeerResponse> {
-    match error {
-        Error::NotFound => Ok(PeerResponse::NotFound),
-        Error::VersionUnavailable => Ok(PeerResponse::VersionUnavailable),
-        Error::Overloaded => Ok(PeerResponse::Overloaded),
-        Error::OriginRejected => Ok(PeerResponse::OriginRejected),
-        Error::OriginForbidden => Ok(PeerResponse::OriginForbidden),
-        Error::Unavailable | Error::HopBudgetExhausted | Error::DeadlineExceeded => {
-            Ok(PeerResponse::Unavailable)
-        }
-        error => Err(error),
-    }
+    use racer_core::read::candidates::ResponseKind;
+    let kind = racer_core::read::Error::try_from(error)
+        .ok()
+        .and_then(racer_core::read::policy::peer_error);
+    Ok(match kind {
+        Some(ResponseKind::NotFound) => PeerResponse::NotFound,
+        Some(ResponseKind::VersionUnavailable) => PeerResponse::VersionUnavailable,
+        Some(ResponseKind::Overloaded) => PeerResponse::Overloaded,
+        Some(ResponseKind::OriginRejected) => PeerResponse::OriginRejected,
+        Some(ResponseKind::OriginForbidden) => PeerResponse::OriginForbidden,
+        Some(ResponseKind::Unavailable) => PeerResponse::Unavailable,
+        _ => return Err(error),
+    })
 }
 
 #[cfg(test)]

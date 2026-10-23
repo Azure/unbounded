@@ -565,7 +565,9 @@ impl MetadataService {
         budget: &mut AcquisitionBudget,
     ) -> std::result::Result<RefreshOutput, RefreshFailure> {
         authority.validate(&context.object, PageNumber(0))?;
-        budget.begin_attempt(uring_runtime::environment::now(), scope.deadline.0)?;
+        budget
+            .begin_attempt(uring_runtime::environment::now(), scope.deadline.0)
+            .map_err(Error::from)?;
         let selector = purpose.selector();
         let acquisition = match purpose {
             RefreshPurpose::Bootstrap => {
@@ -1194,9 +1196,12 @@ pub(crate) mod tests {
         assert_eq!(next.begin_attempt(now, deadline), Ok(deadline));
         assert_eq!(
             supplier.begin_attempt(now, deadline),
-            Err(Error::Unavailable)
+            Err(racer_core::read::Error::Unavailable)
         );
-        assert_eq!(next.begin_attempt(now, deadline), Err(Error::Unavailable));
+        assert_eq!(
+            next.begin_attempt(now, deadline),
+            Err(racer_core::read::Error::Unavailable)
+        );
     }
 
     #[test]

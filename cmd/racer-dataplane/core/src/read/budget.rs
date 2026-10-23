@@ -1,7 +1,6 @@
 //! Acquisition credits: deadline, attempts, and route links.
 //!
-//! Errors are generic over `E: From<Error>` so callers keep their own error
-//! type without wrapping each call.
+//! Errors are racer-core errors; the dataplane converts them with `?`.
 
 use super::error::{Error, Result};
 use std::time::Instant;
@@ -36,20 +35,16 @@ impl AcquisitionBudget {
 
     /// Pure budget validation/debit. The driver also checks original cancellation
     /// and candidate authority before I/O. Return the tighter original deadline.
-    pub fn begin_attempt<E: From<Error>>(
-        &mut self,
-        now: Instant,
-        caller_deadline: Instant,
-    ) -> Result<Instant, E> {
+    pub fn begin_attempt(&mut self, now: Instant, caller_deadline: Instant) -> Result<Instant> {
         let deadline = self.deadline.min(caller_deadline);
         if now >= deadline {
-            return Err(Error::DeadlineExceeded.into());
+            return Err(Error::DeadlineExceeded);
         }
         self.attempts = self.attempts.checked_sub(1).ok_or(Error::Unavailable)?;
         Ok(deadline)
     }
 
-    pub fn charge_links<E: From<Error>>(&mut self, links: u8) -> Result<(), E> {
+    pub fn charge_links(&mut self, links: u8) -> Result<()> {
         self.links = self
             .links
             .checked_sub(links)
@@ -60,7 +55,7 @@ impl AcquisitionBudget {
 
     /// Reconcile unused links only after a verified completed route. Refunds
     /// cannot exceed prior debits; failed exchanges must retain their full debit.
-    pub fn refund_links<E: From<Error>>(&mut self, links: u8) -> Result<(), E> {
+    pub fn refund_links(&mut self, links: u8) -> Result<()> {
         let charged = self
             .charged_links
             .checked_sub(u16::from(links))
@@ -92,7 +87,7 @@ impl AcquisitionBudget {
 
     /// Consume an owned child's unused credits exactly once. Do not reconstruct a
     /// default budget or refund uncertain work after a lost remote response.
-    pub fn reunite<E: From<Error>>(&mut self, child: Self) -> Result<(), E> {
+    pub fn reunite(&mut self, child: Self) -> Result<()> {
         let attempts = self
             .attempts
             .checked_add(child.attempts)
@@ -110,7 +105,7 @@ impl AcquisitionBudget {
 
     /// Move credits into an independently owned worker/range child. Failure is
     /// atomic; neither fanout nor a worker transfer can mint original credits.
-    pub fn partition<E: From<Error>>(&mut self, attempts: u32, links: u8) -> Result<Self, E> {
+    pub fn partition(&mut self, attempts: u32, links: u8) -> Result<Self> {
         let remaining_attempts = self
             .attempts
             .checked_sub(attempts)
@@ -139,21 +134,21 @@ impl AcquisitionBudget {
     }
 
     /// Atomically debit a peer route's attempt and all forwarded links before I/O.
-    pub fn begin_peer_attempt<E: From<Error>>(
+    pub fn begin_peer_attempt(
         &mut self,
         now: Instant,
         caller_deadline: Instant,
         links: u8,
-    ) -> Result<Instant, E> {
+    ) -> Result<Instant> {
         if links == 0 {
-            return Err(Error::InvalidRequest.into());
+            return Err(Error::InvalidRequest);
         }
         let deadline = self.deadline.min(caller_deadline);
         if now >= deadline {
-            return Err(Error::DeadlineExceeded.into());
+            return Err(Error::DeadlineExceeded);
         }
         if self.attempts == 0 {
-            return Err(Error::Unavailable.into());
+            return Err(Error::Unavailable);
         }
         let remaining = self
             .links
@@ -175,15 +170,15 @@ pub const NORMAL_ROUTE_LINKS: u8 = 4;
 /// Inherit a forwarded peer's remaining route allowance without extending its
 /// deadline. `scope_deadline` is the local request deadline; the route fields
 /// come from the verified forwarding budget. The caller checks cancellation.
-pub fn inherited_budget<E: From<Error>>(
+pub fn inherited_budget(
     scope_deadline: Instant,
     route_deadline: Instant,
     remaining_attempts: u32,
     remaining_links: u8,
     visited: usize,
-) -> Result<AcquisitionBudget, E> {
+) -> Result<AcquisitionBudget> {
     if remaining_links > MAX_ROUTE_LINKS || remaining_links == 0 || visited == 0 {
-        return Err(Error::HopBudgetExhausted.into());
+        return Err(Error::HopBudgetExhausted);
     }
     let mut budget = AcquisitionBudget::new(
         scope_deadline.min(route_deadline),
@@ -208,17 +203,16 @@ mod tests {
         let now = Instant::now();
         let mut budget = AcquisitionBudget::new(now + Duration::from_secs(5), 1, 8);
         let deadline: Instant = budget
-            .begin_attempt::<Error>(now, now + Duration::from_secs(1))
+            .begin_attempt(now, now + Duration::from_secs(1))
             .unwrap();
         assert_eq!(deadline, now + Duration::from_secs(1));
         assert_eq!(budget.remaining_attempts(), 0);
         assert_eq!(
-            budget.begin_attempt::<Error>(now, now + Duration::from_secs(1)),
+            budget.begin_attempt(now, now + Duration::from_secs(1)),
             Err(Error::Unavailable)
         );
         assert_eq!(
-            budget
-                .begin_attempt::<Error>(now + Duration::from_secs(5), now + Duration::from_secs(9)),
+            budget.begin_attempt(now + Duration::from_secs(5), now + Duration::from_secs(9)),
             Err(Error::DeadlineExceeded)
         );
     }
@@ -227,15 +221,12 @@ mod tests {
     fn links_charge_refund_and_never_mint() {
         let now = Instant::now();
         let mut budget = AcquisitionBudget::new(now, 3, 8);
-        budget.charge_links::<Error>(3).unwrap();
+        budget.charge_links(3).unwrap();
         assert_eq!(budget.remaining_links(), 5);
-        assert_eq!(budget.refund_links::<Error>(4), Err(Error::InvalidRequest));
-        budget.refund_links::<Error>(3).unwrap();
+        assert_eq!(budget.refund_links(4), Err(Error::InvalidRequest));
+        budget.refund_links(3).unwrap();
         assert_eq!(budget.remaining_links(), 8);
-        assert_eq!(
-            budget.charge_links::<Error>(9),
-            Err(Error::HopBudgetExhausted)
-        );
+        assert_eq!(budget.charge_links(9), Err(Error::HopBudgetExhausted));
         assert_eq!(budget.route_links(), 4);
         budget.note_route_failure();
         assert_eq!(budget.route_links(), 8);
@@ -245,20 +236,17 @@ mod tests {
     fn partition_and_reunite_conserve_credits() {
         let now = Instant::now();
         let mut parent = AcquisitionBudget::new(now, 4, 8);
-        let child = parent.partition::<Error>(3, 5).unwrap();
+        let child = parent.partition(3, 5).unwrap();
         assert_eq!(
             (parent.remaining_attempts(), parent.remaining_links()),
             (1, 3)
         );
+        assert!(matches!(parent.partition(2, 0), Err(Error::Unavailable)));
         assert!(matches!(
-            parent.partition::<Error>(2, 0),
-            Err(Error::Unavailable)
-        ));
-        assert!(matches!(
-            parent.partition::<Error>(0, 4),
+            parent.partition(0, 4),
             Err(Error::HopBudgetExhausted)
         ));
-        parent.reunite::<Error>(child).unwrap();
+        parent.reunite(child).unwrap();
         assert_eq!(
             (parent.remaining_attempts(), parent.remaining_links()),
             (4, 8)
@@ -280,20 +268,20 @@ mod tests {
         let later = now + Duration::from_secs(1);
         let mut budget = AcquisitionBudget::new(later, 1, 2);
         assert_eq!(
-            budget.begin_peer_attempt::<Error>(now, later, 0),
+            budget.begin_peer_attempt(now, later, 0),
             Err(Error::InvalidRequest)
         );
         assert_eq!(
-            budget.begin_peer_attempt::<Error>(now, later, 3),
+            budget.begin_peer_attempt(now, later, 3),
             Err(Error::HopBudgetExhausted)
         );
         assert_eq!(
             (budget.remaining_attempts(), budget.remaining_links()),
             (1, 2)
         );
-        assert_eq!(budget.begin_peer_attempt::<Error>(now, later, 2), Ok(later));
+        assert_eq!(budget.begin_peer_attempt(now, later, 2), Ok(later));
         assert_eq!(
-            budget.begin_peer_attempt::<Error>(now, later, 1),
+            budget.begin_peer_attempt(now, later, 1),
             Err(Error::Unavailable)
         );
     }
@@ -311,16 +299,16 @@ mod tests {
             (8, 1, true),
         ] {
             assert_eq!(
-                inherited_budget::<Error>(later, soon, 2, links, visited).is_ok(),
+                inherited_budget(later, soon, 2, links, visited).is_ok(),
                 ok,
                 "{links} {visited}"
             );
         }
-        let budget = inherited_budget::<Error>(later, soon, 2, 5, 1).unwrap();
+        let budget = inherited_budget(later, soon, 2, 5, 1).unwrap();
         assert_eq!(budget.deadline(), soon);
         assert_eq!(budget.remaining_links(), 4);
         assert_eq!(budget.route_links(), 4);
-        let budget = inherited_budget::<Error>(soon, later, 2, 4, 1).unwrap();
+        let budget = inherited_budget(soon, later, 2, 4, 1).unwrap();
         assert_eq!(budget.deadline(), soon);
         assert_eq!(budget.route_links(), 3);
     }
