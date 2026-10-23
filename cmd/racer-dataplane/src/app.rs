@@ -1552,9 +1552,10 @@ impl WorkerApplication {
                 let Some((owner, bytes)) = admission.reclamation(cache, class, amount) else {
                     break;
                 };
-                let released = memory.reclaim_idle(class, owner.as_ref(), bytes, |page| {
-                    writer.discard_idle_copy(page)
-                });
+                let released =
+                    memory.reclaim_idle(class, owner.as_ref(), bytes, |page, ciphertext| {
+                        writer.discard_idle_copy(page, ciphertext)
+                    });
                 if released < bytes {
                     writer.reclaim_ciphertext(owner.as_ref(), bytes - released);
                 }
@@ -1663,11 +1664,15 @@ impl WorkerApplication {
         Ok(())
     }
 
-    /// Advance demand sizing of the idle recycler and staging pools.
+    /// Advance demand sizing of the idle recycler, staging, and aligned pools.
     /// Each pool is O(1) until its observation window elapses.
     fn maintain_pools(&self, now: std::time::Instant) {
         self.runtime.admission.maintain_buffers(now);
         self.store.writer.maintain_staging(now);
+        // Expire idle cache entries first so their buffers reach the pools
+        // before those decay.
+        self.memory.expire_idle(now);
+        self.memory.buffers().maintain_idle_buffers(now);
     }
 
     /// Sample memory pressure on the sampling worker, then apply any level
@@ -1725,7 +1730,8 @@ impl WorkerApplication {
     }
 
     /// While Critical, release a bounded number of idle memory-cache quanta.
-    /// Entries still referenced by readers or queued writes are never evicted.
+    /// The cache holds only ciphertext; entries whose ciphertext is still
+    /// referenced by readers or queued writes are never evicted.
     fn reclaim_cache_under_pressure(&self) {
         let level = self.pressure.responder.level();
         let quanta = crate::pressure::pressure_actions(level).reclaim_cache_quanta;
@@ -1734,10 +1740,10 @@ impl WorkerApplication {
         }
         for _ in 0..quanta {
             let released = self.memory.reclaim_idle(
-                crate::admission::ResourceClass::Plaintext,
+                crate::admission::ResourceClass::Ciphertext,
                 None,
                 usize::MAX,
-                |_| 0,
+                |_, _| 0,
             );
             if released == 0 {
                 break;
@@ -1765,10 +1771,11 @@ impl WorkerApplication {
         metrics.observe_memory(memory);
     }
 
-    /// Hold both idle pools at their minimum while memory is constrained.
+    /// Hold every idle pool at its minimum while memory is constrained.
     pub(crate) fn constrain_pools(&self, constrained: bool) {
         self.runtime.admission.constrain_buffers(constrained);
         self.store.writer.constrain_staging(constrained);
+        self.memory.buffers().constrain_idle_buffers(constrained);
     }
 
     /// Idle pool statistics as `(recycler, staging slab)`.
@@ -1778,6 +1785,12 @@ impl WorkerApplication {
             self.runtime.admission.buffer_pool_stats(),
             self.store.writer.staging_pool_stats(),
         )
+    }
+
+    /// Demand counters of this worker's aligned ciphertext pool.
+    #[cfg(test)]
+    pub(crate) fn aligned_pool_stats(&self) -> page_alloc::PoolStats {
+        self.memory.buffers().aligned_pool_stats()
     }
 
     /// Schedule placement progress or back off pinned capacity with a bounded warning rate.

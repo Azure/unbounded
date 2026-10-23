@@ -180,7 +180,10 @@ fn owned_writeback_staging_reclaims_only_idle_memory_after_hard_quota_rejection(
         let reclaimed = owned && !live && ciphertext;
         // Optional writes already scan idle memory against their lower ceiling,
         // but cannot gain enough headroom from this one tiny entry.
-        assert_eq!(deps.memory.get(&id).unwrap().is_none(), !live && ciphertext);
+        assert_eq!(
+            deps.memory.ciphertext(&id).unwrap().is_none(),
+            !live && ciphertext
+        );
         assert_eq!(deps.writer.pending_count(), usize::from(reclaimed));
         assert_eq!(deps.writer.discarded_count(), 0);
         assert_eq!(incoming.plaintext.bytes(), &[1; 3]);
@@ -287,7 +290,7 @@ fn optional_persistence_recycler_pressure_does_not_evict_memory_unnecessarily() 
     f.fill.observe_verified(&incoming, &f.scope);
     assert_eq!(deps.writer.pending_count(), 1);
     assert_eq!(admission.retained_buffer_bytes(), 0);
-    assert!(deps.memory.get(&id).unwrap().is_some());
+    assert!(deps.memory.ciphertext(&id).unwrap().is_some());
     assert!(admission.used(ResourceClass::Ciphertext) <= ceiling);
     assert_eq!(deps.writer.discarded_count(), 0);
     drop(held);
@@ -342,7 +345,7 @@ fn optional_persistence_idle_memory_reclaim_is_bounded_and_stops_at_deficit() {
     );
     assert_eq!(
         ids.iter()
-            .filter(|id| deps.memory.get(id).unwrap().is_some())
+            .filter(|id| deps.memory.ciphertext(id).unwrap().is_some())
             .count(),
         44
     );
@@ -352,7 +355,7 @@ fn optional_persistence_idle_memory_reclaim_is_bounded_and_stops_at_deficit() {
     assert_eq!(deps.writer.retention().snapshot().persistence_accepted, 1);
     assert_eq!(
         ids.iter()
-            .filter(|id| deps.memory.get(id).unwrap().is_some())
+            .filter(|id| deps.memory.ciphertext(id).unwrap().is_some())
             .count(),
         43
     );
@@ -403,8 +406,13 @@ fn optional_persistence_idle_reclaim_preserves_active_and_queued_owners() {
     assert_eq!(deps.writer.queued_count(), 1);
     assert_eq!(deps.writer.discarded_count(), 0);
     assert!(deps.writer.copy_only(&queued_id).unwrap().is_some());
-    assert!(deps.memory.get(&queued_id).unwrap().is_some());
-    assert!(deps.memory.get(active.plaintext.page()).unwrap().is_some());
+    assert!(deps.memory.ciphertext(&queued_id).unwrap().is_some());
+    assert!(
+        deps.memory
+            .ciphertext(active.plaintext.page())
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(active.plaintext.bytes(), &[1; 3]);
     assert_eq!(incoming.plaintext.bytes(), &[1; 3]);
     assert_eq!(
@@ -1368,30 +1376,20 @@ fn idle_tiny_prefix_must_not_hide_reclaimable_full_page() {
     let pressure = admission
         .reserve(None, ResourceClass::Plaintext, 828_901_886)
         .unwrap();
-    assert_eq!(admission.used(ResourceClass::Plaintext), 846_203_390);
+    // Cached pages retain only ciphertext, so neither the tiny prefix nor the
+    // large page charges plaintext and nothing must be reclaimed to admit.
+    // Released backing may sit in the recycler until reclaimed.
+    admission.reclaim_buffers();
+    assert_eq!(admission.used(ResourceClass::Plaintext), 828_901_886);
     let mut reserve = Box::pin(f.fill.reserve_network_plaintext(&f.scope, &f.page));
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-    assert!(reserve.as_mut().poll(&mut cx).is_pending());
-    assert!(reserve.as_mut().poll(&mut cx).is_pending());
-    {
-        // Match the captured final failure exactly, then prove the capacity was
-        // available in an idle entry beyond the two visited batches.
-        assert_eq!(admission.used(ResourceClass::Plaintext), 845_679_102);
-        assert_eq!(
-            admission.limit(ResourceClass::Plaintext) - admission.used(ResourceClass::Plaintext),
-            13_314_357
-        );
-        for id in &tiny {
-            assert!(cache.get(id).unwrap().is_none());
-        }
-        assert_eq!(pressure.amount(), 828_901_886);
-    }
-    assert!(reserve.as_mut().poll(&mut cx).is_pending());
     let Poll::Ready(Ok(result)) = reserve.as_mut().poll(&mut cx) else {
-        panic!("one catalog cycle must reclaim the idle large page");
+        panic!("released plaintext must admit without a reclaim cycle");
     };
     assert_eq!(result.amount(), PAGE_BYTES as usize);
-    assert!(cache.get(large.as_ref().unwrap()).unwrap().is_none());
+    for id in tiny.iter().chain(large.as_ref()) {
+        assert!(cache.ciphertext(id).unwrap().is_some());
+    }
     assert_eq!(pressure.amount(), 828_901_886);
     assert_eq!(f.origin.calls.get(), 0);
 }
@@ -1447,8 +1445,8 @@ fn cooperative_reclaim_bounds_busy_cycle_and_preserves_cancellation() {
                 Poll::Ready(Err(error)) if error == expected
             ));
         } else {
-            assert!(reserve.as_mut().poll(&mut cx).is_pending());
-            assert!(reserve.as_mut().poll(&mut cx).is_pending());
+            // Live readers hold all plaintext and the cache holds none, so
+            // the single post-yield retry fails without scanning.
             assert!(matches!(
                 reserve.as_mut().poll(&mut cx),
                 Poll::Ready(Err(Error::Overloaded))
@@ -1502,37 +1500,31 @@ fn cooperative_reclaim_fair_share_keeps_other_cache_and_live_ciphertext() {
         .unwrap();
     let result = futures::executor::block_on(f.fill.reserve_network_plaintext(&f.scope, &f.page));
     assert!(matches!(result, Err(Error::Overloaded)));
-    assert!(cache.get(&foreign_id).unwrap().is_some());
-    assert!(cache.get(&f.page).unwrap().is_some());
+    assert!(cache.ciphertext(&foreign_id).unwrap().is_some());
+    assert!(cache.ciphertext(&f.page).unwrap().is_some());
     assert_eq!(ciphertext.bytes(), &[2; 19]);
 }
 
+/// The memory cache retains no plaintext, so plaintext reclamation is a
+/// no-op that never evicts cached ciphertext or invokes the queued-copy callback.
 #[test]
-fn cooperative_reclaim_clock_cut_ignores_new_touches_and_other_cursors() {
+fn cooperative_plaintext_reclaim_keeps_cached_ciphertext() {
     let f = fixture();
     let admission = &f.fill.dependencies.admission;
     let cache = &f.fill.dependencies.memory;
     let first = crate::memory::tests::bundle_for(admission, f.origin.metadata.immutable());
     let id = first.plaintext.page().clone();
     cache.publish(first).unwrap();
-    let mut scan = cache.plaintext_reclaim();
-    // A fresh lookup moves this entry beyond the captured upper tick.
-    drop(cache.get(&id).unwrap());
-    let mut descriptor = f.origin.metadata.immutable();
-    descriptor.version.etag = StrongEtag::test_value("new");
-    cache
-        .publish(crate::memory::tests::bundle_for(admission, descriptor))
-        .unwrap();
-    assert!(cache.reclaim_plaintext_quantum(&mut scan, None, 1, |_| 0));
-    assert!(cache.get(&id).unwrap().is_some());
-    let mut scan = cache.plaintext_reclaim();
-    assert_eq!(
-        cache.reclaim_idle(ResourceClass::Plaintext, None, 1, |_| 0),
-        3
-    );
-    assert!(cache.reclaim_plaintext_quantum(&mut scan, None, usize::MAX, |_| 0));
     admission.reclaim_buffers();
     assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+    assert_eq!(
+        cache.reclaim_idle(ResourceClass::Plaintext, None, usize::MAX, |_, _| {
+            panic!("plaintext reclaim must not release queued copies")
+        }),
+        0
+    );
+    assert!(cache.get(&id).unwrap().is_none());
+    assert!(cache.ciphertext(&id).unwrap().is_some());
 }
 
 #[test]
@@ -1882,14 +1874,15 @@ mod metadata {
             panic!("page")
         };
         assert_eq!(first.envelope().page.version, first_metadata.version);
-        let first_bytes = f
-            .fill
-            .dependencies
-            .memory
-            .get(&first.envelope().page)
-            .unwrap()
-            .unwrap();
+        // The cache keeps only ciphertext; a local read decrypts it again.
+        let first_bytes = drive(
+            f.fill.warm_local(&first.envelope().page, &f.scope),
+            &mut f.engine,
+            &f.crypto,
+        )
+        .unwrap();
         assert_eq!(first_bytes.plaintext.bytes(), &[1; 3]);
+        assert_eq!(first_bytes.ciphertext.bytes(), first.bytes());
         assert_eq!(adapter.count(RequestKind::InitialGet), 2);
         let mut metadata = f.origin.metadata.clone();
         metadata.version.etag = StrongEtag::test_value("v2");
@@ -1916,13 +1909,12 @@ mod metadata {
             panic!("page")
         };
         assert_eq!(second.envelope().page.version, second_metadata.version);
-        let second_bytes = f
-            .fill
-            .dependencies
-            .memory
-            .get(&second.envelope().page)
-            .unwrap()
-            .unwrap();
+        let second_bytes = drive(
+            f.fill.warm_local(&second.envelope().page, &f.scope),
+            &mut f.engine,
+            &f.crypto,
+        )
+        .unwrap();
         assert_eq!(second_bytes.plaintext.bytes(), &[2; 3]);
         assert_eq!(second_metadata.version.etag, StrongEtag::test_value("v2"));
         assert_eq!(first_bytes.plaintext.bytes(), &[1; 3]);
@@ -2027,7 +2019,14 @@ mod metadata {
                 index.publish_version(cached.metadata.immutable()).unwrap();
                 assert_eq!(index.evict_metadata(1).unwrap(), 1);
                 assert!(index.version(&f.page.version).unwrap().is_none());
-                assert!(f.fill.dependencies.memory.get(&f.page).unwrap().is_some());
+                assert!(
+                    f.fill
+                        .dependencies
+                        .memory
+                        .ciphertext(&f.page)
+                        .unwrap()
+                        .is_some()
+                );
                 let mut fresh = cached.metadata.clone();
                 fresh.content_type = fresh_type.map(|v| ContentType::parse(v.as_bytes()).unwrap());
                 fresh.expires_at = ExpiresAt::from_unix_millis(1_900_000_000_000).unwrap();
@@ -2428,10 +2427,19 @@ mod pressure {
                 pages as usize,
                 "byte capacity must not permanently block idle-cache misses"
             );
-            assert!(
-                f.fill.dependencies.memory.get(&f.page).unwrap().is_some(),
-                "independent reader protected its cached page"
-            );
+            // Only a held ciphertext owner protects the cached page; pinned
+            // plaintext alone is the reader's own and does not.
+            if hold_bundle {
+                assert!(
+                    f.fill
+                        .dependencies
+                        .memory
+                        .ciphertext(&f.page)
+                        .unwrap()
+                        .is_some(),
+                    "independent reader protected its cached page"
+                );
+            }
             drop((pinned, bundle));
             f.fill.dependencies.writer.discard_unsubmitted();
             f.fill.dependencies.memory.evict_idle(usize::MAX).unwrap();
@@ -2490,14 +2498,11 @@ mod pressure {
         );
         assert_eq!(adapter.count(RequestKind::InitialGet), 1);
         assert_eq!(adapter.count(RequestKind::Head), 0);
-        assert_eq!(dependencies.writer.discarded_count(), 1);
-        assert_eq!(dependencies.writer.pending_count(), 0);
-        assert!(dependencies.memory.get(&f.page).unwrap().is_none());
-        assert_eq!(dependencies.admission.used(ResourceClass::Ciphertext), 0);
-        assert_eq!(
-            dependencies.admission.used(ResourceClass::DirtyCiphertext),
-            0
-        );
+        // The cached page holds no plaintext, so the one-page plaintext budget
+        // admits the bootstrap without discarding queued work or evicting.
+        assert_eq!(dependencies.writer.discarded_count(), 0);
+        assert_eq!(dependencies.writer.pending_count(), 1);
+        assert!(dependencies.memory.ciphertext(&f.page).unwrap().is_some());
         // The empty reply releases the bootstrap plaintext reservation after I/O.
         assert_eq!(dependencies.admission.used(ResourceClass::Plaintext), 0);
     }
@@ -2596,7 +2601,7 @@ mod pressure {
                 let mut readers = Vec::new();
                 for n in 0..busy_count {
                     let id = retained_page(&f, cache, &format!("busy-{n}"), class, amount, false);
-                    readers.push(deps.memory.get(&id).unwrap().unwrap());
+                    readers.push(deps.memory.ciphertext(&id).unwrap().unwrap());
                 }
                 let tail =
                     idle_tail.then(|| retained_page(&f, cache, "idle-tail", class, amount, false));
@@ -2612,19 +2617,27 @@ mod pressure {
                         .reserve(Some(cache), class, amount)
                         .map_err(Into::into)
                 });
-                if busy_count == 256 && idle_tail {
+                // The cache holds no plaintext, so plaintext pressure can never
+                // be relieved by evicting cached pages.
+                let cipher = matches!(class, ResourceClass::Ciphertext);
+                if busy_count == 256 && idle_tail && cipher {
                     assert!(
                         result.is_ok(),
                         "idle tail beyond first scan must admit: {class:?}, {:?}",
                         result.as_ref().err()
                     );
-                    assert!(deps.memory.get(tail.as_ref().unwrap()).unwrap().is_none());
+                    assert!(
+                        deps.memory
+                            .ciphertext(tail.as_ref().unwrap())
+                            .unwrap()
+                            .is_none()
+                    );
                 } else {
                     assert!(matches!(result, Err(Error::Overloaded)));
                     if let Some(tail) = &tail {
                         assert!(
-                            deps.memory.get(tail).unwrap().is_some(),
-                            "must not scan beyond existing two-pass bound"
+                            deps.memory.ciphertext(tail).unwrap().is_some(),
+                            "must not scan beyond existing two-pass bound or evict for plaintext"
                         );
                     }
                 }
@@ -2634,9 +2647,13 @@ mod pressure {
                     "initial admission plus two bounded scans"
                 );
                 for reader in &readers {
-                    assert_eq!(reader.plaintext.bytes(), &[1; 3]);
                     assert_eq!(reader.ciphertext.bytes(), &[2; 19]);
-                    assert!(deps.memory.get(reader.plaintext.page()).unwrap().is_some());
+                    assert!(
+                        deps.memory
+                            .ciphertext(&reader.ciphertext.envelope().page)
+                            .unwrap()
+                            .is_some()
+                    );
                 }
                 assert_eq!(deps.writer.discarded_count(), 0);
             }
@@ -2670,14 +2687,16 @@ mod pressure {
                 .reserve_with_reclamation(cache, class, amount)
                 .unwrap();
             let deps = &f.fill.dependencies;
-            assert!(deps.memory.get(&first).unwrap().is_none());
+            // Cached pages hold no plaintext: plaintext admission never evicts
+            // them or discards their queued writes.
+            assert_eq!(deps.memory.ciphertext(&first).unwrap().is_none(), !queued);
             for page in [&other, &second, &third] {
-                assert!(deps.memory.get(page).unwrap().is_some());
+                assert!(deps.memory.ciphertext(page).unwrap().is_some());
                 if queued {
                     assert!(deps.writer.copy_only(page).unwrap().is_some());
                 }
             }
-            assert_eq!(deps.writer.discarded_count(), u64::from(queued));
+            assert_eq!(deps.writer.discarded_count(), 0);
             drop(reservation);
         }
     }
@@ -2701,16 +2720,26 @@ mod pressure {
             .fill
             .reserve_with_reclamation(cache, ResourceClass::Plaintext, 6)
             .unwrap();
-        assert!(f.fill.dependencies.memory.get(&first).unwrap().is_none());
-        assert!(f.fill.dependencies.memory.get(&second).unwrap().is_none());
-        assert!(f.fill.dependencies.memory.get(&third).unwrap().is_some());
-        // A full-page deficit cannot be remedied by the remaining short idle page.
+        // Cached pages charge no plaintext, so the small reservation fits
+        // without evicting any of them.
+        assert_eq!(
+            admission.used(ResourceClass::Plaintext),
+            admission.limit(ResourceClass::Plaintext) - 3
+        );
+        // A full-page deficit cannot be remedied by evicting cached pages.
         assert!(matches!(
             f.fill.reserve_bootstrap(cache),
             Err(Error::Overloaded)
         ));
         for page in [&first, &second, &third] {
-            assert!(f.fill.dependencies.memory.get(page).unwrap().is_none());
+            assert!(
+                f.fill
+                    .dependencies
+                    .memory
+                    .ciphertext(page)
+                    .unwrap()
+                    .is_some()
+            );
         }
     }
 
@@ -2746,7 +2775,7 @@ mod pressure {
         assert_eq!(result.plaintext.bytes(), b"abc");
         assert_eq!(f.origin.calls.get(), 1);
         assert!(deps.writer.copy_only(&f.page).unwrap().is_none());
-        assert!(deps.memory.get(&page).unwrap().is_some());
+        assert!(deps.memory.ciphertext(&page).unwrap().is_some());
         assert!(deps.writer.copy_only(&page).unwrap().is_some());
         assert_eq!(deps.writer.discarded_count(), 0);
     }
@@ -2758,7 +2787,7 @@ mod pressure {
         let first = retained_page(&f, cache, "first", ResourceClass::Plaintext, 3, true);
         let second = retained_page(&f, cache, "second", ResourceClass::Plaintext, 3, true);
         let deps = &f.fill.dependencies;
-        let plaintext = deps.memory.get(&first).unwrap().unwrap().plaintext;
+        let plaintext = deps.memory.ciphertext(&first).unwrap().unwrap();
         let ciphertext = deps.memory.ciphertext(&second).unwrap().unwrap();
         let _pressure = deps
             .admission
@@ -2774,7 +2803,7 @@ mod pressure {
         ));
         assert_eq!(deps.writer.discarded_count(), 0);
         assert_eq!(deps.writer.pending_count(), 2);
-        assert_eq!(plaintext.bytes(), &[1; 3]);
+        assert_eq!(plaintext.ciphertext.bytes(), &[2; 19]);
         assert_eq!(ciphertext.ciphertext.bytes(), &[2; 19]);
         drop((plaintext, ciphertext));
         assert!(matches!(
@@ -2782,8 +2811,8 @@ mod pressure {
                 .reserve_with_reclamation(cache, ResourceClass::Plaintext, usize::MAX),
             Err(Error::Overloaded)
         ));
-        assert!(deps.memory.get(&first).unwrap().is_some());
-        assert!(deps.memory.get(&second).unwrap().is_some());
+        assert!(deps.memory.ciphertext(&first).unwrap().is_some());
+        assert!(deps.memory.ciphertext(&second).unwrap().is_some());
         assert_eq!(deps.writer.discarded_count(), 0);
     }
 
@@ -2810,8 +2839,8 @@ mod pressure {
         assert_eq!(deps.writer.discarded_count(), 1);
         assert!(deps.writer.copy_only(&first).unwrap().is_none());
         assert!(deps.writer.copy_only(&second).unwrap().is_some());
-        assert!(deps.memory.get(&first).unwrap().is_some());
-        assert!(deps.memory.get(&second).unwrap().is_some());
+        assert!(deps.memory.ciphertext(&first).unwrap().is_some());
+        assert!(deps.memory.ciphertext(&second).unwrap().is_some());
     }
 }
 pub(super) use crate::admission::ResourceClass;
@@ -3607,7 +3636,7 @@ fn selected_owner_reclaims_foreign_receive_charges_across_full_pages() {
                 .fill
                 .dependencies
                 .memory
-                .get(&page)
+                .ciphertext(&page)
                 .unwrap()
                 .is_some()
         );
@@ -3874,7 +3903,14 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
             .lease(Some(&f.context.object.cache), old_key, KeyPurpose::Page)
             .is_err()
     );
-    assert!(f.fill.dependencies.memory.get(&f.page).unwrap().is_none());
+    assert!(
+        f.fill
+            .dependencies
+            .memory
+            .ciphertext(&f.page)
+            .unwrap()
+            .is_none()
+    );
     assert!(
         f.fill
             .dependencies
@@ -4159,14 +4195,21 @@ fn ciphertext_origin_fill_retains_verified_publication_without_a_plaintext_waite
         &retained.ciphertext.inner,
         &copy.ciphertext.inner
     ));
-    assert!(
-        f.fill
-            .dependencies
-            .memory
-            .unverified(&f.page)
-            .unwrap()
-            .is_none()
-    );
+    // The verified entry is the one cached ciphertext; a later local reader
+    // decrypts it from memory once no owner holds the plaintext.
+    let cached = f
+        .fill
+        .dependencies
+        .memory
+        .unverified(&f.page)
+        .unwrap()
+        .unwrap();
+    assert!(cached.disk_token.is_none());
+    assert!(Arc::ptr_eq(
+        &cached.copy.ciphertext.inner,
+        &copy.ciphertext.inner
+    ));
+    drop(cached);
     assert!(f.fill.local_copies.is_empty());
     assert!(matches!(
         flights.join_copy(&f.page, &f.scope).unwrap(),
@@ -5333,4 +5376,587 @@ fn canceled_supplier_retains_crypto_fence_before_replacement_origin_work() {
     assert_eq!(f.origin.calls.get(), 2);
     assert_eq!(f.fill.metrics.gauge(Gauge::ActiveFills), 0);
     assert_eq!(f.fill.metrics.count(Event::OriginFill), 1);
+}
+
+/// Publish a tampered copy of the on-disk page to the memory cache, optionally
+/// carrying the disk invalidation token, and attempt a plaintext local read.
+fn cached_tampered_copy_local_read(with_token: bool) -> Fixture {
+    let mut f = cold_disk_fixture();
+    let (disk, token) = drive_disk(
+        &f,
+        f.fill.dependencies.disk.read_with_token(&f.page, &f.scope),
+    )
+    .unwrap()
+    .unwrap();
+    let mut bytes = disk.ciphertext.bytes().to_vec();
+    bytes[0] ^= 1;
+    let charge = f
+        .fill
+        .dependencies
+        .admission
+        .reserve(
+            Some(&f.context.object.cache),
+            ResourceClass::Ciphertext,
+            bytes.len(),
+        )
+        .unwrap();
+    let copy = crate::memory::CiphertextCopy {
+        metadata: disk.metadata.clone(),
+        ciphertext: f
+            .fill
+            .dependencies
+            .buffers
+            .ciphertext(charge, disk.ciphertext.envelope().clone(), bytes)
+            .unwrap(),
+    };
+    drop(disk);
+    f.fill
+        .dependencies
+        .memory
+        .publish_ciphertext(UnverifiedPage {
+            copy,
+            disk_token: with_token.then_some(token),
+        })
+        .unwrap();
+    let result = drive(
+        f.fill.acquire_local_copy(&f.page, &f.scope, true),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    assert!(
+        result.is_none(),
+        "a tampered cached copy must not be served"
+    );
+    assert!(
+        f.fill
+            .dependencies
+            .memory
+            .ciphertext(&f.page)
+            .unwrap()
+            .is_none(),
+        "the rejected memory entry must be removed"
+    );
+    assert_eq!(f.fill.metrics.count(Event::CorruptMiss), 1);
+    f
+}
+
+#[test]
+fn cached_disk_copy_authentication_failure_invalidates_disk_record() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let f = cached_tampered_copy_local_read(true);
+    assert!(
+        f.fill
+            .dependencies
+            .writer
+            .index()
+            .lookup(&f.page)
+            .unwrap()
+            .is_none(),
+        "the rejected disk record must not stay indexed"
+    );
+    assert_eq!(f.origin.calls.get(), 0);
+}
+
+#[test]
+fn cached_memory_copy_authentication_failure_keeps_disk_record() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let f = cached_tampered_copy_local_read(false);
+    // Without a token the cached copy is not tied to the disk record.
+    assert!(
+        f.fill
+            .dependencies
+            .writer
+            .index()
+            .lookup(&f.page)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(f.origin.calls.get(), 0);
+}
+
+#[test]
+fn concurrent_warm_local_after_plaintext_release_shares_one_decrypt() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let original = acquire(&mut f, &mut budget).unwrap();
+    drop(original);
+    assert!(f.fill.dependencies.memory.get(&f.page).unwrap().is_none());
+    let origin_calls = f.origin.calls.get();
+    let metrics = Metrics::default();
+    f.fill.metrics = metrics.clone();
+    let mut first = Box::pin(f.fill.warm_local(&f.page, &f.scope));
+    let mut second = Box::pin(f.fill.warm_local(&f.page, &f.scope));
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(first.as_mut().poll(&mut cx).is_pending());
+    assert!(second.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.fill.local_plaintext.len(), 1, "one local decrypt flight");
+    let (first, second) = drive(
+        futures::future::join(first, second),
+        &mut f.engine,
+        &f.crypto,
+    );
+    let (first, second) = (first.unwrap(), second.unwrap());
+    assert_eq!(first.plaintext.bytes(), b"abc");
+    assert_eq!(second.plaintext.bytes(), b"abc");
+    assert_eq!(metrics.count(Event::PageDecrypt), 1, "one shared decrypt");
+    assert_eq!(f.origin.calls.get(), origin_calls, "never contacts origin");
+    assert!(f.fill.local_plaintext.is_empty());
+    assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Flight), 0);
+    assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Waiter), 0);
+}
+
+#[test]
+fn concurrent_warm_local_without_local_copy_fails_together_without_acquisition() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let metrics = Metrics::default();
+    f.fill.metrics = metrics.clone();
+    let first = f.fill.warm_local(&f.page, &f.scope);
+    let second = f.fill.warm_local(&f.page, &f.scope);
+    let (first, second) = drive(
+        futures::future::join(first, second),
+        &mut f.engine,
+        &f.crypto,
+    );
+    assert!(matches!(first, Err(Error::Unavailable)));
+    assert!(matches!(second, Err(Error::Unavailable)));
+    assert_eq!(metrics.count(Event::PageDecrypt), 0);
+    assert_eq!(f.origin.calls.get(), 0, "never starts acquisition");
+    assert!(f.fill.local_plaintext.is_empty());
+    assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Flight), 0);
+    assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Waiter), 0);
+    assert_eq!(
+        f.fill.dependencies.admission.used(ResourceClass::Plaintext),
+        0
+    );
+}
+
+/// Acquire and release `f.page`, leaving only its retained ciphertext cached.
+fn retained_ciphertext_only(f: &mut Fixture) -> Metrics {
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    drop(acquire(f, &mut budget).unwrap());
+    assert!(f.fill.dependencies.memory.get(&f.page).unwrap().is_none());
+    assert!(
+        f.fill
+            .dependencies
+            .memory
+            .unverified(&f.page)
+            .unwrap()
+            .is_some()
+    );
+    let metrics = Metrics::default();
+    f.fill.metrics = metrics.clone();
+    metrics
+}
+
+fn assert_local_plaintext_idle(f: &Fixture) {
+    assert!(f.fill.local_plaintext.is_empty());
+    assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Flight), 0);
+    assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Waiter), 0);
+    assert_eq!(
+        f.fill.dependencies.admission.used(ResourceClass::Plaintext),
+        0
+    );
+}
+
+#[test]
+fn range_probe_then_acquisition_share_one_retained_decrypt() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let metrics = retained_ciphertext_only(&mut f);
+    let origin_calls = f.origin.calls.get();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut probe = Box::pin(f.fill.warm_local(&f.page, &f.scope));
+    assert!(probe.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.fill.local_plaintext.len(), 1, "probe leads the decrypt");
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let acquisition = f.fill.acquire(
+        f.page.clone(),
+        f.membership.clone(),
+        &f.context,
+        &f.scope,
+        &mut budget,
+    );
+    let (probe, acquired) = drive(
+        futures::future::join(probe, acquisition),
+        &mut f.engine,
+        &f.crypto,
+    );
+    let (probe, acquired) = (probe.unwrap(), acquired.unwrap());
+    assert_eq!(acquired.plaintext.bytes(), b"abc");
+    assert!(Arc::ptr_eq(
+        &probe.plaintext.inner,
+        &acquired.plaintext.inner
+    ));
+    assert_eq!(metrics.count(Event::PageDecrypt), 1, "one shared decrypt");
+    assert_eq!(f.origin.calls.get(), origin_calls);
+    drop((probe, acquired));
+    assert_local_plaintext_idle(&f);
+}
+
+#[test]
+fn acquisition_then_range_probe_share_one_retained_decrypt() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let metrics = retained_ciphertext_only(&mut f);
+    let origin_calls = f.origin.calls.get();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let mut acquisition = f.fill.acquire(
+        f.page.clone(),
+        f.membership.clone(),
+        &f.context,
+        &f.scope,
+        &mut budget,
+    );
+    // Run the elected driver without the crypto service, so its decrypt is
+    // submitted but cannot complete before the probe arrives.
+    for _ in 0..16 {
+        if !f.fill.local_plaintext.is_empty() {
+            break;
+        }
+        uring_runtime::drivers::poll(&mut cx, 64);
+        assert!(acquisition.as_mut().poll(&mut cx).is_pending());
+    }
+    assert_eq!(f.fill.local_plaintext.len(), 1, "acquisition leads");
+    let mut probe = Box::pin(f.fill.warm_local(&f.page, &f.scope));
+    assert!(probe.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.fill.local_plaintext.len(), 1, "probe joins");
+    let (probe, acquired) = drive(
+        futures::future::join(probe, acquisition),
+        &mut f.engine,
+        &f.crypto,
+    );
+    let (probe, acquired) = (probe.unwrap(), acquired.unwrap());
+    assert_eq!(probe.plaintext.bytes(), b"abc");
+    assert!(Arc::ptr_eq(
+        &probe.plaintext.inner,
+        &acquired.plaintext.inner
+    ));
+    assert_eq!(metrics.count(Event::PageDecrypt), 1, "one shared decrypt");
+    assert_eq!(f.origin.calls.get(), origin_calls);
+    drop((probe, acquired));
+    assert_local_plaintext_idle(&f);
+}
+
+#[test]
+fn range_probe_without_local_copy_does_not_block_acquisition() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let mut acquisition = f.fill.acquire(
+        f.page.clone(),
+        f.membership.clone(),
+        &f.context,
+        &f.scope,
+        &mut budget,
+    );
+    assert!(acquisition.as_mut().poll(&mut cx).is_pending());
+    // A local-only probe never starts acquisition. Driving it also runs the
+    // detached acquisition driver, so it either misses or sees that driver's
+    // published page.
+    let probe = drive(
+        f.fill.warm_local(&f.page, &f.scope),
+        &mut f.engine,
+        &f.crypto,
+    );
+    match probe {
+        Ok(page) => assert_eq!(page.plaintext.bytes(), b"abc"),
+        Err(error) => assert_eq!(error, Error::Unavailable),
+    }
+    let acquired = drive(acquisition, &mut f.engine, &f.crypto).unwrap();
+    assert_eq!(acquired.plaintext.bytes(), b"abc");
+    assert_eq!(
+        f.origin.calls.get(),
+        1,
+        "only the acquisition reaches origin"
+    );
+    drop(acquired);
+    assert_local_plaintext_idle(&f);
+}
+
+#[test]
+fn local_plaintext_probe_job_retains_flight_charge_after_cancellation() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let metrics = retained_ciphertext_only(&mut f);
+    let admission = f.fill.dependencies.admission.clone();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut probe = Box::pin(f.fill.warm_local(&f.page, &f.scope));
+    assert!(probe.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(admission.used(ResourceClass::Flight), 1);
+    drop(probe);
+    // The detached job keeps its Flight charge after its only caller leaves.
+    assert_eq!(admission.used(ResourceClass::Flight), 1);
+    assert_eq!(admission.used(ResourceClass::Waiter), 0);
+    let joined = drive(
+        f.fill.warm_local(&f.page, &f.scope),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    assert_eq!(joined.plaintext.bytes(), b"abc");
+    assert_eq!(metrics.count(Event::PageDecrypt), 1);
+    drop(joined);
+    assert_local_plaintext_idle(&f);
+}
+
+#[test]
+fn canceled_acquisition_led_local_plaintext_retains_flight_until_job_completes() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let metrics = retained_ciphertext_only(&mut f);
+    let admission = f.fill.dependencies.admission.clone();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let mut acquisition = f.fill.acquire(
+        f.page.clone(),
+        f.membership.clone(),
+        &f.context,
+        &f.scope,
+        &mut budget,
+    );
+    // Submit the shared decrypt without running the crypto service.
+    for _ in 0..16 {
+        if !f.fill.local_plaintext.is_empty() {
+            break;
+        }
+        uring_runtime::drivers::poll(&mut cx, 64);
+        assert!(acquisition.as_mut().poll(&mut cx).is_pending());
+    }
+    assert_eq!(f.fill.local_plaintext.len(), 1, "acquisition leads");
+    assert_eq!(admission.used(ResourceClass::Flight), 1);
+    f.scope.cancel().unwrap();
+    let mut early = None;
+    for _ in 0..16 {
+        uring_runtime::drivers::poll(&mut cx, 64);
+        if early.is_none()
+            && let std::task::Poll::Ready(result) = acquisition.as_mut().poll(&mut cx)
+        {
+            early = Some(result);
+        }
+    }
+    // The pending shared job still runs under the acquisition's operation, so
+    // its fence and Flight credit stay held.
+    assert_eq!(f.fill.local_plaintext.len(), 1, "shared job still pending");
+    assert_eq!(
+        admission.used(ResourceClass::Flight),
+        1,
+        "canceled acquisition keeps its Flight credit while the job runs"
+    );
+    let result = match early {
+        Some(result) => result,
+        None => drive(acquisition, &mut f.engine, &f.crypto),
+    };
+    assert!(result.is_err(), "canceled acquisition reports its error");
+    // Let the shared job finish through a fresh joiner.
+    let fresh = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+    let joined = drive(f.fill.warm_local(&f.page, &fresh), &mut f.engine, &f.crypto);
+    if let Ok(page) = &joined {
+        assert_eq!(page.plaintext.bytes(), b"abc");
+    }
+    drop(joined);
+    for _ in 0..16 {
+        uring_runtime::drivers::poll(&mut cx, 64);
+    }
+    assert!(metrics.count(Event::PageDecrypt) <= 1);
+    assert_local_plaintext_idle(&f);
+}
+
+#[test]
+fn local_plaintext_probe_respects_exhausted_flight_quota() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let metrics = retained_ciphertext_only(&mut f);
+    let admission = f.fill.dependencies.admission.clone();
+    let held = admission
+        .reserve(
+            None,
+            ResourceClass::Flight,
+            admission.limit(ResourceClass::Flight),
+        )
+        .unwrap();
+    let result = drive(
+        f.fill.warm_local(&f.page, &f.scope),
+        &mut f.engine,
+        &f.crypto,
+    );
+    assert!(matches!(result, Err(Error::Overloaded)));
+    assert_eq!(metrics.count(Event::PageDecrypt), 0);
+    drop(held);
+    assert_local_plaintext_idle(&f);
+}
+
+#[test]
+fn local_plaintext_follower_after_key_retirement_misses_but_leader_finishes() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    use crate::test_support::security::rotation_bundle;
+    let mut f = fixture_with(3, None);
+    let _metrics = retained_ciphertext_only(&mut f);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut leader = Box::pin(f.fill.warm_local(&f.page, &f.scope));
+    assert!(leader.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.fill.local_plaintext.len(), 1);
+    let roots = (*f.keys.peer_trust_roots().unwrap()).clone();
+    f.keys.install(rotation_bundle(2, roots)).unwrap();
+    // The job still runs, but a new follower cannot join its retired key.
+    assert_eq!(f.fill.local_plaintext.len(), 1);
+    let follower = drive(
+        f.fill.warm_local(&f.page, &f.scope),
+        &mut f.engine,
+        &f.crypto,
+    );
+    assert!(
+        matches!(follower.as_ref().err(), Some(Error::MissingKey)),
+        "{:?}",
+        follower.err()
+    );
+    let leader = drive(leader, &mut f.engine, &f.crypto).unwrap();
+    assert_eq!(leader.plaintext.bytes(), b"abc", "admitted caller finishes");
+}
+
+/// A scope whose deadline passes before the crypto service next runs.
+fn short_scope() -> RequestScope {
+    RequestScope::new(
+        RequestId([7; 16]),
+        Instant::now() + Duration::from_millis(30),
+    )
+    .unwrap()
+}
+
+/// Let a short scope's deadline pass.
+fn expire(short: &RequestScope) {
+    while Instant::now() <= short.deadline.0 + Duration::from_millis(5) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(short.check().err(), Some(Error::DeadlineExceeded));
+}
+
+#[test]
+fn warm_reader_retries_after_joined_short_deadline_probe_expires() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let metrics = retained_ciphertext_only(&mut f);
+    let origin_calls = f.origin.calls.get();
+    let short = short_scope();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut probe = Box::pin(f.fill.warm_local(&f.page, &short));
+    assert!(probe.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.fill.local_plaintext.len(), 1, "probe leads the decrypt");
+    let mut reader = Box::pin(f.fill.warm_local(&f.page, &f.scope));
+    assert!(reader.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.fill.local_plaintext.len(), 1, "reader joins the probe");
+    expire(&short);
+    let (probe, reader) = drive(
+        futures::future::join(probe, reader),
+        &mut f.engine,
+        &f.crypto,
+    );
+    assert_eq!(probe.err(), Some(Error::DeadlineExceeded));
+    let reader = reader.unwrap();
+    assert_eq!(reader.plaintext.bytes(), b"abc");
+    assert_eq!(
+        metrics.count(Event::PageDecrypt),
+        2,
+        "the expired attempt and one retry"
+    );
+    assert_eq!(f.origin.calls.get(), origin_calls, "never contacts origin");
+    drop(reader);
+    assert_local_plaintext_idle(&f);
+}
+
+#[test]
+fn acquisition_retries_after_joined_short_deadline_probe_expires() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let metrics = retained_ciphertext_only(&mut f);
+    let origin_calls = f.origin.calls.get();
+    let short = short_scope();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut probe = Box::pin(f.fill.warm_local(&f.page, &short));
+    assert!(probe.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.fill.local_plaintext.len(), 1, "probe leads the decrypt");
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let mut acquisition = f.fill.acquire(
+        f.page.clone(),
+        f.membership.clone(),
+        &f.context,
+        &f.scope,
+        &mut budget,
+    );
+    for _ in 0..16 {
+        uring_runtime::drivers::poll(&mut cx, 64);
+        assert!(acquisition.as_mut().poll(&mut cx).is_pending());
+    }
+    assert_eq!(
+        f.fill.local_plaintext.len(),
+        1,
+        "acquisition joins the probe"
+    );
+    expire(&short);
+    let (probe, acquired) = drive(
+        futures::future::join(probe, acquisition),
+        &mut f.engine,
+        &f.crypto,
+    );
+    assert_eq!(probe.err(), Some(Error::DeadlineExceeded));
+    let acquired = acquired.unwrap();
+    assert_eq!(acquired.plaintext.bytes(), b"abc");
+    assert_eq!(
+        metrics.count(Event::PageDecrypt),
+        2,
+        "the expired attempt and one retry"
+    );
+    assert_eq!(f.origin.calls.get(), origin_calls, "retry stays local");
+    drop(acquired);
+    assert_local_plaintext_idle(&f);
+}
+
+#[test]
+fn expired_follower_of_expired_probe_reports_its_own_deadline() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let metrics = retained_ciphertext_only(&mut f);
+    let short = short_scope();
+    let follower_scope = RequestScope::new(RequestId([8; 16]), short.deadline.0).unwrap();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut probe = Box::pin(f.fill.warm_local(&f.page, &short));
+    assert!(probe.as_mut().poll(&mut cx).is_pending());
+    let mut follower = Box::pin(f.fill.warm_local(&f.page, &follower_scope));
+    assert!(follower.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.fill.local_plaintext.len(), 1);
+    expire(&short);
+    let (probe, follower) = drive(
+        futures::future::join(probe, follower),
+        &mut f.engine,
+        &f.crypto,
+    );
+    assert_eq!(probe.err(), Some(Error::DeadlineExceeded));
+    assert_eq!(follower.err(), Some(Error::DeadlineExceeded));
+    assert_eq!(
+        metrics.count(Event::PageDecrypt),
+        1,
+        "only the expired attempt, no retry"
+    );
+    for _ in 0..16 {
+        uring_runtime::drivers::poll(&mut cx, 64);
+    }
+    assert_local_plaintext_idle(&f);
 }

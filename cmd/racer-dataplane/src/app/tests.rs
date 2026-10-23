@@ -1697,8 +1697,9 @@ fn snapshot_refresh_retries_canceled_publication_and_applies_skipped_removal() {
     let index = worker.store.writer.index().clone();
     index.publish_version(metadata.clone()).unwrap();
     worker.memory.publish(page).unwrap();
-    assert!(worker.memory.get(&page_id).unwrap().is_some());
-    assert_eq!(retained_plaintext.strong_count(), 1);
+    assert!(worker.memory.ciphertext(&page_id).unwrap().is_some());
+    // The cache retains only ciphertext; published plaintext is released.
+    assert_eq!(retained_plaintext.strong_count(), 0);
     assert_eq!(retained_ciphertext.strong_count(), 1);
     assert_eq!(index.snapshot_metadata(), vec![metadata.clone()]);
 
@@ -1713,7 +1714,6 @@ fn snapshot_refresh_retries_canceled_publication_and_applies_skipped_removal() {
         .snapshots
         .apply(publication(&config, 3, vec![replacement.clone()]))
         .unwrap();
-    assert_eq!(retained_plaintext.strong_count(), 1);
     assert_eq!(retained_ciphertext.strong_count(), 1);
     assert_eq!(index.snapshot_metadata(), vec![metadata]);
     let canceled = scope(Duration::from_secs(1)).unwrap();
@@ -1729,7 +1729,7 @@ fn snapshot_refresh_retries_canceled_publication_and_applies_skipped_removal() {
     assert_eq!(worker.caches, vec![replacement]);
     assert_eq!(worker.snapshot_sequence, Some(wire::PublicationSequence(3)));
     worker.refresh_snapshot(&canceled).unwrap();
-    assert!(worker.memory.get(&page_id).unwrap().is_none());
+    assert!(worker.memory.ciphertext(&page_id).unwrap().is_none());
     assert!(index.snapshot_metadata().is_empty());
     assert!(worker.peer_task.is_none());
     assert!(worker.prepared_listeners.borrow().is_none());
@@ -4677,6 +4677,7 @@ fn shared_pressure_constrains_pools_and_releases_retained_buffers() {
     worker.poll_pressure(now);
     let (recycler, staging) = worker.pool_stats();
     assert!(recycler.constrained && staging.constrained);
+    assert!(worker.aligned_pool_stats().constrained);
     assert_eq!(recycler.bytes, 0);
     assert_eq!(staging.bytes, 0);
     assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
@@ -4695,6 +4696,7 @@ fn shared_pressure_constrains_pools_and_releases_retained_buffers() {
     worker.poll_pressure(now);
     let (recycler, staging) = worker.pool_stats();
     assert!(!recycler.constrained && !staging.constrained);
+    assert!(!worker.aligned_pool_stats().constrained);
     assert_eq!(
         worker
             .telemetry
@@ -4736,4 +4738,117 @@ fn sampling_worker_owns_the_monitor_and_others_do_not() {
     assert!(sampler.monitor.is_some() && sampler.shared.is_some() && sampler.samples_memory);
     let other = WorkerPressure::new(true, &shared, false);
     assert!(other.monitor.is_none() && other.shared.is_some() && !other.samples_memory);
+}
+
+#[test]
+fn maintain_pools_releases_idle_aligned_storage() {
+    use crate::admission::ResourceClass;
+    let worker = wake_test_worker();
+    let buffers = worker.memory.buffers();
+    let length = 4096;
+    let capacity = buffers.aligned_capacity(length).unwrap();
+    let take = || {
+        let reservation = worker
+            .runtime
+            .admission
+            .reserve(None, ResourceClass::Ciphertext, capacity)
+            .unwrap();
+        buffers.aligned_ciphertext(reservation, length).unwrap()
+    };
+    drop([take(), take()]);
+    assert_eq!(worker.aligned_pool_stats().entries, 2);
+    let window = page_alloc::DEFAULT_WINDOW;
+    let start = std::time::Instant::now();
+    worker.maintain_pools(start);
+    // Reuse within each window retains the storage.
+    for turn in 1..=3 {
+        drop([take(), take()]);
+        worker.maintain_pools(start + window * turn);
+        assert_eq!(worker.aligned_pool_stats().entries, 2);
+    }
+    // An idle worker releases it within a few windows.
+    for turn in 4..=6 {
+        worker.maintain_pools(start + window * turn);
+    }
+    let stats = worker.aligned_pool_stats();
+    assert_eq!((stats.entries, stats.bytes), (0, 0));
+}
+
+#[test]
+fn maintain_pools_expires_idle_cache_entries_then_their_aligned_storage() {
+    use crate::admission::ResourceClass;
+    use racer_control_wire as wire;
+    let config = crate::test_support::cluster::config(false);
+    let node = Arc::new(NodeState::default());
+    let (mut worker, _, _) = local_worker(&config, &node, 1);
+    let original = definition();
+    let current_scope = scope(Duration::from_secs(1)).unwrap();
+    worker
+        .snapshots
+        .apply(publication(&config, 1, vec![original.clone()]))
+        .unwrap();
+    worker.refresh_snapshot(&current_scope).unwrap();
+    let (_, _, roots) = crate::test_support::security::issued();
+    worker
+        .keys
+        .install(wire::KeyringBundle {
+            schema_version: wire::SCHEMA_VERSION,
+            cluster: config.cluster.clone(),
+            generation: wire::BundleGeneration(1),
+            peer_trust_roots: roots,
+            cache_keys: vec![wire::CacheEncryptionKey::new(
+                wire::CacheKeyRef {
+                    cache: original.id.clone(),
+                    id: crate::model::key_id_from_generation(1, 7).unwrap(),
+                    purpose: wire::CacheKeyPurpose::Page,
+                },
+                wire::CacheKeyState::Active,
+                zeroize::Zeroizing::new([19; 32]),
+            )],
+        })
+        .unwrap();
+    let mut page = page(&worker);
+    let page_id = page.plaintext.page().clone();
+    // Retain the ciphertext in this worker's aligned pool, as fills do.
+    let buffers = worker.memory.buffers();
+    let length = page.ciphertext.bytes().len();
+    let reservation = worker
+        .runtime
+        .admission
+        .reserve(
+            Some(&original.id),
+            ResourceClass::Ciphertext,
+            buffers.aligned_capacity(length).unwrap(),
+        )
+        .unwrap();
+    let shared = page.ciphertext.clone();
+    page.ciphertext = buffers.rehome_aligned(shared, reservation).unwrap();
+    worker.memory.publish(page).unwrap();
+    assert_eq!(worker.aligned_pool_stats().entries, 0);
+
+    let start = std::time::Instant::now();
+    let second = Duration::from_secs(1);
+    let mut now = start;
+    while now < start + crate::memory::CACHE_IDLE_TTL {
+        worker.maintain_pools(now);
+        now += second;
+    }
+    assert!(worker.memory.ciphertext(&page_id).unwrap().is_some());
+    // The hit renews the entry for another full TTL.
+    let renewed = now;
+    while now < renewed + crate::memory::CACHE_IDLE_TTL {
+        worker.maintain_pools(now);
+        assert_eq!(worker.aligned_pool_stats().entries, 0);
+        now += second;
+    }
+    worker.maintain_pools(now);
+    assert!(worker.memory.ciphertext(&page_id).unwrap().is_none());
+    // The released buffer is pooled, then decays once nothing reuses it.
+    assert_eq!(worker.aligned_pool_stats().entries, 1);
+    for _ in 0..6 {
+        now += page_alloc::DEFAULT_WINDOW;
+        worker.maintain_pools(now);
+    }
+    let stats = worker.aligned_pool_stats();
+    assert_eq!((stats.entries, stats.bytes), (0, 0));
 }

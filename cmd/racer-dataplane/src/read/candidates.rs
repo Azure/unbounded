@@ -3159,7 +3159,7 @@ pub(super) mod tests {
                         crate::admission::ResourceClass::Ciphertext,
                         Some(cache),
                         bytes,
-                        |page| writer.discard_idle_copy(page),
+                        |page, ciphertext| writer.discard_idle_copy(page, ciphertext),
                     );
                     writer.reclaim_ciphertext(Some(cache), bytes);
                 }),

@@ -1295,7 +1295,14 @@ fn known_copy_admission_validates_before_reclaim_and_preserves_failures() {
         assert_eq!(f.crypto.outstanding(), 0);
         assert_eq!(f.origin.calls.get(), 0);
         if case != "success" {
-            assert!(f.fill.dependencies.memory.get(&f.page).unwrap().is_none());
+            assert!(
+                f.fill
+                    .dependencies
+                    .memory
+                    .ciphertext(&f.page)
+                    .unwrap()
+                    .is_none()
+            );
             admission.reclaim_buffers();
             assert_eq!(admission.used(ResourceClass::Plaintext), before);
         }
@@ -1316,11 +1323,16 @@ fn known_copy_reclaims_only_idle_bytes_after_validation() {
     let idle = crate::memory::tests::bundle_for(&admission, descriptor);
     let idle_id = idle.plaintext.page().clone();
     f.fill.dependencies.memory.publish(idle).unwrap();
+    // Only the busy reader's plaintext is charged; the cache released the idle
+    // page's plaintext at publication. Leave room for exactly one small page.
+    assert_eq!(admission.used(ResourceClass::Plaintext), 3);
     let pressure = admission
         .reserve(
             None,
             ResourceClass::Plaintext,
-            admission.limit(ResourceClass::Plaintext) - admission.used(ResourceClass::Plaintext),
+            admission.limit(ResourceClass::Plaintext)
+                - admission.used(ResourceClass::Plaintext)
+                - 3,
         )
         .unwrap();
     let mut wrong = copy.clone();
@@ -1329,10 +1341,25 @@ fn known_copy_reclaims_only_idle_bytes_after_validation() {
         f.fill.reserve_copy_plaintext(&f.page, &wrong),
         Err(Error::CorruptRecord)
     ));
-    assert!(f.fill.dependencies.memory.get(&idle_id).unwrap().is_some());
+    assert!(
+        f.fill
+            .dependencies
+            .memory
+            .ciphertext(&idle_id)
+            .unwrap()
+            .is_some()
+    );
     let reservation = f.fill.reserve_copy_plaintext(&f.page, &copy).unwrap();
     assert_eq!(reservation.amount(), 3);
-    assert!(f.fill.dependencies.memory.get(&idle_id).unwrap().is_none());
+    // Plaintext admission never needs to evict cached ciphertext.
+    assert!(
+        f.fill
+            .dependencies
+            .memory
+            .ciphertext(&idle_id)
+            .unwrap()
+            .is_some()
+    );
     assert!(
         f.fill
             .dependencies
@@ -2301,7 +2328,14 @@ fn assert_published(f: &Fixture, result: &PageResult, persist: bool) {
 }
 
 fn assert_unpublished(f: &Fixture) {
-    assert!(f.fill.dependencies.memory.get(&f.page).unwrap().is_none());
+    assert!(
+        f.fill
+            .dependencies
+            .memory
+            .ciphertext(&f.page)
+            .unwrap()
+            .is_none()
+    );
     assert!(
         f.fill
             .dependencies

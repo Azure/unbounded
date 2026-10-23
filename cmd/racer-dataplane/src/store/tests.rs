@@ -996,7 +996,12 @@ fn second_sight_reclaim_scans_only_a_fixed_queue_prefix_and_makes_progress() {
     let last = crate::memory::tests::bundle_for(&f.admission, metadata);
     f.enqueue(last.copy()).unwrap();
     // Arbitrary idle-page reclamation must not walk a capacity-sized suffix.
-    assert_eq!(f.store.writer.discard_idle_copy(&last), 0);
+    assert_eq!(
+        f.store
+            .writer
+            .discard_idle_copy(last.plaintext.page(), &last.ciphertext),
+        0
+    );
     assert_eq!(f.store.writer.queued_count(), 65);
     let calls = Rc::new(Cell::new(0));
     let counted = calls.clone();
@@ -1017,7 +1022,12 @@ fn second_sight_reclaim_scans_only_a_fixed_queue_prefix_and_makes_progress() {
     assert_eq!(f.store.writer.queued_count(), 1);
     assert_eq!(f.store.writer.discarded_count(), 64);
     // Later calls reach the untouched suffix; no queued page becomes pinned.
-    assert!(f.store.writer.discard_idle_copy(&last) > 0);
+    assert!(
+        f.store
+            .writer
+            .discard_idle_copy(last.plaintext.page(), &last.ciphertext)
+            > 0
+    );
     assert_eq!(f.store.writer.pending_count(), 0);
     assert_eq!(f.store.writer.discarded_count(), 65);
 }

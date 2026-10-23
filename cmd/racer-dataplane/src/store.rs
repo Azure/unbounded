@@ -798,8 +798,11 @@ impl StoreWriter {
     }
     /// Unpin exactly one otherwise-idle memory bundle. The two ciphertext owners
     /// must be that bundle and this queued write, not a submitted operation/reader.
-    pub(crate) fn discard_idle_copy(&self, page: &crate::memory::PageResult) -> usize {
-        let id = page.plaintext.page();
+    pub(crate) fn discard_idle_copy(
+        &self,
+        id: &PageId,
+        ciphertext: &crate::memory::CiphertextPage,
+    ) -> usize {
         if self.protected_pending(id) {
             return 0;
         }
@@ -809,8 +812,8 @@ impl StoreWriter {
         };
         let mut pending = self.pending.borrow_mut();
         if pending.get(id).is_some_and(|dirty| {
-            std::sync::Arc::ptr_eq(&dirty.page.ciphertext.inner, &page.ciphertext.inner)
-                && std::sync::Arc::strong_count(&page.ciphertext.inner) == 2
+            std::sync::Arc::ptr_eq(&dirty.page.ciphertext.inner, &ciphertext.inner)
+                && std::sync::Arc::strong_count(&ciphertext.inner) == 2
         }) {
             queue.remove(position);
             let dirty = pending.remove(id).expect("located queued copy");

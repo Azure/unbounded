@@ -482,7 +482,13 @@ mod duplex_release {
             for _ in 0..4096 {
                 assert!(send.as_mut().poll(&mut cx).is_pending());
                 pump(&mut endpoint);
-                if f.fill.dependencies.memory.get(&third).unwrap().is_some() {
+                if f.fill
+                    .dependencies
+                    .memory
+                    .ciphertext(&third)
+                    .unwrap()
+                    .is_some()
+                {
                     break;
                 }
             }
@@ -491,7 +497,14 @@ mod duplex_release {
                 &[0, 1, 2],
                 "wire release must refill acquisition before page-one write completes"
             );
-            assert!(f.fill.dependencies.memory.get(&third).unwrap().is_some());
+            assert!(
+                f.fill
+                    .dependencies
+                    .memory
+                    .ciphertext(&third)
+                    .unwrap()
+                    .is_some()
+            );
             let mut done = None;
             for _ in 0..8192 {
                 if done.is_none()
@@ -1580,4 +1593,327 @@ fn origin_fill_preserves_ciphertext_for_memory_and_pending_candidate_copy() {
     ));
     assert_eq!(f.fill.metrics.count(Event::OriginFill), 1);
     assert_eq!(f.fill.metrics.count(Event::MemoryHit), 2);
+}
+
+/// Acquire `f.page` twice concurrently on the same worker.
+fn acquire_pair(f: &mut Fixture) -> (Result<PageResult>, Result<PageResult>) {
+    let mut first_budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let mut second_budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    drive(
+        futures::future::join(
+            f.fill.acquire(
+                f.page.clone(),
+                f.membership.clone(),
+                &f.context,
+                &f.scope,
+                &mut first_budget,
+            ),
+            f.fill.acquire(
+                f.page.clone(),
+                f.membership.clone(),
+                &f.context,
+                &f.scope,
+                &mut second_budget,
+            ),
+        ),
+        &mut f.engine,
+        &f.crypto,
+    )
+}
+
+/// Fill one page from origin, then release every plaintext owner.
+fn fill_and_release(f: &mut Fixture) -> CiphertextPage {
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let result = acquire(f, &mut budget).unwrap();
+    assert_eq!(result.plaintext.bytes(), b"abc");
+    let ciphertext = result.ciphertext.clone();
+    drop(result);
+    f.fill.dependencies.flights.poll_budgeted(64).unwrap();
+    ciphertext
+}
+
+#[test]
+fn memory_cache_retains_only_ciphertext_after_delivery() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let ciphertext = fill_and_release(&mut f);
+    let deps = &f.fill.dependencies;
+    deps.admission.reclaim_buffers();
+    assert_eq!(deps.admission.used(ResourceClass::Plaintext), 0);
+    assert!(deps.memory.get(&f.page).unwrap().is_none());
+    let cached = deps.memory.ciphertext(&f.page).unwrap().unwrap();
+    assert!(Arc::ptr_eq(&cached.ciphertext.inner, &ciphertext.inner));
+    assert!(deps.admission.used(ResourceClass::Ciphertext) > 0);
+}
+
+#[test]
+fn cached_ciphertext_hit_decrypts_without_refetching() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let ciphertext = fill_and_release(&mut f);
+    let decrypts = f.fill.metrics.count(Event::FillDecryptCount);
+    let hits = f.fill.metrics.count(Event::MemoryHit);
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let again = acquire(&mut f, &mut budget).unwrap();
+    assert_eq!(again.plaintext.bytes(), b"abc");
+    // The decrypt used the cached allocation; no origin, disk, or peer work.
+    assert!(Arc::ptr_eq(&again.ciphertext.inner, &ciphertext.inner));
+    assert_eq!(f.origin.calls.get(), 1);
+    assert_eq!(f.fill.metrics.count(Event::FillDecryptCount), decrypts + 1);
+    assert_eq!(f.fill.metrics.count(Event::MemoryHit), hits + 1);
+    assert_eq!(f.fill.metrics.count(Event::DiskHit), 0);
+    assert_eq!(f.fill.metrics.count(Event::PeerHit), 0);
+    // The decrypted plaintext is shared while held, then released.
+    let shared = f.fill.dependencies.memory.get(&f.page).unwrap().unwrap();
+    assert!(Arc::ptr_eq(&shared.plaintext.inner, &again.plaintext.inner));
+    drop((again, shared));
+    f.fill.dependencies.flights.poll_budgeted(64).unwrap();
+    f.fill.dependencies.admission.reclaim_buffers();
+    assert_eq!(
+        f.fill.dependencies.admission.used(ResourceClass::Plaintext),
+        0
+    );
+}
+
+#[test]
+fn concurrent_cached_ciphertext_hits_coalesce_into_one_decrypt() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    fill_and_release(&mut f);
+    let decrypts = f.fill.metrics.count(Event::FillDecryptCount);
+    let (first, second) = acquire_pair(&mut f);
+    let (first, second) = (first.unwrap(), second.unwrap());
+    assert_eq!(first.plaintext.bytes(), b"abc");
+    assert!(Arc::ptr_eq(&first.plaintext.inner, &second.plaintext.inner));
+    assert_eq!(f.fill.metrics.count(Event::FillDecryptCount), decrypts + 1);
+    assert_eq!(f.origin.calls.get(), 1);
+}
+
+#[test]
+fn live_plaintext_is_reused_without_another_decrypt() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let held = acquire(&mut f, &mut budget).unwrap();
+    f.fill.dependencies.flights.poll_budgeted(64).unwrap();
+    let decrypts = f.fill.metrics.count(Event::FillDecryptCount);
+    for _ in 0..3 {
+        let again = acquire(&mut f, &mut budget).unwrap();
+        assert!(Arc::ptr_eq(&again.plaintext.inner, &held.plaintext.inner));
+    }
+    assert_eq!(f.fill.metrics.count(Event::FillDecryptCount), decrypts);
+    assert_eq!(f.origin.calls.get(), 1);
+    // The weak handle never keeps the plaintext alive by itself.
+    let plaintext = Arc::downgrade(&held.plaintext.inner);
+    drop(held);
+    f.fill.dependencies.flights.poll_budgeted(64).unwrap();
+    assert!(plaintext.upgrade().is_none());
+    assert!(f.fill.dependencies.memory.get(&f.page).unwrap().is_none());
+}
+
+#[test]
+fn peers_receive_cached_ciphertext_without_plaintext() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let ciphertext = fill_and_release(&mut f);
+    let decrypts = f.fill.metrics.count(Event::FillDecryptCount);
+    let (metadata, copy) = futures::executor::block_on(f.fill.copy_only(&f.page, &f.scope))
+        .unwrap()
+        .unwrap();
+    assert_eq!(metadata.version, f.page.version);
+    assert!(Arc::ptr_eq(&copy.inner, &ciphertext.inner));
+    assert_eq!(copy.envelope().nonce, ciphertext.envelope().nonce);
+    // Serving ciphertext neither decrypts nor materializes plaintext.
+    assert_eq!(f.fill.metrics.count(Event::FillDecryptCount), decrypts);
+    assert!(f.fill.dependencies.memory.get(&f.page).unwrap().is_none());
+}
+
+/// A fixture whose memory cache can hold `pages` ciphertext pages.
+fn roomy_fixture(pages: u64) -> Fixture {
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    let bytes =
+        std::num::NonZeroUsize::new(2 * (pages as usize + 1) * PAGE_BYTES as usize).unwrap();
+    limits.ciphertext_bytes = bytes;
+    limits.plaintext_bytes = bytes;
+    fixture_with(pages * PAGE_BYTES, Some(limits))
+}
+
+/// Fill `pages` of `f` from origin through `membership`, then release every
+/// plaintext so the memory cache holds only their ciphertext.
+fn cache_ciphertext_only(
+    f: &mut Fixture,
+    membership: &std::sync::Arc<crate::topology::Membership>,
+    pages: &[u64],
+) {
+    for &number in pages {
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+        let page = PageId {
+            version: f.page.version.clone(),
+            number: PageNumber(number),
+        };
+        drop(
+            drive(
+                f.fill
+                    .acquire(page, membership.clone(), &f.context, &f.scope, &mut budget),
+                &mut f.engine,
+                &f.crypto,
+            )
+            .unwrap(),
+        );
+    }
+    f.fill.dependencies.flights.poll_budgeted(64).unwrap();
+    f.fill.dependencies.admission.reclaim_buffers();
+    assert_eq!(
+        f.fill.dependencies.admission.used(ResourceClass::Plaintext),
+        0
+    );
+    for &number in pages {
+        let page = PageId {
+            version: f.page.version.clone(),
+            number: PageNumber(number),
+        };
+        assert!(f.fill.dependencies.memory.get(&page).unwrap().is_none());
+        assert!(
+            f.fill
+                .dependencies
+                .memory
+                .ciphertext(&page)
+                .unwrap()
+                .is_some(),
+            "page {number} cached"
+        );
+    }
+}
+
+/// Read the whole object as one range stream and return the delivered pages.
+fn read_range(
+    f: &mut Fixture,
+    local: &Rc<Coordinator>,
+    endpoint: &mut crate::read::dispatch::WorkerEndpoint,
+    pages: u64,
+) -> Vec<u64> {
+    let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+    let request = ClientRequest {
+        retain: None,
+        kind: ReadKind::Subscription {
+            pin: Some(f.page.version.etag.clone()),
+            range: None,
+            page_credits: 64,
+            byte_credits: 64 * PAGE_BYTES,
+        },
+        origin: OriginContext {
+            object: f.context.object.clone(),
+            metadata: None,
+            authorization: None,
+        },
+    };
+    let mut stream = match futures::executor::block_on(local.read(request, &scope))
+        .unwrap()
+        .payload
+    {
+        crate::read::ReadPayload::Stream(stream) => stream,
+        crate::read::ReadPayload::Empty => panic!("expected a nonempty read stream"),
+    };
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut delivered = Vec::new();
+    for _ in 0..8192 {
+        let polled = stream.next_slice().as_mut().poll(&mut cx);
+        if let Poll::Ready(result) = polled {
+            let Some(reader) = result.unwrap() else {
+                break;
+            };
+            let slice = reader.slice();
+            delivered.push(slice.page.0);
+            drop(reader);
+            stream.release_page(slice.page, slice.length).unwrap();
+            continue;
+        }
+        endpoint.poll(&mut cx, 64).unwrap();
+        uring_runtime::drivers::poll(&mut cx, 64);
+        uring_runtime::group::Service::poll_budgeted(&mut f.engine, &mut cx, 64).unwrap();
+        f.crypto.poll_budgeted(64).unwrap();
+        f.reactor.poll_budgeted(128).unwrap();
+    }
+    assert_eq!(delivered.len() as u64, pages, "range stream completed");
+    drop(stream);
+    for _ in 0..32 {
+        endpoint.poll(&mut cx, 64).unwrap();
+        uring_runtime::drivers::poll(&mut cx, 64);
+    }
+    delivered
+}
+
+#[test]
+fn warm_range_reread_decrypts_cached_ciphertext_without_any_transfer() {
+    const PAGES: u64 = 6;
+    const WINDOW: usize = 4;
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let signers = network(2);
+    let mut f = roomy_fixture(PAGES);
+    f.reactor.init().unwrap();
+    // A heavily weighted remote node owns every page, so a missed probe
+    // selects the range from it. Any peer request panics.
+    let remote = Arc::new(
+        Membership::validate(
+            MembershipVersion(1),
+            (0..2)
+                .map(|i| Member {
+                    node: node(i),
+                    shares: NonZeroU32::new(if i == 1 { 1_000_000 } else { 1 }).unwrap(),
+                    peer_endpoint: format!("127.0.0.1:{}", 8100 + i),
+                    rails: vec![],
+                    site: String::new(),
+                })
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let all: Vec<u64> = (0..PAGES).collect();
+    let prefill = f.membership.clone();
+    cache_ciphertext_only(&mut f, &prefill, &all);
+    let origin = f.origin.calls.get();
+    let (local, mut endpoint, _publication) =
+        coordinator_with_window(&f, &signers[0], &remote, NoPeer::requester(), WINDOW);
+    assert_eq!(read_range(&mut f, &local, &mut endpoint, PAGES), all);
+    assert_eq!(f.origin.calls.get(), origin, "no origin requests");
+    assert_eq!(
+        local.fill.metrics.count(Event::FillDecryptCount),
+        PAGES,
+        "each page is decrypted exactly once"
+    );
+    endpoint.uninstall().unwrap();
+}
+
+#[test]
+fn warm_range_reread_transfers_only_uncached_pages() {
+    const PAGES: u64 = 6;
+    const WINDOW: usize = 4;
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let signers = network(1);
+    let mut f = roomy_fixture(PAGES);
+    f.reactor.init().unwrap();
+    let membership = local_membership(&signers[0]);
+    let prefill = f.membership.clone();
+    cache_ciphertext_only(&mut f, &prefill, &[0, 1, 2, 4, 5]);
+    f.origin.started_pages.borrow_mut().clear();
+    let (local, mut endpoint, _publication) =
+        coordinator_with_window(&f, &signers[0], &membership, NoPeer::requester(), WINDOW);
+    assert_eq!(
+        read_range(&mut f, &local, &mut endpoint, PAGES),
+        (0..PAGES).collect::<Vec<_>>()
+    );
+    assert_eq!(&*f.origin.started_pages.borrow(), &[3]);
+    assert_eq!(
+        local.fill.metrics.count(Event::FillDecryptCount),
+        5,
+        "cached pages are decrypted once each"
+    );
+    endpoint.uninstall().unwrap();
 }
