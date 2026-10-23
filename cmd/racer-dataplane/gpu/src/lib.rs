@@ -256,6 +256,7 @@ impl Gpu {
     pub fn open_file(&self, fd: OwnedFd) -> Result<GpuFile> {
         let shared = &self.shared;
         shared.check(unsafe { (shared.api.file_open)() })?;
+        let fd = cufile_descriptor(fd);
         let raw = create(shared, |out| unsafe {
             (shared.api.file)(fd.as_raw_fd(), out)
         })?;
@@ -782,6 +783,48 @@ impl Drop for Stream {
     }
 }
 
+/// Return a descriptor cuFile accepts for the same open file.
+///
+/// cuFile refuses to register a descriptor whose status flags include
+/// `O_NOFOLLOW` (`CU_FILE_INVALID_FILE_OPEN_FLAG`, 5019), and Racer opens every
+/// slab file and block device with it. Reopening `/proc/self/fd/N` follows the
+/// kernel's link to the already-open file, not a path, so dropping the flag
+/// here does not reintroduce the symlink race it guards against. The new
+/// descriptor keeps the access mode and `O_DIRECT`, and is used only if it
+/// names the same file. Otherwise the original is returned unchanged and
+/// cuFile reports its own error.
+fn cufile_descriptor(fd: OwnedFd) -> OwnedFd {
+    let raw = fd.as_raw_fd();
+    let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
+    if flags < 0 || flags & libc::O_NOFOLLOW == 0 {
+        return fd;
+    }
+    let path = format!("/proc/self/fd/{raw}\0");
+    let reopen = (flags & !(libc::O_NOFOLLOW | libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC))
+        | libc::O_CLOEXEC;
+    let new = unsafe { libc::open(path.as_ptr().cast(), reopen) };
+    if new < 0 {
+        return fd;
+    }
+    let new = unsafe { OwnedFd::from_raw_fd(new) };
+    match (stat(&fd), stat(&new)) {
+        (Some(a), Some(b))
+            if a.st_dev == b.st_dev && a.st_ino == b.st_ino && a.st_rdev == b.st_rdev =>
+        {
+            new
+        }
+        _ => fd,
+    }
+}
+
+fn stat(fd: &OwnedFd) -> Option<libc::stat> {
+    let mut out = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd.as_raw_fd(), out.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    Some(unsafe { out.assume_init() })
+}
+
 /// A file registered with cuFile.
 pub struct GpuFile {
     shared: Rc<Shared>,
@@ -840,6 +883,67 @@ impl Drop for GpuFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn open(path: &std::path::Path, flags: i32) -> OwnedFd {
+        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let fd = unsafe { libc::open(path.as_ptr(), flags | libc::O_CLOEXEC) };
+        assert!(fd >= 0, "open: {}", std::io::Error::last_os_error());
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    }
+
+    fn status(fd: &OwnedFd) -> i32 {
+        unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) }
+    }
+
+    fn temp_file(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("racer-gpu-{}-{name}", std::process::id()));
+        std::fs::write(&path, b"racer").unwrap();
+        path
+    }
+
+    #[test]
+    /// cuFile rejects O_NOFOLLOW, so the descriptor is reopened without it
+    /// and keeps the same file and access mode.
+    fn cufile_descriptor_drops_nofollow() {
+        let path = temp_file("nofollow");
+        let fd = open(&path, libc::O_RDWR | libc::O_NOFOLLOW);
+        let before = stat(&fd).unwrap();
+        let fd = cufile_descriptor(fd);
+        let after = stat(&fd).unwrap();
+        let flags = status(&fd);
+        assert_eq!(flags & libc::O_NOFOLLOW, 0);
+        assert_eq!(flags & libc::O_ACCMODE, libc::O_RDWR);
+        assert_eq!((before.st_dev, before.st_ino), (after.st_dev, after.st_ino));
+        let cloexec = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(cloexec & libc::FD_CLOEXEC, 0);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    /// An unlinked file is still reopened through the kernel's link.
+    fn cufile_descriptor_follows_open_file_not_path() {
+        let path = temp_file("unlinked");
+        let fd = open(&path, libc::O_RDONLY | libc::O_NOFOLLOW);
+        let before = stat(&fd).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"other").unwrap();
+        let fd = cufile_descriptor(fd);
+        let after = stat(&fd).unwrap();
+        assert_eq!(status(&fd) & libc::O_NOFOLLOW, 0);
+        assert_eq!((before.st_dev, before.st_ino), (after.st_dev, after.st_ino));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    /// A descriptor without O_NOFOLLOW is returned as is.
+    fn cufile_descriptor_keeps_other_descriptors() {
+        let path = temp_file("plain");
+        let fd = open(&path, libc::O_RDONLY);
+        let raw = fd.as_raw_fd();
+        let fd = cufile_descriptor(fd);
+        assert_eq!(fd.as_raw_fd(), raw);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     /// Without a backend in scope or built in, loading fails cleanly.
