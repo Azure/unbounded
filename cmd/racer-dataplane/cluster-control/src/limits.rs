@@ -49,6 +49,17 @@ pub const MIN_WRITE_BYTES_PER_SEC: u64 = 100 * 1024;
 /// publication bodies are shared, never copied per connection. The effective
 /// cap is lowered further when `RLIMIT_NOFILE` is smaller, see
 /// [`connection_capacity`].
+///
+/// Connections are not the binding limit when a publication lands. All
+/// waiting long polls wake together, but at most [`MAX_WRITES`] (64) can take
+/// a write slot; the rest answer 429 (`Overloaded`) and retry, so a seat with
+/// 12500 polls drains a new publication in roughly 12500 / 64 write rounds
+/// plus client retry delays (`server.rs` `Server::snapshot` takes the slot
+/// after the wait). Each `Signal::notify` (`exec.rs` `Signal::changed`) also
+/// costs O(W^2) waker comparisons for W waiting polls, because every woken
+/// poll that re-registers scans the waker list (`will_wake`); see
+/// [`crate::step::cost::notify`]. Neither cost appears in the per-connection
+/// sizing above.
 pub const MAX_CONTROL_CONNECTIONS: usize = 16384;
 
 /// Maximum concurrent TLS handshakes, the CPU-heavy stage of a connection.
