@@ -75,6 +75,14 @@ directly with `io_uring_setup`, `mmap`, and `io_uring_enter`.
 - Errors: a handler error that is a `syscall.Errno` is passed to the kernel.
   Any other error, or a handler panic, becomes `EIO`.
 
+Both delete paths keep the char device open until removal is confirmed, so
+another device cannot reuse its ID while deletion is pending. On kernels
+without `DEL_DEV_ASYNC`, an io_uring cancel interrupts the delete's final
+ID-release wait. The delete completion is still checked before closing the
+char device. If a control completion is unknown, cleanup reports an error and
+keeps the char device open until the process exits. A stalled kernel can still
+stall a completion wait.
+
 If racer-block exits without cleanup, the device stays in the kernel. A new run
 with the same `--id` stops and deletes that device first, even if it is still
 in use. Only choose an ID for a device you own. Without `--id`, the kernel

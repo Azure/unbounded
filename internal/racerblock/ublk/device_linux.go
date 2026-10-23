@@ -365,8 +365,9 @@ func (d *Device) fail(err error) {
 	d.stopAsync(err)
 }
 
-// teardown stops the device once and records cause. It blocks until the
-// device is fully released.
+// teardown stops the device once and records cause. It waits for queues,
+// handlers and kernel completions. An unknown control completion keeps the
+// char device pinned and is reported through closeErr.
 func (d *Device) teardown(cause error) {
 	d.once.Do(func() {
 		var errs []error
