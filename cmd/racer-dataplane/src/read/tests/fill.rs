@@ -5536,3 +5536,232 @@ fn concurrent_warm_local_without_local_copy_fails_together_without_acquisition()
         0
     );
 }
+
+/// Acquire and release `f.page`, leaving only its retained ciphertext cached.
+fn retained_ciphertext_only(f: &mut Fixture) -> Metrics {
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    drop(acquire(f, &mut budget).unwrap());
+    assert!(f.fill.dependencies.memory.get(&f.page).unwrap().is_none());
+    assert!(
+        f.fill
+            .dependencies
+            .memory
+            .unverified(&f.page)
+            .unwrap()
+            .is_some()
+    );
+    let metrics = Metrics::default();
+    f.fill.metrics = metrics.clone();
+    metrics
+}
+
+fn assert_local_plaintext_idle(f: &Fixture) {
+    assert!(f.fill.local_plaintext.is_empty());
+    assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Flight), 0);
+    assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Waiter), 0);
+    assert_eq!(
+        f.fill.dependencies.admission.used(ResourceClass::Plaintext),
+        0
+    );
+}
+
+#[test]
+fn range_probe_then_acquisition_share_one_retained_decrypt() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let metrics = retained_ciphertext_only(&mut f);
+    let origin_calls = f.origin.calls.get();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut probe = Box::pin(f.fill.warm_local(&f.page, &f.scope));
+    assert!(probe.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.fill.local_plaintext.len(), 1, "probe leads the decrypt");
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let acquisition = f.fill.acquire(
+        f.page.clone(),
+        f.membership.clone(),
+        &f.context,
+        &f.scope,
+        &mut budget,
+    );
+    let (probe, acquired) = drive(
+        futures::future::join(probe, acquisition),
+        &mut f.engine,
+        &f.crypto,
+    );
+    let (probe, acquired) = (probe.unwrap(), acquired.unwrap());
+    assert_eq!(acquired.plaintext.bytes(), b"abc");
+    assert!(Arc::ptr_eq(
+        &probe.plaintext.inner,
+        &acquired.plaintext.inner
+    ));
+    assert_eq!(metrics.count(Event::PageDecrypt), 1, "one shared decrypt");
+    assert_eq!(f.origin.calls.get(), origin_calls);
+    drop((probe, acquired));
+    assert_local_plaintext_idle(&f);
+}
+
+#[test]
+fn acquisition_then_range_probe_share_one_retained_decrypt() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let metrics = retained_ciphertext_only(&mut f);
+    let origin_calls = f.origin.calls.get();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let mut acquisition = f.fill.acquire(
+        f.page.clone(),
+        f.membership.clone(),
+        &f.context,
+        &f.scope,
+        &mut budget,
+    );
+    // Run the elected driver without the crypto service, so its decrypt is
+    // submitted but cannot complete before the probe arrives.
+    for _ in 0..16 {
+        if !f.fill.local_plaintext.is_empty() {
+            break;
+        }
+        uring_runtime::drivers::poll(&mut cx, 64);
+        assert!(acquisition.as_mut().poll(&mut cx).is_pending());
+    }
+    assert_eq!(f.fill.local_plaintext.len(), 1, "acquisition leads");
+    let mut probe = Box::pin(f.fill.warm_local(&f.page, &f.scope));
+    assert!(probe.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.fill.local_plaintext.len(), 1, "probe joins");
+    let (probe, acquired) = drive(
+        futures::future::join(probe, acquisition),
+        &mut f.engine,
+        &f.crypto,
+    );
+    let (probe, acquired) = (probe.unwrap(), acquired.unwrap());
+    assert_eq!(probe.plaintext.bytes(), b"abc");
+    assert!(Arc::ptr_eq(
+        &probe.plaintext.inner,
+        &acquired.plaintext.inner
+    ));
+    assert_eq!(metrics.count(Event::PageDecrypt), 1, "one shared decrypt");
+    assert_eq!(f.origin.calls.get(), origin_calls);
+    drop((probe, acquired));
+    assert_local_plaintext_idle(&f);
+}
+
+#[test]
+fn range_probe_without_local_copy_does_not_block_acquisition() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let mut acquisition = f.fill.acquire(
+        f.page.clone(),
+        f.membership.clone(),
+        &f.context,
+        &f.scope,
+        &mut budget,
+    );
+    assert!(acquisition.as_mut().poll(&mut cx).is_pending());
+    // A local-only probe never starts acquisition. Driving it also runs the
+    // detached acquisition driver, so it either misses or sees that driver's
+    // published page.
+    let probe = drive(
+        f.fill.warm_local(&f.page, &f.scope),
+        &mut f.engine,
+        &f.crypto,
+    );
+    match probe {
+        Ok(page) => assert_eq!(page.plaintext.bytes(), b"abc"),
+        Err(error) => assert_eq!(error, Error::Unavailable),
+    }
+    let acquired = drive(acquisition, &mut f.engine, &f.crypto).unwrap();
+    assert_eq!(acquired.plaintext.bytes(), b"abc");
+    assert_eq!(
+        f.origin.calls.get(),
+        1,
+        "only the acquisition reaches origin"
+    );
+    drop(acquired);
+    assert_local_plaintext_idle(&f);
+}
+
+#[test]
+fn local_plaintext_probe_job_retains_flight_charge_after_cancellation() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let metrics = retained_ciphertext_only(&mut f);
+    let admission = f.fill.dependencies.admission.clone();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut probe = Box::pin(f.fill.warm_local(&f.page, &f.scope));
+    assert!(probe.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(admission.used(ResourceClass::Flight), 1);
+    drop(probe);
+    // The detached job keeps its Flight charge after its only caller leaves.
+    assert_eq!(admission.used(ResourceClass::Flight), 1);
+    assert_eq!(admission.used(ResourceClass::Waiter), 0);
+    let joined = drive(
+        f.fill.warm_local(&f.page, &f.scope),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    assert_eq!(joined.plaintext.bytes(), b"abc");
+    assert_eq!(metrics.count(Event::PageDecrypt), 1);
+    drop(joined);
+    assert_local_plaintext_idle(&f);
+}
+
+#[test]
+fn local_plaintext_probe_respects_exhausted_flight_quota() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let metrics = retained_ciphertext_only(&mut f);
+    let admission = f.fill.dependencies.admission.clone();
+    let held = admission
+        .reserve(
+            None,
+            ResourceClass::Flight,
+            admission.limit(ResourceClass::Flight),
+        )
+        .unwrap();
+    let result = drive(
+        f.fill.warm_local(&f.page, &f.scope),
+        &mut f.engine,
+        &f.crypto,
+    );
+    assert!(matches!(result, Err(Error::Overloaded)));
+    assert_eq!(metrics.count(Event::PageDecrypt), 0);
+    drop(held);
+    assert_local_plaintext_idle(&f);
+}
+
+#[test]
+fn local_plaintext_follower_after_key_retirement_misses_but_leader_finishes() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    use crate::test_support::security::rotation_bundle;
+    let mut f = fixture_with(3, None);
+    let _metrics = retained_ciphertext_only(&mut f);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut leader = Box::pin(f.fill.warm_local(&f.page, &f.scope));
+    assert!(leader.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.fill.local_plaintext.len(), 1);
+    let roots = (*f.keys.peer_trust_roots().unwrap()).clone();
+    f.keys.install(rotation_bundle(2, roots)).unwrap();
+    // The job still runs, but a new follower cannot join its retired key.
+    assert_eq!(f.fill.local_plaintext.len(), 1);
+    let follower = drive(
+        f.fill.warm_local(&f.page, &f.scope),
+        &mut f.engine,
+        &f.crypto,
+    );
+    assert!(
+        matches!(follower.as_ref().err(), Some(Error::MissingKey)),
+        "{:?}",
+        follower.err()
+    );
+    let leader = drive(leader, &mut f.engine, &f.crypto).unwrap();
+    assert_eq!(leader.plaintext.bytes(), b"abc", "admitted caller finishes");
+}

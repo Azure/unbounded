@@ -886,6 +886,24 @@ impl Flights {
         Ok(())
     }
 
+    /// Admit a new follower of shared local plaintext work with the same current
+    /// cache and source-key checks as flight registration. Callers admitted
+    /// before a key retirement keep their completion rights.
+    pub(super) fn admit_local(
+        &self,
+        page: &PageId,
+        key: Option<racer_control_wire::KeyId>,
+    ) -> Result<()> {
+        let cache = &page.version.object.cache;
+        if !self.availability.cache(cache) {
+            return Err(Error::Unavailable);
+        }
+        if key.is_some_and(|key| !self.availability.page(cache, key)) {
+            return Err(Error::MissingKey);
+        }
+        Ok(())
+    }
+
     fn update<T>(&self, f: impl FnOnce(&mut Table, &mut Vec<Waker>) -> T) -> T {
         coalesce::flight::update(&self.table, f)
     }

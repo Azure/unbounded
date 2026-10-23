@@ -67,9 +67,15 @@ pub struct FillDependencies {
     pub metadata_owner: Arc<super::dispatch::WorkerDirectory>,
 }
 type LocalCopies = flow_control::coalesce::shared::Table<PageId, Result<Option<UnverifiedPage>>>;
-/// Local-only plaintext recovery keyed by page: one decrypt of a local copy is
-/// shared by every concurrent warm reader, and none of them may start acquisition.
+/// Local plaintext recovery keyed by page: one decrypt of a retained or local
+/// copy is shared by every concurrent warm reader and by elected acquisitions
+/// that find the page cached. Local-only readers never start acquisition.
 type LocalPlaintext = flow_control::coalesce::shared::Table<PageId, Result<Option<PageResult>>>;
+/// Source key of each running local plaintext job, once its copy is chosen.
+/// New followers are admitted only while that key remains available.
+type LocalPlaintextKeys = std::cell::RefCell<
+    std::collections::BTreeMap<PageId, Rc<std::cell::Cell<Option<racer_control_wire::KeyId>>>>,
+>;
 
 /// Optional writes may use half of the aggregate class budget, with a floor
 /// sufficient for one valid page when the configured budget can hold it. Owned
@@ -85,6 +91,7 @@ pub struct Fill {
     pub(super) metrics: Metrics,
     pub(super) local_copies: Rc<LocalCopies>,
     pub(super) local_plaintext: Rc<LocalPlaintext>,
+    local_plaintext_keys: Rc<LocalPlaintextKeys>,
 
     diagnostic: Option<DriverDiagnostic>,
     fence_acquisition: bool,
@@ -143,53 +150,95 @@ impl Fill {
         if let Some(result) = self.cached_page(page, scope)? {
             return Ok(result);
         }
-        match self.local_plaintext_copy(page, scope).await? {
+        match self.local_plaintext_copy(page, scope, true).await? {
             Some(result) => Ok(result),
             None => Err(Error::Unavailable),
         }
     }
 
-    /// Coalesce local-only decrypts so concurrent warm readers reserve and
-    /// decrypt one plaintext. A detached worker driver owns the shared work, so
-    /// one caller's cancellation never fails another caller. The driver only
-    /// reads pending, cached, or disk copies; it never contacts peers or origin.
+    /// Coalesce local decrypts so concurrent warm readers and elected
+    /// acquisitions reserve and decrypt one plaintext. A detached worker driver
+    /// owns the shared work, so one caller's cancellation never fails another
+    /// caller. The driver only reads pending, cached, or disk copies; it never
+    /// contacts peers or origin, so a local-only caller cannot start acquisition.
+    ///
+    /// A `probe` caller owns its own Waiter charge, and a probe that starts the
+    /// job reserves a Flight charge retained by the detached driver until the
+    /// job completes. An elected acquisition already holds both through its
+    /// flight registration and awaits the job inside its retained operation.
+    /// New followers recheck current cache and source-key admission; callers
+    /// admitted earlier keep their completion rights.
     async fn local_plaintext_copy(
         &self,
         page: &PageId,
         scope: &RequestScope,
+        probe: bool,
     ) -> Result<Option<PageResult>> {
         use std::future::Future;
         scope.check()?;
-        let _waiter = self.dependencies.admission.reserve(
-            Some(&page.version.object.cache),
-            ResourceClass::Waiter,
-            1,
-        )?;
+        let _waiter = if probe {
+            Some(self.dependencies.admission.reserve(
+                Some(&page.version.object.cache),
+                ResourceClass::Waiter,
+                1,
+            )?)
+        } else {
+            None
+        };
         let cancellation = scope.cancellation.subscribe()?;
         let mut receive = if let Some(existing) = self.local_plaintext.get(page) {
+            let key = self
+                .local_plaintext_keys
+                .borrow()
+                .get(page)
+                .and_then(|key| key.get());
+            self.dependencies.flights.admit_local(page, key)?;
             existing
         } else {
+            self.dependencies.flights.admit_local(page, None)?;
             let permit = uring_runtime::drivers::reserve().map_err(Error::from)?;
+            let flight = if probe {
+                Some(self.dependencies.flights.reserve_copy_flight(page, scope)?)
+            } else {
+                None
+            };
             let owned_scope = RequestScope::new(scope.request, scope.deadline.0)?;
             let (receive, completion) = self
                 .local_plaintext
                 .start(page.clone(), Err(Error::Unavailable));
             if let Some(completion) = completion {
+                let source = Rc::new(std::cell::Cell::new(None));
+                self.local_plaintext_keys
+                    .borrow_mut()
+                    .insert(page.clone(), source.clone());
                 let mut fill = self.clone();
                 fill.diagnostic = None;
                 let page = page.clone();
                 permit.submit_detached(Box::pin(async move {
+                    let _flight = flight;
                     let result = match fill.cached_page(&page, &owned_scope) {
                         Ok(Some(result)) => Ok(Some(result)),
-                        Ok(None) => fill
-                            .acquire_local_copy(&page, &owned_scope, true)
+                        Ok(None) => match fill
+                            .retained_plaintext(&page, &owned_scope, &source)
                             .await
-                            .map(|acquired| match acquired {
-                                Some(AcquiredPage::Plaintext(result)) => Some(result),
-                                _ => None,
-                            }),
+                        {
+                            Ok(Some(result)) => Ok(Some(result)),
+                            Ok(None) => fill
+                                .acquire_local_copy_from(&page, &owned_scope, true, Some(&source))
+                                .await
+                                .map(|acquired| match acquired {
+                                    Some(AcquiredPage::Plaintext(result)) => Some(result),
+                                    _ => None,
+                                }),
+                            Err(error) => Err(error),
+                        },
                         Err(error) => Err(error),
                     };
+                    let mut keys = fill.local_plaintext_keys.borrow_mut();
+                    if keys.get(&page).is_some_and(|key| Rc::ptr_eq(key, &source)) {
+                        keys.remove(&page);
+                    }
+                    drop(keys);
                     completion.finish(result);
                     Ok::<_, Error>(())
                 }));
@@ -204,6 +253,68 @@ impl Fill {
         })
         .await
     }
+    /// Decrypt the memory cache's retained ciphertext, the same copy an elected
+    /// acquisition previously decrypted on its own. A rejected copy is
+    /// invalidated, with its disk record, and reported as a miss so the caller
+    /// can try pending or disk copies.
+    async fn retained_plaintext(
+        &self,
+        page: &PageId,
+        scope: &RequestScope,
+        source_key: &std::cell::Cell<Option<racer_control_wire::KeyId>>,
+    ) -> Result<Option<PageResult>> {
+        let Some(cached) = self.metrics.lookup(
+            LookupTier::Ciphertext,
+            self.dependencies.memory.unverified(page),
+        )?
+        else {
+            return Ok(None);
+        };
+        // Disk-sourced copies already counted their disk hit.
+        if cached.disk_token.is_none() {
+            self.metrics.record(Event::MemoryHit, 1);
+        }
+        source_key.set(Some(cached.copy.ciphertext.envelope().key_id));
+        let result = async {
+            let reservation = self.observe_reservation(
+                scope,
+                page,
+                FillAdmissionSite::RetainedPlaintext,
+                || self.reserve_copy_plaintext(page, &cached.copy),
+            )?;
+            self.call(
+                DriverStage::DecryptCall,
+                self.decrypt(
+                    page,
+                    cached.copy.clone(),
+                    reservation,
+                    scope,
+                    DecryptSource::Retained,
+                ),
+            )
+            .await
+        }
+        .await;
+        match result {
+            Ok(result) => {
+                self.call(
+                    DriverStage::PublishCall,
+                    self.publish(result.clone(), None, scope),
+                )
+                .await?;
+                Ok(Some(result))
+            }
+            Err(Error::CorruptRecord | Error::MissingKey) => {
+                self.dependencies.memory.invalidate_ciphertext(&cached);
+                if let Some(token) = &cached.disk_token {
+                    self.dependencies.disk.invalidate(token)?;
+                }
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Mark this detached driver's call boundary, if it owns a diagnostic generation.
     fn stage(&self, stage: DriverStage) {
         if let Some(diagnostic) = &self.diagnostic {
@@ -672,6 +783,7 @@ impl Fill {
             metrics: Metrics::default(),
             local_copies: Rc::new(LocalCopies::default()),
             local_plaintext: Rc::new(LocalPlaintext::default()),
+            local_plaintext_keys: Rc::default(),
             diagnostic: None,
             fence_acquisition: false,
         }
@@ -941,10 +1053,20 @@ impl Fill {
     ) -> Result<()> {
         use std::future::Future;
 
+        let mut shared_local = false;
         let ready = match self.dependencies.flights.ciphertext_for(&leader)? {
             Some(ready) => Some(ready),
-            // Cached pages retain only ciphertext. Decrypting it here keeps
-            // concurrent local readers coalesced on this flight.
+            // Cached pages retain only ciphertext. A plaintext acquisition
+            // decrypts it through the shared local plaintext job, so range
+            // probes and warm readers of the same page share one reservation
+            // and one decrypt in either arrival order.
+            None if plaintext
+                && (self.local_plaintext.get(page).is_some()
+                    || self.dependencies.memory.unverified(page)?.is_some()) =>
+            {
+                shared_local = true;
+                None
+            }
             None => {
                 let cached = self.metrics.lookup(
                     LookupTier::Ciphertext,
@@ -996,6 +1118,18 @@ impl Fill {
             let started = uring_runtime::environment::now();
             let _diagnostic_lifetime = diagnostic_lifetime;
             let mut work = Box::pin(async {
+                if shared_local {
+                    // A local miss or a rejected local copy falls through to
+                    // ordinary acquisition with this flight's own rights.
+                    match fill
+                        .local_plaintext_copy(&owned_page, &owned_scope, false)
+                        .await
+                    {
+                        Ok(Some(result)) => return Ok(result.into()),
+                        Ok(None) | Err(Error::MissingKey | Error::Unavailable) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
                 if let Some(copy) = ready {
                     if !plaintext {
                         return Ok(AcquiredPage::Ciphertext(copy));
@@ -1320,6 +1454,19 @@ impl Fill {
         scope: &RequestScope,
         want_plaintext: bool,
     ) -> Result<Option<AcquiredPage>> {
+        self.acquire_local_copy_from(page, scope, want_plaintext, None)
+            .await
+    }
+
+    /// Record the chosen copy's key in `source_key` before decrypting it, so shared
+    /// local plaintext work can admit new followers against that key.
+    async fn acquire_local_copy_from(
+        &self,
+        page: &PageId,
+        scope: &RequestScope,
+        want_plaintext: bool,
+        source_key: Option<&std::cell::Cell<Option<racer_control_wire::KeyId>>>,
+    ) -> Result<Option<AcquiredPage>> {
         scope.check()?;
         // Pending copies already own ciphertext. Disk owns a separate complete
         // staging/decoded bundle; neither source needs speculative network bytes.
@@ -1395,6 +1542,9 @@ impl Fill {
             } else {
                 DecryptSource::Retained
             };
+            if let Some(source_key) = source_key {
+                source_key.set(Some(copy.ciphertext.envelope().key_id));
+            }
             let result = async {
                 scope.check()?;
                 let reservation = self.observe_reservation(
