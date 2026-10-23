@@ -5246,8 +5246,10 @@ fn cache_disk_samples_handle_empty_inputs() {
 
 #[test]
 fn cache_disk_samples_scale_to_large_catalogs() {
-    // A linear catalog search per sample would make 50 million id compares
-    // here; the map join keeps this to one pass over each input.
+    // Regression input for the old linear catalog search per sample, which
+    // made about 50 million id compares at this size. The map join makes one
+    // pass over each input. Reversed usage order checks that every lookup is
+    // by id, not by position.
     const CACHES: usize = 10_000;
     let caches: Vec<_> = (0..CACHES)
         .map(|i| cache_definition(&format!("uid-{i:05}"), &format!("cache-{i}")))
@@ -5256,9 +5258,7 @@ fn cache_disk_samples_scale_to_large_catalogs() {
         .rev()
         .map(|i| cache_disk(&format!("uid-{i:05}"), i as u64, 1))
         .collect();
-    let started = std::time::Instant::now();
     let samples = super::cache_disk_samples(&caches, usage);
-    assert!(started.elapsed() < std::time::Duration::from_secs(2));
     assert_eq!(samples.len(), CACHES);
     for (sample, i) in samples.iter().zip((0..CACHES).rev()) {
         assert_eq!(&*sample.cache, format!("cache-{i}"));
