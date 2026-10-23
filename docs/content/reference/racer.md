@@ -1028,7 +1028,8 @@ for the process. At most 256 GPU reads run at once; more get 503.
 
 Where the bytes come from decides who decrypts them:
 
-- A page that is already plaintext in memory is copied to the GPU.
+- A page whose plaintext another read still holds in memory is copied to the
+  GPU. The memory cache itself keeps only encrypted pages.
 - A page fetched from the origin is encrypted on the CPU, so its plaintext is
   copied to the GPU too.
 - Other pages reach the GPU still encrypted, and the GPU checks and decrypts

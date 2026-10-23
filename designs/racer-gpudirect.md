@@ -170,8 +170,10 @@ startup fail instead.
 
 For each page of a `gpu-read`:
 
-- If the plaintext is in memory, the dataplane copies it host to GPU.
-- Otherwise it fetches the ciphertext and decrypts it on the GPU (below).
+- If another reader still holds the page's plaintext, the dataplane copies it
+  host to GPU.
+- Otherwise it takes the ciphertext (the memory cache keeps only ciphertext)
+  and decrypts it on the GPU (below).
 
 ### GPU decryption
 
@@ -189,7 +191,8 @@ dataplane's GPU memory and are wiped after use.
 
 Ciphertext reaches GPU staging memory owned by the dataplane in one of three ways:
 
-- **Memory, origin or HTTP peer:** one host-to-GPU copy.
+- **Memory, origin or HTTP peer:** one host-to-GPU copy. A page cached in
+  memory is staged from there even if it is also on disk.
 - **Local disk:** cuFile reads it straight from NVMe (aligned records only, below).
 - **RDMA peer:** the NIC writes it into a GPU landing buffer registered with
   `ibv_reg_dmabuf_mr`. The dma-buf comes from `cuMemGetHandleForAddressRange`.
@@ -200,8 +203,8 @@ How the implementation works today, where it adds to or differs from the plan
 above:
 
 - The read path asks for sealed pages only for `gpu-read`
-  (`RangeStream::set_sealed`, `Fill::acquire_sealed`). Pages that are verified
-  plaintext in memory, origin fills (the CPU encrypts them, so it has the
+  (`RangeStream::set_sealed`, `Fill::acquire_sealed`). Pages whose plaintext
+  another reader still holds, origin fills (the CPU encrypts them, so it has the
   plaintext), and pages another reader already decrypted are still delivered
   as plaintext and copied host to GPU. So are pages that a peer selection fans
   out to the read window, and pages whose key cannot be derived or whose AAD is
