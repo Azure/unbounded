@@ -140,6 +140,9 @@ struct Term_ {
     inventory: Rc<RefCell<Inventory>>,
     changed: Signal,
     extra: RefCell<BTreeMap<&'static str, Option<String>>>,
+    /// Notified when `extra` changes, so renew publishes it without waiting
+    /// a full renew period.
+    publish: Signal,
     seat_observer: RefCell<Observer>,
     webhook_retired: RetiredTrust,
 }
@@ -161,6 +164,7 @@ async fn lead(shared: &Rc<Shared>, seat: &Rc<Seat>, object: Value, started: Inst
         inventory: Rc::new(RefCell::new(Inventory::default())),
         changed: Signal::default(),
         extra: RefCell::new(BTreeMap::new()),
+        publish: Signal::default(),
         seat_observer: RefCell::new(Observer::default()),
         webhook_retired: RefCell::new(BTreeMap::new()),
     });
@@ -220,6 +224,8 @@ async fn renew(t: Rc<Term_>) {
     let ns = t.shared.config.namespace.clone();
     while t.alive.get() {
         let started = Instant::now();
+        // Taken before reading `extra`: a change from here on renews again.
+        let publish = t.publish.generation();
         let object = t.object.borrow().clone();
         let spec = election::renew(&lease::observe(&object).spec, &election::now_micro());
         let body = lease::with(
@@ -262,7 +268,8 @@ async fn renew(t: Rc<Term_>) {
             t.changed.notify();
             return;
         }
-        exec::sleep_until(started + limits::LEASE_RENEW).await;
+        // Renew on schedule, or early to publish changed discovery.
+        let _ = exec::deadline(started + limits::LEASE_RENEW, t.publish.changed(publish)).await;
     }
 }
 
@@ -786,6 +793,7 @@ async fn update_discovery(
         .collect();
     {
         let mut extra = t.extra.borrow_mut();
+        let before = extra.clone();
         extra.insert(annotations::SEATS, Some(desired.to_string()));
         extra.insert(
             annotations::SEAT_NODES,
@@ -796,6 +804,10 @@ async fn update_discovery(
             Some((eligible as u64 / 50).clamp(10, 600).to_string()),
         );
         extra.insert(annotations::ENDPOINTS, Some(encode_endpoints(&endpoints)));
+        if *extra != before {
+            drop(extra);
+            t.publish.notify();
+        }
     }
     let webhooks: Vec<WebhookSeat> = ready
         .iter()
