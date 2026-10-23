@@ -18,7 +18,6 @@ use crate::runtime::HashMap;
 use crate::runtime::HashSet;
 use racer_control_wire::CacheId;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
