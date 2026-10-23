@@ -74,6 +74,11 @@ def header_length(prefix: bytes) -> int:
     return n
 
 
+def _is_uint_list(v) -> bool:
+    # JSON integers only: reject floats, numeric strings, and bools (bool is an int subclass).
+    return isinstance(v, list) and all(type(x) is int and x >= 0 for x in v)
+
+
 def parse_header(raw: bytes, file_size: int | None = None) -> Header:
     """Parse header JSON (without the 8-byte prefix) into sorted TensorInfo."""
     try:
@@ -88,10 +93,14 @@ def parse_header(raw: bytes, file_size: int | None = None) -> Header:
     for name, spec in doc.items():
         try:
             dtype = spec["dtype"]
-            shape = tuple(int(d) for d in spec["shape"])
-            begin, end = (int(x) for x in spec["data_offsets"])
-        except (KeyError, TypeError, ValueError) as exc:
+            raw_shape = spec["shape"]
+            raw_offsets = spec["data_offsets"]
+        except (KeyError, TypeError) as exc:
             raise SafetensorsError(f"bad entry for {name!r}") from exc
+        if not _is_uint_list(raw_shape) or not _is_uint_list(raw_offsets) or len(raw_offsets) != 2:
+            raise SafetensorsError(f"bad shape or offsets for {name!r}")
+        shape = tuple(raw_shape)
+        begin, end = raw_offsets
         if dtype not in DTYPE_SIZES:
             raise SafetensorsError(f"unsupported dtype {dtype} for {name!r}")
         if any(d < 0 for d in shape) or begin < 0 or end < begin:

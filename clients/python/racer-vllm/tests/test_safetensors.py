@@ -66,6 +66,17 @@ def test_plan_chunks_split_and_dedicated():
         b'{"a":{"dtype":"U8","shape":[2],"data_offsets":[0,2]},"b":{"dtype":"U8","shape":[2],"data_offsets":[1,3]}}',
         b'{"a":{"dtype":"U8","shape":[-1],"data_offsets":[0,0]}}',
         b'{"a":{"dtype":"U8"}}',
+        b'{"a":{"dtype":"U8","shape":[1.9],"data_offsets":[0.9,1.9]}}',
+        b'{"a":{"dtype":"U8","shape":[1],"data_offsets":[0.0,1.0]}}',
+        b'{"a":{"dtype":"U8","shape":[-0.5],"data_offsets":[0,0]}}',
+        b'{"a":{"dtype":"U8","shape":["1"],"data_offsets":[0,1]}}',
+        b'{"a":{"dtype":"U8","shape":[1],"data_offsets":["0","1"]}}',
+        b'{"a":{"dtype":"U8","shape":[true],"data_offsets":[0,1]}}',
+        b'{"a":{"dtype":"U8","shape":[1],"data_offsets":[false,true]}}',
+        b'{"a":{"dtype":"U8","shape":"1","data_offsets":[0,1]}}',
+        b'{"a":{"dtype":"U8","shape":[1],"data_offsets":[0,1,2]}}',
+        b'{"a":{"dtype":"U8","shape":[1],"data_offsets":{"0":0}}}',
+        b'{"a":[]}',
     ],
 )
 def test_bad_headers(header):
