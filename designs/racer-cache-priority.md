@@ -137,11 +137,12 @@ or a small total budget, the equal split can be smaller than `progress`, and a
 read can still be rejected with Overloaded.
 
 Only the memory classes plaintext (reader working memory), ciphertext, and
-dirty ciphertext are weighted. Request-serving classes (request context, registered buffers,
-flights, waiters, connections, pipes, control progress, and relays) keep the
-equal split across active caches. Priority describes retention, not request
-service, and a priority 0 cache must still be able to reserve the full request
-context needed to read a request while a higher-priority cache is busy.
+dirty ciphertext are weighted. Request-serving classes (request context,
+registered buffers, flights, waiters, connections, pipes, control progress,
+and relays) keep the equal split across active caches. Priority describes
+retention, not request service, and a priority 0 cache must still be able to
+reserve the full request context needed to read a request while a
+higher-priority cache is busy.
 
 The memory cache retains only ciphertext. Plaintext is working memory held by
 readers, so plaintext pressure frees nothing from the cache. When a cache is

@@ -310,8 +310,8 @@ impl Policy for AdmissionPolicy {
     fn weight(&self, key: &CacheId) -> u64 {
         self.weights.weight(key)
     }
-    /// Priority shares only cached page memory. Request-serving classes keep
-    /// an equal split so a priority-0 cache can still serve requests.
+    /// Priority weights page-memory budgets. Other request-serving classes
+    /// keep an equal split so a priority-0 cache can still serve requests.
     fn weighted(class: ResourceClass) -> bool {
         matches!(
             class,
@@ -330,11 +330,11 @@ impl Policy for AdmissionPolicy {
             _ => 1,
         }
     }
-    /// Plaintext and ciphertext are request working memory as well as cache
-    /// memory. Each cache keeps an allowance sized for one range window, the
-    /// same amount configuration validation requires of each whole budget
-    /// (`config.rs`). All concurrent requests on the cache share it, and the
-    /// equal-share cap can make it smaller, so a low-priority cache can still
+    /// Plaintext is request working memory; ciphertext is both working and
+    /// retained memory. Each cache keeps an allowance sized for one range
+    /// window, the same amount configuration validation requires of each whole
+    /// budget (`config.rs`). All concurrent requests on the cache share it, and
+    /// the equal-share cap can make it smaller, so a low-priority cache can still
     /// see `Overloaded`. It limits how far low priority shrinks the share; it
     /// does not guarantee progress.
     fn progress(&self, class: ResourceClass) -> usize {

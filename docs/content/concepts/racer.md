@@ -158,10 +158,10 @@ chance of one-off reads pushing out useful data. This policy is called
 available capacity, and eviction still apply.
 
 When caches compete for space, each gets a share of the node's capacity in
-proportion to its `spec.priority`. Under pressure, eviction prefers data from caches above their share, within
-bounded scans.
-Among pages in the same state, hotter pages and pages this node owns stay
-longer. A cache can use idle space beyond its share.
+proportion to its `spec.priority`. Under pressure, eviction prefers data from
+caches above their share, within bounded scans. Among pages in the same state,
+hotter pages and pages this node owns stay longer. A cache can use idle space
+beyond its share.
 
 The default storage is slab files under `/var/lib/racer/slabs`, with
 raw block devices as an alternative. Checkpoints let a node
