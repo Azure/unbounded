@@ -64,13 +64,21 @@ func newHarness(t *testing.T) *harness {
 
 	root := repoRoot(t)
 
+	// Validate the cluster name before any filesystem write: it becomes a
+	// path component of the private kubeconfig.
+	clusterName := resolveClusterName()
+
+	kubeconfig, err := harnessKubeconfigPath(root, clusterName)
+	if err != nil {
+		t.Fatalf("GANTRY_E2E_CLUSTER: %v", err)
+	}
+
 	artifacts := filepath.Join(root, "e2e", ".artifacts")
 	if err := os.MkdirAll(artifacts, 0o755); err != nil {
 		t.Fatalf("mkdir artifacts: %v", err)
 	}
 
 	manifests := renderGantryChart(t, root)
-	clusterName := resolveClusterName()
 
 	return &harness{
 		t:               t,
@@ -79,7 +87,7 @@ func newHarness(t *testing.T) *harness {
 		manifests:       manifests,
 		containerEngine: resolveContainerEngine(t),
 		clusterName:     clusterName,
-		kubeconfig:      harnessKubeconfigPath(root, clusterName),
+		kubeconfig:      kubeconfig,
 		keepCluster:     os.Getenv("E2E_KEEP") == "1",
 	}
 }
@@ -130,8 +138,28 @@ func resolveClusterName() string {
 // harnessKubeconfigPath returns the private kubeconfig the harness uses for
 // clusterName. It lives under the gitignored repo tmp/ directory so the
 // suite never reads or rewrites ~/.kube/config or an ambient KUBECONFIG.
-func harnessKubeconfigPath(root, clusterName string) string {
-	return filepath.Join(root, "tmp", "gantry-e2e", clusterName, "kubeconfig")
+func harnessKubeconfigPath(root, clusterName string) (string, error) {
+	if err := validateClusterName(clusterName); err != nil {
+		return "", err
+	}
+
+	return filepath.Join(root, "tmp", "gantry-e2e", clusterName, "kubeconfig"), nil
+}
+
+// validateClusterName rejects names that would not stay a single path
+// component under the repo tmp directory. kind validates the name itself
+// later, but only after the harness has written the kubeconfig directory.
+func validateClusterName(name string) error {
+	switch {
+	case name == "":
+		return errors.New("cluster name is empty")
+	case name == "." || name == "..":
+		return fmt.Errorf("cluster name %q is not a valid path component", name)
+	case filepath.IsAbs(name) || strings.ContainsAny(name, `/\`):
+		return fmt.Errorf("cluster name %q must not contain path separators", name)
+	}
+
+	return nil
 }
 
 // kindContext is the kubeconfig context kind writes for clusterName.
