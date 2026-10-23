@@ -31,6 +31,36 @@ type testInformer struct {
 func (f *testInformer) GetStore() cache.Store { return f.store }
 func (f *testInformer) HasSynced() bool       { return true }
 
+func TestClearGatewayNodeRoutesStatusWithoutCache(t *testing.T) {
+	node := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "net.unbounded-cloud.io/v1alpha1",
+		"kind":       "GatewayPoolNode",
+		"metadata":   map[string]interface{}{"name": "gateway-a"},
+		"status": map[string]interface{}{
+			"routes":    map[string]interface{}{"10.0.0.0/16": map[string]interface{}{"type": "NodeCidr"}},
+			"publicKey": "keep",
+		},
+	}}
+
+	client := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), node)
+	if err := clearGatewayNodeRoutesStatus(t.Context(), client, node.GetName()); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := client.Resource(gatewayNodeGVR).Get(t.Context(), node.GetName(), metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, found, err := unstructured.NestedMap(got.Object, "status", "routes"); err != nil || found {
+		t.Fatalf("routes remain after clear: %v, err=%v", got.Object, err)
+	}
+
+	if value, _, _ := unstructured.NestedString(got.Object, "status", "publicKey"); value != "keep" {
+		t.Fatalf("unrelated status removed: %v", got.Object)
+	}
+}
+
 func toUnstructured(t *testing.T, obj interface{}) *unstructured.Unstructured {
 	t.Helper()
 
