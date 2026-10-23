@@ -62,22 +62,27 @@ spec:
 
 Each cache's fair share of a resource is `capacity * priority / sum of all
 priorities`. If every cache has priority 0, shares are equal. Shares apply to
-disk, the pending write queue, and page cache memory (plaintext and
-ciphertext). Request-serving resources such as request context, connections,
-and in-flight fetches are split equally between active caches regardless of
-priority, so a priority 0 cache can still serve requests. Page cache memory
-shares also never drop below what one read needs (`RACER_RANGE_WINDOW_PAGES`
-plus one page), capped at an equal split. Each I/O worker computes
-shares on its own; pages are spread across workers by hash, so this is close to
-a node-wide share.
+disk, the pending write queue, and memory: plaintext (working memory held by
+readers) and ciphertext (the only data the memory cache retains).
+Request-serving resources such as request context, connections, and in-flight
+fetches are split equally between active caches regardless of priority, so a
+priority 0 cache can still serve requests. Each cache also keeps a plaintext
+and ciphertext working allowance of about one range window
+(`RACER_RANGE_WINDOW_PAGES`), capped at an equal split. All concurrent requests
+on that cache share this allowance, and the cap can make it smaller, so a read
+can still be rejected with Overloaded. Each I/O worker computes shares on its
+own; pages are spread across workers by hash, so this is close to a node-wide
+share.
 
-A cache above its share is over share. Under pressure, over-share caches lose
-data first. Idle capacity is still used by any cache, so a cache can grow past
+A cache above its share is over share. Under pressure, eviction prefers data
+from over-share caches. Scans are bounded, so this is a preference, not a
+guarantee. Idle capacity is still used by any cache, so a cache can grow past
 its share while others do not need the space. Priority is not a quota or a
 reservation, and nodes do not coordinate.
 
-Priority 0 gives no share. The cache is evicted first but is still cached while
-capacity is idle.
+Priority 0 gives no weighted share unless every cache has priority 0. The cache
+keeps its working allowance, is preferred for eviction, and is still cached
+while capacity is idle.
 
 The controller and dataplane must run the same version. A mismatched pair
 rejects the cache catalog.
