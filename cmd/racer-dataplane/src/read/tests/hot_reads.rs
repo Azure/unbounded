@@ -482,7 +482,13 @@ mod duplex_release {
             for _ in 0..4096 {
                 assert!(send.as_mut().poll(&mut cx).is_pending());
                 pump(&mut endpoint);
-                if f.fill.dependencies.memory.get(&third).unwrap().is_some() {
+                if f.fill
+                    .dependencies
+                    .memory
+                    .ciphertext(&third)
+                    .unwrap()
+                    .is_some()
+                {
                     break;
                 }
             }
@@ -491,7 +497,14 @@ mod duplex_release {
                 &[0, 1, 2],
                 "wire release must refill acquisition before page-one write completes"
             );
-            assert!(f.fill.dependencies.memory.get(&third).unwrap().is_some());
+            assert!(
+                f.fill
+                    .dependencies
+                    .memory
+                    .ciphertext(&third)
+                    .unwrap()
+                    .is_some()
+            );
             let mut done = None;
             for _ in 0..8192 {
                 if done.is_none()
@@ -1580,4 +1593,142 @@ fn origin_fill_preserves_ciphertext_for_memory_and_pending_candidate_copy() {
     ));
     assert_eq!(f.fill.metrics.count(Event::OriginFill), 1);
     assert_eq!(f.fill.metrics.count(Event::MemoryHit), 2);
+}
+
+/// Acquire `f.page` twice concurrently on the same worker.
+fn acquire_pair(f: &mut Fixture) -> (Result<PageResult>, Result<PageResult>) {
+    let mut first_budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let mut second_budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    drive(
+        futures::future::join(
+            f.fill.acquire(
+                f.page.clone(),
+                f.membership.clone(),
+                &f.context,
+                &f.scope,
+                &mut first_budget,
+            ),
+            f.fill.acquire(
+                f.page.clone(),
+                f.membership.clone(),
+                &f.context,
+                &f.scope,
+                &mut second_budget,
+            ),
+        ),
+        &mut f.engine,
+        &f.crypto,
+    )
+}
+
+/// Fill one page from origin, then release every plaintext owner.
+fn fill_and_release(f: &mut Fixture) -> CiphertextPage {
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let result = acquire(f, &mut budget).unwrap();
+    assert_eq!(result.plaintext.bytes(), b"abc");
+    let ciphertext = result.ciphertext.clone();
+    drop(result);
+    f.fill.dependencies.flights.poll_budgeted(64).unwrap();
+    ciphertext
+}
+
+#[test]
+fn memory_cache_retains_only_ciphertext_after_delivery() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let ciphertext = fill_and_release(&mut f);
+    let deps = &f.fill.dependencies;
+    deps.admission.reclaim_buffers();
+    assert_eq!(deps.admission.used(ResourceClass::Plaintext), 0);
+    assert!(deps.memory.get(&f.page).unwrap().is_none());
+    let cached = deps.memory.ciphertext(&f.page).unwrap().unwrap();
+    assert!(Arc::ptr_eq(&cached.ciphertext.inner, &ciphertext.inner));
+    assert!(deps.admission.used(ResourceClass::Ciphertext) > 0);
+}
+
+#[test]
+fn cached_ciphertext_hit_decrypts_without_refetching() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let ciphertext = fill_and_release(&mut f);
+    let decrypts = f.fill.metrics.count(Event::FillDecryptCount);
+    let hits = f.fill.metrics.count(Event::MemoryHit);
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let again = acquire(&mut f, &mut budget).unwrap();
+    assert_eq!(again.plaintext.bytes(), b"abc");
+    // The decrypt used the cached allocation; no origin, disk, or peer work.
+    assert!(Arc::ptr_eq(&again.ciphertext.inner, &ciphertext.inner));
+    assert_eq!(f.origin.calls.get(), 1);
+    assert_eq!(f.fill.metrics.count(Event::FillDecryptCount), decrypts + 1);
+    assert_eq!(f.fill.metrics.count(Event::MemoryHit), hits + 1);
+    assert_eq!(f.fill.metrics.count(Event::DiskHit), 0);
+    assert_eq!(f.fill.metrics.count(Event::PeerHit), 0);
+    // The decrypted plaintext is shared while held, then released.
+    let shared = f.fill.dependencies.memory.get(&f.page).unwrap().unwrap();
+    assert!(Arc::ptr_eq(&shared.plaintext.inner, &again.plaintext.inner));
+    drop((again, shared));
+    f.fill.dependencies.flights.poll_budgeted(64).unwrap();
+    f.fill.dependencies.admission.reclaim_buffers();
+    assert_eq!(
+        f.fill.dependencies.admission.used(ResourceClass::Plaintext),
+        0
+    );
+}
+
+#[test]
+fn concurrent_cached_ciphertext_hits_coalesce_into_one_decrypt() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    fill_and_release(&mut f);
+    let decrypts = f.fill.metrics.count(Event::FillDecryptCount);
+    let (first, second) = acquire_pair(&mut f);
+    let (first, second) = (first.unwrap(), second.unwrap());
+    assert_eq!(first.plaintext.bytes(), b"abc");
+    assert!(Arc::ptr_eq(&first.plaintext.inner, &second.plaintext.inner));
+    assert_eq!(f.fill.metrics.count(Event::FillDecryptCount), decrypts + 1);
+    assert_eq!(f.origin.calls.get(), 1);
+}
+
+#[test]
+fn live_plaintext_is_reused_without_another_decrypt() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let held = acquire(&mut f, &mut budget).unwrap();
+    f.fill.dependencies.flights.poll_budgeted(64).unwrap();
+    let decrypts = f.fill.metrics.count(Event::FillDecryptCount);
+    for _ in 0..3 {
+        let again = acquire(&mut f, &mut budget).unwrap();
+        assert!(Arc::ptr_eq(&again.plaintext.inner, &held.plaintext.inner));
+    }
+    assert_eq!(f.fill.metrics.count(Event::FillDecryptCount), decrypts);
+    assert_eq!(f.origin.calls.get(), 1);
+    // The weak handle never keeps the plaintext alive by itself.
+    let plaintext = Arc::downgrade(&held.plaintext.inner);
+    drop(held);
+    f.fill.dependencies.flights.poll_budgeted(64).unwrap();
+    assert!(plaintext.upgrade().is_none());
+    assert!(f.fill.dependencies.memory.get(&f.page).unwrap().is_none());
+}
+
+#[test]
+fn peers_receive_cached_ciphertext_without_plaintext() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let ciphertext = fill_and_release(&mut f);
+    let decrypts = f.fill.metrics.count(Event::FillDecryptCount);
+    let (metadata, copy) = futures::executor::block_on(f.fill.copy_only(&f.page, &f.scope))
+        .unwrap()
+        .unwrap();
+    assert_eq!(metadata.version, f.page.version);
+    assert!(Arc::ptr_eq(&copy.inner, &ciphertext.inner));
+    assert_eq!(copy.envelope().nonce, ciphertext.envelope().nonce);
+    // Serving ciphertext neither decrypts nor materializes plaintext.
+    assert_eq!(f.fill.metrics.count(Event::FillDecryptCount), decrypts);
+    assert!(f.fill.dependencies.memory.get(&f.page).unwrap().is_none());
 }
