@@ -459,7 +459,11 @@ impl<M: Member> Membership<M> {
     }
 
     /// Hash of the domain and IDs. Weights are left out.
-    fn topology_identity(&self) -> [u8; 32] {
+    ///
+    /// This is the graph identity that route cache keys use, so callers of
+    /// [`SharedRoutes::forget`] pass it to keep a membership's routes.
+    #[must_use]
+    pub fn topology_identity(&self) -> [u8; 32] {
         self.topology_identity
     }
 
