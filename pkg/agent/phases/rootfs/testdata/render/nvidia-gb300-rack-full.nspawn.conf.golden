@@ -52,6 +52,9 @@ Bind=/dev/nvidia-caps
 Bind=/dev/nvidia-caps-imex-channels
 BindReadOnly=/usr/lib/aarch64-linux-gnu:/run/host-nvidia/0
 BindReadOnly=/usr/lib/aarch64-linux-gnu/vdpau:/run/host-nvidia/1
+# Expose the host udev database so GPUDirect Storage (cuFile) can resolve the
+# properties of the host's block devices.
+BindReadOnly=/run/udev
 # Stage host-matched NVIDIA helpers so node-start can copy them into the root
 # passed to nvidia-ctk with --driver-root. They are not run from this mount.
 BindReadOnly=/usr/bin:/run/host-nvidia-bin

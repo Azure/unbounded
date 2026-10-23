@@ -196,7 +196,6 @@ func TestNSpawnConfig_NVIDIAGPUDirectStorage(t *testing.T) {
 
 	data := defaultNSpawnTemplateData("kube1")
 	data.NvidiaDeviceTargets = nvidiaNSpawnDeviceTargets([]string{"/dev/nvidia0", nvidiaFS})
-	data.NvidiaUdevDataDir = "/run/udev"
 
 	var nspawnBuf bytes.Buffer
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
@@ -207,7 +206,7 @@ func TestNSpawnConfig_NVIDIAGPUDirectStorage(t *testing.T) {
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&overrideBuf, "service-override.conf", data))
 	require.Contains(t, overrideBuf.String(), "DeviceAllow="+nvidiaFS+" rwm")
 
-	data.NvidiaUdevDataDir = ""
+	data.NvidiaDeviceTargets = nil
 
 	nspawnBuf.Reset()
 	require.NoError(t, nspawnTemplates.ExecuteTemplate(&nspawnBuf, "nspawn.conf", data))
