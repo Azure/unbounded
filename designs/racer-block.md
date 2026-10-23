@@ -145,10 +145,11 @@ still block if neither ring can finish requests already handed to the server.
 - Warm (optional): with `--warm-ttl`, racer-block asks Racer to retain the
   pinned version and renews the request until close. Racer may grant less
   than the TTL asked for. Each renewal happens at half the time left on the
-  latest deadline Racer granted, and at most every half TTL. If Racer refuses
-  or a renewal fails, racer-block keeps the earlier deadline while it is still
-  valid and retries at most once a second. Once no deadline is valid, it
-  retries every half TTL.
+  latest deadline Racer granted, but no later than half the TTL after the
+  last response. If Racer refuses or a renewal fails, racer-block keeps the
+  earlier deadline while it is still valid and retries at half the time left.
+  Retries are never closer than
+  1 ms apart. Once no deadline is valid, it retries every half TTL.
 
 ## Connections
 

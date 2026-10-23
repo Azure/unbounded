@@ -199,8 +199,10 @@ func TestWarmCloseDuringRenewal(t *testing.T) {
 	wantCalls(t, got, 0, 30*time.Minute)
 }
 
-// checkWarmGaps checks calls before deadline are at least a second apart and
-// all happen before it, and later calls are WarmTTL/2 apart.
+// checkWarmGaps checks that each call made while the deadline is valid is
+// followed by one after half the time left (at least minWarmDelay), that the
+// number of such calls stays bounded, and that calls after expiry are
+// WarmTTL/2 apart.
 func checkWarmGaps(t *testing.T, got []time.Duration, deadline, ttl time.Duration) {
 	t.Helper()
 
@@ -209,23 +211,51 @@ func checkWarmGaps(t *testing.T, got []time.Duration, deadline, ttl time.Duratio
 	for i := 1; i < len(got); i++ {
 		gap := got[i] - got[i-1]
 
-		switch {
-		case got[i-1] < deadline && gap < minWarmRetry:
-			t.Fatalf("calls %v: gap %v below %v", got, gap, minWarmRetry)
-		case got[i-1] >= deadline && gap != ttl/2:
-			t.Fatalf("calls %v: gap %v after expiry, want %v", got, gap, ttl/2)
-		}
+		if left := deadline - got[i-1]; left > 0 {
+			if want := max(left/2, minWarmDelay); gap != want {
+				t.Fatalf("calls %v: gap %v with %v left, want %v", got, gap, left, want)
+			}
 
-		if got[i] < deadline {
 			before++
+		} else if gap != ttl/2 {
+			t.Fatalf("calls %v: gap %v after expiry, want %v", got, gap, ttl/2)
 		}
 	}
 
-	if before < 10 || before > 20 {
+	if before < 10 || before > 40 {
 		t.Fatalf("calls %v: %d renewals before deadline", got, before)
 	}
 
 	if last := got[len(got)-1]; last < deadline+ttl/2-time.Second {
 		t.Fatalf("calls %v: no fallback renewal after expiry", got)
 	}
+}
+
+// Racer may cap every grant at one second. Renewals must still come before
+// each deadline, every 500 ms, not at expiry.
+func TestWarmRenewsRepeatedOneSecondGrant(t *testing.T) {
+	got := runWarm(t, 4*time.Hour, 2100*time.Millisecond, warmStep{grant: time.Second})
+	wantCalls(t, got, 0, 500*time.Millisecond, time.Second, 1500*time.Millisecond, 2*time.Second)
+}
+
+// When latency leaves less than a second of a grant, the renewal still comes
+// before the deadline.
+func TestWarmRenewsWithUnderOneSecondLeft(t *testing.T) {
+	got := runWarm(t, 4*time.Hour, 900*time.Millisecond, // Close at 1.5s
+		warmStep{delay: 600 * time.Millisecond, grant: 400 * time.Millisecond}, // Open: returns at 600ms, deadline 1s
+		warmStep{grant: 300 * time.Millisecond},                                // 800ms: deadline 1.1s
+		warmStep{grant: 300 * time.Millisecond},                                // 950ms: deadline 1.25s
+	)
+	wantCalls(t, got, 0, 800*time.Millisecond, 950*time.Millisecond, 1100*time.Millisecond,
+		1250*time.Millisecond, 1400*time.Millisecond)
+}
+
+// A failed retry with a short deadline left is retried before that deadline.
+func TestWarmErrorRetriesBeforeShortDeadline(t *testing.T) {
+	got := runWarm(t, 4*time.Hour, 900*time.Millisecond,
+		warmStep{grant: time.Second},           // deadline 1s, next at 500ms
+		warmStep{err: racersdk.ErrUnavailable}, // 500ms: next at 750ms
+		warmStep{grant: time.Second},           // 750ms: deadline 1.75s, next at 1.25s
+	)
+	wantCalls(t, got, 0, 500*time.Millisecond, 750*time.Millisecond)
 }

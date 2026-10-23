@@ -88,25 +88,27 @@ func (l *logLimiter) allow(key string) bool {
 	return true
 }
 
-// minWarmRetry is the shortest delay between warm renewals, so that a grant
-// close to expiry or a run of failures never makes the loop spin.
-const minWarmRetry = time.Second
+// minWarmDelay is the shortest delay between warm renewals, so the loop never
+// spins.
+const minWarmDelay = time.Millisecond
 
 // nextWarm returns the delay before the next warm renewal.
 //
-// While retainUntil is in the future, the delay is half the time left, so a
-// renewal happens well before the grant runs out even when Racer granted less
-// than WarmTTL. Without a valid grant, because Racer refused retention, the
-// grant expired, or no renewal has succeeded yet, the delay falls back to
-// WarmTTL/2. Either way the delay is at most WarmTTL/2 and at least
-// min(minWarmRetry, WarmTTL/2), and never below 1 ms.
+// While retainUntil is in the future, the delay is half the time left, capped
+// at WarmTTL/2, so a renewal happens before the grant runs out even when
+// Racer granted much less than WarmTTL. Without a valid grant, because Racer
+// refused retention, the grant expired, or no renewal has succeeded yet, the
+// delay is WarmTTL/2. The delay is never below minWarmDelay. Only when less
+// than 2*minWarmDelay is left can that floor put the renewal at or after the
+// deadline. Halving the time left means at most about log2(left/minWarmDelay)
+// retries before a grant expires, even if every retry fails.
 func nextWarm(now, retainUntil time.Time, ttl time.Duration) time.Duration {
 	d := ttl / 2
 	if left := retainUntil.Sub(now); !retainUntil.IsZero() && left > 0 {
 		d = min(d, left/2)
 	}
 
-	return max(d, min(minWarmRetry, ttl/2), time.Millisecond)
+	return max(d, minWarmDelay)
 }
 
 // refreshWarm renews Racer retention until Close. retainUntil is the
