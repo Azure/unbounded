@@ -958,7 +958,9 @@ impl WorkerDirectory {
         let Ok(owner) = self.page_owner(&report.page) else {
             return;
         };
-        if self.is_local(owner) {
+        // A landed page has no host copy or disk mapping for its owner to act
+        // on, so its verdict is settled here and never takes a retained slot.
+        if self.is_local(owner) || !report.has_owner_state() {
             if let Ok(local) = self.local() {
                 local.fill.sealed_verdict(report, passed);
             }
@@ -1628,6 +1630,14 @@ mod tests {
     }
     fn failed_report(page: PageId) -> super::super::sealed::SealedReport {
         super::super::sealed::SealedReport {
+            page: page.clone(),
+            copy: None,
+            token: Some(crate::store::ReadToken::for_test(page)),
+        }
+    }
+    /// A landed page's report: nothing for the owner to persist or drop.
+    fn landed_report(page: PageId) -> super::super::sealed::SealedReport {
+        super::super::sealed::SealedReport {
             page,
             copy: None,
             token: None,
@@ -1700,6 +1710,41 @@ mod tests {
             directory.report_sealed(failed_report(page), false, &scope());
         }
         assert_eq!(directory.mailboxes[1].take_failed_verdicts().len(), 1);
+    }
+    #[test]
+    fn failed_landed_verdict_settles_locally() {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(64));
+        let _queue = queue.enter();
+        let workers = vec![WorkerId(0), WorkerId(1)];
+        let directory = Arc::new(
+            WorkerDirectory::new(
+                Arc::new(WorkerMap::new(workers.clone()).unwrap()),
+                workers,
+                4,
+            )
+            .unwrap(),
+        );
+        directory.mailboxes[1].install().unwrap();
+        let page = page_owned_by(&directory, WorkerId(1));
+        let (local, _fixture) = crate::read::tests::admission_coordinator();
+        let before = local
+            .fill
+            .metrics
+            .count(crate::telemetry::Event::CorruptMiss);
+        {
+            let _local = directory.simulation_scope(Some((WorkerId(0), local.clone())));
+            directory.report_sealed(landed_report(page), false, &scope());
+        }
+        assert_eq!(
+            local
+                .fill
+                .metrics
+                .count(crate::telemetry::Event::CorruptMiss)
+                - before,
+            1
+        );
+        assert_eq!(directory.mailboxes[1].outstanding(), 0);
+        assert!(directory.mailboxes[1].take_failed_verdicts().is_empty());
     }
     #[test]
     fn failed_sealed_verdicts_are_bounded() {

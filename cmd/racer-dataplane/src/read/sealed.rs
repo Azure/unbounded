@@ -103,6 +103,14 @@ pub struct SealedReport {
     pub(crate) token: Option<ReadToken>,
 }
 
+impl SealedReport {
+    /// Whether the owner holds anything to persist or invalidate for this
+    /// page. Landed pages are used once and leave nothing behind.
+    pub(crate) fn has_owner_state(&self) -> bool {
+        self.copy.is_some() || self.token.is_some()
+    }
+}
+
 impl SealedPage {
     /// Owner-side facts about where the bytes came from. Cheap: it shares
     /// the ciphertext and copies no secrets.

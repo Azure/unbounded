@@ -101,6 +101,20 @@ pub struct ReadToken {
     page: PageId,
     location: RecordLocation,
 }
+#[cfg(test)]
+impl ReadToken {
+    /// A token for a mapping that need not exist, for tests that only route it.
+    pub(crate) fn for_test(page: PageId) -> Self {
+        Self {
+            page,
+            location: RecordLocation {
+                segment: page_alloc::SegmentId(0),
+                generation: page_alloc::Generation(1),
+                extent: page_alloc::Extent::new(0, 512).unwrap(),
+            },
+        }
+    }
+}
 impl StoreReader {
     pub fn metadata(
         &self,
