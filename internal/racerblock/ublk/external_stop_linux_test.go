@@ -44,26 +44,52 @@ func waitStopped(t *testing.T, d *Device) {
 	}
 }
 
+// directDelete issues a bare DEL_DEV for id on a separate control channel,
+// without the STOP_DEV that Delete sends first, so the device's own teardown
+// cannot remove the ID before the DEL_DEV arrives. The goroutine owns the
+// channel and closes it only after DEL_DEV returns, so a failing test never
+// closes a ring still in use. The result is sent on the returned channel.
+func directDelete(t *testing.T, id int) <-chan error {
+	t.Helper()
+
+	c, err := openCtrl()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res := make(chan error, 1)
+
+	go func() {
+		err := c.delDev(id)
+		if cerr := c.close(); err == nil {
+			err = cerr
+		}
+
+		res <- err
+	}()
+
+	return res
+}
+
 func TestIntegrationExternalDelete(t *testing.T) {
 	requireUblk(t)
 
 	d := startTestDevice(t, context.Background(), newPatternHandler(1<<20), Config{ID: -1, Size: 1 << 20, Queues: 2})
 
-	// DEL_DEV waits for this process to release the char device, so it
-	// only returns once the device has noticed and torn itself down.
-	delErr := make(chan error, 1)
-
-	go func() { delErr <- Delete(d.ID()) }()
+	// DEL_DEV on a separate control channel waits for the device to release
+	// the char device, so it only returns once the device has noticed and
+	// torn itself down.
+	delErr := directDelete(t, d.ID())
 
 	waitStopped(t, d)
 
 	select {
 	case err := <-delErr:
 		if err != nil {
-			t.Fatalf("Delete: %v", err)
+			t.Fatalf("DEL_DEV: %v", err)
 		}
 	case <-time.After(30 * time.Second):
-		t.Fatal("external Delete did not return")
+		t.Fatal("external DEL_DEV did not return")
 	}
 }
 
