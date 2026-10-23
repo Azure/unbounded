@@ -235,9 +235,20 @@ func (q *queue) run(ready chan<- error) {
 
 	err := q.serve(ready)
 
+	if testHooks.afterServe != nil {
+		testHooks.afterServe(q, err)
+	}
+
+	// serve returns nil when this process stops the queue, so any error
+	// is a real failure and is reported even if teardown started after
+	// serve returned. Only the decision to hold the ring depends on
+	// whether the stop is local.
+	if err != nil {
+		q.dev.fail(fmt.Errorf("ublk: queue %d: %w", q.id, err))
+	}
+
 	if err != nil && !q.localStop() {
 		q.failed.Store(true)
-		q.dev.fail(fmt.Errorf("ublk: queue %d: %w", q.id, err))
 
 		reason := q.holdUntilSafe(err)
 		if testHooks.failedRingClose != nil {

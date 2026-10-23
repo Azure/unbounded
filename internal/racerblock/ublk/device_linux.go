@@ -195,6 +195,9 @@ var testHooks struct {
 	// eioBeforeDrain runs in a held queue's EIO loop just before it
 	// drains the eventfd.
 	eioBeforeDrain func(q *queue)
+	// afterServe runs in the queue thread after serve returns err and
+	// before run decides whether the stop was local.
+	afterServe func(q *queue, err error)
 }
 
 // launchQueues starts every queue thread and waits until each one has
