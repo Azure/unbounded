@@ -117,6 +117,34 @@ The simulator reports peak RSS and the size of each component so this table can 
 - Each processed event feeds a running trace hash. Two runs with the same inputs must give the same
   hash. A test checks this for the smoke scenario.
 
+3. A requester that adopted a newer membership than its destination fails the read. The
+   destination cannot resolve the newer version and answers `StaleMembership`; the requester then
+   refreshes, but its latest version is not newer than the one it used, so `refresh_candidates`
+   returns `IncompatibleMembership` (`cmd/racer-dataplane/src/read/candidates.rs:1203-1204`,
+   `racer_core::read::walk::refresh_allowed` at `core/src/read/walk.rs:430-437`). That error is not
+   `recoverable` (`core/src/read/policy.rs:9-22`), so the walk does not try the next owner. In the
+   `churn` scenario (seed 1, 1 s, `request_rate` 2, 256 objects) this fails 812 of about 13k page
+   reads at 5,000 nodes and 6,939 of about 60k at 50,000 nodes, while nodes adopt each publication
+   within 100 ms. No invariant is relaxed; this is reported as a behavior to review.
+
+4. A cold page can reach the origin once per owner, up to 3 times, with no concurrency at all. The
+   rank 0 owner never asks later owners (`CandidateWalk::new` sets the walk length to the rank,
+   `core/src/read/walk.rs:146`), and readers probe owners in spread order (`visit_order`), so a
+   later owner may fetch first (after rank 0 answers a copy-only miss) and rank 0 fetches again
+   when a reader asks it. In `node::tests::single_reader_then_storm_reuses_copies` (64 nodes,
+   seed 7) one reader and then 64 readers cause 33 origin requests for 16 pages. The simulator
+   bounds origin requests per page by `REPLICAS` in tests, not 1.
+
+5. Under heavy overload a page read fails with `HopBudgetExhausted`, which is not `recoverable`.
+   Each probe charges its route links up front (`plan_attempt`, `core/src/read/walk.rs:478`), and
+   after a failed route each probe charges 8. With the page budget of 16 links (`PAGE_LINKS`,
+   `core/src/read/range.rs:24`) two `Overloaded` relays use it up; the next `plan_attempt` returns
+   `HopBudgetExhausted` (`walk.rs:481`), `transport_outcome` does not map it (`walk.rs:420`), so the
+   walk is abandoned with that error instead of ending as `Exhausted` (`Unavailable`). Production
+   does the same (`src/read/candidates.rs:1037-1045`). In the `storm` scenario at 50,000 nodes
+   (seed 1, 1 s, `request_rate` 2) 99,562 page reads fail this way while relays reject 1.25M
+   transfers on the `Relay` quota (16 per worker).
+
 ## Invariants
 
 Checked during every run:
@@ -415,3 +443,83 @@ the first second of the storm, from every Pod's lottery read. No run saw a 503 a
 new sequence within one follow interval of each other, so clients that move between seats are not ahead.
 The control-plane share of the 32 GiB budget is about 1 GiB peak RSS (about 20 KiB per Pod); the accounted
 model state is 135 MB, mostly the model's inventory and image.
+
+## Node integration
+
+`racer-sim` now runs the real read path for every scenario except `standin` (the old stand-in world,
+kept for substrate comparisons). Code: `cmd/racer-dataplane/sim/src/node/`.
+
+Per node, with 2 workers:
+
+- Per worker: `Placement<Phantom>` (shared ranking memo), `PageFlights` with a seeded hasher,
+  `TickLru<u64, u32>` memory index, and its own `flow_control::Quotas`. `WorkerMap::select` picks
+  the worker for a page.
+- Per node: `Paths<SharedRoutes>` (shared route memo), `flow_control::Circuits<u32>` (the state
+  behind `LinkHealth`), a real `Segments` table with `SegmentClock` and `PhantomEntries<u64>`, and
+  `SecondSight` plus `Heat` for retention.
+- Shared: one `topology::Membership` per published version (`Rc`), the phantom and route memos, and
+  per-class rejection counters.
+
+Read flow (`node/world.rs`): local memory, then disk, then `PageFlights::join`. Waiters sleep on a
+token. The leader runs `FillPlan`: rank with `rank_async` (one CPU ranking chunk per poll), then
+`CandidateWalk`. Each probe is sized by `plan_attempt` and sent hop by hop. Every holder runs
+`decide_hop`; relays take a `Relay` quota, search their own route with the budget from
+`search_budget` and `relay`, and forward. Failed links feed the circuits and the path `blocked`
+list. The destination applies `serve_action`: copy-only checks local tiers, acquire gets
+`inherited_budget` and runs the same flight and fill. Replies go back on the reverse route; pages
+are cut-through transfers. Responses are checked with `classify`. Before the origin, the leader
+re-ranks and checks `validate_origin_authority`. 412 goes to `RemainingWalk`; 403 and 5xx fail the
+fill. Publication inserts into memory and applies `persist`; disk writes reclaim with
+`reclaim_scored` and the catalog's segment value. Range reads schedule slots with `direct_fills`.
+
+Membership: churn is batched every `membership_batch_ns` (250 ms) into a new version built with
+`new_with_predecessor`. Each node adopts it after a fixed per-node lag (at most 100 ms) and can
+resolve its version plus `retained_versions` (2) older ones. On adoption each worker runs
+`Placement::maintain`. Dropped versions are removed from both memos with `forget`, which needed
+`Membership::topology_identity` to be public.
+
+Invariants checked: `budget_never_grows` (attempt plans, relays, inherited budgets),
+`route_within_hop_limit`, `only_owner_hits_origin` (rank, owner, and authority on the walk's
+version), `membership_version_monotonic` (per node), `relay_route_valid`, and
+`flight_leader_valid`. None is relaxed. Three behaviors are listed in Known issues (3, 4, and 5).
+
+Choices and differences from production:
+
+- Sim capacities: placement 256 entries per worker (production about 16,384), route cache 128
+  entries and 256 KiB per node (production 128 entries, 8 MiB). Decisions are the same code at any
+  capacity; these keep per-node memory small. Flight, waiter, relay, and fill quota limits use
+  production defaults. All are set under `"node"` in `--config`.
+- `AdmissionPolicy` depends on dataplane config and telemetry, so the simulator has its own
+  `flow_control::Policy` with the same limits, floors, and wipe rules for the classes it uses
+  (`Plaintext`, `Ciphertext`, `DirtyCiphertext`, `Flight`, `Waiter`, `Relay`). The cache id is
+  interned to `u32`.
+- Hedges: `hedge_eligible` is evaluated and counted, but no hedge is raced.
+- Retention observes a page when it is published, not at client read time.
+- Link backoff has the production shape, with jitter from a fixed mix instead of SHA-256.
+- Searches and rankings finish inside one event; CPU time is charged per poll.
+- Reads at nodes outside the current membership are skipped. Clients retry `recoverable` errors
+  up to 4 times.
+- `page-alloc` is built with its `simulation` feature (for `Segments::configure`). The
+  dataplane image builds `--bin racer-dataplane`, which does not unify features with `racer-sim`.
+
+Scale (release, `--duration 1s`, `--config '{"objects": 256, "request_rate": 2.0}'`, seed 1,
+one thread). Peak RSS is `VmHWM`. Accounted bytes are the sum of `approximate_bytes` estimates.
+
+| Scenario | Nodes | Wall | Events | Peak RSS | RSS per node | Accounted per node |
+| --- | --- | --- | --- | --- | --- | --- |
+| zipf | 5,000 | 7.3 s | 93k | 145 MiB | 30 KiB | 15 KiB |
+| zipf | 50,000 | 97.5 s | 620k | 1.23 GiB | 26 KiB | 14 KiB |
+| storm | 5,000 | 23.3 s | 434k | 560 MiB | 115 KiB | 50 KiB |
+| churn | 5,000 | 8.9 s | 84k | 151 MiB | 31 KiB | 15 KiB |
+| churn | 50,000 | 183 s | 612k | 1.30 GiB | 27 KiB | 14 KiB |
+| storm | 50,000 | 667 s | 6.0M | 5.27 GiB | 111 KiB | 64 KiB |
+
+All runs end with zero hard invariant failures. At 50,000 nodes the host time goes to real
+topology work: in zipf, 39 s placement ranking (each new slot scores all members) and 54 s route
+search (each new (from, to, budget, visited) key runs `EqualCostSearch`); in churn, 124 s ranking
+because batches of more than `MAX_INCREMENTAL_CHANGES` (64) changes force full rescoring. The
+report's `profile_wall_ms` shows this split. Memory is far below the 32 GiB target; the default
+request rate (20 per node per second) and 4,096 objects make 5,000 nodes take about 60 s per
+simulated second, again mostly in route search. The 50,000 node storm (every node reads the same 16
+pages at once) is the largest: 588 s of route search, and the shared route memo (1.1 GiB) and
+per-node route caches (0.6 GiB) dominate memory.

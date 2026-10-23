@@ -1,4 +1,8 @@
-//! Plug-in points for real Racer logic, and simple stand-ins.
+//! Stand-in node logic for the `standin` scenario.
+//!
+//! The real logic lives in [`crate::node`]; every other scenario runs it.
+//! This module and [`crate::scenario::World`] stay as a cheap baseline for
+//! the substrate. The original plug-in notes follow.
 //!
 //! The simulator world ([`crate::scenario::World`]) asks a [`NodeLogic`]
 //! every decision it needs: which node owns a page, which links reach it,

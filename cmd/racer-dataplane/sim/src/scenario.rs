@@ -1,4 +1,6 @@
-//! The simulated world and the placeholder "caches-only" read flow.
+//! The stand-in world (`standin` scenario) and its fixed read flow.
+//!
+//! Every other scenario runs [`crate::node::NodeWorld`].
 //!
 //! [`World`] owns the engine, the fabric, the origin, membership, a
 //! [`NodeLogic`] and all metrics. The read flow here is a fixed stand-in:
@@ -10,7 +12,7 @@
 //! 4. The owner serves from its tiers or joins/starts a per-page flight to
 //!    the origin (singleflight), then streams the page back cut-through.
 //!
-//! Real decision logic replaces steps 3 and 4 (see [`crate::logic`]).
+//! [`crate::node`] runs the real decision logic for steps 3 and 4.
 
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
