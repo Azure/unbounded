@@ -143,7 +143,12 @@ still block if neither ring can finish requests already handed to the server.
   `ErrForbidden`, `ErrInvalidRequest`, and `ErrRangeNotSatisfiable` are not
   retried. A failed read returns `EIO` to the kernel.
 - Warm (optional): with `--warm-ttl`, racer-block asks Racer to retain the
-  pinned version and refreshes the request at about half the TTL.
+  pinned version and renews the request until close. Racer may grant less
+  than the TTL asked for. Each renewal happens at half the time left on the
+  latest deadline Racer granted, and at most every half TTL. If Racer refuses
+  or a renewal fails, racer-block keeps the earlier deadline while it is still
+  valid and retries at most once a second. Once no deadline is valid, it
+  retries every half TTL.
 
 ## Connections
 
