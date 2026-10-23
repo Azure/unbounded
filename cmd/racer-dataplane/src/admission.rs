@@ -331,9 +331,12 @@ impl Policy for AdmissionPolicy {
         }
     }
     /// Plaintext and ciphertext are request working memory as well as cache
-    /// memory. Keep the per-request allowance that configuration validation
-    /// requires of each whole budget (`config.rs`), so a low retention
-    /// priority cannot make a range window's read-ahead fail admission.
+    /// memory. Each cache keeps an allowance sized for one range window, the
+    /// same amount configuration validation requires of each whole budget
+    /// (`config.rs`). All concurrent requests on the cache share it, and the
+    /// equal-share cap can make it smaller, so a low-priority cache can still
+    /// see `Overloaded`. It limits how far low priority shrinks the share; it
+    /// does not guarantee progress.
     fn progress(&self, class: ResourceClass) -> usize {
         let window = self.limits.range_window_pages.get();
         let record = PAGE_BYTES as usize + 16 + crate::store::MAX_HEADER_BYTES;

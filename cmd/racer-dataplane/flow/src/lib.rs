@@ -129,10 +129,12 @@ pub trait Policy: 'static {
         1
     }
 
-    /// Return the request-progress allowance of a weighted class. Weights
-    /// never reduce a key's share below this allowance or the unweighted
-    /// equal split, whichever is smaller, so retention priority cannot starve
-    /// request working memory. Unweighted classes ignore it.
+    /// Return the per-key working-memory allowance of a weighted class.
+    /// Weights never reduce a key's share below this allowance or the
+    /// unweighted equal split, whichever is smaller. All concurrent work on
+    /// the key shares the allowance, so it limits how far a low weight can
+    /// shrink the share but does not guarantee that any request makes
+    /// progress. Unweighted classes ignore it.
     fn progress(&self, _class: Self::Class) -> usize {
         0
     }
@@ -967,8 +969,8 @@ impl<P: Policy> Quotas<P> {
     ) -> usize {
         let limit = self.limit(class);
         let fair = if P::weighted(class) {
-            // Weights divide retention, not request progress: a key keeps up to
-            // its progress allowance, bounded by the unweighted equal split.
+            // Low weight cannot cut a key below its shared progress allowance,
+            // capped at the unweighted equal split.
             let equal = limit / active.max(1);
             share(limit, active, weight, total, include).max(self.policy.progress(class).min(equal))
         } else {
