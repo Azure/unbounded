@@ -533,10 +533,13 @@ disk admission and neutral eviction scores; resource budgets, integrity checks,
 and authorization still apply. Configuration values are validated even when the
 policy is disabled.
 
-[ClusterCache priority](#priority) runs before the score. Victims are ranked
-first by whether their cache is over share, then by score, then by age. An
-over-share page is evicted before any under-share page, and never replaces an
-under-share page in a full pending write queue. Segment reclamation favors
+[ClusterCache priority](#priority) runs before the score. Each eviction ranks a
+bounded set of candidate pages, first by whether their cache is over share,
+then by score, then by age. Candidates come first from the most over-share
+caches, so an over-share page is normally evicted before any under-share page.
+An under-share page can still go first when the over-share candidates are held.
+An over-share page never replaces an under-share page in a full pending write
+queue. Segment reclamation favors
 segments that hold mostly over-share data; under-share pages in a recycled
 segment are still lost. A non-owned page is not admitted when its cache is over
 share and the worker has no free segments beyond the reserve. Owned pages are

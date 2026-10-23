@@ -87,12 +87,22 @@ Rules:
 
 ### Disk eviction
 
-Page-index eviction ranks victims by the tuple `(under_share, score, age)`.
-Over-share pages are taken before any under-share page, then lower score, then
-older. Each eviction first scans over-share caches through a per-cache age
-order, splitting a 64-page budget across them, so older under-share pages
-cannot hide them. Only if that finds no unheld page does it scan 64 pages of
-the global order.
+Page-index eviction ranks a bounded set of candidates by the tuple
+`(under_share, score, age)`. It does not search for the best page overall.
+
+Retention keeps resident caches ordered by resident bytes per unit of weight.
+Over-share caches are always a prefix of this order, so each eviction takes the
+over-share caches among the top 64, without classifying every cache. The order
+changes in O(log C) when a cache's resident bytes change and is rebuilt only
+after a priority catalog change.
+
+Each eviction splits a 64-page budget across those caches and scans each
+through its own age order with its own cursor, so older under-share pages
+cannot hide them. If no unheld page is found, it ranks the next 64 pages of the
+global age order. An under-share page can then be evicted even though an
+unheld over-share page exists outside the candidates, for example when the
+scanned pages of every candidate cache are held, or when more than 64 caches
+are over share.
 
 Segment reclamation works on whole segments, and a segment holds pages from many
 caches. Segment value weights under-share pages heavily, so segments that hold

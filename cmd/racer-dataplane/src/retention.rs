@@ -71,10 +71,15 @@ impl Drop for Payload {
         if let Some(cache) = &self.cache {
             let mut caches = self.retention.cache_bytes.borrow_mut();
             let used = caches.get_mut(cache).expect("charged cache payload");
+            let old = *used;
             *used -= self.bytes;
-            if *used == 0 {
+            let new = *used;
+            if new == 0 {
                 caches.remove(cache);
-                drop(caches);
+            }
+            drop(caches);
+            self.retention.pressure_changed(cache, old, new);
+            if new == 0 {
                 self.retention.member_changed(cache, false);
             }
         }
@@ -126,13 +131,21 @@ impl Scoring<'_> {
             .share_in(basis, self.capacity, cache);
         over_share(resident, share, self.capacity)
     }
-    /// Whether any cache with resident payload is over share. Scans only the
-    /// resident caches, once per pass.
+    /// Over-share caches among the `limit` resident caches with the highest
+    /// pressure, highest first. Over-share caches form a prefix of the
+    /// pressure order, so this misses one only when more than `limit` caches
+    /// are over share. Costs O(limit) between catalog changes.
+    pub(crate) fn over_share_candidates(&self, limit: usize) -> Vec<CacheId> {
+        let mut caches = self.retention.pressure_order(limit);
+        caches.retain(|cache| self.over_share(cache));
+        caches
+    }
+    /// Whether any cache with resident payload is over share. Checks only the
+    /// top of the pressure order, once per pass.
     pub(crate) fn any_over_share(&self) -> bool {
-        *self.any_over_share.get_or_init(|| {
-            let used = self.retention.cache_bytes.borrow();
-            used.keys().any(|cache| self.over_share(cache))
-        })
+        *self
+            .any_over_share
+            .get_or_init(|| !self.over_share_candidates(2).is_empty())
     }
     /// Combined victim rank: under-share pages outrank every over-share page;
     /// the retention score orders pages within one class. Higher is kept longer.
@@ -197,6 +210,53 @@ pub struct Retention {
 
     /// Full recounts of `unpublished`, for complexity regression tests.
     basis_scans: Cell<u64>,
+
+    /// Resident caches ordered by pressure. See `Pressure`.
+    pressure: RefCell<Option<PressureOrder>>,
+
+    /// Full rebuilds of `pressure`, for complexity regression tests.
+    pressure_rebuilds: Cell<u64>,
+
+    /// Directory entries returned to callers, for complexity regression tests.
+    pressure_visits: Cell<u64>,
+}
+/// One resident cache, keyed by resident bytes per unit of weight.
+///
+/// With weight total `W > 0`, a cache is over share when
+/// `resident * W > capacity * weight`, that is when `resident / weight`
+/// exceeds `capacity / W`. That threshold is the same for every cache, so the
+/// over-share caches are a prefix of this order, whatever the capacity or the
+/// set of unpublished members. Zero weight ranks above any finite ratio. When
+/// every weight is 0, shares are equal and resident bytes break the tie.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Pressure {
+    resident: u64,
+    weight: u64,
+    cache: CacheId,
+}
+impl Ord for Pressure {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let ratio = match (self.weight, other.weight) {
+            (0, 0) => std::cmp::Ordering::Equal,
+            (0, _) => std::cmp::Ordering::Greater,
+            (_, 0) => std::cmp::Ordering::Less,
+            (a, b) => (u128::from(self.resident) * u128::from(b))
+                .cmp(&(u128::from(other.resident) * u128::from(a))),
+        };
+        ratio
+            .then(self.resident.cmp(&other.resident))
+            .then_with(|| other.cache.cmp(&self.cache))
+    }
+}
+impl PartialOrd for Pressure {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+/// Pressure order valid for one weights generation.
+struct PressureOrder {
+    generation: u64,
+    order: std::collections::BTreeSet<Pressure>,
 }
 struct State {
     history: SecondSight,
@@ -229,6 +289,9 @@ impl Retention {
             weights: RefCell::default(),
             unpublished: Cell::new(None),
             basis_scans: Cell::new(0),
+            pressure: RefCell::new(None),
+            pressure_rebuilds: Cell::new(0),
+            pressure_visits: Cell::new(0),
         })
     }
     pub fn set_ownership(&self, classify: Ownership) {
@@ -242,6 +305,7 @@ impl Retention {
     pub fn set_weights(&self, weights: Weights) {
         *self.weights.borrow_mut() = weights;
         self.unpublished.set(None);
+        *self.pressure.borrow_mut() = None;
     }
     pub fn weights(&self) -> Weights {
         self.weights.borrow().clone()
@@ -300,6 +364,80 @@ impl Retention {
             }
         }
         self.unpublished.set(Some(counted));
+    }
+    /// Move `cache` in the pressure order after its resident bytes changed,
+    /// in O(log C). A stale order is dropped and rebuilt lazily.
+    fn pressure_changed(&self, cache: &CacheId, old: u64, new: u64) {
+        let mut pressure = self.pressure.borrow_mut();
+        let Some(order) = pressure.as_mut() else {
+            return;
+        };
+        let Some(weight) = self.weights.borrow().weight_at(cache, order.generation) else {
+            *pressure = None;
+            return;
+        };
+        if old != 0 {
+            order.order.remove(&Pressure {
+                resident: old,
+                weight,
+                cache: cache.clone(),
+            });
+        }
+        if new != 0 {
+            order.order.insert(Pressure {
+                resident: new,
+                weight,
+                cache: cache.clone(),
+            });
+        }
+    }
+    /// Up to `limit` resident caches with the highest pressure, highest first.
+    /// O(limit) plus O(C log C) only after the weights table changed.
+    fn pressure_order(&self, limit: usize) -> Vec<CacheId> {
+        let weights = self.weights.borrow();
+        let mut pressure = self.pressure.borrow_mut();
+        loop {
+            let generation = weights.generation();
+            if pressure
+                .as_ref()
+                .is_some_and(|o| o.generation == generation)
+            {
+                break;
+            }
+            self.pressure_rebuilds.set(self.pressure_rebuilds.get() + 1);
+            let mut order = std::collections::BTreeSet::new();
+            let mut stale = false;
+            for (cache, resident) in self.cache_bytes.borrow().iter() {
+                let Some(weight) = weights.weight_at(cache, generation) else {
+                    stale = true;
+                    break;
+                };
+                order.insert(Pressure {
+                    resident: *resident,
+                    weight,
+                    cache: cache.clone(),
+                });
+            }
+            // A concurrent catalog update during the rebuild rebuilds again.
+            if !stale {
+                *pressure = Some(PressureOrder { generation, order });
+            }
+        }
+        let order = &pressure.as_ref().expect("fresh pressure order").order;
+        let top: Vec<CacheId> = order
+            .iter()
+            .rev()
+            .take(limit)
+            .map(|p| p.cache.clone())
+            .collect();
+        self.pressure_visits
+            .set(self.pressure_visits.get() + top.len() as u64);
+        top
+    }
+    /// Pressure order rebuilds and returned entries, for complexity tests.
+    #[cfg(test)]
+    pub(crate) fn pressure_counters(&self) -> (u64, u64) {
+        (self.pressure_rebuilds.get(), self.pressure_visits.get())
     }
     /// Indexed payload bytes currently charged to one cache.
     pub fn cache_payload_bytes(&self, cache: &CacheId) -> u64 {
@@ -449,12 +587,15 @@ impl Retention {
     /// Charge one index mapping's payload to the aggregate and its cache.
     pub(crate) fn indexed_payload(self: &Rc<Self>, cache: &CacheId, bytes: u64) -> Payload {
         let mut payload = self.payload(bytes, true);
-        let joined = {
+        let (old, new) = {
             let mut caches = self.cache_bytes.borrow_mut();
-            let joined = !caches.contains_key(cache);
-            *caches.entry(cache.clone()).or_default() += bytes;
-            joined
+            let used = caches.entry(cache.clone()).or_default();
+            let old = *used;
+            *used += bytes;
+            (old, *used)
         };
+        self.pressure_changed(cache, old, new);
+        let joined = old == 0;
         if joined {
             self.member_changed(cache, true);
         }
@@ -657,6 +798,108 @@ mod tests {
         check(&policy);
         policy.set_weights(other);
         check(&policy);
+    }
+    #[test]
+    fn over_share_candidates_are_bounded_and_exact_with_many_caches() {
+        use racer_control_wire::CacheDefinition;
+        let clock = uring_runtime::environment::SimulationClock::new(59);
+        let _environment = clock.environment(0).enter();
+        let policy = Rc::new(Retention::new(4096, 1).unwrap());
+        let id = |n: usize| CacheId(format!("c{n:04}"));
+        let def = |n: usize, priority: u16| CacheDefinition {
+            id: id(n),
+            name: format!("c{n}"),
+            client_socket: "/client".into(),
+            origin_socket: "/origin".into(),
+            priority,
+        };
+        const CACHES: usize = 2000;
+        const LIMIT: usize = 64;
+        let capacity = 1_000_000;
+        // Reference: classify every resident cache, then compare.
+        let check = |policy: &Retention, label: &str| {
+            let scoring = policy.scoring_at(uring_runtime::environment::now(), capacity);
+            let visits = policy.pressure_visits.get();
+            let got = scoring.over_share_candidates(LIMIT);
+            assert!(
+                policy.pressure_visits.get() - visits <= LIMIT as u64,
+                "{label}"
+            );
+            let over: Vec<CacheId> = policy
+                .cache_bytes
+                .borrow()
+                .keys()
+                .filter(|c| policy.over_share(c, capacity))
+                .cloned()
+                .collect();
+            for cache in &got {
+                assert!(over.contains(cache), "{label}: {cache:?} not over share");
+            }
+            if over.len() <= LIMIT {
+                assert_eq!(got.len(), over.len(), "{label}");
+            } else {
+                assert_eq!(got.len(), LIMIT, "{label}");
+            }
+            assert_eq!(scoring.any_over_share(), !over.is_empty(), "{label}");
+        };
+        // Varied weights, including zero, and varied residency.
+        let table: Vec<_> = (0..CACHES).map(|n| def(n, (n % 7) as u16 * 100)).collect();
+        policy.weights().update(&table);
+        let mut held: Vec<Vec<Payload>> = (0..CACHES)
+            .map(|n| vec![policy.indexed_payload(&id(n), 100 + (n as u64 * 37) % 900)])
+            .collect();
+        check(&policy, "initial");
+        assert_eq!(policy.pressure_rebuilds.get(), 1);
+        // Repeated decisions and resident-byte changes never rebuild.
+        for round in 0..200 {
+            let n = (round * 131) % CACHES;
+            if round % 3 == 0 {
+                held[n].clear();
+            } else {
+                held[n].push(policy.indexed_payload(&id(n), 50 + round as u64));
+            }
+            let scoring = policy.scoring_at(uring_runtime::environment::now(), capacity);
+            let visits = policy.pressure_visits.get();
+            scoring.over_share_candidates(LIMIT);
+            assert!(policy.pressure_visits.get() - visits <= LIMIT as u64);
+        }
+        check(&policy, "after churn");
+        // First and last caches leave and come back.
+        held[0].clear();
+        held[CACHES - 1].clear();
+        check(&policy, "first and last removed");
+        held[0].push(policy.indexed_payload(&id(0), 5000));
+        held[CACHES - 1].push(policy.indexed_payload(&id(CACHES - 1), 5000));
+        check(&policy, "first and last re-added");
+        // An unknown resident cache joins with the default priority.
+        let unknown = policy.indexed_payload(&CacheId("zz-unknown".into()), 90_000);
+        check(&policy, "unknown resident");
+        assert_eq!(policy.pressure_rebuilds.get(), 1);
+        // A priority update rebuilds exactly once.
+        let table: Vec<_> = (0..CACHES).map(|n| def(n, (n % 5) as u16 * 50)).collect();
+        policy.weights().update(&table);
+        check(&policy, "reweighted");
+        check(&policy, "reweighted again");
+        assert_eq!(policy.pressure_rebuilds.get(), 2);
+        // All-zero weights with an unknown member, then without it.
+        let table: Vec<_> = (0..CACHES).map(|n| def(n, 0)).collect();
+        policy.weights().update(&table);
+        check(&policy, "zero weights with unknown");
+        drop(unknown);
+        check(&policy, "zero weights");
+        assert_eq!(policy.pressure_rebuilds.get(), 3);
+        // No published catalog: nothing is over share.
+        policy.weights().update(&[]);
+        check(&policy, "unpublished");
+        let scoring = policy.scoring_at(uring_runtime::environment::now(), capacity);
+        assert!(scoring.over_share_candidates(LIMIT).is_empty());
+        // Replacing the table object also rebuilds.
+        policy.set_weights(crate::priority::Weights::default());
+        check(&policy, "replaced");
+        assert_eq!(policy.pressure_rebuilds.get(), 5);
+        // Everything leaves.
+        held.clear();
+        check(&policy, "empty");
     }
     #[test]
     fn scoring_pass_pins_ownership_and_time_and_replacement_clears_factory() {

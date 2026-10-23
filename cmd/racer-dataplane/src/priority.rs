@@ -45,6 +45,24 @@ impl Weights {
         table.weights.keys().cloned().collect()
     }
 
+    /// Table generation, bumped by every effective `update`.
+    pub fn generation(&self) -> u64 {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).generation
+    }
+
+    /// Weight of one cache, or `None` when the table changed since
+    /// `generation`. Unknown caches use `DEFAULT_PRIORITY`.
+    pub fn weight_at(&self, cache: &CacheId, generation: u64) -> Option<u64> {
+        let table = self.0.read().unwrap_or_else(|e| e.into_inner());
+        (table.generation == generation).then(|| {
+            table
+                .weights
+                .get(cache)
+                .copied()
+                .unwrap_or(u64::from(DEFAULT_PRIORITY))
+        })
+    }
+
     /// Weight of one cache. Unknown caches use `DEFAULT_PRIORITY`.
     pub fn weight(&self, cache: &CacheId) -> u64 {
         let table = self.0.read().unwrap_or_else(|e| e.into_inner());

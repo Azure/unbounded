@@ -846,28 +846,22 @@ impl Index {
     /// monotonic.
     ///
     /// Over-share caches are scanned first through their own per-cache order,
-    /// so a full window of under-share pages cannot hide them. The 64-candidate
-    /// budget is split across over-share caches, at least one each. Only when
+    /// so a full window of under-share pages cannot hide them. Candidates are
+    /// the over-share caches among the 64 with the highest pressure, and the
+    /// 64-page budget is split across them, at least one page each. Only when
     /// that finds no unheld page does the global window rank all caches.
+    /// Work is at most 64 caches and 128 pages, independent of cache count,
+    /// except for one rebuild of the pressure order after a catalog change.
     fn victim(&self, state: &State) -> Option<PageId> {
         const BUDGET: usize = 64;
         let retention = self.retention();
         let scoring = retention.scoring_at(uring_runtime::environment::now(), self.disk_capacity());
         let eligible =
             |page: &PageId, _: &IndexedPage| (!self.is_held(page)).then(|| scoring.rank(page));
-        // One classification per cache with mappings, memoized by the pass.
-        let over: Vec<&CacheId> = state
-            .pages
-            .groups()
-            .filter(|cache| scoring.over_share(cache))
-            .collect();
+        let over = scoring.over_share_candidates(BUDGET);
         if !over.is_empty() {
             let per_cache = (BUDGET / over.len()).max(1);
-            if let Some(victim) =
-                state
-                    .pages
-                    .victim_in_groups(over.iter().copied(), per_cache, eligible)
-            {
+            if let Some(victim) = state.pages.victim_in_groups(&over, per_cache, eligible) {
                 return Some(victim);
             }
         }
@@ -3010,6 +3004,95 @@ mod priority_tests {
         // Nothing is over share any more: the global window decides.
         let victim = index.victim(&index.state.borrow()).unwrap();
         assert!(a.contains(&victim));
+    }
+
+    #[test]
+    fn index_victim_work_is_bounded_with_many_resident_caches() {
+        const PHANTOMS: usize = 3000;
+        let index = Rc::new(Index::new(
+            WorkerId(0),
+            64,
+            crate::test_support::availability_for(vec![cache("a"), cache("z")]),
+        ));
+        index.set_page_capacity(84).unwrap();
+        let segments = segments(50);
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        drop(segments.append(4 * PAGE as usize).unwrap());
+        // Many resident caches without index pages, each with weight 1, so
+        // "a" stays under share. Every tenth one is over share.
+        let mut definitions = vec![definition("a", 60000), definition("z", 0)];
+        let phantom = |n: usize| CacheId(format!("phantom-{n}"));
+        definitions.extend((0..PHANTOMS).map(|n| CacheDefinition {
+            id: phantom(n),
+            ..definition("a", 1)
+        }));
+        let table = crate::priority::Weights::default();
+        table.update(&definitions);
+        let retention = index.retention();
+        retention.set_weights(table.clone());
+        let phantoms: Vec<_> = (0..PHANTOMS)
+            .map(|n| {
+                let bytes = if n % 10 == 0 { PAGE } else { 1 };
+                retention.indexed_payload(&phantom(n), bytes)
+            })
+            .collect();
+        let calls = Rc::new(Cell::new(0u64));
+        let counted = calls.clone();
+        retention.set_ownership(Rc::new(move |_| {
+            counted.set(counted.get() + 1);
+            false
+        }));
+        for n in 0..64 {
+            publish(&index, "a", &n.to_string(), 0);
+        }
+        let z: Vec<_> = (0..20)
+            .map(|n| publish(&index, "z", &n.to_string(), 0))
+            .collect();
+        let capacity = index.disk_capacity();
+        assert!(!retention.over_share(&cache("a"), capacity));
+        assert!(retention.over_share(&cache("z"), capacity));
+        // Repeated decisions: the 64-page global window holds only "a".
+        let (rebuilds, _) = retention.pressure_counters();
+        for n in 0..10 {
+            let (_, visits) = retention.pressure_counters();
+            calls.set(0);
+            let before = retention.cache_payload_bytes(&cache("z"));
+            drop(index.reserve_page(true).unwrap());
+            assert_eq!(
+                retention.cache_payload_bytes(&cache("z")),
+                before - PAGE,
+                "decision {n}"
+            );
+            // Refill with an under-share page so the next decision evicts.
+            publish(&index, "a", &format!("new{n}"), 0);
+            assert!(calls.get() <= 2 * 128, "decision {n}: {}", calls.get());
+            assert!(retention.pressure_counters().1 - visits <= 2 * 64);
+        }
+        // Only the first decision builds the order.
+        assert_eq!(retention.pressure_counters().0, rebuilds + 1);
+        // Held over-share pages fall back to the global window, still bounded.
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        let live: Vec<_> = z
+            .iter()
+            .filter(|page| index.state.borrow().pages.contains_key(page))
+            .cloned()
+            .collect();
+        assert_eq!(live.len(), 10);
+        for page in &live {
+            index.reserve_hold(&page.version, 1, until).unwrap();
+        }
+        calls.set(0);
+        let victim = index.victim(&index.state.borrow()).unwrap();
+        assert_eq!(victim.version.object.cache, cache("a"));
+        assert!(calls.get() <= 128);
+        // A catalog update rebuilds the order once.
+        definitions[0].priority = 59999;
+        table.update(&definitions);
+        index.victim(&index.state.borrow());
+        index.victim(&index.state.borrow());
+        assert_eq!(retention.pressure_counters().0, rebuilds + 2);
+        drop(phantoms);
+        assert_accounting(&index);
     }
 
     #[test]
