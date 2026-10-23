@@ -31,6 +31,133 @@ func TestResolveContainerEngine(t *testing.T) {
 	}
 }
 
+func TestResolveClusterName(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  string
+		want string
+	}{
+		{name: "default", want: defaultCluster},
+		{name: "blank", env: "  ", want: defaultCluster},
+		{name: "override", env: " gantry-e2e-mine ", want: "gantry-e2e-mine"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("GANTRY_E2E_CLUSTER", tc.env)
+
+			if got := resolveClusterName(); got != tc.want {
+				t.Fatalf("resolveClusterName() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHarnessKubeconfigPathStaysInRepoTmp(t *testing.T) {
+	got, err := harnessKubeconfigPath("/repo", "gantry-e2e-mine")
+	if err != nil {
+		t.Fatalf("harnessKubeconfigPath() error = %v", err)
+	}
+
+	if want := filepath.Join("/repo", "tmp", "gantry-e2e", "gantry-e2e-mine", "kubeconfig"); got != want {
+		t.Fatalf("harnessKubeconfigPath() = %q, want %q", got, want)
+	}
+}
+
+func TestHarnessKubeconfigPathRejectsUnsafeClusterNames(t *testing.T) {
+	for _, name := range []string{
+		"",
+		".",
+		"..",
+		"../../../other",
+		"a/b",
+		`a\b`,
+		`..\sibling`,
+		"/abs/path",
+		"/",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got, err := harnessKubeconfigPath("/repo", name); err == nil {
+				t.Fatalf("harnessKubeconfigPath(%q) = %q, want error", name, got)
+			}
+		})
+	}
+}
+
+func TestHarnessKubeconfigPathAcceptsKindNames(t *testing.T) {
+	for _, name := range []string{"gantry-e2e", "gantry-ci-fix-kcfg", "kind", "a.b", "..x", "x.."} {
+		t.Run(name, func(t *testing.T) {
+			got, err := harnessKubeconfigPath("/repo", name)
+			if err != nil {
+				t.Fatalf("harnessKubeconfigPath(%q) error = %v", name, err)
+			}
+
+			if want := filepath.Join("/repo", "tmp", "gantry-e2e", name, "kubeconfig"); got != want {
+				t.Fatalf("harnessKubeconfigPath(%q) = %q, want %q", name, got, want)
+			}
+		})
+	}
+}
+
+func TestClusterCommandOverridesAmbientKubeconfig(t *testing.T) {
+	environ := []string{"PATH=/bin", "KUBECONFIG=/home/someone/.kube/config", "HOME=/home/someone"}
+
+	for _, tc := range []struct {
+		name     string
+		bin      string
+		args     []string
+		wantArgs []string
+	}{
+		{
+			name: "kubectl pinned to private config and context",
+			bin:  "kubectl",
+			args: []string{"-n", "ns", "port-forward", "pod/p", "1:2"},
+			wantArgs: []string{
+				"--kubeconfig", "/repo/tmp/k", "--context", "kind-mine",
+				"-n", "ns", "port-forward", "pod/p", "1:2",
+			},
+		},
+		{
+			name:     "kubectl by path",
+			bin:      "/usr/local/bin/kubectl",
+			args:     []string{"apply", "-f", "-"},
+			wantArgs: []string{"--kubeconfig", "/repo/tmp/k", "--context", "kind-mine", "apply", "-f", "-"},
+		},
+		{
+			name:     "kind args unchanged",
+			bin:      "kind",
+			args:     []string{"get", "nodes", "--name", "mine"},
+			wantArgs: []string{"get", "nodes", "--name", "mine"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args, env := clusterCommand(tc.bin, tc.args, environ, "/repo/tmp/k", "mine")
+
+			if strings.Join(args, " ") != strings.Join(tc.wantArgs, " ") {
+				t.Fatalf("args = %q, want %q", args, tc.wantArgs)
+			}
+
+			var kubeconfigs []string
+
+			for _, kv := range env {
+				if strings.HasPrefix(kv, "KUBECONFIG=") {
+					kubeconfigs = append(kubeconfigs, kv)
+				}
+			}
+
+			if len(kubeconfigs) != 1 || kubeconfigs[0] != "KUBECONFIG=/repo/tmp/k" {
+				t.Fatalf("KUBECONFIG entries = %q, want only the private kubeconfig", kubeconfigs)
+			}
+
+			if len(env) != len(environ) {
+				t.Fatalf("env = %q, want other variables preserved", env)
+			}
+		})
+	}
+
+	if environ[1] != "KUBECONFIG=/home/someone/.kube/config" {
+		t.Fatalf("clusterCommand mutated caller environ: %q", environ)
+	}
+}
+
 // TestPatchDaemonSetForE2E_TargetsGantryContainerOnly is the
 // regression test for the twelfth-review finding: the harness's
 // previous strings.Replace(..., 1) on the bare "imagePullPolicy:

@@ -34,7 +34,8 @@ func TestMain(m *testing.M) {
 //   - the DaemonSet rolls out to every node,
 //   - each pod's /readyz turns green within the timeout,
 //   - node-local containerd can pull through Gantry's mirror,
-//   - a second node can reuse the warmed content through peer fetch.
+//   - a second node, after its own seeded copy is evicted, reuses the
+//     warmed content through peer fetch.
 //
 // This is still a smoke-sized scenario; deeper auth, eviction, and chaos
 // cases should be added as separate tests.
@@ -68,17 +69,32 @@ func TestSmoke_DaemonSetBecomesReadyAndPullThrough(t *testing.T) {
 	workers := h.workerNodes(ctx)
 
 	advertiseBefore := h.metricSum(ctx, "gantry_advertise_total")
-	peerHitBefore := h.metricSum(ctx, "p2p_peer_fetch_total", `outcome="hit"`)
 
 	h.deletePod(ctx, "gantry-e2e-first")
 	h.applyPullPod(ctx, "gantry-e2e-first", workers[0])
 	h.waitForPodReady(ctx, "gantry-e2e-first")
 	h.waitForMetricIncrease(ctx, "gantry_advertise_total", advertiseBefore)
 
+	// The e2e ConfigMap makes every kind node a chair and keeps eight seeds
+	// per digest, so the first cold pull also seeds workers[1]. Its pull would
+	// then be served from its own store and never touch a peer. Let the seed
+	// pulls on workers[1] finish, then evict its copy so the second pull has
+	// to fetch the content again while the other seeds still hold it. Origin
+	// fallback remains possible, so readiness alone proves nothing; the
+	// peer-hit assertion on workers[1]'s own Gantry pod is what proves reuse.
+	requesterPod := h.gantryPodOnNode(ctx, workers[1])
+	h.waitForInFlightPullsDrained(ctx, requesterPod)
+	t.Logf("after first pull: cluster peer hits=%.0f, %s please_pull started=%.0f",
+		h.metricSum(ctx, "p2p_peer_fetch_total", `outcome="hit"`), requesterPod,
+		h.metricSumOnPod(ctx, requesterPod, "p2p_coord_please_pull_started_total"))
+	h.evictImageFromNode(ctx, workers[1])
+
+	peerHitBefore := h.metricSumOnPod(ctx, requesterPod, "p2p_peer_fetch_total", `outcome="hit"`)
+
 	h.deletePod(ctx, "gantry-e2e-second")
 	h.applyPullPod(ctx, "gantry-e2e-second", workers[1])
 	h.waitForPodReady(ctx, "gantry-e2e-second")
-	h.waitForMetricIncrease(ctx, "p2p_peer_fetch_total", peerHitBefore, `outcome="hit"`)
+	h.waitForMetricIncreaseOnPod(ctx, requesterPod, "p2p_peer_fetch_total", peerHitBefore, `outcome="hit"`)
 }
 
 // TestE2E_ColdStartDesignatedOriginPuller proves the per-digest Lease-chair

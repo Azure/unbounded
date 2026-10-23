@@ -34,7 +34,7 @@ import (
 )
 
 const (
-	clusterName       = "gantry-e2e"
+	defaultCluster    = "gantry-e2e"
 	imageTag          = "docker.io/library/gantry:e2e"
 	kindNodeImage     = "kindest/node:v1.34.0@sha256:7416a61b42b1662ca6ca89f02028ac133a309a2a30ba309614e8ec94d976dc5a"
 	namespace         = "unbounded-system"
@@ -52,6 +52,8 @@ type harness struct {
 	artifacts       string
 	manifests       string
 	containerEngine string
+	clusterName     string
+	kubeconfig      string
 	keepCluster     bool
 }
 
@@ -61,6 +63,15 @@ func newHarness(t *testing.T) *harness {
 	t.Helper()
 
 	root := repoRoot(t)
+
+	// Validate the cluster name before any filesystem write: it becomes a
+	// path component of the private kubeconfig.
+	clusterName := resolveClusterName()
+
+	kubeconfig, err := harnessKubeconfigPath(root, clusterName)
+	if err != nil {
+		t.Fatalf("GANTRY_E2E_CLUSTER: %v", err)
+	}
 
 	artifacts := filepath.Join(root, "e2e", ".artifacts")
 	if err := os.MkdirAll(artifacts, 0o755); err != nil {
@@ -75,6 +86,8 @@ func newHarness(t *testing.T) *harness {
 		artifacts:       artifacts,
 		manifests:       manifests,
 		containerEngine: resolveContainerEngine(t),
+		clusterName:     clusterName,
+		kubeconfig:      kubeconfig,
 		keepCluster:     os.Getenv("E2E_KEEP") == "1",
 	}
 }
@@ -109,6 +122,83 @@ func renderGantryChart(t *testing.T, root string) string {
 	}
 
 	return filepath.Join(outputRoot, "gantry", "templates")
+}
+
+// resolveClusterName returns the kind cluster name for this run.
+// GANTRY_E2E_CLUSTER lets a developer run the suite beside another
+// cluster on a shared host without reusing or deleting it.
+func resolveClusterName() string {
+	if name := strings.TrimSpace(os.Getenv("GANTRY_E2E_CLUSTER")); name != "" {
+		return name
+	}
+
+	return defaultCluster
+}
+
+// harnessKubeconfigPath returns the private kubeconfig the harness uses for
+// clusterName. It lives under the gitignored repo tmp/ directory so the
+// suite never reads or rewrites ~/.kube/config or an ambient KUBECONFIG.
+func harnessKubeconfigPath(root, clusterName string) (string, error) {
+	if err := validateClusterName(clusterName); err != nil {
+		return "", err
+	}
+
+	return filepath.Join(root, "tmp", "gantry-e2e", clusterName, "kubeconfig"), nil
+}
+
+// validateClusterName rejects names that would not stay a single path
+// component under the repo tmp directory. kind validates the name itself
+// later, but only after the harness has written the kubeconfig directory.
+func validateClusterName(name string) error {
+	switch {
+	case name == "":
+		return errors.New("cluster name is empty")
+	case name == "." || name == "..":
+		return fmt.Errorf("cluster name %q is not a valid path component", name)
+	case filepath.IsAbs(name) || strings.ContainsAny(name, `/\`):
+		return fmt.Errorf("cluster name %q must not contain path separators", name)
+	}
+
+	return nil
+}
+
+// kindContext is the kubeconfig context kind writes for clusterName.
+func kindContext(clusterName string) string {
+	return "kind-" + clusterName
+}
+
+// clusterCommand returns the argv and environment for one harness command.
+// Every command gets KUBECONFIG pointed at the harness kubeconfig, replacing
+// any ambient value, and kubectl is additionally pinned to the selected
+// cluster's context so a stale current-context cannot redirect it.
+func clusterCommand(name string, args, environ []string, kubeconfig, clusterName string) ([]string, []string) {
+	env := make([]string, 0, len(environ)+1)
+	for _, kv := range environ {
+		if !strings.HasPrefix(kv, "KUBECONFIG=") {
+			env = append(env, kv)
+		}
+	}
+
+	env = append(env, "KUBECONFIG="+kubeconfig)
+
+	if filepath.Base(name) == "kubectl" {
+		args = append([]string{"--kubeconfig", kubeconfig, "--context", kindContext(clusterName)}, args...)
+	}
+
+	return args, env
+}
+
+// command builds an exec.Cmd bound to this harness's cluster. All harness
+// subprocesses go through it so kind and kubectl see the same private
+// kubeconfig.
+func (h *harness) command(ctx context.Context, name string, args ...string) *exec.Cmd {
+	argv, env := clusterCommand(name, args, os.Environ(), h.kubeconfig, h.clusterName)
+
+	cmd := exec.CommandContext(ctx, name, argv...)
+	cmd.Dir = h.repoRoot
+	cmd.Env = env
+
+	return cmd
 }
 
 func resolveContainerEngine(t *testing.T) string {
@@ -147,14 +237,24 @@ func (h *harness) checkPrereqs() {
 func (h *harness) bootCluster(ctx context.Context) {
 	h.t.Helper()
 
-	if h.clusterExists(ctx) {
-		h.t.Logf("kind cluster %q already exists; reusing", clusterName)
-		return
+	if err := os.MkdirAll(filepath.Dir(h.kubeconfig), 0o700); err != nil {
+		h.t.Fatalf("mkdir kubeconfig dir: %v", err)
 	}
 
-	cfg := filepath.Join(h.repoRoot, "e2e", "gantry", "kind-config.yaml")
-	if err := h.run(ctx, "kind", "create", "cluster", "--config", cfg, "--image", kindNodeImage, "--wait", "120s"); err != nil {
-		h.t.Fatalf("kind create cluster: %v", err)
+	if h.clusterExists(ctx) {
+		h.t.Logf("kind cluster %q already exists; reusing", h.clusterName)
+	} else {
+		cfg := filepath.Join(h.repoRoot, "e2e", "gantry", "kind-config.yaml")
+		if err := h.run(ctx, "kind", "create", "cluster", "--name", h.clusterName, "--kubeconfig", h.kubeconfig,
+			"--config", cfg, "--image", kindNodeImage, "--wait", "120s"); err != nil {
+			h.t.Fatalf("kind create cluster: %v", err)
+		}
+	}
+
+	// Export even after create so a reused cluster, or one created by an
+	// earlier run, is selected through the private kubeconfig.
+	if err := h.run(ctx, "kind", "export", "kubeconfig", "--name", h.clusterName, "--kubeconfig", h.kubeconfig); err != nil {
+		h.t.Fatalf("kind export kubeconfig: %v", err)
 	}
 }
 
@@ -165,7 +265,7 @@ func (h *harness) clusterExists(ctx context.Context) bool {
 	}
 
 	for _, line := range strings.Split(out, "\n") {
-		if strings.TrimSpace(line) == clusterName {
+		if strings.TrimSpace(line) == h.clusterName {
 			return true
 		}
 	}
@@ -190,7 +290,7 @@ func (h *harness) buildAndLoadImage(ctx context.Context) {
 		h.t.Fatalf("save image archive: %v", err)
 	}
 
-	if err := h.run(ctx, "kind", "load", "image-archive", archive, "--name", clusterName); err != nil {
+	if err := h.run(ctx, "kind", "load", "image-archive", archive, "--name", h.clusterName); err != nil {
 		h.t.Fatalf("kind load: %v", err)
 	}
 }
@@ -263,7 +363,7 @@ func (h *harness) installMirrorHosts(ctx context.Context) {
 func (h *harness) kindNodes(ctx context.Context) []string {
 	h.t.Helper()
 
-	out, err := h.runOut(ctx, "kind", "get", "nodes", "--name", clusterName)
+	out, err := h.runOut(ctx, "kind", "get", "nodes", "--name", h.clusterName)
 	if err != nil {
 		h.t.Fatalf("kind get nodes: %v", err)
 	}
@@ -492,6 +592,7 @@ func (h *harness) waitForMetricIncrease(ctx context.Context, metric string, befo
 		}
 	}
 
+	h.dumpMetricDiagnostics(ctx)
 	h.t.Fatalf("metric %s did not increase above %.0f within 2m", metric, before)
 
 	return before
@@ -514,9 +615,42 @@ func (h *harness) waitForMetricIncreaseOnPod(ctx context.Context, pod, metric st
 		}
 	}
 
+	h.dumpMetricDiagnostics(ctx)
 	h.t.Fatalf("metric %s on %s did not increase above %.0f within 2m", metric, pod, before)
 
 	return before
+}
+
+// waitForInFlightPullsDrained waits until pod reports no in-flight origin
+// pulls for several consecutive scrapes. Seed pulls requested by another
+// node's cold start keep writing into this node's store until they finish.
+func (h *harness) waitForInFlightPullsDrained(ctx context.Context, pod string) {
+	h.t.Helper()
+
+	const quietScrapes = 3
+
+	quiet := 0
+	deadline := time.Now().Add(2 * time.Minute)
+
+	for time.Now().Before(deadline) {
+		if h.metricSumOnPod(ctx, pod, "p2p_in_flight_pulls") == 0 {
+			quiet++
+			if quiet >= quietScrapes {
+				return
+			}
+		} else {
+			quiet = 0
+		}
+
+		select {
+		case <-ctx.Done():
+			h.t.Fatalf("context canceled waiting for in-flight pulls on %s: %v", pod, ctx.Err())
+		case <-time.After(2 * time.Second):
+		}
+	}
+
+	h.dumpMetricDiagnostics(ctx)
+	h.t.Fatalf("in-flight pulls on %s did not drain within 2m", pod)
 }
 
 func (h *harness) gantryPods(ctx context.Context) []string {
@@ -611,9 +745,7 @@ func (h *harness) fetchPodHTTP(
 	pfCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	cmd := exec.CommandContext(pfCtx, "kubectl", "-n", namespace, "port-forward", "pod/"+pod, fmt.Sprintf("%d:%d", port, remotePort))
-	cmd.Dir = h.repoRoot
-	cmd.Env = os.Environ()
+	cmd := h.command(pfCtx, "kubectl", "-n", namespace, "port-forward", "pod/"+pod, fmt.Sprintf("%d:%d", port, remotePort))
 
 	var buf bytes.Buffer
 
@@ -709,7 +841,7 @@ func (h *harness) applyDaemonSet(ctx context.Context) error {
 		return err
 	}
 
-	cmd := exec.CommandContext(ctx, "kubectl", "apply", "-f", "-")
+	cmd := h.command(ctx, "kubectl", "apply", "-f", "-")
 	cmd.Stdin = strings.NewReader(patched)
 
 	var stdout, stderr bytes.Buffer
@@ -740,7 +872,7 @@ func (h *harness) applyConfigMap(ctx context.Context) error {
 		return err
 	}
 
-	cmd := exec.CommandContext(ctx, "kubectl", "apply", "-f", "-")
+	cmd := h.command(ctx, "kubectl", "apply", "-f", "-")
 	cmd.Stdin = strings.NewReader(patched)
 
 	var stdout, stderr bytes.Buffer
@@ -925,11 +1057,11 @@ func (h *harness) checkReadyz(ctx context.Context) {
 // teardown deletes the kind cluster. Skipped when E2E_KEEP=1.
 func (h *harness) teardown(ctx context.Context) {
 	if h.keepCluster {
-		h.t.Logf("E2E_KEEP=1 - leaving cluster %q running", clusterName)
+		h.t.Logf("E2E_KEEP=1 - leaving cluster %q running", h.clusterName)
 		return
 	}
 
-	if err := h.run(ctx, "kind", "delete", "cluster", "--name", clusterName); err != nil {
+	if err := h.run(ctx, "kind", "delete", "cluster", "--name", h.clusterName); err != nil {
 		h.t.Logf("kind delete cluster: %v", err)
 	}
 }
@@ -950,6 +1082,41 @@ func (h *harness) dumpDiagnostics(ctx context.Context) {
 	for _, pod := range h.gantryPods(ctx) {
 		h.dumpKubectlArtifact(ctx, "-n", namespace, "logs", "pod/"+pod, "-c", "gantry", "--tail=500")
 	}
+}
+
+// dumpMetricDiagnostics records pod state, Gantry logs, and every Gantry
+// pod's /metrics page. Metric assertions otherwise fail without leaving
+// anything under the artifacts directory for CI to upload.
+func (h *harness) dumpMetricDiagnostics(ctx context.Context) {
+	h.t.Helper()
+
+	h.dumpDiagnostics(ctx)
+
+	for _, pod := range h.gantryPods(ctx) {
+		body, err := h.fetchPodPath(ctx, pod, "/metrics")
+		if err != nil {
+			body = "fetch failed: " + err.Error() + "\n"
+		}
+
+		h.writeArtifact("metrics_"+pod, body)
+	}
+}
+
+// writeArtifact stores content under the artifacts directory using the
+// test name and a filesystem-safe suffix.
+func (h *harness) writeArtifact(suffix, content string) {
+	h.t.Helper()
+
+	safe := strings.NewReplacer("/", "_", ",", "_", "=", "_").Replace(suffix)
+	dst := filepath.Join(h.artifacts, fmt.Sprintf("%s_%s.log", strings.ReplaceAll(h.t.Name(), "/", "_"), safe))
+	//#nosec G306 -- test artifact
+	if err := os.WriteFile(dst, []byte(content), 0o644); err != nil {
+		h.t.Logf("diagnostics: could not write %s: %v", dst, err)
+
+		return
+	}
+
+	h.t.Logf("diagnostics: wrote %s", dst)
 }
 
 func (h *harness) dumpKubectlArtifact(ctx context.Context, args ...string) {
@@ -1114,14 +1281,11 @@ func (h *harness) waitForPodReadyByName(ctx context.Context, pod string) {
 }
 
 // run executes cmd and pipes stdout+stderr to the test log.
-// Inherits the parent process environment; per-call env overrides are
-// not currently needed.
+// The environment is the parent's with KUBECONFIG replaced; see command.
 func (h *harness) run(ctx context.Context, name string, args ...string) error {
 	h.t.Helper()
 
-	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Dir = h.repoRoot
-	cmd.Env = os.Environ()
+	cmd := h.command(ctx, name, args...)
 
 	var buf bytes.Buffer
 
@@ -1138,9 +1302,7 @@ func (h *harness) run(ctx context.Context, name string, args ...string) error {
 func (h *harness) runWithInput(ctx context.Context, input, name string, args ...string) error {
 	h.t.Helper()
 
-	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Dir = h.repoRoot
-	cmd.Env = os.Environ()
+	cmd := h.command(ctx, name, args...)
 	cmd.Stdin = strings.NewReader(input)
 
 	var buf bytes.Buffer
@@ -1160,9 +1322,7 @@ func (h *harness) runWithInput(ctx context.Context, input, name string, args ...
 func (h *harness) runOut(ctx context.Context, name string, args ...string) (string, error) {
 	h.t.Helper()
 
-	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Dir = h.repoRoot
-	cmd.Env = os.Environ()
+	cmd := h.command(ctx, name, args...)
 
 	var stdout, stderr bytes.Buffer
 
