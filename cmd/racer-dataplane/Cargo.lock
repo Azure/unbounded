@@ -958,6 +958,8 @@ version = "0.1.0"
 dependencies = [
  "flow-control",
  "page-alloc",
+ "racer-cluster-control",
+ "racer-control-wire",
  "racer-core",
  "serde_json",
  "topology",

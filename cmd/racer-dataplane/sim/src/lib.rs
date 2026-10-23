@@ -16,6 +16,7 @@
 //! - [`scenario`]: the world and the placeholder caches-only read flow.
 
 pub mod config;
+pub mod control;
 pub mod engine;
 pub mod faults;
 pub mod logic;
@@ -35,7 +36,8 @@ use crate::workload::{Churn, Storm};
 
 pub const USAGE: &str = "usage: racer-sim [--scenario NAME] [--nodes N] [--seed S] \
 [--duration D] [--config FILE.json] [--out PATH]\n\
-scenarios: smoke, caches-only, zipf, storm, churn, faults, empty\n\
+scenarios: smoke, caches-only, zipf, storm, churn, faults, empty,\n\
+           enrollment-storm, failover, ctl-churn, lagging\n\
 durations: integer with ns, us, ms or s suffix (plain numbers are seconds)";
 
 pub const SCENARIOS: &[&str] = &[
@@ -110,7 +112,8 @@ impl Options {
             match flag {
                 "--scenario" => {
                     let s = value()?;
-                    if !SCENARIOS.contains(&s.as_str()) {
+                    if !SCENARIOS.contains(&s.as_str()) && !control::SCENARIOS.contains(&s.as_str())
+                    {
                         return Err(format!("unknown scenario {s:?}"));
                     }
                     options.scenario = s;
@@ -239,10 +242,38 @@ pub fn build(options: &Options) -> Result<World<StandIn>, String> {
 
 /// Run a scenario and return its JSON report.
 pub fn run(options: &Options) -> Result<Value, String> {
+    if control::SCENARIOS.contains(&options.scenario.as_str()) {
+        return run_control(options);
+    }
     let mut world = build(options)?;
     let end = world.config.duration_ns;
     world.run(end);
     Ok(world.report(&options.scenario, options.seed))
+}
+
+/// Run a control-plane scenario. `--config` may carry a `"control"` object
+/// of [`control::Settings`] overrides; other keys go to [`Config`].
+fn run_control(options: &Options) -> Result<Value, String> {
+    let mut json: Option<Value> = match &options.config {
+        Some(path) => {
+            let text = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
+            Some(serde_json::from_str(&text).map_err(|e| format!("parse config: {e}"))?)
+        }
+        None => None,
+    };
+    let overrides = json
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .and_then(|o| o.remove("control"));
+    let rest = json.map(|v| v.to_string());
+    let config = options.build_config_with(rest.as_deref())?;
+    control::run(
+        &options.scenario,
+        config.nodes,
+        options.seed,
+        options.duration_ns,
+        overrides.as_ref(),
+    )
 }
 
 #[cfg(test)]
@@ -310,6 +341,27 @@ mod tests {
         ] {
             assert!(Options::parse(&args(bad)).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn control_scenarios_run_from_the_cli() {
+        for s in control::SCENARIOS {
+            let o = Options::parse(&args(&[
+                "--scenario",
+                s,
+                "--nodes",
+                "40",
+                "--duration",
+                "60s",
+            ]))
+            .unwrap();
+            let r = run(&o).unwrap();
+            assert_eq!(r["scenario"], *s);
+            assert_eq!(r["invariants"]["hard_failures"], 0, "{s}");
+        }
+        let mut o = opts("failover", 40, 1);
+        o.config = Some("/nonexistent/racer-sim/control.json".into());
+        assert!(run(&o).is_err());
     }
 
     #[test]

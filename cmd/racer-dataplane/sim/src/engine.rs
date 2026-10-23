@@ -102,6 +102,11 @@ impl<E> Engine<E> {
         self.at(self.now.saturating_add(delay), event);
     }
 
+    /// Time of the next pending event, if any.
+    pub fn next_at(&self) -> Option<Nanos> {
+        self.heap.peek().map(|e| e.at)
+    }
+
     /// Pop the next event no later than `end`, advancing the clock.
     pub fn pop_until(&mut self, end: Nanos) -> Option<E> {
         if self.heap.peek()?.at > end {
@@ -223,6 +228,8 @@ mod tests {
         e.finish(150);
         assert_eq!(e.now(), 150);
         assert_eq!(e.pending(), 1);
+        assert_eq!(e.next_at(), Some(200));
+        assert_eq!(Engine::<u8>::new().next_at(), None);
     }
 
     #[test]
