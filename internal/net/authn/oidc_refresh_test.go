@@ -79,7 +79,12 @@ func newOIDCTestIssuer(t *testing.T) *oidcTestIssuer {
 				select {
 				case <-gate.release:
 				case <-r.Context().Done():
-					return
+					// Abort without writing a response. Returning normally
+					// would send an empty 200, which the client transport
+					// can still accept if it arrives while the canceled
+					// caller is tearing down the connection (the TLS
+					// close_notify reaches the server before the TCP close).
+					panic(http.ErrAbortHandler)
 				}
 			}
 
