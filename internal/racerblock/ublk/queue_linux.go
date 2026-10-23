@@ -275,6 +275,8 @@ func (q *queue) run(ready chan<- error) {
 		if testHooks.failedRingClose != nil {
 			testHooks.failedRingClose(q, reason)
 		}
+	} else if err != nil {
+		q.rescueDuringTeardown(err)
 	}
 
 	if cerr := q.ring.close(); cerr != nil {
@@ -289,6 +291,23 @@ func (q *queue) run(ready chan<- error) {
 		}
 
 		q.oldRing = nil
+	}
+}
+
+// rescueDuringTeardown handles a queue whose loop failed after local
+// teardown began. Until teardown stops the queue it may still be waiting
+// in STOP_DEV for a request this queue owns, which on Linux 7.0 closing
+// the ring would strand (see rescue). The queue therefore answers I/O
+// through a rescue ring until it is stopped. Once stopped, STOP_DEV has
+// returned or was never sent, so the ring can be closed.
+func (q *queue) rescueDuringTeardown(err error) {
+	if q.stopping.Load() {
+		return
+	}
+
+	if rerr := q.rescue(); rerr != nil {
+		q.dev.cfg.Logger.Error("ublk: queue failed during teardown and cannot answer I/O; STOP_DEV may block",
+			"queue", q.id, "err", err, "rescueErr", rerr)
 	}
 }
 

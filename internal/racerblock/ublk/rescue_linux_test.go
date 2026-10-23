@@ -239,3 +239,65 @@ func TestRescueFailureFallsBackToBrokenPath(t *testing.T) {
 		t.Fatal("failed rescue replaced the ring")
 	}
 }
+
+// TestRescueDuringTeardownServesUntilStopped checks that a queue whose
+// loop fails after teardown began, but before teardown stopped it,
+// answers I/O through a rescue ring until it is stopped, since STOP_DEV
+// may be waiting for a request it owns.
+func TestRescueDuringTeardownServesUntilStopped(t *testing.T) {
+	q := newEIOQueue(t)
+	q.dev.closing.Store(true)
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		q.rescueDuringTeardown(errors.New("ring broken during STOP_DEV"))
+	}()
+
+	select {
+	case <-q.serving:
+	case <-time.After(5 * time.Second):
+		t.Fatal("queue failing during teardown never served")
+	}
+
+	select {
+	case <-done:
+		t.Fatal("rescue returned before the queue was stopped")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	q.stop()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rescue did not return after stop")
+	}
+
+	if q.oldRing == nil {
+		t.Fatal("no rescue ring was set up")
+	}
+}
+
+// TestRescueDuringTeardownSkipsStoppedQueue checks that a queue that
+// teardown already stopped closes its ring without a rescue.
+func TestRescueDuringTeardownSkipsStoppedQueue(t *testing.T) {
+	q := newEIOQueue(t)
+	q.dev.closing.Store(true)
+	q.stop()
+
+	testHooks.rescue = func(*queue) error {
+		t.Error("stopped queue started a rescue")
+		return errors.New("unexpected")
+	}
+
+	t.Cleanup(func() { testHooks.rescue = nil })
+
+	q.rescueDuringTeardown(errors.New("ring broken after stop"))
+
+	if q.oldRing != nil || isClosed(q.serving) {
+		t.Fatal("stopped queue was rescued")
+	}
+}
