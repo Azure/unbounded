@@ -352,3 +352,39 @@ func TestIntegrationFatalRingDuringTeardown(t *testing.T) {
 
 	checkNoLeak(t, before)
 }
+
+// TestIntegrationStartFailsWithoutSpareRing checks that Start fails
+// before START_DEV, and leaves no device behind, when a queue cannot
+// reserve its rescue ring.
+func TestIntegrationStartFailsWithoutSpareRing(t *testing.T) {
+	requireFaultVM(t)
+
+	before := ublkNodes(t)
+	boom := errors.New("injected rescue ring reservation failure")
+
+	setHooks(t, nil, nil)
+
+	testHooks.spareRing = func(q *queue) error {
+		if q.id == 1 {
+			return boom
+		}
+
+		return nil
+	}
+	testHooks.beforeStartCmd = func(*Device) {
+		t.Error("START_DEV sent without every rescue ring reserved")
+	}
+
+	d, err := startBounded(t, 2)
+	if err == nil {
+		_ = d.Close()
+
+		t.Fatal("Start succeeded without a rescue ring")
+	}
+
+	if !errors.Is(err, boom) {
+		t.Fatalf("Start = %v, want %v", err, boom)
+	}
+
+	checkNoLeak(t, before)
+}

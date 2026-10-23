@@ -88,6 +88,7 @@ func newEIOQueue(t *testing.T) *queue {
 		depth:   depth,
 		charFd:  null,
 		ring:    newTestRing(t, depth+1),
+		spare:   newTestRing(t, rescueRingEntries(depth)),
 		efd:     efd,
 		bufs:    make([][]byte, depth),
 		exited:  make(chan struct{}),

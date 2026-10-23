@@ -129,6 +129,10 @@ type uring struct {
 
 // newURing creates an io_uring with at least entries submission entries.
 func newURing(entries uint32) (*uring, error) {
+	if testHooks.uringSetup != nil {
+		testHooks.uringSetup()
+	}
+
 	var p uringParams
 
 	p.Flags = ioringSetupSQE128

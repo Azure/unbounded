@@ -205,6 +205,11 @@ var testHooks struct {
 	// rescue fails a queue's rescue on entry to force the broken-ring
 	// path.
 	rescue func(q *queue) error
+	// spareRing fails reserving a queue's rescue ring during setup.
+	spareRing func(q *queue) error
+	// uringSetup runs before every io_uring_setup; tests use it to
+	// check that a rescue sets up no new ring.
+	uringSetup func()
 	// rescued runs once a rescue ring has submitted its first sweep.
 	rescued func(q *queue)
 	// beforeStop runs in teardown of a started device just before

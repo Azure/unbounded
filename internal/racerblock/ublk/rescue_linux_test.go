@@ -7,6 +7,7 @@ package ublk
 
 import (
 	"errors"
+	"os"
 	"slices"
 	"sync/atomic"
 	"syscall"
@@ -372,5 +373,113 @@ func TestDrainKeepsCompletionsAfterPrepFailure(t *testing.T) {
 		if !slices.Equal(results[tag], want) {
 			t.Errorf("tag %d committed %v by the rescue, want %v", tag, results[tag], want)
 		}
+	}
+}
+
+// countFds returns the number of open file descriptors of this process.
+func countFds(t *testing.T) int {
+	t.Helper()
+
+	fds, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return len(fds)
+}
+
+// TestRescueUsesSpareRingWithoutNewRing checks that a rescue serves
+// through the ring reserved at setup and sets up no new io_uring, so it
+// works even when the failure was resource exhaustion.
+func TestRescueUsesSpareRingWithoutNewRing(t *testing.T) {
+	q := newEIOQueue(t)
+	spare := q.spare
+
+	var setups atomic.Int32
+
+	testHooks.uringSetup = func() { setups.Add(1) }
+
+	t.Cleanup(func() { testHooks.uringSetup = nil })
+
+	res := make(chan string, 1)
+
+	go func() { res <- q.holdUntilSafe(errors.New("io_uring_enter: ENOMEM")) }()
+
+	select {
+	case <-q.serving:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rescued queue never reported that it serves")
+	}
+
+	q.stop()
+
+	if got := <-res; got != holdRescued {
+		t.Fatalf("holdUntilSafe = %q, want %q", got, holdRescued)
+	}
+
+	if n := setups.Load(); n != 0 {
+		t.Fatalf("rescue set up %d new rings", n)
+	}
+
+	if q.ring != spare || q.spare != nil {
+		t.Fatal("rescue did not take the spare ring")
+	}
+}
+
+// TestRescueWithoutSpareRingFailsClosed checks that a queue whose spare
+// ring is gone takes the broken-ring path instead of serving.
+func TestRescueWithoutSpareRingFailsClosed(t *testing.T) {
+	q := newEIOQueue(t)
+	close(q.dev.startDone)
+
+	q.spare = nil
+
+	if got := q.holdUntilSafe(errors.New("commit failed")); got != holdResolved {
+		t.Fatalf("holdUntilSafe = %q, want %q", got, holdResolved)
+	}
+
+	if isClosed(q.serving) || q.oldRing != nil {
+		t.Fatal("queue without a spare ring was rescued")
+	}
+}
+
+// TestNewQueueFailsWithoutSpareRing checks that queue setup fails, and
+// leaks nothing, when it cannot reserve the rescue ring.
+func TestNewQueueFailsWithoutSpareRing(t *testing.T) {
+	d, _, _ := newStartupDevice(t)
+	d.cfg = Config{Depth: 4, MaxIOBytes: 4096}
+
+	boom := errors.New("injected ENOMEM")
+	testHooks.spareRing = func(*queue) error { return boom }
+
+	t.Cleanup(func() { testHooks.spareRing = nil })
+
+	before := countFds(t)
+
+	q, err := newQueue(d, 0)
+	if !errors.Is(err, boom) || q != nil {
+		t.Fatalf("newQueue = %v, %v; want %v", q, err, boom)
+	}
+
+	if after := countFds(t); after != before {
+		t.Fatalf("open fds %d after failed setup, want %d", after, before)
+	}
+}
+
+// TestReleaseClosesUnusedSpareRingOnce checks that release closes a
+// spare ring no rescue used and is safe to repeat.
+func TestReleaseClosesUnusedSpareRingOnce(t *testing.T) {
+	q := newEIOQueue(t)
+	q.bufs = nil
+	q.efd = -1
+
+	for range 2 {
+		if err := q.release(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if q.spare != nil || q.ring != nil {
+		t.Fatal("release left a ring")
 	}
 }

@@ -6,6 +6,7 @@
 package ublk
 
 import (
+	"errors"
 	"fmt"
 	"syscall"
 	"time"
@@ -18,6 +19,29 @@ const holdRescued = "rescued"
 // rescueTick is how often a rescue looks for requests the kernel handed
 // to the replaced ring.
 var rescueTick = 5 * time.Millisecond
+
+// errNoSpareRing reports that a queue has no rescue ring left, because
+// it was never reserved or a rescue already used it.
+var errNoSpareRing = errors.New("no spare rescue ring")
+
+// rescueRingEntries is the submission queue size of a rescue ring. A
+// rescue may prepare one sweep commit per tag, then one commit per tag
+// from the replaced ring and from handlers, before it submits; the ring
+// flushes when full, so the size only limits batching.
+func rescueRingEntries(depth int) uint32 {
+	return uint32(2*depth + 2) //nolint:gosec // depth is at most MaxQueueDepth
+}
+
+// newRescueRing reserves the rescue ring of q.
+func newRescueRing(q *queue) (*uring, error) {
+	if testHooks.spareRing != nil {
+		if err := testHooks.spareRing(q); err != nil {
+			return nil, err
+		}
+	}
+
+	return newURing(rescueRingEntries(q.depth))
+}
 
 // rescue answers every request the queue owns, or will be handed, with
 // EIO through a fresh io_uring, until the queue is stopped. It is used
@@ -61,11 +85,14 @@ func (q *queue) rescue() error {
 		}
 	}
 
-	r, err := newURing(uint32(2*q.depth + 2)) //nolint:gosec // depth is at most MaxQueueDepth
-	if err != nil {
-		return fmt.Errorf("rescue ring: %w", err)
+	// Use the ring reserved at setup: a failure may be resource
+	// exhaustion, so the rescue must not need a new file or mapping.
+	r := q.spare
+	if r == nil {
+		return errNoSpareRing
 	}
 
+	q.spare = nil
 	q.oldRing, q.ring = q.ring, r
 	q.pollP = false
 
