@@ -737,7 +737,26 @@ the reconcile context itself is terminal for that operation.
 | `/metrics` | Prometheus metrics, including `racer_ready` and `racer_live` |
 | `/debug/membership` | Applied membership state |
 | `/debug/failures` | Bounded failure diagnostics |
+| `/debug/aead`, `/debug/decrypt-failures`, `/debug/send-crc` | Bounded crypto and checksum failure details |
+| `/debug/terminal`, `/debug/admission-final`, `/debug/candidate-final` | Bounded final-outcome records |
+| `/debug/gate-events`, `/debug/flight-expiry` | Bounded gate and in-flight expiry events |
+| `/debug/hardware` | Live JSON report of block devices, RDMA devices, and Racer's claimed disks and RDMA rails |
 | `/debug/pprof/profile?seconds=30` | Opt-in native CPU profile |
+
+`/debug/hardware` reads sysfs on every request. It never opens block devices.
+The read runs on a helper thread, so a slow read does not delay health checks.
+Values it cannot read are `null`, and section failures are listed in `errors`.
+It returns 503 `response_too_large` if the JSON does not fit in one response
+(about 64 KiB), or if discovery exceeds its fixed working-memory budget, which
+can happen on hosts with very many block or RDMA devices. Attribute files
+larger than 4 KiB are reported as `null`. Only one report is built at a time: a request made while another
+is still running returns 409 `busy`. A report that takes longer than 5 seconds
+closes the connection without a response. In managed workloads, read it through the API server pod proxy.
+This needs RBAC `get` on `pods/proxy`:
+
+```sh
+kubectl get --raw "/api/v1/namespaces/<namespace>/pods/<pod>:9090/proxy/debug/hardware"
+```
 
 CPU profiling is disabled by default. Set the dataplane environment variable
 `RACER_PPROF_ENABLED=true` to enable it; only the exact values `true` and `false`
@@ -792,7 +811,7 @@ and per-tier `racer_*_lookup_hits_total` / `racer_*_lookup_misses_total`. Page-s
 are not request counts or byte rates. A scrape is not readiness. Restrict diagnostics
 network access, especially with host networking.
 
-The example metrics port `19090` is installation-specific.
+The diagnostics listener uses port 9090 by default.
 Persist scrape configuration on workload templates or supported overrides, not only live Pods.
 
 ## Upgrade and recovery
