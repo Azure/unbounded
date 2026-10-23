@@ -199,7 +199,8 @@ mod tests {
         let (intervals, _) = selection_demand(&slots, 10, |n| n == 11, 2, 64).unwrap();
         assert_eq!(intervals, [10..11, 13..14]);
         let (intervals, _) = selection_demand(&slots, 10, |_| false, 99, 2).unwrap();
-        assert_eq!(intervals, [10..12]);
+        assert_eq!(intervals.len(), 1);
+        assert_eq!(intervals[0], 10..12);
         assert!(selection_demand(&[Ready], 0, |_| false, 9, 64).is_none());
     }
 
