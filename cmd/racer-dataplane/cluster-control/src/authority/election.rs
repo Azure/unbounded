@@ -120,11 +120,12 @@ pub fn micro_time(since_epoch: Duration) -> String {
     )
 }
 
-/// Current wall time as MicroTime.
-pub fn now_micro() -> String {
+/// `wall` as MicroTime. Callers pass the wall clock (production:
+/// `SystemTime::now()`), so this module stays pure. Times before the epoch
+/// render as the epoch.
+pub fn now_micro(wall: std::time::SystemTime) -> String {
     micro_time(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        wall.duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default(),
     )
 }
@@ -249,6 +250,14 @@ mod tests {
             micro_time(Duration::from_secs(253_402_300_799)),
             "9999-12-31T23:59:59.000000Z"
         );
+    }
+
+    #[test]
+    fn now_micro_uses_given_wall_time() {
+        let t = std::time::UNIX_EPOCH + Duration::from_secs(1_709_164_800);
+        assert_eq!(now_micro(t), "2024-02-29T00:00:00.000000Z");
+        let before = std::time::UNIX_EPOCH - Duration::from_secs(1);
+        assert_eq!(now_micro(before), "1970-01-01T00:00:00.000000Z");
     }
 
     #[test]

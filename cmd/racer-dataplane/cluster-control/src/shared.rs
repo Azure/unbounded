@@ -106,6 +106,8 @@ pub struct Shared {
     /// its grace period, so held Leases are freed rather than left to expire.
     pub releasing: Cell<usize>,
     pub last_error: Cell<Option<crate::Error>>,
+    /// Jitter and claim-delay salt. Production: [`crate::entropy::OsEntropy`].
+    pub rng: RefCell<Box<dyn crate::entropy::Entropy>>,
 }
 
 impl Shared {
@@ -234,6 +236,7 @@ pub(crate) mod tests {
             stopping: Cell::new(false),
             releasing: Cell::new(0),
             last_error: Cell::new(None),
+            rng: RefCell::new(Box::new(crate::entropy::Seeded::new(1))),
         })
     }
 }

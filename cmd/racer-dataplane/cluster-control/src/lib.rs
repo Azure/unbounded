@@ -41,6 +41,7 @@ mod auth;
 mod authority;
 mod config;
 mod control;
+pub mod entropy;
 mod exec;
 mod http;
 mod kube;

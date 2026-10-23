@@ -65,8 +65,11 @@ pub async fn contend(shared: Rc<Shared>, seat: Rc<Seat>) {
                 seat_mine(&shared, &seat),
                 observer.expired(&obs, Instant::now()),
             ) {
-                let spec =
-                    election::claim(&obs.spec, &shared.config.pod_name, &election::now_micro());
+                let spec = election::claim(
+                    &obs.spec,
+                    &shared.config.pod_name,
+                    &election::now_micro(SystemTime::now()),
+                );
                 let started = Instant::now();
                 let body = lease::with(
                     &object,
@@ -79,15 +82,10 @@ pub async fn contend(shared: Rc<Shared>, seat: Rc<Seat>) {
                 }
             }
         }
-        let wait = limits::LEASE_RENEW + Duration::from_millis(u64::from(rand_u16()) % 3000);
+        let wait = limits::LEASE_RENEW
+            + Duration::from_millis(u64::from(shared.rng.borrow_mut().u16_or_zero()) % 3000);
         exec::sleep(wait).await;
     }
-}
-
-fn rand_u16() -> u16 {
-    let mut b = [0u8; 2];
-    let _ = getrandom::getrandom(&mut b);
-    u16::from_ne_bytes(b)
 }
 
 fn primary_annotations(
@@ -269,7 +267,10 @@ async fn renew(t: Rc<Term_>) {
         // Taken before reading `extra`: a change from here on renews again.
         let publish = t.publish.generation();
         let object = t.object.borrow().clone();
-        let spec = election::renew(&lease::observe(&object).spec, &election::now_micro());
+        let spec = election::renew(
+            &lease::observe(&object).spec,
+            &election::now_micro(SystemTime::now()),
+        );
         let body = lease::with(
             &object,
             &spec,
@@ -661,8 +662,15 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
             })
             .collect();
         let policy = Policy::from(shared.config.rotation);
-        let plan = keyring::plan_with(&policy, &durable, catalog.as_deref(), &offers, unix_now())
-            .map_err(|_| StateError::TooLarge)?;
+        let plan = keyring::plan_with(
+            &policy,
+            &durable,
+            catalog.as_deref(),
+            &offers,
+            unix_now(),
+            &mut **shared.rng.borrow_mut(),
+        )
+        .map_err(|_| StateError::TooLarge)?;
         if plan.refused_roots > 0 {
             // Root slots are full. Those seats stay unready until slots free up.
             shared.last_error.set(Some(crate::Error::Unavailable));

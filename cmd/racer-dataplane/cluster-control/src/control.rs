@@ -3,6 +3,7 @@
 use crate::{
     Config, DiscoveredEndpoints, Error, annotations,
     authority::rails::{self, Report},
+    entropy::{Entropy, OsEntropy},
     exec::{self, Executor, Listener, Notifier, Signal},
     kube::{Kube, KubeConfig, paths, str_at},
     limits,
@@ -148,8 +149,9 @@ fn run(
                 .map(|ip| Listener::bind(SocketAddr::new(ip, config.webhook_listen.port())))
                 .transpose()
                 .map_err(|_| Error::Io)?;
+            let mut rng: Box<dyn Entropy> = Box::new(OsEntropy);
             let mut nonce = [0u8; 8];
-            getrandom::getrandom(&mut nonce).map_err(|_| Error::Io)?;
+            rng.fill(&mut nonce).map_err(|_| Error::Io)?;
             let nonce: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
             let shared = Rc::new(Shared {
                 identity: format!("{}/{nonce}", config.pod_name),
@@ -169,6 +171,7 @@ fn run(
                 stopping: Default::default(),
                 releasing: Default::default(),
                 last_error: Default::default(),
+                rng: RefCell::new(rng),
             });
             Ok((executor, shared, control, webhook, webhook_alternate))
         };

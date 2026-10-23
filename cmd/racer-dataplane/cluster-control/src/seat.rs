@@ -137,9 +137,8 @@ pub fn initial_seats(shared: &Shared) -> usize {
 }
 
 fn jitter(shared: &Shared, salt: u32, max: Duration) -> Duration {
-    let mut b = [0u8; 4];
-    let _ = getrandom::getrandom(&mut b);
-    election::claim_delay(&shared.config.pod_uid, salt ^ u32::from_ne_bytes(b), max)
+    let r = shared.rng.borrow_mut().u32_or_zero();
+    election::claim_delay(&shared.config.pod_uid, salt ^ r, max)
 }
 
 /// Watch the primary Lease. One watch per Pod; no polling while it holds.
@@ -448,7 +447,11 @@ pub async fn lottery(shared: Rc<Shared>, primary_changed: Rc<RefCell<(String, Op
         let Ok(seat) = new_seat(&shared, index) else {
             continue;
         };
-        let spec = election::claim(&obs.spec, &shared.config.pod_name, &election::now_micro());
+        let spec = election::claim(
+            &obs.spec,
+            &shared.config.pod_name,
+            &election::now_micro(SystemTime::now()),
+        );
         let started = Instant::now();
         let body = lease::with(&object, &spec, &my_seat_annotations(&shared, &seat));
         match lease::put(&shared.lease_api, &ns, &body).await {
@@ -591,7 +594,7 @@ pub async fn seat_task(shared: Rc<Shared>, seat: Rc<Seat>, mut object: serde_jso
         }
         rotate(&shared, &seat);
         let obs = lease::observe(&object);
-        let spec = election::renew(&obs.spec, &election::now_micro());
+        let spec = election::renew(&obs.spec, &election::now_micro(SystemTime::now()));
         let body = lease::with(&object, &spec, &my_seat_annotations(&shared, &seat));
         let started = Instant::now();
         last_put = started;
