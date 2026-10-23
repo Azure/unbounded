@@ -305,7 +305,9 @@ impl Application {
                 .native
                 .prepare(plan.pairs.iter().map(|p| p.worker), &self.limits)?;
         }
-        let signals = SignalGuard::install()?;
+        // Shares handlers the entry point may already hold across cluster bootstrap;
+        // a stop requested before this point stays pending.
+        let signals = StopSignals::install()?;
         if self.config.managed() && self.config.managed_control.is_none() {
             // Managed mode has no static endpoint; startup must attach control first.
             return Err(Error::InvalidConfiguration);
@@ -629,47 +631,82 @@ extern "C" fn request_stop(_: libc::c_int) {
     STOP_REQUESTED.store(true, Ordering::Relaxed);
 }
 
-/// Restore the original process signal handlers when application ownership ends.
-struct SignalGuard {
+/// Installed handler state shared by every live [`StopSignals`] guard.
+struct Installed {
+    guards: usize,
     previous: Vec<(libc::c_int, libc::sigaction)>,
 }
 
-impl SignalGuard {
-    /// Install stop handlers while retaining each previous process handler.
-    fn install() -> Result<Self> {
-        STOP_REQUESTED.store(false, Ordering::Relaxed);
-        let mut guard = Self {
-            previous: Vec::new(),
-        };
-        for signal in [libc::SIGINT, libc::SIGTERM] {
-            // SAFETY: initialized sigaction records and a signal-safe atomic handler.
-            unsafe {
-                let mut action: libc::sigaction = std::mem::zeroed();
-                action.sa_sigaction = request_stop as *const () as usize;
-                libc::sigemptyset(&mut action.sa_mask);
-                let mut previous = std::mem::zeroed();
-                if libc::sigaction(signal, &action, &mut previous) != 0 {
-                    return Err(Error::Io);
+// SAFETY: sigaction records are plain process-global handler descriptions.
+unsafe impl Send for Installed {}
+
+static INSTALLED: Mutex<Installed> = Mutex::new(Installed {
+    guards: 0,
+    previous: Vec::new(),
+});
+
+/// Process SIGINT/SIGTERM stop handlers, shared across startup phases.
+///
+/// The first live guard installs the handlers and clears any stale stop request;
+/// nested guards (for example the one taken by [`Application::run`] while the
+/// entry point already holds one across cluster bootstrap) only share them and
+/// never clear a pending stop. The last guard dropped restores the original
+/// process handlers.
+pub struct StopSignals(());
+
+impl StopSignals {
+    /// Install, or share already installed, stop handlers.
+    pub fn install() -> Result<Self> {
+        let mut installed = INSTALLED.lock().map_err(|_| Error::Internal)?;
+        if installed.guards == 0 {
+            STOP_REQUESTED.store(false, Ordering::Relaxed);
+            let mut previous = Vec::new();
+            for signal in [libc::SIGINT, libc::SIGTERM] {
+                // SAFETY: initialized sigaction records and a signal-safe atomic handler.
+                unsafe {
+                    let mut action: libc::sigaction = std::mem::zeroed();
+                    action.sa_sigaction = request_stop as *const () as usize;
+                    libc::sigemptyset(&mut action.sa_mask);
+                    let mut old = std::mem::zeroed();
+                    if libc::sigaction(signal, &action, &mut old) != 0 {
+                        restore(&previous);
+                        return Err(Error::Io);
+                    }
+                    previous.push((signal, old));
                 }
-                guard.previous.push((signal, previous));
             }
+            installed.previous = previous;
         }
-        Ok(guard)
+        installed.guards += 1;
+        Ok(Self(()))
     }
 
     /// Check whether a handled process signal requested shutdown.
-    fn requested(&self) -> bool {
+    pub fn requested(&self) -> bool {
         STOP_REQUESTED.load(Ordering::Relaxed)
     }
 }
 
-impl Drop for SignalGuard {
+impl Drop for StopSignals {
     fn drop(&mut self) {
-        for (signal, previous) in self.previous.iter().rev() {
-            // SAFETY: restore the exact process handlers saved during installation.
-            unsafe {
-                libc::sigaction(*signal, previous, std::ptr::null_mut());
-            }
+        let mut installed = match INSTALLED.lock() {
+            Ok(installed) => installed,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        installed.guards = installed.guards.saturating_sub(1);
+        if installed.guards == 0 {
+            let previous = std::mem::take(&mut installed.previous);
+            restore(&previous);
+        }
+    }
+}
+
+/// Restore saved process handlers in reverse installation order.
+fn restore(previous: &[(libc::c_int, libc::sigaction)]) {
+    for (signal, previous) in previous.iter().rev() {
+        // SAFETY: restore the exact process handlers saved during installation.
+        unsafe {
+            libc::sigaction(*signal, previous, std::ptr::null_mut());
         }
     }
 }
