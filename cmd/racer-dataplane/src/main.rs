@@ -1,7 +1,15 @@
 //! Process entry point. Configuration and application lifecycle own all resources.
+//!
+//! In managed deployments the embedded cluster-control service starts first, on
+//! its own bounded thread, and the dataplane waits for its bootstrap before any
+//! worker is assembled. Standalone fixtures set a static endpoint instead.
 
 use racer_dataplane::app::Application;
 use racer_dataplane::config::Config;
+use racer_dataplane::control::managed::{BootstrapError, Bootstrapped, ClusterControl};
+use racer_dataplane::error::Error;
+use std::sync::Arc;
+use std::time::Duration;
 
 fn main() -> std::process::ExitCode {
     tune_allocator();
@@ -16,10 +24,91 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-fn run() -> std::result::Result<(), (&'static str, racer_dataplane::error::Error)> {
-    let config = Config::from_env().map_err(|error| ("config", error))?;
-    let application = Application::assemble(config).map_err(|error| ("assemble", error))?;
-    application.run().map_err(|error| ("run", error))
+/// Cluster-control handle adapted to the dataplane startup contract.
+struct Embedded(racer_cluster_control::Handle);
+
+impl ClusterControl for Embedded {
+    fn bootstrap(&self, timeout: Duration) -> Result<Bootstrapped, BootstrapError> {
+        match self.0.bootstrap(timeout) {
+            Ok(bootstrap) => Ok(Bootstrapped {
+                cluster: bootstrap.cluster,
+                block_devices: bootstrap.block_devices,
+            }),
+            Err(
+                racer_cluster_control::Error::Unavailable | racer_cluster_control::Error::Timeout,
+            ) => Err(BootstrapError::Retry),
+            Err(error) => {
+                eprintln!("racer-dataplane: stage=cluster-bootstrap control error={error}");
+                Err(BootstrapError::Fatal)
+            }
+        }
+    }
+
+    fn endpoints(&self) -> wire_codec::DiscoveredEndpoints {
+        self.0.endpoints()
+    }
+
+    fn report(&self, shares: u32, rails: Vec<racer_control_wire::RailMapping>) {
+        // Reports are retried by control; a refused enqueue is logged, never fatal.
+        if let Err(error) = self.0.report(shares, rails) {
+            eprintln!("racer-dataplane: stage=cluster-report error={error}");
+        }
+    }
+}
+
+fn run() -> std::result::Result<(), (&'static str, Error)> {
+    let mut config = Config::from_env().map_err(|error| ("config", error))?;
+    let control = racer_cluster_control::Config::from_env().map_err(|error| {
+        eprintln!("racer-dataplane: stage=cluster-control-config error={error}");
+        ("cluster-control-config", Error::InvalidConfiguration)
+    })?;
+    // Retained until the application stops; dropping it stops control boundedly.
+    // The concrete handle is kept beside the trait object for fatal diagnostics.
+    let control = match (control, config.managed()) {
+        (None, false) => None,
+        (Some(control), true) => {
+            let handle = racer_cluster_control::start(control).map_err(|error| {
+                eprintln!("racer-dataplane: stage=cluster-control-start error={error}");
+                ("cluster-control-start", Error::Unavailable)
+            })?;
+            let concrete = Arc::new(Embedded(handle));
+            let embedded: Arc<dyn ClusterControl> = concrete.clone();
+            racer_dataplane::control::managed::start(&mut config, embedded, &|| false)
+                .map_err(|error| fatal(&concrete, ("cluster-bootstrap", error)))?;
+            Some(concrete)
+        }
+        (Some(_), false) => {
+            eprintln!(
+                "racer-dataplane: RACER_CLUSTER_ID and RACER_CONTROL_ENDPOINT must be unset when RACER_NAMESPACE selects managed control"
+            );
+            return Err(("config", Error::InvalidConfiguration));
+        }
+        (None, true) => {
+            eprintln!(
+                "racer-dataplane: set RACER_NAMESPACE for managed control, or both RACER_CLUSTER_ID and RACER_CONTROL_ENDPOINT for standalone control"
+            );
+            return Err(("config", Error::InvalidConfiguration));
+        }
+    };
+    let report = |failure| match &control {
+        Some(control) => fatal(control, failure),
+        None => failure,
+    };
+    let application = Application::assemble(config).map_err(|error| report(("assemble", error)))?;
+    application.run().map_err(|error| report(("run", error)))
+}
+
+/// Log payload-free embedded control state for a fatal lifecycle failure.
+fn fatal(control: &Embedded, failure: (&'static str, Error)) -> (&'static str, Error) {
+    let state = control.0.diagnostics();
+    let last_error = state
+        .last_error
+        .map_or_else(|| "none".to_owned(), |error| error.to_string());
+    eprintln!(
+        "racer-dataplane: stage={} control role={:?} sequence={} ready={} tasks={} last_error={last_error}",
+        failure.0, state.role, state.sequence, state.ready, state.tasks
+    );
+    failure
 }
 
 /// Environment variable glibc reads at startup to fix the mmap threshold. When an operator sets

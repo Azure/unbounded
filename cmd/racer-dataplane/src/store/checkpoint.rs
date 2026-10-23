@@ -30,6 +30,7 @@ use page_alloc::SegmentSnapshot;
 use page_alloc::SegmentState;
 use page_alloc::Segments;
 use racer_control_wire::CacheId;
+use racer_control_wire::ClusterId;
 use racer_control_wire::KeyId;
 use sha2::Digest;
 use sha2::Sha256;
@@ -44,7 +45,7 @@ pub(crate) const CHECKPOINT_NAMES: [&str; 2] = ["checkpoint.0", "checkpoint.1"];
 const SLOTS: uring_runtime::reactor::filesystem::checkpoint::Slots<HEADER_BYTES> =
     uring_runtime::reactor::filesystem::checkpoint::Slots {
         names: CHECKPOINT_NAMES,
-        minimum_bytes: HEADER_BYTES + 4 + DIGEST_BYTES,
+        minimum_bytes: HEADER_BYTES + CLUSTER_BYTES + 4 + DIGEST_BYTES,
         maximum_bytes: MAX_CHECKPOINT_BYTES,
     };
 
@@ -219,7 +220,7 @@ impl Checkpointer {
 
     /// One coordinator calls this after all owner-worker snapshots have succeeded.
     /// The coordinator must keep all owners frozen until this operation completes.
-    pub fn publish(&self, shards: Vec<ShardImage>) -> Operation<'_, ()> {
+    pub fn publish(&self, cluster: ClusterId, shards: Vec<ShardImage>) -> Operation<'_, ()> {
         Box::pin(async move {
             let newest = candidates(&self.directory, MAX_CHECKPOINT_BYTES)?
                 .next()
@@ -229,6 +230,7 @@ impl Checkpointer {
             let (slot, sequence) = SLOTS.next_publication(newest).ok_or(Error::Unavailable)?;
             let bytes = encode(&CheckpointImage {
                 version: CHECKPOINT_VERSION,
+                cluster,
                 sequence,
                 shards,
             })?;
@@ -238,8 +240,10 @@ impl Checkpointer {
 
     /// Periodic disposable hints. The coordinator serializes generations and
     /// keeps segment reuse frozen until rename completes. No fsync is issued.
+    #[allow(clippy::too_many_arguments)]
     pub fn publish_async(
         &self,
+        cluster: ClusterId,
         shards: Vec<ShardImage>,
         reactor: Rc<crate::runtime::Reactor>,
         scope: crate::runtime::RequestScope,
@@ -256,6 +260,7 @@ impl Checkpointer {
         Ok(Box::pin(async move {
             let bytes = encode_incremental(&CheckpointImage {
                 version: CHECKPOINT_VERSION,
+                cluster,
                 sequence,
                 shards,
             })
@@ -318,7 +323,7 @@ pub(super) fn snapshot_base_bytes(segments: usize) -> Result<usize> {
 }
 
 fn snapshot_image_bytes(shards: &[ShardImage]) -> Result<usize> {
-    let mut total = HEADER_BYTES + 4 + DIGEST_BYTES;
+    let mut total = HEADER_BYTES + CLUSTER_BYTES + 4 + DIGEST_BYTES;
     for shard in shards {
         total = total.checked_add(SHARD_BYTES).ok_or(Error::Overloaded)?;
         for segment in &shard.segments {
@@ -461,7 +466,7 @@ pub(crate) fn read_candidates(directory: &Path) -> Result<Vec<(usize, Checkpoint
 
 // Bounded, versioned binary checkpoints. SHA-256 covers the header and body.
 // Integers are little-endian: magic[8], version:u32, flags:u32, sequence:u64,
-// total_bytes:u64, shard_count:u32, then shards and digest[32]. Each shard is
+// total_bytes:u64, cluster[36], shard_count:u32, then shards and digest[32]. Each shard is
 // worker:u16, six geometry u64s, layout_digest[32] (the raw-device layout or
 // file mode), counted segments, counted page entries, and counted standalone
 // descriptors. Counts and string lengths are u32. A descriptor is cache UTF-8
@@ -472,8 +477,13 @@ pub(crate) fn read_candidates(directory: &Path) -> Result<Vec<(usize, Checkpoint
 // page:u64, key_id[16], segment:u64, generation:u64, offset:u64,
 // disk_length:u64. Encoder ordering is canonical by worker, segment, and full
 // version/page identity. No freshness or payload bytes are serialized.
-// Checkpoints with any other version are discarded as disposable cache hints.
-pub const CHECKPOINT_VERSION: u32 = 1;
+// cluster is the canonical lowercase cluster UUID. Cache IDs survive a cluster
+// change, and key IDs only add a random 32-bit suffix to a generation that
+// restarts at 1, so they can repeat across clusters. Recovery skips a cut
+// from another cluster. Checkpoints with any other version or cluster are
+// discarded as disposable cache hints.
+pub const CHECKPOINT_VERSION: u32 = 2;
+const CLUSTER_BYTES: usize = 36;
 pub const FILE_LAYOUT_DIGEST: [u8; 32] = *b"racer-file-layout-v1\0\0\0\0\0\0\0\0\0\0\0\0";
 pub const MAX_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
 const MAGIC: &[u8; 8] = b"RACERCP\0";
@@ -688,8 +698,16 @@ impl ShardImage {
 
 pub struct CheckpointImage {
     pub version: u32,
+    /// Cluster UID that owns the keys named by page entries.
+    pub cluster: ClusterId,
     pub sequence: u64,
     pub shards: Vec<ShardImage>,
+}
+
+/// Shared canonical cluster UID for checkpoint fixtures.
+#[cfg(test)]
+pub(crate) fn test_cluster() -> ClusterId {
+    ClusterId(crate::test_support::security::CLUSTER.into())
 }
 
 pub fn encode(image: &CheckpointImage) -> Result<Vec<u8>> {
@@ -710,6 +728,7 @@ pub async fn encode_incremental(image: &CheckpointImage) -> Result<Vec<u8>> {
     out.u32(0)?; // Reserved flags.
     out.u64(image.sequence)?;
     out.u64(0)?; // Total encoded length, filled before hashing.
+    out.bytes(image.cluster.0.as_bytes())?;
     out.count(image.shards.len())?;
     let mut shards: Vec<_> = image.shards.iter().collect();
     shards.sort_by_key(|shard| shard.worker.0);
@@ -806,7 +825,9 @@ pub fn decode(bytes: &[u8]) -> Result<CheckpointImage> {
 /// A downsized budget rejects the disposable cut rather than partially restoring it.
 pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage> {
     recovery_memory(bytes, budget)?;
-    if bytes.len() < HEADER_BYTES + 4 + DIGEST_BYTES || bytes.len() > MAX_CHECKPOINT_BYTES {
+    if bytes.len() < HEADER_BYTES + CLUSTER_BYTES + 4 + DIGEST_BYTES
+        || bytes.len() > MAX_CHECKPOINT_BYTES
+    {
         return Err(Error::CorruptRecord);
     }
     let (body, digest) = bytes.split_at(bytes.len() - DIGEST_BYTES);
@@ -825,6 +846,11 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
     if input.u64()? != bytes.len() as u64 {
         return Err(Error::CorruptRecord);
     }
+    let cluster = ClusterId(
+        std::str::from_utf8(input.take(CLUSTER_BYTES)?)
+            .map_err(|_| Error::CorruptRecord)?
+            .to_owned(),
+    );
     let count = input.count(MAX_SHARDS, SHARD_BYTES)?;
     let mut shards = Vec::with_capacity(count);
     for _ in 0..count {
@@ -916,6 +942,7 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
     }
     let image = CheckpointImage {
         version,
+        cluster,
         sequence,
         shards,
     };
@@ -929,7 +956,9 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
 /// include page identity duplication and descriptor parsing during validation.
 /// Live restored index storage has its own page/catalog capacities.
 pub(super) fn recovery_memory(bytes: &[u8], budget: usize) -> Result<usize> {
-    if bytes.len() < HEADER_BYTES + 4 + DIGEST_BYTES || bytes.len() > MAX_CHECKPOINT_BYTES {
+    if bytes.len() < HEADER_BYTES + CLUSTER_BYTES + 4 + DIGEST_BYTES
+        || bytes.len() > MAX_CHECKPOINT_BYTES
+    {
         return Err(Error::CorruptRecord);
     }
     sequence_hint(bytes)?;
@@ -944,6 +973,7 @@ pub(super) fn recovery_memory(bytes: &[u8], budget: usize) -> Result<usize> {
     };
     charge(1, std::mem::size_of::<CheckpointImage>())?;
     let mut input = Decoder(&bytes[HEADER_BYTES..bytes.len() - DIGEST_BYTES]);
+    input.take(CLUSTER_BYTES)?;
     let shards = input.count(MAX_SHARDS, SHARD_BYTES)?;
     charge(shards, std::mem::size_of::<ShardImage>() + 512)?;
     for _ in 0..shards {
@@ -1014,6 +1044,8 @@ fn version_key(version: &ObjectVersion) -> (&str, &[u8; 32], &[u8]) {
 }
 fn validate_image(image: &CheckpointImage) -> Result<()> {
     if image.version != CHECKPOINT_VERSION
+        || image.cluster.0.len() != CLUSTER_BYTES
+        || !racer_crypto::identity::canonical_uuid(&image.cluster.0)
         || image.shards.is_empty()
         || image.shards.len() > MAX_SHARDS
     {
@@ -1269,6 +1301,7 @@ mod budget_tests {
                 segments[0].retained_records = retained;
                 let image = CheckpointImage {
                     version: CHECKPOINT_VERSION,
+                    cluster: crate::store::checkpoint::test_cluster(),
                     sequence: 1,
                     shards: vec![ShardImage {
                         worker: WorkerId(0),

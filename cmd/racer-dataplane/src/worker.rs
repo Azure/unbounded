@@ -302,7 +302,19 @@ impl WorkerGroup {
         self.runtime.start(factory, scope)
     }
     pub fn run(&mut self, factory: &dyn Factory<RequestScope>) -> Result<()> {
-        let scope = lifecycle_scope()?;
+        self.run_with_startup(factory, LIFECYCLE_TIMEOUT)
+    }
+    /// Like `run`, with an explicit budget for service startup only.
+    ///
+    /// Managed startup waits on cluster election and the first publication, so
+    /// it needs more than the fixed lifecycle budget. Services bound their own
+    /// I/O and control turns; teardown keeps the fixed lifecycle budget.
+    pub fn run_with_startup(
+        &mut self,
+        factory: &dyn Factory<RequestScope>,
+        startup: Duration,
+    ) -> Result<()> {
+        let scope = startup_scope(startup)?;
         self.prepare(true)?;
         self.runtime.run(factory, &scope)
     }
@@ -487,11 +499,18 @@ fn log_fatal(stage: &str, error: Error) {
     }
 }
 
+/// Fixed budget for lifecycle phases: standalone startup and every teardown.
+pub(crate) const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn lifecycle_scope() -> Result<RequestScope> {
+    startup_scope(LIFECYCLE_TIMEOUT)
+}
+
+fn startup_scope(budget: Duration) -> Result<RequestScope> {
     Ok(RequestScope {
         body_deadlines: None,
         request: RequestId([0; 16]),
-        deadline: Deadline(uring_runtime::environment::now() + Duration::from_secs(30)),
+        deadline: Deadline(uring_runtime::environment::now() + budget),
         cancellation: Cancellation::new()?,
     })
 }
@@ -2352,6 +2371,7 @@ mod tests {
             fail_io: bool,
             fail_crypto: bool,
             stop_on_poll: bool,
+            start_delay: Duration,
             cpu: usize,
         }
         struct TestIo {
@@ -2409,7 +2429,13 @@ mod tests {
         }
         impl Service<RequestScope> for TestIo {
             fn start<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
+                let ready = Instant::now() + self.factory.start_delay;
                 Box::pin(std::future::poll_fn(move |cx| {
+                    if Instant::now() < ready {
+                        // Models startup waiting on publication; the driver re-polls.
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
                     self.driver = Some(cx.waker().clone());
                     self.factory.event("io-start");
                     Poll::Ready(Ok(()))
@@ -2500,6 +2526,7 @@ mod tests {
                     fail_io: false,
                     fail_crypto: false,
                     stop_on_poll: false,
+                    start_delay: Duration::ZERO,
                     cpu,
                 },
             )
@@ -2636,6 +2663,31 @@ mod tests {
             assert_eq!(current_cpus().unwrap(), before);
             assert_eq!(group.runtime.stats().done, 2);
             assert!(factory.events.lock().unwrap().contains(&"crypto-shutdown"));
+        }
+
+        #[test]
+        fn startup_budget_outlives_lifecycle_and_still_bounds_startup() {
+            assert!(crate::worker::LIFECYCLE_TIMEOUT == Duration::from_secs(30));
+            for (budget, expected) in [
+                (Duration::from_millis(50), Err(Error::DeadlineExceeded)),
+                (Duration::from_secs(3600), Err(Error::Cancelled)),
+            ] {
+                let (group, mut factory) = fixture(2);
+                let plan = AffinityPlan {
+                    pairs: group.plan.pairs.clone(),
+                    max_threads: 2,
+                };
+                factory.stop_on_poll = true;
+                factory.start_delay = Duration::from_millis(300);
+                let mut group = WorkerGroup::new(plan);
+                let scope = startup_scope(budget).unwrap();
+                let result = group.run_inner(&factory, &scope, false);
+                // A long budget reaches steady state (which this fixture stops);
+                // a short one fails startup. Both fully join every service.
+                assert_eq!(result, expected);
+                assert_eq!(group.runtime.stats().done, 2);
+                assert!(factory.events.lock().unwrap().contains(&"crypto-shutdown"));
+            }
         }
 
         #[test]

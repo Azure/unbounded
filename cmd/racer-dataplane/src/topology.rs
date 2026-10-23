@@ -952,7 +952,7 @@ pub(crate) mod tests {
         fn wire_member_adapter_preserves_publication_fields_at_validation() {
             let publication = racer_control_wire::decode_publication(include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/../../internal/racer/wire/testdata/publication.json"
+                "/control-wire/testdata/publication.json"
             )))
             .unwrap();
             let membership = Membership::validate(
