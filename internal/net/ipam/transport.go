@@ -64,9 +64,13 @@ func writeMessage(conn net.Conn, message proto.Message) error {
 		return errors.New("IPAM message exceeds maximum size")
 	}
 
-	_, err := protodelim.MarshalTo(conn, message)
+	// An empty payload must not trigger a second socket write after the frame header.
+	writer := bufio.NewWriter(conn)
+	if _, err := protodelim.MarshalTo(writer, message); err != nil {
+		return err
+	}
 
-	return err
+	return writer.Flush()
 }
 
 func GetConfig(ctx context.Context, path string) (*ipamproto.Config, error) {
