@@ -1100,7 +1100,9 @@ pub mod flight {
         }
 
         /// One attached caller's policy, acquisition eligibility, and notification state.
-        pub struct Waiter<W: WaiterPolicy> {
+        /// `T` is the wake target: a [`Waker`] in production, or a plain token for
+        /// sans-IO drivers such as the simulator.
+        pub struct Waiter<W: WaiterPolicy, T = Waker> {
             /// Caller-owned policy facts, available through dereferencing as well.
             policy: W,
 
@@ -1117,10 +1119,10 @@ pub mod flight {
             pub error: Option<W::Error>,
 
             /// Latest wake target, taken once when notification is enqueued.
-            pub waker: Option<Waker>,
+            pub waker: Option<T>,
         }
 
-        impl<W: WaiterPolicy> Deref for Waiter<W> {
+        impl<W: WaiterPolicy, T> Deref for Waiter<W, T> {
             type Target = W;
 
             /// Read the caller-owned policy facts.
@@ -1129,14 +1131,14 @@ pub mod flight {
             }
         }
 
-        impl<W: WaiterPolicy> DerefMut for Waiter<W> {
+        impl<W: WaiterPolicy, T> DerefMut for Waiter<W, T> {
             /// Update caller-owned policy facts without replacing waiter state.
             fn deref_mut(&mut self) -> &mut W {
                 &mut self.policy
             }
         }
 
-        impl<W: WaiterPolicy> Waiter<W> {
+        impl<W: WaiterPolicy, T> Waiter<W, T> {
             /// Whether an unissued acquisition opportunity remains usable.
             fn eligible(&self) -> bool {
                 self.acquisition && !self.issued && self.error.is_none()
@@ -1184,7 +1186,7 @@ pub mod flight {
 
         /// Worker-local waiter index and transition state driven by an owning adapter.
         /// The adapter supplies actual operation idleness; cancellation is not idleness.
-        pub struct State<C, P, O, W: WaiterPolicy> {
+        pub struct State<C, P, O, W: WaiterPolicy, T = Waker> {
             /// Current acquisition or settlement phase.
             pub phase: Phase<C, O, W::Error>,
 
@@ -1192,7 +1194,7 @@ pub mod flight {
             pub leader: Option<u64>,
 
             /// Attached callers indexed by monotonic waiter identifier.
-            pub waiters: BTreeMap<u64, Waiter<W>>,
+            pub waiters: BTreeMap<u64, Waiter<W, T>>,
 
             /// Deadline index used for bounded expiration work.
             pub deadlines: BTreeMap<(Instant, u64), ()>,
@@ -1206,7 +1208,7 @@ pub mod flight {
             local: std::marker::PhantomData<std::rc::Rc<()>>,
         }
 
-        impl<C, P, O, W: WaiterPolicy> Default for State<C, P, O, W> {
+        impl<C, P, O, W: WaiterPolicy, T> Default for State<C, P, O, W, T> {
             /// Start without callers or a retained attempt, ready for initial election.
             fn default() -> Self {
                 Self {
@@ -1221,7 +1223,7 @@ pub mod flight {
             }
         }
 
-        impl<C, P, O, W: WaiterPolicy> State<C, P, O, W> {
+        impl<C, P, O, W: WaiterPolicy, T> State<C, P, O, W, T> {
             /// Attach a caller using an identifier allocated by the owning table.
             pub fn register(&mut self, id: u64, policy: W, acquisition: bool, complete: bool) {
                 self.deadlines.insert((policy.deadline(), id), ());
@@ -1277,7 +1279,7 @@ pub mod flight {
             }
 
             /// Enqueue all parked caller notifications without invoking their wakers.
-            pub fn notify(&mut self, wakes: &mut Vec<Waker>) {
+            pub fn notify(&mut self, wakes: &mut Vec<T>) {
                 for waiter in self.waiters.values_mut() {
                     if let Some(waker) = waiter.waker.take() {
                         wakes.push(waker);
@@ -1286,7 +1288,7 @@ pub mod flight {
             }
 
             /// Check one caller in round-robin order without scanning the waiter map.
-            pub fn sweep_waiter(&mut self, wakes: &mut Vec<Waker>) {
+            pub fn sweep_waiter(&mut self, wakes: &mut Vec<T>) {
                 if let Some((id, _)) = self.cursor.next(&self.waiters) {
                     self.refresh_waiter(id, wakes);
                 }
@@ -1328,7 +1330,7 @@ pub mod flight {
                 idle: bool,
                 unavailable: W::Error,
                 split: fn(O) -> Published<C, P>,
-                wakes: &mut Vec<Waker>,
+                wakes: &mut Vec<T>,
             ) {
                 if !idle || !matches!(self.phase, Phase::Draining(_)) {
                     return;
@@ -1365,7 +1367,7 @@ pub mod flight {
             }
 
             /// Revoke acquisition immediately, retaining its outcome behind completion.
-            pub fn revoke(&mut self, error: W::Error, wakes: &mut Vec<Waker>) {
+            pub fn revoke(&mut self, error: W::Error, wakes: &mut Vec<T>) {
                 if let Some(waiter) = self.leader.and_then(|id| self.waiters.get_mut(&id)) {
                     waiter.error = Some(error);
                 }
@@ -1381,7 +1383,7 @@ pub mod flight {
                 canceled: W::Error,
                 now: impl Fn() -> Instant,
                 split: fn(O) -> Published<C, P>,
-                wakes: &mut Vec<Waker>,
+                wakes: &mut Vec<T>,
             ) {
                 if let Some(id) = self.leader {
                     self.refresh_waiter(id, wakes);
@@ -1405,7 +1407,7 @@ pub mod flight {
             }
 
             /// Detach and notify all callers while preserving the operation drain fence.
-            pub fn stop(&mut self, error: W::Error, wakes: &mut Vec<Waker>) {
+            pub fn stop(&mut self, error: W::Error, wakes: &mut Vec<T>) {
                 for waiter in self.waiters.values_mut() {
                     waiter.error = Some(error);
                 }
@@ -1416,7 +1418,7 @@ pub mod flight {
             }
 
             /// Check one caller and enqueue its wake if its policy has failed.
-            fn refresh_waiter(&mut self, id: u64, wakes: &mut Vec<Waker>) {
+            fn refresh_waiter(&mut self, id: u64, wakes: &mut Vec<T>) {
                 let Some(waiter) = self.waiters.get_mut(&id) else {
                     return;
                 };
@@ -1432,7 +1434,7 @@ pub mod flight {
             }
 
             /// Consume at most 64 due deadline entries, independently of leader checks.
-            fn refresh_expired(&mut self, now: &impl Fn() -> Instant, wakes: &mut Vec<Waker>) {
+            fn refresh_expired(&mut self, now: &impl Fn() -> Instant, wakes: &mut Vec<T>) {
                 for _ in 0..64 {
                     let Some((&(deadline, id), _)) = self.deadlines.first_key_value() else {
                         break;
