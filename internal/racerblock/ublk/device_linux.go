@@ -7,6 +7,8 @@ package ublk
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -32,6 +34,10 @@ type Device struct {
 	cfg     Config
 	handler Handler
 	id      int
+
+	// cookie is the random ublksrv_flags value this Device's ADD_DEV
+	// set. It tells our device apart from one that reused the id.
+	cookie uint64
 
 	ctrl   *ctrl
 	charFd int
@@ -96,7 +102,12 @@ func Start(ctx context.Context, cfg Config, h Handler) (*Device, error) {
 		return nil, err
 	}
 
-	id, err := c.addDev(cfg.ID, cfg)
+	cookie, err := newCookie()
+	if err != nil {
+		return nil, errors.Join(err, c.close())
+	}
+
+	id, err := c.addDev(cfg.ID, cfg, cookie)
 	if err != nil {
 		return nil, errors.Join(err, c.close())
 	}
@@ -105,6 +116,7 @@ func Start(ctx context.Context, cfg Config, h Handler) (*Device, error) {
 		cfg:     cfg,
 		handler: h,
 		id:      id,
+		cookie:  cookie,
 		ctrl:    c,
 		charFd:  -1,
 		done:    make(chan struct{}),
@@ -132,10 +144,10 @@ func Start(ctx context.Context, cfg Config, h Handler) (*Device, error) {
 }
 
 // errUnpinnedLeft marks a device that startup added but whose char device
-// it never opened. Without that open nothing stops another process from
+// it never opened, or opened but could not verify as its own. Without that open nothing stops another process from
 // deleting the id and adding a new device under it, so teardown sends no
 // command by id and leaves the device for manual cleanup.
-var errUnpinnedLeft = errors.New("ublk: device left in place because its char device was never opened; " +
+var errUnpinnedLeft = errors.New("ublk: device left in place because startup never pinned and verified its char device; " +
 	"verify it is ours before deleting it")
 
 // abortStart tears down a device whose startup failed and returns err.
@@ -235,6 +247,10 @@ var testHooks struct {
 	beforeStop func(d *Device)
 	// pinnedDelPause replaces the pause before a pinned DEL_DEV cancel.
 	pinnedDelPause func(round int)
+	// openChar replaces opening the char device in start.
+	openChar func(path string) (int, error)
+	// devCookie replaces the GET_DEV_INFO cookie query in start.
+	devCookie func(id int) (uint64, error)
 	// ctrlSent observes every control command before it is sent.
 	ctrlSent func(op, devID uint32)
 	// pinnedDelDone runs in teardown after a pinned DEL_DEV returns and
@@ -269,18 +285,22 @@ func (d *Device) launchQueues() error {
 }
 
 func (d *Device) start() error {
+	open, query := openWhenPresent, d.ctrl.devCookie
+	if testHooks.openChar != nil {
+		open = testHooks.openChar
+	}
+
+	if testHooks.devCookie != nil {
+		query = testHooks.devCookie
+	}
+
+	if err := d.pinOwned(open, query); err != nil {
+		return err
+	}
+
 	if err := d.ctrl.setParams(d.id, d.cfg); err != nil {
 		return err
 	}
-
-	charPath := "/dev/ublkc" + strconv.Itoa(d.id)
-
-	fd, err := openWhenPresent(charPath)
-	if err != nil {
-		return err
-	}
-
-	d.charFd = fd
 
 	for i := range d.cfg.Queues {
 		q, err := newQueue(d, i)
@@ -316,6 +336,50 @@ func (d *Device) start() error {
 	}
 
 	return waitForNode(d.Path())
+}
+
+// newCookie returns a random nonzero device cookie. It identifies a
+// device across concurrent lifecycle races; it is not a defense against
+// another root process that copies it.
+func newCookie() (uint64, error) {
+	var b [8]byte
+
+	for {
+		if _, err := rand.Read(b[:]); err != nil {
+			return 0, fmt.Errorf("ublk: device cookie: %w", err)
+		}
+
+		if v := binary.LittleEndian.Uint64(b[:]); v != 0 {
+			return v, nil
+		}
+	}
+}
+
+// pinOwned opens the char device, which keeps the id from being freed and
+// reused, then checks through query that the device holding the id is
+// the one this Device added. Another process may have deleted ours and
+// added a new device under the id before the open. Only after a match is
+// charFd set, so no command by id is sent unless the pinned device is
+// ours; on any failure the fd is closed.
+func (d *Device) pinOwned(open func(string) (int, error), query func(int) (uint64, error)) error {
+	fd, err := open("/dev/ublkc" + strconv.Itoa(d.id))
+	if err != nil {
+		return err
+	}
+
+	got, err := query(d.id)
+	if err == nil && got != d.cookie {
+		err = fmt.Errorf("ublk: device %d is not the one this process added (cookie %#x, want %#x)",
+			d.id, got, d.cookie)
+	}
+
+	if err != nil {
+		return errors.Join(fmt.Errorf("ublk: verify device %d: %w", d.id, err), unix.Close(fd))
+	}
+
+	d.charFd = fd
+
+	return nil
 }
 
 func openWhenPresent(path string) (int, error) {

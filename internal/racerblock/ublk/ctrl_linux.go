@@ -193,8 +193,11 @@ func resErr(name string, res int32) error {
 	return fmt.Errorf("ublk: %s: %w", name, syscall.Errno(-res))
 }
 
-func (c *ctrl) addDev(id int, cfg Config) (int, error) {
+// addDev adds a device tagged with cookie in ublksrv_flags, a field the
+// driver stores and returns from GET_DEV_INFO but never interprets.
+func (c *ctrl) addDev(id int, cfg Config, cookie uint64) (int, error) {
 	info := ctrlDevInfo{
+		UblksrvFlags:  cookie,
 		NrHwQueues:    uint16(cfg.Queues),
 		QueueDepth:    uint16(cfg.Depth),
 		MaxIOBufBytes: uint32(cfg.MaxIOBytes),
@@ -214,6 +217,22 @@ func (c *ctrl) addDev(id int, cfg Config) (int, error) {
 	}
 
 	return int(info.DevID), nil
+}
+
+// devCookie returns the ublksrv_flags of device id, as set by addDev.
+func (c *ctrl) devCookie(id int) (uint64, error) {
+	var info ctrlDevInfo
+
+	res, err := c.doPayload(uCmdGetDevInfo, uint32(id), 0, nil, structBytes(&info))
+	if err != nil {
+		return 0, err
+	}
+
+	if err := resErr("GET_DEV_INFO", res); err != nil {
+		return 0, err
+	}
+
+	return info.UblksrvFlags, nil
 }
 
 func (c *ctrl) setParams(id int, cfg Config) error {
