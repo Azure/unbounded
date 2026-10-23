@@ -67,6 +67,24 @@ func runLateStop(t *testing.T, setStop func(q *queue)) []error {
 func TestServeErrorRecordedWhenCloseWinsAfterServe(t *testing.T) {
 	var q0 *queue
 
+	// Closing alone leaves the queue unstopped, so run rescues it until
+	// teardown's STOP_DEV lands. Simulate that STOP once the rescue has
+	// answered its first sweep.
+	rescued := false
+	testHooks.rescued = func(q *queue) {
+		rescued = true
+
+		q.stop()
+	}
+
+	t.Cleanup(func() { testHooks.rescued = nil })
+
+	defer func() {
+		if !rescued {
+			t.Error("queue was not rescued during teardown")
+		}
+	}()
+
 	stops := runLateStop(t, func(q *queue) {
 		q0 = q
 		q.dev.closing.Store(true)
@@ -108,10 +126,14 @@ func TestServeErrorHoldDecidedBeforeTeardown(t *testing.T) {
 
 	testHooks.serveEIO = func(*queue) error { return errors.New("forced broken ring") }
 	testHooks.failedRingClose = func(_ *queue, reason string) { reasons = append(reasons, reason) }
+	// The held queue rescues its requests until teardown stops it.
+	// Simulate the STOP that teardown sends once the rescue is serving.
+	testHooks.rescued = func(q *queue) { q.stop() }
 
 	t.Cleanup(func() {
 		testHooks.serveEIO = nil
 		testHooks.failedRingClose = nil
+		testHooks.rescued = nil
 	})
 
 	ready := make(chan error, 1)
