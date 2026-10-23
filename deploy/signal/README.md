@@ -77,13 +77,14 @@ The referenced WorkflowTemplate must accept these string parameters:
 | `tolerations` | JSON-encoded toleration list |
 | `script-environment` | JSON-encoded, validated environment map |
 | `workload-policy` | JSON-encoded immutable participant-container resources, security context, and bounded volume policy |
-| `mpi-payload-mode` | Optional operator-defined execution mode |
-| `expected-gpu-product-regex` | Optional operator policy |
-| `expected-gpu-count` | Optional operator policy |
-| `observed-gpu-capacity` | Capacity copied from the admitted Node |
-| `observed-gpu-allocatable` | Allocatable count copied from the admitted Node |
-| `gpu-resource-count` | Optional operator policy |
-| `privileged` | Optional operator policy |
+| `backend-evidence-bytes` | Per-check evidence output bound, at most 64 KiB |
+| `mpi-payload-mode` | Compatibility input for operator-defined templates |
+| `expected-gpu-product-regex` | Compatibility input for operator-defined templates |
+| `expected-gpu-count` | Compatibility input for operator-defined templates |
+| `observed-gpu-capacity` | Compatibility input copied from admitted Node inventory |
+| `observed-gpu-allocatable` | Compatibility input copied from admitted Node inventory |
+| `gpu-resource-count` | GPU count, defaults to `0` for Pod diagnostics; must be positive for MPIJobs |
+| `privileged` | Explicit boolean, defaults to `false` |
 | `attempt` | One-based attempt number |
 
 The Workflow must publish only these output parameters:
@@ -100,11 +101,12 @@ Unexpected, duplicate, malformed, or oversized outputs are rejected and the
 run remains fail-closed. Each `backend-resources` entry must contain
 `apiVersion`, `kind`, `name`, `uid`, and the zero-based `participantIndexes`
 that the workload executed. `namespace` is optional. A multi-Node successful
-result must cover every admitted participant. The controller prefers present
-top-level Workflow outputs. When Argo leaves those outputs absent, it accepts
-outputs only from the unique Workflow entrypoint node whose name exactly
-matches the Workflow name; missing, malformed, duplicate, or ambiguous
-entrypoint identity and outputs fail closed.
+result must cover every admitted participant. The controller reads outputs only
+from each check's unique deterministic DAG task node. Missing, malformed,
+duplicate, or ambiguous task identity and outputs fail closed. Operator script
+parameters, including GPU expectations and observed inventory, are carried in
+`script-environment`. Their existing individual compatibility inputs remain
+available to external templates; the supplied adapter uses the environment.
 
 Before foreground deletion, the adapter captures and writes a typed v1
 projection for every participant backend to the Argo output path. The
@@ -120,7 +122,7 @@ secret-like assignments, URL user information, private-key blocks, and complete
 result-marker payloads. Object reason and message fields are also bounded. If a
 required object or current log cannot be captured, a restarted container's
 previous log is unavailable, or the projection must omit content to fit the
-256 KiB output limit, `complete` is false and the run cannot pass. Capture and
+configured per-check output limit (at most 64 KiB), `complete` is false and the run cannot pass. Capture and
 cleanup failures remain explicit, while an earlier backend execution failure
 continues to be the causal result reason.
 
@@ -131,6 +133,23 @@ outputs as Inconclusive; the backend cause remains unknown rather than being
 inferred. A termination after the write may leave the evidence file available
 to Argo, but collection still depends on the Workflow executor surviving long
 enough to publish output parameters.
+
+The controller cross-checks typed backend evidence against the declared backend,
+namespace, exact workload UID, participant coverage, and required Pod/container
+and current/previous log records. A template's `complete: true` alone is not
+sufficient. Log collection requests the latest 64 lines, retains at most 64 KiB
+for result parsing, and projects redacted tails of at most 512 bytes into evidence.
+Earlier log content is intentionally outside this bounded result contract.
+
+After durable terminal evidence is recorded, the controller foreground-deletes
+the Workflow and waits for owned backend descendants to be removed before
+releasing Node reservations. This also covers adapter crashes, cancellation,
+and a controller crash between Workflow creation and status persistence.
+The six-hour Workflow TTL is a fallback, not the normal evidence-retention
+mechanism; immutable terminal evidence remains available after Workflow cleanup.
+The controller's namespace-scoped backend patch/delete and owner-finalizer
+permissions allow Kubernetes' owner-reference admission checks to authorize
+blocking deletion fences. It does not receive backend workload creation rights.
 
 ## Multi-Node execution
 
@@ -425,6 +444,9 @@ Controller-owned labels:
 Pending, testing, failed, and inconclusive states use
 `eligibility=blocked`. A successful run projects `passed/production`. Older
 runs cannot overwrite a newer terminal projection.
+Projection and request clearing also require the current reservation to name
+the same Run, so historical Runs cannot overwrite a newer pending/testing run
+or consume its request. Completed finalizer cleanup is not replayed.
 
 ## Operations
 

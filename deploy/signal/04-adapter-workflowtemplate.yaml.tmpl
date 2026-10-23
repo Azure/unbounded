@@ -26,6 +26,8 @@ spec:
           - name: tolerations
           - name: script-environment
           - name: workload-policy
+          - name: backend-evidence-bytes
+            default: "65536"
           - name: mpi-payload-mode
           - name: expected-gpu-product-regex
           - name: expected-gpu-count
@@ -75,6 +77,8 @@ spec:
           - "{{`{{inputs.parameters.script-environment}}`}}"
           - --workload-policy
           - "{{`{{inputs.parameters.workload-policy}}`}}"
+          - --backend-evidence-bytes
+          - "{{`{{inputs.parameters.backend-evidence-bytes}}`}}"
           - --gpu-resource-count
           - "{{`{{inputs.parameters.gpu-resource-count}}`}}"
           - "--privileged={{`{{inputs.parameters.privileged}}`}}"

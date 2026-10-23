@@ -202,7 +202,7 @@ func (r *Runner) Execute(ctx context.Context, config Config) (output AggregateOu
 		recordEvidenceCaptureFailure(&output)
 	}
 
-	if err := r.persistEvidenceBeforeCleanup(&output); err != nil {
+	if err := r.persistEvidenceBeforeCleanup(&output, config.BackendEvidenceBytes); err != nil {
 		return AggregateOutput{}, err
 	}
 
@@ -220,7 +220,7 @@ func (r *Runner) Execute(ctx context.Context, config Config) (output AggregateOu
 	return output, nil
 }
 
-func (r *Runner) persistEvidenceBeforeCleanup(output *AggregateOutput) error {
+func (r *Runner) persistEvidenceBeforeCleanup(output *AggregateOutput, limit int) error {
 	if r.PersistBackendEvidence == nil {
 		return nil
 	}
@@ -231,6 +231,7 @@ func (r *Runner) persistEvidenceBeforeCleanup(output *AggregateOutput) error {
 		output.BackendEvidence, markErr = markBackendEvidenceIncomplete(
 			output.BackendEvidence,
 			"persist backend evidence before cleanup: "+err.Error(),
+			limit,
 		)
 		if markErr != nil {
 			return markErr
@@ -570,14 +571,18 @@ func (r *Runner) readPodLog(
 		return r.ReadPodLog(ctx, namespace, podName, containerName, previous)
 	}
 
+	tailLines := int64(64)
+
 	stream, err := r.Kubernetes.CoreV1().Pods(namespace).
-		GetLogs(podName, &corev1.PodLogOptions{Container: containerName, Previous: previous}).
+		GetLogs(podName, &corev1.PodLogOptions{Container: containerName, Previous: previous, TailLines: &tailLines}).
 		Stream(ctx)
 	if err != nil {
 		return "", fmt.Errorf("open result log: %w", err)
 	}
 
-	content, err := io.ReadAll(io.LimitReader(stream, maxResultLogBytes+1))
+	tail := &resultLogTail{}
+
+	_, err = io.Copy(tail, stream)
 	if err != nil {
 		closeErr := stream.Close()
 		if closeErr != nil {
@@ -594,11 +599,28 @@ func (r *Runner) readPodLog(
 		return "", fmt.Errorf("close result log: %w", err)
 	}
 
-	if len(content) > maxResultLogBytes {
-		return "", fmt.Errorf("result log exceeds %d bytes", maxResultLogBytes)
+	return string(tail.content), nil
+}
+
+type resultLogTail struct {
+	content []byte
+}
+
+func (tail *resultLogTail) Write(content []byte) (int, error) {
+	count := len(content)
+	if len(content) >= maxResultLogBytes {
+		tail.content = append(tail.content[:0], content[len(content)-maxResultLogBytes:]...)
+
+		return count, nil
 	}
 
-	return string(content), nil
+	if excess := len(tail.content) + len(content) - maxResultLogBytes; excess > 0 {
+		tail.content = tail.content[excess:]
+	}
+
+	tail.content = append(tail.content, content...)
+
+	return count, nil
 }
 
 func resultLogSourceWithContent(content string, err error) resultLogSource {

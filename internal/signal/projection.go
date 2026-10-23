@@ -39,11 +39,14 @@ const (
 func projectPending(
 	ctx context.Context,
 	kube client.Client,
-	participants []signalv1.Participant,
-	profile signalv1.PinnedProfile,
+	run *signalv1.CertificationRun,
 ) error {
-	return projectParticipants(ctx, kube, participants, func(node *corev1.Node) error {
-		setProfileProjection(node, profile)
+	return projectParticipants(ctx, kube, run.Spec.Participants, func(node *corev1.Node) error {
+		if node.Annotations[ReservationLabel] != run.Name {
+			return nil
+		}
+
+		setProfileProjection(node, run.Spec.Profile)
 		node.Labels[StateLabel] = "pending"
 		node.Labels[EligibilityLabel] = "blocked"
 
@@ -53,6 +56,10 @@ func projectPending(
 
 func projectTesting(ctx context.Context, kube client.Client, run *signalv1.CertificationRun) error {
 	return projectParticipants(ctx, kube, run.Spec.Participants, func(node *corev1.Node) error {
+		if node.Annotations[ReservationLabel] != run.Name {
+			return nil
+		}
+
 		setProfileProjection(node, run.Spec.Profile)
 		node.Labels[StateLabel] = "testing"
 		node.Labels[EligibilityLabel] = "blocked"
@@ -69,6 +76,10 @@ func projectTerminal(ctx context.Context, kube client.Client, run *signalv1.Cert
 	finishedAt := run.Status.FinishedAt.UTC().Format(time.RFC3339)
 
 	return projectParticipants(ctx, kube, run.Spec.Participants, func(node *corev1.Node) error {
+		if node.Annotations[ReservationLabel] != run.Name {
+			return nil
+		}
+
 		if projectionTimeAfter(node.Annotations[LastRunAtAnnotation], run.Status.FinishedAt.Time) {
 			return nil
 		}
@@ -140,7 +151,7 @@ func projectParticipants(
 				return err
 			}
 
-			return kube.Patch(ctx, &node, client.MergeFrom(before))
+			return kube.Patch(ctx, &node, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 		}); err != nil {
 			return fmt.Errorf("project Node %s status: %w", participant.NodeName, err)
 		}

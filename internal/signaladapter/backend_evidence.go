@@ -143,7 +143,7 @@ func (r *Runner) captureBackendEvidence(
 		evidence.Complete = evidence.Complete && complete
 	}
 
-	content, complete, err := marshalBackendEvidence(evidence)
+	content, complete, err := marshalBackendEvidence(evidence, config.BackendEvidenceBytes)
 	if err != nil {
 		return "", false, err
 	}
@@ -151,13 +151,21 @@ func (r *Runner) captureBackendEvidence(
 	return string(content), complete, nil
 }
 
-func marshalBackendEvidence(evidence BackendEvidence) ([]byte, bool, error) {
+func marshalBackendEvidence(evidence BackendEvidence, limit int) ([]byte, bool, error) {
+	if limit == 0 {
+		limit = MaxBackendEvidenceBytes
+	}
+
+	if limit < 1 || limit > MaxBackendEvidenceBytes {
+		return nil, false, fmt.Errorf("backend evidence limit must be between 1 and %d bytes", MaxBackendEvidenceBytes)
+	}
+
 	content, err := json.Marshal(evidence)
 	if err != nil {
 		return nil, false, fmt.Errorf("encode backend evidence: %w", err)
 	}
 
-	if len(content) <= MaxBackendEvidenceBytes {
+	if len(content) <= limit {
 		return content, evidence.Complete, nil
 	}
 
@@ -181,7 +189,7 @@ func marshalBackendEvidence(evidence BackendEvidence) ([]byte, bool, error) {
 		return nil, false, fmt.Errorf("encode bounded backend evidence: %w", err)
 	}
 
-	if len(content) <= MaxBackendEvidenceBytes {
+	if len(content) <= limit {
 		return content, false, nil
 	}
 
@@ -204,8 +212,8 @@ func marshalBackendEvidence(evidence BackendEvidence) ([]byte, bool, error) {
 		return nil, false, fmt.Errorf("encode reduced backend evidence: %w", err)
 	}
 
-	if len(content) > MaxBackendEvidenceBytes {
-		return nil, false, fmt.Errorf("reduced backend evidence exceeds %d bytes", MaxBackendEvidenceBytes)
+	if len(content) > limit {
+		return nil, false, fmt.Errorf("reduced backend evidence exceeds %d bytes", limit)
 	}
 
 	return content, false, nil
@@ -222,7 +230,7 @@ func omitLogContent(logEvidence *CapturedLogEvidence) {
 	logEvidence.Error = "content omitted because backend evidence exceeded the size limit"
 }
 
-func markBackendEvidenceIncomplete(content, captureError string) (string, error) {
+func markBackendEvidenceIncomplete(content, captureError string, limit int) (string, error) {
 	var evidence BackendEvidence
 
 	if err := json.Unmarshal([]byte(content), &evidence); err != nil {
@@ -232,7 +240,7 @@ func markBackendEvidenceIncomplete(content, captureError string) (string, error)
 	evidence.Complete = false
 	evidence.CaptureError = boundedRedactedText(captureError, maxEvidenceTextBytes)
 
-	bounded, _, err := marshalBackendEvidence(evidence)
+	bounded, _, err := marshalBackendEvidence(evidence, limit)
 	if err != nil {
 		return "", err
 	}
@@ -262,6 +270,9 @@ func (r *Runner) captureParticipantEvidence(
 	if err != nil {
 		participant.CaptureError = boundedRedactedText("get backend object: "+err.Error(), maxEvidenceTextBytes)
 		complete = false
+	} else if object.GetUID() != backend.resource.GetUID() {
+		participant.CaptureError = "backend object UID changed before evidence capture"
+		complete = false
 	} else {
 		projected, projectErr := projectBackendObject(object)
 		if projectErr != nil {
@@ -281,6 +292,12 @@ func (r *Runner) captureParticipantEvidence(
 			Get(ctx, backend.resource.GetName(), metav1.GetOptions{})
 		if podErr != nil {
 			participant.CaptureError = joinCaptureError(participant.CaptureError, "get participant Pod: "+podErr.Error())
+
+			return participant, false
+		}
+
+		if pod.UID != backend.resource.GetUID() {
+			participant.CaptureError = joinCaptureError(participant.CaptureError, "participant Pod UID changed before evidence capture")
 
 			return participant, false
 		}
@@ -602,7 +619,9 @@ func capturedLog(content string, err error) CapturedLogEvidence {
 
 func redactLog(content string) string {
 	lines := strings.Split(content, "\n")
-	inPrivateKey := false
+	begin := strings.Index(content, "BEGIN ")
+	end := strings.Index(content, "END ")
+	inPrivateKey := end >= 0 && (begin < 0 || end < begin) && strings.Contains(content[end:], "PRIVATE KEY")
 
 	for index, line := range lines {
 		if strings.Contains(line, "BEGIN ") && strings.Contains(line, "PRIVATE KEY") {

@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +40,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/recorder"
 
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
+	"github.com/Azure/unbounded/internal/signaladapter"
 	"github.com/Azure/unbounded/internal/signalworkload"
 )
 
@@ -75,7 +77,7 @@ var reservedScriptEnvironmentNames = map[string]struct{}{
 
 var workflowOutputLimits = map[string]int{
 	"backend-resources": 16 * 1024,
-	"backend-evidence":  256 * 1024,
+	"backend-evidence":  signaladapter.MaxBackendEvidenceBytes,
 	"cleanup-failure":   64,
 	"measurements":      16 * 1024,
 	"reason":            4 * 1024,
@@ -105,13 +107,11 @@ type AdmissionReconciler struct {
 
 type RunReconciler struct {
 	client.Client
-	APIReader          client.Reader
-	Namespace          string
-	Evidence           EvidenceStore
-	Now                func() time.Time
-	MaxConcurrentRuns  int
-	WorkflowAPIVersion string
-	Recorder           recorder.EventRecorder
+	APIReader         client.Reader
+	Evidence          EvidenceStore
+	Now               func() time.Time
+	MaxConcurrentRuns int
+	Recorder          recorder.EventRecorder
 }
 
 func (r *AdmissionReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -155,27 +155,9 @@ func (r *AdmissionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 }
 
 func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, profileName string) error {
-	return r.admitNodeWithTrigger(ctx, node, profileName, "manual")
-}
-
-func (r *AdmissionReconciler) admitNodeWithTrigger(
-	ctx context.Context,
-	node *corev1.Node,
-	profileName string,
-	trigger string,
-) error {
 	r.admissionMu.Lock()
 	defer r.admissionMu.Unlock()
 
-	return r.admitNodeWithTriggerLocked(ctx, node, profileName, trigger)
-}
-
-func (r *AdmissionReconciler) admitNodeWithTriggerLocked(
-	ctx context.Context,
-	node *corev1.Node,
-	profileName string,
-	trigger string,
-) error {
 	if runName := node.Annotations[ReservationLabel]; runName != "" {
 		var run signalv1.CertificationRun
 
@@ -271,6 +253,20 @@ func (r *AdmissionReconciler) admitNodeWithTriggerLocked(
 		return err
 	}
 
+	for index := range checks {
+		if _, _, err := participantsForCheck(participants, checks[index].ParticipantPolicy); err != nil {
+			return fmt.Errorf("check %s participants: %w", checks[index].ID, err)
+		}
+
+		if _, err := signalworkload.Encode(checks[index].WorkloadPolicy); err != nil {
+			return fmt.Errorf("check %s workload policy: %w", checks[index].ID, err)
+		}
+
+		if _, _, err := adapterParameterValues(checks[index].Parameters, checks[index].Backend.Kind); err != nil {
+			return fmt.Errorf("check %s parameters: %w", checks[index].ID, err)
+		}
+	}
+
 	runName := runName(node.Name, profile.Name, r.now())
 	if err := r.reserveParticipants(ctx, participants, runName); err != nil {
 		return err
@@ -326,7 +322,7 @@ func (r *AdmissionReconciler) admitNodeWithTriggerLocked(
 				RunProfileLabel: profile.Name,
 			},
 			Annotations: map[string]string{
-				RunTriggerAnnotation: trigger,
+				RunTriggerAnnotation: "manual",
 			},
 			Finalizers: []string{RunFinalizer},
 		},
@@ -349,6 +345,12 @@ func (r *AdmissionReconciler) admitNodeWithTriggerLocked(
 			RequestNodeName:     node.Name,
 		},
 	}
+	if _, err := buildWorkflow(run, 1); err != nil {
+		deleteErr := r.Delete(context.WithoutCancel(ctx), snapshot)
+
+		return errors.Join(fmt.Errorf("validate executable plan: %w", err), client.IgnoreNotFound(deleteErr))
+	}
+
 	if err := r.Create(ctx, run); err != nil {
 		deleteErr := r.Delete(context.WithoutCancel(ctx), snapshot)
 
@@ -356,16 +358,11 @@ func (r *AdmissionReconciler) admitNodeWithTriggerLocked(
 	}
 
 	cleanupFailedAdmission := func(cause error) error {
+		releaseOnFailure = false
 		deleteRunErr := r.Delete(context.WithoutCancel(ctx), run)
-		if deleteRunErr != nil && !apierrors.IsNotFound(deleteRunErr) {
-			// Keep the reservation if the run could not be made inert. This
-			// prevents another admission from overlapping the surviving run.
-			releaseOnFailure = false
-		}
 
-		deleteSnapshotErr := r.Delete(context.WithoutCancel(ctx), snapshot)
-
-		return errors.Join(cause, client.IgnoreNotFound(deleteRunErr), client.IgnoreNotFound(deleteSnapshotErr))
+		// The Run finalizer owns rollback once the Run exists, including its snapshot.
+		return errors.Join(cause, client.IgnoreNotFound(deleteRunErr))
 	}
 
 	snapshot.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(run, signalv1.GroupVersion.WithKind("CertificationRun"))}
@@ -373,7 +370,7 @@ func (r *AdmissionReconciler) admitNodeWithTriggerLocked(
 		return cleanupFailedAdmission(fmt.Errorf("bind script snapshot to run: %w", err))
 	}
 
-	if err := projectPending(ctx, r.Client, participants, run.Spec.Profile); err != nil {
+	if err := projectPending(ctx, r.Client, run); err != nil {
 		return cleanupFailedAdmission(fmt.Errorf("project pending certification state: %w", err))
 	}
 
@@ -941,7 +938,7 @@ func (r *AdmissionReconciler) releaseParticipants(ctx context.Context, participa
 		before := node.DeepCopy()
 		delete(node.Annotations, ReservationLabel)
 
-		if err := r.Patch(ctx, &node, client.MergeFrom(before)); err != nil {
+		if err := r.Patch(ctx, &node, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -1041,6 +1038,10 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	}
 
 	if run.Status.Phase.Terminal() {
+		if !containsString(run.Finalizers, RunFinalizer) {
+			return ctrl.Result{}, nil
+		}
+
 		return r.cleanup(ctx, &run)
 	}
 
@@ -1133,7 +1134,15 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 func (r *RunReconciler) startAttempt(ctx context.Context, run *signalv1.CertificationRun, attempt int32) (ctrl.Result, error) {
 	workflow, err := buildWorkflow(run, attempt)
 	if err != nil {
-		return ctrl.Result{}, err
+		before := run.DeepCopy()
+		now := metav1.NewTime(r.now())
+		run.Status.Phase = signalv1.RunPhaseInconclusive
+		run.Status.ExecutionState = "Error"
+		run.Status.Verdict = "Inconclusive"
+		run.Status.Reason = "InvalidExecutionPlan: " + err.Error()
+		run.Status.FinishedAt = &now
+
+		return ctrl.Result{RequeueAfter: time.Millisecond}, r.Status().Patch(ctx, run, client.MergeFrom(before))
 	}
 
 	if err := r.Create(ctx, workflow); err != nil {
@@ -1235,6 +1244,11 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 			return nil, fmt.Errorf("encode check %s workload policy: %w", check.ID, encodeErr)
 		}
 
+		gpuCount, privileged, err := adapterParameterValues(check.Parameters, check.Backend.Kind)
+		if err != nil {
+			return nil, fmt.Errorf("check %s parameters: %w", check.ID, err)
+		}
+
 		taskName := checkTaskName(check)
 		task := map[string]any{
 			"name": taskName,
@@ -1252,6 +1266,8 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 					string(tolerationsJSON),
 					string(environmentJSON),
 					workloadPolicyJSON,
+					gpuCount,
+					privileged,
 				),
 			},
 		}
@@ -1325,6 +1341,8 @@ func checkWorkflowParameters(
 	tolerationsJSON string,
 	scriptEnvironmentJSON string,
 	workloadPolicyJSON string,
+	gpuCount string,
+	privileged string,
 ) []any {
 	return []any{
 		map[string]any{"name": "run-name", "value": checkRunName(run.Name, check.ID)},
@@ -1355,10 +1373,35 @@ func checkWorkflowParameters(
 		map[string]any{"name": "expected-gpu-count", "value": check.Parameters["expected-gpu-count"]},
 		map[string]any{"name": "observed-gpu-capacity", "value": check.Parameters["observed-gpu-capacity"]},
 		map[string]any{"name": "observed-gpu-allocatable", "value": check.Parameters["observed-gpu-allocatable"]},
-		map[string]any{"name": "gpu-resource-count", "value": check.Parameters["gpu-resource-count"]},
-		map[string]any{"name": "privileged", "value": check.Parameters["privileged"]},
+		map[string]any{"name": "backend-evidence-bytes", "value": strconv.Itoa(int(check.ResultBounds.BackendEvidenceBytes))},
+		map[string]any{"name": "gpu-resource-count", "value": gpuCount},
+		map[string]any{"name": "privileged", "value": privileged},
 		map[string]any{"name": "attempt", "value": fmt.Sprintf("%d", attempt)},
 	}
+}
+
+func adapterParameterValues(parameters map[string]string, backendKind string) (string, string, error) {
+	gpuCount := parameters["gpu-resource-count"]
+	if gpuCount == "" {
+		gpuCount = "0"
+	}
+
+	count, err := strconv.ParseInt(gpuCount, 10, 64)
+	if err != nil || count < 0 || (backendKind == "MPIJob" && count == 0) {
+		return "", "", errors.New("gpu-resource-count must be nonnegative and positive for MPIJob")
+	}
+
+	privileged := parameters["privileged"]
+	if privileged == "" {
+		privileged = "false"
+	}
+
+	value, err := strconv.ParseBool(privileged)
+	if err != nil {
+		return "", "", fmt.Errorf("privileged must be a boolean: %w", err)
+	}
+
+	return strconv.FormatInt(count, 10), strconv.FormatBool(value), nil
 }
 
 func validEnvironmentName(value string) bool {
@@ -1498,9 +1541,14 @@ func (r *RunReconciler) resumeGroupedEvidence(
 		return ctrl.Result{}, false, fmt.Errorf("decode persisted grouped evidence: %w", err)
 	}
 
-	if document.RunName != run.Name ||
-		(document.RunID != "" && run.UID != "" && document.RunID != string(run.UID)) {
+	if document.RunName != run.Name || document.RunID == "" || document.RunID != string(run.UID) {
 		return ctrl.Result{}, false, fmt.Errorf("persisted grouped evidence identity does not match run %s", run.Name)
+	}
+
+	if document.Workflow.Name != "" &&
+		(document.Workflow.Name != fmt.Sprintf("%s-a1", run.Name) || document.Workflow.UID == "" ||
+			(run.Status.Workflow.UID != "" && document.Workflow.UID != run.Status.Workflow.UID)) {
+		return ctrl.Result{}, false, errors.New("persisted evidence Workflow identity does not match run")
 	}
 
 	if len(document.CheckStatus) != len(run.Spec.Checks) {
@@ -1782,6 +1830,9 @@ func terminalCheckStatuses(
 		normalizedEvidence, complete, evidenceErr := groupedBackendEvidenceForParticipants(
 			outputs["backend-evidence"],
 			globalIndexes,
+			outputs["backend-resources"],
+			check.Backend,
+			run.Namespace,
 		)
 		if evidenceErr != nil {
 			status.Phase = signalv1.CheckPhaseInconclusive
@@ -2177,42 +2228,20 @@ func decodeWorkflowParametersWithLimits(parameters []any, limits map[string]int)
 	return outputs, nil
 }
 
-func groupedBackendEvidenceComplete(content string, participantCount int) (bool, error) {
-	if content == "" {
-		return false, errors.New("backend-evidence is required")
+func groupedBackendEvidenceComplete(
+	content string,
+	participantCount int,
+	references []signalv1.BackendResourceReference,
+	backend signalv1.ExecutionBackend,
+	namespace string,
+) (bool, error) {
+	if err := signaladapter.ValidateBackendEvidence(content); err != nil {
+		return false, err
 	}
 
-	var evidence struct {
-		Version      string `json:"version"`
-		Complete     bool   `json:"complete"`
-		CaptureError string `json:"captureError,omitempty"`
-		Participants []struct {
-			ParticipantIndex int `json:"participantIndex"`
-			Resource         struct {
-				APIVersion string    `json:"apiVersion"`
-				Kind       string    `json:"kind"`
-				Namespace  string    `json:"namespace,omitempty"`
-				Name       string    `json:"name"`
-				UID        types.UID `json:"uid"`
-			} `json:"resource"`
-			LauncherJob  any    `json:"launcherJob,omitempty"`
-			Pods         []any  `json:"pods"`
-			CaptureError string `json:"captureError,omitempty"`
-		} `json:"participants"`
-	}
-
-	decoder := json.NewDecoder(strings.NewReader(content))
-	if err := decoder.Decode(&evidence); err != nil {
-		return false, fmt.Errorf("decode backend-evidence: %w", err)
-	}
-
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return false, errors.New("backend-evidence contains trailing JSON values")
-	}
-
-	if evidence.Version != "v1" {
-		return false, fmt.Errorf("backend-evidence version %q is invalid", evidence.Version)
+	var evidence signaladapter.BackendEvidence
+	if err := json.Unmarshal([]byte(content), &evidence); err != nil {
+		return false, err
 	}
 
 	if len(evidence.Participants) != participantCount {
@@ -2224,6 +2253,8 @@ func groupedBackendEvidenceComplete(content string, participantCount int) (bool,
 	}
 
 	seen := make([]bool, participantCount)
+	complete := evidence.Complete && evidence.CaptureError == ""
+	podUIDs := map[types.UID]struct{}{}
 
 	for index := range evidence.Participants {
 		participant := &evidence.Participants[index]
@@ -2252,16 +2283,85 @@ func groupedBackendEvidenceComplete(content string, participantCount int) (bool,
 				participant.ParticipantIndex,
 			)
 		}
+
+		matches := 0
+
+		for _, reference := range references {
+			if !slices.Contains(reference.ParticipantIndexes, int32(participant.ParticipantIndex)) {
+				continue
+			}
+
+			if reference.APIVersion != participant.Resource.APIVersion ||
+				reference.Kind != participant.Resource.Kind ||
+				reference.Namespace != participant.Resource.Namespace ||
+				reference.Name != participant.Resource.Name ||
+				reference.UID != participant.Resource.UID {
+				return false, fmt.Errorf("backend-evidence participant %d resource differs from backend-resources", participant.ParticipantIndex)
+			}
+
+			matches++
+		}
+
+		if matches != 1 || participant.Resource.APIVersion != backend.APIVersion ||
+			participant.Resource.Kind != backend.Kind || participant.Resource.Namespace != namespace {
+			return false, fmt.Errorf("backend-evidence participant %d does not match the declared backend", participant.ParticipantIndex)
+		}
+
+		complete = complete && participant.CaptureError == "" && len(participant.Pods) > 0
+		launcher, worker := false, false
+
+		for _, pod := range participant.Pods {
+			if pod.UID == "" || pod.Name == "" {
+				return false, errors.New("backend-evidence Pod identity is incomplete")
+			}
+
+			if _, duplicate := podUIDs[pod.UID]; duplicate {
+				return false, errors.New("backend-evidence repeats a Pod UID")
+			}
+
+			podUIDs[pod.UID] = struct{}{}
+			if backend.Kind == "Pod" && (pod.UID != participant.Resource.UID ||
+				pod.Name != participant.Resource.Name || pod.Role != "participant" || len(participant.Pods) != 1) {
+				return false, errors.New("backend-evidence Pod differs from its backend resource")
+			}
+
+			launcher = launcher || pod.Role == "launcher"
+			worker = worker || pod.Role == "worker"
+
+			complete = complete && pod.Phase != "" && len(pod.Containers) > 0
+			for _, container := range pod.Containers {
+				complete = complete && container.Name != "" && container.State.State != "" &&
+					container.CurrentLog.Status == "captured" && container.CurrentLog.Error == "" &&
+					(container.PreviousLog.Status == "captured" || container.PreviousLog.Status == "not-applicable") &&
+					container.PreviousLog.Error == ""
+				if container.RestartCount > 0 || container.LastState.State == "terminated" {
+					complete = complete && container.PreviousLog.Status == "captured"
+				}
+			}
+		}
+
+		if backend.Kind == "MPIJob" {
+			complete = complete && launcher && worker && participant.LauncherJob != nil &&
+				participant.LauncherJob.Name != "" && participant.LauncherJob.UID != ""
+		}
 	}
 
-	return evidence.Complete, nil
+	return complete, nil
 }
 
 func groupedBackendEvidenceForParticipants(
 	content string,
 	globalIndexes []int32,
+	resources string,
+	backend signalv1.ExecutionBackend,
+	namespace string,
 ) (string, bool, error) {
-	complete, err := groupedBackendEvidenceComplete(content, len(globalIndexes))
+	references, err := backendResourceReferences(resources, len(globalIndexes))
+	if err != nil {
+		return "", false, err
+	}
+
+	complete, err := groupedBackendEvidenceComplete(content, len(globalIndexes), references, backend, namespace)
 	if err != nil {
 		return "", false, err
 	}
@@ -2353,7 +2453,20 @@ func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationR
 }
 
 func (r *RunReconciler) cleanup(ctx context.Context, run *signalv1.CertificationRun) (ctrl.Result, error) {
+	stopped, err := r.ensureWorkflowStopped(ctx, run)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if !stopped {
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+
 	if err := projectTerminal(ctx, r.Client, run); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := r.clearRequest(ctx, run); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -2377,10 +2490,6 @@ func (r *RunReconciler) cleanup(ctx context.Context, run *signalv1.Certification
 	}
 
 	deleted = true
-
-	if err := r.clearRequest(ctx, run); err != nil {
-		return ctrl.Result{}, err
-	}
 
 	statusBefore := run.DeepCopy()
 
@@ -2418,12 +2527,35 @@ func (r *RunReconciler) reconcileDeleting(ctx context.Context, run *signalv1.Cer
 		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
+	if err := r.clearRequest(ctx, run); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	if _, err := r.releaseRunReservations(ctx, run); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	if err := r.clearRequest(ctx, run); err != nil {
-		return ctrl.Result{}, err
+	if len(run.Spec.Checks) > 0 {
+		snapshot := &corev1.ConfigMap{}
+
+		reader := r.APIReader
+		if reader == nil {
+			reader = r.Client
+		}
+
+		err := reader.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.Checks[0].Script.ConfigMapName}, snapshot)
+		if err == nil {
+			if snapshot.Labels[SnapshotRunLabel] != run.Name {
+				return ctrl.Result{}, errors.New("refusing to delete script snapshot with different run identity")
+			}
+
+			uid := snapshot.UID
+			if err := r.Delete(ctx, snapshot, client.Preconditions{UID: &uid}); err != nil && !apierrors.IsNotFound(err) {
+				return ctrl.Result{}, err
+			}
+		} else if !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
 	}
 
 	before := run.DeepCopy()
@@ -2454,7 +2586,7 @@ func (r *RunReconciler) releaseRunReservations(ctx context.Context, run *signalv
 		before := node.DeepCopy()
 		delete(node.Annotations, ReservationLabel)
 
-		if err := r.Patch(ctx, &node, client.MergeFrom(before)); err != nil {
+		if err := r.Patch(ctx, &node, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
 			return false, err
 		}
 	}
@@ -2472,25 +2604,26 @@ func (r *RunReconciler) clearRequest(ctx context.Context, run *signalv1.Certific
 		return nil
 	}
 
-	if node.Labels[RequestLabel] != run.Spec.Profile.Name {
+	if node.Labels[RequestLabel] != run.Spec.Profile.Name || node.Annotations[ReservationLabel] != run.Name {
 		return nil
 	}
 
 	before := node.DeepCopy()
 	delete(node.Labels, RequestLabel)
 
-	return r.Patch(ctx, &node, client.MergeFrom(before))
+	return r.Patch(ctx, &node, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 }
 
 func (r *RunReconciler) ensureWorkflowStopped(ctx context.Context, run *signalv1.CertificationRun) (bool, error) {
-	if run.Status.Workflow.Name == "" {
-		return true, nil
+	name := run.Status.Workflow.Name
+	if name == "" {
+		name = fmt.Sprintf("%s-a1", run.Name)
 	}
 
 	workflow := &unstructured.Unstructured{}
 	workflow.SetGroupVersionKind(workflowGVK)
 
-	key := client.ObjectKey{Namespace: run.Namespace, Name: run.Status.Workflow.Name}
+	key := client.ObjectKey{Namespace: run.Namespace, Name: name}
 	reader := r.APIReader
 
 	if reader == nil {
@@ -2499,16 +2632,19 @@ func (r *RunReconciler) ensureWorkflowStopped(ctx context.Context, run *signalv1
 
 	if err := reader.Get(ctx, key, workflow); err != nil {
 		if apierrors.IsNotFound(err) {
-			return true, nil
+			return r.runWorkloadsGone(ctx, reader, run)
 		}
 
 		return false, fmt.Errorf("get Workflow before deletion: %w", err)
 	}
 
-	if run.Status.Workflow.UID == "" ||
-		string(workflow.GetUID()) != run.Status.Workflow.UID ||
+	if (run.Status.Workflow.UID != "" && string(workflow.GetUID()) != run.Status.Workflow.UID) ||
 		!metav1.IsControlledBy(workflow, run) {
 		return false, fmt.Errorf("refusing to delete Workflow with changed identity or ownership")
+	}
+
+	if err := r.fenceWorkflowDependents(ctx, reader, workflow, run); err != nil {
+		return false, err
 	}
 
 	propagation := metav1.DeletePropagationForeground
@@ -2525,13 +2661,113 @@ func (r *RunReconciler) ensureWorkflowStopped(ctx context.Context, run *signalv1
 
 	if err := reader.Get(ctx, key, workflow); err != nil {
 		if apierrors.IsNotFound(err) {
-			return true, nil
+			return r.runWorkloadsGone(ctx, reader, run)
 		}
 
 		return false, fmt.Errorf("confirm Workflow deletion: %w", err)
 	}
 
 	return false, nil
+}
+
+func (r *RunReconciler) runWorkloadsGone(ctx context.Context, reader client.Reader, run *signalv1.CertificationRun) (bool, error) {
+	for _, check := range run.Spec.Checks {
+		for _, kind := range []schema.GroupVersionKind{
+			corev1.SchemeGroupVersion.WithKind("Pod"),
+			{Group: "batch", Version: "v1", Kind: "Job"},
+			{Group: "kubeflow.org", Version: "v2beta1", Kind: "MPIJob"},
+		} {
+			if kind.Kind != "Pod" && check.Backend.Kind != "MPIJob" {
+				continue
+			}
+
+			list := &unstructured.UnstructuredList{}
+			list.SetGroupVersionKind(kind.GroupVersion().WithKind(kind.Kind + "List"))
+
+			if err := reader.List(ctx, list, client.InNamespace(run.Namespace),
+				client.MatchingLabels{SnapshotRunLabel: checkRunName(run.Name, check.ID)}); err != nil {
+				return false, fmt.Errorf("confirm %s cleanup: %w", kind.Kind, err)
+			}
+
+			if len(list.Items) > 0 {
+				return false, nil
+			}
+		}
+	}
+
+	return true, nil
+}
+
+func (r *RunReconciler) fenceWorkflowDependents(
+	ctx context.Context,
+	reader client.Reader,
+	workflow *unstructured.Unstructured,
+	run *signalv1.CertificationRun,
+) error {
+	owners := map[types.UID]struct{}{workflow.GetUID(): {}}
+	kinds := []schema.GroupVersionKind{}
+
+	for _, check := range run.Spec.Checks {
+		if check.Backend.Kind == "MPIJob" {
+			kinds = append(kinds, schema.GroupVersionKind{Group: "kubeflow.org", Version: "v2beta1", Kind: "MPIJob"})
+
+			break
+		}
+	}
+
+	kinds = append(
+		kinds,
+		schema.GroupVersionKind{Group: "batch", Version: "v1", Kind: "Job"},
+		corev1.SchemeGroupVersion.WithKind("Pod"),
+	)
+
+	// Fence every level before deleting the Workflow so foreground GC also waits
+	// for existing backend descendants whose original owner reference did not block.
+	for _, kind := range kinds {
+		list := &unstructured.UnstructuredList{}
+		list.SetGroupVersionKind(kind.GroupVersion().WithKind(kind.Kind + "List"))
+
+		if err := reader.List(ctx, list, client.InNamespace(run.Namespace)); err != nil {
+			return fmt.Errorf("list %s before Workflow cleanup: %w", kind.Kind, err)
+		}
+
+		for index := range list.Items {
+			object := &list.Items[index]
+			references := object.GetOwnerReferences()
+			owned := false
+			changed := false
+
+			for ownerIndex := range references {
+				if _, found := owners[references[ownerIndex].UID]; !found {
+					continue
+				}
+
+				owned = true
+
+				if references[ownerIndex].BlockOwnerDeletion == nil || !*references[ownerIndex].BlockOwnerDeletion {
+					block := true
+					references[ownerIndex].BlockOwnerDeletion = &block
+					changed = true
+				}
+			}
+
+			if !owned {
+				continue
+			}
+
+			owners[object.GetUID()] = struct{}{}
+			if changed {
+				before := object.DeepCopy()
+				object.SetOwnerReferences(references)
+
+				if err := r.Patch(ctx, object, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+					return fmt.Errorf("fence %s %s before Workflow cleanup: %w", kind.Kind, object.GetName(), err)
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 func participantNodeUID(run *signalv1.CertificationRun, nodeName string) types.UID {

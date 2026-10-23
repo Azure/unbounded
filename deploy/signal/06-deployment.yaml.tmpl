@@ -20,7 +20,7 @@ spec:
           imagePullPolicy: IfNotPresent
           args:
             - --namespace={{ default "project-signal" .Namespace }}
-            - --script-namespace={{ default "project-signal" .Namespace }}
+            - --script-namespace={{ default (default "project-signal" .Namespace) .ScriptNamespace }}
             - --leader-elect=true
           ports:
             - name: metrics
