@@ -73,11 +73,21 @@ type Member struct {
 	Site string `json:"site"`
 }
 
+// MaxCachePriority bounds CacheDefinition.Priority. DefaultCachePriority is
+// what the controller publishes for a ClusterCache without spec.priority.
+const (
+	MaxCachePriority     uint16 = 1000
+	DefaultCachePriority uint16 = 500
+)
+
 type CacheDefinition struct {
 	ID           CacheID `json:"id"`
 	Name         string  `json:"name"`
 	ClientSocket string  `json:"client_socket"`
 	OriginSocket string  `json:"origin_socket"`
+	// Priority is the cache's relative weight, 0 to MaxCachePriority, for
+	// sharing node disk and memory. It is always present on the wire.
+	Priority uint16 `json:"priority"`
 }
 
 type Publication struct {
@@ -478,7 +488,7 @@ func validateCaches(caches []CacheDefinition) error {
 
 	names := map[string]bool{}
 	for _, c := range caches {
-		if !ValidUUID(string(c.ID)) || ids[c.ID] || names[c.Name] {
+		if !ValidUUID(string(c.ID)) || ids[c.ID] || names[c.Name] || c.Priority > MaxCachePriority {
 			return InvalidRequest
 		}
 

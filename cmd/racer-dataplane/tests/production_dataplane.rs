@@ -860,6 +860,7 @@ fn fixture_publication() -> Publication {
             name: "production-fixture".into(),
             client_socket,
             origin_socket,
+            priority: racer_control_wire::DEFAULT_PRIORITY,
         }],
     }
 }

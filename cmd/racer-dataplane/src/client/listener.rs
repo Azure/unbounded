@@ -411,7 +411,7 @@ impl ClientListeners {
                 .filter_map(|definition| {
                     old_by_name
                         .get(definition.name.as_str())
-                        .filter(|old| old.definition != *definition)
+                        .filter(|old| !same_endpoint(&old.definition, definition))
                         .map(|old| old.definition.id.clone())
                 })
                 .collect();
@@ -462,7 +462,7 @@ impl ClientListeners {
                 scope.check()?;
                 if let Some(current) = old
                     .get(&definition.id)
-                    .filter(|current| current.definition == *definition)
+                    .filter(|current| same_endpoint(&current.definition, definition))
                 {
                     if !current.owns_checked(endpoint_layout()?.canonical())? {
                         return Err(BoundListener::ownership_error());
@@ -1545,6 +1545,24 @@ fn temporary_name(name: &str) -> bool {
     name.len() == 39
         && name.starts_with(".racer-")
         && name[7..].bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Whether a bound listener can serve `next` unchanged. Priority only weights
+/// disk and memory sharing, so a priority-only change must not replace the socket
+/// or consume a retirement slot. A reused listener keeps its original priority,
+/// which listener code never reads.
+pub(super) fn same_endpoint(current: &CacheDefinition, next: &CacheDefinition) -> bool {
+    let CacheDefinition {
+        id,
+        name,
+        client_socket,
+        origin_socket,
+        priority: _,
+    } = current;
+    *id == next.id
+        && *name == next.name
+        && *client_socket == next.client_socket
+        && *origin_socket == next.origin_socket
 }
 
 #[cfg(test)]

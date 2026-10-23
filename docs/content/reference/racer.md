@@ -19,7 +19,7 @@ See [Racer concepts]({{< relref "concepts/racer" >}}) and the [Azure Blob cache 
 | API | `racer.unbounded-cloud.io/v1alpha1`, kind `ClusterCache` |
 | Resource / short name | `clustercaches` / `ccache` |
 | Scope | Cluster-scoped |
-| Fields | Optional `spec.origin` for an operator-managed Azure origin; no `status` |
+| Fields | Optional `spec.origin` for an operator-managed Azure origin; optional `spec.priority` for the cache's share of node capacity; no `status` |
 | Name | DNS subdomain, at most 82 characters total and 63 per dot-separated label |
 | Identity | Kubernetes UID, not name; deleting and recreating a cache creates a new identity |
 
@@ -32,8 +32,9 @@ metadata:
 
 Any ClusterCache triggers installation by the Unbounded operator, not a Site
 component flag. This resource is not a Kubernetes PersistentVolume or
-PersistentVolumeClaim (PVC), does not configure capacity, and makes no durability
-promise. It configures an origin only when `spec.origin` is set (see
+PersistentVolumeClaim (PVC), does not set absolute capacity, and makes no
+durability promise. `spec.priority` sets only its relative share of each node's
+cache capacity (see [Priority](#priority)). It configures an origin only when `spec.origin` is set (see
 [Managed Azure origin](#managed-azure-origin)). Cached data is disposable. A cache's Kubernetes UID is its
 wire cache identity (`CacheID`).
 
@@ -44,6 +45,47 @@ wire cache identity (`CacheID`).
 
 Pod mounts grant access: expose only the needed cache/role. Origins need existing trusted
 parent directories. Clients do not automatically bypass Racer to connect directly to origins.
+
+### Priority
+
+`spec.priority` is a relative weight, 0 to 1000. Unset means 500. You can
+change it on a live cache; the new value takes effect without a restart.
+
+```yaml
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: ClusterCache
+metadata:
+  name: models
+spec:
+  priority: 900
+```
+
+Each cache's weighted share of a resource is `capacity * priority / sum of all
+priorities`. Memory shares count active caches. If all counted priorities are
+0, shares are equal. Shares apply to disk, the pending write queue, and memory:
+plaintext (working memory held by readers) and ciphertext (the only data the
+memory cache retains). Request-serving resources such as request context,
+connections, and in-flight fetches are split equally between active caches
+regardless of priority, so a priority 0 cache can still serve requests.
+Plaintext and ciphertext also keep a per-cache working allowance of one range
+window (`RACER_RANGE_WINDOW_PAGES`) plus one page, capped at an equal split.
+Concurrent requests on that cache share this allowance. The cap can make it
+smaller, so a read can still be rejected with Overloaded. Each I/O worker
+computes shares on its own; pages are spread across workers by hash, so this
+is close to a node-wide share.
+
+A cache above its share is over share. Under pressure, eviction prefers data
+from over-share caches. Scans are bounded, so this is a preference, not a
+guarantee. Idle capacity is still used by any cache, so a cache can grow past
+its share while others do not need the space. Priority is not a quota or a
+reservation, and nodes do not coordinate.
+
+Priority 0 has no weighted share when competing with positive-priority caches.
+The cache keeps its working allowance, is preferred for eviction, and is still
+cached while capacity is idle.
+
+The controller and dataplane must run the same version. A mismatched pair
+rejects the cache catalog.
 
 ### Managed Azure origin
 
@@ -496,6 +538,18 @@ disk admission and neutral eviction scores; resource budgets, integrity checks,
 and authorization still apply. Configuration values are validated even when the
 policy is disabled.
 
+[ClusterCache priority](#priority) runs before the score. Each eviction ranks a
+bounded set of candidate pages, first by whether their cache is over share,
+then by score, then by age. Candidates come first from the most over-share
+caches, so an over-share page is normally evicted before any under-share page.
+An under-share page can still go first when the over-share candidates are held.
+An over-share page never replaces an under-share page in a full pending write
+queue. Segment reclamation favors
+segments that hold mostly over-share data; under-share pages in a recycled
+segment are still lost. A non-owned page is not admitted when its cache is over
+share and the worker has no free segments beyond the reserve. Owned pages are
+always admitted. Warm and spill holds are never evicted.
+
 Ownership hints use completed rankings for the current accepted placement.
 Missing or obsolete hints provide no bonus until refreshed. Each worker also
 refreshes indexed residents, including recovered idle pages, without requiring
@@ -532,6 +586,9 @@ Ownership refresh affects subsequent events only, never rewrites old counters.
 | `racer_disk_class_read_payload_bytes_total{classification}` | Logical page payload bytes returned successfully by StoreReader after framing and mapping checks |
 | `racer_disk_pending_payload_bytes` | Total logical payload bytes owned by pending writes, including submitted writes until cleanup |
 | `racer_disk_indexed_payload_bytes` | Total logical payload bytes in retained index mappings, including restored mappings |
+| `racer_cache_disk_resident_bytes{cache}` | Gauge of logical payload bytes in retained index mappings for one ClusterCache, summed over workers |
+| `racer_cache_disk_share_bytes{cache}` | Gauge of the ClusterCache's fair share of disk, summed over workers. Only published ClusterCaches have series; see [Priority](#priority) |
+| `racer_retention_share_rejected_total` | Optional (non-owned) pages not written to disk because their ClusterCache was over its share and free segments were at the reserve |
 
 For per-disk utilization as a percentage, use:
 

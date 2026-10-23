@@ -303,6 +303,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
             name: "remote".into(),
             client_socket: "/run/racer/remote/client/socket".into(),
             origin_socket: "/run/racer/remote/origin/socket".into(),
+            priority: racer_control_wire::DEFAULT_PRIORITY,
         }],
         members: (0..4)
             .map(|i| racer_control_wire::Member {
@@ -930,6 +931,7 @@ fn metadata_coordinator_with_newer_publication(
             name: "remote".into(),
             client_socket: "/run/racer/remote/client/socket".into(),
             origin_socket: "/run/racer/remote/origin/socket".into(),
+            priority: racer_control_wire::DEFAULT_PRIORITY,
         }],
     };
     snapshots.apply(publication.clone()).unwrap();

@@ -1354,6 +1354,10 @@ impl WorkerApplication {
             config.admission_period,
             config.admission_mode == crate::config::AdmissionMode::SecondSight,
         )?));
+        // Disk shares use the same priority table as memory flow control.
+        writer
+            .retention()
+            .set_weights(runtime.admission.policy().weights().clone());
         metrics.observe_retention(writer.retention().snapshot());
         Ok(Store {
             reader,
@@ -1385,13 +1389,15 @@ impl WorkerApplication {
                 let Some((owner, bytes)) = admission.reclamation(cache, class, amount) else {
                     break;
                 };
-                let released =
-                    memory.reclaim_idle(class, owner.as_ref(), bytes, |page, ciphertext| {
-                        writer.discard_idle_copy(page, ciphertext)
-                    });
-                if released < bytes {
-                    writer.reclaim_ciphertext(owner.as_ref(), bytes - released);
-                }
+                // Global pressure takes over-share caches' idle bytes first.
+                memory.reclaim(
+                    class,
+                    owner.as_ref(),
+                    bytes,
+                    |cache| admission.excess(cache, class),
+                    |page, ciphertext| writer.discard_idle_copy(page, ciphertext),
+                    |cache, bytes| writer.reclaim_ciphertext(cache, bytes),
+                );
                 memory.buffers().reclaim_idle_buffers();
             }
         }
@@ -1432,6 +1438,12 @@ impl WorkerApplication {
             }
         }
         current_scope.check()?;
+        // Priority changes apply live: memory shares are recomputed now, disk
+        // shares on the next ranking pass.
+        let admission = &self.runtime.admission;
+        if admission.policy().weights().update(&snapshot.caches) {
+            admission.reweigh();
+        }
         self.caches = snapshot.caches.clone();
         self.snapshot_sequence = Some(snapshot.sequence);
         Ok(())
@@ -2410,6 +2422,7 @@ impl WorkerApplication {
             .metrics
             .observe_held(self.store.writer.index().held_snapshot());
         self.store.writer.observe_disks();
+        self.store.writer.observe_cache_disks(&self.caches);
         self.telemetry
             .metrics
             .observe_retention(self.store.writer.retention().snapshot());

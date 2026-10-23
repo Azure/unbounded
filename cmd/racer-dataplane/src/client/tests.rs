@@ -961,6 +961,7 @@ fn definition() -> CacheDefinition {
         name: "example".into(),
         client_socket: "/run/racer/example/client/socket".into(),
         origin_socket: "/run/racer/example/origin/socket".into(),
+        priority: racer_control_wire::DEFAULT_PRIORITY,
     }
 }
 fn scope() -> RequestScope {
@@ -2821,6 +2822,70 @@ fn retirement_generations_are_bounded_and_removal_allows_immediate_recreation() 
             .receive(&mut socket, true)
             .starts_with(b"HTTP/1.1 200")
     );
+}
+
+#[test]
+fn priority_only_changes_reuse_listeners_beyond_retirement_bound() {
+    let fixture = Fixture::new();
+    let count = MAX_RETIRING_LISTENERS + 1;
+    let mut caches: Vec<_> = (0..count)
+        .map(|n| {
+            let name = format!("cache-{n}");
+            CacheDefinition {
+                id: CacheId(format!("00000000-0000-4000-8000-{:012x}", n + 100)),
+                client_socket: format!("/run/racer/{name}/client/socket").into(),
+                origin_socket: format!("/run/racer/{name}/origin/socket").into(),
+                name,
+                priority: racer_control_wire::DEFAULT_PRIORITY,
+            }
+        })
+        .collect();
+    fixture.reconcile(&caches).unwrap();
+    let before: Vec<_> = caches
+        .iter()
+        .map(|cache| Rc::as_ptr(&fixture.listeners.listeners.borrow()[&cache.id]))
+        .collect();
+    for cache in &mut caches {
+        cache.priority = 7;
+    }
+    let prepared =
+        futures::executor::block_on(fixture.listeners.prepare(&caches, &scope())).unwrap();
+    // The publication carries the new priorities even though sockets are reused.
+    assert_eq!(prepared.definitions(), caches.as_slice());
+    prepared.commit();
+    for (cache, old) in caches.iter().zip(&before) {
+        assert_eq!(
+            Rc::as_ptr(&fixture.listeners.listeners.borrow()[&cache.id]),
+            *old
+        );
+    }
+    // Endpoint identity changes still replace the listener.
+    caches[0].id = CacheId("00000000-0000-4000-8000-000000000fff".into());
+    fixture.reconcile(&caches).unwrap();
+    let listeners = fixture.listeners.listeners.borrow();
+    assert!(!listeners.contains_key(&CacheId("00000000-0000-4000-8000-000000000064".into())));
+    assert!(listeners.contains_key(&caches[0].id));
+    assert_eq!(Rc::as_ptr(&listeners[&caches[1].id]), before[1]);
+}
+
+#[test]
+fn listener_reuse_ignores_only_priority() {
+    use super::listener::same_endpoint;
+    let current = definition();
+    let mut next = definition();
+    next.priority = 0;
+    assert!(same_endpoint(&current, &next));
+    let changes: [fn(&mut CacheDefinition); 4] = [
+        |d| d.id = CacheId("00000000-0000-4000-8000-000000000fff".into()),
+        |d| d.name = "other".into(),
+        |d| d.client_socket = "/run/racer/other/client/socket".into(),
+        |d| d.origin_socket = "/run/racer/other/origin/socket".into(),
+    ];
+    for change in changes {
+        let mut next = definition();
+        change(&mut next);
+        assert!(!same_endpoint(&current, &next));
+    }
 }
 
 #[test]

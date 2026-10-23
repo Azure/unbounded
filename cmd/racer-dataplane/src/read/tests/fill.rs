@@ -676,6 +676,74 @@ fn optional_persistence_owned_dirty_pressure_reclaims_only_optional_queue() {
     }
 }
 
+/// Global dirty pressure is resolved in the reservation before `enqueue`, so
+/// the full-queue share rule never runs there. An unheld owned page from an
+/// over-share cache must still not evict an under-share optional write, while
+/// a live reweight that puts its cache under share lets it reclaim.
+#[test]
+fn optional_persistence_owned_dirty_pressure_keeps_disk_share_order() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _queue = queue.enter();
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    limits.dirty_bytes = std::num::NonZeroUsize::new(19).unwrap();
+    let under = CacheId(crate::test_support::security::CACHE.into());
+    let over = CacheId("44444444-4444-4444-8444-444444444444".into());
+    let f = fixture_with_caches(3, Some(limits), vec![under.clone(), over.clone()]);
+    let deps = &f.fill.dependencies;
+    let policy = deps.writer.retention();
+    let page = |cache: &CacheId, etag: &str| {
+        let mut metadata = f.origin.metadata.immutable();
+        metadata.version.object.cache = cache.clone();
+        metadata.version.etag = StrongEtag::test_value(etag);
+        crate::memory::tests::bundle_for(&deps.admission, metadata)
+    };
+    let kept = page(&under, "kept");
+    let kept_id = kept.plaintext.page().clone();
+    let incoming = page(&over, "incoming");
+    let incoming_id = incoming.plaintext.page().clone();
+    // Queue the under-share write as owned, then reclassify it as optional.
+    policy.set_ownership(Rc::new(|_| true));
+    f.fill.observe_verified(&kept, &f.scope);
+    assert!(deps.writer.copy_only(&kept_id).unwrap().is_some());
+    let owned = incoming_id.clone();
+    policy.set_ownership(Rc::new(move |id| id == &owned));
+    let definition = |id: &CacheId, priority| racer_control_wire::CacheDefinition {
+        id: id.clone(),
+        name: id.0.clone(),
+        client_socket: "/c".into(),
+        origin_socket: "/o".into(),
+        priority,
+    };
+    let weigh = |under_priority, over_priority| {
+        policy.weights().update(&[
+            definition(&under, under_priority),
+            definition(&over, over_priority),
+        ]);
+    };
+    weigh(1000, 1);
+    // Indexed residency is what makes a cache over its disk share.
+    let _resident = policy.indexed_payload(&over, crate::model::PAGE_BYTES);
+    let capacity = deps.writer.index().disk_capacity();
+    assert!(policy.over_share(&over, capacity));
+    assert!(!policy.over_share(&under, capacity));
+    // Failure: the lower-pressure queued write survives and the fill defers.
+    f.fill.observe_verified(&incoming, &f.scope);
+    assert!(deps.writer.copy_only(&kept_id).unwrap().is_some());
+    assert!(deps.writer.copy_only(&incoming_id).unwrap().is_none());
+    assert_eq!(deps.writer.pending_count(), 1);
+    assert_eq!(deps.writer.discarded_count(), 0);
+    assert_eq!(deps.admission.used(ResourceClass::DirtyCiphertext), 19);
+    // Live reweight: the incoming cache is now under share and may reclaim.
+    weigh(1, 1000);
+    assert!(!policy.over_share(&over, capacity));
+    f.fill.observe_verified(&incoming, &f.scope);
+    assert!(deps.writer.copy_only(&kept_id).unwrap().is_none());
+    assert!(deps.writer.copy_only(&incoming_id).unwrap().is_some());
+    assert_eq!(deps.writer.pending_count(), 1);
+    assert_eq!(deps.writer.discarded_count(), 1);
+    assert_eq!(deps.admission.used(ResourceClass::DirtyCiphertext), 19);
+}
+
 #[test]
 fn optional_persistence_staging_pressure_skips_without_read_failure() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
@@ -2701,6 +2769,72 @@ mod pressure {
         }
     }
 
+    /// Optional persistence headroom is global ciphertext pressure, so it
+    /// takes over-share idle bytes first and never discards queued copies.
+    #[test]
+    fn optional_headroom_prefers_over_share_idle_bytes_and_keeps_queued_copies() {
+        for queued in [false, true] {
+            let page = PAGE_BYTES as usize + 16;
+            let class = ResourceClass::Ciphertext;
+            let mut limits = crate::test_support::cluster::config(false).limits;
+            limits.ciphertext_bytes = std::num::NonZeroUsize::new(16 * page).unwrap();
+            // A one-page window keeps the low-priority allowance near two pages.
+            limits.range_window_pages = std::num::NonZeroUsize::new(1).unwrap();
+            let under = CacheId(crate::test_support::security::CACHE.into());
+            let over = CacheId("44444444-4444-4444-8444-444444444444".into());
+            let f = fixture_with_caches(3, Some(limits), vec![under.clone(), over.clone()]);
+            let deps = &f.fill.dependencies;
+            let admission = &deps.admission;
+            let definition = |id: &CacheId, priority| racer_control_wire::CacheDefinition {
+                id: id.clone(),
+                name: id.0.clone(),
+                client_socket: "/c".into(),
+                origin_socket: "/o".into(),
+                priority,
+            };
+            let weigh = |under_priority, over_priority| {
+                admission.policy().weights().update(&[
+                    definition(&under, under_priority),
+                    definition(&over, over_priority),
+                ]);
+                admission.reweigh();
+            };
+            weigh(100, 900);
+            // The under-share page is oldest, so plain age order would take it.
+            let kept = retained_page(&f, &under, "kept", class, page, false);
+            let victim = retained_page(&f, &over, "victim", class, page, queued);
+            let _extra = admission.reserve(Some(&over), class, 6 * page).unwrap();
+            weigh(900, 100);
+            assert_eq!(admission.excess(&under, class), 0);
+            assert!(admission.excess(&over, class) > page);
+            let used = admission.used(class);
+            let ceiling = admission.limit(class) / 2;
+            assert!(used > ceiling - page);
+            let headroom = f.fill.optional_staging_headroom(page, PAGE_BYTES as usize);
+            assert_eq!(
+                headroom,
+                crate::read::fill::optional_headroom(
+                    admission.limit(class),
+                    admission.used(class),
+                    page,
+                    PAGE_BYTES as usize,
+                )
+            );
+            assert_eq!(deps.writer.discarded_count(), 0);
+            if queued {
+                // The queued copy is not idle and is never discarded, so the
+                // idle-only fallback takes the under-share page instead.
+                assert!(deps.writer.copy_only(&victim).unwrap().is_some());
+                assert!(deps.memory.ciphertext(&victim).unwrap().is_some());
+                assert!(deps.memory.ciphertext(&kept).unwrap().is_none());
+            } else {
+                assert!(deps.memory.ciphertext(&victim).unwrap().is_none());
+                assert!(deps.memory.ciphertext(&kept).unwrap().is_some());
+                assert_eq!(admission.used(class), used - page);
+            }
+        }
+    }
+
     #[test]
     fn global_plaintext_deficit_counts_plaintext_not_combined_bundle_bytes() {
         let f = fixture();
@@ -3066,6 +3200,7 @@ impl Fixture {
                     name: settings.name.into(),
                     client_socket,
                     origin_socket,
+                    priority: racer_control_wire::DEFAULT_PRIORITY,
                 }],
             })
             .unwrap();
@@ -3375,6 +3510,7 @@ fn adapter_client(
                 name: "fixture".into(),
                 client_socket,
                 origin_socket,
+                priority: racer_control_wire::DEFAULT_PRIORITY,
             }],
         })
         .unwrap();

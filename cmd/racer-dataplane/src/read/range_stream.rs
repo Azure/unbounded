@@ -2574,6 +2574,7 @@ pub(super) mod tests {
                     name: "framing".into(),
                     client_socket,
                     origin_socket,
+                    priority: racer_control_wire::DEFAULT_PRIORITY,
                 },
                 metadata.clone(),
                 admission.clone(),

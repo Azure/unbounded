@@ -67,3 +67,32 @@ func TestClusterCacheOriginJSONAndDeepCopy(t *testing.T) {
 	require.Equal(t, "https://account.blob.core.windows.net/models", cache.Spec.Origin.Azure.ContainerURL)
 	require.Equal(t, "azure", cache.Spec.Origin.Azure.Credential.Default.SecretRef.Name)
 }
+
+func TestClusterCachePriorityJSONDeepCopyAndDefault(t *testing.T) {
+	require.Equal(t, DefaultPriority, ClusterCacheSpec{}.EffectivePriority())
+
+	for _, priority := range []int32{MinPriority, 1, DefaultPriority, MaxPriority} {
+		spec := ClusterCacheSpec{Priority: &priority}
+		require.Equal(t, priority, spec.EffectivePriority())
+	}
+
+	priority := int32(0)
+	cache := &ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "cache"}, Spec: ClusterCacheSpec{Priority: &priority}}
+	data, err := json.Marshal(cache)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"metadata":{"name":"cache"},"spec":{"priority":0}}`, string(data))
+
+	decoded := &ClusterCache{}
+	require.NoError(t, json.Unmarshal(data, decoded))
+	require.Equal(t, cache, decoded)
+	require.Equal(t, int32(0), decoded.Spec.EffectivePriority())
+
+	copy := cache.DeepCopy()
+	*copy.Spec.Priority = 900
+	require.Equal(t, int32(0), *cache.Spec.Priority)
+
+	unset := &ClusterCache{}
+	require.NoError(t, json.Unmarshal([]byte(`{"metadata":{"name":"cache"},"spec":{}}`), unset))
+	require.Nil(t, unset.Spec.Priority)
+	require.Equal(t, DefaultPriority, unset.Spec.EffectivePriority())
+}

@@ -629,17 +629,15 @@ impl Fill {
             else {
                 return false;
             };
-            let released = self.dependencies.memory.reclaim_idle(
+            // Global pressure takes over-share caches' idle bytes first.
+            self.dependencies.memory.reclaim(
                 class,
                 owner.as_ref(),
                 bytes,
+                |cache| self.dependencies.admission.excess(cache, class),
                 |page, ciphertext| self.dependencies.writer.discard_idle_copy(page, ciphertext),
+                |cache, bytes| self.dependencies.writer.reclaim_ciphertext(cache, bytes),
             );
-            if released < bytes && matches!(class, ResourceClass::Ciphertext) {
-                self.dependencies
-                    .writer
-                    .reclaim_ciphertext(owner.as_ref(), bytes - released);
-            }
             true
         })
     }
@@ -2144,6 +2142,14 @@ impl Fill {
         let owned = retention.owned_only(id).eligible();
         let admission = &self.dependencies.admission;
         let amount = result.ciphertext.bytes().len();
+        // Optional pages of an over-share cache do not displace other caches'
+        // data once free segments reach the reserve. Owned pages compete
+        // through eviction instead.
+        if !owned && self.dependencies.writer.over_share_under_pressure(cache) {
+            retention.share_rejected();
+            retention.persistence_attempt(false);
+            return;
+        }
         if !owned
             && !optional_headroom(
                 admission.limit(ResourceClass::DirtyCiphertext),
@@ -2209,7 +2215,7 @@ impl Fill {
     /// Reclaim against the optional ceiling, not the larger hard quota. One
     /// bounded idle-only pass advances cursors for later independent interests.
     /// Never release queued copies or submitted/live owners to admit a write.
-    fn optional_staging_headroom(&self, amount: usize, one_page: usize) -> bool {
+    pub(super) fn optional_staging_headroom(&self, amount: usize, one_page: usize) -> bool {
         let admission = &self.dependencies.admission;
         let class = ResourceClass::Ciphertext;
         let limit = admission.limit(class);
@@ -2224,9 +2230,16 @@ impl Fill {
         admission.reclaim_buffers();
         let deficit = admission.used(class).saturating_sub(available_used);
         if deficit != 0 {
-            self.dependencies
-                .memory
-                .reclaim_idle(class, None, deficit, |_, _| 0);
+            // Over-share caches' idle bytes go first. Zero callbacks never
+            // discard queued or submitted copies.
+            self.dependencies.memory.reclaim(
+                class,
+                None,
+                deficit,
+                |cache| admission.excess(cache, class),
+                |_, _| 0,
+                |_, _| 0,
+            );
             // Evicted payloads may have returned backing to the recycler rather
             // than releasing their charges. Drop those idle allocations too.
             admission.reclaim_buffers();
@@ -2262,11 +2275,17 @@ impl Fill {
                     ) else {
                         break;
                     };
-                    // A zero callback never discards queued writes to make a cache
-                    // entry idle. Only unleased cache allocations may disappear.
-                    self.dependencies
-                        .memory
-                        .reclaim_idle(class, cache.as_ref(), bytes, |_, _| 0);
+                    // Zero callbacks never discard queued writes to make a cache
+                    // entry idle. Only unleased cache allocations may disappear,
+                    // over-share caches first under global pressure.
+                    self.dependencies.memory.reclaim(
+                        class,
+                        cache.as_ref(),
+                        bytes,
+                        |cache| self.dependencies.admission.excess(cache, class),
+                        |_, _| 0,
+                        |_, _| 0,
+                    );
                     result = reserve();
                 }
                 result

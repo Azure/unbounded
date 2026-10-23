@@ -1265,9 +1265,16 @@ impl Fixture {
         }
     }
     fn copy(&self, number: u8, length: usize) -> CiphertextCopy {
+        self.copy_in(
+            CacheId(crate::test_support::security::CACHE.into()),
+            number,
+            length,
+        )
+    }
+    fn copy_in(&self, cache: CacheId, number: u8, length: usize) -> CiphertextCopy {
         let version = ObjectVersion {
             object: ObjectId {
-                cache: CacheId(crate::test_support::security::CACHE.into()),
+                cache,
                 key: CacheKey([number; 32]),
             },
             etag: StrongEtag::parse(b"\"v1\"").unwrap(),
@@ -5067,4 +5074,280 @@ fn zero_copy_write_failure_releases_charges_and_does_not_publish() {
         assert_eq!(f.admission.used(ResourceClass::Ciphertext), page_charge);
         assert_eq!(page.ciphertext.disk_body(alignment).unwrap(), &before[..]);
     }
+}
+
+const OTHER_CACHE: &str = "44444444-4444-4444-8444-444444444444";
+
+/// Fixture cache at priority 1 next to `OTHER_CACHE` at 1000, with one
+/// indexed page so the fixture cache is over its share.
+fn over_share_fixture() -> (Fixture, CacheId, CacheId) {
+    let over = CacheId(crate::test_support::security::CACHE.into());
+    let under = CacheId(OTHER_CACHE.into());
+    let f = Fixture::assemble(
+        Directory::new(),
+        crate::test_support::availability_for(vec![over.clone(), under.clone()]),
+    );
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    let definition = |id: &CacheId, priority| racer_control_wire::CacheDefinition {
+        id: id.clone(),
+        name: id.0.clone(),
+        client_socket: "/c".into(),
+        origin_socket: "/o".into(),
+        priority,
+    };
+    f.store
+        .writer
+        .retention()
+        .weights()
+        .update(&[definition(&over, 1), definition(&under, 1000)]);
+    let resident = f.copy_in(over.clone(), 200, crate::model::PAGE_BYTES as usize);
+    f.store
+        .writer
+        .index()
+        .publish(
+            resident.ciphertext.envelope().page.clone(),
+            catalog::IndexedPage {
+                metadata: crate::model::VersionMetadata {
+                    content_type: None,
+                    version: resident.metadata.version.clone(),
+                    length: resident.metadata.length,
+                },
+                key_id: resident.ciphertext.envelope().key_id,
+                location: RecordLocation {
+                    segment: SegmentId(0),
+                    generation: Generation(1),
+                    extent: page_alloc::Extent::new(0, 512).unwrap(),
+                },
+            },
+        )
+        .unwrap();
+    let capacity = f.store.writer.index().disk_capacity();
+    assert!(f.store.writer.retention().over_share(&over, capacity));
+    assert!(!f.store.writer.retention().over_share(&under, capacity));
+    (f, over, under)
+}
+
+#[test]
+fn full_queue_never_lets_over_share_page_displace_under_share_page() {
+    let (f, over, under) = over_share_fixture();
+    let retention = f.store.writer.retention();
+    let hot = f.copy_in(over.clone(), 1, 113);
+    let hot_id = hot.ciphertext.envelope().page.clone();
+    let kept = f.copy_in(under.clone(), 2, 113);
+    let kept_id = kept.ciphertext.envelope().page.clone();
+    f.enqueue(kept).unwrap();
+    f.enqueue(hot).unwrap();
+    for _ in 0..3 {
+        retention.touch(&hot_id);
+    }
+    // An over-share page cannot displace anything at equal or higher rank.
+    assert_eq!(
+        f.enqueue(f.copy_in(over.clone(), 3, 113)),
+        Err(Error::Overloaded)
+    );
+    // A cold under-share page displaces the hot over-share page.
+    let incoming = f.copy_in(under, 4, 113);
+    let incoming_id = incoming.ciphertext.envelope().page.clone();
+    f.enqueue(incoming).unwrap();
+    assert!(f.store.writer.copy_only(&hot_id).unwrap().is_none());
+    assert!(f.store.writer.copy_only(&kept_id).unwrap().is_some());
+    assert!(f.store.writer.copy_only(&incoming_id).unwrap().is_some());
+}
+
+#[test]
+fn write_order_and_ciphertext_reclaim_put_under_share_first() {
+    let (f, over, under) = over_share_fixture();
+    f.reactor.init().expect("queue tests require io_uring");
+    let retention = f.store.writer.retention();
+    let first = f.copy_in(over, 1, 113);
+    let first_id = first.ciphertext.envelope().page.clone();
+    let second = f.copy_in(under, 2, 113);
+    let second_id = second.ciphertext.envelope().page.clone();
+    f.enqueue(first).unwrap();
+    f.enqueue(second).unwrap();
+    for _ in 0..3 {
+        retention.touch(&first_id);
+    }
+    // Reclaim releases the over-share copy first despite its heat.
+    assert!(f.store.writer.reclaim_ciphertext(None, 1) > 0);
+    assert!(f.store.writer.copy_only(&first_id).unwrap().is_none());
+    assert!(f.store.writer.copy_only(&second_id).unwrap().is_some());
+    drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
+    assert!(f.store.writer.index().lookup(&second_id).unwrap().is_some());
+}
+
+#[test]
+fn optional_admission_pressure_requires_over_share_and_reserved_free_segments() {
+    let (f, over, under) = over_share_fixture();
+    let writer = &f.store.writer;
+    assert!(f.segments.free_count() > 1);
+    assert!(!writer.over_share_under_pressure(&over));
+    let _filled = f.segments.append(512).unwrap();
+    while f.segments.free_count() > 1 {
+        drop(f.segments.append(32 * 1024 * 1024).unwrap());
+    }
+    assert!(writer.over_share_under_pressure(&over));
+    assert!(!writer.over_share_under_pressure(&under));
+}
+
+fn cache_definition(id: &str, name: &str) -> racer_control_wire::CacheDefinition {
+    racer_control_wire::CacheDefinition {
+        id: CacheId(id.into()),
+        name: name.into(),
+        client_socket: "/c".into(),
+        origin_socket: "/o".into(),
+        priority: 1,
+    }
+}
+
+fn cache_disk(id: &str, resident: u64, share: u64) -> crate::retention::CacheDisk {
+    crate::retention::CacheDisk {
+        cache: CacheId(id.into()),
+        resident_bytes: resident,
+        share_bytes: share,
+    }
+}
+
+#[test]
+fn cache_disk_samples_label_by_name_and_drop_unpublished_caches() {
+    let caches = [
+        cache_definition("uid-b", "logs"),
+        cache_definition("uid-a", "models"),
+        cache_definition("uid-c", "empty"),
+    ];
+    let samples = super::cache_disk_samples(
+        &caches,
+        vec![
+            cache_disk("uid-a", 900, 800),
+            cache_disk("uid-b", 50, 200),
+            cache_disk("uid-c", 0, 300),
+            cache_disk("uid-removed", 70, 0),
+        ],
+    );
+    let got: Vec<_> = samples
+        .iter()
+        .map(|s| (s.cache.to_string(), s.resident, s.share))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("models".to_string(), 900, 800),
+            ("logs".to_string(), 50, 200),
+            ("empty".to_string(), 0, 300),
+        ]
+    );
+}
+
+#[test]
+fn cache_disk_samples_handle_empty_inputs() {
+    assert!(super::cache_disk_samples(&[], vec![cache_disk("uid-a", 1, 2)]).is_empty());
+    assert!(super::cache_disk_samples(&[cache_definition("uid-a", "a")], vec![]).is_empty());
+}
+
+#[test]
+fn cache_disk_samples_scale_to_large_catalogs() {
+    // Regression input for the old linear catalog search per sample, which
+    // made about 50 million id compares at this size. The map join makes one
+    // pass over each input. Reversed usage order checks that every lookup is
+    // by id, not by position.
+    const CACHES: usize = 10_000;
+    let caches: Vec<_> = (0..CACHES)
+        .map(|i| cache_definition(&format!("uid-{i:05}"), &format!("cache-{i}")))
+        .collect();
+    let usage: Vec<_> = (0..CACHES)
+        .rev()
+        .map(|i| cache_disk(&format!("uid-{i:05}"), i as u64, 1))
+        .collect();
+    let samples = super::cache_disk_samples(&caches, usage);
+    assert_eq!(samples.len(), CACHES);
+    for (sample, i) in samples.iter().zip((0..CACHES).rev()) {
+        assert_eq!(&*sample.cache, format!("cache-{i}"));
+        assert_eq!(sample.resident, i as u64);
+    }
+}
+
+/// Owned reservation reclaim follows the full-queue share rule: an unheld
+/// over-share incoming page only takes over-share optional writes. Held or
+/// under-share incoming pages may take any optional write, and the share
+/// classification is current, so a live reweight changes eligibility.
+#[test]
+fn owned_reclaim_never_lets_unheld_over_share_page_take_under_share_write() {
+    let (f, over, under) = over_share_fixture();
+    let writer = &f.store.writer;
+    let incoming = f
+        .copy_in(over.clone(), 9, 113)
+        .ciphertext
+        .envelope()
+        .page
+        .clone();
+    let owner = incoming.clone();
+    writer
+        .retention()
+        .set_ownership(Rc::new(move |page| page == &owner));
+    let kept = f.copy_in(under.clone(), 1, 113);
+    let kept_id = kept.ciphertext.envelope().page.clone();
+    f.enqueue(kept).unwrap();
+    let dirty = f.admission.used(ResourceClass::DirtyCiphertext);
+    // Failure: the only optional write is under share, so nothing is freed.
+    assert_eq!(
+        writer.reclaim_optional_for_owned(&incoming, None, usize::MAX, usize::MAX),
+        0
+    );
+    assert!(writer.copy_only(&kept_id).unwrap().is_some());
+    assert_eq!(writer.discarded_count(), 0);
+    assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), dirty);
+    // Success: an over-share optional write is replaced, the under-share one stays.
+    let victim = f.copy_in(over.clone(), 2, 113);
+    let victim_id = victim.ciphertext.envelope().page.clone();
+    f.enqueue(victim).unwrap();
+    assert_eq!(
+        writer.reclaim_optional_for_owned(&incoming, None, usize::MAX, usize::MAX),
+        1
+    );
+    assert!(writer.copy_only(&victim_id).unwrap().is_none());
+    assert!(writer.copy_only(&kept_id).unwrap().is_some());
+    assert_eq!(writer.discarded_count(), 1);
+    assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), dirty);
+    // A held incoming page is exempt, as in the full-queue path.
+    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+    writer
+        .index()
+        .reserve_hold(&incoming.version, 1, until)
+        .unwrap();
+    assert_eq!(writer.reclaim_optional_for_owned(&incoming, None, 1, 0), 1);
+    assert!(writer.copy_only(&kept_id).unwrap().is_none());
+    assert_eq!(writer.pending_count(), 0);
+    // Live reweight: once the incoming cache is under share, it may take an
+    // under-share optional write without being held.
+    let unheld = f
+        .copy_in(over.clone(), 10, 113)
+        .ciphertext
+        .envelope()
+        .page
+        .clone();
+    let owner = unheld.clone();
+    writer
+        .retention()
+        .set_ownership(Rc::new(move |page| page == &owner));
+    let other = f.copy_in(under.clone(), 3, 113);
+    let other_id = other.ciphertext.envelope().page.clone();
+    f.enqueue(other).unwrap();
+    assert_eq!(writer.reclaim_optional_for_owned(&unheld, None, 1, 0), 0);
+    let definition = |id: &CacheId, priority| racer_control_wire::CacheDefinition {
+        id: id.clone(),
+        name: id.0.clone(),
+        client_socket: "/c".into(),
+        origin_socket: "/o".into(),
+        priority,
+    };
+    writer
+        .retention()
+        .weights()
+        .update(&[definition(&over, 1000), definition(&under, 1)]);
+    let capacity = writer.index().disk_capacity();
+    assert!(!writer.retention().over_share(&over, capacity));
+    assert_eq!(writer.reclaim_optional_for_owned(&unheld, None, 1, 0), 1);
+    assert!(writer.copy_only(&other_id).unwrap().is_none());
+    assert_eq!(writer.pending_count(), 0);
+    assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
 }

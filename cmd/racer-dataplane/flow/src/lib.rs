@@ -61,7 +61,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -127,6 +127,34 @@ pub trait Policy: 'static {
     /// Return the minimum keyed share, clipped to the aggregate ceiling.
     fn floor(&self, _class: Self::Class) -> usize {
         1
+    }
+
+    /// Return the per-key working-memory allowance of a weighted class.
+    /// Weights never reduce a key's share below this allowance or the
+    /// unweighted equal split, whichever is smaller. All concurrent work on
+    /// the key shares the allowance, so it limits how far a low weight can
+    /// shrink the share but does not guarantee that any request makes
+    /// progress. Unweighted classes ignore it.
+    fn progress(&self, _class: Self::Class) -> usize {
+        0
+    }
+
+    /// Return the relative fair-share weight of a key. A key's share of a
+    /// class is `limit * weight / sum(weights of active keys)`, still bounded
+    /// below by `floor` and, for weighted classes, by `progress` capped at the
+    /// equal split. Weight 0 grants no guaranteed share beyond those bounds.
+    /// When every active weight is 0, active keys share equally. Values above
+    /// `u32::MAX` are clamped. Weights are sampled when a key becomes active
+    /// and again on each `Quotas::reweigh`.
+    fn weight(&self, _key: &Self::Key) -> u64 {
+        1
+    }
+
+    /// Whether `weight` shapes this class's keyed share. Unweighted classes
+    /// split equally across active keys regardless of key weight, so
+    /// request-serving resources stay independent of retention priority.
+    fn weighted(_class: Self::Class) -> bool {
+        true
     }
 
     /// Bound the number of retained key records.
@@ -237,6 +265,8 @@ pub struct Quotas<P: Policy> {
     keys: Keys<P::Key>,
 
     active_keys: Arc<AtomicUsize>,
+
+    active_weight: Arc<AtomicU64>,
 
     retired_keys: Arc<Mutex<VecDeque<P::Key>>>,
 
@@ -638,6 +668,7 @@ impl<P: Policy> Quotas<P> {
             totals: Arc::new(Counters::new(P::Class::COUNT)),
             keys: RefCell::default(),
             active_keys: Arc::new(AtomicUsize::new(0)),
+            active_weight: Arc::new(AtomicU64::new(0)),
             retired_keys: Arc::new(Mutex::new(VecDeque::new())),
             stopped: Arc::new(AtomicBool::new(false)),
             buffers: Arc::new(Buffers::new(PoolDemand::new().with_bounds(0, BUFFER_DEPTH))),
@@ -724,7 +755,9 @@ impl<P: Policy> Quotas<P> {
     }
 
     /// A keyed fair-share deficit must be reclaimed from that key. Global
-    /// pressure can use any idle key; impossible requests have no byte remedy.
+    /// pressure returns no key; callers should first reclaim from keys with
+    /// [`Self::excess`], then from any idle key. Impossible requests have no
+    /// byte remedy.
     pub fn reclamation(
         &self,
         key: &P::Key,
@@ -733,10 +766,16 @@ impl<P: Policy> Quotas<P> {
     ) -> Option<(Option<P::Key>, usize)> {
         // Keep the counters alive, but release the lookup borrow before callbacks.
         let local = self.keys.borrow().get(key).and_then(Weak::upgrade);
-        let fair = self.fair_limit(
-            class,
-            self.active_keys.load(Ordering::Acquire) + usize::from(local.is_none()),
-        );
+        let fair = match &local {
+            Some(local) => self.fair_limit_for(class, local),
+            None => self.weighted_limit(
+                class,
+                self.active_keys.load(Ordering::Acquire) + 1,
+                self.key_weight(key),
+                self.active_weight.load(Ordering::Acquire),
+                true,
+            ),
+        };
         if amount > fair {
             return None;
         }
@@ -750,6 +789,20 @@ impl<P: Policy> Quotas<P> {
         let headroom = self.limit(class).checked_sub(amount)?;
         let deficit = self.used(class).saturating_sub(headroom);
         (deficit != 0).then_some((None, deficit))
+    }
+
+    /// Bytes `key` holds above its current weighted fair share, or zero when
+    /// the key is inactive or within its share. One map lookup, so callers may
+    /// ask about a few candidate keys on each reclaim without walking all keys.
+    pub fn excess(&self, key: &P::Key, class: P::Class) -> usize {
+        // Release the lookup borrow before policy callbacks, as in `reclamation`.
+        let Some(local) = self.keys.borrow().get(key).and_then(Weak::upgrade) else {
+            return 0;
+        };
+        local
+            .counter(class)
+            .used()
+            .saturating_sub(self.fair_limit_for(class, &local))
     }
 
     /// Admit nonzero keyed or aggregate-only work under ordinary policy.
@@ -853,12 +906,93 @@ impl<P: Policy> Quotas<P> {
         self.buffers.stats()
     }
 
-    /// Divide the aggregate ceiling, honoring the clipped per-key floor.
-    fn fair_limit(&self, class: P::Class, active: usize) -> usize {
+    /// Sum of the weights recorded for currently active keys.
+    pub fn active_weight(&self) -> u64 {
+        self.active_weight.load(Ordering::Acquire)
+    }
+
+    /// Return the current keyed fair limit for `key` in `class`, counting the
+    /// key as active (with its current policy weight) if it is not yet.
+    pub fn fair_limit(&self, key: &P::Key, class: P::Class) -> usize {
+        let local = self.keys.borrow().get(key).and_then(Weak::upgrade);
+        match &local {
+            Some(local) => self.fair_limit_for(class, local),
+            None => self.weighted_limit(
+                class,
+                self.active_keys.load(Ordering::Acquire) + 1,
+                self.key_weight(key),
+                self.active_weight.load(Ordering::Acquire),
+                true,
+            ),
+        }
+    }
+
+    /// Re-read `Policy::weight` for every active key and update the recorded
+    /// weights and their total. Wakes the shared waiter so blocked admission
+    /// can retry against changed shares. Safe to call at any time.
+    pub fn reweigh(&self) {
+        // Upgrade owners only: key clones and policy callbacks may reenter
+        // the key map, so they must run after the borrow is released.
+        let live: Vec<_> = self
+            .keys
+            .borrow()
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for counts in &live {
+            let Some(retirement) = counts.retirement.as_ref() else {
+                continue;
+            };
+            let next = self.key_weight(&retirement.key);
+            // The upgraded owner prevents concurrent retirement of this key.
+            let previous = retirement.weight.swap(next, Ordering::AcqRel);
+            self.active_weight.fetch_add(next, Ordering::AcqRel);
+            self.active_weight.fetch_sub(previous, Ordering::AcqRel);
+        }
+        drop(live);
+        self.totals.wake.wake();
+    }
+
+    /// Clamp policy weights so the total over all keys cannot overflow.
+    fn key_weight(&self, key: &P::Key) -> u64 {
+        self.policy.weight(key).min(u64::from(u32::MAX))
+    }
+
+    /// Fair limit for an active key record using its recorded weight.
+    fn fair_limit_for(&self, class: P::Class, local: &Counters<P::Key>) -> usize {
+        let weight = local
+            .retirement
+            .as_ref()
+            .map_or(1, |retirement| retirement.weight.load(Ordering::Acquire));
+        self.weighted_limit(
+            class,
+            self.active_keys.load(Ordering::Acquire).max(1),
+            weight,
+            self.active_weight.load(Ordering::Acquire),
+            false,
+        )
+    }
+
+    /// Divide the aggregate ceiling by weight, honoring the clipped per-key
+    /// floor. `include` adds `weight` to `total` for a not-yet-active key.
+    fn weighted_limit(
+        &self,
+        class: P::Class,
+        active: usize,
+        weight: u64,
+        total: u64,
+        include: bool,
+    ) -> usize {
         let limit = self.limit(class);
-        (limit / active.max(1))
-            .max(self.policy.floor(class))
-            .min(limit)
+        let fair = if P::weighted(class) {
+            // Low weight cannot cut a key below its shared progress allowance,
+            // capped at the unweighted equal split.
+            let equal = limit / active.max(1);
+            share(limit, active, weight, total, include).max(self.policy.progress(class).min(equal))
+        } else {
+            limit / active.max(1)
+        };
+        fair.max(self.policy.floor(class)).min(limit)
     }
 
     /// Retry overload once after reclaiming relevant retained backing.
@@ -994,7 +1128,7 @@ impl<P: Policy> Quotas<P> {
         let limit = self.limit(class);
         self.buffers.limits[class.index()].store(limit, Ordering::Relaxed);
         if let Some(local) = local.as_ref().filter(|_| mode == AdmissionMode::Ordinary) {
-            let fair = self.fair_limit(class, self.active_keys.load(Ordering::Acquire).max(1));
+            let fair = self.fair_limit_for(class, local);
             let used = local.counter(class).used();
             if used.checked_add(amount).is_none_or(|next| next > fair) {
                 return Err(self.rejected(class, amount, Some(used), Some(fair)));
@@ -1057,8 +1191,10 @@ impl<P: Policy> Quotas<P> {
         let retirement_key = key.clone();
         let map_key = key.clone();
         let limit = self.policy.max_keys();
+        // Sample the weight while unborrowed: the policy may reenter Quotas.
+        let weight = self.key_weight(key);
         let mut keys = self.keys.borrow_mut();
-        // Either clone may have installed this key or filled the table.
+        // Either clone or the weight callback may have installed this key or filled the table.
         if let Some(counts) = keys.get(key).and_then(Weak::upgrade) {
             return Ok(counts);
         }
@@ -1070,6 +1206,8 @@ impl<P: Policy> Quotas<P> {
         let counts = Arc::new(Counters::keyed(
             P::Class::COUNT,
             retirement_key,
+            weight,
+            self.active_weight.clone(),
             self.active_keys.clone(),
             self.retired_keys.clone(),
         ));
@@ -1478,12 +1616,21 @@ impl<K> Counters<K> {
     fn keyed(
         classes: usize,
         key: K,
+        weight: u64,
+        total_weight: Arc<AtomicU64>,
         active: Arc<AtomicUsize>,
         queue: Arc<Mutex<VecDeque<K>>>,
     ) -> Self {
         let mut counters = Self::new(classes);
         active.fetch_add(1, Ordering::AcqRel);
-        counters.retirement = Some(Retirement { key, active, queue });
+        total_weight.fetch_add(weight, Ordering::AcqRel);
+        counters.retirement = Some(Retirement {
+            key,
+            weight: AtomicU64::new(weight),
+            total_weight,
+            active,
+            queue,
+        });
         counters
     }
 
@@ -1506,6 +1653,10 @@ impl<K> Drop for Counters<K> {
 struct Retirement<K> {
     key: K,
 
+    weight: AtomicU64,
+
+    total_weight: Arc<AtomicU64>,
+
     active: Arc<AtomicUsize>,
 
     queue: Arc<Mutex<VecDeque<K>>>,
@@ -1514,12 +1665,29 @@ struct Retirement<K> {
 impl<K> Retirement<K> {
     /// Publish retirement only after the last owner releases the key record.
     fn retire(self) {
+        self.total_weight
+            .fetch_sub(self.weight.load(Ordering::Acquire), Ordering::AcqRel);
         self.active.fetch_sub(1, Ordering::AcqRel);
         self.queue
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push_back(self.key);
     }
+}
+
+/// Weighted share of `limit` before floor clipping. Falls back to an equal
+/// split across `active` keys when the total weight is zero.
+fn share(limit: usize, active: usize, weight: u64, total: u64, include: bool) -> usize {
+    let total = if include {
+        total.saturating_add(weight)
+    } else {
+        total
+    };
+    if total == 0 {
+        return limit / active.max(1);
+    }
+    let scaled = limit as u128 * u128::from(weight.min(total)) / u128::from(total);
+    usize::try_from(scaled).unwrap_or(limit)
 }
 
 /// Initialize and wipe the full allocation, including truncated and spare bytes.
@@ -1983,6 +2151,8 @@ mod quota_tests {
         rejected: Arc<Mutex<Vec<Rejection<Resource>>>>,
 
         limit_samples: Arc<Mutex<VecDeque<usize>>>,
+
+        weights: Arc<Mutex<HashMap<String, u64>>>,
     }
 
     impl TestPolicy {
@@ -1993,6 +2163,7 @@ mod quota_tests {
                 max_keys,
                 rejected: Arc::default(),
                 limit_samples: Arc::default(),
+                weights: Arc::default(),
             }
         }
     }
@@ -2011,6 +2182,16 @@ mod quota_tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or(self.limit)
+        }
+
+        /// Configured key weights, defaulting to 1.
+        fn weight(&self, key: &String) -> u64 {
+            self.weights.lock().unwrap().get(key).copied().unwrap_or(1)
+        }
+
+        /// Progress stays an equal split regardless of key weight.
+        fn weighted(class: Resource) -> bool {
+            !matches!(class, Resource::Progress)
         }
 
         /// Return the fixture's key-record bound.
@@ -2037,6 +2218,264 @@ mod quota_tests {
         fn rejected(&self, rejection: Rejection<Resource>) {
             self.rejected.lock().unwrap().push(rejection);
         }
+    }
+
+    /// Build an authority whose keys carry the given weights.
+    fn weighted(limit: usize, weights: &[(&str, u64)]) -> (Quotas<TestPolicy>, TestPolicy) {
+        let policy = TestPolicy::new(limit, 16);
+        policy.weights.lock().unwrap().extend(
+            weights
+                .iter()
+                .map(|(key, weight)| ((*key).to_owned(), *weight)),
+        );
+        (Quotas::new(policy.clone()), policy)
+    }
+
+    /// Shares are proportional to weight and admission enforces them.
+    #[test]
+    fn weighted_limits_are_proportional() {
+        let (quotas, _) = weighted(1000, &[("a", 900), ("b", 100)]);
+        let a = quotas
+            .reserve(Some(&"a".into()), Resource::Other, 1)
+            .unwrap();
+        let b = quotas
+            .reserve(Some(&"b".into()), Resource::Other, 1)
+            .unwrap();
+        assert_eq!(quotas.active_weight(), 1000);
+        assert_eq!(quotas.fair_limit(&"a".into(), Resource::Other), 900);
+        assert_eq!(quotas.fair_limit(&"b".into(), Resource::Other), 100);
+        let more = quotas
+            .reserve(Some(&"b".into()), Resource::Other, 99)
+            .unwrap();
+        assert_eq!(
+            quotas.reserve(Some(&"b".into()), Resource::Other, 1).err(),
+            Some(Error::Overloaded)
+        );
+        // A new key's prospective limit includes its own weight.
+        assert_eq!(quotas.fair_limit(&"c".into(), Resource::Other), 1);
+        drop((a, b, more));
+    }
+
+    /// Unweighted classes split equally even when a key has weight 0.
+    #[test]
+    fn unweighted_classes_ignore_key_weight() {
+        let (quotas, _) = weighted(1000, &[("a", 1), ("z", 0)]);
+        let _a = quotas
+            .reserve(Some(&"a".into()), Resource::Progress, 500)
+            .unwrap();
+        assert_eq!(quotas.fair_limit(&"z".into(), Resource::Progress), 500);
+        let _z = quotas
+            .reserve(Some(&"z".into()), Resource::Progress, 500)
+            .unwrap();
+        assert_eq!(quotas.fair_limit(&"a".into(), Resource::Progress), 500);
+        // The weighted class still follows key weight.
+        assert_eq!(quotas.fair_limit(&"z".into(), Resource::Other), 1);
+        assert_eq!(quotas.fair_limit(&"a".into(), Resource::Other), 1000);
+    }
+
+    /// Weight 0 keeps only the floor; all-zero weights share equally.
+    #[test]
+    fn zero_weights_get_floor_or_equal_shares() {
+        let (quotas, _) = weighted(1000, &[("a", 1), ("z", 0)]);
+        let _a = quotas
+            .reserve(Some(&"a".into()), Resource::Other, 1)
+            .unwrap();
+        let _z = quotas
+            .reserve(Some(&"z".into()), Resource::Other, 1)
+            .unwrap();
+        assert_eq!(quotas.fair_limit(&"z".into(), Resource::Other), 1);
+        assert_eq!(quotas.fair_limit(&"a".into(), Resource::Other), 1000);
+
+        let (quotas, _) = weighted(1000, &[("x", 0), ("y", 0)]);
+        assert_eq!(quotas.fair_limit(&"x".into(), Resource::Other), 1000);
+        let _x = quotas
+            .reserve(Some(&"x".into()), Resource::Other, 1)
+            .unwrap();
+        let _y = quotas
+            .reserve(Some(&"y".into()), Resource::Other, 1)
+            .unwrap();
+        assert_eq!(quotas.active_weight(), 0);
+        assert_eq!(quotas.fair_limit(&"x".into(), Resource::Other), 500);
+    }
+
+    /// Reclamation targets a key that exceeds its weighted share.
+    #[test]
+    fn weighted_reclamation_targets_over_share_key() {
+        let (quotas, _) = weighted(1000, &[("a", 900), ("b", 100)]);
+        let _b = quotas
+            .reserve(Some(&"b".into()), Resource::Other, 500)
+            .unwrap();
+        let _a = quotas
+            .reserve(Some(&"a".into()), Resource::Other, 100)
+            .unwrap();
+        assert_eq!(
+            quotas.reclamation(&"b".into(), Resource::Other, 10),
+            Some((Some("b".into()), 410))
+        );
+        assert_eq!(quotas.reclamation(&"a".into(), Resource::Other, 400), None);
+        assert_eq!(
+            quotas.reclamation(&"a".into(), Resource::Other, 500),
+            Some((None, 100))
+        );
+    }
+
+    /// Reweigh applies runtime changes; retirement subtracts the recorded weight.
+    #[test]
+    fn reweigh_updates_limits_and_retirement_uses_recorded_weight() {
+        let (quotas, policy) = weighted(1000, &[("a", 1), ("b", 1)]);
+        let a = quotas
+            .reserve(Some(&"a".into()), Resource::Other, 1)
+            .unwrap();
+        let b = quotas
+            .reserve(Some(&"b".into()), Resource::Other, 1)
+            .unwrap();
+        assert_eq!(quotas.fair_limit(&"a".into(), Resource::Other), 500);
+        policy.weights.lock().unwrap().insert("a".into(), 3);
+        // Not applied until reweigh.
+        assert_eq!(quotas.active_weight(), 2);
+        quotas.reweigh();
+        assert_eq!(quotas.active_weight(), 4);
+        assert_eq!(quotas.fair_limit(&"a".into(), Resource::Other), 750);
+        assert_eq!(quotas.fair_limit(&"b".into(), Resource::Other), 250);
+        // Changed but not reweighed: retirement subtracts the recorded 1.
+        policy.weights.lock().unwrap().insert("b".into(), 7);
+        drop(b);
+        assert_eq!(quotas.active_weight(), 3);
+        drop(a);
+        assert_eq!(quotas.active_weight(), 0);
+        quotas.reweigh();
+        assert_eq!(quotas.active_weight(), 0);
+    }
+
+    /// Excess follows live reweigh and is zero for inactive or retired keys.
+    #[test]
+    fn excess_follows_reweigh_and_retirement() {
+        let (quotas, policy) = weighted(100, &[("low", 1), ("high", 1)]);
+        assert_eq!(quotas.excess(&"low".into(), Resource::Payload), 0);
+        let low = quotas
+            .reserve(Some(&"low".into()), Resource::Payload, 50)
+            .unwrap();
+        let high = quotas
+            .reserve(Some(&"high".into()), Resource::Payload, 20)
+            .unwrap();
+        // Equal weights: both keys are within a share of 50.
+        assert_eq!(quotas.excess(&"low".into(), Resource::Payload), 0);
+        assert_eq!(quotas.excess(&"high".into(), Resource::Payload), 0);
+        policy.weights.lock().unwrap().insert("low".into(), 100);
+        policy.weights.lock().unwrap().insert("high".into(), 900);
+        // Not applied until reweigh.
+        assert_eq!(quotas.excess(&"low".into(), Resource::Payload), 0);
+        quotas.reweigh();
+        assert_eq!(quotas.excess(&"low".into(), Resource::Payload), 40);
+        assert_eq!(quotas.excess(&"high".into(), Resource::Payload), 0);
+        // Other classes keep their own counters.
+        assert_eq!(quotas.excess(&"low".into(), Resource::Other), 0);
+        drop(low);
+        assert_eq!(quotas.excess(&"low".into(), Resource::Payload), 0);
+        drop(high);
+        assert_eq!(quotas.excess(&"high".into(), Resource::Payload), 0);
+    }
+
+    /// `Policy::weight` may reenter the authority while a new key activates.
+    #[test]
+    fn weight_callback_may_reenter_quotas() {
+        use std::{
+            cell::{Cell, RefCell},
+            rc::Weak as RcWeak,
+        };
+
+        /// Reenters fair-share queries and nested keyed admission from `weight`.
+        struct WeightPolicy {
+            quotas: RefCell<RcWeak<Quotas<WeightPolicy>>>,
+
+            nested: RefCell<Vec<Charge<WeightPolicy>>>,
+
+            reentered: Cell<bool>,
+        }
+
+        impl Policy for WeightPolicy {
+            type Class = Resource;
+
+            type Key = String;
+
+            /// Fixed aggregate ceiling.
+            fn limit(&self, _: Resource) -> usize {
+                100
+            }
+
+            /// Query and install other keys while the outer key activates.
+            fn weight(&self, key: &String) -> u64 {
+                if key == "outer" && !self.reentered.replace(true) {
+                    let quotas = self.quotas.borrow().upgrade().unwrap();
+                    let _ = quotas.fair_limit(&"outer".into(), Resource::Other);
+                    let nested = quotas
+                        .reserve(Some(&"nested".into()), Resource::Other, 1)
+                        .unwrap();
+                    self.nested.borrow_mut().push(nested);
+                }
+                if key == "outer" { 3 } else { 1 }
+            }
+
+            /// Room for both keys only.
+            fn max_keys(&self) -> usize {
+                2
+            }
+
+            /// No waiter is needed.
+            fn wakes(_: Resource) -> bool {
+                false
+            }
+
+            /// No page backing.
+            fn covers(_: Resource) -> bool {
+                false
+            }
+
+            /// Every admission must succeed.
+            fn rejected(&self, _: Rejection<Resource>) {
+                panic!("unexpected rejection");
+            }
+        }
+
+        let quotas = Rc::new(Quotas::new(WeightPolicy {
+            quotas: RefCell::default(),
+            nested: RefCell::default(),
+            reentered: Cell::default(),
+        }));
+        *quotas.policy.quotas.borrow_mut() = Rc::downgrade(&quotas);
+        let outer = quotas
+            .reserve(Some(&"outer".into()), Resource::Other, 1)
+            .unwrap();
+        assert_eq!(quotas.policy.nested.borrow().len(), 1);
+        assert_eq!(quotas.active_weight(), 4);
+        assert_eq!(quotas.used(Resource::Other), 2);
+        assert_eq!(quotas.fair_limit(&"outer".into(), Resource::Other), 75);
+        assert_eq!(quotas.fair_limit(&"nested".into(), Resource::Other), 25);
+        drop(outer);
+        quotas.policy.nested.borrow_mut().clear();
+        assert_eq!(quotas.active_weight(), 0);
+        assert_eq!(quotas.used(Resource::Other), 0);
+    }
+
+    /// Large limits and clamped weights do not overflow.
+    #[test]
+    fn weighted_share_is_overflow_safe() {
+        assert_eq!(share(usize::MAX, 2, u64::MAX, u64::MAX, false), usize::MAX);
+        assert_eq!(share(usize::MAX, 2, 1, 2, false), usize::MAX / 2);
+        assert_eq!(share(10, 2, 0, 0, false), 5);
+        assert_eq!(share(10, 2, 5, u64::MAX, true), 0);
+        let (quotas, _) = weighted(usize::MAX, &[("a", u64::MAX), ("b", u64::MAX)]);
+        let _a = quotas
+            .reserve(Some(&"a".into()), Resource::Other, 1)
+            .unwrap();
+        let _b = quotas
+            .reserve(Some(&"b".into()), Resource::Other, 1)
+            .unwrap();
+        assert_eq!(quotas.active_weight(), 2 * u64::from(u32::MAX));
+        assert_eq!(
+            quotas.fair_limit(&"a".into(), Resource::Other),
+            usize::MAX / 2
+        );
     }
 
     /// Wiping initializes every allocated byte without moving or resizing backing.
@@ -2702,6 +3141,104 @@ mod quota_tests {
     #[test]
     fn quota_key_clone_charge_reentry() {
         check_quota_key_clone(2);
+    }
+
+    /// A key clone that reserves keyed work during reweigh does not panic.
+    #[test]
+    fn reweigh_allows_reentrant_key_clone() {
+        thread_local! {
+            static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+        }
+
+        /// Run the one-shot hook after releasing its borrow.
+        fn fire() {
+            if let Some(action) = HOOK.with(|slot| slot.borrow_mut().take()) {
+                action();
+            }
+        }
+
+        /// A key whose clone runs a one-shot reentrant hook.
+        #[derive(Debug, Eq, PartialEq, Hash)]
+        struct Key(String);
+
+        impl Clone for Key {
+            /// Reenter admission from application clone code.
+            fn clone(&self) -> Self {
+                fire();
+                Self(self.0.clone())
+            }
+        }
+
+        /// Weighted policy over reentrant keys.
+        struct KeyPolicy(TestPolicy);
+
+        impl Policy for KeyPolicy {
+            type Class = Resource;
+
+            type Key = Key;
+
+            /// Delegate the aggregate ceiling.
+            fn limit(&self, class: Resource) -> usize {
+                self.0.limit(class)
+            }
+
+            /// Delegate the record ceiling.
+            fn max_keys(&self) -> usize {
+                self.0.max_keys()
+            }
+
+            /// This fixture has no admission waiter.
+            fn wakes(_: Resource) -> bool {
+                false
+            }
+
+            /// This fixture allocates no page backing.
+            fn covers(_: Resource) -> bool {
+                false
+            }
+
+            /// This fixture does not observe rejections.
+            fn rejected(&self, _: Rejection<Resource>) {}
+
+            /// Reenter admission, then delegate the configured weight.
+            fn weight(&self, key: &Key) -> u64 {
+                fire();
+                self.0.weight(&key.0)
+            }
+        }
+
+        let policy = TestPolicy::new(1000, 16);
+        policy
+            .weights
+            .lock()
+            .unwrap()
+            .extend([("a".to_owned(), 1), ("b".to_owned(), 1)]);
+        let quotas = Rc::new(Quotas::new(KeyPolicy(policy.clone())));
+        let a = quotas
+            .reserve(Some(&Key("a".into())), Resource::Other, 1)
+            .unwrap();
+        policy.weights.lock().unwrap().insert("a".into(), 3);
+        let held = Rc::new(RefCell::new(Vec::new()));
+        let nested = quotas.clone();
+        let nested_held = held.clone();
+        HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                nested_held.borrow_mut().push(
+                    nested
+                        .reserve(Some(&Key("b".into())), Resource::Other, 1)
+                        .unwrap(),
+                );
+            }));
+        });
+        quotas.reweigh();
+        HOOK.with(|slot| slot.borrow_mut().take());
+        // The hook fired inside reweigh and admitted "b" with weight 1.
+        assert_eq!(held.borrow().len(), 1);
+        assert_eq!(quotas.active_weight(), 4);
+        assert_eq!(quotas.fair_limit(&Key("a".into()), Resource::Other), 750);
+        held.borrow_mut().clear();
+        drop(a);
+        assert_eq!(quotas.active_weight(), 0);
     }
 
     /// Idle backing retains concurrent charges and reports pressure before retry.
