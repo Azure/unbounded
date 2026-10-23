@@ -9,7 +9,13 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let report = racer_sim::run(&options);
+    let report = match racer_sim::run(&options) {
+        Ok(report) => report,
+        Err(err) => {
+            eprintln!("racer-sim: {err}");
+            std::process::exit(2);
+        }
+    };
     let text = serde_json::to_string_pretty(&report).expect("report serializes");
     match &options.out {
         Some(path) => {
