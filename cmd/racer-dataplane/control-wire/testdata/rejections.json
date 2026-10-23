@@ -383,5 +383,61 @@
     "old": "\"port\":1",
     "new": "\"port\":1,\"gid\":\"ABCDEF0123456789abcdef0123456789\"",
     "code": "invalid_request"
+  },
+  {
+    "name": "missing cache priority",
+    "file": "publication.json",
+    "old": ",\"priority\":250",
+    "new": "",
+    "code": "invalid_request"
+  },
+  {
+    "name": "null cache priority",
+    "file": "publication.json",
+    "old": "\"priority\":250",
+    "new": "\"priority\":null",
+    "code": "invalid_request"
+  },
+  {
+    "name": "string cache priority",
+    "file": "publication.json",
+    "old": "\"priority\":250",
+    "new": "\"priority\":\"250\"",
+    "code": "invalid_request"
+  },
+  {
+    "name": "negative cache priority",
+    "file": "publication.json",
+    "old": "\"priority\":250",
+    "new": "\"priority\":-1",
+    "code": "invalid_request"
+  },
+  {
+    "name": "fractional cache priority",
+    "file": "publication.json",
+    "old": "\"priority\":250",
+    "new": "\"priority\":250.5",
+    "code": "invalid_request"
+  },
+  {
+    "name": "exponent cache priority",
+    "file": "publication.json",
+    "old": "\"priority\":250",
+    "new": "\"priority\":2.5e2",
+    "code": "invalid_request"
+  },
+  {
+    "name": "cache priority above maximum",
+    "file": "publication.json",
+    "old": "\"priority\":250",
+    "new": "\"priority\":1001",
+    "code": "invalid_request"
+  },
+  {
+    "name": "overflow cache priority",
+    "file": "publication.json",
+    "old": "\"priority\":250",
+    "new": "\"priority\":65536",
+    "code": "invalid_request"
   }
 ]

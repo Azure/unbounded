@@ -365,11 +365,9 @@ help: ## Show this help
 	@echo "  docs-serve                       Start local Hugo dev server"
 	@echo ""
 	@echo "Racer Controller:"
-	@echo "  racer-controller                 Test and build the Go controller"
-	@echo "  racer-controller-build           Build the Go controller without lint/test"
-	@echo "  racer-test                       Lint and race-test the controller and deployment contracts"
-	@echo "  racer-envtest                    Run controller API-server tests with KUBEBUILDER_ASSETS"
-	@echo "  racer-envtest-ci                 Provision pinned assets and run controller API-server tests"
+	@echo "  racer-test                       Test the Rust Racer workspace and Go Racer API and wire contracts"
+	@echo "  racer-envtest                    Run Racer API-server tests with KUBEBUILDER_ASSETS"
+	@echo "  racer-envtest-ci                 Provision pinned assets and run Racer API-server tests"
 	@echo "  racer-generate                   Generate Racer deepcopy and CRD artifacts"
 	@echo "  racer-loadgen | racer-loadgen-build  Build loadgen (with/without focused tests)"
 	@echo "  racer-loadgen-test                Race-test racer-loadgen"
@@ -568,18 +566,15 @@ e2e-racer: ## Run the kind-based Racer e2e suite (object caching and the Gantry 
 e2e-playpen: ## Run the kind-based playpen e2e suite
 	$(GOTEST) -tags=e2e ./e2e/playpen -v -timeout=10m
 
-.PHONY: racer-controller racer-controller-build racer-test racer-server-test racer-envtest racer-envtest-ci racer-generate
-racer-controller: racer-server-test racer-controller-build ## Test and build the Racer controller
+.PHONY: racer-test racer-go-test racer-rust-test racer-envtest racer-envtest-ci racer-generate
+racer-go-test: ## Lint and race-test the Go Racer API and workload packages
+	timeout --signal=TERM --kill-after=10s 300s $(GOLINT) ./api/racer/... ./internal/racer/...
+	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m -race ./api/racer/... ./internal/racer/...
 
-racer-controller-build: ## Build the Racer controller without lint/test
-	@mkdir -p bin
-	timeout --signal=TERM --kill-after=10s 300s $(GOBUILD) -trimpath -ldflags '$(STAMP_LDFLAGS)' -o bin/racer-controller ./cmd/racer-controller
+racer-rust-test: ## Test the Rust Racer workspace, including the embedded cluster control plane
+	timeout --signal=TERM --kill-after=10s 1500s cargo test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --workspace
 
-racer-server-test: ## Lint and race-test the Racer server
-	timeout --signal=TERM --kill-after=10s 300s $(GOLINT) ./api/racer/... ./internal/racer/... ./cmd/racer-controller/...
-	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -timeout=5m -race ./api/racer/... ./internal/racer/... ./cmd/racer-controller/...
-
-racer-test: racer-server-test ## Check the Racer controller
+racer-test: racer-go-test racer-rust-test ## Check Racer
 
 RACER_PY_VENV ?= $(CURDIR)/tmp/racer-python-venv
 
@@ -600,27 +595,17 @@ racer-envtest-ci: $(SETUP_ENVTEST) ## Provision pinned local API-server assets a
 	@assets=$$(TMPDIR="$(CURDIR)/tmp/racer-envtest" timeout --signal=TERM --kill-after=10s 300s "$(SETUP_ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(CURDIR)/bin/envtest" -p path) && \
 		$(MAKE) racer-envtest KUBEBUILDER_ASSETS="$$assets"
 
-racer-envtest: ## Run real API-server, manager election, TLS and crash-recovery tests
+racer-envtest: ## Run real API-server tests for Racer APIs and operator restrictions
 	@test -n "$(KUBEBUILDER_ASSETS)" || { echo "Set KUBEBUILDER_ASSETS to repository-local envtest binaries"; exit 1; }
 	@mkdir -p tmp/racer-envtest
-	TMPDIR="$(CURDIR)/tmp/racer-envtest" KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)" timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -race ./api/racer/v1alpha1 ./internal/racer ./internal/racer/authority ./deploy/racer ./internal/operator/components/racer -run '^TestEnvtest' -count=1 -v -timeout=5m
+	TMPDIR="$(CURDIR)/tmp/racer-envtest" KUBEBUILDER_ASSETS="$(KUBEBUILDER_ASSETS)" timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -race ./api/racer/v1alpha1 ./internal/operator/components/racer -run '^TestEnvtest' -count=1 -v -timeout=5m
 
 racer-generate: ## Generate Racer deepcopy and CRD artifacts
 	timeout --signal=TERM --kill-after=10s 300s $(GOCMD) generate ./api/racer/v1alpha1
 
-RACER_CONTROLLER_IMAGE ?= $(CONTAINER_REGISTRY)/racer-controller:$(VERSION_TAG)
 RACER_DATAPLANE_IMAGE ?= $(CONTAINER_REGISTRY)/racer-dataplane:$(VERSION_TAG)
 
-.PHONY: image-racer-controller-local image-racer-dataplane-local
-image-racer-controller-local: ## Build the racer-controller container image locally (single-arch)
-	$(CONTAINER_ENGINE) build \
-		--build-arg VERSION=$(VERSION) \
-		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
-		--build-arg BUILD_TIME=$(BUILD_TIME) \
-		-t racer-controller:$(VERSION_TAG) -t $(RACER_CONTROLLER_IMAGE) \
-		-f ./images/racer-controller/Containerfile .
-	$(call trivy-maybe,$(RACER_CONTROLLER_IMAGE))
-
+.PHONY: image-racer-dataplane-local
 image-racer-dataplane-local: ## Build the racer-dataplane container image locally (single-arch)
 	$(CONTAINER_ENGINE) build \
 		-t racer-dataplane:$(VERSION_TAG) -t $(RACER_DATAPLANE_IMAGE) \
