@@ -22,9 +22,9 @@ use std::{
 /// A seat this process holds.
 pub struct Seat {
     pub index: usize,
-    pub issuer: RefCell<SeatIssuer>,
+    pub issuer: RefCell<Rc<SeatIssuer>>,
     /// Next issuer, offered until its root is committed.
-    pub pending: RefCell<Option<SeatIssuer>>,
+    pub pending: RefCell<Option<Rc<SeatIssuer>>>,
     pub control: RefCell<Rc<ServingIdentity>>,
     pub webhook: RefCell<Rc<ServingIdentity>>,
     pub control_tls: RefCell<Arc<rustls::ServerConfig>>,
@@ -48,6 +48,15 @@ pub struct Serving {
     /// [`crate::seat::fail_closed`], so a rolled back or wiped Secret is
     /// refused for the life of the process.
     pub high_water: Option<StateRecord>,
+}
+
+/// The issuer this process offers, reused across seat claims so that
+/// reclaims, drains, and index changes do not mint new keyring roots.
+pub struct CachedIssuer {
+    pub cluster: String,
+    pub issuer: Rc<SeatIssuer>,
+    /// Last time the root was offered through a seat Lease.
+    pub offered: std::time::SystemTime,
 }
 
 /// A live seat holder, as last observed by the primary.
@@ -78,6 +87,8 @@ pub struct Shared {
     /// TokenReview, lists, watches, and other bulk calls.
     pub api: Rc<Kube>,
     pub seat: RefCell<Option<Rc<Seat>>>,
+    /// Issuer reused by the next seat claim, see [`crate::seat::new_seat`].
+    pub issuer: RefCell<Option<CachedIssuer>>,
     pub serving: RefCell<Serving>,
     /// Notified when the image, bundle, or authority changes.
     pub changed: Signal,
@@ -194,6 +205,7 @@ pub(crate) mod tests {
             lease_api: kube.clone(),
             api: kube,
             seat: RefCell::new(None),
+            issuer: RefCell::new(None),
             serving: RefCell::new(Serving::default()),
             changed: Signal::default(),
             verifier: DynamicClientVerifier::new(),
