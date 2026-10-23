@@ -4,8 +4,12 @@
 //! process and one thread. See `designs/racer-core-simulation.md`.
 //! This is a skeleton: it parses options and returns a report stub.
 
+pub mod config;
 pub mod engine;
+pub mod faults;
 pub mod report;
+pub mod resources;
+pub mod workload;
 
 use serde_json::{Value, json};
 
