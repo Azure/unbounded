@@ -768,6 +768,22 @@ pub fn response_head(
     Ok(head)
 }
 
+/// The response head for a page whose ciphertext a NIC wrote straight into
+/// GPU landing memory. It matches [`response_head`] for
+/// [`PeerResponse::Page`]; only the metadata and envelope are signed, never
+/// the ciphertext bytes, so no host copy is needed to check it.
+pub(crate) fn landed_response_head(
+    metadata: &ObjectMetadata,
+    envelope: &crate::model::PageEnvelope,
+    request_digest: &[u8; 32],
+    path: &[NodeId],
+) -> Result<MessageHead> {
+    let mut head = response_prefix(request_digest, path)?;
+    page_fields(&mut head, metadata, envelope)?;
+    response_tail(&mut head, "page", u64::from(envelope.ciphertext_length));
+    Ok(head)
+}
+
 /// Start a canonical response with its retained request binding and reverse path.
 fn response_prefix(binding: &[u8; 32], path: &[NodeId]) -> Result<MessageHead> {
     let mut head = MessageHead {

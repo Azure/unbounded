@@ -424,6 +424,8 @@ impl Relay {
                         .append_response(response, &previous)
                         .map(transport::RelayResponse::Complete)
                 }
+                // A relay never asks for landing.
+                transport::RelayResponse::Landed(_) => Err(Error::Internal),
                 transport::RelayResponse::Http {
                     authentication,
                     connection,
@@ -442,6 +444,16 @@ impl Relay {
             }
         })
     }
+}
+
+/// What [`Requester::request_landing`] produced.
+#[allow(clippy::large_enum_variant)] // Short-lived, returned once per request.
+pub(crate) enum Delivered {
+    /// A verified response, as from [`Requester::request`].
+    Response(VerifiedResponse),
+
+    /// A verified page in a GPU landing buffer.
+    Landed(Box<transport::LandedResponse>),
 }
 
 /// Concrete candidate requester. Scripted outcomes exist only in unit tests and
@@ -677,7 +689,15 @@ impl Requester {
             let (signed, binding) = forwarding.sign_request_to(request, &next)?;
             let mut timing = PageTiming::new(metrics);
             let response = self
-                .exchange_inner_mode(signed, membership, None, &scope, true, Some(&mut timing))
+                .exchange_inner_mode(
+                    signed,
+                    membership,
+                    None,
+                    &scope,
+                    true,
+                    Some(&mut timing),
+                    None,
+                )
                 .await?;
             let transport::RelayResponse::Complete(response) = response else {
                 return Err(Error::Internal);
@@ -698,6 +718,58 @@ impl Requester {
         membership: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
     ) -> Operation<'a, VerifiedResponse> {
+        Box::pin(async move {
+            match self
+                .request_network_landing(request, membership, None, scope)
+                .await?
+            {
+                Delivered::Response(response) => Ok(response),
+                Delivered::Landed(_) => Err(Error::Internal),
+            }
+        })
+    }
+
+    /// Like [`Self::request`] for one fixed page that a `gpu-read` will
+    /// decrypt on GPU `ordinal`. If the last hop is RDMA and this node has a
+    /// free landing slot on that GPU's rail, the page lands in GPU memory and
+    /// comes back as [`Delivered::Landed`]. Otherwise this is a plain request.
+    pub(crate) fn request_landing<'a>(
+        &'a self,
+        request: PeerRequest,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        ordinal: i32,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Delivered> {
+        match self {
+            Self::Network { .. } => {
+                self.request_network_landing(request, membership, Some(ordinal), scope)
+            }
+            #[cfg(any(test, feature = "subscription-interop"))]
+            Self::Scripted {
+                request: script, ..
+            } => {
+                let response = script(request, membership, scope.clone(), false);
+                Box::pin(async move { response.await.map(Delivered::Response) })
+            }
+        }
+    }
+
+    /// Whether this node has a landing buffer for GPU `ordinal` on any rail.
+    pub(crate) fn landing_ready(&self, ordinal: i32) -> bool {
+        match self {
+            Self::Network { transfers, .. } => transfers.landing_ready(ordinal),
+            #[cfg(any(test, feature = "subscription-interop"))]
+            Self::Scripted { .. } => false,
+        }
+    }
+
+    fn request_network_landing<'a>(
+        &'a self,
+        request: PeerRequest,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        landing: Option<i32>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Delivered> {
         let (network, paths, observer, forwarding, metrics) = match self {
             Self::Network {
                 network,
@@ -727,10 +799,24 @@ impl Requester {
             let (signed, binding) = forwarding.sign_request_to(request, next)?;
             let mut timing = PageTiming::new(metrics);
             let response = self
-                .exchange_inner_mode(signed, membership, None, &scope, false, Some(&mut timing))
+                .exchange_inner_mode(
+                    signed,
+                    membership,
+                    None,
+                    &scope,
+                    false,
+                    Some(&mut timing),
+                    landing,
+                )
                 .await?;
-            let transport::RelayResponse::Complete(response) = response else {
-                return Err(Error::Internal);
+            let response = match response {
+                transport::RelayResponse::Complete(response) => response,
+                // Verified by exchange_inner_mode against `binding`.
+                transport::RelayResponse::Landed(landed) => {
+                    scope.check()?;
+                    return Ok(Delivered::Landed(landed));
+                }
+                transport::RelayResponse::Http { .. } => return Err(Error::Internal),
             };
             scope.check()?;
             let response = observer.result(
@@ -741,7 +827,7 @@ impl Requester {
                     .await,
             )?;
             timing.success(&response);
-            Ok(response)
+            Ok(Delivered::Response(response))
         })
     }
 }
@@ -782,7 +868,7 @@ impl Requester {
         relay: Option<Rc<flow_control::Charge<AdmissionPolicy>>>,
         scope: &'a RequestScope,
     ) -> Operation<'a, transport::RelayResponse> {
-        self.exchange_inner_mode(request, membership, relay, scope, false, None)
+        self.exchange_inner_mode(request, membership, relay, scope, false, None, None)
     }
     fn exchange_inner_mode<'a>(
         &'a self,
@@ -792,6 +878,7 @@ impl Requester {
         scope: &'a RequestScope,
         direct_http: bool,
         timing: Option<&'a mut PageTiming<'_>>,
+        landing: Option<i32>,
     ) -> Operation<'a, transport::RelayResponse> {
         let (network, paths, health, forwarding, transfers) = match self {
             Self::Network {
@@ -877,6 +964,7 @@ impl Requester {
                     receive_permit,
                     socket_failure.clone(),
                     timing,
+                    landing,
                     &scope,
                 )
                 .await;
@@ -888,7 +976,9 @@ impl Requester {
             };
             use crate::topology::LinkOutcome;
             let outcome = match &response {
-                Ok(transport::RelayResponse::Complete(_)) => Some(LinkOutcome::Success),
+                Ok(transport::RelayResponse::Complete(_) | transport::RelayResponse::Landed(_)) => {
+                    Some(LinkOutcome::Success)
+                }
                 Err(_) if permit.is_none() && socket_failure.get() => Some(LinkOutcome::Refused),
                 // Unavailable/deadline/protocol errors can arise locally or at a
                 // downstream node. Do not blame an immediate peer without evidence.
@@ -906,7 +996,9 @@ impl Requester {
                     {
                         Outcome::Neutral
                     }
-                    Ok(transport::RelayResponse::Complete(_)) => Outcome::Verified,
+                    Ok(
+                        transport::RelayResponse::Complete(_) | transport::RelayResponse::Landed(_),
+                    ) => Outcome::Verified,
                     Err(Error::Overloaded) => Outcome::LocalPressure,
                     _ => Outcome::Neutral,
                 });
@@ -934,6 +1026,15 @@ impl Requester {
                 .verify_response_async(response, binding, scope)
                 .await
                 .map(|verified| transport::RelayResponse::Complete(verified.into_signed())),
+            transport::RelayResponse::Landed(landed) => {
+                forwarding.verify_landed(
+                    &landed.authentication,
+                    &landed.metadata,
+                    &landed.envelope,
+                    binding,
+                )?;
+                Ok(transport::RelayResponse::Landed(landed))
+            }
             transport::RelayResponse::Http {
                 authentication,
                 mut connection,

@@ -403,13 +403,27 @@ impl Transfers {
             .await?;
         Ok((written.lease, true))
     }
+    /// Whether a rail of this node has a landing buffer on GPU `ordinal`.
+    pub(crate) fn landing_ready(&self, ordinal: i32) -> bool {
+        self.links.as_ref().is_some_and(|links| {
+            links
+                .active()
+                .iter()
+                .any(|rail| links.landing_ordinal(rail.rail) == Some(ordinal))
+        })
+    }
     /// Receiver: when the hop plan is RDMA and the link is ready, grant a page
     /// window in-band and sign it into the request's `Accept` control. Any
     /// recoverable failure means a plain HTTP request.
+    ///
+    /// With `landing`, the GPU of a `gpu-read` that asked for this fixed page,
+    /// the grant is over a slot of that GPU's landing buffer when this rail
+    /// has one and a slot is free. Otherwise it is a host grant as usual.
     pub(super) async fn accept_native(
         &self,
         request: &SignedRequest,
         plan: TransportPlan,
+        landing: Option<i32>,
         scope: &RequestScope,
     ) -> Result<Option<(Binding, SignedHead, NodeId, PendingReceive)>> {
         let TransportPlan::Rdma { rail } = plan else {
@@ -436,10 +450,34 @@ impl Transfers {
             scope,
             rail,
         )?;
-        let pending = match links
-            .grant(&peer, rail, binding.transfer, &native_scope(scope))
-            .await
-        {
+        let landed = match landing {
+            Some(ordinal)
+                if matches!(
+                    request.request.operation,
+                    crate::peer::protocol::Operation::Page { .. }
+                ) && links.landing_ordinal(rail) == Some(ordinal) =>
+            {
+                match links
+                    .grant_landing(&peer, rail, binding.transfer, ordinal, &native_scope(scope))
+                    .await
+                {
+                    Ok(pending) => Some(pending),
+                    // No free landing slot: grant host memory instead.
+                    Err(error) if native_failure(error, scope) => None,
+                    Err(error) => return Err(error),
+                }
+            }
+            _ => None,
+        };
+        let granted = match landed {
+            Some(pending) => Ok(pending),
+            None => {
+                links
+                    .grant(&peer, rail, binding.transfer, &native_scope(scope))
+                    .await
+            }
+        };
+        let pending = match granted {
             Ok(pending) => pending,
             Err(error) if native_failure(error, scope) => {
                 links.record_http_fallback();
@@ -525,8 +563,46 @@ impl Transfers {
     /// Receiver: read the sender's one signed outcome. `Complete` means the page
     /// is in the granted window; anything after that is `Io`, because the HTTP
     /// body was never sent. `Finish` carries the HTTP body.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)] // Preserve explicit authenticated transfer inputs.
     pub(super) async fn receive_native(
+        &self,
+        connection: ConnectionLease,
+        authentication: ForwardedHead,
+        binding: Binding,
+        accept: SignedHead,
+        peer: NodeId,
+        control: SignedHead,
+        pending: PendingReceive,
+        membership: &std::sync::Arc<crate::topology::Membership>,
+        length: usize,
+        scope: &RequestScope,
+    ) -> Result<SignedResponse> {
+        match self
+            .receive_native_into(
+                connection,
+                authentication,
+                binding,
+                accept,
+                peer,
+                control,
+                pending,
+                membership,
+                length,
+                scope,
+            )
+            .await?
+        {
+            RelayResponse::Complete(response) => Ok(response),
+            _ => Err(Error::Internal),
+        }
+    }
+
+    /// Like [`Self::receive_native`], but a landing grant
+    /// ([`Self::accept_native`] with a GPU) whose page the sender wrote
+    /// comes back as [`RelayResponse::Landed`].
+    #[allow(clippy::too_many_arguments)] // Preserve explicit authenticated transfer inputs.
+    pub(super) async fn receive_native_into(
         &self,
         connection: ConnectionLease,
         authentication: ForwardedHead,
@@ -538,7 +614,7 @@ impl Transfers {
         membership: &std::sync::Arc<crate::topology::Membership>,
         length: usize,
         scope: &RequestScope,
-    ) -> Result<SignedResponse> {
+    ) -> Result<RelayResponse> {
         binding.response = envelope_digest(&authentication)?;
         let (verified, phase) = binding.verify(
             &self.signatures,
@@ -572,7 +648,49 @@ impl Transfers {
             drop(pending);
             return self
                 .receive_fallback(connection, authentication, length, scope)
-                .await;
+                .await
+                .map(RelayResponse::Complete);
+        }
+        if pending.is_landing() {
+            let landed = pending
+                .finish_landed(&verified, &envelope, &native_scope(scope))
+                .await?;
+            #[cfg(test)]
+            self.native_completions
+                .set(self.native_completions.get() + 1);
+            // Only a fixed page request asks for landing. The signed head must
+            // describe exactly this page; the requester verifies the chain
+            // against its binding, and the GPU checks the tag.
+            let original = &authentication.original.head;
+            if crate::peer::protocol::field(original, "racer-outcome")? != "page" {
+                return Err(Error::Unauthorized);
+            }
+            let request_digest = crate::peer::protocol::decode_binary(
+                crate::peer::protocol::field(original, "racer-request-binding")?.as_bytes(),
+            )?
+            .try_into()
+            .map_err(|_| Error::InvalidRequest)?;
+            let path = crate::peer::protocol::decode_nodes(
+                crate::peer::protocol::field(original, "racer-response-path")?.as_bytes(),
+            )?;
+            crate::peer::protocol::agrees(
+                original,
+                &crate::peer::protocol::landed_response_head(
+                    &metadata,
+                    &envelope,
+                    &request_digest,
+                    &path,
+                )?,
+                false,
+            )?;
+            let mut connection = connection;
+            connection.finish_exchange()?;
+            return Ok(RelayResponse::Landed(Box::new(LandedResponse {
+                authentication,
+                metadata,
+                envelope,
+                landed,
+            })));
         }
         let (admission, _) = &self.wire;
         // The arrival stays in registered memory; retaining paths copy it out.
@@ -615,10 +733,10 @@ impl Transfers {
         )?;
         let mut connection = connection;
         connection.finish_exchange()?;
-        Ok(SignedResponse {
+        Ok(RelayResponse::Complete(SignedResponse {
             authentication,
             response,
-        })
+        }))
     }
     async fn receive_fallback(
         &self,
@@ -964,11 +1082,27 @@ fn observe_read(
     result
 }
 
+/// A peer page whose ciphertext a NIC wrote into a GPU landing buffer, with
+/// its signed response envelope. The requester verifies the signatures
+/// against its outstanding binding, as for any response, and the GPU checks
+/// the tag. There are no host bytes: this never reaches memory, disk, or
+/// another reader.
+pub struct LandedResponse {
+    pub authentication: crate::peer::forwarding::ForwardedHead,
+    pub metadata: crate::model::ObjectMetadata,
+    pub envelope: crate::model::PageEnvelope,
+    pub landed: crate::gpu::LandedCiphertext,
+}
+
 /// Internal transport result: native delivery stays materialized; HTTP relay
 /// delivery owns an unfinished connection and its exact opaque body framing.
 #[allow(clippy::large_enum_variant)] // Keep completed delivery inline without another allocation.
 pub enum RelayResponse {
     Complete(SignedResponse),
+
+    /// A page in a GPU landing buffer. Only a requester that asked for
+    /// landing gets this, and only that requester's sealed read uses it.
+    Landed(Box<LandedResponse>),
 
     Http {
         authentication: crate::peer::forwarding::ForwardedHead,
@@ -1074,6 +1208,7 @@ impl Transfers {
         receive_permit: Option<Arc<super::receive::Permit>>,
         failure: Rc<std::cell::Cell<bool>>,
         mut timing: Option<&'a mut super::PageTiming<'_>>,
+        landing: Option<i32>,
         scope: &'a RequestScope,
     ) -> Operation<'a, RelayResponse> {
         Box::pin(async move {
@@ -1159,7 +1294,7 @@ impl Transfers {
             // Native response verification requires an authenticated membership lease.
             let granting = now();
             let native = if membership.is_some() {
-                self.accept_native(&request, plan, scope).await?
+                self.accept_native(&request, plan, landing, scope).await?
             } else {
                 None
             };
@@ -1218,7 +1353,7 @@ impl Transfers {
                 let (binding, accept, peer, pending) = native.ok_or(Error::Unauthorized)?;
                 let arriving = now();
                 let received = self
-                    .receive_native(
+                    .receive_native_into(
                         received.connection,
                         authentication,
                         binding,
@@ -1230,8 +1365,7 @@ impl Transfers {
                         length,
                         scope,
                     )
-                    .await
-                    .map(RelayResponse::Complete);
+                    .await;
                 if received.is_ok() {
                     self.record_rdma_stage(Event::RdmaArrivalCount, Event::RdmaArrivalNs, arriving);
                 }
