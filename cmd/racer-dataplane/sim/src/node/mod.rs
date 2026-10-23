@@ -23,5 +23,10 @@ pub mod config;
 pub mod ids;
 pub mod membership;
 pub mod state;
+pub mod world;
 
 pub use config::NodeConfig;
+pub use world::NodeWorld;
+
+#[cfg(test)]
+mod tests;
