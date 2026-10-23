@@ -4,6 +4,9 @@
 //! process and one thread. See `designs/racer-core-simulation.md`.
 //! This is a skeleton: it parses options and returns a report stub.
 
+pub mod engine;
+pub mod report;
+
 use serde_json::{Value, json};
 
 pub const USAGE: &str = "usage: racer-sim [--scenario NAME] [--nodes N] [--seed S] [--out PATH]";
