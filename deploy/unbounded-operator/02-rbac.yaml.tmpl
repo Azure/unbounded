@@ -66,11 +66,13 @@ rules:
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["get"]
-  # Racer creates its empty racer-webhook EndpointSlice once. The Racer
-  # runtime fills it; the operator never updates it.
+  # Racer creates its empty racer-webhook EndpointSlice. The Racer runtime
+  # fills it; the operator never updates it. The address type is immutable,
+  # so when the racer-webhook Service changes primary IP family the operator
+  # deletes its slice and creates it again.
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
-    verbs: ["create"]
+    verbs: ["create", "delete"]
   - apiGroups: ["apps"]
     resources: ["deployments", "daemonsets"]
     verbs: ["get", "list", "watch", "create", "patch", "update", "delete", "deletecollection"]

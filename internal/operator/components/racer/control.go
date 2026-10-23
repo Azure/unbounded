@@ -104,33 +104,50 @@ func planControl(ctx context.Context, env *component.Env, plan *component.Plan, 
 // differ from status.podIP, for example on dual-stack hostNetwork Pods, so
 // seats serve the webhook on each Pod IP family and the primary publishes the
 // one matching this slice. It waits for the Service to exist.
+//
+// When the Service was recreated with a different primary family, the
+// existing slice is replaced: the executor runs removals before writes, so
+// the delete and the create land in the same pass.
 func planEndpointSlice(ctx context.Context, env *component.Env, plan *component.Plan) error {
-	current := &discoveryv1.EndpointSlice{}
-
-	err := env.LiveReader().Get(ctx, objectKey(env, webhookName), current)
-	if err == nil {
-		current.SetGroupVersionKind(discoveryv1.SchemeGroupVersion.WithKind("EndpointSlice"))
-		return validateAdoptable(ctx, env, current)
-	}
-
-	if !apierrors.IsNotFound(err) {
-		return err
-	}
-
 	service := &corev1.Service{}
 
-	err = env.LiveReader().Get(ctx, objectKey(env, webhookName), service)
-	if apierrors.IsNotFound(err) {
-		return nil
-	}
+	err := env.LiveReader().Get(ctx, objectKey(env, webhookName), service)
+	serviceFound := err == nil
 
-	if err != nil {
+	if err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
 
-	family := discoveryv1.AddressTypeIPv4
-	if len(service.Spec.IPFamilies) != 0 && service.Spec.IPFamilies[0] == corev1.IPv6Protocol {
-		family = discoveryv1.AddressTypeIPv6
+	current := &discoveryv1.EndpointSlice{}
+
+	err = env.LiveReader().Get(ctx, objectKey(env, webhookName), current)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	if err == nil {
+		current.SetGroupVersionKind(discoveryv1.SchemeGroupVersion.WithKind("EndpointSlice"))
+
+		if err := validateAdoptable(ctx, env, current); err != nil {
+			return err
+		}
+
+		if !serviceFound || current.AddressType == serviceFamily(service) {
+			return nil
+		}
+
+		if current.Labels[managerLabel] != component.FieldOwner || current.Labels[discoveryv1.LabelManagedBy] != sliceManager {
+			return fmt.Errorf("EndpointSlice %s has address type %s but Service %s is %s, and the slice is not labeled as operator created; delete it to let the operator recreate it",
+				webhookName, current.AddressType, webhookName, serviceFamily(service))
+		}
+
+		stale := current.DeepCopy()
+		stale.SetManagedFields(nil)
+		plan.Add(component.Operation{Kind: component.OpDelete, Object: component.ToUnstructured(stale), Component: name})
+	}
+
+	if !serviceFound {
+		return nil
 	}
 
 	slice := &discoveryv1.EndpointSlice{
@@ -140,11 +157,11 @@ func planEndpointSlice(ctx context.Context, env *component.Env, plan *component.
 			Labels: map[string]string{
 				discoveryv1.LabelServiceName: webhookName,
 				// Keeps the EndpointSlice controller and mirroring away.
-				discoveryv1.LabelManagedBy: "racer.unbounded-cloud.io",
+				discoveryv1.LabelManagedBy: sliceManager,
 				managerLabel:               component.FieldOwner,
 			},
 		},
-		AddressType: family,
+		AddressType: serviceFamily(service),
 		Ports:       []discoveryv1.EndpointPort{{Name: ptr.To("webhook"), Port: ptr.To(int32(9443)), Protocol: ptr.To(corev1.ProtocolTCP)}},
 		Endpoints:   []discoveryv1.Endpoint{},
 	}
@@ -152,4 +169,17 @@ func planEndpointSlice(ctx context.Context, env *component.Env, plan *component.
 	plan.Add(component.Operation{Kind: component.OpCreateIfAbsent, Object: component.ToUnstructured(slice), Component: name})
 
 	return nil
+}
+
+// sliceManager is the EndpointSlice managed-by label value for racer-webhook.
+const sliceManager = "racer.unbounded-cloud.io"
+
+// serviceFamily returns the EndpointSlice address type matching the primary
+// IP family of a Service.
+func serviceFamily(service *corev1.Service) discoveryv1.AddressType {
+	if len(service.Spec.IPFamilies) != 0 && service.Spec.IPFamilies[0] == corev1.IPv6Protocol {
+		return discoveryv1.AddressTypeIPv6
+	}
+
+	return discoveryv1.AddressTypeIPv4
 }
