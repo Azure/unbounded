@@ -117,6 +117,20 @@ func TestResolveNvidiaHostForPreflightDefersReadiness(t *testing.T) {
 	require.Contains(t, host.GPUDevicePaths, filepath.Join(deviceDir, "nvidia0"))
 }
 
+func TestDiscoverNVIDIADevicesIncludesNvidiaFS(t *testing.T) {
+	t.Parallel()
+
+	deviceDir := t.TempDir()
+
+	for _, device := range []string{"nvidia0", nvidiaControlDeviceName, "nvidia-fs0", "nvidia-fs15"} {
+		require.NoError(t, os.WriteFile(filepath.Join(deviceDir, device), nil, 0o644))
+	}
+
+	devices := discoverNVIDIADevicesIn(deviceDir)
+	require.Contains(t, devices, filepath.Join(deviceDir, "nvidia-fs0"))
+	require.Contains(t, devices, filepath.Join(deviceDir, "nvidia-fs15"))
+}
+
 func TestResolveNvidiaHostUdevDataDir(t *testing.T) {
 	t.Parallel()
 
