@@ -5,6 +5,7 @@ package healthcheck
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -33,6 +34,8 @@ const flapWindowDuration = 5 * time.Minute
 type session struct {
 	peerHostname   string
 	overlayIP      net.IP
+	viaIf          string
+	viaIfIndex     int // cached index of viaIf; only used by sendProbe
 	port           int
 	localHost      string
 	probePhaseSeed uint64
@@ -65,6 +68,7 @@ type session struct {
 type sessionConfig struct {
 	peerHostname  string
 	overlayIP     net.IP
+	viaIf         string // when set, probes leave through this interface
 	port          int
 	localHostname string
 	settings      HealthCheckSettings
@@ -86,6 +90,7 @@ func newSession(cfg sessionConfig) *session {
 	return &session{
 		peerHostname:     cfg.peerHostname,
 		overlayIP:        cfg.overlayIP,
+		viaIf:            cfg.viaIf,
 		port:             cfg.port,
 		localHost:        cfg.localHostname,
 		probePhaseSeed:   seed,
@@ -400,8 +405,15 @@ func (s *session) sendProbe() {
 	addr := &net.UDPAddr{IP: s.overlayIP, Port: s.port}
 	s.mu.Unlock()
 
-	if _, err := s.conn.WriteTo(data, addr); err != nil {
-		klog.V(4).Infof("healthcheck: failed to send probe to %s (%s): %v",
+	if err := s.write(data, addr); err != nil {
+		// A probe through a named interface fails for configuration reasons
+		// (missing device, no route), not transient loss, so make it visible.
+		level := klog.Level(4)
+		if s.viaIf != "" {
+			level = 2
+		}
+
+		klog.V(level).Infof("healthcheck: failed to send probe to %s (%s): %v",
 			s.peerHostname, addr, err)
 
 		return
@@ -411,6 +423,33 @@ func (s *session) sendProbe() {
 	s.packetsSent++
 	s.mu.Unlock()
 	metricPacketsSent.Inc()
+}
+
+// write sends a probe, through viaIf when the session has one. The interface
+// index is cached and looked up again after a failed send, since the device
+// may have been recreated.
+func (s *session) write(data []byte, addr *net.UDPAddr) error {
+	if s.viaIf == "" {
+		_, err := s.conn.WriteTo(data, addr)
+		return err
+	}
+
+	if s.viaIfIndex == 0 {
+		ifi, err := net.InterfaceByName(s.viaIf)
+		if err != nil {
+			return fmt.Errorf("send via %s: %w", s.viaIf, err)
+		}
+
+		s.viaIfIndex = ifi.Index
+	}
+
+	if err := writeVia(s.conn, data, addr, s.viaIfIndex); err != nil {
+		s.viaIfIndex = 0
+
+		return fmt.Errorf("send via %s: %w", s.viaIf, err)
+	}
+
+	return nil
 }
 
 func (s *session) setState(newState SessionState) {
