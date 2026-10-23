@@ -183,6 +183,7 @@ def test_register_and_load(server, uri, monkeypatch, tmp_path):
 
 def test_entry_point_declared():
     here = os.path.dirname(__file__)
-    text = open(os.path.join(here, "..", "pyproject.toml")).read()
+    with open(os.path.join(here, "..", "pyproject.toml"), encoding="utf-8") as f:
+        text = f.read()
     assert '[project.entry-points."vllm.general_plugins"]' in text
     assert 'racer = "racer_vllm:register"' in text
