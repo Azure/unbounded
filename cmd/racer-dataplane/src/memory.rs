@@ -1361,7 +1361,11 @@ impl MemoryCache {
         ) {
             return Err(Error::MissingKey);
         }
-        if self.ciphertext_entries.borrow().contains_key(id) {
+        // A verified entry already owns this page's ciphertext. Retaining a
+        // second copy would pin it and keep it from ever going idle.
+        if self.entries.borrow().pages.contains_key(id)
+            || self.ciphertext_entries.borrow().contains_key(id)
+        {
             return Ok(());
         }
         page.copy.ciphertext = self.pool.retainable(page.copy.ciphertext)?;
@@ -2027,6 +2031,44 @@ pub(crate) mod tests {
                 assert!(entries.order.is_empty() && entries.ticks.is_empty());
                 drop(entries);
                 assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+            }
+
+            #[test]
+            fn republishing_verified_ciphertext_does_not_pin_it() {
+                let admission = admission(8);
+                let cache = MemoryCache::new(
+                    BufferPool::new(admission.clone()),
+                    crate::test_support::availability(),
+                );
+                let start = std::time::Instant::now();
+                let page = publish(&cache, &admission, "page");
+                // A ciphertext acquisition after the plaintext was released
+                // returns the verified entry, which a fill republishes.
+                let copy = cache.unverified(&page).unwrap().unwrap();
+                cache.publish_ciphertext(copy.clone()).unwrap();
+                assert!(cache.ciphertext_entries.borrow().is_empty());
+                assert_eq!(cache.entries.borrow().len(), 1);
+                // Still held externally, so not idle yet.
+                assert_eq!(expire_through(&cache, start, CACHE_IDLE_TTL * 2), 0);
+                drop(copy);
+                let later = start + CACHE_IDLE_TTL * 2 + CACHE_EXPIRY_CHECKPOINT;
+                assert_eq!(cache.expire_idle(later), 1);
+                assert_eq!(cache.entries.borrow().len(), 0);
+                assert!(cache.ciphertext_entries.borrow().is_empty());
+            }
+
+            #[test]
+            fn publish_ciphertext_still_caches_pages_without_verified_entry() {
+                let admission = admission(8);
+                let cache = MemoryCache::new(
+                    BufferPool::new(admission.clone()),
+                    crate::test_support::availability(),
+                );
+                let verified = publish(&cache, &admission, "verified");
+                let other = publish_ciphertext(&cache, &admission, "other");
+                assert!(cache.entries.borrow().pages.contains_key(&verified));
+                assert!(!cache.entries.borrow().pages.contains_key(&other));
+                assert!(cache.ciphertext_entries.borrow().contains_key(&other));
             }
 
             #[test]
