@@ -52,9 +52,48 @@ func TestResolveClusterName(t *testing.T) {
 }
 
 func TestHarnessKubeconfigPathStaysInRepoTmp(t *testing.T) {
-	got := harnessKubeconfigPath("/repo", "gantry-e2e-mine")
+	got, err := harnessKubeconfigPath("/repo", "gantry-e2e-mine")
+	if err != nil {
+		t.Fatalf("harnessKubeconfigPath() error = %v", err)
+	}
+
 	if want := filepath.Join("/repo", "tmp", "gantry-e2e", "gantry-e2e-mine", "kubeconfig"); got != want {
 		t.Fatalf("harnessKubeconfigPath() = %q, want %q", got, want)
+	}
+}
+
+func TestHarnessKubeconfigPathRejectsUnsafeClusterNames(t *testing.T) {
+	for _, name := range []string{
+		"",
+		".",
+		"..",
+		"../../../other",
+		"a/b",
+		`a\b`,
+		`..\sibling`,
+		"/abs/path",
+		"/",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got, err := harnessKubeconfigPath("/repo", name); err == nil {
+				t.Fatalf("harnessKubeconfigPath(%q) = %q, want error", name, got)
+			}
+		})
+	}
+}
+
+func TestHarnessKubeconfigPathAcceptsKindNames(t *testing.T) {
+	for _, name := range []string{"gantry-e2e", "gantry-ci-fix-kcfg", "kind", "a.b", "..x", "x.."} {
+		t.Run(name, func(t *testing.T) {
+			got, err := harnessKubeconfigPath("/repo", name)
+			if err != nil {
+				t.Fatalf("harnessKubeconfigPath(%q) error = %v", name, err)
+			}
+
+			if want := filepath.Join("/repo", "tmp", "gantry-e2e", name, "kubeconfig"); got != want {
+				t.Fatalf("harnessKubeconfigPath(%q) = %q, want %q", name, got, want)
+			}
+		})
 	}
 }
 
