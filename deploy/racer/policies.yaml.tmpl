@@ -70,8 +70,8 @@ spec:
       reason: Forbidden
     - expression: >-
         !('racer.unbounded-cloud.io/report' in variables.annotations) ||
-        size(variables.annotations['racer.unbounded-cloud.io/report']) <= 32768
-      message: The Racer report annotation is limited to 32768 bytes
+        size(bytes(variables.annotations['racer.unbounded-cloud.io/report'])) <= 32768
+      message: The Racer report annotation is limited to 32768 UTF-8 bytes
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

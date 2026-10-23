@@ -122,12 +122,20 @@ pub const MAX_ADMISSION_BYTES: usize = 3 * 1024 * 1024;
 /// Maximum bearer token length.
 pub const MAX_TOKEN_BYTES: usize = 16 * 1024;
 
-/// Longest RDMA device name discovery can report: the kernel's
-/// `IB_DEVICE_NAME_MAX` (64) less its NUL terminator. The wire itself does not
-/// bound device names; a longer name only fits while the whole report does.
+/// Longest RDMA device name discovery can report. Discovery copies
+/// `ibv_get_device_name` into the 64-byte `name` of `struct rdma_verbs_port`
+/// and skips any port whose name does not fit with its NUL terminator
+/// (`verbs/native/verbs.c`, mirrored by `Port::name` in `verbs/src/ffi.rs`;
+/// libibverbs bounds names by `IBV_SYSFS_NAME_MAX` (64) as well). This crate
+/// does not depend on `rdma-verbs`, so the value is restated here.
+///
+/// The wire itself does not bound device names, so a wire-valid report with
+/// longer names is accepted only while the whole report fits.
 pub const MAX_REPORT_DEVICE_BYTES: usize = 63;
 
-/// Largest canonical report for the wire maximum NIC inventory.
+/// Largest canonical report for the largest discoverable NIC inventory. It
+/// does not cover every wire-valid report, since wire device names are
+/// unbounded.
 ///
 /// The worst case NIC has a device name of [`MAX_REPORT_DEVICE_BYTES`] control
 /// characters, each escaped by JSON as `\u00XX` (6 bytes; other UTF-8 is not
@@ -147,7 +155,8 @@ pub const MAX_REPORT_INVENTORY_BYTES: usize = {
 
 /// Maximum Pod report annotation length. It is the inventory bound rounded up
 /// to 32 KiB, well below the 256 KiB Kubernetes limit on all annotations of
-/// an object. `deploy/racer/policies.yaml.tmpl` enforces the same value.
+/// an object. `deploy/racer/policies.yaml.tmpl` enforces the same value in
+/// UTF-8 bytes; `report_limit_matches_policy` checks they agree.
 pub const MAX_REPORT_BYTES: usize = 32 * 1024;
 
 const _: () = assert!(MAX_REPORT_INVENTORY_BYTES <= MAX_REPORT_BYTES);
@@ -175,6 +184,17 @@ mod tests {
         );
         assert_eq!(connection_capacity(1 << 20), MAX_CONTROL_CONNECTIONS);
         assert_eq!(connection_capacity(0), 1);
+    }
+
+    #[test]
+    fn report_limit_matches_policy() {
+        let policy = include_str!("../../../../deploy/racer/policies.yaml.tmpl");
+        let check = format!(
+            "size(bytes(variables.annotations['racer.unbounded-cloud.io/report'])) <= {MAX_REPORT_BYTES}"
+        );
+        assert_eq!(policy.matches(&check).count(), 1, "{check}");
+        let message = format!("limited to {MAX_REPORT_BYTES} UTF-8 bytes");
+        assert_eq!(policy.matches(&message).count(), 1, "{message}");
     }
 
     #[test]

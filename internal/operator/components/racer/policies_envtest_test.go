@@ -5,7 +5,10 @@ package racer
 
 import (
 	"context"
+	"io/fs"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -176,8 +179,20 @@ func TestEnvtestRacerAdmissionAndRBAC(t *testing.T) {
 		denied(t, update(t, f, a.client, pod, func(p *corev1.Pod) {
 			p.OwnerReferences = []metav1.OwnerReference{{APIVersion: "v1", Kind: "ConfigMap", Name: "x", UID: "x"}}
 		}))
-		// Matches MAX_REPORT_BYTES in cmd/racer-dataplane/cluster-control/src/limits.rs.
-		const maxReport = 32 * 1024
+		// The policy's limit, which a Rust test ties to MAX_REPORT_BYTES in
+		// cmd/racer-dataplane/cluster-control/src/limits.rs.
+		policy, err := fs.ReadFile(manifests.Manifests, "policies.yaml")
+		require.NoError(t, err)
+
+		limit := regexp.MustCompile(`size\(bytes\(variables\.annotations\['racer\.unbounded-cloud\.io/report'\]\)\) <= (\d+)`).FindSubmatch(policy)
+		require.NotNil(t, limit)
+		maxReport, err := strconv.Atoi(string(limit[1]))
+		require.NoError(t, err)
+		// "\u00e9" is two UTF-8 bytes: the limit counts bytes, not code points.
+		nonASCII := strings.Repeat("\u00e9", maxReport/2)
+		require.NoError(t, f.annotatePod(ctx, a.client, a.pod, "racer.unbounded-cloud.io/report", nonASCII))
+		denied(t, f.annotatePod(ctx, a.client, a.pod, "racer.unbounded-cloud.io/report", nonASCII+"r"))
+		denied(t, f.annotatePod(ctx, a.client, a.pod, "racer.unbounded-cloud.io/report", strings.Repeat("\u00e9", maxReport/2+1)))
 		require.NoError(t, f.annotatePod(ctx, a.client, a.pod, "racer.unbounded-cloud.io/report", strings.Repeat("r", maxReport)))
 		denied(t, f.annotatePod(ctx, a.client, a.pod, "racer.unbounded-cloud.io/report", strings.Repeat("r", maxReport+1)))
 		denied(t, update(t, f, a.client, pod, func(p *corev1.Pod) {
