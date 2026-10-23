@@ -252,6 +252,7 @@ pub fn validate_origin_authority(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Tests build instants to feed the API.
 mod tests {
     use super::*;
     use racer_control_wire::CacheId;

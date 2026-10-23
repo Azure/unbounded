@@ -110,6 +110,7 @@ pub fn persist(facts: PersistFacts) -> Persist {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Tests build instants to feed the API.
 mod tests {
     use super::*;
 

@@ -8,6 +8,7 @@ pub mod budget;
 pub mod candidates;
 pub mod error;
 pub mod policy;
+pub mod walk;
 pub mod worker;
 
 pub use budget::AcquisitionBudget;
