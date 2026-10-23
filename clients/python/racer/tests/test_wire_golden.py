@@ -14,7 +14,7 @@ import socket
 import pytest
 
 import racer
-from racer import _wire as wire
+import racer._wire as wire
 
 KEY = "ab" * 32
 
@@ -108,9 +108,9 @@ def test_direct_head_from_rust_is_accepted():
         "Racer-Delivery: host\r\nConnection: close\r\n\r\n" % length
     ).encode()
     h = wire.parse_response_head(raw)
-    from racer.client import Client
+    import racer.client
 
-    meta, first, end = Client._check_selection(h, 3, 3, None)
+    meta, first, end = racer.client.Client._check_selection(h, 3, 3, None)
     assert (meta.size, first, end) == (length, 3, 6)
     assert wire.decimal(h.get("content-length")) == wire.FRAME_SIZE * (wire.page_count(first, end) + 1)
     seq = wire.Sequence(first, end)

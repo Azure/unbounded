@@ -10,14 +10,14 @@ sys.path.insert(0, os.path.dirname(__file__))
 from fakeserver import FakeRacer  # noqa: E402
 
 import racer  # noqa: E402
-from racer import _wire  # noqa: E402
+import racer._wire  # noqa: E402
 
 SMALL_PAGE = 4096
 
 
 @pytest.fixture
 def small_pages(monkeypatch):
-    monkeypatch.setattr(_wire, "PAGE_SIZE", SMALL_PAGE)
+    monkeypatch.setattr(racer._wire, "PAGE_SIZE", SMALL_PAGE)
     return SMALL_PAGE
 
 

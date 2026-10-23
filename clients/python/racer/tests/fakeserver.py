@@ -13,7 +13,7 @@ import threading
 from dataclasses import dataclass, field
 
 import racer
-from racer import _wire as wire
+import racer._wire as wire
 
 
 @dataclass

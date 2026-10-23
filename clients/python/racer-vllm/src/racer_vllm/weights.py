@@ -172,7 +172,8 @@ class TorchBackend(Backend):
         self._events: dict = {}
 
     def _new(self, size: int):
-        from racer import cuda, tensors
+        import racer.cuda as cuda
+        import racer.tensors as tensors
 
         if self.use_vmm:
             try:

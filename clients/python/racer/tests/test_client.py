@@ -7,8 +7,8 @@ from conftest import FakeGpu
 from fakeserver import Obj
 
 import racer
-from racer import _wire as wire
-from racer.client import _mode_state
+import racer._wire as wire
+import racer.client
 
 DATA = bytes(range(256)) * 50  # 12800 bytes: 4 pages of 4096 (last partial)
 
@@ -253,7 +253,7 @@ def test_modes_remembered_per_socket(server, tmp_path):
     server.old = True
     with racer.HostBuffer(len(DATA)) as buf:
         client(server).read_into_host(req, buf)
-    assert _mode_state[server.path][racer.HOST] == "unsupported"
+    assert racer.client._mode_state[server.path][racer.HOST] == "unsupported"
     other = racer.Client(socket_path=str(tmp_path / "other"))
     assert other.mode_state(racer.HOST) is None
 
