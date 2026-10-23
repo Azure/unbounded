@@ -458,9 +458,13 @@ pub fn plan_with(
     for offer in offers {
         let encoded = STANDARD.encode(&offer.der);
         if let Some(r) = d.roots.iter_mut().find(|r| r.der == encoded) {
-            r.retain_until = r
-                .retain_until
-                .max((now + keep_after_offer).min(r.not_after));
+            // Extend with hysteresis so idle passes do not rewrite the
+            // deadline: only when less than keep_after_offer remains, and
+            // then by twice that, so a root is always retained at least
+            // keep_after_offer past the last pass that saw it offered.
+            if r.retain_until < (now + keep_after_offer).min(r.not_after) {
+                r.retain_until = (now + 2 * keep_after_offer).min(r.not_after);
+            }
             continue;
         }
         let hash = sha256(&offer.der);
@@ -484,7 +488,7 @@ pub fn plan_with(
             seat: offer.seat,
             holder: offer.holder.clone(),
             not_after: info.not_after,
-            retain_until: (now + keep_after_offer).min(info.not_after),
+            retain_until: (now + 2 * keep_after_offer).min(info.not_after),
         });
     }
     let mut kept = Vec::new();
@@ -503,7 +507,8 @@ pub fn plan_with(
     }
     d.roots = kept;
 
-    // Only these fields count as a change. Retain deadlines move every pass.
+    // Only these fields count as a change. Retain deadline extensions are
+    // persisted but do not bump the bundle generation.
     let material_change = |a: &Durable, b: &Durable| {
         a.keys != b.keys
             || a.roots
@@ -740,12 +745,13 @@ pub(crate) mod tests {
         .unwrap()
         .durable;
         assert_eq!(d.roots.len(), 2);
-        // b stops offering. It stays until a lease plus a certificate lifetime.
+        // b stops offering. It stays at least a lease plus a certificate
+        // lifetime (new roots get twice that, see hysteresis in plan_with).
         let d = plan(&policy(), &d, &[], std::slice::from_ref(&a), t + 100)
             .unwrap()
             .durable;
         assert_eq!(d.roots.len(), 2);
-        let later = t + 30 + DAY + 60 + 1;
+        let later = t + 2 * (30 + DAY + 60) + 1;
         let p = plan(&policy(), &d, &[], std::slice::from_ref(&a), later).unwrap();
         assert!(p.changed);
         assert_eq!(p.durable.roots.len(), 1);
@@ -762,6 +768,47 @@ pub(crate) mod tests {
         .durable;
         assert_eq!(again.roots.len(), 1);
         again.validate().unwrap();
+    }
+
+    #[test]
+    fn idle_passes_do_not_change_and_retention_stays_ahead() {
+        let t = now();
+        let a = Offer {
+            der: root(7),
+            seat: 0,
+            holder: "a".into(),
+        };
+        let pol = policy();
+        let keep = (pol.lease_duration + pol.certificate_lifetime + SKEW).as_secs();
+        let offers = std::slice::from_ref(&a);
+        let mut d = plan(&pol, &Durable::default(), &[], offers, t)
+            .unwrap()
+            .durable;
+        // (a) A second pass one second later is idle.
+        let p = plan(&pol, &d, &[], offers, t + 1).unwrap();
+        assert!(!p.changed);
+        // (b) Retention never drops below keep_after_offer while offered,
+        // and changes are rare.
+        let mut changes = 0;
+        let mut now_ = t;
+        while now_ < t + 3 * keep {
+            now_ += 10;
+            let p = plan(&pol, &d, &[], offers, now_).unwrap();
+            assert!(p.durable.roots[0].retain_until >= now_ + keep);
+            if p.changed {
+                changes += 1;
+            }
+            d = p.durable;
+        }
+        assert!(changes <= 4, "changes={changes}");
+        // (c) Stops being offered: kept for keep_after_offer, then retired.
+        let last = now_;
+        let p = plan(&pol, &d, &[], &[], last + keep - 1).unwrap();
+        assert_eq!(p.durable.roots.len(), 1);
+        let p = plan(&pol, &p.durable, &[], &[], last + 2 * keep + 1).unwrap();
+        assert!(p.changed);
+        assert!(p.durable.roots.is_empty());
+        assert_eq!(p.durable.retired.len(), 1);
     }
 
     #[test]
