@@ -15,7 +15,7 @@ use std::{
 use rdma_verbs::{
     Arrival, BACKOFF_MIN, BufferState, COMMAND_QUEUE, Client, Epoch, Error, Granted, LinkKey,
     LinkState, NodeConfig, Op, Opened, Owner, SETUP_TIMEOUT, Setup, Source,
-    simulation::{Device, Fault, Operation, Simulation},
+    simulation::{Device, Fault, MemfdMemory, Operation, Simulation},
 };
 use uring_runtime::environment::{Environment, SimulationClock};
 
@@ -197,7 +197,7 @@ fn bytes(data: Vec<u8>) -> Source {
 fn page(arrival: rdma_verbs::Result<Arrival>) -> rdma_verbs::RegisteredPage {
     match arrival.unwrap() {
         Arrival::Page(page) => page,
-        Arrival::Released => panic!("released"),
+        Arrival::Released | Arrival::Device(_) => panic!("expected a host page"),
     }
 }
 
@@ -816,4 +816,170 @@ mod inner {
             Box::pin(async { Ok(()) })
         }
     }
+}
+
+/// Device pool memory: two buffers plus a tail too small for a third.
+fn device_memory() -> Arc<MemfdMemory> {
+    MemfdMemory::new(2 * LEN + 5, 0x7000_0000).unwrap()
+}
+
+fn device_page(arrival: rdma_verbs::Result<Arrival>) -> rdma_verbs::DevicePage {
+    match arrival.unwrap() {
+        Arrival::Device(page) => page,
+        other => panic!("expected a device page, got {other:?}"),
+    }
+}
+
+#[test]
+/// A device grant lands the peer's write in dma-buf memory with no CPU copy:
+/// the bytes are only visible through the memory owner, the page holds its
+/// buffer until dropped, and host grants keep using the host pool.
+fn device_grants_land_in_dmabuf_memory() {
+    let mut w = world();
+    let (ea, eb) = link_up(&mut w);
+    let memory = device_memory();
+    let attached = w.a.clients[0].attach_device(7, memory.clone());
+    assert_eq!(wait(&mut w, &attached), Ok(2));
+    assert_eq!(w.a.clients[0].device_buffers(7, BufferState::Free), Some(2));
+    assert_eq!(w.b.clients[0].device_buffers(7, BufferState::Free), None);
+    let deadline = now() + 5 * SECOND;
+    let mut held = Vec::new();
+    for round in 0..2u8 {
+        let granted = w.a.clients[0].grant_device(TO_B, ea, [round; 16], 100, deadline);
+        let granted = wait(&mut w, &granted).unwrap();
+        let data = vec![0xa0 | round; 100];
+        let written = w.b.clients[1].write(TO_A, eb, granted.tag, bytes(data.clone()), deadline);
+        assert_eq!(wait(&mut w, &written), Ok(()));
+        let page = device_page(ready(&granted.arrival));
+        assert_eq!((page.len(), page.is_empty()), (100, false));
+        assert_eq!(page.offset(), u64::from(round) * LEN as u64);
+        assert!(Arc::ptr_eq(
+            page.memory(),
+            &(memory.clone() as rdma_verbs::DeviceMemory)
+        ));
+        assert_eq!(memory.read(page.offset() as usize, 100), data);
+        held.push(page);
+    }
+    assert_eq!(
+        w.a.clients[0].device_buffers(7, BufferState::Owned),
+        Some(2)
+    );
+    // Both device buffers are held: the next device grant is refused, and
+    // nothing falls back to host memory.
+    let refused = w.a.clients[0].grant_device(TO_B, ea, [7; 16], 10, deadline);
+    assert_eq!(wait(&mut w, &refused).err(), Some(Error::Overloaded));
+    assert_eq!(w.a.clients[0].buffers(7, BufferState::Free), Some(BUFFERS));
+    // Host grants still use the host pool.
+    let host = w.a.clients[0].grant(TO_B, ea, [8; 16], 3, deadline);
+    let host = wait(&mut w, &host).unwrap();
+    let written = w.b.clients[0].write(TO_A, eb, host.tag, bytes(vec![1, 2, 3]), deadline);
+    assert_eq!(wait(&mut w, &written), Ok(()));
+    assert_eq!(page(ready(&host.arrival)).bytes(), [1, 2, 3]);
+    // A page dropped on another thread frees its buffer for the next grant,
+    // and a release returns a device buffer without producing a page.
+    let page = held.pop().unwrap();
+    std::thread::spawn(move || drop(page)).join().unwrap();
+    pump(&mut w);
+    let granted = w.a.clients[0].grant_device(TO_B, ea, [9; 16], 10, deadline);
+    let granted = wait(&mut w, &granted).unwrap();
+    let released = w.b.clients[0].release(TO_A, eb, granted.tag);
+    assert_eq!(wait(&mut w, &released), Ok(()));
+    assert!(matches!(ready(&granted.arrival), Ok(Arrival::Released)));
+    assert_eq!(w.a.clients[0].device_buffers(7, BufferState::Free), Some(1));
+    // Shutdown waits for the held device page.
+    w.a.clients[0].close();
+    pump(&mut w);
+    assert!(!w.a.clients[0].drained());
+    drop(held);
+    pump(&mut w);
+    assert!(w.a.clients[0].drained());
+    assert_eq!(
+        Arc::strong_count(&memory),
+        1,
+        "the memory owner is released"
+    );
+    shutdown(w);
+}
+
+#[test]
+/// Attach is once per activated rail; a device grant without a device pool
+/// is unavailable; a failed registration leaves nothing behind and can be
+/// retried.
+fn device_attach_rules_and_registration_faults() {
+    let mut w = world();
+    let (ea, _) = link_up(&mut w);
+    let deadline = now() + 5 * SECOND;
+    let missing = w.a.clients[0].grant_device(TO_B, ea, [1; 16], 10, deadline);
+    assert_eq!(wait(&mut w, &missing).err(), Some(Error::Unavailable));
+    let memory = device_memory();
+    let wrong_rail = w.a.clients[0].attach_device(3, memory.clone());
+    assert_eq!(wait(&mut w, &wrong_rail), Err(Error::InvalidRequest));
+    let live = w.sim.live_resources();
+    w.sim.fault(Operation::RegisterDmabuf, Fault::Reject);
+    let failed = w.a.clients[0].attach_device(7, memory.clone());
+    assert_eq!(wait(&mut w, &failed), Err(Error::Unavailable));
+    assert_eq!(w.sim.live_resources(), live, "nothing registered stays");
+    assert_eq!(Arc::strong_count(&memory), 1);
+    // Memory smaller than one buffer is refused after registration, and
+    // the region is deregistered again.
+    let small = w.a.clients[0].attach_device(7, MemfdMemory::new(LEN - 1, 0).unwrap());
+    assert_eq!(wait(&mut w, &small), Err(Error::InvalidConfiguration));
+    assert_eq!(w.sim.live_resources(), live);
+    let attached = w.a.clients[0].attach_device(7, memory.clone());
+    assert_eq!(wait(&mut w, &attached), Ok(2));
+    assert_eq!(w.sim.live_resources(), live + 1);
+    let again = w.a.clients[0].attach_device(7, device_memory());
+    assert_eq!(wait(&mut w, &again), Err(Error::InvalidRequest));
+    let attempts: Vec<i64> = w
+        .sim
+        .trace()
+        .iter()
+        .filter(|e| e.operation == Operation::RegisterDmabuf)
+        .map(|e| e.result)
+        .collect();
+    assert_eq!(attempts, [-1, 0, 0]);
+    shutdown(w);
+    assert_eq!(Arc::strong_count(&memory), 1);
+}
+
+#[test]
+/// A link break while a device grant is exposed fails the arrival, and the
+/// buffer is reused only after the QP is destroyed (the same fence as host
+/// grants).
+fn device_grant_break_fences_before_reuse() {
+    let mut w = world();
+    let (ea, eb) = link_up(&mut w);
+    let attached = w.a.clients[0].attach_device(7, device_memory());
+    assert_eq!(wait(&mut w, &attached), Ok(2));
+    let deadline = now() + 5 * SECOND;
+    let granted = w.a.clients[0].grant_device(TO_B, ea, [1; 16], 10, deadline);
+    let granted = wait(&mut w, &granted).unwrap();
+    assert_eq!(
+        w.a.clients[0].device_buffers(7, BufferState::Exposed),
+        Some(1)
+    );
+    w.sim
+        .fault_on(Operation::WriteImm, None, Fault::DuplicateImmediate);
+    let written = w.b.clients[0].write(TO_A, eb, granted.tag, bytes(vec![1; 10]), deadline);
+    pump(&mut w);
+    let _ = ready(&written);
+    assert_eq!(ready(&granted.arrival).err(), Some(Error::Unavailable));
+    assert!(matches!(w.a.clients[0].link(TO_B), LinkState::Backoff(_)));
+    assert_eq!(w.a.clients[0].device_buffers(7, BufferState::Free), Some(2));
+    shutdown(w);
+}
+
+#[test]
+/// Failed deregistration leaks the device region with its memory owner and
+/// charge, so the memory is never freed while the NIC may write it.
+fn failed_deregister_leaks_device_memory_owner() {
+    let mut w = world();
+    link_up(&mut w);
+    let memory = device_memory();
+    let attached = w.a.clients[0].attach_device(7, memory.clone());
+    assert_eq!(wait(&mut w, &attached), Ok(2));
+    w.sim.reject(Operation::Deregister, None, true);
+    drop(w.a.owner.take());
+    assert!(Arc::strong_count(&memory) > 1, "memory owner leaked");
+    assert!(w.a.charge.load(Ordering::Acquire) >= 1, "charge leaked");
 }

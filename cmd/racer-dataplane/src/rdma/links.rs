@@ -853,7 +853,8 @@ impl PendingReceive {
             .await;
         let page = match arrival {
             Ok(Arrival::Page(page)) => page,
-            Ok(Arrival::Released) => return Err(Error::Io),
+            // Only `grant` reaches here, and it never asks for a device page.
+            Ok(Arrival::Released | Arrival::Device(_)) => return Err(Error::Io),
             Err(error @ Error::Cancelled) => return Err(error),
             Err(_) => {
                 scope.check()?;

@@ -166,7 +166,7 @@ pub(crate) fn receive_registered(
     drive!(w, w.b.links.send(&a, &grant, page, &scope)).unwrap();
     match drive!(w, poll_fn(|cx| pending.arrival.poll(cx))).unwrap() {
         Arrival::Page(page) => page,
-        Arrival::Released => panic!("expected a page"),
+        Arrival::Released | Arrival::Device(_) => panic!("expected a page"),
     }
 }
 
@@ -382,7 +382,7 @@ fn setup_page_both_directions_and_release() {
         let arrival = drive!(w, poll_fn(|cx| pending.arrival.poll(cx))).unwrap();
         match arrival {
             Arrival::Page(page) => assert_eq!(page.bytes(), &[0x5a; 35]),
-            Arrival::Released => panic!("expected a page"),
+            Arrival::Released | Arrival::Device(_) => panic!("expected a page"),
         }
         // Release path: the receiver sees `Released` and the buffer is free.
         let pending = drive!(w, receiver.grant(from, RAIL, TransferId([4; 16]), &scope)).unwrap();
@@ -634,7 +634,7 @@ mod send_failures {
     fn arrived(w: &mut World, pending: &PendingReceive) -> Vec<u8> {
         match drive!(w, poll_fn(|cx| pending.arrival.poll(cx))).unwrap() {
             Arrival::Page(page) => page.bytes().to_vec(),
-            Arrival::Released => panic!("expected a page"),
+            Arrival::Released | Arrival::Device(_) => panic!("expected a page"),
         }
     }
 
@@ -796,7 +796,7 @@ mod send_in_place {
         let arrival = drive!(w, poll_fn(|cx| pending.arrival.poll(cx))).unwrap();
         match arrival {
             Arrival::Page(page) => assert_eq!(page.bytes(), &[0xc3; 35][..]),
-            Arrival::Released => panic!("expected a page"),
+            Arrival::Released | Arrival::Device(_) => panic!("expected a page"),
         }
         pump!(w);
         assert!(

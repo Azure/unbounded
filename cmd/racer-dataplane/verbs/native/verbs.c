@@ -64,10 +64,14 @@ _Static_assert(IBV_WC_SEND == 0 && IBV_WC_RDMA_WRITE == 1 && IBV_WC_BIND_MW == 5
 /* Private handles. Rust only holds pointers to these. */
 struct rdma_verbs_device { struct ibv_context *ctx; struct ibv_pd *pd; };
 struct rdma_verbs_qp { struct ibv_qp *qp; struct ibv_cq *cq; };
-struct rdma_verbs_mr { struct ibv_mr *mr; void *bytes; size_t length; };
+/* `bytes` is NULL for an implicit or dma-buf region. `addr` is the address
+ * windows bind from: the buffer pointer, or the dma-buf iova. `device` is set
+ * for a dma-buf region, which only receives through windows. */
+struct rdma_verbs_mr { struct ibv_mr *mr; void *bytes; size_t length; uint64_t addr; int device; };
 
-/* ABI version. Rust refuses to load any other value. */
-uint32_t rdma_verbs_abi(void) { return 4; }
+/* ABI version. Rust refuses to load any other value.
+ * Version 5 added rdma_verbs_register_dmabuf. */
+uint32_t rdma_verbs_abi(void) { return 5; }
 
 /* Distinct from negative errno: cleanup leaked a resource. Rust must keep
  * the admission owner and adapter loaded. Stop before another resource leaks. */
@@ -246,11 +250,30 @@ void *rdma_verbs_register(struct rdma_verbs_device *d, uint64_t length, uint32_t
     if (!m) return NULL;
     if (posix_memalign(&m->bytes, 4096, (size_t)length)) { free(m); return NULL; }
     memset(m->bytes, 0, (size_t)length); m->length = (size_t)length;
+    m->addr = (uintptr_t)m->bytes;
     m->mr = ibv_reg_mr(d->pd, m->bytes, (size_t)length, flags);
     if (!m->mr) { free(m->bytes); free(m); return NULL; }
     return m;
 }
-/* Deregister and free the buffer. */
+/* Register `length` bytes of a dma-buf, starting at `offset` in it, as page
+ * buffers (LOCAL_WRITE | MW_BIND, so peers write only through windows).
+ * Windows over it bind from `iova`. The caller keeps the memory behind the
+ * dma-buf alive until deregister succeeds. The kernel holds its own reference
+ * to the dma-buf, so `fd` may be closed after this returns. The CPU cannot
+ * reach the memory: rdma_verbs_bytes returns NULL, and send, write, and
+ * receive posts reject the region. Needs rdma-core 34 or later. */
+void *rdma_verbs_register_dmabuf(struct rdma_verbs_device *d, uint64_t offset, uint64_t length,
+                                 uint64_t iova, int fd) {
+    if (!length || length > SIZE_MAX || fd < 0) return NULL;
+    struct rdma_verbs_mr *m = calloc(1, sizeof(*m));
+    if (!m) return NULL;
+    m->length = (size_t)length; m->addr = iova; m->device = 1;
+    m->mr = ibv_reg_dmabuf_mr(d->pd, offset, (size_t)length, iova, fd,
+                              IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_MW_BIND);
+    if (!m->mr) { free(m); return NULL; }
+    return m;
+}
+/* Deregister and free the buffer, if this side allocated one. */
 int rdma_verbs_deregister(struct rdma_verbs_mr *m) {
     int rc = ibv_dereg_mr(m->mr);
     if (!rc) { free(m->bytes); free(m); }
@@ -279,7 +302,7 @@ void *rdma_verbs_register_implicit(struct rdma_verbs_device *d) {
     m->bytes = NULL; m->length = SIZE_MAX;
     return m;
 }
-/* The buffer behind a registered region. */
+/* The buffer behind a registered region. NULL for an implicit or dma-buf region. */
 void *rdma_verbs_bytes(struct rdma_verbs_mr *m) { return m->bytes; }
 /* Allocate a type 2 memory window. Writes the key to use for its next bind. */
 void *rdma_verbs_window(struct rdma_verbs_device *d, uint32_t *key) {
@@ -289,6 +312,8 @@ void *rdma_verbs_window(struct rdma_verbs_device *d, uint32_t *key) {
 }
 /* Free a memory window. */
 int rdma_verbs_window_free(struct ibv_mw *mw) { return ibv_dealloc_mw(mw); }
+/* True if `m` has CPU-reachable or implicit memory a post may use as an SGE. */
+static int host_sge(const struct rdma_verbs_mr *m) { return !m->device; }
 /* True if [offset, offset + length) is a nonempty range inside `m`. */
 static int in_region(const struct rdma_verbs_mr *m, uint64_t offset, uint32_t length) {
     return length && offset <= m->length && length <= m->length - offset;
@@ -306,7 +331,7 @@ int rdma_verbs_bind(struct rdma_verbs_qp *q, struct ibv_mw *mw, struct rdma_verb
     wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_FENCE;
     wr.bind_mw.mw = mw; wr.bind_mw.rkey = key;
     wr.bind_mw.bind_info.mr = m->mr;
-    wr.bind_mw.bind_info.addr = (uintptr_t)m->bytes + offset;
+    wr.bind_mw.bind_info.addr = m->addr + offset;
     wr.bind_mw.bind_info.length = length;
     wr.bind_mw.bind_info.mw_access_flags = IBV_ACCESS_REMOTE_WRITE;
     return ibv_post_send(q->qp, &wr, &bad);
@@ -325,7 +350,7 @@ int rdma_verbs_invalidate(struct rdma_verbs_qp *q, uint32_t key, uint64_t id) {
 int rdma_verbs_write_imm(struct rdma_verbs_qp *q, struct rdma_verbs_mr *m, uint64_t offset,
                          uint32_t length, uint64_t address, uint32_t key, uint32_t imm,
                          uint64_t id) {
-    if (!in_region(m, offset, length)) return EINVAL;
+    if (!host_sge(m) || !in_region(m, offset, length)) return EINVAL;
     struct ibv_sge sge = { .addr = (uintptr_t)m->bytes + offset, .length = length,
                            .lkey = m->mr->lkey };
     struct ibv_send_wr wr = {0}, *bad = NULL;
@@ -338,7 +363,7 @@ int rdma_verbs_write_imm(struct rdma_verbs_qp *q, struct rdma_verbs_mr *m, uint6
  * the peer's posted receives. */
 int rdma_verbs_send(struct rdma_verbs_qp *q, struct rdma_verbs_mr *m, uint64_t offset,
                     uint32_t length, uint64_t id) {
-    if (!in_region(m, offset, length)) return EINVAL;
+    if (!host_sge(m) || !in_region(m, offset, length)) return EINVAL;
     struct ibv_sge sge = { .addr = (uintptr_t)m->bytes + offset, .length = length,
                            .lkey = m->mr->lkey };
     struct ibv_send_wr wr = {0}, *bad = NULL;
@@ -349,7 +374,7 @@ int rdma_verbs_send(struct rdma_verbs_qp *q, struct rdma_verbs_mr *m, uint64_t o
 /* Post a receive into `length` bytes of `m` at `offset`. */
 int rdma_verbs_post_recv(struct rdma_verbs_qp *q, struct rdma_verbs_mr *m, uint64_t offset,
                          uint32_t length, uint64_t id) {
-    if (!in_region(m, offset, length)) return EINVAL;
+    if (!host_sge(m) || !in_region(m, offset, length)) return EINVAL;
     struct ibv_sge sge = { .addr = (uintptr_t)m->bytes + offset, .length = length,
                            .lkey = m->mr->lkey };
     struct ibv_recv_wr wr = {0}, *bad = NULL;
