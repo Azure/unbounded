@@ -66,7 +66,10 @@ def iter_weights(
     Up to ``depth`` chunks are read ahead, each into its own staging buffer,
     so reads overlap with the consumer. A staging buffer is reused only after
     the consumer has moved past all of its tensors and backend.wait() says
-    queued GPU work that reads it has finished.
+    queued GPU work that reads it has finished. Every staging and dedicated
+    target is fenced with done() and wait() before the pipeline drops its
+    reference, including on early close or error, so external allocations
+    are never released while queued GPU work may still read them.
     """
     if depth < 1:
         raise ValueError("depth must be at least 1")
@@ -94,19 +97,33 @@ def iter_weights(
             inflight.append((pool.submit(read, req, etag, chunk, target), chunk))
         return True
 
+    # Dedicated targets the consumer has moved past; fenced at the end.
+    retired: list = []
+    active = None
     try:
         while fill():
             fut, chunk = inflight.popleft()
             target = fut.result()
+            active = target
             for t in chunk.tensors:
                 yield t.name, backend.tensor(target, t.start - chunk.start, t, not chunk.dedicated)
-            if not chunk.dedicated:
-                backend.done(target)
+            active = None
+            backend.done(target)
+            if chunk.dedicated:
+                retired.append(target)
+            else:
                 free.append(target)
     finally:
         for fut, _ in inflight:
             fut.cancel()
         pool.shutdown(wait=True)
+        if active is not None:
+            backend.done(active)
+            retired.append(active)
+        # Reads have stopped; fence consumer GPU work before release. Targets
+        # still in flight were fenced by read() and the consumer never saw them.
+        for target in retired + free:
+            backend.wait(target)
 
 
 class MemoryBackend(Backend):

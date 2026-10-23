@@ -240,3 +240,74 @@ def test_torch_backend_records_event_on_target_device_stream(monkeypatch):
     b.done(target)
     b.wait(target)
     assert calls == [("enter", 3), ("event",), ("record", ("stream", 3)), ("exit", 3), ("sync",)]
+
+
+class _FencingBackend(MemoryBackend):
+    """Records done/wait so tests can check every target is fenced."""
+
+    def __init__(self):
+        self.targets = []
+        self.done_ids = set()
+        self.waited = set()
+
+    def _track(self, t):
+        self.targets.append(t)
+        return t
+
+    def new_staging(self, size):
+        return self._track(self.Target(size))
+
+    def new_dedicated(self, size):
+        return self._track(self.Target(size))
+
+    def done(self, target):
+        self.done_ids.add(id(target))
+        self.waited.discard(id(target))
+
+    def wait(self, target):
+        if id(target) in self.done_ids:
+            self.waited.add(id(target))
+
+    def used(self):
+        return [t for t in self.targets if id(t) in self.done_ids]
+
+    def assert_fenced(self):
+        assert self.used()
+        for t in self.used():
+            assert id(t) in self.waited
+
+
+@pytest.mark.parametrize("depth", [1, 2])
+def test_iter_weights_fences_on_completion(server, uri, depth):
+    setup_model(server, uri)
+    c = racer.Client(socket_path=server.path, staging_bytes=4096)
+    b = _FencingBackend()
+    names = [n for n, _ in iter_weights(c, uri, b, staging_bytes=400, depth=depth)]
+    assert "w3" in names
+    b.assert_fenced()
+    # The dedicated target (w3) was fenced too.
+    assert any(t.size == 900 for t in b.used())
+
+
+@pytest.mark.parametrize("stop", ["w1", "w3"])
+def test_iter_weights_fences_on_early_close(server, uri, stop):
+    setup_model(server, uri)
+    c = racer.Client(socket_path=server.path, staging_bytes=4096)
+    b = _FencingBackend()
+    gen = iter_weights(c, uri, b, staging_bytes=400, depth=2)
+    for name, _ in gen:
+        if name == stop:
+            break
+    gen.close()
+    b.assert_fenced()
+
+
+def test_iter_weights_fences_on_exception(server, uri):
+    setup_model(server, uri)
+    c = racer.Client(socket_path=server.path, staging_bytes=4096)
+    b = _FencingBackend()
+    gen = iter_weights(c, uri, b, staging_bytes=400, depth=2)
+    next(gen)
+    with pytest.raises(RuntimeError):
+        gen.throw(RuntimeError("consumer failed"))
+    b.assert_fenced()
