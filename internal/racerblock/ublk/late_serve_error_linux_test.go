@@ -88,3 +88,44 @@ func TestServeErrorRecordedWhenStopWinsAfterServe(t *testing.T) {
 		t.Fatalf("teardown causes = %v, want one serve failure", stops)
 	}
 }
+
+// TestServeErrorHoldDecidedBeforeTeardown checks that a queue's own
+// failure marks it failed and holds its ring even when the teardown it
+// schedules starts a local shutdown immediately.
+func TestServeErrorHoldDecidedBeforeTeardown(t *testing.T) {
+	q := newEIOQueue(t)
+	leaveStartup(t, q.dev)
+
+	var failedAtStop []bool
+
+	q.dev.stopAsync = func(error) {
+		failedAtStop = append(failedAtStop, q.failed.Load())
+		// Teardown starts at once, as if it won the scheduler.
+		q.dev.closing.Store(true)
+	}
+
+	var reasons []string
+
+	testHooks.serveEIO = func(*queue) error { return errors.New("forced broken ring") }
+	testHooks.failedRingClose = func(_ *queue, reason string) { reasons = append(reasons, reason) }
+
+	t.Cleanup(func() {
+		testHooks.serveEIO = nil
+		testHooks.failedRingClose = nil
+	})
+
+	ready := make(chan error, 1)
+	q.run(ready)
+
+	if err := <-ready; err == nil {
+		t.Fatal("FETCH_REQ on /dev/null succeeded, want an error")
+	}
+
+	if len(failedAtStop) != 1 || !failedAtStop[0] {
+		t.Fatalf("failed at teardown = %v, want [true]", failedAtStop)
+	}
+
+	if len(reasons) != 1 {
+		t.Fatalf("held ring closes = %v, want one hold", reasons)
+	}
+}
