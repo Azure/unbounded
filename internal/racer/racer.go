@@ -69,6 +69,47 @@ type Application struct {
 	Replication *Replication
 	// ObjectImage is the racer-object sidecar image injected by the webhook.
 	ObjectImage string
+
+	serving       sync.Mutex
+	servingClosed bool
+	servingActive sync.WaitGroup
+}
+
+// servingRunnable tracks the HTTPS server so Start can join it. On leadership
+// loss controller-runtime skips graceful shutdown and returns before
+// non-leader runnables exit, which would leave the old leader listening.
+type servingRunnable struct{ app *Application }
+
+func (servingRunnable) NeedLeaderElection() bool { return false }
+
+func (r servingRunnable) Start(ctx context.Context) error {
+	a := r.app
+
+	a.serving.Lock()
+	if a.servingClosed {
+		a.serving.Unlock()
+		return nil
+	}
+
+	a.servingActive.Add(1)
+	a.serving.Unlock()
+
+	defer a.servingActive.Done()
+
+	return a.Server.Start(ctx)
+}
+
+// Start runs mgr and returns only after the HTTPS listener and its
+// connections are closed, including after an unintended leadership loss.
+func (a *Application) Start(ctx context.Context, mgr ctrl.Manager) error {
+	err := mgr.Start(ctx)
+
+	a.serving.Lock()
+	a.servingClosed = true
+	a.serving.Unlock()
+	a.servingActive.Wait()
+
+	return err
 }
 
 // Assemble performs no Kubernetes calls, I/O, cryptography, or goroutine startup.
@@ -114,7 +155,7 @@ func (a *Application) SetupWithManager(mgr ctrl.Manager) error {
 		return fmt.Errorf("register keyring: %w", err)
 	}
 
-	if err := mgr.Add(a.Server); err != nil {
+	if err := mgr.Add(servingRunnable{app: a}); err != nil {
 		return fmt.Errorf("register HTTPS server: %w", err)
 	}
 
@@ -190,7 +231,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 
-	return mgr.Start(ctx)
+	return app.Start(ctx, mgr)
 }
 
 // Recover runs the production startup guard before any manager runnable starts.

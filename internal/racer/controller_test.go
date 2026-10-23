@@ -836,7 +836,7 @@ func startIntegrationManager(t *testing.T, rc *rest.Config, scheme *runtime.Sche
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 
-	go func() { done <- mgr.Start(ctx) }()
+	go func() { done <- app.Start(ctx, mgr) }()
 
 	t.Cleanup(func() {
 		cancel()
