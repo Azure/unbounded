@@ -43,8 +43,11 @@ const (
 	pinnedCancelUserData = 1<<62 | 2
 )
 
-// Bounds that keep a pinned DEL_DEV finite. They only limit retries; no
-// outcome depends on timing.
+// Retry limits for a pinned DEL_DEV: how many times DEL_DEV is resent after
+// a cancel before dispatch, and how many cancels one DEL_DEV gets. They cap
+// retries only. Each wait for a completion still lasts as long as the
+// kernel takes, so a stalled kernel can stall the delete. No outcome
+// depends on timing.
 const (
 	pinnedDelSubmits = 8
 	pinnedDelCancels = 16
