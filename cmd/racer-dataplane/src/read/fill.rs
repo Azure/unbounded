@@ -2215,7 +2215,7 @@ impl Fill {
     /// Reclaim against the optional ceiling, not the larger hard quota. One
     /// bounded idle-only pass advances cursors for later independent interests.
     /// Never release queued copies or submitted/live owners to admit a write.
-    fn optional_staging_headroom(&self, amount: usize, one_page: usize) -> bool {
+    pub(super) fn optional_staging_headroom(&self, amount: usize, one_page: usize) -> bool {
         let admission = &self.dependencies.admission;
         let class = ResourceClass::Ciphertext;
         let limit = admission.limit(class);
@@ -2230,9 +2230,16 @@ impl Fill {
         admission.reclaim_buffers();
         let deficit = admission.used(class).saturating_sub(available_used);
         if deficit != 0 {
-            self.dependencies
-                .memory
-                .reclaim_idle(class, None, deficit, |_, _| 0);
+            // Over-share caches' idle bytes go first. Zero callbacks never
+            // discard queued or submitted copies.
+            self.dependencies.memory.reclaim(
+                class,
+                None,
+                deficit,
+                |cache| admission.excess(cache, class),
+                |_, _| 0,
+                |_, _| 0,
+            );
             // Evicted payloads may have returned backing to the recycler rather
             // than releasing their charges. Drop those idle allocations too.
             admission.reclaim_buffers();

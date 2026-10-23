@@ -1105,8 +1105,10 @@ impl CachedPage {
 /// Most entries one bounded reclaim pass examines, per cache or overall.
 const RECLAIM_SCAN: usize = 256;
 /// Most caches one global reclaim checks for over-share bytes. The window
-/// rotates, so every cache with retained entries is checked within
-/// `ceil(caches / PRESSURE_WINDOW)` global reclaims.
+/// rotates and resumes after the last examined cache. When every call
+/// examines a full window, each cache with retained entries is checked within
+/// `ceil(caches / PRESSURE_WINDOW)` global reclaims; calls that end early
+/// advance by fewer caches but never skip one.
 pub(crate) const PRESSURE_WINDOW: usize = 8;
 
 /// One cache's entries in touch order, with its own resumable reclaim cursor.
@@ -1727,10 +1729,10 @@ impl MemoryCache {
     }
     /// Reclaim `bytes` of ciphertext for `owner`, or for global pressure when
     /// `owner` is `None`. An owner's deficit scans only that owner's entries.
-    /// Global pressure first takes idle bytes from caches
-    /// over their weighted share, so an under-share requester does not lose
-    /// its own pages while another cache holds more than its share. Then it
-    /// falls back to the unweighted pass.
+    /// Global pressure first takes idle bytes from over-share caches in a
+    /// bounded window, then falls back to the unweighted pass. So an
+    /// under-share requester keeps its own pages unless the window's
+    /// over-share bytes are busy, missing, or too few.
     ///
     /// `excess` reports a cache's bytes above its share (`Quotas::excess`).
     /// `reclaim_writer` releases queued writer copies and returns the bytes
@@ -1739,9 +1741,10 @@ impl MemoryCache {
     ///
     /// Work is bounded: at most `PRESSURE_WINDOW` caches, each with at most
     /// `RECLAIM_SCAN` entries per kind, plus the existing unweighted pass.
-    /// The window rotates instead of ranking all caches, so a cache outside
-    /// this call's window is checked on a later call. Busy or held entries
-    /// are skipped as in [`Self::reclaim_idle`].
+    /// The window rotates instead of ranking all caches. The next call
+    /// resumes after the last cache this call examined, so a pass that ends
+    /// early does not skip the rest of its window. Busy or held entries are
+    /// skipped as in [`Self::reclaim_idle`].
     pub(crate) fn reclaim(
         &self,
         class: ResourceClass,
@@ -1766,6 +1769,8 @@ impl MemoryCache {
             if released >= bytes {
                 break;
             }
+            // Resume after the last examined cache, not the last prefetched one.
+            *self.pressure_cursor.borrow_mut() = Some(cache.clone());
             let want = excess(&cache).min(bytes - released);
             if want == 0 {
                 continue;
@@ -1789,10 +1794,12 @@ impl MemoryCache {
         }
         released
     }
-    /// Up to `PRESSURE_WINDOW` caches with retained entries, in rotating order.
-    /// Cost is O(PRESSURE_WINDOW * log caches), independent of entry count.
+    /// Up to `PRESSURE_WINDOW` caches with retained entries after the cursor,
+    /// in rotating order. Does not move the cursor; `reclaim` moves it as it
+    /// examines each cache. Cost is O(PRESSURE_WINDOW * log caches),
+    /// independent of entry count.
     fn pressure_window(&self) -> Vec<CacheId> {
-        let mut cursor = self.pressure_cursor.borrow_mut();
+        let cursor = self.pressure_cursor.borrow();
         let mut caches = self.entries.borrow().lanes.window(cursor.as_ref());
         caches.extend(
             self.ciphertext_entries
@@ -1805,7 +1812,6 @@ impl MemoryCache {
         caches.sort_by(|a, b| (wrapped(a), a).cmp(&(wrapped(b), b)));
         caches.dedup();
         caches.truncate(PRESSURE_WINDOW);
-        *cursor = caches.last().cloned();
         caches
     }
     /// One bounded pass over a single cache's idle ciphertext, oldest first.
@@ -2480,6 +2486,148 @@ pub(crate) mod tests {
                     assert_eq!(seen.borrow().len(), CACHES);
                     assert_lanes(&cache);
                     drop((busy, held));
+                }
+
+                #[test]
+                fn early_success_rotation_reaches_every_cache() {
+                    // A multiple of the window, so a cursor that jumped to the
+                    // last prefetched cache would revisit only every eighth.
+                    const CACHES: usize = 2 * PRESSURE_WINDOW;
+                    let names: Vec<_> = (0..CACHES).map(|i| format!("r{i:02}")).collect();
+                    let all: Vec<&str> = names.iter().map(String::as_str).collect();
+                    let cache = memory(&all, 8 * CACHES);
+                    // Each cache keeps a held entry, so its lane survives, and
+                    // two idle entries, so every call can succeed at once.
+                    let held: Vec<_> = names
+                        .iter()
+                        .map(|name| {
+                            let page = unverified_in(&cache, name, "held");
+                            for i in 0..2 {
+                                unverified_in(&cache, name, &format!("idle{i}"));
+                            }
+                            cache.ciphertext(&page).unwrap().unwrap()
+                        })
+                        .collect();
+                    for round in 0..2 {
+                        let examined = RefCell::new(Vec::new());
+                        for _ in 0..CACHES {
+                            let released = cache.reclaim(
+                                ResourceClass::Ciphertext,
+                                None,
+                                CIPHER,
+                                |owner| {
+                                    examined.borrow_mut().push(owner.clone());
+                                    CIPHER
+                                },
+                                |_, _| panic!("unverified entries only"),
+                                |_, _| panic!("idle bytes suffice"),
+                            );
+                            assert_eq!(released, CIPHER);
+                        }
+                        // One cache per call, each exactly once per round.
+                        let mut examined = examined.take();
+                        assert_eq!(examined.len(), CACHES);
+                        examined.sort();
+                        examined.dedup();
+                        assert_eq!(examined.len(), CACHES, "round {round}");
+                        for name in &names {
+                            assert_eq!(resident(&cache, name), 2 - round, "round {round}");
+                        }
+                    }
+                    assert_lanes(&cache);
+                    drop(held);
+                }
+
+                /// Real `AdmissionPolicy` weights, `reclamation`, and `excess`
+                /// drive `reclaim`. Extra charges with no payload stand in for
+                /// other live or writer-owned bytes, so no 16 MiB pages are needed.
+                #[test]
+                fn real_quotas_choose_over_share_cache_after_live_reweight() {
+                    let page = PAGE_BYTES as usize;
+                    let class = ResourceClass::Ciphertext;
+                    let mut limits = crate::test_support::cluster::config(false).limits;
+                    limits.ciphertext_bytes = std::num::NonZeroUsize::new(100 * page).unwrap();
+                    limits.metadata_entries = std::num::NonZeroUsize::new(1000).unwrap();
+                    let admission =
+                        Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
+                    let (low, high) = (id("low"), id("high"));
+                    let definition = |id: &CacheId, priority| racer_control_wire::CacheDefinition {
+                        id: id.clone(),
+                        name: id.0.clone(),
+                        client_socket: "/c".into(),
+                        origin_socket: "/o".into(),
+                        priority,
+                    };
+                    let weigh = |low_priority, high_priority| {
+                        admission.policy().weights().update(&[
+                            definition(&low, low_priority),
+                            definition(&high, high_priority),
+                        ]);
+                        admission.reweigh();
+                    };
+                    weigh(900, 100);
+                    let cache = MemoryCache::new(
+                        BufferPool::new(admission.clone()),
+                        crate::test_support::availability_for(vec![low.clone(), high.clone()]),
+                    );
+                    // High activates first, alone, with 20 pages of accounted bytes.
+                    let high_pages: Vec<_> = (0..4)
+                        .map(|i| verified_in(&cache, "high", &format!("h{i}")))
+                        .collect();
+                    let _high_extra = admission
+                        .reserve(Some(&high), class, 20 * page - 4 * CIPHER)
+                        .unwrap();
+                    // Low's 80 pages fit its 90-page share once it activates.
+                    let low_pages: Vec<_> = (0..8)
+                        .map(|i| verified_in(&cache, "low", &format!("l{i}")))
+                        .collect();
+                    let low_extra = admission
+                        .reserve(Some(&low), class, 80 * page - 8 * CIPHER)
+                        .unwrap();
+                    assert_eq!(admission.used(class), 100 * page);
+                    assert_eq!(admission.excess(&low, class), 0);
+                    assert!(admission.excess(&high, class) > 0);
+                    assert_eq!(admission.excess(&id("missing"), class), 0);
+                    let reclaim = |requester: &CacheId| {
+                        let (owner, deficit) =
+                            admission.reclamation(requester, class, CIPHER).unwrap();
+                        assert_eq!((owner, deficit), (None, CIPHER));
+                        let used = admission.used(class);
+                        let released = cache.reclaim(
+                            class,
+                            None,
+                            deficit,
+                            |cache| admission.excess(cache, class),
+                            |_, _| 0,
+                            |_, _| 0,
+                        );
+                        assert_eq!(released, CIPHER);
+                        assert_eq!(admission.used(class), used - released);
+                    };
+                    // An under-share low request takes over-share high bytes.
+                    reclaim(&low);
+                    assert_eq!((resident(&cache, "low"), resident(&cache, "high")), (8, 3));
+                    // Live reweigh: now low is far over share.
+                    weigh(100, 900);
+                    assert_eq!(admission.excess(&high, class), 0);
+                    assert!(admission.excess(&low, class) > 0);
+                    for i in 0..3 {
+                        // Refill to full aggregate capacity with a tiny high page.
+                        verified_in(&cache, "high", &format!("refill{i}"));
+                        assert_eq!(admission.used(class), 100 * page);
+                        for page in &low_pages {
+                            let _ = cache.ciphertext(page).unwrap();
+                        }
+                        reclaim(&high);
+                        assert_eq!(resident(&cache, "high"), 4 + i);
+                        assert_eq!(resident(&cache, "low"), 7 - i);
+                    }
+                    assert!(cache.ciphertext(&high_pages[3]).unwrap().is_some());
+                    // Retirement: once low's last charge leaves, it has no excess.
+                    drop(low_extra);
+                    cache.remove_cache(&low).unwrap();
+                    assert_eq!(admission.excess(&low, class), 0);
+                    assert_lanes(&cache);
                 }
             }
 

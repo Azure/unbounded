@@ -2701,6 +2701,72 @@ mod pressure {
         }
     }
 
+    /// Optional persistence headroom is global ciphertext pressure, so it
+    /// takes over-share idle bytes first and never discards queued copies.
+    #[test]
+    fn optional_headroom_prefers_over_share_idle_bytes_and_keeps_queued_copies() {
+        for queued in [false, true] {
+            let page = PAGE_BYTES as usize + 16;
+            let class = ResourceClass::Ciphertext;
+            let mut limits = crate::test_support::cluster::config(false).limits;
+            limits.ciphertext_bytes = std::num::NonZeroUsize::new(16 * page).unwrap();
+            // A one-page window keeps the low-priority allowance near two pages.
+            limits.range_window_pages = std::num::NonZeroUsize::new(1).unwrap();
+            let under = CacheId(crate::test_support::security::CACHE.into());
+            let over = CacheId("44444444-4444-4444-8444-444444444444".into());
+            let f = fixture_with_caches(3, Some(limits), vec![under.clone(), over.clone()]);
+            let deps = &f.fill.dependencies;
+            let admission = &deps.admission;
+            let definition = |id: &CacheId, priority| racer_control_wire::CacheDefinition {
+                id: id.clone(),
+                name: id.0.clone(),
+                client_socket: "/c".into(),
+                origin_socket: "/o".into(),
+                priority,
+            };
+            let weigh = |under_priority, over_priority| {
+                admission.policy().weights().update(&[
+                    definition(&under, under_priority),
+                    definition(&over, over_priority),
+                ]);
+                admission.reweigh();
+            };
+            weigh(100, 900);
+            // The under-share page is oldest, so plain age order would take it.
+            let kept = retained_page(&f, &under, "kept", class, page, false);
+            let victim = retained_page(&f, &over, "victim", class, page, queued);
+            let _extra = admission.reserve(Some(&over), class, 6 * page).unwrap();
+            weigh(900, 100);
+            assert_eq!(admission.excess(&under, class), 0);
+            assert!(admission.excess(&over, class) > page);
+            let used = admission.used(class);
+            let ceiling = admission.limit(class) / 2;
+            assert!(used > ceiling - page);
+            let headroom = f.fill.optional_staging_headroom(page, PAGE_BYTES as usize);
+            assert_eq!(
+                headroom,
+                crate::read::fill::optional_headroom(
+                    admission.limit(class),
+                    admission.used(class),
+                    page,
+                    PAGE_BYTES as usize,
+                )
+            );
+            assert_eq!(deps.writer.discarded_count(), 0);
+            if queued {
+                // The queued copy is not idle and is never discarded, so the
+                // idle-only fallback takes the under-share page instead.
+                assert!(deps.writer.copy_only(&victim).unwrap().is_some());
+                assert!(deps.memory.ciphertext(&victim).unwrap().is_some());
+                assert!(deps.memory.ciphertext(&kept).unwrap().is_none());
+            } else {
+                assert!(deps.memory.ciphertext(&victim).unwrap().is_none());
+                assert!(deps.memory.ciphertext(&kept).unwrap().is_some());
+                assert_eq!(admission.used(class), used - page);
+            }
+        }
+    }
+
     #[test]
     fn global_plaintext_deficit_counts_plaintext_not_combined_bundle_bytes() {
         let f = fixture();

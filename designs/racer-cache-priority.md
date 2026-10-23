@@ -148,12 +148,17 @@ readers, so plaintext pressure frees nothing from the cache. When a cache is
 above its own limit, it reclaims only its own idle ciphertext. When the total is
 full but the requester is within its limit, reclaim first takes idle
 ciphertext, and queued write copies, from caches above their limit. It then
-falls back to plain age order. Each worker keeps a per-cache age order, updated
-in O(log C) on insert, hit, and removal. Each reclaim checks at most 8 caches
-from a rotating cursor and scans at most 256 entries per cache. It does not
-rank all caches. So a cache outside this window, or one whose scanned entries
-are all busy, can let an under-share page go first. The rotation checks every
-cache within `ceil(C / 8)` reclaims. Busy entries are never evicted.
+falls back to plain age order. Each worker keeps a per-cache age order for
+verified and for unverified ciphertext, updated in O(log C + log entries) on
+insert, hit, and removal. Each reclaim checks at most 8 caches from a rotating
+cursor and scans at most 256 entries of each kind per cache. It does not rank
+all caches. So a cache outside this window, or one whose scanned entries are
+all busy, can let an under-share page go first. The next reclaim resumes after
+the last cache examined. When each reclaim examines a full window, every cache
+is checked within `ceil(C / 8)` reclaims; a reclaim that ends early advances
+by fewer caches but skips none. Busy entries are never evicted. The optional
+persistence headroom check uses the same order, with no queued copies
+discarded.
 
 ### Disk admission
 
