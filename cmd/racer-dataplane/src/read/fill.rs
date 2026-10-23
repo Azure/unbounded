@@ -141,6 +141,10 @@ fn stage_events(stage: DriverStage) -> Option<(Event, Event)> {
         | DriverStage::WorkReturned => None,
     }
 }
+/// Bound on retries after a joined local plaintext job fails under its
+/// starter's inherited scope.
+const LOCAL_PLAINTEXT_JOIN_RETRIES: usize = 2;
+
 impl Fill {
     pub(super) async fn warm_local(
         &self,
@@ -187,81 +191,102 @@ impl Fill {
             None
         };
         let cancellation = scope.cancellation.subscribe()?;
-        let mut receive = if let Some(existing) = self.local_plaintext.get(page) {
-            let key = self
-                .local_plaintext_keys
-                .borrow()
-                .get(page)
-                .and_then(|key| key.get());
-            self.dependencies.flights.admit_local(page, key)?;
-            existing
-        } else {
-            self.dependencies.flights.admit_local(page, None)?;
-            let permit = uring_runtime::drivers::reserve().map_err(Error::from)?;
-            let flight = if probe {
-                Some(self.dependencies.flights.reserve_copy_flight(page, scope)?)
+        // A joined job runs under the scope of the caller that started it. If
+        // that inherited scope expires or is cancelled while this caller's own
+        // scope is still valid, retry under this caller's own scope. A job this
+        // caller started shares its deadline, so its failure is final. The
+        // bound stops a stream of short-lived starters from looping forever.
+        let mut joins_left = LOCAL_PLAINTEXT_JOIN_RETRIES;
+        loop {
+            let mut started = false;
+            let mut receive = if let Some(existing) = self.local_plaintext.get(page) {
+                let key = self
+                    .local_plaintext_keys
+                    .borrow()
+                    .get(page)
+                    .and_then(|key| key.get());
+                self.dependencies.flights.admit_local(page, key)?;
+                existing
             } else {
-                None
-            };
-            let owned_scope = RequestScope::new(scope.request, scope.deadline.0)?;
-            let (receive, completion) = self
-                .local_plaintext
-                .start(page.clone(), Err(Error::Unavailable));
-            if let Some(completion) = completion {
-                let source = Rc::new(std::cell::Cell::new(None));
-                self.local_plaintext_keys
-                    .borrow_mut()
-                    .insert(page.clone(), source.clone());
-                let mut fill = self.clone();
-                fill.diagnostic = None;
-                let page = page.clone();
-                permit.submit_detached(Box::pin(async move {
-                    let _flight = flight;
-                    let result = match fill.cached_page(&page, &owned_scope) {
-                        Ok(Some(result)) => Ok(Some(result)),
-                        Ok(None) => match fill
-                            .retained_plaintext(&page, &owned_scope, &source)
-                            .await
-                        {
+                self.dependencies.flights.admit_local(page, None)?;
+                started = true;
+                let permit = uring_runtime::drivers::reserve().map_err(Error::from)?;
+                let flight = if probe {
+                    Some(self.dependencies.flights.reserve_copy_flight(page, scope)?)
+                } else {
+                    None
+                };
+                let owned_scope = RequestScope::new(scope.request, scope.deadline.0)?;
+                let (receive, completion) = self
+                    .local_plaintext
+                    .start(page.clone(), Err(Error::Unavailable));
+                if let Some(completion) = completion {
+                    let source = Rc::new(std::cell::Cell::new(None));
+                    self.local_plaintext_keys
+                        .borrow_mut()
+                        .insert(page.clone(), source.clone());
+                    let mut fill = self.clone();
+                    fill.diagnostic = None;
+                    let page = page.clone();
+                    permit.submit_detached(Box::pin(async move {
+                        let _flight = flight;
+                        let result = match fill.cached_page(&page, &owned_scope) {
                             Ok(Some(result)) => Ok(Some(result)),
-                            Ok(None) => fill
-                                .acquire_local_copy_from(&page, &owned_scope, true, Some(&source))
-                                .await
-                                .map(|acquired| match acquired {
-                                    Some(AcquiredPage::Plaintext(result)) => Some(result),
-                                    _ => None,
-                                }),
+                            Ok(None) => {
+                                match fill.retained_plaintext(&page, &owned_scope, &source).await {
+                                    Ok(Some(result)) => Ok(Some(result)),
+                                    Ok(None) => fill
+                                        .acquire_local_copy_from(
+                                            &page,
+                                            &owned_scope,
+                                            true,
+                                            Some(&source),
+                                        )
+                                        .await
+                                        .map(|acquired| match acquired {
+                                            Some(AcquiredPage::Plaintext(result)) => Some(result),
+                                            _ => None,
+                                        }),
+                                    Err(error) => Err(error),
+                                }
+                            }
                             Err(error) => Err(error),
-                        },
-                        Err(error) => Err(error),
-                    };
-                    let mut keys = fill.local_plaintext_keys.borrow_mut();
-                    if keys.get(&page).is_some_and(|key| Rc::ptr_eq(key, &source)) {
-                        keys.remove(&page);
-                    }
-                    drop(keys);
-                    completion.finish(result);
-                    Ok::<_, Error>(())
-                }));
-            }
-            receive
-        };
-        std::future::poll_fn(|cx| {
-            cancellation.register(cx.waker());
-            // A probe-led job owns its own Flight charge, so a probe may
-            // detach. An acquisition-led job has no charge of its own and
-            // relies on the acquisition's retained operation, so acquisition
-            // callers stay attached until the job completes and only then
-            // report cancellation or deadline expiry.
-            if probe {
+                        };
+                        let mut keys = fill.local_plaintext_keys.borrow_mut();
+                        if keys.get(&page).is_some_and(|key| Rc::ptr_eq(key, &source)) {
+                            keys.remove(&page);
+                        }
+                        drop(keys);
+                        completion.finish(result);
+                        Ok::<_, Error>(())
+                    }));
+                }
+                receive
+            };
+            let result = std::future::poll_fn(|cx| {
+                cancellation.register(cx.waker());
+                // A probe-led job owns its own Flight charge, so a probe may
+                // detach. An acquisition-led job has no charge of its own and
+                // relies on the acquisition's retained operation, so acquisition
+                // callers stay attached until the job completes and only then
+                // report cancellation or deadline expiry.
+                if probe {
+                    scope.check()?;
+                }
+                uring_runtime::drivers::poll(cx, 64);
+                let result = std::task::ready!(std::pin::Pin::new(&mut receive).poll(cx));
                 scope.check()?;
+                std::task::Poll::Ready(result)
+            })
+            .await;
+            match result {
+                Err(Error::DeadlineExceeded | Error::Cancelled) if !started && joins_left > 0 => {
+                    scope.check()?;
+                    joins_left -= 1;
+                }
+                result => return result,
             }
-            uring_runtime::drivers::poll(cx, 64);
-            let result = std::task::ready!(std::pin::Pin::new(&mut receive).poll(cx));
-            scope.check()?;
-            std::task::Poll::Ready(result)
-        })
-        .await
+        }
     }
     /// Decrypt the memory cache's retained ciphertext, the same copy an elected
     /// acquisition previously decrypted on its own. A rejected copy is

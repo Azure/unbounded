@@ -5828,3 +5828,135 @@ fn local_plaintext_follower_after_key_retirement_misses_but_leader_finishes() {
     let leader = drive(leader, &mut f.engine, &f.crypto).unwrap();
     assert_eq!(leader.plaintext.bytes(), b"abc", "admitted caller finishes");
 }
+
+/// A scope whose deadline passes before the crypto service next runs.
+fn short_scope() -> RequestScope {
+    RequestScope::new(
+        RequestId([7; 16]),
+        Instant::now() + Duration::from_millis(30),
+    )
+    .unwrap()
+}
+
+/// Let a short scope's deadline pass.
+fn expire(short: &RequestScope) {
+    while Instant::now() <= short.deadline.0 + Duration::from_millis(5) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(short.check().err(), Some(Error::DeadlineExceeded));
+}
+
+#[test]
+fn warm_reader_retries_after_joined_short_deadline_probe_expires() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let metrics = retained_ciphertext_only(&mut f);
+    let origin_calls = f.origin.calls.get();
+    let short = short_scope();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut probe = Box::pin(f.fill.warm_local(&f.page, &short));
+    assert!(probe.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.fill.local_plaintext.len(), 1, "probe leads the decrypt");
+    let mut reader = Box::pin(f.fill.warm_local(&f.page, &f.scope));
+    assert!(reader.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.fill.local_plaintext.len(), 1, "reader joins the probe");
+    expire(&short);
+    let (probe, reader) = drive(
+        futures::future::join(probe, reader),
+        &mut f.engine,
+        &f.crypto,
+    );
+    assert_eq!(probe.err(), Some(Error::DeadlineExceeded));
+    let reader = reader.unwrap();
+    assert_eq!(reader.plaintext.bytes(), b"abc");
+    assert_eq!(
+        metrics.count(Event::PageDecrypt),
+        2,
+        "the expired attempt and one retry"
+    );
+    assert_eq!(f.origin.calls.get(), origin_calls, "never contacts origin");
+    drop(reader);
+    assert_local_plaintext_idle(&f);
+}
+
+#[test]
+fn acquisition_retries_after_joined_short_deadline_probe_expires() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let metrics = retained_ciphertext_only(&mut f);
+    let origin_calls = f.origin.calls.get();
+    let short = short_scope();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut probe = Box::pin(f.fill.warm_local(&f.page, &short));
+    assert!(probe.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.fill.local_plaintext.len(), 1, "probe leads the decrypt");
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let mut acquisition = f.fill.acquire(
+        f.page.clone(),
+        f.membership.clone(),
+        &f.context,
+        &f.scope,
+        &mut budget,
+    );
+    for _ in 0..16 {
+        uring_runtime::drivers::poll(&mut cx, 64);
+        assert!(acquisition.as_mut().poll(&mut cx).is_pending());
+    }
+    assert_eq!(
+        f.fill.local_plaintext.len(),
+        1,
+        "acquisition joins the probe"
+    );
+    expire(&short);
+    let (probe, acquired) = drive(
+        futures::future::join(probe, acquisition),
+        &mut f.engine,
+        &f.crypto,
+    );
+    assert_eq!(probe.err(), Some(Error::DeadlineExceeded));
+    let acquired = acquired.unwrap();
+    assert_eq!(acquired.plaintext.bytes(), b"abc");
+    assert_eq!(
+        metrics.count(Event::PageDecrypt),
+        2,
+        "the expired attempt and one retry"
+    );
+    assert_eq!(f.origin.calls.get(), origin_calls, "retry stays local");
+    drop(acquired);
+    assert_local_plaintext_idle(&f);
+}
+
+#[test]
+fn expired_follower_of_expired_probe_reports_its_own_deadline() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let metrics = retained_ciphertext_only(&mut f);
+    let short = short_scope();
+    let follower_scope = RequestScope::new(RequestId([8; 16]), short.deadline.0).unwrap();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut probe = Box::pin(f.fill.warm_local(&f.page, &short));
+    assert!(probe.as_mut().poll(&mut cx).is_pending());
+    let mut follower = Box::pin(f.fill.warm_local(&f.page, &follower_scope));
+    assert!(follower.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.fill.local_plaintext.len(), 1);
+    expire(&short);
+    let (probe, follower) = drive(
+        futures::future::join(probe, follower),
+        &mut f.engine,
+        &f.crypto,
+    );
+    assert_eq!(probe.err(), Some(Error::DeadlineExceeded));
+    assert_eq!(follower.err(), Some(Error::DeadlineExceeded));
+    assert_eq!(
+        metrics.count(Event::PageDecrypt),
+        1,
+        "only the expired attempt, no retry"
+    );
+    for _ in 0..16 {
+        uring_runtime::drivers::poll(&mut cx, 64);
+    }
+    assert_local_plaintext_idle(&f);
+}
