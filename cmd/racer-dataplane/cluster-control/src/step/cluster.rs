@@ -1,0 +1,889 @@
+//! A compact, single-threaded model of the whole control plane, built from
+//! the real steps, for the simulator.
+//!
+//! [`ControlPlane`] holds `n` dataplane Pods (one per Node). Each runs the
+//! real [`Lottery`], [`SeatRenew`], [`Contend`], and [`Follower`] steps; the
+//! primary runs the real [`plan_pass`] and [`discovery`] over typed
+//! inventory, and commits through the real [`Writer`] fence. Leases and the
+//! state record are typed values with resourceVersion counters rather than
+//! JSON objects, and every API read or write is counted. Client long polls
+//! are modeled per seat with the real write-slot limit and the
+//! [`super::cost`] notify model, so the simulator sees 429s and delivery lag
+//! at 50k Pods without one socket or thread per Pod.
+//!
+//! Time is `u64` nanoseconds from an `Instant` base chosen by the caller;
+//! wall time is `wall_base + ns`. Randomness comes from one [`Seeded`]
+//! stream, so runs replay exactly.
+
+use super::{
+    Image, LeaseObservation, LeaseSpec, NodeInfo, Ownership, PodInfo, Policy, PrimaryView, Seeded,
+    StateRecord, Term, Writer,
+    contend::Contend,
+    cost,
+    follower::Follower,
+    lottery::{self, Lottery},
+    primary::{Inventory, PassInputs, discovery, plan_pass},
+    renew::{self, SeatRenew},
+};
+use crate::{
+    SeatPolicy, annotations,
+    authority::{election, members::Owner, state},
+    limits,
+};
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, BinaryHeap},
+    time::{Duration, Instant, SystemTime},
+};
+
+/// Primary reconcile debounce, as in `primary.rs`.
+const DEBOUNCE: Duration = Duration::from_secs(1);
+
+/// Model settings.
+#[derive(Clone, Debug)]
+pub struct Settings {
+    pub pods: u32,
+    pub seats: SeatPolicy,
+    pub seed: u64,
+    /// Time to write one publication body to one client.
+    pub write_ns: u64,
+    /// Bytes of one image copy from the primary to a seat (for accounting).
+    pub image_bytes_per_member: u64,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            pods: 100,
+            seats: SeatPolicy::Auto,
+            seed: 1,
+            write_ns: 2_000_000,
+            image_bytes_per_member: 128,
+        }
+    }
+}
+
+/// Counters reported by the model.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Stats {
+    pub api_reads: u64,
+    pub api_writes: u64,
+    pub conflicts: u64,
+    pub seat_claims: u64,
+    pub seat_releases: u64,
+    pub primary_terms: u64,
+    pub passes: u64,
+    pub commits: u64,
+    pub image_fetches: u64,
+    pub image_bytes: u64,
+    pub watch_events: u64,
+    pub client_replies: u64,
+    pub client_429s: u64,
+    pub notify_comparisons: u64,
+    /// Longest time from a commit until every client was served.
+    pub max_client_lag_ns: u64,
+    /// Times two Pods both held a fresh primary term with a writable fence.
+    pub dual_primary: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Lease {
+    rv: u64,
+    uid: u64,
+    spec: LeaseSpec,
+    holder: Option<u32>,
+    ready: Option<u64>,
+    /// Last sequence this seat delivered to its clients.
+    served: Option<u64>,
+}
+
+struct Pod {
+    alive: bool,
+    /// Bumped on crash so stale events are ignored.
+    epoch: u32,
+    lottery: Lottery,
+    seat: Option<u8>,
+    renew: Option<SeatRenew>,
+    contend: Contend,
+    follower: Follower,
+    lease_fresh_until: Option<u64>,
+    primary: Option<Writer>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Ev {
+    Lottery(u32),
+    Attempt(u32, u8),
+    Renew(u32),
+    Contend(u32),
+    Follow(u32),
+    PrimaryRenew(u32),
+    Reconcile(u32),
+}
+
+/// The control plane of a simulated cluster.
+pub struct ControlPlane {
+    settings: Settings,
+    base: Instant,
+    wall_base: SystemTime,
+    now: u64,
+    seq: u64,
+    queue: BinaryHeap<Reverse<(u64, u64, u32, Ev)>>,
+    rng: Seeded,
+    pods: Vec<Pod>,
+    seats: Vec<Lease>,
+    primary: Lease,
+    view: PrimaryView,
+    view_changed_at: Option<Instant>,
+    record: Option<StateRecord>,
+    image: Option<Image>,
+    commit_at: BTreeMap<u64, u64>,
+    inventory: Inventory,
+    ownership: Ownership,
+    policy: Policy,
+    cluster: String,
+    pub stats: Stats,
+}
+
+fn uuid(i: u64, tag: u16) -> String {
+    format!("{i:08x}-{tag:04x}-4000-8000-000000000000")
+}
+
+impl ControlPlane {
+    /// Build a cluster of `settings.pods` Nodes and Pods, all synced.
+    pub fn new(settings: Settings, base: Instant, wall_base: SystemTime) -> Self {
+        let ownership = Ownership {
+            namespace: "racer-system".into(),
+            daemonset: "racer-dataplane".into(),
+            uid: uuid(0, 0xd5),
+            service_account: "racer-dataplane".into(),
+        };
+        let mut inventory = Inventory {
+            nodes_synced: true,
+            pods_synced: true,
+            caches_synced: true,
+            ..Default::default()
+        };
+        let mut pods = Vec::with_capacity(settings.pods as usize);
+        for i in 0..settings.pods {
+            Self::add_objects(&mut inventory, &ownership, i);
+            pods.push(Pod {
+                alive: true,
+                epoch: 0,
+                lottery: Lottery::default(),
+                seat: None,
+                renew: None,
+                contend: Contend::default(),
+                follower: Follower::default(),
+                lease_fresh_until: None,
+                primary: None,
+            });
+        }
+        let mut cp = Self {
+            rng: Seeded::new(settings.seed),
+            settings,
+            base,
+            wall_base,
+            now: 0,
+            seq: 0,
+            queue: BinaryHeap::new(),
+            pods,
+            seats: (0..annotations::MAX_SEATS)
+                .map(|i| Lease {
+                    uid: 1000 + i as u64,
+                    ..Default::default()
+                })
+                .collect(),
+            primary: Lease {
+                uid: 999,
+                ..Default::default()
+            },
+            view: PrimaryView::default(),
+            view_changed_at: None,
+            record: None,
+            image: None,
+            commit_at: BTreeMap::new(),
+            inventory,
+            ownership,
+            policy: Policy::from(crate::Rotation::default()),
+            cluster: "c1c1c1c1-0000-4000-8000-000000000001".into(),
+            stats: Stats::default(),
+        };
+        for i in 0..cp.settings.pods {
+            cp.schedule(0, i, Ev::Lottery(i));
+        }
+        cp
+    }
+
+    fn add_objects(inv: &mut Inventory, own: &Ownership, i: u32) {
+        let name = format!("n{i}");
+        inv.nodes.insert(
+            name.clone(),
+            NodeInfo {
+                name: name.clone(),
+                uid: uuid(u64::from(i), 0),
+                ..Default::default()
+            },
+        );
+        inv.pods.insert(
+            uuid(u64::from(i), 1),
+            PodInfo {
+                namespace: own.namespace.clone(),
+                name: format!("p{i}"),
+                uid: uuid(u64::from(i), 1),
+                node_name: name,
+                pod_ip: format!("10.{}.{}.{}", i >> 16, (i >> 8) & 255, i & 255),
+                phase: "Running".into(),
+                service_account: own.service_account.clone(),
+                owner: Some(Owner {
+                    api_version: "apps/v1".into(),
+                    kind: "DaemonSet".into(),
+                    name: own.daemonset.clone(),
+                    uid: own.uid.clone(),
+                }),
+                ..Default::default()
+            },
+        );
+    }
+
+    fn at(&self, ns: u64) -> Instant {
+        self.base + Duration::from_nanos(ns)
+    }
+
+    fn wall(&self) -> SystemTime {
+        self.wall_base + Duration::from_nanos(self.now)
+    }
+
+    fn schedule(&mut self, at: u64, pod: u32, ev: Ev) {
+        self.seq += 1;
+        let epoch = self.pods.get(pod as usize).map_or(0, |p| p.epoch);
+        self.queue.push(Reverse((at, self.seq, epoch, ev)));
+    }
+
+    fn after(&mut self, d: Duration, pod: u32, ev: Ev) {
+        let at = self.now + d.as_nanos() as u64;
+        self.schedule(at, pod, ev);
+    }
+
+    /// Current model time.
+    pub fn now_ns(&self) -> u64 {
+        self.now
+    }
+
+    /// Time of the next pending event.
+    pub fn next_event_ns(&self) -> Option<u64> {
+        self.queue.peek().map(|Reverse((t, ..))| *t)
+    }
+
+    /// Committed publication sequence.
+    pub fn sequence(&self) -> Option<u64> {
+        self.record.as_ref().map(|r| r.sequence)
+    }
+
+    /// Pod currently acting as primary, if any.
+    pub fn primary_pod(&self) -> Option<u32> {
+        self.primary.holder
+    }
+
+    /// Seat holders, by seat index.
+    pub fn seat_holders(&self) -> Vec<Option<u32>> {
+        self.seats.iter().map(|s| s.holder).collect()
+    }
+
+    /// Ready seats at the committed sequence.
+    pub fn ready_seats(&self) -> usize {
+        let seq = self.sequence();
+        self.seats
+            .iter()
+            .filter(|s| s.holder.is_some() && s.ready.is_some() && s.ready == seq)
+            .count()
+    }
+
+    /// Crash a Pod. Its Leases are left to expire. Its Node and Pod objects
+    /// stay, as after a process restart; call [`ControlPlane::restart`] to
+    /// bring it back with fresh process state.
+    pub fn crash(&mut self, pod: u32) {
+        let p = &mut self.pods[pod as usize];
+        p.alive = false;
+        p.epoch += 1;
+        p.seat = None;
+        p.renew = None;
+        p.primary = None;
+    }
+
+    /// Restart a crashed Pod with a new process (fresh lottery and fence).
+    pub fn restart(&mut self, pod: u32) {
+        let p = &mut self.pods[pod as usize];
+        p.alive = true;
+        p.epoch += 1;
+        p.lottery = Lottery::default();
+        p.contend = Contend::default();
+        p.follower = Follower::default();
+        p.lease_fresh_until = None;
+        self.schedule(self.now, pod, Ev::Lottery(pod));
+    }
+
+    /// Add a Node and its Pod (cluster growth).
+    pub fn add_pod(&mut self) -> u32 {
+        let i = self.pods.len() as u32;
+        Self::add_objects(&mut self.inventory, &self.ownership, i);
+        self.pods.push(Pod {
+            alive: true,
+            epoch: 0,
+            lottery: Lottery::default(),
+            seat: None,
+            renew: None,
+            contend: Contend::default(),
+            follower: Follower::default(),
+            lease_fresh_until: None,
+            primary: None,
+        });
+        self.schedule(self.now, i, Ev::Lottery(i));
+        i
+    }
+
+    fn observe(&self, lease: &Lease, name: String) -> LeaseObservation {
+        let mut a = BTreeMap::new();
+        if let Some(h) = lease.holder {
+            a.insert(annotations::HOLDER_NONCE.to_owned(), format!("{h}"));
+            a.insert(annotations::HOLDER_NODE.to_owned(), format!("n{h}"));
+            a.insert(annotations::HOLDER_UID.to_owned(), uuid(u64::from(h), 1));
+            a.insert(annotations::CLUSTER_ID.to_owned(), self.cluster.clone());
+            a.insert(
+                annotations::ENDPOINT.to_owned(),
+                format!("https://10.{}.{}.{}:8443", h >> 16, (h >> 8) & 255, h & 255),
+            );
+            a.insert(annotations::SERVING_CERTIFICATE.to_owned(), "AAAA".into());
+            if let Some(r) = lease.ready {
+                a.insert(annotations::READY.to_owned(), r.to_string());
+            }
+        }
+        LeaseObservation {
+            name,
+            uid: format!("lease-{}", lease.uid),
+            resource_version: lease.rv.to_string(),
+            spec: lease.spec.clone(),
+            annotations: a,
+        }
+    }
+
+    fn identity(pod: u32) -> String {
+        format!("p{pod}/{pod}")
+    }
+
+    /// Process every event up to and including `until_ns`.
+    pub fn advance_to(&mut self, until_ns: u64) {
+        while let Some(Reverse((t, _, epoch, ev))) = self.queue.peek().copied() {
+            if t > until_ns {
+                break;
+            }
+            self.queue.pop();
+            self.now = t;
+            let pod = match ev {
+                Ev::Lottery(p)
+                | Ev::Attempt(p, _)
+                | Ev::Renew(p)
+                | Ev::Contend(p)
+                | Ev::Follow(p)
+                | Ev::PrimaryRenew(p)
+                | Ev::Reconcile(p) => p,
+            };
+            let p = &self.pods[pod as usize];
+            if !p.alive || p.epoch != epoch {
+                continue;
+            }
+            match ev {
+                Ev::Lottery(p) => self.lottery(p),
+                Ev::Attempt(p, i) => self.attempt(p, i),
+                Ev::Renew(p) => self.renew(p),
+                Ev::Contend(p) => self.contend(p),
+                Ev::Follow(p) => self.follow(p),
+                Ev::PrimaryRenew(p) => self.primary_renew(p),
+                Ev::Reconcile(p) => self.reconcile(p),
+            }
+            self.check_primaries();
+        }
+        self.now = self.now.max(until_ns);
+    }
+
+    fn lottery(&mut self, pod: u32) {
+        let now = self.at(self.now);
+        let initial = match self.settings.seats {
+            SeatPolicy::Fixed(n) => n,
+            SeatPolicy::Auto => limits::MIN_AUTO_SEATS,
+        };
+        let node = format!("n{pod}");
+        let uid = uuid(u64::from(pod), 1);
+        let p = &mut self.pods[pod as usize];
+        let plan = p.lottery.plan(
+            &lottery::Inputs {
+                holds_seat: p.seat.is_some(),
+                cluster_known: true,
+                view: &self.view,
+                primary_changed_at: self.view_changed_at,
+                node: &node,
+                pod_uid: &uid,
+                initial_seats: initial,
+            },
+            now,
+            &mut self.rng,
+        );
+        match plan {
+            lottery::Plan::Idle(d) | lottery::Plan::NoVacancy(d) => {
+                self.after(d, pod, Ev::Lottery(pod))
+            }
+            lottery::Plan::Attempt { delay, index } => {
+                self.after(delay, pod, Ev::Attempt(pod, index as u8))
+            }
+        }
+    }
+
+    fn attempt(&mut self, pod: u32, index: u8) {
+        self.schedule(self.now, pod, Ev::Lottery(pod));
+        if self.pods[pod as usize].seat.is_some() {
+            return;
+        }
+        let now = self.at(self.now);
+        self.pods[pod as usize].lottery.begin();
+        self.stats.api_reads += 1;
+        let obs = self.observe(
+            &self.seats[index as usize],
+            annotations::seat_lease(index as usize),
+        );
+        if !self.pods[pod as usize].lottery.observe(
+            index as usize,
+            &obs,
+            now,
+            &format!("n{pod}"),
+            &Self::identity(pod),
+        ) {
+            return;
+        }
+        // The claim PUT is CAS on the version just read; in this model reads
+        // and writes of one event are atomic, so it succeeds.
+        self.stats.api_writes += 1;
+        let spec = election::claim(
+            &obs.spec,
+            &format!("p{pod}"),
+            &election::now_micro(self.wall()),
+        );
+        let lease = &mut self.seats[index as usize];
+        lease.rv += 1;
+        lease.spec = spec;
+        lease.holder = Some(pod);
+        lease.ready = None;
+        self.stats.seat_claims += 1;
+        let p = &mut self.pods[pod as usize];
+        p.lottery.won();
+        p.seat = Some(index);
+        p.renew = Some(SeatRenew::new(now));
+        p.lease_fresh_until = Some(self.now + limits::LEASE_FRESHNESS.as_nanos() as u64);
+        self.after(limits::LEASE_RENEW, pod, Ev::Renew(pod));
+        self.schedule(self.now, pod, Ev::Follow(pod));
+        self.schedule(self.now, pod, Ev::Contend(pod));
+    }
+
+    fn renew(&mut self, pod: u32) {
+        let Some(index) = self.pods[pod as usize].seat else {
+            return;
+        };
+        let now = self.at(self.now);
+        let ready = self.pods[pod as usize]
+            .follower
+            .ready(now)
+            .then(|| self.sequence())
+            .flatten();
+        let lease_ready = self.seats[index as usize].ready;
+        let inputs = renew::Inputs::from_view(
+            &self.view,
+            index as usize,
+            &format!("n{pod}"),
+            self.pods[pod as usize].primary.is_some(),
+            false,
+            false,
+            ready != lease_ready,
+        );
+        let Some(mut schedule) = self.pods[pod as usize].renew else {
+            return;
+        };
+        let action = schedule.decide(now, inputs);
+        match action {
+            renew::Action::Wait => {}
+            renew::Action::Release => {
+                self.stats.api_writes += 1;
+                self.stats.seat_releases += 1;
+                let lease = &mut self.seats[index as usize];
+                lease.rv += 1;
+                lease.spec = election::release(&lease.spec);
+                lease.holder = None;
+                lease.ready = None;
+                let p = &mut self.pods[pod as usize];
+                p.seat = None;
+                p.renew = None;
+                p.primary = None;
+                return;
+            }
+            renew::Action::Renew => {
+                self.stats.api_writes += 1;
+                schedule.put_started(now);
+                let wall = election::now_micro(self.wall());
+                let lease = &mut self.seats[index as usize];
+                if lease.holder == Some(pod) {
+                    lease.rv += 1;
+                    lease.spec = election::renew(&lease.spec, &wall);
+                    lease.ready = ready;
+                    schedule.put_ok(now);
+                    self.pods[pod as usize].lease_fresh_until =
+                        Some(self.now + limits::LEASE_FRESHNESS.as_nanos() as u64);
+                } else {
+                    // Taken over after expiry: the re-read shows another term.
+                    self.stats.conflicts += 1;
+                    self.stats.api_reads += 1;
+                    let _ = schedule.conflict(Some(false), now);
+                    let p = &mut self.pods[pod as usize];
+                    p.seat = None;
+                    p.renew = None;
+                    p.primary = None;
+                    return;
+                }
+            }
+        }
+        self.pods[pod as usize].renew = Some(schedule);
+        // Production also wakes on local changes; polling at the ready
+        // interval stands in for that.
+        let wait = schedule
+            .next
+            .saturating_duration_since(now)
+            .clamp(Duration::from_millis(1), renew::READY_MIN_INTERVAL);
+        self.after(wait, pod, Ev::Renew(pod));
+    }
+
+    fn contend(&mut self, pod: u32) {
+        if self.pods[pod as usize].seat.is_none() {
+            return;
+        }
+        let now = self.at(self.now);
+        let wait = Contend::wait(&mut self.rng);
+        if self.pods[pod as usize].primary.is_some() {
+            self.after(wait, pod, Ev::Contend(pod));
+            return;
+        }
+        self.stats.api_reads += 1;
+        let obs = self.observe(&self.primary, annotations::PRIMARY_LEASE.into());
+        if self.pods[pod as usize].contend.observe(&obs, now, true) {
+            self.stats.api_writes += 1;
+            self.primary.rv += 1;
+            self.primary.spec = election::claim(
+                &obs.spec,
+                &format!("p{pod}"),
+                &election::now_micro(self.wall()),
+            );
+            self.primary.holder = Some(pod);
+            self.stats.primary_terms += 1;
+            let term = Term {
+                lease_uid: format!("lease-{}", self.primary.uid),
+                transitions: self.primary.spec.transitions,
+                holder: Self::identity(pod),
+            };
+            self.pods[pod as usize].primary = Some(Writer::new(term));
+            self.pods[pod as usize].contend.term_ended();
+            self.primary_changed();
+            self.after(DEBOUNCE, pod, Ev::Reconcile(pod));
+            self.after(limits::LEASE_RENEW, pod, Ev::PrimaryRenew(pod));
+        }
+        self.after(wait, pod, Ev::Contend(pod));
+    }
+
+    fn primary_changed(&mut self) {
+        self.view_changed_at = Some(self.at(self.now));
+        self.view.holder = self.primary.holder.map(Self::identity);
+        let alive = self.pods.iter().filter(|p| p.alive).count() as u64;
+        self.stats.watch_events += alive;
+    }
+
+    fn primary_renew(&mut self, pod: u32) {
+        if self.pods[pod as usize].primary.is_none() {
+            return;
+        }
+        self.stats.api_writes += 1;
+        if self.primary.holder != Some(pod) {
+            self.stats.conflicts += 1;
+            self.pods[pod as usize].primary = None;
+            return;
+        }
+        self.primary.rv += 1;
+        self.primary.spec = election::renew(&self.primary.spec, &election::now_micro(self.wall()));
+        self.primary_changed();
+        self.after(limits::LEASE_RENEW, pod, Ev::PrimaryRenew(pod));
+    }
+
+    fn reconcile(&mut self, pod: u32) {
+        if self.pods[pod as usize].primary.is_none() {
+            return;
+        }
+        self.stats.passes += 1;
+        // Seat reads, state read.
+        self.stats.api_reads += annotations::MAX_SEATS as u64 + 2;
+        let now = self.at(self.now);
+        let current = self.record.clone();
+        let lease_uid = format!("lease-{}", self.primary.uid);
+        let writer = self.pods[pod as usize].primary.as_mut().expect("primary");
+        if writer.observe(current.as_ref(), Some(&lease_uid)).is_err() {
+            self.pods[pod as usize].primary = None;
+            return;
+        }
+        let live: BTreeMap<usize, LeaseObservation> = self
+            .seats
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                s.holder.is_some_and(|h| {
+                    self.pods[h as usize].alive && self.pods[h as usize].seat.is_some()
+                })
+            })
+            .map(|(i, s)| (i, self.observe(s, annotations::seat_lease(i))))
+            .collect();
+        let writer = self.pods[pod as usize].primary.as_ref().expect("primary");
+        let plan = plan_pass(
+            &PassInputs {
+                cluster: &self.cluster,
+                pod_uid: &uuid(u64::from(pod), 1),
+                seats: self.settings.seats,
+                peer_port: 8082,
+                policy: &self.policy,
+                inventory: &self.inventory,
+                synced: self.inventory.synced(),
+                ownership: &self.ownership,
+                current: current.as_ref(),
+                previous_image: self.image.as_ref(),
+                live: &live,
+                writer,
+                wall_unix: self
+                    .wall()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            },
+            &mut self.rng,
+        );
+        if let Ok(plan) = plan {
+            if plan.changed
+                && current
+                    .as_ref()
+                    .is_none_or(|c| state::check_monotonic(c, &plan.next).is_ok())
+            {
+                self.stats.api_writes += 1;
+                self.stats.commits += 1;
+                if current
+                    .as_ref()
+                    .is_none_or(|c| c.sequence != plan.next.sequence)
+                {
+                    self.commit_at.insert(plan.next.sequence, self.now);
+                }
+                self.record = Some(plan.next.clone());
+            }
+            if let Some(image) = plan.image
+                && self
+                    .record
+                    .as_ref()
+                    .is_some_and(|r| r.sequence == image.record.sequence)
+            {
+                self.image = Some(image);
+            }
+            let sequence = self.sequence();
+            let d = discovery(&live, plan.desired, plan.eligible, sequence, None);
+            let desired = d.extra[annotations::SEATS]
+                .as_deref()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(plan.desired);
+            let nodes: Vec<String> = d.extra[annotations::SEAT_NODES]
+                .as_deref()
+                .and_then(|v| serde_json::from_str(v).ok())
+                .unwrap_or_default();
+            let window = d.extra[annotations::CLAIM_WINDOW]
+                .as_deref()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30);
+            if self.view.desired != desired
+                || self.view.seat_nodes != nodes
+                || self.view.claim_window != window
+            {
+                self.view.desired = desired;
+                self.view.seat_nodes = nodes;
+                self.view.claim_window = window;
+                self.stats.api_writes += 1;
+                self.primary.rv += 1;
+                self.primary_changed();
+            }
+            // The primary serves its own image.
+            if let Some(r) = self.record.clone() {
+                let f = &mut self.pods[pod as usize].follower;
+                let _ = f.install(r, now);
+                if let Some(i) = &self.image {
+                    f.install_image(i.record.clone());
+                }
+            }
+        }
+        self.after(limits::LEASE_RENEW, pod, Ev::Reconcile(pod));
+    }
+
+    fn follow(&mut self, pod: u32) {
+        let Some(index) = self.pods[pod as usize].seat else {
+            return;
+        };
+        let now = self.at(self.now);
+        self.stats.api_reads += 1;
+        let is_primary = self.pods[pod as usize].primary.is_some();
+        if let Some(r) = self.record.clone() {
+            let f = &mut self.pods[pod as usize].follower;
+            if f.install(r.clone(), now).is_ok()
+                && super::follower::need_image(&r, f.image.as_ref(), is_primary)
+                && let Some(i) = &self.image
+                && i.record.sequence == r.sequence
+            {
+                self.stats.image_fetches += 1;
+                self.stats.image_bytes +=
+                    i.publication.members.len() as u64 * self.settings.image_bytes_per_member;
+                f.install_image(i.record.clone());
+            }
+            if f.ready(now) && self.seats[index as usize].served != Some(r.sequence) {
+                self.seats[index as usize].served = Some(r.sequence);
+                self.serve_clients(index, r.sequence);
+            }
+        }
+        self.after(crate::seat::FOLLOW_INTERVAL, pod, Ev::Follow(pod));
+    }
+
+    /// A seat became ready at `sequence`: its share of client long polls
+    /// receive the new image through the write slots.
+    fn serve_clients(&mut self, _seat: u8, sequence: u64) {
+        let seats = self
+            .seats
+            .iter()
+            .filter(|s| s.holder.is_some())
+            .count()
+            .max(1) as u64;
+        let alive = self.pods.iter().filter(|p| p.alive).count() as u64;
+        let polls = alive.div_ceil(seats);
+        let slots = limits::MAX_WRITES as u64;
+        let rounds = cost::write_rounds(polls, slots);
+        self.stats.client_replies += polls;
+        // Round k answers `slots` polls; the rest get 429 and retry.
+        let mut remaining = polls;
+        while remaining > slots {
+            remaining -= slots;
+            self.stats.client_429s += remaining;
+        }
+        self.stats.notify_comparisons += cost::notify(polls).comparisons;
+        if let Some(at) = self.commit_at.get(&sequence) {
+            let lag = self.now.saturating_sub(*at) + rounds * self.settings.write_ns;
+            self.stats.max_client_lag_ns = self.stats.max_client_lag_ns.max(lag);
+        }
+    }
+
+    fn check_primaries(&mut self) {
+        let fresh = self
+            .pods
+            .iter()
+            .filter(|p| {
+                p.alive
+                    && p.primary.as_ref().is_some_and(Writer::may_write)
+                    && p.lease_fresh_until.is_some_and(|t| t > self.now)
+            })
+            .count();
+        if fresh > 1 {
+            self.stats.dual_primary += 1;
+        }
+    }
+
+    /// Approximate heap bytes held by the model, for memory reports.
+    pub fn approximate_bytes(&self) -> usize {
+        let per_pod = std::mem::size_of::<Pod>() + 64;
+        let inv = self.inventory.nodes.len() * 256 + self.inventory.pods.len() * 512;
+        let image = self
+            .image
+            .as_ref()
+            .map_or(0, |i| i.encoded.len() + i.publication.members.len() * 160);
+        self.pods.len() * per_pod + inv + image + self.queue.len() * 40
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(pods: u32, secs: u64, seed: u64) -> ControlPlane {
+        let mut cp = ControlPlane::new(
+            Settings {
+                pods,
+                seed,
+                ..Default::default()
+            },
+            Instant::now(),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+        );
+        cp.advance_to(secs * 1_000_000_000);
+        cp
+    }
+
+    #[test]
+    fn cold_start_elects_seats_primary_and_publishes() {
+        let cp = run(50, 240, 1);
+        assert_eq!(cp.stats.primary_terms, 1, "{:?}", cp.stats);
+        assert!(cp.primary_pod().is_some());
+        assert_eq!(
+            cp.seat_holders().iter().filter(|s| s.is_some()).count(),
+            3,
+            "{:?}",
+            cp.seat_holders()
+        );
+        assert!(cp.sequence().is_some_and(|s| s >= 1));
+        assert_eq!(cp.ready_seats(), 3, "{:?}", cp.stats);
+        assert_eq!(cp.stats.dual_primary, 0);
+        assert!(cp.stats.client_replies >= 50);
+    }
+
+    #[test]
+    fn replays_exactly() {
+        assert_eq!(run(30, 120, 7).stats, run(30, 120, 7).stats);
+    }
+
+    #[test]
+    fn primary_failover_and_growth() {
+        let mut cp = run(40, 240, 3);
+        let first = cp.primary_pod().unwrap();
+        let seq = cp.sequence().unwrap();
+        cp.crash(first);
+        let t = cp.now_ns();
+        cp.advance_to(t + 180_000_000_000);
+        let second = cp.primary_pod().unwrap();
+        assert_ne!(first, second);
+        assert_eq!(cp.stats.primary_terms, 2);
+        assert_eq!(cp.stats.dual_primary, 0);
+        cp.add_pod();
+        let t = cp.now_ns();
+        cp.advance_to(t + 60_000_000_000);
+        assert!(cp.sequence().unwrap() > seq, "growth publishes");
+        cp.restart(first);
+        let t = cp.now_ns();
+        cp.advance_to(t + 60_000_000_000);
+        assert!(cp.approximate_bytes() > 0);
+    }
+
+    /// 50k Pods cold start. Run with `--ignored --release`.
+    #[test]
+    #[ignore]
+    fn fifty_thousand_pods_cold_start() {
+        let started = std::time::Instant::now();
+        let cp = run(50_000, 300, 1);
+        eprintln!(
+            "50k: {:?} in {:?}, ~{} MiB model",
+            cp.stats,
+            started.elapsed(),
+            cp.approximate_bytes() >> 20
+        );
+        assert_eq!(cp.stats.dual_primary, 0);
+        assert!(cp.sequence().is_some());
+        assert!(cp.ready_seats() >= 3);
+    }
+}

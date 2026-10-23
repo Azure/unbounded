@@ -13,11 +13,13 @@
 //! - [`follower`]: committed record admission and the need-image rule.
 //! - [`contend`]: primary Lease contention.
 //! - [`primary`]: one primary reconcile pass and discovery annotations.
+//! - [`cluster`]: a compact whole-cluster model built from these steps.
 //! - [`cost`]: CPU cost models for control thread hot spots.
 //! - [`admission`]: seat server admission (write and bootstrap slots, long
 //!   poll cursors, delta versus full image bodies).
 
 pub mod admission;
+pub mod cluster;
 pub mod contend;
 pub mod cost;
 pub mod follower;
