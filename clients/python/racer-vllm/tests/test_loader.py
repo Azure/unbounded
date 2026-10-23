@@ -204,3 +204,39 @@ def test_entry_point_declared():
         text = f.read()
     assert '[project.entry-points."vllm.general_plugins"]' in text
     assert 'racer = "racer_vllm:register"' in text
+
+
+def test_torch_backend_records_event_on_target_device_stream(monkeypatch):
+    calls = []
+
+    class Event:
+        def record(self, stream=None):
+            calls.append(("record", stream))
+
+        def synchronize(self):
+            calls.append(("sync",))
+
+    class DeviceCtx:
+        def __init__(self, dev):
+            self.dev = dev
+
+        def __enter__(self):
+            calls.append(("enter", self.dev))
+
+        def __exit__(self, *a):
+            calls.append(("exit", self.dev))
+
+    cuda = types.SimpleNamespace(
+        current_device=lambda: 0,
+        device=DeviceCtx,
+        Event=lambda: (calls.append(("event",)), Event())[1],
+        current_stream=lambda dev=None: ("stream", dev),
+    )
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(cuda=cuda))
+    from racer_vllm.weights import TorchBackend
+
+    b = TorchBackend(device=3)
+    target = object()
+    b.done(target)
+    b.wait(target)
+    assert calls == [("enter", 3), ("event",), ("record", ("stream", 3)), ("exit", 3), ("sync",)]

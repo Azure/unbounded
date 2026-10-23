@@ -211,8 +211,12 @@ class TorchBackend(Backend):
         return raw.view(dtype).view(info.shape)
 
     def done(self, target):
-        ev = self.torch.cuda.Event()
-        ev.record()
+        # Record on the target device's stream; the calling thread's current
+        # device may differ, and its stream would not cover our copies.
+        cuda = self.torch.cuda
+        with cuda.device(self.device):
+            ev = cuda.Event()
+            ev.record(cuda.current_stream(self.device))
         self._events[id(target)] = ev
 
     def wait(self, target):
