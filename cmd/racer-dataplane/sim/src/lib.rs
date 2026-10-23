@@ -18,6 +18,7 @@
 //!   ownership, direct-mapped caches), kept as the `standin` scenario for
 //!   substrate comparisons.
 
+pub mod combined;
 pub mod config;
 pub mod control;
 pub mod engine;
@@ -42,7 +43,8 @@ use crate::workload::{Churn, Storm};
 pub const USAGE: &str = "usage: racer-sim [--scenario NAME] [--nodes N] [--seed S] \
 [--duration D] [--config FILE.json] [--out PATH]\n\
 scenarios: smoke, caches-only, zipf, storm, churn, faults, empty, standin,\n\
-           enrollment-storm, failover, ctl-churn, lagging\n\
+           enrollment-storm, failover, ctl-churn, lagging,\n\
+           full-cold-start, full-failover, full-churn, full-lagging\n\
 durations: integer with ns, us, ms or s suffix (plain numbers are seconds)";
 
 pub const SCENARIOS: &[&str] = &[
@@ -118,7 +120,9 @@ impl Options {
             match flag {
                 "--scenario" => {
                     let s = value()?;
-                    if !SCENARIOS.contains(&s.as_str()) && !control::SCENARIOS.contains(&s.as_str())
+                    if !SCENARIOS.contains(&s.as_str())
+                        && !control::SCENARIOS.contains(&s.as_str())
+                        && !combined::SCENARIOS.contains(&s.as_str())
                     {
                         return Err(format!("unknown scenario {s:?}"));
                     }
@@ -164,6 +168,9 @@ impl Options {
         if self.scenario == "zipf" {
             config.objects = 4096;
             config.zipf_s = 1.0;
+        }
+        if combined::SCENARIOS.contains(&self.scenario.as_str()) {
+            combined::data_defaults(&mut config);
         }
         if let Some(text) = json {
             let value: Value =
@@ -257,6 +264,20 @@ pub fn run(options: &Options) -> Result<Value, String> {
     if control::SCENARIOS.contains(&options.scenario.as_str()) {
         return run_control(options);
     }
+    if combined::SCENARIOS.contains(&options.scenario.as_str()) {
+        #[allow(clippy::disallowed_methods)] // Wall time is reported, never simulated.
+        let started = std::time::Instant::now();
+        let (config, overrides) = split_control(options)?;
+        let mut report = combined::run(
+            &options.scenario,
+            config,
+            options.seed,
+            options.duration_ns,
+            overrides.as_ref(),
+        )?;
+        report["wall_ms"] = serde_json::json!(started.elapsed().as_millis() as u64);
+        return Ok(report);
+    }
     #[allow(clippy::disallowed_methods)] // Wall time is reported, never simulated.
     let started = std::time::Instant::now();
     let mut report = if options.scenario == "standin" {
@@ -277,6 +298,19 @@ pub fn run(options: &Options) -> Result<Value, String> {
 /// Run a control-plane scenario. `--config` may carry a `"control"` object
 /// of [`control::Settings`] overrides; other keys go to [`Config`].
 fn run_control(options: &Options) -> Result<Value, String> {
+    let (config, overrides) = split_control(options)?;
+    control::run(
+        &options.scenario,
+        config.nodes,
+        options.seed,
+        options.duration_ns,
+        overrides.as_ref(),
+    )
+}
+
+/// Split `--config` into the `"control"` overrides and the rest, which
+/// builds the [`Config`].
+fn split_control(options: &Options) -> Result<(Config, Option<Value>), String> {
     let mut json: Option<Value> = match &options.config {
         Some(path) => {
             let text = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
@@ -290,13 +324,7 @@ fn run_control(options: &Options) -> Result<Value, String> {
         .and_then(|o| o.remove("control"));
     let rest = json.map(|v| v.to_string());
     let config = options.build_config_with(rest.as_deref())?;
-    control::run(
-        &options.scenario,
-        config.nodes,
-        options.seed,
-        options.duration_ns,
-        overrides.as_ref(),
-    )
+    Ok((config, overrides))
 }
 
 #[cfg(test)]
