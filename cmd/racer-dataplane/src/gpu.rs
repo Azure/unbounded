@@ -36,6 +36,18 @@
 //! two scratch slots are never shared by two jobs and no staged slot is in use
 //! by a stream between jobs, which [`racer_gpu::GpuFile::read`] requires.
 //!
+//! # RDMA landing
+//!
+//! When RDMA is active, each rail may get one GPU's landing buffer
+//! ([`GpuHelper::landing`]): separate GPU memory, capped by
+//! `RACER_GPU_LANDING_BYTES`, exported once as a dma-buf and registered with
+//! the rail's NIC as an `rdma_verbs` device pool. A peer's NIC writes a
+//! `gpu-read` page's ciphertext straight into it, and the GPU decrypts from
+//! there ([`LandedCiphertext`]). The CPU never reads or copies those bytes.
+//! Landing buffers are never freed while the process runs, and are leaked on
+//! purpose when the helper exits, because a NIC registration may still cover
+//! them.
+//!
 //! At startup the helper probes each GPU with a zero-length decrypt. A GPU
 //! whose shim has no decrypt kernels, or whose staging cap cannot hold the two
 //! scratch slots, gets plaintext pages only: the CPU decrypts as for a Get.
@@ -168,6 +180,86 @@ impl Drop for StagedCiphertext {
     }
 }
 
+/// Each GPU's landing buffer gets its own NIC address range from here. Any
+/// value works: the address is local to the memory registration.
+const LANDING_IOVA: u64 = 1 << 40;
+
+/// One GPU's RDMA landing buffer, shared with `rdma_verbs` as a dma-buf.
+/// See the module docs, "RDMA landing".
+pub struct GpuLanding {
+    /// Export of the whole landing buffer.
+    fd: OwnedFd,
+    ordinal: i32,
+    length: u64,
+}
+
+impl GpuLanding {
+    /// The GPU the memory is on.
+    pub fn ordinal(&self) -> i32 {
+        self.ordinal
+    }
+}
+
+impl rdma_verbs::DmabufMemory for GpuLanding {
+    fn fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd;
+        self.fd.as_fd()
+    }
+
+    fn offset(&self) -> u64 {
+        0
+    }
+
+    fn length(&self) -> usize {
+        self.length as usize
+    }
+
+    fn iova(&self) -> u64 {
+        LANDING_IOVA * (self.ordinal as u64 + 1)
+    }
+}
+
+/// Peer ciphertext that a NIC wrote into a GPU landing buffer. Holds the
+/// RDMA device page, so the slot is not reused until this is dropped.
+pub struct LandedCiphertext {
+    page: rdma_verbs::DevicePage,
+    ordinal: i32,
+}
+
+impl LandedCiphertext {
+    /// Wrap `page` if it lies in `landing`'s memory.
+    pub fn new(landing: &Arc<GpuLanding>, page: rdma_verbs::DevicePage) -> Result<Self> {
+        let memory = Arc::as_ptr(page.memory()).cast::<()>();
+        if !std::ptr::eq(memory, Arc::as_ptr(landing).cast::<()>()) {
+            return Err(Error::Internal);
+        }
+        Ok(Self {
+            page,
+            ordinal: landing.ordinal,
+        })
+    }
+
+    /// The GPU the bytes are on.
+    pub fn ordinal(&self) -> i32 {
+        self.ordinal
+    }
+
+    /// Bytes that landed.
+    pub fn len(&self) -> u64 {
+        self.page.len() as u64
+    }
+
+    /// Never true: landed ciphertext always holds a tag.
+    pub fn is_empty(&self) -> bool {
+        self.page.is_empty()
+    }
+
+    /// Byte offset in the landing buffer.
+    fn offset(&self) -> u64 {
+        self.page.offset()
+    }
+}
+
 /// Counters for GPU decryption, for logs and tests.
 #[derive(Debug, Default)]
 pub struct GpuCounters {
@@ -185,6 +277,9 @@ pub struct GpuCounters {
 
     /// cuFile reads or registrations that failed.
     pub file_failures: AtomicU64,
+
+    /// Sealed pages decrypted from an RDMA landing buffer.
+    pub landed: AtomicU64,
 }
 
 /// Per-GPU state shared with I/O threads.
@@ -224,6 +319,12 @@ enum Job {
         id: u64,
         reply: Option<oneshot::Sender<Result<()>>>,
     },
+    /// Allocate a GPU's RDMA landing buffer and export it as a dma-buf.
+    Landing {
+        ordinal: i32,
+        length: u64,
+        reply: oneshot::Sender<Result<OwnedFd>>,
+    },
     #[cfg(test)]
     Run(Box<dyn FnOnce() + Send>),
 }
@@ -240,6 +341,8 @@ pub struct GpuHelper {
     cufile: Arc<AtomicBool>,
     counters: Arc<GpuCounters>,
     kernels_off: Arc<Mutex<std::collections::HashSet<i32>>>,
+    /// Landing buffers made so far, one per GPU at most.
+    landings: Mutex<HashMap<i32, Arc<GpuLanding>>>,
 }
 
 impl GpuHelper {
@@ -332,6 +435,7 @@ impl GpuHelper {
             cufile,
             counters,
             kernels_off,
+            landings: Mutex::new(HashMap::new()),
         })))
     }
 
@@ -402,6 +506,47 @@ impl GpuHelper {
         // On cancellation the helper still runs the read; the staged slot
         // then drops with the unread answer and returns to the pool.
         answer(&mut receiver, scope).await?
+    }
+
+    /// GPU `ordinal`'s RDMA landing buffer of `length` bytes (a multiple of
+    /// 4 KiB), allocated and exported on first call and reused after that.
+    /// [`Error::Unavailable`] if the GPU does not decrypt or the export
+    /// fails, [`Error::Overloaded`] if the GPU has no room.
+    pub(crate) async fn landing(
+        &self,
+        ordinal: i32,
+        length: u64,
+        scope: &RequestScope,
+    ) -> Result<Arc<GpuLanding>> {
+        if !self.decrypts(ordinal) || length == 0 || !length.is_multiple_of(4096) {
+            return Err(Error::Unavailable);
+        }
+        if let Some(landing) = self
+            .landings
+            .lock()
+            .ok()
+            .and_then(|l| l.get(&ordinal).cloned())
+        {
+            return Ok(landing);
+        }
+        let (reply, mut receiver) = oneshot::channel();
+        self.send(Job::Landing {
+            ordinal,
+            length,
+            reply,
+        })?;
+        let fd = answer(&mut receiver, scope).await??;
+        let mut landings = self.landings.lock().map_err(|_| Error::Internal)?;
+        Ok(landings
+            .entry(ordinal)
+            .or_insert_with(|| {
+                Arc::new(GpuLanding {
+                    fd,
+                    ordinal,
+                    length,
+                })
+            })
+            .clone())
     }
 
     /// Where a request on GPU `ordinal` should have sealed pages delivered,
@@ -637,6 +782,9 @@ struct Helper {
     /// long lived, so one registration serves many reads.
     files: HashMap<(u64, u64), racer_gpu::GpuFile>,
     requests: HashMap<u64, Request>,
+    /// RDMA landing buffers by GPU. Never freed: a NIC may hold a
+    /// registration over them.
+    landing: HashMap<i32, racer_gpu::StagingBuffer>,
     state: HelperState,
 }
 
@@ -658,6 +806,7 @@ fn helper_main(
                 staging: HashMap::new(),
                 files: HashMap::new(),
                 requests: HashMap::new(),
+                landing: HashMap::new(),
                 state,
             }
         }
@@ -674,6 +823,10 @@ fn helper_main(
     let ids: Vec<u64> = helper.requests.keys().copied().collect();
     for id in ids {
         let _ = helper.release(id);
+    }
+    // A NIC registration may still cover landing memory: never free it.
+    for (_, buffer) in helper.landing.drain() {
+        std::mem::forget(buffer);
     }
 }
 
@@ -819,9 +972,46 @@ impl Helper {
                     let _ = reply.send(result);
                 }
             }
+            Job::Landing {
+                ordinal,
+                length,
+                reply,
+            } => {
+                let result = self.landing(ordinal, length);
+                self.note_leaks();
+                let _ = reply.send(result);
+            }
             #[cfg(test)]
             Job::Run(f) => f(),
         }
+    }
+
+    /// Allocate GPU `ordinal`'s landing buffer, once, and export it.
+    fn landing(&mut self, ordinal: i32, length: u64) -> Result<OwnedFd> {
+        if !self.landing.contains_key(&ordinal) {
+            let context = self
+                .contexts
+                .iter()
+                .find(|context| context.ordinal() == ordinal)
+                .ok_or(Error::Unavailable)?;
+            let buffer = context.staging(length).map_err(|error| {
+                eprintln!(
+                    "racer-dataplane: stage=gpu ordinal={ordinal} state=landing-failed reason={error}"
+                );
+                Error::Overloaded
+            })?;
+            self.landing.insert(ordinal, buffer);
+        }
+        let buffer = self.landing.get(&ordinal).ok_or(Error::Internal)?;
+        if buffer.size() != length {
+            return Err(Error::InvalidConfiguration);
+        }
+        buffer.dma_buf(0, length).map_err(|error| {
+            eprintln!(
+                "racer-dataplane: stage=gpu ordinal={ordinal} state=landing-export-failed reason={error}"
+            );
+            Error::Unavailable
+        })
     }
 
     /// Try each usable GPU until one owns the allocation.
@@ -953,7 +1143,7 @@ impl Helper {
             return Err(Error::InvalidRange);
         }
         let stream = &request.stream;
-        let source = match &page.source {
+        let (source_buffer, source) = match &page.source {
             SealedSource::Host(copy) => {
                 let bytes = copy.copy.ciphertext.bytes();
                 if bytes.len() as u64 != length + 16 {
@@ -968,13 +1158,20 @@ impl Helper {
                     let _ = stream.synchronize();
                     return Err(gpu_error(error));
                 }
-                CIPHERTEXT_SCRATCH
+                (staging, CIPHERTEXT_SCRATCH)
             }
             SealedSource::Staged { staged, .. } => {
                 if staged.ordinal() != ordinal {
                     return Err(Error::Internal);
                 }
-                staged.offset()
+                (staging, staged.offset())
+            }
+            SealedSource::Landed(landed) => {
+                if landed.ordinal() != ordinal || landed.len() != length + 16 {
+                    return Err(Error::Internal);
+                }
+                let buffer = self.landing.get(&ordinal).ok_or(Error::Internal)?;
+                (buffer, landed.offset())
             }
         };
         let request_key = racer_gpu::DecryptRequest {
@@ -993,7 +1190,7 @@ impl Helper {
         } else {
             (racer_gpu::Destination::Staging(staging), PLAINTEXT_SCRATCH)
         };
-        let queued = stream.decrypt(&request_key, staging, source, destination, at);
+        let queued = stream.decrypt(&request_key, source_buffer, source, destination, at);
         let synchronized = stream.synchronize();
         if let Err(racer_gpu::Error::KernelUnavailable) = queued {
             if let Ok(mut off) = self.state.kernels_off.lock() {
@@ -1025,6 +1222,9 @@ impl Helper {
             .counters
             .decrypted
             .fetch_add(1, Ordering::Relaxed);
+        if matches!(page.source, SealedSource::Landed(_)) {
+            self.state.counters.landed.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 

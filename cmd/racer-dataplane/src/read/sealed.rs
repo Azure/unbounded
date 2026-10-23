@@ -14,6 +14,7 @@
 use crate::error::Error;
 use crate::error::Result;
 use crate::gpu::GpuHelper;
+use crate::gpu::LandedCiphertext;
 use crate::gpu::StagedCiphertext;
 use crate::memory::PageResult;
 use crate::memory::UnverifiedPage;
@@ -64,6 +65,11 @@ pub enum SealedSource {
         /// The disk mapping the bytes came from.
         token: ReadToken,
     },
+
+    /// Ciphertext a peer's NIC wrote straight into the target GPU's RDMA
+    /// landing buffer. No host copy exists, so nothing is shared, published,
+    /// or persisted, and the page is used once.
+    Landed(LandedCiphertext),
 }
 
 /// A page that only the GPU will authenticate. Nothing here is proof of
@@ -104,6 +110,7 @@ impl SealedPage {
         let (copy, token) = match &self.source {
             SealedSource::Host(copy) => (Some(copy.clone()), None),
             SealedSource::Staged { token, .. } => (None, Some(token.clone())),
+            SealedSource::Landed(_) => (None, None),
         };
         SealedReport {
             page: self.page().clone(),
@@ -130,6 +137,11 @@ impl SealedPage {
             || self.metadata.version != page.version
             || self.metadata.immutable().page_length(page)? != self.envelope.plaintext_length
             || self.aad.len() > racer_gpu::MAX_AAD
+        {
+            return Err(Error::CorruptRecord);
+        }
+        if let SealedSource::Landed(landed) = &self.source
+            && landed.len() != u64::from(self.envelope.ciphertext_length)
         {
             return Err(Error::CorruptRecord);
         }

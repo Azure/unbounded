@@ -127,6 +127,9 @@ pub struct Config {
     /// Per-GPU cap on dataplane-owned ciphertext staging memory. Parsed and
     /// validated now; plaintext `gpu-read` does not allocate staging.
     pub gpu_staging_bytes: u64,
+    /// Per-GPU GPU memory that peers' NICs write `gpu-read` ciphertext into
+    /// over RDMA (GPUDirect RDMA landing). 0 turns landing off.
+    pub gpu_landing_bytes: u64,
     /// Opt into experimental opaque HTTP transit; materialized relay is the default.
     pub opaque_relay: bool,
     /// Peer-only TCP_NODELAY. Peer exchanges are strictly request/response with
@@ -205,6 +208,10 @@ impl Config {
         {
             return Err(Error::InvalidConfiguration);
         }
+        let gpu_landing_bytes = raw.gpu_landing_bytes.unwrap_or(DEFAULT_GPU_LANDING_BYTES);
+        if !gpu_landing_bytes.is_multiple_of(GPU_STAGING_UNIT) {
+            return Err(Error::InvalidConfiguration);
+        }
         let mut config = Self {
             warm: crate::read::warm::Config {
                 max_ttl: Duration::from_secs(raw.warm_max_ttl_secs.unwrap_or(3600)),
@@ -259,6 +266,7 @@ impl Config {
             enable_rdma,
             enable_gpu,
             gpu_staging_bytes,
+            gpu_landing_bytes,
             opaque_relay: raw.opaque_relay.unwrap_or(false),
             peer_tcp_nodelay: raw.peer_tcp_nodelay.unwrap_or(true),
             memory_pressure: raw.memory_pressure.unwrap_or(true),
@@ -614,6 +622,9 @@ pub enum GpuMode {
 /// Default `RACER_GPU_STAGING_BYTES`: 256 MiB per GPU.
 pub const DEFAULT_GPU_STAGING_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Default `RACER_GPU_LANDING_BYTES`: 256 MiB per GPU.
+pub const DEFAULT_GPU_LANDING_BYTES: u64 = 256 * 1024 * 1024;
+
 /// GPU staging is allocated in 2 MiB device granules, so the cap must be a
 /// whole number of them.
 pub const GPU_STAGING_UNIT: u64 = 2 * 1024 * 1024;
@@ -625,6 +636,7 @@ const ENV_NAMES: &[&str] = &[
     "ENABLE_RDMA",
     "ENABLE_GPU",
     "GPU_STAGING_BYTES",
+    "GPU_LANDING_BYTES",
     "ALLOW_SMT",
     "OPAQUE_RELAY",
     "PEER_TCP_NODELAY",
@@ -703,6 +715,8 @@ struct RawConfig {
     enable_gpu: Option<String>,
     #[serde(default, deserialize_with = "decimal")]
     gpu_staging_bytes: Option<u64>,
+    #[serde(default, deserialize_with = "decimal")]
+    gpu_landing_bytes: Option<u64>,
     allow_smt: Option<bool>,
     opaque_relay: Option<bool>,
     peer_tcp_nodelay: Option<bool>,
@@ -1400,6 +1414,24 @@ mod tests {
         ] {
             assert!(
                 parse(&[("RACER_GPU_STAGING_BYTES", value)]).is_err(),
+                "{value:?}"
+            );
+        }
+        assert_eq!(
+            parse(&[]).unwrap().gpu_landing_bytes,
+            DEFAULT_GPU_LANDING_BYTES
+        );
+        for (value, bytes) in [("0", 0), ("4194304", 4 << 20)] {
+            assert_eq!(
+                parse(&[("RACER_GPU_LANDING_BYTES", value)])
+                    .unwrap()
+                    .gpu_landing_bytes,
+                bytes
+            );
+        }
+        for value in ["1048576", "3145728", "-2097152", "2MiB"] {
+            assert!(
+                parse(&[("RACER_GPU_LANDING_BYTES", value)]).is_err(),
                 "{value:?}"
             );
         }
