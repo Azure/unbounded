@@ -866,6 +866,7 @@ dependencies = [
  "flow-control",
  "racer-control-wire",
  "racer-object-wire",
+ "sha2",
  "topology",
 ]
 

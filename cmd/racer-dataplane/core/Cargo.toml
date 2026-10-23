@@ -14,3 +14,4 @@ topology = { path = "../topology" }
 racer-object-wire = { path = "../object-wire" }
 racer-control-wire = { path = "../control-wire" }
 flow-control = { path = "../flow" }
+sha2 = "0.10"

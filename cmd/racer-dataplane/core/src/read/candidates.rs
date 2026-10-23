@@ -1,0 +1,435 @@
+//! Candidate ordering, peer response classification, and origin authority rules.
+
+use super::error::{Error, Result};
+use racer_control_wire::NodeId;
+use racer_object_wire::model::{ObjectId, PageNumber};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProbeOutcome {
+    CopyMiss,
+    Unreachable,
+    Overloaded,
+    VersionUnavailable,
+    /// An authenticated response carried a copy that could not be used locally.
+    UnusableCopy,
+}
+/// How a non-owner requester orders its remote attempts across a page's
+/// ranked owners. Placement, rank, and origin authority are unchanged: this only
+/// chooses which owner receives the first Acquire.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ReplicaSelection {
+    /// Visit owners in canonical rank order, so every remote read of a page
+    /// lands on the primary owner first.
+    Primary,
+    /// Visit owners that are direct overlay neighbors before owners that need
+    /// a relay hop. Among equally preferred owners, a rendezvous hash of the
+    /// requester and page picks a stable order, so one requester keeps using
+    /// the same replica for a page while different requesters spread the
+    /// load across all replicas.
+    #[default]
+    Spread,
+}
+
+/// Canonical ranks in the order a non-owner requester visits them. At most
+/// three owners exist; `ordered` itself stays the authoritative rank order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VisitOrder {
+    ranks: [u8; 3],
+    len: u8,
+}
+
+impl VisitOrder {
+    /// The identity order over the first `len` (at most three) ranks.
+    pub fn canonical(len: usize) -> Self {
+        Self {
+            ranks: [0, 1, 2],
+            len: len.min(3) as u8,
+        }
+    }
+
+    /// Canonical ranks in visiting order.
+    pub fn ranks(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
+        self.ranks[..usize::from(self.len)]
+            .iter()
+            .map(|rank| usize::from(*rank))
+    }
+
+    /// The canonical rank visited at `index`, if any.
+    pub fn get(&self, index: usize) -> Option<usize> {
+        self.ranks[..usize::from(self.len)]
+            .get(index)
+            .map(|rank| usize::from(*rank))
+    }
+}
+
+/// Order `len` canonical ranks for a non-owner requester. `Primary` returns the
+/// canonical order. `Spread` visits ranks for which `neighbor` holds first, then
+/// orders each group by descending `score` (ties keep canonical order).
+pub fn visit_order(
+    selection: ReplicaSelection,
+    len: usize,
+    neighbor: impl Fn(usize) -> bool,
+    score: impl Fn(usize) -> u64,
+) -> VisitOrder {
+    let mut order = VisitOrder::canonical(len);
+    if selection == ReplicaSelection::Primary || order.len < 2 {
+        return order;
+    }
+    let mut keys = [(false, 0u64); 3];
+    for (rank, key) in keys.iter_mut().enumerate().take(usize::from(order.len)) {
+        *key = (!neighbor(rank), u64::MAX - score(rank));
+    }
+    order.ranks[..usize::from(order.len)].sort_by_key(|rank| (keys[usize::from(*rank)], *rank));
+    order
+}
+
+/// Rendezvous weight of one owner for one requester and page. Stable within a
+/// process; it only spreads load, so it never needs to agree across nodes.
+pub fn replica_score(
+    requester: &NodeId,
+    object: &ObjectId,
+    page: PageNumber,
+    owner: &NodeId,
+) -> u64 {
+    use std::hash::Hash;
+    use std::hash::Hasher;
+    let mut hasher = std::hash::DefaultHasher::new();
+    requester.0.hash(&mut hasher);
+    object.cache.0.hash(&mut hasher);
+    object.key.0.hash(&mut hasher);
+    page.0.hash(&mut hasher);
+    owner.0.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Payload-free shape of a peer operation, as far as classification cares.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationKind {
+    Subscribe,
+    Page,
+    /// `fresh` is true for `MetadataSelector::Fresh`.
+    Metadata {
+        fresh: bool,
+    },
+    Bootstrap,
+    Warm,
+}
+
+/// Payload-free shape of a peer response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResponseKind {
+    Selected,
+    Bootstrap,
+    Page,
+    Metadata,
+    Miss,
+    NotFound,
+    VersionUnavailable,
+    Unavailable,
+    Overloaded,
+    OriginRejected,
+    OriginForbidden,
+    StaleMembership,
+    Held,
+    Warmed,
+    Released,
+}
+
+impl ResponseKind {
+    /// Whether this response carries a page or metadata payload.
+    pub fn has_payload(self) -> bool {
+        matches!(
+            self,
+            Self::Selected | Self::Bootstrap | Self::Page | Self::Metadata
+        )
+    }
+
+    /// The operation a payload response must answer, if any.
+    fn answers(self, operation: OperationKind) -> bool {
+        matches!(
+            (self, operation),
+            (Self::Selected, OperationKind::Subscribe)
+                | (Self::Bootstrap, OperationKind::Bootstrap)
+                | (Self::Page, OperationKind::Page)
+                | (Self::Metadata, OperationKind::Metadata { .. })
+        )
+    }
+}
+
+/// Classify one authenticated candidate response.
+///
+/// `acquire` describes the actual probe, which may be CopyOnly even when the
+/// caller's operation requests acquisition (predecessors and remaining copies).
+/// Payload responses that answer the operation's kind call `validate`, which
+/// checks payload identity and content and returns `Ok(())` for a usable copy;
+/// mismatched kinds are `CorruptRecord` without calling it. `Ok(None)` means a
+/// usable payload; `Ok(Some(outcome))` is a recoverable probe outcome.
+pub fn classify<E: From<Error>>(
+    response: ResponseKind,
+    operation: OperationKind,
+    acquire: bool,
+    validate: impl FnOnce() -> Result<(), E>,
+) -> Result<Option<ProbeOutcome>, E> {
+    let outcome = match response {
+        kind if kind.has_payload() => {
+            if !kind.answers(operation) {
+                return Err(Error::CorruptRecord.into());
+            }
+            return validate().map(|()| None);
+        }
+        ResponseKind::Miss => ProbeOutcome::CopyMiss,
+        ResponseKind::NotFound => {
+            return Err(match operation {
+                OperationKind::Bootstrap | OperationKind::Metadata { fresh: true } if acquire => {
+                    Error::NotFound
+                }
+                _ => Error::Unauthorized,
+            }
+            .into());
+        }
+        ResponseKind::VersionUnavailable => ProbeOutcome::VersionUnavailable,
+        ResponseKind::Unavailable => ProbeOutcome::Unreachable,
+        ResponseKind::Overloaded => ProbeOutcome::Overloaded,
+        ResponseKind::OriginRejected => return Err(Error::OriginRejected.into()),
+        ResponseKind::OriginForbidden => return Err(Error::OriginForbidden.into()),
+        ResponseKind::StaleMembership => return Err(Error::IncompatibleMembership.into()),
+        // Warm acknowledgements never answer a candidate data probe.
+        _ => return Err(Error::CorruptRecord.into()),
+    };
+    Ok(Some(outcome))
+}
+
+/// Map a payload validation failure to a recoverable probe outcome. Only page
+/// content validation is recoverable; transport and security errors never reach
+/// here, and `Unauthorized` remains terminal.
+pub fn unusable_copy(error: Error, operation: OperationKind) -> Option<ProbeOutcome> {
+    (matches!(error, Error::CorruptRecord | Error::MissingKey)
+        && matches!(operation, OperationKind::Page | OperationKind::Bootstrap))
+    .then_some(ProbeOutcome::UnusableCopy)
+}
+
+/// Error after every ranked owner missed: any unreachable, overloaded, or
+/// unusable predecessor makes the miss transient rather than authoritative.
+pub fn origin_miss_error(predecessor_evidence: &[ProbeOutcome]) -> Error {
+    if predecessor_evidence.iter().any(|outcome| {
+        matches!(
+            outcome,
+            ProbeOutcome::Unreachable | ProbeOutcome::Overloaded | ProbeOutcome::UnusableCopy
+        )
+    }) {
+        Error::Unavailable
+    } else {
+        Error::VersionUnavailable
+    }
+}
+
+/// Facts an origin authority was minted from.
+#[derive(Clone, Copy, Debug)]
+pub struct AuthorityFacts<'a> {
+    pub object: &'a ObjectId,
+    pub page: PageNumber,
+    pub rank: usize,
+    pub predecessor_evidence: usize,
+    /// Whether the authority's node is still a member of its membership.
+    pub member: bool,
+}
+
+/// Validate an origin authority for `object`/`page`. Private construction
+/// follows a recomputed ranking under an immutable membership, so validation
+/// need not rehash the entire cluster on each write.
+pub fn validate_origin_authority(
+    facts: AuthorityFacts<'_>,
+    object: &ObjectId,
+    page: PageNumber,
+) -> Result<()> {
+    if object != facts.object || page != facts.page {
+        return Err(Error::Unauthorized);
+    }
+    if facts.rank >= 3 || facts.predecessor_evidence != facts.rank || !facts.member {
+        return Err(Error::Unauthorized);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use racer_control_wire::CacheId;
+    use racer_object_wire::model::CacheKey;
+
+    fn object(key: u8) -> ObjectId {
+        ObjectId {
+            cache: CacheId("c".into()),
+            key: CacheKey([key; 32]),
+        }
+    }
+
+    #[test]
+    fn classify_outcomes_and_errors() {
+        use OperationKind as O;
+        use ResponseKind as R;
+        let ok = || Ok::<(), Error>(());
+        assert_eq!(
+            classify(R::Miss, O::Page, true, ok),
+            Ok(Some(ProbeOutcome::CopyMiss))
+        );
+        assert_eq!(
+            classify(R::Unavailable, O::Page, true, ok),
+            Ok(Some(ProbeOutcome::Unreachable))
+        );
+        assert_eq!(
+            classify(R::Overloaded, O::Page, true, ok),
+            Ok(Some(ProbeOutcome::Overloaded))
+        );
+        assert_eq!(
+            classify(R::VersionUnavailable, O::Page, true, ok),
+            Ok(Some(ProbeOutcome::VersionUnavailable))
+        );
+        assert_eq!(classify(R::Page, O::Page, true, ok), Ok(None));
+        assert_eq!(classify(R::Selected, O::Subscribe, false, ok), Ok(None));
+        assert_eq!(
+            classify(R::Metadata, O::Metadata { fresh: false }, false, ok),
+            Ok(None)
+        );
+        assert_eq!(classify(R::Bootstrap, O::Bootstrap, false, ok), Ok(None));
+        assert_eq!(
+            classify(R::Page, O::Bootstrap, true, ok),
+            Err(Error::CorruptRecord)
+        );
+        assert_eq!(
+            classify(R::Page, O::Page, true, || Err(Error::MissingKey)),
+            Err(Error::MissingKey)
+        );
+        assert_eq!(
+            classify(R::NotFound, O::Bootstrap, true, ok),
+            Err(Error::NotFound)
+        );
+        assert_eq!(
+            classify(R::NotFound, O::Bootstrap, false, ok),
+            Err(Error::Unauthorized)
+        );
+        assert_eq!(
+            classify(R::NotFound, O::Metadata { fresh: true }, true, ok),
+            Err(Error::NotFound)
+        );
+        assert_eq!(
+            classify(R::NotFound, O::Metadata { fresh: false }, true, ok),
+            Err(Error::Unauthorized)
+        );
+        assert_eq!(
+            classify(R::NotFound, O::Page, true, ok),
+            Err(Error::Unauthorized)
+        );
+        assert_eq!(
+            classify(R::OriginRejected, O::Page, true, ok),
+            Err(Error::OriginRejected)
+        );
+        assert_eq!(
+            classify(R::OriginForbidden, O::Page, true, ok),
+            Err(Error::OriginForbidden)
+        );
+        assert_eq!(
+            classify(R::StaleMembership, O::Page, true, ok),
+            Err(Error::IncompatibleMembership)
+        );
+        for warm in [R::Held, R::Warmed, R::Released] {
+            assert_eq!(classify(warm, O::Warm, true, ok), Err(Error::CorruptRecord));
+        }
+    }
+
+    #[test]
+    fn unusable_copy_only_for_page_content() {
+        assert_eq!(
+            unusable_copy(Error::CorruptRecord, OperationKind::Page),
+            Some(ProbeOutcome::UnusableCopy)
+        );
+        assert_eq!(
+            unusable_copy(Error::MissingKey, OperationKind::Bootstrap),
+            Some(ProbeOutcome::UnusableCopy)
+        );
+        assert_eq!(
+            unusable_copy(Error::Unauthorized, OperationKind::Page),
+            None
+        );
+        assert_eq!(
+            unusable_copy(Error::CorruptRecord, OperationKind::Subscribe),
+            None
+        );
+    }
+
+    #[test]
+    fn origin_miss_error_requires_clean_misses() {
+        assert_eq!(origin_miss_error(&[]), Error::VersionUnavailable);
+        assert_eq!(
+            origin_miss_error(&[ProbeOutcome::CopyMiss, ProbeOutcome::VersionUnavailable]),
+            Error::VersionUnavailable
+        );
+        for transient in [
+            ProbeOutcome::Unreachable,
+            ProbeOutcome::Overloaded,
+            ProbeOutcome::UnusableCopy,
+        ] {
+            assert_eq!(
+                origin_miss_error(&[ProbeOutcome::CopyMiss, transient]),
+                Error::Unavailable
+            );
+        }
+    }
+
+    #[test]
+    fn authority_validation() {
+        let a = object(1);
+        let facts = |rank, evidence, member| AuthorityFacts {
+            object: &a,
+            page: PageNumber(3),
+            rank,
+            predecessor_evidence: evidence,
+            member,
+        };
+        assert_eq!(
+            validate_origin_authority(facts(1, 1, true), &a, PageNumber(3)),
+            Ok(())
+        );
+        assert_eq!(
+            validate_origin_authority(facts(1, 1, true), &object(2), PageNumber(3)),
+            Err(Error::Unauthorized)
+        );
+        assert_eq!(
+            validate_origin_authority(facts(1, 1, true), &a, PageNumber(4)),
+            Err(Error::Unauthorized)
+        );
+        assert_eq!(
+            validate_origin_authority(facts(3, 3, true), &a, PageNumber(3)),
+            Err(Error::Unauthorized)
+        );
+        assert_eq!(
+            validate_origin_authority(facts(1, 0, true), &a, PageNumber(3)),
+            Err(Error::Unauthorized)
+        );
+        assert_eq!(
+            validate_origin_authority(facts(0, 0, false), &a, PageNumber(3)),
+            Err(Error::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn visit_order_primary_and_spread() {
+        assert_eq!(
+            visit_order(ReplicaSelection::Primary, 3, |_| false, |r| r as u64)
+                .ranks()
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        let order = visit_order(ReplicaSelection::Spread, 3, |r| r == 2, |r| r as u64);
+        assert_eq!(order.ranks().collect::<Vec<_>>(), [2, 1, 0]);
+        assert_eq!(order.get(1), Some(1));
+        assert_eq!(order.get(3), None);
+        assert_eq!(VisitOrder::canonical(9).ranks().len(), 3);
+        let requester = NodeId("r".into());
+        let owner = NodeId("o".into());
+        assert_eq!(
+            replica_score(&requester, &object(1), PageNumber(0), &owner),
+            replica_score(&requester, &object(1), PageNumber(0), &owner)
+        );
+    }
+}
