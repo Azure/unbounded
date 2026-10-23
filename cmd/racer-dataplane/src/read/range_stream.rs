@@ -782,6 +782,12 @@ impl RangeStream {
                 .as_mut()
                 .and_then(|spill| spill.pages.remove(&number.0));
             self.slots.push_back(Slot::Probing(match spilled {
+                // A sealed read probes live plaintext only. Cached or disk
+                // ciphertext is then fetched sealed, so the GPU rather than
+                // the CPU decrypts it.
+                None if sealed => {
+                    Box::pin(async move { directory.cached_page(page, &scope).await })
+                }
                 // Holding pages stay with the spill state until the hold
                 // completes, so the hold is released exactly once.
                 None => Box::pin(async move { directory.local_page(page, &scope).await }),
@@ -791,7 +797,11 @@ impl RangeStream {
                         .unwrap()
                         .pages
                         .insert(number.0, Spilling::Holding(holding));
-                    Box::pin(async move { directory.local_page(page, &scope).await })
+                    if sealed {
+                        Box::pin(async move { directory.cached_page(page, &scope).await })
+                    } else {
+                        Box::pin(async move { directory.local_page(page, &scope).await })
+                    }
                 }
                 // A sealed read probes memory only: a spilled page on disk is
                 // then fetched sealed, so the GPU decrypts it.

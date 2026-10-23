@@ -901,8 +901,9 @@ impl Fill {
         }
     }
 
-    /// Acquire one page for direct GPU delivery: verified plaintext when the
-    /// CPU has it anyway, otherwise ciphertext for the GPU to verify and
+    /// Acquire one page for direct GPU delivery: verified plaintext when a
+    /// reader still holds it on the CPU, otherwise ciphertext (from memory
+    /// first, then disk, peers or origin) for the GPU to verify and
     /// decrypt. Network and disk copies keep the usual single-flight sharing,
     /// memory publication and disk persistence; only the CPU decrypt and the
     /// plaintext publication are skipped.
@@ -924,7 +925,12 @@ impl Fill {
                 .await
                 .map(Fetched::Page);
         }
-        if target.helper.cufile()
+        // The memory cache keeps only ciphertext once readers drop the
+        // plaintext. A cached copy skips the disk and peer paths and is sealed
+        // for the GPU from host memory below.
+        let cached = self.dependencies.memory.unverified(&page)?.is_some();
+        if !cached
+            && target.helper.cufile()
             && self
                 .dependencies
                 .writer
@@ -941,15 +947,17 @@ impl Fill {
                 Err(_) => {}
             }
         }
-        match self
-            .land_from_peer(&page, membership.clone(), context, scope, budget, target)
-            .await
-        {
-            Ok(Some(fetched)) => return Ok(fetched),
-            Ok(None) => {}
-            Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => return Err(error),
-            // Any other failure takes the usual path through host memory.
-            Err(_) => {}
+        if !cached {
+            match self
+                .land_from_peer(&page, membership.clone(), context, scope, budget, target)
+                .await
+            {
+                Ok(Some(fetched)) => return Ok(fetched),
+                Ok(None) => {}
+                Err(error @ (Error::Cancelled | Error::DeadlineExceeded)) => return Err(error),
+                // Any other failure takes the usual path through host memory.
+                Err(_) => {}
+            }
         }
         let acquired = self
             .acquire_with_prefetch(

@@ -336,8 +336,12 @@ fn arrange(
     assert!(head.starts_with("http/1.1 200"), "{head}");
     let mut copies = Vec::new();
     for number in 0..pages {
-        let result = worker.memory().get(&page_id(number)).unwrap().unwrap();
-        copies.push(result.copy());
+        let copy = worker
+            .memory()
+            .ciphertext(&page_id(number))
+            .unwrap()
+            .unwrap();
+        copies.push(copy);
     }
     worker.memory().remove_cache(&definition().id).unwrap();
     for copy in copies {
@@ -372,23 +376,64 @@ fn default_slots() -> usize {
     (crate::config::DEFAULT_GPU_STAGING_BYTES / crate::gpu::SLOT_BYTES) as usize - 2
 }
 
+/// The memory cache keeps only ciphertext, so a page read before is
+/// decrypted again, on the GPU, from the cached ciphertext.
 #[test]
-fn gpu_read_memory_plaintext_hit_copies_plaintext() {
+fn gpu_read_memory_ciphertext_hit_decrypts_on_the_gpu() {
     let helper = start(GpuMode::Required, 1).unwrap();
     let data = body(5000);
     let fixture = gpu_fixture(data.clone(), &helper);
     worker(&fixture).retain(true);
     let _ = gpu_read(&fixture, &helper, None, 5000);
+    assert!(
+        worker(&fixture)
+            .memory()
+            .get(&page_id(0))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        worker(&fixture)
+            .memory()
+            .ciphertext(&page_id(0))
+            .unwrap()
+            .is_some()
+    );
     let mark = trace_len(&helper);
     let decrypts = worker(&fixture).cpu_decrypts();
+    let decrypted = counter(&helper.counters().decrypted);
     let (head, frames, allocation, _) = gpu_read(&fixture, &helper, Some((10, 99)), 90);
     assert!(head.starts_with("http/1.1 200"), "{head}");
     assert_eq!(frames, [(1, 0, 10, 90), (2, 1, 90, 0)]);
     assert_eq!(read_allocation(&allocation, 64, 90), &data[10..100]);
-    assert_eq!(calls(&helper, mark, Operation::Decrypt), 0);
+    assert_eq!(calls(&helper, mark, Operation::FileRead), 0);
     assert_eq!(calls(&helper, mark, Operation::CopyH2d), 1);
+    assert_eq!(calls(&helper, mark, Operation::Decrypt), 1);
+    assert_eq!(calls(&helper, mark, Operation::CopyD2d), 1);
     assert_eq!(worker(&fixture).cpu_decrypts(), decrypts);
-    assert_eq!(counter(&helper.counters().decrypted), 0);
+    assert_eq!(counter(&helper.counters().decrypted), decrypted + 1);
+    assert_eq!(worker(&fixture).metric(Event::GpuDirectDiskRead), 0);
+    assert_idle(&fixture, &helper, default_slots());
+}
+
+/// A page cached in memory and on disk is staged from memory: cuFile does
+/// not read the disk copy.
+#[test]
+fn gpu_read_prefers_memory_ciphertext_over_cufile() {
+    let helper = start(GpuMode::Required, 1).unwrap();
+    let data = body(5000);
+    let fixture = gpu_fixture(data.clone(), &helper);
+    arrange(&fixture, &helper, 1, 5000, true, true);
+    assert!(worker(&fixture).disk_location(&page_id(0)).is_some());
+    let mark = trace_len(&helper);
+    let (head, frames, allocation, _) = gpu_read(&fixture, &helper, None, 5000);
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert_eq!(frames.len(), 2, "{frames:?}");
+    assert_eq!(read_allocation(&allocation, 64, 5000), data);
+    assert_eq!(calls(&helper, mark, Operation::FileRead), 0);
+    assert_eq!(calls(&helper, mark, Operation::Decrypt), 1);
+    assert_eq!(worker(&fixture).cpu_decrypts(), 0);
+    assert_eq!(worker(&fixture).metric(Event::GpuDirectDiskRead), 0);
     assert_idle(&fixture, &helper, default_slots());
 }
 
