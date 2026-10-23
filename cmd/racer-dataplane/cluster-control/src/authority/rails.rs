@@ -220,6 +220,16 @@ pub(crate) mod tests {
             )
         );
         assert_eq!(parse_report(&padded), Err(wire::Error::Overloaded));
+        // The limit counts UTF-8 bytes, like the admission policy: two-byte
+        // characters reach it at half the code points.
+        let max = crate::limits::MAX_REPORT_BYTES;
+        let at = "\u{e9}".repeat(max / 2);
+        assert_eq!(at.len(), max);
+        assert_eq!(parse_report(&at), Err(wire::Error::InvalidRequest));
+        assert_eq!(
+            parse_report(&format!("{at}r")),
+            Err(wire::Error::Overloaded)
+        );
         // Invalid NICs remain rejected at any size.
         let mut r = max_report();
         r.rdma_nics[1].port = r.rdma_nics[0].port;
