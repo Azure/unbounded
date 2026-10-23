@@ -163,7 +163,69 @@ struct SimStream {
 /// Device memory: client memfd or staging bytes.
 enum Memory {
     Import { file: File },
-    Staging { bytes: Vec<u8>, registered: bool },
+    Staging { bytes: Mapped, registered: bool },
+}
+
+/// Staging bytes in a shared memfd mapping. A dma-buf export of the whole
+/// buffer is a duplicate of the memfd, so a simulated NIC that maps it writes
+/// bytes the simulated GPU then reads, as with real GPUDirect RDMA.
+struct Mapped {
+    file: File,
+    pointer: std::ptr::NonNull<u8>,
+    length: usize,
+}
+
+impl Mapped {
+    /// A zeroed shared mapping of `length` bytes, or None.
+    fn new(length: usize) -> Option<Self> {
+        let fd = unsafe { libc::memfd_create(c"racer-gpu-staging".as_ptr(), libc::MFD_CLOEXEC) };
+        if fd < 0 {
+            return None;
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        file.set_len(length as u64).ok()?;
+        let pointer = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                std::os::fd::AsRawFd::as_raw_fd(&file),
+                0,
+            )
+        };
+        if pointer == libc::MAP_FAILED {
+            return None;
+        }
+        Some(Self {
+            file,
+            pointer: std::ptr::NonNull::new(pointer.cast())?,
+            length,
+        })
+    }
+}
+
+impl std::ops::Deref for Mapped {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        // SAFETY: the mapping lives as long as self. Other writers (a
+        // simulated NIC) only write while the dataplane holds the slot.
+        unsafe { std::slice::from_raw_parts(self.pointer.as_ptr(), self.length) }
+    }
+}
+
+impl std::ops::DerefMut for Mapped {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as for deref.
+        unsafe { std::slice::from_raw_parts_mut(self.pointer.as_ptr(), self.length) }
+    }
+}
+
+impl Drop for Mapped {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.pointer.as_ptr().cast(), self.length) };
+    }
 }
 
 /// One buffer.
@@ -502,6 +564,9 @@ unsafe extern "C" fn staging(context: *mut c_void, size: u64, out: ffi::Out) -> 
         if size > 1 << 32 {
             return (code::ENOMEM, 0);
         }
+        let Some(bytes) = Mapped::new(size as usize) else {
+            return (code::ENOMEM, 0);
+        };
         let handle = give(w, out);
         w.buffers.insert(
             handle,
@@ -509,7 +574,7 @@ unsafe extern "C" fn staging(context: *mut c_void, size: u64, out: ffi::Out) -> 
                 context: id(context),
                 size,
                 memory: Memory::Staging {
-                    bytes: vec![0; size as usize],
+                    bytes,
                     registered: false,
                 },
             },
@@ -813,9 +878,15 @@ unsafe extern "C" fn dmabuf(
     fd: *mut c_int,
 ) -> c_int {
     with(Operation::Dmabuf, |w| {
-        let Some(size) = w.staging(id(staging)).map(|b| b.len() as u64) else {
+        let Some(Buffer {
+            memory: Memory::Staging { bytes, .. },
+            ..
+        }) = w.buffers.get(&id(staging))
+        else {
             return (code::EINVAL, id(staging));
         };
+        let size = bytes.len() as u64;
+        let live = (offset == 0).then(|| bytes.file.try_clone());
         if fd.is_null() {
             return (code::EINVAL, id(staging));
         }
@@ -827,7 +898,16 @@ unsafe extern "C" fn dmabuf(
         {
             return (code::ERANGE, id(staging));
         }
-        // Not a live view of the buffer: a placeholder fd of the right size.
+        // An export from offset 0 is a live view: a duplicate of the backing
+        // memfd, so the dma-buf offset equals the staging offset as it does on
+        // real hardware. Other offsets get a placeholder fd of the right size.
+        if let Some(file) = live {
+            let Ok(file) = file else {
+                return (code::EDRIVER, id(staging));
+            };
+            unsafe { *fd = std::os::fd::IntoRawFd::into_raw_fd(file) };
+            return (code::OK, id(staging));
+        }
         let memfd = unsafe { libc::memfd_create(c"racer-gpu-dmabuf".as_ptr(), libc::MFD_CLOEXEC) };
         if memfd < 0 {
             return (code::EDRIVER, id(staging));

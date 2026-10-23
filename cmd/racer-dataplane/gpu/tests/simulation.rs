@@ -414,6 +414,34 @@ fn dma_buf_export_checks_alignment() {
 }
 
 #[test]
+/// A whole-buffer export is a live view: writes through the dma-buf (as a
+/// NIC would make) are what the GPU then reads, and the other way around.
+fn dma_buf_export_from_zero_is_live() {
+    use std::os::unix::fs::FileExt;
+    let sim = simulation();
+    let _env = sim.enter();
+    let gpu = Gpu::load().unwrap();
+    let ctx = gpu.context(0).unwrap();
+    let staging = ctx.staging(16384).unwrap();
+    let file = std::fs::File::from(staging.dma_buf(0, 16384).unwrap());
+    file.write_all_at(b"from the nic", 8192).unwrap();
+    let stream = ctx.stream().unwrap();
+    let mut out = [0; 12];
+    stream.read_staging(&staging, 8192, &mut out).unwrap();
+    stream.synchronize().unwrap();
+    assert_eq!(&out, b"from the nic");
+    stream
+        .copy_from_host(Destination::Staging(&staging), 4096, b"gpu")
+        .unwrap();
+    stream.synchronize().unwrap();
+    let mut back = [0; 3];
+    file.read_exact_at(&mut back, 4096).unwrap();
+    assert_eq!(&back, b"gpu");
+    drop((stream, staging, file));
+    assert_eq!(sim.live().staging, 0);
+}
+
+#[test]
 /// Device copies move staged bytes into the window; reads of staging work.
 fn device_copy_from_staging() {
     let sim = simulation();
