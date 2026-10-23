@@ -362,12 +362,8 @@ func TestEnsureDaemonSetForUnmanagedSite(t *testing.T) {
 			}},
 		},
 	}
-	clientset := k8sfake.NewClientset()
 
-	c := &ManagedKubeProxyController{
-		clientset: clientset,
-		options:   ManagedKubeProxyOptions{Namespace: "unbounded-net", Image: "kube-proxy:v1"},
-	}
+	c, clientset := newKubeProxyTestController(t, nil, nil)
 	if err := c.ensureDaemonSet(t.Context(), site); err != nil {
 		t.Fatal(err)
 	}
