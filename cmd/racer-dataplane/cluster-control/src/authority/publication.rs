@@ -166,8 +166,10 @@ impl Image {
 
     /// Delta for the exact base, else the full image.
     pub fn for_base(&self, after: Option<u64>, base_hash: Option<&str>) -> Arc<Vec<u8>> {
-        match (&self.delta, after, base_hash) {
-            (Some((seq, hash, d)), Some(a), Some(h)) if *seq == a && hash == h => d.clone(),
+        use crate::step::admission::{Body, body_for};
+        let base = self.delta.as_ref().map(|(s, h, _)| (*s, h.as_str()));
+        match (body_for(base, after, base_hash), &self.delta) {
+            (Body::Delta, Some((_, _, d))) => d.clone(),
             _ => self.encoded.clone(),
         }
     }

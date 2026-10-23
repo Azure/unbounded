@@ -52,6 +52,7 @@ mod primary;
 mod seat;
 mod server;
 mod shared;
+pub mod step;
 #[cfg(test)]
 mod tests;
 

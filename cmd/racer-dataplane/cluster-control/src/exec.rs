@@ -383,8 +383,8 @@ impl Slots {
     }
 
     pub fn try_acquire(&self) -> Option<Slot> {
-        (self.0.get() < self.1).then(|| {
-            self.0.set(self.0.get() + 1);
+        crate::step::admission::take(self.0.get(), self.1).map(|n| {
+            self.0.set(n);
             Slot(self.0.clone())
         })
     }

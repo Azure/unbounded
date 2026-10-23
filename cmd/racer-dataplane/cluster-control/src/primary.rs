@@ -6,20 +6,24 @@
 //! Secret, checks the term (see [`state::Writer`]), and checks the Lease is
 //! still fresh by the monotonic clock.
 
+use crate::step::{
+    contend::Contend,
+    primary::{Inventory, PassInputs, PassPlan, discovery, plan_pass},
+};
 use crate::{
-    DiscoveredEndpoint, annotations,
+    annotations,
     authority::{
-        catalog::{self, CacheInfo},
+        catalog::CacheInfo,
         election::{self, LeaseObservation, Observer},
-        keyring::{self, Offer, Policy},
-        members::{self, NodeInfo, Ownership, PodInfo},
-        publication::{self, Image, Record},
+        keyring::Policy,
+        members::{NodeInfo, Ownership, PodInfo},
+        publication::Image,
         state::{self, Freshness, StateError, StateRecord, Term, Writer, lease_authority},
     },
     exec::{self, Signal},
     kube::{KubeError, paths, str_at},
-    lease, limits, pki,
-    seat::{self, encode_endpoints, install_record, state_markers_match},
+    lease, limits,
+    seat::{self, install_record, state_markers_match},
     shared::{Seat, SeatHolder, Shared},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -56,15 +60,11 @@ fn seat_mine(shared: &Shared, seat: &Rc<Seat>) -> bool {
 /// Contend for the primary Lease while holding `seat`.
 pub async fn contend(shared: Rc<Shared>, seat: Rc<Seat>) {
     let ns = shared.config.namespace.clone();
-    let mut observer = Observer::default();
+    let mut contend = Contend::default();
     while seat_mine(&shared, &seat) && !shared.stopping.get() {
         if let Ok(object) = lease::get(&shared.lease_api, &ns, annotations::PRIMARY_LEASE).await {
             let obs = lease::observe(&object);
-            observer.observe(&obs, Instant::now());
-            if election::may_claim_primary(
-                seat_mine(&shared, &seat),
-                observer.expired(&obs, Instant::now()),
-            ) {
+            if contend.observe(&obs, Instant::now(), seat_mine(&shared, &seat)) {
                 let spec = election::claim(
                     &obs.spec,
                     &shared.config.pod_name,
@@ -78,12 +78,11 @@ pub async fn contend(shared: Rc<Shared>, seat: Rc<Seat>) {
                 );
                 if let Ok(v) = lease::put(&shared.lease_api, &ns, &body).await {
                     lead(&shared, &seat, v, started).await;
-                    observer.forget(annotations::PRIMARY_LEASE);
+                    contend.term_ended();
                 }
             }
         }
-        let wait = limits::LEASE_RENEW
-            + Duration::from_millis(u64::from(shared.rng.borrow_mut().u16_or_zero()) % 3000);
+        let wait = Contend::wait(&mut **shared.rng.borrow_mut());
         exec::sleep(wait).await;
     }
 }
@@ -113,18 +112,6 @@ fn primary_annotations(
         a.insert(k, v.clone());
     }
     a
-}
-
-/// Observed cluster objects, compact.
-#[derive(Default)]
-pub struct Inventory {
-    pub nodes: BTreeMap<String, NodeInfo>,
-    pub pods: BTreeMap<String, PodInfo>,
-    pub caches: BTreeMap<String, CacheInfo>,
-    /// ClusterCaches listed at least once, or the CRD is absent.
-    pub caches_synced: bool,
-    pub nodes_synced: bool,
-    pub pods_synced: bool,
 }
 
 /// One primary term.
@@ -532,16 +519,6 @@ fn live_seats(t: &Term_, s: &SeatSnapshot) -> BTreeMap<usize, LeaseObservation> 
         .collect()
 }
 
-fn record_of(r: Option<&StateRecord>) -> Record {
-    r.map(|r| Record {
-        sequence: r.sequence,
-        membership_version: r.membership_version,
-        content_hash: r.content_hash.clone(),
-        membership_hash: r.membership_hash.clone(),
-    })
-    .unwrap_or_default()
-}
-
 /// One reconcile pass and, when needed, one commit.
 async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
     let shared = &t.shared;
@@ -598,140 +575,41 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
             .observe(current.as_ref(), live_uid.as_deref())?;
         let cluster = shared.cluster.borrow().clone();
         let previous_image = shared.serving.borrow().image.clone();
-        let previous_record = record_of(current.as_ref());
-        let history = previous_image
-            .as_ref()
-            .filter(|i| i.record == previous_record)
-            .map(|i| publication::history(&i.publication))
-            .unwrap_or_default();
-
-        let (members, eligible, catalog_input) = {
-            let inv = t.inventory.borrow();
-            let pods: Vec<PodInfo> = inv.pods.values().cloned().collect();
-            let mut by_node: BTreeMap<String, Vec<PodInfo>> = BTreeMap::new();
-            for p in &pods {
-                by_node
-                    .entry(p.node_name.clone())
-                    .or_default()
-                    .push(p.clone());
-            }
-            let nodes: Vec<NodeInfo> = inv.nodes.values().cloned().collect();
-            let m = members::reconcile(
-                &nodes,
-                &by_node,
-                &ownership,
-                shared.config.peer_port,
-                &history,
-            )
-            .map_err(|_| StateError::TooLarge);
-            (
-                m,
-                members::eligible_nodes(&pods, &ownership),
-                inv.caches.values().cloned().collect::<Vec<_>>(),
-            )
-        };
-        let durable = current
-            .as_ref()
-            .map(|c| c.keyring.clone())
-            .unwrap_or_default();
-        // The catalog is unknown until the ClusterCache watch synced, or
-        // when it fails to build or admit and no image of the committed
-        // record exists. Unknown is not empty: it must neither publish an
-        // empty catalog nor drop cache keys.
-        let caches_synced = t.inventory.borrow().caches_synced;
-        let catalog: Option<Vec<_>> = caches_synced
-            .then(|| catalog::build(&catalog_input).ok())
-            .flatten()
-            .and_then(|c| keyring::admit_catalog(&c, &durable).ok())
-            .or_else(|| {
-                previous_image
-                    .as_ref()
-                    .filter(|i| i.record == previous_record)
-                    .map(|i| i.publication.caches.clone())
-            });
-        let offers: Vec<Offer> = live
-            .iter()
-            .filter_map(|(i, o)| {
-                Some(Offer {
-                    der: STANDARD
-                        .decode(o.annotations.get(annotations::ISSUER_CERTIFICATE)?)
-                        .ok()?,
-                    seat: *i as u8,
-                    holder: o.annotations.get(annotations::HOLDER_UID)?.clone(),
-                })
-            })
-            .collect();
         let policy = Policy::from(shared.config.rotation);
-        let plan = keyring::plan_with(
-            &policy,
-            &durable,
-            catalog.as_deref(),
-            &offers,
-            unix_now(),
-            &mut **shared.rng.borrow_mut(),
-        )
-        .map_err(|_| StateError::TooLarge)?;
+        let plan = {
+            let inventory = t.inventory.borrow();
+            let writer = t.writer.borrow();
+            plan_pass(
+                &PassInputs {
+                    cluster: &cluster,
+                    pod_uid: &shared.config.pod_uid,
+                    seats: shared.config.seats,
+                    peer_port: shared.config.peer_port,
+                    policy: &policy,
+                    inventory: &inventory,
+                    synced: ready,
+                    ownership: &ownership,
+                    current: current.as_ref(),
+                    previous_image: previous_image.as_ref(),
+                    live: &live,
+                    writer: &writer,
+                    wall_unix: unix_now(),
+                },
+                &mut **shared.rng.borrow_mut(),
+            )?
+        };
         if plan.refused_roots > 0 {
             // Root slots are full. Those seats stay unready until slots free up.
             shared.last_error.set(Some(crate::Error::Unavailable));
         }
-
-        // Without a full observation, keep the committed publication.
-        let (members, prepared) = match (&members, ready, &catalog) {
-            (Ok(m), true, Some(catalog)) => {
-                let p = publication::prepare(
-                    &previous_record,
-                    &cluster,
-                    m.members.values().cloned(),
-                    catalog.clone(),
-                )
-                .map_err(|_| StateError::TooLarge)?;
-                (m.members.len(), Some(p))
-            }
-            _ => (
-                previous_image
-                    .as_ref()
-                    .map_or(0, |i| i.publication.members.len()),
-                None,
-            ),
-        };
-        let desired =
-            election::desired_seats(shared.config.seats, members, eligible.max(live.len()));
-        let term_changed = current
-            .as_ref()
-            .is_none_or(|c| c.term != *t.writer.borrow().term());
-        let base = current.clone().unwrap_or_else(|| StateRecord {
-            version: state::VERSION,
-            cluster: cluster.clone(),
-            ..Default::default()
-        });
-        let mut next =
-            t.writer
-                .borrow()
-                .stamp(base.clone(), &cluster, &shared.config.pod_uid, unix_now());
-        next.keyring = plan.durable.clone();
-        next.desired_seats = desired as u8;
-        if let Some(p) = &prepared {
-            next.sequence = p.record.sequence;
-            next.membership_version = p.record.membership_version;
-            next.content_hash = p.record.content_hash.clone();
-            next.membership_hash = p.record.membership_hash.clone();
-            next.publication_bytes = p.encoded.len() as u64;
-        }
-        let changed = term_changed
-            || plan.changed
-            || next.desired_seats != base.desired_seats
-            || next.sequence != base.sequence
-            || next.membership_version != base.membership_version;
-        // Image for the record we end up with, when we built one.
-        let image = prepared.as_ref().map(|p| {
-            Image::new(
-                p.record.clone(),
-                p.publication.clone(),
-                p.encoded.clone(),
-                previous_image.as_ref(),
-            )
-        });
+        let PassPlan {
+            next,
+            image,
+            desired,
+            eligible,
+            changed,
+            ..
+        } = plan;
 
         if !changed {
             if let Some(c) = current {
@@ -811,79 +689,17 @@ async fn update_discovery(
     let shared = &t.shared;
     let sequence = shared.serving.borrow().record.as_ref().map(|r| r.sequence);
     let previous = ready_floor(t.ready_floor.get(), sequence, Instant::now());
-    let width = desired.max(live.keys().next_back().map_or(0, |i| i + 1));
-    let nodes: Vec<String> = (0..width)
-        .map(|i| {
-            live.get(&i)
-                .and_then(|o| o.annotations.get(annotations::HOLDER_NODE).cloned())
-                .unwrap_or_default()
-        })
-        .collect();
-    let ready: Vec<(usize, &LeaseObservation)> = live
-        .iter()
-        .filter(|(_, o)| {
-            seat_ready(
-                o.annotations.get(annotations::READY).map(String::as_str),
-                sequence,
-                previous,
-            )
-        })
-        .map(|(i, o)| (*i, o))
-        .collect();
-    let endpoints: Vec<DiscoveredEndpoint> = ready
-        .iter()
-        .filter_map(|(i, o)| {
-            let cert = STANDARD
-                .decode(o.annotations.get(annotations::SERVING_CERTIFICATE)?)
-                .ok()?;
-            Some(DiscoveredEndpoint {
-                url: o.annotations.get(annotations::ENDPOINT)?.clone(),
-                generation: format!(
-                    "{i}-{}-{}",
-                    o.spec.transitions,
-                    &pki::fingerprint(&cert)[..16]
-                ),
-                certificate: cert,
-            })
-        })
-        .collect();
+    let d = discovery(live, desired, eligible, sequence, previous);
     {
         let mut extra = t.extra.borrow_mut();
         let before = extra.clone();
-        extra.insert(annotations::SEATS, Some(desired.to_string()));
-        extra.insert(
-            annotations::SEAT_NODES,
-            Some(serde_json::to_string(&nodes).unwrap_or_default()),
-        );
-        extra.insert(
-            annotations::CLAIM_WINDOW,
-            Some((eligible as u64 / 50).clamp(10, 600).to_string()),
-        );
-        extra.insert(annotations::ENDPOINTS, Some(encode_endpoints(&endpoints)));
+        extra.extend(d.extra);
         if *extra != before {
             drop(extra);
             t.publish.notify();
         }
     }
-    let webhooks: Vec<WebhookSeat> = ready
-        .iter()
-        .filter_map(|(_, o)| {
-            let url = o.annotations.get(annotations::ENDPOINT)?;
-            let ip = url
-                .strip_prefix("https://")?
-                .parse::<std::net::SocketAddr>()
-                .ok()?
-                .ip();
-            Some(WebhookSeat {
-                pod: o.spec.holder.clone()?,
-                uid: o.annotations.get(annotations::HOLDER_UID)?.clone(),
-                ips: webhook_ips(o.annotations.get(annotations::WEBHOOK_ADDRESSES), ip),
-                ca: STANDARD
-                    .decode(o.annotations.get(annotations::WEBHOOK_CERTIFICATE)?)
-                    .ok()?,
-            })
-        })
-        .collect();
+    let webhooks = d.webhooks;
     let fresh =
         || t.alive.get() && t.writer.borrow().may_write() && t.lease.get().fresh(Instant::now());
     let _ = reconcile_webhook(
@@ -1116,7 +932,7 @@ mod tests {
                 pod: format!("racer-dataplane-{n}"),
                 uid: format!("u{n}"),
                 ips: vec![ip.parse().unwrap()],
-                ca: keyring::tests::root(1),
+                ca: crate::authority::keyring::tests::root(1),
             };
             let a = seat(1, "10.0.0.1");
             let v6 = seat(3, "fd00::1");
@@ -1203,7 +1019,7 @@ mod tests {
                 pod: "racer-dataplane-1".into(),
                 uid: "u1".into(),
                 ips: vec!["10.0.0.1".parse().unwrap()],
-                ca: keyring::tests::root(1),
+                ca: crate::authority::keyring::tests::root(1),
             };
             let yes = || true;
             reconcile_webhook(
@@ -1239,7 +1055,7 @@ mod tests {
                 pod: "racer-dataplane-1".into(),
                 uid: "u1".into(),
                 ips: vec!["10.0.0.1".parse().unwrap()],
-                ca: keyring::tests::root(1),
+                ca: crate::authority::keyring::tests::root(1),
             };
             let checks = Cell::new(0);
             let fresh = || {
@@ -1283,7 +1099,7 @@ mod tests {
                     published.map(str::to_owned).as_ref(),
                     format!("10.0.0.{n}").parse().unwrap(),
                 ),
-                ca: keyring::tests::root(1),
+                ca: crate::authority::keyring::tests::root(1),
             };
             let seats = [
                 seat(1, Some("10.0.0.1,fd00::1")),
@@ -1326,8 +1142,8 @@ mod tests {
 
     #[test]
     fn pem_roundtrip() {
-        let a = keyring::tests::root(1);
-        let b = keyring::tests::root(1);
+        let a = crate::authority::keyring::tests::root(1);
+        let b = crate::authority::keyring::tests::root(1);
         let p = pem(&[a.clone(), b.clone()]);
         assert_eq!(parse_pem(p.as_bytes()), vec![a, b]);
         assert!(parse_pem(b"").is_empty());

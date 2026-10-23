@@ -123,15 +123,7 @@ pub fn cursor(query: Option<&str>) -> Result<Option<u64>, ProtocolFailure> {
     Ok(Some(n))
 }
 
-/// A cursor ahead of what this seat serves means this seat lags another
-/// seat the client already read from. Like the Go controller, answer 503 so
-/// the client retries or fails over instead of treating its cursor as bad.
-fn check_ahead(after: Option<u64>, current: u64) -> Result<(), ProtocolFailure> {
-    if after.is_some_and(|a| a > current) {
-        return Err(ProtocolFailure::Unavailable);
-    }
-    Ok(())
-}
+use crate::step::admission::check_ahead;
 
 fn pki_failure(e: PkiError) -> ProtocolFailure {
     match e {
@@ -632,7 +624,7 @@ impl Server {
         check_ahead(after, image.record.sequence)?;
         drop(image);
         let deadline = self.poll_deadline(id.expires)?;
-        let newer = |i: &Image| after.is_none_or(|a| i.record.sequence > a);
+        let newer = |i: &Image| crate::step::admission::newer(after, i.record.sequence);
         let found = self
             .wait_until(deadline, || self.shared.image().filter(newer))
             .await;
