@@ -17,7 +17,7 @@ data:
   # mode off when no usable GPU is found; true fails startup instead.
   # RACER_ENABLE_GPU: "auto"
   # Cap on ciphertext staging memory per GPU, in bytes: a nonzero multiple of
-  # 2 MiB, default 256 MiB. Reserved for GPU decryption; not used yet.
+  # 2 MiB, default 256 MiB. GPU reads stage ciphertext here for decryption.
   # RACER_GPU_STAGING_BYTES: "268435456"
   # GPU memory per GPU that peers' NICs write GPU-read pages into over RDMA
   # (GPUDirect RDMA), in bytes: a multiple of 2 MiB, default 256 MiB. 0 turns
