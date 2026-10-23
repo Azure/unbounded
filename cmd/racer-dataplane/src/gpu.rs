@@ -99,6 +99,10 @@ const PLAINTEXT_SCRATCH: u64 = SLOT_BYTES;
 /// Registered cuFile handles kept per process; more are reopened on demand.
 const MAX_FILES: usize = 64;
 
+/// Threads that run cuFile reads. One synchronous read keeps an NVMe drive
+/// far from busy, and reads on the helper thread would stall decryption.
+const FILE_READERS: usize = 4;
+
 /// A shared ciphertext page the GPU stream holds until its copy completes.
 struct HostCiphertext(crate::memory::CiphertextPage);
 
@@ -806,6 +810,64 @@ struct HelperState {
     slots: u64,
 }
 
+/// A registered cuFile handle and the reads using it.
+struct OpenFile {
+    file: racer_gpu::GpuFile,
+    /// Reads queued or running on a reader thread.
+    reads: usize,
+    /// No longer in [`Helper::files`]: free it once `reads` is zero.
+    retired: bool,
+}
+
+/// A cuFile read for a reader thread.
+struct FileJob {
+    read: racer_gpu::FileRead,
+    file: u64,
+    staged: StagedCiphertext,
+    reply: oneshot::Sender<Result<StagedCiphertext>>,
+}
+
+/// A finished cuFile read.
+struct FileDone {
+    file: u64,
+    failed: bool,
+}
+
+/// Run cuFile reads until the helper stops sending them. Reports each read
+/// to the helper before answering, so a later stage sees a failed handle gone.
+fn reader_main(
+    reader: racer_gpu::FileReader,
+    jobs: Arc<Mutex<mpsc::Receiver<FileJob>>>,
+    done: mpsc::Sender<FileDone>,
+    counters: Arc<GpuCounters>,
+) {
+    loop {
+        let job = match jobs.lock() {
+            Ok(jobs) => jobs.recv(),
+            Err(_) => return,
+        };
+        let Ok(job) = job else {
+            return;
+        };
+        let result = reader.read(job.read);
+        let failed = result.is_err();
+        if let Err(error) = &result {
+            counters.file_failures.fetch_add(1, Ordering::Relaxed);
+            eprintln!("racer-dataplane: stage=gpu state=cufile-read-failed reason={error}");
+        } else {
+            counters.staged.fetch_add(1, Ordering::Relaxed);
+        }
+        let _ = done.send(FileDone {
+            file: job.file,
+            failed,
+        });
+        // A dropped receiver drops the slot, which frees it.
+        let _ = job
+            .reply
+            .send(result.map(|()| job.staged).map_err(|_| Error::Unavailable));
+    }
+}
+
 /// State owned by the helper thread.
 struct Helper {
     gpu: racer_gpu::Gpu,
@@ -814,7 +876,15 @@ struct Helper {
     staging: HashMap<i32, racer_gpu::StagingBuffer>,
     /// Registered files by (device, inode). The slab descriptors are few and
     /// long lived, so one registration serves many reads.
-    files: HashMap<(u64, u64), racer_gpu::GpuFile>,
+    files: HashMap<(u64, u64), u64>,
+    /// Registered files by id, including retired ones that reads still use.
+    open: HashMap<u64, OpenFile>,
+    next_file: u64,
+    /// Reads for the reader threads. `None` once they are told to stop.
+    reads: Option<mpsc::Sender<FileJob>>,
+    /// Reads the reader threads finished, so their files can be released.
+    done: mpsc::Receiver<FileDone>,
+    readers: Vec<std::thread::JoinHandle<()>>,
     requests: HashMap<u64, Request>,
     /// RDMA landing buffers by GPU. Never freed: a NIC may hold a
     /// registration over them.
@@ -833,12 +903,36 @@ fn helper_main(
     let mut helper = match discover(loader) {
         Ok((gpu, contexts, usable)) => {
             let decrypt = contexts.iter().map(probe_decrypt).collect();
+            let (reads, queue) = mpsc::channel();
+            let queue = Arc::new(Mutex::new(queue));
+            let (finished, done) = mpsc::channel();
+            let mut readers = Vec::new();
+            for _ in 0..FILE_READERS {
+                let (reader, queue, finished, counters) = (
+                    gpu.file_reader(),
+                    queue.clone(),
+                    finished.clone(),
+                    state.counters.clone(),
+                );
+                // Without readers, stages fail and pages go through the host.
+                if let Ok(thread) = std::thread::Builder::new()
+                    .name("racer-gpu-read".into())
+                    .spawn(move || reader_main(reader, queue, finished, counters))
+                {
+                    readers.push(thread);
+                }
+            }
             let _ = ready.send(Ok((usable, decrypt)));
             Helper {
                 gpu,
                 contexts,
                 staging: HashMap::new(),
                 files: HashMap::new(),
+                open: HashMap::new(),
+                next_file: 0,
+                reads: (!readers.is_empty()).then_some(reads),
+                done,
+                readers,
                 requests: HashMap::new(),
                 landing: HashMap::new(),
                 state,
@@ -851,9 +945,16 @@ fn helper_main(
     };
     drop(ready);
     while let Ok(job) = jobs.recv() {
+        helper.finish_reads();
         helper.run(job);
     }
-    // Every sender is gone: release what is left, stream first.
+    // Every sender is gone: let queued reads finish, then release their files.
+    helper.reads = None;
+    for reader in std::mem::take(&mut helper.readers) {
+        let _ = reader.join();
+    }
+    helper.finish_reads();
+    // Release what is left, stream first.
     let ids: Vec<u64> = helper.requests.keys().copied().collect();
     for id in ids {
         let _ = helper.release(id);
@@ -983,10 +1084,12 @@ impl Helper {
                 length,
                 reply,
             } => {
-                let result = self.stage(&staged, fd, file_offset, length);
+                let result = self.stage(staged, fd, file_offset, length, reply);
                 self.note_leaks();
                 // A dropped receiver drops the slot, which frees it.
-                let _ = reply.send(result.map(|()| staged));
+                if let Err((error, reply)) = result {
+                    let _ = reply.send(Err(error));
+                }
             }
             Job::Write {
                 id,
@@ -1104,52 +1207,132 @@ impl Helper {
         self.staging.get(&ordinal).ok_or(Error::Internal)
     }
 
-    /// Read a file range into a staged slot with cuFile.
+    /// Queue a cuFile read of a file range into a staged slot. A reader
+    /// thread answers `reply`; on an early error it comes back to the caller.
     fn stage(
         &mut self,
-        staged: &StagedCiphertext,
+        staged: StagedCiphertext,
         fd: OwnedFd,
         file_offset: u64,
         length: u64,
-    ) -> Result<()> {
-        let identity = file_identity(&fd)?;
-        self.staging(staged.ordinal)?;
-        let staging = self.staging.get(&staged.ordinal).ok_or(Error::Internal)?;
-        let counters = &self.state.counters;
+        reply: oneshot::Sender<Result<StagedCiphertext>>,
+    ) -> std::result::Result<(), (Error, oneshot::Sender<Result<StagedCiphertext>>)> {
+        let Some(reads) = self.reads.clone() else {
+            return Err((Error::Unavailable, reply));
+        };
+        let identity = match file_identity(&fd) {
+            Ok(identity) => identity,
+            Err(error) => return Err((error, reply)),
+        };
+        if let Err(error) = self.staging(staged.ordinal) {
+            return Err((error, reply));
+        }
+        let Some(staging) = self.staging.get(&staged.ordinal) else {
+            return Err((Error::Internal, reply));
+        };
         if let Err(error) = staging.register_cufile() {
-            counters.file_failures.fetch_add(1, Ordering::Relaxed);
+            self.state
+                .counters
+                .file_failures
+                .fetch_add(1, Ordering::Relaxed);
             self.disable_cufile(error);
-            return Err(Error::Unavailable);
+            return Err((Error::Unavailable, reply));
         }
-        if !self.files.contains_key(&identity) {
-            if self.files.len() >= MAX_FILES {
-                self.files.clear();
+        let id = match self.files.get(&identity) {
+            Some(id) => *id,
+            None => {
+                if self.files.len() >= MAX_FILES {
+                    for id in std::mem::take(&mut self.files).into_values() {
+                        self.retire(id);
+                    }
+                }
+                match self.gpu.open_file(fd) {
+                    Ok(file) => {
+                        let id = self.next_file;
+                        self.next_file += 1;
+                        self.open.insert(
+                            id,
+                            OpenFile {
+                                file,
+                                reads: 0,
+                                retired: false,
+                            },
+                        );
+                        self.files.insert(identity, id);
+                        id
+                    }
+                    Err(error) => {
+                        self.state
+                            .counters
+                            .file_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.disable_cufile(error);
+                        return Err((Error::Unavailable, reply));
+                    }
+                }
             }
-            match self.gpu.open_file(fd) {
-                Ok(file) => {
-                    self.files.insert(identity, file);
-                }
-                Err(error) => {
-                    counters.file_failures.fetch_add(1, Ordering::Relaxed);
-                    self.disable_cufile(error);
-                    return Err(Error::Unavailable);
-                }
+        };
+        let (Some(open), Some(staging)) =
+            (self.open.get_mut(&id), self.staging.get(&staged.ordinal))
+        else {
+            return Err((Error::Internal, reply));
+        };
+        // SAFETY: the file stays in `open` while `reads` is above zero, the
+        // staging buffer and backend live until the readers are joined, and
+        // the slot is this job's alone until the read answers.
+        let read = match unsafe {
+            open.file
+                .detach(staging, staged.offset(), file_offset, length)
+        } {
+            Ok(read) => read,
+            Err(error) => return Err((gpu_error(error), reply)),
+        };
+        open.reads += 1;
+        let job = FileJob {
+            read,
+            file: id,
+            staged,
+            reply,
+        };
+        if let Err(mpsc::SendError(job)) = reads.send(job) {
+            open.reads -= 1;
+            return Err((Error::Unavailable, job.reply));
+        }
+        Ok(())
+    }
+
+    /// Account for reads the reader threads finished. A failed handle may be
+    /// stale, so it is registered again next time.
+    fn finish_reads(&mut self) {
+        while let Ok(FileDone { file, failed }) = self.done.try_recv() {
+            if let Some(open) = self.open.get_mut(&file) {
+                open.reads = open.reads.saturating_sub(1);
+            }
+            if failed {
+                self.files.retain(|_, id| *id != file);
+                self.retire(file);
+            } else {
+                self.release_file(file);
             }
         }
-        let file = self.files.get(&identity).ok_or(Error::Internal)?;
-        let staging = self.staging.get(&staged.ordinal).ok_or(Error::Internal)?;
-        match file.read(staging, staged.offset(), file_offset, length) {
-            Ok(()) => {
-                counters.staged.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
-            Err(error) => {
-                counters.file_failures.fetch_add(1, Ordering::Relaxed);
-                // A failed handle may be stale; register again next time.
-                self.files.remove(&identity);
-                eprintln!("racer-dataplane: stage=gpu state=cufile-read-failed reason={error}");
-                Err(Error::Unavailable)
-            }
+    }
+
+    /// Stop handing out a file; free it once no read uses it.
+    fn retire(&mut self, id: u64) {
+        if let Some(open) = self.open.get_mut(&id) {
+            open.retired = true;
+        }
+        self.release_file(id);
+    }
+
+    /// Free a retired file that no read uses.
+    fn release_file(&mut self, id: u64) {
+        if self
+            .open
+            .get(&id)
+            .is_some_and(|open| open.retired && open.reads == 0)
+        {
+            self.open.remove(&id);
         }
     }
 
@@ -1305,7 +1488,7 @@ pub(crate) mod testing {
     }
 
     /// A test scope with a few seconds on the real clock.
-    fn scope() -> RequestScope {
+    pub(crate) fn scope() -> RequestScope {
         RequestScope::new(
             crate::model::RequestId([1; 16]),
             std::time::Instant::now() + std::time::Duration::from_secs(5),
@@ -1552,5 +1735,103 @@ mod tests {
             Err(Error::Internal)
         );
         assert_eq!(helper.counters().landed.load(Ordering::Relaxed), 0);
+    }
+
+    /// A memfd standing in for a slab file.
+    fn slab(bytes: &[u8]) -> OwnedFd {
+        use std::os::unix::fs::FileExt;
+        let fd = unsafe { libc::memfd_create(c"slab".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        let file = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+        file.write_all_at(bytes, 0).unwrap();
+        file.into()
+    }
+
+    /// Stage `length` bytes at `offset` of `fd` on GPU 0, blocking.
+    fn stage(
+        helper: &GpuHelper,
+        fd: &OwnedFd,
+        offset: u64,
+        length: u64,
+    ) -> Result<StagedCiphertext> {
+        futures::executor::block_on(helper.stage_file(
+            0,
+            fd.try_clone().unwrap(),
+            offset,
+            length,
+            &scope(),
+        ))
+    }
+
+    fn operations(helper: &GpuHelper, operation: racer_gpu::simulation::Operation) -> usize {
+        helper.run(move || {
+            simulation()
+                .trace()
+                .iter()
+                .filter(|event| event.operation == operation)
+                .count()
+        })
+    }
+
+    #[test]
+    /// Many stages in flight at once share one registration, each gets its
+    /// own slot, and the slots come back when the answers drop.
+    fn concurrent_stages_share_one_file_registration() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None]);
+        let bytes: Vec<u8> = (0..(16 * 4096)).map(|i| (i % 253) as u8).collect();
+        let fd = slab(&bytes);
+        let free = helper.free_slots(0);
+        let staged = futures::executor::block_on(futures::future::join_all((0..8).map(|i| {
+            let fd = fd.try_clone().unwrap();
+            let scope = scope();
+            let helper = helper.clone();
+            async move { helper.stage_file(0, fd, i * 4096, 4096, &scope).await }
+        })));
+        let staged: Vec<_> = staged.into_iter().map(Result::unwrap).collect();
+        let mut slots: Vec<_> = staged.iter().map(|staged| staged.offset()).collect();
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(slots.len(), 8);
+        assert_eq!(helper.free_slots(0), free - 8);
+        assert_eq!(helper.counters().staged.load(Ordering::Relaxed), 8);
+        assert_eq!(operations(&helper, Operation::FileRead), 8);
+        assert_eq!(operations(&helper, Operation::File), 1);
+        drop(staged);
+        assert_eq!(helper.free_slots(0), free);
+        assert_eq!(helper.run(|| simulation().live().files), 1);
+    }
+
+    #[test]
+    /// A failed read frees its slot and the file is registered again for the
+    /// next read; cuFile stays on.
+    fn failed_read_registers_the_file_again() {
+        use racer_gpu::simulation::Operation;
+        let helper = helper(&[None]);
+        let fd = slab(&[7; 8192]);
+        let free = helper.free_slots(0);
+        stage(&helper, &fd, 0, 4096).unwrap();
+        helper.run(|| simulation().fault(Operation::FileRead, -5));
+        assert_eq!(stage(&helper, &fd, 0, 4096).err(), Some(Error::Unavailable));
+        assert_eq!(helper.free_slots(0), free);
+        assert_eq!(helper.counters().file_failures.load(Ordering::Relaxed), 1);
+        assert!(helper.cufile());
+        stage(&helper, &fd, 4096, 4096).unwrap();
+        assert_eq!(operations(&helper, Operation::File), 2);
+        assert_eq!(operations(&helper, Operation::FileFree), 1);
+        assert_eq!(helper.run(|| simulation().live().files), 1);
+        assert_eq!(helper.counters().staged.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    /// A short file read fails cleanly, as it would on a truncated slab.
+    fn short_read_fails_the_stage() {
+        let helper = helper(&[None]);
+        let fd = slab(&[1; 4096]);
+        assert_eq!(
+            stage(&helper, &fd, 2048, 4096).err(),
+            Some(Error::Unavailable)
+        );
+        assert_eq!(helper.counters().file_failures.load(Ordering::Relaxed), 1);
     }
 }
