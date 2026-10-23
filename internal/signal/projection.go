@@ -41,9 +41,9 @@ func projectPending(
 	kube client.Client,
 	run *signalv1.CertificationRun,
 ) error {
-	return projectParticipants(ctx, kube, run.Spec.Participants, func(node *corev1.Node) error {
+	return projectParticipants(ctx, kube, run.Spec.Participants, true, func(node *corev1.Node) error {
 		if node.Annotations[ReservationLabel] != run.Name {
-			return nil
+			return fmt.Errorf("reservation is not owned by Run %s", run.Name)
 		}
 
 		setProfileProjection(node, run.Spec.Profile)
@@ -55,7 +55,7 @@ func projectPending(
 }
 
 func projectTesting(ctx context.Context, kube client.Client, run *signalv1.CertificationRun) error {
-	return projectParticipants(ctx, kube, run.Spec.Participants, func(node *corev1.Node) error {
+	return projectParticipants(ctx, kube, run.Spec.Participants, false, func(node *corev1.Node) error {
 		if node.Annotations[ReservationLabel] != run.Name {
 			return nil
 		}
@@ -75,7 +75,7 @@ func projectTerminal(ctx context.Context, kube client.Client, run *signalv1.Cert
 
 	finishedAt := run.Status.FinishedAt.UTC().Format(time.RFC3339)
 
-	return projectParticipants(ctx, kube, run.Spec.Participants, func(node *corev1.Node) error {
+	return projectParticipants(ctx, kube, run.Spec.Participants, false, func(node *corev1.Node) error {
 		if node.Annotations[ReservationLabel] != run.Name {
 			return nil
 		}
@@ -127,6 +127,7 @@ func projectParticipants(
 	ctx context.Context,
 	kube client.Client,
 	participants []signalv1.Participant,
+	strict bool,
 	mutate func(*corev1.Node) error,
 ) error {
 	for _, participant := range participants {
@@ -137,10 +138,22 @@ func projectParticipants(
 		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			var node corev1.Node
 			if err := kube.Get(ctx, client.ObjectKey{Name: participant.NodeName}, &node); err != nil {
-				return client.IgnoreNotFound(err)
+				if !strict {
+					return client.IgnoreNotFound(err)
+				}
+
+				return err
 			}
 
 			if participant.NodeUID != "" && node.UID != participant.NodeUID {
+				if strict {
+					return fmt.Errorf(
+						"node UID changed from %s to %s",
+						participant.NodeUID,
+						node.UID,
+					)
+				}
+
 				return nil
 			}
 

@@ -45,13 +45,16 @@ import (
 )
 
 const (
-	RequestLabel         = "signal.unbounded-cloud.io/certification-request"
-	ReservationLabel     = "signal.unbounded-cloud.io/reserved-by"
-	RunNodeLabel         = "signal.unbounded-cloud.io/request-node"
-	RunProfileLabel      = "signal.unbounded-cloud.io/profile"
-	RunTriggerAnnotation = "signal.unbounded-cloud.io/trigger"
-	RunFinalizer         = "signal.unbounded-cloud.io/cleanup"
-	SnapshotRunLabel     = "signal.unbounded-cloud.io/run"
+	RequestLabel           = "signal.unbounded-cloud.io/certification-request"
+	ReservationLabel       = "signal.unbounded-cloud.io/reserved-by"
+	RunNodeLabel           = "signal.unbounded-cloud.io/request-node"
+	RunProfileLabel        = "signal.unbounded-cloud.io/profile"
+	RunTriggerAnnotation   = "signal.unbounded-cloud.io/trigger"
+	RunAdmissionAnnotation = "signal.unbounded-cloud.io/admission"
+	RunFinalizer           = "signal.unbounded-cloud.io/cleanup"
+	SnapshotRunLabel       = "signal.unbounded-cloud.io/run"
+	runAdmissionReady      = "ready"
+	runAdmissionPending    = "pending"
 )
 
 var runnerImageDigestPattern = regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)
@@ -169,7 +172,7 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 
 		err := reader.Get(ctx, client.ObjectKey{Namespace: r.Namespace, Name: runName}, &run)
 		if err == nil {
-			return nil
+			return r.completeRunAdmission(ctx, &run)
 		}
 
 		if !apierrors.IsNotFound(err) {
@@ -221,6 +224,10 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 		return fmt.Errorf("profile %s participant constraints: %w", profile.Name, err)
 	}
 
+	if profile.Spec.Purpose != "" && profile.Spec.Purpose != signalv1.PurposeFullCertification {
+		return fmt.Errorf("profile %s purpose must be %s", profile.Name, signalv1.PurposeFullCertification)
+	}
+
 	for index := range checks {
 		check := &checks[index]
 		if err := signalv1.ValidateRuntimeContract(
@@ -255,8 +262,48 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 	}
 
 	for index := range checks {
-		if _, _, err := participantsForCheck(participants, checks[index].ParticipantPolicy); err != nil {
+		checkParticipants, _, err := participantsForCheck(participants, checks[index].ParticipantPolicy)
+		if err != nil {
 			return fmt.Errorf("check %s participants: %w", checks[index].ID, err)
+		}
+
+		minimumEvidenceBytes := signaladapter.MinimumBackendEvidenceBytes(len(checkParticipants))
+		if int(checks[index].ResultBounds.BackendEvidenceBytes) < minimumEvidenceBytes {
+			return fmt.Errorf(
+				"check %s backendEvidenceBytes must be at least %d for %d participants",
+				checks[index].ID,
+				minimumEvidenceBytes,
+				len(checkParticipants),
+			)
+		}
+
+		minimumReasonBytes := signaladapter.MinimumPartialReasonBytes()
+		if int(checks[index].ResultBounds.ReasonBytes) < minimumReasonBytes {
+			return fmt.Errorf(
+				"check %s reasonBytes must be at least %d for mandatory failure output",
+				checks[index].ID,
+				minimumReasonBytes,
+			)
+		}
+
+		minimumMeasurementsBytes := signaladapter.MinimumPartialMeasurementsBytes(len(checkParticipants))
+		if int(checks[index].ResultBounds.MeasurementsBytes) < minimumMeasurementsBytes {
+			return fmt.Errorf(
+				"check %s measurementsBytes must be at least %d for %d participants",
+				checks[index].ID,
+				minimumMeasurementsBytes,
+				len(checkParticipants),
+			)
+		}
+
+		minimumBackendResourcesBytes := signaladapter.MinimumPartialBackendResourcesBytes(len(checkParticipants))
+		if int(checks[index].ResultBounds.BackendResourcesBytes) < minimumBackendResourcesBytes {
+			return fmt.Errorf(
+				"check %s backendResourcesBytes must be at least %d for %d participants",
+				checks[index].ID,
+				minimumBackendResourcesBytes,
+				len(checkParticipants),
+			)
 		}
 
 		if _, err := signalworkload.Encode(checks[index].WorkloadPolicy); err != nil {
@@ -323,7 +370,8 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 				RunProfileLabel: profile.Name,
 			},
 			Annotations: map[string]string{
-				RunTriggerAnnotation: "manual",
+				RunTriggerAnnotation:   "manual",
+				RunAdmissionAnnotation: runAdmissionPending,
 			},
 			Finalizers: []string{RunFinalizer},
 		},
@@ -339,7 +387,7 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 			Checks:              checkSnapshots,
 			ExecutionPolicy:     profile.Spec.ExecutionPolicy,
 			Workflow:            profile.Spec.Workflow,
-			Purpose:             profile.Spec.Purpose,
+			Purpose:             signalv1.PurposeFullCertification,
 			EvidencePath:        strings.Trim(profile.Spec.EvidencePath, "/") + "/" + runName + ".json",
 			Deadline:            profile.Spec.Deadline,
 			Tolerations:         profile.Spec.Tolerations,
@@ -371,15 +419,45 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 		return cleanupFailedAdmission(fmt.Errorf("bind script snapshot to run: %w", err))
 	}
 
-	if err := projectPending(ctx, r.Client, run); err != nil {
-		return cleanupFailedAdmission(fmt.Errorf("project pending certification state: %w", err))
-	}
-
 	releaseOnFailure = false
+
+	if err := r.completeRunAdmission(ctx, run); err != nil {
+		return err
+	}
 
 	if r.Recorder != nil {
 		r.Recorder.Eventf(run, nil, corev1.EventTypeNormal, "CertificationAdmitted", "AdmitCertification",
 			"Created CertificationRun %s with %d immutable checks", run.Name, len(checkSnapshots))
+	}
+
+	return nil
+}
+
+func (r *AdmissionReconciler) completeRunAdmission(
+	ctx context.Context,
+	run *signalv1.CertificationRun,
+) error {
+	if run.Annotations[RunAdmissionAnnotation] == runAdmissionReady {
+		return nil
+	}
+
+	if err := projectPending(ctx, r.Client, run); err != nil {
+		return fmt.Errorf("project pending certification state: %w", err)
+	}
+
+	before := run.DeepCopy()
+	if run.Annotations == nil {
+		run.Annotations = map[string]string{}
+	}
+
+	run.Annotations[RunAdmissionAnnotation] = runAdmissionReady
+
+	if err := r.Patch(
+		ctx,
+		run,
+		client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}),
+	); err != nil {
+		return fmt.Errorf("mark certification admission ready: %w", err)
 	}
 
 	return nil
@@ -1081,6 +1159,10 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 
 	if run.Spec.Cancel {
 		return r.cancel(ctx, &run)
+	}
+
+	if run.Annotations[RunAdmissionAnnotation] != runAdmissionReady {
+		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
 	if run.Status.Workflow.Name == "" {
@@ -1879,6 +1961,8 @@ func terminalCheckStatuses(
 		status.Verdict = outputs["verdict"]
 		status.Reason = outputs["reason"]
 		status.Measurements = outputs["measurements"]
+		allowPartialBackendEvidence := status.Verdict == "Inconclusive" &&
+			status.Reason == "BackendSetupFailed"
 
 		_, globalIndexes, participantErr := participantsForCheck(
 			run.Spec.Participants,
@@ -1901,6 +1985,7 @@ func terminalCheckStatuses(
 			outputs["backend-resources"],
 			check.Backend,
 			run.Namespace,
+			allowPartialBackendEvidence,
 		)
 		if evidenceErr != nil {
 			status.Phase = signalv1.CheckPhaseInconclusive
@@ -1924,6 +2009,7 @@ func terminalCheckStatuses(
 			outputs["backend-resources"],
 			globalIndexes,
 			run.Namespace,
+			allowPartialBackendEvidence,
 		)
 		if resourceErr != nil {
 			status.Phase = signalv1.CheckPhaseInconclusive
@@ -2160,6 +2246,7 @@ func backendResourceReferences(
 	value string,
 	participantCount int,
 	namespace string,
+	allowPartial bool,
 ) ([]signalv1.BackendResourceReference, error) {
 	if participantCount < 1 || participantCount > 64 {
 		return nil, fmt.Errorf("participant count must be between 1 and 64")
@@ -2243,7 +2330,7 @@ func backendResourceReferences(
 		}
 	}
 
-	if participantCount > 1 {
+	if !allowPartial && participantCount > 1 {
 		for index, isCovered := range covered {
 			if !isCovered {
 				return nil, fmt.Errorf("backend-resources does not cover participant index %d", index)
@@ -2258,8 +2345,9 @@ func backendResourceReferencesForParticipants(
 	value string,
 	globalIndexes []int32,
 	namespace string,
+	allowPartial bool,
 ) ([]signalv1.BackendResourceReference, error) {
-	references, err := backendResourceReferences(value, len(globalIndexes), namespace)
+	references, err := backendResourceReferences(value, len(globalIndexes), namespace, allowPartial)
 	if err != nil {
 		return nil, err
 	}
@@ -2314,6 +2402,7 @@ func groupedBackendEvidenceComplete(
 	references []signalv1.BackendResourceReference,
 	backend signalv1.ExecutionBackend,
 	namespace string,
+	allowPartial bool,
 ) (bool, error) {
 	if err := signaladapter.ValidateBackendEvidence(content); err != nil {
 		return false, err
@@ -2324,16 +2413,16 @@ func groupedBackendEvidenceComplete(
 		return false, err
 	}
 
-	if len(evidence.Participants) != participantCount {
+	if len(evidence.Participants) > participantCount || (!allowPartial && len(evidence.Participants) != participantCount) {
 		return false, fmt.Errorf(
-			"backend-evidence contains %d participants, want %d",
+			"backend-evidence contains %d participants, want at most %d",
 			len(evidence.Participants),
 			participantCount,
 		)
 	}
 
 	seen := make([]bool, participantCount)
-	complete := evidence.Complete && evidence.CaptureError == ""
+	complete := !allowPartial && evidence.Complete && evidence.CaptureError == ""
 	podUIDs := map[types.UID]struct{}{}
 
 	for index := range evidence.Participants {
@@ -2435,13 +2524,21 @@ func groupedBackendEvidenceForParticipants(
 	resources string,
 	backend signalv1.ExecutionBackend,
 	namespace string,
+	allowPartial bool,
 ) (string, bool, error) {
-	references, err := backendResourceReferences(resources, len(globalIndexes), namespace)
+	references, err := backendResourceReferences(resources, len(globalIndexes), namespace, allowPartial)
 	if err != nil {
 		return "", false, err
 	}
 
-	complete, err := groupedBackendEvidenceComplete(content, len(globalIndexes), references, backend, namespace)
+	complete, err := groupedBackendEvidenceComplete(
+		content,
+		len(globalIndexes),
+		references,
+		backend,
+		namespace,
+		allowPartial,
+	)
 	if err != nil {
 		return "", false, err
 	}
@@ -2486,15 +2583,6 @@ func groupedBackendEvidenceForParticipants(
 }
 
 func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationRun) (ctrl.Result, error) {
-	stopped, err := r.ensureWorkflowStopped(ctx, run)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	if !stopped {
-		return ctrl.Result{RequeueAfter: time.Second}, nil
-	}
-
 	evidenceRun := run.DeepCopy()
 	evidenceRun.Status.Phase = signalv1.RunPhaseCancelled
 	evidenceRun.Status.ExecutionState = "Interrupted"

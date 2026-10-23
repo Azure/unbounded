@@ -121,7 +121,7 @@ type CertificationRunSpec struct {
 	Checks          []CertificationCheckSnapshot `json:"checks"`
 	ExecutionPolicy SuiteExecutionPolicy         `json:"executionPolicy"`
 	Workflow        WorkflowReference            `json:"workflow"`
-	// +kubebuilder:validation:Enum=FullCertification;QuickCertification;Preflight;TargetedVerification;Diagnostic
+	// +kubebuilder:validation:Enum=FullCertification
 	Purpose         CertificationPurpose `json:"purpose,omitempty"`
 	EvidencePath    string               `json:"evidencePath"`
 	Deadline        metav1.Duration      `json:"deadline"`

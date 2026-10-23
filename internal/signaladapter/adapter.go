@@ -310,6 +310,15 @@ func ValidateConfig(config Config) ([]signalv1.Participant, []corev1.Toleration,
 		return nil, nil, nil, err
 	}
 
+	minimumEvidenceBytes := MinimumBackendEvidenceBytes(len(participants))
+	if config.BackendEvidenceBytes > 0 && config.BackendEvidenceBytes < minimumEvidenceBytes {
+		return nil, nil, nil, fmt.Errorf(
+			"backend-evidence-bytes must be at least %d for %d participants",
+			minimumEvidenceBytes,
+			len(participants),
+		)
+	}
+
 	var tolerations []corev1.Toleration
 	if err := decodeJSONObject(config.TolerationsJSON, &tolerations); err != nil {
 		return nil, nil, nil, fmt.Errorf("decode tolerations: %w", err)
@@ -470,6 +479,13 @@ func BackendResource(resource *unstructured.Unstructured, participantIndex int32
 		)
 	}
 
+	return backendResourceIdentity(resource, participantIndex)
+}
+
+func backendResourceIdentity(
+	resource *unstructured.Unstructured,
+	participantIndex int32,
+) (signalv1.BackendResourceReference, error) {
 	if resource.GetAPIVersion() == "" ||
 		resource.GetKind() == "" ||
 		resource.GetName() == "" ||
@@ -485,6 +501,55 @@ func BackendResource(resource *unstructured.Unstructured, participantIndex int32
 		UID:                resource.GetUID(),
 		ParticipantIndexes: []int32{participantIndex},
 	}, nil
+}
+
+func MinimumPartialReasonBytes() int {
+	return len("BackendSetupFailed")
+}
+
+func MinimumPartialMeasurementsBytes(participantCount int) int {
+	results := make([]Result, participantCount)
+	for index := range results {
+		results[index] = Result{
+			ParticipantIndex: index,
+			ExecutionState:   "Error",
+			Verdict:          "Inconclusive",
+			Reason:           "BackendSetupFailed",
+		}
+	}
+
+	content, err := json.Marshal(map[string]any{
+		"participantCount": participantCount,
+		"createdBackends":  participantCount,
+		"error":            strings.Repeat("\x00", maxEvidenceTextBytes),
+		"results":          results,
+	})
+	if err != nil {
+		return MaxMeasurementsBytes + 1
+	}
+
+	return len(content) + 64
+}
+
+func MinimumPartialBackendResourcesBytes(participantCount int) int {
+	references := make([]signalv1.BackendResourceReference, participantCount)
+	for index := range references {
+		references[index] = signalv1.BackendResourceReference{
+			APIVersion:         strings.Repeat("a", 32),
+			Kind:               strings.Repeat("a", 16),
+			Namespace:          strings.Repeat("a", 63),
+			Name:               strings.Repeat("a", 63),
+			UID:                types.UID(strings.Repeat("a", 128)),
+			ParticipantIndexes: []int32{int32(index)},
+		}
+	}
+
+	content, err := json.Marshal(references)
+	if err != nil {
+		return MaxBackendOutputBytes + 1
+	}
+
+	return len(content) + 64
 }
 
 func Aggregate(

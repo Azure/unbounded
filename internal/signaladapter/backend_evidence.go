@@ -126,6 +126,35 @@ type CapturedLogEvidence struct {
 	Error                 string `json:"error,omitempty"`
 }
 
+func MinimumBackendEvidenceBytes(participantCount int) int {
+	evidence := BackendEvidence{
+		Version:      backendEvidenceVersion,
+		Complete:     false,
+		Participants: make([]ParticipantBackendEvidence, participantCount),
+	}
+
+	for index := range evidence.Participants {
+		evidence.Participants[index] = ParticipantBackendEvidence{
+			ParticipantIndex: index,
+			Resource: BackendObjectEvidence{
+				APIVersion: strings.Repeat("a", 32),
+				Kind:       strings.Repeat("a", 16),
+				Namespace:  strings.Repeat("a", 63),
+				Name:       strings.Repeat("a", 63),
+				UID:        types.UID(strings.Repeat("a", 128)),
+			},
+			CaptureError: strings.Repeat("a", maxEvidenceTextBytes),
+		}
+	}
+
+	content, err := json.Marshal(evidence)
+	if err != nil {
+		return MaxBackendEvidenceBytes + 1
+	}
+
+	return len(content) + 64
+}
+
 func (r *Runner) captureBackendEvidence(
 	ctx context.Context,
 	config Config,
