@@ -14,9 +14,12 @@ type fakeIPTables struct {
 	deleteJumpErr      error
 	deletedCurrentJump bool
 	deletedLegacyJump  bool
+	appended           [][]string
 }
 
-func (f *fakeIPTables) Append(_, _ string, _ ...string) error {
+func (f *fakeIPTables) Append(_, _ string, rulespec ...string) error {
+	f.appended = append(f.appended, rulespec)
+
 	return nil
 }
 
