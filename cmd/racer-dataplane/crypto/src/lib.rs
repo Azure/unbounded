@@ -357,8 +357,7 @@ pub fn xaes_derive(key: &[u8; 32], nonce: &[u8; 24]) -> DerivedPageKey {
     let derived = PageCipher::new(key)
         .derive_key(nonce)
         .expect("16-byte halves always convert to AES blocks");
-    let mut gcm_nonce = [0; 12];
-    gcm_nonce.copy_from_slice(&nonce[12..]);
+    let gcm_nonce: [u8; 12] = std::array::from_fn(|i| nonce[12 + i]);
     DerivedPageKey {
         key: derived,
         nonce: gcm_nonce,
