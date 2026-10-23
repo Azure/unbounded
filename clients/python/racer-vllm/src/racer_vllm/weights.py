@@ -123,7 +123,6 @@ def iter_weights(
         if active is not None:
             backend.done(active)
             backend.wait(active)
-            active = None
         # Reads have stopped; fence consumer GPU work before release. Targets
         # still in flight were fenced by read() and the consumer never saw them.
         for target in free:
