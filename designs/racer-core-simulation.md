@@ -371,3 +371,47 @@ function. For each, the sans-IO version has its own tests, and production calls 
 `request_traced` now reserves remote credits (`plan_attempt`) before it builds the attempt scope,
 where it used to reserve them after. These can only fail in different order if `Cancellation::new`
 fails.
+
+## Control plane integration
+
+`racer_sim::control::ControlSim` runs the `cluster-control` model (`step::cluster::ControlPlane`: lottery,
+seats, primary, `plan_pass`, commits) and a per-client model on one timeline. `advance_to` runs whichever
+queue is earlier (the model first on ties), so control and client events share one trace hash. A data-plane
+world can co-step it with `next_event_ns`/`advance_to` and read `membership_version(node)` or
+`applied_sequence(node)` to make a node lag like its control client.
+
+The client model uses the real seat server rules: a bootstrap slot (32 per seat), then the bearer
+authorization calls (one TokenReview and four GETs, `auth.rs` `authorize`) through `apiserver::Store` with a
+`TokenBucket` (default 1000 QPS, burst 2000, 5 ms). Snapshot long polls use `SeatAdmission::snapshot`
+(`check_ahead` 503), a write slot (64 per seat, none free is a 429), and `body_for` for delta or full bodies.
+Waking a seat's waiters costs `cost::notify` comparisons. Base hashes are not stored per client: a client at
+the delta base sequence is assumed to hold the matching hash. The model gained read-only accessors
+(`record`, `image`, `seat_served`, `commit_ns`, `alive`, `pod_count`) and `remove_pod`.
+
+Scenarios (CLI `--scenario`): `enrollment-storm` (every Pod starts within 5 s), `failover` (crash the
+primary at d/3, two seat holders at d/2, the new primary 5 s later; restarts after 60 s), `ctl-churn`
+(1/16 of the Pods at start, eight growth waves until d/2, two removal waves of 2.5%), `lagging` (10% of
+clients partitioned for d/6, 5% slow, a 1% removal and a seat crash while they lag). `--config` takes a
+`"control"` object of `control::Settings` overrides.
+
+Invariants: `ctl_single_primary` (the model's `dual_primary` never grows), `ctl_terms_monotonic`,
+`ctl_sequence_monotonic` (sequence grows, membership version never drops), `ctl_client_membership_monotonic`
+(per client), and `ctl_client_converges`: once faults have healed for 180 s, every live client that started
+at least 180 s plus the API time for all enrollments ago has applied every sequence committed 180 s ago.
+None needed relaxing.
+
+Results at 50,000 Pods, seed 1, default durations, release build, each run alone on one thread (the four ran
+at the same time):
+
+| scenario | sim time | wall | peak RSS | key results |
+|---|---|---|---|---|
+| enrollment-storm | 600 s | 2:34 | 0.91 GiB | all enrolled at 282 s; 462k API 429s, 501 write 429s; 58k TokenReviews; enroll p50 129 s, p99 258 s |
+| failover | 900 s | 2:48 | 0.97 GiB | 3 terms; time to new primary 32 s and 35 s; dual primaries 0 |
+| ctl-churn | 1200 s | 3:05 | 0.87 GiB | 11 membership versions, commit interval 60 to 180 s; 295k delta vs 54k full replies (3.9k full fallbacks); publication up to 5.7 MiB, delta up to 0.7 MiB; 454k write 429s; client lag p50 4.3 s, p99 24 s |
+| lagging | 900 s | 3:26 | 0.97 GiB | 45k unreachable attempts; 4.1k full-image fallbacks; client lag p50 21 s, p90 206 s (partitioned clients); 0 503 ahead rejections |
+
+The combined API peak (Lease reads and writes plus enrollment calls, including rejected ones) is 42k in
+the first second of the storm, from every Pod's lottery read. No run saw a 503 ahead rejection: seats serve a
+new sequence within one follow interval of each other, so clients that move between seats are not ahead.
+The control-plane share of the 32 GiB budget is about 1 GiB peak RSS (about 20 KiB per Pod); the accounted
+model state is 135 MB, mostly the model's inventory and image.
