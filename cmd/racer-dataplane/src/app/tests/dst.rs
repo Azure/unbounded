@@ -2350,6 +2350,9 @@ impl Harness {
         let _fabric = fabric.enter();
         let mut config = crate::test_support::cluster::config(self.native);
         config.opaque_relay = self.opaque_relay;
+        // Memory pressure reads the real host cgroup and PSI files, which the
+        // simulation does not control. Turn it off so replays stay deterministic.
+        config.memory_pressure = false;
         config.node = node_id(id);
         config.peer_listen = format!("127.0.0.1:{}", 20000 + id).parse().unwrap();
         config.diagnostics_listen = format!("127.0.0.1:{}", 30000 + id).parse().unwrap();
