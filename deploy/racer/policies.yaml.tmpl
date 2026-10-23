@@ -126,6 +126,16 @@ spec:
       expression: "'racer.unbounded-cloud.io/holder-uid' in variables.oldAnnotations ? variables.oldAnnotations['racer.unbounded-cloud.io/holder-uid'] : ''"
     - name: oldMine
       expression: "variables.oldHolder != '' && variables.oldHolder == variables.podName && variables.oldHolderUID == variables.podUID"
+    # The runtime stamps a new acquireTime on every claim and keeps it on
+    # renewal, so an unchanged acquireTime marks a renewal of the same term.
+    - name: renewing
+      expression: >-
+        variables.oldMine &&
+        (has(object.spec.acquireTime) ? (has(oldObject.spec.acquireTime) && object.spec.acquireTime == oldObject.spec.acquireTime) : !has(oldObject.spec.acquireTime))
+    - name: nonce
+      expression: "'racer.unbounded-cloud.io/holder-nonce' in variables.annotations ? variables.annotations['racer.unbounded-cloud.io/holder-nonce'] : ''"
+    - name: oldNonce
+      expression: "'racer.unbounded-cloud.io/holder-nonce' in variables.oldAnnotations ? variables.oldAnnotations['racer.unbounded-cloud.io/holder-nonce'] : ''"
     - name: transitions
       expression: "has(object.spec.leaseTransitions) ? object.spec.leaseTransitions : 0"
     - name: oldTransitions
@@ -166,11 +176,17 @@ spec:
           (k in variables.oldAnnotations && variables.annotations[k] == variables.oldAnnotations[k])))
       message: A Racer Pod may only release its own Lease
       reason: Forbidden
-    # Each acquisition starts a new term. Renewal keeps the term.
+    # Each acquisition starts a new term with a new acquireTime and a higher
+    # spec.leaseTransitions. A restarted container of the same Pod, or the
+    # same process after its Lease went stale, reacquires that way. Renewal
+    # keeps acquireTime, the term, and the holder nonce.
     - expression: >-
         variables.holder == '' ||
-        (variables.oldMine ? variables.transitions == variables.oldTransitions : variables.transitions > variables.oldTransitions)
+        (variables.renewing ? variables.transitions == variables.oldTransitions : variables.transitions > variables.oldTransitions)
       message: Acquiring a Racer Lease must increase spec.leaseTransitions, and renewing it must not change it
+      reason: Forbidden
+    - expression: "variables.holder == '' || !variables.renewing || variables.nonce == variables.oldNonce"
+      message: Renewing a Racer Lease must not change the holder nonce
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1
