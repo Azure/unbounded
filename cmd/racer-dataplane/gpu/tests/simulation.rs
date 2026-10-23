@@ -139,25 +139,25 @@ fn import_rejects_out_of_window_and_wrong_device() {
     let stream = ctx.stream().unwrap();
     let foreign = other.stream().unwrap();
     let dst = Destination::Import(&import);
-    stream.copy_from_host(dst, 100, &[7; 100]).unwrap();
+    stream.copy_from_host(dst, 100, [7; 100]).unwrap();
     assert_eq!(
-        stream.copy_from_host(dst, 99, &[1; 2]),
+        stream.copy_from_host(dst, 99, [1; 2]),
         Err(Error::InvalidRange)
     );
     assert_eq!(
-        stream.copy_from_host(dst, 150, &[1; 51]),
+        stream.copy_from_host(dst, 150, [1; 51]),
         Err(Error::InvalidRange)
     );
     assert_eq!(
-        stream.copy_from_host(dst, u64::MAX, &[1]),
+        stream.copy_from_host(dst, u64::MAX, [1]),
         Err(Error::InvalidRange)
     );
     assert_eq!(
-        stream.copy_from_host(dst, 100, &[]),
+        stream.copy_from_host(dst, 100, []),
         Err(Error::InvalidRange)
     );
     assert_eq!(
-        foreign.copy_from_host(dst, 100, &[1]),
+        foreign.copy_from_host(dst, 100, [1]),
         Err(Error::WrongDevice)
     );
     stream.synchronize().unwrap();
@@ -187,7 +187,7 @@ fn decrypt_into_import_verifies_before_writing() {
 
     assert_eq!(stream.verdict(), Err(Error::Busy));
     stream
-        .copy_from_host(Destination::Staging(&staging), 16, &page.sealed)
+        .copy_from_host(Destination::Staging(&staging), 16, page.sealed.clone())
         .unwrap();
     stream
         .decrypt(&page.request(Some(crc)), &staging, 16, dst, 64)
@@ -217,7 +217,7 @@ fn decrypt_into_import_verifies_before_writing() {
     let mut tampered = page.sealed.clone();
     tampered[4999] ^= 1;
     stream
-        .copy_from_host(Destination::Staging(&staging), 16, &tampered)
+        .copy_from_host(Destination::Staging(&staging), 16, tampered)
         .unwrap();
     stream
         .decrypt(&page.request(None), &staging, 16, dst2, 0)
@@ -286,7 +286,7 @@ fn import_is_released_only_after_stream_sync() {
     let import = ctx.import(client, GRANULARITY, 0..10).unwrap();
     let stream = ctx.stream().unwrap();
     stream
-        .copy_from_host(Destination::Import(&import), 0, b"0123456789")
+        .copy_from_host(Destination::Import(&import), 0, *b"0123456789")
         .unwrap();
     drop(import);
     assert_eq!(sim.live().imports, 1);
@@ -304,7 +304,7 @@ fn import_is_released_only_after_stream_sync() {
     let client = sim.allocate(0, GRANULARITY);
     let import = ctx.import(client, GRANULARITY, 0..10).unwrap();
     stream
-        .copy_from_host(Destination::Import(&import), 0, b"x")
+        .copy_from_host(Destination::Import(&import), 0, *b"x")
         .unwrap();
     drop(import);
     drop(stream);
@@ -333,7 +333,7 @@ fn failed_frees_leak_and_count() {
     let stream = ctx.stream().unwrap();
     let staging = ctx.staging(16).unwrap();
     stream
-        .copy_from_host(Destination::Staging(&staging), 0, &[1; 16])
+        .copy_from_host(Destination::Staging(&staging), 0, [1; 16])
         .unwrap();
     assert!(staging.in_flight());
     sim.fault(Operation::StreamFree, -5);
@@ -347,7 +347,7 @@ fn failed_frees_leak_and_count() {
     let stream = ctx.stream().unwrap();
     let staging = ctx.staging(16).unwrap();
     stream
-        .copy_from_host(Destination::Staging(&staging), 0, &[1; 16])
+        .copy_from_host(Destination::Staging(&staging), 0, [1; 16])
         .unwrap();
     sim.fault(Operation::StreamSync, -5);
     assert_eq!(stream.synchronize(), Err(Error::Driver(999)));
@@ -384,7 +384,7 @@ fn cufile_reads_into_staging() {
 
     // A queued copy holds the buffer.
     stream
-        .copy_from_host(Destination::Staging(&staging), 0, &[1])
+        .copy_from_host(Destination::Staging(&staging), 0, [1])
         .unwrap();
     assert_eq!(file.read(&staging, 0, 0, 1), Err(Error::Busy));
     stream.synchronize().unwrap();
@@ -431,7 +431,7 @@ fn dma_buf_export_from_zero_is_live() {
     stream.synchronize().unwrap();
     assert_eq!(&out, b"from the nic");
     stream
-        .copy_from_host(Destination::Staging(&staging), 4096, b"gpu")
+        .copy_from_host(Destination::Staging(&staging), 4096, *b"gpu")
         .unwrap();
     stream.synchronize().unwrap();
     let mut back = [0; 3];
@@ -455,7 +455,7 @@ fn device_copy_from_staging() {
     let staging = ctx.staging(32).unwrap();
     let stream = ctx.stream().unwrap();
     stream
-        .copy_from_host(Destination::Staging(&staging), 0, b"abcdefghij")
+        .copy_from_host(Destination::Staging(&staging), 0, *b"abcdefghij")
         .unwrap();
     stream
         .copy_from_staging(Destination::Import(&import), 10, &staging, 0, 10)
@@ -470,4 +470,40 @@ fn device_copy_from_staging() {
     );
     stream.synchronize().unwrap();
     assert_eq!(read_allocation(&client, 10, 10), b"abcdefghij");
+}
+
+#[test]
+fn host_source_is_held_until_stream_sync() {
+    let sim = simulation();
+    let _env = sim.enter();
+    let gpu = Gpu::load().unwrap();
+    let ctx = gpu.context(0).unwrap();
+    let client = sim.allocate(0, GRANULARITY);
+    let import = ctx
+        .import(client.try_clone().unwrap(), GRANULARITY, 0..10)
+        .unwrap();
+    let stream = ctx.stream().unwrap();
+    let source = std::sync::Arc::<[u8]>::from(&b"0123456789"[..]);
+    let weak = std::sync::Arc::downgrade(&source);
+    stream
+        .copy_from_host(Destination::Import(&import), 0, source.clone())
+        .unwrap();
+    // The caller drops its handle early; the stream still owns the bytes.
+    drop(source);
+    assert_eq!(weak.strong_count(), 1);
+    assert_eq!(stream.retained_host_sources(), 1);
+    stream.synchronize().unwrap();
+    assert_eq!(weak.strong_count(), 0);
+    assert_eq!(stream.retained_host_sources(), 0);
+    assert_eq!(read_allocation(&client, 0, 10), b"0123456789");
+
+    // A rejected copy does not keep the source.
+    let source = std::sync::Arc::<[u8]>::from(vec![1u8; 11]);
+    let weak = std::sync::Arc::downgrade(&source);
+    assert_eq!(
+        stream.copy_from_host(Destination::Import(&import), 0, source),
+        Err(Error::InvalidRange)
+    );
+    assert_eq!(weak.strong_count(), 0);
+    assert_eq!(stream.retained_host_sources(), 0);
 }

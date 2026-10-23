@@ -117,8 +117,10 @@ int racer_gpu_import_free(void *allocation);
 int racer_gpu_staging(void *context, uint64_t size, void **out);
 int racer_gpu_staging_free(void *staging);
 
-/* Queue a copy of host bytes into an import or staging buffer. The host
- * buffer may be reused as soon as this returns. */
+/* Queue a copy of host bytes into an import or staging buffer. The copy is
+ * asynchronous: for page-locked memory CUDA may still read the host buffer
+ * after this returns, so the caller must keep it alive and unchanged until
+ * the stream is synchronized. The Rust wrapper owns the source until then. */
 int racer_gpu_copy_h2d(void *stream, void *dst, uint64_t offset, const void *src, uint64_t length);
 /* Queue a device copy. `src` must be a staging buffer. */
 int racer_gpu_copy_d2d(void *stream, void *dst, uint64_t dst_offset, void *src, uint64_t src_offset,

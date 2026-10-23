@@ -99,15 +99,31 @@ const PLAINTEXT_SCRATCH: u64 = SLOT_BYTES;
 /// Registered cuFile handles kept per process; more are reopened on demand.
 const MAX_FILES: usize = 64;
 
+/// A shared ciphertext page the GPU stream holds until its copy completes.
+struct HostCiphertext(crate::memory::CiphertextPage);
+
+impl AsRef<[u8]> for HostCiphertext {
+    fn as_ref(&self) -> &[u8] {
+        self.0.bytes()
+    }
+}
+
 /// Builds the GPU backend on the helper thread.
 pub type Loader = Box<dyn FnOnce() -> racer_gpu::Result<racer_gpu::Gpu> + Send>;
 
 /// Plaintext bytes handed to the helper. The page is immutable and its
 /// storage is reference counted, so the helper reads it in place; the handle
 /// goes back with the answer so the page is released on the I/O thread.
+#[derive(Clone)]
 struct Plaintext {
     page: VerifiedPage,
     range: Range<usize>,
+}
+
+impl AsRef<[u8]> for Plaintext {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes()
+    }
 }
 
 impl Plaintext {
@@ -1062,7 +1078,7 @@ impl Helper {
         let destination = racer_gpu::Destination::Import(&request.import);
         let queued = request
             .stream
-            .copy_from_host(destination, offset, plaintext.bytes());
+            .copy_from_host(destination, offset, plaintext.clone());
         // Synchronize even after a failed queue call: part of it may run.
         let synchronized = request.stream.synchronize();
         queued.and(synchronized).map_err(gpu_error)
@@ -1170,7 +1186,7 @@ impl Helper {
                 let copied = stream.copy_from_host(
                     racer_gpu::Destination::Staging(staging),
                     CIPHERTEXT_SCRATCH,
-                    bytes,
+                    HostCiphertext(copy.copy.ciphertext.clone()),
                 );
                 if let Err(error) = copied {
                     let _ = stream.synchronize();

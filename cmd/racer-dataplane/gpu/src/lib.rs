@@ -495,6 +495,9 @@ enum Retained {
     Import(#[allow(dead_code)] Rc<ImportInner>),
 
     Staging(Rc<StagingInner>),
+
+    /// Host bytes a queued copy may still read.
+    Host(#[allow(dead_code)] Box<dyn AsRef<[u8]>>),
 }
 
 impl Drop for Retained {
@@ -612,23 +615,38 @@ impl Stream {
         self.retained.borrow_mut().extend(holds);
     }
 
-    /// Queue a copy of host bytes. `bytes` may be reused once this returns.
-    pub fn copy_from_host(&self, dst: Destination<'_>, offset: u64, bytes: &[u8]) -> Result<()> {
-        if bytes.is_empty() {
+    /// Queue a copy of host bytes. CUDA may keep reading page-locked host
+    /// memory after the call returns, so the stream takes ownership of
+    /// `bytes` and holds it until [`Stream::synchronize`] succeeds (or leaks
+    /// it if the stream cannot be synchronized). Pass a cheap shared handle,
+    /// such as an `Arc`, to avoid copying large buffers.
+    pub fn copy_from_host<S>(&self, dst: Destination<'_>, offset: u64, bytes: S) -> Result<()>
+    where
+        S: AsRef<[u8]> + 'static,
+    {
+        // Box first so the bytes do not move after the pointer is taken.
+        let source: Box<dyn AsRef<[u8]>> = Box::new(bytes);
+        let slice = (*source).as_ref();
+        let (ptr, length) = (slice.as_ptr(), slice.len() as u64);
+        if length == 0 {
             return Err(Error::InvalidRange);
         }
-        let (raw, hold) = self.destination(dst, offset, bytes.len() as u64)?;
+        let (raw, hold) = self.destination(dst, offset, length)?;
         let rc = unsafe {
-            (self.shared().api.copy_h2d)(
-                self.raw.as_ptr(),
-                raw,
-                offset,
-                bytes.as_ptr().cast(),
-                bytes.len() as u64,
-            )
+            (self.shared().api.copy_h2d)(self.raw.as_ptr(), raw, offset, ptr.cast(), length)
         };
-        self.retain([hold]);
+        self.retain([hold, Retained::Host(source)]);
         self.shared().check(rc)
+    }
+
+    /// Number of host sources held for queued copies. Test helper.
+    #[doc(hidden)]
+    pub fn retained_host_sources(&self) -> usize {
+        self.retained
+            .borrow()
+            .iter()
+            .filter(|hold| matches!(hold, Retained::Host(_)))
+            .count()
     }
 
     /// Queue a device copy from staging memory.
