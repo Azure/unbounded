@@ -70,6 +70,14 @@ func newCtrl(fd int) (*ctrl, error) {
 	return &ctrl{fd: fd, ring: ring, payload: payload}, nil
 }
 
+// isPoisoned reports whether a command's completion was missed.
+func (c *ctrl) isPoisoned() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.poisoned
+}
+
 func (c *ctrl) close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()

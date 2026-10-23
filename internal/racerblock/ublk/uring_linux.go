@@ -20,6 +20,11 @@ const (
 	ioringOpNop      = 0
 	ioringOpPollAdd  = 6
 	ioringOpURingCmd = 46
+	// ioringOpAsyncCancel is IORING_OP_ASYNC_CANCEL.
+	ioringOpAsyncCancel = 14
+
+	// iosqeAsync is IOSQE_ASYNC: always issue from an io-wq worker.
+	iosqeAsync = 1 << 4
 
 	ioringSetupSQE128 = 1 << 10
 
