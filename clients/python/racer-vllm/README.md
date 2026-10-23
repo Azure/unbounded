@@ -37,7 +37,7 @@ Then start vLLM on that directory:
 
 ```
 vllm serve /models/llama-3-8b --load-format racer \
-  --model-loader-extra-config '{"staging_bytes": 268435456, "concurrency": 2}'
+  --model-loader-extra-config '{"staging_bytes": 268435456, "concurrency": 4}'
 ```
 
 Extra config keys, all optional:
@@ -46,7 +46,7 @@ Extra config keys, all optional:
 |---|---|---|
 | `uri` | from `racer-model.json` | The `racer://` model location. |
 | `staging_bytes` | 256 MiB | Size of each GPU staging buffer. |
-| `concurrency` | 2 | Staging buffers, and reads in flight. |
+| `concurrency` | 4 | Staging buffers, and reads in flight. |
 | `clone` | true | Copy each tensor out of staging before handing it to vLLM. |
 | `socket` | none | Client socket path. |
 | `use_vmm` | true | Allow exportable `cuMemCreate` staging, needed for `gpu-read`. |
@@ -56,7 +56,10 @@ Extra config keys, all optional:
 1. Find the safetensors files from `model.safetensors.index.json`, or use
    `model.safetensors`.
 2. For each file, read the 8-byte header length and the JSON header.
-3. Group tensors into ranges that fit a staging buffer. Read each range into
+3. Group tensors into ranges that fit a staging buffer. Each range ends on a
+   Racer page boundary (16 MiB), so no page is read twice. A tensor that
+   crosses the boundary is split across two ranges and joined again before vLLM
+   sees it. Read each range into
    GPU memory with `gpu-read`. If the dataplane cannot do that, use
    `host-read` into pinned memory and copy, else the normal stream.
 4. Give each tensor (right dtype and shape) to `model.load_weights`. While

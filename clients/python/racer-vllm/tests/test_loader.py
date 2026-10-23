@@ -90,7 +90,7 @@ def test_weight_files_single(server, uri):
         model.weight_files(c, uri)
 
 
-@pytest.mark.parametrize("depth", [1, 2, 3])
+@pytest.mark.parametrize("depth", [1, 2, 3, 4])
 def test_iter_weights(server, uri, depth):
     setup_model(server, uri)
     c = racer.Client(socket_path=server.path, staging_bytes=4096)
@@ -105,7 +105,7 @@ def test_iter_weights(server, uri, depth):
     assert 900 in sizes
 
 
-@pytest.mark.parametrize("depth", [1, 2, 3])
+@pytest.mark.parametrize("depth", [1, 2, 3, 4])
 def test_iter_weights_reads_each_page_once(server, uri, depth):
     setup_model(server, uri)
     c = racer.Client(socket_path=server.path, staging_bytes=4096)

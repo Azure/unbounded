@@ -42,7 +42,7 @@ def make_loader_class(base):
           uri            racer://<cache>/<bucket>/<prefix>; optional when the
                          model directory has racer-model.json (racer-vllm-fetch)
           staging_bytes  size of each GPU staging buffer (default 256 MiB)
-          concurrency    number of staging buffers and reads in flight (default 2)
+          concurrency    number of staging buffers and reads in flight (default 4)
           clone          copy each tensor out of staging (default true)
           socket         client socket path (else RACER_SOCKET, else the cache)
           use_vmm        allow exportable cuMemCreate staging (default true)

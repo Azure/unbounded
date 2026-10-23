@@ -20,7 +20,7 @@ from .safetensors import Chunk, TensorInfo, header_length, parse_header, plan_ch
 log = logging.getLogger(__name__)
 
 DEFAULT_STAGING_BYTES = 256 * 1024 * 1024
-DEFAULT_DEPTH = 2
+DEFAULT_DEPTH = 4
 
 
 class Backend:
