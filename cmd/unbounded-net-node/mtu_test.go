@@ -36,7 +36,7 @@ func TestGatewayLocalForwardingMTUCaps(t *testing.T) {
 	mesh := []meshPeerInfo{{SiteName: "same"}}
 	gateways := []gatewayPeerInfo{{PoolName: "remote", SiteName: "other"}}
 	resolvePeerTunnelMTUs(cfg, mesh, gateways, "same", true, localMTU, nil, nil,
-		map[string]int{"same": 1420}, nil, nil, nil, pools, nil)
+		map[string]int{"same": 1420}, nil, nil, nil, pools, unboundednetnetlink.NewNetlinkCache(0))
 
 	if mesh[0].TunnelMTU != 1200 || gateways[0].TunnelMTU != 1200 {
 		t.Fatalf("local pool cap missing: mesh=%d gateway=%d", mesh[0].TunnelMTU, gateways[0].TunnelMTU)
@@ -78,7 +78,7 @@ func TestWorkerGatewayFirstHopPeeringMTU(t *testing.T) {
 			cfg := &config{MTU: 1250, TunnelIPFamily: "IPv4"}
 			peers := []gatewayPeerInfo{{SiteName: tc.site, PoolName: "pool-g"}}
 			resolvePeerTunnelMTUs(cfg, nil, peers, "site-a", tc.gateway, 0, nil, nil,
-				nil, tc.peeringCaps, nil, nil, nil, nil)
+				nil, tc.peeringCaps, nil, nil, nil, unboundednetnetlink.NewNetlinkCache(0))
 
 			if peers[0].TunnelMTU != tc.want {
 				t.Fatalf("gateway peer MTU=%d, want %d", peers[0].TunnelMTU, tc.want)
