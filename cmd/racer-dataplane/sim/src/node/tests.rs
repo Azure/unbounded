@@ -524,4 +524,68 @@ fn joined_owners_copy_from_previous_owners() {
     // Without handoff probes this was 19 (three pages fetched twice).
     assert!(counter(&report, "handoff_probes") > 0, "{report}");
     assert_eq!(counter(&report, "origin_requests"), pages, "{per_page:?}");
+    assert_eq!(
+        report["origin_per_page"]["repeats"],
+        serde_json::json!({"after_owner_move": 0, "copy_held": 0, "copy_lost": 0})
+    );
+}
+
+fn repeats(report: &Value, kind: &str) -> u64 {
+    report["origin_per_page"]["repeats"][kind].as_u64().unwrap()
+}
+
+/// Known issue 12: under churn, an owner whose predecessor has not adopted
+/// the current membership yet used to get `StaleMembership`, record it as
+/// missing, and fetch the page itself while the predecessor (usually rank 0)
+/// held it. Owners now ask predecessors that held the same rank under the
+/// previous membership under that membership, so the lagging predecessor
+/// serves. Before the fix these runs had 48 to 52 owner skips and 40 to 48
+/// repeat fetches whose previous fetcher still held the page.
+#[test]
+fn owners_ask_lagging_predecessors_under_the_previous_membership() {
+    for (nodes, seed) in [(120, 1), (120, 2), (300, 1)] {
+        let (_, report) = run(churny(nodes, 2), seed);
+        assert!(
+            counter(&report, "previous_membership_probes") > 0,
+            "{report}"
+        );
+        assert!(
+            counter(&report, "owner_stale_destination_skips") <= 2,
+            "{nodes} {seed}: {}",
+            report["metrics"]["counters"]
+        );
+        assert!(
+            repeats(&report, "copy_held") <= 8,
+            "{nodes} {seed}: {}",
+            report["origin_per_page"]
+        );
+    }
+    // Without retained versions peers cannot resolve the previous
+    // membership, so owners never use it (production: no grace retention).
+    let (_, report) = run(churny(120, 0), 2);
+    assert_eq!(counter(&report, "previous_membership_probes"), 0);
+}
+
+/// Known issues 6 and 13: repeated origin fetches of a page are bounded.
+/// Each one is classified against the previous fetch (`classify_repeat`):
+/// after an ownership move (allowed, at most one per move), after the copy
+/// was lost (unavoidable), or while the previous fetcher still held it. The
+/// last kind needs a transient failure, a concurrent cold miss, or a walk
+/// without credits for the delegation; it stays under 2% of origin requests
+/// under churn, and every repeat is one of the three.
+#[test]
+fn repeat_origin_fetches_are_classified_and_bounded() {
+    for (nodes, seed) in [(120, 1), (300, 1), (300, 2)] {
+        let (_, report) = run(churny(nodes, 2), seed);
+        let origin = counter(&report, "origin_requests");
+        let pages = report["origin_per_page"]["pages"].as_u64().unwrap();
+        let held = repeats(&report, "copy_held");
+        let all = held + repeats(&report, "copy_lost") + repeats(&report, "after_owner_move");
+        assert_eq!(all, origin - pages, "{}", report["origin_per_page"]);
+        assert!(
+            held * 50 <= origin,
+            "{nodes} {seed}: {}",
+            report["origin_per_page"]
+        );
+    }
 }

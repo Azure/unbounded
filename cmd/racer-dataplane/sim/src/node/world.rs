@@ -488,6 +488,9 @@ pub struct NodeWorld {
     /// Relay reservations of replies still streaming (see `Event::Release`).
     held: HashMap<u64, Vec<SimCharge>, Fixed>,
     origin_per_page: HashMap<u64, u32, Fixed>,
+    /// Per page: the node that last asked origin for it and the page's rank 0
+    /// under that request's membership (see [`Self::classify_repeat`]).
+    last_origin: HashMap<u64, (u32, u32), Fixed>,
     tasks: HashMap<u64, Task, Fixed>,
     /// When each currently down node went down (Known issue 7 evidence).
     down_since: HashMap<u32, Nanos, Fixed>,
@@ -594,6 +597,7 @@ impl NodeWorld {
             writes: HashMap::default(),
             held: HashMap::default(),
             origin_per_page: HashMap::default(),
+            last_origin: HashMap::default(),
             tasks: HashMap::default(),
             down_since: HashMap::default(),
             woken: std::sync::Arc::default(),
@@ -2953,8 +2957,48 @@ impl NodeWorld {
             .request(now, object, self.config.page_bytes, errors);
         self.metrics.incr("origin_requests");
         *self.origin_per_page.entry(page).or_default() += 1;
+        self.classify_repeat(id);
         self.engine
             .at(done, Event::OriginDone { fill: id, outcome });
+    }
+
+    /// Classify a repeated origin request for a page (Known issues 6, 12,
+    /// 13). With `A` the node that last asked origin for the page:
+    ///
+    /// - `origin_repeats_after_move`: the page's rank 0 differs from rank 0
+    ///   under `A`'s request, so ownership moved in between. At most one
+    ///   such fetch per move is the bound the walk aims for: the new rank 0
+    ///   finds `A` only through handoff probes (previous membership) or not
+    ///   at all once that membership is gone.
+    /// - `origin_repeats_copy_lost`: same rank 0, and `A` no longer holds
+    ///   the page (evicted or crashed); a fetch is unavoidable.
+    /// - `origin_repeats_copy_held`: same rank 0 and `A` still holds the
+    ///   page. Only transient failures (rank 0 unreachable or overloaded,
+    ///   origin errors), concurrent cold misses, or a walk without credits
+    ///   or links for the delegation lead here; tests bound it.
+    fn classify_repeat(&mut self, id: u64) {
+        let fill = &self.fills[&id];
+        let (node, page) = (fill.node, fill.page);
+        let rank0 = fill.cands.first().copied().unwrap_or(node);
+        let Some((last, last_rank0)) = self.last_origin.insert(page, (node, rank0)) else {
+            return;
+        };
+        let held = |n: &NodeWorld| {
+            let holder = &n.nodes[last as usize];
+            !holder.down
+                && (holder.disk.entries.get(&page).is_some()
+                    || holder
+                        .workers
+                        .iter()
+                        .any(|w| w.memory.pages.contains_key(&page)))
+        };
+        self.metrics.incr(if last_rank0 != rank0 {
+            "origin_repeats_after_move"
+        } else if held(self) {
+            "origin_repeats_copy_held"
+        } else {
+            "origin_repeats_copy_lost"
+        });
     }
 
     fn origin_done(&mut self, id: u64, outcome: OriginOutcome) {
@@ -3267,6 +3311,7 @@ impl NodeWorld {
                 + self.tasks.len() * (std::mem::size_of::<Task>() + 256),
         ));
         list.push(("origin_per_page", self.origin_per_page.capacity() * 16));
+        list.push(("last_origin", self.last_origin.capacity() * 24));
         list.push((
             "node_rng",
             self.node_rng.capacity() * std::mem::size_of::<SplitMix64>(),
@@ -3320,6 +3365,11 @@ impl NodeWorld {
                 "mean_requests_per_page": if pages == 0 { 0.0 } else { requests as f64 / pages as f64 },
                 "page_bytes": self.config.page_bytes,
                 "bytes_per_page": if pages == 0 { 0 } else { c("origin_bytes") / pages as u64 },
+                "repeats": {
+                    "after_owner_move": c("origin_repeats_after_move"),
+                    "copy_lost": c("origin_repeats_copy_lost"),
+                    "copy_held": c("origin_repeats_copy_held"),
+                },
             },
             "cache": {
                 "memory_hits": c("memory_hits"),
