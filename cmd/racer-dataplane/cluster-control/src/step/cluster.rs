@@ -79,7 +79,7 @@ pub struct Stats {
     pub watch_events: u64,
     pub client_replies: u64,
     pub client_429s: u64,
-    pub notify_comparisons: u64,
+    pub notify_registrations: u64,
     /// Longest time from a commit until every client was served.
     pub max_client_lag_ns: u64,
     /// Times two Pods both held a fresh primary term with a writable fence.
@@ -809,18 +809,21 @@ impl ControlPlane {
             .max(1) as u64;
         let alive = self.pods.iter().filter(|p| p.alive).count() as u64;
         let polls = alive.div_ceil(seats);
-        let slots = limits::MAX_WRITES as u64;
-        let rounds = cost::write_rounds(polls, slots);
-        self.stats.client_replies += polls;
-        // Round k answers `slots` polls; the rest get 429 and retry.
-        let mut remaining = polls;
-        while remaining > slots {
-            remaining -= slots;
-            self.stats.client_429s += remaining;
-        }
-        self.stats.notify_comparisons += cost::notify(polls).comparisons;
+        // Woken polls queue for the write slots (`exec::Slots::acquire`);
+        // only those still queued after the grace answer 429. A poll woken
+        // mid-wait has at least the grace, so it is the model's bound.
+        let d = cost::drain(
+            polls,
+            limits::MAX_WRITES as u64,
+            self.settings.write_ns,
+            limits::WRITE_QUEUE_GRACE.as_nanos() as u64,
+            limits::MAX_WRITE_WAITERS as u64,
+        );
+        self.stats.client_replies += d.replies;
+        self.stats.client_429s += d.rejected;
+        self.stats.notify_registrations += cost::notify(polls).registrations;
         if let Some(at) = self.commit_at.get(&sequence) {
-            let lag = self.now.saturating_sub(*at) + rounds * self.settings.write_ns;
+            let lag = self.now.saturating_sub(*at) + d.last_ns;
             self.stats.max_client_lag_ns = self.stats.max_client_lag_ns.max(lag);
         }
     }
@@ -952,5 +955,23 @@ mod tests {
         assert_eq!(cp.stats.dual_primary, 0);
         assert!(cp.sequence().is_some());
         assert!(cp.ready_seats() >= 3);
+        // Woken polls queue for write slots (round 3): no 429s.
+        assert_eq!(cp.stats.client_429s, 0);
+        assert_eq!(cp.stats.client_replies, cp.stats.notify_registrations);
+    }
+
+    /// More polls per seat than write slots: all are answered from the
+    /// queue, none get 429 (before round 3 every round past the first 64
+    /// answered 429).
+    #[test]
+    fn mass_wake_queues_instead_of_429() {
+        let cp = run(600, 240, 3);
+        assert!(cp.sequence().is_some());
+        assert!(
+            cp.stats.client_replies > 3 * limits::MAX_WRITES as u64,
+            "{:?}",
+            cp.stats
+        );
+        assert_eq!(cp.stats.client_429s, 0, "{:?}", cp.stats);
     }
 }

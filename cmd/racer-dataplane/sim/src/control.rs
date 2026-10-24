@@ -21,9 +21,11 @@
 //!   releases the slot and backs off.
 //! - Snapshot long polls use [`SeatAdmission::snapshot`] (one poll per
 //!   node, [`check_ahead`] 503 for a client ahead of its seat), a write slot
-//!   ([`SeatAdmission::writes`], 64 per seat; none free is a 429), and
-//!   [`body_for`] for delta versus full bodies. Waiters wake when their seat
-//!   serves a new sequence; the wake costs [`cost::notify`] comparisons.
+//!   ([`SeatAdmission::writes`], 64 per seat, then a FIFO queue bounded by
+//!   `limits::MAX_WRITE_WAITERS`; a poll still queued past its poll deadline
+//!   plus `limits::WRITE_QUEUE_GRACE` answers 429), and [`body_for`] for
+//!   delta versus full bodies. Waiters wake when their seat serves a new
+//!   sequence; the wake costs [`cost::notify`] registrations (O(W)).
 //! - Each client holds the content hash of the image it applied (none
 //!   after a process restart) and sends it with its applied sequence, as
 //!   production clients do; `body_for` answers a delta only when both
@@ -39,7 +41,7 @@ use racer_cluster_control::{
     apiserver::{Store, TokenBucket},
     limits,
     step::{
-        admission::{Body, Poll, SeatAdmission, body_for},
+        admission::{Admit, Body, Poll, SeatAdmission, WriteWaiter, body_for},
         cluster::{ControlPlane, Settings as ModelSettings},
         cost,
     },
@@ -55,6 +57,30 @@ use crate::report::{Invariants, Metrics, peak_rss_bytes};
 fn fingerprint(hash: &str) -> u64 {
     let head = hash.get(..16).unwrap_or(hash);
     u64::from_str_radix(head, 16).unwrap_or_else(|_| mix(hash.len() as u64)) | 1
+}
+
+/// A queued write waiter still wants its slot at `now`: same connection
+/// epoch, still polling, deadline not passed.
+fn queued_live(epoch: &[u32], state: &[State], w: &WriteWaiter, now: Nanos) -> bool {
+    epoch[w.node as usize] == w.epoch
+        && matches!(state[w.node as usize], State::Polling)
+        && w.deadline_ns >= now
+}
+
+/// [`queued_live`], collecting connected waiters whose deadline passed so
+/// the caller can answer them 429.
+fn expire(
+    epoch: &[u32],
+    state: &[State],
+    w: &WriteWaiter,
+    now: Nanos,
+    expired: &mut Vec<u32>,
+) -> bool {
+    let connected = queued_live(epoch, state, w, Nanos::MIN);
+    if connected && w.deadline_ns < now {
+        expired.push(w.node);
+    }
+    connected && w.deadline_ns >= now
 }
 
 /// The body a seat sends a client that applied `after` and holds the
@@ -317,6 +343,9 @@ pub struct ControlSim {
     partitioned: Vec<bool>,
     slow: Vec<bool>,
     started_ns: Vec<Nanos>,
+    /// When each client's current long poll started (its poll deadline is
+    /// a whole number of `POLL_WAIT`s later, as the client re-polls on 204).
+    poll_ns: Vec<Nanos>,
     faults: Vec<CtlFault>,
     /// Time after which every live client must converge.
     settled_ns: Nanos,
@@ -391,6 +420,7 @@ impl ControlSim {
             partitioned: Vec::new(),
             slow: Vec::new(),
             started_ns: Vec::new(),
+            poll_ns: Vec::new(),
             settled_ns: faults.iter().map(CtlFault::heals_at).max().unwrap_or(0),
             faults,
             commits: Vec::new(),
@@ -442,6 +472,7 @@ impl ControlSim {
         self.partitioned.push(false);
         self.slow.push(false);
         self.started_ns.push(self.engine.now());
+        self.poll_ns.push(0);
         self.live_clients += 1;
         let spread = self.settings.enroll_spread_ns.max(1);
         let delay = self.rng.next_u64() % spread;
@@ -647,8 +678,8 @@ impl ControlSim {
             self.trace(at, 0xC4, i as u64, served.unwrap_or(u64::MAX));
             let waiters = std::mem::take(&mut self.seats[i].waiters);
             self.metrics.add(
-                "ctl_notify_comparisons",
-                cost::notify(waiters.len() as u64).comparisons,
+                "ctl_notify_registrations",
+                cost::notify(waiters.len() as u64).registrations,
             );
             match served {
                 Some(_) if previous.is_some() => {
@@ -661,7 +692,12 @@ impl ControlSim {
                 }
                 _ => {
                     // Seat lost or new holder: connections drop, clients
-                    // reconnect (possibly to another seat).
+                    // reconnect (possibly to another seat). Polls queued
+                    // for a write slot drop too.
+                    let queued = self.seats[i].admission.writes.take_waiting();
+                    let waiters = waiters
+                        .into_iter()
+                        .chain(queued.into_iter().map(|w| (w.node, w.epoch)));
                     for (c, e) in waiters {
                         self.seats[i].admission.end_poll(c, false);
                         if self.epoch[c as usize] == e {
@@ -724,7 +760,7 @@ impl ControlSim {
             Ev::Enrolled(_, _, s) => self.seats[s as usize].admission.bootstraps.put(),
             Ev::Poll(c, e) if self.live(c, e) => self.poll(c, e, now),
             Ev::Delivered(c, e, s, seq, mv, hash) => {
-                self.seats[s as usize].admission.writes.put();
+                self.release_write(s, now);
                 if !self.live(c, e) {
                     return;
                 }
@@ -844,6 +880,7 @@ impl ControlSim {
         }
         let after = Some(self.applied_seq[c as usize]).filter(|a| *a > 0);
         let current = self.seats[s as usize].served;
+        self.poll_ns[c as usize] = now;
         match self.seats[s as usize].admission.snapshot(c, after, current) {
             Ok(Poll::Reply) => self.reply(c, s, now),
             Ok(Poll::Wait) => self.seats[s as usize].waiters.push((c, e)),
@@ -865,22 +902,85 @@ impl ControlSim {
         }
     }
 
-    /// Answer a registered poll from seat `s` at its served sequence.
+    /// The poll deadline of client `c`'s current long poll plus the write
+    /// queue grace (`server.rs` `queued_write_slot`).
+    fn write_deadline(&self, c: u32, now: Nanos) -> Nanos {
+        let wait = racer_control_wire::POLL_WAIT.as_nanos() as Nanos;
+        let start = self.poll_ns[c as usize].min(now);
+        let cycle = start + (now - start) / wait * wait;
+        cycle + wait + limits::WRITE_QUEUE_GRACE.as_nanos() as Nanos
+    }
+
+    /// Answer a registered poll from seat `s` at its served sequence:
+    /// take a write slot or queue for one.
     fn reply(&mut self, c: u32, s: u8, now: Nanos) {
         let e = self.epoch[c as usize];
+        let deadline_ns = self.write_deadline(c, now);
         let seat = &mut self.seats[s as usize];
-        let Some(seq) = seat.served else {
+        if seat.served.is_none() {
             seat.admission.end_poll(c, false);
             self.engine.at(now, Ev::Poll(c, e));
             return;
-        };
-        if !seat.admission.writes.try_take() {
-            seat.admission.end_poll(c, false);
-            self.metrics.incr("ctl_write_429");
-            let d = self.backoff(c);
-            self.engine.after(d, Ev::Poll(c, e));
-            return;
         }
+        let waiter = WriteWaiter {
+            node: c,
+            epoch: e,
+            deadline_ns,
+        };
+        let mut expired = Vec::new();
+        let (epoch, state) = (&self.epoch, &self.state);
+        let admit = seat
+            .admission
+            .writes
+            .admit(waiter, |w| expire(epoch, state, w, now, &mut expired));
+        for x in expired {
+            self.reject_write(x, s);
+        }
+        match admit {
+            Admit::Take => self.write(c, s, now),
+            Admit::Wait => self.metrics.incr("ctl_write_queued"),
+            Admit::Full => self.reject_write(c, s),
+        }
+    }
+
+    /// No write slot within the queue bound or deadline: 429 and retry.
+    fn reject_write(&mut self, c: u32, s: u8) {
+        let e = self.epoch[c as usize];
+        self.seats[s as usize].admission.end_poll(c, false);
+        self.metrics.incr("ctl_write_429");
+        let d = self.backoff(c);
+        self.engine.after(d, Ev::Poll(c, e));
+    }
+
+    /// A write on seat `s` finished: hand its slot to the oldest live
+    /// queued poll. Queued polls whose deadline passed answer 429 (they
+    /// learn it here, at the next release, an approximation of their own
+    /// timer firing).
+    fn release_write(&mut self, s: u8, now: Nanos) {
+        let mut expired = Vec::new();
+        let (epoch, state) = (&self.epoch, &self.state);
+        let next = self.seats[s as usize]
+            .admission
+            .writes
+            .release(|w| expire(epoch, state, w, now, &mut expired));
+        for c in expired {
+            self.reject_write(c, s);
+        }
+        if let Some(w) = next {
+            self.metrics.incr("ctl_write_dequeued");
+            self.write(w.node, s, now);
+        }
+    }
+
+    /// Write the reply for `c` holding a write slot on seat `s`.
+    fn write(&mut self, c: u32, s: u8, now: Nanos) {
+        let e = self.epoch[c as usize];
+        let Some(seq) = self.seats[s as usize].served else {
+            self.release_write(s, now);
+            self.seats[s as usize].admission.end_poll(c, false);
+            self.engine.at(now, Ev::Poll(c, e));
+            return;
+        };
         let after = Some(self.applied_seq[c as usize]).filter(|a| *a > 0);
         let image = self.cp.image().filter(|i| i.record.sequence == seq);
         let mv = match image {
@@ -1422,6 +1522,38 @@ mod tests {
             r["metrics"]["counters"]
         );
         assert_eq!(r["control"]["enrolled"], 200);
+    }
+
+    /// More polls per seat than write slots: woken polls queue and drain in
+    /// FIFO order instead of answering 429 (Known issue 1).
+    #[test]
+    fn mass_wake_queues_for_write_slots() {
+        let overrides = json!({"write_ns": 20_000_000u64});
+        let r = run("ctl-churn", 600, 1, Some(600 * SECONDS), Some(&overrides)).unwrap();
+        assert_clean(&r);
+        let c = &r["metrics"]["counters"];
+        assert!(counter(&r, "ctl_write_queued") > 0, "{c}");
+        assert_eq!(
+            counter(&r, "ctl_write_queued"),
+            counter(&r, "ctl_write_dequeued") + counter(&r, "ctl_write_429"),
+            "{c}"
+        );
+        assert_eq!(counter(&r, "ctl_write_429"), 0, "{c}");
+        assert_eq!(
+            counter(&r, "ctl_notify_registrations") > 0,
+            counter(&r, "ctl_client_replies") > 0
+        );
+    }
+
+    /// Writes slower than the queue wait allows: queued polls past their
+    /// deadline still answer 429 (overload protection), and clients retry.
+    #[test]
+    fn slow_writes_still_shed_with_429() {
+        let overrides = json!({"write_ns": 20_000_000_000u64});
+        let r = run("ctl-churn", 600, 1, Some(300 * SECONDS), Some(&overrides)).unwrap();
+        let c = &r["metrics"]["counters"];
+        assert!(counter(&r, "ctl_write_429") > 0, "{c}");
+        assert!(counter(&r, "ctl_write_dequeued") > 0, "{c}");
     }
 
     #[test]
