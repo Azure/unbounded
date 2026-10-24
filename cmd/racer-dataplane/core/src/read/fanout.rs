@@ -90,7 +90,12 @@ fn fnv(parts: &[&[u8]]) -> u64 {
 
 /// Concurrent bodies of one page an owner streams to readers before it sheds
 /// further readers of that page with `Overloaded` (see [`shed_hot_page`]).
-pub const HOT_PAGE_BODIES: usize = 4;
+/// Equal to the default relay quota (`relay_transfers`, 16 bodies a worker
+/// forwards at once): an owner keeps as many bodies of one page in flight as
+/// a relay may carry. In the simulator 4 and 8 shed Zipf-popular pages that
+/// the owner would have served within the deadline, adding a relayed helper
+/// hop under global load ("Round 4: fanout").
+pub const HOT_PAGE_BODIES: usize = 16;
 
 /// Whether an owner sheds a request for a page it is already streaming to
 /// [`HOT_PAGE_BODIES`] requesters. The shed requester asks its helper (the
