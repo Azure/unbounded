@@ -967,14 +967,24 @@ impl CandidatePolicy {
                 .ordered
                 .iter()
                 .position(|node| node == &self.node);
+            let page_operation = matches!(operation, PeerOperation::Page { .. });
             let previous = match rank {
-                Some(rank) if matches!(operation, PeerOperation::Page { .. }) => self
+                Some(rank) if page_operation => self
                     .previous_owners(&candidates, object, page, rank, scope)
                     .await
                     .unwrap_or_default(),
                 _ => PreviousOwners::default(),
             };
-            let handoff = previous.handoff;
+            // Owners: previous-membership owners to ask before origin.
+            // Non-owners: the page's overflow helper (Known issue 16).
+            let handoff = match rank {
+                Some(_) => previous.handoff.clone(),
+                None if page_operation => self
+                    .fanout_helper(&candidates, object, page)
+                    .into_iter()
+                    .collect(),
+                None => Vec::new(),
+            };
             // racer-core owns the visit order, funding, and evidence rules;
             // this loop performs the exchanges it plans.
             let mut walk = CandidateWalk::new(WalkConfig {
@@ -991,8 +1001,9 @@ impl CandidatePolicy {
                     primary_outcome: continuation.primary_outcome,
                     bounded_routes: continuation.bounded_routes,
                 },
-                handoff: handoff.len(),
+                handoff: if rank.is_some() { handoff.len() } else { 0 },
                 previous: previous.same_rank,
+                helper: rank.is_none() && !handoff.is_empty(),
             });
             let end = loop {
                 let probe = match walk.next(budget)? {
@@ -1008,7 +1019,8 @@ impl CandidatePolicy {
                     .request_traced(
                         membership,
                         // Canonical ranks past the owners address handoff
-                        // targets (`WalkConfig::handoff`).
+                        // targets (`WalkConfig::handoff`) or, for a
+                        // non-owner, the overflow helper (`WalkConfig::helper`).
                         match probe.canonical.checked_sub(candidates.ordered.len()) {
                             Some(i) => &handoff[i],
                             None => &candidates.ordered[probe.canonical],
@@ -1143,6 +1155,23 @@ impl CandidatePolicy {
                 }
             }
         })
+    }
+
+    /// The member this non-owner asks to acquire `page` for it when an owner
+    /// sheds the request (`racer_core::read::fanout`): one of the page's
+    /// hash-chosen helpers, never an owner and never this node.
+    pub(crate) fn fanout_helper(
+        &self,
+        candidates: &Candidates,
+        object: &ObjectId,
+        page: PageNumber,
+    ) -> Option<NodeId> {
+        let members = candidates.membership.members();
+        racer_core::read::fanout::fanout_helper(object, page, &self.node, members.len(), |p| {
+            let node = &members[p].node;
+            node == &self.node || candidates.ordered.contains(node)
+        })
+        .map(|p| members[p].node.clone())
     }
 
     /// What an owner at `rank` uses from the membership published just
@@ -2629,11 +2658,119 @@ pub(super) mod tests {
         });
     }
 
+    /// Known issue 71: a non-owner whose owner sheds it (`Overloaded`) asks
+    /// the page's overflow helper once, with an Acquire funded from what is
+    /// left (too little for the helper to ask another helper), then the
+    /// remaining owners. Owners are never asked for helpers' sake twice.
+    #[test]
+    fn shed_reader_asks_the_page_helper_once_then_the_other_owners() {
+        futures::executor::block_on(async {
+            let membership = spread_membership(100);
+            let placement = Placement::new(8);
+            let local = membership.members()[0].node.clone();
+            let probe = spread_policy(local.clone(), ReplicaSelection::Primary);
+            let (page, candidates, helper) = (0..256)
+                .map(PageNumber)
+                .find_map(|page| {
+                    let candidates = placement.rank(membership.clone(), &object(), page);
+                    if candidates.ordered.contains(&local) {
+                        return None;
+                    }
+                    let helper = probe.fanout_helper(&candidates, &object(), page)?;
+                    Some((page, candidates, helper))
+                })
+                .expect("some page has a helper");
+            assert!(!candidates.ordered.contains(&helper) && helper != local);
+            for (error, helped) in [
+                (Error::Overloaded, true),
+                (Error::Unavailable, true),
+                (Error::Unauthorized, false),
+            ] {
+                let peers = Rc::new(FundedPeer {
+                    error: Some(error),
+                    ..FundedPeer::default()
+                });
+                let policy = CandidatePolicy::new(
+                    local.clone(),
+                    Rc::new(Placement::new(8)),
+                    Requester::scripted(
+                        peers.clone(),
+                        FundedPeer::direct_hedge_available,
+                        FundedPeer::request,
+                        FundedPeer::request_direct,
+                    ),
+                    probe.credentials.clone(),
+                    probe.published.clone(),
+                );
+                let context = OriginContext {
+                    object: object(),
+                    metadata: None,
+                    authorization: None,
+                };
+                let scope = scope();
+                let mut budget = AcquisitionBudget::new(
+                    scope.deadline.0,
+                    racer_core::read::range::PAGE_ATTEMPTS,
+                    racer_core::read::range::PAGE_LINKS,
+                );
+                let operation = PeerOperation::Page {
+                    page: crate::model::PageId {
+                        version: crate::model::ObjectVersion {
+                            object: object(),
+                            etag: crate::model::StrongEtag::test_value("v1"),
+                        },
+                        number: page,
+                    },
+                    mode: FetchMode::Acquire,
+                };
+                let result = policy
+                    .resolve_with_budget(
+                        candidates.clone(),
+                        &context,
+                        operation,
+                        &scope,
+                        &mut budget,
+                    )
+                    .await;
+                let calls = peers.calls.borrow();
+                let visited: Vec<_> = calls.iter().map(|(to, ..)| to.clone()).collect();
+                if !helped {
+                    assert!(
+                        matches!(result, Err(Error::Unauthorized)),
+                        "{:?}",
+                        result.err()
+                    );
+                    assert_eq!(visited, vec![candidates.ordered[0].clone()]);
+                    continue;
+                }
+                assert!(
+                    matches!(result, Err(Error::Unavailable)),
+                    "{:?}",
+                    result.err()
+                );
+                assert_eq!(
+                    visited[..2],
+                    [candidates.ordered[0].clone(), helper.clone()]
+                );
+                assert_eq!(visited.iter().filter(|n| **n == helper).count(), 1);
+                assert!(visited[2..].iter().all(|n| candidates.ordered.contains(n)));
+                // The helper probe is an Acquire carrying fewer credits than a
+                // walk needs to ask a helper itself.
+                let (_, copy, attempts, _) = &calls[1];
+                assert!(!copy);
+                assert!(*attempts >= 1);
+                assert!(*attempts < racer_core::read::fanout::HELPER_MIN_ATTEMPTS);
+            }
+        });
+    }
+
     /// Records each request's destination, mode, and route funding, then fails.
     #[derive(Default)]
     struct FundedPeer {
         #[allow(clippy::type_complexity)]
         calls: RefCell<Vec<(NodeId, bool, u32, u8)>>,
+        /// Error every request fails with (default `Unavailable`).
+        error: Option<Error>,
     }
     impl FundedPeer {
         fn direct_hedge_available(
@@ -2671,7 +2808,7 @@ pub(super) mod tests {
                     request.route.remaining_attempts,
                     request.route.remaining_links,
                 ));
-                Err(Error::Unavailable)
+                Err(self.error.unwrap_or(Error::Unavailable))
             })
         }
     }
