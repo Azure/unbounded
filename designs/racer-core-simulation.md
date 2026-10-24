@@ -187,6 +187,8 @@ Verified against the code at the start of this work.
    during a 300 s cold start and a worst client lag of about 4.1 s. Each wake also costs O(W^2) waker
    comparisons (`step::cost::notify`). The `limits.rs` comment now says so; the behavior is
    unchanged.
+   Resolved: woken long polls queue for a write slot and `Signal` wakes in O(W); see
+   "Round 3: ctl" (commits 75ee86562, 0dde5abdd).
 
 2. Resolved: `RouteBudget::forwarded` and `RouteBudget::validate_forwarded`
    (formerly `cmd/racer-dataplane/src/topology.rs:536`, `:552`) were called only by tests and used the
@@ -679,7 +681,8 @@ scenarios carry data-plane faults.
 
 ### Known issues, summary
 
-1. Long poll replies are bounded by 64 write slots per seat, so mass wakeups answer 429.
+1. Resolved: long poll replies queue for the 64 write slots instead of answering 429; notify is O(W)
+   (75ee86562).
 2. Resolved: the test-only `RouteBudget::forwarded` was removed; tests use `racer_core::route`.
 3. A requester on a newer membership than its destination fails with `IncompatibleMembership`.
 4. A cold page can reach the origin once per owner (up to `REPLICAS`).
@@ -915,3 +918,103 @@ Slow nodes are every `1000 / slow_permille`-th node, starting at half that strid
 
 The four combined scenarios were rerun at 50,000 nodes with these models. The results are in
 "Combined acceptance (50k)".
+
+## Round 3: ctl
+
+Fixes Known issue 1 in production and in both control models.
+
+### Root cause
+
+- Write slots were taken without waiting after a long poll woke.
+  `Server::snapshot` waited for a newer image (`wait_until`), then called `write_slot()?`, a
+  non-queuing `Slots::try_acquire` (formerly `cluster-control/src/server.rs:510-512`, `:642`).
+  Every waiter on a seat wakes on one `Signal::notify`, so all but the first 64 (`MAX_WRITES`)
+  answered 429 and retried after client backoff. `keyring` (`:716`) and `replica` (`:751`) had the
+  same pattern.
+- Notify cost O(W^2). `Signal::changed` scanned the whole waker list with `will_wake` before pushing
+  (formerly `cluster-control/src/exec.rs:357-361`). Each of the W woken polls that waits again
+  re-registers, which costs W(W-1)/2 comparisons per notify.
+
+### Changes
+
+- `step::admission::WriteQueue` is the shared rule: a `Gate` plus a bounded FIFO of waiters. A
+  released slot goes straight to the oldest live waiter, newcomers cannot jump the queue, and dead
+  waiters are trimmed lazily. A full queue is `Full`, which still answers 429.
+  `SeatAdmission::writes` is now a `WriteQueue<WriteWaiter>`.
+- `exec::Slots` is built on `WriteQueue`. `try_acquire` keeps its old behavior (fail fast), and the
+  new `Slots::acquire(deadline)` waits in FIFO order. A waiter that times out or is cancelled hands
+  any slot it was granted, but never claimed, to the next waiter.
+- `Server::queued_write_slot` serves snapshot, keyring, and replica replies. It waits until the poll
+  deadline plus `limits::WRITE_QUEUE_GRACE` (5 s). The wait is clamped to seat authority and to the
+  caller's credential. Clients allow `POLL_WAIT` + 10 s per turn (`src/control/session.rs:960`), so
+  5 s are left to write. After the wait the server rechecks readiness, and a snapshot reply uses the
+  newest image. Enrollment still uses fail-fast `write_slot`. `limits::MAX_WRITE_WAITERS` equals
+  `MAX_CONTROL_CONNECTIONS`, so the deadline, not the queue length, turns sustained overload into
+  429. The wire format is unchanged.
+- `Signal::changed` returns an `exec::Changed` future that owns one entry in a waker slab. Register,
+  re-register (`clone_from` only when `will_wake` is false), and drop are O(1). Notify takes the
+  slab and wakes W entries, so a wake costs O(W). Dropped waiters no longer leave stale wakers until
+  the next notify.
+- Models: `step::cost::notify` now reports `registrations` (W) instead of `comparisons`.
+  `step::cost::drain` models FIFO draining with a wait bound and a queue bound. `step::cluster`
+  `serve_clients` uses `drain`. In the client simulator (`sim/src/control.rs`), `reply` admits
+  through `SeatAdmission::writes`, `release_write` hands slots to queued polls, and expired waiters
+  get 429 and back off. Each waiter's deadline is the end of its current `POLL_WAIT` cycle plus the
+  grace. Seat loss drops queued polls along with the waiting ones. New counters are
+  `ctl_write_queued` and `ctl_write_dequeued`, and `ctl_notify_comparisons` was renamed
+  `ctl_notify_registrations`.
+
+### Tests
+
+- `exec`:
+    - `signal_registration_is_one_entry_per_waiter`
+    - `signal_dropped_waiters_free_their_entries`
+    - `signal_wakes_many_waiters_in_linear_work` (2000 waiters, slab size stays W)
+    - `slots_queue_in_order_and_hand_over`
+    - `slots_wait_times_out_and_cancel_passes_slot_on`
+    - `slots_granted_but_unclaimed_slot_moves_on`
+- `server::long_poll_replies_queue_for_a_write_slot`: covers the queued grant, a deadline 429, a
+  credential bound, readiness rechecked after the wait, and enrollment that still fails fast.
+- `step::admission`: `write_queue_hands_slots_over_in_order` and `write_queue_trims_dead_waiters`.
+- `step::cost`: `drain_queues_within_the_wait`.
+- `step::cluster`: `mass_wake_queues_instead_of_429`, which counted 429s before this fix. The ignored
+  50k test now asserts zero 429s.
+- `racer-sim`: `mass_wake_queues_for_write_slots`, which would fail before because nothing queued,
+  and `slow_writes_still_shed_with_429`, which covers overload protection.
+
+### Evidence
+
+All runs are release builds with seed 1. Before means base 01812bd3f, and after means this branch.
+
+| Run | Write 429s | Queued (dequeued) | Notify work | Client lag p50 / p99 / max |
+|-----|------------|-------------------|-------------|----------------------------|
+| ctl-churn 5k, before | 30,417 | - | 21.5M comparisons | 3.2 s / 8.6 s / 10.3 s |
+| ctl-churn 5k, after | 0 | 30,485 (30,485) | 32.6k registrations | 2.7 s / 8.6 s / 10.3 s |
+| ctl-churn 50k, before | 454,295 | - | 548M comparisons | 4.3 s / 23.6 s / 49.5 s |
+| ctl-churn 50k, after | 0 | 293,251 (293,251) | 304k registrations | 2.7 s / 23.6 s / 46.6 s |
+| enrollment-storm 50k, before | 501 | - | 0 | 129 s / 258 s / 281.7 s |
+| enrollment-storm 50k, after | 0 | 426 (426) | 0 | 129 s / 258 s / 284.4 s |
+| full-cold-start 50k, before | 501 | - | 0 | 129 s / 258 s / 281.7 s |
+| full-cold-start 50k, after | 0 | 426 (426) | 0 | 129 s / 258 s / 284.4 s |
+
+- Lag percentiles are histogram bucket bounds.
+- At 5k, enrollment-storm and full-cold-start had no write contention before or after.
+- The 50k wall times were 3:26 (ctl-churn), 3:53 (enrollment-storm), and 27:53 (full-cold-start
+  after; 29:10 before). The full-cold-start runs had two runs in parallel. Peak RSS was unchanged:
+  0.89 GiB (ctl-churn), 0.93 GiB (enrollment-storm), and 6.6 GiB (full-cold-start).
+- Enrollment-storm and full-cold-start lag is dominated by enrollment, which is bound by API 429s
+  (about 462k, unchanged). Their all-enrolled time moved from 282.4 s to 285.1 s because the event
+  schedule changed (no write backoffs). It is not a regression in write handling.
+- Data-plane results of full-cold-start are not affected by this track.
+- `step::cluster` `fifty_thousand_pods_cold_start` went from about 4.5M 429s to 0 with 86,749
+  replies. Its worst lag stays 4.1 s, because the model's lag is dominated by seat follow intervals
+  (`self.now - commit`), not by write rounds. The old 4.1 s figure was not caused by write slots, and
+  the old model never added retry delays.
+
+### Deviations and open items
+
+- In the client simulator, a queued poll whose deadline passes learns its 429 at the next slot
+  release or admission on that seat, not at its own timer. In production, its timer fires.
+- Commit 75ee86562 changes `SeatAdmission::writes` before the simulator is updated in 0dde5abdd, so
+  `racer-sim` builds only at the second commit. Cherry-pick the two commits together.
+- New issues: none.
