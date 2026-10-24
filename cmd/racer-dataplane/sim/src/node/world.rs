@@ -1657,28 +1657,11 @@ impl NodeWorld {
                 |r| replica_score(requester, &object, number, self.ids.node(cands[r])),
             )
         };
-        // A non-owner may ask the page's overflow helper when an owner sheds
-        // it (production `CandidatePolicy::fanout_helper`, Known issue 71).
-        let helper = (rank.is_none() && self.config.node.fanout)
-            .then(|| {
-                let requester = self.ids.node(node);
-                let at = |p: usize| members.members()[p].node;
-                fanout_helper(
-                    &self.ids.object(page),
-                    self.ids.number(page),
-                    requester,
-                    members.members().len(),
-                    |p| at(p) == node || cands.contains(&at(p)),
-                )
-                .map(at)
-            })
-            .flatten();
         let fill = self.fills.get_mut(&id).expect("present");
         fill.cands = cands;
         fill.handoff.clear();
         fill.previous_member = false;
         fill.previous = 0;
-        fill.handoff.extend(helper);
         fill.version = version;
         fill.rank = rank;
         fill.order = order;
@@ -1742,6 +1725,11 @@ impl NodeWorld {
     /// Build the candidate walk from the fill's ranking and the carried
     /// continuation, then step it.
     fn start_candidates(&mut self, id: u64) {
+        let fill = &self.fills[&id];
+        let helpers_possible = self
+            .versions
+            .get(fill.version)
+            .is_some_and(|v| v.members.members().len() > fill.cands.len() + 1);
         let fill = self.fills.get_mut(&id).expect("present");
         let continuation = std::mem::take(&mut fill.continuation);
         fill.walk = Walking::Candidates(CandidateWalk::new(WalkConfig {
@@ -1752,7 +1740,10 @@ impl NodeWorld {
             continuation,
             handoff: fill.handoff.len(),
             previous: fill.previous,
-            helper: fill.rank.is_none() && !fill.handoff.is_empty(),
+            // A non-owner may ask the page's overflow helper when an owner
+            // sheds it (production `resolve_epoch_traced`, Known issue 16);
+            // the helper is chosen when the walk asks for it.
+            helper: fill.rank.is_none() && self.config.node.fanout && helpers_possible,
         }));
         self.step_walk(id);
     }
@@ -2183,18 +2174,23 @@ impl NodeWorld {
         let now = self.now();
         let instant = self.instant(now);
         let attempt_timeout = Duration::from_nanos(self.config.node.attempt_timeout_ns);
-        let fill = self.fills.get_mut(&id).expect("present");
+        let fill = &self.fills[&id];
         let dest = match probe.canonical.checked_sub(fill.cands.len()) {
-            Some(i) => {
-                self.metrics.incr(if fill.rank.is_none() {
-                    "helper_probes"
-                } else {
-                    "handoff_probes"
-                });
+            Some(i) if fill.rank.is_some() => {
+                self.metrics.incr("handoff_probes");
                 fill.handoff[i]
             }
+            Some(_) => match self.fanout_helper(id) {
+                Some(helper) => {
+                    self.metrics.incr("helper_probes");
+                    helper
+                }
+                // Every candidate helper is excluded: a miss.
+                None => return Err(Some(ProbeOutcome::CopyMiss)),
+            },
             None => fill.cands[probe.canonical],
         };
+        let fill = self.fills.get_mut(&id).expect("present");
         let scope = fill.scope;
         let budget = match &mut fill.walk {
             Walking::Candidates(walk) => walk.request_budget(&mut fill.budget),
@@ -2593,6 +2589,26 @@ impl NodeWorld {
                 }
             }
         }
+    }
+
+    /// The member fill `id`'s node asks to acquire its page (production
+    /// `CandidatePolicy::fanout_helper`): one of the page's helpers, never an
+    /// owner or the node itself, preferring a direct overlay neighbor.
+    fn fanout_helper(&self, id: u64) -> Option<u32> {
+        let fill = &self.fills[&id];
+        let (node, page) = (fill.node, fill.page);
+        let members = &self.versions.get(fill.version)?.members;
+        let me = position(members, node);
+        let at = |p: usize| members.members()[p].node;
+        fanout_helper(
+            &self.ids.object(page),
+            self.ids.number(page),
+            self.ids.node(node),
+            members.members().len(),
+            |p| at(p) == node || fill.cands.contains(&at(p)),
+            |p| me.is_some_and(|me| members.is_neighbor(me, p)),
+        )
+        .map(at)
     }
 
     /// Production hot-page shed (`racer_core::read::fanout::shed_hot_page`):

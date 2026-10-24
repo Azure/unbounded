@@ -975,16 +975,15 @@ impl CandidatePolicy {
                     .unwrap_or_default(),
                 _ => PreviousOwners::default(),
             };
-            // Owners: previous-membership owners to ask before origin.
-            // Non-owners: the page's overflow helper (Known issue 16).
             let handoff = match rank {
                 Some(_) => previous.handoff.clone(),
-                None if page_operation => self
-                    .fanout_helper(&candidates, object, page)
-                    .into_iter()
-                    .collect(),
                 None => Vec::new(),
             };
+            // A non-owner page walk may ask the page's overflow helper (Known
+            // issue 16). It is chosen only when the walk asks for it.
+            let helper = rank.is_none()
+                && page_operation
+                && candidates.membership.members().len() > candidates.ordered.len() + 1;
             // racer-core owns the visit order, funding, and evidence rules;
             // this loop performs the exchanges it plans.
             let mut walk = CandidateWalk::new(WalkConfig {
@@ -1001,9 +1000,9 @@ impl CandidatePolicy {
                     primary_outcome: continuation.primary_outcome,
                     bounded_routes: continuation.bounded_routes,
                 },
-                handoff: if rank.is_some() { handoff.len() } else { 0 },
+                handoff: handoff.len(),
                 previous: previous.same_rank,
-                helper: rank.is_none() && !handoff.is_empty(),
+                helper,
             });
             let end = loop {
                 let probe = match walk.next(budget)? {
@@ -1018,8 +1017,20 @@ impl CandidatePolicy {
                 // Canonical ranks past the owners address handoff targets
                 // (`WalkConfig::handoff`) or, for a non-owner, the overflow
                 // helper (`WalkConfig::helper`).
+                let chosen;
                 let destination = match probe.canonical.checked_sub(candidates.ordered.len()) {
-                    Some(i) => &handoff[i],
+                    Some(i) if rank.is_some() => &handoff[i],
+                    Some(_) => match self.fanout_helper(&candidates, object, page) {
+                        Some(helper) => {
+                            chosen = helper;
+                            &chosen
+                        }
+                        None => {
+                            // Every candidate helper is excluded: a miss.
+                            walk.complete(budget, WalkOutcome::Probe(ProbeOutcome::CopyMiss))?;
+                            continue;
+                        }
+                    },
                     None => &candidates.ordered[probe.canonical],
                 };
                 let response = self
@@ -1169,18 +1180,27 @@ impl CandidatePolicy {
 
     /// The member this non-owner asks to acquire `page` for it when an owner
     /// sheds the request (`racer_core::read::fanout`): one of the page's
-    /// hash-chosen helpers, never an owner and never this node.
+    /// hash-chosen helpers, never an owner and never this node, preferring a
+    /// direct overlay neighbor so the exchange needs no relay.
     pub(crate) fn fanout_helper(
         &self,
         candidates: &Candidates,
         object: &ObjectId,
         page: PageNumber,
     ) -> Option<NodeId> {
-        let members = candidates.membership.members();
-        racer_core::read::fanout::fanout_helper(object, page, &self.node, members.len(), |p| {
-            let node = &members[p].node;
-            node == &self.node || candidates.ordered.contains(node)
-        })
+        let membership = &candidates.membership;
+        let members = membership.members();
+        racer_core::read::fanout::fanout_helper(
+            object,
+            page,
+            &self.node,
+            members.len(),
+            |p| {
+                let node = &members[p].node;
+                node == &self.node || candidates.ordered.contains(node)
+            },
+            |p| membership.is_neighbor(&self.node, &members[p].node),
+        )
         .map(|p| members[p].node.clone())
     }
 
@@ -2734,7 +2754,7 @@ pub(super) mod tests {
         }
     }
 
-    /// Known issue 71: a non-owner whose owner itself sheds it (a signed
+    /// Known issue 16: a non-owner whose owner itself sheds it (a signed
     /// `Overloaded` from the destination) asks the page's overflow helper
     /// once, with an Acquire funded from what is left (too little for the
     /// helper to ask another helper), then the remaining owners. A transport

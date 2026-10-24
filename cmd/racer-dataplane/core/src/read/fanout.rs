@@ -128,13 +128,17 @@ pub fn is_helper(object: &ObjectId, page: PageNumber, position: usize, members: 
 /// `excluded(position)` must be true for the page's owners and for the
 /// requester itself. Helper `j` of a page is `hash(page, j) % members`; the
 /// requester starts at `hash(requester, page) % width` and takes the first
-/// helper that is not excluded.
+/// helper that is not excluded and is `preferred` (a direct overlay neighbor,
+/// so the exchange needs no relay), else the first that is not excluded.
+/// Scans at most [`fanout_width`] helpers; callers compute it only when the
+/// walk asks for the helper.
 pub fn fanout_helper(
     object: &ObjectId,
     page: PageNumber,
     requester: &NodeId,
     members: usize,
     excluded: impl Fn(usize) -> bool,
+    preferred: impl Fn(usize) -> bool,
 ) -> Option<usize> {
     let width = fanout_width(members);
     if width == 0 {
@@ -144,11 +148,19 @@ pub fn fanout_helper(
     let key = &object.key.0[..];
     let number = page.0.to_le_bytes();
     let start = fnv(&[requester.0.as_bytes(), cache, key, &number]) as usize % width;
-    (0..width).find_map(|offset| {
+    let mut first = None;
+    for offset in 0..width {
         let j = ((start + offset) % width) as u64;
         let position = fnv(&[cache, key, &number, &j.to_le_bytes()]) as usize % members;
-        (!excluded(position)).then_some(position)
-    })
+        if excluded(position) {
+            continue;
+        }
+        if preferred(position) {
+            return Some(position);
+        }
+        first.get_or_insert(position);
+    }
+    first
 }
 
 #[cfg(test)]
@@ -180,9 +192,14 @@ mod tests {
         let mut chosen = std::collections::BTreeSet::new();
         for r in 0..members {
             let requester = NodeId(format!("node-{r}"));
-            let helper = fanout_helper(&object(), PageNumber(3), &requester, members, |p| {
-                owners.contains(&p) || p == r
-            })
+            let helper = fanout_helper(
+                &object(),
+                PageNumber(3),
+                &requester,
+                members,
+                |p| owners.contains(&p) || p == r,
+                |_| false,
+            )
             .expect("helper");
             assert!(!owners.contains(&helper) && helper != r);
             chosen.insert(helper);
@@ -198,12 +215,14 @@ mod tests {
             &NodeId("x".into()),
             members,
             |_| false,
+            |_| false,
         );
         let b = fanout_helper(
             &object(),
             PageNumber(3),
             &NodeId("x".into()),
             members,
+            |_| false,
             |_| false,
         );
         assert_eq!(a, b);
@@ -215,8 +234,15 @@ mod tests {
         let mut helpers = 0;
         for r in 0..members {
             let requester = NodeId(format!("node-{r}"));
-            let h = fanout_helper(&object(), PageNumber(9), &requester, members, |p| p == r)
-                .expect("helper");
+            let h = fanout_helper(
+                &object(),
+                PageNumber(9),
+                &requester,
+                members,
+                |p| p == r,
+                |p| p % 7 == r % 7,
+            )
+            .expect("helper");
             assert!(is_helper(&object(), PageNumber(9), h, members));
         }
         for p in 0..members {
@@ -238,14 +264,53 @@ mod tests {
     }
 
     #[test]
+    fn a_neighbor_helper_is_preferred_but_never_required() {
+        let members = 5_000;
+        let r = NodeId("r".into());
+        let all: Vec<usize> = (0..members)
+            .filter(|p| is_helper(&object(), PageNumber(4), *p, members))
+            .collect();
+        let pick = |neighbor: usize| {
+            fanout_helper(
+                &object(),
+                PageNumber(4),
+                &r,
+                members,
+                |_| false,
+                |p| p == neighbor,
+            )
+        };
+        // Each helper of the page is chosen when it is the only neighbor.
+        for neighbor in &all {
+            assert_eq!(pick(*neighbor), Some(*neighbor));
+        }
+        // A neighbor outside the helper set is never chosen.
+        let outside = (0..members).find(|p| !all.contains(p)).unwrap();
+        let chosen = pick(outside).unwrap();
+        assert!(all.contains(&chosen));
+        // An excluded neighbor is never chosen.
+        let excluded = all[0];
+        let chosen = fanout_helper(
+            &object(),
+            PageNumber(4),
+            &r,
+            members,
+            |p| p == excluded,
+            |p| p == excluded,
+        )
+        .unwrap();
+        assert_ne!(chosen, excluded);
+    }
+
+    #[test]
     fn no_helper_when_everyone_is_excluded_or_membership_is_empty() {
         let r = NodeId("r".into());
         assert_eq!(
-            fanout_helper(&object(), PageNumber(0), &r, 0, |_| false),
+            fanout_helper(&object(), PageNumber(0), &r, 0, |_| false, |_| false),
             None
         );
         assert_eq!(
-            fanout_helper(&object(), PageNumber(0), &r, 4, |_| true),
+            fanout_helper(&object(), PageNumber(0), &r, 4, |_| true, |_| true),
             None
         );
     }
@@ -254,7 +319,9 @@ mod tests {
     fn different_pages_use_different_helpers() {
         let r = NodeId("r".into());
         let helpers: std::collections::BTreeSet<_> = (0..64)
-            .filter_map(|p| fanout_helper(&object(), PageNumber(p), &r, 5_000, |_| false))
+            .filter_map(|p| {
+                fanout_helper(&object(), PageNumber(p), &r, 5_000, |_| false, |_| false)
+            })
             .collect();
         assert!(helpers.len() > 32);
     }
