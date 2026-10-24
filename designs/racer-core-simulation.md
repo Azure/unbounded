@@ -197,7 +197,10 @@ Verified against the code at the start of this work.
    `racer_core::route::forward` and `validate` on a `RouteBudget`'s fields, so search-form forwarding
    has one rule; the signed wire form stays in `racer_core::route::check_wire_transition`.
 
-3. A requester that adopted a newer membership than its destination fails the read. The
+3. Resolved: a `StaleMembership` answer with nothing newer to refresh to now skips that owner
+   (`racer_core::read::walk::stale_action`, `Outcome::StaleDestination`), commit 296a54117. See
+   "Round 3: route". Original text:
+   A requester that adopted a newer membership than its destination fails the read. The
    destination cannot resolve the newer version and answers `StaleMembership`; the requester then
    refreshes, but its latest version is not newer than the one it used, so `refresh_candidates`
    returns `IncompatibleMembership` (`cmd/racer-dataplane/src/read/candidates.rs:1203-1204`,
@@ -215,7 +218,10 @@ Verified against the code at the start of this work.
    seed 7) one reader and then 64 readers cause 33 origin requests for 16 pages. The simulator
    bounds origin requests per page by `REPLICAS` in tests, not 1.
 
-5. Under heavy overload a page read fails with `HopBudgetExhausted`, which is not `recoverable`.
+5. Resolved: a local `HopBudgetExhausted` is walk evidence (`transport_outcome`), so the walk ends
+   `Exhausted` (recoverable `Unavailable`) or at origin for an owner, commit 296a54117. See
+   "Round 3: route". Original text:
+   Under heavy overload a page read fails with `HopBudgetExhausted`, which is not `recoverable`.
    Each probe charges its route links up front (`plan_attempt`, `core/src/read/walk.rs:478`), and
    after a failed route each probe charges 8. With the page budget of 16 links (`PAGE_LINKS`,
    `core/src/read/range.rs:24`) two `Overloaded` relays use it up; the next `plan_attempt` returns
@@ -233,7 +239,10 @@ Verified against the code at the start of this work.
    11 times and 20,035 of 45,938 pages more than once. No invariant is relaxed: `only_owner_hits_origin`
    holds on each request's own version; this is the cost of ownership moves, reported for review.
 
-7. Crashed members stay in the membership (their Node and Pod objects remain, so `plan_pass` keeps
+7. Partly resolved: reads near crashed members no longer fail with `HopBudgetExhausted` (issue 5),
+   commit 296a54117. Crashed members still stay routable until link backoff; the remaining failures
+   are recoverable `Unavailable` after client retries. See "Round 3: route". Original text:
+   Crashed members stay in the membership (their Node and Pod objects remain, so `plan_pass` keeps
    them), and peers keep routing through them until link backoff opens their circuits. Each failed
    route makes the next probe charge 8 links (Known issue 5), so reads near a crashed member fail
    with `HopBudgetExhausted`. In `full-failover` at 50,000 nodes (4 crashes, seed 1) 11,950 of about
@@ -254,7 +263,10 @@ Verified against the code at the start of this work.
    promotes a page that is already in memory. Pinned by
    `read::core_equivalence::duplicate_publish_touches_only_in_the_simulator`.
 
-10. Route search admission is per node and has no queue. A node runs at most 8 distinct searches at
+10. Resolved: searches beyond the 8 slots wait in a bounded FIFO queue (`Paths::with_queue`,
+   `DEFAULT_SEARCH_QUEUE` 64) instead of failing, commit 5528e6066. See "Round 3: route".
+   Original text:
+   Route search admission is per node and has no queue. A node runs at most 8 distinct searches at
    once (`Paths::route`, `cmd/racer-dataplane/topology/src/paths.rs:530`), and any further search
    fails at once with `Overloaded`. The send then fails: a requester sees a transport error, and a
    relay answers `Overloaded` through `relay_failure`. Either way the walk pays the failure-route
@@ -263,6 +275,21 @@ Verified against the code at the start of this work.
    `request_rate` 0.005), 720,628 searches were rejected this way during the storm, along with 502k
    `HopBudgetExhausted` failures. No search was rejected in the other combined runs. No invariant
    is relaxed. This is reported as a behavior to review.
+
+21. The 50k `full-cold-start` storm still fails most page reads. With issues 5 and 10 fixed, no read
+   fails with `HopBudgetExhausted` and no search is rejected, but walks that end `Exhausted` are now
+   retried by the client (`Unavailable` is `recoverable`) and run into the read deadline instead:
+   180k ok / 708k failed (696k `DeadlineExceeded`, 11.9k `Unavailable`), against 153k / 735k
+   (502k hop budget, 230k deadline) before (seed 1, `request_rate` 0.005). The storm (50,000 nodes
+   times 16 pages while nodes enroll) exceeds what the read deadline allows; 1.34M walks end
+   `Exhausted`. No invariant is relaxed. Reported for review: the failure is now a capacity limit,
+   not an error classification.
+
+22. An owner whose predecessor is behind (Known issue 3) now reaches the origin with transient
+   evidence for that predecessor, where it used to fail with `IncompatibleMembership`. This adds
+   origin requests during churn: in `churn` at 5,000 nodes (seed 1) the maximum per page rose from 3
+   to 4 (mean 1.35 to 1.41); at 50,000 nodes the maximum stays 5 (mean 2.39 to 2.47).
+   `only_owner_hits_origin` holds. Same family as Known issue 6.
 
 ## Simulator engine (racer-sim substrate)
 
@@ -684,15 +711,19 @@ scenarios carry data-plane faults.
 1. Resolved: long poll replies queue for the 64 write slots instead of answering 429; notify is O(W)
    (75ee86562).
 2. Resolved: the test-only `RouteBudget::forwarded` was removed; tests use `racer_core::route`.
-3. A requester on a newer membership than its destination fails with `IncompatibleMembership`.
+3. Resolved: a requester on a newer membership than its destination skips it (round 3, route).
 4. A cold page can reach the origin once per owner (up to `REPLICAS`).
-5. Under overload or failed routes, page reads fail with `HopBudgetExhausted` instead of trying
-   other owners.
+5. Resolved: a local hop budget shortfall ends the walk recoverably (round 3, route).
 6. Ownership moves on membership changes add origin requests beyond `REPLICAS` per page.
-7. Crashed members stay routable until link backoff; reads near them hit issue 5.
+7. Partly resolved: crashed members stay routable until link backoff, but reads near them no
+   longer fail with `HopBudgetExhausted` (round 3, route).
 8. Core `PageFlights` lets an origin-rejected leader receive a later result; production fails it.
 9. The simulator touches a page on a duplicate memory publish; production does not.
-10. Route searches beyond 8 per node fail at once with `Overloaded`; storms reject many of them.
+10. Resolved: route searches beyond 8 per node queue (up to 64) instead of failing (round 3, route).
+21. The 50k `full-cold-start` storm still fails most reads; failures moved from hop budget to read
+   deadline (round 3, route).
+22. Owners whose predecessor is behind now reach the origin, adding origin requests per page in
+   churn (round 3, route).
 
 ## Round 2: production admission
 
@@ -1018,3 +1049,116 @@ All runs are release builds with seed 1. Before means base 01812bd3f, and after 
 - Commit 75ee86562 changes `SeatAdmission::writes` before the simulator is updated in 0dde5abdd, so
   `racer-sim` builds only at the second commit. Cherry-pick the two commits together.
 - New issues: none.
+
+## Round 3: route
+
+Known issues 3, 5, 7, and 10. One root runs through them: a failure that only concerns one owner
+or one moment (a destination behind this node, a probe the remaining links cannot fund, a busy
+search slot) ended the whole read with a terminal error instead of being treated as transient.
+
+### Stale destinations (issue 3)
+
+Root cause: `refresh_candidates` (`src/read/candidates.rs`, round 2 at about line 1203) and the
+core `refresh_allowed` returned `IncompatibleMembership` when the local membership was not
+strictly newer than the one used, or after the one refresh. `IncompatibleMembership` is not
+`recoverable` (`core/src/read/policy.rs:9-22`), so the read failed although the other owners were
+fine.
+
+Fix (`core/src/read/walk.rs`): `stale_action(retried, previous, latest)` returns `Refresh` (strictly
+newer and not yet retried, unchanged) or `Skip`. On `Skip` the caller completes the probe with the
+new `Outcome::StaleDestination`: the walk records `Unreachable` evidence, sets the transient flag,
+and moves to the next owner without charging a route failure (the route worked). An owner keeps
+its origin authority with that evidence; `RemainingWalk` treats it as unavailable. No published
+membership at all is still `Unavailable`. `refresh_allowed` was removed. The dataplane
+(`CandidatePolicy::refresh_membership`, both the in-walk path and the stale hedge path, which now
+walks the same epoch with bounded routes) and racer-sim (`NodeWorld::reply`, `hedge_result`) call
+the same function. The wire format is unchanged.
+
+### Local hop budget shortfall (issues 5 and 7)
+
+Root cause: `plan_attempt` returns `HopBudgetExhausted` when the remaining links cannot fund the
+next route (`core/src/read/walk.rs`, `route_links() == 0`), and `transport_outcome` did not map it,
+so the dataplane (`src/read/candidates.rs`, the `transport_outcome` call in `resolve_epoch_traced`)
+and the simulator abandoned the walk with a non-recoverable error. Overloaded relays (issue 5) and
+links toward crashed members (issue 7) both spend links quickly because each failed route raises
+the per-probe charge to 8.
+
+Fix: `transport_outcome` maps `HopBudgetExhausted` to `ProbeOutcome::Unreachable`. The error is
+local (no bytes were sent), so later probes that cannot be funded fail the same way without I/O;
+the walk ends `Exhausted` (recoverable `Unavailable`, so the client retries within its own retry
+limit) or, at an owner, with origin authority. Budgets are unchanged and never grow
+(`budget_never_grows` holds in every run).
+
+Issue 7 is only partly fixed: crashed members still stay in the membership and are routed through
+until link backoff opens their circuits. The resulting failures are now recoverable `Unavailable`
+after client retries (12.4k in `full-failover` at 50k, see below).
+
+### Route search queue (issue 10)
+
+Root cause: `Paths::route` (`topology/src/paths.rs`, round 2 line 530) failed any new search with
+`Overloaded` when 8 searches were running.
+
+Fix: `Paths::with_queue(limit)` keeps a FIFO of callers waiting for a slot. A waiting caller holds
+no slot and does no work; it registers its waker and is woken when a search finishes or is
+cancelled (`SharedSearch::poll`, `SearchAdmission::drop`) or when the caller ahead leaves the queue
+(`QueueTicket::drop`). A free slot goes to the head of the queue; new callers do not bypass
+waiting ones. Waiters still join a running search for the same key and take cache hits without a
+slot. Dropping a waiting future (for example on its deadline; the dataplane's
+`Paths::shortest_async` checks the request scope on every poll) leaves the queue. A full queue still
+answers `Overloaded`, so overload protection stays bounded. `Paths::new`, used by the dataplane,
+queues up to `DEFAULT_SEARCH_QUEUE` (64, eight per slot); `with_limits` keeps no queue.
+
+racer-sim previously polled tasks with a no-op waker and rescheduled every slice. Tasks now get a
+`TaskWaker`; a task that returns `Pending` without waking itself is parked (no CPU) until another
+task wakes it (`route_search_queued`, `route_search_queue_wakes`). `node.search_queue` (default 64)
+sets the queue; 0 restores rejection.
+
+### Tests
+
+- racer-core: `stale_destination_moves_to_the_next_owner`,
+  `stale_destinations_everywhere_end_exhausted_or_at_origin`,
+  `remaining_walk_treats_a_stale_destination_as_unavailable`, `spent_links_end_the_walk_exhausted`,
+  and the extended `stale_membership_ends_and_returns_child_credits` and transport mapping test.
+- topology: `queued_searches_wait_in_order_and_full_queue_rejects`,
+  `queue_is_fair_cancellable_and_joins_running_searches`.
+- dataplane: `stale_destination_without_newer_membership_tries_the_next_owner`,
+  `all_stale_destinations_end_unavailable_after_one_probe_each`,
+  `owner_with_stale_predecessor_reaches_origin`, `stale_answer_without_published_membership_is_unavailable`,
+  `topology::tests::...::searches_beyond_the_slot_limit_wait_for_a_slot`. Changed expectations:
+  `hedge_stale_membership_refreshes_once_without_fresh_credits` (a second stale answer now reaches
+  the next owner) and `corrupt_copies_exhaust_sources_or_original_credits_without_origin_for_noncandidate`
+  (4 links: `Unavailable` instead of `HopBudgetExhausted`).
+- racer-sim: `requesters_ahead_of_their_destination_skip_it`, `queued_searches_wait_instead_of_failing`
+  (`yielding_searches_hit_production_concurrency_limits` now sets `search_queue` 0). The cold start
+  test (`contention_scenarios.rs`) now requires zero `HopBudgetExhausted` and at most 1% failures,
+  all admission `Overloaded`. Before the fix it saw 851 of 6,400 (400 nodes) and 7,122 of 32,000
+  (2,000 nodes) reads fail with `HopBudgetExhausted`; after, 0 and 1 (`Overloaded`).
+
+### Evidence
+
+Release build, seed 1. `storm` and `churn` with `--duration 1s` and
+`{"objects": 256, "request_rate": 2.0}`; `full-*` with default durations and
+`{"request_rate": 0.005}`. Read counts are the report's `reads_completed` / `reads_failed`.
+The 50k `full-*` "before" rows are the round 2 table above (same base code); the others were rerun.
+
+| Scenario | Nodes | Reads ok / failed before | after | Failures before | after |
+| --- | --- | --- | --- | --- | --- |
+| storm | 5,000 | 35,166 / 2,075 | 35,409 / 0 | 2,075 hop; 6,849 searches rejected | none; 3,403 searches queued |
+| churn | 5,000 | 12,272 / 915 | 13,763 / 114 | 800 incompatible, 81 hop, 34 unavailable | 114 unavailable; 1,547 stale skips |
+| full-cold-start | 5,000 | 92,738 / 2,141 | 94,798 / 103 | 2,104 hop, 37 unavailable; 6,613 rejected | 103 unavailable; 3,284 queued |
+| full-failover | 5,000 | 33,544 / 348 | 33,934 / 116 | 305 hop, 43 unavailable | 116 unavailable |
+| storm | 50,000 | 44,137 / 282,617 | 48,576 / 17 | 282,604 hop, 13 overloaded; 704,665 rejected | 4 unavailable, 13 overloaded; 446,186 queued |
+| churn | 50,000 | 100,460 / 9,440 | 111,854 / 1,209 | 7,901 incompatible, 1,147 hop, 392 unavailable | 1,209 unavailable; 13,316 stale skips |
+| full-cold-start | 50,000 | 153k / 735k | 180k / 708k | 502k hop, 230k deadline, 3.5k unavailable; 721k rejected | 696k deadline, 11.9k unavailable; 459k queued (Known issue 21) |
+| full-failover | 50,000 | 263k / 18.4k | 274k / 12.4k | 14.7k hop, 3.7k unavailable | 12.4k unavailable |
+
+All runs end with zero hard invariant failures and no relaxed invariant. Read latency p50 and p99
+are unchanged in `churn` and `storm` at 50k (p99 738 ms, log buckets). Origin requests per page are
+unchanged except as noted in Known issue 22. The 5k set ran in about 40 s wall (four runs in
+parallel). At 50k, `full-cold-start` took 25:35 wall (round 2: 18:41) with 211M events and 10.1 GiB
+peak RSS (6.2 GiB): woken queued searches and client retries of recoverable walks add events. `storm`
+peak RSS rose from 4.9 to 6.6 GiB. `full-failover` link failures rose from 96k to 164k because walks
+now continue past unreachable owners and retries probe again.
+
+Deviation: the 50k `full-*` "before" numbers are taken from the round 2 table, not rerun.
+
