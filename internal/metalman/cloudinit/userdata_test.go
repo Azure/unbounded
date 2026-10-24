@@ -42,6 +42,15 @@ users:
 `,
 			wantErr: "must not define top-level users",
 		},
+		{
+			name: "reject Jinja users bypass",
+			content: `## template: jinja
+#cloud-config
+"{{ 'users' }}":
+- name: temporary-admin
+`,
+			wantErr: "cloud-init templating is not allowed",
+		},
 		{name: "reject empty", wantErr: "exactly one YAML mapping document"},
 		{name: "reject invalid yaml", content: "users: [", wantErr: "parse cloud-init user-data"},
 		{name: "reject sequence", content: "- package\n", wantErr: "exactly one YAML mapping document"},
@@ -125,6 +134,31 @@ func TestResolveUserDataScopesValidationToHillsboroImage(t *testing.T) {
 			require.Equal(t, userData, resolved)
 		})
 	}
+}
+
+func TestResolveUserDataAllowsTemplatingForGenericImages(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+
+	userData := []byte(`## template: jinja
+#cloud-config
+"{{ 'users' }}":
+- name: temporary-admin
+`)
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "access", Namespace: "default"},
+		Data:       map[string]string{"user-data": string(userData)},
+	}
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(configMap).Build()
+	machine := machineWithUserData("ghcr.io/azure/host-ubuntu2404:v1")
+
+	resolved, ok, err := ResolveUserData(t.Context(), reader, machine)
+
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, userData, resolved)
 }
 
 func TestPreservesImageUsers(t *testing.T) {

@@ -38,6 +38,15 @@ users:
 			wantErr: "must not define top-level users",
 		},
 		{
+			name: "reject Jinja users bypass",
+			content: `## template: jinja
+#cloud-config
+"{{ 'users' }}":
+- name: temporary-admin
+`,
+			wantErr: "cloud-init templating is not allowed",
+		},
+		{
 			name:    "reject invalid yaml",
 			content: "users: [",
 			wantErr: "parse cloud-init user-data",
@@ -70,6 +79,20 @@ runcmd: [echo unexpected]
 			require.ErrorContains(t, err, tt.wantErr)
 		})
 	}
+}
+
+func TestRunRejectsJinjaTemplate(t *testing.T) {
+	t.Parallel()
+
+	var stderr bytes.Buffer
+	exitCode := run([]string{"-"}, strings.NewReader(`## template: jinja
+#cloud-config
+"{{ 'users' }}":
+- name: temporary-admin
+`), &stderr)
+
+	require.Equal(t, 1, exitCode)
+	require.Contains(t, stderr.String(), "cloud-init templating is not allowed")
 }
 
 func TestRunReadsStdin(t *testing.T) {

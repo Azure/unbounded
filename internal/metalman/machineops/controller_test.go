@@ -605,44 +605,70 @@ func TestReconcilerRequestsHostReplaceOnceAndCompletesAfterRepave(t *testing.T) 
 func TestReconcilerRejectsHillsboroUserDataBeforeHostReplace(t *testing.T) {
 	t.Parallel()
 
-	for _, source := range []string{"data", "binaryData"} {
-		t.Run(source, func(t *testing.T) {
+	payloads := []struct {
+		name    string
+		data    []byte
+		wantErr string
+	}{
+		{
+			name:    "top-level users",
+			data:    []byte("#cloud-config\nusers: []\n"),
+			wantErr: "must not define top-level users",
+		},
+		{
+			name: "Jinja users bypass",
+			data: []byte(`## template: jinja
+#cloud-config
+"{{ 'users' }}":
+- name: temporary-admin
+`),
+			wantErr: "cloud-init templating is not allowed",
+		},
+	}
+
+	for _, payload := range payloads {
+		t.Run(payload.name, func(t *testing.T) {
 			t.Parallel()
 
-			machine := testBareMetalMachine("machine-1", "rack-a")
-			machine.Spec.PXE.Image = "ghcr.io/azure/host-ubuntu2404-gb200-hillsboro@sha256:abc"
-			machine.Spec.PXE.CloudInit = &v1alpha3.CloudInitSpec{
-				UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{Name: "access", Namespace: "default"},
-			}
-			configMap := &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{Name: "access", Namespace: "default"},
-			}
-			userData := []byte("#cloud-config\nusers: []\n")
-			if source == "data" {
-				configMap.Data = map[string]string{"user-data": string(userData)}
-			} else {
-				configMap.BinaryData = map[string][]byte{"user-data": userData}
-			}
-			op := testOperation("op-replace-invalid-userdata", v1alpha3.OperationHostReplace)
-			op.Spec.MachineRef = machine.Name
+			for _, source := range []string{"data", "binaryData"} {
+				t.Run(source, func(t *testing.T) {
+					t.Parallel()
 
-			c := fake.NewClientBuilder().
-				WithScheme(testScheme(t)).
-				WithObjects(machine, configMap, op, testRedfishSecret()).
-				WithStatusSubresource(op, machine).
-				Build()
-			power := &recordingPowerClient{}
-			reconciler := testReconciler(c, power, "rack-a")
+					machine := testBareMetalMachine("machine-1", "rack-a")
+					machine.Spec.PXE.Image = "ghcr.io/azure/host-ubuntu2404-gb200-hillsboro@sha256:abc"
+					machine.Spec.PXE.CloudInit = &v1alpha3.CloudInitSpec{
+						UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{Name: "access", Namespace: "default"},
+					}
+					configMap := &corev1.ConfigMap{
+						ObjectMeta: metav1.ObjectMeta{Name: "access", Namespace: "default"},
+					}
+					if source == "data" {
+						configMap.Data = map[string]string{"user-data": string(payload.data)}
+					} else {
+						configMap.BinaryData = map[string][]byte{"user-data": payload.data}
+					}
+					op := testOperation("op-replace-invalid-userdata", v1alpha3.OperationHostReplace)
+					op.Spec.MachineRef = machine.Name
 
-			_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
-			require.NoError(t, err)
+					c := fake.NewClientBuilder().
+						WithScheme(testScheme(t)).
+						WithObjects(machine, configMap, op, testRedfishSecret()).
+						WithStatusSubresource(op, machine).
+						Build()
+					power := &recordingPowerClient{}
+					reconciler := testReconciler(c, power, "rack-a")
 
-			var updated v1alpha3.MachineOperation
-			require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: op.Name}, &updated))
-			require.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
-			require.Len(t, updated.Status.Targets, 1)
-			require.Contains(t, updated.Status.Targets[0].Message, "must not define top-level users")
-			require.Empty(t, power.calls)
+					_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+					require.NoError(t, err)
+
+					var updated v1alpha3.MachineOperation
+					require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: op.Name}, &updated))
+					require.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
+					require.Len(t, updated.Status.Targets, 1)
+					require.Contains(t, updated.Status.Targets[0].Message, payload.wantErr)
+					require.Empty(t, power.calls)
+				})
+			}
 		})
 	}
 }

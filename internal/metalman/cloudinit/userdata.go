@@ -24,7 +24,18 @@ const hillsboroImageRepository = "ghcr.io/azure/host-ubuntu2404-gb200-hillsboro"
 
 // ValidateUserData rejects cloud-config that would replace image-baked users.
 func ValidateUserData(reader io.Reader) error {
-	decoder := yaml.NewDecoder(reader)
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return fmt.Errorf("read cloud-init user-data: %w", err)
+	}
+
+	firstLine, _, _ := bytes.Cut(data, []byte("\n"))
+	templateHeader := strings.TrimSpace(strings.TrimPrefix(string(firstLine), "\uFEFF"))
+	if strings.HasPrefix(strings.ToLower(templateHeader), "## template:") {
+		return errors.New("cloud-init templating is not allowed for images with baked users")
+	}
+
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
 
 	var document yaml.Node
 	if err := decoder.Decode(&document); err != nil {
