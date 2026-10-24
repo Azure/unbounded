@@ -34,7 +34,7 @@ pub use crate::{
         catalog::CacheInfo,
         election::{LeaseObservation, LeaseSpec, Observer, SeatView},
         keyring::Policy,
-        members::{NodeInfo, Ownership, PodInfo},
+        members::{NodeInfo, Ownership, PodInfo, Readiness},
         publication::{Image, Record},
         state::{StateError, StateRecord, Term, Writer},
     },

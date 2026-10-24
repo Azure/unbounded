@@ -129,6 +129,9 @@ pub struct Settings {
     pub check_ns: Nanos,
     pub converge_ns: Nanos,
     pub image_bytes_per_member: u64,
+    /// Crash to Node `Ready=Unknown` (Kubernetes `node-monitor-grace-period`);
+    /// 0 never marks crashed Nodes (the pre-round-4 model).
+    pub node_monitor_grace_ns: Nanos,
     /// Seat authorization model, see [`AuthModel`].
     pub auth: AuthModel,
     /// Per-seat authorization API budget (`limits::AUTH_API_QPS`, `_BURST`)
@@ -174,6 +177,7 @@ impl Default for Settings {
             check_ns: 10 * SECONDS,
             converge_ns: 180 * SECONDS,
             image_bytes_per_member: 128,
+            node_monitor_grace_ns: 40 * SECONDS,
             auth: AuthModel::Cached,
             auth_qps: limits::AUTH_API_QPS,
             auth_burst: limits::AUTH_API_BURST,
@@ -228,6 +232,7 @@ impl Settings {
                 "check_ns" => self.check_ns = u()?.max(MILLIS),
                 "converge_ns" => self.converge_ns = u()?,
                 "image_bytes_per_member" => self.image_bytes_per_member = u()?,
+                "node_monitor_grace_ns" => self.node_monitor_grace_ns = u()?,
                 "auth" => {
                     self.auth = match v.as_str() {
                         Some("legacy") => AuthModel::Legacy,
@@ -437,6 +442,8 @@ impl ControlSim {
                 pods: initial,
                 seed,
                 image_bytes_per_member: settings.image_bytes_per_member,
+                node_monitor_grace: (settings.node_monitor_grace_ns > 0)
+                    .then(|| Duration::from_nanos(settings.node_monitor_grace_ns)),
                 ..ModelSettings::default()
             },
             Instant::now(),

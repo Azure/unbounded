@@ -16,8 +16,8 @@
 //! stream, so runs replay exactly.
 
 use super::{
-    Image, LeaseObservation, LeaseSpec, NodeInfo, Ownership, PodInfo, Policy, PrimaryView, Seeded,
-    StateRecord, Term, Writer,
+    Image, LeaseObservation, LeaseSpec, NodeInfo, Ownership, PodInfo, Policy, PrimaryView,
+    Readiness, Seeded, StateRecord, Term, Writer,
     contend::Contend,
     cost,
     follower::Follower,
@@ -49,6 +49,11 @@ pub struct Settings {
     pub write_ns: u64,
     /// Bytes of one image copy from the primary to a seat (for accounting).
     pub image_bytes_per_member: u64,
+    /// Time after a crash until the node lifecycle controller marks the
+    /// Node `Ready=Unknown` (Kubernetes `node-monitor-grace-period`, 40 s
+    /// by default). A crash here is the whole node: the kubelet stops
+    /// heartbeating with it. `None` never marks crashed Nodes.
+    pub node_monitor_grace: Option<Duration>,
 }
 
 impl Default for Settings {
@@ -59,6 +64,7 @@ impl Default for Settings {
             seed: 1,
             write_ns: 2_000_000,
             image_bytes_per_member: 128,
+            node_monitor_grace: Some(Duration::from_secs(40)),
         }
     }
 }
@@ -119,6 +125,8 @@ enum Ev {
     Follow(u32),
     PrimaryRenew(u32),
     Reconcile(u32),
+    /// The node lifecycle controller marks a crashed Pod's Node not ready.
+    NodeNotReady(u32),
 }
 
 /// The control plane of a simulated cluster.
@@ -353,6 +361,34 @@ impl ControlPlane {
         p.seat = None;
         p.renew = None;
         p.primary = None;
+        if let Some(grace) = self.settings.node_monitor_grace {
+            self.after(grace, pod, Ev::NodeNotReady(pod));
+        }
+    }
+
+    /// Set Node `n{pod}`'s `Ready` condition, stamped now, if it changes.
+    fn set_node_ready(&mut self, pod: u32, ready: bool) {
+        let since = self
+            .wall()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if let Some(n) = self.inventory.nodes.get_mut(&format!("n{pod}"))
+            && n.ready.is_none_or(|r| r.ready != ready)
+        {
+            n.ready = Some(Readiness {
+                ready,
+                since_unix: Some(since),
+            });
+        }
+    }
+
+    /// Whether Node `n{pod}` currently reports `Ready=True` (or nothing).
+    pub fn node_ready(&self, pod: u32) -> bool {
+        self.inventory
+            .nodes
+            .get(&format!("n{pod}"))
+            .is_some_and(|n| n.ready.is_none_or(|r| r.ready))
     }
 
     /// Restart a crashed Pod with a new process (fresh lottery and fence).
@@ -365,6 +401,9 @@ impl ControlPlane {
         p.follower = Follower::default();
         p.lease_fresh_until = None;
         self.schedule(self.now, pod, Ev::Lottery(pod));
+        if !self.node_ready(pod) {
+            self.set_node_ready(pod, true);
+        }
     }
 
     /// Add a Node and its Pod (cluster growth).
@@ -430,10 +469,19 @@ impl ControlPlane {
                 | Ev::Contend(p)
                 | Ev::Follow(p)
                 | Ev::PrimaryRenew(p)
-                | Ev::Reconcile(p) => p,
+                | Ev::Reconcile(p)
+                | Ev::NodeNotReady(p) => p,
             };
             let p = &self.pods[pod as usize];
-            if !p.alive || p.epoch != epoch {
+            if p.epoch != epoch {
+                continue;
+            }
+            if let Ev::NodeNotReady(p) = ev {
+                // Fires for a dead Pod; a restart bumped the epoch.
+                self.set_node_ready(p, false);
+                continue;
+            }
+            if !p.alive {
                 continue;
             }
             match ev {
@@ -444,6 +492,7 @@ impl ControlPlane {
                 Ev::Follow(p) => self.follow(p),
                 Ev::PrimaryRenew(p) => self.primary_renew(p),
                 Ev::Reconcile(p) => self.reconcile(p),
+                Ev::NodeNotReady(_) => {}
             }
             self.check_primaries();
         }
@@ -915,6 +964,55 @@ mod tests {
         let t = cp.now_ns();
         cp.advance_to(t + 60_000_000_000);
         assert!(cp.approximate_bytes() > 0);
+    }
+
+    fn members(cp: &ControlPlane) -> usize {
+        cp.image().map_or(0, |i| i.publication.members.len())
+    }
+
+    #[test]
+    fn crashed_node_leaves_membership_after_grace_and_returns() {
+        const S: u64 = 1_000_000_000;
+        let mut cp = run(30, 240, 5);
+        assert_eq!(members(&cp), 30);
+        let mv = cp.record().unwrap().membership_version;
+        let victim = (0..30).find(|p| Some(*p) != cp.primary_pod()).unwrap();
+        cp.crash(victim);
+        let t = cp.now_ns();
+        // Before the node monitor grace plus the readiness grace: kept.
+        cp.advance_to(t + 39 * S);
+        assert!(cp.node_ready(victim));
+        cp.advance_to(t + 41 * S);
+        assert!(!cp.node_ready(victim));
+        cp.advance_to(t + 65 * S);
+        assert_eq!(members(&cp), 30, "dropped inside the grace");
+        assert_eq!(cp.record().unwrap().membership_version, mv);
+        // One pass period after both graces: gone, in one version.
+        cp.advance_to(t + 85 * S);
+        assert_eq!(members(&cp), 29);
+        assert_eq!(cp.record().unwrap().membership_version, mv + 1);
+        cp.restart(victim);
+        assert!(cp.node_ready(victim));
+        let t = cp.now_ns();
+        cp.advance_to(t + 15 * S);
+        assert_eq!(members(&cp), 30);
+        assert_eq!(cp.record().unwrap().membership_version, mv + 2);
+    }
+
+    #[test]
+    fn quick_restart_keeps_membership() {
+        const S: u64 = 1_000_000_000;
+        let mut cp = run(30, 240, 5);
+        let mv = cp.record().unwrap().membership_version;
+        let victim = (0..30).find(|p| Some(*p) != cp.primary_pod()).unwrap();
+        cp.crash(victim);
+        let t = cp.now_ns();
+        cp.advance_to(t + 30 * S);
+        cp.restart(victim);
+        cp.advance_to(t + 200 * S);
+        assert!(cp.node_ready(victim));
+        assert_eq!(members(&cp), 30);
+        assert_eq!(cp.record().unwrap().membership_version, mv);
     }
 
     #[test]

@@ -438,6 +438,25 @@ mod tests {
         assert!(counter(&r, "reads_completed") > 0);
     }
 
+    /// Known issue 7: the Pod crashed for good at `d / 2 + 5 s` leaves the
+    /// membership once its Node has been not ready for the grace, so peers
+    /// stop choosing it. Before round 4 they chose it until the end.
+    #[test]
+    fn failover_drops_the_dead_member() {
+        let r = quick("full-failover", 200, 300, 1, 0.2);
+        assert_clean(&r);
+        let age = &r["metrics"]["histograms"]["dead_member_link_age_s"];
+        assert!(counter(&r, "dead_member_links") > 0, "{}", r["metrics"]);
+        // Node monitor grace 40 s, readiness grace 30 s, one 10 s pass,
+        // plus client propagation.
+        assert!(age["max"].as_u64().unwrap() <= 90, "{age}");
+        assert!(
+            ctl_counter(&r, "ctl_commits") > 0 && counter(&r, "membership_publications") >= 2,
+            "{}",
+            r["metrics"]["counters"]
+        );
+    }
+
     #[test]
     fn churn_grows_the_data_plane() {
         let r = quick("full-churn", 320, 400, 1, 0.1);
