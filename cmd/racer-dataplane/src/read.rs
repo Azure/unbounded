@@ -16,6 +16,7 @@ use crate::model::ByteRange;
 use crate::model::MetadataSelector;
 use crate::model::ObjectId;
 use crate::model::ObjectMetadata;
+use crate::model::PAGE_BYTES;
 use crate::model::ResolvedRange;
 use crate::peer::forwarding::VerifiedRequest;
 use crate::peer::protocol::FetchMode;
@@ -36,6 +37,7 @@ pub mod fill;
 pub mod flight;
 pub mod metadata;
 pub mod range_stream;
+pub mod sealed;
 pub mod warm;
 
 /// Metadata and its optional stream, with no independent range to disagree with it.
@@ -169,7 +171,9 @@ impl Coordinator {
                 retain,
             } = request;
             let selector = match &kind {
-                ReadKind::Subscription { pin, .. } => pin
+                ReadKind::Subscription { pin, .. }
+                | ReadKind::HostRead { pin, .. }
+                | ReadKind::GpuRead { pin, .. } => pin
                     .clone()
                     .map_or(MetadataSelector::Fresh, MetadataSelector::Pinned),
                 ReadKind::Head => MetadataSelector::Fresh,
@@ -185,6 +189,21 @@ impl Coordinator {
                 )
                 .await?;
             validate_metadata(&metadata, &origin.object, &selector)?;
+            // Direct reads have no client credits. The dataplane paces them
+            // with its own window, at least `range_window_pages`, and releases
+            // each page after writing it.
+            let direct_window = crate::client::DIRECT_WINDOW_PAGES.max(self.streams.window_pages());
+            let kind = match kind {
+                ReadKind::HostRead { range, .. } | ReadKind::GpuRead { range, .. } => {
+                    ReadKind::Subscription {
+                        pin: None,
+                        range,
+                        page_credits: direct_window,
+                        byte_credits: direct_window as u64 * PAGE_BYTES,
+                    }
+                }
+                kind => kind,
+            };
             match kind {
                 ReadKind::Subscription {
                     range,
@@ -244,6 +263,8 @@ impl Coordinator {
                         retain_until,
                     })
                 }
+                // Mapped to Subscription above.
+                ReadKind::HostRead { .. } | ReadKind::GpuRead { .. } => Err(Error::Internal),
             }
         })
     }

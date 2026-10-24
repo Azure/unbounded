@@ -153,7 +153,7 @@ impl PageCipher {
     }
 
     /// Derive the per-nonce AES-256-GCM key Kx from the first 12 nonce bytes.
-    fn derive(&self, nonce: &[u8; 24]) -> Result<ring::aead::LessSafeKey, Error> {
+    fn derive_key(&self, nonce: &[u8; 24]) -> Result<Zeroizing<[u8; 32]>, Error> {
         use aes::cipher::BlockCipherEncrypt;
         let mut kx = Zeroizing::new([0u8; 32]);
         for (index, half) in kx.chunks_exact_mut(16).enumerate() {
@@ -166,6 +166,11 @@ impl PageCipher {
             self.aes
                 .encrypt_block(half.try_into().map_err(|_| Error(()))?);
         }
+        Ok(kx)
+    }
+
+    fn derive(&self, nonce: &[u8; 24]) -> Result<ring::aead::LessSafeKey, Error> {
+        let kx = self.derive_key(nonce)?;
         let key = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &kx[..])
             .map_err(|_| Error(()))?;
         Ok(ring::aead::LessSafeKey::new(key))
@@ -318,6 +323,45 @@ where
     cipher
         .decrypt_inout_detached(nonce.into(), aad, buffer, &tag)
         .map_err(|_| Error(()))
+}
+
+/// The AES-256-GCM key and 96-bit nonce that XAES-256-GCM uses for one
+/// 24-byte nonce. Lets a page be decrypted by a plain AES-256-GCM
+/// implementation, such as the GPU kernels. The key is wiped on drop.
+/// Intentionally does not implement Debug or Clone.
+pub struct DerivedPageKey {
+    key: Zeroizing<[u8; 32]>,
+
+    nonce: [u8; 12],
+}
+
+impl DerivedPageKey {
+    /// The derived AES-256 key. Callers must not persist it.
+    pub fn key(&self) -> &[u8; 32] {
+        &self.key
+    }
+
+    /// The 12-byte AES-GCM nonce: the last 12 bytes of the XAES nonce.
+    pub fn nonce(&self) -> &[u8; 12] {
+        &self.nonce
+    }
+}
+
+/// Derive the AES-256-GCM key and nonce XAES-256-GCM uses for `nonce`, as
+/// specified at <https://c2sp.org/XAES-256-GCM>:
+/// `L = AES-256(K, 0^128)`, `K1 = L << 1` (xor `0x87` on carry), and the key is
+/// `AES-256(K, [0,1,'X',0] || N[..12] ^ K1) || AES-256(K, [0,2,'X',0] || N[..12] ^ K1)`.
+/// Shares the derivation [`seal`] and [`open`] use, so the result matches them
+/// and `xaes_256_gcm::Xaes256Gcm` 0.1 byte for byte (see the tests).
+pub fn xaes_derive(key: &[u8; 32], nonce: &[u8; 24]) -> DerivedPageKey {
+    let derived = PageCipher::new(key)
+        .derive_key(nonce)
+        .expect("16-byte halves always convert to AES blocks");
+    let gcm_nonce: [u8; 12] = std::array::from_fn(|i| nonce[12 + i]);
+    DerivedPageKey {
+        key: derived,
+        nonce: gcm_nonce,
+    }
 }
 
 /// Seal the unchanged XChaCha20-Poly1305 credential format, not the page format.
@@ -1082,6 +1126,20 @@ pub mod identity {
                 .page_cipher
                 .open_in_place(nonce, aad, inout, tag)
                 .map_err(|_| Error::CorruptRecord)
+        }
+
+        /// Derive the per-page AES-256-GCM key and nonce for offloaded page
+        /// decryption (the GPU path). Checks cache, key ID and purpose like
+        /// [`Self::open_page`]. Never exposes the epoch key itself; the
+        /// derived key is valid for this one XAES nonce and wiped on drop.
+        pub fn derive_page_subkey(
+            &self,
+            cache: &CacheId,
+            id: KeyId,
+            nonce: &[u8; 24],
+        ) -> Result<crate::DerivedPageKey> {
+            let material = self.bound_material(cache, id, KeyPurpose::Page)?;
+            Ok(crate::xaes_derive(material, nonce))
         }
 
         /// Seal credentials using only a credential epoch. Caller owns nonce and AAD.

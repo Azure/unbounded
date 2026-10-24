@@ -22,7 +22,7 @@ use crate::{
     ffi::{
         Access, MemoryWindow, NativeDevice, NativeQueuePair, NativeRegion, WorkCompletion, opcode,
     },
-    pool::{Buffer, BufferState, Pool, RegisteredPage},
+    pool::{Buffer, BufferState, DevicePage, Pool, RegisteredPage},
 };
 
 /// A link not `Ready` this long after creation breaks.
@@ -62,6 +62,10 @@ pub enum Arrival {
     /// Write with immediate observed and the window invalidated. Exclusive
     /// CPU access.
     Page(RegisteredPage),
+
+    /// Like [`Self::Page`], for a grant made with [`crate::Client::grant_device`]:
+    /// the bytes are in device memory and the CPU never touched them.
+    Device(DevicePage),
 
     /// The peer sent `Release`. The buffer is already back in the pool.
     Released,
@@ -383,6 +387,9 @@ pub(crate) struct Link {
 
     windows: Vec<Rc<MemoryWindow>>,
 
+    /// The device, for windows over a device pool, made on first use.
+    device: Rc<NativeDevice>,
+
     control: Rc<NativeRegion>,
 
     epoch: Epoch,
@@ -413,6 +420,10 @@ pub(crate) struct Link {
     next_tag: u32,
 
     free_windows: Vec<usize>,
+
+    /// Free windows tied to the device pool. A window stays tied to the
+    /// first region it binds, so device grants never reuse host windows.
+    free_device_windows: Vec<usize>,
 
     free_slots: Vec<u32>,
 
@@ -491,6 +502,8 @@ impl Link {
             qp,
             free_windows: (0..windows.len()).rev().collect(),
             windows,
+            device: device.clone(),
+            free_device_windows: Vec::new(),
             control,
             epoch,
             role,
@@ -603,10 +616,15 @@ impl Link {
     }
 
     /// Bind a window over a free buffer and queue a `Grant`. `done` gets the
-    /// tag and arrival op once the `Grant` is posted.
+    /// tag and arrival op once the `Grant` is posted. With `device`, the
+    /// buffer comes from the device pool and the arrival is
+    /// [`Arrival::Device`]: fails with [`Error::Unavailable`] if the rail has
+    /// no device pool and [`Error::Overloaded`] if none is free.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn grant(
         &mut self,
         pool: &Pool,
+        device: bool,
         transfer: [u8; 16],
         length: u32,
         deadline: Instant,
@@ -628,12 +646,42 @@ impl Link {
             return;
         }
 
-        let Some(buffer) = pool.take(BufferState::Binding) else {
+        if device && pool.device_shared().is_none() {
+            let _ = done.complete(Err(Error::Unavailable));
+            return;
+        }
+
+        let window = if device {
+            match self.free_device_windows.pop() {
+                Some(window) => window,
+                None => match MemoryWindow::new(&self.device) {
+                    // At most one device window per concurrent grant, so
+                    // device windows never exceed the grant cap.
+                    Ok(window) => {
+                        self.windows.push(window);
+                        self.windows.len() - 1
+                    }
+                    Err(error) => {
+                        let _ = done.complete(Err(error));
+                        return;
+                    }
+                },
+            }
+        } else {
+            self.free_windows.pop().expect("a window per grant")
+        };
+
+        let taken = if device {
+            pool.take_device(BufferState::Binding)
+        } else {
+            pool.take(BufferState::Binding)
+        };
+        let Some(buffer) = taken else {
+            self.free_window(device, window);
             let _ = done.complete(Err(Error::Overloaded));
             return;
         };
 
-        let window = self.free_windows.pop().expect("a window per grant");
         let tag = self.allocate_tag();
         self.last_used = now;
         self.grants.insert(
@@ -651,6 +699,15 @@ impl Link {
             },
         );
         self.outbox.push_back(Outgoing::Bind(tag));
+    }
+
+    /// Return `window` to its free list.
+    fn free_window(&mut self, device: bool, window: usize) {
+        if device {
+            self.free_device_windows.push(window);
+        } else {
+            self.free_windows.push(window);
+        }
     }
 
     /// Next nonzero tag not in use.
@@ -880,22 +937,27 @@ impl Link {
             }
             InFlight::Invalidate(tag) => {
                 let mut entry = self.grants.remove(&tag).ok_or(Break::Error)?;
-                self.free_windows.push(entry.window);
                 let buffer = entry.buffer.take().ok_or(Break::Error)?;
+                self.free_window(buffer.is_device(), entry.window);
                 let GrantState::Invalidating(outcome) = entry.state else {
                     return Err(Break::Error);
                 };
 
                 match outcome {
                     Outcome::Written(len) => {
-                        let page = pool.own(buffer, len as usize).map_err(|buffer| {
+                        let page = if buffer.is_device() {
+                            pool.own_device(buffer, len as usize).map(Arrival::Device)
+                        } else {
+                            pool.own(buffer, len as usize).map(Arrival::Page)
+                        }
+                        .map_err(|buffer| {
                             self.quarantine.push(buffer);
                             Break::Error
                         })?;
 
                         if let Some(arrival) = entry.arrival.take() {
                             // A dropped op hands the page back; dropping it frees the buffer.
-                            let _ = arrival.complete(Ok(Arrival::Page(page)));
+                            let _ = arrival.complete(Ok(page));
                         }
                     }
                     Outcome::Released => {
@@ -1172,7 +1234,7 @@ impl Link {
                 let key = self.qp.bind_window(
                     wr(BIND, tag),
                     &self.windows[entry.window],
-                    pool.region(),
+                    pool.region_of(buffer),
                     pool.offset(buffer),
                     entry.length,
                 )?;
@@ -1229,7 +1291,7 @@ impl Link {
                 let message = ControlKind::Grant {
                     tag,
                     rkey: entry.key,
-                    addr: pool.region().address() + pool.offset(buffer),
+                    addr: pool.region_of(buffer).address() + pool.offset(buffer),
                     length: entry.length,
                     transfer_id: entry.transfer,
                 };

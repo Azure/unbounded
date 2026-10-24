@@ -3,7 +3,7 @@
 //! Only the native thread uses these. Each type owns one RDMA object and frees
 //! it on drop. If freeing fails, the object is leaked on purpose, along with
 //! everything it depends on, because the NIC may still be using it.
-use crate::{Error, GuardOwner, Result};
+use crate::{DeviceMemory, Error, GuardOwner, Result};
 
 use std::{
     cell::{Cell, RefCell},
@@ -109,8 +109,8 @@ struct Completion {
 const WC_IMM: u32 = 1;
 
 /// Native adapter ABI version this crate speaks.
-#[cfg(all(feature = "native", target_os = "linux"))]
-const ABI_VERSION: u32 = 4;
+#[cfg(any(test, all(feature = "native", target_os = "linux")))]
+const ABI_VERSION: u32 = 5;
 
 /// Completion opcodes (`enum ibv_wc_opcode`), pinned by C static asserts.
 pub(crate) mod opcode {
@@ -165,6 +165,10 @@ impl Access {
     /// Marks an implicit ODP region from `rdma_verbs_register_implicit`.
     /// Never passed to `rdma_verbs_register`; only a local write source.
     pub(crate) const IMPLICIT: Self = Self(8);
+
+    /// Marks a dma-buf page region from `rdma_verbs_register_dmabuf`. Never
+    /// passed to `rdma_verbs_register`; peers write it through windows only.
+    pub(crate) const DEVICE: Self = Self(1 | 16);
 
     /// The raw ABI value.
     pub(crate) fn bits(self) -> u32 {
@@ -256,6 +260,8 @@ native_api! {
     register: unsafe extern "C" fn(*mut c_void, u64, u32) -> *mut c_void,
 
     register_implicit: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+
+    register_dmabuf: unsafe extern "C" fn(*mut c_void, u64, u64, u64, c_int) -> *mut c_void,
 
     deregister: unsafe extern "C" fn(*mut c_void) -> c_int,
 
@@ -489,10 +495,17 @@ fn discover_with_api(
 ///
 /// Posts do not track which ranges the NIC may touch; their caller must.
 /// Holds the node's guard and leaks it if deregister fails.
+///
+/// A dma-buf region (`memory` is set) has no CPU mapping. It can only be
+/// bound to windows for receives; sends, writes, and receives reject it.
 pub(crate) struct NativeRegion {
     device: Rc<NativeDevice>,
 
     raw: NonNull<c_void>,
+
+    /// The dma-buf owner. Kept alive while registered, and leaked with the
+    /// region if deregister fails.
+    memory: Option<DeviceMemory>,
 
     /// Allocated size.
     length: usize,
@@ -520,10 +533,54 @@ impl NativeRegion {
         Ok(Rc::new(Self {
             device,
             raw,
+            memory: None,
             length,
             quota: Some(quota),
             access,
         }))
+    }
+
+    /// Register all of `memory`'s dma-buf range as page buffers. `memory`
+    /// stays alive until deregister succeeds, or forever if it fails.
+    pub(crate) fn dmabuf(
+        device: Rc<NativeDevice>,
+        memory: DeviceMemory,
+        quota: Arc<GuardOwner>,
+    ) -> Result<Rc<Self>> {
+        use std::os::fd::AsRawFd;
+
+        let length = memory.length();
+        if length == 0 || u64::try_from(length).is_err() {
+            return Err(Error::InvalidRange);
+        }
+        let raw = NonNull::new(unsafe {
+            (device.api.register_dmabuf)(
+                device.raw.as_ptr(),
+                memory.offset(),
+                length as u64,
+                memory.iova(),
+                memory.fd().as_raw_fd(),
+            )
+        })
+        .ok_or(Error::Unavailable)?;
+        Ok(Rc::new(Self {
+            device,
+            raw,
+            memory: Some(memory),
+            length,
+            quota: Some(quota),
+            access: Access::DEVICE,
+        }))
+    }
+
+    /// The dma-buf owner, if this is a dma-buf region.
+    pub(crate) fn memory(&self) -> Option<&DeviceMemory> {
+        self.memory.as_ref()
+    }
+
+    /// True for a dma-buf region from [`Self::dmabuf`].
+    pub(crate) fn is_device(&self) -> bool {
+        self.memory.is_some()
     }
 
     /// Register the whole process address space as one implicit on-demand
@@ -538,6 +595,7 @@ impl NativeRegion {
         Some(Rc::new(Self {
             device,
             raw,
+            memory: None,
             length: usize::MAX,
             quota: Some(quota),
             access: Access::IMPLICIT,
@@ -552,7 +610,11 @@ impl NativeRegion {
     /// The start of the registered buffer, valid while `self` lives.
     ///
     /// The caller must not read or write any range the NIC may still access.
+    /// Null for a dma-buf region.
     pub(crate) fn as_ptr(&self) -> *mut u8 {
+        if self.is_device() {
+            return std::ptr::null_mut();
+        }
         unsafe { (self.device.api.bytes)(self.raw.as_ptr()) }
     }
 
@@ -566,6 +628,9 @@ impl NativeRegion {
 
     /// The address peers use to write here.
     pub(crate) fn address(&self) -> u64 {
+        if let Some(memory) = &self.memory {
+            return memory.iova();
+        }
         #[cfg(any(test, feature = "simulation"))]
         if simulation::is_api(&self.device.api) {
             return simulation::address(self.raw);
@@ -580,10 +645,11 @@ impl NativeRegion {
 }
 
 impl Drop for NativeRegion {
-    /// Deregister. On failure, leak the device and guard.
+    /// Deregister. On failure, leak the device, guard, and dma-buf owner.
     fn drop(&mut self) {
         if unsafe { (self.device.api.deregister)(self.raw.as_ptr()) } != 0 {
             std::mem::forget(self.device.clone());
+            std::mem::forget(self.memory.take());
             self.quota.as_ref().unwrap().quarantine();
             std::mem::forget(self.quota.take());
         }
@@ -945,6 +1011,7 @@ impl NativeQueuePair {
         post: impl FnOnce() -> c_int,
     ) -> Result<()> {
         if (region.is_implicit() && (recv || opcode != opcode::RDMA_WRITE))
+            || (region.is_device() && !matches!(opcode, opcode::BIND_MW | opcode::LOCAL_INV))
             || !Rc::ptr_eq(&region.device, &self.device)
             || !region.contains(offset, length)
             || self.pending.borrow().contains_key(&id)
@@ -1196,6 +1263,20 @@ mod tests {
     }
 
     #[test]
+    /// The C adapter reports the ABI version Rust requires and exports the
+    /// dma-buf registration with the signature Rust calls.
+    fn c_adapter_abi_version_and_dmabuf_signature_match() {
+        let source = include_str!("../native/verbs.c");
+        assert!(source.contains(&format!(
+            "uint32_t rdma_verbs_abi(void) {{ return {ABI_VERSION}; }}"
+        )));
+        assert!(source.contains(
+            "void *rdma_verbs_register_dmabuf(struct rdma_verbs_device *d, uint64_t offset, \
+             uint64_t length,\n                                 uint64_t iova, int fd)"
+        ));
+    }
+
+    #[test]
     /// Reject queue pair numbers outside the native 24-bit field.
     fn endpoint_rejects_invalid_native_parameters() {
         let mut e = Endpoint {
@@ -1287,6 +1368,17 @@ pub(crate) mod lifetime_tests {
 
     /// The fixture device has no implicit ODP.
     unsafe extern "C" fn register_implicit(_: *mut c_void) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+
+    /// The fixture device has no dma-buf support.
+    unsafe extern "C" fn register_dmabuf(
+        _: *mut c_void,
+        _: u64,
+        _: u64,
+        _: u64,
+        _: c_int,
+    ) -> *mut c_void {
         std::ptr::null_mut()
     }
 
@@ -1452,6 +1544,7 @@ pub(crate) mod lifetime_tests {
             qp_free,
             register,
             register_implicit,
+            register_dmabuf,
             deregister,
             bytes,
             window,

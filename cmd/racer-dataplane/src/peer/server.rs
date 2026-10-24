@@ -519,6 +519,10 @@ impl PeerServer {
                             return result;
                         }
                         Ok((super::transport::RelayResponse::Complete(response), _)) => response,
+                        // A relay never asks for landing.
+                        Ok((super::transport::RelayResponse::Landed(_), _)) => {
+                            return Err(Error::Internal);
+                        }
                         Err(Error::Overloaded) => self
                             .forwarding
                             .sign_response(&binding, PeerResponse::Overloaded)?,

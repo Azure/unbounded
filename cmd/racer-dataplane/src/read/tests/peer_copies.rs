@@ -2970,3 +2970,245 @@ fn registered_copy_out_refused_by_admission_keeps_the_registered_page() {
     crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
     assert_eq!(free_buffers(&w), Some(2));
 }
+
+/// GPU landing for `gpu-read` (GPUDirect RDMA) through `Fill::acquire_sealed`.
+mod landing {
+    use super::*;
+    use crate::gpu::GpuHelper;
+    use crate::read::sealed::Fetched;
+    use crate::read::sealed::SealedSource;
+    use crate::read::sealed::SealedTarget;
+
+    struct Landing {
+        f: Fixture,
+        peers: Rc<ScriptedPeers>,
+        ordered: Vec<NodeId>,
+        helper: Arc<GpuHelper>,
+        copy: CiphertextCopy,
+        /// Requests the landing script saw.
+        asked: Rc<Cell<usize>>,
+    }
+
+    /// A non-owner whose first provider may land page 0 on GPU `ordinal`.
+    /// With `lands`, the script answers with the real ciphertext written into
+    /// the landing buffer, as a NIC would; otherwise the request goes to the
+    /// usual peer script.
+    fn landing(ordinal: i32, lands: bool) -> Landing {
+        let mut f = fixture();
+        let copy = encrypted_copy(&mut f);
+        let (peers, ordered) = install_peers(&mut f, None);
+        let helper = crate::gpu::testing::helper(&[None, None]);
+        let buffer = crate::gpu::testing::landing(&helper, 0, 2 * crate::gpu::SLOT_BYTES).unwrap();
+        crate::gpu::testing::nic_write(&buffer, 0, copy.ciphertext.bytes());
+        let asked = Rc::new(Cell::new(0));
+        let envelope = copy.ciphertext.envelope().clone();
+        let metadata = copy.metadata.clone();
+        let length = copy.ciphertext.bytes().len() as u64;
+        let seen = asked.clone();
+        let land: crate::peer::ScriptedLanding = Box::new(move |request| {
+            seen.set(seen.get() + 1);
+            assert!(matches!(
+                request.operation,
+                PeerOperation::Page {
+                    mode: FetchMode::CopyOnly,
+                    ..
+                }
+            ));
+            if !lands {
+                return None;
+            }
+            Some(crate::peer::transport::LandedResponse {
+                // The fill path never reads the head: the transport verified it.
+                authentication: crate::peer::forwarding::ForwardedHead {
+                    original: Arc::new(peer_wire::SignedHead {
+                        head: http1::MessageHead {
+                            start: http1::StartLine::Request {
+                                method: "POST".into(),
+                                target: "/test".into(),
+                            },
+                            headers: vec![],
+                        },
+                        signature: vec![],
+                    }),
+                    hops: vec![],
+                },
+                metadata: metadata.clone(),
+                envelope: envelope.clone(),
+                landed: crate::gpu::LandedCiphertext::for_test(&buffer, 0, length),
+            })
+        });
+        let mut dependencies = f.fill.dependencies.clone();
+        dependencies.candidates = Rc::new(CandidatePolicy::new(
+            node(peers.local),
+            Rc::new(Placement::new(16)),
+            Requester::scripted(
+                peers.clone(),
+                ScriptedPeers::direct_hedge_available,
+                ScriptedPeers::request,
+                ScriptedPeers::request_direct,
+            )
+            .with_scripted_landing(ordinal, land),
+            dependencies.credentials.clone(),
+            Arc::new(controlplane::Published::new(
+                crate::control::Snapshot::retention(2),
+            )),
+        ));
+        f.fill = Fill::new(dependencies);
+        f.fill
+            .dependencies
+            .writer
+            .retention()
+            .set_ownership(Rc::new(|_| false));
+        Landing {
+            f,
+            peers,
+            ordered,
+            helper,
+            copy,
+            asked,
+        }
+    }
+
+    fn acquire_sealed(l: &mut Landing) -> Result<Fetched> {
+        let target = SealedTarget {
+            helper: l.helper.clone(),
+            ordinal: 0,
+        };
+        let mut budget = AcquisitionBudget::new(l.f.scope.deadline.0, 16, 32);
+        let f = &mut l.f;
+        drive(
+            f.fill.acquire_sealed(
+                f.page.clone(),
+                f.membership.clone(),
+                &f.context,
+                &f.scope,
+                &mut budget,
+                &target,
+            ),
+            &mut f.engine,
+            &f.crypto,
+        )
+    }
+
+    fn landed_count(helper: &GpuHelper) -> u64 {
+        helper
+            .counters()
+            .landed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[test]
+    /// A landed page decrypts on the GPU and is private to this read: no
+    /// CPU decrypt, no memory publication, no persistence, no host
+    /// ciphertext charge, and a later plain read fetches it again.
+    fn landed_peer_page_decrypts_on_the_gpu_and_stays_private() {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let _owner = queue.enter();
+        let mut l = landing(0, true);
+        let ciphertext =
+            l.f.fill
+                .dependencies
+                .admission
+                .used(ResourceClass::Ciphertext);
+        let Fetched::Sealed(sealed) = acquire_sealed(&mut l).unwrap() else {
+            panic!("expected a sealed page");
+        };
+        assert!(matches!(sealed.source, SealedSource::Landed(_)));
+        assert!(sealed.expected_crc.is_none());
+        // One landing request to the first provider, none through the script.
+        assert_eq!(l.asked.get(), 1);
+        assert!(l.peers.calls.borrow().is_empty());
+        assert_unpublished(&l.f);
+        assert_eq!(
+            l.f.fill
+                .dependencies
+                .admission
+                .used(ResourceClass::Ciphertext),
+            ciphertext
+        );
+        let report = sealed.report();
+        assert!(report.copy.is_none() && report.token.is_none());
+        let fd = crate::gpu::testing::import(&l.helper, 1, 0);
+        crate::gpu::testing::write(&l.helper, 1, sealed, 0..3).unwrap();
+        assert_eq!(racer_gpu::simulation::read_allocation(&fd, 0, 3), b"abc");
+        assert_eq!(landed_count(&l.helper), 1);
+        // A passed verdict persists nothing: there is no host copy.
+        l.f.fill.sealed_verdict(report, true);
+        assert_unpublished(&l.f);
+        // Nothing was shared: a later plain read fetches the page again.
+        let deadline = l.f.scope.deadline.0;
+        l.peers
+            .replies
+            .borrow_mut()
+            .push_back((l.ordered[0].clone(), Reply::Copy(l.copy.clone())));
+        let result = acquire(&mut l.f, &mut AcquisitionBudget::new(deadline, 16, 32)).unwrap();
+        assert_eq!(result.plaintext.bytes(), b"abc");
+        assert_eq!(l.peers.calls.borrow().len(), 1);
+        drop(fd);
+        assert_eq!(l.helper.leaked(), 0);
+    }
+
+    #[test]
+    /// No free landing slot at this node: the provider sends the page to
+    /// host memory, and that answer is used once rather than fetched again.
+    fn host_answer_to_a_landing_request_is_used_once_and_not_published() {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let _owner = queue.enter();
+        let mut l = landing(0, false);
+        l.peers
+            .replies
+            .borrow_mut()
+            .push_back((l.ordered[0].clone(), Reply::Copy(l.copy.clone())));
+        let Fetched::Sealed(sealed) = acquire_sealed(&mut l).unwrap() else {
+            panic!("expected a sealed page");
+        };
+        assert!(matches!(sealed.source, SealedSource::Host(_)));
+        assert_eq!(l.asked.get(), 1);
+        assert_eq!(l.peers.calls.borrow().len(), 1, "not fetched twice");
+        assert!(
+            l.f.fill
+                .dependencies
+                .memory
+                .get(&l.f.page)
+                .unwrap()
+                .is_none()
+        );
+        let fd = crate::gpu::testing::import(&l.helper, 1, 0);
+        crate::gpu::testing::write(&l.helper, 1, sealed, 0..3).unwrap();
+        assert_eq!(racer_gpu::simulation::read_allocation(&fd, 0, 3), b"abc");
+        assert_eq!(landed_count(&l.helper), 0);
+    }
+
+    #[test]
+    /// A landing buffer on another GPU is never used, and a failed landing
+    /// request falls back to the usual acquisition.
+    fn landing_falls_back_to_the_usual_path() {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let _owner = queue.enter();
+        let mut l = landing(1, true);
+        l.peers
+            .replies
+            .borrow_mut()
+            .push_back((l.ordered[0].clone(), Reply::Copy(l.copy.clone())));
+        let fetched = acquire_sealed(&mut l).unwrap();
+        assert!(!matches!(
+            fetched,
+            Fetched::Sealed(ref sealed) if matches!(sealed.source, SealedSource::Landed(_))
+        ));
+        assert_eq!(l.asked.get(), 0);
+        assert_eq!(l.peers.calls.borrow().len(), 1);
+        let mut l = landing(0, false);
+        {
+            let mut replies = l.peers.replies.borrow_mut();
+            replies.push_back((l.ordered[0].clone(), Reply::Unauthorized));
+            for node in &l.ordered {
+                replies.push_back((node.clone(), Reply::Copy(l.copy.clone())));
+            }
+        }
+        let fetched = acquire_sealed(&mut l);
+        assert!(fetched.is_ok(), "{:?}", fetched.err());
+        assert_eq!(l.asked.get(), 1);
+        assert!(l.peers.calls.borrow().len() >= 2);
+        assert_eq!(landed_count(&l.helper), 0);
+    }
+}

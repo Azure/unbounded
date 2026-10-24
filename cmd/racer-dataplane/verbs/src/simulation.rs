@@ -16,6 +16,11 @@
 //! 5. Check what happened with [`Simulation::trace`].
 //!
 //! Addresses seen on the wire are fake; they are never host pointers.
+//! A dma-buf region maps the given descriptor, so a memfd from
+//! [`MemfdMemory`] stands in for GPU memory. Its wire address is the iova.
+//! Like the C adapter, sends, writes, and receives that name a dma-buf region
+//! are rejected, and [`Operation::RegisterDmabuf`] traces and faults its
+//! registration.
 //! Device names must be unique within a discovery view, even for different ports.
 //! A remote QP must already exist in this fabric before its peer connects to it.
 //!
@@ -109,6 +114,8 @@ pub enum Operation {
     QpFree,
 
     Register,
+
+    RegisterDmabuf,
 
     Deregister,
 
@@ -225,7 +232,7 @@ enum Resource {
     Region {
         device: u32,
 
-        bytes: Box<[u8]>,
+        bytes: Memory,
 
         address: u64,
 
@@ -296,6 +303,10 @@ const MR_CONTROL: u32 = 2;
 
 /// `RDMA_VERBS_MR_REMOTE_WRITE`.
 const MR_REMOTE_WRITE: u32 = 4;
+
+/// A dma-buf region from `rdma_verbs_register_dmabuf`. Peers write through
+/// windows; never a send, write, or receive buffer.
+const MR_DEVICE: u32 = 16;
 
 /// An implicit on-demand paging region over this process's address space.
 /// Offsets are virtual addresses; it is only a local write or send source.
@@ -538,6 +549,7 @@ pub(super) fn api() -> Rc<Api> {
         qp_free,
         register,
         register_implicit,
+        register_dmabuf,
         deregister,
         bytes,
         window,
@@ -1370,7 +1382,7 @@ unsafe extern "C" fn register(device: *mut c_void, length: u64, access: u32) -> 
         &h.sim,
         Resource::Region {
             device: h.id,
-            bytes: vec![0; length as usize].into_boxed_slice(),
+            bytes: Memory::Host(vec![0; length as usize].into_boxed_slice()),
             address,
             access,
         },
@@ -1401,7 +1413,7 @@ unsafe extern "C" fn register_implicit(device: *mut c_void) -> *mut c_void {
         &h.sim,
         Resource::Region {
             device: h.id,
-            bytes: Box::default(),
+            bytes: Memory::Host(Box::default()),
             address: 0,
             access: MR_IMPLICIT,
         },
@@ -1413,13 +1425,213 @@ unsafe extern "C" fn register_implicit(device: *mut c_void) -> *mut c_void {
     raw
 }
 
-/// Pointer to a region's bytes. Valid until the region is freed.
+/// Map a dma-buf as a page region whose wire address is `iova`. Like C,
+/// `fd` is not kept: the mapping holds its own reference.
+unsafe extern "C" fn register_dmabuf(
+    device: *mut c_void,
+    offset: u64,
+    length: u64,
+    iova: u64,
+    fd: c_int,
+) -> *mut c_void {
+    let Some(h) = (unsafe { handle(device) }) else {
+        return std::ptr::null_mut();
+    };
+    let mut world = h.sim.world.borrow_mut();
+    if world.rejected(Operation::RegisterDmabuf, h.id) {
+        return std::ptr::null_mut();
+    }
+    let mapped = (length != 0 && fd >= 0 && usize::try_from(length).is_ok())
+        .then(|| map(fd, offset, length as usize))
+        .flatten();
+    let Some(pointer) = mapped else {
+        world.record(Operation::RegisterDmabuf, h.id, None, -1, false);
+        return std::ptr::null_mut();
+    };
+    drop(world);
+    let raw = allocate(
+        &h.sim,
+        Resource::Region {
+            device: h.id,
+            bytes: Memory::Mapped {
+                pointer,
+                length: length as usize,
+            },
+            address: iova,
+            access: MR_PAGES | MR_DEVICE,
+        },
+    );
+    h.sim
+        .world
+        .borrow_mut()
+        .record(Operation::RegisterDmabuf, h.id, None, 0, false);
+    raw
+}
+
+/// A region's bytes: owned host memory, or a shared mapping of a dma-buf.
+enum Memory {
+    Host(Box<[u8]>),
+
+    Mapped { pointer: NonNull<u8>, length: usize },
+}
+
+impl std::ops::Deref for Memory {
+    type Target = [u8];
+
+    /// The region's bytes.
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Host(bytes) => bytes,
+            // SAFETY: the mapping lives until this value drops.
+            Self::Mapped { pointer, length } => unsafe {
+                std::slice::from_raw_parts(pointer.as_ptr(), *length)
+            },
+        }
+    }
+}
+
+impl std::ops::DerefMut for Memory {
+    /// The region's bytes, writable.
+    fn deref_mut(&mut self) -> &mut [u8] {
+        match self {
+            Self::Host(bytes) => bytes,
+            // SAFETY: the mapping lives until this value drops.
+            Self::Mapped { pointer, length } => unsafe {
+                std::slice::from_raw_parts_mut(pointer.as_ptr(), *length)
+            },
+        }
+    }
+}
+
+impl Drop for Memory {
+    /// Unmap a dma-buf mapping. The owner's memory stays.
+    fn drop(&mut self) {
+        if let Self::Mapped { pointer, length } = self {
+            unsafe {
+                libc::munmap(pointer.as_ptr().cast(), *length);
+            }
+        }
+    }
+}
+
+/// Map `length` bytes of `fd` from `offset`, shared and writable.
+fn map(fd: c_int, offset: u64, length: usize) -> Option<NonNull<u8>> {
+    let offset = libc::off_t::try_from(offset).ok()?;
+    let pointer = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            length,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            offset,
+        )
+    };
+    if pointer == libc::MAP_FAILED {
+        return None;
+    }
+    NonNull::new(pointer.cast())
+}
+
+/// Host memory standing in for a GPU dma-buf: a memfd the simulation maps.
+///
+/// The simulated NIC writes through its own shared mapping, so
+/// [`Self::read`] sees exactly what a peer wrote.
+pub struct MemfdMemory {
+    fd: std::os::fd::OwnedFd,
+
+    view: NonNull<u8>,
+
+    length: usize,
+
+    iova: u64,
+}
+
+// SAFETY: the mapping is plain shared memory, valid for this value's lifetime.
+unsafe impl Send for MemfdMemory {}
+
+unsafe impl Sync for MemfdMemory {}
+
+impl MemfdMemory {
+    /// A zeroed memfd of `length` bytes that windows address from `iova`.
+    pub fn new(length: usize, iova: u64) -> std::io::Result<Arc<Self>> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        if length == 0 {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        let raw = unsafe { libc::memfd_create(c"rdma-verbs-sim".as_ptr(), libc::MFD_CLOEXEC) };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        if unsafe { libc::ftruncate(fd.as_raw_fd(), length as libc::off_t) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let view = map(fd.as_raw_fd(), 0, length).ok_or_else(std::io::Error::last_os_error)?;
+        Ok(Arc::new(Self {
+            fd,
+            view,
+            length,
+            iova,
+        }))
+    }
+
+    /// Copy `length` bytes at `offset` out, as a GPU kernel would read them.
+    pub fn read(&self, offset: usize, length: usize) -> Vec<u8> {
+        assert!(
+            offset
+                .checked_add(length)
+                .is_some_and(|end| end <= self.length)
+        );
+        unsafe { std::slice::from_raw_parts(self.view.as_ptr().add(offset), length) }.to_vec()
+    }
+}
+
+impl Drop for MemfdMemory {
+    /// Unmap this value's view. The memfd closes with `fd`.
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.view.as_ptr().cast(), self.length);
+        }
+    }
+}
+
+impl crate::DmabufMemory for MemfdMemory {
+    /// The memfd.
+    fn fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd;
+
+        self.fd.as_fd()
+    }
+
+    /// Always 0.
+    fn offset(&self) -> u64 {
+        0
+    }
+
+    /// The memfd size.
+    fn length(&self) -> usize {
+        self.length
+    }
+
+    /// The iova given to [`Self::new`].
+    fn iova(&self) -> u64 {
+        self.iova
+    }
+}
+
+/// Pointer to a host region's bytes. Valid until the region is freed. Null
+/// for an implicit or dma-buf region, like C.
 unsafe extern "C" fn bytes(raw: *mut c_void) -> *mut u8 {
     let Some(h) = (unsafe { handle(raw) }) else {
         return std::ptr::null_mut();
     };
     match h.sim.world.borrow_mut().resources.get_mut(&h.id) {
-        Some(Resource::Region { bytes, .. }) => bytes.as_mut_ptr(),
+        Some(Resource::Region {
+            bytes: Memory::Host(bytes),
+            ..
+        }) => bytes.as_mut_ptr(),
         _ => std::ptr::null_mut(),
     }
 }
@@ -1506,7 +1718,11 @@ unsafe fn qp_and_region<'a>(
     let (Some(q), Some(r)) = (unsafe { (handle(qp), handle(region)) }) else {
         return None;
     };
-    if !Rc::ptr_eq(&q.sim.world, &r.sim.world) {
+    let device = matches!(
+        r.sim.world.borrow().resources.get(&r.id),
+        Some(Resource::Region { access, .. }) if access & MR_DEVICE != 0
+    );
+    if device || !Rc::ptr_eq(&q.sim.world, &r.sim.world) {
         q.sim
             .world
             .borrow_mut()
@@ -2098,6 +2314,57 @@ mod tests {
         }
         assert_eq!(sim.live_resources(), 0);
         assert_eq!(foreign.live_resources(), 0);
+    }
+
+    #[test]
+    /// A dma-buf region has no CPU mapping and is never a send, write, or
+    /// receive buffer, in Rust or at the adapter: only windows reach it.
+    fn dmabuf_regions_reject_cpu_and_copy_paths() {
+        let sim = Simulation::new();
+        {
+            let link = link(&sim, |_| {});
+            let memory = MemfdMemory::new(8192, 0x5000_0000).unwrap();
+            let (quota, _) = lifetime_tests::quota();
+            let region =
+                NativeRegion::dmabuf(link.pages.device.clone(), memory.clone(), quota).unwrap();
+            assert!(region.is_device() && !region.is_implicit());
+            assert!(region.as_ptr().is_null());
+            assert_eq!(region.address(), 0x5000_0000);
+            assert_eq!(region.length(), 8192);
+            assert_eq!(
+                link.a.send(wr(1), &region, 0, 16),
+                Err(Error::InvalidRequest)
+            );
+            assert_eq!(
+                link.a.post_recv(wr(2), &region, 0, 16),
+                Err(Error::InvalidRequest)
+            );
+            assert_eq!(
+                link.a
+                    .write_imm(wr(3), &region, 0, 16, link.pages.address(), 1, 0),
+                Err(Error::InvalidRequest)
+            );
+            sim.take_trace();
+            let q = link.a.raw.as_ptr();
+            let qpn = link.a.endpoint.qpn;
+            unsafe {
+                assert!(bytes(region.raw.as_ptr()).is_null());
+                assert_eq!(send(q, region.raw.as_ptr(), 0, 16, 51), -1);
+                events(&sim, &[(Operation::Send, qpn, Some(51), -1, false)]);
+                assert_eq!(post_recv(q, region.raw.as_ptr(), 0, 16, 52), -1);
+                events(&sim, &[(Operation::PostRecv, qpn, Some(52), -1, false)]);
+                let target = link.pages.address();
+                assert_eq!(
+                    write_imm(q, region.raw.as_ptr(), 0, 16, target, 1, 0, 53),
+                    -1
+                );
+                events(&sim, &[(Operation::WriteImm, qpn, Some(53), -1, false)]);
+            }
+            drop(region);
+            assert_eq!(Arc::strong_count(&memory), 1, "deregister drops the owner");
+            stop_both(&link);
+        }
+        assert_eq!(sim.live_resources(), 0);
     }
 
     /// Two connected QPs on one device with explicit depths, a page region,

@@ -2,7 +2,7 @@
 
 use crate::model::{
     ByteRange, CacheKey, MAX_FIELD_BYTES, MAX_WIRE_INTEGER, ObjectMetadata, PAGE_BYTES,
-    ResolvedRange, StrongEtag,
+    ResolvedRange, StrongEtag, parse_decimal,
 };
 use crate::{Error, Result};
 use http1::{Header, MessageHead, StartLine, is_token, trim_ows};
@@ -28,6 +28,58 @@ pub enum ReadKind {
 
         byte_credits: u64,
     },
+    /// Write the plaintext into a client file instead of the socket.
+    HostRead {
+        pin: Option<StrongEtag>,
+
+        range: Option<ByteRange>,
+
+        destination: Destination,
+    },
+    /// Write the plaintext into a client GPU allocation.
+    GpuRead {
+        pin: Option<StrongEtag>,
+
+        range: Option<ByteRange>,
+
+        destination: Destination,
+
+        /// The size the client passed to `cuMemCreate`.
+        allocation_size: u64,
+    },
+}
+
+/// The client window `[offset, offset + length)` that a direct read may write.
+/// The parser guarantees `length > 0` and that the end fits in a wire integer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Destination {
+    pub offset: u64,
+
+    pub length: u64,
+}
+
+impl Destination {
+    /// Exclusive end of the window.
+    pub fn end(&self) -> u64 {
+        self.offset + self.length
+    }
+}
+
+/// Where a direct read puts the plaintext, sent as `Racer-Delivery`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectDelivery {
+    Host,
+    Gpu,
+}
+
+impl DirectDelivery {
+    /// The `Racer-Delivery` header value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Gpu => "gpu",
+        }
+    }
 }
 
 impl ReadKind {
@@ -40,7 +92,39 @@ impl ReadKind {
     pub fn pin(&self) -> Option<&StrongEtag> {
         match self {
             Self::HeadPinned { etag } => Some(etag),
-            Self::Subscription { pin, .. } => pin.as_ref(),
+            Self::Subscription { pin, .. }
+            | Self::HostRead { pin, .. }
+            | Self::GpuRead { pin, .. } => pin.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The requested range of a body read, if any.
+    pub fn range(&self) -> Option<ByteRange> {
+        match self {
+            Self::Subscription { range, .. }
+            | Self::HostRead { range, .. }
+            | Self::GpuRead { range, .. } => *range,
+            _ => None,
+        }
+    }
+
+    /// Whether this request writes into a client descriptor, not the socket.
+    /// Exactly these requests must carry one descriptor.
+    pub fn direct(&self) -> Option<DirectDelivery> {
+        match self {
+            Self::HostRead { .. } => Some(DirectDelivery::Host),
+            Self::GpuRead { .. } => Some(DirectDelivery::Gpu),
+            _ => None,
+        }
+    }
+
+    /// The destination window of a direct read.
+    pub fn destination(&self) -> Option<Destination> {
+        match self {
+            Self::HostRead { destination, .. } | Self::GpuRead { destination, .. } => {
+                Some(*destination)
+            }
             _ => None,
         }
     }
@@ -86,6 +170,19 @@ impl RequestParser {
             return Err(Error::InvalidRequest);
         };
         let mut decoded_bytes = method.len().saturating_add(target.len());
+        let path = target
+            .strip_prefix("/v1/objects/")
+            .ok_or(Error::InvalidRequest)?;
+        // Only the exact suffixes select a direct read; anything else keeps the
+        // plain object path and its existing key validation.
+        let (key_text, direct) = match path.split_once('/') {
+            Some((key, "host-read")) => (key, Some(DirectDelivery::Host)),
+            Some((key, "gpu-read")) => (key, Some(DirectDelivery::Gpu)),
+            _ => (path, None),
+        };
+        let mut destination_offset = None;
+        let mut destination_length = None;
+        let mut allocation_size = None;
         let mut seen = HashSet::new();
         let mut host = None;
         let mut pin = None;
@@ -165,8 +262,19 @@ impl RequestParser {
                     pin = Some(StrongEtag::parse(value)?);
                 }
                 "range" => range = Some(ByteRange::parse(value)?),
+                // Direct reads are paced by the dataplane and ignore credits.
+                "racer-page-credits" | "racer-byte-credits" if direct.is_some() => {}
                 "racer-page-credits" => page_credits = decimal(value, 1, 64)? as usize,
                 "racer-byte-credits" => byte_credits = decimal(value, PAGE_BYTES, 64 * PAGE_BYTES)?,
+                "racer-destination-offset" if direct.is_some() => {
+                    once(&mut destination_offset, parse_decimal(value)?)?;
+                }
+                "racer-destination-length" if direct.is_some() => {
+                    once(&mut destination_length, parse_decimal(value)?)?;
+                }
+                "racer-allocation-size" if direct == Some(DirectDelivery::Gpu) => {
+                    once(&mut allocation_size, parse_decimal(value)?)?;
+                }
                 "racer-metadata" => {
                     validate_opaque(value)?;
                     metadata = Some(value);
@@ -184,26 +292,56 @@ impl RequestParser {
         if host != Some(true) {
             return Err(Error::InvalidRequest);
         }
-        let key = CacheKey::parse_hex(
-            target
-                .strip_prefix("/v1/objects/")
-                .ok_or(Error::InvalidRequest)?
-                .as_bytes(),
-        )?;
-        let kind = match method.as_str() {
-            "HEAD" if range.is_none() => match pin {
-                Some(etag) => ReadKind::HeadPinned { etag },
-                None => ReadKind::Head,
+        let key = CacheKey::parse_hex(key_text.as_bytes())?;
+        let kind = match (method.as_str(), direct) {
+            ("POST", Some(_)) if !content_length => return Err(Error::InvalidRequest),
+            ("POST", Some(delivery)) => {
+                let destination = Destination {
+                    offset: destination_offset.ok_or(Error::InvalidRequest)?,
+                    length: destination_length
+                        .filter(|&length| length != 0)
+                        .ok_or(Error::InvalidRequest)?,
+                };
+                destination
+                    .offset
+                    .checked_add(destination.length)
+                    .filter(|&end| end <= MAX_WIRE_INTEGER)
+                    .ok_or(Error::InvalidRequest)?;
+                match delivery {
+                    DirectDelivery::Host => ReadKind::HostRead {
+                        pin,
+                        range,
+                        destination,
+                    },
+                    DirectDelivery::Gpu => {
+                        let allocation_size = allocation_size
+                            .filter(|&size| destination.end() <= size)
+                            .ok_or(Error::InvalidRequest)?;
+                        ReadKind::GpuRead {
+                            pin,
+                            range,
+                            destination,
+                            allocation_size,
+                        }
+                    }
+                }
+            }
+            (_, Some(_)) => return Err(Error::MethodNotAllowed),
+            (method, None) => match method {
+                "HEAD" if range.is_none() => match pin {
+                    Some(etag) => ReadKind::HeadPinned { etag },
+                    None => ReadKind::Head,
+                },
+                "HEAD" => return Err(Error::InvalidRequest),
+                "POST" if content_length => ReadKind::Subscription {
+                    pin,
+                    range,
+                    page_credits,
+                    byte_credits,
+                },
+                "POST" => return Err(Error::InvalidRequest),
+                _ => return Err(Error::MethodNotAllowed),
             },
-            "HEAD" => return Err(Error::InvalidRequest),
-            "POST" if content_length => ReadKind::Subscription {
-                pin,
-                range,
-                page_credits,
-                byte_credits,
-            },
-            "POST" => return Err(Error::InvalidRequest),
-            _ => return Err(Error::MethodNotAllowed),
         };
         Ok(ClientRequest {
             kind,
@@ -271,6 +409,14 @@ fn parse_max_age(value: &[u8], max_age: &mut Option<u64>) -> Result<()> {
     Ok(())
 }
 
+/// Store a destination field, rejecting a repeated one.
+fn once(slot: &mut Option<u64>, value: u64) -> Result<()> {
+    if slot.replace(value).is_some() {
+        return Err(Error::InvalidRequest);
+    }
+    Ok(())
+}
+
 /// Parse a nonzero canonical credit value inside its protocol bounds.
 fn decimal(value: &[u8], minimum: u64, maximum: u64) -> Result<u64> {
     if value.is_empty() || value[0] == b'0' || !value.iter().all(u8::is_ascii_digit) {
@@ -308,6 +454,15 @@ pub fn subscription_head(
     metadata: &ObjectMetadata,
     range: Option<ResolvedRange>,
 ) -> Result<MessageHead> {
+    body_head(metadata, range, true)
+}
+
+/// Shared Get-style head. Without payload, page frames carry only their 21 bytes.
+fn body_head(
+    metadata: &ObjectMetadata,
+    range: Option<ResolvedRange>,
+    payload: bool,
+) -> Result<MessageHead> {
     let mut head = success_head(metadata, None)?;
     head.headers
         .retain(|h| !h.name.eq_ignore_ascii_case("Content-Length"));
@@ -323,7 +478,7 @@ pub fn subscription_head(
     let length = pages
         .checked_add(1)
         .and_then(|n| n.checked_mul(21))
-        .and_then(|n| n.checked_add(end - start))
+        .and_then(|n| n.checked_add(if payload { end - start } else { 0 }))
         .filter(|&n| n <= MAX_WIRE_INTEGER)
         .ok_or(Error::BadGateway)?;
     head.start = StartLine::Response { status: 200 };
@@ -334,6 +489,24 @@ pub fn subscription_head(
         header("Content-Length", length.to_string()),
         header("Connection", "close"),
     ]);
+    Ok(head)
+}
+
+/// Encode a direct-read success head. Page frames carry no payload, so the
+/// body is `21 * (pages + 1)` bytes. An empty object has no pages.
+pub fn direct_head(
+    metadata: &ObjectMetadata,
+    range: Option<ResolvedRange>,
+    delivery: DirectDelivery,
+) -> Result<MessageHead> {
+    let mut head = body_head(metadata, range, false)?;
+    let close = head
+        .headers
+        .iter()
+        .position(|h| h.name.eq_ignore_ascii_case("Connection"))
+        .unwrap_or(head.headers.len());
+    head.headers
+        .insert(close, header("Racer-Delivery", delivery.as_str()));
     Ok(head)
 }
 

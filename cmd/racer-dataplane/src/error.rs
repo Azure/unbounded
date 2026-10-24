@@ -67,6 +67,8 @@ boundary_errors! {
     CorruptRecord,
     MissingKey,
     DirectIoUnsupported,
+    /// The request is valid, but this dataplane cannot serve it (HTTP 501).
+    NotImplemented,
     Io,
     Os(errno: i32),
 }

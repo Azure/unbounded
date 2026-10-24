@@ -177,6 +177,140 @@ pub struct Completion<B: 'static, L: 'static = ()> {
     pub lease: L,
 }
 
+/// Most `SCM_RIGHTS` descriptors one [`Reactor::recv_msg`] accepts. More set
+/// [`MessageCompletion::truncated`], and the kernel closes the excess.
+pub const MAX_RECEIVED_DESCRIPTORS: usize = 8;
+
+/// A fenced `recvmsg` result with any descriptors that arrived with the bytes.
+pub struct MessageCompletion<B: 'static, L: 'static = ()> {
+    /// Original allocation, returned only after all applicable CQEs.
+    pub buffer: B,
+
+    /// Bytes received, possibly less than the buffer length.
+    pub bytes: usize,
+
+    /// Caller-owned admission or reuse guard retained through completion.
+    pub lease: L,
+
+    /// Received `SCM_RIGHTS` descriptors, already close-on-exec.
+    pub descriptors: Vec<HostFd>,
+
+    /// The kernel reported `MSG_CTRUNC`: ancillary data did not fit.
+    pub truncated: bool,
+}
+
+/// Heap-pinned `msghdr`, `iovec`, and control storage for one `RecvMsg`.
+/// Any descriptors the kernel installed are closed when this is dropped.
+struct MessageHeader {
+    header: libc::msghdr,
+
+    iov: libc::iovec,
+
+    control: Vec<u64>,
+}
+
+impl MessageHeader {
+    /// Control bytes able to hold [`MAX_RECEIVED_DESCRIPTORS`] descriptors.
+    fn control_bytes() -> usize {
+        // SAFETY: CMSG_SPACE only computes an aligned size.
+        unsafe {
+            libc::CMSG_SPACE((MAX_RECEIVED_DESCRIPTORS * std::mem::size_of::<i32>()) as u32)
+                as usize
+        }
+    }
+
+    fn new() -> Box<Self> {
+        let words = Self::control_bytes().div_ceil(std::mem::size_of::<u64>());
+        Box::new(Self {
+            // SAFETY: msghdr is plain old data; all-zero is a valid empty value.
+            header: unsafe { std::mem::zeroed() },
+            iov: libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            },
+            control: vec![0; words],
+        })
+    }
+
+    /// Point the header at `ptr..ptr+len` and an empty control buffer.
+    fn prepare(&mut self, ptr: *mut u8, len: u32) -> *mut libc::msghdr {
+        // Close anything left by an earlier attempt before reusing the storage.
+        drop(self.take_descriptors());
+        self.control.fill(0);
+        self.iov = libc::iovec {
+            iov_base: ptr.cast(),
+            iov_len: len as usize,
+        };
+        // SAFETY: as in new().
+        self.header = unsafe { std::mem::zeroed() };
+        self.header.msg_iov = &mut self.iov;
+        self.header.msg_iovlen = 1;
+        self.header.msg_control = self.control.as_mut_ptr().cast();
+        self.header.msg_controllen = Self::control_bytes() as _;
+        &mut self.header
+    }
+
+    /// Whether the kernel truncated ancillary data on the completed receive.
+    fn truncated(&self) -> bool {
+        self.header.msg_flags & libc::MSG_CTRUNC != 0
+    }
+
+    /// Take ownership of every `SCM_RIGHTS` descriptor in the control buffer.
+    /// The buffer is cleared, so a second call or the drop finds nothing.
+    // Control lengths are usize on glibc but narrower on other libcs.
+    #[allow(clippy::unnecessary_cast)]
+    fn take_descriptors(&mut self) -> Vec<HostFd> {
+        let mut descriptors = Vec::new();
+        let capacity = self.control.len() * std::mem::size_of::<u64>();
+        let used = (self.header.msg_controllen as usize).min(capacity);
+        if self.header.msg_control.is_null() || used < std::mem::size_of::<libc::cmsghdr>() {
+            return descriptors;
+        }
+        let base = self.control.as_ptr().cast::<u8>();
+        let mut offset = 0;
+        while offset + std::mem::size_of::<libc::cmsghdr>() <= used {
+            // SAFETY: the header lies inside the initialized control buffer;
+            // read_unaligned tolerates any alignment.
+            let cmsg: libc::cmsghdr = unsafe { std::ptr::read_unaligned(base.add(offset).cast()) };
+            let length = cmsg.cmsg_len as usize;
+            if length < std::mem::size_of::<libc::cmsghdr>() || offset + length > used {
+                break;
+            }
+            // SAFETY: CMSG_LEN(0) is the aligned header size.
+            let data = unsafe { libc::CMSG_LEN(0) } as usize;
+            if cmsg.cmsg_level == libc::SOL_SOCKET && cmsg.cmsg_type == libc::SCM_RIGHTS {
+                let count = (length.saturating_sub(data)) / std::mem::size_of::<i32>();
+                for index in 0..count {
+                    // SAFETY: the descriptor array is inside this control message.
+                    let fd: i32 = unsafe {
+                        std::ptr::read_unaligned(
+                            base.add(offset + data + index * std::mem::size_of::<i32>())
+                                .cast(),
+                        )
+                    };
+                    if fd >= 0 {
+                        // SAFETY: the kernel installed this descriptor for us alone.
+                        descriptors.push(unsafe { HostFd::from_raw_fd(fd) });
+                    }
+                }
+            }
+            // CMSG_NXTHDR advances by CMSG_ALIGN(cmsg_len).
+            let step = length.next_multiple_of(std::mem::size_of::<usize>());
+            offset += step;
+        }
+        self.control.fill(0);
+        self.header.msg_controllen = 0;
+        descriptors
+    }
+}
+
+impl Drop for MessageHeader {
+    /// Close descriptors that no caller took, including after an abandoned wait.
+    fn drop(&mut self) {
+        drop(self.take_descriptors());
+    }
+}
+
 /// An exclusively owned, stable backing allocation with an independent lifetime.
 ///
 /// # Safety
@@ -1710,6 +1844,132 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                                 len
                             )
                             .flags(libc::MSG_NOSIGNAL)
+                            .build()
+                        );
+                        Ok(sqe)
+                    },
+                )
+                .await?;
+            Ok(owned.complete(bytes))
+        })
+    }
+
+    /// Receive like [`Self::recv`], also accepting `SCM_RIGHTS` descriptors with
+    /// `MSG_CMSG_CLOEXEC`. Descriptors are owned before this returns; a dropped
+    /// or failed wait closes any the kernel delivered. Simulated sockets carry
+    /// no ancillary data and always report none.
+    pub fn recv_msg<'a, B: IoBuffer, L: 'static>(
+        &'a self,
+        fd: Rc<Descriptor>,
+        buffer: B,
+        lease: L,
+        scope: &'a S,
+    ) -> Operation<'a, MessageCompletion<B, L>, S::Error>
+    where
+        S::Error: From<B::Error>,
+    {
+        Box::pin(async move {
+            let retained_fd = fd.clone();
+            let ((owned, mut header), bytes) = self
+                .retry_data(
+                    (
+                        InFlight {
+                            file: fd,
+                            buffer,
+                            lease,
+                        },
+                        MessageHeader::new(),
+                    ),
+                    retained_fd,
+                    scope,
+                    None,
+                    libc::POLLIN as u32,
+                    |(owned, header)| {
+                        let (ptr, len) =
+                            Self::buffer_region(&mut owned.buffer, BufferOperation::Recv)?;
+                        let sqe = submission!(
+                            self,
+                            simulation::Op::Buffer {
+                                fd: owned.file.clone(),
+                                operation: BufferOperation::Recv,
+                                ptr,
+                                len: len as usize,
+                            },
+                            opcode::RecvMsg::new(
+                                types::Fd(owned.file.as_raw_fd()),
+                                header.prepare(ptr, len)
+                            )
+                            .flags(libc::MSG_CMSG_CLOEXEC as u32)
+                            .build()
+                        );
+                        Ok(sqe)
+                    },
+                )
+                .await?;
+            let truncated = header.truncated();
+            let descriptors = header.take_descriptors();
+            let Completion {
+                buffer,
+                bytes,
+                lease,
+            } = owned.complete(bytes);
+            Ok(MessageCompletion {
+                buffer,
+                bytes,
+                lease,
+                descriptors,
+                truncated,
+            })
+        })
+    }
+
+    /// Write immutable shared storage at an explicit file offset, returning
+    /// short progress without replaying bytes. Unlike [`Self::write_at`], the
+    /// buffer needs no mutable capability, so verified pages can be written.
+    pub fn write_shared_at<'a, B: SendBuffer, L: 'static>(
+        &'a self,
+        file: Rc<Descriptor>,
+        offset: u64,
+        buffer: B,
+        lease: L,
+        scope: &'a S,
+    ) -> Operation<'a, Completion<B, L>, S::Error>
+    where
+        S::Error: From<B::Error>,
+    {
+        Box::pin(async move {
+            if offset > i64::MAX as u64 {
+                return Err(Error::InvalidInput.into());
+            }
+            let retained_fd = file.clone();
+            let (owned, bytes) = self
+                .retry_data(
+                    InFlight {
+                        file,
+                        buffer,
+                        lease,
+                    },
+                    retained_fd,
+                    scope,
+                    None,
+                    libc::POLLOUT as u32,
+                    |owned| {
+                        let bytes = owned.buffer.send_bytes()?;
+                        let len = u32::try_from(bytes.len()).map_err(|_| Error::InvalidInput)?;
+                        let sqe = submission!(
+                            self,
+                            simulation::Op::Buffer {
+                                fd: owned.file.clone(),
+                                operation: BufferOperation::Write(offset),
+                                ptr: bytes.as_ptr().cast_mut(),
+                                len: len as usize,
+                            },
+                            opcode::Write::new(
+                                types::Fd(owned.file.as_raw_fd()),
+                                bytes.as_ptr(),
+                                len
+                            )
+                            .offset(offset)
                             .build()
                         );
                         Ok(sqe)

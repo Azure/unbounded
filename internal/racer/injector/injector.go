@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package injector implements a mutating admission handler that injects the
-// racer-object sidecar into opted-in pods as a native (restartable init) sidecar.
+// racer-object sidecar into opted-in pods as a native (restartable init)
+// sidecar, and mounts the Racer client socket into opted-in app containers.
 package injector
 
 import (
@@ -45,6 +46,22 @@ const (
 	MemoryLimitAnnotation   = "racer.unbounded-cloud.io/object-memory-limit"
 	InjectedAnnotation      = "racer.unbounded-cloud.io/object-sidecar-injected"
 
+	// ClientSocketLabel opts a pod into a read-only mount of the Racer client
+	// socket directory, independent of the racer-object sidecar.
+	ClientSocketLabel = "racer.unbounded-cloud.io/client-socket"
+	// ClientCacheAnnotation names the ClusterCache whose socket is mounted.
+	ClientCacheAnnotation = "racer.unbounded-cloud.io/client-cache"
+	// ClientContainersAnnotation optionally lists, comma-separated, the app
+	// containers that get the mount. The default is every app container.
+	ClientContainersAnnotation = "racer.unbounded-cloud.io/client-containers"
+	// ClientSocketInjectedAnnotation records the mounted cache.
+	ClientSocketInjectedAnnotation = "racer.unbounded-cloud.io/client-socket-injected"
+	// ClientVolumeName is the volume added when no volume already mounts the
+	// cache's client directory.
+	ClientVolumeName = "racer-client-socket"
+	// SocketEnv tells clients where the socket is.
+	SocketEnv = "RACER_SOCKET"
+
 	osLabel = "kubernetes.io/os"
 )
 
@@ -70,15 +87,26 @@ func (c Config) Validate() error {
 	return nil
 }
 
-// Mutate injects the racer-object sidecar into pod in place. Pods without the
-// opt-in label, or that already contain a container named ContainerName, are
-// left unchanged. Opted-in pods must set CacheAnnotation. Missing or invalid
-// annotations return an error naming the annotation.
+// Mutate applies both opt-ins to pod in place: the racer-object sidecar
+// (EnabledLabel) and the client socket mount (ClientSocketLabel). Pods without
+// either label are left unchanged. Missing or invalid annotations return an
+// error naming the annotation.
 func Mutate(pod *corev1.Pod, cfg Config) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
 
+	if err := mutateSidecar(pod, cfg); err != nil {
+		return err
+	}
+
+	return mutateClientSocket(pod)
+}
+
+// mutateSidecar injects the racer-object sidecar. Pods without the opt-in
+// label, or that already contain a container named ContainerName, are left
+// unchanged. Opted-in pods must set CacheAnnotation.
+func mutateSidecar(pod *corev1.Pod, cfg Config) error {
 	if pod.Labels[EnabledLabel] != EnabledValue {
 		return nil
 	}
@@ -149,13 +177,7 @@ func Mutate(pod *corev1.Pod, cfg Config) error {
 		}},
 	})
 
-	if pod.Spec.NodeSelector == nil {
-		pod.Spec.NodeSelector = map[string]string{}
-	}
-
-	pod.Spec.NodeSelector[osLabel] = "linux"
-
-	addExclusionAffinity(&pod.Spec)
+	requireRacerNode(&pod.Spec)
 
 	if pod.Annotations == nil {
 		pod.Annotations = map[string]string{}
@@ -164,6 +186,155 @@ func Mutate(pod *corev1.Pod, cfg Config) error {
 	pod.Annotations[InjectedAnnotation] = cfg.Image
 
 	return nil
+}
+
+// requireRacerNode places the pod on Linux nodes that run the dataplane.
+func requireRacerNode(spec *corev1.PodSpec) {
+	if spec.NodeSelector == nil {
+		spec.NodeSelector = map[string]string{}
+	}
+
+	spec.NodeSelector[osLabel] = "linux"
+
+	addExclusionAffinity(spec)
+}
+
+// mutateClientSocket mounts /run/racer/<cache>/client read-only at the same
+// path in the selected app containers and sets SocketEnv. A read-only mount
+// still permits connect(2) on the socket: write permission on the socket
+// inode is checked, not the mount's read-only flag. Pods without the label,
+// or already marked with ClientSocketInjectedAnnotation, are left unchanged.
+func mutateClientSocket(pod *corev1.Pod) error {
+	if pod.Labels[ClientSocketLabel] != EnabledValue {
+		return nil
+	}
+
+	if _, done := pod.Annotations[ClientSocketInjectedAnnotation]; done {
+		return nil
+	}
+
+	cache, ok := pod.Annotations[ClientCacheAnnotation]
+	if !ok {
+		return fmt.Errorf("annotation %s is required and must name the ClusterCache to bind to", ClientCacheAnnotation)
+	}
+
+	if err := validateCache(cache); err != nil {
+		return fmt.Errorf("annotation %s has invalid cache name %q", ClientCacheAnnotation, cache)
+	}
+
+	targets, err := clientTargets(pod)
+	if err != nil {
+		return err
+	}
+
+	if pod.Spec.OS != nil && pod.Spec.OS.Name != corev1.Linux {
+		return fmt.Errorf("pod spec.os.name %q conflicts with the Racer client socket, which requires linux", pod.Spec.OS.Name)
+	}
+
+	if v, ok := pod.Spec.NodeSelector[osLabel]; ok && v != "linux" {
+		return fmt.Errorf("pod nodeSelector %s=%q conflicts with the Racer client socket, which requires linux", osLabel, v)
+	}
+
+	clientDir := "/run/racer/" + cache + "/client"
+	socket := clientDir + "/socket"
+
+	// Reuse a volume that already mounts this directory, such as the one the
+	// racer-object sidecar adds for the same cache.
+	volume := ""
+
+	for _, v := range pod.Spec.Volumes {
+		if v.HostPath != nil && v.HostPath.Path == clientDir {
+			volume = v.Name
+			break
+		}
+	}
+
+	if volume == "" {
+		for _, v := range pod.Spec.Volumes {
+			if v.Name == ClientVolumeName {
+				return fmt.Errorf("pod already defines a volume named %q", ClientVolumeName)
+			}
+		}
+	}
+
+	for _, i := range targets {
+		c := &pod.Spec.Containers[i]
+		for _, m := range c.VolumeMounts {
+			if m.MountPath == clientDir {
+				return fmt.Errorf("container %q already mounts %s", c.Name, clientDir)
+			}
+		}
+
+		for _, e := range c.Env {
+			if e.Name == SocketEnv {
+				return fmt.Errorf("container %q already sets %s", c.Name, SocketEnv)
+			}
+		}
+	}
+
+	if volume == "" {
+		volume = ClientVolumeName
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+			Name: volume,
+			VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
+				Path: clientDir,
+				Type: ptr.To(corev1.HostPathDirectory),
+			}},
+		})
+	}
+
+	for _, i := range targets {
+		c := &pod.Spec.Containers[i]
+		c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: volume, MountPath: clientDir, ReadOnly: true})
+		c.Env = append(c.Env, corev1.EnvVar{Name: SocketEnv, Value: socket})
+	}
+
+	requireRacerNode(&pod.Spec)
+
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+
+	pod.Annotations[ClientSocketInjectedAnnotation] = cache
+
+	return nil
+}
+
+// clientTargets returns indexes into pod.Spec.Containers.
+func clientTargets(pod *corev1.Pod) ([]int, error) {
+	value, ok := pod.Annotations[ClientContainersAnnotation]
+	if !ok {
+		targets := make([]int, len(pod.Spec.Containers))
+		for i := range targets {
+			targets[i] = i
+		}
+
+		return targets, nil
+	}
+
+	index := make(map[string]int, len(pod.Spec.Containers))
+	for i, c := range pod.Spec.Containers {
+		index[c.Name] = i
+	}
+
+	var targets []int
+
+	seen := map[string]bool{}
+
+	for _, name := range strings.Split(value, ",") {
+		name = strings.TrimSpace(name)
+
+		i, found := index[name]
+		if !found || seen[name] {
+			return nil, fmt.Errorf("annotation %s must list distinct app container names, separated by commas", ClientContainersAnnotation)
+		}
+
+		seen[name] = true
+
+		targets = append(targets, i)
+	}
+
+	return targets, nil
 }
 
 type sidecarSpec struct {

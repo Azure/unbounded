@@ -948,8 +948,9 @@ async fn serve_connection(
         )?;
         let idle_scope = new_scope(timeout, cancellation.clone())?;
         deadline.set(idle_scope.deadline.0);
+        // Read with recvmsg so a direct read's descriptor arrives with its head.
         let received = io
-            .receive_request_head_limited(connection, &idle_scope, parser.header_limit())
+            .receive_request_head_with_descriptors(connection, &idle_scope, parser.header_limit())
             .await?;
         connection = received.connection;
         if !retirement_request && retired.load(std::sync::atomic::Ordering::Acquire) {
@@ -962,8 +963,21 @@ async fn serve_connection(
         let scope = new_scope(timeout, cancellation.clone())?;
         deadline.set(scope.deadline.0);
         let scope = &scope;
-        let request = match received.value.and_then(|head| parser.parse(cache, head)) {
-            Ok(request) => request,
+        // Every descriptor must be claimed by a direct read; the rest close here.
+        let parsed = received.value.and_then(|received| {
+            let request = parser.parse(cache, received.head)?;
+            let sink = responses.open_sink(&request.kind, received.descriptors)?;
+            Ok((request, sink))
+        });
+        let parsed = match parsed {
+            Ok((request, Some(mut sink))) => match sink.ready(scope).await {
+                Ok(()) => Ok((request, Some(sink))),
+                Err(error) => Err(error),
+            },
+            other => other,
+        };
+        let (request, sink) = match parsed {
+            Ok(parsed) => parsed,
             Err(error) => {
                 observation.fail(error);
                 responses.send_error(connection, error, scope).await?;
@@ -1015,6 +1029,7 @@ async fn serve_connection(
             scope,
             &mut observation,
             timeout,
+            sink,
         )
         .await?
         {

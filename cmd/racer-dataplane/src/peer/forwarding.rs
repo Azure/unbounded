@@ -576,6 +576,28 @@ impl Forwarding {
         let (origin, forwarders) = self.verify_response_parts(&response, request)?;
         Ok(Self::finish_response(response, request, origin, forwarders))
     }
+    /// Like [`Self::verify_response`] for a page that landed in GPU memory:
+    /// verify the signed head for `metadata` and `envelope`. The GPU checks
+    /// the ciphertext itself with the AEAD tag.
+    pub(crate) fn verify_landed(
+        &self,
+        authentication: &ForwardedHead,
+        metadata: &crate::model::ObjectMetadata,
+        envelope: &crate::model::PageEnvelope,
+        request: &RequestBinding,
+    ) -> Result<()> {
+        let path = protocol::decode_nodes(
+            field(&authentication.original.head, "racer-response-path")?.as_bytes(),
+        )?;
+        let expected = protocol::landed_response_head(
+            metadata,
+            envelope,
+            &signed_digest(&request.original)?,
+            &path,
+        )?;
+        self.verify_response_head(authentication, &expected, request)
+            .map(|_| ())
+    }
     fn verify_response_parts(
         &self,
         response: &SignedResponse,

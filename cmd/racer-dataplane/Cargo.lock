@@ -868,6 +868,7 @@ dependencies = [
  "prost",
  "racer-control-wire",
  "racer-crypto",
+ "racer-gpu",
  "racer-object-wire",
  "rcgen",
  "rdma-verbs",
@@ -882,6 +883,16 @@ dependencies = [
  "uring-runtime",
  "wire-codec",
  "x509-parser",
+ "zeroize",
+]
+
+[[package]]
+name = "racer-gpu"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "libc",
+ "racer-crypto",
  "zeroize",
 ]
 

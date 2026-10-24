@@ -121,6 +121,15 @@ pub struct Config {
     /// Opt into logical-CPU sizing instead of one eligible CPU per physical core.
     pub allow_smt: bool,
     pub enable_rdma: bool,
+    /// `gpu-read` support. Resolved against hardware at startup, on the GPU
+    /// helper thread, because GPU handles cannot move between threads.
+    pub enable_gpu: GpuMode,
+    /// Per-GPU cap on dataplane-owned ciphertext staging memory. Parsed and
+    /// validated now; plaintext `gpu-read` does not allocate staging.
+    pub gpu_staging_bytes: u64,
+    /// Per-GPU GPU memory that peers' NICs write `gpu-read` ciphertext into
+    /// over RDMA (GPUDirect RDMA landing). 0 turns landing off.
+    pub gpu_landing_bytes: u64,
     /// Opt into experimental opaque HTTP transit; materialized relay is the default.
     pub opaque_relay: bool,
     /// Peer-only TCP_NODELAY. Peer exchanges are strictly request/response with
@@ -187,6 +196,22 @@ impl Config {
             "false" => false,
             _ => return Err(Error::InvalidConfiguration),
         };
+        let enable_gpu = match raw.enable_gpu.as_deref().unwrap_or("auto") {
+            "auto" => GpuMode::Auto,
+            "true" => GpuMode::Required,
+            "false" => GpuMode::Disabled,
+            _ => return Err(Error::InvalidConfiguration),
+        };
+        let gpu_staging_bytes = raw.gpu_staging_bytes.unwrap_or(DEFAULT_GPU_STAGING_BYTES);
+        if gpu_staging_bytes < GPU_STAGING_UNIT
+            || !gpu_staging_bytes.is_multiple_of(GPU_STAGING_UNIT)
+        {
+            return Err(Error::InvalidConfiguration);
+        }
+        let gpu_landing_bytes = raw.gpu_landing_bytes.unwrap_or(DEFAULT_GPU_LANDING_BYTES);
+        if !gpu_landing_bytes.is_multiple_of(GPU_STAGING_UNIT) {
+            return Err(Error::InvalidConfiguration);
+        }
         let mut config = Self {
             warm: crate::read::warm::Config {
                 max_ttl: Duration::from_secs(raw.warm_max_ttl_secs.unwrap_or(3600)),
@@ -239,6 +264,9 @@ impl Config {
             crypto_helpers: raw.crypto_helpers.map(to_usize).transpose()?,
             allow_smt: raw.allow_smt.unwrap_or(false),
             enable_rdma,
+            enable_gpu,
+            gpu_staging_bytes,
+            gpu_landing_bytes,
             opaque_relay: raw.opaque_relay.unwrap_or(false),
             peer_tcp_nodelay: raw.peer_tcp_nodelay.unwrap_or(true),
             memory_pressure: raw.memory_pressure.unwrap_or(true),
@@ -580,11 +608,35 @@ impl Config {
     }
 }
 
+/// How `RACER_ENABLE_GPU` asks for `gpu-read`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GpuMode {
+    /// Serve `gpu-read` when built with `cuda` and a usable GPU is found.
+    Auto,
+    /// Fail startup unless a usable GPU is found.
+    Required,
+    /// Never serve `gpu-read`; answer 501.
+    Disabled,
+}
+
+/// Default `RACER_GPU_STAGING_BYTES`: 256 MiB per GPU.
+pub const DEFAULT_GPU_STAGING_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Default `RACER_GPU_LANDING_BYTES`: 256 MiB per GPU.
+pub const DEFAULT_GPU_LANDING_BYTES: u64 = 256 * 1024 * 1024;
+
+/// GPU staging is allocated in 2 MiB device granules, so the cap must be a
+/// whole number of them.
+pub const GPU_STAGING_UNIT: u64 = 2 * 1024 * 1024;
+
 /// Environment names are exact and case sensitive, even though envy folds keys.
 const ENV_NAMES: &[&str] = &[
     "CLUSTER_ID",
     "CONTROL_ENDPOINT",
     "ENABLE_RDMA",
+    "ENABLE_GPU",
+    "GPU_STAGING_BYTES",
+    "GPU_LANDING_BYTES",
     "ALLOW_SMT",
     "OPAQUE_RELAY",
     "PEER_TCP_NODELAY",
@@ -660,6 +712,11 @@ struct RawConfig {
     cluster_id: String,
     control_endpoint: String,
     enable_rdma: Option<String>,
+    enable_gpu: Option<String>,
+    #[serde(default, deserialize_with = "decimal")]
+    gpu_staging_bytes: Option<u64>,
+    #[serde(default, deserialize_with = "decimal")]
+    gpu_landing_bytes: Option<u64>,
     allow_smt: Option<bool>,
     opaque_relay: Option<bool>,
     peer_tcp_nodelay: Option<bool>,
@@ -1321,6 +1378,63 @@ mod tests {
             .is_err()
         );
         assert!(parse(&[("RACER_ENABLE_RDMA", "true")]).unwrap().enable_rdma);
+    }
+
+    #[test]
+    fn gpu_mode_and_staging_bytes_parse_and_validate() {
+        let config = parse(&[]).unwrap();
+        assert_eq!(config.enable_gpu, GpuMode::Auto);
+        assert_eq!(config.gpu_staging_bytes, 256 << 20);
+        for (value, mode) in [
+            ("auto", GpuMode::Auto),
+            ("true", GpuMode::Required),
+            ("false", GpuMode::Disabled),
+        ] {
+            assert_eq!(
+                parse(&[("RACER_ENABLE_GPU", value)]).unwrap().enable_gpu,
+                mode
+            );
+        }
+        for value in ["TRUE", "1", "yes", "", " auto"] {
+            assert!(parse(&[("RACER_ENABLE_GPU", value)]).is_err(), "{value:?}");
+        }
+        assert_eq!(
+            parse(&[("RACER_GPU_STAGING_BYTES", "4194304")])
+                .unwrap()
+                .gpu_staging_bytes,
+            4 << 20
+        );
+        for value in [
+            "0",
+            "1048576",
+            "3145728",
+            "-2097152",
+            "2MiB",
+            "18446744073709551616",
+        ] {
+            assert!(
+                parse(&[("RACER_GPU_STAGING_BYTES", value)]).is_err(),
+                "{value:?}"
+            );
+        }
+        assert_eq!(
+            parse(&[]).unwrap().gpu_landing_bytes,
+            DEFAULT_GPU_LANDING_BYTES
+        );
+        for (value, bytes) in [("0", 0), ("4194304", 4 << 20)] {
+            assert_eq!(
+                parse(&[("RACER_GPU_LANDING_BYTES", value)])
+                    .unwrap()
+                    .gpu_landing_bytes,
+                bytes
+            );
+        }
+        for value in ["1048576", "3145728", "-2097152", "2MiB"] {
+            assert!(
+                parse(&[("RACER_GPU_LANDING_BYTES", value)]).is_err(),
+                "{value:?}"
+            );
+        }
     }
 
     #[test]
