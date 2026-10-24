@@ -52,6 +52,15 @@ pub struct NodeConfig {
     pub connect_timeout_ns: Nanos,
     /// Request scope at a serving peer.
     pub serve_timeout_ns: Nanos,
+    /// Concurrent page hedges per node (production `page_hedge_slots`,
+    /// default 0: hedging off).
+    pub hedge_slots: u32,
+    /// Delay before the duplicate starts (production `page_hedge_delay_ms`,
+    /// default 100 ms).
+    pub hedge_delay_ns: Nanos,
+    /// Speculative bytes per node (production `page_hedge_bytes`, default
+    /// one `DUPLICATE_BYTES`).
+    pub hedge_bytes: u64,
 }
 
 impl Default for NodeConfig {
@@ -76,6 +85,9 @@ impl Default for NodeConfig {
             read_timeout_ns: 10 * SECONDS,
             connect_timeout_ns: 100 * MILLIS,
             serve_timeout_ns: 5 * SECONDS,
+            hedge_slots: 0,
+            hedge_delay_ns: 100 * MILLIS,
+            hedge_bytes: DUPLICATE_BYTES,
         }
     }
 }
@@ -110,6 +122,9 @@ impl NodeConfig {
                 "read_timeout_ns" => self.read_timeout_ns = n,
                 "connect_timeout_ns" => self.connect_timeout_ns = n,
                 "serve_timeout_ns" => self.serve_timeout_ns = n,
+                "hedge_slots" => self.hedge_slots = small()?,
+                "hedge_delay_ns" => self.hedge_delay_ns = n,
+                "hedge_bytes" => self.hedge_bytes = n,
                 _ => return Err(format!("unknown key node.{key}")),
             }
         }
@@ -133,9 +148,15 @@ impl NodeConfig {
         if self.attempt_timeout_ns == 0 || self.read_timeout_ns == 0 || self.serve_timeout_ns == 0 {
             return Err("node: timeouts must be nonzero".into());
         }
+        if self.hedge_slots > 0 && self.hedge_bytes < DUPLICATE_BYTES {
+            return Err("node: hedge_bytes must cover one duplicate page".into());
+        }
         Ok(())
     }
 }
+
+/// Production `DUPLICATE_BYTES`: two pages plus a tag.
+const DUPLICATE_BYTES: u64 = 2 * MIB + 16;
 
 #[cfg(test)]
 mod tests {

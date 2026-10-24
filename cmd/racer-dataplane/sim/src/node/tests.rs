@@ -304,3 +304,89 @@ fn yielding_searches_hit_production_concurrency_limits() {
     let (_, report) = run(roomy, 3);
     assert_eq!(counter(&report, "ranking_overloaded"), 0, "{report}");
 }
+
+/// Runs the hedge scenario: every ranked owner of object 4 warms its pages,
+/// then each rank 0 owner becomes 255 times slower and non-owner readers
+/// (never slow) read every page.
+fn hedge_scenario(slots: u32) -> (NodeWorld, Value) {
+    use crate::faults::Fault;
+    let mut config = quiet(64);
+    config.node.hedge_slots = slots;
+    config.node.hedge_delay_ns = 5 * MILLIS;
+    config.node.hedge_bytes = u64::from(slots.max(1)) * super::world::DUPLICATE_BYTES as u64;
+    config.duration_ns = 8 * SECONDS;
+    let probe = NodeWorld::new(config.clone(), 21);
+    let pages = u64::from(probe.config.pages_per_object);
+    let range: Vec<u64> = (4 * pages..5 * pages).collect();
+    let owners: Vec<Vec<u32>> = range.iter().map(|p| probe.owners(*p)).collect();
+    let slow: std::collections::BTreeSet<u32> = owners.iter().map(|o| o[0]).collect();
+    for node in &slow {
+        config.faults.push(Fault::Slow {
+            node: *node,
+            factor: 255,
+            from_ns: SECONDS,
+            until_ns: 3 * SECONDS,
+        });
+    }
+    let mut world = NodeWorld::new(config, 21);
+    for (p, o) in range.iter().zip(&owners) {
+        for node in o {
+            world.engine.at(0, client_read(*node, *p, 0));
+        }
+        let readers = (0..64u32)
+            .filter(|n| !o.contains(n) && !slow.contains(n))
+            .take(4);
+        for (i, node) in readers.enumerate() {
+            let at = SECONDS + 100 * MILLIS + i as u64 * MILLIS;
+            world.engine.at(at, client_read(node, *p, at));
+        }
+    }
+    world.run(8 * SECONDS);
+    let report = world.report("hedge", 21);
+    assert_eq!(
+        report["invariants"]["hard_failures"], 0,
+        "{}",
+        report["invariants"]
+    );
+    (world, report)
+}
+
+/// Production default (no slots) never races; with slots, a slow rank 0
+/// owner loses to the copy-only duplicate at the second owner: lower peer
+/// read latency, duplicate bytes counted per started hedge, and the split
+/// budgets never grow (checked by `budget_never_grows`).
+#[test]
+fn hedging_beats_a_slow_primary() {
+    let (_, off) = hedge_scenario(0);
+    let (_, on) = hedge_scenario(4);
+    assert_eq!(counter(&off, "hedge_races"), 0);
+    assert!(counter(&off, "hedge_eligible") > 0, "{off}");
+    assert!(counter(&on, "hedge_races") > 0, "{on}");
+    let started = counter(&on, "hedge_started");
+    assert!(started > 0, "{on}");
+    // The duplicate at the fast second owner wins most races.
+    assert!(2 * counter(&on, "hedge_won") > started, "{on}");
+    assert!(counter(&on, "hedge_losers_canceled") > 0, "{on}");
+    assert_eq!(
+        counter(&on, "hedge_duplicate_bytes"),
+        started * super::world::DUPLICATE_BYTES as u64
+    );
+    assert_eq!(
+        counter(&on, "reads_completed"),
+        counter(&off, "reads_completed"),
+        "on {}\noff {}",
+        on["metrics"]["counters"],
+        off["metrics"]["counters"]
+    );
+    let mean = |r: &Value| {
+        r["metrics"]["histograms"]["read_ns"]["mean"]
+            .as_u64()
+            .unwrap()
+    };
+    assert!(
+        mean(&on) < mean(&off),
+        "on {} off {}",
+        mean(&on),
+        mean(&off)
+    );
+}

@@ -49,9 +49,9 @@ use racer_core::read::policy::{
 use racer_core::read::range::{PageBudget, SlotKind, direct_fills, first_failure};
 use racer_core::read::serve::{ServeAction, ServeFacts, serve_action, serve_deadline};
 use racer_core::read::walk::{
-    AttemptInputs, CandidateWalk, Continuation, End, HedgeFacts, Mode, Outcome, Probe,
-    RemainingWalk, Step, WalkConfig, hedge_eligible, plan_attempt, refresh_allowed,
-    transport_outcome,
+    AttemptInputs, AttemptPlan, CandidateWalk, Continuation, End, HedgeFacts, Mode, Outcome, Probe,
+    RemainingWalk, RouteMode, Step, WalkConfig, hedge_budgets, hedge_eligible, hedge_fallback,
+    plan_attempt, refresh_allowed, transport_outcome,
 };
 use racer_core::route::MAX_LINKS;
 use racer_core::time::SplitMix64;
@@ -156,6 +156,10 @@ pub enum Event {
         node: u32,
         factor: u8,
     },
+    /// A hedge race's duplicate delay elapsed.
+    HedgeDelay {
+        fill: u64,
+    },
     /// A ranking or route search task yielded; run its next slice.
     Slice {
         task: u64,
@@ -194,6 +198,7 @@ impl Event {
             Self::Restart { node } => (13, node.into(), 0),
             Self::Slow { node, factor } => (14, node.into(), factor.into()),
             Self::Slice { task } => (16, task, 0),
+            Self::HedgeDelay { fill } => (17, fill, 0),
         }
     }
 }
@@ -261,7 +266,24 @@ struct Fill {
     probe: Option<u64>,
     /// The leader's retention observation, used at publication.
     eligible: bool,
+    order: VisitOrder,
+    continuation: Continuation,
+    hedge: Option<Box<Race>>,
     _reservation: Vec<SimCharge>,
+}
+
+impl Fill {
+    /// Outstanding probe ids, including hedge contenders.
+    fn probes(&self) -> impl Iterator<Item = u64> + use<> {
+        let race = self.hedge.as_ref();
+        [
+            self.probe,
+            race.and_then(|r| r.primary),
+            race.and_then(|r| r.secondary),
+        ]
+        .into_iter()
+        .flatten()
+    }
 }
 
 struct Waiting {
@@ -290,11 +312,53 @@ struct Msg {
     attempts: u32,
     deadline: Nanos,
     relays: Vec<SimCharge>,
+    /// A pinned single-link hedge exchange.
+    direct: bool,
 }
 
 struct Probing {
     fill: u64,
     acquire: bool,
+    /// `Some(true)` for a hedge primary, `Some(false)` for its duplicate.
+    hedge: Option<bool>,
+}
+
+/// One hedge race (production `hedge_page` and `drivers::race`).
+struct Race {
+    primary_budget: AcquisitionBudget,
+    secondary_budget: AcquisitionBudget,
+    /// Outstanding probe ids.
+    primary: Option<u64>,
+    secondary: Option<u64>,
+    primary_done: bool,
+    secondary_done: bool,
+    /// The duplicate's delay elapsed (or the primary finished first).
+    launched: bool,
+    /// `Some(true)` when the primary won.
+    winner: Option<bool>,
+    fatal: Option<Error>,
+    primary_outcome: Option<ProbeOutcome>,
+    stale: bool,
+    /// Budget before the split, for `budget_never_grows`.
+    before: (u32, u8),
+    first: usize,
+    second: usize,
+    _permit: flow_control::HedgePermit,
+    _escrow: Vec<SimCharge>,
+}
+
+/// Production `DUPLICATE_BYTES` (`src/read/candidates.rs`).
+pub const DUPLICATE_BYTES: usize = PAGE_BYTES * 2 + 16;
+
+/// Production `reserve_hedge_pages`: plaintext and ciphertext for `pages`.
+fn hedge_pages(
+    quotas: &super::admission::SimQuotas,
+    pages: usize,
+) -> Result<Vec<SimCharge>, Error> {
+    Ok(vec![
+        reserve(quotas, ResourceClass::Plaintext, PAGE_BYTES * pages)?,
+        reserve(quotas, ResourceClass::Ciphertext, (PAGE_BYTES + 16) * pages)?,
+    ])
 }
 
 struct RangeRead {
@@ -632,7 +696,15 @@ impl NodeWorld {
             Event::ProbeTimeout { probe } => {
                 if let Some(p) = self.probes.remove(&probe) {
                     self.metrics.incr("probe_timeouts");
-                    self.complete_probe(p.fill, Ok(Outcome::Transport(ProbeOutcome::Unreachable)));
+                    match p.hedge {
+                        Some(primary) => {
+                            self.hedge_result(p.fill, primary, Err(Error::Unavailable))
+                        }
+                        None => self.complete_probe(
+                            p.fill,
+                            Ok(Outcome::Transport(ProbeOutcome::Unreachable)),
+                        ),
+                    }
                 }
             }
             Event::OriginDone { fill, outcome } => self.origin_done(fill, outcome),
@@ -666,6 +738,7 @@ impl NodeWorld {
                 }
             }
             Event::Slice { task } => self.slice(task),
+            Event::HedgeDelay { fill } => self.hedge_delay(fill),
         }
     }
 
@@ -697,10 +770,10 @@ impl NodeWorld {
             .collect();
         dead.sort_unstable();
         for id in dead {
-            if let Some(fill) = self.fills.remove(&id)
-                && let Some(probe) = fill.probe
-            {
-                self.probes.remove(&probe);
+            if let Some(fill) = self.fills.remove(&id) {
+                for probe in fill.probes() {
+                    self.probes.remove(&probe);
+                }
             }
         }
         self.tokens.retain(|_, w| w.node != node);
@@ -1211,6 +1284,9 @@ impl NodeWorld {
                 retried: false,
                 probe: None,
                 eligible,
+                order: VisitOrder::canonical(0),
+                continuation: Continuation::default(),
+                hedge: None,
                 _reservation: reservation,
             },
         );
@@ -1429,34 +1505,354 @@ impl NodeWorld {
             )
         };
         let fill = self.fills.get_mut(&id).expect("present");
-        if *fill.plan.step() == FillStep::Hedge {
-            let facts = HedgeFacts {
-                page_operation: true,
-                is_candidate: rank.is_some(),
-                owners: cands.len(),
-                first: order.get(0).unwrap_or(0),
-                second: order.get(1).unwrap_or(0),
-                distinct: cands.len() >= 2,
-                remaining_attempts: fill.budget.remaining_attempts(),
-                remaining_links: fill.budget.remaining_links(),
-            };
-            if hedge_eligible(facts) {
-                // Hedging is evaluated but not raced; see the design doc.
-                self.metrics.incr("hedge_eligible");
-            }
-            fill.plan.hedge(false);
-        }
-        fill.walk = Walking::Candidates(CandidateWalk::new(WalkConfig {
-            rank,
-            owners: cands.len(),
-            order,
-            page_operation: true,
-            continuation: Continuation::default(),
-        }));
         fill.cands = cands;
         fill.version = version;
         fill.rank = rank;
+        fill.order = order;
+        if *fill.plan.step() == FillStep::Hedge && self.try_hedge(id) {
+            return;
+        }
+        self.start_candidates(id);
+    }
+
+    /// Build the candidate walk from the fill's ranking and the carried
+    /// continuation, then step it.
+    fn start_candidates(&mut self, id: u64) {
+        let fill = self.fills.get_mut(&id).expect("present");
+        let continuation = std::mem::take(&mut fill.continuation);
+        fill.walk = Walking::Candidates(CandidateWalk::new(WalkConfig {
+            rank: fill.rank,
+            owners: fill.cands.len(),
+            order: fill.order,
+            page_operation: true,
+            continuation,
+        }));
         self.step_walk(id);
+    }
+
+    /// Whether `node` may open a pinned direct exchange to `dest` now
+    /// (production `direct_hedge_available`: link health allows it).
+    fn direct_available(&self, node: u32, dest: u32) -> bool {
+        let instant = self.instant(self.now());
+        self.nodes[node as usize].links.available(&dest, instant)
+    }
+
+    /// Production `hedge_page` (`src/read/candidates.rs`): start a hedge
+    /// race when enabled, eligible, directly reachable, and admitted.
+    /// Otherwise report no hedge to the plan and return false.
+    fn try_hedge(&mut self, id: u64) -> bool {
+        let now = self.now();
+        let instant = self.instant(now);
+        let fill = self.fills.get(&id).expect("present");
+        let (node, w) = (fill.node, fill.worker);
+        let enabled = self.config.node.hedge_slots > 0;
+        let (first, second) = (
+            fill.order.get(0).unwrap_or(0),
+            fill.order.get(1).unwrap_or(0),
+        );
+        let facts = HedgeFacts {
+            page_operation: true,
+            is_candidate: fill.rank.is_some(),
+            owners: fill.cands.len(),
+            first,
+            second,
+            distinct: fill.cands.len() >= 2 && fill.cands[first] != fill.cands[second],
+            remaining_attempts: fill.budget.remaining_attempts(),
+            remaining_links: fill.budget.remaining_links(),
+        };
+        let eligible = hedge_eligible(facts);
+        if eligible {
+            self.metrics.incr("hedge_eligible");
+        }
+        if !enabled {
+            self.fills.get_mut(&id).expect("present").plan.hedge(false);
+            return false;
+        }
+        let (a, b) = (fill.cands[first], fill.cands[second]);
+        let started = eligible && self.direct_available(node, a) && self.direct_available(node, b);
+        let reservation = started
+            .then(|| {
+                let n = &self.nodes[node as usize];
+                let quotas = &n.workers[w as usize].quotas;
+                let escrow = hedge_pages(quotas, 1)?;
+                // Fund both contenders before spending credits.
+                drop(hedge_pages(quotas, 2)?);
+                let delay = Duration::from_nanos(self.config.node.hedge_delay_ns);
+                let permit = n
+                    .hedges
+                    .acquire(DUPLICATE_BYTES, instant + delay)
+                    .map_err(|_| Error::Overloaded)?;
+                Ok::<_, Error>((permit, escrow))
+            })
+            .and_then(Result::ok);
+        let Some((permit, escrow)) = reservation else {
+            if eligible {
+                self.metrics.incr("hedge_suppressed");
+            }
+            self.fills.get_mut(&id).expect("present").plan.hedge(false);
+            return false;
+        };
+        let fill = self.fills.get_mut(&id).expect("present");
+        let (before_attempts, before_links) = (
+            fill.budget.remaining_attempts(),
+            fill.budget.remaining_links(),
+        );
+        let Ok((secondary, primary)) = hedge_budgets(&mut fill.budget) else {
+            self.metrics.incr("hedge_suppressed");
+            fill.plan.hedge(false);
+            return false;
+        };
+        fill.continuation = Continuation {
+            primary_consumed: true,
+            primary_outcome: None,
+            bounded_routes: true,
+        };
+        fill.hedge = Some(Box::new(Race {
+            primary_budget: primary,
+            secondary_budget: secondary,
+            primary: None,
+            secondary: None,
+            primary_done: false,
+            secondary_done: false,
+            launched: false,
+            winner: None,
+            fatal: None,
+            primary_outcome: None,
+            stale: false,
+            before: (before_attempts, before_links),
+            first,
+            second,
+            _permit: permit,
+            _escrow: escrow,
+        }));
+        self.metrics.incr("hedge_races");
+        match self.send_hedge(id, true) {
+            Ok(()) => {
+                let delay = self.config.node.hedge_delay_ns;
+                self.engine
+                    .after(delay.max(1), Event::HedgeDelay { fill: id });
+            }
+            Err(e) => self.hedge_result(id, true, Err(e)),
+        }
+        true
+    }
+
+    /// Plan and send one hedge contender as a pinned direct exchange.
+    fn send_hedge(&mut self, id: u64, primary: bool) -> Result<(), Error> {
+        let now = self.now();
+        let instant = self.instant(now);
+        let attempt_timeout = Duration::from_nanos(self.config.node.attempt_timeout_ns);
+        let fill = self.fills.get_mut(&id).expect("present");
+        let scope = fill.scope.min(fill.budget.deadline());
+        let race = fill.hedge.as_mut().expect("racing");
+        let (budget, canonical, mode) = if primary {
+            (&mut race.primary_budget, race.first, Mode::Acquire)
+        } else {
+            (&mut race.secondary_budget, race.second, Mode::CopyOnly)
+        };
+        let (before_attempts, before_links) =
+            (budget.remaining_attempts(), budget.remaining_links());
+        let plan = plan_attempt(
+            budget,
+            AttemptInputs {
+                now: instant,
+                caller_deadline: scope,
+                remaining_opportunities: 3,
+                route: RouteMode::DirectHedge,
+                mode,
+                attempt_timeout,
+                failure_links: MAX_LINKS,
+            },
+        )?;
+        let node = fill.node;
+        self.invariants.check(
+            "budget_never_grows",
+            plan.links <= before_links && plan.links == 1 && plan.remote_attempts < before_attempts.max(1),
+            now,
+            Some(node),
+            || format!("hedge plan {} links {} attempts from {before_links} links {before_attempts} attempts", plan.links, plan.remote_attempts),
+        );
+        let dest = fill.cands[canonical];
+        let pid = self.launch(id, dest, mode == Mode::Acquire, &plan, true, Some(primary));
+        let race = self
+            .fills
+            .get_mut(&id)
+            .expect("present")
+            .hedge
+            .as_mut()
+            .expect("racing");
+        if primary {
+            race.primary = Some(pid);
+        } else {
+            race.secondary = Some(pid);
+        }
+        Ok(())
+    }
+
+    /// The hedge delay elapsed: launch the copy-only duplicate unless the
+    /// primary already finished or the race is decided.
+    fn hedge_delay(&mut self, id: u64) {
+        let Some(fill) = self.fills.get(&id) else {
+            return;
+        };
+        let Some(race) = &fill.hedge else {
+            return;
+        };
+        if race.launched || race.secondary_done || race.winner.is_some() || race.fatal.is_some() {
+            return;
+        }
+        let (node, w, dest) = (fill.node, fill.worker, fill.cands[race.second]);
+        // Recheck the link and local headroom after the delay.
+        let quotas = &self.nodes[node as usize].workers[w as usize].quotas;
+        let ok = self.direct_available(node, dest) && hedge_pages(quotas, 1).is_ok();
+        let race = self
+            .fills
+            .get_mut(&id)
+            .expect("present")
+            .hedge
+            .as_mut()
+            .expect("racing");
+        race.launched = true;
+        if !ok {
+            self.metrics.incr("hedge_suppressed");
+            return self.hedge_result(id, false, Err(Error::Overloaded));
+        }
+        self.metrics.incr("hedge_started");
+        self.metrics
+            .add("hedge_duplicate_bytes", DUPLICATE_BYTES as u64);
+        if let Err(e) = self.send_hedge(id, false) {
+            self.hedge_result(id, false, Err(e));
+        }
+    }
+
+    /// One hedge contender finished (production `record_result` in
+    /// `uring_runtime::drivers::race`).
+    fn hedge_result(&mut self, id: u64, primary: bool, result: Result<(), Error>) {
+        let Some(fill) = self.fills.get_mut(&id) else {
+            return;
+        };
+        let Some(race) = fill.hedge.as_mut() else {
+            return;
+        };
+        if primary {
+            race.primary = None;
+            race.primary_done = true;
+            if !race.launched {
+                // A ready primary never launches the duplicate.
+                race.secondary_done = true;
+            }
+        } else {
+            race.secondary = None;
+            race.secondary_done = true;
+        }
+        match result {
+            Ok(()) if race.winner.is_none() && race.fatal.is_none() => {
+                race.winner = Some(primary);
+            }
+            Err(e) if !recoverable(e) && race.winner.is_none() && race.fatal.is_none() => {
+                race.fatal = Some(e);
+            }
+            _ => {}
+        }
+        let decided = race.winner.is_some() || race.fatal.is_some();
+        let mut cancel = Vec::new();
+        if decided {
+            if let Some(pid) = race.primary.take() {
+                race.primary_done = true;
+                cancel.push(pid);
+            }
+            if let Some(pid) = race.secondary.take() {
+                race.secondary_done = true;
+                cancel.push(pid);
+            }
+            race.secondary_done |= !race.launched;
+        }
+        let finished = race.primary_done && race.secondary_done;
+        for pid in cancel {
+            // The loser is canceled: its exchange and relay charges are
+            // released now. Production waits for the loser's completion
+            // fence; the simulator releases at cancellation.
+            self.metrics.incr("hedge_losers_canceled");
+            self.probes.remove(&pid);
+            if let Some(mid) = self
+                .msgs
+                .iter()
+                .find(|(_, m)| m.probe == pid)
+                .map(|(k, _)| *k)
+            {
+                self.msgs.remove(&mid);
+            }
+        }
+        if finished {
+            self.finish_race(id);
+        }
+    }
+
+    /// Both contenders are fenced: reunite budgets and either publish the
+    /// winner or fall back to the serial walk.
+    fn finish_race(&mut self, id: u64) {
+        let now = self.now();
+        let fill = self.fills.get_mut(&id).expect("present");
+        let race = *fill.hedge.take().expect("racing");
+        let node = fill.node;
+        let reunited = fill
+            .budget
+            .reunite(race.primary_budget)
+            .and_then(|()| fill.budget.reunite(race.secondary_budget));
+        let (attempts, links) = (
+            fill.budget.remaining_attempts(),
+            fill.budget.remaining_links(),
+        );
+        let (before_attempts, before_links) = race.before;
+        self.invariants.check(
+            "budget_never_grows",
+            reunited.is_ok() && attempts <= before_attempts && links <= before_links,
+            now,
+            Some(node),
+            || format!("hedge reunited {links} links {attempts} attempts from {before_links} links {before_attempts} attempts"),
+        );
+        let fill = self.fills.get_mut(&id).expect("present");
+        fill.continuation.primary_outcome =
+            Some(race.primary_outcome.unwrap_or(ProbeOutcome::Unreachable));
+        if let Err(e) = reunited {
+            return self.finish_fill(id, Err(e));
+        }
+        if let Some(primary) = race.winner {
+            self.metrics.incr(if primary {
+                "hedge_primary_won"
+            } else {
+                "hedge_won"
+            });
+            fill.continuation = Continuation::default();
+            fill.plan.hedge(true);
+            return self.continue_plan(id);
+        }
+        if let Some(e) = race.fatal
+            && !hedge_fallback(e)
+        {
+            return self.finish_fill(id, Err(e));
+        }
+        fill.plan.hedge(false);
+        self.metrics.incr("hedge_fallbacks");
+        if race.stale {
+            // Production `resolve_epoch_traced`: a stale hedge refreshes the
+            // candidates and walks the new epoch with bounded routes.
+            fill.continuation = Continuation {
+                bounded_routes: true,
+                ..Continuation::default()
+            };
+            let (retried, previous) = (fill.retried, fill.version);
+            let latest = self.adopt(node);
+            return match refresh_allowed(retried, previous, Some(latest)) {
+                Ok(()) => {
+                    self.metrics.incr("walk_membership_refreshes");
+                    self.fills.get_mut(&id).expect("present").retried = true;
+                    self.begin_walk(id)
+                }
+                Err(e) => self.fail_walk(id, e),
+            };
+        }
+        self.start_candidates(id);
     }
 
     fn step_walk(&mut self, id: u64) {
@@ -1593,26 +1989,50 @@ impl NodeWorld {
             },
         );
         let acquire = probe.mode == Mode::Acquire;
+        let pid = self.launch(id, dest, acquire, &plan, false, None);
+        self.fills.get_mut(&id).expect("present").probe = Some(pid);
+        Ok(())
+    }
+
+    /// Send one planned probe for fill `id` to `dest`. Returns the probe id.
+    fn launch(
+        &mut self,
+        id: u64,
+        dest: u32,
+        acquire: bool,
+        plan: &AttemptPlan,
+        direct: bool,
+        hedge: Option<bool>,
+    ) -> u64 {
+        let now = self.now();
+        let fill = &self.fills[&id];
         let deadline = plan.overall.saturating_duration_since(self.base).as_nanos() as Nanos;
+        let node = fill.node;
         let msg = Msg {
             probe: 0,
-            requester: fill.node,
-            at: fill.node,
+            requester: node,
+            at: node,
             dest,
             version: fill.version,
             page: fill.page,
             acquire,
-            path: vec![fill.node],
+            path: vec![node],
             links: plan.links,
             attempts: plan.remote_attempts,
             deadline,
             relays: Vec::new(),
+            direct,
         };
-        let node = fill.node;
         let pid = self.fresh();
         let mid = self.fresh();
-        self.fills.get_mut(&id).expect("present").probe = Some(pid);
-        self.probes.insert(pid, Probing { fill: id, acquire });
+        self.probes.insert(
+            pid,
+            Probing {
+                fill: id,
+                acquire,
+                hedge,
+            },
+        );
         self.msgs.insert(mid, Msg { probe: pid, ..msg });
         let timeout = self.nanos(plan.attempt_end).max(now + 1);
         self.engine.at(timeout, Event::ProbeTimeout { probe: pid });
@@ -1622,7 +2042,7 @@ impl NodeWorld {
             "peer_requests_copy_only"
         });
         self.forward(mid, node, None);
-        Ok(())
+        pid
     }
 
     // ---- peer messages ----
@@ -1631,6 +2051,12 @@ impl NodeWorld {
     /// `None` at the requester.
     fn forward(&mut self, mid: u64, holder: u32, plan: Option<RelayPlan>) {
         let m = self.msgs.get(&mid).expect("message");
+        if m.direct && plan.is_none() {
+            // A pinned direct hedge exchange: one link, no route search
+            // (production `request_direct`).
+            let dest = m.dest;
+            return self.link(mid, holder, None, dest);
+        }
         let Some(version) = self.versions.get(m.version) else {
             return self.fail_hop(mid, holder, Fault::IncompatibleMembership);
         };
@@ -1706,8 +2132,6 @@ impl NodeWorld {
         members: Rc<Members>,
         route: Result<Vec<usize>, topology::Error>,
     ) {
-        let now = self.now();
-        let instant = self.instant(now);
         if !self.msgs.contains_key(&mid) {
             return;
         }
@@ -1732,6 +2156,13 @@ impl NodeWorld {
             }
         };
         let next = members.members()[route[1]].node;
+        self.link(mid, holder, plan, next);
+    }
+
+    /// Send `mid` from `holder` over its link to `next`.
+    fn link(&mut self, mid: u64, holder: u32, plan: Option<RelayPlan>, next: u32) {
+        let now = self.now();
+        let instant = self.instant(now);
         let m = self.msgs.get_mut(&mid).expect("message");
         if let Some(plan) = plan {
             let Ok(outbound) = plan.outbound else {
@@ -2036,7 +2467,37 @@ impl NodeWorld {
                 })
             }
         };
-        self.complete_probe(probe.fill, outcome);
+        match probe.hedge {
+            None => self.complete_probe(probe.fill, outcome),
+            Some(primary) => {
+                // Production `hedge_page` contenders: a page wins, a stale
+                // reply marks the race stale, any other answer is a
+                // recoverable `Unavailable` (the primary's is kept as the
+                // walk's first evidence).
+                let result = match outcome {
+                    Ok(Outcome::Copy) => Ok(()),
+                    Ok(Outcome::StaleMembership) => {
+                        self.set_race(probe.fill, |r| r.stale = true);
+                        Err(Error::Unavailable)
+                    }
+                    Ok(Outcome::Probe(o)) => {
+                        if primary {
+                            self.set_race(probe.fill, |r| r.primary_outcome = Some(o));
+                        }
+                        Err(Error::Unavailable)
+                    }
+                    Ok(Outcome::Transport(_)) => Err(Error::Unavailable),
+                    Err(e) => Err(e),
+                };
+                self.hedge_result(probe.fill, primary, result);
+            }
+        }
+    }
+
+    fn set_race(&mut self, id: u64, f: impl FnOnce(&mut Race)) {
+        if let Some(race) = self.fills.get_mut(&id).and_then(|f| f.hedge.as_mut()) {
+            f(race);
+        }
     }
 
     fn complete_probe(&mut self, id: u64, outcome: Result<Outcome, Error>) {
@@ -2405,7 +2866,7 @@ impl NodeWorld {
         let Some(fill) = self.fills.remove(&id) else {
             return;
         };
-        if let Some(probe) = fill.probe {
+        for probe in fill.probes() {
             self.probes.remove(&probe);
         }
         let now = self.now();

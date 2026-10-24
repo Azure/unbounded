@@ -139,6 +139,9 @@ pub struct Node {
     pub version: u64,
     pub down: bool,
     pub incarnation: u32,
+    /// Speculative hedge slots and bytes shared by the node's workers
+    /// (production `Hedges`; zero slots disable hedging).
+    pub hedges: std::sync::Arc<flow_control::Hedges>,
 }
 
 pub struct Shared {
@@ -173,6 +176,10 @@ impl Node {
             version: 1,
             down: false,
             incarnation: 0,
+            hedges: flow_control::Hedges::new(
+                config.hedge_slots as usize,
+                config.hedge_bytes as usize,
+            ),
         }
     }
 
