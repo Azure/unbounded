@@ -23,6 +23,95 @@ pub struct NodeInfo {
     pub labels: BTreeMap<String, String>,
     pub annotations: BTreeMap<String, String>,
     pub deleting: bool,
+    /// The `Ready` condition, when the Node reports one.
+    pub ready: Option<Readiness>,
+}
+
+/// A `Ready` condition: whether it is `True`, and its `lastTransitionTime`
+/// in Unix seconds when that parsed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Readiness {
+    pub ready: bool,
+    pub since_unix: Option<u64>,
+}
+
+/// How long a member's Node must report `Ready` other than `True`
+/// before the member is dropped. Kubernetes already waits
+/// `node-monitor-grace-period` (40 s by default) of missed kubelet
+/// heartbeats before it marks a Node and its Pods not ready, so a dead
+/// member leaves the membership about 70 s after it stops; a process that
+/// restarts within that time keeps its place (and its pages) without
+/// membership churn.
+pub const NOT_READY_GRACE_SECS: u64 = 30;
+
+impl Readiness {
+    /// The `Ready` condition under `status.conditions`, if any.
+    pub fn from_json(v: &Value) -> Option<Self> {
+        let c = v["status"]["conditions"]
+            .as_array()?
+            .iter()
+            .find(|c| c["type"].as_str() == Some("Ready"))?;
+        Some(Self {
+            ready: c["status"].as_str() == Some("True"),
+            since_unix: c["lastTransitionTime"].as_str().and_then(parse_rfc3339),
+        })
+    }
+
+    /// Not ready for at least [`NOT_READY_GRACE_SECS`] at `now_unix`. A
+    /// condition without a parsable transition time, or one stamped in the
+    /// future, does not count: dropping a member needs positive evidence.
+    pub fn dead(&self, now_unix: u64) -> bool {
+        !self.ready
+            && self
+                .since_unix
+                .and_then(|t| t.checked_add(NOT_READY_GRACE_SECS))
+                .is_some_and(|end| now_unix >= end)
+    }
+}
+
+/// Parse a Kubernetes RFC 3339 UTC timestamp (`2024-01-02T03:04:05Z`, with
+/// optional fractional seconds) to Unix seconds.
+pub fn parse_rfc3339(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| -> Option<u64> {
+        let t = &s[r];
+        t.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| t.parse().ok())?
+    };
+    let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, mi, se) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    let rest = &s[19..];
+    let rest = match rest.strip_prefix('.') {
+        Some(f) => f.trim_start_matches(|c: char| c.is_ascii_digit()),
+        None => rest,
+    };
+    if rest != "Z"
+        || !(1..=12).contains(&mo)
+        || !(1..=31).contains(&d)
+        || h > 23
+        || mi > 59
+        || se > 60
+    {
+        return None;
+    }
+    // Days from civil (Howard Hinnant), proleptic Gregorian.
+    let (y, mo) = (y as i64 - i64::from(mo <= 2), mo as i64);
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (mo + if mo > 2 { -3 } else { 9 }) + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + (h * 3600 + mi * 60 + se) as i64).ok()
 }
 
 /// Controller owner reference.
@@ -59,6 +148,7 @@ impl NodeInfo {
             labels: kube::map_at(v, &["metadata", "labels"]),
             annotations: kube::map_at(v, &["metadata", "annotations"]),
             deleting: !kube::str_at(v, &["metadata", "deletionTimestamp"]).is_empty(),
+            ready: Readiness::from_json(v),
         }
     }
 
@@ -218,12 +308,33 @@ fn attributes(
 }
 
 /// Build membership. `pods_by_node` groups Pods by `spec.nodeName`.
+/// Readiness is not consulted; see [`reconcile_at`].
+#[cfg(test)]
 pub fn reconcile(
     nodes: &[NodeInfo],
     pods_by_node: &BTreeMap<String, Vec<PodInfo>>,
     ownership: &Ownership,
     peer_port: u16,
     accepted: &History,
+) -> std::result::Result<Result, MembersError> {
+    reconcile_at(nodes, pods_by_node, ownership, peer_port, accepted, None)
+}
+
+/// Build membership at wall time `now_unix` (Unix seconds). With a time, a
+/// Node whose `Ready` condition has not been `True` for
+/// [`NOT_READY_GRACE_SECS`] is left out (diagnostic `ready`), even if it was
+/// a member: a crashed member otherwise stays routable for as long as its
+/// Node and Pod objects exist. The Node condition is the kubelet heartbeat
+/// as judged by the node lifecycle controller. Pod readiness is not used: an
+/// operator-added readiness probe on `/readyz` depends on membership, so it
+/// would keep a new Pod out forever.
+pub fn reconcile_at(
+    nodes: &[NodeInfo],
+    pods_by_node: &BTreeMap<String, Vec<PodInfo>>,
+    ownership: &Ownership,
+    peer_port: u16,
+    accepted: &History,
+    now_unix: Option<u64>,
 ) -> std::result::Result<Result, MembersError> {
     if peer_port == 0 {
         return Err(MembersError::Invalid);
@@ -247,6 +358,15 @@ pub fn reconcile(
         let previous = accepted.get(&node.uid);
         let pods = pods_by_node.get(&node.name).unwrap_or(&empty);
         let selected = select_pod(pods, ownership, &node.name);
+        if let Some(now) = now_unix
+            && node.ready.is_some_and(|r| r.dead(now))
+        {
+            result.diagnostics.push(Diagnostic {
+                object: node.name.clone(),
+                field: "ready",
+            });
+            continue;
+        }
         let report = selected
             .and_then(|(p, _)| p.annotations.get(annotations::REPORT))
             .map(String::as_str);
@@ -544,5 +664,155 @@ mod tests {
             &serde_json::json!({"metadata":{"name":"n","uid":"x","deletionTimestamp":"t"}}),
         );
         assert!(n.deleting && !n.authorized());
+    }
+
+    #[test]
+    fn rfc3339_parsing() {
+        assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_rfc3339("2024-02-29T12:34:56Z"), Some(1_709_210_096));
+        assert_eq!(
+            parse_rfc3339("2024-02-29T12:34:56.789Z"),
+            Some(1_709_210_096)
+        );
+        assert_eq!(parse_rfc3339("2000-03-01T00:00:00Z"), Some(951_868_800));
+        for bad in [
+            "",
+            "t1",
+            "2024-02-29 12:34:56Z",
+            "2024-02-29T12:34:56+01:00",
+            "2024-13-01T00:00:00Z",
+            "2024-00-01T00:00:00Z",
+            "2024-01-01T24:00:00Z",
+            "2024-01-01T00:00:00",
+            "2024-01-01T00:00:0xZ",
+            "1969-12-31T23:59:59Z",
+        ] {
+            assert_eq!(parse_rfc3339(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn node_ready_condition_parsing() {
+        let n = NodeInfo::from_json(&serde_json::json!({
+            "metadata": {"name": "n", "uid": "x"},
+            "status": {"conditions": [
+                {"type": "MemoryPressure", "status": "False"},
+                {"type": "Ready", "status": "Unknown", "lastTransitionTime": "1970-01-01T00:01:40Z"}
+            ]}
+        }));
+        assert_eq!(
+            n.ready,
+            Some(Readiness {
+                ready: false,
+                since_unix: Some(100)
+            })
+        );
+        let n = NodeInfo::from_json(&serde_json::json!({
+            "metadata": {"name": "n", "uid": "x"},
+            "status": {"conditions": [{"type": "Ready", "status": "True"}]}
+        }));
+        assert_eq!(
+            n.ready,
+            Some(Readiness {
+                ready: true,
+                since_unix: None
+            })
+        );
+        let n = NodeInfo::from_json(&serde_json::json!({"metadata": {"name": "n", "uid": "x"}}));
+        assert_eq!(n.ready, None);
+    }
+
+    #[test]
+    fn readiness_needs_grace_and_a_time() {
+        let down = |since| Readiness {
+            ready: false,
+            since_unix: since,
+        };
+        assert!(!down(Some(100)).dead(100));
+        assert!(!down(Some(100)).dead(100 + NOT_READY_GRACE_SECS - 1));
+        assert!(down(Some(100)).dead(100 + NOT_READY_GRACE_SECS));
+        // A future stamp (clock skew) and an unparsable one are not evidence.
+        assert!(!down(Some(10_000)).dead(100));
+        assert!(!down(None).dead(u64::MAX));
+        assert!(
+            !Readiness {
+                ready: true,
+                since_unix: Some(0)
+            }
+            .dead(10_000)
+        );
+        assert!(!down(Some(u64::MAX)).dead(u64::MAX));
+    }
+
+    #[test]
+    fn dead_nodes_leave_and_return() {
+        let (a, mut b) = (node(1), node(2));
+        let pods = by_node(vec![
+            pod("n1", "10.0.0.1", "t", "a"),
+            pod("n2", "10.0.0.2", "t", "b"),
+        ]);
+        let at = |nodes: &[NodeInfo], h: &History, now| {
+            reconcile_at(nodes, &pods, &own(), 1, h, now).unwrap()
+        };
+        let first = at(&[a.clone(), b.clone()], &History::new(), Some(1000));
+        assert_eq!(first.members.len(), 2);
+        // Not ready, within the grace: kept.
+        b.ready = Some(Readiness {
+            ready: false,
+            since_unix: Some(1000),
+        });
+        let r = at(&[a.clone(), b.clone()], &first.members, Some(1010));
+        assert_eq!(r.members.len(), 2);
+        // Past the grace: dropped even though it was a member.
+        let r = at(
+            &[a.clone(), b.clone()],
+            &first.members,
+            Some(1000 + NOT_READY_GRACE_SECS),
+        );
+        assert_eq!(r.members.len(), 1);
+        assert!(r.members.contains_key(&a.uid));
+        assert!(
+            r.diagnostics
+                .iter()
+                .any(|d| d.object == "n2" && d.field == "ready")
+        );
+        // Without a time, readiness is not consulted.
+        assert_eq!(
+            at(&[a.clone(), b.clone()], &first.members, None)
+                .members
+                .len(),
+            2
+        );
+        // Ready again: back with the same attributes.
+        b.ready = Some(Readiness {
+            ready: true,
+            since_unix: Some(1100),
+        });
+        let back = at(&[a, b.clone()], &r.members, Some(1100));
+        let (was, now) = (&first.members[&b.uid], &back.members[&b.uid]);
+        assert_eq!(
+            (&was.peer_endpoint, was.shares),
+            (&now.peer_endpoint, now.shares)
+        );
+    }
+
+    #[test]
+    fn not_ready_within_grace_still_joins() {
+        let mut a = node(1);
+        a.ready = Some(Readiness {
+            ready: false,
+            since_unix: Some(1000),
+        });
+        let pods = by_node(vec![pod("n1", "10.0.0.1", "t", "a")]);
+        let r = reconcile_at(
+            std::slice::from_ref(&a),
+            &pods,
+            &own(),
+            1,
+            &History::new(),
+            Some(1001),
+        )
+        .unwrap();
+        assert_eq!(r.members.len(), 1);
     }
 }

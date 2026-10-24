@@ -128,8 +128,15 @@ pub fn plan_pass(i: &PassInputs<'_>, rng: &mut dyn Entropy) -> Result<PassPlan, 
             .push(p.clone());
     }
     let nodes: Vec<NodeInfo> = inv.nodes.values().cloned().collect();
-    let members = members::reconcile(&nodes, &by_node, i.ownership, i.peer_port, &history)
-        .map_err(|_| StateError::TooLarge);
+    let members = members::reconcile_at(
+        &nodes,
+        &by_node,
+        i.ownership,
+        i.peer_port,
+        &history,
+        Some(i.wall_unix),
+    )
+    .map_err(|_| StateError::TooLarge);
     let eligible = members::eligible_nodes(&pods, i.ownership);
     let catalog_input: Vec<CacheInfo> = inv.caches.values().cloned().collect();
     let durable = i.current.map(|c| c.keyring.clone()).unwrap_or_default();
