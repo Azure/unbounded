@@ -134,22 +134,17 @@ fn non_owner_funds_delegation_from_slack_only() {
     let mut walk = CandidateWalk::new(config(None, 3, order));
     let mut b = budget(8, 16);
     let mut seen = Vec::new();
-    loop {
-        match walk.next(&mut b).unwrap() {
-            Step::Probe(p) => {
-                let request = walk.request_budget(&mut b);
-                seen.push((p.canonical, request.remaining_attempts()));
-                // Spend the child entirely, as a forwarded funded route does.
-                let spent = request.remaining_attempts();
-                drop(request.partition(spent, 0).unwrap());
-                assert_eq!(
-                    walk.complete(&mut b, Outcome::Probe(ProbeOutcome::CopyMiss))
-                        .unwrap(),
-                    None
-                );
-            }
-            Step::End(_) => break,
-        }
+    while let Step::Probe(p) = walk.next(&mut b).unwrap() {
+        let request = walk.request_budget(&mut b);
+        seen.push((p.canonical, request.remaining_attempts()));
+        // Spend the child entirely, as a forwarded funded route does.
+        let spent = request.remaining_attempts();
+        let _ = request.partition(spent, 0).unwrap();
+        assert_eq!(
+            walk.complete(&mut b, Outcome::Probe(ProbeOutcome::CopyMiss))
+                .unwrap(),
+            None
+        );
     }
     assert_eq!(order.ranks().collect::<Vec<_>>(), [1, 2, 0]);
     assert_eq!(
@@ -258,7 +253,7 @@ fn handoff_probes_never_spend_the_origin_credit() {
         match walk.next(&mut b).unwrap() {
             Step::Probe(_) => {
                 probes += 1;
-                drop(walk.request_budget(&mut b).partition(1, 0).unwrap());
+                let _ = walk.request_budget(&mut b).partition(1, 0).unwrap();
                 assert_eq!(
                     walk.complete(&mut b, Outcome::Probe(ProbeOutcome::CopyMiss))
                         .unwrap(),
