@@ -339,3 +339,91 @@ fn canceled_crypto_holds_owners_until_completion_reap() {
     assert_eq!(occupancy(&real), [0, 0, 0], "reaped");
     assert!(CLASSES.iter().all(|class| real.used(*class) == 0));
 }
+
+/// Limits of the old model's `global_capacity_config`: 16 pages, 16 dirty
+/// pages, 6 pipes, 64 queue entries.
+fn global_capacity() -> flow_control::Quotas<AdmissionPolicy> {
+    const CONTEXT: usize = 256;
+    let nz = |n: usize| NonZeroUsize::new(n).unwrap();
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    limits.plaintext_bytes = nz(16 * PLAIN);
+    limits.ciphertext_bytes = nz(16 * CIPHER);
+    limits.dirty_bytes = nz(16 * CIPHER);
+    limits.pipes = nz(6);
+    limits.queue_entries = nz(64);
+    limits.flights = nz(16);
+    limits.waiters_per_flight = nz(64);
+    limits.client_connections = nz(64 + 6);
+    limits.request_context_bytes = nz((64 + 6) * CONTEXT);
+    limits.metadata_entries = nz(64);
+    flow_control::Quotas::new(AdmissionPolicy::new(limits))
+}
+
+/// Old: `two_live_caches_can_use_global_transport_capacity_until_exhaustion`
+/// and `two_caches_with_spare_pipes_do_not_park_readers`. Pipe and connection
+/// leases are node-wide (no cache key, as `PipePool` and `HttpPool` charge
+/// them): one live cache may use more than half while another cache holds
+/// request contexts, until the global limit.
+#[test]
+fn transport_capacity_is_global_across_live_caches() {
+    for class in [ResourceClass::Pipe, ResourceClass::Connection] {
+        let admission = global_capacity();
+        let caches = [CacheId("0".into()), CacheId("1".into())];
+        let contexts: Vec<_> = caches
+            .iter()
+            .map(|cache| {
+                admission
+                    .reserve(Some(cache), ResourceClass::RequestContext, 256)
+                    .unwrap()
+            })
+            .collect();
+        let limit = admission.limit(class);
+        let leases: Vec<_> = (0..limit)
+            .map(|slot| {
+                admission
+                    .reserve(None, class, 1)
+                    .unwrap_or_else(|_| panic!("{class:?} rejected at {slot}/{limit}"))
+            })
+            .collect();
+        assert!(leases.iter().all(|lease| lease.key().is_none()));
+        assert_eq!(admission.used(class), limit);
+        assert!(admission.reserve(None, class, 1).is_err());
+        let mut leases = leases;
+        drop(leases.pop());
+        let reused = admission.reserve(None, class, 1).unwrap();
+        assert_eq!(admission.used(class), limit);
+        drop((leases, reused, contexts));
+        assert!(CLASSES.iter().all(|class| admission.used(*class) == 0));
+    }
+}
+
+/// Old: `cache_scoped_resources_still_enforce_fairness_with_global_room`.
+/// Cache-keyed classes keep per-cache fair share even with global room: a
+/// cache holding half the limit is rejected once another cache is live.
+#[test]
+fn cache_scoped_resources_enforce_fairness_with_global_room() {
+    for (class, amount) in [
+        (ResourceClass::Plaintext, PLAIN),
+        (ResourceClass::Ciphertext, CIPHER),
+        (ResourceClass::DirtyCiphertext, CIPHER),
+        (ResourceClass::Registered, CIPHER),
+        (ResourceClass::RequestContext, 256),
+        (ResourceClass::Flight, 1),
+        (ResourceClass::Waiter, 1),
+    ] {
+        let admission = global_capacity();
+        let (a, b) = (CacheId("0".into()), CacheId("1".into()));
+        let limit = admission.limit(class);
+        let first = admission.reserve(Some(&a), class, limit / 2).unwrap();
+        let second = admission.reserve(Some(&b), class, amount).unwrap();
+        assert_eq!(first.key(), Some(&a));
+        assert_eq!(second.key(), Some(&b));
+        assert!(admission.used(class) + amount <= limit);
+        assert!(
+            admission.reserve(Some(&a), class, amount).is_err(),
+            "{class:?}"
+        );
+        drop((first, second));
+        assert_eq!(admission.used(class), 0);
+    }
+}
