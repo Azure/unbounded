@@ -120,6 +120,7 @@ func TestResolveUserDataScopesValidationToHillsboroImage(t *testing.T) {
 
 			_, _, err := ResolveUserData(t.Context(), reader, machine)
 			require.ErrorContains(t, err, "must not define top-level users")
+			require.True(t, IsPermanentError(err))
 
 			machine.Spec.Host = &v1alpha3.HostSpec{Netboot: machine.Spec.PXE.DeepCopy()}
 			machine.Spec.PXE = nil
@@ -134,6 +135,24 @@ func TestResolveUserDataScopesValidationToHillsboroImage(t *testing.T) {
 			require.Equal(t, userData, resolved)
 		})
 	}
+}
+
+func TestResolveUserDataClassifiesMissingKeyAsPermanent(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "access", Namespace: "default"},
+	}
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(configMap).Build()
+	machine := machineWithUserData("ghcr.io/azure/host-ubuntu2404-gb200-hillsboro:v1")
+
+	_, _, err := ResolveUserData(t.Context(), reader, machine)
+
+	require.ErrorContains(t, err, `key "user-data" not found`)
+	require.True(t, IsPermanentError(err))
 }
 
 func TestResolveUserDataAllowsTemplatingForGenericImages(t *testing.T) {

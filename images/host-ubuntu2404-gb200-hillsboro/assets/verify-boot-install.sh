@@ -24,6 +24,7 @@ for user in cchildress chokevin imiller31 jveski jwilder phealy plombardi89 qike
     keys="/home/$user/.ssh/authorized_keys"
     test -s "$keys"
     grep -Fq "gh:$user" "$keys"
+    ssh-keygen -l -f "$keys" >/dev/null
 done
 
 echo UNBOUNDED_GB200_UBUNTU_BOOT_PASS > /dev/ttyAMA0

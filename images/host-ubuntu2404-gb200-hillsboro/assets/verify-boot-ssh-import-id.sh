@@ -12,5 +12,18 @@ fi
 
 umask 077
 mkdir -p "$HOME/.ssh"
-printf 'ssh-ed25519 deterministic-boot-qualification %s\n' "$identity" \
+public_key=$(python3 - <<'PY'
+import base64
+import struct
+
+
+def field(value):
+    return struct.pack(">I", len(value)) + value
+
+
+blob = field(b"ssh-ed25519") + field(bytes(range(32)))
+print("ssh-ed25519", base64.b64encode(blob).decode())
+PY
+)
+printf '%s %s\n' "$public_key" "$identity" \
     > "$HOME/.ssh/authorized_keys"

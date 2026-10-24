@@ -22,6 +22,26 @@ import (
 
 const hillsboroImageRepository = "ghcr.io/azure/host-ubuntu2404-gb200-hillsboro"
 
+type permanentError struct {
+	err error
+}
+
+func (e permanentError) Error() string {
+	return e.err.Error()
+}
+
+func (e permanentError) Unwrap() error {
+	return e.err
+}
+
+// IsPermanentError reports whether retrying the same user-data cannot succeed
+// without changing the referenced ConfigMap.
+func IsPermanentError(err error) bool {
+	var permanent permanentError
+
+	return errors.As(err, &permanent)
+}
+
 // ValidateUserData rejects cloud-config that would replace image-baked users.
 func ValidateUserData(reader io.Reader) error {
 	data, err := io.ReadAll(reader)
@@ -104,12 +124,16 @@ func ResolveUserData(ctx context.Context, reader client.Reader, machine *v1alpha
 	}
 
 	if !ok {
-		return nil, false, fmt.Errorf("key %q not found in ConfigMap %s/%s", key, ref.Namespace, ref.Name)
+		return nil, false, permanentError{
+			err: fmt.Errorf("key %q not found in ConfigMap %s/%s", key, ref.Namespace, ref.Name),
+		}
 	}
 
 	if PreservesImageUsers(machine.Spec.Netboot().Image) {
 		if err := ValidateUserData(bytes.NewReader(data)); err != nil {
-			return nil, false, fmt.Errorf("validating ConfigMap %s/%s key %q: %w", ref.Namespace, ref.Name, key, err)
+			return nil, false, permanentError{
+				err: fmt.Errorf("validating ConfigMap %s/%s key %q: %w", ref.Namespace, ref.Name, key, err),
+			}
 		}
 	}
 

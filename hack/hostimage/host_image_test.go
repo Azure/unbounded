@@ -5,11 +5,14 @@ package hostimage
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/ssh"
 	"sigs.k8s.io/yaml"
 )
 
@@ -184,4 +187,22 @@ func TestHillsboroBootGateValidatesNamedAccess(t *testing.T) {
 	require.Contains(t, importer, "ssh-import-id must not be invoked for keyless bcho")
 	require.Contains(t, importer, "exit 1")
 	require.Contains(t, importer, `> "$HOME/.ssh/authorized_keys"`)
+
+	idCommand := exec.Command("id", "-un")
+	idOutput, err := idCommand.Output()
+	require.NoError(t, err)
+	username := strings.TrimSpace(string(idOutput))
+	require.NotEqual(t, "bcho", username)
+
+	home := t.TempDir()
+	importCommand := exec.Command("sh", filepath.Join(repoRoot(t), imageDir, "assets", "verify-boot-ssh-import-id.sh"), "gh:"+username)
+	importCommand.Env = append(os.Environ(), "HOME="+home)
+	require.NoError(t, importCommand.Run())
+
+	authorizedKey, err := os.ReadFile(filepath.Join(home, ".ssh", "authorized_keys"))
+	require.NoError(t, err)
+	_, comment, _, _, err := ssh.ParseAuthorizedKey(authorizedKey)
+	require.NoError(t, err)
+	require.Equal(t, "gh:"+username, comment)
+	require.Contains(t, install, `ssh-keygen -l -f "$keys"`)
 }

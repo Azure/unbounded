@@ -16,6 +16,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -704,6 +705,217 @@ func TestReconcilerRejectsHillsboroUserDataDuringVirtualMediaReplace(t *testing.
 
 	require.Equal(t, v1alpha3.OperationPhaseFailed, change.target.Phase)
 	require.Contains(t, change.target.Message, "must not define top-level users")
+}
+
+func TestReconcilerRetriesTransientUserDataReadBeforeHostReplace(t *testing.T) {
+	t.Parallel()
+
+	machine := testBareMetalMachine("machine-1", "rack-a")
+	machine.Spec.PXE.Image = "ghcr.io/azure/host-ubuntu2404-gb200-hillsboro@sha256:abc"
+	machine.Spec.PXE.CloudInit = &v1alpha3.CloudInitSpec{
+		UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{Name: "access", Namespace: "default"},
+	}
+	op := testOperation("op-replace-transient-userdata", v1alpha3.OperationHostReplace)
+	op.Spec.MachineRef = machine.Name
+	op.Status.Phase = v1alpha3.OperationPhaseInProgress
+	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{{
+		MachineRef: machine.Name,
+		Phase:      v1alpha3.OperationPhasePending,
+	}}
+	c := fake.NewClientBuilder().
+		WithScheme(testScheme(t)).
+		WithObjects(machine, op).
+		WithStatusSubresource(machine, op).
+		Build()
+	power := &recordingPowerClient{}
+	reconciler := testReconciler(c, power, "rack-a")
+	reconciler.APIReader = configMapErrorReader{
+		Reader: c,
+		err:    apierrors.NewTimeoutError("temporary ConfigMap timeout", 1),
+	}
+
+	_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+
+	require.ErrorContains(t, err, "temporary ConfigMap timeout")
+	require.Empty(t, power.calls)
+
+	var unchanged v1alpha3.MachineOperation
+	require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: op.Name}, &unchanged))
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, unchanged.Status.Phase)
+	require.Len(t, unchanged.Status.Targets, 1)
+	require.Equal(t, v1alpha3.OperationPhasePending, unchanged.Status.Targets[0].Phase)
+	require.Nil(t, unchanged.Status.Targets[0].CompletedAt)
+}
+
+func TestReconcilerRetriesTransientUserDataReadDuringVirtualMediaReplace(t *testing.T) {
+	t.Parallel()
+
+	machine := testBareMetalMachine("machine-1", "rack-a")
+	machine.Spec.PXE.Image = "ghcr.io/azure/host-ubuntu2404-gb200-hillsboro@sha256:abc"
+	machine.Spec.PXE.BootProtocol = v1alpha3.PXEBootProtocolVirtualMedia
+	machine.Spec.PXE.CloudInit = &v1alpha3.CloudInitSpec{
+		UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{Name: "access", Namespace: "default"},
+	}
+	op := testOperation("op-replace-active-transient-userdata", v1alpha3.OperationHostReplace)
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
+	power := &recordingPowerClient{}
+	reconciler := testReconciler(c, power, "rack-a")
+	reconciler.APIReader = configMapErrorReader{
+		Reader: c,
+		err:    apierrors.NewTimeoutError("temporary ConfigMap timeout", 1),
+	}
+	target := v1alpha3.MachineOperationTargetStatus{
+		MachineRef: machine.Name,
+		Phase:      v1alpha3.OperationPhaseInProgress,
+		Stage:      v1alpha3.OperationStageWaitingRepave,
+		BootMedia: &v1alpha3.MachineOperationBootMediaStatus{
+			Netboot:    machine.Spec.PXE.DeepCopy(),
+			Site:       "rack-a",
+			MachineUID: machine.UID,
+			Phase:      "Installing",
+		},
+	}
+
+	change := reconciler.advanceTarget(t.Context(), op, target)
+
+	require.ErrorContains(t, change.err, "temporary ConfigMap timeout")
+	require.Equal(t, v1alpha3.OperationPhaseInProgress, change.target.Phase)
+	require.Equal(t, v1alpha3.OperationStageWaitingRepave, change.target.Stage)
+	require.Nil(t, change.target.CompletedAt)
+	require.Empty(t, power.calls)
+}
+
+func TestReconcilerPreflightsAllUserDataBeforeConcurrentHostReplace(t *testing.T) {
+	t.Parallel()
+
+	protected := testBareMetalMachine("machine-protected", "rack-a")
+	protected.Spec.PXE.Image = "ghcr.io/azure/host-ubuntu2404-gb200-hillsboro@sha256:abc"
+	protected.Spec.PXE.CloudInit = &v1alpha3.CloudInitSpec{
+		UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{Name: "access", Namespace: "default"},
+	}
+	generic := testBareMetalMachine("machine-generic", "rack-a")
+	op := testOperation("op-replace-batch-transient-userdata", v1alpha3.OperationHostReplace)
+	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{
+		{MachineRef: protected.Name, Phase: v1alpha3.OperationPhasePending},
+		{MachineRef: generic.Name, Phase: v1alpha3.OperationPhasePending},
+	}
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(protected, generic).Build()
+	power := &recordingPowerClient{
+		states: map[string]redfish.PowerState{generic.Name: redfish.PowerOn},
+	}
+	reconciler := testReconciler(c, power, "rack-a")
+	reconciler.APIReader = configMapErrorReader{
+		Reader: c,
+		err:    apierrors.NewTimeoutError("temporary ConfigMap timeout", 1),
+	}
+
+	changes, _ := reconciler.advanceTargets(t.Context(), op, nil)
+
+	require.Len(t, changes, 1)
+	require.ErrorContains(t, changes[0].err, "temporary ConfigMap timeout")
+	require.Empty(t, power.calls)
+}
+
+func TestReconcilerPersistsSiblingProgressBeforeReturningConcurrentReadError(t *testing.T) {
+	t.Parallel()
+
+	protected := testBareMetalMachine("machine-protected", "rack-a")
+	protected.UID = types.UID("protected-uid")
+	protected.Spec.PXE.Image = "ghcr.io/azure/host-ubuntu2404-gb200-hillsboro@sha256:abc"
+	protected.Spec.PXE.CloudInit = &v1alpha3.CloudInitSpec{
+		UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{Name: "access", Namespace: "default"},
+	}
+	generic := testBareMetalMachine("machine-generic", "rack-a")
+	op := testOperation("op-replace-concurrent-read-error", v1alpha3.OperationHostReplace)
+	op.Status.Phase = v1alpha3.OperationPhaseInProgress
+	op.Status.Targets = []v1alpha3.MachineOperationTargetStatus{
+		{
+			MachineRef: protected.Name,
+			Phase:      v1alpha3.OperationPhaseInProgress,
+			Stage:      v1alpha3.OperationStageWaitingRepave,
+			BootMedia: &v1alpha3.MachineOperationBootMediaStatus{
+				Netboot:        protected.Spec.PXE.DeepCopy(),
+				Site:           "rack-a",
+				MachineUID:     protected.UID,
+				Phase:          "Installing",
+				PhaseStartedAt: ptrTo(fixedNow()),
+			},
+		},
+		{MachineRef: generic.Name, Phase: v1alpha3.OperationPhasePending},
+	}
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "access", Namespace: "default"},
+		Data:       map[string]string{"user-data": "#cloud-config\nruncmd: []\n"},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(testScheme(t)).
+		WithObjects(generic, op, configMap).
+		WithStatusSubresource(op).
+		Build()
+	power := &recordingPowerClient{
+		states: map[string]redfish.PowerState{generic.Name: redfish.PowerOn},
+	}
+	reconciler := testReconciler(c, power, "rack-a")
+	reconciler.APIReader = objectErrorReader{
+		Reader: c,
+		name:   protected.Name,
+		err:    apierrors.NewTimeoutError("temporary Machine timeout", 1),
+	}
+
+	changes, _ := reconciler.advanceTargets(t.Context(), op, nil)
+
+	require.Len(t, changes, 2)
+	require.Equal(t, []string{"machine-generic:ForceOff"}, power.calls)
+	require.ErrorContains(t, reconciler.applyTargetChanges(t.Context(), op.Name, changes, false), "temporary Machine timeout")
+
+	var updated v1alpha3.MachineOperation
+	require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: op.Name}, &updated))
+	require.Equal(t, v1alpha3.OperationStageWaitingRepave, updated.Status.Targets[0].Stage)
+	require.Equal(t, v1alpha3.OperationStageWaitingOff, updated.Status.Targets[1].Stage)
+	require.Equal(t, "sent ForceOff before configuring repave boot", updated.Status.Targets[1].Message)
+}
+
+func TestReconcilerUsesPreflightedMachineSnapshotForHostReplace(t *testing.T) {
+	t.Parallel()
+
+	const genericImage = "ghcr.io/azure/host-ubuntu2404-gb200@sha256:abc"
+
+	machine := testBareMetalMachine("machine-1", "rack-a")
+	machine.Spec.PXE.Image = genericImage
+	machine.Spec.PXE.CloudInit = &v1alpha3.CloudInitSpec{
+		UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{Name: "access", Namespace: "default"},
+	}
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "access", Namespace: "default"},
+		Data:       map[string]string{"user-data": "#cloud-config\nusers: [unexpected]\n"},
+	}
+	op := testOperation("op-replace-preflight-snapshot", v1alpha3.OperationHostReplace)
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(machine, configMap).Build()
+	power := &recordingPowerClient{
+		states: map[string]redfish.PowerState{machine.Name: redfish.PowerOn},
+	}
+	reconciler := testReconciler(c, power, "rack-a")
+	target := v1alpha3.MachineOperationTargetStatus{
+		MachineRef: machine.Name,
+		Phase:      v1alpha3.OperationPhasePending,
+	}
+
+	change, validatedMachine, proceed := reconciler.preflightTargetUserData(t.Context(), op, target)
+	require.True(t, proceed)
+	require.NoError(t, change.err)
+	require.Equal(t, genericImage, validatedMachine.Spec.PXE.Image)
+
+	var updatedMachine v1alpha3.Machine
+	require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: machine.Name}, &updatedMachine))
+	updatedMachine.Spec.PXE.Image = "ghcr.io/azure/host-ubuntu2404-gb200-hillsboro@sha256:def"
+	require.NoError(t, c.Update(t.Context(), &updatedMachine))
+
+	action := reconciler.advanceTargetAfterUserDataValidation(t.Context(), op, validatedMachine, change.target)
+
+	require.NoError(t, action.err)
+	require.Equal(t, v1alpha3.OperationStageWaitingOff, action.target.Stage)
+	require.Equal(t, genericImage, power.images[machine.Name])
+	require.Equal(t, []string{"machine-1:ForceOff"}, power.calls)
 }
 
 func TestReconcilerPowersOnHostReplaceTargetWhenOff(t *testing.T) {
@@ -1697,9 +1909,37 @@ func testReconciler(c client.Client, power PowerClientFactory, site string) *Rec
 	}
 }
 
+type configMapErrorReader struct {
+	client.Reader
+	err error
+}
+
+func (r configMapErrorReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*corev1.ConfigMap); ok {
+		return r.err
+	}
+
+	return r.Reader.Get(ctx, key, obj, opts...)
+}
+
+type objectErrorReader struct {
+	client.Reader
+	name string
+	err  error
+}
+
+func (r objectErrorReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if key.Name == r.name {
+		return r.err
+	}
+
+	return r.Reader.Get(ctx, key, obj, opts...)
+}
+
 type recordingPowerClient struct {
 	mu                      sync.Mutex
 	states                  map[string]redfish.PowerState
+	images                  map[string]string
 	disableBootUnsupported  map[string]bool
 	httpBootUnsupported     map[string]bool
 	httpBootURIAbsent       map[string]bool
@@ -1721,9 +1961,15 @@ func (r *recordingPowerClient) ForMachine(_ context.Context, machine *v1alpha3.M
 	if r.states == nil {
 		r.states = map[string]redfish.PowerState{}
 	}
+	if r.images == nil {
+		r.images = map[string]string{}
+	}
 
 	if _, ok := r.states[machine.Name]; !ok {
 		r.states[machine.Name] = redfish.PowerOn
+	}
+	if netboot := machine.Spec.Netboot(); netboot != nil {
+		r.images[machine.Name] = netboot.Image
 	}
 
 	return &recordingMachinePowerClient{parent: r, machine: machine.Name}, nil
