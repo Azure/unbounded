@@ -2699,6 +2699,12 @@ impl WorkerApplication {
             self.refresh_snapshot(startup)?;
             self.activate_native(startup).await?;
             self.start_listeners().await?;
+            // Only now may managed control report this Pod: a primary
+            // admits a new member once it reports, so peers never route to
+            // a member whose listener is not open (Known issue 51).
+            if let Some(control) = &self.control {
+                control.mark_serving();
+            }
             self.started = true;
             self.observe_health()?;
             Ok(())
