@@ -233,7 +233,7 @@ Verified against the code at the start of this work.
    (seed 1, 1 s, `request_rate` 2) 99,562 page reads fail this way while relays reject 1.25M
    transfers on the `Relay` quota (16 per worker).
 
-6. Resolved (round 4, track handoff, 3a5afb9bc, f174052bb, c720c7ba8): origin requests for a page
+6. Resolved (round 4, track handoff, cda9f9ea6, 57792bc40, 2733abafd): origin requests for a page
    are at most 1 + (rank 0 changes) + (fetches after the previous fetcher lost the page) +
    (fetches while it still held it). The last class needs a transient failure, a concurrent cold
    miss, or an owner without credits or links to delegate; tests keep it under 2% of origin requests
@@ -249,7 +249,7 @@ Verified against the code at the start of this work.
    11 times and 20,035 of 45,938 pages more than once. No invariant is relaxed: `only_owner_hits_origin`
    holds on each request's own version; this is the cost of ownership moves, reported for review.
 
-7. Resolved (round 4, liveness, 4332bbcf6 and 4e2279844): the primary drops a member whose Node
+7. Resolved (round 4, liveness, af267b813 and f3be4c1cc): the primary drops a member whose Node
    has not been `Ready` for 30 s, so a crashed member is chosen for at most about 90 s (76 s
    observed at 50k); see "Round 4: liveness". Earlier: reads near crashed members no longer fail
    with `HopBudgetExhausted` (issue 5), commit 296a54117. Crashed members still stay routable until link backoff; the remaining failures
@@ -292,11 +292,18 @@ Verified against the code at the start of this work.
    `HopBudgetExhausted` failures. No search was rejected in the other combined runs. No invariant
    is relaxed. This is reported as a behavior to review.
 
-11. Data-plane half resolved (round 4, capacity, 98a025f91 and 35ae1eb21): the simulator
+11. Resolved in two halves (round 4, enroll and capacity). Combined numbers: "Round 4: combined
+   (wave 1)".
+   Data-plane half (round 4, capacity, 90544e2ca and 4654ec26e): the simulator
    streamed page bodies to requesters that had timed out, and the 1 s storm was 14 times over the
-   owners' egress bound; 50k now reads 884k ok / 11.8k failed (background reads, issue 72), with the
-   bound enforced by a test. See "Round 4: capacity". The control-plane half (enrollment 429s) is
-   the enroll track's. Original text:
+   owners' egress bound; 50k now reads 884k ok / 11.8k failed (background reads, issue 17), with the
+   bound enforced by a test. See "Round 4: capacity".
+   Control-plane half resolved: enrollment is no longer limited by API 429s. Each authorization
+   reuses cached TokenReviews and bindings, a whole authorization is reused for 5 s, the immediate
+   keyring recheck is skipped, and a per-seat adaptive API budget keeps calls under the server's
+   rate. In 50k `enrollment-storm`, 429s fell from 462k to 23.5k and the all-enrolled time from
+   282 s to 171 s. See "Round 4: enroll" (commits 9c36377e8..50a1963bf).
+   Original text:
    The 50k `full-cold-start` storm still fails most page reads. With issues 5 and 10 fixed, no read
    fails with `HopBudgetExhausted` and no search is rejected, but walks that end `Exhausted` are now
    retried by the client (`Unavailable` is `recoverable`) and run into the read deadline instead:
@@ -305,14 +312,8 @@ Verified against the code at the start of this work.
    times 16 pages while nodes enroll) exceeds what the read deadline allows; 1.34M walks end
    `Exhausted`. No invariant is relaxed. Reported for review: the failure is now a capacity limit,
    not an error classification.
-   Control-plane half resolved: enrollment is no longer limited by API 429s. Each authorization
-   reuses cached TokenReviews and bindings, a whole authorization is reused for 5 s, the immediate
-   keyring recheck is skipped, and a per-seat adaptive API budget keeps calls under the server's
-   rate. In 50k `enrollment-storm`, 429s fell from 462k to 23.5k and the all-enrolled time from
-   282 s to 171 s. See "Round 4: enroll" (commits 275f60475..e4737c390). The data-plane half (reads
-   failing on the deadline) is the capacity track's.
 
-12. Resolved (round 4, track handoff, f174052bb): an owner asks a predecessor that held the same
+12. Resolved (round 4, track handoff, 57792bc40): an owner asks a predecessor that held the same
    rank under the previous membership under that membership, for 10 s after replacing it, so a
    lagging predecessor serves. Owner stale skips in 5k `churn-r` went from 143 to 3. See "Round 4:
    handoff". Original report:
@@ -322,7 +323,7 @@ Verified against the code at the start of this work.
    to 4 (mean 1.35 to 1.41); at 50,000 nodes the maximum stays 5 (mean 2.39 to 2.47).
    `only_owner_hits_origin` holds. Same family as Known issue 6.
 
-13. Resolved (round 4, track handoff, 3a5afb9bc): handoff targets no longer reserve credits or
+13. Resolved (round 4, track handoff, cda9f9ea6): handoff targets no longer reserve credits or
    links that the delegation to rank 0 needs, and an owner with handoff targets forwards spare
    credits to rank 0. 5k `full-churn` max per page 9 to 5. See "Round 4: handoff". Original report:
    Repeat origin fetches across membership versions have a heavier tail with handoff probes than
@@ -331,16 +332,16 @@ Verified against the code at the start of this work.
    (handoff needs two), and a rank 0 reached through delegation has one credit, so it never asks
    them. Root cause not fully established; see "Round 3: origin". No invariant is relaxed.
 
-51. Members whose control client has not applied a membership yet (enrolling, or restarted) are
+14. Members whose control client has not applied a membership yet (enrolling, or restarted) are
    routable but refuse peer links. In `full-failover` at 50,000 nodes (seed 1) about 145k of
    165,343 link failures go to them, coinciding with most of the 12.6k failed reads (60 to 200
    s). Inference from counters; see "Round 4: liveness". No invariant is relaxed.
 
-52. Dropping a dead member (issue 7 fix) is an ownership move and inherits issues 6 and 12: at
+15. Dropping a dead member (issue 7 fix) is an ownership move and inherits issues 6 and 12: at
    50,000 nodes in `full-failover` it added 171 recoverable `Unavailable` reads and moved the
    worst page from 7 to 9 origin requests. See "Round 4: liveness".
 
-71. Hot-page peer throughput is capped by the page's `REPLICAS` owners: candidates are only the
+16. Hot-page peer throughput is capped by the page's `REPLICAS` owners: candidates are only the
    ranked owners (`src/read/candidates.rs:628-635`), so readers holding a copy never serve other
    readers, and a storm on one page gets at most `REPLICAS * nic_bps / page_bytes` deliveries per
    second. Enforced by
@@ -348,7 +349,7 @@ Verified against the code at the start of this work.
    overload relays shed on the `Relay` quota before the owners' NICs saturate (50k, 1 s storm: about
    177k storm pages against a 570k bound). Raising it is a design change. See "Round 4: capacity".
 
-72. Background reads during enrollment fail `Unavailable`: in `full-cold-start` about 12% of the
+17. Background reads during enrollment fail `Unavailable`: in `full-cold-start` about 12% of the
    Zipf reads (11.7k at 50k, ~100 at 5k, unchanged since round 3) fail while 138k link attempts hit
    members that are published but not yet enrolled (inference from `link_failures`; the storm alone
    reads 80,000 of 80,000 pages at 5k). Belongs with the enroll and liveness work.
@@ -776,42 +777,27 @@ scenarios carry data-plane faults.
 3. Resolved: a requester on a newer membership than its destination skips it (round 3, route).
 4. Resolved: owners above rank 0 delegate cold fetches to rank 0 (ea016b68d).
 5. Resolved: a local hop budget shortfall ends the walk recoverably (round 3, route).
-6. Partly resolved: owners ask previous-membership owners before origin (07a932713); see
-   "Round 3: origin" for what remains.
-7. Resolved: members whose Node has not been `Ready` for 30 s leave the membership, bounding how
-   long a crashed member is chosen to about 90 s (round 4, liveness, 4332bbcf6, 4e2279844).
-
 6. Resolved: origin requests per page are at most 1 + rank 0 changes + copies lost + a small,
    tested remainder (round 4, handoff).
-7. Partly resolved: crashed members stay routable until link backoff, but reads near them no
-   longer fail with `HopBudgetExhausted` (round 3, route).
+7. Resolved: members whose Node has not been `Ready` for 30 s leave the membership, bounding how
+   long a crashed member is chosen to about 90 s (round 4, liveness).
 8. Resolved: core `PageFlights::reject` fails the rejected leader like production (a27f1f7ac).
 9. Resolved: the simulator no longer touches on a duplicate publish (a27f1f7ac).
 10. Resolved: route searches beyond 8 per node queue (up to 64) instead of failing (round 3, route).
-11. The 50k `full-cold-start` storm still fails most reads; failures moved from hop budget to read
-   deadline (round 3, route).
-   Control-plane half resolved: enrollment is no longer bound by API 429s (462k to 23.5k at 50k;
-   round 4, enroll, 275f60475..e4737c390). The data-plane half remains open (capacity track).
-
-11. Data-plane half resolved: abandoned page bodies are no longer streamed and the storm window
-   fits the owners' egress (round 4, capacity, 98a025f91, 35ae1eb21); control-plane half: enroll track.
-12. Owners whose predecessor is behind now reach the origin, adding origin requests per page in
-   churn (round 3, route).
-13. Repeat origin fetches across membership versions have a heavier tail with handoff probes in
-   50k `full-churn` (max 13 vs 10) (round 3, origin).
-51. Members not yet holding a membership are routable but refuse peer links; most 50k
-   `full-failover` link failures (round 4, liveness).
-52. Dropping a dead member costs one ownership move (issues 6, 12) (round 4, liveness).
-
-71. Hot-page throughput is capped at `REPLICAS` owners' NICs; bound enforced by a test (round 4,
+11. Resolved: enrollment is no longer bound by API 429s (462k to 23.5k at 50k; round 4, enroll),
+   and the storm no longer streams to abandoned requesters and fits the owners' egress (round 4,
    capacity).
-72. Background reads during enrollment fail `Unavailable` near unenrolled members (round 4,
-   capacity).
-
 12. Resolved: owners ask an unchanged predecessor under the previous membership, so a lagging one
-   serves (round 4, handoff, f174052bb).
+   serves (round 4, handoff).
 13. Resolved: handoff targets no longer block or starve the delegation to rank 0 (round 4,
-   handoff, 3a5afb9bc).
+   handoff).
+14. Members not yet holding a membership are routable but refuse peer links; most 50k
+   `full-failover` link failures (round 4, liveness).
+15. Dropping a dead member costs one ownership move (issues 6, 12) (round 4, liveness).
+16. Hot-page throughput is capped at `REPLICAS` owners' NICs; bound enforced by a test (round 4,
+   capacity).
+17. Background reads during enrollment fail `Unavailable` near unenrolled members (round 4,
+   capacity).
 
 ## Round 2: production admission
 
@@ -1577,7 +1563,7 @@ Known issue 7: crashed members stayed in the membership and routable.
   mostly between 60 and 200 s (`read_failed_at_s` p50 120 s, p90 192 s). Of the 165,343 link
   failures, 20,108 cross the site partition (`partition_link_failures`) and 13 reach crashed
   members. The rest, about 145k, reach members whose control client has not applied a membership
-  yet, so they do not accept peer links (new issue 51). The round 1 and round 3 text attributed
+  yet, so they do not accept peer links (new issue 14). The round 1 and round 3 text attributed
   the failures to crashes without measuring this.
 
 ### Liveness signal
@@ -1672,13 +1658,13 @@ toward it at most once per link backoff (100 ms doubling to 20 s), as before.
   nothing to speed up there.
 - A Pod that crash-loops while its kubelet is healthy stays a member, because Pod readiness is
   deliberately not used. Its peers' link backoff covers it.
-- New issue 51: about 145k of 165k link failures in 50k `full-failover` go to members whose
+- New issue 14: about 145k of 165k link failures in 50k `full-failover` go to members whose
   control client has not applied any membership yet, during enrollment and after restarts. They
   coincide with the bulk of the failed reads (60 to 200 s). This is an inference from the
   counters; the link failure is not yet tagged per read. Either membership should not include
   members that cannot serve, or such members should accept links. It overlaps with the enroll
   and capacity tracks.
-- New issue 52: dropping a dead member is an ownership move, so it inherits the issue 6 and 12
+- New issue 15: dropping a dead member is an ownership move, so it inherits the issue 6 and 12
   origin and `StaleMembership` costs (171 recoverable failed reads at 50k). The handoff track
   fixes apply.
 
@@ -1746,7 +1732,7 @@ abandoned exchanges dropped, the owners now deliver close to that bound instead 
 10 s read deadline. Before the fix it saw 375 late replies and 16 peer fills (19 of 97 reads ok);
 after, 0 late replies and 86 peer fills (bound 120; 89 of 97 reads ok). Raising hot-page
 throughput beyond `REPLICAS` owners (readers serving readers) would be a design change and is
-recorded as Known issue 71.
+recorded as Known issue 16.
 
 ### Tests
 
@@ -1775,7 +1761,7 @@ Release build, seed 1, `full-cold-start` with default duration. "before" is the 
 
 - The storm alone completes: 5k with `{"request_rate": 0}` reads 80,000 of 80,000 pages. The
   remaining ~100 (5k) and 11.7k (50k) failures are background Zipf reads, unchanged by this track
-  and present before it; see Known issue 72.
+  and present before it; see Known issue 17.
 - At 50k, origin requests per page fell from mean 1.60 to 1.22 (max 3 both). All enrolled at 285 s
   in all three 50k runs (the storm starts at 300 s). Zero hard invariant failures, no relaxed
   invariant.
@@ -1784,7 +1770,7 @@ Release build, seed 1, `full-cold-start` with default duration. "before" is the 
   they hold it while bodies stream, walks end `Exhausted`, and reads fail `Unavailable` after the
   client's retries; successful reads finish within 2 s (p99). The successes stay below the owner
   bound (about 177k storm pages against a 10 s bound of about 570k): shedding happens at the relays
-  in front of the owners, so an owner's NIC is not kept saturated (Known issue 71).
+  in front of the owners, so an owner's NIC is not kept saturated (Known issue 16).
 - 50k wall and peak RSS: before 24:43, 10.3 GiB; after 14:55, 4.1 GiB; 1 s storm 26:26. The
   liveness track's 50k run shared the host.
 
@@ -1793,14 +1779,14 @@ Release build, seed 1, `full-cold-start` with default duration. "before" is the 
 - No production change; the failing behavior was a simulator artifact plus an overloaded scenario.
   The brief's "fail fast with `Overloaded`" happens at relays (production's held `Relay`
   reservation), and the client-visible error is `Unavailable` after the walk is exhausted.
-- Known issue 71 (new): hot-page throughput is capped by `REPLICAS` owners; the bound above is
+- Known issue 16 (new): hot-page throughput is capped by `REPLICAS` owners; the bound above is
   enforced by a test, raising it is a design change.
-- Known issue 72 (new): background reads during enrollment fail `Unavailable`.
+- Known issue 17 (new): background reads during enrollment fail `Unavailable`.
 
 ## Round 4: handoff
 
 Track handoff closes Known issues 6, 12 and 13. Commits on branch `racer-sim4-handoff`:
-b5da57b53 (`Published::resolve_recent`), 3a5afb9bc (issue 13), f174052bb (issue 12), c720c7ba8
+a09fac015 (`Published::resolve_recent`), cda9f9ea6 (issue 13), 57792bc40 (issue 12), 2733abafd
 (repeat classification and simulator tests), plus this section.
 
 ### Root causes
