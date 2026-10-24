@@ -2337,6 +2337,7 @@ func evidenceCheckStatuses(statuses []signalv1.CheckStatus) ([]evidenceCheckStat
 
 	for index := range statuses {
 		status := &statuses[index]
+
 		var document json.RawMessage
 
 		if status.BackendEvidence.Content != "" {
@@ -2634,8 +2635,8 @@ func groupedBackendEvidenceComplete(
 	seen := make([]bool, participantCount)
 	complete := !allowPartial && evidence.Complete && evidence.CaptureError == ""
 	podUIDs := map[types.UID]struct{}{}
-	expectedAPIVersion, expectedKind, err := backendIdentity(backend)
 
+	expectedAPIVersion, expectedKind, err := backendIdentity(backend)
 	if err != nil {
 		return false, err
 	}
@@ -2816,8 +2817,8 @@ func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationR
 	evidenceRun.Status.Workflow.Phase = "Canceled"
 
 	statuses := initialCheckStatuses(run.Spec.Checks)
-	workflow, err := r.workflowForCancellation(ctx, run)
 
+	workflow, err := r.workflowForCancellation(ctx, run)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
