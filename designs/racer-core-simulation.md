@@ -244,8 +244,10 @@ Verified against the code at the start of this work.
    11 times and 20,035 of 45,938 pages more than once. No invariant is relaxed: `only_owner_hits_origin`
    holds on each request's own version; this is the cost of ownership moves, reported for review.
 
-7. Partly resolved: reads near crashed members no longer fail with `HopBudgetExhausted` (issue 5),
-   commit 296a54117. Crashed members still stay routable until link backoff; the remaining failures
+7. Resolved (round 4, liveness, 4332bbcf6 and 4e2279844): the primary drops a member whose Node
+   has not been `Ready` for 30 s, so a crashed member is chosen for at most about 90 s (76 s
+   observed at 50k); see "Round 4: liveness". Earlier: reads near crashed members no longer fail
+   with `HopBudgetExhausted` (issue 5), commit 296a54117. Crashed members still stay routable until link backoff; the remaining failures
    are recoverable `Unavailable` after client retries. See "Round 3: route". Original text:
    Crashed members stay in the membership (their Node and Pod objects remain, so `plan_pass` keeps
    them), and peers keep routing through them until link backoff opens their circuits. Each failed
@@ -311,6 +313,15 @@ Verified against the code at the start of this work.
    fetched more than once. Owners left with one credit after delegating cannot ask previous owners
    (handoff needs two), and a rank 0 reached through delegation has one credit, so it never asks
    them. Root cause not fully established; see "Round 3: origin". No invariant is relaxed.
+
+51. Members whose control client has not applied a membership yet (enrolling, or restarted) are
+   routable but refuse peer links. In `full-failover` at 50,000 nodes (seed 1) about 145k of
+   165,343 link failures go to them, coinciding with most of the 12.6k failed reads (60 to 200
+   s). Inference from counters; see "Round 4: liveness". No invariant is relaxed.
+
+52. Dropping a dead member (issue 7 fix) is an ownership move and inherits issues 6 and 12: at
+   50,000 nodes in `full-failover` it added 171 recoverable `Unavailable` reads and moved the
+   worst page from 7 to 9 origin requests. See "Round 4: liveness".
 
 ## Simulator engine (racer-sim substrate)
 
@@ -737,8 +748,8 @@ scenarios carry data-plane faults.
 5. Resolved: a local hop budget shortfall ends the walk recoverably (round 3, route).
 6. Partly resolved: owners ask previous-membership owners before origin (07a932713); see
    "Round 3: origin" for what remains.
-7. Partly resolved: crashed members stay routable until link backoff, but reads near them no
-   longer fail with `HopBudgetExhausted` (round 3, route).
+7. Resolved: members whose Node has not been `Ready` for 30 s leave the membership, bounding how
+   long a crashed member is chosen to about 90 s (round 4, liveness, 4332bbcf6, 4e2279844).
 8. Resolved: core `PageFlights::reject` fails the rejected leader like production (a27f1f7ac).
 9. Resolved: the simulator no longer touches on a duplicate publish (a27f1f7ac).
 10. Resolved: route searches beyond 8 per node queue (up to 64) instead of failing (round 3, route).
@@ -750,6 +761,9 @@ scenarios carry data-plane faults.
    churn (round 3, route).
 13. Repeat origin fetches across membership versions have a heavier tail with handoff probes in
    50k `full-churn` (max 13 vs 10) (round 3, origin).
+51. Members not yet holding a membership are routable but refuse peer links; most 50k
+   `full-failover` link failures (round 4, liveness).
+52. Dropping a dead member costs one ownership move (issues 6, 12) (round 4, liveness).
 
 ## Round 2: production admission
 
@@ -1490,3 +1504,132 @@ faithful model of production before this round. "After" is this branch. `full-co
 - **This round changes enrollment timing for the capacity track's `full-cold-start` runs.** Nodes
   enroll sooner at 50k, so reads start earlier in the storm.
 - New issues: none.
+
+## Round 4: liveness
+
+Known issue 7: crashed members stayed in the membership and routable.
+
+### Root cause
+
+- `members::reconcile` (`cluster-control/src/authority/members.rs`, the loop after
+  `if !node.authorized()`) admitted every authorized Node with a selected Pod, and kept the
+  previous member when the Pod was missing (`previous.map(|p| p.peer_endpoint.clone())`, line
+  393). No input said whether the node was alive, so a dead node stayed a member for as long as
+  its Node and Pod objects existed, which for a crashed node is indefinitely.
+- The step model matched: `ControlPlane::crash` (`cluster-control/src/step/cluster.rs`) left the
+  objects untouched and nothing ever changed them, so `plan_pass` kept the member forever.
+- Measured with new sim metrics (`dead_member_links`, `dead_member_link_age_s` in
+  `sim/src/node/world.rs:2370`), at 50,000 nodes in `full-failover` the permanently crashed Pod
+  was still chosen 370 s after its crash, at the end of the run. In a longer run there is no
+  bound.
+- The scale of the read failures blamed on issue 7 was wrong. Before the fix, the same run had
+  13 link attempts toward crashed members and 0 failed reads while any member was down
+  (`reads_failed_while_crashed`, `sim/src/node/world.rs:1258`). The 12,588 failed reads happen
+  mostly between 60 and 200 s (`read_failed_at_s` p50 120 s, p90 192 s). Of the 165,343 link
+  failures, 20,108 cross the site partition (`partition_link_failures`) and 13 reach crashed
+  members. The rest, about 145k, reach members whose control client has not applied a membership
+  yet, so they do not accept peer links (new issue 51). The round 1 and round 3 text attributed
+  the failures to crashes without measuring this.
+
+### Liveness signal
+
+The fix uses the Node `Ready` condition, which is the kubelet heartbeat as judged by the node
+lifecycle controller. It goes `Unknown` after `node-monitor-grace-period` (40 s by default) of
+missed heartbeats. The other candidates were rejected:
+
+- Pod readiness: the deployed DaemonSet is not in this repo and has no probe here, and
+  `/readyz` requires `membership_usable` (`src/telemetry.rs:1205`). An operator-added readiness
+  probe would therefore keep a new Pod out of the membership forever.
+- The reporter annotation: it is written rarely and has no freshness stamp.
+- Seat and peer reports: they would need a new wire field and do not exist today.
+
+### Changes
+
+- Production, `cluster-control/src/authority/members.rs`:
+  - `NodeInfo` gains `ready: Option<Readiness>`, parsed from `status.conditions[type=Ready]`
+    (`Readiness::from_json`, with a small RFC 3339 parser, `parse_rfc3339`, line 74).
+  - `reconcile_at` (line 331) takes the wall time and leaves out a Node whose `Ready` condition
+    has been other than `True` for `NOT_READY_GRACE_SECS` = 30 s (line 362), recording the
+    diagnostic `ready`. This applies even when the node was a member.
+  - `Readiness::dead` (line 63) needs positive evidence: a missing or unparsable transition
+    time, or one in the future, never drops a member. A Node with no `Ready` condition is kept.
+  - A not-ready Node inside the grace still joins, so readiness never delays enrollment.
+- `plan_pass` (`cluster-control/src/step/primary.rs:131`), which production also uses, calls
+  `reconcile_at` with `wall_unix`. Passes run at least every `LEASE_RENEW` (10 s), so a drop
+  needs no extra trigger. There is no wire format change.
+- Hysteresis and change rate: a member leaves only after 40 s of missed heartbeats plus 30 s of
+  grace, so a Pod that restarts within about 70 s keeps its place and its pages without
+  membership churn. Each node therefore adds at most one drop per 70 s of downtime, and the
+  primary batches all drops of one pass into one version. A node returns on the first pass after
+  its Node is `Ready` again.
+- Step model, `cluster-control/src/step/cluster.rs`:
+  - `crash` schedules `Ev::NodeNotReady` after `node_monitor_grace` (line 364, default 40 s).
+    The event is handled for dead Pods and cancelled by the epoch bump on restart.
+  - `restart` sets the Node `Ready` again. A crash in the combined model is a whole-node crash.
+- racer-sim, `sim/src/control.rs`: new control key `node_monitor_grace_ns` (default 40 s). Setting
+  it to 0 restores the pre-round-4 model exactly: the `full-failover` 5k trace hash is
+  0fedb04dad20626a either way.
+
+### Tests
+
+- `authority::members` tests:
+  - `rfc3339_parsing`
+  - `node_ready_condition_parsing`
+  - `readiness_needs_grace_and_a_time` (boundary, future stamps, overflow, missing time)
+  - `dead_nodes_leave_and_return` (kept inside the grace, dropped after it even with history,
+    unchanged without a time, back with the same attributes)
+  - `not_ready_within_grace_still_joins`
+- `step::cluster` tests:
+  - `crashed_node_leaves_membership_after_grace_and_returns`: kept for 65 s, dropped by 85 s in
+    exactly one version, back after restart.
+  - `quick_restart_keeps_membership`: a 30 s outage causes no version change.
+- `combined::tests::failover_drops_the_dead_member` checks that the oldest link toward a crashed
+  member is at most 90 s after the crash, and that a second membership was published. With
+  `node_monitor_grace_ns` 0 (the old model) it fails: 214 links, oldest at 143 s.
+
+### Evidence
+
+Release build, seed 1, `full-failover`, `--config '{"request_rate": 0.005}'`. "Off" is the same
+binary with `node_monitor_grace_ns` 0, which reproduces the pre-fix model. No run had a hard
+invariant failure.
+
+| Nodes | Model | Dead-member links (oldest) | Reads ok / failed | Failed while crashed | Origin requests (max per page) | Wall |
+| --- | --- | --- | --- | --- | --- | --- |
+| 5,000 | off | 11 (388 s) | 33,924 / 122 | 0 | 13,421 (7) | 0:29 |
+| 5,000 | on | 5 (72 s) | 33,917 / 127 | 5 | 13,432 (7) | 0:29 |
+| 50,000 | off | 13 (370 s) | 273,215 / 12,588 | 0 | 57,221 (7) | 14:26 |
+| 50,000 | on | 6 (76 s) | 272,950 / 12,759 | 171 | 57,163 (9) | 21:53 |
+
+Reading the table:
+
+- With the fix, crashed members stop being chosen within 76 s of the crash at both scales.
+  Before, they were chosen until the end of the run.
+- The cost is one extra membership version per node that stays dead. At 50k that version caused
+  1,859 `StaleMembership` replies, 150 origin fetches on an older membership, and 171 more
+  recoverable `Unavailable` reads (0.06%). The worst page moved from 7 to 9 origin requests
+  (pages fetched more than once: 12,526 to 12,531). This is the ownership-move cost of Known
+  issues 6 and 12 (handoff track), not a liveness cost.
+- Wall time rose with the second version's placement ranking.
+
+Resolved bound: a crashed member is chosen for at most `node-monitor-grace-period` (40 s) +
+`NOT_READY_GRACE_SECS` (30 s) + one pass (10 s) + client propagation, which is under 90 s in
+the model. `failover_drops_the_dead_member` enforces this. Within that window each holder fails
+toward it at most once per link backoff (100 ms doubling to 20 s), as before.
+
+### Deviations and open items
+
+- The data-plane side (`LinkHealth`, ranked owner skip) is unchanged. The measurements show
+  crashed members are not a significant source of failed reads at 5k or 50k, so there was
+  nothing to speed up there.
+- A Pod that crash-loops while its kubelet is healthy stays a member, because Pod readiness is
+  deliberately not used. Its peers' link backoff covers it.
+- New issue 51: about 145k of 165k link failures in 50k `full-failover` go to members whose
+  control client has not applied any membership yet, during enrollment and after restarts. They
+  coincide with the bulk of the failed reads (60 to 200 s). This is an inference from the
+  counters; the link failure is not yet tagged per read. Either membership should not include
+  members that cannot serve, or such members should accept links. It overlaps with the enroll
+  and capacity tracks.
+- New issue 52: dropping a dead member is an ownership move, so it inherits the issue 6 and 12
+  origin and `StaleMembership` costs (171 recoverable failed reads at 50k). The handoff track
+  fixes apply.
+
