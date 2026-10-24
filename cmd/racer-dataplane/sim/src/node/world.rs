@@ -110,6 +110,10 @@ pub enum Reply {
     /// The exchange failed without a signed response.
     Transport,
     Response(ResponseKind),
+    /// `Overloaded` signed by the destination itself, not by a relay
+    /// (production: `VerifiedResponse::origin` is the destination). The
+    /// walk reports it as `Outcome::Shed`.
+    Shed,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -186,6 +190,7 @@ impl Event {
                 match reply {
                     Reply::Transport => 0,
                     Reply::Response(kind) => 1 + kind as u64,
+                    Reply::Shed => 1_000,
                 },
             ),
             Self::ProbeTimeout { probe } => (6, probe, 0),
@@ -2716,6 +2721,11 @@ impl NodeWorld {
         let Some(m) = self.msgs.remove(&mid) else {
             return;
         };
+        let reply = if from == m.dest && reply == Reply::Response(ResponseKind::Overloaded) {
+            Reply::Shed
+        } else {
+            reply
+        };
         let now = self.now();
         let mut route: Vec<u32> = Vec::with_capacity(m.path.len() + 1);
         route.push(from);
@@ -2785,6 +2795,7 @@ impl NodeWorld {
         let page = fill.page;
         let outcome = match reply {
             Reply::Transport => Ok(Outcome::Transport(ProbeOutcome::Unreachable)),
+            Reply::Shed => Ok(Outcome::Shed),
             Reply::Response(ResponseKind::StaleMembership)
                 if probe.hedge.is_none() && self.pending_no_refresh(probe.fill) =>
             {
@@ -2851,6 +2862,14 @@ impl NodeWorld {
                     Ok(Outcome::Copy) => Ok(()),
                     Ok(Outcome::StaleMembership) => {
                         self.set_race(probe.fill, |r| r.stale = true);
+                        Err(Error::Unavailable)
+                    }
+                    Ok(Outcome::Shed) => {
+                        if primary {
+                            self.set_race(probe.fill, |r| {
+                                r.primary_outcome = Some(ProbeOutcome::Overloaded)
+                            });
+                        }
                         Err(Error::Unavailable)
                     }
                     Ok(Outcome::Probe(o)) => {

@@ -89,8 +89,10 @@ pub struct WalkConfig {
     /// The walk is eligible only when it starts with at least
     /// [`HELPER_MIN_ATTEMPTS`] attempts (so a helper, which inherits fewer,
     /// never asks another helper). It asks the helper at most once, right
-    /// after an owner probe fails transiently (`Overloaded` or
-    /// `Unreachable`), funded with up to [`HELPER_ATTEMPTS`] attempts and
+    /// after an owner itself sheds the probe ([`Outcome::Shed`]; an
+    /// `Overloaded` signed by a relay or a timeout does not count, since
+    /// those say the route, not the page, is congested), funded with up to
+    /// [`HELPER_ATTEMPTS`] attempts and
     /// [`HELPER_LINKS`] links from what is left. Owner probes are planned
     /// exactly as without a helper. Ignored for owners and non-pages.
     pub helper: bool,
@@ -192,6 +194,14 @@ pub enum Outcome {
     /// on to the next owner without charging a route failure; the route
     /// itself worked.
     StaleDestination,
+    /// The destination itself answered `Overloaded` (signed by the
+    /// destination, not by a relay in front of it): for example an owner
+    /// shedding readers of a hot page
+    /// ([`super::fanout::shed_hot_page`]). Recorded like
+    /// `Probe(Overloaded)` but without charging a route failure (the route
+    /// worked); for a non-owner page walk it is also the one signal that asks
+    /// the page's overflow helper.
+    Shed,
 }
 
 /// How the epoch ended.
@@ -454,15 +464,6 @@ impl CandidateWalk {
                 self.saw_version |= outcome == ProbeOutcome::VersionUnavailable;
                 self.saw_transient |= transient(outcome);
                 self.index += 1;
-                if self.helper == Helper::Armed
-                    && matches!(
-                        outcome,
-                        ProbeOutcome::Overloaded | ProbeOutcome::Unreachable
-                    )
-                {
-                    self.helper = Helper::Due;
-                    return self.next(budget);
-                }
                 continue;
             }
             // With only the sender attempt left, a page Acquire would carry
@@ -644,13 +645,7 @@ impl CandidateWalk {
             };
         }
         self.index += 1;
-        if self.helper == Helper::Armed
-            && matches!(
-                outcome,
-                Outcome::Probe(ProbeOutcome::Overloaded | ProbeOutcome::Unreachable)
-                    | Outcome::Transport(ProbeOutcome::Overloaded | ProbeOutcome::Unreachable)
-            )
-        {
+        if self.helper == Helper::Armed && outcome == Outcome::Shed {
             self.helper = Helper::Due;
         }
         match outcome {
@@ -662,7 +657,11 @@ impl CandidateWalk {
             }
             // A previous owner that lags or leads this membership is only a
             // missing copy: never refresh the owner's walk for it.
-            Outcome::StaleMembership | Outcome::StaleDestination if pending.handoff => Ok(None),
+            Outcome::StaleMembership | Outcome::StaleDestination | Outcome::Shed
+                if pending.handoff =>
+            {
+                Ok(None)
+            }
             Outcome::Probe(outcome) | Outcome::Transport(outcome) if pending.handoff => {
                 if matches!(
                     outcome,
@@ -691,6 +690,12 @@ impl CandidateWalk {
             Outcome::StaleDestination => {
                 self.saw_transient = true;
                 self.evidence.push(ProbeOutcome::Unreachable);
+                Ok(None)
+            }
+            // The route worked; the destination is busy.
+            Outcome::Shed => {
+                self.saw_transient = true;
+                self.evidence.push(ProbeOutcome::Overloaded);
                 Ok(None)
             }
             Outcome::Probe(outcome) | Outcome::Transport(outcome) => {
@@ -787,6 +792,7 @@ impl RemainingWalk {
         match outcome {
             Outcome::Copy => return Some(RemainingEnd::Copy),
             Outcome::Probe(outcome) => self.transient |= transient(outcome),
+            Outcome::Shed => self.transient = true,
             Outcome::Transport(_) => {
                 self.transient = true;
                 budget.note_route_failure();

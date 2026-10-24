@@ -2,9 +2,10 @@
 //!
 //! Only a page's ranked owners (at most `REPLICAS`) are candidates, so a page
 //! that every node reads at once can be sent no faster than `REPLICAS` NICs
-//! allow. When a non-owner's first owner probe fails transiently (the owner or
-//! a relay in front of it is `Overloaded`, or the exchange timed out), the
-//! walk asks one *helper* to acquire the page for it (see
+//! allow. An owner already streaming [`HOT_PAGE_BODIES`] bodies of a page
+//! sheds further readers with a signed `Overloaded` ([`shed_hot_page`]), and
+//! a non-owner whose owner sheds it asks one *helper* to acquire the page for
+//! it (see
 //! [`super::walk::WalkConfig::helper`]). A helper is an ordinary member that
 //! is not an owner of the page; it runs its own non-owner walk against the
 //! owners, coalesces concurrent requests for the page in its page flight, and

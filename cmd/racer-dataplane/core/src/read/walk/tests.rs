@@ -978,7 +978,7 @@ fn overloaded_owner_sends_the_reader_to_its_helper_once() {
         if p.canonical == 3 {
             Outcome::Copy
         } else {
-            Outcome::Transport(ProbeOutcome::Overloaded)
+            Outcome::Shed
         }
     });
     assert_eq!(end, End::Copy);
@@ -1005,12 +1005,26 @@ fn overloaded_owner_sends_the_reader_to_its_helper_once() {
 fn helper_miss_falls_back_to_remaining_owners_and_never_repeats() {
     let mut walk = CandidateWalk::new(helper_config(VisitOrder::canonical(3)));
     let mut b = budget(32, 64);
-    let (probes, end) = drive(&mut walk, &mut b, |_, _| {
-        Outcome::Transport(ProbeOutcome::Unreachable)
-    });
+    let (probes, end) = drive(&mut walk, &mut b, |_, _| Outcome::Shed);
     let canon: Vec<_> = probes.iter().map(|(p, ..)| p.canonical).collect();
     assert_eq!(canon, vec![0, 3, 1, 2]);
     assert!(matches!(end, End::Exhausted { .. }), "{end:?}");
+}
+
+#[test]
+fn only_a_destination_shed_asks_the_helper() {
+    // Relay overload and timeouts say the route is congested, not the page.
+    for outcome in [
+        Outcome::Probe(ProbeOutcome::Overloaded),
+        Outcome::Transport(ProbeOutcome::Overloaded),
+        Outcome::Transport(ProbeOutcome::Unreachable),
+        Outcome::Probe(ProbeOutcome::CopyMiss),
+    ] {
+        let mut walk = CandidateWalk::new(helper_config(VisitOrder::canonical(3)));
+        let mut b = budget(32, 64);
+        let (probes, _) = drive(&mut walk, &mut b, |_, _| outcome);
+        assert!(probes.iter().all(|(p, ..)| p.canonical < 3), "{outcome:?}");
+    }
 }
 
 #[test]
@@ -1039,9 +1053,7 @@ fn helper_never_chains_and_owners_never_use_helpers() {
     const { assert!(HELPER_ATTEMPTS < HELPER_MIN_ATTEMPTS) };
     let mut walk = CandidateWalk::new(helper_config(VisitOrder::canonical(3)));
     let mut b = budget(HELPER_ATTEMPTS, 8);
-    let (probes, _) = drive(&mut walk, &mut b, |_, _| {
-        Outcome::Transport(ProbeOutcome::Overloaded)
-    });
+    let (probes, _) = drive(&mut walk, &mut b, |_, _| Outcome::Shed);
     assert!(probes.iter().all(|(p, ..)| p.canonical < 3));
     // Owners ignore the helper flag.
     let mut walk = CandidateWalk::new(WalkConfig {
@@ -1049,9 +1061,7 @@ fn helper_never_chains_and_owners_never_use_helpers() {
         ..config(Some(2), 3, VisitOrder::canonical(3))
     });
     let mut b = budget(8, 16);
-    let (probes, end) = drive(&mut walk, &mut b, |_, _| {
-        Outcome::Transport(ProbeOutcome::Overloaded)
-    });
+    let (probes, end) = drive(&mut walk, &mut b, |_, _| Outcome::Shed);
     assert!(probes.iter().all(|(p, ..)| p.canonical < 2));
     assert!(matches!(end, End::Origin { rank: 2, .. }));
 }
@@ -1068,7 +1078,7 @@ fn helper_is_skipped_when_too_little_is_left() {
         canon.push(probe.canonical);
         // The exchange forwards every credit of its budget.
         let _ = walk.request_budget(&mut b).transfer();
-        let outcome = Outcome::Transport(ProbeOutcome::Overloaded);
+        let outcome = Outcome::Shed;
         if walk.complete(&mut b, outcome).unwrap().is_some() {
             break;
         }
@@ -1101,13 +1111,32 @@ fn small_budget_non_owner_visits_rank_zero_first() {
 }
 
 #[test]
-fn hedged_primary_overflow_asks_the_helper_first() {
+fn hedged_primary_overload_does_not_ask_the_helper() {
+    // A hedge reports only `ProbeOutcome::Overloaded`, without who signed it,
+    // so it never counts as a destination shed.
     let mut cfg = helper_config(VisitOrder::canonical(3));
     cfg.continuation.primary_consumed = true;
     cfg.continuation.primary_outcome = Some(ProbeOutcome::Overloaded);
     let mut walk = CandidateWalk::new(cfg);
     let mut b = budget(8, 16);
     let (probes, end) = drive(&mut walk, &mut b, |_, _| Outcome::Copy);
-    assert_eq!(probes[0].0.canonical, 3);
+    assert_eq!(probes[0].0.canonical, 1);
     assert_eq!(end, End::Copy);
+}
+
+#[test]
+fn destination_shed_is_evidence_but_not_a_route_failure() {
+    for (outcome, failed) in [
+        (Outcome::Shed, false),
+        (Outcome::Transport(ProbeOutcome::Overloaded), true),
+    ] {
+        let mut walk = CandidateWalk::new(config(None, 3, VisitOrder::canonical(3)));
+        let mut b = budget(32, 64);
+        let Step::Probe(_) = walk.next(&mut b).unwrap() else {
+            panic!("probe")
+        };
+        assert_eq!(walk.complete(&mut b, outcome).unwrap(), None);
+        assert_eq!(walk.evidence(), &[ProbeOutcome::Overloaded]);
+        assert_eq!(b.route_links(), if failed { 8 } else { 4 }, "{outcome:?}");
+    }
 }

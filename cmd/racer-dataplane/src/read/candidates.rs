@@ -1015,16 +1015,17 @@ impl CandidatePolicy {
                     (Some(previous), true) => previous,
                     _ => &candidates.membership,
                 };
+                // Canonical ranks past the owners address handoff targets
+                // (`WalkConfig::handoff`) or, for a non-owner, the overflow
+                // helper (`WalkConfig::helper`).
+                let destination = match probe.canonical.checked_sub(candidates.ordered.len()) {
+                    Some(i) => &handoff[i],
+                    None => &candidates.ordered[probe.canonical],
+                };
                 let response = self
                     .request_traced(
                         membership,
-                        // Canonical ranks past the owners address handoff
-                        // targets (`WalkConfig::handoff`) or, for a
-                        // non-owner, the overflow helper (`WalkConfig::helper`).
-                        match probe.canonical.checked_sub(candidates.ordered.len()) {
-                            Some(i) => &handoff[i],
-                            None => &candidates.ordered[probe.canonical],
-                        },
+                        destination,
                         context,
                         &operation,
                         if copy_only {
@@ -1044,6 +1045,15 @@ impl CandidatePolicy {
                     )
                     .await;
                 let outcome = match response {
+                    Ok(response)
+                        if matches!(response.response(), PeerResponse::Overloaded)
+                            && response.origin().node() == destination =>
+                    {
+                        // The destination itself, not a relay, shed the
+                        // request (for example a hot-page owner): the walk
+                        // may ask the page's helper (Known issue 16).
+                        WalkOutcome::Shed
+                    }
                     Ok(response) => {
                         if matches!(response.response(), PeerResponse::StaleMembership) {
                             if walk.pending_handoff() || walk.pending_previous() {
@@ -2658,46 +2668,135 @@ pub(super) mod tests {
         });
     }
 
-    /// Known issue 71: a non-owner whose owner sheds it (`Overloaded`) asks
-    /// the page's overflow helper once, with an Acquire funded from what is
-    /// left (too little for the helper to ask another helper), then the
-    /// remaining owners. Owners are never asked for helpers' sake twice.
+    /// Signs every reply as its destination, answering `Overloaded` (owners
+    /// shedding a hot page) or `Miss` (the helper); records each request.
+    struct ShedPeer {
+        nodes: Vec<NodeId>,
+        signing: Vec<crate::peer::forwarding::Forwarding>,
+        local: usize,
+        owners: Vec<NodeId>,
+        /// Owners fail at the transport (no signed reply) instead.
+        transport: bool,
+        #[allow(clippy::type_complexity)]
+        calls: RefCell<Vec<(NodeId, bool, u32)>>,
+    }
+    impl ShedPeer {
+        fn direct_hedge_available(
+            &self,
+            _: &std::sync::Arc<crate::topology::Membership>,
+            _: &NodeId,
+        ) -> bool {
+            false
+        }
+        fn request_direct<'a>(
+            &'a self,
+            _: PeerRequest,
+            _: std::sync::Arc<crate::topology::Membership>,
+            _: &'a RequestScope,
+        ) -> Operation<'a, VerifiedResponse> {
+            panic!("shed fixture does not admit direct hedges")
+        }
+        fn request<'a>(
+            &'a self,
+            request: PeerRequest,
+            _: std::sync::Arc<crate::topology::Membership>,
+            _: &'a RequestScope,
+        ) -> Operation<'a, VerifiedResponse> {
+            Box::pin(async move {
+                let destination = request.route.destination.clone();
+                let copy = matches!(
+                    request.operation,
+                    PeerOperation::Page {
+                        mode: FetchMode::CopyOnly,
+                        ..
+                    }
+                );
+                self.calls.borrow_mut().push((
+                    destination.clone(),
+                    copy,
+                    request.route.remaining_attempts,
+                ));
+                let owner = self.owners.contains(&destination);
+                if owner && self.transport {
+                    return Err(Error::Overloaded);
+                }
+                let remote = self.nodes.iter().position(|n| n == &destination).unwrap();
+                let (signed, binding) = self.signing[self.local].sign_request(request)?;
+                let admitted = self.signing[remote].verify_request(signed)?;
+                let response = if owner {
+                    PeerResponse::Overloaded
+                } else {
+                    PeerResponse::Miss
+                };
+                let response = self.signing[remote].sign_response(admitted.binding(), response)?;
+                self.signing[self.local].verify_response(response, &binding)
+            })
+        }
+    }
+
+    /// Known issue 71: a non-owner whose owner itself sheds it (a signed
+    /// `Overloaded` from the destination) asks the page's overflow helper
+    /// once, with an Acquire funded from what is left (too little for the
+    /// helper to ask another helper), then the remaining owners. A transport
+    /// `Overloaded` (no signed answer, as from a congested route) does not.
     #[test]
     fn shed_reader_asks_the_page_helper_once_then_the_other_owners() {
+        use crate::test_support::security::{network, node};
         futures::executor::block_on(async {
-            let membership = spread_membership(100);
+            let count = 16;
+            let nodes: Vec<NodeId> = (0..count).map(node).collect();
+            let membership = std::sync::Arc::new(
+                crate::topology::Membership::validate(
+                    racer_control_wire::MembershipVersion(1),
+                    nodes
+                        .iter()
+                        .enumerate()
+                        .map(|(i, n)| crate::topology::Member {
+                            node: n.clone(),
+                            shares: std::num::NonZeroU32::new(4).unwrap(),
+                            peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
+                            rails: vec![],
+                            site: String::new(),
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+            );
             let placement = Placement::new(8);
-            let local = membership.members()[0].node.clone();
-            let probe = spread_policy(local.clone(), ReplicaSelection::Primary);
+            let local = 0;
+            let probe = spread_policy(nodes[local].clone(), ReplicaSelection::Primary);
             let (page, candidates, helper) = (0..256)
                 .map(PageNumber)
                 .find_map(|page| {
                     let candidates = placement.rank(membership.clone(), &object(), page);
-                    if candidates.ordered.contains(&local) {
+                    if candidates.ordered.contains(&nodes[local]) {
                         return None;
                     }
                     let helper = probe.fanout_helper(&candidates, &object(), page)?;
                     Some((page, candidates, helper))
                 })
                 .expect("some page has a helper");
-            assert!(!candidates.ordered.contains(&helper) && helper != local);
-            for (error, helped) in [
-                (Error::Overloaded, true),
-                (Error::Unavailable, true),
-                (Error::Unauthorized, false),
-            ] {
-                let peers = Rc::new(FundedPeer {
-                    error: Some(error),
-                    ..FundedPeer::default()
+            assert!(!candidates.ordered.contains(&helper) && helper != nodes[local]);
+            for transport in [false, true] {
+                let peers = Rc::new(ShedPeer {
+                    nodes: nodes.clone(),
+                    signing: network(count)
+                        .into_iter()
+                        .map(crate::peer::forwarding::Forwarding::new)
+                        .collect(),
+                    local,
+                    owners: candidates.ordered.clone(),
+                    transport,
+                    calls: RefCell::default(),
                 });
                 let policy = CandidatePolicy::new(
-                    local.clone(),
+                    nodes[local].clone(),
                     Rc::new(Placement::new(8)),
                     Requester::scripted(
                         peers.clone(),
-                        FundedPeer::direct_hedge_available,
-                        FundedPeer::request,
-                        FundedPeer::request_direct,
+                        ShedPeer::direct_hedge_available,
+                        ShedPeer::request,
+                        ShedPeer::request_direct,
                     ),
                     probe.credentials.clone(),
                     probe.published.clone(),
@@ -2724,39 +2823,21 @@ pub(super) mod tests {
                     mode: FetchMode::Acquire,
                 };
                 let result = policy
-                    .resolve_with_budget(
-                        candidates.clone(),
-                        &context,
-                        operation,
-                        &scope,
-                        &mut budget,
-                    )
+                    .resolve_with_budget(candidates.clone(), &context, operation, &scope, &mut budget)
                     .await;
+                assert!(matches!(result, Err(Error::Unavailable)), "{:?}", result.err());
                 let calls = peers.calls.borrow();
                 let visited: Vec<_> = calls.iter().map(|(to, ..)| to.clone()).collect();
-                if !helped {
-                    assert!(
-                        matches!(result, Err(Error::Unauthorized)),
-                        "{:?}",
-                        result.err()
-                    );
-                    assert_eq!(visited, vec![candidates.ordered[0].clone()]);
+                if transport {
+                    assert!(!visited.contains(&helper), "{visited:?}");
                     continue;
                 }
-                assert!(
-                    matches!(result, Err(Error::Unavailable)),
-                    "{:?}",
-                    result.err()
-                );
-                assert_eq!(
-                    visited[..2],
-                    [candidates.ordered[0].clone(), helper.clone()]
-                );
+                assert_eq!(visited[..2], [candidates.ordered[0].clone(), helper.clone()]);
                 assert_eq!(visited.iter().filter(|n| **n == helper).count(), 1);
                 assert!(visited[2..].iter().all(|n| candidates.ordered.contains(n)));
                 // The helper probe is an Acquire carrying fewer credits than a
                 // walk needs to ask a helper itself.
-                let (_, copy, attempts, _) = &calls[1];
+                let (_, copy, attempts) = &calls[1];
                 assert!(!copy);
                 assert!(*attempts >= 1);
                 assert!(*attempts < racer_core::read::fanout::HELPER_MIN_ATTEMPTS);
@@ -2769,8 +2850,6 @@ pub(super) mod tests {
     struct FundedPeer {
         #[allow(clippy::type_complexity)]
         calls: RefCell<Vec<(NodeId, bool, u32, u8)>>,
-        /// Error every request fails with (default `Unavailable`).
-        error: Option<Error>,
     }
     impl FundedPeer {
         fn direct_hedge_available(
@@ -2808,7 +2887,7 @@ pub(super) mod tests {
                     request.route.remaining_attempts,
                     request.route.remaining_links,
                 ));
-                Err(self.error.unwrap_or(Error::Unavailable))
+                Err(Error::Unavailable)
             })
         }
     }
