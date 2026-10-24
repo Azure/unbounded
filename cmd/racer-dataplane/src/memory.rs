@@ -1251,6 +1251,11 @@ pub struct MemoryCache {
 }
 
 impl MemoryCache {
+    /// Verified pages currently indexed, without touching them.
+    #[cfg(test)]
+    pub(crate) fn resident(&self) -> Vec<PageId> {
+        self.entries.borrow().pages.keys().cloned().collect()
+    }
     /// This worker's allocation front end.
     pub(crate) fn buffers(&self) -> &BufferPool {
         &self.pool

@@ -24,6 +24,7 @@ pub(super) fn admission_coordinator() -> (Rc<Coordinator>, impl Sized) {
 }
 mod hot_reads;
 mod peer_copies;
+mod persist_policy;
 mod remote;
 mod warming;
 

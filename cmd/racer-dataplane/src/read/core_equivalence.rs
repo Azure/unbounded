@@ -572,3 +572,146 @@ fn origin_rejection_is_retry_in_core() {
     pair.check();
     assert!(pair.table.is_empty());
 }
+
+/// The simulator's memory admission (`sim/src/node/world.rs`, `memory_insert`
+/// and the memory-hit path of `serve_local`), restated over the same core
+/// `TickLru` because those functions are private to the simulator.
+struct SimMemory {
+    lru: racer_core::cache::lru::TickLru<u32, u32>,
+    cap: usize,
+}
+
+impl SimMemory {
+    fn hit(&mut self, page: u32) -> bool {
+        if self.lru.pages.contains_key(&page) {
+            self.lru.touch(&page).unwrap();
+            return true;
+        }
+        false
+    }
+
+    fn insert(&mut self, page: u32) {
+        if self.lru.pages.contains_key(&page) {
+            // Production does not touch here; see
+            // `duplicate_publish_touches_only_in_the_simulator`.
+            self.lru.touch(&page).unwrap();
+            return;
+        }
+        while self.lru.len() >= self.cap {
+            let Some(victim) = self.lru.victim(|_| true) else {
+                break;
+            };
+            self.lru.remove(&victim);
+        }
+        self.lru.insert(page, 0).unwrap();
+    }
+
+    fn resident(&self) -> std::collections::BTreeSet<u32> {
+        self.lru.pages.keys().copied().collect()
+    }
+}
+
+struct ProdMemory {
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+    cache: crate::memory::MemoryCache,
+}
+
+impl ProdMemory {
+    fn new(cap: usize) -> Self {
+        let admission = crate::memory::tests::admission(cap);
+        let cache = crate::memory::MemoryCache::new(
+            crate::memory::BufferPool::new(admission.clone()),
+            crate::test_support::availability(),
+        );
+        Self { admission, cache }
+    }
+
+    fn id(page: u32) -> PageId {
+        let mut id = page_id();
+        id.version.etag = StrongEtag::test_value(&format!("v{page}"));
+        id
+    }
+
+    fn hit(&self, page: u32) -> bool {
+        // `get` touches a resident entry even when its plaintext is gone.
+        let resident = self.cache.resident().contains(&Self::id(page));
+        let _ = self.cache.get(&Self::id(page)).unwrap();
+        resident
+    }
+
+    fn insert(&self, page: u32) {
+        let bundle = crate::memory::tests::bundle(&self.admission, &format!("v{page}"));
+        self.cache.publish(bundle).unwrap();
+    }
+
+    fn resident(&self, pages: u32) -> std::collections::BTreeSet<u32> {
+        let resident = self.cache.resident();
+        (0..pages)
+            .filter(|p| resident.contains(&Self::id(*p)))
+            .collect()
+    }
+}
+
+/// Seeded hit and insert traces: production `MemoryCache` (entry cap, idle
+/// victim from the reclamation cursor, touch on hit) keeps exactly the pages
+/// the simulator's `TickLru` keeps, step by step. Replaces the old
+/// `fair_reclamation_matches_metadata_trace_and_keeps_other_cache` oracle for
+/// the single-cache order; quota-driven `evict_idle` and per-cache fair share
+/// are not simulated (see the design doc).
+#[test]
+fn memory_cache_matches_sim_lru_on_seeded_traces() {
+    const PAGES: u32 = 12;
+    let mut evictions = 0;
+    for seed in 0..32u64 {
+        let mut rng = SplitMix64::new(seed);
+        let cap = 2 + rng.below(4) as usize;
+        let prod = ProdMemory::new(cap);
+        let mut sim = SimMemory {
+            lru: Default::default(),
+            cap,
+        };
+        for step in 0..80 {
+            let page = rng.below(u64::from(PAGES)) as u32;
+            let before = sim.resident();
+            if rng.below(2) == 0 {
+                assert_eq!(prod.hit(page), sim.hit(page), "seed {seed} step {step}");
+            } else if !before.contains(&page) {
+                // Duplicate publishes differ; they are pinned separately.
+                prod.insert(page);
+                sim.insert(page);
+                evictions += usize::from(before.len() == cap);
+            }
+            assert_eq!(
+                prod.resident(PAGES),
+                sim.resident(),
+                "seed {seed} step {step}"
+            );
+        }
+    }
+    assert!(evictions > 100, "{evictions}");
+}
+
+/// Divergence (Known issue 9 in `designs/racer-core-simulation.md`):
+/// production `MemoryCache::publish` returns early for a resident page
+/// without touching it (`src/memory.rs:1415-1418`, "must not ... turn its
+/// historical deadline into renewed freshness"), while the simulator's
+/// `memory_insert` touches it (`sim/src/node/world.rs:1084-1086`). The
+/// simulator calls `memory_insert` when a fill publishes or a disk hit
+/// promotes a page, so a page already in memory is rare there; when it
+/// happens the simulator keeps that page slightly longer than production.
+#[test]
+fn duplicate_publish_touches_only_in_the_simulator() {
+    let prod = ProdMemory::new(2);
+    let mut sim = SimMemory {
+        lru: Default::default(),
+        cap: 2,
+    };
+    for page in [0, 1, 0, 2] {
+        prod.insert(page);
+        sim.insert(page);
+    }
+    // Production evicts the oldest insert (0); the simulator's touch moved 0
+    // behind 1, so it evicts 1.
+    assert_eq!(prod.resident(3), [1, 2].into());
+    assert_eq!(sim.resident(), [0, 2].into());
+}
