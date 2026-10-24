@@ -16,17 +16,16 @@ spec:
           - name: script-configmap
           - name: script-key
           - name: script-digest
-          - name: script-requires-runtime-stage
-          - name: runtime-stage-name
-          - name: backend-api-version
           - name: backend-kind
           - name: backend-active-deadline-seconds
           - name: runner-image
-          - name: tolerations
           - name: script-environment
           - name: workload-policy
           - name: gpu-resource-count
-          - name: attempt
+      tolerations:
+        - key: node.kubernetes.io/unschedulable
+          operator: Exists
+          effect: NoSchedule
       container:
         image: {{ default "example.invalid/project-signal-adapter@sha256:0000000000000000000000000000000000000000000000000000000000000000" .AdapterImage }}
         imagePullPolicy: IfNotPresent
@@ -49,27 +48,18 @@ spec:
           - "{{`{{inputs.parameters.script-key}}`}}"
           - --script-digest
           - "{{`{{inputs.parameters.script-digest}}`}}"
-          - "--script-requires-runtime-stage={{`{{inputs.parameters.script-requires-runtime-stage}}`}}"
-          - --runtime-stage-name
-          - "{{`{{inputs.parameters.runtime-stage-name}}`}}"
           - --runner-image
           - "{{`{{inputs.parameters.runner-image}}`}}"
-          - --backend-api-version
-          - "{{`{{inputs.parameters.backend-api-version}}`}}"
           - --backend-kind
           - "{{`{{inputs.parameters.backend-kind}}`}}"
           - --backend-active-deadline-seconds
           - "{{`{{inputs.parameters.backend-active-deadline-seconds}}`}}"
-          - --tolerations
-          - "{{`{{inputs.parameters.tolerations}}`}}"
           - --script-environment
           - "{{`{{inputs.parameters.script-environment}}`}}"
           - --workload-policy
           - "{{`{{inputs.parameters.workload-policy}}`}}"
           - --gpu-resource-count
           - "{{`{{inputs.parameters.gpu-resource-count}}`}}"
-          - --attempt
-          - "{{`{{inputs.parameters.attempt}}`}}"
         env:
           - name: POD_NAMESPACE
             valueFrom:
@@ -93,9 +83,6 @@ spec:
           - name: reason
             valueFrom:
               path: /outputs/reason
-          - name: cleanup-failure
-            valueFrom:
-              path: /outputs/cleanup-failure
           - name: measurements
             valueFrom:
               path: /outputs/measurements

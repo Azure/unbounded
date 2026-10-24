@@ -1,467 +1,252 @@
 # Project Signal controller
 
-Project Signal is a Kubernetes controller for admitting approved idle Nodes to
-certification workflows. The upstream integration provides the API, controller,
-CRDs, controller Deployment, and an optional generic participant adapter for
-ordinary Pods and Kubeflow MPIJobs. It intentionally does not publish
-certification scripts, runner images, CertificationProfiles, hardware policy,
-or environment-specific hardware configuration.
+Project Signal performs one certification run for a newly joined Node or a
+small, explicitly selected group of Nodes. The controller snapshots the
+approved profile and scripts, reserves and cordons every participant, runs 15
+ordered checks through Argo Workflows, persists one immutable evidence
+document, and cleans up all temporary workloads.
 
-## Architecture
+Project Signal does not integrate with Kueue. Queue admission and repeatable
+fleet scheduling are intentionally deferred.
 
-```text
-approved Node request
-              |
-              v
-      CertificationProfile
-              |
-              v
- reserve Nodes and snapshot the ordered 15-check script plan
-              |
-              v
- immutable CertificationRun input + SHA-256 digest
-              |
-              v
- one Argo Workflow with a serial, visible 15-task DAG
-              |
-              v
- per-check typed results -> aggregate evidence -> Node projection -> cleanup
-```
+## Components
 
-The controller snapshots all 15 selected script keys into one run-owned
-immutable ConfigMap. Updating a source affects only later runs. The controller
-does not contain or publish certification script bodies.
+- `CertificationProfile` is cluster-scoped operator policy.
+- `CertificationRun` is a namespaced, immutable execution snapshot.
+- `project-signal-controller` admits Nodes, owns reservations and cordons,
+  creates the Workflow, persists status and evidence, and performs teardown.
+- `project-signal-participant-adapter` creates Pod or MPIJob backends and
+  captures typed evidence. Ordinary Pods and completed MPI resources remain
+  until controller teardown; the MPI Operator removes still-running workers
+  after launcher completion so later sequential checks can use the GPUs.
+  On setup, observation, or wall-clock deadline failures, the adapter first
+  persists the available evidence and then quiesces uncertain backends.
+- `project-signal-participant-adapter` is a fixed WorkflowTemplate used by
+  every check. Profiles cannot replace it or pass arbitrary Workflow wiring.
 
-## Prerequisites
+Argo Workflows is required. The Kubeflow MPI Operator is required only when a
+profile contains an `MPIJob` check.
 
-- Kubernetes with the `Node`, `Pod`, and `ConfigMap` APIs.
-- Argo Workflows `argoproj.io/v1alpha1` Workflow API.
-- A controller image built from `cmd/project-signal-controller`.
-- An operator-owned script ConfigMap and execution image.
-- An operator-owned WorkflowTemplate implementing the interface below, or the
-  included `project-signal-participant-adapter` WorkflowTemplate.
-- Explicitly reviewed Node selectors, resource requests, tolerations, policy
-  values, and cleanup behavior.
+## First deployment
 
-The execution image used with the included adapter must contain Bash and the
-standard `mkdir`, `chmod`, `base64`, and `tr` utilities, plus every tool required
-by the selected script. The adapter image and execution image are separate: the
-upstream adapter creates and observes workloads, while the operator-owned
-execution image runs the script.
-
-The included adapter supports standalone `v1` Pods and
-`kubeflow.org/v2beta1` MPIJobs. Project Signal does not install MPI Operator.
-Kueue integration is intentionally deferred. The adapter RBAC is
-namespace-scoped and intentionally grants only the Pod, Pod log, MPIJob,
-Workflow, and Argo task-result access needed by the included template.
-
-## WorkflowTemplate interface
-
-The referenced WorkflowTemplate must accept these string parameters:
-
-| Parameter | Meaning |
-| --- | --- |
-| `run-name` | CertificationRun name |
-| `run-uid` | CertificationRun UID |
-| `participants-json` | Ordered JSON array of participant indexes, Node names, immutable UIDs, capacity, and allocatable resources |
-| `participant-count` | Number of atomically admitted participants |
-| `script-configmap` | Immutable run-owned ConfigMap |
-| `script-key` | Selected ConfigMap key |
-| `script-digest` | Algorithm-qualified SHA-256 of the selected script bytes (`sha256:<64 lowercase hex>`) |
-| `script-requires-runtime-stage` | Whether the selected script requires a runtime stage |
-| `runtime-stage-name` | Optional validated runtime stage name |
-| `backend-api-version` | Backend API version from the profile |
-| `backend-kind` | Backend kind from the profile |
-| `backend-active-deadline-seconds` | Participant backend deadline, shorter than the outer Workflow deadline |
-| `runner-image` | Digest-pinned execution image |
-| `tolerations` | JSON-encoded toleration list |
-| `script-environment` | JSON-encoded, validated environment map |
-| `workload-policy` | JSON-encoded immutable resources, privilege/capabilities, host networking, working directory, and read-only host paths |
-| `gpu-resource-count` | GPU count, defaults to `0` for Pod diagnostics; must be positive for MPIJobs |
-| `attempt` | One-based attempt number |
-
-The Workflow must publish only these output parameters:
-
-| Output | Limit | Meaning |
-| --- | ---: | --- |
-| `verdict` | 32 bytes | `Pass`, `Fail`, or `Inconclusive` |
-| `reason` | 512 bytes | Bounded diagnostic reason |
-| `measurements` | 16 KiB | Bounded measurement summary |
-| `backend-resources` | 8 KiB | Optional JSON array of backend workload identities and covered participant indexes; required for a multi-Node `Pass` |
-| `backend-evidence` | 24 KiB per check | Required redacted pre-cleanup backend object, container state, and bounded current/previous log projection |
-
-Unexpected, duplicate, malformed, or oversized outputs are rejected and the
-run remains fail-closed. Each `backend-resources` entry must contain
-`apiVersion`, `kind`, `name`, `uid`, and the zero-based `participantIndexes`
-that the workload executed. `namespace` is optional and defaults to the
-CertificationRun namespace; an explicitly different namespace is rejected.
-A multi-Node successful result must cover every admitted participant.
-Each check may select at most eight participants so all 15 checks' fixed output
-bounds remain within the 768 KiB Workflow status budget.
-The controller reads outputs only
-from each check's unique deterministic DAG task node. Missing, malformed,
-duplicate, or ambiguous task identity and outputs fail closed. Operator script
-inputs are explicit entries in `spec.checks[].scriptEnvironment`; the
-controller validates their environment names before reserving Nodes.
-
-Before foreground deletion, the adapter captures and writes a typed v1
-projection for every participant backend to the Argo output path. The
-projection includes Pod or MPIJob state and
-conditions, launcher Job conditions, participant container exit state and
-restart count, and bounded current and previous container log tails. Generated
-participant commands emit lifecycle markers for result-directory preparation
-and final verdict, reason, and measurements file presence. The projection
-records those markers without retaining the result payload itself.
-
-Each retained log tail is limited to 512 bytes and redacts bearer credentials,
-secret-like assignments, URL user information, private-key blocks, and complete
-result-marker payloads. Object reason and message fields are also bounded. If a
-required object or current log cannot be captured, a restarted container's
-previous log is unavailable, or the projection must omit content to fit the
-configured per-check output limit (at most 64 KiB), `complete` is false and the run cannot pass. Capture and
-cleanup failures remain explicit, while an earlier backend execution failure
-continues to be the causal result reason.
-
-The adapter cannot observe or serialize its own state if the adapter container
-or Node terminates before this pre-cleanup write. In that boundary the
-`backend-evidence` output is missing and the controller rejects the Workflow
-outputs as Inconclusive; the backend cause remains unknown rather than being
-inferred. A termination after the write may leave the evidence file available
-to Argo, but collection still depends on the Workflow executor surviving long
-enough to publish output parameters.
-
-The controller cross-checks typed backend evidence against the declared backend,
-namespace, exact workload UID, participant coverage, and required Pod/container
-and current/previous log records. A template's `complete: true` alone is not
-sufficient. Log collection requests the latest 64 lines, retains at most 64 KiB
-for result parsing, and projects redacted tails of at most 512 bytes into evidence.
-Earlier log content is intentionally outside this bounded result contract.
-
-After the adapter creates its first backend, every later setup or aggregation
-failure is reported as an Inconclusive output with bounded partial backend
-identity and typed evidence. The adapter persists that evidence before
-foreground cleanup; missing participant coverage can never produce a passing
-result. If the Argo output write fails, cleanup is blocked and the backends
-remain available rather than destroying the only remaining audit state.
-
-After durable terminal evidence is recorded, the controller foreground-deletes
-the Workflow and waits for owned backend descendants to be removed before
-releasing Node reservations. This also covers adapter crashes, cancellation,
-and a controller crash between Workflow creation and status persistence.
-The six-hour Workflow TTL is a fallback, not the normal evidence-retention
-mechanism; immutable terminal evidence remains available after Workflow cleanup.
-The controller's namespace-scoped backend patch and owner-finalizer permissions
-allow Kubernetes' owner-reference admission checks to authorize blocking
-deletion fences. It does not receive backend workload creation or deletion
-rights.
-
-## Multi-Node execution
-
-Participant admission is deterministic and atomic. The requesting Node is
-participant zero, additional eligible Nodes are selected by name, and a failed
-reservation rolls back every reservation already acquired. Each participant is
-bound by Node UID and an immutable capacity and allocatable snapshot in the
-CertificationRun.
-
-The participant group is a certification boundary, not one distributed process
-group. The included adapter creates one independently pinned backend workload
-per participant. Ordinary diagnostics use one Pod per participant. MPI
-diagnostics use one MPIJob per participant with one launcher and one GPU worker;
-ordinary Pods and MPI workers use required Node affinity on the immutable
-`metadata.name` field and a controller-owned reservation label containing the
-admitted Node UID. This binds execution to the exact admitted Node without
-bypassing scheduler admission or accepting a replacement Node that reuses its
-name. Only the worker receives the configured GPU limit. The adapter propagates
-the Workflow active deadline, records API-assigned workload UIDs, reads the
-final typed result from bounded workload
-logs, aggregates diagnostic state separately from backend execution state, and
-foreground-deletes every created workload only after its evidence output is
-durable.
-
-The selected script is invoked with no arguments for a Pod backend,
-`mpi-launcher <gpu-count>` in an MPIJob launcher, and `mpi-worker` in its worker.
-Scripts write `verdict`, `reason`, and optional `measurements.txt` under
-`/results`. The script exit code must match the result verdict: `Pass` exits 0,
-`Fail` exits 1, and `Inconclusive` exits 2. A valid bounded result remains
-authoritative when its verdict-associated exit code makes the backend Pod or
-MPIJob terminally unsuccessful. The adapter removes reserved result files
-before each invocation and removes trailing newline bytes from repository-owned
-result files before encoding them. It rejects missing files, malformed values,
-stale or contradictory result/exit combinations, and any other exit code.
-Partial backend execution, identity gaps, deadline interruption, and cleanup
-failure also remain `Inconclusive`.
-
-The MPI launcher also applies a compatibility fence for
-[`kubeflow/mpi-operator#615`](https://github.com/kubeflow/mpi-operator/issues/615),
-whose suspend/resume race is fixed upstream by
-[`kubeflow/mpi-operator#868`](https://github.com/kubeflow/mpi-operator/pull/868)
-at commit `3a1e56d8accd0d924703d79af3149e3fa8ba1b01`. Before invoking the diagnostic
-launcher command, the adapter writes `/tmp/project-signal-hostfile` from the
-operator's deterministic worker DNS contract
-`<mpijob>-worker-<index>.<mpijob>.<namespace>.svc` and the validated
-`slotsPerWorker`. It exports that file through
-`OMPI_MCA_orte_default_hostfile`, so an empty or stale operator-injected
-`/etc/mpi/hostfile` cannot control launcher behavior after resume.
-
-The launcher waits for every generated host to complete SSH `/bin/true` with
-`BatchMode=yes`, `ConnectTimeout=2`, `ConnectionAttempts=1`,
-`StrictHostKeyChecking=accept-new`, and a launcher-local
-`UserKnownHostsFile=/tmp/project-signal-known-hosts`. SSH stderr remains visible
-for diagnosis. The wait is capped at 30 seconds total and is always at least
-one second shorter than `backendActiveDeadline`; timeout exits 124 and names
-the last unready host. Launcher and worker replica restart policies are both
-`Never`, preserving the result prelude and marker.
-
-The adapter keeps the current launcher log primary and reads the previous
-container log defensively. A single valid previous result can recover a
-restarted launcher when the current log has no result, identical current and
-previous results select the current log, and conflicting results or a malformed
-current marker fail closed. Bounded current/previous availability, byte counts,
-parse status, and selected-source metadata are included in aggregate
-measurements before foreground backend cleanup. This preserves the first
-execution failure while keeping any cleanup failure separately visible.
-
-Other backend kinds remain operator-supplied and are not installed or granted
-permissions by the included adapter.
-
-## Render and install
-
-Render the controller manifests:
+Render the manifests with immutable controller and adapter images:
 
 ```bash
 make signal-manifests \
-  SIGNAL_CONTROLLER_IMAGE=<controller-image@sha256:digest> \
-  SIGNAL_ADAPTER_IMAGE=<adapter-image@sha256:digest>
+  SIGNAL_CONTROLLER_IMAGE=<controller-image> \
+  SIGNAL_ADAPTER_IMAGE=<adapter-image>@sha256:<digest>
 ```
 
-Local adapter builds use the separate mutable
-`SIGNAL_ADAPTER_BUILD_IMAGE=<registry/repository:tag>` staging reference because
-container engines cannot tag a local build with an `image@sha256:` reference.
-
-Generated output is written to `deploy/signal/rendered/`. Validate it with the
-target cluster before applying:
+Install the rendered CRDs and namespaced resources:
 
 ```bash
-kubectl apply --dry-run=server -f deploy/signal/rendered/crd/
-kubectl apply --dry-run=server -f deploy/signal/rendered/
 kubectl apply -f deploy/signal/rendered/crd/
 kubectl apply -f deploy/signal/rendered/
 ```
 
-The upstream manifests install no profiles. Operators must create a
-CertificationProfile with exactly 15 checks that reference operator-owned
-script ConfigMaps and digest-pinned runner images. To use the included adapter,
-set `spec.workflow.name: project-signal-participant-adapter`. Each
-`spec.checks[]` entry selects either:
+The install creates:
 
-```yaml
-checks:
-  - id: <stable-check-id>
-    order: 0
-    script:
-      name: <script-configmap>
-      key: <script-key>
-      digest: sha256:<approved-script-digest>
-    runnerImage: <runner-image>@sha256:<digest>
-    backend:
-      apiVersion: v1
-      kind: Pod
-    backendActiveDeadline: 19m
-```
+- the `project-signal` namespace;
+- controller and adapter service accounts and RBAC;
+- the fixed participant adapter WorkflowTemplate;
+- the controller Deployment.
 
-or an MPIJob backend:
+The controller requires cluster permission to get, list, watch, and patch
+Nodes because it owns participant reservation markers and cordons.
 
-```yaml
-checks:
-  - id: <stable-check-id>
-    order: <0-14>
-    backend:
-      apiVersion: kubeflow.org/v2beta1
-      kind: MPIJob
-```
+## CertificationProfile contract
 
-Checks may set `spec.checks[].workloadPolicy` when a diagnostic needs explicit
-participant-container policy. The controller validates and snapshots this
-policy into the immutable CertificationRun before reserving Nodes. The included
-adapter applies it to the ordinary Pod container or the MPIJob worker only; the
-unpinned MPI launcher does not receive participant resources, host devices, or
-extra mounts.
+A Profile contains only operator choices that legitimately vary between
+certification suites:
 
-```yaml
-workloadPolicy:
-  resources:
-    requests:
-      cpu: "8"
-      memory: 32Gi
-      ephemeral-storage: 20Gi
-    limits:
-      cpu: "8"
-      memory: 32Gi
-      ephemeral-storage: 40Gi
-  privileged: false
-  capabilities: [IPC_LOCK]
-  hostNetwork: true
-  workingDir: /opt/diagnostic
-  hostPaths:
-    - name: work
-      mountPath: /work
-      path: /var/lib/project-signal
-      type: Directory
-```
+| Field | Meaning |
+|---|---|
+| `spec.participants.count` | Total Nodes selected for a Run |
+| `spec.participants.selector` | Labels every selected Node must match |
+| `spec.participants.minimumAllocatable` | Admission-time allocatable resource floor |
+| `spec.participantRoles` | Optional named role counts and role-specific selectors |
+| `spec.topologyConstraints` | Optional minimum topology diversity for a role |
+| `spec.checks` | Exactly 15 ordered checks; position defines R01 through R15 |
+| `spec.deadline` | Whole-suite deadline |
 
-Host paths are always mounted read-only. Names and mount paths must be unique;
-`scripts`, `results`, `/scripts`, and `/results` are reserved. Paths must be
-clean and absolute, resource quantities must be nonnegative, and limits cannot
-be below requests. The policy is bounded to 16 host paths and 16 KiB of
-serialized input. GPU requests and limits remain controlled by
-`gpu-resource-count`, which sets equal requests and limits on the participant
-container. Kubernetes admission and operator policy still decide whether a
-capability, host path, device, or privileged context is allowed; technical
-rendering is not authorization.
+If roles are configured, their counts must sum to the total participant count.
+The requesting Node is participant zero. The remaining participants are
+selected deterministically from currently ready, schedulable, unreserved
+Nodes.
 
-Stage-aware scripts declare
-`spec.checks[].script.requiresRuntimeStage: true` and require an explicit
-`spec.checks[].runtimeStage.name`. The name is a lowercase DNS label of at most
-63 characters and is snapshotted into the immutable CertificationRun and
-evidence. The adapter exports it as `PROJECT_SIGNAL_STAGE_NAME` only to ordinary
-participant Pods and MPIJob workers. MPI launchers never receive it. Scripts
-that are not stage-aware leave both fields unset.
+Each check contains:
 
-Every profile sets two distinct deadlines:
+| Field | Meaning |
+|---|---|
+| `script` | Source ConfigMap name, key, and approved SHA-256 digest |
+| `runnerImage` | Digest-pinned check image |
+| `backend` | `Pod` or `MPIJob` |
+| `backendActiveDeadline` | Backend execution deadline |
+| `gpuCount` | GPU request; must be positive for MPIJob |
+| `scriptEnvironment` | At most 32 bounded, non-reserved environment values |
+| `participantPolicy.roles` | Optional included roles; omission means all participants |
+| `workloadPolicy` | Narrow container resources and host access policy |
 
-```yaml
-deadline: 20m
-checks:
-  - backendActiveDeadline: 19m
-```
+Workload policy is intentionally constrained:
 
-`deadline` is the outer Workflow deadline for backend observation, result and
-evidence projection, and cleanup. Each check's `backendActiveDeadline` is
-rendered to its participant Pod or MPIJob `activeDeadlineSeconds`. It must be
-positive and leave at least 60 seconds before the outer deadline; the
-controller rejects an invalid ordering before reserving Nodes.
+- the only added Linux capability is `IPC_LOCK`;
+- host sources must be under `/proc`, `/sys`, or
+  `/var/lib/project-signal`;
+- host mounts are read-only and their volume names and `Directory` type are
+  controller-owned;
+- scheduling tolerations are controller-owned;
+- arbitrary PodSpec, Workflow, retry, TTL, queue, and cleanup settings are not
+  accepted.
 
-All checks use fixed output limits. Together, the 15 checks stay below the
-768 KiB Workflow status budget, and every accepted plan can represent its
-mandatory partial-failure envelope.
+Profile edits affect only future Runs.
 
-`hostNetwork: true` is an explicit participant policy for diagnostics that must
-observe the selected Node's network namespace, such as physical NIC inventory.
-The adapter sets `dnsPolicy: ClusterFirstWithHostNet` with it. For MPIJobs this
-applies only to the Node-pinned worker; the unpinned launcher remains outside
-the host network namespace. Omitting the field keeps Kubernetes' default Pod
-networking.
+## Starting one certification
 
-`spec.checks[].gpuCount` may be zero for Pod diagnostics and must be positive
-for MPIJobs. The controller renders it as `gpu-resource-count` for the adapter.
-The MPIJob policy is
-fail-closed: `backoffLimit: 0`, `cleanPodPolicy: All`, a one-hour post-finish
-TTL, replica-level `restartPolicy: Never`, `WaitForWorkersReady`, and
-`runLauncherAsWorker: false`.
-
-A `CertificationProfile` defines exactly 15 ordered checks. Admission snapshots
-the complete plan and selected participants once into one immutable
-`CertificationRun`. Each check binds its script identity and digest, runner,
-backend, workload and topology policy, runtime inputs, deadline, and
-participant-role inclusion or exclusion. Every run is a one-time full
-certification; alternate purposes and retries are not public configuration.
-
-The controller creates one Argo Workflow with an inline DAG entrypoint. Every
-task invokes the configured adapter `certification` template through
-`templateRef`; dependencies make execution serial and visible in
-`status.nodes`. `executionPolicy.onFailure` is immutable and is either `Stop`
-or `Continue`. A stopped task is recorded as skipped/not-run, never inferred as
-a diagnostic result.
-
-Before creating the Workflow, the controller durably records its deterministic
-name and attempt in CertificationRun status. Once that creation intent exists,
-a missing Workflow terminates the Run as Inconclusive and is never recreated.
-This fail-closed fence prevents a controller outage plus Workflow TTL cleanup
-from executing the one-time certification suite twice.
-
-Admission also remains fail-closed until every selected Node has received the
-pending projection. The Run is retained as the durable owner while a failed
-Node patch is retried; its Workflow cannot start until admission is marked
-ready.
-
-Participant roles and topology constraints are generic typed policy. Profiles
-can, for example, bind one role to one participant, another role to three
-participants, require the latter to span at least two values of an operator
-chosen topology label, and exclude a role from a specific check without
-publishing environment-specific names or label values upstream.
-
-## Results and evidence
-
-Workflow infrastructure state and certification verdicts are separate:
-
-```text
-executionState=Completed, verdict=Pass|Fail, reason=<diagnostic reason>
-executionState=Error,     verdict=Inconclusive, reason=<workflow reason>
-```
-
-Ambiguous or incomplete workflow execution remains `Inconclusive`. The
-controller identifies each check only by its deterministic DAG task-node name
-and rejects missing, duplicate, malformed, partial, or unexpected outputs. An
-aggregate `Pass` requires all 15 checks, exact participant and backend
-coverage, complete v1 backend evidence, and successful backend cleanup.
-If backend execution and cleanup both fail, `reason` retains the first causal
-backend failure and the bounded `cleanup-failure` Workflow output records
-`BackendCleanupFailed` separately. Cleanup failure always forces
-`executionState=Error` and `verdict=Inconclusive`, including after an otherwise
-successful diagnostic.
-
-CertificationRun status retains bounded measurements, backend identities, and
-the SHA-256 digest and completeness of each check's backend-evidence v1
-document. Full backend-evidence content and script snapshots are retained only
-in the immutable terminal evidence artifact. Small artifacts use one
-ConfigMap; larger artifacts use an immutable manifest plus bounded immutable
-chunks so valid grouped evidence cannot exceed one Kubernetes object limit.
-
-## Node metadata
-
-Controller-owned labels:
-
-| Key | Values |
-| --- | --- |
-| `signal.unbounded-cloud.io/state` | `pending`, `testing`, `passed`, `failed`, `inconclusive` |
-| `signal.unbounded-cloud.io/eligibility` | `blocked`, `production` |
-| `signal.unbounded-cloud.io/profile` | bounded profile identifier |
-
-Pending, testing, failed, and inconclusive states use
-`eligibility=blocked`. A successful run projects `passed/production`. Older
-runs cannot overwrite a newer terminal projection.
-Projection and request clearing also require the current reservation to name
-the same Run, so historical Runs cannot overwrite a newer pending/testing run
-or consume its request. Completed finalizer cleanup is not replayed.
-
-## Operations
-
-Request a run by applying the stable trigger label:
+Add the request label to a schedulable Node:
 
 ```bash
-kubectl label node <approved-node> \
+kubectl label node <node-name> \
   signal.unbounded-cloud.io/certification-request=<profile-name>
 ```
 
-Cancel an active run:
+Admission then:
+
+1. validates the Profile and all 15 checks;
+2. selects the requesting Node plus any additional participants;
+3. atomically records the Run reservation name, participant Node UID, and
+   `spec.unschedulable=true` on each participant;
+4. copies all verified scripts into one immutable Run-owned ConfigMap;
+5. creates one immutable `CertificationRun`;
+6. projects the pending certification state and marks admission ready.
+
+Ordinary workloads cannot schedule onto cordoned participants. Signal backend
+Pods receive only the fixed GPU toleration and the fixed
+`node.kubernetes.io/unschedulable` toleration needed to execute on the Nodes
+reserved by this Run. Required Node affinity pins every backend to the admitted
+Node name and UID.
+
+## CertificationRun contract
+
+The Run spec snapshots:
+
+- Profile name, UID, and generation;
+- ordered participants with Node name, Node UID, admission-time allocatable
+  resources, optional role, and referenced topology values;
+- the immutable script bundle name and UID;
+- 15 ordered check snapshots;
+- the suite deadline;
+- monotonic `cancel` and `release` actions.
+
+Participant and check identity is positional. Participant zero is the
+requesting Node. Check positions zero through fourteen are R01 through R15.
+The controller derives these identities after every API read rather than
+serializing duplicate index and ID fields.
+
+Run status contains:
+
+- `observedGeneration`;
+- phase and bounded reason;
+- Workflow name, UID, and observed phase;
+- evidence URI and SHA-256 digest;
+- positional check phases, bounded reasons and measurements, backend
+  identities, and backend-evidence digest/completeness;
+- start and finish timestamps;
+- `Cordoned`, `WorkloadCleanupComplete`, and `Released` conditions.
+
+Detailed Pod and MPIJob evidence is retained in the durable evidence document,
+not duplicated into CR status.
+
+## Terminal behavior
+
+The controller never releases a participant before evidence is durable and
+all Workflow and backend resources are gone.
+
+- `Succeeded`: cleanup completes and participants are released automatically.
+- `Failed`, `Inconclusive`, or `Canceled`: cleanup completes, but participants
+  remain reserved and cordoned.
+- Set `spec.release: true` to release a non-successful Run after inspection.
+- Deleting a Run requests teardown. Its finalizer stops and removes owned
+  workloads, verifies participant identity and reservation ownership, removes
+  owned cordons and reservations, deletes the script bundle, and then permits
+  deletion.
+
+Release uncordons a Node only when all of these still match:
+
+- the snapshotted Node UID;
+- `signal.unbounded-cloud.io/reserved-by=<run-name>`;
+- `signal.unbounded-cloud.io/reserved-node-uid=<node-uid>`.
+
+Identity replacement or ownership loss is skipped during release. Signal
+never uncordons or removes markers from a Node it cannot prove it still owns,
+but it continues releasing the remaining exact identity matches.
+
+Cancel a live Run:
 
 ```bash
-kubectl -n project-signal patch certificationrun <run-name> \
+kubectl patch certificationrun -n project-signal <run-name> \
   --type=merge -p '{"spec":{"cancel":true}}'
 ```
 
-Before removing the controller, wait for active grouped runs to become
-terminal. Argo Workflows and any workload backend may be shared
-cluster services and must not be removed as part of Project Signal cleanup.
+Release a retained terminal Run:
+
+```bash
+kubectl patch certificationrun -n project-signal <run-name> \
+  --type=merge -p '{"spec":{"release":true}}'
+```
+
+## Evidence
+
+The evidence document includes:
+
+- Run, Profile, participant, script-bundle, and Workflow identities;
+- the immutable check snapshots and script contents;
+- aggregate execution state, verdict, reason, phase, and timestamps;
+- each positional check's verdict and timing;
+- typed Pod or MPIJob evidence, including Pods, containers, states, bounded
+  logs, and capture errors;
+- backend identities and participant positions;
+- a per-check cleanup disposition showing that deletion is deferred to the
+  controller.
+
+The adapter persists typed backend evidence and leaves completed resources in
+place. MPI worker evidence is captured when still present; a worker may already
+be absent because `cleanPodPolicy: Running` releases its GPU after launcher
+completion. If an uncertain backend cannot be quiesced, the adapter task fails
+and later checks are skipped rather than overlapping execution. The controller
+deletes the Workflow and all remaining owned backends only after the final
+evidence document is durable.
+`WorkloadCleanupComplete=True` is the authoritative record that this
+controller-owned cleanup finished.
+
+## Operations
+
+Inspect Runs and lifecycle conditions:
+
+```bash
+kubectl get certificationruns -n project-signal
+kubectl describe certificationrun -n project-signal <run-name>
+```
+
+Inspect the immutable script bundle before terminal cleanup:
+
+```bash
+kubectl get configmap -n project-signal <run-name>-scripts -o yaml
+```
+
+Controller restarts are safe:
+
+- Workflow creation intent is recorded before creation;
+- a missing Workflow after durable intent becomes Inconclusive and is not
+  recreated;
+- positional identities are re-derived after every Run read;
+- persisted terminal evidence can reconstruct compact Run status;
+- owned premature uncordons are repaired while a Run is active or retained.
 
 ## Non-goals
 
-This upstream integration does not provide:
-
-- certification scripts or proprietary thresholds;
-- a runner image;
-- bundled CertificationProfiles or WorkflowTemplates;
-- workload-backend installation or runner RBAC;
-- destructive stress, reboot, cordon, drain, or remediation;
-- an external evidence service;
-- authoritative recovery of ambiguous external mutations.
+- Kueue or other queue integration;
+- recurring certification or automatic retry;
+- arbitrary WorkflowTemplate, PodSpec, toleration, capability, or host-path
+  pass-through;
+- general-purpose workload scheduling;
+- live Node draining or eviction of workloads that existed before the cordon.

@@ -52,39 +52,19 @@ spec:
                 items:
                   properties:
                     backend:
-                      properties:
-                        apiVersion:
-                          type: string
-                        kind:
-                          type: string
-                      required:
-                      - apiVersion
-                      - kind
-                      type: object
+                      enum:
+                      - Pod
+                      - MPIJob
+                      type: string
                     backendActiveDeadline:
                       type: string
                     gpuCount:
                       format: int32
                       minimum: 0
                       type: integer
-                    id:
-                      maxLength: 63
-                      minLength: 1
-                      pattern: ^R(0[1-9]|1[0-5])$
-                      type: string
-                    order:
-                      format: int32
-                      maximum: 14
-                      minimum: 0
-                      type: integer
                     participantPolicy:
                       properties:
-                        excludedRoles:
-                          items:
-                            type: string
-                          maxItems: 16
-                          type: array
-                        requiredRoles:
+                        roles:
                           items:
                             type: string
                           maxItems: 16
@@ -92,16 +72,6 @@ spec:
                       type: object
                     runnerImage:
                       type: string
-                    runtimeStage:
-                      properties:
-                        name:
-                          maxLength: 63
-                          minLength: 1
-                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
-                          type: string
-                      required:
-                      - name
-                      type: object
                     script:
                       properties:
                         digest:
@@ -113,8 +83,6 @@ spec:
                           type: string
                         name:
                           type: string
-                        requiresRuntimeStage:
-                          type: boolean
                       required:
                       - digest
                       - key
@@ -123,6 +91,7 @@ spec:
                     scriptEnvironment:
                       additionalProperties:
                         type: string
+                      maxProperties: 32
                       type: object
                     workloadPolicy:
                       properties:
@@ -138,15 +107,10 @@ spec:
                             properties:
                               mountPath:
                                 type: string
-                              name:
-                                type: string
                               path:
-                                type: string
-                              type:
                                 type: string
                             required:
                             - mountPath
-                            - name
                             - path
                             type: object
                           maxItems: 16
@@ -220,35 +184,21 @@ spec:
                   required:
                   - backend
                   - backendActiveDeadline
-                  - id
-                  - order
                   - runnerImage
                   - script
                   type: object
                   x-kubernetes-validations:
                   - message: backendActiveDeadline must be positive
                     rule: duration(self.backendActiveDeadline) > duration('0s')
-                  - message: runtimeStage is required when the script requires a runtime
-                      stage
-                    rule: '!has(self.script.requiresRuntimeStage) || !self.script.requiresRuntimeStage
-                      || has(self.runtimeStage)'
+                  - message: scriptEnvironment names must not exceed 253 characters
+                      and values must not exceed 4096 characters
+                    rule: '!has(self.scriptEnvironment) || self.scriptEnvironment.all(k,
+                      size(k) <= 253 && size(self.scriptEnvironment[k]) <= 4096)'
                 maxItems: 15
                 minItems: 15
                 type: array
               deadline:
                 type: string
-              evidencePath:
-                type: string
-              executionPolicy:
-                properties:
-                  onFailure:
-                    enum:
-                    - Stop
-                    - Continue
-                    type: string
-                required:
-                - onFailure
-                type: object
               participantRoles:
                 items:
                   properties:
@@ -322,7 +272,7 @@ spec:
                     maximum: 64
                     minimum: 1
                     type: integer
-                  requiredResources:
+                  minimumAllocatable:
                     additionalProperties:
                       anyOf:
                       - type: integer
@@ -385,45 +335,6 @@ spec:
                 - count
                 - selector
                 type: object
-              tolerations:
-                items:
-                  description: |-
-                    The pod this Toleration is attached to tolerates any taint that matches
-                    the triple <key,value,effect> using the matching operator <operator>.
-                  properties:
-                    effect:
-                      description: |-
-                        Effect indicates the taint effect to match. Empty means match all taint effects.
-                        When specified, allowed values are NoSchedule, PreferNoSchedule and NoExecute.
-                      type: string
-                    key:
-                      description: |-
-                        Key is the taint key that the toleration applies to. Empty means match all taint keys.
-                        If the key is empty, operator must be Exists; this combination means to match all values and all keys.
-                      type: string
-                    operator:
-                      description: |-
-                        Operator represents a key's relationship to the value.
-                        Valid operators are Exists, Equal, Lt, and Gt. Defaults to Equal.
-                        Exists is equivalent to wildcard for value, so that a pod can
-                        tolerate all taints of a particular category.
-                        Lt and Gt perform numeric comparisons (requires feature gate TaintTolerationComparisonOperators).
-                      type: string
-                    tolerationSeconds:
-                      description: |-
-                        TolerationSeconds represents the period of time the toleration (which must be
-                        of effect NoExecute, otherwise this field is ignored) tolerates the taint. By default,
-                        it is not set, which means tolerate the taint forever (do not evict). Zero and
-                        negative values will be treated as 0 (evict immediately) by the system.
-                      format: int64
-                      type: integer
-                    value:
-                      description: |-
-                        Value is the taint value the toleration matches to.
-                        If the operator is Exists, the value should be empty, otherwise just a regular string.
-                      type: string
-                  type: object
-                type: array
               topologyConstraints:
                 items:
                   properties:
@@ -447,34 +358,20 @@ spec:
                   type: object
                 maxItems: 16
                 type: array
-              workflow:
-                properties:
-                  name:
-                    type: string
-                required:
-                - name
-                type: object
             required:
             - checks
             - deadline
-            - evidencePath
-            - executionPolicy
             - participants
-            - workflow
             type: object
             x-kubernetes-validations:
-            - message: checks must contain unique IDs
-              rule: self.checks.all(c, self.checks.exists_one(x, x.id == c.id))
-            - message: checks must use immutable contiguous order 0 through 14
-              rule: self.checks.map(c, c.order) == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
-                10, 11, 12, 13, 14]
-            - message: checks must use ordered IDs R01 through R15
-              rule: self.checks.map(c, c.id) == ['R01', 'R02', 'R03', 'R04', 'R05',
-                'R06', 'R07', 'R08', 'R09', 'R10', 'R11', 'R12', 'R13', 'R14', 'R15']
             - message: every backendActiveDeadline must leave at least 60 seconds
                 before deadline
               rule: self.checks.all(c, duration(self.deadline) - duration(c.backendActiveDeadline)
                 >= duration('60s'))
+            - message: deadline must cover every sequential backendActiveDeadline
+                plus 60 seconds of evidence time per check
+              rule: self.checks.map(c, duration(c.backendActiveDeadline) + duration('60s')).sum()
+                <= duration(self.deadline)
         required:
         - spec
         type: object

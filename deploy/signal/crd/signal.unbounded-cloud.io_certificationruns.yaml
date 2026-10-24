@@ -25,9 +25,6 @@ spec:
     - jsonPath: .status.phase
       name: Phase
       type: string
-    - jsonPath: .status.verdict
-      name: Verdict
-      type: string
     - jsonPath: .status.workflow.name
       name: Workflow
       type: string
@@ -63,38 +60,18 @@ spec:
                 items:
                   properties:
                     backend:
-                      properties:
-                        apiVersion:
-                          type: string
-                        kind:
-                          type: string
-                      required:
-                      - apiVersion
-                      - kind
-                      type: object
+                      enum:
+                      - Pod
+                      - MPIJob
+                      type: string
                     backendActiveDeadline:
                       type: string
                     gpuCount:
                       format: int32
                       type: integer
-                    id:
-                      maxLength: 63
-                      minLength: 1
-                      pattern: ^R(0[1-9]|1[0-5])$
-                      type: string
-                    order:
-                      format: int32
-                      maximum: 14
-                      minimum: 0
-                      type: integer
                     participantPolicy:
                       properties:
-                        excludedRoles:
-                          items:
-                            type: string
-                          maxItems: 16
-                          type: array
-                        requiredRoles:
+                        roles:
                           items:
                             type: string
                           maxItems: 16
@@ -102,20 +79,8 @@ spec:
                       type: object
                     runnerImage:
                       type: string
-                    runtimeStage:
-                      properties:
-                        name:
-                          maxLength: 63
-                          minLength: 1
-                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
-                          type: string
-                      required:
-                      - name
-                      type: object
                     script:
                       properties:
-                        configMapName:
-                          type: string
                         digest:
                           description: Digest is the algorithm-qualified SHA-256 digest
                             of the selected script bytes.
@@ -123,16 +88,14 @@ spec:
                           type: string
                         key:
                           type: string
-                        requiresRuntimeStage:
-                          type: boolean
                       required:
-                      - configMapName
                       - digest
                       - key
                       type: object
                     scriptEnvironment:
                       additionalProperties:
                         type: string
+                      maxProperties: 32
                       type: object
                     workloadPolicy:
                       properties:
@@ -148,15 +111,10 @@ spec:
                             properties:
                               mountPath:
                                 type: string
-                              name:
-                                type: string
                               path:
-                                type: string
-                              type:
                                 type: string
                             required:
                             - mountPath
-                            - name
                             - path
                             type: object
                           maxItems: 16
@@ -230,101 +188,21 @@ spec:
                   required:
                   - backend
                   - backendActiveDeadline
-                  - id
-                  - order
                   - runnerImage
                   - script
                   type: object
                   x-kubernetes-validations:
                   - message: backendActiveDeadline must be positive
                     rule: duration(self.backendActiveDeadline) > duration('0s')
-                  - message: runtimeStage is required when the script requires a runtime
-                      stage
-                    rule: '!has(self.script.requiresRuntimeStage) || !self.script.requiresRuntimeStage
-                      || has(self.runtimeStage)'
+                  - message: scriptEnvironment names must not exceed 253 characters
+                      and values must not exceed 4096 characters
+                    rule: '!has(self.scriptEnvironment) || self.scriptEnvironment.all(k,
+                      size(k) <= 253 && size(self.scriptEnvironment[k]) <= 4096)'
                 maxItems: 15
                 minItems: 15
                 type: array
               deadline:
                 type: string
-              evidencePath:
-                type: string
-              executionPolicy:
-                properties:
-                  onFailure:
-                    enum:
-                    - Stop
-                    - Continue
-                    type: string
-                required:
-                - onFailure
-                type: object
-              participantRoles:
-                items:
-                  properties:
-                    count:
-                      format: int32
-                      maximum: 64
-                      minimum: 1
-                      type: integer
-                    name:
-                      maxLength: 63
-                      minLength: 1
-                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
-                      type: string
-                    selector:
-                      description: Selector further constrains participants assigned
-                        to this role.
-                      properties:
-                        matchExpressions:
-                          description: matchExpressions is a list of label selector
-                            requirements. The requirements are ANDed.
-                          items:
-                            description: |-
-                              A label selector requirement is a selector that contains values, a key, and an operator that
-                              relates the key and values.
-                            properties:
-                              key:
-                                description: key is the label key that the selector
-                                  applies to.
-                                type: string
-                              operator:
-                                description: |-
-                                  operator represents a key's relationship to a set of values.
-                                  Valid operators are In, NotIn, Exists and DoesNotExist.
-                                type: string
-                              values:
-                                description: |-
-                                  values is an array of string values. If the operator is In or NotIn,
-                                  the values array must be non-empty. If the operator is Exists or DoesNotExist,
-                                  the values array must be empty. This array is replaced during a strategic
-                                  merge patch.
-                                items:
-                                  type: string
-                                type: array
-                                x-kubernetes-list-type: atomic
-                            required:
-                            - key
-                            - operator
-                            type: object
-                          type: array
-                          x-kubernetes-list-type: atomic
-                        matchLabels:
-                          additionalProperties:
-                            type: string
-                          description: |-
-                            matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
-                            map is equivalent to an element of matchExpressions, whose key field is "key", the
-                            operator is "In", and the values array contains only "value". The requirements are ANDed.
-                          type: object
-                      type: object
-                      x-kubernetes-map-type: atomic
-                  required:
-                  - count
-                  - name
-                  type: object
-                maxItems: 16
-                type: array
               participants:
                 items:
                   properties:
@@ -338,20 +216,6 @@ spec:
                       description: ResourceList is a set of (resource name, quantity)
                         pairs.
                       type: object
-                    capacity:
-                      additionalProperties:
-                        anyOf:
-                        - type: integer
-                        - type: string
-                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                        x-kubernetes-int-or-string: true
-                      description: ResourceList is a set of (resource name, quantity)
-                        pairs.
-                      type: object
-                    index:
-                      format: int32
-                      minimum: 0
-                      type: integer
                     nodeName:
                       type: string
                     nodeUID:
@@ -360,13 +224,14 @@ spec:
                         don't ONLY use UUIDs, this is an alias to string.  Being a type captures
                         intent and helps make sure that UIDs and names do not get conflated.
                       type: string
-                    roles:
-                      items:
+                    role:
+                      type: string
+                    topologyValues:
+                      additionalProperties:
                         type: string
-                      maxItems: 16
-                      type: array
+                      maxProperties: 16
+                      type: object
                   required:
-                  - index
                   - nodeName
                   - nodeUID
                   type: object
@@ -391,162 +256,74 @@ spec:
                 - name
                 - uid
                 type: object
-              requestNodeName:
-                type: string
-              tolerations:
-                items:
-                  description: |-
-                    The pod this Toleration is attached to tolerates any taint that matches
-                    the triple <key,value,effect> using the matching operator <operator>.
-                  properties:
-                    effect:
-                      description: |-
-                        Effect indicates the taint effect to match. Empty means match all taint effects.
-                        When specified, allowed values are NoSchedule, PreferNoSchedule and NoExecute.
-                      type: string
-                    key:
-                      description: |-
-                        Key is the taint key that the toleration applies to. Empty means match all taint keys.
-                        If the key is empty, operator must be Exists; this combination means to match all values and all keys.
-                      type: string
-                    operator:
-                      description: |-
-                        Operator represents a key's relationship to the value.
-                        Valid operators are Exists, Equal, Lt, and Gt. Defaults to Equal.
-                        Exists is equivalent to wildcard for value, so that a pod can
-                        tolerate all taints of a particular category.
-                        Lt and Gt perform numeric comparisons (requires feature gate TaintTolerationComparisonOperators).
-                      type: string
-                    tolerationSeconds:
-                      description: |-
-                        TolerationSeconds represents the period of time the toleration (which must be
-                        of effect NoExecute, otherwise this field is ignored) tolerates the taint. By default,
-                        it is not set, which means tolerate the taint forever (do not evict). Zero and
-                        negative values will be treated as 0 (evict immediately) by the system.
-                      format: int64
-                      type: integer
-                    value:
-                      description: |-
-                        Value is the taint value the toleration matches to.
-                        If the operator is Exists, the value should be empty, otherwise just a regular string.
-                      type: string
-                  type: object
-                type: array
-              topologyConstraints:
-                items:
-                  properties:
-                    labelKey:
-                      description: LabelKey is the Node label used to identify topology
-                        domains.
-                      type: string
-                    minDistinctValues:
-                      format: int32
-                      maximum: 64
-                      minimum: 1
-                      type: integer
-                    role:
-                      description: Role names the participant role whose selected
-                        Nodes are evaluated.
-                      type: string
-                  required:
-                  - labelKey
-                  - minDistinctValues
-                  - role
-                  type: object
-                maxItems: 16
-                type: array
-              workflow:
+              release:
+                type: boolean
+              scriptBundle:
                 properties:
                   name:
                     type: string
+                  uid:
+                    description: |-
+                      UID is a type that holds unique ID values, including UUIDs.  Because we
+                      don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                      intent and helps make sure that UIDs and names do not get conflated.
+                    type: string
                 required:
                 - name
+                - uid
                 type: object
             required:
             - checks
             - deadline
-            - evidencePath
-            - executionPolicy
             - participants
             - profile
-            - requestNodeName
-            - workflow
+            - scriptBundle
             type: object
             x-kubernetes-validations:
             - message: profile is immutable
               rule: self.profile == oldSelf.profile
             - message: participants are immutable
               rule: self.participants == oldSelf.participants
-            - message: participantRoles are immutable
-              rule: has(self.participantRoles) == has(oldSelf.participantRoles) &&
-                (!has(self.participantRoles) || self.participantRoles == oldSelf.participantRoles)
-            - message: topologyConstraints are immutable
-              rule: has(self.topologyConstraints) == has(oldSelf.topologyConstraints)
-                && (!has(self.topologyConstraints) || self.topologyConstraints ==
-                oldSelf.topologyConstraints)
+            - message: scriptBundle is immutable
+              rule: self.scriptBundle == oldSelf.scriptBundle
             - message: checks are immutable
               rule: self.checks == oldSelf.checks
-            - message: executionPolicy is immutable
-              rule: self.executionPolicy == oldSelf.executionPolicy
-            - message: workflow is immutable
-              rule: self.workflow == oldSelf.workflow
-            - message: evidencePath is immutable
-              rule: self.evidencePath == oldSelf.evidencePath
             - message: deadline is immutable
               rule: self.deadline == oldSelf.deadline
-            - message: tolerations are immutable
-              rule: has(self.tolerations) == has(oldSelf.tolerations) && (!has(self.tolerations)
-                || self.tolerations == oldSelf.tolerations)
-            - message: requestNodeName is immutable
-              rule: self.requestNodeName == oldSelf.requestNodeName
-            - message: checks must contain unique IDs
-              rule: self.checks.all(c, self.checks.exists_one(x, x.id == c.id))
-            - message: checks must use immutable contiguous order 0 through 14
-              rule: self.checks.map(c, c.order) == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
-                10, 11, 12, 13, 14]
-            - message: checks must use ordered IDs R01 through R15
-              rule: self.checks.map(c, c.id) == ['R01', 'R02', 'R03', 'R04', 'R05',
-                'R06', 'R07', 'R08', 'R09', 'R10', 'R11', 'R12', 'R13', 'R14', 'R15']
+            - message: cancel cannot be cleared
+              rule: '!has(oldSelf.cancel) || !oldSelf.cancel || (has(self.cancel)
+                && self.cancel)'
+            - message: release cannot be cleared
+              rule: '!has(oldSelf.release) || !oldSelf.release || (has(self.release)
+                && self.release)'
             - message: every backendActiveDeadline must leave at least 60 seconds
                 before deadline
               rule: self.checks.all(c, duration(self.deadline) - duration(c.backendActiveDeadline)
                 >= duration('60s'))
+            - message: deadline must cover every sequential backendActiveDeadline
+                plus 60 seconds of evidence time per check
+              rule: self.checks.map(c, duration(c.backendActiveDeadline) + duration('60s')).sum()
+                <= duration(self.deadline)
           status:
             properties:
               checks:
                 items:
                   properties:
-                    attempt:
-                      format: int32
-                      type: integer
                     backendEvidence:
                       properties:
                         complete:
                           type: boolean
-                        content:
-                          description: |-
-                            Content is populated only while constructing the durable evidence
-                            artifact and is not persisted in CertificationRun status.
-                          type: string
                         digest:
                           description: |-
                             Digest identifies the complete backend-evidence v1 document retained in
                             the durable evidence artifact.
                           pattern: ^sha256:[0-9a-f]{64}$
                           type: string
-                        version:
-                          type: string
                       type: object
                     backendResources:
                       items:
                         properties:
-                          apiVersion:
-                            type: string
-                          kind:
-                            type: string
                           name:
-                            type: string
-                          namespace:
                             type: string
                           participantIndexes:
                             items:
@@ -562,63 +339,38 @@ spec:
                               intent and helps make sure that UIDs and names do not get conflated.
                             type: string
                         required:
-                        - apiVersion
-                        - kind
                         - name
+                        - participantIndexes
                         - uid
                         type: object
+                      maxItems: 64
                       type: array
-                    cleanup:
-                      properties:
-                        complete:
-                          type: boolean
-                        reason:
-                          type: string
-                      type: object
-                    duration:
-                      type: string
                     finishedAt:
                       format: date-time
                       type: string
-                    id:
-                      type: string
                     measurements:
+                      maxLength: 16384
                       type: string
-                    notRun:
-                      type: boolean
-                    order:
-                      format: int32
-                      type: integer
                     phase:
+                      enum:
+                      - Pending
+                      - Running
+                      - Succeeded
+                      - Failed
+                      - Inconclusive
+                      - Skipped
                       type: string
                     reason:
+                      maxLength: 1024
                       type: string
-                    retryCount:
-                      format: int32
-                      type: integer
                     startedAt:
                       format: date-time
                       type: string
-                    verdict:
-                      type: string
-                    workflowNodeName:
-                      type: string
                   required:
-                  - attempt
-                  - id
-                  - order
                   - phase
-                  - retryCount
                   type: object
                 maxItems: 15
                 type: array
-              cleanup:
-                properties:
-                  reservationsReleased:
-                    type: boolean
-                  snapshotDeleted:
-                    type: boolean
-                type: object
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
@@ -674,7 +426,11 @@ spec:
                   - status
                   - type
                   type: object
+                maxItems: 8
                 type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
               evidence:
                 properties:
                   digest:
@@ -685,25 +441,29 @@ spec:
                   uri:
                     type: string
                 type: object
-              executionState:
-                type: string
               finishedAt:
                 format: date-time
                 type: string
+              observedGeneration:
+                format: int64
+                type: integer
               phase:
+                enum:
+                - Pending
+                - Running
+                - Succeeded
+                - Failed
+                - Inconclusive
+                - Canceled
                 type: string
               reason:
+                maxLength: 1024
                 type: string
               startedAt:
                 format: date-time
                 type: string
-              verdict:
-                type: string
               workflow:
                 properties:
-                  attempt:
-                    format: int32
-                    type: integer
                   name:
                     type: string
                   phase:

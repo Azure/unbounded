@@ -4,6 +4,7 @@
 package signaladapter
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -32,11 +33,9 @@ const (
 	MaxMeasurementsBytes    = 16 * 1024
 	MaxBackendOutputBytes   = 8 * 1024
 	MaxBackendEvidenceBytes = 24 * 1024
-	MaxCleanupFailureBytes  = 64
 	maxMPIWorkerReadyWait   = int64(30)
 	maxMPIWorkerSlots       = int64(1<<31 - 1)
 	mpiBackoffLimit         = int64(0)
-	mpiTTLSeconds           = int64(3600)
 	mpiHostfilePath         = "/tmp/project-signal-hostfile"
 	mpiKnownHostsPath       = "/tmp/project-signal-known-hosts"
 	resultPrefix            = "PROJECT_SIGNAL_RESULT_V2 "
@@ -71,17 +70,12 @@ type Config struct {
 	ScriptConfigMap        string
 	ScriptKey              string
 	ScriptDigest           string
-	ScriptRequiresStage    bool
-	RuntimeStageName       string
 	RunnerImage            string
-	BackendAPIVersion      string
 	BackendKind            string
 	BackendDeadlineSeconds int64
-	TolerationsJSON        string
 	ScriptEnvironmentJSON  string
 	WorkloadPolicyJSON     string
 	GPUResourceCount       string
-	Attempt                int
 }
 
 type Result struct {
@@ -114,7 +108,6 @@ type AggregateOutput struct {
 	ExecutionState   string                              `json:"executionState"`
 	Verdict          string                              `json:"verdict"`
 	Reason           string                              `json:"reason"`
-	CleanupFailure   string                              `json:"cleanupFailure,omitempty"`
 	Measurements     string                              `json:"measurements"`
 	BackendResources []signalv1.BackendResourceReference `json:"-"`
 	BackendJSON      string                              `json:"backend-resources"`
@@ -164,9 +157,7 @@ func ParseParticipants(
 
 	for index := range participants {
 		participant := &participants[index]
-		if participant.Index != int32(index) {
-			return nil, fmt.Errorf("participants-json[%d].index must equal %d", index, index)
-		}
+		participant.Index = int32(index)
 
 		if errors := validation.IsDNS1123Subdomain(participant.NodeName); len(errors) > 0 {
 			return nil, fmt.Errorf("participants-json[%d].nodeName is invalid: %s", index, strings.Join(errors, ", "))
@@ -238,37 +229,20 @@ func ValidateConfig(config Config) ([]signalv1.Participant, []corev1.Toleration,
 		)
 	}
 
-	var runtimeStage *signalv1.RuntimeStage
-	if config.RuntimeStageName != "" {
-		runtimeStage = &signalv1.RuntimeStage{Name: config.RuntimeStageName}
-	}
-
-	if err := signalv1.ValidateRuntimeStage(config.ScriptRequiresStage, runtimeStage); err != nil {
-		return nil, nil, nil, fmt.Errorf("runtime stage: %w", err)
-	}
-
 	if config.BackendDeadlineSeconds <= 0 {
 		return nil, nil, nil, errors.New("backend-active-deadline-seconds must be positive")
 	}
 
-	switch {
-	case config.BackendKind == "Pod" && config.BackendAPIVersion == "v1":
-	case config.BackendKind == "MPIJob" && config.BackendAPIVersion == "kubeflow.org/v2beta1":
+	switch signalv1.ExecutionBackend(config.BackendKind) {
+	case signalv1.ExecutionBackendPod:
+	case signalv1.ExecutionBackendMPIJob:
 		if config.BackendDeadlineSeconds < 2 {
 			return nil, nil, nil, errors.New(
 				"backend-active-deadline-seconds must be at least 2 for MPIJob worker readiness",
 			)
 		}
 	default:
-		return nil, nil, nil, fmt.Errorf(
-			"unsupported backend %s %s",
-			config.BackendAPIVersion,
-			config.BackendKind,
-		)
-	}
-
-	if config.Attempt < 1 {
-		return nil, nil, nil, errors.New("attempt must be positive")
+		return nil, nil, nil, fmt.Errorf("unsupported backend %q", config.BackendKind)
 	}
 
 	if _, err := signalworkload.Decode(config.WorkloadPolicyJSON); err != nil {
@@ -293,14 +267,23 @@ func ValidateConfig(config Config) ([]signalv1.Participant, []corev1.Toleration,
 		)
 	}
 
-	var tolerations []corev1.Toleration
-	if err := decodeJSONObject(config.TolerationsJSON, &tolerations); err != nil {
-		return nil, nil, nil, fmt.Errorf("decode tolerations: %w", err)
-	}
+	tolerations := []corev1.Toleration{{
+		Key:      "nvidia.com/gpu",
+		Operator: corev1.TolerationOpExists,
+		Effect:   corev1.TaintEffectNoSchedule,
+	}, {
+		Key:      corev1.TaintNodeUnschedulable,
+		Operator: corev1.TolerationOpExists,
+		Effect:   corev1.TaintEffectNoSchedule,
+	}}
 
 	var environment map[string]string
 	if err := decodeJSONObject(config.ScriptEnvironmentJSON, &environment); err != nil {
 		return nil, nil, nil, fmt.Errorf("decode script-environment: %w", err)
+	}
+
+	if len(environment) > 32 {
+		return nil, nil, nil, errors.New("script-environment must not contain more than 32 entries")
 	}
 
 	environmentNames := make([]string, 0, len(environment))
@@ -312,6 +295,10 @@ func ValidateConfig(config Config) ([]signalv1.Participant, []corev1.Toleration,
 
 	env := make([]corev1.EnvVar, 0, len(environmentNames)+4)
 	for _, name := range environmentNames {
+		if len(name) > 253 {
+			return nil, nil, nil, fmt.Errorf("script-environment name %q exceeds 253 bytes", name)
+		}
+
 		if errors := validation.IsEnvVarName(name); len(errors) > 0 {
 			return nil, nil, nil, fmt.Errorf("script-environment contains invalid name %q", name)
 		}
@@ -322,6 +309,10 @@ func ValidateConfig(config Config) ([]signalv1.Participant, []corev1.Toleration,
 
 		if _, reserved := reservedEnvironmentNames[name]; reserved {
 			return nil, nil, nil, fmt.Errorf("script-environment contains reserved name %q", name)
+		}
+
+		if len(environment[name]) > 4096 {
+			return nil, nil, nil, fmt.Errorf("script-environment value for %q exceeds 4096 bytes", name)
 		}
 
 		env = append(env, corev1.EnvVar{Name: name, Value: environment[name]})
@@ -431,9 +422,6 @@ func backendResourceIdentity(
 	}
 
 	return signalv1.BackendResourceReference{
-		APIVersion:         resource.GetAPIVersion(),
-		Kind:               resource.GetKind(),
-		Namespace:          resource.GetNamespace(),
 		Name:               resource.GetName(),
 		UID:                resource.GetUID(),
 		ParticipantIndexes: []int32{participantIndex},
@@ -472,9 +460,6 @@ func MinimumPartialBackendResourcesBytes(participantCount int) int {
 	references := make([]signalv1.BackendResourceReference, participantCount)
 	for index := range references {
 		references[index] = signalv1.BackendResourceReference{
-			APIVersion:         strings.Repeat("a", 32),
-			Kind:               strings.Repeat("a", 16),
-			Namespace:          strings.Repeat("a", 63),
 			Name:               strings.Repeat("a", 63),
 			UID:                types.UID(strings.Repeat("a", 128)),
 			ParticipantIndexes: []int32{int32(index)},
@@ -703,6 +688,10 @@ func resultCommand(arguments ...string) []string {
 }
 
 func resultCommandWithPrelude(prelude string, arguments ...string) []string {
+	if strings.TrimSpace(prelude) == "" {
+		prelude = ":"
+	}
+
 	quotedArguments := make([]string, len(arguments))
 	for index, argument := range arguments {
 		quotedArguments[index] = shellQuote(argument)
@@ -718,13 +707,33 @@ chmod 0755 /results
 rm -f /results/verdict /results/reason /results/measurements.txt
 printf 'PROJECT_SIGNAL_RESULTS_V1 prepared\n'
 set +e
-%s
-prelude_status=$?
-if [[ "${prelude_status}" -eq 0 ]]; then
- /bin/bash "/scripts/${PROJECT_SIGNAL_SCRIPT_KEY}" %s
- status=$?
+script_path="/scripts/${PROJECT_SIGNAL_SCRIPT_KEY}"
+expected_digest="${PROJECT_SIGNAL_SCRIPT_DIGEST#sha256:}"
+actual_digest=""
+verification_reason=""
+if command -v sha256sum >/dev/null 2>&1; then
+  actual_digest="$(sha256sum "${script_path}" | cut -d ' ' -f 1)"
+elif command -v shasum >/dev/null 2>&1; then
+  actual_digest="$(shasum -a 256 "${script_path}" | cut -d ' ' -f 1)"
 else
- status="${prelude_status}"
+  verification_reason="ScriptDigestVerificationUnavailable"
+fi
+if [[ -z "${verification_reason}" && "${actual_digest}" != "${expected_digest}" ]]; then
+  verification_reason="ScriptDigestMismatch"
+fi
+if [[ -n "${verification_reason}" ]]; then
+  printf 'Inconclusive' > /results/verdict
+  printf '%%s' "${verification_reason}" > /results/reason
+  status=125
+else
+  %s
+  prelude_status=$?
+  if [[ "${prelude_status}" -eq 0 ]]; then
+    /bin/bash "${script_path}" %s
+    status=$?
+  else
+    status="${prelude_status}"
+  fi
 fi
 set -e
 canonicalize_result_file() {
@@ -883,7 +892,7 @@ func ordinaryPod(
 ) *corev1.Pod {
 	labels := resourceLabels(config, participant)
 
-	env := workloadEnvironment(config, participant, environment, true)
+	env := workloadEnvironment(config, participant, environment)
 	container := workloadContainer(
 		config,
 		policy,
@@ -932,8 +941,8 @@ func mpiJob(
 	labels := resourceLabels(config, participant)
 
 	jobName := resourceNameWithLimit(config.RunName, participant.Index, 63-len("-worker-0"))
-	launcherEnv := workloadEnvironment(config, participant, environment, false)
-	workerEnv := workloadEnvironment(config, participant, environment, true)
+	launcherEnv := workloadEnvironment(config, participant, environment)
+	workerEnv := workloadEnvironment(config, participant, environment)
 	readinessTimeout := mpiWorkerReadinessTimeout(backendDeadlineSeconds)
 
 	workerHosts, err := mpiWorkerHosts(config.Namespace, jobName, 1, gpuCount)
@@ -968,10 +977,9 @@ func mpiJob(
 			"runLauncherAsWorker":    false,
 			"slotsPerWorker":         gpuCount,
 			"runPolicy": map[string]any{
-				"activeDeadlineSeconds":   backendDeadlineSeconds,
-				"backoffLimit":            mpiBackoffLimit,
-				"cleanPodPolicy":          "All",
-				"ttlSecondsAfterFinished": mpiTTLSeconds,
+				"activeDeadlineSeconds": backendDeadlineSeconds,
+				"backoffLimit":          mpiBackoffLimit,
+				"cleanPodPolicy":        "Running",
 			},
 			"mpiReplicaSpecs": map[string]any{
 				"Launcher": map[string]any{
@@ -981,7 +989,7 @@ func mpiJob(
 						labels,
 						"",
 						"",
-						nil,
+						tolerations,
 						corev1.Container{
 							Name:  "launcher",
 							Image: config.RunnerImage,
@@ -1091,7 +1099,6 @@ func workloadEnvironment(
 	config Config,
 	participant signalv1.Participant,
 	environment []corev1.EnvVar,
-	includeRuntimeStage bool,
 ) []corev1.EnvVar {
 	result := slices.Clone(environment)
 
@@ -1104,16 +1111,8 @@ func workloadEnvironment(
 		corev1.EnvVar{Name: "PROJECT_SIGNAL_NODE_UID", Value: string(participant.NodeUID)},
 		corev1.EnvVar{Name: "PROJECT_SIGNAL_SCRIPT_KEY", Value: config.ScriptKey},
 		corev1.EnvVar{Name: "PROJECT_SIGNAL_SCRIPT_DIGEST", Value: config.ScriptDigest},
-		corev1.EnvVar{Name: "PROJECT_SIGNAL_ATTEMPT", Value: strconv.Itoa(config.Attempt)},
 		corev1.EnvVar{Name: "PROJECT_SIGNAL_RESULTS_DIR", Value: "/results"},
 	)
-
-	if includeRuntimeStage && config.RuntimeStageName != "" {
-		result = append(result, corev1.EnvVar{
-			Name:  "PROJECT_SIGNAL_STAGE_NAME",
-			Value: config.RuntimeStageName,
-		})
-	}
 
 	return result
 }
@@ -1176,12 +1175,13 @@ func workloadVolumes(scriptConfigMap string, policy signalv1.WorkloadPolicy) []c
 
 	for index := range policy.HostPaths {
 		hostPath := &policy.HostPaths[index]
+		hostPathType := corev1.HostPathDirectory
 		volumes = append(volumes, corev1.Volume{
-			Name: hostPath.Name,
+			Name: signalworkload.HostPathVolumeName(index),
 			VolumeSource: corev1.VolumeSource{
 				HostPath: &corev1.HostPathVolumeSource{
 					Path: hostPath.Path,
-					Type: ptr(hostPath.Type),
+					Type: &hostPathType,
 				},
 			},
 		})
@@ -1195,7 +1195,7 @@ func workloadVolumeMounts(policy signalv1.WorkloadPolicy) []corev1.VolumeMount {
 	for index := range policy.HostPaths {
 		hostPath := &policy.HostPaths[index]
 		mounts = append(mounts, corev1.VolumeMount{
-			Name:      hostPath.Name,
+			Name:      signalworkload.HostPathVolumeName(index),
 			MountPath: hostPath.MountPath,
 			ReadOnly:  true,
 		})
@@ -1223,14 +1223,11 @@ func validateBackendCoverage(
 	covered := make([]bool, participantCount)
 
 	for index, resource := range resources {
-		if resource.APIVersion == "" || resource.Kind == "" || resource.Name == "" || resource.UID == "" {
+		if resource.Name == "" || resource.UID == "" {
 			return fmt.Errorf("backend-resources[%d] has an incomplete identity", index)
 		}
 
 		identity := strings.Join([]string{
-			resource.APIVersion,
-			resource.Kind,
-			resource.Namespace,
 			resource.Name,
 			string(resource.UID),
 		}, "\x00")
@@ -1309,7 +1306,9 @@ func resourceNameWithLimit(runName string, participantIndex int32, maximumLength
 
 	maximumRunLength := maximumLength - len(suffix)
 	if len(runName) > maximumRunLength {
-		runName = strings.TrimRight(runName[:maximumRunLength], "-.")
+		digest := fmt.Sprintf("%x", sha256.Sum256([]byte(runName)))[:8]
+		prefixLength := maximumRunLength - len(digest) - 1
+		runName = strings.TrimRight(runName[:prefixLength], "-.") + "-" + digest
 	}
 
 	return runName + suffix

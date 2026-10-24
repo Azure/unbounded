@@ -60,15 +60,7 @@ func main() {
 		"",
 		"algorithm-qualified SHA-256 digest of the script bytes (sha256:<64 lowercase hex>)",
 	)
-	flags.BoolVar(
-		&cfg.ScriptRequiresStage,
-		"script-requires-runtime-stage",
-		false,
-		"Require a validated runtime stage name",
-	)
-	flags.StringVar(&cfg.RuntimeStageName, "runtime-stage-name", "", "Runtime stage name for participant containers")
 	flags.StringVar(&cfg.RunnerImage, "runner-image", "", "Digest-pinned runner image")
-	flags.StringVar(&cfg.BackendAPIVersion, "backend-api-version", "", "Backend API version")
 	flags.StringVar(&cfg.BackendKind, "backend-kind", "", "Backend kind")
 	flags.Int64Var(
 		&cfg.BackendDeadlineSeconds,
@@ -76,11 +68,9 @@ func main() {
 		0,
 		"Active deadline for participant backend workloads",
 	)
-	flags.StringVar(&cfg.TolerationsJSON, "tolerations", "[]", "JSON-encoded Pod tolerations")
 	flags.StringVar(&cfg.ScriptEnvironmentJSON, "script-environment", "{}", "JSON-encoded script environment")
 	flags.StringVar(&cfg.WorkloadPolicyJSON, "workload-policy", "{}", "JSON-encoded participant workload policy")
 	flags.StringVar(&cfg.GPUResourceCount, "gpu-resource-count", "0", "GPU resource limit per participant")
-	flags.IntVar(&cfg.Attempt, "attempt", 0, "One-based Workflow attempt number")
 	flags.StringVar(&cfg.outputDirectory, "output-directory", "/outputs", "Argo output directory")
 
 	command.CompletionOptions.DisableDefaultCmd = true
@@ -136,13 +126,6 @@ func writeOutputs(directory string, output signaladapter.AggregateOutput) error 
 		return errors.New("output-directory is required")
 	}
 
-	if len(output.CleanupFailure) > signaladapter.MaxCleanupFailureBytes {
-		return fmt.Errorf(
-			"cleanup failure exceeds %d bytes",
-			signaladapter.MaxCleanupFailureBytes,
-		)
-	}
-
 	if err := signaladapter.ValidateBackendEvidence(output.BackendEvidence); err != nil {
 		return err
 	}
@@ -154,7 +137,6 @@ func writeOutputs(directory string, output signaladapter.AggregateOutput) error 
 	outputs := map[string]string{
 		"verdict":           output.Verdict,
 		"reason":            output.Reason,
-		"cleanup-failure":   output.CleanupFailure,
 		"measurements":      output.Measurements,
 		"backend-resources": output.BackendJSON,
 		"backend-evidence":  output.BackendEvidence,
