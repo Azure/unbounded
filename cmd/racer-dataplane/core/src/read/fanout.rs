@@ -88,6 +88,31 @@ fn fnv(parts: &[&[u8]]) -> u64 {
     z ^ (z >> 31)
 }
 
+/// Concurrent bodies of one page an owner streams to readers before it sheds
+/// further readers of that page with `Overloaded` (see [`shed_hot_page`]).
+pub const HOT_PAGE_BODIES: usize = 4;
+
+/// Whether an owner sheds a request for a page it is already streaming to
+/// [`HOT_PAGE_BODIES`] requesters. The shed requester asks its helper (the
+/// walk's overflow step), which the owner always serves, so the owner's NIC
+/// feeds at most [`fanout_width`] helpers plus a few readers per page instead
+/// of a queue of readers that time out. Owners and helpers of the page are
+/// never shed (`exempt`), and non-owners never shed: a helper queues the
+/// readers it was chosen for.
+pub fn shed_hot_page(owner: bool, streaming: usize, exempt: bool) -> bool {
+    owner && !exempt && streaming >= HOT_PAGE_BODIES
+}
+
+/// Whether the member at `position` is one of `page`'s helpers (any reader
+/// may pick it; see [`fanout_helper`]). At most [`fanout_width`] hashes.
+pub fn is_helper(object: &ObjectId, page: PageNumber, position: usize, members: usize) -> bool {
+    let cache = object.cache.0.as_bytes();
+    let key = &object.key.0[..];
+    let number = page.0.to_le_bytes();
+    (0..fanout_width(members) as u64)
+        .any(|j| fnv(&[cache, key, &number, &j.to_le_bytes()]) as usize % members == position)
+}
+
 /// Position (in membership order) of the member `requester` asks to acquire
 /// `page` for it, or `None` when the membership has no eligible helper.
 ///
@@ -173,6 +198,30 @@ mod tests {
             |_| false,
         );
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn every_chosen_helper_is_recognized_and_few_others_are() {
+        let members = 5_000;
+        let mut helpers = 0;
+        for r in 0..members {
+            let requester = NodeId(format!("node-{r}"));
+            let h = fanout_helper(&object(), PageNumber(9), &requester, members, |p| p == r)
+                .expect("helper");
+            assert!(is_helper(&object(), PageNumber(9), h, members));
+        }
+        for p in 0..members {
+            helpers += usize::from(is_helper(&object(), PageNumber(9), p, members));
+        }
+        assert!(helpers <= fanout_width(members), "{helpers}");
+    }
+
+    #[test]
+    fn owners_shed_only_non_exempt_requesters_of_a_hot_page() {
+        assert!(!shed_hot_page(true, HOT_PAGE_BODIES - 1, false));
+        assert!(shed_hot_page(true, HOT_PAGE_BODIES, false));
+        assert!(!shed_hot_page(true, usize::MAX, true));
+        assert!(!shed_hot_page(false, usize::MAX, false));
     }
 
     #[test]
