@@ -72,12 +72,31 @@ pub struct PassInputs<'a> {
     pub membership_changed_unix: Option<u64>,
 }
 
-/// Join hold-down: after a membership version change, new members wait
-/// this long before the next version admits them, so a storm of joining
-/// Pods costs at most one membership version per hold instead of one per
-/// debounced pass. Passes run at least every `LEASE_RENEW` (10 s), so a
-/// held join lands within one hold plus one pass. Removals are not held.
+/// Shortest join hold-down: after a membership version change, new members
+/// wait at least this long before the next version admits them, so a storm
+/// of joining Pods costs at most one membership version per hold instead of
+/// one per debounced pass. Passes run at least every `LEASE_RENEW` (10 s),
+/// so a held join lands within one hold plus one pass. Removals are not
+/// held. See [`join_hold_secs`].
 pub const JOIN_HOLD_SECS: u64 = 10;
+
+/// Longest join hold-down.
+pub const MAX_JOIN_HOLD_SECS: u64 = 60;
+
+/// Join hold-down for a membership of `members`: one second per thousand
+/// members, within [`JOIN_HOLD_SECS`] and [`MAX_JOIN_HOLD_SECS`].
+///
+/// Every version costs each client a reply, and a client that is two or
+/// more versions behind gets the full image (about 120 bytes per member)
+/// instead of a delta. The cost of one round of full replies grows with
+/// the square of the membership while seat capacity grows only linearly
+/// (`MEMBERS_PER_SEAT`), so the hold grows with the membership to keep
+/// clients within one version. At 50,000 members a 10 s hold produced 33
+/// versions during enrollment, 646k full fallbacks and 2.9 TB of seat
+/// egress (designs/racer-core-simulation.md, "Round 4: join").
+pub fn join_hold_secs(members: usize) -> u64 {
+    (members as u64 / 1000).clamp(JOIN_HOLD_SECS, MAX_JOIN_HOLD_SECS)
+}
 
 /// Output of one pass.
 pub struct PassPlan {
@@ -143,7 +162,7 @@ pub fn plan_pass(i: &PassInputs<'_>, rng: &mut dyn Entropy) -> Result<PassPlan, 
         require_report: true,
         hold: !history.is_empty()
             && i.membership_changed_unix
-                .is_some_and(|t| i.wall_unix < t.saturating_add(JOIN_HOLD_SECS)),
+                .is_some_and(|t| i.wall_unix < t.saturating_add(join_hold_secs(history.len()))),
     };
     let members = members::reconcile_at(
         &nodes,
@@ -459,6 +478,15 @@ mod tests {
         .unwrap();
         assert_eq!(p2.image.unwrap().publication.members.len(), 1);
         assert_eq!(p2.desired, all.desired);
+    }
+
+    #[test]
+    fn join_hold_grows_with_the_membership() {
+        assert_eq!(join_hold_secs(0), JOIN_HOLD_SECS);
+        assert_eq!(join_hold_secs(10_999), JOIN_HOLD_SECS);
+        assert_eq!(join_hold_secs(25_000), 25);
+        assert_eq!(join_hold_secs(50_000), 50);
+        assert_eq!(join_hold_secs(usize::MAX), MAX_JOIN_HOLD_SECS);
     }
 
     /// New members are batched: within the hold after a membership change
