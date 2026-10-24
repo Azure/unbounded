@@ -387,10 +387,10 @@ func (r *Runner) captureParticipantEvidence(
 			complete = false
 		}
 
-		if !hasPodRole(participant.Pods, "launcher") || !hasPodRole(participant.Pods, "worker") {
+		if !hasPodRole(participant.Pods, "launcher") {
 			participant.CaptureError = joinCaptureError(
 				participant.CaptureError,
-				"MPI launcher and worker Pods were not both found",
+				"MPI launcher Pod was not found",
 			)
 			complete = false
 		}

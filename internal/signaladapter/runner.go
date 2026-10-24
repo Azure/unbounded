@@ -35,7 +35,7 @@ type Runner struct {
 	Dynamic                dynamic.Interface
 	Kubernetes             kubernetes.Interface
 	PollInterval           time.Duration
-	CleanupWait            time.Duration
+	CaptureWait            time.Duration
 	ReadPodLog             func(context.Context, string, string, string, bool) (string, error)
 	PersistBackendEvidence func(string) error
 }
@@ -88,9 +88,7 @@ func (r *Runner) Execute(ctx context.Context, config Config) (AggregateOutput, e
 		return AggregateOutput{}, errors.New("owning Workflow requires a positive activeDeadlineSeconds")
 	}
 
-	if err := signalv1.ValidateRuntimeContract(
-		config.ScriptRequiresStage,
-		runtimeStage(config.RuntimeStageName),
+	if err := signalv1.ValidateExecutionDeadlines(
 		time.Duration(config.BackendDeadlineSeconds)*time.Second,
 		time.Duration(activeDeadlineSeconds)*time.Second,
 	); err != nil {
@@ -99,7 +97,7 @@ func (r *Runner) Execute(ctx context.Context, config Config) (AggregateOutput, e
 
 	executionContext, cancelExecution := context.WithTimeout(
 		ctx,
-		time.Duration(activeDeadlineSeconds)*time.Second,
+		time.Duration(config.BackendDeadlineSeconds)*time.Second,
 	)
 	defer cancelExecution()
 
@@ -126,19 +124,7 @@ func (r *Runner) Execute(ctx context.Context, config Config) (AggregateOutput, e
 	created := make([]createdResource, 0, len(resources))
 	references := make([]signalv1.BackendResourceReference, 0, len(resources))
 	finishBackendFailure := func(cause error) (AggregateOutput, error) {
-		output, err := r.backendFailureOutput(config, len(participants), created, references, cause)
-		if err != nil {
-			return AggregateOutput{}, err
-		}
-
-		cleanupContext, cancel := context.WithTimeout(context.Background(), r.cleanupWait())
-		defer cancel()
-
-		if err := r.cleanup(cleanupContext, config.Namespace, created); err != nil {
-			recordCleanupFailure(&output)
-		}
-
-		return output, nil
+		return r.backendFailureOutput(config, len(participants), created, references, cause)
 	}
 
 	for index, resource := range resources {
@@ -202,7 +188,7 @@ func (r *Runner) Execute(ctx context.Context, config Config) (AggregateOutput, e
 		return finishBackendFailure(fmt.Errorf("aggregate participant results: %w", err))
 	}
 
-	captureContext, cancelCapture := context.WithTimeout(context.Background(), r.cleanupWait())
+	captureContext, cancelCapture := context.WithTimeout(context.Background(), r.captureWait())
 	defer cancelCapture()
 
 	var evidenceComplete bool
@@ -220,17 +206,14 @@ func (r *Runner) Execute(ctx context.Context, config Config) (AggregateOutput, e
 		recordEvidenceCaptureFailure(&output)
 	}
 
-	if err := r.persistEvidenceBeforeCleanup(&output, MaxBackendEvidenceBytes); err != nil {
+	if err := r.persistBackendEvidence(&output, MaxBackendEvidenceBytes); err != nil {
 		return finishBackendFailure(fmt.Errorf("persist backend evidence: %w", err))
 	}
 
-	cleanupContext, cancel := context.WithTimeout(context.Background(), r.cleanupWait())
-	defer cancel()
-
-	if err := r.cleanup(cleanupContext, config.Namespace, created); err != nil {
-		recordCleanupFailure(&output)
-
-		return output, nil
+	if resultsRequireQuiescence(results) {
+		if err := r.quiesceBackends(created); err != nil {
+			return AggregateOutput{}, fmt.Errorf("quiesce uncertain backends: %w", err)
+		}
 	}
 
 	return output, nil
@@ -243,7 +226,7 @@ func (r *Runner) backendFailureOutput(
 	references []signalv1.BackendResourceReference,
 	cause error,
 ) (AggregateOutput, error) {
-	captureContext, cancelCapture := context.WithTimeout(context.Background(), r.cleanupWait())
+	captureContext, cancelCapture := context.WithTimeout(context.Background(), r.captureWait())
 	defer cancelCapture()
 
 	evidence, _, err := r.captureBackendEvidence(
@@ -292,14 +275,18 @@ func (r *Runner) backendFailureOutput(
 		BackendEvidence:  evidence,
 	}
 
-	if err := r.persistEvidenceBeforeCleanup(&output, MaxBackendEvidenceBytes); err != nil {
+	if err := r.persistBackendEvidence(&output, MaxBackendEvidenceBytes); err != nil {
 		return AggregateOutput{}, err
+	}
+
+	if err := r.quiesceBackends(created); err != nil {
+		return AggregateOutput{}, fmt.Errorf("quiesce partial backends: %w", err)
 	}
 
 	return output, nil
 }
 
-func (r *Runner) persistEvidenceBeforeCleanup(output *AggregateOutput, limit int) error {
+func (r *Runner) persistBackendEvidence(output *AggregateOutput, limit int) error {
 	if r.PersistBackendEvidence == nil {
 		return nil
 	}
@@ -309,40 +296,81 @@ func (r *Runner) persistEvidenceBeforeCleanup(output *AggregateOutput, limit int
 
 		output.BackendEvidence, markErr = markBackendEvidenceIncomplete(
 			output.BackendEvidence,
-			"persist backend evidence before cleanup: "+err.Error(),
+			"persist backend evidence: "+err.Error(),
 			limit,
 		)
 		if markErr != nil {
 			return errors.Join(
-				fmt.Errorf("persist backend evidence before cleanup: %w", err),
+				fmt.Errorf("persist backend evidence: %w", err),
 				markErr,
 			)
 		}
 
 		recordEvidenceCaptureFailure(output)
 
-		return fmt.Errorf("persist backend evidence before cleanup: %w", err)
+		return fmt.Errorf("persist backend evidence: %w", err)
 	}
 
 	return nil
 }
 
-func recordCleanupFailure(output *AggregateOutput) {
-	output.ExecutionState = "Error"
-	output.Verdict = "Inconclusive"
-	output.CleanupFailure = "BackendCleanupFailed"
-
-	if output.Reason == "" || output.Reason == "AllParticipantsPassed" {
-		output.Reason = output.CleanupFailure
+func resultsRequireQuiescence(results []Result) bool {
+	for _, result := range results {
+		if result.Reason == "BackendDeadlineExceeded" ||
+			strings.HasPrefix(result.Reason, "BackendObservationFailed:") ||
+			strings.HasPrefix(result.Reason, "BackendStatusInvalid:") {
+			return true
+		}
 	}
+
+	return false
 }
 
-func runtimeStage(name string) *signalv1.RuntimeStage {
-	if name == "" {
-		return nil
+func (r *Runner) quiesceBackends(backends []createdResource) error {
+	ctx, cancel := context.WithTimeout(context.Background(), r.captureWait())
+	defer cancel()
+
+	propagation := metav1.DeletePropagationForeground
+	for _, backend := range backends {
+		uid := backend.resource.GetUID()
+		err := r.Dynamic.Resource(backend.gvr).Namespace(backend.resource.GetNamespace()).
+			Delete(ctx, backend.resource.GetName(), metav1.DeleteOptions{
+				Preconditions:     &metav1.Preconditions{UID: &uid},
+				PropagationPolicy: &propagation,
+			})
+		if err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
 	}
 
-	return &signalv1.RuntimeStage{Name: name}
+	ticker := time.NewTicker(r.pollInterval())
+	defer ticker.Stop()
+
+	for _, backend := range backends {
+		for {
+			object, err := r.Dynamic.Resource(backend.gvr).Namespace(backend.resource.GetNamespace()).
+				Get(ctx, backend.resource.GetName(), metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				break
+			}
+
+			if err != nil {
+				return err
+			}
+
+			if object.GetUID() != backend.resource.GetUID() {
+				return fmt.Errorf("backend %s/%s identity changed during quiescence", object.GetKind(), object.GetName())
+			}
+
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("wait for backend %s/%s quiescence: %w", object.GetKind(), object.GetName(), ctx.Err())
+			case <-ticker.C:
+			}
+		}
+	}
+
+	return nil
 }
 
 func (r *Runner) waitForResult(ctx context.Context, config Config, backend createdResource) Result {
@@ -744,64 +772,6 @@ func resultLogSourceMetadata(content string, err error) ResultLogSourceMetadata 
 	}
 }
 
-func (r *Runner) cleanup(
-	ctx context.Context,
-	namespace string,
-	resources []createdResource,
-) error {
-	propagation := metav1.DeletePropagationForeground
-
-	var errs []error
-
-	for _, resource := range resources {
-		err := r.Dynamic.Resource(resource.gvr).Namespace(namespace).Delete(
-			ctx,
-			resource.resource.GetName(),
-			metav1.DeleteOptions{
-				Preconditions:     &metav1.Preconditions{UID: ptr(resource.resource.GetUID())},
-				PropagationPolicy: &propagation,
-			},
-		)
-		if err != nil && !apierrors.IsNotFound(err) {
-			errs = append(errs, fmt.Errorf("delete %s %s: %w", resource.resource.GetKind(), resource.resource.GetName(), err))
-		}
-	}
-
-	ticker := time.NewTicker(r.pollInterval())
-	defer ticker.Stop()
-
-	for _, resource := range resources {
-		for {
-			_, err := r.Dynamic.Resource(resource.gvr).Namespace(namespace).
-				Get(ctx, resource.resource.GetName(), metav1.GetOptions{})
-			if apierrors.IsNotFound(err) {
-				break
-			}
-
-			if err != nil {
-				errs = append(errs, fmt.Errorf("observe deletion of %s %s: %w", resource.resource.GetKind(), resource.resource.GetName(), err))
-
-				break
-			}
-
-			select {
-			case <-ctx.Done():
-				errs = append(errs, fmt.Errorf(
-					"wait for deletion of %s %s: %w",
-					resource.resource.GetKind(),
-					resource.resource.GetName(),
-					ctx.Err(),
-				))
-
-				return errors.Join(errs...)
-			case <-ticker.C:
-			}
-		}
-	}
-
-	return errors.Join(errs...)
-}
-
 func (r *Runner) pollInterval() time.Duration {
 	if r.PollInterval > 0 {
 		return r.PollInterval
@@ -810,9 +780,9 @@ func (r *Runner) pollInterval() time.Duration {
 	return 2 * time.Second
 }
 
-func (r *Runner) cleanupWait() time.Duration {
-	if r.CleanupWait > 0 {
-		return r.CleanupWait
+func (r *Runner) captureWait() time.Duration {
+	if r.CaptureWait > 0 {
+		return r.CaptureWait
 	}
 
 	return 30 * time.Second

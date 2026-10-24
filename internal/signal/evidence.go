@@ -35,6 +35,7 @@ const maximumEvidenceChunkBytes = 700 * 1024
 
 type evidenceChunkManifest struct {
 	Version          string `json:"version"`
+	Generation       string `json:"generation"`
 	Chunks           int    `json:"chunks"`
 	CompressedDigest string `json:"compressedDigest"`
 }
@@ -58,6 +59,7 @@ func (s *KubernetesEvidenceStore) Put(ctx context.Context, path string, data []b
 	}
 
 	digest := digestBytes(data)
+	generation := strings.TrimPrefix(digest, "sha256:")
 
 	compressed, err := compressEvidence(data)
 	if err != nil {
@@ -94,7 +96,7 @@ func (s *KubernetesEvidenceStore) Put(ctx context.Context, path string, data []b
 
 			chunk := &corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      fmt.Sprintf("%s-evidence-%03d", name, index),
+					Name:      fmt.Sprintf("%s-evidence-%s-%03d", name, generation, index),
 					Namespace: s.namespace,
 					Labels: map[string]string{
 						SnapshotRunLabel: name,
@@ -115,7 +117,8 @@ func (s *KubernetesEvidenceStore) Put(ctx context.Context, path string, data []b
 		}
 
 		manifest, err := json.Marshal(evidenceChunkManifest{
-			Version:          "v1",
+			Version:          "v2",
+			Generation:       generation,
 			Chunks:           chunkCount,
 			CompressedDigest: digestBytes(compressed),
 		})
@@ -170,8 +173,12 @@ func (s *KubernetesEvidenceStore) Get(
 			return nil, "", "", false, fmt.Errorf("decode evidence ConfigMap %s chunk manifest: %w", evidence.Name, err)
 		}
 
-		if manifest.Version != "v1" || manifest.Chunks < 1 {
+		if manifest.Version != "v2" || manifest.Generation == "" || manifest.Chunks < 1 {
 			return nil, "", "", false, fmt.Errorf("evidence ConfigMap %s has an invalid chunk manifest", evidence.Name)
+		}
+
+		if "sha256:"+manifest.Generation != evidence.Annotations["signal.unbounded-cloud.io/evidence-digest"] {
+			return nil, "", "", false, fmt.Errorf("evidence ConfigMap %s chunk generation does not match its digest", evidence.Name)
 		}
 
 		compressed = make([]byte, 0, manifest.Chunks*maximumEvidenceChunkBytes)
@@ -181,7 +188,7 @@ func (s *KubernetesEvidenceStore) Get(
 				ctx,
 				client.ObjectKey{
 					Namespace: s.namespace,
-					Name:      fmt.Sprintf("%s-%03d", evidence.Name, index),
+					Name:      fmt.Sprintf("%s-%s-%03d", evidence.Name, manifest.Generation, index),
 				},
 				&chunk,
 			); err != nil {

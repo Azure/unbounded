@@ -23,6 +23,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
@@ -81,16 +82,17 @@ var reservedScriptEnvironmentNames = map[string]struct{}{
 var workflowOutputLimits = map[string]int{
 	"backend-resources": signaladapter.MaxBackendOutputBytes,
 	"backend-evidence":  signaladapter.MaxBackendEvidenceBytes,
-	"cleanup-failure":   signaladapter.MaxCleanupFailureBytes,
 	"measurements":      signaladapter.MaxMeasurementsBytes,
 	"reason":            signaladapter.MaxReasonBytes,
 	"verdict":           32,
 }
 
 const (
-	groupedCheckCount          = 15
-	adapterServiceAccountName  = "project-signal-adapter"
-	maximumWorkflowOutputBytes = 768 * 1024
+	groupedCheckCount           = 15
+	adapterServiceAccountName   = "project-signal-adapter"
+	adapterWorkflowTemplateName = "project-signal-participant-adapter"
+	maximumWorkflowOutputBytes  = 768 * 1024
+	maximumStatusTextRunes      = 1024
 )
 
 var workflowGVK = schema.GroupVersionKind{
@@ -152,7 +154,17 @@ func (r *AdmissionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	profileName := node.Labels[RequestLabel]
 	if profileName == "" {
-		return ctrl.Result{}, nil
+		runName := node.Annotations[ReservationLabel]
+		if runName == "" || node.Labels[signalv1.ReservationNodeUIDLabel] != string(node.UID) {
+			return ctrl.Result{}, nil
+		}
+
+		r.admissionMu.Lock()
+		defer r.admissionMu.Unlock()
+
+		_, err := r.resumeOrReleaseReservation(ctx, runName)
+
+		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{}, r.admitNode(ctx, &node, profileName)
@@ -163,50 +175,9 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 	defer r.admissionMu.Unlock()
 
 	if runName := node.Annotations[ReservationLabel]; runName != "" {
-		var run signalv1.CertificationRun
-
-		reader := r.APIReader
-		if reader == nil {
-			reader = r.Client
-		}
-
-		err := reader.Get(ctx, client.ObjectKey{Namespace: r.Namespace, Name: runName}, &run)
-		if err == nil {
-			return r.completeRunAdmission(ctx, &run)
-		}
-
-		if !apierrors.IsNotFound(err) {
+		handled, err := r.resumeOrReleaseReservation(ctx, runName)
+		if err != nil || handled {
 			return err
-		}
-
-		var snapshot corev1.ConfigMap
-
-		err = reader.Get(
-			ctx,
-			client.ObjectKey{
-				Namespace: r.Namespace,
-				Name:      runName + "-scripts",
-			},
-			&snapshot,
-		)
-		if err == nil {
-			if snapshot.Labels[SnapshotRunLabel] != runName {
-				return fmt.Errorf(
-					"orphaned snapshot %s is not bound to reservation %q",
-					snapshot.Name,
-					runName,
-				)
-			}
-
-			if err := r.Delete(ctx, &snapshot); err != nil && !apierrors.IsNotFound(err) {
-				return fmt.Errorf("delete orphaned script snapshot: %w", err)
-			}
-		} else if !apierrors.IsNotFound(err) {
-			return fmt.Errorf("get orphaned script snapshot: %w", err)
-		}
-
-		if err := r.releaseOrphanedReservations(ctx, runName); err != nil {
-			return fmt.Errorf("release orphaned Project Signal reservations: %w", err)
 		}
 	}
 
@@ -216,7 +187,7 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 	}
 
 	checks := profileChecks(&profile)
-	if err := validateCheckPlan(checks); err != nil {
+	if err := validateCheckPlan(checks, profile.Spec.Deadline.Duration); err != nil {
 		return fmt.Errorf("profile %s checks: %w", profile.Name, err)
 	}
 
@@ -226,9 +197,7 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 
 	for index := range checks {
 		check := &checks[index]
-		if err := signalv1.ValidateRuntimeContract(
-			check.Script.RequiresRuntimeStage,
-			check.RuntimeStage,
+		if err := signalv1.ValidateExecutionDeadlines(
 			check.BackendActiveDeadline.Duration,
 			profile.Spec.Deadline.Duration,
 		); err != nil {
@@ -315,7 +284,7 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 			return fmt.Errorf("check %s workload policy: %w", checks[index].ID, err)
 		}
 
-		if err := validateGPUCount(checks[index].GPUCount, checks[index].Backend.Kind); err != nil {
+		if err := validateGPUCount(checks[index].GPUCount, checks[index].Backend); err != nil {
 			return fmt.Errorf("check %s GPU count: %w", checks[index].ID, err)
 		}
 	}
@@ -360,19 +329,16 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 				UID:        profile.UID,
 				Generation: profile.Generation,
 			},
-			Participants:        participants,
-			ParticipantRoles:    append([]signalv1.ParticipantRoleConstraint(nil), profile.Spec.ParticipantRoles...),
-			TopologyConstraints: append([]signalv1.ParticipantTopologyConstraint(nil), profile.Spec.TopologyConstraints...),
-			Checks:              checkSnapshots,
-			ExecutionPolicy:     profile.Spec.ExecutionPolicy,
-			Workflow:            profile.Spec.Workflow,
-			EvidencePath:        strings.Trim(profile.Spec.EvidencePath, "/") + "/" + runName + ".json",
-			Deadline:            profile.Spec.Deadline,
-			Tolerations:         profile.Spec.Tolerations,
-			RequestNodeName:     node.Name,
+			Participants: participants,
+			ScriptBundle: signalv1.ScriptBundleReference{
+				Name: snapshot.Name,
+				UID:  snapshot.UID,
+			},
+			Checks:   checkSnapshots,
+			Deadline: profile.Spec.Deadline,
 		},
 	}
-	if _, err := buildWorkflow(run, 1); err != nil {
+	if _, err := buildWorkflow(run); err != nil {
 		deleteErr := r.Delete(context.WithoutCancel(ctx), snapshot)
 
 		return errors.Join(fmt.Errorf("validate executable plan: %w", err), client.IgnoreNotFound(deleteErr))
@@ -409,6 +375,56 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 	}
 
 	return nil
+}
+
+func (r *AdmissionReconciler) resumeOrReleaseReservation(ctx context.Context, runName string) (bool, error) {
+	var run signalv1.CertificationRun
+
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
+	err := reader.Get(ctx, client.ObjectKey{Namespace: r.Namespace, Name: runName}, &run)
+	if err == nil {
+		return true, r.completeRunAdmission(ctx, &run)
+	}
+
+	if !apierrors.IsNotFound(err) {
+		return false, err
+	}
+
+	var snapshot corev1.ConfigMap
+
+	err = reader.Get(
+		ctx,
+		client.ObjectKey{
+			Namespace: r.Namespace,
+			Name:      runName + "-scripts",
+		},
+		&snapshot,
+	)
+	if err == nil {
+		if snapshot.Labels[SnapshotRunLabel] != runName {
+			return false, fmt.Errorf(
+				"orphaned snapshot %s is not bound to reservation %q",
+				snapshot.Name,
+				runName,
+			)
+		}
+
+		if err := r.Delete(ctx, &snapshot); err != nil && !apierrors.IsNotFound(err) {
+			return false, fmt.Errorf("delete orphaned script snapshot: %w", err)
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return false, fmt.Errorf("get orphaned script snapshot: %w", err)
+	}
+
+	if err := r.releaseOrphanedReservations(ctx, runName); err != nil {
+		return false, fmt.Errorf("release orphaned Project Signal reservations: %w", err)
+	}
+
+	return false, nil
 }
 
 func (r *AdmissionReconciler) completeRunAdmission(
@@ -476,7 +492,8 @@ func (r *AdmissionReconciler) selectParticipants(
 		return nil, fmt.Errorf("profile %s participant selector: %w", profile.Name, err)
 	}
 
-	if !selector.Matches(labels.Set(requestNode.Labels)) || !nodeEligible(requestNode, profile.Spec.Participants.RequiredResources) {
+	if !selector.Matches(labels.Set(requestNode.Labels)) ||
+		!nodeEligible(requestNode, profile.Spec.Participants.MinimumAllocatable) {
 		return nil, fmt.Errorf("request node %s does not satisfy profile %s", requestNode.Name, profile.Name)
 	}
 
@@ -495,7 +512,7 @@ func (r *AdmissionReconciler) selectParticipants(
 
 		if candidate.Name == requestNode.Name ||
 			!selector.Matches(labels.Set(candidate.Labels)) ||
-			!nodeEligible(candidate, profile.Spec.Participants.RequiredResources) ||
+			!nodeEligible(candidate, profile.Spec.Participants.MinimumAllocatable) ||
 			candidate.Annotations[ReservationLabel] != "" ||
 			candidate.Labels[signalv1.ReservationNodeUIDLabel] != "" {
 			continue
@@ -558,7 +575,6 @@ func participantSnapshot(node *corev1.Node, index int32) signalv1.Participant {
 		Index:       index,
 		NodeName:    node.Name,
 		NodeUID:     node.UID,
-		Capacity:    node.Status.Capacity.DeepCopy(),
 		Allocatable: node.Status.Allocatable.DeepCopy(),
 	}
 }
@@ -620,11 +636,34 @@ func selectParticipantPlan(
 	participants := make([]signalv1.Participant, 0, count)
 	for _, candidateIndex := range selectedIndexes {
 		participant := participantSnapshot(&candidates[candidateIndex], int32(len(participants)))
-		participant.Roles = slices.Clone(assignments[candidateIndex])
+		if len(assignments[candidateIndex]) > 0 {
+			participant.Role = assignments[candidateIndex][0]
+		}
+
+		participant.TopologyValues = topologyValues(&candidates[candidateIndex], topology)
 		participants = append(participants, participant)
 	}
 
 	return participants, nil
+}
+
+func topologyValues(
+	node *corev1.Node,
+	constraints []signalv1.ParticipantTopologyConstraint,
+) map[string]string {
+	values := make(map[string]string)
+	for index := range constraints {
+		key := constraints[index].LabelKey
+		if value, exists := node.Labels[key]; exists {
+			values[key] = value
+		}
+	}
+
+	if len(values) == 0 {
+		return nil
+	}
+
+	return values
 }
 
 func solveParticipantRoles(
@@ -942,6 +981,13 @@ func (r *AdmissionReconciler) reserveParticipants(ctx context.Context, participa
 			)
 		}
 
+		if node.Spec.Unschedulable {
+			return errors.Join(
+				fmt.Errorf("participant %s became unschedulable before reservation", participant.NodeName),
+				r.releaseParticipants(context.WithoutCancel(ctx), reserved, runName),
+			)
+		}
+
 		if value := node.Annotations[ReservationLabel]; value != "" {
 			return errors.Join(
 				fmt.Errorf("participant %s is already reserved by %s", participant.NodeName, value),
@@ -967,6 +1013,7 @@ func (r *AdmissionReconciler) reserveParticipants(ctx context.Context, participa
 
 		node.Annotations[ReservationLabel] = runName
 		node.Labels[signalv1.ReservationNodeUIDLabel] = string(participant.NodeUID)
+		node.Spec.Unschedulable = true
 
 		if err := r.Patch(
 			ctx,
@@ -999,6 +1046,13 @@ func (r *AdmissionReconciler) releaseParticipants(ctx context.Context, participa
 		}
 
 		if participant.NodeUID != "" && node.UID != participant.NodeUID {
+			errs = append(errs, fmt.Errorf(
+				"participant %s identity changed from %s to %s",
+				participant.NodeName,
+				participant.NodeUID,
+				node.UID,
+			))
+
 			continue
 		}
 
@@ -1006,7 +1060,7 @@ func (r *AdmissionReconciler) releaseParticipants(ctx context.Context, participa
 			continue
 		}
 
-		if value := node.Labels[signalv1.ReservationNodeUIDLabel]; value != "" && value != string(participant.NodeUID) {
+		if value := node.Labels[signalv1.ReservationNodeUIDLabel]; value != string(participant.NodeUID) {
 			errs = append(errs, fmt.Errorf(
 				"participant %s reservation identity changed from %s to %s",
 				participant.NodeName,
@@ -1018,6 +1072,7 @@ func (r *AdmissionReconciler) releaseParticipants(ctx context.Context, participa
 		}
 
 		before := node.DeepCopy()
+		node.Spec.Unschedulable = false
 		delete(node.Annotations, ReservationLabel)
 		delete(node.Labels, signalv1.ReservationNodeUIDLabel)
 
@@ -1086,15 +1141,12 @@ func (r *AdmissionReconciler) createSnapshot(
 			ID:    check.ID,
 			Order: check.Order,
 			Script: signalv1.ScriptSnapshot{
-				ConfigMapName:        snapshot.Name,
-				Key:                  key,
-				RequiresRuntimeStage: check.Script.RequiresRuntimeStage,
-				Digest:               digest,
+				Key:    key,
+				Digest: digest,
 			},
 			RunnerImage:           check.RunnerImage,
 			Backend:               check.Backend,
 			WorkloadPolicy:        *check.WorkloadPolicy.DeepCopy(),
-			RuntimeStage:          copyRuntimeStage(check.RuntimeStage),
 			GPUCount:              check.GPUCount,
 			ScriptEnvironment:     maps.Clone(check.ScriptEnvironment),
 			BackendActiveDeadline: check.BackendActiveDeadline,
@@ -1115,6 +1167,8 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	hydrateRunDerivedFields(&run)
+
 	if !run.DeletionTimestamp.IsZero() {
 		return r.reconcileDeleting(ctx, &run)
 	}
@@ -1125,6 +1179,10 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		}
 
 		return r.cleanup(ctx, &run)
+	}
+
+	if err := r.verifyScriptBundle(ctx, &run); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	if run.Status.Evidence.URI == "" {
@@ -1138,12 +1196,21 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return r.cancel(ctx, &run)
 	}
 
+	participantsOwned, err := r.ensureParticipantsCordoned(ctx, &run)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if !participantsOwned {
+		return r.finishParticipantOwnershipLoss(ctx, &run)
+	}
+
 	if run.Annotations[RunAdmissionAnnotation] != runAdmissionReady {
 		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
 	if run.Status.Workflow.Name == "" {
-		return r.startAttempt(ctx, &run, 1)
+		return r.startWorkflow(ctx, &run)
 	}
 
 	workflow := &unstructured.Unstructured{}
@@ -1176,7 +1243,7 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	}
 
 	if run.Status.Workflow.UID == "" {
-		return r.recordWorkflowStarted(ctx, &run, workflow, run.Status.Workflow.Attempt)
+		return r.recordWorkflowStarted(ctx, &run, workflow)
 	}
 
 	if string(workflow.GetUID()) != run.Status.Workflow.UID {
@@ -1226,15 +1293,197 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	}
 }
 
-func (r *RunReconciler) startAttempt(ctx context.Context, run *signalv1.CertificationRun, attempt int32) (ctrl.Result, error) {
-	workflow, err := buildWorkflow(run, attempt)
+func (r *RunReconciler) verifyScriptBundle(ctx context.Context, run *signalv1.CertificationRun) error {
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
+	var snapshot corev1.ConfigMap
+	if err := reader.Get(
+		ctx,
+		client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.ScriptBundle.Name},
+		&snapshot,
+	); err != nil {
+		return fmt.Errorf("read immutable script bundle: %w", err)
+	}
+
+	if snapshot.UID != run.Spec.ScriptBundle.UID || snapshot.Labels[SnapshotRunLabel] != run.Name {
+		return errors.New("script bundle identity does not match the run")
+	}
+
+	if snapshot.Immutable == nil || !*snapshot.Immutable {
+		return errors.New("script bundle is not immutable")
+	}
+
+	for index := range run.Spec.Checks {
+		check := &run.Spec.Checks[index]
+		content, found := snapshot.Data[check.Script.Key]
+		if !found {
+			return fmt.Errorf("script bundle is missing check %s key %s", check.ID, check.Script.Key)
+		}
+
+		if digestString(content) != check.Script.Digest {
+			return fmt.Errorf("script bundle digest does not match check %s", check.ID)
+		}
+	}
+
+	return nil
+}
+
+func hydrateRunDerivedFields(run *signalv1.CertificationRun) {
+	for index := range run.Spec.Participants {
+		run.Spec.Participants[index].Index = int32(index)
+	}
+
+	for index := range run.Spec.Checks {
+		run.Spec.Checks[index].ID = signalv1.CheckID(fmt.Sprintf("R%02d", index+1))
+		run.Spec.Checks[index].Order = int32(index)
+	}
+
+	if len(run.Status.Checks) == len(run.Spec.Checks) {
+		for index := range run.Status.Checks {
+			run.Status.Checks[index].ID = run.Spec.Checks[index].ID
+			run.Status.Checks[index].Order = run.Spec.Checks[index].Order
+		}
+	}
+}
+
+func (r *RunReconciler) ensureParticipantsCordoned(
+	ctx context.Context,
+	run *signalv1.CertificationRun,
+) (bool, error) {
+	allOwned := true
+
+	for _, participant := range run.Spec.Participants {
+		var node corev1.Node
+		if err := r.Get(ctx, client.ObjectKey{Name: participant.NodeName}, &node); err != nil {
+			if apierrors.IsNotFound(err) {
+				allOwned = false
+
+				continue
+			}
+
+			return false, fmt.Errorf("get cordoned participant %s: %w", participant.NodeName, err)
+		}
+
+		if node.UID != participant.NodeUID {
+			allOwned = false
+
+			continue
+		}
+
+		if node.Annotations[ReservationLabel] != run.Name ||
+			node.Labels[signalv1.ReservationNodeUIDLabel] != string(participant.NodeUID) {
+			allOwned = false
+
+			continue
+		}
+
+		if node.Spec.Unschedulable {
+			continue
+		}
+
+		before := node.DeepCopy()
+		node.Spec.Unschedulable = true
+		if err := r.Patch(
+			ctx,
+			&node,
+			client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}),
+		); err != nil {
+			return false, fmt.Errorf("restore participant %s cordon: %w", participant.NodeName, err)
+		}
+	}
+
+	status := metav1.ConditionTrue
+	reason := "ParticipantsCordoned"
+	message := "All participants are reserved and cordoned by this Run"
+	if !allOwned {
+		status = metav1.ConditionFalse
+		reason = "ParticipantOwnershipLost"
+		message = "One or more snapshotted participants are missing, replaced, or no longer owned by this Run"
+	}
+
+	if err := r.patchRunCondition(
+		ctx,
+		run,
+		signalv1.RunConditionCordoned,
+		status,
+		reason,
+		message,
+	); err != nil {
+		return false, err
+	}
+
+	return allOwned, nil
+}
+
+func (r *RunReconciler) finishParticipantOwnershipLoss(
+	ctx context.Context,
+	run *signalv1.CertificationRun,
+) (ctrl.Result, error) {
+	workflow, err := r.workflowForCancellation(ctx, run)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if workflow == nil {
+		workflow = &unstructured.Unstructured{}
+		workflow.SetGroupVersionKind(workflowGVK)
+		workflow.SetNamespace(run.Namespace)
+		workflow.SetName(fmt.Sprintf("%s-a1", run.Name))
+	} else {
+		workflow = workflow.DeepCopy()
+	}
+
+	if err := unstructured.SetNestedField(workflow.Object, "Error", "status", "phase"); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := unstructured.SetNestedField(
+		workflow.Object,
+		"participant identity or reservation ownership changed",
+		"status",
+		"message",
+	); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return r.finishGrouped(ctx, run, workflow, "Error")
+}
+
+func (r *RunReconciler) patchRunCondition(
+	ctx context.Context,
+	run *signalv1.CertificationRun,
+	conditionType string,
+	status metav1.ConditionStatus,
+	reason string,
+	message string,
+) error {
+	before := run.DeepCopy()
+	run.Status.ObservedGeneration = run.Generation
+	apimeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
+		Type:               conditionType,
+		Status:             status,
+		ObservedGeneration: run.Generation,
+		Reason:             reason,
+		Message:            message,
+	})
+
+	if reflect.DeepEqual(before.Status, run.Status) {
+		return nil
+	}
+
+	return r.Status().Patch(ctx, run, client.MergeFrom(before))
+}
+
+func (r *RunReconciler) startWorkflow(ctx context.Context, run *signalv1.CertificationRun) (ctrl.Result, error) {
+	workflow, err := buildWorkflow(run)
 	if err != nil {
 		before := run.DeepCopy()
 		now := metav1.NewTime(r.now())
 		run.Status.Phase = signalv1.RunPhaseInconclusive
-		run.Status.ExecutionState = "Error"
-		run.Status.Verdict = "Inconclusive"
-		run.Status.Reason = "InvalidExecutionPlan: " + err.Error()
+		run.Status.Reason = boundedStatusText("InvalidExecutionPlan: " + err.Error())
 		run.Status.FinishedAt = &now
 
 		return ctrl.Result{RequeueAfter: time.Millisecond}, r.Status().Patch(ctx, run, client.MergeFrom(before))
@@ -1242,9 +1491,8 @@ func (r *RunReconciler) startAttempt(ctx context.Context, run *signalv1.Certific
 
 	before := run.DeepCopy()
 	run.Status.Workflow = signalv1.WorkflowStatus{
-		Name:    workflow.GetName(),
-		Attempt: attempt,
-		Phase:   "Creating",
+		Name:  workflow.GetName(),
+		Phase: "Creating",
 	}
 	run.Status.Checks = initialCheckStatuses(run.Spec.Checks)
 
@@ -1254,41 +1502,37 @@ func (r *RunReconciler) startAttempt(ctx context.Context, run *signalv1.Certific
 
 	if err := r.Create(ctx, workflow); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
-			return ctrl.Result{}, fmt.Errorf("create Workflow attempt %d: %w", attempt, err)
+			return ctrl.Result{}, fmt.Errorf("create Workflow: %w", err)
 		}
 
 		existing := &unstructured.Unstructured{}
 		existing.SetGroupVersionKind(workflowGVK)
-
 		if getErr := r.Get(ctx, client.ObjectKeyFromObject(workflow), existing); getErr != nil {
-			return ctrl.Result{}, fmt.Errorf("get existing Workflow attempt %d: %w", attempt, getErr)
+			return ctrl.Result{}, fmt.Errorf("get existing Workflow: %w", getErr)
 		}
 
 		if !metav1.IsControlledBy(existing, run) {
-			return ctrl.Result{}, fmt.Errorf("workflow attempt %d already exists without matching CertificationRun ownership", attempt)
+			return ctrl.Result{}, errors.New("Workflow already exists without matching CertificationRun ownership")
 		}
 
 		workflow = existing
 	}
 
-	return r.recordWorkflowStarted(ctx, run, workflow, attempt)
+	return r.recordWorkflowStarted(ctx, run, workflow)
 }
 
 func (r *RunReconciler) recordWorkflowStarted(
 	ctx context.Context,
 	run *signalv1.CertificationRun,
 	workflow *unstructured.Unstructured,
-	attempt int32,
 ) (ctrl.Result, error) {
 	before := run.DeepCopy()
 	run.Status.Phase = signalv1.RunPhaseRunning
-	run.Status.ExecutionState = "Running"
 
 	run.Status.Workflow = signalv1.WorkflowStatus{
-		Name:    workflow.GetName(),
-		UID:     string(workflow.GetUID()),
-		Attempt: attempt,
-		Phase:   "Pending",
+		Name:  workflow.GetName(),
+		UID:   string(workflow.GetUID()),
+		Phase: "Pending",
 	}
 	run.Status.Checks = initialCheckStatuses(run.Spec.Checks)
 
@@ -1298,35 +1542,24 @@ func (r *RunReconciler) recordWorkflowStarted(
 	}
 
 	if err := r.Status().Patch(ctx, run, client.MergeFrom(before)); err != nil {
-		return ctrl.Result{}, fmt.Errorf("record Workflow attempt: %w", err)
+		return ctrl.Result{}, fmt.Errorf("record Workflow identity: %w", err)
 	}
 
 	if r.Recorder != nil {
 		r.Recorder.Eventf(run, nil, corev1.EventTypeNormal, "WorkflowStarted", "StartWorkflow",
-			"Created Workflow %s for attempt %d", workflow.GetName(), attempt)
+			"Created Workflow %s", workflow.GetName())
 	}
 
 	return ctrl.Result{}, nil
 }
 
-func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured.Unstructured, error) {
+func buildWorkflow(run *signalv1.CertificationRun) (*unstructured.Unstructured, error) {
 	checks := run.Spec.Checks
-	if err := validateRunCheckPlan(checks); err != nil {
+	if err := validateRunCheckPlan(checks, run.Spec.Deadline.Duration); err != nil {
 		return nil, err
 	}
 
-	tolerations := uniqueTolerations(append([]corev1.Toleration{{
-		Key:      "nvidia.com/gpu",
-		Operator: corev1.TolerationOpExists,
-		Effect:   corev1.TaintEffectNoSchedule,
-	}}, run.Spec.Tolerations...))
-
-	tolerationsJSON, err := json.Marshal(tolerations)
-	if err != nil {
-		return nil, fmt.Errorf("encode Workflow tolerations: %w", err)
-	}
-
-	name := fmt.Sprintf("%s-a%d", run.Name, attempt)
+	name := run.Name + "-a1"
 	tasks := make([]any, 0, len(checks))
 
 	for index := range checks {
@@ -1359,17 +1592,15 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 		task := map[string]any{
 			"name": taskName,
 			"templateRef": map[string]any{
-				"name":     run.Spec.Workflow.Name,
+				"name":     adapterWorkflowTemplateName,
 				"template": "certification",
 			},
 			"arguments": map[string]any{
 				"parameters": checkWorkflowParameters(
 					run,
 					check,
-					attempt,
 					checkParticipants,
 					string(participantsJSON),
-					string(tolerationsJSON),
 					string(environmentJSON),
 					workloadPolicyJSON,
 					strconv.FormatInt(int64(check.GPUCount), 10),
@@ -1379,18 +1610,7 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 
 		if index > 0 {
 			previous := checkTaskName(&checks[index-1])
-			if run.Spec.ExecutionPolicy.OnFailure == signalv1.SuiteFailurePolicyContinue {
-				task["depends"] = fmt.Sprintf(
-					"%[1]s.Succeeded || %[1]s.Failed || %[1]s.Errored || %[1]s.Skipped || %[1]s.Omitted",
-					previous,
-				)
-			} else {
-				task["depends"] = previous + ".Succeeded"
-				task["when"] = fmt.Sprintf(
-					"{{tasks.%s.outputs.parameters.verdict}} == Pass",
-					previous,
-				)
-			}
+			task["depends"] = previous + ".Succeeded"
 		}
 
 		tasks = append(tasks, task)
@@ -1409,16 +1629,7 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 		"spec": map[string]any{
 			"activeDeadlineSeconds": int64(run.Spec.Deadline.Seconds()),
 			"serviceAccountName":    adapterServiceAccountName,
-			"ttlStrategy": map[string]any{
-				"secondsAfterCompletion": int64(6 * time.Hour / time.Second),
-				"secondsAfterSuccess":    int64(6 * time.Hour / time.Second),
-				"secondsAfterFailure":    int64(6 * time.Hour / time.Second),
-			},
-			"podGC": map[string]any{
-				"strategy":            "OnWorkflowCompletion",
-				"deleteDelayDuration": "2h",
-			},
-			"entrypoint": "certification-suite",
+			"entrypoint":            "certification-suite",
 			"templates": []any{
 				map[string]any{
 					"name": "certification-suite",
@@ -1440,10 +1651,8 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 func checkWorkflowParameters(
 	run *signalv1.CertificationRun,
 	check *signalv1.CertificationCheckSnapshot,
-	attempt int32,
 	participants []signalv1.Participant,
 	participantsJSON string,
-	tolerationsJSON string,
 	scriptEnvironmentJSON string,
 	workloadPolicyJSON string,
 	gpuCount string,
@@ -1453,31 +1662,27 @@ func checkWorkflowParameters(
 		map[string]any{"name": "run-uid", "value": string(run.UID)},
 		map[string]any{"name": "participants-json", "value": participantsJSON},
 		map[string]any{"name": "participant-count", "value": fmt.Sprintf("%d", len(participants))},
-		map[string]any{"name": "script-configmap", "value": check.Script.ConfigMapName},
+		map[string]any{"name": "script-configmap", "value": run.Spec.ScriptBundle.Name},
 		map[string]any{"name": "script-key", "value": check.Script.Key},
 		map[string]any{"name": "script-digest", "value": check.Script.Digest},
-		map[string]any{
-			"name":  "script-requires-runtime-stage",
-			"value": fmt.Sprintf("%t", check.Script.RequiresRuntimeStage),
-		},
-		map[string]any{"name": "runtime-stage-name", "value": runtimeStageName(check.RuntimeStage)},
-		map[string]any{"name": "backend-api-version", "value": check.Backend.APIVersion},
-		map[string]any{"name": "backend-kind", "value": check.Backend.Kind},
+		map[string]any{"name": "backend-kind", "value": string(check.Backend)},
 		map[string]any{
 			"name":  "backend-active-deadline-seconds",
 			"value": fmt.Sprintf("%d", int64(check.BackendActiveDeadline.Seconds())),
 		},
 		map[string]any{"name": "runner-image", "value": check.RunnerImage},
-		map[string]any{"name": "tolerations", "value": tolerationsJSON},
 		map[string]any{"name": "script-environment", "value": scriptEnvironmentJSON},
 		map[string]any{"name": "workload-policy", "value": workloadPolicyJSON},
 		map[string]any{"name": "gpu-resource-count", "value": gpuCount},
-		map[string]any{"name": "attempt", "value": fmt.Sprintf("%d", attempt)},
 	}
 }
 
-func validateGPUCount(gpuCount int32, backendKind string) error {
-	if gpuCount < 0 || (backendKind == "MPIJob" && gpuCount == 0) {
+func validateGPUCount(gpuCount int32, backend signalv1.ExecutionBackend) error {
+	if backend != signalv1.ExecutionBackendPod && backend != signalv1.ExecutionBackendMPIJob {
+		return fmt.Errorf("unsupported backend %q", backend)
+	}
+
+	if gpuCount < 0 || (backend == signalv1.ExecutionBackendMPIJob && gpuCount == 0) {
 		return errors.New("must be nonnegative and positive for MPIJob")
 	}
 
@@ -1502,6 +1707,10 @@ func validEnvironmentName(value string) bool {
 }
 
 func validateScriptEnvironment(environment map[string]string) error {
+	if len(environment) > 32 {
+		return errors.New("must not contain more than 32 entries")
+	}
+
 	keys := make([]string, 0, len(environment))
 	for key := range environment {
 		keys = append(keys, key)
@@ -1510,6 +1719,10 @@ func validateScriptEnvironment(environment map[string]string) error {
 	sort.Strings(keys)
 
 	for _, name := range keys {
+		if len(name) > 253 {
+			return fmt.Errorf("name %q exceeds 253 bytes", name)
+		}
+
 		if !validEnvironmentName(name) {
 			return fmt.Errorf("name %q is invalid", name)
 		}
@@ -1520,6 +1733,10 @@ func validateScriptEnvironment(environment map[string]string) error {
 
 		if _, reserved := reservedScriptEnvironmentNames[name]; reserved {
 			return fmt.Errorf("name %q is reserved", name)
+		}
+
+		if len(environment[name]) > 4096 {
+			return fmt.Errorf("value for %q exceeds 4096 bytes", name)
 		}
 	}
 
@@ -1546,8 +1763,6 @@ func (r *RunReconciler) finishGrouped(
 
 	evidenceRun := run.DeepCopy()
 	evidenceRun.Status.Checks = checks
-	evidenceRun.Status.ExecutionState = executionState
-	evidenceRun.Status.Verdict = verdict
 	evidenceRun.Status.Reason = reason
 	evidenceRun.Status.Phase = runPhaseForVerdict(verdict)
 	evidenceRun.Status.Workflow.Phase = workflowPhase
@@ -1566,7 +1781,7 @@ func (r *RunReconciler) finishGrouped(
 		return ctrl.Result{}, err
 	}
 
-	uri, digest, err := r.Evidence.Put(ctx, run.Spec.EvidencePath, evidence)
+	uri, digest, err := r.Evidence.Put(ctx, evidencePath(run), evidence)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -1576,6 +1791,7 @@ func (r *RunReconciler) finishGrouped(
 	run.Status.Checks = compactCheckStatuses(checks)
 	run.Status.Evidence = signalv1.EvidenceStatus{URI: uri, Digest: digest}
 	run.Status.Phase = runPhaseForVerdict(verdict)
+	run.Status.Reason = boundedStatusText(reason)
 
 	if err := r.Status().Patch(ctx, run, client.MergeFrom(before)); err != nil {
 		return ctrl.Result{}, err
@@ -1592,7 +1808,7 @@ func (r *RunReconciler) resumeGroupedEvidence(
 	ctx context.Context,
 	run *signalv1.CertificationRun,
 ) (ctrl.Result, bool, error) {
-	data, uri, digest, found, err := r.Evidence.Get(ctx, run.Spec.EvidencePath)
+	data, uri, digest, found, err := r.Evidence.Get(ctx, evidencePath(run))
 	if err != nil || !found {
 		return ctrl.Result{}, false, err
 	}
@@ -1601,7 +1817,7 @@ func (r *RunReconciler) resumeGroupedEvidence(
 		RunID          string                  `json:"runID"`
 		RunName        string                  `json:"runName"`
 		Workflow       signalv1.WorkflowStatus `json:"workflow"`
-		CheckStatus    []signalv1.CheckStatus  `json:"checkStatus"`
+		CheckStatus    []evidenceCheckStatus   `json:"checkStatus"`
 		ExecutionState string                  `json:"executionState"`
 		Verdict        string                  `json:"verdict"`
 		Reason         string                  `json:"reason"`
@@ -1616,10 +1832,18 @@ func (r *RunReconciler) resumeGroupedEvidence(
 		return ctrl.Result{}, false, fmt.Errorf("persisted grouped evidence identity does not match run %s", run.Name)
 	}
 
-	if document.Workflow.Name != "" &&
-		(document.Workflow.Name != fmt.Sprintf("%s-a1", run.Name) || document.Workflow.UID == "" ||
-			(run.Status.Workflow.UID != "" && document.Workflow.UID != run.Status.Workflow.UID)) {
-		return ctrl.Result{}, false, errors.New("persisted evidence Workflow identity does not match run")
+	if document.Workflow.Name != "" {
+		if document.Workflow.Name != fmt.Sprintf("%s-a1", run.Name) ||
+			(run.Status.Workflow.UID != "" && document.Workflow.UID != run.Status.Workflow.UID) {
+			return ctrl.Result{}, false, errors.New("persisted evidence Workflow identity does not match run")
+		}
+
+		neverObserved := document.Workflow.UID == "" &&
+			((document.Phase == signalv1.RunPhaseInconclusive && document.Workflow.Phase == "Error") ||
+				(document.Phase == signalv1.RunPhaseCancelled && document.Workflow.Phase == "Canceled"))
+		if document.Workflow.UID == "" && !neverObserved {
+			return ctrl.Result{}, false, errors.New("persisted evidence is missing the observed Workflow UID")
+		}
 	}
 
 	if len(document.CheckStatus) != len(run.Spec.Checks) {
@@ -1646,10 +1870,8 @@ func (r *RunReconciler) resumeGroupedEvidence(
 	}
 
 	before := run.DeepCopy()
-	run.Status.Checks = compactCheckStatuses(document.CheckStatus)
-	run.Status.ExecutionState = document.ExecutionState
-	run.Status.Verdict = document.Verdict
-	run.Status.Reason = document.Reason
+	run.Status.Checks = compactEvidenceCheckStatuses(document.CheckStatus)
+	run.Status.Reason = boundedStatusText(document.Reason)
 	run.Status.Workflow = document.Workflow
 	run.Status.Evidence = signalv1.EvidenceStatus{URI: uri, Digest: digest}
 
@@ -1734,11 +1956,9 @@ func initialCheckStatuses(checks []signalv1.CertificationCheckSnapshot) []signal
 	statuses := make([]signalv1.CheckStatus, len(checks))
 	for index := range checks {
 		statuses[index] = signalv1.CheckStatus{
-			ID:         checks[index].ID,
-			Order:      checks[index].Order,
-			Phase:      signalv1.CheckPhasePending,
-			Attempt:    1,
-			RetryCount: 0,
+			ID:    checks[index].ID,
+			Order: checks[index].Order,
+			Phase: signalv1.CheckPhasePending,
 		}
 	}
 
@@ -1750,15 +1970,29 @@ func compactCheckStatuses(statuses []signalv1.CheckStatus) []signalv1.CheckStatu
 	for index := range statuses {
 		compacted[index] = *statuses[index].DeepCopy()
 		compacted[index].BackendEvidence.Content = ""
+		compacted[index].Reason = boundedStatusText(compacted[index].Reason)
 	}
 
 	return compacted
+}
+
+func boundedStatusText(value string) string {
+	runes := []rune(value)
+	if len(runes) <= maximumStatusTextRunes {
+		return value
+	}
+
+	return string(runes[:maximumStatusTextRunes])
 }
 
 func contentDigest(content string) string {
 	sum := sha256.Sum256([]byte(content))
 
 	return fmt.Sprintf("sha256:%x", sum)
+}
+
+func evidencePath(run *signalv1.CertificationRun) string {
+	return run.Name + ".json"
 }
 
 func runningCheckStatuses(
@@ -1790,7 +2024,6 @@ func runningCheckStatuses(
 			statuses[index].Phase = signalv1.CheckPhaseInconclusive
 		case "Omitted", "Skipped":
 			statuses[index].Phase = signalv1.CheckPhaseSkipped
-			statuses[index].NotRun = true
 		}
 
 		setCheckTimes(&statuses[index], node)
@@ -1811,7 +2044,6 @@ func terminalCheckStatuses(
 			statuses[index].Phase = signalv1.CheckPhaseInconclusive
 			statuses[index].Verdict = "Inconclusive"
 			statuses[index].Reason = "WorkflowNodesUnavailable"
-			statuses[index].NotRun = true
 		}
 
 		return statuses, "Inconclusive", "workflow task nodes are missing or malformed"
@@ -1819,7 +2051,6 @@ func terminalCheckStatuses(
 
 	aggregateVerdict := "Pass"
 	aggregateReason := "AllChecksPassed"
-	stoppedByPolicy := false
 
 	for index := range run.Spec.Checks {
 		check := &run.Spec.Checks[index]
@@ -1830,7 +2061,6 @@ func terminalCheckStatuses(
 			status.Phase = signalv1.CheckPhaseInconclusive
 			status.Verdict = "Inconclusive"
 			status.Reason = "WorkflowTaskIdentityInvalid"
-			status.NotRun = true
 			aggregateVerdict = "Inconclusive"
 			aggregateReason = "workflow did not contain exactly one task node for every check"
 
@@ -1846,12 +2076,9 @@ func terminalCheckStatuses(
 			status.Phase = signalv1.CheckPhaseSkipped
 			status.Verdict = "Inconclusive"
 			status.Reason = "NotRun"
-			status.NotRun = true
 
-			if run.Spec.ExecutionPolicy.OnFailure != signalv1.SuiteFailurePolicyStop || !stoppedByPolicy {
-				aggregateVerdict = "Inconclusive"
-				aggregateReason = "one or more checks were not run"
-			}
+			aggregateVerdict = "Inconclusive"
+			aggregateReason = "one or more checks were not run"
 
 			continue
 		case "Failed", "Error":
@@ -1860,7 +2087,6 @@ func terminalCheckStatuses(
 			status.Reason = "WorkflowTask" + phase
 			aggregateVerdict = "Inconclusive"
 			aggregateReason = "one or more check tasks failed at the workflow boundary"
-			stoppedByPolicy = true
 
 			continue
 		case "Succeeded":
@@ -1868,10 +2094,8 @@ func terminalCheckStatuses(
 			status.Phase = signalv1.CheckPhaseInconclusive
 			status.Verdict = "Inconclusive"
 			status.Reason = "WorkflowTaskIncomplete"
-			status.NotRun = true
 			aggregateVerdict = "Inconclusive"
 			aggregateReason = "one or more check tasks were incomplete"
-			stoppedByPolicy = true
 
 			continue
 		}
@@ -1883,7 +2107,6 @@ func terminalCheckStatuses(
 			status.Reason = "OutputsRejected: " + outputErr.Error()
 			aggregateVerdict = "Inconclusive"
 			aggregateReason = "one or more check outputs were malformed or incomplete"
-			stoppedByPolicy = true
 
 			continue
 		}
@@ -1904,7 +2127,6 @@ func terminalCheckStatuses(
 			status.Reason = "ParticipantPolicyInvalid: " + participantErr.Error()
 			aggregateVerdict = "Inconclusive"
 			aggregateReason = "one or more checks had invalid participant policy"
-			stoppedByPolicy = true
 
 			continue
 		}
@@ -1923,13 +2145,11 @@ func terminalCheckStatuses(
 			status.Reason = "BackendEvidenceRejected: " + evidenceErr.Error()
 			aggregateVerdict = "Inconclusive"
 			aggregateReason = "one or more checks had invalid backend evidence"
-			stoppedByPolicy = true
 
 			continue
 		}
 
 		status.BackendEvidence = signalv1.BackendEvidenceStatus{
-			Version:  "v1",
 			Complete: complete,
 			Digest:   contentDigest(normalizedEvidence),
 			Content:  normalizedEvidence,
@@ -1947,22 +2167,20 @@ func terminalCheckStatuses(
 			status.Reason = "BackendResourcesRejected: " + resourceErr.Error()
 			aggregateVerdict = "Inconclusive"
 			aggregateReason = "one or more checks had invalid backend identities"
-			stoppedByPolicy = true
 
 			continue
 		}
 
 		status.BackendResources = resources
-		status.Cleanup.Complete = outputs["cleanup-failure"] == ""
-		status.Cleanup.Reason = outputs["cleanup-failure"]
+		status.Cleanup.Complete = false
+		status.Cleanup.Reason = "DeferredToController"
 
-		if !complete || !status.Cleanup.Complete || len(resources) == 0 {
+		if !complete || len(resources) == 0 {
 			status.Phase = signalv1.CheckPhaseInconclusive
 			status.Verdict = "Inconclusive"
 			status.Reason = "EvidenceOrCleanupIncomplete"
 			aggregateVerdict = "Inconclusive"
-			aggregateReason = "one or more checks lacked complete evidence, backend coverage, or cleanup"
-			stoppedByPolicy = true
+			aggregateReason = "one or more checks lacked complete evidence or backend coverage"
 
 			continue
 		}
@@ -1972,7 +2190,6 @@ func terminalCheckStatuses(
 			status.Phase = signalv1.CheckPhaseSucceeded
 		case "Fail":
 			status.Phase = signalv1.CheckPhaseFailed
-			stoppedByPolicy = true
 
 			if aggregateVerdict == "Pass" {
 				aggregateVerdict = "Fail"
@@ -1982,14 +2199,12 @@ func terminalCheckStatuses(
 			status.Phase = signalv1.CheckPhaseInconclusive
 			aggregateVerdict = "Inconclusive"
 			aggregateReason = "one or more checks were inconclusive"
-			stoppedByPolicy = true
 		default:
 			status.Phase = signalv1.CheckPhaseInconclusive
 			status.Verdict = "Inconclusive"
 			status.Reason = "InvalidVerdict"
 			aggregateVerdict = "Inconclusive"
 			aggregateReason = "one or more checks returned an invalid verdict"
-			stoppedByPolicy = true
 		}
 	}
 
@@ -2040,7 +2255,6 @@ func nodeWorkflowParameters(node map[string]any) (map[string]string, error) {
 		"measurements":      workflowOutputLimits["measurements"],
 		"backend-resources": workflowOutputLimits["backend-resources"],
 		"backend-evidence":  workflowOutputLimits["backend-evidence"],
-		"cleanup-failure":   workflowOutputLimits["cleanup-failure"],
 	}
 
 	decoded, err := decodeWorkflowParametersWithLimits(parameters, limits)
@@ -2054,7 +2268,6 @@ func nodeWorkflowParameters(node map[string]any) (map[string]string, error) {
 		"measurements",
 		"backend-resources",
 		"backend-evidence",
-		"cleanup-failure",
 	} {
 		if _, exists := decoded[required]; !exists {
 			return nil, fmt.Errorf("required parameter %q is missing", required)
@@ -2077,10 +2290,6 @@ func setCheckTimes(status *signalv1.CheckStatus, node map[string]any) {
 		value := metav1.NewTime(parsed)
 		status.FinishedAt = &value
 	}
-
-	if status.StartedAt != nil && status.FinishedAt != nil {
-		status.Duration = metav1.Duration{Duration: status.FinishedAt.Sub(status.StartedAt.Time)}
-	}
 }
 
 func nodeString(node map[string]any, key string) string {
@@ -2092,25 +2301,98 @@ func nodeString(node map[string]any, key string) string {
 	return value
 }
 
-func uniqueTolerations(tolerations []corev1.Toleration) []corev1.Toleration {
-	unique := make([]corev1.Toleration, 0, len(tolerations))
-	for _, toleration := range tolerations {
-		duplicate := false
+type evidenceBackendStatus struct {
+	Complete bool            `json:"complete"`
+	Digest   string          `json:"digest,omitempty"`
+	Document json.RawMessage `json:"document,omitempty"`
+}
 
-		for _, existing := range unique {
-			if reflect.DeepEqual(existing, toleration) {
-				duplicate = true
+type evidenceCleanupStatus struct {
+	Complete bool   `json:"complete"`
+	Reason   string `json:"reason,omitempty"`
+}
 
-				break
+type evidenceCheckStatus struct {
+	ID               signalv1.CheckID                    `json:"id"`
+	Order            int32                               `json:"order"`
+	WorkflowNodeName string                              `json:"workflowNodeName,omitempty"`
+	Phase            signalv1.CheckPhase                 `json:"phase"`
+	Verdict          string                              `json:"verdict"`
+	Reason           string                              `json:"reason,omitempty"`
+	Measurements     string                              `json:"measurements,omitempty"`
+	BackendResources []signalv1.BackendResourceReference `json:"backendResources,omitempty"`
+	BackendEvidence  evidenceBackendStatus               `json:"backendEvidence"`
+	Cleanup          evidenceCleanupStatus               `json:"cleanup"`
+	StartedAt        *metav1.Time                        `json:"startedAt,omitempty"`
+	FinishedAt       *metav1.Time                        `json:"finishedAt,omitempty"`
+}
+
+func evidenceCheckStatuses(statuses []signalv1.CheckStatus) ([]evidenceCheckStatus, error) {
+	result := make([]evidenceCheckStatus, len(statuses))
+	for index := range statuses {
+		status := &statuses[index]
+		var document json.RawMessage
+
+		if status.BackendEvidence.Content != "" {
+			document = json.RawMessage(status.BackendEvidence.Content)
+			if !json.Valid(document) {
+				return nil, fmt.Errorf("check %s backend evidence is not valid JSON", status.ID)
 			}
 		}
 
-		if !duplicate {
-			unique = append(unique, toleration)
+		result[index] = evidenceCheckStatus{
+			ID:               status.ID,
+			Order:            status.Order,
+			WorkflowNodeName: status.WorkflowNodeName,
+			Phase:            status.Phase,
+			Verdict:          status.Verdict,
+			Reason:           status.Reason,
+			Measurements:     status.Measurements,
+			BackendResources: status.BackendResources,
+			BackendEvidence: evidenceBackendStatus{
+				Complete: status.BackendEvidence.Complete,
+				Digest:   status.BackendEvidence.Digest,
+				Document: document,
+			},
+			Cleanup: evidenceCleanupStatus{
+				Complete: status.Cleanup.Complete,
+				Reason:   status.Cleanup.Reason,
+			},
+			StartedAt:  status.StartedAt,
+			FinishedAt: status.FinishedAt,
 		}
 	}
 
-	return unique
+	return result, nil
+}
+
+func compactEvidenceCheckStatuses(statuses []evidenceCheckStatus) []signalv1.CheckStatus {
+	result := make([]signalv1.CheckStatus, len(statuses))
+	for index := range statuses {
+		status := &statuses[index]
+		result[index] = signalv1.CheckStatus{
+			ID:               status.ID,
+			Order:            status.Order,
+			WorkflowNodeName: status.WorkflowNodeName,
+			Phase:            status.Phase,
+			Verdict:          status.Verdict,
+			Reason:           boundedStatusText(status.Reason),
+			Measurements:     status.Measurements,
+			BackendResources: status.BackendResources,
+			BackendEvidence: signalv1.BackendEvidenceStatus{
+				Complete: status.BackendEvidence.Complete,
+				Digest:   status.BackendEvidence.Digest,
+			},
+			StartedAt:  status.StartedAt,
+			FinishedAt: status.FinishedAt,
+			Cleanup: signalv1.CheckCleanupStatus{
+				Complete: status.Cleanup.Complete,
+				Reason:   status.Cleanup.Reason,
+			},
+		}
+	}
+
+	return result
 }
 
 func (r *RunReconciler) evidenceDocument(
@@ -2128,10 +2410,14 @@ func (r *RunReconciler) evidenceDocument(
 	var snapshot corev1.ConfigMap
 	if err := r.Get(
 		ctx,
-		client.ObjectKey{Namespace: run.Namespace, Name: checks[0].Script.ConfigMapName},
+		client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.ScriptBundle.Name},
 		&snapshot,
 	); err != nil {
 		return nil, fmt.Errorf("read script snapshot for evidence: %w", err)
+	}
+
+	if snapshot.UID != run.Spec.ScriptBundle.UID || snapshot.Labels[SnapshotRunLabel] != run.Name {
+		return nil, errors.New("script bundle identity does not match the run")
 	}
 
 	scriptContents := make(map[string]string, len(checks))
@@ -2144,25 +2430,28 @@ func (r *RunReconciler) evidenceDocument(
 		scriptContents[string(checks[index].ID)] = content
 	}
 
+	checkStatuses, err := evidenceCheckStatuses(run.Status.Checks)
+	if err != nil {
+		return nil, err
+	}
+
 	doc := map[string]any{
-		"apiVersion":          "signal.unbounded-cloud.io/evidence/v1alpha1",
-		"runID":               string(run.UID),
-		"runName":             run.Name,
-		"profile":             run.Spec.Profile,
-		"participants":        run.Spec.Participants,
-		"participantRoles":    run.Spec.ParticipantRoles,
-		"topologyConstraints": run.Spec.TopologyConstraints,
-		"workflow":            run.Status.Workflow,
-		"checks":              checks,
-		"checkStatus":         run.Status.Checks,
-		"scriptContents":      scriptContents,
-		"executionPolicy":     run.Spec.ExecutionPolicy,
-		"executionState":      executionState,
-		"verdict":             verdict,
-		"reason":              reason,
-		"phase":               run.Status.Phase,
-		"startedAt":           run.Status.StartedAt,
-		"finishedAt":          run.Status.FinishedAt.UTC().Format(time.RFC3339Nano),
+		"apiVersion":     "signal.unbounded-cloud.io/evidence/v1alpha1",
+		"runID":          string(run.UID),
+		"runName":        run.Name,
+		"profile":        run.Spec.Profile,
+		"participants":   run.Spec.Participants,
+		"scriptBundle":   run.Spec.ScriptBundle,
+		"workflow":       run.Status.Workflow,
+		"checks":         checks,
+		"checkStatus":    checkStatuses,
+		"scriptContents": scriptContents,
+		"executionState": executionState,
+		"verdict":        verdict,
+		"reason":         reason,
+		"phase":          run.Status.Phase,
+		"startedAt":      run.Status.StartedAt,
+		"finishedAt":     run.Status.FinishedAt.UTC().Format(time.RFC3339Nano),
 	}
 
 	return json.MarshalIndent(doc, "", "  ")
@@ -2171,7 +2460,7 @@ func (r *RunReconciler) evidenceDocument(
 func backendResourceReferences(
 	value string,
 	participantCount int,
-	namespace string,
+	_ string,
 	allowPartial bool,
 ) ([]signalv1.BackendResourceReference, error) {
 	if participantCount < 1 || participantCount > 64 {
@@ -2204,22 +2493,11 @@ func backendResourceReferences(
 
 	for index := range references {
 		reference := &references[index]
-		if reference.APIVersion == "" || reference.Kind == "" || reference.Name == "" || reference.UID == "" {
+		if reference.Name == "" || reference.UID == "" {
 			return nil, fmt.Errorf("backend-resources[%d] has an incomplete identity", index)
 		}
 
-		if reference.Namespace == "" {
-			reference.Namespace = namespace
-		}
-
-		if reference.Namespace != namespace {
-			return nil, fmt.Errorf("backend-resources[%d] namespace does not match the Run namespace", index)
-		}
-
 		identity := strings.Join([]string{
-			reference.APIVersion,
-			reference.Kind,
-			reference.Namespace,
 			reference.Name,
 			string(reference.UID),
 		}, "\x00")
@@ -2350,6 +2628,10 @@ func groupedBackendEvidenceComplete(
 	seen := make([]bool, participantCount)
 	complete := !allowPartial && evidence.Complete && evidence.CaptureError == ""
 	podUIDs := map[types.UID]struct{}{}
+	expectedAPIVersion, expectedKind, err := backendIdentity(backend)
+	if err != nil {
+		return false, err
+	}
 
 	for index := range evidence.Participants {
 		participant := &evidence.Participants[index]
@@ -2386,10 +2668,7 @@ func groupedBackendEvidenceComplete(
 				continue
 			}
 
-			if reference.APIVersion != participant.Resource.APIVersion ||
-				reference.Kind != participant.Resource.Kind ||
-				reference.Namespace != participant.Resource.Namespace ||
-				reference.Name != participant.Resource.Name ||
+			if reference.Name != participant.Resource.Name ||
 				reference.UID != participant.Resource.UID {
 				return false, fmt.Errorf("backend-evidence participant %d resource differs from backend-resources", participant.ParticipantIndex)
 			}
@@ -2397,13 +2676,13 @@ func groupedBackendEvidenceComplete(
 			matches++
 		}
 
-		if matches != 1 || participant.Resource.APIVersion != backend.APIVersion ||
-			participant.Resource.Kind != backend.Kind || participant.Resource.Namespace != namespace {
+		if matches != 1 || participant.Resource.APIVersion != expectedAPIVersion ||
+			participant.Resource.Kind != expectedKind || participant.Resource.Namespace != namespace {
 			return false, fmt.Errorf("backend-evidence participant %d does not match the declared backend", participant.ParticipantIndex)
 		}
 
 		complete = complete && participant.CaptureError == "" && len(participant.Pods) > 0
-		launcher, worker := false, false
+		launcher := false
 
 		for _, pod := range participant.Pods {
 			if pod.UID == "" || pod.Name == "" {
@@ -2415,13 +2694,12 @@ func groupedBackendEvidenceComplete(
 			}
 
 			podUIDs[pod.UID] = struct{}{}
-			if backend.Kind == "Pod" && (pod.UID != participant.Resource.UID ||
+			if backend == signalv1.ExecutionBackendPod && (pod.UID != participant.Resource.UID ||
 				pod.Name != participant.Resource.Name || pod.Role != "participant" || len(participant.Pods) != 1) {
 				return false, errors.New("backend-evidence Pod differs from its backend resource")
 			}
 
 			launcher = launcher || pod.Role == "launcher"
-			worker = worker || pod.Role == "worker"
 
 			complete = complete && pod.Phase != "" && len(pod.Containers) > 0
 			for _, container := range pod.Containers {
@@ -2435,13 +2713,25 @@ func groupedBackendEvidenceComplete(
 			}
 		}
 
-		if backend.Kind == "MPIJob" {
-			complete = complete && launcher && worker && participant.LauncherJob != nil &&
+		if backend == signalv1.ExecutionBackendMPIJob {
+			complete = complete && launcher && participant.LauncherJob != nil &&
 				participant.LauncherJob.Name != "" && participant.LauncherJob.UID != ""
 		}
+
 	}
 
 	return complete, nil
+}
+
+func backendIdentity(backend signalv1.ExecutionBackend) (string, string, error) {
+	switch backend {
+	case signalv1.ExecutionBackendPod:
+		return "v1", "Pod", nil
+	case signalv1.ExecutionBackendMPIJob:
+		return "kubeflow.org/v2beta1", "MPIJob", nil
+	default:
+		return "", "", fmt.Errorf("unsupported backend %q", backend)
+	}
 }
 
 func groupedBackendEvidenceForParticipants(
@@ -2511,14 +2801,41 @@ func groupedBackendEvidenceForParticipants(
 func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationRun) (ctrl.Result, error) {
 	evidenceRun := run.DeepCopy()
 	evidenceRun.Status.Phase = signalv1.RunPhaseCancelled
-	evidenceRun.Status.ExecutionState = "Interrupted"
-	evidenceRun.Status.Verdict = "Inconclusive"
 	evidenceRun.Status.Reason = "canceled by operator"
+	if !run.DeletionTimestamp.IsZero() {
+		evidenceRun.Status.Reason = "canceled by deletion"
+	}
 	evidenceRun.Status.Workflow.Phase = "Canceled"
 
-	statuses := evidenceRun.Status.Checks
-	if len(statuses) != len(run.Spec.Checks) {
-		statuses = initialCheckStatuses(run.Spec.Checks)
+	statuses := initialCheckStatuses(run.Spec.Checks)
+	workflow, err := r.workflowForCancellation(ctx, run)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if workflow != nil {
+		evidenceRun.Status.Workflow.Name = workflow.GetName()
+		evidenceRun.Status.Workflow.UID = string(workflow.GetUID())
+		if phase, found, phaseErr := unstructured.NestedString(workflow.Object, "status", "phase"); phaseErr != nil {
+			return ctrl.Result{}, fmt.Errorf("read Workflow phase during cancellation: %w", phaseErr)
+		} else if found {
+			evidenceRun.Status.Workflow.Phase = phase
+		}
+
+		completed, _, _ := terminalCheckStatuses(workflow, run)
+		nodes, found, nodesErr := unstructured.NestedMap(workflow.Object, "status", "nodes")
+		if nodesErr != nil {
+			return ctrl.Result{}, fmt.Errorf("read Workflow nodes during cancellation: %w", nodesErr)
+		}
+
+		if found {
+			for index := range run.Spec.Checks {
+				node, count := exactCheckNode(nodes, workflow.GetName(), &run.Spec.Checks[index])
+				if count == 1 && nodeString(node, "phase") == "Succeeded" {
+					statuses[index] = completed[index]
+				}
+			}
+		}
 	}
 
 	for index := range statuses {
@@ -2531,7 +2848,6 @@ func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationR
 		statuses[index].Phase = signalv1.CheckPhaseSkipped
 		statuses[index].Verdict = "Inconclusive"
 		statuses[index].Reason = "Canceled"
-		statuses[index].NotRun = true
 	}
 
 	evidenceRun.Status.Checks = statuses
@@ -2542,15 +2858,15 @@ func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationR
 	evidence, err := r.evidenceDocument(
 		ctx,
 		evidenceRun,
-		evidenceRun.Status.ExecutionState,
-		evidenceRun.Status.Verdict,
+		"Interrupted",
+		"Inconclusive",
 		evidenceRun.Status.Reason,
 	)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	uri, digest, err := r.Evidence.Put(ctx, run.Spec.EvidencePath, evidence)
+	uri, digest, err := r.Evidence.Put(ctx, evidencePath(run), evidence)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -2566,7 +2882,52 @@ func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationR
 	return ctrl.Result{RequeueAfter: time.Millisecond}, nil
 }
 
+func (r *RunReconciler) workflowForCancellation(
+	ctx context.Context,
+	run *signalv1.CertificationRun,
+) (*unstructured.Unstructured, error) {
+	name := run.Status.Workflow.Name
+	if name == "" {
+		name = fmt.Sprintf("%s-a1", run.Name)
+	}
+
+	workflow := &unstructured.Unstructured{}
+	workflow.SetGroupVersionKind(workflowGVK)
+
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
+	err := reader.Get(
+		ctx,
+		client.ObjectKey{Namespace: run.Namespace, Name: name},
+		workflow,
+	)
+	if apierrors.IsNotFound(err) {
+		return nil, nil
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	if !metav1.IsControlledBy(workflow, run) ||
+		(run.Status.Workflow.UID != "" && string(workflow.GetUID()) != run.Status.Workflow.UID) {
+		return nil, errors.New("Workflow identity changed during cancellation")
+	}
+
+	return workflow, nil
+}
+
 func (r *RunReconciler) cleanup(ctx context.Context, run *signalv1.CertificationRun) (ctrl.Result, error) {
+	holdParticipants := run.Status.Phase != signalv1.RunPhaseSucceeded && !run.Spec.Release
+	if holdParticipants {
+		if _, err := r.ensureParticipantsCordoned(ctx, run); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	stopped, err := r.ensureWorkflowStopped(ctx, run)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -2580,35 +2941,63 @@ func (r *RunReconciler) cleanup(ctx context.Context, run *signalv1.Certification
 		return ctrl.Result{}, err
 	}
 
+	if err := r.deleteScriptBundle(ctx, run); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := r.patchRunCondition(
+		ctx,
+		run,
+		signalv1.RunConditionCleanup,
+		metav1.ConditionTrue,
+		"WorkloadsDeleted",
+		"Workflow, backend descendants, and script bundle are deleted",
+	); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if holdParticipants {
+		if err := r.patchRunCondition(
+			ctx,
+			run,
+			signalv1.RunConditionReleased,
+			metav1.ConditionFalse,
+			"AwaitingExplicitRelease",
+			"Participants remain reserved and cordoned until spec.release is true",
+		); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
 	if err := r.clearRequest(ctx, run); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	released, err := r.releaseRunReservations(ctx, run)
-	if err != nil {
+	if _, err := r.releaseRunReservations(ctx, run); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	deleted := false
-
-	checks := run.Spec.Checks
-	if len(checks) == 0 {
-		return ctrl.Result{}, errors.New("run has no certification checks")
-	}
-
-	snapshot := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: checks[0].Script.ConfigMapName},
-	}
-	if err := r.Delete(ctx, snapshot); err != nil && !apierrors.IsNotFound(err) {
+	if err := r.patchRunCondition(
+		ctx,
+		run,
+		signalv1.RunConditionReleased,
+		metav1.ConditionTrue,
+		"ParticipantsReleased",
+		"Participant reservations and Signal-owned cordons are released",
+	); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	deleted = true
-
-	statusBefore := run.DeepCopy()
-
-	run.Status.Cleanup = signalv1.CleanupStatus{ReservationsReleased: released, SnapshotDeleted: deleted}
-	if err := r.Status().Patch(ctx, run, client.MergeFrom(statusBefore)); err != nil {
+	if err := r.patchRunCondition(
+		ctx,
+		run,
+		signalv1.RunConditionCordoned,
+		metav1.ConditionFalse,
+		"ParticipantsReleased",
+		"Signal no longer owns participant cordons",
+	); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -2621,15 +3010,56 @@ func (r *RunReconciler) cleanup(ctx context.Context, run *signalv1.Certification
 
 	if r.Recorder != nil {
 		r.Recorder.Eventf(run, nil, corev1.EventTypeNormal, "CertificationCleaned", "CleanCertification",
-			"Released participant reservations, cleared the request label, and deleted the script snapshot")
+			"Deleted certification workloads and released participant reservations and cordons")
 	}
 
 	return ctrl.Result{}, nil
 }
 
+func (r *RunReconciler) deleteScriptBundle(ctx context.Context, run *signalv1.CertificationRun) error {
+	snapshot := &corev1.ConfigMap{}
+
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
+	err := reader.Get(
+		ctx,
+		client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.ScriptBundle.Name},
+		snapshot,
+	)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+
+	if err != nil {
+		return err
+	}
+
+	if snapshot.UID != run.Spec.ScriptBundle.UID || snapshot.Labels[SnapshotRunLabel] != run.Name {
+		return errors.New("refusing to delete script bundle with changed identity")
+	}
+
+	uid := snapshot.UID
+
+	return client.IgnoreNotFound(r.Delete(ctx, snapshot, client.Preconditions{UID: &uid}))
+}
+
 func (r *RunReconciler) reconcileDeleting(ctx context.Context, run *signalv1.CertificationRun) (ctrl.Result, error) {
 	if !containsString(run.Finalizers, RunFinalizer) {
 		return ctrl.Result{}, nil
+	}
+
+	if !run.Status.Phase.Terminal() && run.Status.Evidence.URI == "" {
+		result, recovered, err := r.resumeGroupedEvidence(ctx, run)
+		if err != nil || recovered {
+			return result, err
+		}
+	}
+
+	if !run.Status.Phase.Terminal() && run.Status.Workflow.Name != "" {
+		return r.cancel(ctx, run)
 	}
 
 	stopped, err := r.ensureWorkflowStopped(ctx, run)
@@ -2649,27 +3079,8 @@ func (r *RunReconciler) reconcileDeleting(ctx context.Context, run *signalv1.Cer
 		return ctrl.Result{}, err
 	}
 
-	if len(run.Spec.Checks) > 0 {
-		snapshot := &corev1.ConfigMap{}
-
-		reader := r.APIReader
-		if reader == nil {
-			reader = r.Client
-		}
-
-		err := reader.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.Checks[0].Script.ConfigMapName}, snapshot)
-		if err == nil {
-			if snapshot.Labels[SnapshotRunLabel] != run.Name {
-				return ctrl.Result{}, errors.New("refusing to delete script snapshot with different run identity")
-			}
-
-			uid := snapshot.UID
-			if err := r.Delete(ctx, snapshot, client.Preconditions{UID: &uid}); err != nil && !apierrors.IsNotFound(err) {
-				return ctrl.Result{}, err
-			}
-		} else if !apierrors.IsNotFound(err) {
-			return ctrl.Result{}, err
-		}
+	if err := r.deleteScriptBundle(ctx, run); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	before := run.DeepCopy()
@@ -2697,16 +3108,12 @@ func (r *RunReconciler) releaseRunReservations(ctx context.Context, run *signalv
 			continue
 		}
 
-		if value := node.Labels[signalv1.ReservationNodeUIDLabel]; value != "" && value != string(participant.NodeUID) {
-			return false, fmt.Errorf(
-				"participant %s reservation identity changed from %s to %s",
-				participant.NodeName,
-				participant.NodeUID,
-				value,
-			)
+		if node.Labels[signalv1.ReservationNodeUIDLabel] != string(participant.NodeUID) {
+			continue
 		}
 
 		before := node.DeepCopy()
+		node.Spec.Unschedulable = false
 		delete(node.Annotations, ReservationLabel)
 		delete(node.Labels, signalv1.ReservationNodeUIDLabel)
 
@@ -2719,12 +3126,18 @@ func (r *RunReconciler) releaseRunReservations(ctx context.Context, run *signalv
 }
 
 func (r *RunReconciler) clearRequest(ctx context.Context, run *signalv1.CertificationRun) error {
+	if len(run.Spec.Participants) == 0 {
+		return errors.New("run has no requesting participant")
+	}
+
+	requestNode := run.Spec.Participants[0]
+
 	var node corev1.Node
-	if err := r.Get(ctx, client.ObjectKey{Name: run.Spec.RequestNodeName}, &node); err != nil {
+	if err := r.Get(ctx, client.ObjectKey{Name: requestNode.NodeName}, &node); err != nil {
 		return client.IgnoreNotFound(err)
 	}
 
-	if requestNodeUID := participantNodeUID(run, run.Spec.RequestNodeName); requestNodeUID != "" && node.UID != requestNodeUID {
+	if node.UID != requestNode.NodeUID {
 		return nil
 	}
 
@@ -2801,7 +3214,7 @@ func (r *RunReconciler) runWorkloadsGone(ctx context.Context, reader client.Read
 			{Group: "batch", Version: "v1", Kind: "Job"},
 			{Group: "kubeflow.org", Version: "v2beta1", Kind: "MPIJob"},
 		} {
-			if kind.Kind != "Pod" && check.Backend.Kind != "MPIJob" {
+			if kind.Kind != "Pod" && check.Backend != signalv1.ExecutionBackendMPIJob {
 				continue
 			}
 
@@ -2832,7 +3245,7 @@ func (r *RunReconciler) fenceWorkflowDependents(
 	kinds := []schema.GroupVersionKind{}
 
 	for _, check := range run.Spec.Checks {
-		if check.Backend.Kind == "MPIJob" {
+		if check.Backend == signalv1.ExecutionBackendMPIJob {
 			kinds = append(kinds, schema.GroupVersionKind{Group: "kubeflow.org", Version: "v2beta1", Kind: "MPIJob"})
 
 			break
@@ -2986,48 +3399,33 @@ func profileChecks(profile *signalv1.CertificationProfile) []signalv1.Certificat
 	checks := make([]signalv1.CertificationCheck, len(profile.Spec.Checks))
 	for index := range profile.Spec.Checks {
 		checks[index] = profile.Spec.Checks[index]
+		checks[index].ID = signalv1.CheckID(fmt.Sprintf("R%02d", index+1))
+		checks[index].Order = int32(index)
 		checks[index].WorkloadPolicy = *profile.Spec.Checks[index].WorkloadPolicy.DeepCopy()
-		checks[index].RuntimeStage = copyRuntimeStage(profile.Spec.Checks[index].RuntimeStage)
 		checks[index].ScriptEnvironment = maps.Clone(profile.Spec.Checks[index].ScriptEnvironment)
-		checks[index].ParticipantPolicy.RequiredRoles = slices.Clone(
-			profile.Spec.Checks[index].ParticipantPolicy.RequiredRoles,
-		)
-		checks[index].ParticipantPolicy.ExcludedRoles = slices.Clone(
-			profile.Spec.Checks[index].ParticipantPolicy.ExcludedRoles,
-		)
+		checks[index].ParticipantPolicy.Roles = slices.Clone(profile.Spec.Checks[index].ParticipantPolicy.Roles)
 	}
 
 	return checks
 }
 
-func validateCheckPlan(checks []signalv1.CertificationCheck) error {
+func validateCheckPlan(checks []signalv1.CertificationCheck, deadline time.Duration) error {
 	if len(checks) != groupedCheckCount {
 		return fmt.Errorf("must contain exactly %d checks", groupedCheckCount)
 	}
 
-	seen := make(map[signalv1.CheckID]struct{}, len(checks))
-
 	for index := range checks {
 		check := &checks[index]
-		if check.ID == "" {
-			return fmt.Errorf("check %d has an empty ID", index)
-		}
-
-		if check.Order != int32(index) {
-			return fmt.Errorf("check %s order is %d, want %d", check.ID, check.Order, index)
-		}
-
-		if string(check.ID) != fmt.Sprintf("R%02d", index+1) {
-			return fmt.Errorf("check order %d must use ID R%02d", index, index+1)
-		}
-
-		if _, duplicate := seen[check.ID]; duplicate {
-			return fmt.Errorf("duplicate check ID %q", check.ID)
-		}
-
-		seen[check.ID] = struct{}{}
-
 		if err := validateCheckParticipantPolicy(check.ID, check.ParticipantPolicy); err != nil {
+			return err
+		}
+
+		deadlines := make([]time.Duration, len(checks))
+		for index := range checks {
+			deadlines[index] = checks[index].BackendActiveDeadline.Duration
+		}
+
+		if err := signalv1.ValidateSuiteDeadlines(deadlines, deadline); err != nil {
 			return err
 		}
 	}
@@ -3043,28 +3441,24 @@ func validateCheckPlan(checks []signalv1.CertificationCheck) error {
 	return nil
 }
 
-func validateRunCheckPlan(checks []signalv1.CertificationCheckSnapshot) error {
+func validateRunCheckPlan(checks []signalv1.CertificationCheckSnapshot, deadline time.Duration) error {
 	if len(checks) != groupedCheckCount {
 		return fmt.Errorf("run must contain exactly %d checks", groupedCheckCount)
 	}
 
-	seen := make(map[signalv1.CheckID]struct{}, len(checks))
-
 	for index := range checks {
 		check := &checks[index]
-		if check.ID == "" || check.Order != int32(index) {
-			return fmt.Errorf("run check %d has invalid identity or order", index)
-		}
+		check.ID = signalv1.CheckID(fmt.Sprintf("R%02d", index+1))
+		check.Order = int32(index)
+	}
 
-		if string(check.ID) != fmt.Sprintf("R%02d", index+1) {
-			return fmt.Errorf("run check order %d must use ID R%02d", index, index+1)
-		}
+	deadlines := make([]time.Duration, len(checks))
+	for index := range checks {
+		deadlines[index] = checks[index].BackendActiveDeadline.Duration
+	}
 
-		if _, duplicate := seen[check.ID]; duplicate {
-			return fmt.Errorf("run contains duplicate check ID %q", check.ID)
-		}
-
-		seen[check.ID] = struct{}{}
+	if err := signalv1.ValidateSuiteDeadlines(deadlines, deadline); err != nil {
+		return err
 	}
 
 	if fixedWorkflowOutputBytes() > maximumWorkflowOutputBytes {
@@ -3081,7 +3475,6 @@ func validateRunCheckPlan(checks []signalv1.CertificationCheckSnapshot) error {
 func fixedWorkflowOutputBytes() int64 {
 	perCheck := int64(
 		workflowOutputLimits["verdict"] +
-			workflowOutputLimits["cleanup-failure"] +
 			workflowOutputLimits["reason"] +
 			workflowOutputLimits["measurements"] +
 			workflowOutputLimits["backend-resources"] +
@@ -3092,34 +3485,17 @@ func fixedWorkflowOutputBytes() int64 {
 }
 
 func validateCheckParticipantPolicy(id signalv1.CheckID, policy signalv1.CheckParticipantPolicy) error {
-	required := make(map[string]struct{}, len(policy.RequiredRoles))
-	for _, role := range policy.RequiredRoles {
+	roles := make(map[string]struct{}, len(policy.Roles))
+	for _, role := range policy.Roles {
 		if role == "" {
-			return fmt.Errorf("check %s contains an empty required role", id)
+			return fmt.Errorf("check %s contains an empty participant role", id)
 		}
 
-		if _, duplicate := required[role]; duplicate {
-			return fmt.Errorf("check %s repeats required role %q", id, role)
+		if _, duplicate := roles[role]; duplicate {
+			return fmt.Errorf("check %s repeats participant role %q", id, role)
 		}
 
-		required[role] = struct{}{}
-	}
-
-	excluded := make(map[string]struct{}, len(policy.ExcludedRoles))
-	for _, role := range policy.ExcludedRoles {
-		if role == "" {
-			return fmt.Errorf("check %s contains an empty excluded role", id)
-		}
-
-		if _, duplicate := excluded[role]; duplicate {
-			return fmt.Errorf("check %s repeats excluded role %q", id, role)
-		}
-
-		if _, conflict := required[role]; conflict {
-			return fmt.Errorf("check %s both requires and excludes role %q", id, role)
-		}
-
-		excluded[role] = struct{}{}
+		roles[role] = struct{}{}
 	}
 
 	return nil
@@ -3151,11 +3527,11 @@ func validateParticipantConstraints(
 		assigned += role.Count
 	}
 
-	if assigned > profile.Spec.Participants.Count {
+	if len(profile.Spec.ParticipantRoles) > 0 && assigned != profile.Spec.Participants.Count {
 		return fmt.Errorf(
-			"participant roles require %d assignments but participant count is %d",
-			assigned,
+			"participant roles require exactly %d assignments, got %d",
 			profile.Spec.Participants.Count,
+			assigned,
 		)
 	}
 
@@ -3171,10 +3547,7 @@ func validateParticipantConstraints(
 	}
 
 	for index := range checks {
-		for _, role := range append(
-			slices.Clone(checks[index].ParticipantPolicy.RequiredRoles),
-			checks[index].ParticipantPolicy.ExcludedRoles...,
-		) {
+		for _, role := range checks[index].ParticipantPolicy.Roles {
 			if _, exists := roles[role]; !exists {
 				return fmt.Errorf("check %s references unknown participant role %q", checks[index].ID, role)
 			}
@@ -3188,14 +3561,9 @@ func participantsForCheck(
 	participants []signalv1.Participant,
 	policy signalv1.CheckParticipantPolicy,
 ) ([]signalv1.Participant, []int32, error) {
-	required := make(map[string]bool, len(policy.RequiredRoles))
-	for _, role := range policy.RequiredRoles {
-		required[role] = false
-	}
-
-	excluded := make(map[string]struct{}, len(policy.ExcludedRoles))
-	for _, role := range policy.ExcludedRoles {
-		excluded[role] = struct{}{}
+	included := make(map[string]struct{}, len(policy.Roles))
+	for _, role := range policy.Roles {
+		included[role] = struct{}{}
 	}
 
 	selected := make([]signalv1.Participant, 0, len(participants))
@@ -3203,38 +3571,20 @@ func participantsForCheck(
 	globalIndexes := make([]int32, 0, len(participants))
 	for index := range participants {
 		participant := participants[index]
-		include := len(required) == 0
-
-		for _, role := range participant.Roles {
-			if _, blocked := excluded[role]; blocked {
-				include = false
-
-				break
-			}
-
-			if _, wanted := required[role]; wanted {
-				required[role] = true
-				include = true
-			}
-		}
+		_, include := included[participant.Role]
+		include = len(included) == 0 || include
 
 		if !include {
 			continue
 		}
 
-		globalIndexes = append(globalIndexes, participant.Index)
+		globalIndexes = append(globalIndexes, int32(index))
 		participant.Index = int32(len(selected))
 		selected = append(selected, participant)
 	}
 
 	if len(selected) == 0 {
 		return nil, nil, errors.New("participant policy selected no participants")
-	}
-
-	for role, present := range required {
-		if !present {
-			return nil, nil, fmt.Errorf("required role %q has no selected participant", role)
-		}
 	}
 
 	return selected, globalIndexes, nil
@@ -3281,22 +3631,6 @@ func checkRunName(runName string, checkID signalv1.CheckID) string {
 	prefixLength := 63 - len(hash) - 1
 
 	return strings.TrimRight(candidate[:prefixLength], "-") + "-" + hash
-}
-
-func copyRuntimeStage(stage *signalv1.RuntimeStage) *signalv1.RuntimeStage {
-	if stage == nil {
-		return nil
-	}
-
-	return &signalv1.RuntimeStage{Name: stage.Name}
-}
-
-func runtimeStageName(stage *signalv1.RuntimeStage) string {
-	if stage == nil {
-		return ""
-	}
-
-	return stage.Name
 }
 
 func AddToScheme(scheme *runtime.Scheme) error {

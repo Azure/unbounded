@@ -13,14 +13,23 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/util/validation"
 
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
 )
 
 const MaxPolicyBytes = 16 * 1024
 
-var capabilityPattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
+var (
+	capabilityPattern   = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
+	allowedCapabilities = map[corev1.Capability]struct{}{
+		"IPC_LOCK": {},
+	}
+	allowedHostPathRoots = []string{"/proc", "/sys", "/var/lib/project-signal"}
+)
+
+func HostPathVolumeName(index int) string {
+	return fmt.Sprintf("host-%02d", index)
+}
 
 func Encode(policy signalv1.WorkloadPolicy) (string, error) {
 	if err := Validate(policy); err != nil {
@@ -88,21 +97,10 @@ func Validate(policy signalv1.WorkloadPolicy) error {
 		return errors.New("workload policy must not contain more than 16 host paths")
 	}
 
-	names := map[string]struct{}{"scripts": {}, "results": {}}
 	mountPaths := map[string]struct{}{"/scripts": {}, "/results": {}}
 
 	for index := range policy.HostPaths {
 		hostPath := &policy.HostPaths[index]
-		if errors := validation.IsDNS1123Label(hostPath.Name); len(errors) > 0 {
-			return fmt.Errorf("workload policy host path %d name is invalid: %s", index, strings.Join(errors, ", "))
-		}
-
-		if _, exists := names[hostPath.Name]; exists {
-			return fmt.Errorf("workload policy host path %d duplicates reserved or existing name %q", index, hostPath.Name)
-		}
-
-		names[hostPath.Name] = struct{}{}
-
 		if err := validateAbsolutePath(fmt.Sprintf("workload policy host path %d mountPath", index), hostPath.MountPath); err != nil {
 			return err
 		}
@@ -118,6 +116,10 @@ func Validate(policy signalv1.WorkloadPolicy) error {
 		mountPaths[hostPath.MountPath] = struct{}{}
 		if err := validateAbsolutePath(fmt.Sprintf("workload policy host path %d path", index), hostPath.Path); err != nil {
 			return err
+		}
+
+		if !allowedHostPath(hostPath.Path) {
+			return fmt.Errorf("workload policy host path %d source %q is not allowlisted", index, hostPath.Path)
 		}
 	}
 
@@ -153,6 +155,10 @@ func validateCapabilities(capabilities []corev1.Capability) error {
 			return fmt.Errorf("workload policy capability %q is invalid", capability)
 		}
 
+		if _, allowed := allowedCapabilities[capability]; !allowed {
+			return fmt.Errorf("workload policy capability %q is not allowlisted", capability)
+		}
+
 		if _, exists := seen[capability]; exists {
 			return fmt.Errorf("workload policy capability %q is repeated", capability)
 		}
@@ -161,6 +167,16 @@ func validateCapabilities(capabilities []corev1.Capability) error {
 	}
 
 	return nil
+}
+
+func allowedHostPath(value string) bool {
+	for _, root := range allowedHostPathRoots {
+		if value == root || strings.HasPrefix(value, root+"/") {
+			return true
+		}
+	}
+
+	return false
 }
 
 func validateAbsolutePath(name, value string) error {

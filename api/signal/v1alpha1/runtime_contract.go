@@ -7,37 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"time"
-
-	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 const MinimumBackendDeadlineReserve = time.Minute
-
-func ValidateRuntimeContract(
-	scriptRequiresStage bool,
-	stage *RuntimeStage,
-	backendDeadline, outerDeadline time.Duration,
-) error {
-	if err := ValidateRuntimeStage(scriptRequiresStage, stage); err != nil {
-		return err
-	}
-
-	return ValidateExecutionDeadlines(backendDeadline, outerDeadline)
-}
-
-func ValidateRuntimeStage(scriptRequiresStage bool, stage *RuntimeStage) error {
-	if scriptRequiresStage && stage == nil {
-		return errors.New("runtime stage is required by the script")
-	}
-
-	if stage != nil {
-		if errors := validation.IsDNS1123Label(stage.Name); len(errors) > 0 {
-			return fmt.Errorf("runtime stage name is invalid: %v", errors)
-		}
-	}
-
-	return nil
-}
 
 func ValidateExecutionDeadlines(backendDeadline, outerDeadline time.Duration) error {
 	if backendDeadline <= 0 {
@@ -52,6 +24,35 @@ func ValidateExecutionDeadlines(backendDeadline, outerDeadline time.Duration) er
 		return fmt.Errorf(
 			"backend active deadline must leave at least %s before the outer deadline",
 			MinimumBackendDeadlineReserve,
+		)
+	}
+
+	return nil
+}
+
+func ValidateSuiteDeadlines(backendDeadlines []time.Duration, suiteDeadline time.Duration) error {
+	if suiteDeadline <= 0 || suiteDeadline%time.Second != 0 {
+		return errors.New("suite deadline must be a positive whole number of seconds")
+	}
+
+	var required time.Duration
+	for _, backendDeadline := range backendDeadlines {
+		if backendDeadline <= 0 || backendDeadline%time.Second != 0 {
+			return errors.New("backend active deadlines must be positive whole numbers of seconds")
+		}
+
+		if backendDeadline > time.Duration(1<<63-1)-required-MinimumBackendDeadlineReserve {
+			return errors.New("combined check deadlines overflow")
+		}
+
+		required += backendDeadline + MinimumBackendDeadlineReserve
+	}
+
+	if required > suiteDeadline {
+		return fmt.Errorf(
+			"combined backend deadlines and evidence reserves require %s, suite deadline is %s",
+			required,
+			suiteDeadline,
 		)
 	}
 
