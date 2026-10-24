@@ -321,6 +321,8 @@ struct Fill {
     started: Nanos,
     /// Destination of the outstanding walk probe.
     asking: Option<u32>,
+    /// Why the outstanding walk probe failed in transport, if it did.
+    cut: Option<Cut>,
     /// Walk probes so far: destination and how each ended (repeat
     /// classification, [`NodeWorld::classify_repeat`]).
     asked: Vec<(u32, Asked)>,
@@ -331,13 +333,76 @@ struct Fill {
 enum Asked {
     Copy,
     Miss,
-    /// Transport failure: the destination or the route to it was down,
-    /// partitioned, not serving yet, or out of budget on the way.
-    Unreachable,
+    /// Transport failure, and why (see [`Cut`]).
+    Unreachable(Cut),
+    /// The destination answered with a failure of its own (for a
+    /// delegation: rank 0's own acquisition, such as its origin request,
+    /// failed).
+    Failed,
     /// The destination or a relay shed the request, or it was behind.
     Busy,
     /// The probe could not be planned (budget) or failed terminally.
     Unfunded,
+}
+
+/// Why a walk probe failed in transport (repeat classification).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Cut {
+    /// A node on the way, or the destination, is a member that does not
+    /// serve yet (no membership; Known issue 14).
+    NotServing,
+    /// A site partition cut a link on the way.
+    Partition,
+    /// A node on the way, or the destination, is down.
+    Down,
+    /// No route within the probe's links, or the route changed.
+    Route,
+    /// A link circuit was open (backoff after earlier failures).
+    Circuit,
+    /// The attempt timed out or a relay failed otherwise.
+    Other,
+}
+
+/// Skip causes (`classify_repeat`), as `&'static` counter names.
+const SKIPS: [&str; 10] = [
+    "not_serving",
+    "partition",
+    "down",
+    "route",
+    "circuit",
+    "timeout",
+    "failed",
+    "busy",
+    "copy_only",
+    "unfunded",
+];
+
+/// `prefix` + `skip` as a static counter name (`copy` never orphans).
+fn skip_counter(prefix: &'static str, skip: &'static str) -> &'static str {
+    match (prefix, skip) {
+        ("origin_skips_", "not_serving") => "origin_skips_not_serving",
+        ("origin_skips_", "partition") => "origin_skips_partition",
+        ("origin_skips_", "down") => "origin_skips_down",
+        ("origin_skips_", "route") => "origin_skips_route",
+        ("origin_skips_", "circuit") => "origin_skips_circuit",
+        ("origin_skips_", "timeout") => "origin_skips_timeout",
+        ("origin_skips_", "failed") => "origin_skips_failed",
+        ("origin_skips_", "busy") => "origin_skips_busy",
+        ("origin_skips_", "copy_only") => "origin_skips_copy_only",
+        ("origin_skips_", "copy") => "origin_skips_copy",
+        ("origin_skips_", _) => "origin_skips_unfunded",
+        (_, "not_serving") => "origin_repeats_orphan_not_serving",
+        (_, "partition") => "origin_repeats_orphan_partition",
+        (_, "down") => "origin_repeats_orphan_down",
+        (_, "route") => "origin_repeats_orphan_route",
+        (_, "circuit") => "origin_repeats_orphan_circuit",
+        (_, "timeout") => "origin_repeats_orphan_timeout",
+        (_, "failed") => "origin_repeats_orphan_failed",
+        (_, "busy") => "origin_repeats_orphan_busy",
+        (_, "copy_only") => "origin_repeats_orphan_copy_only",
+        (_, "copy") => "origin_repeats_orphan_copy",
+        (_, _) => "origin_repeats_orphan_unfunded",
+    }
 }
 
 /// The last origin request for a page ([`NodeWorld::classify_repeat`]).
@@ -350,6 +415,9 @@ struct LastOrigin {
     ok: Option<bool>,
     /// When it completed.
     done: Nanos,
+    /// For a fetch by an owner above rank 0: why rank 0 did not serve it
+    /// (`origin_skips_*`).
+    skip: Option<&'static str>,
 }
 
 impl Fill {
@@ -1446,6 +1514,7 @@ impl NodeWorld {
                 _reservation: reservation,
                 started: self.engine.now(),
                 asking: None,
+                cut: None,
                 asked: Vec::new(),
             },
         );
@@ -2289,10 +2358,12 @@ impl NodeWorld {
         if probe.previous {
             self.metrics.incr("previous_membership_probes");
         }
+        // Set before launching: the first hop may fail synchronously.
+        fill.asking = Some(dest);
+        fill.cut = None;
         let pid = self.launch(id, dest, version, acquire, &plan, false, None);
         let fill = self.fills.get_mut(&id).expect("present");
         fill.probe = Some(pid);
-        fill.asking = Some(dest);
         Ok(())
     }
 
@@ -2448,6 +2519,7 @@ impl NodeWorld {
         // attempt with `Unavailable` under the same budget.
         if self.blocked(holder, &members) != blocked {
             self.metrics.incr("route_blocked_changed");
+            self.note_cut(mid, Cut::Route);
             return self.fail_hop(mid, holder, Fault::Unavailable);
         }
         let route = match route {
@@ -2457,6 +2529,7 @@ impl NodeWorld {
             }
             Err(_) => {
                 self.metrics.incr("route_unreachable");
+                self.note_cut(mid, Cut::Route);
                 return self.fail_hop(mid, holder, Fault::Unavailable);
             }
         };
@@ -2471,6 +2544,7 @@ impl NodeWorld {
         let m = self.msgs.get_mut(&mid).expect("message");
         if let Some(plan) = plan {
             let Ok(outbound) = plan.outbound else {
+                self.note_cut(mid, Cut::Route);
                 return self.fail_hop(mid, holder, Fault::HopBudgetExhausted);
             };
             let inbound = m.links;
@@ -2489,13 +2563,25 @@ impl NodeWorld {
         let n = &mut self.nodes[holder as usize];
         let Ok(probe) = n.links.acquire(&next, instant) else {
             self.metrics.incr("link_circuit_open");
+            self.note_cut(mid, Cut::Circuit);
             return self.fail_hop(mid, holder, Fault::Unavailable);
         };
         drop(probe);
         let site = |x: u32| self.fabric.site[x as usize];
-        let up = !self.nodes[next as usize].down
-            && self.versions.enrolled(next)
-            && !self.partitions.blocked(now, site(holder), site(next));
+        let partitioned = self.partitions.blocked(now, site(holder), site(next));
+        let cut = if self.nodes[next as usize].down {
+            Some(Cut::Down)
+        } else if !self.versions.enrolled(next) {
+            Some(Cut::NotServing)
+        } else if partitioned {
+            Some(Cut::Partition)
+        } else {
+            None
+        };
+        let up = cut.is_none();
+        if let Some(cut) = cut {
+            self.note_cut(mid, cut);
+        }
         let target = &self.nodes[next as usize];
         let unready =
             (!target.down && !self.versions.enrolled(next)).then_some(target.incarnation > 0);
@@ -2511,12 +2597,12 @@ impl NodeWorld {
             self.engine.at(arrive, Event::Hop { msg: mid });
         } else {
             self.metrics.incr("link_failures");
-            if self.partitions.blocked(now, site(holder), site(next)) {
+            if partitioned {
                 self.metrics.incr("partition_link_failures");
             }
             if let Some(restarted) = unready {
                 // A member that has not applied a membership yet: no peer
-                // listener (Known issue 51).
+                // listener (Known issue 14).
                 self.metrics.incr("unready_member_links");
                 if restarted {
                     self.metrics.incr("unready_member_links_restarted");
@@ -2540,6 +2626,23 @@ impl NodeWorld {
     }
 
     /// Forwarding from `holder` failed with `fault`.
+    /// Record why walk probe message `mid` failed in transport (the first
+    /// cause wins).
+    fn note_cut(&mut self, mid: u64, cut: Cut) {
+        let Some(m) = self.msgs.get(&mid) else {
+            return;
+        };
+        let Some(p) = self.probes.get(&m.probe) else {
+            return;
+        };
+        if p.hedge.is_none()
+            && let Some(fill) = self.fills.get_mut(&p.fill)
+            && fill.cut.is_none()
+        {
+            fill.cut = Some(cut);
+        }
+    }
+
     fn fail_hop(&mut self, mid: u64, holder: u32, fault: Fault) {
         let Some(m) = self.msgs.get(&mid) else {
             return;
@@ -2582,6 +2685,12 @@ impl NodeWorld {
         let at = m.at;
         if self.nodes[at as usize].down || !self.versions.enrolled(at) {
             self.metrics.incr("messages_lost_to_crash");
+            let cut = if self.nodes[at as usize].down {
+                Cut::Down
+            } else {
+                Cut::NotServing
+            };
+            self.note_cut(mid, cut);
             self.msgs.remove(&mid);
             return;
         }
@@ -3012,8 +3121,10 @@ impl NodeWorld {
                 Ok(Outcome::Probe(ProbeOutcome::CopyMiss | ProbeOutcome::VersionUnavailable)) => {
                     Asked::Miss
                 }
-                Ok(Outcome::Transport(ProbeOutcome::Unreachable))
-                | Ok(Outcome::Probe(ProbeOutcome::Unreachable)) => Asked::Unreachable,
+                Ok(Outcome::Transport(ProbeOutcome::Unreachable)) => {
+                    Asked::Unreachable(fill.cut.take().unwrap_or(Cut::Other))
+                }
+                Ok(Outcome::Probe(ProbeOutcome::Unreachable)) => Asked::Failed,
                 Ok(_) => Asked::Busy,
                 Err(_) => Asked::Unfunded,
             };
@@ -3217,11 +3328,41 @@ impl NodeWorld {
         let fill = &self.fills[&id];
         let (node, page) = (fill.node, fill.page);
         let rank0 = fill.cands.first().copied().unwrap_or(node);
+        // An owner above rank 0 reaches origin only with transient evidence
+        // against rank 0: record why rank 0 did not serve (the last probe of
+        // rank 0 decides).
+        let skip = (fill.rank.is_some_and(|r| r > 0)).then(|| {
+            let last = fill
+                .asked
+                .iter()
+                .rev()
+                .find(|(dest, _)| *dest == rank0)
+                .map(|(_, a)| *a);
+            match last {
+                Some(Asked::Unreachable(cut)) => match cut {
+                    Cut::NotServing => "not_serving",
+                    Cut::Partition => "partition",
+                    Cut::Down => "down",
+                    Cut::Route => "route",
+                    Cut::Circuit => "circuit",
+                    Cut::Other => "timeout",
+                },
+                Some(Asked::Failed) => "failed",
+                Some(Asked::Busy) => "busy",
+                Some(Asked::Miss) => "copy_only",
+                Some(Asked::Copy) => "copy",
+                Some(Asked::Unfunded) | None => "unfunded",
+            }
+        });
+        if let Some(skip) = skip {
+            self.metrics.incr(skip_counter("origin_skips_", skip));
+        }
         let next = LastOrigin {
             node,
             rank0,
             ok: None,
             done: now,
+            skip,
         };
         let Some(last) = self.last_origin.insert(page, next) else {
             return;
@@ -3244,25 +3385,31 @@ impl NodeWorld {
         } else if !held(self) {
             "origin_repeats_copy_lost"
         } else {
-            let asked = |kind: Asked| {
+            let asked = |kind: fn(Asked) -> bool| {
                 fill.asked
                     .iter()
-                    .any(|&(dest, a)| dest == last.node && a == kind)
+                    .any(|&(dest, a)| dest == last.node && kind(a))
             };
             let cause = if last.done > fill.started {
                 "origin_repeats_held_raced"
-            } else if asked(Asked::Unreachable) {
+            } else if asked(|a| matches!(a, Asked::Unreachable(_) | Asked::Failed)) {
                 "origin_repeats_held_unreachable"
-            } else if asked(Asked::Busy) {
+            } else if asked(|a| a == Asked::Busy) {
                 "origin_repeats_held_busy"
-            } else if asked(Asked::Unfunded) {
+            } else if asked(|a| a == Asked::Unfunded) {
                 "origin_repeats_held_unfunded"
-            } else if asked(Asked::Miss) || asked(Asked::Copy) {
+            } else if asked(|a| matches!(a, Asked::Miss | Asked::Copy)) {
                 "origin_repeats_held_missed"
             } else {
                 "origin_repeats_held_unasked"
             };
             self.metrics.incr(cause);
+            // `A` fetched as an owner above rank 0, so rank 0 has no copy
+            // and fetches again: charge the repeat to why `A` skipped it.
+            if let Some(skip) = last.skip {
+                self.metrics
+                    .incr(skip_counter("origin_repeats_orphan_", skip));
+            }
             "origin_repeats_copy_held"
         };
         self.metrics.incr(class);
@@ -3658,7 +3805,15 @@ impl NodeWorld {
                         "missed": c("origin_repeats_held_missed"),
                         "unasked": c("origin_repeats_held_unasked"),
                     },
+                    "orphan": SKIPS
+                        .iter()
+                        .map(|k| (k.to_string(), json!(c(skip_counter("origin_repeats_orphan_", k)))))
+                        .collect::<serde_json::Map<_, _>>(),
                 },
+                "skips": SKIPS
+                    .iter()
+                    .map(|k| (k.to_string(), json!(c(skip_counter("origin_skips_", k)))))
+                    .collect::<serde_json::Map<_, _>>(),
             },
             "cache": {
                 "memory_hits": c("memory_hits"),
