@@ -954,6 +954,13 @@ impl CandidatePolicy {
                 .ordered
                 .iter()
                 .position(|node| node == &self.node);
+            let handoff = match rank {
+                Some(rank) if matches!(operation, PeerOperation::Page { .. }) => self
+                    .handoff_targets(&candidates, object, page, rank, scope)
+                    .await
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
             // racer-core owns the visit order, funding, and evidence rules;
             // this loop performs the exchanges it plans.
             let mut walk = CandidateWalk::new(WalkConfig {
@@ -970,7 +977,7 @@ impl CandidatePolicy {
                     primary_outcome: continuation.primary_outcome,
                     bounded_routes: continuation.bounded_routes,
                 },
-                handoff: 0,
+                handoff: handoff.len(),
             });
             let end = loop {
                 let probe = match walk.next(budget)? {
@@ -981,7 +988,12 @@ impl CandidatePolicy {
                 let response = self
                     .request_traced(
                         &candidates.membership,
-                        &candidates.ordered[probe.canonical],
+                        // Canonical ranks past the owners address handoff
+                        // targets (`WalkConfig::handoff`).
+                        match probe.canonical.checked_sub(candidates.ordered.len()) {
+                            Some(i) => &handoff[i],
+                            None => &candidates.ordered[probe.canonical],
+                        },
                         context,
                         &operation,
                         if copy_only {
@@ -1103,6 +1115,44 @@ impl CandidatePolicy {
                     unreachable!("handled while probing")
                 }
             }
+        })
+    }
+
+    /// Owners of `page` under the membership published just before
+    /// `candidates.membership`, if still retained, that an owner at `rank`
+    /// asks copy-only before origin (Known issue 6): previous owners that
+    /// are current members, without this node and its current predecessors.
+    /// Empty when the owner set did not change. Ranking failures are not
+    /// errors; the walk just has no handoff targets.
+    fn handoff_targets<'a>(
+        &'a self,
+        candidates: &'a Candidates,
+        object: &'a ObjectId,
+        page: PageNumber,
+        rank: usize,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Vec<NodeId>> {
+        Box::pin(async move {
+            let Some(version) = candidates.membership.version.0.checked_sub(1) else {
+                return Ok(Vec::new());
+            };
+            let Ok(Some(previous)) = self
+                .published
+                .resolve(version, uring_runtime::environment::now())
+            else {
+                return Ok(Vec::new());
+            };
+            let Ok(previous) = self.candidates_scoped(previous, object, page, scope).await else {
+                return Ok(Vec::new());
+            };
+            Ok(racer_core::read::walk::handoff_targets(
+                &previous.ordered,
+                &candidates.ordered,
+                rank,
+            )
+            .into_iter()
+            .filter(|node| candidates.membership.member(node).is_ok())
+            .collect())
         })
     }
 

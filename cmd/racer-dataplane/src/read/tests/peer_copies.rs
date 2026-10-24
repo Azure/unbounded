@@ -3400,3 +3400,102 @@ fn stale_answer_without_published_membership_is_unavailable() {
     ));
     assert_eq!(peers.calls.borrow().len(), 1);
 }
+
+/// Known issue 6: a page owner whose ranking moved with the last membership
+/// asks the page's previous owners copy-only before origin. Here the local
+/// node is rank 0 of version 2 and was not a member of version 1, so every
+/// version 1 owner is a handoff target. A copy there avoids origin; when all
+/// miss, the owner reaches origin. Without a retained version 1 it goes to
+/// origin directly.
+#[test]
+fn owner_asks_previous_membership_owners_before_origin() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    for (retained, copy) in [(true, true), (true, false), (false, false)] {
+        let mut f = fixture();
+        let (peers, ordered) = install_peers(&mut f, Some(0));
+        let good = encrypted_copy(&mut f);
+        let current = Arc::new(
+            Membership::validate(
+                racer_control_wire::MembershipVersion(2),
+                f.membership.members().to_vec(),
+            )
+            .unwrap(),
+        );
+        let old = Arc::new(
+            Membership::validate(
+                racer_control_wire::MembershipVersion(1),
+                f.membership
+                    .members()
+                    .iter()
+                    .filter(|m| m.node != ordered[0])
+                    .cloned()
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        let published = Arc::new(controlplane::Published::new(
+            crate::control::Snapshot::retention(2),
+        ));
+        let snapshots = if retained {
+            vec![old.clone(), current.clone()]
+        } else {
+            vec![current.clone()]
+        };
+        for (i, membership) in snapshots.into_iter().enumerate() {
+            let mut snapshot = crate::control::Snapshot::membership_fixture(membership);
+            snapshot.sequence = racer_control_wire::PublicationSequence(i as u64 + 1);
+            published
+                .publish(
+                    Arc::new(snapshot),
+                    uring_runtime::environment::now(),
+                    |_, _| Ok::<_, Error>(()),
+                    || (),
+                )
+                .unwrap();
+        }
+        let placement = Rc::new(Placement::new(16));
+        let previous = placement
+            .rank(old.clone(), &f.context.object, f.page.number)
+            .ordered;
+        assert!(!previous.contains(&ordered[0]));
+        let mut deps = f.fill.dependencies.clone();
+        deps.candidates = Rc::new(CandidatePolicy::new(
+            ordered[0].clone(),
+            placement,
+            peers.requester(),
+            deps.credentials.clone(),
+            published,
+        ));
+        f.fill = Fill::new(deps);
+        f.membership = current;
+        let replies = previous.iter().map(|node| {
+            (
+                node.clone(),
+                if copy && node == &previous[0] {
+                    Reply::Copy(good.clone())
+                } else {
+                    Reply::Miss
+                },
+            )
+        });
+        peers.replies.borrow_mut().extend(replies);
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+        let result = acquire(&mut f, &mut budget).unwrap();
+        assert_eq!(result.plaintext.bytes(), b"abc");
+        let calls = peers.calls.borrow();
+        let asked: Vec<_> = calls.iter().map(|c| c.0.clone()).collect();
+        if !retained {
+            assert!(asked.is_empty(), "{asked:?}");
+            assert_eq!(f.origin.calls.get(), 1);
+        } else if copy {
+            assert_eq!(asked, previous[..1]);
+            assert_eq!(f.origin.calls.get(), 0);
+        } else {
+            // Handoff probes keep one credit for origin: 8 credits ask all.
+            assert_eq!(asked, previous);
+            assert_eq!(f.origin.calls.get(), 1);
+        }
+        assert!(calls.iter().all(|c| c.1), "handoff probes are copy-only");
+    }
+}

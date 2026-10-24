@@ -1611,11 +1611,10 @@ impl NodeWorld {
         fill.version = version;
         fill.rank = rank;
         fill.order = order;
-        // An owner also ranks the page under the publication before its
-        // membership, when still retained (production
-        // `CandidatePolicy::previous_membership`).
+        // An owner also ranks the page under membership version - 1, when
+        // still retained (production `CandidatePolicy::handoff_targets`).
         if rank.is_some() {
-            if let Some(old) = self.versions.before(version) {
+            if let Some(old) = version.checked_sub(1).and_then(|v| self.versions.get(v)) {
                 let old = old.members.clone();
                 let w = self.fills[&id].worker;
                 self.rank(node, w, old, page, Then::Handoff { fill: id });

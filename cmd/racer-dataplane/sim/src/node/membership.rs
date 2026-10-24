@@ -255,12 +255,6 @@ impl Versions {
         self.history.back().map_or(0, |v| v.number)
     }
 
-    /// The retained version published just before `number`, if any.
-    pub fn before(&self, number: u64) -> Option<&Version> {
-        let i = self.history.partition_point(|v| v.number < number);
-        i.checked_sub(1).and_then(|i| self.history.get(i))
-    }
-
     pub fn get(&self, number: u64) -> Option<&Version> {
         // Numbers are increasing but may skip in combined mode.
         let i = self
