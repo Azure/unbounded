@@ -18,8 +18,8 @@ produces `ghcr.io/<owner>/agent-ubuntu2404`.
 ## Building Images
 
 Images are built automatically by the **Build Container Images** GitHub Actions workflow
-(`.github/workflows/images.yaml`). All builds produce multi-arch images for `linux/amd64` and
-`linux/arm64`.
+(`.github/workflows/images.yaml`). Builds default to multi-arch images for `linux/amd64` and
+`linux/arm64`, except for ARM64-only GB200 Ubuntu host disks.
 
 ### Metalman Netboot Image
 
@@ -27,6 +27,13 @@ The `netboot` image contains the reusable PXE boot environment: bootloaders, ker
 GRUB and cloud-init templates, and metadata. The cloud-init template downloads and installs
 `unbounded-agent` from the configured release/source during first boot. It does not contain a
 machine disk image.
+
+### GB200 Ubuntu Host Disks
+
+Images whose names start with `host-ubuntu2404-gb200` use the shared producer
+under `images/host-ubuntu2404-gb200/`. They build on a native ARM64 runner and
+must pass offline rootfs checks plus an ARM64 UEFI boot check before
+publication. Building an image does not deploy or repave a Machine.
 
 ### Tagged Release
 

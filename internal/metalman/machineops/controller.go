@@ -27,6 +27,7 @@ import (
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/metalman/bootmedia"
+	metalcloudinit "github.com/Azure/unbounded/internal/metalman/cloudinit"
 	"github.com/Azure/unbounded/internal/metalman/netboot"
 	"github.com/Azure/unbounded/internal/metalman/redfish"
 )
@@ -88,6 +89,7 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list
 
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -360,20 +362,34 @@ func (r *Reconciler) advanceTargets(ctx context.Context, op *v1alpha3.MachineOpe
 		return []targetChange{{aggregateOnly: true}}, 0
 	}
 
-	changes := make([]targetChange, len(selected))
+	changes := make([]targetChange, 0, len(selected))
+	ready := make([]preflightedTarget, 0, len(selected))
+	for _, target := range selected {
+		change, machine, proceed := r.preflightTargetUserData(ctx, op, target)
+		if change.err != nil {
+			return []targetChange{change}, r.pollInterval()
+		}
+		if proceed {
+			ready = append(ready, preflightedTarget{target: change.target, machine: machine})
+		} else {
+			changes = append(changes, change)
+		}
+	}
 
 	var wg sync.WaitGroup
-	for i, target := range selected {
+	advanced := make([]targetChange, len(ready))
+	for i, item := range ready {
 		wg.Add(1)
 
-		go func(i int, target v1alpha3.MachineOperationTargetStatus) {
+		go func(i int, item preflightedTarget) {
 			defer wg.Done()
 
-			changes[i] = r.advanceTarget(ctx, op, target)
-		}(i, target)
+			advanced[i] = r.advanceTargetAfterUserDataValidation(ctx, op, item.machine, item.target)
+		}(i, item)
 	}
 
 	wg.Wait()
+	changes = append(changes, advanced...)
 
 	requeue := r.pollInterval()
 
@@ -381,8 +397,21 @@ func (r *Reconciler) advanceTargets(ctx context.Context, op *v1alpha3.MachineOpe
 }
 
 func (r *Reconciler) advanceTarget(ctx context.Context, op *v1alpha3.MachineOperation, target v1alpha3.MachineOperationTargetStatus) targetChange {
+	change, machine, proceed := r.preflightTargetUserData(ctx, op, target)
+	if !proceed {
+		return change
+	}
+
+	return r.advanceTargetAfterUserDataValidation(ctx, op, machine, change.target)
+}
+
+func (r *Reconciler) preflightTargetUserData(
+	ctx context.Context,
+	op *v1alpha3.MachineOperation,
+	target v1alpha3.MachineOperationTargetStatus,
+) (targetChange, *v1alpha3.Machine, bool) {
 	if target.BootMedia != nil && target.BootMedia.Site != r.Site {
-		return targetChange{aggregateOnly: true}
+		return targetChange{aggregateOnly: true}, nil, false
 	}
 
 	now := r.now()
@@ -390,24 +419,67 @@ func (r *Reconciler) advanceTarget(ctx context.Context, op *v1alpha3.MachineOper
 		target.StartedAt = &now
 	}
 
+	if op.Spec.OperationKind != v1alpha3.OperationHostReplace {
+		return targetChange{target: target}, nil, true
+	}
+
 	if target.BootMedia != nil {
-		return r.advanceVirtualMedia(ctx, op, mediaMachine(target), target, now)
+		machine := mediaMachine(target)
+		if err := r.validateReplaceUserData(ctx, op, machine); err != nil {
+			return userDataValidationChange(target, err, now), nil, false
+		}
+
+		return targetChange{target: target}, machine, true
 	}
 
 	var machine v1alpha3.Machine
 	if err := r.Get(ctx, client.ObjectKey{Name: target.MachineRef}, &machine); err != nil {
 		if apierrors.IsNotFound(err) {
-			return failTarget(target, reasonMachineNotFound, fmt.Sprintf("Machine %s not found", target.MachineRef), now)
+			return targetChange{target: target}, nil, true
 		}
 
-		return retryTarget(target, fmt.Errorf("get Machine %s: %w", target.MachineRef, err), now, r.maxAttempts())
+		return targetChange{
+			target: target,
+			err:    fmt.Errorf("get Machine %s for cloud-init user-data validation: %w", target.MachineRef, err),
+		}, nil, false
 	}
 
-	if !r.ownsMachine(&machine) {
+	if err := r.validateReplaceUserData(ctx, op, &machine); err != nil {
+		return userDataValidationChange(target, err, now), nil, false
+	}
+
+	return targetChange{target: target}, &machine, true
+}
+
+func (r *Reconciler) advanceTargetAfterUserDataValidation(
+	ctx context.Context,
+	op *v1alpha3.MachineOperation,
+	validatedMachine *v1alpha3.Machine,
+	target v1alpha3.MachineOperationTargetStatus,
+) targetChange {
+	now := r.now()
+
+	if target.BootMedia != nil {
+		return r.advanceVirtualMedia(ctx, op, validatedMachine, target, now)
+	}
+
+	machine := validatedMachine
+	if machine == nil {
+		machine = &v1alpha3.Machine{}
+		if err := r.Get(ctx, client.ObjectKey{Name: target.MachineRef}, machine); err != nil {
+			if apierrors.IsNotFound(err) {
+				return failTarget(target, reasonMachineNotFound, fmt.Sprintf("Machine %s not found", target.MachineRef), now)
+			}
+
+			return retryTarget(target, fmt.Errorf("get Machine %s: %w", target.MachineRef, err), now, r.maxAttempts())
+		}
+	}
+
+	if !r.ownsMachine(machine) {
 		return failTarget(target, reasonTargetNoLongerOwned, fmt.Sprintf("Machine %s is no longer owned by this metalman instance", machine.Name), now)
 	}
 
-	if !isBareMetalRedfishMachine(&machine) {
+	if !isBareMetalRedfishMachine(machine) {
 		return failTarget(target, reasonUnsupportedTarget, fmt.Sprintf("Machine %s is not a bare-metal Redfish target", machine.Name), now)
 	}
 
@@ -417,20 +489,40 @@ func (r *Reconciler) advanceTarget(ctx context.Context, op *v1alpha3.MachineOper
 
 	switch op.Spec.OperationKind {
 	case v1alpha3.OperationHostPowerOff:
-		return r.advancePowerOff(ctx, &machine, target, now)
+		return r.advancePowerOff(ctx, machine, target, now)
 	case v1alpha3.OperationHostPowerOn:
-		return r.advancePowerOn(ctx, op, &machine, target, now)
+		return r.advancePowerOn(ctx, op, machine, target, now)
 	case v1alpha3.OperationHostReboot:
-		return r.advanceReboot(ctx, op, &machine, target, now)
+		return r.advanceReboot(ctx, op, machine, target, now)
 	case v1alpha3.OperationHostReplace:
 		if machine.Spec.Netboot().TargetBootProtocol() == v1alpha3.PXEBootProtocolVirtualMedia {
-			return r.advanceVirtualMedia(ctx, op, &machine, target, now)
+			return r.advanceVirtualMedia(ctx, op, machine, target, now)
 		}
 
-		return r.advanceReplace(ctx, op, &machine, target, now)
+		return r.advanceReplace(ctx, op, machine, target, now)
 	default:
 		return failTarget(target, reasonUnsupportedTarget, fmt.Sprintf("%s is not handled by metalman", op.Spec.OperationKind), now)
 	}
+}
+
+func (r *Reconciler) validateReplaceUserData(ctx context.Context, op *v1alpha3.MachineOperation, machine *v1alpha3.Machine) error {
+	if op.Spec.OperationKind != v1alpha3.OperationHostReplace {
+		return nil
+	}
+
+	if _, _, err := metalcloudinit.ResolveUserData(ctx, r.reader(), machine); err != nil {
+		return fmt.Errorf("validate cloud-init user-data: %w", err)
+	}
+
+	return nil
+}
+
+func userDataValidationChange(target v1alpha3.MachineOperationTargetStatus, err error, now metav1.Time) targetChange {
+	if metalcloudinit.IsPermanentError(err) {
+		return failTarget(target, reasonExecutionFailed, err.Error(), now)
+	}
+
+	return targetChange{target: target, err: err}
 }
 
 func (r *Reconciler) advancePowerOff(ctx context.Context, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {
@@ -890,16 +982,28 @@ func cloudInitReplaceStatus(conditions []metav1.Condition, target v1alpha3.Machi
 }
 
 func (r *Reconciler) applyTargetChanges(ctx context.Context, opName string, changes []targetChange, restoreHostReplaceTriggerConditions bool) error {
+	var changeErr error
+	persisted := make([]targetChange, 0, len(changes))
 	for _, change := range changes {
 		if change.err != nil {
-			return change.err
+			if changeErr == nil {
+				changeErr = change.err
+			}
+
+			continue
 		}
+
+		persisted = append(persisted, change)
 	}
 
-	return r.updateOperationStatus(ctx, opName, func(latest *v1alpha3.MachineOperation) {
+	if len(persisted) == 0 && !restoreHostReplaceTriggerConditions {
+		return changeErr
+	}
+
+	if err := r.updateOperationStatus(ctx, opName, func(latest *v1alpha3.MachineOperation) {
 		byName := map[string]v1alpha3.MachineOperationTargetStatus{}
 
-		for _, change := range changes {
+		for _, change := range persisted {
 			if change.aggregateOnly || change.target.MachineRef == "" {
 				continue
 			}
@@ -919,7 +1023,11 @@ func (r *Reconciler) applyTargetChanges(ctx context.Context, opName string, chan
 		}
 
 		r.aggregateStatus(latest)
-	})
+	}); err != nil {
+		return err
+	}
+
+	return changeErr
 }
 
 func (r *Reconciler) aggregateStatus(op *v1alpha3.MachineOperation) {
@@ -1248,6 +1356,11 @@ type targetChange struct {
 	target        v1alpha3.MachineOperationTargetStatus
 	err           error
 	aggregateOnly bool
+}
+
+type preflightedTarget struct {
+	target  v1alpha3.MachineOperationTargetStatus
+	machine *v1alpha3.Machine
 }
 
 func completeTarget(target v1alpha3.MachineOperationTargetStatus, message string, now metav1.Time) targetChange {

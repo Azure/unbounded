@@ -1,0 +1,48 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+ARG UBUNTU_IMAGE=docker.io/library/ubuntu@sha256:18b33ff3829707f31ada654a963b9ee35f2e6f0241b964bd17a22a9b330cb63d
+
+FROM ${UBUNTU_IMAGE} AS rootfs
+ARG TARGETARCH
+ARG SOURCE_COMMIT
+ENV GB200_PROFILE=canonical-nvidia-580167
+COPY images/host-ubuntu2404-gb200/assets/ /usr/local/lib/unbounded-image/
+COPY images/host-ubuntu2404-gb200-hillsboro/assets/90-hillsboro-users.cfg \
+    /etc/cloud/cloud.cfg.d/90-hillsboro-users.cfg
+COPY images/host-ubuntu2404-gb200-hillsboro/assets/ \
+    /usr/local/lib/unbounded-image/hillsboro/
+COPY images/netboot/assets/vendor-data.tmpl \
+    /usr/local/lib/unbounded-image/vendor-data.tmpl
+RUN test "${TARGETARCH}" = arm64 && \
+    sh /usr/local/lib/unbounded-image/rootfs.sh install
+RUN python3 /usr/local/lib/unbounded-image/hillsboro/verify_cloud_init_merge.py \
+      --image-config /etc/cloud/cloud.cfg.d/90-hillsboro-users.cfg \
+      --vendor-template /usr/local/lib/unbounded-image/vendor-data.tmpl \
+      --install-script /usr/local/lib/unbounded-image/hillsboro/verify-boot-install.sh \
+      --ssh-import-id-script /usr/local/lib/unbounded-image/hillsboro/verify-boot-ssh-import-id.sh && \
+    SOURCE_COMMIT="${SOURCE_COMMIT}" \
+      sh /usr/local/lib/unbounded-image/rootfs.sh finish
+
+FROM ${UBUNTU_IMAGE} AS build
+ARG TARGETARCH
+RUN test "${TARGETARCH}" = arm64 && apt-get update && \
+    apt-get install -y --no-install-recommends \
+      dosfstools e2fsprogs fdisk mtools pigz && \
+    rm -rf /var/lib/apt/lists/*
+COPY --from=rootfs /rootfs.tar /rootfs.kver /
+COPY --from=rootfs /usr/share/unbounded/image-inputs.json /disk/image-inputs.json
+COPY images/host-azurelinux3/assets/disk.sh /usr/local/bin/build-disk
+RUN TARGETARCH="${TARGETARCH}" ROOT_EXTRA_MIB=7168 sh /usr/local/bin/build-disk && \
+    pigz --test /disk/disk.img.gz && \
+    cd /disk && sha256sum disk.img.gz > disk.img.gz.sha256
+
+FROM scratch
+ARG SOURCE_COMMIT
+LABEL org.opencontainers.image.source="https://github.com/Azure/unbounded" \
+      org.opencontainers.image.revision="${SOURCE_COMMIT}" \
+      org.opencontainers.image.description="Hillsboro Metalman Ubuntu 24.04 ARM64 GB200 NVIDIA 580.167.08 host disk" \
+      io.unbounded.host.architecture="arm64" \
+      io.unbounded.host.access-policy="Azure/unbounded-dev@2026-10-23"
+COPY --from=build /disk /disk
+COPY LICENSE NOTICE /unbounded/licenses/
