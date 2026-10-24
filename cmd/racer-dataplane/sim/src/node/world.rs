@@ -3420,6 +3420,27 @@ impl NodeWorld {
                 self.metrics
                     .incr(skip_counter("origin_repeats_orphan_", skip));
             }
+            // Every such repeat is a skip itself (`F` above rank 0), an
+            // orphan (`A` fetched as a skip), or raced. Anything else is
+            // the avoidable class (rank 0 fetching although the copy it
+            // or its delegate fetched is still held); tests keep it at 0.
+            let explained =
+                skip.is_some() || last.skip.is_some() || cause == "origin_repeats_held_raced";
+            if !explained {
+                self.metrics.incr("origin_repeats_held_unexplained");
+            }
+            self.invariants.check(
+                "origin_repeat_explained",
+                explained,
+                now,
+                Some(node),
+                || {
+                    format!(
+                        "page {page} fetched by {node} while {} still holds it ({cause})",
+                        last.node
+                    )
+                },
+            );
             "origin_repeats_copy_held"
         };
         self.metrics.incr(class);
@@ -3815,6 +3836,7 @@ impl NodeWorld {
                         "missed": c("origin_repeats_held_missed"),
                         "unasked": c("origin_repeats_held_unasked"),
                     },
+                    "unexplained": c("origin_repeats_held_unexplained"),
                     "orphan": SKIPS
                         .iter()
                         .map(|k| (k.to_string(), json!(c(skip_counter("origin_repeats_orphan_", k)))))

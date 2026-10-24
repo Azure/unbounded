@@ -486,6 +486,44 @@ mod tests {
         assert!(counter(&r, "reads_completed") > 0);
     }
 
+    /// Known issue 15: in a failover run (crashes, a site partition, origin
+    /// error bursts, members enrolling) every repeated origin request is
+    /// classified, and every repeat while the previous fetcher still held
+    /// the page is a skip (an owner above rank 0 that fetched after a
+    /// recorded failure of rank 0) or the one rank 0 refetch such a skip
+    /// leaves behind (an orphan). Each skip orphans at most one refetch, so
+    /// `copy_held <= skips + orphans <= 2 * skips`; the unexplained class
+    /// (a rank 0 refetch with no skip behind it) is a hard invariant.
+    #[test]
+    fn failover_repeats_are_skips_or_their_orphans() {
+        for (nodes, secs, seed) in [(200, 300, 1), (400, 300, 2)] {
+            let r = quick("full-failover", nodes, secs, seed, 0.2);
+            assert_clean(&r);
+            let o = &r["origin_per_page"];
+            let n = |v: &Value| v.as_u64().unwrap();
+            let sum = |v: &Value| v.as_object().unwrap().values().map(n).sum::<u64>();
+            let repeats = &o["repeats"];
+            let classes: u64 = [
+                "after_owner_move",
+                "after_failure",
+                "concurrent",
+                "copy_lost",
+                "copy_held",
+            ]
+            .iter()
+            .map(|k| n(&repeats[k]))
+            .sum();
+            assert_eq!(classes, n(&o["requests"]) - n(&o["pages"]), "{o}");
+            let held = n(&repeats["copy_held"]);
+            assert_eq!(sum(&repeats["held"]), held, "{o}");
+            assert_eq!(n(&repeats["unexplained"]), 0, "{o}");
+            let (skips, orphans) = (sum(&o["skips"]), sum(&repeats["orphan"]));
+            assert!(skips > 0, "{o}");
+            assert!(orphans <= skips, "{o}");
+            assert!(held <= skips + orphans, "{o}");
+        }
+    }
+
     /// Known issue 7: the Pod crashed for good at `d / 2 + 5 s` leaves the
     /// membership once its Node has been not ready for the grace, so peers
     /// stop choosing it. Before round 4 they chose it until the end.
