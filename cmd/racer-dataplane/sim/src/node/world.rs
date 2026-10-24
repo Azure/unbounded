@@ -3114,6 +3114,15 @@ impl NodeWorld {
         let max_per_page = self.origin_per_page.values().copied().max().unwrap_or(0);
         let requests: u64 = self.origin_per_page.values().map(|c| u64::from(*c)).sum();
         let pages = self.origin_per_page.len();
+        // Pages by origin request count.
+        let mut counts = std::collections::BTreeMap::<u32, u64>::new();
+        for c in self.origin_per_page.values() {
+            *counts.entry(*c).or_default() += 1;
+        }
+        let histogram: serde_json::Map<_, _> = counts
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), json!(v)))
+            .collect();
         let c = |k: &str| self.metrics.get(k);
         json!({
             "scenario": scenario,
@@ -3129,6 +3138,7 @@ impl NodeWorld {
                 "requests": requests,
                 "pages_fetched_more_than_once": duplicated,
                 "max_requests_per_page": max_per_page,
+                "histogram": histogram,
                 "mean_requests_per_page": if pages == 0 { 0.0 } else { requests as f64 / pages as f64 },
                 "page_bytes": self.config.page_bytes,
                 "bytes_per_page": if pages == 0 { 0 } else { c("origin_bytes") / pages as u64 },
