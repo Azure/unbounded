@@ -332,10 +332,12 @@ Verified against the code at the start of this work.
    (handoff needs two), and a rank 0 reached through delegation has one credit, so it never asks
    them. Root cause not fully established; see "Round 3: origin". No invariant is relaxed.
 
-14. Members whose control client has not applied a membership yet (enrolling, or restarted) are
-   routable but refuse peer links. In `full-failover` at 50,000 nodes (seed 1) about 145k of
-   165,343 link failures go to them, coinciding with most of the 12.6k failed reads (60 to 200
-   s). Inference from counters; see "Round 4: liveness". No invariant is relaxed.
+14. Resolved: a new member joins only once its dataplane serves peers (it reports its Pod after
+   opening the peer listener) and joins are batched by a hold (round 4, join, 789725d9c,
+   19ed37c90). Was: members whose control client has not applied a membership yet (enrolling,
+   or restarted) are routable but refuse peer links. In `full-failover` at 50,000 nodes (seed 1)
+   about 145k of 165,343 link failures go to them, coinciding with most of the 12.6k failed reads
+   (60 to 200 s). Measured in round 4: 145,222 link failures and 12,424 of 12,759 failed reads.
 
 15. Dropping a dead member (issue 7 fix) is an ownership move and inherits issues 6 and 12: at
    50,000 nodes in `full-failover` it added 171 recoverable `Unavailable` reads and moved the
@@ -352,18 +354,18 @@ Verified against the code at the start of this work.
    most of their queue, and a shed reader asks one of the page's helpers; see "Round 4: fanout".
    Residual bound: a page is sent by at most its `REPLICAS` owners plus `fanout_width(members)`
    helpers (integer square root, at most 256), and helpers never chain.
-   Original report: hot-page peer throughput is capped by the page's `REPLICAS` owners: candidates are only the
-   ranked owners (`src/read/candidates.rs:628-635`), so readers holding a copy never serve other
-   readers, and a storm on one page gets at most `REPLICAS * nic_bps / page_bytes` deliveries per
-   second. Enforced by
+   Original report: hot-page peer throughput is capped by the page's `REPLICAS` owners: candidates
+   are only the ranked owners (`src/read/candidates.rs:628-635`), so readers holding a copy never
+   serve other readers, and a storm on one page gets at most `REPLICAS * nic_bps / page_bytes`
+   deliveries per second. Enforced by
    `contention_scenarios::overloaded_hot_page_owners_do_not_stream_to_abandoned_requesters`. Under
    overload relays shed on the `Relay` quota before the owners' NICs saturate (50k, 1 s storm: about
    177k storm pages against a 570k bound). Raising it is a design change. See "Round 4: capacity".
 
-17. Background reads during enrollment fail `Unavailable`: in `full-cold-start` about 12% of the
-   Zipf reads (11.7k at 50k, ~100 at 5k, unchanged since round 3) fail while 138k link attempts hit
-   members that are published but not yet enrolled (inference from `link_failures`; the storm alone
-   reads 80,000 of 80,000 pages at 5k). Belongs with the enroll and liveness work.
+17. Resolved: no read fails because a listed member cannot serve yet (round 4, join, same fixes
+   as 14). Was: about 12% of background reads during enrollment fail `Unavailable` (11.7k at
+   50,000 nodes in `full-cold-start`), suspected to share the cause of 14 (round 4, capacity).
+   The remaining enrollment-time failures come from join versions (new issue 19).
 
 18. The relay hold from the capacity track (`Relay` reservation kept while a body streams, as in
    `src/peer/server.rs:438-445` and `:660`) makes the 5k hot-page scenarios shed on the `Relay`
@@ -375,6 +377,19 @@ Verified against the code at the start of this work.
    rejections, so relays no longer dominate there; `zipf` still fails 3,430 reads `Unavailable`
    with 309,552 relay rejections (inference: its traffic is spread over many warm pages, below the
    hot-page shed threshold), so the issue stays open for `zipf`.
+
+19. Join versions cause `StaleMembership` skips. A new member learns that it is listed at the
+   same time as its peers, so a requester that already holds the version skips it as a stale
+   destination; when all owners of a page are new, the walk is exhausted. At 50,000 nodes
+   (seed 1, `full-cold-start` without the storm) 17,573 stale-destination skips and 1,411 failed
+   reads; in `full-failover`, 1,756 failed reads (was 12,759). See "Round 4: join". No invariant
+   is relaxed. Same family as Known issues 3 and 12.
+
+20. Join versions cost origin fetches and seat egress. Pages move from early members to later
+   ones as the membership grows, and clients that fall two versions behind get full images.
+   `full-failover` at 50,000 nodes: origin requests 57,163 to 66,620 (worst page 9 to 12), seat
+   reply bytes 298 GB to 689 GB (9 versions instead of 2). See "Round 4: join". Same family as
+   Known issue 6.
 
 ## Simulator engine (racer-sim substrate)
 
@@ -813,16 +828,19 @@ scenarios carry data-plane faults.
    serves (round 4, handoff).
 13. Resolved: handoff targets no longer block or starve the delegation to rank 0 (round 4,
    handoff).
-14. Members not yet holding a membership are routable but refuse peer links; most 50k
-   `full-failover` link failures (round 4, liveness).
+14. Resolved: a new member joins only after it reports serving, joins batched by a hold
+   (round 4, join, 789725d9c, 19ed37c90).
 15. Dropping a dead member costs one ownership move (issues 6, 12) (round 4, liveness); after the
    merge no repeat follows an owner move, but 50k `full-failover` `copy_held` is 10.5%.
 16. Resolved: owners shed readers of a dominant hot page to the page's helpers; a page is sent by at
    most `REPLICAS` owners plus `fanout_width` helpers (round 4, fanout, 751b85b1e..f887fe173).
-17. Background reads during enrollment fail `Unavailable` near unenrolled members (round 4,
-   capacity).
+17. Resolved: no read fails because a listed member cannot serve yet (round 4, join, 789725d9c).
 18. `zipf` at 5k sheds on the `Relay` quota since the relay hold (3,430 failed, 309,552 relay
    rejections after fanout); `storm` is down to 461 failed (round 4, combined waves 1 and 2).
+19. Join versions cause `StaleMembership` skips: 1,411 to 1,756 failed reads at 50k (round 4,
+   join).
+20. Join versions cost origin fetches (50k `full-failover` worst page 9 to 12) and seat egress
+   (298 GB to 689 GB) (round 4, join).
 
 ## Round 2: production admission
 
@@ -2175,7 +2193,7 @@ probes / helper copies / owner sheds. Read latency is log-bucket upper bounds.
 
 - 50k: with fan-out the 1 s storm completes like the capacity track's 28 s window (same ok and
   failed counts within 4 reads; the 11.7k failures are background Zipf reads during enrollment,
-  Known issue 72). 99.8% of helper probes returned a copy, origin requests are unchanged (27,448
+  Known issue 17). 99.8% of helper probes returned a copy, origin requests are unchanged (27,448
   before, 27,446 after), and relay rejections fell from 11.4M to 3,310. All 50,000 nodes were
   enrolled before the storm. Wall 24:23 before and 22:01 after; peak RSS 7.2 and 6.5 GiB. The
   "before" run reproduces the capacity track's 1 s numbers exactly.
@@ -2207,3 +2225,187 @@ probes / helper copies / owner sheds. Read latency is log-bucket upper bounds.
 - The simulator counts a node's bodies across all its workers (one simulated node is one production
   worker).
 - No new Known issues.
+
+
+## Round 4: join
+
+Known issues 14 and 17 (track numbers 51 and 72): members were listed, and so routable and ranked
+as owners, before they could serve peers, and reads failed while they enrolled. Branch `racer-sim4-join`, based on
+`racer-sim4-liveness` (0386dbed7). The enroll track's commits were not cherry-picked; enrollment
+timing is the liveness base's (all 50,000 clients enrolled at about 285 s).
+
+### Root cause
+
+- When a node becomes a member: `members::reconcile_at` (base
+  `cluster-control/src/authority/members.rs:355-386`) admits every authorized Node whose newest
+  managed Pod has an IP (`select_pod`, `endpoint_ip` at line 225). Nothing about the process
+  behind that IP is consulted. A DaemonSet Pod gets its IP when it is created, so in a cold start
+  every Node is a member in the first version, long before its dataplane runs.
+- When a node can serve peers: `WorkerApplication::start` (base `src/app.rs:2645-2651`) enrolls,
+  accepts the first publication (`accept_initial_publication`), and only then opens the peer
+  listener (`start_listeners`). Before that every link to it fails. The simulator models this
+  exactly: a link succeeds only if `versions.enrolled(next)` (base `sim/src/node/world.rs:2351`).
+- The gap is the whole enrollment: at 50,000 Pods the API server limits enrollment to about
+  285 s. Measured with the new counters (`unready_member_links`,
+  `reads_failed_while_members_unready`, `sim/src/node/world.rs`), the old model gives:
+  - `full-failover`, 50k: 145,222 of 165,336 link failures go to members that never applied a
+    membership (none to restarted ones), and 12,424 of the 12,759 failed reads happen while such
+    members are listed. This confirms the inference of Known issue 14.
+  - `full-cold-start` without the storm, 50k: 138,406 link failures, all to such members, and
+    11,727 failed reads, all while they are listed. This is the 11.7k of Known issue 17, so 17
+    has the same cause as 14.
+- No existing signal said "serving". The Pod report annotation was written before enrollment
+  (base `src/control/session.rs:625`, `report_rails` ahead of `enroll` at line 631), Pod
+  readiness is not usable (see "Round 4: liveness"), and the admission policy
+  (`deploy/racer/policies.yaml.tmpl:65-69`) lets a Pod change only its report annotation.
+
+### Changes
+
+Production, no wire or durable format change:
+
+- `src/control/session.rs`: `report_rails` holds the rails until `Session::mark_serving`
+  (line 505), which `WorkerApplication::start` calls right after `start_listeners`
+  (`src/app.rs:2660-2665`). The report annotation now means "this Pod serves peers". Older
+  dataplanes report before enrollment and so join as before.
+- `cluster-control/src/authority/members.rs`: `reconcile_at` takes `Joins` (line 281). With
+  `require_report`, a Node that is not already a member joins only once its selected Pod carries
+  the report (diagnostic `serving`); with `hold`, new Nodes wait (line 433). Both count in
+  `Result::pending`. A member is never held back, so a restarted process or a replaced Pod
+  causes no membership change.
+- `cluster-control/src/step/primary.rs` (`plan_pass`, used by production and the simulator):
+  - always requires the report;
+  - holds joins for `join_hold_secs` (line 97) after the term's last membership version change
+    (`PassInputs::membership_changed_unix`, tracked per term in `primary.rs` `Term_`). The hold is
+    one second per thousand of the larger of the membership and the Nodes with an eligible Pod,
+    from 10 s to 60 s. Removals (dead members) are never held. Passes run at least every
+    `LEASE_RENEW`, so a held join lands within one hold plus one pass;
+  - sizes seats with the held joiners (`members + pending`), so a cold start does not shrink the
+    seats that enrollment needs;
+  - bootstrap: with no previous membership there is no hold, the first pass publishes an empty
+    membership, and the first Pods to report join on the next pass. Nodes fetch publications
+    without being members, so nothing needs a member to bootstrap.
+- `src/app.rs` `membership_usable` (line 2625): a worker is ready (`/readyz`) only when its
+  applied membership lists the node. Between opening its listener and applying the version that
+  lists it, a node cannot route a read (`Membership::position` fails with
+  `IncompatibleMembership`, `src/topology.rs:273`, and peers reject requests from non-members,
+  `src/peer/server.rs:801`).
+- `src/app/native.rs`: a node not yet listed starts without native rails instead of failing
+  startup (`IncompatibleMembership` from `native_publication`, lines 179 and 210), and
+  `poll_native` activates them from the first publication that lists it.
+
+Why the hold scales: every version costs each client a reply, and a client two or more versions
+behind gets the full image (about 120 bytes per member) instead of a delta. With a fixed 10 s
+hold, `full-failover` at 50k published 33 versions during enrollment, with 646,517 full
+fallbacks, 2.9 TB of seat replies, and 100,595 `StaleMembership` replies (8,589 failed reads).
+Sizing by the membership alone gave 19 versions (1.2 TB, 2,631 failed reads), because the
+membership is small early in a cold start. Sizing by eligible Pods gives 9 (689 GB, 1,756).
+
+Simulator model:
+
+- `cluster-control/src/step/cluster.rs`: Pods carry the report from creation only with
+  `Settings::report_at_start` (the old dataplane). `ControlPlane::report_serving` (line 285)
+  writes it (one API write per process start; a new annotation is one watch event) and wakes one
+  debounced primary pass (`Ev::Wake`), as the production Pod watch does.
+- `sim/src/control.rs`: a client reports when it first applies a publication after a (re)start
+  (line 1066), which is when production opens its listener. Control knob `report_at_start`
+  (default false) restores the old model; with it the binary reproduces the base exactly (5k
+  `full-cold-start`: same 99 failed reads, 1,312 link failures and 7,014 origin requests).
+- `sim/src/node/world.rs`: a node reads only when its adopted membership lists it (line 892,
+  `reads_skipped_not_member`), matching production readiness. Before, the check used the latest
+  committed version, which is the same thing only when every node is listed from the start.
+
+### Tests
+
+- `authority::members`: `new_nodes_join_once_serving` (gate, attributes from the report, members
+  kept without a report, no pending without a Pod) and `hold_defers_only_new_nodes` (dead
+  members still leave during a hold).
+- `step::primary`: `unreported_pods_wait_but_size_seats` (empty bootstrap version, seats sized as
+  if everyone were a member, first reporter joins), `join_hold_batches_new_members` (boundary,
+  new primary, removals not held), `join_hold_grows_with_the_membership`,
+  `join_hold_is_sized_by_eligible_pods`.
+- `step::cluster`: `pods_join_once_serving_in_batches` (nobody listed until reports, joins
+  batched, crash and restart cause no version).
+- `tests.rs` (`cold_start_elects_commits_serves_and_fails_closed`): fixture Pods carry a report,
+  as serving dataplanes do.
+- Dataplane: `managed_report_waits_until_serving`, `serving_without_rails_reports_nothing`,
+  `membership_is_usable_only_when_it_lists_the_node`,
+  `native_activates_once_membership_lists_the_node`; `local_configuration_cannot_replace_missing_local_membership`
+  now expects startup to continue without rails (it expected `IncompatibleMembership`).
+- `combined::tests::cold_start_members_serve_before_they_are_routable` (300 nodes): with
+  `report_at_start` there are unready-member links and failed reads; without, none, every
+  Pod reports once, and versions stay within one per hold. It fails on the old model.
+
+### Evidence
+
+Release build, seed 1, `--config '{"request_rate": 0.005}'`. "Off" is the same binary with
+`"control": {"report_at_start": true}`. `full-cold-start` runs here move the 1 s storm past the
+end (`storms` with `at_ns` 1e14) to measure background reads during enrollment; with the storm,
+50k `full-cold-start` fails 697k reads in the storm window (Known issue 71, capacity track, whose
+simulator fix is not on this branch). No run had a hard invariant failure.
+
+| Scenario | Nodes | Model | Reads ok / failed | Failed while unready | Unready-member links (all links) | Not-ready skips | Stale skips | Origin requests (max) | Versions | Seat replies | Wall |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| cold start | 5,000 | off | 14,804 / 99 | 99 | 1,312 (1,312) | 0 | 0 | 7,014 (3) | 1 | 3.0 GB | 0:15 |
+| cold start | 5,000 | on | 14,660 / 0 | 0 | 0 (0) | 228 | 2 | 7,524 (5) | 5 | 4.9 GB | 0:20 |
+| failover | 5,000 | off | 33,917 / 127 | 110 | 1,402 (3,218) | 0 | 83 | 13,432 (7) | 2 | 3.0 GB | 0:42 |
+| failover | 5,000 | on | 33,762 / 12 | 0 | 0 (1,812) | 233 | 102 | 13,534 (7) | 7 | 4.9 GB | 0:53 |
+| cold start | 50,000 | off | 84,165 / 11,727 | 11,727 | 138,406 (138,406) | 0 | 0 | 27,447 (3) | 1 | 298 GB | 7:26 |
+| cold start | 50,000 | on | 85,855 / 1,411 | 0 | 0 (0) | 8,266 | 17,573 | 33,891 (12) | 8 | 677 GB | 12:23 |
+| failover | 50,000 | off | 272,950 / 12,759 | 12,424 | 145,222 (165,336) | 0 | 1,859 | 57,163 (9) | 2 | 298 GB | 21:24 |
+| failover | 50,000 | on | 275,691 / 1,756 | 151 | 0 (19,551) | 8,659 | 19,980 | 66,620 (12) | 9 | 689 GB | 31:42 |
+
+Reading the table:
+
+- Links toward members that cannot serve drop to zero at both scales. The remaining failover
+  link failures are the site partition (19,543) and crashed members (8).
+- Failed reads: 5k cold start 99 to 0, 5k failover 127 to 12 (the rest fall in the origin error
+  and partition windows, 384 to 534 s), 50k cold start 11,727 to 1,411, 50k failover 12,759 to
+  1,756. None of the remaining 50k cold start failures happen while a listed member cannot
+  serve. They come from the join versions: a requester that already holds a new version skips
+  owners that do not yet (17,573 stale-destination skips), and when every owner of a page just
+  joined the walk is exhausted (new Known issue 19).
+- "Not-ready skips" are reads a node did not issue because no membership it held listed it yet.
+  This is the price of the fix: a new node is not ready for up to one hold plus one pass plus
+  propagation after it starts serving (by the constants, about 20 s plus propagation at 5k and
+  60 s plus propagation at 50k; inferred, not measured per node). In production
+  `/readyz` is false meanwhile; a client that ignores readiness gets an immediate
+  `IncompatibleMembership` failure rather than a read deadline. Before the fix the node was
+  "ready" but its reads failed or routed to owners that could not serve.
+- Costs (new Known issue 20): pages move from early members to later ones as the membership
+  grows, so origin requests rise (50k cold start 27,447 to 33,891, worst page 3 to 12; 50k
+  failover 57,163 to 66,620, worst page 9 to 12), and clients that fall two versions behind get
+  full images (50k: 298 GB to about 680 GB of seat replies, from 0 to about 128k full
+  fallbacks). Wall
+  time rises with the extra versions' placement work.
+- The report adds no API calls: every dataplane already patched it once per process start; it
+  now patches after enrollment instead of before. API 429s are unchanged (467,296 vs 467,317 in
+  50k failover).
+
+Resolved bounds:
+
+- No member is listed before its dataplane opened its peer listener, provided the dataplane
+  reports only then (this branch). `unready_member_links` is 0 in every run above, and the
+  combined test enforces it.
+- Joins add at most one membership version per `join_hold_secs` (10 s up to 10,000 Pods, then
+  one second per thousand, at most 60 s), and a serving node is listed within one hold plus one
+  pass.
+- Restarted members keep their place (the report outlives the process), so they are not
+  covered: peers fail toward them until they re-apply a membership, bounded by link backoff as
+  before. Measured: 0 such links (`unready_member_links_restarted`) in every run.
+
+### Deviations and open items
+
+- The data plane still treats a link failure to a member that cannot serve like any other
+  failure; with the control fix it no longer happens in these scenarios, so nothing was changed
+  there.
+- New Known issue 19 (join version skew failures) belongs with the route and handoff work
+  (issues 3 and 12): for example, a requester could fall back to the previous version's owners
+  when every owner in its version is a stale destination.
+- New Known issue 20 (origin fetches and seat egress of join versions) belongs with Known issue 6
+  and with control deltas: seats keep only a one-version delta, so a client two versions behind
+  gets a full image.
+- A rollout that replaces a member's Pod keeps the member and switches it to the new Pod's IP at
+  once, before the new Pod serves, as before (the Node is in the previous membership). Gating that
+  would leave the old, dead endpoint listed instead.
+- Production readiness changed: an operator relying on `/readyz` sees a new node become ready one
+  membership version later than before.
