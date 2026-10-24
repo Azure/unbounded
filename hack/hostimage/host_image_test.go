@@ -45,12 +45,12 @@ func TestHillsboroImageUsesPinnedARM64Producer(t *testing.T) {
 		"COPY images/netboot/assets/vendor-data.tmpl",
 		"ROOT_EXTRA_MIB=7168",
 		"COPY --from=build /disk /disk",
-		`io.unbounded.host.qualification="blocked-bcho-has-no-github-ssh-keys"`,
 	} {
 		require.Contains(t, containerfile, value)
 	}
 	require.NotContains(t, containerfile, "images/host-ubuntu2404/Containerfile")
 	require.NotContains(t, containerfile, "customize.py")
+	require.NotContains(t, containerfile, "blocked-bcho")
 }
 
 func TestHillsboroAccessPolicyMatchesVerifiedTeamSnapshot(t *testing.T) {
@@ -128,7 +128,10 @@ func TestHillsboroDocumentationKeepsActivationSeparate(t *testing.T) {
 		"separately authorized `HostReplace`",
 		"native cloud-init",
 		"bcho",
-		"qualification blocker",
+		"Cloud-init still creates the locked `bcho` account",
+		"key-based access until `bcho` publishes a key",
+		"does not block image",
+		"readiness or affect key-based access",
 		"`spec.host.netboot.cloudInit.userDataConfigMapRef: gb200-metal-host-access`",
 		"must be removed or replaced",
 		"go run ./hack/cmd/hostimage-userdata-preflight -",

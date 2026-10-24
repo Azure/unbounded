@@ -12,10 +12,9 @@ sudo, and `ssh_import_id: [gh:<user>]`. No SSH keys, custom account script, or
 systemd cloud-final hook are embedded in the image.
 
 The snapshot includes `bcho`, who published no GitHub SSH keys when it was
-verified. The producer intentionally keeps that account in policy as a
-qualification blocker rather than silently dropping a team member. Do not
-activate a built image until every listed member publishes at least one usable
-GitHub SSH key and the blocker is re-reviewed.
+verified. Cloud-init still creates the locked `bcho` account, but it has no
+key-based access until `bcho` publishes a key. This does not block image
+readiness or affect key-based access for the other listed users.
 
 ## Build
 

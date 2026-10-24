@@ -41,7 +41,6 @@ LABEL org.opencontainers.image.source="https://github.com/Azure/unbounded" \
       org.opencontainers.image.revision="${SOURCE_COMMIT}" \
       org.opencontainers.image.description="Hillsboro Metalman Ubuntu 24.04 ARM64 GB200 NVIDIA 580.167.08 host disk" \
       io.unbounded.host.architecture="arm64" \
-      io.unbounded.host.access-policy="Azure/unbounded-dev@2026-10-23" \
-      io.unbounded.host.qualification="blocked-bcho-has-no-github-ssh-keys"
+      io.unbounded.host.access-policy="Azure/unbounded-dev@2026-10-23"
 COPY --from=build /disk /disk
 COPY LICENSE NOTICE /unbounded/licenses/
