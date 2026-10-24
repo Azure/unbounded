@@ -2834,8 +2834,8 @@ func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationR
 		}
 
 		completed, _, _ := terminalCheckStatuses(workflow, run)
-		nodes, found, nodesErr := unstructured.NestedMap(workflow.Object, "status", "nodes")
 
+		nodes, found, nodesErr := unstructured.NestedMap(workflow.Object, "status", "nodes")
 		if nodesErr != nil {
 			return ctrl.Result{}, fmt.Errorf("read Workflow nodes during cancellation: %w", nodesErr)
 		}
