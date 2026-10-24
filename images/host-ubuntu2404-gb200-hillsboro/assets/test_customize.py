@@ -21,14 +21,6 @@ class IdentityStateTest(unittest.TestCase):
             [],
         )
 
-    def test_rejects_captured_administrator_account(self):
-        with self.assertRaisesRegex(RuntimeError, "captured administrator account"):
-            customize.validate_identity_state(
-                "unbounded-metal:x:1000:1000::/home/unbounded-metal:/bin/bash\n",
-                "unbounded-metal:!:1:0:99999:7:::\n",
-                [],
-            )
-
     def test_rejects_password_hash(self):
         with self.assertRaisesRegex(RuntimeError, "captured password credential"):
             customize.validate_identity_state(

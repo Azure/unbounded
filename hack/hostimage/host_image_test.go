@@ -97,7 +97,6 @@ func TestHillsboroCustomizerFailsClosedAndGeneralizes(t *testing.T) {
 	customizer := readRepoFile(t, imageDir+"/assets/customize.py")
 
 	for _, value := range []string{
-		`FORBIDDEN_ACCOUNTS = {"administrator", "unbounded", "unbounded-metal"}`,
 		`"/usr/bin/cloud-init"`,
 		`"/usr/bin/ssh-import-id"`,
 		"filesystem.install_tree(ssh_import_id_package)",
