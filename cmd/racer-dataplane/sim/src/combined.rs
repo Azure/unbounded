@@ -212,14 +212,30 @@ pub fn data_schedules(scenario: &str, config: &mut Config) {
     }
     if scenario == "full-cold-start" && config.storms.is_empty() {
         // Once everyone has enrolled (about 280 s at 50,000 Pods), every
-        // node reads object 0 within one second.
+        // node reads object 0 within `cold_start_window_ns`.
         config.storms.push(Storm {
             at_ns: config.duration_ns * 3 / 4,
             object: 0,
             nodes: config.nodes,
-            window_ns: SECONDS,
+            window_ns: cold_start_window_ns(config),
         });
     }
+}
+
+/// Arrival window of the `full-cold-start` storm: at least one second, and
+/// long enough that the storm offers at most half of what the object's owners
+/// can send. Every reader wants every page of object 0, and only a page's
+/// `REPLICAS` owners serve it (non-owners are never candidates), so a page's
+/// peer throughput is `REPLICAS * nic_bps` (Known issue 11). With 16 pages on
+/// distinct owners the storm needs `nodes * page_bytes / (REPLICAS *
+/// nic_bps)` seconds of owner egress: about 14 s at 50,000 nodes and 10 Gbit/s.
+/// A one-second window there is 14 times over that bound and measures only
+/// overload (pass `storms` in `--config` to run it).
+pub fn cold_start_window_ns(config: &Config) -> Nanos {
+    let replicas = topology::REPLICAS as u128;
+    let egress = u128::from(config.nodes) * u128::from(config.page_bytes) * u128::from(SECONDS)
+        / (replicas * u128::from(config.nic_bps.max(1)));
+    (2 * egress).clamp(u128::from(SECONDS), u128::from(Nanos::MAX)) as Nanos
 }
 
 pub struct Combined {
@@ -407,6 +423,36 @@ mod tests {
             "{}\n{}",
             r["invariants"], r["combined"]["control_invariants"]
         );
+    }
+
+    #[test]
+    fn cold_start_window_fits_owner_egress() {
+        let at = |nodes: u32, nic_bps: u64| {
+            let config = Config {
+                nodes,
+                nic_bps,
+                ..Config::default()
+            };
+            cold_start_window_ns(&config)
+        };
+        // Small fleets keep the one-second storm.
+        assert_eq!(at(200, 1_250_000_000), SECONDS);
+        assert_eq!(at(1, 1), 2 * (1 << 20) * SECONDS / 3);
+        // 50,000 nodes at 10 Gbit/s: twice the ~14 s owner egress bound.
+        let w = at(50_000, 1_250_000_000);
+        assert!((27 * SECONDS..29 * SECONDS).contains(&w), "{w}");
+        // A slower NIC stretches the window in proportion.
+        assert_eq!(at(50_000, 125_000_000) / SECONDS, w * 10 / SECONDS);
+        // Generated only when no storm is configured.
+        let mut config = Config {
+            nodes: 50_000,
+            duration_ns: 400 * SECONDS,
+            ..Config::default()
+        };
+        data_schedules("full-cold-start", &mut config);
+        assert_eq!(config.storms.len(), 1);
+        assert_eq!(config.storms[0].window_ns, w);
+        assert_eq!(config.storms[0].at_ns, 300 * SECONDS);
     }
 
     #[test]
