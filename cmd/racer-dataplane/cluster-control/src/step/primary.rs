@@ -492,6 +492,55 @@ mod tests {
         assert_eq!(join_hold_secs(usize::MAX), MAX_JOIN_HOLD_SECS);
     }
 
+    /// A cold start: few members, many eligible Pods. The hold is sized by
+    /// the cluster, not by the small membership.
+    #[test]
+    fn join_hold_is_sized_by_eligible_pods() {
+        let own = ownership();
+        let policy = Policy::from(crate::Rotation::default());
+        let live = BTreeMap::new();
+        let w = writer();
+        let mut inv = inventory(11_000);
+        for (k, p) in inv.pods.iter_mut() {
+            if k.parse::<usize>().unwrap() >= 4 {
+                p.annotations.clear();
+            }
+        }
+        let first = plan_pass(
+            &inputs(&inv, &own, &policy, &live, &w, None, None),
+            &mut Seeded::new(1),
+        )
+        .unwrap();
+        let (committed, image) = (first.next, first.image.unwrap());
+        assert_eq!(image.publication.members.len(), 4);
+        inv.pods.get_mut("4").unwrap().annotations.insert(
+            annotations::REPORT.into(),
+            r#"{"shares":1,"rdma_nics":[]}"#.into(),
+        );
+        let at = |since: u64| {
+            let mut i = inputs(
+                &inv,
+                &own,
+                &policy,
+                &live,
+                &w,
+                Some(&committed),
+                Some(&image),
+            );
+            i.membership_changed_unix = Some(1_800_000_000 - since);
+            plan_pass(&i, &mut Seeded::new(2))
+                .unwrap()
+                .image
+                .unwrap()
+                .publication
+                .members
+                .len()
+        };
+        assert_eq!(join_hold_secs(11_000), 11);
+        assert_eq!(at(JOIN_HOLD_SECS), 4, "held for 11 s, not 10");
+        assert_eq!(at(11), 5);
+    }
+
     /// New members are batched: within the hold after a membership change
     /// they wait; afterwards they join.
     #[test]
