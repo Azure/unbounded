@@ -348,13 +348,6 @@ Verified against the code at the start of this work.
    Inference: the holders sit behind the scenario's partitions (19,325 partition link failures).
    See "Round 4: combined (wave 1)".
 
-18. The relay hold from the capacity track (`Relay` reservation kept while a body streams, as in
-   `src/peer/server.rs:438-445` and `:660`) makes the 5k hot-page scenarios shed on the `Relay`
-   quota: `storm` 18,013 and `zipf` 4,627 reads fail `Unavailable` (692,964 and 366,626 relay
-   rejections), against 0 and 11 on the handoff branch. The capacity branch alone fails 23,040
-   `storm` reads (787,758 rejections), so the merge did not cause it; handoff's fixes reduce it.
-   Same family as issue 16 (fanout track). No invariant is relaxed.
-
 16. Hot-page peer throughput is capped by the page's `REPLICAS` owners: candidates are only the
    ranked owners (`src/read/candidates.rs:628-635`), so readers holding a copy never serve other
    readers, and a storm on one page gets at most `REPLICAS * nic_bps / page_bytes` deliveries per
@@ -367,6 +360,13 @@ Verified against the code at the start of this work.
    Zipf reads (11.7k at 50k, ~100 at 5k, unchanged since round 3) fail while 138k link attempts hit
    members that are published but not yet enrolled (inference from `link_failures`; the storm alone
    reads 80,000 of 80,000 pages at 5k). Belongs with the enroll and liveness work.
+
+18. The relay hold from the capacity track (`Relay` reservation kept while a body streams, as in
+   `src/peer/server.rs:438-445` and `:660`) makes the 5k hot-page scenarios shed on the `Relay`
+   quota: `storm` 18,013 and `zipf` 4,627 reads fail `Unavailable` (692,964 and 366,626 relay
+   rejections), against 0 and 11 on the handoff branch. The capacity branch alone fails 23,040
+   `storm` reads (787,758 rejections), so the merge did not cause it; handoff's fixes reduce it.
+   Same family as issue 16 (fanout track). No invariant is relaxed.
 
 ## Simulator engine (racer-sim substrate)
 
