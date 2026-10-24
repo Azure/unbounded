@@ -71,7 +71,42 @@ pub struct PeerServer {
     signatures: Rc<crate::peer::protocol::Signatures>,
     transfers: Rc<super::transport::Transfers>,
     request_timeout: Duration,
+    /// Page response bodies this server is writing, per page
+    /// (`racer_core::read::fanout::shed_hot_page`).
+    streaming: Rc<std::cell::RefCell<std::collections::HashMap<crate::model::PageId, usize>>>,
 }
+
+/// Counts one page body being written until dropped.
+struct Streaming {
+    pages: Rc<std::cell::RefCell<std::collections::HashMap<crate::model::PageId, usize>>>,
+    page: crate::model::PageId,
+}
+
+impl Streaming {
+    fn new(
+        pages: &Rc<std::cell::RefCell<std::collections::HashMap<crate::model::PageId, usize>>>,
+        page: crate::model::PageId,
+    ) -> Self {
+        *pages.borrow_mut().entry(page.clone()).or_default() += 1;
+        Self {
+            pages: pages.clone(),
+            page,
+        }
+    }
+}
+
+impl Drop for Streaming {
+    fn drop(&mut self) {
+        let mut pages = self.pages.borrow_mut();
+        if let Some(count) = pages.get_mut(&self.page) {
+            *count -= 1;
+            if *count == 0 {
+                pages.remove(&self.page);
+            }
+        }
+    }
+}
+
 impl PeerServer {
     pub(crate) fn configure_accepted(
         &self,
@@ -319,7 +354,56 @@ impl PeerServer {
             signatures,
             transfers,
             request_timeout: settings.request_timeout,
+            streaming: Rc::default(),
         }
+    }
+
+    /// Bodies of `page` this server is writing now.
+    pub(crate) fn streaming(&self, page: &crate::model::PageId) -> usize {
+        self.streaming.borrow().get(page).copied().unwrap_or(0)
+    }
+
+    /// Count `n` bodies of `page` as being written until the result drops.
+    #[cfg(test)]
+    pub(crate) fn hold_streaming(
+        &self,
+        page: &crate::model::PageId,
+        n: usize,
+    ) -> impl Sized + use<> {
+        (0..n)
+            .map(|_| Streaming::new(&self.streaming, page.clone()))
+            .collect::<Vec<_>>()
+    }
+
+    /// Whether to answer a page request with `Overloaded` because this node
+    /// owns the page and is already writing `HOT_PAGE_BODIES` bodies of it to
+    /// other requesters (Known issue 71). The requester then asks one of the
+    /// page's helpers, which, like the page's owners, is never shed. The
+    /// ranking is only computed for a page that is already hot, and stays in
+    /// this server's placement cache.
+    fn shed_hot_page(
+        &self,
+        page: &crate::model::PageId,
+        requester: &racer_control_wire::NodeId,
+        membership: &std::sync::Arc<crate::topology::Membership>,
+    ) -> bool {
+        use racer_core::read::fanout::{HOT_PAGE_BODIES, is_helper, shed_hot_page};
+        let streaming = self.streaming(page);
+        if streaming < HOT_PAGE_BODIES {
+            return false;
+        }
+        let (object, number) = (&page.version.object, page.number);
+        let owners = self.placement.rank(membership.clone(), object, number);
+        let owner = owners
+            .ordered
+            .iter()
+            .take(3)
+            .any(|node| node == &self.relay.network.local);
+        let exempt = owners.ordered.iter().take(3).any(|node| node == requester)
+            || membership
+                .position(requester)
+                .is_ok_and(|p| is_helper(object, number, p, membership.members().len()));
+        shed_hot_page(owner, streaming, exempt)
     }
     /// Bound incoming heads and the complete connection handshake, including writes.
     /// Authenticated page dispatch and transfer retain their signed request deadline.
@@ -639,6 +723,14 @@ impl PeerServer {
             _ => &[],
         };
         let head = super::protocol::encode_envelope(&response.authentication, true, body.len())?;
+        // Counted from the head until the body is written or abandoned.
+        let _streaming = match &response.response {
+            PeerResponse::Page { ciphertext, .. } if !body.is_empty() => Some(Streaming::new(
+                &self.streaming,
+                ciphertext.envelope().page.clone(),
+            )),
+            _ => None,
+        };
         let sent = self.io.send_head(connection, head, scope).await?;
         let mut connection = sent.connection;
         if !body.is_empty() {
@@ -755,6 +847,14 @@ impl PeerServer {
                 };
             }
             let binding = request.binding().clone();
+            if let super::protocol::Operation::Page { page, .. } = &request.request().operation
+                && self.shed_hot_page(page, request.origin().node(), &membership)
+            {
+                self.metrics.record(crate::telemetry::Event::Overload, 1);
+                return self
+                    .forwarding
+                    .sign_response(&binding, PeerResponse::Overloaded);
+            }
             let reservation = self
                 .admission
                 .reserve(None, ResourceClass::Waiter, 1)
