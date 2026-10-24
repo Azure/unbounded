@@ -313,9 +313,9 @@ impl CandidateWalk {
             let count = self.count;
             let owner_attempts = 1 + u32::from(delegated);
             let bounded = if delegated {
-                // Exactly the exchange and rank 0's origin credit: a funded
-                // route forwards all of it, so rank 0 receives one credit
-                // and this owner keeps the rest for later probes and origin.
+                // The exchange and rank 0's origin credit: a funded route
+                // forwards all of it, and this owner keeps what later probes
+                // and its own origin attempt need.
                 let tight = u16::from(budget.remaining_links())
                     < (count - index) as u16 * u16::from(budget.route_links());
                 let links = if tight {

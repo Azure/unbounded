@@ -65,7 +65,7 @@ fn owner_asks_rank_zero_to_acquire_then_probes_copy_only_then_gets_origin() {
         ]
     );
     // The Acquire to rank 0 carries exactly the exchange and one origin
-    // credit over a normal route.
+    // credit over a normal route (remote credits stay spent, so no more).
     assert_eq!((probes[0].1, probes[0].2), (2, 4));
     assert_eq!(
         end,

@@ -50,8 +50,8 @@ use racer_core::read::range::{PageBudget, SlotKind, direct_fills, first_failure}
 use racer_core::read::serve::{ServeAction, ServeFacts, serve_action, serve_deadline};
 use racer_core::read::walk::{
     AttemptInputs, AttemptPlan, CandidateWalk, Continuation, End, HedgeFacts, Mode, Outcome, Probe,
-    RemainingWalk, RouteMode, StaleAction, Step, WalkConfig, hedge_budgets, hedge_eligible,
-    hedge_fallback, plan_attempt, stale_action, transport_outcome,
+    RemainingWalk, RouteMode, StaleAction, Step, WalkConfig, handoff_targets, hedge_budgets,
+    hedge_eligible, hedge_fallback, plan_attempt, stale_action, transport_outcome,
 };
 use racer_core::route::MAX_LINKS;
 use racer_core::time::SplitMix64;
@@ -209,6 +209,9 @@ type TaskFuture = Pin<Box<dyn Future<Output = Result<Vec<usize>, topology::Error
 enum Then {
     /// Placement ranking for a fill's candidate walk.
     Walk { fill: u64, version: u64 },
+    /// An owner's ranking of the page under its previous membership, for
+    /// copy-only handoff probes before origin.
+    Handoff { fill: u64 },
     /// Re-ranking before origin (production `resolve_epoch_traced`).
     Origin {
         fill: u64,
@@ -281,6 +284,9 @@ struct Fill {
     scope: Instant,
     walk: Walking,
     cands: Vec<u32>,
+    /// Previous-membership owners to ask before origin; probe canonical
+    /// `cands.len() + i` addresses `handoff[i]`.
+    handoff: Vec<u32>,
     version: u64,
     rank: Option<usize>,
     retried: bool,
@@ -1334,6 +1340,7 @@ impl NodeWorld {
                 scope,
                 walk: Walking::None,
                 cands: Vec::new(),
+                handoff: Vec::new(),
                 version: 0,
                 rank: None,
                 retried: false,
@@ -1504,6 +1511,10 @@ impl NodeWorld {
                 let cands = Self::to_nodes(&members, result);
                 self.walk_ranked(fill, version, members, cands);
             }
+            Then::Handoff { fill } => {
+                let previous = Self::to_nodes(&members, result);
+                self.handoff_ranked(fill, previous);
+            }
             Then::Origin {
                 fill,
                 rank,
@@ -1596,9 +1607,44 @@ impl NodeWorld {
         };
         let fill = self.fills.get_mut(&id).expect("present");
         fill.cands = cands;
+        fill.handoff.clear();
         fill.version = version;
         fill.rank = rank;
         fill.order = order;
+        // An owner also ranks the page under the publication before its
+        // membership, when still retained (production
+        // `CandidatePolicy::previous_membership`).
+        if rank.is_some() {
+            if let Some(old) = self.versions.before(version) {
+                let old = old.members.clone();
+                let w = self.fills[&id].worker;
+                self.rank(node, w, old, page, Then::Handoff { fill: id });
+                return;
+            }
+        }
+        self.walk_owners(id);
+    }
+
+    /// Previous-membership owners are ranked: keep those that are still
+    /// members and that the walk does not ask anyway, then walk.
+    fn handoff_ranked(&mut self, id: u64, previous: Result<Vec<u32>, Error>) {
+        let Some(fill) = self.fills.get(&id) else {
+            return;
+        };
+        if let (Ok(previous), Some(rank)) = (previous, fill.rank) {
+            let current = self.versions.get(fill.version).map(|v| v.members.clone());
+            let targets = handoff_targets(&previous, &fill.cands, rank);
+            let fill = self.fills.get_mut(&id).expect("present");
+            fill.handoff = targets
+                .into_iter()
+                .filter(|n| current.as_ref().is_some_and(|m| position(m, *n).is_some()))
+                .collect();
+        }
+        self.walk_owners(id);
+    }
+
+    fn walk_owners(&mut self, id: u64) {
+        let fill = self.fills.get_mut(&id).expect("present");
         if *fill.plan.step() == FillStep::Hedge && self.try_hedge(id) {
             return;
         }
@@ -1616,7 +1662,7 @@ impl NodeWorld {
             order: fill.order,
             page_operation: true,
             continuation,
-            handoff: 0,
+            handoff: fill.handoff.len(),
         }));
         self.step_walk(id);
     }
@@ -2039,7 +2085,13 @@ impl NodeWorld {
         let instant = self.instant(now);
         let attempt_timeout = Duration::from_nanos(self.config.node.attempt_timeout_ns);
         let fill = self.fills.get_mut(&id).expect("present");
-        let dest = fill.cands[probe.canonical];
+        let dest = match probe.canonical.checked_sub(fill.cands.len()) {
+            Some(i) => {
+                self.metrics.incr("handoff_probes");
+                fill.handoff[i]
+            }
+            None => fill.cands[probe.canonical],
+        };
         let scope = fill.scope;
         let budget = match &mut fill.walk {
             Walking::Candidates(walk) => walk.request_budget(&mut fill.budget),

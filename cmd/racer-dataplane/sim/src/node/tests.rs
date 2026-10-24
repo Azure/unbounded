@@ -480,3 +480,48 @@ fn duplicate_memory_publish_does_not_touch() {
     assert!(world.in_memory(0, 0, 1));
     assert!(world.in_memory(0, 0, 2));
 }
+
+/// Ownership moves when nodes join: an owner that adopted the new membership
+/// asks the page's previous owners copy-only before origin (Known issue 6),
+/// so a page read before the join is not fetched again after it.
+#[test]
+fn joined_owners_copy_from_previous_owners() {
+    let mut config = quiet(64);
+    config.duration_ns = 4 * SECONDS;
+    let mut churn = Vec::new();
+    for node in 48..64 {
+        churn.push(Churn {
+            at_ns: MILLIS,
+            node,
+            join: false,
+        });
+        churn.push(Churn {
+            at_ns: SECONDS + SECONDS / 2,
+            node,
+            join: true,
+        });
+    }
+    config.churn = churn;
+    config.storms = vec![
+        Storm {
+            at_ns: SECONDS,
+            object: 3,
+            nodes: 1,
+            window_ns: 1,
+        },
+        Storm {
+            at_ns: 3 * SECONDS,
+            object: 3,
+            nodes: 48,
+            window_ns: 100 * MILLIS,
+        },
+    ];
+    let (world, report) = run(config, 7);
+    let pages = u64::from(world.config.pages_per_object);
+    let per_page: Vec<u32> = (0..pages)
+        .map(|p| world.origin_requests(3 * pages + p))
+        .collect();
+    // Without handoff probes this was 19 (three pages fetched twice).
+    assert!(counter(&report, "handoff_probes") > 0, "{report}");
+    assert_eq!(counter(&report, "origin_requests"), pages, "{per_page:?}");
+}
