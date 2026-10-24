@@ -36,6 +36,7 @@ func ValidateSuiteDeadlines(backendDeadlines []time.Duration, suiteDeadline time
 	}
 
 	var required time.Duration
+
 	for _, backendDeadline := range backendDeadlines {
 		if backendDeadline <= 0 || backendDeadline%time.Second != 0 {
 			return errors.New("backend active deadlines must be positive whole numbers of seconds")

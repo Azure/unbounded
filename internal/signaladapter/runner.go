@@ -331,6 +331,7 @@ func (r *Runner) quiesceBackends(backends []createdResource) error {
 	defer cancel()
 
 	propagation := metav1.DeletePropagationForeground
+
 	for _, backend := range backends {
 		uid := backend.resource.GetUID()
 		err := r.Dynamic.Resource(backend.gvr).Namespace(backend.resource.GetNamespace()).
@@ -338,6 +339,7 @@ func (r *Runner) quiesceBackends(backends []createdResource) error {
 				Preconditions:     &metav1.Preconditions{UID: &uid},
 				PropagationPolicy: &propagation,
 			})
+
 		if err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
