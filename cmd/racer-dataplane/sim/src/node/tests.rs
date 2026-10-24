@@ -218,3 +218,61 @@ fn memory_accounting_is_per_component() {
         .unwrap();
     assert!(per_node < 640 << 10, "{per_node}");
 }
+
+fn client_read(node: u32, page: u64, at: crate::engine::Nanos) -> super::world::Event {
+    super::world::Event::Read(super::world::ClientRead {
+        node,
+        incarnation: 0,
+        page,
+        start: at,
+        attempt: 0,
+        range: 0,
+        slot: 0,
+    })
+}
+
+/// Retention observes every client read, including memory hits: a non-owner
+/// persists a page on its second read (second sight), not at publication.
+#[test]
+fn retention_observes_client_reads_including_memory_hits() {
+    let config = quiet(64);
+    let mut world = NodeWorld::new(config, 5);
+    let pages = u64::from(world.config.pages_per_object);
+    let reader = 9;
+    let foreign: Vec<u64> = (3 * pages..4 * pages)
+        .filter(|p| !world.owners(*p).contains(&reader))
+        .collect();
+    assert!(!foreign.is_empty());
+    for p in &foreign {
+        world.engine.at(0, client_read(reader, *p, 0));
+    }
+    world.run(SECONDS);
+    let after_first = world.metrics.get("retention_observations");
+    assert_eq!(after_first, foreign.len() as u64);
+    for p in &foreign {
+        assert!(
+            !world.on_disk(reader, *p),
+            "page {p} persisted on first sight"
+        );
+    }
+    let hits = world.metrics.get("memory_hits");
+    for p in &foreign {
+        world.engine.at(SECONDS, client_read(reader, *p, SECONDS));
+    }
+    world.run(2 * SECONDS);
+    assert_eq!(
+        world.metrics.get("memory_hits") - hits,
+        foreign.len() as u64
+    );
+    assert_eq!(
+        world.metrics.get("retention_observations"),
+        2 * foreign.len() as u64
+    );
+    for p in &foreign {
+        assert!(
+            world.on_disk(reader, *p),
+            "page {p} not persisted on second sight"
+        );
+    }
+    assert_eq!(world.invariants.to_json()["hard_failures"], 0);
+}

@@ -215,6 +215,8 @@ struct Fill {
     rank: Option<usize>,
     retried: bool,
     probe: Option<u64>,
+    /// The leader's retention observation, used at publication.
+    eligible: bool,
     _reservation: Vec<SimCharge>,
 }
 
@@ -225,6 +227,8 @@ struct Waiting {
     page: u64,
     id: u64,
     want: Want,
+    /// Retention observation latched when this operation joined.
+    eligible: bool,
 }
 
 struct Msg {
@@ -862,6 +866,15 @@ impl NodeWorld {
         let costs = self.fabric.costs;
         let t = self.fabric.cpu(now, node, w, costs.request_ns);
         let peer = matches!(want, Want::Peer { .. });
+        // Production observes retention once per client operation, before
+        // the memory lookup result is used (`src/read/fill.rs`
+        // `acquire_with_prefetch`: `retention.observe` on a plaintext hit and
+        // before joining a flight); peer acquires use `owned_only`.
+        let eligible = if peer {
+            self.owned(node, w, page)
+        } else {
+            self.observe(node, w, page)
+        };
         let n = &mut self.nodes[node as usize];
         let worker = &mut n.workers[w as usize];
         if worker.memory.pages.contains_key(&page) {
@@ -871,13 +884,13 @@ impl NodeWorld {
             } else {
                 "memory_hits"
             });
+            if !peer {
+                self.persist_page(node, w, page, eligible);
+            }
             self.resolve_at(want, Ok(Got::Local), t);
             return;
         }
         if n.disk.entries.get(&page).is_some() {
-            n.retention
-                .heat
-                .touch(&page, self.base + Duration::from_nanos(now));
             self.metrics
                 .incr(if peer { "peer_disk_hits" } else { "disk_hits" });
             let read = self
@@ -919,6 +932,9 @@ impl NodeWorld {
             }
             Ok(Joined::Complete(_) | Joined::Partial(_)) => {
                 self.metrics.incr("flight_completed_joins");
+                if !peer {
+                    self.persist_page(node, w, page, eligible);
+                }
                 self.resolve_at(want, Ok(Got::Joined), t);
             }
             Ok(Joined::Waiter(id)) => {
@@ -936,11 +952,12 @@ impl NodeWorld {
                         page,
                         id,
                         want,
+                        eligible,
                     },
                 );
                 match event {
                     Ok(FlightEvent::Lead) => {
-                        self.start_fill(node, w, page, id, token, budget, plaintext);
+                        self.start_fill(node, w, page, id, token, budget, plaintext, eligible);
                     }
                     Ok(FlightEvent::Pending) => self.metrics.incr("flight_joins"),
                     Ok(FlightEvent::Complete(_) | FlightEvent::Failed(_)) => wakes.push(token),
@@ -992,7 +1009,12 @@ impl NodeWorld {
                 self.tokens.insert(token, waiting);
                 return;
             }
-            Ok(FlightEvent::Complete(_)) => Ok(Got::Joined),
+            Ok(FlightEvent::Complete(_)) => {
+                if let Want::Client(_) = waiting.want {
+                    self.persist_page(waiting.node, waiting.worker, waiting.page, waiting.eligible);
+                }
+                Ok(Got::Joined)
+            }
             Ok(FlightEvent::Failed(e)) | Err(e) => Err(e),
             Ok(FlightEvent::Lead) => {
                 // Only `Outcome::Retry` re-elects, and the simulator never
@@ -1109,6 +1131,7 @@ impl NodeWorld {
         token: u64,
         budget: AcquisitionBudget,
         plaintext: bool,
+        eligible: bool,
     ) {
         let id = self.fresh();
         let quotas = &self.nodes[node as usize].workers[w as usize].quotas;
@@ -1152,6 +1175,7 @@ impl NodeWorld {
                 rank: None,
                 retried: false,
                 probe: None,
+                eligible,
                 _reservation: reservation,
             },
         );
@@ -1970,17 +1994,56 @@ impl NodeWorld {
     }
 
     fn publish_page(&mut self, id: u64, source: Source) {
-        let now = self.now();
-        let instant = self.instant(now);
         let fill = self.fills.get(&id).expect("present");
-        let (node, w, page, owned) = (fill.node, fill.worker, fill.page, fill.rank.is_some());
+        let (node, w, page, eligible) = (fill.node, fill.worker, fill.page, fill.eligible);
         self.memory_insert(node, w, page);
-        let n = &mut self.nodes[node as usize];
-        let seen = n.retention.history.observe(&page, instant);
-        n.retention.heat.touch(&page, instant);
+        self.persist_page(node, w, page, eligible);
+        let fill = self.fills.get_mut(&id).expect("present");
+        fill.plan.published(Ok(()));
+        let _ = source;
+        self.continue_plan(id);
+    }
+
+    /// Whether `node` owns `page` in its current published snapshot, from
+    /// the worker's cached ranking only (production `Retention::is_owned`:
+    /// missing or partial rankings are not owned).
+    fn owned(&self, node: u32, w: u8, page: u64) -> bool {
+        let n = &self.nodes[node as usize];
+        let Some(version) = self.versions.get(n.version) else {
+            return false;
+        };
+        let Some(me) = position(&version.members, node) else {
+            return false;
+        };
+        n.workers[w as usize]
+            .placement
+            .is_owner(&*version.members, &page.to_be_bytes(), |o| o == me)
+    }
+
+    /// Production `Retention::observe_at` for one client operation: the
+    /// ownership predicate, then second-sight history and heat.
+    fn observe(&mut self, node: u32, w: u8, page: u64) -> bool {
+        let owned = self.owned(node, w, page);
+        let instant = self.instant(self.now());
+        let retention = &mut self.nodes[node as usize].retention;
+        let seen = retention.history.observe(&page, instant);
+        retention.heat.touch(&page, instant);
+        self.metrics.incr("retention_observations");
+        let eligible = retention_eligible(owned, true, seen);
+        if eligible {
+            self.metrics.incr("retention_qualified");
+        }
+        eligible
+    }
+
+    /// Production `persist_verified`: write an eligible, not yet resident
+    /// page, with ownership reclassified now and the observation latched.
+    fn persist_page(&mut self, node: u32, w: u8, page: u64, eligible: bool) {
+        let owned = self.owned(node, w, page);
+        let n = &self.nodes[node as usize];
         let quotas = &n.workers[w as usize].quotas;
         let decision = persist(PersistFacts {
-            eligible: retention_eligible(owned, true, seen),
+            eligible,
             metadata_valid: true,
             resident: n.disk.entries.get(&page).is_some(),
             owned,
@@ -1998,10 +2061,6 @@ impl NodeWorld {
         if decision == Persist::Write {
             self.disk_write(node, w, page);
         }
-        let fill = self.fills.get_mut(&id).expect("present");
-        fill.plan.published(Ok(()));
-        let _ = source;
-        self.continue_plan(id);
     }
 
     fn disk_write(&mut self, node: u32, w: u8, page: u64) {
@@ -2259,6 +2318,21 @@ impl NodeWorld {
     /// Origin requests for `page` so far.
     pub fn origin_requests(&self, page: u64) -> u32 {
         self.origin_per_page.get(&page).copied().unwrap_or(0)
+    }
+
+    /// Whether `node` holds `page` on disk.
+    pub fn on_disk(&self, node: u32, page: u64) -> bool {
+        self.nodes[node as usize].disk.entries.get(&page).is_some()
+    }
+
+    /// The ranked owners of `page` in the latest membership (node ids).
+    pub fn owners(&self, page: u64) -> Vec<u32> {
+        let members = self.members();
+        Placement::<Phantom>::with_rankings(0, self.shared.phantom.clone())
+            .rank(&*members, &page.to_be_bytes())
+            .into_iter()
+            .map(|p| members.members()[p].node)
+            .collect()
     }
 
     /// Shared handles for tests.
