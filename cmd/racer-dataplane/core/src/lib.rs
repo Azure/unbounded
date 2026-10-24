@@ -7,6 +7,7 @@
 //! spawns threads, or reads OS randomness. `tests/purity.rs` and
 //! `clippy.toml` enforce this.
 
+pub mod admission;
 pub mod cache;
 pub mod peer;
 pub mod read;

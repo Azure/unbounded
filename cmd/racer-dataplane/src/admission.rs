@@ -21,41 +21,16 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::task::Waker;
 
-#[derive(Clone, Copy, Debug)]
-pub enum ResourceClass {
-    Plaintext,
-    Ciphertext,
-    DirtyCiphertext,
-    Registered,
-    RequestContext,
-    Flight,
-    Waiter,
-    Connection,
-    Pipe,
-    ControlProgress,
-    Relay,
-    IngressConnection,
-    OutboundConnection,
-    ControlConnection,
-    /// Outbound sockets other than origin metadata, kept below the outbound
-    /// limit so metadata lookups never queue behind page bodies.
-    OrdinaryOutboundConnection,
-}
-impl flow_control::Class for ResourceClass {
-    const COUNT: usize = 15;
-    fn index(self) -> usize {
-        self as usize
-    }
+pub use racer_core::admission::ResourceClass;
+pub use racer_core::admission::Rules;
 
-    fn requires_wipe(self) -> bool {
-        // Only Ciphertext backs AEAD output and disk records sent to peers.
-        // Keep every other class conservative, including mixed-use Registered.
-        !matches!(self, Self::Ciphertext)
-    }
+/// Production floors: 16 MiB pages and the store's maximum record header.
+pub fn production_floors() -> racer_core::admission::Floors {
+    racer_core::admission::Floors::for_page(PAGE_BYTES as usize, crate::store::MAX_HEADER_BYTES)
 }
 
 pub struct AdmissionPolicy {
-    limits: Limits,
+    rules: Rules,
 
     observer: OnceLock<Observer>,
 
@@ -65,7 +40,7 @@ pub struct AdmissionPolicy {
 impl Clone for AdmissionPolicy {
     fn clone(&self) -> Self {
         Self {
-            limits: self.limits.clone(),
+            rules: self.rules.clone(),
             observer: self.observer.clone(),
             weights: self.weights.clone(),
         }
@@ -74,7 +49,7 @@ impl Clone for AdmissionPolicy {
 impl AdmissionPolicy {
     pub fn new(limits: Limits) -> Self {
         Self {
-            limits,
+            rules: Rules::new(limits, production_floors()),
             observer: OnceLock::new(),
             weights: crate::priority::Weights::default(),
         }
@@ -84,7 +59,7 @@ impl AdmissionPolicy {
         &self.weights
     }
     pub fn limits(&self) -> &Limits {
-        &self.limits
+        &self.rules.limits
     }
     pub fn set_observer(&self, observer: Observer) {
         assert!(
@@ -275,95 +250,32 @@ impl Policy for AdmissionPolicy {
     type Class = ResourceClass;
     type Key = CacheId;
     fn limit(&self, class: ResourceClass) -> usize {
-        match class {
-            ResourceClass::Plaintext => self.limits.plaintext_bytes.get(),
-            ResourceClass::Ciphertext => self.limits.ciphertext_bytes.get(),
-            ResourceClass::DirtyCiphertext => self.limits.dirty_bytes.get(),
-            ResourceClass::Registered => self.limits.registered_bytes.get(),
-            ResourceClass::RequestContext => self.limits.request_context_bytes.get(),
-            ResourceClass::Flight => self.limits.flights.get(),
-            ResourceClass::Waiter => self
-                .limits
-                .flights
-                .get()
-                .saturating_mul(self.limits.waiters_per_flight.get()),
-            ResourceClass::Connection => self.limits.client_connections.get(),
-            // Snapshot, renewal, and keyring delivery make independent progress.
-            ResourceClass::ControlConnection => (self.limits.client_connections.get() / 4).min(3),
-            ResourceClass::OutboundConnection => self.limits.client_connections.get() / 4,
-            ResourceClass::OrdinaryOutboundConnection => {
-                let outbound = self.limit(ResourceClass::OutboundConnection);
-                outbound - usize::from(outbound >= 2) * METADATA_OUTBOUND_RESERVE
-            }
-            ResourceClass::IngressConnection => {
-                self.limits.client_connections.get().saturating_sub(
-                    self.limit(ResourceClass::ControlConnection)
-                        + self.limit(ResourceClass::OutboundConnection),
-                )
-            }
-            ResourceClass::Pipe => self.limits.pipes.get(),
-            ResourceClass::ControlProgress => self.limits.queue_entries.get(),
-            ResourceClass::Relay => self.limits.relay_transfers.get(),
-        }
+        self.rules.limit(class)
     }
     /// A cache's keyed fair share follows its published priority.
     fn weight(&self, key: &CacheId) -> u64 {
         self.weights.weight(key)
     }
-    /// Priority weights page-memory budgets. Other request-serving classes
-    /// keep an equal split so a priority-0 cache can still serve requests.
     fn weighted(class: ResourceClass) -> bool {
-        matches!(
-            class,
-            ResourceClass::Plaintext | ResourceClass::Ciphertext | ResourceClass::DirtyCiphertext
-        )
+        Rules::weighted(class)
     }
     fn floor(&self, class: ResourceClass) -> usize {
-        match class {
-            ResourceClass::Plaintext => PAGE_BYTES as usize,
-            // Disk ciphertext retains one padded, size-class-rounded slab allocation.
-            ResourceClass::Ciphertext => page_alloc::buffer_capacity(
-                PAGE_BYTES as usize + 16 + crate::store::MAX_HEADER_BYTES + 4096,
-            )
-            .expect("bounded page capacity"),
-            ResourceClass::DirtyCiphertext | ResourceClass::Registered => PAGE_BYTES as usize + 16,
-            _ => 1,
-        }
+        self.rules.floor(class)
     }
-    /// Plaintext is request working memory; ciphertext is both working and
-    /// retained memory. Each cache keeps an allowance sized for one range
-    /// window, the same amount configuration validation requires of each whole
-    /// budget (`config.rs`). All concurrent requests on the cache share it, and
-    /// the equal-share cap can make it smaller, so a low-priority cache can still
-    /// see `Overloaded`. It limits how far low priority shrinks the share; it
-    /// does not guarantee progress.
     fn progress(&self, class: ResourceClass) -> usize {
-        let window = self.limits.range_window_pages.get();
-        let record = PAGE_BYTES as usize + 16 + crate::store::MAX_HEADER_BYTES;
-        match class {
-            ResourceClass::Plaintext => {
-                window.saturating_add(1).saturating_mul(PAGE_BYTES as usize)
-            }
-            ResourceClass::Ciphertext => window
-                .saturating_mul(PAGE_BYTES as usize + 16)
-                .saturating_add(record),
-            _ => 0,
-        }
+        self.rules.progress(class)
     }
     fn max_keys(&self) -> usize {
-        self.limits.metadata_entries.get()
+        self.rules.max_keys()
     }
     fn wakes(class: ResourceClass) -> bool {
-        matches!(
-            class,
-            ResourceClass::Connection | ResourceClass::IngressConnection
-        )
+        Rules::wakes(class)
     }
     fn allows_stopped(class: ResourceClass) -> bool {
-        matches!(class, ResourceClass::ControlProgress)
+        Rules::allows_stopped(class)
     }
     fn covers(class: ResourceClass) -> bool {
-        matches!(class, ResourceClass::Ciphertext)
+        Rules::covers(class)
     }
     fn rejected(&self, rejection: Rejection<ResourceClass>) {
         let detail = rejection_detail(rejection);
@@ -471,9 +383,7 @@ mod capture_tests {
         ));
     }
 }
-/// Outbound slots only origin metadata may use once a worker has at least two.
-/// A single-slot worker keeps no reserve so ordinary traffic still progresses.
-pub const METADATA_OUTBOUND_RESERVE: usize = 1;
+pub use racer_core::admission::METADATA_OUTBOUND_RESERVE;
 
 /// Compound socket role admission, retained through kernel completion.
 pub struct ConnectionReservation {
@@ -1050,5 +960,104 @@ mod tests {
         assert_eq!(admission.used(ResourceClass::RequestContext), 100);
         drop((first, third));
         assert_eq!(admission.used(ResourceClass::RequestContext), 0);
+    }
+}
+
+#[cfg(test)]
+mod rules_equivalence_tests {
+    use super::*;
+    use std::num::NonZeroUsize;
+
+    /// The policy as it read before the rules moved to racer-core, kept
+    /// verbatim so the delegation is checked against it.
+    fn legacy_limit(limits: &Limits, class: ResourceClass) -> usize {
+        match class {
+            ResourceClass::Plaintext => limits.plaintext_bytes.get(),
+            ResourceClass::Ciphertext => limits.ciphertext_bytes.get(),
+            ResourceClass::DirtyCiphertext => limits.dirty_bytes.get(),
+            ResourceClass::Registered => limits.registered_bytes.get(),
+            ResourceClass::RequestContext => limits.request_context_bytes.get(),
+            ResourceClass::Flight => limits.flights.get(),
+            ResourceClass::Waiter => limits
+                .flights
+                .get()
+                .saturating_mul(limits.waiters_per_flight.get()),
+            ResourceClass::Connection => limits.client_connections.get(),
+            ResourceClass::ControlConnection => (limits.client_connections.get() / 4).min(3),
+            ResourceClass::OutboundConnection => limits.client_connections.get() / 4,
+            ResourceClass::OrdinaryOutboundConnection => {
+                let outbound = legacy_limit(limits, ResourceClass::OutboundConnection);
+                outbound - usize::from(outbound >= 2) * METADATA_OUTBOUND_RESERVE
+            }
+            ResourceClass::IngressConnection => limits.client_connections.get().saturating_sub(
+                legacy_limit(limits, ResourceClass::ControlConnection)
+                    + legacy_limit(limits, ResourceClass::OutboundConnection),
+            ),
+            ResourceClass::Pipe => limits.pipes.get(),
+            ResourceClass::ControlProgress => limits.queue_entries.get(),
+            ResourceClass::Relay => limits.relay_transfers.get(),
+        }
+    }
+
+    fn legacy_floor(class: ResourceClass) -> usize {
+        match class {
+            ResourceClass::Plaintext => PAGE_BYTES as usize,
+            ResourceClass::Ciphertext => page_alloc::buffer_capacity(
+                PAGE_BYTES as usize + 16 + crate::store::MAX_HEADER_BYTES + 4096,
+            )
+            .expect("bounded page capacity"),
+            ResourceClass::DirtyCiphertext | ResourceClass::Registered => PAGE_BYTES as usize + 16,
+            _ => 1,
+        }
+    }
+
+    fn check(limits: Limits) {
+        let policy = AdmissionPolicy::new(limits.clone());
+        for class in ResourceClass::ALL {
+            assert_eq!(policy.limit(class), legacy_limit(&limits, class), "{class:?}");
+            assert_eq!(policy.floor(class), legacy_floor(class), "{class:?}");
+            assert_eq!(
+                AdmissionPolicy::wakes(class),
+                matches!(
+                    class,
+                    ResourceClass::Connection | ResourceClass::IngressConnection
+                )
+            );
+            assert_eq!(
+                AdmissionPolicy::allows_stopped(class),
+                matches!(class, ResourceClass::ControlProgress)
+            );
+            assert_eq!(
+                AdmissionPolicy::covers(class),
+                matches!(class, ResourceClass::Ciphertext)
+            );
+        }
+        assert_eq!(policy.max_keys(), limits.metadata_entries.get());
+    }
+
+    #[test]
+    fn moved_rules_match_legacy_policy() {
+        let config = crate::test_support::cluster::config(false);
+        check(config.limits.clone());
+        // Unset environment yields exactly the racer-core per-worker defaults.
+        let parsed = crate::config::Config::from_lookup(|_| Ok(None)).unwrap();
+        assert_eq!(parsed.limits, Limits::default());
+        check(parsed.limits.clone());
+        let mut scaled = parsed;
+        scaled.scale_limits(7).unwrap();
+        check(scaled.limits);
+        let one = NonZeroUsize::MIN;
+        for connections in [1, 2, 3, 4, 7, 8, 11, 12, 13, 16, 65_536] {
+            let mut limits = Limits::default();
+            limits.client_connections = NonZeroUsize::new(connections).unwrap();
+            check(limits);
+        }
+        let mut limits = Limits::default();
+        limits.flights = NonZeroUsize::MAX;
+        limits.waiters_per_flight = NonZeroUsize::MAX;
+        limits.metadata_entries = one;
+        limits.relay_transfers = one;
+        limits.queue_entries = one;
+        check(limits);
     }
 }
