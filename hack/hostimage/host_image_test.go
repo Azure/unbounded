@@ -33,28 +33,24 @@ func readRepoFile(t *testing.T, path string) string {
 	return string(data)
 }
 
-func TestHillsboroImageIsPinnedArm64Derivative(t *testing.T) {
+func TestHillsboroImageUsesPinnedARM64Producer(t *testing.T) {
 	containerfile := readRepoFile(t, imageDir+"/Containerfile")
 
 	for _, value := range []string{
-		"ghcr.io/azure/host-ubuntu2404-gb200-nvidia-580167@sha256:39f4fd5312307ee2ef7ec5e236e420faa5d08e663853800d86fb6a3e162181bb",
-		"FROM --platform=linux/arm64 ${BASE_IMAGE} AS source",
+		"ENV GB200_PROFILE=canonical-nvidia-580167",
 		`test "${TARGETARCH}" = arm64`,
-		"COPY --from=source /disk/disk.img.gz /input/disk.img.gz",
-		"python3 /usr/local/lib/unbounded-image/customize.py",
+		"COPY images/host-ubuntu2404-gb200/assets/",
+		"COPY images/host-ubuntu2404-gb200-hillsboro/assets/90-hillsboro-users.cfg",
 		"python3 /usr/local/lib/unbounded-image/verify_cloud_init_merge.py",
-		`ARG SSH_IMPORT_ID_VERSION=5.11-0ubuntu2.24.04.1`,
-		`ARG SSH_IMPORT_ID_SHA256=97bb2840a271ee0573da934ce1811f961e4b844fe876e34602b4661db25135b5`,
-		"sha256sum --check --strict",
-		"--ssh-import-id-package /ssh-import-id-package",
 		"COPY images/netboot/assets/vendor-data.tmpl",
-		"pigz -1 -n -c /work/disk.img > /disk/disk.img.gz",
+		"ROOT_EXTRA_MIB=7168",
 		"COPY --from=build /disk /disk",
 		`io.unbounded.host.qualification="blocked-bcho-has-no-github-ssh-keys"`,
 	} {
 		require.Contains(t, containerfile, value)
 	}
 	require.NotContains(t, containerfile, "images/host-ubuntu2404/Containerfile")
+	require.NotContains(t, containerfile, "customize.py")
 }
 
 func TestHillsboroAccessPolicyMatchesVerifiedTeamSnapshot(t *testing.T) {
@@ -93,30 +89,13 @@ func TestHillsboroAccessPolicyMatchesVerifiedTeamSnapshot(t *testing.T) {
 	}
 }
 
-func TestHillsboroCustomizerFailsClosedAndGeneralizes(t *testing.T) {
-	customizer := readRepoFile(t, imageDir+"/assets/customize.py")
+func TestGB200ProducerInstallsSSHImportIDBeforeCapture(t *testing.T) {
+	rootfs := readRepoFile(t, "images/host-ubuntu2404-gb200/assets/rootfs.sh")
+	verify := readRepoFile(t, "images/host-ubuntu2404-gb200/assets/verify.py")
 
-	for _, value := range []string{
-		`"/usr/bin/cloud-init"`,
-		`"/usr/bin/ssh-import-id"`,
-		"filesystem.install_tree(ssh_import_id_package)",
-		`filesystem.remove_tree("/var/lib/cloud")`,
-		`name.startswith("ssh_host_")`,
-		`"/etc/machine-id"`,
-		`"/var/lib/dbus/machine-id"`,
-		"captured password credential present",
-		"captured SSH credential present",
-		`"/etc/cloud/cloud.cfg.d/90-hillsboro-users.cfg"`,
-	} {
-		require.Contains(t, customizer, value)
-	}
-	for _, forbidden := range []string{
-		"/etc/sudoers.d/",
-		"/etc/systemd/system/cloud-final.service.d/",
-		"/usr/local/sbin/unbounded-hillsboro-access",
-	} {
-		require.NotContains(t, customizer, forbidden)
-	}
+	require.Contains(t, rootfs, `"ssh-import-id=${SSH_IMPORT_ID_VERSION}"`)
+	require.Contains(t, verify, `Path("/usr/bin/ssh-import-id").is_file()`)
+	require.Contains(t, verify, `"missing pinned ssh-import-id"`)
 }
 
 func TestHillsboroAssetsContainNoEmbeddedCredentials(t *testing.T) {

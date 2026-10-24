@@ -1,10 +1,9 @@
 # Hillsboro Ubuntu 24.04 GB200 Metalman host image
 
-This ARM64-only image is a Hillsboro access-policy derivative of the proven
-GB200 machine image. It copies the source disk by immutable OCI digest and
-changes only the installed root filesystem. The generic
-`images/host-ubuntu2404` image and the Azure Linux netboot installer remain
-unchanged.
+This ARM64-only image builds the proven GB200 NVIDIA 580.167.08 root filesystem
+directly, using the shared producer under `images/host-ubuntu2404-gb200`. The
+generic `images/host-ubuntu2404` image and the Azure Linux netboot installer
+remain unchanged.
 
 The build adds all members in the verified 2026-10-23
 `Azure/unbounded-dev` snapshot to `/etc/cloud/cloud.cfg.d` as native cloud-init
@@ -20,26 +19,28 @@ GitHub SSH key and the blocker is re-reviewed.
 
 ## Build
 
-The default base is the digest that successfully repaved the GB200 Ubuntu host
-on 2026-10-21. The build uses `debugfs` against an extracted ext4 partition; it
-does not use a privileged mount, contact GitHub APIs, publish an image, or
-touch a Machine:
+The selected NVIDIA profile matches the source revision used to build the
+digest that successfully repaved the GB200 Ubuntu host on 2026-10-21. The
+producer installs `ssh-import-id` with APT before disk capture, so the package
+and its dependencies are registered normally. It builds the GPT disk directly
+from the root filesystem without a privileged mount, contacting GitHub APIs,
+publishing an image, or touching a Machine:
 
 ```bash
 docker buildx build \
   --platform linux/arm64 \
+  --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" \
   --load \
   -t localhost/unbounded/host-ubuntu2404-gb200-hillsboro:test \
   -f images/host-ubuntu2404-gb200-hillsboro/Containerfile .
 ```
 
-The OCI artifact retains `/disk/disk.img.gz`. The build fails if the source
-disk lacks cloud-init or account-management tools; contains an `administrator`,
-`unbounded`, or `unbounded-metal` account; contains a password hash or captured
-user SSH credential; or cannot be generalized. The producer verifies and
-extracts the pinned Ubuntu `ssh-import-id` package into the disk before capture,
-then installs the native cloud-init user fragment. It clears cloud-init state
-and machine-id and removes SSH host keys before recompressing the disk.
+The OCI artifact retains `/disk/disk.img.gz`. Before capture, the producer
+verifies the pinned kernel, NVIDIA stack, MANA drivers, EFI binaries,
+cloud-init, and `ssh-import-id`. It clears machine identity and SSH host keys.
+The root filesystem is assembled into a new disk, so it cannot inherit
+captured user accounts, password hashes, authorized keys, or host keys from an
+earlier machine.
 
 MetalMan vendor-data intentionally does not define `users`; otherwise its
 higher-priority list would replace the image fragment. The image build runs

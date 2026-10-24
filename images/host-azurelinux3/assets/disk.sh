@@ -7,6 +7,7 @@
 #
 # Environment:
 #   TARGETARCH  amd64 or arm64
+#   ROOT_EXTRA_MIB  additional free space (default: 512)
 set -eu
 
 : "${TARGETARCH:?TARGETARCH is required}"
@@ -41,13 +42,19 @@ UUID=$ROOT_UUID / ext4 defaults 0 1
 UUID=$ESP_UUID /boot/efi vfat umask=0077 0 2
 EOF
 
-# The ESP holds shim and GRUB. The signed Azure Linux GRUB reads
-# /boot/grub2/grub.cfg from the partition it was loaded from.
+INITRD="/boot/initramfs-$KVER.img"
+if [ -f "$ROOT/boot/initrd.img-$KVER" ]; then
+  INITRD="/boot/initrd.img-$KVER"
+fi
+test -s "$ROOT$INITRD"
+
+# The ESP holds shim and GRUB. Azure Linux and Ubuntu use different
+# embedded GRUB prefixes; publish the configuration for each present loader.
 cat > "$WORK/grub.cfg" <<EOF
 set timeout=0
 search --no-floppy --fs-uuid --set=root $ROOT_UUID
 linux /boot/vmlinuz-$KVER root=UUID=$ROOT_UUID rw $CONSOLE
-initrd /boot/initramfs-$KVER.img
+initrd $INITRD
 boot
 EOF
 
@@ -59,13 +66,16 @@ mmd -i "$ESP_IMG" ::/EFI ::/boot ::/boot/grub2
 mcopy -s -i "$ESP_IMG" "$ROOT/boot/efi/EFI/"* ::/EFI/
 mcopy -i "$ESP_IMG" "$WORK/grub.cfg" ::/boot/grub2/grub.cfg
 mcopy -i "$ESP_IMG" "$WORK/grub.cfg" ::/EFI/BOOT/grub.cfg
+if [ -d "$ROOT/boot/efi/EFI/ubuntu" ]; then
+  mcopy -i "$ESP_IMG" "$WORK/grub.cfg" ::/EFI/ubuntu/grub.cfg
+fi
 # The ESP is mounted at /boot/efi, so keep the root copy empty.
 rm -rf "${ROOT:?}/boot/efi/"*
 
 # Size the root file system with room for first boot. cloud-init grows the
 # partition and file system to fill the disk.
 USED_MIB=$(du -sm "$ROOT" | cut -f1)
-ROOT_MIB=$((USED_MIB + USED_MIB * 3 / 10 + 512))
+ROOT_MIB=$((USED_MIB + USED_MIB * 3 / 10 + ${ROOT_EXTRA_MIB:-512}))
 ROOT_IMG="$WORK/root.img"
 truncate -s "${ROOT_MIB}M" "$ROOT_IMG"
 mkfs.ext4 -q -F -O ^orphan_file -U "$ROOT_UUID" -L root \
