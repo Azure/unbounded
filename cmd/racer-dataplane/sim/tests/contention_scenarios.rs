@@ -248,11 +248,13 @@ fn reads_recover_after_partition_heals() {
 /// page reaches the origin at most once per owner, and admission invariants
 /// (per-worker quotas) hold.
 ///
-/// The old model asserted that every read succeeds. With the real logic, the
-/// flight table cap (`NodeConfig::flights`) rejects joins under this storm and
-/// the rejected walks end in `HopBudgetExhausted`, which is not recoverable
-/// (Known issue 5 in the design doc). The test pins that: failures happen only
-/// for that reason or admission `Overloaded` and every read has exactly one outcome.
+/// The old model asserted that every read succeeds. With the real logic,
+/// before round 3 the flight table cap (`NodeConfig::flights`) rejected joins
+/// under this storm and the rejected walks ended in `HopBudgetExhausted`
+/// (Known issue 5): 851 of 6,400 reads at 400 nodes and 7,122 of 32,000 at
+/// 2,000 nodes (seed 8). A local hop budget shortfall is now walk evidence and
+/// route searches queue (Known issue 10), so no read fails that way; only
+/// admission `Overloaded` may fail a read, at most 1 in 100.
 #[test]
 fn cold_start_completes_with_bounded_origin_traffic() {
     cold_start(400);
@@ -277,12 +279,13 @@ fn cold_start(nodes: u32) {
     assert_eq!(completed + failed, total, "{report}");
     // `Overloaded` is an admission rejection (quota full), the expected
     // shed under pressure.
+    assert_eq!(counter(&report, "error_hop_budget_exhausted"), 0, "{report}");
     assert_eq!(
         failed,
-        counter(&report, "error_hop_budget_exhausted") + counter(&report, "error_overloaded"),
-        "only Known issue 5 or admission may fail reads: {report}"
+        counter(&report, "error_overloaded"),
+        "only admission may fail reads: {report}"
     );
-    assert!(completed * 2 > total, "{report}");
+    assert!(failed * 100 <= total, "{report}");
     let max = report["origin_per_page"]["max_requests_per_page"]
         .as_u64()
         .unwrap();
