@@ -220,6 +220,20 @@ Verified against the code at the start of this work.
    (seed 1, 1 s, `request_rate` 2) 99,562 page reads fail this way while relays reject 1.25M
    transfers on the `Relay` quota (16 per worker).
 
+6. Origin requests per page are bounded by `REPLICAS` only within one membership version. When a
+   membership change moves a page's ranked owners, the new owners have no copy, and a reader that
+   walks the new owners ends in `End::Origin` at the new rank 0 (Known issue 4 applies per
+   version). Nodes still on the old version keep fetching from the old owners. In `full-churn` at
+   50,000 nodes (seed 1, 11 membership versions, `request_rate` 0.005) one page reached the origin
+   11 times and 20,035 of 45,938 pages more than once. No invariant is relaxed: `only_owner_hits_origin`
+   holds on each request's own version; this is the cost of ownership moves, reported for review.
+
+7. Crashed members stay in the membership (their Node and Pod objects remain, so `plan_pass` keeps
+   them), and peers keep routing through them until link backoff opens their circuits. Each failed
+   route makes the next probe charge 8 links (Known issue 5), so reads near a crashed member fail
+   with `HopBudgetExhausted`. In `full-failover` at 50,000 nodes (4 crashes, seed 1) 11,950 of about
+   283,000 page reads fail this way. Same root cause as issue 5; no invariant is relaxed.
+
 ## Simulator engine (racer-sim substrate)
 
 `cmd/racer-dataplane/sim` provides the substrate the extracted logic plugs into:
@@ -523,3 +537,114 @@ request rate (20 per node per second) and 4,096 objects make 5,000 nodes take ab
 simulated second, again mostly in route search. The 50,000 node storm (every node reads the same 16
 pages at once) is the largest: 588 s of route search, and the shared route memo (1.1 GiB) and
 per-node route caches (0.6 GiB) dominate memory.
+
+## Combined control and data plane
+
+Code: `cmd/racer-dataplane/sim/src/combined.rs`. `Combined` holds a `ControlSim` and a
+`NodeWorld` built with `NodeWorld::new_combined`. Pod `i` is data-plane node `i`.
+
+Coupling:
+
+- One timeline. Before the data plane pops an event at time `t`, every control event at or before
+  `t` runs (`ControlSim::advance_to`), control first on ties. The report's `trace_hash` mixes both
+  hashes; `data_trace_hash` is the data plane's alone.
+- `ControlSim::record_changes` makes the control side log what the data plane needs, drained after
+  each control step (`ControlSim::drain`): newly committed membership versions with their member
+  Pods (from the committed image's `publication.members`; the model names Node `i` with the UID
+  `{i:08x}-0000-...`), each client's applied membership version (0 when its process restarts),
+  and Pod crashes, restarts, and removals.
+- Membership: `Versions::external` has no version until the first commit. `Versions::commit` builds
+  the shared `topology::Membership` for each committed version once, with the previous version as
+  predecessor, cached by version number (numbers may skip). A node adopts exactly the version its
+  client applied (`Versions::apply`) and resolves it plus `retained_versions` older ones, so a
+  lagging or partitioned client gives real data-plane skew (`StaleMembership`,
+  `IncompatibleMembership`). Versions no live node can resolve are pruned (at most once per
+  simulated second) and forgotten in the shared memos.
+- A node whose client has applied nothing (not enrolled yet, or restarted) does not read and does
+  not accept peer links (`Versions::enrolled`). A Pod crash crashes the node (disk survives), a
+  restart restarts it, and a removed Pod stays down. Crashed members stay in the membership, as in
+  the control model.
+- The synthetic churn, batching, and per-node lag of standalone runs are not used. Standalone
+  scenarios are unchanged: with `Versions::new`, `enrolled` is always true and `get` returns the
+  same version as before, so their trace hashes do not change.
+
+Scenarios. Each uses the control plan of the named control scenario and a light Zipf read load
+(`objects` 4096, `zipf_s` 1.0, `request_rate` 0.02 per node per second by default):
+
+| scenario | control plan | default duration | data plane |
+| --- | --- | --- | --- |
+| `full-cold-start` | `enrollment-storm` | 400 s | every node reads object 0 within 1 s at 3/4 of the run |
+| `full-failover` | `failover` | 900 s | Zipf reads while the primary and seats crash and restart |
+| `full-churn` | `ctl-churn` | 1200 s | Zipf reads while the cluster grows from 1/16 in 8 waves, then 2 removals |
+| `full-lagging` | `lagging` | 900 s | Zipf reads while 10% of clients are partitioned, 5% slow, 1% removed |
+
+How to run:
+
+```sh
+make racer-sim ARGS='--scenario full-churn --nodes 200 --duration 300s'
+make racer-sim ARGS='--scenario full-lagging --nodes 50000 --config cfg.json --out lagging.json'
+```
+
+`--config` takes data-plane keys (for example `{"request_rate": 0.005}`) and a `"control"`
+object of control settings. Every data-plane and control invariant applies; the report's
+`invariants.hard_failures` is the sum of both, and `combined` carries the control invariants,
+control metrics, and the membership skew at the end. Tests: `combined::tests` (80 to 320 nodes,
+every scenario, replay).
+
+### Combined acceptance (50k)
+
+Release build, seed 1, 50,000 nodes, default durations, `--config '{"request_rate": 0.005}'`
+(250 reads per second cluster-wide; at 0.02 the placement ranking at 50,000 members would make each
+run several times longer). Runs went two at a time on a 48-core host, each on one thread. Peak RSS
+is `VmHWM`; histogram values are log-bucket upper bounds.
+
+| scenario | sim time | wall | peak RSS | accounted per node | events |
+| --- | --- | --- | --- | --- | --- |
+| full-cold-start | 400 s | 19:17 | 6.74 GiB | 77 KB | 16.3M |
+| full-failover | 900 s | 12:52 | 2.65 GiB | 24 KB | 3.1M |
+| full-churn | 1200 s | 21:12 | 2.54 GiB | 25 KB | 4.1M |
+| full-lagging | 900 s | 15:35 | 2.66 GiB | 24 KB | 3.3M |
+
+All four end with zero hard invariant failures and no relaxed invariant. Peak RSS is far below
+32 GiB; the cold-start storm is the largest (route memo and in-flight state, as in `storm`).
+
+| scenario | page reads ok / failed | failures by cause | origin requests per page (mean, max) | control |
+| --- | --- | --- | --- | --- |
+| full-cold-start | 123k / 762k | 510k hop budget, 249k deadline, 3.6k unavailable | 1.59, 3 | all enrolled at 282 s; 462k API 429s, 501 write 429s; client lag p50 129 s, p99 258 s (enrollment) |
+| full-failover | 268k / 15.6k | 12.0k hop budget, 3.7k unavailable | 1.38, 3 | 3 terms, 4 crashes, 3 restarts; all enrolled at 284 s |
+| full-churn | 329k / 5.0k | 3.8k incompatible membership, 1.0k hop budget, 0.2k unavailable | 1.64, 11 | 11 versions, 2,500 Pods removed; 454k write 429s; client lag p50 4.3 s, p99 24 s; 4.5k `StaleMembership` replies |
+| full-lagging | 254k / 21.4k | 12.1k hop budget, 5.6k incompatible membership, 3.7k unavailable | 1.37, 4 | 45k unreachable attempts, 50k write 429s; client lag p50 21 s, p99 258 s; 6.8k `StaleMembership` replies |
+
+Observations:
+
+- The cold-start storm (50,000 nodes times 16 pages in one second) fails most reads through Known
+  issue 5 and read deadlines, as the standalone `storm` does; origin load stays at most 3 per page.
+- Membership skew from lagging control clients shows up as `StaleMembership` replies and
+  `IncompatibleMembership` failures (Known issue 3). At the end of every run all live nodes are on
+  the latest committed version.
+- Ownership moves raise origin requests per page above `REPLICAS` (Known issue 6), and crashed
+  members cause hop budget failures (Known issue 7).
+- Host time goes to real placement ranking at 50,000 members (404 to 876 s per run, from the
+  report's `profile_wall_ms`), then route search (768 s in the cold-start storm).
+- About 34k reads per run are skipped while their nodes are not yet enrolled (73k in
+  `full-churn`, where Pods join late).
+
+### Remaining gaps
+
+- Hedges are evaluated (`hedge_eligible`) but not raced.
+- Retention observes a page at publish, not at client read time.
+- Searches and rankings finish inside one event; CPU is charged per poll.
+- The control client model assumes a client at the delta base holds its hash.
+- Data-plane faults (site partitions, slow nodes, origin errors) are not combined with the control
+  plans; `--config` `faults` still applies to the data plane.
+
+### Known issues, summary
+
+1. Long poll replies are bounded by 64 write slots per seat, so mass wakeups answer 429.
+2. `RouteBudget::forwarded` uses the search form of `visited`; only tests call it.
+3. A requester on a newer membership than its destination fails with `IncompatibleMembership`.
+4. A cold page can reach the origin once per owner (up to `REPLICAS`).
+5. Under overload or failed routes, page reads fail with `HopBudgetExhausted` instead of trying
+   other owners.
+6. Ownership moves on membership changes add origin requests beyond `REPLICAS` per page.
+7. Crashed members stay routable until link backoff; reads near them hit issue 5.
