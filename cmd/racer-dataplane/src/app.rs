@@ -2670,7 +2670,7 @@ impl WorkerApplication {
 
     /// The worker applied `snapshot` and it lists this node. A node not
     /// listed in its own membership cannot route a read; a new node is
-    /// listed only after it serves (Known issue 51 in
+    /// listed only after it serves (Known issue 14 in
     /// designs/racer-core-simulation.md), so it is not ready until then.
     fn membership_usable(&self, snapshot: Option<&Snapshot>) -> bool {
         snapshot.is_some_and(|s| {
@@ -2710,7 +2710,7 @@ impl WorkerApplication {
             self.start_listeners().await?;
             // Only now may managed control report this Pod: a primary
             // admits a new member once it reports, so peers never route to
-            // a member whose listener is not open (Known issue 51).
+            // a member whose listener is not open (Known issue 14).
             if let Some(control) = &self.control {
                 control.mark_serving();
             }

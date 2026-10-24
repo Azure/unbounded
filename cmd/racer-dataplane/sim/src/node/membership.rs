@@ -72,7 +72,7 @@ pub struct Versions {
     /// adoption follows the synthetic per-node lag.
     external: Option<Vec<u64>>,
     /// Combined mode: members of the latest version whose client has
-    /// applied nothing, so they refuse peer links (Known issue 51).
+    /// applied nothing, so they refuse peer links (Known issue 14).
     unready: u32,
 }
 

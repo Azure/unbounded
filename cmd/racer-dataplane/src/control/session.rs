@@ -501,7 +501,7 @@ impl Session {
 
     /// The peer listener is open: report the rails held back so far. A
     /// managed primary admits a new member only after this report (Known
-    /// issue 51 in designs/racer-core-simulation.md).
+    /// issue 14 in designs/racer-core-simulation.md).
     pub fn mark_serving(&self) {
         self.serving.set(true);
         let held = self.unreported.borrow_mut().take();
@@ -1493,7 +1493,7 @@ pub(super) mod tests {
         assert_eq!(*seen.lock().unwrap(), vec![(4, vec![]), (4, vec![rail])]);
     }
 
-    /// Known issue 51: nothing is reported before the peer listener is
+    /// Known issue 14: nothing is reported before the peer listener is
     /// open; then only the newest rails, once.
     #[test]
     fn managed_report_waits_until_serving() {

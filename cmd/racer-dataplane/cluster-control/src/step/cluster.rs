@@ -1084,7 +1084,7 @@ mod tests {
         assert_eq!(cp.record().unwrap().membership_version, mv + 2);
     }
 
-    /// Known issue 51: with reports only from serving dataplanes, a Pod
+    /// Known issue 14: with reports only from serving dataplanes, a Pod
     /// joins after it reports, joins are batched by the hold, and seats
     /// are sized for every eligible Pod meanwhile.
     #[test]

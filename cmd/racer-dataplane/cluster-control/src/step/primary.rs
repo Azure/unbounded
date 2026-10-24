@@ -433,7 +433,7 @@ mod tests {
         }
     }
 
-    /// Known issue 51: Pods that have not reported (not serving yet) wait,
+    /// Known issue 14: Pods that have not reported (not serving yet) wait,
     /// but still size the seats; reporting admits them.
     #[test]
     fn unreported_pods_wait_but_size_seats() {

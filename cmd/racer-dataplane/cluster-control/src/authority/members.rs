@@ -275,7 +275,7 @@ pub struct Result {
 /// A dataplane Pod accepts peer links only after it enrolled and applied a
 /// publication (`App::start` opens listeners last). A member listed before
 /// that is routable but refuses every link, so peers fail toward it and
-/// reads fail while it enrolls (Known issues 51 and 72 in
+/// reads fail while it enrolls (Known issues 14 and 17 in
 /// designs/racer-core-simulation.md).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Joins {
@@ -874,7 +874,7 @@ mod tests {
         p
     }
 
-    /// Known issue 51: a new Node joins only once its Pod reports, which
+    /// Known issue 14: a new Node joins only once its Pod reports, which
     /// the dataplane does after its peer listener is open.
     #[test]
     fn new_nodes_join_once_serving() {

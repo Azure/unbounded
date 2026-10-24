@@ -2365,7 +2365,7 @@ Simulator model:
 Release build, seed 1, `--config '{"request_rate": 0.005}'`. "Off" is the same binary with
 `"control": {"report_at_start": true}`. `full-cold-start` runs here move the 1 s storm past the
 end (`storms` with `at_ns` 1e14) to measure background reads during enrollment; with the storm,
-50k `full-cold-start` fails 697k reads in the storm window (Known issue 71, capacity track, whose
+50k `full-cold-start` fails 697k reads in the storm window (Known issue 16, capacity track, whose
 simulator fix is not on this branch). No run had a hard invariant failure.
 
 | Scenario | Nodes | Model | Reads ok / failed | Failed while unready | Unready-member links (all links) | Not-ready skips | Stale skips | Origin requests (max) | Versions | Seat replies | Wall |

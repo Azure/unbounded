@@ -1027,7 +1027,7 @@ impl NodeWorld {
         // Not listed in the membership it holds: production `/readyz` is
         // false (`WorkerApplication::membership_usable`) and a read could
         // not route. A new node is listed only after it serves (Known
-        // issue 51), a little after it applied its first membership.
+        // issue 14), a little after it applied its first membership.
         if position(&self.versions.adopted(node, now).members, node).is_none() {
             self.metrics.incr("reads_skipped_not_member");
             return;
@@ -1402,7 +1402,7 @@ impl NodeWorld {
                                 self.metrics.incr("reads_failed_while_crashed");
                             }
                             if self.versions.unready_members() > 0 {
-                                // Known issue 72: reads failing while some
+                                // Known issue 17: reads failing while some
                                 // member cannot serve yet.
                                 self.metrics.incr("reads_failed_while_members_unready");
                             }

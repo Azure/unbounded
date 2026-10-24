@@ -191,7 +191,7 @@ impl WorkerApplication {
         }
         let publication = match self.native_publication() {
             // Not a member yet: a new node joins only after it serves
-            // (Known issue 51). Activate once a publication lists it.
+            // (Known issue 14). Activate once a publication lists it.
             Err(Error::IncompatibleMembership) => return Ok(()),
             result => result?,
         };
@@ -1240,7 +1240,7 @@ mod tests {
             })
             .unwrap();
         // Not a member yet (a new node joins only once it serves, Known
-        // issue 51): startup continues without native rails, and local
+        // issue 14): startup continues without native rails, and local
         // configuration does not stand in for the missing membership.
         assert_eq!(
             futures::executor::block_on(
@@ -1262,7 +1262,7 @@ mod tests {
     }
 
     /// Readiness needs this node in its own membership: a new node is
-    /// listed only after it serves (Known issue 51).
+    /// listed only after it serves (Known issue 14).
     #[test]
     fn membership_is_usable_only_when_it_lists_the_node() {
         let app = configured();

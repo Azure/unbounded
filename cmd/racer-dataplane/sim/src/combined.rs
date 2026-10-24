@@ -543,7 +543,7 @@ mod tests {
         );
     }
 
-    /// Known issues 51 and 72: members join only once they serve, so no
+    /// Known issues 14 and 17: members join only once they serve, so no
     /// peer link fails toward a member that has not applied a membership,
     /// and no read fails while one is listed. With the pre-round-4
     /// reporting (`report_at_start`) both happen.
