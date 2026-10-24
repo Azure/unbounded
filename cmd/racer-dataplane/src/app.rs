@@ -2658,9 +2658,7 @@ impl WorkerApplication {
                 listeners_usable: self.started
                     && (self.control.is_none()
                         || self.peer_task.is_some() && self.diagnostic_task.is_some()),
-                membership_usable: snapshot
-                    .as_ref()
-                    .is_some_and(|s| self.snapshot_sequence == Some(s.sequence)),
+                membership_usable: self.membership_usable(snapshot.as_deref()),
                 admission_usable: !self.runtime.admission.is_stopped() && !self.stopping,
                 credentials_valid_until: credentials,
                 observed_until: Some(now + Duration::from_secs(2)),
@@ -2668,6 +2666,17 @@ impl WorkerApplication {
             node.count,
             self.snapshot_sequence,
         )
+    }
+
+    /// The worker applied `snapshot` and it lists this node. A node not
+    /// listed in its own membership cannot route a read; a new node is
+    /// listed only after it serves (Known issue 51 in
+    /// designs/racer-core-simulation.md), so it is not ready until then.
+    fn membership_usable(&self, snapshot: Option<&Snapshot>) -> bool {
+        snapshot.is_some_and(|s| {
+            self.snapshot_sequence == Some(s.sequence)
+                && s.membership.position(self.keys.node()).is_ok()
+        })
     }
 
     /// Recover storage and accept initial control state before opening listeners.

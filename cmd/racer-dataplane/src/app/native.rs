@@ -1261,6 +1261,35 @@ mod tests {
         assert_eq!(worker.runtime.admission.used(ResourceClass::Registered), 0);
     }
 
+    /// Readiness needs this node in its own membership: a new node is
+    /// listed only after it serves (Known issue 51).
+    #[test]
+    fn membership_is_usable_only_when_it_lists_the_node() {
+        let app = configured();
+        let (mut worker, _engine) = worker(&app, true, true);
+        let listed = worker.snapshots.current().unwrap();
+        worker.snapshot_sequence = Some(listed.sequence);
+        assert!(worker.membership_usable(Some(&listed)));
+        assert!(!worker.membership_usable(None));
+        worker
+            .snapshots
+            .apply(Publication {
+                schema_version: 1,
+                cluster: app.config.cluster.clone(),
+                sequence: PublicationSequence(2),
+                membership_version: MembershipVersion(2),
+                members: vec![],
+                caches: vec![],
+            })
+            .unwrap();
+        let unlisted = worker.snapshots.current().unwrap();
+        worker.snapshot_sequence = Some(unlisted.sequence);
+        assert!(!worker.membership_usable(Some(&unlisted)));
+        // A snapshot this worker has not applied is not usable either.
+        worker.snapshot_sequence = Some(unlisted.sequence);
+        assert!(!worker.membership_usable(Some(&listed)));
+    }
+
     /// A node admitted after it started activates its rails from the
     /// publication that first lists it.
     #[test]
