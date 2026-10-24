@@ -1266,3 +1266,41 @@ What remains (issue 6 stays open, and new issue 13):
 13. Repeat origin fetches across membership versions have a heavier tail with handoff
     probes than without in `full-churn` at 50,000 nodes (max 13 vs 10), though fewer pages are fetched
     more than once. Root cause not established; see "Round 3: origin". No invariant is relaxed.
+
+## Round 3: combined
+
+The ctl, route, and origin tracks were merged in that order. The route track's stale-destination
+skip and the origin track's handoff probes meet in one place: a `StaleMembership` answer from a
+handoff target (a previous-membership owner) is only a miss. Callers check
+`CandidateWalk::pending_handoff` before `stale_action`, so such an answer never refreshes
+membership, never adopts a version in the simulator, and never counts as a stale-destination skip.
+`Outcome::StaleDestination` from a handoff target is also only a miss
+(`pending_handoff_marks_handoff_probes_and_stale_destination_is_a_miss`). The 400-node cold start
+test (`cold_start_completes_with_bounded_origin_traffic`, seed 8) now also accepts a recoverable
+`Unavailable` after the client's retries (1 of 6,400 reads with both tracks); hop budget failures
+stay at zero, and failures stay at or below 1 in 100.
+
+Known issue 12 is not changed by the handoff probes. At 5,000 nodes, `churn` with the route
+settings still has a maximum of 4 origin requests per page. An owner whose predecessor is behind
+usually has the same owner set under the previous version, so `handoff_targets` is empty and there
+is no one to ask before origin.
+
+Evidence, release build, seed 1, 5,000 nodes. The "-r" rows use the route track settings (`--duration
+1s`, `{"objects": 256, "request_rate": 2.0}`). The other rows use scenario defaults, and `full-*` use
+`{"request_rate": 0.005}`. There were no hop budget failures, no write 429s (`client_429s`), and no
+hard invariant failures in any run. Four runs ran in parallel.
+
+| Scenario | Reads ok / failed | Origin total, max, dup | Track "after" | Wall | Peak RSS |
+| --- | --- | --- | --- | --- | --- |
+| storm-r | 36,724 / 0 | 2,478, 2, 136 | route 35,409 / 0 | 0:27 | 0.56 GiB |
+| churn-r | 13,811 / 113 unavailable | 2,835, 4, 256 | route 13,763 / 114 | 0:12 | 0.16 GiB |
+| storm | 171,391 / 0 | 1,196, 2, 172 | origin 1,196, 2, 172 | 1:04 | 1.22 GiB |
+| churn | 167,231 / 1,479 (1,478 unavailable, 1 overloaded) | 1,220, 3, 191 | origin 1,196, 3, 171 | 1:07 | 0.94 GiB |
+| zipf | 147,684 / 11 unavailable | 42,755, 3, 3,935 | origin 42,607, 3, 3,907 | 1:54 | 1.42 GiB |
+| full-cold-start | 94,805 / 99 unavailable | 7,014, 3, 203 | route 94,798 / 103 | 0:34 | 0.63 GiB |
+| full-failover | 33,924 / 122 unavailable | 13,421, 7, 722 | route 33,934 / 116 | 0:29 | 0.31 GiB |
+| full-churn | 34,196 / 76 unavailable | 14,784, 9, 1,699 | origin 14,926, 10, 1,785 | 0:43 | 0.28 GiB |
+
+`full-churn` queued 30,485 long poll replies for write slots and answered none with 429, which
+matches the ctl track's `ctl-churn` count. The combined numbers stay within a few percent of each
+track's own results.
