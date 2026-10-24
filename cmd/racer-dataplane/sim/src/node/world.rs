@@ -3266,6 +3266,16 @@ impl NodeWorld {
         if version < self.versions.latest_number() {
             self.metrics.incr("origin_on_older_membership");
         }
+        let instant = self.instant(now);
+        let fill = self.fills.get_mut(&id).expect("present");
+        // Production debits one attempt before origin
+        // (`src/read/fill.rs`, `budget.begin_attempt` after
+        // `authority.validate`); an owner without one fails the fill.
+        let scope = fill.scope;
+        if let Err(e) = fill.budget.begin_attempt(instant, scope) {
+            self.metrics.incr("origin_unfunded");
+            return self.fail_walk(id, e);
+        }
         let fill = self.fills.get_mut(&id).expect("present");
         fill.plan.walk(WalkResult::Origin { evidence });
         self.issue_origin(id);
