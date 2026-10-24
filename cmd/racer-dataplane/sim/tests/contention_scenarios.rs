@@ -354,10 +354,14 @@ fn seed_matrix_replays_identical_reports() {
 /// useful throughput collapsed far below the NIC bound. Now a body stops at
 /// the requester's attempt deadline, so no reply arrives late and the owners
 /// deliver at least half of what their NICs allow during the storm.
+///
+/// Runs with overflow fan-out off, so only the owners serve the page; see
+/// `hot_page_readers_fan_out_through_helpers` for the same storm with it on.
 #[test]
 fn overloaded_hot_page_owners_do_not_stream_to_abandoned_requesters() {
     let nodes = 96;
     let mut config = quiet(nodes);
+    config.node.fanout = false;
     config.pages_per_object = 1;
     config.nic_bps = 4 << 20;
     config.duration_ns = 40 * SECONDS;
@@ -380,5 +384,40 @@ fn overloaded_hot_page_owners_do_not_stream_to_abandoned_requesters() {
     assert!(
         peer * 2 >= bound,
         "owners delivered {peer} pages, under half of the NIC bound {bound}: {report}"
+    );
+}
+
+/// Known issue 71 (round 4 fanout). The storm above, with overflow fan-out
+/// on: owners already streaming `HOT_PAGE_BODIES` bodies of the page shed
+/// further readers with `Overloaded`, and a shed reader asks one of the page's
+/// helpers, which the owners always serve. Every read completes, readers get
+/// copies from helpers, no reply arrives late, and the page still reaches the
+/// origin once. With fan-out off the same storm fails reads (the owner bound
+/// of Known issue 11).
+#[test]
+fn hot_page_readers_fan_out_through_helpers() {
+    let nodes = 96;
+    let mut config = quiet(nodes);
+    config.pages_per_object = 1;
+    config.nic_bps = 4 << 20;
+    config.duration_ns = 40 * SECONDS;
+    config.storms = vec![storm(0, 0, 1, 1), storm(5 * SECONDS, 0, nodes, MILLIS)];
+    let on = run(config.clone(), 5);
+    config.node.fanout = false;
+    let off = run(config, 5);
+    let reads = u64::from(nodes) + 1;
+    assert_eq!(counter(&on, "reads_completed"), reads, "{on}");
+    assert_eq!(counter(&on, "reads_failed"), 0, "{on}");
+    assert!(counter(&on, "hot_page_sheds") > 0, "{on}");
+    assert!(counter(&on, "helper_copies") > 0, "{on}");
+    assert_eq!(counter(&on, "late_replies"), 0, "{on}");
+    assert_eq!(counter(&on, "origin_requests"), 1, "{on}");
+    assert!(counter(&off, "reads_failed") > 0, "{off}");
+    assert_eq!(counter(&off, "helper_probes"), 0, "{off}");
+    assert!(
+        max_ns(&on, "read_ns") < max_ns(&off, "read_ns"),
+        "fan-out must shorten the slowest read: {} vs {}",
+        max_ns(&on, "read_ns"),
+        max_ns(&off, "read_ns")
     );
 }

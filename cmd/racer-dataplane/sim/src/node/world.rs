@@ -41,6 +41,7 @@ use racer_core::read::candidates::{
     AuthorityFacts, OperationKind, ProbeOutcome, ReplicaSelection, ResponseKind, VisitOrder,
     classify, replica_score, validate_origin_authority, visit_order,
 };
+use racer_core::read::fanout::{HOT_PAGE_BODIES, fanout_helper, is_helper, shed_hot_page};
 use racer_core::read::fill::{FailureKind, FillPlan, FillStep, Source, WalkResult};
 use racer_core::read::flight::{Event as FlightEvent, Joined};
 use racer_core::read::policy::{
@@ -291,8 +292,9 @@ struct Fill {
     scope: Instant,
     walk: Walking,
     cands: Vec<u32>,
-    /// Previous-membership owners to ask before origin; probe canonical
-    /// `cands.len() + i` addresses `handoff[i]`.
+    /// Previous-membership owners to ask before origin (owners), or the
+    /// page's overflow helper (non-owners); probe canonical `cands.len() + i`
+    /// addresses `handoff[i]`.
     handoff: Vec<u32>,
     /// This owner is a member of membership version - 1, which is still
     /// retained and was replaced within `PREVIOUS_MEMBERSHIP_WITHIN`.
@@ -487,6 +489,9 @@ pub struct NodeWorld {
     writes: HashMap<u64, SimCharge, Fixed>,
     /// Relay reservations of replies still streaming (see `Event::Release`).
     held: HashMap<u64, Vec<SimCharge>, Fixed>,
+    /// End times of page bodies each (node, page) is still streaming
+    /// (production: page responses being written, `send_http_response`).
+    streaming: HashMap<(u32, u64), Vec<Nanos>, Fixed>,
     origin_per_page: HashMap<u64, u32, Fixed>,
     /// Per page: the node that last asked origin for it and the page's rank 0
     /// under that request's membership (see [`Self::classify_repeat`]).
@@ -596,6 +601,7 @@ impl NodeWorld {
             ranges: HashMap::default(),
             writes: HashMap::default(),
             held: HashMap::default(),
+            streaming: HashMap::default(),
             origin_per_page: HashMap::default(),
             last_origin: HashMap::default(),
             tasks: HashMap::default(),
@@ -1643,11 +1649,28 @@ impl NodeWorld {
                 |r| replica_score(requester, &object, number, self.ids.node(cands[r])),
             )
         };
+        // A non-owner may ask the page's overflow helper when an owner sheds
+        // it (production `CandidatePolicy::fanout_helper`, Known issue 71).
+        let helper = (rank.is_none() && self.config.node.fanout)
+            .then(|| {
+                let requester = self.ids.node(node);
+                let at = |p: usize| members.members()[p].node;
+                fanout_helper(
+                    &self.ids.object(page),
+                    self.ids.number(page),
+                    requester,
+                    members.members().len(),
+                    |p| at(p) == node || cands.contains(&at(p)),
+                )
+                .map(at)
+            })
+            .flatten();
         let fill = self.fills.get_mut(&id).expect("present");
         fill.cands = cands;
         fill.handoff.clear();
         fill.previous_member = false;
         fill.previous = 0;
+        fill.handoff.extend(helper);
         fill.version = version;
         fill.rank = rank;
         fill.order = order;
@@ -1721,6 +1744,7 @@ impl NodeWorld {
             continuation,
             handoff: fill.handoff.len(),
             previous: fill.previous,
+            helper: fill.rank.is_none() && !fill.handoff.is_empty(),
         }));
         self.step_walk(id);
     }
@@ -2154,7 +2178,11 @@ impl NodeWorld {
         let fill = self.fills.get_mut(&id).expect("present");
         let dest = match probe.canonical.checked_sub(fill.cands.len()) {
             Some(i) => {
-                self.metrics.incr("handoff_probes");
+                self.metrics.incr(if fill.rank.is_none() {
+                    "helper_probes"
+                } else {
+                    "handoff_probes"
+                });
                 fill.handoff[i]
             }
             None => fill.cands[probe.canonical],
@@ -2559,10 +2587,61 @@ impl NodeWorld {
         }
     }
 
+    /// Production hot-page shed (`racer_core::read::fanout::shed_hot_page`):
+    /// an owner already streaming `HOT_PAGE_BODIES` bodies of `page` answers
+    /// `Overloaded` to a requester that is neither an owner nor a helper of
+    /// the page.
+    fn shed_hot(&mut self, dest: u32, requester: u32, page: u64) -> bool {
+        let now = self.now();
+        let streaming = match self.streaming.get_mut(&(dest, page)) {
+            Some(ends) => {
+                ends.retain(|end| *end > now);
+                let n = ends.len();
+                if n == 0 {
+                    self.streaming.remove(&(dest, page));
+                }
+                n
+            }
+            None => 0,
+        };
+        if streaming < HOT_PAGE_BODIES || !self.config.node.fanout {
+            return false;
+        }
+        let w = self.ids.worker(page);
+        if !self.owned(dest, w, page) {
+            return false;
+        }
+        let version = self.nodes[dest as usize].version;
+        let Some(members) = self.versions.get(version).map(|v| v.members.clone()) else {
+            return false;
+        };
+        let exempt = match position(&members, requester) {
+            None => false,
+            Some(p) => {
+                is_helper(
+                    &self.ids.object(page),
+                    self.ids.number(page),
+                    p,
+                    members.members().len(),
+                ) || self.nodes[dest as usize].workers[w as usize]
+                    .placement
+                    .is_owner(&*members, &page.to_be_bytes(), |o| o == p)
+            }
+        };
+        shed_hot_page(true, streaming, exempt)
+    }
+
     fn serve(&mut self, mid: u64) {
         let now = self.now();
         let m = self.msgs.get(&mid).expect("message");
-        let (dest, page) = (m.dest, m.page);
+        let (dest, page, requester) = (m.dest, m.page, m.requester);
+        if self.shed_hot(dest, requester, page) {
+            self.metrics.incr("hot_page_sheds");
+            let reply = peer_error(Error::Overloaded).map_or(Reply::Transport, Reply::Response);
+            self.send_reply(mid, dest, reply, now);
+            return;
+        }
+        let m = self.msgs.get(&mid).expect("message");
         let action = serve_action(ServeFacts {
             operation: OperationKind::Page,
             copy_only: !m.acquire,
@@ -2670,6 +2749,9 @@ impl NodeWorld {
                 self.metrics.incr("replies_abandoned");
                 return;
             };
+            if done > now {
+                self.streaming.entry((from, m.page)).or_default().push(done);
+            }
             self.metrics.add("peer_bytes", bytes * links);
             self.metrics.observe("hops", links);
             done
@@ -2750,6 +2832,14 @@ impl NodeWorld {
                 })
             }
         };
+        if probe.hedge.is_none()
+            && matches!(outcome, Ok(Outcome::Copy))
+            && self.fills.get(&probe.fill).is_some_and(
+                |f| matches!(&f.walk, Walking::Candidates(walk) if walk.pending_helper()),
+            )
+        {
+            self.metrics.incr("helper_copies");
+        }
         match probe.hedge {
             None => self.complete_probe(probe.fill, outcome),
             Some(primary) => {
@@ -3308,6 +3398,7 @@ impl NodeWorld {
                 + self.probes.len() * 32
                 + self.ranges.len() * 96
                 + self.writes.len() * 96
+                + self.streaming.len() * 64
                 + self.tasks.len() * (std::mem::size_of::<Task>() + 256),
         ));
         list.push(("origin_per_page", self.origin_per_page.capacity() * 16));

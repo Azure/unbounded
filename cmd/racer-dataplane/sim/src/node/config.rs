@@ -64,6 +64,9 @@ pub struct NodeConfig {
     /// Speculative bytes per node (production `page_hedge_bytes`, default
     /// one `DUPLICATE_BYTES`).
     pub hedge_bytes: u64,
+    /// Overflow fan-out to page helpers (production: always on; set 0 to
+    /// measure without it, Known issue 71).
+    pub fanout: bool,
 }
 
 impl Default for NodeConfig {
@@ -92,6 +95,7 @@ impl Default for NodeConfig {
             hedge_slots: 0,
             hedge_delay_ns: 100 * MILLIS,
             hedge_bytes: DUPLICATE_BYTES,
+            fanout: true,
         }
     }
 }
@@ -130,6 +134,7 @@ impl NodeConfig {
                 "hedge_slots" => self.hedge_slots = small()?,
                 "hedge_delay_ns" => self.hedge_delay_ns = n,
                 "hedge_bytes" => self.hedge_bytes = n,
+                "fanout" if n <= 1 => self.fanout = n == 1,
                 _ => return Err(format!("unknown key node.{key}")),
             }
         }

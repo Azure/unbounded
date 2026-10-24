@@ -224,13 +224,15 @@ pub fn data_schedules(scenario: &str, config: &mut Config) {
 
 /// Arrival window of the `full-cold-start` storm: at least one second, and
 /// long enough that the storm offers at most half of what the object's owners
-/// can send. Every reader wants every page of object 0, and only a page's
-/// `REPLICAS` owners serve it (non-owners are never candidates), so a page's
-/// peer throughput is `REPLICAS * nic_bps` (Known issue 11). With 16 pages on
+/// can send. Every reader wants every page of object 0; without overflow
+/// fan-out only a page's `REPLICAS` owners serve it, so a page's peer
+/// throughput is `REPLICAS * nic_bps` (Known issue 11). With 16 pages on
 /// distinct owners the storm needs `nodes * page_bytes / (REPLICAS *
 /// nic_bps)` seconds of owner egress: about 14 s at 50,000 nodes and 10 Gbit/s.
-/// A one-second window there is 14 times over that bound and measures only
-/// overload (pass `storms` in `--config` to run it).
+/// Overflow fan-out (Known issue 71) lets page helpers serve readers too, so
+/// the one-second storm no longer overloads the system; it stays available
+/// through `storms` in `--config`, and this window keeps the default run
+/// comparable with earlier rounds.
 pub fn cold_start_window_ns(config: &Config) -> Nanos {
     let replicas = topology::REPLICAS as u128;
     let egress = u128::from(config.nodes) * u128::from(config.page_bytes) * u128::from(SECONDS)
