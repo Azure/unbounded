@@ -66,7 +66,18 @@ pub struct PassInputs<'a> {
     pub writer: &'a Writer,
     /// Wall clock, Unix seconds.
     pub wall_unix: u64,
+    /// Wall time (Unix seconds) at which this primary last committed a new
+    /// membership version, if it has. New members join at most once per
+    /// [`JOIN_HOLD_SECS`] after that.
+    pub membership_changed_unix: Option<u64>,
 }
+
+/// Join hold-down: after a membership version change, new members wait
+/// this long before the next version admits them, so a storm of joining
+/// Pods costs at most one membership version per hold instead of one per
+/// debounced pass. Passes run at least every `LEASE_RENEW` (10 s), so a
+/// held join lands within one hold plus one pass. Removals are not held.
+pub const JOIN_HOLD_SECS: u64 = 10;
 
 /// Output of one pass.
 pub struct PassPlan {
@@ -128,6 +139,12 @@ pub fn plan_pass(i: &PassInputs<'_>, rng: &mut dyn Entropy) -> Result<PassPlan, 
             .push(p.clone());
     }
     let nodes: Vec<NodeInfo> = inv.nodes.values().cloned().collect();
+    let joins = members::Joins {
+        require_report: true,
+        hold: !history.is_empty()
+            && i.membership_changed_unix
+                .is_some_and(|t| i.wall_unix < t.saturating_add(JOIN_HOLD_SECS)),
+    };
     let members = members::reconcile_at(
         &nodes,
         &by_node,
@@ -135,6 +152,7 @@ pub fn plan_pass(i: &PassInputs<'_>, rng: &mut dyn Entropy) -> Result<PassPlan, 
         i.peer_port,
         &history,
         Some(i.wall_unix),
+        joins,
     )
     .map_err(|_| StateError::TooLarge);
     let eligible = members::eligible_nodes(&pods, i.ownership);
@@ -170,7 +188,8 @@ pub fn plan_pass(i: &PassInputs<'_>, rng: &mut dyn Entropy) -> Result<PassPlan, 
                 catalog.clone(),
             )
             .map_err(|_| StateError::TooLarge)?;
-            (m.members.len(), Some(p))
+            // Held joiners count: seats must not shrink while they wait.
+            (m.members.len() + m.pending, Some(p))
         }
         _ => (
             i.previous_image
@@ -345,6 +364,7 @@ mod tests {
                 "metadata": {
                     "name": format!("p{i}"), "namespace": "racer-system",
                     "uid": format!("{i:08x}-1111-4000-8000-000000000000"),
+                    "annotations": {"racer.unbounded-cloud.io/report": "{\"shares\":1,\"rdma_nics\":[]}"},
                     "ownerReferences": [{"apiVersion": "apps/v1", "kind": "DaemonSet", "name": "racer-dataplane", "uid": "ds-uid", "controller": true}]
                 },
                 "spec": {"nodeName": format!("n{i}"), "serviceAccountName": "racer-dataplane"},
@@ -387,7 +407,117 @@ mod tests {
             live,
             writer: w,
             wall_unix: 1_800_000_000,
+            membership_changed_unix: None,
         }
+    }
+
+    /// Known issue 51: Pods that have not reported (not serving yet) wait,
+    /// but still size the seats; reporting admits them.
+    #[test]
+    fn unreported_pods_wait_but_size_seats() {
+        let mut inv = inventory(40);
+        for p in inv.pods.values_mut() {
+            p.annotations.clear();
+        }
+        let own = ownership();
+        let policy = Policy::from(crate::Rotation::default());
+        let live = BTreeMap::new();
+        let w = writer();
+        let p = plan_pass(
+            &inputs(&inv, &own, &policy, &live, &w, None, None),
+            &mut Seeded::new(1),
+        )
+        .unwrap();
+        let image = p.image.expect("image");
+        // Bootstrap: an empty membership is published.
+        assert!(image.publication.members.is_empty());
+        let all = plan_pass(
+            &inputs(&inventory(40), &own, &policy, &live, &w, None, None),
+            &mut Seeded::new(1),
+        )
+        .unwrap();
+        assert_eq!(p.desired, all.desired);
+        // One Pod reports: it joins at once (empty history, no hold).
+        let committed = p.next;
+        let pod = inv.pods.get_mut("0").unwrap();
+        pod.annotations.insert(
+            annotations::REPORT.into(),
+            r#"{"shares":1,"rdma_nics":[]}"#.into(),
+        );
+        let p2 = plan_pass(
+            &inputs(
+                &inv,
+                &own,
+                &policy,
+                &live,
+                &w,
+                Some(&committed),
+                Some(&image),
+            ),
+            &mut Seeded::new(2),
+        )
+        .unwrap();
+        assert_eq!(p2.image.unwrap().publication.members.len(), 1);
+        assert_eq!(p2.desired, all.desired);
+    }
+
+    /// New members are batched: within the hold after a membership change
+    /// they wait; afterwards they join.
+    #[test]
+    fn join_hold_batches_new_members() {
+        let own = ownership();
+        let policy = Policy::from(crate::Rotation::default());
+        let live = BTreeMap::new();
+        let w = writer();
+        let inv = inventory(4);
+        let first = plan_pass(
+            &inputs(&inv, &own, &policy, &live, &w, None, None),
+            &mut Seeded::new(1),
+        )
+        .unwrap();
+        let (committed, image) = (first.next, first.image.unwrap());
+        let more = inventory(6);
+        let at = |changed: Option<u64>| {
+            let mut i = inputs(
+                &more,
+                &own,
+                &policy,
+                &live,
+                &w,
+                Some(&committed),
+                Some(&image),
+            );
+            i.membership_changed_unix = changed;
+            plan_pass(&i, &mut Seeded::new(2)).unwrap()
+        };
+        let now = 1_800_000_000;
+        let held = at(Some(now - JOIN_HOLD_SECS + 1));
+        assert!(!held.changed, "joins wait inside the hold");
+        let held_image = held.image.unwrap();
+        assert_eq!(held_image.publication.members.len(), 4);
+        assert_eq!(
+            held_image.record.membership_version,
+            committed.membership_version
+        );
+        let open = at(Some(now - JOIN_HOLD_SECS));
+        assert!(open.changed);
+        assert_eq!(open.image.unwrap().publication.members.len(), 6);
+        // A new primary (no change recorded) does not hold.
+        assert_eq!(at(None).image.unwrap().publication.members.len(), 6);
+        // Removals are never held.
+        let fewer = inventory(3);
+        let mut i = inputs(
+            &fewer,
+            &own,
+            &policy,
+            &live,
+            &w,
+            Some(&committed),
+            Some(&image),
+        );
+        i.membership_changed_unix = Some(now);
+        let p = plan_pass(&i, &mut Seeded::new(3)).unwrap();
+        assert_eq!(p.image.unwrap().publication.members.len(), 3);
     }
 
     #[test]

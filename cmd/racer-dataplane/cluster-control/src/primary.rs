@@ -133,6 +133,9 @@ struct Term_ {
     /// After a commit: (committed sequence, replaced sequence, grace end).
     /// Seats still at the replaced sequence count as ready until then.
     ready_floor: Cell<Option<(u64, u64, Instant)>>,
+    /// Wall time (Unix seconds) this term last committed a new membership
+    /// version; drives the join hold-down (`step::primary::JOIN_HOLD_SECS`).
+    membership_changed: Cell<Option<u64>>,
 }
 
 /// How long after a commit seats still READY at the replaced sequence count
@@ -172,6 +175,7 @@ async fn lead(shared: &Rc<Shared>, seat: &Rc<Seat>, object: Value, started: Inst
         seat_observer: RefCell::new(Observer::default()),
         webhook_retired: RefCell::new(BTreeMap::new()),
         ready_floor: Cell::new(None),
+        membership_changed: Cell::new(None),
     });
     // Held for the whole term: shutdown waits until the loop exits and the
     // release PUT below completes, even if the seat is cleared first.
@@ -594,6 +598,7 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
                     live: &live,
                     writer: &writer,
                     wall_unix: unix_now(),
+                    membership_changed_unix: t.membership_changed.get(),
                 },
                 &mut **shared.rng.borrow_mut(),
             )?
@@ -647,6 +652,12 @@ async fn reconcile(t: &Rc<Term_>) -> Result<(), StateError> {
             .await
         {
             Ok(_) => {
+                if current
+                    .as_ref()
+                    .is_none_or(|c| c.membership_version != next.membership_version)
+                {
+                    t.membership_changed.set(Some(unix_now()));
+                }
                 // Seats learn the new record after this pass, so a seat
                 // still at the sequence this commit replaced keeps serving.
                 t.ready_floor.set(

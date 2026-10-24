@@ -36,6 +36,9 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+/// Report annotation value of a modeled Pod (default shares, no rails).
+const REPORT: &str = r#"{"shares":1,"rdma_nics":[]}"#;
+
 /// Primary reconcile debounce, as in `primary.rs`.
 const DEBOUNCE: Duration = Duration::from_secs(1);
 
@@ -54,6 +57,11 @@ pub struct Settings {
     /// by default). A crash here is the whole node: the kubelet stops
     /// heartbeating with it. `None` never marks crashed Nodes.
     pub node_monitor_grace: Option<Duration>,
+    /// Pods carry the report annotation from creation, as dataplanes from
+    /// before round 4 (join) did: they reported before enrollment. When
+    /// false, a Pod reports only through [`ControlPlane::report_serving`],
+    /// which the client model calls once the dataplane can serve peers.
+    pub report_at_start: bool,
 }
 
 impl Default for Settings {
@@ -65,6 +73,7 @@ impl Default for Settings {
             write_ns: 2_000_000,
             image_bytes_per_member: 128,
             node_monitor_grace: Some(Duration::from_secs(40)),
+            report_at_start: true,
         }
     }
 }
@@ -127,6 +136,9 @@ enum Ev {
     Reconcile(u32),
     /// The node lifecycle controller marks a crashed Pod's Node not ready.
     NodeNotReady(u32),
+    /// A watched Pod changed: one debounced primary pass, as `primary.rs`
+    /// runs after any inventory change. Does not reschedule.
+    Wake(u32),
 }
 
 /// The control plane of a simulated cluster.
@@ -150,6 +162,11 @@ pub struct ControlPlane {
     ownership: Ownership,
     policy: Policy,
     cluster: String,
+    /// Wall seconds of the last commit that changed the membership version
+    /// in the current term (the join hold-down input).
+    membership_changed: Option<u64>,
+    /// A [`Ev::Wake`] pass is queued.
+    wake_pending: bool,
     pub stats: Stats,
 }
 
@@ -174,7 +191,7 @@ impl ControlPlane {
         };
         let mut pods = Vec::with_capacity(settings.pods as usize);
         for i in 0..settings.pods {
-            Self::add_objects(&mut inventory, &ownership, i);
+            Self::add_objects(&mut inventory, &ownership, i, settings.report_at_start);
             pods.push(Pod {
                 alive: true,
                 epoch: 0,
@@ -215,6 +232,8 @@ impl ControlPlane {
             ownership,
             policy: Policy::from(crate::Rotation::default()),
             cluster: "c1c1c1c1-0000-4000-8000-000000000001".into(),
+            membership_changed: None,
+            wake_pending: false,
             stats: Stats::default(),
         };
         for i in 0..cp.settings.pods {
@@ -223,7 +242,7 @@ impl ControlPlane {
         cp
     }
 
-    fn add_objects(inv: &mut Inventory, own: &Ownership, i: u32) {
+    fn add_objects(inv: &mut Inventory, own: &Ownership, i: u32, report: bool) {
         let name = format!("n{i}");
         inv.nodes.insert(
             name.clone(),
@@ -249,9 +268,46 @@ impl ControlPlane {
                     name: own.daemonset.clone(),
                     uid: own.uid.clone(),
                 }),
+                annotations: if report {
+                    BTreeMap::from([(annotations::REPORT.to_owned(), REPORT.to_owned())])
+                } else {
+                    BTreeMap::new()
+                },
                 ..Default::default()
             },
         );
+    }
+
+    /// The dataplane on `pod` opened its peer listener and patched its
+    /// report annotation (one API write). The annotation outlives process
+    /// restarts, like the real one. The primary's Pod watch wakes a pass.
+    /// Returns whether the annotation was new.
+    pub fn report_serving(&mut self, pod: u32) -> bool {
+        let Some(p) = self.inventory.pods.get_mut(&uuid(u64::from(pod), 1)) else {
+            return false;
+        };
+        if p.annotations.contains_key(annotations::REPORT) {
+            return false;
+        }
+        p.annotations
+            .insert(annotations::REPORT.to_owned(), REPORT.to_owned());
+        self.stats.api_writes += 1;
+        self.stats.watch_events += 1;
+        if let Some(primary) = self.primary_pod()
+            && !self.wake_pending
+        {
+            self.wake_pending = true;
+            self.after(DEBOUNCE, primary, Ev::Wake(primary));
+        }
+        true
+    }
+
+    /// Whether Pod `pod` carries its report annotation.
+    pub fn reported(&self, pod: u32) -> bool {
+        self.inventory
+            .pods
+            .get(&uuid(u64::from(pod), 1))
+            .is_some_and(|p| p.annotations.contains_key(annotations::REPORT))
     }
 
     fn at(&self, ns: u64) -> Instant {
@@ -409,7 +465,12 @@ impl ControlPlane {
     /// Add a Node and its Pod (cluster growth).
     pub fn add_pod(&mut self) -> u32 {
         let i = self.pods.len() as u32;
-        Self::add_objects(&mut self.inventory, &self.ownership, i);
+        Self::add_objects(
+            &mut self.inventory,
+            &self.ownership,
+            i,
+            self.settings.report_at_start,
+        );
         self.pods.push(Pod {
             alive: true,
             epoch: 0,
@@ -470,8 +531,12 @@ impl ControlPlane {
                 | Ev::Follow(p)
                 | Ev::PrimaryRenew(p)
                 | Ev::Reconcile(p)
-                | Ev::NodeNotReady(p) => p,
+                | Ev::NodeNotReady(p)
+                | Ev::Wake(p) => p,
             };
+            if let Ev::Wake(_) = ev {
+                self.wake_pending = false;
+            }
             let p = &self.pods[pod as usize];
             if p.epoch != epoch {
                 continue;
@@ -491,7 +556,8 @@ impl ControlPlane {
                 Ev::Contend(p) => self.contend(p),
                 Ev::Follow(p) => self.follow(p),
                 Ev::PrimaryRenew(p) => self.primary_renew(p),
-                Ev::Reconcile(p) => self.reconcile(p),
+                Ev::Reconcile(p) => self.reconcile(p, true),
+                Ev::Wake(p) => self.reconcile(p, false),
                 Ev::NodeNotReady(_) => {}
             }
             self.check_primaries();
@@ -679,6 +745,8 @@ impl ControlPlane {
                 holder: Self::identity(pod),
             };
             self.pods[pod as usize].primary = Some(Writer::new(term));
+            // In-memory, per term, like `primary.rs`.
+            self.membership_changed = None;
             self.pods[pod as usize].contend.term_ended();
             self.primary_changed();
             self.after(DEBOUNCE, pod, Ev::Reconcile(pod));
@@ -710,7 +778,8 @@ impl ControlPlane {
         self.after(limits::LEASE_RENEW, pod, Ev::PrimaryRenew(pod));
     }
 
-    fn reconcile(&mut self, pod: u32) {
+    /// One primary pass. A `periodic` pass schedules the next one.
+    fn reconcile(&mut self, pod: u32, periodic: bool) {
         if self.pods[pod as usize].primary.is_none() {
             return;
         }
@@ -756,6 +825,7 @@ impl ControlPlane {
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
+                membership_changed_unix: self.membership_changed,
             },
             &mut self.rng,
         );
@@ -767,6 +837,17 @@ impl ControlPlane {
             {
                 self.stats.api_writes += 1;
                 self.stats.commits += 1;
+                if current
+                    .as_ref()
+                    .is_none_or(|c| c.membership_version != plan.next.membership_version)
+                {
+                    self.membership_changed = Some(
+                        self.wall()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    );
+                }
                 if current
                     .as_ref()
                     .is_none_or(|c| c.sequence != plan.next.sequence)
@@ -817,7 +898,9 @@ impl ControlPlane {
                 }
             }
         }
-        self.after(limits::LEASE_RENEW, pod, Ev::Reconcile(pod));
+        if periodic {
+            self.after(limits::LEASE_RENEW, pod, Ev::Reconcile(pod));
+        }
     }
 
     fn follow(&mut self, pod: u32) {
@@ -997,6 +1080,58 @@ mod tests {
         cp.advance_to(t + 15 * S);
         assert_eq!(members(&cp), 30);
         assert_eq!(cp.record().unwrap().membership_version, mv + 2);
+    }
+
+    /// Known issue 51: with reports only from serving dataplanes, a Pod
+    /// joins after it reports, joins are batched by the hold, and seats
+    /// are sized for every eligible Pod meanwhile.
+    #[test]
+    fn pods_join_once_serving_in_batches() {
+        const S: u64 = 1_000_000_000;
+        let mut cp = ControlPlane::new(
+            Settings {
+                pods: 40,
+                seed: 3,
+                report_at_start: false,
+                ..Default::default()
+            },
+            Instant::now(),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+        );
+        cp.advance_to(120 * S);
+        assert_eq!(members(&cp), 0, "nobody serves yet");
+        assert!(cp.sequence().is_some(), "an empty membership is published");
+        assert_eq!(cp.ready_seats(), 3, "{:?}", cp.stats);
+        assert!(!cp.reported(0));
+        assert!(cp.report_serving(0));
+        assert!(!cp.report_serving(0), "reported once");
+        assert!(cp.reported(0));
+        // Woken by the watch: the first member joins after the debounce.
+        cp.advance_to(122 * S);
+        assert_eq!(members(&cp), 1);
+        let mv = cp.record().unwrap().membership_version;
+        for p in 1..40 {
+            cp.report_serving(p);
+            cp.advance_to(122 * S + u64::from(p) * S / 10);
+        }
+        // Inside the hold after the first join: nobody else yet.
+        cp.advance_to(129 * S);
+        assert_eq!(members(&cp), 1);
+        cp.advance_to(160 * S);
+        assert_eq!(members(&cp), 40);
+        assert!(
+            cp.record().unwrap().membership_version <= mv + 2,
+            "joins are batched"
+        );
+        // A crash and restart keeps the report: no new version.
+        let mv = cp.record().unwrap().membership_version;
+        let victim = (0..40).find(|p| Some(*p) != cp.primary_pod()).unwrap();
+        cp.crash(victim);
+        cp.advance_to(170 * S);
+        cp.restart(victim);
+        cp.advance_to(240 * S);
+        assert!(cp.reported(victim));
+        assert_eq!(cp.record().unwrap().membership_version, mv);
     }
 
     #[test]

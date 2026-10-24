@@ -81,6 +81,8 @@ fn seed(api: &fake::FakeApi, pods: usize) {
             &format!("/api/v1/namespaces/{NS}/pods/p{i}"),
             json!({
                 "metadata":{"name":format!("p{i}"),"namespace":NS,"uid":pod_uid(i),"creationTimestamp":"2026-01-01T00:00:00Z",
+                    // Serving dataplanes have reported (round 4, join).
+                    "annotations":{annotations::REPORT:"{\"shares\":1,\"rdma_nics\":[]}"},
                     "ownerReferences":[{"apiVersion":"apps/v1","kind":"DaemonSet","name":"racer-dataplane","uid":DS_UID,"controller":true}]},
                 "spec":{"nodeName":format!("n{i}"),"serviceAccountName":"racer-dataplane"},
                 "status":{"podIP":format!("127.0.0.{}", i + 1),"phase":"Running"}
