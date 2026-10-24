@@ -342,7 +342,7 @@ impl Server {
             connections: Slots::new(budget.connections),
             handshakes: Slots::new(budget.handshakes),
             bootstraps: Slots::new(budget.bootstraps),
-            writes: Slots::new(budget.writes),
+            writes: Slots::queued(budget.writes, limits::MAX_WRITE_WAITERS),
             polls: RefCell::new(HashSet::new()),
             keyring_polls: RefCell::new(HashSet::new()),
         })
@@ -511,6 +511,31 @@ impl Server {
         self.writes.try_acquire().ok_or(ProtocolFailure::Overloaded)
     }
 
+    /// Write slot for a long poll reply. Waits in FIFO order until
+    /// `poll_deadline` plus [`limits::WRITE_QUEUE_GRACE`], clamped to seat
+    /// authority and `expires` (the caller's credential), so a mass wake
+    /// queues instead of answering 429. A full queue or a passed deadline is
+    /// overload and still answers 429. Authority is rechecked after waiting.
+    async fn queued_write_slot(
+        &self,
+        poll_deadline: Instant,
+        expires: u64,
+    ) -> Result<Slot, ProtocolFailure> {
+        let mut at = (poll_deadline + limits::WRITE_QUEUE_GRACE).min(caller_deadline(expires));
+        if let Some(a) = self.shared.authority().deadline() {
+            at = at.min(a);
+        }
+        let slot = self
+            .writes
+            .acquire(at)
+            .await
+            .ok_or(ProtocolFailure::Overloaded)?;
+        if !self.shared.ready() {
+            return Err(ProtocolFailure::Unavailable);
+        }
+        Ok(slot)
+    }
+
     /// Enrollment. The caller holds a bootstrap admission slot.
     async fn bootstrap(&self, head: &Head, body: &[u8]) -> Result<Reply<'static>, Fail> {
         if !self.shared.ready() {
@@ -639,7 +664,11 @@ impl Server {
         let reply = match found {
             None => Reply::no_content(),
             Some(image) => {
-                let write = self.write_slot()?;
+                let write = self
+                    .queued_write_slot(deadline, id2.expires.min(id.expires))
+                    .await?;
+                // A newer image may have landed while queued.
+                let image = self.shared.image().filter(newer).unwrap_or(image);
                 let base = head.one(DELTA_HEADER).ok().flatten();
                 Reply::ok(image.for_base(after, base), write)
             }
@@ -713,7 +742,7 @@ impl Server {
         }
         let reply = match found {
             None => Reply::no_content(),
-            Some((_, bytes)) => Reply::ok(bytes, self.write_slot()?),
+            Some((_, bytes)) => Reply::ok(bytes, self.queued_write_slot(deadline, expires).await?),
         };
         Ok(reply.until(expires).polling(poll))
     }
@@ -748,7 +777,10 @@ impl Server {
         }
         let reply = match found {
             None => Reply::no_content(),
-            Some(i) => Reply::ok(i.encoded.clone(), self.write_slot()?),
+            Some(i) => Reply::ok(
+                i.encoded.clone(),
+                self.queued_write_slot(deadline, expires).await?,
+            ),
         };
         Ok(reply.until(expires))
     }
@@ -1856,6 +1888,46 @@ mod tests {
             "a".repeat(1025),
         );
         assert_eq!(block_devices(&a), None);
+    }
+
+    #[test]
+    fn long_poll_replies_queue_for_a_write_slot() {
+        fake::run(|_, kube| async move {
+            let (shared, _) = seated(kube);
+            let server = Server::with_budget(shared.clone(), budget());
+            let expires = unix_now() + 3600;
+            let held = server.write_slot().unwrap();
+            // Enrollment and other non-poll replies still fail fast.
+            assert_eq!(server.write_slot().err(), Some(ProtocolFailure::Overloaded));
+            // A poll whose deadline (plus grace) passes while queued: 429.
+            let past = Instant::now() - limits::WRITE_QUEUE_GRACE;
+            assert_eq!(
+                server.queued_write_slot(past, expires).await.err(),
+                Some(ProtocolFailure::Overloaded)
+            );
+            // An expired credential bounds the wait too.
+            let now = Instant::now();
+            assert_eq!(
+                server.queued_write_slot(now, unix_now()).await.err(),
+                Some(ProtocolFailure::Overloaded)
+            );
+            // A queued poll gets the slot when it is released instead of a
+            // 429, then rechecks readiness (this seat is not ready: 503).
+            let result = Rc::new(RefCell::new(None));
+            let (s, r) = (server.clone(), result.clone());
+            exec::spawn(async move {
+                let out = s.queued_write_slot(Instant::now(), expires).await;
+                *r.borrow_mut() = Some(out.err());
+            })
+            .unwrap();
+            exec::sleep(Duration::from_millis(20)).await;
+            assert!(result.borrow().is_none());
+            drop(held);
+            exec::sleep(Duration::from_millis(20)).await;
+            assert_eq!(*result.borrow(), Some(Some(ProtocolFailure::Unavailable)));
+            assert!(server.write_slot().is_ok());
+            shared.stopping.set(true);
+        });
     }
 
     #[test]

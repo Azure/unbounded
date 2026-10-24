@@ -51,15 +51,13 @@ pub const MIN_WRITE_BYTES_PER_SEC: u64 = 100 * 1024;
 /// [`connection_capacity`].
 ///
 /// Connections are not the binding limit when a publication lands. All
-/// waiting long polls wake together, but at most [`MAX_WRITES`] (64) can take
-/// a write slot; the rest answer 429 (`Overloaded`) and retry, so a seat with
-/// 12500 polls drains a new publication in roughly 12500 / 64 write rounds
-/// plus client retry delays (`server.rs` `Server::snapshot` takes the slot
-/// after the wait). Each `Signal::notify` (`exec.rs` `Signal::changed`) also
-/// costs O(W^2) waker comparisons for W waiting polls, because every woken
-/// poll that re-registers scans the waker list (`will_wake`); see
-/// [`crate::step::cost::notify`]. Neither cost appears in the per-connection
-/// sizing above.
+/// waiting long polls wake together, and at most [`MAX_WRITES`] (64) write
+/// at once. The rest queue for a slot in FIFO order (`exec::Slots::acquire`,
+/// [`MAX_WRITE_WAITERS`], [`WRITE_QUEUE_GRACE`]) instead of answering 429, so
+/// a seat with 12500 polls drains a new publication in about 12500 / 64
+/// write rounds with no client retries. Waking W polls costs O(W): each
+/// `Signal::changed` waiter owns one waker slot and re-registers in O(1)
+/// (see [`crate::step::cost::notify`]).
 pub const MAX_CONTROL_CONNECTIONS: usize = 16384;
 
 /// Maximum concurrent TLS handshakes, the CPU-heavy stage of a connection.
@@ -114,6 +112,20 @@ pub const MAX_BOOTSTRAPS: usize = 32;
 /// enrollments). A slot is held until the last byte is written. Bodies are
 /// shared, so this bounds bandwidth and TLS buffers, not copies.
 pub const MAX_WRITES: usize = 64;
+
+/// Maximum responses queued for a write slot per server. Woken long polls
+/// wait here instead of answering 429 when the only problem is that all
+/// [`MAX_WRITES`] slots are busy. Sized to the connection bound, so every
+/// connection may wait; the deadline ([`WRITE_QUEUE_GRACE`]) is what turns
+/// sustained overload into 429.
+pub const MAX_WRITE_WAITERS: usize = MAX_CONTROL_CONNECTIONS;
+
+/// How long past its poll deadline a woken long poll may wait for a write
+/// slot. Clients give a long poll `POLL_WAIT` plus 10 s
+/// (`src/control/session.rs` `turn`), so 5 s of queueing leaves 5 s to
+/// write. The wait is also bounded by seat authority and the caller's
+/// credential. Past it the poll answers 429, as before.
+pub const WRITE_QUEUE_GRACE: Duration = Duration::from_secs(5);
 
 /// Maximum concurrent outbound Kubernetes API requests.
 pub const MAX_API_REQUESTS: usize = 48;
