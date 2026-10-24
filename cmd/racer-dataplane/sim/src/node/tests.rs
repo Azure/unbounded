@@ -558,7 +558,9 @@ fn held(report: &Value, cause: &str) -> u64 {
 /// held it. Owners now ask predecessors that held the same rank under the
 /// previous membership under that membership, so the lagging predecessor
 /// serves. Before the fix these runs had 48 to 52 owner skips and 40 to 48
-/// repeat fetches whose previous fetcher still held the page.
+/// repeat fetches whose previous fetcher still held the page. Since the
+/// simulator debits the origin attempt like production (round 4, repeat),
+/// one run has 3 owner skips (a fill without credits fails and is retried).
 #[test]
 fn owners_ask_lagging_predecessors_under_the_previous_membership() {
     for (nodes, seed) in [(120, 1), (120, 2), (300, 1)] {
@@ -568,7 +570,7 @@ fn owners_ask_lagging_predecessors_under_the_previous_membership() {
             "{report}"
         );
         assert!(
-            counter(&report, "owner_stale_destination_skips") <= 2,
+            counter(&report, "owner_stale_destination_skips") <= 4,
             "{nodes} {seed}: {}",
             report["metrics"]["counters"]
         );
