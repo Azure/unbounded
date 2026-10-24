@@ -4,6 +4,8 @@
 set -euo pipefail
 
 disk_dir=$(realpath "${1:?usage: verify-boot.sh DISK_DIRECTORY}")
+image_name=${2:-}
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$disk_dir"
 sha256sum --check disk.img.gz.sha256
 gzip -dc disk.img.gz > disk.img
@@ -12,7 +14,16 @@ cat > seed/meta-data <<'EOF'
 instance-id: unbounded-gb200-image-ci
 local-hostname: unbounded-gb200-image-ci
 EOF
-cat > seed/user-data <<'EOF'
+
+if [ "$image_name" = host-ubuntu2404-gb200-hillsboro ]; then
+    printf '%s\n' '#cloud-config' > seed/user-data
+    python3 "$script_dir/../host-ubuntu2404-gb200-hillsboro/assets/render_boot_vendor_data.py" \
+        --template "$script_dir/../netboot/assets/vendor-data.tmpl" \
+        --install-script "$script_dir/../host-ubuntu2404-gb200-hillsboro/assets/verify-boot-install.sh" \
+        --ssh-import-id-script "$script_dir/../host-ubuntu2404-gb200-hillsboro/assets/verify-boot-ssh-import-id.sh" \
+        --output seed/vendor-data
+else
+    cat > seed/user-data <<'EOF'
 #cloud-config
 runcmd:
   - |
@@ -28,6 +39,7 @@ runcmd:
     echo UNBOUNDED_GB200_UBUNTU_BOOT_PASS > /dev/ttyAMA0
     systemctl poweroff --no-block
 EOF
+fi
 cat > seed/network-config <<'EOF'
 version: 2
 ethernets:
@@ -39,6 +51,9 @@ EOF
 truncate -s 16M seed.img
 mkfs.vfat -n CIDATA seed.img >/dev/null
 mcopy -i seed.img seed/meta-data seed/user-data seed/network-config ::/
+if [ -f seed/vendor-data ]; then
+    mcopy -i seed.img seed/vendor-data ::/
+fi
 # QEMU 8.2 TCG's max CPU advertises MOPS, which faults in clear_page on this
 # 64K kernel. Use a stable server CPU profile for the architecture boot gate.
 timeout --signal=TERM --kill-after=10s 300s \

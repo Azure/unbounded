@@ -6,33 +6,16 @@
 package main
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 
-	"sigs.k8s.io/yaml"
+	metalcloudinit "github.com/Azure/unbounded/internal/metalman/cloudinit"
 )
 
 func validateUserData(reader io.Reader) error {
-	data, err := io.ReadAll(reader)
-	if err != nil {
-		return fmt.Errorf("read user-data: %w", err)
-	}
-	if len(bytes.TrimSpace(data)) == 0 {
-		return nil
-	}
-
-	var config map[string]any
-	if err := yaml.UnmarshalStrict(data, &config); err != nil {
-		return fmt.Errorf("parse cloud-init user-data: %w", err)
-	}
-	if _, found := config["users"]; found {
-		return errors.New("cloud-init user-data must not define top-level users; it would replace the image access policy")
-	}
-
-	return nil
+	return metalcloudinit.ValidateUserData(reader)
 }
 
 func openInput(args []string, stdin io.Reader) (io.Reader, func() error, error) {

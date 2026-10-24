@@ -1895,6 +1895,48 @@ func TestResolveFileByPath_UserDataFromBinaryData(t *testing.T) {
 	}
 }
 
+func TestResolveFileByPath_HillsboroRejectsConflictingUserData(t *testing.T) {
+	t.Parallel()
+
+	for _, source := range []string{"data", "binaryData"} {
+		t.Run(source, func(t *testing.T) {
+			t.Parallel()
+
+			cache := setupOCICache(t, "ghcr.io/test/netboot:v1", "hillud123", map[string][]byte{
+				"vmlinuz": []byte("kernel"),
+			})
+			configMap := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "access", Namespace: "default"},
+			}
+			userData := []byte("#cloud-config\nusers: []\n")
+			if source == "data" {
+				configMap.Data = map[string]string{"user-data": string(userData)}
+			} else {
+				configMap.BinaryData = map[string][]byte{"user-data": userData}
+			}
+			node := &v1alpha3.Machine{
+				ObjectMeta: metav1.ObjectMeta{Name: "hillsboro-node"},
+				Spec: v1alpha3.MachineSpec{
+					PXE: &v1alpha3.PXESpec{
+						Image:        "ghcr.io/azure/host-ubuntu2404-gb200-hillsboro@sha256:abc",
+						NetbootImage: "ghcr.io/test/netboot:v1",
+						CloudInit: &v1alpha3.CloudInitSpec{
+							UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{Name: "access", Namespace: "default"},
+						},
+					},
+				},
+			}
+			resolver := FileResolver{
+				Cache:  cache,
+				Reader: fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(node, configMap).Build(),
+			}
+
+			_, err := resolver.ResolveFileByPath(t.Context(), userDataPath, node, node.Spec.PXE.NetbootImage)
+			require.ErrorContains(t, err, "must not define top-level users")
+		})
+	}
+}
+
 func TestHTTPServer_UserDataConfigMapMissing(t *testing.T) {
 	cache := setupOCICache(t, "ghcr.io/test/image:v1", "httpcmmiss123", map[string][]byte{
 		"vmlinuz": []byte("kernel"),

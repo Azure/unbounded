@@ -10,15 +10,17 @@ ENV GB200_PROFILE=canonical-nvidia-580167
 COPY images/host-ubuntu2404-gb200/assets/ /usr/local/lib/unbounded-image/
 COPY images/host-ubuntu2404-gb200-hillsboro/assets/90-hillsboro-users.cfg \
     /etc/cloud/cloud.cfg.d/90-hillsboro-users.cfg
-COPY images/host-ubuntu2404-gb200-hillsboro/assets/verify_cloud_init_merge.py \
-    /usr/local/lib/unbounded-image/verify_cloud_init_merge.py
+COPY images/host-ubuntu2404-gb200-hillsboro/assets/ \
+    /usr/local/lib/unbounded-image/hillsboro/
 COPY images/netboot/assets/vendor-data.tmpl \
     /usr/local/lib/unbounded-image/vendor-data.tmpl
 RUN test "${TARGETARCH}" = arm64 && \
     sh /usr/local/lib/unbounded-image/rootfs.sh install
-RUN python3 /usr/local/lib/unbounded-image/verify_cloud_init_merge.py \
+RUN python3 /usr/local/lib/unbounded-image/hillsboro/verify_cloud_init_merge.py \
       --image-config /etc/cloud/cloud.cfg.d/90-hillsboro-users.cfg \
-      --vendor-template /usr/local/lib/unbounded-image/vendor-data.tmpl && \
+      --vendor-template /usr/local/lib/unbounded-image/vendor-data.tmpl \
+      --install-script /usr/local/lib/unbounded-image/hillsboro/verify-boot-install.sh \
+      --ssh-import-id-script /usr/local/lib/unbounded-image/hillsboro/verify-boot-ssh-import-id.sh && \
     SOURCE_COMMIT="${SOURCE_COMMIT}" \
       sh /usr/local/lib/unbounded-image/rootfs.sh finish
 

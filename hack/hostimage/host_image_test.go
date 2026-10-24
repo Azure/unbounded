@@ -41,7 +41,7 @@ func TestHillsboroImageUsesPinnedARM64Producer(t *testing.T) {
 		`test "${TARGETARCH}" = arm64`,
 		"COPY images/host-ubuntu2404-gb200/assets/",
 		"COPY images/host-ubuntu2404-gb200-hillsboro/assets/90-hillsboro-users.cfg",
-		"python3 /usr/local/lib/unbounded-image/verify_cloud_init_merge.py",
+		"python3 /usr/local/lib/unbounded-image/hillsboro/verify_cloud_init_merge.py",
 		"COPY images/netboot/assets/vendor-data.tmpl",
 		"ROOT_EXTRA_MIB=7168",
 		"COPY --from=build /disk /disk",
@@ -149,4 +149,30 @@ func TestMetalmanVendorDataDoesNotReplaceImageUsers(t *testing.T) {
 	require.Contains(t, mergeTest, "util.mergemanydict([vendor_config, image_config])")
 	require.Contains(t, mergeTest, `"users" in vendor_config`)
 	require.Contains(t, mergeTest, `("reporting", "write_files", "runcmd")`)
+}
+
+func TestHillsboroBootGateValidatesNamedAccess(t *testing.T) {
+	boot := readRepoFile(t, "images/host-ubuntu2404-gb200/verify-boot.sh")
+	install := readRepoFile(t, imageDir+"/assets/verify-boot-install.sh")
+	importer := readRepoFile(t, imageDir+"/assets/verify-boot-ssh-import-id.sh")
+
+	require.Contains(t, boot, "seed/vendor-data")
+	require.Contains(t, boot, "render_boot_vendor_data.py")
+	require.Contains(t, install, "test ! -s /home/bcho/.ssh/authorized_keys")
+	for _, user := range []string{
+		"cchildress",
+		"chokevin",
+		"imiller31",
+		"jveski",
+		"jwilder",
+		"phealy",
+		"plombardi89",
+		"qike-ms",
+		"vpatelsj",
+	} {
+		require.Contains(t, install, user)
+	}
+	require.Contains(t, install, `grep -Fq "gh:$user" "$keys"`)
+	require.Contains(t, importer, `if [ "$user" = bcho ]`)
+	require.Contains(t, importer, `> "$HOME/.ssh/authorized_keys"`)
 }

@@ -602,6 +602,84 @@ func TestReconcilerRequestsHostReplaceOnceAndCompletesAfterRepave(t *testing.T) 
 	require.Equal(t, v1alpha3.OperationPhaseComplete, completed.Status.Phase)
 }
 
+func TestReconcilerRejectsHillsboroUserDataBeforeHostReplace(t *testing.T) {
+	t.Parallel()
+
+	for _, source := range []string{"data", "binaryData"} {
+		t.Run(source, func(t *testing.T) {
+			t.Parallel()
+
+			machine := testBareMetalMachine("machine-1", "rack-a")
+			machine.Spec.PXE.Image = "ghcr.io/azure/host-ubuntu2404-gb200-hillsboro@sha256:abc"
+			machine.Spec.PXE.CloudInit = &v1alpha3.CloudInitSpec{
+				UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{Name: "access", Namespace: "default"},
+			}
+			configMap := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "access", Namespace: "default"},
+			}
+			userData := []byte("#cloud-config\nusers: []\n")
+			if source == "data" {
+				configMap.Data = map[string]string{"user-data": string(userData)}
+			} else {
+				configMap.BinaryData = map[string][]byte{"user-data": userData}
+			}
+			op := testOperation("op-replace-invalid-userdata", v1alpha3.OperationHostReplace)
+			op.Spec.MachineRef = machine.Name
+
+			c := fake.NewClientBuilder().
+				WithScheme(testScheme(t)).
+				WithObjects(machine, configMap, op, testRedfishSecret()).
+				WithStatusSubresource(op, machine).
+				Build()
+			power := &recordingPowerClient{}
+			reconciler := testReconciler(c, power, "rack-a")
+
+			_, err := reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: op.Name}})
+			require.NoError(t, err)
+
+			var updated v1alpha3.MachineOperation
+			require.NoError(t, c.Get(t.Context(), client.ObjectKey{Name: op.Name}, &updated))
+			require.Equal(t, v1alpha3.OperationPhaseFailed, updated.Status.Phase)
+			require.Len(t, updated.Status.Targets, 1)
+			require.Contains(t, updated.Status.Targets[0].Message, "must not define top-level users")
+			require.Empty(t, power.calls)
+		})
+	}
+}
+
+func TestReconcilerRejectsHillsboroUserDataDuringVirtualMediaReplace(t *testing.T) {
+	t.Parallel()
+
+	machine := testBareMetalMachine("machine-1", "rack-a")
+	machine.Spec.PXE.Image = "ghcr.io/azure/host-ubuntu2404-gb200-hillsboro@sha256:abc"
+	machine.Spec.PXE.BootProtocol = v1alpha3.PXEBootProtocolVirtualMedia
+	machine.Spec.PXE.CloudInit = &v1alpha3.CloudInitSpec{
+		UserDataConfigMapRef: &v1alpha3.ConfigMapKeySelector{Name: "access", Namespace: "default"},
+	}
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "access", Namespace: "default"},
+		Data:       map[string]string{"user-data": "#cloud-config\nusers: []\n"},
+	}
+	op := testOperation("op-replace-active-invalid-userdata", v1alpha3.OperationHostReplace)
+	target := v1alpha3.MachineOperationTargetStatus{
+		MachineRef: machine.Name,
+		Phase:      v1alpha3.OperationPhaseInProgress,
+		BootMedia: &v1alpha3.MachineOperationBootMediaStatus{
+			Netboot:    machine.Spec.PXE.DeepCopy(),
+			Site:       "rack-a",
+			MachineUID: machine.UID,
+			Phase:      "Installing",
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(configMap).Build()
+	reconciler := testReconciler(c, &recordingPowerClient{}, "rack-a")
+
+	change := reconciler.advanceTarget(t.Context(), op, target)
+
+	require.Equal(t, v1alpha3.OperationPhaseFailed, change.target.Phase)
+	require.Contains(t, change.target.Message, "must not define top-level users")
+}
+
 func TestReconcilerPowersOnHostReplaceTargetWhenOff(t *testing.T) {
 	t.Parallel()
 

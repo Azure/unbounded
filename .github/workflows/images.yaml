@@ -113,6 +113,7 @@ jobs:
         run: |
           test "$(uname -m)" = aarch64
           python3 -m unittest discover -s images/host-ubuntu2404-gb200/assets -p test_verify.py
+          python3 -m unittest discover -s images/host-ubuntu2404-gb200-hillsboro/assets -p test_render_boot_vendor_data.py
 
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         if: ${{ !startsWith(needs.resolve.outputs.name, 'host-ubuntu2404-gb200') }}
@@ -200,7 +201,9 @@ jobs:
           docker create --name gb200-image "$IMAGE" /unused
           docker cp gb200-image:/disk gb200-evidence/disk
           docker rm gb200-image
-          bash images/host-ubuntu2404-gb200/verify-boot.sh gb200-evidence/disk
+          bash images/host-ubuntu2404-gb200/verify-boot.sh \
+            gb200-evidence/disk \
+            "${{ needs.resolve.outputs.name }}"
 
       - name: Retain GB200 Ubuntu qualification evidence
         if: always() && startsWith(needs.resolve.outputs.name, 'host-ubuntu2404-gb200')

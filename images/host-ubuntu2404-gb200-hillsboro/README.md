@@ -41,6 +41,11 @@ The root filesystem is assembled into a new disk, so it cannot inherit
 captured user accounts, password hashes, authorized keys, or host keys from an
 earlier machine.
 
+The publication boot gate uses the rendered MetalMan vendor-data with a
+side-effect-free installer fixture. It proves cloud-init creates every named
+account, keeps `bcho` keyless, and writes a nonempty deterministic
+`authorized_keys` file for every other listed user.
+
 MetalMan vendor-data intentionally does not define `users`; otherwise its
 higher-priority list would replace the image fragment. The image build runs
 Ubuntu Noble cloud-init's merge implementation against the actual vendor-data
@@ -73,8 +78,13 @@ would replace the image-baked access policy.
 The current temporary
 `spec.host.netboot.cloudInit.userDataConfigMapRef: gb200-metal-host-access`
 defines `users: [unbounded-metal]`. It must be removed or replaced with
-user-data that does not define `users` before any `HostReplace`. This repository
-includes a fail-closed preflight for the referenced ConfigMap content:
+user-data that does not define `users` before any `HostReplace`. MetalMan
+automatically rejects a HostReplace and refuses to serve conflicting user-data
+from either ConfigMap `data` or `binaryData` for this dedicated image. Other
+machine images retain generic cloud-init user-data behavior.
+
+The repository also includes a read-only CLI wrapper around the same
+production validator:
 
 ```bash
 kubectl -n <namespace> get configmap gb200-metal-host-access \
@@ -82,9 +92,9 @@ kubectl -n <namespace> get configmap gb200-metal-host-access \
   go run ./hack/cmd/hostimage-userdata-preflight -
 ```
 
-The command exits nonzero for invalid cloud-config or any top-level `users`
-key. Running the preflight is read-only; it does not update the Machine or
-ConfigMap.
+The command exits nonzero unless the input is exactly one cloud-config mapping
+document without a top-level `users` key. Running it does not update the
+Machine or ConfigMap.
 
 Updating the image reference alone is non-destructive. Metalman uses the new
 disk only during a later, separately authorized `HostReplace`. Do not create a

@@ -27,6 +27,7 @@ import (
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/metalman/bootmedia"
+	metalcloudinit "github.com/Azure/unbounded/internal/metalman/cloudinit"
 	"github.com/Azure/unbounded/internal/metalman/netboot"
 	"github.com/Azure/unbounded/internal/metalman/redfish"
 )
@@ -88,6 +89,7 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machineoperations/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=unbounded-cloud.io,resources=machines/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list
 
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -391,6 +393,10 @@ func (r *Reconciler) advanceTarget(ctx context.Context, op *v1alpha3.MachineOper
 	}
 
 	if target.BootMedia != nil {
+		if err := r.validateReplaceUserData(ctx, op, mediaMachine(target)); err != nil {
+			return failTarget(target, reasonExecutionFailed, err.Error(), now)
+		}
+
 		return r.advanceVirtualMedia(ctx, op, mediaMachine(target), target, now)
 	}
 
@@ -415,6 +421,10 @@ func (r *Reconciler) advanceTarget(ctx context.Context, op *v1alpha3.MachineOper
 		target.ObservedGeneration = machine.Generation
 	}
 
+	if err := r.validateReplaceUserData(ctx, op, &machine); err != nil {
+		return failTarget(target, reasonExecutionFailed, err.Error(), now)
+	}
+
 	switch op.Spec.OperationKind {
 	case v1alpha3.OperationHostPowerOff:
 		return r.advancePowerOff(ctx, &machine, target, now)
@@ -431,6 +441,18 @@ func (r *Reconciler) advanceTarget(ctx context.Context, op *v1alpha3.MachineOper
 	default:
 		return failTarget(target, reasonUnsupportedTarget, fmt.Sprintf("%s is not handled by metalman", op.Spec.OperationKind), now)
 	}
+}
+
+func (r *Reconciler) validateReplaceUserData(ctx context.Context, op *v1alpha3.MachineOperation, machine *v1alpha3.Machine) error {
+	if op.Spec.OperationKind != v1alpha3.OperationHostReplace {
+		return nil
+	}
+
+	if _, _, err := metalcloudinit.ResolveUserData(ctx, r.reader(), machine); err != nil {
+		return fmt.Errorf("validate cloud-init user-data: %w", err)
+	}
+
+	return nil
 }
 
 func (r *Reconciler) advancePowerOff(ctx context.Context, machine *v1alpha3.Machine, target v1alpha3.MachineOperationTargetStatus, now metav1.Time) targetChange {

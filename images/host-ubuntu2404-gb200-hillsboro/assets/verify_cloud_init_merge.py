@@ -11,23 +11,29 @@ from pathlib import Path
 from cloudinit import util
 import yaml
 
+from render_boot_vendor_data import render_vendor_data
 
-def load_yaml(path: Path) -> dict:
-    contents = path.read_text()
-    if path.name.endswith(".tmpl"):
-        contents = contents.replace("{{ .ServeURL }}", "http://192.0.2.1")
-        contents = contents.replace(
-            "{{ indent 4 .InstallScript }}", "    echo install"
-        )
+
+def load_yaml(contents: str, source: Path) -> dict:
     loaded = yaml.safe_load(contents)
     if not isinstance(loaded, dict):
-        raise RuntimeError(f"{path} did not contain a cloud-config mapping")
+        raise RuntimeError(f"{source} did not contain a cloud-config mapping")
     return loaded
 
 
-def verify(image_config_path: Path, vendor_template_path: Path) -> None:
-    image_config = load_yaml(image_config_path)
-    vendor_config = load_yaml(vendor_template_path)
+def verify(
+    image_config_path: Path,
+    vendor_template_path: Path,
+    install_script_path: Path,
+    ssh_import_id_script_path: Path,
+) -> None:
+    image_config = load_yaml(image_config_path.read_text(), image_config_path)
+    rendered_vendor_data = render_vendor_data(
+        vendor_template_path,
+        install_script_path,
+        ssh_import_id_script_path,
+    )
+    vendor_config = load_yaml(rendered_vendor_data, vendor_template_path)
     if "users" in vendor_config:
         raise RuntimeError("MetalMan vendor-data must not replace image users")
 
@@ -43,8 +49,15 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--image-config", type=Path, required=True)
     parser.add_argument("--vendor-template", type=Path, required=True)
+    parser.add_argument("--install-script", type=Path, required=True)
+    parser.add_argument("--ssh-import-id-script", type=Path, required=True)
     args = parser.parse_args()
-    verify(args.image_config, args.vendor_template)
+    verify(
+        args.image_config,
+        args.vendor_template,
+        args.install_script,
+        args.ssh_import_id_script,
+    )
 
 
 if __name__ == "__main__":

@@ -17,13 +17,12 @@ import (
 	"sync"
 	"text/template"
 
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	metalcloudinit "github.com/Azure/unbounded/internal/metalman/cloudinit"
 	"github.com/Azure/unbounded/internal/metalman/indexing"
 	"github.com/Azure/unbounded/internal/provision"
 )
@@ -191,7 +190,7 @@ func (f *FileResolver) ResolveFileByPath(ctx context.Context, path string, node 
 
 func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, node *v1alpha3.Machine, imageRef, requestIP string) (*ResolvedFile, error) {
 	if path == userDataPath && node != nil {
-		if data, ok, err := f.resolveUserDataFromConfigMap(ctx, node); err != nil {
+		if data, ok, err := metalcloudinit.ResolveUserData(ctx, f.Reader, node); err != nil {
 			return nil, fmt.Errorf("resolving user-data from ConfigMap: %w", err)
 		} else if ok {
 			return &ResolvedFile{Data: data, ContentType: "text/plain"}, nil
@@ -273,41 +272,6 @@ func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, 
 
 	// Static file - serve from disk
 	return &ResolvedFile{DiskPath: diskPath}, nil
-}
-
-func (f *FileResolver) resolveUserDataFromConfigMap(ctx context.Context, node *v1alpha3.Machine) ([]byte, bool, error) {
-	if node.Spec.Netboot() == nil || node.Spec.Netboot().CloudInit == nil || node.Spec.Netboot().CloudInit.UserDataConfigMapRef == nil {
-		return nil, false, nil
-	}
-
-	ref := node.Spec.Netboot().CloudInit.UserDataConfigMapRef
-
-	var cm corev1.ConfigMap
-	if err := f.Reader.Get(ctx, client.ObjectKey{
-		Namespace: ref.Namespace,
-		Name:      ref.Name,
-	}, &cm); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil, false, nil
-		}
-
-		return nil, false, fmt.Errorf("getting ConfigMap %s/%s: %w", ref.Namespace, ref.Name, err)
-	}
-
-	key := ref.Key
-	if key == "" {
-		key = "user-data"
-	}
-
-	if data, ok := cm.Data[key]; ok {
-		return []byte(data), true, nil
-	}
-
-	if data, ok := cm.BinaryData[key]; ok {
-		return data, true, nil
-	}
-
-	return nil, false, fmt.Errorf("key %q not found in ConfigMap %s/%s", key, ref.Namespace, ref.Name)
 }
 
 type templateData struct {

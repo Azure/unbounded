@@ -20,9 +20,6 @@ func TestValidateUserData(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name: "empty",
-		},
-		{
 			name: "bootstrap without users",
 			content: `#cloud-config
 packages:
@@ -44,6 +41,19 @@ users:
 			name:    "reject invalid yaml",
 			content: "users: [",
 			wantErr: "parse cloud-init user-data",
+		},
+		{
+			name:    "reject empty",
+			wantErr: "exactly one YAML mapping document",
+		},
+		{
+			name: "reject second document",
+			content: `#cloud-config
+packages: [jq]
+---
+runcmd: [echo unexpected]
+`,
+			wantErr: "exactly one YAML document",
 		},
 	}
 
