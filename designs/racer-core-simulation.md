@@ -339,9 +339,17 @@ Verified against the code at the start of this work.
    about 145k of 165,343 link failures go to them, coinciding with most of the 12.6k failed reads
    (60 to 200 s). Measured in round 4: 145,222 link failures and 12,424 of 12,759 failed reads.
 
-15. Dropping a dead member (issue 7 fix) is an ownership move and inherits issues 6 and 12: at
-   50,000 nodes in `full-failover` it added 171 recoverable `Unavailable` reads and moved the
-   worst page from 7 to 9 origin requests. See "Round 4: liveness".
+15. Resolved (round 4, track repeat, 34a4bf93f, 293eaa5d4): a repeat while the previous fetcher
+   still holds the page is a skip (an owner above rank 0 fetched after its probe of rank 0
+   failed) or the one rank 0 refetch of the copy a skip left behind, so `copy_held <= skips +
+   orphans <= 2 * skips`; anything else is the hard invariant `origin_repeat_explained`, enforced on
+   every run. Partitions were not the cause: in 50k `full-failover` the 4,531 orphans come from
+   rank 0's own origin failure (1,818), members that do not serve yet (1,024, issue 14), no route
+   within the probe's links (948), an owner that could not fund a delegation (595) and partitions
+   (145). The budget-limited part is issue 21. See "Round 4: repeat".
+   Original report: Dropping a dead member (issue 7 fix) is an ownership move and inherits issues
+   6 and 12: at 50,000 nodes in `full-failover` it added 171 recoverable `Unavailable` reads and
+   moved the worst page from 7 to 9 origin requests. See "Round 4: liveness".
    After the wave 1 merge (handoff fixes present), `full-failover` classifies no repeat as
    `after_owner_move` at 5k or 50k, and the worst page is 7 (5k) and 8 (50k, against 9 with
    liveness alone), so the drop itself no longer adds unbounded repeats. It stays open because 50k
@@ -390,6 +398,19 @@ Verified against the code at the start of this work.
    `full-failover` at 50,000 nodes: origin requests 57,163 to 66,620 (worst page 9 to 12), seat
    reply bytes 298 GB to 689 GB (9 versions instead of 2). See "Round 4: join". Same family as
    Known issue 6.
+
+21. An owner above rank 0 that cannot fund or route its delegation fetches the page itself, and
+   rank 0, which never asks successors, fetches it again later: in 50k `full-failover` (seed 1)
+   1,621 such skips for lack of a route and 1,024 for lack of credits, leaving 948 and 595
+   `copy_held` repeats (1.8% and 1.1% of 52,152 origin requests). Every fix tried trades read
+   availability or costs more than it saves (rank 0 asking successors, funding rank 0, delegating
+   without the owner's fallback credit; see "Round 4: repeat", "Fixes tried and rejected"). Bounded
+   by issue 15's invariant. Open (round 4, repeat).
+
+22. Resolved (round 4, track repeat, ba709b40e): the simulator issued origin requests without
+   debiting the attempt production debits after validating origin authority
+   (`src/read/fill.rs:1810`), so an owner with a spent budget still fetched (135 requests in 5k
+   `full-failover`). It now fails the fill like production (`origin_unfunded`).
 
 ## Simulator engine (racer-sim substrate)
 
@@ -830,8 +851,9 @@ scenarios carry data-plane faults.
    handoff).
 14. Resolved: a new member joins only after it reports serving, joins batched by a hold
    (round 4, join, 789725d9c, 19ed37c90).
-15. Dropping a dead member costs one ownership move (issues 6, 12) (round 4, liveness); after the
-   merge no repeat follows an owner move, but 50k `full-failover` `copy_held` is 10.5%.
+15. Resolved: repeats while the previous fetcher holds the page are skips of rank 0 or their one
+   orphaned refetch, `copy_held <= 2 * skips`, invariant `origin_repeat_explained` (round 4,
+   repeat).
 16. Resolved: owners shed readers of a dominant hot page to the page's helpers; a page is sent by at
    most `REPLICAS` owners plus `fanout_width` helpers (round 4, fanout, 751b85b1e..f887fe173).
 17. Resolved: no read fails because a listed member cannot serve yet (round 4, join, 789725d9c).
@@ -841,6 +863,9 @@ scenarios carry data-plane faults.
    join).
 20. Join versions cost origin fetches (50k `full-failover` worst page 9 to 12) and seat egress
    (298 GB to 689 GB) (round 4, join).
+21. Owners above rank 0 without the credits or links to delegate fetch themselves and orphan the
+   copy; 2.9% of 50k `full-failover` origin requests (round 4, repeat).
+22. Resolved: the simulator debits the origin attempt like production (round 4, repeat).
 
 ## Round 2: production admission
 
@@ -2230,8 +2255,8 @@ probes / helper copies / owner sheds. Read latency is log-bucket upper bounds.
 ## Round 4: join
 
 Known issues 14 and 17 (track numbers 51 and 72): members were listed, and so routable and ranked
-as owners, before they could serve peers, and reads failed while they enrolled. Branch `racer-sim4-join`, based on
-`racer-sim4-liveness` (0386dbed7). The enroll track's commits were not cherry-picked; enrollment
+as owners, before they could serve peers, and reads failed while they enrolled. Branch
+`racer-sim4-join`, based on `racer-sim4-liveness` (0386dbed7). The enroll track's commits were not cherry-picked; enrollment
 timing is the liveness base's (all 50,000 clients enrolled at about 285 s).
 
 ### Root cause
@@ -2409,3 +2434,133 @@ Resolved bounds:
   would leave the old, dead endpoint listed instead.
 - Production readiness changed: an operator relying on `/readyz` sees a new node become ready one
   membership version later than before.
+
+
+## Round 4: repeat
+
+Track repeat takes Known issue 15 and the "still held" class from "Round 4: handoff" (`copy_held`:
+origin requests for a page while the node that fetched it last still holds it). Commits on
+branch `racer-sim4-repeat`: beed76792 (repeat classes), 34a4bf93f (skip causes), ba709b40e (origin
+debit), ad4e26225 (a test bound after the debit), 293eaa5d4 (invariant and failover test), plus
+this section. All changes are in the simulator: no production or racer-core behavior changed (see
+"Fixes tried and rejected").
+
+### Root cause
+
+The simulator was instrumented to record, for every repeated origin request, which node held the
+page, its rank, whether it was down or cut off from the fetcher, the fetcher's rank and budget,
+and every probe of the fetcher's walk with how it ended (temporary counters first, then the
+committed classification below). Cited at 0d282020f.
+
+1. The merge guess was wrong: partitions are a small part. In 50k `full-failover` (seed 1) 4,375
+   of the 5,473 `copy_held` repeats were fetched by rank 0 while an owner above rank 0 held the
+   page, and in 5,348 the fetcher could reach rank 0 at fetch time. Rank 0 never asks its
+   successors: an owner walk only visits predecessors and handoff targets
+   (`CandidateWalk::new`, `core/src/read/walk.rs:239-257`), so rank 0 goes straight to origin.
+2. The copy sits above rank 0 because that owner fetched it itself earlier: an owner above rank 0
+   reaches origin only after its probe of rank 0 ended without a copy (origin authority needs one
+   piece of evidence per predecessor, `validate_origin_authority`). Each such fetch, a skip, leaves
+   an orphan copy that rank 0 does not know about. Its next cold miss fetches the page again;
+   after that rank 0 holds it, so one skip causes at most one such refetch.
+3. Why rank 0 was skipped, at 50k (orphans charged to the skip that created them, of 4,531):
+   - `failed` 1,818: rank 0 answered the delegation with `Unavailable` (`peer_error`,
+     `core/src/read/policy.rs:33`; classified transient, `core/src/read/candidates.rs:191`):
+     its own origin request failed in a 5xx burst, so the owner's fallback fetch was an origin
+     retry from another node.
+   - `not_serving` 1,024: rank 0, or a relay on the route, is a member that does not serve yet
+     (Known issue 14).
+   - `route` 948: no route within the probe's links.
+   - `copy_only` 595: the owner could not fund a delegation (`delegated` needs `left + 2` credits,
+     `core/src/read/walk.rs:351-355`), asked rank 0 copy-only, got a miss, and fetched itself.
+   - `partition` 145.
+   The other 937 `copy_held` repeats at 50k (and 4 raced) are skips themselves: an owner above
+   rank 0 fetched while rank 0 held the page but could not be reached.
+4. Two `copy_lost` repeats per run were really failed origin requests: the old classification
+   called every repeat whose previous fetcher held nothing `copy_lost`, and a fetch that failed
+   leaves nothing (370 of 372 at 5k, 1,915 of 1,918 at 50k).
+5. Simulator fidelity (new Known issue 22): production debits one attempt from the page budget
+   after validating origin authority (`budget.begin_attempt`, `src/read/fill.rs:1810`). The
+   simulator issued the origin request without it, so an owner whose budget was spent still
+   fetched (135 such requests in 5k `full-failover`).
+
+### Changes
+
+- `NodeWorld::classify_repeat` (`sim/src/node/world.rs:3169`) splits repeats into
+  `after_owner_move`, `after_failure` (the previous request failed), `concurrent` (it is still in
+  flight), `copy_lost` (it succeeded and the copy is gone) and `copy_held`. `copy_held` is split by
+  why the fetcher did not get the copy (`held`): `raced` (the copy landed after the fetch started),
+  `unreachable`, `busy`, `unfunded`, `missed`, or `unasked` (the holder was not a probe target).
+- Every walk probe records how it ended (`Asked`, `sim/src/node/world.rs:326`) and, for transport
+  failures, why (`Cut`, `:343`, set by `note_cut`, `:2579`): a node that does not serve yet, a
+  partition, a down node, no route, an open circuit. Origin requests by owners above rank 0 are
+  counted by why rank 0 did not serve (`origin_per_page.skips`), and a `copy_held` repeat whose
+  holder fetched as such a skip is charged to that cause (`repeats.orphan`).
+- The simulator debits the origin attempt like production (`sim/src/node/world.rs:3108`,
+  counter `origin_unfunded`). The 120 to 300 node lagging-predecessor test now sees up to 3 owner
+  stale skips (bound 4, was 2; 48 to 52 before Known issue 12).
+
+### The bound (issue 15)
+
+For a page whose rank 0 does not change, a repeat while the previous fetcher still holds the page
+is either a skip (an owner above rank 0 fetched after its probe of rank 0 failed: rank 0 or the
+route to it unreachable, not serving, partitioned, busy, its own acquisition failed, or the owner
+could not fund a delegation), or the one rank 0 refetch of a copy such a skip left behind, or a
+fetch that raced the copy. Each skip is the previous fetch of at most one later request, so:
+
+- `copy_held <= skips + orphans` and `orphans <= skips`, hence `copy_held <= 2 * skips`;
+- the remaining class, `unexplained` (rank 0 fetching while a copy it or its delegate fetched is
+  still held, with no skip behind it), is zero. It is the hard invariant `origin_repeat_explained`,
+  checked on every repeat at every scale, so every run below enforces it.
+
+Inherent (needs a failure the walk cannot see past): `failed` (an origin error at rank 0;
+retrying elsewhere is the availability the fallback exists for), `partition`, `down`. Avoidable
+elsewhere: `not_serving` is Known issue 14 (join track); with those members not ranked until they
+serve, the skip becomes an ownership move, which handoff probes and the `after_owner_move` bound
+cover. Budget-limited: `route` and `copy_only` are new Known issue 21.
+
+Tests: `combined::tests::failover_repeats_are_skips_or_their_orphans` (200 and 400 nodes,
+`full-failover` faults: classes sum to the repeats, causes sum to `copy_held`, `unexplained` is 0,
+`orphans <= skips`, `copy_held <= skips + orphans`); `repeat_origin_fetches_are_classified_and_bounded`
+and `joined_owners_copy_from_previous_owners` now sum all five classes and check the `held` split.
+
+### Fixes tried and rejected
+
+Each was measured at 5k (release, seed 1) and reverted.
+
+| Change | `copy_held` ff | Origin ff | Failed reads ff | Side effect |
+| --- | --- | --- | --- | --- |
+| Debit only (kept) | 247 | 13,171 | 77 | - |
+| Rank 0 asks successors copy-only before origin, within budget | 266 | 13,196 | 59 | `storm` failed 18,013 to 23,856, `zipf` 4,627 to 5,589 |
+| Plus readers fund a first-visited rank 0 with 8 links and 2 more credits | 211 | 13,145 | 57 | `storm` 31,362 failed, `zipf` 11,873, `churn` ok 167k to 157k |
+| Delegate without keeping the owner's own origin credit | 175 | 13,093 | 113 | +36 failed reads in 5xx bursts |
+| A delegation answered `Unavailable` ends the owner's walk (reader retries) | 181 | 13,099 | 100 | +23 failed reads, +224 retries |
+| Delegation route up to 8 links | 247 | 13,171 | 77 | no change (route skips are not on that route) |
+
+(The first three rows predate the debit and compare with 264 / 13,193 / 61.) Successor probes found
+a copy 19 times in 4,285 probes at 5k and 39 in 16,713 at 50k: rank 0 inherits 1 to 6 links from
+its requester, too few for a route to a successor (2,817 of its successor probes failed route
+search at 5k), and when reached by delegation it holds only its origin credit. Every change that
+moves the copy to rank 0 does so by giving up the owner's own fallback attempt, which costs reads
+when rank 0 fails.
+
+### Evidence
+
+Release build, seed 1, `full-*` with `{"request_rate": 0.005}`, `churn` with defaults. Before is
+the branch after beed76792 (classification only; origin numbers equal the wave 1 merge), after is
+293eaa5d4. Origin: total, max per page, pages fetched more than once. `read_ns` in ms.
+
+| 5,000 nodes | Origin before | after | Reads ok / failed before | after | p50 / p99 before | after |
+| --- | --- | --- | --- | --- | --- | --- |
+| full-failover | 13,193, 7, 486 | 13,171, 5, 471 | 34,004 / 61 | 33,987 / 77 | 60 / 256 | 60 / 288 |
+| full-churn | 13,640, 5, 987 | 13,635, 5, 992 | 34,199 / 76 | 34,193 / 78 | 60 / 144 | 60 / 144 |
+| churn | 1,041, 2, 17 | 1,041, 2, 17 | 167,252 / 1,503 | 167,252 / 1,503 | 384 / 704 | 384 / 704 |
+
+Repeat classes after (`after_owner_move` / `after_failure` / `copy_lost` / `copy_held`, then skips
+and `unexplained`): `full-failover` 0 / 376 / 2 / 247 (skips 791, orphans 180: `failed` 82,
+`copy_only` 41, `not_serving` 31, `partition` 19, `route` 7; unexplained 0), `full-churn`
+1,044 / 52 / 2 / 18 (skips 89, unexplained 0), `churn` 13 / 0 / 0 / 4 (skips 16, all `busy`;
+unexplained 0). The added failed reads in `full-failover` are the debit: fills that reached origin
+without a credit now fail as in production.
+
+50,000 nodes, `full-failover`: see the table below (filled from
+`/tmp/opencode/r4-repeat/after-50k-full-failover.json`).
