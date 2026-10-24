@@ -141,6 +141,50 @@ fn failure_and_retry_semantics() {
 }
 
 #[test]
+fn rejected_leader_fails_and_next_waiter_leads() {
+    let now = Instant::now();
+    let deadline = now + Duration::from_secs(10);
+    let mut t = table(FlightLimits::default(), now);
+    let mut wakes = Vec::new();
+    let p = page(4);
+    let a = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
+    let b = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
+    assert_eq!(t.poll(&p, a, now, 1, &mut wakes), Ok(Event::Lead));
+    assert_eq!(t.poll(&p, b, now, 2, &mut wakes), Ok(Event::Pending));
+    // Only leader-held flights accept a rejection, and only origin errors.
+    assert_eq!(
+        t.reject(&p, b, Error::OriginRejected, &mut wakes),
+        Err(Error::Internal)
+    );
+    assert_eq!(t.reject(&p, a, Error::Io, &mut wakes), Err(Error::Internal));
+    wakes.clear();
+    t.reject(&p, a, Error::OriginRejected, &mut wakes).unwrap();
+    assert!(wakes.contains(&2), "{wakes:?}");
+    assert_eq!(
+        t.poll(&p, a, now, 1, &mut wakes),
+        Ok(Event::Failed(Error::OriginRejected))
+    );
+    assert_eq!(t.poll(&p, b, now, 2, &mut wakes), Ok(Event::Lead));
+    t.finish(&p, b, Outcome::Published(Acquired::Plain(5)), &mut wakes)
+        .unwrap();
+    // The rejected caller is not served another caller's result.
+    assert_eq!(
+        t.poll(&p, a, now, 1, &mut wakes),
+        Ok(Event::Failed(Error::OriginRejected))
+    );
+    assert_eq!(t.poll(&p, b, now, 2, &mut wakes), Ok(Event::Complete(5)));
+    // A forbidden sole leader fails with its own error; no waiter remains.
+    let q = page(5);
+    let c = waiter(t.join(&q, now, deadline, 2, true, &mut Unlimited, &mut wakes));
+    assert_eq!(t.poll(&q, c, now, 1, &mut wakes), Ok(Event::Lead));
+    t.reject(&q, c, Error::OriginForbidden, &mut wakes).unwrap();
+    assert_eq!(
+        t.poll(&q, c, now, 1, &mut wakes),
+        Ok(Event::Failed(Error::OriginForbidden))
+    );
+}
+
+#[test]
 fn canceled_leader_is_revoked_and_follower_takes_over() {
     let now = Instant::now();
     let deadline = now + Duration::from_secs(10);

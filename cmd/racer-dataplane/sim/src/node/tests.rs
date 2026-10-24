@@ -188,6 +188,30 @@ fn origin_errors_follow_the_fill_plan() {
     assert!(counter(&report, "error_origin_forbidden") > 0);
 }
 
+/// A 403 fails only the leader that received it; a waiter on the same flight
+/// is re-elected and fills with its own budget (Known issue 8, matching
+/// production `Flights::fail(OriginForbidden)`).
+#[test]
+fn origin_forbidden_reelects_a_waiter() {
+    let mut config = quiet(64);
+    config.storms = vec![Storm {
+        at_ns: 0,
+        object: 1,
+        nodes: 64,
+        window_ns: MILLIS,
+    }];
+    config.origin_errors = OriginErrors {
+        p412: 0.0,
+        p403: 0.5,
+        p5xx: 0.0,
+    };
+    let (_, report) = run(config, 11);
+    assert!(counter(&report, "origin_403") > 0);
+    assert!(counter(&report, "flight_reelected") > 0);
+    assert_eq!(counter(&report, "flight_unexpected_lead"), 0);
+    assert!(counter(&report, "error_origin_forbidden") > 0);
+}
+
 /// Tight quotas reject work per resource class.
 #[test]
 fn tight_quotas_reject_by_class() {
@@ -446,4 +470,20 @@ fn hedging_beats_a_slow_primary() {
         mean(&on),
         mean(&off)
     );
+}
+
+/// A duplicate publish of a resident page does not refresh its recency, as in
+/// production `MemoryCache::publish` (Known issue 9): inserting 0, 1, 0, 2
+/// into a two-page worker cache evicts 0, the oldest insert.
+#[test]
+fn duplicate_memory_publish_does_not_touch() {
+    let mut config = quiet(4);
+    config.memory_pages = 2 * u32::from(config.workers);
+    let mut world = NodeWorld::new(config, 1);
+    for page in [0, 1, 0, 2] {
+        world.memory_insert(0, 0, page);
+    }
+    assert!(!world.in_memory(0, 0, 0));
+    assert!(world.in_memory(0, 0, 1));
+    assert!(world.in_memory(0, 0, 2));
 }

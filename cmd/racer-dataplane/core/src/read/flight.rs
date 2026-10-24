@@ -310,6 +310,34 @@ impl<C: Clone, P: Clone, O, S: BuildHasher> PageFlights<C, P, O, S> {
         Ok(())
     }
 
+    /// Leader `id`'s own origin attempt was rejected for its credentials
+    /// (`error` is `OriginRejected` or `OriginForbidden`). Matches production
+    /// `Flights::fail` with `AcquisitionFailure::OriginRejected`/`OriginForbidden`:
+    /// the leader fails with `error` and is never served another caller's
+    /// result for this cohort, and the next eligible waiter is elected.
+    pub fn reject(
+        &mut self,
+        page: &PageId,
+        id: u64,
+        error: Error,
+        wakes: &mut Vec<Token>,
+    ) -> Result<()> {
+        if !matches!(error, Error::OriginRejected | Error::OriginForbidden) {
+            return Err(Error::Internal);
+        }
+        let split = self.split;
+        let flight = self.flights.get_mut(page).ok_or(Error::Internal)?;
+        flight
+            .state
+            .validate_leader(id, true)
+            .map_err(|_| Error::Internal)?;
+        flight.state.cancel(id, error);
+        flight.state.begin_completion(Outcome::Retry);
+        flight.state.notify(wakes);
+        flight.state.settle(true, Error::Unavailable, split, wakes);
+        Ok(())
+    }
+
     /// Cancel waiter `id`; a canceled leader is revoked on the next refresh.
     pub fn cancel(&mut self, page: &PageId, id: u64, wakes: &mut Vec<Token>) {
         if let Some(flight) = self.flights.get_mut(page) {

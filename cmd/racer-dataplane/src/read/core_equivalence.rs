@@ -155,10 +155,6 @@ struct Caller {
     leader: Option<FlightLeader>,
     scope: &'static RequestScope,
     core: u64,
-    /// Rejected by its own origin attempt. Production reports
-    /// `Failed(OriginRejected)` to it; core keeps it parked (see
-    /// [`origin_rejection_is_retry_in_core`]), so its polls are not compared.
-    rejected: bool,
 }
 
 struct Pair {
@@ -288,7 +284,6 @@ impl Pair {
                 leader: None,
                 scope,
                 core: id,
-                rejected: false,
             }),
             _ => None,
         };
@@ -310,9 +305,7 @@ impl Pair {
             Ok(core::Event::Pending) => Obs::Pending,
             Err(e) => Obs::Err(format!("{e:?}")),
         };
-        if !caller.rejected {
-            assert_eq!(prod, core, "poll");
-        }
+        assert_eq!(prod, core, "poll");
         if let Some(leader) = leader {
             caller.leader = Some(leader);
         }
@@ -370,10 +363,12 @@ impl Pair {
             .flights
             .fail(leader, AcquisitionFailure::OriginRejected)
             .map(|_| ());
-        let core = self
-            .table
-            .finish(&self.page, caller.core, Outcome::Retry, &mut self.wakes);
-        caller.rejected = prod.is_ok();
+        let core = self.table.reject(
+            &self.page,
+            caller.core,
+            racer_core::read::Error::OriginRejected,
+            &mut self.wakes,
+        );
         settle(prod, core);
     }
 
@@ -531,18 +526,13 @@ fn flights_match_page_flights_on_seeded_traces() {
     }
 }
 
-/// Divergence (Known issue 8 in `designs/racer-core-simulation.md`):
-/// production `Flights::fail(OriginRejected)` (`src/read/flight.rs:1441`)
-/// cancels the supplying caller with `OriginRejected` before `Outcome::Retry`,
-/// so that caller fails even when another caller later publishes. Core
-/// `PageFlights::finish(Outcome::Retry)` (`core/src/read/flight.rs:295`) has
-/// no rejection error: the rejected leader stays parked and receives the later
-/// result. Both re-elect the next eligible waiter (compared by the trace
-/// test). The simulator never finishes a flight with `Retry`
-/// (`sim/src/node/world.rs`, `FlightEvent::Lead` arm), so its runs are not
-/// affected. This test pins the current behavior of both.
+/// Known issue 8 (resolved): production `Flights::fail(OriginRejected)`
+/// fails the supplying caller, which must not be served a page fetched with
+/// another caller's credentials, and re-elects the next eligible waiter. Core
+/// `PageFlights::reject` does the same; both keep failing the rejected caller
+/// after another caller publishes.
 #[test]
-fn origin_rejection_is_retry_in_core() {
+fn origin_rejection_fails_only_the_rejected_caller() {
     let clock = uring_runtime::environment::SimulationClock::new(77);
     let _environment = clock.environment(0).enter();
     let mut pair = Pair::new(core::FlightLimits::default());
@@ -552,21 +542,11 @@ fn origin_rejection_is_retry_in_core() {
     assert_eq!(pair.poll(&mut b), Obs::Pending);
     pair.reject(&mut a);
     assert_eq!(pair.poll(&mut b), Obs::Lead);
-    let (prod, _) = poll_prod(a.prod.as_mut().unwrap());
-    assert_eq!(prod, Obs::Failed("OriginRejected".into()));
-    let core = pair
-        .table
-        .poll(&pair.page, a.core, Pair::now(), a.core, &mut pair.wakes)
-        .unwrap();
-    assert_eq!(core, core::Event::Pending);
+    // `Pair::poll` asserts production and core agree.
+    assert_eq!(pair.poll(&mut a), Obs::Failed("OriginRejected".into()));
     pair.publish(&mut b, 9);
-    let (prod, _) = poll_prod(a.prod.as_mut().unwrap());
-    assert_eq!(prod, Obs::Failed("OriginRejected".into()));
-    let core = pair
-        .table
-        .poll(&pair.page, a.core, Pair::now(), a.core, &mut pair.wakes)
-        .unwrap();
-    assert_eq!(core, core::Event::Complete(9));
+    assert_eq!(pair.poll(&mut a), Obs::Failed("OriginRejected".into()));
+    assert_eq!(pair.poll(&mut b), Obs::Complete(9));
     pair.detach(a);
     pair.detach(b);
     pair.check();
@@ -592,9 +572,6 @@ impl SimMemory {
 
     fn insert(&mut self, page: u32) {
         if self.lru.pages.contains_key(&page) {
-            // Production does not touch here; see
-            // `duplicate_publish_touches_only_in_the_simulator`.
-            self.lru.touch(&page).unwrap();
             return;
         }
         while self.lru.len() >= self.cap {
@@ -675,11 +652,11 @@ fn memory_cache_matches_sim_lru_on_seeded_traces() {
             let before = sim.resident();
             if rng.below(2) == 0 {
                 assert_eq!(prod.hit(page), sim.hit(page), "seed {seed} step {step}");
-            } else if !before.contains(&page) {
-                // Duplicate publishes differ; they are pinned separately.
+            } else {
+                // Includes duplicate publishes of resident pages.
                 prod.insert(page);
                 sim.insert(page);
-                evictions += usize::from(before.len() == cap);
+                evictions += usize::from(before.len() == cap && !before.contains(&page));
             }
             assert_eq!(
                 prod.resident(PAGES),
@@ -691,16 +668,12 @@ fn memory_cache_matches_sim_lru_on_seeded_traces() {
     assert!(evictions > 100, "{evictions}");
 }
 
-/// Divergence (Known issue 9 in `designs/racer-core-simulation.md`):
-/// production `MemoryCache::publish` returns early for a resident page
-/// without touching it (`src/memory.rs:1415-1418`, "must not ... turn its
-/// historical deadline into renewed freshness"), while the simulator's
-/// `memory_insert` touches it (`sim/src/node/world.rs:1084-1086`). The
-/// simulator calls `memory_insert` when a fill publishes or a disk hit
-/// promotes a page, so a page already in memory is rare there; when it
-/// happens the simulator keeps that page slightly longer than production.
+/// Known issue 9 (resolved): a duplicate publish of a resident page does
+/// not touch it in production (`MemoryCache::publish`) or in the simulator
+/// (`memory_insert` in `sim/src/node/world.rs`), so both evict the oldest
+/// insert.
 #[test]
-fn duplicate_publish_touches_only_in_the_simulator() {
+fn duplicate_publish_does_not_touch() {
     let prod = ProdMemory::new(2);
     let mut sim = SimMemory {
         lru: Default::default(),
@@ -710,8 +683,6 @@ fn duplicate_publish_touches_only_in_the_simulator() {
         prod.insert(page);
         sim.insert(page);
     }
-    // Production evicts the oldest insert (0); the simulator's touch moved 0
-    // behind 1, so it evicts 1.
     assert_eq!(prod.resident(3), [1, 2].into());
-    assert_eq!(sim.resident(), [0, 2].into());
+    assert_eq!(sim.resident(), [1, 2].into());
 }
