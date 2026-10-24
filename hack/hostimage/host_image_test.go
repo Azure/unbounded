@@ -50,6 +50,7 @@ func TestHillsboroImageIsPinnedArm64Derivative(t *testing.T) {
 		"COPY images/netboot/assets/vendor-data.tmpl",
 		"pigz -1 -n -c /work/disk.img > /disk/disk.img.gz",
 		"COPY --from=build /disk /disk",
+		`io.unbounded.host.qualification="blocked-bcho-has-no-github-ssh-keys"`,
 	} {
 		require.Contains(t, containerfile, value)
 	}
@@ -150,6 +151,9 @@ func TestHillsboroDocumentationKeepsActivationSeparate(t *testing.T) {
 		"native cloud-init",
 		"bcho",
 		"qualification blocker",
+		"`spec.host.netboot.cloudInit.userDataConfigMapRef: gb200-metal-host-access`",
+		"must be removed or replaced",
+		"go run ./hack/cmd/hostimage-userdata-preflight -",
 	} {
 		require.Contains(t, readme, value)
 	}

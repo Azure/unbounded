@@ -65,6 +65,27 @@ spec:
 For a legacy Machine, replace `spec.pxe.image` instead and leave
 `spec.pxe.netbootImage` unchanged.
 
+Before changing the image reference, verify that the Machine's cloud-init
+user-data does not define a top-level `users` key. User-data has higher
+precedence than both vendor-data and the image's `cloud.cfg.d`; a `users` key
+would replace the image-baked access policy.
+
+The current temporary
+`spec.host.netboot.cloudInit.userDataConfigMapRef: gb200-metal-host-access`
+defines `users: [unbounded-metal]`. It must be removed or replaced with
+user-data that does not define `users` before any `HostReplace`. This repository
+includes a fail-closed preflight for the referenced ConfigMap content:
+
+```bash
+kubectl -n <namespace> get configmap gb200-metal-host-access \
+  -o jsonpath='{.data.user-data}' |
+  go run ./hack/cmd/hostimage-userdata-preflight -
+```
+
+The command exits nonzero for invalid cloud-config or any top-level `users`
+key. Running the preflight is read-only; it does not update the Machine or
+ConfigMap.
+
 Updating the image reference alone is non-destructive. Metalman uses the new
 disk only during a later, separately authorized `HostReplace`. Do not create a
 `HostReplace`, reboot a host, or otherwise activate this image as part of the
