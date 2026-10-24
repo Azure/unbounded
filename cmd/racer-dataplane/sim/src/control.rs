@@ -923,9 +923,22 @@ impl ControlSim {
         if cached {
             let t = at(now + *latency);
             reserved = self.seats[seat].auth.calls(&key, t);
-            if !self.seats[seat].budget.try_reserve(reserved, t) {
-                self.metrics.incr("ctl_auth_overloaded");
-                return Err(());
+            match self.seats[seat]
+                .budget
+                .reserve(reserved, t, limits::AUTH_BUDGET_WAIT)
+            {
+                Some(wait) => {
+                    if !wait.is_zero() {
+                        self.metrics.incr("ctl_auth_waited");
+                        self.metrics
+                            .observe("ctl_auth_wait_ns", wait.as_nanos() as u64);
+                    }
+                    *latency += wait.as_nanos() as Nanos;
+                }
+                None => {
+                    self.metrics.incr("ctl_auth_overloaded");
+                    return Err(());
+                }
             }
         }
         let pod = pod_path(c);

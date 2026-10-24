@@ -205,7 +205,8 @@ async fn bindings(shared: &Shared) -> Result<Bindings, ProtocolFailure> {
 /// The Pod and Node are always read live. The TokenReview and the
 /// DaemonSet and ServiceAccount reads may come from [`Shared::authz`]. All
 /// API calls the authorization will make are reserved from
-/// [`Shared::auth_budget`] first; without budget it answers `Overloaded`
+/// [`Shared::auth_budget`] first, waiting up to
+/// [`limits::AUTH_BUDGET_WAIT`] for it; beyond that it answers `Overloaded`
 /// before calling the API, so a storm is shed here rather than by API
 /// server 429s part way through an authorization.
 pub async fn authorize(
@@ -217,12 +218,13 @@ pub async fn authorize(
     let expires = token_expiry(token, now)?;
     let key = authz::token_key(token);
     let calls = shared.authz.borrow().calls(&key, Instant::now());
-    if !shared
+    let wait = shared
         .auth_budget
         .borrow_mut()
-        .try_reserve(calls, Instant::now())
-    {
-        return Err(ProtocolFailure::Overloaded);
+        .reserve(calls, Instant::now(), limits::AUTH_BUDGET_WAIT)
+        .ok_or(ProtocolFailure::Overloaded)?;
+    if !wait.is_zero() {
+        crate::exec::sleep(wait).await;
     }
     let user = reviewed(shared, token, &key, expires, now).await?;
     let refuse = |bindings: bool| {

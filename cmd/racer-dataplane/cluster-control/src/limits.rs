@@ -119,6 +119,11 @@ pub const MAX_BOOTSTRAPS: usize = 32;
 /// number, is what sizes the rate in a storm.
 pub const AUTH_API_QPS: f64 = 400.0;
 
+/// Longest an authorization waits in the seat for [`AUTH_API_QPS`] budget
+/// before answering `Overloaded`. Held under a bootstrap slot and well
+/// inside [`IO_TIMEOUT`].
+pub const AUTH_BUDGET_WAIT: Duration = Duration::from_secs(2);
+
 /// Burst of [`AUTH_API_QPS`]: a quarter second of calls, so 16 seats
 /// starting together send at most 1,600 calls before the first 429 cuts.
 pub const AUTH_API_BURST: f64 = 100.0;

@@ -248,16 +248,31 @@ impl ApiBudget {
 
     /// Reserve `calls` tokens at `now`. Fails, taking nothing, when short.
     pub fn try_reserve(&mut self, calls: u32, now: Instant) -> bool {
+        self.reserve(calls, now, Duration::ZERO).is_some()
+    }
+
+    /// Reserve `calls` tokens at `now`, borrowing against future refill:
+    /// returns how long the caller must wait before making the calls, at
+    /// most `max_wait`. Fails, taking nothing, when the wait would be
+    /// longer. Waiting a little in the seat instead of refusing keeps
+    /// clients out of exponential backoff, whose tail would otherwise set
+    /// the time to enroll everyone.
+    pub fn reserve(&mut self, calls: u32, now: Instant, max_wait: Duration) -> Option<Duration> {
         self.refill(now);
         let n = f64::from(calls);
-        if self.tokens + 1e-9 >= n {
-            self.tokens -= n;
-            self.stats.reserved += u64::from(calls);
-            true
+        let short = n - self.tokens;
+        let wait = if short <= 1e-9 {
+            Duration::ZERO
         } else {
+            Duration::from_secs_f64(short / self.qps)
+        };
+        if wait > max_wait {
             self.stats.refused += 1;
-            false
+            return None;
         }
+        self.tokens -= n;
+        self.stats.reserved += u64::from(calls);
+        Some(wait)
     }
 
     /// Return tokens of calls that were reserved but not made.
@@ -375,9 +390,30 @@ mod tests {
         // Time going backwards does not mint tokens.
         assert!(!b.try_reserve(1, t0));
         // Refill caps at burst.
+        assert!(
+            b.reserve(1, t0 + Duration::from_secs(1), Duration::ZERO)
+                .is_some()
+        );
         assert!(b.try_reserve(5, t0 + Duration::from_secs(100)));
         assert!(!b.try_reserve(1, t0 + Duration::from_secs(100)));
         assert_eq!(b.stats.refused, 5);
+    }
+
+    #[test]
+    fn budget_reservations_wait_up_to_a_bound() {
+        let t0 = Instant::now();
+        let mut b = ApiBudget::new(10.0, 5.0);
+        assert_eq!(b.reserve(5, t0, Duration::ZERO), Some(Duration::ZERO));
+        // 0.5 s of refill borrowed.
+        let w = b.reserve(5, t0, Duration::from_secs(1)).unwrap();
+        assert!((w.as_secs_f64() - 0.5).abs() < 1e-6, "{w:?}");
+        // Next in line waits behind it; past the bound it is refused and
+        // nothing is taken.
+        assert_eq!(b.reserve(10, t0, Duration::from_secs(1)), None);
+        let w = b.reserve(5, t0, Duration::from_secs(1)).unwrap();
+        assert!((w.as_secs_f64() - 1.0).abs() < 1e-6, "{w:?}");
+        assert_eq!(b.stats.refused, 1);
+        assert_eq!(b.stats.reserved, 15);
     }
 
     #[test]
