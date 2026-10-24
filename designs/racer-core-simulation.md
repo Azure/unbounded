@@ -340,6 +340,20 @@ Verified against the code at the start of this work.
 15. Dropping a dead member (issue 7 fix) is an ownership move and inherits issues 6 and 12: at
    50,000 nodes in `full-failover` it added 171 recoverable `Unavailable` reads and moved the
    worst page from 7 to 9 origin requests. See "Round 4: liveness".
+   After the wave 1 merge (handoff fixes present), `full-failover` classifies no repeat as
+   `after_owner_move` at 5k or 50k, and the worst page is 7 (5k) and 8 (50k, against 9 with
+   liveness alone), so the drop itself no longer adds unbounded repeats. It stays open because 50k
+   `full-failover` has 5,473 `copy_held` repeats (10.5% of 52,152 origin requests), above the 2%
+   that `repeat_origin_fetches_are_classified_and_bounded` enforces at small scale; 5k is at 2.0%.
+   Inference: the holders sit behind the scenario's partitions (19,325 partition link failures).
+   See "Round 4: combined (wave 1)".
+
+18. The relay hold from the capacity track (`Relay` reservation kept while a body streams, as in
+   `src/peer/server.rs:438-445` and `:660`) makes the 5k hot-page scenarios shed on the `Relay`
+   quota: `storm` 18,013 and `zipf` 4,627 reads fail `Unavailable` (692,964 and 366,626 relay
+   rejections), against 0 and 11 on the handoff branch. The capacity branch alone fails 23,040
+   `storm` reads (787,758 rejections), so the merge did not cause it; handoff's fixes reduce it.
+   Same family as issue 16 (fanout track). No invariant is relaxed.
 
 16. Hot-page peer throughput is capped by the page's `REPLICAS` owners: candidates are only the
    ranked owners (`src/read/candidates.rs:628-635`), so readers holding a copy never serve other
@@ -793,11 +807,14 @@ scenarios carry data-plane faults.
    handoff).
 14. Members not yet holding a membership are routable but refuse peer links; most 50k
    `full-failover` link failures (round 4, liveness).
-15. Dropping a dead member costs one ownership move (issues 6, 12) (round 4, liveness).
+15. Dropping a dead member costs one ownership move (issues 6, 12) (round 4, liveness); after the
+   merge no repeat follows an owner move, but 50k `full-failover` `copy_held` is 10.5%.
 16. Hot-page throughput is capped at `REPLICAS` owners' NICs; bound enforced by a test (round 4,
    capacity).
 17. Background reads during enrollment fail `Unavailable` near unenrolled members (round 4,
    capacity).
+18. Hot-page `storm` and `zipf` at 5k shed on the `Relay` quota since the relay hold (round 4,
+   combined wave 1).
 
 ## Round 2: production admission
 
@@ -1945,3 +1962,47 @@ histogram bucket. Wall time is not comparable: four tracks shared the host durin
 - Workspace tests: `read::range_stream::tests::responses_stream_more_than_three_pages_only_with_client_sized_http_framing`
   and `alloc` `buffer_tests::mmap_threshold_zero_alignment_and_matching_unmap` each failed once under
   load and pass alone; neither touches code changed here.
+
+## Round 4: combined (wave 1)
+
+The enroll, liveness, capacity, and handoff branches were cherry-picked in that order onto
+`racer-core-sim`. Code merged without conflicts except `sim/src/control.rs`, where enroll's
+authorization settings (`auth`, `auth_qps`, `auth_burst`) and liveness's `node_monitor_grace_ns`
+were both kept. In this document the new issues were renumbered: liveness 51 and 52 to 14 and 15,
+capacity 71 and 72 to 16 and 17. Commit hashes in the round 4 sections refer to the merged commits.
+
+Evidence, release build, seed 1, scenario defaults; `full-*` and `enrollment-storm` use
+`{"request_rate": 0.005}`. Origin is total, max per page, pages fetched more than once. "API 429s"
+is `ctl_apiserver_throttled`. The 5k runs ran 7 in parallel; the 50k runs one at a time, alongside
+one 50k run of another track.
+
+| Scenario | Reads ok / failed | Origin total, max, pages>1 | API 429s | Wall | Peak RSS | Hard failures |
+| --- | --- | --- | --- | --- | --- | --- |
+| storm 5k | 177,361 / 18,013 unavailable | 1,029, 2, 5 | - | 1:28 | 1.42 GiB | 0 |
+| zipf 5k | 148,195 / 4,627 unavailable | 42,763, 3, 4,673 | - | 2:06 | 1.50 GiB | 0 |
+| churn 5k | 167,252 / 1,503 (3 overloaded) | 1,041, 2, 17 | - | 1:07 | 0.99 GiB | 0 |
+| full-cold-start 5k | 95,054 / 50 | 7,009, 3, 79 | 65 | 0:35 | 0.53 GiB | 0 |
+| full-failover 5k | 34,004 / 61 | 13,193, 7, 486 | 56 | 0:42 | 0.32 GiB | 0 |
+| full-churn 5k | 34,199 / 76 | 13,640, 5, 987 | 0 | 0:45 | 0.29 GiB | 0 |
+| enrollment-storm 5k | all 5,000 enrolled at 31.4 s | - | 65 | 0:03 | 0.09 GiB | 0 |
+| full-cold-start 50k | 914,717 / 6,665 | 29,991, 3, 2,552 | 23,532 | 15:24 | 4.10 GiB | 0 |
+| full-churn 50k | 336,739 / 1,739 | 57,696, 9, 9,107 | 13,783 | 36:46 | 2.54 GiB | 0 |
+| full-failover 50k | 304,333 / 6,936 | 52,152, 8, 5,748 | 21,562 | 22:11 | 2.81 GiB | 0 |
+
+Against each track's own numbers:
+- enroll: 5k all enrolled at 31.4 s with 65 API 429s and 50k at 170.6 s with 23,532, identical.
+- capacity: 50k `full-cold-start` reads 914,717 / 6,665 against 884,120 / 11,753 on the capacity
+  branch; 5k 95,054 / 50 against 94,810 / 98.
+- liveness: `full-failover` 5k 61 failed (122 on its branch) and 50k 6,936 (12,759), with 178
+  reads failed while crashed (171) and 5 links to dead members.
+- handoff: 50k `full-churn` 57,696 origin requests, max 9, 9,107 pages>1, against 58,414, 9,
+  9,494; reads 336,739 / 1,739 against 334,957 / 1,779. 5k `full-churn`, `full-failover` and
+  `churn` match within a few percent.
+- Regression: 5k `storm` and `zipf` now fail 18,013 and 4,627 reads on the `Relay` quota, against
+  0 and 11 on the handoff branch. A storm run of the capacity branch alone fails 23,040, so the
+  cause is capacity's relay hold, not the merge; recorded as Known issue 18 rather than changed,
+  because the hold matches production (`src/peer/server.rs:438-445`, `:660`) and the hot-page
+  capacity is the fanout track's (issue 16).
+- Known issue 15 was rechecked with handoff's bound: no repeat is `after_owner_move` in
+  `full-failover` at either scale, but 50k `copy_held` is 10.5% of origin requests; it stays open.
+
