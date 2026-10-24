@@ -1,15 +1,19 @@
-//! Simulator admission policy over the real `flow_control::Quotas`.
+//! Simulator admission over the real `flow_control::Quotas` and the
+//! production admission rules.
 //!
-//! Production `AdmissionPolicy` (`src/admission.rs`) depends on dataplane
-//! configuration and telemetry, so the simulator implements
-//! `flow_control::Policy` itself with the resource classes the read path
-//! charges, the same limits (`src/admission.rs`, `Policy::limit`) and the
-//! same requires-wipe and covers rules. Cache ids are interned to `u32`
-//! (one simulated cache), so a charge never clones a string. Rejections are
-//! counted per class in a counter shared by every node.
+//! `limit`, `floor`, `max_keys`, `wakes`, `allows_stopped`, and `covers`
+//! delegate to `racer_core::admission::Rules`, the same rules the dataplane's
+//! `AdmissionPolicy` (`src/admission.rs`) delegates to, over production
+//! `ResourceClass`. Limits start from production per-worker defaults
+//! (`Limits::default()`) with the read-path dimensions taken from
+//! `NodeConfig`. Floors use the simulator's 1 MiB page (production 16 MiB).
+//! Only `rejected` differs: it counts per class in a counter shared by every
+//! node instead of recording telemetry. Cache ids are interned to `u32` (one
+//! simulated cache), so a charge never clones a `CacheId` string.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::rc::Rc;
 
 use flow_control::{Charge, Policy, Quotas, Rejection};
@@ -21,73 +25,53 @@ use super::config::NodeConfig;
 use super::ids::{CACHE, Ids};
 use crate::scenario::Fixed;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResourceClass {
-    Plaintext,
-    Ciphertext,
-    DirtyCiphertext,
-    Flight,
-    Waiter,
-    Relay,
-}
-
-impl ResourceClass {
-    pub const ALL: [Self; 6] = [
-        Self::Plaintext,
-        Self::Ciphertext,
-        Self::DirtyCiphertext,
-        Self::Flight,
-        Self::Waiter,
-        Self::Relay,
-    ];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Plaintext => "plaintext",
-            Self::Ciphertext => "ciphertext",
-            Self::DirtyCiphertext => "dirty_ciphertext",
-            Self::Flight => "flight",
-            Self::Waiter => "waiter",
-            Self::Relay => "relay",
-        }
-    }
-}
-
-impl flow_control::Class for ResourceClass {
-    const COUNT: usize = 6;
-
-    fn index(self) -> usize {
-        self as usize
-    }
-
-    fn requires_wipe(self) -> bool {
-        !matches!(self, Self::Ciphertext)
-    }
-}
+pub use racer_core::admission::ResourceClass;
+use racer_core::admission::{Floors, Limits, Rules};
 
 /// Rejection counts per class, plus key-table rejections at the end.
 pub type Rejections = Rc<RefCell<[u64; ResourceClass::ALL.len() + 1]>>;
 
 pub struct SimPolicy {
-    limits: [usize; 6],
+    rules: Rules,
     rejections: Rejections,
 }
 
-/// Production page size; `floor` rules use it like `src/admission.rs`.
+/// Simulated page size; production pages are 16 MiB (`PAGE_BYTES`).
 pub const PAGE_BYTES: usize = 1 << 20;
+
+/// Production `store::MAX_HEADER_BYTES` (`src/store.rs`), the per-record
+/// overhead in the ciphertext floor.
+pub const MAX_HEADER_BYTES: usize = 16384 + 4096;
+
+fn nonzero(value: u64) -> NonZeroUsize {
+    NonZeroUsize::new(usize::try_from(value).unwrap_or(usize::MAX)).unwrap_or(NonZeroUsize::MIN)
+}
+
+/// Production per-worker limits with the read-path dimensions the
+/// simulator configures. One simulated node is one production I/O worker.
+pub fn limits(config: &NodeConfig) -> Limits {
+    Limits {
+        plaintext_bytes: nonzero(config.plaintext_bytes),
+        ciphertext_bytes: nonzero(config.ciphertext_bytes),
+        dirty_bytes: nonzero(config.dirty_bytes),
+        flights: nonzero(config.flights.into()),
+        waiters_per_flight: nonzero(config.waiters_per_flight.into()),
+        relay_transfers: nonzero(config.relay_transfers.into()),
+        cached_paths: nonzero(config.path_entries.into()),
+        path_cache_bytes: nonzero(config.path_bytes),
+        active_path_searches: nonzero(config.active_searches.into()),
+        retained_snapshots: nonzero(config.retained_versions),
+        ..Limits::default()
+    }
+}
 
 impl SimPolicy {
     pub fn new(config: &NodeConfig, rejections: Rejections) -> Self {
-        let flights = config.flights as usize;
         Self {
-            limits: [
-                config.plaintext_bytes as usize,
-                config.ciphertext_bytes as usize,
-                config.dirty_bytes as usize,
-                flights,
-                flights.saturating_mul(config.waiters_per_flight as usize),
-                config.relay_transfers as usize,
-            ],
+            rules: Rules::new(
+                limits(config),
+                Floors::for_page(PAGE_BYTES, MAX_HEADER_BYTES),
+            ),
             rejections,
         }
     }
@@ -98,27 +82,35 @@ impl Policy for SimPolicy {
     type Key = u32;
 
     fn limit(&self, class: ResourceClass) -> usize {
-        self.limits[class as usize]
+        self.rules.limit(class)
     }
 
     fn floor(&self, class: ResourceClass) -> usize {
-        match class {
-            ResourceClass::Plaintext => PAGE_BYTES,
-            ResourceClass::Ciphertext | ResourceClass::DirtyCiphertext => PAGE_BYTES + 16,
-            _ => 1,
-        }
+        self.rules.floor(class)
+    }
+
+    fn progress(&self, class: ResourceClass) -> usize {
+        self.rules.progress(class)
+    }
+
+    fn weighted(class: ResourceClass) -> bool {
+        Rules::weighted(class)
     }
 
     fn max_keys(&self) -> usize {
-        4096
+        self.rules.max_keys()
     }
 
-    fn wakes(_: ResourceClass) -> bool {
-        false
+    fn wakes(class: ResourceClass) -> bool {
+        Rules::wakes(class)
+    }
+
+    fn allows_stopped(class: ResourceClass) -> bool {
+        Rules::allows_stopped(class)
     }
 
     fn covers(class: ResourceClass) -> bool {
-        matches!(class, ResourceClass::Ciphertext)
+        Rules::covers(class)
     }
 
     fn rejected(&self, rejection: Rejection<ResourceClass>) {
@@ -258,6 +250,13 @@ mod tests {
         assert_eq!(counts[ResourceClass::Plaintext as usize], 0);
         assert!(reserve(&quotas, ResourceClass::Relay, 17).is_err());
         assert_eq!(ResourceClass::Relay.name(), "relay");
+        // Production rules: unconfigured classes keep production defaults.
+        assert_eq!(quotas.limit(ResourceClass::IngressConnection), 45);
+        assert_eq!(quotas.policy().max_keys(), 4096);
+        assert_eq!(
+            quotas.policy().floor(ResourceClass::Ciphertext),
+            PAGE_BYTES + (64 << 10)
+        );
         assert_eq!(read_error(flow_control::Error::Io), Error::Unavailable);
     }
 }
