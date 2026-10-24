@@ -497,6 +497,8 @@ pub struct NodeWorld {
     /// End times of page bodies each (node, page) is still streaming
     /// (production: page responses being written, `send_http_response`).
     streaming: HashMap<(u32, u64), Vec<Nanos>, Fixed>,
+    /// End times of all page bodies each node is still streaming.
+    bodies: HashMap<u32, Vec<Nanos>, Fixed>,
     origin_per_page: HashMap<u64, u32, Fixed>,
     /// Per page: the node that last asked origin for it and the page's rank 0
     /// under that request's membership (see [`Self::classify_repeat`]).
@@ -607,6 +609,7 @@ impl NodeWorld {
             writes: HashMap::default(),
             held: HashMap::default(),
             streaming: HashMap::default(),
+            bodies: HashMap::default(),
             origin_per_page: HashMap::default(),
             last_origin: HashMap::default(),
             tasks: HashMap::default(),
@@ -2593,9 +2596,9 @@ impl NodeWorld {
     }
 
     /// Production hot-page shed (`racer_core::read::fanout::shed_hot_page`):
-    /// an owner already streaming `HOT_PAGE_BODIES` bodies of `page` answers
-    /// `Overloaded` to a requester that is neither an owner nor a helper of
-    /// the page.
+    /// an owner already streaming `HOT_PAGE_BODIES` bodies of `page`, at
+    /// least half of all bodies it streams, answers `Overloaded` to a
+    /// requester that is neither an owner nor a helper of the page.
     fn shed_hot(&mut self, dest: u32, requester: u32, page: u64) -> bool {
         let now = self.now();
         let streaming = match self.streaming.get_mut(&(dest, page)) {
@@ -2612,6 +2615,17 @@ impl NodeWorld {
         if streaming < HOT_PAGE_BODIES || !self.config.node.fanout {
             return false;
         }
+        let all = match self.bodies.get_mut(&dest) {
+            Some(ends) => {
+                ends.retain(|end| *end > now);
+                let n = ends.len();
+                if n == 0 {
+                    self.bodies.remove(&dest);
+                }
+                n
+            }
+            None => 0,
+        };
         let w = self.ids.worker(page);
         if !self.owned(dest, w, page) {
             return false;
@@ -2633,7 +2647,7 @@ impl NodeWorld {
                     .is_owner(&*members, &page.to_be_bytes(), |o| o == p)
             }
         };
-        shed_hot_page(true, streaming, exempt)
+        shed_hot_page(true, streaming, all, exempt)
     }
 
     fn serve(&mut self, mid: u64) {
@@ -2761,6 +2775,7 @@ impl NodeWorld {
             };
             if done > now {
                 self.streaming.entry((from, m.page)).or_default().push(done);
+                self.bodies.entry(from).or_default().push(done);
             }
             self.metrics.add("peer_bytes", bytes * links);
             self.metrics.observe("hops", links);
@@ -2843,14 +2858,6 @@ impl NodeWorld {
                 })
             }
         };
-        if probe.hedge.is_none()
-            && matches!(outcome, Ok(Outcome::Copy))
-            && self.fills.get(&probe.fill).is_some_and(
-                |f| matches!(&f.walk, Walking::Candidates(walk) if walk.pending_helper()),
-            )
-        {
-            self.metrics.incr("helper_copies");
-        }
         match probe.hedge {
             None => self.complete_probe(probe.fill, outcome),
             Some(primary) => {
@@ -2909,6 +2916,21 @@ impl NodeWorld {
             return;
         };
         fill.probe = None;
+        if let Walking::Candidates(walk) = &fill.walk
+            && walk.pending_helper()
+        {
+            let label = match &outcome {
+                Ok(Outcome::Copy) => "helper_copies",
+                Ok(Outcome::Transport(ProbeOutcome::Unreachable)) => "helper_unreachable",
+                Ok(Outcome::Transport(_) | Outcome::Probe(ProbeOutcome::Overloaded)) => {
+                    "helper_overloaded"
+                }
+                Ok(Outcome::Shed) => "helper_shed",
+                Ok(_) => "helper_misses",
+                Err(_) => "helper_errors",
+            };
+            self.metrics.incr(label);
+        }
         match &mut fill.walk {
             Walking::Candidates(walk) => match outcome {
                 Err(e) => self.hard_fail(id, e),
@@ -3418,6 +3440,7 @@ impl NodeWorld {
                 + self.ranges.len() * 96
                 + self.writes.len() * 96
                 + self.streaming.len() * 64
+                + self.bodies.len() * 64
                 + self.tasks.len() * (std::mem::size_of::<Task>() + 256),
         ));
         list.push(("origin_per_page", self.origin_per_page.capacity() * 16));

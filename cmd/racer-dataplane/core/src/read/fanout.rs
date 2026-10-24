@@ -89,24 +89,27 @@ fn fnv(parts: &[&[u8]]) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Concurrent bodies of one page an owner streams to readers before it sheds
-/// further readers of that page with `Overloaded` (see [`shed_hot_page`]).
-/// Equal to the default relay quota (`relay_transfers`, 16 bodies a worker
-/// forwards at once): an owner keeps as many bodies of one page in flight as
-/// a relay may carry. In the simulator 4 and 8 shed Zipf-popular pages that
-/// the owner would have served within the deadline, adding a relayed helper
-/// hop under global load ("Round 4: fanout").
-pub const HOT_PAGE_BODIES: usize = 16;
+/// Concurrent bodies of one page an owner writes before it may shed further
+/// readers of that page with `Overloaded` (see [`shed_hot_page`]). Chosen by
+/// measurement ("Round 4: fanout" in `designs/racer-core-simulation.md`):
+/// at 4 to 16 owners shed Zipf-popular pages they would have served within
+/// the deadline, and the relayed helper hop failed more reads than it saved;
+/// at 32 the Zipf scenario is unchanged within seed noise while storms keep
+/// most of the gain.
+pub const HOT_PAGE_BODIES: usize = 32;
 
-/// Whether an owner sheds a request for a page it is already streaming to
-/// [`HOT_PAGE_BODIES`] requesters. The shed requester asks its helper (the
+/// Whether an owner sheds a request for a page it is already writing to at
+/// least [`HOT_PAGE_BODIES`] requesters, when that page is at least half of
+/// the `all` bodies the owner is writing (the page is the owner's queue; when
+/// many pages share a busy NIC, moving their readers to helpers only adds a
+/// relayed hop for each of them). The shed requester asks its helper (the
 /// walk's overflow step), which the owner always serves, so the owner's NIC
 /// feeds at most [`fanout_width`] helpers plus a few readers per page instead
 /// of a queue of readers that time out. Owners and helpers of the page are
 /// never shed (`exempt`), and non-owners never shed: a helper queues the
 /// readers it was chosen for.
-pub fn shed_hot_page(owner: bool, streaming: usize, exempt: bool) -> bool {
-    owner && !exempt && streaming >= HOT_PAGE_BODIES
+pub fn shed_hot_page(owner: bool, streaming: usize, all: usize, exempt: bool) -> bool {
+    owner && !exempt && streaming >= HOT_PAGE_BODIES && streaming * 2 >= all
 }
 
 /// Whether the member at `position` is one of `page`'s helpers (any reader
@@ -223,11 +226,15 @@ mod tests {
     }
 
     #[test]
-    fn owners_shed_only_non_exempt_requesters_of_a_hot_page() {
-        assert!(!shed_hot_page(true, HOT_PAGE_BODIES - 1, false));
-        assert!(shed_hot_page(true, HOT_PAGE_BODIES, false));
-        assert!(!shed_hot_page(true, usize::MAX, true));
-        assert!(!shed_hot_page(false, usize::MAX, false));
+    fn owners_shed_only_non_exempt_requesters_of_a_dominant_hot_page() {
+        let n = HOT_PAGE_BODIES;
+        assert!(!shed_hot_page(true, n - 1, n - 1, false));
+        assert!(shed_hot_page(true, n, n, false));
+        assert!(shed_hot_page(true, n, 2 * n, false));
+        // A page that is not most of the owner's queue is not shed.
+        assert!(!shed_hot_page(true, n, 2 * n + 1, false));
+        assert!(!shed_hot_page(true, n, n, true));
+        assert!(!shed_hot_page(false, n, n, false));
     }
 
     #[test]

@@ -358,9 +358,10 @@ impl PeerServer {
         }
     }
 
-    /// Bodies of `page` this server is writing now.
-    pub(crate) fn streaming(&self, page: &crate::model::PageId) -> usize {
-        self.streaming.borrow().get(page).copied().unwrap_or(0)
+    /// Bodies of `page` this server is writing now, and of all pages.
+    pub(crate) fn streaming(&self, page: &crate::model::PageId) -> (usize, usize) {
+        let pages = self.streaming.borrow();
+        (pages.get(page).copied().unwrap_or(0), pages.values().sum())
     }
 
     /// Count `n` bodies of `page` as being written until the result drops.
@@ -377,7 +378,8 @@ impl PeerServer {
 
     /// Whether to answer a page request with `Overloaded` because this node
     /// owns the page and is already writing `HOT_PAGE_BODIES` bodies of it to
-    /// other requesters (Known issue 71). The requester then asks one of the
+    /// other requesters, at least half of all the bodies it is writing (Known
+    /// issue 71). The requester then asks one of the
     /// page's helpers, which, like the page's owners, is never shed. The
     /// ranking is only computed for a page that is already hot, and stays in
     /// this server's placement cache.
@@ -388,7 +390,7 @@ impl PeerServer {
         membership: &std::sync::Arc<crate::topology::Membership>,
     ) -> bool {
         use racer_core::read::fanout::{HOT_PAGE_BODIES, is_helper, shed_hot_page};
-        let streaming = self.streaming(page);
+        let (streaming, all) = self.streaming(page);
         if streaming < HOT_PAGE_BODIES {
             return false;
         }
@@ -403,7 +405,7 @@ impl PeerServer {
             || membership
                 .position(requester)
                 .is_ok_and(|p| is_helper(object, number, p, membership.members().len()));
-        shed_hot_page(owner, streaming, exempt)
+        shed_hot_page(owner, streaming, all, exempt)
     }
     /// Bound incoming heads and the complete connection handshake, including writes.
     /// Authenticated page dispatch and transfer retain their signed request deadline.

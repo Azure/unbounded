@@ -2823,16 +2823,29 @@ pub(super) mod tests {
                     mode: FetchMode::Acquire,
                 };
                 let result = policy
-                    .resolve_with_budget(candidates.clone(), &context, operation, &scope, &mut budget)
+                    .resolve_with_budget(
+                        candidates.clone(),
+                        &context,
+                        operation,
+                        &scope,
+                        &mut budget,
+                    )
                     .await;
-                assert!(matches!(result, Err(Error::Unavailable)), "{:?}", result.err());
+                assert!(
+                    matches!(result, Err(Error::Unavailable)),
+                    "{:?}",
+                    result.err()
+                );
                 let calls = peers.calls.borrow();
                 let visited: Vec<_> = calls.iter().map(|(to, ..)| to.clone()).collect();
                 if transport {
                     assert!(!visited.contains(&helper), "{visited:?}");
                     continue;
                 }
-                assert_eq!(visited[..2], [candidates.ordered[0].clone(), helper.clone()]);
+                assert_eq!(
+                    visited[..2],
+                    [candidates.ordered[0].clone(), helper.clone()]
+                );
                 assert_eq!(visited.iter().filter(|n| **n == helper).count(), 1);
                 assert!(visited[2..].iter().all(|n| candidates.ordered.contains(n)));
                 // The helper probe is an Acquire carrying fewer credits than a
