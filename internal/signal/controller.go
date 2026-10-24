@@ -652,6 +652,7 @@ func topologyValues(
 	constraints []signalv1.ParticipantTopologyConstraint,
 ) map[string]string {
 	values := make(map[string]string)
+
 	for index := range constraints {
 		key := constraints[index].LabelKey
 		if value, exists := node.Labels[key]; exists {
@@ -1319,6 +1320,7 @@ func (r *RunReconciler) verifyScriptBundle(ctx context.Context, run *signalv1.Ce
 	for index := range run.Spec.Checks {
 		check := &run.Spec.Checks[index]
 		content, found := snapshot.Data[check.Script.Key]
+
 		if !found {
 			return fmt.Errorf("script bundle is missing check %s key %s", check.ID, check.Script.Key)
 		}
@@ -1386,6 +1388,7 @@ func (r *RunReconciler) ensureParticipantsCordoned(
 
 		before := node.DeepCopy()
 		node.Spec.Unschedulable = true
+
 		if err := r.Patch(
 			ctx,
 			&node,
@@ -1398,6 +1401,7 @@ func (r *RunReconciler) ensureParticipantsCordoned(
 	status := metav1.ConditionTrue
 	reason := "ParticipantsCordoned"
 	message := "All participants are reserved and cordoned by this Run"
+
 	if !allOwned {
 		status = metav1.ConditionFalse
 		reason = "ParticipantOwnershipLost"
@@ -1507,12 +1511,13 @@ func (r *RunReconciler) startWorkflow(ctx context.Context, run *signalv1.Certifi
 
 		existing := &unstructured.Unstructured{}
 		existing.SetGroupVersionKind(workflowGVK)
+
 		if getErr := r.Get(ctx, client.ObjectKeyFromObject(workflow), existing); getErr != nil {
 			return ctrl.Result{}, fmt.Errorf("get existing Workflow: %w", getErr)
 		}
 
 		if !metav1.IsControlledBy(existing, run) {
-			return ctrl.Result{}, errors.New("Workflow already exists without matching CertificationRun ownership")
+			return ctrl.Result{}, errors.New("workflow already exists without matching CertificationRun ownership")
 		}
 
 		workflow = existing
@@ -2329,6 +2334,7 @@ type evidenceCheckStatus struct {
 
 func evidenceCheckStatuses(statuses []signalv1.CheckStatus) ([]evidenceCheckStatus, error) {
 	result := make([]evidenceCheckStatus, len(statuses))
+
 	for index := range statuses {
 		status := &statuses[index]
 		var document json.RawMessage
@@ -2629,6 +2635,7 @@ func groupedBackendEvidenceComplete(
 	complete := !allowPartial && evidence.Complete && evidence.CaptureError == ""
 	podUIDs := map[types.UID]struct{}{}
 	expectedAPIVersion, expectedKind, err := backendIdentity(backend)
+
 	if err != nil {
 		return false, err
 	}
@@ -2717,7 +2724,6 @@ func groupedBackendEvidenceComplete(
 			complete = complete && launcher && participant.LauncherJob != nil &&
 				participant.LauncherJob.Name != "" && participant.LauncherJob.UID != ""
 		}
-
 	}
 
 	return complete, nil
@@ -2802,13 +2808,16 @@ func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationR
 	evidenceRun := run.DeepCopy()
 	evidenceRun.Status.Phase = signalv1.RunPhaseCancelled
 	evidenceRun.Status.Reason = "canceled by operator"
+
 	if !run.DeletionTimestamp.IsZero() {
 		evidenceRun.Status.Reason = "canceled by deletion"
 	}
+
 	evidenceRun.Status.Workflow.Phase = "Canceled"
 
 	statuses := initialCheckStatuses(run.Spec.Checks)
 	workflow, err := r.workflowForCancellation(ctx, run)
+
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -2816,6 +2825,7 @@ func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationR
 	if workflow != nil {
 		evidenceRun.Status.Workflow.Name = workflow.GetName()
 		evidenceRun.Status.Workflow.UID = string(workflow.GetUID())
+
 		if phase, found, phaseErr := unstructured.NestedString(workflow.Object, "status", "phase"); phaseErr != nil {
 			return ctrl.Result{}, fmt.Errorf("read Workflow phase during cancellation: %w", phaseErr)
 		} else if found {
@@ -2824,6 +2834,7 @@ func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationR
 
 		completed, _, _ := terminalCheckStatuses(workflow, run)
 		nodes, found, nodesErr := unstructured.NestedMap(workflow.Object, "status", "nodes")
+
 		if nodesErr != nil {
 			return ctrl.Result{}, fmt.Errorf("read Workflow nodes during cancellation: %w", nodesErr)
 		}
@@ -2831,6 +2842,7 @@ func (r *RunReconciler) cancel(ctx context.Context, run *signalv1.CertificationR
 		if found {
 			for index := range run.Spec.Checks {
 				node, count := exactCheckNode(nodes, workflow.GetName(), &run.Spec.Checks[index])
+
 				if count == 1 && nodeString(node, "phase") == "Succeeded" {
 					statuses[index] = completed[index]
 				}
@@ -2914,7 +2926,7 @@ func (r *RunReconciler) workflowForCancellation(
 
 	if !metav1.IsControlledBy(workflow, run) ||
 		(run.Status.Workflow.UID != "" && string(workflow.GetUID()) != run.Status.Workflow.UID) {
-		return nil, errors.New("Workflow identity changed during cancellation")
+		return nil, errors.New("workflow identity changed during cancellation")
 	}
 
 	return workflow, nil
@@ -3305,16 +3317,6 @@ func (r *RunReconciler) fenceWorkflowDependents(
 	}
 
 	return nil
-}
-
-func participantNodeUID(run *signalv1.CertificationRun, nodeName string) types.UID {
-	for _, participant := range run.Spec.Participants {
-		if participant.NodeName == nodeName {
-			return participant.NodeUID
-		}
-	}
-
-	return ""
 }
 
 func workflowMessage(workflow *unstructured.Unstructured) string {
