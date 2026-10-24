@@ -293,6 +293,12 @@ Verified against the code at the start of this work.
    times 16 pages while nodes enroll) exceeds what the read deadline allows; 1.34M walks end
    `Exhausted`. No invariant is relaxed. Reported for review: the failure is now a capacity limit,
    not an error classification.
+   Control-plane half resolved: enrollment is no longer limited by API 429s. Each authorization
+   reuses cached TokenReviews and bindings, a whole authorization is reused for 5 s, the immediate
+   keyring recheck is skipped, and a per-seat adaptive API budget keeps calls under the server's
+   rate. In 50k `enrollment-storm`, 429s fell from 462k to 23.5k and the all-enrolled time from
+   282 s to 171 s. See "Round 4: enroll" (commits 275f60475..e4737c390). The data-plane half (reads
+   failing on the deadline) is the capacity track's.
 
 12. An owner whose predecessor is behind (Known issue 3) now reaches the origin with transient
    evidence for that predecessor, where it used to fail with `IncompatibleMembership`. This adds
@@ -738,6 +744,8 @@ scenarios carry data-plane faults.
 10. Resolved: route searches beyond 8 per node queue (up to 64) instead of failing (round 3, route).
 11. The 50k `full-cold-start` storm still fails most reads; failures moved from hop budget to read
    deadline (round 3, route).
+   Control-plane half resolved: enrollment is no longer bound by API 429s (462k to 23.5k at 50k;
+   round 4, enroll, 275f60475..e4737c390). The data-plane half remains open (capacity track).
 12. Owners whose predecessor is behind now reach the origin, adding origin requests per page in
    churn (round 3, route).
 13. Repeat origin fetches across membership versions have a heavier tail with handoff probes in
@@ -1304,3 +1312,181 @@ hard invariant failures in any run. Four runs ran in parallel.
 `full-churn` queued 30,485 long poll replies for write slots and answered none with 429, which
 matches the ctl track's `ctl-churn` count. The combined numbers stay within a few percent of each
 track's own results.
+
+## Round 4: enroll
+
+This track fixes the control-plane half of Known issue 11: enrollment was limited by API server
+429s. The data-plane half (reads failing on the read deadline in the 50k `full-cold-start` storm)
+belongs to the capacity track and is not addressed here.
+
+### Root cause
+
+Line numbers are from base 48ca50329.
+
+- Every bearer authorization made five API calls: a TokenReview POST
+  (`cluster-control/src/auth.rs:129`), then GETs of the Pod, the DaemonSet (`:161`), the
+  ServiceAccount (`:179`), and the Node (`:190`). The DaemonSet and ServiceAccount are the same two
+  objects for every caller. Nothing was reused between authorizations, including for the same token.
+- An unenrolled client authorizes three times before it holds a certificate. `start_inner`
+  (`src/control/session.rs:611`) runs the bearer keyring feed until it has a bundle, then enrolls
+  (`:631`). The keyring handler authorizes on entry (`server.rs:707`) and again before data leaves
+  (`server.rs:735`), even when the data was already there and nothing was waited for. The bootstrap
+  authorizes a third time (`server.rs:557`). That is 15 API calls per enrollment.
+- Nothing bounded the rate of these calls except the 32 bootstrap slots per seat
+  (`limits::MAX_BOOTSTRAPS`). Each slot is held only for the calls' latency, so 16 seats could
+  start several thousand authorizations per second against an API server that admits about 1,000.
+  A 429 part way through an authorization wasted the calls already made, and it was reported to the
+  client as `Unavailable` (`kube/mod.rs:54` maps 429 to `KubeError::Unavailable`, and `auth.rs:65`
+  maps that to `ProtocolFailure::Unavailable`). Seats kept the same rate after a 429.
+- The simulator modeled only the bootstrap authorization (`sim/src/control.rs:284`
+  `API_CALLS_PER_ENROLLMENT = 5`, `enroll` at `:802`). It undercounted production's API calls per
+  enrollment by a factor of three.
+
+### Changes
+
+- `step::authz` (new, sans-IO, used by `auth.rs` and racer-sim) adds the following:
+  - `AuthCache`, keyed by the SHA-256 of the bearer token. It holds a successful TokenReview for
+    `REVIEW_TTL` (10 s), a whole successful authorization for `CALLER_TTL` (5 s), and the DaemonSet
+    and ServiceAccount UIDs (one entry shared by all callers) for `BINDINGS_TTL` (5 s). No entry
+    outlives the token's `exp`. Failures are never cached. A refusal drops the token's entries, and
+    a refusal that may come from stale bindings drops the bindings too. Each map holds at most 8,192
+    entries: expired entries are purged first, then the entry closest to expiry is evicted.
+  - `ApiBudget`, a per-process token bucket for authorization calls (`limits::AUTH_API_QPS` 400,
+    burst 100):
+    - An authorization reserves all of its calls before the first call. It may wait up to
+      `limits::AUTH_BUDGET_WAIT` (2 s), holding its bootstrap slot. Beyond that it answers
+      `Overloaded` without calling the API.
+    - The rate is additive increase, multiplicative decrease. An API 429 halves it, at most once per
+      second, and drops the saved burst. The rate never falls below 1/16 of the ceiling and recovers
+      linearly over 30 s.
+    - With 16 seats sharing an API server without coordinating, the 429 feedback, not the ceiling,
+      sets the rate in a storm. The ceiling is high so that a 3-seat cluster is not held below what
+      its API server admits.
+- `auth::authorize` uses the caller cache first, then reserves budget, then makes only the calls
+  not cached. The Pod and Node are read live unless the whole authorization is cached.
+  `authorize_seat_caller` reuses cached reviews.
+- `KubeError::Throttled` (new) maps 429. An authorization that hits it slows the budget and answers
+  `Overloaded`, a 429 with `Retry-After: 1`. Before, it answered `Unavailable`.
+- The keyring handler skips the bearer recheck when the bundle was already there before waiting
+  (`server::bearer_recheck`). The authorization made a moment ago is current. A recheck after a
+  real wait still runs, and after `POLL_WAIT` (30 s) it misses `CALLER_TTL`, so it reads live.
+- Per enrollment, the API calls drop from 15 to 3 on a warm seat: the TokenReview, Pod, and Node for
+  the keyring poll. The bootstrap hits the caller cache. The bindings are shared.
+- racer-sim:
+  - `control::Settings::auth` selects the model. `"legacy"` is the production behavior before this
+    round: three full authorizations, no cache, no budget. `"cached"` (the default) uses
+    `step::authz` for a keyring authorization and then a bootstrap authorization.
+  - Each seat holder process has its own cache and budget. They are reset when the seat changes
+    holder.
+  - New counters are `ctl_auth_overloaded`, `ctl_auth_waited`, `ctl_auth_caller_hits`, and the
+    histogram `ctl_auth_wait_ns`.
+  - The convergence bound uses each model's worst case for API calls per enrollment (15 legacy, 10
+    cached).
+- No wire format change. Clients already floor their backoff at `Retry-After`
+  (`controlplane/src/feed.rs:692`, `src/control/session.rs:541`), so no client change was needed.
+
+### Why the caches are safe
+
+- **TokenReview, 10 s.** kube-apiserver caches successful token authentication for the same 10 s.
+  For a bound token, the review says only that the signature is valid and that the bound objects
+  existed. The bound objects are checked live by UID. Deleting the ServiceAccount is seen through
+  the bindings within 5 s.
+- **DaemonSet and ServiceAccount UIDs, 5 s.** Operators rarely change these objects. A replaced or
+  deleting DaemonSet or ServiceAccount is refused at most 5 s later. A refusal that may come from
+  stale bindings drops them, so the next attempt reads them live.
+- **Whole authorization, 5 s.** Deleting a Pod or Node, or replacing a Pod, is seen within 5 s
+  instead of at once. That is the same order as the bindings TTL and short against the issued
+  certificate's lifetime. The primary removes a deleted Pod's Node from membership through its own
+  watch regardless. The test `authorization_caches_review_and_bindings_under_budget` pins this
+  window, showing that a replaced Pod is accepted within it and refused after it.
+- Cache keys are SHA-256 of the token, so the raw token is not stored as a key. Failed reviews and
+  refusals are never cached, so an attacker cannot poison the cache.
+
+### Tests
+
+- `step::authz`:
+  - `review_ttl_is_capped_by_token_expiry`
+  - `whole_authorizations_are_reused_briefly`
+  - `distinct_tokens_do_not_share_reviews`
+  - `bindings_expire_and_drop`
+  - `review_cache_is_bounded`
+  - `budget_reserves_whole_authorizations`
+  - `budget_reservations_wait_up_to_a_bound`
+  - `budget_backs_off_on_throttling_and_recovers`
+- `auth::authorization_caches_review_and_bindings_under_budget` runs against the fake API with
+  request counts:
+  - The first authorization makes 5 calls. A repeat within `CALLER_TTL` makes 0.
+  - After `CALLER_TTL`, an authorization makes 2 calls (Pod and Node).
+  - A replaced Pod is refused, and its review is dropped. A deleted Pod is refused.
+  - Failed reviews are not cached.
+  - An API 429 answers `Overloaded` and halves the budget.
+  - Out of budget, it answers `Overloaded` with no API call.
+- `auth::live_bindings_are_all_checked` now clears the cache between cases, which models the TTL
+  passing.
+- `kube` maps 429 to `Throttled` and 503 to `Unavailable`.
+- `server::bearer_keyring_rechecks_only_after_a_wait`.
+- racer-sim `control::cached_authorization_cuts_api_calls_and_429s` runs a 3,000-Pod storm against
+  a 300 qps API server. Legacy makes at least 15 calls and 3 TokenReviews per enrollment. Cached
+  makes at most 4 calls per enrollment and fewer than 2 TokenReviews. Cached has under a tenth of
+  the 429s and enrolls everyone sooner. The test fails with the base model.
+- racer-sim `control::auth_budget_sheds_locally_and_everyone_enrolls`: with a tight budget, seats
+  refuse locally (`ctl_auth_overloaded` > 0) with zero API 429s, and every client enrolls.
+
+### Evidence
+
+All runs are release builds with seed 1. "Base" is the base binary, which models one
+authorization per enrollment. "Legacy" is this branch with `{"control": {"auth": "legacy"}}`, a
+faithful model of production before this round. "After" is this branch. `full-cold-start` uses
+`{"request_rate": 0.005}`. API calls counts successful TokenReviews plus GETs.
+
+| Run | All enrolled | Enroll p50 / p99 | API 429s | API calls (TokenReviews) | Local refusals |
+| --- | --- | --- | --- | --- | --- |
+| enrollment-storm 5k, base | 32.3 s | 16 s / 30 s | 7,932 | 25,734 (5,332) | - |
+| enrollment-storm 5k, legacy | 106.2 s | 43 s / 95 s | 16,114 | 75,833 (15,350) | - |
+| enrollment-storm 5k, after | 31.4 s | 11 s / 28 s | 65 | 15,036 (5,000) | 0 |
+| enrollment-storm 50k, base (round 3) | 282 s | 129 s / 258 s | 462k | not reported (58k) | - |
+| enrollment-storm 50k, legacy | not within 600 s (37,598 of 50,000) | 309 s / 550 s | 1,023,547 | 600,712 (123,771) | - |
+| enrollment-storm 50k, after | 170.6 s | 69 s / 137 s | 23,532 | 151,443 (50,254) | 125,906 |
+| full-cold-start 5k, base | 32.3 s | 16 s / 30 s | 7,932 | 25,734 (5,332) | - |
+| full-cold-start 5k, legacy | 106.2 s | 43 s / 95 s | 16,114 | 75,833 (15,350) | - |
+| full-cold-start 5k, after | 31.4 s | 11 s / 28 s | 65 | 15,036 (5,000) | 0 |
+| full-cold-start 50k, base (round 3) | 282 s | 129 s / 258 s | 462k | not reported (58k) | - |
+| full-cold-start 50k, after | 170.6 s | 69 s / 137 s | 23,532 | 151,443 (50,254) | 125,906 |
+
+- Enrollment percentiles are histogram bucket bounds.
+- Data-plane reads in `full-cold-start` at 5k:
+  - base: 94,805 ok and 99 failed, with 434 reads skipped before enrollment
+  - legacy: 93,414 ok and 351 failed, with 1,136 skipped
+  - after: 95,053 ok and 51 failed, with 321 skipped
+- Data-plane reads in `full-cold-start` at 50k:
+  - after: 213,609 ok and 700,096 failed, with 18,959 skipped before enrollment
+  - round 3: 180k ok and 708k failed
+  - Most reads still fail, which is the data-plane half of Known issue 11 (capacity track).
+  - The run took 25:07 wall with a peak RSS of 10.3 GiB.
+- "Local refusals" counts `ctl_auth_overloaded`. Bootstrap slot refusals (`ctl_bootstrap_overloaded`)
+  rise because authorizations now hold their slot while they wait for budget: 5,344 at 5k after,
+  against 4 at base.
+- No run had hard invariant failures.
+- At 5k only 3 seats exist (`MIN_AUTO_SEATS`), and the all-enrolled time is bound by seat readiness
+  and client backoff, not API calls. The after time matches base, and the 429s nearly vanish.
+- At 50k, the time is bound by the API server's 1,000 qps. Fewer calls per enrollment is what moves
+  it.
+- The remaining 50k 429s come from the first second of each seat's burst and from the additive
+  increase probing back up. That is about 0.47 per enrollment, against 9.2 before.
+- A 1,000 qps ceiling was also tried. At 50k it gave 106k 429s and 268 s, without the caller
+  cache. At 400 qps without the caller cache, the 50k numbers were 30k 429s and 280 s. 400 was kept.
+
+### Deviations and open items
+
+- **The caller cache adds a revocation window.** Deleting a Pod or Node is seen within
+  `CALLER_TTL` (5 s), not at once. This is a deliberate trade, documented in `step::authz` and
+  pinned by a test.
+- **The budget ceiling is a per-process constant, not configuration.** `AUTH_API_QPS` 400 matches
+  the simulated API server well. A cluster whose API server admits far less relies on the 429
+  feedback.
+- **The simulator models the bootstrap right after the keyring poll on the same seat.** In
+  production the client prepares a CSR in between, which is well within `CALLER_TTL`. A bootstrap
+  that lands on another seat pays 3 to 5 calls there.
+- **This round changes enrollment timing for the capacity track's `full-cold-start` runs.** Nodes
+  enroll sooner at 50k, so reads start earlier in the storm.
+- New issues: none.
