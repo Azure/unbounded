@@ -210,7 +210,9 @@ Verified against the code at the start of this work.
    reads at 5,000 nodes and 6,939 of about 60k at 50,000 nodes, while nodes adopt each publication
    within 100 ms. No invariant is relaxed; this is reported as a behavior to review.
 
-4. A cold page can reach the origin once per owner, up to 3 times, with no concurrency at all. The
+4. Resolved (round 3, track origin, ea016b68d): owners above rank 0 send an `Acquire` to rank 0
+   instead of a copy-only probe, so rank 0 alone fetches a cold page; see "Round 3: origin".
+   Original report: A cold page can reach the origin once per owner, up to 3 times, with no concurrency at all. The
    rank 0 owner never asks later owners (`CandidateWalk::new` sets the walk length to the rank,
    `core/src/read/walk.rs:146`), and readers probe owners in spread order (`visit_order`), so a
    later owner may fetch first (after rank 0 answers a copy-only miss) and rank 0 fetches again
@@ -231,7 +233,10 @@ Verified against the code at the start of this work.
    (seed 1, 1 s, `request_rate` 2) 99,562 page reads fail this way while relays reject 1.25M
    transfers on the `Relay` quota (16 per worker).
 
-6. Origin requests per page are bounded by `REPLICAS` only within one membership version. When a
+6. Partly resolved (round 3, track origin, 07a932713): an owner asks the page's owners under
+   membership version - 1 copy-only before origin. Pages still reach origin again when the
+   previous owners lack a copy or the walk has no spare credit; see "Round 3: origin".
+   Original report: Origin requests per page are bounded by `REPLICAS` only within one membership version. When a
    membership change moves a page's ranked owners, the new owners have no copy, and a reader that
    walks the new owners ends in `End::Origin` at the new rank 0 (Known issue 4 applies per
    version). Nodes still on the old version keep fetching from the old owners. In `full-churn` at
@@ -248,7 +253,10 @@ Verified against the code at the start of this work.
    with `HopBudgetExhausted`. In `full-failover` at 50,000 nodes (4 crashes, seed 1) 11,950 of about
    283,000 page reads fail this way. Same root cause as issue 5; no invariant is relaxed.
 
-8. Core `PageFlights` has no origin-rejection error. Production `Flights::fail(OriginRejected)`
+8. Resolved (round 3, track origin, a27f1f7ac): production is the intended behavior (a rejected
+   caller must not be served a page fetched with another caller's credentials); core gained
+   `PageFlights::reject`, and the simulator re-elects a waiter on 403. Original report:
+   Core `PageFlights` has no origin-rejection error. Production `Flights::fail(OriginRejected)`
    (`cmd/racer-dataplane/src/read/flight.rs:1441`) cancels the supplying caller with
    `OriginRejected` before `Outcome::Retry`, so that caller fails even when another caller later
    publishes. `PageFlights::finish(Outcome::Retry)` (`core/src/read/flight.rs:295`) only makes the
@@ -256,7 +264,8 @@ Verified against the code at the start of this work.
    eligible waiter. The simulator never finishes a flight with `Retry`, so runs are unaffected.
    Pinned by `read::core_equivalence::origin_rejection_is_retry_in_core`.
 
-9. A duplicate memory publish touches only in the simulator. Production `MemoryCache::publish`
+9. Resolved (round 3, track origin, a27f1f7ac): the simulator no longer touches on a duplicate
+   publish. Original report: A duplicate memory publish touches only in the simulator. Production `MemoryCache::publish`
    returns early for a resident page without touching it (`cmd/racer-dataplane/src/memory.rs:1415-1418`),
    while the simulator's `memory_insert` touches it (`sim/src/node/world.rs:1214-1216`), so such a
    page lives slightly longer in the simulator. It only happens when a fill publishes or a disk hit
@@ -276,7 +285,7 @@ Verified against the code at the start of this work.
    `HopBudgetExhausted` failures. No search was rejected in the other combined runs. No invariant
    is relaxed. This is reported as a behavior to review.
 
-21. The 50k `full-cold-start` storm still fails most page reads. With issues 5 and 10 fixed, no read
+11. The 50k `full-cold-start` storm still fails most page reads. With issues 5 and 10 fixed, no read
    fails with `HopBudgetExhausted` and no search is rejected, but walks that end `Exhausted` are now
    retried by the client (`Unavailable` is `recoverable`) and run into the read deadline instead:
    180k ok / 708k failed (696k `DeadlineExceeded`, 11.9k `Unavailable`), against 153k / 735k
@@ -285,11 +294,17 @@ Verified against the code at the start of this work.
    `Exhausted`. No invariant is relaxed. Reported for review: the failure is now a capacity limit,
    not an error classification.
 
-22. An owner whose predecessor is behind (Known issue 3) now reaches the origin with transient
+12. An owner whose predecessor is behind (Known issue 3) now reaches the origin with transient
    evidence for that predecessor, where it used to fail with `IncompatibleMembership`. This adds
    origin requests during churn: in `churn` at 5,000 nodes (seed 1) the maximum per page rose from 3
    to 4 (mean 1.35 to 1.41); at 50,000 nodes the maximum stays 5 (mean 2.39 to 2.47).
    `only_owner_hits_origin` holds. Same family as Known issue 6.
+
+13. Repeat origin fetches across membership versions have a heavier tail with handoff probes than
+   without in `full-churn` at 50,000 nodes (seed 1, max 13 vs 10 per page), though fewer pages are
+   fetched more than once. Owners left with one credit after delegating cannot ask previous owners
+   (handoff needs two), and a rank 0 reached through delegation has one credit, so it never asks
+   them. Root cause not fully established; see "Round 3: origin". No invariant is relaxed.
 
 ## Simulator engine (racer-sim substrate)
 
@@ -712,18 +727,21 @@ scenarios carry data-plane faults.
    (75ee86562).
 2. Resolved: the test-only `RouteBudget::forwarded` was removed; tests use `racer_core::route`.
 3. Resolved: a requester on a newer membership than its destination skips it (round 3, route).
-4. A cold page can reach the origin once per owner (up to `REPLICAS`).
+4. Resolved: owners above rank 0 delegate cold fetches to rank 0 (ea016b68d).
 5. Resolved: a local hop budget shortfall ends the walk recoverably (round 3, route).
-6. Ownership moves on membership changes add origin requests beyond `REPLICAS` per page.
+6. Partly resolved: owners ask previous-membership owners before origin (07a932713); see
+   "Round 3: origin" for what remains.
 7. Partly resolved: crashed members stay routable until link backoff, but reads near them no
    longer fail with `HopBudgetExhausted` (round 3, route).
-8. Core `PageFlights` lets an origin-rejected leader receive a later result; production fails it.
-9. The simulator touches a page on a duplicate memory publish; production does not.
+8. Resolved: core `PageFlights::reject` fails the rejected leader like production (a27f1f7ac).
+9. Resolved: the simulator no longer touches on a duplicate publish (a27f1f7ac).
 10. Resolved: route searches beyond 8 per node queue (up to 64) instead of failing (round 3, route).
-21. The 50k `full-cold-start` storm still fails most reads; failures moved from hop budget to read
+11. The 50k `full-cold-start` storm still fails most reads; failures moved from hop budget to read
    deadline (round 3, route).
-22. Owners whose predecessor is behind now reach the origin, adding origin requests per page in
+12. Owners whose predecessor is behind now reach the origin, adding origin requests per page in
    churn (round 3, route).
+13. Repeat origin fetches across membership versions have a heavier tail with handoff probes in
+   50k `full-churn` (max 13 vs 10) (round 3, origin).
 
 ## Round 2: production admission
 
@@ -1149,12 +1167,12 @@ The 50k `full-*` "before" rows are the round 2 table above (same base code); the
 | full-failover | 5,000 | 33,544 / 348 | 33,934 / 116 | 305 hop, 43 unavailable | 116 unavailable |
 | storm | 50,000 | 44,137 / 282,617 | 48,576 / 17 | 282,604 hop, 13 overloaded; 704,665 rejected | 4 unavailable, 13 overloaded; 446,186 queued |
 | churn | 50,000 | 100,460 / 9,440 | 111,854 / 1,209 | 7,901 incompatible, 1,147 hop, 392 unavailable | 1,209 unavailable; 13,316 stale skips |
-| full-cold-start | 50,000 | 153k / 735k | 180k / 708k | 502k hop, 230k deadline, 3.5k unavailable; 721k rejected | 696k deadline, 11.9k unavailable; 459k queued (Known issue 21) |
+| full-cold-start | 50,000 | 153k / 735k | 180k / 708k | 502k hop, 230k deadline, 3.5k unavailable; 721k rejected | 696k deadline, 11.9k unavailable; 459k queued (Known issue 11) |
 | full-failover | 50,000 | 263k / 18.4k | 274k / 12.4k | 14.7k hop, 3.7k unavailable | 12.4k unavailable |
 
 All runs end with zero hard invariant failures and no relaxed invariant. Read latency p50 and p99
 are unchanged in `churn` and `storm` at 50k (p99 738 ms, log buckets). Origin requests per page are
-unchanged except as noted in Known issue 22. The 5k set ran in about 40 s wall (four runs in
+unchanged except as noted in Known issue 12. The 5k set ran in about 40 s wall (four runs in
 parallel). At 50k, `full-cold-start` took 25:35 wall (round 2: 18:41) with 211M events and 10.1 GiB
 peak RSS (6.2 GiB): woken queued searches and client retries of recoverable walks add events. `storm`
 peak RSS rose from 4.9 to 6.6 GiB. `full-failover` link failures rose from 96k to 164k because walks
@@ -1162,3 +1180,89 @@ now continue past unreachable owners and retries probe again.
 
 Deviation: the 50k `full-*` "before" numbers are taken from the round 2 table, not rerun.
 
+## Round 3: origin
+
+Track origin closes Known issues 4, 8 and 9 and partly addresses 6. Commits on branch
+`racer-sim3-origin`: a27f1f7ac (issues 8, 9), afdd9c28a (origin-per-page histogram in reports),
+ea016b68d (issue 4), 754c3a53d and 07a932713 (issue 6, simulator and production), 27f117aa7
+(a stale handoff target is a miss), plus a clippy fix.
+
+Issue 8. Production `Flights::fail(OriginRejected | OriginForbidden)` cancels the supplying caller
+before `Outcome::Retry` (`src/read/flight.rs`, `fail`). That is the intended behavior: the rejection
+is about that caller's credentials, and serving it a page another caller fetched would bypass the
+origin's decision. Core gained `PageFlights::reject` (`core/src/read/flight.rs`), which does the same.
+`read::core_equivalence` now drives both sides through `reject` and compares every poll
+(`origin_rejection_fails_only_the_rejected_caller`). The simulator settles a leader with the shared
+`racer_core::read::fill::acquisition_failure` mapping, as production `Fill` does, and a re-elected
+waiter now leads its own fill (`node::tests::origin_forbidden_reelects_a_waiter`). Waiters keep their
+budget for that (`Waiting::budget`).
+
+Issue 9. `memory_insert` (`sim/src/node/world.rs`) no longer touches a resident page.
+`read::core_equivalence::duplicate_publish_does_not_touch` asserts both sides evict the oldest
+insert, the seeded LRU trace test now includes duplicate publishes, and
+`node::tests::duplicate_memory_publish_does_not_touch` drives the simulator's own function.
+
+Issue 4. Root cause: an owner at rank r probed ranks 0..r copy-only and then fetched itself
+(`CandidateWalk::new` limited the walk to the predecessors, and `next` made every owner probe
+`CopyOnly`), so each owner a reader reached first could fetch. Fix, in `racer_core::read::walk`:
+
+- An owner above rank 0 sends an `Acquire` to rank 0 over a funded route that carries exactly the
+  exchange and one origin credit. Rank 0 fetches (or joins its own flight), so concurrent misses at
+  different owners coalesce there. The owner does this only when it keeps one credit per later probe
+  and one for its own origin attempt; otherwise it probes copy-only as before. If rank 0 answers
+  `VersionUnavailable`, the walk ends there instead of asking origin again.
+- `owner_funding(r)` is one credit more than before for r > 0 (`owner_funding_min`). A non-owner pays
+  it only from slack: the funded visits after it keep their minimum (`later_minimum`), so a walk's
+  reach does not shrink. Page attempts stay at 8. Hedge eligibility is unchanged.
+- No wire change: the Acquire is an existing page request.
+
+Issue 6. An owner ranks the page under membership version - 1 when that publication is still
+retained (`CandidatePolicy::handoff_targets`, `Published::resolve`; in the simulator
+`Versions::get(version - 1)`). `racer_core::read::walk::handoff_targets` keeps the previous owners
+that are current members, not this node and not a current predecessor, and is empty when the owner
+set did not change, so a steady cold miss pays nothing. The walk asks them copy-only after the
+predecessors (`WalkConfig::handoff`; probe canonical `owners + i`), only while one credit for origin
+remains. Their outcomes are not predecessor evidence, and a stale reply is only a miss.
+
+Tests: core walk tests for delegation, funding, slack, handoff gating and targets;
+`read::tests::peer_copies::owner_asks_previous_membership_owners_before_origin` (copy found, all
+miss, previous version not retained); the mesh test
+`replica_selection_orders_first_acquire_and_non_primary_owner_fills` now checks that rank 0 alone
+fetches. Seven scripted production tests changed their expected credits or probe modes for the
+delegated Acquire. Simulator: `single_reader_then_storm_reuses_copies` now requires exactly one origin
+request per page (33 before, 16 now), and `joined_owners_copy_from_previous_owners` requires one per
+page after a join (19 without handoff).
+
+Evidence, release, seed 1. 5,000 nodes, scenario defaults; `full-churn` with `request_rate` 0.005.
+Origin requests per page: total, max, pages fetched more than once, histogram.
+
+| scenario | before | after |
+| --- | --- | --- |
+| storm 5k | 2,630, max 3, 922 dup (1:102 2:238 3:684) | 1,196, max 2, 172 dup (1:852 2:172) |
+| zipf 5k | 60,514, max 3, 16,108 dup | 42,607, max 3, 3,907 dup (3: 74 pages) |
+| churn 5k | 2,638, max 4, 929 dup | 1,196, max 3, 171 dup |
+| full-churn 5k | 15,673, max 7, 2,280 dup | 14,926, max 10, 1,785 dup |
+| full-churn 50k | 75,533, max 10, 20,131 dup | 75,386, max 13, 18,455 dup |
+
+Read latency (p50, p99 of `read_ns`): storm 268/1342 ms before, 302/1342 ms after; zipf 201/1611 ms
+before, 168/1476 ms after; churn 470/738 ms before, 436/738 ms after. A cold miss at a non-primary
+owner now takes one funded exchange to rank 0 instead of a copy-only probe followed by a local origin
+fetch, so its latency is about the same; warm reads are unaffected. Failed reads: storm 363 to 300,
+zipf 1,588 to 2,132, churn 15.5k to 15.5k, full-churn 50k 4,966 to 5,234. The 50k `full-churn` run
+took about 34 minutes wall instead of 24, mostly the extra ranking under the previous membership.
+
+What remains (issue 6 stays open, and new issue 13):
+
+- Under churn, the total barely moves: in `full-churn` at 50k, single-fetch pages went from 25.8k to
+  27.4k, but the tail grew (29 pages fetched 10 or more times, max 13). Traces at 5k show most repeat
+  fetches come from owners left with one credit after delegating (handoff needs two), and from owners
+  at rank 1 or 2 whose delegation to a new rank 0 failed. A rank 0 reached through delegation has
+  only one credit, so it never asks previous owners. Giving it more is not free: remote credits stay
+  spent. Not tuned further in this round.
+- In visit orders where a non-owner cannot fund delegation from slack (for example [1, 2, 0] when
+  rank 2's minimum must stay fundable), rank 1 still fetches itself; the result can be one extra
+  origin request per page per membership version.
+
+13. Repeat origin fetches across membership versions have a heavier tail with handoff
+    probes than without in `full-churn` at 50,000 nodes (max 13 vs 10), though fewer pages are fetched
+    more than once. Root cause not established; see "Round 3: origin". No invariant is relaxed.
