@@ -287,7 +287,12 @@ Verified against the code at the start of this work.
    `HopBudgetExhausted` failures. No search was rejected in the other combined runs. No invariant
    is relaxed. This is reported as a behavior to review.
 
-11. The 50k `full-cold-start` storm still fails most page reads. With issues 5 and 10 fixed, no read
+11. Data-plane half resolved (round 4, capacity, 98a025f91 and 35ae1eb21): the simulator
+   streamed page bodies to requesters that had timed out, and the 1 s storm was 14 times over the
+   owners' egress bound; 50k now reads 884k ok / 11.8k failed (background reads, issue 72), with the
+   bound enforced by a test. See "Round 4: capacity". The control-plane half (enrollment 429s) is
+   the enroll track's. Original text:
+   The 50k `full-cold-start` storm still fails most page reads. With issues 5 and 10 fixed, no read
    fails with `HopBudgetExhausted` and no search is rejected, but walks that end `Exhausted` are now
    retried by the client (`Unavailable` is `recoverable`) and run into the read deadline instead:
    180k ok / 708k failed (696k `DeadlineExceeded`, 11.9k `Unavailable`), against 153k / 735k
@@ -322,6 +327,19 @@ Verified against the code at the start of this work.
 52. Dropping a dead member (issue 7 fix) is an ownership move and inherits issues 6 and 12: at
    50,000 nodes in `full-failover` it added 171 recoverable `Unavailable` reads and moved the
    worst page from 7 to 9 origin requests. See "Round 4: liveness".
+
+71. Hot-page peer throughput is capped by the page's `REPLICAS` owners: candidates are only the
+   ranked owners (`src/read/candidates.rs:628-635`), so readers holding a copy never serve other
+   readers, and a storm on one page gets at most `REPLICAS * nic_bps / page_bytes` deliveries per
+   second. Enforced by
+   `contention_scenarios::overloaded_hot_page_owners_do_not_stream_to_abandoned_requesters`. Under
+   overload relays shed on the `Relay` quota before the owners' NICs saturate (50k, 1 s storm: about
+   177k storm pages against a 570k bound). Raising it is a design change. See "Round 4: capacity".
+
+72. Background reads during enrollment fail `Unavailable`: in `full-cold-start` about 12% of the
+   Zipf reads (11.7k at 50k, ~100 at 5k, unchanged since round 3) fail while 138k link attempts hit
+   members that are published but not yet enrolled (inference from `link_failures`; the storm alone
+   reads 80,000 of 80,000 pages at 5k). Belongs with the enroll and liveness work.
 
 ## Simulator engine (racer-sim substrate)
 
@@ -662,7 +680,7 @@ Scenarios. Each uses the control plan of the named control scenario and a light 
 
 | scenario | control plan | default duration | data plane |
 | --- | --- | --- | --- |
-| `full-cold-start` | `enrollment-storm` | 400 s | every node reads object 0 within 1 s at 3/4 of the run |
+| `full-cold-start` | `enrollment-storm` | 400 s | every node reads object 0 at 3/4 of the run, within `cold_start_window_ns` (1 s; 28 s at 50k, see "Round 4: capacity") |
 | `full-failover` | `failover` | 900 s | Zipf reads while the primary and seats crash and restart |
 | `full-churn` | `ctl-churn` | 1200 s | Zipf reads while the cluster grows from 1/16 in 8 waves, then 2 removals |
 | `full-lagging` | `lagging` | 900 s | Zipf reads while 10% of clients are partitioned, 5% slow, 1% removed |
@@ -757,6 +775,9 @@ scenarios carry data-plane faults.
    deadline (round 3, route).
    Control-plane half resolved: enrollment is no longer bound by API 429s (462k to 23.5k at 50k;
    round 4, enroll, 275f60475..e4737c390). The data-plane half remains open (capacity track).
+
+11. Data-plane half resolved: abandoned page bodies are no longer streamed and the storm window
+   fits the owners' egress (round 4, capacity, 98a025f91, 35ae1eb21); control-plane half: enroll track.
 12. Owners whose predecessor is behind now reach the origin, adding origin requests per page in
    churn (round 3, route).
 13. Repeat origin fetches across membership versions have a heavier tail with handoff probes in
@@ -764,6 +785,11 @@ scenarios carry data-plane faults.
 51. Members not yet holding a membership are routable but refuse peer links; most 50k
    `full-failover` link failures (round 4, liveness).
 52. Dropping a dead member costs one ownership move (issues 6, 12) (round 4, liveness).
+
+71. Hot-page throughput is capped at `REPLICAS` owners' NICs; bound enforced by a test (round 4,
+   capacity).
+72. Background reads during enrollment fail `Unavailable` near unenrolled members (round 4,
+   capacity).
 
 ## Round 2: production admission
 
@@ -1633,3 +1659,117 @@ toward it at most once per link backoff (100 ms doubling to 20 s), as before.
   origin and `StaleMembership` costs (171 recoverable failed reads at 50k). The handoff track
   fixes apply.
 
+## Round 4: capacity
+
+Scope: the data-plane half of Known issue 11 (the 50k `full-cold-start` storm fails most reads on
+the read deadline after retries). The control-plane half (API-server 429s during enrollment) is the
+enroll track's.
+
+### Root cause
+
+Two causes, one a simulator modeling artifact and one a real capacity bound of the design.
+
+1. The simulator streamed page bodies to requesters that had already given up. A destination's
+   page reply reserved NIC time on every link of the reverse route (`Fabric::transfer`,
+   `sim/src/resources.rs`) no matter when it would arrive, and `send_reply` then scheduled the
+   `Reply` event; when the requester's attempt had timed out (`attempt_timeout_ns`, 2 s) the reply
+   only counted as `late_replies` (`reply`, `sim/src/node/world.rs`). The NIC time was spent anyway,
+   so a hot owner's transmit queue (`tx_free`) grew without bound and every later reply queued behind
+   bodies nobody was waiting for. In the round 3 run, 3.49M probes timed out and the same 3.49M
+   replies arrived late, while peers moved 11.2 TB for 180k completed reads.
+   Production does not do this: the requester drops the exchange at its attempt deadline, relays
+   cancel the downstream exchange on upstream close (`disconnect_fenced_exchange`,
+   `src/peer/server.rs:904`), and the destination's writes then fail. The simulator also released a
+   relay's `Relay` reservation when the reply was scheduled, while production keeps it on the
+   connection until the body has streamed through (`src/peer/server.rs:444`), so relays never
+   rejected (`rejections.relay` 0).
+2. Hot-page throughput is capped by the page's owners. Candidates are the placement-ranked owners
+   only (`CandidatePolicy::candidates`, `src/read/candidates.rs:628-635`; the simulator's
+   `walk_ranked` uses the same ranking, `topology/src/placement.rs:827`, up to `REPLICAS` = 3), and
+   a reader that holds a copy is never asked by other readers. A warm page can therefore be sent at
+   no more than `REPLICAS * nic_bps`. Object 0 has 16 pages on (about) 48 distinct owners, so the
+   storm needs at least `nodes * page_bytes / (REPLICAS * nic_bps)` of owner egress: 14.0 s at 50,000
+   nodes and 10 Gbit/s, against a 1 s arrival window and a 10 s read deadline. The 1 s window was 14
+   times over the bound, so the scenario measured overload rather than the system. At 5,000 nodes the
+   same bound is 1.4 s, which is why the 5k run was clean.
+
+The control-plane cause does not contribute: all 50,000 nodes are enrolled at 282 s, before the
+storm at 300 s, and reads issued by unenrolled nodes are skipped (`reads_skipped_not_enrolled`).
+Retries did not add bytes once cause 1 was fixed (a retried probe that is abandoned sends nothing),
+and search queueing and flight admission had no rejections.
+
+### Changes
+
+- `Fabric::transfer_until` (`sim/src/resources.rs`): no chunk starts on any link at or after the
+  requester's abandon time; chunks already started keep their reservation. `transfer` is
+  `transfer_until` with no cutoff.
+- `Msg::abandon` is the requester's attempt end (`AttemptPlan::attempt_end`). `send_reply` streams a
+  page body with `transfer_until` and counts `replies_abandoned` instead of a late reply; `hop`
+  drops a request that reaches a node after its requester gave up (`requests_abandoned`). Relays hold
+  their `Relay` reservation until the body has passed or was abandoned (`Event::Release`).
+- `combined::cold_start_window_ns`: the `full-cold-start` storm's arrival window is twice the owner
+  egress bound, at least 1 s (28 s at 50,000 nodes and 10 Gbit/s; 1 s up to about 3,500 nodes).
+  The overloaded 1 s storm stays available through `storms` in `--config`.
+- No production change: production already drops abandoned exchanges. The remaining limit is a
+  design bound (below), not a bug.
+
+### Bound (residual, enforced)
+
+During a storm on one warm page, peer deliveries over a span `T` are at most
+`REPLICAS * nic_bps * T / page_bytes` (owners only; non-owner copies are never candidates). With
+abandoned exchanges dropped, the owners now deliver close to that bound instead of wasting it.
+`contention_scenarios::overloaded_hot_page_owners_do_not_stream_to_abandoned_requesters`
+(96 nodes, 4 MiB/s NICs, seed 5) requires no late replies and at least half of the bound over the
+10 s read deadline. Before the fix it saw 375 late replies and 16 peer fills (19 of 97 reads ok);
+after, 0 late replies and 86 peer fills (bound 120; 89 of 97 reads ok). Raising hot-page
+throughput beyond `REPLICAS` owners (readers serving readers) would be a design change and is
+recorded as Known issue 71.
+
+### Tests
+
+- `resources::tests::abandoned_transfer_stops_sending_at_the_cutoff`.
+- `contention_scenarios::overloaded_hot_page_owners_do_not_stream_to_abandoned_requesters`
+  (fails before the fix).
+- `combined::tests::cold_start_window_fits_owner_egress`.
+
+### Evidence
+
+Release build, seed 1, `full-cold-start` with default duration. "before" is the base (48ca50329),
+"fix 1" adds only the abandoned-exchange change, "after" is the branch head. `{"request_rate":
+0.005}` unless noted; "1G" also sets `nic_bps` to 125,000,000, which puts the 5k storm at the same
+14-times overload as 50k at 10 Gbit/s. Read latency is log-bucket upper bounds.
+
+| Run | Reads ok / failed | Failures | Late replies | Peer bytes | Read p50 / p99 |
+| --- | --- | --- | --- | --- | --- |
+| 5k before | 94,805 / 99 | 99 unavailable | 0 | 246 GB | 470 ms / 1.34 s |
+| 5k after | 94,810 / 98 | 98 unavailable | 0 | 246 GB | 46 ms / 134 ms |
+| 5k 1G before | 23,714 / 70,268 | 70,171 deadline, 97 unavailable | 352,820 | 960 GB | 151 ms / 1.88 s |
+| 5k 1G fix 1 | 52,116 / 42,785 | 22,845 deadline, 19,940 unavailable | 0 (212,612 abandoned) | 138 GB | 1.74 s / 9.66 s |
+| 5k 1G after | 94,799 / 102 | 102 unavailable | 0 | 246 GB | 84 ms / 201 ms |
+| 50k before | 178,986 / 709,178 | 697,451 deadline, 11,727 unavailable | 3,497,446 | 11.27 TB | 537 ms / 3.22 s |
+| 50k after | 884,120 / 11,753 | 11,753 unavailable | 0 | 2.71 TB | 55 ms / 235 ms |
+| 50k after, 1 s storm | 261,113 / 634,751 | 634,751 unavailable | 0 (35 abandoned) | 0.81 TB | 738 ms / 2.01 s |
+
+- The storm alone completes: 5k with `{"request_rate": 0}` reads 80,000 of 80,000 pages. The
+  remaining ~100 (5k) and 11.7k (50k) failures are background Zipf reads, unchanged by this track
+  and present before it; see Known issue 72.
+- At 50k, origin requests per page fell from mean 1.60 to 1.22 (max 3 both). All enrolled at 285 s
+  in all three 50k runs (the storm starts at 300 s). Zero hard invariant failures, no relaxed
+  invariant.
+- Overloaded configuration (1 s storm, 14 times over the owner bound): no read fails on the
+  deadline any more. Relays shed with `Overloaded` on the `Relay` quota (11.4M rejections) because
+  they hold it while bodies stream, walks end `Exhausted`, and reads fail `Unavailable` after the
+  client's retries; successful reads finish within 2 s (p99). The successes stay below the owner
+  bound (about 177k storm pages against a 10 s bound of about 570k): shedding happens at the relays
+  in front of the owners, so an owner's NIC is not kept saturated (Known issue 71).
+- 50k wall and peak RSS: before 24:43, 10.3 GiB; after 14:55, 4.1 GiB; 1 s storm 26:26. The
+  liveness track's 50k run shared the host.
+
+### Deviations and open items
+
+- No production change; the failing behavior was a simulator artifact plus an overloaded scenario.
+  The brief's "fail fast with `Overloaded`" happens at relays (production's held `Relay`
+  reservation), and the client-visible error is `Unavailable` after the walk is exhausted.
+- Known issue 71 (new): hot-page throughput is capped by `REPLICAS` owners; the bound above is
+  enforced by a test, raising it is a design change.
+- Known issue 72 (new): background reads during enrollment fail `Unavailable`.
