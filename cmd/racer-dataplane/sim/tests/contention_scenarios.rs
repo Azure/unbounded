@@ -345,3 +345,40 @@ fn seed_matrix_replays_identical_reports() {
         "distinct seeds produced identical traces"
     );
 }
+
+/// Known issue 11 (data plane, round 4 capacity). A warm hot page is served
+/// only by its `REPLICAS` owners, so their NICs bound the storm's peer
+/// throughput. Before round 4 a sender streamed every queued page body even
+/// after the requester's attempt timed out: the owners' NIC queues grew
+/// without bound, almost every reply arrived late (`late_replies`), and
+/// useful throughput collapsed far below the NIC bound. Now a body stops at
+/// the requester's attempt deadline, so no reply arrives late and the owners
+/// deliver at least half of what their NICs allow during the storm.
+#[test]
+fn overloaded_hot_page_owners_do_not_stream_to_abandoned_requesters() {
+    let nodes = 96;
+    let mut config = quiet(nodes);
+    config.pages_per_object = 1;
+    config.nic_bps = 4 << 20;
+    config.duration_ns = 40 * SECONDS;
+    config.storms = vec![storm(0, 0, 1, 1), storm(5 * SECONDS, 0, nodes, MILLIS)];
+    let report = run(config.clone(), 5);
+    let completed = counter(&report, "reads_completed");
+    let failed = counter(&report, "reads_failed");
+    assert_eq!(completed + failed, u64::from(nodes) + 1, "{report}");
+    assert!(failed > 0, "the storm must overload the owners: {report}");
+    assert_eq!(counter(&report, "late_replies"), 0, "{report}");
+    assert!(counter(&report, "replies_abandoned") > 0, "{report}");
+    // Each storm read ends within the read timeout (10 s) plus retries'
+    // short backoff; over that span the owners' NICs can send at most this
+    // many pages. Relayed bytes also cross relay NICs, so this is an upper
+    // bound on what the owners alone can deliver.
+    let page = config.page_bytes;
+    let span_s = 10;
+    let bound = topology::REPLICAS as u64 * config.nic_bps * span_s / page;
+    let peer = counter(&report, "fills_from_peer");
+    assert!(
+        peer * 2 >= bound,
+        "owners delivered {peer} pages, under half of the NIC bound {bound}: {report}"
+    );
+}

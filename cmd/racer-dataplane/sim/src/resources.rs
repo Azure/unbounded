@@ -161,8 +161,27 @@ impl Fabric {
     /// as it has fully arrived there, so a long transfer pipelines across
     /// hops. Returns the time the last byte reaches the final node.
     pub fn transfer(&mut self, now: Nanos, route: &[u32], bytes: u64) -> Nanos {
+        self.transfer_until(now, route, bytes, Nanos::MAX)
+            .expect("no cutoff")
+    }
+
+    /// [`Fabric::transfer`] for an exchange the receiver abandons at
+    /// `cutoff` (its attempt timeout). Production drops the exchange then:
+    /// the requester closes its connection, relays cancel the downstream
+    /// exchange on upstream FIN (`peer/server.rs`,
+    /// `disconnect_fenced_exchange`), and the sender's writes fail. So no
+    /// chunk starts on any link at or after `cutoff`; chunks already started
+    /// keep their reservations. Returns `None` when the last byte does not
+    /// arrive before `cutoff`.
+    pub fn transfer_until(
+        &mut self,
+        now: Nanos,
+        route: &[u32],
+        bytes: u64,
+        cutoff: Nanos,
+    ) -> Option<Nanos> {
         if route.len() < 2 {
-            return now;
+            return Some(now);
         }
         let mut done = now;
         let mut sent = 0u64;
@@ -177,6 +196,9 @@ impl Fabric {
                 let wire = service_ns(chunk, self.nic_bps);
                 let (send, receive) = (self.scale(a, wire), self.scale(b, wire));
                 let start = ready.max(self.tx_free[a as usize]);
+                if start >= cutoff {
+                    return None;
+                }
                 // The receiver is a work-conserving backlog of its own
                 // service time from the transfer's issue, not a slot at the
                 // chunk's (possibly far future) send time: a slow sender
@@ -191,7 +213,7 @@ impl Fabric {
             }
             done = done.max(ready);
         }
-        done
+        (done < cutoff || cutoff == Nanos::MAX).then_some(done)
     }
 
     pub fn disk_read(&mut self, now: Nanos, node: u32, bytes: u64) -> Nanos {
@@ -419,6 +441,30 @@ mod tests {
         let again = f.transfer(0, &[0, 2], chunk);
         assert!(again > per_chunk + lat);
         assert_eq!(f.transfer(7, &[1], 10), 7);
+    }
+
+    #[test]
+    fn abandoned_transfer_stops_sending_at_the_cutoff() {
+        let mut f = fabric(3, 1);
+        let chunk = f.chunk_bytes;
+        let per_chunk = service_ns(chunk, f.nic_bps);
+        let lat = f.latency(0, 1);
+        // Completes before the cutoff: same as an uncut transfer.
+        assert_eq!(
+            f.transfer_until(0, &[0, 1], chunk, Nanos::MAX - 1),
+            Some(per_chunk + lat)
+        );
+        // Node 0 is busy until `per_chunk`; a cutoff at that instant means
+        // no chunk may start, so nothing is reserved.
+        assert_eq!(f.transfer_until(0, &[0, 1], 4 * chunk, per_chunk), None);
+        assert_eq!(f.tx_free[0], per_chunk);
+        // A cutoff partway through: chunks that started keep their slots,
+        // later chunks are never sent.
+        assert_eq!(f.transfer_until(0, &[0, 1], 8 * chunk, 3 * per_chunk), None);
+        assert_eq!(f.tx_free[0], 3 * per_chunk);
+        // Arriving exactly at the cutoff is too late.
+        let mut g = fabric(2, 1);
+        assert_eq!(g.transfer_until(0, &[0, 1], chunk, per_chunk + lat), None);
     }
 
     #[test]

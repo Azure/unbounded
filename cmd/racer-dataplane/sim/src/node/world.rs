@@ -160,6 +160,11 @@ pub enum Event {
     HedgeDelay {
         fill: u64,
     },
+    /// A relayed reply finished streaming (or was abandoned): release the
+    /// relays' `Relay` reservations held under `id`.
+    Release {
+        id: u64,
+    },
     /// A ranking or route search task yielded; run its next slice.
     Slice {
         task: u64,
@@ -199,6 +204,7 @@ impl Event {
             Self::Slow { node, factor } => (14, node.into(), factor.into()),
             Self::Slice { task } => (16, task, 0),
             Self::HedgeDelay { fill } => (17, fill, 0),
+            Self::Release { id } => (18, id, 0),
         }
     }
 }
@@ -343,6 +349,8 @@ struct Msg {
     links: u8,
     attempts: u32,
     deadline: Nanos,
+    /// When the requester abandons this exchange (its attempt timeout).
+    abandon: Nanos,
     relays: Vec<SimCharge>,
     /// A pinned single-link hedge exchange.
     direct: bool,
@@ -470,6 +478,8 @@ pub struct NodeWorld {
     probes: HashMap<u64, Probing, Fixed>,
     ranges: HashMap<u64, RangeRead, Fixed>,
     writes: HashMap<u64, SimCharge, Fixed>,
+    /// Relay reservations of replies still streaming (see `Event::Release`).
+    held: HashMap<u64, Vec<SimCharge>, Fixed>,
     origin_per_page: HashMap<u64, u32, Fixed>,
     tasks: HashMap<u64, Task, Fixed>,
     /// When each currently down node went down (Known issue 7 evidence).
@@ -575,6 +585,7 @@ impl NodeWorld {
             probes: HashMap::default(),
             ranges: HashMap::default(),
             writes: HashMap::default(),
+            held: HashMap::default(),
             origin_per_page: HashMap::default(),
             tasks: HashMap::default(),
             down_since: HashMap::default(),
@@ -778,6 +789,9 @@ impl NodeWorld {
             }
             Event::Slice { task } => self.slice(task),
             Event::HedgeDelay { fill } => self.hedge_delay(fill),
+            Event::Release { id } => {
+                self.held.remove(&id);
+            }
         }
     }
 
@@ -2179,6 +2193,7 @@ impl NodeWorld {
             links: plan.links,
             attempts: plan.remote_attempts,
             deadline,
+            abandon: self.nanos(plan.attempt_end).max(now + 1),
             relays: Vec::new(),
             direct,
         };
@@ -2428,6 +2443,13 @@ impl NodeWorld {
             self.msgs.remove(&mid);
             return;
         }
+        if now >= m.abandon {
+            // The requester gave up: production relays and the destination
+            // see the upstream connection close and drop the exchange.
+            self.metrics.incr("requests_abandoned");
+            self.msgs.remove(&mid);
+            return;
+        }
         self.fabric.crypto(now, at, self.fabric.costs.verify_ns);
         self.adopt(at);
         let m = self.msgs.get(&mid).expect("message");
@@ -2582,7 +2604,21 @@ impl NodeWorld {
         let arrive = if reply == Reply::Response(ResponseKind::Page) {
             let bytes = self.config.page_bytes;
             let sealed = self.fabric.crypto(ready, from, costs.sign_ns);
-            let done = self.fabric.transfer(sealed, &route, bytes);
+            // The body streams only while the requester still waits; relays
+            // hold their `Relay` reservation until the body has passed
+            // (production keeps it on the connection while streaming,
+            // `peer/server.rs` `relay.reservation`).
+            let done = self.fabric.transfer_until(sealed, &route, bytes, m.abandon);
+            let release = done.unwrap_or(m.abandon);
+            if !m.relays.is_empty() && release > now {
+                let id = self.fresh();
+                self.held.insert(id, m.relays);
+                self.engine.at(release, Event::Release { id });
+            }
+            let Some(done) = done else {
+                self.metrics.incr("replies_abandoned");
+                return;
+            };
             self.metrics.add("peer_bytes", bytes * links);
             self.metrics.observe("hops", links);
             done
