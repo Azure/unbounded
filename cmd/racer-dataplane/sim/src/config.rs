@@ -92,6 +92,8 @@ pub struct Config {
     pub faults: Vec<Fault>,
     /// Real node logic knobs (`"node"` object in JSON).
     pub node: NodeConfig,
+    /// Data-plane faults the combined scenarios add (`"combined_faults"`).
+    pub combined_faults: crate::combined::DataFaults,
 }
 
 impl Default for Config {
@@ -130,6 +132,7 @@ impl Default for Config {
             churn: Vec::new(),
             faults: Vec::new(),
             node: NodeConfig::default(),
+            combined_faults: crate::combined::DataFaults::default(),
         }
     }
 }
@@ -218,6 +221,7 @@ impl Config {
                 "churn" => self.churn = list(k, v, Churn::from_json)?,
                 "faults" => self.faults = list(k, v, Fault::from_json)?,
                 "node" => self.node.apply_json(v)?,
+                "combined_faults" => self.combined_faults.apply_json(v)?,
                 _ => return Err(format!("unknown config key {key:?}")),
             }
         }

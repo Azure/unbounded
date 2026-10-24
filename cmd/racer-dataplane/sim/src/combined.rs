@@ -23,8 +23,10 @@ use serde_json::{Value, json};
 use crate::config::Config;
 use crate::control::{self, Changes, ControlSim, CtlFault, Life};
 use crate::engine::{Nanos, SECONDS, mix};
+use crate::faults::Fault;
 use crate::node::NodeWorld;
 use crate::node::world::Event;
+use crate::resources::OriginErrors;
 use crate::workload::Storm;
 
 /// Combined scenario names accepted by the CLI.
@@ -64,8 +66,150 @@ pub fn data_defaults(config: &mut Config) {
     config.request_rate = 0.02;
 }
 
+/// Data-plane faults layered on the control plans (`"combined_faults"` in
+/// `--config`). Used only when `--config` gives no `faults` list.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DataFaults {
+    pub enabled: bool,
+    /// Slow nodes per thousand (`full-lagging`, `full-cold-start`).
+    pub slow_permille: u32,
+    /// Slowdown factor of a slow node.
+    pub slow_factor: u8,
+    /// Origin 5xx probability during a burst (`full-failover`).
+    pub p5xx: f64,
+    /// Origin 412 probability during a burst (`full-churn`).
+    pub p412: f64,
+    /// Length of each origin error burst.
+    pub burst_ns: Nanos,
+    /// Site 0 and site 1 are cut apart (`full-failover`).
+    pub partition: bool,
+}
+
+impl Default for DataFaults {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            slow_permille: 10,
+            slow_factor: 8,
+            p5xx: 0.3,
+            p412: 0.1,
+            burst_ns: 30 * SECONDS,
+            partition: true,
+        }
+    }
+}
+
+impl DataFaults {
+    pub fn apply_json(&mut self, value: &Value) -> Result<(), String> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| format!("combined_faults: expected an object, got {value}"))?;
+        for (key, v) in obj {
+            let bad = || format!("combined_faults.{key}: invalid value {v}");
+            match key.as_str() {
+                "enabled" => self.enabled = v.as_bool().ok_or_else(bad)?,
+                "partition" => self.partition = v.as_bool().ok_or_else(bad)?,
+                "slow_permille" => {
+                    self.slow_permille = v.as_u64().filter(|n| *n <= 1000).ok_or_else(bad)? as u32;
+                }
+                "slow_factor" => {
+                    self.slow_factor = v
+                        .as_u64()
+                        .and_then(|n| u8::try_from(n).ok())
+                        .filter(|n| *n >= 1)
+                        .ok_or_else(bad)?;
+                }
+                "p5xx" => {
+                    self.p5xx = v
+                        .as_f64()
+                        .filter(|p| (0.0..=1.0).contains(p))
+                        .ok_or_else(bad)?
+                }
+                "p412" => {
+                    self.p412 = v
+                        .as_f64()
+                        .filter(|p| (0.0..=1.0).contains(p))
+                        .ok_or_else(bad)?
+                }
+                "burst_ns" => self.burst_ns = v.as_u64().ok_or_else(bad)?,
+                _ => return Err(format!("unknown key combined_faults.{key}")),
+            }
+        }
+        Ok(())
+    }
+
+    /// Every `1000 / slow_permille`-th node, slowed during `[from, until)`.
+    fn slow(&self, nodes: u32, from_ns: Nanos, until_ns: Nanos, out: &mut Vec<Fault>) {
+        if self.slow_permille == 0 || self.slow_factor <= 1 {
+            return;
+        }
+        let stride = (1000 / self.slow_permille).max(1);
+        for node in (stride / 2..nodes).step_by(stride as usize) {
+            out.push(Fault::Slow {
+                node,
+                factor: self.slow_factor,
+                from_ns,
+                until_ns,
+            });
+        }
+    }
+
+    fn origin(&self, at: &[Nanos], errors: OriginErrors, out: &mut Vec<Fault>) {
+        if errors.p412 + errors.p5xx <= 0.0 || self.burst_ns == 0 {
+            return;
+        }
+        for from_ns in at {
+            out.push(Fault::OriginErrors {
+                from_ns: *from_ns,
+                until_ns: from_ns + self.burst_ns,
+                errors,
+            });
+        }
+    }
+
+    /// The default data-plane faults of `scenario` over `d` nanoseconds.
+    pub fn plan(&self, scenario: &str, nodes: u32, d: Nanos) -> Vec<Fault> {
+        let mut out = Vec::new();
+        if !self.enabled {
+            return out;
+        }
+        match scenario {
+            "full-cold-start" => self.slow(nodes, d * 3 / 4 - d / 40, d * 3 / 4 + d / 20, &mut out),
+            "full-failover" => {
+                if self.partition {
+                    out.push(Fault::Partition {
+                        from_ns: d * 2 / 5,
+                        until_ns: d / 2,
+                        site_a: 0,
+                        site_b: 1,
+                    });
+                }
+                let errors = OriginErrors {
+                    p5xx: self.p5xx,
+                    ..OriginErrors::default()
+                };
+                self.origin(&[d / 5, d * 3 / 5], errors, &mut out);
+            }
+            "full-churn" => {
+                let errors = OriginErrors {
+                    p412: self.p412,
+                    ..OriginErrors::default()
+                };
+                self.origin(&[d / 2], errors, &mut out);
+            }
+            _ => self.slow(nodes, d / 10, d * 9 / 10, &mut out),
+        }
+        out
+    }
+}
+
 /// Data-plane schedules generated after `--config` (only when empty).
 pub fn data_schedules(scenario: &str, config: &mut Config) {
+    if config.faults.is_empty() {
+        config.faults = config
+            .combined_faults
+            .plan(scenario, config.nodes, config.duration_ns);
+    }
     if scenario == "full-cold-start" && config.storms.is_empty() {
         // Once everyone has enrolled (about 280 s at 50,000 Pods), every
         // node reads object 0 within one second.
@@ -320,6 +464,84 @@ mod tests {
             "{}",
             r["metrics"]["counters"]
         );
+    }
+
+    /// The combined plans carry data-plane faults by default; the knobs
+    /// turn them off, and an explicit `faults` list replaces them.
+    #[test]
+    fn data_faults_join_the_control_plans() {
+        let d = 300 * SECONDS;
+        let faults = DataFaults::default();
+        let failover = faults.plan("full-failover", 200, d);
+        assert!(
+            failover
+                .iter()
+                .any(|f| matches!(f, Fault::Partition { .. }))
+        );
+        assert_eq!(
+            failover
+                .iter()
+                .filter(|f| matches!(f, Fault::OriginErrors { .. }))
+                .count(),
+            2
+        );
+        let lagging = faults.plan("full-lagging", 1000, d);
+        assert_eq!(lagging.len(), 10);
+        assert!(
+            lagging
+                .iter()
+                .all(|f| matches!(f, Fault::Slow { factor: 8, .. }))
+        );
+        let mut off = faults;
+        off.apply_json(&json!({"enabled": false})).unwrap();
+        assert!(off.plan("full-failover", 200, d).is_empty());
+        assert!(off.apply_json(&json!({"slow_factor": 0})).is_err());
+        assert!(
+            DataFaults::default()
+                .apply_json(&json!({"nope": 1}))
+                .is_err()
+        );
+
+        let r = quick("full-failover", 200, 300, 1, 0.2);
+        assert_clean(&r);
+        assert!(
+            counter(&r, "origin_5xx") > 0,
+            "{}",
+            r["metrics"]["counters"]
+        );
+        assert!(
+            counter(&r, "link_failures") > 0,
+            "{}",
+            r["metrics"]["counters"]
+        );
+
+        let mut config = Config {
+            nodes: 200,
+            ..Config::default()
+        };
+        data_defaults(&mut config);
+        config.request_rate = 0.2;
+        config.combined_faults.enabled = false;
+        let r = run(
+            "full-failover",
+            config.clone(),
+            1,
+            Some(300 * SECONDS),
+            None,
+        )
+        .unwrap();
+        assert_clean(&r);
+        assert_eq!(counter(&r, "origin_5xx"), 0);
+        // An explicit fault list replaces the defaults.
+        config.combined_faults.enabled = true;
+        config.faults = vec![Fault::Slow {
+            node: 1,
+            factor: 2,
+            from_ns: 0,
+            until_ns: SECONDS,
+        }];
+        let r = run("full-failover", config, 1, Some(300 * SECONDS), None).unwrap();
+        assert_eq!(counter(&r, "origin_5xx"), 0);
     }
 
     #[test]
