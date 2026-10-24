@@ -24,6 +24,9 @@
 use super::budget::AcquisitionBudget;
 use super::candidates::{ProbeOutcome, VisitOrder};
 use super::error::{Error, Result};
+use super::fanout::{
+    HELPER_ATTEMPTS, HELPER_FLOOR_ATTEMPTS, HELPER_FLOOR_LINKS, HELPER_LINKS, HELPER_MIN_ATTEMPTS,
+};
 use std::time::{Duration, Instant};
 
 /// Whether a probe may start acquisition at its destination.
@@ -81,6 +84,16 @@ pub struct WalkConfig {
     /// issue 12); see [`same_rank_previous`]. Ignored for non-owners, for
     /// handoff targets, and for non-page walks.
     pub previous: u8,
+    /// A non-owner page walk has an overflow helper (see
+    /// [`super::fanout`]); a probe of it reports `canonical = owners`.
+    /// The walk is eligible only when it starts with at least
+    /// [`HELPER_MIN_ATTEMPTS`] attempts (so a helper, which inherits fewer,
+    /// never asks another helper). It asks the helper at most once, right
+    /// after an owner probe fails transiently (`Overloaded` or
+    /// `Unreachable`), funded with up to [`HELPER_ATTEMPTS`] attempts and
+    /// [`HELPER_LINKS`] links from what is left. Owner probes are planned
+    /// exactly as without a helper. Ignored for owners and non-pages.
+    pub helper: bool,
 }
 
 /// Most previous-membership owners one walk asks (the replica count).
@@ -222,6 +235,22 @@ pub struct CandidateWalk {
     funding: bool,
     pending: Option<Pending>,
     done: bool,
+    helper: Helper,
+}
+
+/// Overflow helper state of a non-owner page walk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Helper {
+    /// Not decided yet (before the first `next`).
+    Unset,
+    /// No helper for this walk.
+    Off,
+    /// Eligible; no owner probe has failed transiently yet.
+    Armed,
+    /// An owner failed transiently: the next probe asks the helper.
+    Due,
+    /// Asked (or disarmed).
+    Used,
 }
 
 struct Pending {
@@ -233,6 +262,8 @@ struct Pending {
     delegated: bool,
     /// Sent under the previous membership ([`WalkConfig::previous`]).
     previous: bool,
+    /// The probe asks the overflow helper.
+    helper: bool,
 }
 
 impl CandidateWalk {
@@ -267,7 +298,59 @@ impl CandidateWalk {
             funding: false,
             pending: None,
             done: false,
+            helper: Helper::Unset,
         }
+    }
+
+    /// Decide once, from the starting budget, whether this walk may ask an
+    /// overflow helper. A non-owner that cannot fund its first out-of-order
+    /// owner at all (which would end the walk on funding before any probe)
+    /// visits the owners canonically instead, starting at rank 0; a helper's
+    /// small inherited budget can take this path.
+    fn start(&mut self, budget: &AcquisitionBudget) {
+        let eligible = self.config.helper
+            && self.config.rank.is_none()
+            && self.config.page_operation
+            && budget.remaining_attempts() >= HELPER_MIN_ATTEMPTS;
+        self.helper = if eligible { Helper::Armed } else { Helper::Off };
+        if self.config.rank.is_none()
+            && !self.config.continuation.bounded_routes
+            && !self.config.continuation.primary_consumed
+            && self.order.get(0).is_some_and(|first| {
+                first > 0 && budget.remaining_attempts() < owner_funding_min(first)
+            })
+        {
+            let len = self.order.ranks().len();
+            self.order = VisitOrder::canonical(len);
+        }
+    }
+
+    /// An owner (or a relay in front of it) shed this walk's request or timed
+    /// out: ask the page's helper to acquire it, funded from what is left.
+    fn helper_probe(&mut self, budget: &mut AcquisitionBudget) -> Result<Step> {
+        let attempts = budget.remaining_attempts().min(HELPER_ATTEMPTS);
+        let links = budget.remaining_links().min(HELPER_LINKS);
+        let child = budget.partition(attempts, links)?;
+        self.pending = Some(Pending {
+            bounded: Some(child),
+            handoff: true,
+            delegated: false,
+            helper: true,
+            previous: false,
+        });
+        Ok(Step::Probe(Probe {
+            index: self.index,
+            canonical: self.config.owners,
+            mode: Mode::Acquire,
+            remaining_opportunities: (self.count.saturating_sub(self.index) + 1) as u32,
+            route: RouteMode::FundedRoute,
+            previous: false,
+        }))
+    }
+
+    /// Whether the pending probe asks the overflow helper.
+    pub fn pending_helper(&self) -> bool {
+        self.pending.as_ref().is_some_and(|p| p.helper)
     }
 
     /// Credits the funded visits after `index` need at least: minimum
@@ -320,6 +403,17 @@ impl CandidateWalk {
     pub fn next(&mut self, budget: &mut AcquisitionBudget) -> Result<Step> {
         assert!(self.pending.is_none(), "complete the pending probe first");
         assert!(!self.done, "walk already ended");
+        if self.helper == Helper::Unset {
+            self.start(budget);
+        }
+        if self.helper == Helper::Due {
+            self.helper = Helper::Used;
+            if budget.remaining_attempts() >= HELPER_FLOOR_ATTEMPTS
+                && budget.remaining_links() >= HELPER_FLOOR_LINKS
+            {
+                return self.helper_probe(budget);
+            }
+        }
         let rank = self.config.rank;
         let continuation = self.config.continuation;
         while let Some(canonical) = self.target(self.index) {
@@ -360,6 +454,15 @@ impl CandidateWalk {
                 self.saw_version |= outcome == ProbeOutcome::VersionUnavailable;
                 self.saw_transient |= transient(outcome);
                 self.index += 1;
+                if self.helper == Helper::Armed
+                    && matches!(
+                        outcome,
+                        ProbeOutcome::Overloaded | ProbeOutcome::Unreachable
+                    )
+                {
+                    self.helper = Helper::Due;
+                    return self.next(budget);
+                }
                 continue;
             }
             // With only the sender attempt left, a page Acquire would carry
@@ -468,6 +571,7 @@ impl CandidateWalk {
                 handoff,
                 delegated,
                 previous,
+                helper: false,
             });
             return Ok(Step::Probe(Probe {
                 index,
@@ -522,7 +626,33 @@ impl CandidateWalk {
         if let Some(bounded) = pending.bounded {
             budget.reunite(bounded)?;
         }
+        if pending.helper {
+            // The helper does not consume a visit-order position. Its
+            // failure is only a miss (handled with handoff probes below).
+            return match outcome {
+                Outcome::Copy => {
+                    self.done = true;
+                    Ok(Some(End::Copy))
+                }
+                Outcome::Probe(o) | Outcome::Transport(o)
+                    if matches!(o, ProbeOutcome::Unreachable | ProbeOutcome::Overloaded) =>
+                {
+                    budget.note_route_failure();
+                    Ok(None)
+                }
+                _ => Ok(None),
+            };
+        }
         self.index += 1;
+        if self.helper == Helper::Armed
+            && matches!(
+                outcome,
+                Outcome::Probe(ProbeOutcome::Overloaded | ProbeOutcome::Unreachable)
+                    | Outcome::Transport(ProbeOutcome::Overloaded | ProbeOutcome::Unreachable)
+            )
+        {
+            self.helper = Helper::Due;
+        }
         match outcome {
             Outcome::Probe(ProbeOutcome::VersionUnavailable) if pending.delegated => {
                 // Rank 0 asked origin for this version and was told it does

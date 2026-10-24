@@ -7,6 +7,7 @@
 pub mod budget;
 pub mod candidates;
 pub mod error;
+pub mod fanout;
 pub mod fill;
 pub mod flight;
 pub mod metadata;

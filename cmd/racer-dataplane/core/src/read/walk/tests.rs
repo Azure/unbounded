@@ -5,6 +5,9 @@
 #[cfg(test)]
 use super::*;
 use crate::read::candidates::{ReplicaSelection, visit_order};
+use crate::read::fanout::{
+    HELPER_ATTEMPTS, HELPER_FLOOR_ATTEMPTS, HELPER_FLOOR_LINKS, HELPER_LINKS, HELPER_MIN_ATTEMPTS,
+};
 
 fn config(rank: Option<usize>, owners: usize, order: VisitOrder) -> WalkConfig {
     WalkConfig {
@@ -15,6 +18,7 @@ fn config(rank: Option<usize>, owners: usize, order: VisitOrder) -> WalkConfig {
         continuation: Continuation::default(),
         handoff: 0,
         previous: 0,
+        helper: false,
     }
 }
 
@@ -951,4 +955,164 @@ fn stale_answer_under_the_previous_membership_is_transient_evidence() {
         );
         assert_eq!((b.remaining_attempts(), b.remaining_links()), (8, 32));
     }
+}
+fn helper_config(order: VisitOrder) -> WalkConfig {
+    WalkConfig {
+        helper: true,
+        ..config(None, 3, order)
+    }
+}
+
+fn shapes(probes: &[(Probe, u32, u8)]) -> Vec<(usize, Mode, RouteMode)> {
+    probes
+        .iter()
+        .map(|(p, ..)| (p.canonical, p.mode, p.route))
+        .collect()
+}
+
+#[test]
+fn overloaded_owner_sends_the_reader_to_its_helper_once() {
+    let mut walk = CandidateWalk::new(helper_config(VisitOrder::canonical(3)));
+    let mut b = budget(8, 16);
+    let (probes, end) = drive(&mut walk, &mut b, |p, _| {
+        if p.canonical == 3 {
+            Outcome::Copy
+        } else {
+            Outcome::Transport(ProbeOutcome::Overloaded)
+        }
+    });
+    assert_eq!(end, End::Copy);
+    assert_eq!(
+        shapes(&probes),
+        vec![
+            (0, Mode::Acquire, RouteMode::SharedRoute),
+            (3, Mode::Acquire, RouteMode::FundedRoute),
+        ]
+    );
+    // The helper probe is funded from what the owner probe left, capped.
+    let (_, attempts, links) = probes[1];
+    assert!(
+        attempts >= HELPER_FLOOR_ATTEMPTS && attempts <= HELPER_ATTEMPTS,
+        "{attempts}"
+    );
+    assert!(
+        links >= HELPER_FLOOR_LINKS && links <= HELPER_LINKS,
+        "{links}"
+    );
+}
+
+#[test]
+fn helper_miss_falls_back_to_remaining_owners_and_never_repeats() {
+    let mut walk = CandidateWalk::new(helper_config(VisitOrder::canonical(3)));
+    let mut b = budget(32, 64);
+    let (probes, end) = drive(&mut walk, &mut b, |_, _| {
+        Outcome::Transport(ProbeOutcome::Unreachable)
+    });
+    let canon: Vec<_> = probes.iter().map(|(p, ..)| p.canonical).collect();
+    assert_eq!(canon, vec![0, 3, 1, 2]);
+    assert!(matches!(end, End::Exhausted { .. }), "{end:?}");
+}
+
+#[test]
+fn owner_probes_are_planned_exactly_as_without_a_helper() {
+    // Without overflow the helper changes nothing, for every visit order.
+    for first in 0..3 {
+        let order = visit_order(ReplicaSelection::Spread, 3, |r| r == first, |_| 0);
+        let run = |helper: bool| {
+            let mut walk = CandidateWalk::new(WalkConfig {
+                helper,
+                ..config(None, 3, order)
+            });
+            let mut b = budget(8, 16);
+            let (probes, end) = drive(&mut walk, &mut b, |_, _| {
+                Outcome::Probe(ProbeOutcome::CopyMiss)
+            });
+            (probes, end, b.remaining_attempts(), b.remaining_links())
+        };
+        assert_eq!(run(true), run(false), "first {first}");
+    }
+}
+
+#[test]
+fn helper_never_chains_and_owners_never_use_helpers() {
+    // A helper inherits at most HELPER_ATTEMPTS - 1: too few to be eligible.
+    assert!(HELPER_ATTEMPTS < HELPER_MIN_ATTEMPTS);
+    let mut walk = CandidateWalk::new(helper_config(VisitOrder::canonical(3)));
+    let mut b = budget(HELPER_ATTEMPTS, 8);
+    let (probes, _) = drive(&mut walk, &mut b, |_, _| {
+        Outcome::Transport(ProbeOutcome::Overloaded)
+    });
+    assert!(probes.iter().all(|(p, ..)| p.canonical < 3));
+    // Owners ignore the helper flag.
+    let mut walk = CandidateWalk::new(WalkConfig {
+        helper: true,
+        ..config(Some(2), 3, VisitOrder::canonical(3))
+    });
+    let mut b = budget(8, 16);
+    let (probes, end) = drive(&mut walk, &mut b, |_, _| {
+        Outcome::Transport(ProbeOutcome::Overloaded)
+    });
+    assert!(probes.iter().all(|(p, ..)| p.canonical < 2));
+    assert!(matches!(end, End::Origin { rank: 2, .. }));
+}
+
+#[test]
+fn helper_is_skipped_when_too_little_is_left() {
+    // Rank 2 first is funded with `owner_funding(2)` = 5 of 6 and spends it
+    // all (forwarded credits never come back), leaving 1 < the floor.
+    let order = visit_order(ReplicaSelection::Spread, 3, |r| r == 2, |_| 0);
+    let mut walk = CandidateWalk::new(helper_config(order));
+    let mut b = budget(HELPER_MIN_ATTEMPTS + 1, 16);
+    let mut canon = Vec::new();
+    loop {
+        match walk.next(&mut b).unwrap() {
+            Step::Probe(probe) => {
+                canon.push(probe.canonical);
+                // The exchange forwards every credit of its budget.
+                let _ = walk.request_budget(&mut b).transfer();
+                let outcome = Outcome::Transport(ProbeOutcome::Overloaded);
+                if walk.complete(&mut b, outcome).unwrap().is_some() {
+                    break;
+                }
+            }
+            Step::End(_) => break,
+        }
+    }
+    assert_eq!(canon[0], 2);
+    assert!(canon.iter().all(|c| *c < 3), "{canon:?}");
+}
+
+#[test]
+fn small_budget_non_owner_visits_rank_zero_first() {
+    // A helper's inherited budget cannot fund rank 2 out of order at all; it
+    // asks rank 0 (the origin authority) first instead of ending the walk on
+    // funding before any probe.
+    let order = visit_order(ReplicaSelection::Spread, 3, |r| r == 2, |_| 0);
+    assert_eq!(order.get(0), Some(2));
+    let mut walk = CandidateWalk::new(config(None, 3, order));
+    let mut b = budget(HELPER_ATTEMPTS - 1, 7);
+    let (probes, end) = drive(&mut walk, &mut b, |p, _| {
+        if p.canonical == 0 {
+            Outcome::Copy
+        } else {
+            Outcome::Probe(ProbeOutcome::CopyMiss)
+        }
+    });
+    assert_eq!(
+        shapes(&probes)[0],
+        (0, Mode::Acquire, RouteMode::SharedRoute)
+    );
+    assert_eq!(end, End::Copy);
+}
+
+#[test]
+fn hedged_primary_overflow_asks_the_helper_first() {
+    let mut cfg = helper_config(VisitOrder::canonical(3));
+    cfg.continuation.primary_consumed = true;
+    cfg.continuation.primary_outcome = Some(ProbeOutcome::Overloaded);
+    let mut walk = CandidateWalk::new(cfg);
+    let mut b = budget(8, 16);
+    let (probes, end) = drive(&mut walk, &mut b, |_, _| Outcome::Copy);
+    assert_eq!(probes[0].0.canonical, 3);
+    assert_eq!(end, End::Copy);
 }
