@@ -534,6 +534,7 @@ mod tests {
             "{}",
             before["metrics"]["counters"]
         );
+        assert!(counter(&before, "reads_failed_while_members_unready") > 0);
         let after = run_with(false);
         assert_clean(&after);
         assert_eq!(after["combined"]["control"]["enrolled"], 300);
@@ -544,6 +545,9 @@ mod tests {
             after["metrics"]["counters"]
         );
         assert_eq!(counter(&after, "reads_failed_while_members_unready"), 0);
+        assert_eq!(counter(&after, "reads_failed"), 0);
+        // The price: a node does not read until a membership lists it.
+        assert!(counter(&after, "reads_skipped_not_member") > 0);
         assert!(counter(&after, "reads_completed") > 0);
         assert_eq!(ctl_counter(&after, "ctl_reports"), 300);
         // Joins are batched: at most one version per hold, plus the empty
