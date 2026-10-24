@@ -83,8 +83,8 @@ pub const JOIN_HOLD_SECS: u64 = 10;
 /// Longest join hold-down.
 pub const MAX_JOIN_HOLD_SECS: u64 = 60;
 
-/// Join hold-down for a membership of `members`: one second per thousand
-/// members, within [`JOIN_HOLD_SECS`] and [`MAX_JOIN_HOLD_SECS`].
+/// Join hold-down for a cluster of `members` (the larger of the membership
+/// and the Nodes with an eligible Pod): one second per thousand, within [`JOIN_HOLD_SECS`] and [`MAX_JOIN_HOLD_SECS`].
 ///
 /// Every version costs each client a reply, and a client that is two or
 /// more versions behind gets the full image (about 120 bytes per member)
@@ -158,11 +158,15 @@ pub fn plan_pass(i: &PassInputs<'_>, rng: &mut dyn Entropy) -> Result<PassPlan, 
             .push(p.clone());
     }
     let nodes: Vec<NodeInfo> = inv.nodes.values().cloned().collect();
+    // Sized by the eligible Pods too: during a cold start the membership is
+    // small but the cluster, and so the cost of each version, is not.
+    let eligible = members::eligible_nodes(&pods, i.ownership);
+    let hold_secs = join_hold_secs(history.len().max(eligible));
     let joins = members::Joins {
         require_report: true,
         hold: !history.is_empty()
             && i.membership_changed_unix
-                .is_some_and(|t| i.wall_unix < t.saturating_add(join_hold_secs(history.len()))),
+                .is_some_and(|t| i.wall_unix < t.saturating_add(hold_secs)),
     };
     let members = members::reconcile_at(
         &nodes,
@@ -174,7 +178,6 @@ pub fn plan_pass(i: &PassInputs<'_>, rng: &mut dyn Entropy) -> Result<PassPlan, 
         joins,
     )
     .map_err(|_| StateError::TooLarge);
-    let eligible = members::eligible_nodes(&pods, i.ownership);
     let catalog_input: Vec<CacheInfo> = inv.caches.values().cloned().collect();
     let durable = i.current.map(|c| c.keyring.clone()).unwrap_or_default();
     // The catalog is unknown until the ClusterCache watch synced, or when it
