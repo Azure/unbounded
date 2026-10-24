@@ -17,8 +17,10 @@
 //! - [`cost`]: CPU cost models for control thread hot spots.
 //! - [`admission`]: seat server admission (write and bootstrap slots, long
 //!   poll cursors, delta versus full image bodies).
+//! - [`authz`]: bearer authorization cache and API budget.
 
 pub mod admission;
+pub mod authz;
 pub mod cluster;
 pub mod contend;
 pub mod cost;
