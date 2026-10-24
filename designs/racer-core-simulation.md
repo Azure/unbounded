@@ -401,8 +401,8 @@ Verified against the code at the start of this work.
 
 21. An owner above rank 0 that cannot fund or route its delegation fetches the page itself, and
    rank 0, which never asks successors, fetches it again later: in 50k `full-failover` (seed 1)
-   1,621 such skips for lack of a route and 1,024 for lack of credits, leaving 948 and 595
-   `copy_held` repeats (1.8% and 1.1% of 52,152 origin requests). Every fix tried trades read
+   1,643 such skips for lack of a route and 621 for lack of credits, leaving 944 and 336
+   `copy_held` repeats (1.8% and 0.7% of 51,585 origin requests). Every fix tried trades read
    availability or costs more than it saves (rank 0 asking successors, funding rank 0, delegating
    without the owner's fallback credit; see "Round 4: repeat", "Fixes tried and rejected"). Bounded
    by issue 15's invariant. Open (round 4, repeat).
@@ -864,7 +864,7 @@ scenarios carry data-plane faults.
 20. Join versions cost origin fetches (50k `full-failover` worst page 9 to 12) and seat egress
    (298 GB to 689 GB) (round 4, join).
 21. Owners above rank 0 without the credits or links to delegate fetch themselves and orphan the
-   copy; 2.9% of 50k `full-failover` origin requests (round 4, repeat).
+   copy; 2.5% of 50k `full-failover` origin requests (round 4, repeat).
 22. Resolved: the simulator debits the origin attempt like production (round 4, repeat).
 
 ## Round 2: production admission
@@ -2562,5 +2562,24 @@ and `unexplained`): `full-failover` 0 / 376 / 2 / 247 (skips 791, orphans 180: `
 unexplained 0). The added failed reads in `full-failover` are the debit: fills that reached origin
 without a credit now fail as in production.
 
-50,000 nodes, `full-failover`: see the table below (filled from
-`/tmp/opencode/r4-repeat/after-50k-full-failover.json`).
+50,000 nodes, `full-failover`, run one at a time next to other tracks' runs. Before is the branch
+after 34a4bf93f (skip causes, no debit; origin numbers equal the wave 1 merge), after is 293eaa5d4.
+
+| | Before | After |
+| --- | --- | --- |
+| Origin requests, max, pages>1 | 52,152, 8, 5,748 | 51,585, 8, 5,320 |
+| Repeats move / failure / lost / held | 0 / 1,915 / 1 / 5,472 | 0 / 1,924 / 1 / 4,985 |
+| `held`: unasked / unreachable / raced | 4,375 / 1,093 / 4 | 3,930 / 1,052 / 3 |
+| Skips (fetches above rank 0) | 7,903 | 7,280 |
+| Orphans: failed / not serving / route / copy-only / partition | 1,818 / 1,024 / 948 / 595 / 145 | 1,712 / 931 / 944 / 336 / 129 |
+| `unexplained` (hard invariant) | not measured | 0 |
+| Reads ok / failed | 304,333 / 6,936 | 303,786 / 7,315 |
+| `read_ns` p50 / p99 (ms) | 64 / 416 | 64 / 416 |
+| Wall, peak RSS | 21:27, 2.82 GiB | 21:34, 2.82 GiB |
+
+The bound holds at 50k: 4,985 `copy_held` <= 7,280 skips + 4,052 orphans, orphans <= skips, and no
+hard invariant failed. `copy_held` is still 9.7% of origin requests. Of its 4,052 orphans, 45%
+have inherent causes (rank 0's own origin failure 42%, partitions 3%), 23% belong to issue 14
+(members that do not serve yet) and 32% to the budget (issue 21: route 23%, copy-only 8%); the
+other 930 repeats are skips of a rank 0 that held the page but could not be reached. The 379 more
+failed reads are the debit (1,576 fills reached origin without a credit and now fail).
