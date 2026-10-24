@@ -551,4 +551,6 @@ fn peer_error(error: Error) -> Result<PeerResponse> {
 }
 
 #[cfg(test)]
+mod core_equivalence;
+#[cfg(test)]
 pub(crate) mod tests;

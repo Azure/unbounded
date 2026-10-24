@@ -1,0 +1,574 @@
+//! Equivalence between production read-path state machines and the sans-IO
+//! versions in `racer-core` that the simulator (`racer-sim`) drives.
+//!
+//! These replace the `fidelity` and `waiter_detach` oracles of the retired
+//! `src/contention.rs` model: rather than comparing a payload-free model with
+//! production, they check that the core used by the simulator makes the same
+//! decisions as production on seeded traces.
+
+use crate::admission::AdmissionPolicy;
+use crate::admission::ResourceClass;
+use crate::error::Error;
+use crate::memory::PageResult;
+use crate::model::CacheKey;
+use crate::model::ObjectId;
+use crate::model::ObjectVersion;
+use crate::model::PageId;
+use crate::model::PageNumber;
+use crate::model::RequestId;
+use crate::model::StrongEtag;
+use crate::read::flight::AcquisitionBudget;
+use crate::read::flight::AcquisitionEvent;
+use crate::read::flight::AcquisitionFailure;
+use crate::read::flight::AcquisitionWaiter;
+use crate::read::flight::FlightLeader;
+use crate::read::flight::FlightLimits;
+use crate::read::flight::Flights;
+use crate::read::flight::JoinedFlight;
+use crate::runtime::RequestScope;
+use crate::security::OriginContext;
+use flow_control::coalesce::flight::state::Outcome;
+use flow_control::coalesce::flight::state::Published;
+use racer_control_wire::CacheId;
+use racer_core::read::flight as core;
+use racer_core::time::SplitMix64;
+use std::rc::Rc;
+use std::task::Context;
+use std::task::Poll;
+use std::time::Duration;
+use std::time::Instant;
+
+/// Observable outcome of one step, comparable across both tables.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Obs {
+    Waiter,
+    Complete(u8),
+    Partial,
+    Lead,
+    Pending,
+    Failed(String),
+    Err(String),
+}
+
+fn page_id() -> PageId {
+    PageId {
+        version: ObjectVersion {
+            object: ObjectId {
+                cache: CacheId(crate::test_support::security::CACHE.into()),
+                key: CacheKey([0; 32]),
+            },
+            etag: StrongEtag::test_value("v1"),
+        },
+        number: PageNumber(0),
+    }
+}
+
+/// A published production page whose plaintext is `[value; 3]`.
+fn result(flights: &Flights, page: PageId, value: u8) -> PageResult {
+    use crate::memory::CiphertextBytes;
+    use crate::memory::CiphertextPage;
+    use crate::memory::VerifiedBytes;
+    use crate::memory::VerifiedPage;
+    use crate::model::ExpiresAt;
+    use crate::model::Nonce;
+    use crate::model::ObjectMetadata;
+    use crate::model::PageEnvelope;
+    use std::sync::Arc;
+    PageResult {
+        metadata: ObjectMetadata {
+            content_type: None,
+            version: page.version.clone(),
+            length: 3,
+            expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
+        },
+        plaintext: VerifiedPage {
+            inner: Arc::new(VerifiedBytes {
+                page: page.clone(),
+                storage: flow_control::ChargedBytes {
+                    bytes: vec![value; 3],
+                    reservation: flights
+                        .admission
+                        .reserve(None, ResourceClass::Plaintext, 3)
+                        .unwrap(),
+                },
+            }),
+        },
+        ciphertext: CiphertextPage {
+            provenance: None,
+            inner: Arc::new(CiphertextBytes {
+                checksum: std::sync::OnceLock::new(),
+                envelope: PageEnvelope {
+                    cipher: crate::model::PageCipher::Xaes256Gcm,
+                    page,
+                    key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
+                    nonce: Nonce([0; 24]),
+                    plaintext_length: 3,
+                    ciphertext_length: 19,
+                },
+                storage: flow_control::ChargedBytes {
+                    bytes: vec![0; 19],
+                    reservation: flights
+                        .admission
+                        .reserve(None, ResourceClass::Ciphertext, 19)
+                        .unwrap(),
+                }
+                .into(),
+            }),
+        },
+    }
+}
+
+/// Core admission that counts what production charges as `Waiter` and
+/// `Flight` quota.
+#[derive(Default)]
+struct Count {
+    waiters: usize,
+    flights: usize,
+}
+
+impl core::FlightAdmission for Count {
+    fn waiter(&mut self, _: &PageId) -> racer_core::read::Result<()> {
+        self.waiters += 1;
+        Ok(())
+    }
+    fn flight(&mut self, _: &PageId) -> racer_core::read::Result<()> {
+        self.flights += 1;
+        Ok(())
+    }
+    fn release_waiter(&mut self, _: &PageId) {
+        self.waiters -= 1;
+    }
+    fn release_flight(&mut self, _: &PageId) {
+        self.flights -= 1;
+    }
+}
+
+type CoreTable = core::PageFlights<u8, (), u8>;
+
+fn split(value: u8) -> Published<u8, ()> {
+    Published::Complete(value)
+}
+
+/// One caller present on both sides.
+struct Caller {
+    prod: Option<AcquisitionWaiter<'static>>,
+    leader: Option<FlightLeader>,
+    scope: &'static RequestScope,
+    core: u64,
+    /// Rejected by its own origin attempt. Production reports
+    /// `Failed(OriginRejected)` to it; core keeps it parked (see
+    /// [`origin_rejection_is_retry_in_core`]), so its polls are not compared.
+    rejected: bool,
+}
+
+struct Pair {
+    flights: Rc<Flights>,
+    quotas: Rc<flow_control::Quotas<AdmissionPolicy>>,
+    table: CoreTable,
+    count: Count,
+    wakes: Vec<core::Token>,
+    origin: &'static OriginContext,
+    page: PageId,
+    next_request: u8,
+}
+
+fn poll_prod(waiter: &mut AcquisitionWaiter<'static>) -> (Obs, Option<FlightLeader>) {
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    match waiter.wait().as_mut().poll(&mut cx) {
+        Poll::Pending => (Obs::Pending, None),
+        Poll::Ready(Ok(AcquisitionEvent::Lead(leader))) => (Obs::Lead, Some(leader)),
+        Poll::Ready(Ok(AcquisitionEvent::Complete(page))) => {
+            (Obs::Complete(page.plaintext.inner.storage.bytes[0]), None)
+        }
+        Poll::Ready(Ok(AcquisitionEvent::Ciphertext(_))) => (Obs::Partial, None),
+        Poll::Ready(Ok(AcquisitionEvent::Failed(e))) => (Obs::Failed(format!("{e:?}")), None),
+        Poll::Ready(Err(e)) => (Obs::Err(format!("{e:?}")), None),
+    }
+}
+
+/// Leader settlement must succeed or fail together. A revoked leader (its
+/// waiter canceled or expired) is rejected by both, with different errors:
+/// production returns `StaleFlight` from the fence check
+/// (`src/read/flight.rs:1605`, `leader_entry`), core returns `Internal` from
+/// `validate_leader` (`core/src/read/flight.rs:295`, `finish`). Neither reaches a
+/// reader; both drivers drop the attempt.
+fn settle(prod: crate::error::Result<()>, core: racer_core::read::Result<()>) {
+    match (&prod, &core) {
+        (Ok(()), Ok(())) => {}
+        (Err(Error::StaleFlight), Err(racer_core::read::Error::Internal)) => {}
+        _ => panic!("settle: production {prod:?}, core {core:?}"),
+    }
+}
+
+impl Pair {
+    fn new(limits: core::FlightLimits) -> Self {
+        let quotas = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        )));
+        let flights = Rc::new(
+            Flights::with_limits(
+                quotas.clone(),
+                crate::test_support::availability(),
+                FlightLimits {
+                    entries: limits.entries,
+                    waiters_per_flight: limits.waiters_per_flight,
+                    operations_per_flight: 64,
+                    generations_per_flight: limits.generations_per_flight,
+                },
+            )
+            .unwrap(),
+        );
+        let page = page_id();
+        let origin = Box::leak(Box::new(OriginContext {
+            object: page.version.object.clone(),
+            metadata: None,
+            authorization: None,
+        }));
+        Self {
+            flights,
+            quotas,
+            table: CoreTable::new(limits, split, uring_runtime::environment::now()),
+            count: Count::default(),
+            wakes: Vec::new(),
+            origin,
+            page,
+            next_request: 0,
+        }
+    }
+
+    fn now() -> Instant {
+        uring_runtime::environment::now()
+    }
+
+    /// Join a new caller on both sides. Returns the outcome and the caller
+    /// when both registered a waiter.
+    fn join(&mut self, ttl: Duration, attempts: u32) -> (Obs, Option<Caller>) {
+        let now = Self::now();
+        let deadline = now + ttl;
+        self.next_request = self.next_request.wrapping_add(1);
+        let scope: &'static RequestScope = Box::leak(Box::new(
+            RequestScope::new(RequestId([self.next_request; 16]), deadline).unwrap(),
+        ));
+        let budget: &'static mut AcquisitionBudget =
+            Box::leak(Box::new(AcquisitionBudget::new(deadline, attempts, 8)));
+        let membership = std::sync::Arc::new(
+            crate::topology::Membership::validate(racer_control_wire::MembershipVersion(1), vec![])
+                .unwrap(),
+        );
+        let prod = self
+            .flights
+            .join(self.page.clone(), membership, self.origin, scope, budget);
+        let core = self.table.join(
+            &self.page,
+            now,
+            deadline,
+            attempts,
+            true,
+            &mut self.count,
+            &mut self.wakes,
+        );
+        let prod_obs = match &prod {
+            Ok(JoinedFlight::Waiter(_)) => Obs::Waiter,
+            Ok(JoinedFlight::Complete(page)) => {
+                Obs::Complete(page.plaintext.inner.storage.bytes[0])
+            }
+            Ok(JoinedFlight::Ciphertext(_)) => Obs::Partial,
+            Err(e) => Obs::Err(format!("{e:?}")),
+        };
+        let core_obs = match &core {
+            Ok(core::Joined::Waiter(_)) => Obs::Waiter,
+            Ok(core::Joined::Complete(v)) => Obs::Complete(*v),
+            Ok(core::Joined::Partial(())) => Obs::Partial,
+            Err(e) => Obs::Err(format!("{e:?}")),
+        };
+        assert_eq!(prod_obs, core_obs, "join");
+        let caller = match (prod, core) {
+            (Ok(JoinedFlight::Waiter(waiter)), Ok(core::Joined::Waiter(id))) => Some(Caller {
+                prod: Some(waiter),
+                leader: None,
+                scope,
+                core: id,
+                rejected: false,
+            }),
+            _ => None,
+        };
+        (prod_obs, caller)
+    }
+
+    fn poll(&mut self, caller: &mut Caller) -> Obs {
+        let (prod, leader) = poll_prod(caller.prod.as_mut().unwrap());
+        let core = match self.table.poll(
+            &self.page,
+            caller.core,
+            Self::now(),
+            caller.core,
+            &mut self.wakes,
+        ) {
+            Ok(core::Event::Lead) => Obs::Lead,
+            Ok(core::Event::Complete(v)) => Obs::Complete(v),
+            Ok(core::Event::Failed(e)) => Obs::Failed(format!("{e:?}")),
+            Ok(core::Event::Pending) => Obs::Pending,
+            Err(e) => Obs::Err(format!("{e:?}")),
+        };
+        if !caller.rejected {
+            assert_eq!(prod, core, "poll");
+        }
+        if let Some(leader) = leader {
+            caller.leader = Some(leader);
+        }
+        prod
+    }
+
+    fn cancel(&mut self, caller: &mut Caller) {
+        caller.scope.cancel().unwrap();
+        self.table.cancel(&self.page, caller.core, &mut self.wakes);
+    }
+
+    /// Detach: production drops the waiter (and an unfinished leader, which
+    /// revokes it); core cancels a leader and detaches.
+    fn detach(&mut self, mut caller: Caller) {
+        if caller.leader.is_some() {
+            self.table.cancel(&self.page, caller.core, &mut self.wakes);
+        }
+        drop(caller.leader.take());
+        drop(caller.prod.take());
+        self.table
+            .detach(&self.page, caller.core, &mut self.count, &mut self.wakes);
+    }
+
+    fn publish(&mut self, caller: &mut Caller, value: u8) {
+        let leader = caller.leader.take().unwrap();
+        let page = result(&self.flights, self.page.clone(), value);
+        let prod = self.flights.publish(leader, page).map(|_| ());
+        let core = self.table.finish(
+            &self.page,
+            caller.core,
+            Outcome::Published(value),
+            &mut self.wakes,
+        );
+        settle(prod, core);
+    }
+
+    fn fail(&mut self, caller: &mut Caller) {
+        let leader = caller.leader.take().unwrap();
+        let prod = self
+            .flights
+            .fail(leader, AcquisitionFailure::Terminal(Error::Io))
+            .map(|_| ());
+        let core = self.table.finish(
+            &self.page,
+            caller.core,
+            Outcome::Failed(racer_core::read::Error::Io),
+            &mut self.wakes,
+        );
+        settle(prod, core);
+    }
+
+    fn reject(&mut self, caller: &mut Caller) {
+        let leader = caller.leader.take().unwrap();
+        let prod = self
+            .flights
+            .fail(leader, AcquisitionFailure::OriginRejected)
+            .map(|_| ());
+        let core = self
+            .table
+            .finish(&self.page, caller.core, Outcome::Retry, &mut self.wakes);
+        caller.rejected = prod.is_ok();
+        settle(prod, core);
+    }
+
+    fn refresh(&mut self) {
+        self.table.refresh(&self.page, Self::now(), &mut self.wakes);
+    }
+
+    /// Admission and table occupancy agree.
+    fn check(&self) {
+        assert_eq!(
+            self.quotas.used(ResourceClass::Waiter),
+            self.count.waiters,
+            "waiter quota"
+        );
+        assert_eq!(
+            self.quotas.used(ResourceClass::Flight),
+            self.count.flights,
+            "flight quota"
+        );
+        assert_eq!(self.table.waiters(&self.page), self.count.waiters);
+    }
+}
+
+/// Production `Error` and core `Error` print the same variant names.
+#[test]
+fn error_names_match() {
+    assert_eq!(
+        format!("{:?}", Error::Overloaded),
+        format!("{:?}", racer_core::read::Error::Overloaded)
+    );
+}
+
+/// Seeded join, poll, cancel, deadline, detach, publish, fail, and origin
+/// rejection traces on one page: every step has the same observable outcome
+/// and the same waiter and flight admission on both sides. Covers terminal
+/// waiter replacement before completion (a waiter cap forces `Overloaded`
+/// until a canceled or expired waiter detaches), last-waiter detach, and
+/// leader re-election after cancellation and origin rejection.
+#[test]
+fn flights_match_page_flights_on_seeded_traces() {
+    let mut steps = std::collections::BTreeMap::<&str, usize>::new();
+    for seed in 0..48u64 {
+        let clock = uring_runtime::environment::SimulationClock::new(900 + seed);
+        let _environment = clock.environment(0).enter();
+        let mut rng = SplitMix64::new(seed);
+        let mut pair = Pair::new(core::FlightLimits {
+            entries: 4,
+            waiters_per_flight: 3,
+            generations_per_flight: 1024,
+        });
+        let mut callers: Vec<Caller> = Vec::new();
+        let mut value = 0u8;
+        for _ in 0..60 {
+            let leader = callers.iter().position(|c| c.leader.is_some());
+            match rng.below(9) {
+                0 | 1 => {
+                    let ttl = if rng.below(3) == 0 {
+                        Duration::from_secs(1)
+                    } else {
+                        Duration::from_secs(60)
+                    };
+                    let attempts = rng.below(3) as u32;
+                    let (obs, caller) = pair.join(ttl, attempts);
+                    *steps
+                        .entry(match obs {
+                            Obs::Err(_) => "join_rejected",
+                            Obs::Complete(_) => "join_complete",
+                            _ => "join",
+                        })
+                        .or_default() += 1;
+                    callers.extend(caller);
+                }
+                2 | 3 if !callers.is_empty() => {
+                    let i = rng.below(callers.len() as u64) as usize;
+                    if callers[i].leader.is_none() {
+                        let obs = pair.poll(&mut callers[i]);
+                        *steps
+                            .entry(match obs {
+                                Obs::Lead => "lead",
+                                Obs::Failed(_) => "failed",
+                                Obs::Complete(_) => "complete",
+                                _ => "poll",
+                            })
+                            .or_default() += 1;
+                    }
+                }
+                4 if !callers.is_empty() => {
+                    let i = rng.below(callers.len() as u64) as usize;
+                    *steps.entry("cancel").or_default() += 1;
+                    let mut caller = callers.swap_remove(i);
+                    pair.cancel(&mut caller);
+                    if caller.leader.is_none() {
+                        pair.poll(&mut caller);
+                    }
+                    pair.detach(caller);
+                }
+                5 if !callers.is_empty() => {
+                    let i = rng.below(callers.len() as u64) as usize;
+                    *steps.entry("detach").or_default() += 1;
+                    pair.detach(callers.swap_remove(i));
+                }
+                6 if leader.is_some() => {
+                    let caller = &mut callers[leader.unwrap()];
+                    match rng.below(3) {
+                        0 => {
+                            value += 1;
+                            pair.publish(caller, value);
+                            *steps.entry("publish").or_default() += 1;
+                        }
+                        1 => {
+                            pair.fail(caller);
+                            *steps.entry("fail").or_default() += 1;
+                        }
+                        _ => {
+                            pair.reject(caller);
+                            *steps.entry("reject").or_default() += 1;
+                        }
+                    }
+                }
+                7 => {
+                    clock.advance(Duration::from_millis(600));
+                    pair.refresh();
+                    *steps.entry("advance").or_default() += 1;
+                }
+                _ => {}
+            }
+            pair.check();
+        }
+        for caller in callers.drain(..) {
+            pair.detach(caller);
+        }
+        pair.check();
+        assert_eq!(pair.count.waiters, 0);
+        assert_eq!(pair.count.flights, 0, "seed {seed}");
+        assert!(pair.table.is_empty());
+    }
+    for step in [
+        "join",
+        "join_rejected",
+        "join_complete",
+        "lead",
+        "failed",
+        "complete",
+        "cancel",
+        "detach",
+        "publish",
+        "fail",
+        "reject",
+        "advance",
+    ] {
+        assert!(
+            steps.get(step).copied().unwrap_or(0) > 0,
+            "{step}: {steps:?}"
+        );
+    }
+}
+
+/// Divergence (Known issue 8 in `designs/racer-core-simulation.md`):
+/// production `Flights::fail(OriginRejected)` (`src/read/flight.rs:1441`)
+/// cancels the supplying caller with `OriginRejected` before `Outcome::Retry`,
+/// so that caller fails even when another caller later publishes. Core
+/// `PageFlights::finish(Outcome::Retry)` (`core/src/read/flight.rs:295`) has
+/// no rejection error: the rejected leader stays parked and receives the later
+/// result. Both re-elect the next eligible waiter (compared by the trace
+/// test). The simulator never finishes a flight with `Retry`
+/// (`sim/src/node/world.rs`, `FlightEvent::Lead` arm), so its runs are not
+/// affected. This test pins the current behavior of both.
+#[test]
+fn origin_rejection_is_retry_in_core() {
+    let clock = uring_runtime::environment::SimulationClock::new(77);
+    let _environment = clock.environment(0).enter();
+    let mut pair = Pair::new(core::FlightLimits::default());
+    let mut a = pair.join(Duration::from_secs(60), 2).1.unwrap();
+    let mut b = pair.join(Duration::from_secs(60), 2).1.unwrap();
+    assert_eq!(pair.poll(&mut a), Obs::Lead);
+    assert_eq!(pair.poll(&mut b), Obs::Pending);
+    pair.reject(&mut a);
+    assert_eq!(pair.poll(&mut b), Obs::Lead);
+    let (prod, _) = poll_prod(a.prod.as_mut().unwrap());
+    assert_eq!(prod, Obs::Failed("OriginRejected".into()));
+    let core = pair
+        .table
+        .poll(&pair.page, a.core, Pair::now(), a.core, &mut pair.wakes)
+        .unwrap();
+    assert_eq!(core, core::Event::Pending);
+    pair.publish(&mut b, 9);
+    let (prod, _) = poll_prod(a.prod.as_mut().unwrap());
+    assert_eq!(prod, Obs::Failed("OriginRejected".into()));
+    let core = pair
+        .table
+        .poll(&pair.page, a.core, Pair::now(), a.core, &mut pair.wakes)
+        .unwrap();
+    assert_eq!(core, core::Event::Complete(9));
+    pair.detach(a);
+    pair.detach(b);
+    pair.check();
+    assert!(pair.table.is_empty());
+}
