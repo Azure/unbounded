@@ -68,31 +68,25 @@ spec:
                           type: string
                         kind:
                           type: string
-                        queue:
-                          type: string
                       required:
                       - apiVersion
                       - kind
                       type: object
                     backendActiveDeadline:
                       type: string
+                    gpuCount:
+                      format: int32
+                      type: integer
                     id:
                       maxLength: 63
                       minLength: 1
                       pattern: ^R(0[1-9]|1[0-5])$
                       type: string
-                    maxAttempts:
-                      format: int32
-                      type: integer
                     order:
                       format: int32
                       maximum: 14
                       minimum: 0
                       type: integer
-                    parameters:
-                      additionalProperties:
-                        type: string
-                      type: object
                     participantPolicy:
                       properties:
                         excludedRoles:
@@ -105,34 +99,6 @@ spec:
                             type: string
                           maxItems: 16
                           type: array
-                      type: object
-                    resultBounds:
-                      properties:
-                        backendEvidenceBytes:
-                          format: int32
-                          maximum: 65536
-                          minimum: 1
-                          type: integer
-                        backendResourcesBytes:
-                          format: int32
-                          maximum: 16384
-                          minimum: 1
-                          type: integer
-                        measurementsBytes:
-                          format: int32
-                          maximum: 16384
-                          minimum: 1
-                          type: integer
-                        reasonBytes:
-                          format: int32
-                          maximum: 4096
-                          minimum: 1
-                          type: integer
-                      required:
-                      - backendEvidenceBytes
-                      - backendResourcesBytes
-                      - measurementsBytes
-                      - reasonBytes
                       type: object
                     runnerImage:
                       type: string
@@ -164,23 +130,39 @@ spec:
                       - digest
                       - key
                       type: object
+                    scriptEnvironment:
+                      additionalProperties:
+                        type: string
+                      type: object
                     workloadPolicy:
                       properties:
+                        capabilities:
+                          items:
+                            description: Capability represent POSIX capabilities type
+                            type: string
+                          type: array
                         hostNetwork:
                           type: boolean
-                        kueueTopology:
-                          properties:
-                            requiredLevel:
-                              description: |-
-                                RequiredLevel is the Node label key for the minimum topology domain in which
-                                Kueue must place the participant PodSet.
-                              maxLength: 316
-                              minLength: 1
-                              pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
-                              type: string
-                          required:
-                          - requiredLevel
-                          type: object
+                        hostPaths:
+                          items:
+                            properties:
+                              mountPath:
+                                type: string
+                              name:
+                                type: string
+                              path:
+                                type: string
+                              type:
+                                type: string
+                            required:
+                            - mountPath
+                            - name
+                            - path
+                            type: object
+                          maxItems: 16
+                          type: array
+                        privileged:
+                          type: boolean
                         resources:
                           description: ResourceRequirements describes the compute
                             resource requirements.
@@ -242,331 +224,6 @@ spec:
                                 More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                               type: object
                           type: object
-                        results:
-                          description: |-
-                            Represents an empty directory for a pod.
-                            Empty directory volumes support ownership management and SELinux relabeling.
-                          properties:
-                            medium:
-                              description: |-
-                                medium represents what type of storage medium should back this directory.
-                                The default is "" which means to use the node's default medium.
-                                Must be an empty string (default) or Memory.
-                                More info: https://kubernetes.io/docs/concepts/storage/volumes#emptydir
-                              type: string
-                            mode:
-                              description: |-
-                                mode specifies the permission bits for the emptyDir directory, in numeric
-                                notation (e.g., 0755, 01777). Must be a value between 0000 and 01777.
-                                If not specified, defaults to 0777.
-                                This might be in conflict with other options that affect the file
-                                mode, like fsGroup. If fsGroup is specified, the fsGroup permissions
-                                will override the mode specified here.
-                                This field has no effect on Windows.
-                                This field is alpha and requires EmptyDirVolumeMode featuregate to be enabled.
-                              format: int32
-                              type: integer
-                            sizeLimit:
-                              anyOf:
-                              - type: integer
-                              - type: string
-                              description: |-
-                                sizeLimit is the total amount of local storage required for this EmptyDir volume.
-                                The size limit is also applicable for memory medium.
-                                The maximum usage on memory medium EmptyDir would be the minimum value between
-                                the SizeLimit specified here and the sum of memory limits of all containers in a pod.
-                                The default is nil which means that the limit is undefined.
-                                More info: https://kubernetes.io/docs/concepts/storage/volumes#emptydir
-                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                              x-kubernetes-int-or-string: true
-                          type: object
-                        securityContext:
-                          description: |-
-                            SecurityContext holds security configuration that will be applied to a container.
-                            Some fields are present in both SecurityContext and PodSecurityContext.  When both
-                            are set, the values in SecurityContext take precedence.
-                          properties:
-                            allowPrivilegeEscalation:
-                              description: |-
-                                AllowPrivilegeEscalation controls whether a process can gain more
-                                privileges than its parent process. This bool directly controls if
-                                the no_new_privs flag will be set on the container process.
-                                AllowPrivilegeEscalation is true always when the container is:
-                                1) run as Privileged
-                                2) has CAP_SYS_ADMIN
-                                Note that this field cannot be set when spec.os.name is windows.
-                              type: boolean
-                            appArmorProfile:
-                              description: |-
-                                appArmorProfile is the AppArmor options to use by this container. If set, this profile
-                                overrides the pod's appArmorProfile.
-                                Note that this field cannot be set when spec.os.name is windows.
-                              properties:
-                                localhostProfile:
-                                  description: |-
-                                    localhostProfile indicates a profile loaded on the node that should be used.
-                                    The profile must be preconfigured on the node to work.
-                                    Must match the loaded name of the profile.
-                                    Must be set if and only if type is "Localhost".
-                                  type: string
-                                type:
-                                  description: |-
-                                    type indicates which kind of AppArmor profile will be applied.
-                                    Valid options are:
-                                      Localhost - a profile pre-loaded on the node.
-                                      RuntimeDefault - the container runtime's default profile.
-                                      Unconfined - no AppArmor enforcement.
-                                  type: string
-                              required:
-                              - type
-                              type: object
-                            capabilities:
-                              description: |-
-                                The capabilities to add/drop when running containers.
-                                Defaults to the default set of capabilities granted by the container runtime.
-                                Note that this field cannot be set when spec.os.name is windows.
-                              properties:
-                                add:
-                                  description: Added capabilities
-                                  items:
-                                    description: Capability represent POSIX capabilities
-                                      type
-                                    type: string
-                                  type: array
-                                  x-kubernetes-list-type: atomic
-                                drop:
-                                  description: Removed capabilities
-                                  items:
-                                    description: Capability represent POSIX capabilities
-                                      type
-                                    type: string
-                                  type: array
-                                  x-kubernetes-list-type: atomic
-                              type: object
-                            privileged:
-                              description: |-
-                                Run container in privileged mode.
-                                Processes in privileged containers are essentially equivalent to root on the host.
-                                Defaults to false.
-                                Note that this field cannot be set when spec.os.name is windows.
-                              type: boolean
-                            procMount:
-                              description: |-
-                                procMount denotes the type of proc mount to use for the containers.
-                                The default value is Default which uses the container runtime defaults for
-                                readonly paths and masked paths.
-                                Note that this field cannot be set when spec.os.name is windows.
-                              type: string
-                            readOnlyRootFilesystem:
-                              description: |-
-                                Whether this container has a read-only root filesystem.
-                                Default is false.
-                                Note that this field cannot be set when spec.os.name is windows.
-                              type: boolean
-                            runAsGroup:
-                              description: |-
-                                The GID to run the entrypoint of the container process.
-                                Uses runtime default if unset.
-                                May also be set in PodSecurityContext.  If set in both SecurityContext and
-                                PodSecurityContext, the value specified in SecurityContext takes precedence.
-                                Note that this field cannot be set when spec.os.name is windows.
-                              format: int64
-                              type: integer
-                            runAsNonRoot:
-                              description: |-
-                                Indicates that the container must run as a non-root user.
-                                If true, the Kubelet will validate the image at runtime to ensure that it
-                                does not run as UID 0 (root) and fail to start the container if it does.
-                                If unset or false, no such validation will be performed.
-                                May also be set in PodSecurityContext.  If set in both SecurityContext and
-                                PodSecurityContext, the value specified in SecurityContext takes precedence.
-                              type: boolean
-                            runAsUser:
-                              description: |-
-                                The UID to run the entrypoint of the container process.
-                                Defaults to user specified in image metadata if unspecified.
-                                May also be set in PodSecurityContext.  If set in both SecurityContext and
-                                PodSecurityContext, the value specified in SecurityContext takes precedence.
-                                Note that this field cannot be set when spec.os.name is windows.
-                              format: int64
-                              type: integer
-                            seLinuxOptions:
-                              description: |-
-                                The SELinux context to be applied to the container.
-                                If unspecified, the container runtime will allocate a random SELinux context for each
-                                container.  May also be set in PodSecurityContext.  If set in both SecurityContext and
-                                PodSecurityContext, the value specified in SecurityContext takes precedence.
-                                Note that this field cannot be set when spec.os.name is windows.
-                              properties:
-                                level:
-                                  description: Level is SELinux level label that applies
-                                    to the container.
-                                  type: string
-                                role:
-                                  description: Role is a SELinux role label that applies
-                                    to the container.
-                                  type: string
-                                type:
-                                  description: Type is a SELinux type label that applies
-                                    to the container.
-                                  type: string
-                                user:
-                                  description: User is a SELinux user label that applies
-                                    to the container.
-                                  type: string
-                              type: object
-                            seccompProfile:
-                              description: |-
-                                The seccomp options to use by this container. If seccomp options are
-                                provided at both the pod & container level, the container options
-                                override the pod options.
-                                Note that this field cannot be set when spec.os.name is windows.
-                              properties:
-                                localhostProfile:
-                                  description: |-
-                                    localhostProfile indicates a profile defined in a file on the node should be used.
-                                    The profile must be preconfigured on the node to work.
-                                    Must be a descending path, relative to the kubelet's configured seccomp profile location.
-                                    Must be set if type is "Localhost". Must NOT be set for any other type.
-                                  type: string
-                                type:
-                                  description: |-
-                                    type indicates which kind of seccomp profile will be applied.
-                                    Valid options are:
-
-                                    Localhost - a profile defined in a file on the node should be used.
-                                    RuntimeDefault - the container runtime default profile should be used.
-                                    Unconfined - no profile should be applied.
-                                  type: string
-                              required:
-                              - type
-                              type: object
-                            windowsOptions:
-                              description: |-
-                                The Windows specific settings applied to all containers.
-                                If unspecified, the options from the PodSecurityContext will be used.
-                                If set in both SecurityContext and PodSecurityContext, the value specified in SecurityContext takes precedence.
-                                Note that this field cannot be set when spec.os.name is linux.
-                              properties:
-                                gmsaCredentialSpec:
-                                  description: |-
-                                    GMSACredentialSpec is where the GMSA admission webhook
-                                    (https://github.com/kubernetes-sigs/windows-gmsa) inlines the contents of the
-                                    GMSA credential spec named by the GMSACredentialSpecName field.
-                                  type: string
-                                gmsaCredentialSpecName:
-                                  description: GMSACredentialSpecName is the name
-                                    of the GMSA credential spec to use.
-                                  type: string
-                                hostProcess:
-                                  description: |-
-                                    HostProcess determines if a container should be run as a 'Host Process' container.
-                                    All of a Pod's containers must have the same effective HostProcess value
-                                    (it is not allowed to have a mix of HostProcess containers and non-HostProcess containers).
-                                    In addition, if HostProcess is true then HostNetwork must also be set to true.
-                                  type: boolean
-                                runAsUserName:
-                                  description: |-
-                                    The UserName in Windows to run the entrypoint of the container process.
-                                    Defaults to the user specified in image metadata if unspecified.
-                                    May also be set in PodSecurityContext. If set in both SecurityContext and
-                                    PodSecurityContext, the value specified in SecurityContext takes precedence.
-                                  type: string
-                              type: object
-                          type: object
-                        volumes:
-                          items:
-                            properties:
-                              emptyDir:
-                                description: |-
-                                  Represents an empty directory for a pod.
-                                  Empty directory volumes support ownership management and SELinux relabeling.
-                                properties:
-                                  medium:
-                                    description: |-
-                                      medium represents what type of storage medium should back this directory.
-                                      The default is "" which means to use the node's default medium.
-                                      Must be an empty string (default) or Memory.
-                                      More info: https://kubernetes.io/docs/concepts/storage/volumes#emptydir
-                                    type: string
-                                  mode:
-                                    description: |-
-                                      mode specifies the permission bits for the emptyDir directory, in numeric
-                                      notation (e.g., 0755, 01777). Must be a value between 0000 and 01777.
-                                      If not specified, defaults to 0777.
-                                      This might be in conflict with other options that affect the file
-                                      mode, like fsGroup. If fsGroup is specified, the fsGroup permissions
-                                      will override the mode specified here.
-                                      This field has no effect on Windows.
-                                      This field is alpha and requires EmptyDirVolumeMode featuregate to be enabled.
-                                    format: int32
-                                    type: integer
-                                  sizeLimit:
-                                    anyOf:
-                                    - type: integer
-                                    - type: string
-                                    description: |-
-                                      sizeLimit is the total amount of local storage required for this EmptyDir volume.
-                                      The size limit is also applicable for memory medium.
-                                      The maximum usage on memory medium EmptyDir would be the minimum value between
-                                      the SizeLimit specified here and the sum of memory limits of all containers in a pod.
-                                      The default is nil which means that the limit is undefined.
-                                      More info: https://kubernetes.io/docs/concepts/storage/volumes#emptydir
-                                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                                    x-kubernetes-int-or-string: true
-                                type: object
-                              hostPath:
-                                description: |-
-                                  Represents a host path mapped into a pod.
-                                  Host path volumes do not support ownership management or SELinux relabeling.
-                                properties:
-                                  path:
-                                    description: |-
-                                      path of the directory on the host.
-                                      If the path is a symlink, it will follow the link to the real path.
-                                      More info: https://kubernetes.io/docs/concepts/storage/volumes#hostpath
-                                    type: string
-                                  type:
-                                    description: |-
-                                      type for HostPath Volume
-                                      Defaults to ""
-                                      More info: https://kubernetes.io/docs/concepts/storage/volumes#hostpath
-                                    type: string
-                                required:
-                                - path
-                                type: object
-                              mountPath:
-                                type: string
-                              name:
-                                type: string
-                              persistentVolumeClaim:
-                                description: |-
-                                  PersistentVolumeClaimVolumeSource references the user's PVC in the same namespace.
-                                  This volume finds the bound PV and mounts that volume for the pod. A
-                                  PersistentVolumeClaimVolumeSource is, essentially, a wrapper around another
-                                  type of volume that is owned by someone else (the system).
-                                properties:
-                                  claimName:
-                                    description: |-
-                                      claimName is the name of a PersistentVolumeClaim in the same namespace as the pod using this volume.
-                                      More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#persistentvolumeclaims
-                                    type: string
-                                  readOnly:
-                                    description: |-
-                                      readOnly Will force the ReadOnly setting in VolumeMounts.
-                                      Default false.
-                                    type: boolean
-                                required:
-                                - claimName
-                                type: object
-                              readOnly:
-                                type: boolean
-                            required:
-                            - mountPath
-                            - name
-                            type: object
-                          maxItems: 16
-                          type: array
                         workingDir:
                           type: string
                       type: object
@@ -574,15 +231,11 @@ spec:
                   - backend
                   - backendActiveDeadline
                   - id
-                  - maxAttempts
                   - order
-                  - resultBounds
                   - runnerImage
                   - script
                   type: object
                   x-kubernetes-validations:
-                  - message: maxAttempts must be exactly 1
-                    rule: self.maxAttempts == 1
                   - message: backendActiveDeadline must be positive
                     rule: duration(self.backendActiveDeadline) > duration('0s')
                   - message: runtimeStage is required when the script requires a runtime
@@ -738,10 +391,6 @@ spec:
                 - name
                 - uid
                 type: object
-              purpose:
-                enum:
-                - FullCertification
-                type: string
               requestNodeName:
                 type: string
               tolerations:
@@ -841,9 +490,6 @@ spec:
               rule: self.executionPolicy == oldSelf.executionPolicy
             - message: workflow is immutable
               rule: self.workflow == oldSelf.workflow
-            - message: purpose is immutable
-              rule: has(self.purpose) == has(oldSelf.purpose) && (!has(self.purpose)
-                || self.purpose == oldSelf.purpose)
             - message: evidencePath is immutable
               rule: self.evidencePath == oldSelf.evidencePath
             - message: deadline is immutable

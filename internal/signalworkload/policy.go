@@ -13,7 +13,6 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/validation"
 
 	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
@@ -75,17 +74,8 @@ func Validate(policy signalv1.WorkloadPolicy) error {
 		return err
 	}
 
-	if err := validateSecurityContext(policy.SecurityContext); err != nil {
+	if err := validateCapabilities(policy.Capabilities); err != nil {
 		return err
-	}
-
-	if policy.KueueTopology != nil {
-		if errors := validation.IsQualifiedName(policy.KueueTopology.RequiredLevel); len(errors) > 0 {
-			return fmt.Errorf(
-				"workload policy kueueTopology requiredLevel is invalid: %s",
-				strings.Join(errors, ", "),
-			)
-		}
 	}
 
 	if policy.WorkingDir != "" {
@@ -94,74 +84,44 @@ func Validate(policy signalv1.WorkloadPolicy) error {
 		}
 	}
 
-	if len(policy.Volumes) > 16 {
-		return errors.New("workload policy must not contain more than 16 volumes")
+	if len(policy.HostPaths) > 16 {
+		return errors.New("workload policy must not contain more than 16 host paths")
 	}
 
 	names := map[string]struct{}{"scripts": {}, "results": {}}
 	mountPaths := map[string]struct{}{"/scripts": {}, "/results": {}}
 
-	for index := range policy.Volumes {
-		volume := &policy.Volumes[index]
-		if errors := validation.IsDNS1123Label(volume.Name); len(errors) > 0 {
-			return fmt.Errorf("workload policy volume %d name is invalid: %s", index, strings.Join(errors, ", "))
+	for index := range policy.HostPaths {
+		hostPath := &policy.HostPaths[index]
+		if errors := validation.IsDNS1123Label(hostPath.Name); len(errors) > 0 {
+			return fmt.Errorf("workload policy host path %d name is invalid: %s", index, strings.Join(errors, ", "))
 		}
 
-		if _, exists := names[volume.Name]; exists {
-			return fmt.Errorf("workload policy volume %d duplicates reserved or existing name %q", index, volume.Name)
+		if _, exists := names[hostPath.Name]; exists {
+			return fmt.Errorf("workload policy host path %d duplicates reserved or existing name %q", index, hostPath.Name)
 		}
 
-		names[volume.Name] = struct{}{}
+		names[hostPath.Name] = struct{}{}
 
-		if err := validateAbsolutePath(fmt.Sprintf("workload policy volume %d mountPath", index), volume.MountPath); err != nil {
+		if err := validateAbsolutePath(fmt.Sprintf("workload policy host path %d mountPath", index), hostPath.MountPath); err != nil {
 			return err
 		}
 
-		if _, exists := mountPaths[volume.MountPath]; exists {
+		if _, exists := mountPaths[hostPath.MountPath]; exists {
 			return fmt.Errorf(
-				"workload policy volume %d duplicates reserved or existing mountPath %q",
+				"workload policy host path %d duplicates reserved or existing mountPath %q",
 				index,
-				volume.MountPath,
+				hostPath.MountPath,
 			)
 		}
 
-		mountPaths[volume.MountPath] = struct{}{}
-
-		sources := 0
-		if volume.HostPath != nil {
-			sources++
-
-			if err := validateAbsolutePath(fmt.Sprintf("workload policy volume %d hostPath", index), volume.HostPath.Path); err != nil {
-				return err
-			}
-		}
-
-		if volume.EmptyDir != nil {
-			sources++
-
-			if err := validateQuantity(fmt.Sprintf("workload policy volume %d emptyDir sizeLimit", index), volume.EmptyDir.SizeLimit); err != nil {
-				return err
-			}
-		}
-
-		if volume.PersistentVolumeClaim != nil {
-			sources++
-
-			if errors := validation.IsDNS1123Subdomain(volume.PersistentVolumeClaim.ClaimName); len(errors) > 0 {
-				return fmt.Errorf(
-					"workload policy volume %d persistentVolumeClaim claimName is invalid: %s",
-					index,
-					strings.Join(errors, ", "),
-				)
-			}
-		}
-
-		if sources != 1 {
-			return fmt.Errorf("workload policy volume %d must define exactly one source", index)
+		mountPaths[hostPath.MountPath] = struct{}{}
+		if err := validateAbsolutePath(fmt.Sprintf("workload policy host path %d path", index), hostPath.Path); err != nil {
+			return err
 		}
 	}
 
-	return validateQuantity("workload policy results sizeLimit", sizeLimit(policy.Results))
+	return nil
 }
 
 func validateResources(resources corev1.ResourceRequirements) error {
@@ -185,33 +145,19 @@ func validateResources(resources corev1.ResourceRequirements) error {
 	return nil
 }
 
-func validateSecurityContext(context *corev1.SecurityContext) error {
-	if context == nil || context.Capabilities == nil {
-		return nil
-	}
+func validateCapabilities(capabilities []corev1.Capability) error {
+	seen := map[corev1.Capability]struct{}{}
 
-	seen := map[corev1.Capability]string{}
-
-	for listName, capabilities := range map[string][]corev1.Capability{
-		"add":  context.Capabilities.Add,
-		"drop": context.Capabilities.Drop,
-	} {
-		for _, capability := range capabilities {
-			if !capabilityPattern.MatchString(string(capability)) {
-				return fmt.Errorf("workload policy capability %q is invalid", capability)
-			}
-
-			if previous, exists := seen[capability]; exists {
-				return fmt.Errorf(
-					"workload policy capability %q appears in both or repeatedly within %s and %s",
-					capability,
-					previous,
-					listName,
-				)
-			}
-
-			seen[capability] = listName
+	for _, capability := range capabilities {
+		if !capabilityPattern.MatchString(string(capability)) {
+			return fmt.Errorf("workload policy capability %q is invalid", capability)
 		}
+
+		if _, exists := seen[capability]; exists {
+			return fmt.Errorf("workload policy capability %q is repeated", capability)
+		}
+
+		seen[capability] = struct{}{}
 	}
 
 	return nil
@@ -223,20 +169,4 @@ func validateAbsolutePath(name, value string) error {
 	}
 
 	return nil
-}
-
-func validateQuantity(name string, quantity *resource.Quantity) error {
-	if quantity != nil && quantity.Sign() < 0 {
-		return fmt.Errorf("%s must not be negative", name)
-	}
-
-	return nil
-}
-
-func sizeLimit(source *corev1.EmptyDirVolumeSource) *resource.Quantity {
-	if source == nil {
-		return nil
-	}
-
-	return source.SizeLimit
 }

@@ -79,11 +79,11 @@ var reservedScriptEnvironmentNames = map[string]struct{}{
 }
 
 var workflowOutputLimits = map[string]int{
-	"backend-resources": 16 * 1024,
+	"backend-resources": signaladapter.MaxBackendOutputBytes,
 	"backend-evidence":  signaladapter.MaxBackendEvidenceBytes,
-	"cleanup-failure":   64,
-	"measurements":      16 * 1024,
-	"reason":            4 * 1024,
+	"cleanup-failure":   signaladapter.MaxCleanupFailureBytes,
+	"measurements":      signaladapter.MaxMeasurementsBytes,
+	"reason":            signaladapter.MaxReasonBytes,
 	"verdict":           32,
 }
 
@@ -224,10 +224,6 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 		return fmt.Errorf("profile %s participant constraints: %w", profile.Name, err)
 	}
 
-	if profile.Spec.Purpose != "" && profile.Spec.Purpose != signalv1.PurposeFullCertification {
-		return fmt.Errorf("profile %s purpose must be %s", profile.Name, signalv1.PurposeFullCertification)
-	}
-
 	for index := range checks {
 		check := &checks[index]
 		if err := signalv1.ValidateRuntimeContract(
@@ -243,16 +239,12 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 			return fmt.Errorf("profile %s check %s runner image must use an immutable sha256 digest", profile.Name, check.ID)
 		}
 
-		if _, err := scriptEnvironment(check.Parameters); err != nil {
-			return fmt.Errorf("profile %s check %s parameters: %w", profile.Name, check.ID, err)
+		if err := validateScriptEnvironment(check.ScriptEnvironment); err != nil {
+			return fmt.Errorf("profile %s check %s script environment: %w", profile.Name, check.ID, err)
 		}
 
 		if err := signalworkload.Validate(check.WorkloadPolicy); err != nil {
 			return fmt.Errorf("profile %s check %s workload policy: %w", profile.Name, check.ID, err)
-		}
-
-		if check.WorkloadPolicy.KueueTopology != nil && check.Backend.Queue == "" {
-			return fmt.Errorf("profile %s check %s workload policy kueueTopology requires a backend queue", profile.Name, check.ID)
 		}
 	}
 
@@ -267,42 +259,55 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 			return fmt.Errorf("check %s participants: %w", checks[index].ID, err)
 		}
 
-		minimumEvidenceBytes := signaladapter.MinimumBackendEvidenceBytes(len(checkParticipants))
-		if int(checks[index].ResultBounds.BackendEvidenceBytes) < minimumEvidenceBytes {
+		if len(checkParticipants) > signaladapter.MaxCheckParticipants {
 			return fmt.Errorf(
-				"check %s backendEvidenceBytes must be at least %d for %d participants",
+				"check %s selects %d participants, maximum is %d",
 				checks[index].ID,
-				minimumEvidenceBytes,
 				len(checkParticipants),
+				signaladapter.MaxCheckParticipants,
+			)
+		}
+
+		minimumEvidenceBytes := signaladapter.MinimumBackendEvidenceBytes(len(checkParticipants))
+		if signaladapter.MaxBackendEvidenceBytes < minimumEvidenceBytes {
+			return fmt.Errorf(
+				"check %s fixed backend evidence limit %d cannot represent %d participants; requires at least %d bytes",
+				checks[index].ID,
+				signaladapter.MaxBackendEvidenceBytes,
+				len(checkParticipants),
+				minimumEvidenceBytes,
 			)
 		}
 
 		minimumReasonBytes := signaladapter.MinimumPartialReasonBytes()
-		if int(checks[index].ResultBounds.ReasonBytes) < minimumReasonBytes {
+		if signaladapter.MaxReasonBytes < minimumReasonBytes {
 			return fmt.Errorf(
-				"check %s reasonBytes must be at least %d for mandatory failure output",
+				"check %s fixed reason limit %d cannot represent mandatory failure output; requires at least %d bytes",
 				checks[index].ID,
+				signaladapter.MaxReasonBytes,
 				minimumReasonBytes,
 			)
 		}
 
 		minimumMeasurementsBytes := signaladapter.MinimumPartialMeasurementsBytes(len(checkParticipants))
-		if int(checks[index].ResultBounds.MeasurementsBytes) < minimumMeasurementsBytes {
+		if signaladapter.MaxMeasurementsBytes < minimumMeasurementsBytes {
 			return fmt.Errorf(
-				"check %s measurementsBytes must be at least %d for %d participants",
+				"check %s fixed measurements limit %d cannot represent %d participants; requires at least %d bytes",
 				checks[index].ID,
-				minimumMeasurementsBytes,
+				signaladapter.MaxMeasurementsBytes,
 				len(checkParticipants),
+				minimumMeasurementsBytes,
 			)
 		}
 
 		minimumBackendResourcesBytes := signaladapter.MinimumPartialBackendResourcesBytes(len(checkParticipants))
-		if int(checks[index].ResultBounds.BackendResourcesBytes) < minimumBackendResourcesBytes {
+		if signaladapter.MaxBackendOutputBytes < minimumBackendResourcesBytes {
 			return fmt.Errorf(
-				"check %s backendResourcesBytes must be at least %d for %d participants",
+				"check %s fixed backend resource limit %d cannot represent %d participants; requires at least %d bytes",
 				checks[index].ID,
-				minimumBackendResourcesBytes,
+				signaladapter.MaxBackendOutputBytes,
 				len(checkParticipants),
+				minimumBackendResourcesBytes,
 			)
 		}
 
@@ -310,8 +315,8 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 			return fmt.Errorf("check %s workload policy: %w", checks[index].ID, err)
 		}
 
-		if _, _, err := adapterParameterValues(checks[index].Parameters, checks[index].Backend.Kind); err != nil {
-			return fmt.Errorf("check %s parameters: %w", checks[index].ID, err)
+		if err := validateGPUCount(checks[index].GPUCount, checks[index].Backend.Kind); err != nil {
+			return fmt.Errorf("check %s GPU count: %w", checks[index].ID, err)
 		}
 	}
 
@@ -328,32 +333,6 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 			}
 		}
 	}()
-
-	if len(participants) == 1 {
-		var participantNode corev1.Node
-
-		reader := r.APIReader
-		if reader == nil {
-			reader = r.Client
-		}
-
-		if err := reader.Get(ctx, client.ObjectKey{Name: participants[0].NodeName}, &participantNode); err != nil {
-			return fmt.Errorf("read admitted participant inventory: %w", err)
-		}
-
-		gpuResource := corev1.ResourceName("nvidia.com/gpu")
-		gpuCapacity := participantNode.Status.Capacity[gpuResource]
-		gpuAllocatable := participantNode.Status.Allocatable[gpuResource]
-
-		for index := range checks {
-			if checks[index].Parameters == nil {
-				checks[index].Parameters = map[string]string{}
-			}
-
-			checks[index].Parameters["observed-gpu-capacity"] = gpuCapacity.String()
-			checks[index].Parameters["observed-gpu-allocatable"] = gpuAllocatable.String()
-		}
-	}
 
 	snapshot, checkSnapshots, err := r.createSnapshot(ctx, runName, checks)
 	if err != nil {
@@ -387,7 +366,6 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 			Checks:              checkSnapshots,
 			ExecutionPolicy:     profile.Spec.ExecutionPolicy,
 			Workflow:            profile.Spec.Workflow,
-			Purpose:             signalv1.PurposeFullCertification,
 			EvidencePath:        strings.Trim(profile.Spec.EvidencePath, "/") + "/" + runName + ".json",
 			Deadline:            profile.Spec.Deadline,
 			Tolerations:         profile.Spec.Tolerations,
@@ -1117,11 +1095,10 @@ func (r *AdmissionReconciler) createSnapshot(
 			Backend:               check.Backend,
 			WorkloadPolicy:        *check.WorkloadPolicy.DeepCopy(),
 			RuntimeStage:          copyRuntimeStage(check.RuntimeStage),
-			Parameters:            maps.Clone(check.Parameters),
+			GPUCount:              check.GPUCount,
+			ScriptEnvironment:     maps.Clone(check.ScriptEnvironment),
 			BackendActiveDeadline: check.BackendActiveDeadline,
-			ResultBounds:          check.ResultBounds,
 			ParticipantPolicy:     check.ParticipantPolicy,
-			MaxAttempts:           check.MaxAttempts,
 		}
 	}
 
@@ -1368,12 +1345,7 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 			return nil, fmt.Errorf("encode check %s participants: %w", check.ID, marshalErr)
 		}
 
-		environment, environmentErr := scriptEnvironment(check.Parameters)
-		if environmentErr != nil {
-			return nil, fmt.Errorf("check %s: %w", check.ID, environmentErr)
-		}
-
-		environmentJSON, marshalErr := json.Marshal(environment)
+		environmentJSON, marshalErr := json.Marshal(check.ScriptEnvironment)
 		if marshalErr != nil {
 			return nil, fmt.Errorf("encode check %s script environment: %w", check.ID, marshalErr)
 		}
@@ -1381,11 +1353,6 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 		workloadPolicyJSON, encodeErr := signalworkload.Encode(check.WorkloadPolicy)
 		if encodeErr != nil {
 			return nil, fmt.Errorf("encode check %s workload policy: %w", check.ID, encodeErr)
-		}
-
-		gpuCount, privileged, err := adapterParameterValues(check.Parameters, check.Backend.Kind)
-		if err != nil {
-			return nil, fmt.Errorf("check %s parameters: %w", check.ID, err)
 		}
 
 		taskName := checkTaskName(check)
@@ -1405,8 +1372,7 @@ func buildWorkflow(run *signalv1.CertificationRun, attempt int32) (*unstructured
 					string(tolerationsJSON),
 					string(environmentJSON),
 					workloadPolicyJSON,
-					gpuCount,
-					privileged,
+					strconv.FormatInt(int64(check.GPUCount), 10),
 				),
 			},
 		}
@@ -1481,7 +1447,6 @@ func checkWorkflowParameters(
 	scriptEnvironmentJSON string,
 	workloadPolicyJSON string,
 	gpuCount string,
-	privileged string,
 ) []any {
 	return []any{
 		map[string]any{"name": "run-name", "value": checkRunName(run.Name, check.ID)},
@@ -1502,45 +1467,21 @@ func checkWorkflowParameters(
 			"name":  "backend-active-deadline-seconds",
 			"value": fmt.Sprintf("%d", int64(check.BackendActiveDeadline.Seconds())),
 		},
-		map[string]any{"name": "queue", "value": check.Backend.Queue},
 		map[string]any{"name": "runner-image", "value": check.RunnerImage},
 		map[string]any{"name": "tolerations", "value": tolerationsJSON},
 		map[string]any{"name": "script-environment", "value": scriptEnvironmentJSON},
 		map[string]any{"name": "workload-policy", "value": workloadPolicyJSON},
-		map[string]any{"name": "mpi-payload-mode", "value": check.Parameters["mpi-payload-mode"]},
-		map[string]any{"name": "expected-gpu-product-regex", "value": check.Parameters["expected-gpu-product-regex"]},
-		map[string]any{"name": "expected-gpu-count", "value": check.Parameters["expected-gpu-count"]},
-		map[string]any{"name": "observed-gpu-capacity", "value": check.Parameters["observed-gpu-capacity"]},
-		map[string]any{"name": "observed-gpu-allocatable", "value": check.Parameters["observed-gpu-allocatable"]},
-		map[string]any{"name": "backend-evidence-bytes", "value": strconv.Itoa(int(check.ResultBounds.BackendEvidenceBytes))},
 		map[string]any{"name": "gpu-resource-count", "value": gpuCount},
-		map[string]any{"name": "privileged", "value": privileged},
 		map[string]any{"name": "attempt", "value": fmt.Sprintf("%d", attempt)},
 	}
 }
 
-func adapterParameterValues(parameters map[string]string, backendKind string) (string, string, error) {
-	gpuCount := parameters["gpu-resource-count"]
-	if gpuCount == "" {
-		gpuCount = "0"
+func validateGPUCount(gpuCount int32, backendKind string) error {
+	if gpuCount < 0 || (backendKind == "MPIJob" && gpuCount == 0) {
+		return errors.New("must be nonnegative and positive for MPIJob")
 	}
 
-	count, err := strconv.ParseInt(gpuCount, 10, 64)
-	if err != nil || count < 0 || (backendKind == "MPIJob" && count == 0) {
-		return "", "", errors.New("gpu-resource-count must be nonnegative and positive for MPIJob")
-	}
-
-	privileged := parameters["privileged"]
-	if privileged == "" {
-		privileged = "false"
-	}
-
-	value, err := strconv.ParseBool(privileged)
-	if err != nil {
-		return "", "", fmt.Errorf("privileged must be a boolean: %w", err)
-	}
-
-	return strconv.FormatInt(count, 10), strconv.FormatBool(value), nil
+	return nil
 }
 
 func validEnvironmentName(value string) bool {
@@ -1560,40 +1501,29 @@ func validEnvironmentName(value string) bool {
 	return true
 }
 
-func scriptEnvironment(parameters map[string]string) (map[string]string, error) {
-	keys := make([]string, 0, len(parameters))
-	for key := range parameters {
+func validateScriptEnvironment(environment map[string]string) error {
+	keys := make([]string, 0, len(environment))
+	for key := range environment {
 		keys = append(keys, key)
 	}
 
 	sort.Strings(keys)
 
-	environment := make(map[string]string, len(parameters))
-	parameterByEnvironment := make(map[string]string, len(parameters))
-
-	for _, key := range keys {
-		environmentName := strings.ToUpper(strings.ReplaceAll(key, "-", "_"))
-		if !validEnvironmentName(environmentName) {
-			return nil, fmt.Errorf("profile parameter %q cannot be mapped to a script environment variable", key)
+	for _, name := range keys {
+		if !validEnvironmentName(name) {
+			return fmt.Errorf("name %q is invalid", name)
 		}
 
-		if strings.HasPrefix(environmentName, "PROJECT_SIGNAL_") {
-			return nil, fmt.Errorf("profile parameter %q maps to reserved environment variable %s", key, environmentName)
+		if strings.HasPrefix(name, "PROJECT_SIGNAL_") {
+			return fmt.Errorf("name %q is reserved", name)
 		}
 
-		if _, reserved := reservedScriptEnvironmentNames[environmentName]; reserved {
-			return nil, fmt.Errorf("profile parameter %q maps to reserved environment variable %s", key, environmentName)
+		if _, reserved := reservedScriptEnvironmentNames[name]; reserved {
+			return fmt.Errorf("name %q is reserved", name)
 		}
-
-		if previous, exists := parameterByEnvironment[environmentName]; exists {
-			return nil, fmt.Errorf("profile parameters %q and %q both map to %s", previous, key, environmentName)
-		}
-
-		parameterByEnvironment[environmentName] = key
-		environment[environmentName] = parameters[key]
 	}
 
-	return environment, nil
+	return nil
 }
 
 func (r *RunReconciler) finishGrouped(
@@ -1946,7 +1876,7 @@ func terminalCheckStatuses(
 			continue
 		}
 
-		outputs, outputErr := nodeWorkflowParameters(node, check.ResultBounds)
+		outputs, outputErr := nodeWorkflowParameters(node)
 		if outputErr != nil {
 			status.Phase = signalv1.CheckPhaseInconclusive
 			status.Verdict = "Inconclusive"
@@ -2093,10 +2023,7 @@ func exactCheckNode(
 	return match, count
 }
 
-func nodeWorkflowParameters(
-	node map[string]any,
-	bounds signalv1.ResultBounds,
-) (map[string]string, error) {
+func nodeWorkflowParameters(node map[string]any) (map[string]string, error) {
 	outputs, ok := node["outputs"].(map[string]any)
 	if !ok {
 		return nil, errors.New("task outputs are missing or malformed")
@@ -2109,10 +2036,10 @@ func nodeWorkflowParameters(
 
 	limits := map[string]int{
 		"verdict":           workflowOutputLimits["verdict"],
-		"reason":            int(bounds.ReasonBytes),
-		"measurements":      int(bounds.MeasurementsBytes),
-		"backend-resources": int(bounds.BackendResourcesBytes),
-		"backend-evidence":  int(bounds.BackendEvidenceBytes),
+		"reason":            workflowOutputLimits["reason"],
+		"measurements":      workflowOutputLimits["measurements"],
+		"backend-resources": workflowOutputLimits["backend-resources"],
+		"backend-evidence":  workflowOutputLimits["backend-evidence"],
 		"cleanup-failure":   workflowOutputLimits["cleanup-failure"],
 	}
 
@@ -2230,7 +2157,6 @@ func (r *RunReconciler) evidenceDocument(
 		"checkStatus":         run.Status.Checks,
 		"scriptContents":      scriptContents,
 		"executionPolicy":     run.Spec.ExecutionPolicy,
-		"purpose":             run.Spec.Purpose,
 		"executionState":      executionState,
 		"verdict":             verdict,
 		"reason":              reason,
@@ -3062,7 +2988,7 @@ func profileChecks(profile *signalv1.CertificationProfile) []signalv1.Certificat
 		checks[index] = profile.Spec.Checks[index]
 		checks[index].WorkloadPolicy = *profile.Spec.Checks[index].WorkloadPolicy.DeepCopy()
 		checks[index].RuntimeStage = copyRuntimeStage(profile.Spec.Checks[index].RuntimeStage)
-		checks[index].Parameters = maps.Clone(profile.Spec.Checks[index].Parameters)
+		checks[index].ScriptEnvironment = maps.Clone(profile.Spec.Checks[index].ScriptEnvironment)
 		checks[index].ParticipantPolicy.RequiredRoles = slices.Clone(
 			profile.Spec.Checks[index].ParticipantPolicy.RequiredRoles,
 		)
@@ -3079,10 +3005,7 @@ func validateCheckPlan(checks []signalv1.CertificationCheck) error {
 		return fmt.Errorf("must contain exactly %d checks", groupedCheckCount)
 	}
 
-	var (
-		seen        = make(map[signalv1.CheckID]struct{}, len(checks))
-		outputBytes int64
-	)
+	seen := make(map[signalv1.CheckID]struct{}, len(checks))
 
 	for index := range checks {
 		check := &checks[index]
@@ -3104,25 +3027,15 @@ func validateCheckPlan(checks []signalv1.CertificationCheck) error {
 
 		seen[check.ID] = struct{}{}
 
-		if check.MaxAttempts != 1 {
-			return fmt.Errorf("check %s maxAttempts must be exactly 1", check.ID)
-		}
-
-		if err := validateResultBounds(check.ID, check.ResultBounds); err != nil {
-			return err
-		}
-
-		outputBytes += workflowOutputBytes(check.ResultBounds)
-
 		if err := validateCheckParticipantPolicy(check.ID, check.ParticipantPolicy); err != nil {
 			return err
 		}
 	}
 
-	if outputBytes > maximumWorkflowOutputBytes {
+	if fixedWorkflowOutputBytes() > maximumWorkflowOutputBytes {
 		return fmt.Errorf(
-			"aggregate check output budget is %d bytes, maximum is %d",
-			outputBytes,
+			"fixed aggregate check output budget is %d bytes, maximum is %d",
+			fixedWorkflowOutputBytes(),
 			maximumWorkflowOutputBytes,
 		)
 	}
@@ -3135,10 +3048,7 @@ func validateRunCheckPlan(checks []signalv1.CertificationCheckSnapshot) error {
 		return fmt.Errorf("run must contain exactly %d checks", groupedCheckCount)
 	}
 
-	var (
-		seen        = make(map[signalv1.CheckID]struct{}, len(checks))
-		outputBytes int64
-	)
+	seen := make(map[signalv1.CheckID]struct{}, len(checks))
 
 	for index := range checks {
 		check := &checks[index]
@@ -3155,22 +3065,12 @@ func validateRunCheckPlan(checks []signalv1.CertificationCheckSnapshot) error {
 		}
 
 		seen[check.ID] = struct{}{}
-
-		if check.MaxAttempts != 1 {
-			return fmt.Errorf("run check %s maxAttempts must be exactly 1", check.ID)
-		}
-
-		if err := validateResultBounds(check.ID, check.ResultBounds); err != nil {
-			return err
-		}
-
-		outputBytes += workflowOutputBytes(check.ResultBounds)
 	}
 
-	if outputBytes > maximumWorkflowOutputBytes {
+	if fixedWorkflowOutputBytes() > maximumWorkflowOutputBytes {
 		return fmt.Errorf(
-			"run aggregate check output budget is %d bytes, maximum is %d",
-			outputBytes,
+			"fixed run aggregate check output budget is %d bytes, maximum is %d",
+			fixedWorkflowOutputBytes(),
 			maximumWorkflowOutputBytes,
 		)
 	}
@@ -3178,39 +3078,17 @@ func validateRunCheckPlan(checks []signalv1.CertificationCheckSnapshot) error {
 	return nil
 }
 
-func workflowOutputBytes(bounds signalv1.ResultBounds) int64 {
-	return int64(
-		workflowOutputLimits["verdict"]+
-			workflowOutputLimits["cleanup-failure"],
-	) +
-		int64(bounds.ReasonBytes) +
-		int64(bounds.MeasurementsBytes) +
-		int64(bounds.BackendResourcesBytes) +
-		int64(bounds.BackendEvidenceBytes)
-}
+func fixedWorkflowOutputBytes() int64 {
+	perCheck := int64(
+		workflowOutputLimits["verdict"] +
+			workflowOutputLimits["cleanup-failure"] +
+			workflowOutputLimits["reason"] +
+			workflowOutputLimits["measurements"] +
+			workflowOutputLimits["backend-resources"] +
+			workflowOutputLimits["backend-evidence"],
+	)
 
-func validateResultBounds(id signalv1.CheckID, bounds signalv1.ResultBounds) error {
-	switch {
-	case bounds.ReasonBytes < 1 || bounds.ReasonBytes > int32(workflowOutputLimits["reason"]):
-		return fmt.Errorf("check %s reasonBytes must be between 1 and %d", id, workflowOutputLimits["reason"])
-	case bounds.MeasurementsBytes < 1 || bounds.MeasurementsBytes > int32(workflowOutputLimits["measurements"]):
-		return fmt.Errorf(
-			"check %s measurementsBytes must be between 1 and %d",
-			id,
-			workflowOutputLimits["measurements"],
-		)
-	case bounds.BackendResourcesBytes < 1 ||
-		bounds.BackendResourcesBytes > int32(workflowOutputLimits["backend-resources"]):
-		return fmt.Errorf(
-			"check %s backendResourcesBytes must be between 1 and %d",
-			id,
-			workflowOutputLimits["backend-resources"],
-		)
-	case bounds.BackendEvidenceBytes < 1 || bounds.BackendEvidenceBytes > 64*1024:
-		return fmt.Errorf("check %s backendEvidenceBytes must be between 1 and 65536", id)
-	}
-
-	return nil
+	return groupedCheckCount * perCheck
 }
 
 func validateCheckParticipantPolicy(id signalv1.CheckID, policy signalv1.CheckParticipantPolicy) error {

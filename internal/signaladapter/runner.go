@@ -220,7 +220,7 @@ func (r *Runner) Execute(ctx context.Context, config Config) (AggregateOutput, e
 		recordEvidenceCaptureFailure(&output)
 	}
 
-	if err := r.persistEvidenceBeforeCleanup(&output, config.BackendEvidenceBytes); err != nil {
+	if err := r.persistEvidenceBeforeCleanup(&output, MaxBackendEvidenceBytes); err != nil {
 		return finishBackendFailure(fmt.Errorf("persist backend evidence: %w", err))
 	}
 
@@ -292,7 +292,7 @@ func (r *Runner) backendFailureOutput(
 		BackendEvidence:  evidence,
 	}
 
-	if err := r.persistEvidenceBeforeCleanup(&output, config.BackendEvidenceBytes); err != nil {
+	if err := r.persistEvidenceBeforeCleanup(&output, MaxBackendEvidenceBytes); err != nil {
 		return AggregateOutput{}, err
 	}
 

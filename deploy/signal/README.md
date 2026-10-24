@@ -5,7 +5,7 @@ certification workflows. The upstream integration provides the API, controller,
 CRDs, controller Deployment, and an optional generic participant adapter for
 ordinary Pods and Kubeflow MPIJobs. It intentionally does not publish
 certification scripts, runner images, CertificationProfiles, hardware policy,
-or environment-specific queue configuration.
+or environment-specific hardware configuration.
 
 ## Architecture
 
@@ -49,8 +49,9 @@ by the selected script. The adapter image and execution image are separate: the
 upstream adapter creates and observes workloads, while the operator-owned
 execution image runs the script.
 
-The included adapter supports `v1` Pods and `kubeflow.org/v2beta1` MPIJobs.
-Project Signal does not install MPI Operator or Kueue. Its adapter RBAC is
+The included adapter supports standalone `v1` Pods and
+`kubeflow.org/v2beta1` MPIJobs. Project Signal does not install MPI Operator.
+Kueue integration is intentionally deferred. The adapter RBAC is
 namespace-scoped and intentionally grants only the Pod, Pod log, MPIJob,
 Workflow, and Argo task-result access needed by the included template.
 
@@ -72,19 +73,11 @@ The referenced WorkflowTemplate must accept these string parameters:
 | `backend-api-version` | Backend API version from the profile |
 | `backend-kind` | Backend kind from the profile |
 | `backend-active-deadline-seconds` | Participant backend deadline, shorter than the outer Workflow deadline |
-| `queue` | Optional backend queue |
 | `runner-image` | Digest-pinned execution image |
 | `tolerations` | JSON-encoded toleration list |
 | `script-environment` | JSON-encoded, validated environment map |
-| `workload-policy` | JSON-encoded immutable participant-container resources, security context, and bounded volume policy |
-| `backend-evidence-bytes` | Per-check evidence output bound, at most 64 KiB |
-| `mpi-payload-mode` | Compatibility input for operator-defined templates |
-| `expected-gpu-product-regex` | Compatibility input for operator-defined templates |
-| `expected-gpu-count` | Compatibility input for operator-defined templates |
-| `observed-gpu-capacity` | Compatibility input copied from admitted Node inventory |
-| `observed-gpu-allocatable` | Compatibility input copied from admitted Node inventory |
+| `workload-policy` | JSON-encoded immutable resources, privilege/capabilities, host networking, working directory, and read-only host paths |
 | `gpu-resource-count` | GPU count, defaults to `0` for Pod diagnostics; must be positive for MPIJobs |
-| `privileged` | Explicit boolean, defaults to `false` |
 | `attempt` | One-based attempt number |
 
 The Workflow must publish only these output parameters:
@@ -92,10 +85,10 @@ The Workflow must publish only these output parameters:
 | Output | Limit | Meaning |
 | --- | ---: | --- |
 | `verdict` | 32 bytes | `Pass`, `Fail`, or `Inconclusive` |
-| `reason` | 4 KiB | Bounded diagnostic reason |
+| `reason` | 512 bytes | Bounded diagnostic reason |
 | `measurements` | 16 KiB | Bounded measurement summary |
-| `backend-resources` | 16 KiB | Optional JSON array of backend workload identities and covered participant indexes; required for a multi-Node `Pass` |
-| `backend-evidence` | 64 KiB per check | Required redacted pre-cleanup backend object, container state, and bounded current/previous log projection |
+| `backend-resources` | 8 KiB | Optional JSON array of backend workload identities and covered participant indexes; required for a multi-Node `Pass` |
+| `backend-evidence` | 24 KiB per check | Required redacted pre-cleanup backend object, container state, and bounded current/previous log projection |
 
 Unexpected, duplicate, malformed, or oversized outputs are rejected and the
 run remains fail-closed. Each `backend-resources` entry must contain
@@ -103,12 +96,13 @@ run remains fail-closed. Each `backend-resources` entry must contain
 that the workload executed. `namespace` is optional and defaults to the
 CertificationRun namespace; an explicitly different namespace is rejected.
 A multi-Node successful result must cover every admitted participant.
+Each check may select at most eight participants so all 15 checks' fixed output
+bounds remain within the 768 KiB Workflow status budget.
 The controller reads outputs only
 from each check's unique deterministic DAG task node. Missing, malformed,
 duplicate, or ambiguous task identity and outputs fail closed. Operator script
-parameters, including GPU expectations and observed inventory, are carried in
-`script-environment`. Their existing individual compatibility inputs remain
-available to external templates; the supplied adapter uses the environment.
+inputs are explicit entries in `spec.checks[].scriptEnvironment`; the
+controller validates their environment names before reserving Nodes.
 
 Before foreground deletion, the adapter captures and writes a typed v1
 projection for every participant backend to the Argo output path. The
@@ -178,8 +172,8 @@ ordinary Pods and MPI workers use required Node affinity on the immutable
 admitted Node UID. This binds execution to the exact admitted Node without
 bypassing scheduler admission or accepting a replacement Node that reuses its
 name. Only the worker receives the configured GPU limit. The adapter propagates
-the Workflow active deadline, applies the profile's optional queue, records
-API-assigned workload UIDs, reads the final typed result from bounded workload
+the Workflow active deadline, records API-assigned workload UIDs, reads the
+final typed result from bounded workload
 logs, aggregates diagnostic state separately from backend execution state, and
 foreground-deletes every created workload only after its evidence output is
 durable.
@@ -272,17 +266,10 @@ checks:
     backend:
       apiVersion: v1
       kind: Pod
-      queue: <optional-local-queue>
     backendActiveDeadline: 19m
-    resultBounds:
-      reasonBytes: 4096
-      measurementsBytes: 16384
-      backendResourcesBytes: 16384
-      backendEvidenceBytes: 65536
-    maxAttempts: 1
 ```
 
-or an MPIJob backend, optionally submitted through a Kueue queue:
+or an MPIJob backend:
 
 ```yaml
 checks:
@@ -291,13 +278,7 @@ checks:
     backend:
       apiVersion: kubeflow.org/v2beta1
       kind: MPIJob
-      queue: <local-queue>
 ```
-
-When either backend supplies a queue, the adapter writes the standard
-`kueue.x-k8s.io/queue-name` label. Pod and MPIJob backends may both omit it for
-standalone execution without Kueue. A `kueueTopology` policy still requires an
-explicit queue.
 
 Checks may set `spec.checks[].workloadPolicy` when a diagnostic needs explicit
 participant-container policy. The controller validates and snapshots this
@@ -308,8 +289,6 @@ extra mounts.
 
 ```yaml
 workloadPolicy:
-  kueueTopology:
-    requiredLevel: kubernetes.io/hostname
   resources:
     requests:
       cpu: "8"
@@ -319,37 +298,26 @@ workloadPolicy:
       cpu: "8"
       memory: 32Gi
       ephemeral-storage: 40Gi
-  securityContext:
-    privileged: false
-    capabilities:
-      add: [IPC_LOCK]
+  privileged: false
+  capabilities: [IPC_LOCK]
   hostNetwork: true
   workingDir: /opt/diagnostic
-  results:
-    sizeLimit: 2Gi
-  volumes:
+  hostPaths:
     - name: work
       mountPath: /work
-      emptyDir:
-        sizeLimit: 16Gi
-    - name: host-proc
-      mountPath: /host/proc
-      readOnly: true
-      hostPath:
-        path: /proc
-        type: Directory
+      path: /var/lib/project-signal
+      type: Directory
 ```
 
-Each extra volume must select exactly one `hostPath`, `emptyDir`, or
-`persistentVolumeClaim` source. Names and mount paths must be unique;
+Host paths are always mounted read-only. Names and mount paths must be unique;
 `scripts`, `results`, `/scripts`, and `/results` are reserved. Paths must be
 clean and absolute, resource quantities must be nonnegative, and limits cannot
-be below requests. The policy is bounded to 16 volumes and 16 KiB of serialized
-input. GPU requests and limits remain controlled by `gpu-resource-count`, which
-sets equal requests and limits on the participant container. Kubernetes
-admission and operator policy still decide whether a capability, host path,
-device, PVC, or privileged context is allowed; technical rendering is not
-authorization.
+be below requests. The policy is bounded to 16 host paths and 16 KiB of
+serialized input. GPU requests and limits remain controlled by
+`gpu-resource-count`, which sets equal requests and limits on the participant
+container. Kubernetes admission and operator policy still decide whether a
+capability, host path, device, or privileged context is allowed; technical
+rendering is not authorization.
 
 Stage-aware scripts declare
 `spec.checks[].script.requiresRuntimeStage: true` and require an explicit
@@ -373,22 +341,9 @@ rendered to its participant Pod or MPIJob `activeDeadlineSeconds`. It must be
 positive and leave at least 60 seconds before the outer deadline; the
 controller rejects an invalid ordering before reserving Nodes.
 
-The sum of all 15 checks' declared verdict, reason, measurements, backend
-resource, backend evidence, and cleanup output bounds cannot exceed 768 KiB.
-The controller rejects larger plans before reserving Nodes so valid per-check
-bounds cannot collectively exceed a safe Argo Workflow status budget.
-Each reason, measurements, backend-resource, and backend-evidence bound must
-also fit the mandatory partial-failure envelope for the check's selected
-participant count. Every accepted plan can therefore report a bounded partial
-setup failure.
-
-`kueueTopology.requiredLevel` is an explicit Kueue Topology Aware Scheduling
-request. It must be a valid Kubernetes label key and requires a nonempty backend
-queue. The adapter writes
-`kueue.x-k8s.io/podset-required-topology: <requiredLevel>` on ordinary
-participant Pods and MPIJob worker Pod templates only. It never annotates the
-unpinned MPI launcher, does not accept arbitrary annotations, and does not
-choose a topology level when the field is omitted.
+All checks use fixed output limits. Together, the 15 checks stay below the
+768 KiB Workflow status budget, and every accepted plan can represent its
+mandatory partial-failure envelope.
 
 `hostNetwork: true` is an explicit participant policy for diagnostics that must
 observe the selected Node's network namespace, such as physical NIC inventory.
@@ -397,27 +352,19 @@ applies only to the Node-pinned worker; the unpinned launcher remains outside
 the host network namespace. Omitting the field keeps Kubernetes' default Pod
 networking.
 
-`gpu-resource-count` remains an operator-supplied profile parameter. It may be
-zero for Pod diagnostics and must be positive for MPIJobs. The MPIJob policy is
+`spec.checks[].gpuCount` may be zero for Pod diagnostics and must be positive
+for MPIJobs. The controller renders it as `gpu-resource-count` for the adapter.
+The MPIJob policy is
 fail-closed: `backoffLimit: 0`, `cleanPodPolicy: All`, a one-hour post-finish
 TTL, replica-level `restartPolicy: Never`, `WaitForWorkersReady`, and
 `runLauncherAsWorker: false`.
 
-Operators can override the nonnegative MPI retry and TTL values through profile
-parameters `backend-backoff-limit` and
-`backend-ttl-seconds-after-finished`. These become
-`BACKEND_BACKOFF_LIMIT` and `BACKEND_TTL_SECONDS_AFTER_FINISHED` in the validated
-script environment and remain explicit per-profile policy rather than cluster
-defaults.
-
 A `CertificationProfile` defines exactly 15 ordered checks. Admission snapshots
 the complete plan and selected participants once into one immutable
 `CertificationRun`. Each check binds its script identity and digest, runner,
-backend, workload and topology policy, runtime inputs, deadline, result bounds,
-participant-role inclusion or exclusion, and `maxAttempts: 1`.
-The only supported purpose is `FullCertification`; diagnostic, preflight, and
-targeted modes are intentionally outside this one-time Node join contract and
-cannot project production eligibility.
+backend, workload and topology policy, runtime inputs, deadline, and
+participant-role inclusion or exclusion. Every run is a one-time full
+certification; alternate purposes and retries are not public configuration.
 
 The controller creates one Argo Workflow with an inline DAG entrypoint. Every
 task invokes the configured adapter `certification` template through
