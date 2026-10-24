@@ -2413,12 +2413,19 @@ fn unusable_peer_copy_advances_to_alternate_or_authorized_origin() {
             }
             let calls = peers.calls.borrow();
             assert_eq!(calls.len(), 2);
+            // An owner asks rank 0 to acquire (one origin credit), then
+            // probes copy-only; a non-owner sends Acquire to both.
             assert!(
                 calls
                     .iter()
-                    .all(|(_, copy, _, links, deadline)| *copy == rank.is_some()
-                        && *links == 4
-                        && *deadline == f.scope.deadline.0)
+                    .enumerate()
+                    .all(|(i, (_, copy, credits, links, deadline))| {
+                        let delegated = rank.is_some() && i == 0;
+                        *copy == (rank.is_some() && !delegated)
+                            && (!delegated || *credits == 1)
+                            && *links == 4
+                            && *deadline == f.scope.deadline.0
+                    })
             );
             // Both probes retain later candidates or local origin as a fallback.
             // Only local time shares advance; signed authority never renews.
@@ -2547,7 +2554,9 @@ fn corrupt_predecessor_evidence_survives_origin_and_later_copy_misses() {
     ));
     assert_eq!(f.origin.calls.get(), 1);
     assert_eq!(peers.calls.borrow().len(), 2);
-    assert_eq!(budget.remaining_attempts(), 5);
+    // Acquire to rank 0 (exchange and its origin credit), origin, and one
+    // remaining-copy probe.
+    assert_eq!(budget.remaining_attempts(), 4);
     assert_unpublished(&f);
 }
 
@@ -2612,7 +2621,8 @@ fn unauthorized_after_corrupt_copy_is_terminal_not_origin_evidence() {
     ));
     assert_eq!(f.origin.calls.get(), 0);
     assert_eq!(peers.calls.borrow().len(), 2);
-    assert_eq!(budget.remaining_attempts(), 6);
+    // The Acquire to rank 0 spends its exchange and rank 0's origin credit.
+    assert_eq!(budget.remaining_attempts(), 5);
     assert_unpublished(&f);
 }
 
@@ -2657,7 +2667,8 @@ fn corrupt_copy_cannot_extend_original_budget_deadline() {
         Err(Error::DeadlineExceeded)
     ));
     assert_eq!(peers.calls.borrow().len(), 1);
-    assert_eq!(budget.remaining_attempts(), 7);
+    // The Acquire to rank 0 spends its exchange and rank 0's origin credit.
+    assert_eq!(budget.remaining_attempts(), 6);
     assert_eq!(budget.remaining_links(), 12);
     assert_eq!(budget.deadline(), deadline);
     assert_eq!(f.origin.calls.get(), 0);
@@ -2665,9 +2676,9 @@ fn corrupt_copy_cannot_extend_original_budget_deadline() {
 }
 
 /// A non-owner in `Spread` mode sends its first Acquire to the owner chosen by
-/// its visiting order. A non-primary owner then checks its local copy, probes
-/// its predecessors CopyOnly, and fills from origin. `Primary` mode keeps the
-/// primary-first order.
+/// its visiting order. A non-primary owner then checks its local copy and asks
+/// rank 0 to acquire, so rank 0 alone fills from origin (Known issue 4).
+/// `Primary` mode keeps the primary-first order.
 #[test]
 fn replica_selection_orders_first_acquire_and_non_primary_owner_fills() {
     use crate::read::candidates::ReplicaSelection;
@@ -2796,22 +2807,34 @@ fn replica_selection_orders_first_acquire_and_non_primary_owner_fills() {
         assert_eq!(*to, ordered[first_rank]);
         assert!(!copy, "a non-owner sends Acquire");
         if first_rank > 0 {
-            // Funded by canonical rank: sender, one probe per predecessor, origin.
-            assert_eq!(*attempts, first_rank as u32 + 1);
+            // Funded by canonical rank (`owner_funding`): sender, an Acquire
+            // to rank 0 with its origin credit, one probe per later
+            // predecessor, and the owner's own origin attempt.
+            assert_eq!(
+                *attempts,
+                racer_core::read::walk::owner_funding(first_rank) - 1
+            );
             assert_eq!(*links, 8);
         }
-        // The serving owner probes exactly its predecessors, CopyOnly, in rank order.
+        // A non-primary serving owner asks rank 0 to acquire, which fills from
+        // origin; the copy ends the walk. Rank 0 never forwards acquisition.
         let probes: Vec<_> = calls
             .iter()
             .filter(|(from, ..)| *from == node(target))
-            .map(|(_, to, copy, ..)| {
-                assert!(copy, "an owner never forwards acquisition");
-                to.clone()
-            })
+            .map(|(_, to, copy, attempts, _)| (to.clone(), *copy, *attempts))
             .collect();
-        assert_eq!(probes, ordered[..first_rank].to_vec());
+        let primary = (0..4).find(|i| node(*i) == ordered[0]).unwrap();
+        if first_rank > 0 {
+            assert_eq!(probes, [(ordered[0].clone(), false, 1)]);
+        } else {
+            assert!(probes.is_empty());
+        }
+        assert!(
+            calls.iter().all(|(from, ..)| *from != node(primary)),
+            "{calls:?}"
+        );
         for (i, f) in fixtures.iter().enumerate() {
-            assert_eq!(f.origin.calls.get(), usize::from(i == target));
+            assert_eq!(f.origin.calls.get(), usize::from(i == primary));
         }
         drop(calls);
         drop(endpoints);

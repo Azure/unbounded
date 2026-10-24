@@ -970,6 +970,7 @@ impl CandidatePolicy {
                     primary_outcome: continuation.primary_outcome,
                     bounded_routes: continuation.bounded_routes,
                 },
+                handoff: 0,
             });
             let end = loop {
                 let probe = match walk.next(budget)? {
@@ -2505,10 +2506,11 @@ pub(super) mod tests {
                 );
                 assert!(calls.iter().all(|(_, copy, ..)| !copy));
                 if selection == ReplicaSelection::Spread {
-                    // Rank 2 visited first: it must be able to probe two
-                    // predecessors and then reach origin, over failure routes.
+                    // Rank 2 visited first: it must be able to ask rank 0 to
+                    // acquire, probe rank 1, and then reach origin itself, over
+                    // failure routes (`owner_funding` less the exchange).
                     let (_, _, attempts, links) = &calls[0];
-                    assert_eq!(*attempts, 3);
+                    assert_eq!(*attempts, racer_core::read::walk::owner_funding(2) - 1);
                     assert_eq!(*links, 8);
                 } else {
                     // Primary first: shared route, shared credits.

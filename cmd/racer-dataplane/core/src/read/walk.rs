@@ -67,6 +67,49 @@ pub struct WalkConfig {
     /// The operation is a fixed page fetch (`Operation::Page`).
     pub page_operation: bool,
     pub continuation: Continuation,
+    /// Previous-membership owners an owner may ask copy-only before origin
+    /// (at most [`MAX_HANDOFF`]); see [`handoff_targets`]. A probe of handoff
+    /// target `i` reports `canonical = owners + i`. Ignored for non-owners and
+    /// for operations other than pages.
+    pub handoff: usize,
+}
+
+/// Most previous-membership owners one walk asks (the replica count).
+pub const MAX_HANDOFF: usize = 3;
+
+/// Fewest attempts a non-owner funds an out-of-order Acquire to the owner at
+/// `canonical` rank with: the exchange itself, one copy-only probe per
+/// predecessor, and the owner's own origin attempt.
+pub fn owner_funding_min(canonical: usize) -> u32 {
+    canonical as u32 + 2
+}
+
+/// Attempts a non-owner funds an out-of-order Acquire with when it can:
+/// [`owner_funding_min`] plus, above rank 0, the remote credit the owner's
+/// `Acquire` to rank 0 carries, so it can delegate the cold fetch.
+pub fn owner_funding(canonical: usize) -> u32 {
+    owner_funding_min(canonical) + u32::from(canonical > 0)
+}
+
+/// Which previous-membership owners a page owner should ask before origin.
+///
+/// `previous` and `current` are the page's ranked owners under the previous
+/// and current membership; `rank` is this node's current rank. Returns the
+/// previous owners in previous rank order, without this node and without the
+/// current predecessors (the walk asks those anyway). Empty when the owner
+/// set did not change, so a steady cold miss pays no extra probe.
+pub fn handoff_targets<N: PartialEq + Clone>(previous: &[N], current: &[N], rank: usize) -> Vec<N> {
+    let same = previous.len() == current.len() && previous.iter().all(|n| current.contains(n));
+    if same {
+        return Vec::new();
+    }
+    let me = current.get(rank);
+    previous
+        .iter()
+        .filter(|n| Some(*n) != me && !current[..rank.min(current.len())].contains(n))
+        .take(MAX_HANDOFF)
+        .cloned()
+        .collect()
 }
 
 /// One probe the caller must perform.
@@ -134,6 +177,8 @@ pub enum Step {
 pub struct CandidateWalk {
     config: WalkConfig,
     order: VisitOrder,
+    /// Owner walks: predecessors then handoff targets (`owners + i`).
+    targets: [u8; 2 + MAX_HANDOFF],
     count: usize,
     index: usize,
     evidence: Vec<ProbeOutcome>,
@@ -146,19 +191,37 @@ pub struct CandidateWalk {
 
 struct Pending {
     bounded: Option<AcquisitionBudget>,
+    /// The probe asks a previous-membership owner; its outcome is not
+    /// predecessor evidence.
+    handoff: bool,
+    /// An owner's `Acquire` to rank 0.
+    delegated: bool,
 }
 
 impl CandidateWalk {
     pub fn new(config: WalkConfig) -> Self {
-        let count = config.rank.unwrap_or(config.owners);
-        let order = if config.rank.is_some() {
-            VisitOrder::canonical(count)
+        let mut targets = [0; 2 + MAX_HANDOFF];
+        let mut count = config.rank.unwrap_or(config.owners);
+        let order = if let Some(rank) = config.rank {
+            let rank = rank.min(2);
+            count = rank;
+            for (i, target) in targets.iter_mut().enumerate().take(rank) {
+                *target = i as u8;
+            }
+            if config.page_operation {
+                for i in 0..config.handoff.min(MAX_HANDOFF) {
+                    targets[count] = (config.owners + i) as u8;
+                    count += 1;
+                }
+            }
+            VisitOrder::canonical(rank)
         } else {
             config.order
         };
         Self {
             config,
             order,
+            targets,
             count,
             index: 0,
             evidence: Vec::new(),
@@ -167,6 +230,26 @@ impl CandidateWalk {
             funding: false,
             pending: None,
             done: false,
+        }
+    }
+
+    /// Credits the funded visits after `index` need at least: minimum
+    /// funding for each out-of-order owner (every owner on bounded routes).
+    /// Shared visits take a share of whatever is left.
+    fn later_minimum(&self, index: usize) -> u32 {
+        (index + 1..self.count)
+            .filter_map(|later| self.target(later).map(|c| (later, c)))
+            .filter(|(later, c)| *c > *later || self.config.continuation.bounded_routes)
+            .map(|(_, c)| owner_funding_min(c))
+            .sum()
+    }
+
+    /// Canonical rank (or `owners + i` for handoff target `i`) at `index`.
+    fn target(&self, index: usize) -> Option<usize> {
+        if self.config.rank.is_some() {
+            (index < self.count).then(|| usize::from(self.targets[index]))
+        } else {
+            self.order.get(index)
         }
     }
 
@@ -186,8 +269,26 @@ impl CandidateWalk {
         assert!(!self.done, "walk already ended");
         let rank = self.config.rank;
         let continuation = self.config.continuation;
-        while let Some(canonical) = self.order.get(self.index) {
+        while let Some(canonical) = self.target(self.index) {
             let index = self.index;
+            let handoff = canonical >= self.config.owners;
+            let left = (self.count - index) as u32;
+            if handoff && (budget.remaining_attempts() < 2 || budget.remaining_links() == 0) {
+                // Handoff probes are opportunistic: never spend the credit
+                // the owner's own origin attempt needs.
+                break;
+            }
+            // An owner above rank 0 asks rank 0 to acquire, so one owner per
+            // membership fetches a cold page and concurrent misses coalesce in
+            // rank 0's flight. The Acquire costs two credits (the exchange and
+            // rank 0's origin credit); the owner keeps one per later probe
+            // and one for its own origin attempt if rank 0 fails
+            // ([`owner_funding`] provides them).
+            let delegated = rank.is_some_and(|rank| rank > 0)
+                && canonical == 0
+                && self.config.page_operation
+                && budget.remaining_attempts() >= left + 2
+                && u32::from(budget.remaining_links()) >= left;
             if continuation.primary_consumed && index == 0 {
                 let outcome = continuation
                     .primary_outcome
@@ -200,7 +301,7 @@ impl CandidateWalk {
             // With only the sender attempt left, a page Acquire would carry
             // zero remote credits and reject before checking disk/pending copies.
             // Spend the same last route on local copies, never new acquisition.
-            let copy_only = rank.is_some()
+            let copy_only = (rank.is_some() && !delegated)
                 || (!continuation.bounded_routes
                     && budget.remaining_attempts() == 1
                     && self.config.page_operation);
@@ -210,7 +311,20 @@ impl CandidateWalk {
                 Mode::Acquire
             };
             let count = self.count;
-            let bounded = if rank.is_some()
+            let owner_attempts = 1 + u32::from(delegated);
+            let bounded = if delegated {
+                // Exactly the exchange and rank 0's origin credit: a funded
+                // route forwards all of it, so rank 0 receives one credit
+                // and this owner keeps the rest for later probes and origin.
+                let tight = u16::from(budget.remaining_links())
+                    < (count - index) as u16 * u16::from(budget.route_links());
+                let links = if tight {
+                    (budget.remaining_links() / (count - index) as u8).min(4)
+                } else {
+                    budget.route_links()
+                };
+                Some(budget.partition(owner_attempts, links)?)
+            } else if rank.is_some()
                 && u16::from(budget.remaining_links())
                     < (count - index) as u16 * u16::from(budget.route_links())
             {
@@ -218,20 +332,30 @@ impl CandidateWalk {
                 // pool; the first must not consume every link after an incoming
                 // eight-link envelope selected failure routing.
                 let remaining = (count - index) as u8;
-                Some(budget.partition(1, (budget.remaining_links() / remaining).min(4))?)
+                Some(budget.partition(
+                    owner_attempts,
+                    (budget.remaining_links() / remaining).min(4),
+                )?)
             } else if continuation.bounded_routes
                 || (rank.is_none()
                     && !copy_only
                     && canonical > index
-                    && budget.remaining_attempts() >= canonical as u32 + 2
+                    && budget.remaining_attempts() >= owner_funding_min(canonical)
                     && budget.remaining_links() >= 8)
             {
                 // Fund by the destination's canonical rank: it probes all of its
                 // predecessors, wherever it falls in this visit.
+                // Prefer the funding that lets the owner delegate to rank 0,
+                // but only from slack: later visits keep the credits they had
+                // before delegation, so the walk's reach does not shrink.
                 let attempts = if rank.is_some() {
-                    1
+                    owner_attempts
+                } else if budget.remaining_attempts()
+                    >= owner_funding(canonical) + self.later_minimum(index)
+                {
+                    owner_funding(canonical)
                 } else {
-                    canonical as u32 + 2
+                    owner_funding_min(canonical)
                 };
                 let links = if rank.is_some() { 4 } else { 8 };
                 if budget.remaining_attempts() < attempts || budget.remaining_links() < links {
@@ -249,8 +373,13 @@ impl CandidateWalk {
             } else {
                 None
             };
-            let funded = continuation.bounded_routes || (rank.is_none() && bounded.is_some());
-            self.pending = Some(Pending { bounded });
+            let funded =
+                continuation.bounded_routes || delegated || (rank.is_none() && bounded.is_some());
+            self.pending = Some(Pending {
+                bounded,
+                handoff,
+                delegated,
+            });
             return Ok(Step::Probe(Probe {
                 index,
                 canonical,
@@ -284,6 +413,7 @@ impl CandidateWalk {
         self.done = true;
         if let Some(Pending {
             bounded: Some(bounded),
+            ..
         }) = self.pending.take()
         {
             budget.reunite(bounded)?;
@@ -304,6 +434,21 @@ impl CandidateWalk {
         }
         self.index += 1;
         match outcome {
+            Outcome::Probe(ProbeOutcome::VersionUnavailable) if pending.delegated => {
+                // Rank 0 asked origin for this version and was told it does
+                // not exist; asking again would only repeat that.
+                self.done = true;
+                Ok(Some(End::VersionUnavailable))
+            }
+            Outcome::Probe(outcome) | Outcome::Transport(outcome) if pending.handoff => {
+                if matches!(
+                    outcome,
+                    ProbeOutcome::Unreachable | ProbeOutcome::Overloaded
+                ) {
+                    budget.note_route_failure();
+                }
+                Ok(None)
+            }
             Outcome::Copy => {
                 self.done = true;
                 Ok(Some(End::Copy))
@@ -581,15 +726,15 @@ pub struct HedgeFacts {
 
 /// Whether to hedge before direct-link availability is checked. Only rank 0 can
 /// serve as hedge primary, and one cold fallback must remain fundable:
-/// primary(2) + duplicate(1) + the second visited owner at rank r (r + 2), with
-/// links 1 + 1 + 8.
+/// primary(2) + duplicate(1) + the second visited owner at rank r
+/// ([`owner_funding_min`]), with links 1 + 1 + 8.
 pub fn hedge_eligible(facts: HedgeFacts) -> bool {
     facts.page_operation
         && !facts.is_candidate
         && facts.owners >= 2
         && facts.first == 0
         && facts.distinct
-        && facts.remaining_attempts >= 3 + facts.second as u32 + 2
+        && facts.remaining_attempts >= 3 + owner_funding_min(facts.second)
         && facts.remaining_links >= 10
 }
 

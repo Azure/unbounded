@@ -13,6 +13,7 @@ fn config(rank: Option<usize>, owners: usize, order: VisitOrder) -> WalkConfig {
         order,
         page_operation: true,
         continuation: Continuation::default(),
+        handoff: 0,
     }
 }
 
@@ -47,7 +48,7 @@ fn drive(
 }
 
 #[test]
-fn owner_probes_predecessors_copy_only_then_gets_origin() {
+fn owner_asks_rank_zero_to_acquire_then_probes_copy_only_then_gets_origin() {
     let mut walk = CandidateWalk::new(config(Some(2), 3, VisitOrder::canonical(3)));
     let mut b = budget(32, 96);
     let (probes, end) = drive(&mut walk, &mut b, |_, _| {
@@ -59,10 +60,13 @@ fn owner_probes_predecessors_copy_only_then_gets_origin() {
             .map(|(p, ..)| (p.canonical, p.mode, p.remaining_opportunities, p.route))
             .collect::<Vec<_>>(),
         [
-            (0, Mode::CopyOnly, 3, RouteMode::SharedRoute),
+            (0, Mode::Acquire, 3, RouteMode::FundedRoute),
             (1, Mode::CopyOnly, 2, RouteMode::SharedRoute)
         ]
     );
+    // The Acquire to rank 0 carries exactly the exchange and one origin
+    // credit over a normal route.
+    assert_eq!((probes[0].1, probes[0].2), (2, 4));
     assert_eq!(
         end,
         End::Origin {
@@ -71,6 +75,229 @@ fn owner_probes_predecessors_copy_only_then_gets_origin() {
         }
     );
     assert_eq!((b.remaining_attempts(), b.remaining_links()), (32, 96));
+}
+
+#[test]
+fn owner_funding_covers_delegation_and_origin() {
+    // Rank 0: the exchange and its origin attempt.
+    assert_eq!(owner_funding(0), 2);
+    assert_eq!(owner_funding_min(0), 2);
+    // Without delegation: one copy-only probe per predecessor instead.
+    assert_eq!(owner_funding_min(1), 3);
+    assert_eq!(owner_funding_min(2), 4);
+    // Rank r > 0: the exchange, an Acquire to rank 0 (two credits), r - 1
+    // copy-only probes, and its own origin attempt.
+    assert_eq!(owner_funding(1), 4);
+    assert_eq!(owner_funding(2), 5);
+}
+
+#[test]
+fn owner_delegates_only_with_credit_left_for_its_own_origin() {
+    // Rank 1 holding two credits cannot fund the Acquire to rank 0 (two) and
+    // keep one for its own origin attempt, so it probes copy-only as before.
+    let mut walk = CandidateWalk::new(config(Some(1), 3, VisitOrder::canonical(3)));
+    let mut b = budget(2, 16);
+    let (probes, end) = drive(&mut walk, &mut b, |_, _| {
+        Outcome::Probe(ProbeOutcome::CopyMiss)
+    });
+    assert_eq!(probes.len(), 1);
+    assert_eq!(probes[0].0.mode, Mode::CopyOnly);
+    assert!(matches!(end, End::Origin { rank: 1, .. }));
+    // With three it delegates.
+    let mut walk = CandidateWalk::new(config(Some(1), 3, VisitOrder::canonical(3)));
+    let mut b = budget(3, 16);
+    let (probes, _) = drive(&mut walk, &mut b, |_, _| {
+        Outcome::Probe(ProbeOutcome::CopyMiss)
+    });
+    assert_eq!(probes[0].0.mode, Mode::Acquire);
+    // Rank 2 needs four: the Acquire, rank 1's probe, and its own origin.
+    let mut walk = CandidateWalk::new(config(Some(2), 3, VisitOrder::canonical(3)));
+    let mut b = budget(3, 16);
+    let (probes, _) = drive(&mut walk, &mut b, |_, _| {
+        Outcome::Probe(ProbeOutcome::CopyMiss)
+    });
+    assert!(probes.iter().all(|(p, ..)| p.mode == Mode::CopyOnly));
+    let mut walk = CandidateWalk::new(config(Some(2), 3, VisitOrder::canonical(3)));
+    let mut b = budget(4, 16);
+    let (probes, _) = drive(&mut walk, &mut b, |_, _| {
+        Outcome::Probe(ProbeOutcome::CopyMiss)
+    });
+    assert_eq!(probes[0].0.mode, Mode::Acquire);
+    assert_eq!(probes[1].0.mode, Mode::CopyOnly);
+}
+
+#[test]
+fn non_owner_funds_delegation_from_slack_only() {
+    // Default page budget, visit order [1, 2, 0]: rank 1 gets `owner_funding`
+    // because rank 2's minimum (4) still fits; rank 2 then gets its minimum.
+    let order = visit_order(ReplicaSelection::Spread, 3, |r| r != 0, |r| 3 - r as u64);
+    let mut walk = CandidateWalk::new(config(None, 3, order));
+    let mut b = budget(8, 16);
+    let mut seen = Vec::new();
+    loop {
+        match walk.next(&mut b).unwrap() {
+            Step::Probe(p) => {
+                let request = walk.request_budget(&mut b);
+                seen.push((p.canonical, request.remaining_attempts()));
+                // Spend the child entirely, as a forwarded funded route does.
+                let spent = request.remaining_attempts();
+                drop(request.partition(spent, 0).unwrap());
+                assert_eq!(
+                    walk.complete(&mut b, Outcome::Probe(ProbeOutcome::CopyMiss))
+                        .unwrap(),
+                    None
+                );
+            }
+            Step::End(_) => break,
+        }
+    }
+    assert_eq!(order.ranks().collect::<Vec<_>>(), [1, 2, 0]);
+    assert_eq!(
+        seen[..2],
+        [(1, owner_funding(1)), (2, owner_funding_min(2))]
+    );
+}
+
+#[test]
+fn delegated_version_miss_ends_without_origin() {
+    let mut walk = CandidateWalk::new(config(Some(2), 3, VisitOrder::canonical(3)));
+    let mut b = budget(8, 16);
+    let (probes, end) = drive(&mut walk, &mut b, |_, _| {
+        Outcome::Probe(ProbeOutcome::VersionUnavailable)
+    });
+    assert_eq!(probes.len(), 1);
+    assert_eq!(end, End::VersionUnavailable);
+    // A copy-only predecessor's version miss is only evidence.
+    let mut walk = CandidateWalk::new(config(Some(2), 3, VisitOrder::canonical(3)));
+    let mut b = budget(8, 16);
+    let (probes, end) = drive(&mut walk, &mut b, |p, _| {
+        Outcome::Probe(if p.canonical == 0 {
+            ProbeOutcome::CopyMiss
+        } else {
+            ProbeOutcome::VersionUnavailable
+        })
+    });
+    assert_eq!(probes.len(), 2);
+    assert!(matches!(end, End::Origin { rank: 2, .. }));
+    // Metadata and other non-page walks never delegate.
+    let mut cfg = config(Some(1), 3, VisitOrder::canonical(3));
+    cfg.page_operation = false;
+    let mut walk = CandidateWalk::new(cfg);
+    let mut b = budget(8, 16);
+    let (probes, _) = drive(&mut walk, &mut b, |_, _| {
+        Outcome::Probe(ProbeOutcome::CopyMiss)
+    });
+    assert_eq!(probes[0].0.mode, Mode::CopyOnly);
+}
+
+#[test]
+fn owner_asks_handoff_targets_copy_only_after_predecessors() {
+    let mut cfg = config(Some(1), 3, VisitOrder::canonical(3));
+    cfg.handoff = 2;
+    let mut walk = CandidateWalk::new(cfg);
+    let mut b = budget(8, 32);
+    let (probes, end) = drive(&mut walk, &mut b, |p, _| {
+        Outcome::Probe(if p.canonical == 0 {
+            ProbeOutcome::Overloaded
+        } else {
+            ProbeOutcome::CopyMiss
+        })
+    });
+    assert_eq!(
+        probes
+            .iter()
+            .map(|(p, ..)| (p.canonical, p.mode, p.remaining_opportunities))
+            .collect::<Vec<_>>(),
+        [
+            (0, Mode::Acquire, 4),
+            (3, Mode::CopyOnly, 3),
+            (4, Mode::CopyOnly, 2)
+        ]
+    );
+    // Handoff outcomes are not predecessor evidence.
+    assert_eq!(
+        end,
+        End::Origin {
+            rank: 1,
+            evidence: vec![ProbeOutcome::Overloaded]
+        }
+    );
+    // A handoff target's copy wins.
+    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
+    cfg.handoff = 3;
+    let mut walk = CandidateWalk::new(cfg);
+    let mut b = budget(8, 32);
+    let (probes, end) = drive(&mut walk, &mut b, |p, _| {
+        if p.canonical == 4 {
+            Outcome::Copy
+        } else {
+            Outcome::Probe(ProbeOutcome::CopyMiss)
+        }
+    });
+    assert_eq!(probes.len(), 2);
+    assert_eq!(end, End::Copy);
+    // Non-page walks and non-owners ignore handoff targets.
+    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
+    cfg.handoff = 3;
+    cfg.page_operation = false;
+    let mut walk = CandidateWalk::new(cfg);
+    let (probes, _) = drive(&mut walk, &mut budget(8, 32), |_, _| unreachable!());
+    assert!(probes.is_empty());
+}
+
+#[test]
+fn handoff_probes_never_spend_the_origin_credit() {
+    // Rank 0 with three credits asks two handoff targets (each exchange
+    // spends one) and keeps one credit for origin.
+    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
+    cfg.handoff = 3;
+    let mut walk = CandidateWalk::new(cfg);
+    let mut b = budget(3, 32);
+    let mut probes = 0;
+    let end = loop {
+        match walk.next(&mut b).unwrap() {
+            Step::Probe(_) => {
+                probes += 1;
+                drop(walk.request_budget(&mut b).partition(1, 0).unwrap());
+                assert_eq!(
+                    walk.complete(&mut b, Outcome::Probe(ProbeOutcome::CopyMiss))
+                        .unwrap(),
+                    None
+                );
+            }
+            Step::End(end) => break end,
+        }
+    };
+    assert_eq!(probes, 2);
+    assert_eq!(b.remaining_attempts(), 1);
+    assert!(matches!(end, End::Origin { rank: 0, .. }));
+    // One credit: straight to origin.
+    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
+    cfg.handoff = 3;
+    let mut walk = CandidateWalk::new(cfg);
+    let (probes, _) = drive(&mut walk, &mut budget(1, 32), |_, _| unreachable!());
+    assert!(probes.is_empty());
+    // No links left for a route: straight to origin.
+    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
+    cfg.handoff = 1;
+    let mut walk = CandidateWalk::new(cfg);
+    let (probes, _) = drive(&mut walk, &mut budget(8, 0), |_, _| unreachable!());
+    assert!(probes.is_empty());
+}
+
+#[test]
+fn handoff_targets_skip_self_predecessors_and_unchanged_sets() {
+    // Unchanged owner set (any order): nothing to ask.
+    assert!(handoff_targets(&[1, 2, 3], &[2, 1, 3], 0).is_empty());
+    // A join put 9 at rank 0: the old owners, in old rank order.
+    assert_eq!(handoff_targets(&[1, 2, 3], &[9, 1, 2], 0), [1, 2, 3]);
+    // At rank 1 (node 1), its predecessor 9 is probed anyway; itself skipped.
+    assert_eq!(handoff_targets(&[1, 2, 3], &[9, 1, 2], 1), [2, 3]);
+    // A removal: the previous owner 1 is gone from the current set.
+    assert_eq!(handoff_targets(&[1, 2, 3], &[2, 3, 4], 2), [1]);
+    // Fewer owners before.
+    assert_eq!(handoff_targets(&[1], &[1, 2], 1), Vec::<i32>::new());
+    assert_eq!(handoff_targets::<i32>(&[], &[1], 0), Vec::<i32>::new());
 }
 
 #[test]
@@ -91,21 +318,23 @@ fn rank_zero_owner_gets_origin_without_probes() {
 #[test]
 fn owner_with_tight_links_partitions_predecessor_routes() {
     // Two predecessors, eight inherited links after a failure route: each probe
-    // gets a one-attempt child with links/remaining capped at four.
+    // gets a child with links/remaining capped at four, and one attempt (two
+    // for the Acquire to rank 0: the exchange and rank 0's origin credit).
     let mut walk = CandidateWalk::new(config(Some(2), 3, VisitOrder::canonical(3)));
     let mut b = budget(4, 7);
     b.note_route_failure();
     let (probes, _) = drive(&mut walk, &mut b, |_, _| {
         Outcome::Probe(ProbeOutcome::CopyMiss)
     });
-    assert_eq!((probes[0].1, probes[0].2), (1, 3));
+    assert_eq!(probes[0].0.mode, Mode::Acquire);
+    assert_eq!((probes[0].1, probes[0].2), (2, 3));
     // The last predecessor may use the whole remaining pool.
     assert_eq!((probes[1].1, probes[1].2), (4, 7));
 }
 
 #[test]
 fn non_owner_funds_out_of_order_owner_and_reports_version_unavailable() {
-    // Visit rank 1 first: it is funded with rank + 2 attempts and 8 links.
+    // Visit rank 1 first: it is funded with `owner_funding(1)` attempts and 8 links.
     let order = visit_order(ReplicaSelection::Spread, 3, |r| r == 1, |_| 0);
     assert_eq!(order.get(0), Some(1));
     let mut walk = CandidateWalk::new(config(None, 3, order));
@@ -115,7 +344,16 @@ fn non_owner_funds_out_of_order_owner_and_reports_version_unavailable() {
     });
     assert_eq!(probes.len(), 3);
     assert_eq!(probes[0].0.route, RouteMode::FundedRoute);
-    assert_eq!((probes[0].1, probes[0].2), (3, 8));
+    assert_eq!((probes[0].1, probes[0].2), (owner_funding(1), 8));
+    assert_eq!(owner_funding(1), 4);
+    // With fewer credits it still funds the minimum, so reach is unchanged.
+    let mut walk = CandidateWalk::new(config(None, 3, order));
+    let mut b = budget(3, 96);
+    let (probes, _) = drive(&mut walk, &mut b, |_, _| {
+        Outcome::Probe(ProbeOutcome::VersionUnavailable)
+    });
+    assert_eq!(probes[0].0.route, RouteMode::FundedRoute);
+    assert_eq!((probes[0].1, probes[0].2), (owner_funding_min(1), 8));
     assert_eq!(probes[1].0.route, RouteMode::SharedRoute);
     assert!(probes.iter().all(|(p, ..)| p.mode == Mode::Acquire));
     assert_eq!(end, End::VersionUnavailable);
@@ -264,7 +502,7 @@ fn abandon_returns_child_credits() {
     let mut walk = CandidateWalk::new(config(None, 3, order));
     let mut b = budget(32, 96);
     assert!(matches!(walk.next(&mut b).unwrap(), Step::Probe(_)));
-    assert_eq!(b.remaining_attempts(), 28);
+    assert_eq!(b.remaining_attempts(), 32 - owner_funding(2));
     walk.abandon(&mut b).unwrap();
     assert_eq!((b.remaining_attempts(), b.remaining_links()), (32, 96));
 }

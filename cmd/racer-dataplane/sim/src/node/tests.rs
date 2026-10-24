@@ -35,10 +35,9 @@ fn quiet(nodes: u32) -> Config {
 }
 
 /// One reader fetches an object, then every node reads it. Each page reaches
-/// the origin at most once per ranked owner: a reader probes owners in spread
-/// order, a later owner fetches after its predecessors miss, and the rank 0
-/// owner always fetches itself (`CandidateWalk` with `rank = Some(0)` ends in
-/// `End::Origin` at once). See Known issues in the design doc.
+/// the origin exactly once: whichever owner a reader asks first, an owner
+/// above rank 0 asks rank 0 to acquire (`CandidateWalk` delegation), so rank
+/// 0 alone fetches and later owners copy from it (Known issue 4).
 #[test]
 fn single_reader_then_storm_reuses_copies() {
     let mut config = quiet(64);
@@ -60,17 +59,11 @@ fn single_reader_then_storm_reuses_copies() {
     let pages = u64::from(world.config.pages_per_object);
     assert_eq!(counter(&report, "reads_completed"), pages * 65);
     let origin = counter(&report, "origin_requests");
-    assert!(
-        (pages..=pages * topology::REPLICAS as u64).contains(&origin),
-        "{origin}"
-    );
-    for p in 0..pages {
-        let n = world.origin_requests(3 * pages + p);
-        assert!(
-            (1..=topology::REPLICAS as u32).contains(&n),
-            "page {p}: {n}"
-        );
-    }
+    let per_page: Vec<u32> = (0..pages)
+        .map(|p| world.origin_requests(3 * pages + p))
+        .collect();
+    // Before owners delegated to rank 0 (Known issue 4) this was 33.
+    assert_eq!(origin, pages, "{per_page:?}");
     assert!(counter(&report, "peer_bytes") > 0);
     assert!(counter(&report, "flight_joins") + counter(&report, "peer_memory_hits") > 0);
     assert!(

@@ -1616,6 +1616,7 @@ impl NodeWorld {
             order: fill.order,
             page_operation: true,
             continuation,
+            handoff: 0,
         }));
         self.step_walk(id);
     }
