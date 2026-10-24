@@ -2166,14 +2166,16 @@ probes / helper copies / owner sheds. Read latency is log-bucket upper bounds.
 | 5k churn seeds 1, 2, 3, after | 1,488 / 1,462 / 1,594 failed | 1,224, 3, 196 (seed 1) | 3,682 / 3,190 / 3,468 | 540 GB | 0.37 / 0.81 s |
 | 5k full-cold-start, before | 94,810 / 98 | 7,017, 3, 204 | - | 246 GB | 0.05 / 0.13 s |
 | 5k full-cold-start, after | 94,809 / 98 | 7,017, 3, 204 | 623 / 592 / 623 | 245 GB | 0.05 / 0.13 s |
-| 50k full-cold-start 1 s, before (capacity track) | 261,113 / 634,751 unavailable | - | - | 0.81 TB | 0.74 / 2.01 s |
+| 50k full-cold-start 1 s, before | 261,113 / 634,751 unavailable | 27,448, 3, 4,510 (mean 1.22) | - | 0.81 TB | 0.74 / 2.01 s |
 | 50k full-cold-start 1 s, after | 884,116 / 11,754 unavailable | 27,446, 3, 4,507 (mean 1.22) | 781,006 / 779,516 / 782,075 | 2.32 TB | 0.50 / 1.61 s |
 | 50k full-cold-start 28 s window, capacity track "after" | 884,120 / 11,753 unavailable | mean 1.22, max 3 | - | 2.71 TB | 0.06 / 0.24 s |
 
 - 50k: with fan-out the 1 s storm completes like the capacity track's 28 s window (same ok and
   failed counts within 4 reads; the 11.7k failures are background Zipf reads during enrollment,
-  Known issue 72). 99.8% of helper probes returned a copy. All 50,000 nodes were enrolled before
-  the storm. Wall 22:01, peak RSS 6.5 GiB (capacity's 1 s run: 26:26).
+  Known issue 72). 99.8% of helper probes returned a copy, origin requests are unchanged (27,448
+  before, 27,446 after), and relay rejections fell from 11.4M to 3,310. All 50,000 nodes were
+  enrolled before the storm. Wall 24:23 before and 22:01 after; peak RSS 7.2 and 6.5 GiB. The
+  "before" run reproduces the capacity track's 1 s numbers exactly.
 
 - No hard invariant failure and no relaxed invariant in any run; `only_owner_hits_origin` and
   `budget_never_grows` held throughout.
