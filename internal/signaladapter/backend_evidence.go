@@ -172,7 +172,7 @@ func (r *Runner) captureBackendEvidence(
 		evidence.Complete = evidence.Complete && complete
 	}
 
-	content, complete, err := marshalBackendEvidence(evidence, config.BackendEvidenceBytes)
+	content, complete, err := marshalBackendEvidence(evidence, MaxBackendEvidenceBytes)
 	if err != nil {
 		return "", false, err
 	}

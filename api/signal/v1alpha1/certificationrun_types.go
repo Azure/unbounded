@@ -68,7 +68,6 @@ type ScriptSnapshot struct {
 	Digest string `json:"digest"`
 }
 
-// +kubebuilder:validation:XValidation:rule="self.maxAttempts == 1",message="maxAttempts must be exactly 1"
 // +kubebuilder:validation:XValidation:rule="duration(self.backendActiveDeadline) > duration('0s')",message="backendActiveDeadline must be positive"
 // +kubebuilder:validation:XValidation:rule="!has(self.script.requiresRuntimeStage) || !self.script.requiresRuntimeStage || has(self.runtimeStage)",message="runtimeStage is required when the script requires a runtime stage"
 type CertificationCheckSnapshot struct {
@@ -84,11 +83,10 @@ type CertificationCheckSnapshot struct {
 	Backend               ExecutionBackend       `json:"backend"`
 	WorkloadPolicy        WorkloadPolicy         `json:"workloadPolicy,omitempty"`
 	RuntimeStage          *RuntimeStage          `json:"runtimeStage,omitempty"`
-	Parameters            map[string]string      `json:"parameters,omitempty"`
+	GPUCount              int32                  `json:"gpuCount,omitempty"`
+	ScriptEnvironment     map[string]string      `json:"scriptEnvironment,omitempty"`
 	BackendActiveDeadline metav1.Duration        `json:"backendActiveDeadline"`
-	ResultBounds          ResultBounds           `json:"resultBounds"`
 	ParticipantPolicy     CheckParticipantPolicy `json:"participantPolicy,omitempty"`
-	MaxAttempts           int32                  `json:"maxAttempts"`
 }
 
 // +kubebuilder:validation:XValidation:rule="self.profile == oldSelf.profile",message="profile is immutable"
@@ -98,7 +96,6 @@ type CertificationCheckSnapshot struct {
 // +kubebuilder:validation:XValidation:rule="self.checks == oldSelf.checks",message="checks are immutable"
 // +kubebuilder:validation:XValidation:rule="self.executionPolicy == oldSelf.executionPolicy",message="executionPolicy is immutable"
 // +kubebuilder:validation:XValidation:rule="self.workflow == oldSelf.workflow",message="workflow is immutable"
-// +kubebuilder:validation:XValidation:rule="has(self.purpose) == has(oldSelf.purpose) && (!has(self.purpose) || self.purpose == oldSelf.purpose)",message="purpose is immutable"
 // +kubebuilder:validation:XValidation:rule="self.evidencePath == oldSelf.evidencePath",message="evidencePath is immutable"
 // +kubebuilder:validation:XValidation:rule="self.deadline == oldSelf.deadline",message="deadline is immutable"
 // +kubebuilder:validation:XValidation:rule="has(self.tolerations) == has(oldSelf.tolerations) && (!has(self.tolerations) || self.tolerations == oldSelf.tolerations)",message="tolerations are immutable"
@@ -121,13 +118,11 @@ type CertificationRunSpec struct {
 	Checks          []CertificationCheckSnapshot `json:"checks"`
 	ExecutionPolicy SuiteExecutionPolicy         `json:"executionPolicy"`
 	Workflow        WorkflowReference            `json:"workflow"`
-	// +kubebuilder:validation:Enum=FullCertification
-	Purpose         CertificationPurpose `json:"purpose,omitempty"`
-	EvidencePath    string               `json:"evidencePath"`
-	Deadline        metav1.Duration      `json:"deadline"`
-	Tolerations     []corev1.Toleration  `json:"tolerations,omitempty"`
-	RequestNodeName string               `json:"requestNodeName"`
-	Cancel          bool                 `json:"cancel,omitempty"`
+	EvidencePath    string                       `json:"evidencePath"`
+	Deadline        metav1.Duration              `json:"deadline"`
+	Tolerations     []corev1.Toleration          `json:"tolerations,omitempty"`
+	RequestNodeName string                       `json:"requestNodeName"`
+	Cancel          bool                         `json:"cancel,omitempty"`
 }
 
 type WorkflowStatus struct {

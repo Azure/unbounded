@@ -76,16 +76,11 @@ func main() {
 		0,
 		"Active deadline for participant backend workloads",
 	)
-	flags.StringVar(&cfg.Queue, "queue", "", "Kueue LocalQueue name")
 	flags.StringVar(&cfg.TolerationsJSON, "tolerations", "[]", "JSON-encoded Pod tolerations")
 	flags.StringVar(&cfg.ScriptEnvironmentJSON, "script-environment", "{}", "JSON-encoded script environment")
 	flags.StringVar(&cfg.WorkloadPolicyJSON, "workload-policy", "{}", "JSON-encoded participant workload policy")
-	flags.IntVar(&cfg.BackendEvidenceBytes, "backend-evidence-bytes", signaladapter.MaxBackendEvidenceBytes, "Maximum backend evidence output bytes")
 	flags.StringVar(&cfg.GPUResourceCount, "gpu-resource-count", "0", "GPU resource limit per participant")
-	flags.BoolVar(&cfg.Privileged, "privileged", false, "Run the participant workload with a privileged security context")
 	flags.IntVar(&cfg.Attempt, "attempt", 0, "One-based Workflow attempt number")
-	flags.Int64Var(&cfg.BackoffLimit, "backoff-limit", 0, "MPIJob backoff limit")
-	flags.Int64Var(&cfg.TTLSeconds, "ttl-seconds-after-finished", 3600, "MPIJob TTL after completion")
 	flags.StringVar(&cfg.outputDirectory, "output-directory", "/outputs", "Argo output directory")
 
 	command.CompletionOptions.DisableDefaultCmd = true

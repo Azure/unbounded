@@ -21,28 +21,7 @@ type WorkflowReference struct {
 	Name string `json:"name"`
 }
 
-type CertificationPurpose string
-
-const (
-	PurposeFullCertification CertificationPurpose = "FullCertification"
-)
-
 type CheckID string
-
-type ResultBounds struct {
-	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:Maximum=4096
-	ReasonBytes int32 `json:"reasonBytes"`
-	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:Maximum=16384
-	MeasurementsBytes int32 `json:"measurementsBytes"`
-	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:Maximum=16384
-	BackendResourcesBytes int32 `json:"backendResourcesBytes"`
-	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:Maximum=65536
-	BackendEvidenceBytes int32 `json:"backendEvidenceBytes"`
-}
 
 type ParticipantRoleConstraint struct {
 	// +kubebuilder:validation:MinLength=1
@@ -73,7 +52,6 @@ type CheckParticipantPolicy struct {
 	ExcludedRoles []string `json:"excludedRoles,omitempty"`
 }
 
-// +kubebuilder:validation:XValidation:rule="self.maxAttempts == 1",message="maxAttempts must be exactly 1"
 // +kubebuilder:validation:XValidation:rule="duration(self.backendActiveDeadline) > duration('0s')",message="backendActiveDeadline must be positive"
 // +kubebuilder:validation:XValidation:rule="!has(self.script.requiresRuntimeStage) || !self.script.requiresRuntimeStage || has(self.runtimeStage)",message="runtimeStage is required when the script requires a runtime stage"
 type CertificationCheck struct {
@@ -83,17 +61,17 @@ type CertificationCheck struct {
 	ID CheckID `json:"id"`
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=14
-	Order                 int32                  `json:"order"`
-	Script                ScriptReference        `json:"script"`
-	RunnerImage           string                 `json:"runnerImage"`
-	Backend               ExecutionBackend       `json:"backend"`
-	WorkloadPolicy        WorkloadPolicy         `json:"workloadPolicy,omitempty"`
-	RuntimeStage          *RuntimeStage          `json:"runtimeStage,omitempty"`
-	Parameters            map[string]string      `json:"parameters,omitempty"`
+	Order          int32            `json:"order"`
+	Script         ScriptReference  `json:"script"`
+	RunnerImage    string           `json:"runnerImage"`
+	Backend        ExecutionBackend `json:"backend"`
+	WorkloadPolicy WorkloadPolicy   `json:"workloadPolicy,omitempty"`
+	RuntimeStage   *RuntimeStage    `json:"runtimeStage,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	GPUCount              int32                  `json:"gpuCount,omitempty"`
+	ScriptEnvironment     map[string]string      `json:"scriptEnvironment,omitempty"`
 	BackendActiveDeadline metav1.Duration        `json:"backendActiveDeadline"`
-	ResultBounds          ResultBounds           `json:"resultBounds"`
 	ParticipantPolicy     CheckParticipantPolicy `json:"participantPolicy,omitempty"`
-	MaxAttempts           int32                  `json:"maxAttempts"`
 }
 
 type SuiteFailurePolicy string
@@ -118,7 +96,6 @@ type RuntimeStage struct {
 type ExecutionBackend struct {
 	APIVersion string `json:"apiVersion"`
 	Kind       string `json:"kind"`
-	Queue      string `json:"queue,omitempty"`
 }
 
 type ParticipantPolicy struct {
@@ -131,34 +108,21 @@ type ParticipantPolicy struct {
 	RequiredResources corev1.ResourceList `json:"requiredResources,omitempty"`
 }
 
-type WorkloadVolume struct {
-	Name      string `json:"name"`
-	MountPath string `json:"mountPath"`
-	ReadOnly  bool   `json:"readOnly,omitempty"`
-
-	HostPath              *corev1.HostPathVolumeSource              `json:"hostPath,omitempty"`
-	EmptyDir              *corev1.EmptyDirVolumeSource              `json:"emptyDir,omitempty"`
-	PersistentVolumeClaim *corev1.PersistentVolumeClaimVolumeSource `json:"persistentVolumeClaim,omitempty"`
-}
-
-type KueueTopologyPolicy struct {
-	// RequiredLevel is the Node label key for the minimum topology domain in which
-	// Kueue must place the participant PodSet.
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=316
-	// +kubebuilder:validation:Pattern=`^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$`
-	RequiredLevel string `json:"requiredLevel"`
+type WorkloadHostPath struct {
+	Name      string              `json:"name"`
+	MountPath string              `json:"mountPath"`
+	Path      string              `json:"path"`
+	Type      corev1.HostPathType `json:"type,omitempty"`
 }
 
 type WorkloadPolicy struct {
-	Resources       corev1.ResourceRequirements  `json:"resources,omitempty"`
-	SecurityContext *corev1.SecurityContext      `json:"securityContext,omitempty"`
-	HostNetwork     bool                         `json:"hostNetwork,omitempty"`
-	KueueTopology   *KueueTopologyPolicy         `json:"kueueTopology,omitempty"`
-	WorkingDir      string                       `json:"workingDir,omitempty"`
-	Results         *corev1.EmptyDirVolumeSource `json:"results,omitempty"`
+	Resources    corev1.ResourceRequirements `json:"resources,omitempty"`
+	Privileged   bool                        `json:"privileged,omitempty"`
+	Capabilities []corev1.Capability         `json:"capabilities,omitempty"`
+	HostNetwork  bool                        `json:"hostNetwork,omitempty"`
+	WorkingDir   string                      `json:"workingDir,omitempty"`
 	// +kubebuilder:validation:MaxItems=16
-	Volumes []WorkloadVolume `json:"volumes,omitempty"`
+	HostPaths []WorkloadHostPath `json:"hostPaths,omitempty"`
 }
 
 // +kubebuilder:validation:XValidation:rule="self.checks.all(c, self.checks.exists_one(x, x.id == c.id))",message="checks must contain unique IDs"
@@ -176,11 +140,9 @@ type CertificationProfileSpec struct {
 	// +kubebuilder:validation:MaxItems=15
 	Checks          []CertificationCheck `json:"checks"`
 	ExecutionPolicy SuiteExecutionPolicy `json:"executionPolicy"`
-	// +kubebuilder:validation:Enum=FullCertification
-	Purpose      CertificationPurpose `json:"purpose,omitempty"`
-	EvidencePath string               `json:"evidencePath"`
-	Deadline     metav1.Duration      `json:"deadline"`
-	Tolerations  []corev1.Toleration  `json:"tolerations,omitempty"`
+	EvidencePath    string               `json:"evidencePath"`
+	Deadline        metav1.Duration      `json:"deadline"`
+	Tolerations     []corev1.Toleration  `json:"tolerations,omitempty"`
 }
 
 // +kubebuilder:object:root=true

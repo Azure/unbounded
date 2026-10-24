@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"regexp"
 	"slices"
 	"strconv"
@@ -28,17 +27,19 @@ import (
 
 const (
 	MaxParticipants         = 64
-	MaxReasonBytes          = 4 * 1024
+	MaxCheckParticipants    = 8
+	MaxReasonBytes          = 512
 	MaxMeasurementsBytes    = 16 * 1024
-	MaxBackendOutputBytes   = 16 * 1024
-	MaxBackendEvidenceBytes = 64 * 1024
+	MaxBackendOutputBytes   = 8 * 1024
+	MaxBackendEvidenceBytes = 24 * 1024
 	MaxCleanupFailureBytes  = 64
 	maxMPIWorkerReadyWait   = int64(30)
 	maxMPIWorkerSlots       = int64(1<<31 - 1)
+	mpiBackoffLimit         = int64(0)
+	mpiTTLSeconds           = int64(3600)
 	mpiHostfilePath         = "/tmp/project-signal-hostfile"
 	mpiKnownHostsPath       = "/tmp/project-signal-known-hosts"
 	resultPrefix            = "PROJECT_SIGNAL_RESULT_V2 "
-	requiredTopologyKey     = "kueue.x-k8s.io/podset-required-topology"
 )
 
 var runnerImagePattern = regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)
@@ -76,16 +77,11 @@ type Config struct {
 	BackendAPIVersion      string
 	BackendKind            string
 	BackendDeadlineSeconds int64
-	Queue                  string
 	TolerationsJSON        string
 	ScriptEnvironmentJSON  string
 	WorkloadPolicyJSON     string
 	GPUResourceCount       string
-	Privileged             bool
 	Attempt                int
-	BackoffLimit           int64
-	TTLSeconds             int64
-	BackendEvidenceBytes   int
 }
 
 type Result struct {
@@ -129,8 +125,8 @@ func ParseParticipants(
 	participantsJSON string,
 	participantCount int,
 ) ([]signalv1.Participant, error) {
-	if participantCount < 1 || participantCount > MaxParticipants {
-		return nil, fmt.Errorf("participant-count must be between 1 and %d", MaxParticipants)
+	if participantCount < 1 || participantCount > MaxCheckParticipants {
+		return nil, fmt.Errorf("participant-count must be between 1 and %d", MaxCheckParticipants)
 	}
 
 	if strings.TrimSpace(participantsJSON) == "" {
@@ -271,35 +267,12 @@ func ValidateConfig(config Config) ([]signalv1.Participant, []corev1.Toleration,
 		)
 	}
 
-	if config.Queue != "" {
-		if errors := validation.IsDNS1123Subdomain(config.Queue); len(errors) > 0 {
-			return nil, nil, nil, fmt.Errorf("queue is invalid: %s", strings.Join(errors, ", "))
-		}
-	}
-
-	if config.BackoffLimit < 0 {
-		return nil, nil, nil, errors.New("backoff-limit must not be negative")
-	}
-
-	if config.TTLSeconds < 0 {
-		return nil, nil, nil, errors.New("ttl-seconds-after-finished must not be negative")
-	}
-
 	if config.Attempt < 1 {
 		return nil, nil, nil, errors.New("attempt must be positive")
 	}
 
-	if config.BackendEvidenceBytes < 0 || config.BackendEvidenceBytes > MaxBackendEvidenceBytes {
-		return nil, nil, nil, fmt.Errorf("backend-evidence-bytes must be between 1 and %d when set", MaxBackendEvidenceBytes)
-	}
-
-	policy, err := signalworkload.Decode(config.WorkloadPolicyJSON)
-	if err != nil {
+	if _, err := signalworkload.Decode(config.WorkloadPolicyJSON); err != nil {
 		return nil, nil, nil, err
-	}
-
-	if policy.KueueTopology != nil && config.Queue == "" {
-		return nil, nil, nil, errors.New("workload policy kueueTopology requires a queue")
 	}
 
 	participants, err := ParseParticipants(
@@ -311,11 +284,12 @@ func ValidateConfig(config Config) ([]signalv1.Participant, []corev1.Toleration,
 	}
 
 	minimumEvidenceBytes := MinimumBackendEvidenceBytes(len(participants))
-	if config.BackendEvidenceBytes > 0 && config.BackendEvidenceBytes < minimumEvidenceBytes {
+	if minimumEvidenceBytes > MaxBackendEvidenceBytes {
 		return nil, nil, nil, fmt.Errorf(
-			"backend-evidence-bytes must be at least %d for %d participants",
-			minimumEvidenceBytes,
+			"fixed backend evidence limit %d cannot represent %d participants; requires at least %d bytes",
+			MaxBackendEvidenceBytes,
 			len(participants),
+			minimumEvidenceBytes,
 		)
 	}
 
@@ -327,24 +301,6 @@ func ValidateConfig(config Config) ([]signalv1.Participant, []corev1.Toleration,
 	var environment map[string]string
 	if err := decodeJSONObject(config.ScriptEnvironmentJSON, &environment); err != nil {
 		return nil, nil, nil, fmt.Errorf("decode script-environment: %w", err)
-	}
-
-	if value := environment["BACKEND_BACKOFF_LIMIT"]; value != "" {
-		parsed, err := strconv.ParseInt(value, 10, 64)
-		if err != nil || parsed < 0 {
-			return nil, nil, nil, errors.New("BACKEND_BACKOFF_LIMIT must be a nonnegative integer")
-		}
-
-		config.BackoffLimit = parsed
-	}
-
-	if value := environment["BACKEND_TTL_SECONDS_AFTER_FINISHED"]; value != "" {
-		parsed, err := strconv.ParseInt(value, 10, 64)
-		if err != nil || parsed < 0 {
-			return nil, nil, nil, errors.New("BACKEND_TTL_SECONDS_AFTER_FINISHED must be a nonnegative integer")
-		}
-
-		config.TTLSeconds = parsed
 	}
 
 	environmentNames := make([]string, 0, len(environment))
@@ -404,25 +360,6 @@ func RenderResources(
 
 	if _, exists := policy.Resources.Limits[gpuResource]; exists {
 		return nil, errors.New("workload policy must not set nvidia.com/gpu limits; use gpu-resource-count")
-	}
-
-	var policyEnvironment map[string]string
-	if err := decodeJSONObject(config.ScriptEnvironmentJSON, &policyEnvironment); err != nil {
-		return nil, fmt.Errorf("decode adapter policy: %w", err)
-	}
-
-	if value := policyEnvironment["BACKEND_BACKOFF_LIMIT"]; value != "" {
-		config.BackoffLimit, err = strconv.ParseInt(value, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("parse BACKEND_BACKOFF_LIMIT: %w", err)
-		}
-	}
-
-	if value := policyEnvironment["BACKEND_TTL_SECONDS_AFTER_FINISHED"]; value != "" {
-		config.TTLSeconds, err = strconv.ParseInt(value, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("parse BACKEND_TTL_SECONDS_AFTER_FINISHED: %w", err)
-		}
 	}
 
 	for _, participant := range participants {
@@ -945,9 +882,6 @@ func ordinaryPod(
 	gpuCount int64,
 ) *corev1.Pod {
 	labels := resourceLabels(config, participant)
-	if config.Queue != "" {
-		labels = withLabel(labels, "kueue.x-k8s.io/queue-name", config.Queue)
-	}
 
 	env := workloadEnvironment(config, participant, environment, true)
 	container := workloadContainer(
@@ -968,7 +902,6 @@ func ordinaryPod(
 			Name:            resourceName(config.RunName, participant.Index),
 			Namespace:       config.Namespace,
 			Labels:          labels,
-			Annotations:     workloadAnnotations(policy),
 			OwnerReferences: []metav1.OwnerReference{workflow},
 		},
 		Spec: corev1.PodSpec{
@@ -997,9 +930,6 @@ func mpiJob(
 	gpuCount int64,
 ) (*unstructured.Unstructured, error) {
 	labels := resourceLabels(config, participant)
-	if config.Queue != "" {
-		labels = withLabel(labels, "kueue.x-k8s.io/queue-name", config.Queue)
-	}
 
 	jobName := resourceNameWithLimit(config.RunName, participant.Index, 63-len("-worker-0"))
 	launcherEnv := workloadEnvironment(config, participant, environment, false)
@@ -1039,9 +969,9 @@ func mpiJob(
 			"slotsPerWorker":         gpuCount,
 			"runPolicy": map[string]any{
 				"activeDeadlineSeconds":   backendDeadlineSeconds,
-				"backoffLimit":            config.BackoffLimit,
+				"backoffLimit":            mpiBackoffLimit,
 				"cleanPodPolicy":          "All",
-				"ttlSecondsAfterFinished": config.TTLSeconds,
+				"ttlSecondsAfterFinished": mpiTTLSeconds,
 			},
 			"mpiReplicaSpecs": map[string]any{
 				"Launcher": map[string]any{
@@ -1102,8 +1032,7 @@ func podTemplate(
 
 	template := corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
-			Labels:      labels,
-			Annotations: workloadAnnotations(policy),
+			Labels: labels,
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy:                corev1.RestartPolicyNever,
@@ -1147,14 +1076,6 @@ func participantNodeAffinity(nodeName string, nodeUID types.UID) *corev1.Affinit
 			},
 		},
 	}
-}
-
-func workloadAnnotations(policy signalv1.WorkloadPolicy) map[string]string {
-	if policy.KueueTopology == nil {
-		return nil
-	}
-
-	return map[string]string{requiredTopologyKey: policy.KueueTopology.RequiredLevel}
 }
 
 func applyPodPolicy(spec *corev1.PodSpec, policy signalv1.WorkloadPolicy) {
@@ -1233,10 +1154,15 @@ func workloadContainer(
 		container.Resources.Limits[corev1.ResourceName("nvidia.com/gpu")] = gpu
 	}
 
-	if policy.SecurityContext != nil {
-		container.SecurityContext = policy.SecurityContext.DeepCopy()
-	} else if config.Privileged {
-		container.SecurityContext = &corev1.SecurityContext{Privileged: ptr(true)}
+	if policy.Privileged || len(policy.Capabilities) > 0 {
+		container.SecurityContext = &corev1.SecurityContext{
+			Privileged: ptr(policy.Privileged),
+		}
+		if len(policy.Capabilities) > 0 {
+			container.SecurityContext.Capabilities = &corev1.Capabilities{
+				Add: slices.Clone(policy.Capabilities),
+			}
+		}
 	}
 
 	container.WorkingDir = policy.WorkingDir
@@ -1247,18 +1173,16 @@ func workloadContainer(
 
 func workloadVolumes(scriptConfigMap string, policy signalv1.WorkloadPolicy) []corev1.Volume {
 	volumes := resultVolumes(scriptConfigMap)
-	if policy.Results != nil {
-		volumes[1].EmptyDir = policy.Results.DeepCopy()
-	}
 
-	for index := range policy.Volumes {
-		volume := &policy.Volumes[index]
+	for index := range policy.HostPaths {
+		hostPath := &policy.HostPaths[index]
 		volumes = append(volumes, corev1.Volume{
-			Name: volume.Name,
+			Name: hostPath.Name,
 			VolumeSource: corev1.VolumeSource{
-				HostPath:              volume.HostPath.DeepCopy(),
-				EmptyDir:              volume.EmptyDir.DeepCopy(),
-				PersistentVolumeClaim: volume.PersistentVolumeClaim.DeepCopy(),
+				HostPath: &corev1.HostPathVolumeSource{
+					Path: hostPath.Path,
+					Type: ptr(hostPath.Type),
+				},
 			},
 		})
 	}
@@ -1267,13 +1191,13 @@ func workloadVolumes(scriptConfigMap string, policy signalv1.WorkloadPolicy) []c
 }
 
 func workloadVolumeMounts(policy signalv1.WorkloadPolicy) []corev1.VolumeMount {
-	mounts := make([]corev1.VolumeMount, 0, len(policy.Volumes))
-	for index := range policy.Volumes {
-		volume := &policy.Volumes[index]
+	mounts := make([]corev1.VolumeMount, 0, len(policy.HostPaths))
+	for index := range policy.HostPaths {
+		hostPath := &policy.HostPaths[index]
 		mounts = append(mounts, corev1.VolumeMount{
-			Name:      volume.Name,
-			MountPath: volume.MountPath,
-			ReadOnly:  volume.ReadOnly,
+			Name:      hostPath.Name,
+			MountPath: hostPath.MountPath,
+			ReadOnly:  true,
 		})
 	}
 
@@ -1396,13 +1320,6 @@ func stringMapAny(values map[string]string) map[string]any {
 	for key, value := range values {
 		result[key] = value
 	}
-
-	return result
-}
-
-func withLabel(values map[string]string, key, value string) map[string]string {
-	result := maps.Clone(values)
-	result[key] = value
 
 	return result
 }
