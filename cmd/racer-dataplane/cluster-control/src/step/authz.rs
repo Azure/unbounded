@@ -249,7 +249,10 @@ mod tests {
         let k = token_key("a");
         assert_eq!(c.calls(&k, t0), FULL_CALLS);
         c.put_review(k, reviewed("p"), Duration::from_secs(60), t0);
-        assert_eq!(c.review(&k, t0 + Duration::from_secs(9)), Some(reviewed("p")));
+        assert_eq!(
+            c.review(&k, t0 + Duration::from_secs(9)),
+            Some(reviewed("p"))
+        );
         assert_eq!(c.review(&k, t0 + REVIEW_TTL), None);
         // Token expiring in 2 s is never reused past its exp.
         c.put_review(k, reviewed("p"), Duration::from_secs(2), t0);

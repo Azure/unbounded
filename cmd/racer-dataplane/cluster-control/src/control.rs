@@ -172,6 +172,8 @@ fn run(
                 releasing: Default::default(),
                 last_error: Default::default(),
                 rng: RefCell::new(rng),
+                authz: Default::default(),
+                auth_budget: Default::default(),
             });
             Ok((executor, shared, control, webhook, webhook_alternate))
         };
