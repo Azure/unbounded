@@ -42,6 +42,7 @@ use racer_cluster_control::{
     limits,
     step::{
         admission::{Admit, Body, Poll, SeatAdmission, WriteWaiter, body_for},
+        authz::{ApiBudget, AuthCache, Bindings, Reviewed, TokenKey},
         cluster::{ControlPlane, Settings as ModelSettings},
         cost,
     },
@@ -128,6 +129,29 @@ pub struct Settings {
     pub check_ns: Nanos,
     pub converge_ns: Nanos,
     pub image_bytes_per_member: u64,
+    /// Seat authorization model, see [`AuthModel`].
+    pub auth: AuthModel,
+    /// Per-seat authorization API budget (`limits::AUTH_API_QPS`, `_BURST`)
+    /// for [`AuthModel::Cached`].
+    pub auth_qps: f64,
+    pub auth_burst: f64,
+}
+
+/// How seats authorize an enrolling client's bearer token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthModel {
+    /// Before round 4: the client's first bearer keyring poll authorizes
+    /// twice (once on entry, again because data is about to leave), then
+    /// the bootstrap authorizes again: three full authorizations of five
+    /// API calls each, no cache, no budget. An API 429 part way wastes the
+    /// calls already made.
+    Legacy,
+    /// Round 4 (`step::authz`): one keyring authorization (data found
+    /// without waiting needs no recheck) and one bootstrap authorization,
+    /// both through the seat's `AuthCache` (TokenReview reused for
+    /// `REVIEW_TTL`, DaemonSet and ServiceAccount for `BINDINGS_TTL`; Pod
+    /// and Node always read) and its adaptive `ApiBudget`.
+    Cached,
 }
 
 impl Default for Settings {
@@ -150,6 +174,20 @@ impl Default for Settings {
             check_ns: 10 * SECONDS,
             converge_ns: 180 * SECONDS,
             image_bytes_per_member: 128,
+            auth: AuthModel::Cached,
+            auth_qps: limits::AUTH_API_QPS,
+            auth_burst: limits::AUTH_API_BURST,
+        }
+    }
+}
+
+impl Settings {
+    /// Authorizations per enrollment and the most API calls they make.
+    fn enrollment_calls(&self) -> (u8, u64) {
+        match self.auth {
+            AuthModel::Legacy => (3, 15),
+            // Cold seat: 5 for the first, 2 for the second.
+            AuthModel::Cached => (2, 7),
         }
     }
 }
@@ -189,6 +227,15 @@ impl Settings {
                 "check_ns" => self.check_ns = u()?.max(MILLIS),
                 "converge_ns" => self.converge_ns = u()?,
                 "image_bytes_per_member" => self.image_bytes_per_member = u()?,
+                "auth" => {
+                    self.auth = match v.as_str() {
+                        Some("legacy") => AuthModel::Legacy,
+                        Some("cached") => AuthModel::Cached,
+                        _ => return Err(format!("control.{k}: expected \"legacy\" or \"cached\"")),
+                    }
+                }
+                "auth_qps" => self.auth_qps = f()?,
+                "auth_burst" => self.auth_burst = f()?,
                 _ => return Err(format!("unknown control key {k:?}")),
             }
         }
@@ -281,12 +328,22 @@ enum State {
 }
 
 const NO_SEAT: u8 = u8::MAX;
-const API_CALLS_PER_ENROLLMENT: u64 = 5;
 
 struct Seat {
     admission: SeatAdmission,
     served: Option<u64>,
     waiters: Vec<(u32, u32)>,
+    /// The holder process's authorization cache and API budget; a new
+    /// holder starts with fresh ones.
+    auth: AuthCache,
+    budget: ApiBudget,
+}
+
+/// Token cache key of client `c` (production hashes the token).
+fn client_key(c: u32) -> TokenKey {
+    let mut k = [0u8; 32];
+    k[..4].copy_from_slice(&c.to_le_bytes());
+    k
 }
 
 /// A Pod lifecycle change, for a co-stepped data plane.
@@ -336,6 +393,8 @@ pub struct ControlSim {
     epoch: Vec<u32>,
     seat: Vec<u8>,
     attempts: Vec<u8>,
+    /// Authorizations of the current enrollment already granted.
+    authorized: Vec<u8>,
     applied_seq: Vec<u64>,
     applied_mv: Vec<u64>,
     /// Fingerprint of the content hash each client holds (0: none).
@@ -359,6 +418,8 @@ pub struct ControlSim {
     cp_api: (u64, u64),
     qps_second: u64,
     qps_count: u64,
+    /// Monotonic origin of the simulated clock for `step::authz`.
+    base: Instant,
     enrolled: u32,
     live_clients: u32,
     record: bool,
@@ -408,13 +469,17 @@ impl ControlSim {
                     admission: SeatAdmission::default(),
                     served: None,
                     waiters: Vec::new(),
+                    auth: AuthCache::default(),
+                    budget: ApiBudget::new(settings.auth_qps, settings.auth_burst),
                 })
                 .collect(),
             state: Vec::new(),
             epoch: Vec::new(),
             seat: Vec::new(),
             attempts: Vec::new(),
+            authorized: Vec::new(),
             applied_seq: Vec::new(),
+            base: Instant::now(),
             applied_mv: Vec::new(),
             held: Vec::new(),
             partitioned: Vec::new(),
@@ -466,6 +531,7 @@ impl ControlSim {
         self.epoch.push(0);
         self.seat.push(NO_SEAT);
         self.attempts.push(0);
+        self.authorized.push(0);
         self.applied_seq.push(0);
         self.applied_mv.push(0);
         self.held.push(0);
@@ -694,6 +760,12 @@ impl ControlSim {
                     // Seat lost or new holder: connections drop, clients
                     // reconnect (possibly to another seat). Polls queued
                     // for a write slot drop too.
+                    if served.is_none() || previous.is_none() {
+                        // A new holder process: cold cache, full budget.
+                        self.seats[i].auth = AuthCache::default();
+                        self.seats[i].budget =
+                            ApiBudget::new(self.settings.auth_qps, self.settings.auth_burst);
+                    }
                     let queued = self.seats[i].admission.writes.take_waiting();
                     let waiters = waiters
                         .into_iter()
@@ -743,6 +815,7 @@ impl ControlSim {
                 self.state[c as usize] = State::Polling;
                 self.seat[c as usize] = s;
                 self.attempts[c as usize] = 0;
+                self.authorized[c as usize] = 0;
                 self.enrolled += 1;
                 self.metrics.incr("ctl_enrollments");
                 self.metrics
@@ -819,42 +892,107 @@ impl ControlSim {
             self.engine.after(d, Ev::Enroll(c, e));
             return;
         }
-        // auth.rs `authorize`: TokenReview, then Pod, DaemonSet,
-        // ServiceAccount, and Node reads.
         let mut latency = self.settings.handshake_ns;
+        let (needed, _) = self.settings.enrollment_calls();
+        while self.authorized[c as usize] < needed {
+            match self.authorize(c, s, now, &mut latency) {
+                Ok(()) => self.authorized[c as usize] += 1,
+                Err(()) => {
+                    self.seats[s as usize].admission.bootstraps.put();
+                    let d = self.backoff(c);
+                    self.engine.after(d, Ev::Enroll(c, e));
+                    return;
+                }
+            }
+        }
+        self.engine.after(latency, Ev::Enrolled(c, e, s));
+    }
+
+    /// One bearer authorization of client `c` on seat `s` (`auth.rs`
+    /// `authorize`): TokenReview, Pod, DaemonSet and ServiceAccount, Node,
+    /// in that order, through the seat's cache and budget under
+    /// [`AuthModel::Cached`]. Adds the API latency to `latency`. Fails on
+    /// a local budget refusal or an API 429.
+    fn authorize(&mut self, c: u32, s: u8, now: Nanos, latency: &mut Nanos) -> Result<(), ()> {
+        let cached = self.settings.auth == AuthModel::Cached;
+        let key = client_key(c);
+        let base = self.base;
+        let at = |ns: Nanos| base + Duration::from_nanos(ns);
+        let seat = s as usize;
+        let mut reserved = 0;
+        if cached {
+            let t = at(now + *latency);
+            reserved = self.seats[seat].auth.calls(&key, t);
+            if !self.seats[seat].budget.try_reserve(reserved, t) {
+                self.metrics.incr("ctl_auth_overloaded");
+                return Err(());
+            }
+        }
         let pod = pod_path(c);
         let node = node_path(c);
         let ds = daemonset_path();
         let sa = service_account_path();
-        let calls: [(&str, &str, &[u8], &'static str); API_CALLS_PER_ENROLLMENT as usize] = [
-            ("POST", TOKEN_REVIEWS, b"{}", "ctl_api_tokenreviews"),
-            ("GET", &pod, b"", "ctl_api_gets"),
-            ("GET", &ds, b"", "ctl_api_gets"),
-            ("GET", &sa, b"", "ctl_api_gets"),
-            ("GET", &node, b"", "ctl_api_gets"),
-        ];
+        // (method, path, metric); None marks a cache check.
+        let review_cached = cached && {
+            let t = at(now + *latency);
+            self.seats[seat].auth.review(&key, t).is_some()
+        };
+        let mut calls: Vec<(&str, &str, &[u8], &'static str)> = Vec::with_capacity(5);
+        if !review_cached {
+            calls.push(("POST", TOKEN_REVIEWS, b"{}", "ctl_api_tokenreviews"));
+        }
+        calls.push(("GET", &pod, b"", "ctl_api_gets"));
+        let bindings_index = calls.len();
+        calls.push(("GET", &ds, b"", "ctl_api_gets"));
+        calls.push(("GET", &sa, b"", "ctl_api_gets"));
+        calls.push(("GET", &node, b"", "ctl_api_gets"));
+        let mut issued = 0u32;
         let mut throttled = false;
-        let mut issued = 0;
-        for (method, path, body, counter) in calls {
-            let (status, _, l) = self.api.handle(method, path, body, now + latency);
+        let mut i = 0;
+        while i < calls.len() {
+            if i == bindings_index && cached {
+                let t = at(now + *latency);
+                if self.seats[seat].auth.bindings(t).is_some() {
+                    i += 2;
+                    continue;
+                }
+            }
+            let (method, path, body, counter) = calls[i];
+            let (status, _, l) = self.api.handle(method, path, body, now + *latency);
             issued += 1;
             if status == 429 {
                 throttled = true;
                 break;
             }
             self.metrics.incr(counter);
-            latency += l;
+            *latency += l;
+            if cached {
+                let t = at(now + *latency);
+                if method == "POST" {
+                    self.seats[seat].auth.put_review(
+                        key,
+                        Reviewed::default(),
+                        Duration::from_secs(3600),
+                        t,
+                    );
+                } else if i == bindings_index + 1 {
+                    self.seats[seat].auth.put_bindings(Bindings::default(), t);
+                }
+            }
+            i += 1;
         }
-        debug_assert!(issued <= API_CALLS_PER_ENROLLMENT);
-        self.count_api(now, issued);
+        self.count_api(now, u64::from(issued));
         if throttled {
             self.metrics.incr("ctl_api_429");
-            self.seats[s as usize].admission.bootstraps.put();
-            let d = self.backoff(c);
-            self.engine.after(d, Ev::Enroll(c, e));
-            return;
+            if cached {
+                let t = at(now + *latency);
+                let b = &mut self.seats[seat].budget;
+                b.throttled(t);
+                b.refund(reserved.saturating_sub(issued));
+            }
+            return Err(());
         }
-        self.engine.after(latency, Ev::Enrolled(c, e, s));
+        Ok(())
     }
 
     fn poll(&mut self, c: u32, e: u32, now: Nanos) {
@@ -1189,6 +1327,7 @@ impl ControlSim {
         self.epoch[c] += 1;
         self.seat[c] = NO_SEAT;
         self.attempts[c] = 0;
+        self.authorized[c] = 0;
         // A restarted process starts with no applied snapshot.
         if self.record && self.applied_mv[c] != 0 {
             self.changes.applied.push((p, 0));
@@ -1249,17 +1388,17 @@ impl ControlSim {
     /// calls (an enrollment storm heals only when the limit lets everyone
     /// through). Healed faults use `converge_ns` alone.
     pub fn bound(&self) -> Nanos {
-        let calls = f64::from(self.settings.pods) * API_CALLS_PER_ENROLLMENT as f64;
+        let calls = f64::from(self.settings.pods) * self.settings.enrollment_calls().1 as f64;
         self.settings.converge_ns + (calls / self.settings.api_qps * 1e9) as Nanos
     }
 
     pub fn memory(&self) -> Vec<(&'static str, usize)> {
         let n = self.state.capacity();
-        let clients = n * (1 + 4 + 1 + 1 + 8 + 8 + 1 + 1 + 8);
+        let clients = n * (1 + 4 + 1 + 1 + 1 + 8 + 8 + 1 + 1 + 8);
         let seats: usize = self
             .seats
             .iter()
-            .map(|s| s.waiters.capacity() * 8 + s.admission.polls().0 * 16)
+            .map(|s| s.waiters.capacity() * 8 + s.admission.polls().0 * 16 + s.auth.len() * 200)
             .sum();
         vec![
             ("ctl_model", self.cp.approximate_bytes()),
@@ -1522,6 +1661,80 @@ mod tests {
             r["metrics"]["counters"]
         );
         assert_eq!(r["control"]["enrolled"], 200);
+    }
+
+    /// Known issue 11 (control-plane half): with the legacy authorization
+    /// model an enrollment storm makes three full authorizations per
+    /// client and the API server sheds them with 429s part way through.
+    /// The cached model (`step::authz`) makes at most two, reuses the
+    /// TokenReview and binding reads, and its adaptive budget keeps the
+    /// seats' sum near the API rate, so 429s drop by an order of magnitude
+    /// and everyone enrolls sooner.
+    #[test]
+    fn cached_authorization_cuts_api_calls_and_429s() {
+        let storm = |auth: &str| {
+            let overrides = json!({"api_qps": 300.0, "api_burst": 300.0, "auth": auth});
+            let r = run(
+                "enrollment-storm",
+                3000,
+                1,
+                Some(400 * SECONDS),
+                Some(&overrides),
+            )
+            .unwrap();
+            assert_clean(&r);
+            assert_eq!(r["control"]["enrolled"], 3000, "{auth}");
+            r
+        };
+        let legacy = storm("legacy");
+        let cached = storm("cached");
+        let c = |r: &Value| r["metrics"]["counters"].clone();
+        let calls = |r: &Value| counter(r, "ctl_api_tokenreviews") + counter(r, "ctl_api_gets");
+        // Successful calls per enrollment: 15 before, at most 7 after.
+        assert!(calls(&legacy) >= 15 * 3000, "{}", c(&legacy));
+        assert!(calls(&cached) <= 7 * 3000, "{}", c(&cached));
+        assert!(counter(&legacy, "ctl_api_tokenreviews") >= 3 * 3000);
+        assert!(counter(&cached, "ctl_api_tokenreviews") < 2 * 3000);
+        assert!(
+            counter(&cached, "ctl_api_429") * 10 < counter(&legacy, "ctl_api_429"),
+            "legacy {} cached {}",
+            c(&legacy),
+            c(&cached)
+        );
+        assert!(
+            counter(&cached, "ctl_all_enrolled_ns") < counter(&legacy, "ctl_all_enrolled_ns"),
+            "legacy {} cached {}",
+            c(&legacy),
+            c(&cached)
+        );
+    }
+
+    /// The budget refuses locally, before any API call, when the seat is
+    /// out of authorization budget; clients back off and still enroll.
+    #[test]
+    fn auth_budget_sheds_locally_and_everyone_enrolls() {
+        let overrides = json!({"auth_qps": 20.0, "auth_burst": 10.0});
+        let r = run(
+            "enrollment-storm",
+            500,
+            1,
+            Some(300 * SECONDS),
+            Some(&overrides),
+        )
+        .unwrap();
+        assert_clean(&r);
+        assert_eq!(r["control"]["enrolled"], 500);
+        assert!(
+            counter(&r, "ctl_auth_overloaded") > 0,
+            "{}",
+            r["metrics"]["counters"]
+        );
+        assert_eq!(
+            counter(&r, "ctl_api_429"),
+            0,
+            "{}",
+            r["metrics"]["counters"]
+        );
     }
 
     /// More polls per seat than write slots: woken polls queue and drain in

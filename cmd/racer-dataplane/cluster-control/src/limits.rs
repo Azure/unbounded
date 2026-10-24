@@ -114,10 +114,13 @@ pub const MAX_BOOTSTRAPS: usize = 32;
 /// grows back, so 16 seats settle near what the API server admits rather
 /// than at 16 times this. An authorization beyond it answers `Overloaded`
 /// before making any call, rather than starting calls the API server would
-/// answer 429.
-pub const AUTH_API_QPS: f64 = 100.0;
+/// answer 429. The ceiling is high so a cluster with only 3 seats is not
+/// held below what its API server admits; the 429 feedback, not this
+/// number, is what sizes the rate in a storm.
+pub const AUTH_API_QPS: f64 = 400.0;
 
-/// Burst of [`AUTH_API_QPS`]: one second of calls.
+/// Burst of [`AUTH_API_QPS`]: a quarter second of calls, so 16 seats
+/// starting together send at most 1,600 calls before the first 429 cuts.
 pub const AUTH_API_BURST: f64 = 100.0;
 
 /// Maximum concurrent responses with a body (publications, keyrings,
