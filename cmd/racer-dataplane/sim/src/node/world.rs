@@ -63,7 +63,7 @@ use super::ids::Ids;
 use super::membership::{Members, Versions, position};
 use super::state::{Components, Disk, Node, Shared, record_bytes};
 use crate::config::Config;
-use crate::engine::{Engine, MILLIS, Nanos, Role, Streams, mix};
+use crate::engine::{Engine, MILLIS, Nanos, Role, SECONDS, Streams, mix};
 use crate::faults::{Fault as SimFault, Partitions, origin_errors_at};
 use crate::report::{Invariants, Metrics, peak_rss_bytes};
 use crate::resources::{Fabric, Origin, OriginOutcome};
@@ -472,6 +472,8 @@ pub struct NodeWorld {
     writes: HashMap<u64, SimCharge, Fixed>,
     origin_per_page: HashMap<u64, u32, Fixed>,
     tasks: HashMap<u64, Task, Fixed>,
+    /// When each currently down node went down (Known issue 7 evidence).
+    down_since: HashMap<u32, Nanos, Fixed>,
     /// Task ids woken since the last drain (see [`TaskWaker`]).
     woken: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
     publish_scheduled: bool,
@@ -575,6 +577,7 @@ impl NodeWorld {
             writes: HashMap::default(),
             origin_per_page: HashMap::default(),
             tasks: HashMap::default(),
+            down_since: HashMap::default(),
             woken: std::sync::Arc::default(),
             publish_scheduled: false,
             profile: Profile::default(),
@@ -763,6 +766,7 @@ impl NodeWorld {
             Event::Restart { node } => {
                 if self.valid(node) && self.nodes[node as usize].down {
                     self.nodes[node as usize].down = false;
+                    self.down_since.remove(&node);
                     self.fabric.reset_node(node, self.now());
                     self.metrics.incr("restarts");
                 }
@@ -821,6 +825,7 @@ impl NodeWorld {
         let n = &mut self.nodes[node as usize];
         n.restart(&node_config, &self.shared, self.config.disk_pages, now);
         n.down = true;
+        self.down_since.insert(node, self.now());
     }
 
     /// Adopt the newest membership version visible to `node` now, running
@@ -2351,6 +2356,12 @@ impl NodeWorld {
             self.engine.at(arrive, Event::Hop { msg: mid });
         } else {
             self.metrics.incr("link_failures");
+            if let Some(since) = self.down_since.get(&next) {
+                // A peer chose a crashed member: how long after the crash.
+                self.metrics.incr("dead_member_links");
+                self.metrics
+                    .observe("dead_member_link_age_s", (now - since) / SECONDS);
+            }
             let _ = n.links.failure(&next, instant, link_backoff);
             if !n.suspects.contains(&next) && n.suspects.len() < topology::MAX_DEGREE {
                 n.suspects.push(next);
