@@ -175,13 +175,18 @@ impl Fabric {
             for hop in route.windows(2) {
                 let (a, b) = (hop[0], hop[1]);
                 let wire = service_ns(chunk, self.nic_bps);
-                let service = self.scale(a, wire).max(self.scale(b, wire));
-                let start = ready
-                    .max(self.tx_free[a as usize])
-                    .max(self.rx_free[b as usize]);
-                let end = start + service;
-                self.tx_free[a as usize] = end;
-                self.rx_free[b as usize] = end;
+                let (send, receive) = (self.scale(a, wire), self.scale(b, wire));
+                let start = ready.max(self.tx_free[a as usize]);
+                // The receiver is a work-conserving backlog of its own
+                // service time from the transfer's issue, not a slot at the
+                // chunk's (possibly far future) send time: a slow sender
+                // trickles its chunks without holding the receiver's NIC for
+                // other senders. With equal-speed senders this matches a
+                // FIFO slot reservation.
+                let received = self.rx_free[b as usize].max(now) + receive;
+                let end = (start + send).max(received);
+                self.tx_free[a as usize] = start + send;
+                self.rx_free[b as usize] = received;
                 ready = end + self.latency(a, b);
             }
             done = done.max(ready);
@@ -436,6 +441,17 @@ mod tests {
         assert_eq!(f.cpu(0, 0, 0, 100), 1100);
         assert!(f.disk_read(0, 1, 4096) > f.disk_latency);
         assert!(f.crypto(0, 1, 10) == 40);
+    }
+
+    /// A slow sender takes longer, but holds the receiver's NIC only for the
+    /// receiver's own service time, so a fast sender is not queued behind it.
+    #[test]
+    fn slow_sender_does_not_hold_the_receiver() {
+        let mut f = fabric(3, 1);
+        f.slow[0] = 100;
+        let slow = f.transfer(0, &[0, 2], 1 << 20);
+        let fast = f.transfer(0, &[1, 2], 1 << 20);
+        assert!(fast * 10 < slow, "fast {fast} slow {slow}");
     }
 
     #[test]
