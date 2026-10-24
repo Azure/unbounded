@@ -71,6 +71,9 @@ pub struct Versions {
     /// (0 before its first snapshot). `None` in standalone mode, where
     /// adoption follows the synthetic per-node lag.
     external: Option<Vec<u64>>,
+    /// Combined mode: members of the latest version whose client has
+    /// applied nothing, so they refuse peer links (Known issue 51).
+    unready: u32,
 }
 
 impl Versions {
@@ -90,6 +93,7 @@ impl Versions {
             lag,
             retained,
             external: None,
+            unready: 0,
         }
     }
 
@@ -104,6 +108,7 @@ impl Versions {
             lag: 0,
             retained,
             external: Some(vec![0; nodes as usize]),
+            unready: 0,
         }
     }
 
@@ -125,6 +130,7 @@ impl Versions {
         for n in &members {
             self.live[*n as usize] = true;
         }
+        self.unready = members.iter().filter(|n| !self.enrolled(**n)).count() as u32;
         let list: Vec<SimMember> = members.into_iter().map(SimMember::new).collect();
         let next = match self.history.back() {
             Some(prev) => Members::new_with_predecessor(list, &prev.members),
@@ -145,13 +151,27 @@ impl Versions {
         if number != 0 && self.get(number).is_none() {
             return;
         }
+        let live = self.is_live(node);
         if let Some(slot) = self
             .external
             .as_mut()
             .and_then(|e| e.get_mut(node as usize))
         {
+            if live && (*slot == 0) != (number == 0) {
+                if number == 0 {
+                    self.unready += 1;
+                } else {
+                    self.unready -= 1;
+                }
+            }
             *slot = number;
         }
+    }
+
+    /// Combined mode: members of the latest version that cannot serve yet
+    /// (their client has applied nothing: enrolling, or restarted).
+    pub fn unready_members(&self) -> u32 {
+        self.unready
     }
 
     /// Combined mode: drop versions no live node can resolve any more (older

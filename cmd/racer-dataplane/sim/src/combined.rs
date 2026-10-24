@@ -505,6 +505,57 @@ mod tests {
         );
     }
 
+    /// Known issues 51 and 72: members join only once they serve, so no
+    /// peer link fails toward a member that has not applied a membership,
+    /// and no read fails while one is listed. With the pre-round-4
+    /// reporting (`report_at_start`) both happen.
+    #[test]
+    fn cold_start_members_serve_before_they_are_routable() {
+        let run_with = |report_at_start: bool| {
+            let mut config = Config {
+                nodes: 300,
+                ..Config::default()
+            };
+            data_defaults(&mut config);
+            config.request_rate = 0.05;
+            run(
+                "full-cold-start",
+                config,
+                1,
+                Some(120 * SECONDS),
+                Some(&json!({ "report_at_start": report_at_start })),
+            )
+            .unwrap()
+        };
+        let before = run_with(true);
+        assert_clean(&before);
+        assert!(
+            counter(&before, "unready_member_links") > 0,
+            "{}",
+            before["metrics"]["counters"]
+        );
+        let after = run_with(false);
+        assert_clean(&after);
+        assert_eq!(after["combined"]["control"]["enrolled"], 300);
+        assert_eq!(
+            counter(&after, "unready_member_links"),
+            0,
+            "{}",
+            after["metrics"]["counters"]
+        );
+        assert_eq!(counter(&after, "reads_failed_while_members_unready"), 0);
+        assert!(counter(&after, "reads_completed") > 0);
+        assert_eq!(ctl_counter(&after, "ctl_reports"), 300);
+        // Joins are batched: at most one version per hold, plus the empty
+        // bootstrap version and the first join.
+        let versions = ctl_counter(&after, "ctl_membership_versions");
+        let window = ctl_counter(&after, "ctl_all_enrolled_ns") / SECONDS;
+        assert!(
+            versions <= 3 + window / racer_cluster_control::step::primary::JOIN_HOLD_SECS,
+            "{versions} versions in {window} s"
+        );
+    }
+
     #[test]
     fn churn_grows_the_data_plane() {
         let r = quick("full-churn", 320, 400, 1, 0.1);

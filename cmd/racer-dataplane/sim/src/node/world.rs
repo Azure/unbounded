@@ -923,7 +923,11 @@ impl NodeWorld {
             self.metrics.incr("reads_skipped_not_enrolled");
             return;
         }
-        if !self.versions.is_live(node) {
+        // Not listed in the membership it holds: production `/readyz` is
+        // false (`WorkerApplication::membership_usable`) and a read could
+        // not route. A new node is listed only after it serves (Known
+        // issue 51), a little after it applied its first membership.
+        if position(&self.versions.adopted(node, now).members, node).is_none() {
             self.metrics.incr("reads_skipped_not_member");
             return;
         }
@@ -1295,6 +1299,11 @@ impl NodeWorld {
                                 .observe("read_failed_at_s", self.now() / SECONDS);
                             if !self.down_since.is_empty() {
                                 self.metrics.incr("reads_failed_while_crashed");
+                            }
+                            if self.versions.unready_members() > 0 {
+                                // Known issue 72: reads failing while some
+                                // member cannot serve yet.
+                                self.metrics.incr("reads_failed_while_members_unready");
                             }
                             self.range_slot_done(r, false);
                         }
@@ -2448,6 +2457,9 @@ impl NodeWorld {
         let up = !self.nodes[next as usize].down
             && self.versions.enrolled(next)
             && !self.partitions.blocked(now, site(holder), site(next));
+        let target = &self.nodes[next as usize];
+        let unready =
+            (!target.down && !self.versions.enrolled(next)).then_some(target.incarnation > 0);
         let n = &mut self.nodes[holder as usize];
         if up {
             n.links.success(&next);
@@ -2462,6 +2474,14 @@ impl NodeWorld {
             self.metrics.incr("link_failures");
             if self.partitions.blocked(now, site(holder), site(next)) {
                 self.metrics.incr("partition_link_failures");
+            }
+            if let Some(restarted) = unready {
+                // A member that has not applied a membership yet: no peer
+                // listener (Known issue 51).
+                self.metrics.incr("unready_member_links");
+                if restarted {
+                    self.metrics.incr("unready_member_links_restarted");
+                }
             }
             if let Some(since) = self.down_since.get(&next) {
                 // A peer chose a crashed member: how long after the crash.

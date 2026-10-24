@@ -138,6 +138,11 @@ pub struct Settings {
     /// for [`AuthModel::Cached`].
     pub auth_qps: f64,
     pub auth_burst: f64,
+    /// Pods report from creation, before enrolling (the pre-round-4
+    /// dataplane), so they join the membership before they can serve.
+    /// False (the default) reports when the client first applies a
+    /// publication, which is when production opens its peer listener.
+    pub report_at_start: bool,
 }
 
 /// How seats authorize an enrolling client's bearer token.
@@ -181,6 +186,7 @@ impl Default for Settings {
             auth: AuthModel::Cached,
             auth_qps: limits::AUTH_API_QPS,
             auth_burst: limits::AUTH_API_BURST,
+            report_at_start: false,
         }
     }
 }
@@ -242,6 +248,11 @@ impl Settings {
                 }
                 "auth_qps" => self.auth_qps = f()?,
                 "auth_burst" => self.auth_burst = f()?,
+                "report_at_start" => {
+                    self.report_at_start = v
+                        .as_bool()
+                        .ok_or_else(|| format!("control.{k}: expected a boolean"))?
+                }
                 _ => return Err(format!("unknown control key {k:?}")),
             }
         }
@@ -444,6 +455,7 @@ impl ControlSim {
                 image_bytes_per_member: settings.image_bytes_per_member,
                 node_monitor_grace: (settings.node_monitor_grace_ns > 0)
                     .then(|| Duration::from_nanos(settings.node_monitor_grace_ns)),
+                report_at_start: settings.report_at_start,
                 ..ModelSettings::default()
             },
             Instant::now(),
@@ -1218,6 +1230,11 @@ impl ControlSim {
             self.changes.applied.push((c, mv));
         }
         self.attempts[c as usize] = 0;
+        if old_seq == 0 && self.cp.report_serving(c) {
+            // First snapshot of this Pod: the dataplane opens its peer
+            // listener, then reports (`Session::mark_serving`).
+            self.metrics.incr("ctl_reports");
+        }
         // Lag from the commit, or from the client's start if it joined
         // (or restarted) after the commit.
         if let Some(t) = self.cp.commit_ns(seq) {

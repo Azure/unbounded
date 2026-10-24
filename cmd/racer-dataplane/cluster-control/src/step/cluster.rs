@@ -280,18 +280,20 @@ impl ControlPlane {
 
     /// The dataplane on `pod` opened its peer listener and patched its
     /// report annotation (one API write). The annotation outlives process
-    /// restarts, like the real one. The primary's Pod watch wakes a pass.
-    /// Returns whether the annotation was new.
+    /// restarts, like the real one. A new annotation wakes a primary pass
+    /// through its Pod watch. Returns whether the annotation was new.
     pub fn report_serving(&mut self, pod: u32) -> bool {
         let Some(p) = self.inventory.pods.get_mut(&uuid(u64::from(pod), 1)) else {
             return false;
         };
+        // Every process start patches once (`control.rs` `reporter`); an
+        // unchanged value is no watch event.
+        self.stats.api_writes += 1;
         if p.annotations.contains_key(annotations::REPORT) {
             return false;
         }
         p.annotations
             .insert(annotations::REPORT.to_owned(), REPORT.to_owned());
-        self.stats.api_writes += 1;
         self.stats.watch_events += 1;
         if let Some(primary) = self.primary_pod()
             && !self.wake_pending
