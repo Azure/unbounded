@@ -229,7 +229,7 @@ pub fn data_schedules(scenario: &str, config: &mut Config) {
 /// throughput is `REPLICAS * nic_bps` (Known issue 11). With 16 pages on
 /// distinct owners the storm needs `nodes * page_bytes / (REPLICAS *
 /// nic_bps)` seconds of owner egress: about 14 s at 50,000 nodes and 10 Gbit/s.
-/// Overflow fan-out (Known issue 71) lets page helpers serve readers too, so
+/// Overflow fan-out (Known issue 16) lets page helpers serve readers too, so
 /// the one-second storm no longer overloads the system; it stays available
 /// through `storms` in `--config`, and this window keeps the default run
 /// comparable with earlier rounds.

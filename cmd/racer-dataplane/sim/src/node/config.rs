@@ -65,7 +65,7 @@ pub struct NodeConfig {
     /// one `DUPLICATE_BYTES`).
     pub hedge_bytes: u64,
     /// Overflow fan-out to page helpers (production: always on; set 0 to
-    /// measure without it, Known issue 71).
+    /// measure without it, Known issue 16).
     pub fanout: bool,
 }
 

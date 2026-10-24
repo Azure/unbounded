@@ -387,7 +387,7 @@ fn overloaded_hot_page_owners_do_not_stream_to_abandoned_requesters() {
     );
 }
 
-/// Known issue 71 (round 4 fanout). One warm page read by 512 nodes within
+/// Known issue 16 (round 4 fanout). One warm page read by 512 nodes within
 /// a millisecond over 32 MiB/s NICs: in a 2 s attempt the page's 3 owners can
 /// send about 192 copies, so without fan-out readers queue on the owners
 /// until their attempts time out and some reads fail. With fan-out, owners

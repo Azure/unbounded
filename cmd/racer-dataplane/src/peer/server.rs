@@ -379,7 +379,7 @@ impl PeerServer {
     /// Whether to answer a page request with `Overloaded` because this node
     /// owns the page and is already writing `HOT_PAGE_BODIES` bodies of it to
     /// other requesters, at least half of all the bodies it is writing (Known
-    /// issue 71). The requester then asks one of the
+    /// issue 16). The requester then asks one of the
     /// page's helpers, which, like the page's owners, is never shed. The
     /// ranking is only computed for a page that is already hot, and stays in
     /// this server's placement cache.

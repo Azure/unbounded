@@ -371,6 +371,10 @@ Verified against the code at the start of this work.
    rejections), against 0 and 11 on the handoff branch. The capacity branch alone fails 23,040
    `storm` reads (787,758 rejections), so the merge did not cause it; handoff's fixes reduce it.
    Same family as issue 16 (fanout track). No invariant is relaxed.
+   After the fanout merge (wave 2, seed 1, 5k): `storm` fails 461 reads with 14,756 relay
+   rejections, so relays no longer dominate there; `zipf` still fails 3,430 reads `Unavailable`
+   with 309,552 relay rejections (inference: its traffic is spread over many warm pages, below the
+   hot-page shed threshold), so the issue stays open for `zipf`.
 
 ## Simulator engine (racer-sim substrate)
 
@@ -817,8 +821,8 @@ scenarios carry data-plane faults.
    most `REPLICAS` owners plus `fanout_width` helpers (round 4, fanout, 751b85b1e..f887fe173).
 17. Background reads during enrollment fail `Unavailable` near unenrolled members (round 4,
    capacity).
-18. Hot-page `storm` and `zipf` at 5k shed on the `Relay` quota since the relay hold (round 4,
-   combined wave 1).
+18. `zipf` at 5k sheds on the `Relay` quota since the relay hold (3,430 failed, 309,552 relay
+   rejections after fanout); `storm` is down to 461 failed (round 4, combined waves 1 and 2).
 
 ## Round 2: production admission
 
@@ -2010,11 +2014,10 @@ Against each track's own numbers:
 - Known issue 15 was rechecked with handoff's bound: no repeat is `after_owner_move` in
   `full-failover` at either scale, but 50k `copy_held` is 10.5% of origin requests; it stays open.
 
-
 ## Round 4: fanout
 
-Scope: Known issue 16 (fanout track number 71) (hot-page throughput capped by the page's `REPLICAS` owners). Measurements
-include the round 4 capacity track's simulator commits 98a025f91 and 35ae1eb21 (cherry-picked here
+Scope: Known issue 16 (track number 71; hot-page throughput capped by the page's `REPLICAS`
+owners). Measurements include the round 4 capacity track's simulator commits 98a025f91 and 35ae1eb21 (cherry-picked here
 as 522e1acc6 and 06bd58800 before this track's work), so "before" is the base plus those two.
 
 ### Does production already fan out?

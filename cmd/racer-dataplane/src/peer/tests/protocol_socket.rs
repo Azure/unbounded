@@ -1807,7 +1807,7 @@ mod established_sessions {
     }
 }
 
-/// Known issue 71: an owner already writing `HOT_PAGE_BODIES` bodies of a page,
+/// Known issue 16: an owner already writing `HOT_PAGE_BODIES` bodies of a page,
 /// at least half of all bodies it writes, answers a signed `Overloaded` to a
 /// requester that is neither an owner nor a helper of the page, without
 /// calling the page service; below either threshold, for a page it does not

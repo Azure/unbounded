@@ -1,4 +1,4 @@
-//! Overflow fan-out for hot pages (Known issue 71).
+//! Overflow fan-out for hot pages (Known issue 16).
 //!
 //! Only a page's ranked owners (at most `REPLICAS`) are candidates, so a page
 //! that every node reads at once can be sent no faster than `REPLICAS` NICs
