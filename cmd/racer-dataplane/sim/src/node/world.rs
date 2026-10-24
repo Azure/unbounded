@@ -1251,6 +1251,12 @@ impl NodeWorld {
                         } else {
                             self.metrics.incr("reads_failed");
                             self.metrics.incr(err_name(e));
+                            // When reads fail, to attribute them to faults.
+                            self.metrics
+                                .observe("read_failed_at_s", self.now() / SECONDS);
+                            if !self.down_since.is_empty() {
+                                self.metrics.incr("reads_failed_while_crashed");
+                            }
                             self.range_slot_done(r, false);
                         }
                     }
@@ -2356,6 +2362,9 @@ impl NodeWorld {
             self.engine.at(arrive, Event::Hop { msg: mid });
         } else {
             self.metrics.incr("link_failures");
+            if self.partitions.blocked(now, site(holder), site(next)) {
+                self.metrics.incr("partition_link_failures");
+            }
             if let Some(since) = self.down_since.get(&next) {
                 // A peer chose a crashed member: how long after the crash.
                 self.metrics.incr("dead_member_links");
