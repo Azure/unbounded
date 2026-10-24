@@ -233,9 +233,14 @@ Verified against the code at the start of this work.
    (seed 1, 1 s, `request_rate` 2) 99,562 page reads fail this way while relays reject 1.25M
    transfers on the `Relay` quota (16 per worker).
 
-6. Partly resolved (round 3, track origin, 07a932713): an owner asks the page's owners under
-   membership version - 1 copy-only before origin. Pages still reach origin again when the
-   previous owners lack a copy or the walk has no spare credit; see "Round 3: origin".
+6. Resolved (round 4, track handoff, 3a5afb9bc, f174052bb, c720c7ba8): origin requests for a page
+   are at most 1 + (rank 0 changes) + (fetches after the previous fetcher lost the page) +
+   (fetches while it still held it). The last class needs a transient failure, a concurrent cold
+   miss, or an owner without credits or links to delegate; tests keep it under 2% of origin requests
+   in small churn runs (24 of 13,644 in 5k `full-churn`, 1,603 of 58,414 in 50k `full-churn`).
+   50k `full-churn`: 75,267 origin requests to 58,414, max per page 11 to 9. See "Round 4: handoff".
+   Earlier (round 3, track origin, 07a932713): an owner asks the page's owners under
+   membership version - 1 copy-only before origin.
    Original report: Origin requests per page are bounded by `REPLICAS` only within one membership version. When a
    membership change moves a page's ranked owners, the new owners have no copy, and a reader that
    walks the new owners ends in `End::Origin` at the new rank 0 (Known issue 4 applies per
@@ -307,13 +312,20 @@ Verified against the code at the start of this work.
    282 s to 171 s. See "Round 4: enroll" (commits 275f60475..e4737c390). The data-plane half (reads
    failing on the deadline) is the capacity track's.
 
-12. An owner whose predecessor is behind (Known issue 3) now reaches the origin with transient
+12. Resolved (round 4, track handoff, f174052bb): an owner asks a predecessor that held the same
+   rank under the previous membership under that membership, for 10 s after replacing it, so a
+   lagging predecessor serves. Owner stale skips in 5k `churn-r` went from 143 to 3. See "Round 4:
+   handoff". Original report:
+   An owner whose predecessor is behind (Known issue 3) now reaches the origin with transient
    evidence for that predecessor, where it used to fail with `IncompatibleMembership`. This adds
    origin requests during churn: in `churn` at 5,000 nodes (seed 1) the maximum per page rose from 3
    to 4 (mean 1.35 to 1.41); at 50,000 nodes the maximum stays 5 (mean 2.39 to 2.47).
    `only_owner_hits_origin` holds. Same family as Known issue 6.
 
-13. Repeat origin fetches across membership versions have a heavier tail with handoff probes than
+13. Resolved (round 4, track handoff, 3a5afb9bc): handoff targets no longer reserve credits or
+   links that the delegation to rank 0 needs, and an owner with handoff targets forwards spare
+   credits to rank 0. 5k `full-churn` max per page 9 to 5. See "Round 4: handoff". Original report:
+   Repeat origin fetches across membership versions have a heavier tail with handoff probes than
    without in `full-churn` at 50,000 nodes (seed 1, max 13 vs 10 per page), though fewer pages are
    fetched more than once. Owners left with one credit after delegating cannot ask previous owners
    (handoff needs two), and a rank 0 reached through delegation has one credit, so it never asks
@@ -768,6 +780,11 @@ scenarios carry data-plane faults.
    "Round 3: origin" for what remains.
 7. Resolved: members whose Node has not been `Ready` for 30 s leave the membership, bounding how
    long a crashed member is chosen to about 90 s (round 4, liveness, 4332bbcf6, 4e2279844).
+
+6. Resolved: origin requests per page are at most 1 + rank 0 changes + copies lost + a small,
+   tested remainder (round 4, handoff).
+7. Partly resolved: crashed members stay routable until link backoff, but reads near them no
+   longer fail with `HopBudgetExhausted` (round 3, route).
 8. Resolved: core `PageFlights::reject` fails the rejected leader like production (a27f1f7ac).
 9. Resolved: the simulator no longer touches on a duplicate publish (a27f1f7ac).
 10. Resolved: route searches beyond 8 per node queue (up to 64) instead of failing (round 3, route).
@@ -790,6 +807,11 @@ scenarios carry data-plane faults.
    capacity).
 72. Background reads during enrollment fail `Unavailable` near unenrolled members (round 4,
    capacity).
+
+12. Resolved: owners ask an unchanged predecessor under the previous membership, so a lagging one
+   serves (round 4, handoff, f174052bb).
+13. Resolved: handoff targets no longer block or starve the delegation to rank 0 (round 4,
+   handoff, 3a5afb9bc).
 
 ## Round 2: production admission
 
@@ -1313,7 +1335,8 @@ What remains (issue 6 stays open, and new issue 13):
 
 13. Repeat origin fetches across membership versions have a heavier tail with handoff
     probes than without in `full-churn` at 50,000 nodes (max 13 vs 10), though fewer pages are fetched
-    more than once. Root cause not established; see "Round 3: origin". No invariant is relaxed.
+    more than once. Root cause not established; see "Round 3: origin". No invariant is relaxed. Resolved in round 4;
+    see "Round 4: handoff".
 
 ## Round 3: combined
 
@@ -1773,3 +1796,166 @@ Release build, seed 1, `full-cold-start` with default duration. "before" is the 
 - Known issue 71 (new): hot-page throughput is capped by `REPLICAS` owners; the bound above is
   enforced by a test, raising it is a design change.
 - Known issue 72 (new): background reads during enrollment fail `Unavailable`.
+
+## Round 4: handoff
+
+Track handoff closes Known issues 6, 12 and 13. Commits on branch `racer-sim4-handoff`:
+b5da57b53 (`Published::resolve_recent`), 3a5afb9bc (issue 13), f174052bb (issue 12), c720c7ba8
+(repeat classification and simulator tests), plus this section.
+
+### Root causes
+
+The simulator was given a temporary per-fetch trace (not committed) that recorded, for each
+repeated origin request of a page, the fetcher's rank and credits, its handoff targets, the
+previous fetcher, and whether that node still held the page. In 5k `full-churn` (seed 1) 1,106
+of 2,265 repeats came while rank 0 was the same as at the previous fetch, nearly all while the
+previous fetcher still held the page. Most were fetched by an owner above rank 0 that did not get
+rank 0 to fetch. The causes, cited at 48ca50329:
+
+1. Handoff targets blocked the delegation (issue 13). The delegation reserved one credit per
+   remaining probe, handoff targets included (`let left = (self.count - index)`,
+   `core/src/read/walk.rs:282`, used at `:297`). Rank 1 holds 3 credits when a reader funds it
+   (`owner_funding(1)` minus the exchange); with any handoff target it needed 4 or more, so it probed
+   rank 0 copy-only, got a miss, and fetched itself. The copy then sat at rank 1, and the next rank
+   0 fetch missed it.
+2. The delegation route was starved of links (issue 13). Links were split evenly over the remaining
+   probes, again counting handoff targets (`walk.rs:326-331`). Rank 2 typically inherits 5 links and
+   gave the Acquire 2, too few to reach rank 0. With cause 1 fixed, 2,313 of 11,811 delegations in
+   that run failed before reaching rank 0 (`route_unreachable`), and the owner fetched itself.
+   Handoff probes split the same way (`walk.rs:341`): with the delegation fixed, 5,300 of about
+   7,700 handoff probes got one link and failed.
+3. A predecessor that is behind made the owner fetch (issue 12). It answers `StaleMembership`; the
+   requester has nothing newer, so the probe completes as `StaleDestination`
+   (`src/read/candidates.rs:1022-1033`), which is transient evidence (`walk.rs:470`), and the owner
+   reaches origin. In 5k `churn` with the route settings, 138 delegations got this answer; in a
+   120-node churn test 48 owner skips led to 40 repeat fetches while rank 0 held the page.
+
+Rank 0 reached through delegation held one credit (issue 13): the Acquire carried exactly the
+exchange and the origin credit (`walk.rs:321`), and handoff probes need two (`walk.rs:283`).
+
+### Changes
+
+- Handoff probes reserve nothing (`left` counts only later predecessors, `walk.rs:332`).
+- The delegation takes a full route and leaves one link per later predecessor; copy-only
+  predecessors still split evenly; handoff targets take the remaining links in order, so the first
+  (the previous rank 0, most likely to hold the page) gets a usable route (`sharing`, `walk.rs:394`).
+- An owner with handoff targets forwards its spare credits (up to `MAX_HANDOFF`) with the Acquire,
+  so rank 0 can ask previous owners too (`spare`, `walk.rs:384`). Readers do not fund owners more:
+  a trial that added two credits from reader slack added about 50 failed reads in 5k
+  `full-failover`, because credits sent to a crashed owner are lost (issue 7).
+- An owner asks a predecessor that held the same rank under membership version - 1 under that
+  version (`same_rank_previous`, `WalkConfig::previous`, `Probe::previous`). The authority is the
+  same under either version, and a predecessor that has not adopted the current version still
+  resolves the previous one. A `StaleMembership` answer to such a probe is transient evidence and
+  never refreshes the walk (`pending_previous`).
+- That rule applies only for `PREVIOUS_MEMBERSHIP_WITHIN` (10 s) after this node replaced the
+  previous membership. Peers keep a replaced membership for the 30 s grace window
+  (`Snapshot::retention`), but a node may also keep one alive through its own leases, which says
+  nothing about a peer. A first version that used any locally retained previous membership failed
+  `app::tests::dst::dst_native_faults_reach_warmed_peers_in_small_topologies`: 26 s after a change the
+  peer had dropped version - 1 and answered `StaleMembership`. Production checks the window with
+  the new `controlplane::Published::resolve_recent` (`controlplane/src/published.rs:130`), which
+  only returns parts held for grace. `CandidatePolicy::previous_owners`
+  (`src/read/candidates.rs:1159`) resolves the previous membership once for both handoff targets
+  and same-rank predecessors. The simulator measures the window from the version's publication
+  (no later than adoption, so it is stricter) and uses the rule only when nodes retain old versions.
+- No wire change: requests already carry their membership version, and peers already serve any
+  version they retain.
+
+### The bound (issue 6)
+
+`NodeWorld::classify_repeat` (`sim/src/node/world.rs:2923`) classifies each repeated origin request
+for a page against the previous one, and reports list the counts under
+`origin_per_page.repeats`:
+
+- `after_owner_move`: the page's rank 0 under this request's membership differs from rank 0 under
+  the previous request's. Two requests in a row with the same rank 0 never fall here, so this class
+  has at most one request per rank 0 change.
+- `copy_lost`: same rank 0, and the previous fetcher no longer holds the page (evicted or crashed).
+- `copy_held`: same rank 0, and the previous fetcher still holds it. Reaching origin here needs a
+  transient failure (rank 0 unreachable or overloaded, or behind by more than one version), a
+  concurrent cold miss, or an owner without credits or links to delegate.
+
+So origin requests for a page are at most 1 + (rank 0 changes) + `copy_lost` + `copy_held`. With no
+failures, no concurrency and no evictions this is one fetch per page plus one per ownership move.
+Tests enforce it: `repeat_origin_fetches_are_classified_and_bounded` (every repeat is classified,
+and `copy_held` is at most 2% of origin requests under churn), `joined_owners_copy_from_previous_owners`
+(no repeats after a join), and `single_reader_then_storm_reuses_copies` (one request per page).
+
+### Tests
+
+- racer-core: `handoff_targets_do_not_block_delegation`,
+  `delegation_forwards_spare_credits_for_rank_zero_handoff`,
+  `delegation_route_takes_priority_over_later_predecessors`,
+  `handoff_probes_take_remaining_links_in_order`, `same_rank_previous_marks_unchanged_predecessors`,
+  `predecessors_with_unchanged_rank_are_asked_under_the_previous_membership`,
+  `stale_answer_under_the_previous_membership_is_transient_evidence`; the link split in
+  `owner_with_tight_links_partitions_predecessor_routes` changed for the delegation.
+- controlplane: `resolve_recent_returns_only_recently_superseded_grace_parts`.
+- Production: `owner_with_handoff_targets_delegates_with_spare_credits` (3 credits now delegate;
+  before, rank 0 got a copy-only probe) and
+  `owner_asks_unchanged_predecessors_under_the_recent_previous_membership` (version, age, rank
+  change, and stale answer cases).
+- Simulator: `owners_ask_lagging_predecessors_under_the_previous_membership` (owner stale skips 48
+  to 52 before, at most 2 now; `copy_held` 40 to 48 before, at most 8 now; never with no retained
+  versions), `repeat_origin_fetches_are_classified_and_bounded`, and the repeat counts in
+  `joined_owners_copy_from_previous_owners`.
+
+### Evidence
+
+Release build, seed 1, 5,000 nodes, scenario defaults; `churn-r` uses `--duration 1s` and
+`{"objects": 256, "request_rate": 2.0}`; `full-*` use `{"request_rate": 0.005}`. Origin requests
+per page: total, max, pages fetched more than once. Read latency `read_ns` p50 / p99 in ms.
+
+| Scenario | Origin before | Origin after | Reads ok / failed before | after | p50 / p99 before | after |
+| --- | --- | --- | --- | --- | --- | --- |
+| storm | 1,196, 2, 172 | 1,024, 1, 0 | 171,391 / 0 | 163,808 / 0 | 302 / 1342 | 268 / 1342 |
+| churn | 1,220, 3, 191 | 1,028, 2, 4 | 167,231 / 1,479 | 170,015 / 1,495 | 403 / 738 | 336 / 738 |
+| churn-r | 2,835, 4, 256 | 2,613, 4, 37 | 13,811 / 113 | 13,825 / 112 | 50 / 151 | 50 / 151 |
+| zipf | 42,755, 3, 3,935 | 40,722, 3, 1,932 | 147,684 / 11 | 148,922 / 11 | 168 / 1476 | 185 / 1476 |
+| full-churn | 14,784, 9, 1,699 | 13,644, 5, 991 | 34,196 / 76 | 34,194 / 76 | 63 / 168 | 63 / 151 |
+| full-failover | 13,421, 7, 722 | 13,170, 7, 466 | 33,924 / 122 | 33,922 / 125 | 63 / 302 | 63 / 302 |
+
+Repeat classes after (`after_owner_move` / `copy_lost` / `copy_held`): storm 0 / 0 / 0, churn 4 / 0 /
+0, churn-r 13 / 5 / 23, zipf 0 / 1,752 / 203, full-churn 1,046 / 55 / 24, full-failover 0 / 399 /
+264. In `full-failover` no membership changes (crashed members stay, issue 7), so its repeats come
+from crashed rank 0 owners: the page is lost with the node, or rank 0 is unreachable until link
+backoff. The storm's lower `reads_completed` is reads still in flight at the 2 s cutoff; a 6 s run
+completes 473,965 reads after against 472,630 before, with the same p90 and p99.
+
+In `churn-r`, `owner_stale_destination_skips` went from 143 (a trial without the change) to 3, with
+1,784 probes sent under the previous membership. The page fetched 4 times there is fetched after
+ownership moves.
+
+50,000 nodes, `full-churn` (`{"request_rate": 0.005}`). Before is the round 3 combined run on the
+same base (48ca50329).
+
+| | Before | After |
+| --- | --- | --- |
+| Origin requests | 75,267 | 58,414 |
+| Max per page | 11 | 9 |
+| Pages fetched more than once | 20,035 of 45,938 | 9,494 of 46,408 |
+| Repeats (move / lost / held) | not measured | 10,171 / 232 / 1,603 |
+| Reads ok / failed | 329,024 / 4,959 | 334,957 / 1,779 |
+| `read_ns` p50 / p99 (ms) | 63 / 185 | 63 / 201 |
+| Wall, peak RSS | 21:11, 2.54 GiB | 34:47, 2.60 GiB |
+
+No hard invariant failed. Owners sent 2,707 probes under the previous membership and skipped 101
+lagging predecessors. `copy_held` is 2.7% of origin requests at this scale, above the 2% the small
+churn tests enforce; most of the remaining repeats follow ownership moves. The p99 rose by one
+histogram bucket. Wall time is not comparable: four tracks shared the host during this run.
+
+### Deviations and open items
+
+- Issue 13 asked for rank 0 reached through delegation to ask previous owners. It does when the
+  delegating owner has spare credits; readers fund owners as before (see above), so with the
+  default page budget most delegations still carry one origin credit. The tail came from the three
+  causes above, not from this.
+- Handoff probes still only look one version back, and production keeps a replaced membership for
+  30 s. After that, a new rank 0 cannot find the previous holder; those fetches count as
+  `after_owner_move`. Asking current successors before every cold fetch at rank 0 would catch some
+  of them (about 400 in 5k `full-churn`) but adds a probe to every first fetch; not done.
+- `copy_held` in `full-failover` (264) belongs to issue 7 (crashed members stay routable).
+- Workspace tests: `read::range_stream::tests::responses_stream_more_than_three_pages_only_with_client_sized_http_framing`
+  and `alloc` `buffer_tests::mmap_threshold_zero_alignment_and_matching_unmap` each failed once under
+  load and pass alone; neither touches code changed here.
