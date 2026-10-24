@@ -28,8 +28,9 @@ use std::os::fd::OwnedFd;
 use std::rc::Rc;
 use uring_runtime::reactor::descriptor::Descriptor;
 
-/// Pages the dataplane fetches ahead for one direct read. Clients send no
-/// credits, so this window alone bounds the plaintext a direct read pins.
+/// The fewest pages the dataplane fetches ahead for one direct read. Clients
+/// send no credits, so this window, or `range_window_pages` when larger, alone
+/// bounds the pages a direct read pins.
 pub const DIRECT_WINDOW_PAGES: usize = 4;
 
 /// One page handed to a [`DirectSink`].

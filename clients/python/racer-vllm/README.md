@@ -51,6 +51,11 @@ Extra config keys, all optional:
 | `socket` | none | Client socket path. |
 | `use_vmm` | true | Allow exportable `cuMemCreate` staging, needed for `gpu-read`. |
 
+On fast local disks, more reads in flight help only when the dataplane also
+fetches further ahead. Set `concurrency` to 8 together with a larger
+`RACER_RANGE_WINDOW_PAGES` and `RACER_GPU_STAGING_BYTES` on the dataplane. See
+the GPU reads section of the Racer reference.
+
 ## How it loads
 
 1. Find the safetensors files from `model.safetensors.index.json`, or use

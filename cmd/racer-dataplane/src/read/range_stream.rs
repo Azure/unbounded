@@ -44,7 +44,8 @@ use std::task::Waker;
 use std::time::Duration;
 use std::time::Instant;
 
-/// Direct fills a read keeps in flight beyond its head page.
+/// Direct fills a read keeps in flight beyond its head page. A sealed read
+/// fills its whole window directly (see `RangeStream::direct_ahead`).
 const DIRECT_AHEAD: usize = 1;
 
 /// Provider selections a read keeps in flight. Beyond the first, a read only
@@ -614,6 +615,11 @@ impl RangeStreams {
         }
     }
 
+    /// The configured `range_window_pages` of each stream.
+    pub(crate) fn window_pages(&self) -> usize {
+        self.window_pages
+    }
+
     /// Share the same metadata and page owners used by newly opened streams.
     pub(crate) fn directory(&self) -> &Arc<WorkerDirectory> {
         &self.directory
@@ -985,7 +991,7 @@ impl RangeStream {
                 .any(|slot| matches!(slot, Slot::Fetching(_) | Slot::FetchingSealed(_)))
     }
 
-    /// Start a direct fill for the head page, up to `DIRECT_AHEAD` more holes,
+    /// Start a direct fill for the head page, up to `direct_ahead` more holes,
     /// and provider selections for the remaining holes.
     fn admit(&mut self, scope: &RequestScope) -> Result<bool> {
         // A failed page stops admission at and after it until it reaches the
@@ -1024,7 +1030,8 @@ impl RangeStream {
             .map(WindowLease::busy_elsewhere)
             .unwrap_or_default();
         let mut index = 1;
-        while ahead < DIRECT_AHEAD && index < limit {
+        let direct_ahead = self.direct_ahead();
+        while ahead < direct_ahead && index < limit {
             if matches!(self.slots[index], Slot::Missing { .. })
                 && !elsewhere.contains(&self.page_at(index))
             {
@@ -1042,6 +1049,18 @@ impl RangeStream {
             changed = true;
         }
         Ok(changed)
+    }
+
+    /// Direct fills to keep in flight beyond the head page. Provider selections
+    /// deliver verified plaintext, so a sealed read fills its whole window
+    /// directly. Its direct fills stage disk pages with cuFile and keep
+    /// ciphertext for the GPU to decrypt.
+    fn direct_ahead(&self) -> usize {
+        if self.sealed.is_some() {
+            self.window_pages.saturating_sub(1).max(DIRECT_AHEAD)
+        } else {
+            DIRECT_AHEAD
+        }
     }
 
     /// Returns false when the range budget admits no more work for now.
@@ -1735,6 +1754,28 @@ pub(super) mod tests {
                     .into(),
                 }),
             },
+        }
+    }
+
+    #[test]
+    fn sealed_reads_fill_their_whole_window_directly() {
+        for (window, sealed) in [(1, 1), (2, 1), (8, 7)] {
+            let f = Fixture::new(crate::test_support::cluster::config(false).limits, window);
+            let mut metadata = metadata();
+            metadata.length = 16 * PAGE_BYTES;
+            let range = ByteRange::From(0).resolve(metadata.length).unwrap();
+            let scope =
+                RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(60))
+                    .unwrap();
+            let mut stream = f.open(&metadata, range, scope);
+            assert_eq!(stream.direct_ahead(), DIRECT_AHEAD);
+            stream
+                .set_sealed(SealedTarget {
+                    helper: crate::gpu::testing::helper(&[None]),
+                    ordinal: 0,
+                })
+                .unwrap();
+            assert_eq!(stream.direct_ahead(), sealed, "window {window}");
         }
     }
 

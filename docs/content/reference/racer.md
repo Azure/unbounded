@@ -1068,6 +1068,15 @@ other slots hold pages read with cuFile. When all of them are in use, the
 dataplane reads the next page through host memory instead. If the image has no
 GPU decrypt support, the CPU decrypts every page.
 
+A GPU read fetches its whole `RACER_RANGE_WINDOW_PAGES` window directly, with
+cuFile where it can, so a larger window keeps more disk reads in flight. To
+load from fast local disks, raise the window, raise `RACER_GPU_STAGING_BYTES`
+to hold every page in flight, and raise the client's reads in flight. Each IO
+worker's share of `RACER_PLAINTEXT_BYTES` and `RACER_CIPHERTEXT_BYTES` must
+still hold the window plus one page. On one NVMe drive, a window of 8, 1 GiB
+of staging, and 8 loader reads loaded a 7B model in vLLM in 2.34 seconds,
+against 2.44 seconds with the defaults. That is close to the drive's speed.
+
 The dataplane does not request `nvidia.com/gpu`. It is privileged, so it
 already sees `/dev/nvidia*`. It only needs the host driver libraries.
 `RACER_DATAPLANE_NVIDIA` in `racer-config` controls how it asks for them:
