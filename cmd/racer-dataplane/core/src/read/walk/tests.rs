@@ -992,11 +992,11 @@ fn overloaded_owner_sends_the_reader_to_its_helper_once() {
     // The helper probe is funded from what the owner probe left, capped.
     let (_, attempts, links) = probes[1];
     assert!(
-        attempts >= HELPER_FLOOR_ATTEMPTS && attempts <= HELPER_ATTEMPTS,
+        (HELPER_FLOOR_ATTEMPTS..=HELPER_ATTEMPTS).contains(&attempts),
         "{attempts}"
     );
     assert!(
-        links >= HELPER_FLOOR_LINKS && links <= HELPER_LINKS,
+        (HELPER_FLOOR_LINKS..=HELPER_LINKS).contains(&links),
         "{links}"
     );
 }
@@ -1036,7 +1036,7 @@ fn owner_probes_are_planned_exactly_as_without_a_helper() {
 #[test]
 fn helper_never_chains_and_owners_never_use_helpers() {
     // A helper inherits at most HELPER_ATTEMPTS - 1: too few to be eligible.
-    assert!(HELPER_ATTEMPTS < HELPER_MIN_ATTEMPTS);
+    const { assert!(HELPER_ATTEMPTS < HELPER_MIN_ATTEMPTS) };
     let mut walk = CandidateWalk::new(helper_config(VisitOrder::canonical(3)));
     let mut b = budget(HELPER_ATTEMPTS, 8);
     let (probes, _) = drive(&mut walk, &mut b, |_, _| {
@@ -1064,18 +1064,13 @@ fn helper_is_skipped_when_too_little_is_left() {
     let mut walk = CandidateWalk::new(helper_config(order));
     let mut b = budget(HELPER_MIN_ATTEMPTS + 1, 16);
     let mut canon = Vec::new();
-    loop {
-        match walk.next(&mut b).unwrap() {
-            Step::Probe(probe) => {
-                canon.push(probe.canonical);
-                // The exchange forwards every credit of its budget.
-                let _ = walk.request_budget(&mut b).transfer();
-                let outcome = Outcome::Transport(ProbeOutcome::Overloaded);
-                if walk.complete(&mut b, outcome).unwrap().is_some() {
-                    break;
-                }
-            }
-            Step::End(_) => break,
+    while let Step::Probe(probe) = walk.next(&mut b).unwrap() {
+        canon.push(probe.canonical);
+        // The exchange forwards every credit of its budget.
+        let _ = walk.request_budget(&mut b).transfer();
+        let outcome = Outcome::Transport(ProbeOutcome::Overloaded);
+        if walk.complete(&mut b, outcome).unwrap().is_some() {
+            break;
         }
     }
     assert_eq!(canon[0], 2);
