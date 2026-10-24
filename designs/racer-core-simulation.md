@@ -348,7 +348,11 @@ Verified against the code at the start of this work.
    Inference: the holders sit behind the scenario's partitions (19,325 partition link failures).
    See "Round 4: combined (wave 1)".
 
-16. Hot-page peer throughput is capped by the page's `REPLICAS` owners: candidates are only the
+16. Resolved (round 4, fanout, 751b85b1e through f887fe173): owners shed readers of a page that is
+   most of their queue, and a shed reader asks one of the page's helpers; see "Round 4: fanout".
+   Residual bound: a page is sent by at most its `REPLICAS` owners plus `fanout_width(members)`
+   helpers (integer square root, at most 256), and helpers never chain.
+   Original report: hot-page peer throughput is capped by the page's `REPLICAS` owners: candidates are only the
    ranked owners (`src/read/candidates.rs:628-635`), so readers holding a copy never serve other
    readers, and a storm on one page gets at most `REPLICAS * nic_bps / page_bytes` deliveries per
    second. Enforced by
@@ -809,8 +813,8 @@ scenarios carry data-plane faults.
    `full-failover` link failures (round 4, liveness).
 15. Dropping a dead member costs one ownership move (issues 6, 12) (round 4, liveness); after the
    merge no repeat follows an owner move, but 50k `full-failover` `copy_held` is 10.5%.
-16. Hot-page throughput is capped at `REPLICAS` owners' NICs; bound enforced by a test (round 4,
-   capacity).
+16. Resolved: owners shed readers of a dominant hot page to the page's helpers; a page is sent by at
+   most `REPLICAS` owners plus `fanout_width` helpers (round 4, fanout, 751b85b1e..f887fe173).
 17. Background reads during enrollment fail `Unavailable` near unenrolled members (round 4,
    capacity).
 18. Hot-page `storm` and `zipf` at 5k shed on the `Relay` quota since the relay hold (round 4,
@@ -2006,3 +2010,195 @@ Against each track's own numbers:
 - Known issue 15 was rechecked with handoff's bound: no repeat is `after_owner_move` in
   `full-failover` at either scale, but 50k `copy_held` is 10.5% of origin requests; it stays open.
 
+
+## Round 4: fanout
+
+Scope: Known issue 16 (fanout track number 71) (hot-page throughput capped by the page's `REPLICAS` owners). Measurements
+include the round 4 capacity track's simulator commits 98a025f91 and 35ae1eb21 (cherry-picked here
+as 522e1acc6 and 06bd58800 before this track's work), so "before" is the base plus those two.
+
+### Does production already fan out?
+
+No. What exists is node-local or per-owner coalescing, not more senders:
+
+- Candidates are the placement-ranked owners only: `CandidatePolicy::candidates`
+  (`src/read/candidates.rs:628`) ranks at most `REPLICAS` (`topology/src/placement.rs:10`, `:832`).
+- Peer subscriptions (RangeStream `SELECTIONS`) go to the primary of the first demanded page only
+  (`subscribe_provider`, `src/read/candidates.rs:462`) and a grant from any other node is rejected
+  as `Unauthorized` (`:519`). `flow_control::subscriptions::Fanout` (`flow/src/subscriptions.rs:152`)
+  fans one provider completion out to that provider's waiting subscribers, and the RangeStream
+  `Reader` registry (`src/read/range_stream.rs:65`) shares selected pages among windows of one node.
+  Neither adds a sender.
+- `SingleFlightPeers` only remembers providers that refused multi-flight contracts; `Spread` only
+  reorders the same three owners (`core/src/read/candidates.rs`, `visit_order`).
+- A destination does serve `CopyOnly` and `Acquire` page requests without checking that it owns the
+  page (`serve_action`, `core/src/read/serve.rs:36`; `Coordinator::serve_peer`, `src/read.rs:345`,
+  `:402`). So the wire and the serve path already allow any member to act as a source; nothing
+  ever sends a reader to a non-owner.
+
+The simulator models the same rule, so the cap is real and not a modeling artifact.
+
+### Design
+
+All decisions are in `racer_core::read::fanout` (`core/src/read/fanout.rs`) and the candidate walk,
+used by production and the simulator. No wire change: helpers are asked with an ordinary signed
+`Page` `Acquire`, sheds are an ordinary signed `Overloaded`.
+
+1. Helpers. Each page has `fanout_width(members)` helpers (integer square root, at most 256,
+   `fanout.rs:71`): helper `j` is member `fnv(page, j) % members` (FNV-1a with a splitmix finish,
+   stable across processes). A reader picks one by `fnv(reader, page)`, skipping owners and itself,
+   and prefers a helper that is a direct overlay neighbor so the exchange needs no relay
+   (`fanout_helper`, `fanout.rs:135`). Readers of a hot page therefore converge on the same small
+   set, so owners send roughly `sqrt(n)` copies to helpers and each helper roughly `sqrt(n)` to
+   readers.
+2. Shed. An owner already writing `HOT_PAGE_BODIES` (32) bodies of a page, when that page is at
+   least half of all bodies it is writing, answers a signed `Overloaded` to a requester that is
+   neither an owner nor a helper of the page, before reserving a waiter or calling the page service
+   (`shed_hot_page`, `fanout.rs:111`; production `PeerServer::shed_hot_page`,
+   `src/peer/server.rs:386`, called at `:849`; bodies counted from the response head until the
+   body is written or abandoned, `:725`). Helpers and owners are exempt (`is_helper`,
+   `fanout.rs:117`, at most `fanout_width` hashes), and only a page owner sheds, so a helper queues
+   the readers it was chosen for. The ranking is computed only for a page that already has 32 bodies
+   in flight and stays in the server's placement cache.
+3. Walk. `WalkConfig::helper` lets a non-owner page walk ask the helper once, only right after an
+   owner itself shed it (`Outcome::Shed`, an `Overloaded` signed by the destination;
+   `core/src/read/walk.rs:563`). A relay's `Overloaded` or a timeout says the route is congested,
+   not the page, and does not ask the helper. `Shed` is recorded like `Probe(Overloaded)` but does
+   not charge a route failure. The helper probe is an `Acquire` funded from what is left, at most
+   `HELPER_ATTEMPTS` (4) attempts and 8 links, at least 3 and 4 (`helper_probe`, `walk.rs:303`).
+   Owner probes are planned exactly as without a helper
+   (`owner_probes_are_planned_exactly_as_without_a_helper`). Production maps a `PeerResponse::Overloaded`
+   whose verified signer is the destination to `Outcome::Shed` (`src/read/candidates.rs:1043`) and
+   chooses the helper only when the walk asks for it (`:966`, `:1159`); the simulator does the same
+   (`Reply::Shed`, `sim/src/node/world.rs:2684`; `fanout_helper`, `:2526`; `shed_hot`, `:2547`).
+4. Small budgets. A non-owner that cannot fund its first out-of-order owner at all now visits rank 0
+   first instead of ending the walk on funding before any probe (`CandidateWalk::start`,
+   `walk.rs:283`); a helper's inherited budget can take this path.
+
+### Bounds and security
+
+- Depth: only walks that start with at least `HELPER_MIN_ATTEMPTS` (5) attempts may ask a helper,
+  and a helper inherits at most `HELPER_ATTEMPTS - 1` (3), so helpers never chain
+  (`helper_never_chains_and_owners_never_use_helpers`, and a `const` assertion in `fanout.rs`).
+- Origin: helpers are non-owners, so their walks end `Exhausted`, never `Origin`; origin authority
+  and `only_owner_hits_origin` are unchanged. Origin requests per page did not grow in any run
+  below.
+- Senders: a page is sent by at most `REPLICAS` owners plus `fanout_width` helpers (at most 259),
+  and at most `fanout_width` extra copies of a page are made per membership version. This is the
+  residual bound on hot-page throughput (`width_is_square_root_and_bounded`,
+  `every_chosen_helper_is_recognized_and_few_others_are`).
+- Budgets never grow: the helper probe is partitioned from the walk's budget and reunited like any
+  other probe (`budget_never_grows` held in every run).
+- Security: a helper's answer is an ordinary signed peer `Page` response, validated exactly like an
+  owner's (`validate_payload` checks the envelope against the immutable metadata, and the reader
+  opens the AEAD ciphertext with its own key). The helper acquires with the reader's signed origin
+  context, as an owner does. Every member can already be ranked an owner of some page of any object
+and receive such requests, so a helper learns nothing a member could not already receive. A shed is
+  a signed `Overloaded`; a forged one would need the destination's key, and the worst a member can
+  do by shedding is what it can already do by answering `Overloaded`. The requester checks the
+  signer against the destination it addressed, so a relay cannot make a reader leave an owner for
+  a helper.
+
+### Tuning
+
+The shed thresholds were chosen by measurement (5,000 nodes, seed 1, release). Lower thresholds, or
+no share rule, shed Zipf-popular pages that owners would have served within the deadline, and the
+relayed helper hop failed more reads than it saved. Choosing a random helper rather than preferring
+a neighbor sent most helper exchanges through relays, which shed them in `zipf`.
+
+| Shed rule | Helper asked after | Helper choice | zipf ok / failed | full-cold-start 1G 1 s | storm |
+| --- | --- | --- | --- | --- | --- |
+| none (before) | - | - | 147,376 / 3,655 | 52,116 / 42,785 | 165,851 / 23,040 |
+| 4 bodies | any `Overloaded` or timeout | hashed | not run | 94,646 / 238 | not run |
+| 16 bodies | any `Overloaded` | hashed | 138,576 / 13,330 | 94,630 / 253 | 221,419 / 11,619 |
+| 16 bodies | destination shed | hashed | 144,213 / 6,658 | 94,079 / 821 | 218,656 / 14,334 |
+| 32 bodies, half of queue | destination shed | hashed | 148,026 / 4,013 | 94,524 / 376 | 210,250 / 12,668 |
+| 32 bodies, half of queue | destination shed | neighbor preferred (final) | 152,799 / 2,635 | 94,798 / 102 | 267,367 / 476 |
+
+Without any shed (helper asked only after a timeout or relay overload) the 1 Gbit/s 1 s storm
+reached 88,131 / 6,752: readers waited out a 2 s attempt on an owner's queue before asking.
+
+A time-based rule (shed only once the oldest body of the page had been in flight 50 ms to 1 s)
+was also tried and dropped: short stalls still shed Zipf pages, and long ones let storm readers
+queue until they timed out (storm failures 28k to 47k).
+
+### Tests
+
+- racer-core: `fanout::tests` (width, convergence and exclusion, set recognition, shed rule,
+  neighbor preference, no helper); `walk::tests` `overloaded_owner_sends_the_reader_to_its_helper_once`,
+  `helper_miss_falls_back_to_remaining_owners_and_never_repeats`, `only_a_destination_shed_asks_the_helper`,
+  `owner_probes_are_planned_exactly_as_without_a_helper`, `helper_never_chains_and_owners_never_use_helpers`,
+  `helper_is_skipped_when_too_little_is_left`, `small_budget_non_owner_visits_rank_zero_first`,
+  `hedged_primary_overload_does_not_ask_the_helper`, `destination_shed_is_evidence_but_not_a_route_failure`.
+- Production: `read::candidates::tests::shed_reader_asks_the_page_helper_once_then_the_other_owners`
+  (signed responses from 16 members: a destination-signed `Overloaded` sends the walk to the helper
+  once, with fewer than `HELPER_MIN_ATTEMPTS` credits; a transport `Overloaded` does not);
+  `peer::tests::protocol_socket::hot_page_owner_sheds_non_helper_readers_with_signed_overload`
+  (threshold, share rule, helper exemption, non-owner never sheds, page service not called).
+  Both fail before the change (no helper probe; no shed).
+- racer-sim: `contention_scenarios::hot_page_readers_fan_out_through_helpers` (one page, 512
+  readers within 1 ms, 32 MiB/s NICs): with fan-out all 513 reads complete, 322 from helpers, the
+  page reaches origin once, slowest read 3.56 s; with `node.fanout` 0 (the old behavior) 98 reads
+  fail, origin twice, slowest 7.41 s. `overloaded_hot_page_owners_do_not_stream_to_abandoned_requesters`
+  now runs with fan-out off so it keeps measuring the owner bound it was written for.
+
+### Evidence
+
+Release build, seed 1. "before" is 48ca50329 plus the two capacity commits; "after" is f887fe173.
+"1G" sets `nic_bps` 125,000,000. `full-cold-start` uses `{"request_rate": 0.005}`; "1 s" also sets
+`storms` to one 1 s storm of every node on object 0 at 300 s (the overloaded window the capacity
+track kept available). "quiet" is `storm` with `request_rate` 0 and 15 s. Helper columns are helper
+probes / helper copies / owner sheds. Read latency is log-bucket upper bounds.
+
+| Run | Reads ok / failed | Origin total, max, >1 | Helper / copies / sheds | Peer bytes | Read p50 / p99 |
+| --- | --- | --- | --- | --- | --- |
+| 5k full-cold-start 1G 1 s, before | 52,116 / 42,785 (22,845 deadline, 19,940 unavailable) | 7,019, 3, 215 | - | 138 GB | 1.74 / 9.66 s |
+| 5k full-cold-start 1G 1 s, after | 94,798 / 102 unavailable | 7,009, 3, 204 | 77,285 / 70,846 / 80,113 | 185 GB | 1.07 / 2.95 s |
+| 5k storm quiet 1G, before | 35,876 / 44,124 | 43, 3, 16 | - | 87 GB | 5.37 / 9.66 s |
+| 5k storm quiet 1G, after | 72,986 / 7,014 | 32, 3, 15 | 157,663 / 64,815 / 82,942 | 123 GB | 2.68 / 4.29 s |
+| 5k storm, before | 165,851 / 23,040 | 1,195, 2, 171 | - | 542 GB | 0.30 / 1.34 s |
+| 5k storm, after | 267,367 / 476 | 1,190, 2, 166 | 117,415 / 81,979 / 124,165 | 554 GB | 0.27 / 1.01 s |
+| 5k storm 1G (2 s), before | 29,072 / 97,569 | 1,221, 3, 196 | - | 155 GB | 0.60 / 1.74 s |
+| 5k storm 1G (2 s), after | 29,432 / 40,774 | 1,221, 2, 197 | 113,711 / 703 / 148,514 | 180 GB | 0.60 / 1.74 s |
+| 5k zipf seeds 1, 2, 3, before | 3,655 / 4,101 / 3,731 failed | 44,168, 3, 5,932 (seed 1) | - | 432 GB | 0.18 / 1.48 s |
+| 5k zipf seeds 1, 2, 3, after | 2,635 / 4,106 / 3,200 failed | 44,154, 3, 5,702 (seed 1) | 7,778 / 4,913 / 10,042 | 438 GB | 0.18 / 1.48 s |
+| 5k churn seeds 1, 2, 3, before | 1,515 / 1,454 / 1,593 failed | 1,225, 3, 195 (seed 1) | - | 545 GB | 0.40 / 0.74 s |
+| 5k churn seeds 1, 2, 3, after | 1,488 / 1,462 / 1,594 failed | 1,224, 3, 196 (seed 1) | 3,682 / 3,190 / 3,468 | 540 GB | 0.37 / 0.81 s |
+| 5k full-cold-start, before | 94,810 / 98 | 7,017, 3, 204 | - | 246 GB | 0.05 / 0.13 s |
+| 5k full-cold-start, after | 94,809 / 98 | 7,017, 3, 204 | 623 / 592 / 623 | 245 GB | 0.05 / 0.13 s |
+| 50k full-cold-start 1 s, before (capacity track) | 261,113 / 634,751 unavailable | - | - | 0.81 TB | 0.74 / 2.01 s |
+| 50k full-cold-start 1 s, after | 884,116 / 11,754 unavailable | 27,446, 3, 4,507 (mean 1.22) | 781,006 / 779,516 / 782,075 | 2.32 TB | 0.50 / 1.61 s |
+| 50k full-cold-start 28 s window, capacity track "after" | 884,120 / 11,753 unavailable | mean 1.22, max 3 | - | 2.71 TB | 0.06 / 0.24 s |
+
+- 50k: with fan-out the 1 s storm completes like the capacity track's 28 s window (same ok and
+  failed counts within 4 reads; the 11.7k failures are background Zipf reads during enrollment,
+  Known issue 72). 99.8% of helper probes returned a copy. All 50,000 nodes were enrolled before
+  the storm. Wall 22:01, peak RSS 6.5 GiB (capacity's 1 s run: 26:26).
+
+- No hard invariant failure and no relaxed invariant in any run; `only_owner_hits_origin` and
+  `budget_never_grows` held throughout.
+- The 2 s `storm` at 1 Gbit/s ends while most storm reads are still in flight (ok + failed is 70k
+  of the 126k counted before); failures fell by 57k and successes are unchanged. The quiet 15 s run
+  is the clean measurement of the same storm.
+- `churn` successes vary by more than 10% between seeds with or without fan-out (153k to 176k);
+  failures are unchanged.
+- In the quiet 1 Gbit/s storm (every node reads all 16 pages within 10 ms), the remaining 7,014
+  failures are helpers answering `Overloaded` from their own flight and waiter admission (27,585
+  `helper_shed`) or ending their walks `Exhausted` (32,631 `helper_misses`): each of the about 70
+  helpers per page serves about 70 readers through one flight, which is the residual bound above.
+
+### Deviations and open items
+
+- `HOT_PAGE_BODIES` (32) counts bodies, not bytes or time. With production's 16 MiB pages 32
+  bodies are 512 MiB of queued egress, 0.4 s at 10 Gbit/s; with the simulator's 1 MiB pages 32 MiB.
+  The share rule and the threshold were tuned in the simulator; production may need a different
+  count, and a rate-aware rule (queued bytes over measured egress) would be more portable. Recorded
+  as an open tuning item, not a known issue.
+- Hedged reads (off by default) do not ask helpers: the hedge race reports only
+  `ProbeOutcome::Overloaded`, not who signed it (`hedged_primary_overload_does_not_ask_the_helper`).
+- Native (RDMA) page transfers are not counted as streaming bodies (`send_native` bypasses
+  `send_http_response_inner`), so an owner serving mostly over native transfers sheds less. This
+  only makes shedding rarer.
+- The simulator counts a node's bodies across all its workers (one simulated node is one production
+  worker).
+- No new Known issues.
