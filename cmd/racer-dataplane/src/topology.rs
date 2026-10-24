@@ -531,39 +531,6 @@ impl Error {
 pub const NORMAL_LINKS: u8 = 4;
 pub const FAILURE_LINKS: u8 = 8;
 impl RouteBudget {
-    /// Search form: `visited` contains prior senders, excluding `from`. See
-    /// `racer_core::route` for the wire form the origin signs.
-    pub fn forwarded(&self, from: &NodeId, next: &NodeId) -> Result<Self> {
-        let remaining_links = racer_core::route::forward(
-            &self.visited,
-            from,
-            next,
-            &self.destination,
-            self.remaining_links,
-            self.deadline.0,
-            uring_runtime::environment::now(),
-        )?;
-        let mut forwarded = self.clone();
-        forwarded.visited.push(from.clone());
-        forwarded.remaining_links = remaining_links;
-        Ok(forwarded)
-    }
-    /// Authentication verifies this monotonic relationship between signed hops.
-    pub fn validate_forwarded(&self, forwarded: &Self, from: &NodeId, next: &NodeId) -> Result<()> {
-        let expected = self.forwarded(from, next)?;
-        if forwarded.membership != expected.membership
-            || forwarded.request != expected.request
-            || forwarded.attempt != expected.attempt
-            || forwarded.destination != expected.destination
-            || forwarded.visited != expected.visited
-            || forwarded.remaining_links != expected.remaining_links
-            || forwarded.remaining_attempts > expected.remaining_attempts
-            || forwarded.deadline.0 > expected.deadline.0
-        {
-            return Err(Error::InvalidRequest);
-        }
-        forwarded.validate_at(next, uring_runtime::environment::now())
-    }
     fn validate_at(&self, from: &NodeId, now: Instant) -> Result<()> {
         racer_core::route::validate(
             &self.visited,
@@ -1637,23 +1604,58 @@ pub(crate) mod tests {
             // A fresh cold search succeeds after dropping the previous operation.
             assert!(cold.shortest(members.clone(), source, &request).is_ok());
         }
+        /// Forwarding a search-form budget goes through the one rule in
+        /// `racer_core::route`; the signed wire form is checked in peer-wire.
         #[test]
         fn forwarded_budget_is_monotonic_and_rejects_cycles() {
             let members = membership(100);
             let request = budget(&members, 99, 4);
             let from = &members.members()[0].node;
             let next = &members.members()[1].node;
-            let forwarded = request.forwarded(from, next).unwrap();
-            request.validate_forwarded(&forwarded, from, next).unwrap();
-            assert_eq!(forwarded.remaining_links, 3);
-            assert_eq!(forwarded.remaining_attempts, request.remaining_attempts);
-            assert!(forwarded.forwarded(next, from).is_err());
-            let mut invalid = forwarded.clone();
-            invalid.remaining_attempts += 1;
-            assert!(request.validate_forwarded(&invalid, from, next).is_err());
-            invalid = forwarded;
-            invalid.deadline.0 += Duration::from_secs(1);
-            assert!(request.validate_forwarded(&invalid, from, next).is_err());
+            let now = uring_runtime::environment::now();
+            let forward = |visited: &[NodeId], holder: &NodeId, to: &NodeId, links: u8| {
+                racer_core::route::forward(
+                    visited,
+                    holder,
+                    to,
+                    &request.destination,
+                    links,
+                    request.deadline.0,
+                    now,
+                )
+            };
+            let links = forward(&request.visited, from, next, request.remaining_links).unwrap();
+            assert_eq!(links, 3);
+            let mut forwarded = request.clone();
+            forwarded.visited.push(from.clone());
+            forwarded.remaining_links = links;
+            forwarded.validate_at(next, now).unwrap();
+            assert_eq!(
+                forward(&forwarded.visited, next, from, links),
+                Err(racer_core::route::RouteFault::Invalid)
+            );
+            assert_eq!(
+                forward(&forwarded.visited, next, next, links),
+                Err(racer_core::route::RouteFault::Invalid)
+            );
+            assert_eq!(
+                forward(&forwarded.visited, next, &members.members()[2].node, 0),
+                Err(racer_core::route::RouteFault::HopBudgetExhausted)
+            );
+            // A holder that already appears in `visited` is a cycle.
+            assert!(forwarded.validate_at(from, now).is_err());
+            assert_eq!(
+                racer_core::route::forward(
+                    &request.visited,
+                    from,
+                    next,
+                    &request.destination,
+                    request.remaining_links,
+                    request.deadline.0,
+                    request.deadline.0,
+                ),
+                Err(racer_core::route::RouteFault::DeadlineExceeded)
+            );
         }
         #[test]
         fn rejects_unknown_and_empty_membership() {

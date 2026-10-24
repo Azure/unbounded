@@ -20,8 +20,9 @@ production dataplane and the simulator both call.
 ## Non-goals
 
 - Simulating payload bytes, crypto output, or real disk contents.
-- Replacing the existing deterministic tests (`src/app/tests/dst.rs`) or `src/contention.rs`.
-  `src/contention.rs` stays until `racer-sim` covers its scenarios.
+- Replacing the existing deterministic tests (`src/app/tests/dst.rs`). The former test-only pressure
+  model `src/contention.rs` was retired in round 2 once `racer-sim` covered its scenarios (see
+  "Round 2: contention model retired").
 - Changing production behavior. New generic code must have monomorphized defaults that compile to
   the current code.
 
@@ -187,10 +188,12 @@ Verified against the code at the start of this work.
    comparisons (`step::cost::notify`). The `limits.rs` comment now says so; the behavior is
    unchanged.
 
-2. `RouteBudget::forwarded` and `RouteBudget::validate_forwarded`
-   (`cmd/racer-dataplane/src/topology.rs:536`, `:552`) are called only by tests. They use the search form, where
-   `visited` excludes the sender, while the signed wire form includes it (`racer_core::route`). The two
-   conventions are inconsistent; a future caller must pick the right one.
+2. Resolved: `RouteBudget::forwarded` and `RouteBudget::validate_forwarded`
+   (formerly `cmd/racer-dataplane/src/topology.rs:536`, `:552`) were called only by tests and used the
+   search form of `visited`. Both were removed in round 2. Their test
+   (`topology::tests::scenarios::forwarded_budget_is_monotonic_and_rejects_cycles`) now drives
+   `racer_core::route::forward` and `validate` on a `RouteBudget`'s fields, so search-form forwarding
+   has one rule; the signed wire form stays in `racer_core::route::check_wire_transition`.
 
 3. A requester that adopted a newer membership than its destination fails the read. The
    destination cannot resolve the newer version and answers `StaleMembership`; the requester then
@@ -233,6 +236,21 @@ Verified against the code at the start of this work.
    route makes the next probe charge 8 links (Known issue 5), so reads near a crashed member fail
    with `HopBudgetExhausted`. In `full-failover` at 50,000 nodes (4 crashes, seed 1) 11,950 of about
    283,000 page reads fail this way. Same root cause as issue 5; no invariant is relaxed.
+
+8. Core `PageFlights` has no origin-rejection error. Production `Flights::fail(OriginRejected)`
+   (`cmd/racer-dataplane/src/read/flight.rs:1441`) cancels the supplying caller with
+   `OriginRejected` before `Outcome::Retry`, so that caller fails even when another caller later
+   publishes. `PageFlights::finish(Outcome::Retry)` (`core/src/read/flight.rs:295`) only makes the
+   leader ineligible; it stays parked and receives the later result. Both re-elect the next
+   eligible waiter. The simulator never finishes a flight with `Retry`, so runs are unaffected.
+   Pinned by `read::core_equivalence::origin_rejection_is_retry_in_core`.
+
+9. A duplicate memory publish touches only in the simulator. Production `MemoryCache::publish`
+   returns early for a resident page without touching it (`cmd/racer-dataplane/src/memory.rs:1415-1418`),
+   while the simulator's `memory_insert` touches it (`sim/src/node/world.rs:1084-1086`), so such a
+   page lives slightly longer in the simulator. It only happens when a fill publishes or a disk hit
+   promotes a page that is already in memory. Pinned by
+   `read::core_equivalence::duplicate_publish_touches_only_in_the_simulator`.
 
 ## Simulator engine (racer-sim substrate)
 
@@ -640,13 +658,15 @@ Observations:
 ### Known issues, summary
 
 1. Long poll replies are bounded by 64 write slots per seat, so mass wakeups answer 429.
-2. `RouteBudget::forwarded` uses the search form of `visited`; only tests call it.
+2. Resolved: the test-only `RouteBudget::forwarded` was removed; tests use `racer_core::route`.
 3. A requester on a newer membership than its destination fails with `IncompatibleMembership`.
 4. A cold page can reach the origin once per owner (up to `REPLICAS`).
 5. Under overload or failed routes, page reads fail with `HopBudgetExhausted` instead of trying
    other owners.
 6. Ownership moves on membership changes add origin requests beyond `REPLICAS` per page.
 7. Crashed members stay routable until link backoff; reads near them hit issue 5.
+8. Core `PageFlights` lets an origin-rejected leader receive a later result; production fails it.
+9. The simulator touches a page on a duplicate memory publish; production does not.
 
 ## Round 2: production admission
 
@@ -680,3 +700,60 @@ production `ResourceClass`; only `rejected` (per-class counters) differs. Sim-sp
 
 All other classes reject 0 in both. Metric counters are identical before and after, so the
 production rules do not change simulated behavior for the classes the read path charges.
+
+## Round 2: contention model retired
+
+`cmd/racer-dataplane/src/contention.rs` (a test-only, payload-free discrete-event pressure model) was
+removed. Its scenario tests now run the real node logic in `racer-sim`
+(`sim/tests/contention_scenarios.rs`); its `fidelity` and `waiter_detach` oracles, which compared
+model owner traces with production allocations, became production contract tests and equivalence
+tests between production and the `racer-core` code the simulator drives:
+
+- `src/read/core_equivalence.rs`: production `Flights` against core `PageFlights` on 48 seeded
+  join, poll, cancel, deadline, detach, publish, fail, and origin-rejection traces (outcome of every
+  step, waiter and flight admission); production `MemoryCache` against the simulator's `TickLru`
+  admission on 32 seeded hit and insert traces (resident set after every step).
+- `src/read/tests/persist_policy.rs`: real `Fill::observe_verified` and bootstrap reads against
+  `racer_core::read::policy::persist` across ownership, second sight, and dirty headroom.
+- `src/read/owner_contracts.rs`: production halves of the owner, reclamation, crypto, and admission
+  checks.
+
+Two divergences were found and pinned (Known issues 8 and 9). The old dirty-pressure oracle never
+reached dirty pressure: its retention classifier owned nothing, so its page was never eligible for
+persistence. The replacement sets ownership and checks both outcomes.
+
+| Old test | Replacement |
+| --- | --- |
+| `scenarios::cold_nodes_contend_for_one_global_origin_queue` | `contention_scenarios::cold_nodes_contend_for_one_global_origin` |
+| `scenarios::warm_peer_fanout_is_limited_by_source_node_network` | `contention_scenarios::warm_peer_fanout_is_limited_by_source_node_network` |
+| `scenarios::workers_share_node_network_bandwidth` | `contention_scenarios::workers_share_node_network_bandwidth` |
+| `scenarios::overlapping_ranges_join_cold_fills_and_deliver_each_read` | `contention_scenarios::concurrent_cold_readers_join_flights` |
+| `scenarios::slow_disk_sheds_persistence_without_losing_reader_progress` | `contention_scenarios::slow_disk_sheds_persistence_without_losing_reader_progress` |
+| `scenarios::partition_retries_recover_after_heal`, `retry_exhaustion_is_bounded_and_does_not_poison_later_requests` | `contention_scenarios::reads_recover_after_partition_heals` |
+| `scenarios::two_thousand_nodes_keep_per_worker_bounds_under_cold_start` | `contention_scenarios::two_thousand_nodes_cold_start`, `cold_start_completes_with_bounded_origin_traffic` (400 nodes) |
+| `scenarios::generated_seed_matrix_replays_identical_reports_and_drains` | `contention_scenarios::seed_matrix_replays_identical_reports` |
+| `scenarios::canceling_one_joined_reader_preserves_the_surviving_read`, `cancellation_and_deadline_drain_inflight_owners_before_recovery` | `core_equivalence::flights_match_page_flights_on_seeded_traces` (cancel and deadline steps with survivors) |
+| `waiter_detach::terminal_waiter_replacement_matches_production_before_completion`, `last_waiter_detach_keeps_peer_source_and_completion_owners`, `replacement_reads_finish_after_cancellation_or_deadline_detaches_waiters` | `core_equivalence::flights_match_page_flights_on_seeded_traces` (waiter cap 3, so replacements join only after a detach), `origin_rejection_is_retry_in_core` |
+| `fidelity::duplicate_owners_match_full_page_occupancy_until_each_last_owner` | `owner_contracts::duplicate_owners_charge_once_until_each_last_owner` |
+| `fidelity::fair_reclamation_matches_metadata_trace_and_keeps_other_cache` | `owner_contracts::fair_reclamation_keeps_other_cache`, `core_equivalence::memory_cache_matches_sim_lru_on_seeded_traces` |
+| `fidelity::dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds` | `persist_policy::fill_persistence_matches_core_policy`, `dirty_pressure_skips_persistence_while_bootstrap_read_succeeds`, `owner_contracts::non_owned_persistence_uses_optional_headroom` |
+| `fidelity::canceled_crypto_matches_metadata_owner_trace_through_completion_reap` | `owner_contracts::canceled_crypto_holds_owners_until_completion_reap` |
+| `scenarios::two_live_caches_can_use_global_transport_capacity_until_exhaustion`, `two_caches_with_spare_pipes_do_not_park_readers` | `owner_contracts::transport_capacity_is_global_across_live_caches` |
+| `scenarios::cache_scoped_resources_still_enforce_fairness_with_global_room` | `owner_contracts::cache_scoped_resources_enforce_fairness_with_global_room` |
+| `scenarios::same_tick_newer_pump_cannot_bypass_a_notified_head`, `cancellation_removes_every_queue_position_before_delayed_release`, `canceling_a_notified_head_wakes_its_successor_before_delayed_release`, `one_pipe_drains_a_full_bounded_queue_sequentially`, `canceling_the_only_queued_request_allows_later_recovery`, `canceling_a_queued_request_preserves_survivor_fifo_order`, `canceled_queue_tail_frees_capacity_for_a_replacement_waiter`, `canceled_send_keeps_page_and_pipe_until_their_scheduled_completions` | Not ported: they tested the model's own pipe queue. Production FIFO, cancellation, and charge retention are covered by `flow/src/pipe.rs` (`scheduled_acquisition_is_bounded_fifo_and_wakes_only_for_progress`, `pipe_waker_rearms_and_advances_fifo`, `canceled_waiter_storage_remains_charged`) and `flow/src/fifo.rs` (`fifo_cancellation_and_completion_ownership`) |
+| `scenarios::request_context_bound_rejects_excess_arrivals_and_recovers`, `connection_rejection_rolls_back_the_new_request_context`, `idle_nodes_add_no_polling_events_or_logical_ownership` | Not ported: model scheduler mechanics. Admission rejection by class is covered in `racer-sim` (`node::tests::tight_quotas_reject_by_class`); idle nodes adding no events by the `empty` scenario (`racer-sim` `smoke_scenarios_hold_invariants`, `events == 0`) |
+| `scenarios::slow_reader_keeps_a_bounded_window_and_eventually_makes_progress`, `larger_request_window_overlaps_fill_and_reader_service`, `cache_churn_reclaims_idle_bundles_and_allows_a_new_cache_to_progress`, `identical_object_numbers_in_distinct_caches_do_not_singleflight` | Not ported: the simulator has no client reader rate, request window, or multiple cache identities per object. Production range windows are covered in `src/read/range_stream.rs` (for example `scheduler_windows_are_bounded_and_drop_frees_capacity`), cache churn by `src/read/tests/fill.rs` (`cooperative_reclaim_fair_share_keeps_other_cache_and_live_ciphertext`), and the cache is part of the `PageId` that keys flights and the memory cache |
+
+Differences from the old assertions:
+
+- Cold start: the old model required every read to succeed. With real limits, flight-table
+  rejections under a full-fleet storm end walks in `HopBudgetExhausted` (Known issue 5), about 38%
+  of reads at 2,000 nodes. The test requires that every read ends and that failures are only that
+  error or admission `Overloaded`.
+- Warm fanout: copies come from up to `REPLICAS` owners and relays, not one warm node, so the
+  test checks the aggregate NIC floor and that a 17-reader fanout takes at least twice as long as one
+  reader on the same slow NIC.
+- The simulator does not model quota-driven `evict_idle`, per-cache fair-share reclamation, client
+  cancellation, or request deadlines on the data plane; those stay production contract tests.
+
+`sim/tests/contention_scenarios.rs` runs in about 9 s under the workspace test profile.
