@@ -24,9 +24,10 @@
 //!   ([`SeatAdmission::writes`], 64 per seat; none free is a 429), and
 //!   [`body_for`] for delta versus full bodies. Waiters wake when their seat
 //!   serves a new sequence; the wake costs [`cost::notify`] comparisons.
-//! - Base hashes are not stored per client: a client at the delta base
-//!   sequence is assumed to hold its hash (content hashes are unique per
-//!   sequence), so `body_for` decides on the sequence.
+//! - Each client holds the content hash of the image it applied (none
+//!   after a process restart) and sends it with its applied sequence, as
+//!   production clients do; `body_for` answers a delta only when both
+//!   match the image's delta base, else the full image.
 //!
 //! Faults: crash the primary or seat holders, restart, partition a fraction
 //! of clients from the control plane, slow clients, grow and shrink.
@@ -49,6 +50,24 @@ use serde_json::{Value, json};
 
 use crate::engine::{Engine, MILLIS, Nanos, Role, SECONDS, Streams, mix};
 use crate::report::{Invariants, Metrics, peak_rss_bytes};
+
+/// Nonzero fingerprint of a hex content hash (its first 64 bits).
+fn fingerprint(hash: &str) -> u64 {
+    let head = hash.get(..16).unwrap_or(hash);
+    u64::from_str_radix(head, 16).unwrap_or_else(|_| mix(hash.len() as u64)) | 1
+}
+
+/// The body a seat sends a client that applied `after` and holds the
+/// content hash with fingerprint `held` (0: none), for an image whose delta
+/// base is `base`. The client sends the hash it actually holds; a different
+/// held hash is any other string to `body_for`.
+fn reply_body(base: Option<(u64, &str)>, after: Option<u64>, held: u64) -> Body {
+    let sent = (held != 0).then(|| match base {
+        Some((_, h)) if fingerprint(h) == held => h,
+        _ => "",
+    });
+    body_for(base, after, sent)
+}
 
 /// Control scenario names accepted by the CLI.
 pub const SCENARIOS: &[&str] = &["enrollment-storm", "failover", "ctl-churn", "lagging"];
@@ -217,7 +236,9 @@ enum Ev {
     Enroll(u32, u32),
     Enrolled(u32, u32, u8),
     Poll(u32, u32),
-    Delivered(u32, u32, u8, u64, u64),
+    /// Client, epoch, seat, sequence, membership version, and the
+    /// fingerprint of the delivered image's content hash.
+    Delivered(u32, u32, u8, u64, u64, u64),
     Fault(u32),
     Heal(u32),
     Restart(u32),
@@ -291,6 +312,8 @@ pub struct ControlSim {
     attempts: Vec<u8>,
     applied_seq: Vec<u64>,
     applied_mv: Vec<u64>,
+    /// Fingerprint of the content hash each client holds (0: none).
+    held: Vec<u64>,
     partitioned: Vec<bool>,
     slow: Vec<bool>,
     started_ns: Vec<Nanos>,
@@ -298,6 +321,8 @@ pub struct ControlSim {
     /// Time after which every live client must converge.
     settled_ns: Nanos,
     commits: Vec<(Nanos, u64, u64)>,
+    /// Content hash fingerprint per committed sequence.
+    hashes: std::collections::HashMap<u64, u64>,
     last_primary: Option<u32>,
     primary_lost_ns: Option<Nanos>,
     last_terms: u64,
@@ -362,12 +387,14 @@ impl ControlSim {
             attempts: Vec::new(),
             applied_seq: Vec::new(),
             applied_mv: Vec::new(),
+            held: Vec::new(),
             partitioned: Vec::new(),
             slow: Vec::new(),
             started_ns: Vec::new(),
             settled_ns: faults.iter().map(CtlFault::heals_at).max().unwrap_or(0),
             faults,
             commits: Vec::new(),
+            hashes: std::collections::HashMap::new(),
             last_primary: None,
             primary_lost_ns: None,
             last_terms: 0,
@@ -411,6 +438,7 @@ impl ControlSim {
         self.attempts.push(0);
         self.applied_seq.push(0);
         self.applied_mv.push(0);
+        self.held.push(0);
         self.partitioned.push(false);
         self.slow.push(false);
         self.started_ns.push(self.engine.now());
@@ -560,6 +588,9 @@ impl ControlSim {
         }
         if let Some(r) = self.cp.record() {
             let (seq, mv) = (r.sequence, r.membership_version);
+            self.hashes
+                .entry(seq)
+                .or_insert_with(|| fingerprint(&r.content_hash));
             let last = self.commits.last().copied();
             if last.is_none_or(|(_, s, _)| s != seq) {
                 let ok = last.is_none_or(|(_, s, m)| seq > s && mv >= m);
@@ -692,13 +723,13 @@ impl ControlSim {
             }
             Ev::Enrolled(_, _, s) => self.seats[s as usize].admission.bootstraps.put(),
             Ev::Poll(c, e) if self.live(c, e) => self.poll(c, e, now),
-            Ev::Delivered(c, e, s, seq, mv) => {
+            Ev::Delivered(c, e, s, seq, mv, hash) => {
                 self.seats[s as usize].admission.writes.put();
                 if !self.live(c, e) {
                     return;
                 }
                 self.seats[s as usize].admission.end_poll(c, false);
-                self.apply(c, seq, mv, now);
+                self.apply(c, seq, mv, hash, now);
                 let delay = if self.slow[c as usize] {
                     self.settings.slow_delay_ns
                 } else {
@@ -863,8 +894,16 @@ impl ControlSim {
         };
         let delta = image.and_then(|i| i.delta.as_ref());
         let base = delta.map(|(q, h, _)| (*q, h.as_str()));
-        let held = base.filter(|(q, _)| Some(*q) == after).map(|(_, h)| h);
-        let (kind, bytes) = match body_for(base, after, held) {
+        let fp = self.held[c as usize];
+        let body = reply_body(base, after, fp);
+        if body == Body::Full && base.is_some_and(|(q, _)| Some(q) == after) {
+            self.metrics.incr("ctl_base_hash_mismatches");
+        }
+        let hash = image.map_or_else(
+            || self.hashes.get(&seq).copied().unwrap_or(0),
+            |i| fingerprint(&i.record.content_hash),
+        );
+        let (kind, bytes) = match body {
             Body::Delta => ("ctl_delta_replies", delta.map_or(0, |d| d.2.len())),
             Body::Full => (
                 "ctl_full_replies",
@@ -882,10 +921,11 @@ impl ControlSim {
         self.metrics.incr("ctl_client_replies");
         let write = self.settings.write_ns
             + (bytes as u64).saturating_mul(SECONDS) / self.settings.slot_bps.max(1);
-        self.engine.after(write, Ev::Delivered(c, e, s, seq, mv));
+        self.engine
+            .after(write, Ev::Delivered(c, e, s, seq, mv, hash));
     }
 
-    fn apply(&mut self, c: u32, seq: u64, mv: u64, now: Nanos) {
+    fn apply(&mut self, c: u32, seq: u64, mv: u64, hash: u64, now: Nanos) {
         let (old_seq, old_mv) = (self.applied_seq[c as usize], self.applied_mv[c as usize]);
         self.invariants.check(
             "ctl_client_membership_monotonic",
@@ -899,6 +939,7 @@ impl ControlSim {
         }
         self.applied_seq[c as usize] = seq;
         self.applied_mv[c as usize] = mv;
+        self.held[c as usize] = hash;
         if self.record && mv != old_mv {
             self.changes.applied.push((c, mv));
         }
@@ -1054,6 +1095,7 @@ impl ControlSim {
         }
         self.applied_seq[c] = 0;
         self.applied_mv[c] = 0;
+        self.held[c] = 0;
     }
 
     /// Convergence: once faults have healed for `converge_ns`, every live
@@ -1125,7 +1167,10 @@ impl ControlSim {
             ("ctl_clients", clients + seats),
             // Two small JSON objects per Pod in the fake API server.
             ("ctl_api_store", self.api.len() * 256),
-            ("ctl_commits", self.commits.capacity() * 24),
+            (
+                "ctl_commits",
+                self.commits.capacity() * 24 + self.hashes.capacity() * 24,
+            ),
         ]
     }
 
@@ -1464,6 +1509,51 @@ mod tests {
         assert!(caught_up > 50, "{caught_up}");
         assert!(sim.applied_sequence(0) > 0);
         assert!(sim.model().sequence().is_some());
+    }
+
+    /// Delta only for a client that applied the base sequence and holds its
+    /// hash; restarted, lagging, and mismatched clients get the full image.
+    #[test]
+    fn delta_needs_the_held_base_hash() {
+        let h = "00000000000000aa00000000000000000000000000000000000000000000beef";
+        let other = "00000000000000bb00000000000000000000000000000000000000000000beef";
+        let base = Some((7, h));
+        assert_eq!(reply_body(base, Some(7), fingerprint(h)), Body::Delta);
+        // Restarted: nothing applied, nothing held.
+        assert_eq!(reply_body(base, None, 0), Body::Full);
+        // Lagging two sequences behind.
+        assert_eq!(reply_body(base, Some(5), fingerprint(h)), Body::Full);
+        // At the base sequence with a different image.
+        assert_eq!(reply_body(base, Some(7), fingerprint(other)), Body::Full);
+        // At the base sequence but holding no hash.
+        assert_eq!(reply_body(base, Some(7), 0), Body::Full);
+        // No delta.
+        assert_eq!(reply_body(None, Some(7), fingerprint(h)), Body::Full);
+        assert_ne!(fingerprint("zz"), 0);
+    }
+
+    /// A client whose held hash differs from the delta base's gets full
+    /// images until it applies one, then deltas again.
+    #[test]
+    fn mismatched_held_hash_falls_back_to_full() {
+        let (settings, _, faults) = plan("ctl-churn", 120, None);
+        let mut sim = ControlSim::new(settings, 2, faults);
+        sim.advance_to(600 * SECONDS);
+        for h in &mut sim.held {
+            if *h != 0 {
+                *h ^= 2;
+            }
+        }
+        sim.advance_to(1200 * SECONDS);
+        let r = sim.report("ctl-churn", 2);
+        let c = |k: &str| r["metrics"]["counters"][k].as_u64().unwrap_or(0);
+        assert!(
+            c("ctl_base_hash_mismatches") > 0,
+            "{}",
+            r["metrics"]["counters"]
+        );
+        assert!(c("ctl_delta_replies") > 0);
+        assert_eq!(r["invariants"]["hard_failures"], 0);
     }
 
     #[test]
