@@ -279,13 +279,14 @@ fn retention_observes_client_reads_including_memory_hits() {
 
 /// Rankings and route searches yield between CPU slices and hold their
 /// placement pin or search slot meanwhile, so production's concurrency
-/// limits reject concurrent work with `Overloaded`.
+/// limits reject concurrent work with `Overloaded` (without a search queue).
 #[test]
 fn yielding_searches_hit_production_concurrency_limits() {
     let mut config = quiet(600);
     config.duration_ns = 2 * SECONDS;
     config.node.placement_entries = 2;
     config.node.active_searches = 1;
+    config.node.search_queue = 0;
     config.storms = vec![Storm {
         at_ns: 0,
         object: 2,
@@ -303,6 +304,40 @@ fn yielding_searches_hit_production_concurrency_limits() {
     roomy.node.active_searches = 8;
     let (_, report) = run(roomy, 3);
     assert_eq!(counter(&report, "ranking_overloaded"), 0, "{report}");
+}
+
+/// Known issue 10: with the production search queue, searches beyond the
+/// slot limit wait (parked, no CPU) and are woken when a slot frees, so the
+/// same storm rejects far fewer searches, and none at the default limits.
+#[test]
+fn queued_searches_wait_instead_of_failing() {
+    let mut config = quiet(600);
+    config.duration_ns = 2 * SECONDS;
+    config.node.placement_entries = 2;
+    config.node.active_searches = 1;
+    config.storms = vec![Storm {
+        at_ns: 0,
+        object: 2,
+        nodes: 600,
+        window_ns: MILLIS,
+    }];
+    let mut rejecting = config.clone();
+    rejecting.node.search_queue = 0;
+    let (_, before) = run(rejecting, 3);
+    let (world, after) = run(config.clone(), 3);
+    let rejected = counter(&before, "route_search_overloaded");
+    assert!(rejected > 0, "{before}");
+    assert!(counter(&after, "route_search_queued") > 0, "{after}");
+    assert!(counter(&after, "route_search_queue_wakes") > 0, "{after}");
+    assert!(
+        counter(&after, "route_search_overloaded") * 4 < rejected,
+        "{after}"
+    );
+    assert_eq!(world.invariants.to_json()["hard_failures"], 0);
+    let mut roomy = config;
+    roomy.node.active_searches = 8;
+    let (_, report) = run(roomy, 3);
+    assert_eq!(counter(&report, "route_search_overloaded"), 0, "{report}");
 }
 
 /// Runs the hedge scenario: every ranked owner of object 4 warms its pages,

@@ -240,6 +240,27 @@ struct Task {
     route: bool,
     then: Then,
     done: Option<Result<Vec<usize>, topology::Error>>,
+    /// Pending without having woken itself: waiting in the route search
+    /// queue (`Paths::with_queue`) until another task wakes it.
+    parked: bool,
+}
+
+/// A task waker: records the task id so the world can schedule its next
+/// slice. Searches wake themselves after each step; a queued search is woken
+/// by the task that frees a slot.
+struct TaskWaker {
+    task: u64,
+    woken: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+}
+
+impl std::task::Wake for TaskWaker {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &std::sync::Arc<Self>) {
+        self.woken.lock().expect("single thread").push(self.task);
+    }
 }
 
 enum Walking {
@@ -440,6 +461,8 @@ pub struct NodeWorld {
     writes: HashMap<u64, SimCharge, Fixed>,
     origin_per_page: HashMap<u64, u32, Fixed>,
     tasks: HashMap<u64, Task, Fixed>,
+    /// Task ids woken since the last drain (see [`TaskWaker`]).
+    woken: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
     publish_scheduled: bool,
     profile: Profile,
 }
@@ -541,6 +564,7 @@ impl NodeWorld {
             writes: HashMap::default(),
             origin_per_page: HashMap::default(),
             tasks: HashMap::default(),
+            woken: std::sync::Arc::default(),
             publish_scheduled: false,
             profile: Profile::default(),
             config,
@@ -779,6 +803,7 @@ impl NodeWorld {
         self.tokens.retain(|_, w| w.node != node);
         // Dropping a task's future releases its placement pin or search slot.
         self.tasks.retain(|_, t| t.node != node);
+        self.wake_tasks(None);
         self.ranges.retain(|_, r| r.node != node);
         let now = self.instant(self.now());
         let node_config = self.config.node;
@@ -1332,6 +1357,7 @@ impl NodeWorld {
                 route,
                 then,
                 done: None,
+                parked: false,
             },
         );
         self.slice(id);
@@ -1350,8 +1376,13 @@ impl NodeWorld {
             let task = self.tasks.remove(&id).expect("present");
             return self.task_done(task);
         }
+        task.parked = false;
         let started = wall_clock();
-        let mut cx = Context::from_waker(Waker::noop());
+        let waker = Waker::from(std::sync::Arc::new(TaskWaker {
+            task: id,
+            woken: self.woken.clone(),
+        }));
+        let mut cx = Context::from_waker(&waker);
         let poll = task.future.as_mut().poll(&mut cx);
         let spent = started.elapsed().as_nanos() as u64;
         task.polls += 1;
@@ -1379,14 +1410,43 @@ impl NodeWorld {
         if let Poll::Ready(result) = poll {
             if end <= now {
                 let task = self.tasks.remove(&id).expect("present");
+                self.wake_tasks(None);
                 return self.task_done(Task {
                     done: Some(result),
                     ..task
                 });
             }
             task.done = Some(result);
+        } else if !self.wake_tasks(Some(id)) {
+            // Queued for a search slot: no next slice until a wake.
+            self.metrics.incr("route_search_queued");
+            self.tasks.get_mut(&id).expect("present").parked = true;
+            return;
         }
+        self.wake_tasks(None);
         self.engine.at(end.max(now + 1), Event::Slice { task: id });
+    }
+
+    /// Schedule a slice now for every parked task woken since the last call.
+    /// Returns whether `current` (the task being polled) woke itself.
+    fn wake_tasks(&mut self, current: Option<u64>) -> bool {
+        let woken = std::mem::take(&mut *self.woken.lock().expect("single thread"));
+        let mut itself = false;
+        let now = self.now();
+        for id in woken {
+            if Some(id) == current {
+                itself = true;
+                continue;
+            }
+            if let Some(task) = self.tasks.get_mut(&id)
+                && task.parked
+            {
+                task.parked = false;
+                self.metrics.incr("route_search_queue_wakes");
+                self.engine.at(now, Event::Slice { task: id });
+            }
+        }
+        itself
     }
 
     fn task_done(&mut self, task: Task) {

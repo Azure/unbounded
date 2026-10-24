@@ -132,8 +132,8 @@ mod paths;
 mod placement;
 
 pub use paths::{
-    Alternatives, EqualCostSearch, Exhaustive, PathKey, PathQuery, Paths, ReplayedSearch, Searches,
-    SharedRoutes,
+    Alternatives, DEFAULT_SEARCH_QUEUE, EqualCostSearch, Exhaustive, PathKey, PathQuery, Paths,
+    ReplayedSearch, Searches, SharedRoutes,
 };
 
 pub use placement::{

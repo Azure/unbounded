@@ -1476,6 +1476,45 @@ pub(crate) mod tests {
                 Error::Internal
             );
         }
+        /// Known issue 10: production `Paths::new` queues searches beyond its 8
+        /// slots instead of failing them with `Overloaded`; a queued search runs
+        /// when a slot frees, and a cancelled one leaves the queue.
+        #[test]
+        fn searches_beyond_the_slot_limit_wait_for_a_slot() {
+            let members = membership(100_000);
+            let source = &members.members()[0].node;
+            let paths = Paths::new(Rc::new(LinkHealth::default()), 0);
+            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            let budgets: Vec<_> = (0..10)
+                .map(|i| budget(&members, 80_003 + i, NORMAL_LINKS))
+                .collect();
+            let scopes: Vec<_> = budgets
+                .iter()
+                .map(|b| RequestScope::new(b.request, b.deadline.0).unwrap())
+                .collect();
+            let mut running: Vec<_> = budgets[..8]
+                .iter()
+                .zip(&scopes)
+                .map(|(b, scope)| paths.shortest_async(members.clone(), source, b, scope))
+                .collect();
+            for search in &mut running {
+                assert!(search.as_mut().poll(&mut cx).is_pending());
+            }
+            let mut cancelled =
+                paths.shortest_async(members.clone(), source, &budgets[8], &scopes[8]);
+            assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+            let mut waiting =
+                paths.shortest_async(members.clone(), source, &budgets[9], &scopes[9]);
+            assert!(waiting.as_mut().poll(&mut cx).is_pending());
+            drop(cancelled);
+            drop(running.pop());
+            let route = loop {
+                if let std::task::Poll::Ready(route) = waiting.as_mut().poll(&mut cx) {
+                    break route;
+                }
+            };
+            assert!(route.is_ok());
+        }
         #[test]
         fn independent_hash_vectors_cache_reselection_and_snapshot_weights() {
             let mut input = membership(1500).members().to_vec();

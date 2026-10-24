@@ -26,6 +26,9 @@ pub struct NodeConfig {
     pub path_bytes: u64,
     /// Concurrent route searches per node (production 8).
     pub active_searches: u32,
+    /// Route searches that may wait for a slot per node (production
+    /// `topology::DEFAULT_SEARCH_QUEUE`, 64). Zero rejects at once.
+    pub search_queue: u32,
     pub flights: u32,
     pub waiters_per_flight: u32,
     pub relay_transfers: u32,
@@ -70,6 +73,7 @@ impl Default for NodeConfig {
             path_entries: 128,
             path_bytes: 256 << 10,
             active_searches: 8,
+            search_queue: topology::DEFAULT_SEARCH_QUEUE as u32,
             flights: 64,
             waiters_per_flight: 64,
             relay_transfers: 16,
@@ -107,6 +111,7 @@ impl NodeConfig {
                 "path_entries" => self.path_entries = small()?,
                 "path_bytes" => self.path_bytes = n,
                 "active_searches" => self.active_searches = small()?,
+                "search_queue" => self.search_queue = small()?,
                 "flights" => self.flights = small()?,
                 "waiters_per_flight" => self.waiters_per_flight = small()?,
                 "relay_transfers" => self.relay_transfers = small()?,

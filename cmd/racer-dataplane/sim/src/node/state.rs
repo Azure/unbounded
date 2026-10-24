@@ -163,12 +163,15 @@ impl Node {
             workers: (0..workers.max(1))
                 .map(|_| Worker::new(config, &shared.phantom, &shared.rejections, now))
                 .collect(),
-            paths: Rc::new(Paths::with_searches(
-                config.path_entries as usize,
-                config.path_bytes as usize,
-                config.active_searches as usize,
-                shared.routes.clone(),
-            )),
+            paths: Rc::new(
+                Paths::with_searches(
+                    config.path_entries as usize,
+                    config.path_bytes as usize,
+                    config.active_searches as usize,
+                    shared.routes.clone(),
+                )
+                .with_queue(config.search_queue as usize),
+            ),
             links: Circuits::new(MAX_DEGREE, Duration::from_secs(1)),
             suspects: Vec::new(),
             disk,
