@@ -714,13 +714,16 @@ impl Server {
         let (generation, _) = self.shared.bundle().ok_or(ProtocolFailure::Unavailable)?;
         check_ahead(after, generation)?;
         let deadline = self.poll_deadline(expires)?;
-        let found = self
-            .wait_until(deadline, || {
-                self.shared
-                    .bundle()
-                    .filter(|(g, _)| after.is_none_or(|a| *g > a))
-            })
-            .await;
+        let newer = || {
+            self.shared
+                .bundle()
+                .filter(|(g, _)| after.is_none_or(|a| *g > a))
+        };
+        // Data already there: the authorization above is current, so the
+        // bearer recheck below is skipped. An unenrolled client's first
+        // keyring poll (no cursor) always takes this path.
+        let immediate = newer().is_some();
+        let found = self.wait_until(deadline, newer).await;
         if !bearer {
             let again = self.certificate(chain)?;
             if again.node != node {
@@ -728,10 +731,11 @@ impl Server {
             }
         } else if expires <= unix_now() {
             return Err(ProtocolFailure::Unauthenticated);
-        } else if found.is_some() {
-            // Data is about to leave: the Pod, Node, and token must still be
-            // live. An empty 204 reveals nothing, so it needs no API calls,
-            // which keeps idle bearer polls from amplifying into reviews.
+        } else if bearer_recheck(found.is_some(), immediate) {
+            // Data is about to leave after a wait: the Pod, Node, and token
+            // must still be live. An empty 204 reveals nothing, so it needs
+            // no API calls, which keeps idle bearer polls from amplifying
+            // into reviews.
             let again = self.authorize_bearer(head).await?;
             if again.node.uid != node {
                 return Err(ProtocolFailure::Forbidden);
@@ -1124,6 +1128,13 @@ pub fn pinned_client(certificate: &[u8]) -> Result<Arc<rustls::ClientConfig>, cr
         .with_custom_certificate_verifier(Arc::new(Pin(certificate.to_vec(), algorithms)))
         .with_no_client_auth();
     Ok(Arc::new(config))
+}
+
+/// Whether a bearer keyring poll authorizes again before replying. Only
+/// data that leaves after a wait needs it: a 204 reveals nothing, and data
+/// found before waiting leaves under the authorization just made.
+fn bearer_recheck(found: bool, immediate: bool) -> bool {
+    found && !immediate
 }
 
 #[cfg(test)]
@@ -1928,6 +1939,14 @@ mod tests {
             assert!(server.write_slot().is_ok());
             shared.stopping.set(true);
         });
+    }
+
+    #[test]
+    fn bearer_keyring_rechecks_only_after_a_wait() {
+        assert!(bearer_recheck(true, false));
+        assert!(!bearer_recheck(true, true));
+        assert!(!bearer_recheck(false, false));
+        assert!(!bearer_recheck(false, true));
     }
 
     #[test]

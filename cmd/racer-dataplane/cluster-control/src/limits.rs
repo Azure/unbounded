@@ -108,15 +108,16 @@ pub const MAX_WEBHOOK_CONNECTIONS: usize = 64;
 /// Maximum concurrent bootstrap requests, including TokenReview and API reads.
 pub const MAX_BOOTSTRAPS: usize = 32;
 
-/// Sustained Kubernetes API calls per second this process spends on bearer
+/// Most Kubernetes API calls per second this process spends on bearer
 /// authorization (TokenReview and binding reads), see
-/// [`crate::step::authz::ApiBudget`]. Matches the kubelet's default client
-/// rate; with 16 seats it is 800 calls/s cluster-wide. An authorization
-/// beyond it answers `Overloaded` before making any call, rather than
-/// starting calls the API server would answer 429.
-pub const AUTH_API_QPS: f64 = 50.0;
+/// [`crate::step::authz::ApiBudget`]. The budget halves on an API 429 and
+/// grows back, so 16 seats settle near what the API server admits rather
+/// than at 16 times this. An authorization beyond it answers `Overloaded`
+/// before making any call, rather than starting calls the API server would
+/// answer 429.
+pub const AUTH_API_QPS: f64 = 100.0;
 
-/// Burst of [`AUTH_API_QPS`].
+/// Burst of [`AUTH_API_QPS`]: one second of calls.
 pub const AUTH_API_BURST: f64 = 100.0;
 
 /// Maximum concurrent responses with a body (publications, keyrings,

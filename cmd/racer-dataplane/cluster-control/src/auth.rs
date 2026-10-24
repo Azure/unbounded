@@ -65,9 +65,15 @@ pub fn token_expiry(token: &str, now: u64) -> Result<u64, ProtocolFailure> {
     Ok(exp)
 }
 
-fn api(e: KubeError) -> ProtocolFailure {
+/// Map an API failure. A 429 slows this process's authorization budget and
+/// answers `Overloaded`, so the client backs off instead of retrying.
+fn api_failure(shared: &Shared, e: KubeError) -> ProtocolFailure {
     match e {
         KubeError::NotFound => ProtocolFailure::Forbidden,
+        KubeError::Throttled => {
+            shared.auth_budget.borrow_mut().throttled(Instant::now());
+            ProtocolFailure::Overloaded
+        }
         _ => ProtocolFailure::Unavailable,
     }
 }
@@ -128,7 +134,10 @@ pub async fn review(shared: &Shared, token: &str) -> Result<User, ProtocolFailur
         .api
         .post(paths::TOKEN_REVIEWS, &body)
         .await
-        .map_err(|_| ProtocolFailure::Unavailable)?;
+        .map_err(|e| match api_failure(shared, e) {
+            ProtocolFailure::Overloaded => ProtocolFailure::Overloaded,
+            _ => ProtocolFailure::Unavailable,
+        })?;
     check_review(
         &r["status"],
         &shared.config.namespace,
@@ -169,12 +178,12 @@ async fn bindings(shared: &Shared) -> Result<Bindings, ProtocolFailure> {
         .api
         .get(&paths::daemonset(ns, &shared.config.daemonset))
         .await
-        .map_err(api)?;
+        .map_err(|e| api_failure(shared, e))?;
     let sa = shared
         .api
         .get(&paths::service_account(ns, &shared.config.service_account))
         .await
-        .map_err(api)?;
+        .map_err(|e| api_failure(shared, e))?;
     let b = Bindings {
         daemonset_uid: if str_at(&ds, &["metadata", "deletionTimestamp"]).is_empty() {
             str_at(&ds, &["metadata", "uid"]).into()
@@ -230,7 +239,7 @@ pub async fn authorize(
             .api
             .get(&paths::pod(ns, &user.pod_name))
             .await
-            .map_err(api)?,
+            .map_err(|e| api_failure(shared, e))?,
     );
     if pod.uid != user.pod_uid {
         return Err(refuse(false));
@@ -253,7 +262,7 @@ pub async fn authorize(
             .api
             .get(&paths::node(&pod.node_name))
             .await
-            .map_err(api)?,
+            .map_err(|e| api_failure(shared, e))?,
     );
     if !node.authorized() || node.name != user.node_name || node.uid != user.node_uid {
         return Err(refuse(false));
@@ -533,6 +542,14 @@ pub(crate) mod tests {
             }
             authenticated.set(true);
             assert_eq!(shared.authz.borrow().len(), 0);
+            // An API 429 answers Overloaded and halves the budget.
+            api.fail_next(&[429]);
+            assert_eq!(
+                authorize(&shared, Some(&header), 1).await.err(),
+                Some(ProtocolFailure::Overloaded)
+            );
+            assert_eq!(shared.auth_budget.borrow().stats.cuts, 1);
+            assert!(shared.auth_budget.borrow().qps() < limits::AUTH_API_QPS);
             // Out of budget: Overloaded before any API call.
             *shared.auth_budget.borrow_mut() = authz::ApiBudget::new(1e-6, 5.0);
             authorize(&shared, Some(&header), 1).await.unwrap();

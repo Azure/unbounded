@@ -181,12 +181,36 @@ impl AuthCache {
 /// Per-process token bucket for authorization API calls. An authorization
 /// reserves all of its calls up front, so it either runs to completion
 /// under the budget or is refused before its first call.
+///
+/// The rate adapts to the API server (additive increase, multiplicative
+/// decrease): an API 429 halves it, at most once per [`CUT_INTERVAL`] so a
+/// burst of 429s from calls already in flight counts once, and drops the
+/// saved burst. It never falls below 1/16 of the configured rate and grows
+/// back to it linearly over [`RECOVERY`]. Seats share one API server
+/// without coordinating, so this is what keeps their sum near its capacity
+/// instead of each retrying into 429s.
 #[derive(Clone, Debug)]
 pub struct ApiBudget {
-    pub qps: f64,
+    pub max_qps: f64,
     pub burst: f64,
+    qps: f64,
     tokens: f64,
     at: Option<Instant>,
+    cut_at: Option<Instant>,
+    pub stats: BudgetStats,
+}
+
+/// Minimum time between two rate cuts.
+pub const CUT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Time to grow from the floor back to the configured rate.
+pub const RECOVERY: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BudgetStats {
+    pub reserved: u64,
+    pub refused: u64,
+    pub cuts: u64,
 }
 
 impl Default for ApiBudget {
@@ -198,17 +222,26 @@ impl Default for ApiBudget {
 impl ApiBudget {
     pub fn new(qps: f64, burst: f64) -> Self {
         Self {
-            qps,
+            max_qps: qps,
             burst,
+            qps,
             tokens: burst,
             at: None,
+            cut_at: None,
+            stats: BudgetStats::default(),
         }
+    }
+
+    /// Current sustained rate.
+    pub fn qps(&self) -> f64 {
+        self.qps
     }
 
     fn refill(&mut self, now: Instant) {
         if let Some(at) = self.at {
             let dt = now.saturating_duration_since(at).as_secs_f64();
             self.tokens = (self.tokens + dt * self.qps).min(self.burst);
+            self.qps = (self.qps + dt * self.max_qps / RECOVERY.as_secs_f64()).min(self.max_qps);
         }
         self.at = Some(self.at.map_or(now, |a| a.max(now)));
     }
@@ -219,8 +252,10 @@ impl ApiBudget {
         let n = f64::from(calls);
         if self.tokens + 1e-9 >= n {
             self.tokens -= n;
+            self.stats.reserved += u64::from(calls);
             true
         } else {
+            self.stats.refused += 1;
             false
         }
     }
@@ -228,6 +263,21 @@ impl ApiBudget {
     /// Return tokens of calls that were reserved but not made.
     pub fn refund(&mut self, calls: u32) {
         self.tokens = (self.tokens + f64::from(calls)).min(self.burst);
+    }
+
+    /// The API server answered 429: slow down.
+    pub fn throttled(&mut self, now: Instant) {
+        self.refill(now);
+        if self
+            .cut_at
+            .is_some_and(|c| now.saturating_duration_since(c) < CUT_INTERVAL)
+        {
+            return;
+        }
+        self.cut_at = Some(now);
+        self.qps = (self.qps / 2.0).max(self.max_qps / 16.0);
+        self.tokens = self.tokens.min(0.0);
+        self.stats.cuts += 1;
     }
 }
 
@@ -327,5 +377,30 @@ mod tests {
         // Refill caps at burst.
         assert!(b.try_reserve(5, t0 + Duration::from_secs(100)));
         assert!(!b.try_reserve(1, t0 + Duration::from_secs(100)));
+        assert_eq!(b.stats.refused, 5);
+    }
+
+    #[test]
+    fn budget_backs_off_on_throttling_and_recovers() {
+        let t0 = Instant::now();
+        let s = |n: u64| t0 + Duration::from_millis(n);
+        let mut b = ApiBudget::new(160.0, 160.0);
+        assert!(b.try_reserve(5, t0));
+        b.throttled(s(10));
+        assert_eq!(b.qps(), 80.0);
+        // Saved burst is dropped.
+        assert!(!b.try_reserve(5, s(10)));
+        // 429s within CUT_INTERVAL count once.
+        b.throttled(s(500));
+        assert_eq!(b.stats.cuts, 1);
+        for i in 0..10 {
+            b.throttled(s(1100 + i * 1000));
+        }
+        // Never below 1/16 of the configured rate.
+        assert!(b.qps() >= 10.0, "{}", b.qps());
+        assert!(b.qps() < 12.0, "{}", b.qps());
+        // Linear recovery to the configured rate.
+        b.try_reserve(0, s(10_100 + RECOVERY.as_millis() as u64));
+        assert_eq!(b.qps(), 160.0);
     }
 }
