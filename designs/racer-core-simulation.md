@@ -381,9 +381,9 @@ Verified against the code at the start of this work.
    rejections), against 0 and 11 on the handoff branch. The capacity branch alone fails 23,040
    `storm` reads (787,758 rejections), so the merge did not cause it; handoff's fixes reduce it.
    Same family as issue 16 (fanout track). No invariant is relaxed.
-   After the fanout merge (wave 2, seed 1, 5k): `storm` fails 461 reads with 14,756 relay
-   rejections, so relays no longer dominate there; `zipf` still fails 3,430 reads `Unavailable`
-   with 309,552 relay rejections (inference: its traffic is spread over many warm pages, below the
+   After the wave 2 merge (fanout, join, repeat; seed 1, 5k): `storm` fails 461 reads with 14,756
+   relay rejections, so relays no longer dominate there; `zipf` still fails 4,373 reads
+   `Unavailable` with 339,136 relay rejections (3,430 and 309,552 with fanout alone) (inference: its traffic is spread over many warm pages, below the
    hot-page shed threshold), so the issue stays open for `zipf`.
 
 19. Join versions cause `StaleMembership` skips. A new member learns that it is listed at the
@@ -857,8 +857,8 @@ scenarios carry data-plane faults.
 16. Resolved: owners shed readers of a dominant hot page to the page's helpers; a page is sent by at
    most `REPLICAS` owners plus `fanout_width` helpers (round 4, fanout, 751b85b1e..f887fe173).
 17. Resolved: no read fails because a listed member cannot serve yet (round 4, join, 789725d9c).
-18. `zipf` at 5k sheds on the `Relay` quota since the relay hold (3,430 failed, 309,552 relay
-   rejections after fanout); `storm` is down to 461 failed (round 4, combined waves 1 and 2).
+18. `zipf` at 5k sheds on the `Relay` quota since the relay hold (4,373 failed, 339,136 relay
+   rejections after wave 2); `storm` is down to 461 failed (round 4, combined waves 1 and 2).
 19. Join versions cause `StaleMembership` skips: 1,411 to 1,756 failed reads at 50k (round 4,
    join).
 20. Join versions cost origin fetches (50k `full-failover` worst page 9 to 12) and seat egress
@@ -2583,3 +2583,57 @@ have inherent causes (rank 0's own origin failure 42%, partitions 3%), 23% belon
 (members that do not serve yet) and 32% to the budget (issue 21: route 23%, copy-only 8%); the
 other 930 repeats are skips of a rank 0 that held the page but could not be reached. The 379 more
 failed reads are the debit (1,576 fills reached origin without a credit and now fail).
+
+## Round 4: combined (wave 2)
+
+Branch `racer-sim4-merge2` from the wave 1 merge (0d282020f): fanout (751b85b1e through
+f887fe173 plus its two doc commits; its cherry-picks of capacity commits were skipped), join
+(789725d9c through da9e8c8b7, without the liveness commits it was based on, which wave 1 already
+has), and repeat (beed76792 through e2e1b994d). Track numbers were renumbered: fanout 71 is 16,
+join 51 is 14, 72 is 17, 81 is 19, 82 is 20, repeat 101 is 21, 102 is 22.
+
+Conflicts and resolutions (both sides' behavior kept):
+
+- `core/src/read/walk.rs` and its tests: handoff's `previous` (probes under the previous
+  membership) and fanout's `helper` are both `WalkConfig`, `Pending`, and `Probe` fields; the
+  helper probe sends `previous: false`.
+- `src/read/candidates.rs`: owners use `previous_owners` (handoff targets and same-rank
+  predecessors); non-owners get the lazily chosen overflow helper; the request goes to the
+  probe's membership (previous or current) and its destination.
+- `sim/src/node/world.rs`: helper probe counters and repeat's `asked` record both run on a probe
+  outcome; the link check keeps repeat's `Cut` causes and join's `unready_member_links` counter.
+- `sim/src/control.rs`: enroll's `auth`, `auth_qps`, `auth_burst` and join's `report_at_start`.
+- No Cargo.toml changes; no duplicate dependency lines.
+
+Issue 18: fanout removes the relay shedding in `storm` (18,013 to 461 failed reads, 692,964 to
+14,756 relay rejections) but not in `zipf`, so 18 stays open with the new numbers.
+
+Repeat invariant: `origin_repeat_explained` holds (`unexplained` 0) in every run below, and
+`failover_repeats_are_skips_or_their_orphans` passes; join versions and helper copies needed no
+new class. Join versions show up as `after_owner_move` repeats (Known issue 20). No invariant was
+relaxed.
+
+Verification: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` and
+`cargo test --workspace` pass; all 16 scenarios run at 200 nodes, 1 s with no hard invariant
+failure.
+
+Release, seed 1. `storm`, `zipf`, `churn` use scenario defaults; `full-*` use
+`{"request_rate": 0.005}`. Origin is total, max per page, pages fetched more than once. Repeats
+are `after_failure` / `after_owner_move` / `copy_held` / `copy_lost` / `concurrent`. Unready links
+is `unready_member_links` (links toward members that do not serve yet).
+
+| Run | Reads ok / failed | Origin | Repeats | Relay rejections | Unready links | Wall | Peak RSS |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 5k storm | 268,449 / 461 | 1,024, 1, 0 | 0 / 0 / 0 / 0 / 0 | 14,756 | 0 | 1:28 | 1.28 GiB |
+| 5k zipf | 149,525 / 4,373 | 42,216, 3, 4,171 | 0 / 0 / 565 / 0 / 3,734 | 339,136 | 0 | 2:14 | 1.53 GiB |
+| 5k churn | 172,701 / 450 | 1,040, 3, 15 | 0 / 9 / 7 / 0 / 0 | 16,932 | 0 | 1:12 | 1.00 GiB |
+| 5k full-cold-start | 94,829 / 1 | 6,946, 2, 52 | 0 / 47 / 5 / 0 / 0 | 0 | 0 | 0:43 | 0.55 GiB |
+| 5k full-failover | 33,804 / 23 | 13,075, 7, 458 | 408 / 59 / 169 / 2 / 0 | 0 | 0 | 0:53 | 0.35 GiB |
+| 5k full-churn | 33,988 / 4 | 13,653, 6, 991 | 51 / 1,061 / 13 / 0 / 0 | 0 | 0 | 0:52 | 0.30 GiB |
+| 50k full-cold-start | 908,373 / 1,103 | 29,336, 5, 2,639 | 0 / 2,627 / 330 / 0 / 1 | 0 | 0 | 20:38 | 4.21 GiB |
+| 50k full-failover | 299,717 / 1,527 | 52,461, 9, 6,136 | 2,138 / 3,498 / 2,451 / 1 / 0 | 0 | 0 | 28:37 | 2.95 GiB |
+
+Against wave 1 (`/tmp/opencode/m4/`): 50k `full-cold-start` failed reads 6,665 to 1,103 (link
+failures 79,581 to 0, all enrolled at 172 s against 171 s); 50k `full-failover` failed reads 6,936
+to 1,527, link failures 97,579 to 20,019 (20,017 of them partitions), `copy_held` 5,473 to 2,451,
+worst page 8 to 9 (join versions, Known issue 20). Logs and reports: `/tmp/opencode/m4b/`.
