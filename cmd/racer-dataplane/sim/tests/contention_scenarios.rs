@@ -279,7 +279,11 @@ fn cold_start(nodes: u32) {
     assert_eq!(completed + failed, total, "{report}");
     // `Overloaded` is an admission rejection (quota full), the expected
     // shed under pressure.
-    assert_eq!(counter(&report, "error_hop_budget_exhausted"), 0, "{report}");
+    assert_eq!(
+        counter(&report, "error_hop_budget_exhausted"),
+        0,
+        "{report}"
+    );
     assert_eq!(
         failed,
         counter(&report, "error_overloaded"),

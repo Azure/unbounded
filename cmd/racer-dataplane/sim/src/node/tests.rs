@@ -148,6 +148,28 @@ fn stale_requesters_refresh_their_walk() {
     );
 }
 
+/// Known issue 3: requesters that adopted a publication before their
+/// destination get `StaleMembership` with nothing newer to refresh to. They
+/// skip that owner and try the next one; no read fails with
+/// `IncompatibleMembership`. Before round 3 this run failed such reads.
+#[test]
+fn requesters_ahead_of_their_destination_skip_it() {
+    for (retained, seed) in [(0, 2), (2, 1)] {
+        let (_, report) = run(churny(120, retained), seed);
+        assert!(counter(&report, "stale_destination_skips") > 0, "{report}");
+        assert_eq!(
+            counter(&report, "error_incompatible_membership"),
+            0,
+            "{report}"
+        );
+        assert_eq!(
+            counter(&report, "error_hop_budget_exhausted"),
+            0,
+            "{report}"
+        );
+    }
+}
+
 /// 412 continues with the remaining walk; 403 and 5xx fail the fill.
 #[test]
 fn origin_errors_follow_the_fill_plan() {
