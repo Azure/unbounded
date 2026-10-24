@@ -109,7 +109,7 @@ pub struct Shared {
     /// Jitter and claim-delay salt. Production: [`crate::entropy::OsEntropy`].
     pub rng: RefCell<Box<dyn crate::entropy::Entropy>>,
     /// Bearer authorization cache, see [`crate::step::authz`].
-    pub authz: RefCell<crate::step::authz::AuthCache>,
+    pub authz: RefCell<crate::step::authz::AuthCache<crate::auth::Caller>>,
     /// API call budget for bearer authorization.
     pub auth_budget: RefCell<crate::step::authz::ApiBudget>,
 }

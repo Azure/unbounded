@@ -19,6 +19,15 @@
 //!   authorization and must match the review by UID. Deleting the
 //!   ServiceAccount is seen within [`BINDINGS_TTL`] through the binding
 //!   cache. Failed reviews are never cached.
+//! - A whole successful authorization (review plus the live Pod and Node
+//!   checks), keyed by token, for at most [`CALLER_TTL`] and never past
+//!   `exp`. This is what lets the bootstrap that follows an unenrolled
+//!   client's keyring poll skip the API. Pod, Node or ServiceAccount
+//!   revocation is therefore seen within `CALLER_TTL` rather than at once;
+//!   that is the same order as [`BINDINGS_TTL`], short against the issued
+//!   certificate's lifetime, and the primary drops a deleted Pod's Node from
+//!   membership on its own watch regardless. A long poll that waited (the
+//!   keyring recheck after up to `POLL_WAIT`) outlives it and so re-reads.
 //! - The DaemonSet and ServiceAccount UIDs, shared by every caller, for at
 //!   most [`BINDINGS_TTL`]. Both are cluster objects an operator changes
 //!   rarely; a replaced or deleting DaemonSet or ServiceAccount is refused
@@ -38,7 +47,11 @@ pub const REVIEW_TTL: Duration = Duration::from_secs(10);
 /// Longest time the DaemonSet and ServiceAccount UIDs are reused.
 pub const BINDINGS_TTL: Duration = Duration::from_secs(5);
 
-/// Bound on cached reviews; expired entries are dropped first, then the
+/// Longest time a whole successful authorization (TokenReview plus the
+/// live Pod and Node reads) is reused for the same token.
+pub const CALLER_TTL: Duration = Duration::from_secs(5);
+
+/// Bound on cached reviews, and separately on cached authorizations; expired entries are dropped first, then the
 /// entry closest to expiry.
 pub const MAX_REVIEWS: usize = 8192;
 
@@ -72,12 +85,45 @@ pub struct Bindings {
     pub service_account_deleting: bool,
 }
 
-/// Cached authorization inputs. See the module docs for the safety argument.
-#[derive(Debug, Default)]
-pub struct AuthCache {
+/// Cached authorization inputs and results, `C` being the authorized
+/// caller. See the module docs for the safety argument.
+#[derive(Debug)]
+pub struct AuthCache<C = ()> {
     reviews: BTreeMap<TokenKey, (Reviewed, Instant)>,
+    callers: BTreeMap<TokenKey, (C, Instant)>,
     bindings: Option<(Bindings, Instant)>,
     pub stats: CacheStats,
+}
+
+impl<C> Default for AuthCache<C> {
+    fn default() -> Self {
+        Self {
+            reviews: BTreeMap::new(),
+            callers: BTreeMap::new(),
+            bindings: None,
+            stats: CacheStats::default(),
+        }
+    }
+}
+
+/// Insert into a bounded expiring map: expired entries are purged first,
+/// then the entry closest to expiry is evicted.
+fn put_bounded<V>(
+    map: &mut BTreeMap<TokenKey, (V, Instant)>,
+    key: TokenKey,
+    v: V,
+    until: Instant,
+    now: Instant,
+) {
+    if map.len() >= MAX_REVIEWS && !map.contains_key(&key) {
+        map.retain(|_, (_, u)| now < *u);
+        if map.len() >= MAX_REVIEWS
+            && let Some(k) = map.iter().min_by_key(|(_, (_, u))| *u).map(|(k, _)| *k)
+        {
+            map.remove(&k);
+        }
+    }
+    map.insert(key, (v, until));
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -86,9 +132,34 @@ pub struct CacheStats {
     pub review_misses: u64,
     pub binding_hits: u64,
     pub binding_misses: u64,
+    pub caller_hits: u64,
 }
 
-impl AuthCache {
+impl<C: Clone> AuthCache<C> {
+    /// A whole authorization of `key` younger than [`CALLER_TTL`].
+    pub fn caller(&mut self, key: &TokenKey, now: Instant) -> Option<C> {
+        match self.callers.get(key) {
+            Some((c, until)) if now < *until => {
+                self.stats.caller_hits += 1;
+                Some(c.clone())
+            }
+            Some(_) => {
+                self.callers.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Remember a whole successful authorization for [`CALLER_TTL`], never
+    /// past the token's expiry.
+    pub fn put_caller(&mut self, key: TokenKey, c: C, token_left: Duration, now: Instant) {
+        let ttl = CALLER_TTL.min(token_left);
+        if !ttl.is_zero() {
+            put_bounded(&mut self.callers, key, c, now + ttl, now);
+        }
+    }
+
     /// A cached review of `key` still valid at `now`.
     pub fn review(&mut self, key: &TokenKey, now: Instant) -> Option<Reviewed> {
         match self.reviews.get(key) {
@@ -116,24 +187,14 @@ impl AuthCache {
         if ttl.is_zero() {
             return;
         }
-        if self.reviews.len() >= MAX_REVIEWS && !self.reviews.contains_key(&key) {
-            self.reviews.retain(|_, (_, until)| now < *until);
-            if self.reviews.len() >= MAX_REVIEWS
-                && let Some(k) = self
-                    .reviews
-                    .iter()
-                    .min_by_key(|(_, (_, until))| *until)
-                    .map(|(k, _)| *k)
-            {
-                self.reviews.remove(&k);
-            }
-        }
-        self.reviews.insert(key, (r, now + ttl));
+        put_bounded(&mut self.reviews, key, r, now + ttl, now);
     }
 
-    /// Forget a review, for example after the live checks refused it.
+    /// Forget a review and authorization, for example after the live
+    /// checks refused it.
     pub fn drop_review(&mut self, key: &TokenKey) {
         self.reviews.remove(key);
+        self.callers.remove(key);
     }
 
     /// Cached bindings still valid at `now`.
@@ -155,26 +216,37 @@ impl AuthCache {
         self.bindings = Some((b, now + BINDINGS_TTL));
     }
 
+    /// Forget every cached whole authorization, as if [`CALLER_TTL`] had
+    /// passed; reviews and bindings stay.
+    pub fn drop_callers(&mut self) {
+        self.callers.clear();
+    }
+
     /// Forget the bindings so the next authorization reads them live.
     pub fn drop_bindings(&mut self) {
         self.bindings = None;
     }
 
-    /// API calls the next authorization of `key` makes at `now`: Pod and
-    /// Node always, plus the TokenReview and two binding reads when not
-    /// cached. Does not count as a cache lookup.
+    /// API calls the next authorization of `key` makes at `now`: none
+    /// when the whole authorization is cached, else Pod and Node, plus the
+    /// TokenReview and two binding reads when not cached. Does not count
+    /// as a cache lookup.
     pub fn calls(&self, key: &TokenKey, now: Instant) -> u32 {
+        if self.callers.get(key).is_some_and(|(_, u)| now < *u) {
+            return 0;
+        }
         let review = self.reviews.get(key).is_some_and(|(_, u)| now < *u);
         let bindings = self.bindings.as_ref().is_some_and(|(_, u)| now < *u);
         2 + u32::from(!review) + 2 * u32::from(!bindings)
     }
 
+    /// Cached entries (reviews plus authorizations).
     pub fn len(&self) -> usize {
-        self.reviews.len()
+        self.reviews.len() + self.callers.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.reviews.is_empty()
+        self.len() == 0
     }
 }
 
@@ -310,7 +382,7 @@ mod tests {
     #[test]
     fn review_ttl_is_capped_by_token_expiry() {
         let t0 = Instant::now();
-        let mut c = AuthCache::default();
+        let mut c: AuthCache = AuthCache::default();
         let k = token_key("a");
         assert_eq!(c.calls(&k, t0), FULL_CALLS);
         c.put_review(k, reviewed("p"), Duration::from_secs(60), t0);
@@ -330,9 +402,28 @@ mod tests {
     }
 
     #[test]
+    fn whole_authorizations_are_reused_briefly() {
+        let t0 = Instant::now();
+        let mut c: AuthCache<u32> = AuthCache::default();
+        let k = token_key("a");
+        c.put_caller(k, 7, Duration::from_secs(60), t0);
+        assert_eq!(c.calls(&k, t0), 0);
+        assert_eq!(c.caller(&k, t0 + Duration::from_secs(4)), Some(7));
+        assert_eq!(c.caller(&k, t0 + CALLER_TTL), None);
+        assert_eq!(c.calls(&k, t0 + CALLER_TTL), FULL_CALLS);
+        // Capped by token expiry, and dropped with the review.
+        c.put_caller(k, 7, Duration::from_secs(1), t0);
+        assert_eq!(c.caller(&k, t0 + Duration::from_secs(1)), None);
+        c.put_caller(k, 7, Duration::from_secs(60), t0);
+        c.drop_review(&k);
+        assert_eq!(c.caller(&k, t0), None);
+        assert_eq!(c.stats.caller_hits, 1);
+    }
+
+    #[test]
     fn distinct_tokens_do_not_share_reviews() {
         let t0 = Instant::now();
-        let mut c = AuthCache::default();
+        let mut c: AuthCache = AuthCache::default();
         c.put_review(token_key("a"), reviewed("p"), REVIEW_TTL, t0);
         assert_eq!(c.review(&token_key("b"), t0), None);
         c.drop_review(&token_key("a"));
@@ -342,7 +433,7 @@ mod tests {
     #[test]
     fn bindings_expire_and_drop() {
         let t0 = Instant::now();
-        let mut c = AuthCache::default();
+        let mut c: AuthCache = AuthCache::default();
         let k = token_key("a");
         assert_eq!(c.bindings(t0), None);
         c.put_bindings(Bindings::default(), t0);
@@ -359,7 +450,7 @@ mod tests {
     #[test]
     fn review_cache_is_bounded() {
         let t0 = Instant::now();
-        let mut c = AuthCache::default();
+        let mut c: AuthCache = AuthCache::default();
         for i in 0..MAX_REVIEWS + 10 {
             let left = Duration::from_millis(1 + i as u64);
             c.put_review(token_key(&i.to_string()), reviewed("p"), left, t0);

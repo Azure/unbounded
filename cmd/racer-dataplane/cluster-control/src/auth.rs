@@ -202,8 +202,10 @@ async fn bindings(shared: &Shared) -> Result<Bindings, ProtocolFailure> {
 
 /// Full bearer authorization of a dataplane Pod.
 ///
-/// The Pod and Node are always read live. The TokenReview and the
-/// DaemonSet and ServiceAccount reads may come from [`Shared::authz`]. All
+/// A whole authorization of the same token younger than
+/// [`authz::CALLER_TTL`] is reused. Otherwise the Pod and Node are read
+/// live, and the TokenReview and the DaemonSet and ServiceAccount reads may
+/// come from [`Shared::authz`]. All
 /// API calls the authorization will make are reserved from
 /// [`Shared::auth_budget`] first, waiting up to
 /// [`limits::AUTH_BUDGET_WAIT`] for it; beyond that it answers `Overloaded`
@@ -217,6 +219,9 @@ pub async fn authorize(
     let token = bearer(header)?;
     let expires = token_expiry(token, now)?;
     let key = authz::token_key(token);
+    if let Some(c) = shared.authz.borrow_mut().caller(&key, Instant::now()) {
+        return Ok(c);
+    }
     let calls = shared.authz.borrow().calls(&key, Instant::now());
     let wait = shared
         .auth_budget
@@ -269,7 +274,14 @@ pub async fn authorize(
     if !node.authorized() || node.name != user.node_name || node.uid != user.node_uid {
         return Err(refuse(false));
     }
-    Ok(Caller { node, expires })
+    let caller = Caller { node, expires };
+    shared.authz.borrow_mut().put_caller(
+        key,
+        caller.clone(),
+        Duration::from_secs(expires.saturating_sub(now)),
+        Instant::now(),
+    );
+    Ok(caller)
 }
 
 /// An authenticated seat holder calling the primary's replica endpoint.
@@ -513,9 +525,18 @@ pub(crate) mod tests {
             let posts = || api.requests().iter().filter(|(m, _)| m == "POST").count();
             authorize(&shared, Some(&header), 1).await.unwrap();
             assert_eq!((n(), posts()), (5, 1));
-            // Cached review and bindings: only the Pod and Node are read.
+            // Within CALLER_TTL the whole authorization is reused, even
+            // across a Pod change (the documented revocation window).
+            api.put_object(&paths::pod(ns, "p"), pod("other"));
+            authorize(&shared, Some(&header), 1).await.unwrap();
+            assert_eq!(n(), 5);
+            api.put_object(&paths::pod(ns, "p"), pod("pu"));
+            // Past it, cached review and bindings: only the Pod and Node
+            // are read.
+            shared.authz.borrow_mut().drop_callers();
             authorize(&shared, Some(&header), 1).await.unwrap();
             assert_eq!((n(), posts()), (7, 1));
+            shared.authz.borrow_mut().drop_callers();
             // A replaced Pod is refused at once and the review is dropped.
             api.put_object(&paths::pod(ns, "p"), pod("other"));
             assert_eq!(
@@ -526,7 +547,8 @@ pub(crate) mod tests {
             api.put_object(&paths::pod(ns, "p"), pod("pu"));
             authorize(&shared, Some(&header), 1).await.unwrap();
             assert_eq!((n(), posts()), (11, 2));
-            // A deleted Pod is refused at once, cache or not.
+            shared.authz.borrow_mut().drop_callers();
+            // A deleted Pod is refused once no whole authorization is cached.
             api.delete_object(&paths::pod(ns, "p"));
             assert_eq!(
                 authorize(&shared, Some(&header), 1).await.err(),
@@ -555,6 +577,7 @@ pub(crate) mod tests {
             // Out of budget: Overloaded before any API call.
             *shared.auth_budget.borrow_mut() = authz::ApiBudget::new(1e-6, 5.0);
             authorize(&shared, Some(&header), 1).await.unwrap();
+            shared.authz.borrow_mut().drop_callers();
             let before = n();
             assert_eq!(
                 authorize(&shared, Some(&header), 1).await.err(),

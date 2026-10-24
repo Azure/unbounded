@@ -148,9 +148,9 @@ pub enum AuthModel {
     Legacy,
     /// Round 4 (`step::authz`): one keyring authorization (data found
     /// without waiting needs no recheck) and one bootstrap authorization,
-    /// both through the seat's `AuthCache` (TokenReview reused for
-    /// `REVIEW_TTL`, DaemonSet and ServiceAccount for `BINDINGS_TTL`; Pod
-    /// and Node always read) and its adaptive `ApiBudget`.
+    /// both through the seat's `AuthCache` (a whole authorization reused
+    /// for `CALLER_TTL`, TokenReview for `REVIEW_TTL`, DaemonSet and
+    /// ServiceAccount for `BINDINGS_TTL`) and its adaptive `ApiBudget`.
     Cached,
 }
 
@@ -186,8 +186,9 @@ impl Settings {
     fn enrollment_calls(&self) -> (u8, u64) {
         match self.auth {
             AuthModel::Legacy => (3, 15),
-            // Cold seat: 5 for the first, 2 for the second.
-            AuthModel::Cached => (2, 7),
+            // Cold seat: 5 for the first, none for the second within
+            // `CALLER_TTL` on the same seat; 10 if it moves seats.
+            AuthModel::Cached => (2, 10),
         }
     }
 }
@@ -920,6 +921,15 @@ impl ControlSim {
         let at = |ns: Nanos| base + Duration::from_nanos(ns);
         let seat = s as usize;
         let mut reserved = 0;
+        if cached
+            && self.seats[seat]
+                .auth
+                .caller(&key, at(now + *latency))
+                .is_some()
+        {
+            self.metrics.incr("ctl_auth_caller_hits");
+            return Ok(());
+        }
         if cached {
             let t = at(now + *latency);
             reserved = self.seats[seat].auth.calls(&key, t);
@@ -1004,6 +1014,12 @@ impl ControlSim {
                 b.refund(reserved.saturating_sub(issued));
             }
             return Err(());
+        }
+        if cached {
+            let t = at(now + *latency);
+            self.seats[seat]
+                .auth
+                .put_caller(key, (), Duration::from_secs(3600), t);
         }
         Ok(())
     }
@@ -1703,9 +1719,10 @@ mod tests {
         let cached = storm("cached");
         let c = |r: &Value| r["metrics"]["counters"].clone();
         let calls = |r: &Value| counter(r, "ctl_api_tokenreviews") + counter(r, "ctl_api_gets");
-        // Successful calls per enrollment: 15 before, at most 7 after.
+        // Successful calls per enrollment: 15 before, about 3 after.
         assert!(calls(&legacy) >= 15 * 3000, "{}", c(&legacy));
-        assert!(calls(&cached) <= 7 * 3000, "{}", c(&cached));
+        assert!(calls(&cached) <= 4 * 3000, "{}", c(&cached));
+        assert!(counter(&cached, "ctl_auth_caller_hits") > 0);
         assert!(counter(&legacy, "ctl_api_tokenreviews") >= 3 * 3000);
         assert!(counter(&cached, "ctl_api_tokenreviews") < 2 * 3000);
         assert!(
