@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::pin::pin;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
@@ -156,6 +156,10 @@ pub enum Event {
         node: u32,
         factor: u8,
     },
+    /// A ranking or route search task yielded; run its next slice.
+    Slice {
+        task: u64,
+    },
 }
 
 impl Event {
@@ -189,8 +193,48 @@ impl Event {
             Self::Crash { node } => (12, node.into(), 0),
             Self::Restart { node } => (13, node.into(), 0),
             Self::Slow { node, factor } => (14, node.into(), factor.into()),
+            Self::Slice { task } => (16, task, 0),
         }
     }
+}
+
+type TaskFuture = Pin<Box<dyn Future<Output = Result<Vec<usize>, topology::Error>>>>;
+
+/// What to do with a finished ranking or route search.
+enum Then {
+    /// Placement ranking for a fill's candidate walk.
+    Walk { fill: u64, version: u64 },
+    /// Re-ranking before origin (production `resolve_epoch_traced`).
+    Origin {
+        fill: u64,
+        rank: usize,
+        evidence: Vec<ProbeOutcome>,
+    },
+    /// Route search for a message at `holder`.
+    Route {
+        msg: u64,
+        holder: u32,
+        plan: Option<RelayPlan>,
+        blocked: Vec<usize>,
+    },
+}
+
+/// A yielding ranking or route search: the real future, polled once per
+/// simulated CPU slice on its worker's CPU FIFO (see the design doc,
+/// "Round 2: fidelity").
+struct Task {
+    node: u32,
+    worker: u8,
+    incarnation: u32,
+    future: TaskFuture,
+    members: Rc<Members>,
+    /// CPU per poll after the first (ranking: one chunk for every poll).
+    slice_ns: Nanos,
+    first_ns: Nanos,
+    polls: u64,
+    route: bool,
+    then: Then,
+    done: Option<Result<Vec<usize>, topology::Error>>,
 }
 
 enum Walking {
@@ -298,20 +342,6 @@ fn response_kind(r: Response) -> ResponseKind {
     }
 }
 
-/// Poll a future that never waits on I/O to completion with a no-op waker,
-/// returning its output and the number of polls (work quanta).
-fn drive<F: Future>(future: F) -> (F::Output, u64) {
-    let mut future = pin!(future);
-    let mut cx = Context::from_waker(Waker::noop());
-    let mut polls = 0;
-    loop {
-        polls += 1;
-        if let Poll::Ready(out) = future.as_mut().poll(&mut cx) {
-            return (out, polls);
-        }
-    }
-}
-
 /// Link retry backoff, shaped like production `backoff` (`src/topology.rs`):
 /// 100 ms doubling per failure up to 20 s, plus up to a quarter of jitter. The
 /// jitter comes from a fixed mix instead of SHA-256 of the node name.
@@ -345,6 +375,7 @@ pub struct NodeWorld {
     ranges: HashMap<u64, RangeRead, Fixed>,
     writes: HashMap<u64, SimCharge, Fixed>,
     origin_per_page: HashMap<u64, u32, Fixed>,
+    tasks: HashMap<u64, Task, Fixed>,
     publish_scheduled: bool,
     profile: Profile,
 }
@@ -445,6 +476,7 @@ impl NodeWorld {
             ranges: HashMap::default(),
             writes: HashMap::default(),
             origin_per_page: HashMap::default(),
+            tasks: HashMap::default(),
             publish_scheduled: false,
             profile: Profile::default(),
             config,
@@ -633,6 +665,7 @@ impl NodeWorld {
                     self.fabric.slow[node as usize] = factor.max(1);
                 }
             }
+            Event::Slice { task } => self.slice(task),
         }
     }
 
@@ -671,6 +704,8 @@ impl NodeWorld {
             }
         }
         self.tokens.retain(|_, w| w.node != node);
+        // Dropping a task's future releases its placement pin or search slot.
+        self.tasks.retain(|_, t| t.node != node);
         self.ranges.retain(|_, r| r.node != node);
         let now = self.instant(self.now());
         let node_config = self.config.node;
@@ -1186,24 +1221,163 @@ impl NodeWorld {
         }
     }
 
-    /// Rank `key` with the worker's phantom placement, charging one ranking
-    /// chunk of CPU per poll.
-    fn rank(&mut self, node: u32, w: u8, members: &Members, page: u64) -> Result<Vec<u32>, Error> {
-        let key = page.to_be_bytes();
-        let placement: &Placement<Phantom> =
-            &self.nodes[node as usize].workers[w as usize].placement;
-        let started = wall_clock();
-        let (owners, polls) = drive(placement.rank_async(members, &key));
-        self.profile.rank_ns += started.elapsed().as_nanos() as u64;
-        self.metrics.add("ranking_polls", polls);
+    /// Start a yielding task and run its first slice now.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn(
+        &mut self,
+        node: u32,
+        worker: u8,
+        future: TaskFuture,
+        members: Rc<Members>,
+        route: bool,
+        then: Then,
+    ) {
         let costs = self.fabric.costs;
-        self.fabric
-            .cpu(self.engine.now(), node, w, polls * costs.ranking_chunk_ns);
-        let owners = owners.map_err(|_| Error::Overloaded)?;
+        let (first_ns, slice_ns) = if route {
+            // A cache hit answers on the first poll; each further poll
+            // expands up to 32 nodes (`SEARCH_QUANTUM`).
+            (0, 32 * costs.path_expand_ns_per_node)
+        } else {
+            // Each poll scores up to 256 members (`WORK_QUANTUM`).
+            (costs.ranking_chunk_ns, costs.ranking_chunk_ns)
+        };
+        let id = self.fresh();
+        self.tasks.insert(
+            id,
+            Task {
+                node,
+                worker,
+                incarnation: self.nodes[node as usize].incarnation,
+                future,
+                members,
+                slice_ns,
+                first_ns,
+                polls: 0,
+                route,
+                then,
+                done: None,
+            },
+        );
+        self.slice(id);
+    }
+
+    /// Run one slice of `task`: deliver a finished result, or poll the
+    /// future once and reserve that poll's CPU on the worker FIFO. Other
+    /// work queued on the CPU meanwhile runs before the next slice, as an
+    /// executor runs other tasks after a yield.
+    fn slice(&mut self, id: u64) {
+        let now = self.now();
+        let Some(task) = self.tasks.get_mut(&id) else {
+            return;
+        };
+        if task.done.is_some() {
+            let task = self.tasks.remove(&id).expect("present");
+            return self.task_done(task);
+        }
+        let started = wall_clock();
+        let mut cx = Context::from_waker(Waker::noop());
+        let poll = task.future.as_mut().poll(&mut cx);
+        let spent = started.elapsed().as_nanos() as u64;
+        task.polls += 1;
+        let cost = if task.polls == 1 {
+            task.first_ns
+        } else {
+            task.slice_ns
+        };
+        let (node, worker, route) = (task.node, task.worker, task.route);
+        if route {
+            self.profile.route_ns += spent;
+            if task.polls > 1 {
+                self.metrics.incr("route_search_polls");
+            }
+        } else {
+            self.profile.rank_ns += spent;
+            self.metrics.incr("ranking_polls");
+        }
+        let end = if cost == 0 {
+            now
+        } else {
+            self.fabric.cpu(now, node, worker, cost)
+        };
+        let task = self.tasks.get_mut(&id).expect("present");
+        if let Poll::Ready(result) = poll {
+            if end <= now {
+                let task = self.tasks.remove(&id).expect("present");
+                return self.task_done(Task {
+                    done: Some(result),
+                    ..task
+                });
+            }
+            task.done = Some(result);
+        }
+        self.engine.at(end.max(now + 1), Event::Slice { task: id });
+    }
+
+    fn task_done(&mut self, task: Task) {
+        let Task {
+            node,
+            incarnation,
+            members,
+            then,
+            done,
+            ..
+        } = task;
+        if self.nodes[node as usize].incarnation != incarnation {
+            return;
+        }
+        let result = done.expect("finished task");
+        if matches!(result, Err(topology::Error::Overloaded)) {
+            self.metrics.incr(if matches!(then, Then::Route { .. }) {
+                "route_search_overloaded"
+            } else {
+                "ranking_overloaded"
+            });
+        }
+        match then {
+            Then::Walk { fill, version } => {
+                let cands = Self::to_nodes(&members, result);
+                self.walk_ranked(fill, version, members, cands);
+            }
+            Then::Origin {
+                fill,
+                rank,
+                evidence,
+            } => {
+                let expected = Self::to_nodes(&members, result);
+                self.origin_ranked(fill, rank, evidence, members, expected);
+            }
+            Then::Route {
+                msg,
+                holder,
+                plan,
+                blocked,
+            } => self.routed(msg, holder, plan, blocked, members, result),
+        }
+    }
+
+    fn to_nodes(
+        members: &Members,
+        result: Result<Vec<usize>, topology::Error>,
+    ) -> Result<Vec<u32>, Error> {
+        let owners = result.map_err(|_| Error::Overloaded)?;
         Ok(owners
             .into_iter()
             .map(|p| members.members()[p].node)
             .collect())
+    }
+
+    /// Rank `page` with the worker's phantom placement as a yielding task:
+    /// one CPU ranking chunk per poll, the cache entry pinned until done.
+    fn rank(&mut self, node: u32, w: u8, members: Rc<Members>, page: u64, then: Then) {
+        let placement = self.nodes[node as usize].workers[w as usize]
+            .placement
+            .clone();
+        let held = members.clone();
+        let future: TaskFuture = Box::pin(async move {
+            let key = page.to_be_bytes();
+            placement.rank_async(&*held, &key).await
+        });
+        self.spawn(node, w, future, members, false, then);
     }
 
     fn begin_walk(&mut self, id: u64) {
@@ -1218,7 +1392,21 @@ impl NodeWorld {
             .expect("adopted version retained")
             .members
             .clone();
-        let cands = match self.rank(node, w, &members, page) {
+        self.rank(node, w, members, page, Then::Walk { fill: id, version });
+    }
+
+    fn walk_ranked(
+        &mut self,
+        id: u64,
+        version: u64,
+        members: Rc<Members>,
+        cands: Result<Vec<u32>, Error>,
+    ) {
+        let Some(fill) = self.fills.get(&id) else {
+            return;
+        };
+        let (node, page) = (fill.node, fill.page);
+        let cands = match cands {
             Ok(cands) if !cands.is_empty() => cands,
             Ok(_) => return self.hard_fail(id, Error::Unavailable),
             Err(e) => return self.hard_fail(id, e),
@@ -1442,7 +1630,6 @@ impl NodeWorld {
     /// Route `msg` one hop from `holder`. `plan` is the relay plan at a relay;
     /// `None` at the requester.
     fn forward(&mut self, mid: u64, holder: u32, plan: Option<RelayPlan>) {
-        let now = self.now();
         let m = self.msgs.get(&mid).expect("message");
         let Some(version) = self.versions.get(m.version) else {
             return self.fail_hop(mid, holder, Fault::IncompatibleMembership);
@@ -1466,31 +1653,73 @@ impl NodeWorld {
         let Some(visited) = visited else {
             return self.fail_hop(mid, holder, Fault::Unavailable);
         };
-        let instant = self.instant(now);
+        let blocked = self.blocked(holder, &members);
+        let seed = m.probe.to_be_bytes();
+        let worker = (m.probe % u64::from(self.fabric.workers)) as u8;
+        let paths = self.nodes[holder as usize].paths.clone();
+        let held = members.clone();
+        let hint = blocked.clone();
+        let future: TaskFuture = Box::pin(async move {
+            let query = PathQuery {
+                from,
+                to,
+                links,
+                visited: &visited,
+                blocked: &hint,
+                seed: &seed,
+            };
+            paths.route(&*held, query).await
+        });
+        self.spawn(
+            holder,
+            worker,
+            future,
+            members,
+            true,
+            Then::Route {
+                msg: mid,
+                holder,
+                plan,
+                blocked,
+            },
+        );
+    }
+
+    /// Links from `holder` its circuits currently block (the path hint).
+    fn blocked(&self, holder: u32, members: &Members) -> Vec<usize> {
+        let instant = self.instant(self.now());
         let n = &self.nodes[holder as usize];
-        let blocked: Vec<usize> = n
-            .suspects
+        n.suspects
             .iter()
             .filter(|s| !n.links.available(s, instant))
-            .filter_map(|s| position(&members, *s))
-            .collect();
-        let seed = m.probe.to_be_bytes();
-        let query = PathQuery {
-            from,
-            to,
-            links,
-            visited: &visited,
-            blocked: &blocked,
-            seed: &seed,
-        };
-        let started = wall_clock();
-        let (route, polls) = drive(n.paths.route(&*members, query));
-        self.profile.route_ns += started.elapsed().as_nanos() as u64;
-        let worker = (m.probe % u64::from(self.fabric.workers)) as u8;
-        if polls > 1 {
-            self.metrics.add("route_search_polls", polls - 1);
-            let cost = (polls - 1) * 32 * self.fabric.costs.path_expand_ns_per_node;
-            self.fabric.cpu(now, holder, worker, cost);
+            .filter_map(|s| position(members, *s))
+            .collect()
+    }
+
+    /// A route search for `mid` at `holder` finished.
+    fn routed(
+        &mut self,
+        mid: u64,
+        holder: u32,
+        plan: Option<RelayPlan>,
+        blocked: Vec<usize>,
+        members: Rc<Members>,
+        route: Result<Vec<usize>, topology::Error>,
+    ) {
+        let now = self.now();
+        let instant = self.instant(now);
+        if !self.msgs.contains_key(&mid) {
+            return;
+        }
+        if self.nodes[holder as usize].down {
+            return;
+        }
+        // Production `Paths::shortest` (`src/topology.rs`): link health may
+        // change while the search yields; a changed blocked set fails the
+        // attempt with `Unavailable` under the same budget.
+        if self.blocked(holder, &members) != blocked {
+            self.metrics.incr("route_blocked_changed");
+            return self.fail_hop(mid, holder, Fault::Unavailable);
         }
         let route = match route {
             Ok(route) => route,
@@ -1881,14 +2110,39 @@ impl NodeWorld {
     /// `resolve_epoch_traced`), validate origin authority, and check that only
     /// a ranked owner reaches the origin.
     fn origin_authority(&mut self, id: u64, rank: usize, evidence: Vec<ProbeOutcome>) {
-        let now = self.now();
         let fill = self.fills.get(&id).expect("present");
         let (node, w, page, version) = (fill.node, fill.worker, fill.page, fill.version);
-        let cands = fill.cands.clone();
         let Some(members) = self.versions.get(version).map(|v| v.members.clone()) else {
             return self.fail_walk(id, Error::IncompatibleMembership);
         };
-        let expected = match self.rank(node, w, &members, page) {
+        self.rank(
+            node,
+            w,
+            members,
+            page,
+            Then::Origin {
+                fill: id,
+                rank,
+                evidence,
+            },
+        );
+    }
+
+    fn origin_ranked(
+        &mut self,
+        id: u64,
+        rank: usize,
+        evidence: Vec<ProbeOutcome>,
+        members: Rc<Members>,
+        expected: Result<Vec<u32>, Error>,
+    ) {
+        let now = self.now();
+        let Some(fill) = self.fills.get(&id) else {
+            return;
+        };
+        let (node, page, version) = (fill.node, fill.page, fill.version);
+        let cands = fill.cands.clone();
+        let expected = match expected {
             Ok(expected) => expected,
             Err(e) => return self.fail_walk(id, e),
         };
@@ -2230,7 +2484,8 @@ impl NodeWorld {
                 + self.msgs.len() * (std::mem::size_of::<Msg>() + 64)
                 + self.probes.len() * 32
                 + self.ranges.len() * 96
-                + self.writes.len() * 96,
+                + self.writes.len() * 96
+                + self.tasks.len() * (std::mem::size_of::<Task>() + 256),
         ));
         list.push(("origin_per_page", self.origin_per_page.capacity() * 16));
         list.push((

@@ -276,3 +276,31 @@ fn retention_observes_client_reads_including_memory_hits() {
     }
     assert_eq!(world.invariants.to_json()["hard_failures"], 0);
 }
+
+/// Rankings and route searches yield between CPU slices and hold their
+/// placement pin or search slot meanwhile, so production's concurrency
+/// limits reject concurrent work with `Overloaded`.
+#[test]
+fn yielding_searches_hit_production_concurrency_limits() {
+    let mut config = quiet(600);
+    config.duration_ns = 2 * SECONDS;
+    config.node.placement_entries = 2;
+    config.node.active_searches = 1;
+    config.storms = vec![Storm {
+        at_ns: 0,
+        object: 2,
+        nodes: 600,
+        window_ns: MILLIS,
+    }];
+    let (_, report) = run(config.clone(), 3);
+    assert!(counter(&report, "ranking_overloaded") > 0, "{report}");
+    assert!(counter(&report, "route_search_overloaded") > 0, "{report}");
+    // 600 members take three 256-member chunks per cold ranking.
+    assert!(counter(&report, "ranking_polls") > counter(&report, "fills"));
+    // Default limits: the same storm sees no placement overload.
+    let mut roomy = config;
+    roomy.node.placement_entries = 256;
+    roomy.node.active_searches = 8;
+    let (_, report) = run(roomy, 3);
+    assert_eq!(counter(&report, "ranking_overloaded"), 0, "{report}");
+}

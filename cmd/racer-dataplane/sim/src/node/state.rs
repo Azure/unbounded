@@ -35,7 +35,9 @@ pub const SEGMENT_MAPPING_BYTES: usize = 121;
 pub const TICK_LRU_ENTRY_BYTES: usize = 67;
 
 pub struct Worker {
-    pub placement: Placement<Phantom>,
+    /// Shared with in-flight ranking tasks (`world::Task`), which hold it
+    /// across yields as production's `rank_async` future does.
+    pub placement: Rc<Placement<Phantom>>,
     pub flights: Flights,
     pub memory: TickLru<u64, u32, Fixed>,
     pub quotas: SimQuotas,
@@ -55,7 +57,10 @@ impl Worker {
             ..FlightLimits::default()
         };
         Self {
-            placement: Placement::with_rankings(config.placement_entries as usize, phantom.clone()),
+            placement: Rc::new(Placement::with_rankings(
+                config.placement_entries as usize,
+                phantom.clone(),
+            )),
             flights: PageFlights::with_hasher(limits, split, now, Fixed::default()),
             memory: TickLru::default(),
             quotas: SimQuotas::new(SimPolicy::new(config, rejections.clone())),
@@ -122,7 +127,8 @@ impl Retention {
 
 pub struct Node {
     pub workers: Vec<Worker>,
-    pub paths: Paths<SharedRoutes>,
+    /// Shared with in-flight route search tasks.
+    pub paths: Rc<Paths<SharedRoutes>>,
     /// Link circuits, as production `LinkHealth` (`src/topology.rs`).
     pub links: Circuits<u32>,
     /// Neighbors with failure records, for the path `blocked` hint.
@@ -154,12 +160,12 @@ impl Node {
             workers: (0..workers.max(1))
                 .map(|_| Worker::new(config, &shared.phantom, &shared.rejections, now))
                 .collect(),
-            paths: Paths::with_searches(
+            paths: Rc::new(Paths::with_searches(
                 config.path_entries as usize,
                 config.path_bytes as usize,
                 config.active_searches as usize,
                 shared.routes.clone(),
-            ),
+            )),
             links: Circuits::new(MAX_DEGREE, Duration::from_secs(1)),
             suspects: Vec::new(),
             disk,
@@ -192,8 +198,8 @@ impl Node {
                 + 512
                 + w.charges.capacity() * (8 + std::mem::size_of::<PageCharges>());
         }
-        out.paths +=
-            std::mem::size_of_val(&self.paths) + self.paths.cached_entries() * ROUTE_ENTRY_BYTES;
+        out.paths += std::mem::size_of::<Paths<SharedRoutes>>()
+            + self.paths.cached_entries() * ROUTE_ENTRY_BYTES;
         out.links += std::mem::size_of_val(&self.links)
             + self.links.len() * 64
             + self.suspects.capacity() * 4;
