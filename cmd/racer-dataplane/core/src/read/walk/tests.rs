@@ -14,6 +14,7 @@ fn config(rank: Option<usize>, owners: usize, order: VisitOrder) -> WalkConfig {
         page_operation: true,
         continuation: Continuation::default(),
         handoff: 0,
+        previous: 0,
     }
 }
 
@@ -848,4 +849,106 @@ fn handoff_probes_take_remaining_links_in_order() {
     };
     assert_eq!(probe.canonical, 3);
     assert_eq!(walk.request_budget(&mut b).remaining_links(), 3);
+}
+
+#[test]
+fn same_rank_previous_marks_unchanged_predecessors() {
+    // Unchanged owners: every predecessor of rank 2.
+    assert_eq!(same_rank_previous(&[1, 2, 3], &[1, 2, 3], 2), 0b11);
+    // Rank 0 has no predecessors.
+    assert_eq!(same_rank_previous(&[1, 2, 3], &[1, 2, 3], 0), 0);
+    // A join at rank 0 shifts everyone: nothing held the same rank.
+    assert_eq!(same_rank_previous(&[1, 2, 3], &[9, 1, 2], 2), 0);
+    // A removal at rank 1 keeps rank 0.
+    assert_eq!(same_rank_previous(&[1, 2, 3], &[1, 3, 4], 2), 0b01);
+    // Fewer owners before.
+    assert_eq!(same_rank_previous(&[1], &[1, 2, 3], 2), 0b01);
+    assert_eq!(same_rank_previous::<i32>(&[], &[1, 2], 1), 0);
+}
+
+/// Known issue 12: predecessors that held the same rank under the previous
+/// membership are asked under it, so one that has not adopted the current
+/// version yet serves instead of answering `StaleMembership`.
+#[test]
+fn predecessors_with_unchanged_rank_are_asked_under_the_previous_membership() {
+    let mut cfg = config(Some(2), 3, VisitOrder::canonical(3));
+    cfg.previous = 0b01;
+    cfg.handoff = 1;
+    let mut walk = CandidateWalk::new(cfg);
+    let mut b = budget(8, 32);
+    let (probes, end) = drive(&mut walk, &mut b, |p, _| {
+        Outcome::Probe(if p.canonical == 0 {
+            ProbeOutcome::Overloaded
+        } else {
+            ProbeOutcome::CopyMiss
+        })
+    });
+    assert_eq!(
+        probes
+            .iter()
+            .map(|(p, ..)| (p.canonical, p.mode, p.previous))
+            .collect::<Vec<_>>(),
+        [
+            (0, Mode::Acquire, true),
+            (1, Mode::CopyOnly, false),
+            // Handoff targets are never asked under the previous membership.
+            (3, Mode::CopyOnly, false)
+        ]
+    );
+    assert!(matches!(end, End::Origin { rank: 2, .. }));
+    // A copy from the predecessor asked under the previous membership wins.
+    let mut cfg = config(Some(1), 3, VisitOrder::canonical(3));
+    cfg.previous = 0b01;
+    let mut walk = CandidateWalk::new(cfg);
+    let (probes, end) = drive(&mut walk, &mut budget(8, 32), |_, _| Outcome::Copy);
+    assert!(probes[0].0.previous);
+    assert_eq!(end, End::Copy);
+    // Non-owners and non-page walks ignore the bits.
+    let mut cfg = config(None, 3, VisitOrder::canonical(3));
+    cfg.previous = 0b111;
+    let mut walk = CandidateWalk::new(cfg);
+    let (probes, _) = drive(&mut walk, &mut budget(8, 32), |_, _| {
+        Outcome::Probe(ProbeOutcome::CopyMiss)
+    });
+    assert!(probes.iter().all(|(p, ..)| !p.previous));
+    let mut cfg = config(Some(1), 3, VisitOrder::canonical(3));
+    cfg.previous = 0b01;
+    cfg.page_operation = false;
+    let mut walk = CandidateWalk::new(cfg);
+    let (probes, _) = drive(&mut walk, &mut budget(8, 32), |_, _| {
+        Outcome::Probe(ProbeOutcome::CopyMiss)
+    });
+    assert!(!probes[0].0.previous);
+}
+
+/// A `StaleMembership` (or `StaleDestination`) answer to a probe sent under
+/// the previous membership means the destination no longer resolves it: the
+/// walk records transient evidence and moves on; it never refreshes.
+#[test]
+fn stale_answer_under_the_previous_membership_is_transient_evidence() {
+    for stale in [Outcome::StaleMembership, Outcome::StaleDestination] {
+        let mut cfg = config(Some(2), 3, VisitOrder::canonical(3));
+        cfg.previous = 0b11;
+        let mut walk = CandidateWalk::new(cfg);
+        let mut b = budget(8, 32);
+        let mut seen = Vec::new();
+        let (probes, end) = drive(&mut walk, &mut b, |p, _| {
+            seen.push(p.previous);
+            if p.canonical == 0 {
+                stale
+            } else {
+                Outcome::Probe(ProbeOutcome::CopyMiss)
+            }
+        });
+        assert_eq!(probes.len(), 2);
+        assert_eq!(seen, [true, true]);
+        assert_eq!(
+            end,
+            End::Origin {
+                rank: 2,
+                evidence: vec![ProbeOutcome::Unreachable, ProbeOutcome::CopyMiss]
+            }
+        );
+        assert_eq!((b.remaining_attempts(), b.remaining_links()), (8, 32));
+    }
 }

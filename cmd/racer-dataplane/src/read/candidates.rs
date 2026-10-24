@@ -171,6 +171,19 @@ enum RequestMode {
     FundedRoute,
     DirectHedge,
 }
+/// What an owner's walk uses from the previous membership
+/// (`CandidatePolicy::previous_owners`).
+#[derive(Default)]
+struct PreviousOwners {
+    /// Previous owners to ask copy-only before origin (`WalkConfig::handoff`).
+    handoff: Vec<NodeId>,
+    /// Predecessors to ask under the previous membership
+    /// (`WalkConfig::previous`).
+    same_rank: u8,
+    /// The previous membership, when `same_rank` is not empty.
+    membership: Option<std::sync::Arc<crate::topology::Membership>>,
+}
+
 #[derive(Default, Clone, Copy)]
 pub(crate) struct HedgeContinuation {
     // This is local acquisition progress, never placement/origin authority.
@@ -954,13 +967,14 @@ impl CandidatePolicy {
                 .ordered
                 .iter()
                 .position(|node| node == &self.node);
-            let handoff = match rank {
+            let previous = match rank {
                 Some(rank) if matches!(operation, PeerOperation::Page { .. }) => self
-                    .handoff_targets(&candidates, object, page, rank, scope)
+                    .previous_owners(&candidates, object, page, rank, scope)
                     .await
                     .unwrap_or_default(),
-                _ => Vec::new(),
+                _ => PreviousOwners::default(),
             };
+            let handoff = previous.handoff;
             // racer-core owns the visit order, funding, and evidence rules;
             // this loop performs the exchanges it plans.
             let mut walk = CandidateWalk::new(WalkConfig {
@@ -978,6 +992,7 @@ impl CandidatePolicy {
                     bounded_routes: continuation.bounded_routes,
                 },
                 handoff: handoff.len(),
+                previous: previous.same_rank,
             });
             let end = loop {
                 let probe = match walk.next(budget)? {
@@ -985,9 +1000,13 @@ impl CandidatePolicy {
                     Step::End(end) => break end,
                 };
                 let copy_only = probe.mode == WalkMode::CopyOnly;
+                let membership = match (&previous.membership, probe.previous) {
+                    (Some(previous), true) => previous,
+                    _ => &candidates.membership,
+                };
                 let response = self
                     .request_traced(
-                        &candidates.membership,
+                        membership,
                         // Canonical ranks past the owners address handoff
                         // targets (`WalkConfig::handoff`).
                         match probe.canonical.checked_sub(candidates.ordered.len()) {
@@ -1015,8 +1034,11 @@ impl CandidatePolicy {
                 let outcome = match response {
                     Ok(response) => {
                         if matches!(response.response(), PeerResponse::StaleMembership) {
-                            if walk.pending_handoff() {
-                                // A stale handoff target is only a miss.
+                            if walk.pending_handoff() || walk.pending_previous() {
+                                // A stale handoff target is only a miss, and
+                                // a predecessor asked under the previous
+                                // membership no longer resolves it: neither
+                                // refreshes this walk's membership.
                                 walk.complete(budget, WalkOutcome::StaleMembership)?;
                                 continue;
                             }
@@ -1123,41 +1145,73 @@ impl CandidatePolicy {
         })
     }
 
-    /// Owners of `page` under the membership published just before
-    /// `candidates.membership`, if still retained, that an owner at `rank`
-    /// asks copy-only before origin (Known issue 6): previous owners that
-    /// are current members, without this node and its current predecessors.
-    /// Empty when the owner set did not change. Ranking failures are not
-    /// errors; the walk just has no handoff targets.
-    fn handoff_targets<'a>(
+    /// What an owner at `rank` uses from the membership published just
+    /// before `candidates.membership`, if still retained:
+    ///
+    /// - handoff targets it asks copy-only before origin (Known issue 6):
+    ///   previous owners that are current members, without this node and its
+    ///   current predecessors; empty when the owner set did not change;
+    /// - predecessors that held the same rank there, which it asks under that
+    ///   membership so one that has not adopted the current version yet still
+    ///   serves (Known issue 12), when this node replaced it at most
+    ///   `PREVIOUS_MEMBERSHIP_WITHIN` ago and is a member of it.
+    ///
+    /// Ranking failures are not errors; the walk just goes without.
+    fn previous_owners<'a>(
         &'a self,
         candidates: &'a Candidates,
         object: &'a ObjectId,
         page: PageNumber,
         rank: usize,
         scope: &'a RequestScope,
-    ) -> Operation<'a, Vec<NodeId>> {
+    ) -> Operation<'a, PreviousOwners> {
         Box::pin(async move {
             let Some(version) = candidates.membership.version.0.checked_sub(1) else {
-                return Ok(Vec::new());
+                return Ok(PreviousOwners::default());
             };
-            let Ok(Some(previous)) = self
+            let now = uring_runtime::environment::now();
+            let Ok(Some(previous)) = self.published.resolve(version, now) else {
+                return Ok(PreviousOwners::default());
+            };
+            // Ask predecessors under the previous membership only while
+            // peers that adopted the current one still hold it in grace
+            // (`PREVIOUS_MEMBERSHIP_WITHIN`); a lease held only here says
+            // nothing about a peer.
+            let recent = self
                 .published
-                .resolve(version, uring_runtime::environment::now())
-            else {
-                return Ok(Vec::new());
-            };
+                .resolve_recent(
+                    version,
+                    now,
+                    racer_core::read::walk::PREVIOUS_MEMBERSHIP_WITHIN,
+                )
+                .ok()
+                .flatten()
+                .filter(|recent| recent.member(&self.node).is_ok());
             let Ok(previous) = self.candidates_scoped(previous, object, page, scope).await else {
-                return Ok(Vec::new());
+                return Ok(PreviousOwners::default());
             };
-            Ok(racer_core::read::walk::handoff_targets(
+            let handoff = racer_core::read::walk::handoff_targets(
                 &previous.ordered,
                 &candidates.ordered,
                 rank,
             )
             .into_iter()
             .filter(|node| candidates.membership.member(node).is_ok())
-            .collect())
+            .collect();
+            let same_rank = if recent.is_some() {
+                racer_core::read::walk::same_rank_previous(
+                    &previous.ordered,
+                    &candidates.ordered,
+                    rank,
+                )
+            } else {
+                0
+            };
+            Ok(PreviousOwners {
+                handoff,
+                same_rank,
+                membership: recent.filter(|_| same_rank != 0),
+            })
         })
     }
 

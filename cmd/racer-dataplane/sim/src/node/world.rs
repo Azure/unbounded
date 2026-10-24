@@ -49,9 +49,10 @@ use racer_core::read::policy::{
 use racer_core::read::range::{PageBudget, SlotKind, direct_fills, first_failure};
 use racer_core::read::serve::{ServeAction, ServeFacts, serve_action, serve_deadline};
 use racer_core::read::walk::{
-    AttemptInputs, AttemptPlan, CandidateWalk, Continuation, End, HedgeFacts, Mode, Outcome, Probe,
-    RemainingWalk, RouteMode, StaleAction, Step, WalkConfig, handoff_targets, hedge_budgets,
-    hedge_eligible, hedge_fallback, plan_attempt, stale_action, transport_outcome,
+    AttemptInputs, AttemptPlan, CandidateWalk, Continuation, End, HedgeFacts, Mode, Outcome,
+    PREVIOUS_MEMBERSHIP_WITHIN, Probe, RemainingWalk, RouteMode, StaleAction, Step, WalkConfig,
+    handoff_targets, hedge_budgets, hedge_eligible, hedge_fallback, plan_attempt,
+    same_rank_previous, stale_action, transport_outcome,
 };
 use racer_core::route::MAX_LINKS;
 use racer_core::time::SplitMix64;
@@ -293,6 +294,12 @@ struct Fill {
     /// Previous-membership owners to ask before origin; probe canonical
     /// `cands.len() + i` addresses `handoff[i]`.
     handoff: Vec<u32>,
+    /// This owner is a member of membership version - 1, which is still
+    /// retained and was replaced within `PREVIOUS_MEMBERSHIP_WITHIN`.
+    previous_member: bool,
+    /// Predecessors to ask under membership version - 1
+    /// (`WalkConfig::previous`).
+    previous: u8,
     version: u64,
     rank: Option<usize>,
     retried: bool,
@@ -1366,6 +1373,8 @@ impl NodeWorld {
                 walk: Walking::None,
                 cands: Vec::new(),
                 handoff: Vec::new(),
+                previous_member: false,
+                previous: 0,
                 version: 0,
                 rank: None,
                 retried: false,
@@ -1633,6 +1642,8 @@ impl NodeWorld {
         let fill = self.fills.get_mut(&id).expect("present");
         fill.cands = cands;
         fill.handoff.clear();
+        fill.previous_member = false;
+        fill.previous = 0;
         fill.version = version;
         fill.rank = rank;
         fill.order = order;
@@ -1642,7 +1653,21 @@ impl NodeWorld {
             && let Some(old) = version.checked_sub(1).and_then(|v| self.versions.get(v))
         {
             let old = old.members.clone();
-            let w = self.fills[&id].worker;
+            // Production asks predecessors under the previous membership only
+            // within `PREVIOUS_MEMBERSHIP_WITHIN` of replacing it, and only
+            // with grace retention on (`Published::resolve_recent`), so peers
+            // still resolve it. The simulator measures from the version's
+            // publication, which is no later than this node's adoption, so
+            // it is the stricter of the two; peers resolve older versions
+            // only with `retained_versions` of at least 1.
+            let recent = self.config.node.retained_versions >= 1
+                && self.versions.get(version).is_some_and(|v| {
+                    self.now().saturating_sub(v.published)
+                        <= PREVIOUS_MEMBERSHIP_WITHIN.as_nanos() as Nanos
+                });
+            let fill = self.fills.get_mut(&id).expect("present");
+            fill.previous_member = recent && position(&old, node).is_some();
+            let w = fill.worker;
             self.rank(node, w, old, page, Then::Handoff { fill: id });
             return;
         }
@@ -1658,7 +1683,11 @@ impl NodeWorld {
         if let (Ok(previous), Some(rank)) = (previous, fill.rank) {
             let current = self.versions.get(fill.version).map(|v| v.members.clone());
             let targets = handoff_targets(&previous, &fill.cands, rank);
+            let same = same_rank_previous(&previous, &fill.cands, rank);
             let fill = self.fills.get_mut(&id).expect("present");
+            if fill.previous_member {
+                fill.previous = same;
+            }
             fill.handoff = targets
                 .into_iter()
                 .filter(|n| current.as_ref().is_some_and(|m| position(m, *n).is_some()))
@@ -1687,6 +1716,7 @@ impl NodeWorld {
             page_operation: true,
             continuation,
             handoff: fill.handoff.len(),
+            previous: fill.previous,
         }));
         self.step_walk(id);
     }
@@ -1834,7 +1864,16 @@ impl NodeWorld {
             || format!("hedge plan {} links {} attempts from {before_links} links {before_attempts} attempts", plan.links, plan.remote_attempts),
         );
         let dest = fill.cands[canonical];
-        let pid = self.launch(id, dest, mode == Mode::Acquire, &plan, true, Some(primary));
+        let version = self.fills[&id].version;
+        let pid = self.launch(
+            id,
+            dest,
+            version,
+            mode == Mode::Acquire,
+            &plan,
+            true,
+            Some(primary),
+        );
         let race = self
             .fills
             .get_mut(&id)
@@ -2162,16 +2201,24 @@ impl NodeWorld {
             },
         );
         let acquire = probe.mode == Mode::Acquire;
-        let pid = self.launch(id, dest, acquire, &plan, false, None);
+        let version = fill.version - u64::from(probe.previous);
+        // Predecessors that held the same rank under the previous membership
+        // are asked under it (`Probe::previous`, Known issue 12).
+        if probe.previous {
+            self.metrics.incr("previous_membership_probes");
+        }
+        let pid = self.launch(id, dest, version, acquire, &plan, false, None);
         self.fills.get_mut(&id).expect("present").probe = Some(pid);
         Ok(())
     }
 
     /// Send one planned probe for fill `id` to `dest`. Returns the probe id.
+    #[allow(clippy::too_many_arguments)]
     fn launch(
         &mut self,
         id: u64,
         dest: u32,
+        version: u64,
         acquire: bool,
         plan: &AttemptPlan,
         direct: bool,
@@ -2186,7 +2233,7 @@ impl NodeWorld {
             requester: node,
             at: node,
             dest,
-            version: fill.version,
+            version,
             page: fill.page,
             acquire,
             path: vec![node],
@@ -2653,9 +2700,11 @@ impl NodeWorld {
         let outcome = match reply {
             Reply::Transport => Ok(Outcome::Transport(ProbeOutcome::Unreachable)),
             Reply::Response(ResponseKind::StaleMembership)
-                if probe.hedge.is_none() && self.pending_handoff(probe.fill) =>
+                if probe.hedge.is_none() && self.pending_no_refresh(probe.fill) =>
             {
-                // A stale handoff target is only a miss (no adopt, no skip).
+                // A stale handoff target is only a miss, and a predecessor
+                // asked under the previous membership no longer resolves it
+                // (no adopt, no skip).
                 Ok(Outcome::StaleMembership)
             }
             Reply::Response(ResponseKind::StaleMembership) if probe.hedge.is_none() => {
@@ -2663,11 +2712,16 @@ impl NodeWorld {
                 // newer membership, once; otherwise the destination is behind
                 // and the walk moves on (Known issue 3).
                 let (node, retried, previous) = (fill.node, fill.retried, fill.version);
+                let owner = fill.rank.is_some();
                 let latest = self.adopt(node);
                 match stale_action(retried, previous, Some(latest)) {
                     Ok(StaleAction::Refresh) => Ok(Outcome::StaleMembership),
                     Ok(StaleAction::Skip) => {
                         self.metrics.incr("stale_destination_skips");
+                        if owner {
+                            // An owner's predecessor is behind (Known issue 12).
+                            self.metrics.incr("owner_stale_destination_skips");
+                        }
                         Ok(Outcome::StaleDestination)
                     }
                     Err(e) => Err(e),
@@ -2727,11 +2781,14 @@ impl NodeWorld {
         }
     }
 
-    /// Whether `fill`'s pending candidate probe is a handoff target.
-    fn pending_handoff(&self, fill: u64) -> bool {
-        self.fills
-            .get(&fill)
-            .is_some_and(|f| matches!(&f.walk, Walking::Candidates(walk) if walk.pending_handoff()))
+    /// Whether a `StaleMembership` answer to `fill`'s pending candidate probe
+    /// must not refresh membership: a handoff target, or a predecessor asked
+    /// under the previous membership.
+    fn pending_no_refresh(&self, fill: u64) -> bool {
+        self.fills.get(&fill).is_some_and(|f| {
+            matches!(&f.walk, Walking::Candidates(walk)
+                if walk.pending_handoff() || walk.pending_previous())
+        })
     }
 
     fn complete_probe(&mut self, id: u64, outcome: Result<Outcome, Error>) {

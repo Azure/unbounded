@@ -72,6 +72,15 @@ pub struct WalkConfig {
     /// target `i` reports `canonical = owners + i`. Ignored for non-owners and
     /// for operations other than pages.
     pub handoff: usize,
+    /// Predecessors (bit `c` for canonical rank `c`) to ask under membership
+    /// version - 1 ([`Probe::previous`]): the caller replaced that version at
+    /// most [`PREVIOUS_MEMBERSHIP_WITHIN`] ago, this node is a member of
+    /// it, and the predecessor held the same rank
+    /// there, so the request carries the same authority and a predecessor
+    /// that has not adopted the current version yet still serves it (Known
+    /// issue 12); see [`same_rank_previous`]. Ignored for non-owners, for
+    /// handoff targets, and for non-page walks.
+    pub previous: u8,
 }
 
 /// Most previous-membership owners one walk asks (the replica count).
@@ -89,6 +98,29 @@ pub fn owner_funding_min(canonical: usize) -> u32 {
 /// `Acquire` to rank 0 carries, so it can delegate the cold fetch.
 pub fn owner_funding(canonical: usize) -> u32 {
     owner_funding_min(canonical) + u32::from(canonical > 0)
+}
+
+/// How long after this node replaced membership version - 1 its owners may
+/// still ask predecessors under it ([`WalkConfig::previous`]). Peers keep a
+/// superseded membership for a 30 s grace window
+/// (`Snapshot::retention`), so this leaves 20 s for a peer that adopted the
+/// current membership before this node; past it, a peer may answer
+/// `StaleMembership` and the probe would be wasted.
+pub const PREVIOUS_MEMBERSHIP_WITHIN: Duration = Duration::from_secs(10);
+
+/// Predecessors an owner at `rank` may ask under the previous membership
+/// ([`WalkConfig::previous`]): bit `c` is set when canonical rank `c` <
+/// `rank` names the same node in `previous` and `current`. Such a request
+/// carries the same authority under either version, and a predecessor that
+/// has not adopted the current version yet still resolves the previous one,
+/// so it serves (or, at rank 0, fetches for everyone) instead of answering
+/// `StaleMembership` and leaving the page to this owner (Known issue 12).
+/// The caller sets nothing unless it replaced the previous membership at
+/// most [`PREVIOUS_MEMBERSHIP_WITHIN`] ago and is a member of it.
+pub fn same_rank_previous<N: PartialEq>(previous: &[N], current: &[N], rank: usize) -> u8 {
+    (0..rank.min(current.len()).min(8))
+        .filter(|c| previous.get(*c).is_some_and(|p| *p == current[*c]))
+        .fold(0, |bits, c| bits | (1 << c))
 }
 
 /// Which previous-membership owners a page owner should ask before origin.
@@ -124,6 +156,9 @@ pub struct Probe {
     /// reserve a share for origin.
     pub remaining_opportunities: u32,
     pub route: RouteMode,
+    /// Send under membership version - 1 ([`WalkConfig::previous`]). The
+    /// caller routes and signs the request under that membership.
+    pub previous: bool,
 }
 
 /// Outcome the caller reports for the current probe.
@@ -196,6 +231,8 @@ struct Pending {
     handoff: bool,
     /// An owner's `Acquire` to rank 0.
     delegated: bool,
+    /// Sent under the previous membership ([`WalkConfig::previous`]).
+    previous: bool,
 }
 
 impl CandidateWalk {
@@ -260,6 +297,15 @@ impl CandidateWalk {
         self.pending.as_ref().is_some_and(|p| p.handoff)
     }
 
+    /// Whether the pending probe is sent under the previous membership. A
+    /// `StaleMembership` answer to it (the destination no longer resolves
+    /// that version) must not refresh this walk's membership: report
+    /// [`Outcome::StaleMembership`] and the walk records transient evidence,
+    /// as for a destination that is behind.
+    pub fn pending_previous(&self) -> bool {
+        self.pending.as_ref().is_some_and(|p| p.previous)
+    }
+
     /// Whether the walk stopped because a probe could not be funded.
     pub fn funding_stopped(&self) -> bool {
         self.funding
@@ -289,6 +335,13 @@ impl CandidateWalk {
                 // the owner's own origin attempt needs.
                 break;
             }
+            // A predecessor that held the same rank under the previous
+            // membership is asked under it (Known issue 12).
+            let previous = !handoff
+                && rank.is_some()
+                && self.config.page_operation
+                && canonical < 8
+                && self.config.previous & (1 << canonical) != 0;
             // An owner above rank 0 asks rank 0 to acquire, so one owner per
             // membership fetches a cold page and concurrent misses coalesce in
             // rank 0's flight. The Acquire costs two credits (the exchange and
@@ -414,6 +467,7 @@ impl CandidateWalk {
                 bounded,
                 handoff,
                 delegated,
+                previous,
             });
             return Ok(Step::Probe(Probe {
                 index,
@@ -425,6 +479,7 @@ impl CandidateWalk {
                 } else {
                     RouteMode::SharedRoute
                 },
+                previous,
             }));
         }
         self.done = true;
@@ -485,6 +540,14 @@ impl CandidateWalk {
                 ) {
                     budget.note_route_failure();
                 }
+                Ok(None)
+            }
+            Outcome::StaleDestination | Outcome::StaleMembership if pending.previous => {
+                // The destination no longer resolves the previous
+                // membership: transient evidence, like a destination that
+                // is behind.
+                self.saw_transient = true;
+                self.evidence.push(ProbeOutcome::Unreachable);
                 Ok(None)
             }
             Outcome::Copy => {
@@ -578,6 +641,7 @@ impl RemainingWalk {
             mode: Mode::CopyOnly,
             remaining_opportunities: (self.owners - self.index) as u32,
             route: RouteMode::SharedRoute,
+            previous: false,
         })
     }
 

@@ -45,6 +45,9 @@ struct ScriptedPeers {
     #[allow(clippy::type_complexity)]
     calls: RefCell<Vec<(NodeId, bool, u32, u8, Instant)>>,
 
+    /// Membership version each request was routed under.
+    memberships: RefCell<Vec<u64>>,
+
     local_deadlines: RefCell<Vec<(Instant, Instant)>>,
 
     demands: RefCell<Vec<crate::peer::subscriptions::Demand>>,
@@ -102,6 +105,9 @@ impl ScriptedPeers {
                 request.route.remaining_links,
                 request.route.deadline.0,
             ));
+            self.memberships
+                .borrow_mut()
+                .push(request.route.membership.0);
             let (expected, reply) = self
                 .replies
                 .borrow_mut()
@@ -261,6 +267,7 @@ fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Ve
         signing: network(4).into_iter().map(Forwarding::new).collect(),
         replies: RefCell::new(VecDeque::new()),
         calls: RefCell::new(Vec::new()),
+        memberships: RefCell::new(Vec::new()),
         local_deadlines: RefCell::new(Vec::new()),
         demands: RefCell::new(Vec::new()),
     });
@@ -3497,6 +3504,120 @@ fn owner_asks_previous_membership_owners_before_origin() {
             assert_eq!(f.origin.calls.get(), 1);
         }
         assert!(calls.iter().all(|c| c.1), "handoff probes are copy-only");
+    }
+}
+
+/// Known issue 12: an owner asks a predecessor that held the same rank under
+/// the previous membership under that membership, while it replaced it
+/// recently (`PREVIOUS_MEMBERSHIP_WITHIN`). A predecessor that has not adopted
+/// the current version yet then serves (here rank 0 answers the delegated
+/// Acquire with a copy) instead of answering `StaleMembership` and leaving
+/// the page to this owner's origin attempt.
+#[test]
+fn owner_asks_unchanged_predecessors_under_the_recent_previous_membership() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    // (superseded seconds ago, rank 0 unchanged under version 1, rank 0
+    // copies) -> (version rank 0 is asked under, origin calls)
+    for (age, same, copy, expected) in [
+        (0, true, true, (1, 0)),
+        (9, true, true, (1, 0)),
+        // Too old: a peer may have dropped version 1 already.
+        (11, true, true, (2, 0)),
+        // Rank 0 changed: the current version carries the authority.
+        (0, false, true, (2, 0)),
+        // Rank 0 no longer resolves version 1: transient evidence, no
+        // membership refresh, and this owner reaches origin.
+        (0, true, false, (1, 1)),
+    ] {
+        let mut f = fixture();
+        let (peers, ordered) = install_peers(&mut f, Some(1));
+        let good = encrypted_copy(&mut f);
+        let members = f.membership.members().to_vec();
+        let current = Arc::new(
+            Membership::validate(racer_control_wire::MembershipVersion(2), members.clone())
+                .unwrap(),
+        );
+        // Without rank 0, version 1 ranks someone else first.
+        let old = Arc::new(
+            Membership::validate(
+                racer_control_wire::MembershipVersion(1),
+                if same {
+                    members
+                } else {
+                    members
+                        .into_iter()
+                        .filter(|m| m.node != ordered[0])
+                        .collect()
+                },
+            )
+            .unwrap(),
+        );
+        let published = Arc::new(controlplane::Published::new(
+            crate::control::Snapshot::retention(2),
+        ));
+        let now = uring_runtime::environment::now();
+        for (i, (membership, at)) in [
+            (old.clone(), now - Duration::from_secs(60)),
+            (current.clone(), now - Duration::from_secs(age)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut snapshot = crate::control::Snapshot::membership_fixture(membership);
+            snapshot.sequence = racer_control_wire::PublicationSequence(i as u64 + 1);
+            published
+                .publish(Arc::new(snapshot), at, |_, _| Ok::<_, Error>(()), || ())
+                .unwrap();
+        }
+        let placement = Rc::new(Placement::new(16));
+        let previous = placement
+            .rank(old.clone(), &f.context.object, f.page.number)
+            .ordered;
+        assert_eq!(previous[0] == ordered[0], same);
+        let mut deps = f.fill.dependencies.clone();
+        deps.candidates = Rc::new(CandidatePolicy::new(
+            ordered[1].clone(),
+            placement,
+            peers.requester(),
+            deps.credentials.clone(),
+            published,
+        ));
+        f.fill = Fill::new(deps);
+        f.membership = current;
+        peers.replies.borrow_mut().push_back((
+            ordered[0].clone(),
+            if copy {
+                Reply::Copy(good.clone())
+            } else {
+                Reply::Stale
+            },
+        ));
+        // Handoff targets (version 1 owners that are not current
+        // predecessors or this node) answer misses if asked.
+        for node in previous
+            .iter()
+            .filter(|n| **n != ordered[0] && **n != ordered[1])
+        {
+            peers
+                .replies
+                .borrow_mut()
+                .push_back((node.clone(), Reply::Miss));
+        }
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+        let result = acquire(&mut f, &mut budget).unwrap();
+        assert_eq!(result.plaintext.bytes(), b"abc");
+        let calls = peers.calls.borrow();
+        let memberships = peers.memberships.borrow();
+        assert_eq!(calls[0].0, ordered[0]);
+        assert!(!calls[0].1, "rank 0 receives the delegated Acquire");
+        assert_eq!(
+            (memberships[0], f.origin.calls.get()),
+            expected,
+            "age {age} same {same} copy {copy}"
+        );
+        // Only predecessor probes use the previous membership.
+        assert!(memberships[1..].iter().all(|v| *v == 2), "{memberships:?}");
     }
 }
 
