@@ -317,6 +317,39 @@ struct Fill {
     continuation: Continuation,
     hedge: Option<Box<Race>>,
     _reservation: Vec<SimCharge>,
+    /// When the fill started (repeat classification).
+    started: Nanos,
+    /// Destination of the outstanding walk probe.
+    asking: Option<u32>,
+    /// Walk probes so far: destination and how each ended (repeat
+    /// classification, [`NodeWorld::classify_repeat`]).
+    asked: Vec<(u32, Asked)>,
+}
+
+/// How one walk probe ended, for repeat classification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Asked {
+    Copy,
+    Miss,
+    /// Transport failure: the destination or the route to it was down,
+    /// partitioned, not serving yet, or out of budget on the way.
+    Unreachable,
+    /// The destination or a relay shed the request, or it was behind.
+    Busy,
+    /// The probe could not be planned (budget) or failed terminally.
+    Unfunded,
+}
+
+/// The last origin request for a page ([`NodeWorld::classify_repeat`]).
+#[derive(Clone, Copy, Debug)]
+struct LastOrigin {
+    node: u32,
+    /// The page's rank 0 under that request's membership.
+    rank0: u32,
+    /// `None` while in flight, then whether it succeeded.
+    ok: Option<bool>,
+    /// When it completed.
+    done: Nanos,
 }
 
 impl Fill {
@@ -502,7 +535,7 @@ pub struct NodeWorld {
     origin_per_page: HashMap<u64, u32, Fixed>,
     /// Per page: the node that last asked origin for it and the page's rank 0
     /// under that request's membership (see [`Self::classify_repeat`]).
-    last_origin: HashMap<u64, (u32, u32), Fixed>,
+    last_origin: HashMap<u64, LastOrigin, Fixed>,
     tasks: HashMap<u64, Task, Fixed>,
     /// When each currently down node went down (Known issue 7 evidence).
     down_since: HashMap<u32, Nanos, Fixed>,
@@ -1411,6 +1444,9 @@ impl NodeWorld {
                 continuation: Continuation::default(),
                 hedge: None,
                 _reservation: reservation,
+                started: self.engine.now(),
+                asking: None,
+                asked: Vec::new(),
             },
         );
         self.metrics.incr("fills");
@@ -2222,6 +2258,7 @@ impl NodeWorld {
         let plan = match plan {
             Ok(plan) => plan,
             Err(e) => {
+                fill.asked.push((dest, Asked::Unfunded));
                 return match transport_outcome(e) {
                     Some(outcome) => Err(Some(outcome)),
                     None => {
@@ -2253,7 +2290,9 @@ impl NodeWorld {
             self.metrics.incr("previous_membership_probes");
         }
         let pid = self.launch(id, dest, version, acquire, &plan, false, None);
-        self.fills.get_mut(&id).expect("present").probe = Some(pid);
+        let fill = self.fills.get_mut(&id).expect("present");
+        fill.probe = Some(pid);
+        fill.asking = Some(dest);
         Ok(())
     }
 
@@ -2967,6 +3006,19 @@ impl NodeWorld {
             };
             self.metrics.incr(label);
         }
+        if let Some(dest) = fill.asking.take() {
+            let asked = match &outcome {
+                Ok(Outcome::Copy) => Asked::Copy,
+                Ok(Outcome::Probe(ProbeOutcome::CopyMiss | ProbeOutcome::VersionUnavailable)) => {
+                    Asked::Miss
+                }
+                Ok(Outcome::Transport(ProbeOutcome::Unreachable))
+                | Ok(Outcome::Probe(ProbeOutcome::Unreachable)) => Asked::Unreachable,
+                Ok(_) => Asked::Busy,
+                Err(_) => Asked::Unfunded,
+            };
+            fill.asked.push((dest, asked));
+        }
         match &mut fill.walk {
             Walking::Candidates(walk) => match outcome {
                 Err(e) => self.hard_fail(id, e),
@@ -3130,28 +3182,52 @@ impl NodeWorld {
     }
 
     /// Classify a repeated origin request for a page (Known issues 6, 12,
-    /// 13). With `A` the node that last asked origin for the page:
+    /// 13, 15). With `A` the node that last asked origin for the page and
+    /// `F` the fill asking now:
     ///
     /// - `origin_repeats_after_move`: the page's rank 0 differs from rank 0
     ///   under `A`'s request, so ownership moved in between. At most one
     ///   such fetch per move is the bound the walk aims for: the new rank 0
     ///   finds `A` only through handoff probes (previous membership) or not
     ///   at all once that membership is gone.
-    /// - `origin_repeats_copy_lost`: same rank 0, and `A` no longer holds
-    ///   the page (evicted or crashed); a fetch is unavoidable.
+    /// - `origin_repeats_after_failure`: same rank 0, and `A`'s request
+    ///   failed (origin 5xx, 412, 403), so nobody got the page from it.
+    /// - `origin_repeats_concurrent`: same rank 0, and `A`'s request is
+    ///   still in flight (two cold misses that did not coalesce).
+    /// - `origin_repeats_copy_lost`: same rank 0, `A`'s request succeeded,
+    ///   and `A` no longer holds the page (evicted or crashed).
     /// - `origin_repeats_copy_held`: same rank 0 and `A` still holds the
-    ///   page. Only transient failures (rank 0 unreachable or overloaded,
-    ///   origin errors), concurrent cold misses, or a walk without credits
-    ///   or links for the delegation lead here; tests bound it.
+    ///   page, split by why `F` did not get it from `A`
+    ///   (`origin_repeats_held_*`):
+    ///   - `raced`: `A`'s copy landed after `F` started, so `F` may have
+    ///     asked before it existed (concurrency);
+    ///   - `unreachable`: `F` asked `A` and the probe failed in transport
+    ///     (`A` or the route to it down, partitioned, not serving yet);
+    ///   - `busy`: `F` asked `A` and it, or a relay, shed the request or
+    ///     was behind on membership;
+    ///   - `unfunded`: `F` had a probe for `A` but no budget to send it;
+    ///   - `missed`: `F` asked `A` and was told it had no copy although
+    ///     it held one before `F` started (should not happen);
+    ///   - `unasked`: `F` never asked `A`. This is the avoidable class
+    ///     (Known issue 15): owners ask predecessors, handoff targets and
+    ///     successors, so `A` goes unasked only when it is no current or
+    ///     previous owner, or the walk ran out of credits first.
     fn classify_repeat(&mut self, id: u64) {
+        let now = self.now();
         let fill = &self.fills[&id];
         let (node, page) = (fill.node, fill.page);
         let rank0 = fill.cands.first().copied().unwrap_or(node);
-        let Some((last, last_rank0)) = self.last_origin.insert(page, (node, rank0)) else {
+        let next = LastOrigin {
+            node,
+            rank0,
+            ok: None,
+            done: now,
+        };
+        let Some(last) = self.last_origin.insert(page, next) else {
             return;
         };
         let held = |n: &NodeWorld| {
-            let holder = &n.nodes[last as usize];
+            let holder = &n.nodes[last.node as usize];
             !holder.down
                 && (holder.disk.entries.get(&page).is_some()
                     || holder
@@ -3159,13 +3235,37 @@ impl NodeWorld {
                         .iter()
                         .any(|w| w.memory.pages.contains_key(&page)))
         };
-        self.metrics.incr(if last_rank0 != rank0 {
+        let class = if last.rank0 != rank0 {
             "origin_repeats_after_move"
-        } else if held(self) {
-            "origin_repeats_copy_held"
-        } else {
+        } else if last.ok == Some(false) {
+            "origin_repeats_after_failure"
+        } else if last.ok.is_none() {
+            "origin_repeats_concurrent"
+        } else if !held(self) {
             "origin_repeats_copy_lost"
-        });
+        } else {
+            let asked = |kind: Asked| {
+                fill.asked
+                    .iter()
+                    .any(|&(dest, a)| dest == last.node && a == kind)
+            };
+            let cause = if last.done > fill.started {
+                "origin_repeats_held_raced"
+            } else if asked(Asked::Unreachable) {
+                "origin_repeats_held_unreachable"
+            } else if asked(Asked::Busy) {
+                "origin_repeats_held_busy"
+            } else if asked(Asked::Unfunded) {
+                "origin_repeats_held_unfunded"
+            } else if asked(Asked::Miss) || asked(Asked::Copy) {
+                "origin_repeats_held_missed"
+            } else {
+                "origin_repeats_held_unasked"
+            };
+            self.metrics.incr(cause);
+            "origin_repeats_copy_held"
+        };
+        self.metrics.incr(class);
     }
 
     fn origin_done(&mut self, id: u64, outcome: OriginOutcome) {
@@ -3190,7 +3290,17 @@ impl NodeWorld {
                 Err(Error::Unavailable)
             }
         };
+        let (node, page) = (fill.node, fill.page);
+        let ok = result.is_ok();
         fill.plan.origin(result);
+        let now = self.now();
+        if let Some(last) = self.last_origin.get_mut(&page)
+            && last.node == node
+            && last.ok.is_none()
+        {
+            last.ok = Some(ok);
+            last.done = now;
+        }
         self.continue_plan(id);
     }
 
@@ -3480,7 +3590,7 @@ impl NodeWorld {
                 + self.tasks.len() * (std::mem::size_of::<Task>() + 256),
         ));
         list.push(("origin_per_page", self.origin_per_page.capacity() * 16));
-        list.push(("last_origin", self.last_origin.capacity() * 24));
+        list.push(("last_origin", self.last_origin.capacity() * 32));
         list.push((
             "node_rng",
             self.node_rng.capacity() * std::mem::size_of::<SplitMix64>(),
@@ -3537,7 +3647,17 @@ impl NodeWorld {
                 "repeats": {
                     "after_owner_move": c("origin_repeats_after_move"),
                     "copy_lost": c("origin_repeats_copy_lost"),
+                    "after_failure": c("origin_repeats_after_failure"),
+                    "concurrent": c("origin_repeats_concurrent"),
                     "copy_held": c("origin_repeats_copy_held"),
+                    "held": {
+                        "raced": c("origin_repeats_held_raced"),
+                        "unreachable": c("origin_repeats_held_unreachable"),
+                        "busy": c("origin_repeats_held_busy"),
+                        "unfunded": c("origin_repeats_held_unfunded"),
+                        "missed": c("origin_repeats_held_missed"),
+                        "unasked": c("origin_repeats_held_unasked"),
+                    },
                 },
             },
             "cache": {

@@ -524,14 +524,32 @@ fn joined_owners_copy_from_previous_owners() {
     // Without handoff probes this was 19 (three pages fetched twice).
     assert!(counter(&report, "handoff_probes") > 0, "{report}");
     assert_eq!(counter(&report, "origin_requests"), pages, "{per_page:?}");
-    assert_eq!(
-        report["origin_per_page"]["repeats"],
-        serde_json::json!({"after_owner_move": 0, "copy_held": 0, "copy_lost": 0})
-    );
+    assert_eq!(all_repeats(&report), 0, "{}", report["origin_per_page"]);
 }
 
 fn repeats(report: &Value, kind: &str) -> u64 {
     report["origin_per_page"]["repeats"][kind].as_u64().unwrap()
+}
+
+/// Repeated origin requests over every class (`NodeWorld::classify_repeat`).
+fn all_repeats(report: &Value) -> u64 {
+    [
+        "after_owner_move",
+        "after_failure",
+        "concurrent",
+        "copy_lost",
+        "copy_held",
+    ]
+    .iter()
+    .map(|kind| repeats(report, kind))
+    .sum()
+}
+
+/// `copy_held` repeats with cause `cause` (`origin_repeats_held_*`).
+fn held(report: &Value, cause: &str) -> u64 {
+    report["origin_per_page"]["repeats"]["held"][cause]
+        .as_u64()
+        .unwrap()
 }
 
 /// Known issue 12: under churn, an owner whose predecessor has not adopted
@@ -572,7 +590,7 @@ fn owners_ask_lagging_predecessors_under_the_previous_membership() {
 /// was lost (unavoidable), or while the previous fetcher still held it. The
 /// last kind needs a transient failure, a concurrent cold miss, or a walk
 /// without credits for the delegation; it stays under 2% of origin requests
-/// under churn, and every repeat is one of the three.
+/// under churn, and every repeat falls in exactly one class.
 #[test]
 fn repeat_origin_fetches_are_classified_and_bounded() {
     for (nodes, seed) in [(120, 1), (300, 1), (300, 2)] {
@@ -580,8 +598,24 @@ fn repeat_origin_fetches_are_classified_and_bounded() {
         let origin = counter(&report, "origin_requests");
         let pages = report["origin_per_page"]["pages"].as_u64().unwrap();
         let held = repeats(&report, "copy_held");
-        let all = held + repeats(&report, "copy_lost") + repeats(&report, "after_owner_move");
-        assert_eq!(all, origin - pages, "{}", report["origin_per_page"]);
+        assert_eq!(
+            all_repeats(&report),
+            origin - pages,
+            "{}",
+            report["origin_per_page"]
+        );
+        let causes: u64 = [
+            "raced",
+            "unreachable",
+            "busy",
+            "unfunded",
+            "missed",
+            "unasked",
+        ]
+        .iter()
+        .map(|cause| self::held(&report, cause))
+        .sum();
+        assert_eq!(causes, held, "{}", report["origin_per_page"]);
         assert!(
             held * 50 <= origin,
             "{nodes} {seed}: {}",
