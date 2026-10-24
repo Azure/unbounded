@@ -247,10 +247,20 @@ Verified against the code at the start of this work.
 
 9. A duplicate memory publish touches only in the simulator. Production `MemoryCache::publish`
    returns early for a resident page without touching it (`cmd/racer-dataplane/src/memory.rs:1415-1418`),
-   while the simulator's `memory_insert` touches it (`sim/src/node/world.rs:1084-1086`), so such a
+   while the simulator's `memory_insert` touches it (`sim/src/node/world.rs:1214-1216`), so such a
    page lives slightly longer in the simulator. It only happens when a fill publishes or a disk hit
    promotes a page that is already in memory. Pinned by
    `read::core_equivalence::duplicate_publish_touches_only_in_the_simulator`.
+
+10. Route search admission is per node and has no queue. A node runs at most 8 distinct searches at
+   once (`Paths::route`, `cmd/racer-dataplane/topology/src/paths.rs:530`), and any further search
+   fails at once with `Overloaded`. The send then fails: a requester sees a transport error, and a
+   relay answers `Overloaded` through `relay_failure`. Either way the walk pays the failure-route
+   charge from Known issue 5. In the simulator, searches run as yielding tasks ("Round 2:
+   fidelity"), so they now overlap in time. In `full-cold-start` at 50,000 nodes (seed 1,
+   `request_rate` 0.005), 720,628 searches were rejected this way during the storm, along with 502k
+   `HopBudgetExhausted` failures. No search was rejected in the other combined runs. No invariant
+   is relaxed. This is reported as a behavior to review.
 
 ## Simulator engine (racer-sim substrate)
 
@@ -524,10 +534,11 @@ Choices and differences from production:
 - Admission runs the production rules (`racer_core::admission::Rules`, see "Round 2: production
   admission"). Only rejection reporting differs (per-class counters instead of telemetry), and the
   cache id is interned to `u32`.
-- Hedges: `hedge_eligible` is evaluated and counted, but no hedge is raced.
-- Retention observes a page when it is published, not at client read time.
+- Hedges are raced as in production when `node.hedge_slots` is nonzero (default 0, as in production);
+  see "Round 2: fidelity".
+- Retention observes every client read, as production does; see "Round 2: fidelity".
 - Link backoff has the production shape, with jitter from a fixed mix instead of SHA-256.
-- Searches and rankings finish inside one event; CPU time is charged per poll.
+- Searches and rankings yield between CPU slices; see "Round 2: fidelity".
 - Reads at nodes outside the current membership are skipped. Clients retry `recoverable` errors
   up to 4 times.
 - `page-alloc` is built with its `simulation` feature (for `Segments::configure`). The
@@ -615,45 +626,56 @@ Release build, seed 1, 50,000 nodes, default durations, `--config '{"request_rat
 run several times longer). Runs went two at a time on a 48-core host, each on one thread. Peak RSS
 is `VmHWM`; histogram values are log-bucket upper bounds.
 
+These numbers are from the rerun after round 2 ("Round 2: fidelity"), with yielding searches,
+client-time retention, held base hashes, and the default data-plane faults of each scenario. Hedging
+is off, the production default. Events now include one per ranking or search CPU slice.
+
 | scenario | sim time | wall | peak RSS | accounted per node | events |
 | --- | --- | --- | --- | --- | --- |
-| full-cold-start | 400 s | 19:17 | 6.74 GiB | 77 KB | 16.3M |
-| full-failover | 900 s | 12:52 | 2.65 GiB | 24 KB | 3.1M |
-| full-churn | 1200 s | 21:12 | 2.54 GiB | 25 KB | 4.1M |
-| full-lagging | 900 s | 15:35 | 2.66 GiB | 24 KB | 3.3M |
+| full-cold-start | 400 s | 18:41 | 6.21 GiB | 61 KB | 197.5M |
+| full-failover | 900 s | 13:50 | 2.64 GiB | 24 KB | 73.0M |
+| full-churn | 1200 s | 23:57 | 2.50 GiB | 25 KB | 76.5M |
+| full-lagging | 900 s | 16:42 | 2.65 GiB | 24 KB | 71.1M |
 
 All four end with zero hard invariant failures and no relaxed invariant. Peak RSS is far below
-32 GiB; the cold-start storm is the largest (route memo and in-flight state, as in `storm`).
+32 GiB. The cold-start storm uses the most memory (route memo and in-flight state, as in `storm`).
 
 | scenario | page reads ok / failed | failures by cause | origin requests per page (mean, max) | control |
 | --- | --- | --- | --- | --- |
-| full-cold-start | 123k / 762k | 510k hop budget, 249k deadline, 3.6k unavailable | 1.59, 3 | all enrolled at 282 s; 462k API 429s, 501 write 429s; client lag p50 129 s, p99 258 s (enrollment) |
-| full-failover | 268k / 15.6k | 12.0k hop budget, 3.7k unavailable | 1.38, 3 | 3 terms, 4 crashes, 3 restarts; all enrolled at 284 s |
-| full-churn | 329k / 5.0k | 3.8k incompatible membership, 1.0k hop budget, 0.2k unavailable | 1.64, 11 | 11 versions, 2,500 Pods removed; 454k write 429s; client lag p50 4.3 s, p99 24 s; 4.5k `StaleMembership` replies |
-| full-lagging | 254k / 21.4k | 12.1k hop budget, 5.6k incompatible membership, 3.7k unavailable | 1.37, 4 | 45k unreachable attempts, 50k write 429s; client lag p50 21 s, p99 258 s; 6.8k `StaleMembership` replies |
+| full-cold-start | 153k / 735k | 502k hop budget, 230k deadline, 3.5k unavailable | 1.45, 3 | all enrolled at 282 s; 462k API 429s, 501 write 429s; client lag p50 129 s, p99 258 s (enrollment) |
+| full-failover | 263k / 18.4k | 14.7k hop budget, 3.7k unavailable | 1.42, 8 | 3 terms, 4 crashes, 3 restarts; all enrolled at 284 s; 1.6k origin 5xx, 96k link failures |
+| full-churn | 329k / 5.0k | 3.8k incompatible membership, 1.0k hop budget, 0.2k unavailable | 1.64, 10 | 11 versions, 2,500 Pods removed; 454k write 429s; client lag p50 4.3 s, p99 24 s; 4.5k `StaleMembership` replies; 285 origin 412s; 295k delta and 54k full replies |
+| full-lagging | 254k / 21.5k | 12.3k hop budget, 5.6k incompatible membership, 3.6k unavailable | 1.37, 4 | 45k unreachable attempts, 50k write 429s; client lag p50 21 s, p99 258 s; 6.8k `StaleMembership` replies; 45k delta and 54k full replies |
 
 Observations:
 
 - The cold-start storm (50,000 nodes times 16 pages in one second) fails most reads through Known
-  issue 5 and read deadlines, as the standalone `storm` does; origin load stays at most 3 per page.
+  issue 5 and read deadlines, as the standalone `storm` does. Origin load stays at most 3 per page.
+  With yielding searches, nodes reject 721k route searches with `Overloaded` at the production
+  limit of 8 concurrent searches (Known issue 10). This limit causes no failures in the other three
+  runs.
+- In `full-failover`, origin 5xx bursts fail fills, and client retries fetch again, so one page
+  reached the origin 8 times. The site partition adds link failures and hop budget failures (Known
+  issues 5 and 7).
 - Membership skew from lagging control clients shows up as `StaleMembership` replies and
   `IncompatibleMembership` failures (Known issue 3). At the end of every run all live nodes are on
   the latest committed version.
 - Ownership moves raise origin requests per page above `REPLICAS` (Known issue 6), and crashed
   members cause hop budget failures (Known issue 7).
-- Host time goes to real placement ranking at 50,000 members (404 to 876 s per run, from the
-  report's `profile_wall_ms`), then route search (768 s in the cold-start storm).
+- No placement ranking was rejected (`ranking_overloaded` 0): 256 entries per worker are enough
+  for this load.
+- No control reply fell back to a full image because of a held hash mismatch
+  (`ctl_base_hash_mismatches` 0). Delta and full counts follow the sequence check, as before.
+- Host time goes to real placement ranking at 50,000 members (252 to 965 s per run, from the
+  report's `profile_wall_ms`), then route search (596 s in the cold-start storm).
 - About 34k reads per run are skipped while their nodes are not yet enrolled (73k in
   `full-churn`, where Pods join late).
 
 ### Remaining gaps
 
-- Hedges are evaluated (`hedge_eligible`) but not raced.
-- Retention observes a page at publish, not at client read time.
-- Searches and rankings finish inside one event; CPU is charged per poll.
-- The control client model assumes a client at the delta base holds its hash.
-- Data-plane faults (site partitions, slow nodes, origin errors) are not combined with the control
-  plans; `--config` `faults` still applies to the data plane.
+Closed in round 2 (see "Round 2: fidelity"): hedges are raced, retention observes client reads,
+searches and rankings yield, control clients send the base hash they hold, and the combined
+scenarios carry data-plane faults.
 
 ### Known issues, summary
 
@@ -667,6 +689,7 @@ Observations:
 7. Crashed members stay routable until link backoff; reads near them hit issue 5.
 8. Core `PageFlights` lets an origin-rejected leader receive a later result; production fails it.
 9. The simulator touches a page on a duplicate memory publish; production does not.
+10. Route searches beyond 8 per node fail at once with `Overloaded`; storms reject many of them.
 
 ## Round 2: production admission
 
@@ -757,3 +780,138 @@ Differences from the old assertions:
   cancellation, or request deadlines on the data plane; those stay production contract tests.
 
 `sim/tests/contention_scenarios.rs` runs in about 9 s under the workspace test profile.
+
+## Round 2: fidelity
+
+This round closes the five gaps listed under "Combined control and data plane". Code:
+`cmd/racer-dataplane/sim/src/node/world.rs`, `node/state.rs`, `node/config.rs`, `control.rs`,
+`combined.rs`, and `resources.rs`. Production behavior is unchanged.
+
+### Hedged page reads
+
+The simulator races hedges with the same rules as production `hedge_page`
+(`src/read/candidates.rs:190`) and `uring_runtime::drivers::race` (`runtime/src/drivers.rs:599`):
+
+- After ranking, a plaintext fill at a non-owner evaluates `hedge_eligible`. The race starts only when
+  `node.hedge_slots` is nonzero, both of the first two visited owners are directly reachable (the
+  requester's link circuits allow them), one page of plaintext and ciphertext is held as escrow, two
+  pages fit as a trial reservation, and the node's shared `flow_control::Hedges` grants a permit for
+  `DUPLICATE_BYTES`. Otherwise the plan reports no hedge (`hedge_suppressed` when eligible).
+- `hedge_budgets` splits the fill budget. The primary is an `Acquire` to rank 0 and the duplicate is a
+  `CopyOnly` to the second visited owner. Both are planned with `RouteMode::DirectHedge` and sent as
+  pinned one-link exchanges that skip route search.
+- The duplicate starts after `node.hedge_delay_ns`, unless the primary has already finished or the race
+  is decided. Before it starts, the link and one page of headroom are checked again. Each started
+  duplicate counts `DUPLICATE_BYTES` in `hedge_duplicate_bytes`, as production `Permit::started` does.
+- The first page wins. A non-recoverable error is fatal, and recoverable errors wait for the other
+  contender. When the race is decided, the losing probe and its message are dropped, which releases
+  its relay charges. Production waits for the loser's completion fence before it returns. The
+  simulator releases at cancellation.
+- When both sides are done, the budgets are reunited. `budget_never_grows` checks the split, both
+  attempt plans, and the reunited budget. A winner publishes as `Source::Hedge`. Otherwise
+  `hedge_fallback` errors run the serial walk with `primary_consumed`, the primary's evidence, and
+  bounded routes. A stale reply refreshes the membership (`refresh_allowed`) and walks the new epoch,
+  as `resolve_epoch_traced` does.
+
+Knobs under `"node"`: `hedge_slots` (default 0, hedging off, as production `page_hedge_slots`),
+`hedge_delay_ns` (100 ms), and `hedge_bytes` (one `DUPLICATE_BYTES`; it must cover one duplicate when
+hedging is on). Because the default byte budget allows one race per node at a time, `hedge_bytes`
+must grow with `hedge_slots` for more concurrent races. Test: `node::tests::hedging_beats_a_slow_primary`.
+It uses 64 nodes, seed 21, and makes each rank 0 owner 255 times slower. Without hedging, 20 page
+fills are eligible and none is raced. With 4 slots and a 5 ms delay, 17 races start, the duplicate
+wins all 17, the losers are canceled, and the mean read latency falls from about 137 ms to about
+80 ms.
+
+Fabric change found by this test: `Fabric::transfer` used to reserve the receiver's NIC at each chunk's
+send time, so a slow sender's chunks, reserved up front into the future, blocked every other sender to
+that receiver until the slow transfer ended. The receiver is now a work-conserving backlog of its own
+service time from the transfer's issue (`resources.rs:186`). With equal-speed senders this matches the
+old FIFO slot. Test: `resources::tests::slow_sender_does_not_hold_the_receiver`.
+
+### Retention at client read time
+
+Production observes retention once per client operation (`src/read/fill.rs:983-1014`): on a memory hit
+it calls `Retention::observe` and then `persist_verified`. On a miss it observes before joining the
+flight, and a peer acquire uses `owned_only`. The simulator now does the same:
+
+- `NodeWorld::observe` (`world.rs:2740`) follows `Retention::observe_at` (`src/retention.rs:181`): it
+  applies the ownership predicate, then records second-sight history and touches heat. Ownership is
+  `NodeWorld::owned` (`world.rs:2725`), the worker's cached `Placement::is_owner` on the node's
+  current snapshot. A missing or partial ranking is not owned, as in production `is_owned`.
+- The observation is held by the read. Memory hits and completed joins call `persist_page`
+  (`world.rs:2756`, production `persist_verified`, with ownership checked again when it runs). A
+  flight leader carries its observation to publication, and waiters use their own when they wake
+  with the page.
+- Heat is no longer touched by peer disk hits, matching production, where a peer acquire does not
+  observe.
+
+Test: `node::tests::retention_observes_client_reads_including_memory_hits` (a non-owner persists a page
+on its second read, which is a memory hit, not at publication).
+
+### Yielding rankings and route searches
+
+Rankings and route searches run as tasks (`spawn` and `slice`, `world.rs:1302-1440`). Each task holds
+the real future (`Placement::rank_async` or `Paths::route`) together with `Rc` handles to the worker's
+placement or the node's paths. Each poll is one CPU slice on the worker's CPU FIFO, and the next poll
+runs in an event at the end of that slice, so work queued on the CPU in the meantime runs between
+slices, as an executor runs other tasks after a yield:
+
+- Ranking: every poll costs `ranking_chunk_ns` and scores up to `WORK_QUANTUM` (256) members
+  (`topology/src/placement.rs:19`). The future pins its cache entry across yields. When the cache is
+  full of pinned entries, `ranking()` returns `Overloaded` (`placement.rs:815`), counted as
+  `ranking_overloaded`.
+- Route search: a cache hit answers on the first poll at no cost. Each further poll expands up to
+  32 nodes (`SEARCH_QUANTUM`) at `path_expand_ns_per_node` each. A search holds its in-flight slot,
+  and the ninth concurrent distinct search on a node fails with `Overloaded`
+  (`topology/src/paths.rs:530`, `active_searches` 8), counted as `route_search_overloaded`.
+- When a search finishes, the blocked set is recomputed. If it changed, the hop fails with
+  `Unavailable` (`route_blocked_changed`), as production `Paths::shortest` does (`src/topology.rs:681`).
+- The phantom placement's shared memo still provides the result. Each worker's cache entry keeps its
+  own cursor, so a cold slot takes the production number of polls and keeps its pin for that long.
+  Route results are shared through `SharedRoutes`, and each node's `Paths` still charges and holds its
+  own search.
+
+A crash drops the node's tasks, which releases their pins and slots. Test:
+`node::tests::yielding_searches_hit_production_concurrency_limits` (600 nodes, so each ranking takes
+three polls, with 2 placement entries and 1 search slot: both limits reject work; with defaults no
+ranking is rejected).
+
+### Control clients send the base hash they hold
+
+Each control client keeps a fingerprint of the content hash of the image it applied (`held` in
+`control.rs`, the first 64 bits of the hex SHA-256). The fingerprint is cleared on a process restart and
+set from the delivered image (or from the hash recorded per committed sequence when the seat answers
+from an older sequence). A reply sends the hash the client actually holds. `reply_body`
+(`control.rs:64`) passes it to the real `body_for` (`cluster-control/src/step/admission.rs:71`, used by
+`Image::for_base`), so a seat sends a delta only when the client's applied sequence and held hash both
+match the delta base. Otherwise it sends the full image (`ctl_base_hash_mismatches` counts full replies
+at the base sequence). Tests: `control::tests::delta_needs_the_held_base_hash` (up to date gets a
+delta; restarted, two behind, and a different hash at the same sequence get full images) and
+`mismatched_held_hash_falls_back_to_full`.
+
+In the existing scenarios, sequences are monotonic (`ctl_sequence_monotonic`) and each content hash
+belongs to one sequence, so the delta and full counts do not change. Restarted and lagging clients
+already fell back on the sequence check. The held hash only matters when a client holds a different
+image at the same sequence.
+
+### Data-plane faults in the combined scenarios
+
+`DataFaults` (`combined.rs:72`, `"combined_faults"` in `--config`) adds data-plane faults to each
+combined plan when `--config` gives no `faults` list. An explicit list replaces the defaults, and
+`"enabled": false` turns them off. For a run of length `d`:
+
+| scenario | data-plane faults |
+| --- | --- |
+| `full-cold-start` | 1% of nodes (`slow_permille` 10) run 8 times slower (`slow_factor`) from 3d/4 - d/40 to 3d/4 + d/20, around the storm |
+| `full-failover` | sites 0 and 1 are cut apart from 2d/5 to d/2 (`partition`); origin 5xx at `p5xx` 0.3 for `burst_ns` (30 s) at d/5 and 3d/5 |
+| `full-churn` | origin 412 at `p412` 0.1 for 30 s at d/2, while ownership moves |
+| `full-lagging` | 1% of nodes run 8 times slower from d/10 to 9d/10 |
+
+Slow nodes are every `1000 / slow_permille`-th node, starting at half that stride. The standalone
+`faults` scenario and `--config` `faults` work as before. Test:
+`combined::tests::data_faults_join_the_control_plans`.
+
+### Scale
+
+The four combined scenarios were rerun at 50,000 nodes with these models. The results are in
+"Combined acceptance (50k)".
