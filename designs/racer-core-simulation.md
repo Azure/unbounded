@@ -503,10 +503,9 @@ Choices and differences from production:
   entries and 256 KiB per node (production 128 entries, 8 MiB). Decisions are the same code at any
   capacity; these keep per-node memory small. Flight, waiter, relay, and fill quota limits use
   production defaults. All are set under `"node"` in `--config`.
-- `AdmissionPolicy` depends on dataplane config and telemetry, so the simulator has its own
-  `flow_control::Policy` with the same limits, floors, and wipe rules for the classes it uses
-  (`Plaintext`, `Ciphertext`, `DirtyCiphertext`, `Flight`, `Waiter`, `Relay`). The cache id is
-  interned to `u32`.
+- Admission runs the production rules (`racer_core::admission::Rules`, see "Round 2: production
+  admission"). Only rejection reporting differs (per-class counters instead of telemetry), and the
+  cache id is interned to `u32`.
 - Hedges: `hedge_eligible` is evaluated and counted, but no hedge is raced.
 - Retention observes a page when it is published, not at client read time.
 - Link backoff has the production shape, with jitter from a fixed mix instead of SHA-256.

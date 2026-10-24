@@ -1011,10 +1011,44 @@ mod rules_equivalence_tests {
         }
     }
 
+    /// Cache priority's per-cache allowance as it read before it moved to
+    /// racer-core.
+    fn legacy_progress(limits: &Limits, class: ResourceClass) -> usize {
+        let window = limits.range_window_pages.get();
+        let record = PAGE_BYTES as usize + 16 + crate::store::MAX_HEADER_BYTES;
+        match class {
+            ResourceClass::Plaintext => {
+                window.saturating_add(1).saturating_mul(PAGE_BYTES as usize)
+            }
+            ResourceClass::Ciphertext => window
+                .saturating_mul(PAGE_BYTES as usize + 16)
+                .saturating_add(record),
+            _ => 0,
+        }
+    }
+
     fn check(limits: Limits) {
         let policy = AdmissionPolicy::new(limits.clone());
         for class in ResourceClass::ALL {
-            assert_eq!(policy.limit(class), legacy_limit(&limits, class), "{class:?}");
+            assert_eq!(
+                policy.progress(class),
+                legacy_progress(&limits, class),
+                "{class:?}"
+            );
+            assert_eq!(
+                AdmissionPolicy::weighted(class),
+                matches!(
+                    class,
+                    ResourceClass::Plaintext
+                        | ResourceClass::Ciphertext
+                        | ResourceClass::DirtyCiphertext
+                )
+            );
+            assert_eq!(
+                policy.limit(class),
+                legacy_limit(&limits, class),
+                "{class:?}"
+            );
             assert_eq!(policy.floor(class), legacy_floor(class), "{class:?}");
             assert_eq!(
                 AdmissionPolicy::wakes(class),
@@ -1048,16 +1082,18 @@ mod rules_equivalence_tests {
         check(scaled.limits);
         let one = NonZeroUsize::MIN;
         for connections in [1, 2, 3, 4, 7, 8, 11, 12, 13, 16, 65_536] {
-            let mut limits = Limits::default();
-            limits.client_connections = NonZeroUsize::new(connections).unwrap();
-            check(limits);
+            check(Limits {
+                client_connections: NonZeroUsize::new(connections).unwrap(),
+                ..Limits::default()
+            });
         }
-        let mut limits = Limits::default();
-        limits.flights = NonZeroUsize::MAX;
-        limits.waiters_per_flight = NonZeroUsize::MAX;
-        limits.metadata_entries = one;
-        limits.relay_transfers = one;
-        limits.queue_entries = one;
-        check(limits);
+        check(Limits {
+            flights: NonZeroUsize::MAX,
+            waiters_per_flight: NonZeroUsize::MAX,
+            metadata_entries: one,
+            relay_transfers: one,
+            queue_entries: one,
+            ..Limits::default()
+        });
     }
 }
