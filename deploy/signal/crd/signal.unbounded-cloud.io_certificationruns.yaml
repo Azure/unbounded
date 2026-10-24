@@ -1,0 +1,481 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: certificationruns.signal.unbounded-cloud.io
+spec:
+  group: signal.unbounded-cloud.io
+  names:
+    kind: CertificationRun
+    listKind: CertificationRunList
+    plural: certificationruns
+    shortNames:
+    - certrun
+    singular: certificationrun
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.profile.name
+      name: Profile
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.workflow.name
+      name: Workflow
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            properties:
+              cancel:
+                type: boolean
+              checks:
+                items:
+                  properties:
+                    backend:
+                      enum:
+                      - Pod
+                      - MPIJob
+                      type: string
+                    backendActiveDeadline:
+                      type: string
+                    gpuCount:
+                      format: int32
+                      type: integer
+                    participantPolicy:
+                      properties:
+                        roles:
+                          items:
+                            type: string
+                          maxItems: 16
+                          type: array
+                      type: object
+                    runnerImage:
+                      type: string
+                    script:
+                      properties:
+                        digest:
+                          description: Digest is the algorithm-qualified SHA-256 digest
+                            of the selected script bytes.
+                          pattern: ^sha256:[0-9a-f]{64}$
+                          type: string
+                        key:
+                          type: string
+                      required:
+                      - digest
+                      - key
+                      type: object
+                    scriptEnvironment:
+                      additionalProperties:
+                        type: string
+                      maxProperties: 32
+                      type: object
+                    workloadPolicy:
+                      properties:
+                        capabilities:
+                          items:
+                            description: Capability represent POSIX capabilities type
+                            type: string
+                          type: array
+                        hostNetwork:
+                          type: boolean
+                        hostPaths:
+                          items:
+                            properties:
+                              mountPath:
+                                type: string
+                              path:
+                                type: string
+                            required:
+                            - mountPath
+                            - path
+                            type: object
+                          maxItems: 16
+                          type: array
+                        privileged:
+                          type: boolean
+                        resources:
+                          description: ResourceRequirements describes the compute
+                            resource requirements.
+                          properties:
+                            claims:
+                              description: |-
+                                Claims lists the names of resources, defined in spec.resourceClaims,
+                                that are used by this container.
+
+                                This field depends on the
+                                DynamicResourceAllocation feature gate.
+
+                                This field is immutable. It can only be set for containers.
+                              items:
+                                description: ResourceClaim references one entry in
+                                  PodSpec.ResourceClaims.
+                                properties:
+                                  name:
+                                    description: |-
+                                      Name must match the name of one entry in pod.spec.resourceClaims of
+                                      the Pod where this field is used. It makes that resource available
+                                      inside a container.
+                                    type: string
+                                  request:
+                                    description: |-
+                                      Request is the name chosen for a request in the referenced claim.
+                                      If empty, everything from the claim is made available, otherwise
+                                      only the result of this request.
+                                    type: string
+                                required:
+                                - name
+                                type: object
+                              type: array
+                              x-kubernetes-list-map-keys:
+                              - name
+                              x-kubernetes-list-type: map
+                            limits:
+                              additionalProperties:
+                                anyOf:
+                                - type: integer
+                                - type: string
+                                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                x-kubernetes-int-or-string: true
+                              description: |-
+                                Limits describes the maximum amount of compute resources allowed.
+                                More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                              type: object
+                            requests:
+                              additionalProperties:
+                                anyOf:
+                                - type: integer
+                                - type: string
+                                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                x-kubernetes-int-or-string: true
+                              description: |-
+                                Requests describes the minimum amount of compute resources required.
+                                If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                                otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                                More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                              type: object
+                          type: object
+                        workingDir:
+                          type: string
+                      type: object
+                  required:
+                  - backend
+                  - backendActiveDeadline
+                  - runnerImage
+                  - script
+                  type: object
+                  x-kubernetes-validations:
+                  - message: backendActiveDeadline must be positive
+                    rule: duration(self.backendActiveDeadline) > duration('0s')
+                  - message: scriptEnvironment names must not exceed 253 characters
+                      and values must not exceed 4096 characters
+                    rule: '!has(self.scriptEnvironment) || self.scriptEnvironment.all(k,
+                      size(k) <= 253 && size(self.scriptEnvironment[k]) <= 4096)'
+                maxItems: 15
+                minItems: 15
+                type: array
+              deadline:
+                type: string
+              participants:
+                items:
+                  properties:
+                    allocatable:
+                      additionalProperties:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      description: ResourceList is a set of (resource name, quantity)
+                        pairs.
+                      type: object
+                    nodeName:
+                      type: string
+                    nodeUID:
+                      description: |-
+                        UID is a type that holds unique ID values, including UUIDs.  Because we
+                        don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                        intent and helps make sure that UIDs and names do not get conflated.
+                      type: string
+                    role:
+                      type: string
+                    topologyValues:
+                      additionalProperties:
+                        type: string
+                      maxProperties: 16
+                      type: object
+                  required:
+                  - nodeName
+                  - nodeUID
+                  type: object
+                maxItems: 64
+                minItems: 1
+                type: array
+              profile:
+                properties:
+                  generation:
+                    format: int64
+                    type: integer
+                  name:
+                    type: string
+                  uid:
+                    description: |-
+                      UID is a type that holds unique ID values, including UUIDs.  Because we
+                      don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                      intent and helps make sure that UIDs and names do not get conflated.
+                    type: string
+                required:
+                - generation
+                - name
+                - uid
+                type: object
+              release:
+                type: boolean
+              scriptBundle:
+                properties:
+                  name:
+                    type: string
+                  uid:
+                    description: |-
+                      UID is a type that holds unique ID values, including UUIDs.  Because we
+                      don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                      intent and helps make sure that UIDs and names do not get conflated.
+                    type: string
+                required:
+                - name
+                - uid
+                type: object
+            required:
+            - checks
+            - deadline
+            - participants
+            - profile
+            - scriptBundle
+            type: object
+            x-kubernetes-validations:
+            - message: profile is immutable
+              rule: self.profile == oldSelf.profile
+            - message: participants are immutable
+              rule: self.participants == oldSelf.participants
+            - message: scriptBundle is immutable
+              rule: self.scriptBundle == oldSelf.scriptBundle
+            - message: checks are immutable
+              rule: self.checks == oldSelf.checks
+            - message: deadline is immutable
+              rule: self.deadline == oldSelf.deadline
+            - message: cancel cannot be cleared
+              rule: '!has(oldSelf.cancel) || !oldSelf.cancel || (has(self.cancel)
+                && self.cancel)'
+            - message: release cannot be cleared
+              rule: '!has(oldSelf.release) || !oldSelf.release || (has(self.release)
+                && self.release)'
+            - message: every backendActiveDeadline must leave at least 60 seconds
+                before deadline
+              rule: self.checks.all(c, duration(self.deadline) - duration(c.backendActiveDeadline)
+                >= duration('60s'))
+            - message: deadline must cover every sequential backendActiveDeadline
+                plus 60 seconds of evidence time per check
+              rule: self.checks.map(c, duration(c.backendActiveDeadline) + duration('60s')).sum()
+                <= duration(self.deadline)
+          status:
+            properties:
+              checks:
+                items:
+                  properties:
+                    backendEvidence:
+                      properties:
+                        complete:
+                          type: boolean
+                        digest:
+                          description: |-
+                            Digest identifies the complete backend-evidence v1 document retained in
+                            the durable evidence artifact.
+                          pattern: ^sha256:[0-9a-f]{64}$
+                          type: string
+                      type: object
+                    backendResources:
+                      items:
+                        properties:
+                          name:
+                            type: string
+                          participantIndexes:
+                            items:
+                              format: int32
+                              type: integer
+                            maxItems: 64
+                            minItems: 1
+                            type: array
+                          uid:
+                            description: |-
+                              UID is a type that holds unique ID values, including UUIDs.  Because we
+                              don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                              intent and helps make sure that UIDs and names do not get conflated.
+                            type: string
+                        required:
+                        - name
+                        - participantIndexes
+                        - uid
+                        type: object
+                      maxItems: 64
+                      type: array
+                    finishedAt:
+                      format: date-time
+                      type: string
+                    measurements:
+                      maxLength: 16384
+                      type: string
+                    phase:
+                      enum:
+                      - Pending
+                      - Running
+                      - Succeeded
+                      - Failed
+                      - Inconclusive
+                      - Skipped
+                      type: string
+                    reason:
+                      maxLength: 1024
+                      type: string
+                    startedAt:
+                      format: date-time
+                      type: string
+                  required:
+                  - phase
+                  type: object
+                maxItems: 15
+                type: array
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                maxItems: 8
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              evidence:
+                properties:
+                  digest:
+                    description: Digest is the algorithm-qualified SHA-256 digest
+                      of the evidence bytes.
+                    pattern: ^sha256:[0-9a-f]{64}$
+                    type: string
+                  uri:
+                    type: string
+                type: object
+              finishedAt:
+                format: date-time
+                type: string
+              observedGeneration:
+                format: int64
+                type: integer
+              phase:
+                enum:
+                - Pending
+                - Running
+                - Succeeded
+                - Failed
+                - Inconclusive
+                - Canceled
+                type: string
+              reason:
+                maxLength: 1024
+                type: string
+              startedAt:
+                format: date-time
+                type: string
+              workflow:
+                properties:
+                  name:
+                    type: string
+                  phase:
+                    type: string
+                  uid:
+                    type: string
+                type: object
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
