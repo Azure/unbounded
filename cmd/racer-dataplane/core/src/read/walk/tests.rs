@@ -713,3 +713,41 @@ fn spent_links_end_the_walk_exhausted() {
     assert_eq!(end, End::Exhausted { funding: false });
     assert_eq!(b.remaining_links(), 0);
 }
+
+/// Merge of round 3 route and origin: `pending_handoff` tells callers a
+/// stale answer comes from a handoff target (a miss, no refresh), and a
+/// `StaleDestination` from one is also only a miss, never walk evidence.
+#[test]
+fn pending_handoff_marks_handoff_probes_and_stale_destination_is_a_miss() {
+    let mut cfg = config(Some(1), 3, VisitOrder::canonical(3));
+    cfg.handoff = 1;
+    let mut walk = CandidateWalk::new(cfg);
+    let mut b = budget(8, 32);
+    assert!(!walk.pending_handoff());
+    let mut seen = Vec::new();
+    let end = loop {
+        match walk.next(&mut b).unwrap() {
+            Step::Probe(p) => {
+                seen.push((p.canonical, walk.pending_handoff()));
+                let outcome = if walk.pending_handoff() {
+                    Outcome::StaleDestination
+                } else {
+                    Outcome::Probe(ProbeOutcome::CopyMiss)
+                };
+                if let Some(end) = walk.complete(&mut b, outcome).unwrap() {
+                    break end;
+                }
+                assert!(!walk.pending_handoff());
+            }
+            Step::End(end) => break end,
+        }
+    };
+    assert_eq!(seen, [(0, false), (3, true)]);
+    assert_eq!(
+        end,
+        End::Origin {
+            rank: 1,
+            evidence: vec![ProbeOutcome::CopyMiss]
+        }
+    );
+}
