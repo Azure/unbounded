@@ -281,23 +281,8 @@ def customize(disk: Path, assets: Path, ssh_import_id_package: Path) -> None:
             filesystem.write(Path(empty.name), "/var/lib/dbus/machine-id", 0o644)
 
     filesystem.write(
-        assets / "hillsboro-access",
-        "/usr/local/sbin/unbounded-hillsboro-access",
-        0o755,
-    )
-    filesystem.write(
-        assets / "90-unbounded-dev",
-        "/etc/sudoers.d/90-unbounded-dev",
-        0o440,
-    )
-    filesystem.write(
-        assets / "90-hillsboro-access.conf",
-        "/etc/systemd/system/cloud-final.service.d/90-hillsboro-access.conf",
-        0o644,
-    )
-    filesystem.write(
-        assets / "access-policy.json",
-        "/usr/share/unbounded/hillsboro-access.json",
+        assets / "90-hillsboro-users.cfg",
+        "/etc/cloud/cloud.cfg.d/90-hillsboro-users.cfg",
         0o644,
     )
 

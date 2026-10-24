@@ -13,7 +13,7 @@ ARG SSH_IMPORT_ID_SHA256=97bb2840a271ee0573da934ce1811f961e4b844fe876e34602b4661
 RUN test "${TARGETARCH}" = arm64 && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
-      e2fsprogs fdisk pigz python3 sudo && \
+      cloud-init e2fsprogs fdisk pigz python3-yaml && \
     cd /tmp && \
     apt-get download "ssh-import-id=${SSH_IMPORT_ID_VERSION}" && \
     printf '%s  %s\n' "${SSH_IMPORT_ID_SHA256}" \
@@ -27,8 +27,11 @@ RUN test "${TARGETARCH}" = arm64 && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=source /disk/disk.img.gz /input/disk.img.gz
 COPY images/host-ubuntu2404-gb200-hillsboro/assets/ /usr/local/lib/unbounded-image/
+COPY images/netboot/assets/vendor-data.tmpl /usr/local/lib/unbounded-image/vendor-data.tmpl
 RUN mkdir -p /disk /work && \
-    visudo -cf /usr/local/lib/unbounded-image/90-unbounded-dev && \
+    python3 /usr/local/lib/unbounded-image/verify_cloud_init_merge.py \
+      --image-config /usr/local/lib/unbounded-image/90-hillsboro-users.cfg \
+      --vendor-template /usr/local/lib/unbounded-image/vendor-data.tmpl && \
     pigz --test /input/disk.img.gz && \
     pigz -dc /input/disk.img.gz > /work/disk.img && \
     python3 /usr/local/lib/unbounded-image/customize.py \
@@ -38,16 +41,14 @@ RUN mkdir -p /disk /work && \
     pigz -1 -n -c /work/disk.img > /disk/disk.img.gz && \
     pigz --test /disk/disk.img.gz && \
     cd /disk && sha256sum disk.img.gz > disk.img.gz.sha256 && \
-    cp /usr/local/lib/unbounded-image/access-policy.json /disk/access-policy.json && \
     rm -rf /input /work
 
 FROM scratch
 ARG BASE_IMAGE=ghcr.io/azure/host-ubuntu2404-gb200-nvidia-580167@sha256:39f4fd5312307ee2ef7ec5e236e420faa5d08e663853800d86fb6a3e162181bb
 LABEL org.opencontainers.image.source="https://github.com/Azure/unbounded" \
-      org.opencontainers.image.description="Hillsboro Metalman Ubuntu 24.04 ARM64 GB200 host disk with durable named GitHub access" \
+      org.opencontainers.image.description="Hillsboro Metalman Ubuntu 24.04 ARM64 GB200 host disk with native cloud-init GitHub access" \
       io.unbounded.host.architecture="arm64" \
       io.unbounded.host.base-image="${BASE_IMAGE}" \
-      io.unbounded.host.access-policy="Azure/unbounded-dev@2026-10-23" \
-      io.unbounded.host.qualification="blocked-bcho-has-no-github-ssh-keys"
+      io.unbounded.host.access-policy="Azure/unbounded-dev@2026-10-23"
 COPY --from=build /disk /disk
 COPY LICENSE NOTICE /unbounded/licenses/

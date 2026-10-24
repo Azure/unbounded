@@ -4,14 +4,13 @@
 package hostimage
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"sigs.k8s.io/yaml"
 )
 
 const imageDir = "images/host-ubuntu2404-gb200-hillsboro"
@@ -43,11 +42,12 @@ func TestHillsboroImageIsPinnedArm64Derivative(t *testing.T) {
 		`test "${TARGETARCH}" = arm64`,
 		"COPY --from=source /disk/disk.img.gz /input/disk.img.gz",
 		"python3 /usr/local/lib/unbounded-image/customize.py",
-		"visudo -cf /usr/local/lib/unbounded-image/90-unbounded-dev",
+		"python3 /usr/local/lib/unbounded-image/verify_cloud_init_merge.py",
 		`ARG SSH_IMPORT_ID_VERSION=5.11-0ubuntu2.24.04.1`,
 		`ARG SSH_IMPORT_ID_SHA256=97bb2840a271ee0573da934ce1811f961e4b844fe876e34602b4661db25135b5`,
 		"sha256sum --check --strict",
 		"--ssh-import-id-package /ssh-import-id-package",
+		"COPY images/netboot/assets/vendor-data.tmpl",
 		"pigz -1 -n -c /work/disk.img > /disk/disk.img.gz",
 		"COPY --from=build /disk /disk",
 	} {
@@ -57,15 +57,20 @@ func TestHillsboroImageIsPinnedArm64Derivative(t *testing.T) {
 }
 
 func TestHillsboroAccessPolicyMatchesVerifiedTeamSnapshot(t *testing.T) {
-	var policy struct {
-		Users                 []string `json:"users"`
-		QualificationBlockers []string `json:"qualificationBlockers"`
+	var config struct {
+		Users []struct {
+			Name        string   `json:"name"`
+			LockPasswd  bool     `json:"lock_passwd"`
+			Shell       string   `json:"shell"`
+			Sudo        string   `json:"sudo"`
+			SSHImportID []string `json:"ssh_import_id"`
+		} `json:"users"`
 	}
-	require.NoError(t, json.Unmarshal(
-		[]byte(readRepoFile(t, imageDir+"/assets/access-policy.json")),
-		&policy,
+	require.NoError(t, yaml.Unmarshal(
+		[]byte(readRepoFile(t, imageDir+"/assets/90-hillsboro-users.cfg")),
+		&config,
 	))
-	require.Equal(t, []string{
+	expectedUsers := []string{
 		"bcho",
 		"cchildress",
 		"chokevin",
@@ -76,18 +81,15 @@ func TestHillsboroAccessPolicyMatchesVerifiedTeamSnapshot(t *testing.T) {
 		"plombardi89",
 		"qike-ms",
 		"vpatelsj",
-	}, policy.Users)
-	require.Contains(t, strings.Join(policy.QualificationBlockers, "\n"), "bcho")
-
-	access := readRepoFile(t, imageDir+"/assets/hillsboro-access")
-	sudoers := readRepoFile(t, imageDir+"/assets/90-unbounded-dev")
-	for _, user := range policy.Users {
-		require.Contains(t, access, "\n  "+user+"\n")
-		require.Contains(t, sudoers, user+" ALL=(ALL:ALL) NOPASSWD:ALL")
 	}
-	require.Contains(t, access, `usermod --lock --shell /bin/bash "$user"`)
-	require.Contains(t, access, `ssh-import-id -o "$output" "gh:$user"`)
-	require.Contains(t, access, "GitHub publishes no usable SSH keys")
+	require.Len(t, config.Users, len(expectedUsers))
+	for index, user := range config.Users {
+		require.Equal(t, expectedUsers[index], user.Name)
+		require.True(t, user.LockPasswd)
+		require.Equal(t, "/bin/bash", user.Shell)
+		require.Equal(t, "ALL=(ALL:ALL) NOPASSWD:ALL", user.Sudo)
+		require.Equal(t, []string{"gh:" + user.Name}, user.SSHImportID)
+	}
 }
 
 func TestHillsboroCustomizerFailsClosedAndGeneralizes(t *testing.T) {
@@ -104,10 +106,16 @@ func TestHillsboroCustomizerFailsClosedAndGeneralizes(t *testing.T) {
 		`"/var/lib/dbus/machine-id"`,
 		"captured password credential present",
 		"captured SSH credential present",
-		`"/etc/sudoers.d/90-unbounded-dev"`,
-		`"/etc/systemd/system/cloud-final.service.d/90-hillsboro-access.conf"`,
+		`"/etc/cloud/cloud.cfg.d/90-hillsboro-users.cfg"`,
 	} {
 		require.Contains(t, customizer, value)
+	}
+	for _, forbidden := range []string{
+		"/etc/sudoers.d/",
+		"/etc/systemd/system/cloud-final.service.d/",
+		"/usr/local/sbin/unbounded-hillsboro-access",
+	} {
+		require.NotContains(t, customizer, forbidden)
 	}
 }
 
@@ -139,9 +147,21 @@ func TestHillsboroDocumentationKeepsActivationSeparate(t *testing.T) {
 		"`spec.pxe.netbootImage` unchanged",
 		"Updating the image reference alone is non-destructive",
 		"separately authorized `HostReplace`",
+		"native cloud-init",
 		"bcho",
-		"qualification-blocked",
+		"qualification blocker",
 	} {
 		require.Contains(t, readme, value)
 	}
+}
+
+func TestMetalmanVendorDataDoesNotReplaceImageUsers(t *testing.T) {
+	vendorData := readRepoFile(t, "images/netboot/assets/vendor-data.tmpl")
+	require.NotContains(t, vendorData, "\nusers:")
+
+	mergeTest := readRepoFile(t, imageDir+"/assets/verify_cloud_init_merge.py")
+	require.Contains(t, mergeTest, "from cloudinit import util")
+	require.Contains(t, mergeTest, "util.mergemanydict([vendor_config, image_config])")
+	require.Contains(t, mergeTest, `"users" in vendor_config`)
+	require.Contains(t, mergeTest, `("reporting", "write_files", "runcmd")`)
 }

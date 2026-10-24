@@ -7,16 +7,16 @@ changes only the installed root filesystem. The generic
 unchanged.
 
 The build adds all members in the verified 2026-10-23
-`Azure/unbounded-dev` snapshot as same-named local users. Passwords are locked,
-passwordless sudo is defined in a reviewed sudoers file, and a cloud-init final
-hook refreshes each user's `authorized_keys` with `ssh-import-id gh:<user>` on
-every repave. No SSH keys are embedded in the image.
+`Azure/unbounded-dev` snapshot to `/etc/cloud/cloud.cfg.d` as native cloud-init
+users. Each same-named account has a locked password, reviewed passwordless
+sudo, and `ssh_import_id: [gh:<user>]`. No SSH keys, custom account script, or
+systemd cloud-final hook are embedded in the image.
 
 The snapshot includes `bcho`, who published no GitHub SSH keys when it was
-verified. The producer intentionally keeps that account in policy and labels
-the image as qualification-blocked. Do not activate a built image until every
-listed member publishes at least one usable GitHub SSH key and the blocker is
-re-reviewed.
+verified. The producer intentionally keeps that account in policy as a
+qualification blocker rather than silently dropping a team member. Do not
+activate a built image until every listed member publishes at least one usable
+GitHub SSH key and the blocker is re-reviewed.
 
 ## Build
 
@@ -34,12 +34,20 @@ docker buildx build \
 ```
 
 The OCI artifact retains `/disk/disk.img.gz`. The build fails if the source
-disk lacks cloud-init, account-management tools, or sudo validation; contains
-an `administrator`, `unbounded`, or `unbounded-metal` account; contains a
-password hash or captured user SSH credential; or cannot be generalized. The
-producer verifies and extracts the pinned Ubuntu `ssh-import-id` package into
-the disk before capture. It clears cloud-init state and machine-id and removes
-SSH host keys before recompressing the disk.
+disk lacks cloud-init or account-management tools; contains an `administrator`,
+`unbounded`, or `unbounded-metal` account; contains a password hash or captured
+user SSH credential; or cannot be generalized. The producer verifies and
+extracts the pinned Ubuntu `ssh-import-id` package into the disk before capture,
+then installs the native cloud-init user fragment. It clears cloud-init state
+and machine-id and removes SSH host keys before recompressing the disk.
+
+MetalMan vendor-data intentionally does not define `users`; otherwise its
+higher-priority list would replace the image fragment. The image build runs
+Ubuntu Noble cloud-init's merge implementation against the actual vendor-data
+template and verifies that the image users and MetalMan's `reporting`,
+`write_files`, and `runcmd` configuration all survive unchanged. A Machine
+user-data ConfigMap may still intentionally override `users`, because user-data
+has the highest cloud-init precedence.
 
 ## Metalman activation
 
