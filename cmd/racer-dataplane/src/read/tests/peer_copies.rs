@@ -3499,3 +3499,83 @@ fn owner_asks_previous_membership_owners_before_origin() {
         assert!(calls.iter().all(|c| c.1), "handoff probes are copy-only");
     }
 }
+
+/// Known issue 13: an owner above rank 0 that sees an ownership change (it
+/// has handoff targets) still delegates the cold fetch to rank 0 with the
+/// credits a reader funds it with (handoff probes reserve nothing), and
+/// forwards its spare credits so rank 0 can ask the previous owners too.
+#[test]
+fn owner_with_handoff_targets_delegates_with_spare_credits() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    // Owner credits -> remote credits the Acquire carries to rank 0.
+    for (attempts, remote) in [(3, 1), (4, 2), (6, 4), (8, 4)] {
+        let mut f = fixture();
+        let (peers, ordered) = install_peers(&mut f, Some(1));
+        let good = encrypted_copy(&mut f);
+        let current = Arc::new(
+            Membership::validate(
+                racer_control_wire::MembershipVersion(2),
+                f.membership.members().to_vec(),
+            )
+            .unwrap(),
+        );
+        // Rank 0 joined in version 2.
+        let old = Arc::new(
+            Membership::validate(
+                racer_control_wire::MembershipVersion(1),
+                f.membership
+                    .members()
+                    .iter()
+                    .filter(|m| m.node != ordered[0])
+                    .cloned()
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        let published = Arc::new(controlplane::Published::new(
+            crate::control::Snapshot::retention(2),
+        ));
+        for (i, membership) in [old.clone(), current.clone()].into_iter().enumerate() {
+            let mut snapshot = crate::control::Snapshot::membership_fixture(membership);
+            snapshot.sequence = racer_control_wire::PublicationSequence(i as u64 + 1);
+            published
+                .publish(
+                    Arc::new(snapshot),
+                    uring_runtime::environment::now(),
+                    |_, _| Ok::<_, Error>(()),
+                    || (),
+                )
+                .unwrap();
+        }
+        let placement = Rc::new(Placement::new(16));
+        let previous = placement
+            .rank(old.clone(), &f.context.object, f.page.number)
+            .ordered;
+        let handoff = racer_core::read::walk::handoff_targets(&previous, &ordered, 1);
+        assert!(!handoff.is_empty());
+        let mut deps = f.fill.dependencies.clone();
+        deps.candidates = Rc::new(CandidatePolicy::new(
+            ordered[1].clone(),
+            placement,
+            peers.requester(),
+            deps.credentials.clone(),
+            published,
+        ));
+        f.fill = Fill::new(deps);
+        f.membership = current;
+        peers
+            .replies
+            .borrow_mut()
+            .push_back((ordered[0].clone(), Reply::Copy(good.clone())));
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, attempts, 16);
+        let result = acquire(&mut f, &mut budget).unwrap();
+        assert_eq!(result.plaintext.bytes(), b"abc");
+        let calls = peers.calls.borrow();
+        assert_eq!(calls.len(), 1, "{attempts} credits");
+        assert_eq!(calls[0].0, ordered[0]);
+        assert!(!calls[0].1, "{attempts} credits: rank 0 gets an Acquire");
+        assert_eq!(calls[0].2, remote, "{attempts} credits");
+        assert_eq!(f.origin.calls.get(), 0);
+    }
+}

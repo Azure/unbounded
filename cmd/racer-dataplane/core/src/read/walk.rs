@@ -279,7 +279,11 @@ impl CandidateWalk {
         while let Some(canonical) = self.target(self.index) {
             let index = self.index;
             let handoff = canonical >= self.config.owners;
-            let left = (self.count - index) as u32;
+            // Credits the delegation must leave: one per later predecessor
+            // probe and one for this owner's own origin attempt. Handoff
+            // probes are opportunistic and never reserve credits, so they
+            // cannot turn a delegation into a local fetch (Known issue 13).
+            let left = rank.map_or(0, |rank| rank.min(2).saturating_sub(index)) as u32;
             if handoff && (budget.remaining_attempts() < 2 || budget.remaining_links() == 0) {
                 // Handoff probes are opportunistic: never spend the credit
                 // the owner's own origin attempt needs.
@@ -318,27 +322,51 @@ impl CandidateWalk {
                 Mode::Acquire
             };
             let count = self.count;
-            let owner_attempts = 1 + u32::from(delegated);
+            // When this owner sees an ownership change (it has handoff
+            // targets), rank 0 has previous owners to ask too, but an
+            // Acquire that carries only its origin credit leaves rank 0
+            // none to ask them with (Known issue 13). Forward spare credits,
+            // up to one per previous owner: they would otherwise fund this
+            // owner's own handoff probes, which only run if rank 0 fails.
+            let spare = if delegated && self.config.handoff > 0 {
+                (budget.remaining_attempts() - (left + 2)).min(MAX_HANDOFF as u32)
+            } else {
+                0
+            };
+            let owner_attempts = 1 + u32::from(delegated) + spare;
+            // Probes that share the owner's inherited links with this one:
+            // the remaining predecessors, or the remaining handoff targets.
+            // Opportunistic handoff probes never shrink a predecessor's
+            // route; they get whatever links the predecessors left.
+            let sharing = if handoff {
+                1
+            } else {
+                rank.map_or(count, |rank| rank.min(2))
+                    .saturating_sub(index)
+                    .max(1)
+            };
             let bounded = if delegated {
                 // The exchange and rank 0's origin credit: a funded route
                 // forwards all of it, and this owner keeps what later probes
-                // and its own origin attempt need.
-                let tight = u16::from(budget.remaining_links())
-                    < (count - index) as u16 * u16::from(budget.route_links());
-                let links = if tight {
-                    (budget.remaining_links() / (count - index) as u8).min(4)
-                } else {
-                    budget.route_links()
-                };
+                // and its own origin attempt need. The delegation decides
+                // whether rank 0 fetches for everyone, so its route comes
+                // first: later copy-only predecessors (which matter only if
+                // rank 0 fails) keep one link each, not an equal share
+                // (an equal share left rank 2 too few links to reach rank 0
+                // and made it fetch itself; Known issue 13).
+                let links = budget
+                    .route_links()
+                    .min(budget.remaining_links().saturating_sub(sharing as u8 - 1))
+                    .max(1);
                 Some(budget.partition(owner_attempts, links)?)
             } else if rank.is_some()
                 && u16::from(budget.remaining_links())
-                    < (count - index) as u16 * u16::from(budget.route_links())
+                    < sharing as u16 * u16::from(budget.route_links())
             {
                 // Receiver CopyOnly predecessor probes share the inherited route
                 // pool; the first must not consume every link after an incoming
                 // eight-link envelope selected failure routing.
-                let remaining = (count - index) as u8;
+                let remaining = sharing as u8;
                 Some(budget.partition(
                     owner_attempts,
                     (budget.remaining_links() / remaining).min(4),

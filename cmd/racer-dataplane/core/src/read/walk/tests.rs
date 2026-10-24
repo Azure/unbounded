@@ -321,9 +321,11 @@ fn rank_zero_owner_gets_origin_without_probes() {
 
 #[test]
 fn owner_with_tight_links_partitions_predecessor_routes() {
-    // Two predecessors, eight inherited links after a failure route: each probe
-    // gets a child with links/remaining capped at four, and one attempt (two
-    // for the Acquire to rank 0: the exchange and rank 0's origin credit).
+    // Two predecessors, seven inherited links after a failure route. The
+    // Acquire to rank 0 (two attempts: the exchange and rank 0's origin
+    // credit) comes first: it gets a full failure route and leaves one link
+    // for rank 1's copy-only probe, which matters only if rank 0 fails
+    // (Known issue 13: an equal split left it too few links to reach rank 0).
     let mut walk = CandidateWalk::new(config(Some(2), 3, VisitOrder::canonical(3)));
     let mut b = budget(4, 7);
     b.note_route_failure();
@@ -331,9 +333,19 @@ fn owner_with_tight_links_partitions_predecessor_routes() {
         Outcome::Probe(ProbeOutcome::CopyMiss)
     });
     assert_eq!(probes[0].0.mode, Mode::Acquire);
-    assert_eq!((probes[0].1, probes[0].2), (2, 3));
+    assert_eq!((probes[0].1, probes[0].2), (2, 6));
+    // Without a delegation (too few attempts), copy-only predecessors split
+    // the pool, each capped at four.
+    let mut walk = CandidateWalk::new(config(Some(2), 3, VisitOrder::canonical(3)));
+    let mut b = budget(3, 7);
+    b.note_route_failure();
+    let (probes, _) = drive(&mut walk, &mut b, |_, _| {
+        Outcome::Probe(ProbeOutcome::CopyMiss)
+    });
+    assert_eq!(probes[0].0.mode, Mode::CopyOnly);
+    assert_eq!((probes[0].1, probes[0].2), (1, 3));
     // The last predecessor may use the whole remaining pool.
-    assert_eq!((probes[1].1, probes[1].2), (4, 7));
+    assert_eq!((probes[1].1, probes[1].2), (3, 7));
 }
 
 #[test]
@@ -750,4 +762,90 @@ fn pending_handoff_marks_handoff_probes_and_stale_destination_is_a_miss() {
             evidence: vec![ProbeOutcome::CopyMiss]
         }
     );
+}
+
+/// Known issue 13: handoff probes are opportunistic, so they must not
+/// reserve credits that make an owner skip the delegation to rank 0 and fetch
+/// the page itself.
+#[test]
+fn handoff_targets_do_not_block_delegation() {
+    for (rank, attempts) in [(1, 3), (2, 4)] {
+        for handoff in 0..=MAX_HANDOFF {
+            let mut cfg = config(Some(rank), 3, VisitOrder::canonical(3));
+            cfg.handoff = handoff;
+            let mut walk = CandidateWalk::new(cfg);
+            let mut b = budget(attempts, 16);
+            let Step::Probe(probe) = walk.next(&mut b).unwrap() else {
+                panic!("expected a probe");
+            };
+            assert_eq!(
+                (probe.canonical, probe.mode),
+                (0, Mode::Acquire),
+                "rank {rank} handoff {handoff}"
+            );
+            // The owner keeps one credit per later predecessor and one for
+            // its own origin attempt.
+            assert_eq!(b.remaining_attempts(), rank as u32);
+        }
+    }
+}
+
+/// Known issue 13: rank 0 reached by an owner's delegation asks previous
+/// owners only with credits the delegation carries. An owner that sees an
+/// ownership change forwards its spare credits (up to [`MAX_HANDOFF`]); an
+/// owner that sees none forwards exactly the exchange and the origin credit.
+#[test]
+fn delegation_forwards_spare_credits_for_rank_zero_handoff() {
+    for (handoff, attempts, child) in [(0, 8, 2), (1, 3, 2), (1, 4, 3), (2, 6, 5), (3, 16, 5)] {
+        let mut cfg = config(Some(1), 3, VisitOrder::canonical(3));
+        cfg.handoff = handoff;
+        let mut walk = CandidateWalk::new(cfg);
+        let mut b = budget(attempts, 16);
+        let Step::Probe(probe) = walk.next(&mut b).unwrap() else {
+            panic!("expected a probe");
+        };
+        assert_eq!(probe.mode, Mode::Acquire);
+        assert_eq!(probe.route, RouteMode::FundedRoute);
+        assert_eq!(
+            walk.request_budget(&mut b).remaining_attempts(),
+            child,
+            "handoff {handoff} attempts {attempts}"
+        );
+        // The owner keeps its origin credit, never less.
+        assert!(b.remaining_attempts() >= 1);
+        assert_eq!(b.remaining_attempts() + child, attempts);
+    }
+}
+
+/// Known issue 13: the delegation route comes first. Rank 2 with five
+/// inherited links (a failure route) gives the Acquire four and keeps one
+/// for rank 1's copy-only probe instead of splitting them evenly (two each,
+/// too few to reach rank 0 in most topologies).
+#[test]
+fn delegation_route_takes_priority_over_later_predecessors() {
+    let mut walk = CandidateWalk::new(config(Some(2), 3, VisitOrder::canonical(3)));
+    let mut b = budget(6, 5);
+    b.note_route_failure();
+    let Step::Probe(probe) = walk.next(&mut b).unwrap() else {
+        panic!("expected a probe");
+    };
+    assert_eq!(probe.mode, Mode::Acquire);
+    assert_eq!(walk.request_budget(&mut b).remaining_links(), 4);
+    assert_eq!(b.remaining_links(), 1);
+}
+
+/// Handoff targets are asked in previous rank order, each with whatever
+/// links the earlier ones left, so the first (most likely holder) gets a
+/// usable route rather than an even share of a small pool.
+#[test]
+fn handoff_probes_take_remaining_links_in_order() {
+    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
+    cfg.handoff = 3;
+    let mut walk = CandidateWalk::new(cfg);
+    let mut b = budget(8, 3);
+    let Step::Probe(probe) = walk.next(&mut b).unwrap() else {
+        panic!("expected a probe");
+    };
+    assert_eq!(probe.canonical, 3);
+    assert_eq!(walk.request_budget(&mut b).remaining_links(), 3);
 }
