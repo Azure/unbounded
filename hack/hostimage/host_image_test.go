@@ -85,7 +85,11 @@ func TestHillsboroAccessPolicyMatchesVerifiedTeamSnapshot(t *testing.T) {
 		require.True(t, user.LockPasswd)
 		require.Equal(t, "/bin/bash", user.Shell)
 		require.Equal(t, "ALL=(ALL:ALL) NOPASSWD:ALL", user.Sudo)
-		require.Equal(t, []string{"gh:" + user.Name}, user.SSHImportID)
+		if user.Name == "bcho" {
+			require.Empty(t, user.SSHImportID)
+		} else {
+			require.Equal(t, []string{"gh:" + user.Name}, user.SSHImportID)
+		}
 	}
 }
 
@@ -128,8 +132,11 @@ func TestHillsboroDocumentationKeepsActivationSeparate(t *testing.T) {
 		"separately authorized `HostReplace`",
 		"native cloud-init",
 		"bcho",
-		"Cloud-init still creates the locked `bcho` account",
-		"key-based access until `bcho` publishes a key",
+		"entry deliberately omits `ssh_import_id`",
+		"cloud-init creates",
+		"locked `bcho` account",
+		"Publishing a key does not grant access",
+		"policy snapshot must restore the import entry",
 		"does not block image",
 		"readiness or affect key-based access",
 		"`spec.host.netboot.cloudInit.userDataConfigMapRef: gb200-metal-host-access`",
@@ -142,7 +149,8 @@ func TestHillsboroDocumentationKeepsActivationSeparate(t *testing.T) {
 
 func TestMetalmanVendorDataDoesNotReplaceImageUsers(t *testing.T) {
 	vendorData := readRepoFile(t, "images/netboot/assets/vendor-data.tmpl")
-	require.NotContains(t, vendorData, "\nusers:")
+	require.Contains(t, vendorData, "{{ if not .PreserveImageUsers }}")
+	require.Contains(t, vendorData, "- name: unbounded-metal")
 
 	mergeTest := readRepoFile(t, imageDir+"/assets/verify_cloud_init_merge.py")
 	require.Contains(t, mergeTest, "from cloudinit import util")
@@ -173,6 +181,7 @@ func TestHillsboroBootGateValidatesNamedAccess(t *testing.T) {
 		require.Contains(t, install, user)
 	}
 	require.Contains(t, install, `grep -Fq "gh:$user" "$keys"`)
-	require.Contains(t, importer, `if [ "$user" = bcho ]`)
+	require.Contains(t, importer, "ssh-import-id must not be invoked for keyless bcho")
+	require.Contains(t, importer, "exit 1")
 	require.Contains(t, importer, `> "$HOME/.ssh/authorized_keys"`)
 }

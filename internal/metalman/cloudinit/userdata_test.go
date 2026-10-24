@@ -127,7 +127,7 @@ func TestResolveUserDataScopesValidationToHillsboroImage(t *testing.T) {
 	}
 }
 
-func TestRequiresImageUsersPolicy(t *testing.T) {
+func TestPreservesImageUsers(t *testing.T) {
 	t.Parallel()
 
 	for _, image := range []string{
@@ -136,14 +136,14 @@ func TestRequiresImageUsersPolicy(t *testing.T) {
 		"ghcr.io/azure/host-ubuntu2404-gb200-hillsboro@sha256:abc",
 		"GHCR.IO/AZURE/HOST-UBUNTU2404-GB200-HILLSBORO:TEST",
 	} {
-		require.True(t, requiresImageUsersPolicy(image), image)
+		require.True(t, PreservesImageUsers(image), image)
 	}
 	for _, image := range []string{
 		"ghcr.io/azure/host-ubuntu2404-gb200",
 		"ghcr.io/azure/host-ubuntu2404-gb200-hillsboro-copy:test",
 		"example.com/azure/host-ubuntu2404-gb200-hillsboro:test",
 	} {
-		require.False(t, requiresImageUsersPolicy(image), image)
+		require.False(t, PreservesImageUsers(image), image)
 	}
 }
 

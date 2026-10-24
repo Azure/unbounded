@@ -21,6 +21,7 @@ if [ "$image_name" = host-ubuntu2404-gb200-hillsboro ]; then
         --template "$script_dir/../netboot/assets/vendor-data.tmpl" \
         --install-script "$script_dir/../host-ubuntu2404-gb200-hillsboro/assets/verify-boot-install.sh" \
         --ssh-import-id-script "$script_dir/../host-ubuntu2404-gb200-hillsboro/assets/verify-boot-ssh-import-id.sh" \
+        --preserve-image-users \
         --output seed/vendor-data
 else
     cat > seed/user-data <<'EOF'

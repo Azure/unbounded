@@ -275,17 +275,18 @@ func (f *FileResolver) ResolveFileByPathForIP(ctx context.Context, path string, 
 }
 
 type templateData struct {
-	Machine          *v1alpha3.Machine
-	BootLease        *v1alpha3.DHCPLease
-	ApiserverURL     string
-	ServeURL         string
-	AgentConfigJSON  string
-	InstallScript    string
-	InstallEnv       []string
-	InstallRequested bool
-	VirtualMedia     bool
-	ArtifactRoot     string
-	MediaCallbackURL string
+	Machine            *v1alpha3.Machine
+	BootLease          *v1alpha3.DHCPLease
+	ApiserverURL       string
+	ServeURL           string
+	AgentConfigJSON    string
+	InstallScript      string
+	InstallEnv         []string
+	InstallRequested   bool
+	VirtualMedia       bool
+	ArtifactRoot       string
+	MediaCallbackURL   string
+	PreserveImageUsers bool
 }
 
 func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConfigJSON, requestIP string, installRequested bool) templateData {
@@ -299,15 +300,21 @@ func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConf
 		bootLease = selectBootLease(node, requestIP)
 	}
 
+	preserveImageUsers := false
+	if node != nil && node.Spec.Netboot() != nil {
+		preserveImageUsers = metalcloudinit.PreservesImageUsers(node.Spec.Netboot().Image)
+	}
+
 	return templateData{
-		Machine:          node,
-		BootLease:        bootLease,
-		ApiserverURL:     ci.ApiserverURL,
-		ServeURL:         serveURL,
-		AgentConfigJSON:  agentConfigJSON,
-		InstallScript:    provision.UnboundedAgentInstallScript(),
-		InstallEnv:       provision.AgentInstallEnv(agent),
-		InstallRequested: installRequested,
+		Machine:            node,
+		BootLease:          bootLease,
+		ApiserverURL:       ci.ApiserverURL,
+		ServeURL:           serveURL,
+		AgentConfigJSON:    agentConfigJSON,
+		InstallScript:      provision.UnboundedAgentInstallScript(),
+		InstallEnv:         provision.AgentInstallEnv(agent),
+		InstallRequested:   installRequested,
+		PreserveImageUsers: preserveImageUsers,
 	}
 }
 

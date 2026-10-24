@@ -8,13 +8,17 @@ remain unchanged.
 The build adds all members in the verified 2026-10-23
 `Azure/unbounded-dev` snapshot to `/etc/cloud/cloud.cfg.d` as native cloud-init
 users. Each same-named account has a locked password, reviewed passwordless
-sudo, and `ssh_import_id: [gh:<user>]`. No SSH keys, custom account script, or
-systemd cloud-final hook are embedded in the image.
+sudo, and, when the member has published keys, `ssh_import_id: [gh:<user>]`.
+No SSH keys, custom account script, or systemd cloud-final hook are embedded
+in the image.
 
 The snapshot includes `bcho`, who published no GitHub SSH keys when it was
-verified. Cloud-init still creates the locked `bcho` account, but it has no
-key-based access until `bcho` publishes a key. This does not block image
-readiness or affect key-based access for the other listed users.
+verified. Its entry deliberately omits `ssh_import_id`, so cloud-init creates
+the locked `bcho` account without turning the absence of keys into a boot
+failure. It has no key-based access. Publishing a key does not grant access
+automatically; a later reviewed policy snapshot must restore the import entry.
+This does not block image readiness or affect key-based access for the other
+listed users.
 
 ## Build
 
@@ -46,13 +50,14 @@ side-effect-free installer fixture. It proves cloud-init creates every named
 account, keeps `bcho` keyless, and writes a nonempty deterministic
 `authorized_keys` file for every other listed user.
 
-MetalMan vendor-data intentionally does not define `users`; otherwise its
-higher-priority list would replace the image fragment. The image build runs
-Ubuntu Noble cloud-init's merge implementation against the actual vendor-data
-template and verifies that the image users and MetalMan's `reporting`,
-`write_files`, and `runcmd` configuration all survive unchanged. A Machine
-user-data ConfigMap may still intentionally override `users`, because user-data
-has the highest cloud-init precedence.
+Generic MetalMan vendor-data continues creating the `unbounded-metal` account.
+For this exact Hillsboro image repository, MetalMan suppresses that top-level
+`users` stanza so its higher-priority list cannot replace the image fragment.
+The image build runs Ubuntu Noble cloud-init's merge implementation against
+that rendered vendor-data and verifies that the image users and MetalMan's
+`reporting`, `write_files`, and `runcmd` configuration all survive unchanged.
+MetalMan also rejects a top-level `users` key in this image's Machine user-data
+ConfigMap; generic images retain their existing override behavior.
 
 ## Metalman activation
 

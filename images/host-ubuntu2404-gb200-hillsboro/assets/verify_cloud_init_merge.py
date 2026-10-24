@@ -32,6 +32,7 @@ def verify(
         vendor_template_path,
         install_script_path,
         ssh_import_id_script_path,
+        True,
     )
     vendor_config = load_yaml(rendered_vendor_data, vendor_template_path)
     if "users" in vendor_config:

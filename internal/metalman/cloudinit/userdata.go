@@ -96,7 +96,7 @@ func ResolveUserData(ctx context.Context, reader client.Reader, machine *v1alpha
 		return nil, false, fmt.Errorf("key %q not found in ConfigMap %s/%s", key, ref.Namespace, ref.Name)
 	}
 
-	if requiresImageUsersPolicy(machine.Spec.Netboot().Image) {
+	if PreservesImageUsers(machine.Spec.Netboot().Image) {
 		if err := ValidateUserData(bytes.NewReader(data)); err != nil {
 			return nil, false, fmt.Errorf("validating ConfigMap %s/%s key %q: %w", ref.Namespace, ref.Name, key, err)
 		}
@@ -105,7 +105,9 @@ func ResolveUserData(ctx context.Context, reader client.Reader, machine *v1alpha
 	return data, true, nil
 }
 
-func requiresImageUsersPolicy(imageRef string) bool {
+// PreservesImageUsers reports whether vendor-data and user-data must retain
+// the users baked into the image.
+func PreservesImageUsers(imageRef string) bool {
 	repository := strings.TrimSpace(imageRef)
 	if digest, _, found := strings.Cut(repository, "@"); found {
 		repository = digest

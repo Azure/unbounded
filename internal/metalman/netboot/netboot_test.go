@@ -1336,6 +1336,56 @@ func TestInstallRequestedBeforeBootImageWritten(t *testing.T) {
 	require.True(t, installRequested)
 }
 
+func TestVendorDataTemplateScopesDefaultUserToGenericImages(t *testing.T) {
+	t.Parallel()
+
+	vendorDataTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "vendor-data.tmpl"))
+	require.NoError(t, err)
+
+	tests := []struct {
+		name          string
+		image         string
+		preserveUsers bool
+	}{
+		{
+			name:  "generic image retains unbounded metal",
+			image: "ghcr.io/azure/host-ubuntu2404:v1",
+		},
+		{
+			name:          "Hillsboro image preserves baked users",
+			image:         "ghcr.io/azure/host-ubuntu2404-gb200-hillsboro@sha256:abc",
+			preserveUsers: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			machine := &v1alpha3.Machine{
+				Spec: v1alpha3.MachineSpec{
+					Host: &v1alpha3.HostSpec{
+						Netboot: &v1alpha3.PXESpec{Image: tt.image},
+					},
+				},
+			}
+			data := newTemplateData(machine, ClusterInfo{}, "http://192.0.2.1", "{}", "", false)
+			require.Equal(t, tt.preserveUsers, data.PreserveImageUsers)
+
+			result, err := renderTemplate(string(vendorDataTmpl), data)
+			require.NoError(t, err)
+
+			var config map[string]any
+			require.NoError(t, yaml.Unmarshal(result, &config))
+			_, found := config["users"]
+			require.Equal(t, !tt.preserveUsers, found)
+			if found {
+				require.Contains(t, string(result), "- name: unbounded-metal")
+			}
+		})
+	}
+}
+
 func TestVendorDataTemplate_WithAgentImage(t *testing.T) {
 	vendorDataTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "vendor-data.tmpl"))
 	if err != nil {

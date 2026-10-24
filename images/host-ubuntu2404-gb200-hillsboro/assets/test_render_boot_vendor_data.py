@@ -18,6 +18,7 @@ class RenderBootVendorDataTest(unittest.TestCase):
             template,
             assets / "verify-boot-install.sh",
             assets / "verify-boot-ssh-import-id.sh",
+            True,
         )
 
         self.assertNotIn("{{", rendered)
@@ -29,17 +30,32 @@ class RenderBootVendorDataTest(unittest.TestCase):
         self.assertEqual(rendered.count("runcmd:"), 1)
         self.assertIn("bash /usr/local/bin/unbounded-agent-install.sh", rendered)
 
+    def test_generic_render_retains_unbounded_metal_user(self):
+        assets = Path(__file__).resolve().parent
+        template = assets.parents[1] / "netboot" / "assets" / "vendor-data.tmpl"
+
+        rendered = render_vendor_data(
+            template,
+            assets / "verify-boot-install.sh",
+            assets / "verify-boot-ssh-import-id.sh",
+            False,
+        )
+
+        self.assertIn("\nusers:\n", rendered)
+        self.assertIn("- name: unbounded-metal", rendered)
+
     def test_rejects_template_shape_drift(self):
         assets = Path(__file__).resolve().parent
         with tempfile.TemporaryDirectory() as directory:
             template = Path(directory) / "vendor-data.tmpl"
             template.write_text("#cloud-config\nwrite_files: []\nruncmd: []\n")
 
-            with self.assertRaisesRegex(RuntimeError, "reporting template changed"):
+            with self.assertRaisesRegex(RuntimeError, "users template changed"):
                 render_vendor_data(
                     template,
                     assets / "verify-boot-install.sh",
                     assets / "verify-boot-ssh-import-id.sh",
+                    True,
                 )
 
 

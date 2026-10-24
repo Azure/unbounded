@@ -23,6 +23,15 @@ INSTALL_ENV_TEMPLATE = """    {{ range .InstallEnv }}
     export {{ . }}
     {{ end }}
 """
+GENERIC_USERS = """users:
+- name: unbounded-metal
+  lock_passwd: true
+  shell: /bin/bash
+  sudo: ALL=(ALL) NOPASSWD:ALL
+"""
+USERS_TEMPLATE = f"""{{{{ if not .PreserveImageUsers }}}}
+{GENERIC_USERS}{{{{ end }}}}
+"""
 
 
 def indent_block(contents: str) -> str:
@@ -33,8 +42,16 @@ def render_vendor_data(
     template_path: Path,
     install_script_path: Path,
     ssh_import_id_path: Path,
+    preserve_image_users: bool,
 ) -> str:
     contents = template_path.read_text()
+    if USERS_TEMPLATE not in contents:
+        raise RuntimeError("MetalMan users template changed")
+    contents = contents.replace(
+        USERS_TEMPLATE,
+        "" if preserve_image_users else GENERIC_USERS,
+        1,
+    )
     if REPORTING_TEMPLATE not in contents:
         raise RuntimeError("MetalMan reporting template changed")
     contents = contents.replace(REPORTING_TEMPLATE, SAFE_REPORTING, 1)
@@ -60,7 +77,7 @@ def render_vendor_data(
 
     if "{{" in contents or "}}" in contents:
         raise RuntimeError("unrendered MetalMan vendor-data template expression")
-    if re.search(r"^users:", contents, re.MULTILINE):
+    if preserve_image_users and re.search(r"^users:", contents, re.MULTILINE):
         raise RuntimeError("boot vendor-data must not replace image users")
     for key in ("reporting:", "write_files:", "runcmd:"):
         if contents.count(key) != 1:
@@ -74,6 +91,7 @@ def main() -> None:
     parser.add_argument("--template", type=Path, required=True)
     parser.add_argument("--install-script", type=Path, required=True)
     parser.add_argument("--ssh-import-id-script", type=Path, required=True)
+    parser.add_argument("--preserve-image-users", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -82,6 +100,7 @@ def main() -> None:
             args.template,
             args.install_script,
             args.ssh_import_id_script,
+            args.preserve_image_users,
         )
     )
 

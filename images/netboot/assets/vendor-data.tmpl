@@ -7,6 +7,13 @@ growpart:
 resize_rootfs: true
 swap:
   size: 0
+{{ if not .PreserveImageUsers }}
+users:
+- name: unbounded-metal
+  lock_passwd: true
+  shell: /bin/bash
+  sudo: ALL=(ALL) NOPASSWD:ALL
+{{ end }}
 ssh_pwauth: false
 reporting:
   unbounded:
