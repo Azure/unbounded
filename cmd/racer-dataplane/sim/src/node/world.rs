@@ -2596,6 +2596,12 @@ impl NodeWorld {
         let page = fill.page;
         let outcome = match reply {
             Reply::Transport => Ok(Outcome::Transport(ProbeOutcome::Unreachable)),
+            Reply::Response(ResponseKind::StaleMembership)
+                if probe.hedge.is_none() && self.pending_handoff(probe.fill) =>
+            {
+                // A stale handoff target is only a miss (no adopt, no skip).
+                Ok(Outcome::StaleMembership)
+            }
             Reply::Response(ResponseKind::StaleMembership) if probe.hedge.is_none() => {
                 // Production `resolve_epoch_traced`: refresh only to a strictly
                 // newer membership, once; otherwise the destination is behind
@@ -2663,6 +2669,13 @@ impl NodeWorld {
         if let Some(race) = self.fills.get_mut(&id).and_then(|f| f.hedge.as_mut()) {
             f(race);
         }
+    }
+
+    /// Whether `fill`'s pending candidate probe is a handoff target.
+    fn pending_handoff(&self, fill: u64) -> bool {
+        self.fills
+            .get(&fill)
+            .is_some_and(|f| matches!(&f.walk, Walking::Candidates(walk) if walk.pending_handoff()))
     }
 
     fn complete_probe(&mut self, id: u64, outcome: Result<Outcome, Error>) {

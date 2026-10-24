@@ -217,6 +217,15 @@ fn owner_asks_handoff_targets_copy_only_after_predecessors() {
             evidence: vec![ProbeOutcome::Overloaded]
         }
     );
+    // A stale handoff target is only a miss.
+    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
+    cfg.handoff = 1;
+    let mut walk = CandidateWalk::new(cfg);
+    let (probes, end) = drive(&mut walk, &mut budget(8, 32), |_, _| {
+        Outcome::StaleMembership
+    });
+    assert_eq!(probes.len(), 1);
+    assert!(matches!(end, End::Origin { rank: 0, .. }));
     // A handoff target's copy wins.
     let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
     cfg.handoff = 3;

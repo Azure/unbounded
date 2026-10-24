@@ -253,6 +253,13 @@ impl CandidateWalk {
         }
     }
 
+    /// Whether the pending probe asks a previous-membership owner (handoff
+    /// target). A `StaleMembership` answer from one is only a miss: callers
+    /// must neither refresh membership nor skip it as a stale destination.
+    pub fn pending_handoff(&self) -> bool {
+        self.pending.as_ref().is_some_and(|p| p.handoff)
+    }
+
     /// Whether the walk stopped because a probe could not be funded.
     pub fn funding_stopped(&self) -> bool {
         self.funding
@@ -440,6 +447,9 @@ impl CandidateWalk {
                 self.done = true;
                 Ok(Some(End::VersionUnavailable))
             }
+            // A previous owner that lags or leads this membership is only a
+            // missing copy: never refresh the owner's walk for it.
+            Outcome::StaleMembership | Outcome::StaleDestination if pending.handoff => Ok(None),
             Outcome::Probe(outcome) | Outcome::Transport(outcome) if pending.handoff => {
                 if matches!(
                     outcome,

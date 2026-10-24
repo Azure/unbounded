@@ -1015,6 +1015,11 @@ impl CandidatePolicy {
                 let outcome = match response {
                     Ok(response) => {
                         if matches!(response.response(), PeerResponse::StaleMembership) {
+                            if walk.pending_handoff() {
+                                // A stale handoff target is only a miss.
+                                walk.complete(budget, WalkOutcome::StaleMembership)?;
+                                continue;
+                            }
                             let refresh = match self.refresh_membership(&candidates, retried) {
                                 Ok(refresh) => refresh,
                                 Err(error) => {
