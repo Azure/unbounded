@@ -647,3 +647,36 @@ Observations:
    other owners.
 6. Ownership moves on membership changes add origin requests beyond `REPLICAS` per page.
 7. Crashed members stay routable until link backoff; reads near them hit issue 5.
+
+## Round 2: production admission
+
+`ResourceClass`, `Limits` (with its per-worker defaults as `Limits::default()`), and the pure policy
+rules (`limit`, `floor`, `max_keys`, `wakes`, `allows_stopped`, `covers`) moved to
+`racer_core::admission` (`cmd/racer-dataplane/core/src/admission.rs`). The dataplane re-exports them
+from `src/admission.rs` and `src/config.rs`, and `AdmissionPolicy` delegates to `Rules`, keeping the
+telemetry `Observer` and `rejected` hook. `Config::from_lookup` takes unset limit defaults from
+`Limits::default()`. `rules_equivalence_tests::moved_rules_match_legacy_policy` checks the delegated
+policy against a verbatim copy of the old rules for the default, environment, scaled, and edge
+(1 to 65,536 connections, saturating waiters, single-entry) configurations.
+
+The simulator's `SimPolicy` (`sim/src/node/admission.rs`) now delegates to the same `Rules` over the
+production `ResourceClass`; only `rejected` (per-class counters) differs. Sim-specific choices:
+
+- Limits are `Limits::default()` (one simulated node is one production I/O worker, so no
+  `scale_limits`), with plaintext, ciphertext, dirty, flights, waiters per flight, relay, route, and
+  retained-snapshot dimensions taken from `NodeConfig`, whose defaults equal production's.
+- Floors use the simulator's 1 MiB page (production 16 MiB) with the production record header
+  bound, so the ciphertext floor is 1 MiB + 64 KiB (it was 1 MiB + 16).
+- The report's `rejections` now lists all 15 production classes plus `keys`.
+- Cache ids stay interned to `u32`, so a charge never clones a `CacheId` string; there is no
+  per-charge clone cost to remove.
+
+5,000 nodes, seed 1, release, same host (wall time is noisy on a shared host):
+
+| Scenario | Wall before / after | Max RSS before / after | Rejections before / after |
+| --- | --- | --- | --- |
+| zipf | 105 s / 114 s | 1.59 / 1.60 GiB | relay 28,008 / relay 28,008 |
+| storm | 61 s / 61 s | 1.32 / 1.33 GiB | relay 4,534 / relay 4,534 |
+
+All other classes reject 0 in both. Metric counters are identical before and after, so the
+production rules do not change simulated behavior for the classes the read path charges.
