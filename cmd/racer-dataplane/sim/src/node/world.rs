@@ -3008,27 +3008,29 @@ impl NodeWorld {
             }
             None => 0,
         };
+        // Production ranks the page here (`PeerServer::shed_hot_page`,
+        // `placement.rank`), not only from the placement cache: an owner that
+        // holds the page without having ranked it under its current
+        // membership (fetched under an older one, or never missed it since)
+        // still sheds (Known issue 23).
         let w = self.ids.worker(page);
-        if !self.owned(dest, w, page) {
+        let owners = self.owners_at(dest, w, page, true);
+        if !owners.contains(&dest) {
             return false;
         }
         let version = self.nodes[dest as usize].version;
         let Some(members) = self.versions.get(version).map(|v| v.members.clone()) else {
             return false;
         };
-        let exempt = match position(&members, requester) {
-            None => false,
-            Some(p) => {
+        let exempt = owners.contains(&requester)
+            || position(&members, requester).is_some_and(|p| {
                 is_helper(
                     &self.ids.object(page),
                     self.ids.number(page),
                     p,
                     members.members().len(),
-                ) || self.nodes[dest as usize].workers[w as usize]
-                    .placement
-                    .is_owner(&*members, &page.to_be_bytes(), |o| o == p)
-            }
-        };
+                )
+            });
         shed_hot_page(true, streaming, all, exempt, threshold)
     }
 
@@ -4471,3 +4473,74 @@ impl NodeWorld {
     }
 }
 
+#[cfg(test)]
+mod shed_tests {
+    use super::*;
+
+    /// Known issue 23: production `PeerServer::shed_hot_page` ranks the page
+    /// (`placement.rank`), so an owner sheds even when its placement cache
+    /// holds no ranking of the page under its current membership (it fetched
+    /// the page under an older one, or has served it from memory since). The
+    /// simulator used the cache-only ownership test of retention, and owners
+    /// queued every reader after a membership change.
+    #[test]
+    fn owner_without_a_cached_ranking_sheds_a_hot_page() {
+        let nodes = 256;
+        let config = Config {
+            nodes,
+            request_rate: 0.0,
+            pages_per_object: 1,
+            ..Config::default()
+        };
+        let mut world = NodeWorld::new(config, 1);
+        let page = 0;
+        let w = world.ids.worker(page);
+        let members = world
+            .versions
+            .get(world.nodes[0].version)
+            .unwrap()
+            .members
+            .clone();
+        // Rank on a node that is not asked below, so the owners' own caches
+        // stay empty.
+        let ranker = (0..nodes)
+            .find(|n| !world.owners_at(*n, w, page, true).contains(n))
+            .unwrap();
+        let owners = world.owners_at(ranker, w, page, true);
+        assert_eq!(owners.len(), 3);
+        let owner = owners[0];
+        assert!(world.owners_at(owner, w, page, false).is_empty());
+        let helper = |n: u32| {
+            position(&members, n).is_some_and(|p| {
+                is_helper(
+                    &world.ids.object(page),
+                    world.ids.number(page),
+                    p,
+                    members.members().len(),
+                )
+            })
+        };
+        let reader = (0..nodes)
+            .find(|n| !owners.contains(n) && !helper(*n) && *n != ranker)
+            .unwrap();
+        let helper_node = (0..nodes).find(|n| !owners.contains(n) && helper(*n));
+        let threshold = world.hot_page_threshold();
+        let busy = vec![SECONDS; threshold];
+        world.streaming.insert((owner, page), busy.clone());
+        world.bodies.insert(owner, busy);
+        assert!(world.shed_hot(owner, reader, page));
+        assert!(!world.shed_hot(owner, owners[1], page), "owners are exempt");
+        if let Some(h) = helper_node {
+            assert!(!world.shed_hot(owner, h, page), "helpers are exempt");
+        }
+        // A non-owner never sheds, cached ranking or not.
+        let busy = vec![SECONDS; threshold];
+        world.streaming.insert((reader, page), busy.clone());
+        world.bodies.insert(reader, busy);
+        assert!(!world.shed_hot(reader, ranker, page));
+        world
+            .streaming
+            .insert((owner, page), vec![SECONDS; threshold - 1]);
+        assert!(!world.shed_hot(owner, reader, page), "below the threshold");
+    }
+}
