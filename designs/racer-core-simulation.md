@@ -721,7 +721,8 @@ Verified against the code at the start of this work.
    re-ask spent all 16 links on that one owner and the other two were never asked. A verified
    `StaleMembership` now also returns the links past its answerer
    (`racer_core::read::budget::stale_unused_links`); 50k failed reads 11 to 4. The remainder is
-   Known issue 57 (round 4, ctl3, wave 6).
+   Known issue 57 (round 4, ctl3, wave 6). Resolved with 57: 50k `full-cold-start` seed 1
+   fails 0 reads (round 4, budget, wave 7).
 
 48. A seat follower takes the `shared.changed` generation after `follow_once`
    (`cluster-control/src/seat.rs`, `follower`), so a primary Lease change that arrives during the
@@ -835,7 +836,17 @@ Verified against the code at the start of this work.
    a few credits; its rank 0 (or the member it delegates to) is behind on membership (often a
    member whose client applied only its first version), answers `StaleMembership`, and the
    owner has no attempt left to wait or to fetch, so it answers `Unavailable`. Open (round 4,
-   ctl3, wave 6).
+   ctl3, wave 6). Resolved: the owners were short because non-owners forwarded their
+   Acquire on a shared route, which grants only `remaining.div_ceil(visits)` remote credits:
+   a non-owner reached by a funded route inherits seven links and could never fund (it
+   required eight), and an in-order visit to rank 1 with three attempts left granted one
+   credit. Non-owners now fund such owners with `owner_funding_min` attempts and the links a
+   shared route would charge (`walk::funded_links`, `walk::shared_share_short`), except in
+   order after an earlier owner was busy (shed, timed out, overloaded). 50k `full-cold-start`
+   failed reads 3 to 0; 5k `full-failover` 32/23/29 to 17/19/24 (seeds 1 to 3). Bound: an
+   owner can still end with origin authority and no attempt when its sender lacked
+   `owner_funding_min` attempts itself (`origin_unfunded_short`, 50k 143 to 82, all recovered
+   by retries) (round 4, budget, wave 7).
 
 58. 50k `full-failover` failed reads rose with the offer2 changes: 266, 243, 265 to 343, 298,
    338 (seeds 1 to 3), a regression, not variance. Root cause: issue 51's offers to rank 1 make
@@ -1371,8 +1382,9 @@ scenarios carry data-plane faults.
 46. Resolved: rankings keep ranks to 12, owners ask up to six lineage targets, including demoted
    members of unknown age; 5k `full-churn` moved repeats 194 to 66; holders ranked below 12 or
    past six targets are not asked (round 4, probes, wave 6).
-47. Partly resolved: stale answers now return unused route links; 50k `full-cold-start` failed
-   reads 11 to 4, the rest is 57 (round 4, ctl3, wave 6).
+47. Resolved: stale answers return unused route links (ctl3, wave 6) and owners get the
+   credits they need (57); 50k `full-cold-start` failed reads 11 to 4 to 0 (round 4, budget,
+   wave 7).
 48. Resolved: seat followers reread after a primary Lease change during their read (round 4,
    ctl3, wave 6).
 49. Resolved with a tested bound: a second stale wait only at the last visit, rank 0 or 1
@@ -1393,8 +1405,9 @@ scenarios carry data-plane faults.
    with offer2 5k worst pages 5, 50k worst page 7 and `copy_held` 527 (round 4, probes, wave 6).
 56. Resolved: a primary's follower read overlapping its own commit failed closed (round 4, ctl3,
    wave 6).
-57. Owners with too little inherited budget fail when their rank 0 is behind on membership (4
-   reads at 50k `full-cold-start`) (round 4, ctl3, wave 6).
+57. Resolved: non-owners fund forwarded and short in-order Acquires with the credits the owner
+   needs and the shared route's links; 50k `full-cold-start` failed reads 3 to 0 (round 4,
+   budget, wave 7).
 58. 50k `full-failover` failed reads about 258 to 326 after offer2 (seeds 1 to 3): rank 1
    defers readers to issue 51's offer senders, often down; the direct fix fails DST seed 11.
    Open (round 4, offer2, wave 6).
@@ -6214,3 +6227,93 @@ origin requests, worst page, pages fetched more than once; `copy_held` repeats; 
   343). The worst page is 7 (probes alone: 8, wave 5: 6) and `copy_held` falls 578 to 527
   (probes alone: 626), so Known issue 55 is smaller but not gone at 50k. No invariant failures
   and `unexplained` 0 in both runs.
+
+## Round 4: budget (wave 7)
+
+Known issues 57 and 47 (remainder). Branch `racer-sim9-budget` from racer-core-sim 985006526.
+Logs and reports: `/tmp/opencode/r9-budget/`.
+
+### Root cause
+
+The `RACER_SIM_TRACE_FAILED` trace of the ctl3 50k run classified every remaining failure the
+same way: the reader's owners each failed their own acquisition because they held one credit,
+spent it on a copy-only probe of a rank 0 that was behind on membership (or had just failed the
+reader), and had none left for origin (`origin_unfunded`). The owners were short because a
+non-owner sent their Acquire over a shared route, and `walk::plan_attempt` grants a shared
+route only `remaining.div_ceil(opportunities)` remote credits. Two paths:
+
+- Forwarded out-of-order visits (`core/src/read/walk.rs`, the non-owner funded branch of
+  `CandidateWalk::next`): a non-owner funded an out-of-order owner only with eight links, but a
+  non-owner reached by a funded route inherits at most seven (`budget::inherited_budget`), so
+  it always fell back to a shared route that spent the same seven links and granted one
+  credit (owner reached as rank 2 under a newer membership: 31298 and 4813 in the trace).
+- In-order visits: in 5k `full-failover` all 161 `origin_unfunded` owners were rank 1 holding
+  one credit, sent in visit order by a non-owner with three attempts left after rank 0
+  (temporary trace, not kept).
+
+### Change
+
+- `walk::funded_links`: a non-owner funds an out-of-order owner with a full route when it has
+  eight links, else with exactly the links a shared route would charge (at least
+  `FUNDED_MIN_LINKS`, 2). Later visits keep the same links as before; only attempts move.
+- `walk::shared_share_short`: an in-order Acquire whose shared share is below
+  `owner_funding_min(c) - 1` is funded with the minimum instead, unless an earlier owner was
+  busy in this walk (`CandidateWalk::saw_busy`: shed, timeout, or `Overloaded` from it or a
+  relay). A busy rank 0 is most likely serving or fetching the page, so funding rank 1 to fetch
+  added overlapping origin requests (5k `zipf` at 16 MiB: 120 to 165 without the exception, 144
+  with shed and timeout only, 128 with overload too). A route failure or a refusal still funds.
+- Budgets never grow: both are partitions of the walk's budget. Origin authority rules are
+  unchanged. Shared core logic, so production `src/read/candidates.rs` gets the same walk.
+- Simulator counters: `forwarded_funded_routes`, `origin_unfunded_short`,
+  `origin_unfunded_spent`.
+
+### Tests
+
+`walk::tests`: `forwarded_non_owner_funds_an_out_of_order_owner_with_its_route_links`,
+`funded_links_match_a_shared_route_below_a_full_route`,
+`in_order_owner_gets_the_credits_it_needs_when_a_share_is_short`,
+`shared_share_short_only_below_an_owners_minimum`,
+`a_busy_owner_keeps_the_next_in_order_owner_on_its_share` (the first and the last fail before
+their change).
+
+### Evidence
+
+Release, seed 1 unless noted; reads ok / failed; origin total, worst page, pages fetched more
+than once; overlapping (`concurrent`) origin requests where relevant.
+
+| Run | Wave 6 | Budget |
+| --- | --- | --- |
+| 5k storm | 378,544 / 0; 1,024, 1, 0 | unchanged |
+| 5k zipf | 202,851 / 15; 40,404, 3, 1,452; 1,245 | unchanged |
+| 5k churn | 291,482 / 93; 1,026, 2, 2 | unchanged |
+| 5k zipf 16 MiB | 37,639 / 29; 17,826, 3, 134; 120 | 37,637 / 29; 17,834, 3, 143; 128 |
+| 5k 1 Gbit/s storm | 95,107 / 0; 6,941, 2, 2 | 95,107 / 0; 6,942, 2, 2 |
+| 5k full-cold-start | 95,107 / 0; 6,942, 2, 2 | unchanged |
+| 5k full-failover | 33,976 / 32; 12,963, 5, 320 | 33,991 / 17; 12,993, 6, 316 |
+| 5k full-failover seed 2 | 33,747 / 23; 12,976, 5, 348 | 33,754 / 19; 12,993, 6, 368 |
+| 5k full-failover seed 3 | 33,594 / 29; 12,902, 6, 292 | 33,603 / 24; 12,921, 6, 308 |
+| 5k full-churn | 34,073 / 0; 12,637, 4, 90 | 34,073 / 0; 12,638, 4, 91 |
+| 5k zipf, 50 hung members | 30,634 / 3; 11,843, 2, 24 | 30,640 / 3; 11,854, 2, 24 |
+| 50k full-cold-start | 912,774 / 3; 27,148, 3, 187 | 912,775 / 0; 27,157, 3, 194 |
+
+- 50k `full-cold-start` (22:42 wall, peak RSS 4.6 GiB): 0 failed reads, `origin_unfunded` 143
+  to 82 (all `short`, all recovered by a retry), `unexplained` 0, no invariant failures.
+- 5k `full-failover`: `origin_unfunded` 161 to 0 (seed 1); owners that could not fetch now do,
+  so failed reads fall and origin rises by 17 to 30 requests (0.1 to 0.2%); `copy_held` repeats
+  58/67/55 to 67/76/72 and the worst page 5 to 6 at seeds 1 and 2 (Known issue 55 class).
+- fmt, clippy `-D warnings`, workspace tests (3,567 passed), DST seeds 1 to 20 native and
+  non-native, and all 16 scenarios at 200 nodes pass; hard invariants hold.
+
+### Bounds
+
+- An owner reached by a non-owner holds at least `owner_funding_min(c) - 1` credits whenever
+  its sender had `owner_funding_min(c)` attempts and two links and no earlier owner of the walk
+  was busy. Below that, the owner may still end with authority and no attempt
+  (`origin_unfunded_short`); the reader's next attempt starts with a fresh page budget.
+
+### Deviations and open items
+
+- 50k seed 2 was not run (host time shared with other tracks); 5k seeds 1 to 3 cover failover.
+- New Known issue 511: the in-order funding trades 17 to 30 extra origin requests and a few
+  more `copy_held` repeats in 5k `full-failover` for 4 to 15 fewer failed reads; funded owners
+  fetch after rank 0 failed where they previously failed the reader.
