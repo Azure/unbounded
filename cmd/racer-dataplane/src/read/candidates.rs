@@ -1177,13 +1177,16 @@ impl CandidatePolicy {
                         .iter()
                         .map(|node| candidates.membership.since(node))
                         .collect();
-                    for node in racer_core::read::walk::demoted_targets(
+                    // Arrivals at generation 0 are unknown: present since
+                    // this node's chain began (Known issue 46).
+                    for node in racer_core::read::walk::demoted_targets_from(
                         &since,
                         &demoted,
                         &demoted_since,
                         rank,
+                        Some(0),
                     ) {
-                        if targets.len() < racer_core::read::walk::MAX_HANDOFF
+                        if targets.len() < racer_core::read::walk::MAX_LINEAGE
                             && !targets.contains(&node)
                         {
                             targets.push(node);
@@ -1250,6 +1253,8 @@ impl CandidatePolicy {
                 helper,
                 lineage,
                 granted,
+                // Granted probes go out at once (Known issue 45).
+                parallel_granted: true,
                 rank0: match (rank, &operation) {
                     (Some(rank), PeerOperation::Page { page: id, .. }) if rank > 0 => {
                         self.rank0_watch.borrow().state(
@@ -1270,6 +1275,39 @@ impl CandidatePolicy {
             let end = loop {
                 let probe = match walk.next(budget)? {
                     Step::Probe(probe) => probe,
+                    Step::Granted(probes) => {
+                        // Every granted target at once, copy-only, each on
+                        // its own grant and sharing one time share (Known
+                        // issue 45). Only a validated copy matters; every
+                        // other answer is a miss.
+                        match self
+                            .granted_batch(
+                                &candidates,
+                                &handoff,
+                                &probes,
+                                context,
+                                &operation,
+                                scope,
+                                budget.deadline(),
+                                &mut validate,
+                                trail,
+                            )
+                            .await
+                        {
+                            Ok(Some(copy)) => {
+                                walk.complete_granted(true);
+                                return Ok(CandidateResolution::Copy(copy));
+                            }
+                            Ok(None) => {
+                                walk.complete_granted(false);
+                                continue;
+                            }
+                            Err(error) => {
+                                walk.abandon(budget)?;
+                                return Err(error);
+                            }
+                        }
+                    }
                     Step::End(end) => break end,
                 };
                 let copy_only = probe.mode == WalkMode::CopyOnly;
@@ -1538,6 +1576,78 @@ impl CandidatePolicy {
                 }
             }
         })
+    }
+
+    /// Send a run of granted probes at once (`Step::Granted`, Known issue
+    /// 45): copy-only, each on its own grant
+    /// (`racer_core::read::walk::granted_budget`), all sharing the first
+    /// probe's time share, so the run costs one round trip instead of one per
+    /// target. Waits for every answer before validating, so no exchange is
+    /// left running; returns the first validated copy in probe order. Any
+    /// other answer, and any transport failure while `scope` still runs, is
+    /// a miss, as for a sequential granted probe.
+    #[allow(clippy::too_many_arguments)] // The batch borrows the walk's distinct inputs.
+    async fn granted_batch<'a, T>(
+        &'a self,
+        candidates: &Candidates,
+        handoff: &[NodeId],
+        probes: &[racer_core::read::walk::Probe],
+        context: &'a OriginContext,
+        operation: &PeerOperation,
+        scope: &RequestScope,
+        deadline: std::time::Instant,
+        validate: &mut (impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a),
+        trail: &mut CandidateTrail,
+    ) -> Result<Option<T>> {
+        let mut grants: Vec<(AcquisitionBudget, bool)> = probes
+            .iter()
+            .map(|_| (racer_core::read::walk::granted_budget(deadline), false))
+            .collect();
+        let owners = candidates.ordered.len();
+        let responses = futures::future::join_all(probes.iter().zip(grants.iter_mut()).map(
+            |(probe, (grant, timed_out))| {
+                self.request_traced(
+                    &candidates.membership,
+                    &handoff[probe.canonical - owners],
+                    context,
+                    operation,
+                    FetchMode::CopyOnly,
+                    scope,
+                    grant,
+                    probe.remaining_opportunities,
+                    RequestMode::FundedRoute,
+                    None,
+                    timed_out,
+                )
+            },
+        ))
+        .await;
+        for response in responses {
+            match response {
+                Ok(response)
+                    if matches!(
+                        response.response(),
+                        PeerResponse::StaleMembership | PeerResponse::Overloaded
+                    ) => {}
+                Ok(response) => {
+                    let validated = validated_copy(response, operation, false, validate).await;
+                    note_validation(trail, &validated);
+                    match validated {
+                        Ok(Ok(copy)) => return Ok(Some(copy)),
+                        Ok(Err(_)) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error)
+                    if racer_core::read::Error::try_from(error)
+                        .ok()
+                        .and_then(racer_core::read::walk::transport_outcome)
+                        .is_some()
+                        || scope.check().is_ok() => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
     }
 
     /// The member this non-owner asks to acquire `page` for it when an owner

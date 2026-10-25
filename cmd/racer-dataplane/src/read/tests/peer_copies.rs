@@ -3687,20 +3687,18 @@ fn a_newer_owner_asks_older_later_owners_before_origin() {
                     Reply::Miss
                 };
                 peers.replies.borrow_mut().push_back((n.clone(), reply));
-                if holder == Some(i) {
-                    break;
-                }
             }
-            if holder.is_none() {
-                // Then version 1's other owner, which is not a current one.
-                let other = members
-                    .iter()
-                    .map(|m| m.node.clone())
-                    .find(|n| !ordered.contains(n))
-                    .unwrap();
-                expected.push(other.clone());
-                peers.replies.borrow_mut().push_back((other, Reply::Miss));
-            }
+            // Then version 1's other owner, which is not a current one. It
+            // is also the member ranked fourth, a demoted target granted with
+            // the lineage targets, so all three go out at once (Known issue
+            // 45) whoever holds the copy.
+            let other = members
+                .iter()
+                .map(|m| m.node.clone())
+                .find(|n| !ordered.contains(n))
+                .unwrap();
+            expected.push(other.clone());
+            peers.replies.borrow_mut().push_back((other, Reply::Miss));
         }
         let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
         let result = acquire(&mut f, &mut budget);
@@ -3732,11 +3730,11 @@ fn a_newer_owner_asks_older_later_owners_before_origin() {
     }
 }
 
-/// Known issues 34 and 35: rank 0 reached by a delegation carries one
+/// Known issues 34, 35 and 45: rank 0 reached by a delegation carries one
 /// credit, kept for its origin attempt. It still asks its lineage targets
 /// (later owners that arrived before it) and the member ranked fourth, which
-/// was an owner before rank 0 arrived, each copy-only on its own grant, and
-/// keeps the credit. Before, handoff probes stopped short of the origin
+/// was an owner before rank 0 arrived, each copy-only on its own grant, all
+/// at once, and keeps the credit. Before, handoff probes stopped short of the origin
 /// credit, so it fetched without asking anyone.
 #[test]
 fn a_delegated_rank_zero_asks_lineage_and_demoted_targets_on_their_own_grant() {
@@ -3816,9 +3814,6 @@ fn a_delegated_rank_zero_asks_lineage_and_demoted_targets_on_their_own_grant() {
                     Reply::Miss
                 };
                 peers.replies.borrow_mut().push_back((n.clone(), reply));
-                if holder == Some(i + 1) {
-                    break;
-                }
             }
         }
         // What a delegation carries: the origin credit and one link.
@@ -3841,6 +3836,21 @@ fn a_delegated_rank_zero_asks_lineage_and_demoted_targets_on_their_own_grant() {
             // The grants never touched the walk's own credit.
             assert_eq!(budget.remaining_attempts(), 1, "{case}");
         }
+        // All three went out at once (Known issue 45): each on its own
+        // one-attempt grant, sharing the first one's time share (up to the
+        // test clock's progress), where one after the other each would have
+        // had a larger share of what the earlier ones left.
+        let deadlines = peers.local_deadlines.borrow();
+        let first = deadlines.first().map(|d| d.1);
+        assert!(
+            deadlines.iter().all(|d| first
+                .is_some_and(|first| { d.1.max(first) - d.1.min(first) < Duration::from_secs(1) })),
+            "{case}: {deadlines:?}"
+        );
+        assert!(
+            peers.calls.borrow().iter().all(|c| c.2 == 0),
+            "{case}: one-attempt grants"
+        );
         // The member ranked fourth is cached below the owners.
         assert_eq!(
             placement.demoted(&current, &f.context.object, f.page.number),
