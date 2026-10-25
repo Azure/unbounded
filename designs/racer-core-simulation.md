@@ -455,7 +455,8 @@ Verified against the code at the start of this work.
 25. Resolved (round 4, lineage, wave 5, with Known issues 34 and 35): owners also ask the members
    ranked just below them and ask every lineage target on its own grant; 5k `full-churn`
    moved-page repeats 884 to 188 (origin requests 13,471 to 12,748, pages fetched more than once
-   852 to 216), 5k `full-cold-start` 37 to 12. What remains are holders that were never owners
+   852 to 216), 5k `full-cold-start` 37 to 12. 50k `full-failover`: 2,864 to 672 (origin requests 50,858 to
+   48,054). What remains are holders that were never owners
    or are ranked sixth or lower, holders that dropped the copy, and unreachable holders; bound in
    "Round 4: lineage (wave 5)". See that section.
    Was partly resolved (round 4, history, wave 4, 8ba959e3f..f8ec46f53): membership chains record
@@ -4464,6 +4465,17 @@ mean / p99 of `read_ns` in ms. Probes: lineage plus demoted granted probes / cop
 | full-failover after | 33,796 / 32 | 12,940, 6, 376 | 23 | 95 | 89 / 335 | 10,324 / 58 | 3,247 |
 | full-churn before | 33,996 / 1 | 13,471, 4, 852 | 884 | 6 | 71 / 150 | - | - |
 | full-churn after | 33,991 / 1 | 12,748, 3, 216 | 188 | 3 | 95 / 268 | 21,313 / 776 | 6,025 |
+
+50k `full-failover` (seed 1, `/tmp/opencode/m4b/rr.json`; before is `/tmp/opencode/m6/a/`):
+
+| Run | Reads ok / failed | Origin | Move | `copy_held` | Latency | Probes | Joins declined | Peak RSS | Wall |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| before | 302,776 / 395 | 50,858, 6, 4,998 | 2,864 | 1,410 | 79 / 301 | - | - | 3.0 GiB | 28:00 |
+| after | 302,759 / 370 | 48,054, 7, 2,702 | 672 | 918 | 88 / 369 | 57,644 / 2,838 | 16,231 | 3.0 GiB | 29:21 |
+
+At 50k, origin requests fall 2,804 (5.5%), moved-page repeats 77% and pages fetched more than
+once 46%; failed reads 395 to 370. The worst page goes 6 to 7 (one page). Peak RSS 3,119,364 to
+3,195,016 kB.
 
 Steps, 5k `full-churn` (same binary, knobs): grants without demoted targets and without the join
 rule: moved 202, origin 12,811, lineage probe failures 6,525, failed reads 3, worst page 6;
