@@ -370,9 +370,9 @@ struct Fill {
     /// after a destination under the current one was behind
     /// (`stale_fallback`).
     fell_back: bool,
-    /// This read waited once for a destination that is behind
+    /// Waits this read made for destinations that are behind
     /// (`racer_core::read::stale::stale_wait`, Known issue 26).
-    waited: bool,
+    waits: u8,
     /// The walk is paused in that wait (`Event::StaleWait`).
     stale_waiting: bool,
     /// This node owns the page under the previous membership, so this walk
@@ -1819,7 +1819,7 @@ impl NodeWorld {
                 stale: 0,
                 fell_back: false,
                 fallback_denied: false,
-                waited: false,
+                waits: 0,
                 stale_waiting: false,
                 probe: None,
                 eligible,
@@ -3880,8 +3880,8 @@ impl NodeWorld {
         (go, old, member, recent)
     }
 
-    /// Production `resolve_epoch_traced` (Known issue 26): a non-owner that
-    /// cannot walk the previous membership waits once for a destination
+    /// Production `resolve_epoch_traced` (Known issues 26 and 36): a non-owner that
+    /// cannot walk the previous membership waits (at most `MAX_STALE_WAITS` times) for a destination
     /// that is behind, then asks it again (`racer_core::read::stale::stale_wait`).
     /// The pending probe's credits are back in the fill's budget. Returns
     /// whether it waits.
@@ -3892,10 +3892,15 @@ impl NodeWorld {
         let now = self.instant(self.now());
         let (fallback, ..) = self.fallback_facts(id);
         let fill = self.fills.get_mut(&id).expect("present");
+        let affordable = match &fill.walk {
+            Walking::Candidates(walk) => walk.retry_affordable(&fill.budget),
+            _ => false,
+        };
         let Some(wait) = stale_wait(StaleWaitFacts {
             owner: fill.rank.is_some(),
             fallback,
-            waited: fill.waited,
+            waits: fill.waits,
+            affordable,
             remaining: fill.budget.deadline().saturating_duration_since(now),
         }) else {
             return false;
@@ -3906,7 +3911,11 @@ impl NodeWorld {
         if walk.retry_pending(&mut fill.budget).is_err() {
             return false;
         }
-        fill.waited = true;
+        if fill.waits > 0 {
+            // A further wait (Known issue 36).
+            self.metrics.incr("stale_waits_again");
+        }
+        fill.waits = fill.waits.saturating_add(1);
         fill.stale_waiting = true;
         fill.asking = None;
         self.metrics.incr("stale_waits");

@@ -915,6 +915,35 @@ impl CandidateWalk {
         Ok(())
     }
 
+    /// Whether asking the pending destination once more (one more exchange,
+    /// after [`Self::retry_pending`]) still leaves the walk enough attempts
+    /// to fund that visit and every later one at its minimum
+    /// ([`owner_funding_min`]), and links for a full route share
+    /// ([`AcquisitionBudget::route_links`]) to each. A read's further waits
+    /// for a destination that is behind take this (Known issue 36), so
+    /// waiting never starves a later owner that may already be current.
+    pub fn retry_affordable(&self, budget: &AcquisitionBudget) -> bool {
+        // The pending probe's child holds its credits and its route share.
+        let (attempts, links, route) = match &self.pending {
+            Some(Pending {
+                bounded: Some(b),
+                granted: false,
+                ..
+            }) => (b.remaining_attempts(), b.remaining_links(), b.route_links()),
+            _ => (0, 0, 0),
+        };
+        let attempts = budget.remaining_attempts().saturating_add(attempts);
+        let links = u32::from(budget.remaining_links()) + u32::from(links);
+        let later = (self.index + 1..self.count)
+            .filter(|i| self.target(*i).is_some())
+            .count() as u32;
+        let need = 1
+            + self.target(self.index).map_or(0, owner_funding_min)
+            + self.later_reserve(self.index);
+        let route = u32::from(route.max(budget.route_links()).max(1));
+        attempts >= need && links >= route * (1 + later)
+    }
+
     /// Record the pending probe's outcome. Returns an end when the walk stops
     /// early (copy or stale membership).
     pub fn complete(

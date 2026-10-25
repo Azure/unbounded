@@ -1757,4 +1757,48 @@ fn delegated_rank_zero_asks_granted_lineage_targets_and_keeps_origin_credit() {
     });
     assert_eq!(probes.len(), 2);
     assert_eq!(end, End::Copy);
+
+/// Known issue 36: a further ask of a destination that is behind must leave
+/// attempts for every later visit's minimum and a full route share of links
+/// for each.
+#[test]
+fn retry_affordable_keeps_later_visits_funded() {
+    let order = visit_order(ReplicaSelection::Spread, 3, |r| r != 0, |r| 3 - r as u64);
+    for (attempts, links, affordable) in [
+        (8, 16, false),
+        (16, 32, true),
+        // Attempts enough, links not.
+        (16, 8, false),
+        // Links enough, attempts not.
+        (6, 32, false),
+    ] {
+        let mut walk = CandidateWalk::new(config(None, 3, order.clone()));
+        let mut b = budget(attempts, links);
+        let Step::Probe(_) = walk.next(&mut b).unwrap() else {
+            panic!("expected a probe");
+        };
+        assert_eq!(
+            walk.retry_affordable(&b),
+            affordable,
+            "{attempts} attempts, {links} links"
+        );
+    }
+    // The last visit needs nothing after it.
+    let mut walk = CandidateWalk::new(config(None, 3, order));
+    let mut b = budget(8, 16);
+    for _ in 0..2 {
+        let Step::Probe(_) = walk.next(&mut b).unwrap() else {
+            panic!("expected a probe");
+        };
+        walk.complete(&mut b, Outcome::StaleDestination).unwrap();
+    }
+    let Step::Probe(last) = walk.next(&mut b).unwrap() else {
+        panic!("expected a probe");
+    };
+    assert_eq!(last.index, 2);
+    assert!(
+        walk.retry_affordable(&b),
+        "{} attempts",
+        b.remaining_attempts()
+    );
 }

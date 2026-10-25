@@ -19,14 +19,21 @@
 //! [`fallback_rank_allowed`] ends it when this node owns the page there.
 //!
 //! A reader that cannot fall back (it joined in N, so it is not a member of
-//! N - 1) waits for the destination to adopt N once instead ([`stale_wait`],
-//! Known issue 26).
+//! N - 1) waits for the destination to adopt N instead, at most
+//! [`MAX_STALE_WAITS`] times ([`stale_wait`], Known issues 26 and 36).
 
 use std::time::Duration;
 
 /// Most time one wait for a destination that is behind may take
 /// ([`stale_wait`]).
 pub const MAX_STALE_WAIT: Duration = Duration::from_secs(4);
+
+/// Most waits one read makes for destinations that are behind
+/// ([`stale_wait`]). A membership reaches every client within the seats'
+/// write window after a commit (about 5 s at 50,000 clients, Known issue
+/// 36): with a 10 s deadline, two waits (a third, then a third of the rest)
+/// cover 5.5 s and leave the rest for the remaining owners.
+pub const MAX_STALE_WAITS: u8 = 2;
 
 /// Shortest wait worth making: below this the destination is unlikely to
 /// have adopted the membership, and the read keeps walking instead.
@@ -40,8 +47,13 @@ pub struct StaleWaitFacts {
     pub owner: bool,
     /// [`previous_fallback`] walks the previous membership instead.
     pub fallback: bool,
-    /// This read already waited for a destination once.
-    pub waited: bool,
+    /// Waits this read already made for destinations that are behind.
+    pub waits: u8,
+    /// One more exchange with the destination still leaves the walk
+    /// enough attempts for its later visits
+    /// (`super::walk::CandidateWalk::retry_affordable`). Required for every
+    /// wait after the first.
+    pub affordable: bool,
     /// Time left until the read's deadline.
     pub remaining: Duration,
 }
@@ -55,13 +67,18 @@ pub struct StaleWaitFacts {
 /// on N - 1 cannot resolve N. Skipping every such owner exhausted the walk
 /// and failed the read, although the owners adopt N within the propagation
 /// window. Waiting a third of the time left (at most [`MAX_STALE_WAIT`],
-/// once per read, never below [`MIN_STALE_WAIT`]) leaves the rest of the
+/// at most [`MAX_STALE_WAITS`] times per read, never below
+/// [`MIN_STALE_WAIT`]) leaves the rest of the
 /// deadline for the remaining owners. The destination's verified
 /// `StaleMembership` returns the credits it was sent
 /// ([`super::budget::AcquisitionBudget::refund_remote`]), so the second ask
 /// costs one exchange and its links, like any probe; budgets never grow.
 pub fn stale_wait(facts: StaleWaitFacts) -> Option<Duration> {
-    if facts.owner || facts.fallback || facts.waited {
+    if facts.owner
+        || facts.fallback
+        || facts.waits >= MAX_STALE_WAITS
+        || (facts.waits > 0 && !facts.affordable)
+    {
         return None;
     }
     let wait = (facts.remaining / 3).min(MAX_STALE_WAIT);
@@ -136,13 +153,48 @@ mod tests {
     fn waiting() -> StaleWaitFacts {
         StaleWaitFacts {
             remaining: Duration::from_secs(9),
+            affordable: true,
             ..StaleWaitFacts::default()
         }
     }
 
     #[test]
-    fn a_reader_that_cannot_fall_back_waits_once() {
+    fn a_reader_that_cannot_fall_back_waits_twice() {
         assert_eq!(stale_wait(waiting()), Some(Duration::from_secs(3)));
+        // The first wait does not depend on funding (Known issue 26).
+        assert_eq!(
+            stale_wait(StaleWaitFacts {
+                affordable: false,
+                ..waiting()
+            }),
+            Some(Duration::from_secs(3))
+        );
+        // Known issue 36: a second wait, a third of what is left, covers
+        // the 50k propagation window (about 5 s) within a 10 s deadline.
+        let deadline = Duration::from_secs(10);
+        let first = stale_wait(StaleWaitFacts {
+            remaining: deadline,
+            ..waiting()
+        })
+        .unwrap();
+        let second = stale_wait(StaleWaitFacts {
+            remaining: deadline - first,
+            waits: 1,
+            ..waiting()
+        })
+        .unwrap();
+        assert!(
+            first + second >= Duration::from_millis(5500),
+            "{first:?} {second:?}"
+        );
+        assert_eq!(
+            stale_wait(StaleWaitFacts {
+                remaining: deadline - first - second,
+                waits: 2,
+                ..waiting()
+            }),
+            None
+        );
         // Capped, and a third of what is left.
         let long = StaleWaitFacts {
             remaining: Duration::from_secs(60),
@@ -168,7 +220,13 @@ mod tests {
                 ..waiting()
             },
             StaleWaitFacts {
-                waited: true,
+                waits: MAX_STALE_WAITS,
+                ..waiting()
+            },
+            // A further wait must leave the later visits funded.
+            StaleWaitFacts {
+                waits: 1,
+                affordable: false,
                 ..waiting()
             },
             StaleWaitFacts {

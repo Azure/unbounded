@@ -246,9 +246,9 @@ pub(crate) struct HedgeContinuation {
     pub primary_outcome: Option<ProbeOutcome>,
     pub stale: bool,
     pub bounded_routes: bool,
-    /// This read already waited for a destination that is behind
-    /// (`racer_core::read::stale::stale_wait`, Known issue 26).
-    pub waited: bool,
+    /// Waits this read already made for destinations that are behind
+    /// (`racer_core::read::stale::stale_wait`, Known issues 26 and 36).
+    pub waits: u8,
 }
 impl CandidatePolicy {
     #[cfg(test)]
@@ -1124,7 +1124,7 @@ impl CandidatePolicy {
                         retried,
                         HedgeContinuation {
                             bounded_routes: true,
-                            waited: continuation.waited,
+                            waits: continuation.waits,
                             ..Default::default()
                         },
                         trail,
@@ -1264,9 +1264,9 @@ impl CandidatePolicy {
             // This node owns the page under version - 1, so the stale
             // fallback (Known issue 19) is not available to this walk.
             let mut fallback_denied = false;
-            // This walk waited for a destination that is behind (Known
-            // issue 26).
-            let mut waited = false;
+            // Waits this walk made for destinations that are behind (Known
+            // issues 26 and 36).
+            let mut waits = 0u8;
             let end = loop {
                 let probe = match walk.next(budget)? {
                     Step::Probe(probe) => probe,
@@ -1359,14 +1359,16 @@ impl CandidatePolicy {
                                     .filter(|_| !fallback_denied);
                                 // One that cannot (it joined in this
                                 // membership) waits for the destination to
-                                // adopt it and asks again, once (Known
-                                // issue 26).
+                                // adopt it and asks again, at most
+                                // `MAX_STALE_WAITS` times (Known issues 26
+                                // and 36).
                                 let now = uring_runtime::environment::now();
                                 if let Some(wait) = racer_core::read::stale::stale_wait(
                                     racer_core::read::stale::StaleWaitFacts {
                                         owner: rank.is_some(),
                                         fallback: fallback.is_some(),
-                                        waited: continuation.waited || waited,
+                                        waits: continuation.waits.saturating_add(waits),
+                                        affordable: walk.retry_affordable(budget),
                                         remaining: budget
                                             .deadline()
                                             .min(scope.deadline.0)
@@ -1375,7 +1377,7 @@ impl CandidatePolicy {
                                 ) && self.can_wait()
                                 {
                                     walk.retry_pending(budget)?;
-                                    waited = true;
+                                    waits = waits.saturating_add(1);
                                     self.stale_sleep(now + wait, scope).await?;
                                     continue;
                                 }
@@ -1405,7 +1407,7 @@ impl CandidatePolicy {
                                                 validate,
                                                 true,
                                                 HedgeContinuation {
-                                                    waited: continuation.waited || waited,
+                                                    waits: continuation.waits.saturating_add(waits),
                                                     ..Default::default()
                                                 },
                                                 trail,
@@ -1430,7 +1432,7 @@ impl CandidatePolicy {
                                     true,
                                     HedgeContinuation {
                                         bounded_routes: continuation.bounded_routes,
-                                        waited: continuation.waited || waited,
+                                        waits: continuation.waits.saturating_add(waits),
                                         ..Default::default()
                                     },
                                     trail,

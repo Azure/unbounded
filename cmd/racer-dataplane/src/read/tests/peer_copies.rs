@@ -3506,18 +3506,35 @@ fn stale_owners_fall_back_to_the_recent_previous_membership() {
     }
 }
 
-/// Known issue 26: a reader that joined in version 2 is not a member of
-/// version 1, so it cannot walk the previous membership when an owner is
-/// behind. It waits once and asks the same owner again; a verified
+/// Known issues 26 and 36: a reader that joined in version 2 is not a member
+/// of version 1, so it cannot walk the previous membership when an owner is
+/// behind. It waits and asks the same owner again, at most
+/// `MAX_STALE_WAITS` times; a verified
 /// `StaleMembership` returns the credits the request carried, so each stale
 /// answer costs only its exchange. If the owner is still behind, the walk
 /// goes on as before and fails `Unavailable` without reaching the origin.
 #[test]
-fn readers_that_cannot_fall_back_wait_once_for_an_owner_that_is_behind() {
+fn readers_that_cannot_fall_back_wait_for_an_owner_that_is_behind() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    // (wait available, owner adopts during the wait)
-    for (wait, adopts) in [(true, true), (true, false), (false, false)] {
+    // (wait available, read attempts and links, owners asked in order
+    // (indexes into the visit order), whether the last one answers with the
+    // copy)
+    let cases: [(bool, u32, u8, &[usize], bool); 6] = [
+        // Adopts during the first wait.
+        (true, 8, 16, &[0, 0], true),
+        // Adopts during the second wait, which a larger budget affords.
+        (true, 16, 32, &[0, 0, 0], true),
+        // Still behind after both waits: each owner once more as before.
+        (true, 16, 32, &[0, 0, 0, 1, 2], false),
+        // A default read (8 attempts, 16 links) cannot afford a second ask
+        // and still fund its later owners: one wait, then as before.
+        (true, 8, 16, &[0, 0, 1, 2], false),
+        (true, 8, 16, &[0, 0, 1, 2], true),
+        // No timer: as before the waits.
+        (false, 8, 16, &[0, 1, 2], false),
+    ];
+    for (wait, attempts, links, asked, adopts) in cases {
         let mut f = fixture();
         let (peers, ordered) = install_peers(&mut f, None);
         let good = encrypted_copy(&mut f);
@@ -3558,43 +3575,37 @@ fn readers_that_cannot_fall_back_wait_once_for_an_owner_that_is_behind() {
         deps.candidates = Rc::new(policy);
         f.fill = Fill::new(deps);
         f.membership = current;
-        let mut replies = Vec::new();
-        if wait {
-            replies.push((ordered[0].clone(), Reply::Stale));
+        let expected: Vec<_> = asked.iter().map(|i| ordered[*i].clone()).collect();
+        for (k, n) in expected.iter().enumerate() {
+            let reply = if adopts && k + 1 == expected.len() {
+                Reply::Copy(good.clone())
+            } else {
+                Reply::Stale
+            };
+            peers.replies.borrow_mut().push_back((n.clone(), reply));
         }
-        if adopts {
-            replies.push((ordered[0].clone(), Reply::Copy(good.clone())));
-        } else {
-            replies.extend(ordered.iter().map(|n| (n.clone(), Reply::Stale)));
-        }
-        peers.replies.borrow_mut().extend(replies);
-        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, attempts, links);
         let result = acquire(&mut f, &mut budget);
-        let case = format!("wait {wait} adopts {adopts}");
+        let case = format!(
+            "wait {wait} attempts {attempts} links {links} asked {asked:?} adopts {adopts}"
+        );
         let calls: Vec<_> = peers.calls.borrow().iter().map(|c| c.0.clone()).collect();
         let memberships = peers.memberships.borrow().clone();
         assert!(
             memberships.iter().all(|v| *v == 2),
             "{case}: {memberships:?}"
         );
+        assert_eq!(calls, expected, "{case}");
         if adopts {
             let result = result.unwrap_or_else(|e| panic!("{case}: {e:?}"));
             assert_eq!(result.plaintext.bytes(), b"abc", "{case}");
-            assert_eq!(calls, [ordered[0].clone(), ordered[0].clone()], "{case}");
         } else {
             assert!(matches!(result, Err(Error::Unavailable)), "{case}");
-            // One more ask of the first owner with the wait, then each owner
-            // once as before.
-            let mut expected = ordered.clone();
-            if wait {
-                expected.insert(0, ordered[0].clone());
-            }
-            assert_eq!(calls, expected, "{case}");
             // Each stale answer returned its remote credits: only the
             // exchanges are spent.
             assert_eq!(
                 budget.remaining_attempts(),
-                8 - calls.len() as u32,
+                attempts - calls.len() as u32,
                 "{case}"
             );
         }
@@ -3696,7 +3707,19 @@ fn a_newer_owner_asks_older_later_owners_before_origin() {
         let result = result.unwrap_or_else(|e| panic!("{case}: {e:?}"));
         assert_eq!(result.plaintext.bytes(), b"abc", "{case}");
         let calls: Vec<_> = peers.calls.borrow().iter().map(|c| c.0.clone()).collect();
-        assert_eq!(calls, expected, "{case}");
+        assert_eq!(
+            calls,
+            expected,
+            "{case} {:?} {} {}",
+            peers
+                .calls
+                .borrow()
+                .iter()
+                .map(|c| (c.2, c.3))
+                .collect::<Vec<_>>(),
+            budget.remaining_attempts(),
+            budget.remaining_links()
+        );
         assert!(
             peers.calls.borrow().iter().all(|c| c.1),
             "{case}: copy-only"
