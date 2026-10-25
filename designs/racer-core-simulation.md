@@ -448,9 +448,20 @@ Verified against the code at the start of this work.
    48,438 to 35,917, the most requests for one page from 24 to 4, origin requests canceled from
    18,468 to 2,186, and failed reads from 90 to 54. 1 MiB scenarios keep their trace hashes. See
    "Round 4: handover (wave 3)" (round 4, handover, wave 3).
-141. `dst_generated_native_traffic_churn_oracle` (seed 1) stalls in RDMA link setup on the orphan
-   branch: one side `Ready`, the peer `Idle`, after a successor deferral changes the run's
-   trajectory. Not root-caused. See "Round 4: orphan (wave 3)".
+141. Resolved: DST harness bug, not production. `connect_links`
+   (`src/app/tests/dst.rs`) only asked node `a` to set up the link, but step 28
+   (`InflightCrash`) crashed and restarted node `10` under `0d`'s `Ready` link. `0d` holds a
+   half-open link it only learns about on use (`verbs/src/simulation.rs:917-918` returns
+   `RETRY_EXC_ERR` for an unpaired queue pair), and `Links::wants` requires `Idle`
+   (`src/rdma/links.rs:475-480`), so `ensure_link` from `0d` was a no-op forever. Production
+   recovers either way: the restarted peer's setup replaces the stale link
+   (`verbs/src/node.rs:881-885`), or the survivor's first use breaks it. The harness now has the
+   not-ready side initiate and waits out either side's backoff. Regression tests
+   `rdma::links::tests::half_open_link_after_peer_restart_*`. See "Round 4: orphan (wave 3)".
+
+145. `dst_generated_native_traffic_churn_oracle` seed 16 fails at step 0 (`PendingWriteCrash`):
+   retired node 24 leaks 30,776 `RequestContext` bytes. Pre-existing: base 3771e5c3f fails the
+   same way; the non-native oracle passes seed 16. Not root-caused.
 
 ## Simulator engine (racer-sim substrate)
 
@@ -917,8 +928,10 @@ scenarios carry data-plane faults.
    cancel, wave 3).
 161. Resolved: a running fill passes to another live waiter when its leader expires; 5k `zipf` at
    16 MiB: origin requests 48,438 to 35,917, most per page 24 to 4 (round 4, handover, wave 3).
-141. DST native churn oracle seed 1 stalls in link setup on the orphan branch (round 4,
-   orphan).
+141. Resolved: DST harness only let the survivor set up a half-open link after a peer
+   crash-restart; the restarted peer now initiates (round 4, orphan).
+145. DST native churn oracle seed 16 leaks `RequestContext` on a crashed node (pre-existing on
+   base; open).
 
 ## Round 2: production admission
 
@@ -3273,4 +3286,17 @@ without hints, so this is run-to-run sensitivity, not a cost.
   recovers. Seeds 2 to 14 pass on both branches and base passes seed 1. Inference: a link-state
   divergence (peer reset while the other side stays ready) that the new trajectory exposes; not
   root-caused here. Must be resolved or triaged before merge.
+
+### Known issue 141 triage
+
+Tracing link opens, accepts, and breaks for seed 1 showed `0d` opened epoch 7 to `10` at step
+24 and `10` accepted it, then step 28 (`InflightCrash`) crashed and restarted `10`. The new
+owner has no links, but `0d`'s link stays `Ready`: nothing used it, and an RC queue pair only
+learns that its peer is gone when it posts (the simulator returns `RETRY_EXC_ERR`). The
+deferral only changed which node the crash and the next `NativeFault` picked. `connect_links`
+asked only `0d` to set up, and `Links::wants` is false for a `Ready` link, so it spun. The
+production paths both recover (the restarted peer's setup replaces the stale link, and first use
+breaks it); unit tests in `src/rdma/links/tests.rs` pin both. The harness now lets the side
+that is not ready initiate. The native oracle passes seeds 1 to 15 and 17 to 40; seed 16 fails at
+step 0 with a `RequestContext` leak that base also has (new Known issue 145).
 
