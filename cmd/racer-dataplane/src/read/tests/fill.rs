@@ -5473,6 +5473,58 @@ fn copy_only_miss_has_no_origin_side_effect_and_wrong_context_never_joins() {
     assert_eq!(f.origin.calls.get(), 0);
 }
 
+/// Known issue 311: a copy-only request that must not wait on this node's
+/// running acquisition (`join` false, an earlier owner asking) is a miss at
+/// once, with no origin side effect, while one that may join waits for the
+/// running acquisition and gets its copy.
+#[test]
+fn copy_only_without_join_misses_a_running_acquisition_and_with_join_waits() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+    let mut running = f.fill.acquire(
+        f.page.clone(),
+        f.membership.clone(),
+        &f.context,
+        &f.scope,
+        &mut budget,
+    );
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(running.as_mut().poll(&mut cx).is_pending());
+    assert!(f.fill.dependencies.flights.acquiring(&f.page));
+    let mut declined = f.fill.copy_only_joining(&f.page, &f.scope, false);
+    assert!(matches!(
+        declined.as_mut().poll(&mut cx),
+        Poll::Ready(Ok(None))
+    ));
+    let mut joined = f.fill.copy_only_joining(&f.page, &f.scope, true);
+    assert!(joined.as_mut().poll(&mut cx).is_pending());
+    let (result, copy) = drive(
+        futures::future::join(running, joined),
+        &mut f.engine,
+        &f.crypto,
+    );
+    assert_eq!(result.unwrap().plaintext.bytes(), b"abc");
+    assert!(copy.unwrap().is_some());
+    assert_eq!(f.origin.calls.get(), 1);
+    // Without a running acquisition `join` changes nothing: a local copy
+    // is served either way.
+    for join in [false, true] {
+        assert!(
+            drive(
+                f.fill.copy_only_joining(&f.page, &f.scope, join),
+                &mut f.engine,
+                &f.crypto
+            )
+            .unwrap()
+            .is_some(),
+            "join {join}"
+        );
+    }
+    assert_eq!(f.origin.calls.get(), 1);
+}
+
 #[test]
 fn rejected_origin_supplier_does_not_fail_an_independent_coalesced_reader() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));

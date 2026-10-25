@@ -3709,6 +3709,124 @@ fn a_newer_owner_asks_older_later_owners_before_origin() {
     }
 }
 
+/// Known issues 34 and 35: rank 0 reached by a delegation carries one
+/// credit, kept for its origin attempt. It still asks its lineage targets
+/// (later owners that arrived before it) and the member ranked fourth, which
+/// was an owner before rank 0 arrived, each copy-only on its own grant, and
+/// keeps the credit. Before, handoff probes stopped short of the origin
+/// credit, so it fetched without asking anyone.
+#[test]
+fn a_delegated_rank_zero_asks_lineage_and_demoted_targets_on_their_own_grant() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    // (chained, holder: canonical rank 1 or 2, or 3 for the demoted member)
+    for (chained, holder) in [
+        (true, Some(1)),
+        (true, Some(2)),
+        (true, Some(3)),
+        (true, None),
+        (false, None),
+    ] {
+        let mut f = fixture();
+        let (peers, ordered) = install_peers(&mut f, Some(0));
+        let good = encrypted_copy(&mut f);
+        let members = f.membership.members().to_vec();
+        let local = node(peers.local);
+        let demoted = members
+            .iter()
+            .map(|m| m.node.clone())
+            .find(|n| !ordered.contains(n))
+            .unwrap();
+        let old = Membership::validate(
+            racer_control_wire::MembershipVersion(1),
+            members
+                .iter()
+                .filter(|m| !chained || m.node != local)
+                .cloned()
+                .collect(),
+        )
+        .unwrap();
+        let current = Arc::new(
+            Membership::validate_with_predecessor(
+                racer_control_wire::MembershipVersion(2),
+                members.clone(),
+                Some(&old),
+            )
+            .unwrap(),
+        );
+        let published = Arc::new(controlplane::Published::new(
+            crate::control::Snapshot::retention(2),
+        ));
+        let now = uring_runtime::environment::now();
+        for (i, membership) in [Arc::new(old), current.clone()].into_iter().enumerate() {
+            let mut snapshot = crate::control::Snapshot::membership_fixture(membership);
+            snapshot.sequence = racer_control_wire::PublicationSequence(i as u64 + 1);
+            published
+                .publish(Arc::new(snapshot), now, |_, _| Ok::<_, Error>(()), || ())
+                .unwrap();
+        }
+        let placement = Rc::new(Placement::new(16));
+        let mut deps = f.fill.dependencies.clone();
+        deps.candidates = Rc::new(CandidatePolicy::new(
+            local.clone(),
+            placement.clone(),
+            peers.requester(),
+            deps.credentials.clone(),
+            published,
+        ));
+        f.fill = Fill::new(deps);
+        f.membership = current.clone();
+        f.fill
+            .dependencies
+            .writer
+            .retention()
+            .set_ownership(Rc::new(|_| true));
+        let case = format!("chained {chained} holder {holder:?}");
+        let mut expected = Vec::new();
+        if chained {
+            let targets = [ordered[1].clone(), ordered[2].clone(), demoted.clone()];
+            for (i, n) in targets.iter().enumerate() {
+                expected.push(n.clone());
+                let reply = if holder == Some(i + 1) {
+                    Reply::Copy(good.clone())
+                } else {
+                    Reply::Miss
+                };
+                peers.replies.borrow_mut().push_back((n.clone(), reply));
+                if holder == Some(i + 1) {
+                    break;
+                }
+            }
+        }
+        // What a delegation carries: the origin credit and one link.
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 1, 1);
+        let result = acquire(&mut f, &mut budget);
+        let result = result.unwrap_or_else(|e| panic!("{case}: {e:?}"));
+        assert_eq!(result.plaintext.bytes(), b"abc", "{case}");
+        let calls: Vec<_> = peers.calls.borrow().iter().map(|c| c.0.clone()).collect();
+        assert_eq!(calls, expected, "{case}");
+        assert!(
+            peers.calls.borrow().iter().all(|c| c.1),
+            "{case}: copy-only"
+        );
+        assert_eq!(
+            f.origin.calls.get(),
+            usize::from(holder.is_none()),
+            "{case}"
+        );
+        if holder.is_some() {
+            // The grants never touched the walk's own credit.
+            assert_eq!(budget.remaining_attempts(), 1, "{case}");
+        }
+        // The member ranked fourth is cached below the owners.
+        assert_eq!(
+            placement.demoted(&current, &f.context.object, f.page.number),
+            [demoted.clone()],
+            "{case}"
+        );
+    }
+}
+
 /// The fallback walks the previous membership only as a non-owner: a node
 /// that owned the page there keeps walking the current membership rather
 /// than reach the origin with authority it no longer has.
