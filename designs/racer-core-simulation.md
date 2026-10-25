@@ -5595,7 +5595,7 @@ Release, seed 1 unless noted, 5k, same configurations as the wave 5 table ("Roun
 | 5k full-churn | 34,040 / 0 | 12,768, 3, 223; 0 | 34,040 / 0 | 12,768, 3, 223; 0 |
 | 5k zipf, 50 hung members | 30,478 / 140 | 11,757, 2, 25; 0 | 30,642 / 3 | 11,867, 2, 38; 0 |
 | 5k zipf, 50 hung members, seed 2 | 30,045 / 154 | 11,293, 2, 20; 0 | 30,234 / 1 | 11,425, 2, 40; 0 |
-| 50k full-failover | 303,355 / 266 | 47,617, 6, 2,268; 1 | see below | see below |
+| 50k full-failover | 303,355 / 266 | 47,617, 6, 2,268; 0 | 303,374 / 269 | 47,619, 6, 2,314; 0 |
 
 - Hung members by class (seed 1; seed 2): reads whose page's rank 0 hangs 114 to 1 (113 to 1), a
   hung owner other than rank 0 16 to 2 (20 to 0), other hangs 10 to 0 (18 to 0). 799 silence
@@ -5610,6 +5610,10 @@ Release, seed 1 unless noted, 5k, same configurations as the wave 5 table ("Roun
   full-churn, full-failover seed 1) have the wave 5 trace exactly; full-failover seeds 2 and 3
   have 2 and 1 probe timeouts, and their numbers move within noise.
 - `hang-nosil.json` (silence off) reproduces the wave 5 hung-member run exactly (30,478 / 140).
+- 50k `full-failover` (`/tmp/opencode/m4b/rr.json`, the wave 5 binary's run in `/tmp/opencode/m7/`
+  is the before): 11 probe timeouts in the whole run, 9 pings, 2 peers marked silent (pings to
+  members that crashed while the ping was in flight); the other differences follow from the
+  changed traces and are within noise. Wall 28:55 to 29:11, peak RSS 3.2 GiB unchanged.
 - 16-scenario smoke at 200 nodes, 1 s: every trace hash matches the wave 5 merge; no invariant
   failure. `origin_repeat_explained` `unexplained` 0 and no hard invariant failure in any run.
 - `cargo fmt --check` and `cargo clippy --workspace --all-targets -D warnings` are clean; the
