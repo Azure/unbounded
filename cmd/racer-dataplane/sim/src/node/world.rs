@@ -52,7 +52,10 @@ use racer_core::read::serve::{ServeAction, ServeFacts, serve_action, serve_deadl
 use racer_core::read::stale::{
     StaleSkip, StaleWaitFacts, fallback_rank_allowed, previous_fallback, stale_wait,
 };
-use racer_core::read::successor::{MAX_DEFERRALS, defer_allowed, should_note, successor_deferral, successor_targets, with_successors};
+use racer_core::read::successor::{
+    MAX_DEFERRALS, defer_allowed, should_note, successor_deferral, successor_targets,
+    with_successors,
+};
 use racer_core::read::walk::{
     AttemptInputs, AttemptPlan, CandidateWalk, Continuation, End, HedgeFacts, MAX_HANDOFF, Mode,
     Outcome, PREVIOUS_MEMBERSHIP_WITHIN, Probe, RemainingWalk, RouteMode, StaleAction, Step,
