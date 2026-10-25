@@ -5620,7 +5620,7 @@ Release, seed 1 unless noted, 5k, same configurations as the wave 5 table ("Roun
 - Issue 42 is resolved as correct behavior with a bound, not removed; the measured alternatives
   (retry, withholding) are above.
 - Production evidence at a relay depends on its exchange ending with `Cancelled` or
-  `DeadlineExceeded` when the upstream gives up (the relay keeps polling a cancelled exchange to
+  `DeadlineExceeded` when the upstream gives up (the relay keeps polling a canceled exchange to
   its completion fence, `request_traced`); that a relay future is never dropped earlier is an
   inference from that comment, not traced. Without it relays would learn only from their own
   timeouts, and requesters from their probes of rank 0.
