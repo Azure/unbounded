@@ -482,8 +482,8 @@ Verified against the code at the start of this work.
 
 132. Readers that joined in the version their owners have not applied yet cannot use the stale
    fallback (they are not members of version - 1, so peers would reject them under it): 50k
-   `full-cold-start` 247 failed reads, all during enrollment (54 to 161 s); 5k every non-owner
-   that could not fall back was such a reader (`stale_fallback_not_member`). Open (round 4,
+   `full-cold-start` 247 failed reads, all during enrollment (54 to 161 s); every one of the
+   1,732 stale skips that could not fall back was by such a reader (`stale_fallback_not_member`). Open (round 4,
    join2).
 
 ## Simulator engine (racer-sim substrate)
@@ -3480,9 +3480,10 @@ Reading the table:
   fallbacks).
 - Remaining stale failures: the reader cannot fall back. At 5k every such case is a reader that
   is not a member of version - 1, that is, a node that joined in the version its owners have not
-  applied yet (`stale_fallback_not_member`: 8 in `full-cold-start`, 4 in `full-churn`); at 50k
-  the 247 cold start failures all happen between 54 and 161 s, during enrollment. They are new
-  Known issue 132.
+  applied yet (`stale_fallback_not_member`: 8 in `full-cold-start`, 4 in `full-churn`). At 50k
+  `full-cold-start` (rerun with the counters, same results) all 1,732 stale skips that could not
+  fall back were for that reason (`stale_fallback_not_recent` 0), and the 247 failures all happen
+  between 54 and 161 s, during enrollment. They are new Known issue 132.
 - Origin: unchanged within noise (50k failover 52,461 to 52,384, worst page 9; cold start 29,336
   to 29,680, worst page 5). The fallback does not add origin requests: it never runs at an owner.
   The origin half of issue 20 is the holder that the handoff cannot find (new Known issue 131).
