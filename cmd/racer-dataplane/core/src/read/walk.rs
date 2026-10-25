@@ -120,6 +120,10 @@ pub struct WalkConfig {
 /// copy-only exchange.
 pub const SUCCESSOR_GRANT_ATTEMPTS: u32 = 1;
 
+/// Extra opportunities a successor probe's time share is divided by, so it
+/// takes at most a fifth of the time left ([`plan_attempt`]).
+pub const SUCCESSOR_SHARE_DIVISOR: u32 = 4;
+
 /// Links granted to one successor probe, as a reader funds an owner.
 pub const SUCCESSOR_GRANT_LINKS: u8 = 8;
 
@@ -589,7 +593,10 @@ impl CandidateWalk {
                     index,
                     canonical,
                     mode: Mode::CopyOnly,
-                    remaining_opportunities: (self.count - index + 1) as u32,
+                    // A short time share: the requester waiting on this
+                    // owner must not time out while it asks a successor.
+                    remaining_opportunities: (self.count - index + 1) as u32
+                        + SUCCESSOR_SHARE_DIVISOR,
                     route: RouteMode::FundedRoute,
                     previous: false,
                 }));

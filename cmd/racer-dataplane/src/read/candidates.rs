@@ -1332,6 +1332,12 @@ impl CandidatePolicy {
                         .and_then(racer_core::read::walk::transport_outcome)
                     {
                         Some(outcome) => WalkOutcome::Transport(outcome),
+                        // A successor probe is opportunistic and runs on its
+                        // own grant: any failure of it is only a miss, unless
+                        // this request itself is over.
+                        None if walk.pending_successor() && scope.check().is_ok() => {
+                            WalkOutcome::Transport(ProbeOutcome::Unreachable)
+                        }
                         None => {
                             walk.abandon(budget)?;
                             return Err(error);
