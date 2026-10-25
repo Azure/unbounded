@@ -663,14 +663,36 @@ Verified against the code at the start of this work.
    asking a non-owner (`racer_core::read::serve::copy_join_allowed`,
    `Coordinator::copy_join_allowed`); lineage probe failures 6,525 to 6.
 
-45. Lineage and demoted probes are sequential round trips before origin, and most miss (5k
+45. Resolved (round 4, probes, wave 6): granted probes (successor, lineage and demoted targets) go
+   out at once (`walk::Step::Granted`, `CandidateWalk::complete_granted`, production
+   `CandidatePolicy::granted_batch`), each copy-only on its own grant and all on the first one's
+   time share, so the run costs one round trip (its slowest probe), whatever the number of
+   targets. 5k `full-churn`: mean / p99 read latency 95 / 268 to 90 / 218 ms with 2.5 times the
+   probes; `full-failover` 87 / 302 to 88 / 302 (batches there average 2.6 probes; the same
+   targets one after the other cost 94 / 336). The remaining cost over wave 4 (71 ms in
+   `full-churn`, 76 ms in `full-failover`) is that one round trip before origin, the price of
+   asking holders at all. See "Round 4: probes (wave 6)".
+   Was: lineage and demoted probes are sequential round trips before origin, and most miss (5k
    `full-churn`: 21,313 probes, 776 copies). In the simulator's multi-hop network this raises the
    mean read latency of 5k `full-churn` from 71 to 95 ms (p99 150 to 268 ms) and of 5k
    `full-failover` from 76 to 89 ms; reads that fail do not change. Asking the granted targets
    concurrently (or with a hedge) would bound the cost to one round trip. Open (round 4, lineage,
    wave 5).
 
-46. Rendezvous ranks below the fifth are not kept, and a member that was never an owner while
+46. Resolved (round 4, probes, wave 6): rankings keep a best-effort tail to rank 12
+   (`topology::RETAINED_DEPTH`, scores shrunk to 16 bytes so `ENTRY_BYTES` is unchanged), an
+   owner asks up to six lineage targets (`walk::MAX_LINEAGE`, was three), and demoted members of
+   unknown age (arrived when this node's membership chain began, production `since` 0) count as
+   targets in rank order when the owner arrived later (`walk::demoted_targets_from`). A new
+   counter classifies unasked holders by rank: in 5k `full-churn` with the deeper ranking alone,
+   the arrival rule excluded all 55 unasked holders ranked 12 or better, whose arrival was tied
+   with the owners above them at the start of the fetching owner's chain (from a temporary trace);
+   naming such members cut unasked holders 84 to 40. Moved-page repeats 194 to 66 (`full-churn`), 23 to 14 (`full-failover`),
+   16 to 9 (`full-cold-start`); probes 21,250 to 53,543 in `full-churn`. Bound: an owner asks the
+   first `MAX_LINEAGE` qualifying members among ranks 4 to `RETAINED_DEPTH`; a holder ranked lower
+   or past those six is not asked (5k `full-churn`: 29 of the 40 unasked holders rank 13 or
+   lower, 11 rank 6 to 12). See "Round 4: probes (wave 6)".
+   Was: rendezvous ranks below the fifth are not kept, and a member that was never an owner while
    the page was read has nothing to give; 157 of the 188 moved-page repeats left in 5k
    `full-churn` had a holder older than version - 1 that was not asked. That these are holders
    ranked sixth or lower, or past the three-target cap, is an inference: the run has no counter
@@ -1225,10 +1247,11 @@ scenarios carry data-plane faults.
 43. Each owner learns on its own that a rank 0 hangs (round 4, hang, wave 5).
 44. Resolved: a copy-only probe from an earlier owner joined a later owner's acquisition that
    waited on the prober; the join is now declined (round 4, lineage, wave 5).
-45. Sequential lineage and demoted probes add latency before origin (5k `full-churn` mean read
-   71 to 95 ms) (round 4, lineage, wave 5).
-46. Holders ranked sixth or lower, or past the three-target cap, are not asked (157 of 188 5k
-   `full-churn` moved repeats) (round 4, lineage, wave 5).
+45. Resolved: granted probes go out at once, so they cost one round trip before origin (5k
+   `full-churn` mean / p99 read 95 / 268 to 90 / 218 ms) (round 4, probes, wave 6).
+46. Resolved: rankings keep ranks to 12, owners ask up to six lineage targets, including demoted
+   members of unknown age; 5k `full-churn` moved repeats 194 to 66; holders ranked below 12 or
+   past six targets are not asked (round 4, probes, wave 6).
 47. 50k `full-cold-start` still fails 8 reads, none after a stale skip (round 4, stale, wave 5).
 48. A seat follower misses a primary Lease change that arrives during its read until its next
    `FOLLOW_INTERVAL` (round 4, stale, wave 5).
@@ -5186,3 +5209,172 @@ than once.
 ### Open issues after wave 5
 
 40 (partly), 41, 42, 43, 45, 46, 47, 48, 49, 50, 51, 52.
+
+## Round 4: probes (wave 6)
+
+Known issues 45 and 46. Branch `racer-sim8-probes` from racer-core-sim 5d1ea912b. Nothing was
+cherry-picked. Evidence: `/tmp/opencode/r8-probes/` (final binary, runs and logs under `fin/`).
+
+### Root causes
+
+- Issue 45: `CandidateWalk::next` returned one granted probe per step
+  (`core/src/read/walk.rs`, the `if granted` branch, on 5d1ea912b), and both production
+  (`resolve_epoch_traced`, one `request_traced` per loop iteration) and the simulator (`step_walk`,
+  one `send_probe` per step) waited for each answer before the next. Each granted probe is
+  copy-only on its own grant and only a copy changes the walk, so nothing forced the order: an
+  owner with three targets paid three round trips before origin, most of them misses.
+- Issue 46, three causes, measured with a new counter of the rendezvous rank of every unasked
+  moved-page holder (`moved_unasked_holder_rank_*`, using the new `topology::rank_of`). In 5k
+  `full-churn` on 5d1ea912b the 153 unasked holders ranked: 6 fourth or fifth, 74 sixth to
+  eighth, 56 ninth to sixteenth, 17 lower; all had arrived before the fetching owner.
+  - Depth: `Ranking::insert` kept `RANKED_DEPTH` (5) scores (`topology/src/placement.rs`), so
+    no target could rank sixth or lower.
+  - Cap: `demoted_targets` and `merge_handoff` cut lineage targets at `MAX_HANDOFF` (3).
+  - Arrival rule: with ranks to 12, 84 holders stayed unasked, and a temporary trace showed that
+    every one of the 55 ranked 12 or better was excluded by `demoted_targets` because its arrival
+    was tied with the owners above it: all of them arrived at the start of the fetching owner's
+    membership chain (production `Membership::since` 0, simulator `since_of` clamped to the chain
+    base), so "fewer than three members above it present when it arrived" never held. Their age is
+    unknown, not equal: the holders had fetched the page as owners before the fetching owner's
+    chain began.
+
+### Changes
+
+- topology: rankings keep `RETAINED_DEPTH` (12) scores. The first `RANKED_DEPTH` (5) follow the
+  exact incremental update rule as before. Below them the tail is best effort: a tail member that
+  leaves is dropped (no rescore) and a tail member that loses weight is rescored in place, so the
+  tail is an ordered subset of the true ranks below five and costs no rescore the exact ranks would
+  not cost. `Score::node` is `u32`, so a score is 16 bytes and the 12-score vector (allocated at
+  exactly 12, an insert into a full vector drops the worst first) fits the unchanged
+  `Placement::ENTRY_BYTES` (1,024; the budget test sums 1,024). `Placement::demoted` returns ranks
+  4 to 12. New `rank_of` (scores every member; diagnostics and tests only).
+- racer-core `walk`: `WalkConfig::parallel_granted`; with it `next` returns
+  `Step::Granted(probes)`, the whole run of consecutive granted targets, each copy-only with the
+  first probe's time share, and refuses to plan more until `complete_granted(copy)`. Callers fund
+  each from `granted_budget` (1 attempt, 8 links, never added to the walk). `MAX_LINEAGE` (6)
+  lineage targets per owner walk, `MAX_TARGETS` (8) handoff targets; version - 1 targets are
+  still only added while fewer than `MAX_HANDOFF` targets are listed, and successor targets are
+  still at most `MAX_HANDOFF`, so the walk-funded probes do not grow with the cap.
+  `demoted_targets_from(.., oldest)` also names demoted members whose arrival is `oldest` (the
+  chain's start) when this owner arrived later, in rank order.
+- Production: `CandidatePolicy::granted_batch` sends a `Step::Granted` run with
+  `futures::future::join_all`, waits for every answer (no exchange is left running or canceled),
+  then validates in probe order and returns the first copy; any other answer, or a transport
+  failure while the scope runs, is a miss, as for a sequential granted probe.
+  `resolve_epoch_traced` sets `parallel_granted` and uses `demoted_targets_from(.., Some(0))` with
+  `MAX_LINEAGE`. No wire change.
+- Simulator: `send_granted` launches a batch, `complete_batch_probe` and `batch_maybe_done` report
+  it when all answered (transport cause and relay signer per probe, so `origin_repeat_explained`
+  stays exact); knobs `node.parallel_granted`, `node.lineage_cap`, `node.unknown_age_targets`
+  (production values by default); counters `granted_batches`, histogram `granted_batch_probes`,
+  `moved_unasked_holder_rank_{owner,4_5,6_8,9_12,13_16,17}[_older]`. The placement memo estimate
+  rises from 240 to 288 bytes per entry.
+
+### Tests
+
+- topology: `tail_departure_updates_incrementally_and_keeps_exact_ranks` (an exact rank leaving
+  still rescores; a tail member leaving updates incrementally, the exact ranks equal full scoring,
+  the tail is an ordered subset); the incremental oracle now checks the exact ranks and the subset
+  property; `demoted_lists_...` checks `rank_of` and the deeper list; the entry budget test checks
+  16-byte scores and capacity 12.
+- racer-core: `parallel_granted_probes_go_out_at_once_and_match_the_sequential_walk` (ranks 0 to 2
+  and 1 to 7 granted targets: same probes, end and budget as the sequential walk, one shared time
+  share, a copy ends it), `parallel_granted_probes_must_be_reported_before_the_next_step`,
+  `lineage_targets_go_past_three_and_version_one_targets_do_not`,
+  `unknown_age_demoted_members_are_targets_when_the_owner_arrived_later`,
+  `successors_come_first_within_the_handoff_cap` (updated).
+- Production: `a_delegated_rank_zero_asks_lineage_and_demoted_targets_on_their_own_grant` and
+  `a_newer_owner_asks_older_later_owners_before_origin` now expect every granted target asked at
+  once whoever holds the copy, each on a one-attempt grant within one time share (both fail with
+  `parallel_granted` off).
+- Simulator: `combined::tests::parallel_deep_lineage_probes_find_more_copies_without_more_latency`
+  (500 nodes `full-churn`: deeper targets cut moved repeats against the wave 5 rules, parallel
+  probes lower mean read latency against sequential ones, no holder ranked fourth or fifth is left
+  unasked, failed reads do not grow).
+
+### Evidence
+
+Release, seed 1, 5k, the wave 5 configurations (`/tmp/opencode/m7/`). Wave 5 is the merge
+(`/tmp/opencode/m7/5k-*.json`). Origin: requests, worst page, pages fetched more than once. Move:
+`after_owner_move` repeats. Latency: mean / p99 of `read_ns` in ms. Probes: lineage plus demoted
+granted probes / copies.
+
+| Run | Wave 5 ok / failed | Wave 6 ok / failed | Wave 5 origin | Wave 6 origin | Move | Latency | Probes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| storm | 378,544 / 0 | 378,544 / 0 | 1,024, 1, 0 | 1,024, 1, 0 | 0 to 0 | 48 / 168 to 48 / 168 | 0 |
+| zipf | 202,851 / 15 | 202,851 / 15 | 40,404, 3, 1,452 | 40,404, 3, 1,452 | 0 to 0 | 156 / 1,476 unchanged | 0 |
+| churn | 291,474 / 87 | 291,474 / 87 | 1,028, 2, 4 | 1,028, 2, 4 | 4 to 4 | 41 / 126 unchanged | 0 |
+| zipf 16 MiB | 37,637 / 28 | 37,637 / 28 | 17,829, 3, 139 | 17,829, 3, 139 | 0 to 0 | 705 / 6,442 unchanged | 0 |
+| zipf, 50 hung | 30,478 / 140 | 30,478 / 140 | 11,757, 2, 25 | 11,757, 2, 25 | 0 to 0 | 145 / 2,013 unchanged | 0 |
+| 1 Gbit/s storm | 95,158 / 0 | 95,159 / 0 | 6,970, 2, 16 | 6,963, 2, 9 | 16 to 9 | 319 / 1,208 to 321 / 1,208 | 4,523 / 22 to 10,540 / 49 |
+| full-cold-start | 95,159 / 0 | 95,159 / 0 | 6,970, 2, 16 | 6,963, 2, 9 | 16 to 9 | 53 / 201 to 53 / 185 | 4,523 / 22 to 10,540 / 49 |
+| full-failover | 33,970 / 33 | 33,979 / 27 | 12,951, 6, 342 | 12,943, 6, 321 | 23 to 14 | 87 / 302 to 88 / 302 | 8,515 / 24 to 20,129 / 52 |
+| full-failover seed 2 | 33,740 / 30 | 33,732 / 36 | 12,975, 6, 368 | 12,964, 7, 355 | 11 to 9 | 88 / 336 to 89 / 302 | 8,431 / 26 to 20,138 / 44 |
+| full-failover seed 3 | 33,715 / 37 | 33,729 / 28 | 12,907, 6, 287 | 12,914, 6, 281 | 7 to 3 | 88 / 336 to 89 / 302 | 8,427 / 35 to 20,316 / 56 |
+| full-churn | 34,040 / 0 | 34,039 / 0 | 12,768, 3, 223 | 12,639, 3, 95 | 194 to 66 | 95 / 268 to 90 / 218 | 21,250 / 756 to 53,543 / 1,735 |
+
+Steps (same binary and knobs, seed 1; "sequential" is `parallel_granted` 0, "cap" is
+`lineage_cap`, "unknown" is `unknown_age_targets`; all with ranks to 12):
+
+| Run | Origin | Move | Latency | Probes |
+| --- | --- | --- | --- | --- |
+| full-churn, sequential, cap 3 | 12,688, 3, 145 | 118 | 106 / 302 | 30,546 / 831 |
+| full-churn, sequential, cap 6 | 12,689, 3, 147 | 118 | 106 / 302 | 30,553 / 833 |
+| full-churn, parallel, cap 6 | 12,692, 3, 147 | 118 | 88 / 218 | 31,887 / 1,349 |
+| full-churn, parallel, cap 3, unknown | 12,690, 3, 146 | 118 | 88 / 218 | 31,900 / 1,351 |
+| full-churn, parallel, cap 4, unknown | 12,661, 4, 113 | 90 | 89 / 218 | 40,236 / 1,542 |
+| full-churn, parallel, cap 6, unknown (final) | 12,639, 3, 95 | 66 | 90 / 218 | 53,543 / 1,735 |
+| full-failover, sequential, cap 6 | 12,950, 6, 332 | 15 | 94 / 336 | 13,723 / 34 |
+| full-failover, parallel, cap 6 | 12,955, 6, 345 | 15 | 88 / 302 | 13,823 / 44 |
+| full-failover, final | 12,943, 6, 321 | 14 | 88 / 302 | 20,129 / 52 |
+
+- Ranks to 12 alone cut 5k `full-churn` moved repeats 194 to 118; the larger cap alone does
+  nothing until unknown-age members qualify (the arrival rule rarely names more than three), and
+  both together reach 66. Sending the batch at once takes the latency these deeper probes add
+  (106 / 302 sequential) below wave 5 (95 / 268) in `full-churn`; in `full-failover` it keeps it
+  equal (87 to 88 ms mean) while probes rise 2.4 times.
+- `storm`, `zipf`, `churn`, zipf at 16 MiB and the hung-member run have the same trace hash as
+  wave 5: none of their owner walks has a granted target.
+- Unasked holders left in 5k `full-churn`: 40 (from 153), of which 29 rank 13 or lower and 11 rank
+  6 to 12 (2 sixth to eighth); 26 more moved repeats had lost the copy. `full-failover`: all 12
+  unasked holders rank 13 or lower.
+- Hard invariants, including `origin_repeat_explained` (`unexplained` 0) and
+  `budget_never_grows` (also checked on every granted plan), hold in every run and in all 16
+  scenarios at 200 nodes, 1 s. `cargo fmt --check`, `clippy -D warnings` (workspace, all
+  targets) and the workspace tests pass; DST seeds 1 to 20 pass, native and not.
+
+### Bounds
+
+- Latency: the granted probes of one owner walk cost one time share (the first granted probe's,
+  `SUCCESSOR_SHARE_DIVISOR` included) instead of one per target; the walk sees no difference
+  except order of exchanges (tested equal to the sequential walk on misses).
+- Exchanges: at most `MAX_TARGETS` (8) granted probes per owner walk (at most `MAX_HANDOFF`
+  successors plus `MAX_LINEAGE` lineage targets; wave 5 allowed 3 in all), each on its own
+  one-attempt, eight-link grant that is never added to the walk's budget, so the walk's budget
+  never grows and a delegated rank 0 keeps its origin credit. Walk-funded version - 1 probes are
+  bounded as before. Every new probe is copy-only: origin authority is unchanged
+  (`only_owner_hits_origin` holds).
+- Holders: an owner asks, in rank order, the first `MAX_LINEAGE` members among ranks 4 to
+  `RETAINED_DEPTH` (12) that arrived before it and either were owners when they arrived or are of
+  unknown age (arrived at its chain's start). A holder ranked below 12, or past those six, is not
+  asked; nor is one whose arrival is known and says it never was an owner (it may have become one
+  after members above it left, which the membership does not record).
+- Memory: production entries stay within `Placement::ENTRY_BYTES` (1,024, unchanged; the score
+  vector grows from 144 to 192 bytes, within the budget the test sums). The simulator's shared
+  memo grows 48 bytes per (membership, slot).
+
+### Deviations and open items
+
+- The latency over wave 4 (5k `full-churn` 71 ms, `full-failover` 76 ms) is the one round trip
+  the batch costs before origin; it cannot shrink without not asking, or racing origin, which would
+  add origin requests.
+- Granted probes rise 2.5 times in 5k `full-churn` (21,250 to 53,543) for 128 fewer moved repeats
+  and 129 fewer origin requests: about 250 copy-only exchanges per avoided fetch. At production
+  page size (16 MiB) a miss is small next to a fetch; with 1 MiB simulator pages the bytes roughly
+  balance. `lineage_cap` 4 gives most of the cut for fewer probes (moved 90, probes 40,236).
+- The racer-core commit and the production commit after it do not build the workspace alone
+  (`Step::Granted` needs the production and simulator callers); the simulator commit after them
+  does.
+- The production glue for unknown-age targets (`Some(0)`) is exercised only by the simulator
+  and DST: the production fixture has four members, too few to separate it from the arrival
+  rule.
