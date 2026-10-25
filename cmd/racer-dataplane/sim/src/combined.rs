@@ -658,6 +658,65 @@ mod tests {
         assert!(counter(&on, "reads_failed") <= counter(&off, "reads_failed"));
     }
 
+    /// Known issues 34, 35 and 311: owners also ask members ranked just
+    /// below them that were owners when they arrived, every lineage probe
+    /// runs on its own grant (so a delegated rank 0 with one credit asks
+    /// too), and a copy-only probe from an earlier owner does not wait on
+    /// the later owner's acquisition (which waits on the prober). Each step
+    /// finds more moved copies, and the last stops the probes timing out.
+    #[test]
+    fn demoted_targets_and_lineage_grants_find_more_moved_copies() {
+        let run_with = |grants: bool, demoted: bool, join_rank: bool| {
+            let mut config = Config {
+                nodes: 500,
+                ..Config::default()
+            };
+            data_defaults(&mut config);
+            config.request_rate = 0.005;
+            config.node.lineage_grants = grants;
+            config.node.demoted_targets = demoted;
+            config.node.copy_join_rank = join_rank;
+            run("full-churn", config, 1, None, None).unwrap()
+        };
+        let before = run_with(false, false, false);
+        let grants = run_with(true, false, true);
+        let all = run_with(true, true, true);
+        let cycles = run_with(true, true, false);
+        for r in [&before, &grants, &all, &cycles] {
+            assert_clean(r);
+        }
+        let moved = |r: &Value| {
+            r["origin_per_page"]["repeats"]["after_owner_move"]
+                .as_u64()
+                .unwrap()
+        };
+        let origin = |r: &Value| r["origin_per_page"]["requests"].as_u64().unwrap();
+        assert!(
+            moved(&grants) < moved(&before),
+            "{} vs {}",
+            moved(&grants),
+            moved(&before)
+        );
+        assert!(moved(&all) <= moved(&grants));
+        assert!(origin(&all) < origin(&before));
+        assert!(counter(&all, "lineage_grant_copies") > 0);
+        assert!(counter(&all, "demoted_probes") > 0);
+        assert_eq!(counter(&before, "lineage_grant_probes"), 0);
+        assert_eq!(counter(&grants, "demoted_probes"), 0);
+        // Without the join rule, lineage probes wait on acquisitions that
+        // wait on the prober and fail; with it they almost never do.
+        assert!(counter(&cycles, "copy_only_join_declined") == 0);
+        assert!(counter(&all, "copy_only_join_declined") > 0);
+        assert!(
+            counter(&all, "lineage_grant_failures") * 4
+                < counter(&cycles, "lineage_grant_failures"),
+            "{} vs {}",
+            counter(&all, "lineage_grant_failures"),
+            counter(&cycles, "lineage_grant_failures")
+        );
+        assert!(counter(&all, "reads_failed") <= counter(&before, "reads_failed") + 1);
+    }
+
     #[test]
     fn cold_start_members_serve_before_they_are_routable() {
         let run_with = |report_at_start: bool| {
