@@ -772,6 +772,60 @@ mod tests {
         assert!(counter(&all, "reads_failed") <= counter(&before, "reads_failed") + 1);
     }
 
+    /// Known issues 45 and 46: granted probes go out at once, which bounds
+    /// their cost to one time share and lowers read latency against sending
+    /// them one after the other; deeper ranks, a lineage cap of
+    /// `MAX_LINEAGE` and unknown-age demoted members find more moved copies
+    /// than the wave 5 rules (three targets from ranks 4 and 5 by arrival).
+    #[test]
+    fn parallel_deep_lineage_probes_find_more_copies_without_more_latency() {
+        let run_with = |parallel: bool, cap: usize, unknown: bool| {
+            let mut config = Config {
+                nodes: 500,
+                ..Config::default()
+            };
+            data_defaults(&mut config);
+            config.request_rate = 0.005;
+            config.node.parallel_granted = parallel;
+            config.node.lineage_cap = cap;
+            config.node.unknown_age_targets = unknown;
+            run("full-churn", config, 1, None, None).unwrap()
+        };
+        let max = racer_core::read::walk::MAX_LINEAGE;
+        let narrow = run_with(false, 3, false);
+        let sequential = run_with(false, max, true);
+        let parallel = run_with(true, max, true);
+        for r in [&narrow, &sequential, &parallel] {
+            assert_clean(r);
+        }
+        let moved = |r: &Value| {
+            r["origin_per_page"]["repeats"]["after_owner_move"]
+                .as_u64()
+                .unwrap()
+        };
+        let mean = |r: &Value| {
+            r["metrics"]["histograms"]["read_ns"]["mean"]
+                .as_f64()
+                .unwrap()
+        };
+        assert!(
+            moved(&sequential) < moved(&narrow),
+            "{} vs {}",
+            moved(&sequential),
+            moved(&narrow)
+        );
+        assert!(moved(&parallel) <= moved(&sequential) + 2);
+        assert!(
+            mean(&parallel) < mean(&sequential),
+            "{} vs {}",
+            mean(&parallel),
+            mean(&sequential)
+        );
+        assert!(counter(&parallel, "granted_batches") > 0);
+        assert_eq!(counter(&sequential, "granted_batches"), 0);
+        assert!(counter(&parallel, "reads_failed") <= counter(&narrow, "reads_failed") + 1);
+    }
+
     #[test]
     fn cold_start_members_serve_before_they_are_routable() {
         let run_with = |report_at_start: bool| {

@@ -121,6 +121,19 @@ pub struct NodeConfig {
     /// page (production `Rank0Watch`: always on; set 0 to measure without
     /// it, Known issue 39).
     pub rank0_watch: bool,
+    /// Granted probes (successor and lineage targets) go out at once
+    /// (production `WalkConfig::parallel_granted`: always on; set 0 to send
+    /// them one after the other, Known issue 45).
+    pub parallel_granted: bool,
+    /// Most lineage targets per owner walk (production
+    /// `walk::MAX_LINEAGE`; set lower to measure, 3 is the wave 5 cap, Known
+    /// issue 46).
+    pub lineage_cap: usize,
+    /// Demoted members whose arrival is the chain's start (unknown age) are
+    /// lineage targets too when the owner arrived later (production
+    /// `demoted_targets_from` with `oldest` 0: always on; set 0 to measure
+    /// without, Known issue 46).
+    pub unknown_age_targets: bool,
 }
 
 impl Default for NodeConfig {
@@ -163,6 +176,9 @@ impl Default for NodeConfig {
             copy_join_rank: true,
             orphan_notices: true,
             rank0_watch: true,
+            parallel_granted: true,
+            lineage_cap: racer_core::read::walk::MAX_LINEAGE,
+            unknown_age_targets: true,
         }
     }
 }
@@ -215,6 +231,11 @@ impl NodeConfig {
                 "copy_join_rank" if n <= 1 => self.copy_join_rank = n == 1,
                 "orphan_notices" if n <= 1 => self.orphan_notices = n == 1,
                 "rank0_watch" if n <= 1 => self.rank0_watch = n == 1,
+                "parallel_granted" if n <= 1 => self.parallel_granted = n == 1,
+                "unknown_age_targets" if n <= 1 => self.unknown_age_targets = n == 1,
+                "lineage_cap" if n <= racer_core::read::walk::MAX_LINEAGE as u64 => {
+                    self.lineage_cap = n as usize;
+                }
                 _ => return Err(format!("unknown key node.{key}")),
             }
         }

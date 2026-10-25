@@ -62,9 +62,9 @@ use racer_core::read::successor::{
 use racer_core::read::walk::{
     AttemptInputs, AttemptPlan, CandidateWalk, Continuation, End, HedgeFacts, MAX_HANDOFF, Mode,
     Outcome, PREVIOUS_MEMBERSHIP_WITHIN, Probe, Rank0State, RemainingWalk, RouteMode, StaleAction,
-    Step, WalkConfig, demoted_targets, granted_prefix, handoff_targets, hedge_budgets,
-    hedge_eligible, hedge_fallback, lineage_counts, lineage_targets, merge_handoff, plan_attempt,
-    same_rank_previous, stale_action, transport_outcome,
+    Step, WalkConfig, demoted_targets_from, granted_budget, granted_prefix, handoff_targets,
+    hedge_budgets, hedge_eligible, hedge_fallback, lineage_counts, lineage_targets, merge_handoff,
+    plan_attempt, same_rank_previous, stale_action, transport_outcome,
 };
 use racer_core::route::MAX_LINKS;
 use racer_core::time::SplitMix64;
@@ -388,6 +388,10 @@ struct Fill {
     /// The ranking allowed the fallback: walk it once the skip completes.
     fallback_ready: Option<Ranked>,
     probe: Option<u64>,
+    /// Granted probes sent at once (`Step::Granted`), and whether one of
+    /// them returned a copy.
+    batch: Vec<BatchProbe>,
+    batch_copy: bool,
     /// The leader's retention observation, used at publication.
     eligible: bool,
     order: VisitOrder,
@@ -539,6 +543,12 @@ impl Fill {
     /// Outstanding probe ids, including hedge contenders.
     fn probes(&self) -> impl Iterator<Item = u64> + use<> {
         let race = self.hedge.as_ref();
+        let batch: Vec<u64> = self
+            .batch
+            .iter()
+            .filter(|b| !b.done)
+            .map(|b| b.pid)
+            .collect();
         [
             self.probe,
             race.and_then(|r| r.primary),
@@ -546,6 +556,7 @@ impl Fill {
         ]
         .into_iter()
         .flatten()
+        .chain(batch)
     }
 }
 
@@ -599,6 +610,23 @@ struct Probing {
     remote: u32,
     /// `Some(true)` for a hedge primary, `Some(false)` for its duplicate.
     hedge: Option<bool>,
+    /// Index in the fill's `batch`: one of a run of granted probes sent at
+    /// once (`Step::Granted`, Known issue 45).
+    granted: Option<usize>,
+}
+
+/// One granted probe of a batch (`Step::Granted`).
+struct BatchProbe {
+    pid: u64,
+    dest: u32,
+    /// Counter kind: `successor`, `lineage` or `demoted`.
+    kind: &'static str,
+    /// Why it failed in transport, if it did (first cause wins).
+    cut: Option<Cut>,
+    /// A relay on the route signed its answer (Known issue 38).
+    relayed: bool,
+    /// Answered (or timed out).
+    done: bool,
 }
 
 /// One hedge race (production `hedge_page` and `drivers::race`).
@@ -1017,6 +1045,9 @@ impl NodeWorld {
                     match p.hedge {
                         Some(primary) => {
                             self.hedge_result(p.fill, primary, Err(Error::Unavailable))
+                        }
+                        None if let Some(index) = p.granted => {
+                            self.complete_batch_probe(p.fill, index, Ok(Outcome::TimedOut))
                         }
                         // Sent, but unanswered within the attempt's own bound
                         // (production `request_traced`, attempt scope).
@@ -1650,15 +1681,19 @@ impl NodeWorld {
     /// Arrival generations of `owners` in `node`'s membership chain
     /// (production `Membership::since`): the shared chain clamped to the
     /// generation this node's process started from (Known issue 25).
+    /// The generation `node`'s membership chain began at (production: 0).
+    fn chain_base(&self, node: u32) -> u32 {
+        self.versions
+            .chain_base(node)
+            .or(self.nodes[node as usize].lineage_base)
+            .unwrap_or(0)
+    }
+
     fn since_of(&self, node: u32, members: &Members, owners: &[u32]) -> Vec<Option<u32>> {
         if !self.config.node.lineage {
             return vec![None; owners.len()];
         }
-        let base = self
-            .versions
-            .chain_base(node)
-            .or(self.nodes[node as usize].lineage_base)
-            .unwrap_or(0);
+        let base = self.chain_base(node);
         owners
             .iter()
             .map(|c| {
@@ -1820,6 +1855,8 @@ impl NodeWorld {
                 successors: 0,
                 granted: 0,
                 granted_kind: None,
+                batch: Vec::new(),
+                batch_copy: false,
                 previous_member: false,
                 previous: 0,
                 version: 0,
@@ -2135,7 +2172,14 @@ impl NodeWorld {
                     .map(|p| members.members()[p].node)
                     .collect();
                 let below_since = self.since_of(node, &members, &below);
-                demoted_targets(&since, &below, &below_since, rank)
+                // Arrivals at the chain's start are unknown (production
+                // `Membership::since` 0, Known issue 46).
+                let oldest = self
+                    .config
+                    .node
+                    .unknown_age_targets
+                    .then(|| self.chain_base(node));
+                demoted_targets_from(&since, &below, &below_since, rank, oldest)
             }
             _ => Vec::new(),
         };
@@ -2150,7 +2194,9 @@ impl NodeWorld {
             None => Vec::new(),
         };
         for n in &demoted {
-            if !fill.lineage_targets.contains(n) && fill.lineage_targets.len() < MAX_HANDOFF {
+            if !fill.lineage_targets.contains(n)
+                && fill.lineage_targets.len() < self.config.node.lineage_cap
+            {
                 fill.lineage_targets.push(*n);
             }
         }
@@ -2300,6 +2346,7 @@ impl NodeWorld {
             helper: fill.rank.is_none() && self.config.node.fanout && helpers_possible,
             lineage: fill.lineage,
             granted: fill.granted,
+            parallel_granted: self.config.node.parallel_granted,
             rank0,
         }));
         self.step_walk(id);
@@ -2656,6 +2703,7 @@ impl NodeWorld {
             match walk.next(&mut fill.budget) {
                 Err(e) => return self.hard_fail(id, e),
                 Ok(Step::End(end)) => return self.on_end(id, end),
+                Ok(Step::Granted(probes)) => return self.send_granted(id, probes),
                 Ok(Step::Probe(probe)) => match self.send_probe(id, probe) {
                     Ok(()) | Err(None) => return,
                     Err(Some(outcome)) => {
@@ -2725,6 +2773,167 @@ impl NodeWorld {
         self.continue_plan(id);
     }
 
+    /// Counter kind of handoff target `i` of fill `id`, and count the probe.
+    fn handoff_kind(&mut self, id: u64, i: usize) -> Option<&'static str> {
+        let fill = &self.fills[&id];
+        let dest = fill.handoff[i];
+        let kind = if i < fill.successors {
+            Some("successor")
+        } else if i < fill.granted && fill.demoted.contains(&dest) {
+            Some("demoted")
+        } else if i < fill.granted {
+            Some("lineage")
+        } else {
+            None
+        };
+        self.metrics.incr(match kind {
+            Some("successor") => "successor_probes",
+            Some("demoted") => "demoted_probes",
+            Some(_) => "lineage_grant_probes",
+            None => "handoff_probes",
+        });
+        kind
+    }
+
+    /// Production `resolve_epoch_traced` (Known issue 45): send a run of
+    /// granted probes at once, each copy-only on its own grant, and report
+    /// them together once all have answered (`batch_done`).
+    fn send_granted(&mut self, id: u64, probes: Vec<Probe>) {
+        let now = self.now();
+        let instant = self.instant(now);
+        let attempt_timeout = Duration::from_nanos(self.config.node.attempt_timeout_ns);
+        self.metrics.incr("granted_batches");
+        self.metrics
+            .observe("granted_batch_probes", probes.len() as u64);
+        let fill = self.fills.get_mut(&id).expect("present");
+        fill.batch.clear();
+        fill.batch_copy = false;
+        for probe in probes {
+            let i = probe.canonical - self.fills[&id].cands.len();
+            let kind = self.handoff_kind(id, i).unwrap_or("successor");
+            let fill = self.fills.get_mut(&id).expect("present");
+            let dest = fill.handoff[i];
+            let scope = fill.scope.min(fill.budget.deadline());
+            let mut grant = granted_budget(fill.budget.deadline());
+            let (before_attempts, before_links) =
+                (grant.remaining_attempts(), grant.remaining_links());
+            let plan = plan_attempt(
+                &mut grant,
+                AttemptInputs {
+                    now: instant,
+                    caller_deadline: scope,
+                    remaining_opportunities: probe.remaining_opportunities,
+                    route: probe.route,
+                    mode: probe.mode,
+                    attempt_timeout,
+                    failure_links: MAX_LINKS,
+                },
+            );
+            let Ok(plan) = plan else {
+                // An unfundable grant is only a miss.
+                fill.asked.push((dest, Asked::Unfunded));
+                self.count_granted(kind, "failures");
+                continue;
+            };
+            self.invariants.check(
+                "budget_never_grows",
+                plan.links <= before_links
+                    && plan.links <= MAX_LINKS
+                    && plan.remote_attempts < before_attempts,
+                now,
+                Some(fill.node),
+                || {
+                    format!(
+                        "granted plan {} links {} attempts from {before_links} links {before_attempts} attempts",
+                        plan.links, plan.remote_attempts
+                    )
+                },
+            );
+            let version = fill.version;
+            let index = fill.batch.len();
+            fill.batch.push(BatchProbe {
+                pid: 0,
+                dest,
+                kind,
+                cut: None,
+                relayed: false,
+                done: false,
+            });
+            // The first hop may fail synchronously and answer through an
+            // event, never inline, so the batch entry is complete first.
+            let pid = self.launch(id, dest, version, false, &plan, false, None);
+            if let Some(p) = self.probes.get_mut(&pid) {
+                p.granted = Some(index);
+            }
+            if let Some(fill) = self.fills.get_mut(&id)
+                && let Some(b) = fill.batch.get_mut(index)
+            {
+                b.pid = pid;
+            }
+        }
+        self.batch_maybe_done(id);
+    }
+
+    fn count_granted(&mut self, kind: &str, what: &str) {
+        self.metrics.incr(granted_counter(kind, what));
+    }
+
+    /// Granted probe `index` of fill `id` answered with `outcome`.
+    fn complete_batch_probe(&mut self, id: u64, index: usize, outcome: Result<Outcome, Error>) {
+        let Some(fill) = self.fills.get_mut(&id) else {
+            return;
+        };
+        let Some(b) = fill.batch.get_mut(index) else {
+            return;
+        };
+        if b.done {
+            return;
+        }
+        b.done = true;
+        let (dest, kind, cut, relayed) = (b.dest, b.kind, b.cut, b.relayed);
+        let asked = match &outcome {
+            Ok(Outcome::Copy) => Asked::Copy,
+            Ok(Outcome::Probe(ProbeOutcome::CopyMiss | ProbeOutcome::VersionUnavailable)) => {
+                Asked::Miss
+            }
+            Ok(Outcome::Transport(ProbeOutcome::Unreachable) | Outcome::TimedOut) => {
+                Asked::Unreachable(cut.unwrap_or(Cut::Other))
+            }
+            Ok(Outcome::Probe(ProbeOutcome::Unreachable)) if relayed => Asked::Relayed,
+            Ok(Outcome::Probe(ProbeOutcome::Unreachable)) => Asked::Failed,
+            Ok(_) => Asked::Busy,
+            Err(_) => Asked::Unfunded,
+        };
+        fill.asked.push((dest, asked));
+        fill.batch_copy |= asked == Asked::Copy;
+        let what = match asked {
+            Asked::Copy => "copies",
+            Asked::Miss => "misses",
+            _ => "failures",
+        };
+        self.count_granted(kind, what);
+        self.batch_maybe_done(id);
+    }
+
+    /// Every granted probe of fill `id` answered: report them to the walk.
+    fn batch_maybe_done(&mut self, id: u64) {
+        let Some(fill) = self.fills.get_mut(&id) else {
+            return;
+        };
+        if fill.batch.iter().any(|b| !b.done) {
+            return;
+        }
+        let copy = std::mem::take(&mut fill.batch_copy);
+        fill.batch.clear();
+        let Walking::Candidates(walk) = &mut fill.walk else {
+            return;
+        };
+        match walk.complete_granted(copy) {
+            Some(end) => self.on_end(id, end),
+            None => self.step_walk(id),
+        }
+    }
+
     /// Plan and send one probe. `Err(Some)` is a transport outcome the caller
     /// completes; `Err(None)` means the fill already failed.
     fn send_probe(&mut self, id: u64, probe: Probe) -> Result<(), Option<ProbeOutcome>> {
@@ -2735,21 +2944,7 @@ impl NodeWorld {
         let dest = match probe.canonical.checked_sub(fill.cands.len()) {
             Some(i) if fill.rank.is_some() => {
                 let dest = fill.handoff[i];
-                let kind = if i < fill.successors {
-                    Some("successor")
-                } else if i < fill.granted && fill.demoted.contains(&dest) {
-                    Some("demoted")
-                } else if i < fill.granted {
-                    Some("lineage")
-                } else {
-                    None
-                };
-                self.metrics.incr(match kind {
-                    Some("successor") => "successor_probes",
-                    Some("demoted") => "demoted_probes",
-                    Some(_) => "lineage_grant_probes",
-                    None => "handoff_probes",
-                });
+                let kind = self.handoff_kind(id, i);
                 self.fills.get_mut(&id).expect("present").granted_kind = kind;
                 dest
             }
@@ -2871,6 +3066,7 @@ impl NodeWorld {
                 acquire,
                 remote: plan.remote_attempts,
                 hedge,
+                granted: None,
             },
         );
         self.msgs.insert(mid, Msg { probe: pid, ..msg });
@@ -3099,7 +3295,16 @@ impl NodeWorld {
         let Some(p) = self.probes.get(&m.probe) else {
             return;
         };
-        if p.hedge.is_none()
+        if let Some(index) = p.granted {
+            if let Some(b) = self
+                .fills
+                .get_mut(&p.fill)
+                .and_then(|f| f.batch.get_mut(index))
+                && b.cut.is_none()
+            {
+                b.cut = Some(cut);
+            }
+        } else if p.hedge.is_none()
             && let Some(fill) = self.fills.get_mut(&p.fill)
             && fill.cut.is_none()
         {
@@ -3522,7 +3727,10 @@ impl NodeWorld {
             && let Some(fill) = self.fills.get_mut(&p.fill)
         {
             // A relay signs this answer (Known issue 38).
-            fill.relayed = true;
+            match p.granted.and_then(|i| fill.batch.get_mut(i)) {
+                Some(b) => b.relayed = true,
+                None => fill.relayed = true,
+            }
         }
         let reply = if from == m.dest && reply == Reply::Response(ResponseKind::Overloaded) {
             Reply::Shed
@@ -3617,7 +3825,10 @@ impl NodeWorld {
         self.fabric
             .crypto(now, fill.node, self.fabric.costs.verify_ns);
         let page = fill.page;
-        if reply == Reply::Response(ResponseKind::StaleMembership) && probe.hedge.is_none() {
+        if reply == Reply::Response(ResponseKind::StaleMembership)
+            && probe.hedge.is_none()
+            && probe.granted.is_none()
+        {
             // The answering node could not resolve the request's membership,
             // so the credits it carried were never used (production
             // `request_traced`, Known issue 26).
@@ -3642,7 +3853,8 @@ impl NodeWorld {
             Reply::Transport => Ok(Outcome::Transport(ProbeOutcome::Unreachable)),
             Reply::Shed => Ok(Outcome::Shed),
             Reply::Response(ResponseKind::StaleMembership)
-                if probe.hedge.is_none() && self.pending_no_refresh(probe.fill) =>
+                if probe.hedge.is_none()
+                    && (probe.granted.is_some() || self.pending_no_refresh(probe.fill)) =>
             {
                 // A stale handoff target is only a miss, and a predecessor
                 // asked under the previous membership no longer resolves it
@@ -3699,6 +3911,9 @@ impl NodeWorld {
             }
         };
         match probe.hedge {
+            None if let Some(index) = probe.granted => {
+                self.complete_batch_probe(probe.fill, index, outcome)
+            }
             None => self.complete_probe(probe.fill, outcome),
             Some(primary) => {
                 // Production `hedge_page` contenders: a page wins, a stale
@@ -3782,17 +3997,7 @@ impl NodeWorld {
                 Ok(Outcome::Probe(ProbeOutcome::CopyMiss)) => "misses",
                 _ => "failures",
             };
-            self.metrics.incr(match (kind, what) {
-                ("successor", "copies") => "successor_copies",
-                ("successor", "misses") => "successor_misses",
-                ("successor", _) => "successor_failures",
-                ("demoted", "copies") => "demoted_copies",
-                ("demoted", "misses") => "demoted_misses",
-                ("demoted", _) => "demoted_failures",
-                (_, "copies") => "lineage_grant_copies",
-                (_, "misses") => "lineage_grant_misses",
-                _ => "lineage_grant_failures",
-            });
+            self.metrics.incr(granted_counter(kind, what));
         }
         if let Walking::Candidates(walk) = &fill.walk
             && walk.pending_rank0()
@@ -4377,6 +4582,34 @@ impl NodeWorld {
         self.origin_check_at(id)
     }
 
+    /// Counter for the rendezvous rank of `holder` for fill `id`'s page in
+    /// the fill's membership, and whether it arrived before the fetching
+    /// owner (so a lineage rule could have named it): Known issue 46.
+    fn holder_rank_bucket(&self, id: u64, holder: u32) -> &'static str {
+        let fill = &self.fills[&id];
+        let Some(members) = self.versions.get(fill.version).map(|v| v.members.clone()) else {
+            return "moved_unasked_holder_rank_unknown";
+        };
+        let Some(at) = position(&members, holder) else {
+            return "moved_unasked_holder_not_member";
+        };
+        let rank = topology::rank_of(&*members, &fill.page.to_be_bytes(), at);
+        let mine = self.since_of(fill.node, &members, &[fill.node])[0];
+        let theirs = self.since_of(fill.node, &members, &[holder])[0];
+        let older = matches!((theirs, mine), (Some(t), Some(m)) if t < m);
+        match (rank, older) {
+            (0..3, _) => "moved_unasked_holder_rank_owner",
+            (3..5, true) => "moved_unasked_holder_rank_4_5_older",
+            (3..5, false) => "moved_unasked_holder_rank_4_5",
+            (5..8, true) => "moved_unasked_holder_rank_6_8_older",
+            (5..8, false) => "moved_unasked_holder_rank_6_8",
+            (8..16, true) => "moved_unasked_holder_rank_9_16_older",
+            (8..16, false) => "moved_unasked_holder_rank_9_16",
+            (_, true) => "moved_unasked_holder_rank_17_older",
+            (_, false) => "moved_unasked_holder_rank_17",
+        }
+    }
+
     /// Classify a repeated origin request for a page (Known issues 6, 12,
     /// 13, 15). With `A` the node that last asked origin for the page and
     /// `F` the fill asking now:
@@ -4498,6 +4731,12 @@ impl NodeWorld {
                 "origin_repeats_after_move_held_unasked"
             };
             self.metrics.incr(sub);
+            if sub.contains("_unasked") {
+                // Where the unasked holder ranks for this page in the
+                // fetching owner's membership (Known issue 46).
+                let bucket = self.holder_rank_bucket(id, last.node);
+                self.metrics.incr(bucket);
+            }
             "origin_repeats_after_move"
         } else if last.ok == Some(false) {
             "origin_repeats_after_failure"
@@ -5061,9 +5300,10 @@ impl NodeWorld {
             n.account(&mut components);
         }
         let mut list = components.list();
-        // Shared memos: real rankings (`RANKED_DEPTH` scores and a cursor)
+        // Shared memos: real rankings (`RETAINED_DEPTH` 16-byte scores and
+        // a cursor; 48 bytes more than five 24-byte scores with one spare)
         // and route alternatives, estimated per entry.
-        list.push(("placement_memo", self.shared.phantom.memo_len() * 240));
+        list.push(("placement_memo", self.shared.phantom.memo_len() * 288));
         list.push(("route_memo", self.shared.routes.memo_len() * 320));
         list.push(("membership_versions", self.versions.approximate_bytes()));
         list.push(("engine", self.engine.approximate_bytes()));
@@ -5237,6 +5477,21 @@ impl NodeWorld {
     /// Shared handles for tests.
     pub fn members(&self) -> Rc<Members> {
         self.versions.latest().members.clone()
+    }
+}
+
+/// Counter for a granted probe of `kind` that ended `what`.
+fn granted_counter(kind: &str, what: &str) -> &'static str {
+    match (kind, what) {
+        ("successor", "copies") => "successor_copies",
+        ("successor", "misses") => "successor_misses",
+        ("successor", _) => "successor_failures",
+        ("demoted", "copies") => "demoted_copies",
+        ("demoted", "misses") => "demoted_misses",
+        ("demoted", _) => "demoted_failures",
+        (_, "copies") => "lineage_grant_copies",
+        (_, "misses") => "lineage_grant_misses",
+        _ => "lineage_grant_failures",
     }
 }
 
