@@ -2025,3 +2025,51 @@ fn unknown_age_demoted_members_are_targets_when_the_owner_arrived_later() {
     // Rank 1 arrived at the chain start: nothing either.
     assert!(demoted_targets_from(&since, &demoted, &demoted_since, 1, Some(5)).is_empty());
 }
+
+/// Known issue 42 (round 4, hang2): an `Overloaded` signed by a relay on an
+/// owner's route to rank 0 (`Outcome::Probe(Overloaded)`; rank 0's own is
+/// `Outcome::Shed`) gives an owner above rank 0 origin authority after one
+/// probe of rank 0, without a retry, and never gives a non-owner authority.
+/// The walk has nothing to retry with: the probe of rank 0 got every link
+/// but one per later predecessor, and the relay keeps the links it was sent
+/// (only a verified `StaleMembership` refunds anything), so what is left is
+/// exactly one credit per later predecessor and the owner's own origin
+/// attempt. Budgets never grow, so each such owner walk costs at most one
+/// overlapping origin request, at most two per page and membership version
+/// (ranks 1 and 2).
+#[test]
+fn relay_overload_on_the_route_to_rank_zero_gives_authority_without_a_retry() {
+    for rank in [1, 2] {
+        for state in [Rank0State::Unknown, Rank0State::Fetching] {
+            let mut walk = CandidateWalk::new(WalkConfig {
+                rank0: state,
+                ..config(Some(rank), 3, VisitOrder::canonical(3))
+            });
+            let mut b = budget(owner_funding_min(rank), 8);
+            let (probes, end) = drive(&mut walk, &mut b, |p, _| {
+                if p.canonical == 0 {
+                    Outcome::Probe(ProbeOutcome::Overloaded)
+                } else {
+                    Outcome::Probe(ProbeOutcome::CopyMiss)
+                }
+            });
+            assert_eq!(
+                probes.iter().filter(|(p, ..)| p.canonical == 0).count(),
+                1,
+                "rank {rank} {state:?}"
+            );
+            assert!(
+                matches!(end, End::Origin { rank: r, .. } if r == rank),
+                "rank {rank} {state:?}: {end:?}"
+            );
+            // The owner's own origin credit is left, and nothing more grew.
+            assert!(b.remaining_attempts() >= 1);
+            assert!(b.remaining_attempts() <= owner_funding_min(rank));
+        }
+    }
+    let mut walk = CandidateWalk::new(config(None, 3, VisitOrder::canonical(3)));
+    let (_, end) = drive(&mut walk, &mut budget(8, 16), |_, _| {
+        Outcome::Probe(ProbeOutcome::Overloaded)
+    });
+    assert!(matches!(end, End::Exhausted { .. }), "{end:?}");
+}
