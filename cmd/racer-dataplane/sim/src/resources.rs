@@ -195,19 +195,24 @@ impl Fabric {
                 let (a, b) = (hop[0], hop[1]);
                 let wire = service_ns(chunk, self.nic_bps);
                 let (send, receive) = (self.scale(a, wire), self.scale(b, wire));
-                let start = ready.max(self.tx_free[a as usize]);
+                // Both NICs are work-conserving backlogs of their own service
+                // time from the transfer's issue, not slots at the chunk's
+                // (possibly far future) send time. A relay forwarding a body
+                // that is still queued at the sender upstream must not hold
+                // its own transmit side idle until that body arrives: other
+                // streams use the gap (Known issue 18). A slow sender likewise
+                // trickles its chunks without holding the receiver's NIC.
+                // With every hop ready at issue (one link, or idle upstream
+                // links) this matches a FIFO slot reservation.
+                let backlog = self.tx_free[a as usize].max(now);
+                let start = ready.max(backlog);
                 if start >= cutoff {
                     return None;
                 }
-                // The receiver is a work-conserving backlog of its own
-                // service time from the transfer's issue, not a slot at the
-                // chunk's (possibly far future) send time: a slow sender
-                // trickles its chunks without holding the receiver's NIC for
-                // other senders. With equal-speed senders this matches a
-                // FIFO slot reservation.
+                let tx_done = backlog + send;
                 let received = self.rx_free[b as usize].max(now) + receive;
-                let end = (start + send).max(received);
-                self.tx_free[a as usize] = start + send;
+                let end = (ready + send).max(tx_done).max(received);
+                self.tx_free[a as usize] = tx_done;
                 self.rx_free[b as usize] = received;
                 ready = end + self.latency(a, b);
             }
@@ -465,6 +470,31 @@ mod tests {
         // Arriving exactly at the cutoff is too late.
         let mut g = fabric(2, 1);
         assert_eq!(g.transfer_until(0, &[0, 1], chunk, per_chunk + lat), None);
+    }
+
+    /// Known issue 18: a relay forwarding a body still queued upstream must
+    /// not keep its own transmit side idle until the body arrives. Before the
+    /// fix the relay's NIC was reserved at the body's far-future send time,
+    /// so every later send from the relay queued behind it.
+    #[test]
+    fn relay_transmit_is_not_held_by_a_body_queued_upstream() {
+        let mut f = fabric(3, 1);
+        let chunk = f.chunk_bytes;
+        let per_chunk = service_ns(chunk, f.nic_bps);
+        let lat = f.latency(0, 1);
+        // Node 0 is busy for 100 chunks.
+        f.transfer(0, &[0, 2], 100 * chunk);
+        // A body from 0 relayed by 1 to 2 waits behind that backlog.
+        let relayed = f.transfer(0, &[0, 1, 2], chunk);
+        assert!(relayed >= 101 * per_chunk + 2 * lat, "relayed {relayed}");
+        // The relay's own send at time 0 waits only for the relayed
+        // chunk's service time, not for that chunk to arrive.
+        assert_eq!(f.transfer(0, &[1, 0], chunk), 2 * per_chunk + lat);
+        // The relay's backlog is the work it has accepted, not a future slot.
+        assert_eq!(f.tx_free[1], 2 * per_chunk);
+        // Two chunks issued to an idle relay at once still serialize.
+        let mut g = fabric(2, 1);
+        assert_eq!(g.transfer(0, &[0, 1], 2 * chunk), 2 * per_chunk + lat);
     }
 
     #[test]
