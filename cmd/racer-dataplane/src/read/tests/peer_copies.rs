@@ -4227,12 +4227,18 @@ fn rank_zero_defers_readers_to_the_owner_it_missed() {
     }
     assert_eq!(s.count(Event::SuccessorDeferral), u64::from(MAX_DEFERRALS));
     assert_eq!(s.f.origin.calls.get(), 0);
-    // The hint is spent: rank 0 acquires for the reader.
+    // The deferrals are spent: rank 0 acquires for the reader, asking rank
+    // 1 copy-only first (it missed: its own fetch failed).
+    s.peers
+        .replies
+        .borrow_mut()
+        .push_back((s.ordered[1].clone(), Reply::Miss));
     assert!(matches!(
         s.serve(reader, FetchMode::Acquire),
         PeerResponse::Page { .. }
     ));
     assert_eq!(s.f.origin.calls.get(), 1);
+    assert_eq!(s.peers.calls.borrow().len(), 1);
     // Holding a copy, rank 0 serves it even with a fresh hint.
     assert!(matches!(
         s.serve(other, FetchMode::CopyOnly),
@@ -4251,10 +4257,13 @@ fn rank_zero_defers_readers_to_the_owner_it_missed() {
 }
 
 /// Known issue 21: owners are never deferred. Rank 2 delegating to rank 0
-/// after rank 1 missed there gets rank 0's acquisition, as without a hint.
+/// after rank 1 missed there gets rank 0's acquisition, which asks rank 1
+/// copy-only before origin on its own grant (round 4, orphan2): the
+/// delegation's single credit stays for origin.
 #[test]
 fn rank_zero_never_defers_owner_requesters() {
     use crate::telemetry::Event;
+    use racer_core::read::walk::{SUCCESSOR_GRANT_ATTEMPTS, SUCCESSOR_GRANT_LINKS};
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut s = SuccessorFixture::new();
@@ -4264,11 +4273,103 @@ fn rank_zero_never_defers_owner_requesters() {
         PeerResponse::Miss
     ));
     assert_eq!(s.count(Event::SuccessorHint), 1);
+    s.peers
+        .replies
+        .borrow_mut()
+        .push_back((s.ordered[1].clone(), Reply::Miss));
     assert!(matches!(
         s.serve(other, FetchMode::Acquire),
         PeerResponse::Page { .. }
     ));
     assert_eq!(s.f.origin.calls.get(), 1);
+    assert_eq!(s.count(Event::SuccessorDeferral), 0);
+    let calls = s.peers.calls.borrow();
+    assert_eq!(calls.len(), 1);
+    let (dest, copy_only, attempts, links, _) = &calls[0];
+    assert_eq!(dest, &s.ordered[1]);
+    assert!(copy_only);
+    // The grant, less this exchange and its first link.
+    assert!(*attempts < SUCCESSOR_GRANT_ATTEMPTS + 1);
+    assert!(*links <= SUCCESSOR_GRANT_LINKS);
+}
+
+/// Known issue 21 (round 4, orphan2): rank 0 asks the owner it answered
+/// without a copy before origin; that owner's orphan copy is served and
+/// origin is not asked again. The hint funds one probe: a second miss of
+/// rank 0's later acquisition goes straight to origin.
+#[test]
+fn rank_zero_copies_from_the_owner_it_missed() {
+    use crate::telemetry::Event;
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut s = SuccessorFixture::new();
+    let (successor, other) = (s.index(Some(1)), s.index(Some(2)));
+    assert!(matches!(
+        s.serve(successor, FetchMode::CopyOnly),
+        PeerResponse::Miss
+    ));
+    let copy = encrypted_copy(&mut s.f);
+    s.peers
+        .replies
+        .borrow_mut()
+        .push_back((s.ordered[1].clone(), Reply::Copy(copy)));
+    assert!(matches!(
+        s.serve(other, FetchMode::Acquire),
+        PeerResponse::Page { .. }
+    ));
+    assert_eq!(s.f.origin.calls.get(), 0);
+    assert_eq!(s.peers.calls.borrow().len(), 1);
+    assert_eq!(s.count(Event::SuccessorDeferral), 0);
+    // Rank 0 now holds the copy and serves it without asking anyone.
+    assert!(matches!(
+        s.serve(other, FetchMode::CopyOnly),
+        PeerResponse::Page { .. }
+    ));
+    assert_eq!(s.peers.calls.borrow().len(), 1);
+}
+
+/// A hint noted from a predecessor (rank 0's own successor probe, answered
+/// `Miss` at rank 1) never defers readers: the predecessor has no copy.
+#[test]
+fn rank_one_never_defers_to_rank_zero() {
+    use crate::telemetry::Event;
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let (peers, ordered) = install_peers(&mut f, Some(1));
+    let (coordinator, _, _) = f.read_graph(
+        Rc::new(f.fill.clone()),
+        &f.membership,
+        ReadGraphSettings {
+            name: "successor-rank1",
+            snapshots: 4,
+            metadata: 16,
+            window: 1,
+            stall: Duration::from_secs(10),
+            seed: None,
+        },
+    );
+    let mut s = SuccessorFixture {
+        f,
+        peers,
+        ordered,
+        coordinator,
+        ids: 0x61,
+    };
+    let (rank0, reader) = (s.index(Some(0)), s.index(None));
+    assert!(matches!(
+        s.serve(rank0, FetchMode::CopyOnly),
+        PeerResponse::Miss
+    ));
+    assert_eq!(s.count(Event::SuccessorHint), 1);
+    // The reader's Acquire is not deferred to rank 0. Rank 1 delegates to
+    // rank 0 (scripted miss) and fetches.
+    s.peers
+        .replies
+        .borrow_mut()
+        .push_back((s.ordered[0].clone(), Reply::Miss));
+    let response = s.serve(reader, FetchMode::Acquire);
+    assert!(!matches!(response, PeerResponse::Miss));
     assert_eq!(s.count(Event::SuccessorDeferral), 0);
 }
 

@@ -80,14 +80,7 @@ pub struct Coordinator {
     pub(super) credentials: Rc<CredentialCrypto>,
 
     availability: Rc<crate::control::Availability>,
-
-    /// Owners this node answered a page probe without a copy, by page
-    /// (Known issue 21; see `racer_core::read::successor`).
-    successors: std::cell::RefCell<Successors>,
 }
-
-type Successors =
-    racer_core::read::successor::SuccessorHints<crate::model::PageId, racer_control_wire::NodeId>;
 
 /// Metadata/bootstrap allowance. Normal pinned client ranges admit bounded page
 /// acquisitions separately; this is not a ceiling on successful pages delivered.
@@ -135,10 +128,6 @@ impl Coordinator {
             streams,
             credentials,
             availability,
-            successors: std::cell::RefCell::new(Successors::new(
-                racer_core::read::successor::HINT_CAPACITY,
-                racer_core::read::successor::HINT_TTL,
-            )),
         }
     }
 
@@ -183,11 +172,16 @@ impl Coordinator {
         if local == requester || !(copy_only || owners()) {
             return;
         }
-        self.successors.borrow_mut().note(
-            page.clone(),
-            requester.clone(),
-            uring_runtime::environment::now(),
-        );
+        self.fill
+            .dependencies
+            .candidates
+            .successors
+            .borrow_mut()
+            .note(
+                page.clone(),
+                requester.clone(),
+                uring_runtime::environment::now(),
+            );
         self.fill
             .metrics
             .record(crate::telemetry::Event::SuccessorHint, 1);
@@ -208,6 +202,9 @@ impl Coordinator {
             return false;
         }
         let hints = self
+            .fill
+            .dependencies
+            .candidates
             .successors
             .borrow()
             .peek(page, uring_runtime::environment::now());
@@ -221,7 +218,12 @@ impl Coordinator {
         if successor_deferral(hints, local, requester, &owners).is_none() {
             return false;
         }
-        self.successors.borrow_mut().charge(page, MAX_DEFERRALS);
+        self.fill
+            .dependencies
+            .candidates
+            .successors
+            .borrow_mut()
+            .charge(page, MAX_DEFERRALS);
         self.fill
             .metrics
             .record(crate::telemetry::Event::SuccessorDeferral, 1);

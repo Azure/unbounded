@@ -100,6 +100,10 @@ pub struct CandidatePolicy {
     /// Test only: wait without a timer, returning at once.
     #[cfg(test)]
     pub(crate) instant_stale_wait: std::cell::Cell<bool>,
+    /// Owners this node answered a page probe without a copy, by page
+    /// (Known issue 21; see `racer_core::read::successor`). The coordinator
+    /// notes and defers on them; an owner walk asks them before origin.
+    pub(crate) successors: RefCell<Successors>,
 }
 
 /// When each of the page's owners arrived in this node's membership chain
@@ -111,6 +115,9 @@ fn owner_arrivals(candidates: &Candidates) -> Vec<Option<u32>> {
         .map(|node| candidates.membership.since(node))
         .collect()
 }
+
+pub(crate) type Successors =
+    racer_core::read::successor::SuccessorHints<crate::model::PageId, NodeId>;
 
 /// How long a provider stays single-flight after a refused multi-flight
 /// Subscribe. An upgraded provider is asked again after this.
@@ -615,6 +622,10 @@ impl CandidatePolicy {
             reactor: None,
             #[cfg(test)]
             instant_stale_wait: std::cell::Cell::new(false),
+            successors: RefCell::new(Successors::new(
+                racer_core::read::successor::HINT_CAPACITY,
+                racer_core::read::successor::HINT_TTL,
+            )),
         }
     }
 
@@ -1065,7 +1076,7 @@ impl CandidatePolicy {
             } else {
                 [0; racer_core::read::walk::MAX_HANDOFF]
             };
-            let handoff = match rank {
+            let mut handoff = match rank {
                 Some(rank) if page_operation => racer_core::read::walk::merge_handoff(
                     previous.handoff.clone(),
                     racer_core::read::walk::lineage_targets(&candidates.ordered, &since, rank),
@@ -1073,6 +1084,26 @@ impl CandidatePolicy {
                 Some(_) => previous.handoff.clone(),
                 None => Vec::new(),
             };
+            // Later owners that asked this node for the page and got no copy
+            // likely fetched it themselves: ask them copy-only before origin,
+            // each on its own grant (Known issue 21, round 4 orphan2).
+            let mut successors = 0;
+            if let (Some(rank), PeerOperation::Page { page: id, .. }) = (rank, &operation) {
+                let hints = self
+                    .successors
+                    .borrow_mut()
+                    .probe(id, uring_runtime::environment::now());
+                let targets = racer_core::read::successor::successor_targets(
+                    &hints,
+                    &candidates.ordered,
+                    rank,
+                    &handoff,
+                );
+                if !targets.is_empty() {
+                    (handoff, successors) =
+                        racer_core::read::successor::with_successors(targets, &handoff);
+                }
+            }
             // A non-owner page walk may ask the page's overflow helper (Known
             // issue 16). It is chosen only when the walk asks for it.
             let helper = rank.is_none()
@@ -1098,6 +1129,7 @@ impl CandidatePolicy {
                 previous: previous.same_rank,
                 helper,
                 lineage,
+                successors,
             });
             // This node owns the page under version - 1, so the stale
             // fallback (Known issue 19) is not available to this walk.
