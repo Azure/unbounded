@@ -149,6 +149,10 @@ pub struct NodeConfig {
     /// `racer_core::read::notice` cut groups: always on; set 0 to measure
     /// without it, Known issue 50).
     pub offer_cut_groups: bool,
+    /// A rank 2 holder also offers its origin copy to rank 1 (production
+    /// `racer_core::read::notice::notice_indexes`: always on; set 0 to
+    /// measure without it, Known issue 51).
+    pub offer_predecessors: bool,
 }
 
 impl Default for NodeConfig {
@@ -198,6 +202,7 @@ impl Default for NodeConfig {
             silence: true,
             rank0_failure_hold: true,
             offer_cut_groups: true,
+            offer_predecessors: true,
         }
     }
 }
@@ -259,6 +264,7 @@ impl NodeConfig {
                 "silence" if n <= 1 => self.silence = n == 1,
                 "rank0_failure_hold" if n <= 1 => self.rank0_failure_hold = n == 1,
                 "offer_cut_groups" if n <= 1 => self.offer_cut_groups = n == 1,
+                "offer_predecessors" if n <= 1 => self.offer_predecessors = n == 1,
                 _ => return Err(format!("unknown key node.{key}")),
             }
         }

@@ -156,7 +156,7 @@ pub struct Node {
     pub hints: SuccessorHints<u64, u32>,
     /// Pages this node fetched from origin as an owner above rank 0, to
     /// offer to rank 0 later (production orphan notices, Known issue 37).
-    pub notices: OrphanNotices<u64, u32, u16>,
+    pub notices: OrphanNotices<(u64, u8), u32, u16>,
     /// Pages whose rank 0 this node, an owner above it, found fetching or
     /// overdue (production `CandidatePolicy::rank0_watch`, Known issue 39).
     pub rank0: Rank0Watch<u64, u32>,

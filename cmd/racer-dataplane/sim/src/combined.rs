@@ -654,6 +654,12 @@ mod tests {
             on["metrics"]
         );
         assert!(sent <= noted * NOTICE_TRIES as u64, "{}", on["metrics"]);
+        // Known issue 51: rank 2 holders also notice rank 1.
+        assert!(
+            counter(&on, "orphan_notices_noted_rank1") > 0,
+            "{}",
+            on["metrics"]
+        );
         assert_eq!(
             sent,
             counter(&on, "orphan_offers_delivered") + counter(&on, "orphan_offers_failed"),

@@ -46,7 +46,9 @@ use racer_core::read::candidates::{
 use racer_core::read::fanout::{fanout_helper, hot_page_bodies, is_helper, shed_hot_page};
 use racer_core::read::fill::{FailureKind, FillPlan, FillStep, Source, WalkResult};
 use racer_core::read::flight::{Event as FlightEvent, Joined, JoinedCopy};
-use racer_core::read::notice::{Due, NOTICE_LINKS, notice_target, offer_noted, should_notice};
+use racer_core::read::notice::{
+    Due, NOTICE_LINKS, notice_indexes, notice_target, offer_noted, should_notice,
+};
 use racer_core::read::policy::{
     Persist, PersistFacts, peer_error, persist, recoverable, retention_eligible, retention_score,
 };
@@ -436,6 +438,10 @@ struct Fill {
     concurrent: bool,
 }
 
+/// A due copy offer: keyed by page and the target's owner rank (Known issue
+/// 51).
+type OfferDue = Due<(u64, u8), u32>;
+
 /// How a copy offer ended (Known issue 50).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OfferEnd {
@@ -794,7 +800,7 @@ pub struct NodeWorld {
     probes: HashMap<u64, Probing, Fixed>,
     /// Outstanding copy offers: the sending node, its incarnation, and the
     /// notice (Known issue 37).
-    offers: HashMap<u64, (u32, u32, Due<u64, u32>), Fixed>,
+    offers: HashMap<u64, (u32, u32, OfferDue), Fixed>,
     /// Outstanding offers a relay answered (Known issue 50: cut evidence).
     offers_relayed: HashSet<u64, Fixed>,
     ranges: HashMap<u64, RangeRead, Fixed>,
@@ -5312,11 +5318,33 @@ impl NodeWorld {
         };
         let (node, page) = (fill.node, fill.page);
         let ok = result.is_ok();
-        let rank0 = fill.cands.first().copied();
         let notice = ok && should_notice(fill.rank);
+        // The walk's predecessor evidence in rank order (the last answer of
+        // each predecessor; production `OriginAuthority`).
+        let evidence: Vec<ProbeOutcome> = fill
+            .cands
+            .iter()
+            .take(fill.rank.unwrap_or(0))
+            .map(|c| {
+                match fill
+                    .asked
+                    .iter()
+                    .rev()
+                    .find(|(d, _)| d == c)
+                    .map(|(_, a)| *a)
+                {
+                    Some(Asked::Miss) => ProbeOutcome::CopyMiss,
+                    _ => ProbeOutcome::Unreachable,
+                }
+            })
+            .collect();
+        let targets: Vec<(u8, u32)> = notice_indexes(fill.rank, &evidence)
+            .into_iter()
+            .filter_map(|i| fill.cands.get(usize::from(i)).map(|t| (i, *t)))
+            .collect();
         fill.plan.origin(result);
-        if notice && let Some(rank0) = rank0 {
-            self.note_notice(node, page, rank0);
+        if notice {
+            self.note_notice(node, page, &targets);
         }
         let now = self.now();
         if let Some(last) = self.last_origin.get_mut(&page)
@@ -5329,17 +5357,28 @@ impl NodeWorld {
         self.continue_plan(id);
     }
 
-    /// `node` fetched `page` from origin as an owner above `rank0`: offer
-    /// the copy to `rank0` later (Known issue 37).
-    fn note_notice(&mut self, node: u32, page: u64, rank0: u32) {
+    /// `node` fetched `page` from origin as an owner after `targets` (owner
+    /// rank, node): offer the copy to rank 0 later (Known issue 37), and to
+    /// rank 1 (Known issue 51, `node.offer_predecessors`).
+    fn note_notice(&mut self, node: u32, page: u64, targets: &[(u8, u32)]) {
         let config = &self.config.node;
-        if !config.orphan_notices || !config.successor_hints || rank0 == node {
+        if !config.orphan_notices || !config.successor_hints {
             return;
         }
         let instant = self.instant(self.now());
-        let due = self.nodes[node as usize].notices.note(page, rank0, instant);
-        self.metrics.incr("orphan_notices_noted");
-        self.engine.at(self.nanos(due), Event::Notice { node });
+        for &(index, target) in targets {
+            if target == node || (index > 0 && !config.offer_predecessors) {
+                continue;
+            }
+            let due = self.nodes[node as usize]
+                .notices
+                .note((page, index), target, instant);
+            self.metrics.incr("orphan_notices_noted");
+            if index > 0 {
+                self.metrics.incr("orphan_notices_noted_rank1");
+            }
+            self.engine.at(self.nanos(due), Event::Notice { node });
+        }
     }
 
     /// Send `node`'s due copy offers (production orphan notice timer).
@@ -5363,13 +5402,13 @@ impl NodeWorld {
             let Some(due) = next else {
                 break;
             };
-            let page = due.key;
+            let (page, index) = due.key;
             let w = self.ids.worker(page);
             let n = &self.nodes[node as usize];
             let holds = n.workers[w as usize].memory.pages.contains_key(&page)
                 || n.disk.entries.get(&page).is_some();
             let owners = self.owners_at(node, w, page, true);
-            match notice_target(&node, &owners, holds) {
+            match notice_target(&node, &owners, holds, index) {
                 Some(target) => self.launch_offer(node, Due { target, ..due }),
                 None => {
                     self.metrics.incr("orphan_notices_dropped");
@@ -5391,7 +5430,7 @@ impl NodeWorld {
 
     /// Send one copy offer for `due` from `node`, on its own route grant
     /// ([`NOTICE_LINKS`], no attempts).
-    fn launch_offer(&mut self, node: u32, due: Due<u64, u32>) {
+    fn launch_offer(&mut self, node: u32, due: OfferDue) {
         let now = self.now();
         let timeout = now + self.config.node.attempt_timeout_ns;
         let version = self.nodes[node as usize].version;
@@ -5404,7 +5443,7 @@ impl NodeWorld {
             at: node,
             dest: due.target,
             version,
-            page: due.key,
+            page: due.key.0,
             acquire: false,
             path: vec![node],
             links: NOTICE_LINKS,
@@ -5425,7 +5464,7 @@ impl NodeWorld {
     }
 
     /// A copy offer ended: delivered, or try again after the next delay.
-    fn offer_done(&mut self, node: u32, incarnation: u32, due: Due<u64, u32>, end: OfferEnd) {
+    fn offer_done(&mut self, node: u32, incarnation: u32, due: OfferDue, end: OfferEnd) {
         let n = &self.nodes[node as usize];
         let live = !n.down && n.incarnation == incarnation;
         let group = self.fabric.site[due.target as usize];
