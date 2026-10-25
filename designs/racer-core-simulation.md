@@ -436,15 +436,13 @@ Verified against the code at the start of this work.
    new `origin_within_scope` invariant holds; 1 MiB scenarios keep their trace hashes. See
    "Round 4: cancel (wave 3)" (round 4, cancel, wave 3).
 
-161. Under origin overload, production re-fetches a page from scratch each time a flight's leader
-   expires. The fill's owned scope is the leader's deadline (`src/read/fill.rs:1133`), and the
-   driver cancels it when the leader is revoked (`src/read/fill.rs:1229-1238`,
-   `src/read/flight.rs:314-325`), even when other waiters with later deadlines still want the page.
-   The re-elected waiter then starts a new origin request at the back of the origin queue, and
-   the partially transferred body is lost. In 5k `zipf` at 16 MiB pages this raises origin
-   requests from 36,239 to 48,438, the most requests for one page from 4 to 24, and re-elections
-   from 550 to 16,219, while successful origin fills fall from 2,372 to 1,710 (round 4, cancel,
-   wave 3).
+161. Resolved: an expired or canceled leader's running fill now continues for the live acquisition
+   waiter with the latest deadline instead of being canceled and restarted (shared flight state
+   `allow_handover`, production `Flights::allow_handover` and `FlightOperation::poll_cancellation`,
+   core `PageFlights::allow_handover`). In 5k `zipf` at 16 MiB pages, origin requests fall from
+   48,438 to 35,917, the most requests for one page from 24 to 4, origin requests canceled from
+   18,468 to 2,186, and failed reads from 90 to 54. 1 MiB scenarios keep their trace hashes. See
+   "Round 4: handover (wave 3)" (round 4, handover, wave 3).
 
 ## Simulator engine (racer-sim substrate)
 
@@ -908,9 +906,8 @@ scenarios carry data-plane faults.
 151. Resolved: the origin model cancels a tracked request (slot and unsent bandwidth freed), and
    the simulator cancels an expired fill's origin request at its scope like production (round 4,
    cancel, wave 3).
-161. Production cancels a fill when its leader expires even if other waiters remain, so under
-   origin overload a page is re-fetched from scratch per leader (5k `zipf` at 16 MiB: up to 24
-   origin requests per page) (round 4, cancel, wave 3).
+161. Resolved: a running fill passes to another live waiter when its leader expires; 5k `zipf` at
+   16 MiB: origin requests 48,438 to 35,917, most per page 24 to 4 (round 4, handover, wave 3).
 
 ## Round 2: production admission
 
@@ -3033,3 +3030,145 @@ and the workspace tests pass (3,405 tests).
   and fill ownership in production, so it is left open.
 - 50k was not run: the change has no effect at default page size (identical hashes), and 16 MiB
   pages at 50k are not a standard configuration.
+
+## Round 4: handover (wave 3)
+
+Branch `racer-sim5-handover`, based on `racer-sim5-cancel` (52d4dcd8b). Resolves Known issue 161.
+Evidence logs and configs: `/tmp/opencode/r5-handover/`.
+
+### Root cause
+
+Production canceled a fill as soon as its leader's scope ended, even when other acquisition
+waiters still wanted the page:
+
+- The fill's owned scope used the leader caller's deadline (`src/read/fill.rs`, `owned_scope`
+  in `drive_elected_acquisition`).
+- The driver canceled that scope when the caller's scope failed or the operation asked for
+  cancellation (`src/read/fill.rs`, the `poll_fn` around `work`). The operation asked for
+  cancellation once the leader's waiter scope failed (`src/read/flight.rs`,
+  `FlightOperation::cancellation_requested`).
+- The shared flight state then revoked the leader (`flow/src/coalesce.rs`, `State::refresh` and
+  `State::revoke`). Once the canceled operation completed, the next waiter was elected and
+  started a new origin request at the back of the origin queue. The body already transferred was
+  lost.
+
+### Changes
+
+- Shared flight state (`flow/src/coalesce.rs`, `State`):
+  - `elected` records the waiter elected for the current generation. `leader` is the waiter
+    the acquisition currently serves.
+  - `allow_handover` enables handover for the running acquisition. `elect` and `settle` reset it.
+  - In `refresh`, a failed leader with handover allowed and a running operation passes the
+    acquisition to the live eligible acquisition waiter with the latest deadline. That waiter is
+    not marked issued. Copy waiters never adopt. With no live adopter the acquisition is revoked
+    as before.
+  - `validate_leader` also accepts the elected waiter, so the driver's capability can still
+    publish. `revoke` marks the elected waiter, not an adopter, so abandoning a handed-over
+    acquisition does not fail the adopter.
+- Production:
+  - The fill driver allows handover unless its caller fences on the operation (`acquire_warm`
+    sets `fence_acquisition`). Its owned scope runs to
+    `racer_core::read::flight::handover_ceiling`: the leader's deadline plus 4 times its
+    remaining span. This is only a hard cap for the scope's timers.
+  - The driver no longer cancels on the leader caller's scope when handover is allowed. It calls
+    `FlightOperation::poll_cancellation`, which refreshes the entry (so an adopter can take over)
+    and registers a wake at the current leader's deadline in the worker's deadline registry. The
+    fill is canceled once no live waiter remains.
+  - `Flights::fail` turns the elected caller's own `DeadlineExceeded` or `Cancelled` into a
+    retry after a handover, so the adopter leads with its own unspent budget instead of failing.
+- Core `PageFlights`: `allow_handover`, `leader_deadline`, `handed_over`, `abandon` (production
+  `Drop for FlightLeader`), and `finish` uses `handover_outcome` for the same retry rule.
+- Simulator: fills allow handover (knob `node.flight_handover`, default on). The origin check runs
+  at the deadline of the waiter the fill serves. If another waiter adopts, the elected leader's
+  read fails with `DeadlineExceeded`, as production's caller ends at its deadline, and the check
+  is rescheduled. Otherwise the fill is canceled as before. Peer attempts stay within the leader's
+  budget deadline. New counter `flight_handovers` and invariant `origin_for_live_waiter`.
+
+Budgets and authority:
+
+- Budgets never grow. Attempts and links stay charged to the elected leader's budget, and an
+  origin attempt still has to begin before that budget's deadline (`begin_attempt`). The time
+  after the leader's deadline is within the adopter's own scope and budget deadline, because the
+  adopter's policy check (`WaiterRecord::check`) ends the handover. The adopter spends none of its
+  own budget. If the work ends without a result, it leads with its full budget.
+- Origin authority is unchanged. The elected leader validated it under its membership snapshot
+  before the origin request began. A handover only continues that exchange on the same node.
+  Before this change a completed fill was already shared with every waiter of the flight, so the
+  result relies on the same authority either way.
+
+### Tests
+
+- Shared state: `running_operation_hands_over_to_latest_eligible_waiter`,
+  `handover_requires_permission_running_work_and_a_live_waiter`, and
+  `handed_over_publication_completes_and_election_resets_permission`.
+- Core: `expired_leader_hands_running_fill_to_latest_waiter`,
+  `handed_over_fill_deadline_retries_and_last_expiry_revokes`, and
+  `handover_outcome_maps_only_caller_scope_failures`.
+- Production flights: `canceled_leader_hands_running_operation_to_live_waiter`,
+  `handover_ends_with_last_adopter_and_caller_scope_failure_retries`, and
+  `without_handover_canceled_leader_revokes_running_operation`.
+- Production fill driver: `canceled_leader_fill_driver_continues_for_remaining_caller` checks
+  that the driver never sees a cancellation request and that the remaining caller completes
+  without spending attempts.
+- Production versus core:
+  - `flights_match_page_flights_on_seeded_traces` now allows handover at random, fails with the
+    elected caller's deadline, and compares `handed_over` on both tables. Both steps are
+    required.
+  - `expired_leader_hands_over_running_operation_on_both_tables` covers handover, retry, and
+    abandonment.
+- Simulator:
+  - `expired_leaders_hand_their_fill_to_later_waiters` compares runs with and without handover.
+    With handover there are fewer origin requests and cancellations, the most requests for one
+    page does not rise, and no violations occur.
+  - The Known issue 122 and 151 tests now set `flight_handover = false`, so they still cover
+    draining and cancellation.
+
+### Evidence
+
+5k `zipf`, seed 1, 16 MiB pages (`{"page_bytes":16777216,"request_rate":1.25,"duration_ns":8000000000}`):
+
+| | cancel (52d4dcd8b) | handover |
+|---|---|---|
+| reads completed / failed | 33,374 / 90 | 32,691 / 54 |
+| read p99 | 4.83 s | 5.91 s |
+| origin requests (max per page) | 48,438 (24) | 35,917 (4) |
+| origin requests canceled | 18,468 | 2,186 |
+| origin fills / origin bytes | 1,710 / 28.7 GB | 2,372 / 39.8 GB |
+| flight stale finishes / re-elections / handovers | 18,468 / 16,219 / 0 | 2,186 / 0 / 13,532 |
+| violations | 0 | 0 |
+
+The same run with `node.flight_handover = 0` reproduces the cancel branch exactly (trace hash
+`c0ef323f96686117`).
+
+Origin bandwidth now goes to complete bodies, with no body discarded partway. Failed reads fall
+by 40%. Completed reads fall by 2% and p99 rises. Waiters now wait for one long transfer through
+the overloaded origin. Before, each re-elected leader restarted the transfer; those restarts
+were mostly canceled, but freed origin bandwidth for other pages. The workload's range reads
+are closed loop, so higher latency also lowers the number of reads issued. This is an inference
+from `range_reads_completed` (1,263 to 1,217) and lower peer request counts; it was not
+instrumented further.
+
+At default 1 MiB pages no fill outlives its leader with an origin request outstanding. These
+5k runs (seed 1) keep the trace hashes and counters of the cancel branch: `zipf`
+`ef7607be6a3bb784`, `storm` `ca1b1acb8b9fc903`, `churn` `681512f470c3c7d1`, `full-cold-start`
+`38885a3d7aaa1c9a`, `full-failover` `ca1fbb12e1302c50`, `full-churn` `7a6dcad8908e8cf6`, and
+`full-lagging` `4e6be4c16c724572`. Wall time was 6-12% higher. Those runs overlapped with
+workspace tests and clippy on the same host, so this is likely load rather than the change. The
+16-scenario smoke at 200 nodes (1 s) has no hard invariant failures, and every trace hash
+matches the cancel branch.
+
+Checks: `cargo fmt --check` and `cargo clippy --workspace --all-targets -D warnings` are clean,
+and the workspace tests pass (3,417 tests).
+
+### Deviations and open items
+
+- Production behavior changed as approved. Wire format is unchanged.
+- Warm gates (`acquire_warm`) do not hand over, because their caller fences on the operation.
+- The handover ceiling (`HANDOVER_SPANS = 4`) is a fixed bound. It was not tuned, because the
+  live-waiter check normally ends the fill first.
+- 50k was not run: 1 MiB scenarios are unchanged (identical hashes), and 16 MiB pages at 50k are
+  not a standard configuration.
+- `origin_repeats_concurrent` stays high in 16 MiB `zipf` (18,275). These are concurrent
+  requests for one page from different nodes, not restarts by one flight, so they are outside
+  this issue.
+
