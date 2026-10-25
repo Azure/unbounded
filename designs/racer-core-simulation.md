@@ -835,9 +835,19 @@ Verified against the code at the start of this work.
    owner has no attempt left to wait or to fetch, so it answers `Unavailable`. Open (round 4,
    ctl3, wave 6).
 
-431. 50k `full-failover` failed reads rose 266 to 343 with the offer2 changes (one run each);
-   5k seeds 1 to 3 did not rise. Unclassified: run variance or the issue 52 hold. Open (round
-   4, offer2, wave 6).
+431. 50k `full-failover` failed reads rose with the offer2 changes: 266, 243, 265 to 343, 298,
+   338 (seeds 1 to 3), a regression, not variance. Root cause: issue 51's offers to rank 1 make
+   rank 1 defer readers to the offer's sender (`note_offer` adds the sender to an existing
+   hint, which `peek` defers to). A reader reaches rank 1 when rank 0 failed it, often because
+   rank 0 crashed, and the sender is often down too, so the reader loses the one owner that
+   would have fetched: deferrals 890 to 1,600 and reads failed while members were crashed 1 to
+   56 (seed 1). Not deferring to offer senders above rank 0 restores 293 failed reads and 890
+   deferrals at 50k, but fails the DST churn oracle (non-native seed 11 returns a 502 in
+   `cache_obligations`, where rank 1's deferral to the offer's sender is how a pinned read finds
+   the cached copy with origin offline), so it is not applied. Open: needs a deferral rule
+   that skips senders likely down without losing that copy (round 4, offer2, wave 6). Not the
+   issue 52 hold (`rank0_failure_hold` 0: 329 failed) nor cut groups (`offer_cut_groups` 0:
+   374); `offer_predecessors` 0: 273.
 
 ## Simulator engine (racer-sim substrate)
 
@@ -1387,8 +1397,9 @@ scenarios carry data-plane faults.
    wave 6).
 57. Owners with too little inherited budget fail when their rank 0 is behind on membership (4
    reads at 50k `full-cold-start`) (round 4, ctl3, wave 6).
-431. 50k `full-failover` failed reads 266 to 343 after offer2, unclassified (round 4, offer2,
-   wave 6).
+431. 50k `full-failover` failed reads about 258 to 326 after offer2 (seeds 1 to 3): rank 1
+   defers readers to issue 51's offer senders, often down; the direct fix fails DST seed 11.
+   Open (round 4, offer2, wave 6).
 
 ## Round 2: production admission
 
@@ -2772,10 +2783,6 @@ probes / helper copies / owner sheds. Read latency is log-bucket upper bounds.
   only makes shedding rarer.
 - The simulator counts a node's bodies across all its workers (one simulated node is one production
   worker).
-- New Known issue 431: 50k `full-failover` failed reads 266 to 343 (one run each). Not
-  classified; 5k seeds 1 to 3 went 100 to 88 and the outage run 687 to 688, so it may be run
-  variance or the issue 52 hold (a reader whose owner withholds must retry rank 0). Needs more
-  50k seeds.
 
 
 ## Round 4: join
@@ -6015,10 +6022,56 @@ worst page, pages fetched more than once. Orphans: all orphan repeats.
 - Issue 50's reduction is small (7%); the remaining offer link failures are bounded and on cut
   links only. Issue 51's rank 1 offers raise offers by about 45% (no bodies) and add offer link
   failures across partitions, which cut groups partly absorb.
-- New Known issue 431: 50k `full-failover` failed reads 266 to 343 (one run each). Not
-  classified; 5k seeds 1 to 3 went 100 to 88 and the outage run 687 to 688, so it may be run
-  variance or the issue 52 hold (a reader whose owner withholds must retry rank 0). Needs more
-  50k seeds.
+- New Known issue 431: 50k `full-failover` failed reads 266 to 343 (seed 1). A regression
+  from rank 1 deferring readers to offer senders, open; see the follow-up below.
+
+### Known issue 431 follow-up
+
+50k `full-failover` (`/tmp/opencode/m4b/rr.json`), wave 5 base binary (5d1ea912b) against
+offer2 (c2ca119c7), one run per cell. Columns: ok / failed reads; origin requests, worst page,
+pages fetched more than once.
+
+| Seed | Base | Base origin | offer2 | offer2 origin |
+|---|---|---|---|---|
+| 1 | 303,355 / 266 | 47,617, 6, 2,268 | 303,299 / 343 | 47,581, 6, 2,320 |
+| 2 | 303,461 / 243 | 47,992, 8, 2,428 | 303,398 / 298 | 47,920, 7, 2,389 |
+| 3 | 302,692 / 265 | 47,521, 8, 2,422 | 302,596 / 338 | 47,453, 8, 2,400 |
+
+offer2 fails 55 to 77 more reads on every seed: a regression, not variance. Seed 1 with one
+offer2 switch off at a time (`node.*` in the config):
+
+| Variant | ok / failed | origin | successor deferrals | failed while crashed |
+|---|---|---|---|---|
+| offer2 | 303,299 / 343 | 47,581, 6, 2,320 | 1,600 | 56 |
+| `rank0_failure_hold` 0 | 303,304 / 329 | 47,573, 8, 2,272 | | |
+| `offer_cut_groups` 0 | 303,249 / 374 | 47,537, 6, 2,251 | | |
+| `offer_predecessors` 0 | 303,358 / 273 | 47,632, 6, 2,312 | 849 | 3 |
+| no deferral to offer senders above rank 0 | 303,341 / 293 | 47,581, 6, 2,275 | 890 | 5 |
+| offers do not renew the deferral TTL | 303,300 / 342 | 47,581, 6, 2,320 | | |
+
+Seeds 2 and 3 show the same signature (deferrals 765 to 1,511 and 802 to 1,386; reads failed
+while members were crashed 3 to 49 and 3 to 43). All extra failures are `Unavailable`, late in
+the run (p90 of `read_failed_at_s` 416 s to 512 s, max up to 872 s).
+
+Mechanism: an offer to rank 1 (issue 51) goes through `SuccessorHints::note_offer`
+(`core/src/read/successor.rs`), which for a page rank 1 already has a hint for adds the sender
+to the hint's nodes; `peek` returns them and `successor_deferral` defers a reader's `Acquire`
+to the sender (`src/read.rs` `defer_to_successor`, simulator `defer_to_successor`). A reader
+reaches rank 1 when rank 0 failed it, and in `full-failover` that is mostly while members are
+crashed. The offer's sender is then often down as well, so the reader loses the one owner
+that would have fetched for it. Rank 0's deferrals do not have this problem: rank 1 still
+fetches after them.
+
+Not fixed. Excluding offer senders from deferrals above rank 0 (rank 0 keeps them) restores
+the base numbers (293 against 266) but fails the DST churn oracle on non-native seed 11: in
+`cache_obligations` origin is offline and a pinned read must be served from a cache; rank 1's
+deferral to the offer's sender is how the read found the copy, and without it rank 1 fetches,
+origin answers 404 for the pinned object, and the client gets 502. Excluding senders at every
+rank fails the same way. Not renewing the deferral TTL on offers (committed as 247734245 and
+reverted in 49615fead) changed nothing. A fix needs a rule that skips senders likely to be down
+(for example ones this node's link health marks failed) while keeping the deferral to a live
+holder; `offer_predecessors` 0 also restores the base but returns orphan repeats 130 to 187.
+5k `full-failover` seeds 1 to 3 do not show the regression (100 base to 88).
 
 ## Round 4: combined (wave 6)
 
