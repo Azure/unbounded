@@ -122,7 +122,16 @@ impl LinkHealth {
     }
     /// `peer` answered an exchange: it is not hung.
     pub fn silence_answered(&self, peer: &NodeId) {
-        self.silence.borrow_mut().answered(peer);
+        self.silence
+            .borrow_mut()
+            .answered(peer, uring_runtime::environment::now());
+    }
+    /// `peer` itself shed an exchange for `page` (an `Overloaded` it
+    /// signed): it is alive and busy; see `Silence::shed` (Known issue 54).
+    pub fn silence_shed(&self, peer: &NodeId, page: crate::model::PageId) {
+        self.silence
+            .borrow_mut()
+            .shed(peer.clone(), page, uring_runtime::environment::now());
     }
     /// At most `max` pings due now, each marked outstanding
     /// (`Silence::due_pings`).

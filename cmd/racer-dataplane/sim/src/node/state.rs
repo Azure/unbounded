@@ -163,7 +163,13 @@ pub struct Node {
     /// Next hops that left exchanges unanswered (production
     /// `LinkHealth::silence`, Known issues 41 and 43).
     pub silence: Silence<u32, u64>,
+    /// The last few owners that shed this node's page requests, with the
+    /// page and when (measurement only: `shed_repeats`, Known issue 54).
+    pub recent_sheds: Vec<(u32, u64, crate::engine::Nanos)>,
 }
+
+/// Bound on [`Node::recent_sheds`].
+pub const RECENT_SHEDS: usize = 8;
 
 pub struct Shared {
     pub phantom: Phantom,
@@ -220,6 +226,7 @@ impl Node {
                 Duration::from_nanos(config.read_timeout_ns / 2),
                 Duration::from_nanos(config.attempt_timeout_ns),
             ),
+            recent_sheds: Vec::new(),
         }
     }
 

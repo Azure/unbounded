@@ -140,6 +140,11 @@ pub struct NodeConfig {
     /// Senders hold next hops that leave exchanges unanswered silent and
     /// fail requests for them at once (Known issues 41 and 43).
     pub silence: bool,
+    /// Readers visit an owner that itself shed them (a signed
+    /// `Overloaded`) after the page's other owners for half a request
+    /// timeout (production `Silence::shed`: always on; set 0 to measure
+    /// without it, Known issue 54). Needs `silence`.
+    pub shed_busy: bool,
     /// Owners above rank 0 leave the next attempt to rank 0 after rank 0's
     /// own acquisition failed (production `Outcome::Failed`: always on;
     /// set 0 to measure without it, Known issue 52). Needs `rank0_watch`.
@@ -200,6 +205,7 @@ impl Default for NodeConfig {
             lineage_cap: racer_core::read::walk::MAX_LINEAGE,
             unknown_age_targets: true,
             silence: true,
+            shed_busy: true,
             rank0_failure_hold: true,
             offer_cut_groups: true,
             offer_predecessors: true,
@@ -262,6 +268,7 @@ impl NodeConfig {
                     self.lineage_cap = n as usize;
                 }
                 "silence" if n <= 1 => self.silence = n == 1,
+                "shed_busy" if n <= 1 => self.shed_busy = n == 1,
                 "rank0_failure_hold" if n <= 1 => self.rank0_failure_hold = n == 1,
                 "offer_cut_groups" if n <= 1 => self.offer_cut_groups = n == 1,
                 "offer_predecessors" if n <= 1 => self.offer_predecessors = n == 1,

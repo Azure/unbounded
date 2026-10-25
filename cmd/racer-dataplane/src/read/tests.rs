@@ -2252,6 +2252,9 @@ mod timeouts {
         /// The destination answers page requests with a signed
         /// `Unavailable`, as a rank 0 whose origin fetch failed does.
         pages_unavailable: Cell<bool>,
+        /// The next this many page requests are shed by their destination
+        /// (a signed `Overloaded`, as a hot page's owner does).
+        shed_pages: Cell<usize>,
     }
 
     impl Peers {
@@ -2287,6 +2290,10 @@ mod timeouts {
                 }
                 PeerOperation::Page { .. } if self.pages_unavailable.get() => {
                     PeerResponse::Unavailable
+                }
+                PeerOperation::Page { .. } if self.shed_pages.get() > 0 => {
+                    self.shed_pages.set(self.shed_pages.get() - 1);
+                    PeerResponse::Overloaded
                 }
                 PeerOperation::Subscribe { .. } | PeerOperation::Page { .. } => PeerResponse::Miss,
                 _ => PeerResponse::Metadata(metadata),
@@ -2435,6 +2442,7 @@ mod timeouts {
                 relay_unavailable: Cell::new(false),
                 fail_pages: Cell::new(false),
                 pages_unavailable: Cell::new(false),
+                shed_pages: Cell::new(0),
             });
             let policy = CandidatePolicy::new(
                 local,
@@ -3068,6 +3076,105 @@ mod timeouts {
         f = f.bounded(211, 60, 24);
         resolve_once(&mut f, false);
         assert_eq!(visited(&f, before)[0], hung);
+    }
+
+    /// Known issue 54 (round 4, busy): an owner that itself shed a reader's
+    /// request (a signed `Overloaded`, as a hot page's owner does) is busy,
+    /// not hung. The reader's next walks visit it after the page's other
+    /// owners for the quiet time (half a request timeout), without a ping,
+    /// instead of first again (`Spread` is deterministic per requester and
+    /// page, so a retried read repeated the shed walk). Any other answer
+    /// from it, or the quiet time passing, restores its place.
+    #[test]
+    fn reader_visits_an_owner_that_shed_it_after_the_others() {
+        use racer_core::read::candidates::Answering;
+        let clock = uring_runtime::environment::SimulationClock::new(212);
+        let _env = clock.environment(0).enter();
+        let mut f = Fixture::new(None, 0, false).bounded(212, 60, 24);
+        f.policy = f
+            .policy
+            .with_attempt_timeout(Duration::from_secs(1))
+            .with_replica_selection(crate::read::candidates::ReplicaSelection::Spread);
+        f.policy
+            .link_health()
+            .set_silence(Duration::from_secs(5), Duration::from_secs(1));
+        let page = crate::model::PageId {
+            version: ObjectVersion {
+                object: f.context.object.clone(),
+                etag: StrongEtag::test_value("v"),
+            },
+            number: PageNumber(0),
+        };
+        let resolve_once = |f: &mut Fixture| {
+            let operation = PeerOperation::Page {
+                page: page.clone(),
+                mode: FetchMode::Acquire,
+            };
+            let candidates = Candidates {
+                membership: f.candidates.membership.clone(),
+                ordered: f.candidates.ordered.clone(),
+            };
+            let mut resolve = f.policy.resolve_with_budget(
+                candidates,
+                &f.context,
+                operation,
+                &f.scope,
+                &mut f.budget,
+            );
+            let Poll::Ready(_) = poll(resolve.as_mut()) else {
+                panic!("bounded resolution")
+            };
+        };
+        let visited = |f: &Fixture, from: usize| -> Vec<NodeId> {
+            f.peers.calls.borrow()[from..]
+                .iter()
+                .map(|c| c.destination.clone())
+                .collect()
+        };
+        // Without a shed, the first owner visited.
+        resolve_once(&mut f);
+        let usual = visited(&f, 0);
+        let busy = usual[0].clone();
+        assert_eq!(f.policy.link_health().answering(&busy), Answering::Answers);
+        // It sheds this time: busy, alive, never pinged.
+        f.peers.shed_pages.set(1);
+        let before = f.peers.calls.borrow().len();
+        f = f.bounded(213, 60, 24);
+        resolve_once(&mut f);
+        assert_eq!(visited(&f, before)[0], busy);
+        assert_eq!(
+            f.policy.link_health().answering(&busy),
+            Answering::Unanswered
+        );
+        assert!(!f.policy.link_health().silent(&busy));
+        assert!(
+            f.policy
+                .link_health()
+                .due_pings(uring_runtime::environment::now(), 16)
+                .is_empty()
+        );
+        // The next walk visits it last; it answers, which restores its place.
+        let before = f.peers.calls.borrow().len();
+        f = f.bounded(214, 60, 24);
+        resolve_once(&mut f);
+        let next = visited(&f, before);
+        assert_ne!(next[0], busy, "{usual:?} then {next:?}");
+        assert_eq!(next.last(), Some(&busy), "{usual:?} then {next:?}");
+        assert_eq!(f.policy.link_health().answering(&busy), Answering::Answers);
+        // A shed is forgotten after the quiet time without another answer.
+        f.peers.shed_pages.set(1);
+        f = f.bounded(215, 60, 24);
+        resolve_once(&mut f);
+        assert_eq!(
+            f.policy.link_health().answering(&busy),
+            Answering::Unanswered
+        );
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(f.policy.link_health().answering(&busy), Answering::Answers);
+        let before = f.peers.calls.borrow().len();
+        f = f.bounded(216, 60, 24);
+        resolve_once(&mut f);
+        assert_eq!(visited(&f, before)[0], busy);
     }
 
     #[test]

@@ -47,6 +47,14 @@
 //! (the sender's neighbors and direct peers); the oldest entry is evicted.
 //! No reader's budget pays for a ping, and the rule only fails, earlier, a
 //! request that would have timed out.
+//!
+//! Busy is not hung (Known issues 53 and 54). Any answer from a peer quiets
+//! it for [`Silence::quiet`], as an answered ping does, so a busy peer that
+//! answers some exchanges and leaves others (that joined its running work)
+//! unanswered is pinged at most once per sender per `quiet`. A peer that
+//! itself sheds an exchange (a signed `Overloaded`, such as a hot page's
+//! owner) is busy: [`Silence::shed`] marks it so readers visit it after the
+//! page's other owners for `quiet`, without a ping.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -91,6 +99,10 @@ struct Entry<P> {
     /// When a silent peer is pinged again, or until when a peer that
     /// answered a ping is not pinged again.
     next: Instant,
+    /// The peer itself shed one of this node's requests (a signed
+    /// `Overloaded`): it is busy, not hung, and readers visit it after the
+    /// page's other owners until then (Known issue 54).
+    busy_until: Option<Instant>,
     /// Last event (expiry and eviction stamp).
     last: Instant,
     /// Insertion order, to evict deterministically among equal stamps.
@@ -194,12 +206,47 @@ impl<N: Eq + Hash + Clone, P: Clone> Silence<N, P> {
                 pinging: None,
                 silent: false,
                 next: now,
+                busy_until: None,
                 last: now,
                 seq: self.seq,
             },
         );
         self.seq += 1;
         needed <= 1
+    }
+
+    /// `peer` itself shed an exchange of this node at `now` (an
+    /// `Overloaded` it signed, such as a hot page's owner shedding a
+    /// reader): it answered, so it is alive ([`Self::answered`]), and busy.
+    /// Readers visit it after the page's other owners for [`Self::quiet`]
+    /// ([`Self::unanswered`]), unless it answers something else first (Known
+    /// issue 54): a read retried after a shed otherwise repeated the same
+    /// walk (`Spread` is deterministic per requester and page) and was shed
+    /// again. No ping: the shed is the answer.
+    pub fn shed(&mut self, peer: N, subject: P, now: Instant) {
+        let quiet = self.quiet();
+        if !self.entries.contains_key(&peer) {
+            self.make_room(now);
+            self.entries.insert(
+                peer.clone(),
+                Entry {
+                    subject,
+                    want: false,
+                    timeouts: 0,
+                    pinging: None,
+                    silent: false,
+                    next: now,
+                    busy_until: None,
+                    last: now,
+                    seq: self.seq,
+                },
+            );
+            self.seq += 1;
+        }
+        self.answered(&peer, now);
+        if let Some(entry) = self.entries.get_mut(&peer) {
+            entry.busy_until = Some(now + quiet);
+        }
     }
 
     /// Send the ping a timeout asked for now (see [`Self::timed_out`]).
@@ -273,18 +320,36 @@ impl<N: Eq + Hash + Clone, P: Clone> Silence<N, P> {
         }
     }
 
-    /// `peer` answered an exchange (a response it signed or relayed): it is
-    /// not hung. An outstanding ping's outcome is then ignored.
-    pub fn answered(&mut self, peer: &N) {
-        self.entries.remove(peer);
+    /// `peer` answered an exchange at `now` (a response it signed or
+    /// relayed): it is not hung. An outstanding ping's outcome is then
+    /// ignored, and the peer is not pinged for [`Self::quiet`] after the
+    /// answer, as after an answered ping (Known issue 53): a busy peer
+    /// answers this node between the probes that join its running work and
+    /// time out, and each answer used to forget the peer, so the next such
+    /// timeout pinged it again. A peer that hangs right after answering is
+    /// found at most `quiet` later, the bound an answered ping already has.
+    /// Only a peer already tracked is kept (no entry per answer).
+    pub fn answered(&mut self, peer: &N, now: Instant) {
+        let quiet = self.quiet();
+        if let Some(entry) = self.entries.get_mut(peer) {
+            entry.want = false;
+            entry.timeouts = 0;
+            entry.pinging = None;
+            entry.silent = false;
+            entry.next = entry.next.max(now + quiet);
+            entry.busy_until = None;
+            entry.last = entry.last.max(now);
+        }
     }
 
     /// Whether `peer` left an exchange of this node unanswered and has
-    /// answered nothing since (or is silent), within [`SILENCE_TTL`]:
-    /// readers visit it after the page's other owners (Known issue 41).
+    /// answered nothing since (or is silent), within [`SILENCE_TTL`], or
+    /// shed this node within [`Self::quiet`] ([`Self::shed`]): readers visit
+    /// it after the page's other owners (Known issues 41 and 54).
     pub fn unanswered(&self, peer: &N, now: Instant) -> bool {
         self.entries.get(peer).is_some_and(|e| {
-            (e.silent || e.timeouts > 0) && now.saturating_duration_since(e.last) <= SILENCE_TTL
+            ((e.silent || e.timeouts > 0) && now.saturating_duration_since(e.last) <= SILENCE_TTL)
+                || e.busy_until.is_some_and(|until| now < until)
         })
     }
 
@@ -397,21 +462,94 @@ mod tests {
     fn any_answer_clears_and_voids_an_outstanding_ping() {
         let t = Instant::now();
         let mut s = silence();
-        assert!(s.timed_out(1, (), t, t + 2 * S, 1));
-        s.answered(&1);
+        // An untracked peer's answer adds no entry.
+        s.answered(&9, t);
         assert!(s.is_empty());
         assert!(s.timed_out(1, (), t, t + 2 * S, 1));
         s.start_ping(&1, t + 2 * S);
-        s.answered(&1);
+        s.answered(&1, t + 3 * S);
         // The peer answered meanwhile: a lost ping proves nothing.
         assert!(!s.ping_failed(&1, t + 4 * S));
         assert!(!s.silent(&1, t + 4 * S));
-        assert!(s.timed_out(1, (), t + 3 * S, t + 5 * S, 1));
-        s.start_ping(&1, t + 5 * S);
-        assert!(s.ping_failed(&1, t + 7 * S));
-        s.answered(&1);
-        assert!(!s.silent(&1, t + 7 * S));
-        assert!(s.is_empty());
+        assert!(!s.unanswered(&1, t + 4 * S));
+        // Past the quiet time after the answer, a timeout asks again.
+        assert!(s.timed_out(1, (), t + 6 * S, t + 8 * S, 1));
+        s.start_ping(&1, t + 8 * S);
+        assert!(s.ping_failed(&1, t + 10 * S));
+        // An answer clears a silent peer.
+        s.answered(&1, t + 10 * S);
+        assert!(!s.silent(&1, t + 10 * S));
+        assert!(s.silent_peers(t + 10 * S).next().is_none());
+        assert!(s.due_pings(t + 30 * S, 16).is_empty());
+    }
+
+    #[test]
+    fn a_peer_that_answered_recently_is_not_pinged_for_the_quiet_time() {
+        // Known issue 53: a busy peer answers some exchanges and leaves
+        // others (that joined its running work) unanswered; each answer
+        // used to forget it, so every later timeout pinged it again.
+        let t = Instant::now();
+        let mut s = silence();
+        assert!(s.timed_out(1, (), t, t + 2 * S, RANK0_TIMEOUTS));
+        s.start_ping(&1, t + 2 * S);
+        s.ping_answered(&1, t + 3 * S);
+        // It answers an exchange at 7 s: quiet until 12 s.
+        s.answered(&1, t + 7 * S);
+        assert!(!s.timed_out(1, (), t + 8 * S, t + 10 * S, RANK0_TIMEOUTS));
+        assert!(s.due_pings(t + 11 * S, 16).is_empty());
+        // Still demoted by the unanswered exchange meanwhile.
+        assert!(s.unanswered(&1, t + 11 * S));
+        // A peer that hangs after its last answer is pinged once the quiet
+        // time has passed, and found silent.
+        assert!(s.timed_out(1, (), t + 10 * S, t + 12 * S, RANK0_TIMEOUTS));
+        s.start_ping(&1, t + 12 * S);
+        assert!(s.ping_failed(&1, t + 14 * S));
+        assert!(s.silent(&1, t + 14 * S));
+        // An answer never shortens a quiet time already set.
+        s.ping_answered(&1, t + 20 * S);
+        s.answered(&1, t + 16 * S);
+        assert!(!s.timed_out(1, (), t + 22 * S, t + 24 * S, RANK0_TIMEOUTS));
+        assert!(s.timed_out(1, (), t + 23 * S, t + 25 * S, RANK0_TIMEOUTS));
+    }
+
+    #[test]
+    fn a_peer_that_shed_this_node_is_busy_for_the_quiet_time() {
+        // Known issue 54: an owner that signed `Overloaded` for this node is
+        // alive and busy. Readers visit it after the other owners until the
+        // quiet time passes or it answers something else; it is never
+        // pinged or silent for it.
+        let t = Instant::now();
+        let mut s = silence();
+        assert!(!s.unanswered(&1, t));
+        s.shed(1, (), t);
+        assert!(s.unanswered(&1, t + S));
+        assert!(!s.silent(&1, t + S));
+        assert!(s.due_pings(t + S, 16).is_empty());
+        assert!(s.unanswered(&1, t + 5 * S - S / 2));
+        assert!(!s.unanswered(&1, t + 5 * S));
+        // Another answer ends it at once.
+        s.shed(1, (), t + 10 * S);
+        s.answered(&1, t + 11 * S);
+        assert!(!s.unanswered(&1, t + 11 * S));
+        // A ping answer does not: it is answered at once, even when busy.
+        s.shed(1, (), t + 20 * S);
+        assert!(s.timed_out(2, (), t + 18 * S, t + 21 * S, RANK0_TIMEOUTS));
+        s.start_ping(&2, t + 21 * S);
+        s.ping_answered(&1, t + 22 * S);
+        assert!(s.unanswered(&1, t + 22 * S));
+        // A shed clears a silent verdict (the peer answered) and voids an
+        // outstanding ping.
+        assert!(s.ping_failed(&2, t + 23 * S));
+        assert!(s.silent(&2, t + 23 * S));
+        s.shed(2, (), t + 24 * S);
+        assert!(!s.silent(&2, t + 24 * S));
+        assert!(s.unanswered(&2, t + 24 * S));
+        assert!(!s.ping_failed(&2, t + 25 * S));
+        // Bounded like any entry.
+        for i in 10..20u8 {
+            s.shed(i, (), t + 30 * S);
+            assert!(s.len() <= 4);
+        }
     }
 
     #[test]
@@ -420,15 +558,15 @@ mod tests {
         let mut s = silence();
         assert!(!s.timed_out(1, (), t, t + S, LINK_TIMEOUTS));
         assert!(s.due_pings(t + S, 16).is_empty());
-        // Any answer in between starts the count again.
-        s.answered(&1);
-        assert!(!s.timed_out(1, (), t, t + 2 * S, LINK_TIMEOUTS));
-        assert!(s.timed_out(1, (), t, t + 3 * S, LINK_TIMEOUTS));
-        assert_eq!(s.due_pings(t + 3 * S, 16), vec![(1, ())]);
+        // Any answer in between starts the count again (and quiets it).
+        s.answered(&1, t + S);
+        assert!(!s.timed_out(1, (), t + 5 * S, t + 6 * S, LINK_TIMEOUTS));
+        assert!(s.timed_out(1, (), t + 5 * S, t + 7 * S, LINK_TIMEOUTS));
+        assert_eq!(s.due_pings(t + 7 * S, 16), vec![(1, ())]);
         // An answered ping also starts it again (after the quiet time).
-        s.ping_answered(&1, t + 3 * S);
-        assert!(!s.timed_out(1, (), t + 8 * S, t + 9 * S, LINK_TIMEOUTS));
-        assert!(s.timed_out(1, (), t + 8 * S, t + 10 * S, LINK_TIMEOUTS));
+        s.ping_answered(&1, t + 7 * S);
+        assert!(!s.timed_out(1, (), t + 12 * S, t + 13 * S, LINK_TIMEOUTS));
+        assert!(s.timed_out(1, (), t + 12 * S, t + 14 * S, LINK_TIMEOUTS));
         assert_eq!(RANK0_TIMEOUTS, 1);
     }
 
@@ -448,7 +586,7 @@ mod tests {
         assert!(!s.silent(&1, t + 3 * S));
         // Any answer clears it, and so does time.
         assert!(!s.unanswered(&1, t + 4 * S + SILENCE_TTL));
-        s.answered(&1);
+        s.answered(&1, t + 4 * S);
         assert!(!s.unanswered(&1, t + 4 * S));
         // An answered ping too.
         assert!(s.timed_out(2, (), t, t + 2 * S, 1));

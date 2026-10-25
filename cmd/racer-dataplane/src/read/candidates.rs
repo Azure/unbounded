@@ -1431,7 +1431,18 @@ impl CandidatePolicy {
                     {
                         // The destination itself, not a relay, shed the
                         // request (for example a hot-page owner): the walk
-                        // may ask the page's helper (Known issue 16).
+                        // may ask the page's helper (Known issue 16). It is
+                        // busy, not hung: a reader's later walks visit it
+                        // after the page's other owners for a while, so a
+                        // retry does not repeat the shed walk (Known issue
+                        // 54).
+                        if let PeerOperation::Page { page: id, .. } = &operation {
+                            self.peers
+                                .link_health()
+                                .silence_shed(destination, id.clone());
+                        } else {
+                            self.peers.link_health().silence_answered(destination);
+                        }
                         WalkOutcome::Shed
                     }
                     Ok(response)
@@ -1441,7 +1452,8 @@ impl CandidatePolicy {
                     {
                         // Rank 0 itself, not a relay, answered that its own
                         // acquisition failed: leave the next attempt to it
-                        // (Known issue 52).
+                        // (Known issue 52). It answered: it is not hung.
+                        self.peers.link_health().silence_answered(destination);
                         WalkOutcome::Failed
                     }
                     Ok(response) => {

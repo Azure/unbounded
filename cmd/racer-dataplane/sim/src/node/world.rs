@@ -4087,7 +4087,8 @@ impl NodeWorld {
             && let Some((sender, dest, ..)) = self.last_hops.remove(&mid)
         {
             // The destination answered before the requester gave up.
-            self.nodes[sender as usize].silence.answered(&dest);
+            let at = self.instant(self.now());
+            self.nodes[sender as usize].silence.answered(&dest, at);
         }
         let reply = if from == m.dest && reply == Reply::Response(ResponseKind::Overloaded) {
             Reply::Shed
@@ -4204,7 +4205,31 @@ impl NodeWorld {
             // The destination answered this node: it is not hung
             // (production `resolve_epoch_traced`, Known issue 41).
             let node = fill.node;
-            self.nodes[node as usize].silence.answered(&probe.dest);
+            let at = self.instant(now);
+            let shed = reply == Reply::Shed && self.config.node.shed_busy;
+            if reply == Reply::Shed {
+                // The same owner shed this node's request for the page
+                // within half a request timeout before (Known issue 54;
+                // measurement only, the last few sheds per node).
+                let window = self.config.node.read_timeout_ns / 2;
+                let recent = &mut self.nodes[node as usize].recent_sheds;
+                recent.retain(|&(.., t)| now.saturating_sub(t) < window);
+                if recent.iter().any(|&(d, p, _)| d == probe.dest && p == page) {
+                    self.metrics.incr("shed_repeats");
+                }
+                if recent.len() >= super::state::RECENT_SHEDS {
+                    recent.remove(0);
+                }
+                recent.push((probe.dest, page, now));
+            }
+            let silence = &mut self.nodes[node as usize].silence;
+            if shed {
+                // The destination itself shed the request: busy, not hung
+                // (production `resolve_epoch_traced`, Known issue 54).
+                silence.shed(probe.dest, page, at);
+            } else {
+                silence.answered(&probe.dest, at);
+            }
         }
         if reply == Reply::Response(ResponseKind::StaleMembership)
             && probe.hedge.is_none()
