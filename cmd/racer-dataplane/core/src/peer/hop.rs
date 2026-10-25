@@ -168,6 +168,22 @@ pub fn exchange_link_outcome(exchange: Exchange, admitted: bool) -> Option<LinkO
     }
 }
 
+/// Silence evidence (`super::silence`) from an exchange over the last link
+/// to its destination: `Some(true)` when the destination answered (a
+/// response or a body), `Some(false)` when the exchange ended unanswered by
+/// a time bound or the upstream's cancellation without a socket failure,
+/// and `None` otherwise (a failed connection is link health's evidence).
+pub fn silence_evidence(exchange: Exchange) -> Option<bool> {
+    match exchange {
+        Exchange::Complete { .. } | Exchange::Streaming => Some(true),
+        Exchange::Failed {
+            fault: Fault::DeadlineExceeded | Fault::Cancelled,
+            socket_failure: false,
+        } => Some(false),
+        Exchange::Failed { .. } => None,
+    }
+}
+
 /// Adaptive admission evidence for an exchange (`Requester::exchange`).
 /// A downstream overload is not attributable to the immediate peer.
 pub fn exchange_admission_outcome(exchange: Exchange) -> flow_control::AdaptiveOutcome {
@@ -321,5 +337,40 @@ mod tests {
             exchange_admission_outcome(Exchange::Streaming),
             A::Neutral
         ));
+    }
+
+    #[test]
+    fn silence_evidence_counts_answers_and_unanswered_exchanges_only() {
+        assert_eq!(
+            silence_evidence(Exchange::Complete { overloaded: true }),
+            Some(true)
+        );
+        assert_eq!(silence_evidence(Exchange::Streaming), Some(true));
+        for fault in [Fault::DeadlineExceeded, Fault::Cancelled] {
+            assert_eq!(
+                silence_evidence(Exchange::Failed {
+                    fault,
+                    socket_failure: false
+                }),
+                Some(false)
+            );
+            // A failed socket is link health's evidence.
+            assert_eq!(
+                silence_evidence(Exchange::Failed {
+                    fault,
+                    socket_failure: true
+                }),
+                None
+            );
+        }
+        for fault in [Fault::Unavailable, Fault::Io, Fault::Overloaded] {
+            assert_eq!(
+                silence_evidence(Exchange::Failed {
+                    fault,
+                    socket_failure: false
+                }),
+                None
+            );
+        }
     }
 }

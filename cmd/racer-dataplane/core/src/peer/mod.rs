@@ -6,8 +6,10 @@
 //! - [`validity`]: typed response-validity rules that the header-level checks
 //!   in the dataplane (`src/peer/forwarding.rs`) call.
 //! - [`subscriptions`]: the token-based subscription scheduler.
+//! - [`silence`]: next hops that accept requests and never answer them.
 
 pub mod hop;
+pub mod silence;
 pub mod subscriptions;
 pub mod validity;
 
