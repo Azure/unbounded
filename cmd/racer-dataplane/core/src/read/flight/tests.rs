@@ -665,3 +665,98 @@ fn handover_outcome_maps_only_caller_scope_failures() {
     );
     assert_eq!(handover_ceiling(d, now, true), now, "expired leader");
 }
+
+fn copy_waiter(joined: Result<JoinedCopy<u32, u32>>) -> u64 {
+    match joined.unwrap() {
+        JoinedCopy::Waiter(id) => id,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Known issue 31: a copy-only request joins the running acquisition like
+/// production `Flights::join_copy`, waits for its result, and never leads.
+#[test]
+fn copy_join_waits_for_the_running_acquisition_and_never_leads() {
+    let now = Instant::now();
+    let deadline = now + Duration::from_secs(10);
+    let mut t = table(FlightLimits::default(), now);
+    let mut wakes = Vec::new();
+    let p = page(0);
+    // No flight: a miss, and no flight is created.
+    assert_eq!(
+        t.join_copy(&p, now, deadline, &mut Unlimited, &mut wakes),
+        Ok(JoinedCopy::Miss)
+    );
+    assert!(t.is_empty());
+    let a = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
+    assert_eq!(t.poll(&p, a, now, 10, &mut wakes), Ok(Event::Lead));
+    let c = copy_waiter(t.join_copy(&p, now, deadline, &mut Unlimited, &mut wakes));
+    assert_eq!(t.waiters(&p), 2);
+    assert_eq!(t.poll(&p, c, now, 11, &mut wakes), Ok(Event::Pending));
+    t.finish(&p, a, Outcome::Published(Acquired::Plain(7)), &mut wakes)
+        .unwrap();
+    assert_eq!(wakes, [11]);
+    assert_eq!(t.poll(&p, c, now, 11, &mut wakes), Ok(Event::Complete(7)));
+    // Settled results are returned without registering.
+    assert_eq!(
+        t.join_copy(&p, now, deadline, &mut Unlimited, &mut wakes),
+        Ok(JoinedCopy::Complete(7))
+    );
+    t.detach(&p, a, &mut Unlimited, &mut wakes);
+    t.detach(&p, c, &mut Unlimited, &mut wakes);
+    assert!(t.is_empty());
+}
+
+#[test]
+fn copy_join_misses_failed_and_takes_partial_results() {
+    let now = Instant::now();
+    let deadline = now + Duration::from_secs(10);
+    let mut t = table(FlightLimits::default(), now);
+    let mut wakes = Vec::new();
+    let p = page(1);
+    let a = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
+    assert_eq!(t.poll(&p, a, now, 1, &mut wakes), Ok(Event::Lead));
+    t.finish(&p, a, Outcome::Published(Acquired::Cipher(3)), &mut wakes)
+        .unwrap();
+    assert_eq!(
+        t.join_copy(&p, now, deadline, &mut Unlimited, &mut wakes),
+        Ok(JoinedCopy::Partial(3))
+    );
+    let q = page(2);
+    let b = waiter(t.join(&q, now, deadline, 2, true, &mut Unlimited, &mut wakes));
+    assert_eq!(t.poll(&q, b, now, 2, &mut wakes), Ok(Event::Lead));
+    t.finish(&q, b, Outcome::Failed(Error::Unavailable), &mut wakes)
+        .unwrap();
+    assert_eq!(
+        t.join_copy(&q, now, deadline, &mut Unlimited, &mut wakes),
+        Ok(JoinedCopy::Miss)
+    );
+}
+
+#[test]
+fn copy_join_respects_the_waiter_cap_and_a_lost_leader_fails_copy_waiters() {
+    let now = Instant::now();
+    let deadline = now + Duration::from_secs(10);
+    let limits = FlightLimits {
+        waiters_per_flight: 2,
+        ..FlightLimits::default()
+    };
+    let mut t = table(limits, now);
+    let mut wakes = Vec::new();
+    let p = page(3);
+    let a = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
+    assert_eq!(t.poll(&p, a, now, 1, &mut wakes), Ok(Event::Lead));
+    let c = copy_waiter(t.join_copy(&p, now, deadline, &mut Unlimited, &mut wakes));
+    assert_eq!(
+        t.join_copy(&p, now, deadline, &mut Unlimited, &mut wakes),
+        Err(Error::Overloaded)
+    );
+    assert_eq!(t.poll(&p, c, now, 2, &mut wakes), Ok(Event::Pending));
+    // The leader goes away; the copy waiter cannot adopt or lead.
+    t.abandon(&p, a, &mut wakes);
+    t.detach(&p, a, &mut Unlimited, &mut wakes);
+    assert!(matches!(
+        t.poll(&p, c, now, 2, &mut wakes),
+        Ok(Event::Failed(_))
+    ));
+}

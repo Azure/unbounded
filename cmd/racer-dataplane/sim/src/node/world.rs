@@ -43,7 +43,7 @@ use racer_core::read::candidates::{
 };
 use racer_core::read::fanout::{fanout_helper, hot_page_bodies, is_helper, shed_hot_page};
 use racer_core::read::fill::{FailureKind, FillPlan, FillStep, Source, WalkResult};
-use racer_core::read::flight::{Event as FlightEvent, Joined};
+use racer_core::read::flight::{Event as FlightEvent, Joined, JoinedCopy};
 use racer_core::read::policy::{
     Persist, PersistFacts, peer_error, persist, recoverable, retention_eligible, retention_score,
 };
@@ -100,9 +100,11 @@ pub struct ClientRead {
 #[derive(Clone, Copy, Debug)]
 pub enum Want {
     Client(ClientRead),
-    /// A peer acquire request waiting at its destination.
+    /// A peer request waiting at its destination: an acquire, or a
+    /// copy-only request joined to a running acquisition (`copy_only`).
     Peer {
         msg: u64,
+        copy_only: bool,
     },
 }
 
@@ -210,7 +212,7 @@ impl Event {
                 8,
                 match want {
                     Want::Client(r) => r.page,
-                    Want::Peer { msg } => msg,
+                    Want::Peer { msg, .. } => msg,
                 },
                 result.is_ok().into(),
             ),
@@ -1476,7 +1478,7 @@ impl NodeWorld {
                     }
                 }
             }
-            Want::Peer { msg } => {
+            Want::Peer { msg, copy_only } => {
                 let Some(m) = self.msgs.get(&msg) else {
                     return;
                 };
@@ -1484,8 +1486,11 @@ impl NodeWorld {
                 match result {
                     Ok(_) => self.send_reply(msg, dest, Reply::Response(ResponseKind::Page), now),
                     Err(e) => {
-                        let requester = m.requester;
-                        self.note_hint(dest, page, requester, false);
+                        // Production notes a failed acquire, not a failed
+                        // copy-only wait (`Coordinator::serve_peer`).
+                        if !copy_only {
+                            self.note_hint(dest, page, m.requester, false);
+                        }
                         let reply = peer_error(e).map_or(Reply::Transport, Reply::Response);
                         self.send_reply(msg, dest, reply, now);
                     }
@@ -3075,7 +3080,7 @@ impl NodeWorld {
                         .fabric
                         .disk_read(t, dest, record_bytes(self.config.page_bytes));
                     self.send_reply(mid, dest, Reply::Response(ResponseKind::Page), read);
-                } else {
+                } else if !self.join_copy(mid, dest, page, t) {
                     self.metrics.incr("copy_only_misses");
                     self.note_hint(dest, page, requester, true);
                     self.send_reply(mid, dest, Reply::Response(ResponseKind::Miss), t);
@@ -3115,11 +3120,96 @@ impl NodeWorld {
                             },
                         );
                         self.metrics.incr("peer_acquires");
-                        self.want(dest, page, Want::Peer { msg: mid }, budget, false);
+                        self.want(
+                            dest,
+                            page,
+                            Want::Peer {
+                                msg: mid,
+                                copy_only: false,
+                            },
+                            budget,
+                            false,
+                        );
                     }
                 }
             }
         }
+    }
+
+    /// A copy-only request found no local copy: join the destination's
+    /// running acquisition of the page without acquisition rights, like
+    /// production `FillEngine::copy_only` (`Flights::join_copy`), and answer
+    /// with its result (Known issue 31). Returns false for a miss (no
+    /// acquisition to wait for), which the caller answers.
+    fn join_copy(&mut self, mid: u64, dest: u32, page: u64, t: Nanos) -> bool {
+        let now = self.now();
+        let deadline = {
+            let m = &self.msgs[&mid];
+            self.instant(m.deadline.min(now + self.config.node.serve_timeout_ns))
+        };
+        let w = self.ids.worker(page);
+        let page_id = self.ids.page(page);
+        let instant = self.instant(now);
+        let mut wakes = Vec::new();
+        let n = &mut self.nodes[dest as usize];
+        let incarnation = n.incarnation;
+        let worker = &mut n.workers[w as usize];
+        let mut admit = Admit {
+            quotas: &worker.quotas,
+            charges: &mut worker.charges,
+            ids: &self.ids,
+        };
+        let joined = worker
+            .flights
+            .join_copy(&page_id, instant, deadline, &mut admit, &mut wakes);
+        let handled = match joined {
+            Ok(JoinedCopy::Miss) => false,
+            Ok(JoinedCopy::Complete(_) | JoinedCopy::Partial(_)) => {
+                self.metrics.incr("copy_only_flight_hits");
+                self.send_reply(mid, dest, Reply::Response(ResponseKind::Page), t);
+                true
+            }
+            Err(e) => {
+                self.metrics.incr("copy_only_join_rejected");
+                let reply = peer_error(e).map_or(Reply::Transport, Reply::Response);
+                self.send_reply(mid, dest, reply, t);
+                true
+            }
+            Ok(JoinedCopy::Waiter(id)) => {
+                self.metrics.incr("copy_only_flight_joins");
+                self.next_id += 1;
+                let token = self.next_id;
+                let worker = &mut self.nodes[dest as usize].workers[w as usize];
+                let event = worker
+                    .flights
+                    .poll(&page_id, id, instant, token, &mut wakes);
+                self.tokens.insert(
+                    token,
+                    Waiting {
+                        node: dest,
+                        incarnation,
+                        worker: w,
+                        page,
+                        id,
+                        want: Want::Peer {
+                            msg: mid,
+                            copy_only: true,
+                        },
+                        eligible: false,
+                        budget: None,
+                        plaintext: false,
+                    },
+                );
+                if !matches!(event, Ok(FlightEvent::Pending)) {
+                    wakes.push(token);
+                }
+                true
+            }
+        };
+        for token in wakes {
+            self.wake(token);
+        }
+        handled
     }
 
     /// Send `reply` for `mid` from `from` back along the reverse route,

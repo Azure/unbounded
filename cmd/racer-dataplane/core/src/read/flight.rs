@@ -143,6 +143,20 @@ pub enum Joined<C, P> {
     Waiter(u64),
 }
 
+/// Result of a copy-only join ([`PageFlights::join_copy`]).
+#[derive(Debug, Eq, PartialEq)]
+pub enum JoinedCopy<C, P> {
+    /// No acquisition to wait for: no flight, or it failed or is draining.
+    Miss,
+    /// The page is already complete.
+    Complete(C),
+    /// The retained partial (ciphertext) result.
+    Partial(P),
+    /// Registered as copy waiter `id`: it never leads or adopts, and wakes
+    /// with the acquisition's result.
+    Waiter(u64),
+}
+
 /// What a waiter should do next.
 #[derive(Debug, Eq, PartialEq)]
 pub enum Event<C> {
@@ -263,6 +277,51 @@ impl<C: Clone, P: Clone, O, S: BuildHasher> PageFlights<C, P, O, S> {
             plaintext,
         );
         Ok(Joined::Waiter(id))
+    }
+
+    /// Join `page`'s running acquisition without acquisition rights, as a
+    /// copy-only peer request does (production `Flights::join_copy`, used by
+    /// `FillEngine::copy_only` after the memory, pending and disk lookups).
+    /// Never creates a flight. Gate order follows production: a settled
+    /// result first, then a failed or draining phase (a miss), the waiter
+    /// cap, and waiter admission.
+    pub fn join_copy(
+        &mut self,
+        page: &PageId,
+        now: Instant,
+        deadline: Instant,
+        admission: &mut impl FlightAdmission,
+        wakes: &mut Vec<Token>,
+    ) -> Result<JoinedCopy<C, P>> {
+        self.now.set(now);
+        let Some(flight) = self.flights.get_mut(page) else {
+            return Ok(JoinedCopy::Miss);
+        };
+        refresh(flight, self.split, self.now.get(), wakes);
+        if let Phase::Complete(result) = &flight.state.phase {
+            return Ok(JoinedCopy::Complete(result.clone()));
+        }
+        if let Some(partial) = &flight.state.partial {
+            return Ok(JoinedCopy::Partial(partial.clone()));
+        }
+        if matches!(flight.state.phase, Phase::Failed(_) | Phase::Draining(_)) {
+            return Ok(JoinedCopy::Miss);
+        }
+        waiter_cap_gate(flight.state.waiters.len(), &self.limits)?;
+        admission.waiter(page)?;
+        let id = self.next_id;
+        self.next_id += 1;
+        let flight = self.flights.get_mut(page).expect("present");
+        flight.state.register(
+            id,
+            Waiter {
+                deadline,
+                now: self.now.clone(),
+            },
+            false,
+            false,
+        );
+        Ok(JoinedCopy::Waiter(id))
     }
 
     /// Poll waiter `id` at `now`; parks `token` when nothing is ready.
