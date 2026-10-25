@@ -485,3 +485,32 @@ fn operation_errors_and_completed_operation_settles_published_result() {
     assert!(wakes.contains(&2));
     assert_eq!(t.poll(&p, b, now, 2, &mut wakes), Ok(Event::Complete(7)));
 }
+
+/// Production checks a waiter's scope before its recorded error: a rejected
+/// leader polled after its deadline reports `DeadlineExceeded`, before it
+/// reports `OriginRejected`, and a canceled waiter stays `Cancelled`.
+#[test]
+fn deadline_takes_precedence_over_recorded_rejection() {
+    let now = Instant::now();
+    let deadline = now + Duration::from_secs(1);
+    let mut t = table(FlightLimits::default(), now);
+    let mut wakes = Vec::new();
+    let p = page(23);
+    let a = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
+    let b = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
+    assert_eq!(t.poll(&p, a, now, 1, &mut wakes), Ok(Event::Lead));
+    t.reject(&p, a, Error::OriginRejected, &mut wakes).unwrap();
+    t.cancel(&p, b, &mut wakes);
+    assert_eq!(
+        t.poll(&p, a, now, 1, &mut wakes),
+        Ok(Event::Failed(Error::OriginRejected))
+    );
+    assert_eq!(
+        t.poll(&p, a, deadline, 1, &mut wakes),
+        Ok(Event::Failed(Error::DeadlineExceeded))
+    );
+    assert_eq!(
+        t.poll(&p, b, deadline, 2, &mut wakes),
+        Ok(Event::Failed(Error::Cancelled))
+    );
+}

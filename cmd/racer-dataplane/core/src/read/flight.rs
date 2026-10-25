@@ -281,6 +281,14 @@ impl<C: Clone, P: Clone, O, S: BuildHasher> PageFlights<C, P, O, S> {
         refresh(flight, split, now, wakes);
         let waiter = flight.state.waiters.get(&id).ok_or(Error::Internal)?;
         if let Some(error) = waiter.error {
+            // Production `AcquisitionWaiter::wait` checks the caller's scope
+            // (cancellation, then deadline) before a recorded error such as
+            // `OriginRejected`.
+            let error = if error != Error::Cancelled && now >= waiter.deadline() {
+                Error::DeadlineExceeded
+            } else {
+                error
+            };
             return Ok(Event::Failed(error));
         }
         match &flight.state.phase {
