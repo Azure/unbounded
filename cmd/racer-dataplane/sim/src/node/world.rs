@@ -3788,8 +3788,27 @@ impl NodeWorld {
             // it; and whether the page moved over one version or more.
             let sub = if !held(self) {
                 "origin_repeats_after_move_lost"
-            } else if fill.asked.iter().any(|&(dest, _)| dest == last.node) {
-                "origin_repeats_after_move_held_asked"
+            } else if let Some(&(_, a)) = fill
+                .asked
+                .iter()
+                .rev()
+                .find(|&&(dest, _)| dest == last.node)
+            {
+                match a {
+                    Asked::Miss => "origin_repeats_after_move_held_asked_miss",
+                    Asked::Copy => "origin_repeats_after_move_held_asked_copy",
+                    Asked::Unreachable(_) | Asked::Failed => {
+                        "origin_repeats_after_move_held_asked_unreachable"
+                    }
+                    Asked::Busy => "origin_repeats_after_move_held_asked_busy",
+                    Asked::Unfunded => "origin_repeats_after_move_held_asked_unfunded",
+                }
+            } else if fill.version == last.version + 1 && fill.handoff.contains(&last.node) {
+                "origin_repeats_after_move_held_unasked_target"
+            } else if fill.version == last.version + 1 && fill.cands.contains(&last.node) {
+                "origin_repeats_after_move_held_unasked_owner"
+            } else if fill.version == last.version {
+                "origin_repeats_after_move_held_unasked_same"
             } else if fill.version > last.version + 2 {
                 "origin_repeats_after_move_held_unasked_older"
             } else if fill.version == last.version + 2 {
