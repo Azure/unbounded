@@ -4478,7 +4478,7 @@ fn rank_zero_defers_readers_to_the_owner_it_missed() {
     let mut s = SuccessorFixture::new();
     s.f.scope = RequestScope::new(
         s.f.scope.request,
-        uring_runtime::environment::now() + Duration::from_secs(900),
+        uring_runtime::environment::now() + Duration::from_secs(60),
     )
     .unwrap();
     let (reader, successor, other) = (s.index(None), s.index(Some(1)), s.index(Some(2)));
@@ -4495,17 +4495,19 @@ fn rank_zero_defers_readers_to_the_owner_it_missed() {
         PeerResponse::Miss
     ));
     assert_eq!(s.count(Event::SuccessorHint), 2);
-    // A reader that comes back within `RETURN_WITHIN` is not deferred
-    // again (Known issue 58), so each deferral here is a new read.
+    // A deferral to an owner noted from its own miss is not remembered
+    // (Known issue 58 applies to offer senders only): the same reader is
+    // deferred each time.
     for i in 0..MAX_DEFERRALS {
         assert!(
             matches!(s.serve(reader, FetchMode::Acquire), PeerResponse::Miss),
             "deferral {i}"
         );
-        clock.advance(racer_core::read::successor::RETURN_WITHIN + Duration::from_secs(1));
     }
     assert_eq!(s.count(Event::SuccessorDeferral), u64::from(MAX_DEFERRALS));
     assert_eq!(s.f.origin.calls.get(), 0);
+    // The hinted owner's own fetch has had time to finish.
+    clock.advance(racer_core::read::successor::PROBE_AFTER);
     // The deferrals are spent: rank 0 acquires for the reader, asking rank
     // 1 copy-only first (it missed: its own fetch failed).
     s.peers
@@ -4535,13 +4537,13 @@ fn rank_zero_defers_readers_to_the_owner_it_missed() {
     assert_eq!(s.count(Event::SuccessorDeferral), u64::from(MAX_DEFERRALS));
 }
 
-/// Known issue 58: a reader deferred to the hinted owner that comes back
-/// for the page within `RETURN_WITHIN` did not get it there (the hinted
-/// owner may be down), so the deferring owner acquires for it instead of
-/// deferring it again (the window itself:
+/// Known issue 58: a reader deferred to an offer's sender (Known issue 51)
+/// that comes back for the page within `RETURN_WITHIN` did not get it
+/// there (the sender may have crashed since it offered), so the deferring
+/// owner acquires for it instead of deferring it again (the window itself:
 /// `racer_core::read::successor::tests::returning_requesters_are_not_deferred_again`).
 #[test]
-fn a_returning_reader_is_not_deferred_again() {
+fn a_reader_returning_from_an_offer_sender_is_not_deferred_again() {
     use crate::telemetry::Event;
     use racer_core::read::successor::PROBE_AFTER;
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
@@ -4554,30 +4556,38 @@ fn a_returning_reader_is_not_deferred_again() {
         uring_runtime::environment::now() + Duration::from_secs(600),
     )
     .unwrap();
-    let (reader, successor) = (s.index(None), s.index(Some(1)));
+    let (reader, successor, sender) = (s.index(None), s.index(Some(1)), s.index(Some(2)));
+    // Rank 1 missed here (a hint that defers readers), then rank 2 offered
+    // its copy: the reader is deferred to the newest later owner, rank 2.
     assert!(matches!(
         s.serve(successor, FetchMode::CopyOnly),
         PeerResponse::Miss
     ));
     assert!(matches!(
+        s.serve(sender, FetchMode::Offer),
+        PeerResponse::Miss
+    ));
+    assert_eq!(s.count(Event::OrphanOfferNoted), 1);
+    assert!(matches!(
         s.serve(reader, FetchMode::Acquire),
         PeerResponse::Miss
     ));
     assert_eq!(s.count(Event::SuccessorDeferral), 1);
-    // The reader's retry: rank 1 failed it. Rank 0 acquires, asking rank 1
-    // copy-only first (its successor probe), which misses here.
+    // The reader's retry: rank 2 failed it. Rank 0 acquires, asking its
+    // hinted owners copy-only first (both miss here), then origin.
     clock.advance(PROBE_AFTER);
-    s.peers
-        .replies
-        .borrow_mut()
-        .push_back((s.ordered[1].clone(), Reply::Miss));
+    for rank in [2, 1] {
+        s.peers
+            .replies
+            .borrow_mut()
+            .push_back((s.ordered[rank].clone(), Reply::Miss));
+    }
     assert!(matches!(
         s.serve(reader, FetchMode::Acquire),
         PeerResponse::Page { .. }
     ));
     assert_eq!(s.count(Event::SuccessorDeferral), 1);
     assert_eq!(s.f.origin.calls.get(), 1);
-    assert_eq!(s.peers.calls.borrow().len(), 1);
     // Holding the copy now, rank 0 serves it.
     assert!(matches!(
         s.serve(reader, FetchMode::Acquire),

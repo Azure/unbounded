@@ -77,12 +77,13 @@ pub const PROBE_AFTER: Duration = Duration::from_secs(2);
 /// Default bound on remembered pages per node.
 pub const HINT_CAPACITY: usize = 4096;
 
-/// How long a deferred requester is remembered ([`SuccessorHints::peek_for`]):
-/// a requester that comes back for the page within this window lost the
-/// deferral (the hinted owner failed it, for example because it crashed), so
-/// this node acquires instead of deferring it again. Twice the default
-/// request timeout (30 s): it covers a read's retries, while a new read of
-/// the page minutes later is deferred as usual (Known issue 58).
+/// How long a requester deferred to an offer's sender is remembered
+/// ([`SuccessorHints::peek_for`]): a requester that comes back for the page
+/// within this window lost the deferral (the sender failed it, for example
+/// because it crashed), so this node acquires instead of deferring it again.
+/// Twice the default request timeout (30 s): it covers a read's retries,
+/// while a new read of the page minutes later is deferred as usual (Known
+/// issue 58).
 pub const RETURN_WITHIN: Duration = Duration::from_secs(60);
 
 struct Entry<N> {
@@ -97,10 +98,13 @@ struct Entry<N> {
     /// The newest node was noted from an offer: it holds the copy, so
     /// [`PROBE_AFTER`] does not apply (Known issue 51).
     offered: bool,
-    /// Requesters deferred on this entry and when, newest last, at most
-    /// [`MAX_DEFERRALS`] ([`SuccessorHints::charge`]). Kept when the hint is
-    /// renewed: the requester's return says the deferral failed it, whoever
-    /// noted the hint since.
+    /// The nodes in `nodes` noted by an offer ([`SuccessorHints::note_offer`])
+    /// and not since by [`SuccessorHints::note`].
+    senders: Vec<N>,
+    /// Requesters deferred to an offer's sender on this entry and when,
+    /// newest last, at most [`MAX_DEFERRALS`] ([`SuccessorHints::charge`]).
+    /// Kept when the hint is renewed: the requester's return says the
+    /// deferral failed it, whoever noted the hint since.
     deferred: Vec<(N, Instant)>,
 }
 
@@ -137,10 +141,13 @@ impl<K: Eq + Hash + Clone, N: Clone + PartialEq> SuccessorHints<K, N> {
     pub fn note(&mut self, key: K, node: N, now: Instant) {
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.nodes.retain(|n| *n != node);
+            entry.senders.retain(|n| *n != node);
             entry.nodes.push(node);
             if entry.nodes.len() > HINTS_PER_PAGE {
                 entry.nodes.remove(0);
             }
+            let nodes = &entry.nodes;
+            entry.senders.retain(|n| nodes.contains(n));
             entry.at = now;
             entry.uses = 0;
             entry.max = u32::MAX;
@@ -167,6 +174,7 @@ impl<K: Eq + Hash + Clone, N: Clone + PartialEq> SuccessorHints<K, N> {
                 max: u32::MAX,
                 probed: false,
                 offered: false,
+                senders: Vec::new(),
                 deferred: Vec::new(),
             },
         );
@@ -183,10 +191,11 @@ impl<K: Eq + Hash + Clone, N: Clone + PartialEq> SuccessorHints<K, N> {
     /// returned a 503 when offers deferred readers).
     pub fn note_offer(&mut self, key: K, node: N, now: Instant) {
         let kept = self.entries.get(&key).map(|e| (e.uses, e.max));
-        self.note(key.clone(), node, now);
+        self.note(key.clone(), node.clone(), now);
         if let Some(entry) = self.entries.get_mut(&key) {
             (entry.uses, entry.max) = kept.unwrap_or((0, 0));
             entry.offered = true;
+            entry.senders.push(node);
         }
     }
 
@@ -232,13 +241,20 @@ impl<K: Eq + Hash + Clone, N: Clone + PartialEq> SuccessorHints<K, N> {
     }
 
     /// [`Self::peek`] for a deferral of `requester`: nothing if this node
-    /// deferred `requester` for `key` within [`RETURN_WITHIN`] (Known issue
-    /// 58). A deferral answers `Miss` and the requester asks the hinted
-    /// owner next; a requester that comes back did not get the page there.
-    /// The hinted owner may be down: an offer's sender (Known issue 51)
-    /// that crashed since, while this node, reached because rank 0 failed
-    /// the reader, is the one owner left that would fetch. Deferring the
-    /// returning requester again failed every retry of its read.
+    /// deferred `requester` for `key` to an offer's sender within
+    /// [`RETURN_WITHIN`] (Known issue 58). A deferral answers `Miss` and the
+    /// requester asks the hinted owner next; a requester that comes back did
+    /// not get the page there. An offer's sender (Known issue 51) may have
+    /// crashed since it offered, while this node, reached because rank 0
+    /// failed the reader, is the one owner left that would fetch; deferring
+    /// the returning requester again failed every retry of its read.
+    ///
+    /// Deferrals to an owner noted from its own miss are not remembered: it
+    /// asked this node moments before and is fetching, and a requester that
+    /// comes back was most likely shed by it while busy. Acquiring for such
+    /// requesters failed more reads in 5k `zipf` (14 to 18 and 16 to 22 on
+    /// seeds 2 and 3): the returning reader reaches this owner last, with
+    /// too few credits to fetch.
     pub fn peek_for(&self, key: &K, requester: &N, now: Instant) -> Vec<N> {
         let returned = self.entries.get(key).is_some_and(|e| {
             e.deferred.iter().any(|(n, at)| {
@@ -251,14 +267,18 @@ impl<K: Eq + Hash + Clone, N: Clone + PartialEq> SuccessorHints<K, N> {
         self.peek(key, now)
     }
 
-    /// Count one deferral of `requester` on `key`'s hints; [`Self::peek`]
-    /// stops returning them after `max` (they stay for [`Self::probe`] until
-    /// they expire or are evicted), and [`Self::peek_for`] returns nothing
-    /// for `requester` within [`RETURN_WITHIN`].
-    pub fn charge(&mut self, key: &K, requester: N, max: u32, now: Instant) {
+    /// Count one deferral of `requester` to `to` on `key`'s hints;
+    /// [`Self::peek`] stops returning them after `max` (they stay for
+    /// [`Self::probe`] until they expire or are evicted). If `to` is an
+    /// offer's sender, [`Self::peek_for`] returns nothing for `requester`
+    /// within [`RETURN_WITHIN`].
+    pub fn charge(&mut self, key: &K, requester: N, to: &N, max: u32, now: Instant) {
         if let Some(entry) = self.entries.get_mut(key) {
             entry.uses += 1;
             entry.max = max;
+            if !entry.senders.contains(to) {
+                return;
+            }
             entry.deferred.retain(|(n, _)| *n != requester);
             entry.deferred.push((requester, now));
             if entry.deferred.len() > MAX_DEFERRALS as usize {
@@ -420,10 +440,10 @@ mod tests {
         assert!(h.peek(&1, now).is_empty());
         assert_eq!(h.probe(&1, now + PROBE_AFTER), [7]);
         h.note(2u64, 8u32, now);
-        h.charge(&2, 100, 2, now);
+        h.charge(&2, 100, &0, 2, now);
         h.note_offer(2, 9, now);
         assert_eq!(h.peek(&2, now), [8, 9]);
-        h.charge(&2, 100, 2, now);
+        h.charge(&2, 100, &0, 2, now);
         assert!(h.peek(&2, now).is_empty());
         assert_eq!(h.probe(&2, now + PROBE_AFTER), [8, 9]);
     }
@@ -462,51 +482,62 @@ mod tests {
         let now = Instant::now();
         let mut h = SuccessorHints::new(8, HINT_TTL);
         h.note(1u64, 7u32, now);
-        h.charge(&1, 100, 2, now);
+        h.charge(&1, 100, &0, 2, now);
         assert_eq!(h.peek(&1, now), [7]);
         h.note(1, 7, now);
-        h.charge(&1, 100, 2, now);
+        h.charge(&1, 100, &0, 2, now);
         assert_eq!(h.peek(&1, now), [7]);
-        h.charge(&1, 100, 2, now);
+        h.charge(&1, 100, &0, 2, now);
         assert!(h.peek(&1, now).is_empty());
         // The hint stays for this node's own successor probe.
         assert_eq!(h.len(), 1);
         assert_eq!(h.probe(&1, now + PROBE_AFTER), [7]);
         // Charging an absent key is a no-op.
-        h.charge(&2, 100, 1, now);
+        h.charge(&2, 100, &0, 1, now);
         assert_eq!(h.len(), 1);
     }
 
-    /// Known issue 58: a requester this node deferred that comes back
-    /// within [`RETURN_WITHIN`] is not deferred again (the hinted owner
-    /// failed it); other requesters still are, renewals keep the memory,
-    /// and it lapses after the window.
+    /// Known issue 58: a requester this node deferred to an offer's sender
+    /// that comes back within [`RETURN_WITHIN`] is not deferred again (the
+    /// sender failed it); other requesters still are, renewals keep the
+    /// memory, and it lapses after the window. Deferrals to an owner noted
+    /// from its own miss are not remembered.
     #[test]
     fn returning_requesters_are_not_deferred_again() {
         let now = Instant::now();
         let mut h = SuccessorHints::new(8, HINT_TTL);
         h.note(1u64, 7u32, now);
+        h.charge(&1, 100, &7, MAX_DEFERRALS, now);
         assert_eq!(h.peek_for(&1, &100, now), [7]);
-        h.charge(&1, 100, MAX_DEFERRALS, now);
+        h.note_offer(1, 9, now);
+        assert_eq!(h.peek_for(&1, &100, now), [7, 9]);
+        h.charge(&1, 100, &9, MAX_DEFERRALS, now);
         assert!(h.peek_for(&1, &100, now).is_empty());
         assert!(h.peek_for(&1, &100, now + RETURN_WITHIN).is_empty());
-        assert_eq!(h.peek_for(&1, &101, now), [7]);
-        // Renewed by a note or an offer: the returning requester still
-        // gets no deferral.
-        h.note(1, 8, now);
-        h.note_offer(1, 9, now);
+        assert_eq!(h.peek_for(&1, &101, now), [7, 9]);
+        // Renewed by a note: the returning requester still gets no
+        // deferral, and the renewed node is no longer a sender.
+        h.note(1, 9, now);
         assert!(h.peek_for(&1, &100, now).is_empty());
-        assert_eq!(h.peek_for(&1, &101, now), [8, 9]);
+        h.charge(&1, 101, &9, MAX_DEFERRALS, now);
+        assert_eq!(h.peek_for(&1, &101, now), [7, 9]);
         // After the window it is an ordinary requester again.
         let later = now + RETURN_WITHIN + Duration::from_secs(1);
-        assert_eq!(h.peek_for(&1, &100, later), [8, 9]);
+        assert_eq!(h.peek_for(&1, &100, later), [7, 9]);
         // Bounded: the oldest deferred requester is forgotten first.
+        h.note_offer(1, 8, now);
         for r in 0..=MAX_DEFERRALS {
-            h.note(1, 8, now);
-            h.charge(&1, 200 + r, MAX_DEFERRALS, now);
+            h.note(1, 9, now);
+            h.charge(&1, 200 + r, &8, MAX_DEFERRALS, now);
         }
-        assert_eq!(h.peek_for(&1, &200, now), [9, 8]);
+        assert_eq!(h.peek_for(&1, &200, now), [8, 9]);
         assert!(h.peek_for(&1, &(200 + MAX_DEFERRALS), now).is_empty());
+        // A sender pushed out of the hint is no longer one.
+        h.note(1, 10, now);
+        h.note(1, 11, now);
+        h.note_offer(1, 12, now);
+        h.charge(&1, 300, &11, MAX_DEFERRALS, now);
+        assert_eq!(h.peek_for(&1, &300, now), [11, 12]);
     }
 
     #[test]

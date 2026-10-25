@@ -215,9 +215,9 @@ impl Coordinator {
             return false;
         };
         let local = &self.fill.dependencies.candidates.node;
-        if successor_deferral(hints, local, requester, &owners).is_none() {
+        let Some(to) = successor_deferral(hints, local, requester, &owners) else {
             return false;
-        }
+        };
         self.fill
             .dependencies
             .candidates
@@ -226,6 +226,7 @@ impl Coordinator {
             .charge(
                 page,
                 requester.clone(),
+                &to,
                 MAX_DEFERRALS,
                 uring_runtime::environment::now(),
             );
