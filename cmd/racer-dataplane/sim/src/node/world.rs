@@ -68,7 +68,7 @@ use racer_core::read::walk::{
     Outcome, PREVIOUS_MEMBERSHIP_WITHIN, Probe, Rank0State, RemainingWalk, RouteMode, StaleAction,
     Step, WalkConfig, demoted_targets_from, granted_budget, granted_prefix, handoff_targets,
     hedge_budgets, hedge_eligible, hedge_fallback, lineage_counts, lineage_targets, merge_handoff,
-    plan_attempt, same_rank_previous, stale_action, transport_outcome,
+    owner_funding_min, plan_attempt, same_rank_previous, stale_action, transport_outcome,
 };
 use racer_core::route::MAX_LINKS;
 use racer_core::time::SplitMix64;
@@ -343,6 +343,8 @@ enum Walking {
 }
 
 struct Fill {
+    /// Attempts the fill started with (inherited, for a peer's Acquire).
+    initial_attempts: u32,
     node: u32,
     incarnation: u32,
     worker: u8,
@@ -1905,6 +1907,7 @@ impl NodeWorld {
         eligible: bool,
     ) {
         let id = self.fresh();
+        let initial_attempts = budget.remaining_attempts();
         let quotas = &self.nodes[node as usize].workers[w as usize].quotas;
         let mut reservation = Vec::with_capacity(2);
         let mut failed = None;
@@ -1958,6 +1961,7 @@ impl NodeWorld {
         self.fills.insert(
             id,
             Fill {
+                initial_attempts,
                 node,
                 incarnation: self.nodes[node as usize].incarnation,
                 worker: w,
@@ -3121,7 +3125,19 @@ impl NodeWorld {
             },
         );
         let plan = match plan {
-            Ok(plan) => plan,
+            Ok(plan) => {
+                if fill.rank.is_none()
+                    && probe.route == RouteMode::FundedRoute
+                    && probe.mode == Mode::Acquire
+                    && plan.links < MAX_LINKS
+                {
+                    // A non-owner funds an out-of-order owner with less than
+                    // a full route: it was reached by a funded route itself
+                    // (Known issue 57, `walk::funded_links`).
+                    self.metrics.incr("forwarded_funded_routes");
+                }
+                plan
+            }
             Err(e) => {
                 fill.asked.push((dest, Asked::Unfunded));
                 return match transport_outcome(e) {
@@ -4869,6 +4885,14 @@ impl NodeWorld {
         let scope = fill.scope;
         if let Err(e) = fill.budget.begin_attempt(instant, scope) {
             self.metrics.incr("origin_unfunded");
+            // Started with fewer credits than its predecessor probes and
+            // its origin attempt need (Known issue 57), or spent them.
+            self.metrics
+                .incr(if fill.initial_attempts < owner_funding_min(rank) - 1 {
+                    "origin_unfunded_short"
+                } else {
+                    "origin_unfunded_spent"
+                });
             return self.fail_walk(id, e);
         }
         let fill = self.fills.get_mut(&id).expect("present");
