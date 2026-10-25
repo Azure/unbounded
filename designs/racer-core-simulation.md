@@ -843,8 +843,8 @@ Verified against the code at the start of this work.
    would have fetched: deferrals 890 to 1,600 and reads failed while members were crashed 1 to
    56 (seed 1). Not deferring to offer senders above rank 0 restores 293 failed reads and 890
    deferrals at 50k, but fails the DST churn oracle (non-native seed 11 returns a 502 in
-   `cache_obligations`, where rank 1's deferral to the offer's sender is how a pinned read finds
-   the cached copy with origin offline), so it is not applied. Open: needs a deferral rule
+   `cache_obligations`: with origin offline an owner fetched instead of deferring and origin
+   answered 404 for the pinned object), so it is not applied. Open: needs a deferral rule
    that skips senders likely down without losing that copy (round 4, offer2, wave 6). Not the
    issue 52 hold (`rank0_failure_hold` 0: 329 failed) nor cut groups (`offer_cut_groups` 0:
    374); `offer_predecessors` 0: 273.
@@ -6064,9 +6064,10 @@ fetches after them.
 
 Not fixed. Excluding offer senders from deferrals above rank 0 (rank 0 keeps them) restores
 the base numbers (293 against 266) but fails the DST churn oracle on non-native seed 11: in
-`cache_obligations` origin is offline and a pinned read must be served from a cache; rank 1's
-deferral to the offer's sender is how the read found the copy, and without it rank 1 fetches,
-origin answers 404 for the pinned object, and the client gets 502. Excluding senders at every
+`cache_obligations` origin is offline and a pinned read must be served from a cache. With the
+change an owner fetched from origin, which answered 404 for the pinned object
+(`object-wire/src/origin.rs` maps a pinned 404 to `BadGateway`), and the client got 502.
+Inferred, not traced: the deferral to the offer's sender is how the base run found the copy. Excluding senders at every
 rank fails the same way. Not renewing the deferral TTL on offers (committed as 247734245 and
 reverted in 49615fead) changed nothing. A fix needs a rule that skips senders likely to be down
 (for example ones this node's link health marks failed) while keeping the deferral to a live
