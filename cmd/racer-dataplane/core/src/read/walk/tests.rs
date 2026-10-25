@@ -1757,6 +1757,7 @@ fn delegated_rank_zero_asks_granted_lineage_targets_and_keeps_origin_credit() {
     });
     assert_eq!(probes.len(), 2);
     assert_eq!(end, End::Copy);
+}
 
 /// Known issue 36: a further ask of a destination that is behind must leave
 /// attempts for every later visit's minimum and a full route share of links
