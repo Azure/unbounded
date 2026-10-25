@@ -9,6 +9,13 @@ use std::{cell::RefCell, collections::BTreeMap, future::Future, rc::Rc, task::Po
 /// Most owners returned for one key.
 pub const REPLICAS: usize = 3;
 
+/// Scores kept per slot: the [`REPLICAS`] owners plus the best members
+/// ranked below them ([`Placement::demoted`]). A member that later arrivals
+/// pushed out of the owners keeps the copy it fetched while it was one, so
+/// owners can ask it before origin (Known issue 34). Every retained score
+/// follows the same incremental update rule, so the extra ranks are exact.
+pub const RANKED_DEPTH: usize = REPLICAS + 2;
+
 /// Number of hash bits used to pick a key's slot.
 pub const SLOT_BITS: u32 = 20;
 
@@ -93,6 +100,15 @@ pub trait Rankings {
         slot: u32,
     ) -> Vec<usize>;
 
+    /// Member positions ranked just below the owners, best first, at most
+    /// [`RANKED_DEPTH`] - [`REPLICAS`]. Only called on complete entries.
+    fn demoted<M: Member>(
+        &self,
+        entry: &Self::Entry,
+        membership: &Membership<M>,
+        slot: u32,
+    ) -> Vec<usize>;
+
     /// True if `matches` accepts one of the first three owners. Only called on
     /// complete entries.
     fn owner<M: Member>(
@@ -155,6 +171,11 @@ impl Rankings for Scored {
     #[inline]
     fn candidates<M: Member>(&self, entry: &Ranking, _: &Membership<M>, _: u32) -> Vec<usize> {
         entry.candidates()
+    }
+
+    #[inline]
+    fn demoted<M: Member>(&self, entry: &Ranking, _: &Membership<M>, _: u32) -> Vec<usize> {
+        entry.demoted()
     }
 
     #[inline]
@@ -301,6 +322,15 @@ impl Rankings for Phantom {
         slot: u32,
     ) -> Vec<usize> {
         self.with(membership, slot, |result| result.ranking.candidates())
+    }
+
+    fn demoted<M: Member>(
+        &self,
+        _: &PhantomEntry,
+        membership: &Membership<M>,
+        slot: u32,
+    ) -> Vec<usize> {
+        self.with(membership, slot, |result| result.ranking.demoted())
     }
 
     fn owner<M: Member>(
@@ -458,14 +488,15 @@ impl<E: RankingEntry> RankingCache<E> {
     }
 }
 
-/// The best three scores for one slot, finished or still in progress.
-/// Requests for the same slot share it.
+/// The best [`RANKED_DEPTH`] scores for one slot, finished or still in
+/// progress. The first [`REPLICAS`] are the owners. Requests for the same
+/// slot share it.
 pub struct Ranking {
     /// Next member to score. Equals the member count when done.
     cursor: usize,
 
-    /// Up to three best scores, plus room for one more so inserts never
-    /// reallocate.
+    /// Up to [`RANKED_DEPTH`] best scores, plus room for one more so inserts
+    /// never reallocate.
     best: Vec<Score>,
 
     /// CLOCK "recently used" bit. Set whenever a request finds this entry.
@@ -485,7 +516,7 @@ impl Default for Ranking {
     fn default() -> Self {
         Self {
             cursor: 0,
-            best: Vec::with_capacity(REPLICAS + 1),
+            best: Vec::with_capacity(RANKED_DEPTH + 1),
             referenced: true,
             #[cfg(test)]
             scored: 0,
@@ -576,12 +607,12 @@ impl Ranking {
         }
     }
 
-    /// Add a score, keeping only the best three.
+    /// Add a score, keeping only the best [`RANKED_DEPTH`].
     fn insert(&mut self, score: Score) {
         let position = self.best.partition_point(|old| old.compare(&score).is_lt());
-        if position < REPLICAS {
+        if position < RANKED_DEPTH {
             self.best.insert(position, score);
-            self.best.truncate(REPLICAS);
+            self.best.truncate(RANKED_DEPTH);
         }
     }
 
@@ -590,7 +621,8 @@ impl Ranking {
     ///
     /// Returns `None` when that could give a wrong answer and a full rescore is
     /// needed: there is no change list, the old ranking is unfinished, or a
-    /// winner left or lost weight (an unseen fourth member could move up).
+    /// retained score's member left or lost weight (an unseen member could
+    /// move up).
     fn updated<M: Member>(&self, membership: &Membership<M>, slot: u32) -> Option<Self> {
         let delta = membership.delta.as_ref()?;
         debug_assert!(delta.changes.len() <= MAX_INCREMENTAL_CHANGES);
@@ -608,7 +640,7 @@ impl Ranking {
                 .find(|change| change.old_position() == Some(old.node))
             {
                 let new = change.new_position()?;
-                // A worse retained winner may expose an unretained fourth node.
+                // A worse retained score may expose an unretained node.
                 if membership.weight(new).get() < old.shares {
                     return None;
                 }
@@ -657,9 +689,22 @@ impl Ranking {
         self.cursor = end;
     }
 
-    /// Return the ranked member positions, best first.
+    /// Return the owners' member positions, best first.
     fn candidates(&self) -> Vec<usize> {
-        self.best.iter().map(|score| score.node).collect()
+        self.best
+            .iter()
+            .take(REPLICAS)
+            .map(|score| score.node)
+            .collect()
+    }
+
+    /// Return the positions ranked just below the owners, best first.
+    fn demoted(&self) -> Vec<usize> {
+        self.best
+            .iter()
+            .skip(REPLICAS)
+            .map(|score| score.node)
+            .collect()
     }
 }
 
@@ -716,6 +761,23 @@ impl<R: Rankings> Placement<R> {
         self.rankings
             .complete(&ranking, membership)
             .then(|| self.rankings.candidates(&ranking, membership, slot))
+    }
+
+    /// Completed cached members ranked just below the owners, best first (at
+    /// most [`RANKED_DEPTH`] - [`REPLICAS`]), without scoring, admission,
+    /// eviction, or refreshing CLOCK. Partial and obsolete rankings are
+    /// misses. Owners ask these copy-only before origin: a member pushed out
+    /// of the owners by later arrivals may still hold a copy (Known issue
+    /// 34).
+    #[must_use]
+    pub fn demoted<M: Member>(&self, membership: &Membership<M>, key: &[u8]) -> Option<Vec<usize>> {
+        let cache = self.cache.borrow();
+        let slot = slot::<M>(key);
+        let ranking = cache.entries.get(&(membership.identity(), slot))?;
+        let ranking = ranking.borrow();
+        self.rankings
+            .complete(&ranking, membership)
+            .then(|| self.rankings.demoted(&ranking, membership, slot))
     }
 
     /// Test the first three cached owners without allocating a candidate list.
@@ -981,6 +1043,43 @@ mod tests {
         let disabled = Placement::new(0);
         disabled.rank(&members, key);
         assert!(!disabled.is_owner(&members, key, |_| true));
+    }
+
+    /// Members ranked just below the owners come from complete cached
+    /// rankings only, match full scoring, and agree between `Scored` and
+    /// `Phantom` (Known issue 34).
+    #[test]
+    fn demoted_lists_the_next_ranks_from_complete_cached_rankings_only() {
+        let members = membership(1000);
+        let key = b"demoted";
+        let placement = Placement::new(4);
+        assert_eq!(placement.demoted(&members, key), None);
+        let mut pending = Box::pin(placement.rank_async(&members, key));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(pending.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(placement.demoted(&members, key), None, "partial");
+        let owners = futures::executor::block_on(pending).unwrap();
+        let demoted = placement.demoted(&members, key).unwrap();
+        assert_eq!(owners.len(), REPLICAS);
+        assert_eq!(demoted.len(), RANKED_DEPTH - REPLICAS);
+        let mut scoring = Ranking::default();
+        let slot = slot::<TestMember>(key);
+        let mut all: Vec<_> = (0..members.members().len())
+            .map(|index| scoring.score(&members, slot, index))
+            .collect();
+        all.sort_by(Score::compare);
+        let order: Vec<_> = all.iter().map(|score| score.node).collect();
+        assert_eq!(owners, order[..REPLICAS]);
+        assert_eq!(demoted, order[REPLICAS..RANKED_DEPTH]);
+        assert_eq!(placement.demoted(&membership(1001), key), None, "obsolete");
+        // Small memberships list only who exists.
+        let small = membership(4);
+        placement.rank(&small, key);
+        assert_eq!(placement.demoted(&small, key).unwrap().len(), 1);
+        let phantom = Placement::with_rankings(4, Phantom::new());
+        phantom.rank(&members, key);
+        assert_eq!(phantom.demoted(&members, key), Some(demoted));
+        assert_eq!(Placement::new(0).demoted(&members, key), None, "uncached");
     }
 
     use std::{num::NonZeroU32, task::Context};
@@ -1423,7 +1522,7 @@ mod tests {
                 oracle.advance(&next, slot, usize::MAX);
                 assert_eq!(ranking.candidates(), oracle.candidates());
                 if ranking.incremental {
-                    assert!(ranking.scored <= MAX_INCREMENTAL_CHANGES + REPLICAS);
+                    assert!(ranking.scored <= MAX_INCREMENTAL_CHANGES + RANKED_DEPTH);
                 } else {
                     cold_slots += 1;
                     assert_eq!(ranking.scored, next.members().len());
@@ -1733,6 +1832,13 @@ mod tests {
                 all.sort_by(Score::compare);
                 let expected: Vec<_> = all.iter().take(REPLICAS).map(|score| score.node).collect();
                 assert_eq!(updated.candidates(), expected);
+                let below: Vec<_> = all
+                    .iter()
+                    .skip(REPLICAS)
+                    .take(RANKED_DEPTH - REPLICAS)
+                    .map(|score| score.node)
+                    .collect();
+                assert_eq!(updated.demoted(), below);
             }
         }
         assert!(fast > 0 && cold > 0, "fast={fast}, cold={cold}");
@@ -1767,7 +1873,7 @@ mod tests {
         use std::mem::size_of;
         let mut ranking = Ranking::default();
         ranking.advance(&membership(100), 0, usize::MAX);
-        assert_eq!(ranking.best.capacity(), REPLICAS + 1);
+        assert_eq!(ranking.best.capacity(), RANKED_DEPTH + 1);
         // Explicit standard-library layout assumptions, not an allocator contract.
         let map_node = 11 * size_of::<(CacheKey, Rc<RefCell<Ranking>>)>()
             + 12 * size_of::<usize>()

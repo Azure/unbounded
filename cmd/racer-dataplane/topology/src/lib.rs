@@ -137,8 +137,8 @@ pub use paths::{
 };
 
 pub use placement::{
-    Maintenance, Phantom, PhantomEntry, Placement, REPLICAS, Ranking, RankingEntry, Rankings,
-    SLOT_BITS, SLOT_COUNT, Scored, slot,
+    Maintenance, Phantom, PhantomEntry, Placement, RANKED_DEPTH, REPLICAS, Ranking, RankingEntry,
+    Rankings, SLOT_BITS, SLOT_COUNT, Scored, slot,
 };
 
 use sha2::Digest;
