@@ -649,3 +649,26 @@ fn expired_leaders_drain_before_a_new_fill() {
     assert!(counter(&report, "flight_stale_finishes") > 0, "{report}");
     assert_eq!(counter(&report, "flight_unexpected_lead"), 0);
 }
+
+/// Known issue 151: production cancels an expired fill's origin exchange at
+/// the leader's deadline, which frees the origin connection and bandwidth.
+/// The simulator cancels it too, so no origin answer arrives after a fill's
+/// scope, and the canceled bodies leave bandwidth to later requests.
+#[test]
+fn expired_fills_cancel_their_origin_request() {
+    let mut config = quiet(64);
+    config.origin_bps = 1 << 20;
+    config.duration_ns = 12 * SECONDS;
+    config.storms = (0..4)
+        .map(|i| Storm {
+            at_ns: i * 3 * SECONDS,
+            object: 1,
+            nodes: 64,
+            window_ns: 100 * MILLIS,
+        })
+        .collect();
+    let (_, report) = run(config, 5);
+    assert!(counter(&report, "flight_stale_finishes") > 0, "{report}");
+    assert!(counter(&report, "origin_canceled") > 0, "{report}");
+    assert_eq!(counter(&report, "flight_unexpected_lead"), 0);
+}

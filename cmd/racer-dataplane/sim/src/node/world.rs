@@ -68,7 +68,7 @@ use crate::config::Config;
 use crate::engine::{Engine, MILLIS, Nanos, Role, SECONDS, Streams, mix};
 use crate::faults::{Fault as SimFault, Partitions, origin_errors_at};
 use crate::report::{Invariants, Metrics, peak_rss_bytes};
-use crate::resources::{Fabric, Origin, OriginOutcome};
+use crate::resources::{Fabric, Origin, OriginHandle, OriginOutcome};
 use crate::scenario::{Fixed, MAX_ATTEMPTS};
 use crate::workload::{Poisson, Reads, page_id};
 
@@ -162,6 +162,14 @@ pub enum Event {
         node: u32,
         factor: u8,
     },
+    /// A fill's scope expired while its origin request was outstanding:
+    /// cancel it like production's fill driver (`src/read/fill.rs`,
+    /// `owned_scope.cancel()`).
+    OriginCancel {
+        fill: u64,
+    },
+    /// Deliver moved origin completions that are due (`origin_moved`).
+    OriginWake,
     /// A hedge race's duplicate delay elapsed.
     HedgeDelay {
         fill: u64,
@@ -212,6 +220,8 @@ impl Event {
             Self::Slice { task } => (16, task, 0),
             Self::HedgeDelay { fill } => (17, fill, 0),
             Self::Release { id } => (18, id, 0),
+            Self::OriginCancel { fill } => (19, fill, 0),
+            Self::OriginWake => (20, 0, 0),
         }
     }
 }
@@ -326,6 +336,10 @@ struct Fill {
     /// Walk probes so far: destination and how each ended (repeat
     /// classification, [`NodeWorld::classify_repeat`]).
     asked: Vec<(u32, Asked)>,
+    /// Outstanding origin request and its outcome (drawn at issue).
+    origin: Option<(OriginHandle, OriginOutcome)>,
+    /// The fill was canceled at its scope (Known issue 151).
+    canceled: bool,
 }
 
 /// How one walk probe ended, for repeat classification.
@@ -603,6 +617,10 @@ pub struct NodeWorld {
     /// End times of all page bodies each node is still streaming.
     bodies: HashMap<u32, Vec<Nanos>, Fixed>,
     origin_per_page: HashMap<u64, u32, Fixed>,
+    /// Earliest scheduled [`Event::OriginWake`], which delivers origin
+    /// completions a cancellation moved earlier ([`Origin::pop_moved`]), so
+    /// a cancellation schedules one event, not one per moved request.
+    origin_wake: Option<Nanos>,
     /// Per page: the node that last asked origin for it and the page's rank 0
     /// under that request's membership (see [`Self::classify_repeat`]).
     last_origin: HashMap<u64, LastOrigin, Fixed>,
@@ -714,6 +732,7 @@ impl NodeWorld {
             streaming: HashMap::default(),
             bodies: HashMap::default(),
             origin_per_page: HashMap::default(),
+            origin_wake: None,
             last_origin: HashMap::default(),
             tasks: HashMap::default(),
             down_since: HashMap::default(),
@@ -884,7 +903,7 @@ impl NodeWorld {
                     }
                 }
             }
-            Event::OriginDone { fill, outcome } => self.origin_done(fill, outcome),
+            Event::OriginDone { fill, .. } => self.origin_done(fill),
             Event::Resolve { want, result } => self.resolve(want, result),
             Event::Written { write } => {
                 self.writes.remove(&write);
@@ -917,6 +936,8 @@ impl NodeWorld {
             }
             Event::Slice { task } => self.slice(task),
             Event::HedgeDelay { fill } => self.hedge_delay(fill),
+            Event::OriginCancel { fill } => self.origin_cancel(fill),
+            Event::OriginWake => self.origin_wake(),
             Event::Release { id } => {
                 self.held.remove(&id);
             }
@@ -952,6 +973,10 @@ impl NodeWorld {
         dead.sort_unstable();
         for id in dead {
             if let Some(fill) = self.fills.remove(&id) {
+                // A crash closes the node's origin connections.
+                if let Some((handle, ..)) = fill.origin {
+                    self.cancel_origin(handle);
+                }
                 for probe in fill.probes() {
                     self.probes.remove(&probe);
                 }
@@ -1532,6 +1557,8 @@ impl NodeWorld {
                 asking: None,
                 cut: None,
                 asked: Vec::new(),
+                origin: None,
+                canceled: false,
             },
         );
         self.metrics.incr("fills");
@@ -3328,14 +3355,82 @@ impl NodeWorld {
         let page = self.fills[&id].page;
         let errors = origin_errors_at(&self.config.faults, self.config.origin_errors, now);
         let object = page / u64::from(self.config.pages_per_object);
-        let (done, outcome) = self
-            .origin
-            .request(now, object, self.config.page_bytes, errors);
+        let (handle, done, outcome) =
+            self.origin
+                .request_tracked(now, object, self.config.page_bytes, errors, id);
         self.metrics.incr("origin_requests");
         *self.origin_per_page.entry(page).or_default() += 1;
         self.classify_repeat(id);
+        let scope = self.nanos(self.fills[&id].scope);
+        let fill = self.fills.get_mut(&id).expect("present");
+        fill.origin = Some((handle, outcome));
+        // Production bounds the origin exchange by the fill's owned scope,
+        // which is the leader's deadline (`src/read/fill.rs`, `owned_scope`
+        // and its cancellation once the leader is revoked).
+        if done > scope {
+            self.engine.at(scope, Event::OriginCancel { fill: id });
+        }
         self.engine
             .at(done, Event::OriginDone { fill: id, outcome });
+    }
+
+    /// Close an outstanding origin request now and move the completions of
+    /// the requests queued behind it.
+    fn cancel_origin(&mut self, handle: OriginHandle) {
+        let now = self.engine.now();
+        if self.origin.cancel(handle, now) > 0 {
+            self.schedule_origin_wake();
+        }
+    }
+
+    fn schedule_origin_wake(&mut self) {
+        if let Some(next) = self.origin.next_moved()
+            && self.origin_wake.is_none_or(|w| next < w)
+        {
+            self.origin_wake = Some(next);
+            self.engine.at(next, Event::OriginWake);
+        }
+    }
+
+    fn origin_wake(&mut self) {
+        let now = self.engine.now();
+        if self.origin_wake == Some(now) {
+            self.origin_wake = None;
+        }
+        for id in self.origin.pop_moved(now) {
+            self.origin_complete(id);
+        }
+        self.schedule_origin_wake();
+    }
+
+    /// The fill's scope expired with its origin request outstanding: close
+    /// it (freeing origin concurrency and bandwidth for later requests) and
+    /// fail the fill with `DeadlineExceeded`, as production does.
+    fn origin_cancel(&mut self, id: u64) {
+        let now = self.now();
+        let Some(fill) = self.fills.get_mut(&id) else {
+            return;
+        };
+        let Some((handle, _)) = fill.origin else {
+            return;
+        };
+        if self.origin.end(handle).is_none_or(|done| done <= now) {
+            return;
+        }
+        fill.origin = None;
+        fill.canceled = true;
+        let (node, page) = (fill.node, fill.page);
+        fill.plan.origin(Err(Error::DeadlineExceeded));
+        self.metrics.incr("origin_canceled");
+        self.cancel_origin(handle);
+        if let Some(last) = self.last_origin.get_mut(&page)
+            && last.node == node
+            && last.ok.is_none()
+        {
+            last.ok = Some(false);
+            last.done = now;
+        }
+        self.continue_plan(id);
     }
 
     /// Classify a repeated origin request for a page (Known issues 6, 12,
@@ -3482,10 +3577,33 @@ impl NodeWorld {
         self.metrics.incr(class);
     }
 
-    fn origin_done(&mut self, id: u64, outcome: OriginOutcome) {
+    /// The completion event scheduled at issue. Stale if the request was
+    /// canceled or a cancellation moved it ([`Self::origin_wake`]).
+    fn origin_done(&mut self, id: u64) {
+        let now = self.engine.now();
+        if let Some((handle, _)) = self.fills.get(&id).and_then(|f| f.origin)
+            && self.origin.due_as_issued(handle, now)
+        {
+            self.origin_complete(id);
+        }
+    }
+
+    fn origin_complete(&mut self, id: u64) {
+        let now = self.engine.now();
         let Some(fill) = self.fills.get_mut(&id) else {
             return;
         };
+        let Some((handle, outcome)) = fill.origin.take() else {
+            return;
+        };
+        self.origin.finish(handle);
+        let (scope, node) = (fill.scope, fill.node);
+        let scope = self.nanos(scope);
+        self.invariants
+            .check("origin_within_scope", now <= scope, now, Some(node), || {
+                format!("fill {id} origin answered at {now} after its scope {scope}")
+            });
+        let fill = self.fills.get_mut(&id).expect("present");
         let result = match outcome {
             OriginOutcome::Ok => {
                 self.metrics.add("origin_bytes", self.config.page_bytes);
@@ -3698,6 +3816,9 @@ impl NodeWorld {
         let Some(fill) = self.fills.remove(&id) else {
             return;
         };
+        if let Some((handle, ..)) = fill.origin {
+            self.cancel_origin(handle);
+        }
         for probe in fill.probes() {
             self.probes.remove(&probe);
         }
@@ -3726,6 +3847,16 @@ impl NodeWorld {
             charges: &mut worker.charges,
             ids: &self.ids,
         };
+        if fill.canceled {
+            // Production cancels the fill because the leader's scope expired
+            // (`Operation::cancellation_requested`) and completes the
+            // operation with the clock at that time, so the table sees the
+            // leader revoked; the sim's table clock only advances on joins
+            // and polls.
+            worker
+                .flights
+                .refresh(&page_id, self.base + Duration::from_nanos(now), &mut wakes);
+        }
         let completed = worker
             .flights
             .complete_operation(&page_id, &mut admit, &mut wakes);
@@ -3940,6 +4071,11 @@ impl NodeWorld {
     }
 
     /// Origin requests for `page` so far.
+    /// Origin requests still outstanding (canceled ones excluded).
+    pub fn origin_outstanding(&self) -> usize {
+        self.origin.outstanding()
+    }
+
     pub fn origin_requests(&self, page: u64) -> u32 {
         self.origin_per_page.get(&page).copied().unwrap_or(0)
     }
