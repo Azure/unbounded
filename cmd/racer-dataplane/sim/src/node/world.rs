@@ -355,6 +355,9 @@ struct Fill {
     origin: Option<(OriginHandle, OriginOutcome)>,
     /// The fill was canceled at its scope (Known issue 29).
     canceled: bool,
+    /// Its origin request overlapped another node's request for the page
+    /// (`origin_repeats_concurrent`, Known issue 31).
+    concurrent: bool,
 }
 
 /// How one walk probe ended, for repeat classification.
@@ -431,6 +434,24 @@ fn skip_counter(prefix: &'static str, skip: &'static str) -> &'static str {
         (_, "copy_only") => "origin_repeats_orphan_copy_only",
         (_, "copy") => "origin_repeats_orphan_copy",
         (_, _) => "origin_repeats_orphan_unfunded",
+    }
+}
+
+/// `origin_repeats_concurrent_skip_<skip>`: a concurrent repeat by an owner
+/// above rank 0, by why it skipped rank 0 (Known issue 31).
+fn concurrent_counter(skip: &'static str) -> &'static str {
+    match skip {
+        "not_serving" => "origin_repeats_concurrent_skip_not_serving",
+        "partition" => "origin_repeats_concurrent_skip_partition",
+        "down" => "origin_repeats_concurrent_skip_down",
+        "route" => "origin_repeats_concurrent_skip_route",
+        "circuit" => "origin_repeats_concurrent_skip_circuit",
+        "timeout" => "origin_repeats_concurrent_skip_timeout",
+        "failed" => "origin_repeats_concurrent_skip_failed",
+        "busy" => "origin_repeats_concurrent_skip_busy",
+        "copy_only" => "origin_repeats_concurrent_skip_copy_only",
+        "copy" => "origin_repeats_concurrent_skip_copy",
+        _ => "origin_repeats_concurrent_skip_unfunded",
     }
 }
 
@@ -1673,6 +1694,7 @@ impl NodeWorld {
                 asked: Vec::new(),
                 origin: None,
                 canceled: false,
+                concurrent: false,
             },
         );
         self.metrics.incr("fills");
@@ -3837,6 +3859,19 @@ impl NodeWorld {
         } else if last.ok == Some(false) {
             "origin_repeats_after_failure"
         } else if last.ok.is_none() {
+            // Known issue 31: who overlaps whom. `F` above rank 0 skipped
+            // rank 0 (why), or `F` is rank 0 and `A` skipped it earlier.
+            let sub = if last.node == node {
+                "origin_repeats_concurrent_same_node"
+            } else if let Some(skip) = skip {
+                concurrent_counter(skip)
+            } else if last.skip.is_some() {
+                "origin_repeats_concurrent_rank0_after_skip"
+            } else {
+                "origin_repeats_concurrent_other"
+            };
+            self.metrics.incr(sub);
+            self.fills.get_mut(&id).expect("present").concurrent = true;
             "origin_repeats_concurrent"
         } else if !held(self) {
             "origin_repeats_copy_lost"
@@ -3912,6 +3947,7 @@ impl NodeWorld {
             return;
         };
         self.origin.finish(handle);
+        self.metrics.incr("origin_answered");
         let (scope, node) = (fill.scope, fill.node);
         let scope = self.nanos(scope);
         self.invariants
@@ -3929,6 +3965,10 @@ impl NodeWorld {
         let result = match outcome {
             OriginOutcome::Ok => {
                 self.metrics.add("origin_bytes", self.config.page_bytes);
+                if fill.concurrent {
+                    // Known issue 31: overlapping requests that cost egress.
+                    self.metrics.incr("origin_concurrent_completed");
+                }
                 Ok(())
             }
             OriginOutcome::PreconditionFailed => {
@@ -4430,3 +4470,4 @@ impl NodeWorld {
         self.versions.latest().members.clone()
     }
 }
+
