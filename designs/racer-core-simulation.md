@@ -427,14 +427,23 @@ Verified against the code at the start of this work.
    3771e5c3f, 376 with the relay fixes, 0 after). See "Round 4: flight (wave 3)" (round 4,
    flight, wave 3).
 
-151. A fill whose leader's deadline passed keeps running until origin answers. Production's fill
-   driver cancels its owned scope once the leader is revoked (`src/read/fill.rs`,
-   `operation.cancellation_requested()` then `owned_scope.cancel()`), which completes the flight
-   operation at about the deadline. The simulator cannot model that faithfully yet because the
-   origin model (`sim/src/resources.rs`, `Origin::request`) reserves FIFO bandwidth up front and
-   never refunds a canceled request: a trial that canceled at the deadline without a refund wasted
-   origin bandwidth and cut origin fills in 5k `zipf` at 16 MiB from 2,372 to 1,584. Flights in the
-   simulator therefore drain later than in production under origin overload (round 4, flight,
+151. Resolved: a fill whose leader's deadline passed kept running until origin answered, because
+   the origin model (`sim/src/resources.rs`, `Origin::request`) reserved FIFO bandwidth up front
+   and could not cancel. The origin model now cancels a tracked request like production closing
+   the connection (slot and unsent bandwidth freed, later requests move earlier), and the
+   simulator cancels the fill's origin request at its scope. 5k `zipf` at 16 MiB pages: 18,468
+   origin requests canceled, completed reads 31,111 to 33,374, failed reads 211 to 90, and the
+   new `origin_within_scope` invariant holds; 1 MiB scenarios keep their trace hashes. See
+   "Round 4: cancel (wave 3)" (round 4, cancel, wave 3).
+
+161. Under origin overload, production re-fetches a page from scratch each time a flight's leader
+   expires. The fill's owned scope is the leader's deadline (`src/read/fill.rs:1133`), and the
+   driver cancels it when the leader is revoked (`src/read/fill.rs:1229-1238`,
+   `src/read/flight.rs:314-325`), even when other waiters with later deadlines still want the page.
+   The re-elected waiter then starts a new origin request at the back of the origin queue, and
+   the partially transferred body is lost. In 5k `zipf` at 16 MiB pages this raises origin
+   requests from 36,239 to 48,438, the most requests for one page from 4 to 24, and re-elections
+   from 550 to 16,219, while successful origin fills fall from 2,372 to 1,710 (round 4, cancel,
    wave 3).
 
 ## Simulator engine (racer-sim substrate)
@@ -896,9 +905,12 @@ scenarios carry data-plane faults.
    (102 to 38,430 failed reads) (round 4, relay, wave 3).
 122. Resolved: core `PageFlights` retains leader operations like production `Flights`; the
    simulator retains each fill (round 4, flight, wave 3).
-151. The origin model does not refund bandwidth for a canceled request, so the simulator lets a
-   fill whose leader expired run to origin completion instead of canceling it at the deadline
-   like production (round 4, flight, wave 3).
+151. Resolved: the origin model cancels a tracked request (slot and unsent bandwidth freed), and
+   the simulator cancels an expired fill's origin request at its scope like production (round 4,
+   cancel, wave 3).
+161. Production cancels a fill when its leader expires even if other waiters remain, so under
+   origin overload a page is re-fetched from scratch per leader (5k `zipf` at 16 MiB: up to 24
+   origin requests per page) (round 4, cancel, wave 3).
 
 ## Round 2: production admission
 
@@ -2910,3 +2922,114 @@ invariant failures.
 
 - Production is unchanged. The bug was in the core model and in the simulator's use of it.
 - Known issue 151 is new: the simulator does not cancel an expired fill's origin request.
+
+## Round 4: cancel (wave 3)
+
+Known issue 151: the simulator let a fill run until origin answered after its leader's deadline
+passed, while production cancels it at about the deadline.
+
+### Root cause
+
+What production does:
+
+- The fill's owned scope uses the leader caller's deadline (`src/read/fill.rs:1133`).
+- The fill driver cancels that scope once the caller's scope fails or the flight operation asks
+  for cancellation (`src/read/fill.rs:1229-1238`). The operation asks for cancellation when the
+  leader's waiter scope has expired or the leader was replaced (`src/read/flight.rs:314-325`).
+- The origin adapter checks the scope at each step (`src/origin.rs`). A canceled or expired
+  exchange releases its `Connection` and `Plaintext` reservations, as the test
+  `real_uds_canceled_and_expired_reads_release_owned_resources` (`src/origin/tests.rs:1136`)
+  asserts. Closing the connection frees the per-endpoint concurrency and stops the body transfer.
+
+The simulator did none of this. `Origin::request` (`sim/src/resources.rs`) fixed the slot and a
+FIFO bandwidth reservation when the request was issued, and nothing could take them back.
+`NodeWorld::issue_origin` scheduled `OriginDone` at that time, and the fill ran until then, even
+far past its scope. The flight track tried canceling at the deadline without a refund. That
+wasted origin bandwidth, so it was not kept.
+
+### Changes
+
+- `Origin::request_tracked`, `Origin::cancel`, `Origin::finish`. Tracked requests are kept in
+  issue order. Canceling a request works like this:
+  - A request that has not started is removed.
+  - A started request gives up its slot at the cancel time. If its body is flowing, it keeps
+    only the bandwidth it already used.
+  - The requests issued after it are then replayed in issue order. Each moves earlier, never
+    later (a debug assertion checks this).
+  - With no cancellations, the schedule is identical to `Origin::request`. A unit test compares
+    200 mixed requests.
+  - Each cancellation costs one scan of the outstanding requests. The moved completions go into
+    a heap that is rebuilt once per cancellation, so a cancellation never schedules one event per
+    moved request.
+- `NodeWorld`:
+  - `issue_origin` uses tracked requests. If the answer would arrive after the fill's scope, it
+    schedules `OriginCancel` at the scope.
+  - `origin_cancel` closes the request and fails the fill's origin step with
+    `DeadlineExceeded`.
+  - `OriginWake` delivers completions that moved earlier. An original `OriginDone` is ignored
+    when its request was canceled or moved (`Origin::due_as_issued`).
+  - A fill removed by a crash or finished with its origin request still open also closes that
+    request.
+- A canceled fill refreshes the flight table clock before `complete_operation`. Without this,
+  the table clock, which advances only on joins and polls, still showed the expired leader as
+  active. The leader would then settle the flight with `DeadlineExceeded` for every waiter,
+  where production drops its outcome as stale and re-elects.
+- New invariant `origin_within_scope`: no origin answer reaches a fill after its scope. New
+  counter `origin_canceled`.
+
+### Tests
+
+- `resources::tests`:
+  - `tracked_requests_match_untracked_without_cancellation`.
+  - `canceling_a_transfer_releases_bandwidth_to_later_requests`: bandwidth refund, moved
+    completions, delivery order, and a repeated cancel.
+  - `canceling_releases_the_concurrency_slot`: an unstarted request is removed, and a running
+    one frees its slot.
+  - `canceling_a_queued_request_moves_only_later_ones_on_shared_bandwidth`.
+- `node::tests::expired_fills_cancel_their_origin_request`: 64 nodes, a 1 MiB/s origin, four
+  storms. It requires `origin_canceled > 0` and stale finishes, and `run` checks
+  `origin_within_scope`. It fails before the fix because no request was canceled.
+- `node::tests::expired_leaders_drain_before_a_new_fill` (flight track) still passes. It failed
+  until the clock refresh above was added.
+
+### Evidence
+
+5k `zipf`, seed 1, 16 MiB pages (`{"page_bytes":16777216,"request_rate":1.25,"duration_ns":8000000000}`):
+
+| | flight (f02905375) | cancel |
+|---|---|---|
+| reads completed / failed | 31,111 / 211 | 33,374 / 90 |
+| read p99 | 5.91 s | 4.83 s |
+| origin requests (max per page) | 36,239 (4) | 48,438 (24) |
+| origin requests canceled | 0 | 18,468 |
+| origin fills / origin bytes | 2,372 / 39.8 GB | 1,710 / 28.7 GB |
+| flight stale finishes / re-elections | 683 / 550 | 18,468 / 16,219 |
+| violations | 0 | 0 |
+| wall, peak RSS | 0:48, 0.72 GiB | 1:15, 0.71 GiB |
+
+Reads improve because waiters no longer wait for an expired fill to finish. Origin requests rise
+because each re-elected leader starts a new request that is often canceled as well. This is what
+production does, so it is recorded as Known issue 161 and not hidden in the model. Wall time rises
+by 27 s, mostly from replaying the queue of about 30k outstanding requests on each of the 18k
+cancellations.
+
+At default 1 MiB pages no origin request outlives its scope. These 5k runs (seed 1) have the same
+trace hashes and counters as the flight branch: `zipf` `ef7607be6a3bb784`, `storm`
+`ca1b1acb8b9fc903`, `churn` `681512f470c3c7d1`, `full-cold-start` `38885a3d7aaa1c9a`,
+`full-failover` `ca1fbb12e1302c50`, `full-churn` `7a6dcad8908e8cf6`, `full-lagging`
+`4e6be4c16c724572`. Wall time and RSS are within noise. The 16-scenario smoke at 200 nodes (1 s)
+has no hard invariant failures, and every trace hash matches the flight branch.
+
+Checks: `cargo fmt --check` and `cargo clippy --workspace --all-targets -D warnings` are clean,
+and the workspace tests pass (3,405 tests).
+
+### Deviations and open items
+
+- Production is unchanged. Issue 151 was a modeling gap.
+- Known issue 161 (new, production): a fill is canceled when its leader expires even if other
+  waiters remain. Each re-elected waiter restarts the origin fetch and discards the partly
+  transferred body. Possible fixes are handing the running operation to the next waiter's scope
+  or letting the fill run to the latest waiter deadline within budget. Either fix changes flight
+  and fill ownership in production, so it is left open.
+- 50k was not run: the change has no effect at default page size (identical hashes), and 16 MiB
+  pages at 50k are not a standard configuration.
