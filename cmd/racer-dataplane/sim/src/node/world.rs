@@ -1449,7 +1449,7 @@ impl NodeWorld {
                     Ok(_) => self.send_reply(msg, dest, Reply::Response(ResponseKind::Page), now),
                     Err(e) => {
                         let requester = m.requester;
-                        self.note_hint(dest, page, requester);
+                        self.note_hint(dest, page, requester, false);
                         let reply = peer_error(e).map_or(Reply::Transport, Reply::Response);
                         self.send_reply(msg, dest, reply, now);
                     }
@@ -1479,24 +1479,32 @@ impl NodeWorld {
         if hints.is_empty() {
             return false;
         }
-        let owners = self.owners_at(node, w, page);
-        if successor_deferral(hints, &requester, &owners).is_none() {
+        let owners = self.owners_at(node, w, page, true);
+        if successor_deferral(hints, &node, &requester, &owners).is_none() {
             return false;
         }
         self.nodes[node as usize].hints.charge(&page, MAX_DEFERRALS);
         true
     }
 
-    /// The page's owners under the membership `at` adopted (production
-    /// ranks them in the serve path, as `shed_hot_page` does).
-    fn owners_at(&self, at: u32, w: u8, page: u64) -> Vec<u32> {
+    /// The page's owners under the membership `at` adopted, ranking them
+    /// when `rank` (production `CandidatePolicy::candidates_scoped`) or only
+    /// from the placement cache (production `Placement::cached`).
+    fn owners_at(&self, at: u32, w: u8, page: u64, rank: bool) -> Vec<u32> {
         let n = &self.nodes[at as usize];
         let Some(version) = self.versions.get(n.version) else {
             return Vec::new();
         };
-        n.workers[w as usize]
-            .placement
-            .rank(&*version.members, &page.to_be_bytes())
+        let key = page.to_be_bytes();
+        let placement = &n.workers[w as usize].placement;
+        let ranked = if rank {
+            placement.rank(&*version.members, &key)
+        } else {
+            placement
+                .cached(&*version.members, &key)
+                .unwrap_or_default()
+        };
+        ranked
             .into_iter()
             .take(3)
             .map(|p| version.members.members()[p].node)
@@ -1504,13 +1512,16 @@ impl NodeWorld {
     }
 
     /// `node` answered `requester`'s page probe without a copy (production
-    /// `Coordinator::serve_peer`, Known issue 21).
-    fn note_hint(&mut self, node: u32, page: u64, requester: u32) {
-        if !self.config.node.successor_hints {
+    /// `Coordinator::serve_peer`, Known issue 21). A copy-only miss is noted
+    /// without ranking (`successor_deferral` checks ownership); a failed
+    /// acquisition checks the ranking its own walk cached, so neither path
+    /// ranks a page or disturbs the placement cache.
+    fn note_hint(&mut self, node: u32, page: u64, requester: u32, copy_only: bool) {
+        if !self.config.node.successor_hints || node == requester {
             return;
         }
         let w = self.ids.worker(page);
-        if !should_note(&node, &requester, &self.owners_at(node, w, page)) {
+        if !copy_only && !should_note(&node, &requester, &self.owners_at(node, w, page, false)) {
             return;
         }
         self.metrics.incr("successor_hints_noted");
@@ -3013,7 +3024,7 @@ impl NodeWorld {
                     self.send_reply(mid, dest, Reply::Response(ResponseKind::Page), read);
                 } else {
                     self.metrics.incr("copy_only_misses");
-                    self.note_hint(dest, page, requester);
+                    self.note_hint(dest, page, requester, true);
                     self.send_reply(mid, dest, Reply::Response(ResponseKind::Miss), t);
                 }
             }
