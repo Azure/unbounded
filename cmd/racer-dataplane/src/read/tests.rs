@@ -2904,6 +2904,86 @@ mod timeouts {
         assert!(calls.iter().all(|c| c.destination == rank0 && !c.copy));
     }
 
+    /// Known issue 41 (round 4, hang2): a reader whose probe of an owner
+    /// went unanswered visits that owner after the page's other owners on
+    /// its next walk, instead of first again (`Spread` is deterministic per
+    /// requester and page); an answer from it restores its place.
+    #[test]
+    fn reader_visits_an_owner_that_left_it_unanswered_after_the_others() {
+        let clock = uring_runtime::environment::SimulationClock::new(209);
+        let _env = clock.environment(0).enter();
+        let mut f = Fixture::new(None, 1, false).bounded(209, 60, 24);
+        f.policy = f
+            .policy
+            .with_attempt_timeout(Duration::from_secs(1))
+            .with_replica_selection(crate::read::candidates::ReplicaSelection::Spread);
+        // No minimum wait, so the scripted timeout counts.
+        f.policy
+            .link_health()
+            .set_silence(Duration::ZERO, Duration::from_secs(1));
+        let page = crate::model::PageId {
+            version: ObjectVersion {
+                object: f.context.object.clone(),
+                etag: StrongEtag::test_value("v"),
+            },
+            number: PageNumber(0),
+        };
+        let resolve_once = |f: &mut Fixture, stall: bool| {
+            let operation = PeerOperation::Page {
+                page: page.clone(),
+                mode: FetchMode::Acquire,
+            };
+            let candidates = Candidates {
+                membership: f.candidates.membership.clone(),
+                ordered: f.candidates.ordered.clone(),
+            };
+            let mut resolve = f.policy.resolve_with_budget(
+                candidates,
+                &f.context,
+                operation,
+                &f.scope,
+                &mut f.budget,
+            );
+            if stall {
+                assert!(poll(resolve.as_mut()).is_pending());
+                clock.advance(Duration::from_secs(2));
+            }
+            let Poll::Ready(_) = poll(resolve.as_mut()) else {
+                panic!("bounded resolution")
+            };
+        };
+        let visited = |f: &Fixture, from: usize| -> Vec<NodeId> {
+            f.peers.calls.borrow()[from..]
+                .iter()
+                .map(|c| c.destination.clone())
+                .collect()
+        };
+        resolve_once(&mut f, true);
+        let first = visited(&f, 0);
+        assert!(first.len() >= 2, "{first:?}");
+        let hung = first[0].clone();
+        assert_eq!(
+            f.policy.link_health().answering(&hung),
+            racer_core::read::candidates::Answering::Unanswered
+        );
+        // The next walk visits it last: everyone else answered.
+        let before = f.peers.calls.borrow().len();
+        f = f.bounded(210, 60, 24);
+        resolve_once(&mut f, false);
+        let second = visited(&f, before);
+        assert_eq!(second.last(), Some(&hung), "{first:?} then {second:?}");
+        assert_ne!(second[0], hung);
+        // It answered this time: its place is restored.
+        assert_eq!(
+            f.policy.link_health().answering(&hung),
+            racer_core::read::candidates::Answering::Answers
+        );
+        let before = f.peers.calls.borrow().len();
+        f = f.bounded(211, 60, 24);
+        resolve_once(&mut f, false);
+        assert_eq!(visited(&f, before)[0], hung);
+    }
+
     #[test]
     fn candidate_final_remaining_copy_and_origin_miss_only_at_final_boundary() {
         let clock = uring_runtime::environment::SimulationClock::new(200);

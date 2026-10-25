@@ -786,10 +786,20 @@ impl CandidatePolicy {
         }
         // Visit an older later owner before the newer owner that displaced
         // it, which would fetch the page again (Known issue 25).
-        racer_core::read::candidates::lineage_first(order, &owner_arrivals(candidates), |rank| {
-            candidates
-                .membership
-                .is_neighbor(&self.node, &ordered[rank])
+        let order = racer_core::read::candidates::lineage_first(
+            order,
+            &owner_arrivals(candidates),
+            |rank| {
+                candidates
+                    .membership
+                    .is_neighbor(&self.node, &ordered[rank])
+            },
+        );
+        // Owners that left this node's request unanswered go after the
+        // others, silent ones last (Known issue 41).
+        let health = self.peers.link_health();
+        racer_core::read::candidates::demote_unanswered(order, |rank| {
+            health.answering(&ordered[rank])
         })
     }
 
@@ -1380,6 +1390,11 @@ impl CandidatePolicy {
                     }
                     Ok(response) => {
                         relayed = response.origin().node() != destination;
+                        if !relayed {
+                            // The destination answered this node: it is not
+                            // hung (Known issue 41).
+                            self.peers.link_health().silence_answered(destination);
+                        }
                         if matches!(response.response(), PeerResponse::StaleMembership) {
                             if walk.pending_handoff() || walk.pending_previous() {
                                 // A stale handoff target is only a miss, and
@@ -1551,20 +1566,25 @@ impl CandidatePolicy {
                         budget.deadline().min(scope.deadline.0),
                     );
                 }
-                if walk.pending_rank0()
-                    && outcome == WalkOutcome::TimedOut
+                if outcome == WalkOutcome::TimedOut
                     && let PeerOperation::Page { page: id, .. } = &operation
                 {
-                    let health = self.peers.link_health();
-                    // Ask whether rank 0 answers at all (Known issue 43):
-                    // `poll_pings` sends the ping, and a silent rank 0 then
-                    // fails this owner's next probe at once, which gives it
-                    // origin authority without another wait.
-                    health.silence_timed_out(
+                    use racer_core::peer::silence::{NO_PING, RANK0_TIMEOUTS};
+                    // A probe of the page's rank 0 (an owner's, or a
+                    // reader's) asks whether rank 0 answers at all (Known
+                    // issue 43): `poll_pings` sends the ping, and a silent
+                    // rank 0 then fails the next probe at once, which gives
+                    // an owner above it origin authority without another
+                    // wait and sends a reader to the other owners. Any other
+                    // timeout only demotes the owner in this node's visit
+                    // order (Known issue 41).
+                    let rank0 = walk.pending_rank0()
+                        || (rank.is_none() && candidates.ordered.first() == Some(destination));
+                    self.peers.link_health().silence_timed_out(
                         destination,
                         id.clone(),
                         sent,
-                        racer_core::peer::silence::RANK0_TIMEOUTS,
+                        if rank0 { RANK0_TIMEOUTS } else { NO_PING },
                     );
                 }
                 walk.complete(budget, outcome)?;

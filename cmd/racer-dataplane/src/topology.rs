@@ -144,6 +144,20 @@ impl LinkHealth {
             None => false,
         }
     }
+    /// What this worker last learned about `peer`'s answers (readers'
+    /// visit order, Known issue 41).
+    pub fn answering(&self, peer: &NodeId) -> racer_core::read::candidates::Answering {
+        use racer_core::read::candidates::Answering;
+        let now = uring_runtime::environment::now();
+        let silence = self.silence.borrow();
+        if silence.silent(peer, now) {
+            Answering::Silent
+        } else if silence.unanswered(peer, now) {
+            Answering::Unanswered
+        } else {
+            Answering::Answers
+        }
+    }
     /// Whether `peer` is silent: requests for it fail at once.
     pub fn silent(&self, peer: &NodeId) -> bool {
         self.silent_at(peer, uring_runtime::environment::now())
