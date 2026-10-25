@@ -94,6 +94,22 @@ pub struct CandidatePolicy {
     published: Arc<controlplane::Published<crate::control::Snapshot>>,
     ownership_refresh: RefCell<OwnershipRefresh>,
     single_flight: RefCell<SingleFlightPeers>,
+    /// Timer for waiting on a destination that is behind (Known issue 26).
+    /// Without one, the walk skips it as before.
+    reactor: Option<Rc<crate::runtime::Reactor>>,
+    /// Test only: wait without a timer, returning at once.
+    #[cfg(test)]
+    pub(crate) instant_stale_wait: std::cell::Cell<bool>,
+}
+
+/// When each of the page's owners arrived in this node's membership chain
+/// (`Membership::since`), for lineage targets (Known issue 25).
+fn owner_arrivals(candidates: &Candidates) -> Vec<Option<u32>> {
+    candidates
+        .ordered
+        .iter()
+        .map(|node| candidates.membership.since(node))
+        .collect()
 }
 
 /// How long a provider stays single-flight after a refused multi-flight
@@ -191,6 +207,9 @@ pub(crate) struct HedgeContinuation {
     pub primary_outcome: Option<ProbeOutcome>,
     pub stale: bool,
     pub bounded_routes: bool,
+    /// This read already waited for a destination that is behind
+    /// (`racer_core::read::stale::stale_wait`, Known issue 26).
+    pub waited: bool,
 }
 impl CandidatePolicy {
     #[cfg(test)]
@@ -593,7 +612,49 @@ impl CandidatePolicy {
             published,
             ownership_refresh: RefCell::default(),
             single_flight: RefCell::default(),
+            reactor: None,
+            #[cfg(test)]
+            instant_stale_wait: std::cell::Cell::new(false),
         }
+    }
+
+    /// Whether this policy can wait for a destination that is behind.
+    fn can_wait(&self) -> bool {
+        #[cfg(test)]
+        if self.instant_stale_wait.get() {
+            return true;
+        }
+        self.reactor.is_some()
+    }
+
+    /// Let readers wait for a destination that is behind this node's
+    /// membership instead of skipping it (Known issue 26).
+    pub(crate) fn with_reactor(mut self, reactor: Rc<crate::runtime::Reactor>) -> Self {
+        self.reactor = Some(reactor);
+        self
+    }
+
+    /// Sleep until `until` under the request's scope. `false` without a
+    /// timer.
+    async fn stale_sleep(&self, until: std::time::Instant, scope: &RequestScope) -> Result<bool> {
+        use uring_runtime::reactor::timer::SleepMode;
+        #[cfg(test)]
+        if self.instant_stale_wait.get() {
+            return Ok(true);
+        }
+        let Some(reactor) = &self.reactor else {
+            return Ok(false);
+        };
+        #[cfg(test)]
+        let mode = if uring_runtime::environment::simulation_seed().is_some() {
+            SleepMode::ClockPoll
+        } else {
+            SleepMode::Kernel
+        };
+        #[cfg(not(test))]
+        let mode = SleepMode::Kernel;
+        reactor.sleep_until(until, mode, scope).await?;
+        Ok(true)
     }
 
     pub(crate) fn with_observer(mut self, observer: Observer) -> Self {
@@ -621,7 +682,7 @@ impl CandidatePolicy {
         page: PageNumber,
     ) -> VisitOrder {
         let ordered = &candidates.ordered;
-        visit_order(
+        let order = visit_order(
             self.replica_selection,
             ordered.len(),
             |rank| {
@@ -630,7 +691,13 @@ impl CandidatePolicy {
                     .is_neighbor(&self.node, &ordered[rank])
             },
             |rank| replica_score(&self.node, object, page, &ordered[rank]),
-        )
+        );
+        if self.replica_selection != ReplicaSelection::Spread {
+            return order;
+        }
+        // Visit an older later owner before the newer owner that displaced
+        // it, which would fetch the page again (Known issue 25).
+        racer_core::read::candidates::lineage_first(order, &owner_arrivals(candidates))
     }
 
     /// Bound each local peer exchange independently of the signed operation ceiling.
@@ -959,6 +1026,7 @@ impl CandidatePolicy {
                         retried,
                         HedgeContinuation {
                             bounded_routes: true,
+                            waited: continuation.waited,
                             ..Default::default()
                         },
                         trail,
@@ -987,7 +1055,21 @@ impl CandidatePolicy {
                     .unwrap_or_default(),
                 _ => PreviousOwners::default(),
             };
+            // Arrival order of the page's owners in this node's membership
+            // chain: an owner may ask later owners that arrived before it,
+            // which it may have displaced however many versions ago (Known
+            // issue 25), and readers and delegations fund those probes.
+            let since = owner_arrivals(&candidates);
+            let lineage = if page_operation {
+                racer_core::read::walk::lineage_counts(&since)
+            } else {
+                [0; racer_core::read::walk::MAX_HANDOFF]
+            };
             let handoff = match rank {
+                Some(rank) if page_operation => racer_core::read::walk::merge_handoff(
+                    previous.handoff.clone(),
+                    racer_core::read::walk::lineage_targets(&candidates.ordered, &since, rank),
+                ),
                 Some(_) => previous.handoff.clone(),
                 None => Vec::new(),
             };
@@ -1015,10 +1097,14 @@ impl CandidatePolicy {
                 handoff: handoff.len(),
                 previous: previous.same_rank,
                 helper,
+                lineage,
             });
             // This node owns the page under version - 1, so the stale
             // fallback (Known issue 19) is not available to this walk.
             let mut fallback_denied = false;
+            // This walk waited for a destination that is behind (Known
+            // issue 26).
+            let mut waited = false;
             let end = loop {
                 let probe = match walk.next(budget)? {
                     Step::Probe(probe) => probe,
@@ -1106,10 +1192,33 @@ impl CandidatePolicy {
                                 // that recently replaced the previous
                                 // membership walks the page's owners under it
                                 // instead, once (Known issue 19).
-                                walk.complete(budget, WalkOutcome::StaleDestination)?;
-                                if let Some(previous) = self
+                                let fallback = self
                                     .stale_fallback(&candidates, rank.is_some(), retried)
-                                    .filter(|_| !fallback_denied)
+                                    .filter(|_| !fallback_denied);
+                                // One that cannot (it joined in this
+                                // membership) waits for the destination to
+                                // adopt it and asks again, once (Known
+                                // issue 26).
+                                let now = uring_runtime::environment::now();
+                                if let Some(wait) = racer_core::read::stale::stale_wait(
+                                    racer_core::read::stale::StaleWaitFacts {
+                                        owner: rank.is_some(),
+                                        fallback: fallback.is_some(),
+                                        waited: continuation.waited || waited,
+                                        remaining: budget
+                                            .deadline()
+                                            .min(scope.deadline.0)
+                                            .saturating_duration_since(now),
+                                    },
+                                ) && self.can_wait()
+                                {
+                                    walk.retry_pending(budget)?;
+                                    waited = true;
+                                    self.stale_sleep(now + wait, scope).await?;
+                                    continue;
+                                }
+                                walk.complete(budget, WalkOutcome::StaleDestination)?;
+                                if let Some(previous) = fallback
                                     && let Ok(previous) =
                                         self.candidates_scoped(previous, object, page, scope).await
                                 {
@@ -1133,7 +1242,10 @@ impl CandidatePolicy {
                                                 budget,
                                                 validate,
                                                 true,
-                                                HedgeContinuation::default(),
+                                                HedgeContinuation {
+                                                    waited: continuation.waited || waited,
+                                                    ..Default::default()
+                                                },
                                                 trail,
                                             )
                                             .await;
@@ -1156,6 +1268,7 @@ impl CandidatePolicy {
                                     true,
                                     HedgeContinuation {
                                         bounded_routes: continuation.bounded_routes,
+                                        waited: continuation.waited || waited,
                                         ..Default::default()
                                     },
                                     trail,
@@ -1823,6 +1936,14 @@ impl CandidatePolicy {
                         );
                     }
                 }
+            }
+            // A verified `StaleMembership` comes from a node that could not
+            // resolve this request's membership, so the remote credits it
+            // carried were never used: return them (Known issue 26).
+            if let Ok(Delivered::Response(response)) = &response
+                && matches!(response.response(), PeerResponse::StaleMembership)
+            {
+                budget.refund_remote(attempts)?;
             }
             check_budget(scope, budget)?;
             let stop = stopped.or_else(|| attempt_scope.check().err());
@@ -2656,6 +2777,74 @@ pub(super) mod tests {
             relayed_first_spread < relayed_first_primary,
             "spread {relayed_first_spread} must relay less than primary {relayed_first_primary}"
         );
+    }
+
+    /// Known issue 25: a reader whose first choice arrived in the membership
+    /// chain after a later owner visits that older owner first, which may
+    /// hold the copy it fetched while it ranked higher. Primary keeps the
+    /// canonical order; with no arrivals in the chain nothing changes.
+    #[test]
+    fn spread_visits_an_older_later_owner_before_a_newer_owner() {
+        use crate::topology::Membership;
+        let all = spread_membership(12);
+        let placement = Placement::new(64);
+        let mut moved = 0;
+        for page in 0..32 {
+            let ranked = placement.rank(all.clone(), &object(), PageNumber(page));
+            let newest = ranked.ordered[0].clone();
+            // `newest` arrives in version 2; the others were in version 1.
+            let before = Membership::validate(
+                racer_control_wire::MembershipVersion(1),
+                all.members()
+                    .iter()
+                    .filter(|m| m.node != newest)
+                    .cloned()
+                    .collect(),
+            )
+            .unwrap();
+            let chain = std::sync::Arc::new(
+                Membership::validate_with_predecessor(
+                    racer_control_wire::MembershipVersion(2),
+                    all.members().to_vec(),
+                    Some(&before),
+                )
+                .unwrap(),
+            );
+            let candidates = placement.rank(chain.clone(), &object(), PageNumber(page));
+            assert_eq!(candidates.ordered, ranked.ordered);
+            for requester in all.members() {
+                if candidates.ordered.contains(&requester.node) {
+                    continue;
+                }
+                let spread = spread_policy(requester.node.clone(), ReplicaSelection::Spread);
+                let plain = spread
+                    .visit_order(&ranked, &object(), PageNumber(page))
+                    .ranks()
+                    .collect::<Vec<_>>();
+                let lineage = spread
+                    .visit_order(&candidates, &object(), PageNumber(page))
+                    .ranks()
+                    .collect::<Vec<_>>();
+                if plain[0] == 0 {
+                    // The newer rank 0 goes after the first older owner.
+                    let mut expected = plain.clone();
+                    expected[..2].rotate_left(1);
+                    assert_eq!(lineage, expected, "page {page}");
+                    moved += 1;
+                } else {
+                    assert_eq!(lineage, plain, "page {page}");
+                }
+                let primary = spread_policy(requester.node.clone(), ReplicaSelection::Primary);
+                assert_eq!(
+                    primary
+                        .visit_order(&candidates, &object(), PageNumber(page))
+                        .ranks()
+                        .collect::<Vec<_>>(),
+                    vec![0, 1, 2]
+                );
+            }
+        }
+        assert!(moved > 0);
     }
 
     #[test]

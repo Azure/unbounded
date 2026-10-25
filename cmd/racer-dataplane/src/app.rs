@@ -1151,6 +1151,7 @@ impl WorkerApplication {
                 node.publications.clone(),
             )
             .with_hedges(hedges)
+            .with_reactor(reactor.clone())
             .with_replica_selection(config.replica_selection)
             .with_attempt_timeout(config.peer_attempt_timeout)
             .with_observer(admission.policy().observer().clone()),

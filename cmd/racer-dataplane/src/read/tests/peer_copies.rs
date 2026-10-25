@@ -3506,6 +3506,209 @@ fn stale_owners_fall_back_to_the_recent_previous_membership() {
     }
 }
 
+/// Known issue 26: a reader that joined in version 2 is not a member of
+/// version 1, so it cannot walk the previous membership when an owner is
+/// behind. It waits once and asks the same owner again; a verified
+/// `StaleMembership` returns the credits the request carried, so each stale
+/// answer costs only its exchange. If the owner is still behind, the walk
+/// goes on as before and fails `Unavailable` without reaching the origin.
+#[test]
+fn readers_that_cannot_fall_back_wait_once_for_an_owner_that_is_behind() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    // (wait available, owner adopts during the wait)
+    for (wait, adopts) in [(true, true), (true, false), (false, false)] {
+        let mut f = fixture();
+        let (peers, ordered) = install_peers(&mut f, None);
+        let good = encrypted_copy(&mut f);
+        let members = f.membership.members().to_vec();
+        let local = node(peers.local);
+        let current = Arc::new(
+            Membership::validate(racer_control_wire::MembershipVersion(2), members.clone())
+                .unwrap(),
+        );
+        // Version 1 does not list this node: it joined in version 2.
+        let old = Arc::new(
+            Membership::validate(
+                racer_control_wire::MembershipVersion(1),
+                members.into_iter().filter(|m| m.node != local).collect(),
+            )
+            .unwrap(),
+        );
+        let published = Arc::new(controlplane::Published::new(
+            crate::control::Snapshot::retention(2),
+        ));
+        let now = uring_runtime::environment::now();
+        for (i, membership) in [old, current.clone()].into_iter().enumerate() {
+            let mut snapshot = crate::control::Snapshot::membership_fixture(membership);
+            snapshot.sequence = racer_control_wire::PublicationSequence(i as u64 + 1);
+            published
+                .publish(Arc::new(snapshot), now, |_, _| Ok::<_, Error>(()), || ())
+                .unwrap();
+        }
+        let mut deps = f.fill.dependencies.clone();
+        let policy = CandidatePolicy::new(
+            local.clone(),
+            Rc::new(Placement::new(16)),
+            peers.requester(),
+            deps.credentials.clone(),
+            published,
+        );
+        policy.instant_stale_wait.set(wait);
+        deps.candidates = Rc::new(policy);
+        f.fill = Fill::new(deps);
+        f.membership = current;
+        let mut replies = Vec::new();
+        if wait {
+            replies.push((ordered[0].clone(), Reply::Stale));
+        }
+        if adopts {
+            replies.push((ordered[0].clone(), Reply::Copy(good.clone())));
+        } else {
+            replies.extend(ordered.iter().map(|n| (n.clone(), Reply::Stale)));
+        }
+        peers.replies.borrow_mut().extend(replies);
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+        let result = acquire(&mut f, &mut budget);
+        let case = format!("wait {wait} adopts {adopts}");
+        let calls: Vec<_> = peers.calls.borrow().iter().map(|c| c.0.clone()).collect();
+        let memberships = peers.memberships.borrow().clone();
+        assert!(
+            memberships.iter().all(|v| *v == 2),
+            "{case}: {memberships:?}"
+        );
+        if adopts {
+            let result = result.unwrap_or_else(|e| panic!("{case}: {e:?}"));
+            assert_eq!(result.plaintext.bytes(), b"abc", "{case}");
+            assert_eq!(calls, [ordered[0].clone(), ordered[0].clone()], "{case}");
+        } else {
+            assert!(matches!(result, Err(Error::Unavailable)), "{case}");
+            // One more ask of the first owner with the wait, then each owner
+            // once as before.
+            let mut expected = ordered.clone();
+            if wait {
+                expected.insert(0, ordered[0].clone());
+            }
+            assert_eq!(calls, expected, "{case}");
+            // Each stale answer returned its remote credits: only the
+            // exchanges are spent.
+            assert_eq!(
+                budget.remaining_attempts(),
+                8 - calls.len() as u32,
+                "{case}"
+            );
+        }
+        assert_eq!(f.origin.calls.get(), 0, "{case}");
+    }
+}
+
+/// Known issue 25: rank 0 arrived in version 2, after the page's other
+/// owners, which ranked above it before and may hold the copy one of them
+/// fetched however many versions ago. On a cold miss it asks them copy-only
+/// (lineage first, then version 1's previous owners) before the origin. In a
+/// chain where every owner arrived together it asks no one and fetches.
+#[test]
+fn a_newer_owner_asks_older_later_owners_before_origin() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    for (chained, holder) in [
+        (true, Some(1)),
+        (true, Some(2)),
+        (true, None),
+        (false, None),
+    ] {
+        let mut f = fixture();
+        let (peers, ordered) = install_peers(&mut f, Some(0));
+        let good = encrypted_copy(&mut f);
+        let members = f.membership.members().to_vec();
+        let local = node(peers.local);
+        let old = Membership::validate(
+            racer_control_wire::MembershipVersion(1),
+            members
+                .iter()
+                .filter(|m| !chained || m.node != local)
+                .cloned()
+                .collect(),
+        )
+        .unwrap();
+        let current = Arc::new(
+            Membership::validate_with_predecessor(
+                racer_control_wire::MembershipVersion(2),
+                members.clone(),
+                Some(&old),
+            )
+            .unwrap(),
+        );
+        let published = Arc::new(controlplane::Published::new(
+            crate::control::Snapshot::retention(2),
+        ));
+        let now = uring_runtime::environment::now();
+        for (i, membership) in [Arc::new(old), current.clone()].into_iter().enumerate() {
+            let mut snapshot = crate::control::Snapshot::membership_fixture(membership);
+            snapshot.sequence = racer_control_wire::PublicationSequence(i as u64 + 1);
+            published
+                .publish(Arc::new(snapshot), now, |_, _| Ok::<_, Error>(()), || ())
+                .unwrap();
+        }
+        let mut deps = f.fill.dependencies.clone();
+        deps.candidates = Rc::new(CandidatePolicy::new(
+            local.clone(),
+            Rc::new(Placement::new(16)),
+            peers.requester(),
+            deps.credentials.clone(),
+            published,
+        ));
+        f.fill = Fill::new(deps);
+        f.membership = current;
+        f.fill
+            .dependencies
+            .writer
+            .retention()
+            .set_ownership(Rc::new(|_| true));
+        let case = format!("chained {chained} holder {holder:?}");
+        let mut expected = Vec::new();
+        if chained {
+            for (i, n) in ordered.iter().enumerate().skip(1) {
+                expected.push(n.clone());
+                let reply = if holder == Some(i) {
+                    Reply::Copy(good.clone())
+                } else {
+                    Reply::Miss
+                };
+                peers.replies.borrow_mut().push_back((n.clone(), reply));
+                if holder == Some(i) {
+                    break;
+                }
+            }
+            if holder.is_none() {
+                // Then version 1's other owner, which is not a current one.
+                let other = members
+                    .iter()
+                    .map(|m| m.node.clone())
+                    .find(|n| !ordered.contains(n))
+                    .unwrap();
+                expected.push(other.clone());
+                peers.replies.borrow_mut().push_back((other, Reply::Miss));
+            }
+        }
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+        let result = acquire(&mut f, &mut budget);
+        let result = result.unwrap_or_else(|e| panic!("{case}: {e:?}"));
+        assert_eq!(result.plaintext.bytes(), b"abc", "{case}");
+        let calls: Vec<_> = peers.calls.borrow().iter().map(|c| c.0.clone()).collect();
+        assert_eq!(calls, expected, "{case}");
+        assert!(
+            peers.calls.borrow().iter().all(|c| c.1),
+            "{case}: copy-only"
+        );
+        assert_eq!(
+            f.origin.calls.get(),
+            usize::from(holder.is_none()),
+            "{case}"
+        );
+    }
+}
+
 /// The fallback walks the previous membership only as a non-owner: a node
 /// that owned the page there keeps walking the current membership rather
 /// than reach the origin with authority it no longer has.
