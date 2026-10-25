@@ -303,6 +303,9 @@ pub struct FlightOperation {
     flights: Rc<Flights>,
     pub(super) fence: Fence,
     pub(super) id: u64,
+    /// Wake at the deadline of the waiter the operation currently serves, so
+    /// a handed-over operation observes the end of its last adopter.
+    alarm: Option<(Instant, uring_runtime::environment::Registration)>,
 }
 impl FlightOperation {
     pub fn complete(self) -> Result<()> {
@@ -311,17 +314,52 @@ impl FlightOperation {
 
     /// Allows a completion owner to observe revoked leadership and request actual
     /// transport cancellation. Cancellation is not itself a completion fence.
+    /// Refreshes the entry first, so an expired leader of a handover-enabled
+    /// acquisition passes to another live waiter rather than ending the work.
     pub fn cancellation_requested(&self) -> bool {
-        let table = self.flights.table.borrow();
-        table.is_stopping()
-            || table.get(&self.fence.page).is_none_or(|entry| {
-                self.fence.validate(&entry.fence).is_err()
-                    || !matches!(entry.phase, Phase::Acquiring)
-                    || entry
-                        .leader
-                        .and_then(|id| entry.waiters.get(&id))
-                        .is_none_or(|waiter| waiter.scope.check().is_err())
-            })
+        self.leader_deadline().is_none()
+    }
+
+    /// Deadline of the waiter this operation currently serves, or `None` once
+    /// the acquisition was revoked, settled, or stopped.
+    fn leader_deadline(&self) -> Option<Instant> {
+        self.flights.update(|table, wakes| {
+            if table.is_stopping() {
+                return None;
+            }
+            let entry = table.get_mut(&self.fence.page)?;
+            self.fence.validate(&entry.fence).ok()?;
+            refresh(entry, wakes);
+            let waiter = entry.leader.and_then(|id| entry.waiters.get(&id))?;
+            if !matches!(entry.phase, Phase::Acquiring) || waiter.scope.check().is_err() {
+                return None;
+            }
+            entry.state.leader_deadline()
+        })
+    }
+
+    /// [`FlightOperation::cancellation_requested`], registering `cx` to be
+    /// woken at the current leader's deadline (Known issue 161). The worker
+    /// expires the alarm through [`Flights::poll_with_context`].
+    pub(super) fn poll_cancellation(&mut self, cx: &mut Context<'_>) -> bool {
+        let Some(deadline) = self.leader_deadline() else {
+            self.alarm = None;
+            return true;
+        };
+        if self.alarm.as_ref().is_none_or(|(at, _)| *at != deadline) {
+            match self.flights.admission_deadlines.register(deadline) {
+                Ok(registration) => self.alarm = Some((deadline, registration)),
+                Err(_) => return true,
+            }
+        }
+        if let Some((_, alarm)) = &self.alarm
+            && alarm.poll_expired(cx).is_ready()
+        {
+            // Expired between the refresh and now; the next poll re-evaluates.
+            self.alarm = None;
+            cx.waker().wake_by_ref();
+        }
+        false
     }
 }
 
@@ -1235,6 +1273,17 @@ impl Flights {
         self.expiry_snapshot(now, now, None)
     }
 
+    /// Refresh `page` and report whether its acquisition was handed over.
+    #[cfg(test)]
+    pub(super) fn handed_over(&self, page: &PageId) -> bool {
+        self.update(|table, wakes| {
+            table.get_mut(page).is_some_and(|entry| {
+                refresh(entry, wakes);
+                entry.state.handed_over()
+            })
+        })
+    }
+
     /// Inspect admission ownership in lifecycle regressions.
     #[cfg(test)]
     pub(super) fn admission_state(&self) -> (usize, usize, bool) {
@@ -1406,6 +1455,18 @@ impl Flights {
         self.publish_acquired(leader, page.into())
     }
 
+    /// Let `leader`'s running operation continue for another live acquisition
+    /// waiter when `leader` expires or is canceled (Known issue 161). Only for
+    /// drivers whose caller does not fence on the operation.
+    pub(crate) fn allow_handover(&self, leader: &FlightLeader) -> Result<()> {
+        self.update(|table, wakes| {
+            self.leader_entry(table, leader, wakes)?
+                .state
+                .allow_handover();
+            Ok(())
+        })
+    }
+
     pub(crate) fn ciphertext_for(&self, leader: &FlightLeader) -> Result<Option<UnverifiedPage>> {
         self.update(|table, wakes| Ok(self.leader_entry(table, leader, wakes)?.partial.clone()))
     }
@@ -1452,6 +1513,13 @@ impl Flights {
                 }
                 AcquisitionFailure::OriginForbidden => {
                     entry.state.cancel(leader.caller, Error::OriginForbidden);
+                    Outcome::Retry
+                }
+                // After a handover the elected caller's own deadline or
+                // cancellation does not end the cohort: retry for the adopter.
+                AcquisitionFailure::Terminal(Error::DeadlineExceeded | Error::Cancelled)
+                    if entry.state.handed_over() =>
+                {
                     Outcome::Retry
                 }
                 AcquisitionFailure::Terminal(error) => Outcome::Failed(error),
@@ -1572,6 +1640,7 @@ impl Flights {
                 flights: self.clone(),
                 fence: entry.fence.clone(),
                 id,
+                alarm: None,
             })
         })
     }

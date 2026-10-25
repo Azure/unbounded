@@ -1479,11 +1479,28 @@ impl Fill {
         // abandonment must cancel only this work.
         let caller_scope = acquisition.scope.clone();
         let caller_cancellation = caller_scope.cancellation.subscribe()?;
-        let owned_scope = RequestScope::new(caller_scope.request, caller_scope.deadline.0)?;
-        let operation = self
+        // Known issue 161: unless the caller fences on this work (warm
+        // gates), the running fill continues for another live acquisition
+        // waiter when the leader expires or is canceled, instead of being
+        // canceled and restarted from scratch by the next leader. The owned
+        // scope then runs to a hard ceiling; the driver cancels it as soon as
+        // no live waiter remains (`FlightOperation::poll_cancellation`).
+        // Attempts and links stay charged to the leader's budget; the extra
+        // time is within the adopting waiter's own deadline and budget.
+        let handover = !self.fence_acquisition;
+        let ceiling = racer_core::read::flight::handover_ceiling(
+            uring_runtime::environment::now(),
+            caller_scope.deadline.0,
+            handover,
+        );
+        let owned_scope = RequestScope::new(caller_scope.request, ceiling)?;
+        let mut operation = self
             .dependencies
             .flights
             .retain_operation(&leader, self.metrics.lease(Gauge::ActiveFills)?)?;
+        if handover {
+            self.dependencies.flights.allow_handover(&leader)?;
+        }
         let mut owned_budget = acquisition.budget.transfer();
         let owned_membership = acquisition.membership.clone();
         let owned_page = page.clone();
@@ -1579,7 +1596,8 @@ impl Fill {
                     caller_cancellation.register(cx.waker());
                 }
                 if !owned_scope.cancellation.is_cancelled()
-                    && (caller_scope.check().is_err() || operation.cancellation_requested())
+                    && ((!handover && caller_scope.check().is_err())
+                        || operation.poll_cancellation(cx))
                 {
                     if let Some(diagnostic) = &fill.diagnostic {
                         diagnostic.cancellation_seen();

@@ -448,6 +448,20 @@ impl<C: Clone, P: Clone, O, S: BuildHasher> PageFlights<C, P, O, S> {
         Ok(())
     }
 
+    /// Leader `id`'s acquisition was abandoned without an outcome: no driver
+    /// remains to continue it, so it is revoked at once and never handed over
+    /// (production `Drop for FlightLeader`).
+    pub fn abandon(&mut self, page: &PageId, id: u64, wakes: &mut Vec<Token>) {
+        let split = self.split;
+        if let Some(flight) = self.flights.get_mut(page)
+            && flight.state.validate_leader(id, true).is_ok()
+        {
+            flight.state.revoke(Error::Cancelled, wakes);
+            let idle = flight.idle();
+            flight.state.settle(idle, Error::Unavailable, split, wakes);
+        }
+    }
+
     /// Cancel waiter `id`; a canceled leader is revoked on the next refresh.
     pub fn cancel(&mut self, page: &PageId, id: u64, wakes: &mut Vec<Token>) {
         if let Some(flight) = self.flights.get_mut(page) {

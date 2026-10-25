@@ -1437,7 +1437,9 @@ pub mod flight {
 
             /// Revoke acquisition immediately, retaining its outcome behind completion.
             pub fn revoke(&mut self, error: W::Error, wakes: &mut Vec<T>) {
-                if let Some(waiter) = self.leader.and_then(|id| self.waiters.get_mut(&id)) {
+                // The elected caller's work is revoked; an adopting waiter keeps
+                // its own election opportunity.
+                if let Some(waiter) = self.elected.and_then(|id| self.waiters.get_mut(&id)) {
                     waiter.error = Some(error);
                 }
                 self.phase = Phase::Draining(Outcome::Retry);

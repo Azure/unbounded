@@ -1221,6 +1221,113 @@ mod flight {
             );
         }
 
+        /// Known issue 161: a canceled leader's running operation continues for
+        /// the remaining acquisition waiter instead of being canceled; the
+        /// elected capability publishes and the adopter completes without
+        /// leading a second fill or spending its budget.
+        #[test]
+        fn canceled_leader_hands_running_operation_to_live_waiter() {
+            let flights = flights(FlightLimits::default());
+            let (context, scope_a, scope_b) = (origin(), scope(), scope());
+            let (mut a_budget, mut b_budget) = (budget(), budget());
+            let mut a = join(&flights, &context, &scope_a, &mut a_budget);
+            let mut b = join(&flights, &context, &scope_b, &mut b_budget);
+            let leader = lead(&mut a);
+            let mut operation = flights.retain_operation(&leader, metric_lease()).unwrap();
+            flights.allow_handover(&leader).unwrap();
+            assert!(poll(b.wait()).is_pending());
+            let cx = &mut Context::from_waker(futures::task::noop_waker_ref());
+            assert!(!operation.poll_cancellation(cx));
+            scope_a.cancel().unwrap();
+            flights.poll_budgeted(1).unwrap();
+            assert!(!operation.cancellation_requested(), "b adopts the work");
+            assert!(!operation.poll_cancellation(cx));
+            failed(&mut a, Error::Cancelled);
+            drop(a);
+            assert!(poll(b.wait()).is_pending(), "no second election");
+            operation.complete().unwrap();
+            let page = result(&flights, fence().page);
+            assert_eq!(flights.publish(leader, page), Ok(FlightState::Complete));
+            assert!(matches!(
+                poll(b.wait()),
+                Poll::Ready(Ok(AcquisitionEvent::Complete(_)))
+            ));
+            drop(b);
+            assert_eq!(b_budget.remaining_attempts(), 3);
+        }
+
+        /// The handed-over operation is canceled once its last adopter is gone,
+        /// copy waiters never adopt, and an elected caller's own deadline or
+        /// cancellation reported by the driver retries for an eligible waiter.
+        #[test]
+        fn handover_ends_with_last_adopter_and_caller_scope_failure_retries() {
+            let flights = flights(FlightLimits::default());
+            let (context, scope_a, scope_b, scope_c) = (origin(), scope(), scope(), scope());
+            let (mut a_budget, mut b_budget, mut c_budget) = (budget(), budget(), budget());
+            let mut a = join(&flights, &context, &scope_a, &mut a_budget);
+            let mut b = join(&flights, &context, &scope_b, &mut b_budget);
+            let leader = lead(&mut a);
+            let mut copy = match flights.join_copy(&fence().page, &scope_c).unwrap() {
+                JoinedCopy::Waiter(waiter) => waiter,
+                _ => panic!("expected copy waiter"),
+            };
+            let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
+            flights.allow_handover(&leader).unwrap();
+            scope_a.cancel().unwrap();
+            assert!(!operation.cancellation_requested());
+            scope_b.cancel().unwrap();
+            assert!(
+                operation.cancellation_requested(),
+                "copy waiters cannot adopt"
+            );
+            failed(&mut b, Error::Cancelled);
+            operation.complete().unwrap();
+            assert!(matches!(
+                poll(copy.wait()),
+                Poll::Ready(Err(Error::Unavailable))
+            ));
+            drop((a, b, copy, leader));
+
+            let (scope_d, scope_e) = (scope(), scope());
+            let mut d = join(&flights, &context, &scope_d, &mut c_budget);
+            let mut e_budget = budget();
+            let mut e = join(&flights, &context, &scope_e, &mut e_budget);
+            let leader = lead(&mut d);
+            let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
+            flights.allow_handover(&leader).unwrap();
+            scope_d.cancel().unwrap();
+            assert!(!operation.cancellation_requested());
+            operation.complete().unwrap();
+            assert_eq!(
+                flights.fail(leader, AcquisitionFailure::Terminal(Error::Cancelled)),
+                Ok(FlightState::RetryPending)
+            );
+            let retry = lead(&mut e);
+            assert_eq!(e.acquisition(&retry).unwrap().budget.remaining_attempts(), 3);
+            flights
+                .fail(retry, AcquisitionFailure::Terminal(Error::Io))
+                .unwrap();
+            failed(&mut e, Error::Io);
+        }
+
+        /// Without handover (warm gates fence on the operation) the old
+        /// cancellation stands even when another waiter remains.
+        #[test]
+        fn without_handover_canceled_leader_revokes_running_operation() {
+            let flights = flights(FlightLimits::default());
+            let (context, scope_a, scope_b) = (origin(), scope(), scope());
+            let (mut a_budget, mut b_budget) = (budget(), budget());
+            let mut a = join(&flights, &context, &scope_a, &mut a_budget);
+            let mut b = join(&flights, &context, &scope_b, &mut b_budget);
+            let leader = lead(&mut a);
+            let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
+            scope_a.cancel().unwrap();
+            assert!(operation.cancellation_requested());
+            assert!(poll(b.wait()).is_pending());
+            operation.complete().unwrap();
+            assert!(lead(&mut b).fence.generation > leader.fence.generation);
+        }
+
         #[test]
         fn join_preserves_occupied_flight_until_operation_drains() {
             let flights = flights(FlightLimits::default());

@@ -326,7 +326,7 @@ impl Pair {
     /// revokes it); core cancels a leader and detaches.
     fn detach(&mut self, mut caller: Caller) {
         if caller.leader.is_some() {
-            self.table.cancel(&self.page, caller.core, &mut self.wakes);
+            self.table.abandon(&self.page, caller.core, &mut self.wakes);
         }
         drop(caller.leader.take());
         drop(caller.prod.take());
@@ -348,18 +348,37 @@ impl Pair {
     }
 
     fn fail(&mut self, caller: &mut Caller) {
+        self.fail_with(caller, Error::Io, racer_core::read::Error::Io);
+    }
+
+    /// Fail with the elected caller's own scope error, which a handed-over
+    /// acquisition turns into a retry for the adopter.
+    fn fail_with(&mut self, caller: &mut Caller, prod: Error, core: racer_core::read::Error) {
         let leader = caller.leader.take().unwrap();
         let prod = self
             .flights
-            .fail(leader, AcquisitionFailure::Terminal(Error::Io))
+            .fail(leader, AcquisitionFailure::Terminal(prod))
             .map(|_| ());
-        let core = self.table.finish(
-            &self.page,
-            caller.core,
-            Outcome::Failed(racer_core::read::Error::Io),
-            &mut self.wakes,
-        );
+        let core = self
+            .table
+            .finish(&self.page, caller.core, Outcome::Failed(core), &mut self.wakes);
         settle(prod, core);
+    }
+
+    /// Allow `caller`'s running acquisition to be handed over on both sides.
+    fn allow_handover(&mut self, caller: &Caller) {
+        let leader = caller.leader.as_ref().unwrap();
+        let prod = self.flights.allow_handover(leader);
+        let core = self.table.allow_handover(&self.page, caller.core);
+        settle(prod, core);
+    }
+
+    /// Whether both tables report the acquisition handed over.
+    fn handed_over(&mut self) -> bool {
+        let prod = self.flights.handed_over(&self.page);
+        self.table.refresh(&self.page, Self::now(), &mut self.wakes);
+        assert_eq!(prod, self.table.handed_over(&self.page), "handed over");
+        prod
     }
 
     fn reject(&mut self, caller: &mut Caller) {
@@ -516,7 +535,7 @@ fn flights_match_page_flights_on_seeded_traces() {
                 }
                 6 if leader.is_some() => {
                     let caller = &mut callers[leader.unwrap()];
-                    match rng.below(3) {
+                    match rng.below(4) {
                         0 => {
                             value += 1;
                             pair.publish(caller, value);
@@ -525,6 +544,21 @@ fn flights_match_page_flights_on_seeded_traces() {
                         1 => {
                             pair.fail(caller);
                             *steps.entry("fail").or_default() += 1;
+                        }
+                        2 => {
+                            let handed = pair.handed_over();
+                            pair.fail_with(
+                                caller,
+                                Error::DeadlineExceeded,
+                                racer_core::read::Error::DeadlineExceeded,
+                            );
+                            *steps
+                                .entry(if handed {
+                                    "fail_handed_over"
+                                } else {
+                                    "fail_deadline"
+                                })
+                                .or_default() += 1;
                         }
                         _ => {
                             pair.reject(caller);
@@ -539,13 +573,14 @@ fn flights_match_page_flights_on_seeded_traces() {
                 }
                 8 if leader.is_some() && pair.operations.len() < 3 => {
                     let caller = &callers[leader.unwrap()];
+                    let retained = pair.retain(caller);
                     *steps
-                        .entry(if pair.retain(caller) {
-                            "retain"
-                        } else {
-                            "retain_stale"
-                        })
+                        .entry(if retained { "retain" } else { "retain_stale" })
                         .or_default() += 1;
+                    if retained && rng.below(4) != 0 {
+                        pair.allow_handover(caller);
+                        *steps.entry("allow_handover").or_default() += 1;
+                    }
                 }
                 9 if !pair.operations.is_empty() => {
                     let i = rng.below(pair.operations.len() as u64) as usize;
@@ -553,6 +588,9 @@ fn flights_match_page_flights_on_seeded_traces() {
                     *steps.entry("complete_operation").or_default() += 1;
                 }
                 _ => {}
+            }
+            if pair.handed_over() {
+                *steps.entry("handed_over").or_default() += 1;
             }
             pair.check();
         }
@@ -582,6 +620,8 @@ fn flights_match_page_flights_on_seeded_traces() {
         "advance",
         "retain",
         "complete_operation",
+        "allow_handover",
+        "handed_over",
     ] {
         assert!(
             steps.get(step).copied().unwrap_or(0) > 0,
@@ -626,6 +666,55 @@ fn expired_leader_with_retained_operation_drains_before_reelection() {
     assert_eq!(pair.poll(&mut b), Obs::Lead);
     pair.publish(&mut b, 2);
     assert_eq!(pair.poll(&mut b), Obs::Complete(2));
+    pair.detach(b);
+    pair.check();
+    assert!(pair.table.is_empty());
+}
+
+/// Known issue 161: an expired leader's running operation passes to the
+/// live waiter with the latest deadline on both tables; the elected
+/// capability's deadline failure then retries for the adopter, which leads
+/// with its own budget; abandoning a handed-over acquisition revokes it and
+/// fails the elected caller, not the adopter.
+#[test]
+fn expired_leader_hands_over_running_operation_on_both_tables() {
+    let clock = uring_runtime::environment::SimulationClock::new(161);
+    let _environment = clock.environment(0).enter();
+    let mut pair = Pair::new(core::FlightLimits::default());
+    let mut a = pair.join(Duration::from_secs(1), 2).1.unwrap();
+    let mut b = pair.join(Duration::from_secs(60), 2).1.unwrap();
+    let mut c = pair.join(Duration::from_secs(30), 2).1.unwrap();
+    assert_eq!(pair.poll(&mut a), Obs::Lead);
+    assert!(pair.retain(&a));
+    pair.allow_handover(&a);
+    assert!(!pair.handed_over());
+    clock.advance(Duration::from_secs(1));
+    pair.refresh();
+    assert!(pair.handed_over());
+    assert_eq!(pair.poll(&mut b), Obs::Pending);
+    assert_eq!(pair.poll(&mut c), Obs::Pending);
+    pair.complete(0);
+    pair.fail_with(
+        &mut a,
+        Error::DeadlineExceeded,
+        racer_core::read::Error::DeadlineExceeded,
+    );
+    assert_eq!(pair.poll(&mut a), Obs::Failed("DeadlineExceeded".into()));
+    // Both remain eligible; c polls first and leads with its own budget.
+    assert_eq!(pair.poll(&mut c), Obs::Lead);
+    assert!(pair.retain(&c));
+    pair.allow_handover(&c);
+    pair.cancel(&mut c);
+    assert!(pair.handed_over(), "b adopts c's operation");
+    // Dropping the driver's capability abandons the work: it is revoked.
+    pair.detach(c);
+    assert!(!pair.handed_over());
+    assert_eq!(pair.poll(&mut b), Obs::Pending, "b is still eligible");
+    pair.complete(0);
+    assert_eq!(pair.poll(&mut b), Obs::Lead);
+    pair.publish(&mut b, 4);
+    assert_eq!(pair.poll(&mut b), Obs::Complete(4));
+    pair.detach(a);
     pair.detach(b);
     pair.check();
     assert!(pair.table.is_empty());
