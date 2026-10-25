@@ -171,7 +171,7 @@ fn requesters_ahead_of_their_destination_skip_it() {
 /// owners reach the origin (`only_owner_hits_origin`, checked by `run`).
 #[test]
 fn stale_owners_send_non_owners_to_the_previous_membership() {
-    let with = |fallback: bool| {
+    let with = |fallback: bool, refund: bool| {
         let mut config = churny(120, 2);
         config.request_rate = 40.0;
         config.node.membership_lag_ns = config.node.membership_batch_ns;
@@ -179,10 +179,14 @@ fn stale_owners_send_non_owners_to_the_previous_membership() {
         // Measure the fallback alone: without it, readers would wait for the
         // stale owners instead (Known issue 26).
         config.node.stale_wait = false;
+        // The links a stale answer returns (Known issues 47 and 49) let a
+        // walk reach the other owners even without the fallback, so most
+        // of the failed reads it saved are measured with that refund off.
+        config.node.stale_link_refund = refund;
         run(config, 3).1
     };
-    let off = with(false);
-    let on = with(true);
+    let off = with(false, false);
+    let on = with(true, false);
     assert_eq!(counter(&off, "stale_fallbacks"), 0);
     assert!(counter(&on, "stale_fallbacks") > 0, "{on}");
     let exhausted = |r: &Value| counter(r, "walk_exhausted_stale");
@@ -193,9 +197,19 @@ fn stale_owners_send_non_owners_to_the_previous_membership() {
         exhausted(&on),
         exhausted(&off)
     );
-    // Seed 3: 1,179 such walks and 53 failed reads without the fallback,
-    // 8 and 3 with it.
+    // Seed 3, refund off: 1,028 such walks and 40 failed reads without the
+    // fallback, 6 and 3 with it.
     assert!(counter(&on, "reads_failed") * 4 <= counter(&off, "reads_failed"));
+    // With the refund (the default) the fallback still ends far fewer walks
+    // exhausted (597 to 1) and fails no more reads (2 and 2).
+    let (off, on) = (with(false, true), with(true, true));
+    assert!(
+        exhausted(&on) * 10 <= exhausted(&off),
+        "{} vs {}",
+        exhausted(&on),
+        exhausted(&off)
+    );
+    assert!(counter(&on, "reads_failed") <= counter(&off, "reads_failed"));
 }
 
 /// Known issue 26: a node that rejoins in version N is not a member of
