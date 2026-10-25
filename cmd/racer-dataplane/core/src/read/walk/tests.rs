@@ -1537,3 +1537,46 @@ fn owner_above_rank_zero_asks_successors_after_its_delegation() {
     });
     assert!(probes.iter().all(|(p, ..)| p.canonical < 3));
 }
+
+/// Wave 4 merge: rank 0 asks a successor (own grant) and then a lineage
+/// target before origin. A `StaleMembership` refund of the successor's
+/// remote credits lands in the grant, which is dropped, so the walk's budget
+/// never grows; and neither probe timing out is a rank 0 timeout, so rank 0
+/// keeps origin authority (Known issues 21, 25, 26, 31).
+#[test]
+fn successor_and_lineage_probes_neither_grow_the_budget_nor_withhold_origin() {
+    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
+    cfg.handoff = 2;
+    cfg.successors = 1;
+    cfg.lineage = [1, 0, 0];
+    let mut walk = CandidateWalk::new(cfg);
+    let mut b = budget(4, 32);
+    let start = (b.remaining_attempts(), b.remaining_links());
+    let mut probes = Vec::new();
+    let end = loop {
+        match walk.next(&mut b).unwrap() {
+            Step::Probe(probe) => {
+                probes.push(probe.canonical);
+                let successor = walk.pending_successor();
+                let request = walk.request_budget(&mut b);
+                let outcome = if successor {
+                    let sent = request.send_remote(1).unwrap();
+                    request.refund_remote(sent).unwrap();
+                    Outcome::StaleDestination
+                } else {
+                    Outcome::TimedOut
+                };
+                if let Some(end) = walk.complete(&mut b, outcome).unwrap() {
+                    break end;
+                }
+                let now = (b.remaining_attempts(), b.remaining_links());
+                assert!(now.0 <= start.0 && now.1 <= start.1, "{now:?} > {start:?}");
+            }
+            Step::End(end) => break end,
+        }
+    };
+    assert_eq!(probes, [3, 4]);
+    assert!(matches!(end, End::Origin { rank: 0, .. }), "{end:?}");
+    assert!(!walk.rank0_unanswered());
+    assert!(b.remaining_attempts() <= start.0 && b.remaining_links() <= start.1);
+}

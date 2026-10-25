@@ -584,9 +584,13 @@ mod tests {
         };
         assert!(orphans(&on) < orphans(&off), "{}", on["origin_per_page"]);
         // A refetch by rank 0 that noted the holder is rare: its one probe
-        // missed (the holder's fetch was still running or failed).
+        // missed (the holder's fetch had failed) or failed. Since copy-only
+        // requests join a running acquisition (Known issue 31), a probe that
+        // reaches a holder still fetching waits in its flight and runs out
+        // of its short time share, which counts as a failure, not a miss.
         assert!(
-            counter(&on, "origin_repeats_orphan_noted") <= counter(&on, "successor_misses"),
+            counter(&on, "origin_repeats_orphan_noted")
+                <= counter(&on, "successor_misses") + counter(&on, "successor_failures"),
             "{}",
             on["metrics"]
         );
