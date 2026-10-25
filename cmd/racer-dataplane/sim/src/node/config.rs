@@ -113,6 +113,10 @@ pub struct NodeConfig {
     /// `copy_join_allowed`: always on; set 0 to measure without it, Known
     /// issue 311).
     pub copy_join_rank: bool,
+    /// An owner above rank 0 that fetched a page from origin offers it to
+    /// rank 0 later (production `orphan_notices`: always on; set 0 to
+    /// measure without it, Known issue 37). Needs `successor_hints`.
+    pub orphan_notices: bool,
 }
 
 impl Default for NodeConfig {
@@ -153,6 +157,7 @@ impl Default for NodeConfig {
             lineage_grants: true,
             lineage_slack: true,
             copy_join_rank: true,
+            orphan_notices: true,
         }
     }
 }
@@ -203,6 +208,7 @@ impl NodeConfig {
                 "lineage_grants" if n <= 1 => self.lineage_grants = n == 1,
                 "lineage_slack" if n <= 1 => self.lineage_slack = n == 1,
                 "copy_join_rank" if n <= 1 => self.copy_join_rank = n == 1,
+                "orphan_notices" if n <= 1 => self.orphan_notices = n == 1,
                 _ => return Err(format!("unknown key node.{key}")),
             }
         }

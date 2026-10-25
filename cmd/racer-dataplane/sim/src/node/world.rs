@@ -44,6 +44,7 @@ use racer_core::read::candidates::{
 use racer_core::read::fanout::{fanout_helper, hot_page_bodies, is_helper, shed_hot_page};
 use racer_core::read::fill::{FailureKind, FillPlan, FillStep, Source, WalkResult};
 use racer_core::read::flight::{Event as FlightEvent, Joined, JoinedCopy};
+use racer_core::read::notice::{Due, NOTICE_LINKS, notice_target, offer_noted, should_notice};
 use racer_core::read::policy::{
     Persist, PersistFacts, peer_error, persist, recoverable, retention_eligible, retention_score,
 };
@@ -200,6 +201,10 @@ pub enum Event {
     StaleWait {
         fill: u64,
     },
+    /// Orphan notices of `node` may be due (Known issue 37).
+    Notice {
+        node: u32,
+    },
 }
 
 impl Event {
@@ -240,6 +245,7 @@ impl Event {
             Self::OriginCancel { fill } => (19, fill, 0),
             Self::OriginWake => (20, 0, 0),
             Self::StaleWait { fill } => (21, fill, 0),
+            Self::Notice { node } => (22, node.into(), 0),
         }
     }
 }
@@ -571,6 +577,9 @@ struct Msg {
     relay_first: Nanos,
     /// A pinned single-link hedge exchange.
     direct: bool,
+    /// An orphan notice's copy offer (Known issue 37): answered `Miss`
+    /// without a body.
+    offer: bool,
 }
 
 struct Probing {
@@ -696,6 +705,9 @@ pub struct NodeWorld {
     tokens: HashMap<u64, Waiting, Fixed>,
     msgs: HashMap<u64, Msg, Fixed>,
     probes: HashMap<u64, Probing, Fixed>,
+    /// Outstanding copy offers: the sending node, its incarnation, and the
+    /// notice (Known issue 37).
+    offers: HashMap<u64, (u32, u32, Due<u64, u32>), Fixed>,
     ranges: HashMap<u64, RangeRead, Fixed>,
     writes: HashMap<u64, SimCharge, Fixed>,
     /// Relay reservations of replies still streaming (see `Event::Release`).
@@ -815,6 +827,7 @@ impl NodeWorld {
             tokens: HashMap::default(),
             msgs: HashMap::default(),
             probes: HashMap::default(),
+            offers: HashMap::default(),
             ranges: HashMap::default(),
             writes: HashMap::default(),
             held: HashMap::default(),
@@ -979,6 +992,9 @@ impl NodeWorld {
             Event::LinkDown { msg, holder } => self.fail_hop(msg, holder, Fault::Unavailable),
             Event::Reply { probe, reply } => self.reply(probe, reply),
             Event::ProbeTimeout { probe } => {
+                if let Some((node, incarnation, due)) = self.offers.remove(&probe) {
+                    self.offer_done(node, incarnation, due, false);
+                }
                 if let Some(p) = self.probes.remove(&probe) {
                     self.metrics.incr("probe_timeouts");
                     match p.hedge {
@@ -1031,6 +1047,7 @@ impl NodeWorld {
             Event::Slice { task } => self.slice(task),
             Event::HedgeDelay { fill } => self.hedge_delay(fill),
             Event::StaleWait { fill } => self.stale_wait_done(fill),
+            Event::Notice { node } => self.send_notices(node),
             Event::OriginCancel { fill } => self.origin_cancel(fill),
             Event::OriginWake => self.origin_wake(),
             Event::Release { id } => {
@@ -2787,6 +2804,7 @@ impl NodeWorld {
             relays: Vec::new(),
             relay_first: 0,
             direct,
+            offer: false,
         };
         let pid = self.fresh();
         let mid = self.fresh();
@@ -3241,6 +3259,9 @@ impl NodeWorld {
         let now = self.now();
         let m = self.msgs.get(&mid).expect("message");
         let (dest, page, requester) = (m.dest, m.page, m.requester);
+        if m.offer {
+            return self.serve_offer(mid, dest, page, requester);
+        }
         if self.shed_hot(dest, requester, page) {
             self.metrics.incr("hot_page_sheds");
             let reply = peer_error(Error::Overloaded).map_or(Reply::Transport, Reply::Response);
@@ -3510,6 +3531,13 @@ impl NodeWorld {
     }
 
     fn reply(&mut self, pid: u64, reply: Reply) {
+        if let Some((node, incarnation, due)) = self.offers.remove(&pid) {
+            // Only the destination answers an offer `Miss`; anything else
+            // (transport, a relay's answer, shed, behind) tries again.
+            let delivered = reply == Reply::Response(ResponseKind::Miss);
+            self.offer_done(node, incarnation, due, delivered);
+            return;
+        }
         let Some(probe) = self.probes.remove(&pid) else {
             self.metrics.incr("late_replies");
             if reply == Reply::Response(ResponseKind::Page) {
@@ -4433,7 +4461,12 @@ impl NodeWorld {
         };
         let (node, page) = (fill.node, fill.page);
         let ok = result.is_ok();
+        let rank0 = fill.cands.first().copied();
+        let notice = ok && should_notice(fill.rank);
         fill.plan.origin(result);
+        if notice && let Some(rank0) = rank0 {
+            self.note_notice(node, page, rank0);
+        }
         let now = self.now();
         if let Some(last) = self.last_origin.get_mut(&page)
             && last.node == node
@@ -4443,6 +4476,113 @@ impl NodeWorld {
             last.done = now;
         }
         self.continue_plan(id);
+    }
+
+    /// `node` fetched `page` from origin as an owner above `rank0`: offer
+    /// the copy to `rank0` later (Known issue 37).
+    fn note_notice(&mut self, node: u32, page: u64, rank0: u32) {
+        let config = &self.config.node;
+        if !config.orphan_notices || !config.successor_hints || rank0 == node {
+            return;
+        }
+        let instant = self.instant(self.now());
+        let due = self.nodes[node as usize].notices.note(page, rank0, instant);
+        self.metrics.incr("orphan_notices_noted");
+        self.engine.at(self.nanos(due), Event::Notice { node });
+    }
+
+    /// Send `node`'s due copy offers (production orphan notice timer).
+    fn send_notices(&mut self, node: u32) {
+        if self.nodes[node as usize].down {
+            return;
+        }
+        let instant = self.instant(self.now());
+        while let Some(due) = self.nodes[node as usize].notices.pop_due(instant) {
+            let page = due.key;
+            let w = self.ids.worker(page);
+            let n = &self.nodes[node as usize];
+            let holds = n.workers[w as usize].memory.pages.contains_key(&page)
+                || n.disk.entries.get(&page).is_some();
+            let owners = self.owners_at(node, w, page, true);
+            match notice_target(&node, &owners, holds) {
+                Some(target) => self.launch_offer(node, Due { target, ..due }),
+                None => self.metrics.incr("orphan_notices_dropped"),
+            }
+        }
+    }
+
+    /// Send one copy offer for `due` from `node`, on its own route grant
+    /// ([`NOTICE_LINKS`], no attempts).
+    fn launch_offer(&mut self, node: u32, due: Due<u64, u32>) {
+        let now = self.now();
+        let timeout = now + self.config.node.attempt_timeout_ns;
+        let version = self.nodes[node as usize].version;
+        let incarnation = self.nodes[node as usize].incarnation;
+        let pid = self.fresh();
+        let mid = self.fresh();
+        let msg = Msg {
+            probe: pid,
+            requester: node,
+            at: node,
+            dest: due.target,
+            version,
+            page: due.key,
+            acquire: false,
+            path: vec![node],
+            links: NOTICE_LINKS,
+            attempts: 0,
+            deadline: timeout,
+            abandon: timeout,
+            relays: Vec::new(),
+            relay_first: 0,
+            direct: false,
+            offer: true,
+        };
+        self.offers.insert(pid, (node, incarnation, due));
+        self.msgs.insert(mid, msg);
+        self.engine.at(timeout, Event::ProbeTimeout { probe: pid });
+        self.metrics.incr("orphan_offers_sent");
+        self.forward(mid, node, None);
+    }
+
+    /// A copy offer ended: delivered, or try again after the next delay.
+    fn offer_done(&mut self, node: u32, incarnation: u32, due: Due<u64, u32>, delivered: bool) {
+        if delivered {
+            self.metrics.incr("orphan_offers_delivered");
+            return;
+        }
+        self.metrics.incr("orphan_offers_failed");
+        let n = &self.nodes[node as usize];
+        if n.down || n.incarnation != incarnation {
+            return;
+        }
+        let instant = self.instant(self.now());
+        match self.nodes[node as usize].notices.failed(due, instant) {
+            Some(next) => self.engine.at(self.nanos(next), Event::Notice { node }),
+            None => self.metrics.incr("orphan_notices_expired"),
+        }
+    }
+
+    /// Answer a copy offer `Miss`, noting the requester as a successor hint
+    /// when this node neither holds the page nor is fetching it (production
+    /// `Coordinator::serve_peer`, Known issue 37).
+    fn serve_offer(&mut self, mid: u64, dest: u32, page: u64, requester: u32) {
+        let now = self.now();
+        let w = self.ids.worker(page);
+        let n = &self.nodes[dest as usize];
+        let holds = n.workers[w as usize].memory.pages.contains_key(&page)
+            || n.disk.entries.get(&page).is_some();
+        let acquiring = n.workers[w as usize]
+            .flights
+            .acquiring(&self.ids.page(page));
+        if offer_noted(holds, acquiring) {
+            self.metrics.incr("orphan_offers_noted");
+            self.note_hint(dest, page, requester, true);
+        } else {
+            self.metrics.incr("orphan_offers_redundant");
+        }
+        let t = self.fabric.cpu(now, dest, w, self.fabric.costs.request_ns);
+        self.send_reply(mid, dest, Reply::Response(ResponseKind::Miss), t);
     }
 
     fn continue_plan(&mut self, id: u64) {

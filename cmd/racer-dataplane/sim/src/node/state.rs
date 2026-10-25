@@ -9,6 +9,7 @@ use page_alloc::retention::{Heat, SecondSight};
 use page_alloc::{Alignment, PhantomEntries, SegmentClock, Segments};
 use racer_core::cache::lru::TickLru;
 use racer_core::read::flight::{FlightLimits, PageFlights};
+use racer_core::read::notice::{NOTICE_CAPACITY, OrphanNotices};
 use racer_core::read::successor::{HINT_CAPACITY, HINT_TTL, SuccessorHints};
 use topology::{MAX_DEGREE, Paths, Phantom, Placement, SharedRoutes};
 
@@ -151,6 +152,9 @@ pub struct Node {
     /// Pages this node answered without a copy, and who asked (production
     /// `Coordinator` successor hints, Known issue 21).
     pub hints: SuccessorHints<u64, u32>,
+    /// Pages this node fetched from origin as an owner above rank 0, to
+    /// offer to rank 0 later (production orphan notices, Known issue 37).
+    pub notices: OrphanNotices<u64, u32>,
 }
 
 pub struct Shared {
@@ -194,6 +198,7 @@ impl Node {
                 config.hedge_bytes as usize,
             ),
             hints: SuccessorHints::new(HINT_CAPACITY, HINT_TTL),
+            notices: OrphanNotices::new(NOTICE_CAPACITY),
         }
     }
 
@@ -224,7 +229,8 @@ impl Node {
         out.links += std::mem::size_of_val(&self.links)
             + self.links.len() * 64
             + self.suspects.capacity() * 4
-            + self.hints.len() * 64;
+            + self.hints.len() * 64
+            + self.notices.len() * 64;
         out.disk_index += self.disk.entries.len() * SEGMENT_MAPPING_BYTES;
         out.segments += std::mem::size_of::<Segments>()
             + std::mem::size_of::<SegmentClock>()
