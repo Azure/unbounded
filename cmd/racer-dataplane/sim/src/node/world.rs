@@ -162,9 +162,10 @@ pub enum Event {
         node: u32,
         factor: u8,
     },
-    /// A fill's scope expired while its origin request was outstanding:
-    /// cancel it like production's fill driver (`src/read/fill.rs`,
-    /// `owned_scope.cancel()`).
+    /// The waiter a fill serves reached its deadline while the fill's origin
+    /// request was outstanding: hand the fill over to another live waiter,
+    /// or cancel it like production's fill driver (`src/read/fill.rs`,
+    /// `FlightOperation::poll_cancellation` and `owned_scope.cancel()`).
     OriginCancel {
         fill: u64,
     },
@@ -1524,7 +1525,20 @@ impl NodeWorld {
             Some(node),
             || format!("retain page {page} leader {leader}: {retained:?}"),
         );
-        let scope = budget.deadline();
+        // Production lets the running fill pass to another live waiter when
+        // its leader expires (Known issue 161, `Flights::allow_handover`),
+        // bounded by a hard ceiling on its owned scope.
+        let handover = self.config.node.flight_handover;
+        if handover {
+            let _ = self.nodes[node as usize].workers[w as usize]
+                .flights
+                .allow_handover(&self.ids.page(page), leader);
+        }
+        let scope = racer_core::read::flight::handover_ceiling(
+            self.instant(self.engine.now()),
+            budget.deadline(),
+            handover,
+        );
         let mut plan = FillPlan::new(plaintext);
         plan.local(false);
         self.fills.insert(
@@ -2348,7 +2362,9 @@ impl NodeWorld {
             None => fill.cands[probe.canonical],
         };
         let fill = self.fills.get_mut(&id).expect("present");
-        let scope = fill.scope;
+        // Peer exchanges stay within the leader's own budget deadline
+        // (`src/read/candidates.rs`, `scope.deadline.0.min(budget.deadline())`).
+        let scope = fill.scope.min(fill.budget.deadline());
         let budget = match &mut fill.walk {
             Walking::Candidates(walk) => walk.request_budget(&mut fill.budget),
             _ => &mut fill.budget,
@@ -3361,14 +3377,15 @@ impl NodeWorld {
         self.metrics.incr("origin_requests");
         *self.origin_per_page.entry(page).or_default() += 1;
         self.classify_repeat(id);
-        let scope = self.nanos(self.fills[&id].scope);
         let fill = self.fills.get_mut(&id).expect("present");
         fill.origin = Some((handle, outcome));
-        // Production bounds the origin exchange by the fill's owned scope,
-        // which is the leader's deadline (`src/read/fill.rs`, `owned_scope`
-        // and its cancellation once the leader is revoked).
-        if done > scope {
-            self.engine.at(scope, Event::OriginCancel { fill: id });
+        // Production bounds the origin exchange by the deadline of the waiter
+        // the fill currently serves, then hands it over or cancels it
+        // (`src/read/fill.rs`, `FlightOperation::poll_cancellation`).
+        if let Some(check) = self.origin_check_at(id)
+            && done > check
+        {
+            self.engine.at(check, Event::OriginCancel { fill: id });
         }
         self.engine
             .at(done, Event::OriginDone { fill: id, outcome });
@@ -3408,15 +3425,22 @@ impl NodeWorld {
     /// fail the fill with `DeadlineExceeded`, as production does.
     fn origin_cancel(&mut self, id: u64) {
         let now = self.now();
-        let Some(fill) = self.fills.get_mut(&id) else {
+        let Some(fill) = self.fills.get(&id) else {
             return;
         };
         let Some((handle, _)) = fill.origin else {
             return;
         };
-        if self.origin.end(handle).is_none_or(|done| done <= now) {
+        let Some(done) = self.origin.end(handle).filter(|done| *done > now) else {
+            return;
+        };
+        if let Some(check) = self.hand_over(id) {
+            if done > check {
+                self.engine.at(check, Event::OriginCancel { fill: id });
+            }
             return;
         }
+        let fill = self.fills.get_mut(&id).expect("present");
         fill.origin = None;
         fill.canceled = true;
         let (node, page) = (fill.node, fill.page);
@@ -3431,6 +3455,55 @@ impl NodeWorld {
             last.done = now;
         }
         self.continue_plan(id);
+    }
+
+    /// When the fill's origin request must next be checked: the deadline of
+    /// the waiter it serves, capped by the fill's ceiling. `None` once no
+    /// live waiter remains.
+    fn origin_check_at(&self, id: u64) -> Option<Nanos> {
+        let fill = &self.fills[&id];
+        let flights = &self.nodes[fill.node as usize].workers[fill.worker as usize].flights;
+        let deadline = flights.leader_deadline(&self.ids.page(fill.page))?;
+        Some(self.nanos(deadline.min(fill.scope)))
+    }
+
+    /// The waiter fill `id` serves reached its deadline. Refresh the flight
+    /// so another live waiter adopts the fill (Known issue 161). If one did,
+    /// fail the elected leader's own read, which production ends at its
+    /// deadline while its driver keeps running, and return when to check
+    /// again; `None` cancels the fill.
+    fn hand_over(&mut self, id: u64) -> Option<Nanos> {
+        let now = self.now();
+        let instant = self.instant(now);
+        let fill = &self.fills[&id];
+        let (node, w, page, leader, token, ceiling) = (
+            fill.node,
+            fill.worker,
+            fill.page,
+            fill.leader,
+            fill.token,
+            self.nanos(fill.scope),
+        );
+        if now >= ceiling {
+            return None;
+        }
+        let page_id = self.ids.page(page);
+        let mut wakes = Vec::new();
+        let flights = &mut self.nodes[node as usize].workers[w as usize].flights;
+        flights.refresh(&page_id, instant, &mut wakes);
+        let live = flights
+            .leader_deadline(&page_id)
+            .filter(|deadline| *deadline > instant);
+        for token in wakes {
+            self.wake(token);
+        }
+        live?;
+        self.metrics.incr("flight_handovers");
+        if let Some(waiting) = self.tokens.remove(&token) {
+            self.detach(node, w, page, leader);
+            self.resolve(waiting.want, Err(Error::DeadlineExceeded));
+        }
+        self.origin_check_at(id)
     }
 
     /// Classify a repeated origin request for a page (Known issues 6, 12,
@@ -3602,6 +3675,13 @@ impl NodeWorld {
         self.invariants
             .check("origin_within_scope", now <= scope, now, Some(node), || {
                 format!("fill {id} origin answered at {now} after its scope {scope}")
+            });
+        // Known issue 161: a handed-over fill runs only while some waiter
+        // it serves is live.
+        let live = self.origin_check_at(id).is_some_and(|check| now <= check);
+        self.invariants
+            .check("origin_for_live_waiter", live, now, Some(node), || {
+                format!("fill {id} origin answered at {now} with no live waiter")
             });
         let fill = self.fills.get_mut(&id).expect("present");
         let result = match outcome {

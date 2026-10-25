@@ -635,6 +635,8 @@ fn repeat_origin_fetches_are_classified_and_bounded() {
 #[test]
 fn expired_leaders_drain_before_a_new_fill() {
     let mut config = quiet(64);
+    // Without handover every expired leader's fill drains or is canceled.
+    config.node.flight_handover = false;
     config.origin_bps = 1 << 20;
     config.duration_ns = 12 * SECONDS;
     config.storms = (0..4)
@@ -657,6 +659,8 @@ fn expired_leaders_drain_before_a_new_fill() {
 #[test]
 fn expired_fills_cancel_their_origin_request() {
     let mut config = quiet(64);
+    // Without handover every expired leader's fill drains or is canceled.
+    config.node.flight_handover = false;
     config.origin_bps = 1 << 20;
     config.duration_ns = 12 * SECONDS;
     config.storms = (0..4)
@@ -671,4 +675,47 @@ fn expired_fills_cancel_their_origin_request() {
     assert!(counter(&report, "flight_stale_finishes") > 0, "{report}");
     assert!(counter(&report, "origin_canceled") > 0, "{report}");
     assert_eq!(counter(&report, "flight_unexpected_lead"), 0);
+}
+
+/// Known issue 161: with origin slower than the read deadline and readers
+/// arriving throughout, an expired leader's fill continues for a later
+/// waiter instead of being canceled and restarted. Compared with the same
+/// run without handover, origin requests and the most requests for one page
+/// fall, and no origin answer reaches a fill without a live waiter
+/// (`origin_for_live_waiter`, checked by `run`).
+#[test]
+fn expired_leaders_hand_their_fill_to_later_waiters() {
+    let report = |handover: bool| {
+        let mut config = quiet(64);
+        config.origin_bps = 1 << 20;
+        config.duration_ns = 16 * SECONDS;
+        config.node.flight_handover = handover;
+        config.storms = (0..12)
+            .map(|i| Storm {
+                at_ns: i * SECONDS,
+                object: 1,
+                nodes: 16,
+                window_ns: 500 * MILLIS,
+            })
+            .collect();
+        run(config, 7).1
+    };
+    let (before, after) = (report(false), report(true));
+    assert_eq!(counter(&before, "flight_handovers"), 0);
+    assert!(counter(&after, "flight_handovers") > 0, "{after}");
+    assert!(
+        counter(&after, "origin_canceled") < counter(&before, "origin_canceled"),
+        "before {} after {}",
+        before["metrics"]["counters"],
+        after["metrics"]["counters"]
+    );
+    assert!(
+        counter(&after, "origin_requests") < counter(&before, "origin_requests"),
+        "before {} after {}",
+        before["metrics"]["counters"],
+        after["metrics"]["counters"]
+    );
+    let max = |r: &Value| r["origin_per_page"]["max_requests_per_page"].as_u64().unwrap();
+    assert!(max(&after) <= max(&before), "{} {}", max(&before), max(&after));
+    assert_eq!(counter(&after, "flight_unexpected_lead"), 0);
 }

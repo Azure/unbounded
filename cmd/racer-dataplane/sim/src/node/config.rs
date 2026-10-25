@@ -71,6 +71,10 @@ pub struct NodeConfig {
     /// page; 0 (default) derives it from the page size like production
     /// (`racer_core::read::fanout::hot_page_bodies`).
     pub hot_page_bodies: u32,
+    /// A running fill continues for another live waiter when its leader
+    /// expires (production: on for every fill except warm gates; set 0 to
+    /// measure without it, Known issue 161).
+    pub flight_handover: bool,
 }
 
 impl Default for NodeConfig {
@@ -101,6 +105,7 @@ impl Default for NodeConfig {
             hedge_bytes: DUPLICATE_BYTES,
             fanout: true,
             hot_page_bodies: 0,
+            flight_handover: true,
         }
     }
 }
@@ -141,6 +146,7 @@ impl NodeConfig {
                 "hedge_bytes" => self.hedge_bytes = n,
                 "fanout" if n <= 1 => self.fanout = n == 1,
                 "hot_page_bodies" => self.hot_page_bodies = small()?,
+                "flight_handover" if n <= 1 => self.flight_handover = n == 1,
                 _ => return Err(format!("unknown key node.{key}")),
             }
         }
@@ -186,11 +192,15 @@ mod tests {
         c.apply_json(&json!({"placement_entries": 9, "membership_lag_ns": 5}))
             .unwrap();
         assert_eq!((c.placement_entries, c.membership_lag_ns), (9, 5));
+        assert!(c.flight_handover);
+        c.apply_json(&json!({"flight_handover": 0})).unwrap();
+        assert!(!c.flight_handover);
         for bad in [
             json!([]),
             json!({"nope": 1}),
             json!({"flights": -1}),
             json!({"flights": 1u64 << 40}),
+            json!({"flight_handover": 2}),
         ] {
             assert!(NodeConfig::default().apply_json(&bad).is_err(), "{bad}");
         }
