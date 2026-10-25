@@ -49,6 +49,7 @@ use racer_core::read::policy::{
 };
 use racer_core::read::range::{PageBudget, SlotKind, direct_fills, first_failure};
 use racer_core::read::serve::{ServeAction, ServeFacts, serve_action, serve_deadline};
+use racer_core::read::successor::{MAX_DEFERRALS, should_note, successor_deferral};
 use racer_core::read::walk::{
     AttemptInputs, AttemptPlan, CandidateWalk, Continuation, End, HedgeFacts, Mode, Outcome,
     PREVIOUS_MEMBERSHIP_WITHIN, Probe, RemainingWalk, RouteMode, StaleAction, Step, WalkConfig,
@@ -1443,16 +1444,80 @@ impl NodeWorld {
                 let Some(m) = self.msgs.get(&msg) else {
                     return;
                 };
-                let dest = m.dest;
+                let (dest, page) = (m.dest, m.page);
                 match result {
                     Ok(_) => self.send_reply(msg, dest, Reply::Response(ResponseKind::Page), now),
                     Err(e) => {
+                        let requester = m.requester;
+                        self.note_hint(dest, page, requester);
                         let reply = peer_error(e).map_or(Reply::Transport, Reply::Response);
                         self.send_reply(msg, dest, reply, now);
                     }
                 }
             }
         }
+    }
+
+    /// Production `Coordinator::serve_peer` (Known issue 21): `node` holds
+    /// no copy of `page` and a hint naming another current owner that
+    /// fetched it after `node` answered it without a copy; a non-owner
+    /// requester is answered `Miss` and asks that owner next.
+    fn defer_to_successor(&mut self, node: u32, page: u64, requester: u32) -> bool {
+        if !self.config.node.successor_hints {
+            return false;
+        }
+        let w = self.ids.worker(page);
+        let instant = self.instant(self.now());
+        let n = &self.nodes[node as usize];
+        if n.hints.is_empty()
+            || n.workers[w as usize].memory.pages.contains_key(&page)
+            || n.disk.entries.get(&page).is_some()
+        {
+            return false;
+        }
+        let hints = n.hints.peek(&page, instant);
+        if hints.is_empty() {
+            return false;
+        }
+        let owners = self.owners_at(node, w, page);
+        if successor_deferral(hints, &requester, &owners).is_none() {
+            return false;
+        }
+        self.nodes[node as usize].hints.charge(&page, MAX_DEFERRALS);
+        true
+    }
+
+    /// The page's owners under the membership `at` adopted (production
+    /// ranks them in the serve path, as `shed_hot_page` does).
+    fn owners_at(&self, at: u32, w: u8, page: u64) -> Vec<u32> {
+        let n = &self.nodes[at as usize];
+        let Some(version) = self.versions.get(n.version) else {
+            return Vec::new();
+        };
+        n.workers[w as usize]
+            .placement
+            .rank(&*version.members, &page.to_be_bytes())
+            .into_iter()
+            .take(3)
+            .map(|p| version.members.members()[p].node)
+            .collect()
+    }
+
+    /// `node` answered `requester`'s page probe without a copy (production
+    /// `Coordinator::serve_peer`, Known issue 21).
+    fn note_hint(&mut self, node: u32, page: u64, requester: u32) {
+        if !self.config.node.successor_hints {
+            return;
+        }
+        let w = self.ids.worker(page);
+        if !should_note(&node, &requester, &self.owners_at(node, w, page)) {
+            return;
+        }
+        self.metrics.incr("successor_hints_noted");
+        let instant = self.instant(self.now());
+        self.nodes[node as usize]
+            .hints
+            .note(page, requester, instant);
     }
 
     pub(super) fn memory_insert(&mut self, node: u32, w: u8, page: u64) {
@@ -2948,10 +3013,19 @@ impl NodeWorld {
                     self.send_reply(mid, dest, Reply::Response(ResponseKind::Page), read);
                 } else {
                     self.metrics.incr("copy_only_misses");
+                    self.note_hint(dest, page, requester);
                     self.send_reply(mid, dest, Reply::Response(ResponseKind::Miss), t);
                 }
             }
+            ServeAction::Acquire if self.defer_to_successor(dest, page, requester) => {
+                // Another owner fetched this page after this node answered
+                // it without a copy: let the requester ask it (Known issue
+                // 21) instead of fetching again.
+                self.metrics.incr("successor_deferrals");
+                self.send_reply(mid, dest, Reply::Response(ResponseKind::Miss), now);
+            }
             ServeAction::Acquire => {
+                let m = self.msgs.get(&mid).expect("message");
                 let scope = self.instant(now + self.config.node.serve_timeout_ns);
                 let route = self.instant(m.deadline);
                 let (attempts, links) = (m.attempts, m.links);

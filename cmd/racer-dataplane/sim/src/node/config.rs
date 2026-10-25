@@ -75,6 +75,9 @@ pub struct NodeConfig {
     /// expires (production: on for every fill except warm gates; set 0 to
     /// measure without it, Known issue 161).
     pub flight_handover: bool,
+    /// Rank 0 asks a successor that recently missed it before origin
+    /// (production: always on; set 0 to measure without it, Known issue 21).
+    pub successor_hints: bool,
 }
 
 impl Default for NodeConfig {
@@ -106,6 +109,7 @@ impl Default for NodeConfig {
             fanout: true,
             hot_page_bodies: 0,
             flight_handover: true,
+            successor_hints: true,
         }
     }
 }
@@ -147,6 +151,7 @@ impl NodeConfig {
                 "fanout" if n <= 1 => self.fanout = n == 1,
                 "hot_page_bodies" => self.hot_page_bodies = small()?,
                 "flight_handover" if n <= 1 => self.flight_handover = n == 1,
+                "successor_hints" if n <= 1 => self.successor_hints = n == 1,
                 _ => return Err(format!("unknown key node.{key}")),
             }
         }

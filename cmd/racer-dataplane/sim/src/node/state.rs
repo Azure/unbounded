@@ -9,6 +9,7 @@ use page_alloc::retention::{Heat, SecondSight};
 use page_alloc::{Alignment, PhantomEntries, SegmentClock, Segments};
 use racer_core::cache::lru::TickLru;
 use racer_core::read::flight::{FlightLimits, PageFlights};
+use racer_core::read::successor::{HINT_CAPACITY, HINT_TTL, SuccessorHints};
 use topology::{MAX_DEGREE, Paths, Phantom, Placement, SharedRoutes};
 
 use super::admission::{PageCharges, Rejections, SimPolicy, SimQuotas};
@@ -142,6 +143,9 @@ pub struct Node {
     /// Speculative hedge slots and bytes shared by the node's workers
     /// (production `Hedges`; zero slots disable hedging).
     pub hedges: std::sync::Arc<flow_control::Hedges>,
+    /// Pages this node answered without a copy, and who asked (production
+    /// `Coordinator` successor hints, Known issue 21).
+    pub hints: SuccessorHints<u64, u32>,
 }
 
 pub struct Shared {
@@ -183,6 +187,7 @@ impl Node {
                 config.hedge_slots as usize,
                 config.hedge_bytes as usize,
             ),
+            hints: SuccessorHints::new(HINT_CAPACITY, HINT_TTL),
         }
     }
 
@@ -212,7 +217,8 @@ impl Node {
             + self.paths.cached_entries() * ROUTE_ENTRY_BYTES;
         out.links += std::mem::size_of_val(&self.links)
             + self.links.len() * 64
-            + self.suspects.capacity() * 4;
+            + self.suspects.capacity() * 4
+            + self.hints.len() * 64;
         out.disk_index += self.disk.entries.len() * SEGMENT_MAPPING_BYTES;
         out.segments += std::mem::size_of::<Segments>()
             + std::mem::size_of::<SegmentClock>()
