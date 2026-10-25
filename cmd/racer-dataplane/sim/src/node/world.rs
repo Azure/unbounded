@@ -41,7 +41,7 @@ use racer_core::read::candidates::{
     AuthorityFacts, OperationKind, ProbeOutcome, ReplicaSelection, ResponseKind, VisitOrder,
     classify, replica_score, validate_origin_authority, visit_order,
 };
-use racer_core::read::fanout::{HOT_PAGE_BODIES, fanout_helper, is_helper, shed_hot_page};
+use racer_core::read::fanout::{fanout_helper, hot_page_bodies, is_helper, shed_hot_page};
 use racer_core::read::fill::{FailureKind, FillPlan, FillStep, Source, WalkResult};
 use racer_core::read::flight::{Event as FlightEvent, Joined};
 use racer_core::read::policy::{
@@ -2782,8 +2782,18 @@ impl NodeWorld {
         .map(at)
     }
 
+    /// Bodies of one page an owner streams before it may shed (production
+    /// `hot_page_threshold`): `hot_page_bodies` of the simulated page size,
+    /// unless `node.hot_page_bodies` overrides it.
+    fn hot_page_threshold(&self) -> usize {
+        match self.config.node.hot_page_bodies {
+            0 => hot_page_bodies(self.config.page_bytes),
+            n => n as usize,
+        }
+    }
+
     /// Production hot-page shed (`racer_core::read::fanout::shed_hot_page`):
-    /// an owner already streaming `HOT_PAGE_BODIES` bodies of `page`, at
+    /// an owner already streaming [`Self::hot_page_threshold`] bodies of `page`, at
     /// least half of all bodies it streams, answers `Overloaded` to a
     /// requester that is neither an owner nor a helper of the page.
     fn shed_hot(&mut self, dest: u32, requester: u32, page: u64) -> bool {
@@ -2799,7 +2809,8 @@ impl NodeWorld {
             }
             None => 0,
         };
-        if streaming < HOT_PAGE_BODIES || !self.config.node.fanout {
+        let threshold = self.hot_page_threshold();
+        if streaming < threshold || !self.config.node.fanout {
             return false;
         }
         let all = match self.bodies.get_mut(&dest) {
@@ -2834,7 +2845,7 @@ impl NodeWorld {
                     .is_owner(&*members, &page.to_be_bytes(), |o| o == p)
             }
         };
-        shed_hot_page(true, streaming, all, exempt)
+        shed_hot_page(true, streaming, all, exempt, threshold)
     }
 
     fn serve(&mut self, mid: u64) {

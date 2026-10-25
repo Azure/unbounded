@@ -2,7 +2,7 @@
 //!
 //! Only a page's ranked owners (at most `REPLICAS`) are candidates, so a page
 //! that every node reads at once can be sent no faster than `REPLICAS` NICs
-//! allow. An owner already streaming [`HOT_PAGE_BODIES`] bodies of a page
+//! allow. An owner already streaming [`hot_page_bodies`] bodies of a page
 //! sheds further readers with a signed `Overloaded` ([`shed_hot_page`]), and
 //! a non-owner whose owner sheds it asks one *helper* to acquire the page for
 //! it (see
@@ -89,17 +89,36 @@ fn fnv(parts: &[&[u8]]) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Concurrent bodies of one page an owner writes before it may shed further
-/// readers of that page with `Overloaded` (see [`shed_hot_page`]). Chosen by
-/// measurement ("Round 4: fanout" in `designs/racer-core-simulation.md`):
-/// at 4 to 16 owners shed Zipf-popular pages they would have served within
-/// the deadline, and the relayed helper hop failed more reads than it saved;
-/// at 32 the Zipf scenario is unchanged within seed noise while storms keep
-/// most of the gain.
-pub const HOT_PAGE_BODIES: usize = 32;
+/// Queued egress of one page, in bytes, an owner writes before it may shed
+/// further readers of that page with `Overloaded` (see [`shed_hot_page`] and
+/// [`hot_page_bodies`]). Stated in bytes so the rule means the same backlog
+/// (about 27 ms at 10 Gbit/s) for the simulator's 1 MiB pages and
+/// production's 16 MiB pages. Chosen by measurement ("Round 4: fanout" and
+/// "Round 4: relay (wave 3)" in `designs/racer-core-simulation.md`).
+pub const HOT_PAGE_QUEUE_BYTES: u64 = 32 << 20;
+
+/// Fewest concurrent bodies of one page before an owner may shed, whatever
+/// the page size: below this a shed reader's extra helper hop costs more than
+/// waiting behind the other bodies.
+pub const HOT_PAGE_MIN_BODIES: usize = 2;
+
+/// Concurrent bodies of one `page_bytes` page an owner writes before it may
+/// shed: [`HOT_PAGE_QUEUE_BYTES`] of that page, at least
+/// [`HOT_PAGE_MIN_BODIES`]. 32 for 1 MiB pages, 2 for production's 16 MiB.
+pub const fn hot_page_bodies(page_bytes: u64) -> usize {
+    let bodies = HOT_PAGE_QUEUE_BYTES / if page_bytes == 0 { 1 } else { page_bytes };
+    if bodies < HOT_PAGE_MIN_BODIES as u64 {
+        HOT_PAGE_MIN_BODIES
+    } else if bodies > u32::MAX as u64 {
+        u32::MAX as usize
+    } else {
+        bodies as usize
+    }
+}
 
 /// Whether an owner sheds a request for a page it is already writing to at
-/// least [`HOT_PAGE_BODIES`] requesters, when that page is at least half of
+/// least `threshold` requesters ([`hot_page_bodies`]), when that page is at
+/// least half of
 /// the `all` bodies the owner is writing (the page is the owner's queue; when
 /// many pages share a busy NIC, moving their readers to helpers only adds a
 /// relayed hop for each of them). The shed requester asks its helper (the
@@ -108,8 +127,14 @@ pub const HOT_PAGE_BODIES: usize = 32;
 /// of a queue of readers that time out. Owners and helpers of the page are
 /// never shed (`exempt`), and non-owners never shed: a helper queues the
 /// readers it was chosen for.
-pub fn shed_hot_page(owner: bool, streaming: usize, all: usize, exempt: bool) -> bool {
-    owner && !exempt && streaming >= HOT_PAGE_BODIES && streaming * 2 >= all
+pub fn shed_hot_page(
+    owner: bool,
+    streaming: usize,
+    all: usize,
+    exempt: bool,
+    threshold: usize,
+) -> bool {
+    owner && !exempt && streaming >= threshold.max(1) && streaming * 2 >= all
 }
 
 /// Whether the member at `position` is one of `page`'s helpers (any reader
@@ -253,14 +278,35 @@ mod tests {
 
     #[test]
     fn owners_shed_only_non_exempt_requesters_of_a_dominant_hot_page() {
-        let n = HOT_PAGE_BODIES;
-        assert!(!shed_hot_page(true, n - 1, n - 1, false));
-        assert!(shed_hot_page(true, n, n, false));
-        assert!(shed_hot_page(true, n, 2 * n, false));
-        // A page that is not most of the owner's queue is not shed.
-        assert!(!shed_hot_page(true, n, 2 * n + 1, false));
-        assert!(!shed_hot_page(true, n, n, true));
-        assert!(!shed_hot_page(false, n, n, false));
+        for n in [hot_page_bodies(1 << 20), hot_page_bodies(16 << 20)] {
+            assert!(!shed_hot_page(true, n - 1, n - 1, false, n));
+            assert!(shed_hot_page(true, n, n, false, n));
+            assert!(shed_hot_page(true, n, 2 * n, false, n));
+            // A page that is not most of the owner's queue is not shed.
+            assert!(!shed_hot_page(true, n, 2 * n + 1, false, n));
+            assert!(!shed_hot_page(true, n, n, true, n));
+            assert!(!shed_hot_page(false, n, n, false, n));
+        }
+        // A zero threshold still needs one body in flight.
+        assert!(!shed_hot_page(true, 0, 0, false, 0));
+    }
+
+    #[test]
+    fn hot_page_threshold_is_the_same_backlog_in_bytes() {
+        assert_eq!(hot_page_bodies(1 << 20), 32);
+        assert_eq!(hot_page_bodies(16 << 20), 2);
+        assert_eq!(hot_page_bodies(8 << 20), 4);
+        // Huge pages never go below the floor; tiny and zero pages saturate.
+        assert_eq!(hot_page_bodies(1 << 30), HOT_PAGE_MIN_BODIES);
+        assert_eq!(hot_page_bodies(1), (32 << 20) as usize);
+        assert_eq!(hot_page_bodies(0), (32 << 20) as usize);
+        // Within the floor, the queued bytes never exceed the byte budget
+        // by more than one page.
+        for shift in 10..=26 {
+            let page = 1u64 << shift;
+            let bodies = hot_page_bodies(page) as u64;
+            assert!(bodies * page <= HOT_PAGE_QUEUE_BYTES.max(page * HOT_PAGE_MIN_BODIES as u64));
+        }
     }
 
     #[test]

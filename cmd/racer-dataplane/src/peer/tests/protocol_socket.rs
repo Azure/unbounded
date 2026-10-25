@@ -1807,7 +1807,7 @@ mod established_sessions {
     }
 }
 
-/// Known issue 16: an owner already writing `HOT_PAGE_BODIES` bodies of a page,
+/// Known issue 16: an owner already writing `hot_page_threshold()` bodies of a page,
 /// at least half of all bodies it writes, answers a signed `Overloaded` to a
 /// requester that is neither an owner nor a helper of the page, without
 /// calling the page service; below either threshold, for a page it does not
@@ -1820,9 +1820,10 @@ fn hot_page_owner_sheds_non_helper_readers_with_signed_overload() {
     use crate::topology::Member;
     use crate::topology::Membership;
     use crate::topology::Paths;
-    use racer_core::read::fanout::{HOT_PAGE_BODIES, is_helper};
+    use racer_core::read::fanout::is_helper;
     use std::cell::Cell;
     use std::num::NonZeroU32;
+    let hot = crate::peer::server::hot_page_threshold();
     struct Service(Rc<Cell<usize>>);
     impl server::LocalPageService for Service {
         fn serve_peer<'a>(
@@ -1949,31 +1950,28 @@ fn hot_page_owner_sheds_non_helper_readers_with_signed_overload() {
         )
     };
     // Below the threshold every page is served.
-    let held = server.hold_streaming(&page_id(shed_page), HOT_PAGE_BODIES - 1);
+    let held = server.hold_streaming(&page_id(shed_page), hot - 1);
     assert!(!ask(shed_page));
     assert_eq!(calls.get(), 1);
     drop(held);
     assert_eq!(server.streaming(&page_id(shed_page)), (0, 0));
     // At the threshold a non-owner, non-helper reader is shed unserved.
-    let held = server.hold_streaming(&page_id(shed_page), HOT_PAGE_BODIES);
-    assert_eq!(
-        server.streaming(&page_id(shed_page)),
-        (HOT_PAGE_BODIES, HOT_PAGE_BODIES)
-    );
+    let held = server.hold_streaming(&page_id(shed_page), hot);
+    assert_eq!(server.streaming(&page_id(shed_page)), (hot, hot));
     assert!(ask(shed_page));
     assert_eq!(calls.get(), 1);
     // Not while the page is less than half of what the owner is writing.
-    let other = server.hold_streaming(&page_id(foreign_page), HOT_PAGE_BODIES + 1);
+    let other = server.hold_streaming(&page_id(foreign_page), hot + 1);
     assert!(!ask(shed_page));
     assert_eq!(calls.get(), 2);
     drop((held, other));
     // A helper of the page is always served.
-    let held = server.hold_streaming(&page_id(helper_page), HOT_PAGE_BODIES);
+    let held = server.hold_streaming(&page_id(helper_page), hot);
     assert!(!ask(helper_page));
     assert_eq!(calls.get(), 3);
     drop(held);
     // A node that does not own the page (for example a helper) never sheds.
-    let _held = server.hold_streaming(&page_id(foreign_page), HOT_PAGE_BODIES);
+    let _held = server.hold_streaming(&page_id(foreign_page), hot);
     assert!(!ask(foreign_page));
     assert_eq!(calls.get(), 4);
 }

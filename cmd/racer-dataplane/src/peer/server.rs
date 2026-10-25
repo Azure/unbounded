@@ -76,6 +76,12 @@ pub struct PeerServer {
     streaming: Rc<std::cell::RefCell<std::collections::HashMap<crate::model::PageId, usize>>>,
 }
 
+/// Bodies of one page an owner writes before it may shed readers of that page:
+/// `racer_core::read::fanout::HOT_PAGE_QUEUE_BYTES` of production pages.
+pub(crate) const fn hot_page_threshold() -> usize {
+    racer_core::read::fanout::hot_page_bodies(crate::model::PAGE_BYTES)
+}
+
 /// Counts one page body being written until dropped.
 struct Streaming {
     pages: Rc<std::cell::RefCell<std::collections::HashMap<crate::model::PageId, usize>>>,
@@ -364,6 +370,17 @@ impl PeerServer {
         (pages.get(page).copied().unwrap_or(0), pages.values().sum())
     }
 
+    /// Count a page response's body as being written until the result drops
+    /// (`None` for any other response or an empty body).
+    pub(crate) fn page_streaming(&self, response: &PeerResponse) -> Option<impl Sized + use<>> {
+        match response {
+            PeerResponse::Page { ciphertext, .. } if !ciphertext.bytes().is_empty() => Some(
+                Streaming::new(&self.streaming, ciphertext.envelope().page.clone()),
+            ),
+            _ => None,
+        }
+    }
+
     /// Count `n` bodies of `page` as being written until the result drops.
     #[cfg(test)]
     pub(crate) fn hold_streaming(
@@ -377,7 +394,7 @@ impl PeerServer {
     }
 
     /// Whether to answer a page request with `Overloaded` because this node
-    /// owns the page and is already writing `HOT_PAGE_BODIES` bodies of it to
+    /// owns the page and is already writing [`hot_page_threshold`] bodies of it to
     /// other requesters, at least half of all the bodies it is writing (Known
     /// issue 16). The requester then asks one of the
     /// page's helpers, which, like the page's owners, is never shed. The
@@ -389,9 +406,10 @@ impl PeerServer {
         requester: &racer_control_wire::NodeId,
         membership: &std::sync::Arc<crate::topology::Membership>,
     ) -> bool {
-        use racer_core::read::fanout::{HOT_PAGE_BODIES, is_helper, shed_hot_page};
+        use racer_core::read::fanout::{is_helper, shed_hot_page};
+        let threshold = hot_page_threshold();
         let (streaming, all) = self.streaming(page);
-        if streaming < HOT_PAGE_BODIES {
+        if streaming < threshold {
             return false;
         }
         let (object, number) = (&page.version.object, page.number);
@@ -405,7 +423,7 @@ impl PeerServer {
             || membership
                 .position(requester)
                 .is_ok_and(|p| is_helper(object, number, p, membership.members().len()));
-        shed_hot_page(owner, streaming, all, exempt)
+        shed_hot_page(owner, streaming, all, exempt, threshold)
     }
     /// Bound incoming heads and the complete connection handshake, including writes.
     /// Authenticated page dispatch and transfer retain their signed request deadline.
@@ -726,13 +744,7 @@ impl PeerServer {
         };
         let head = super::protocol::encode_envelope(&response.authentication, true, body.len())?;
         // Counted from the head until the body is written or abandoned.
-        let _streaming = match &response.response {
-            PeerResponse::Page { ciphertext, .. } if !body.is_empty() => Some(Streaming::new(
-                &self.streaming,
-                ciphertext.envelope().page.clone(),
-            )),
-            _ => None,
-        };
+        let _streaming = self.page_streaming(&response.response);
         let sent = self.io.send_head(connection, head, scope).await?;
         let mut connection = sent.connection;
         if !body.is_empty() {
