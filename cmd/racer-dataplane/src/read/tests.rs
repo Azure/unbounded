@@ -2249,6 +2249,9 @@ mod timeouts {
         relay_unavailable: Cell<bool>,
         /// Page requests fail at once with a transport error (`Io`).
         fail_pages: Cell<bool>,
+        /// The destination answers page requests with a signed
+        /// `Unavailable`, as a rank 0 whose origin fetch failed does.
+        pages_unavailable: Cell<bool>,
     }
 
     impl Peers {
@@ -2280,6 +2283,9 @@ mod timeouts {
             };
             let response = match &request.operation {
                 PeerOperation::Subscribe { .. } if self.relay_unavailable.get() => {
+                    PeerResponse::Unavailable
+                }
+                PeerOperation::Page { .. } if self.pages_unavailable.get() => {
                     PeerResponse::Unavailable
                 }
                 PeerOperation::Subscribe { .. } | PeerOperation::Page { .. } => PeerResponse::Miss,
@@ -2428,6 +2434,7 @@ mod timeouts {
                 refuse_flights: Cell::new(false),
                 relay_unavailable: Cell::new(false),
                 fail_pages: Cell::new(false),
+                pages_unavailable: Cell::new(false),
             });
             let policy = CandidatePolicy::new(
                 local,
@@ -2901,6 +2908,77 @@ mod timeouts {
         assert!(matches!(third, Ok(CandidateResolution::Origin(_))));
         let calls = f.peers.calls.borrow();
         assert_eq!(calls.len(), 3);
+        assert!(calls.iter().all(|c| c.destination == rank0 && !c.copy));
+    }
+
+    /// Known issue 52: rank 0 itself answering an owner's delegation that
+    /// its fetch failed does not give the owner origin authority until rank
+    /// 0 has kept failing the page for `with_rank0_hang_after`; then the
+    /// owner fetches once and the next failure starts a new interval. A
+    /// copy or miss from rank 0 forgets it.
+    #[test]
+    fn owner_leaves_origin_retries_to_a_failing_rank_zero() {
+        let clock = uring_runtime::environment::SimulationClock::new(209);
+        let _env = clock.environment(0).enter();
+        let mut f = Fixture::new(Some(1), 0, false).bounded(209, 60, 24);
+        f.policy = f
+            .policy
+            .with_attempt_timeout(Duration::from_secs(1))
+            .with_rank0_hang_after(Duration::from_secs(5));
+        f.peers.pages_unavailable.set(true);
+        let page = crate::model::PageId {
+            version: ObjectVersion {
+                object: f.context.object.clone(),
+                etag: StrongEtag::test_value("v"),
+            },
+            number: PageNumber(0),
+        };
+        let rank0 = f.candidates.ordered[0].clone();
+        let resolve_once = |f: &mut Fixture| {
+            let operation = PeerOperation::Page {
+                page: page.clone(),
+                mode: FetchMode::Acquire,
+            };
+            let candidates = Candidates {
+                membership: f.candidates.membership.clone(),
+                ordered: f.candidates.ordered.clone(),
+            };
+            let mut resolve = f.policy.resolve_with_budget(
+                candidates,
+                &f.context,
+                operation,
+                &f.scope,
+                &mut f.budget,
+            );
+            let Poll::Ready(result) = poll(resolve.as_mut()) else {
+                panic!("immediate answer")
+            };
+            result
+        };
+        // t = 0 and 4: rank 0's fetch failed; leave the retry to it.
+        assert!(matches!(resolve_once(&mut f), Err(Error::Unavailable)));
+        clock.advance(Duration::from_secs(4));
+        f = f.bounded(210, 60, 24);
+        assert!(matches!(resolve_once(&mut f), Err(Error::Unavailable)));
+        // t = 5: rank 0 kept failing for `hang_after`: this owner fetches.
+        clock.advance(Duration::from_secs(1));
+        f = f.bounded(211, 60, 24);
+        assert!(matches!(
+            resolve_once(&mut f),
+            Ok(CandidateResolution::Origin(_))
+        ));
+        // That failure starts the next interval.
+        f = f.bounded(212, 60, 24);
+        assert!(matches!(resolve_once(&mut f), Err(Error::Unavailable)));
+        // A miss from rank 0 forgets it: authority as before.
+        f.peers.pages_unavailable.set(false);
+        f = f.bounded(213, 60, 24);
+        assert!(matches!(
+            resolve_once(&mut f),
+            Ok(CandidateResolution::Origin(_))
+        ));
+        let calls = f.peers.calls.borrow();
+        assert_eq!(calls.len(), 5);
         assert!(calls.iter().all(|c| c.destination == rank0 && !c.copy));
     }
 

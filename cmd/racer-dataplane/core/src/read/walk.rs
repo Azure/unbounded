@@ -426,6 +426,25 @@ pub enum Outcome {
     /// rule: once rank 0 stayed silent too long (`Overdue`) a timeout gives
     /// authority again (Known issue 39).
     TimedOut,
+    /// Rank 0 itself (the response is signed by the destination, not by a
+    /// relay) answered an owner's page probe of it `Unavailable`: its own
+    /// acquisition of the page failed, in practice its origin request (a
+    /// 5xx, or its deadline ran out waiting for origin), since rank 0 asks
+    /// no predecessor. Callers report it only for [`CandidateWalk::pending_rank0`]
+    /// probes; anywhere else it is recorded as `Probe(Unreachable)`.
+    ///
+    /// Recorded like `Probe(Unreachable)`, except that it withholds origin
+    /// authority like [`Outcome::TimedOut`] unless [`WalkConfig::rank0`] is
+    /// `Overdue` (Known issue 52): this owner's own request would go to the
+    /// same origin right after rank 0's failed, and a reader's retry sends
+    /// rank 0 to origin again anyway, so taking authority doubled origin
+    /// requests during an origin error burst. The caller notes the failure
+    /// ([`crate::read::rank0::Rank0Watch::failed`]); once rank 0 keeps
+    /// failing the page for [`crate::read::rank0::Rank0Watch::hang_after`]
+    /// it is `Overdue` and this owner fetches itself, at most once per such
+    /// interval, so a failure local to rank 0 does not make the page
+    /// unavailable.
+    Failed,
 }
 
 /// How the epoch ended.
@@ -659,7 +678,8 @@ impl CandidateWalk {
     }
 
     /// Whether rank 0 left this owner's probe unanswered
-    /// ([`Outcome::TimedOut`]), so the walk will not end with origin
+    /// ([`Outcome::TimedOut`]) or answered that its own acquisition failed
+    /// ([`Outcome::Failed`]), so the walk will not end with origin
     /// authority.
     pub fn rank0_unanswered(&self) -> bool {
         self.rank0_unanswered
@@ -1059,6 +1079,10 @@ impl CandidateWalk {
                 self.rank0_unanswered |= pending.rank0 && self.config.rank0 != Rank0State::Overdue;
                 Outcome::Transport(ProbeOutcome::Unreachable)
             }
+            Outcome::Failed => {
+                self.rank0_unanswered |= pending.rank0 && self.config.rank0 != Rank0State::Overdue;
+                Outcome::Probe(ProbeOutcome::Unreachable)
+            }
             outcome => outcome,
         };
         if pending.helper {
@@ -1135,7 +1159,7 @@ impl CandidateWalk {
                 Ok(None)
             }
             // Normalized above.
-            Outcome::TimedOut => Ok(None),
+            Outcome::TimedOut | Outcome::Failed => Ok(None),
             Outcome::Probe(outcome) | Outcome::Transport(outcome) => {
                 self.saw_version |= outcome == ProbeOutcome::VersionUnavailable;
                 self.saw_transient |= transient(outcome);
@@ -1235,7 +1259,7 @@ impl RemainingWalk {
         match outcome {
             Outcome::Copy => return Some(RemainingEnd::Copy),
             Outcome::Probe(outcome) => self.transient |= transient(outcome),
-            Outcome::Shed => self.transient = true,
+            Outcome::Shed | Outcome::Failed => self.transient = true,
             Outcome::Transport(_) | Outcome::TimedOut => {
                 self.transient = true;
                 budget.note_route_failure();

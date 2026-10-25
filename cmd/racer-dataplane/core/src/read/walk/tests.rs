@@ -2164,3 +2164,84 @@ fn relay_overload_on_the_route_to_rank_zero_gives_authority_without_a_retry() {
     });
     assert!(matches!(end, End::Exhausted { .. }), "{end:?}");
 }
+
+/// Known issue 52: rank 0 itself answering an owner's probe that its own
+/// acquisition failed (`Outcome::Failed`) withholds origin authority unless
+/// the watch says rank 0 has kept failing the page (`Overdue`); a relay's
+/// or a transport failure still gives authority. The walk's probes and
+/// budgets are the same as for `Probe(Unreachable)`.
+#[test]
+fn rank_zero_failure_withholds_origin_until_overdue() {
+    let with = |rank: usize, state: Rank0State| WalkConfig {
+        rank0: state,
+        ..config(Some(rank), 3, VisitOrder::canonical(3))
+    };
+    for state in [
+        Rank0State::Unknown,
+        Rank0State::Fetching,
+        Rank0State::Failed,
+    ] {
+        // Delegated Acquire at rank 1.
+        let mut walk = CandidateWalk::new(with(1, state));
+        let (probes, end) = drive(&mut walk, &mut budget(8, 32), |_, _| Outcome::Failed);
+        assert_eq!(probes[0].0.mode, Mode::Acquire);
+        assert_eq!(end, End::Exhausted { funding: false }, "{state:?}");
+        assert!(walk.rank0_unanswered());
+        // Rank 2: rank 1 is still asked copy-only and its copy wins.
+        let mut walk = CandidateWalk::new(with(2, state));
+        let (probes, end) = drive(&mut walk, &mut budget(8, 32), |p, _| {
+            if p.canonical == 0 {
+                Outcome::Failed
+            } else {
+                Outcome::Copy
+            }
+        });
+        assert_eq!(probes.len(), 2);
+        assert_eq!(end, End::Copy);
+        // Copy-only probe of rank 0 (too few credits to delegate).
+        let mut walk = CandidateWalk::new(with(1, state));
+        let (probes, end) = drive(&mut walk, &mut budget(2, 16), |_, _| Outcome::Failed);
+        assert_eq!(probes[0].0.mode, Mode::CopyOnly);
+        assert_eq!(end, End::Exhausted { funding: false });
+    }
+    // Overdue: the owner fetches.
+    let mut walk = CandidateWalk::new(with(1, Rank0State::Overdue));
+    let (_, end) = drive(&mut walk, &mut budget(8, 32), |_, _| Outcome::Failed);
+    assert!(
+        matches!(end, End::Origin { rank: 1, ref evidence } if evidence == &[ProbeOutcome::Unreachable])
+    );
+    assert!(!walk.rank0_unanswered());
+    // Same probes and budget as an Unavailable signed by a relay.
+    let run = |outcome: Outcome| {
+        let mut walk = CandidateWalk::new(with(2, Rank0State::Unknown));
+        let mut b = budget(8, 32);
+        let (probes, _) = drive(&mut walk, &mut b, |p, _| {
+            if p.canonical == 0 {
+                outcome
+            } else {
+                Outcome::Probe(ProbeOutcome::CopyMiss)
+            }
+        });
+        (shapes(&probes), b.remaining_attempts(), b.remaining_links())
+    };
+    assert_eq!(
+        run(Outcome::Failed),
+        run(Outcome::Probe(ProbeOutcome::Unreachable))
+    );
+    // A non-rank-0 probe reporting it is only a failure.
+    let mut walk = CandidateWalk::new(config(None, 3, VisitOrder::canonical(3)));
+    let (_, end) = drive(&mut walk, &mut budget(16, 64), |_, _| Outcome::Failed);
+    assert_eq!(end, End::Exhausted { funding: false });
+    assert!(!walk.rank0_unanswered());
+}
+
+/// A remaining walk (after an origin version miss) treats `Failed` as a
+/// transient failure.
+#[test]
+fn remaining_walk_treats_a_failure_as_transient() {
+    let mut walk = RemainingWalk::new(0, 2);
+    let mut b = budget(4, 16);
+    walk.next_probe().unwrap();
+    assert_eq!(walk.complete(&mut b, Outcome::Failed), None);
+    assert_eq!(walk.next_probe(), Err(RemainingEnd::Unavailable));
+}

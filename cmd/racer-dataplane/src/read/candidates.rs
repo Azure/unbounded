@@ -697,6 +697,11 @@ impl CandidatePolicy {
                 uring_runtime::environment::now(),
                 deadline,
             ),
+            WalkOutcome::Failed => watch.failed(
+                page.clone(),
+                rank0.clone(),
+                uring_runtime::environment::now(),
+            ),
             WalkOutcome::Copy
             | WalkOutcome::Probe(
                 ProbeOutcome::CopyMiss
@@ -1387,6 +1392,16 @@ impl CandidatePolicy {
                         // request (for example a hot-page owner): the walk
                         // may ask the page's helper (Known issue 16).
                         WalkOutcome::Shed
+                    }
+                    Ok(response)
+                        if walk.pending_rank0()
+                            && matches!(response.response(), PeerResponse::Unavailable)
+                            && response.origin().node() == destination =>
+                    {
+                        // Rank 0 itself, not a relay, answered that its own
+                        // acquisition failed: leave the next attempt to it
+                        // (Known issue 52).
+                        WalkOutcome::Failed
                     }
                     Ok(response) => {
                         relayed = response.origin().node() != destination;

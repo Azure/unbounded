@@ -48,6 +48,22 @@
 //! expires. Without it each page rank 0 owns would fail its readers for
 //! another `hang_after`.
 //!
+//! Rank 0's own failures (Known issue 52). When rank 0 itself answers an
+//! owner's probe `Unavailable`, its acquisition of the page failed, in
+//! practice at origin; the owner notes it ([`Rank0Watch::failed`]) and,
+//! for [`Rank0Watch::hang_after`] after the first such failure, the page is
+//! [`Rank0State::Failed`] and the owner does not fetch the page itself
+//! after a further failure of rank 0 (the walk withholds authority on
+//! [`crate::read::walk::Outcome::Failed`] unless the page is `Overdue`).
+//! Past it the page is `Overdue`: this owner fetches once, and the next
+//! failure starts a new interval. While origin keeps failing, the owner
+//! thus adds at most one origin request per page per `hang_after` to
+//! rank 0's (one per reader retry) instead of one per reader retry, and a
+//! failure local to rank 0 (its route to origin) delays the page by at
+//! most `hang_after`. In the simulator, 5k `full-failover` (180 s origin
+//! 5xx burst), owners above rank 0 doubled the requests on every page that
+//! kept failing.
+//!
 //! Costs: one entry per page an owner deferred to rank 0, bounded by
 //! [`WATCH_CAPACITY`] and expiring [`WATCH_TTL`] after the last timeout.
 //! No message is added and no budget grows: the rule only changes whether a
@@ -81,8 +97,12 @@ pub enum Rank0State {
     /// answered since: rank 0 is presumed to be fetching.
     Fetching,
     /// Rank 0 has not answered this owner since a timeout that long ago, or
-    /// is marked silent: rank 0 is presumed hung.
+    /// is marked silent: rank 0 is presumed hung. Also: rank 0 has kept
+    /// failing the page for that long ([`Rank0Watch::failed`]).
     Overdue,
+    /// Rank 0 itself answered that its acquisition of the page failed less
+    /// than [`Rank0Watch::hang_after`] ago: leave the next attempt to it.
+    Failed,
 }
 
 struct Entry<N> {
@@ -91,8 +111,10 @@ struct Entry<N> {
     /// Deadline of the first unanswered request: rank 0 must have answered
     /// or failed it by then.
     until: Instant,
-    /// Last timeout seen (expiry and eviction stamp).
+    /// Last timeout or failure seen (expiry and eviction stamp).
     last: Instant,
+    /// Noted by [`Rank0Watch::failed`], not by a timeout.
+    failed: bool,
 }
 
 /// Bounded, expiring map from a page to rank 0's presumed state.
@@ -143,7 +165,13 @@ impl<K: Eq + Hash + Clone, N: Eq + Hash + Clone> Rank0Watch<K, N> {
             .is_some_and(|at| now.saturating_duration_since(*at) <= self.ttl);
         match self.entries.get(key) {
             Some(e) if e.node == *rank0 && now.saturating_duration_since(e.last) <= self.ttl => {
-                if now < e.until && !silent {
+                if e.failed {
+                    if now < e.until {
+                        Rank0State::Failed
+                    } else {
+                        Rank0State::Overdue
+                    }
+                } else if now < e.until && !silent {
                     Rank0State::Fetching
                 } else {
                     Rank0State::Overdue
@@ -160,10 +188,9 @@ impl<K: Eq + Hash + Clone, N: Eq + Hash + Clone> Rank0Watch<K, N> {
     /// cannot postpone [`Rank0State::Overdue`].
     /// A timeout on a page that is already overdue marks `rank0` silent.
     pub fn timed_out(&mut self, key: K, rank0: N, now: Instant, deadline: Instant) {
-        let live = self
-            .entries
-            .get(&key)
-            .is_some_and(|e| e.node == rank0 && now.saturating_duration_since(e.last) <= self.ttl);
+        let live = self.entries.get(&key).is_some_and(|e| {
+            e.node == rank0 && !e.failed && now.saturating_duration_since(e.last) <= self.ttl
+        });
         if live {
             let entry = self.entries.get_mut(&key).expect("live");
             entry.last = now;
@@ -178,26 +205,65 @@ impl<K: Eq + Hash + Clone, N: Eq + Hash + Clone> Rank0Watch<K, N> {
                 }
             }
         } else {
-            self.entries.remove(&key);
-            while self.entries.len() >= self.capacity {
-                let Some((old, at)) = self.order.pop_front() else {
-                    break;
-                };
-                if self.entries.get(&old).is_some_and(|e| e.last == at) {
-                    self.entries.remove(&old);
-                }
-            }
-            self.entries.insert(
+            self.insert(
                 key.clone(),
                 Entry {
                     node: rank0,
                     until: deadline.max(now + self.hang_after),
                     last: now,
+                    failed: false,
                 },
             );
         }
         self.order.push_back((key, now));
         self.compact();
+    }
+
+    /// `rank0` itself answered this owner's probe for `key` that its own
+    /// acquisition failed (Known issue 52). It is not hung (the silent mark
+    /// is cleared). The first failure starts an interval of
+    /// [`Rank0Watch::hang_after`] during which the page is
+    /// [`Rank0State::Failed`]; further failures inside it do not extend it.
+    /// A failure after it (the owner was `Overdue` and fetched itself)
+    /// starts the next interval.
+    pub fn failed(&mut self, key: K, rank0: N, now: Instant) {
+        self.silent.remove(&rank0);
+        let live = self.entries.get(&key).is_some_and(|e| {
+            e.node == rank0
+                && e.failed
+                && now < e.until
+                && now.saturating_duration_since(e.last) <= self.ttl
+        });
+        if live {
+            let entry = self.entries.get_mut(&key).expect("live");
+            entry.last = now;
+        } else {
+            self.insert(
+                key.clone(),
+                Entry {
+                    node: rank0,
+                    until: now + self.hang_after,
+                    last: now,
+                    failed: true,
+                },
+            );
+        }
+        self.order.push_back((key, now));
+        self.compact();
+    }
+
+    /// Replace `key`'s entry, evicting the oldest pages beyond capacity.
+    fn insert(&mut self, key: K, entry: Entry<N>) {
+        self.entries.remove(&key);
+        while self.entries.len() >= self.capacity {
+            let Some((old, at)) = self.order.pop_front() else {
+                break;
+            };
+            if self.entries.get(&old).is_some_and(|e| e.last == at) {
+                self.entries.remove(&old);
+            }
+        }
+        self.entries.insert(key, entry);
     }
 
     /// `rank0` itself answered this owner's probe for `key` (a copy, a
@@ -321,5 +387,61 @@ mod tests {
         assert_eq!(w.len(), 2);
         assert!(w.order.len() <= 4);
         assert!(w.silent.len() <= 2);
+    }
+
+    #[test]
+    fn rank_zero_failures_hold_the_page_for_hang_after_then_once_overdue() {
+        let now = Instant::now();
+        let mut w = Rank0Watch::new(8, WATCH_TTL, 10 * S);
+        w.failed(1, A, now);
+        assert_eq!(w.state(&1, &A, now), Rank0State::Failed);
+        assert_eq!(w.state(&1, &8, now), Rank0State::Unknown);
+        assert_eq!(w.state(&2, &A, now), Rank0State::Unknown);
+        // Further failures inside the interval do not extend it.
+        w.failed(1, A, now + 9 * S);
+        assert_eq!(w.state(&1, &A, now + 9 * S), Rank0State::Failed);
+        assert_eq!(w.state(&1, &A, now + 10 * S), Rank0State::Overdue);
+        // The overdue walk's failure starts the next interval.
+        w.failed(1, A, now + 11 * S);
+        assert_eq!(w.state(&1, &A, now + 11 * S), Rank0State::Failed);
+        assert_eq!(w.state(&1, &A, now + 21 * S), Rank0State::Overdue);
+        // An answer forgets it; an old entry expires.
+        w.answered(&1, &A);
+        assert_eq!(w.state(&1, &A, now + 12 * S), Rank0State::Unknown);
+        w.failed(3, A, now);
+        assert_eq!(
+            w.state(&3, &A, now + 11 * S + WATCH_TTL),
+            Rank0State::Unknown
+        );
+    }
+
+    #[test]
+    fn a_failure_answer_clears_silence_and_replaces_a_timeout_entry() {
+        let now = Instant::now();
+        let mut w = Rank0Watch::new(8, WATCH_TTL, Duration::ZERO);
+        w.timed_out(1, A, now, now + S);
+        w.timed_out(1, A, now + 2 * S, now + 3 * S);
+        assert_eq!(w.state(&2, &A, now + 2 * S), Rank0State::Overdue);
+        let mut w2 = Rank0Watch::new(8, WATCH_TTL, 5 * S);
+        w2.timed_out(1, A, now, now + S);
+        w2.failed(1, A, now + S);
+        assert_eq!(w2.state(&1, &A, now + 2 * S), Rank0State::Failed);
+        // A timeout after a failure starts a fresh timeout entry.
+        w2.timed_out(1, A, now + 3 * S, now + 4 * S);
+        assert_eq!(w2.state(&1, &A, now + 3 * S), Rank0State::Fetching);
+        // Rank 0 answering a failure is not silent.
+        w.failed(1, A, now + 2 * S);
+        assert_eq!(w.state(&2, &A, now + 2 * S), Rank0State::Unknown);
+    }
+
+    #[test]
+    fn failures_respect_capacity() {
+        let now = Instant::now();
+        let mut w = Rank0Watch::new(2, WATCH_TTL, S);
+        for i in 0..100u64 {
+            w.failed(i, A, now);
+        }
+        assert_eq!(w.len(), 2);
+        assert!(w.order.len() <= 4);
     }
 }
