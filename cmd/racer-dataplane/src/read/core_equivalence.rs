@@ -359,9 +359,12 @@ impl Pair {
             .flights
             .fail(leader, AcquisitionFailure::Terminal(prod))
             .map(|_| ());
-        let core = self
-            .table
-            .finish(&self.page, caller.core, Outcome::Failed(core), &mut self.wakes);
+        let core = self.table.finish(
+            &self.page,
+            caller.core,
+            Outcome::Failed(core),
+            &mut self.wakes,
+        );
         settle(prod, core);
     }
 

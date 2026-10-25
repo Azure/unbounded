@@ -715,7 +715,16 @@ fn expired_leaders_hand_their_fill_to_later_waiters() {
         before["metrics"]["counters"],
         after["metrics"]["counters"]
     );
-    let max = |r: &Value| r["origin_per_page"]["max_requests_per_page"].as_u64().unwrap();
-    assert!(max(&after) <= max(&before), "{} {}", max(&before), max(&after));
+    let max = |r: &Value| {
+        r["origin_per_page"]["max_requests_per_page"]
+            .as_u64()
+            .unwrap()
+    };
+    assert!(
+        max(&after) <= max(&before),
+        "{} {}",
+        max(&before),
+        max(&after)
+    );
     assert_eq!(counter(&after, "flight_unexpected_lead"), 0);
 }

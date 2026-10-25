@@ -1303,7 +1303,10 @@ mod flight {
                 Ok(FlightState::RetryPending)
             );
             let retry = lead(&mut e);
-            assert_eq!(e.acquisition(&retry).unwrap().budget.remaining_attempts(), 3);
+            assert_eq!(
+                e.acquisition(&retry).unwrap().budget.remaining_attempts(),
+                3
+            );
             flights
                 .fail(retry, AcquisitionFailure::Terminal(Error::Io))
                 .unwrap();

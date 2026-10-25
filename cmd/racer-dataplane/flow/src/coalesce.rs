@@ -1383,7 +1383,11 @@ pub mod flight {
                 candidates.sort_unstable_by(|a, b| b.cmp(a));
                 for (_, id) in candidates {
                     self.refresh_waiter(id, wakes);
-                    if self.waiters.get(&id).is_some_and(|waiter| waiter.error.is_none()) {
+                    if self
+                        .waiters
+                        .get(&id)
+                        .is_some_and(|waiter| waiter.error.is_none())
+                    {
                         self.leader = Some(id);
                         return true;
                     }

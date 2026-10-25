@@ -544,7 +544,11 @@ fn expired_leader_hands_running_fill_to_latest_waiter() {
     t.refresh(&p, secs(1), &mut wakes);
     assert!(t.handed_over(&p));
     assert!(t.is_leader(&p, a), "the elected capability survives");
-    assert_eq!(t.leader_deadline(&p), Some(secs(3)), "latest deadline adopts");
+    assert_eq!(
+        t.leader_deadline(&p),
+        Some(secs(3)),
+        "latest deadline adopts"
+    );
     assert_eq!(
         t.poll(&p, a, secs(1), 1, &mut wakes),
         Ok(Event::Failed(Error::DeadlineExceeded))
@@ -556,8 +560,14 @@ fn expired_leader_hands_running_fill_to_latest_waiter() {
     t.complete_operation(&p, &mut quota, &mut wakes).unwrap();
     t.finish(&p, a, Outcome::Published(Acquired::Plain(7)), &mut wakes)
         .unwrap();
-    assert_eq!(t.poll(&p, b, secs(1), 2, &mut wakes), Ok(Event::Complete(7)));
-    assert_eq!(t.poll(&p, c, secs(1), 3, &mut wakes), Ok(Event::Complete(7)));
+    assert_eq!(
+        t.poll(&p, b, secs(1), 2, &mut wakes),
+        Ok(Event::Complete(7))
+    );
+    assert_eq!(
+        t.poll(&p, c, secs(1), 3, &mut wakes),
+        Ok(Event::Complete(7))
+    );
     t.detach(&p, b, &mut quota, &mut wakes);
     t.detach(&p, c, &mut quota, &mut wakes);
     assert!(t.is_empty());
@@ -586,13 +596,8 @@ fn handed_over_fill_deadline_retries_and_last_expiry_revokes() {
     t.refresh(&p, secs(1), &mut wakes);
     assert!(t.handed_over(&p));
     t.complete_operation(&p, &mut quota, &mut wakes).unwrap();
-    t.finish(
-        &p,
-        a,
-        Outcome::Failed(Error::DeadlineExceeded),
-        &mut wakes,
-    )
-    .unwrap();
+    t.finish(&p, a, Outcome::Failed(Error::DeadlineExceeded), &mut wakes)
+        .unwrap();
     assert_eq!(t.poll(&p, b, secs(1), 2, &mut wakes), Ok(Event::Lead));
     t.retain_operation(&p, b).unwrap();
     t.allow_handover(&p, b).unwrap();
@@ -618,7 +623,10 @@ fn handover_outcome_maps_only_caller_scope_failures() {
         true,
         Outcome::Failed(Error::DeadlineExceeded)
     )));
-    assert!(retry(handover_outcome(true, Outcome::Failed(Error::Cancelled))));
+    assert!(retry(handover_outcome(
+        true,
+        Outcome::Failed(Error::Cancelled)
+    )));
     assert!(matches!(
         handover_outcome(true, Outcome::<u8, _>::Failed(Error::Io)),
         Outcome::Failed(Error::Io)
