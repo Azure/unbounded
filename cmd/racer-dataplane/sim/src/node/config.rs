@@ -95,6 +95,24 @@ pub struct NodeConfig {
     /// a destination that is behind (production `stale_wait`: always on;
     /// set 0 to measure without it, Known issue 26).
     pub stale_wait: bool,
+    /// Owners also ask, before origin, members ranked just below the owners
+    /// that were owners when they arrived (production `demoted_targets`:
+    /// always on; set 0 to measure without it, Known issue 34). Needs
+    /// `lineage`.
+    pub demoted_targets: bool,
+    /// Lineage targets are asked on their own grant, like successor targets
+    /// (production: always on; set 0 to fund them from the walk's slack
+    /// only, Known issue 35).
+    pub lineage_grants: bool,
+    /// With `lineage_grants`, readers and delegations still fund lineage
+    /// probes from slack (`WalkConfig::lineage`) (production: off; Known
+    /// issue 35). Without `lineage_grants` slack funding is always on.
+    pub lineage_slack: bool,
+    /// A copy-only request from an owner ranked before the destination does
+    /// not wait on the destination's acquisition (production
+    /// `copy_join_allowed`: always on; set 0 to measure without it, Known
+    /// issue 311).
+    pub copy_join_rank: bool,
 }
 
 impl Default for NodeConfig {
@@ -131,6 +149,10 @@ impl Default for NodeConfig {
             stale_fallback: true,
             lineage: true,
             stale_wait: true,
+            demoted_targets: true,
+            lineage_grants: true,
+            lineage_slack: true,
+            copy_join_rank: true,
         }
     }
 }
@@ -177,6 +199,10 @@ impl NodeConfig {
                 "stale_fallback" if n <= 1 => self.stale_fallback = n == 1,
                 "lineage" if n <= 1 => self.lineage = n == 1,
                 "stale_wait" if n <= 1 => self.stale_wait = n == 1,
+                "demoted_targets" if n <= 1 => self.demoted_targets = n == 1,
+                "lineage_grants" if n <= 1 => self.lineage_grants = n == 1,
+                "lineage_slack" if n <= 1 => self.lineage_slack = n == 1,
+                "copy_join_rank" if n <= 1 => self.copy_join_rank = n == 1,
                 _ => return Err(format!("unknown key node.{key}")),
             }
         }

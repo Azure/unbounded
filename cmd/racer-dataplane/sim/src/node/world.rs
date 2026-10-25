@@ -48,7 +48,9 @@ use racer_core::read::policy::{
     Persist, PersistFacts, peer_error, persist, recoverable, retention_eligible, retention_score,
 };
 use racer_core::read::range::{PageBudget, SlotKind, direct_fills, first_failure};
-use racer_core::read::serve::{ServeAction, ServeFacts, serve_action, serve_deadline};
+use racer_core::read::serve::{
+    ServeAction, ServeFacts, copy_join_allowed, serve_action, serve_deadline,
+};
 use racer_core::read::stale::{
     StaleSkip, StaleWaitFacts, fallback_rank_allowed, previous_fallback, stale_wait,
 };
@@ -59,9 +61,9 @@ use racer_core::read::successor::{
 use racer_core::read::walk::{
     AttemptInputs, AttemptPlan, CandidateWalk, Continuation, End, HedgeFacts, MAX_HANDOFF, Mode,
     Outcome, PREVIOUS_MEMBERSHIP_WITHIN, Probe, RemainingWalk, RouteMode, StaleAction, Step,
-    WalkConfig, handoff_targets, hedge_budgets, hedge_eligible, hedge_fallback, lineage_counts,
-    lineage_targets, merge_handoff, plan_attempt, same_rank_previous, stale_action,
-    transport_outcome,
+    WalkConfig, demoted_targets, granted_prefix, handoff_targets, hedge_budgets, hedge_eligible,
+    hedge_fallback, lineage_counts, lineage_targets, merge_handoff, plan_attempt,
+    same_rank_previous, stale_action, transport_outcome,
 };
 use racer_core::route::MAX_LINKS;
 use racer_core::time::SplitMix64;
@@ -335,9 +337,18 @@ struct Fill {
     /// This owner's lineage targets (`lineage_targets`), merged into
     /// `handoff` (Known issue 25).
     lineage_targets: Vec<u32>,
-    /// The first `successors` entries of `handoff` are successor targets
-    /// (`WalkConfig::successors`).
+    /// Of `lineage_targets`, the ones ranked below the owners
+    /// (`demoted_targets`, Known issue 34).
+    demoted: Vec<u32>,
+    /// The first `successors` entries of `handoff` are successor targets.
     successors: usize,
+    /// The first `granted` entries of `handoff` are asked on their own
+    /// grant (`WalkConfig::granted`): the successor targets, then the
+    /// lineage targets when `node.lineage_grants` (Known issue 35).
+    granted: usize,
+    /// Kind of the pending granted probe, for counters: `successor`,
+    /// `lineage` or `demoted`.
+    granted_kind: Option<&'static str>,
     /// This owner is a member of membership version - 1, which is still
     /// retained and was replaced within `PREVIOUS_MEMBERSHIP_WITHIN`.
     previous_member: bool,
@@ -1740,7 +1751,10 @@ impl NodeWorld {
                 handoff: Vec::new(),
                 lineage: [0; MAX_HANDOFF],
                 lineage_targets: Vec::new(),
+                demoted: Vec::new(),
                 successors: 0,
+                granted: 0,
+                granted_kind: None,
                 previous_member: false,
                 previous: 0,
                 version: 0,
@@ -2039,12 +2053,40 @@ impl NodeWorld {
         } else {
             order
         };
+        // Members ranked just below the owners that were owners when they
+        // arrived (production `CandidatePolicy::resolve_epoch_traced`,
+        // `Placement::demoted`, Known issue 34).
+        let demoted = match rank {
+            Some(rank) if self.config.node.demoted_targets => {
+                let w = self.fills[&id].worker;
+                let below: Vec<u32> = self.nodes[node as usize].workers[w as usize]
+                    .placement
+                    .demoted(&*members, &page.to_be_bytes())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| members.members()[p].node)
+                    .collect();
+                let below_since = self.since_of(node, &members, &below);
+                demoted_targets(&since, &below, &below_since, rank)
+            }
+            _ => Vec::new(),
+        };
         let fill = self.fills.get_mut(&id).expect("present");
-        fill.lineage = lineage_counts(&since);
+        fill.lineage = if self.config.node.lineage_grants && !self.config.node.lineage_slack {
+            [0; MAX_HANDOFF]
+        } else {
+            lineage_counts(&since)
+        };
         fill.lineage_targets = match rank {
             Some(rank) => lineage_targets(&cands, &since, rank),
             None => Vec::new(),
         };
+        for n in &demoted {
+            if !fill.lineage_targets.contains(n) && fill.lineage_targets.len() < MAX_HANDOFF {
+                fill.lineage_targets.push(*n);
+            }
+        }
+        fill.demoted = demoted;
         fill.cands = cands;
         fill.stale = 0;
         fill.handoff = fill.lineage_targets.clone();
@@ -2151,6 +2193,14 @@ impl NodeWorld {
             .get(fill.version)
             .is_some_and(|v| v.members.members().len() > fill.cands.len() + 1);
         let fill = self.fills.get_mut(&id).expect("present");
+        // Successor targets come first in `handoff`, then lineage targets
+        // (`merge_handoff`); with `lineage_grants` both are granted.
+        fill.granted = fill.successors
+            + if self.config.node.lineage_grants && fill.rank.is_some() {
+                granted_prefix(&fill.handoff[fill.successors..], &fill.lineage_targets)
+            } else {
+                0
+            };
         let continuation = std::mem::take(&mut fill.continuation);
         fill.walk = Walking::Candidates(CandidateWalk::new(WalkConfig {
             rank: fill.rank,
@@ -2165,7 +2215,7 @@ impl NodeWorld {
             // the helper is chosen when the walk asks for it.
             helper: fill.rank.is_none() && self.config.node.fanout && helpers_possible,
             lineage: fill.lineage,
-            successors: fill.successors,
+            granted: fill.granted,
         }));
         self.step_walk(id);
     }
@@ -2599,12 +2649,24 @@ impl NodeWorld {
         let fill = &self.fills[&id];
         let dest = match probe.canonical.checked_sub(fill.cands.len()) {
             Some(i) if fill.rank.is_some() => {
-                self.metrics.incr(if i < fill.successors {
-                    "successor_probes"
+                let dest = fill.handoff[i];
+                let kind = if i < fill.successors {
+                    Some("successor")
+                } else if i < fill.granted && fill.demoted.contains(&dest) {
+                    Some("demoted")
+                } else if i < fill.granted {
+                    Some("lineage")
                 } else {
-                    "handoff_probes"
+                    None
+                };
+                self.metrics.incr(match kind {
+                    Some("successor") => "successor_probes",
+                    Some("demoted") => "demoted_probes",
+                    Some(_) => "lineage_grant_probes",
+                    None => "handoff_probes",
                 });
-                fill.handoff[i]
+                self.fills.get_mut(&id).expect("present").granted_kind = kind;
+                dest
             }
             Some(_) => match self.fanout_helper(id) {
                 Some(helper) => {
@@ -3267,6 +3329,22 @@ impl NodeWorld {
     /// acquisition to wait for), which the caller answers.
     fn join_copy(&mut self, mid: u64, dest: u32, page: u64, t: Nanos) -> bool {
         let now = self.now();
+        // Production `Coordinator::copy_join_allowed` (Known issue 311): an
+        // owner ranked before this node, asking it for a copy, must not wait
+        // on its acquisition, which most likely waits on that owner.
+        let w = self.ids.worker(page);
+        if self.config.node.copy_join_rank
+            && self.nodes[dest as usize].workers[w as usize]
+                .flights
+                .acquiring(&self.ids.page(page))
+        {
+            let requester = self.msgs[&mid].requester;
+            let owners = self.owners_at(dest, w, page, true);
+            if !copy_join_allowed(&owners, &dest, &requester) {
+                self.metrics.incr("copy_only_join_declined");
+                return false;
+            }
+        }
         let deadline = {
             let m = &self.msgs[&mid];
             self.instant(m.deadline.min(now + self.config.node.serve_timeout_ns))
@@ -3585,10 +3663,22 @@ impl NodeWorld {
         if let Walking::Candidates(walk) = &fill.walk
             && walk.pending_successor()
         {
-            self.metrics.incr(match &outcome {
-                Ok(Outcome::Copy) => "successor_copies",
-                Ok(Outcome::Probe(ProbeOutcome::CopyMiss)) => "successor_misses",
-                _ => "successor_failures",
+            let kind = fill.granted_kind.unwrap_or("successor");
+            let what = match &outcome {
+                Ok(Outcome::Copy) => "copies",
+                Ok(Outcome::Probe(ProbeOutcome::CopyMiss)) => "misses",
+                _ => "failures",
+            };
+            self.metrics.incr(match (kind, what) {
+                ("successor", "copies") => "successor_copies",
+                ("successor", "misses") => "successor_misses",
+                ("successor", _) => "successor_failures",
+                ("demoted", "copies") => "demoted_copies",
+                ("demoted", "misses") => "demoted_misses",
+                ("demoted", _) => "demoted_failures",
+                (_, "copies") => "lineage_grant_copies",
+                (_, "misses") => "lineage_grant_misses",
+                _ => "lineage_grant_failures",
             });
         }
         if let Some(dest) = fill.asking.take() {
@@ -4622,9 +4712,9 @@ impl NodeWorld {
             n.account(&mut components);
         }
         let mut list = components.list();
-        // Shared memos: real rankings (three scores and a cursor) and route
-        // alternatives, estimated per entry.
-        list.push(("placement_memo", self.shared.phantom.memo_len() * 192));
+        // Shared memos: real rankings (`RANKED_DEPTH` scores and a cursor)
+        // and route alternatives, estimated per entry.
+        list.push(("placement_memo", self.shared.phantom.memo_len() * 240));
         list.push(("route_memo", self.shared.routes.memo_len() * 320));
         list.push(("membership_versions", self.versions.approximate_bytes()));
         list.push(("engine", self.engine.approximate_bytes()));
