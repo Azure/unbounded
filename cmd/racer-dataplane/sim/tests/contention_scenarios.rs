@@ -352,7 +352,7 @@ fn seed_matrix_replays_identical_reports() {
 /// after the requester's attempt timed out: the owners' NIC queues grew
 /// without bound, almost every reply arrived late (`late_replies`), and
 /// useful throughput collapsed far below the NIC bound. Now a body stops at
-/// the requester's attempt deadline, so no reply arrives late and the owners
+/// the requester's attempt deadline, so no page body arrives late and the owners
 /// deliver at least half of what their NICs allow during the storm.
 ///
 /// Runs with overflow fan-out off, so only the owners serve the page; see
@@ -371,7 +371,11 @@ fn overloaded_hot_page_owners_do_not_stream_to_abandoned_requesters() {
     let failed = counter(&report, "reads_failed");
     assert_eq!(completed + failed, u64::from(nodes) + 1, "{report}");
     assert!(failed > 0, "the storm must overload the owners: {report}");
-    assert_eq!(counter(&report, "late_replies"), 0, "{report}");
+    // No page body arrives after its requester gave up. Short answers may:
+    // an owner above rank 0 whose delegation timed out now fails its
+    // waiters with `Unavailable` instead of fetching (Known issue 31), and
+    // some of those answers reach readers whose own attempt already ended.
+    assert_eq!(counter(&report, "late_page_replies"), 0, "{report}");
     assert!(counter(&report, "replies_abandoned") > 0, "{report}");
     // Each storm read ends within the read timeout (10 s) plus retries'
     // short backoff; over that span the owners' NICs can send at most this

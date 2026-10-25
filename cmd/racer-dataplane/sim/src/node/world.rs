@@ -3289,6 +3289,11 @@ impl NodeWorld {
     fn reply(&mut self, pid: u64, reply: Reply) {
         let Some(probe) = self.probes.remove(&pid) else {
             self.metrics.incr("late_replies");
+            if reply == Reply::Response(ResponseKind::Page) {
+                // A page body that kept streaming after its requester gave
+                // up (bodies stop at the requester's attempt deadline).
+                self.metrics.incr("late_page_replies");
+            }
             return;
         };
         let Some(fill) = self.fills.get(&probe.fill) else {
