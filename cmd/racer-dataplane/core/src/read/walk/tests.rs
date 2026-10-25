@@ -20,6 +20,7 @@ fn config(rank: Option<usize>, owners: usize, order: VisitOrder) -> WalkConfig {
         previous: 0,
         helper: false,
         lineage: [0; MAX_HANDOFF],
+        successors: 0,
     }
 }
 
@@ -1414,4 +1415,125 @@ fn retry_pending_plans_the_same_destination_again() {
         panic!("expected a probe");
     };
     assert_eq!(next.canonical, 2);
+}
+
+#[test]
+fn delegated_rank_zero_asks_successors_on_their_own_grant() {
+    // Rank 0 reached by a delegation: one origin credit, one link. The
+    // successor probe is funded by its grant; the previous-membership target
+    // after it is not (it would spend the origin credit).
+    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
+    cfg.handoff = 2;
+    cfg.successors = 1;
+    let mut walk = CandidateWalk::new(cfg);
+    let mut b = budget(1, 1);
+    let mut granted = Vec::new();
+    let (probes, end) = drive(&mut walk, &mut b, |_, request| {
+        granted.push((request.remaining_attempts(), request.remaining_links()));
+        Outcome::Probe(ProbeOutcome::CopyMiss)
+    });
+    assert_eq!(
+        probes
+            .iter()
+            .map(|(p, ..)| (p.canonical, p.mode, p.route))
+            .collect::<Vec<_>>(),
+        [(3, Mode::CopyOnly, RouteMode::FundedRoute)]
+    );
+    assert_eq!(granted, [(SUCCESSOR_GRANT_ATTEMPTS, SUCCESSOR_GRANT_LINKS)]);
+    assert_eq!(
+        end,
+        End::Origin {
+            rank: 0,
+            evidence: Vec::new()
+        }
+    );
+    // The walk's own credits are untouched: the origin attempt remains.
+    assert_eq!((b.remaining_attempts(), b.remaining_links()), (1, 1));
+
+    // A successor's copy ends the walk.
+    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
+    cfg.handoff = 1;
+    cfg.successors = 1;
+    let mut walk = CandidateWalk::new(cfg);
+    let mut b = budget(1, 1);
+    let (probes, end) = drive(&mut walk, &mut b, |_, _| Outcome::Copy);
+    assert_eq!(probes.len(), 1);
+    assert_eq!(end, End::Copy);
+    assert_eq!((b.remaining_attempts(), b.remaining_links()), (1, 1));
+}
+
+#[test]
+fn successor_grant_never_grows_the_walk_budget() {
+    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
+    cfg.handoff = 2;
+    cfg.successors = 2;
+    let mut walk = CandidateWalk::new(cfg);
+    let mut b = budget(1, 10);
+    // An unreachable successor is a miss and does not mark this walk's
+    // route as failed (the grant's route is not this walk's).
+    let (probes, end) = drive(&mut walk, &mut b, |p, _| {
+        if p.canonical == 3 {
+            Outcome::Transport(ProbeOutcome::Unreachable)
+        } else {
+            Outcome::StaleMembership
+        }
+    });
+    assert_eq!(probes.len(), 2);
+    assert!(probes.iter().all(|(p, ..)| p.mode == Mode::CopyOnly));
+    assert!(matches!(end, End::Origin { rank: 0, .. }));
+    assert_eq!((b.remaining_attempts(), b.remaining_links()), (1, 10));
+    assert_eq!(b.route_links(), 4);
+
+    // Abandoning a pending successor probe drops its grant.
+    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
+    cfg.handoff = 1;
+    cfg.successors = 1;
+    let mut walk = CandidateWalk::new(cfg);
+    let mut b = budget(2, 3);
+    let Step::Probe(probe) = walk.next(&mut b).unwrap() else {
+        panic!("expected a successor probe");
+    };
+    assert!(walk.pending_successor());
+    assert!(walk.pending_handoff());
+    assert_eq!(probe.canonical, 3);
+    walk.abandon(&mut b).unwrap();
+    assert_eq!((b.remaining_attempts(), b.remaining_links()), (2, 3));
+}
+
+#[test]
+fn owner_above_rank_zero_asks_successors_after_its_delegation() {
+    let mut cfg = config(Some(1), 3, VisitOrder::canonical(3));
+    cfg.handoff = 1;
+    cfg.successors = 1;
+    let mut walk = CandidateWalk::new(cfg);
+    let mut b = budget(3, 8);
+    let (probes, end) = drive(&mut walk, &mut b, |p, _| {
+        Outcome::Probe(if p.canonical == 0 {
+            ProbeOutcome::Unreachable
+        } else {
+            ProbeOutcome::CopyMiss
+        })
+    });
+    assert_eq!(
+        probes
+            .iter()
+            .map(|(p, ..)| (p.canonical, p.mode))
+            .collect::<Vec<_>>(),
+        [(0, Mode::Acquire), (3, Mode::CopyOnly)]
+    );
+    assert_eq!(
+        end,
+        End::Origin {
+            rank: 1,
+            evidence: vec![ProbeOutcome::Unreachable]
+        }
+    );
+    // Without successors nothing changes for a non-owner.
+    let mut cfg = config(None, 3, VisitOrder::canonical(3));
+    cfg.successors = 1;
+    let mut walk = CandidateWalk::new(cfg);
+    let (probes, _) = drive(&mut walk, &mut budget(32, 96), |_, _| {
+        Outcome::Probe(ProbeOutcome::CopyMiss)
+    });
+    assert!(probes.iter().all(|(p, ..)| p.canonical < 3));
 }

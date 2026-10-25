@@ -105,7 +105,23 @@ pub struct WalkConfig {
     /// delegation to rank 0 forwards spare credits for rank 0's. Never
     /// reserved: without slack the walk funds exactly as before.
     pub lineage: [u8; MAX_HANDOFF],
+    /// The first `successors` handoff targets are successor targets
+    /// ([`crate::read::successor::successor_targets`]): later owners this
+    /// owner answered without a copy, which then likely fetched the page
+    /// themselves. Each is asked copy-only once, before origin, with its own
+    /// grant ([`SUCCESSOR_GRANT_ATTEMPTS`], [`SUCCESSOR_GRANT_LINKS`])
+    /// instead of the walk's budget, whose credits a delegated rank 0 needs
+    /// for origin. The grant's unused credits are dropped, never added to
+    /// the walk's budget, so the walk's credits never grow (Known issue 21).
+    pub successors: usize,
 }
+
+/// Attempts granted to one successor probe ([`WalkConfig::successors`]): the
+/// copy-only exchange.
+pub const SUCCESSOR_GRANT_ATTEMPTS: u32 = 1;
+
+/// Links granted to one successor probe, as a reader funds an owner.
+pub const SUCCESSOR_GRANT_LINKS: u8 = 8;
 
 /// Most previous-membership owners one walk asks (the replica count).
 pub const MAX_HANDOFF: usize = 3;
@@ -367,6 +383,8 @@ struct Pending {
     previous: bool,
     /// The probe asks the overflow helper.
     helper: bool,
+    /// `bounded` is a successor grant: dropped, never reunited.
+    granted: bool,
 }
 
 impl CandidateWalk {
@@ -442,6 +460,7 @@ impl CandidateWalk {
             rank0: false,
             helper: true,
             previous: false,
+            granted: false,
         });
         Ok(Step::Probe(Probe {
             index: self.index,
@@ -451,6 +470,12 @@ impl CandidateWalk {
             route: RouteMode::FundedRoute,
             previous: false,
         }))
+    }
+
+    /// Whether the pending probe is a granted successor probe
+    /// ([`WalkConfig::successors`]).
+    pub fn pending_successor(&self) -> bool {
+        self.pending.as_ref().is_some_and(|p| p.granted)
     }
 
     /// Whether the pending probe asks the overflow helper.
@@ -542,6 +567,33 @@ impl CandidateWalk {
         while let Some(canonical) = self.target(self.index) {
             let index = self.index;
             let handoff = canonical >= self.config.owners;
+            let granted = handoff && canonical - self.config.owners < self.config.successors;
+            if granted {
+                // A successor probe spends its own grant, never the walk's
+                // credits.
+                let child = AcquisitionBudget::new(
+                    budget.deadline(),
+                    SUCCESSOR_GRANT_ATTEMPTS,
+                    SUCCESSOR_GRANT_LINKS,
+                );
+                self.pending = Some(Pending {
+                    bounded: Some(child),
+                    handoff: true,
+                    delegated: false,
+                    rank0: false,
+                    previous: false,
+                    helper: false,
+                    granted: true,
+                });
+                return Ok(Step::Probe(Probe {
+                    index,
+                    canonical,
+                    mode: Mode::CopyOnly,
+                    remaining_opportunities: (self.count - index + 1) as u32,
+                    route: RouteMode::FundedRoute,
+                    previous: false,
+                }));
+            }
             // Credits the delegation must leave: one per later predecessor
             // probe and one for this owner's own origin attempt. Handoff
             // probes are opportunistic and never reserve credits, so they
@@ -713,6 +765,7 @@ impl CandidateWalk {
                 rank0: rank.is_some() && canonical == 0 && !handoff && self.config.page_operation,
                 previous,
                 helper: false,
+                granted: false,
             });
             return Ok(Step::Probe(Probe {
                 index,
@@ -748,6 +801,7 @@ impl CandidateWalk {
         self.done = true;
         if let Some(Pending {
             bounded: Some(bounded),
+            granted: false,
             ..
         }) = self.pending.take()
         {
@@ -779,7 +833,9 @@ impl CandidateWalk {
         outcome: Outcome,
     ) -> Result<Option<End>> {
         let pending = self.pending.take().expect("no pending probe");
-        if let Some(bounded) = pending.bounded {
+        if let Some(bounded) = pending.bounded
+            && !pending.granted
+        {
             budget.reunite(bounded)?;
         }
         let outcome = match outcome {
@@ -825,10 +881,12 @@ impl CandidateWalk {
                 Ok(None)
             }
             Outcome::Probe(outcome) | Outcome::Transport(outcome) if pending.handoff => {
-                if matches!(
-                    outcome,
-                    ProbeOutcome::Unreachable | ProbeOutcome::Overloaded
-                ) {
+                if !pending.granted
+                    && matches!(
+                        outcome,
+                        ProbeOutcome::Unreachable | ProbeOutcome::Overloaded
+                    )
+                {
                     budget.note_route_failure();
                 }
                 Ok(None)
