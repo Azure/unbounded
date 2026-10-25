@@ -39,7 +39,7 @@ use racer_core::read::Error;
 use racer_core::read::budget::{AcquisitionBudget, inherited_budget};
 use racer_core::read::candidates::{
     AuthorityFacts, OperationKind, ProbeOutcome, ReplicaSelection, ResponseKind, VisitOrder,
-    classify, replica_score, validate_origin_authority, visit_order,
+    classify, lineage_first, replica_score, validate_origin_authority, visit_order,
 };
 use racer_core::read::fanout::{fanout_helper, hot_page_bodies, is_helper, shed_hot_page};
 use racer_core::read::fill::{FailureKind, FillPlan, FillStep, Source, WalkResult};
@@ -49,13 +49,16 @@ use racer_core::read::policy::{
 };
 use racer_core::read::range::{PageBudget, SlotKind, direct_fills, first_failure};
 use racer_core::read::serve::{ServeAction, ServeFacts, serve_action, serve_deadline};
-use racer_core::read::stale::{StaleSkip, fallback_rank_allowed, previous_fallback};
+use racer_core::read::stale::{
+    StaleSkip, StaleWaitFacts, fallback_rank_allowed, previous_fallback, stale_wait,
+};
 use racer_core::read::successor::{MAX_DEFERRALS, defer_allowed, should_note, successor_deferral};
 use racer_core::read::walk::{
-    AttemptInputs, AttemptPlan, CandidateWalk, Continuation, End, HedgeFacts, Mode, Outcome,
-    PREVIOUS_MEMBERSHIP_WITHIN, Probe, RemainingWalk, RouteMode, StaleAction, Step, WalkConfig,
-    handoff_targets, hedge_budgets, hedge_eligible, hedge_fallback, plan_attempt,
-    same_rank_previous, stale_action, transport_outcome,
+    AttemptInputs, AttemptPlan, CandidateWalk, Continuation, End, HedgeFacts, MAX_HANDOFF, Mode,
+    Outcome, PREVIOUS_MEMBERSHIP_WITHIN, Probe, RemainingWalk, RouteMode, StaleAction, Step,
+    WalkConfig, handoff_targets, hedge_budgets, hedge_eligible, hedge_fallback, lineage_counts,
+    lineage_targets, merge_handoff, plan_attempt, same_rank_previous, stale_action,
+    transport_outcome,
 };
 use racer_core::route::MAX_LINKS;
 use racer_core::time::SplitMix64;
@@ -188,6 +191,10 @@ pub enum Event {
     Slice {
         task: u64,
     },
+    /// A fill's wait for a destination that is behind ended (Known issue 26).
+    StaleWait {
+        fill: u64,
+    },
 }
 
 impl Event {
@@ -227,6 +234,7 @@ impl Event {
             Self::Release { id } => (18, id, 0),
             Self::OriginCancel { fill } => (19, fill, 0),
             Self::OriginWake => (20, 0, 0),
+            Self::StaleWait { fill } => (21, fill, 0),
         }
     }
 }
@@ -319,6 +327,11 @@ struct Fill {
     /// page's overflow helper (non-owners); probe canonical `cands.len() + i`
     /// addresses `handoff[i]`.
     handoff: Vec<u32>,
+    /// Lineage targets per canonical owner rank (`WalkConfig::lineage`).
+    lineage: [u8; MAX_HANDOFF],
+    /// This owner's lineage targets (`lineage_targets`), merged into
+    /// `handoff` (Known issue 25).
+    lineage_targets: Vec<u32>,
     /// This owner is a member of membership version - 1, which is still
     /// retained and was replaced within `PREVIOUS_MEMBERSHIP_WITHIN`.
     previous_member: bool,
@@ -334,6 +347,11 @@ struct Fill {
     /// after a destination under the current one was behind
     /// (`stale_fallback`).
     fell_back: bool,
+    /// This read waited once for a destination that is behind
+    /// (`racer_core::read::stale::stale_wait`, Known issue 26).
+    waited: bool,
+    /// The walk is paused in that wait (`Event::StaleWait`).
+    stale_waiting: bool,
     /// This node owns the page under the previous membership, so this walk
     /// keeps the current one.
     fallback_denied: bool,
@@ -530,6 +548,9 @@ struct Msg {
 struct Probing {
     fill: u64,
     acquire: bool,
+    /// Remote credits the request carried, refunded on a verified
+    /// `StaleMembership` (`AcquisitionBudget::refund_remote`).
+    remote: u32,
     /// `Some(true)` for a hedge primary, `Some(false)` for its duplicate.
     hedge: Option<bool>,
 }
@@ -966,6 +987,12 @@ impl NodeWorld {
                     self.down_since.remove(&node);
                     self.fabric.reset_node(node, self.now());
                     self.metrics.incr("restarts");
+                    // The restarted process's membership chain starts at
+                    // the membership it finds (Known issue 25).
+                    self.nodes[node as usize].lineage_base = self
+                        .versions
+                        .get(self.versions.latest_number())
+                        .map(|v| v.members.generation());
                 }
             }
             Event::Slow { node, factor } => {
@@ -975,6 +1002,7 @@ impl NodeWorld {
             }
             Event::Slice { task } => self.slice(task),
             Event::HedgeDelay { fill } => self.hedge_delay(fill),
+            Event::StaleWait { fill } => self.stale_wait_done(fill),
             Event::OriginCancel { fill } => self.origin_cancel(fill),
             Event::OriginWake => self.origin_wake(),
             Event::Release { id } => {
@@ -1041,6 +1069,10 @@ impl NodeWorld {
         let version = self.versions.adopted(node, now);
         let (number, members) = (version.number, version.members.clone());
         let old = self.nodes[node as usize].version;
+        let base = &mut self.nodes[node as usize].lineage_base;
+        if base.is_none() {
+            *base = Some(members.generation());
+        }
         if number == old {
             return number;
         }
@@ -1533,6 +1565,28 @@ impl NodeWorld {
         true
     }
 
+    /// Arrival generations of `owners` in `node`'s membership chain
+    /// (production `Membership::since`): the shared chain clamped to the
+    /// generation this node's process started from (Known issue 25).
+    fn since_of(&self, node: u32, members: &Members, owners: &[u32]) -> Vec<Option<u32>> {
+        if !self.config.node.lineage {
+            return vec![None; owners.len()];
+        }
+        let base = self
+            .versions
+            .chain_base(node)
+            .or(self.nodes[node as usize].lineage_base)
+            .unwrap_or(0);
+        owners
+            .iter()
+            .map(|c| {
+                position(members, *c)
+                    .and_then(|p| members.since(p))
+                    .map(|s| s.max(base))
+            })
+            .collect()
+    }
+
     /// The page's owners under the membership `at` adopted, ranking them
     /// when `rank` (production `CandidatePolicy::candidates_scoped`) or only
     /// from the placement cache (production `Placement::cached`).
@@ -1678,6 +1732,8 @@ impl NodeWorld {
                 walk: Walking::None,
                 cands: Vec::new(),
                 handoff: Vec::new(),
+                lineage: [0; MAX_HANDOFF],
+                lineage_targets: Vec::new(),
                 previous_member: false,
                 previous: 0,
                 version: 0,
@@ -1686,6 +1742,8 @@ impl NodeWorld {
                 stale: 0,
                 fell_back: false,
                 fallback_denied: false,
+                waited: false,
+                stale_waiting: false,
                 probe: None,
                 eligible,
                 order: VisitOrder::canonical(0),
@@ -1958,10 +2016,26 @@ impl NodeWorld {
                 |r| replica_score(requester, &object, number, self.ids.node(cands[r])),
             )
         };
+        // Arrival order of the owners in this node's chain (production
+        // `Membership::since`, Known issue 25): the shared chain clamped to
+        // the generation this node's process started from.
+        let since = self.since_of(node, &members, &cands);
+        // A non-owner visits an older later owner before the newer owner
+        // that displaced it (production `visit_order`, Known issue 25).
+        let order = if rank.is_none() {
+            lineage_first(order, &since)
+        } else {
+            order
+        };
         let fill = self.fills.get_mut(&id).expect("present");
+        fill.lineage = lineage_counts(&since);
+        fill.lineage_targets = match rank {
+            Some(rank) => lineage_targets(&cands, &since, rank),
+            None => Vec::new(),
+        };
         fill.cands = cands;
         fill.stale = 0;
-        fill.handoff.clear();
+        fill.handoff = fill.lineage_targets.clone();
         fill.previous_member = false;
         fill.previous = 0;
         fill.version = version;
@@ -2008,10 +2082,11 @@ impl NodeWorld {
             if fill.previous_member {
                 fill.previous = same;
             }
-            fill.handoff = targets
+            let targets = targets
                 .into_iter()
                 .filter(|n| current.as_ref().is_some_and(|m| position(m, *n).is_some()))
                 .collect();
+            fill.handoff = merge_handoff(targets, fill.lineage_targets.clone());
         }
         self.walk_owners(id);
     }
@@ -2046,6 +2121,7 @@ impl NodeWorld {
             // sheds it (production `resolve_epoch_traced`, Known issue 16);
             // the helper is chosen when the walk asks for it.
             helper: fill.rank.is_none() && self.config.node.fanout && helpers_possible,
+            lineage: fill.lineage,
         }));
         self.step_walk(id);
     }
@@ -2597,6 +2673,7 @@ impl NodeWorld {
             Probing {
                 fill: id,
                 acquire,
+                remote: plan.remote_attempts,
                 hedge,
             },
         );
@@ -3303,6 +3380,27 @@ impl NodeWorld {
         self.fabric
             .crypto(now, fill.node, self.fabric.costs.verify_ns);
         let page = fill.page;
+        if reply == Reply::Response(ResponseKind::StaleMembership) && probe.hedge.is_none() {
+            // The answering node could not resolve the request's membership,
+            // so the credits it carried were never used (production
+            // `request_traced`, Known issue 26).
+            let fill = self.fills.get_mut(&probe.fill).expect("present");
+            let budget = match &mut fill.walk {
+                Walking::Candidates(walk) => walk.request_budget(&mut fill.budget),
+                _ => &mut fill.budget,
+            };
+            let refunded = budget.refund_remote(probe.remote);
+            self.invariants.check(
+                "budget_never_grows",
+                refunded.is_ok(),
+                now,
+                Some(fill.node),
+                || format!("refund {} remote credits: {refunded:?}", probe.remote),
+            );
+        }
+        let Some(fill) = self.fills.get(&probe.fill) else {
+            return;
+        };
         let outcome = match reply {
             Reply::Transport => Ok(Outcome::Transport(ProbeOutcome::Unreachable)),
             Reply::Shed => Ok(Outcome::Shed),
@@ -3323,6 +3421,11 @@ impl NodeWorld {
                 let latest = self.adopt(node);
                 match stale_action(retried, previous, Some(latest)) {
                     Ok(StaleAction::Refresh) => Ok(Outcome::StaleMembership),
+                    Ok(StaleAction::Skip) if !owner && self.stale_wait(probe.fill) => {
+                        // Waiting for the destination to adopt this
+                        // membership, then asking it again (Known issue 26).
+                        return;
+                    }
                     Ok(StaleAction::Skip) => {
                         self.metrics.incr("stale_destination_skips");
                         if let Some(fill) = self.fills.get_mut(&probe.fill) {
@@ -3472,14 +3575,14 @@ impl NodeWorld {
         }
     }
 
-    /// Production `resolve_epoch_traced`: at a destination behind this
-    /// node, a non-owner stops its walk and walks the page's owners under
-    /// membership version - 1 instead, once (`racer_core::read::stale`,
-    /// Known issue 19). Returns whether it did.
-    fn stale_fallback(&mut self, id: u64) -> bool {
+    /// Whether fill `id` may walk the previous membership at a destination
+    /// that is behind (`racer_core::read::stale::previous_fallback`), with
+    /// the previous membership, whether this node is a member of it, and
+    /// whether it was replaced recently.
+    fn fallback_facts(&self, id: u64) -> (bool, Option<Rc<Members>>, bool, bool) {
         let now = self.now();
         let fill = &self.fills[&id];
-        let (node, w, page, version) = (fill.node, fill.worker, fill.page, fill.version);
+        let (node, version) = (fill.node, fill.version);
         let old = version
             .checked_sub(1)
             .and_then(|v| self.versions.get(v))
@@ -3497,9 +3600,66 @@ impl NodeWorld {
             previous_recent_member: recent && member,
         }) && !fill.fallback_denied
             && self.config.node.stale_fallback;
+        (go, old, member, recent)
+    }
+
+    /// Production `resolve_epoch_traced` (Known issue 26): a non-owner that
+    /// cannot walk the previous membership waits once for a destination
+    /// that is behind, then asks it again (`racer_core::read::stale::stale_wait`).
+    /// The pending probe's credits are back in the fill's budget. Returns
+    /// whether it waits.
+    fn stale_wait(&mut self, id: u64) -> bool {
+        if !self.config.node.stale_wait {
+            return false;
+        }
+        let now = self.instant(self.now());
+        let (fallback, ..) = self.fallback_facts(id);
+        let fill = self.fills.get_mut(&id).expect("present");
+        let Some(wait) = stale_wait(StaleWaitFacts {
+            owner: fill.rank.is_some(),
+            fallback,
+            waited: fill.waited,
+            remaining: fill.budget.deadline().saturating_duration_since(now),
+        }) else {
+            return false;
+        };
+        let Walking::Candidates(walk) = &mut fill.walk else {
+            return false;
+        };
+        if walk.retry_pending(&mut fill.budget).is_err() {
+            return false;
+        }
+        fill.waited = true;
+        fill.stale_waiting = true;
+        fill.asking = None;
+        self.metrics.incr("stale_waits");
+        self.engine
+            .after(wait.as_nanos() as Nanos, Event::StaleWait { fill: id });
+        true
+    }
+
+    /// A stale wait ended: ask the same destination again.
+    fn stale_wait_done(&mut self, id: u64) {
+        let Some(fill) = self.fills.get_mut(&id) else {
+            return;
+        };
+        if std::mem::take(&mut fill.stale_waiting) {
+            self.step_walk(id);
+        }
+    }
+
+    /// Production `resolve_epoch_traced`: at a destination behind this
+    /// node, a non-owner stops its walk and walks the page's owners under
+    /// membership version - 1 instead, once (`racer_core::read::stale`,
+    /// Known issue 19). Returns whether it did.
+    fn stale_fallback(&mut self, id: u64) -> bool {
+        let fill = &self.fills[&id];
+        let (node, w, page, version) = (fill.node, fill.worker, fill.page, fill.version);
+        let first = fill.rank.is_none() && !fill.retried && !fill.fell_back;
+        let (go, old, member, recent) = self.fallback_facts(id);
         let (true, Some(old)) = (go, old) else {
             // Why a non-owner could not fall back (Known issue 19).
-            if fill.rank.is_none() && !fill.retried && !fill.fell_back {
+            if first {
                 self.metrics.incr(if !member {
                     "stale_fallback_not_member"
                 } else if !recent {

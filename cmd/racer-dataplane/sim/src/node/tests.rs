@@ -195,6 +195,40 @@ fn stale_owners_send_non_owners_to_the_previous_membership() {
     assert!(counter(&on, "reads_failed") * 4 <= counter(&off, "reads_failed"));
 }
 
+/// Known issue 26: a node that rejoins in version N is not a member of
+/// N - 1, so it cannot walk the previous membership when the page's owners
+/// are behind. Without the wait it skips each of them and its walk ends
+/// exhausted; with it, it waits once and asks the same owner again after it
+/// adopted N.
+#[test]
+fn readers_that_cannot_fall_back_wait_for_owners_that_are_behind() {
+    let with = |wait: bool| {
+        let mut config = churny(120, 2);
+        config.request_rate = 40.0;
+        config.node.membership_lag_ns = config.node.membership_batch_ns;
+        config.node.stale_wait = wait;
+        run(config, 3).1
+    };
+    let off = with(false);
+    let on = with(true);
+    assert_eq!(counter(&off, "stale_waits"), 0);
+    assert!(counter(&on, "stale_waits") > 0, "{on}");
+    let exhausted = |r: &Value| counter(r, "walk_exhausted_stale");
+    eprintln!(
+        "exhausted {} -> {}, failed {} -> {}, waits {}, not member {}",
+        exhausted(&off),
+        exhausted(&on),
+        counter(&off, "reads_failed"),
+        counter(&on, "reads_failed"),
+        counter(&on, "stale_waits"),
+        counter(&off, "stale_fallback_not_member"),
+    );
+    assert!(counter(&off, "stale_fallback_not_member") > 0, "{off}");
+    assert!(exhausted(&off) > 0, "{off}");
+    assert!(exhausted(&on) < exhausted(&off));
+    assert!(counter(&on, "reads_failed") <= counter(&off, "reads_failed"));
+}
+
 /// 412 continues with the remaining walk; 403 and 5xx fail the fill.
 #[test]
 fn origin_errors_follow_the_fill_plan() {

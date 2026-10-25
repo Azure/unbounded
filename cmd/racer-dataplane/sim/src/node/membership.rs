@@ -74,6 +74,10 @@ pub struct Versions {
     /// Combined mode: members of the latest version whose client has
     /// applied nothing, so they refuse peer links (Known issue 14).
     unready: u32,
+    /// Combined mode: per node, the generation of the first version its
+    /// control client applied since (re)start, where production's
+    /// membership chain begins (Known issue 25). `None` before any.
+    chain_base: Vec<Option<u32>>,
 }
 
 impl Versions {
@@ -94,6 +98,7 @@ impl Versions {
             retained,
             external: None,
             unready: 0,
+            chain_base: Vec::new(),
         }
     }
 
@@ -109,6 +114,7 @@ impl Versions {
             retained,
             external: Some(vec![0; nodes as usize]),
             unready: 0,
+            chain_base: vec![None; nodes as usize],
         }
     }
 
@@ -151,6 +157,12 @@ impl Versions {
         if number != 0 && self.get(number).is_none() {
             return;
         }
+        let generation = self.get(number).map(|v| v.members.generation());
+        if let Some(base) = self.chain_base.get_mut(node as usize)
+            && (number == 0 || base.is_none())
+        {
+            *base = generation;
+        }
         let live = self.is_live(node);
         if let Some(slot) = self
             .external
@@ -166,6 +178,12 @@ impl Versions {
             }
             *slot = number;
         }
+    }
+
+    /// Combined mode: where `node`'s membership chain begins (see
+    /// `chain_base`); `None` in standalone mode or before it applied any.
+    pub fn chain_base(&self, node: u32) -> Option<u32> {
+        self.chain_base.get(node as usize).copied().flatten()
     }
 
     /// Combined mode: members of the latest version that cannot serve yet

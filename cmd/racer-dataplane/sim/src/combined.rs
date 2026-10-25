@@ -581,6 +581,45 @@ mod tests {
     /// peer link fails toward a member that has not applied a membership,
     /// and no read fails while one is listed. With the pre-round-4
     /// reporting (`report_at_start`) both happen.
+    /// Known issue 25: as members join and leave, pages move to members that
+    /// arrived after their other owners, which may still hold copies they
+    /// fetched before, however many versions ago. Owners ask those lineage
+    /// targets before origin and readers visit them first, so fewer moved
+    /// pages are fetched again. Every repeat stays explained.
+    #[test]
+    fn lineage_targets_find_copies_of_pages_that_moved() {
+        let run_with = |lineage: bool| {
+            let mut config = Config {
+                nodes: 500,
+                ..Config::default()
+            };
+            data_defaults(&mut config);
+            config.request_rate = 0.005;
+            config.node.lineage = lineage;
+            run("full-churn", config, 1, None, None).unwrap()
+        };
+        let off = run_with(false);
+        let on = run_with(true);
+        assert_clean(&off);
+        assert_clean(&on);
+        let moved = |r: &Value| {
+            r["origin_per_page"]["repeats"]["after_owner_move"]
+                .as_u64()
+                .unwrap()
+        };
+        let origin = |r: &Value| r["origin_per_page"]["requests"].as_u64().unwrap();
+        // Seed 1: 91 and 82 repeats after a move, 2,178 and 2,169 requests.
+        assert!(moved(&off) > 0);
+        assert!(
+            moved(&on) < moved(&off),
+            "{} vs {}",
+            moved(&on),
+            moved(&off)
+        );
+        assert!(origin(&on) < origin(&off));
+        assert!(counter(&on, "reads_failed") <= counter(&off, "reads_failed"));
+    }
+
     #[test]
     fn cold_start_members_serve_before_they_are_routable() {
         let run_with = |report_at_start: bool| {

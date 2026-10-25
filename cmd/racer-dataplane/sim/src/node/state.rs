@@ -138,6 +138,11 @@ pub struct Node {
     pub retention: Retention,
     /// Last adopted membership version.
     pub version: u64,
+    /// Generation of the first membership adopted since (re)start: the
+    /// start of this process's membership chain (production builds its
+    /// chain from the first publication it accepts), so earlier arrivals
+    /// are unknown to it (Known issue 25).
+    pub lineage_base: Option<u32>,
     pub down: bool,
     pub incarnation: u32,
     /// Speculative hedge slots and bytes shared by the node's workers
@@ -181,6 +186,7 @@ impl Node {
             disk,
             retention: Retention::new(config.history_bytes, disk_pages, now),
             version: 1,
+            lineage_base: None,
             down: false,
             incarnation: 0,
             hedges: flow_control::Hedges::new(

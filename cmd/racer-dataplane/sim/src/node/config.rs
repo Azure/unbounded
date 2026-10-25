@@ -82,6 +82,15 @@ pub struct NodeConfig {
     /// is behind (production: always on; set 0 to measure without it, Known
     /// issue 19).
     pub stale_fallback: bool,
+    /// Owners ask, readers visit first, and walks fund later owners that
+    /// arrived before an owner (production `lineage_targets`,
+    /// `lineage_first`: always on; set 0 to measure without it, Known issue
+    /// 25).
+    pub lineage: bool,
+    /// A non-owner that cannot walk the previous membership waits once for
+    /// a destination that is behind (production `stale_wait`: always on;
+    /// set 0 to measure without it, Known issue 26).
+    pub stale_wait: bool,
 }
 
 impl Default for NodeConfig {
@@ -115,6 +124,8 @@ impl Default for NodeConfig {
             flight_handover: true,
             successor_hints: true,
             stale_fallback: true,
+            lineage: true,
+            stale_wait: true,
         }
     }
 }
@@ -158,6 +169,8 @@ impl NodeConfig {
                 "flight_handover" if n <= 1 => self.flight_handover = n == 1,
                 "successor_hints" if n <= 1 => self.successor_hints = n == 1,
                 "stale_fallback" if n <= 1 => self.stale_fallback = n == 1,
+                "lineage" if n <= 1 => self.lineage = n == 1,
+                "stale_wait" if n <= 1 => self.stale_wait = n == 1,
                 _ => return Err(format!("unknown key node.{key}")),
             }
         }
