@@ -391,7 +391,7 @@ fn overloaded_hot_page_owners_do_not_stream_to_abandoned_requesters() {
 /// a millisecond over 32 MiB/s NICs: in a 2 s attempt the page's 3 owners can
 /// send about 192 copies, so without fan-out readers queue on the owners
 /// until their attempts time out and some reads fail. With fan-out, owners
-/// already streaming `HOT_PAGE_BODIES` bodies of the page shed further
+/// already streaming `hot_page_bodies` bodies of the page shed further
 /// readers with `Overloaded`, and a shed reader asks one of the page's
 /// helpers, which the owners always serve. Every read completes, readers get
 /// copies from helpers, and the page still reaches the origin once.
@@ -420,4 +420,32 @@ fn hot_page_readers_fan_out_through_helpers() {
         max_ns(&on, "read_ns"),
         max_ns(&off, "read_ns")
     );
+}
+
+/// Known issue 18 (round 4, relay): a relay forwarding a body still queued at
+/// a busy owner reserved its own NIC at the body's future send time, so its
+/// other sends queued behind the gap, backlogs spread from relay to relay and
+/// relays held their `Relay` reservations for hundreds of milliseconds (5k
+/// `zipf`: 339k relay rejections, 4,373 failed reads). With transmit modeled
+/// as a work-conserving backlog, a relayed 1 MiB body streams in about its
+/// links' latency plus wire time: at most two links of (12.5 ms one way
+/// + 0.84 ms at 10 Gbit/s) here. Before the fix this run's p99 was 42 ms.
+#[test]
+fn relays_hold_their_reservation_only_while_the_body_streams() {
+    let mut config = Config {
+        nodes: 300,
+        objects: 1024,
+        zipf_s: 1.0,
+        ..Config::default()
+    };
+    config.node.relay_transfers = 16;
+    let report = run(config, 1);
+    let stream = &report["metrics"]["histograms"]["relay_hold_stream_ns"];
+    assert!(stream["count"].as_u64().unwrap_or(0) > 1_000, "{stream}");
+    let p99 = stream["p99"].as_u64().unwrap();
+    assert!(
+        p99 < 30 * MILLIS,
+        "relayed bodies queue behind idle gaps: {stream}"
+    );
+    assert_eq!(counter(&report, "reads_failed"), 0, "{report}");
 }
