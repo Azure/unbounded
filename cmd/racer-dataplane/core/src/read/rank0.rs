@@ -49,20 +49,27 @@
 //! another `hang_after`.
 //!
 //! Rank 0's own failures (Known issue 52). When rank 0 itself answers an
-//! owner's probe `Unavailable`, its acquisition of the page failed, in
-//! practice at origin; the owner notes it ([`Rank0Watch::failed`]) and,
-//! for [`Rank0Watch::hang_after`] after the first such failure, the page is
-//! [`Rank0State::Failed`] and the owner does not fetch the page itself
-//! after a further failure of rank 0 (the walk withholds authority on
-//! [`crate::read::walk::Outcome::Failed`] unless the page is `Overdue`).
-//! Past it the page is `Overdue`: this owner fetches once, and the next
-//! failure starts a new interval. While origin keeps failing, the owner
-//! thus adds at most one origin request per page per `hang_after` to
-//! rank 0's (one per reader retry) instead of one per reader retry, and a
-//! failure local to rank 0 (its route to origin) delays the page by at
-//! most `hang_after`. In the simulator, 5k `full-failover` (180 s origin
-//! 5xx burst), owners above rank 0 doubled the requests on every page that
-//! kept failing.
+//! owner's probe `Unavailable` ([`crate::read::walk::Outcome::Failed`]),
+//! its acquisition of the page failed, usually at origin, and the owner
+//! takes origin authority and asks the same origin right away; the reader's
+//! next retry then sends rank 0 to origin again, so during an origin error
+//! burst each reader retry cost two origin requests. The cause is not
+//! visible in the answer (rank 0 also answers `Unavailable` when it fails
+//! for reasons of its own, and then the owner's fetch is what serves the
+//! page). So the owner learns it from its own fetch: when its own origin
+//! request for the page fails after it took authority
+//! ([`Rank0Watch::failed`]), origin is failing for the page, and for
+//! [`Rank0Watch::hang_after`] after that the page is
+//! [`Rank0State::Failed`]: a further `Failed` answer from rank 0 leaves the
+//! retry to rank 0 (the walk withholds authority, as for a timeout). Past
+//! it the page is `Unknown` again, so the owner fetches once more after
+//! rank 0's next failure, and a failure of that fetch starts the next
+//! interval. While origin keeps failing a page, the owner adds at most one
+//! origin request per `hang_after` (plus the first) to rank 0's, which
+//! follow the reader retries; a failure local to rank 0 is never withheld
+//! unless the owner's own fetch failed too. In the simulator (5k
+//! `full-failover` with every origin request failing for 30 s twice) this
+//! cut origin requests 17,114 to 15,179.
 //!
 //! Costs: one entry per page an owner deferred to rank 0, bounded by
 //! [`WATCH_CAPACITY`] and expiring [`WATCH_TTL`] after the last timeout.
@@ -97,11 +104,11 @@ pub enum Rank0State {
     /// answered since: rank 0 is presumed to be fetching.
     Fetching,
     /// Rank 0 has not answered this owner since a timeout that long ago, or
-    /// is marked silent: rank 0 is presumed hung. Also: rank 0 has kept
-    /// failing the page for that long ([`Rank0Watch::failed`]).
+    /// is marked silent: rank 0 is presumed hung.
     Overdue,
-    /// Rank 0 itself answered that its acquisition of the page failed less
-    /// than [`Rank0Watch::hang_after`] ago: leave the next attempt to it.
+    /// This owner's own origin request for the page failed less than
+    /// [`Rank0Watch::hang_after`] ago ([`Rank0Watch::failed`]): leave the
+    /// retry after a failure of rank 0 to rank 0.
     Failed,
 }
 
@@ -168,8 +175,10 @@ impl<K: Eq + Hash + Clone, N: Eq + Hash + Clone> Rank0Watch<K, N> {
                 if e.failed {
                     if now < e.until {
                         Rank0State::Failed
-                    } else {
+                    } else if silent {
                         Rank0State::Overdue
+                    } else {
+                        Rank0State::Unknown
                     }
                 } else if now < e.until && !silent {
                     Rank0State::Fetching
@@ -219,15 +228,13 @@ impl<K: Eq + Hash + Clone, N: Eq + Hash + Clone> Rank0Watch<K, N> {
         self.compact();
     }
 
-    /// `rank0` itself answered this owner's probe for `key` that its own
-    /// acquisition failed (Known issue 52). It is not hung (the silent mark
-    /// is cleared). The first failure starts an interval of
+    /// This owner's own origin request for `key`, made with authority
+    /// while `rank0` was the page's rank 0, failed (origin error or
+    /// deadline; Known issue 52). The first failure starts an interval of
     /// [`Rank0Watch::hang_after`] during which the page is
     /// [`Rank0State::Failed`]; further failures inside it do not extend it.
-    /// A failure after it (the owner was `Overdue` and fetched itself)
-    /// starts the next interval.
+    /// A failure after it starts the next interval.
     pub fn failed(&mut self, key: K, rank0: N, now: Instant) {
-        self.silent.remove(&rank0);
         let live = self.entries.get(&key).is_some_and(|e| {
             e.node == rank0
                 && e.failed
@@ -271,6 +278,17 @@ impl<K: Eq + Hash + Clone, N: Eq + Hash + Clone> Rank0Watch<K, N> {
     /// the silent mark.
     pub fn answered(&mut self, key: &K, rank0: &N) {
         self.entries.remove(key);
+        self.silent.remove(rank0);
+    }
+
+    /// `rank0` itself answered this owner's probe for `key` that its own
+    /// acquisition failed ([`crate::read::walk::Outcome::Failed`]): it is
+    /// not hung (forget a timeout and the silent mark), but a recent origin
+    /// failure of this owner's stays (Known issue 52).
+    pub fn answered_failure(&mut self, key: &K, rank0: &N) {
+        if self.entries.get(key).is_some_and(|e| !e.failed) {
+            self.entries.remove(key);
+        }
         self.silent.remove(rank0);
     }
 
@@ -390,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn rank_zero_failures_hold_the_page_for_hang_after_then_once_overdue() {
+    fn own_origin_failures_hold_the_page_for_hang_after() {
         let now = Instant::now();
         let mut w = Rank0Watch::new(8, WATCH_TTL, 10 * S);
         w.failed(1, A, now);
@@ -400,12 +418,14 @@ mod tests {
         // Further failures inside the interval do not extend it.
         w.failed(1, A, now + 9 * S);
         assert_eq!(w.state(&1, &A, now + 9 * S), Rank0State::Failed);
-        assert_eq!(w.state(&1, &A, now + 10 * S), Rank0State::Overdue);
-        // The overdue walk's failure starts the next interval.
+        assert_eq!(w.state(&1, &A, now + 10 * S), Rank0State::Unknown);
+        // A failure after it starts the next interval.
         w.failed(1, A, now + 11 * S);
         assert_eq!(w.state(&1, &A, now + 11 * S), Rank0State::Failed);
-        assert_eq!(w.state(&1, &A, now + 21 * S), Rank0State::Overdue);
-        // An answer forgets it; an old entry expires.
+        assert_eq!(w.state(&1, &A, now + 21 * S), Rank0State::Unknown);
+        // Rank 0's failure answers keep it; any other answer forgets it.
+        w.answered_failure(&1, &A);
+        assert_eq!(w.state(&1, &A, now + 12 * S), Rank0State::Failed);
         w.answered(&1, &A);
         assert_eq!(w.state(&1, &A, now + 12 * S), Rank0State::Unknown);
         w.failed(3, A, now);
@@ -416,21 +436,23 @@ mod tests {
     }
 
     #[test]
-    fn a_failure_answer_clears_silence_and_replaces_a_timeout_entry() {
+    fn failures_and_timeouts_replace_each_other() {
         let now = Instant::now();
+        let mut w = Rank0Watch::new(8, WATCH_TTL, 5 * S);
+        w.timed_out(1, A, now, now + S);
+        w.failed(1, A, now + S);
+        assert_eq!(w.state(&1, &A, now + 2 * S), Rank0State::Failed);
+        // A timeout after a failure starts a fresh timeout entry.
+        w.timed_out(1, A, now + 3 * S, now + 4 * S);
+        assert_eq!(w.state(&1, &A, now + 3 * S), Rank0State::Fetching);
+        // Rank 0 answering a failure forgets a timeout entry and silence.
+        w.answered_failure(&1, &A);
+        assert_eq!(w.state(&1, &A, now + 3 * S), Rank0State::Unknown);
         let mut w = Rank0Watch::new(8, WATCH_TTL, Duration::ZERO);
         w.timed_out(1, A, now, now + S);
         w.timed_out(1, A, now + 2 * S, now + 3 * S);
         assert_eq!(w.state(&2, &A, now + 2 * S), Rank0State::Overdue);
-        let mut w2 = Rank0Watch::new(8, WATCH_TTL, 5 * S);
-        w2.timed_out(1, A, now, now + S);
-        w2.failed(1, A, now + S);
-        assert_eq!(w2.state(&1, &A, now + 2 * S), Rank0State::Failed);
-        // A timeout after a failure starts a fresh timeout entry.
-        w2.timed_out(1, A, now + 3 * S, now + 4 * S);
-        assert_eq!(w2.state(&1, &A, now + 3 * S), Rank0State::Fetching);
-        // Rank 0 answering a failure is not silent.
-        w.failed(1, A, now + 2 * S);
+        w.answered_failure(&9, &A);
         assert_eq!(w.state(&2, &A, now + 2 * S), Rank0State::Unknown);
     }
 

@@ -713,11 +713,7 @@ impl CandidatePolicy {
                 uring_runtime::environment::now(),
                 deadline,
             ),
-            WalkOutcome::Failed => watch.failed(
-                page.clone(),
-                rank0.clone(),
-                uring_runtime::environment::now(),
-            ),
+            WalkOutcome::Failed => watch.answered_failure(page, rank0),
             WalkOutcome::Copy
             | WalkOutcome::Probe(
                 ProbeOutcome::CopyMiss
@@ -2462,6 +2458,41 @@ impl CandidatePolicy {
             noted = true;
         }
         noted
+    }
+
+    /// This node's own origin request for `page`, made with authority at
+    /// `rank` among `owners`, failed with `error`: above rank 0, leave
+    /// retries after rank 0's own failures to rank 0 for a while (Known
+    /// issue 52, `racer_core::read::rank0`). Terminal origin answers (a
+    /// missing version, rejected or forbidden credentials) are not
+    /// failures of origin and are ignored.
+    pub(crate) fn note_origin_failure(
+        &self,
+        page: &crate::model::PageId,
+        owners: &[NodeId],
+        rank: usize,
+        error: &Error,
+    ) {
+        if rank == 0
+            || owners.get(rank) != Some(&self.node)
+            || matches!(
+                error,
+                Error::VersionUnavailable
+                    | Error::OriginRejected
+                    | Error::OriginForbidden
+                    | Error::NotFound
+            )
+        {
+            return;
+        }
+        let Some(rank0) = owners.first() else {
+            return;
+        };
+        self.rank0_watch.borrow_mut().failed(
+            page.clone(),
+            rank0.clone(),
+            uring_runtime::environment::now(),
+        );
     }
 
     /// Send due copy offers (Known issue 37), at most

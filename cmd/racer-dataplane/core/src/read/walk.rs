@@ -129,8 +129,10 @@ pub struct WalkConfig {
     /// timeout of rank 0 gives origin authority like a transport failure,
     /// since rank 0 stayed silent too long
     /// ([`crate::read::rank0::Rank0Watch::hang_after`]). `Fetching` and
-    /// `Unknown` keep the [`Outcome::TimedOut`] rule. Ignored unless this
-    /// node is an owner above rank 0 on a page walk.
+    /// `Unknown` keep the [`Outcome::TimedOut`] rule. `Failed`: this
+    /// owner's own origin request for the page failed recently, so
+    /// [`Outcome::Failed`] withholds authority too (Known issue 52). Ignored
+    /// unless this node is an owner above rank 0 on a page walk.
     pub rank0: Rank0State,
 }
 
@@ -428,22 +430,18 @@ pub enum Outcome {
     TimedOut,
     /// Rank 0 itself (the response is signed by the destination, not by a
     /// relay) answered an owner's page probe of it `Unavailable`: its own
-    /// acquisition of the page failed, in practice its origin request (a
-    /// 5xx, or its deadline ran out waiting for origin), since rank 0 asks
-    /// no predecessor. Callers report it only for [`CandidateWalk::pending_rank0`]
-    /// probes; anywhere else it is recorded as `Probe(Unreachable)`.
+    /// acquisition of the page failed. Callers report it only for
+    /// [`CandidateWalk::pending_rank0`] probes; anywhere else it is
+    /// recorded as `Probe(Unreachable)`.
     ///
-    /// Recorded like `Probe(Unreachable)`, except that it withholds origin
-    /// authority like [`Outcome::TimedOut`] unless [`WalkConfig::rank0`] is
-    /// `Overdue` (Known issue 52): this owner's own request would go to the
-    /// same origin right after rank 0's failed, and a reader's retry sends
-    /// rank 0 to origin again anyway, so taking authority doubled origin
-    /// requests during an origin error burst. The caller notes the failure
-    /// ([`crate::read::rank0::Rank0Watch::failed`]); once rank 0 keeps
-    /// failing the page for [`crate::read::rank0::Rank0Watch::hang_after`]
-    /// it is `Overdue` and this owner fetches itself, at most once per such
-    /// interval, so a failure local to rank 0 does not make the page
-    /// unavailable.
+    /// Recorded like `Probe(Unreachable)`, except that when this owner's
+    /// own origin request for the page failed recently
+    /// ([`WalkConfig::rank0`] is `Failed`, see
+    /// [`crate::read::rank0::Rank0Watch::failed`]) it withholds origin
+    /// authority like [`Outcome::TimedOut`] (Known issue 52): origin is
+    /// failing for the page, this owner's request would go to it right
+    /// after rank 0's failed, and the reader's retry sends rank 0 to origin
+    /// again anyway.
     Failed,
 }
 
@@ -1080,7 +1078,7 @@ impl CandidateWalk {
                 Outcome::Transport(ProbeOutcome::Unreachable)
             }
             Outcome::Failed => {
-                self.rank0_unanswered |= pending.rank0 && self.config.rank0 != Rank0State::Overdue;
+                self.rank0_unanswered |= pending.rank0 && self.config.rank0 == Rank0State::Failed;
                 Outcome::Probe(ProbeOutcome::Unreachable)
             }
             outcome => outcome,

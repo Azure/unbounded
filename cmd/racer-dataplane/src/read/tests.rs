@@ -2912,10 +2912,11 @@ mod timeouts {
     }
 
     /// Known issue 52: rank 0 itself answering an owner's delegation that
-    /// its fetch failed does not give the owner origin authority until rank
-    /// 0 has kept failing the page for `with_rank0_hang_after`; then the
-    /// owner fetches once and the next failure starts a new interval. A
-    /// copy or miss from rank 0 forgets it.
+    /// its fetch failed gives the owner origin authority, unless the owner's
+    /// own origin request for the page failed less than
+    /// `with_rank0_hang_after` ago; then the retry is left to rank 0. A
+    /// terminal origin answer is not an origin failure, and a miss from
+    /// rank 0 forgets the failure.
     #[test]
     fn owner_leaves_origin_retries_to_a_failing_rank_zero() {
         let clock = uring_runtime::environment::SimulationClock::new(209);
@@ -2934,7 +2935,9 @@ mod timeouts {
             number: PageNumber(0),
         };
         let rank0 = f.candidates.ordered[0].clone();
-        let resolve_once = |f: &mut Fixture| {
+        let ordered = f.candidates.ordered.clone();
+        let resolve_once = |f: &mut Fixture, request: u8| {
+            *f = std::mem::replace(f, Fixture::new(Some(1), 0, false)).bounded(request, 60, 24);
             let operation = PeerOperation::Page {
                 page: page.clone(),
                 mode: FetchMode::Acquire,
@@ -2953,32 +2956,37 @@ mod timeouts {
             let Poll::Ready(result) = poll(resolve.as_mut()) else {
                 panic!("immediate answer")
             };
-            result
+            matches!(result, Ok(CandidateResolution::Origin(_)))
         };
-        // t = 0 and 4: rank 0's fetch failed; leave the retry to it.
-        assert!(matches!(resolve_once(&mut f), Err(Error::Unavailable)));
+        // A failure local to rank 0: the owner fetches.
+        assert!(resolve_once(&mut f, 210));
+        // Terminal origin answers are not origin failures.
+        f.policy
+            .note_origin_failure(&page, &ordered, 1, &Error::VersionUnavailable);
+        assert!(resolve_once(&mut f, 211));
+        // The owner's own fetch failed: leave retries to rank 0.
+        f.policy
+            .note_origin_failure(&page, &ordered, 1, &Error::Unavailable);
+        assert!(!resolve_once(&mut f, 212));
         clock.advance(Duration::from_secs(4));
-        f = f.bounded(210, 60, 24);
-        assert!(matches!(resolve_once(&mut f), Err(Error::Unavailable)));
-        // t = 5: rank 0 kept failing for `hang_after`: this owner fetches.
+        assert!(!resolve_once(&mut f, 213));
+        // `hang_after` later the owner fetches once more.
         clock.advance(Duration::from_secs(1));
-        f = f.bounded(211, 60, 24);
-        assert!(matches!(
-            resolve_once(&mut f),
-            Ok(CandidateResolution::Origin(_))
-        ));
-        // That failure starts the next interval.
-        f = f.bounded(212, 60, 24);
-        assert!(matches!(resolve_once(&mut f), Err(Error::Unavailable)));
-        // A miss from rank 0 forgets it: authority as before.
+        assert!(resolve_once(&mut f, 214));
+        f.policy
+            .note_origin_failure(&page, &ordered, 1, &Error::DeadlineExceeded);
+        assert!(!resolve_once(&mut f, 215));
+        // A miss from rank 0 forgets it.
         f.peers.pages_unavailable.set(false);
-        f = f.bounded(213, 60, 24);
-        assert!(matches!(
-            resolve_once(&mut f),
-            Ok(CandidateResolution::Origin(_))
-        ));
+        assert!(resolve_once(&mut f, 216));
+        f.peers.pages_unavailable.set(true);
+        assert!(resolve_once(&mut f, 217));
+        // Rank 0 never notes its own failures.
+        f.policy
+            .note_origin_failure(&page, &ordered, 0, &Error::Unavailable);
+        assert!(resolve_once(&mut f, 218));
         let calls = f.peers.calls.borrow();
-        assert_eq!(calls.len(), 5);
+        assert_eq!(calls.len(), 9);
         assert!(calls.iter().all(|c| c.destination == rank0 && !c.copy));
     }
 

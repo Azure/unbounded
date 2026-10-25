@@ -2284,7 +2284,15 @@ impl Fill {
                                 .final_origin_miss(&authority, &operation, scope, budget)
                         })?
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        self.dependencies.candidates.note_origin_failure(
+                            page,
+                            &candidates.ordered,
+                            authority.rank(),
+                            &error,
+                        );
+                        return Err(error);
+                    }
                 }
             }
         };
