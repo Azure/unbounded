@@ -752,13 +752,25 @@ Verified against the code at the start of this work.
    as link failures: 5k `full-failover` partition link failures rose 19,514 to 22,413 (seeds 1 to
    10) for 8,603 offers. Failed reads did not change measurably (366 to 368), but the failures
    lengthen link backoff. Holding an offer while the path cache or circuit to its target is known
-   down, without spending a try, would avoid most of them. Open (round 4, orphan3, wave 5).
+   down, without spending a try, would avoid most of them. Resolved with a bound: offers now
+   wait out a cut toward their target's site (cut groups: a cut offer or a read's transport
+   failure holds the site's offers without spending tries, then one probe offer goes first),
+   and every offer that fails across a partition is a cut offer (at most one link failure
+   each, on a link that is in fact cut; at most `NOTICE_TRIES` offers per notice). Cut groups
+   remove about 7% of the offer link failures; the rest are first offers after cuts nothing told
+   the holder about. Failed reads are unchanged. See "Round 4: offer2 (wave 6)" (round 4,
+   offer2, wave 6, 0316fe34c, e41d6acb5).
 
 51. Orphan repeats that offers cannot remove: rank 0 refetches before the holder's offer arrives
    (inside the first 5 s delay, or while a partition still cuts the route), or rank 0's successor
    probe of the holder fails in transport; and an owner above rank 0 that skips rank 0 itself
    refetches a page another owner above rank 0 holds (the `skip` side, which offers to rank 0 do not
-   address). 119 left over 5k `full-failover` seeds 1 to 10. Open (round 4, orphan3, wave 5).
+   address). 119 left over 5k `full-failover` seeds 1 to 10. Resolved: holders at rank 2 also
+   offer to rank 1 when rank 1 did not answer their walk, and offered hints are probed at once
+   (no `PROBE_AFTER` wait). The rest are classified (`orphan_why`): the fetching owner asked
+   the holder and the route failed, or the holder's offer to it was still scheduled or held by a
+   cut; both need the holder reachable. 5k `full-failover` seeds 1 to 3: 53 to 42 orphan
+   repeats. See "Round 4: offer2 (wave 6)" (round 4, offer2, wave 6, 112a35524, e41d6acb5).
 
 52. The pages fetched most often in `full-failover` are origin failures, not ownership moves: in
    the wave 5 merge every request but one on the worst pages (6 requests; 5k seeds 1 to 3 and
@@ -769,7 +781,15 @@ Verified against the code at the start of this work.
    is bounded by the read budgets and the retries, and correct when the failure was local to
    rank 0, but it doubles origin load during an origin outage. Withholding authority after a
    rank 0 origin failure (or sharing a short negative result) would halve it. See "Round 4:
-   combined (wave 5)". Open (round 4, combined, wave 5).
+   combined (wave 5)". Resolved: rank 0's own `Unavailable` is a distinct walk outcome
+   (`Outcome::Failed`); once an owner's own origin request for the page failed, it leaves the
+   retries after rank 0's failures to rank 0 for `hang_after` (15 s), so it adds at most one
+   request per page per `hang_after` while origin fails. Re-asking origin is kept when the
+   owner has no failure of its own (a failure local to rank 0, or random 5xx where each request
+   is an independent try). 5k `full-failover` with every origin request failing: origin requests
+   17,114 to 15,660, 5xx 5,145 to 3,688, worst page 28 to 18. With the default 30% 5xx the
+   worst page stays 5 to 6: one request per reader retry is irreducible. See "Round 4: offer2
+   (wave 6)" (round 4, offer2, wave 6, ff93a5a7e, 94c17df5c).
 
 53. Silence pings cost messages when many probes time out on busy owners: in 5k `zipf` at 16
    MiB pages (8 s) 37,990 pings, peer messages 384,907 to 470,202 (+22%), simulator wall time
@@ -814,6 +834,10 @@ Verified against the code at the start of this work.
    member whose client applied only its first version), answers `StaleMembership`, and the
    owner has no attempt left to wait or to fetch, so it answers `Unavailable`. Open (round 4,
    ctl3, wave 6).
+
+431. 50k `full-failover` failed reads rose 266 to 343 with the offer2 changes (one run each);
+   5k seeds 1 to 3 did not rise. Unclassified: run variance or the issue 52 hold. Open (round
+   4, offer2, wave 6).
 
 ## Simulator engine (racer-sim substrate)
 
@@ -1345,13 +1369,12 @@ scenarios carry data-plane faults.
    ctl3, wave 6).
 49. Resolved with a tested bound: a second stale wait only at the last visit, rank 0 or 1
    (round 4, ctl3, wave 6).
-50. Copy offers during a partition add link failures (5k `full-failover` +15%) (round 4, orphan3,
-   wave 5).
-51. Orphan repeats offers cannot remove: rank 0 refetches before the offer arrives, or the holder
-   is itself an owner above rank 0 that another owner skipped to (119 over 10 seeds) (round 4,
-   orphan3, wave 5).
-52. The worst `full-failover` pages are origin failure retries; owners above rank 0 retry origin
-   after rank 0's origin request failed (round 4, combined, wave 5).
+50. Resolved with a bound: copy offers wait out a cut toward their site; each failed offer is
+   one link failure on a cut link, at most `NOTICE_TRIES` per notice (round 4, offer2, wave 6).
+51. Resolved: rank 2 holders offer to rank 1 too and offered hints are probed at once; the rest
+   need the holder reachable (classified `orphan_why`) (round 4, offer2, wave 6).
+52. Resolved: an owner whose own origin request failed leaves retries after rank 0's failures
+   to rank 0 for `hang_after`; one request per reader retry remains (round 4, offer2, wave 6).
 53. Silence pings add peer messages when many probes time out on busy owners (5k `zipf` at 16
    MiB: +22%, outcomes unchanged) (round 4, hang2, wave 6).
 54. A reader returns to a busy rank 0 once it answers the reader's ping; keeping it demoted
@@ -1364,6 +1387,8 @@ scenarios carry data-plane faults.
    wave 6).
 57. Owners with too little inherited budget fail when their rank 0 is behind on membership (4
    reads at 50k `full-cold-start`) (round 4, ctl3, wave 6).
+431. 50k `full-failover` failed reads 266 to 343 after offer2, unclassified (round 4, offer2,
+   wave 6).
 
 ## Round 2: production admission
 
@@ -2747,7 +2772,10 @@ probes / helper copies / owner sheds. Read latency is log-bucket upper bounds.
   only makes shedding rarer.
 - The simulator counts a node's bodies across all its workers (one simulated node is one production
   worker).
-- No new Known issues.
+- New Known issue 431: 50k `full-failover` failed reads 266 to 343 (one run each). Not
+  classified; 5k seeds 1 to 3 went 100 to 88 and the outage run 687 to 688, so it may be run
+  variance or the issue 52 hold (a reader whose owner withholds must retry rank 0). Needs more
+  50k seeds.
 
 
 ## Round 4: join
@@ -5798,6 +5826,199 @@ total, worst page, pages fetched more than once.
   waiting for a behind rank 0, which touches the handoff budgets; left open.
 - The `RACER_SIM_TRACE_FAILED` diagnostic is kept (off unless the variable is set).
 - The 50k run used the trace build of the final code; tracing only prints.
+
+## Round 4: offer2 (wave 6)
+
+Known issues 50, 51 and 52. Branch `racer-sim8-offer2` from racer-core-sim 5d1ea912b. Commits:
+ff93a5a7e and 94c17df5c (52, racer-core and production), 7d7fd6dec (52, simulator), 0316fe34c
+and b2d4ad37f (50), 112a35524 and 33fefb71f (51), e41d6acb5 (50 and 51, racer-core), 8616f5845
+(simulator), plus this section. Evidence: `/tmp/opencode/r8-offer2/` (5k runs under `r5k/`,
+smoke under `smoke/`).
+
+### Issue 52: root cause
+
+Rank 0 answers a delegated `Acquire` (or a copy-only probe that joined its acquisition)
+`Unavailable` when its own acquisition failed: `policy::peer_error` maps `Unavailable`,
+`HopBudgetExhausted` and `DeadlineExceeded` to that one response (`core/src/read/policy.rs:26`),
+and an origin 503 is `Unavailable`. The owner's walk recorded it as `Probe(Unreachable)`,
+transient evidence, so the walk ended `End::Origin` (`CandidateWalk::finish`) and the owner
+asked the same origin right after rank 0's request failed. The reader's retry then reached
+rank 0 again, whose flight had ended, and rank 0 asked origin again. A temporary per-page trace
+(5k `full-failover` seed 1) showed the repeats on failing pages alternating rank 0 and an owner
+above it (196 `failed` skips; worst page 6).
+
+Whether re-asking is wrong depends on the cause, which the answer does not carry. With the
+default faults (30% of requests fail during two 30 s bursts) each request is an independent
+try, so the owner's request is as useful as rank 0's next one, and removing it only delays the
+page until the reader retries: measured, origin requests and failed reads did not change. With
+an outage (every request fails) the owner's request is pure load. And when rank 0 fails for
+reasons of its own (its route to origin, its deadline), the owner's fetch is what serves the
+page: the production test `hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_original_budget`
+asserts exactly that, and a first version of this fix (withhold on every rank 0 failure until
+the rank 0 watch said `Overdue`) failed it.
+
+### Issue 52: change
+
+- racer-core walk: `Outcome::Failed` (`core/src/read/walk.rs`), reported by callers when rank 0
+  itself signed `Unavailable` for an owner's page probe of it (production
+  `CandidatePolicy::resolve_epoch_traced` checks `response.origin().node() == destination`;
+  the simulator uses `Fill::relayed`). It is recorded like `Probe(Unreachable)` and withholds
+  origin authority like `TimedOut` only when `WalkConfig::rank0` is the new `Rank0State::Failed`.
+- racer-core rank 0 watch (`core/src/read/rank0.rs`): `Rank0Watch::failed` notes that this
+  owner's own origin request for the page failed after it took authority; for `hang_after`
+  (15 s, half the client request timeout, the same allowance as Known issue 39) the page is
+  `Failed`, then `Unknown` again; failures inside the interval do not extend it.
+  `answered_failure` (rank 0 answered `Failed`) clears a timeout entry and the silent mark but
+  keeps the failure.
+- Production: `CandidatePolicy::note_origin_failure`, called from `Fill::acquire_once` when the
+  origin call fails (not for `VersionUnavailable`, `OriginRejected`, `OriginForbidden`,
+  `NotFound`); `note_rank0` calls `answered_failure` for `Failed`.
+- Simulator: `note_origin_failure` on a 5xx and on an origin request canceled at its deadline;
+  switch `node.rank0_failure_hold`; counters `rank0_watch_origin_failures`,
+  `rank0_watch_failed_walks`, `origin_left_to_rank0_failed`.
+
+Bound: while origin keeps failing a page, an owner above rank 0 asks it at most once after its
+first failure and then at most once per `hang_after`, besides rank 0's one request per reader
+attempt that reaches it. A failure local to rank 0 is never withheld unless the owner's own
+request failed too. No message is added and no budget grows. The rest (one request per reader
+retry while origin fails) is irreducible: each is the only way to get the page.
+
+### Issue 50: root cause and change
+
+Offers exist because a cut kept the holder from rank 0, and `OrphanNotices` retried them on a
+fixed schedule (5, 15, 45, 90 s) whatever the route said, so offers made during the 90 s
+partition crossed it two or three times. A temporary counter showed that every failed offer
+was a partition link failure (5k `full-failover` seed 1: 283 of 283; 140 at the holder's own
+first hop, whose circuit backoff, at most 20 s, had expired).
+
+- racer-core `notice` cut groups: each target belongs to a group (its site). `pop_open` defers a
+  due offer of a blocked group to the block's end without spending a try; `cut` (a transport
+  failure or an answer a relay signed) schedules the next try and blocks the group until it is
+  due; after a block one probe offer goes first and holds the group for `PROBE_HOLD` (10 s) or
+  until it is reported; `reached` releases the group. `observe` feeds the same table from the
+  node's read probes (transport failure: hold `PROBE_HOLD`; an answer signed by the member:
+  release), only while notices are pending. Blocked groups are bounded by the notice capacity.
+- Production: `Notices` groups by `Member::site`; `poll_offers` uses `pop_open` and reports
+  `Delivered`, `Refused` (the target itself answered otherwise; releases the hold), `Cut` or
+  `Dropped`; `CandidatePolicy::observe_route` feeds walk outcomes (`Transport` and `TimedOut`
+  hold; `Copy`, `Shed`, `Failed`, `CopyMiss` release; relay-ambiguous answers say nothing). An
+  older receiver that rejects `racer-mode: offer` is counted as a cut (conservative: fewer
+  offers).
+- Simulator: the same model, switch `node.offer_cut_groups`, counters `orphan_offers_cut`,
+  `partition_link_failures_offers`. `Fabric::site` became an `Rc<[u16]>` so the notice timer
+  can read it while sending.
+
+The effect is small: 5k `full-failover` seeds 1 to 3, offer partition link failures 1,178 with
+cut groups off to 1,098 on (7%). Most holders have one notice per site, and their reads to the
+site are too rare to see the cut first. Bound, enforced in
+`combined::tests::failover_holders_offer_orphans_to_rank_zero`: every offer that crosses a
+partition is a cut offer (`partition_link_failures_offers <= orphan_offers_cut`), costing one
+link failure on a link that is cut (a single route attempt, no remote attempts), at most
+`NOTICE_TRIES` per notice, and cut groups never send more than without them. These failures do
+not affect reads (failed reads 88 over seeds 1 to 3, wave 5 100) and only confirm a backoff on a
+dead link; holding offers longer would delay the copy past rank 0's next fetch (Known issue 51).
+
+### Issue 51: root cause and change
+
+A temporary trace of every orphan repeat (5k `full-failover` seeds 1 to 3, 43 after the issue
+52 fix) split them:
+
+- The fetching owner `F` asked the holder `A` and the route failed (17), or `F` was rank 0
+  and `A`'s offer had not arrived yet (11: not yet due, or held by the partition). Both need
+  `A` reachable.
+- `F` was rank 1, skipped an unreachable rank 0 and fetched without asking `A` (rank 2), which
+  held the page (14, mostly minutes after `A`'s fetch). Rank 1 asks only later owners it has a hint for
+  (`successor::successor_targets`), and `A`'s walk had not reached it (263 of 265 rank 2 origin
+  fetches found rank 1 unreachable), while `notice_target` sent offers to rank 0 only.
+- Rank 0 had just noted `A` from an offer and refetched within `PROBE_AFTER` (2 s), which
+  `SuccessorHints::probe` waits for so that a concurrent cold miss is not probed; an offer's
+  sender holds the copy, so the wait only lost it (1 here; 1 to 3 per seed counted as
+  `origin_repeats_orphan_noted`).
+
+Changes: `notice_indexes` (racer-core) notes one notice per owner ranked before the holder:
+rank 0 always, rank 1 unless it answered the holder's walk without a copy (then it noted the
+holder already); notices are keyed by page and target rank; `notice_target` takes the rank.
+`SuccessorHints::note_offer` marks the entry offered and `probe` skips `PROBE_AFTER` for it.
+Production `note_orphan` takes the authority's predecessor evidence
+(`OriginAuthority::predecessor_evidence`). The simulator counts `orphan_notices_noted_rank1`
+(switch `node.offer_predecessors`) and classifies every orphan repeat
+(`origin_repeats_orphan_why_{unreachable,pending,noted,other}`).
+
+Bound: one notice per owner before the holder (at most two per orphan fetch), each at most
+`NOTICE_TRIES` offers on its own grant; no budget grows; origin authority is unchanged (an offer
+only arms a hint). 5k `full-failover` seeds 1 to 3: orphan repeats 53 (wave 5) to 42. With the
+first issue 52 variant (withhold after every rank 0 failure) they were 28; the final variant
+lets an owner re-ask origin after a rank 0 failure when its own request has not failed, which
+brings some `failed` orphans back. What remains is
+`unreachable` or `pending` (seed 1: 9 and 2; one `other`): a holder that cannot be reached cannot
+serve, and an offer cannot arrive before its first delay or across a cut. Offers rose 901 to
+1,316 (seed 1), each without a body.
+
+### Tests
+
+- racer-core: `walk::tests::rank_zero_failure_withholds_origin_after_an_own_origin_failure`,
+  `remaining_walk_treats_a_failure_as_transient`; `rank0::tests::own_origin_failures_hold_the_page_for_hang_after`,
+  `failures_and_timeouts_replace_each_other`, `failures_respect_capacity`;
+  `notice::tests::a_cut_holds_the_group_and_sends_one_probe_after_it`,
+  `a_refusal_releases_the_group_and_spends_a_try`, `a_cut_on_the_last_try_still_blocks_and_drops_the_notice`,
+  `deferred_notices_respect_capacity_renewal_and_forget`, `reads_hold_and_release_offers_to_a_group`,
+  `a_fetch_notices_every_owner_before_it_that_did_not_answer`, `target_is_current_rank_zero_while_held`
+  (rank 1 cases); `successor::tests::offered_hints_skip_the_probe_delay`.
+- Production: `read::tests::timeouts::owner_leaves_origin_retries_to_a_failing_rank_zero`,
+  `peer_copies::offers_wait_out_a_cut_toward_their_site`,
+  `peer_copies::rank_two_offers_its_origin_fetch_to_rank_one_too`.
+- Simulator: `combined::tests::owners_leave_origin_retries_to_a_failing_rank_zero` (400 nodes,
+  every origin request failing: fewer 5xx and `failed` skips than without the hold) and new
+  assertions in `failover_holders_offer_orphans_to_rank_zero` (cut offers bound, cut groups
+  never worse, rank 1 notices).
+
+### Evidence
+
+Release, seed 1 unless noted, configurations of "Round 4: combined (wave 5)". Origin: total,
+worst page, pages fetched more than once. Orphans: all orphan repeats.
+
+| Run | Wave 5 reads ok / failed | Wave 5 origin | Wave 6 reads ok / failed | Wave 6 origin | Orphans |
+| --- | --- | --- | --- | --- | --- |
+| 5k storm | 378,544 / 0 | 1,024, 1, 0 | 378,544 / 0 | 1,024, 1, 0 | 0 / 0 |
+| 5k zipf | 202,851 / 15 | 40,404, 3, 1,452 | 202,851 / 15 | 40,404, 3, 1,452 | 0 / 0 |
+| 5k churn | 291,474 / 87 | 1,028, 2, 4 | 291,474 / 87 | 1,028, 2, 4 | 0 / 0 |
+| 5k zipf 16 MiB | 37,637 / 28 | 17,829, 3, 139 | 37,637 / 28 | 17,829, 3, 139 | 0 / 0 |
+| 5k 1 Gbit/s storm | 95,158 / 0 | 6,970, 2, 16 | 95,158 / 0 | 6,970, 2, 16 | 0 / 0 |
+| 5k full-cold-start | 95,159 / 0 | 6,970, 2, 16 | 95,159 / 0 | 6,970, 2, 16 | 0 / 0 |
+| 5k full-failover | 33,970 / 33 | 12,951, 6, 342 | 33,979 / 26 | 12,954, 6, 347 | 14 / 12 |
+| 5k full-failover seed 2 | 33,740 / 30 | 12,975, 6, 368 | 33,735 / 32 | 12,967, 6, 362 | 27 / 18 |
+| 5k full-failover seed 3 | 33,715 / 37 | 12,907, 6, 287 | 33,728 / 30 | 12,910, 5, 285 | 12 / 12 |
+| 5k full-churn | 34,040 / 0 | 12,768, 3, 223 | 34,038 / 0 | 12,769, 3, 224 | 1 / 0 |
+| 5k zipf, 50 hung members | 30,478 / 140 | 11,757, 2, 25 | 30,471 / 139 | 11,750, 2, 17 | 18 / 10 |
+| 5k full-failover, origin outage | 33,045 / 687 | 17,114, 28, 735 | 33,048 / 688 | 15,660, 18, 737 | 16 / 9 |
+| 50k full-failover | 303,355 / 266 | 47,617, 6, 2,268 | 303,299 / 343 | 47,581, 6, 2,320 | 189 / 130 |
+
+- The outage run sets `combined_faults.p5xx` to 1.0 (`/tmp/opencode/r8-offer2/outage.json`); its
+  wave 5 column is the wave 5 merge binary on the same configuration. 5xx answers 5,145 to
+  3,688; `failed` skips 1,943 to 486.
+- Scenarios without failover or origin errors are identical (same counters).
+- 50k `full-failover`: orphan repeats 189 to 130 (`unreachable` 92, `pending` 29, `noted` 9,
+  `other` 0), `copy_held` 578 to 560, `failed` skips 1,062 to 1,023, offers 4,303 to 6,900 (cut
+  2,064; offer partition link failures 1,869 of 24,252). Failed reads rose 266 to 343 (Known
+  issue 431). Wall 29:14, peak RSS 3.1 GiB (wave 5: 28:55, 3.1 GiB). `unexplained` 0, no hard
+  failure.
+- All 16 scenarios at 200 nodes, 1 s pass with no hard failure or violation; `cargo fmt
+  --check`, `clippy -D warnings` (workspace, all targets) and the workspace tests pass; DST
+  `dst_generated_traffic_churn_oracle` and its native variant pass for seeds 1 to 20.
+
+### Deviations and open items
+
+- Issue 52 is fixed only for outages that the owner's own request confirms; with partial 5xx
+  the owner still re-asks once per rank 0 failure, by design (each request is an independent
+  try). A shared negative result at rank 0 was not added: it would turn a 30% error rate into
+  failed reads.
+- Issue 50's reduction is small (7%); the remaining offer link failures are bounded and on cut
+  links only. Issue 51's rank 1 offers raise offers by about 45% (no bodies) and add offer link
+  failures across partitions, which cut groups partly absorb.
+- New Known issue 431: 50k `full-failover` failed reads 266 to 343 (one run each). Not
+  classified; 5k seeds 1 to 3 went 100 to 88 and the outage run 687 to 688, so it may be run
+  variance or the issue 52 hold (a reader whose owner withholds must retry rank 0). Needs more
+  50k seeds.
 
 ## Round 4: combined (wave 6)
 
