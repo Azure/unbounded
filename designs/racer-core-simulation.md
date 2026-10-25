@@ -625,33 +625,48 @@ Verified against the code at the start of this work.
    `zipf` at 16 MiB pages keeps issue 31's gains. See "Round 4: hang (wave 5)" (round 4, hang,
    wave 5).
 
-40. Partly resolved: an owner above rank 0 still fetched when the route to rank 0 failed or an
+40. Resolved: an owner above rank 0 still fetched when the route to rank 0 failed or an
    `Overloaded` came back, even though rank 0 was fetching the page (958 route and 126
    `Overloaded` skips of 1,088 overlapping requests in 5k `zipf` at 16 MiB pages). Every route
    skip was rank 2 finding no route within the two links an equal split of its budget left its
    copy-only probe of rank 0; that probe now gets the route first, like a delegation
-   (overlapping requests 1,089 to 115, origin requests 18,866 to 17,821). The remaining 111 are
-   `Overloaded` answers, 108 of them signed by a relay whose relay quota is full rather than by
-   rank 0; withholding origin after them failed more reads than it saved origin requests, so
-   they still give authority (Known issue 42). See "Round 4: hang (wave 5)".
+   (overlapping requests 1,089 to 115, origin requests 18,866 to 17,821; round 4, hang, wave 5).
+   The remaining `Overloaded` answers are signed by a relay whose relay quota is full, and
+   giving authority after them is the bounded, correct behavior of Known issue 42 (round 4,
+   hang2, wave 6).
 
-41. A reader does not learn that a peer hangs: it keeps visiting a hung owner first, or routing
-   through a hung relay, and each such probe costs it a whole attempt. In the 5k `zipf` run with 50
-   hung members, 24 of the 136 failed reads had a hung owner other than rank 0 or met only hung
-   relays. A timeout could feed link health (circuits) like a transport failure, or demote the
-   owner in the reader's visit order. Open (round 4, hang, wave 5).
+41. Resolved (round 4, hang2, wave 6): a reader did not learn that a peer hangs: it kept
+   visiting a hung owner first (`Spread` is deterministic per requester and page, and the timed
+   out `Acquire` took most of its attempt's credits), or routing through a hung relay, and each
+   such probe cost it a whole attempt (24 of 136 failed reads in 5k `zipf` with 50 of 5,000
+   members hung). Readers now visit owners that left them unanswered after the others and
+   silent owners last (`racer_core::read::candidates::demote_unanswered`); the node on the
+   other end of a hung peer's link pings it (mode `ping`) and, once it is silent, fails requests
+   for it at once and routes around it (`racer_core::peer::silence`). Failed reads with a hung
+   owner other than rank 0 or a hung relay 26 to 2 (seed 1) and 38 to 0 (seed 2). See "Round
+   4: hang2 (wave 6)".
 
-42. An owner above rank 0 takes origin authority from an `Overloaded` answer signed by a relay on
-   its route to rank 0 (relay quota full), which says nothing about rank 0: 108 of the 115
-   overlapping origin requests in 5k `zipf` at 16 MiB pages, and all 1,042 of the `busy` class in
-   default 5k `zipf`. Withholding origin after it (measured) removed most of the overlap but failed
-   29 to 55 more reads. A retry over a route that avoids the relay, within the owner's budget,
-   would be the next thing to try. Open (round 4, hang, wave 5).
+42. Resolved (round 4, hang2, wave 6), as correct behavior with a bound: an owner above rank 0
+   takes origin authority from an `Overloaded` answer signed by a relay on its route to rank 0
+   (relay quota full), which says nothing about rank 0. A retry of rank 0 was tried: it is never
+   affordable (168 of 168 such answers in 5k `zipf` at 16 MiB pages left the owner at most 2
+   credits and 1 link, exactly one per later predecessor and its own origin attempt), the relay
+   keeps the links it was sent, and refunding them is unsafe because a relay can also sign
+   `Overloaded` after forwarding. Withholding origin failed 29 to 55 more reads (wave 5). Each
+   such owner walk costs at most one overlapping origin request, at most two per page and
+   membership version (ranks 1 and 2); enforced by
+   `walk::tests::relay_overload_on_the_route_to_rank_zero_gives_authority_without_a_retry` and
+   the existing `origin_repeat_explained` (`unexplained` 0). 5k `zipf` at 16 MiB: 120 (seed 1)
+   and 137 (seed 2) overlapping requests, 0.7% of origin requests. See "Round 4: hang2 (wave 6)".
 
-43. Each owner learns on its own that a rank 0 hangs, so the first reads of every (owner, hung
-   rank 0) pair still fail for up to half a request timeout: 112 failed reads in the 5k `zipf` run
-   with 50 hung members. Sharing liveness (for example through membership or link health) would
-   shorten it. Open (round 4, hang, wave 5).
+43. Resolved (round 4, hang2, wave 6): each owner learned on its own, after half a request
+   timeout, that a rank 0 hangs, so the first reads of every (owner, hung rank 0) pair failed
+   (112 of 136 failed reads in 5k `zipf` with 50 members hung). An owner (or reader) whose
+   probe of rank 0 goes unanswered now pings rank 0, a page request answered at once without
+   waiting on work, so a busy rank 0 answers and a hung one does not; and the node on the
+   other end of each of rank 0's links learns it too and fails requests for it at once, which
+   gives every owner above it authority without its own wait. Failed reads whose rank 0 hangs
+   114 to 1 (seed 1) and 113 to 1 (seed 2). See "Round 4: hang2 (wave 6)".
 
 44. Resolved (round 4, lineage, wave 5): a copy-only probe that reached a node with a running
    acquisition of the page joined it (Known issue 31), also when the prober was an earlier owner.
@@ -736,6 +751,25 @@ Verified against the code at the start of this work.
    rank 0, but it doubles origin load during an origin outage. Withholding authority after a
    rank 0 origin failure (or sharing a short negative result) would halve it. See "Round 4:
    combined (wave 5)". Open (round 4, combined, wave 5).
+
+401. Silence pings cost messages when many probes time out on busy owners: in 5k `zipf` at 16
+   MiB pages (8 s) 37,990 pings, peer messages 384,907 to 470,202 (+22%), simulator wall time
+   49 to 61 s, with failed reads, origin requests and overlapping requests unchanged within
+   seed noise. Most are readers' pings of a busy rank 0 whose acquisition their probe joined;
+   each (sender, peer) pair pings at most once per `quiet` (half a request timeout) after an
+   answered ping. A ping is a single small exchange, but it takes a relay reservation on every
+   relay it crosses. Sharing an answered ping across the workers of a node, or skipping the
+   ping when rank 0 answered this node anything recently, would cut most of them. Open (round
+   4, hang2, wave 6).
+
+402. A reader whose probe of a busy rank 0 timed out returns to rank 0 first once rank 0 answers
+   the ping. Keeping it demoted until rank 0 answers the reader itself (measured) failed 28 to
+   11 reads in 5k `zipf` at 16 MiB pages (seed 2: 40 to 15), because the reader's retry goes to
+   an owner above rank 0 that already holds or fetches the page, but overlapped 130 to 185
+   origin requests (mostly the relay-signed `Overloaded` class of Known issue 42) and, without
+   the ping, failed 24 reads instead of 3 with 50 of 5,000 members hung. Not adopted; a reader
+   that could tell a joined wait from an empty one (rank 0 answering "fetching" at once) would
+   get both. Open (round 4, hang2, wave 6).
 
 411. After the probes change, 50k `full-failover` (seed 1) has more `copy_held` repeats (578 to
    626: `held` `unasked` 87 to 112, `unreachable` 488 to 514) and one page fetched 8 times (worst
@@ -1246,13 +1280,18 @@ scenarios carry data-plane faults.
 39. Resolved: owners above a rank 0 silent for half a request timeout fetch again (rank 0 watch,
    simulator `hang` fault); 5k `zipf` with 50 hung members failed reads 371 to 136 (round 4,
    hang, wave 5).
-40. Partly resolved: an owner's copy-only probe of rank 0 gets the route first; 5k `zipf` at 16 MiB
-   overlapping origin requests 1,089 to 115; the rest follow relay-signed `Overloaded` (issue
-   42) (round 4, hang, wave 5).
-41. A reader does not learn that a peer hangs (round 4, hang, wave 5).
-42. Owners take origin authority from a relay-signed `Overloaded` on the route to rank 0 (round 4,
-   hang, wave 5).
-43. Each owner learns on its own that a rank 0 hangs (round 4, hang, wave 5).
+40. Resolved: an owner's copy-only probe of rank 0 gets the route first; 5k `zipf` at 16 MiB
+   overlapping origin requests 1,089 to 115 (round 4, hang, wave 5); the rest follow relay-signed
+   `Overloaded`, bounded as issue 42 (round 4, hang2, wave 6).
+41. Resolved: readers visit owners that left them unanswered last, and silent peers fail at once
+   and are routed around; 5k `zipf` with 50 hung members, failed reads with a hung non-rank-0
+   owner or relay 26 to 2 (round 4, hang2, wave 6).
+42. Resolved with a bound: a relay-signed `Overloaded` on the route to rank 0 gives an owner
+   above rank 0 authority without a retry it cannot afford; at most one overlapping origin
+   request per such walk, two per page and version (round 4, hang2, wave 6).
+43. Resolved: owners and readers ping a rank 0 that left a probe unanswered, and its neighbors
+   share the verdict by failing requests for it at once; 5k `zipf` with 50 hung members, failed
+   reads whose rank 0 hangs 114 to 1 (round 4, hang2, wave 6).
 44. Resolved: a copy-only probe from an earlier owner joined a later owner's acquisition that
    waited on the prober; the join is now declined (round 4, lineage, wave 5).
 45. Resolved: granted probes go out at once, so they cost one round trip before origin (5k
@@ -1271,6 +1310,11 @@ scenarios carry data-plane faults.
    orphan3, wave 5).
 52. The worst `full-failover` pages are origin failure retries; owners above rank 0 retry origin
    after rank 0's origin request failed (round 4, combined, wave 5).
+401. Silence pings add peer messages when many probes time out on busy owners (5k `zipf` at 16
+   MiB: +22%, outcomes unchanged) (round 4, hang2, wave 6).
+402. A reader returns to a busy rank 0 once it answers the reader's ping; keeping it demoted
+   failed fewer reads in 5k `zipf` at 16 MiB but overlapped more origin requests (round 4,
+   hang2, wave 6).
 411. 50k `full-failover` `copy_held` 578 to 626 and worst page 6 to 8 after the probes change,
    not traced (round 4, probes, wave 6).
 
@@ -5402,3 +5446,191 @@ Steps (same binary and knobs, seed 1; "sequential" is `parallel_granted` 0, "cap
 - The production glue for unknown-age targets (`Some(0)`) is exercised only by the simulator
   and DST: the production fixture has four members, too few to separate it from the arrival
   rule.
+
+## Round 4: hang2 (wave 6)
+
+Scope: Known issues 40 and 42 (owners above rank 0 take origin authority from an `Overloaded`
+signed by a relay on the route to rank 0), 41 (readers do not learn that a peer hangs) and 43
+(each owner learns on its own that rank 0 hangs). Branch `racer-sim8-hang2` from racer-core-sim
+5d1ea912b. Logs, configurations and binaries: `/tmp/opencode/r8-hang2/` (`hang.json` and
+`Z16.json` are the wave 5 configurations in `/tmp/opencode/m7/`; `hang-nosil.json` is
+`hang.json` with `node.silence` 0). Line numbers below are at 17c6fafa9.
+
+### Issue 43: root cause
+
+The rank 0 watch (`racer_core::read::rank0`) decides per (owner, page) and per owner: an owner
+presumes rank 0 hung only after its own probe timed out and rank 0 stayed silent for half a
+request timeout, and its silent mark covers only that owner's other pages. With 5,000 members a
+given owner is above a given rank 0 for about one page, so the mark almost never helps: the first
+reads of every page whose rank 0 hangs fail. Temporary instrumentation confirmed it: the 114
+failed reads of the hung-member run were spread over the whole 40 s (first at 8 s, median 20 s),
+and an oracle that set every owner's watch to `Overdue` for a hung rank 0 cut them to 5. Nothing
+else can tell a hung rank 0 from a busy one: a probe that joined rank 0's running acquisition
+(Known issue 31) also ends unanswered, and the first attempt at sharing evidence, two timeouts
+over the last link without an answer for half a request timeout, marked 3,374 busy owners in 5k
+`zipf` at 16 MiB pages (no hang) and quintupled overlapping origin requests (130 to 678).
+
+### Issue 41: root cause
+
+Traced failed reads (temporary instrumentation in `complete_probe`) showed one pattern: the
+reader's `Spread` order (`visit_order`, deterministic per requester and page, neighbors first)
+put the hung owner first; the out-of-order `Acquire` to it carried most of the attempt's credits
+(3 attempts and 8 links of 4 and 12) and timed out, leaving 1 attempt and 0 links, so the next
+owner failed at once (`Probe(Unreachable)`); every retry repeated it until the read deadline.
+Nothing recorded that the owner had left the reader unanswered.
+
+### Issue 42: root cause and bound
+
+A retry of rank 0 after a relay-signed `Overloaded` was implemented and measured first: it never
+ran. In 5k `zipf` at 16 MiB pages all 168 such answers left the owner at most 2 credits and 1
+link, exactly one per later predecessor and its own origin attempt: the probe of rank 0 gets
+every link but one per later predecessor (`core/src/read/walk.rs`, the copy-only route-first
+rule of wave 5), and the relay keeps the links it was sent. Refunding them is not safe: a relay
+also signs `Overloaded` when its own downstream exchange fails after forwarding
+(`racer_core::peer::hop::relay_failure`, `Relay::forward_inner` in `src/peer.rs`), so the
+destination may have used them. Withholding origin after it failed 29 to 55 more reads in wave 5.
+The answer is therefore correct as it is, with a bound: each owner walk that meets it costs at
+most one origin request overlapping rank 0's, so at most two per page and membership version
+(ranks 1 and 2). `walk::tests::relay_overload_on_the_route_to_rank_zero_gives_authority_without_a_retry`
+(`core/src/read/walk/tests.rs:1865`) asserts one probe of rank 0, authority for ranks 1 and 2 in
+the `Unknown` and `Fetching` states, the origin credit left, and no authority for a non-owner;
+`origin_repeat_explained` (`unexplained` 0) holds in every run. The retry was removed. Issue 40's
+remainder was this class, so 40 is resolved too.
+
+### Fix: silence pings (issues 41 and 43)
+
+- `racer_core::peer::silence::Silence` (new): per destination, exchanges left unanswered (ended
+  by the attempt's time bound or the upstream's cancellation after at least `min_wait`, a tenth of
+  half the request timeout) raise a question; a ping answers it. A ping is a page request in the
+  new mode `ping` (`FetchMode::Ping`, `src/peer/protocol.rs`), which the receiver answers `Miss`
+  at once without looking at its cache or flights (`Coordinator::serve_peer`, `src/read.rs:480`),
+  so it never waits on work. A peer that answers anything is alive; one that leaves the ping
+  unanswered, or whose relay answers `Unavailable` for it, is silent until it answers anything,
+  and is pinged again every `hold` (a full request timeout). A peer that answered a ping is not
+  pinged again for `quiet` (half a request timeout). Bounded (`SILENCE_CAPACITY` 256 per worker,
+  `SILENCE_TTL` 60 s), one ping per peer at a time, at most 16 pings in flight per worker, each on
+  its own grant (one exchange, no remote attempts, `NOTICE_LINKS` links), never a reader's budget.
+- Who asks: the sender of the last link to a destination after two unanswered exchanges
+  (`LINK_TIMEOUTS`, `src/peer.rs:946`, evidence from `hop::silence_evidence`), and any probe of
+  the page's rank 0 after one (`RANK0_TIMEOUTS`): an owner's (it withholds origin after it) or a
+  reader's. Other reader timeouts ask nothing (`NO_PING`) and only demote the owner (below).
+  Production `src/read/candidates.rs:1533`, `CandidatePolicy::poll_pings` (`:2221`) driven from the
+  worker turn with the copy offers; simulator `requester_timeout`, `last_hop_timeout`,
+  `launch_ping` and `ping_done` (`sim/src/node/world.rs:3070` to `:3155`).
+- What a silent peer changes: a requester fails a probe of it before spending any credit
+  (`src/read/candidates.rs:1947`), which an owner above rank 0 takes as a transport failure
+  (origin authority) and a reader as an unreachable owner; a relay answers `Unavailable` for it at
+  once (`src/peer.rs:387`); and routing avoids its links (`LinkHealth::available_at`,
+  `src/topology.rs:184`). Every request for a destination crosses one of its links, so once the
+  nodes on the common routes hold it silent every requester's probe fails fast: the verdict is
+  shared without a new message. Simulator: `forward` (`sim/src/node/world.rs:2978`) and
+  `blocked`.
+- Readers (issue 41): owners that left this node's request unanswered and answered nothing since
+  are visited after the others, silent owners last
+  (`racer_core::read::candidates::demote_unanswered`, `core/src/read/candidates.rs:155`;
+  production `CandidatePolicy::visit_order`, `src/read/candidates.rs:800`; simulator
+  `sim/src/node/world.rs:2188`). Any answer the destination signs clears the mark
+  (`src/read/candidates.rs:1357`, `sim/src/node/world.rs:3888`). A busy rank 0 answers the
+  reader's ping and keeps its place; a hung one goes last.
+- A relay-signed answer no longer makes the rank 0 watch forget a page (it said nothing about
+  rank 0), in production and in the simulator.
+- Rejected after measurement: readers pinging rank 0 only after a second timeout (24 and 25
+  failed reads with hung members instead of 3 and 1); readers demoting an unanswered rank 0 until
+  it answers them, without a ping (Known issue 402); an owner whose rank 0 is `Overdue` giving
+  rank 0's probe a short time share (no change in any run).
+
+Origin authority rules are unchanged: a silent rank 0 is a transport failure, which always gave
+authority, and only ranked owners take it. No budget grows: a ping has its own fixed grant, and a
+silent destination fails before credits are spent. Wire: one new mode value (`racer-mode: ping`);
+receivers that predate it reject the request, which still signs an answer and so proves them
+alive. Timing in production: half the client request timeout (`config.request_timeout / 2`) and
+one peer attempt per ping (`config.peer_attempt_timeout`), set in `src/app.rs`; in the simulator
+`read_timeout_ns / 2` and `attempt_timeout_ns`. Knob `node.silence` (default on); counters
+`silence_timeouts`, `silence_pings`, `silence_marks`, `silence_rechecks`,
+`silent_destination_fails`; production events `racer_silence_pings_sent_total`,
+`racer_silence_pings_answered_total`, `racer_silence_peers_silent_total`.
+
+### Tests
+
+- racer-core `peer::silence::tests` (timeouts ask, only an unanswered ping makes a peer silent,
+  rechecks every hold, any answer clears and voids an outstanding ping, short exchanges and
+  readers' timeouts ask nothing, capacity and eviction), `hop::tests::silence_evidence_counts_answers_and_unanswered_exchanges_only`,
+  `candidates::tests::demote_unanswered_moves_unanswered_then_silent_owners_last`, and the issue 42
+  bound test above.
+- Production: `topology::tests::a_silent_peer_is_routed_around_until_it_answers`,
+  `peer::tests::protocol_socket::relay_fails_a_request_for_a_silent_destination_at_once` (no
+  outbound exchange, no relay reservation left),
+  `read::tests::peer_copies::an_owner_pings_a_rank_zero_that_timed_out_and_skips_it_while_silent`
+  (rank 1 times out on rank 0, pings it on its own grant, the unanswered ping makes rank 0 silent,
+  the next walk fetches without an exchange to rank 0, an answered recheck clears it),
+  `read::tests::peer_copies::a_ping_is_answered_miss_at_once_without_a_body` (a holder answers
+  `Miss`, no origin call, no hint; encoding refuses remote attempts and non-page operations), and
+  `read::tests::timeouts::reader_visits_an_owner_that_left_it_unanswered_after_the_others`.
+- racer-sim `contention_scenarios::a_hung_peer_is_found_by_a_ping_and_shared_through_its_links`:
+  200 nodes, 10 hung, storms at 0 s and 30 s; with silence at most 2 failed reads in the first
+  storm and 1 in the second, with or without the rank 0 watch; the watch alone fails at least 50
+  in the first (148 at the time of writing). `owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch`
+  now also asserts that its busy rank 0 is pinged and never marked silent.
+  `a_hung_rank_zero_blocks_its_pages_for_at_most_one_request_timeout` measures the watch with
+  silence off, as before.
+
+### Evidence
+
+Release, seed 1 unless noted, 5k, same configurations as the wave 5 table ("Round 4: combined
+(wave 5)"). Origin: total, worst page, pages fetched more than once; overlap is
+`origin_repeats_concurrent`.
+
+| Run | Wave 5 reads ok / failed | Wave 5 origin; overlap | Wave 6 reads ok / failed | Wave 6 origin; overlap |
+| --- | --- | --- | --- | --- |
+| 5k storm | 378,544 / 0 | 1,024, 1, 0; 0 | 378,544 / 0 | 1,024, 1, 0; 0 |
+| 5k zipf | 202,851 / 15 | 40,404, 3, 1,452; 1,245 | 202,851 / 15 | 40,404, 3, 1,452; 1,245 |
+| 5k churn | 291,474 / 87 | 1,028, 2, 4; 0 | 291,474 / 87 | 1,028, 2, 4; 0 |
+| 5k zipf 16 MiB | 37,637 / 28 | 17,829, 3, 139; 130 | 37,639 / 29 | 17,826, 3, 134; 120 |
+| 5k zipf 16 MiB seed 2 | 37,828 / 40 | 17,531, 3, 132; 116 | 37,828 / 25 | 17,551, 3, 146; 137 |
+| 5k 1 Gbit/s storm | 95,158 / 0 | 6,970, 2, 16; 0 | 95,158 / 0 | 6,970, 2, 16; 0 |
+| 5k full-cold-start | 95,159 / 0 | 6,970, 2, 16; 0 | 95,159 / 0 | 6,970, 2, 16; 0 |
+| 5k full-failover | 33,970 / 33 | 12,951, 6, 342; 0 | 33,970 / 33 | 12,951, 6, 342; 0 |
+| 5k full-failover seed 2 | 33,740 / 30 | 12,975, 6, 368; 0 | 33,736 / 30 | 12,964, 6, 355; 0 |
+| 5k full-failover seed 3 | 33,715 / 37 | 12,907, 6, 287; 0 | 33,721 / 37 | 12,917, 6, 289; 0 |
+| 5k full-churn | 34,040 / 0 | 12,768, 3, 223; 0 | 34,040 / 0 | 12,768, 3, 223; 0 |
+| 5k zipf, 50 hung members | 30,478 / 140 | 11,757, 2, 25; 0 | 30,642 / 3 | 11,867, 2, 38; 0 |
+| 5k zipf, 50 hung members, seed 2 | 30,045 / 154 | 11,293, 2, 20; 0 | 30,234 / 1 | 11,425, 2, 40; 0 |
+| 50k full-failover | 303,355 / 266 | 47,617, 6, 2,268; 1 | see below | see below |
+
+- Hung members by class (seed 1; seed 2): reads whose page's rank 0 hangs 114 to 1 (113 to 1), a
+  hung owner other than rank 0 16 to 2 (20 to 0), other hangs 10 to 0 (18 to 0). 799 silence
+  verdicts, 810 requests failed at once for a silent destination, 2,004 pings of which 977
+  rechecks. Origin requests rise 0.9% (11,757 to 11,867): owners above a hung rank 0 now fetch the
+  pages it owns, which its readers previously did not get at all.
+- 5k `zipf` at 16 MiB pages (no hang): failed reads 28 to 29 (seed 2: 40 to 25), origin requests
+  17,829 to 17,826 (17,531 to 17,551), overlap 130 to 120 (116 to 137); issue 31's gains hold
+  within seed noise. No peer is marked silent; 37,990 pings (Known issue 401). The rejected
+  first version of the rule (no ping) marked 3,374 and overlapped 678.
+- Runs without a probe timeout (storm, default `zipf`, churn, 1 Gbit/s storm, full-cold-start,
+  full-churn, full-failover seed 1) have the wave 5 trace exactly; full-failover seeds 2 and 3
+  have 2 and 1 probe timeouts, and their numbers move within noise.
+- `hang-nosil.json` (silence off) reproduces the wave 5 hung-member run exactly (30,478 / 140).
+- 16-scenario smoke at 200 nodes, 1 s: every trace hash matches the wave 5 merge; no invariant
+  failure. `origin_repeat_explained` `unexplained` 0 and no hard invariant failure in any run.
+- `cargo fmt --check` and `cargo clippy --workspace --all-targets -D warnings` are clean; the
+  workspace tests pass (3,531, `--no-fail-fast`); DST seeds 1 to 20 pass, native and not.
+
+### Deviations and open items
+
+- Issue 42 is resolved as correct behavior with a bound, not removed; the measured alternatives
+  (retry, withholding) are above.
+- Production evidence at a relay depends on its exchange ending with `Cancelled` or
+  `DeadlineExceeded` when the upstream gives up (the relay keeps polling a cancelled exchange to
+  its completion fence, `request_traced`); that a relay future is never dropped earlier is an
+  inference from that comment, not traced. Without it relays would learn only from their own
+  timeouts, and requesters from their probes of rank 0.
+- Demotion applies to the `Spread` replica selection (the service default); `Primary` keeps the
+  canonical order.
+- The simulator keeps one silence map per node; production keeps one per worker (with its link
+  health), like the rank 0 watch.
+- New Known issues 401 (ping volume under contention) and 402 (a reader returns to a busy rank 0
+  once it answers the ping).
+
+### Open issues after wave 6 (hang2)
+
+45 to 52, 401, 402.
