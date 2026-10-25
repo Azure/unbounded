@@ -625,3 +625,27 @@ fn repeat_origin_fetches_are_classified_and_bounded() {
         );
     }
 }
+
+/// Known issue 122: with origin slower than the read deadline, leaders expire
+/// while their fills wait on origin. The fill stays a retained flight
+/// operation (production `Flights::retain_operation`), so later readers of
+/// the page wait for it instead of starting a concurrent fill, and the
+/// expired leader's outcome is dropped as stale rather than failing
+/// `flight_leader_valid` (checked by `run`).
+#[test]
+fn expired_leaders_drain_before_a_new_fill() {
+    let mut config = quiet(64);
+    config.origin_bps = 1 << 20;
+    config.duration_ns = 12 * SECONDS;
+    config.storms = (0..4)
+        .map(|i| Storm {
+            at_ns: i * 3 * SECONDS,
+            object: 1,
+            nodes: 64,
+            window_ns: 100 * MILLIS,
+        })
+        .collect();
+    let (_, report) = run(config, 5);
+    assert!(counter(&report, "flight_stale_finishes") > 0, "{report}");
+    assert_eq!(counter(&report, "flight_unexpected_lead"), 0);
+}
