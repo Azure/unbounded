@@ -415,7 +415,7 @@ Verified against the code at the start of this work.
    never added to the walk's budget), so a delegated rank 0 copies an orphan instead of fetching
    it again. 50k `full-failover`: orphans 1,205 to 893 (`copy_only` 140 to 44, `failed` 519 to
    343), `copy_held` 1,914 to 1,584, origin 52,200 to 51,834. Remainder (holder never reached
-   rank 0, so no hint) is Known issue 211. See "Round 4: orphan2 (wave 4)".
+   rank 0, so no hint) is Known issue 37. See "Round 4: orphan2 (wave 4)".
    Earlier, partly resolved (round 4, orphan, a6c0d74a9 through 6b325b87e): an owner that answered
    another owner's page probe without a copy keeps a successor hint and answers a reader's
    `Acquire` with `Miss`, so the reader gets the orphan copy from that owner instead of rank 0
@@ -460,8 +460,10 @@ Verified against the code at the start of this work.
    repeats (origin requests): 50k `full-failover` 3,612 to 2,878 (52,200 to 51,073, worst page
    10 to 9), 50k `full-cold-start` 2,629 to 1,919 (29,695 to 28,960), 5k `full-churn` 1,060 to
    894. What remains are holders ranked below the three owners (Known
-   issue 201) and rank 0 reached by a delegation with too few credits to ask its lineage
-   targets (Known issue 202). See "Round 4: history (wave 4)".
+   issue 34) and rank 0 reached by a delegation with too few credits to ask its lineage
+   targets (Known issue 35). See "Round 4: history (wave 4)". At the wave 4 merge readers stopped
+   visiting a non-neighbor lineage target ahead of a neighbor first owner (DST seed 16 failed
+   with 503); see "Round 4: combined (wave 4)".
    Was: the new owner asks only the owners of membership version - 1, and peers keep older
    memberships only for the 30 s grace window, so a copy fetched two or more versions earlier is
    not asked. 50k `full-failover` (seed 1): of 3,610 `after_owner_move` repeats, 980 had a
@@ -475,7 +477,7 @@ Verified against the code at the start of this work.
    (`AcquisitionBudget::refund_remote`), so a stale answer costs only its exchange. 50k failed
    reads: `full-cold-start` 248 to 95, `full-failover` 535 to 394; walks exhausted on stale
    owners 1,134 to 452 and 1,214 to 451. What
-   remains is owners still behind after the wait (Known issue 203). See "Round 4: history
+   remains is owners still behind after the wait (Known issue 36). See "Round 4: history
    (wave 4)".
    Was: readers that joined in the version their owners have not applied yet cannot use the
    stale fallback (they are not members of version - 1, so peers would reject them under it):
@@ -528,19 +530,8 @@ Verified against the code at the start of this work.
    owner's page probe of rank 0 that is sent but unanswered within the attempt no longer gives
    origin authority (`Outcome::TimedOut`, 5466604de). Overlapping requests 18,030 to 1,088, origin
    requests 35,672 to 18,867, completed reads 32,668 to 37,538. The 1,088 left follow a route
-   failure or an `Overloaded` rank 0 (new issue 222). See "Round 4: overload (wave 4)" (round 4,
+   failure or an `Overloaded` rank 0 (new issue 40). See "Round 4: overload (wave 4)" (round 4,
    overload, wave 4).
-
-221. An owner above rank 0 no longer fetches a page when its probe of rank 0 is accepted but never
-   answered (rank 0, or a relay on the route, hangs without failing the connection): readers of
-   that page fail until rank 0 answers, fails at the transport level, or leaves the membership.
-   This is the price of issue 31's fix; crashed and partitioned members fail at the transport
-   level and are unaffected. Open (round 4, overload, wave 4).
-
-222. An owner above rank 0 still fetches when rank 0 answers `Overloaded` (its flight's waiter cap
-   or admission) or the route to rank 0 fails, even though rank 0 is fetching the page: 958 route
-   and 126 `Overloaded` skips of the 1,088 remaining overlapping requests in 5k `zipf` at 16 MiB
-   pages. Open (round 4, overload, wave 4).
 
 32. Resolved (round 4, leak, a763b576c): DST native seed 60 stalled in `connect_links` when a node
    held a `Ready` link to an earlier incarnation of a crashed and re-added peer. Harness
@@ -552,14 +543,14 @@ Verified against the code at the start of this work.
    because the chosen receiver was not an overlay neighbor of the source and the read went through
    a relay. Harness precondition: the receiver is now a ranked candidate that neighbors the source.
 
-201. Holders ranked below the page's three owners are not asked. A member displaced from the
+34. Holders ranked below the page's three owners are not asked. A member displaced from the
    owners by later arrivals keeps its copy but now ranks fourth or lower, and placement keeps only
    the best three scores per slot (`topology::placement::Ranking`), so no lineage target names it.
    In an instrumented 5k `full-churn` run, 375 of 790 moved-page repeats whose holder was unasked
    had such a holder. Fixing it needs deeper rankings (keep more scores per slot, with the
    incremental update and memory bound that implies). Open (round 4, history, wave 4).
 
-202. Rank 0 reached by an owner's delegation usually carries one credit, which it keeps for its own
+35. Rank 0 reached by an owner's delegation usually carries one credit, which it keeps for its own
    origin attempt, so it cannot ask its lineage targets (in the instrumented 5k `full-churn` run,
    385 of 415 repeats whose holder was a listed but unasked lineage target started with one
    credit). Readers fund the delegating owner's lineage credits only from slack beyond every
@@ -567,16 +558,27 @@ Verified against the code at the start of this work.
    moved-page repeats 894 to 678 but raised failed reads 1 to 29 (5k `full-churn`). Open
    (round 4, history, wave 4).
 
-203. A reader waits only once for an owner that is behind (`stale_wait`); at 50k the propagation
+36. A reader waits only once for an owner that is behind (`stale_wait`); at 50k the propagation
    window (client lag p90 about 24 s) is longer than the wait, so 95 reads still fail in
    `full-cold-start` (57 to 161 s, during enrollment). Open (round 4, history, wave 4).
 
-211. Orphans whose holder never reached rank 0 leave no hint, so rank 0 still refetches them (50k
+37. Orphans whose holder never reached rank 0 leave no hint, so rank 0 still refetches them (50k
    `full-failover`: `route` 285, `partition` 139, `busy` 79, most of `failed` 343). Needs the holder
    to tell rank 0 later (round 4, orphan2).
 
-212. The simulator's repeat classification counts `Unavailable` signed by a relay on the route as
+38. The simulator's repeat classification counts `Unavailable` signed by a relay on the route as
    `failed` (rank 0's own origin failure); split it (round 4, orphan2).
+
+39. An owner above rank 0 no longer fetches a page when its probe of rank 0 is accepted but never
+   answered (rank 0, or a relay on the route, hangs without failing the connection): readers of
+   that page fail until rank 0 answers, fails at the transport level, or leaves the membership.
+   This is the price of issue 31's fix; crashed and partitioned members fail at the transport
+   level and are unaffected. Open (round 4, overload, wave 4).
+
+40. An owner above rank 0 still fetches when rank 0 answers `Overloaded` (its flight's waiter cap
+   or admission) or the route to rank 0 fails, even though rank 0 is fetching the page: 958 route
+   and 126 `Overloaded` skips of the 1,088 remaining overlapping requests in 5k `zipf` at 16 MiB
+   pages. Open (round 4, overload, wave 4).
 
 ## Simulator engine (racer-sim substrate)
 
@@ -1043,11 +1045,11 @@ scenarios carry data-plane faults.
 24. Resolved: core `PageFlights` retains leader operations like production `Flights`; the
    simulator retains each fill (round 4, flight, wave 3).
 25. Partly resolved: owners ask, and readers visit first, later owners that arrived before them
-   (lineage); 50k `full-cold-start` moved-page repeats 2,629 to 1,919; rest is 201 and 202
+   (lineage); 50k `full-cold-start` moved-page repeats 2,629 to 1,919; rest is 34 and 35
    (round 4, history, wave 4).
 26. Partly resolved: readers that cannot fall back wait once for an owner that is behind, and
    stale answers refund their remote credits; 50k `full-cold-start` failed reads 248 to 95; rest
-   is 203 (round 4, history, wave 4).
+   is 36 (round 4, history, wave 4).
 27. Resolved: DST harness only let the survivor set up a half-open link after a peer
    crash-restart; the restarted peer now initiates (round 4, orphan).
 28. Resolved: a worker dropped without a drain no longer leaks RDMA link setup tasks and their
@@ -1062,18 +1064,18 @@ scenarios carry data-plane faults.
    `zipf` at 16 MiB overlapping origin requests 18,030 to 1,088 (round 4, overload, wave 4).
 32. Resolved: DST native harness recovers stale links to re-added peers (round 4, leak).
 33. Resolved: DST native fault reads go to a neighbor of the source (round 4, leak).
-221. A hung rank 0 (accepts, never answers) now blocks the owners above it from fetching (round 4,
-   overload, wave 4).
-222. Owners above rank 0 still fetch after a route failure or an `Overloaded` answer from a rank 0
-   that is fetching (1,088 overlapping requests left) (round 4, overload, wave 4).
-201. Holders ranked below the three owners are not asked (placement keeps three scores per
+34. Holders ranked below the three owners are not asked (placement keeps three scores per
    slot) (round 4, history, wave 4).
-202. Rank 0 reached by a delegation has too few credits to ask its lineage targets (round 4,
+35. Rank 0 reached by a delegation has too few credits to ask its lineage targets (round 4,
    history, wave 4).
-203. One wait does not cover the 50k propagation window: 95 failed reads in `full-cold-start`
+36. One wait does not cover the 50k propagation window: 95 failed reads in `full-cold-start`
    (round 4, history, wave 4).
-211. Orphans whose holder never reached rank 0 still refetch (50k 893 left) (round 4, orphan2).
-212. Relay-signed `Unavailable` is classified as rank 0's `failed` (round 4, orphan2).
+37. Orphans whose holder never reached rank 0 still refetch (50k 893 left) (round 4, orphan2).
+38. Relay-signed `Unavailable` is classified as rank 0's `failed` (round 4, orphan2).
+39. A hung rank 0 (accepts, never answers) now blocks the owners above it from fetching (round 4,
+   overload, wave 4).
+40. Owners above rank 0 still fetch after a route failure or an `Overloaded` answer from a rank 0
+   that is fetching (1,088 overlapping requests left) (round 4, overload, wave 4).
 
 ## Round 2: production admission
 
@@ -3881,10 +3883,10 @@ Origin authority is unchanged (only fewer owners reach it), budgets never grow (
 added), and `only_owner_hits_origin`, `origin_repeat_explained` and `budget_never_grows` hold.
 No wire change.
 
-Trade-off (new Known issue 221): an owner no longer fetches when rank 0 (or a relay on the route)
+Trade-off (new Known issue 39): an owner no longer fetches when rank 0 (or a relay on the route)
 accepts its request and hangs without failing the connection. Crashed or partitioned members fail
 at the transport level (connection refused or connect timeout) and still hand authority to the
-next owner. Remaining overlap (new Known issue 222): an owner still fetches after a route failure
+next owner. Remaining overlap (new Known issue 40): an owner still fetches after a route failure
 to rank 0 or an `Overloaded` rank 0 even when rank 0 is fetching.
 
 ### Tests
@@ -3963,7 +3965,7 @@ Release, seed 1, 5k. "before" is the wave 3 merge (3542f1cc4, `/tmp/opencode/m5/
 
 - Issue 23 was a simulator artifact; production already ranks in the shed. The production
   changes are for issue 31 (timeout classification in `request_traced` and the walk rule).
-- New Known issues 221 (a hung rank 0 now blocks the owners above it) and 222 (route failure or
+- New Known issues 39 (a hung rank 0 now blocks the owners above it) and 40 (route failure or
   `Overloaded` from a rank 0 that is fetching still lets owners fetch).
 
 ## Round 4: history (wave 4)
@@ -4110,12 +4112,12 @@ Reading the table:
 
 ### Deviations and open items
 
-- Issue 25 is partly resolved. Holders ranked below the three owners (Known issue 201) need
+- Issue 25 is partly resolved. Holders ranked below the three owners (Known issue 34) need
   deeper rankings, a topology change not attempted here. Rank 0 reached by a delegation still has
-  one credit too few to ask its lineage targets (Known issue 202); more funding from the reader's
+  one credit too few to ask its lineage targets (Known issue 35); more funding from the reader's
   8-attempt page budget traded failed reads for origin requests and was not kept.
 - Issue 26 is partly resolved: one wait does not cover the 50k propagation window (Known issue
-  203). Longer or repeated waits spend more of the read deadline; production client retries were
+  36). Longer or repeated waits spend more of the read deadline; production client retries were
   not modeled further.
 - The refund changes production behavior for every `StaleMembership` answer, not only for the
   wait: a refreshed walk (Known issue 3) now keeps those credits too.
@@ -4229,11 +4231,91 @@ merge (`/tmp/opencode/m5/`). Origin: total, worst page, pages>1. Orphans: all, t
 ### Deviations and open items
 
 - Known issue 21 is resolved for its avoidable part: rank 0 now copies an orphan whenever it
-  learned of it and the holder still has it. New Known issue 211: what remains are orphans whose
+  learned of it and the holder still has it. New Known issue 37: what remains are orphans whose
   holder never reached rank 0 (50k: `route` 285, `partition` 139, `busy` 79, and most of
   `failed` 343, which includes `Unavailable` answers signed by a relay on the route rather than
   by rank 0), so rank 0 holds no hint. Fixing them needs the holder to tell rank 0 later (a push
   or offer once a route exists), a protocol addition not made here.
-- New Known issue 212: the repeat classification counts relay-signed `Unavailable` as `failed`
+- New Known issue 38: the repeat classification counts relay-signed `Unavailable` as `failed`
   (rank 0's own origin failure); the simulator should split it from relay failures.
 - Production has no counter for successor probes yet: `CandidatePolicy` holds no `Metrics`.
+
+## Round 4: combined (wave 4)
+
+Branch `racer-sim6-merge`: racer-core-sim beba55425 (wave 3 merge 3542f1cc4 plus the leak
+commits), then the overload, history and orphan2 tracks cherry-picked in that order. Logs and
+reports: `/tmp/opencode/m6/` (final binary and runs under `/tmp/opencode/m6/a/`).
+
+### Merge
+
+- Conflicts: the `WalkConfig` fields (`lineage` from history, `successors` from orphan2, both
+  kept) and the walk's `Pending` record (`rank0` from overload, `granted` from orphan2; successor
+  probes set `rank0: false`), `CandidatePolicy` (stale wait timer and successor hint table, both
+  kept; successor targets are added to the handoff list after `merge_handoff` has merged the
+  lineage targets), the simulator's `NodeFill` and imports, the core walk tests (all kept), and
+  this document.
+- New Known issues were renumbered: 201 to 34, 202 to 35, 203 to 36, 211 to 37, 212 to 38, 221
+  to 39, 222 to 40, in this document (no code comment named them).
+
+### Interplay
+
+- Rank 0 timeouts (overload) against lineage and successor probes: only an owner's probe of
+  canonical rank 0 sets `rank0` (`CandidateWalk::next`, `!handoff`), and lineage targets are
+  later owners, so neither a lineage probe nor a successor probe can be rank 0. Their timeouts
+  are `Transport(Unreachable)` and leave origin authority alone; production maps other successor
+  probe errors to a miss as well. Test:
+  `walk::tests::successor_and_lineage_probes_neither_grow_the_budget_nor_withhold_origin`.
+- `StaleMembership` refunds (history) against successor grants (orphan2): production and the
+  simulator refund into `CandidateWalk::request_budget`, which for a successor probe is its
+  grant; the grant is dropped, never reunited, and `refund_remote` never returns more than that
+  budget sent. The walk's budget never grows (same test; the simulator's `budget_never_grows`
+  invariant held in every run).
+- Copy-only joins (overload) against lineage and successor probes: a copy-only probe that reaches
+  a node with a running acquisition now waits in its flight. A successor probe has a short time
+  share, so it may run out while the holder is still fetching; it is then a failure (a miss for
+  the walk), not a `successor_misses`. The simulator test
+  `failover_owners_copy_orphans_from_successors` compared noted orphan refetches only with
+  misses and failed after the merge (22 against 11 misses, 24 failures); it now counts both.
+  A lineage probe can reach a later owner whose acquisition is a delegation to this owner; it
+  then waits for its attempt share and the owner fetches. No failed read was traced to it.
+- Fixed: lineage-first ordering against relay funding (found by the DST oracle, not a track
+  interaction: history alone fails it). Non-native seed 16 failed with a healthy client getting
+  503. A reader visited an older non-neighbor owner first (`lineage_first`) on a funded route that
+  spent its links; the owner deferred it to a successor (Known issue 21) and answered `Miss`; the
+  next owner did the same; the last owner was a non-neighbor and the reader had no links left.
+  `lineage_first` now never moves a non-neighbor ahead of a neighbor visited first (production
+  and simulator). Tests: `candidates::tests::lineage_first_keeps_a_neighbor_ahead_of_a_non_neighbor`
+  and DST seeds 1 to 20, native and not. 5k numbers did not change beyond noise.
+
+### Evidence
+
+Release, seed 1, same configurations as wave 3 (see "Round 4: combined (wave 3)"). Origin: total,
+worst page, pages fetched more than once.
+
+| Run | Wave 3 reads ok / failed | Wave 3 origin | Wave 4 reads ok / failed | Wave 4 origin |
+| --- | --- | --- | --- | --- |
+| 5k storm | 378,544 / 0 | 1,024, 1, 0 | 378,544 / 0 | 1,024, 1, 0 |
+| 5k zipf | 202,884 / 21 | 40,804, 3, 1,830 | 202,961 / 24 | 40,324, 3, 1,388 |
+| 5k churn | 291,640 / 95 | 1,030, 2, 6 | 291,542 / 90 | 1,029, 2, 5 |
+| 5k zipf 16 MiB | 32,668 / 62 | 35,672, 4, 13,715 | 37,524 / 29 | 18,866, 3, 1,181 |
+| 5k 1 Gbit/s storm | 63,637 / 31,191 | 6,947, 2, 52 | 94,829 / 0 | 6,931, 3, 36 |
+| 5k full-cold-start | 94,829 / 0 | 6,945, 2, 50 | 94,830 / 0 | 6,931, 3, 36 |
+| 5k full-failover | 33,797 / 31 | 13,057, 6, 467 | 33,794 / 37 | 13,018, 5, 425 |
+| 5k full-churn | 33,996 / 2 | 13,661, 6, 1,000 | 33,996 / 1 | 13,471, 4, 852 |
+| 50k full-cold-start | 911,471 / 248 | 29,695, 5, 2,506 | 911,703 / 93 | 28,936, 4, 1,899 |
+| 50k full-failover | 302,519 / 535 | 52,200, 10, 5,895 | 302,776 / 395 | 50,858, 6, 4,998 |
+
+- Concurrent origin repeats in 5k zipf 16 MiB: 18,030 to 1,089. 50k `full-failover` orphans
+  (`copy_only` + `failed`): 562 (orphan2 alone 387); route orphans 285 to 159, `failed` 343 to
+  437 (Known issues 37 and 38).
+- 5k `full-failover` failed reads 31 to 37 is within the spread of the tracks (history 33,
+  orphan2 26, seed 2 28).
+- Peak RSS: 50k `full-cold-start` 4.3 GiB, `full-failover` 3.0 GiB (unchanged).
+- Hard invariants, including `origin_repeat_explained` (`unexplained` 0), hold in every run and
+  in all 16 scenarios at 200 nodes, 1 s.
+- Workspace tests pass; `client_disconnect_cancels_pending_metadata_before_acquisition_deadline`
+  failed once under load and passed alone.
+
+### Open issues after wave 4
+
+19 (partly), 25 (partly), 26 (partly), 34 to 40.
