@@ -1186,7 +1186,7 @@ fn half_open_link_after_peer_restart_breaks_on_first_use() {
 
 /// Setup tasks hold an `Rc<Links>` (see `connect_link`), so `Links::tasks` is
 /// a reference cycle. `abandon_setups` must break it so an undrained owner
-/// releases the tasks and their admission charges (Known issue 145).
+/// releases the tasks and their admission charges (Known issue 28).
 #[test]
 fn abandon_setups_breaks_the_task_cycle_and_releases_charges() {
     let w = world_for([node_id(1), node_id(2)], true);

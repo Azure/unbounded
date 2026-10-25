@@ -469,9 +469,13 @@ Verified against the code at the start of this work.
    not-ready side initiate and waits out either side's backoff. Regression tests
    `rdma::links::tests::half_open_link_after_peer_restart_*`. See "Round 4: orphan (wave 3)".
 
-28. `dst_generated_native_traffic_churn_oracle` seed 16 fails at step 0 (`PendingWriteCrash`):
-   retired node 24 leaks 30,776 `RequestContext` bytes. Pre-existing: base 3771e5c3f fails the
-   same way; the non-native oracle passes seed 16. Not root-caused.
+28. Resolved (round 4, leak, 8b8908455): `dst_generated_native_traffic_churn_oracle` seed 16
+   leaked `RequestContext` on a node retired by `PendingWriteCrash`. A reference cycle: RDMA link
+   setup tasks own an `Rc<Links>` (`connect_link`, `src/peer/transport.rs:741`) and live in
+   `Links::tasks` (`src/rdma/links.rs:220`), cleared only by `Links::drain`. A worker dropped
+   without a drain kept the tasks with their connections, I/O budget, and admission charges, plus
+   the telemetry I/O they reached. `WorkerApplication` now abandons setups on drop. See "Round 4:
+   leak (wave 3)".
 
 29. Resolved: a fill whose leader's deadline passed kept running until origin answered, because
    the origin model (`sim/src/resources.rs`, `Origin::request`) reserved FIFO bandwidth up front
@@ -495,6 +499,16 @@ Verified against the code at the start of this work.
    same time, so neither can ask the other for a copy. Each is explained by the
    `origin_repeat_explained` invariant, but it is still origin egress (18,030 after the wave 3
    merge, worst page 4). Open (round 4, handover, wave 3; recorded at the wave 3 merge).
+
+32. Resolved (round 4, leak, a763b576c): DST native seed 60 stalled in `connect_links` when a node
+   held a `Ready` link to an earlier incarnation of a crashed and re-added peer. Harness
+   precondition: production breaks such a link on first use or when its idle `Close` fails. The leak track's harness change (advance past `LINK_IDLE`) was dropped at the
+   wave 3 leak merge in favor of Known issue 27's fix (the not-ready side initiates), which covers
+   the same case.
+
+33. Resolved (round 4, leak, a763b576c): DST native seed 59 left its injected fault unconsumed
+   because the chosen receiver was not an overlay neighbor of the source and the read went through
+   a relay. Harness precondition: the receiver is now a ranked candidate that neighbors the source.
 
 ## Simulator engine (racer-sim substrate)
 
@@ -963,8 +977,8 @@ scenarios carry data-plane faults.
    50k `full-cold-start`) (round 4, join2).
 27. Resolved: DST harness only let the survivor set up a half-open link after a peer
    crash-restart; the restarted peer now initiates (round 4, orphan).
-28. DST native churn oracle seed 16 leaks `RequestContext` on a crashed node (pre-existing on
-   base; open).
+28. Resolved: a worker dropped without a drain no longer leaks RDMA link setup tasks and their
+   admission charges (round 4, leak).
 29. Resolved: the origin model cancels a tracked request (slot and unsent bandwidth freed), and
    the simulator cancels an expired fill's origin request at its scope like production (round 4,
    cancel, wave 3).
@@ -972,6 +986,8 @@ scenarios carry data-plane faults.
    16 MiB: origin requests 48,438 to 35,917, most per page 24 to 4 (round 4, handover, wave 3).
 31. In 5k `zipf` at 16 MiB pages about 18k origin requests overlap with another node's request
    for the same page (`origin_repeats_concurrent`) (round 4, handover, wave 3).
+32. Resolved: DST native harness recovers stale links to re-added peers (round 4, leak).
+33. Resolved: DST native fault reads go to a neighbor of the source (round 4, leak).
 
 ## Round 2: production admission
 
@@ -3605,4 +3621,84 @@ worst page, pages fetched more than once. Wave 2 is `/tmp/opencode/m4b/`.
 
 ### Open issues after wave 3
 
-19 (partly; remainder 26), 21 (partly), 23, 25, 26, 28 (the leak track), 31.
+19 (partly; remainder 26), 21 (partly), 23, 25, 26, 31 (28 resolved by the leak track).
+
+## Round 4: leak (wave 3)
+
+Merged onto racer-core-sim 3542f1cc4. The track's issue numbers were renumbered: 145 to 28,
+155 to 32, 156 to 33, in this document and in code comments.
+
+### Root cause (issue 28)
+
+`RACER_DST_SEEDS=16` with `dst_generated_native_traffic_churn_oracle` failed at step 0
+(`PendingWriteCrash`): retired node 24 held 30,776 `RequestContext` bytes. The non-native oracle
+passes this seed. Base 3771e5c3f fails the same way.
+
+A temporary per-charge backtrace registry in `flow` (not committed) showed three live charges on
+the retired node's admission authority, all reachable only from futures in `Links::tasks`:
+
+- the I/O submission capacity of the telemetry `DiagnosticIo` (`Telemetry::attach_io`),
+- an `AdmissionBudget` I/O charge taken in `link_exchange` (`src/peer/transport.rs:684`),
+- an HTTP connection context taken in `PeerServer::serve_connection`.
+
+`Transfers::ensure_link` (`src/peer/transport.rs:764-790`) spawns `connect_link`, which owns an
+`Rc<Links>` (`src/peer/transport.rs:741`), into `Links::tasks` (`src/rdma/links.rs:220`, `spawn`).
+`Links` therefore owns a future that owns `Links`. Only `Links::drain` (`src/rdma/links.rs:442`)
+clears the tasks, and `WorkerApplication` calls it only at the end of a graceful drain
+(`src/app.rs:2263`). The DST crash path drops the worker without draining (the process is gone),
+so a link setup in flight at the crash kept itself, its connection, and the charges alive forever.
+Only native nodes have `Links`, which is why the plain oracle passes.
+
+This is a production ownership bug, not a harness artifact: any undrained drop of a worker
+leaks. In production that is a startup failure after link setups started, or a drain that fails
+before it reaches `links.drain()`. A real process crash frees everything anyway, so the impact is
+bounded to those in-process paths (inference: no production code drops and recreates a worker in
+the same process today).
+
+### Fix
+
+- `Links::abandon_setups` (`src/rdma/links.rs`) marks the facade draining and drops all setup
+  tasks. It takes the vector out of the `RefCell` before dropping it, because dropping a task runs
+  `SetupAttempt::drop`, which uses the same `Links`.
+- `impl Drop for WorkerApplication` (`src/app.rs`) calls it, breaking the cycle for every undrained
+  drop. A test-only accessor that moved a field out now clones it.
+
+### Harness preconditions found in the 1-60 sweep
+
+Both failed identically on base 3771e5c3f.
+
+- Issue 32, seed 60, `link setup stalled`: after `InflightCrash` re-adds a node under the same
+  id, a surviving node still holds a `Ready` link to the old incarnation while the new one is
+  `Idle`. `ensure_link` does nothing for a `Ready` link and `connect_links` only waits out
+  `Backoff`. Production breaks such a link on first use (error completion,
+  `rdma_verbs::node` `break_link`) or when its idle `Close` fails after `LINK_IDLE` (120 s). The
+  harness now advances the clock past `LINK_IDLE` when the local end is `Ready` and the remote end
+  is `Idle` or `Backoff`, so production logic breaks the link and the normal backoff path
+  reconnects. At the wave 3 leak merge this change was dropped: racer-core-sim already had Known
+  issue 27's fix (the not-ready side initiates), which covers the same case. `Connecting` remote ends are still only settled; treating them as stale made the
+  responder's setup time out.
+- Issue 33, seed 59, `native fault not consumed`: with 22 nodes the chosen receiver
+  (`candidates[1]`) was not an overlay neighbor of the source, so its read went through a relay
+  over links the harness had not set up and used HTTP (no native operation ran). The receiver is
+  now the best-ranked candidate that `Membership::is_neighbor` of the source, falling back to
+  `candidates[1]`. The assertion is unchanged.
+
+### Tests
+
+- `rdma::links::tests::abandon_setups_breaks_the_task_cycle_and_releases_charges`: a pending task
+  owning an `Rc<Links>` and a `RequestContext` charge; after `abandon_setups` the task's reference
+  and the charge are gone, new setups are refused, and the call is idempotent.
+- The whole-app DST oracle seed 16 is the integration regression.
+
+### Evidence
+
+- `RACER_DST_SEEDS=16` native: fails on base and before the fix (30,776 bytes), passes after.
+- Seeds 1 to 60, one process per seed, native and plain: before the harness fixes 118 of 120
+  passed (native 59 and 60 failed, also on base); after, 120 of 120 pass.
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`, and
+  `cargo test --workspace` pass.
+
+### Deviations
+
+- No simulator scenario changes; the leak is in the production worker, so 5k scenario numbers are
+  unaffected and were not rerun.
