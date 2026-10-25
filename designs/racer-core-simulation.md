@@ -492,9 +492,9 @@ Verified against the code at the start of this work.
 
 31. In 5k `zipf` at 16 MiB pages about 18k origin requests still overlap with a request for the
    same page from another node (`origin_repeats_concurrent`): two owners fetch the same page at the
-   same time, so neither can ask the other for a copy. Bounded by `REPLICAS` per page per move and
-   explained by the `origin_repeat_explained` invariant, but it is still origin egress. Open (round
-   4, handover, wave 3; recorded at the wave 3 merge).
+   same time, so neither can ask the other for a copy. Each is explained by the
+   `origin_repeat_explained` invariant, but it is still origin egress (18,030 after the wave 3
+   merge, worst page 4). Open (round 4, handover, wave 3; recorded at the wave 3 merge).
 
 ## Simulator engine (racer-sim substrate)
 
