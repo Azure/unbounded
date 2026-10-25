@@ -35,6 +35,7 @@ use racer_core::peer::Fault;
 use racer_core::peer::hop::{
     Hop, HopRoute, RelayFailure, RelayPlan, Response, decide_hop, relay_failure,
 };
+use racer_core::peer::silence::{LINK_TIMEOUTS, RANK0_TIMEOUTS};
 use racer_core::read::Error;
 use racer_core::read::budget::{AcquisitionBudget, inherited_budget};
 use racer_core::read::candidates::{
@@ -205,6 +206,17 @@ pub enum Event {
     Notice {
         node: u32,
     },
+    /// The requester of `msg` gives up: if its destination has not answered
+    /// the last link's sender by now, that sender notes the timeout (Known
+    /// issues 41 and 43).
+    LastHop {
+        msg: u64,
+    },
+    /// Silent next hops of `from` may be due for another ping.
+    SilenceRecheck {
+        from: u32,
+        to: u32,
+    },
 }
 
 impl Event {
@@ -246,6 +258,8 @@ impl Event {
             Self::OriginWake => (20, 0, 0),
             Self::StaleWait { fill } => (21, fill, 0),
             Self::Notice { node } => (22, node.into(), 0),
+            Self::LastHop { msg } => (23, msg, 0),
+            Self::SilenceRecheck { from, to } => (25, (u64::from(from) << 32) | u64::from(to), 0),
         }
     }
 }
@@ -600,6 +614,17 @@ struct Msg {
     /// An orphan notice's copy offer (Known issue 37): answered `Miss`
     /// without a body.
     offer: bool,
+    /// A silence ping (Known issues 41 and 43): answered `Miss` at once.
+    ping: bool,
+}
+
+/// An outstanding silence ping.
+struct SimPing {
+    node: u32,
+    incarnation: u32,
+    dest: u32,
+    /// A relay, not the destination, answered it.
+    relayed: bool,
 }
 
 struct Probing {
@@ -613,6 +638,10 @@ struct Probing {
     /// Index in the fill's `batch`: one of a run of granted probes sent at
     /// once (`Step::Granted`, Known issue 45).
     granted: Option<usize>,
+    /// The destination, and when the request was sent (silence evidence
+    /// on a timeout).
+    dest: u32,
+    sent: Nanos,
 }
 
 /// One granted probe of a batch (`Step::Granted`).
@@ -767,6 +796,12 @@ pub struct NodeWorld {
     tasks: HashMap<u64, Task, Fixed>,
     /// When each currently down node went down (Known issue 7 evidence).
     down_since: HashMap<u32, Nanos, Fixed>,
+    /// Messages sent over their last link and not answered yet: the sender
+    /// of that link, the destination, the page and the send time (Known issues 41
+    /// and 43).
+    last_hops: HashMap<u64, (u32, u32, u64, Nanos), Fixed>,
+    /// Outstanding silence pings by probe id.
+    pings: HashMap<u64, SimPing, Fixed>,
     /// Task ids woken since the last drain (see [`TaskWaker`]).
     woken: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
     publish_scheduled: bool,
@@ -875,6 +910,8 @@ impl NodeWorld {
             writes: HashMap::default(),
             held: HashMap::default(),
             streaming: HashMap::default(),
+            last_hops: HashMap::default(),
+            pings: HashMap::default(),
             bodies: HashMap::default(),
             origin_per_page: HashMap::default(),
             origin_wake: None,
@@ -1040,6 +1077,9 @@ impl NodeWorld {
                 if let Some((node, incarnation, due)) = self.offers.remove(&probe) {
                     self.offer_done(node, incarnation, due, false);
                 }
+                if let Some(ping) = self.pings.remove(&probe) {
+                    self.ping_done(ping, None);
+                }
                 if let Some(p) = self.probes.remove(&probe) {
                     self.metrics.incr("probe_timeouts");
                     match p.hedge {
@@ -1051,7 +1091,15 @@ impl NodeWorld {
                         }
                         // Sent, but unanswered within the attempt's own bound
                         // (production `request_traced`, attempt scope).
-                        None => self.complete_probe(p.fill, Ok(Outcome::TimedOut)),
+                        None => {
+                            let rank0 = self.fills.get(&p.fill).is_some_and(
+                                |f| matches!(&f.walk, Walking::Candidates(w) if w.pending_rank0()),
+                            );
+                            if rank0 || std::env::var_os("DBG_ALL_PINGS").is_some() {
+                                self.requester_timeout(p.fill, p.dest, p.sent);
+                            }
+                            self.complete_probe(p.fill, Ok(Outcome::TimedOut))
+                        }
                     }
                 }
             }
@@ -1096,6 +1144,8 @@ impl NodeWorld {
             Event::HedgeDelay { fill } => self.hedge_delay(fill),
             Event::StaleWait { fill } => self.stale_wait_done(fill),
             Event::Notice { node } => self.send_notices(node),
+            Event::LastHop { msg } => self.last_hop_timeout(msg),
+            Event::SilenceRecheck { from, .. } => self.silence_recheck(from),
             Event::OriginCancel { fill } => self.origin_cancel(fill),
             Event::OriginWake => self.origin_wake(),
             Event::Release { id } => {
@@ -3056,6 +3106,7 @@ impl NodeWorld {
             relay_first: 0,
             direct,
             offer: false,
+            ping: false,
         };
         let pid = self.fresh();
         let mid = self.fresh();
@@ -3067,6 +3118,8 @@ impl NodeWorld {
                 remote: plan.remote_attempts,
                 hedge,
                 granted: None,
+                dest,
+                sent: now,
             },
         );
         self.msgs.insert(mid, Msg { probe: pid, ..msg });
@@ -3086,6 +3139,15 @@ impl NodeWorld {
     /// Route `msg` one hop from `holder`. `plan` is the relay plan at a relay;
     /// `None` at the requester.
     fn forward(&mut self, mid: u64, holder: u32, plan: Option<RelayPlan>) {
+        let m = self.msgs.get(&mid).expect("message");
+        let instant = self.instant(self.now());
+        let own_ping = m.ping && holder == m.requester;
+        if !own_ping && self.nodes[holder as usize].silence.silent(&m.dest, instant) {
+            // Production `Paths::shortest_async`: the destination is a
+            // silent next hop of this node (Known issues 41 and 43).
+            self.metrics.incr("silent_destination_fails");
+            return self.fail_hop(mid, holder, Fault::Unavailable);
+        }
         let m = self.msgs.get(&mid).expect("message");
         if m.direct && plan.is_none() {
             // A pinned direct hedge exchange: one link, no route search
@@ -3151,11 +3213,156 @@ impl NodeWorld {
     fn blocked(&self, holder: u32, members: &Members) -> Vec<usize> {
         let instant = self.instant(self.now());
         let n = &self.nodes[holder as usize];
-        n.suspects
+        let mut blocked: Vec<usize> = n
+            .suspects
             .iter()
             .filter(|s| !n.links.available(s, instant))
             .filter_map(|s| position(members, *s))
-            .collect()
+            .collect();
+        // Production `LinkHealth::available`: silent next hops too (Known
+        // issue 41).
+        let me = position(members, holder);
+        let mut silent: Vec<usize> = n
+            .silence
+            .silent_peers(instant)
+            .filter_map(|s| position(members, *s))
+            .filter(|p| me.is_some_and(|me| members.is_neighbor(me, *p)))
+            .filter(|p| !blocked.contains(p))
+            .collect();
+        silent.sort_unstable();
+        blocked.extend(silent);
+        blocked
+    }
+
+    /// The requester of `mid` gave up: a last link still unanswered is a
+    /// timeout for its sender (production: the exchange ends with the
+    /// attempt's deadline or the upstream's cancellation).
+    fn last_hop_timeout(&mut self, mid: u64) {
+        let Some((sender, dest, page, sent)) = self.last_hops.remove(&mid) else {
+            return;
+        };
+        let now = self.now();
+        let (sent, at) = (self.instant(sent), self.instant(now));
+        self.metrics.incr("silence_timeouts");
+        if !self.nodes[sender as usize]
+            .silence
+            .timed_out(dest, page, sent, at, LINK_TIMEOUTS)
+        {
+            return;
+        }
+        self.nodes[sender as usize].silence.start_ping(&dest, at);
+        self.launch_ping(sender, dest, page);
+    }
+
+    /// Fill `id`'s probe of `dest`, sent at `sent`, timed out: the requester
+    /// asks whether `dest` hangs (production `request_traced`, Known issues
+    /// 41 and 43).
+    fn requester_timeout(&mut self, id: u64, dest: u32, sent: Nanos) {
+        if !self.config.node.silence {
+            return;
+        }
+        let Some((node, page)) = self.fills.get(&id).map(|f| (f.node, f.page)) else {
+            return;
+        };
+        let (sent, at) = (self.instant(sent), self.instant(self.now()));
+        let silence = &mut self.nodes[node as usize].silence;
+        if silence.timed_out(dest, page, sent, at, RANK0_TIMEOUTS) {
+            silence.start_ping(&dest, at);
+            self.launch_ping(node, dest, page);
+        }
+    }
+
+    /// Ping `dest` from `node` (production `CandidatePolicy::poll_pings`):
+    /// a page request in mode `ping` on its own route grant
+    /// ([`NOTICE_LINKS`], no attempts), which the destination answers `Miss`
+    /// at once.
+    fn launch_ping(&mut self, node: u32, dest: u32, page: u64) {
+        let now = self.now();
+        let timeout = now + self.config.node.attempt_timeout_ns;
+        let version = self.nodes[node as usize].version;
+        let incarnation = self.nodes[node as usize].incarnation;
+        let pid = self.fresh();
+        let mid = self.fresh();
+        let msg = Msg {
+            probe: pid,
+            requester: node,
+            at: node,
+            dest,
+            version,
+            page,
+            acquire: false,
+            path: vec![node],
+            links: NOTICE_LINKS,
+            attempts: 0,
+            deadline: timeout,
+            abandon: timeout,
+            relays: Vec::new(),
+            relay_first: 0,
+            direct: false,
+            offer: false,
+            ping: true,
+        };
+        self.pings.insert(
+            pid,
+            SimPing {
+                node,
+                incarnation,
+                dest,
+                relayed: false,
+            },
+        );
+        self.msgs.insert(mid, msg);
+        self.engine.at(timeout, Event::ProbeTimeout { probe: pid });
+        self.metrics.incr("silence_pings");
+        self.forward(mid, node, None);
+    }
+
+    /// A ping ended with `reply`, or unanswered within its time bound
+    /// (`None`). Any answer the destination signed means it is alive; a
+    /// relay's `Unavailable` (it holds the destination silent, or cannot
+    /// reach it) or no answer at all means silent; anything else (a relay's
+    /// overload, a transport failure here) proves nothing.
+    fn ping_done(&mut self, ping: SimPing, reply: Option<Reply>) {
+        let n = &self.nodes[ping.node as usize];
+        if n.down || n.incarnation != ping.incarnation {
+            return;
+        }
+        let at = self.instant(self.now());
+        let (from, to) = (ping.node, ping.dest);
+        let silence = &mut self.nodes[from as usize].silence;
+        let failed = match reply {
+            None => true,
+            Some(Reply::Shed) => false,
+            Some(Reply::Response(_)) if !ping.relayed => false,
+            Some(Reply::Response(ResponseKind::Unavailable)) => true,
+            Some(_) => {
+                self.metrics.incr("silence_pings_inconclusive");
+                return;
+            }
+        };
+        if !failed {
+            silence.ping_answered(&to, at);
+            return;
+        }
+        if silence.ping_failed(&to, at) {
+            self.metrics.incr("silence_marks");
+        }
+        if silence.silent(&to, at) {
+            // Ping it again after the hold, to learn that it recovered.
+            let hold = silence.hold().as_nanos() as Nanos;
+            self.engine.after(hold, Event::SilenceRecheck { from, to });
+        }
+    }
+
+    /// Re-ping silent next hops of `from` that are due (production
+    /// `CandidatePolicy::poll_pings`).
+    fn silence_recheck(&mut self, from: u32) {
+        let at = self.instant(self.now());
+        let due = self.nodes[from as usize].silence.due_pings(at, usize::MAX);
+        for (to, page) in due {
+            self.metrics.incr("silence_rechecks");
+            self.launch_ping(from, to, page);
+        }
     }
 
     /// A route search for `mid` at `holder` finished.
@@ -3248,6 +3455,14 @@ impl NodeWorld {
         let n = &mut self.nodes[holder as usize];
         if up {
             n.links.success(&next);
+            if next == self.msgs[&mid].dest && self.config.node.silence {
+                // The last link: this sender learns whether the destination
+                // answers (Known issues 41 and 43).
+                let (abandon, page) = (self.msgs[&mid].abandon, self.msgs[&mid].page);
+                self.last_hops.insert(mid, (holder, next, page, now));
+                self.engine
+                    .at(abandon.max(now + 1), Event::LastHop { msg: mid });
+            }
             let costs = self.fabric.costs;
             let signed = self.fabric.crypto(now, holder, costs.sign_ns);
             let arrive = self.fabric.message(signed, holder, next);
@@ -3354,6 +3569,8 @@ impl NodeWorld {
         let at = m.at;
         if self.nodes[at as usize].down || !self.versions.enrolled(at) {
             self.metrics.incr("messages_lost_to_crash");
+            // A crash fails the connection: link health, not silence.
+            self.last_hops.remove(&mid);
             let cut = if self.nodes[at as usize].down {
                 Cut::Down
             } else {
@@ -3529,6 +3746,12 @@ impl NodeWorld {
         let (dest, page, requester) = (m.dest, m.page, m.requester);
         if m.offer {
             return self.serve_offer(mid, dest, page, requester);
+        }
+        if m.ping {
+            // Production: mode `ping` is answered `Miss` at once, without
+            // looking at the cache or flights (Known issues 41 and 43).
+            let t = self.fabric.cpu(now, dest, 0, self.fabric.costs.request_ns);
+            return self.send_reply(mid, dest, Reply::Response(ResponseKind::Miss), t);
         }
         if self.shed_hot(dest, requester, page) {
             self.metrics.incr("hot_page_sheds");
@@ -3722,6 +3945,11 @@ impl NodeWorld {
             return;
         };
         if from != m.dest
+            && let Some(ping) = self.pings.get_mut(&m.probe)
+        {
+            ping.relayed = true;
+        }
+        if from != m.dest
             && let Some(p) = self.probes.get(&m.probe)
             && p.hedge.is_none()
             && let Some(fill) = self.fills.get_mut(&p.fill)
@@ -3731,6 +3959,13 @@ impl NodeWorld {
                 Some(b) => b.relayed = true,
                 None => fill.relayed = true,
             }
+        }
+        if from == m.dest
+            && ready < m.abandon
+            && let Some((sender, dest, ..)) = self.last_hops.remove(&mid)
+        {
+            // The destination answered before the requester gave up.
+            self.nodes[sender as usize].silence.answered(&dest);
         }
         let reply = if from == m.dest && reply == Reply::Response(ResponseKind::Overloaded) {
             Reply::Shed
@@ -3802,6 +4037,9 @@ impl NodeWorld {
     }
 
     fn reply(&mut self, pid: u64, reply: Reply) {
+        if let Some(ping) = self.pings.remove(&pid) {
+            return self.ping_done(ping, Some(reply));
+        }
         if let Some((node, incarnation, due)) = self.offers.remove(&pid) {
             // Only the destination answers an offer `Miss`; anything else
             // (transport, a relay's answer, shed, behind) tries again.
@@ -4002,6 +4240,9 @@ impl NodeWorld {
         if let Walking::Candidates(walk) = &fill.walk
             && walk.pending_rank0()
             && self.config.node.rank0_watch
+            // Only rank 0's own answer (or its silence) says anything about
+            // rank 0: a relay's `Unavailable` does not forget the page.
+            && !fill.relayed
         {
             // Production `CandidatePolicy::note_rank0` (Known issue 39).
             let (node, page, deadline) = (fill.node, fill.page, fill.budget.deadline());
@@ -4954,6 +5195,7 @@ impl NodeWorld {
             relay_first: 0,
             direct: false,
             offer: true,
+            ping: false,
         };
         self.offers.insert(pid, (node, incarnation, due));
         self.msgs.insert(mid, msg);

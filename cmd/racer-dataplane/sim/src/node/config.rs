@@ -134,6 +134,9 @@ pub struct NodeConfig {
     /// `demoted_targets_from` with `oldest` 0: always on; set 0 to measure
     /// without, Known issue 46).
     pub unknown_age_targets: bool,
+    /// Senders hold next hops that leave exchanges unanswered silent and
+    /// fail requests for them at once (Known issues 41 and 43).
+    pub silence: bool,
 }
 
 impl Default for NodeConfig {
@@ -179,6 +182,7 @@ impl Default for NodeConfig {
             parallel_granted: true,
             lineage_cap: racer_core::read::walk::MAX_LINEAGE,
             unknown_age_targets: true,
+            silence: true,
         }
     }
 }
@@ -236,6 +240,7 @@ impl NodeConfig {
                 "lineage_cap" if n <= racer_core::read::walk::MAX_LINEAGE as u64 => {
                     self.lineage_cap = n as usize;
                 }
+                "silence" if n <= 1 => self.silence = n == 1,
                 _ => return Err(format!("unknown key node.{key}")),
             }
         }

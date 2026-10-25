@@ -8,6 +8,7 @@ use flow_control::Circuits;
 use page_alloc::retention::{Heat, SecondSight};
 use page_alloc::{Alignment, PhantomEntries, SegmentClock, Segments};
 use racer_core::cache::lru::TickLru;
+use racer_core::peer::silence::{SILENCE_CAPACITY, Silence};
 use racer_core::read::flight::{FlightLimits, PageFlights};
 use racer_core::read::notice::{NOTICE_CAPACITY, OrphanNotices};
 use racer_core::read::rank0::{Rank0Watch, WATCH_CAPACITY, WATCH_TTL};
@@ -159,6 +160,9 @@ pub struct Node {
     /// Pages whose rank 0 this node, an owner above it, found fetching or
     /// overdue (production `CandidatePolicy::rank0_watch`, Known issue 39).
     pub rank0: Rank0Watch<u64, u32>,
+    /// Next hops that left exchanges unanswered (production
+    /// `LinkHealth::silence`, Known issues 41 and 43).
+    pub silence: Silence<u32, u64>,
 }
 
 pub struct Shared {
@@ -209,6 +213,13 @@ impl Node {
                 // Production: half the client request timeout.
                 Duration::from_nanos(config.read_timeout_ns / 2),
             ),
+            silence: Silence::new(
+                SILENCE_CAPACITY,
+                // Production: half the client request timeout, and the peer
+                // attempt timeout for one ping.
+                Duration::from_nanos(config.read_timeout_ns / 2),
+                Duration::from_nanos(config.attempt_timeout_ns),
+            ),
         }
     }
 
@@ -241,7 +252,8 @@ impl Node {
             + self.suspects.capacity() * 4
             + self.hints.len() * 64
             + self.notices.len() * 64
-            + self.rank0.len() * 48;
+            + self.rank0.len() * 48
+            + self.silence.len() * 64;
         out.disk_index += self.disk.entries.len() * SEGMENT_MAPPING_BYTES;
         out.segments += std::mem::size_of::<Segments>()
             + std::mem::size_of::<SegmentClock>()
