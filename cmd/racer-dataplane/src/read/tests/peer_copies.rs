@@ -4617,8 +4617,9 @@ impl SuccessorFixture {
 
 /// Known issue 37: rank 1 fetched the page from origin without ever
 /// reaching rank 0, then offers it. Rank 0 answers `Miss` without a body,
-/// notes rank 1 as a successor hint, and its next acquisition copies the
-/// page from rank 1 instead of fetching it from origin.
+/// notes rank 1 as a successor hint that defers no readers, and its next
+/// acquisition (for a reader) copies the page from rank 1 instead of
+/// fetching it from origin.
 #[test]
 fn rank_zero_notes_an_offer_and_copies_from_its_sender() {
     use crate::telemetry::Event;
@@ -4632,7 +4633,7 @@ fn rank_zero_notes_an_offer_and_copies_from_its_sender() {
         uring_runtime::environment::now() + Duration::from_secs(60),
     )
     .unwrap();
-    let (holder, other) = (s.index(Some(1)), s.index(Some(2)));
+    let (holder, reader) = (s.index(Some(1)), s.index(None));
     assert!(matches!(s.offer(holder), PeerResponse::Miss));
     assert_eq!(s.count(Event::OrphanOfferNoted), 1);
     assert_eq!(s.count(Event::SuccessorHint), 1);
@@ -4645,11 +4646,13 @@ fn rank_zero_notes_an_offer_and_copies_from_its_sender() {
         .borrow_mut()
         .push_back((s.ordered[1].clone(), Reply::Copy(copy)));
     assert!(matches!(
-        s.serve(other, FetchMode::Acquire),
+        s.serve(reader, FetchMode::Acquire),
         PeerResponse::Page { .. }
     ));
     assert_eq!(s.f.origin.calls.get(), 0);
     assert_eq!(s.peers.calls.borrow().len(), 1);
+    // The offer never deferred the reader: rank 0 copied for it.
+    assert_eq!(s.count(Event::SuccessorDeferral), 0);
 }
 
 /// Known issue 37: an offer to a rank 0 that holds the page is answered

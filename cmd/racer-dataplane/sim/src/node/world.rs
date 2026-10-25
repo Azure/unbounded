@@ -4575,9 +4575,15 @@ impl NodeWorld {
         let acquiring = n.workers[w as usize]
             .flights
             .acquiring(&self.ids.page(page));
-        if offer_noted(holds, acquiring) {
+        if offer_noted(holds, acquiring) && self.config.node.successor_hints && dest != requester {
+            // Production `Coordinator::serve_offer`: armed for this node's
+            // own successor probe, deferring no readers.
             self.metrics.incr("orphan_offers_noted");
-            self.note_hint(dest, page, requester, true);
+            self.metrics.incr("successor_hints_noted");
+            let instant = self.instant(now);
+            self.nodes[dest as usize]
+                .hints
+                .note_offer(page, requester, instant);
         } else {
             self.metrics.incr("orphan_offers_redundant");
         }

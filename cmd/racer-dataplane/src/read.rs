@@ -268,19 +268,33 @@ impl Coordinator {
 
     /// Answer a copy offer (Known issue 37): `requester` fetched `page` from
     /// origin as an owner ranked after this node. Note it as a successor
-    /// hint, exactly as a copy-only miss would, unless this node holds the
-    /// page or is fetching it. Never opens credentials, acquires, or sends a
+    /// hint for this node's own next acquisition (it defers no readers,
+    /// `SuccessorHints::note_offer`), unless this node holds the page or is
+    /// fetching it. Never opens credentials, acquires, or sends a
     /// body.
     fn serve_offer(
         &self,
         page: &crate::model::PageId,
         requester: &racer_control_wire::NodeId,
-        membership: &crate::topology::Membership,
     ) -> Result<PeerResponse> {
         let holds = self.fill.holds(page);
         let acquiring = self.fill.dependencies.flights.acquiring(page);
-        if racer_core::read::notice::offer_noted(holds, acquiring) {
-            self.note_successor(page, requester, membership, true);
+        if racer_core::read::notice::offer_noted(holds, acquiring)
+            && &self.fill.dependencies.candidates.node != requester
+        {
+            self.fill
+                .dependencies
+                .candidates
+                .successors
+                .borrow_mut()
+                .note_offer(
+                    page.clone(),
+                    requester.clone(),
+                    uring_runtime::environment::now(),
+                );
+            self.fill
+                .metrics
+                .record(crate::telemetry::Event::SuccessorHint, 1);
             self.fill
                 .metrics
                 .record(crate::telemetry::Event::OrphanOfferNoted, 1);
@@ -478,7 +492,7 @@ impl LocalPageService for Coordinator {
                 if page.version.object != request.origin.object {
                     return Err(Error::InvalidRequest);
                 }
-                return self.serve_offer(page, &requester, &membership);
+                return self.serve_offer(page, &requester);
             }
             let object = match &request.operation {
                 PeerOperation::Subscribe { .. } => None,

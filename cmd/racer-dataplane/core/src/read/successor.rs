@@ -155,6 +155,21 @@ impl<K: Eq + Hash + Clone, N: Clone + PartialEq> SuccessorHints<K, N> {
         self.compact();
     }
 
+    /// `node` offered its copy of `key` (Known issue 37,
+    /// [`crate::read::notice`]). Like [`Self::note`] for this node's own
+    /// successor probe, but a new hint defers no readers, and an existing
+    /// one keeps its deferral count: the holder may be far away or gone by
+    /// the time a reader would be sent to it, and this node asks it itself on
+    /// its next acquisition (DST `dst_generated_traffic_churn_oracle` seed 1
+    /// returned a 503 when offers deferred readers).
+    pub fn note_offer(&mut self, key: K, node: N, now: Instant) {
+        let kept = self.entries.get(&key).map(|e| (e.uses, e.max));
+        self.note(key.clone(), node, now);
+        if let Some(entry) = self.entries.get_mut(&key) {
+            (entry.uses, entry.max) = kept.unwrap_or((0, 0));
+        }
+    }
+
     /// The unexpired hints for `key` still usable for deferral, oldest
     /// first.
     pub fn peek(&self, key: &K, now: Instant) -> Vec<N> {
@@ -345,6 +360,24 @@ mod tests {
         );
     }
 
+    /// Known issue 37: an offer arms this node's probe but defers no
+    /// readers, and leaves an existing hint's deferral count alone.
+    #[test]
+    fn offers_arm_probes_without_deferrals() {
+        let now = Instant::now();
+        let mut h = SuccessorHints::new(8, HINT_TTL);
+        h.note_offer(1u64, 7u32, now);
+        assert!(h.peek(&1, now).is_empty());
+        assert_eq!(h.probe(&1, now + PROBE_AFTER), [7]);
+        h.note(2u64, 8u32, now);
+        h.charge(&2, 2);
+        h.note_offer(2, 9, now);
+        assert_eq!(h.peek(&2, now), [8, 9]);
+        h.charge(&2, 2);
+        assert!(h.peek(&2, now).is_empty());
+        assert_eq!(h.probe(&2, now + PROBE_AFTER), [8, 9]);
+    }
+
     #[test]
     fn keeps_latest_nodes_per_page_without_duplicates() {
         let now = Instant::now();
@@ -396,7 +429,10 @@ mod tests {
         assert_eq!(h.probe(&1, later), [7, 8]);
         // Hints older than the probe TTL are never probed.
         h.note(2, 9, now);
-        assert!(h.probe(&2, now + PROBE_TTL + Duration::from_secs(1)).is_empty());
+        assert!(
+            h.probe(&2, now + PROBE_TTL + Duration::from_secs(1))
+                .is_empty()
+        );
         assert!(h.names(&2, &9));
         assert!(!h.names(&2, &7));
         assert!(!h.names(&3, &9));
