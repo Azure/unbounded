@@ -737,6 +737,14 @@ Verified against the code at the start of this work.
    rank 0 origin failure (or sharing a short negative result) would halve it. See "Round 4:
    combined (wave 5)". Open (round 4, combined, wave 5).
 
+411. After the probes change, 50k `full-failover` (seed 1) has more `copy_held` repeats (578 to
+   626: `held` `unasked` 87 to 112, `unreachable` 488 to 514) and one page fetched 8 times (worst
+   page was 6), while moved-page repeats fall 590 to 288 and origin requests 47,617 to 47,354. The
+   5k runs do not show it (`copy_held` 79 to 68, 79 to 76, 64 to 65 for seeds 1 to 3).
+   `after_failure` repeats are unchanged (1,790 to 1,789), so the worst pages are likely the
+   Known issue 52 class with shifted timing; that is an inference, not traced. Open (round 4,
+   probes, wave 6).
+
 ## Simulator engine (racer-sim substrate)
 
 `cmd/racer-dataplane/sim` provides the substrate the extracted logic plugs into:
@@ -1263,6 +1271,8 @@ scenarios carry data-plane faults.
    orphan3, wave 5).
 52. The worst `full-failover` pages are origin failure retries; owners above rank 0 retry origin
    after rank 0's origin request failed (round 4, combined, wave 5).
+411. 50k `full-failover` `copy_held` 578 to 626 and worst page 6 to 8 after the probes change,
+   not traced (round 4, probes, wave 6).
 
 ## Round 2: production admission
 
@@ -5342,6 +5352,20 @@ Steps (same binary and knobs, seed 1; "sequential" is `parallel_granted` 0, "cap
   `budget_never_grows` (also checked on every granted plan), hold in every run and in all 16
   scenarios at 200 nodes, 1 s. `cargo fmt --check`, `clippy -D warnings` (workspace, all
   targets) and the workspace tests pass; DST seeds 1 to 20 pass, native and not.
+
+50k `full-failover` (seed 1, `/tmp/opencode/m4b/rr.json`; wave 5 is
+`/tmp/opencode/m7/50k-full-failover-sim.json`):
+
+| Run | Reads ok / failed | Origin | Move | `copy_held` | Latency | Probes | Peak RSS | Wall |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| wave 5 | 303,355 / 266 | 47,617, 6, 2,268 | 590 | 578 | 86 / 369 | 56,927 / 2,485 | 3.1 GiB | 28:55 |
+| wave 6 | 303,396 / 255 | 47,354, 8, 2,056 | 288 | 626 | 85 / 336 | 154,015 / 5,020 | 3.2 GiB | 30:07 |
+
+- Moved-page repeats halve (590 to 288), origin requests fall 263 and pages fetched more than
+  once 212; failed reads 266 to 255; p99 latency 369 to 336 ms. Of the 166 unasked moved-page
+  holders left, 157 rank 13 or lower. Peak RSS 3,223,472 to 3,372,624 kB, far below 32 GiB.
+- `copy_held` rises 578 to 626 and the worst page goes 6 to 8 (one page; one more at 7): Known
+  issue 411.
 
 ### Bounds
 
