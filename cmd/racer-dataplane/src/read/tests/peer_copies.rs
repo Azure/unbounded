@@ -3700,3 +3700,197 @@ fn owner_with_handoff_targets_delegates_with_spare_credits() {
         assert_eq!(f.origin.calls.get(), 0);
     }
 }
+
+/// A page request from `from` to the fixture's local node, signed and
+/// verified as on the wire. Copy-only requests carry no remote credits.
+fn successor_request(
+    f: &Fixture,
+    peers: &ScriptedPeers,
+    from: usize,
+    mode: FetchMode,
+    id: u8,
+) -> crate::peer::forwarding::VerifiedRequest {
+    let attempt = crate::model::AttemptId([id; 16]);
+    let attempts = u32::from(matches!(mode, FetchMode::Acquire)) * 4;
+    let request = PeerRequest {
+        operation: PeerOperation::Page {
+            page: f.page.clone(),
+            mode,
+        },
+        route: crate::topology::RouteBudget {
+            membership: f.membership.version,
+            request: f.scope.request,
+            attempt,
+            destination: node(peers.local),
+            visited: vec![node(from)],
+            remaining_links: 4,
+            remaining_attempts: attempts,
+            deadline: f.scope.deadline,
+        },
+        origin: f
+            .fill
+            .dependencies
+            .credentials
+            .seal(&f.context, attempt, &f.scope)
+            .unwrap(),
+    };
+    let (signed, _) = peers.signing[from].sign_request(request).unwrap();
+    peers.signing[peers.local].verify_request(signed).unwrap()
+}
+
+/// Rank 0 of the fixture's page serving signed peer requests.
+struct SuccessorFixture {
+    f: Fixture,
+    peers: Rc<ScriptedPeers>,
+    ordered: Vec<NodeId>,
+    coordinator: Rc<crate::read::Coordinator>,
+    ids: u8,
+}
+
+impl SuccessorFixture {
+    fn new() -> Self {
+        let mut f = fixture();
+        let (peers, ordered) = install_peers(&mut f, Some(0));
+        let (coordinator, _, _) = f.read_graph(
+            Rc::new(f.fill.clone()),
+            &f.membership,
+            ReadGraphSettings {
+                name: "successor",
+                snapshots: 4,
+                metadata: 16,
+                window: 1,
+                stall: Duration::from_secs(10),
+                seed: None,
+            },
+        );
+        Self {
+            f,
+            peers,
+            ordered,
+            coordinator,
+            ids: 0x41,
+        }
+    }
+
+    /// Node index of the page's owner at `rank`, or of a non-owner.
+    fn index(&self, rank: Option<usize>) -> usize {
+        match rank {
+            Some(rank) => (0..4).find(|i| node(*i) == self.ordered[rank]).unwrap(),
+            None => (0..4).find(|i| !self.ordered.contains(&node(*i))).unwrap(),
+        }
+    }
+
+    fn serve(&mut self, from: usize, mode: FetchMode) -> PeerResponse {
+        use crate::peer::server::LocalPageService;
+        self.ids += 1;
+        let admitted = successor_request(&self.f, &self.peers, from, mode, self.ids);
+        let coordinator = self.coordinator.clone();
+        let f = &mut self.f;
+        drive(
+            coordinator.serve_peer(admitted, f.membership.clone(), &f.scope),
+            &mut f.engine,
+            &f.crypto,
+        )
+        .unwrap()
+    }
+
+    fn count(&self, event: crate::telemetry::Event) -> u64 {
+        self.coordinator.fill.metrics.count(event)
+    }
+}
+
+/// Known issue 21: rank 0 answered rank 1's copy-only probe without a copy,
+/// so rank 1 fetches the page itself. A reader's later `Acquire` is then
+/// answered `Miss` (the reader asks rank 1 next) instead of rank 0 fetching
+/// the page again, at most `MAX_DEFERRALS` times; a reader's own miss is no
+/// hint, and once rank 0 holds a copy it serves it.
+#[test]
+fn rank_zero_defers_readers_to_the_owner_it_missed() {
+    use crate::telemetry::Event;
+    use racer_core::read::successor::MAX_DEFERRALS;
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut s = SuccessorFixture::new();
+    let (reader, successor, other) = (s.index(None), s.index(Some(1)), s.index(Some(2)));
+    // A reader's copy-only miss is no hint.
+    assert!(matches!(
+        s.serve(reader, FetchMode::CopyOnly),
+        PeerResponse::Miss
+    ));
+    assert_eq!(s.count(Event::SuccessorHint), 0);
+    // Rank 1 asks copy-only and misses: it will fetch the page itself.
+    assert!(matches!(
+        s.serve(successor, FetchMode::CopyOnly),
+        PeerResponse::Miss
+    ));
+    assert_eq!(s.count(Event::SuccessorHint), 1);
+    for i in 0..MAX_DEFERRALS {
+        assert!(
+            matches!(s.serve(reader, FetchMode::Acquire), PeerResponse::Miss),
+            "deferral {i}"
+        );
+    }
+    assert_eq!(s.count(Event::SuccessorDeferral), u64::from(MAX_DEFERRALS));
+    assert_eq!(s.f.origin.calls.get(), 0);
+    // The hint is spent: rank 0 acquires for the reader.
+    assert!(matches!(
+        s.serve(reader, FetchMode::Acquire),
+        PeerResponse::Page { .. }
+    ));
+    assert_eq!(s.f.origin.calls.get(), 1);
+    // Holding a copy, rank 0 serves it even with a fresh hint.
+    assert!(matches!(
+        s.serve(other, FetchMode::CopyOnly),
+        PeerResponse::Page { .. }
+    ));
+    assert!(matches!(
+        s.serve(successor, FetchMode::CopyOnly),
+        PeerResponse::Page { .. }
+    ));
+    assert!(matches!(
+        s.serve(reader, FetchMode::Acquire),
+        PeerResponse::Page { .. }
+    ));
+    assert_eq!(s.f.origin.calls.get(), 1);
+    assert_eq!(s.count(Event::SuccessorDeferral), u64::from(MAX_DEFERRALS));
+}
+
+/// Known issue 21: owners are never deferred. Rank 2 delegating to rank 0
+/// after rank 1 missed there gets rank 0's acquisition, as without a hint.
+#[test]
+fn rank_zero_never_defers_owner_requesters() {
+    use crate::telemetry::Event;
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut s = SuccessorFixture::new();
+    let (successor, other) = (s.index(Some(1)), s.index(Some(2)));
+    assert!(matches!(
+        s.serve(successor, FetchMode::CopyOnly),
+        PeerResponse::Miss
+    ));
+    assert_eq!(s.count(Event::SuccessorHint), 1);
+    assert!(matches!(
+        s.serve(other, FetchMode::Acquire),
+        PeerResponse::Page { .. }
+    ));
+    assert_eq!(s.f.origin.calls.get(), 1);
+    assert_eq!(s.count(Event::SuccessorDeferral), 0);
+}
+
+/// Without a hint rank 0 acquires for a reader as before (no ranking or
+/// deferral on the hot path).
+#[test]
+fn rank_zero_without_hints_acquires_for_readers() {
+    use crate::telemetry::Event;
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut s = SuccessorFixture::new();
+    let reader = s.index(None);
+    assert!(matches!(
+        s.serve(reader, FetchMode::Acquire),
+        PeerResponse::Page { .. }
+    ));
+    assert_eq!(s.f.origin.calls.get(), 1);
+    assert_eq!(s.count(Event::SuccessorHint), 0);
+    assert_eq!(s.count(Event::SuccessorDeferral), 0);
+}
