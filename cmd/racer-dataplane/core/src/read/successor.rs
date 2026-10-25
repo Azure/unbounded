@@ -220,9 +220,7 @@ pub fn successor_deferral<N: PartialEq>(
     requester: &N,
     owners: &[N],
 ) -> Option<N> {
-    let Some(me) = owners.iter().position(|o| o == local) else {
-        return None;
-    };
+    let me = owners.iter().position(|o| o == local)?;
     if owners.contains(requester) {
         return None;
     }
