@@ -734,7 +734,23 @@ mod faults {
             let object = self.object_id(5);
             let candidates = self.ranked_nodes(&object);
             let source = candidates[0];
-            let receiver = candidates[1];
+            // The fault is consumed only if the read crosses the link set up
+            // below. In larger topologies not every pair shares an overlay
+            // edge, and a non-neighbor routes through a relay instead, so pick
+            // the best-ranked candidate that is a direct neighbor of `source`.
+            let membership = self.nodes[0].workers[0]
+                .app
+                .snapshots
+                .current()
+                .unwrap()
+                .membership
+                .clone();
+            let source_id = self.nodes[source].config.node.clone();
+            let receiver = candidates[1..]
+                .iter()
+                .copied()
+                .find(|&n| membership.is_neighbor(&source_id, &self.nodes[n].config.node))
+                .unwrap_or(candidates[1]);
             self.update(5);
             // Candidates probe predecessors CopyOnly before filling from origin.
             // Warm the primary's exact version first, including in two-node clusters.
