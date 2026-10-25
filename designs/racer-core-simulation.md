@@ -446,18 +446,36 @@ Verified against the code at the start of this work.
    3771e5c3f, 376 with the relay fixes, 0 after). See "Round 4: flight (wave 3)" (round 4,
    flight, wave 3).
 
-25. Origin repeats after an owner move whose holder the handoff cannot find: the new owner asks
-   only the owners of membership version - 1, and peers keep older memberships only for the 30 s
-   grace window, so a copy fetched two or more versions earlier is not asked. 50k `full-failover`
-   (seed 1): of 3,610 `after_owner_move` repeats, 980 had a version - 2 holder and 1,240 an older
-   one; 5k `full-churn`: 892 of 1,062 older than version - 2. Fixing it needs older memberships
-   kept for ranking or rankings deeper than `REPLICAS`. Open (round 4, join2).
+25. Partly resolved (round 4, history, wave 4, 8ba959e3f..f8ec46f53): membership chains record
+   when each member arrived (`topology::Membership::since`). Placement is rendezvous hashing, so
+   a later owner that arrived before an owner ranked above it until then and may still hold the
+   page, however many versions ago it moved. Owners ask such lineage targets copy-only before
+   origin, Spread readers visit them first, and walks fund their probes from slack. Moved-page
+   repeats (origin requests): 50k `full-failover` 3,612 to 2,878 (52,200 to 51,073, worst page
+   10 to 9), 50k `full-cold-start` 2,629 to 1,919 (29,695 to 28,960), 5k `full-churn` 1,060 to
+   894. What remains are holders ranked below the three owners (Known
+   issue 201) and rank 0 reached by a delegation with too few credits to ask its lineage
+   targets (Known issue 202). See "Round 4: history (wave 4)".
+   Was: the new owner asks only the owners of membership version - 1, and peers keep older
+   memberships only for the 30 s grace window, so a copy fetched two or more versions earlier is
+   not asked. 50k `full-failover` (seed 1): of 3,610 `after_owner_move` repeats, 980 had a
+   version - 2 holder and 1,240 an older one; 5k `full-churn`: 892 of 1,062 older than
+   version - 2 (round 4, join2).
 
-26. Readers that joined in the version their owners have not applied yet cannot use the stale
-   fallback (they are not members of version - 1, so peers would reject them under it): 50k
-   `full-cold-start` 247 failed reads, all during enrollment (54 to 161 s); every one of the
-   1,732 stale skips that could not fall back was by such a reader (`stale_fallback_not_member`). Open (round 4,
-   join2).
+26. Partly resolved (round 4, history, wave 4, f0780ecab, 3e6dd0ed4): a reader that cannot walk
+   the previous membership waits once for an owner that is behind (a third of the time left, at
+   most 4 s) and asks it again (`racer_core::read::stale::stale_wait`), and a verified
+   `StaleMembership` returns the remote credits the request carried
+   (`AcquisitionBudget::refund_remote`), so a stale answer costs only its exchange. 50k failed
+   reads: `full-cold-start` 248 to 95, `full-failover` 535 to 394; walks exhausted on stale
+   owners 1,134 to 452 and 1,214 to 451. What
+   remains is owners still behind after the wait (Known issue 203). See "Round 4: history
+   (wave 4)".
+   Was: readers that joined in the version their owners have not applied yet cannot use the
+   stale fallback (they are not members of version - 1, so peers would reject them under it):
+   50k `full-cold-start` 247 failed reads, all during enrollment (54 to 161 s); every one of the
+   1,732 stale skips that could not fall back was by such a reader (`stale_fallback_not_member`)
+   (round 4, join2).
 
 27. Resolved: DST harness bug, not production. `connect_links`
    (`src/app/tests/dst.rs`) only asked node `a` to set up the link, but step 28
@@ -527,6 +545,25 @@ Verified against the code at the start of this work.
 33. Resolved (round 4, leak, a763b576c): DST native seed 59 left its injected fault unconsumed
    because the chosen receiver was not an overlay neighbor of the source and the read went through
    a relay. Harness precondition: the receiver is now a ranked candidate that neighbors the source.
+
+201. Holders ranked below the page's three owners are not asked. A member displaced from the
+   owners by later arrivals keeps its copy but now ranks fourth or lower, and placement keeps only
+   the best three scores per slot (`topology::placement::Ranking`), so no lineage target names it.
+   In an instrumented 5k `full-churn` run, 375 of 790 moved-page repeats whose holder was unasked
+   had such a holder. Fixing it needs deeper rankings (keep more scores per slot, with the
+   incremental update and memory bound that implies). Open (round 4, history, wave 4).
+
+202. Rank 0 reached by an owner's delegation usually carries one credit, which it keeps for its own
+   origin attempt, so it cannot ask its lineage targets (in the instrumented 5k `full-churn` run,
+   385 of 415 repeats whose holder was a listed but unasked lineage target started with one
+   credit). Readers fund the delegating owner's lineage credits only from slack beyond every
+   later visit's minimum, which an 8-attempt page budget rarely has; funding them anyway cut
+   moved-page repeats 894 to 678 but raised failed reads 1 to 29 (5k `full-churn`). Open
+   (round 4, history, wave 4).
+
+203. A reader waits only once for an owner that is behind (`stale_wait`); at 50k the propagation
+   window (client lag p90 about 24 s) is longer than the wait, so 95 reads still fail in
+   `full-cold-start` (57 to 161 s, during enrollment). Open (round 4, history, wave 4).
 
 ## Simulator engine (racer-sim substrate)
 
@@ -990,10 +1027,12 @@ scenarios carry data-plane faults.
    wave 4).
 24. Resolved: core `PageFlights` retains leader operations like production `Flights`; the
    simulator retains each fill (round 4, flight, wave 3).
-25. Owner moves over more than one version: handoff asks only version - 1 owners (980 + 1,240 of
-   3,610 move repeats in 50k `full-failover`) (round 4, join2).
-26. Readers that joined in the version their owners lack cannot fall back (247 failed reads in
-   50k `full-cold-start`) (round 4, join2).
+25. Partly resolved: owners ask, and readers visit first, later owners that arrived before them
+   (lineage); 50k `full-cold-start` moved-page repeats 2,629 to 1,919; rest is 201 and 202
+   (round 4, history, wave 4).
+26. Partly resolved: readers that cannot fall back wait once for an owner that is behind, and
+   stale answers refund their remote credits; 50k `full-cold-start` failed reads 248 to 95; rest
+   is 203 (round 4, history, wave 4).
 27. Resolved: DST harness only let the survivor set up a half-open link after a peer
    crash-restart; the restarted peer now initiates (round 4, orphan).
 28. Resolved: a worker dropped without a drain no longer leaks RDMA link setup tasks and their
@@ -1012,6 +1051,12 @@ scenarios carry data-plane faults.
    overload, wave 4).
 222. Owners above rank 0 still fetch after a route failure or an `Overloaded` answer from a rank 0
    that is fetching (1,088 overlapping requests left) (round 4, overload, wave 4).
+201. Holders ranked below the three owners are not asked (placement keeps three scores per
+   slot) (round 4, history, wave 4).
+202. Rank 0 reached by a delegation has too few credits to ask its lineage targets (round 4,
+   history, wave 4).
+203. One wait does not cover the 50k propagation window: 95 failed reads in `full-cold-start`
+   (round 4, history, wave 4).
 
 ## Round 2: production admission
 
@@ -3903,3 +3948,159 @@ Release, seed 1, 5k. "before" is the wave 3 merge (3542f1cc4, `/tmp/opencode/m5/
   changes are for issue 31 (timeout classification in `request_traced` and the walk rule).
 - New Known issues 221 (a hung rank 0 now blocks the owners above it) and 222 (route failure or
   `Overloaded` from a rank 0 that is fetching still lets owners fetch).
+
+## Round 4: history (wave 4)
+
+Known issues 25 (a page that moved over more than one membership version is fetched again) and
+26 (readers that joined in the version their owners lack cannot fall back). Branch
+`racer-sim6-history` from racer-core-sim 3542f1cc4. Nothing was cherry-picked.
+
+### Root causes
+
+Issue 25:
+
+- An owner asks copy-only, before origin, only the owners of version - 1 that are not its
+  predecessors (`handoff_targets`, `core/src/read/walk.rs`; production `previous_owners`,
+  `src/read/candidates.rs`). Production can rank only versions it still holds: two old parts for
+  the 30 s grace window (`Snapshot::retention`, `src/control/publication.rs`;
+  `Published::resolve`). So a holder from version - 2 or older is never asked.
+- Instrumenting the 5k `full-churn` repeats (temporary counters, seed 1) showed what the holders
+  were: of 929 moved-page repeats whose holder still had the copy and was not asked, 579 holders
+  were current owners ranked after the fetching owner (578 fetches by rank 0), and the other 350
+  ranked below the three owners. 646 of the 929 had no handoff targets at all: the move happened
+  versions earlier, so version - 1 and the current version had the same owners.
+- Why such a holder exists: placement is weighted rendezvous hashing
+  (`topology/src/placement.rs`), so a member's score for a slot never changes. A member that
+  joins above an owner pushes it down a rank. The pushed-down owner keeps the copy it fetched
+  while it ranked higher. Rank 0 never asks its successors, and nothing remembers the move once
+  version - 1 is gone.
+
+Issue 26:
+
+- A reader that joined in version N is not a member of N - 1, so `previous_fallback` refuses
+  (`core/src/read/stale.rs`), and an owner still on N - 1 cannot resolve N and answers
+  `StaleMembership` (`src/peer/server.rs`, `decide_hop` in `core/src/peer/hop.rs`). The reader
+  skips each owner and the walk ends `Exhausted`.
+- Each skipped probe also lost its remote credits: `plan_attempt` moved them into the request
+  (`core/src/read/walk.rs`) and nothing returned them, although the node that answered
+  `StaleMembership` did not act on the request (it answers before dispatch when it cannot
+  resolve the membership).
+
+### Changes
+
+- `topology::Membership` (shared): a membership built with a predecessor records a generation
+  and, per member, the generation it arrived in (`since`); members of the first membership in a
+  chain have 0. Local only, no wire change; 4 bytes per member, counted in `retained_bytes`. A
+  process's chain starts at the first publication it accepts, so a restarted node sees members
+  that joined before it as equal, and members that join later as newer.
+- `racer_core::read::walk`: `lineage_targets` (later owners that arrived before an owner),
+  `lineage_counts`, and `merge_handoff` (lineage targets first, then version - 1 targets, at most
+  three). `WalkConfig::lineage` funds them from slack only: a delegation to rank 0 forwards spare
+  credits for rank 0's targets, and a non-owner's out-of-order `Acquire` carries one more credit
+  per target of the destination and of rank 0 when every later visit still keeps its minimum
+  (`later_reserve`).
+- `racer_core::read::candidates::lineage_first`: a Spread reader whose first choice arrived after
+  a later owner visits that older owner first. Members that arrived together keep the order.
+- `racer_core::read::stale::stale_wait` and `CandidateWalk::retry_pending`: a non-owner that
+  cannot fall back waits once for a destination that is behind (a third of the time left, at
+  most 4 s, at least 250 ms) and asks it again.
+- `AcquisitionBudget::send_remote` / `refund_remote`: a verified `StaleMembership` returns the
+  remote credits its request carried, never more than were sent.
+- Production (`src/read/candidates.rs`, `src/app.rs`): owners merge lineage targets into their
+  handoff probes, `visit_order` applies `lineage_first` under Spread, `request_traced` refunds
+  remote credits on `StaleMembership`, and `resolve_epoch_traced` waits on the node's reactor
+  (`with_reactor`). No wire change; budgets never grow.
+- Simulator: the same, with `Versions::chain_base` (where each node's chain starts: its first
+  applied version since restart), `Event::StaleWait`, refunds per probe, and knobs `lineage` and
+  `stale_wait` (default on).
+
+### Tests
+
+- `topology`: `lineage_records_arrival_generations`; the retained-bytes test counts `since`.
+- `racer-core`: `lineage_targets_are_later_owners_that_arrived_earlier`,
+  `merge_handoff_keeps_lineage_targets_first_without_duplicates`,
+  `delegation_forwards_spare_credits_for_rank_zero_lineage`,
+  `non_owner_funds_destination_lineage_from_slack_only`,
+  `retry_pending_plans_the_same_destination_again`,
+  `lineage_first_visits_an_older_later_owner_first`,
+  `a_reader_that_cannot_fall_back_waits_once`,
+  `no_wait_for_owners_fallbacks_repeats_or_short_deadlines`,
+  `remote_credits_refund_only_what_was_sent`.
+- Production: `a_newer_owner_asks_older_later_owners_before_origin` (holder at rank 1 or 2: no
+  origin; no holder: asks both, then version 1's other owner, then origin; a chain whose owners
+  arrived together asks no one), `spread_visits_an_older_later_owner_before_a_newer_owner`,
+  `readers_that_cannot_fall_back_wait_once_for_an_owner_that_is_behind` (owner adopts during the
+  wait: copy; still behind: one more probe, then `Unavailable`, only exchanges spent; no timer:
+  as before).
+- Simulator: `combined::tests::lineage_targets_find_copies_of_pages_that_moved` (500 nodes
+  `full-churn`: moved-page repeats 91 to 82, origin requests 2,178 to 2,169) and
+  `node::tests::readers_that_cannot_fall_back_wait_for_owners_that_are_behind` (walks exhausted
+  on stale owners 6 to 2). `stale_owners_send_non_owners_to_the_previous_membership` now turns
+  waits off to measure the fallback alone.
+
+### Evidence
+
+Release, seed 1; `full-*` with `/tmp/opencode/m4b/rr.json`, `churn` with scenario defaults. Base
+is 3542f1cc4 built in this worktree (5k) and `/tmp/opencode/m5/` (50k). Origin: requests, worst
+page, pages fetched more than once. "Move" is `after_owner_move` repeats; "older" is the moved
+repeats whose holder was a version - 2 or older owner and not asked (`_unasked_two` +
+`_unasked_older`). "Exh. stale" is walks that ended exhausted after a stale skip. Logs:
+`/tmp/opencode/r6-history/`.
+
+| Run | Reads ok / failed | Origin | Move | Older | `copy_held` | Handoff probes | Exh. stale | Stale waits | Wall |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 5k churn, base | 291,640 / 95 | 1,030, 2, 6 | 6 | 4 | 0 | 1 | 37 | - | 1:15 |
+| 5k churn | 291,441 / 87 | 1,031, 2, 7 | 7 | 6 | 0 | 1 | 0 | 110 | 1:20 |
+| 5k full-churn, base | 33,996 / 2 | 13,661, 6, 1,000 | 1,060 | 918 | 16 | 1,286 | 5 | - | 0:49 |
+| 5k full-churn | 33,997 / 1 | 13,479, 5, 852 | 894 | 772 | 6 | 1,345 | 3 | 1 | 0:48 |
+| 5k full-failover, base | 33,797 / 31 | 13,057, 6, 467 | 58 | 38 | 154 | 424 | 3 | - | 0:50 |
+| 5k full-failover | 33,796 / 33 | 13,021, 7, 441 | 51 | 39 | 131 | 316 | 3 | 0 | 0:50 |
+| 5k full-cold-start, base | 94,829 / 0 | 6,945, 2, 50 | 47 | 34 | 3 | 448 | 4 | - | 0:40 |
+| 5k full-cold-start | 94,829 / 0 | 6,934, 3, 39 | 39 | 29 | 1 | 299 | 0 | 2 | 0:40 |
+| 50k full-cold-start, base | 911,471 / 248 | 29,695, 5, 2,506 | 2,629 | 1,355 | 169 | 4,794 | 1,134 | - | 20:35 |
+| 50k full-cold-start | 911,699 / 95 | 28,960, 4, 1,913 | 1,919 | 1,158 | 131 | 3,231 | 452 | 325 | 20:55 |
+| 50k full-failover, base | 302,519 / 535 | 52,200, 10, 5,895 | 3,612 | 2,229 | 1,914 | 4,823 | 1,214 | - | 28:06 |
+| 50k full-failover | 302,786 / 394 | 51,073, 9, 5,022 | 2,878 | 1,939 | 1,590 | 3,970 | 451 | 331 | 28:42 |
+
+Reading the table:
+
+- Issue 25: moved-page repeats fall 16% at 5k `full-churn`, 27% at 50k `full-cold-start` and
+  20% at 50k `full-failover`; origin requests fall by 182, 735 and 1,127, and `copy_held`
+  repeats at 50k `full-failover` 1,914 to 1,590. The 50k `full-cold-start` repeats where a holder was
+  asked but unreachable fall 746 to 248: readers now ask the older owner themselves instead of
+  rank 0 asking it with a delegation's few links. The worst page goes 5 to 4 at 50k cold start;
+  at 5k `full-failover` 6 to 7 (one page; the failover partitions dominate that scenario).
+- Issue 26: walks exhausted on stale owners 37 to 0 (5k `churn`) and 1,134 to 452 (50k
+  `full-cold-start`); 50k failed reads 248 to 95. The 5k `churn` completes 199 fewer reads in the
+  same time: waiting readers finish later. In 50k `full-failover` failed reads go 535 to 394 and
+  walks exhausted on stale owners 1,214 to 451; the remaining failures are mostly the failover's
+  crashes and partitions (`read_failed_at_s` p50 384 s, after enrollment).
+- Hard invariants hold in every run, including `origin_repeat_explained` (`unexplained` 0), and
+  in all 16 scenarios at 200 nodes, 1 s. Peak RSS at 50k: `full-cold-start` 4.3 GiB, `full-failover` 3.0 GiB (unchanged).
+
+### Bounds
+
+- Lineage probes are copy-only and opportunistic: at most three handoff probes per owner fetch
+  (lineage and version - 1 targets together, as before), each only with credits left after the
+  owner's own origin credit; readers fund them only from slack beyond every later visit's
+  minimum. A cluster whose members arrived together, or a node whose chain began after them,
+  sees no lineage targets and pays nothing.
+- A read waits at most once, for at most a third of its remaining time and at most 4 s. A refund
+  returns only credits a verified `StaleMembership` shows were never used; refunds never exceed
+  what was sent (`budget_never_grows` checks each refund in the simulator).
+- No reader gains origin authority: lineage targets and waits are copy-only or reader-side
+  (`only_owner_hits_origin` holds in every run).
+
+### Deviations and open items
+
+- Issue 25 is partly resolved. Holders ranked below the three owners (Known issue 201) need
+  deeper rankings, a topology change not attempted here. Rank 0 reached by a delegation still has
+  one credit too few to ask its lineage targets (Known issue 202); more funding from the reader's
+  8-attempt page budget traded failed reads for origin requests and was not kept.
+- Issue 26 is partly resolved: one wait does not cover the 50k propagation window (Known issue
+  203). Longer or repeated waits spend more of the read deadline; production client retries were
+  not modeled further.
+- The refund changes production behavior for every `StaleMembership` answer, not only for the
+  wait: a refreshed walk (Known issue 3) now keeps those credits too.
+- The temporary counters used for the root cause were removed before committing; the numbers
+  above that come from them are marked as instrumented runs.
