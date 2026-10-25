@@ -426,6 +426,9 @@ pub struct ControlSim {
     /// Time after which every live client must converge.
     settled_ns: Nanos,
     commits: Vec<(Nanos, u64, u64)>,
+    /// First time any client applied each membership version (for the
+    /// adoption spread, `ctl_adopt_spread_ns`).
+    first_adopt: std::collections::HashMap<u64, Nanos>,
     /// Content hash fingerprint per committed sequence.
     hashes: std::collections::HashMap<u64, u64>,
     last_primary: Option<u32>,
@@ -509,6 +512,7 @@ impl ControlSim {
             settled_ns: faults.iter().map(CtlFault::heals_at).max().unwrap_or(0),
             faults,
             commits: Vec::new(),
+            first_adopt: std::collections::HashMap::new(),
             hashes: std::collections::HashMap::new(),
             last_primary: None,
             primary_lost_ns: None,
@@ -761,6 +765,14 @@ impl ControlSim {
             }
             let previous = self.seats[i].served;
             self.seats[i].served = served;
+            if let Some(t) = served
+                .filter(|_| previous.is_some())
+                .and_then(|q| self.cp.commit_ns(q))
+            {
+                // Commit to this seat serving it (follower read cadence).
+                self.metrics
+                    .observe("ctl_seat_lag_ns", at.saturating_sub(t));
+            }
             self.trace(at, 0xC4, i as u64, served.unwrap_or(u64::MAX));
             let waiters = std::mem::take(&mut self.seats[i].waiters);
             self.metrics.add(
@@ -1255,6 +1267,20 @@ impl ControlSim {
             let from = t.max(self.started_ns[c as usize]);
             self.metrics
                 .observe("ctl_client_lag_ns", now.saturating_sub(from));
+            if old_seq > 0 && mv != old_mv {
+                // A client that already held a membership: pure propagation.
+                self.metrics
+                    .observe("ctl_member_lag_ns", now.saturating_sub(t));
+            }
+        }
+        if mv != old_mv {
+            // How long after the first client this one adopted `mv`: the
+            // window in which a peer that adopted it asks one still behind.
+            let first = *self.first_adopt.entry(mv).or_insert(now);
+            if old_seq > 0 {
+                self.metrics
+                    .observe("ctl_adopt_spread_ns", now.saturating_sub(first));
+            }
         }
         self.trace(now, 0xD2, u64::from(c), seq);
     }
