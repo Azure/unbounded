@@ -1131,7 +1131,6 @@ impl CandidatePolicy {
                     &hints,
                     &candidates.ordered,
                     rank,
-                    &handoff,
                 );
                 if !targets.is_empty() {
                     (handoff, successors) =

@@ -2203,7 +2203,7 @@ impl NodeWorld {
         let instant = self.instant(self.now());
         let hints = self.nodes[node as usize].hints.probe(&page, instant);
         let fill = &self.fills[&id];
-        let targets = successor_targets(&hints, &fill.cands, rank, &fill.handoff);
+        let targets = successor_targets(&hints, &fill.cands, rank);
         if targets.is_empty() {
             return;
         }

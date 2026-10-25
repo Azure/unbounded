@@ -57,6 +57,15 @@ pub const HINTS_PER_PAGE: usize = 2;
 /// came up to several minutes after the orphan fetch.
 pub const HINT_TTL: Duration = Duration::from_secs(600);
 
+/// How long a hint stays usable for this node's own successor probe
+/// ([`SuccessorHints::probe`]), at least the deferral TTL. Longer than
+/// [`HINT_TTL`]: a stale probe costs one granted copy-only miss, while a
+/// stale deferral costs every deferred reader an extra owner visit. Rank 0
+/// often refetches an orphan more than 10 minutes after it learned of it
+/// (5k `full-failover`: most remaining noted refetches after orphan notices,
+/// Known issue 37).
+pub const PROBE_TTL: Duration = Duration::from_secs(3600);
+
 /// Deferrals per hint before this owner fetches the page again.
 pub const MAX_DEFERRALS: u32 = 8;
 
@@ -156,15 +165,17 @@ impl<K: Eq + Hash + Clone, N: Clone + PartialEq> SuccessorHints<K, N> {
             .unwrap_or_default()
     }
 
-    /// The unexpired hints for `key`, oldest first, for this node's own
-    /// walk to ask before origin ([`successor_targets`]). Each noted hint is
-    /// returned once, so one hint funds at most one granted probe per node
-    /// it names; a renewed note returns it again.
+    /// The hints for `key` not older than [`PROBE_TTL`] (or the deferral
+    /// TTL, if longer), oldest first, for this node's own walk to ask before
+    /// origin ([`successor_targets`]). Each noted hint is returned once, so
+    /// one hint funds at most one granted probe per node it names; a renewed
+    /// note returns it again.
     pub fn probe(&mut self, key: &K, now: Instant) -> Vec<N> {
+        let ttl = self.ttl.max(PROBE_TTL);
         match self.entries.get_mut(key) {
             Some(e)
                 if !e.probed
-                    && now.saturating_duration_since(e.at) <= self.ttl
+                    && now.saturating_duration_since(e.at) <= ttl
                     && now.saturating_duration_since(e.at) >= PROBE_AFTER =>
             {
                 e.probed = true;
@@ -261,18 +272,19 @@ pub fn defer_allowed(acquiring: bool) -> bool {
 /// after which it usually fetched the page itself (an orphan copy). Asking it
 /// before origin turns this owner's refetch into a peer copy (Known issue
 /// 21). Only current owners ranked after this node qualify: predecessors are
-/// asked anyway. Previous-membership targets already in `handoff` are not
-/// repeated.
-pub fn successor_targets<N: PartialEq + Clone>(
-    hints: &[N],
-    owners: &[N],
-    rank: usize,
-    handoff: &[N],
-) -> Vec<N> {
+/// asked anyway.
+///
+/// A hinted owner that is also a handoff or lineage target stays a successor
+/// target: [`with_successors`] moves it to the front on its own grant.
+/// Excluding it (round 4, orphan2) left it an opportunistic handoff probe
+/// that rank 0, holding the single credit of a delegation, never sends: in
+/// 5k `full-failover` most rank 0 refetches of a holder rank 0 had noted were
+/// such lineage targets (Known issue 37).
+pub fn successor_targets<N: PartialEq + Clone>(hints: &[N], owners: &[N], rank: usize) -> Vec<N> {
     let mut out: Vec<N> = Vec::new();
     for n in hints.iter().rev() {
         let later = owners.iter().position(|o| o == n).is_some_and(|r| r > rank);
-        if later && !handoff.contains(n) && !out.contains(n) {
+        if later && !out.contains(n) {
             out.push(n.clone());
         }
     }
@@ -314,6 +326,23 @@ mod tests {
         assert_eq!(h.peek(&1, now), [7]);
         assert_eq!(h.peek(&1, now + Duration::from_secs(1)), [7]);
         assert!(h.peek(&1, now + Duration::from_secs(2)).is_empty());
+    }
+
+    /// Known issue 37: a hint too old for deferrals still funds this
+    /// node's successor probe, up to [`PROBE_TTL`].
+    #[test]
+    fn probe_outlives_the_deferral_ttl() {
+        let now = Instant::now();
+        let mut h = SuccessorHints::new(8, HINT_TTL);
+        h.note(1u64, 7u32, now);
+        h.note(2u64, 8u32, now);
+        let late = now + HINT_TTL + Duration::from_secs(1);
+        assert!(h.peek(&1, late).is_empty());
+        assert_eq!(h.probe(&1, late), [7]);
+        assert!(
+            h.probe(&2, now + PROBE_TTL + Duration::from_secs(1))
+                .is_empty()
+        );
     }
 
     #[test]
@@ -377,13 +406,23 @@ mod tests {
     fn successor_targets_are_later_owners_newest_first() {
         let owners = [1u32, 2, 3];
         // Rank 0 asks both later owners, newest hint first.
-        assert_eq!(successor_targets(&[2, 3], &owners, 0, &[]), [3, 2]);
+        assert_eq!(successor_targets(&[2, 3], &owners, 0), [3, 2]);
         // Rank 1 asks only rank 2; a predecessor or non-owner never.
-        assert_eq!(successor_targets(&[1, 3, 9], &owners, 1, &[]), [3]);
-        assert!(successor_targets(&[1, 2], &owners, 2, &[]).is_empty());
-        // A previous-membership target already asked is not repeated.
-        assert!(successor_targets(&[2], &owners, 0, &[2]).is_empty());
-        assert!(successor_targets(&[], &owners, 0, &[]).is_empty());
+        assert_eq!(successor_targets(&[1, 3, 9], &owners, 1), [3]);
+        assert!(successor_targets(&[1, 2], &owners, 2).is_empty());
+        assert!(successor_targets(&[], &owners, 0).is_empty());
+    }
+
+    /// Known issue 37: a hinted owner that is also a handoff (lineage)
+    /// target is asked first on its own grant, not left as an unfunded
+    /// handoff probe, and is not asked twice.
+    #[test]
+    fn hinted_handoff_target_moves_to_the_granted_front() {
+        let owners = [1u32, 2, 3];
+        let targets = successor_targets(&[2], &owners, 0);
+        assert_eq!(targets, [2]);
+        let (all, n) = with_successors(targets, &[7, 2]);
+        assert_eq!((all, n), (vec![2, 7], 1));
     }
 
     #[test]
