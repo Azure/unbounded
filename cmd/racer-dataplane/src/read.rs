@@ -203,7 +203,10 @@ impl Coordinator {
         membership: std::sync::Arc<crate::topology::Membership>,
         scope: &RequestScope,
     ) -> bool {
-        use racer_core::read::successor::{MAX_DEFERRALS, successor_deferral};
+        use racer_core::read::successor::{MAX_DEFERRALS, defer_allowed, successor_deferral};
+        if !defer_allowed(self.fill.dependencies.flights.acquiring(page)) {
+            return false;
+        }
         let hints = self
             .successors
             .borrow()

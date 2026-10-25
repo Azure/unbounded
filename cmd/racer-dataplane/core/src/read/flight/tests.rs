@@ -75,6 +75,23 @@ fn first_caller_leads_followers_share_completion() {
 }
 
 #[test]
+fn acquiring_only_while_a_leader_fetches() {
+    let now = Instant::now();
+    let deadline = now + Duration::from_secs(10);
+    let mut t = table(FlightLimits::default(), now);
+    let mut wakes = Vec::new();
+    let p = page(0);
+    assert!(!t.acquiring(&p));
+    let a = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
+    assert_eq!(t.poll(&p, a, now, 10, &mut wakes), Ok(Event::Lead));
+    assert!(t.acquiring(&p));
+    assert!(!t.acquiring(&page(1)));
+    t.finish(&p, a, Outcome::Published(Acquired::Plain(7)), &mut wakes)
+        .unwrap();
+    assert!(!t.acquiring(&p));
+}
+
+#[test]
 fn partial_result_serves_ciphertext_callers_and_reelects_plaintext() {
     let now = Instant::now();
     let deadline = now + Duration::from_secs(10);

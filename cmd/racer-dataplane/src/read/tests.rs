@@ -1221,6 +1221,23 @@ mod flight {
             );
         }
 
+        /// Successor hints (Known issue 21) never defer a reader away from a
+        /// running acquisition: `acquiring` is true only while a leader runs.
+        #[test]
+        fn acquiring_only_while_a_leader_runs() {
+            let flights = flights(FlightLimits::default());
+            let (context, scope_a) = (origin(), scope());
+            let mut a_budget = budget();
+            let page = fence().page;
+            assert!(!flights.acquiring(&page));
+            let mut a = join(&flights, &context, &scope_a, &mut a_budget);
+            let leader = lead(&mut a);
+            assert!(flights.acquiring(&page));
+            let result = result(&flights, fence().page);
+            assert_eq!(flights.publish(leader, result), Ok(FlightState::Complete));
+            assert!(!flights.acquiring(&page));
+        }
+
         /// Known issue 30: a canceled leader's running operation continues for
         /// the remaining acquisition waiter instead of being canceled; the
         /// elected capability publishes and the adopter completes without

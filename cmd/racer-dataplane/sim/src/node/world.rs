@@ -50,7 +50,7 @@ use racer_core::read::policy::{
 use racer_core::read::range::{PageBudget, SlotKind, direct_fills, first_failure};
 use racer_core::read::serve::{ServeAction, ServeFacts, serve_action, serve_deadline};
 use racer_core::read::stale::{StaleSkip, fallback_rank_allowed, previous_fallback};
-use racer_core::read::successor::{MAX_DEFERRALS, should_note, successor_deferral};
+use racer_core::read::successor::{MAX_DEFERRALS, defer_allowed, should_note, successor_deferral};
 use racer_core::read::walk::{
     AttemptInputs, AttemptPlan, CandidateWalk, Continuation, End, HedgeFacts, Mode, Outcome,
     PREVIOUS_MEMBERSHIP_WITHIN, Probe, RemainingWalk, RouteMode, StaleAction, Step, WalkConfig,
@@ -1492,6 +1492,12 @@ impl NodeWorld {
         }
         let hints = n.hints.peek(&page, instant);
         if hints.is_empty() {
+            return false;
+        }
+        let acquiring = n.workers[w as usize]
+            .flights
+            .acquiring(&self.ids.page(page));
+        if !defer_allowed(acquiring) {
             return false;
         }
         let owners = self.owners_at(node, w, page, true);

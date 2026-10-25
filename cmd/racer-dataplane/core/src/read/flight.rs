@@ -354,6 +354,14 @@ impl<C: Clone, P: Clone, O, S: BuildHasher> PageFlights<C, P, O, S> {
             .and_then(|f| f.state.leader_deadline())
     }
 
+    /// Whether `page` has an acquisition running (a leader is fetching it),
+    /// so a new waiter would join it rather than start another.
+    pub fn acquiring(&self, page: &PageId) -> bool {
+        self.flights
+            .get(page)
+            .is_some_and(|f| matches!(f.state.phase, Phase::Acquiring))
+    }
+
     /// Whether `page`'s running acquisition passed to a waiter other than
     /// the elected one.
     pub fn handed_over(&self, page: &PageId) -> bool {

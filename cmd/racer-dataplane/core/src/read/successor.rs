@@ -164,6 +164,8 @@ pub fn should_note<N: PartialEq>(local: &N, requester: &N, owners: &[N]) -> bool
 /// `local` is an owner and the requester is not (see the module docs for why
 /// owners are not deferred). The caller answers `Miss` and charges the hint.
 ///
+/// Callers also check [`defer_allowed`] first.
+///
 /// Hints may be noted without ranking (a copy-only miss is answered before
 /// anything ranks the page), so this is where ownership is checked.
 pub fn successor_deferral<N: PartialEq>(
@@ -179,6 +181,17 @@ pub fn successor_deferral<N: PartialEq>(
         .into_iter()
         .rev()
         .find(|n| n != requester && owners.contains(n))
+}
+
+/// Whether a deferral may be considered at all. While this node's own
+/// acquisition of the page runs, the requester joins it instead: a hint only
+/// says that another owner asked for the page and got no copy, not that it
+/// got one, and under origin overload the hinted owner's fetch often fails
+/// or has not finished. Deferring then sent readers away from a fill they
+/// could have joined (5k `zipf` at 16 MiB pages: 78% of deferrals, failed
+/// reads 54 to 1,003; Known issue 21, wave 3 merge).
+pub fn defer_allowed(acquiring: bool) -> bool {
+    !acquiring
 }
 
 #[cfg(test)]
@@ -278,5 +291,11 @@ mod tests {
         assert_eq!(successor_deferral(Vec::<u32>::new(), &1, &9, &owners), None);
         // A node that no longer owns the page never defers.
         assert_eq!(successor_deferral(vec![2], &8, &9, &owners), None);
+    }
+
+    #[test]
+    fn no_deferral_while_this_node_acquires() {
+        assert!(defer_allowed(false));
+        assert!(!defer_allowed(true));
     }
 }

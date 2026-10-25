@@ -1455,6 +1455,15 @@ impl Flights {
         self.publish_acquired(leader, page.into())
     }
 
+    /// Whether `page` has an acquisition running on this worker, so a new
+    /// waiter would join it (successor hints, `racer_core::read::successor`).
+    pub(crate) fn acquiring(&self, page: &PageId) -> bool {
+        self.table
+            .borrow()
+            .get(page)
+            .is_some_and(|entry| matches!(entry.state.phase, Phase::Acquiring))
+    }
+
     /// Let `leader`'s running operation continue for another live acquisition
     /// waiter when `leader` expires or is canceled (Known issue 30). Only for
     /// drivers whose caller does not fence on the operation.
