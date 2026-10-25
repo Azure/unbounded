@@ -35,12 +35,13 @@ use racer_core::peer::Fault;
 use racer_core::peer::hop::{
     Hop, HopRoute, RelayFailure, RelayPlan, Response, decide_hop, relay_failure,
 };
-use racer_core::peer::silence::{LINK_TIMEOUTS, RANK0_TIMEOUTS};
+use racer_core::peer::silence::{LINK_TIMEOUTS, NO_PING, RANK0_TIMEOUTS};
 use racer_core::read::Error;
 use racer_core::read::budget::{AcquisitionBudget, inherited_budget};
 use racer_core::read::candidates::{
-    AuthorityFacts, OperationKind, ProbeOutcome, ReplicaSelection, ResponseKind, VisitOrder,
-    classify, lineage_first, replica_score, validate_origin_authority, visit_order,
+    Answering, AuthorityFacts, OperationKind, ProbeOutcome, ReplicaSelection, ResponseKind,
+    VisitOrder, classify, demote_unanswered, lineage_first, replica_score,
+    validate_origin_authority, visit_order,
 };
 use racer_core::read::fanout::{fanout_helper, hot_page_bodies, is_helper, shed_hot_page};
 use racer_core::read::fill::{FailureKind, FillPlan, FillStep, Source, WalkResult};
@@ -1092,12 +1093,20 @@ impl NodeWorld {
                         // Sent, but unanswered within the attempt's own bound
                         // (production `request_traced`, attempt scope).
                         None => {
-                            let rank0 = self.fills.get(&p.fill).is_some_and(
-                                |f| matches!(&f.walk, Walking::Candidates(w) if w.pending_rank0()),
-                            );
-                            if rank0 || std::env::var_os("DBG_ALL_PINGS").is_some() {
-                                self.requester_timeout(p.fill, p.dest, p.sent);
-                            }
+                            // An owner's probe of rank 0, or a reader's probe
+                            // of the page's rank 0, asks a ping; any other
+                            // only demotes the owner in this node's visit
+                            // order (Known issues 41 and 43).
+                            let needed = match self.fills.get(&p.fill) {
+                                Some(f) if matches!(&f.walk, Walking::Candidates(w) if w.pending_rank0()) => {
+                                    RANK0_TIMEOUTS
+                                }
+                                Some(f) if f.rank.is_none() && f.cands.first() == Some(&p.dest) => {
+                                    RANK0_TIMEOUTS
+                                }
+                                _ => NO_PING,
+                            };
+                            self.requester_timeout(p.fill, p.dest, p.sent, needed);
                             self.complete_probe(p.fill, Ok(Outcome::TimedOut))
                         }
                     }
@@ -2208,6 +2217,23 @@ impl NodeWorld {
         } else {
             order
         };
+        // Owners that left this node's request unanswered go last
+        // (production `CandidatePolicy::visit_order`, Known issue 41).
+        let order = if rank.is_none() && self.config.node.silence {
+            let at = self.instant(self.now());
+            let silence = &self.nodes[node as usize].silence;
+            demote_unanswered(order, |r| {
+                if silence.silent(&cands[r], at) {
+                    Answering::Silent
+                } else if silence.unanswered(&cands[r], at) {
+                    Answering::Unanswered
+                } else {
+                    Answering::Answers
+                }
+            })
+        } else {
+            order
+        };
         // Members ranked just below the owners that were owners when they
         // arrived (production `CandidatePolicy::resolve_epoch_traced`,
         // `Placement::demoted`, Known issue 34).
@@ -3257,7 +3283,7 @@ impl NodeWorld {
     /// Fill `id`'s probe of `dest`, sent at `sent`, timed out: the requester
     /// asks whether `dest` hangs (production `request_traced`, Known issues
     /// 41 and 43).
-    fn requester_timeout(&mut self, id: u64, dest: u32, sent: Nanos) {
+    fn requester_timeout(&mut self, id: u64, dest: u32, sent: Nanos, needed: u32) {
         if !self.config.node.silence {
             return;
         }
@@ -3266,7 +3292,7 @@ impl NodeWorld {
         };
         let (sent, at) = (self.instant(sent), self.instant(self.now()));
         let silence = &mut self.nodes[node as usize].silence;
-        if silence.timed_out(dest, page, sent, at, RANK0_TIMEOUTS) {
+        if silence.timed_out(dest, page, sent, at, needed) {
             silence.start_ping(&dest, at);
             self.launch_ping(node, dest, page);
         }
@@ -4063,6 +4089,16 @@ impl NodeWorld {
         self.fabric
             .crypto(now, fill.node, self.fabric.costs.verify_ns);
         let page = fill.page;
+        let relayed = match probe.granted {
+            Some(i) => fill.batch.get(i).is_some_and(|b| b.relayed),
+            None => fill.relayed,
+        };
+        if probe.hedge.is_none() && !relayed && reply != Reply::Transport {
+            // The destination answered this node: it is not hung
+            // (production `resolve_epoch_traced`, Known issue 41).
+            let node = fill.node;
+            self.nodes[node as usize].silence.answered(&probe.dest);
+        }
         if reply == Reply::Response(ResponseKind::StaleMembership)
             && probe.hedge.is_none()
             && probe.granted.is_none()
