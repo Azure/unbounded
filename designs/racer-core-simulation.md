@@ -430,14 +430,15 @@ Verified against the code at the start of this work.
    (`src/read/fill.rs:1810`), so an owner with a spent budget still fetched (135 requests in 5k
    `full-failover`). It now fails the fill like production (`origin_unfunded`).
 
-23. The wave 2 merge lost most of fan-out's gain in the overloaded 1 Gbit/s `full-cold-start`
-   storm (5k, seed 1, `nic_bps` 125,000,000, one 1 s storm at 300 s): the fanout branch alone
-   completed 94,798 reads with 102 failures; the merged base 3771e5c3f completes 56,399 with
-   38,430 failures (20,119 deadline, 18,311 unavailable), 288,896 relay rejections, 191,873 probe
-   timeouts and only 13,532 helper probes (77,285 on the fanout branch), while membership
-   adoptions go from 0 to 8,135 and `CopyOnly` requests from 1,552 to 23,972 (inference: the
-   join track's membership versions and handoff's previous-owner probes change the storm's walks).
-   With the relay fix: 63,745 / 31,084. Not root-caused (round 4, relay, wave 3).
+23. Resolved: simulator artifact. The simulator's hot-page shed decided ownership from the
+   placement cache only (the retention test `owned`), while production `PeerServer::shed_hot_page`
+   ranks the page (`placement.rank`, `src/peer/server.rs`). After the join track's multi-version
+   cold start (5 membership versions instead of 1) owners held object 0's pages without a
+   ranking under the current version, so 10 of 16 pages were never shed and every reader queued
+   at their owners. The simulator now ranks like production; the 1 Gbit/s `full-cold-start` 1 s
+   storm completes 94,828 reads with 0 failures (63,637 / 31,191 before). Bisected to bdf231156
+   (fanout on wave 1: 47 failed; with `report_at_start` the merged tree fails 63). See
+   "Round 4: overload (wave 4)" (round 4, overload, wave 4, 91fd66397).
 
 24. Resolved: `flight_leader_valid` failed in 5k `zipf` at production page size under origin
    overload because `racer_core::read::flight::PageFlights` did not model production's retained
@@ -494,11 +495,28 @@ Verified against the code at the start of this work.
    18,468 to 2,186, and failed reads from 90 to 54. 1 MiB scenarios keep their trace hashes. See
    "Round 4: handover (wave 3)" (round 4, handover, wave 3).
 
-31. In 5k `zipf` at 16 MiB pages about 18k origin requests still overlap with a request for the
-   same page from another node (`origin_repeats_concurrent`): two owners fetch the same page at the
-   same time, so neither can ask the other for a copy. Each is explained by the
-   `origin_repeat_explained` invariant, but it is still origin egress (18,030 after the wave 3
-   merge, worst page 4). Open (round 4, handover, wave 3; recorded at the wave 3 merge).
+31. Resolved: in 5k `zipf` at 16 MiB pages the origin is about 7.4 times overloaded, and owners
+   above rank 0 fetched pages rank 0 was still fetching. 5,740 of the 18,030 overlapping requests
+   came from a simulator artifact (a copy-only probe of rank 0 answered `Miss` instead of joining
+   rank 0's running acquisition like production `Flights::join_copy`) and 11,352 from a production
+   rule (a timed-out probe of rank 0 was taken as origin authority although rank 0's request was
+   only queued). The simulator joins copy-only requests to the running flight (5bc1f2550), and an
+   owner's page probe of rank 0 that is sent but unanswered within the attempt no longer gives
+   origin authority (`Outcome::TimedOut`, 5466604de). Overlapping requests 18,030 to 1,088, origin
+   requests 35,672 to 18,867, completed reads 32,668 to 37,538. The 1,088 left follow a route
+   failure or an `Overloaded` rank 0 (new issue 222). See "Round 4: overload (wave 4)" (round 4,
+   overload, wave 4).
+
+221. An owner above rank 0 no longer fetches a page when its probe of rank 0 is accepted but never
+   answered (rank 0, or a relay on the route, hangs without failing the connection): readers of
+   that page fail until rank 0 answers, fails at the transport level, or leaves the membership.
+   This is the price of issue 31's fix; crashed and partitioned members fail at the transport
+   level and are unaffected. Open (round 4, overload, wave 4).
+
+222. An owner above rank 0 still fetches when rank 0 answers `Overloaded` (its flight's waiter cap
+   or admission) or the route to rank 0 fails, even though rank 0 is fetching the page: 958 route
+   and 126 `Overloaded` skips of the 1,088 remaining overlapping requests in 5k `zipf` at 16 MiB
+   pages. Open (round 4, overload, wave 4).
 
 32. Resolved (round 4, leak, a763b576c): DST native seed 60 stalled in `connect_links` when a node
    held a `Ready` link to an earlier incarnation of a crashed and re-added peer. Harness
@@ -967,8 +985,9 @@ scenarios carry data-plane faults.
    50k `full-failover` orphans 1,679 to 1,481. Delegation-led refetches and orphans of owners that
    never reached rank 0 remain.
 22. Resolved: the simulator debits the origin attempt like production (round 4, repeat).
-23. The wave 2 merge lost most of fan-out's gain in the 5k 1 Gbit/s `full-cold-start` 1 s storm
-   (102 to 38,430 failed reads) (round 4, relay, wave 3).
+23. Resolved: simulator artifact; the hot-page shed ranks the page like production, so owners
+   without a cached ranking shed (1 Gbit/s 1 s storm 31,191 to 0 failed reads) (round 4, overload,
+   wave 4).
 24. Resolved: core `PageFlights` retains leader operations like production `Flights`; the
    simulator retains each fill (round 4, flight, wave 3).
 25. Owner moves over more than one version: handoff asks only version - 1 owners (980 + 1,240 of
@@ -984,10 +1003,15 @@ scenarios carry data-plane faults.
    cancel, wave 3).
 30. Resolved: a running fill passes to another live waiter when its leader expires; 5k `zipf` at
    16 MiB: origin requests 48,438 to 35,917, most per page 24 to 4 (round 4, handover, wave 3).
-31. In 5k `zipf` at 16 MiB pages about 18k origin requests overlap with another node's request
-   for the same page (`origin_repeats_concurrent`) (round 4, handover, wave 3).
+31. Resolved: copy-only probes join rank 0's running acquisition (simulator), and an owner does
+   not take origin authority from a timed-out probe of rank 0 (production, core, simulator); 5k
+   `zipf` at 16 MiB overlapping origin requests 18,030 to 1,088 (round 4, overload, wave 4).
 32. Resolved: DST native harness recovers stale links to re-added peers (round 4, leak).
 33. Resolved: DST native fault reads go to a neighbor of the source (round 4, leak).
+221. A hung rank 0 (accepts, never answers) now blocks the owners above it from fetching (round 4,
+   overload, wave 4).
+222. Owners above rank 0 still fetch after a route failure or an `Overloaded` answer from a rank 0
+   that is fetching (1,088 overlapping requests left) (round 4, overload, wave 4).
 
 ## Round 2: production admission
 
@@ -3702,3 +3726,180 @@ Both failed identically on base 3771e5c3f.
 
 - No simulator scenario changes; the leak is in the production worker, so 5k scenario numbers are
   unaffected and were not rerun.
+
+## Round 4: overload (wave 4)
+
+Scope: Known issues 23 (the 1 Gbit/s `full-cold-start` 1 s storm) and 31 (overlapping origin
+requests in `zipf` at 16 MiB pages). Branch `racer-sim6-overload` from 3542f1cc4. Logs and
+configs: `/tmp/opencode/r6-overload/` (`k-base.json` is the issue 23 config, `Z16.json` the issue
+31 config).
+
+### Issue 23: root cause
+
+The storm is not a capacity bound. Toggling the simulator knobs on the merged tree changed
+nothing (failed reads: base 31,191; `successor_hints` 0: 31,181; `stale_fallback` 0: 31,207;
+`flight_handover` 0: 31,191; `hot_page_bodies` 8: 31,686, 128: 29,912). Bisecting by building
+each merge point (seed 1, 5k, same config):
+
+| Tree | Reads ok / failed | Helper probes | Sheds | Probe timeouts | Membership versions |
+| --- | --- | --- | --- | --- | --- |
+| 0d282020f (wave 1, no fan-out) | 52,279 / 42,824 | 0 | 0 | 213,257 | 1 |
+| 74c5e8d25 (fan-out on wave 1) | 95,057 / 47 | 79,139 | 80,945 | 10,036 | 1 |
+| c5a446a9f (join: admit once serving, batch) | 95,057 / 47 | 79,139 | 80,945 | 10,036 | 1 |
+| bdf231156 (join: sim models reporting once serving) | 55,793 / 39,037 | 12,904 | 38,825 | 192,129 | 5 |
+| 3771e5c3f (wave 2) | 56,399 / 38,430 | 13,532 | 36,634 | 191,873 | 5 |
+| 3542f1cc4 (wave 3) | 63,637 / 31,191 | 10,930 | 32,830 | 177,942 | 5 |
+| 3542f1cc4 with `control.report_at_start` | 95,039 / 63 | 71,930 | 71,930 | 605 | 1 |
+
+So the regression came with the cold start publishing 5 membership versions instead of 1. A
+per-request trace of the first storm second (temporary instrumentation) showed owners answering
+readers of only 6 of the 16 pages with sheds; for the other 10 pages only the 3 owners ever
+received requests, and their per-page body queues reached 236 without a shed. The simulator's
+`shed_hot` asked "is `dest` an owner?" with `NodeWorld::owned`, the retention predicate, which
+reads the placement cache only (`Placement::is_owner`, `topology/src/placement.rs:723`: "Missing,
+partial, and obsolete rankings return false"). Production's shed ranks the page
+(`PeerServer::shed_hot_page`, `src/peer/server.rs:416`, `self.placement.rank(...)`). An owner that
+fetched a page under an older membership (or has served it from memory since) holds no ranking
+under the current one, so in the simulator it never shed; readers queued on its NIC, timed out
+(2 s attempts), retried through relays (259k relay rejections) and failed. With a single version
+the cached rankings matched and the bug was invisible.
+
+### Issue 23: fix
+
+`shed_hot` ranks the page with `owners_at(dest, w, page, true)` like production and exempts
+requesters among those owners (91fd66397). Unit test
+`node::world::shed_tests::owner_without_a_cached_ranking_sheds_a_hot_page` fails before (the owner
+without a cached ranking does not shed) and passes after; it also checks the owner, helper and
+threshold exemptions and that a non-owner never sheds. Production is unchanged.
+
+### Issue 31: root cause
+
+The configuration is origin-bound. `origin_bps` 5 GB/s serves about 298 16 MiB pages per second,
+2,384 in the 8 s run (2,372 answered); the workload asks for 17,634 distinct pages, about 7.4
+times that. Rank 0's origin request for a page therefore queues for seconds. New counters split
+`origin_repeats_concurrent` by why the overlapping owner skipped rank 0 (ccc23d01d): of 18,030,
+11,352 had rank 0 time out, 5,740 had rank 0 answer `Miss` to a copy-only probe, 838 a route
+failure, 76 `Overloaded`.
+
+- Copy-only (simulator artifact): production `FillEngine::copy_only` (`src/read/fill.rs:1385`)
+  joins the page's running acquisition as a copy waiter (`Flights::join_copy`,
+  `src/read/flight.rs:1360`) when there is no local copy. The simulator answered `Miss`, so an owner
+  that could not fund a delegation and probed rank 0 copy-only got a miss from a rank 0 that was
+  fetching the page, and fetched it too.
+- Timeout (production rule): an owner above rank 0 delegates with an `Acquire`
+  (`CandidateWalk::next`, `core/src/read/walk.rs`, `delegated`) and keeps one credit for its own
+  origin attempt. When rank 0 does not answer within the attempt (its idle share or the attempt
+  timeout), production maps the attempt-scope deadline to `Unavailable`
+  (`request_traced`, `src/read/candidates.rs`), the walk records `Transport(Unreachable)` as
+  transient evidence and ends with origin authority. Rank 0 had accepted the request and its
+  origin request was simply queued; the owner's request queued behind it at the same FIFO origin,
+  so it could not finish first, and it delayed every request behind it until canceled at its scope
+  or handed over to a later waiter. A sim-only experiment that withheld origin after such a timeout
+  completed 37,527 reads instead of 32,829 with half the origin requests.
+
+### Issue 31: fix
+
+- racer-core `PageFlights::join_copy` (`core/src/read/flight.rs`) mirrors production `join_copy`:
+  `Miss` with no flight or after a failure or drain, the settled or partial result, the waiter cap,
+  waiter admission, then a waiter registered without acquisition rights (it never leads or adopts).
+  The simulator's copy-only serve uses it and answers with the acquisition's result (5bc1f2550;
+  counters `copy_only_flight_joins`, `copy_only_flight_hits`, `copy_only_join_rejected`).
+- `Outcome::TimedOut` (`core/src/read/walk.rs`): the request was sent and is unanswered within the
+  attempt's own bound while the caller's scope still runs. For an owner's page probe of rank 0 (a
+  delegated `Acquire`, or copy-only, under either membership; not a handoff probe) the walk ends
+  `Exhausted` instead of `Origin` (`CandidateWalk::rank0_unanswered`); the caller fails with
+  `Unavailable`, the reader's walk moves on or retries, and later attempts join rank 0's
+  acquisition. Everywhere else `TimedOut` is recorded exactly like `Transport(Unreachable)`.
+  A transport failure, `Overloaded`, a shed or a miss from rank 0 still gives authority, and
+  metadata walks are unchanged. Production `request_traced` reports an attempt-scope deadline as a
+  timeout and the candidate walk completes the probe with `TimedOut`; the simulator reports its
+  `ProbeTimeout` the same way (counter `origin_left_to_rank0`) (5466604de).
+
+Origin authority is unchanged (only fewer owners reach it), budgets never grow (no probe is
+added), and `only_owner_hits_origin`, `origin_repeat_explained` and `budget_never_grows` hold.
+No wire change.
+
+Trade-off (new Known issue 221): an owner no longer fetches when rank 0 (or a relay on the route)
+accepts its request and hangs without failing the connection. Crashed or partitioned members fail
+at the transport level (connection refused or connect timeout) and still hand authority to the
+next owner. Remaining overlap (new Known issue 222): an owner still fetches after a route failure
+to rank 0 or an `Overloaded` rank 0 even when rank 0 is fetching.
+
+### Tests
+
+- racer-core `flight::tests`: `copy_join_waits_for_the_running_acquisition_and_never_leads`,
+  `copy_join_misses_failed_and_takes_partial_results`,
+  `copy_join_respects_the_waiter_cap_and_a_lost_leader_fails_copy_waiters`.
+- racer-core `walk::tests`: `owner_leaves_the_fetch_to_rank_zero_after_a_timeout` (delegated and
+  copy-only, rank 1 and rank 2, a later copy still wins) and
+  `only_an_owner_probe_of_rank_zero_timing_out_withholds_origin` (transport failure, `Overloaded`,
+  miss and shed still give authority; a later predecessor or a handoff target timing out does
+  not withhold it; metadata walks and non-owners treat it as `Transport(Unreachable)`; the
+  remaining walk treats it as unavailable).
+- Production `read::tests::timeouts::owner_page_walk_leaves_the_fetch_to_a_rank_zero_that_times_out`
+  (rank 1, a stalled rank 0 ends `Unavailable` after one exchange; a transport failure still gives
+  authority); fails before the production change.
+  `candidate_final_remaining_copy_and_origin_miss_only_at_final_boundary` now takes its origin
+  authority from a metadata walk, since a page walk no longer reaches origin through a timeout;
+  its page-operation diagnostics checks are unchanged.
+- racer-sim `owner_without_a_cached_ranking_sheds_a_hot_page` (above) and
+  `contention_scenarios::owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch` (300 nodes, 48
+  readers of 64 cold pages at 8 MiB/s of origin: no overlapping request and one request per page;
+  98 overlapping requests and up to 3 per page without the rule).
+- `overloaded_hot_page_owners_do_not_stream_to_abandoned_requesters` asserted no late reply of any
+  kind. With the rule an owner above rank 0 whose delegation timed out answers its waiters
+  `Unavailable` instead of fetching, and some of those short answers reach readers whose attempt
+  already ended (81 late replies). The test now asserts what it was written for, no late page body
+  (new counter `late_page_replies`, 0).
+
+### Evidence
+
+Release, seed 1, 5k. "before" is the wave 3 merge (3542f1cc4, `/tmp/opencode/m5/`), "after" is
+5466604de (`/tmp/opencode/r6-overload/fin-*`). cs1g is `k-base.json`
+(`{"nic_bps":125000000,"request_rate":0.005,"storms":[one 1 s storm of all 5,000 nodes on object
+0 at 300 s]}`), z16 is `Z16.json` (`zipf`, 16 MiB pages, `request_rate` 1.25, 8 s); `full-*` use
+`/tmp/opencode/m4b/rr.json`. Origin is total requests, most per page, pages fetched more than once.
+
+| Run | Reads ok / failed | Origin | Concurrent | `copy_held` | Left to rank 0 | Sheds / helper copies | Wall |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| cs1g before | 63,637 / 31,191 | 6,947, 2, 52 | 0 | 5 | 0 | 32,830 / 8,215 | 1:07 |
+| cs1g after | 94,828 / 0 | 6,945, 2, 50 | 0 | 3 | 0 | 72,019 / 71,343 | 0:50 |
+| z16 before | 32,668 / 62 | 35,672, 4, 13,715 | 18,030 | 8 | 0 | 2,402 / 2,130 | 0:53 |
+| z16 after | 37,538 / 29 | 18,867, 3, 1,180 | 1,088 | 5 | 20,350 | 2,557 / 2,184 | 0:49 |
+| zipf before | 202,884 / 21 | 40,804, 3, 1,830 | 1,651 | 198 | 0 | 34 / 34 | 2:02 |
+| zipf after | 202,961 / 24 | 40,324, 3, 1,388 | 1,208 | 199 | 0 | 34 / 34 | 1:59 |
+| storm before / after | 378,544 / 0 both | 1,024, 1, 0 both | 0 | 0 | 0 | 60,365 / 59,001 both | 1:26 |
+| churn before | 291,640 / 95 | 1,030, 2, 6 | 0 | 0 | 0 | 519 / 501 | 1:18 |
+| churn after | 291,695 / 93 | 1,032, 2, 8 | 0 | 0 | 0 | 578 / 540 | 1:15 |
+| full-cold-start before / after | 94,829 / 0 both | 6,945, 2, 50 both | 0 | 3 | 0 | 0 / 0; 2 / 2 | 0:41 |
+| full-failover before / after | 33,797 / 31 both | 13,057, 6, 467 both | 0 | 154 | 0 | 0 / 0 | 0:52 |
+| full-churn before | 33,996 / 2 | 13,661, 6, 1,000 | 0 | 16 | 0 | 0 / 0 | 0:49 |
+| full-churn after | 33,996 / 2 | 13,658, 6, 995 | 0 | 14 | 0 | 0 / 0 | 0:49 |
+
+- Issue 23 by step: the shed fix alone gives cs1g 94,828 / 0 (`f1-cs1g`); the issue 31 changes do
+  not touch it. Probe timeouts 177,942 to 610, relay rejections 258,904 to 0, read p50 1.61 s to
+  302 ms and p99 9.66 s to 1.21 s.
+- Issue 31 by step (z16): the copy-only join alone moves the copy-only class into timeouts
+  (overlap 18,030 to 15,389, `f2-z16`); withholding origin after a delegated timeout gives 4,726
+  (`f4-z16`); extending it to copy-only probes of rank 0 gives 1,088 (`f5-z16`, final). Origin
+  requests canceled 2,175 to 285, flight handovers 13,537 to 7,165, range reads completed 1,217 to
+  1,577. Read p99 rises from 5.91 s to 6.44 s (bucket bounds): readers now wait for rank 0's
+  queued request instead of having a second owner queue one behind it.
+- With 10 times the origin bandwidth (`origin_bps` 50 GB/s) z16 has no overlapping request even
+  without the timeout rule (`f2-z16o10`: 21,502 requests, one per page): the overlap only appears when origin latency
+  exceeds the owners' attempt bound.
+- Default 1 MiB `zipf` is origin-bound too (40,324 requests in 2 s against about 9,400 the origin
+  can answer); its overlap falls from 1,651 to 1,208.
+- No hard invariant failure in any run. The 16-scenario smoke at 200 nodes (1 s) is clean, and all
+  trace hashes match the wave 3 merge except `faults`.
+- `cargo fmt --check` and `cargo clippy --workspace --all-targets -D warnings` are clean; the
+  workspace tests pass (3,449 tests, release, `--no-fail-fast`).
+- 50k was not run: the 5k `full-*` runs (the 50k configurations) are unchanged apart from 2 sheds,
+  and the wave 3 50k `full-cold-start` and `full-failover` had 0 concurrent origin requests.
+
+### Deviations and open items
+
+- Issue 23 was a simulator artifact; production already ranks in the shed. The production
+  changes are for issue 31 (timeout classification in `request_traced` and the walk rule).
+- New Known issues 221 (a hung rank 0 now blocks the owners above it) and 222 (route failure or
+  `Overloaded` from a rank 0 that is fetching still lets owners fetch).
