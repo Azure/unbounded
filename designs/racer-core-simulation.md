@@ -596,16 +596,44 @@ Verified against the code at the start of this work.
    5k `full-failover` seed 1 `failed` orphans 38 split into 19 `failed` and 19 `relay`, skips 379
    into 226 and 153. `origin_repeat_explained` is unchanged and exact (`unexplained` 0).
 
-39. An owner above rank 0 no longer fetches a page when its probe of rank 0 is accepted but never
-   answered (rank 0, or a relay on the route, hangs without failing the connection): readers of
-   that page fail until rank 0 answers, fails at the transport level, or leaves the membership.
-   This is the price of issue 31's fix; crashed and partitioned members fail at the transport
-   level and are unaffected. Open (round 4, overload, wave 4).
+39. Resolved: an owner above rank 0 no longer fetched a page when its probe of rank 0 was accepted
+   but never answered (rank 0, or a relay on the route, hangs without failing the connection), so
+   readers of that page failed until rank 0 answered, failed at the transport level, or left the
+   membership (the price of issue 31's fix). Owners now remember such a timeout per page
+   (`racer_core::read::rank0::Rank0Watch`); once rank 0 stayed silent for half a request timeout
+   a timeout gives origin authority again, and rank 0 is marked silent for its other pages. A new
+   simulator fault (`hang`) models it. With 50 of 5,000 members hung (5k `zipf`, 40 s), failed
+   reads 371 to 136, of which those whose page's rank 0 hangs 342 to 112 (Known issue 303); 5k
+   `zipf` at 16 MiB pages keeps issue 31's gains. See "Round 4: hang (wave 5)" (round 4, hang,
+   wave 5).
 
-40. An owner above rank 0 still fetches when rank 0 answers `Overloaded` (its flight's waiter cap
-   or admission) or the route to rank 0 fails, even though rank 0 is fetching the page: 958 route
-   and 126 `Overloaded` skips of the 1,088 remaining overlapping requests in 5k `zipf` at 16 MiB
-   pages. Open (round 4, overload, wave 4).
+40. Partly resolved: an owner above rank 0 still fetched when the route to rank 0 failed or an
+   `Overloaded` came back, even though rank 0 was fetching the page (958 route and 126
+   `Overloaded` skips of 1,088 overlapping requests in 5k `zipf` at 16 MiB pages). Every route
+   skip was rank 2 finding no route within the two links an equal split of its budget left its
+   copy-only probe of rank 0; that probe now gets the route first, like a delegation
+   (overlapping requests 1,089 to 115, origin requests 18,866 to 17,821). The remaining 111 are
+   `Overloaded` answers, 108 of them signed by a relay whose relay quota is full rather than by
+   rank 0; withholding origin after them failed more reads than it saved origin requests, so
+   they still give authority (Known issue 302). See "Round 4: hang (wave 5)".
+
+301. A reader does not learn that a peer hangs: it keeps visiting a hung owner first, or routing
+   through a hung relay, and each such probe costs it a whole attempt. In the 5k `zipf` run with 50
+   hung members, 24 of the 136 failed reads had a hung owner other than rank 0 or met only hung
+   relays. A timeout could feed link health (circuits) like a transport failure, or demote the
+   owner in the reader's visit order. Open (round 4, hang, wave 5).
+
+302. An owner above rank 0 takes origin authority from an `Overloaded` answer signed by a relay on
+   its route to rank 0 (relay quota full), which says nothing about rank 0: 108 of the 115
+   overlapping origin requests in 5k `zipf` at 16 MiB pages, and all 1,042 of the `busy` class in
+   default 5k `zipf`. Withholding origin after it (measured) removed most of the overlap but failed
+   29 to 55 more reads. A retry over a route that avoids the relay, within the owner's budget,
+   would be the next thing to try. Open (round 4, hang, wave 5).
+
+303. Each owner learns on its own that a rank 0 hangs, so the first reads of every (owner, hung
+   rank 0) pair still fail for up to half a request timeout: 112 failed reads in the 5k `zipf` run
+   with 50 hung members. Sharing liveness (for example through membership or link health) would
+   shorten it. Open (round 4, hang, wave 5).
 
 311. Resolved (round 4, lineage, wave 5): a copy-only probe that reached a node with a running
    acquisition of the page joined it (Known issue 31), also when the prober was an earlier owner.
@@ -1135,10 +1163,12 @@ scenarios carry data-plane faults.
    850 to 192, 5k 542 to 119 over seeds 1 to 10 (round 4, orphan3, wave 5).
 38. Resolved: relay-signed `Unavailable` is its own repeat class, `relay` (round 4, orphan3, wave
    5).
-39. A hung rank 0 (accepts, never answers) now blocks the owners above it from fetching (round 4,
-   overload, wave 4).
-40. Owners above rank 0 still fetch after a route failure or an `Overloaded` answer from a rank 0
-   that is fetching (1,088 overlapping requests left) (round 4, overload, wave 4).
+39. Resolved: owners above a rank 0 silent for half a request timeout fetch again (rank 0 watch,
+   simulator `hang` fault); 5k `zipf` with 50 hung members failed reads 371 to 136 (round 4,
+   hang, wave 5).
+40. Partly resolved: an owner's copy-only probe of rank 0 gets the route first; 5k `zipf` at 16 MiB
+   overlapping origin requests 1,089 to 115; the rest follow relay-signed `Overloaded` (issue
+   302) (round 4, hang, wave 5).
 311. Resolved: a copy-only probe from an earlier owner joined a later owner's acquisition that
    waited on the prober; the join is now declined (round 4, lineage, wave 5).
 312. Sequential lineage and demoted probes add latency before origin (5k `full-churn` mean read
@@ -1150,6 +1180,10 @@ scenarios carry data-plane faults.
 332. Orphan repeats offers cannot remove: rank 0 refetches before the offer arrives, or the holder
    is itself an owner above rank 0 that another owner skipped to (119 over 10 seeds) (round 4,
    orphan3, wave 5).
+301. A reader does not learn that a peer hangs (round 4, hang, wave 5).
+302. Owners take origin authority from a relay-signed `Overloaded` on the route to rank 0 (round 4,
+   hang, wave 5).
+303. Each owner learns on its own that a rank 0 hangs (round 4, hang, wave 5).
 
 ## Round 2: production admission
 
@@ -4687,3 +4721,166 @@ Offers: sent / delivered / noted.
   offers now only arm rank 0's own probe.
 - Wire: `racer-mode: offer` is new. Old receivers reject it (the sender retries on schedule and
   then drops the notice); nothing else on the wire changed.
+
+## Round 4: hang (wave 5)
+
+Scope: Known issues 39 (a rank 0 that accepts and never answers blocks the owners above it) and 40
+(owners above rank 0 still fetch after a route failure or an `Overloaded` while rank 0 is
+fetching). Branch `racer-sim7-hang` from 113a0990d. Logs and configs: `/tmp/opencode/r7-hang/`
+(`Z16.json` is the issue 31 configuration, `hang.json` the hung-member run below, `hang-nw.json`
+the same with the watch off).
+
+### Issue 40: root cause
+
+Temporary instrumentation recorded, for every overlapping origin request whose owner skipped rank 0
+with a route failure, where the route failed, at which hop and with how many links. All 959 in 5k
+`zipf` at 16 MiB pages were the same case: rank 2, at its own route search (`route_unreachable`,
+`sim/src/node/world.rs:2847` at 113a0990d), with 2 links. Rank 0 was alive and fetching; the probe
+never left rank 2. An owner that cannot fund a delegation asks its predecessors copy-only, and
+`CandidateWalk::next` split its links equally between them
+(`(budget.remaining_links() / remaining).min(4)`, `core/src/read/walk.rs:708` at 113a0990d): an
+owner arriving with four links gave rank 0 two, too few to route to a non-neighbor. The route
+failure was recorded as `Transport(Unreachable)` (production maps a local route search failure to
+`Error::Unavailable`, `src/topology.rs:691`, and the walk to `Unreachable`,
+`core/src/read/walk.rs:1087`), which gives origin authority. The delegated path already gave rank 0
+the route first for this reason (Known issue 13); the copy-only path did not.
+
+Of the 126 `Overloaded` skips, a second instrumented run split the outcome: 108 (and 1,042 of 1,042
+in default 5k `zipf`) are `Probe(Overloaded)`, an answer signed by a relay whose relay quota was
+full (61,198 relay rejections in default `zipf`), and 3 are rank 0's own shed. Rank 0's waiter cap
+rejected 2 copy-only joins in the whole run.
+
+### Issue 39: root cause
+
+Issue 31's rule (`Outcome::TimedOut`, `core/src/read/walk.rs:850` and `:946` at 113a0990d;
+production `src/read/candidates.rs:1332`) withholds origin whenever an owner's probe of rank 0 times
+out, with no memory: each walk decides afresh. A rank 0 whose peer server accepts and never answers
+(or a relay on the route that does) times out every probe, so every owner walk for its pages ends
+`Exhausted` and readers fail until the membership drops it. Nothing distinguished "rank 0 is still
+fetching" from "rank 0 will never answer".
+
+### Fix
+
+- Copy-only route first (42a523fd4): `CandidateWalk::next` plans an owner's copy-only probe of rank
+  0 like a delegation: `route_links()` capped so later predecessors keep one link each
+  (`core/src/read/walk.rs:723`). Other copy-only predecessor and handoff probes still split.
+- Rank 0 watch (1bdb548c7, fd3628b4b, 7eec877ea): `racer_core::read::rank0::Rank0Watch`, a bounded
+  (`WATCH_CAPACITY` 4,096 pages), expiring (`WATCH_TTL` 60 s after the last timeout) map per node.
+  An owner notes a page when its probe of rank 0 times out (`timed_out`, `core/src/read/rank0.rs:162`)
+  and forgets it when rank 0 itself answers (a copy, a miss, a failure of its own; `answered`,
+  `:206`). The page is `Fetching` for `hang_after` after the first timeout (or until that request's
+  deadline, if later; `:194`), then `Overdue`. `WalkConfig::rank0` carries the state; for an
+  `Overdue` page a timeout of rank 0 gives authority like a transport failure
+  (`core/src/read/walk.rs:879`). A timeout on an overdue page also marks rank 0 silent, so its other
+  pages are overdue at once until it answers anything.
+  - `hang_after` is half the client request timeout (production `config.request_timeout / 2`,
+    `src/app.rs:1138`; simulator `read_timeout_ns / 2`). Not the request's deadline: an owner's
+    request often carries a short one (a reader's attempt share; about 3 s after the timeout in the
+    simulator), while rank 0's acquisition outlives it through flight handover; using it added an
+    overlapping origin request in `owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch`.
+    Not the whole timeout: a read that met the first timeout should still have time to retry.
+    Measured in the simulator (10 s read timeout): 3 s added 44 overlapping requests in 5k `zipf` at
+    16 MiB pages, 5 s none; with 50 hung members 10 s failed 188 reads, 5 s 136, 3 s 117.
+  - Production: `CandidatePolicy::rank0_watch` and `note_rank0` (`src/read/candidates.rs:646`),
+    updated from the outcome of the pending rank 0 probe (`CandidateWalk::pending_rank0`), read when
+    the walk is built (`:1191`). Simulator: `Node::rank0`, same rules (`sim/src/node/world.rs:3656`,
+    knob `node.rank0_watch`, counters `rank0_watch_fetching_walks`, `rank0_watch_overdue_walks`).
+- Rejected: a `Fetching` page also withholding origin after a route failure, `Overloaded` or shed of
+  rank 0. In 5k `zipf` at 16 MiB pages (seeds 1 and 2) it removed 71 and 80 of 115 and 104
+  overlapping requests but failed 55 and 29 more reads: the `Overloaded` answers are almost all
+  relay-signed (above), and an owner that does not fetch leaves its readers unserved. `Fetching`
+  keeps issue 31's rule and nothing else.
+- Simulator fault `hang` (`{"kind": "hang", "node", "from_ns", "until_ns"}`,
+  `sim/src/faults.rs:162`): the node's peer server accepts every request it receives, as
+  destination or relay, and never answers or forwards it (`messages_lost_to_hang`,
+  `sim/src/node/world.rs:3061`); its own reads still run. Failed reads under a hang are split into
+  `reads_failed_on_hung_nodes` (the reader hangs), `reads_failed_rank0_hung`,
+  `reads_failed_owner_hung` and `reads_failed_other_hang`.
+
+Origin authority rules are unchanged apart from the bounded timeout rule: an overdue timeout gives
+the authority a transport failure always gave. No probe, message or credit is added (the walk's
+probes and budgets are identical in every watch state; tested), and `only_owner_hits_origin`,
+`origin_repeat_explained` (`unexplained` 0) and `budget_never_grows` hold in every run. No wire
+change.
+
+### Tests
+
+- racer-core `rank0::tests`: `a_timeout_means_fetching_until_the_request_deadline_then_overdue`,
+  `rank_zero_gets_at_least_a_request_timeout`, `an_answer_forgets_and_an_old_entry_expires`,
+  `a_rank_zero_silent_past_a_deadline_is_overdue_for_every_page`,
+  `capacity_evicts_the_oldest_page_and_bounds_silent_nodes`.
+- racer-core `walk::tests::rank_zero_watch_bounds_the_timeout_rule` (`Overdue` gives authority at
+  rank 1 and 2, `Fetching` keeps the timeout rule and gives authority after any other outcome,
+  non-owners and rank 0 ignore the state, probes and budgets are identical);
+  `owner_with_tight_links_partitions_predecessor_routes` now expects the copy-only probe of rank 0
+  to get 6 of 7 links after a failure route (was 3) and 3 of 4 otherwise.
+- Production `read::tests::timeouts::owner_page_walk_bounds_the_wait_for_a_silent_rank_zero`: rank
+  1, a stalled rank 0, a 3 s first deadline and a 5 s allowance: unavailable at 2 s and at 7 s
+  (past the deadline), origin authority at 12 s.
+- racer-sim `contention_scenarios::a_hung_rank_zero_blocks_its_pages_for_at_most_one_request_timeout`:
+  200 nodes, 10 hung for the whole run, a 100-reader storm on a cold object at 0 s and again at
+  30 s. Second storm: at most 1 failed read with the watch (the one left visits a hung rank 2 and
+  then reaches rank 1 through a hung relay, Known issue 301), at least 100 without it (199 at the
+  time of writing). `faults::tests::parses_every_kind` covers `hang`.
+- `owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch` raises `waiters_per_flight` to 128:
+  its premise is that rank 0's flight never refuses a waiter, and with copy-only probes of rank 0
+  routed first, more of them reach and join it; one found the default cap of 64 full.
+
+### Evidence
+
+Release, seed 1, 5k, configurations as in "Round 4: combined (wave 4)" (`/tmp/opencode/m6/a/` is
+the before, `/tmp/opencode/r7-hang/` the after, binary 7eec877ea). Origin: total, worst page, pages
+fetched more than once; overlap is `origin_repeats_concurrent`.
+
+| Run | Before reads ok / failed | Before origin; overlap | After reads ok / failed | After origin; overlap |
+| --- | --- | --- | --- | --- |
+| 5k storm | 378,544 / 0 | 1,024, 1, 0; 0 | 378,544 / 0 | 1,024, 1, 0; 0 |
+| 5k zipf | 202,961 / 24 | 40,324, 3, 1,388; 1,208 | 202,851 / 15 | 40,404, 3, 1,452; 1,245 |
+| 5k churn | 291,542 / 90 | 1,029, 2, 5; 0 | 291,542 / 90 | 1,029, 2, 5; 0 |
+| 5k zipf 16 MiB | 37,524 / 29 | 18,866, 3, 1,181; 1,089 | 37,631 / 32 | 17,821, 3, 132; 115 |
+| 5k 1 Gbit/s storm | 94,829 / 0 | 6,931, 3, 36; 0 | 94,829 / 0 | 6,931, 3, 36; 0 |
+| 5k full-cold-start | 94,830 / 0 | 6,931, 3, 36; 0 | 94,830 / 0 | 6,931, 3, 36; 0 |
+| 5k full-failover | 33,794 / 37 | 13,018, 5, 425; 0 | 33,799 / 31 | 12,994, 8, 412; 0 |
+| 5k full-churn | 33,996 / 1 | 13,471, 4, 852; 0 | 33,996 / 1 | 13,475, 4, 850; 0 |
+| 5k zipf, 50 members hung (watch off / on) | 30,155 / 371 | 11,700, 2, 3; 0 | 30,476 / 136 | 11,760, 2, 29; 0 |
+
+- Issue 40 by step (5k `zipf` at 16 MiB pages): the route-first change alone gives the final
+  numbers (route skips 959 to 0); the watch changes nothing there (`rank0_watch_overdue_walks` 60,
+  no overdue skip). Seed 2: overlap 104 (watch off) and 115 (seed 1); failed reads 33 and 32.
+  Range reads failed 12 to 19.
+- Default 1 MiB `zipf`: overlap 1,208 to 1,245 (seed 2: 1,015 to 1,147) and origin requests up by
+  0.2 to 0.3%, while failed reads fall 24 to 15 (seed 2: 21 to 14). Routing copy-only probes of rank
+  0 first moves skips from `route` (41 to 8) to relay-signed `Overloaded` (1,001 to 1,042), the
+  issue 302 class, because more of those probes now cross congested relays.
+- Hung members (`hang.json`: `zipf`, `request_rate` 0.1, 40 s, members 0, 100, ..., 4,900 hung for
+  the whole run): failed reads whose page's rank 0 hangs 342 to 112, a hung non-rank-0 owner 13 to
+  14, other hangs 15 to 10, the reader itself hung 1 to 0. Overdue walks 123. Pages fetched more
+  than once 3 to 29: owners fetch the pages of a hung rank 0, and rank 0's own (lost) copies do
+  not count.
+- 5k `full-failover` worst page 5 to 8; seeds 2 and 3 give 6 to 6 and 6 to 7, and pages fetched more
+  than once 425 to 412 (seed 2: 404 to 416, seed 3: 332 to 352). The run has no rank 0 timeout
+  that the watch acts on; the copy-only route change shifts which routes are taken.
+- Trace hashes match the wave 4 merge for storm, churn, 1 Gbit/s storm and full-cold-start.
+- No hard invariant failure in any run; `origin_repeat_explained` `unexplained` 0 everywhere.
+- 16-scenario smoke at 200 nodes, 1 s: clean, no invariant failure; trace hashes match the wave 4
+  merge except `churn` and `faults`.
+- `cargo fmt --check` and `cargo clippy --workspace --all-targets -D warnings` are clean; the
+  workspace tests pass (3,482 tests, `--no-fail-fast`); DST seeds 1 to 20 pass, native and not.
+
+### Deviations and open items
+
+- Issue 40 is only partly resolved: the route class had a root cause in the owner's link split and
+  is fixed; the remaining `Overloaded` class is mostly relay-signed and withholding origin after it
+  costs reads (new Known issue 302). Rank 0's own `Overloaded` (waiter cap) is rare in these runs
+  (2 rejected copy-only joins in 5k `zipf` at 16 MiB pages).
+- The rank 0 watch bounds issue 31's rule by time, so a rank 0 whose origin request stays queued
+  for more than half a request timeout is treated as hung and the owner fetches too. No run here
+  showed it (the issue 31 configuration has 60 overdue walks and no overdue skip).
+- Hang detection is per owner (new Known issue 303) and readers do not learn that a peer hangs
+  (new Known issue 301).
+- `owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch` changed its configuration (waiter cap
+  128), not its assertions; see Tests.
+
+### Open issues after wave 5 (hang)
+
+19 (partly), 25 (partly), 26 (partly), 34 to 38, 40 (partly), 301 to 303.
