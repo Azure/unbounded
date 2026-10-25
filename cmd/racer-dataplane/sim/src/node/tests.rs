@@ -176,6 +176,9 @@ fn stale_owners_send_non_owners_to_the_previous_membership() {
         config.request_rate = 40.0;
         config.node.membership_lag_ns = config.node.membership_batch_ns;
         config.node.stale_fallback = fallback;
+        // Measure the fallback alone: without it, readers would wait for the
+        // stale owners instead (Known issue 26).
+        config.node.stale_wait = false;
         run(config, 3).1
     };
     let off = with(false);
