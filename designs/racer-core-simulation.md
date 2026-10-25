@@ -3300,3 +3300,125 @@ breaks it); unit tests in `src/rdma/links/tests.rs` pin both. The harness now le
 that is not ready initiate. The native oracle passes seeds 1 to 15 and 17 to 40; seed 16 fails at
 step 0 with a `RequestContext` leak that base also has (new Known issue 145).
 
+## Round 4: join2 (wave 3)
+
+Known issues 19 (join versions cause `StaleMembership` skips and failed reads) and 20 (join
+versions cost origin fetches and seat egress). Branch `racer-sim5-join2` from racer-core-sim
+3771e5c3f. Nothing was cherry-picked.
+
+### Root causes
+
+Seat egress and full-image fallbacks (issue 20, control half):
+
+- The simulator split `ctl_full_fallbacks` by cause (`sim/src/control.rs`, `write`): client
+  skipped a version (`_skipped`), client holds the first, empty bootstrap publication (`_first`),
+  image without a delta from the client's version (`_no_delta`), or anything else (`_other`).
+  Before the fix, every fallback at 5k (11,308 in `full-cold-start`) and 96,533 of 97,931 in 50k
+  `full-failover` were `_no_delta` with a one-version gap. No client skipped a version, no base
+  hash mismatched, and no delta hit the 4 MiB cap (`MAX_DELTA_BYTES`).
+- Cause: `plan_pass` (base `cluster-control/src/step/primary.rs:246`) built a new `Image` on every
+  primary pass from the previous image. When nothing changed, the previous image has the same
+  sequence, and `Image::new` builds a delta only from an older one
+  (`cluster-control/src/authority/publication.rs:148`), so the new image had none. The cluster
+  step model installs every planned image (`cluster-control/src/step/cluster.rs:861`), so after
+  the first idle pass (at least every `LEASE_RENEW`) every client one version behind got the full
+  image.
+- Production was not affected in its bytes: the primary installs a planned image only when the
+  record changed (`install_image`, `cluster-control/src/primary.rs:679`), and seats build their
+  own images from their previous one (`cluster-control/src/seat.rs:809`). It did re-encode the
+  image and its delta on every pass. So the extra seat egress was a simulator-model artifact in
+  the shared step code, fixed there.
+- What remains is inherent: a client that applies every version receives each member once, so
+  the total is about one full image per client, which is what the single-version model sent
+  before the join gate (298 GB at 50k). The `_first` fallbacks are clients of the empty bootstrap
+  version, whose delta is no smaller than the image.
+
+`StaleMembership` skips (issue 19):
+
+- A version reaches clients over a propagation window set by seat bandwidth (at 50k, the mean
+  client lag `ctl_client_lag_ns` is 8 to 9 s and p90 about 24 s). A requester that applied version
+  N asks an owner still on N - 1; the owner answers `StaleMembership`; with nothing newer locally
+  (`stale_action`, `core/src/read/walk.rs`), the requester records a `StaleDestination`
+  (`walk.rs:690`) and asks the next owner (base `src/read/candidates.rs:1083-1088`).
+- Each such probe of an owner out of visit order is funded with a partitioned child budget
+  (`walk.rs:560`) whose credits travel to the destination and are not returned. When every owner
+  of a page is behind, three stale probes spend the read's credits: the production test below
+  shows 0 of 8 attempts left after three stale owners, and the walk ends `Exhausted`.
+- The previous membership would have served: every peer resolves N - 1 during the 30 s grace
+  window whether it is still on N - 1 or already on N, and under N - 1 the page's owners are
+  members that held the version.
+
+Origin repeats after an owner move (issue 20, origin half): the simulator now classifies
+`origin_repeats_after_move` by whether the earlier fetcher still holds the page and whether the
+new owner asked it (`sim/src/node/world.rs`, `classify_repeat`). In 50k `full-failover`, of 3,610
+such repeats: 786 asked the holder and it was unreachable (partitions and crashes), 601 had the
+holder as a version - 1 owner (most of them handoff targets left unasked for budget), 980 had the
+holder as a version - 2 owner, and 1,240 as an owner of an older version; 3 lost the copy. In 5k
+`full-churn`, 892 of 1,062 are from versions older than N - 2. Handoff (round 4, handoff) only
+ranks version - 1, and peers do not keep older memberships (grace 30 s, `Snapshot::retention`),
+so those holders are not found. This part is new Known issue 131.
+
+### Changes
+
+- `cluster-control/src/step/primary.rs` (`plan_pass`, used by production and the simulator):
+  when the prepared record equals the previous image's record, keep that image (and its delta)
+  instead of rebuilding it. Production stops re-encoding the image and its delta every pass.
+- `core/src/read/stale.rs` (new, racer-core): `previous_fallback` decides when a destination is
+  behind whether to walk the page's owners under version - 1 instead: only a non-owner (owners
+  keep their own previous-membership probes and handoff targets), only once per read (not after a
+  membership refresh or a fallback), only when version - 1 is still resolvable here, was replaced
+  within `PREVIOUS_MEMBERSHIP_WITHIN` (10 s), and lists this node (peers reject non-members).
+  `fallback_rank_allowed` refuses the walk when this node owns the page under version - 1, so
+  the fallback never gives origin authority.
+- `src/read/candidates.rs` (`resolve_epoch_traced`, `stale_fallback`): at the first stale
+  destination, if allowed, rank the page under version - 1; when this node is not an owner there,
+  abandon the current walk and walk the previous membership with the rest of the same budget;
+  otherwise keep walking the current membership. No wire format change; budgets never grow.
+- Simulator: the same (`stale_fallback`, `fallback_ranked`, `Then::Fallback` in
+  `sim/src/node/world.rs`), node knob `stale_fallback` (default on, 0 measures without it),
+  counters `stale_fallbacks`, `stale_fallback_denied`, `walk_exhausted_stale`, the
+  `ctl_full_fallbacks_*` split, and the `origin_repeats_after_move_*` split.
+
+### Tests
+
+- `step::primary::first_pass_commits_then_settles`: a pass with nothing new keeps the image and
+  its delta (fails before the fix).
+- `control::tests::churn_grows_and_shrinks` (sim): `ctl_full_fallbacks_no_delta` is 0 across 21
+  versions (12 before the fix). `combined::tests::cold_start_members_serve_before_they_are_routable`:
+  no client skips a version.
+- `racer_core::read::stale` unit tests: fallback once, only for non-owners with a recent previous
+  membership listing them; never as an owner under version - 1.
+- Dataplane `stale_owners_fall_back_to_the_recent_previous_membership`: after one stale owner, a
+  non-owner reads from the owners under version 1 (0 and 9 s after the replacement); 11 s, or
+  no version 1 listing the node, keeps one probe per owner then `Unavailable`; a fallback that
+  misses ends `Unavailable`; never the origin. Fails before the fix.
+  `stale_fallback_never_makes_a_previous_owner_fetch`: a node that owns the page under version 1
+  keeps walking version 2 and reads from its last owner, with no origin request.
+- Sim `node::tests::stale_owners_send_non_owners_to_the_previous_membership` (120 nodes, churn,
+  adoption lag equal to the batch period): walks exhausted on stale destinations 1,179 to 8 and
+  failed reads 53 to 3 with the fallback, asserted at least 10x and 4x fewer.
+
+### Evidence
+
+Release, seed 1; `storm`, `zipf`, `churn` with scenario defaults, `full-*` with
+`{"request_rate": 0.005}` (the wave 2 run config). Wave 2 numbers are from
+"Round 4: combined (wave 2)" (`/tmp/opencode/m4b/`). "Exh. stale" is walks that ended exhausted
+after a stale skip; "Full fb." is `ctl_full_fallbacks`. Logs and reports: `/tmp/opencode/r5-join2/`.
+
+| Run | Reads ok / failed | Origin (max, pages > 1) | Repeats fail / move / held | Stale skips | Exh. stale | Fallbacks | Versions | Full fb. | Seat bytes | Wall |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 5k storm, wave 2 | 268,449 / 461 | 1,024 (1, 0) | 0 / 0 / 0 | 0 | - | - | - | - | - | 1:28 |
+| 5k storm | 268,449 / 461 | 1,024 (1, 0) | 0 / 0 / 0 | 0 | 0 | 0 | - | - | - | 1:23 |
+| 5k zipf, wave 2 | 149,525 / 4,373 | 42,216 (3, 4,171) | 0 / 0 / 565 | 0 | - | - | - | - | - | 2:14 |
+| 5k zipf | 149,525 / 4,373 | 42,216 (3, 4,171) | 0 / 0 / 565 | 0 | 0 | 0 | - | - | - | 2:07 |
+| 5k churn, wave 2 | 172,701 / 450 | 1,040 (3, 15) | 0 / 9 / 7 | - | - | - | - | - | - | 1:12 |
+| 5k churn | 177,483 / 397 | 1,033 (2, 9) | 0 / 8 / 1 | 14,594 | 43 | 14,412 | - | - | - | 1:08 |
+| 5k full-cold-start, wave 2 | 94,829 / 1 | 6,946 (2, 52) | 0 / 47 / 5 | 33 | - | - | 5 | 11,308 | 5.8 GB | 0:43 |
+| 5k full-cold-start | 94,829 / 0 | 6,943 (2, 48) | 0 / 47 / 1 | 10 | 4 | 0 | 5 | 2,090 | 3.2 GB | 0:40 |
+| 5k full-failover, wave 2 | 33,804 / 23 | 13,075 (7, 458) | 408 / 59 / 169 | 89 | - | - | 6 | 11,530 | 5.9 GB | 0:53 |
+| 5k full-failover | 33,803 / 24 | 13,088 (6, 480) | 408 / 58 / 186 | 34 | 3 | 29 | 6 | 2,089 | 3.2 GB | 0:51 |
+| 5k full-churn, wave 2 | 33,988 / 4 | 13,653 (6, 991) | 51 / 1,061 / 13 | - | - | - | 21 | - | - | 0:52 |
+| 5k full-churn | 33,997 / 1 | 13,661 (6, 998) | 52 / 1,062 / 17 | 49 | 4 | 35 | 21 | 307 | 3.0 GB | 0:49 |
+| 50k full-failover, wave 2 | 299,717 / 1,527 | 52,461 (9, 6,136) | 2,138 / 3,498 / 2,451 | 15,433 | - | - | 7 | 97,931 | 562 GB | 28:37 |
+| 50k full-failover, intermediate | 301,836 / 959 | 52,385 (8, 5,952) | 2,079 / 3,566 / 2,173 | 8,925 | 3,863 | 3,005 | 7 | 1,398 | 302 GB | 28:40 |
+| 50k full-failover | 302,582 / 479 | 52,384 (9, 5,938) | 2,059 / 3,610 / 2,109 | 4,495 | 1,239 | 1,908 | 7 | 1,398 | 302 GB | 28:30 |

@@ -3372,6 +3372,16 @@ impl NodeWorld {
         }) && !fill.fallback_denied
             && self.config.node.stale_fallback;
         let (true, Some(old)) = (go, old) else {
+            // Why a non-owner could not fall back (Known issue 19).
+            if fill.rank.is_none() && !fill.retried && !fill.fell_back {
+                self.metrics.incr(if !member {
+                    "stale_fallback_not_member"
+                } else if !recent {
+                    "stale_fallback_not_recent"
+                } else {
+                    "stale_fallback_other"
+                });
+            }
             return false;
         };
         // The skipped probe completed, so nothing is pending; the walk
