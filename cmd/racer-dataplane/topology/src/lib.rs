@@ -242,6 +242,18 @@ pub struct Membership<M: Member> {
 
     /// What changed since the previous membership, if known.
     delta: Option<MembershipDelta>,
+
+    /// Position in the chain of memberships built with
+    /// [`Self::with_predecessor`]: 0 for one built without a predecessor,
+    /// otherwise the predecessor's plus one. Local: two processes that
+    /// started at different memberships number them differently.
+    generation: u32,
+
+    /// Per member, matching `ids`: the [`Self::generation`] of the first
+    /// membership in this chain that listed it without a break. Members of
+    /// a membership built without a predecessor all have 0 (unknown, at
+    /// least as old as the chain).
+    since: Vec<u32>,
 }
 
 /// One member that changed, with its position in the old and new lists.
@@ -370,7 +382,10 @@ impl<M: Member> Membership<M> {
             graph,
             owned_bytes: 0,
             delta: None,
+            generation: 0,
+            since: Vec::new(),
         };
+        membership.since = vec![0; membership.ids.len()];
         membership.owned_bytes = membership.measure_owned_bytes();
         Ok(membership)
     }
@@ -380,10 +395,14 @@ impl<M: Member> Membership<M> {
     /// Only up to [`MAX_INCREMENTAL_CHANGES`] changes are recorded. With more,
     /// nothing is recorded and placement recomputes from scratch. Replaces any
     /// earlier record. Does not keep `old` alive or change the graph.
+    ///
+    /// Also continues `old`'s lineage ([`Self::since`]): members that `old`
+    /// listed keep their arrival generation, the others arrive now.
     #[must_use]
     pub fn with_predecessor(mut self, old: &Self) -> Self {
         // Identical or over-budget replacements must not retain a stale hint.
         self.delta = None;
+        self.inherit_lineage(old);
         if self.identity == old.identity {
             return self;
         }
@@ -422,6 +441,42 @@ impl<M: Member> Membership<M> {
             changes,
         });
         self
+    }
+
+    /// Continue `old`'s lineage: one generation later, members `old` listed
+    /// keep their arrival generation and new ones arrive in this one.
+    fn inherit_lineage(&mut self, old: &Self) {
+        self.generation = old.generation.saturating_add(1);
+        let (mut a, mut b) = (0, 0);
+        while b < self.ids.len() {
+            match old.ids.get(a).map(|id| id.cmp(&self.ids[b])) {
+                Some(std::cmp::Ordering::Less) => a += 1,
+                Some(std::cmp::Ordering::Equal) => {
+                    self.since[b] = old.since[a];
+                    a += 1;
+                    b += 1;
+                }
+                _ => {
+                    self.since[b] = self.generation;
+                    b += 1;
+                }
+            }
+        }
+    }
+
+    /// This membership's position in its local chain (see
+    /// [`Self::with_predecessor`]).
+    #[must_use]
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// The generation in which the member at `position` arrived in this
+    /// chain (0: unknown, present since the chain began). A member that left
+    /// and came back arrives again. `None` if the position is out of range.
+    #[must_use]
+    pub fn since(&self, position: usize) -> Option<u32> {
+        self.since.get(position).copied()
     }
 
     /// The original records, sorted by ID.
@@ -518,6 +573,7 @@ impl<M: Member> Membership<M> {
         for id in &self.ids {
             bytes = bytes.saturating_add(id.len());
         }
+        bytes = bytes.saturating_add(self.since.capacity().saturating_mul(size_of::<u32>()));
         // Arc contains the Vec header and two atomic reference counters.
         bytes = bytes.saturating_add(size_of::<Vec<Vec<usize>>>() + 2 * size_of::<usize>());
         bytes = bytes.saturating_add(
@@ -1022,6 +1078,55 @@ mod tests {
 
     /// Changes keep both positions and stop being tracked above 64.
     #[test]
+    fn lineage_records_arrival_generations() {
+        let since = |m: &Membership<BinaryMember>, id: &[u8]| m.since(m.position(id).unwrap());
+        // Without a predecessor every member is as old as the chain.
+        let first = Membership::new(vec![member(b"a", 1), member(b"c", 1)]).unwrap();
+        assert_eq!(first.generation(), 0);
+        assert_eq!(since(&first, b"a"), Some(0));
+        assert_eq!(first.since(2), None);
+        // `b` arrives in generation 1; `a` and `c` keep 0.
+        let second = Membership::new_with_predecessor(
+            vec![member(b"a", 1), member(b"b", 1), member(b"c", 1)],
+            &first,
+        )
+        .unwrap();
+        assert_eq!(second.generation(), 1);
+        assert_eq!(since(&second, b"a"), Some(0));
+        assert_eq!(since(&second, b"b"), Some(1));
+        assert_eq!(since(&second, b"c"), Some(0));
+        // A reweight keeps the arrival; leaving and coming back arrives again.
+        let third =
+            Membership::new_with_predecessor(vec![member(b"b", 1), member(b"c", 3)], &second)
+                .unwrap();
+        assert_eq!(since(&third, b"b"), Some(1));
+        assert_eq!(since(&third, b"c"), Some(0));
+        let fourth = Membership::new_with_predecessor(
+            vec![member(b"a", 1), member(b"b", 1), member(b"c", 3)],
+            &third,
+        )
+        .unwrap();
+        assert_eq!(fourth.generation(), 3);
+        assert_eq!(since(&fourth, b"a"), Some(3));
+        // An identical replacement keeps every arrival and advances the chain.
+        let same = Membership::new(fourth.members().to_vec())
+            .unwrap()
+            .with_predecessor(&fourth);
+        assert_eq!(same.generation(), 4);
+        assert_eq!(since(&same, b"a"), Some(3));
+        assert_eq!(since(&same, b"c"), Some(0));
+        // More changes than the incremental budget still continue the chain.
+        let many: Vec<_> = (0..=MAX_INCREMENTAL_CHANGES as u32 + 1)
+            .map(|i| member(&i.to_be_bytes(), 1))
+            .chain([member(b"c", 3)])
+            .collect();
+        let big = Membership::new_with_predecessor(many, &same).unwrap();
+        assert!(big.delta.is_none());
+        assert_eq!(since(&big, b"c"), Some(0));
+        assert_eq!(since(&big, &0u32.to_be_bytes()), Some(5));
+    }
+
+    #[test]
     fn predecessor_delta_preserves_indices_and_caps_changes() {
         let old = Membership::new(vec![member(b"a", 1), member(b"c", 1), member(b"d", 1)]).unwrap();
         let new = Membership::new(vec![member(b"b", 1), member(b"c", 2), member(b"d", 1)])
@@ -1254,6 +1359,7 @@ mod tests {
             + new.ids.capacity() * size_of::<Box<[u8]>>()
             + new.ids.iter().map(|id| id.len()).sum::<usize>()
             + new.weights.capacity() * size_of::<NonZeroU32>()
+            + new.since.capacity() * size_of::<u32>()
             + new.delta.as_ref().unwrap().changes.capacity() * size_of::<MemberChange>()
             + size_of::<Vec<Vec<usize>>>()
             + 2 * size_of::<usize>()

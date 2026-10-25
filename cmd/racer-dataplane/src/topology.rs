@@ -275,6 +275,13 @@ impl Membership {
             .position(node.0.as_bytes())
             .ok_or(Error::IncompatibleMembership)
     }
+    /// The local generation in which `node` arrived in this node's
+    /// membership chain (`topology::Membership::since`); `None` for a
+    /// non-member. Placement uses it for lineage handoff targets (Known
+    /// issue 25).
+    pub fn since(&self, node: &NodeId) -> Option<u32> {
+        self.inner.since(self.inner.position(node.0.as_bytes())?)
+    }
     pub fn member(&self, node: &NodeId) -> Result<&Member> {
         Ok(&self.members()[self.position(node)?])
     }
