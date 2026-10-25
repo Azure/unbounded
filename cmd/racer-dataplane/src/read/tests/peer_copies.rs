@@ -5080,7 +5080,12 @@ fn offers_wait_out_a_cut_toward_their_site() {
             owners[0] == ordered[0] && owners[1..3].contains(&local)
         })
         .expect("a page ranked like the first");
-    assert!(candidates.note_orphan(&other, &ordered, 1));
+    assert!(candidates.note_orphan(
+        &other,
+        &ordered,
+        1,
+        &[crate::read::candidates::ProbeOutcome::CopyMiss]
+    ));
     poll(&mut f, first, 0);
     poll(
         &mut f,
@@ -5108,6 +5113,88 @@ fn offers_wait_out_a_cut_toward_their_site() {
     assert_eq!(f.fill.metrics.count(Event::OrphanOfferSent), 3);
     assert_eq!(f.fill.metrics.count(Event::OrphanOfferDelivered), 2);
     assert!(candidates.notices.borrow().is_empty());
+}
+
+/// Known issue 51: a rank 2 owner that fetched from origin offers the copy
+/// to rank 1 too when rank 1 did not answer its walk, and the offer is keyed
+/// apart from the rank 0 one; when rank 1 answered (it noted this owner
+/// then), only rank 0 is offered.
+#[test]
+fn rank_two_offers_its_origin_fetch_to_rank_one_too() {
+    use crate::telemetry::Event;
+    use racer_core::read::notice::NOTICE_DELAYS;
+    for answered in [false, true] {
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+        let _owner = queue.enter();
+        let mut f = fixture();
+        let (peers, ordered) = install_peers(&mut f, Some(2));
+        publish_same_membership(&mut f, &peers);
+        f.fill
+            .dependencies
+            .writer
+            .retention()
+            .set_ownership(Rc::new(|_| true));
+        peers
+            .replies
+            .borrow_mut()
+            .push_back((ordered[0].clone(), Reply::Stale));
+        peers.replies.borrow_mut().push_back((
+            ordered[1].clone(),
+            if answered {
+                Reply::Miss
+            } else {
+                Reply::Deadline
+            },
+        ));
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+        let result = acquire(&mut f, &mut budget);
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert_eq!(f.origin.calls.get(), 1);
+        assert_eq!(f.fill.metrics.count(Event::OrphanNotice), 1);
+        let candidates = f.fill.dependencies.candidates.clone();
+        let notices = candidates.notices.borrow().len();
+        assert_eq!(notices, if answered { 1 } else { 2 });
+        // Every offer goes to an owner ranked before this one.
+        let sent = peers.calls.borrow().len();
+        for i in 0..4u64 {
+            let fill = f.fill.clone();
+            for _ in 0..notices {
+                peers
+                    .replies
+                    .borrow_mut()
+                    .push_back((ordered[0].clone(), Reply::Miss));
+                peers
+                    .replies
+                    .borrow_mut()
+                    .push_back((ordered[1].clone(), Reply::Miss));
+            }
+            candidates.poll_offers(
+                uring_runtime::environment::now() + NOTICE_DELAYS[0] + Duration::from_secs(30 * i),
+                |page| fill.holds(page),
+                &fill.metrics,
+            );
+            drive(
+                std::future::poll_fn(|_| {
+                    if fill.metrics.count(Event::OrphanOfferSent)
+                        == fill.metrics.count(Event::OrphanOfferDelivered)
+                            + fill.metrics.count(Event::OrphanOfferFailed)
+                    {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                }),
+                &mut f.engine,
+                &f.crypto,
+            );
+        }
+        let calls = peers.calls.borrow();
+        let targets: Vec<_> = calls[sent..].iter().map(|c| c.0.clone()).collect();
+        assert_eq!(targets.len(), notices, "{targets:?}");
+        assert!(targets.contains(&ordered[0]));
+        assert_eq!(targets.contains(&ordered[1]), !answered);
+        assert!(candidates.notices.borrow().is_empty());
+    }
 }
 
 /// Known issue 37: a page this node no longer holds is not offered, and a

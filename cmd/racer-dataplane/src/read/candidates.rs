@@ -134,8 +134,9 @@ impl Drop for OfferFlight {
 }
 
 /// Orphan notices grouped by their target's site (Known issue 50).
+/// Keyed by page and the target's owner rank (Known issue 51).
 pub(crate) type Notices =
-    racer_core::read::notice::OrphanNotices<crate::model::PageId, NodeId, String>;
+    racer_core::read::notice::OrphanNotices<(crate::model::PageId, u8), NodeId, String>;
 
 /// How a copy offer ended (Known issue 50).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2438,21 +2439,29 @@ impl CandidatePolicy {
         page: &crate::model::PageId,
         owners: &[NodeId],
         rank: usize,
+        evidence: &[ProbeOutcome],
     ) -> bool {
-        use racer_core::read::notice::should_notice;
-        let Some(rank0) = owners.first() else {
-            return false;
-        };
-        if !should_notice(Some(rank)) || owners.get(rank) != Some(&self.node) || rank0 == &self.node
-        {
+        use racer_core::read::notice::{notice_indexes, should_notice};
+        if !should_notice(Some(rank)) || owners.get(rank) != Some(&self.node) {
             return false;
         }
-        self.notices.borrow_mut().note(
-            page.clone(),
-            rank0.clone(),
-            uring_runtime::environment::now(),
-        );
-        true
+        let now = uring_runtime::environment::now();
+        let mut noted = false;
+        // Rank 0 and, for a holder at rank 2, rank 1 unless it answered
+        // this owner's walk (Known issue 51).
+        for index in notice_indexes(Some(rank), evidence) {
+            let Some(target) = owners.get(usize::from(index)) else {
+                continue;
+            };
+            if target == &self.node {
+                continue;
+            }
+            self.notices
+                .borrow_mut()
+                .note((page.clone(), index), target.clone(), now);
+            noted = true;
+        }
+        noted
     }
 
     /// Send due copy offers (Known issue 37), at most
@@ -2488,7 +2497,7 @@ impl CandidatePolicy {
                 return;
             };
             let group = site(&due.target);
-            if !holds(&due.key) {
+            if !holds(&due.key.0) {
                 self.notices.borrow_mut().release(&group);
                 continue;
             }
@@ -2621,10 +2630,10 @@ impl CandidatePolicy {
     /// (membership or route lookup).
     async fn offer(
         &self,
-        due: &racer_core::read::notice::Due<crate::model::PageId, NodeId>,
+        due: &racer_core::read::notice::Due<(crate::model::PageId, u8), NodeId>,
     ) -> Result<OfferEnd> {
         use racer_core::read::notice::{NOTICE_LINKS, notice_target};
-        let page = &due.key;
+        let (page, index) = (&due.key.0, due.key.1);
         let deadline = uring_runtime::environment::now() + self.attempt_timeout;
         let mut id = [0; 16];
         uring_runtime::environment::fill_random(&mut id).map_err(|_| Error::Unavailable)?;
@@ -2645,7 +2654,7 @@ impl CandidatePolicy {
             .await?
             .ordered;
         owners.truncate(3);
-        let Some(target) = notice_target(&self.node, &owners, true) else {
+        let Some(target) = notice_target(&self.node, &owners, true, index) else {
             return Ok(OfferEnd::Dropped);
         };
         let context = OriginContext {
@@ -2846,6 +2855,11 @@ impl OriginAuthority {
     /// The canonical rank this authority was granted at.
     pub(crate) fn rank(&self) -> usize {
         self.rank
+    }
+
+    /// The predecessors' answers this authority rests on, in rank order.
+    pub(crate) fn predecessor_evidence(&self) -> &[ProbeOutcome] {
+        &self.predecessor_evidence
     }
 
     pub fn validate(&self, object: &ObjectId, page: PageNumber) -> Result<()> {

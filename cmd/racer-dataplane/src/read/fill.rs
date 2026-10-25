@@ -2240,6 +2240,7 @@ impl Fill {
                             page,
                             &candidates.ordered,
                             authority.rank(),
+                            authority.predecessor_evidence(),
                         ) {
                             self.metrics.record(Event::OrphanNotice, 1);
                         }

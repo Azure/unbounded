@@ -20,7 +20,19 @@
 //! shed) is tried again after the next delay, at most [`NOTICE_TRIES`] times
 //! over about [`NOTICE_SPAN`] (longer than the simulator's 90 s partitions).
 //!
-//! Bounds: one notice per origin fetch by an owner above rank 0; each sends
+//! Every predecessor (Known issue 51). A holder at rank 2 also offers the
+//! copy to rank 1: when rank 1 later cannot reach rank 0 it fetches the page
+//! itself, and it asks only later owners it has a hint for (its successor
+//! targets). Without the offer it had none whenever the holder's own walk
+//! did not reach it, and fetched again although the holder was its own
+//! successor (5k `full-failover`, seeds 1 to 3: 9 of 43 orphan repeats, all
+//! minutes after the holder's fetch). So a fetch notes one notice per owner
+//! ranked before the holder that did not answer its walk ([`notice_indexes`]),
+//! keyed by the page and that rank, each scheduled and bounded like the rank
+//! 0 notice.
+//!
+//! Bounds: one notice per origin fetch by an owner above rank 0 and owner
+//! ranked before it (at most two); each sends
 //! at most [`NOTICE_TRIES`] offers, each funded by its own fixed route grant
 //! ([`NOTICE_LINKS`] links, no attempts), never by a reader's budget. At most
 //! [`NOTICE_CAPACITY`] notices are pending per node (the oldest give way). An
@@ -414,12 +426,43 @@ pub fn should_notice(rank: Option<usize>) -> bool {
     rank.is_some_and(|r| r > 0)
 }
 
-/// Where a due notice goes under the current membership: the page's rank 0,
-/// when `local` still holds the page and is still an owner ranked after it.
-/// `None` drops the notice.
-pub fn notice_target<N: PartialEq + Clone>(local: &N, owners: &[N], holds: bool) -> Option<N> {
+/// The owner ranks an origin fetch at `rank` notices (Known issue 51): rank
+/// 0, and each later owner ranked before this one that did not answer this
+/// owner's walk without a copy (`evidence[i]`, the walk's predecessor
+/// evidence in rank order, is not `CopyMiss` or `VersionUnavailable`). An
+/// owner that did answer noted this one as a successor hint then, so an
+/// offer would only repeat that. Rank 0 is always noticed (its offer also
+/// re-arms a hint its successor probe may have spent before this fetch
+/// ended, Known issue 37). Empty unless [`should_notice`].
+pub fn notice_indexes(
+    rank: Option<usize>,
+    evidence: &[crate::read::candidates::ProbeOutcome],
+) -> Vec<u8> {
+    use crate::read::candidates::ProbeOutcome;
+    (0..rank.map_or(0, |r| r.min(2)))
+        .filter(|i| {
+            *i == 0
+                || !matches!(
+                    evidence.get(*i),
+                    Some(ProbeOutcome::CopyMiss | ProbeOutcome::VersionUnavailable)
+                )
+        })
+        .map(|i| i as u8)
+        .collect()
+}
+
+/// Where a due notice for owner rank `index` goes under the current
+/// membership: the page's owner at that rank, when `local` still holds the
+/// page and is still an owner ranked after it. `None` drops the notice.
+pub fn notice_target<N: PartialEq + Clone>(
+    local: &N,
+    owners: &[N],
+    holds: bool,
+    index: u8,
+) -> Option<N> {
     let rank = owners.iter().position(|o| o == local)?;
-    (holds && rank > 0).then(|| owners[0].clone())
+    let index = usize::from(index);
+    (holds && index < rank).then(|| owners[index].clone())
 }
 
 /// Whether a node receiving an offer notes the requester as a successor
@@ -573,11 +616,34 @@ mod tests {
     #[test]
     fn target_is_current_rank_zero_while_held() {
         let owners = [5u32, 7, 9];
-        assert_eq!(notice_target(&7, &owners, true), Some(5));
-        assert_eq!(notice_target(&9, &owners, true), Some(5));
-        assert_eq!(notice_target(&7, &owners, false), None);
-        assert_eq!(notice_target(&5, &owners, true), None);
-        assert_eq!(notice_target(&8, &owners, true), None);
+        assert_eq!(notice_target(&7, &owners, true, 0), Some(5));
+        assert_eq!(notice_target(&9, &owners, true, 0), Some(5));
+        assert_eq!(notice_target(&7, &owners, false, 0), None);
+        assert_eq!(notice_target(&5, &owners, true, 0), None);
+        assert_eq!(notice_target(&8, &owners, true, 0), None);
+        // Known issue 51: rank 2 also offers to rank 1; rank 1 does not
+        // offer to itself or to a later owner.
+        assert_eq!(notice_target(&9, &owners, true, 1), Some(7));
+        assert_eq!(notice_target(&7, &owners, true, 1), None);
+        assert_eq!(notice_target(&9, &owners, true, 2), None);
+    }
+
+    #[test]
+    fn a_fetch_notices_every_owner_before_it_that_did_not_answer() {
+        use crate::read::candidates::ProbeOutcome::*;
+        assert!(notice_indexes(None, &[]).is_empty());
+        assert!(notice_indexes(Some(0), &[]).is_empty());
+        assert_eq!(notice_indexes(Some(1), &[CopyMiss]), [0]);
+        assert_eq!(notice_indexes(Some(2), &[CopyMiss, Unreachable]), [0, 1]);
+        assert_eq!(notice_indexes(Some(2), &[Unreachable, Overloaded]), [0, 1]);
+        assert_eq!(notice_indexes(Some(2), &[Unreachable, CopyMiss]), [0]);
+        assert_eq!(
+            notice_indexes(Some(2), &[Unreachable, VersionUnavailable]),
+            [0]
+        );
+        // Missing evidence counts as not answered.
+        assert_eq!(notice_indexes(Some(2), &[Unreachable]), [0, 1]);
+        assert_eq!(notice_indexes(Some(5), &[]), [0, 1]);
     }
 
     #[test]
