@@ -386,7 +386,11 @@ Verified against the code at the start of this work.
    Was: the relay hold from the capacity track makes the 5k hot-page scenarios shed on the `Relay`
    quota (`zipf` 4,373 failed reads, 339,136 relay rejections after the wave 2 merge).
 
-19. Partly resolved (round 4, join2, b08235140, 7aacc03ae): a non-owner whose owner is behind
+19. Resolved (round 4, stale, wave 5, 9ceb9fa79, 1f65aa0b9): with seats woken by each commit and
+   readers that rank the previous membership before skipping, no 50k `full-cold-start` walk ends
+   exhausted on a stale owner (was 448). 50k `full-failover` was not rerun in that track. See
+   Known issues 26 and 36 and "Round 4: stale (wave 5)".
+   Earlier: partly resolved (round 4, join2, b08235140, 7aacc03ae): a non-owner whose owner is behind
    walks the page's owners under the recent previous membership once instead of spending its
    credits on each stale owner (`racer_core::read::stale`). 50k failed reads: `full-failover`
    1,527 to 479, `full-cold-start` 1,103 to 247. What remains are readers that joined in the
@@ -477,7 +481,9 @@ Verified against the code at the start of this work.
    version - 2 holder and 1,240 an older one; 5k `full-churn`: 892 of 1,062 older than
    version - 2 (round 4, join2).
 
-26. Partly resolved (round 4, history, wave 4, f0780ecab, 3e6dd0ed4): a reader that cannot walk
+26. Resolved (round 4, stale, wave 5): the remainder was Known issue 36; 50k `full-cold-start`
+   failed reads 93 to 8, none of them on a stale owner. See "Round 4: stale (wave 5)".
+   Earlier: partly resolved (round 4, history, wave 4, f0780ecab, 3e6dd0ed4): a reader that cannot walk
    the previous membership waits once for an owner that is behind (a third of the time left, at
    most 4 s) and asks it again (`racer_core::read::stale::stale_wait`), and a verified
    `StaleMembership` returns the remote credits the request carried
@@ -575,7 +581,19 @@ Verified against the code at the start of this work.
    moved-page repeats 894 to 678 but raised failed reads 1 to 29 (5k `full-churn`). Open
    (round 4, history, wave 4).
 
-36. A reader waits only once for an owner that is behind (`stale_wait`); at 50k the propagation
+36. Resolved (round 4, stale, wave 5, 9ceb9fa79, 1f65aa0b9). Two causes. Control plane: a commit
+   did not change the primary Lease, so seat followers read it only on their 5 s
+   `FOLLOW_INTERVAL` (`cluster-control/src/seat.rs`, `follower`); seats served a commit 0 to 5 s
+   late (50k mean 3.1 s), which set members up to 9.6 s apart. The primary now publishes the
+   committed sequence on its Lease (`annotations::SEQUENCE`), which wakes every seat follower:
+   seat lag max 5.0 to 0.9 s, member adoption spread max 9.4 to 4.9 s (50k `enrollment-storm`).
+   The "client lag p90 24 s" was mostly enrollment (lag counts from the client's start), not
+   propagation. Reader: a reader that owns the page under version - 1 learned that it may not
+   fall back only after it had skipped the stale owner, so it never waited (every one of the 330
+   remaining stale exhaustions after the seat fix). Production and the simulator now rank first.
+   50k `full-cold-start` failed reads 93 to 8, walks exhausted on stale owners 448 to 0. See
+   "Round 4: stale (wave 5)".
+   Was: a reader waits only once for an owner that is behind (`stale_wait`); at 50k the propagation
    window (client lag p90 about 24 s) is longer than the wait, so 95 reads still fail in
    `full-cold-start` (57 to 161 s, during enrollment). Open (round 4, history, wave 4).
 
@@ -668,6 +686,22 @@ Verified against the code at the start of this work.
    probe of the holder fails in transport; and an owner above rank 0 that skips rank 0 itself
    refetches a page another owner above rank 0 holds (the `skip` side, which offers to rank 0 do not
    address). 119 left over 5k `full-failover` seeds 1 to 10. Open (round 4, orphan3, wave 5).
+
+321. 50k `full-cold-start` still fails 8 reads (`Unavailable`, 106 to 157 s, during enrollment),
+   none after a stale skip (`walk_exhausted_stale` 0); not classified further (round 4, stale,
+   wave 5).
+
+322. A seat follower takes the `shared.changed` generation after `follow_once`
+   (`cluster-control/src/seat.rs`, `follower`), so a primary Lease change that arrives during the
+   read is not seen until the next `FOLLOW_INTERVAL`. Taking it before the read would wake the
+   follower every second, because `install_record` notifies the same signal. Rare (the window is
+   one GET); not modeled (round 4, stale, wave 5).
+
+323. The second stale wait (`MAX_STALE_WAITS` 2) is never taken at 50k `full-cold-start`
+   (`stale_waits_again` 0): a default read (8 attempts, 16 links, 4 links per funded route)
+   cannot afford another exchange and still fund its later owners
+   (`CandidateWalk::retry_affordable`), except at its last owner. Kept because it is bounded and
+   harmless; whether to fund it is open (round 4, stale, wave 5).
 
 ## Simulator engine (racer-sim substrate)
 
@@ -1117,7 +1151,9 @@ scenarios carry data-plane faults.
 18. Resolved: relays no longer hold their transmit side idle for bodies queued upstream (a
    simulator artifact); 5k `zipf` fails 17 reads (was 4,373), `storm` 0 (was 461) (round 4, relay,
    wave 3, 0eba3d9c8).
-19. Partly resolved: non-owners whose owners are behind walk the recent previous membership;
+19. Resolved: seats wake on commits and readers rank the previous membership before skipping;
+   50k `full-cold-start` stale exhaustions 448 to 0 (round 4, stale, wave 5). Earlier: partly
+   resolved: non-owners whose owners are behind walk the recent previous membership;
    50k failed reads 1,527 to 479 (failover) and 1,103 to 247 (cold start); the rest is 26
    (round 4, join2).
 20. Resolved: images keep their delta across idle primary passes; 50k seat replies 562 to 302 GB,
@@ -1136,7 +1172,8 @@ scenarios carry data-plane faults.
 25. Resolved: owners ask, and readers visit first, later owners that arrived before them
    (lineage, round 4, history, wave 4), plus demoted members, all on their own grants (round 4,
    lineage, wave 5); 5k `full-churn` moved-page repeats 884 to 188.
-26. Partly resolved: readers that cannot fall back wait once for an owner that is behind, and
+26. Resolved: rest was 36 (round 4, stale, wave 5). Earlier: partly resolved: readers that
+   cannot fall back wait once for an owner that is behind, and
    stale answers refund their remote credits; 50k `full-cold-start` failed reads 248 to 95; rest
    is 36 (round 4, history, wave 4).
 27. Resolved: DST harness only let the survivor set up a half-open link after a peer
@@ -1157,7 +1194,10 @@ scenarios carry data-plane faults.
    were owners on arrival (round 4, lineage, wave 5).
 35. Resolved: lineage probes run on their own grant, like successor probes (round 4, lineage,
    wave 5).
-36. One wait does not cover the 50k propagation window: 95 failed reads in `full-cold-start`
+36. Resolved: the primary publishes each commit on its Lease so seats serve it within 1 s, and
+   previous owners wait instead of skipping; 50k `full-cold-start` failed reads 93 to 8 (round 4,
+   stale, wave 5). Was: one wait does not cover the 50k propagation window: 95 failed reads in
+   `full-cold-start`
    (round 4, history, wave 4).
 37. Resolved: orphan holders offer their copy to rank 0 later; orphan repeats 50k `full-failover`
    850 to 192, 5k 542 to 119 over seeds 1 to 10 (round 4, orphan3, wave 5).
@@ -1184,6 +1224,10 @@ scenarios carry data-plane faults.
 302. Owners take origin authority from a relay-signed `Overloaded` on the route to rank 0 (round 4,
    hang, wave 5).
 303. Each owner learns on its own that a rank 0 hangs (round 4, hang, wave 5).
+321. 50k `full-cold-start` still fails 8 reads, none after a stale skip (round 4, stale, wave 5).
+322. A seat follower misses a primary Lease change that arrives during its read until its next
+   `FOLLOW_INTERVAL` (round 4, stale, wave 5).
+323. The second stale wait is almost never affordable for a default read (round 4, stale, wave 5).
 
 ## Round 2: production admission
 
@@ -4890,3 +4934,179 @@ fetched more than once; overlap is `origin_repeats_concurrent`.
 ### Open issues after wave 5 (hang)
 
 19 (partly), 25 (partly), 26 (partly), 34 to 38, 40 (partly), 301 to 303.
+
+p='designs/racer-core-simulation.md'; s=open(p).read()
+a="""   pages. Open (round 4, overload, wave 4).
+"""
+assert s.count(a)==1
+s=s.replace(a,a+"""
+321. 50k `full-cold-start` still fails 8 reads (`Unavailable`, 106 to 157 s, during enrollment),
+   none after a stale skip (`walk_exhausted_stale` 0); not classified further (round 4, stale,
+   wave 5).
+
+322. A seat follower takes the `shared.changed` generation after `follow_once`
+   (`cluster-control/src/seat.rs`, `follower`), so a primary Lease change that arrives during the
+   read is not seen until the next `FOLLOW_INTERVAL`. Taking it before the read would wake the
+   follower every second, because `install_record` notifies the same signal. Rare (the window is
+   one GET); not modeled (round 4, stale, wave 5).
+
+323. The second stale wait (`MAX_STALE_WAITS` 2) is never taken at 50k `full-cold-start`
+   (`stale_waits_again` 0): a default read (8 attempts, 16 links, 4 links per funded route)
+   cannot afford another exchange and still fund its later owners
+   (`CandidateWalk::retry_affordable`), except at its last owner. Kept because it is bounded and
+   harmless; whether to fund it is open (round 4, stale, wave 5).
+""",1)
+a="""   that is fetching (1,088 overlapping requests left) (round 4, overload, wave 4).
+"""
+assert s.count(a)==1
+s=s.replace(a,a+"""321. 50k `full-cold-start` still fails 8 reads, none after a stale skip (round 4, stale, wave 5).
+322. A seat follower misses a primary Lease change that arrives during its read until its next
+   `FOLLOW_INTERVAL` (round 4, stale, wave 5).
+323. The second stale wait is almost never affordable for a default read (round 4, stale, wave 5).
+""",1)
+s=s.rstrip('\n')+'\n'+open('/dev/stdin').read()
+open(p,'w').write(s)
+
+## Round 4: stale (wave 5)
+
+Known issues 19 and 26 (remainders) and 36 (one stale wait does not cover the 50k membership
+propagation window). Branch `racer-sim7-stale` from racer-core-sim 113a0990d. Logs, reports and
+binaries: `/tmp/opencode/r7-stale/`.
+
+### Root causes
+
+Measured first: the simulator gained `ctl_seat_lag_ns` (commit to a seat serving it),
+`ctl_member_lag_ns` (commit to a client that already held a membership applying it) and
+`ctl_adopt_spread_ns` (how long after the first client each later client applies a membership
+version), in `sim/src/control.rs`. In 50k `enrollment-storm` (seed 1, 300 s) before the fix:
+
+| Metric | mean | p50 | p90 | max |
+| --- | --- | --- | --- | --- |
+| `ctl_client_lag_ns` | 9.3 s | 4.8 s | 30.1 s | 55.6 s |
+| `ctl_seat_lag_ns` | 3.1 s | 3.8 s | 4.3 s | 5.0 s |
+| `ctl_member_lag_ns` | 3.7 s | 3.8 s | 7.0 s | 9.6 s |
+| `ctl_adopt_spread_ns` | 3.4 s | 2.7 s | 5.9 s | 9.4 s |
+
+- The "client lag p90 about 24 s" in Known issue 36 is mostly enrollment: `ctl_client_lag_ns`
+  counts from the client's start when it started after the commit, and enrollment takes 69 s at
+  the median at 50k. What a reader meets is the adoption spread: at most 9.4 s.
+- About half of that spread was the seats. A seat follower reads the state Secret every
+  `FOLLOW_INTERVAL` (5 s), or earlier when its process's `shared.changed` signal fires
+  (`cluster-control/src/seat.rs`, `follower`). The signal fires on any primary Lease change
+  (`apply_primary`), but a commit does not change the Lease: the primary only renews it every
+  `LEASE_RENEW` (10 s) or when discovery annotations change (`cluster-control/src/primary.rs`,
+  `update_discovery`). So each seat served a commit 0 to 5 s late, and clients of different seats
+  adopted it up to 5 s apart before any write queueing. The step model
+  (`cluster-control/src/step/cluster.rs`) modeled the 5 s poll only.
+- The rest is the seats' write window: every client receives the new image or its delta through
+  64 write slots per seat at the seat's bandwidth (50,000 deltas of about 2 MB over 16 seats at
+  10 Gbit/s is about 5 s). That is bandwidth, inherent to pushing a membership to every client.
+- Reader side, measured in 50k `full-cold-start` with the seat fix alone: 68 failed reads and
+  330 walks exhausted on a stale owner, and `stale_fallback_denied` was 330 as well. Each was a
+  reader that owns the page under version - 1 but not under version N. It may not walk version -
+  1 (`fallback_rank_allowed`: that would give it origin authority), but production and the
+  simulator found that out only after ranking the page there, which they did after they had
+  already skipped the stale owner (`src/read/candidates.rs`, `resolve_epoch_traced`; the
+  simulator's `stale_fallback`). The skip spent its one wait opportunity: `stale_wait` refuses
+  while a fallback looks possible. None of those readers was a reader that joined in N
+  (`stale_fallback_not_member` 0).
+
+### Changes
+
+- Production control plane (`cluster-control`): the primary publishes the committed sequence on
+  its Lease (`annotations::SEQUENCE`, set by `step::primary::discovery`). A commit changes the
+  discovery annotations, so `renew` rewrites the Lease at once (`publish` signal), every Pod
+  watching the Lease sees it, and seat followers read the state within their 1 s floor. Cost:
+  one Lease write per commit, fanned out to every watcher like a renewal (50k
+  `enrollment-storm`: watch events 1.75 M to 1.95 M).
+- Step model: `wake_followers` on every primary Lease write (renewals, discovery changes and the
+  commit's sequence), a 50 ms watch delay and the 1 s read floor; a superseded `Ev::Follow` is
+  ignored (`Pod::follow_at`).
+- Readers (`src/read/candidates.rs` and the simulator): rank the page under version - 1 before
+  deciding between the fallback, a wait and a skip, so a reader that owns the page there waits
+  for the stale owner like a reader that joined in N. In the simulator the stale reply waits for
+  the ranking (`stale_rank_first`, `deferred_skip`) and `fallback_ranked` then walks version - 1,
+  waits, or skips.
+- `racer_core::read::stale`: `MAX_STALE_WAITS` 2. A wait after the first needs
+  `CandidateWalk::retry_affordable`: one more exchange must leave every later visit its minimum
+  attempts (`owner_funding_min`) and a route share of links. Budgets never grow.
+- Simulator counters: `stale_waits_again`, `stale_waits_denied`, and the three control metrics
+  above.
+
+### Tests
+
+- `step::cluster::tests::seats_serve_a_commit_within_a_second` (fails without the wake) and the
+  `SEQUENCE` assertions in `step::primary::tests::discovery_lists_ready_seats_and_vacancies`.
+- `racer_core::read::stale::tests::a_reader_that_cannot_fall_back_waits_twice`,
+  `no_wait_for_owners_fallbacks_repeats_or_short_deadlines` (unaffordable second wait),
+  `read::walk::tests::retry_affordable_keeps_later_visits_funded`.
+- Production `readers_that_cannot_fall_back_wait_for_an_owner_that_is_behind` (adopts after the
+  first or the second wait; still behind; a default budget takes one wait) and
+  `stale_fallback_never_makes_a_previous_owner_fetch` (with a timer the previous owner now waits
+  for the stale owner and reads from it; fails before the change).
+- Simulator `node::tests::previous_owners_wait_instead_of_skipping_owners_that_are_behind`: every
+  denied fallback waits, no walk ends exhausted on a stale owner.
+
+### Evidence
+
+Release, seed 1, the wave 4 configurations (`/tmp/opencode/m6/`); base numbers from
+`/tmp/opencode/m6/` and, for the control scenarios, the wave 4 binary rerun at 5k. "Exh. stale"
+is walks that ended exhausted after a stale skip.
+
+| Run | Base reads ok / failed | Base origin | Reads ok / failed | Origin | Exh. stale |
+| --- | --- | --- | --- | --- | --- |
+| 5k storm | 378,544 / 0 | 1,024 | 378,544 / 0 | 1,024 | 0 |
+| 5k zipf | 202,961 / 24 | 40,324 | 202,961 / 24 | 40,324 | 0 |
+| 5k churn | 291,502 / 91 | 1,029 | 291,542 / 90 | 1,029 | 0 |
+| 5k zipf 16 MiB | 37,524 / 29 | 18,866 | 37,524 / 29 | 18,866 | 0 |
+| 5k full-cold-start | 94,829 / 0 | 6,934 | 95,159 / 0 | 6,989 | 0 |
+| 5k full-cold-start 1 Gbit/s | 94,828 / 0 | 6,934 | 95,158 / 0 | 6,989 | 0 |
+| 5k full-failover | 33,795 / 34 | 12,986 | 33,986 / 27 | 13,024 | 0 (was 3) |
+| 5k full-churn | 33,997 / 1 | 13,481 | 34,043 / 0 | 13,468 | 0 (was 4) |
+| 50k full-cold-start | 911,703 / 93 | 28,936 | 913,195 / 8 | 28,972 | 0 (was 448) |
+| 50k full-cold-start, seat fix only | - | - | 913,098 / 68 | 28,937 | 330 |
+
+Control scenarios (5k, 600 s scenario defaults; 50k `enrollment-storm` 300 s):
+
+| Run | All enrolled | Client lag p90 | Member lag p90 / max | Seat lag max | Reply bytes |
+| --- | --- | --- | --- | --- | --- |
+| 5k enrollment-storm, base | 31.4 s | 7.0 s | - | - | 3.17 GB |
+| 5k enrollment-storm | 25.2 s | 4.3 s | 0.4 / 0.9 s | 0.9 s | 2.97 GB |
+| 5k ctl-churn, base | 11.3 s | 3.8 s | - | - | 3.03 GB |
+| 5k ctl-churn | 10.0 s | 0.1 s | 0.1 / 0.9 s | 0.9 s | 3.02 GB |
+| 5k lagging, base | 31.0 s | 6.4 s | - | - | 3.26 GB |
+| 5k lagging | 26.6 s | 4.0 s | 0.4 / 79 s (slow clients) | 0.9 s | 2.98 GB |
+| 50k enrollment-storm, base | 172.8 s | 30.1 s | 7.0 / 9.6 s | 5.0 s | 302 GB |
+| 50k enrollment-storm | 170.7 s | 27.9 s | 3.2 / 5.0 s | 0.9 s | 298 GB |
+
+Reading the tables:
+
+- 50k `full-cold-start`: failed reads 93 to 8, stale skips 2,440 to 833, walks exhausted on a
+  stale owner 448 to 0. 143 previous owners waited instead of skipping
+  (`stale_waits_denied`). Origin requests 28,936 to 28,972 (worst page 4, unchanged);
+  `origin_repeat_explained` holds (`unexplained` 0). Peak RSS 4.6 GB (was 4.5), wall 21:03.
+- 5k: unchanged where there is no membership change (storm, zipf, zipf 16 MiB). The `full-*`
+  runs complete 46 to 330 more reads: clients get their first membership sooner, so nodes start
+  reading sooner, which also adds a few origin requests in `full-cold-start` (6,934 to 6,989)
+  for the extra reads.
+- Control: seats serve a commit within 0.9 s; members adopt within 5.0 s at 50k (was 9.6 s); the
+  remaining spread is the seats' write bandwidth. Enrollment finishes earlier at 5k (31.4 to
+  25.2 s): new clients wait less for a seat to serve.
+- Hard invariants hold in every run above and in all 16 scenarios at 200 nodes, 1 s.
+
+### Bounds
+
+- A seat serves a commit within the follower's 1 s read floor plus the watch delay
+  (`seats_serve_a_commit_within_a_second`).
+- A read waits at most `MAX_STALE_WAITS` (2) times, each at most a third of the time left and 4 s;
+  a second wait only while every later visit stays funded. The wait never gives origin authority
+  (readers only; `only_owner_hits_origin` holds) and budgets never grow (`budget_never_grows`).
+
+### Deviations and open items
+
+- The second wait is almost never affordable with the default read budget (Known issue 323);
+  the 50k gain comes from the seat wake and from ranking before skipping.
+- Seat write bandwidth (about 5 s per membership version at 50k) was not changed; it is the cost
+  of sending every client its delta.
+- 50k `full-failover` was not rerun in this track.
+- New Known issues 321 (8 failed reads left), 322 (follower generation race), 323.
