@@ -421,11 +421,20 @@ Verified against the code at the start of this work.
    join track's membership versions and handoff's previous-owner probes change the storm's walks).
    With the relay fix: 63,745 / 31,084. Not root-caused (round 4, relay, wave 3).
 
-122. `flight_leader_valid` fails in 5k `zipf` at production page size under origin overload
-   (`page_bytes` 16 MiB, `request_rate` 1.25, 8 s; seed 1): 374 violations on the base 3771e5c3f
-   and 376 with the relay fixes, all `finish page P leader L: Err(Internal)` from
-   `PageFlights::finish` (`core/src/read/flight.rs:295`) after about 5.5 s, when origin demand is
-   about 16 times its 5 GB/s. Never seen with 1 MiB pages. Not root-caused (round 4, relay,
+122. Resolved: `flight_leader_valid` failed in 5k `zipf` at production page size under origin
+   overload because `racer_core::read::flight::PageFlights` did not model production's retained
+   flight operations; the simulator now retains each fill like production (374 violations on
+   3771e5c3f, 376 with the relay fixes, 0 after). See "Round 4: flight (wave 3)" (round 4,
+   flight, wave 3).
+
+151. A fill whose leader's deadline passed keeps running until origin answers. Production's fill
+   driver cancels its owned scope once the leader is revoked (`src/read/fill.rs`,
+   `operation.cancellation_requested()` then `owned_scope.cancel()`), which completes the flight
+   operation at about the deadline. The simulator cannot model that faithfully yet because the
+   origin model (`sim/src/resources.rs`, `Origin::request`) reserves FIFO bandwidth up front and
+   never refunds a canceled request: a trial that canceled at the deadline without a refund wasted
+   origin bandwidth and cut origin fills in 5k `zipf` at 16 MiB from 2,372 to 1,584. Flights in the
+   simulator therefore drain later than in production under origin overload (round 4, flight,
    wave 3).
 
 ## Simulator engine (racer-sim substrate)
@@ -885,8 +894,11 @@ scenarios carry data-plane faults.
 22. Resolved: the simulator debits the origin attempt like production (round 4, repeat).
 121. The wave 2 merge lost most of fan-out's gain in the 5k 1 Gbit/s `full-cold-start` 1 s storm
    (102 to 38,430 failed reads) (round 4, relay, wave 3).
-122. `flight_leader_valid` fails (`Err(Internal)`) in origin-overloaded 5k `zipf` with 16 MiB
-   pages (round 4, relay, wave 3).
+122. Resolved: core `PageFlights` retains leader operations like production `Flights`; the
+   simulator retains each fill (round 4, flight, wave 3).
+151. The origin model does not refund bandwidth for a canceled request, so the simulator lets a
+   fill whose leader expired run to origin completion instead of canceling it at the deadline
+   like production (round 4, flight, wave 3).
 
 ## Round 2: production admission
 
@@ -2809,3 +2821,92 @@ max per page, pages fetched more than once. Repeats are `after_failure` / `after
 - `flight_leader_valid` fails in origin-overloaded `zipf` with 16 MiB pages on the base too (new
   Known issue 122).
 - Hedges still do not ask the helper (off by default; see Changes).
+
+## Round 4: flight (wave 3)
+
+Branch `racer-sim5-flight`, based on `racer-sim5-relay` (b06192038). Resolves Known issue 122.
+Evidence logs and configs: `/tmp/opencode/r5-flight/`.
+
+### Root cause
+
+The bug was in core `PageFlights`, which did not model a production mechanism. Production is
+correct and is unchanged.
+
+- Production retains each fill as a flight operation before submitting it (`src/read/fill.rs`,
+  `retain_operation`), and every settlement passes `entry.operations.is_empty()` as the idle flag
+  (`src/read/flight.rs`, `settle` and `refresh`). A leader revoked because its deadline passed or
+  it was canceled therefore leaves the flight in `Draining` until the operation completes. No other
+  waiter is elected in that time, and the entry is not removed (`quiescent` requires no waiters and
+  no operations). The driver completes the operation, then publishes, and ignores the
+  `StaleFlight` that a revoked leader gets (`let _ = flights.publish_acquired(..)`).
+- Core `PageFlights` always passed `idle = true` (the old `finish`, `reject`, and `refresh`). Once
+  the leader's deadline passed, the flight settled to a retry at once. When the leader detached,
+  the flight was removed. A later reader then created a new flight and led a second fill while the
+  first fill still waited on origin. When the first fill finished, `PageFlights::finish` rejected
+  the stale leader (`validate_leader`) with `Err(Internal)`, and the simulator's
+  `flight_leader_valid` check (`sim/src/node/world.rs`, `finish_fill`) counted that as a
+  violation.
+- This only happens when a fill outlives its leader's deadline. In the simulator that means an
+  origin request still queued when the deadline passes, because the origin model reserves FIFO
+  bandwidth and does not cancel (`sim/src/resources.rs`, `Origin::request`). With 16 MiB pages at
+  16 times origin capacity, origin queues grow past the read deadline. With 1 MiB pages they do not.
+
+### Changes
+
+- `racer_core::read::flight::PageFlights` adds `retain_operation`, `complete_operation`, and
+  `is_leader`, and counts retained operations per flight. Settlement, refresh, and entry removal use
+  `operations == 0` as the idle flag, the same as production `Entry::operations`.
+- `PageFlights::poll` checks the waiter's deadline before a recorded error, as production
+  `AcquisitionWaiter::wait` checks the caller's scope first. Without this, a rejected leader polled
+  after its deadline reported `OriginRejected` in core and `DeadlineExceeded` in production. The
+  extended equivalence traces found this.
+- The simulator retains each fill in `start_fill` and completes the operation in `finish_fill`
+  before settling, as production does. It drops a revoked leader's outcome and counts it as
+  `flight_stale_finishes`. `flight_leader_valid` now also covers retain and complete.
+- Tests:
+  - Core:
+    - `expired_leader_with_retained_operation_blocks_reelection_until_complete` replays the exact
+      sequence.
+    - `expired_leader_without_operation_is_stale_after_new_leader` replays the old failure.
+    - `operation_errors_and_completed_operation_settles_published_result`.
+    - `deadline_takes_precedence_over_recorded_rejection`.
+  - Production versus core:
+    - `flights_match_page_flights_on_seeded_traces` (48 seeds) now retains and completes
+      operations at random and requires both steps.
+    - `expired_leader_with_retained_operation_drains_before_reelection` replays the issue 122
+      sequence against both tables.
+  - Simulator: `node::tests::expired_leaders_drain_before_a_new_fill` uses 64 nodes, a 1 MiB/s
+    origin, and four storms. It fails with 4 `flight_leader_valid` violations when only
+    `world.rs` is reverted, and passes after the fix.
+
+### Evidence
+
+5k `zipf`, seed 1, config `{"page_bytes":16777216,"request_rate":1.25,"duration_ns":8000000000}`:
+
+| | relay branch (b06192038) | flight |
+|---|---|---|
+| `flight_leader_valid` violations | 376 | 0 |
+| reads completed / failed | 34,929 / 230 | 31,111 / 211 |
+| origin requests (max per page) | 39,669 (6) | 36,239 (4) |
+| origin fills | 2,372 | 2,372 |
+| stale finishes / re-elections | - / 2 | 683 / 550 |
+| wall, peak RSS | 0:50, - | 0:48, 0.72 GiB |
+
+The duplicate fills are gone: origin requests fell 8.6% and the most requests for one page fell
+from 6 to 4. Completed reads fell 11% because later readers now wait for the draining flight
+instead of starting another fill. Production behaves the same way, except that production cancels
+the expired fill at about the deadline. The simulator cannot do that yet (Known issue 151), so its
+flights drain later. A trial that canceled at the deadline without refunding origin bandwidth was
+worse (origin fills 1,584) and was not kept.
+
+1 MiB pages are unaffected: 5k `zipf` and `storm` have the same trace hashes as the relay branch
+(`ef7607be6a3bb784`, `ca1b1acb8b9fc903`), so no fill outlives its leader there.
+
+Checks: `cargo fmt --check` and `cargo clippy --workspace --all-targets -D warnings` are clean,
+the workspace tests pass (3,400 tests), and the 16-scenario smoke at 200 nodes (1 s) has no hard
+invariant failures.
+
+### Deviations and open items
+
+- Production is unchanged. The bug was in the core model and in the simulator's use of it.
+- Known issue 151 is new: the simulator does not cancel an expired fill's origin request.
