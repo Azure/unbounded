@@ -11,6 +11,7 @@ pub mod fanout;
 pub mod fill;
 pub mod flight;
 pub mod metadata;
+pub mod notice;
 pub mod policy;
 pub mod range;
 pub mod response;
