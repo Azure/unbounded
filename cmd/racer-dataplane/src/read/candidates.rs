@@ -708,7 +708,11 @@ impl CandidatePolicy {
         }
         // Visit an older later owner before the newer owner that displaced
         // it, which would fetch the page again (Known issue 25).
-        racer_core::read::candidates::lineage_first(order, &owner_arrivals(candidates))
+        racer_core::read::candidates::lineage_first(order, &owner_arrivals(candidates), |rank| {
+            candidates
+                .membership
+                .is_neighbor(&self.node, &ordered[rank])
+        })
     }
 
     /// Bound each local peer exchange independently of the signed operation ceiling.

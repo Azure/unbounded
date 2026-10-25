@@ -2030,7 +2030,12 @@ impl NodeWorld {
         // A non-owner visits an older later owner before the newer owner
         // that displaced it (production `visit_order`, Known issue 25).
         let order = if rank.is_none() {
-            lineage_first(order, &since)
+            let me = position(&members, node);
+            lineage_first(
+                order,
+                &since,
+                |r| matches!((me, position(&members, cands[r])), (Some(a), Some(b)) if members.is_neighbor(a, b)),
+            )
         } else {
             order
         };

@@ -93,16 +93,28 @@ pub fn visit_order(
 /// non-neighbor). The rest of the order is unchanged. Members with equal or
 /// unknown arrival never move, so a cluster whose members arrived together
 /// visits exactly as before.
-pub fn lineage_first(mut order: VisitOrder, since: &[Option<u32>]) -> VisitOrder {
+///
+/// A non-neighbor never moves ahead of a direct `neighbor` visited first: its
+/// funded route spends most of the reader's links, so when it misses (for
+/// example it defers the reader to a successor, Known issue 21) the reader can
+/// no longer route to a non-neighbor owner after it (found by the DST oracle,
+/// seed 16, at the wave 4 merge).
+pub fn lineage_first(
+    mut order: VisitOrder,
+    since: &[Option<u32>],
+    neighbor: impl Fn(usize) -> bool,
+) -> VisitOrder {
     let Some(first) = order.get(0) else {
         return order;
     };
     let Some(Some(newest)) = since.get(first).copied() else {
         return order;
     };
+    let first_neighbor = neighbor(first);
     let older = (1..usize::from(order.len)).find(|&i| {
         let rank = usize::from(order.ranks[i]);
         rank > first
+            && (!first_neighbor || neighbor(rank))
             && since
                 .get(rank)
                 .copied()
@@ -304,21 +316,23 @@ mod tests {
                 |r| 3 - r as u64,
             )
         };
+        // Every owner a neighbor: arrival alone decides.
+        let all = |_: usize| true;
         assert_eq!(ranks(order(0)), [0, 1, 2]);
         // Rank 0 arrived after rank 2: visit rank 2 first, then as before.
         let since = [Some(4), Some(4), Some(1)];
-        assert_eq!(ranks(lineage_first(order(0), &since)), [2, 0, 1]);
+        assert_eq!(ranks(lineage_first(order(0), &since, all)), [2, 0, 1]);
         // The first older one in visit order.
         let since = [Some(4), Some(2), Some(1)];
-        assert_eq!(ranks(lineage_first(order(0), &since)), [1, 0, 2]);
+        assert_eq!(ranks(lineage_first(order(0), &since, all)), [1, 0, 2]);
         // Visiting rank 1 first: only ranks after it can be older.
         assert_eq!(ranks(order(1)), [1, 0, 2]);
         assert_eq!(
-            ranks(lineage_first(order(1), &[Some(0), Some(3), Some(5)])),
+            ranks(lineage_first(order(1), &[Some(0), Some(3), Some(5)], all)),
             [1, 0, 2]
         );
         assert_eq!(
-            ranks(lineage_first(order(1), &[Some(0), Some(3), Some(1)])),
+            ranks(lineage_first(order(1), &[Some(0), Some(3), Some(1)], all)),
             [2, 1, 0]
         );
         // Equal, unknown or newer arrivals keep the order.
@@ -327,21 +341,59 @@ mod tests {
             [None, Some(0), Some(0)],
             [Some(1), Some(2), None],
         ] {
-            assert_eq!(ranks(lineage_first(order(0), &since)), [0, 1, 2]);
+            assert_eq!(ranks(lineage_first(order(0), &since, all)), [0, 1, 2]);
         }
         // Short orders.
         assert_eq!(
-            ranks(lineage_first(VisitOrder::canonical(1), &[Some(3)])),
+            ranks(lineage_first(VisitOrder::canonical(1), &[Some(3)], all)),
             [0]
         );
         assert_eq!(
-            ranks(lineage_first(VisitOrder::canonical(0), &[])),
+            ranks(lineage_first(VisitOrder::canonical(0), &[], all)),
             Vec::<usize>::new()
         );
         assert_eq!(
-            ranks(lineage_first(VisitOrder::canonical(2), &[Some(3), Some(1)])),
+            ranks(lineage_first(
+                VisitOrder::canonical(2),
+                &[Some(3), Some(1)],
+                all
+            )),
             [1, 0]
         );
+    }
+
+    /// Wave 4 merge (DST oracle seed 16): an older later owner that is not a
+    /// neighbor never moves ahead of a neighbor visited first; one that is a
+    /// neighbor still does, and with a non-neighbor first any older one may.
+    #[test]
+    fn lineage_first_keeps_a_neighbor_ahead_of_a_non_neighbor() {
+        let order = |first: usize| {
+            visit_order(
+                ReplicaSelection::Spread,
+                3,
+                |r| r == first,
+                |r| 3 - r as u64,
+            )
+        };
+        let since = [Some(4), Some(4), Some(1)];
+        // Only rank 0 is a neighbor: rank 2 stays behind it.
+        assert_eq!(
+            ranks(lineage_first(order(0), &since, |r| r == 0)),
+            [0, 1, 2]
+        );
+        // Rank 2 is a neighbor too: it moves first.
+        assert_eq!(
+            ranks(lineage_first(order(0), &since, |r| r != 1)),
+            [2, 0, 1]
+        );
+        // The first older neighbor is chosen, skipping a non-neighbor.
+        let since = [Some(4), Some(2), Some(1)];
+        assert_eq!(
+            ranks(lineage_first(order(0), &since, |r| r != 1)),
+            [2, 0, 1]
+        );
+        // No neighbor first (all relayed): any older one may move.
+        assert_eq!(ranks(lineage_first(order(0), &since, |_| false)), [1, 0, 2]);
     }
 
     fn object(key: u8) -> ObjectId {
