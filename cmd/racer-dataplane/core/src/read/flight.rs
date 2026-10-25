@@ -119,6 +119,17 @@ impl WaiterPolicy for Waiter {
 struct Flight<C, P, O> {
     state: State<C, P, O, Waiter, Token>,
     generation: u64,
+    /// Retained leader operations still running (production
+    /// `Entry::operations`). A revoked acquisition settles, and a new leader
+    /// can be elected, only once this reaches zero, and the entry is never
+    /// removed while it is nonzero.
+    operations: usize,
+}
+
+impl<C, P, O> Flight<C, P, O> {
+    fn idle(&self) -> bool {
+        self.operations == 0
+    }
 }
 
 /// Result of a join.
@@ -237,6 +248,7 @@ impl<C: Clone, P: Clone, O, S: BuildHasher> PageFlights<C, P, O, S> {
                 Flight {
                     state: State::default(),
                     generation: 0,
+                    operations: 0,
                 },
             );
         }
@@ -306,8 +318,66 @@ impl<C: Clone, P: Clone, O, S: BuildHasher> PageFlights<C, P, O, S> {
             .validate_leader(id, true)
             .map_err(|_| Error::Internal)?;
         flight.state.begin_completion(outcome);
-        flight.state.settle(true, Error::Unavailable, split, wakes);
+        let idle = flight.idle();
+        flight.state.settle(idle, Error::Unavailable, split, wakes);
         Ok(())
+    }
+
+    /// Whether `id` is the active leader of `page`'s current acquisition.
+    /// False once the leader was revoked (canceled or expired), in which case
+    /// [`PageFlights::finish`] and [`PageFlights::reject`] return `Internal`
+    /// like production's `StaleFlight` and the driver drops the outcome.
+    pub fn is_leader(&self, page: &PageId, id: u64) -> bool {
+        self.flights
+            .get(page)
+            .is_some_and(|f| f.state.validate_leader(id, true).is_ok())
+    }
+
+    /// Retain one operation for leader `id`'s acquisition before it starts
+    /// (production `Flights::retain_operation`). Until
+    /// [`PageFlights::complete_operation`] runs, a revoked acquisition stays
+    /// draining: no other waiter is elected and the entry is kept, so a
+    /// revoked leader's still-running fetch cannot overlap a new leader's.
+    pub fn retain_operation(&mut self, page: &PageId, id: u64) -> Result<()> {
+        let flight = self.flights.get_mut(page).ok_or(Error::Internal)?;
+        flight
+            .state
+            .validate_leader(id, true)
+            .map_err(|_| Error::Internal)?;
+        flight.operations += 1;
+        Ok(())
+    }
+
+    /// The operation retained by [`PageFlights::retain_operation`] finished
+    /// (production `FlightOperation::complete`). Settles a drained outcome,
+    /// wakes waiters, and removes a quiescent entry. Call it before
+    /// `finish`/`reject`, as production completes the operation before
+    /// publishing.
+    pub fn complete_operation(
+        &mut self,
+        page: &PageId,
+        admission: &mut impl FlightAdmission,
+        wakes: &mut Vec<Token>,
+    ) -> Result<()> {
+        let flight = self.flights.get_mut(page).ok_or(Error::Internal)?;
+        flight.operations = flight.operations.checked_sub(1).ok_or(Error::Internal)?;
+        refresh(flight, self.split, self.now.get(), wakes);
+        flight.state.notify(wakes);
+        self.remove_quiescent(page, admission);
+        Ok(())
+    }
+
+    fn remove_quiescent(&mut self, page: &PageId, admission: &mut impl FlightAdmission) {
+        let Some(flight) = self.flights.get(page) else {
+            return;
+        };
+        let quiescent = flight.state.waiters.is_empty()
+            && flight.idle()
+            && !matches!(flight.state.phase, Phase::Acquiring | Phase::Draining(_));
+        if quiescent {
+            self.flights.remove(page);
+            admission.release_flight(page);
+        }
     }
 
     /// Leader `id`'s own origin attempt was rejected for its credentials
@@ -334,7 +404,8 @@ impl<C: Clone, P: Clone, O, S: BuildHasher> PageFlights<C, P, O, S> {
         flight.state.cancel(id, error);
         flight.state.begin_completion(Outcome::Retry);
         flight.state.notify(wakes);
-        flight.state.settle(true, Error::Unavailable, split, wakes);
+        let idle = flight.idle();
+        flight.state.settle(idle, Error::Unavailable, split, wakes);
         Ok(())
     }
 
@@ -362,12 +433,7 @@ impl<C: Clone, P: Clone, O, S: BuildHasher> PageFlights<C, P, O, S> {
             admission.release_waiter(page);
         }
         refresh(flight, self.split, self.now.get(), wakes);
-        let quiescent = flight.state.waiters.is_empty()
-            && !matches!(flight.state.phase, Phase::Acquiring | Phase::Draining(_));
-        if quiescent {
-            self.flights.remove(page);
-            admission.release_flight(page);
-        }
+        self.remove_quiescent(page, admission);
     }
 
     /// Expire waiters whose deadline passed at `now` and settle outcomes.
@@ -385,8 +451,9 @@ fn refresh<C, P, O>(
     now: Instant,
     wakes: &mut Vec<Token>,
 ) {
+    let idle = flight.idle();
     flight.state.refresh(
-        true,
+        idle,
         Error::Unavailable,
         Error::Cancelled,
         || now,

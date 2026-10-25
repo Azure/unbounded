@@ -346,3 +346,142 @@ fn budget_gates() {
     assert_eq!(waiter_cap_gate(255, &limits), Ok(()));
     assert_eq!(entry_cap_gate(1024, &limits), Err(Error::Overloaded));
 }
+
+/// Known issue 122: a leader whose deadline passes while its fill still runs
+/// is revoked. With the fill retained as an operation (production
+/// `Flights::retain_operation`), the flight keeps draining: the expired
+/// leader's detach does not remove it, a new caller waits instead of starting
+/// a second concurrent fill, the stale leader's finish is rejected
+/// (`Internal`, production `StaleFlight`), and only completing the operation
+/// elects the new caller.
+#[test]
+fn expired_leader_with_retained_operation_blocks_reelection_until_complete() {
+    let now = Instant::now();
+    let mut t = table(FlightLimits::default(), now);
+    let mut wakes = Vec::new();
+    let mut quota = Quota {
+        max_flights: 4,
+        ..Quota::default()
+    };
+    let p = page(20);
+    let a = waiter(t.join(
+        &p,
+        now,
+        now + Duration::from_secs(1),
+        2,
+        true,
+        &mut quota,
+        &mut wakes,
+    ));
+    assert_eq!(t.poll(&p, a, now, 1, &mut wakes), Ok(Event::Lead));
+    t.retain_operation(&p, a).unwrap();
+    assert!(t.is_leader(&p, a));
+
+    let later = now + Duration::from_secs(1);
+    t.refresh(&p, later, &mut wakes);
+    assert!(!t.is_leader(&p, a));
+    assert_eq!(
+        t.poll(&p, a, later, 1, &mut wakes),
+        Ok(Event::Failed(Error::DeadlineExceeded))
+    );
+    t.detach(&p, a, &mut quota, &mut wakes);
+    assert_eq!((quota.waiters, quota.flights), (0, 1), "entry kept");
+
+    let deadline = later + Duration::from_secs(5);
+    let b = waiter(t.join(&p, later, deadline, 2, true, &mut quota, &mut wakes));
+    assert_eq!(t.poll(&p, b, later, 2, &mut wakes), Ok(Event::Pending));
+    assert_eq!(
+        t.finish(&p, a, Outcome::Published(Acquired::Plain(1)), &mut wakes),
+        Err(Error::Internal)
+    );
+    assert_eq!(t.poll(&p, b, later, 2, &mut wakes), Ok(Event::Pending));
+
+    wakes.clear();
+    t.complete_operation(&p, &mut quota, &mut wakes).unwrap();
+    assert!(wakes.contains(&2));
+    assert_eq!(t.poll(&p, b, later, 2, &mut wakes), Ok(Event::Lead));
+    t.retain_operation(&p, b).unwrap();
+    t.complete_operation(&p, &mut quota, &mut wakes).unwrap();
+    t.finish(&p, b, Outcome::Published(Acquired::Plain(2)), &mut wakes)
+        .unwrap();
+    assert_eq!(t.poll(&p, b, later, 2, &mut wakes), Ok(Event::Complete(2)));
+    t.detach(&p, b, &mut quota, &mut wakes);
+    assert_eq!((quota.waiters, quota.flights), (0, 0));
+    assert!(t.is_empty());
+}
+
+/// Without a retained operation the same sequence reproduces the simulator's
+/// original Known issue 122 failure: the expired leader's detach removes the
+/// entry, a new caller leads a second fill, and the first leader's finish is
+/// stale.
+#[test]
+fn expired_leader_without_operation_is_stale_after_new_leader() {
+    let now = Instant::now();
+    let mut t = table(FlightLimits::default(), now);
+    let mut wakes = Vec::new();
+    let p = page(21);
+    let a = waiter(t.join(
+        &p,
+        now,
+        now + Duration::from_secs(1),
+        2,
+        true,
+        &mut Unlimited,
+        &mut wakes,
+    ));
+    assert_eq!(t.poll(&p, a, now, 1, &mut wakes), Ok(Event::Lead));
+    let later = now + Duration::from_secs(1);
+    t.refresh(&p, later, &mut wakes);
+    t.detach(&p, a, &mut Unlimited, &mut wakes);
+    assert!(t.is_empty());
+    let b = waiter(t.join(
+        &p,
+        later,
+        later + Duration::from_secs(5),
+        2,
+        true,
+        &mut Unlimited,
+        &mut wakes,
+    ));
+    assert_eq!(t.poll(&p, b, later, 2, &mut wakes), Ok(Event::Lead));
+    assert!(!t.is_leader(&p, a));
+    assert_eq!(
+        t.finish(&p, a, Outcome::Published(Acquired::Plain(1)), &mut wakes),
+        Err(Error::Internal)
+    );
+    assert!(t.is_leader(&p, b));
+}
+
+#[test]
+fn operation_errors_and_completed_operation_settles_published_result() {
+    let now = Instant::now();
+    let deadline = now + Duration::from_secs(10);
+    let mut t = table(FlightLimits::default(), now);
+    let mut wakes = Vec::new();
+    let p = page(22);
+    assert_eq!(t.retain_operation(&p, 0), Err(Error::Internal));
+    assert_eq!(
+        t.complete_operation(&p, &mut Unlimited, &mut wakes),
+        Err(Error::Internal)
+    );
+    let a = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
+    let b = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
+    // Not elected yet.
+    assert_eq!(t.retain_operation(&p, a), Err(Error::Internal));
+    assert_eq!(
+        t.complete_operation(&p, &mut Unlimited, &mut wakes),
+        Err(Error::Internal)
+    );
+    assert_eq!(t.poll(&p, a, now, 1, &mut wakes), Ok(Event::Lead));
+    assert_eq!(t.retain_operation(&p, b), Err(Error::Internal));
+    t.retain_operation(&p, a).unwrap();
+    // Publication while the operation is still retained stays draining.
+    t.finish(&p, a, Outcome::Published(Acquired::Plain(7)), &mut wakes)
+        .unwrap();
+    assert_eq!(t.poll(&p, b, now, 2, &mut wakes), Ok(Event::Pending));
+    wakes.clear();
+    t.complete_operation(&p, &mut Unlimited, &mut wakes)
+        .unwrap();
+    assert!(wakes.contains(&2));
+    assert_eq!(t.poll(&p, b, now, 2, &mut wakes), Ok(Event::Complete(7)));
+}
