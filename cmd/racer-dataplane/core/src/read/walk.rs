@@ -118,6 +118,12 @@ pub struct WalkConfig {
     /// [`granted_prefix`]. The grant's unused credits are dropped, never
     /// added to the walk's budget, so the walk's credits never grow.
     pub granted: usize,
+    /// Send the granted probes of a run of consecutive granted targets at
+    /// once ([`Step::Granted`]) instead of one after the other (Known issue
+    /// 45). Each still has its own grant and only a copy changes the walk,
+    /// so the order of their outcomes cannot matter; the run costs one time
+    /// share instead of one per target.
+    pub parallel_granted: bool,
     /// What this owner last learned about rank 0's acquisition of the page
     /// ([`crate::read::rank0::Rank0Watch`], Known issue 39). `Overdue`: a
     /// timeout of rank 0 gives origin authority like a transport failure,
@@ -141,6 +147,28 @@ pub const SUCCESSOR_GRANT_LINKS: u8 = 8;
 
 /// Most previous-membership owners one walk asks (the replica count).
 pub const MAX_HANDOFF: usize = 3;
+
+/// Most lineage targets (later owners and demoted members,
+/// [`lineage_targets`], [`demoted_targets`]) one owner walk asks, each on its
+/// own grant (Known issue 46). Larger than [`MAX_HANDOFF`] because granted
+/// probes are sent at once ([`WalkConfig::parallel_granted`]): more targets
+/// add copy-only exchanges, not latency, and never draw on the walk's
+/// budget.
+pub const MAX_LINEAGE: usize = 6;
+
+/// Most handoff targets one owner walk lists ([`WalkConfig::handoff`]):
+/// successor targets (later owners, at most two) and lineage targets.
+pub const MAX_TARGETS: usize = REPLICAS_BELOW + MAX_LINEAGE;
+
+/// Later owners an owner can have (successor targets).
+const REPLICAS_BELOW: usize = MAX_HANDOFF - 1;
+
+/// The grant a granted probe spends ([`Step::Granted`],
+/// [`WalkConfig::granted`]): fresh credits that are never added to the
+/// walk's budget.
+pub fn granted_budget(deadline: Instant) -> AcquisitionBudget {
+    AcquisitionBudget::new(deadline, SUCCESSOR_GRANT_ATTEMPTS, SUCCESSOR_GRANT_LINKS)
+}
 
 /// Fewest attempts a non-owner funds an out-of-order Acquire to the owner at
 /// `canonical` rank with: the exchange itself, one copy-only probe per
@@ -248,6 +276,27 @@ pub fn demoted_targets<N: Clone>(
     demoted_since: &[Option<u32>],
     rank: usize,
 ) -> Vec<N> {
+    demoted_targets_from(since, demoted, demoted_since, rank, None)
+}
+
+/// [`demoted_targets`], plus members whose arrival is `oldest`, the
+/// generation this node's membership chain began at (production
+/// `Membership::since` 0): their arrival is unknown, only that they are at
+/// least as old as the chain, so no arrival rule can tell whether one of
+/// them was an owner before the chain began (Known issue 46). In 5k
+/// `full-churn` most holders left unasked by [`demoted_targets`] were such
+/// members, tied at the chain's start with the owners above them. When this
+/// owner arrived after the chain began, they qualify too, in rank order:
+/// a member ranked higher is an owner whenever fewer members above it are
+/// present, so it is the likelier holder. At most [`MAX_LINEAGE`] in all,
+/// each a granted copy-only probe that can only miss.
+pub fn demoted_targets_from<N: Clone>(
+    since: &[Option<u32>],
+    demoted: &[N],
+    demoted_since: &[Option<u32>],
+    rank: usize,
+    oldest: Option<u32>,
+) -> Vec<N> {
     let Some(Some(mine)) = since.get(rank).copied() else {
         return Vec::new();
     };
@@ -264,9 +313,10 @@ pub fn demoted_targets<N: Clone>(
         .enumerate()
         .filter_map(|(k, (n, s))| {
             let arrival = (*s)?;
-            (arrival < mine && above(k, arrival) < MAX_HANDOFF).then(|| n.clone())
+            let unknown = oldest == Some(arrival);
+            (arrival < mine && (unknown || above(k, arrival) < MAX_HANDOFF)).then(|| n.clone())
         })
-        .take(MAX_HANDOFF)
+        .take(MAX_LINEAGE)
         .collect()
 }
 
@@ -295,17 +345,19 @@ pub fn lineage_counts(since: &[Option<u32>]) -> [u8; MAX_HANDOFF] {
     counts
 }
 
-/// The handoff targets an owner asks: lineage targets ([`lineage_targets`])
-/// first, then the version - 1 targets ([`handoff_targets`]) not already
-/// listed, at most [`MAX_HANDOFF`]. Lineage targets come first: each was an
+/// The handoff targets an owner asks: lineage targets ([`lineage_targets`],
+/// [`demoted_targets`], at most [`MAX_LINEAGE`]) first, then the version - 1
+/// targets ([`handoff_targets`]) not already listed while fewer than
+/// [`MAX_HANDOFF`] targets are listed (the walk funds those from its own
+/// budget, so their number does not grow with the lineage cap). Lineage targets come first: each was an
 /// owner above this one before it arrived, so it fetched the page if anyone
 /// read it then, while a version - 1 owner that was displaced since may
 /// never have been asked for it.
 pub fn merge_handoff<N: PartialEq + Clone>(previous: Vec<N>, lineage: Vec<N>) -> Vec<N> {
     let mut targets = lineage;
-    targets.truncate(MAX_HANDOFF);
+    targets.truncate(MAX_LINEAGE);
     for n in previous {
-        if targets.len() == MAX_HANDOFF {
+        if targets.len() >= MAX_HANDOFF {
             break;
         }
         if !targets.contains(&n) {
@@ -399,6 +451,10 @@ pub enum End {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Step {
     Probe(Probe),
+    /// Granted probes to send at once ([`WalkConfig::parallel_granted`]),
+    /// each copy-only on its own [`granted_budget`]. Report them together
+    /// with [`CandidateWalk::complete_granted`] once all have answered.
+    Granted(Vec<Probe>),
     /// No probes remain. The caller still checks its scope before acting.
     End(End),
 }
@@ -408,8 +464,10 @@ pub struct CandidateWalk {
     config: WalkConfig,
     order: VisitOrder,
     /// Owner walks: predecessors then handoff targets (`owners + i`).
-    targets: [u8; 2 + MAX_HANDOFF],
+    targets: [u8; 2 + MAX_TARGETS],
     count: usize,
+    /// Granted probes sent with [`Step::Granted`] and not yet reported.
+    batch: usize,
     index: usize,
     evidence: Vec<ProbeOutcome>,
     saw_transient: bool,
@@ -458,7 +516,7 @@ struct Pending {
 
 impl CandidateWalk {
     pub fn new(config: WalkConfig) -> Self {
-        let mut targets = [0; 2 + MAX_HANDOFF];
+        let mut targets = [0; 2 + MAX_TARGETS];
         let mut count = config.rank.unwrap_or(config.owners);
         let order = if let Some(rank) = config.rank {
             let rank = rank.min(2);
@@ -467,7 +525,7 @@ impl CandidateWalk {
                 *target = i as u8;
             }
             if config.page_operation {
-                for i in 0..config.handoff.min(MAX_HANDOFF) {
+                for i in 0..config.handoff.min(MAX_TARGETS) {
                     targets[count] = (config.owners + i) as u8;
                     count += 1;
                 }
@@ -481,6 +539,7 @@ impl CandidateWalk {
             order,
             targets,
             count,
+            batch: 0,
             index: 0,
             evidence: Vec::new(),
             saw_transient: false,
@@ -625,6 +684,7 @@ impl CandidateWalk {
     /// Plan the next probe, partitioning a bounded child budget when needed.
     pub fn next(&mut self, budget: &mut AcquisitionBudget) -> Result<Step> {
         assert!(self.pending.is_none(), "complete the pending probe first");
+        assert!(self.batch == 0, "complete the granted probes first");
         assert!(!self.done, "walk already ended");
         if self.helper == Helper::Unset {
             self.start(budget);
@@ -643,6 +703,29 @@ impl CandidateWalk {
             let index = self.index;
             let handoff = canonical >= self.config.owners;
             let granted = handoff && canonical - self.config.owners < self.config.granted;
+            if granted && self.config.parallel_granted {
+                // Every granted target from here on, at once (Known issue
+                // 45): one time share for the run, each on its own grant.
+                let remaining_opportunities =
+                    (self.count - index + 1) as u32 + SUCCESSOR_SHARE_DIVISOR;
+                let mut probes = Vec::new();
+                while let Some(canonical) = self.target(self.index)
+                    && canonical >= self.config.owners
+                    && canonical - self.config.owners < self.config.granted
+                {
+                    probes.push(Probe {
+                        index: self.index,
+                        canonical,
+                        mode: Mode::CopyOnly,
+                        remaining_opportunities,
+                        route: RouteMode::FundedRoute,
+                        previous: false,
+                    });
+                    self.index += 1;
+                }
+                self.batch = probes.len();
+                return Ok(Step::Granted(probes));
+            }
             if granted {
                 // A successor probe spends its own grant, never the walk's
                 // credits.
@@ -885,10 +968,24 @@ impl CandidateWalk {
         }
     }
 
+    /// Report the granted probes of the last [`Step::Granted`]: whether any
+    /// of them returned a validated, usable copy. Every other outcome
+    /// (miss, failure, timeout, stale or shed answer) is only a miss, and the
+    /// grants are dropped, so the walk's budget and evidence are as before.
+    pub fn complete_granted(&mut self, copy: bool) -> Option<End> {
+        assert!(self.batch > 0, "no granted probes outstanding");
+        self.batch = 0;
+        copy.then(|| {
+            self.done = true;
+            End::Copy
+        })
+    }
+
     /// Return the pending probe's child credits without recording an outcome,
     /// for a probe that failed terminally.
     pub fn abandon(&mut self, budget: &mut AcquisitionBudget) -> Result<()> {
         self.done = true;
+        self.batch = 0;
         if let Some(Pending {
             bounded: Some(bounded),
             granted: false,

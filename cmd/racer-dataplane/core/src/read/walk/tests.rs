@@ -21,6 +21,7 @@ fn config(rank: Option<usize>, owners: usize, order: VisitOrder) -> WalkConfig {
         helper: false,
         lineage: [0; MAX_HANDOFF],
         granted: 0,
+        parallel_granted: false,
         rank0: Rank0State::Unknown,
     }
 }
@@ -47,6 +48,17 @@ fn drive(
                 ));
                 let result = outcome(&probe, request);
                 if let Some(end) = walk.complete(budget, result).unwrap() {
+                    return (probes, end);
+                }
+            }
+            Step::Granted(batch) => {
+                let mut copy = false;
+                for probe in batch {
+                    let grant = granted_budget(budget.deadline());
+                    probes.push((probe, grant.remaining_attempts(), grant.remaining_links()));
+                    copy |= outcome(&probe, &grant) == Outcome::Copy;
+                }
+                if let Some(end) = walk.complete_granted(copy) {
                     return (probes, end);
                 }
             }
@@ -268,6 +280,7 @@ fn handoff_probes_never_spend_the_origin_credit() {
     let mut probes = 0;
     let end = loop {
         match walk.next(&mut b).unwrap() {
+            Step::Granted(_) => unreachable!("grants are sequential here"),
             Step::Probe(_) => {
                 probes += 1;
                 let _ = walk.request_budget(&mut b).partition(1, 0).unwrap();
@@ -719,6 +732,7 @@ fn spent_links_end_the_walk_exhausted() {
     let mut ends = Vec::new();
     let end = loop {
         match walk.next(&mut b).unwrap() {
+            Step::Granted(_) => unreachable!("grants are sequential here"),
             Step::End(end) => break end,
             Step::Probe(probe) => {
                 let inputs = AttemptInputs {
@@ -760,6 +774,7 @@ fn pending_handoff_marks_handoff_probes_and_stale_destination_is_a_miss() {
     let mut seen = Vec::new();
     let end = loop {
         match walk.next(&mut b).unwrap() {
+            Step::Granted(_) => unreachable!("grants are sequential here"),
             Step::Probe(p) => {
                 seen.push((p.canonical, walk.pending_handoff()));
                 let outcome = if walk.pending_handoff() {
@@ -1643,6 +1658,7 @@ fn successor_and_lineage_probes_neither_grow_the_budget_nor_withhold_origin() {
     let mut probes = Vec::new();
     let end = loop {
         match walk.next(&mut b).unwrap() {
+            Step::Granted(_) => unreachable!("grants are sequential here"),
             Step::Probe(probe) => {
                 probes.push(probe.canonical);
                 let successor = walk.pending_successor();
@@ -1848,4 +1864,164 @@ fn granted_probes_leave_the_rank_zero_timeout_rule_alone() {
         assert_eq!(end, End::Exhausted { funding: false }, "{state:?}");
         assert!(walk.rank0_unanswered(), "{state:?}");
     }
+}
+
+/// Known issue 46: lineage targets past the third are kept, up to
+/// `MAX_LINEAGE`, while version - 1 targets are still only added below
+/// `MAX_HANDOFF` targets (the walk funds those).
+#[test]
+fn lineage_targets_go_past_three_and_version_one_targets_do_not() {
+    // Owners arrived in 10, 11, 12; seven demoted members each arrived
+    // before them with at most two members above present at its arrival.
+    let since = [Some(10), Some(11), Some(12)];
+    let demoted: Vec<u32> = (3..10).collect();
+    let demoted_since = [
+        Some(0),
+        Some(1),
+        Some(2),
+        Some(3),
+        Some(4),
+        Some(5),
+        Some(6),
+    ];
+    // d3 at 0 (none above), d4 at 1 (d3), d5 at 2 (d3, d4); d6 at 3 has
+    // d3, d4, d5 above: never an owner, and so on for the rest.
+    assert_eq!(
+        demoted_targets(&since, &demoted, &demoted_since, 0),
+        [3, 4, 5]
+    );
+    // Arrivals in reverse: each deeper member arrived first, so every one
+    // had at most two members above it present when it arrived.
+    let reverse = [
+        Some(6),
+        Some(5),
+        Some(4),
+        Some(3),
+        Some(2),
+        Some(1),
+        Some(0),
+    ];
+    let targets = demoted_targets(&since, &demoted, &reverse, 0);
+    assert_eq!(targets.len(), MAX_LINEAGE);
+    assert_eq!(targets, demoted[..MAX_LINEAGE]);
+    // Lineage up to `MAX_LINEAGE`, then no version - 1 target.
+    let handoff = merge_handoff(vec![90, 91], targets.clone());
+    assert_eq!(handoff, targets);
+    // Fewer lineage targets than `MAX_HANDOFF`: version - 1 fills to it.
+    assert_eq!(merge_handoff(vec![90, 91], vec![3]), [3, 90, 91]);
+    assert_eq!(merge_handoff(vec![90, 91], vec![3, 4, 5, 6]), [3, 4, 5, 6]);
+}
+
+/// Known issue 45: granted probes go out at once, each on its own grant and
+/// one shared time share; misses leave the walk exactly as the sequential
+/// walk leaves it, and any copy ends it.
+#[test]
+fn parallel_granted_probes_go_out_at_once_and_match_the_sequential_walk() {
+    for rank in [0, 1, 2] {
+        for granted in 1..=MAX_TARGETS - 1 {
+            let mut cfg = config(Some(rank), 3, VisitOrder::canonical(3));
+            cfg.handoff = granted + 1;
+            cfg.granted = granted;
+            let script = |p: &Probe, _: &AcquisitionBudget| {
+                if p.canonical < 3 {
+                    Outcome::Transport(ProbeOutcome::Unreachable)
+                } else {
+                    Outcome::Probe(ProbeOutcome::CopyMiss)
+                }
+            };
+            let (mut seq, mut par) = (CandidateWalk::new(cfg), {
+                cfg.parallel_granted = true;
+                CandidateWalk::new(cfg)
+            });
+            let (mut bs, mut bp) = (budget(8, 16), budget(8, 16));
+            let (ps, es) = drive(&mut seq, &mut bs, script);
+            let (pp, ep) = drive(&mut par, &mut bp, script);
+            assert_eq!(es, ep, "rank {rank}, {granted} granted");
+            let canon =
+                |v: &[(Probe, u32, u8)]| v.iter().map(|(p, ..)| p.canonical).collect::<Vec<_>>();
+            assert_eq!(canon(&ps), canon(&pp));
+            assert_eq!(
+                (bs.remaining_attempts(), bs.remaining_links()),
+                (bp.remaining_attempts(), bp.remaining_links())
+            );
+            // The batch shares the first granted probe's time share, and
+            // each has the grant's credits.
+            let batch: Vec<_> = pp
+                .iter()
+                .filter(|(p, ..)| p.canonical >= 3)
+                .take(granted)
+                .collect();
+            assert!(batch.iter().all(|(p, a, l)| {
+                p.remaining_opportunities == batch[0].0.remaining_opportunities
+                    && p.mode == Mode::CopyOnly
+                    && (*a, *l) == (SUCCESSOR_GRANT_ATTEMPTS, SUCCESSOR_GRANT_LINKS)
+            }));
+        }
+    }
+    // One step returns the whole run of granted targets; the walk refuses
+    // to plan more until they are reported; a copy ends it.
+    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
+    cfg.handoff = 4;
+    cfg.granted = 3;
+    cfg.parallel_granted = true;
+    let mut walk = CandidateWalk::new(cfg);
+    let mut b = budget(1, 1);
+    let Step::Granted(batch) = walk.next(&mut b).unwrap() else {
+        panic!("expected granted probes");
+    };
+    assert_eq!(
+        batch.iter().map(|p| p.canonical).collect::<Vec<_>>(),
+        [3, 4, 5]
+    );
+    assert_eq!(walk.complete_granted(true), Some(End::Copy));
+    assert_eq!((b.remaining_attempts(), b.remaining_links()), (1, 1));
+}
+
+#[test]
+#[should_panic(expected = "complete the granted probes first")]
+fn parallel_granted_probes_must_be_reported_before_the_next_step() {
+    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
+    cfg.handoff = 2;
+    cfg.granted = 2;
+    cfg.parallel_granted = true;
+    let mut walk = CandidateWalk::new(cfg);
+    let mut b = budget(4, 8);
+    let Step::Granted(_) = walk.next(&mut b).unwrap() else {
+        panic!("expected granted probes");
+    };
+    let _ = walk.next(&mut b);
+}
+
+/// Known issue 46: members whose arrival is the chain's start have an
+/// unknown age, tied with the owners above them, so the arrival rule never
+/// names them; with `oldest` they qualify in rank order when this owner
+/// arrived later, within `MAX_LINEAGE`.
+#[test]
+fn unknown_age_demoted_members_are_targets_when_the_owner_arrived_later() {
+    // Every member but rank 0 has been present since the chain began (5).
+    let since = [Some(8), Some(5), Some(5)];
+    let demoted: Vec<u32> = (3..12).collect();
+    let demoted_since = [Some(5); 9];
+    // The arrival rule: owners 1 and 2 and every demoted member above
+    // arrived "together": only the first demoted member qualifies.
+    assert_eq!(demoted_targets(&since, &demoted, &demoted_since, 0), [3]);
+    // Unknown age: all qualify, best ranked first, at most `MAX_LINEAGE`.
+    let targets = demoted_targets_from(&since, &demoted, &demoted_since, 0, Some(5));
+    assert_eq!(targets, demoted[..MAX_LINEAGE]);
+    // A known arrival keeps the arrival rule; the chain start must match.
+    let mixed = [Some(6), Some(6), Some(6), Some(5), Some(5)];
+    assert_eq!(
+        demoted_targets_from(&since, &demoted[..5], &mixed, 0, Some(5)),
+        [3, 6, 7]
+    );
+    assert_eq!(
+        demoted_targets_from(&since, &demoted, &demoted_since, 0, Some(4)),
+        [3]
+    );
+    // An owner that is itself as old as the chain knows of no one it
+    // displaced: no targets.
+    let old = [Some(5), Some(5), Some(5)];
+    assert!(demoted_targets_from(&old, &demoted, &demoted_since, 0, Some(5)).is_empty());
+    // Rank 1 arrived at the chain start: nothing either.
+    assert!(demoted_targets_from(&since, &demoted, &demoted_since, 1, Some(5)).is_empty());
 }

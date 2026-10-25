@@ -306,8 +306,9 @@ pub fn successor_targets<N: PartialEq + Clone>(hints: &[N], owners: &[N], rank: 
     out
 }
 
-/// The handoff targets of an owner walk with `successors` first, at most
-/// [`crate::read::walk::MAX_HANDOFF`] in all, and how many of them are
+/// The handoff targets of an owner walk with `successors` first (at most
+/// [`crate::read::walk::MAX_HANDOFF`] of them), at most
+/// [`crate::read::walk::MAX_TARGETS`] in all, and how many of them are
 /// successor targets ([`crate::read::walk::WalkConfig::successors`]).
 /// Successors come first: they are funded by their own grant, while
 /// previous-membership targets stop when the walk's credits run short.
@@ -320,7 +321,7 @@ pub fn with_successors<N: PartialEq + Clone>(successors: Vec<N>, handoff: &[N]) 
     }
     let count = out.len();
     for n in handoff {
-        if out.len() < crate::read::walk::MAX_HANDOFF && !out.contains(n) {
+        if out.len() < crate::read::walk::MAX_TARGETS && !out.contains(n) {
             out.push(n.clone());
         }
     }
@@ -464,11 +465,18 @@ mod tests {
     #[test]
     fn successors_come_first_within_the_handoff_cap() {
         let (all, n) = with_successors(vec![3, 2], &[7, 8]);
-        assert_eq!((all, n), (vec![3, 2, 7], 2));
+        assert_eq!((all, n), (vec![3, 2, 7, 8], 2));
         let (all, n) = with_successors(Vec::new(), &[7, 8]);
         assert_eq!((all, n), (vec![7, 8], 0));
         let (all, n) = with_successors(vec![1, 2, 3, 4], &[7]);
-        assert_eq!((all, n), (vec![1, 2, 3], 3));
+        assert_eq!((all, n), (vec![1, 2, 3, 7], 3));
+        // Lineage targets are no longer cut at three (Known issue 46), but
+        // the list stays within `MAX_TARGETS`.
+        let lineage: Vec<u32> = (10..30).collect();
+        let (all, n) = with_successors(vec![1, 2], &lineage);
+        assert_eq!(n, 2);
+        assert_eq!(all.len(), crate::read::walk::MAX_TARGETS);
+        assert_eq!(all[2..], lineage[..crate::read::walk::MAX_TARGETS - 2]);
         let (all, n) = with_successors(vec![2], &[2, 7]);
         assert_eq!((all, n), (vec![2, 7], 1));
     }
