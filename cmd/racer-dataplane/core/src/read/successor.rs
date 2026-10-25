@@ -394,9 +394,9 @@ mod tests {
         // A renewed note re-arms it.
         h.note(1, 8, now);
         assert_eq!(h.probe(&1, later), [7, 8]);
-        // Expired hints are never probed.
+        // Hints older than the probe TTL are never probed.
         h.note(2, 9, now);
-        assert!(h.probe(&2, later + Duration::from_secs(2)).is_empty());
+        assert!(h.probe(&2, now + PROBE_TTL + Duration::from_secs(1)).is_empty());
         assert!(h.names(&2, &9));
         assert!(!h.names(&2, &7));
         assert!(!h.names(&3, &9));
