@@ -409,6 +409,11 @@ fn hot_page_readers_fan_out_through_helpers() {
     config.storms = vec![storm(0, 0, 1, 1), storm(5 * SECONDS, 0, nodes, MILLIS)];
     let on = run(config.clone(), 5);
     config.node.fanout = false;
+    // Without fan-out, owners whose flight is full shed readers too; since
+    // Known issue 54 a shed reader's retry visits the other owners first,
+    // which alone completes every read of this storm (513 of 513). Measure
+    // fan-out against the owners-only baseline it was built for.
+    config.node.shed_busy = false;
     let off = run(config, 5);
     let reads = u64::from(nodes) + 1;
     assert_eq!(counter(&on, "reads_completed"), reads, "{on}");
