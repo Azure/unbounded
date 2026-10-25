@@ -6076,11 +6076,12 @@ holder; `offer_predecessors` 0 also restores the base but returns orphan repeats
 
 ## Round 4: combined (wave 6)
 
-Branch `racer-sim8-merge` from racer-core-sim 5d1ea912b, with the probes, hang2 and ctl3
-tracks cherry-picked in that order (the offer2 track follows). Logs, reports and the binary:
-`/tmp/opencode/m8/` (part 1 runs under `p1/`). The track sections above cite commit IDs from the
+Branch `racer-sim8-merge` from racer-core-sim 5d1ea912b, with the probes, hang2, ctl3 and
+offer2 tracks cherry-picked in that order. Logs, reports and the binary: `/tmp/opencode/m8/`
+(runs before offer2 under `p1/` and `p2a/`). The track sections above cite commit IDs from the
 track branches; the merged commits are 52167892a to 89021f889 (probes), 6377f5202 to 6ab32f3d8
-(hang2) and 00a48ae94 to 0dc0a6523 (ctl3).
+(hang2), 00a48ae94 to 0dc0a6523 (ctl3) and eb0a811dd to 5def9b5a9 (offer2; its commit
+247734245 and the revert of it, 49615fead, were left out).
 
 ### Merge
 
@@ -6103,6 +6104,15 @@ track branches; the merged commits are 52167892a to 89021f889 (probes), 6377f520
   longer measured the fallback. The test now measures failed reads with
   `node.stale_link_refund` off (40 to 3) and, with the refund on, asserts the fallback still cuts
   exhausted walks (597 to 1) and fails no more reads (2 and 2).
+
+- offer2: conflicts in core walk tests and production read tests (the hang2 test
+  `reader_visits_an_owner_that_left_it_unanswered_after_the_others` and offer2's
+  `owner_leaves_origin_retries_to_a_failing_rank_zero` had been interleaved; both kept whole),
+  the simulator's `NodeConfig` (`rank0_failure_hold` added), `CandidatePolicy` (offer2's
+  `observe_route` runs for every probe answer, before hang2's rank 0 note, which still needs an
+  answer rank 0 signed; hang2's `link_health` and pings kept before offer2's `offer`), the
+  simulator's probe answer handling (hang2's failed-read trace and offer2's cut evidence both
+  kept), and this document. offer2's new issue 431 was renumbered 58.
 
 ### Interplay
 
@@ -6128,6 +6138,17 @@ track branches; the merged commits are 52167892a to 89021f889 (probes), 6377f520
 - The rank 0 timeout rule is unchanged: a granted probe's timeout neither withholds origin nor
   marks rank 0 unanswered (`walk::tests::granted_probes_leave_the_rank_zero_timeout_rule_alone`
   still passes).
+- offer2's rank 0 failure hold (`Rank0State::Failed`, issue 52) against hang2: the hold only
+  acts on `Outcome::Failed`, an `Unavailable` that rank 0 itself signed, which also clears
+  rank 0's silence (it answered). A silent rank 0 fails at once at the transport level, which
+  gives authority as before. A probe of rank 0 that times out while the page is `Failed`
+  replaces the entry with a `Fetching` one (`Rank0Watch::timed_out` keeps only timeout
+  entries), so the timeout rule and `Overdue` apply as without the hold; a later own origin
+  failure starts a new hold. Granted probes never probe rank 0 and a batch treats every
+  non-copy answer as a miss, so the hold does not reach them; the stale link refund changes no
+  rank 0 state. No interaction bug found; no new test.
+- The hold also covers the issue 55 class at 5k: the worst `full-failover` page falls 7 to 5
+  (seed 1) and 8 to 5 (seed 2) with offer2.
 
 ### Evidence
 
@@ -6162,4 +6183,36 @@ origin.
   both are origin failure retries (Known issue 52 class), recorded under Known issue 55. Seed 3
   completes 129 fewer reads (33,718 to 33,589) with fewer failures (34 to 31);
   ok plus failed falls 33,752 to 33,620, so fewer reads were issued or finished; not traced.
-- 50k runs are deferred to part 2.
+With offer2 (all four tracks), against the ctl3 column above:
+
+| Run | Probes, hang2, ctl3 | All four tracks |
+| --- | --- | --- |
+| 5k storm | 378,544 / 0; 1,024, 1, 0 | 378,544 / 0; 1,024, 1, 0 |
+| 5k zipf | 202,851 / 15; 40,404, 3, 1,452 | 202,851 / 15; 40,404, 3, 1,452 |
+| 5k churn | 291,482 / 93; 1,026, 2, 2 | 291,482 / 93; 1,026, 2, 2 |
+| 5k zipf 16 MiB | 37,639 / 29; 17,826, 3, 134 | 37,639 / 29; 17,826, 3, 134 |
+| 5k 1 Gbit/s storm | 95,107 / 0; 6,941, 2, 2 | 95,107 / 0; 6,941, 2, 2 |
+| 5k full-cold-start | 95,107 / 0; 6,942, 2, 2 | 95,107 / 0; 6,942, 2, 2 |
+| 5k full-failover | 33,977 / 28; 12,971, 7, 314 | 33,976 / 32; 12,963, 5, 320 |
+| 5k full-failover seed 2 | 33,745 / 24; 12,978, 8, 354 | 33,747 / 23; 12,976, 5, 348 |
+| 5k full-failover seed 3 | 33,589 / 31; 12,906, 6, 300 | 33,594 / 29; 12,902, 6, 292 |
+| 5k full-churn | 34,072 / 0; 12,638, 3, 93 | 34,073 / 0; 12,637, 4, 90 |
+| 5k zipf, 50 hung members | 30,642 / 3; 11,867, 2, 38 | 30,634 / 3; 11,843, 2, 24 |
+
+- Scenarios without failover are unchanged by offer2. `copy_held` repeats in 5k
+  `full-failover`: 64 to 58, 69 to 67, 66 to 55 (seeds 1 to 3). The 5k `full-churn` worst page
+  rises 3 to 4 (one page); not traced.
+
+50k, seed 1, `/tmp/opencode/m4b/rr.json` (wave 5: `/tmp/opencode/m7/`). Reads ok / failed;
+origin requests, worst page, pages fetched more than once; `copy_held` repeats; wall; peak RSS.
+
+| Run | Wave 5 | All four tracks |
+| --- | --- | --- |
+| 50k full-cold-start | 913,187 / 11; 27,360, 3, 411; 6; 21:26; 4.4 GiB | 912,774 / 3; 27,148, 3, 187; 9; 22:17; 4.6 GiB |
+| 50k full-failover | 303,355 / 266; 47,617, 6, 2,268; 578; 28:55; 3.1 GiB | 303,161 / 343; 47,320, 7, 1,981; 527; 30:13; 3.3 GiB |
+
+- 50k `full-cold-start` fails 3 reads (wave 5: 11; ctl3 alone: 4, Known issue 57).
+- 50k `full-failover` fails 343 reads, the offer2 regression of Known issue 58 (offer2 alone:
+  343). The worst page is 7 (probes alone: 8, wave 5: 6) and `copy_held` falls 578 to 527
+  (probes alone: 626), so Known issue 55 is smaller but not gone at 50k. No invariant failures
+  and `unexplained` 0 in both runs.
