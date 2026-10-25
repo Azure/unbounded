@@ -816,3 +816,23 @@ fn previous_owners_wait_instead_of_skipping_owners_that_are_behind() {
     );
     assert_eq!(counter(&r, "walk_exhausted_stale"), 0, "{r}");
 }
+
+/// Known issues 47 and 49: a verified `StaleMembership` returns the links
+/// past its answerer, so a reader that waited for, or fell back past, a
+/// stale owner can still fund its later owners.
+#[test]
+fn stale_answers_return_unused_links() {
+    let config = |refund: bool| {
+        let mut config = churny(120, 2);
+        config.request_rate = 40.0;
+        config.node.membership_lag_ns = config.node.membership_batch_ns;
+        config.node.stale_link_refund = refund;
+        config
+    };
+    let on = run(config(true), 3).1;
+    let off = run(config(false), 3).1;
+    assert!(counter(&on, "stale_links_refunded") > 0, "{on}");
+    assert_eq!(counter(&off, "stale_links_refunded"), 0, "{off}");
+    assert!(counter(&on, "walk_exhausted") <= counter(&off, "walk_exhausted"));
+    assert!(counter(&on, "reads_failed") <= counter(&off, "reads_failed"));
+}

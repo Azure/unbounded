@@ -4160,6 +4160,7 @@ impl NodeWorld {
             let refunded = budget
                 .refund_remote(probe.remote)
                 .and_then(|()| budget.refund_links(unused));
+            self.metrics.add("stale_links_refunded", u64::from(unused));
             self.invariants.check(
                 "budget_never_grows",
                 refunded.is_ok(),
