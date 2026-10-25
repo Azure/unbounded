@@ -795,9 +795,12 @@ Verified against the code at the start of this work.
    page was 6), while moved-page repeats fall 590 to 288 and origin requests 47,617 to 47,354. The
    5k runs do not show it (`copy_held` 79 to 68, 79 to 76, 64 to 65 for seeds 1 to 3).
    `after_failure` repeats are unchanged (1,790 to 1,789), so the worst pages are likely the
-   Known issue 52 class with shifted timing; that is an inference, not traced. After the wave 6
-   merge the 5k `full-failover` seed 2 worst page is 7 (wave 5: 6). Open (round 4, probes, wave
-   6).
+   Known issue 52 class with shifted timing; that is an inference, not traced at 50k. At 5k
+   after the wave 6 merge with ctl3 the worst `full-failover` page is 7 (seed 1) and 8 (seed 2),
+   wave 5: 6 and 6. A temporary per-page trace (not committed) showed both worst pages are
+   origin failure retries only: rank 0's origin request fails, an owner above rank 0 asks
+   origin itself (skip `failed` or `copy_only`), its request fails too, and the cycle repeats
+   (the Known issue 52 class). Open (round 4, probes, wave 6; combined, wave 6).
 
 56. Resolved: a primary's own seat follower failed closed when the primary committed while
    the follower's state read was in flight: the read answered the record the commit replaced,
@@ -1354,8 +1357,9 @@ scenarios carry data-plane faults.
 54. A reader returns to a busy rank 0 once it answers the reader's ping; keeping it demoted
    failed fewer reads in 5k `zipf` at 16 MiB but overlapped more origin requests (round 4,
    hang2, wave 6).
-55. 50k `full-failover` `copy_held` 578 to 626 and worst page 6 to 8 after the probes change,
-   not traced (round 4, probes, wave 6).
+55. 50k `full-failover` `copy_held` 578 to 626 and worst page 6 to 8 after the probes change;
+   5k worst pages 7 and 8 after the ctl3 merge are origin failure retries (issue 52 class)
+   (round 4, probes, wave 6).
 56. Resolved: a primary's follower read overlapping its own commit failed closed (round 4, ctl3,
    wave 6).
 57. Owners with too little inherited budget fail when their rank 0 is behind on membership (4
@@ -5797,10 +5801,11 @@ total, worst page, pages fetched more than once.
 
 ## Round 4: combined (wave 6)
 
-Branch `racer-sim8-merge` from racer-core-sim 5d1ea912b, with the probes and hang2 tracks
-cherry-picked in that order (part 1; the ctl3 and offer2 tracks follow). Logs, reports and the
-binary: `/tmp/opencode/m8/`. The track sections above cite commit IDs from the track branches;
-the merged commits are 52167892a to 89021f889 (probes) and 6377f5202 to 6ab32f3d8 (hang2).
+Branch `racer-sim8-merge` from racer-core-sim 5d1ea912b, with the probes, hang2 and ctl3
+tracks cherry-picked in that order (the offer2 track follows). Logs, reports and the binary:
+`/tmp/opencode/m8/` (part 1 runs under `p1/`). The track sections above cite commit IDs from the
+track branches; the merged commits are 52167892a to 89021f889 (probes), 6377f5202 to 6ab32f3d8
+(hang2) and 00a48ae94 to 0dc0a6523 (ctl3).
 
 ### Merge
 
@@ -5812,6 +5817,17 @@ the merged commits are 52167892a to 89021f889 (probes) and 6377f5202 to 6ab32f3d
   (all kept) and this document.
 - New Known issues were renumbered: 401 to 53, 402 to 54, 411 to 55, in this document and in
   code comments.
+- ctl3: only this document conflicted (Known issues lists, track sections). ctl3's 421 and 422
+  were renumbered 56 and 57 (code comments in `cluster-control/src/seat.rs` and
+  `step/follower.rs` too). Issues 47 (partly), 48 and 49 keep ctl3's status.
+- ctl3 against probes: the issue 49 bound test walks a reader, which never gets
+  `Step::Granted`; the match now covers it (did not compile otherwise).
+- ctl3 against the stale fallback test (`node::tests::stale_owners_send_non_owners_to_the_previous_membership`):
+  with the stale link refund a walk reaches the other owners even without the fallback, so on
+  seed 3 failed reads without the fallback fell 53 to 2 and the "four times fewer" assertion no
+  longer measured the fallback. The test now measures failed reads with
+  `node.stale_link_refund` off (40 to 3) and, with the refund on, asserts the fallback still cuts
+  exhausted walks (597 to 1) and fails no more reads (2 and 2).
 
 ### Interplay
 
@@ -5826,6 +5842,14 @@ the merged commits are 52167892a to 89021f889 (probes) and 6377f5202 to 6ab32f3d
 - Demotion of unanswered owners (`demote_unanswered`) reorders only a reader's three owners
   (`VisitOrder`); granted lineage and demoted targets are owner-walk targets outside it, so it
   cannot reorder a batch.
+- ctl3's stale link refund (`budget::stale_unused_links`, issues 47 and 49) against batched
+  grants and pings: `refund_links` and `refund_remote` never exceed what that budget was charged,
+  so no refund grows a budget. A stale answer to a batched granted probe refunds into that
+  probe's own grant, which is then dropped; the walk's budget is untouched (production
+  `request_traced` refunds into the budget it was given; the simulator refunds only non-granted
+  probes). A ping is a separate exchange on its own grant. Extended test
+  `a_granted_batch_feeds_silence_evidence` (a stale answer in the batch; the walk budget does
+  not grow, and the stale answerer counts as answering).
 - The rank 0 timeout rule is unchanged: a granted probe's timeout neither withholds origin nor
   marks rank 0 unanswered (`walk::tests::granted_probes_leave_the_rank_zero_timeout_rule_alone`
   still passes).
@@ -5836,22 +5860,31 @@ Release, seed 1 unless noted, same configurations as wave 5. Origin: total, wors
 fetched more than once. No invariant failures; `origin_repeat_explained` `unexplained` is 0 in
 every run, including the 16-scenario smoke at 200 nodes.
 
-| Run | Wave 5 reads ok / failed | Wave 5 origin | Wave 6 (part 1) reads ok / failed | Wave 6 (part 1) origin |
-| --- | --- | --- | --- | --- |
-| 5k storm | 378,544 / 0 | 1,024, 1, 0 | 378,544 / 0 | 1,024, 1, 0 |
-| 5k zipf | 202,851 / 15 | 40,404, 3, 1,452 | 202,851 / 15 | 40,404, 3, 1,452 |
-| 5k churn | 291,474 / 87 | 1,028, 2, 4 | 291,474 / 87 | 1,028, 2, 4 |
-| 5k zipf 16 MiB | 37,637 / 28 | 17,829, 3, 139 | 37,639 / 29 | 17,826, 3, 134 |
-| 5k 1 Gbit/s storm | 95,158 / 0 | 6,970, 2, 16 | 95,158 / 0 | 6,963, 2, 9 |
-| 5k full-cold-start | 95,159 / 0 | 6,970, 2, 16 | 95,159 / 0 | 6,963, 2, 9 |
-| 5k full-failover | 33,970 / 33 | 12,951, 6, 342 | 33,979 / 27 | 12,943, 6, 321 |
-| 5k full-failover seed 2 | 33,740 / 30 | 12,975, 6, 368 | 33,742 / 22 | 12,977, 7, 354 |
-| 5k full-failover seed 3 | 33,715 / 37 | 12,907, 6, 287 | 33,718 / 34 | 12,907, 6, 277 |
-| 5k full-churn | 34,040 / 0 | 12,768, 3, 223 | 34,039 / 0 | 12,639, 3, 95 |
-| 5k zipf, 50 hung members | 30,478 / 140 | 11,757, 2, 25 | 30,642 / 3 | 11,867, 2, 38 |
+Columns: wave 5, then part 1 (probes and hang2), then with ctl3. Each: reads ok / failed;
+origin.
 
-- Overlapping origin requests in 5k `zipf` at 16 MiB: 130 to 120. `copy_held` repeats in 5k
-  `full-failover`: 79 to 68 (seed 1), 79 to 86 (seed 2), 64 to 61 (seed 3).
+| Run | Wave 5 | Probes, hang2 | Probes, hang2, ctl3 |
+| --- | --- | --- | --- |
+| 5k storm | 378,544 / 0; 1,024, 1, 0 | 378,544 / 0; 1,024, 1, 0 | 378,544 / 0; 1,024, 1, 0 |
+| 5k zipf | 202,851 / 15; 40,404, 3, 1,452 | 202,851 / 15; 40,404, 3, 1,452 | 202,851 / 15; 40,404, 3, 1,452 |
+| 5k churn | 291,474 / 87; 1,028, 2, 4 | 291,474 / 87; 1,028, 2, 4 | 291,482 / 93; 1,026, 2, 2 |
+| 5k zipf 16 MiB | 37,637 / 28; 17,829, 3, 139 | 37,639 / 29; 17,826, 3, 134 | 37,639 / 29; 17,826, 3, 134 |
+| 5k 1 Gbit/s storm | 95,158 / 0; 6,970, 2, 16 | 95,158 / 0; 6,963, 2, 9 | 95,107 / 0; 6,941, 2, 2 |
+| 5k full-cold-start | 95,159 / 0; 6,970, 2, 16 | 95,159 / 0; 6,963, 2, 9 | 95,107 / 0; 6,942, 2, 2 |
+| 5k full-failover | 33,970 / 33; 12,951, 6, 342 | 33,979 / 27; 12,943, 6, 321 | 33,977 / 28; 12,971, 7, 314 |
+| 5k full-failover seed 2 | 33,740 / 30; 12,975, 6, 368 | 33,742 / 22; 12,977, 7, 354 | 33,745 / 24; 12,978, 8, 354 |
+| 5k full-failover seed 3 | 33,715 / 37; 12,907, 6, 287 | 33,718 / 34; 12,907, 6, 277 | 33,589 / 31; 12,906, 6, 300 |
+| 5k full-churn | 34,040 / 0; 12,768, 3, 223 | 34,039 / 0; 12,639, 3, 95 | 34,072 / 0; 12,638, 3, 93 |
+| 5k zipf, 50 hung members | 30,478 / 140; 11,757, 2, 25 | 30,642 / 3; 11,867, 2, 38 | 30,642 / 3; 11,867, 2, 38 |
+
+- Overlapping origin requests in 5k `zipf` at 16 MiB: 130 to 120 (120 with ctl3). `copy_held`
+  repeats in 5k `full-failover`: 79 to 68 to 64 (seed 1), 79 to 86 to 69 (seed 2), 64 to 61 to
+  66 (seed 3).
 - The hung-member run trades 110 more origin requests for 137 fewer failed reads; the hang2
   track measured the same (11,757 to 11,867): owners above a hung rank 0 now fetch the page.
+- ctl3 refunds 23 stale links in 5k `full-failover` and 28 in `full-churn`; most runs move
+  within seed noise. The worst `full-failover` page rises to 7 (seed 1) and 8 (seed 2); traced,
+  both are origin failure retries (Known issue 52 class), recorded under Known issue 55. Seed 3
+  completes 129 fewer reads (33,718 to 33,589) with fewer failures (34 to 31); not traced,
+  likely a shifted schedule (ok plus failed is the issued count, 33,752 to 33,620).
 - 50k runs are deferred to part 2.
