@@ -399,13 +399,18 @@ Verified against the code at the start of this work.
    reply bytes 298 GB to 689 GB (9 versions instead of 2). See "Round 4: join". Same family as
    Known issue 6.
 
-21. An owner above rank 0 that cannot fund or route its delegation fetches the page itself, and
-   rank 0, which never asks successors, fetches it again later: in 50k `full-failover` (seed 1)
-   1,643 such skips for lack of a route and 621 for lack of credits, leaving 944 and 336
-   `copy_held` repeats (1.8% and 0.7% of 51,585 origin requests). Every fix tried trades read
-   availability or costs more than it saves (rank 0 asking successors, funding rank 0, delegating
-   without the owner's fallback credit; see "Round 4: repeat", "Fixes tried and rejected"). Bounded
-   by issue 15's invariant. Open (round 4, repeat).
+21. Partly resolved (round 4, orphan, a6c0d74a9 through 6b325b87e): an owner that answered
+   another owner's page probe without a copy keeps a successor hint and answers a reader's
+   `Acquire` with `Miss`, so the reader gets the orphan copy from that owner instead of rank 0
+   fetching the page again. 50k `full-failover` (seed 1): orphans 1,679 to 1,481, `copy_only`
+   orphans 228 to 103, `failed` 676 to 565, origin requests 52,461 to 52,304. What remains is
+   rank 0 refetching for an owner's delegation (it carries one credit and two to four links, too
+   few to reach the holder) and orphans whose owner never reached rank 0 (`route`, `partition`,
+   `busy`: no hint). Bound unchanged: `origin_repeat_explained`. See "Round 4: orphan (wave 3)".
+   Original report: an owner above rank 0 that cannot fund or route its delegation fetches the
+   page itself, and rank 0, which never asks successors, fetches it again later: in 50k
+   `full-failover` 1,643 such skips for lack of a route and 621 for lack of credits, leaving 944
+   and 336 `copy_held` repeats.
 
 22. Resolved (round 4, track repeat, ba709b40e): the simulator issued origin requests without
    debiting the attempt production debits after validating origin authority
@@ -443,6 +448,9 @@ Verified against the code at the start of this work.
    48,438 to 35,917, the most requests for one page from 24 to 4, origin requests canceled from
    18,468 to 2,186, and failed reads from 90 to 54. 1 MiB scenarios keep their trace hashes. See
    "Round 4: handover (wave 3)" (round 4, handover, wave 3).
+141. `dst_generated_native_traffic_churn_oracle` (seed 1) stalls in RDMA link setup on the orphan
+   branch: one side `Ready`, the peer `Idle`, after a successor deferral changes the run's
+   trajectory. Not root-caused. See "Round 4: orphan (wave 3)".
 
 ## Simulator engine (racer-sim substrate)
 
@@ -896,8 +904,9 @@ scenarios carry data-plane faults.
    join).
 20. Join versions cost origin fetches (50k `full-failover` worst page 9 to 12) and seat egress
    (298 GB to 689 GB) (round 4, join).
-21. Owners above rank 0 without the credits or links to delegate fetch themselves and orphan the
-   copy; 2.5% of 50k `full-failover` origin requests (round 4, repeat).
+21. Partly resolved: readers are deferred to the owner holding an orphan copy (round 4, orphan);
+   50k `full-failover` orphans 1,679 to 1,481. Delegation-led refetches and orphans of owners that
+   never reached rank 0 remain.
 22. Resolved: the simulator debits the origin attempt like production (round 4, repeat).
 121. The wave 2 merge lost most of fan-out's gain in the 5k 1 Gbit/s `full-cold-start` 1 s storm
    (102 to 38,430 failed reads) (round 4, relay, wave 3).
@@ -908,6 +917,8 @@ scenarios carry data-plane faults.
    cancel, wave 3).
 161. Resolved: a running fill passes to another live waiter when its leader expires; 5k `zipf` at
    16 MiB: origin requests 48,438 to 35,917, most per page 24 to 4 (round 4, handover, wave 3).
+141. DST native churn oracle seed 1 stalls in link setup on the orphan branch (round 4,
+   orphan).
 
 ## Round 2: production admission
 
@@ -3171,4 +3182,95 @@ and the workspace tests pass (3,417 tests).
 - `origin_repeats_concurrent` stays high in 16 MiB `zipf` (18,275). These are concurrent
   requests for one page from different nodes, not restarts by one flight, so they are outside
   this issue.
+## Round 4: orphan (wave 3)
+
+Known issue 21. Branch `racer-sim5-orphan` from 3771e5c3f. Commits: a6c0d74a9 (racer-core
+`read::successor`), b63e2d409 (simulator model), d80e0293a and 2f5911b11 (production and tests),
+bc66e9100 (simulator test), 6d63164f5, d812b6b67, 6b325b87e (notes without ranking), plus this
+section.
+
+### Root cause
+
+An owner walk visits only its predecessors and handoff targets (`CandidateWalk::new`,
+`core/src/read/walk.rs:280`), so rank 0 never asks a successor. An owner above rank 0 delegates
+only with `left + 2` credits (`walk.rs:455`); otherwise it asks rank 0 copy-only, misses, and
+fetches (`copy_only`), or rank 0's own fetch fails and the owner falls back (`failed`). Either way
+the copy lands above rank 0 and rank 0 fetches again on its next cold miss.
+
+Instrumented 5k `full-failover` runs showed why the obvious fix (rank 0 asks the successor) does
+not work: every request that reaches rank 0 in these cases carried one credit (a delegation) or
+two to six links, and nine in ten hint probes from rank 0 failed route search. Owner requesters
+cannot help either: rank 2 keeps one link for its rank 1 probe (`walk.rs`, delegation route first),
+so deferring rank 2 to rank 1 made rank 2 fetch the page itself (`copy_only` skips 335 to 480 at
+20k). Readers, however, visit every owner with their own eight links.
+
+### Change
+
+- `racer_core::read::successor`: `SuccessorHints` (per node, at most 4,096 pages, two nodes per
+  page, 600 s), `should_note`, `successor_deferral`, `MAX_DEFERRALS` (8).
+- Noting: an owner answering a copy-only page probe with `Miss` notes the requester without
+  ranking; a failed page `Acquire` notes the requester when the ranking already cached by the
+  owner's own walk shows both as owners (`src/read.rs` `note_successor`, simulator `note_hint`).
+  Neither path ranks or touches the placement cache.
+- Deferral: an owner without a copy that holds a hint naming another current owner answers a
+  non-owner's page `Acquire` with `Miss` (production `defer_to_successor` in
+  `Coordinator::serve_peer`, simulator `defer_to_successor` in `serve`). Owners are never
+  deferred. A hint defers at most 8 requests. No wire change: `Miss` is an existing response, and
+  a deferral never reaches origin, so origin authority and budgets are unchanged.
+- Telemetry: `racer_successor_hints_total`, `racer_successor_deferrals_total`.
+- Simulator switch `node.successor_hints` (default on).
+
+Cost: a deferred reader whose holder lost the copy, or whose fetch failed, takes one more owner
+probe and sometimes exhausts its walk and retries. 5k `full-failover`: `walk_exhausted` 558 to
+615, failed reads 23 to 36; 50k: 12,192 to 12,575, failed reads 1,527 to 1,542.
+
+### Tests
+
+- racer-core: `successor::tests` (table, TTL, eviction, charge, `should_note`, deferral rules).
+- Production (`src/read/tests/peer_copies.rs`): `rank_zero_defers_readers_to_the_owner_it_missed`
+  (fails without deferral), `rank_zero_never_defers_owner_requesters`,
+  `rank_zero_never_defers_to_a_reader`, `rank_zero_without_hints_acquires_for_readers`.
+- Simulator: `combined::tests::failover_readers_are_deferred_to_orphan_holders` (400 nodes, seed
+  2: `copy_only` plus `failed` orphans 152 without hints, 104 with).
+
+### Evidence
+
+Release, seed 1, same configs as wave 2. Before is wave 2 (`/tmp/opencode/m4b/`), after is this
+branch (`/tmp/opencode/r5o/final/`). Origin: total, max, pages>1. Orphans: all, then
+`copy_only` / `failed`.
+
+| Run | Reads ok / failed | Origin | `copy_held` | Orphans | Deferrals | Wall |
+| --- | --- | --- | --- | --- | --- | --- |
+| 5k storm before | 268,449 / 461 | 1,024, 1, 0 | 0 | 0 | - | 1:28 |
+| 5k storm after | 268,449 / 461 | 1,024, 1, 0 | 0 | 0 | 0 | 1:23 |
+| 5k zipf before | 149,525 / 4,373 | 42,216, 3, 4,171 | 565 | 0 | - | 2:14 |
+| 5k zipf after | 150,570 / 3,851 | 42,148, 3, 3,985 | 516 | 0 | 873 | 2:07 |
+| 5k churn before | 172,701 / 450 | 1,040, 3, 15 | 7 | 0 | - | 1:12 |
+| 5k churn after | 169,843 / 451 | 1,041, 2, 17 | 7 | 0 | 0 | 1:08 |
+| 5k full-cold-start before | 94,829 / 1 | 6,946, 2, 52 | 5 | 5 (1 / 0) | - | 0:43 |
+| 5k full-cold-start after | 94,828 / 2 | 6,947, 2, 53 | 6 | 4 (1 / 0) | 42 | 0:40 |
+| 5k full-failover before | 33,804 / 23 | 13,075, 7, 458 | 169 | 97 (30 / 42) | - | 0:53 |
+| 5k full-failover after | 33,781 / 36 | 13,050, 6, 450 | 150 | 76 (14 / 34) | 252 | 0:51 |
+| 5k full-churn before | 33,988 / 4 | 13,653, 6, 991 | 13 | 10 (4 / 4) | - | 0:52 |
+| 5k full-churn after | 33,987 / 4 | 13,662, 6, 998 | 21 | 10 (0 / 8) | 189 | 0:48 |
+| 50k full-failover before | 299,717 / 1,527 | 52,461, 9, 6,136 | 2,451 | 1,679 (228 / 676) | - | 28:37 |
+| 50k full-failover after | 299,710 / 1,542 | 52,304, 7, 6,099 | 2,305 | 1,481 (103 / 565) | 2,143 | 30:09 |
+
+Peak RSS is unchanged (50k 3.1 GiB). `unexplained` is 0 and no hard invariant failed in any run;
+all 16 scenarios at 200 nodes, 1 s, pass. 5k `churn` completes 2.3% fewer reads at seed 1
+with no deferral at all (169,843 against 172,701); seeds 2 and 3 complete 2.4% and 1.2% more than
+without hints, so this is run-to-run sensitivity, not a cost.
+
+### Deviations and open items
+
+- Issue 21 is only partly resolved: delegation-led refetches and orphans of owners that never
+  reached rank 0 (`route` 448, `partition` 154, `busy` 208 at 50k) remain. Fixing them needs a
+  way for rank 0 to learn of the copy without a route to it (for example the orphan owner pushing
+  it), which is a protocol change.
+- New Known issue 141: `app::tests::dst::dst_generated_native_traffic_churn_oracle` fails at seed 1
+  on this branch with "link setup stalled": after one deferral changes the run's trajectory, node
+  `0d` holds a `Ready` RDMA link to `10` while `10` reports `Idle`, and `connect_links` never
+  recovers. Seeds 2 to 14 pass on both branches and base passes seed 1. Inference: a link-state
+  divergence (peer reset while the other side stays ready) that the new trajectory exposes; not
+  root-caused here. Must be resolved or triaged before merge.
 
