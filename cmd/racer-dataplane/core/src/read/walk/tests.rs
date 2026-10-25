@@ -341,8 +341,11 @@ fn owner_with_tight_links_partitions_predecessor_routes() {
     });
     assert_eq!(probes[0].0.mode, Mode::Acquire);
     assert_eq!((probes[0].1, probes[0].2), (2, 6));
-    // Without a delegation (too few attempts), copy-only predecessors split
-    // the pool, each capped at four.
+    // Without a delegation (too few attempts), the copy-only probe of rank
+    // 0 comes first the same way: it decides whether this owner leaves the
+    // fetch to rank 0 (a route failure gives origin authority; an equal
+    // split left rank 2 two links and made it fetch pages rank 0 was
+    // fetching, Known issue 40).
     let mut walk = CandidateWalk::new(config(Some(2), 3, VisitOrder::canonical(3)));
     let mut b = budget(3, 7);
     b.note_route_failure();
@@ -350,9 +353,19 @@ fn owner_with_tight_links_partitions_predecessor_routes() {
         Outcome::Probe(ProbeOutcome::CopyMiss)
     });
     assert_eq!(probes[0].0.mode, Mode::CopyOnly);
-    assert_eq!((probes[0].1, probes[0].2), (1, 3));
+    assert_eq!((probes[0].1, probes[0].2), (1, 6));
     // The last predecessor may use the whole remaining pool.
     assert_eq!((probes[1].1, probes[1].2), (3, 7));
+    // Without a failure route the first route is capped at four links, and
+    // the later predecessor keeps the rest.
+    let mut walk = CandidateWalk::new(config(Some(2), 3, VisitOrder::canonical(3)));
+    let mut b = budget(3, 4);
+    let (probes, _) = drive(&mut walk, &mut b, |_, _| {
+        Outcome::Probe(ProbeOutcome::CopyMiss)
+    });
+    assert_eq!((probes[0].0.canonical, probes[0].2), (0, 3));
+    assert_eq!(probes[1].0.canonical, 1);
+    assert!(probes[1].2 >= 1);
 }
 
 #[test]

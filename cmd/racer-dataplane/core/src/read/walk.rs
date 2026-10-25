@@ -757,10 +757,22 @@ impl CandidateWalk {
                 // pool; the first must not consume every link after an incoming
                 // eight-link envelope selected failure routing.
                 let remaining = sharing as u8;
-                Some(budget.partition(
-                    owner_attempts,
-                    (budget.remaining_links() / remaining).min(4),
-                )?)
+                let links = if canonical == 0 && !handoff && self.config.page_operation {
+                    // A copy-only probe of rank 0 decides, like a
+                    // delegation, whether this owner leaves the fetch to
+                    // rank 0 (which joins it to its running acquisition,
+                    // Known issue 31): later predecessors keep one link each.
+                    // An equal share left rank 2 too few links to route to
+                    // rank 0, and a route failure gives origin authority
+                    // (Known issue 40).
+                    budget
+                        .route_links()
+                        .min(budget.remaining_links().saturating_sub(remaining - 1))
+                        .max(1)
+                } else {
+                    (budget.remaining_links() / remaining).min(4)
+                };
+                Some(budget.partition(owner_attempts, links)?)
             } else if continuation.bounded_routes
                 || (rank.is_none()
                     && !copy_only
