@@ -73,7 +73,7 @@ pub struct NodeConfig {
     pub hot_page_bodies: u32,
     /// A running fill continues for another live waiter when its leader
     /// expires (production: on for every fill except warm gates; set 0 to
-    /// measure without it, Known issue 161).
+    /// measure without it, Known issue 30).
     pub flight_handover: bool,
     /// Rank 0 asks a successor that recently missed it before origin
     /// (production: always on; set 0 to measure without it, Known issue 21).

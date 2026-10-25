@@ -510,7 +510,7 @@ pub fn handover_outcome<O>(handed_over: bool, outcome: Outcome<O, Error>) -> Out
     }
 }
 
-/// Hard ceiling of a fill that may be handed over (Known issue 161): the
+/// Hard ceiling of a fill that may be handed over (Known issue 30): the
 /// leader's deadline plus `HANDOVER_SPANS` times its remaining span. The fill
 /// normally ends earlier, when no live waiter remains to adopt it; the
 /// ceiling only bounds the owned scope's timers. Without handover the

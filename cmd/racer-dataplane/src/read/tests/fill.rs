@@ -5051,7 +5051,7 @@ fn expiry_snapshot_disk_driver_stage_survives_caller_drop() {
     let _ = drive_io(replacement, &f.reactor, &mut f.engine, &f.crypto);
 }
 
-/// Known issue 161: when the leader's caller is canceled while its fill
+/// Known issue 30: when the leader's caller is canceled while its fill
 /// driver runs, the driver keeps running for the other acquisition caller
 /// instead of canceling; that caller completes from the same operation.
 #[test]

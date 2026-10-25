@@ -658,7 +658,7 @@ fn repeat_origin_fetches_are_classified_and_bounded() {
     }
 }
 
-/// Known issue 122: with origin slower than the read deadline, leaders expire
+/// Known issue 24: with origin slower than the read deadline, leaders expire
 /// while their fills wait on origin. The fill stays a retained flight
 /// operation (production `Flights::retain_operation`), so later readers of
 /// the page wait for it instead of starting a concurrent fill, and the
@@ -684,7 +684,7 @@ fn expired_leaders_drain_before_a_new_fill() {
     assert_eq!(counter(&report, "flight_unexpected_lead"), 0);
 }
 
-/// Known issue 151: production cancels an expired fill's origin exchange at
+/// Known issue 29: production cancels an expired fill's origin exchange at
 /// the leader's deadline, which frees the origin connection and bandwidth.
 /// The simulator cancels it too, so no origin answer arrives after a fill's
 /// scope, and the canceled bodies leave bandwidth to later requests.
@@ -709,7 +709,7 @@ fn expired_fills_cancel_their_origin_request() {
     assert_eq!(counter(&report, "flight_unexpected_lead"), 0);
 }
 
-/// Known issue 161: with origin slower than the read deadline and readers
+/// Known issue 30: with origin slower than the read deadline and readers
 /// arriving throughout, an expired leader's fill continues for a later
 /// waiter instead of being canceled and restarted. Compared with the same
 /// run without handover, origin requests and the most requests for one page

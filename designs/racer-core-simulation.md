@@ -390,7 +390,7 @@ Verified against the code at the start of this work.
    walks the page's owners under the recent previous membership once instead of spending its
    credits on each stale owner (`racer_core::read::stale`). 50k failed reads: `full-failover`
    1,527 to 479, `full-cold-start` 1,103 to 247. What remains are readers that joined in the
-   version their owners lack (Known issue 132). See "Round 4: join2 (wave 3)".
+   version their owners lack (Known issue 26). See "Round 4: join2 (wave 3)".
    Was: join versions cause `StaleMembership` skips. A new member learns that it is listed at the
    same time as its peers, so a requester that already holds the version skips it as a stale
    destination; when all owners of a page are new, the walk is exhausted. At 50,000 nodes
@@ -403,7 +403,7 @@ Verified against the code at the start of this work.
    model installed it, so clients one version behind got full images. 50k seat replies 562 GB to
    302 GB (`full-failover`) and 576 to 302 GB (`full-cold-start`), the one-image-per-client floor;
    full fallbacks 97,931 to 1,398, all from the empty bootstrap version. Bound: no full fallback
-   for lack of a delta (tests). The origin half is Known issue 131. See "Round 4: join2 (wave 3)".
+   for lack of a delta (tests). The origin half is Known issue 25. See "Round 4: join2 (wave 3)".
    Was: join versions cost origin fetches and seat egress. Pages move from early members to later
    ones as the membership grows, and clients that fall two versions behind get full images.
    `full-failover` at 50,000 nodes: origin requests 57,163 to 66,620 (worst page 9 to 12), seat
@@ -428,7 +428,7 @@ Verified against the code at the start of this work.
    (`src/read/fill.rs:1810`), so an owner with a spent budget still fetched (135 requests in 5k
    `full-failover`). It now fails the fill like production (`origin_unfunded`).
 
-121. The wave 2 merge lost most of fan-out's gain in the overloaded 1 Gbit/s `full-cold-start`
+23. The wave 2 merge lost most of fan-out's gain in the overloaded 1 Gbit/s `full-cold-start`
    storm (5k, seed 1, `nic_bps` 125,000,000, one 1 s storm at 300 s): the fanout branch alone
    completed 94,798 reads with 102 failures; the merged base 3771e5c3f completes 56,399 with
    38,430 failures (20,119 deadline, 18,311 unavailable), 288,896 relay rejections, 191,873 probe
@@ -437,29 +437,26 @@ Verified against the code at the start of this work.
    join track's membership versions and handoff's previous-owner probes change the storm's walks).
    With the relay fix: 63,745 / 31,084. Not root-caused (round 4, relay, wave 3).
 
-122. Resolved: `flight_leader_valid` failed in 5k `zipf` at production page size under origin
+24. Resolved: `flight_leader_valid` failed in 5k `zipf` at production page size under origin
    overload because `racer_core::read::flight::PageFlights` did not model production's retained
    flight operations; the simulator now retains each fill like production (374 violations on
    3771e5c3f, 376 with the relay fixes, 0 after). See "Round 4: flight (wave 3)" (round 4,
    flight, wave 3).
 
-151. Resolved: a fill whose leader's deadline passed kept running until origin answered, because
-   the origin model (`sim/src/resources.rs`, `Origin::request`) reserved FIFO bandwidth up front
-   and could not cancel. The origin model now cancels a tracked request like production closing
-   the connection (slot and unsent bandwidth freed, later requests move earlier), and the
-   simulator cancels the fill's origin request at its scope. 5k `zipf` at 16 MiB pages: 18,468
-   origin requests canceled, completed reads 31,111 to 33,374, failed reads 211 to 90, and the
-   new `origin_within_scope` invariant holds; 1 MiB scenarios keep their trace hashes. See
-   "Round 4: cancel (wave 3)" (round 4, cancel, wave 3).
+25. Origin repeats after an owner move whose holder the handoff cannot find: the new owner asks
+   only the owners of membership version - 1, and peers keep older memberships only for the 30 s
+   grace window, so a copy fetched two or more versions earlier is not asked. 50k `full-failover`
+   (seed 1): of 3,610 `after_owner_move` repeats, 980 had a version - 2 holder and 1,240 an older
+   one; 5k `full-churn`: 892 of 1,062 older than version - 2. Fixing it needs older memberships
+   kept for ranking or rankings deeper than `REPLICAS`. Open (round 4, join2).
 
-161. Resolved: an expired or canceled leader's running fill now continues for the live acquisition
-   waiter with the latest deadline instead of being canceled and restarted (shared flight state
-   `allow_handover`, production `Flights::allow_handover` and `FlightOperation::poll_cancellation`,
-   core `PageFlights::allow_handover`). In 5k `zipf` at 16 MiB pages, origin requests fall from
-   48,438 to 35,917, the most requests for one page from 24 to 4, origin requests canceled from
-   18,468 to 2,186, and failed reads from 90 to 54. 1 MiB scenarios keep their trace hashes. See
-   "Round 4: handover (wave 3)" (round 4, handover, wave 3).
-141. Resolved: DST harness bug, not production. `connect_links`
+26. Readers that joined in the version their owners have not applied yet cannot use the stale
+   fallback (they are not members of version - 1, so peers would reject them under it): 50k
+   `full-cold-start` 247 failed reads, all during enrollment (54 to 161 s); every one of the
+   1,732 stale skips that could not fall back was by such a reader (`stale_fallback_not_member`). Open (round 4,
+   join2).
+
+27. Resolved: DST harness bug, not production. `connect_links`
    (`src/app/tests/dst.rs`) only asked node `a` to set up the link, but step 28
    (`InflightCrash`) crashed and restarted node `10` under `0d`'s `Ready` link. `0d` holds a
    half-open link it only learns about on use (`verbs/src/simulation.rs:917-918` returns
@@ -470,21 +467,32 @@ Verified against the code at the start of this work.
    not-ready side initiate and waits out either side's backoff. Regression tests
    `rdma::links::tests::half_open_link_after_peer_restart_*`. See "Round 4: orphan (wave 3)".
 
-145. `dst_generated_native_traffic_churn_oracle` seed 16 fails at step 0 (`PendingWriteCrash`):
+28. `dst_generated_native_traffic_churn_oracle` seed 16 fails at step 0 (`PendingWriteCrash`):
    retired node 24 leaks 30,776 `RequestContext` bytes. Pre-existing: base 3771e5c3f fails the
    same way; the non-native oracle passes seed 16. Not root-caused.
-131. Origin repeats after an owner move whose holder the handoff cannot find: the new owner asks
-   only the owners of membership version - 1, and peers keep older memberships only for the 30 s
-   grace window, so a copy fetched two or more versions earlier is not asked. 50k `full-failover`
-   (seed 1): of 3,610 `after_owner_move` repeats, 980 had a version - 2 holder and 1,240 an older
-   one; 5k `full-churn`: 892 of 1,062 older than version - 2. Fixing it needs older memberships
-   kept for ranking or rankings deeper than `REPLICAS`. Open (round 4, join2).
 
-132. Readers that joined in the version their owners have not applied yet cannot use the stale
-   fallback (they are not members of version - 1, so peers would reject them under it): 50k
-   `full-cold-start` 247 failed reads, all during enrollment (54 to 161 s); every one of the
-   1,732 stale skips that could not fall back was by such a reader (`stale_fallback_not_member`). Open (round 4,
-   join2).
+29. Resolved: a fill whose leader's deadline passed kept running until origin answered, because
+   the origin model (`sim/src/resources.rs`, `Origin::request`) reserved FIFO bandwidth up front
+   and could not cancel. The origin model now cancels a tracked request like production closing
+   the connection (slot and unsent bandwidth freed, later requests move earlier), and the
+   simulator cancels the fill's origin request at its scope. 5k `zipf` at 16 MiB pages: 18,468
+   origin requests canceled, completed reads 31,111 to 33,374, failed reads 211 to 90, and the
+   new `origin_within_scope` invariant holds; 1 MiB scenarios keep their trace hashes. See
+   "Round 4: cancel (wave 3)" (round 4, cancel, wave 3).
+
+30. Resolved: an expired or canceled leader's running fill now continues for the live acquisition
+   waiter with the latest deadline instead of being canceled and restarted (shared flight state
+   `allow_handover`, production `Flights::allow_handover` and `FlightOperation::poll_cancellation`,
+   core `PageFlights::allow_handover`). In 5k `zipf` at 16 MiB pages, origin requests fall from
+   48,438 to 35,917, the most requests for one page from 24 to 4, origin requests canceled from
+   18,468 to 2,186, and failed reads from 90 to 54. 1 MiB scenarios keep their trace hashes. See
+   "Round 4: handover (wave 3)" (round 4, handover, wave 3).
+
+31. In 5k `zipf` at 16 MiB pages about 18k origin requests still overlap with a request for the
+   same page from another node (`origin_repeats_concurrent`): two owners fetch the same page at the
+   same time, so neither can ask the other for a copy. Bounded by `REPLICAS` per page per move and
+   explained by the `origin_repeat_explained` invariant, but it is still origin egress. Open (round
+   4, handover, wave 3; recorded at the wave 3 merge).
 
 ## Simulator engine (racer-sim substrate)
 
@@ -934,41 +942,34 @@ scenarios carry data-plane faults.
 18. Resolved: relays no longer hold their transmit side idle for bodies queued upstream (a
    simulator artifact); 5k `zipf` fails 17 reads (was 4,373), `storm` 0 (was 461) (round 4, relay,
    wave 3, 0eba3d9c8).
-19. Join versions cause `StaleMembership` skips: 1,411 to 1,756 failed reads at 50k (round 4,
-   join).
-20. Join versions cost origin fetches (50k `full-failover` worst page 9 to 12) and seat egress
-   (298 GB to 689 GB) (round 4, join).
+19. Partly resolved: non-owners whose owners are behind walk the recent previous membership;
+   50k failed reads 1,527 to 479 (failover) and 1,103 to 247 (cold start); the rest is 26
+   (round 4, join2).
+20. Resolved: images keep their delta across idle primary passes; 50k seat replies 562 to 302 GB,
+   the one-image-per-client floor; origin half split into 25 (round 4, join2).
 21. Partly resolved: readers are deferred to the owner holding an orphan copy (round 4, orphan);
    50k `full-failover` orphans 1,679 to 1,481. Delegation-led refetches and orphans of owners that
    never reached rank 0 remain.
 22. Resolved: the simulator debits the origin attempt like production (round 4, repeat).
-121. The wave 2 merge lost most of fan-out's gain in the 5k 1 Gbit/s `full-cold-start` 1 s storm
+23. The wave 2 merge lost most of fan-out's gain in the 5k 1 Gbit/s `full-cold-start` 1 s storm
    (102 to 38,430 failed reads) (round 4, relay, wave 3).
-122. Resolved: core `PageFlights` retains leader operations like production `Flights`; the
+24. Resolved: core `PageFlights` retains leader operations like production `Flights`; the
    simulator retains each fill (round 4, flight, wave 3).
-151. Resolved: the origin model cancels a tracked request (slot and unsent bandwidth freed), and
+25. Owner moves over more than one version: handoff asks only version - 1 owners (980 + 1,240 of
+   3,610 move repeats in 50k `full-failover`) (round 4, join2).
+26. Readers that joined in the version their owners lack cannot fall back (247 failed reads in
+   50k `full-cold-start`) (round 4, join2).
+27. Resolved: DST harness only let the survivor set up a half-open link after a peer
+   crash-restart; the restarted peer now initiates (round 4, orphan).
+28. DST native churn oracle seed 16 leaks `RequestContext` on a crashed node (pre-existing on
+   base; open).
+29. Resolved: the origin model cancels a tracked request (slot and unsent bandwidth freed), and
    the simulator cancels an expired fill's origin request at its scope like production (round 4,
    cancel, wave 3).
-161. Resolved: a running fill passes to another live waiter when its leader expires; 5k `zipf` at
+30. Resolved: a running fill passes to another live waiter when its leader expires; 5k `zipf` at
    16 MiB: origin requests 48,438 to 35,917, most per page 24 to 4 (round 4, handover, wave 3).
-141. Resolved: DST harness only let the survivor set up a half-open link after a peer
-   crash-restart; the restarted peer now initiates (round 4, orphan).
-145. DST native churn oracle seed 16 leaks `RequestContext` on a crashed node (pre-existing on
-   base; open).
-18. `zipf` at 5k sheds on the `Relay` quota since the relay hold (4,373 failed, 339,136 relay
-   rejections after wave 2); `storm` is down to 461 failed (round 4, combined waves 1 and 2).
-19. Partly resolved: non-owners whose owners are behind walk the recent previous membership;
-   50k failed reads 1,527 to 479 (failover) and 1,103 to 247 (cold start); the rest is 132
-   (round 4, join2).
-20. Resolved: images keep their delta across idle primary passes; 50k seat replies 562 to 302 GB,
-   the one-image-per-client floor; origin half split into 131 (round 4, join2).
-21. Owners above rank 0 without the credits or links to delegate fetch themselves and orphan the
-   copy; 2.5% of 50k `full-failover` origin requests (round 4, repeat).
-22. Resolved: the simulator debits the origin attempt like production (round 4, repeat).
-131. Owner moves over more than one version: handoff asks only version - 1 owners (980 + 1,240 of
-   3,610 move repeats in 50k `full-failover`) (round 4, join2).
-132. Readers that joined in the version their owners lack cannot fall back (247 failed reads in
-   50k `full-cold-start`) (round 4, join2).
+31. In 5k `zipf` at 16 MiB pages about 18k origin requests overlap with another node's request
+   for the same page (`origin_repeats_concurrent`) (round 4, handover, wave 3).
 
 ## Round 2: production admission
 
@@ -2887,14 +2888,14 @@ max per page, pages fetched more than once. Repeats are `after_failure` / `after
   are the byte-based shed threshold (2 bodies instead of 32 for 16 MiB pages) and counting native
   transfers.
 - The 1 Gbit/s `full-cold-start` 1 s storm regressed on the wave 2 merge before this branch (new
-  Known issue 121); this branch improves it but does not restore the fanout branch's result.
+  Known issue 23); this branch improves it but does not restore the fanout branch's result.
 - `flight_leader_valid` fails in origin-overloaded `zipf` with 16 MiB pages on the base too (new
-  Known issue 122).
+  Known issue 24).
 - Hedges still do not ask the helper (off by default; see Changes).
 
 ## Round 4: flight (wave 3)
 
-Branch `racer-sim5-flight`, based on `racer-sim5-relay` (b06192038). Resolves Known issue 122.
+Branch `racer-sim5-flight`, based on `racer-sim5-relay` (b06192038). Resolves Known issue 24.
 Evidence logs and configs: `/tmp/opencode/r5-flight/`.
 
 ### Root cause
@@ -2943,7 +2944,7 @@ correct and is unchanged.
   - Production versus core:
     - `flights_match_page_flights_on_seeded_traces` (48 seeds) now retains and completes
       operations at random and requires both steps.
-    - `expired_leader_with_retained_operation_drains_before_reelection` replays the issue 122
+    - `expired_leader_with_retained_operation_drains_before_reelection` replays the issue 24
       sequence against both tables.
   - Simulator: `node::tests::expired_leaders_drain_before_a_new_fill` uses 64 nodes, a 1 MiB/s
     origin, and four storms. It fails with 4 `flight_leader_valid` violations when only
@@ -2965,7 +2966,7 @@ correct and is unchanged.
 The duplicate fills are gone: origin requests fell 8.6% and the most requests for one page fell
 from 6 to 4. Completed reads fell 11% because later readers now wait for the draining flight
 instead of starting another fill. Production behaves the same way, except that production cancels
-the expired fill at about the deadline. The simulator cannot do that yet (Known issue 151), so its
+the expired fill at about the deadline. The simulator cannot do that yet (Known issue 29), so its
 flights drain later. A trial that canceled at the deadline without refunding origin bandwidth was
 worse (origin fills 1,584) and was not kept.
 
@@ -2979,11 +2980,11 @@ invariant failures.
 ### Deviations and open items
 
 - Production is unchanged. The bug was in the core model and in the simulator's use of it.
-- Known issue 151 is new: the simulator does not cancel an expired fill's origin request.
+- Known issue 29 is new: the simulator does not cancel an expired fill's origin request.
 
 ## Round 4: cancel (wave 3)
 
-Known issue 151: the simulator let a fill run until origin answered after its leader's deadline
+Known issue 29: the simulator let a fill run until origin answered after its leader's deadline
 passed, while production cancels it at about the deadline.
 
 ### Root cause
@@ -3067,7 +3068,7 @@ wasted origin bandwidth, so it was not kept.
 
 Reads improve because waiters no longer wait for an expired fill to finish. Origin requests rise
 because each re-elected leader starts a new request that is often canceled as well. This is what
-production does, so it is recorded as Known issue 161 and not hidden in the model. Wall time rises
+production does, so it is recorded as Known issue 30 and not hidden in the model. Wall time rises
 by 27 s, mostly from replaying the queue of about 30k outstanding requests on each of the 18k
 cancellations.
 
@@ -3083,8 +3084,8 @@ and the workspace tests pass (3,405 tests).
 
 ### Deviations and open items
 
-- Production is unchanged. Issue 151 was a modeling gap.
-- Known issue 161 (new, production): a fill is canceled when its leader expires even if other
+- Production is unchanged. Issue 29 was a modeling gap.
+- Known issue 30 (new, production): a fill is canceled when its leader expires even if other
   waiters remain. Each re-elected waiter restarts the origin fetch and discards the partly
   transferred body. Possible fixes are handing the running operation to the next waiter's scope
   or letting the fill run to the latest waiter deadline within budget. Either fix changes flight
@@ -3094,7 +3095,7 @@ and the workspace tests pass (3,405 tests).
 
 ## Round 4: handover (wave 3)
 
-Branch `racer-sim5-handover`, based on `racer-sim5-cancel` (52d4dcd8b). Resolves Known issue 161.
+Branch `racer-sim5-handover`, based on `racer-sim5-cancel` (52d4dcd8b). Resolves Known issue 30.
 Evidence logs and configs: `/tmp/opencode/r5-handover/`.
 
 ### Root cause
@@ -3181,7 +3182,7 @@ Budgets and authority:
   - `expired_leaders_hand_their_fill_to_later_waiters` compares runs with and without handover.
     With handover there are fewer origin requests and cancellations, the most requests for one
     page does not rise, and no violations occur.
-  - The Known issue 122 and 151 tests now set `flight_handover = false`, so they still cover
+  - The Known issue 24 and 29 tests now set `flight_handover = false`, so they still cover
     draining and cancellation.
 
 ### Evidence
@@ -3317,14 +3318,13 @@ without hints, so this is run-to-run sensitivity, not a cost.
   reached rank 0 (`route` 448, `partition` 154, `busy` 208 at 50k) remain. Fixing them needs a
   way for rank 0 to learn of the copy without a route to it (for example the orphan owner pushing
   it), which is a protocol change.
-- New Known issue 141: `app::tests::dst::dst_generated_native_traffic_churn_oracle` fails at seed 1
+- New Known issue 27: `app::tests::dst::dst_generated_native_traffic_churn_oracle` fails at seed 1
   on this branch with "link setup stalled": after one deferral changes the run's trajectory, node
   `0d` holds a `Ready` RDMA link to `10` while `10` reports `Idle`, and `connect_links` never
-  recovers. Seeds 2 to 14 pass on both branches and base passes seed 1. Inference: a link-state
-  divergence (peer reset while the other side stays ready) that the new trajectory exposes; not
-  root-caused here. Must be resolved or triaged before merge.
+  recovers. Seeds 2 to 14 pass on both branches and base passes seed 1. Since resolved: a DST
+  harness bug, not production (see the triage below and Known issue 27).
 
-### Known issue 141 triage
+### Known issue 27 triage
 
 Tracing link opens, accepts, and breaks for seed 1 showed `0d` opened epoch 7 to `10` at step
 24 and `10` accepted it, then step 28 (`InflightCrash`) crashed and restarted `10`. The new
@@ -3335,7 +3335,7 @@ asked only `0d` to set up, and `Links::wants` is false for a `Ready` link, so it
 production paths both recover (the restarted peer's setup replaces the stale link, and first use
 breaks it); unit tests in `src/rdma/links/tests.rs` pin both. The harness now lets the side
 that is not ready initiate. The native oracle passes seeds 1 to 15 and 17 to 40; seed 16 fails at
-step 0 with a `RequestContext` leak that base also has (new Known issue 145).
+step 0 with a `RequestContext` leak that base also has (new Known issue 28).
 
 ## Round 4: join2 (wave 3)
 
@@ -3393,7 +3393,7 @@ holder as a version - 1 owner (most of them handoff targets left unasked for bud
 holder as a version - 2 owner, and 1,240 as an owner of an older version; 3 lost the copy. In 5k
 `full-churn`, 892 of 1,062 are from versions older than N - 2. Handoff (round 4, handoff) only
 ranks version - 1, and peers do not keep older memberships (grace 30 s, `Snapshot::retention`),
-so those holders are not found. This part is new Known issue 131.
+so those holders are not found. This part is new Known issue 25.
 
 ### Changes
 
@@ -3483,10 +3483,10 @@ Reading the table:
   applied yet (`stale_fallback_not_member`: 8 in `full-cold-start`, 4 in `full-churn`). At 50k
   `full-cold-start` (rerun with the counters, same results) all 1,732 stale skips that could not
   fall back were for that reason (`stale_fallback_not_recent` 0), and the 247 failures all happen
-  between 54 and 161 s, during enrollment. They are new Known issue 132.
+  between 54 and 161 s, during enrollment. They are new Known issue 26.
 - Origin: unchanged within noise (50k failover 52,461 to 52,384, worst page 9; cold start 29,336
   to 29,680, worst page 5). The fallback does not add origin requests: it never runs at an owner.
-  The origin half of issue 20 is the holder that the handoff cannot find (new Known issue 131).
+  The origin half of issue 20 is the holder that the handoff cannot find (new Known issue 25).
 
 ### Bounds
 
@@ -3503,11 +3503,11 @@ Reading the table:
   production cost: production installed planned images only on a record change. The fix is in
   the shared `plan_pass` and saves production a re-encode per pass.
 - Issue 19 is not closed for readers that joined in the version the owners lack (Known issue
-  132): they are not members of version - 1, so peers would reject them under it. Options:
+  26): they are not members of version - 1, so peers would reject them under it. Options:
   delay a new node's readiness by the propagation window, or a reader-side wait and retry within
   the read deadline (the simulator's client retries four times within milliseconds; production's
   client retry policy was not modeled further here).
-- Known issue 131 (origin repeats from holders of versions older than version - 1) needs either
+- Known issue 25 (origin repeats from holders of versions older than version - 1) needs either
   older memberships kept for ranking (production keeps only the 30 s grace window) or rankings
   deeper than `REPLICAS` (`topology` keeps the best three per slot); both are design changes and
   were not attempted.

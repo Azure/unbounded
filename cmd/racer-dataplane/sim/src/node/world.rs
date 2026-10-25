@@ -353,7 +353,7 @@ struct Fill {
     asked: Vec<(u32, Asked)>,
     /// Outstanding origin request and its outcome (drawn at issue).
     origin: Option<(OriginHandle, OriginOutcome)>,
-    /// The fill was canceled at its scope (Known issue 151).
+    /// The fill was canceled at its scope (Known issue 29).
     canceled: bool,
 }
 
@@ -1605,7 +1605,7 @@ impl NodeWorld {
         // Production retains the fill as a flight operation before submitting
         // it (`src/read/fill.rs`, `retain_operation`): a revoked leader's
         // still-running fill keeps the flight draining, so no second leader
-        // starts a concurrent fill for the page (Known issue 122).
+        // starts a concurrent fill for the page (Known issue 24).
         let retained = self.nodes[node as usize].workers[w as usize]
             .flights
             .retain_operation(&self.ids.page(page), leader);
@@ -1617,7 +1617,7 @@ impl NodeWorld {
             || format!("retain page {page} leader {leader}: {retained:?}"),
         );
         // Production lets the running fill pass to another live waiter when
-        // its leader expires (Known issue 161, `Flights::allow_handover`),
+        // its leader expires (Known issue 30, `Flights::allow_handover`),
         // bounded by a hard ceiling on its owned scope.
         let handover = self.config.node.flight_handover;
         if handover {
@@ -3669,7 +3669,7 @@ impl NodeWorld {
     }
 
     /// The waiter fill `id` serves reached its deadline. Refresh the flight
-    /// so another live waiter adopts the fill (Known issue 161). If one did,
+    /// so another live waiter adopts the fill (Known issue 30). If one did,
     /// fail the elected leader's own read, which production ends at its
     /// deadline while its driver keeps running, and return when to check
     /// again; `None` cancels the fill.
@@ -3912,7 +3912,7 @@ impl NodeWorld {
             .check("origin_within_scope", now <= scope, now, Some(node), || {
                 format!("fill {id} origin answered at {now} after its scope {scope}")
             });
-        // Known issue 161: a handed-over fill runs only while some waiter
+        // Known issue 30: a handed-over fill runs only while some waiter
         // it serves is live.
         let live = self.origin_check_at(id).is_some_and(|check| now <= check);
         self.invariants

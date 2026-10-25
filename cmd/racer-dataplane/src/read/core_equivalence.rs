@@ -633,7 +633,7 @@ fn flights_match_page_flights_on_seeded_traces() {
     }
 }
 
-/// Known issue 122: a leader whose deadline passes while its retained
+/// Known issue 24: a leader whose deadline passes while its retained
 /// operation runs is revoked; its detach keeps the entry, a new caller waits
 /// rather than leading a concurrent acquisition, the stale publish is rejected
 /// by both tables, and only completing the operation elects the new caller.
@@ -674,7 +674,7 @@ fn expired_leader_with_retained_operation_drains_before_reelection() {
     assert!(pair.table.is_empty());
 }
 
-/// Known issue 161: an expired leader's running operation passes to the
+/// Known issue 30: an expired leader's running operation passes to the
 /// live waiter with the latest deadline on both tables; the elected
 /// capability's deadline failure then retries for the adopter, which leads
 /// with its own budget; abandoning a handed-over acquisition revokes it and

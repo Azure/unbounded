@@ -1479,7 +1479,7 @@ impl Fill {
         // abandonment must cancel only this work.
         let caller_scope = acquisition.scope.clone();
         let caller_cancellation = caller_scope.cancellation.subscribe()?;
-        // Known issue 161: unless the caller fences on this work (warm
+        // Known issue 30: unless the caller fences on this work (warm
         // gates), the running fill continues for another live acquisition
         // waiter when the leader expires or is canceled, instead of being
         // canceled and restarted from scratch by the next leader. The owned

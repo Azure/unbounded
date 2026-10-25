@@ -347,7 +347,7 @@ fn budget_gates() {
     assert_eq!(entry_cap_gate(1024, &limits), Err(Error::Overloaded));
 }
 
-/// Known issue 122: a leader whose deadline passes while its fill still runs
+/// Known issue 24: a leader whose deadline passes while its fill still runs
 /// is revoked. With the fill retained as an operation (production
 /// `Flights::retain_operation`), the flight keeps draining: the expired
 /// leader's detach does not remove it, a new caller waits instead of starting
@@ -411,7 +411,7 @@ fn expired_leader_with_retained_operation_blocks_reelection_until_complete() {
 }
 
 /// Without a retained operation the same sequence reproduces the simulator's
-/// original Known issue 122 failure: the expired leader's detach removes the
+/// original Known issue 24 failure: the expired leader's detach removes the
 /// entry, a new caller leads a second fill, and the first leader's finish is
 /// stale.
 #[test]
@@ -515,7 +515,7 @@ fn deadline_takes_precedence_over_recorded_rejection() {
     );
 }
 
-/// Known issue 161: with handover allowed, an expired leader's running fill
+/// Known issue 30: with handover allowed, an expired leader's running fill
 /// continues for the live waiter with the latest deadline. That waiter is not
 /// re-elected (no second fill), the elected capability still publishes, and
 /// every remaining waiter completes from the one fill.

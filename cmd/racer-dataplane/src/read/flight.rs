@@ -339,7 +339,7 @@ impl FlightOperation {
     }
 
     /// [`FlightOperation::cancellation_requested`], registering `cx` to be
-    /// woken at the current leader's deadline (Known issue 161). The worker
+    /// woken at the current leader's deadline (Known issue 30). The worker
     /// expires the alarm through [`Flights::poll_with_context`].
     pub(super) fn poll_cancellation(&mut self, cx: &mut Context<'_>) -> bool {
         let Some(deadline) = self.leader_deadline() else {
@@ -1456,7 +1456,7 @@ impl Flights {
     }
 
     /// Let `leader`'s running operation continue for another live acquisition
-    /// waiter when `leader` expires or is canceled (Known issue 161). Only for
+    /// waiter when `leader` expires or is canceled (Known issue 30). Only for
     /// drivers whose caller does not fence on the operation.
     pub(crate) fn allow_handover(&self, leader: &FlightLeader) -> Result<()> {
         self.update(|table, wakes| {

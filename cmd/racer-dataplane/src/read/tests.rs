@@ -1221,7 +1221,7 @@ mod flight {
             );
         }
 
-        /// Known issue 161: a canceled leader's running operation continues for
+        /// Known issue 30: a canceled leader's running operation continues for
         /// the remaining acquisition waiter instead of being canceled; the
         /// elected capability publishes and the adopter completes without
         /// leading a second fill or spending its budget.
