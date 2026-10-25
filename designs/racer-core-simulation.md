@@ -386,14 +386,25 @@ Verified against the code at the start of this work.
    Was: the relay hold from the capacity track makes the 5k hot-page scenarios shed on the `Relay`
    quota (`zipf` 4,373 failed reads, 339,136 relay rejections after the wave 2 merge).
 
-19. Join versions cause `StaleMembership` skips. A new member learns that it is listed at the
+19. Partly resolved (round 4, join2, b08235140, 7aacc03ae): a non-owner whose owner is behind
+   walks the page's owners under the recent previous membership once instead of spending its
+   credits on each stale owner (`racer_core::read::stale`). 50k failed reads: `full-failover`
+   1,527 to 479, `full-cold-start` 1,103 to 247. What remains are readers that joined in the
+   version their owners lack (Known issue 132). See "Round 4: join2 (wave 3)".
+   Was: join versions cause `StaleMembership` skips. A new member learns that it is listed at the
    same time as its peers, so a requester that already holds the version skips it as a stale
    destination; when all owners of a page are new, the walk is exhausted. At 50,000 nodes
    (seed 1, `full-cold-start` without the storm) 17,573 stale-destination skips and 1,411 failed
    reads; in `full-failover`, 1,756 failed reads (was 12,759). See "Round 4: join". No invariant
    is relaxed. Same family as Known issues 3 and 12.
 
-20. Join versions cost origin fetches and seat egress. Pages move from early members to later
+20. Resolved (round 4, join2, 0925234b3): the seat egress was a simulator-model artifact. The
+   shared `plan_pass` rebuilt the image on every primary pass and dropped its delta, and the step
+   model installed it, so clients one version behind got full images. 50k seat replies 562 GB to
+   302 GB (`full-failover`) and 576 to 302 GB (`full-cold-start`), the one-image-per-client floor;
+   full fallbacks 97,931 to 1,398, all from the empty bootstrap version. Bound: no full fallback
+   for lack of a delta (tests). The origin half is Known issue 131. See "Round 4: join2 (wave 3)".
+   Was: join versions cost origin fetches and seat egress. Pages move from early members to later
    ones as the membership grows, and clients that fall two versions behind get full images.
    `full-failover` at 50,000 nodes: origin requests 57,163 to 66,620 (worst page 9 to 12), seat
    reply bytes 298 GB to 689 GB (9 versions instead of 2). See "Round 4: join". Same family as
@@ -462,6 +473,18 @@ Verified against the code at the start of this work.
 145. `dst_generated_native_traffic_churn_oracle` seed 16 fails at step 0 (`PendingWriteCrash`):
    retired node 24 leaks 30,776 `RequestContext` bytes. Pre-existing: base 3771e5c3f fails the
    same way; the non-native oracle passes seed 16. Not root-caused.
+131. Origin repeats after an owner move whose holder the handoff cannot find: the new owner asks
+   only the owners of membership version - 1, and peers keep older memberships only for the 30 s
+   grace window, so a copy fetched two or more versions earlier is not asked. 50k `full-failover`
+   (seed 1): of 3,610 `after_owner_move` repeats, 980 had a version - 2 holder and 1,240 an older
+   one; 5k `full-churn`: 892 of 1,062 older than version - 2. Fixing it needs older memberships
+   kept for ranking or rankings deeper than `REPLICAS`. Open (round 4, join2).
+
+132. Readers that joined in the version their owners have not applied yet cannot use the stale
+   fallback (they are not members of version - 1, so peers would reject them under it): 50k
+   `full-cold-start` 247 failed reads, all during enrollment (54 to 161 s); 5k every non-owner
+   that could not fall back was such a reader (`stale_fallback_not_member`). Open (round 4,
+   join2).
 
 ## Simulator engine (racer-sim substrate)
 
@@ -932,6 +955,20 @@ scenarios carry data-plane faults.
    crash-restart; the restarted peer now initiates (round 4, orphan).
 145. DST native churn oracle seed 16 leaks `RequestContext` on a crashed node (pre-existing on
    base; open).
+18. `zipf` at 5k sheds on the `Relay` quota since the relay hold (4,373 failed, 339,136 relay
+   rejections after wave 2); `storm` is down to 461 failed (round 4, combined waves 1 and 2).
+19. Partly resolved: non-owners whose owners are behind walk the recent previous membership;
+   50k failed reads 1,527 to 479 (failover) and 1,103 to 247 (cold start); the rest is 132
+   (round 4, join2).
+20. Resolved: images keep their delta across idle primary passes; 50k seat replies 562 to 302 GB,
+   the one-image-per-client floor; origin half split into 131 (round 4, join2).
+21. Owners above rank 0 without the credits or links to delegate fetch themselves and orphan the
+   copy; 2.5% of 50k `full-failover` origin requests (round 4, repeat).
+22. Resolved: the simulator debits the origin attempt like production (round 4, repeat).
+131. Owner moves over more than one version: handoff asks only version - 1 owners (980 + 1,240 of
+   3,610 move repeats in 50k `full-failover`) (round 4, join2).
+132. Readers that joined in the version their owners lack cannot fall back (247 failed reads in
+   50k `full-cold-start`) (round 4, join2).
 
 ## Round 2: production admission
 
@@ -3422,3 +3459,59 @@ after a stale skip; "Full fb." is `ctl_full_fallbacks`. Logs and reports: `/tmp/
 | 50k full-failover, wave 2 | 299,717 / 1,527 | 52,461 (9, 6,136) | 2,138 / 3,498 / 2,451 | 15,433 | - | - | 7 | 97,931 | 562 GB | 28:37 |
 | 50k full-failover, intermediate | 301,836 / 959 | 52,385 (8, 5,952) | 2,079 / 3,566 / 2,173 | 8,925 | 3,863 | 3,005 | 7 | 1,398 | 302 GB | 28:40 |
 | 50k full-failover | 302,582 / 479 | 52,384 (9, 5,938) | 2,059 / 3,610 / 2,109 | 4,495 | 1,239 | 1,908 | 7 | 1,398 | 302 GB | 28:30 |
+| 50k full-cold-start, wave 2 | 908,373 / 1,103 | 29,336 (5, 2,639) | 0 / 2,627 / 330 | 12,800 | - | - | 6 | 103,840 | 576 GB | 20:38 |
+| 50k full-cold-start | 911,461 / 247 | 29,680 (5, 2,505) | 0 / 2,629 / 162 | 4,254 | 1,182 | 1,797 | 6 | 1,530 | 302 GB | 20:41 |
+
+"Intermediate" is a build with the image fix and an earlier fallback that ran only after the walk
+was exhausted; by then the stale probes had spent the credits (2,862 of its fallbacks ended
+`Exhausted` for funding), which is why the final version falls back at the first stale owner.
+No run had a hard invariant failure; `origin_repeat_explained` holds (`unexplained` 0). Peak RSS
+at 50k is unchanged (3.1 GB failover).
+
+Reading the table:
+
+- Seat egress: 50k 562 to 302 GB (failover) and 576 to 302 GB (cold start), full fallbacks 97,931
+  to 1,398 (all `_first`); 5k 5.9 to 3.2 GB. This is the one-image-per-client floor (298 GB with
+  the single-version model before the join gate), so the seat cost of join versions is gone. The
+  number of versions is unchanged (7 and 6 at 50k).
+- Failed reads at 50k: failover 1,527 to 479, cold start 1,103 to 247; stale skips 15,433 to 4,495
+  and 12,800 to 4,254. 5k is unchanged within noise (its failures come from the origin error and
+  partition windows); 5k `churn` gains 4,782 completed reads and 53 fewer failures (14,412
+  fallbacks).
+- Remaining stale failures: the reader cannot fall back. At 5k every such case is a reader that
+  is not a member of version - 1, that is, a node that joined in the version its owners have not
+  applied yet (`stale_fallback_not_member`: 8 in `full-cold-start`, 4 in `full-churn`); at 50k
+  the 247 cold start failures all happen between 54 and 161 s, during enrollment. They are new
+  Known issue 132.
+- Origin: unchanged within noise (50k failover 52,461 to 52,384, worst page 9; cold start 29,336
+  to 29,680, worst page 5). The fallback does not add origin requests: it never runs at an owner.
+  The origin half of issue 20 is the holder that the handoff cannot find (new Known issue 131).
+
+### Bounds
+
+- Seat egress: no client gets a full image for lack of a delta. `ctl_full_fallbacks` is only
+  `_first` (clients of the empty bootstrap version) in every run above; the tests assert
+  `_no_delta` 0 under churn and `_skipped` and `_other` 0 in the cold start test.
+- A non-owner spends at most one probe on owners that are behind before it walks the previous
+  membership, and walks at most two memberships per read with one budget; a fallback never
+  reaches the origin (tests above; `only_owner_hits_origin` holds in every run).
+
+### Deviations and open items
+
+- The seat egress half of issue 20 was a simulator-model artifact in shared step code, not a
+  production cost: production installed planned images only on a record change. The fix is in
+  the shared `plan_pass` and saves production a re-encode per pass.
+- Issue 19 is not closed for readers that joined in the version the owners lack (Known issue
+  132): they are not members of version - 1, so peers would reject them under it. Options:
+  delay a new node's readiness by the propagation window, or a reader-side wait and retry within
+  the read deadline (the simulator's client retries four times within milliseconds; production's
+  client retry policy was not modeled further here).
+- Known issue 131 (origin repeats from holders of versions older than version - 1) needs either
+  older memberships kept for ranking (production keeps only the 30 s grace window) or rankings
+  deeper than `REPLICAS` (`topology` keeps the best three per slot); both are design changes and
+  were not attempted.
+- `PREVIOUS_MEMBERSHIP_WITHIN` (10 s) gates the fallback as it gates owners' previous-membership
+  probes. At 50k the propagation window is longer (client lag p90 24 to 30 s), so readers that
+  adopted a version more than 10 s earlier still skip stale owners; a peer that already dropped
+  version - 1 answers `StaleMembership` to the fallback, which is only a skip, so a longer window
+  would cost probes, not correctness. Not tuned.
