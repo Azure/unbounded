@@ -630,6 +630,9 @@ mod tests {
             versions <= 3 + window / racer_cluster_control::step::primary::JOIN_HOLD_SECS,
             "{versions} versions in {window} s"
         );
+        // No client skipped a version on the way (Known issue 20).
+        assert_eq!(ctl_counter(&after, "ctl_full_fallbacks_skipped"), 0);
+        assert_eq!(ctl_counter(&after, "ctl_full_fallbacks_other"), 0);
     }
 
     #[test]

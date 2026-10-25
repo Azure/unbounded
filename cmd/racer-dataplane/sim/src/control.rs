@@ -1201,6 +1201,20 @@ impl ControlSim {
         };
         if kind == "ctl_full_replies" && after.is_some() {
             self.metrics.incr("ctl_full_fallbacks");
+            // Why: the client skipped a version, holds the first publication
+            // (the empty bootstrap membership, whose delta is no smaller than
+            // the image), the image has no delta from the client's version,
+            // or a hash mismatch.
+            let why = if after.is_some_and(|a| seq > a + 1) {
+                "ctl_full_fallbacks_skipped"
+            } else if after == Some(1) && delta.is_none() {
+                "ctl_full_fallbacks_first"
+            } else if delta.is_none() {
+                "ctl_full_fallbacks_no_delta"
+            } else {
+                "ctl_full_fallbacks_other"
+            };
+            self.metrics.incr(why);
         }
         self.metrics.incr(kind);
         self.metrics.add("ctl_reply_bytes", bytes as u64);
@@ -1860,6 +1874,15 @@ mod tests {
         );
         assert!(counter(&r, "ctl_full_replies") > 0);
         assert!(checks(&r, "ctl_client_converges") > 0);
+        // A primary pass that changes nothing keeps the image's delta, so
+        // a client one version behind never gets a full image for lack of
+        // one (Known issue 20).
+        assert_eq!(
+            counter(&r, "ctl_full_fallbacks_no_delta"),
+            0,
+            "{}",
+            r["metrics"]["counters"]
+        );
     }
 
     #[test]

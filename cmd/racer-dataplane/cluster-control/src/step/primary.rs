@@ -243,7 +243,14 @@ pub fn plan_pass(i: &PassInputs<'_>, rng: &mut dyn Entropy) -> Result<PassPlan, 
         || next.desired_seats != base.desired_seats
         || next.sequence != base.sequence
         || next.membership_version != base.membership_version;
-    let image = prepared.map(|p| Image::new(p.record, p.publication, p.encoded, i.previous_image));
+    // An unchanged record keeps the previous image, and with it the delta
+    // from the version before: rebuilding it against itself would drop the
+    // delta, so every client one version behind would get the full image
+    // (Known issue 20), and it would re-encode the image on every pass.
+    let image = prepared.map(|p| match i.previous_image {
+        Some(prev) if prev.record == p.record => prev.clone(),
+        _ => Image::new(p.record, p.publication, p.encoded, i.previous_image),
+    });
     Ok(PassPlan {
         base,
         next,
@@ -658,7 +665,32 @@ mod tests {
         assert!(p3.changed);
         assert_eq!(p3.next.sequence, committed.sequence + 1);
         assert_eq!(p3.next.membership_version, committed.membership_version + 1);
-        assert!(p3.image.unwrap().delta.is_some());
+        let image3 = p3.image.unwrap();
+        assert!(image3.delta.is_some());
+        // A later pass with nothing new keeps that image and its delta, so
+        // clients one version behind still get a delta (Known issue 20).
+        let committed3 = p3.next;
+        let p4 = plan_pass(
+            &inputs(
+                &more,
+                &own,
+                &policy,
+                &live,
+                &w,
+                Some(&committed3),
+                Some(&image3),
+            ),
+            &mut Seeded::new(4),
+        )
+        .unwrap();
+        assert!(!p4.changed);
+        let image4 = p4.image.expect("complete observation keeps an image");
+        assert_eq!(image4.record, image3.record);
+        assert_eq!(
+            image4.delta.as_ref().map(|(s, h, _)| (*s, h.clone())),
+            image3.delta.as_ref().map(|(s, h, _)| (*s, h.clone()))
+        );
+        assert!(std::sync::Arc::ptr_eq(&image4.encoded, &image3.encoded));
     }
 
     #[test]
