@@ -776,8 +776,9 @@ Verified against the code at the start of this work.
    page was 6), while moved-page repeats fall 590 to 288 and origin requests 47,617 to 47,354. The
    5k runs do not show it (`copy_held` 79 to 68, 79 to 76, 64 to 65 for seeds 1 to 3).
    `after_failure` repeats are unchanged (1,790 to 1,789), so the worst pages are likely the
-   Known issue 52 class with shifted timing; that is an inference, not traced. Open (round 4,
-   probes, wave 6).
+   Known issue 52 class with shifted timing; that is an inference, not traced. After the wave 6
+   merge the 5k `full-failover` seed 2 worst page is 7 (wave 5: 6). Open (round 4, probes, wave
+   6).
 
 ## Simulator engine (racer-sim substrate)
 
@@ -5638,3 +5639,64 @@ Release, seed 1 unless noted, 5k, same configurations as the wave 5 table ("Roun
 ### Open issues after wave 6 (hang2)
 
 45 to 52, 53, 54.
+
+## Round 4: combined (wave 6)
+
+Branch `racer-sim8-merge` from racer-core-sim 5d1ea912b, with the probes and hang2 tracks
+cherry-picked in that order (part 1; the ctl3 and offer2 tracks follow). Logs, reports and the
+binary: `/tmp/opencode/m8/`. The track sections above cite commit IDs from the track branches;
+the merged commits are 52167892a to 89021f889 (probes) and 6377f5202 to 6ab32f3d8 (hang2).
+
+### Merge
+
+- Conflicts: the simulator's `NodeConfig` knobs (`parallel_granted`, `lineage_cap`,
+  `unknown_age_targets` from probes, `silence` from hang2, all kept), the simulator's `Probing`
+  state (the batch index `granted` from probes and the destination and send time from hang2,
+  all kept), the simulator's answer handling (the destination clears its silence unless a relay
+  signed the answer; for a batched probe the relay flag is the batch entry's), core walk tests
+  (all kept) and this document.
+- New Known issues were renumbered: 401 to 53, 402 to 54, 411 to 55, in this document and in
+  code comments.
+
+### Interplay
+
+- Batched granted probes (probes, issue 45) and silence (hang2, issues 41 and 43): a batch's
+  exchanges go through the same `request_traced` and hop path as sequential probes, so a
+  request for a silent destination or next hop fails at once inside a batch too. But the batch
+  did not feed the requester's silence state: a sequential granted probe's timeout demotes its
+  destination and its destination's own answer clears it, a batched one did neither (production
+  `CandidatePolicy::granted_batch`, simulator batch timeouts). Both now do, without a ping (a
+  granted target is never rank 0). New test
+  `read::tests::peer_copies::a_granted_batch_feeds_silence_evidence` (fails without the change).
+- Demotion of unanswered owners (`demote_unanswered`) reorders only a reader's three owners
+  (`VisitOrder`); granted lineage and demoted targets are owner-walk targets outside it, so it
+  cannot reorder a batch.
+- The rank 0 timeout rule is unchanged: a granted probe's timeout neither withholds origin nor
+  marks rank 0 unanswered (`walk::tests::granted_probes_leave_the_rank_zero_timeout_rule_alone`
+  still passes).
+
+### Evidence
+
+Release, seed 1 unless noted, same configurations as wave 5. Origin: total, worst page, pages
+fetched more than once. No invariant failures; `origin_repeat_explained` `unexplained` is 0 in
+every run, including the 16-scenario smoke at 200 nodes.
+
+| Run | Wave 5 reads ok / failed | Wave 5 origin | Wave 6 (part 1) reads ok / failed | Wave 6 (part 1) origin |
+| --- | --- | --- | --- | --- |
+| 5k storm | 378,544 / 0 | 1,024, 1, 0 | 378,544 / 0 | 1,024, 1, 0 |
+| 5k zipf | 202,851 / 15 | 40,404, 3, 1,452 | 202,851 / 15 | 40,404, 3, 1,452 |
+| 5k churn | 291,474 / 87 | 1,028, 2, 4 | 291,474 / 87 | 1,028, 2, 4 |
+| 5k zipf 16 MiB | 37,637 / 28 | 17,829, 3, 139 | 37,639 / 29 | 17,826, 3, 134 |
+| 5k 1 Gbit/s storm | 95,158 / 0 | 6,970, 2, 16 | 95,158 / 0 | 6,963, 2, 9 |
+| 5k full-cold-start | 95,159 / 0 | 6,970, 2, 16 | 95,159 / 0 | 6,963, 2, 9 |
+| 5k full-failover | 33,970 / 33 | 12,951, 6, 342 | 33,979 / 27 | 12,943, 6, 321 |
+| 5k full-failover seed 2 | 33,740 / 30 | 12,975, 6, 368 | 33,742 / 22 | 12,977, 7, 354 |
+| 5k full-failover seed 3 | 33,715 / 37 | 12,907, 6, 287 | 33,718 / 34 | 12,907, 6, 277 |
+| 5k full-churn | 34,040 / 0 | 12,768, 3, 223 | 34,039 / 0 | 12,639, 3, 95 |
+| 5k zipf, 50 hung members | 30,478 / 140 | 11,757, 2, 25 | 30,642 / 3 | 11,867, 2, 38 |
+
+- Overlapping origin requests in 5k `zipf` at 16 MiB: 130 to 120. `copy_held` repeats in 5k
+  `full-failover`: 79 to 68 (seed 1), 79 to 86 (seed 2), 64 to 61 (seed 3).
+- The hung-member run trades 110 more origin requests for 137 fewer failed reads: owners above a
+  silent rank 0 fetch at once (issue 43).
+- 50k runs are deferred to part 2.
