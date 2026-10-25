@@ -2793,6 +2793,9 @@ max per page, pages fetched more than once. Repeats are `after_failure` / `after
   complete within the 2 s window.
 - `full-*` at request rate 0.005 carry little relayed traffic and are identical except for 82 helper
   probes in `full-cold-start` that are no longer needed.
+- 50k `full-cold-start` (`request_rate` 0.005): 908,373 / 1,103 before, 908,410 / 1,073 after;
+  origin 29,336 and 29,358 (max 5 both), no relay rejections in either, wall 20:38 and 20:13, peak
+  RSS 4.21 and 4.22 GiB. Its failures are join versions (Known issue 19), not relays.
 - Wall and peak RSS fell slightly (5k `zipf` 2:14 and 1.53 GiB to 2:00 and 1.42 GiB).
 - No hard invariant failure in any run above; the 16-scenario smoke at 200 nodes (1 s) is clean.
 
