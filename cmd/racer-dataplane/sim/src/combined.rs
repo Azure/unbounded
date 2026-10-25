@@ -524,6 +524,40 @@ mod tests {
         }
     }
 
+    /// Known issue 21: an owner that answered another owner's page probe
+    /// without a copy defers readers to it instead of fetching the page
+    /// again, so fewer pages are fetched by rank 0 while a successor's orphan
+    /// copy is held (`copy_only` and `failed` orphans). Without successor
+    /// hints nothing is deferred.
+    #[test]
+    fn failover_readers_are_deferred_to_orphan_holders() {
+        let run_with = |hints: bool| {
+            let mut config = Config {
+                nodes: 400,
+                ..Config::default()
+            };
+            data_defaults(&mut config);
+            config.request_rate = 0.2;
+            config.node.successor_hints = hints;
+            run("full-failover", config, 2, Some(300 * SECONDS), None).unwrap()
+        };
+        // 400 nodes, seed 2: 152 such orphans without hints, 104 with.
+        let (off, on) = (run_with(false), run_with(true));
+        assert_clean(&on);
+        let orphans = |r: &Value| {
+            let o = &r["origin_per_page"]["repeats"]["orphan"];
+            o["copy_only"].as_u64().unwrap() + o["failed"].as_u64().unwrap()
+        };
+        assert_eq!(counter(&off, "successor_deferrals"), 0);
+        assert!(counter(&on, "successor_deferrals") > 0, "{}", on["metrics"]);
+        assert!(
+            counter(&on, "successor_hints_noted") > 0,
+            "{}",
+            on["metrics"]
+        );
+        assert!(orphans(&on) < orphans(&off), "{}", on["origin_per_page"]);
+    }
+
     /// Known issue 7: the Pod crashed for good at `d / 2 + 5 s` leaves the
     /// membership once its Node has been not ready for the grace, so peers
     /// stop choosing it. Before round 4 they chose it until the end.
