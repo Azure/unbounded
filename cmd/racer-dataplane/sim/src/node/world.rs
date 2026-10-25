@@ -1088,6 +1088,10 @@ impl NodeWorld {
                             self.hedge_result(p.fill, primary, Err(Error::Unavailable))
                         }
                         None if let Some(index) = p.granted => {
+                            // A granted probe of a batch is never rank 0's:
+                            // its timeout only demotes, as a sequential
+                            // granted probe's does (Known issues 41 and 45).
+                            self.requester_timeout(p.fill, p.dest, p.sent, NO_PING);
                             self.complete_batch_probe(p.fill, index, Ok(Outcome::TimedOut))
                         }
                         // Sent, but unanswered within the attempt's own bound

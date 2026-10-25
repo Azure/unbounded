@@ -3860,6 +3860,93 @@ fn a_delegated_rank_zero_asks_lineage_and_demoted_targets_on_their_own_grant() {
     }
 }
 
+/// Known issues 41 and 45 (round 4, combined, wave 6): a batch of granted
+/// probes feeds silence evidence as sequential granted probes do. A target
+/// that leaves its probe unanswered is demoted (`Answering::Unanswered`, no
+/// ping: a granted target is never rank 0), one that answers is cleared, and
+/// the timeout does not withhold the owner's origin attempt.
+#[test]
+fn a_granted_batch_feeds_silence_evidence() {
+    use racer_core::read::candidates::Answering;
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let (peers, ordered) = install_peers(&mut f, Some(0));
+    let members = f.membership.members().to_vec();
+    let local = node(peers.local);
+    let demoted = members
+        .iter()
+        .map(|m| m.node.clone())
+        .find(|n| !ordered.contains(n))
+        .unwrap();
+    let old = Membership::validate(
+        racer_control_wire::MembershipVersion(1),
+        members
+            .iter()
+            .filter(|m| m.node != local)
+            .cloned()
+            .collect(),
+    )
+    .unwrap();
+    let current = Arc::new(
+        Membership::validate_with_predecessor(
+            racer_control_wire::MembershipVersion(2),
+            members.clone(),
+            Some(&old),
+        )
+        .unwrap(),
+    );
+    let published = Arc::new(controlplane::Published::new(
+        crate::control::Snapshot::retention(2),
+    ));
+    let now = uring_runtime::environment::now();
+    for (i, membership) in [Arc::new(old), current.clone()].into_iter().enumerate() {
+        let mut snapshot = crate::control::Snapshot::membership_fixture(membership);
+        snapshot.sequence = racer_control_wire::PublicationSequence(i as u64 + 1);
+        published
+            .publish(Arc::new(snapshot), now, |_, _| Ok::<_, Error>(()), || ())
+            .unwrap();
+    }
+    let mut deps = f.fill.dependencies.clone();
+    deps.candidates = Rc::new(CandidatePolicy::new(
+        local.clone(),
+        Rc::new(Placement::new(16)),
+        peers.requester(),
+        deps.credentials.clone(),
+        published,
+    ));
+    f.fill = Fill::new(deps);
+    f.membership = current;
+    f.fill
+        .dependencies
+        .writer
+        .retention()
+        .set_ownership(Rc::new(|_| true));
+    let health = f.fill.dependencies.candidates.link_health();
+    // No minimum wait, so the scripted timeout counts.
+    health.set_silence(Duration::ZERO, Duration::from_secs(1));
+    let replies = [
+        (ordered[1].clone(), Reply::Deadline),
+        (ordered[2].clone(), Reply::Miss),
+        (demoted.clone(), Reply::Miss),
+    ];
+    peers.replies.borrow_mut().extend(replies);
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 1, 1);
+    let result = acquire(&mut f, &mut budget);
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(f.origin.calls.get(), 1);
+    assert_eq!(peers.calls.borrow().len(), 3);
+    assert_eq!(health.answering(&ordered[1]), Answering::Unanswered);
+    assert_eq!(health.answering(&ordered[2]), Answering::Answers);
+    assert_eq!(health.answering(&demoted), Answering::Answers);
+    // No ping is due for a granted target.
+    assert!(
+        health
+            .due_pings(uring_runtime::environment::now(), 8)
+            .is_empty()
+    );
+}
+
 /// The fallback walks the previous membership only as a non-owner: a node
 /// that owned the page there keeps walking the current membership rather
 /// than reach the origin with authority it no longer has. It learns that

@@ -1653,6 +1653,7 @@ impl CandidatePolicy {
             .map(|_| (racer_core::read::walk::granted_budget(deadline), false))
             .collect();
         let owners = candidates.ordered.len();
+        let sent = uring_runtime::environment::now();
         let responses = futures::future::join_all(probes.iter().zip(grants.iter_mut()).map(
             |(probe, (grant, timed_out))| {
                 self.request_traced(
@@ -1671,6 +1672,28 @@ impl CandidatePolicy {
             },
         ))
         .await;
+        // Silence evidence as for a sequential granted probe (Known issues
+        // 41 and 45): the destination's own answer clears it, a timeout
+        // only demotes (a granted target is never rank 0).
+        if let PeerOperation::Page { page: id, .. } = operation {
+            for ((probe, (_, timed_out)), response) in probes.iter().zip(&grants).zip(&responses) {
+                let destination = &handoff[probe.canonical - owners];
+                match response {
+                    Ok(response) if response.origin().node() == destination => {
+                        self.peers.link_health().silence_answered(destination);
+                    }
+                    Err(_) if *timed_out => {
+                        let _ = self.peers.link_health().silence_timed_out(
+                            destination,
+                            id.clone(),
+                            sent,
+                            racer_core::peer::silence::NO_PING,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
         for response in responses {
             match response {
                 Ok(response)
