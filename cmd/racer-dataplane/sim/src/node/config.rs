@@ -111,7 +111,7 @@ pub struct NodeConfig {
     /// A copy-only request from an owner ranked before the destination does
     /// not wait on the destination's acquisition (production
     /// `copy_join_allowed`: always on; set 0 to measure without it, Known
-    /// issue 311).
+    /// issue 44).
     pub copy_join_rank: bool,
     /// An owner above rank 0 that fetched a page from origin offers it to
     /// rank 0 later (production `orphan_notices`: always on; set 0 to

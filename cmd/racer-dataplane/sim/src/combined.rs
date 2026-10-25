@@ -713,7 +713,7 @@ mod tests {
         assert!(counter(&on, "reads_failed") <= counter(&off, "reads_failed"));
     }
 
-    /// Known issues 34, 35 and 311: owners also ask members ranked just
+    /// Known issues 34, 35 and 44: owners also ask members ranked just
     /// below them that were owners when they arrived, every lineage probe
     /// runs on its own grant (so a delegated rank 0 with one credit asks
     /// too), and a copy-only probe from an earlier owner does not wait on

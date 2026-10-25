@@ -1568,7 +1568,7 @@ impl NodeWorld {
                                 // answers to its requests are lost.
                                 self.metrics.incr("reads_failed_on_hung_nodes");
                             } else if self.hangs {
-                                // Whose hang it was (Known issues 39, 301).
+                                // Whose hang it was (Known issues 39, 41).
                                 let now = self.now();
                                 let owners = self.owners_at(r.node, 0, r.page, true);
                                 let hung =
@@ -3425,7 +3425,7 @@ impl NodeWorld {
     /// acquisition to wait for), which the caller answers.
     fn join_copy(&mut self, mid: u64, dest: u32, page: u64, t: Nanos) -> bool {
         let now = self.now();
-        // Production `Coordinator::copy_join_allowed` (Known issue 311): an
+        // Production `Coordinator::copy_join_allowed` (Known issue 44): an
         // owner ranked before this node, asking it for a copy, must not wait
         // on its acquisition, which most likely waits on that owner.
         let w = self.ids.worker(page);

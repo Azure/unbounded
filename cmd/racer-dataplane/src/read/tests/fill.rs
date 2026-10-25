@@ -5473,7 +5473,7 @@ fn copy_only_miss_has_no_origin_side_effect_and_wrong_context_never_joins() {
     assert_eq!(f.origin.calls.get(), 0);
 }
 
-/// Known issue 311: a copy-only request that must not wait on this node's
+/// Known issue 44: a copy-only request that must not wait on this node's
 /// running acquisition (`join` false, an earlier owner asking) is a miss at
 /// once, with no origin side effect, while one that may join waits for the
 /// running acquisition and gets its copy.

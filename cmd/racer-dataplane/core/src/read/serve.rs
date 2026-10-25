@@ -65,7 +65,7 @@ pub fn serve_deadline(scope: Instant, route: Instant) -> Instant {
 /// node, or this node is not an owner: owners delegate a cold fetch to rank 0
 /// through their predecessors and readers walk the owners, so this node's
 /// acquisition most likely waits on the requester itself, which waits on
-/// this answer until its time share runs out (Known issue 311). Owners ask
+/// this answer until its time share runs out (Known issue 44). Owners ask
 /// such nodes only as handoff, lineage or successor targets, which look for a
 /// copy fetched earlier, so a local copy or a miss is the whole answer.
 pub fn copy_join_allowed<N: PartialEq>(owners: &[N], local: &N, requester: &N) -> bool {

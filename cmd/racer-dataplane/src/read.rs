@@ -232,7 +232,7 @@ impl Coordinator {
 
     /// Whether a copy-only page request from `requester` may wait on this
     /// node's running acquisition of the page
-    /// (`racer_core::read::serve::copy_join_allowed`, Known issue 311). Ranks
+    /// (`racer_core::read::serve::copy_join_allowed`, Known issue 44). Ranks
     /// the page only while an acquisition runs.
     async fn copy_join_allowed(
         &self,

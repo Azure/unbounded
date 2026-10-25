@@ -570,7 +570,7 @@ Verified against the code at the start of this work.
 
 35. Resolved (round 4, lineage, wave 5): every lineage target is asked on its own one-attempt
    grant, like successor targets (`WalkConfig::granted`), so the walk's budget never grows and a
-   delegated rank 0 keeps its origin credit. Lineage probes then exposed Known issue 311, fixed
+   delegated rank 0 keeps its origin credit. Lineage probes then exposed Known issue 44, fixed
    too. 5k `full-churn`: moved-page repeats 884 to 405 from the grants alone, failed reads 1 to 1.
    See "Round 4: lineage (wave 5)".
    Was: rank 0 reached by an owner's delegation usually carries one credit, which it keeps for its own
@@ -606,7 +606,7 @@ Verified against the code at the start of this work.
    target was left as an unfunded handoff probe, and hints expired for the probe after 10 minutes.
    5k `full-failover`, seeds 1 to 10: orphan repeats 542 to 119, `copy_held` 1,041 to 603, failed
    reads 366 to 368. 50k `full-failover`: orphan repeats 850 to 192, `copy_held` 1,410 to 775,
-   origin requests 50,858 to 50,230. Residual: issues 331 and 332.
+   origin requests 50,858 to 50,230. Residual: issues 50 and 51.
 
 38. Resolved (round 4, orphan3, wave 5): the simulator's repeat classification counted
    `Unavailable` signed by a relay on the route as `failed` (rank 0's own origin failure). It is now
@@ -621,7 +621,7 @@ Verified against the code at the start of this work.
    (`racer_core::read::rank0::Rank0Watch`); once rank 0 stayed silent for half a request timeout
    a timeout gives origin authority again, and rank 0 is marked silent for its other pages. A new
    simulator fault (`hang`) models it. With 50 of 5,000 members hung (5k `zipf`, 40 s), failed
-   reads 371 to 136, of which those whose page's rank 0 hangs 342 to 112 (Known issue 303); 5k
+   reads 371 to 136, of which those whose page's rank 0 hangs 342 to 112 (Known issue 43); 5k
    `zipf` at 16 MiB pages keeps issue 31's gains. See "Round 4: hang (wave 5)" (round 4, hang,
    wave 5).
 
@@ -633,27 +633,27 @@ Verified against the code at the start of this work.
    (overlapping requests 1,089 to 115, origin requests 18,866 to 17,821). The remaining 111 are
    `Overloaded` answers, 108 of them signed by a relay whose relay quota is full rather than by
    rank 0; withholding origin after them failed more reads than it saved origin requests, so
-   they still give authority (Known issue 302). See "Round 4: hang (wave 5)".
+   they still give authority (Known issue 42). See "Round 4: hang (wave 5)".
 
-301. A reader does not learn that a peer hangs: it keeps visiting a hung owner first, or routing
+41. A reader does not learn that a peer hangs: it keeps visiting a hung owner first, or routing
    through a hung relay, and each such probe costs it a whole attempt. In the 5k `zipf` run with 50
    hung members, 24 of the 136 failed reads had a hung owner other than rank 0 or met only hung
    relays. A timeout could feed link health (circuits) like a transport failure, or demote the
    owner in the reader's visit order. Open (round 4, hang, wave 5).
 
-302. An owner above rank 0 takes origin authority from an `Overloaded` answer signed by a relay on
+42. An owner above rank 0 takes origin authority from an `Overloaded` answer signed by a relay on
    its route to rank 0 (relay quota full), which says nothing about rank 0: 108 of the 115
    overlapping origin requests in 5k `zipf` at 16 MiB pages, and all 1,042 of the `busy` class in
    default 5k `zipf`. Withholding origin after it (measured) removed most of the overlap but failed
    29 to 55 more reads. A retry over a route that avoids the relay, within the owner's budget,
    would be the next thing to try. Open (round 4, hang, wave 5).
 
-303. Each owner learns on its own that a rank 0 hangs, so the first reads of every (owner, hung
+43. Each owner learns on its own that a rank 0 hangs, so the first reads of every (owner, hung
    rank 0) pair still fail for up to half a request timeout: 112 failed reads in the 5k `zipf` run
    with 50 hung members. Sharing liveness (for example through membership or link health) would
    shorten it. Open (round 4, hang, wave 5).
 
-311. Resolved (round 4, lineage, wave 5): a copy-only probe that reached a node with a running
+44. Resolved (round 4, lineage, wave 5): a copy-only probe that reached a node with a running
    acquisition of the page joined it (Known issue 31), also when the prober was an earlier owner.
    Owners above rank 0 delegate to rank 0, so a later owner's acquisition usually waits on rank 0
    itself: rank 0's lineage probe waited on its own answer until its time share ran out. With
@@ -663,45 +663,46 @@ Verified against the code at the start of this work.
    asking a non-owner (`racer_core::read::serve::copy_join_allowed`,
    `Coordinator::copy_join_allowed`); lineage probe failures 6,525 to 6.
 
-312. Lineage and demoted probes are sequential round trips before origin, and most miss (5k
+45. Lineage and demoted probes are sequential round trips before origin, and most miss (5k
    `full-churn`: 21,313 probes, 776 copies). In the simulator's multi-hop network this raises the
    mean read latency of 5k `full-churn` from 71 to 95 ms (p99 150 to 268 ms) and of 5k
    `full-failover` from 76 to 89 ms; reads that fail do not change. Asking the granted targets
    concurrently (or with a hedge) would bound the cost to one round trip. Open (round 4, lineage,
    wave 5).
 
-313. Rendezvous ranks below the fifth are not kept, and a member that was never an owner while
+46. Rendezvous ranks below the fifth are not kept, and a member that was never an owner while
    the page was read has nothing to give; 157 of the 188 moved-page repeats left in 5k
    `full-churn` had a holder older than version - 1 that was not asked. That these are holders
    ranked sixth or lower, or past the three-target cap, is an inference: the run has no counter
    for the holder's rank. Open (round 4, lineage, wave 5).
-331. Copy offers sent while a partition still cuts the route to rank 0 fail in transport and count
-   as link failures: 5k `full-failover` partition link failures rose 19,514 to 22,413 (seeds 1 to
-   10) for 8,603 offers. Failed reads did not change measurably (366 to 368), but the failures
-   lengthen link backoff. Holding an offer while the path cache or circuit to its target is known
-   down, without spending a try, would avoid most of them. Open (round 4, orphan3, wave 5).
 
-332. Orphan repeats that offers cannot remove: rank 0 refetches before the holder's offer arrives
-   (inside the first 5 s delay, or while a partition still cuts the route), or rank 0's successor
-   probe of the holder fails in transport; and an owner above rank 0 that skips rank 0 itself
-   refetches a page another owner above rank 0 holds (the `skip` side, which offers to rank 0 do not
-   address). 119 left over 5k `full-failover` seeds 1 to 10. Open (round 4, orphan3, wave 5).
-
-321. 50k `full-cold-start` still fails 8 reads (`Unavailable`, 106 to 157 s, during enrollment),
+47. 50k `full-cold-start` still fails 8 reads (`Unavailable`, 106 to 157 s, during enrollment),
    none after a stale skip (`walk_exhausted_stale` 0); not classified further (round 4, stale,
    wave 5).
 
-322. A seat follower takes the `shared.changed` generation after `follow_once`
+48. A seat follower takes the `shared.changed` generation after `follow_once`
    (`cluster-control/src/seat.rs`, `follower`), so a primary Lease change that arrives during the
    read is not seen until the next `FOLLOW_INTERVAL`. Taking it before the read would wake the
    follower every second, because `install_record` notifies the same signal. Rare (the window is
    one GET); not modeled (round 4, stale, wave 5).
 
-323. The second stale wait (`MAX_STALE_WAITS` 2) is never taken at 50k `full-cold-start`
+49. The second stale wait (`MAX_STALE_WAITS` 2) is never taken at 50k `full-cold-start`
    (`stale_waits_again` 0): a default read (8 attempts, 16 links, 4 links per funded route)
    cannot afford another exchange and still fund its later owners
    (`CandidateWalk::retry_affordable`), except at its last owner. Kept because it is bounded and
    harmless; whether to fund it is open (round 4, stale, wave 5).
+
+50. Copy offers sent while a partition still cuts the route to rank 0 fail in transport and count
+   as link failures: 5k `full-failover` partition link failures rose 19,514 to 22,413 (seeds 1 to
+   10) for 8,603 offers. Failed reads did not change measurably (366 to 368), but the failures
+   lengthen link backoff. Holding an offer while the path cache or circuit to its target is known
+   down, without spending a try, would avoid most of them. Open (round 4, orphan3, wave 5).
+
+51. Orphan repeats that offers cannot remove: rank 0 refetches before the holder's offer arrives
+   (inside the first 5 s delay, or while a partition still cuts the route), or rank 0's successor
+   probe of the holder fails in transport; and an owner above rank 0 that skips rank 0 itself
+   refetches a page another owner above rank 0 holds (the `skip` side, which offers to rank 0 do not
+   address). 119 left over 5k `full-failover` seeds 1 to 10. Open (round 4, orphan3, wave 5).
 
 ## Simulator engine (racer-sim substrate)
 
@@ -1172,10 +1173,9 @@ scenarios carry data-plane faults.
 25. Resolved: owners ask, and readers visit first, later owners that arrived before them
    (lineage, round 4, history, wave 4), plus demoted members, all on their own grants (round 4,
    lineage, wave 5); 5k `full-churn` moved-page repeats 884 to 188.
-26. Resolved: rest was 36 (round 4, stale, wave 5). Earlier: partly resolved: readers that
-   cannot fall back wait once for an owner that is behind, and
-   stale answers refund their remote credits; 50k `full-cold-start` failed reads 248 to 95; rest
-   is 36 (round 4, history, wave 4).
+26. Resolved: the rest was 36 (round 4, stale, wave 5). Earlier, partly resolved: readers that
+   cannot fall back wait once for an owner that is behind, and stale answers refund their remote
+   credits; 50k `full-cold-start` failed reads 248 to 95 (round 4, history, wave 4).
 27. Resolved: DST harness only let the survivor set up a half-open link after a peer
    crash-restart; the restarted peer now initiates (round 4, orphan).
 28. Resolved: a worker dropped without a drain no longer leaks RDMA link setup tasks and their
@@ -1197,8 +1197,7 @@ scenarios carry data-plane faults.
 36. Resolved: the primary publishes each commit on its Lease so seats serve it within 1 s, and
    previous owners wait instead of skipping; 50k `full-cold-start` failed reads 93 to 8 (round 4,
    stale, wave 5). Was: one wait does not cover the 50k propagation window: 95 failed reads in
-   `full-cold-start`
-   (round 4, history, wave 4).
+   `full-cold-start` (round 4, history, wave 4).
 37. Resolved: orphan holders offer their copy to rank 0 later; orphan repeats 50k `full-failover`
    850 to 192, 5k 542 to 119 over seeds 1 to 10 (round 4, orphan3, wave 5).
 38. Resolved: relay-signed `Unavailable` is its own repeat class, `relay` (round 4, orphan3, wave
@@ -1208,26 +1207,26 @@ scenarios carry data-plane faults.
    hang, wave 5).
 40. Partly resolved: an owner's copy-only probe of rank 0 gets the route first; 5k `zipf` at 16 MiB
    overlapping origin requests 1,089 to 115; the rest follow relay-signed `Overloaded` (issue
-   302) (round 4, hang, wave 5).
-311. Resolved: a copy-only probe from an earlier owner joined a later owner's acquisition that
+   42) (round 4, hang, wave 5).
+41. A reader does not learn that a peer hangs (round 4, hang, wave 5).
+42. Owners take origin authority from a relay-signed `Overloaded` on the route to rank 0 (round 4,
+   hang, wave 5).
+43. Each owner learns on its own that a rank 0 hangs (round 4, hang, wave 5).
+44. Resolved: a copy-only probe from an earlier owner joined a later owner's acquisition that
    waited on the prober; the join is now declined (round 4, lineage, wave 5).
-312. Sequential lineage and demoted probes add latency before origin (5k `full-churn` mean read
+45. Sequential lineage and demoted probes add latency before origin (5k `full-churn` mean read
    71 to 95 ms) (round 4, lineage, wave 5).
-313. Holders ranked sixth or lower, or past the three-target cap, are not asked (157 of 188 5k
+46. Holders ranked sixth or lower, or past the three-target cap, are not asked (157 of 188 5k
    `full-churn` moved repeats) (round 4, lineage, wave 5).
-331. Copy offers during a partition add link failures (5k `full-failover` +15%) (round 4, orphan3,
+47. 50k `full-cold-start` still fails 8 reads, none after a stale skip (round 4, stale, wave 5).
+48. A seat follower misses a primary Lease change that arrives during its read until its next
+   `FOLLOW_INTERVAL` (round 4, stale, wave 5).
+49. The second stale wait is almost never affordable for a default read (round 4, stale, wave 5).
+50. Copy offers during a partition add link failures (5k `full-failover` +15%) (round 4, orphan3,
    wave 5).
-332. Orphan repeats offers cannot remove: rank 0 refetches before the offer arrives, or the holder
+51. Orphan repeats offers cannot remove: rank 0 refetches before the offer arrives, or the holder
    is itself an owner above rank 0 that another owner skipped to (119 over 10 seeds) (round 4,
    orphan3, wave 5).
-301. A reader does not learn that a peer hangs (round 4, hang, wave 5).
-302. Owners take origin authority from a relay-signed `Overloaded` on the route to rank 0 (round 4,
-   hang, wave 5).
-303. Each owner learns on its own that a rank 0 hangs (round 4, hang, wave 5).
-321. 50k `full-cold-start` still fails 8 reads, none after a stale skip (round 4, stale, wave 5).
-322. A seat follower misses a primary Lease change that arrives during its read until its next
-   `FOLLOW_INTERVAL` (round 4, stale, wave 5).
-323. The second stale wait is almost never affordable for a default read (round 4, stale, wave 5).
 
 ## Round 2: production admission
 
@@ -4488,7 +4487,7 @@ Known issues 25 (remainder), 34 and 35. Branch `racer-sim7-lineage` from racer-c
   `remaining_attempts() < 2`). A delegation carries rank 0's origin credit only, so a delegated
   rank 0 asked none of them. Funding them from the reader's 8-attempt budget (tried in wave 4)
   took credits that later visits needed.
-- Known issue 311, found here: once lineage probes ran, half of them failed. A temporary counter
+- Known issue 44, found here: once lineage probes ran, half of them failed. A temporary counter
   in the simulator's `join_copy` showed that 6,641 of 9,354 copy-only flight joins in 5k
   `full-churn` joined an acquisition whose fill had a pending probe to the requester itself. A
   copy-only probe joins any running acquisition of the page (Known issue 31;
@@ -4594,7 +4593,7 @@ matters here, but production keeps it.
   23); origin requests fall 723 and 78; `full-cold-start` 37 to 12. Scenarios without membership
   changes are unchanged (zipf, storm, zipf 16 MiB: same origin counts within noise).
 - Cost: one copy-only exchange per granted probe, at most three per owner fetch (`MAX_HANDOFF`),
-  most of which miss (Known issue 312: mean read latency in `full-churn` 71 to 95 ms).
+  most of which miss (Known issue 45: mean read latency in `full-churn` 71 to 95 ms).
 - Hard invariants, including `origin_repeat_explained` (`unexplained` 0) and
   `budget_never_grows`, hold in every run.
 
@@ -4616,11 +4615,11 @@ matters here, but production keeps it.
 - Known issue 25 is resolved for what lineage can know: a moved page is now asked of every owner
   that ranked above it on arrival among the five best-ranked members, within three probes. What
   remains (5k `full-churn`: 157 unasked older holders, 26 lost copies, 3 unreachable) is, by
-  inference, Known issue 313 (ranks below five, the three-target cap) and copies that were
+  inference, Known issue 46 (ranks below five, the three-target cap) and copies that were
   evicted.
-- New Known issue 312: the probes are sequential; probing granted targets concurrently would cap
+- New Known issue 45: the probes are sequential; probing granted targets concurrently would cap
   the latency at one round trip.
-- The temporary counters used for the root cause of Known issue 311 were removed before
+- The temporary counters used for the root cause of Known issue 44 were removed before
   committing.
 ## Round 4: orphan3 (wave 5)
 
@@ -4742,13 +4741,13 @@ Offers: sent / delivered / noted.
 - 5k `full-failover`, seeds 1 to 10, before and after: failed reads 366 / 368 (seed 2's 29 to 43
   is within the per-seed spread, 27 to 45), origin requests 128,778 / 128,330, `copy_held` 1,041 /
   603, orphan repeats 542 / 119, `unexplained` 0 / 0; 8,603 offers, partition link failures 19,514
-  / 22,413 (Known issue 331). Without offers (`orphan_notices` 0) but with the successor target
+  / 22,413 (Known issue 50). Without offers (`orphan_notices` 0) but with the successor target
   and TTL fixes, seeds 1 to 5 left 219 orphans and 179 failed reads.
 - 50k `full-failover`: orphan repeats 850 to 192 (`failed` 437 to 75 plus 34 `relay`, `route`
   159 to 17, `partition` 128 to 17, `busy` 79 to 32, `copy_only` 45 to 15), `copy_held` 1,410 to
   775, origin requests down 628 (1.2%), pages fetched more than once 4,998 to 4,611. Skips by
   class (issue 38): `failed` 1,201 and `relay` 897 (before: 2,148 `failed` in all). The worst page
-  rose 6 to 8 and failed reads 395 to 400; partition link failures 20,775 to 21,969 (issue 331).
+  rose 6 to 8 and failed reads 395 to 400; partition link failures 20,775 to 21,969 (issue 50).
   Peak RSS 3.0 GiB (unchanged). `unexplained` 0, no hard failure.
 - 5k `cs1g` (1 Gbit/s 1 s storm) is unchanged (94,829 / 0). Scenarios without failover send no
   offers and are unchanged.
@@ -4758,7 +4757,7 @@ Offers: sent / delivered / noted.
 
 ### Deviations and open items
 
-- New Known issue 331: offers during a partition add link failures. New Known issue 332: the
+- New Known issue 50: offers during a partition add link failures. New Known issue 51: the
   orphan repeats offers cannot remove (rank 0 refetches before the offer arrives, the successor
   probe fails in transport, or the next fetcher is itself an owner above rank 0).
 - The first design let offers defer readers like a copy-only miss; DST seed 1 found a 503 and the
@@ -4864,7 +4863,7 @@ change.
 - racer-sim `contention_scenarios::a_hung_rank_zero_blocks_its_pages_for_at_most_one_request_timeout`:
   200 nodes, 10 hung for the whole run, a 100-reader storm on a cold object at 0 s and again at
   30 s. Second storm: at most 1 failed read with the watch (the one left visits a hung rank 2 and
-  then reaches rank 1 through a hung relay, Known issue 301), at least 100 without it (199 at the
+  then reaches rank 1 through a hung relay, Known issue 41), at least 100 without it (199 at the
   time of writing). `faults::tests::parses_every_kind` covers `hang`.
 - `owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch` raises `waiters_per_flight` to 128:
   its premise is that rank 0's flight never refuses a waiter, and with copy-only probes of rank 0
@@ -4895,7 +4894,7 @@ fetched more than once; overlap is `origin_repeats_concurrent`.
 - Default 1 MiB `zipf`: overlap 1,208 to 1,245 (seed 2: 1,015 to 1,147) and origin requests up by
   0.2 to 0.3%, while failed reads fall 24 to 15 (seed 2: 21 to 14). Routing copy-only probes of rank
   0 first moves skips from `route` (41 to 8) to relay-signed `Overloaded` (1,001 to 1,042), the
-  issue 302 class, because more of those probes now cross congested relays.
+  issue 42 class, because more of those probes now cross congested relays.
 - Hung members (`hang.json`: `zipf`, `request_rate` 0.1, 40 s, members 0, 100, ..., 4,900 hung for
   the whole run): failed reads whose page's rank 0 hangs 342 to 112, a hung non-rank-0 owner 13 to
   14, other hangs 15 to 10, the reader itself hung 1 to 0. Overdue walks 123. Pages fetched more
@@ -4921,51 +4920,19 @@ fetched more than once; overlap is `origin_repeats_concurrent`.
 
 - Issue 40 is only partly resolved: the route class had a root cause in the owner's link split and
   is fixed; the remaining `Overloaded` class is mostly relay-signed and withholding origin after it
-  costs reads (new Known issue 302). Rank 0's own `Overloaded` (waiter cap) is rare in these runs
+  costs reads (new Known issue 42). Rank 0's own `Overloaded` (waiter cap) is rare in these runs
   (2 rejected copy-only joins in 5k `zipf` at 16 MiB pages).
 - The rank 0 watch bounds issue 31's rule by time, so a rank 0 whose origin request stays queued
   for more than half a request timeout is treated as hung and the owner fetches too. No run here
   showed it (the issue 31 configuration has 60 overdue walks and no overdue skip).
-- Hang detection is per owner (new Known issue 303) and readers do not learn that a peer hangs
-  (new Known issue 301).
+- Hang detection is per owner (new Known issue 43) and readers do not learn that a peer hangs
+  (new Known issue 41).
 - `owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch` changed its configuration (waiter cap
   128), not its assertions; see Tests.
 
 ### Open issues after wave 5 (hang)
 
-19 (partly), 25 (partly), 26 (partly), 34 to 38, 40 (partly), 301 to 303.
-
-p='designs/racer-core-simulation.md'; s=open(p).read()
-a="""   pages. Open (round 4, overload, wave 4).
-"""
-assert s.count(a)==1
-s=s.replace(a,a+"""
-321. 50k `full-cold-start` still fails 8 reads (`Unavailable`, 106 to 157 s, during enrollment),
-   none after a stale skip (`walk_exhausted_stale` 0); not classified further (round 4, stale,
-   wave 5).
-
-322. A seat follower takes the `shared.changed` generation after `follow_once`
-   (`cluster-control/src/seat.rs`, `follower`), so a primary Lease change that arrives during the
-   read is not seen until the next `FOLLOW_INTERVAL`. Taking it before the read would wake the
-   follower every second, because `install_record` notifies the same signal. Rare (the window is
-   one GET); not modeled (round 4, stale, wave 5).
-
-323. The second stale wait (`MAX_STALE_WAITS` 2) is never taken at 50k `full-cold-start`
-   (`stale_waits_again` 0): a default read (8 attempts, 16 links, 4 links per funded route)
-   cannot afford another exchange and still fund its later owners
-   (`CandidateWalk::retry_affordable`), except at its last owner. Kept because it is bounded and
-   harmless; whether to fund it is open (round 4, stale, wave 5).
-""",1)
-a="""   that is fetching (1,088 overlapping requests left) (round 4, overload, wave 4).
-"""
-assert s.count(a)==1
-s=s.replace(a,a+"""321. 50k `full-cold-start` still fails 8 reads, none after a stale skip (round 4, stale, wave 5).
-322. A seat follower misses a primary Lease change that arrives during its read until its next
-   `FOLLOW_INTERVAL` (round 4, stale, wave 5).
-323. The second stale wait is almost never affordable for a default read (round 4, stale, wave 5).
-""",1)
-s=s.rstrip('\n')+'\n'+open('/dev/stdin').read()
-open(p,'w').write(s)
+19 (partly), 25 (partly), 26 (partly), 34 to 38, 40 (partly), 41 to 43.
 
 ## Round 4: stale (wave 5)
 
@@ -5104,9 +5071,9 @@ Reading the tables:
 
 ### Deviations and open items
 
-- The second wait is almost never affordable with the default read budget (Known issue 323);
+- The second wait is almost never affordable with the default read budget (Known issue 49);
   the 50k gain comes from the seat wake and from ranking before skipping.
 - Seat write bandwidth (about 5 s per membership version at 50k) was not changed; it is the cost
   of sending every client its delta.
 - 50k `full-failover` was not rerun in this track.
-- New Known issues 321 (8 failed reads left), 322 (follower generation race), 323.
+- New Known issues 47 (8 failed reads left), 48 (follower generation race), 49.

@@ -501,7 +501,7 @@ fn relays_hold_their_reservation_only_while_the_body_streams() {
 /// reads almost everything; without the watch it fails again on the same
 /// pages. The one read the second storm
 /// still fails visits a hung rank 2 first and then reaches rank 1 through a
-/// hung relay, twice (Known issue 301: a reader does not learn that a peer
+/// hung relay, twice (Known issue 41: a reader does not learn that a peer
 /// hangs).
 #[test]
 fn a_hung_rank_zero_blocks_its_pages_for_at_most_one_request_timeout() {

@@ -1750,7 +1750,7 @@ impl Fill {
     }
 
     /// [`Self::copy_only`]; without `join` a running acquisition of the page
-    /// is a miss instead of something to wait on (Known issue 311).
+    /// is a miss instead of something to wait on (Known issue 44).
     pub fn copy_only_joining<'a>(
         &'a self,
         page: &'a PageId,
