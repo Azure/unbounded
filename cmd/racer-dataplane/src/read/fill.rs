@@ -1728,6 +1728,16 @@ impl Fill {
         self.metrics.record(Event::OriginFill, 1);
         Ok(result)
     }
+    /// Whether this node holds a copy of `page` in memory, pending write, or
+    /// the disk index, without reading it (orphan notices and copy offers,
+    /// Known issue 37). Lookup errors count as not held.
+    pub(crate) fn holds(&self, page: &PageId) -> bool {
+        let deps = &self.dependencies;
+        deps.memory.ciphertext(page).is_ok_and(|c| c.is_some())
+            || deps.writer.copy_only(page).is_ok_and(|c| c.is_some())
+            || deps.writer.index().lookup(page).is_ok_and(|c| c.is_some())
+    }
+
     /// Strictly local completed/pending copy or join of existing work; never starts
     /// another acquisition or contacts origin. Use Flights::join_copy, whose waiter
     /// has no election/context API. Ciphertext preserves its nonce/tag.
@@ -2224,6 +2234,15 @@ impl Fill {
                 {
                     Ok(origin) => {
                         source = Event::OriginFill;
+                        // An owner after rank 0 holds a copy rank 0 may not
+                        // know of: offer it later (Known issue 37).
+                        if self.dependencies.candidates.note_orphan(
+                            page,
+                            &candidates.ordered,
+                            authority.rank(),
+                        ) {
+                            self.metrics.record(Event::OrphanNotice, 1);
+                        }
                         self.encrypt_origin_page(page, origin, ciphertext, scope)
                             .await?
                             .into()

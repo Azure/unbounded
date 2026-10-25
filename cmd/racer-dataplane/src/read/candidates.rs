@@ -104,7 +104,33 @@ pub struct CandidatePolicy {
     /// (Known issue 21; see `racer_core::read::successor`). The coordinator
     /// notes and defers on them; an owner walk asks them before origin.
     pub(crate) successors: RefCell<Successors>,
+    /// Pages this node fetched from origin as an owner after rank 0, to offer
+    /// to rank 0 later (Known issue 37; see `racer_core::read::notice`).
+    pub(crate) notices: RefCell<Notices>,
+    /// Copy offers in flight ([`MAX_OFFERS_IN_FLIGHT`]).
+    offers: Rc<std::cell::Cell<usize>>,
 }
+
+/// Counts one copy offer in flight until its task ends or is dropped.
+struct OfferFlight(Rc<std::cell::Cell<usize>>);
+
+impl OfferFlight {
+    fn new(count: Rc<std::cell::Cell<usize>>) -> Self {
+        count.set(count.get() + 1);
+        Self(count)
+    }
+}
+
+impl Drop for OfferFlight {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
+}
+
+pub(crate) type Notices = racer_core::read::notice::OrphanNotices<crate::model::PageId, NodeId>;
+
+/// Copy offers a node sends at once; more due offers wait for a later turn.
+pub(crate) const MAX_OFFERS_IN_FLIGHT: usize = 4;
 
 /// When each of the page's owners arrived in this node's membership chain
 /// (`Membership::since`), for lineage targets (Known issue 25).
@@ -626,6 +652,8 @@ impl CandidatePolicy {
                 racer_core::read::successor::HINT_CAPACITY,
                 racer_core::read::successor::HINT_TTL,
             )),
+            notices: RefCell::new(Notices::new(racer_core::read::notice::NOTICE_CAPACITY)),
+            offers: Rc::default(),
         }
     }
 
@@ -2052,6 +2080,139 @@ impl CandidatePolicy {
         result
     }
 
+    /// This node fetched `page` from origin at `rank` among `owners`: when
+    /// that is after rank 0, remember to offer rank 0 the copy later
+    /// (Known issue 37, `racer_core::read::notice`). Returns whether a notice
+    /// was noted.
+    pub(crate) fn note_orphan(
+        &self,
+        page: &crate::model::PageId,
+        owners: &[NodeId],
+        rank: usize,
+    ) -> bool {
+        use racer_core::read::notice::should_notice;
+        let Some(rank0) = owners.first() else {
+            return false;
+        };
+        if !should_notice(Some(rank)) || owners.get(rank) != Some(&self.node) || rank0 == &self.node
+        {
+            return false;
+        }
+        self.notices.borrow_mut().note(
+            page.clone(),
+            rank0.clone(),
+            uring_runtime::environment::now(),
+        );
+        true
+    }
+
+    /// Send due copy offers (Known issue 37), at most
+    /// [`MAX_OFFERS_IN_FLIGHT`] at a time, each on its own detached driver
+    /// task and fixed route grant (never a reader's budget). `holds` reports
+    /// whether this node still holds a page; a page it lost is dropped. Best
+    /// effort: an offer that is not answered `Miss` by its destination is
+    /// tried again on the notice's schedule or expires, and never reaches a
+    /// reader. Call once per worker service turn.
+    pub(crate) fn poll_offers(
+        self: &Rc<Self>,
+        now: std::time::Instant,
+        holds: impl Fn(&crate::model::PageId) -> bool,
+        metrics: &Metrics,
+    ) {
+        while self.offers.get() < MAX_OFFERS_IN_FLIGHT {
+            let Some(due) = self.notices.borrow_mut().pop_due(now) else {
+                return;
+            };
+            if !holds(&due.key) {
+                continue;
+            }
+            let Ok(permit) = uring_runtime::drivers::reserve() else {
+                // No driver slot this turn: count it as a failed offer.
+                let _ = self.notices.borrow_mut().failed(due, now);
+                return;
+            };
+            let flight = OfferFlight::new(self.offers.clone());
+            let policy = self.clone();
+            let metrics = metrics.clone();
+            permit.submit_detached(Box::pin(async move {
+                let _flight = flight;
+                metrics.record(Event::OrphanOfferSent, 1);
+                match policy.offer(&due).await {
+                    Ok(None) => {}
+                    Ok(Some(true)) => metrics.record(Event::OrphanOfferDelivered, 1),
+                    Ok(Some(false)) | Err(_) => {
+                        metrics.record(Event::OrphanOfferFailed, 1);
+                        let now = uring_runtime::environment::now();
+                        let _ = policy.notices.borrow_mut().failed(due, now);
+                    }
+                }
+                Ok::<(), Error>(())
+            }));
+        }
+    }
+
+    /// Send one copy offer for `due` to the page's current rank 0. `None`
+    /// when this node is no longer an owner after rank 0 (the notice is
+    /// dropped); otherwise whether rank 0 itself answered `Miss`.
+    async fn offer(
+        &self,
+        due: &racer_core::read::notice::Due<crate::model::PageId, NodeId>,
+    ) -> Result<Option<bool>> {
+        use racer_core::read::notice::{NOTICE_LINKS, notice_target};
+        let page = &due.key;
+        let deadline = uring_runtime::environment::now() + self.attempt_timeout;
+        let mut id = [0; 16];
+        uring_runtime::environment::fill_random(&mut id).map_err(|_| Error::Unavailable)?;
+        let scope = RequestScope::new(crate::model::RequestId(id), deadline)?;
+        let membership = self
+            .published
+            .current()?
+            .ok_or(Error::Unavailable)?
+            .membership
+            .clone();
+        let mut owners = self
+            .candidates_scoped(
+                membership.clone(),
+                &page.version.object,
+                page.number,
+                &scope,
+            )
+            .await?
+            .ordered;
+        owners.truncate(3);
+        let Some(target) = notice_target(&self.node, &owners, true) else {
+            return Ok(None);
+        };
+        let context = OriginContext {
+            object: page.version.object.clone(),
+            metadata: None,
+            authorization: None,
+        };
+        let operation = PeerOperation::Page {
+            page: page.clone(),
+            mode: FetchMode::Offer,
+        };
+        // A fresh grant: one local exchange, no remote attempts, and
+        // `NOTICE_LINKS` route links.
+        let mut budget = AcquisitionBudget::new(deadline, 1, NOTICE_LINKS);
+        let response = self
+            .request_mode(
+                &membership,
+                &target,
+                &context,
+                &operation,
+                FetchMode::Offer,
+                &scope,
+                &mut budget,
+                1,
+                RequestMode::FundedRoute,
+            )
+            .await;
+        Ok(Some(response.is_ok_and(|response| {
+            matches!(response.response(), PeerResponse::Miss) && response.origin().node() == &target
+        })))
+    }
+
     pub fn origin_miss_error(&self, authority: &OriginAuthority) -> Error {
         racer_core::read::candidates::origin_miss_error(&authority.predecessor_evidence).into()
     }
@@ -2212,6 +2373,11 @@ async fn validated_copy<'a, T>(
     }
 }
 impl OriginAuthority {
+    /// The canonical rank this authority was granted at.
+    pub(crate) fn rank(&self) -> usize {
+        self.rank
+    }
+
     pub fn validate(&self, object: &ObjectId, page: PageNumber) -> Result<()> {
         racer_core::read::candidates::validate_origin_authority(
             racer_core::read::candidates::AuthorityFacts {

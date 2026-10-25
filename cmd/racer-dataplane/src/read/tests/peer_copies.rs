@@ -4557,3 +4557,316 @@ fn rank_zero_never_defers_to_a_reader() {
     assert_eq!(s.f.origin.calls.get(), 1);
     assert_eq!(s.count(Event::SuccessorDeferral), 0);
 }
+
+/// A copy offer from `from` to the fixture's local node (Known issue 37),
+/// signed and verified as on the wire: no origin credentials, no remote
+/// attempts.
+fn offer_request(
+    f: &Fixture,
+    peers: &ScriptedPeers,
+    from: usize,
+    id: u8,
+) -> crate::peer::forwarding::VerifiedRequest {
+    let attempt = crate::model::AttemptId([id; 16]);
+    let context = crate::security::OriginContext {
+        object: f.context.object.clone(),
+        metadata: None,
+        authorization: None,
+    };
+    let request = PeerRequest {
+        operation: PeerOperation::Page {
+            page: f.page.clone(),
+            mode: FetchMode::Offer,
+        },
+        route: crate::topology::RouteBudget {
+            membership: f.membership.version,
+            request: f.scope.request,
+            attempt,
+            destination: node(peers.local),
+            visited: vec![node(from)],
+            remaining_links: 4,
+            remaining_attempts: 0,
+            deadline: f.scope.deadline,
+        },
+        origin: f
+            .fill
+            .dependencies
+            .credentials
+            .seal(&context, attempt, &f.scope)
+            .unwrap(),
+    };
+    let (signed, _) = peers.signing[from].sign_request(request).unwrap();
+    peers.signing[peers.local].verify_request(signed).unwrap()
+}
+
+impl SuccessorFixture {
+    fn offer(&mut self, from: usize) -> PeerResponse {
+        use crate::peer::server::LocalPageService;
+        self.ids += 1;
+        let admitted = offer_request(&self.f, &self.peers, from, self.ids);
+        let coordinator = self.coordinator.clone();
+        let f = &mut self.f;
+        drive(
+            coordinator.serve_peer(admitted, f.membership.clone(), &f.scope),
+            &mut f.engine,
+            &f.crypto,
+        )
+        .unwrap()
+    }
+}
+
+/// Known issue 37: rank 1 fetched the page from origin without ever
+/// reaching rank 0, then offers it. Rank 0 answers `Miss` without a body,
+/// notes rank 1 as a successor hint, and its next acquisition copies the
+/// page from rank 1 instead of fetching it from origin.
+#[test]
+fn rank_zero_notes_an_offer_and_copies_from_its_sender() {
+    use crate::telemetry::Event;
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let clock = uring_runtime::environment::SimulationClock::new(937);
+    let _env = clock.environment(0).enter();
+    let mut s = SuccessorFixture::new();
+    s.f.scope = RequestScope::new(
+        s.f.scope.request,
+        uring_runtime::environment::now() + Duration::from_secs(60),
+    )
+    .unwrap();
+    let (holder, other) = (s.index(Some(1)), s.index(Some(2)));
+    assert!(matches!(s.offer(holder), PeerResponse::Miss));
+    assert_eq!(s.count(Event::OrphanOfferNoted), 1);
+    assert_eq!(s.count(Event::SuccessorHint), 1);
+    assert_eq!(s.f.origin.calls.get(), 0);
+    assert!(s.peers.calls.borrow().is_empty());
+    clock.advance(racer_core::read::successor::PROBE_AFTER);
+    let copy = encrypted_copy(&mut s.f);
+    s.peers
+        .replies
+        .borrow_mut()
+        .push_back((s.ordered[1].clone(), Reply::Copy(copy)));
+    assert!(matches!(
+        s.serve(other, FetchMode::Acquire),
+        PeerResponse::Page { .. }
+    ));
+    assert_eq!(s.f.origin.calls.get(), 0);
+    assert_eq!(s.peers.calls.borrow().len(), 1);
+}
+
+/// Known issue 37: an offer to a rank 0 that holds the page is answered
+/// `Miss` (never the body) and noted nowhere; a malformed offer for another
+/// object is refused.
+#[test]
+fn offer_to_a_holder_is_answered_without_a_body_or_hint() {
+    use crate::telemetry::Event;
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut s = SuccessorFixture::new();
+    let (reader, holder) = (s.index(None), s.index(Some(1)));
+    assert!(matches!(
+        s.serve(reader, FetchMode::Acquire),
+        PeerResponse::Page { .. }
+    ));
+    assert_eq!(s.f.origin.calls.get(), 1);
+    assert!(matches!(s.offer(holder), PeerResponse::Miss));
+    assert_eq!(s.count(Event::OrphanOfferNoted), 0);
+    assert_eq!(s.count(Event::SuccessorHint), 0);
+    assert_eq!(s.f.origin.calls.get(), 1);
+}
+
+/// Encoding refuses offers with origin credentials, remote attempts, or a
+/// non-page operation, and keeps the mode on the wire.
+#[test]
+fn offer_encoding_is_restricted_to_credential_free_page_requests() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let (peers, _) = install_peers(&mut f, Some(0));
+    let from = (peers.local + 1) % 4;
+    let admitted = offer_request(&f, &peers, from, 0x31);
+    assert!(matches!(
+        admitted.request().operation,
+        PeerOperation::Page {
+            mode: FetchMode::Offer,
+            ..
+        }
+    ));
+    let base = |attempts: u32, context: &crate::security::OriginContext| PeerRequest {
+        operation: PeerOperation::Page {
+            page: f.page.clone(),
+            mode: FetchMode::Offer,
+        },
+        route: crate::topology::RouteBudget {
+            membership: f.membership.version,
+            request: f.scope.request,
+            attempt: crate::model::AttemptId([0x32; 16]),
+            destination: node(peers.local),
+            visited: vec![node(from)],
+            remaining_links: 4,
+            remaining_attempts: attempts,
+            deadline: f.scope.deadline,
+        },
+        origin: f
+            .fill
+            .dependencies
+            .credentials
+            .seal(context, crate::model::AttemptId([0x32; 16]), &f.scope)
+            .unwrap(),
+    };
+    // Remote attempts.
+    let bare = crate::security::OriginContext {
+        object: f.context.object.clone(),
+        metadata: None,
+        authorization: None,
+    };
+    assert!(crate::peer::protocol::request_head(&base(1, &bare)).is_err());
+    // Origin credentials (the fixture's context carries them).
+    let sealed = base(0, &f.context);
+    if sealed.origin.authorization.is_some() || sealed.origin.metadata.is_some() {
+        assert!(crate::peer::protocol::request_head(&sealed).is_err());
+    }
+    // Not a page.
+    let mut metadata = base(0, &bare);
+    metadata.operation = PeerOperation::Metadata {
+        object: f.context.object.clone(),
+        selector: crate::model::MetadataSelector::Fresh,
+        mode: FetchMode::Offer,
+    };
+    assert!(crate::peer::protocol::request_head(&metadata).is_err());
+    assert!(crate::peer::protocol::request_head(&base(0, &bare)).is_ok());
+}
+
+/// Drive this node's due copy offers until `n` more of them ended.
+fn drive_offers(f: &mut Fixture, now: Instant, n: u64) {
+    use crate::telemetry::Event;
+    let ended = |f: &Fixture| {
+        f.fill.metrics.count(Event::OrphanOfferDelivered)
+            + f.fill.metrics.count(Event::OrphanOfferFailed)
+    };
+    let target = ended(f) + n;
+    let fill = f.fill.clone();
+    f.fill
+        .dependencies
+        .candidates
+        .poll_offers(now, |page| fill.holds(page), &fill.metrics);
+    let metrics = f.fill.metrics.clone();
+    drive(
+        std::future::poll_fn(|_| {
+            if metrics.count(Event::OrphanOfferDelivered) + metrics.count(Event::OrphanOfferFailed)
+                >= target
+            {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }),
+        &mut f.engine,
+        &f.crypto,
+    );
+}
+
+/// Known issue 37: an owner after rank 0 that fetched the page from origin
+/// offers it to rank 0 after the first notice delay, on a fresh grant with no
+/// remote attempts; an offer that fails is tried again after the next delay,
+/// and a delivered one is not repeated.
+#[test]
+fn owner_after_rank_zero_offers_its_origin_fetch_later() {
+    use crate::telemetry::Event;
+    use racer_core::read::notice::{NOTICE_DELAYS, NOTICE_LINKS};
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let (peers, ordered) = install_peers(&mut f, Some(1));
+    publish_same_membership(&mut f, &peers);
+    f.fill
+        .dependencies
+        .writer
+        .retention()
+        .set_ownership(Rc::new(|_| true));
+    peers
+        .replies
+        .borrow_mut()
+        .push_back((ordered[0].clone(), Reply::Stale));
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+    let result = acquire(&mut f, &mut budget);
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(f.origin.calls.get(), 1);
+    assert_eq!(f.fill.metrics.count(Event::OrphanNotice), 1);
+    let candidates = f.fill.dependencies.candidates.clone();
+    assert_eq!(candidates.notices.borrow().len(), 1);
+    let start = uring_runtime::environment::now();
+    // Not due yet: nothing is sent.
+    let fill = f.fill.clone();
+    candidates.poll_offers(start, |page| fill.holds(page), &fill.metrics);
+    assert_eq!(peers.calls.borrow().len(), 1);
+    // Due: the first offer fails in transport and is rescheduled.
+    peers
+        .replies
+        .borrow_mut()
+        .push_back((ordered[0].clone(), Reply::Deadline));
+    let first = start + NOTICE_DELAYS[0];
+    drive_offers(&mut f, first, 1);
+    assert_eq!(f.fill.metrics.count(Event::OrphanOfferFailed), 1);
+    {
+        let calls = peers.calls.borrow();
+        assert_eq!(calls.len(), 2);
+        let (dest, copy_only, attempts, links, _) = &calls[1];
+        assert_eq!(dest, &ordered[0]);
+        assert!(!copy_only);
+        assert_eq!(*attempts, 0);
+        assert!(*links <= NOTICE_LINKS);
+    }
+    assert_eq!(candidates.notices.borrow().len(), 1);
+    // Delivered on the next try: rank 0 answers `Miss` itself.
+    peers
+        .replies
+        .borrow_mut()
+        .push_back((ordered[0].clone(), Reply::Miss));
+    drive_offers(&mut f, first + NOTICE_DELAYS[1], 1);
+    assert_eq!(f.fill.metrics.count(Event::OrphanOfferDelivered), 1);
+    assert_eq!(f.fill.metrics.count(Event::OrphanOfferSent), 2);
+    assert!(candidates.notices.borrow().is_empty());
+    // Nothing more is sent.
+    let fill = f.fill.clone();
+    candidates.poll_offers(
+        first + Duration::from_secs(3600),
+        |page| fill.holds(page),
+        &fill.metrics,
+    );
+    assert_eq!(peers.calls.borrow().len(), 3);
+    assert_eq!(f.origin.calls.get(), 1);
+}
+
+/// Known issue 37: a page this node no longer holds is not offered, and a
+/// rank 0 origin fetch leaves no notice.
+#[test]
+fn offers_need_a_held_copy_and_an_owner_after_rank_zero() {
+    use crate::telemetry::Event;
+    use racer_core::read::notice::NOTICE_DELAYS;
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let (peers, ordered) = install_peers(&mut f, Some(1));
+    publish_same_membership(&mut f, &peers);
+    peers
+        .replies
+        .borrow_mut()
+        .push_back((ordered[0].clone(), Reply::Stale));
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+    assert!(acquire(&mut f, &mut budget).is_ok());
+    let candidates = f.fill.dependencies.candidates.clone();
+    assert_eq!(candidates.notices.borrow().len(), 1);
+    let due = uring_runtime::environment::now() + NOTICE_DELAYS[0];
+    candidates.poll_offers(due, |_| false, &f.fill.metrics);
+    assert!(candidates.notices.borrow().is_empty());
+    assert_eq!(peers.calls.borrow().len(), 1);
+    assert_eq!(f.fill.metrics.count(Event::OrphanOfferSent), 0);
+
+    let mut f = fixture();
+    let (peers, _) = install_peers(&mut f, Some(0));
+    publish_same_membership(&mut f, &peers);
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+    assert!(acquire(&mut f, &mut budget).is_ok());
+    assert_eq!(f.origin.calls.get(), 1);
+    assert_eq!(f.fill.metrics.count(Event::OrphanNotice), 0);
+    assert!(f.fill.dependencies.candidates.notices.borrow().is_empty());
+}

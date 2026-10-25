@@ -1679,6 +1679,9 @@ impl WorkerApplication {
         self.ownership_maintenance.poll(now, self.stopping, || {
             self.candidates.refresh_ownership(self.store.writer.index())
         });
+        if !self.stopping {
+            self.coordinator.poll_offers(now);
+        }
         stage_result(worker, "checkpoint", self.poll_checkpoint(cx))?;
         stage_result(worker, "ingress", self.poll_ingress(cx, budget))?;
         self.http.poll_waiters(budget);

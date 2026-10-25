@@ -3357,6 +3357,11 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::SuccessorHint => "racer_successor_hints_total",
             Self::SuccessorDeferral => "racer_successor_deferrals_total",
             Self::CopyJoinDeclined => "racer_copy_join_declined_total",
+            Self::OrphanNotice => "racer_orphan_notices_total",
+            Self::OrphanOfferSent => "racer_orphan_offers_sent_total",
+            Self::OrphanOfferDelivered => "racer_orphan_offers_delivered_total",
+            Self::OrphanOfferFailed => "racer_orphan_offers_failed_total",
+            Self::OrphanOfferNoted => "racer_orphan_offers_noted_total",
 }
 metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::WarmTrackedJobs => "racer_warm_tracked_jobs",

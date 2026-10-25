@@ -52,6 +52,12 @@ use uring_runtime::environment::Deadline;
 pub enum FetchMode {
     CopyOnly,
     Acquire,
+    /// A copy offer (Known issue 37, `racer_core::read::notice`): the
+    /// requester holds the page and tells its rank 0. Page requests only, with
+    /// no origin credentials and no remote attempts; the receiver never sends a
+    /// body or acquires, and answers `Miss`. Receivers that predate it reject
+    /// the request, which the sender treats as not delivered.
+    Offer,
 }
 
 /// Retained HTTP provenance and exclusively socket-owned ordered sessions.
@@ -552,7 +558,14 @@ pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
     if op_object != &request.origin.object {
         return Err(Error::InvalidRequest);
     }
-    if matches!(mode, FetchMode::CopyOnly) && request.route.remaining_attempts != 0 {
+    if !matches!(mode, FetchMode::Acquire) && request.route.remaining_attempts != 0 {
+        return Err(Error::InvalidRequest);
+    }
+    if matches!(mode, FetchMode::Offer)
+        && (!matches!(request.operation, Operation::Page { .. })
+            || request.origin.authorization.is_some()
+            || request.origin.metadata.is_some())
+    {
         return Err(Error::InvalidRequest);
     }
     push(
@@ -561,6 +574,7 @@ pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
         match mode {
             FetchMode::CopyOnly => "copy",
             FetchMode::Acquire => "acquire",
+            FetchMode::Offer => "offer",
         },
     );
     push_binary(&mut head, "racer-request", &request.origin.request.0);
@@ -1178,6 +1192,7 @@ impl SecurityCodec {
         let mode = match field(head, "racer-mode")?.as_str() {
             "copy" => FetchMode::CopyOnly,
             "acquire" => FetchMode::Acquire,
+            "offer" => FetchMode::Offer,
             _ => return Err(Error::InvalidRequest),
         };
         let object = object(head)?;

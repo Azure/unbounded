@@ -257,6 +257,37 @@ impl Coordinator {
         allowed
     }
 
+    /// Send this node's due copy offers (Known issue 37); call once per
+    /// worker service turn.
+    pub(crate) fn poll_offers(&self, now: std::time::Instant) {
+        let fill = &self.fill;
+        fill.dependencies
+            .candidates
+            .poll_offers(now, |page| fill.holds(page), &fill.metrics);
+    }
+
+    /// Answer a copy offer (Known issue 37): `requester` fetched `page` from
+    /// origin as an owner ranked after this node. Note it as a successor
+    /// hint, exactly as a copy-only miss would, unless this node holds the
+    /// page or is fetching it. Never opens credentials, acquires, or sends a
+    /// body.
+    fn serve_offer(
+        &self,
+        page: &crate::model::PageId,
+        requester: &racer_control_wire::NodeId,
+        membership: &crate::topology::Membership,
+    ) -> Result<PeerResponse> {
+        let holds = self.fill.holds(page);
+        let acquiring = self.fill.dependencies.flights.acquiring(page);
+        if racer_core::read::notice::offer_noted(holds, acquiring) {
+            self.note_successor(page, requester, membership, true);
+            self.fill
+                .metrics
+                .record(crate::telemetry::Event::OrphanOfferNoted, 1);
+        }
+        Ok(PeerResponse::Miss)
+    }
+
     /// Serve a page copy-only: a local copy or `Miss`, never acquisition.
     /// `join` lets it wait on a running acquisition of the page.
     async fn serve_page_copy(
@@ -438,6 +469,16 @@ impl LocalPageService for Coordinator {
                 || request.origin.attempt != request.route.attempt
             {
                 return Err(Error::Unauthorized);
+            }
+            if let PeerOperation::Page {
+                page,
+                mode: FetchMode::Offer,
+            } = &request.operation
+            {
+                if page.version.object != request.origin.object {
+                    return Err(Error::InvalidRequest);
+                }
+                return self.serve_offer(page, &requester, &membership);
             }
             let object = match &request.operation {
                 PeerOperation::Subscribe { .. } => None,
