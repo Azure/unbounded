@@ -329,6 +329,8 @@ pub fn discovery(
         Some((eligible as u64 / 50).clamp(10, 600).to_string()),
     );
     extra.insert(annotations::ENDPOINTS, Some(encode_endpoints(&endpoints)));
+    // Wakes seat followers on a commit (they watch this Lease).
+    extra.insert(annotations::SEQUENCE, sequence.map(|s| s.to_string()));
     let webhooks: Vec<WebhookSeat> = ready
         .iter()
         .filter_map(|(_, o)| {
@@ -783,6 +785,11 @@ mod tests {
             Some(r#"["n0","","n2","","n4"]"#)
         );
         assert_eq!(d.extra[annotations::CLAIM_WINDOW].as_deref(), Some("20"));
+        // The committed sequence, so a commit rewrites the Lease and wakes
+        // the seat followers watching it.
+        assert_eq!(d.extra[annotations::SEQUENCE].as_deref(), Some("5"));
+        let d = discovery(&live, 3, 1000, None, None);
+        assert_eq!(d.extra[annotations::SEQUENCE], None);
         // During the ready floor grace, the replaced sequence still counts.
         let d = discovery(&live, 3, 0, Some(5), Some(4));
         assert_eq!(d.ready, vec![0, 2]);

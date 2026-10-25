@@ -42,6 +42,9 @@ const REPORT: &str = r#"{"shares":1,"rdma_nics":[]}"#;
 /// Primary reconcile debounce, as in `primary.rs`.
 const DEBOUNCE: Duration = Duration::from_secs(1);
 
+/// Primary Lease write to watch event at the seat followers.
+const WATCH_DELAY: Duration = Duration::from_millis(50);
+
 /// Model settings.
 #[derive(Clone, Debug)]
 pub struct Settings {
@@ -121,6 +124,11 @@ struct Pod {
     renew: Option<SeatRenew>,
     contend: Contend,
     follower: Follower,
+    /// Model time of this Pod's next follower read; an `Ev::Follow` at any
+    /// other time was superseded by an earlier wake.
+    follow_at: u64,
+    /// Model time this Pod's follower last read the state.
+    followed_at: Option<u64>,
     lease_fresh_until: Option<u64>,
     primary: Option<Writer>,
 }
@@ -200,6 +208,8 @@ impl ControlPlane {
                 renew: None,
                 contend: Contend::default(),
                 follower: Follower::default(),
+                follow_at: u64::MAX,
+                followed_at: None,
                 lease_fresh_until: None,
                 primary: None,
             });
@@ -457,6 +467,8 @@ impl ControlPlane {
         p.lottery = Lottery::default();
         p.contend = Contend::default();
         p.follower = Follower::default();
+        p.follow_at = u64::MAX;
+        p.followed_at = None;
         p.lease_fresh_until = None;
         self.schedule(self.now, pod, Ev::Lottery(pod));
         if !self.node_ready(pod) {
@@ -481,6 +493,8 @@ impl ControlPlane {
             renew: None,
             contend: Contend::default(),
             follower: Follower::default(),
+            follow_at: u64::MAX,
+            followed_at: None,
             lease_fresh_until: None,
             primary: None,
         });
@@ -640,7 +654,7 @@ impl ControlPlane {
         p.renew = Some(SeatRenew::new(now));
         p.lease_fresh_until = Some(self.now + limits::LEASE_FRESHNESS.as_nanos() as u64);
         self.after(limits::LEASE_RENEW, pod, Ev::Renew(pod));
-        self.schedule(self.now, pod, Ev::Follow(pod));
+        self.follow_at(pod, self.now);
         self.schedule(self.now, pod, Ev::Contend(pod));
     }
 
@@ -762,6 +776,7 @@ impl ControlPlane {
         self.view.holder = self.primary.holder.map(Self::identity);
         let alive = self.pods.iter().filter(|p| p.alive).count() as u64;
         self.stats.watch_events += alive;
+        self.wake_followers();
     }
 
     fn primary_renew(&mut self, pod: u32) {
@@ -832,6 +847,7 @@ impl ControlPlane {
             &mut self.rng,
         );
         if let Ok(plan) = plan {
+            let mut published = false;
             if plan.changed
                 && current
                     .as_ref()
@@ -855,6 +871,11 @@ impl ControlPlane {
                     .is_none_or(|c| c.sequence != plan.next.sequence)
                 {
                     self.commit_at.insert(plan.next.sequence, self.now);
+                    // The primary publishes the committed sequence on its
+                    // Lease (`annotations::SEQUENCE`), which wakes the seat
+                    // followers instead of leaving them to their next
+                    // `FOLLOW_INTERVAL` read.
+                    published = true;
                 }
                 self.record = Some(plan.next.clone());
             }
@@ -883,6 +904,7 @@ impl ControlPlane {
             if self.view.desired != desired
                 || self.view.seat_nodes != nodes
                 || self.view.claim_window != window
+                || published
             {
                 self.view.desired = desired;
                 self.view.seat_nodes = nodes;
@@ -905,10 +927,41 @@ impl ControlPlane {
         }
     }
 
+    /// Schedule `pod`'s next follower read at `at`, superseding any other.
+    fn follow_at(&mut self, pod: u32, at: u64) {
+        self.pods[pod as usize].follow_at = at;
+        self.schedule(at, pod, Ev::Follow(pod));
+    }
+
+    /// The primary Lease changed: every Pod watches it, and a seat
+    /// follower wakes on the change (`seat.rs` `follower` waits on
+    /// `shared.changed`, which `apply_primary` notifies), reading at most
+    /// once a second.
+    fn wake_followers(&mut self) {
+        let delay = WATCH_DELAY.as_nanos() as u64;
+        let floor = Duration::from_secs(1).as_nanos() as u64;
+        for i in 0..self.pods.len() {
+            let p = &self.pods[i];
+            if !p.alive || p.seat.is_none() {
+                continue;
+            }
+            let at = (self.now + delay).max(p.followed_at.map_or(0, |t| t + floor));
+            if at < p.follow_at {
+                self.follow_at(i as u32, at);
+            }
+        }
+    }
+
     fn follow(&mut self, pod: u32) {
+        if self.pods[pod as usize].follow_at != self.now {
+            // Superseded by an earlier wake.
+            return;
+        }
+        self.pods[pod as usize].follow_at = u64::MAX;
         let Some(index) = self.pods[pod as usize].seat else {
             return;
         };
+        self.pods[pod as usize].followed_at = Some(self.now);
         let now = self.at(self.now);
         self.stats.api_reads += 1;
         let is_primary = self.pods[pod as usize].primary.is_some();
@@ -929,7 +982,8 @@ impl ControlPlane {
                 self.serve_clients(index, r.sequence);
             }
         }
-        self.after(crate::seat::FOLLOW_INTERVAL, pod, Ev::Follow(pod));
+        let next = self.now + crate::seat::FOLLOW_INTERVAL.as_nanos() as u64;
+        self.follow_at(pod, next);
     }
 
     /// A seat became ready at `sequence`: its share of client long polls
@@ -1134,6 +1188,39 @@ mod tests {
         cp.advance_to(240 * S);
         assert!(cp.reported(victim));
         assert_eq!(cp.record().unwrap().membership_version, mv);
+    }
+
+    /// Known issue 36: the primary publishes each commit on its Lease, so
+    /// every seat serves it within the follower's one-second read floor, not
+    /// at its next `FOLLOW_INTERVAL` read.
+    #[test]
+    fn seats_serve_a_commit_within_a_second() {
+        const S: u64 = 1_000_000_000;
+        let mut cp = run(30, 240, 5);
+        let seq = cp.sequence().unwrap();
+        let holders = cp.seat_holders();
+        let victim = (0..30)
+            .find(|p| Some(*p) != cp.primary_pod() && !holders.contains(&Some(*p)))
+            .unwrap();
+        cp.crash(victim);
+        // Step until the commit that drops the victim, then check every
+        // seat 1.1 s later.
+        let mut t = cp.now_ns();
+        while cp.sequence() == Some(seq) {
+            t += S / 100;
+            cp.advance_to(t);
+            assert!(t < 400 * S, "no commit");
+        }
+        let committed = cp.commit_ns(cp.sequence().unwrap()).unwrap();
+        cp.advance_to(committed + S + S / 10);
+        let seq = cp.sequence();
+        let seats: Vec<usize> = (0..annotations::MAX_SEATS)
+            .filter(|i| cp.seat_holders().get(*i).copied().flatten().is_some())
+            .collect();
+        assert!(!seats.is_empty());
+        for i in seats {
+            assert_eq!(cp.seat_served(i), seq, "seat {i}");
+        }
     }
 
     #[test]
