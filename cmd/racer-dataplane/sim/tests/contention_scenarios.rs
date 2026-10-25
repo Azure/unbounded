@@ -471,6 +471,15 @@ fn owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch() {
     assert!(counter(&report, "silence_pings") > 0, "{report}");
     assert_eq!(counter(&report, "silence_marks"), 0, "{report}");
     assert_eq!(counter(&report, "silent_destination_fails"), 0, "{report}");
+    // Known issue 53 bound: a ping follows a probe timeout (at most one
+    // each), two unanswered exchanges over a last link, or a silent peer's
+    // recheck; never anything else.
+    let pings = counter(&report, "silence_pings");
+    let bound = counter(&report, "probe_timeouts")
+        + counter(&report, "silence_timeouts")
+            / u64::from(racer_core::peer::silence::LINK_TIMEOUTS)
+        + counter(&report, "silence_rechecks");
+    assert!(pings <= bound, "{pings} pings, bound {bound}: {report}");
 }
 
 /// Known issue 18 (round 4, relay): a relay forwarding a body still queued at
