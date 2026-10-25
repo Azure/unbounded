@@ -1848,6 +1848,7 @@ fn a_default_read_reaches_every_owner_and_waits_again_at_its_last() {
         loop {
             let probe = match walk.next(&mut b) {
                 Ok(Step::Probe(probe)) => probe,
+                Ok(Step::Granted(_)) => unreachable!("readers have no grants"),
                 Ok(Step::End(_)) | Err(_) => return affordable,
             };
             let deadline = b.deadline();
