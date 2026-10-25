@@ -1371,10 +1371,6 @@ scenarios carry data-plane faults.
 46. Resolved: rankings keep ranks to 12, owners ask up to six lineage targets, including demoted
    members of unknown age; 5k `full-churn` moved repeats 194 to 66; holders ranked below 12 or
    past six targets are not asked (round 4, probes, wave 6).
-45. Sequential lineage and demoted probes add latency before origin (5k `full-churn` mean read
-   71 to 95 ms) (round 4, lineage, wave 5).
-46. Holders ranked sixth or lower, or past the three-target cap, are not asked (157 of 188 5k
-   `full-churn` moved repeats) (round 4, lineage, wave 5).
 47. Partly resolved: stale answers now return unused route links; 50k `full-cold-start` failed
    reads 11 to 4, the rest is 57 (round 4, ctl3, wave 6).
 48. Resolved: seat followers reread after a primary Lease change during their read (round 4,
