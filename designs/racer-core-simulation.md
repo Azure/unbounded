@@ -410,7 +410,13 @@ Verified against the code at the start of this work.
    reply bytes 298 GB to 689 GB (9 versions instead of 2). See "Round 4: join". Same family as
    Known issue 6.
 
-21. Partly resolved (round 4, orphan, a6c0d74a9 through 6b325b87e): an owner that answered
+21. Resolved (round 4, orphan2, 4e66c2124 through f97b81bba): an owner holding a successor hint
+   asks the hinted later owner copy-only before origin, on its own grant (one attempt, eight links,
+   never added to the walk's budget), so a delegated rank 0 copies an orphan instead of fetching
+   it again. 50k `full-failover`: orphans 1,205 to 893 (`copy_only` 140 to 44, `failed` 519 to
+   343), `copy_held` 1,914 to 1,584, origin 52,200 to 51,834. Remainder (holder never reached
+   rank 0, so no hint) is Known issue 211. See "Round 4: orphan2 (wave 4)".
+   Earlier, partly resolved (round 4, orphan, a6c0d74a9 through 6b325b87e): an owner that answered
    another owner's page probe without a copy keeps a successor hint and answers a reader's
    `Acquire` with `Miss`, so the reader gets the orphan copy from that owner instead of rank 0
    fetching the page again. 50k `full-failover` (seed 1): orphans 1,679 to 1,481, `copy_only`
@@ -564,6 +570,13 @@ Verified against the code at the start of this work.
 203. A reader waits only once for an owner that is behind (`stale_wait`); at 50k the propagation
    window (client lag p90 about 24 s) is longer than the wait, so 95 reads still fail in
    `full-cold-start` (57 to 161 s, during enrollment). Open (round 4, history, wave 4).
+
+211. Orphans whose holder never reached rank 0 leave no hint, so rank 0 still refetches them (50k
+   `full-failover`: `route` 285, `partition` 139, `busy` 79, most of `failed` 343). Needs the holder
+   to tell rank 0 later (round 4, orphan2).
+
+212. The simulator's repeat classification counts `Unavailable` signed by a relay on the route as
+   `failed` (rank 0's own origin failure); split it (round 4, orphan2).
 
 ## Simulator engine (racer-sim substrate)
 
@@ -1018,7 +1031,9 @@ scenarios carry data-plane faults.
    (round 4, join2).
 20. Resolved: images keep their delta across idle primary passes; 50k seat replies 562 to 302 GB,
    the one-image-per-client floor; origin half split into 25 (round 4, join2).
-21. Partly resolved: readers are deferred to the owner holding an orphan copy (round 4, orphan);
+21. Resolved: owners ask hinted successors copy-only before origin on their own grant; 50k
+   `full-failover` orphans 1,205 to 893, origin 52,200 to 51,834 (round 4, orphan2). Earlier:
+   readers are deferred to the owner holding an orphan copy (round 4, orphan);
    50k `full-failover` orphans 1,679 to 1,481. Delegation-led refetches and orphans of owners that
    never reached rank 0 remain.
 22. Resolved: the simulator debits the origin attempt like production (round 4, repeat).
@@ -1057,6 +1072,8 @@ scenarios carry data-plane faults.
    history, wave 4).
 203. One wait does not cover the 50k propagation window: 95 failed reads in `full-cold-start`
    (round 4, history, wave 4).
+211. Orphans whose holder never reached rank 0 still refetch (50k 893 left) (round 4, orphan2).
+212. Relay-signed `Unavailable` is classified as rank 0's `failed` (round 4, orphan2).
 
 ## Round 2: production admission
 
@@ -4104,3 +4121,119 @@ Reading the table:
   wait: a refreshed walk (Known issue 3) now keeps those credits too.
 - The temporary counters used for the root cause were removed before committing; the numbers
   above that come from them are marked as instrumented runs.
+
+## Round 4: orphan2 (wave 4)
+
+Known issue 21, remainder. Branch `racer-sim6-orphan2` from 3542f1cc4. Commits: 4e66c2124
+(racer-core grant and successor targets), a33874384 (production), 44bc87db1 (simulator),
+454e315d4 (clippy), 8255e91ca (time share and miss mapping), f97b81bba (`PROBE_AFTER`), plus this
+section. Evidence: `/tmp/opencode/r6-orphan2/`.
+
+### Root cause
+
+Temporary simulator counters (5k `full-failover`, seed 1, base 3542f1cc4) recorded, for each
+`copy_held` repeat that rank 0 fetched while an orphan holder kept the page (68 of 154):
+
+- Who made rank 0 fill: 49 were owner delegations (rank 2 while rank 1 held the page, 33; rank 1
+  while rank 2 held it, 16), 19 were readers after their deferrals ran out, none were local reads.
+- Budget: 59 of the 68 fills started with fewer than 3 attempts or fewer than 4 links. A delegation
+  carries rank 0's origin credit only (`owner_attempts`, `core/src/read/walk.rs`), so handoff
+  probes stop before they spend it (the `remaining_attempts() < 2` break in `CandidateWalk::next`).
+  That is why rank 0 never asks a successor, even when it noted one.
+- Hints: rank 0 held a hint naming the holder in 28 of the 68 cases; in the other 40 it never
+  noted it: the holder never reached rank 0 (`partition`, `route`, and `failed` answers that were
+  signed by a relay on the route, `fail_hop`/`relay_failure`, `sim/src/node/world.rs`; the
+  "failed" class of "Round 4: repeat" includes those relay failures).
+- Deferring owner requesters (the wave 3 alternative, retried here) made things worse (origin
+  13,057 to 13,071, `copy_held` 154 to 170): rank 2's later probe of rank 1 failed route search
+  286 times and missed 154 times at 5k, because the delegation used most of rank 2's links.
+
+### Change
+
+- racer-core `walk`: `WalkConfig::successors`. The first `successors` handoff targets are asked
+  copy-only before origin, each on its own grant (`SUCCESSOR_GRANT_ATTEMPTS` 1,
+  `SUCCESSOR_GRANT_LINKS` 8). The grant is never reunited with the walk's budget (also not on
+  `abandon`), and its route failures do not mark the walk's route failed, so the walk's credits
+  never grow and the delegation's origin credit stays. The probe's time share is divided by
+  `SUCCESSOR_SHARE_DIVISOR` (4) more opportunities, so a hung successor cannot hold the
+  requester past its own attempt timeout. `pending_successor()` reports it.
+- racer-core `successor`: `successor_targets` (hinted owners ranked after this node, not already
+  previous-membership targets, newest first), `with_successors` (successors first, at most
+  `MAX_HANDOFF`), `SuccessorHints::probe` (returns a hint once, re-armed by a renewed note, and
+  only once it is `PROBE_AFTER` = 2 s old: a younger hint names an owner whose own fetch is most
+  likely still running). Charging deferrals no longer drops the hint, only stops deferring on it,
+  so the probe can still use it. `successor_deferral` defers only to owners ranked after this
+  node: a predecessor that asked (rank 0's own successor probe answered `Miss` at rank 1) has no
+  copy either, and deferring to it bounced readers between two owners without one.
+- Production: the hint table moves from `Coordinator` to `CandidatePolicy::successors`
+  (`src/read/candidates.rs`); `resolve_epoch_traced` adds the successor targets for page walks of
+  owners. A successor probe error other than this request ending is a miss (DST
+  `dst_generated_traffic_churn_oracle` seed 7 returned a 503 before both fixes). No wire change:
+  the probe is an ordinary copy-only page request.
+- Simulator: `add_successor_targets` (same core helpers), switch `node.successor_targets`,
+  counters `successor_probes`, `successor_copies`, `successor_misses`, `successor_failures`, and
+  `origin_repeats_orphan_noted` (rank 0 refetched a holder it had noted).
+
+Bound: one granted copy-only probe per noted hint (`HINT_CAPACITY` 4,096 per node, re-armed only
+by a new miss answered to that owner). Origin authority, credits and budgets are unchanged;
+`origin_repeat_explained` is unchanged and holds (`unexplained` 0 in every run). No invariant was
+relaxed.
+
+### Tests
+
+- racer-core: `walk::tests::delegated_rank_zero_asks_successors_on_their_own_grant`,
+  `successor_grant_never_grows_the_walk_budget`, `owner_above_rank_zero_asks_successors_after_its_delegation`;
+  `successor::tests::probe_returns_each_note_once`, `successor_targets_are_later_owners_newest_first`,
+  `successors_come_first_within_the_handoff_cap`, `defers_only_to_owners_ranked_after_this_node`;
+  `charge_drops_hints_after_max_deferrals_and_note_resets` became
+  `charge_stops_deferrals_after_max_and_note_resets` (the hint now stays for the probe).
+- Production (`src/read/tests/peer_copies.rs`): `rank_zero_copies_from_the_owner_it_missed` (no
+  origin call; fails without the change), `rank_one_never_defers_to_rank_zero`;
+  `rank_zero_never_defers_owner_requesters` and `rank_zero_defers_readers_to_the_owner_it_missed`
+  now script the successor probe's miss and check it was the only peer call.
+- Simulator: `combined::tests::failover_owners_copy_orphans_from_successors` (400 nodes, seed 2:
+  successor copies, fewer `copy_only` plus `failed` orphans than without targets, and
+  `origin_repeats_orphan_noted <= successor_misses`).
+
+### Evidence
+
+Release, seed 1 unless noted, 5k `full-*` with `/tmp/opencode/m4b/rr.json`. Before is the wave 3
+merge (`/tmp/opencode/m5/`). Origin: total, worst page, pages>1. Orphans: all, then `copy_only` /
+`failed`. Probes: successor probes / copies.
+
+| Run | Reads ok / failed | Origin | `copy_held` | Orphans | Deferrals | Probes | Wall |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 5k full-failover before | 33,797 / 31 | 13,057, 6, 467 | 154 | 76 (13 / 38) | 266 | - | 0:52 |
+| 5k full-failover after | 33,801 / 26 | 13,034, 8, 446 | 129 | 61 (3 / 21) | 209 | 33 / 31 | 0:51 |
+| 5k full-failover seed 2 before | 33,487 / 38 | 13,084, 7, 453 | 164 | 93 (22 / 53) | 329 | - | 0:50 |
+| 5k full-failover seed 2 after | 33,491 / 28 | 13,030, 6, 436 | 116 | 49 (5 / 21) | 204 | 33 / 31 | 0:51 |
+| 5k full-churn before | 33,996 / 2 | 13,661, 6, 1,000 | 16 | 10 (2 / 6) | 188 | - | 0:49 |
+| 5k full-churn after | 33,995 / 2 | 13,652, 6, 995 | 7 | 3 (0 / 2) | 26 | 7 / 7 | 0:48 |
+| 5k churn before | 291,640 / 95 | 1,030, 2, 6 | 0 | 0 | 0 | - | 1:18 |
+| 5k churn after | 291,640 / 95 | 1,030, 2, 6 | 0 | 0 | 0 | 0 / 0 | 1:16 |
+| 5k zipf before | 202,884 / 21 | 40,804, 3, 1,830 | 198 | 0 | 181 | - | 2:02 |
+| 5k zipf after | 202,884 / 21 | 40,804, 3, 1,830 | 198 | 0 | 181 | 0 / 0 | 2:02 |
+| 50k full-failover before | 302,519 / 535 | 52,200, 10, 5,895 | 1,914 | 1,205 (140 / 519) | 1,878 | - | 28:06 |
+| 50k full-failover after | 302,509 / 530 | 51,834, 10, 5,796 | 1,584 | 893 (44 / 343) | 1,953 | 360 / 310 | 28:23 |
+
+- 50k orphans by cause, before and after: `failed` 519 / 343, `route` 309 / 285, `partition`
+  145 / 139, `copy_only` 140 / 44, `busy` 88 / 79. Origin requests fall by 366 (0.7%), `copy_held`
+  by 17%. 101 refetches remain where rank 0 had noted the holder (`origin_repeats_orphan_noted`:
+  its one probe missed or the hint expired). Peak RSS 3.0 GiB (unchanged). No hard invariant
+  failed; `unexplained` is 0 everywhere; all 16 scenarios at 200 nodes pass.
+- Before `PROBE_AFTER`, 5k `zipf` sent 131 successor probes, copied none (the hinted owners were
+  still fetching) and failed 29 reads instead of 21; 5k `full-failover` sent 111 probes for 25
+  copies. With it, probes copy 94% of the time and `zipf` is unchanged.
+- Workspace tests pass; clippy `-D warnings` clean.
+
+### Deviations and open items
+
+- Known issue 21 is resolved for its avoidable part: rank 0 now copies an orphan whenever it
+  learned of it and the holder still has it. New Known issue 211: what remains are orphans whose
+  holder never reached rank 0 (50k: `route` 285, `partition` 139, `busy` 79, and most of
+  `failed` 343, which includes `Unavailable` answers signed by a relay on the route rather than
+  by rank 0), so rank 0 holds no hint. Fixing them needs the holder to tell rank 0 later (a push
+  or offer once a route exists), a protocol addition not made here.
+- New Known issue 212: the repeat classification counts relay-signed `Unavailable` as `failed`
+  (rank 0's own origin failure); the simulator should split it from relay failures.
+- Production has no counter for successor probes yet: `CandidatePolicy` holds no `Metrics`.
