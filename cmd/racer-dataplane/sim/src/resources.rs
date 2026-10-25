@@ -6,6 +6,9 @@
 //! per-chunk events are needed and per-node state is a few `u64`s (struct of
 //! arrays, indexed by `u32` node id).
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+
 use racer_core::time::SplitMix64;
 
 use crate::config::{Config, Costs};
@@ -309,6 +312,19 @@ pub struct OriginErrors {
 
 /// The origin: per-cache concurrency cap (a pool of `cap` FIFO slots per
 /// cache), one shared bandwidth FIFO, fixed latency, injected errors.
+///
+/// Requests issued with [`Origin::request_tracked`] can be canceled
+/// ([`Origin::cancel`]). Production closes the connection of a canceled or
+/// expired origin exchange (`src/origin.rs`; test
+/// `real_uds_canceled_and_expired_reads_release_owned_resources` shows the
+/// `Connection` and `Plaintext` reservations return to zero), which frees the
+/// per-cache concurrency slot and stops the body transfer. The model
+/// therefore truncates the canceled request's slot and bandwidth
+/// reservations at the cancel time and recomputes, in issue order, the
+/// schedule of every later request that has not started yet or has not
+/// begun its body. Without cancellations the schedule is identical to the
+/// plain FIFO model. Do not mix tracked and untracked requests on one
+/// `Origin`.
 pub struct Origin {
     slots: Vec<Nanos>,
     cap: u32,
@@ -317,6 +333,42 @@ pub struct Origin {
     bps: u64,
     latency: Nanos,
     rng: SplitMix64,
+    /// Tracked requests in issue order. Finished and canceled ones are
+    /// marked dead and compacted away in bulk, so a cancellation's replay is
+    /// a scan of a contiguous vector.
+    pending: Vec<OriginEntry>,
+    dead: usize,
+    /// Outstanding requests whose completion a cancellation moved earlier,
+    /// by `(end, seq)`; rebuilt by each cancellation (see
+    /// [`Origin::pop_moved`]).
+    moved: BinaryHeap<Reverse<(Nanos, u64)>>,
+    next_seq: u64,
+    /// Slot and bandwidth free times left by finished tracked requests.
+    base_slots: Vec<Nanos>,
+    base_bandwidth: Nanos,
+}
+
+/// Handle of a tracked origin request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OriginHandle(u64);
+
+#[derive(Clone, Copy, Debug)]
+struct OriginEntry {
+    seq: u64,
+    live: bool,
+    /// A cancellation moved this request's completion: its original
+    /// completion time is stale and [`Origin::pop_moved`] delivers it.
+    moved: bool,
+    tag: u64,
+    issue: Nanos,
+    cache: u32,
+    slot: usize,
+    start: Nanos,
+    /// Body service time; 0 for error outcomes (no bandwidth).
+    service: Nanos,
+    /// When the body transfer begins (`end - service`).
+    body: Nanos,
+    end: Nanos,
 }
 
 impl Origin {
@@ -331,12 +383,57 @@ impl Origin {
             bps: config.origin_bps,
             latency: config.origin_latency_ns,
             rng,
+            pending: Vec::new(),
+            dead: 0,
+            moved: BinaryHeap::new(),
+            next_seq: 0,
+            base_slots: vec![0; (caches * cap) as usize],
+            base_bandwidth: 0,
         }
     }
 
     /// Origin cache that serves `object`.
     pub fn cache_of(&self, object: u64) -> u32 {
         (mix(object) % u64::from(self.caches)) as u32
+    }
+
+    fn outcome(&mut self, errors: OriginErrors) -> OriginOutcome {
+        let u = unit(&mut self.rng);
+        if u < errors.p412 {
+            OriginOutcome::PreconditionFailed
+        } else if u < errors.p412 + errors.p403 {
+            OriginOutcome::Forbidden
+        } else if u < errors.p412 + errors.p403 + errors.p5xx {
+            OriginOutcome::ServerError
+        } else {
+            OriginOutcome::Ok
+        }
+    }
+
+    /// Earliest free slot of `cache`; ties go to the lowest index
+    /// (deterministic). Returns the global slot index.
+    fn pick(slots: &[Nanos], cache: u32, cap: u32) -> usize {
+        let base = (cache * cap) as usize;
+        let (slot, _) = slots[base..base + cap as usize]
+            .iter()
+            .enumerate()
+            .min_by_key(|(i, t)| (**t, *i))
+            .expect("cap >= 1");
+        base + slot
+    }
+
+    /// Schedule one request against the current free times.
+    fn schedule(&mut self, now: Nanos, cache: u32, service: Nanos) -> (usize, Nanos, Nanos, Nanos) {
+        let slot = Self::pick(&self.slots, cache, self.cap);
+        let start = now.max(self.slots[slot]);
+        let first_byte = start + self.latency;
+        let (body, end) = if service > 0 {
+            reserve(&mut self.bandwidth_free, first_byte, service)
+        } else {
+            (first_byte, first_byte)
+        };
+        self.slots[slot] = end;
+        (slot, start, body, end)
     }
 
     /// Issue a request for `bytes` of `object`. Returns completion time and
@@ -348,42 +445,217 @@ impl Origin {
         bytes: u64,
         errors: OriginErrors,
     ) -> (Nanos, OriginOutcome) {
-        let u = unit(&mut self.rng);
-        let outcome = if u < errors.p412 {
-            OriginOutcome::PreconditionFailed
-        } else if u < errors.p412 + errors.p403 {
-            OriginOutcome::Forbidden
-        } else if u < errors.p412 + errors.p403 + errors.p5xx {
-            OriginOutcome::ServerError
+        let outcome = self.outcome(errors);
+        let service = if outcome == OriginOutcome::Ok {
+            service_ns(bytes, self.bps)
         } else {
-            OriginOutcome::Ok
+            0
         };
-        let base = (self.cache_of(object) * self.cap) as usize;
-        let pool = &mut self.slots[base..base + self.cap as usize];
-        // Earliest free slot; ties go to the lowest index (deterministic).
-        let (slot, _) = pool
-            .iter()
-            .enumerate()
-            .min_by_key(|(i, t)| (**t, *i))
-            .expect("cap >= 1");
-        let start = now.max(pool[slot]);
-        let first_byte = start + self.latency;
-        let end = if outcome == OriginOutcome::Ok {
-            reserve(
-                &mut self.bandwidth_free,
-                first_byte,
-                service_ns(bytes, self.bps),
-            )
-            .1
-        } else {
-            first_byte
-        };
-        pool[slot] = end;
+        let (_, _, _, end) = self.schedule(now, self.cache_of(object), service);
         (end, outcome)
     }
 
+    /// Like [`Origin::request`], but the request can later be canceled.
+    /// `tag` identifies the request in [`Origin::cancel`]'s reschedules.
+    /// Call [`Origin::finish`] when it completes.
+    pub fn request_tracked(
+        &mut self,
+        now: Nanos,
+        object: u64,
+        bytes: u64,
+        errors: OriginErrors,
+        tag: u64,
+    ) -> (OriginHandle, Nanos, OriginOutcome) {
+        let outcome = self.outcome(errors);
+        let service = if outcome == OriginOutcome::Ok {
+            service_ns(bytes, self.bps)
+        } else {
+            0
+        };
+        let cache = self.cache_of(object);
+        let (slot, start, body, end) = self.schedule(now, cache, service);
+        self.next_seq += 1;
+        let seq = self.next_seq;
+        self.pending.push(OriginEntry {
+            seq,
+            live: true,
+            moved: false,
+            tag,
+            issue: now,
+            cache,
+            slot,
+            start,
+            service,
+            body,
+            end,
+        });
+        (OriginHandle(seq), end, outcome)
+    }
+
+    /// The tracked request completed: forget it.
+    pub fn finish(&mut self, handle: OriginHandle) {
+        if let Some(e) = self.take(handle) {
+            self.retire(&e);
+        }
+    }
+
+    /// Mark `handle` dead and return its entry if it was live.
+    fn take(&mut self, handle: OriginHandle) -> Option<OriginEntry> {
+        let i = self
+            .pending
+            .binary_search_by_key(&handle.0, |e| e.seq)
+            .ok()?;
+        let e = &mut self.pending[i];
+        if !e.live {
+            return None;
+        }
+        e.live = false;
+        let taken = *e;
+        self.dead += 1;
+        if self.dead > 64 && self.dead * 2 > self.pending.len() {
+            self.pending.retain(|e| e.live);
+            self.dead = 0;
+        }
+        Some(taken)
+    }
+
+    fn retire(&mut self, e: &OriginEntry) {
+        self.base_slots[e.slot] = self.base_slots[e.slot].max(e.end);
+        if e.service > 0 {
+            self.base_bandwidth = self.base_bandwidth.max(e.end);
+        }
+    }
+
+    /// Cancel a tracked request at `now`, as production closing the
+    /// connection: its slot frees at `now` and its unsent body no longer
+    /// uses bandwidth. Returns how many other outstanding requests had
+    /// their completion moved (always earlier); [`Origin::pop_moved`]
+    /// delivers those.
+    pub fn cancel(&mut self, handle: OriginHandle, now: Nanos) -> usize {
+        let Some(mut canceled) = self.take(handle) else {
+            return 0;
+        };
+        if canceled.end <= now {
+            self.retire(&canceled);
+            return 0;
+        }
+        if canceled.start <= now {
+            // Started: it held the slot (and maybe bandwidth) until now.
+            canceled.end = now;
+            canceled.service = canceled.service.min(now.saturating_sub(canceled.body));
+            self.retire(&canceled);
+        }
+        // Rebuild free times from finished requests and the requests issued
+        // before the canceled one (their schedule does not depend on it),
+        // then replay the later outstanding ones in issue order.
+        self.slots.clone_from(&self.base_slots);
+        self.bandwidth_free = self.base_bandwidth;
+        let split = self.pending.partition_point(|e| e.seq < handle.0);
+        for e in self.pending[..split].iter().filter(|e| e.live) {
+            self.slots[e.slot] = self.slots[e.slot].max(e.end);
+            if e.service > 0 {
+                self.bandwidth_free = self.bandwidth_free.max(e.end);
+            }
+        }
+        let mut moved = 0;
+        let (latency, cap) = (self.latency, self.cap);
+        for e in self.pending[split..].iter_mut().filter(|e| e.live) {
+            let before = e.end;
+            if e.start <= now {
+                // Started: slot fixed. A body already flowing keeps its
+                // reservation; otherwise it waits for bandwidth again.
+                if e.service > 0 && e.body > now {
+                    let ready = (e.start + latency).max(now);
+                    let (body, end) = reserve(&mut self.bandwidth_free, ready, e.service);
+                    e.body = body;
+                    e.end = end;
+                } else if e.service > 0 {
+                    self.bandwidth_free = self.bandwidth_free.max(e.end);
+                }
+            } else {
+                let slot = Self::pick(&self.slots, e.cache, cap);
+                let start = e.issue.max(self.slots[slot]).max(now);
+                let first_byte = start + latency;
+                let (body, end) = if e.service > 0 {
+                    reserve(&mut self.bandwidth_free, first_byte, e.service)
+                } else {
+                    (first_byte, first_byte)
+                };
+                e.slot = slot;
+                e.start = start;
+                e.body = body;
+                e.end = end;
+            }
+            self.slots[e.slot] = self.slots[e.slot].max(e.end);
+            debug_assert!(e.end <= before, "cancellation never delays a request");
+            if e.end != before {
+                e.moved = true;
+                moved += 1;
+            }
+        }
+        if moved > 0 {
+            // Rebuild rather than push per move: a cancellation can move
+            // every queued request, and stale heap entries would pile up.
+            self.moved = self
+                .pending
+                .iter()
+                .filter(|e| e.live && e.moved)
+                .map(|e| Reverse((e.end, e.seq)))
+                .collect();
+        }
+        moved
+    }
+
+    fn entry(&self, handle: OriginHandle) -> Option<&OriginEntry> {
+        let i = self
+            .pending
+            .binary_search_by_key(&handle.0, |e| e.seq)
+            .ok()?;
+        Some(&self.pending[i]).filter(|e| e.live)
+    }
+
+    /// Current completion time of an outstanding tracked request.
+    pub fn end(&self, handle: OriginHandle) -> Option<Nanos> {
+        self.entry(handle).map(|e| e.end)
+    }
+
+    /// Whether the completion time returned at issue still holds and is
+    /// `now` (no cancellation moved it).
+    pub fn due_as_issued(&self, handle: OriginHandle, now: Nanos) -> bool {
+        self.entry(handle).is_some_and(|e| !e.moved && e.end == now)
+    }
+
+    /// Earliest completion among moved requests.
+    pub fn next_moved(&mut self) -> Option<Nanos> {
+        while let Some(&Reverse((end, seq))) = self.moved.peek() {
+            if self.entry(OriginHandle(seq)).is_some_and(|e| e.end == end) {
+                return Some(end);
+            }
+            self.moved.pop();
+        }
+        None
+    }
+
+    /// Tags of moved requests completing at or before `now`, in completion
+    /// then issue order. The caller then calls [`Origin::finish`] for each.
+    pub fn pop_moved(&mut self, now: Nanos) -> Vec<u64> {
+        let mut due = Vec::new();
+        while let Some(end) = self.next_moved()
+            && end <= now
+        {
+            let Reverse((_, seq)) = self.moved.pop().expect("peeked");
+            due.push(self.entry(OriginHandle(seq)).expect("live").tag);
+        }
+        due
+    }
+
+    /// Outstanding tracked requests.
+    pub fn outstanding(&self) -> usize {
+        self.pending.len() - self.dead
+    }
+
     pub fn approximate_bytes(&self) -> usize {
-        self.slots.capacity() * 8
+        self.slots.capacity() * 16 + self.pending.capacity() * size_of::<OriginEntry>()
     }
 }
 
@@ -566,5 +838,120 @@ mod tests {
         for c in counts {
             assert!((800..1200).contains(&c), "{counts:?}");
         }
+    }
+
+    fn origin(caches: u32, concurrency: u32, bps: u64) -> Origin {
+        let config = Config {
+            origin_caches: caches,
+            origin_concurrency: concurrency,
+            origin_latency_ns: 10 * MILLIS,
+            origin_bps: bps,
+            ..Config::default()
+        };
+        Origin::new(&config, SplitMix64::new(1))
+    }
+
+    #[test]
+    fn tracked_requests_match_untracked_without_cancellation() {
+        let none = OriginErrors::default();
+        let mixed = OriginErrors { p5xx: 0.2, ..none };
+        let mut a = origin(3, 2, 1 << 20);
+        let mut b = origin(3, 2, 1 << 20);
+        for i in 0..200u64 {
+            let now = i * 7 * MILLIS;
+            let (end, outcome) = a.request(now, i % 5, 1 << 18, mixed);
+            let (_, tracked_end, tracked_outcome) =
+                b.request_tracked(now, i % 5, 1 << 18, mixed, i);
+            assert_eq!(
+                (end, outcome),
+                (tracked_end, tracked_outcome),
+                "request {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn canceling_a_transfer_releases_bandwidth_to_later_requests() {
+        // One cache, plenty of slots, 1 MiB/s: each 1 MiB body takes 1 s.
+        let mut o = origin(1, 8, 1 << 20);
+        let none = OriginErrors::default();
+        let (first, a_end, _) = o.request_tracked(0, 1, 1 << 20, none, 1);
+        let (b, b_end, _) = o.request_tracked(0, 1, 1 << 20, none, 2);
+        let (c, c_end, _) = o.request_tracked(0, 1, 1 << 20, none, 3);
+        assert_eq!(a_end, 10 * MILLIS + SECONDS);
+        assert_eq!(b_end, 10 * MILLIS + 2 * SECONDS);
+        assert_eq!(c_end, 10 * MILLIS + 3 * SECONDS);
+        // Cancel the first halfway through its body.
+        let at = 10 * MILLIS + SECONDS / 2;
+        assert_eq!(o.cancel(first, at), 2);
+        assert_eq!(o.end(b), Some(at + SECONDS));
+        assert_eq!(o.end(c), Some(at + 2 * SECONDS));
+        assert_eq!(o.end(first), None);
+        assert!(!o.due_as_issued(b, b_end));
+        assert_eq!(o.outstanding(), 2);
+        // Canceling again is a no-op.
+        assert_eq!(o.cancel(first, at), 0);
+        // A new request queues behind the moved ones.
+        let (d, d_end, _) = o.request_tracked(at, 1, 1 << 20, none, 4);
+        assert_eq!(d_end, at + 3 * SECONDS);
+        assert!(o.due_as_issued(d, d_end));
+        // Moved requests are delivered in completion order.
+        assert_eq!(o.next_moved(), Some(at + SECONDS));
+        assert!(o.pop_moved(at + SECONDS - 1).is_empty());
+        assert_eq!(o.pop_moved(at + 2 * SECONDS), vec![2, 3]);
+        o.finish(b);
+        o.finish(c);
+        assert_eq!(o.next_moved(), None);
+        assert_eq!(o.outstanding(), 1);
+    }
+
+    #[test]
+    fn canceling_releases_the_concurrency_slot() {
+        // One slot, no bandwidth limit to speak of: errors pay latency only.
+        let mut o = origin(1, 1, u64::MAX / 2);
+        let none = OriginErrors::default();
+        let (first, a_end, _) = o.request_tracked(0, 1, 0, none, 1);
+        let (second, b_end, _) = o.request_tracked(0, 1, 0, none, 2);
+        let (third, c_end, _) = o.request_tracked(0, 1, 0, none, 3);
+        assert_eq!(
+            (a_end, b_end, c_end),
+            (10 * MILLIS, 20 * MILLIS, 30 * MILLIS)
+        );
+        // Canceling a request that has not started removes it entirely.
+        assert_eq!(o.cancel(third, MILLIS), 0);
+        // Canceling the running one frees the slot now: the second starts.
+        assert_eq!(o.cancel(first, 4 * MILLIS), 1);
+        assert_eq!(o.end(second), Some(14 * MILLIS));
+        let (_, d_end, _) = o.request_tracked(5 * MILLIS, 1, 0, none, 4);
+        assert_eq!(d_end, 24 * MILLIS);
+    }
+
+    #[test]
+    fn canceling_a_queued_request_moves_only_later_ones_on_shared_bandwidth() {
+        // Two caches share bandwidth; cache slots are independent.
+        let mut o = origin(2, 1, 1 << 20);
+        let none = OriginErrors::default();
+        let (x, y) =
+            (0..64)
+                .map(|i| (i, o.cache_of(i)))
+                .fold((None, None), |(x, y), (i, c)| match c {
+                    0 if x.is_none() => (Some(i), y),
+                    1 if y.is_none() => (x, Some(i)),
+                    _ => (x, y),
+                });
+        let (x, y) = (x.unwrap(), y.unwrap());
+        let (_, a_end, _) = o.request_tracked(0, x, 1 << 20, none, 1);
+        let (b, b_end, _) = o.request_tracked(0, y, 1 << 20, none, 2);
+        let (c, c_end, _) = o.request_tracked(0, y, 1 << 20, none, 3);
+        assert_eq!(a_end, 10 * MILLIS + SECONDS);
+        assert_eq!(b_end, 10 * MILLIS + 2 * SECONDS);
+        // `c` waits for `b`'s slot, then for bandwidth.
+        assert_eq!(c_end, b_end + 10 * MILLIS + SECONDS);
+        // Cancel `b` while it waits for bandwidth (started, no body yet):
+        // `c` gets the slot now and the bandwidth once `a` is done.
+        assert_eq!(o.cancel(b, 500 * MILLIS), 1);
+        assert_eq!(o.end(c), Some(a_end + SECONDS));
+        // Completing the rest leaves nothing outstanding.
+        assert_eq!(o.outstanding(), 2);
     }
 }
