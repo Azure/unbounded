@@ -5885,6 +5885,6 @@ origin.
 - ctl3 refunds 23 stale links in 5k `full-failover` and 28 in `full-churn`; most runs move
   within seed noise. The worst `full-failover` page rises to 7 (seed 1) and 8 (seed 2); traced,
   both are origin failure retries (Known issue 52 class), recorded under Known issue 55. Seed 3
-  completes 129 fewer reads (33,718 to 33,589) with fewer failures (34 to 31); not traced,
-  likely a shifted schedule (ok plus failed is the issued count, 33,752 to 33,620).
+  completes 129 fewer reads (33,718 to 33,589) with fewer failures (34 to 31);
+  ok plus failed falls 33,752 to 33,620, so fewer reads were issued or finished; not traced.
 - 50k runs are deferred to part 2.
