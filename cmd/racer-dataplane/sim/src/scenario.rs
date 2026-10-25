@@ -222,7 +222,7 @@ impl<L: NodeLogic> World<L> {
                     self.engine
                         .at(until_ns.max(from_ns), Event::Slow { node, factor: 1 });
                 }
-                Fault::Partition { .. } | Fault::OriginErrors { .. } => {}
+                Fault::Partition { .. } | Fault::Hang { .. } | Fault::OriginErrors { .. } => {}
             }
         }
     }

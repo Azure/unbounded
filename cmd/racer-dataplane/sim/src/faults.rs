@@ -1,4 +1,5 @@
-//! Fault schedule: partitions, crash/restart, slow nodes, origin errors.
+//! Fault schedule: partitions, crash/restart, slow nodes, hung peer servers,
+//! origin errors.
 //!
 //! Faults are data. A scenario turns them into events at start-up and asks
 //! [`Partitions`] whether two nodes can talk at a given time.
@@ -29,6 +30,15 @@ pub enum Fault {
     Slow {
         node: u32,
         factor: u8,
+        from_ns: Nanos,
+        until_ns: Nanos,
+    },
+    /// Node's peer server hangs during `[from_ns, until_ns)`: it accepts
+    /// every peer request it receives, as destination or relay, and never
+    /// answers or forwards it, without failing the connection. Its own reads
+    /// still run (Known issue 39).
+    Hang {
+        node: u32,
         from_ns: Nanos,
         until_ns: Nanos,
     },
@@ -87,6 +97,14 @@ impl Fault {
                     until_ns: field(o, "until_ns")?,
                 }
             }
+            "hang" => {
+                let o = spec(v, &["kind", "node", "from_ns", "until_ns"])?;
+                Self::Hang {
+                    node: small(o, "node")?,
+                    from_ns: field(o, "from_ns")?,
+                    until_ns: field(o, "until_ns")?,
+                }
+            }
             "origin_errors" => {
                 let o = spec(v, &["kind", "from_ns", "until_ns", "p412", "p403", "p5xx"])?;
                 let errors = OriginErrors {
@@ -140,6 +158,14 @@ impl Partitions {
     }
 }
 
+/// Whether `node`'s peer server hangs at `now` ([`Fault::Hang`]).
+pub fn hung(faults: &[Fault], node: u32, now: Nanos) -> bool {
+    faults.iter().any(|f| {
+        matches!(*f, Fault::Hang { node: n, from_ns, until_ns }
+            if n == node && (from_ns..until_ns).contains(&now))
+    })
+}
+
 /// Origin error rates in effect at `now`: the last matching window wins,
 /// otherwise `base`.
 pub fn origin_errors_at(faults: &[Fault], base: OriginErrors, now: Nanos) -> OriginErrors {
@@ -168,6 +194,7 @@ mod tests {
             json!({"kind": "partition", "from_ns": 1, "until_ns": 2, "site_a": 0, "site_b": 1}),
             json!({"kind": "crash", "node": 1, "at_ns": 1, "restart_ns": 2}),
             json!({"kind": "slow", "node": 1, "factor": 0, "from_ns": 1, "until_ns": 2}),
+            json!({"kind": "hang", "node": 1, "from_ns": 1, "until_ns": 2}),
             json!({"kind": "origin_errors", "from_ns": 1, "until_ns": 2, "p5xx": 0.5}),
         ] {
             Fault::from_json(&v).unwrap();

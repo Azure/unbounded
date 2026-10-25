@@ -27,6 +27,7 @@ use super::error::{Error, Result};
 use super::fanout::{
     HELPER_ATTEMPTS, HELPER_FLOOR_ATTEMPTS, HELPER_FLOOR_LINKS, HELPER_LINKS, HELPER_MIN_ATTEMPTS,
 };
+pub use super::rank0::Rank0State;
 use std::time::{Duration, Instant};
 
 /// Whether a probe may start acquisition at its destination.
@@ -117,6 +118,14 @@ pub struct WalkConfig {
     /// [`granted_prefix`]. The grant's unused credits are dropped, never
     /// added to the walk's budget, so the walk's credits never grow.
     pub granted: usize,
+    /// What this owner last learned about rank 0's acquisition of the page
+    /// ([`crate::read::rank0::Rank0Watch`], Known issues 39 and 40).
+    /// `Fetching`: a route failure, `Overloaded` or shed from rank 0 also
+    /// withholds origin like a timeout, since an earlier probe found rank 0
+    /// fetching. `Overdue`: a timeout of rank 0 gives origin authority like
+    /// a transport failure, since rank 0 missed its request's deadline.
+    /// Ignored unless this node is an owner above rank 0 on a page walk.
+    pub rank0: Rank0State,
 }
 
 /// Attempts granted to one successor probe ([`WalkConfig::successors`]): the
@@ -361,7 +370,11 @@ pub enum Outcome {
     /// request would only queue behind rank 0's at the same origin (Known
     /// issue 31). Such a walk ends [`End::Exhausted`] instead of
     /// [`End::Origin`]; a transport failure (rank 0 down or unreachable) or
-    /// a miss still lets the owner fetch.
+    /// a miss still lets the owner fetch. [`WalkConfig::rank0`] bounds the
+    /// rule: once rank 0 missed its request's deadline (`Overdue`) a timeout
+    /// gives authority again (Known issue 39), and while an earlier timeout
+    /// says rank 0 is fetching, a route failure or `Overloaded` withholds
+    /// too (Known issue 40).
     TimedOut,
 }
 
@@ -593,6 +606,12 @@ impl CandidateWalk {
     /// authority.
     pub fn rank0_unanswered(&self) -> bool {
         self.rank0_unanswered
+    }
+
+    /// The pending probe is this owner's page probe of rank 0: the caller
+    /// updates its [`crate::read::rank0::Rank0Watch`] from the outcome.
+    pub fn pending_rank0(&self) -> bool {
+        self.pending.as_ref().is_some_and(|p| p.rank0)
     }
 
     /// Whether the walk stopped because a probe could not be funded.
@@ -913,8 +932,19 @@ impl CandidateWalk {
         }
         let outcome = match outcome {
             Outcome::TimedOut => {
-                self.rank0_unanswered |= pending.rank0;
+                self.rank0_unanswered |= pending.rank0 && self.config.rank0 != Rank0State::Overdue;
                 Outcome::Transport(ProbeOutcome::Unreachable)
+            }
+            // Rank 0 was found fetching the page: a failure that says the
+            // route or rank 0 is busy is not evidence that it stopped (Known
+            // issue 40).
+            Outcome::Shed
+            | Outcome::Probe(ProbeOutcome::Overloaded)
+            | Outcome::Transport(ProbeOutcome::Unreachable | ProbeOutcome::Overloaded)
+                if pending.rank0 && self.config.rank0 == Rank0State::Fetching =>
+            {
+                self.rank0_unanswered = true;
+                outcome
             }
             outcome => outcome,
         };

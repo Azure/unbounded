@@ -10,6 +10,7 @@ use page_alloc::{Alignment, PhantomEntries, SegmentClock, Segments};
 use racer_core::cache::lru::TickLru;
 use racer_core::read::flight::{FlightLimits, PageFlights};
 use racer_core::read::notice::{NOTICE_CAPACITY, OrphanNotices};
+use racer_core::read::rank0::{Rank0Watch, WATCH_CAPACITY, WATCH_TTL};
 use racer_core::read::successor::{HINT_CAPACITY, HINT_TTL, SuccessorHints};
 use topology::{MAX_DEGREE, Paths, Phantom, Placement, SharedRoutes};
 
@@ -155,6 +156,10 @@ pub struct Node {
     /// Pages this node fetched from origin as an owner above rank 0, to
     /// offer to rank 0 later (production orphan notices, Known issue 37).
     pub notices: OrphanNotices<u64, u32>,
+    /// Pages whose rank 0 this node, an owner above it, found fetching or
+    /// overdue (production `CandidatePolicy::rank0_watch`, Known issues 39
+    /// and 40).
+    pub rank0: Rank0Watch<u64, u32>,
 }
 
 pub struct Shared {
@@ -199,6 +204,11 @@ impl Node {
             ),
             hints: SuccessorHints::new(HINT_CAPACITY, HINT_TTL),
             notices: OrphanNotices::new(NOTICE_CAPACITY),
+            rank0: Rank0Watch::new(
+                WATCH_CAPACITY,
+                WATCH_TTL,
+                Duration::from_nanos(config.read_timeout_ns),
+            ),
         }
     }
 
@@ -230,7 +240,8 @@ impl Node {
             + self.links.len() * 64
             + self.suspects.capacity() * 4
             + self.hints.len() * 64
-            + self.notices.len() * 64;
+            + self.notices.len() * 64
+            + self.rank0.len() * 48;
         out.disk_index += self.disk.entries.len() * SEGMENT_MAPPING_BYTES;
         out.segments += std::mem::size_of::<Segments>()
             + std::mem::size_of::<SegmentClock>()

@@ -486,3 +486,69 @@ fn relays_hold_their_reservation_only_while_the_body_streams() {
     );
     assert_eq!(counter(&report, "reads_failed"), 0, "{report}");
 }
+
+/// Known issue 39 (round 4, hang): an owner above rank 0 leaves the fetch to
+/// a rank 0 whose probe timed out (Known issue 31), so a rank 0 whose peer
+/// server accepts requests and never answers used to block its pages for as
+/// long as it stayed a member. Ten of 200 members hang for the whole run; a
+/// storm reads a cold object at 0 s and again at 30 s. The owners above a
+/// hung rank 0 now fetch once it stayed silent for a request timeout (10 s)
+/// after their first probe timed out (`Rank0Watch`), so the second storm
+/// reads almost everything; without the watch it fails again on the same
+/// pages. The one read the second storm
+/// still fails visits a hung rank 2 first and then reaches rank 1 through a
+/// hung relay, twice (Known issue 301: a reader does not learn that a peer
+/// hangs).
+#[test]
+fn a_hung_rank_zero_blocks_its_pages_for_at_most_one_request_timeout() {
+    // Failed reads of members whose own peer server does not hang (a hung
+    // reader loses the answers to its own requests).
+    let failed = |m: &racer_sim::report::Metrics| {
+        m.get("reads_failed") - m.get("reads_failed_on_hung_nodes")
+    };
+    let run_hang = |watch: bool| {
+        let mut config = quiet(200);
+        config.duration_ns = 45 * SECONDS;
+        config.pages_per_object = 64;
+        config.node.rank0_watch = watch;
+        config.faults = (0..10)
+            .map(|node| Fault::Hang {
+                node: node * 20,
+                from_ns: 0,
+                until_ns: config.duration_ns,
+            })
+            .collect();
+        config.storms = vec![
+            storm(0, 0, 100, 100 * MILLIS),
+            storm(30 * SECONDS, 0, 100, 100 * MILLIS),
+        ];
+        let mut world = NodeWorld::new(config, 5);
+        world.run(29 * SECONDS);
+        let early = failed(&world.metrics);
+        let end = world.config.duration_ns;
+        world.run(end);
+        let late = failed(&world.metrics) - early;
+        let report = world.report("contention", 5);
+        assert_eq!(
+            report["invariants"]["hard_failures"], 0,
+            "{}",
+            report["invariants"]
+        );
+        assert!(counter(&report, "messages_lost_to_hang") > 0, "{report}");
+        (early, late, report)
+    };
+    let (early, late, report) = run_hang(true);
+    assert!(
+        counter(&report, "rank0_watch_overdue_walks") > 0,
+        "{report}"
+    );
+    assert!(
+        late <= 1,
+        "second storm still fails {late} (first: {early}): {report}"
+    );
+    let (old_early, old_late, _) = run_hang(false);
+    assert!(
+        old_late >= 100 && old_late > 50 * late,
+        "without the watch: {old_early} early, {old_late} late"
+    );
+}

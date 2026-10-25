@@ -61,9 +61,9 @@ use racer_core::read::successor::{
 };
 use racer_core::read::walk::{
     AttemptInputs, AttemptPlan, CandidateWalk, Continuation, End, HedgeFacts, MAX_HANDOFF, Mode,
-    Outcome, PREVIOUS_MEMBERSHIP_WITHIN, Probe, RemainingWalk, RouteMode, StaleAction, Step,
-    WalkConfig, demoted_targets, granted_prefix, handoff_targets, hedge_budgets, hedge_eligible,
-    hedge_fallback, lineage_counts, lineage_targets, merge_handoff, plan_attempt,
+    Outcome, PREVIOUS_MEMBERSHIP_WITHIN, Probe, Rank0State, RemainingWalk, RouteMode, StaleAction,
+    Step, WalkConfig, demoted_targets, granted_prefix, handoff_targets, hedge_budgets,
+    hedge_eligible, hedge_fallback, lineage_counts, lineage_targets, merge_handoff, plan_attempt,
     same_rank_previous, stale_action, transport_outcome,
 };
 use racer_core::route::MAX_LINKS;
@@ -693,6 +693,8 @@ pub struct NodeWorld {
     pub invariants: Invariants,
     pub versions: Versions,
     partitions: Partitions,
+    /// Some fault hangs a peer server ([`SimFault::Hang`]).
+    hangs: bool,
     ids: Ids,
     shared: Shared,
     nodes: Vec<Node>,
@@ -807,6 +809,10 @@ impl NodeWorld {
                 )
             },
             partitions: Partitions::from_faults(&config.faults),
+            hangs: config
+                .faults
+                .iter()
+                .any(|f| matches!(f, SimFault::Hang { .. })),
             ids: Ids::new(n, config.workers.max(1), config.pages_per_object),
             shared,
             nodes,
@@ -903,7 +909,9 @@ impl NodeWorld {
                     self.engine
                         .at(until_ns.max(from_ns), Event::Slow { node, factor: 1 });
                 }
-                SimFault::Partition { .. } | SimFault::OriginErrors { .. } => {}
+                SimFault::Partition { .. }
+                | SimFault::Hang { .. }
+                | SimFault::OriginErrors { .. } => {}
             }
         }
     }
@@ -1543,6 +1551,13 @@ impl NodeWorld {
                                 .observe("read_failed_at_s", self.now() / SECONDS);
                             if !self.down_since.is_empty() {
                                 self.metrics.incr("reads_failed_while_crashed");
+                            }
+                            if self.hangs
+                                && crate::faults::hung(&self.config.faults, r.node, self.now())
+                            {
+                                // The reader's own peer server hangs: the
+                                // answers to its requests are lost.
+                                self.metrics.incr("reads_failed_on_hung_nodes");
                             }
                             if self.versions.unready_members() > 0 {
                                 // Known issue 17: reads failing while some
@@ -2221,6 +2236,22 @@ impl NodeWorld {
             .versions
             .get(fill.version)
             .is_some_and(|v| v.members.members().len() > fill.cands.len() + 1);
+        // Known issues 39 and 40: what this owner last learned about rank
+        // 0's acquisition of the page.
+        let rank0 = match (fill.rank, fill.cands.first()) {
+            (Some(r), Some(first)) if r > 0 && self.config.node.rank0_watch => {
+                let instant = self.instant(self.now());
+                self.nodes[fill.node as usize]
+                    .rank0
+                    .state(&fill.page, first, instant)
+            }
+            _ => Rank0State::Unknown,
+        };
+        match rank0 {
+            Rank0State::Fetching => self.metrics.incr("rank0_watch_fetching_walks"),
+            Rank0State::Overdue => self.metrics.incr("rank0_watch_overdue_walks"),
+            Rank0State::Unknown => {}
+        }
         let fill = self.fills.get_mut(&id).expect("present");
         // Successor targets come first in `handoff`, then lineage targets
         // (`merge_handoff`); with `lineage_grants` both are granted.
@@ -2245,6 +2276,7 @@ impl NodeWorld {
             helper: fill.rank.is_none() && self.config.node.fanout && helpers_possible,
             lineage: fill.lineage,
             granted: fill.granted,
+            rank0,
         }));
         self.step_walk(id);
     }
@@ -3102,6 +3134,13 @@ impl NodeWorld {
             self.msgs.remove(&mid);
             return;
         }
+        if self.hangs && crate::faults::hung(&self.config.faults, at, now) {
+            // A hung peer server (Known issue 39): accepted, never answered
+            // or forwarded; the requester's attempt times out.
+            self.metrics.incr("messages_lost_to_hang");
+            self.msgs.remove(&mid);
+            return;
+        }
         if now >= m.abandon {
             // The requester gave up: production relays and the destination
             // see the upstream connection close and drop the exchange.
@@ -3729,6 +3768,31 @@ impl NodeWorld {
                 _ => "lineage_grant_failures",
             });
         }
+        if let Walking::Candidates(walk) = &fill.walk
+            && walk.pending_rank0()
+            && self.config.node.rank0_watch
+        {
+            // Production `CandidatePolicy::note_rank0` (Known issues 39, 40).
+            let (node, page, deadline) = (fill.node, fill.page, fill.budget.deadline());
+            let rank0 = fill.cands[0];
+            let instant = self.instant(self.now());
+            let watch = &mut self.nodes[node as usize].rank0;
+            match &outcome {
+                Ok(Outcome::TimedOut) => watch.timed_out(page, rank0, instant, deadline),
+                Ok(
+                    Outcome::Copy
+                    | Outcome::Probe(
+                        ProbeOutcome::CopyMiss
+                        | ProbeOutcome::VersionUnavailable
+                        | ProbeOutcome::Unreachable,
+                    ),
+                ) => watch.answered(&page, &rank0),
+                _ => {}
+            }
+        }
+        let Some(fill) = self.fills.get_mut(&id) else {
+            return;
+        };
         // Both are per probe: a cut noted for a relay-signed answer must not
         // leak into the next probe's classification.
         let cut = fill.cut.take();

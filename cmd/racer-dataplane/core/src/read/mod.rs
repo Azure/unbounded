@@ -14,6 +14,7 @@ pub mod metadata;
 pub mod notice;
 pub mod policy;
 pub mod range;
+pub mod rank0;
 pub mod response;
 pub mod serve;
 pub mod stale;

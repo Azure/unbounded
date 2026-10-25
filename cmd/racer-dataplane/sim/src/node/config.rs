@@ -117,6 +117,10 @@ pub struct NodeConfig {
     /// rank 0 later (production `orphan_notices`: always on; set 0 to
     /// measure without it, Known issue 37). Needs `successor_hints`.
     pub orphan_notices: bool,
+    /// Owners above rank 0 remember rank 0 found fetching or overdue per
+    /// page (production `Rank0Watch`: always on; set 0 to measure without
+    /// it, Known issues 39 and 40).
+    pub rank0_watch: bool,
 }
 
 impl Default for NodeConfig {
@@ -158,6 +162,7 @@ impl Default for NodeConfig {
             lineage_slack: true,
             copy_join_rank: true,
             orphan_notices: true,
+            rank0_watch: true,
         }
     }
 }
@@ -209,6 +214,7 @@ impl NodeConfig {
                 "lineage_slack" if n <= 1 => self.lineage_slack = n == 1,
                 "copy_join_rank" if n <= 1 => self.copy_join_rank = n == 1,
                 "orphan_notices" if n <= 1 => self.orphan_notices = n == 1,
+                "rank0_watch" if n <= 1 => self.rank0_watch = n == 1,
                 _ => return Err(format!("unknown key node.{key}")),
             }
         }

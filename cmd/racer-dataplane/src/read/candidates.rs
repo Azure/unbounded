@@ -109,6 +109,10 @@ pub struct CandidatePolicy {
     pub(crate) notices: RefCell<Notices>,
     /// Copy offers in flight ([`MAX_OFFERS_IN_FLIGHT`]).
     offers: Rc<std::cell::Cell<usize>>,
+    /// Pages whose rank 0 this node, as an owner above it, found fetching
+    /// (a probe timed out) or overdue (it missed that request's deadline);
+    /// see `racer_core::read::rank0` (Known issues 39 and 40).
+    pub(crate) rank0_watch: RefCell<Rank0Watch>,
 }
 
 /// Counts one copy offer in flight until its task ends or is dropped.
@@ -141,6 +145,8 @@ fn owner_arrivals(candidates: &Candidates) -> Vec<Option<u32>> {
         .map(|node| candidates.membership.since(node))
         .collect()
 }
+
+pub(crate) type Rank0Watch = racer_core::read::rank0::Rank0Watch<crate::model::PageId, NodeId>;
 
 pub(crate) type Successors =
     racer_core::read::successor::SuccessorHints<crate::model::PageId, NodeId>;
@@ -654,6 +660,43 @@ impl CandidatePolicy {
             )),
             notices: RefCell::new(Notices::new(racer_core::read::notice::NOTICE_CAPACITY)),
             offers: Rc::default(),
+            rank0_watch: RefCell::new(Rank0Watch::new(
+                racer_core::read::rank0::WATCH_CAPACITY,
+                racer_core::read::rank0::WATCH_TTL,
+                racer_core::read::rank0::HANG_AFTER,
+            )),
+        }
+    }
+
+    /// Update the rank 0 watch from the outcome of this owner's page probe
+    /// of rank 0 (`CandidateWalk::pending_rank0`, Known issues 39 and 40):
+    /// a timeout notes the page with the request's deadline, an answer
+    /// signed by rank 0 itself forgets it.
+    fn note_rank0(
+        &self,
+        rank0: &NodeId,
+        operation: &PeerOperation,
+        outcome: &WalkOutcome,
+        deadline: std::time::Instant,
+    ) {
+        let PeerOperation::Page { page, .. } = operation else {
+            return;
+        };
+        let mut watch = self.rank0_watch.borrow_mut();
+        match outcome {
+            WalkOutcome::TimedOut => watch.timed_out(
+                page.clone(),
+                rank0.clone(),
+                uring_runtime::environment::now(),
+                deadline,
+            ),
+            WalkOutcome::Copy
+            | WalkOutcome::Probe(
+                ProbeOutcome::CopyMiss
+                | ProbeOutcome::VersionUnavailable
+                | ProbeOutcome::Unreachable,
+            ) => watch.answered(page, rank0),
+            _ => {}
         }
     }
 
@@ -746,6 +789,18 @@ impl CandidatePolicy {
     /// Bound each local peer exchange independently of the signed operation ceiling.
     pub(crate) fn with_attempt_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.attempt_timeout = timeout;
+        self
+    }
+
+    /// How long rank 0 may stay silent on a page after an owner's probe of
+    /// it timed out before the owner presumes it hung (the client request
+    /// timeout; see `racer_core::read::rank0`, Known issue 39).
+    pub(crate) fn with_rank0_hang_after(self, hang_after: std::time::Duration) -> Self {
+        *self.rank0_watch.borrow_mut() = Rank0Watch::new(
+            racer_core::read::rank0::WATCH_CAPACITY,
+            racer_core::read::rank0::WATCH_TTL,
+            hang_after,
+        );
         self
     }
 
@@ -1195,6 +1250,16 @@ impl CandidatePolicy {
                 helper,
                 lineage,
                 granted,
+                rank0: match (rank, &operation) {
+                    (Some(rank), PeerOperation::Page { page: id, .. }) if rank > 0 => {
+                        self.rank0_watch.borrow().state(
+                            id,
+                            &candidates.ordered[0],
+                            uring_runtime::environment::now(),
+                        )
+                    }
+                    _ => racer_core::read::rank0::Rank0State::Unknown,
+                },
             });
             // This node owns the page under version - 1, so the stale
             // fallback (Known issue 19) is not available to this walk.
@@ -1379,6 +1444,14 @@ impl CandidatePolicy {
                         note_validation(trail, &validated);
                         match validated {
                             Ok(Ok(copy)) => {
+                                if walk.pending_rank0() {
+                                    self.note_rank0(
+                                        destination,
+                                        &operation,
+                                        &WalkOutcome::Copy,
+                                        budget.deadline().min(scope.deadline.0),
+                                    );
+                                }
                                 walk.complete(budget, WalkOutcome::Copy)?;
                                 return Ok(CandidateResolution::Copy(copy));
                             }
@@ -1409,6 +1482,14 @@ impl CandidatePolicy {
                         }
                     },
                 };
+                if walk.pending_rank0() {
+                    self.note_rank0(
+                        destination,
+                        &operation,
+                        &outcome,
+                        budget.deadline().min(scope.deadline.0),
+                    );
+                }
                 walk.complete(budget, outcome)?;
             };
             if walk.funding_stopped() {

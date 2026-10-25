@@ -21,6 +21,7 @@ fn config(rank: Option<usize>, owners: usize, order: VisitOrder) -> WalkConfig {
         helper: false,
         lineage: [0; MAX_HANDOFF],
         granted: 0,
+        rank0: Rank0State::Unknown,
     }
 }
 
@@ -1263,6 +1264,96 @@ fn only_an_owner_probe_of_rank_zero_timing_out_withholds_origin() {
     remaining.next_probe().unwrap();
     assert_eq!(remaining.complete(&mut b, Outcome::TimedOut), None);
     assert_eq!(remaining.next_probe(), Err(RemainingEnd::Unavailable));
+}
+
+/// Known issues 39 and 40: the rank 0 watch bounds the timeout rule. While an
+/// earlier timeout says rank 0 is fetching, a route failure, `Overloaded` or
+/// shed from rank 0 withholds origin too; a miss or a failure of rank 0's own
+/// still gives authority. Once rank 0 missed its request's deadline, a
+/// timeout gives authority. Probes are planned the same in every state.
+#[test]
+fn rank_zero_watch_bounds_and_extends_the_timeout_rule() {
+    let with = |rank: usize, state: Rank0State| WalkConfig {
+        rank0: state,
+        ..config(Some(rank), 3, VisitOrder::canonical(3))
+    };
+    for outcome in [
+        Outcome::Transport(ProbeOutcome::Unreachable),
+        Outcome::Transport(ProbeOutcome::Overloaded),
+        Outcome::Probe(ProbeOutcome::Overloaded),
+        Outcome::Shed,
+        Outcome::TimedOut,
+    ] {
+        let mut walk = CandidateWalk::new(with(1, Rank0State::Fetching));
+        let (_, end) = drive(&mut walk, &mut budget(8, 32), |_, _| outcome);
+        assert_eq!(end, End::Exhausted { funding: false }, "{outcome:?}");
+        assert!(walk.rank0_unanswered());
+    }
+    for outcome in [
+        Outcome::Probe(ProbeOutcome::CopyMiss),
+        Outcome::Probe(ProbeOutcome::Unreachable),
+    ] {
+        let mut walk = CandidateWalk::new(with(1, Rank0State::Fetching));
+        let (_, end) = drive(&mut walk, &mut budget(8, 32), |_, _| outcome);
+        assert!(matches!(end, End::Origin { rank: 1, .. }), "{outcome:?}");
+    }
+    // Overdue: a timeout is a transport failure again.
+    let mut walk = CandidateWalk::new(with(1, Rank0State::Overdue));
+    let (_, end) = drive(&mut walk, &mut budget(8, 32), |_, _| Outcome::TimedOut);
+    assert!(matches!(end, End::Origin { rank: 1, .. }));
+    assert!(!walk.rank0_unanswered());
+    // Rank 2 fetching: rank 1 failing does not withhold, rank 0 does.
+    let mut walk = CandidateWalk::new(with(2, Rank0State::Fetching));
+    let (_, end) = drive(&mut walk, &mut budget(8, 32), |p, _| {
+        if p.canonical == 0 {
+            Outcome::Probe(ProbeOutcome::CopyMiss)
+        } else {
+            Outcome::Transport(ProbeOutcome::Unreachable)
+        }
+    });
+    assert!(matches!(end, End::Origin { rank: 2, .. }));
+    let mut walk = CandidateWalk::new(with(2, Rank0State::Fetching));
+    let (_, end) = drive(&mut walk, &mut budget(8, 32), |p, _| {
+        if p.canonical == 0 {
+            Outcome::Transport(ProbeOutcome::Unreachable)
+        } else {
+            Outcome::Probe(ProbeOutcome::CopyMiss)
+        }
+    });
+    assert_eq!(end, End::Exhausted { funding: false });
+    // Non-owners and rank 0 ignore the state; probes and budgets match.
+    for state in [Rank0State::Fetching, Rank0State::Overdue] {
+        let run = |cfg: WalkConfig| {
+            let mut walk = CandidateWalk::new(cfg);
+            let mut b = budget(8, 32);
+            let (probes, end) = drive(&mut walk, &mut b, |_, _| {
+                Outcome::Transport(ProbeOutcome::Unreachable)
+            });
+            (
+                shapes(&probes),
+                end,
+                b.remaining_attempts(),
+                b.remaining_links(),
+            )
+        };
+        for rank in [None, Some(0)] {
+            let base = config(rank, 3, VisitOrder::canonical(3));
+            assert_eq!(
+                run(WalkConfig {
+                    rank0: state,
+                    ..base
+                }),
+                run(base)
+            );
+        }
+        let probes = |cfg: WalkConfig| {
+            let mut walk = CandidateWalk::new(cfg);
+            let mut b = budget(8, 32);
+            let (probes, _) = drive(&mut walk, &mut b, |_, _| Outcome::TimedOut);
+            (shapes(&probes), b.remaining_attempts(), b.remaining_links())
+        };
+        assert_eq!(probes(with(1, state)), probes(with(1, Rank0State::Unknown)));
+    }
 }
 
 /// Known issue 25: later owners that arrived before an owner are its lineage
