@@ -385,6 +385,9 @@ struct Fill {
     asking: Option<u32>,
     /// Why the outstanding walk probe failed in transport, if it did.
     cut: Option<Cut>,
+    /// The outstanding walk probe's answer was signed by a relay on the
+    /// route rather than by its destination (Known issue 38).
+    relayed: bool,
     /// Walk probes so far: destination and how each ended (repeat
     /// classification, [`NodeWorld::classify_repeat`]).
     asked: Vec<(u32, Asked)>,
@@ -408,6 +411,10 @@ enum Asked {
     /// delegation: rank 0's own acquisition, such as its origin request,
     /// failed).
     Failed,
+    /// A relay on the route answered with a failure (`Unavailable` signed
+    /// by the relay, `fail_hop`): the destination never saw the request
+    /// (Known issue 38).
+    Relayed,
     /// The destination or a relay shed the request, or it was behind.
     Busy,
     /// The probe could not be planned (budget) or failed terminally.
@@ -433,7 +440,7 @@ enum Cut {
 }
 
 /// Skip causes (`classify_repeat`), as `&'static` counter names.
-const SKIPS: [&str; 10] = [
+const SKIPS: [&str; 11] = [
     "not_serving",
     "partition",
     "down",
@@ -441,6 +448,7 @@ const SKIPS: [&str; 10] = [
     "circuit",
     "timeout",
     "failed",
+    "relay",
     "busy",
     "copy_only",
     "unfunded",
@@ -456,6 +464,7 @@ fn skip_counter(prefix: &'static str, skip: &'static str) -> &'static str {
         ("origin_skips_", "circuit") => "origin_skips_circuit",
         ("origin_skips_", "timeout") => "origin_skips_timeout",
         ("origin_skips_", "failed") => "origin_skips_failed",
+        ("origin_skips_", "relay") => "origin_skips_relay",
         ("origin_skips_", "busy") => "origin_skips_busy",
         ("origin_skips_", "copy_only") => "origin_skips_copy_only",
         ("origin_skips_", "copy") => "origin_skips_copy",
@@ -467,6 +476,7 @@ fn skip_counter(prefix: &'static str, skip: &'static str) -> &'static str {
         (_, "circuit") => "origin_repeats_orphan_circuit",
         (_, "timeout") => "origin_repeats_orphan_timeout",
         (_, "failed") => "origin_repeats_orphan_failed",
+        (_, "relay") => "origin_repeats_orphan_relay",
         (_, "busy") => "origin_repeats_orphan_busy",
         (_, "copy_only") => "origin_repeats_orphan_copy_only",
         (_, "copy") => "origin_repeats_orphan_copy",
@@ -485,6 +495,7 @@ fn concurrent_counter(skip: &'static str) -> &'static str {
         "circuit" => "origin_repeats_concurrent_skip_circuit",
         "timeout" => "origin_repeats_concurrent_skip_timeout",
         "failed" => "origin_repeats_concurrent_skip_failed",
+        "relay" => "origin_repeats_concurrent_skip_relay",
         "busy" => "origin_repeats_concurrent_skip_busy",
         "copy_only" => "origin_repeats_concurrent_skip_copy_only",
         "copy" => "origin_repeats_concurrent_skip_copy",
@@ -1774,6 +1785,7 @@ impl NodeWorld {
                 started: self.engine.now(),
                 asking: None,
                 cut: None,
+                relayed: false,
                 asked: Vec::new(),
                 origin: None,
                 canceled: false,
@@ -3420,6 +3432,14 @@ impl NodeWorld {
         let Some(m) = self.msgs.remove(&mid) else {
             return;
         };
+        if from != m.dest
+            && let Some(p) = self.probes.get(&m.probe)
+            && p.hedge.is_none()
+            && let Some(fill) = self.fills.get_mut(&p.fill)
+        {
+            // A relay signs this answer (Known issue 38).
+            fill.relayed = true;
+        }
         let reply = if from == m.dest && reply == Reply::Response(ResponseKind::Overloaded) {
             Reply::Shed
         } else {
@@ -3681,6 +3701,10 @@ impl NodeWorld {
                 _ => "lineage_grant_failures",
             });
         }
+        // Both are per probe: a cut noted for a relay-signed answer must not
+        // leak into the next probe's classification.
+        let cut = fill.cut.take();
+        let relayed = std::mem::take(&mut fill.relayed);
         if let Some(dest) = fill.asking.take() {
             let asked = match &outcome {
                 Ok(Outcome::Copy) => Asked::Copy,
@@ -3688,8 +3712,9 @@ impl NodeWorld {
                     Asked::Miss
                 }
                 Ok(Outcome::Transport(ProbeOutcome::Unreachable) | Outcome::TimedOut) => {
-                    Asked::Unreachable(fill.cut.take().unwrap_or(Cut::Other))
+                    Asked::Unreachable(cut.unwrap_or(Cut::Other))
                 }
+                Ok(Outcome::Probe(ProbeOutcome::Unreachable)) if relayed => Asked::Relayed,
                 Ok(Outcome::Probe(ProbeOutcome::Unreachable)) => Asked::Failed,
                 Ok(_) => Asked::Busy,
                 Err(_) => Asked::Unfunded,
@@ -4204,6 +4229,7 @@ impl NodeWorld {
                     Cut::Other => "timeout",
                 },
                 Some(Asked::Failed) => "failed",
+                Some(Asked::Relayed) => "relay",
                 Some(Asked::Busy) => "busy",
                 Some(Asked::Miss) => "copy_only",
                 Some(Asked::Copy) => "copy",
@@ -4248,7 +4274,7 @@ impl NodeWorld {
                 match a {
                     Asked::Miss => "origin_repeats_after_move_held_asked_miss",
                     Asked::Copy => "origin_repeats_after_move_held_asked_copy",
-                    Asked::Unreachable(_) | Asked::Failed => {
+                    Asked::Unreachable(_) | Asked::Failed | Asked::Relayed => {
                         "origin_repeats_after_move_held_asked_unreachable"
                     }
                     Asked::Busy => "origin_repeats_after_move_held_asked_busy",
@@ -4296,7 +4322,8 @@ impl NodeWorld {
             };
             let cause = if last.done > fill.started {
                 "origin_repeats_held_raced"
-            } else if asked(|a| matches!(a, Asked::Unreachable(_) | Asked::Failed)) {
+            } else if asked(|a| matches!(a, Asked::Unreachable(_) | Asked::Failed | Asked::Relayed))
+            {
                 "origin_repeats_held_unreachable"
             } else if asked(|a| a == Asked::Busy) {
                 "origin_repeats_held_busy"

@@ -546,7 +546,9 @@ mod tests {
         assert_clean(&on);
         let orphans = |r: &Value| {
             let o = &r["origin_per_page"]["repeats"]["orphan"];
-            o["copy_only"].as_u64().unwrap() + o["failed"].as_u64().unwrap()
+            o["copy_only"].as_u64().unwrap()
+                + o["failed"].as_u64().unwrap()
+                + o["relay"].as_u64().unwrap()
         };
         assert_eq!(counter(&off, "successor_deferrals"), 0);
         assert!(counter(&on, "successor_deferrals") > 0, "{}", on["metrics"]);
@@ -580,7 +582,9 @@ mod tests {
         assert!(counter(&on, "successor_copies") > 0, "{}", on["metrics"]);
         let orphans = |r: &Value| {
             let o = &r["origin_per_page"]["repeats"]["orphan"];
-            o["copy_only"].as_u64().unwrap() + o["failed"].as_u64().unwrap()
+            o["copy_only"].as_u64().unwrap()
+                + o["failed"].as_u64().unwrap()
+                + o["relay"].as_u64().unwrap()
         };
         assert!(orphans(&on) < orphans(&off), "{}", on["origin_per_page"]);
         // A refetch by rank 0 that noted the holder is rare: its one probe
