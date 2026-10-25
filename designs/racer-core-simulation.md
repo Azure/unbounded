@@ -4860,6 +4860,12 @@ fetched more than once; overlap is `origin_repeats_concurrent`.
 - 5k `full-failover` worst page 5 to 8; seeds 2 and 3 give 6 to 6 and 6 to 7, and pages fetched more
   than once 425 to 412 (seed 2: 404 to 416, seed 3: 332 to 352). The run has no rank 0 timeout
   that the watch acts on; the copy-only route change shifts which routes are taken.
+- 50k `full-failover` (`/tmp/opencode/m4b/rr.json`): reads 302,776 / 395 to 302,775 / 399; origin
+  requests 50,858 to 50,760, worst page 6 to 8, pages fetched more than once 4,998 to 4,940;
+  concurrent repeats 1 and 1; orphan repeats after a route failure to rank 0 159 to 26 and after a
+  copy-only miss 45 to 123 (more owners now reach rank 0 copy-only); 3 overdue walks. Peak RSS
+  3.0 GiB, 28 min, unchanged. 50k `full-cold-start` was not run: its 5k run is unchanged (same
+  trace hash).
 - Trace hashes match the wave 4 merge for storm, churn, 1 Gbit/s storm and full-cold-start.
 - No hard invariant failure in any run; `origin_repeat_explained` `unexplained` 0 everywhere.
 - 16-scenario smoke at 200 nodes, 1 s: clean, no invariant failure; trace hashes match the wave 4
