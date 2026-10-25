@@ -4400,7 +4400,7 @@ impl NodeWorld {
             let watch = &mut self.nodes[node as usize].rank0;
             match &outcome {
                 Ok(Outcome::TimedOut) => watch.timed_out(page, rank0, instant, deadline),
-                Ok(Outcome::Failed) => watch.failed(page, rank0, instant),
+                Ok(Outcome::Failed) => watch.answered_failure(&page, &rank0),
                 Ok(
                     Outcome::Copy
                     | Outcome::Probe(
@@ -4962,6 +4962,7 @@ impl NodeWorld {
         let (node, page) = (fill.node, fill.page);
         fill.plan.origin(Err(Error::DeadlineExceeded));
         self.metrics.incr("origin_canceled");
+        self.note_origin_failure(id);
         self.cancel_origin(handle);
         if let Some(last) = self.last_origin.get_mut(&page)
             && last.node == node
@@ -5232,6 +5233,30 @@ impl NodeWorld {
                 if skip.is_none() && self.nodes[node as usize].hints.names(&page, &last.node) {
                     self.metrics.incr("origin_repeats_orphan_noted");
                 }
+                // Known issue 51: why the holder's copy did not reach this
+                // owner. `unreachable`: this walk asked the holder and the
+                // route failed; `pending`: the holder's offer to this
+                // owner's rank is still scheduled (not yet due, or held by
+                // a cut); `noted`: this owner knew of the holder; `other`:
+                // none of these.
+                let index = fill.cands.iter().position(|c| *c == node);
+                let pending = index.is_some_and(|i| {
+                    self.nodes[last.node as usize]
+                        .notices
+                        .pending(&(page, i as u8))
+                });
+                let why = if asked(|a| {
+                    matches!(a, Asked::Unreachable(_) | Asked::Failed | Asked::Relayed)
+                }) {
+                    "origin_repeats_orphan_why_unreachable"
+                } else if pending {
+                    "origin_repeats_orphan_why_pending"
+                } else if self.nodes[node as usize].hints.names(&page, &last.node) {
+                    "origin_repeats_orphan_why_noted"
+                } else {
+                    "origin_repeats_orphan_why_other"
+                };
+                self.metrics.incr(why);
             }
             // Every such repeat is a skip itself (`F` above rank 0), an
             // orphan (`A` fetched as a skip), or raced. Anything else is
@@ -5318,6 +5343,7 @@ impl NodeWorld {
         };
         let (node, page) = (fill.node, fill.page);
         let ok = result.is_ok();
+        let failed = matches!(result, Err(Error::Unavailable));
         let notice = ok && should_notice(fill.rank);
         // The walk's predecessor evidence in rank order (the last answer of
         // each predecessor; production `OriginAuthority`).
@@ -5343,6 +5369,9 @@ impl NodeWorld {
             .filter_map(|i| fill.cands.get(usize::from(i)).map(|t| (i, *t)))
             .collect();
         fill.plan.origin(result);
+        if failed {
+            self.note_origin_failure(id);
+        }
         if notice {
             self.note_notice(node, page, &targets);
         }
@@ -5355,6 +5384,26 @@ impl NodeWorld {
             last.done = now;
         }
         self.continue_plan(id);
+    }
+
+    /// Production `CandidatePolicy::note_origin_failure` (Known issue 52):
+    /// an owner above rank 0 whose own origin request failed leaves retries
+    /// after rank 0's own failures to rank 0 for a while.
+    fn note_origin_failure(&mut self, id: u64) {
+        if !self.config.node.rank0_watch || !self.config.node.rank0_failure_hold {
+            return;
+        }
+        let fill = &self.fills[&id];
+        let (Some(rank), Some(rank0)) = (fill.rank, fill.cands.first().copied()) else {
+            return;
+        };
+        if rank == 0 {
+            return;
+        }
+        let (node, page) = (fill.node, fill.page);
+        let instant = self.instant(self.now());
+        self.nodes[node as usize].rank0.failed(page, rank0, instant);
+        self.metrics.incr("rank0_watch_origin_failures");
     }
 
     /// `node` fetched `page` from origin as an owner after `targets` (owner
