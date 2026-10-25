@@ -87,7 +87,7 @@ impl RttMatrix {
 
 /// Per-node NICs, disks, CPUs, with node placement into sites.
 pub struct Fabric {
-    pub site: Vec<u16>,
+    pub site: std::rc::Rc<[u16]>,
     /// Slowdown multiplier per node (1 = normal), applied to CPU, disk and
     /// NIC service times.
     pub slow: Vec<u8>,
@@ -266,7 +266,7 @@ impl Fabric {
     }
 
     pub fn approximate_bytes(&self) -> usize {
-        self.site.capacity() * 2
+        self.site.len() * 2
             + self.slow.capacity()
             + (self.tx_free.capacity()
                 + self.rx_free.capacity()

@@ -621,6 +621,31 @@ mod tests {
         let (off, on) = (run_with(false), run_with(true));
         assert_clean(&on);
         assert_eq!(counter(&off, "orphan_offers_sent"), 0);
+        // Known issue 50: only offers that failed with cut evidence cross
+        // a partition, and without cut groups offers cross it at least as
+        // often.
+        assert!(
+            counter(&on, "partition_link_failures_offers") <= counter(&on, "orphan_offers_cut"),
+            "{}",
+            on["metrics"]
+        );
+        let ungrouped = {
+            let mut config = Config {
+                nodes: 400,
+                ..Config::default()
+            };
+            data_defaults(&mut config);
+            config.request_rate = 0.2;
+            config.node.offer_cut_groups = false;
+            run("full-failover", config, 2, Some(300 * SECONDS), None).unwrap()
+        };
+        assert!(
+            counter(&on, "partition_link_failures_offers")
+                <= counter(&ungrouped, "partition_link_failures_offers"),
+            "{} {}",
+            counter(&on, "partition_link_failures_offers"),
+            counter(&ungrouped, "partition_link_failures_offers")
+        );
         let noted = counter(&on, "orphan_notices_noted");
         let sent = counter(&on, "orphan_offers_sent");
         assert!(

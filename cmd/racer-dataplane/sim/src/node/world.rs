@@ -436,6 +436,17 @@ struct Fill {
     concurrent: bool,
 }
 
+/// How a copy offer ended (Known issue 50).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OfferEnd {
+    /// The target answered `Miss`.
+    Delivered,
+    /// The target itself answered otherwise (shed, behind).
+    Refused,
+    /// Transport failure or timeout, or a relay's answer: the route is cut.
+    Cut,
+}
+
 /// How one walk probe ended, for repeat classification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Asked {
@@ -784,6 +795,8 @@ pub struct NodeWorld {
     /// Outstanding copy offers: the sending node, its incarnation, and the
     /// notice (Known issue 37).
     offers: HashMap<u64, (u32, u32, Due<u64, u32>), Fixed>,
+    /// Outstanding offers a relay answered (Known issue 50: cut evidence).
+    offers_relayed: HashSet<u64, Fixed>,
     ranges: HashMap<u64, RangeRead, Fixed>,
     writes: HashMap<u64, SimCharge, Fixed>,
     /// Relay reservations of replies still streaming (see `Event::Release`).
@@ -917,6 +930,7 @@ impl NodeWorld {
             msgs: HashMap::default(),
             probes: HashMap::default(),
             offers: HashMap::default(),
+            offers_relayed: HashSet::default(),
             ranges: HashMap::default(),
             writes: HashMap::default(),
             held: HashMap::default(),
@@ -1087,7 +1101,8 @@ impl NodeWorld {
             Event::Reply { probe, reply } => self.reply(probe, reply),
             Event::ProbeTimeout { probe } => {
                 if let Some((node, incarnation, due)) = self.offers.remove(&probe) {
-                    self.offer_done(node, incarnation, due, false);
+                    self.offers_relayed.remove(&probe);
+                    self.offer_done(node, incarnation, due, OfferEnd::Cut);
                 }
                 if let Some(ping) = self.pings.remove(&probe) {
                     self.ping_done(ping, None);
@@ -3545,6 +3560,12 @@ impl NodeWorld {
             self.metrics.incr("link_failures");
             if partitioned {
                 self.metrics.incr("partition_link_failures");
+                if let Some(m) = self.msgs.get(&mid)
+                    && m.offer
+                {
+                    // Known issue 50: a copy offer crossed the cut.
+                    self.metrics.incr("partition_link_failures_offers");
+                }
             }
             if let Some(restarted) = unready {
                 // A member that has not applied a membership yet: no peer
@@ -4020,6 +4041,9 @@ impl NodeWorld {
         let Some(m) = self.msgs.remove(&mid) else {
             return;
         };
+        if from != m.dest && self.offers.contains_key(&m.probe) {
+            self.offers_relayed.insert(m.probe);
+        }
         if from != m.dest
             && let Some(ping) = self.pings.get_mut(&m.probe)
         {
@@ -4121,9 +4145,17 @@ impl NodeWorld {
         }
         if let Some((node, incarnation, due)) = self.offers.remove(&pid) {
             // Only the destination answers an offer `Miss`; anything else
-            // (transport, a relay's answer, shed, behind) tries again.
-            let delivered = reply == Reply::Response(ResponseKind::Miss);
-            self.offer_done(node, incarnation, due, delivered);
+            // (transport, a relay's answer, shed, behind) tries again. A
+            // relay's answer is cut evidence (Known issue 50).
+            let relayed = self.offers_relayed.remove(&pid);
+            let end = if relayed || reply == Reply::Transport {
+                OfferEnd::Cut
+            } else if reply == Reply::Response(ResponseKind::Miss) {
+                OfferEnd::Delivered
+            } else {
+                OfferEnd::Refused
+            };
+            self.offer_done(node, incarnation, due, end);
             return;
         }
         let Some(probe) = self.probes.remove(&pid) else {
@@ -4383,6 +4415,7 @@ impl NodeWorld {
         // leak into the next probe's classification.
         let cut = fill.cut.take();
         let relayed = std::mem::take(&mut fill.relayed);
+        let mut observed = None;
         if let Some(dest) = fill.asking.take() {
             let asked = match &outcome {
                 Ok(Outcome::Copy) => Asked::Copy,
@@ -4411,7 +4444,29 @@ impl NodeWorld {
                     fill.budget.remaining_links()
                 ));
             }
+            // Known issue 50: this node's reads see cuts its offers would
+            // cross.
+            // Production `CandidatePolicy::observe_route`: answers a relay
+            // may have signed say nothing.
+            let cut = match asked {
+                Asked::Unreachable(_) => Some(true),
+                Asked::Copy | Asked::Miss | Asked::Failed => Some(false),
+                Asked::Relayed | Asked::Busy | Asked::Unfunded => None,
+            };
+            observed = cut.map(|cut| (fill.node, dest, cut));
         }
+        if let Some((node, dest, cut)) = observed
+            && self.config.node.offer_cut_groups
+        {
+            let site = self.fabric.site[dest as usize];
+            let instant = self.instant(self.now());
+            self.nodes[node as usize]
+                .notices
+                .observe(site, cut, instant);
+        }
+        let Some(fill) = self.fills.get_mut(&id) else {
+            return;
+        };
         // `reply` counted a skipped destination that is behind this node.
         let skipped = outcome == Ok(Outcome::StaleDestination) && fill.stale > 0;
         match &mut fill.walk {
@@ -5293,7 +5348,21 @@ impl NodeWorld {
             return;
         }
         let instant = self.instant(self.now());
-        while let Some(due) = self.nodes[node as usize].notices.pop_due(instant) {
+        let sites = self.fabric.site.clone();
+        let grouped = self.config.node.offer_cut_groups;
+        let group = |t: &u32| sites[*t as usize];
+        loop {
+            let notices = &mut self.nodes[node as usize].notices;
+            // Without cut groups (`node.offer_cut_groups` 0) offers go as
+            // before Known issue 50.
+            let next = if grouped {
+                notices.pop_open(instant, group)
+            } else {
+                notices.pop_due(instant)
+            };
+            let Some(due) = next else {
+                break;
+            };
             let page = due.key;
             let w = self.ids.worker(page);
             let n = &self.nodes[node as usize];
@@ -5302,8 +5371,21 @@ impl NodeWorld {
             let owners = self.owners_at(node, w, page, true);
             match notice_target(&node, &owners, holds) {
                 Some(target) => self.launch_offer(node, Due { target, ..due }),
-                None => self.metrics.incr("orphan_notices_dropped"),
+                None => {
+                    self.metrics.incr("orphan_notices_dropped");
+                    self.nodes[node as usize]
+                        .notices
+                        .release(&group(&due.target));
+                }
             }
+        }
+        // Offers deferred by a blocked site come due when the block ends
+        // (Known issue 50).
+        if let Some(at) = self.nodes[node as usize].notices.next_due()
+            && at > instant
+            && self.nodes[node as usize].notices.has_deferred()
+        {
+            self.engine.at(self.nanos(at), Event::Notice { node });
         }
     }
 
@@ -5343,18 +5425,33 @@ impl NodeWorld {
     }
 
     /// A copy offer ended: delivered, or try again after the next delay.
-    fn offer_done(&mut self, node: u32, incarnation: u32, due: Due<u64, u32>, delivered: bool) {
-        if delivered {
+    fn offer_done(&mut self, node: u32, incarnation: u32, due: Due<u64, u32>, end: OfferEnd) {
+        let n = &self.nodes[node as usize];
+        let live = !n.down && n.incarnation == incarnation;
+        let group = self.fabric.site[due.target as usize];
+        let grouped = self.config.node.offer_cut_groups;
+        if end == OfferEnd::Delivered {
             self.metrics.incr("orphan_offers_delivered");
+            if live && grouped {
+                self.nodes[node as usize].notices.reached(&group);
+            }
             return;
         }
         self.metrics.incr("orphan_offers_failed");
-        let n = &self.nodes[node as usize];
-        if n.down || n.incarnation != incarnation {
+        if !live {
             return;
         }
         let instant = self.instant(self.now());
-        match self.nodes[node as usize].notices.failed(due, instant) {
+        let notices = &mut self.nodes[node as usize].notices;
+        let next = if !grouped {
+            notices.failed(due, instant)
+        } else if end == OfferEnd::Cut {
+            self.metrics.incr("orphan_offers_cut");
+            notices.cut(due, group, instant)
+        } else {
+            notices.refused(due, &group, instant)
+        };
+        match next {
             Some(next) => self.engine.at(self.nanos(next), Event::Notice { node }),
             None => self.metrics.incr("orphan_notices_expired"),
         }

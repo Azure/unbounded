@@ -144,6 +144,11 @@ pub struct NodeConfig {
     /// own acquisition failed (production `Outcome::Failed`: always on;
     /// set 0 to measure without it, Known issue 52). Needs `rank0_watch`.
     pub rank0_failure_hold: bool,
+    /// Copy offers wait out a cut toward their target's site, seen by an
+    /// offer or by this node's reads (production
+    /// `racer_core::read::notice` cut groups: always on; set 0 to measure
+    /// without it, Known issue 50).
+    pub offer_cut_groups: bool,
 }
 
 impl Default for NodeConfig {
@@ -192,6 +197,7 @@ impl Default for NodeConfig {
             unknown_age_targets: true,
             silence: true,
             rank0_failure_hold: true,
+            offer_cut_groups: true,
         }
     }
 }
@@ -252,6 +258,7 @@ impl NodeConfig {
                 }
                 "silence" if n <= 1 => self.silence = n == 1,
                 "rank0_failure_hold" if n <= 1 => self.rank0_failure_hold = n == 1,
+                "offer_cut_groups" if n <= 1 => self.offer_cut_groups = n == 1,
                 _ => return Err(format!("unknown key node.{key}")),
             }
         }
