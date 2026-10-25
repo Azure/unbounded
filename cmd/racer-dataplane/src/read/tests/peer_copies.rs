@@ -3873,7 +3873,8 @@ fn a_delegated_rank_zero_asks_lineage_and_demoted_targets_on_their_own_grant() {
 /// probes feeds silence evidence as sequential granted probes do. A target
 /// that leaves its probe unanswered is demoted (`Answering::Unanswered`, no
 /// ping: a granted target is never rank 0), one that answers is cleared, and
-/// the timeout does not withhold the owner's origin attempt.
+/// the timeout does not withhold the owner's origin attempt. A stale
+/// answer's refund stays in the probe's grant.
 #[test]
 fn a_granted_batch_feeds_silence_evidence() {
     use racer_core::read::candidates::Answering;
@@ -3937,16 +3938,21 @@ fn a_granted_batch_feeds_silence_evidence() {
     let replies = [
         (ordered[1].clone(), Reply::Deadline),
         (ordered[2].clone(), Reply::Miss),
-        (demoted.clone(), Reply::Miss),
+        // A verified `StaleMembership` refunds unused links and credits
+        // (Known issues 26, 47 and 49) into the probe's own grant, never
+        // into the walk's budget.
+        (demoted.clone(), Reply::Stale),
     ];
     peers.replies.borrow_mut().extend(replies);
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 1, 1);
     let result = acquire(&mut f, &mut budget);
     assert!(result.is_ok(), "{:?}", result.err());
+    assert!(budget.remaining_attempts() <= 1 && budget.remaining_links() <= 1);
     assert_eq!(f.origin.calls.get(), 1);
     assert_eq!(peers.calls.borrow().len(), 3);
     assert_eq!(health.answering(&ordered[1]), Answering::Unanswered);
     assert_eq!(health.answering(&ordered[2]), Answering::Answers);
+    // Its own (stale) answer still says it is not hung.
     assert_eq!(health.answering(&demoted), Answering::Answers);
     // No ping is due for a granted target.
     assert!(
