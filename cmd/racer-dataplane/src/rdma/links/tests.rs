@@ -1106,3 +1106,80 @@ fn late_gpu_landing_attaches_on_active_rails_once() {
     assert!(node.take_landing_pending());
     assert!(!node.take_landing_pending());
 }
+
+/// Crash and restart `b` under the same node id: the new owner has no links,
+/// while `a` still holds its `Ready` link to the dead queue pair (half-open).
+fn restart_b(w: &mut World) {
+    let environment = w.clock.environment(1);
+    let fresh = node(&w._sim, 3, node_id(2), Some(&environment));
+    drop(std::mem::replace(&mut w.b, fresh));
+    let admission = w.b.admission.clone();
+    let rails = drive!(
+        w,
+        w.b.links
+            .activate(vec![mapping(3)], &admission, 2 * BUFFER_LEN, &scope())
+    )
+    .unwrap();
+    assert_eq!(rails.len(), 1);
+    pump!(w);
+}
+
+/// Known issue 141: after a peer restarts, the survivor's link stays `Ready`
+/// (no traffic means no completion reports the dead peer), so the survivor
+/// never wants a setup. The restarted peer's setup replaces the stale link and
+/// both ends become ready again.
+#[test]
+fn half_open_link_after_peer_restart_recovers_when_the_peer_initiates() {
+    let mut w = world();
+    let (a, b) = (node_id(1), node_id(2));
+    let old = link_up(&mut w);
+    restart_b(&mut w);
+    assert_eq!(w.a.links.ready(&b, RAIL).map(|(_, id)| id), Some(old));
+    assert_eq!(w.b.links.state(&a, RAIL), LinkState::Idle);
+    assert!(!w.a.links.wants(&b, RAIL), "the survivor sees a ready link");
+    assert!(w.b.links.wants(&a, RAIL), "the restarted peer wants a link");
+    let scope = scope();
+    let (epoch, ours) = drive!(w, w.b.links.open(&a, RAIL, &scope)).unwrap();
+    assert_eq!(w.a.links.admit_setup(&b, RAIL), SetupAdmission::Accept);
+    let theirs = drive!(w, w.a.links.accept(&b, RAIL, &ours, &scope)).unwrap();
+    drive!(
+        w,
+        w.b.links.connect(
+            &a,
+            RAIL,
+            epoch,
+            &ours,
+            &theirs,
+            &link_setup::binding(&ours),
+            &scope
+        )
+    )
+    .unwrap();
+    pump!(w);
+    let (_, id_a) = w.a.links.ready(&b, RAIL).expect("survivor ready");
+    let (_, id_b) = w.b.links.ready(&a, RAIL).expect("restarted peer ready");
+    assert_eq!(id_a, id_b);
+    assert_ne!(id_a, old, "the stale link was replaced");
+}
+
+/// Known issue 141: the survivor's first use of the half-open link fails at
+/// the transport and breaks it, so its own setups resume after the backoff.
+#[test]
+fn half_open_link_after_peer_restart_breaks_on_first_use() {
+    let mut w = world();
+    let b = node_id(2);
+    link_up(&mut w);
+    restart_b(&mut w);
+    assert!(w.a.links.ready(&b, RAIL).is_some());
+    let scope = scope();
+    // The grant itself may be posted before the transport reports the dead
+    // peer; either way the link must not stay ready.
+    let _ = drive!(w, w.a.links.grant(&b, RAIL, TransferId([6; 16]), &scope));
+    pump!(w);
+    assert!(w.a.links.ready(&b, RAIL).is_none(), "half-open link broke");
+    for _ in 0..8 {
+        w.clock.advance(SETUP_DEADLINE);
+        pump!(w);
+    }
+    assert!(w.a.links.wants(&b, RAIL));
+}

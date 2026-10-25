@@ -2756,7 +2756,8 @@ impl Harness {
     }
 
     /// Set up the persistent link from node `a` to node `b` and wait until
-    /// both ends are ready, waiting out any backoff.
+    /// both ends are ready, waiting out any backoff. If `a` is ready but `b`
+    /// is not (`b` restarted under `a`'s link), `b` initiates instead.
     fn connect_links(&mut self, a: usize, b: usize) {
         let rail = racer_control_wire::RailId(0);
         for _ in 0..64 {
@@ -2770,19 +2771,30 @@ impl Harness {
                 self.coverage.action("native-link");
                 return;
             }
-            if let rdma_verbs::LinkState::Backoff(until) = links.state(&peer, rail) {
-                self.clock.advance(
-                    until.saturating_duration_since(uring_runtime::environment::now())
-                        + Duration::from_millis(1),
-                );
+            for state in [links.state(&peer, rail), remote.state(&local, rail)] {
+                if let rdma_verbs::LinkState::Backoff(until) = state {
+                    self.clock.advance(
+                        until.saturating_duration_since(uring_runtime::environment::now())
+                            + Duration::from_millis(1),
+                    );
+                }
             }
+            // A crash-restart of `b` leaves `a` holding a half-open `Ready`
+            // link that `a` only discovers on use, so `a` never wants a setup
+            // (Known issue 141). In production the restarted peer sets up the
+            // link when it needs one and `a` replaces the stale link; do that.
+            let (from, to, target) = if links.ready(&peer, rail).is_some() {
+                (b, a, local)
+            } else {
+                (a, b, peer)
+            };
             let endpoint =
-                crate::http::Endpoint::Peer(self.nodes[b].config.peer_listen.to_string());
-            self.nodes[a].workers[0]
+                crate::http::Endpoint::Peer(self.nodes[to].config.peer_listen.to_string());
+            self.nodes[from].workers[0]
                 .app
                 .peers
                 .transfers()
-                .ensure_link(&endpoint, &peer, rail);
+                .ensure_link(&endpoint, &target, rail);
             self.settle();
         }
         panic!("seed={} link setup stalled", self.seed);
