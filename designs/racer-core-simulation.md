@@ -704,6 +704,17 @@ Verified against the code at the start of this work.
    refetches a page another owner above rank 0 holds (the `skip` side, which offers to rank 0 do not
    address). 119 left over 5k `full-failover` seeds 1 to 10. Open (round 4, orphan3, wave 5).
 
+52. The pages fetched most often in `full-failover` are origin failures, not ownership moves: in
+   the wave 5 merge every request but one on the worst pages (6 requests; 5k seeds 1 to 3 and
+   50k seed 1) is `after_failure`, a retry after the previous request failed at origin. When rank
+   0 answers that its origin request failed, an owner above rank 0 takes origin authority and
+   asks origin too (skip class `failed`), and the next reader's walk sends rank 0 to origin
+   again, so a page whose origin keeps failing costs about two requests per reader retry. This
+   is bounded by the read budgets and the retries, and correct when the failure was local to
+   rank 0, but it doubles origin load during an origin outage. Withholding authority after a
+   rank 0 origin failure (or sharing a short negative result) would halve it. See "Round 4:
+   combined (wave 5)". Open (round 4, combined, wave 5).
+
 ## Simulator engine (racer-sim substrate)
 
 `cmd/racer-dataplane/sim` provides the substrate the extracted logic plugs into:
@@ -1227,6 +1238,8 @@ scenarios carry data-plane faults.
 51. Orphan repeats offers cannot remove: rank 0 refetches before the offer arrives, or the holder
    is itself an owner above rank 0 that another owner skipped to (119 over 10 seeds) (round 4,
    orphan3, wave 5).
+52. The worst `full-failover` pages are origin failure retries; owners above rank 0 retry origin
+   after rank 0's origin request failed (round 4, combined, wave 5).
 
 ## Round 2: production admission
 
@@ -4621,6 +4634,7 @@ matters here, but production keeps it.
   the latency at one round trip.
 - The temporary counters used for the root cause of Known issue 44 were removed before
   committing.
+
 ## Round 4: orphan3 (wave 5)
 
 Known issues 37 and 38. Branch `racer-sim7-orphan3` from 113a0990d. Commits: 3d492ebf0 (38,
@@ -5077,3 +5091,98 @@ Reading the tables:
   of sending every client its delta.
 - 50k `full-failover` was not rerun in this track.
 - New Known issues 47 (8 failed reads left), 48 (follower generation race), 49.
+
+## Round 4: combined (wave 5)
+
+Branch `racer-sim7-merge` from racer-core-sim 113a0990d, with the lineage, orphan3, hang and
+stale tracks cherry-picked in that order. Logs, reports and the binary: `/tmp/opencode/m7/`. The
+track sections above cite commit IDs from the track branches; the merged commits are 19f8fe190 to
+fb0d34154 (lineage), 1ae9b4316 to 8d2195091 (orphan3), 3ea9c8914 to 57997b662 (hang) and 003159767
+to 706d51755 (stale; 9ceb9fa79 is 003159767, 1f65aa0b9 is a11408abd).
+
+### Merge
+
+- Conflicts: `WalkConfig` (`granted` from lineage replaces `successors`, which orphan3 and hang
+  still named; `rank0` from hang kept), `CandidatePolicy` (orphan notices and the offer counter
+  from orphan3, the rank 0 watch and `note_rank0` from hang, all kept; the walk gets `granted`
+  and `rank0`), the simulator's `NodeConfig` knobs, `Node` state (notices and rank 0 watch,
+  both in the memory estimate), `NodeWorld` (imports; the rank 0 watch update runs before the
+  per-probe `cut` and `relayed` are taken from the re-borrowed fill), `Coordinator` methods
+  (`copy_join_allowed` and `poll_offers`/`serve_offer`), telemetry counters, core walk tests
+  (all kept), and this document.
+- The stale track's section carried a Python snippet that had been pasted into the document by
+  mistake; it was removed.
+- New Known issues were renumbered: 301 to 41, 302 to 42, 303 to 43, 311 to 44, 312 to 45, 313 to
+  46, 321 to 47, 322 to 48, 323 to 49, 331 to 50, 332 to 51, in this document and in code
+  comments. New issue 52 comes from this merge.
+
+### Interplay
+
+- Copy join rule (lineage, issue 44) against the rank 0 route-first probe and the rank 0 watch
+  (hang) and issue 31: `copy_join_allowed` declines a join only for an owner ranked before the
+  destination, or an owner asking a non-owner (`core/src/read/serve.rs:71`). An owner above rank
+  0 asking rank 0, and every reader, still join rank 0's running acquisition (unit test
+  `serve::tests::copy_only_joins_only_for_readers_and_later_owners` asserts both). 5k `zipf` at 16 MiB:
+  overlapping origin requests 1,089 (wave 4) to 130 (hang alone: 115); 128 of the 130 are the
+  relay-signed `Overloaded` class (issue 42).
+- Lineage grants against the rank 0 timeout rule: only the owner's probe of canonical rank 0
+  decides origin authority; a granted probe's timeout neither withholds origin nor marks rank 0
+  unanswered, and a rank 0 timeout after granted misses still withholds it. New test
+  `walk::tests::granted_probes_leave_the_rank_zero_timeout_rule_alone` (rank 0 state `Unknown`
+  and `Fetching`).
+- Offers (orphan3) with lineage grants and the route-first probe: offers send no body and never
+  defer readers; a hinted target that is also a lineage target is a successor probe on its own
+  grant. `budget_never_grows`, `only_owner_hits_origin` and `origin_repeat_explained`
+  (`unexplained` 0) hold in every run below.
+- Ranking the previous membership before a stale skip (stale) against demoted targets (lineage):
+  readers rank version - 1 with the same `Placement`; demoted targets are used only by owner
+  walks (`walk::demoted_targets`), so they do not meet. DST seeds 1 to 20 pass, native and not.
+
+### Worst pages
+
+The worst page in `full-failover` was 6 requests in wave 4 and rose to 8 in both the orphan3 and
+the hang tracks. Merged, it is 6 at 5k (seeds 1, 2 and 3) and at 50k (seed 1). A temporary
+per-page trace in `classify_repeat` (not committed) showed that on every such page (3 pages at 5k
+seed 1, 1 each at seeds 2 and 3, 6 at 50k) every repeat but one is `after_failure`: rank 0's
+origin request failed, an owner above rank 0 then asked origin itself (skip `failed` or
+`copy_only`), and the next reader retry sent rank 0 to origin again. The one exception (50k page
+12219) is a relay-signed skip (class `relay`) at a later version. No repeat was caused by the new
+logic; the cause is recorded as Known issue 52.
+
+### Evidence
+
+Release, seed 1, same configurations as wave 4. Origin: total, worst page, pages fetched more
+than once.
+
+| Run | Wave 4 reads ok / failed | Wave 4 origin | Wave 5 reads ok / failed | Wave 5 origin |
+| --- | --- | --- | --- | --- |
+| 5k storm | 378,544 / 0 | 1,024, 1, 0 | 378,544 / 0 | 1,024, 1, 0 |
+| 5k zipf | 202,961 / 24 | 40,324, 3, 1,388 | 202,851 / 15 | 40,404, 3, 1,452 |
+| 5k churn | 291,542 / 90 | 1,029, 2, 5 | 291,474 / 87 | 1,028, 2, 4 |
+| 5k zipf 16 MiB | 37,524 / 29 | 18,866, 3, 1,181 | 37,637 / 28 | 17,829, 3, 139 |
+| 5k 1 Gbit/s storm | 94,829 / 0 | 6,931, 3, 36 | 95,158 / 0 | 6,970, 2, 16 |
+| 5k full-cold-start | 94,830 / 0 | 6,931, 3, 36 | 95,159 / 0 | 6,970, 2, 16 |
+| 5k full-failover | 33,794 / 37 | 13,018, 5, 425 | 33,970 / 33 | 12,951, 6, 342 |
+| 5k full-failover seed 2 | 33,498 / 29 | 13,013, 6, 404 | 33,740 / 30 | 12,975, 6, 368 |
+| 5k full-failover seed 3 | 33,356 / 36 | 12,761, 6, 332 | 33,715 / 37 | 12,907, 6, 287 |
+| 5k full-churn | 33,996 / 1 | 13,471, 4, 852 | 34,040 / 0 | 12,768, 3, 223 |
+| 5k zipf, 50 hung members | 30,155 / 371 | 11,700, 2, 3 | 30,478 / 140 | 11,757, 2, 25 |
+| 50k full-cold-start | 911,703 / 93 | 28,936, 4, 1,899 | 913,187 / 11 | 27,360, 3, 411 |
+| 50k full-failover | 302,776 / 395 | 50,858, 6, 4,998 | 303,355 / 266 | 47,617, 6, 2,268 |
+
+- Seeds 2 and 3 and the hung-member run have no wave 4 merge run; their "wave 4" columns are the
+  hang track's baselines on 113a0990d (`/tmp/opencode/r7-hang/ff2-base.json`, `ff3-base.json`,
+  `h-hang-nw.json`, the last with the rank 0 watch off).
+- 5k `full-churn` moved-page repeats 884 to 194; 50k `full-cold-start` 1,915 to 409.
+- 5k zipf 16 MiB concurrent origin repeats 1,089 to 130.
+- 50k `full-failover`: orphan repeats 850 to 189, `copy_held` 1,410 to 578, `after_failure` 1,971
+  to 1,790, moved 2,864 to 590.
+- 50k: `full-cold-start` wall 21:26, peak RSS 4.4 GiB (was 20:38, 4.3 GiB); `full-failover`
+  28:55, 3.1 GiB (was 28:00, 3.0 GiB).
+- Hard invariants hold in every run above and in all 16 scenarios at 200 nodes, 1 s.
+- `cargo fmt --check`, `clippy -D warnings` and the workspace tests pass; DST seeds 1 to 20 pass,
+  native and not. No test flaked in these runs.
+
+### Open issues after wave 5
+
+40 (partly), 41, 42, 43, 45, 46, 47, 48, 49, 50, 51, 52.
