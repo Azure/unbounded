@@ -626,3 +626,38 @@ fn a_hung_peer_is_found_by_a_ping_and_shared_through_its_links() {
     assert!(early >= 50, "the watch alone: {early} early: {report}");
     assert_eq!(counter(&report, "silence_pings"), 0, "{report}");
 }
+
+/// Known issue 54 (round 4, busy): an owner that sheds a reader (a signed
+/// `Overloaded`, here a hot page's owner) is busy, not hung. The reader's
+/// later walks visit it after the page's other owners for half a request
+/// timeout, so a retried read does not repeat the walk that was shed
+/// (`Spread` is deterministic per requester and page). In the 5k `zipf` run
+/// at 16 MiB pages every failed read was such a repeat: shed by rank 0, its
+/// helper unable to reach rank 0, four times.
+#[test]
+fn readers_do_not_return_first_to_an_owner_that_shed_them() {
+    let nodes = 512;
+    let mut config = quiet(nodes);
+    config.pages_per_object = 1;
+    config.nic_bps = 32 << 20;
+    config.duration_ns = 40 * SECONDS;
+    config.storms = vec![
+        storm(0, 0, 1, 1),
+        storm(5 * SECONDS, 0, nodes, MILLIS),
+        storm(7 * SECONDS, 0, nodes, MILLIS),
+    ];
+    let on = run(config.clone(), 5);
+    config.node.shed_busy = false;
+    let off = run(config, 5);
+    assert!(counter(&off, "shed_repeats") > 0, "{off}");
+    assert!(
+        counter(&on, "shed_repeats") * 2 <= counter(&off, "shed_repeats"),
+        "{} vs {}",
+        counter(&on, "shed_repeats"),
+        counter(&off, "shed_repeats")
+    );
+    assert!(counter(&on, "reads_failed") <= counter(&off, "reads_failed"));
+    assert_eq!(counter(&on, "origin_requests"), 1, "{on}");
+    // Busy, not hung: nobody is marked silent for a shed.
+    assert_eq!(counter(&on, "silence_marks"), 0, "{on}");
+}
