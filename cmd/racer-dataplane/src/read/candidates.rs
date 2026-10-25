@@ -793,8 +793,8 @@ impl CandidatePolicy {
     }
 
     /// How long rank 0 may stay silent on a page after an owner's probe of
-    /// it timed out before the owner presumes it hung (the client request
-    /// timeout; see `racer_core::read::rank0`, Known issue 39).
+    /// it timed out before the owner presumes it hung (half the client
+    /// request timeout; see `racer_core::read::rank0`, Known issue 39).
     pub(crate) fn with_rank0_hang_after(self, hang_after: std::time::Duration) -> Self {
         *self.rank0_watch.borrow_mut() = Rank0Watch::new(
             racer_core::read::rank0::WATCH_CAPACITY,

@@ -121,7 +121,8 @@ pub struct WalkConfig {
     /// What this owner last learned about rank 0's acquisition of the page
     /// ([`crate::read::rank0::Rank0Watch`], Known issue 39). `Overdue`: a
     /// timeout of rank 0 gives origin authority like a transport failure,
-    /// since rank 0 stayed silent for a request timeout. `Fetching` and
+    /// since rank 0 stayed silent too long
+    /// ([`crate::read::rank0::Rank0Watch::hang_after`]). `Fetching` and
     /// `Unknown` keep the [`Outcome::TimedOut`] rule. Ignored unless this
     /// node is an owner above rank 0 on a page walk.
     pub rank0: Rank0State,
@@ -370,8 +371,8 @@ pub enum Outcome {
     /// issue 31). Such a walk ends [`End::Exhausted`] instead of
     /// [`End::Origin`]; a transport failure (rank 0 down or unreachable) or
     /// a miss still lets the owner fetch. [`WalkConfig::rank0`] bounds the
-    /// rule: once rank 0 stayed silent for a request timeout (`Overdue`) a
-    /// timeout gives authority again (Known issue 39).
+    /// rule: once rank 0 stayed silent too long (`Overdue`) a timeout gives
+    /// authority again (Known issue 39).
     TimedOut,
 }
 

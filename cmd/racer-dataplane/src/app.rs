@@ -1154,7 +1154,7 @@ impl WorkerApplication {
             .with_reactor(reactor.clone())
             .with_replica_selection(config.replica_selection)
             .with_attempt_timeout(config.peer_attempt_timeout)
-            .with_rank0_hang_after(config.request_timeout)
+            .with_rank0_hang_after(config.request_timeout / 2)
             .with_observer(admission.policy().observer().clone()),
         );
         let origin: Rc<dyn Origin> = Rc::new(OriginClient::new(

@@ -206,7 +206,8 @@ impl Node {
             rank0: Rank0Watch::new(
                 WATCH_CAPACITY,
                 WATCH_TTL,
-                Duration::from_nanos(config.read_timeout_ns),
+                // Production: half the client request timeout.
+                Duration::from_nanos(config.read_timeout_ns / 2),
             ),
         }
     }

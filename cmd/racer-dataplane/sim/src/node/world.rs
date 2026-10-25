@@ -1558,6 +1558,19 @@ impl NodeWorld {
                                 // The reader's own peer server hangs: the
                                 // answers to its requests are lost.
                                 self.metrics.incr("reads_failed_on_hung_nodes");
+                            } else if self.hangs {
+                                // Whose hang it was (Known issues 39, 301).
+                                let now = self.now();
+                                let owners = self.owners_at(r.node, 0, r.page, true);
+                                let hung =
+                                    |n: &u32| crate::faults::hung(&self.config.faults, *n, now);
+                                self.metrics.incr(if owners.first().is_some_and(hung) {
+                                    "reads_failed_rank0_hung"
+                                } else if owners.iter().any(hung) {
+                                    "reads_failed_owner_hung"
+                                } else {
+                                    "reads_failed_other_hang"
+                                });
                             }
                             if self.versions.unready_members() > 0 {
                                 // Known issue 17: reads failing while some

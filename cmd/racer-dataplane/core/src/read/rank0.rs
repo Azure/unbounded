@@ -12,8 +12,8 @@
 //! without origin authority.
 //!
 //! The owner therefore notes a page when its probe of rank 0 timed out
-//! ([`Rank0Watch::timed_out`]). For [`Rank0Watch::hang_after`] (the node's
-//! client request timeout) after that, or until the request's own deadline
+//! ([`Rank0Watch::timed_out`]). For [`Rank0Watch::hang_after`] (half the
+//! node's client request timeout) after that, or until the request's own deadline
 //! if later, the page is [`Rank0State::Fetching`] and the timeout rule
 //! holds. After it the page is [`Rank0State::Overdue`]: a further timeout
 //! gives authority like a transport failure, and the page stays overdue
@@ -30,26 +30,29 @@
 //! 0, and an owner that does not fetch leaves its readers unserved (Known
 //! issue 40).
 //!
-//! Why the request timeout and not the request's deadline: rank 0's
+//! Why a fixed allowance and not the request's deadline: rank 0's
 //! acquisition outlives the request that started it while other waiters
 //! join it (flight handover), and an owner's request often carries a short
 //! deadline (a reader's attempt share). In the simulator an owner's first
-//! deadline was about 3 s after the timeout, while rank 0's origin request
-//! stayed queued behind slower ones for longer. No read that started after
-//! the first timeout waits on rank 0 longer than a request timeout, so a
-//! rank 0 that has not answered by then has nothing left to answer.
+//! deadline was about 3 s after the timeout while rank 0's origin request
+//! stayed queued for longer, and taking authority then overlapped it. Why
+//! half the request timeout: a read that met the first timeout still has
+//! time to retry once rank 0 is presumed hung. In the simulator (10 s read
+//! timeout) 5 s added no overlapping origin request in 5k `zipf` at 16 MiB
+//! pages (3 s added 44), and with 50 of 5,000 members hung it failed 136
+//! reads where 10 s failed 188 and no watch 371.
 //!
 //! A hung peer server hangs for every page, so a timeout on a page that is
 //! already overdue also marks rank 0 itself silent: its other pages are
 //! overdue at once, until it answers any probe from this owner or the mark
-//! expires. Without it each page rank 0 owns would fail its readers for one
-//! more request timeout.
+//! expires. Without it each page rank 0 owns would fail its readers for
+//! another `hang_after`.
 //!
 //! Costs: one entry per page an owner deferred to rank 0, bounded by
 //! [`WATCH_CAPACITY`] and expiring [`WATCH_TTL`] after the last timeout.
 //! No message is added and no budget grows: the rule only changes whether a
 //! walk that already ended ends with origin authority. A hung rank 0 blocks
-//! a page for at most one request timeout after the first timeout; a rank 0
+//! a page for at most `hang_after` after the first timeout; a rank 0
 //! that is down or partitioned fails at the transport level, which gives
 //! authority as before.
 
@@ -60,9 +63,9 @@ use std::time::{Duration, Instant};
 /// Default bound on watched pages per node.
 pub const WATCH_CAPACITY: usize = 4096;
 
-/// Default [`Rank0Watch::hang_after`]: the dataplane's default client
+/// Default [`Rank0Watch::hang_after`]: half the dataplane's default client
 /// request timeout.
-pub const HANG_AFTER: Duration = Duration::from_secs(30);
+pub const HANG_AFTER: Duration = Duration::from_secs(15);
 
 /// How long an entry outlives the last timeout that renewed it.
 pub const WATCH_TTL: Duration = Duration::from_secs(60);
@@ -107,8 +110,8 @@ pub struct Rank0Watch<K, N> {
 
 impl<K: Eq + Hash + Clone, N: Eq + Hash + Clone> Rank0Watch<K, N> {
     /// `hang_after` is how long rank 0 may stay silent on a page after the
-    /// first timeout before it is presumed hung (the node's client request
-    /// timeout); `ttl` should exceed it.
+    /// first timeout before it is presumed hung (half the node's client
+    /// request timeout); `ttl` should exceed it.
     pub fn new(capacity: usize, ttl: Duration, hang_after: Duration) -> Self {
         Self {
             capacity: capacity.max(1),

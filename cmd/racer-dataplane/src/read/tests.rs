@@ -2838,8 +2838,7 @@ mod timeouts {
     }
 
     /// Known issue 39: after rank 0 timed out, another timeout of rank 0
-    /// does not give rank 1 authority for the request timeout
-    /// (`with_rank0_hang_after`), even past the first request's short
+    /// does not give rank 1 authority for `with_rank0_hang_after`, even past the first request's short
     /// deadline (rank 0's acquisition outlives it while other waiters join);
     /// a rank 0 still silent after that (hung) no longer blocks the page: the
     /// next timeout gives authority.

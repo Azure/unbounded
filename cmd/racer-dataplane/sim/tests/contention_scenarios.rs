@@ -496,8 +496,8 @@ fn relays_hold_their_reservation_only_while_the_body_streams() {
 /// server accepts requests and never answers used to block its pages for as
 /// long as it stayed a member. Ten of 200 members hang for the whole run; a
 /// storm reads a cold object at 0 s and again at 30 s. The owners above a
-/// hung rank 0 now fetch once it stayed silent for a request timeout (10 s)
-/// after their first probe timed out (`Rank0Watch`), so the second storm
+/// hung rank 0 now fetch once it stayed silent for half a request timeout
+/// (5 s) after their first probe timed out (`Rank0Watch`), so the second storm
 /// reads almost everything; without the watch it fails again on the same
 /// pages. The one read the second storm
 /// still fails visits a hung rank 2 first and then reaches rank 1 through a
