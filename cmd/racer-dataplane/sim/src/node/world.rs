@@ -6050,6 +6050,14 @@ impl NodeWorld {
             .copied()
             .max()
             .unwrap_or(0);
+        let mut retry_counts = std::collections::BTreeMap::<u32, u64>::new();
+        for c in self.failure_retries_per_page.values() {
+            *retry_counts.entry(*c).or_default() += 1;
+        }
+        let retry_histogram: serde_json::Map<_, _> = retry_counts
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), json!(v)))
+            .collect();
         let requests: u64 = self.origin_per_page.values().map(|c| u64::from(*c)).sum();
         let pages = self.origin_per_page.len();
         // Pages by origin request count.
@@ -6078,6 +6086,7 @@ impl NodeWorld {
                 "max_requests_per_page": max_per_page,
                 "max_requests_per_page_excluding_failure_retries": max_without_retries,
                 "max_failure_retries_per_page": max_retries,
+                "failure_retries_histogram": retry_histogram,
                 "histogram": histogram,
                 "mean_requests_per_page": if pages == 0 { 0.0 } else { requests as f64 / pages as f64 },
                 "page_bytes": self.config.page_bytes,

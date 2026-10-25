@@ -521,6 +521,21 @@ mod tests {
             assert!(skips > 0, "{o}");
             assert!(orphans <= skips, "{o}");
             assert!(held <= skips + orphans, "{o}");
+            // Known issue 55: the worst pages are retries after failed
+            // origin requests. Each follows a failed (or canceled) request
+            // for the page, and without them no page is fetched more than
+            // once per owner.
+            let failures = counter(&r, "origin_5xx")
+                + counter(&r, "origin_412")
+                + counter(&r, "origin_403")
+                + counter(&r, "origin_canceled");
+            assert!(n(&repeats["after_failure"]) <= failures, "{o}");
+            let without = n(&o["max_requests_per_page_excluding_failure_retries"]);
+            assert!(without <= topology::REPLICAS as u64, "{o}");
+            assert!(
+                n(&o["max_requests_per_page"]) <= without + n(&o["max_failure_retries_per_page"]),
+                "{o}"
+            );
         }
     }
 
