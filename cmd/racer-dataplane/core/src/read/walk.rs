@@ -119,12 +119,11 @@ pub struct WalkConfig {
     /// added to the walk's budget, so the walk's credits never grow.
     pub granted: usize,
     /// What this owner last learned about rank 0's acquisition of the page
-    /// ([`crate::read::rank0::Rank0Watch`], Known issues 39 and 40).
-    /// `Fetching`: a route failure, `Overloaded` or shed from rank 0 also
-    /// withholds origin like a timeout, since an earlier probe found rank 0
-    /// fetching. `Overdue`: a timeout of rank 0 gives origin authority like
-    /// a transport failure, since rank 0 missed its request's deadline.
-    /// Ignored unless this node is an owner above rank 0 on a page walk.
+    /// ([`crate::read::rank0::Rank0Watch`], Known issue 39). `Overdue`: a
+    /// timeout of rank 0 gives origin authority like a transport failure,
+    /// since rank 0 stayed silent for a request timeout. `Fetching` and
+    /// `Unknown` keep the [`Outcome::TimedOut`] rule. Ignored unless this
+    /// node is an owner above rank 0 on a page walk.
     pub rank0: Rank0State,
 }
 
@@ -371,10 +370,8 @@ pub enum Outcome {
     /// issue 31). Such a walk ends [`End::Exhausted`] instead of
     /// [`End::Origin`]; a transport failure (rank 0 down or unreachable) or
     /// a miss still lets the owner fetch. [`WalkConfig::rank0`] bounds the
-    /// rule: once rank 0 missed its request's deadline (`Overdue`) a timeout
-    /// gives authority again (Known issue 39), and while an earlier timeout
-    /// says rank 0 is fetching, a route failure or `Overloaded` withholds
-    /// too (Known issue 40).
+    /// rule: once rank 0 stayed silent for a request timeout (`Overdue`) a
+    /// timeout gives authority again (Known issue 39).
     TimedOut,
 }
 
@@ -934,17 +931,6 @@ impl CandidateWalk {
             Outcome::TimedOut => {
                 self.rank0_unanswered |= pending.rank0 && self.config.rank0 != Rank0State::Overdue;
                 Outcome::Transport(ProbeOutcome::Unreachable)
-            }
-            // Rank 0 was found fetching the page: a failure that says the
-            // route or rank 0 is busy is not evidence that it stopped (Known
-            // issue 40).
-            Outcome::Shed
-            | Outcome::Probe(ProbeOutcome::Overloaded)
-            | Outcome::Transport(ProbeOutcome::Unreachable | ProbeOutcome::Overloaded)
-                if pending.rank0 && self.config.rank0 == Rank0State::Fetching =>
-            {
-                self.rank0_unanswered = true;
-                outcome
             }
             outcome => outcome,
         };

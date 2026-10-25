@@ -119,7 +119,7 @@ pub struct NodeConfig {
     pub orphan_notices: bool,
     /// Owners above rank 0 remember rank 0 found fetching or overdue per
     /// page (production `Rank0Watch`: always on; set 0 to measure without
-    /// it, Known issues 39 and 40).
+    /// it, Known issue 39).
     pub rank0_watch: bool,
 }
 

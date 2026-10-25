@@ -2236,7 +2236,7 @@ impl NodeWorld {
             .versions
             .get(fill.version)
             .is_some_and(|v| v.members.members().len() > fill.cands.len() + 1);
-        // Known issues 39 and 40: what this owner last learned about rank
+        // Known issue 39: what this owner last learned about rank
         // 0's acquisition of the page.
         let rank0 = match (fill.rank, fill.cands.first()) {
             (Some(r), Some(first)) if r > 0 && self.config.node.rank0_watch => {
@@ -3772,7 +3772,7 @@ impl NodeWorld {
             && walk.pending_rank0()
             && self.config.node.rank0_watch
         {
-            // Production `CandidatePolicy::note_rank0` (Known issues 39, 40).
+            // Production `CandidatePolicy::note_rank0` (Known issue 39).
             let (node, page, deadline) = (fill.node, fill.page, fill.budget.deadline());
             let rank0 = fill.cands[0];
             let instant = self.instant(self.now());

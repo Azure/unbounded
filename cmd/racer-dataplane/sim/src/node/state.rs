@@ -157,8 +157,7 @@ pub struct Node {
     /// offer to rank 0 later (production orphan notices, Known issue 37).
     pub notices: OrphanNotices<u64, u32>,
     /// Pages whose rank 0 this node, an owner above it, found fetching or
-    /// overdue (production `CandidatePolicy::rank0_watch`, Known issues 39
-    /// and 40).
+    /// overdue (production `CandidatePolicy::rank0_watch`, Known issue 39).
     pub rank0: Rank0Watch<u64, u32>,
 }
 

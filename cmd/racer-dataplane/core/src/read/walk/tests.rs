@@ -1266,30 +1266,26 @@ fn only_an_owner_probe_of_rank_zero_timing_out_withholds_origin() {
     assert_eq!(remaining.next_probe(), Err(RemainingEnd::Unavailable));
 }
 
-/// Known issues 39 and 40: the rank 0 watch bounds the timeout rule. While an
-/// earlier timeout says rank 0 is fetching, a route failure, `Overloaded` or
-/// shed from rank 0 withholds origin too; a miss or a failure of rank 0's own
-/// still gives authority. Once rank 0 missed its request's deadline, a
-/// timeout gives authority. Probes are planned the same in every state.
+/// Known issue 39: the rank 0 watch bounds the timeout rule. Once rank 0
+/// stayed silent for a request timeout (`Overdue`), a timeout gives
+/// authority; `Fetching` keeps the rule and changes nothing else (a route
+/// failure, `Overloaded`, shed or miss from rank 0 still gives authority,
+/// Known issue 40). Probes are planned the same in every state.
 #[test]
-fn rank_zero_watch_bounds_and_extends_the_timeout_rule() {
+fn rank_zero_watch_bounds_the_timeout_rule() {
     let with = |rank: usize, state: Rank0State| WalkConfig {
         rank0: state,
         ..config(Some(rank), 3, VisitOrder::canonical(3))
     };
+    let mut walk = CandidateWalk::new(with(1, Rank0State::Fetching));
+    let (_, end) = drive(&mut walk, &mut budget(8, 32), |_, _| Outcome::TimedOut);
+    assert_eq!(end, End::Exhausted { funding: false });
+    assert!(walk.rank0_unanswered());
     for outcome in [
         Outcome::Transport(ProbeOutcome::Unreachable),
         Outcome::Transport(ProbeOutcome::Overloaded),
         Outcome::Probe(ProbeOutcome::Overloaded),
         Outcome::Shed,
-        Outcome::TimedOut,
-    ] {
-        let mut walk = CandidateWalk::new(with(1, Rank0State::Fetching));
-        let (_, end) = drive(&mut walk, &mut budget(8, 32), |_, _| outcome);
-        assert_eq!(end, End::Exhausted { funding: false }, "{outcome:?}");
-        assert!(walk.rank0_unanswered());
-    }
-    for outcome in [
         Outcome::Probe(ProbeOutcome::CopyMiss),
         Outcome::Probe(ProbeOutcome::Unreachable),
     ] {
@@ -1297,38 +1293,26 @@ fn rank_zero_watch_bounds_and_extends_the_timeout_rule() {
         let (_, end) = drive(&mut walk, &mut budget(8, 32), |_, _| outcome);
         assert!(matches!(end, End::Origin { rank: 1, .. }), "{outcome:?}");
     }
-    // Overdue: a timeout is a transport failure again.
+    // Overdue: a timeout is a transport failure again, at rank 1 and 2.
     let mut walk = CandidateWalk::new(with(1, Rank0State::Overdue));
     let (_, end) = drive(&mut walk, &mut budget(8, 32), |_, _| Outcome::TimedOut);
     assert!(matches!(end, End::Origin { rank: 1, .. }));
     assert!(!walk.rank0_unanswered());
-    // Rank 2 fetching: rank 1 failing does not withhold, rank 0 does.
-    let mut walk = CandidateWalk::new(with(2, Rank0State::Fetching));
+    let mut walk = CandidateWalk::new(with(2, Rank0State::Overdue));
     let (_, end) = drive(&mut walk, &mut budget(8, 32), |p, _| {
         if p.canonical == 0 {
-            Outcome::Probe(ProbeOutcome::CopyMiss)
+            Outcome::TimedOut
         } else {
-            Outcome::Transport(ProbeOutcome::Unreachable)
+            Outcome::Probe(ProbeOutcome::CopyMiss)
         }
     });
     assert!(matches!(end, End::Origin { rank: 2, .. }));
-    let mut walk = CandidateWalk::new(with(2, Rank0State::Fetching));
-    let (_, end) = drive(&mut walk, &mut budget(8, 32), |p, _| {
-        if p.canonical == 0 {
-            Outcome::Transport(ProbeOutcome::Unreachable)
-        } else {
-            Outcome::Probe(ProbeOutcome::CopyMiss)
-        }
-    });
-    assert_eq!(end, End::Exhausted { funding: false });
     // Non-owners and rank 0 ignore the state; probes and budgets match.
     for state in [Rank0State::Fetching, Rank0State::Overdue] {
         let run = |cfg: WalkConfig| {
             let mut walk = CandidateWalk::new(cfg);
             let mut b = budget(8, 32);
-            let (probes, end) = drive(&mut walk, &mut b, |_, _| {
-                Outcome::Transport(ProbeOutcome::Unreachable)
-            });
+            let (probes, end) = drive(&mut walk, &mut b, |_, _| Outcome::TimedOut);
             (
                 shapes(&probes),
                 end,

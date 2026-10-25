@@ -441,8 +441,12 @@ fn owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch() {
     // 8 s, past the 2 s attempt timeout of the owners delegating to it.
     config.origin_bps = 8 << 20;
     config.duration_ns = 60 * SECONDS;
-    // Few enough readers that rank 0's flight never refuses a waiter (an
-    // `Overloaded` rank 0 is still transient evidence).
+    // Few enough readers, and room for every waiter, that rank 0's flight
+    // never refuses a waiter (an `Overloaded` rank 0 is still transient
+    // evidence, Known issue 40). Since owners route their copy-only probe of
+    // rank 0 first, more of them reach it and join its flight: one of them
+    // found the default cap of 64 full.
+    config.node.waiters_per_flight = 128;
     config.storms = vec![storm(0, 0, 48, 100 * MILLIS)];
     let report = run(config, 3);
     assert!(counter(&report, "origin_left_to_rank0") > 0, "{report}");

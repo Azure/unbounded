@@ -111,7 +111,7 @@ pub struct CandidatePolicy {
     offers: Rc<std::cell::Cell<usize>>,
     /// Pages whose rank 0 this node, as an owner above it, found fetching
     /// (a probe timed out) or overdue (it missed that request's deadline);
-    /// see `racer_core::read::rank0` (Known issues 39 and 40).
+    /// see `racer_core::read::rank0` (Known issue 39).
     pub(crate) rank0_watch: RefCell<Rank0Watch>,
 }
 
@@ -669,7 +669,7 @@ impl CandidatePolicy {
     }
 
     /// Update the rank 0 watch from the outcome of this owner's page probe
-    /// of rank 0 (`CandidateWalk::pending_rank0`, Known issues 39 and 40):
+    /// of rank 0 (`CandidateWalk::pending_rank0`, Known issue 39):
     /// a timeout notes the page with the request's deadline, an answer
     /// signed by rank 0 itself forgets it.
     fn note_rank0(

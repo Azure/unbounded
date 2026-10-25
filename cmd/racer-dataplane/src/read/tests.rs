@@ -2837,17 +2837,17 @@ mod timeouts {
         }
     }
 
-    /// Known issues 39 and 40: after rank 0 timed out, neither a transport
-    /// failure nor another timeout of rank 0 gives rank 1 authority for the
-    /// request timeout (`with_rank0_hang_after`), even past the first
-    /// request's short deadline (rank 0's acquisition outlives it while other
-    /// waiters join); a rank 0 still silent after that (hung) no longer
-    /// blocks the page: the next timeout gives authority.
+    /// Known issue 39: after rank 0 timed out, another timeout of rank 0
+    /// does not give rank 1 authority for the request timeout
+    /// (`with_rank0_hang_after`), even past the first request's short
+    /// deadline (rank 0's acquisition outlives it while other waiters join);
+    /// a rank 0 still silent after that (hung) no longer blocks the page: the
+    /// next timeout gives authority.
     #[test]
     fn owner_page_walk_bounds_the_wait_for_a_silent_rank_zero() {
         let clock = uring_runtime::environment::SimulationClock::new(205);
         let _env = clock.environment(0).enter();
-        let mut f = Fixture::new(Some(1), 4, false).bounded(205, 3, 24);
+        let mut f = Fixture::new(Some(1), 3, false).bounded(205, 3, 24);
         f.policy = f
             .policy
             .with_attempt_timeout(Duration::from_secs(1))
@@ -2888,27 +2888,20 @@ mod timeouts {
         // t = 0..2: rank 0 accepts and stays silent; leave the fetch to it.
         let first = resolve_once(&mut f, true);
         assert!(matches!(first, Err(Error::Unavailable)));
-        // t = 2: its next probe fails in transport: still no origin
-        // authority (Known issue 40).
-        f.peers.fail_pages.set(true);
-        f = f.bounded(206, 60, 24);
-        let second = resolve_once(&mut f, false);
-        assert!(matches!(second, Err(Error::Unavailable)));
-        f.peers.fail_pages.set(false);
         // t = 5..7: past the first request's 3 s deadline but within the
         // 5 s allowance: a timeout still leaves the fetch to rank 0.
         clock.advance(Duration::from_secs(3));
         f = f.bounded(207, 60, 24);
-        let third = resolve_once(&mut f, true);
-        assert!(matches!(third, Err(Error::Unavailable)));
+        let second = resolve_once(&mut f, true);
+        assert!(matches!(second, Err(Error::Unavailable)));
         // t = 10: rank 0 is overdue; a timeout gives authority (Known
         // issue 39).
         clock.advance(Duration::from_secs(3));
         f = f.bounded(208, 60, 24);
-        let fourth = resolve_once(&mut f, true);
-        assert!(matches!(fourth, Ok(CandidateResolution::Origin(_))));
+        let third = resolve_once(&mut f, true);
+        assert!(matches!(third, Ok(CandidateResolution::Origin(_))));
         let calls = f.peers.calls.borrow();
-        assert_eq!(calls.len(), 4);
+        assert_eq!(calls.len(), 3);
         assert!(calls.iter().all(|c| c.destination == rank0 && !c.copy));
     }
 

@@ -1,32 +1,34 @@
 //! Rank 0 watch: what an owner above rank 0 last learned about rank 0's
-//! acquisition of a page, so that it neither fetches a page rank 0 is still
-//! fetching nor waits forever on a rank 0 that hangs (Known issues 39, 40).
+//! acquisition of a page, so that it does not wait forever on a rank 0 that
+//! hangs (Known issue 39).
 //!
 //! An owner above rank 0 asks rank 0 for the page before origin. When rank 0
 //! accepts the request but does not answer within the attempt, rank 0 is most
 //! likely still fetching (its origin request queued behind others), and the
 //! owner leaves the fetch to it ([`crate::read::walk::Outcome::TimedOut`],
-//! Known issue 31). Without memory that rule has two costs:
-//!
-//! - A rank 0 (or a relay on the route) that accepts requests and never
-//!   answers, without failing the connection, blocks the page for as long as
-//!   it stays a member: every owner walk ends without origin authority
-//!   (Known issue 39).
-//! - The owner's next probe of the same rank 0 often fails differently: its
-//!   circuit to rank 0 or to the relay opened after the timeout, a route
-//!   search gives up, or rank 0 sheds it because its flight's waiter cap is
-//!   full. Each of those used to give origin authority, so the owner fetched
-//!   a page rank 0 was fetching (Known issue 40).
+//! Known issue 31). Without memory, a rank 0 (or a relay on the route) that
+//! accepts requests and never answers, without failing the connection,
+//! blocks the page for as long as it stays a member: every owner walk ends
+//! without origin authority.
 //!
 //! The owner therefore notes a page when its probe of rank 0 timed out
 //! ([`Rank0Watch::timed_out`]). For [`Rank0Watch::hang_after`] (the node's
 //! client request timeout) after that, or until the request's own deadline
-//! if later, the page is [`Rank0State::Fetching`]: a timeout, route failure
-//! or `Overloaded` from rank 0 does not give this owner authority. After it
-//! the page is [`Rank0State::Overdue`]: a further timeout gives authority
-//! like a transport failure, and the page stays overdue while timeouts keep
-//! coming. Any answer signed by rank 0 ([`Rank0Watch::answered`]) forgets the
-//! page.
+//! if later, the page is [`Rank0State::Fetching`] and the timeout rule
+//! holds. After it the page is [`Rank0State::Overdue`]: a further timeout
+//! gives authority like a transport failure, and the page stays overdue
+//! while timeouts keep coming. Any answer signed by rank 0
+//! ([`Rank0Watch::answered`]) forgets the page.
+//!
+//! `Fetching` does not withhold origin after other failures of rank 0. The
+//! simulator measured that variant (a route failure, `Overloaded` or shed
+//! from a rank 0 found fetching withheld origin like a timeout): in 5k
+//! `zipf` at 16 MiB pages it removed 71 to 80 of about 110 overlapping
+//! origin requests but failed 29 to 55 more reads (seeds 1 and 2). Nearly
+//! all of those `Overloaded` answers are signed by a relay on the route
+//! whose relay quota is full, not by rank 0, so they say nothing about rank
+//! 0, and an owner that does not fetch leaves its readers unserved (Known
+//! issue 40).
 //!
 //! Why the request timeout and not the request's deadline: rank 0's
 //! acquisition outlives the request that started it while other waiters
@@ -41,16 +43,15 @@
 //! already overdue also marks rank 0 itself silent: its other pages are
 //! overdue at once, until it answers any probe from this owner or the mark
 //! expires. Without it each page rank 0 owns would fail its readers for one
-//! more deadline.
+//! more request timeout.
 //!
 //! Costs: one entry per page an owner deferred to rank 0, bounded by
 //! [`WATCH_CAPACITY`] and expiring [`WATCH_TTL`] after the last timeout.
 //! No message is added and no budget grows: the rule only changes whether a
 //! walk that already ended ends with origin authority. A hung rank 0 blocks
 //! a page for at most one request timeout after the first timeout; a rank 0
-//! that is down fails at the transport level and never enters the watch
-//! unless an earlier probe of it timed out, in which case the same bound
-//! applies.
+//! that is down or partitioned fails at the transport level, which gives
+//! authority as before.
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
@@ -72,11 +73,12 @@ pub enum Rank0State {
     /// Nothing recent: rules as without the watch.
     #[default]
     Unknown,
-    /// Rank 0 accepted a probe that has not been answered and whose request
-    /// deadline has not passed: rank 0 is presumed to be fetching.
+    /// A probe of rank 0 timed out less than [`Rank0Watch::hang_after`]
+    /// ago (or before its request's deadline, if later) and rank 0 has not
+    /// answered since: rank 0 is presumed to be fetching.
     Fetching,
-    /// Rank 0 accepted a probe and neither answered nor failed it by its
-    /// request's deadline: rank 0 is presumed hung.
+    /// Rank 0 has not answered this owner since a timeout that long ago, or
+    /// is marked silent: rank 0 is presumed hung.
     Overdue,
 }
 
