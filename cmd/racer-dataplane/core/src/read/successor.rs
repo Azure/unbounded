@@ -13,7 +13,8 @@
 //!
 //! The reader that reaches rank 0 does have the budget: it visits every owner
 //! anyway. So an owner that answers another owner's page probe without a copy
-//! notes the requester ([`SuccessorHints::note`]), and while the hint is fresh
+//! notes the requester ([`SuccessorHints::note`]; a copy-only miss is noted
+//! without ranking, and [`successor_deferral`] checks ownership), and while the hint is fresh
 //! it answers a non-owner's page `Acquire` with `Miss` instead of acquiring
 //! ([`successor_deferral`]). The reader goes on to the next owner in its visit
 //! order, which includes the holder. Owner requesters are never deferred: an
@@ -158,12 +159,20 @@ pub fn should_note<N: PartialEq>(local: &N, requester: &N, owners: &[N]) -> bool
     local != requester && owners.contains(local) && owners.contains(requester)
 }
 
-/// The hint an owner holding no copy defers a page `Acquire` to, if any: the
-/// newest hinted node that is still one of the page's `owners`, when the
-/// requester is not an owner (see the module docs for why owners are not
-/// deferred). The caller answers `Miss` and charges the hint.
-pub fn successor_deferral<N: PartialEq>(hints: Vec<N>, requester: &N, owners: &[N]) -> Option<N> {
-    if owners.contains(requester) {
+/// The hint `local`, holding no copy, defers a page `Acquire` to, if any:
+/// the newest hinted node that is still one of the page's `owners`, when
+/// `local` is an owner and the requester is not (see the module docs for why
+/// owners are not deferred). The caller answers `Miss` and charges the hint.
+///
+/// Hints may be noted without ranking (a copy-only miss is answered before
+/// anything ranks the page), so this is where ownership is checked.
+pub fn successor_deferral<N: PartialEq>(
+    hints: Vec<N>,
+    local: &N,
+    requester: &N,
+    owners: &[N],
+) -> Option<N> {
+    if !owners.contains(local) || owners.contains(requester) {
         return None;
     }
     hints
@@ -259,13 +268,15 @@ mod tests {
     fn defers_only_non_owners_to_current_owners() {
         let owners = [1u32, 2, 3];
         // A reader goes to the newest hinted owner.
-        assert_eq!(successor_deferral(vec![2, 3], &9, &owners), Some(3));
-        // A hint that is no longer an owner does not qualify.
-        assert_eq!(successor_deferral(vec![2, 7], &9, &owners), Some(2));
-        assert_eq!(successor_deferral(vec![7], &9, &owners), None);
+        assert_eq!(successor_deferral(vec![2, 3], &1, &9, &owners), Some(3));
+        // A hint that is no longer an owner (or a reader) does not qualify.
+        assert_eq!(successor_deferral(vec![2, 7], &1, &9, &owners), Some(2));
+        assert_eq!(successor_deferral(vec![7], &1, &9, &owners), None);
         // Owners are never deferred.
-        assert_eq!(successor_deferral(vec![2], &3, &owners), None);
-        assert_eq!(successor_deferral(vec![3], &2, &owners), None);
-        assert_eq!(successor_deferral(Vec::<u32>::new(), &9, &owners), None);
+        assert_eq!(successor_deferral(vec![2], &1, &3, &owners), None);
+        assert_eq!(successor_deferral(vec![3], &1, &2, &owners), None);
+        assert_eq!(successor_deferral(Vec::<u32>::new(), &1, &9, &owners), None);
+        // A node that no longer owns the page never defers.
+        assert_eq!(successor_deferral(vec![2], &8, &9, &owners), None);
     }
 }
