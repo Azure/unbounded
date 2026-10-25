@@ -4603,8 +4603,10 @@ impl NodeWorld {
             (3..5, false) => "moved_unasked_holder_rank_4_5",
             (5..8, true) => "moved_unasked_holder_rank_6_8_older",
             (5..8, false) => "moved_unasked_holder_rank_6_8",
-            (8..16, true) => "moved_unasked_holder_rank_9_16_older",
-            (8..16, false) => "moved_unasked_holder_rank_9_16",
+            (8..12, true) => "moved_unasked_holder_rank_9_12_older",
+            (8..12, false) => "moved_unasked_holder_rank_9_12",
+            (12..16, true) => "moved_unasked_holder_rank_13_16_older",
+            (12..16, false) => "moved_unasked_holder_rank_13_16",
             (_, true) => "moved_unasked_holder_rank_17_older",
             (_, false) => "moved_unasked_holder_rank_17",
         }

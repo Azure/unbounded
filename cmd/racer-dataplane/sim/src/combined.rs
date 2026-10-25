@@ -821,6 +821,12 @@ mod tests {
             mean(&parallel),
             mean(&sequential)
         );
+        // Every holder ranked fourth or fifth is asked (Known issue 46).
+        assert_eq!(
+            counter(&parallel, "moved_unasked_holder_rank_4_5_older")
+                + counter(&parallel, "moved_unasked_holder_rank_4_5"),
+            0
+        );
         assert!(counter(&parallel, "granted_batches") > 0);
         assert_eq!(counter(&sequential, "granted_batches"), 0);
         assert!(counter(&parallel, "reads_failed") <= counter(&narrow, "reads_failed") + 1);
