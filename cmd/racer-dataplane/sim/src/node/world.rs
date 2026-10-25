@@ -467,6 +467,8 @@ struct Msg {
     /// When the requester abandons this exchange (its attempt timeout).
     abandon: Nanos,
     relays: Vec<SimCharge>,
+    /// When the first relay took its `Relay` reservation.
+    relay_first: Nanos,
     /// A pinned single-link hedge exchange.
     direct: bool,
 }
@@ -2397,6 +2399,7 @@ impl NodeWorld {
             deadline,
             abandon: self.nanos(plan.attempt_end).max(now + 1),
             relays: Vec::new(),
+            relay_first: 0,
             direct,
         };
         let pid = self.fresh();
@@ -2746,11 +2749,11 @@ impl NodeWorld {
                 let quotas = &self.nodes[at as usize].workers[worker].quotas;
                 match reserve(quotas, ResourceClass::Relay, 1) {
                     Ok(charge) => {
-                        self.msgs
-                            .get_mut(&mid)
-                            .expect("message")
-                            .relays
-                            .push(charge);
+                        let m = self.msgs.get_mut(&mid).expect("message");
+                        if m.relays.is_empty() {
+                            m.relay_first = now;
+                        }
+                        m.relays.push(charge);
                         self.forward(mid, at, Some(plan));
                     }
                     Err(_) => self.fail_hop(mid, at, Fault::Overloaded),
@@ -2948,6 +2951,14 @@ impl NodeWorld {
             // `peer/server.rs` `relay.reservation`).
             let done = self.fabric.transfer_until(sealed, &route, bytes, m.abandon);
             let release = done.unwrap_or(m.abandon);
+            if !m.relays.is_empty() {
+                // How long the first relay holds its `Relay` reservation:
+                // waiting for the destination's answer, then streaming.
+                self.metrics
+                    .observe("relay_hold_wait_ns", ready.saturating_sub(m.relay_first));
+                self.metrics
+                    .observe("relay_hold_stream_ns", release.saturating_sub(ready));
+            }
             if !m.relays.is_empty() && release > now {
                 let id = self.fresh();
                 self.held.insert(id, m.relays);
