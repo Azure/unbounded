@@ -1485,6 +1485,20 @@ impl NodeWorld {
                 }
             }
         }
+        // Production retains the fill as a flight operation before submitting
+        // it (`src/read/fill.rs`, `retain_operation`): a revoked leader's
+        // still-running fill keeps the flight draining, so no second leader
+        // starts a concurrent fill for the page (Known issue 122).
+        let retained = self.nodes[node as usize].workers[w as usize]
+            .flights
+            .retain_operation(&self.ids.page(page), leader);
+        self.invariants.check(
+            "flight_leader_valid",
+            retained.is_ok(),
+            self.engine.now(),
+            Some(node),
+            || format!("retain page {page} leader {leader}: {retained:?}"),
+        );
         let scope = budget.deadline();
         let mut plan = FillPlan::new(plaintext);
         plan.local(false);
@@ -3702,9 +3716,27 @@ impl NodeWorld {
         let page_id = self.ids.page(fill.page);
         let mut wakes = Vec::new();
         let worker = &mut n.workers[fill.worker as usize];
+        // Production completes the retained operation first, then publishes
+        // and ignores `StaleFlight` (`src/read/fill.rs`, `operation.complete()`
+        // and `let _ = flights.publish_acquired(..)`): a leader revoked while
+        // its fill ran (canceled or past its deadline) cannot settle the
+        // flight, which already drained to a retry once the fill completed.
+        let mut admit = Admit {
+            quotas: &worker.quotas,
+            charges: &mut worker.charges,
+            ids: &self.ids,
+        };
+        let completed = worker
+            .flights
+            .complete_operation(&page_id, &mut admit, &mut wakes);
+        let active = worker.flights.is_leader(&page_id, fill.leader);
+        if !active {
+            self.metrics.incr("flight_stale_finishes");
+        }
         // Same leader settlement as production `Fill` (`src/read/fill.rs`):
         // a credential rejection fails only the leader and re-elects.
         let finished = match result.map_err(racer_core::read::fill::acquisition_failure) {
+            _ if !active => Ok(()),
             Ok(_) => worker.flights.finish(
                 &page_id,
                 fill.leader,
@@ -3729,12 +3761,12 @@ impl NodeWorld {
         };
         self.invariants.check(
             "flight_leader_valid",
-            finished.is_ok(),
+            finished.is_ok() && completed.is_ok(),
             now,
             Some(fill.node),
             || {
                 format!(
-                    "finish page {} leader {}: {finished:?}",
+                    "finish page {} leader {}: {finished:?}, operation {completed:?}",
                     fill.page, fill.leader
                 )
             },
