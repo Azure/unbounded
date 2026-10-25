@@ -418,6 +418,8 @@ Verified against the code at the start of this work.
    rank 0 refetching for an owner's delegation (it carries one credit and two to four links, too
    few to reach the holder) and orphans whose owner never reached rank 0 (`route`, `partition`,
    `busy`: no hint). Bound unchanged: `origin_repeat_explained`. See "Round 4: orphan (wave 3)".
+   Wave 3 merge (7c6a08583): an owner no longer defers while its own acquisition of the page runs
+   (`racer_core::read::successor::defer_allowed`); see "Round 4: combined (wave 3)".
    Original report: an owner above rank 0 that cannot fund or route its delegation fetches the
    page itself, and rank 0, which never asks successors, fetches it again later: in 50k
    `full-failover` 1,643 such skips for lack of a route and 621 for lack of credits, leaving 944
@@ -3516,3 +3518,91 @@ Reading the table:
   adopted a version more than 10 s earlier still skip stale owners; a peer that already dropped
   version - 1 answers `StaleMembership` to the fallback, which is only a skip, so a longer window
   would cost probes, not correctness. Not tuned.
+
+## Round 4: combined (wave 3)
+
+Branch `racer-sim5-merge`: racer-core-sim 3771e5c3f plus the relay, flight, cancel and handover
+tracks (one linear chain), then orphan and join2 cherry-picked. Logs and reports:
+`/tmp/opencode/m5/`.
+
+### Merge
+
+- Conflicts were textual only: the `NodeConfig` knobs (`hot_page_bodies`, `flight_handover`,
+  `successor_hints`, `stale_fallback`, all kept), the `racer_core::read` module list and the
+  simulator's imports (`stale` and `successor`, both kept), and this document.
+- The wave 3 Known issues were renumbered: 121 to 23, 122 to 24, 131 to 25, 132 to 26, 141 to 27,
+  145 to 28, 151 to 29, 161 to 30, in this document and in code comments. New 31 records the
+  handover track's concurrent origin overlap.
+
+### Interplay
+
+- Successor hints and stale fallback: a non-owner that falls back to version - 1 walks that
+  version's owners; one of them may answer `Miss` on a successor hint, which is an ordinary miss
+  in the fallback walk. `successor_deferral` checks ownership under the deferring node's own
+  membership and never defers an owner requester, and the fallback walk ends when the reader owns
+  the page under version - 1 (`fallback_rank_allowed`), so neither path gives a reader origin
+  authority. A deferral costs a probe but no credit is added; `MAX_DEFERRALS` bounds it.
+- Successor hints and flights (fixed in this merge, 7c6a08583): in 5k `zipf` at 16 MiB pages the
+  merged tree failed 1,003 reads against 54 for the handover branch; with `successor_hints = 0`
+  it failed 54 again. A hint only records that another owner asked for the page and got no copy;
+  under origin overload that owner's fetch often fails or has not finished. 15,338 of 19,588
+  deferrals (78%, temporary counter) happened while the deferring owner's own acquisition of the
+  page was running, so readers were sent away from a fill they could have joined and exhausted
+  their walks (`walk_exhausted` 20,292 to 29,491, `error_unavailable` 54 to 1,003). Production
+  (`Coordinator::defer_to_successor`, `src/read.rs`) and the simulator now skip the deferral
+  while `Flights::acquiring` / `PageFlights::acquiring` holds for the page
+  (`racer_core::read::successor::defer_allowed`). After: 62 failed reads, 796 deferrals. Tests:
+  `successor::tests::no_deferral_while_this_node_acquires`,
+  `flight::tests::acquiring_only_while_a_leader_fetches`, and production
+  `acquiring_only_while_a_leader_runs`.
+- Fan-out helpers and handoff previous-owner probes are unchanged by orphan and join2; the hard
+  invariants (including `origin_repeat_explained`, `unexplained` 0) hold in every run below and
+  in all 16 scenarios at 200 nodes, 1 s. No invariant was relaxed.
+
+### Evidence
+
+Release, seed 1. 5k `full-*` and 50k use `/tmp/opencode/m4b/rr.json`; z16 is `zipf` with 16 MiB
+pages (`/tmp/opencode/r5-handover/Z16.json`); cs1g is the 1 Gbit/s `full-cold-start` 1 s storm
+of Known issue 23 (`/tmp/opencode/r5-relay/fin/cs1g.json`, 5k as in that issue). Origin: total,
+worst page, pages fetched more than once. Wave 2 is `/tmp/opencode/m4b/`.
+
+| Run | Reads ok / failed | Origin | `copy_held` | Concurrent | Deferrals | Stale fallbacks | Wall |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 5k storm, wave 2 | 268,449 / 461 | 1,024, 1, 0 | 0 | 0 | - | - | 1:28 |
+| 5k storm | 378,544 / 0 | 1,024, 1, 0 | 0 | 0 | 0 | 0 | 1:26 |
+| 5k zipf, wave 2 | 149,525 / 4,373 | 42,216, 3, 4,171 | 565 | 3,734 | - | - | 2:14 |
+| 5k zipf | 202,884 / 21 | 40,804, 3, 1,830 | 198 | 1,651 | 181 | 0 | 2:02 |
+| 5k churn, wave 2 | 172,701 / 450 | 1,040, 3, 15 | 7 | 0 | - | - | 1:12 |
+| 5k churn | 291,640 / 95 | 1,030, 2, 6 | 0 | 0 | 0 | 15,975 | 1:18 |
+| 5k full-cold-start, wave 2 | 94,829 / 1 | 6,946, 2, 52 | 5 | 0 | - | - | 0:43 |
+| 5k full-cold-start | 94,829 / 0 | 6,945, 2, 50 | 3 | 0 | 37 | 0 | 0:41 |
+| 5k full-failover, wave 2 | 33,804 / 23 | 13,075, 7, 458 | 169 | 0 | - | - | 0:53 |
+| 5k full-failover | 33,797 / 31 | 13,057, 6, 467 | 154 | 0 | 266 | 30 | 0:52 |
+| 5k full-churn, wave 2 | 33,988 / 4 | 13,653, 6, 991 | 13 | 0 | - | - | 0:52 |
+| 5k full-churn | 33,996 / 2 | 13,661, 6, 1,000 | 16 | 0 | 188 | 31 | 0:49 |
+| 5k z16, handover branch | 32,691 / 54 | 35,917, 4, 13,740 | 10 | 18,275 | - | - | 0:58 |
+| 5k z16, merge before 7c6a08583 | 32,427 / 1,003 | 35,846, 4, 13,702 | 10 | 18,219 | 19,588 | 0 | 0:58 |
+| 5k z16 | 32,668 / 62 | 35,672, 4, 13,715 | 8 | 18,030 | 796 | 0 | 0:53 |
+| 5k cs1g, relay branch | 63,745 / 31,084 | - | - | - | - | - | - |
+| 5k cs1g | 63,637 / 31,191 | 6,947, 2, 52 | 5 | 0 | 41 | 1 | 1:07 |
+| 50k full-cold-start, wave 2 | 908,373 / 1,103 | 29,336, 5, 2,639 | 330 | 1 | - | - | 20:38 |
+| 50k full-cold-start, join2 | 911,461 / 247 | 29,680, 5, 2,505 | 162 | 0 | - | 1,797 | 20:42 |
+| 50k full-cold-start | 911,471 / 248 | 29,695, 5, 2,506 | 169 | 0 | 156 | 1,798 | 20:35 |
+| 50k full-failover, wave 2 | 299,717 / 1,527 | 52,461, 9, 6,136 | 2,451 | 0 | - | - | 28:37 |
+| 50k full-failover, orphan | 299,710 / 1,542 | 52,304, 7, 6,099 | 2,305 | 2 | 2,143 | - | 30:09 |
+| 50k full-failover, join2 | 302,582 / 479 | 52,384, 9, 5,938 | 2,109 | 0 | - | 1,908 | 28:29 |
+| 50k full-failover | 302,519 / 535 | 52,200, 10, 5,895 | 1,914 | 0 | 1,878 | 1,908 | 28:06 |
+
+- The tracks combine: 50k `full-failover` has join2's failed reads (535 against 479) with fewer
+  `copy_held` repeats than either branch (1,914) and the fewest origin requests (52,200); orphans
+  fall from 1,481 (orphan branch) to 1,205. The worst page is 10 (7 on the orphan branch, 9 on
+  join2 and wave 2); every repeat is explained.
+- Known issue 23 is unchanged: 31,191 failed reads in the 1 Gbit/s storm (31,084 on the relay
+  branch).
+- Peak RSS: 50k `full-cold-start` 4.3 GiB, `full-failover` 3.0 GiB (wave 2 4.2 and 3.0).
+- Workspace tests pass on an idle host. Under the load of eight concurrent 5k runs, 32
+  deadline-based control and app tests (`DeadlineExceeded`) failed; they all passed on rerun.
+
+### Open issues after wave 3
+
+19 (partly; remainder 26), 21 (partly), 23, 25, 26, 28 (the leak track), 31.
