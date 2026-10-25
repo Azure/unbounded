@@ -86,6 +86,9 @@ struct Entry<N> {
     max: u32,
     /// Already returned by [`SuccessorHints::probe`].
     probed: bool,
+    /// The newest node was noted from an offer: it holds the copy, so
+    /// [`PROBE_AFTER`] does not apply (Known issue 51).
+    offered: bool,
 }
 
 /// Bounded, expiring map from a page to the owners that recently asked this
@@ -129,6 +132,7 @@ impl<K: Eq + Hash + Clone, N: Clone + PartialEq> SuccessorHints<K, N> {
             entry.uses = 0;
             entry.max = u32::MAX;
             entry.probed = false;
+            entry.offered = false;
             self.order.push_back((key, now));
             self.compact();
             return;
@@ -149,6 +153,7 @@ impl<K: Eq + Hash + Clone, N: Clone + PartialEq> SuccessorHints<K, N> {
                 uses: 0,
                 max: u32::MAX,
                 probed: false,
+                offered: false,
             },
         );
         self.order.push_back((key, now));
@@ -167,6 +172,7 @@ impl<K: Eq + Hash + Clone, N: Clone + PartialEq> SuccessorHints<K, N> {
         self.note(key.clone(), node, now);
         if let Some(entry) = self.entries.get_mut(&key) {
             (entry.uses, entry.max) = kept.unwrap_or((0, 0));
+            entry.offered = true;
         }
     }
 
@@ -184,14 +190,17 @@ impl<K: Eq + Hash + Clone, N: Clone + PartialEq> SuccessorHints<K, N> {
     /// TTL, if longer), oldest first, for this node's own walk to ask before
     /// origin ([`successor_targets`]). Each noted hint is returned once, so
     /// one hint funds at most one granted probe per node it names; a renewed
-    /// note returns it again.
+    /// note returns it again. A hint younger than [`PROBE_AFTER`] is held
+    /// back unless an offer noted it: an offer's sender holds the copy, and
+    /// waiting let rank 0 refetch pages offered a second earlier (Known
+    /// issue 51).
     pub fn probe(&mut self, key: &K, now: Instant) -> Vec<N> {
         let ttl = self.ttl.max(PROBE_TTL);
         match self.entries.get_mut(key) {
             Some(e)
                 if !e.probed
                     && now.saturating_duration_since(e.at) <= ttl
-                    && now.saturating_duration_since(e.at) >= PROBE_AFTER =>
+                    && (e.offered || now.saturating_duration_since(e.at) >= PROBE_AFTER) =>
             {
                 e.probed = true;
                 e.nodes.clone()
@@ -377,6 +386,23 @@ mod tests {
         h.charge(&2, 2);
         assert!(h.peek(&2, now).is_empty());
         assert_eq!(h.probe(&2, now + PROBE_AFTER), [8, 9]);
+    }
+
+    /// Known issue 51: an offered hint is probed at once; a miss-noted one
+    /// waits `PROBE_AFTER`, and a later miss note restores the wait.
+    #[test]
+    fn offered_hints_skip_the_probe_delay() {
+        let now = Instant::now();
+        let mut h = SuccessorHints::new(8, HINT_TTL);
+        h.note(1u64, 7u32, now);
+        assert!(h.probe(&1, now).is_empty());
+        h.note_offer(2u64, 8u32, now);
+        assert_eq!(h.probe(&2, now), [8]);
+        assert!(h.probe(&2, now).is_empty());
+        h.note_offer(3u64, 9u32, now);
+        h.note(3, 10, now);
+        assert!(h.probe(&3, now).is_empty());
+        assert_eq!(h.probe(&3, now + PROBE_AFTER), [9, 10]);
     }
 
     #[test]

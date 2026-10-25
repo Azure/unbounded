@@ -143,6 +143,12 @@ impl<K: Eq + Hash + Clone, N: Clone, G: Eq + Hash + Clone> OrphanNotices<K, N, G
         }
     }
 
+    /// Whether a notice for `key` is pending (not yet due, deferred, or
+    /// waiting for its next try).
+    pub fn pending(&self, key: &K) -> bool {
+        self.entries.contains_key(key)
+    }
+
     /// Whether some notice waits for a blocked group to open: callers that
     /// schedule a timer per noted or failed offer also need one for
     /// [`Self::next_due`] then.
@@ -160,8 +166,9 @@ impl<K: Eq + Hash + Clone, N: Clone, G: Eq + Hash + Clone> OrphanNotices<K, N, G
 
     /// Remove and return the earliest notice due at `now` whose target's
     /// group (`group_of`) is not blocked. Due notices of a blocked group are
-    /// deferred to the block's end without spending a try. The returned
-    /// offer holds its group for [`PROBE_HOLD`]: report it with
+    /// deferred to the block's end without spending a try. An offer to a
+    /// group whose block just ended holds the group for [`PROBE_HOLD`]
+    /// (one probe per cut); report every offer with
     /// [`Self::reached`] or [`Self::cut`] (or [`Self::failed`] for a failure
     /// that says nothing about the route).
     pub fn pop_open(&mut self, now: Instant, group_of: impl Fn(&N) -> G) -> Option<Due<K, N>> {
@@ -171,7 +178,12 @@ impl<K: Eq + Hash + Clone, N: Clone, G: Eq + Hash + Clone> OrphanNotices<K, N, G
             match self.blocked(&group, now) {
                 Some(until) => self.defer(due, until),
                 None => {
-                    self.block(group, now + PROBE_HOLD, now);
+                    // After a block ends, this offer probes the group:
+                    // hold the rest until it is reported. A group never
+                    // blocked (or released since) is not held.
+                    if self.blocked.contains_key(&group) {
+                        self.block(group, now + PROBE_HOLD, now);
+                    }
                     return Some(due);
                 }
             }
@@ -664,18 +676,18 @@ mod tests {
         let mut n: OrphanNotices<u64, u32, u8> = OrphanNotices::new(16);
         let site = |t: &u32| (*t / 10) as u8;
         n.note(1, 10, now);
-        n.note(2, 11, now + Duration::from_secs(1));
-        n.note(3, 12, now + Duration::from_secs(2));
-        n.note(4, 20, now + Duration::from_secs(3));
+        n.note(2, 11, now + Duration::from_secs(3));
+        n.note(3, 12, now + Duration::from_secs(4));
+        n.note(4, 20, now + Duration::from_secs(5));
         let first = n.pop_open(at(now, 5), site).expect("due");
         assert_eq!(first.key, 1);
-        // Held while the probe is out: 2 is due but deferred, untouched.
-        assert_eq!(n.pop_open(at(now, 6), site), None);
+        // No cut seen yet: offers to the group are not held.
+        assert_eq!(n.blocked(&1, at(now, 5)), None);
         // Cut at 7 s: next offer of 1 at 22 s; group 1 blocked until then.
         assert_eq!(n.cut(first, 1, at(now, 7)), Some(at(now, 22)));
         assert_eq!(n.blocked(&1, at(now, 7)), Some(at(now, 22)));
-        // 3 comes due and is deferred; another group is unaffected.
-        assert_eq!(n.pop_open(at(now, 8), site).map(|d| d.key), Some(4));
+        // 2 and 3 come due and are deferred; another group is unaffected.
+        assert_eq!(n.pop_open(at(now, 10), site).map(|d| d.key), Some(4));
         assert_eq!(n.pop_open(at(now, 21), site), None);
         assert_eq!(n.len(), 3);
         assert_eq!(n.next_due(), Some(at(now, 22)));
@@ -709,15 +721,29 @@ mod tests {
         n.note(1, 10, now);
         n.note(2, 11, now);
         let due = n.pop_open(at(now, 5), |_| 1).expect("due");
-        assert_eq!(n.refused(due, &1, at(now, 5)), Some(at(now, 20)));
-        assert_eq!(n.blocked(&1, at(now, 5)), None);
-        assert_eq!(n.pop_open(at(now, 5), |_| 1).map(|d| d.key), Some(2));
-        // An unreported probe holds the group for `PROBE_HOLD` only.
-        assert!(n.blocked(&1, at(now, 5)).is_some());
+        n.cut(due, 1, at(now, 5));
+        // After the block, one probe; a refusal releases the group.
+        let due = n.pop_open(at(now, 20), |_| 1).expect("probe");
+        assert!(n.blocked(&1, at(now, 20)).is_some());
+        let other = 3 - due.key;
+        let tries = due.tries;
         assert_eq!(
-            n.blocked(&1, now + Duration::from_secs(5) + PROBE_HOLD),
-            None
+            n.refused(due, &1, at(now, 20)),
+            Some(at(now, 20) + NOTICE_DELAYS[tries + 1])
         );
+        assert_eq!(n.blocked(&1, at(now, 20)), None);
+        assert_eq!(n.pop_open(at(now, 20), |_| 1).map(|d| d.key), Some(other));
+        assert_eq!(n.blocked(&1, at(now, 20)), None);
+        // An unreported probe holds the group for `PROBE_HOLD` only.
+        n.note(3, 10, at(now, 20));
+        n.note(4, 10, at(now, 20));
+        let due = n.pop_open(at(now, 25), |_| 1).expect("due");
+        n.cut(due, 1, at(now, 25));
+        let _probe = n.pop_open(at(now, 40), |_| 1).expect("probe");
+        assert_eq!(n.pop_open(at(now, 40), |_| 1), None);
+        assert!(n.blocked(&1, at(now, 40)).is_some());
+        assert_eq!(n.blocked(&1, at(now, 40) + PROBE_HOLD), None);
+        assert!(n.pop_open(at(now, 40) + PROBE_HOLD, |_| 1).is_some());
     }
 
     #[test]
