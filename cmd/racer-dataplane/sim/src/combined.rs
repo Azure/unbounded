@@ -600,6 +600,57 @@ mod tests {
         );
     }
 
+    /// Known issue 37: an owner after rank 0 that fetched a page from origin
+    /// offers it to rank 0 later, so rank 0 copies orphans whose holder never
+    /// reached it instead of fetching them again. Offers are bounded by the
+    /// notice schedule. Known issue 38: relay-signed failures are their own
+    /// skip class, apart from rank 0's own failures.
+    #[test]
+    fn failover_holders_offer_orphans_to_rank_zero() {
+        use racer_core::read::notice::NOTICE_TRIES;
+        let run_with = |notices: bool| {
+            let mut config = Config {
+                nodes: 400,
+                ..Config::default()
+            };
+            data_defaults(&mut config);
+            config.request_rate = 0.2;
+            config.node.orphan_notices = notices;
+            run("full-failover", config, 2, Some(300 * SECONDS), None).unwrap()
+        };
+        let (off, on) = (run_with(false), run_with(true));
+        assert_clean(&on);
+        assert_eq!(counter(&off, "orphan_offers_sent"), 0);
+        let noted = counter(&on, "orphan_notices_noted");
+        let sent = counter(&on, "orphan_offers_sent");
+        assert!(
+            counter(&on, "orphan_offers_delivered") > 0,
+            "{}",
+            on["metrics"]
+        );
+        assert!(sent <= noted * NOTICE_TRIES as u64, "{}", on["metrics"]);
+        assert_eq!(
+            sent,
+            counter(&on, "orphan_offers_delivered") + counter(&on, "orphan_offers_failed"),
+            "{}",
+            on["metrics"]
+        );
+        let orphans = |r: &Value| {
+            let o = &r["origin_per_page"]["repeats"]["orphan"];
+            o.as_object()
+                .unwrap()
+                .values()
+                .map(|v| v.as_u64().unwrap())
+                .sum::<u64>()
+        };
+        assert!(orphans(&on) < orphans(&off), "{}", on["origin_per_page"]);
+        // Known issue 38: the skip classes partition the skips, and the
+        // relay class is reported.
+        let skips = &on["origin_per_page"]["skips"];
+        assert!(skips.get("relay").is_some(), "{skips}");
+        assert_eq!(on["origin_per_page"]["repeats"]["unexplained"], 0);
+    }
+
     /// Known issue 7: the Pod crashed for good at `d / 2 + 5 s` leaves the
     /// membership once its Node has been not ready for the grace, so peers
     /// stop choosing it. Before round 4 they chose it until the end.
