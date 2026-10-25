@@ -687,6 +687,18 @@ impl CandidatePolicy {
             })
         })
     }
+    /// Whether `node` owns `page` under `membership` by a completed cached
+    /// ranking; never ranks (successor hints, Known issue 21).
+    pub(crate) fn owns_cached(
+        &self,
+        membership: &crate::topology::Membership,
+        page: &crate::model::PageId,
+        node: &NodeId,
+    ) -> bool {
+        self.placement
+            .is_owner(membership, &page.version.object, page.number, node)
+    }
+
     /// Retention is a hint from CURRENT publication, not the read's leased route.
     /// This callback is lookup-only: no cold scoring or cache eviction. Missing
     /// and obsolete results contribute no bonus, never a storage pin.

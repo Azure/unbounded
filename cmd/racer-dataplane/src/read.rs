@@ -162,32 +162,35 @@ impl Coordinator {
         Some(owners)
     }
 
-    /// This node answered `requester`'s page probe without a copy: when both
-    /// own the page, remember that `requester` is likely to fetch it itself.
-    async fn note_successor(
+    /// This node answered `requester`'s page probe without a copy: remember
+    /// that `requester` is likely to fetch the page itself. A copy-only miss
+    /// is noted without ranking (deferral checks ownership); a failed
+    /// acquisition is noted when the ranking this node's own walk cached
+    /// shows both as owners. Neither path ranks a page.
+    fn note_successor(
         &self,
         page: &crate::model::PageId,
         requester: &racer_control_wire::NodeId,
-        membership: std::sync::Arc<crate::topology::Membership>,
-        scope: &RequestScope,
+        membership: &crate::topology::Membership,
+        copy_only: bool,
     ) {
-        let local = &self.fill.dependencies.candidates.node;
-        if local == requester {
-            return;
-        }
-        let Some(owners) = self.page_owners(membership, page, scope).await else {
-            return;
+        let candidates = &self.fill.dependencies.candidates;
+        let local = &candidates.node;
+        let owners = || {
+            candidates.owns_cached(membership, page, local)
+                && candidates.owns_cached(membership, page, requester)
         };
-        if racer_core::read::successor::should_note(local, requester, &owners) {
-            self.successors.borrow_mut().note(
-                page.clone(),
-                requester.clone(),
-                uring_runtime::environment::now(),
-            );
-            self.fill
-                .metrics
-                .record(crate::telemetry::Event::SuccessorHint, 1);
+        if local == requester || !(copy_only || owners()) {
+            return;
         }
+        self.successors.borrow_mut().note(
+            page.clone(),
+            requester.clone(),
+            uring_runtime::environment::now(),
+        );
+        self.fill
+            .metrics
+            .record(crate::telemetry::Event::SuccessorHint, 1);
     }
 
     /// Whether to answer a non-owner's page `Acquire` with `Miss` because
@@ -211,7 +214,8 @@ impl Coordinator {
         let Some(owners) = self.page_owners(membership, page, scope).await else {
             return false;
         };
-        if successor_deferral(hints, requester, &owners).is_none() {
+        let local = &self.fill.dependencies.candidates.node;
+        if successor_deferral(hints, local, requester, &owners).is_none() {
             return false;
         }
         self.successors.borrow_mut().charge(page, MAX_DEFERRALS);
@@ -602,8 +606,7 @@ impl LocalPageService for Coordinator {
                     Ok(_) => false,
                 };
                 if missed {
-                    self.note_successor(&page, &noted_requester, noted_membership, &effective)
-                        .await;
+                    self.note_successor(&page, &noted_requester, &noted_membership, copy_only);
                 }
             }
             match result {

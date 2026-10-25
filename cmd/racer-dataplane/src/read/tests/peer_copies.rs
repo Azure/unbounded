@@ -3812,18 +3812,19 @@ fn rank_zero_defers_readers_to_the_owner_it_missed() {
     let _owner = queue.enter();
     let mut s = SuccessorFixture::new();
     let (reader, successor, other) = (s.index(None), s.index(Some(1)), s.index(Some(2)));
-    // A reader's copy-only miss is no hint.
+    // A copy-only miss is noted without ranking, but a reader's hint never
+    // defers anyone: deferral checks that the hinted node owns the page.
     assert!(matches!(
         s.serve(reader, FetchMode::CopyOnly),
         PeerResponse::Miss
     ));
-    assert_eq!(s.count(Event::SuccessorHint), 0);
+    assert_eq!(s.count(Event::SuccessorHint), 1);
     // Rank 1 asks copy-only and misses: it will fetch the page itself.
     assert!(matches!(
         s.serve(successor, FetchMode::CopyOnly),
         PeerResponse::Miss
     ));
-    assert_eq!(s.count(Event::SuccessorHint), 1);
+    assert_eq!(s.count(Event::SuccessorHint), 2);
     for i in 0..MAX_DEFERRALS {
         assert!(
             matches!(s.serve(reader, FetchMode::Acquire), PeerResponse::Miss),
@@ -3892,5 +3893,27 @@ fn rank_zero_without_hints_acquires_for_readers() {
     ));
     assert_eq!(s.f.origin.calls.get(), 1);
     assert_eq!(s.count(Event::SuccessorHint), 0);
+    assert_eq!(s.count(Event::SuccessorDeferral), 0);
+}
+
+/// A reader's copy-only miss is noted (without ranking), but it never
+/// defers: the hinted node must own the page.
+#[test]
+fn rank_zero_never_defers_to_a_reader() {
+    use crate::telemetry::Event;
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut s = SuccessorFixture::new();
+    let reader = s.index(None);
+    assert!(matches!(
+        s.serve(reader, FetchMode::CopyOnly),
+        PeerResponse::Miss
+    ));
+    assert_eq!(s.count(Event::SuccessorHint), 1);
+    assert!(matches!(
+        s.serve(reader, FetchMode::Acquire),
+        PeerResponse::Page { .. }
+    ));
+    assert_eq!(s.f.origin.calls.get(), 1);
     assert_eq!(s.count(Event::SuccessorDeferral), 0);
 }
