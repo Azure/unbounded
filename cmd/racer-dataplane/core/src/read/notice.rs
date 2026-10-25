@@ -226,6 +226,7 @@ pub fn offer_noted(holds: bool, acquiring: bool) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Tests build instants to feed the API.
 mod tests {
     use super::*;
 
