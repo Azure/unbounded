@@ -41,7 +41,12 @@ const _: () = assert!(MAX_DEGREE <= u64::BITS as usize);
 // Worker-local link circuits, distinct from process readiness and placement.
 pub struct LinkHealth {
     inner: flow_control::Circuits<NodeId>,
+    /// Destinations that accept requests and never answer them (Known
+    /// issues 41 and 43, `racer_core::peer::silence`). A ping carries the
+    /// page of the last unanswered exchange.
+    silence: std::cell::RefCell<Silence<NodeId, crate::model::PageId>>,
 }
+type Silence<N, P> = racer_core::peer::silence::Silence<N, P>;
 pub type LinkProbe<'a> = flow_control::Probe<'a, NodeId>;
 impl Default for LinkHealth {
     /// Construct independent worker-local circuit state for all possible neighbors.
@@ -73,10 +78,78 @@ impl LinkHealth {
         }
         result
     }
-    pub const fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize) -> Self {
         Self {
             inner: flow_control::Circuits::new(capacity, Duration::from_secs(1)),
+            silence: std::cell::RefCell::new(Silence::new(
+                racer_core::peer::silence::SILENCE_CAPACITY,
+                racer_core::read::rank0::HANG_AFTER,
+                SILENCE_PING_TIMEOUT,
+            )),
         }
+    }
+    /// Silence timing (`racer_core::peer::silence::Silence::new`):
+    /// `hang_after` is half the client request timeout and `ping_timeout`
+    /// the peer attempt timeout.
+    pub fn with_silence(self, hang_after: Duration, ping_timeout: Duration) -> Self {
+        self.set_silence(hang_after, ping_timeout);
+        self
+    }
+    /// [`Self::with_silence`] on a shared handle; forgets every peer.
+    pub fn set_silence(&self, hang_after: Duration, ping_timeout: Duration) {
+        *self.silence.borrow_mut() = Silence::new(
+            racer_core::peer::silence::SILENCE_CAPACITY,
+            hang_after,
+            ping_timeout,
+        );
+    }
+    /// An exchange for `page` sent to `peer` at `sent` ended unanswered; see
+    /// `Silence::timed_out`. Returns whether a ping is wanted.
+    pub fn silence_timed_out(
+        &self,
+        peer: &NodeId,
+        page: crate::model::PageId,
+        sent: Instant,
+        needed: u32,
+    ) -> bool {
+        self.silence.borrow_mut().timed_out(
+            peer.clone(),
+            page,
+            sent,
+            uring_runtime::environment::now(),
+            needed,
+        )
+    }
+    /// `peer` answered an exchange: it is not hung.
+    pub fn silence_answered(&self, peer: &NodeId) {
+        self.silence.borrow_mut().answered(peer);
+    }
+    /// At most `max` pings due now, each marked outstanding
+    /// (`Silence::due_pings`).
+    pub fn due_pings(&self, now: Instant, max: usize) -> Vec<(NodeId, crate::model::PageId)> {
+        self.silence.borrow_mut().due_pings(now, max)
+    }
+    /// Outcome of a ping sent for `peer`: answered by it (`Some(true)`),
+    /// left unanswered or refused by a relay that cannot reach it
+    /// (`Some(false)`), or inconclusive (`None`). Returns whether `peer`
+    /// became silent.
+    pub fn ping_outcome(&self, peer: &NodeId, answered: Option<bool>, now: Instant) -> bool {
+        let mut silence = self.silence.borrow_mut();
+        match answered {
+            Some(true) => {
+                silence.ping_answered(peer, now);
+                false
+            }
+            Some(false) => silence.ping_failed(peer, now),
+            None => false,
+        }
+    }
+    /// Whether `peer` is silent: requests for it fail at once.
+    pub fn silent(&self, peer: &NodeId) -> bool {
+        self.silent_at(peer, uring_runtime::environment::now())
+    }
+    pub fn silent_at(&self, peer: &NodeId, now: Instant) -> bool {
+        self.silence.borrow().silent(peer, now)
     }
     pub fn observe(&self, neighbor: &NodeId, outcome: LinkOutcome) -> Result<()> {
         self.observe_at(neighbor, outcome, uring_runtime::environment::now())
@@ -95,7 +168,8 @@ impl LinkHealth {
         self.available_at(neighbor, uring_runtime::environment::now())
     }
     pub fn available_at(&self, neighbor: &NodeId, now: Instant) -> Result<bool> {
-        Ok(self.inner.available(neighbor, now))
+        // A silent neighbor is routed around (Known issue 41).
+        Ok(self.inner.available(neighbor, now) && !self.silent_at(neighbor, now))
     }
     pub fn try_acquire(&self, neighbor: &NodeId) -> Result<bool> {
         self.try_acquire_at(neighbor, uring_runtime::environment::now())
@@ -110,6 +184,9 @@ impl LinkHealth {
         self.inner.len()
     }
 }
+/// Default ping time bound: the default peer attempt timeout.
+pub const SILENCE_PING_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn backoff(node: &NodeId, failures: u32) -> Duration {
     let base = (100u64 << failures.saturating_sub(1).min(8)).min(20_000);
     let mut digest = hash_domain(b"racer/link-backoff/v1\0");
@@ -712,6 +789,59 @@ fn map_error(error: ::topology::Error) -> Error {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Known issues 41 and 43: a destination whose ping went unanswered is
+    /// silent: unavailable for routing until it answers anything.
+    #[test]
+    fn a_silent_peer_is_routed_around_until_it_answers() {
+        let clock = uring_runtime::environment::SimulationClock::new(1);
+        let _env = clock.environment(0).enter();
+        let health =
+            LinkHealth::default().with_silence(Duration::from_secs(10), Duration::from_secs(2));
+        let peer = NodeId("peer".into());
+        let page = crate::model::PageId {
+            version: crate::model::ObjectVersion {
+                object: ObjectId {
+                    cache: CacheId("cache".into()),
+                    key: crate::model::CacheKey([7; 32]),
+                },
+                etag: crate::model::StrongEtag::test_value("v"),
+            },
+            number: PageNumber(3),
+        };
+        let sent = uring_runtime::environment::now();
+        clock.advance(Duration::from_secs(2));
+        // One unanswered exchange over the last link asks nothing yet.
+        assert!(!health.silence_timed_out(
+            &peer,
+            page.clone(),
+            sent,
+            racer_core::peer::silence::LINK_TIMEOUTS
+        ));
+        assert!(health.silence_timed_out(
+            &peer,
+            page.clone(),
+            sent,
+            racer_core::peer::silence::LINK_TIMEOUTS
+        ));
+        let now = uring_runtime::environment::now();
+        assert_eq!(health.due_pings(now, 8), vec![(peer.clone(), page.clone())]);
+        assert!(health.available(&peer).unwrap());
+        // A relay's overload proves nothing; an unanswered ping does.
+        assert!(!health.ping_outcome(&peer, None, now));
+        assert!(!health.silent(&peer));
+        assert!(health.ping_outcome(&peer, Some(false), now));
+        assert!(health.silent(&peer));
+        assert!(!health.available(&peer).unwrap());
+        // Pinged again after the hold; an answer clears it.
+        assert!(health.due_pings(now, 8).is_empty());
+        clock.advance(Duration::from_secs(20));
+        let later = uring_runtime::environment::now();
+        assert_eq!(health.due_pings(later, 8).len(), 1);
+        assert!(!health.ping_outcome(&peer, Some(true), later));
+        assert!(!health.silent(&peer));
+        assert!(health.available(&peer).unwrap());
+    }
 
     pub(crate) mod fixtures {
         use super::*;

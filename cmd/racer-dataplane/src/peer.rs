@@ -382,6 +382,11 @@ impl Relay {
                 Some(reservation) => reservation.clone(),
                 None => Rc::new(self.admission.reserve(None, ResourceClass::Relay, 1)?),
             };
+            // A destination this node holds silent fails at once (Known
+            // issues 41 and 43): signed `Unavailable`, as for no route.
+            if self.paths.link_health().silent(&budget.destination) {
+                return Err(Error::Unavailable);
+            }
             let search_budget = search_budget(budget, &network.local)?;
             let route = self
                 .paths
@@ -508,6 +513,8 @@ pub enum Requester {
         /// a landed page for a request or None to answer it as a plain request.
         #[cfg(test)]
         landing: Option<(i32, ScriptedLanding)>,
+        /// Silence state the candidate policy keeps for scripted peers.
+        health: Rc<crate::topology::LinkHealth>,
     },
 }
 
@@ -538,6 +545,7 @@ impl Requester {
     ) -> Rc<Self> {
         let capability = state.clone();
         Rc::new(Self::Scripted {
+            health: Rc::new(crate::topology::LinkHealth::default()),
             available: Box::new(move |m, n| available(&capability, m, n)),
             request: Box::new(move |r, m, scope, is_direct| {
                 let state = state.clone();
@@ -911,6 +919,15 @@ impl Requester {
     }
 }
 impl Requester {
+    /// This worker's link health (silence included, Known issues 41 and
+    /// 43).
+    pub(crate) fn link_health(&self) -> Rc<crate::topology::LinkHealth> {
+        match self {
+            Self::Network { health, .. } => health.clone(),
+            #[cfg(any(test, feature = "subscription-interop"))]
+            Self::Scripted { health, .. } => health.clone(),
+        }
+    }
     fn exchange_inner<'a>(
         &'a self,
         request: SignedRequest,
@@ -995,8 +1012,17 @@ impl Requester {
             } else {
                 crate::rdma::TransportPlan::Http
             };
+            // The last link: this sender learns whether the destination
+            // answers (Known issues 41 and 43).
+            let last_page = match &request.request.operation {
+                protocol::Operation::Page { page, .. } if next == budget.destination => {
+                    Some(page.clone())
+                }
+                _ => None,
+            };
             let receive_permit = transfers.admit_receive(&request.request, &scope).await?;
             let _probe = health.acquire(&next)?;
+            let sent = uring_runtime::environment::now();
             let permit = paths
                 .peer_admission
                 .as_ref()
@@ -1031,7 +1057,9 @@ impl Requester {
                     overloaded: matches!(response.response, protocol::PeerResponse::Overloaded),
                 },
                 // A landed page was verified by the transport, like a complete response.
-                Ok(transport::RelayResponse::Landed(_)) => hop::Exchange::Complete { overloaded: false },
+                Ok(transport::RelayResponse::Landed(_)) => {
+                    hop::Exchange::Complete { overloaded: false }
+                }
                 Ok(_) => hop::Exchange::Streaming,
                 Err(error) => hop::Exchange::Failed {
                     fault: error.fault(),
@@ -1047,6 +1075,21 @@ impl Requester {
                 // A downstream overload is not attributable to the immediate
                 // peer. It also must not increase its admission or recover a probe.
                 permit.observe(hop::exchange_admission_outcome(exchange));
+            }
+            if let Some(page) = last_page {
+                match hop::silence_evidence(exchange) {
+                    Some(true) => health.silence_answered(&next),
+                    // `CandidatePolicy::poll_pings` sends the ping.
+                    Some(false) => {
+                        let _ = health.silence_timed_out(
+                            &next,
+                            page,
+                            sent,
+                            racer_core::peer::silence::LINK_TIMEOUTS,
+                        );
+                    }
+                    None => {}
+                }
             }
             drop(membership);
             response

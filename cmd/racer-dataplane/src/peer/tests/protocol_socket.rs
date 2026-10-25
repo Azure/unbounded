@@ -557,6 +557,92 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
     }
 }
 
+/// Known issues 41 and 43: a relay that holds the destination silent (a ping
+/// to it went unanswered) answers `Unavailable` at once instead of sending
+/// the request to a peer that would never answer it.
+#[test]
+fn relay_fails_a_request_for_a_silent_destination_at_once() {
+    use crate::topology::LinkHealth;
+    use crate::topology::Member;
+    use crate::topology::Membership;
+    use crate::topology::Paths;
+    let signers = signers();
+    let origin = Forwarding::new(signers[0].clone());
+    let forwarding = Rc::new(Forwarding::new(signers[1].clone()));
+    let socket = SocketFixture::new(2);
+    let admission = socket.admission.clone();
+    let membership = Arc::new(
+        Membership::validate(
+            MembershipVersion(1),
+            [A, B, C]
+                .iter()
+                .map(|n| Member {
+                    node: NodeId((*n).into()),
+                    shares: std::num::NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: "127.0.0.1:9".into(),
+                    rails: vec![],
+                    site: String::new(),
+                })
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let network = Rc::new(
+        PeerNetwork::new(
+            NodeId(B.into()),
+            crate::test_support::published_membership(membership.clone()),
+        )
+        .unwrap(),
+    );
+    let health = Rc::new(
+        LinkHealth::default()
+            .with_silence(std::time::Duration::ZERO, std::time::Duration::from_secs(1)),
+    );
+    let destination = NodeId(C.into());
+    let page = crate::model::PageId {
+        version: crate::model::ObjectVersion {
+            object: crate::model::ObjectId {
+                cache: CacheId("cache".into()),
+                key: crate::model::CacheKey([3; 32]),
+            },
+            etag: crate::model::StrongEtag::test_value("v"),
+        },
+        number: crate::model::PageNumber(0),
+    };
+    let now = uring_runtime::environment::now();
+    assert!(health.silence_timed_out(&destination, page, now, 1));
+    assert_eq!(health.due_pings(now, 1).len(), 1);
+    assert!(health.ping_outcome(&destination, Some(false), now));
+    let paths = Rc::new(Paths::new(health, 1));
+    let requester = Rc::new(Requester::new(
+        paths.clone(),
+        forwarding.clone(),
+        socket.transfers(signers[1].clone()),
+        network.clone(),
+    ));
+    let relay = Relay::new(
+        paths,
+        forwarding.clone(),
+        requester.clone(),
+        admission.clone(),
+        network,
+    );
+    let local = request(&admission, 11);
+    assert_eq!(local.route.destination, destination);
+    let scope = local.origin.scope().clone();
+    let (signed, _) = origin.sign_request_to(local, signers[1].node()).unwrap();
+    let ingress = forwarding.verify_request(signed).unwrap();
+    let result =
+        crate::http::tests::drive(&socket.reactor, relay.forward(ingress, membership, &scope));
+    assert!(
+        matches!(result, Err(Error::Unavailable)),
+        "{:?}",
+        result.err()
+    );
+    assert_eq!(requester.outbound_requests(), 0);
+    assert_eq!(admission.used(ResourceClass::Relay), 0);
+}
+
 #[test]
 fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
     use crate::topology::LinkHealth;

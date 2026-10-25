@@ -1089,7 +1089,12 @@ impl WorkerApplication {
 
         let paths = Rc::new(
             Paths::with_limits(
-                Rc::new(LinkHealth::default()),
+                // Silence (Known issues 41 and 43): the rank 0 watch's
+                // allowance, and one peer attempt per ping.
+                Rc::new(
+                    LinkHealth::default()
+                        .with_silence(config.request_timeout / 2, config.peer_attempt_timeout),
+                ),
                 limits.cached_paths.get(),
                 limits.path_cache_bytes.get(),
                 limits.active_path_searches.get(),
