@@ -1791,9 +1791,34 @@ impl NodeWorld {
         }
         let hints = n.hints.peek_for(&page, &requester, instant);
         if hints.is_empty() {
-            if !n.hints.peek(&page, instant).is_empty() {
+            let all = n.hints.peek(&page, instant);
+            if !all.is_empty() {
                 // Known issue 58: the requester came back after a deferral.
+                // Why the hinted owner it was most likely sent to did not
+                // serve it, as of now.
                 self.metrics.incr("successor_deferrals_declined_returning");
+                let owners = self.owners_at(node, w, page, false);
+                if let Some(to) = successor_deferral(all, &node, &requester, &owners) {
+                    let t = &self.nodes[to as usize];
+                    let site = |x: u32| self.fabric.site[x as usize];
+                    let why = if t.down {
+                        "successor_returns_target_down"
+                    } else if !self.versions.enrolled(to) {
+                        "successor_returns_target_not_serving"
+                    } else if self
+                        .partitions
+                        .blocked(self.now(), site(requester), site(to))
+                    {
+                        "successor_returns_target_partition"
+                    } else if t.disk.entries.get(&page).is_some()
+                        || t.workers.iter().any(|x| x.memory.pages.contains_key(&page))
+                    {
+                        "successor_returns_target_holds"
+                    } else {
+                        "successor_returns_target_no_copy"
+                    };
+                    self.metrics.incr(why);
+                }
             }
             return false;
         }
