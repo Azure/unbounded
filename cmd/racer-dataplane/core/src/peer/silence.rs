@@ -63,9 +63,17 @@ pub const SILENCE_TTL: Duration = Duration::from_secs(60);
 /// rarely pinged.
 pub const LINK_TIMEOUTS: u32 = 2;
 
-/// Unanswered probes of rank 0 before an owner above it pings rank 0: one,
-/// since the owner's walk withholds origin after it ([`crate::read::rank0`]).
+/// Unanswered probes of a page's rank 0 before the prober pings rank 0:
+/// one. An owner above rank 0 withholds origin after it
+/// ([`crate::read::rank0`]); a reader would otherwise visit a hung rank 0
+/// again on its next try (waiting for a second timeout failed ten times as
+/// many reads with 50 of 5,000 members hung in the simulator).
 pub const RANK0_TIMEOUTS: u32 = 1;
+
+/// A reader's unanswered probe of an owner above rank 0 never asks a ping:
+/// such an owner usually waited on rank 0. It only demotes the owner in this
+/// node's visit order ([`Silence::unanswered`]).
+pub const NO_PING: u32 = u32::MAX;
 
 #[derive(Clone, Debug)]
 struct Entry<P> {
@@ -172,8 +180,9 @@ impl<N: Eq + Hash + Clone, P: Clone> Silence<N, P> {
             let pinging = entry
                 .pinging
                 .is_some_and(|at| now.saturating_duration_since(at) < stale);
-            entry.want = !entry.silent && !pinging && now >= entry.next && entry.timeouts >= needed;
-            return entry.want;
+            let want = !entry.silent && !pinging && now >= entry.next && entry.timeouts >= needed;
+            entry.want |= want;
+            return want;
         }
         self.make_room(now);
         self.entries.insert(
@@ -268,6 +277,15 @@ impl<N: Eq + Hash + Clone, P: Clone> Silence<N, P> {
     /// not hung. An outstanding ping's outcome is then ignored.
     pub fn answered(&mut self, peer: &N) {
         self.entries.remove(peer);
+    }
+
+    /// Whether `peer` left an exchange of this node unanswered and has
+    /// answered nothing since (or is silent), within [`SILENCE_TTL`]:
+    /// readers visit it after the page's other owners (Known issue 41).
+    pub fn unanswered(&self, peer: &N, now: Instant) -> bool {
+        self.entries.get(peer).is_some_and(|e| {
+            (e.silent || e.timeouts > 0) && now.saturating_duration_since(e.last) <= SILENCE_TTL
+        })
     }
 
     /// Whether `peer` is silent at `now`: requests for it fail at once.
@@ -412,6 +430,32 @@ mod tests {
         assert!(!s.timed_out(1, (), t + 8 * S, t + 9 * S, LINK_TIMEOUTS));
         assert!(s.timed_out(1, (), t + 8 * S, t + 10 * S, LINK_TIMEOUTS));
         assert_eq!(RANK0_TIMEOUTS, 1);
+    }
+
+    #[test]
+    fn a_reader_timeout_asks_no_ping_but_marks_the_peer_unanswered() {
+        let t = Instant::now();
+        let mut s = silence();
+        assert!(!s.unanswered(&1, t));
+        assert!(!s.timed_out(1, (), t, t + 2 * S, NO_PING));
+        assert!(!s.timed_out(1, (), t, t + 3 * S, NO_PING));
+        assert!(s.due_pings(t + 3 * S, 16).is_empty());
+        assert!(s.unanswered(&1, t + 3 * S));
+        // A reader's timeout does not cancel a ping a link asked for.
+        assert!(s.timed_out(3, (), t, t + 2 * S, 1));
+        assert!(!s.timed_out(3, (), t, t + 2 * S, NO_PING));
+        assert_eq!(s.due_pings(t + 2 * S, 16), vec![(3, ())]);
+        assert!(!s.silent(&1, t + 3 * S));
+        // Any answer clears it, and so does time.
+        assert!(!s.unanswered(&1, t + 4 * S + SILENCE_TTL));
+        s.answered(&1);
+        assert!(!s.unanswered(&1, t + 4 * S));
+        // An answered ping too.
+        assert!(s.timed_out(2, (), t, t + 2 * S, 1));
+        s.start_ping(&2, t + 2 * S);
+        assert!(s.unanswered(&2, t + 2 * S));
+        s.ping_answered(&2, t + 3 * S);
+        assert!(!s.unanswered(&2, t + 3 * S));
     }
 
     #[test]

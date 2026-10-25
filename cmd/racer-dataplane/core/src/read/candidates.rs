@@ -127,6 +127,49 @@ pub fn lineage_first(
     order
 }
 
+/// What this node last learned about an owner's answers (see
+/// [`crate::peer::silence::Silence`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
+pub enum Answering {
+    /// Nothing against it.
+    Answers,
+    /// It left one of this node's requests unanswered and has answered
+    /// nothing since ([`crate::peer::silence::Silence::unanswered`]).
+    Unanswered,
+    /// It left a ping unanswered: requests for it fail at once
+    /// ([`crate::peer::silence::Silence::silent`]).
+    Silent,
+}
+
+/// Visit owners that recently left one of this node's requests unanswered
+/// after the others, and silent owners last, keeping the order within each
+/// group (Known issue 41). A reader's out-of-order `Acquire` carries most of
+/// its attempt's credits, so an owner that hangs costs the whole attempt;
+/// without this, every retry of the read visited the same hung owner first
+/// (`Spread` is deterministic per requester and page) and the read failed
+/// with healthy owners left. A reader pings the page's rank 0 when its probe
+/// of rank 0 goes unanswered, so a busy rank 0 (whose acquisition the probe
+/// joined) answers the ping and keeps its place, while a hung one becomes
+/// silent and goes last: the owners above it, which also find it silent,
+/// fetch the page.
+pub fn demote_unanswered(order: VisitOrder, answering: impl Fn(usize) -> Answering) -> VisitOrder {
+    let len = usize::from(order.len);
+    let mut ranks = [0u8; 3];
+    let mut n = 0;
+    for pass in [Answering::Answers, Answering::Unanswered, Answering::Silent] {
+        for &rank in &order.ranks[..len] {
+            if answering(usize::from(rank)) == pass {
+                ranks[n] = rank;
+                n += 1;
+            }
+        }
+    }
+    VisitOrder {
+        ranks,
+        len: order.len,
+    }
+}
+
 /// Rendezvous weight of one owner for one requester and page. Stable within a
 /// process; it only spreads load, so it never needs to agree across nodes.
 pub fn replica_score(
@@ -304,6 +347,36 @@ mod tests {
 
     fn ranks(order: VisitOrder) -> Vec<usize> {
         order.ranks().collect()
+    }
+
+    /// Known issue 41: owners that left this node's request unanswered go
+    /// after the others, silent owners last, each group in its previous
+    /// order; nothing changes without them.
+    #[test]
+    fn demote_unanswered_moves_unanswered_then_silent_owners_last() {
+        use Answering::*;
+        let spread = visit_order(ReplicaSelection::Spread, 3, |r| r == 2, |r| 3 - r as u64);
+        assert_eq!(ranks(spread), [2, 0, 1]);
+        let with = |states: [Answering; 3]| ranks(demote_unanswered(spread, |r| states[r]));
+        assert_eq!(with([Answers; 3]), [2, 0, 1]);
+        assert_eq!(with([Answers, Answers, Unanswered]), [0, 1, 2]);
+        assert_eq!(with([Unanswered, Answers, Unanswered]), [1, 2, 0]);
+        assert_eq!(with([Unanswered; 3]), [2, 0, 1]);
+        assert_eq!(with([Silent, Unanswered, Unanswered]), [2, 1, 0]);
+        assert_eq!(with([Silent, Answers, Unanswered]), [1, 2, 0]);
+        let short = VisitOrder::canonical(2);
+        assert_eq!(
+            ranks(demote_unanswered(short, |r| if r == 0 {
+                Silent
+            } else {
+                Answers
+            })),
+            [1, 0]
+        );
+        assert_eq!(
+            ranks(demote_unanswered(VisitOrder::canonical(0), |_| Silent)),
+            [0usize; 0]
+        );
     }
 
     #[test]
