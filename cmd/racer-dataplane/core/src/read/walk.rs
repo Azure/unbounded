@@ -105,15 +105,18 @@ pub struct WalkConfig {
     /// delegation to rank 0 forwards spare credits for rank 0's. Never
     /// reserved: without slack the walk funds exactly as before.
     pub lineage: [u8; MAX_HANDOFF],
-    /// The first `successors` handoff targets are successor targets
-    /// ([`crate::read::successor::successor_targets`]): later owners this
-    /// owner answered without a copy, which then likely fetched the page
-    /// themselves. Each is asked copy-only once, before origin, with its own
-    /// grant ([`SUCCESSOR_GRANT_ATTEMPTS`], [`SUCCESSOR_GRANT_LINKS`])
-    /// instead of the walk's budget, whose credits a delegated rank 0 needs
-    /// for origin. The grant's unused credits are dropped, never added to
-    /// the walk's budget, so the walk's credits never grow (Known issue 21).
-    pub successors: usize,
+    /// The first `granted` handoff targets are asked copy-only once, before
+    /// origin, each with its own grant ([`SUCCESSOR_GRANT_ATTEMPTS`],
+    /// [`SUCCESSOR_GRANT_LINKS`]) instead of the walk's budget, whose
+    /// credits a delegated rank 0 needs for origin. They are successor
+    /// targets ([`crate::read::successor::successor_targets`]: later owners
+    /// this owner answered without a copy, which then likely fetched the
+    /// page themselves, Known issue 21), then lineage targets
+    /// ([`lineage_targets`], [`demoted_targets`]: members that ranked above
+    /// this owner before it arrived, Known issues 34 and 35); see
+    /// [`granted_prefix`]. The grant's unused credits are dropped, never
+    /// added to the walk's budget, so the walk's credits never grow.
+    pub granted: usize,
 }
 
 /// Attempts granted to one successor probe ([`WalkConfig::successors`]): the
@@ -214,6 +217,57 @@ pub fn lineage_targets<N: Clone>(owners: &[N], since: &[Option<u32>], rank: usiz
         .map(|(n, _)| n.clone())
         .take(MAX_HANDOFF)
         .collect()
+}
+
+/// Lineage targets ranked below the owners (Known issue 34): members of
+/// `demoted` (the ranks just below the owners, best first, see
+/// `topology::Placement::demoted`) that arrived before the owner at `rank`
+/// and were owners when they arrived, so they may still hold a copy fetched
+/// then. `since` covers the owners, `demoted_since` the demoted members.
+///
+/// Rendezvous scores never change, so a member ranked `k` is an owner
+/// whenever fewer than [`MAX_HANDOFF`] of the members ranked above it are
+/// present. It was one when it arrived (generation `s`) if fewer than
+/// [`MAX_HANDOFF`] members above it have an arrival at or before `s`.
+/// Members with an unknown arrival count as present, so an unknown never
+/// adds a target. Members that left since are not seen, which can only
+/// make a member look like it was an owner when it was not: the probe then
+/// misses, costing one granted copy-only exchange.
+pub fn demoted_targets<N: Clone>(
+    since: &[Option<u32>],
+    demoted: &[N],
+    demoted_since: &[Option<u32>],
+    rank: usize,
+) -> Vec<N> {
+    let Some(Some(mine)) = since.get(rank).copied() else {
+        return Vec::new();
+    };
+    let above = |k: usize, arrival: u32| {
+        since
+            .iter()
+            .chain(&demoted_since[..k])
+            .filter(|s| s.is_none_or(|s| s <= arrival))
+            .count()
+    };
+    demoted
+        .iter()
+        .zip(demoted_since)
+        .enumerate()
+        .filter_map(|(k, (n, s))| {
+            let arrival = (*s)?;
+            (arrival < mine && above(k, arrival) < MAX_HANDOFF).then(|| n.clone())
+        })
+        .take(MAX_HANDOFF)
+        .collect()
+}
+
+/// How many leading `handoff` targets are in `granted` (successor and
+/// lineage targets), for [`WalkConfig::granted`]. Callers order the
+/// handoff targets so these come first ([`merge_handoff`],
+/// [`crate::read::successor::with_successors`]); version - 1 targets after
+/// them stay funded from the walk's budget.
+pub fn granted_prefix<N: PartialEq>(handoff: &[N], granted: &[N]) -> usize {
+    handoff.iter().take_while(|n| granted.contains(n)).count()
 }
 
 /// [`lineage_targets`] counts for every canonical owner rank, for
@@ -571,7 +625,7 @@ impl CandidateWalk {
         while let Some(canonical) = self.target(self.index) {
             let index = self.index;
             let handoff = canonical >= self.config.owners;
-            let granted = handoff && canonical - self.config.owners < self.config.successors;
+            let granted = handoff && canonical - self.config.owners < self.config.granted;
             if granted {
                 // A successor probe spends its own grant, never the walk's
                 // credits.

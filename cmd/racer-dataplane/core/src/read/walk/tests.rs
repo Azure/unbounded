@@ -20,7 +20,7 @@ fn config(rank: Option<usize>, owners: usize, order: VisitOrder) -> WalkConfig {
         previous: 0,
         helper: false,
         lineage: [0; MAX_HANDOFF],
-        successors: 0,
+        granted: 0,
     }
 }
 
@@ -1424,7 +1424,7 @@ fn delegated_rank_zero_asks_successors_on_their_own_grant() {
     // after it is not (it would spend the origin credit).
     let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
     cfg.handoff = 2;
-    cfg.successors = 1;
+    cfg.granted = 1;
     let mut walk = CandidateWalk::new(cfg);
     let mut b = budget(1, 1);
     let mut granted = Vec::new();
@@ -1453,7 +1453,7 @@ fn delegated_rank_zero_asks_successors_on_their_own_grant() {
     // A successor's copy ends the walk.
     let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
     cfg.handoff = 1;
-    cfg.successors = 1;
+    cfg.granted = 1;
     let mut walk = CandidateWalk::new(cfg);
     let mut b = budget(1, 1);
     let (probes, end) = drive(&mut walk, &mut b, |_, _| Outcome::Copy);
@@ -1466,7 +1466,7 @@ fn delegated_rank_zero_asks_successors_on_their_own_grant() {
 fn successor_grant_never_grows_the_walk_budget() {
     let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
     cfg.handoff = 2;
-    cfg.successors = 2;
+    cfg.granted = 2;
     let mut walk = CandidateWalk::new(cfg);
     let mut b = budget(1, 10);
     // An unreachable successor is a miss and does not mark this walk's
@@ -1487,7 +1487,7 @@ fn successor_grant_never_grows_the_walk_budget() {
     // Abandoning a pending successor probe drops its grant.
     let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
     cfg.handoff = 1;
-    cfg.successors = 1;
+    cfg.granted = 1;
     let mut walk = CandidateWalk::new(cfg);
     let mut b = budget(2, 3);
     let Step::Probe(probe) = walk.next(&mut b).unwrap() else {
@@ -1504,7 +1504,7 @@ fn successor_grant_never_grows_the_walk_budget() {
 fn owner_above_rank_zero_asks_successors_after_its_delegation() {
     let mut cfg = config(Some(1), 3, VisitOrder::canonical(3));
     cfg.handoff = 1;
-    cfg.successors = 1;
+    cfg.granted = 1;
     let mut walk = CandidateWalk::new(cfg);
     let mut b = budget(3, 8);
     let (probes, end) = drive(&mut walk, &mut b, |p, _| {
@@ -1530,7 +1530,7 @@ fn owner_above_rank_zero_asks_successors_after_its_delegation() {
     );
     // Without successors nothing changes for a non-owner.
     let mut cfg = config(None, 3, VisitOrder::canonical(3));
-    cfg.successors = 1;
+    cfg.granted = 1;
     let mut walk = CandidateWalk::new(cfg);
     let (probes, _) = drive(&mut walk, &mut budget(32, 96), |_, _| {
         Outcome::Probe(ProbeOutcome::CopyMiss)
@@ -1547,7 +1547,7 @@ fn owner_above_rank_zero_asks_successors_after_its_delegation() {
 fn successor_and_lineage_probes_neither_grow_the_budget_nor_withhold_origin() {
     let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
     cfg.handoff = 2;
-    cfg.successors = 1;
+    cfg.granted = 1;
     cfg.lineage = [1, 0, 0];
     let mut walk = CandidateWalk::new(cfg);
     let mut b = budget(4, 32);
@@ -1579,4 +1579,94 @@ fn successor_and_lineage_probes_neither_grow_the_budget_nor_withhold_origin() {
     assert!(matches!(end, End::Origin { rank: 0, .. }), "{end:?}");
     assert!(!walk.rank0_unanswered());
     assert!(b.remaining_attempts() <= start.0 && b.remaining_links() <= start.1);
+}
+
+#[test]
+fn demoted_targets_are_members_that_were_owners_when_they_arrived() {
+    // Owners arrived in generations 5, 6, 7; the members ranked fourth and
+    // fifth arrived in 0 and 1, before any owner: each was an owner then.
+    let since = [Some(5), Some(6), Some(7)];
+    let demoted = ["d3", "d4"];
+    assert_eq!(
+        demoted_targets(&since, &demoted, &[Some(0), Some(1)], 0),
+        ["d3", "d4"]
+    );
+    // Rank 2 is the newest owner: same targets.
+    assert_eq!(
+        demoted_targets(&since, &demoted, &[Some(0), Some(1)], 2),
+        ["d3", "d4"]
+    );
+    // An owner that arrived before a demoted member never displaced it.
+    assert_eq!(
+        demoted_targets(&since, &demoted, &[Some(5), Some(1)], 0),
+        ["d4"]
+    );
+    // Three members ranked above d4 were present when it arrived (owners 1
+    // and 2 at generation 2, d3 at 0): d4 never was an owner.
+    let since = [Some(9), Some(2), Some(2)];
+    assert_eq!(
+        demoted_targets(&since, &demoted, &[Some(0), Some(3)], 0),
+        ["d3"]
+    );
+    // Unknown arrivals never add a target and count as present above.
+    assert!(
+        demoted_targets(&[None, Some(1), Some(1)], &demoted, &[Some(0), Some(0)], 0).is_empty()
+    );
+    assert_eq!(
+        demoted_targets(&[Some(9), None, None], &demoted, &[Some(0), None], 0),
+        ["d3"]
+    );
+    assert_eq!(
+        demoted_targets(&[Some(9), None, None], &demoted, &[Some(0), Some(0)], 0),
+        ["d3"],
+        "d4 had three members above it"
+    );
+    // A cluster whose members arrived together pays nothing.
+    assert!(demoted_targets(&[Some(0); 3], &demoted, &[Some(0); 2], 0).is_empty());
+    // No demoted members or an unknown own arrival: nothing.
+    assert!(demoted_targets::<&str>(&[Some(3); 3], &[], &[], 0).is_empty());
+    assert!(demoted_targets(&[None, Some(3), Some(3)], &demoted, &[Some(0); 2], 0).is_empty());
+}
+
+#[test]
+fn granted_prefix_counts_leading_successor_and_lineage_targets() {
+    assert_eq!(granted_prefix(&["s", "l", "p"], &["s", "l"]), 2);
+    assert_eq!(granted_prefix(&["p", "l"], &["l"]), 0);
+    assert_eq!(granted_prefix::<&str>(&[], &["l"]), 0);
+    let handoff = merge_handoff(vec!["p1", "p2"], vec!["l1", "d3"]);
+    assert_eq!(handoff, ["l1", "d3", "p1"]);
+    assert_eq!(granted_prefix(&handoff, &["l1", "d3"]), 2);
+}
+
+#[test]
+fn delegated_rank_zero_asks_granted_lineage_targets_and_keeps_origin_credit() {
+    // Known issue 35: rank 0 reached by a delegation has one credit. Its two
+    // lineage targets are granted; the version - 1 target after them is
+    // funded from the walk and stops before the origin credit.
+    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
+    cfg.handoff = 3;
+    cfg.granted = 2;
+    let mut walk = CandidateWalk::new(cfg);
+    let mut b = budget(1, 1);
+    let (probes, end) = drive(&mut walk, &mut b, |_, _| {
+        Outcome::Probe(ProbeOutcome::CopyMiss)
+    });
+    assert_eq!(
+        probes.iter().map(|(p, ..)| p.canonical).collect::<Vec<_>>(),
+        [3, 4]
+    );
+    assert!(matches!(end, End::Origin { rank: 0, .. }));
+    assert_eq!((b.remaining_attempts(), b.remaining_links()), (1, 1));
+    // The second target holds the page: copy, no origin.
+    let mut walk = CandidateWalk::new(cfg);
+    let mut b = budget(1, 1);
+    let (probes, end) = drive(&mut walk, &mut b, |p, _| {
+        if p.canonical == 4 {
+            Outcome::Copy
+        } else {
+            Outcome::Probe(ProbeOutcome::CopyMiss)
+        }
+    });
+    assert_eq!(probes.len(), 2);
+    assert_eq!(end, End::Copy);
 }
