@@ -17,6 +17,56 @@
 //! the second walk does not meet the same skips. Budgets never grow, and the
 //! walk under N - 1 must not give this node origin authority:
 //! [`fallback_rank_allowed`] ends it when this node owns the page there.
+//!
+//! A reader that cannot fall back (it joined in N, so it is not a member of
+//! N - 1) waits for the destination to adopt N once instead ([`stale_wait`],
+//! Known issue 26).
+
+use std::time::Duration;
+
+/// Most time one wait for a destination that is behind may take
+/// ([`stale_wait`]).
+pub const MAX_STALE_WAIT: Duration = Duration::from_secs(4);
+
+/// Shortest wait worth making: below this the destination is unlikely to
+/// have adopted the membership, and the read keeps walking instead.
+pub const MIN_STALE_WAIT: Duration = Duration::from_millis(250);
+
+/// Facts about a destination that answered `StaleMembership` because it is
+/// behind this node, for a reader that cannot walk the previous membership.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StaleWaitFacts {
+    /// This node owns the page (owners go on to their own fetch).
+    pub owner: bool,
+    /// [`previous_fallback`] walks the previous membership instead.
+    pub fallback: bool,
+    /// This read already waited for a destination once.
+    pub waited: bool,
+    /// Time left until the read's deadline.
+    pub remaining: Duration,
+}
+
+/// How long a non-owner waits before asking the same destination again,
+/// instead of skipping it, when the destination is behind this node's
+/// membership and the previous membership is no help (Known issue 26).
+///
+/// A reader that joined in membership N is not a member of N - 1, so peers
+/// would reject it there ([`previous_fallback`] refuses), and an owner still
+/// on N - 1 cannot resolve N. Skipping every such owner exhausted the walk
+/// and failed the read, although the owners adopt N within the propagation
+/// window. Waiting a third of the time left (at most [`MAX_STALE_WAIT`],
+/// once per read, never below [`MIN_STALE_WAIT`]) leaves the rest of the
+/// deadline for the remaining owners. The destination's verified
+/// `StaleMembership` returns the credits it was sent
+/// ([`super::budget::AcquisitionBudget::refund_remote`]), so the second ask
+/// costs one exchange and its links, like any probe; budgets never grow.
+pub fn stale_wait(facts: StaleWaitFacts) -> Option<Duration> {
+    if facts.owner || facts.fallback || facts.waited {
+        return None;
+    }
+    let wait = (facts.remaining / 3).min(MAX_STALE_WAIT);
+    (wait >= MIN_STALE_WAIT).then_some(wait)
+}
 
 /// Facts about a walk under membership N whose destination was behind.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -81,6 +131,59 @@ mod tests {
             ..skip()
         }));
         assert!(!previous_fallback(StaleSkip::default()));
+    }
+
+    fn waiting() -> StaleWaitFacts {
+        StaleWaitFacts {
+            remaining: Duration::from_secs(9),
+            ..StaleWaitFacts::default()
+        }
+    }
+
+    #[test]
+    fn a_reader_that_cannot_fall_back_waits_once() {
+        assert_eq!(stale_wait(waiting()), Some(Duration::from_secs(3)));
+        // Capped, and a third of what is left.
+        let long = StaleWaitFacts {
+            remaining: Duration::from_secs(60),
+            ..waiting()
+        };
+        assert_eq!(stale_wait(long), Some(MAX_STALE_WAIT));
+        let short = StaleWaitFacts {
+            remaining: Duration::from_millis(900),
+            ..waiting()
+        };
+        assert_eq!(stale_wait(short), Some(Duration::from_millis(300)));
+    }
+
+    #[test]
+    fn no_wait_for_owners_fallbacks_repeats_or_short_deadlines() {
+        for facts in [
+            StaleWaitFacts {
+                owner: true,
+                ..waiting()
+            },
+            StaleWaitFacts {
+                fallback: true,
+                ..waiting()
+            },
+            StaleWaitFacts {
+                waited: true,
+                ..waiting()
+            },
+            StaleWaitFacts {
+                remaining: Duration::from_millis(749),
+                ..waiting()
+            },
+            StaleWaitFacts::default(),
+        ] {
+            assert_eq!(stale_wait(facts), None, "{facts:?}");
+        }
+        let edge = StaleWaitFacts {
+            remaining: Duration::from_millis(750),
+            ..waiting()
+        };
+        assert_eq!(stale_wait(edge), Some(MIN_STALE_WAIT));
     }
 
     #[test]

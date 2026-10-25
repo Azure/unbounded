@@ -21,6 +21,9 @@ pub struct AcquisitionBudget {
     links: u8,
     charged_links: u16,
     failed_route: bool,
+    /// Attempts sent to destinations as remote credits
+    /// ([`Self::send_remote`]) and not refunded yet.
+    remote_sent: u32,
 }
 impl AcquisitionBudget {
     pub fn new(deadline: Instant, attempts: u32, links: u8) -> Self {
@@ -30,7 +33,38 @@ impl AcquisitionBudget {
             links,
             charged_links: 0,
             failed_route: false,
+            remote_sent: 0,
         }
+    }
+
+    /// Debit `attempts` that one request carries to its destination as
+    /// remote credits. Returns them for the request.
+    pub fn send_remote(&mut self, attempts: u32) -> Result<u32> {
+        self.attempts = self
+            .attempts
+            .checked_sub(attempts)
+            .ok_or(Error::Unavailable)?;
+        self.remote_sent = self.remote_sent.saturating_add(attempts);
+        Ok(attempts)
+    }
+
+    /// Return remote credits that a verified `StaleMembership` answer shows
+    /// were never used: the answering node could not resolve the request's
+    /// membership, so neither it nor the destination behind it acted on the
+    /// request (Known issue 26). Never more than was sent, so a refund
+    /// cannot mint credits; lost or unverified answers are not refunded.
+    pub fn refund_remote(&mut self, attempts: u32) -> Result<()> {
+        let sent = self
+            .remote_sent
+            .checked_sub(attempts)
+            .ok_or(Error::InvalidRequest)?;
+        let available = self
+            .attempts
+            .checked_add(attempts)
+            .ok_or(Error::InvalidRequest)?;
+        self.remote_sent = sent;
+        self.attempts = available;
+        Ok(())
     }
 
     /// Pure budget validation/debit. The driver also checks original cancellation
@@ -130,6 +164,7 @@ impl AcquisitionBudget {
             links,
             charged_links: std::mem::take(&mut self.charged_links),
             failed_route: self.failed_route,
+            remote_sent: std::mem::take(&mut self.remote_sent),
         }
     }
 
@@ -198,6 +233,29 @@ pub fn inherited_budget(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn remote_credits_refund_only_what_was_sent() {
+        let now = Instant::now();
+        let mut budget = AcquisitionBudget::new(now + Duration::from_secs(5), 8, 16);
+        assert_eq!(budget.send_remote(3), Ok(3));
+        assert_eq!(budget.remaining_attempts(), 5);
+        assert_eq!(budget.refund_remote(4), Err(Error::InvalidRequest));
+        assert_eq!(budget.remaining_attempts(), 5);
+        assert_eq!(budget.refund_remote(3), Ok(()));
+        assert_eq!(budget.remaining_attempts(), 8);
+        // Refunded once: never again.
+        assert_eq!(budget.refund_remote(1), Err(Error::InvalidRequest));
+        assert_eq!(budget.send_remote(9), Err(Error::Unavailable));
+        assert_eq!(budget.remaining_attempts(), 8);
+        // A partitioned child refunds into itself, then reunites.
+        let mut child = budget.partition(4, 4).unwrap();
+        assert_eq!(child.send_remote(3), Ok(3));
+        child.refund_remote(2).unwrap();
+        budget.reunite(child).unwrap();
+        assert_eq!(budget.remaining_attempts(), 7);
+        assert_eq!(budget.refund_remote(1), Err(Error::InvalidRequest));
+    }
 
     #[test]
     fn begin_attempt_debits_and_respects_tighter_deadline() {

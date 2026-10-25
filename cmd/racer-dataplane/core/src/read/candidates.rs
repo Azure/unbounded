@@ -83,6 +83,38 @@ pub fn visit_order(
     order
 }
 
+/// Known issue 25: when the owner a non-owner would visit first arrived after
+/// a later owner (`since`, see [`super::walk::lineage_targets`]), visit that
+/// later owner first. Placement is rendezvous hashing, so the later owner
+/// was above the first one before it arrived and may hold a copy fetched
+/// then; asking the newer owner first made it fetch the page from origin
+/// again, and its own copy-only probes of the older owner carry only the
+/// credits and links the reader forwarded (too few to route to a
+/// non-neighbor). The rest of the order is unchanged. Members with equal or
+/// unknown arrival never move, so a cluster whose members arrived together
+/// visits exactly as before.
+pub fn lineage_first(mut order: VisitOrder, since: &[Option<u32>]) -> VisitOrder {
+    let Some(first) = order.get(0) else {
+        return order;
+    };
+    let Some(Some(newest)) = since.get(first).copied() else {
+        return order;
+    };
+    let older = (1..usize::from(order.len)).find(|&i| {
+        let rank = usize::from(order.ranks[i]);
+        rank > first
+            && since
+                .get(rank)
+                .copied()
+                .flatten()
+                .is_some_and(|s| s < newest)
+    });
+    if let Some(i) = older {
+        order.ranks[..=i].rotate_right(1);
+    }
+    order
+}
+
 /// Rendezvous weight of one owner for one requester and page. Stable within a
 /// process; it only spreads load, so it never needs to agree across nodes.
 pub fn replica_score(
@@ -257,6 +289,60 @@ mod tests {
     use super::*;
     use racer_control_wire::CacheId;
     use racer_object_wire::model::CacheKey;
+
+    fn ranks(order: VisitOrder) -> Vec<usize> {
+        order.ranks().collect()
+    }
+
+    #[test]
+    fn lineage_first_visits_an_older_later_owner_first() {
+        let order = |first: usize| {
+            visit_order(
+                ReplicaSelection::Spread,
+                3,
+                |r| r == first,
+                |r| 3 - r as u64,
+            )
+        };
+        assert_eq!(ranks(order(0)), [0, 1, 2]);
+        // Rank 0 arrived after rank 2: visit rank 2 first, then as before.
+        let since = [Some(4), Some(4), Some(1)];
+        assert_eq!(ranks(lineage_first(order(0), &since)), [2, 0, 1]);
+        // The first older one in visit order.
+        let since = [Some(4), Some(2), Some(1)];
+        assert_eq!(ranks(lineage_first(order(0), &since)), [1, 0, 2]);
+        // Visiting rank 1 first: only ranks after it can be older.
+        assert_eq!(ranks(order(1)), [1, 0, 2]);
+        assert_eq!(
+            ranks(lineage_first(order(1), &[Some(0), Some(3), Some(5)])),
+            [1, 0, 2]
+        );
+        assert_eq!(
+            ranks(lineage_first(order(1), &[Some(0), Some(3), Some(1)])),
+            [2, 1, 0]
+        );
+        // Equal, unknown or newer arrivals keep the order.
+        for since in [
+            [Some(0); 3],
+            [None, Some(0), Some(0)],
+            [Some(1), Some(2), None],
+        ] {
+            assert_eq!(ranks(lineage_first(order(0), &since)), [0, 1, 2]);
+        }
+        // Short orders.
+        assert_eq!(
+            ranks(lineage_first(VisitOrder::canonical(1), &[Some(3)])),
+            [0]
+        );
+        assert_eq!(
+            ranks(lineage_first(VisitOrder::canonical(0), &[])),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            ranks(lineage_first(VisitOrder::canonical(2), &[Some(3), Some(1)])),
+            [1, 0]
+        );
+    }
 
     fn object(key: u8) -> ObjectId {
         ObjectId {

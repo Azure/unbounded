@@ -96,6 +96,15 @@ pub struct WalkConfig {
     /// [`HELPER_LINKS`] links from what is left. Owner probes are planned
     /// exactly as without a helper. Ignored for owners and non-pages.
     pub helper: bool,
+    /// Per canonical owner rank, how many lineage targets that owner has
+    /// ([`lineage_targets`]): later owners that arrived before it and so may
+    /// hold a copy fetched before it was an owner (Known issue 25). Funds
+    /// their copy-only probes from slack: a non-owner's out-of-order
+    /// `Acquire` to that owner carries one more credit per target (and per
+    /// rank 0 target, for the owner's delegation to rank 0), and a
+    /// delegation to rank 0 forwards spare credits for rank 0's. Never
+    /// reserved: without slack the walk funds exactly as before.
+    pub lineage: [u8; MAX_HANDOFF],
 }
 
 /// Most previous-membership owners one walk asks (the replica count).
@@ -157,6 +166,70 @@ pub fn handoff_targets<N: PartialEq + Clone>(previous: &[N], current: &[N], rank
         .take(MAX_HANDOFF)
         .cloned()
         .collect()
+}
+
+/// Lineage handoff targets of the owner at `rank` (Known issue 25): later
+/// owners (`k > rank`) that arrived in this node's membership chain before
+/// that owner (`since[k] < since[rank]`, see `topology::Membership::since`).
+///
+/// Placement is rendezvous hashing, so a member ranks below the owner at
+/// `rank` in every membership listing both. Such a later owner could have
+/// held a higher rank, and fetched the page, only while that owner was not
+/// a member yet: a page that moved to a member that joined is still held by
+/// the owner it displaced, however many versions ago that was, while the
+/// version - 1 [`handoff_targets`] see only the last move. Members with
+/// equal or unknown arrival never qualify, so a cluster whose members
+/// arrived together pays nothing. A target can only miss, so it costs one
+/// copy-only probe at most, funded opportunistically like other handoff
+/// probes.
+pub fn lineage_targets<N: Clone>(owners: &[N], since: &[Option<u32>], rank: usize) -> Vec<N> {
+    let Some(Some(mine)) = since.get(rank).copied() else {
+        return Vec::new();
+    };
+    owners
+        .iter()
+        .zip(since)
+        .skip(rank + 1)
+        .filter(|(_, s)| s.is_some_and(|s| s < mine))
+        .map(|(n, _)| n.clone())
+        .take(MAX_HANDOFF)
+        .collect()
+}
+
+/// [`lineage_targets`] counts for every canonical owner rank, for
+/// [`WalkConfig::lineage`].
+pub fn lineage_counts(since: &[Option<u32>]) -> [u8; MAX_HANDOFF] {
+    let mut counts = [0; MAX_HANDOFF];
+    for (rank, count) in counts.iter_mut().enumerate() {
+        if let Some(Some(mine)) = since.get(rank) {
+            *count = since[rank + 1..]
+                .iter()
+                .filter(|s| s.is_some_and(|s| s < *mine))
+                .count()
+                .min(MAX_HANDOFF) as u8;
+        }
+    }
+    counts
+}
+
+/// The handoff targets an owner asks: lineage targets ([`lineage_targets`])
+/// first, then the version - 1 targets ([`handoff_targets`]) not already
+/// listed, at most [`MAX_HANDOFF`]. Lineage targets come first: each was an
+/// owner above this one before it arrived, so it fetched the page if anyone
+/// read it then, while a version - 1 owner that was displaced since may
+/// never have been asked for it.
+pub fn merge_handoff<N: PartialEq + Clone>(previous: Vec<N>, lineage: Vec<N>) -> Vec<N> {
+    let mut targets = lineage;
+    targets.truncate(MAX_HANDOFF);
+    for n in previous {
+        if targets.len() == MAX_HANDOFF {
+            break;
+        }
+        if !targets.contains(&n) {
+            targets.push(n);
+        }
+    }
+    targets
 }
 
 /// One probe the caller must perform.
@@ -396,6 +469,17 @@ impl CandidateWalk {
             .sum()
     }
 
+    /// What every later visit needs to still reach the origin through its
+    /// owner, in order or not ([`owner_funding_min`]): lineage credits
+    /// (Known issue 25) are slack beyond this, so they never cost a later
+    /// owner its visit.
+    fn later_reserve(&self, index: usize) -> u32 {
+        (index + 1..self.count)
+            .filter_map(|later| self.target(later))
+            .map(owner_funding_min)
+            .sum()
+    }
+
     /// Canonical rank (or `owners + i` for handoff target `i`) at `index`.
     fn target(&self, index: usize) -> Option<usize> {
         if self.config.rank.is_some() {
@@ -514,8 +598,15 @@ impl CandidateWalk {
             // none to ask them with (Known issue 13). Forward spare credits,
             // up to one per previous owner: they would otherwise fund this
             // owner's own handoff probes, which only run if rank 0 fails.
-            let spare = if delegated && self.config.handoff > 0 {
-                (budget.remaining_attempts() - (left + 2)).min(MAX_HANDOFF as u32)
+            // Rank 0's own lineage targets (Known issue 25) are funded the
+            // same way.
+            let spare_for = if self.config.handoff > 0 {
+                MAX_HANDOFF as u32
+            } else {
+                u32::from(self.config.lineage[0])
+            };
+            let spare = if delegated && spare_for > 0 {
+                (budget.remaining_attempts() - (left + 2)).min(spare_for)
             } else {
                 0
             };
@@ -569,8 +660,27 @@ impl CandidateWalk {
                 // Prefer the funding that lets the owner delegate to rank 0,
                 // but only from slack: later visits keep the credits they had
                 // before delegation, so the walk's reach does not shrink.
+                // One more credit per lineage target of the destination and,
+                // above rank 0, of rank 0, which the destination delegates
+                // to and forwards spare credits for (Known issue 25); only
+                // from slack as well.
+                let lineage = self
+                    .config
+                    .lineage
+                    .get(canonical)
+                    .map_or(0, |n| u32::from(*n))
+                    + if canonical > 0 {
+                        u32::from(self.config.lineage[0])
+                    } else {
+                        0
+                    };
                 let attempts = if rank.is_some() {
                     owner_attempts
+                } else if lineage > 0
+                    && budget.remaining_attempts()
+                        >= owner_funding(canonical) + lineage + self.later_reserve(index)
+                {
+                    owner_funding(canonical) + lineage
                 } else if budget.remaining_attempts()
                     >= owner_funding(canonical) + self.later_minimum(index)
                 {
@@ -636,6 +746,21 @@ impl CandidateWalk {
     /// for a probe that failed terminally.
     pub fn abandon(&mut self, budget: &mut AcquisitionBudget) -> Result<()> {
         self.done = true;
+        if let Some(Pending {
+            bounded: Some(bounded),
+            ..
+        }) = self.pending.take()
+        {
+            budget.reunite(bounded)?;
+        }
+        Ok(())
+    }
+
+    /// The pending probe's destination is behind this node and the caller
+    /// waits for it ([`super::stale::stale_wait`], Known issue 26): return
+    /// the child credits and plan the same destination again on the next
+    /// [`Self::next`], instead of recording an outcome and moving on.
+    pub fn retry_pending(&mut self, budget: &mut AcquisitionBudget) -> Result<()> {
         if let Some(Pending {
             bounded: Some(bounded),
             ..
@@ -934,7 +1059,8 @@ pub struct AttemptInputs {
 
 /// Reserve the complete permitted route and remote credits before sending.
 /// Lost responses cannot refund an unknown number of forwarded links, and no
-/// retry gets fresh credits. Partitioned remote credits stay spent.
+/// retry gets fresh credits. Remote credits stay spent unless a verified
+/// `StaleMembership` shows they were never used (`AcquisitionBudget::refund_remote`).
 pub fn plan_attempt(budget: &mut AcquisitionBudget, inputs: AttemptInputs) -> Result<AttemptPlan> {
     let links = budget.route_links();
     if links == 0 {
@@ -961,7 +1087,7 @@ pub fn plan_attempt(budget: &mut AcquisitionBudget, inputs: AttemptInputs) -> Re
         } else {
             budget.remaining_attempts().div_ceil(opportunities)
         };
-        budget.partition(credits, 0)?.remaining_attempts()
+        budget.send_remote(credits)?
     } else {
         0
     };

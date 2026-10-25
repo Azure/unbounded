@@ -19,6 +19,7 @@ fn config(rank: Option<usize>, owners: usize, order: VisitOrder) -> WalkConfig {
         handoff: 0,
         previous: 0,
         helper: false,
+        lineage: [0; MAX_HANDOFF],
     }
 }
 
@@ -1248,4 +1249,169 @@ fn only_an_owner_probe_of_rank_zero_timing_out_withholds_origin() {
     remaining.next_probe().unwrap();
     assert_eq!(remaining.complete(&mut b, Outcome::TimedOut), None);
     assert_eq!(remaining.next_probe(), Err(RemainingEnd::Unavailable));
+}
+
+/// Known issue 25: later owners that arrived before an owner are its lineage
+/// targets; equal or unknown arrivals never are.
+#[test]
+fn lineage_targets_are_later_owners_that_arrived_earlier() {
+    let owners = ["a", "b", "c"];
+    // `a` joined in generation 5 above `b` (0) and `c` (3).
+    let since = [Some(5), Some(0), Some(3)];
+    assert_eq!(lineage_targets(&owners, &since, 0), vec!["b", "c"]);
+    // `b` is older than `c`: `c` never ranked above it.
+    assert!(lineage_targets(&owners, &since, 1).is_empty());
+    assert!(lineage_targets(&owners, &since, 2).is_empty());
+    assert_eq!(lineage_counts(&since), [2, 0, 0]);
+    // Members that arrived together (a fresh chain) pay nothing.
+    let together = [Some(0); 3];
+    assert!(lineage_targets(&owners, &together, 0).is_empty());
+    assert_eq!(lineage_counts(&together), [0; 3]);
+    // Unknown arrivals (not ranked in this chain) never qualify.
+    assert!(lineage_targets(&owners, &[None, Some(0), Some(0)], 0).is_empty());
+    assert_eq!(
+        lineage_targets(&owners, &[Some(2), None, Some(1)], 0),
+        vec!["c"]
+    );
+    assert_eq!(lineage_counts(&[Some(2), None, Some(1)]), [1, 0, 0]);
+    // Out of range or short rankings.
+    assert!(lineage_targets(&owners, &since, 3).is_empty());
+    assert_eq!(lineage_targets(&owners[..2], &since[..2], 0), vec!["b"]);
+    assert_eq!(lineage_counts(&since[..1]), [0; 3]);
+    assert_eq!(lineage_counts(&[]), [0; 3]);
+}
+
+#[test]
+fn merge_handoff_keeps_lineage_targets_first_without_duplicates() {
+    assert_eq!(
+        merge_handoff(vec!["x"], vec!["b", "x", "c"]),
+        vec!["b", "x", "c"]
+    );
+    assert_eq!(
+        merge_handoff(vec!["x", "y", "z"], vec!["b"]),
+        vec!["b", "x", "y"]
+    );
+    assert_eq!(merge_handoff(Vec::<&str>::new(), vec!["b"]), vec!["b"]);
+    assert_eq!(merge_handoff(vec!["x", "y"], Vec::new()), vec!["x", "y"]);
+    assert_eq!(
+        merge_handoff(vec!["x", "y"], vec!["b", "c"]),
+        vec!["b", "c", "x"]
+    );
+    assert!(merge_handoff(Vec::<&str>::new(), Vec::new()).is_empty());
+}
+
+/// Known issue 25: a delegation to rank 0 forwards spare credits for rank 0's
+/// lineage targets even when this owner has no handoff targets of its own;
+/// never the owner's own origin credit.
+#[test]
+fn delegation_forwards_spare_credits_for_rank_zero_lineage() {
+    for (lineage, attempts, child) in [(0, 8, 2), (1, 3, 2), (1, 4, 3), (2, 8, 4), (2, 4, 3)] {
+        let mut cfg = config(Some(1), 3, VisitOrder::canonical(3));
+        cfg.lineage = [lineage, 0, 0];
+        let mut walk = CandidateWalk::new(cfg);
+        let mut b = budget(attempts, 16);
+        let Step::Probe(probe) = walk.next(&mut b).unwrap() else {
+            panic!("expected a probe");
+        };
+        assert_eq!(probe.mode, Mode::Acquire);
+        assert_eq!(
+            walk.request_budget(&mut b).remaining_attempts(),
+            child,
+            "lineage {lineage} attempts {attempts}"
+        );
+        assert!(b.remaining_attempts() >= 1);
+        assert_eq!(b.remaining_attempts() + child, attempts);
+    }
+}
+
+/// Known issue 25: a non-owner's out-of-order Acquire carries one more
+/// credit per lineage target of the destination and of rank 0, only from
+/// slack.
+#[test]
+fn non_owner_funds_destination_lineage_from_slack_only() {
+    let order = visit_order(ReplicaSelection::Spread, 3, |r| r != 0, |r| 3 - r as u64);
+    assert_eq!(order.ranks().collect::<Vec<_>>(), [1, 2, 0]);
+    let first = |attempts: u32, lineage: [u8; 3]| {
+        let mut cfg = config(None, 3, order);
+        cfg.lineage = lineage;
+        let mut walk = CandidateWalk::new(cfg);
+        let mut b = budget(attempts, 16);
+        let Step::Probe(p) = walk.next(&mut b).unwrap() else {
+            panic!("expected a probe");
+        };
+        (
+            p.canonical,
+            walk.request_budget(&mut b).remaining_attempts(),
+        )
+    };
+    // Plenty of slack: rank 1 gets its funding plus its one target.
+    assert_eq!(first(32, [0, 1, 0]), (1, owner_funding(1) + 1));
+    // And for rank 0's, which rank 1 forwards when it delegates.
+    assert_eq!(first(32, [2, 0, 1]), (1, owner_funding(1) + 2));
+    assert_eq!(first(32, [1, 1, 0]), (1, owner_funding(1) + 2));
+    // Not for another later rank's targets.
+    assert_eq!(first(32, [0, 0, 1]), (1, owner_funding(1)));
+    // Without slack for the extra credit, funding is as before: the later
+    // visits of ranks 2 and 0 keep `owner_funding_min` each (4 + 2).
+    assert_eq!(
+        owner_funding(1) + 1 + owner_funding_min(2) + owner_funding_min(0),
+        11
+    );
+    assert_eq!(first(11, [0, 1, 0]), (1, owner_funding(1) + 1));
+    assert_eq!(first(10, [0, 1, 0]), (1, owner_funding(1)));
+    assert_eq!(first(8, [0, 1, 0]), (1, owner_funding(1)));
+    assert_eq!(first(8, [0, 0, 0]), (1, owner_funding(1)));
+}
+
+/// Known issue 26: a reader waiting for a destination that is behind asks
+/// the same destination again, with the credits its verified
+/// `StaleMembership` returned, and then walks on as before.
+#[test]
+fn retry_pending_plans_the_same_destination_again() {
+    let order = visit_order(ReplicaSelection::Spread, 3, |r| r != 0, |r| 3 - r as u64);
+    let mut walk = CandidateWalk::new(config(None, 3, order));
+    let mut b = budget(8, 16);
+    let Step::Probe(first) = walk.next(&mut b).unwrap() else {
+        panic!("expected a probe");
+    };
+    assert_eq!(first.canonical, 1);
+    let request = walk.request_budget(&mut b);
+    let plan = |request: &mut AcquisitionBudget, mode| {
+        plan_attempt(
+            request,
+            AttemptInputs {
+                now: Instant::now(),
+                caller_deadline: Instant::now() + Duration::from_secs(30),
+                attempt_timeout: Duration::from_secs(2),
+                remaining_opportunities: 3,
+                mode,
+                route: RouteMode::FundedRoute,
+                failure_links: 8,
+            },
+        )
+        .unwrap()
+    };
+    let sent = plan(request, first.mode).remote_attempts;
+    assert_eq!(sent, owner_funding(1) - 1);
+    // The destination was behind: its credits come back, the exchange not.
+    request.refund_remote(sent).unwrap();
+    walk.retry_pending(&mut b).unwrap();
+    assert_eq!(b.remaining_attempts(), 7);
+    let Step::Probe(again) = walk.next(&mut b).unwrap() else {
+        panic!("expected a probe");
+    };
+    assert_eq!(
+        (again.index, again.canonical),
+        (first.index, first.canonical)
+    );
+    assert_eq!(
+        walk.request_budget(&mut b).remaining_attempts(),
+        owner_funding_min(1)
+    );
+    // Then the walk goes on as usual.
+    walk.complete(&mut b, Outcome::StaleDestination).unwrap();
+    let Step::Probe(next) = walk.next(&mut b).unwrap() else {
+        panic!("expected a probe");
+    };
+    assert_eq!(next.canonical, 2);
 }
