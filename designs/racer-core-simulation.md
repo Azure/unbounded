@@ -800,7 +800,17 @@ Verified against the code at the start of this work.
    answered ping. A ping is a single small exchange, but it takes a relay reservation on every
    relay it crosses. Sharing an answered ping across the workers of a node, or skipping the
    ping when rank 0 answered this node anything recently, would cut most of them. Open (round
-   4, hang2, wave 6).
+   4, hang2, wave 6). Resolved with a bound: any answer from a peer now quiets it for `quiet`
+   as an answered ping does (it used to forget the peer), so a sender pings a busy peer at most
+   once per `quiet`; but temporary instrumentation showed the pings are almost all first pings
+   of distinct (prober, rank 0) pairs, and 99.6% reach a peer that is acquiring the pinged page,
+   so the cut is small (37,990 to 37,382 pings). The rest is the price of finding hung peers:
+   without owners' pings 50 hung members fail 81 reads instead of 3, without readers' 28. A
+   ping follows a probe timeout (at most one each), two unanswered exchanges over a last link,
+   or a silent peer's recheck, is one bodyless exchange on its own grant, and runs only while
+   probes time out (no pings in any run without probe timeouts); asserted in
+   `owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch`. See "Round 4: busy (wave 7)"
+   (round 4, busy, wave 7, 0ffe977e6, cacc52c4c).
 
 54. A reader whose probe of a busy rank 0 timed out returns to rank 0 first once rank 0 answers
    the ping. Keeping it demoted until rank 0 answers the reader itself (measured) failed 28 to
@@ -809,7 +819,15 @@ Verified against the code at the start of this work.
    origin requests (mostly the relay-signed `Overloaded` class of Known issue 42) and, without
    the ping, failed 24 reads instead of 3 with 50 of 5,000 members hung. Not adopted; a reader
    that could tell a joined wait from an empty one (rank 0 answering "fetching" at once) would
-   get both. Open (round 4, hang2, wave 6).
+   get both. Open (round 4, hang2, wave 6). Resolved: the failed reads were not caused by the
+   ping. Traced (all 27 failed reads of seed 1): rank 0 itself shed the reader (a hot page's
+   signed `Overloaded`), the reader's overflow helper could not reach rank 0 with the links it
+   inherited, the reader had no credits left for ranks 1 and 2, and each of the four tries
+   repeated the same walk (`Spread` is deterministic). An owner that itself sheds a reader is
+   now busy for `quiet`: the reader's next walks visit it after the other owners
+   (`Silence::shed`), without a ping. 5k `zipf` at 16 MiB pages: failed reads 29 to 0 (seed 2:
+   25 to 2), overlapping origin requests 120 to 131 (137 to 113), origin requests unchanged.
+   See "Round 4: busy (wave 7)" (round 4, busy, wave 7, 0ffe977e6).
 
 55. After the probes change, 50k `full-failover` (seed 1) has more `copy_held` repeats (578 to
    626: `held` `unasked` 87 to 112, `unreachable` 488 to 514) and one page fetched 8 times (worst
@@ -866,6 +884,17 @@ Verified against the code at the start of this work.
    reader instead of failing it: 5k `full-failover` origin +17 to +30 requests, `copy_held`
    repeats 58/67/55 to 67/76/72 and worst page 5 to 6 (seeds 1, 2), for 4 to 15 fewer failed
    reads. Open (round 4, budget, wave 7).
+521. A non-owner reader's overflow helper probe (`Walk::helper_probe`,
+   `core/src/read/walk.rs:597`) is funded with up to `HELPER_ATTEMPTS` (4) attempts and
+   `HELPER_LINKS` (8) links from what the reader has left after rank 0 sheds it, which is often
+   everything (4 attempts after the shed in 5k `zipf` at 16 MiB pages). A helper whose route to
+   rank 0 needs more links than reach it (traced: 2 links left at the helper, route search
+   `Unreachable`) fails at once, and the reader then has no credits for ranks 1 and 2
+   (`Unfunded`), so its walk ends without asking them. Before Known issue 54's fix every
+   retry repeated this; now the retry visits ranks 1 and 2 first, so reads no longer fail, but
+   the helper probe is still wasted: 197 of 2,446 helper probes miss in that run (seed 1).
+   Funding the helper only from slack beyond what the next owner needs, or skipping a helper
+   whose route cannot be funded, would fix it. Open (round 4, busy, wave 7).
 
 ## Simulator engine (racer-sim substrate)
 
@@ -1400,11 +1429,13 @@ scenarios carry data-plane faults.
    need the holder reachable (classified `orphan_why`) (round 4, offer2, wave 6).
 52. Resolved: an owner whose own origin request failed leaves retries after rank 0's failures
    to rank 0 for `hang_after`; one request per reader retry remains (round 4, offer2, wave 6).
-53. Silence pings add peer messages when many probes time out on busy owners (5k `zipf` at 16
-   MiB: +22%, outcomes unchanged) (round 4, hang2, wave 6).
-54. A reader returns to a busy rank 0 once it answers the reader's ping; keeping it demoted
-   failed fewer reads in 5k `zipf` at 16 MiB but overlapped more origin requests (round 4,
-   hang2, wave 6).
+53. Resolved with a bound: silence pings under many probe timeouts (5k `zipf` at 16 MiB:
+   +22% messages); any answer now quiets a peer for `quiet`, and each ping follows a probe
+   timeout, two last-link timeouts or a recheck; the rest finds hung peers (round 4, busy,
+   wave 7).
+54. Resolved: the failed reads were shed walks repeated on retry; an owner that sheds a
+   reader is visited after the other owners for `quiet` (5k `zipf` at 16 MiB: failed 29 to 0,
+   overlap unchanged) (round 4, busy, wave 7).
 55. 50k `full-failover` `copy_held` 578 to 626 and worst page 6 to 8 after the probes change;
    5k worst pages 7 and 8 after the ctl3 merge are origin failure retries (issue 52 class);
    with offer2 5k worst pages 5, 50k worst page 7 and `copy_held` 527 (round 4, probes, wave 6).
@@ -1418,6 +1449,9 @@ scenarios carry data-plane faults.
    Open (round 4, offer2, wave 6).
 511. Funded short in-order owners fetch after rank 0 failed the reader: 5k `full-failover`
    origin +17 to +30, worst page 5 to 6, 4 to 15 fewer failed reads (round 4, budget, wave 7).
+521. A reader's overflow helper probe takes every attempt the reader has left (up to
+   `HELPER_ATTEMPTS`), so when the helper fails (here: its route to rank 0 has 2 links) the
+   reader cannot ask ranks 1 and 2 (round 4, busy, wave 7).
 
 ## Round 2: production admission
 
@@ -6324,3 +6358,147 @@ than once; overlapping (`concurrent`) origin requests where relevant.
 - New Known issue 511: the in-order funding trades 17 to 30 extra origin requests and a few
   more `copy_held` repeats in 5k `full-failover` for 4 to 15 fewer failed reads; funded owners
   fetch after rank 0 failed where they previously failed the reader.
+
+## Round 4: busy (wave 7)
+
+Scope: Known issues 53 (silence pings add peer messages when many probes time out on busy
+owners) and 54 (a reader returns to a busy rank 0 once it answers the ping). Branch
+`racer-sim9-busy` from racer-core-sim 985006526. Logs, configurations and binaries:
+`/tmp/opencode/r9-busy/` (`Z16.json` and `hang.json` are the wave 5 configurations in
+`/tmp/opencode/m7/`; `b-*.json` are the wave 6 binary's runs). Line numbers are at cacc52c4c.
+
+### Issue 54: root cause
+
+Hang2 measured that keeping a timed-out rank 0 demoted failed fewer reads, and read it as "the
+reader returns to a busy rank 0 after the ping". A trace of every failed read in 5k `zipf` at 16
+MiB pages (seed 1, `RACER_SIM_TRACE_FAILED`, 29 failed reads before the change) shows none of
+them involves a timeout or a ping. All follow one walk, four times:
+
+1. The reader's first probe goes to rank 0, which sheds it: a hot page's owner already streaming
+   `hot_page_bodies` bodies signs `Overloaded` (`Outcome::Shed`), leaving the reader 4 attempts
+   and 12 links.
+2. The reader asks the page's overflow helper (Known issue 16) with everything it has left:
+   `Walk::helper_probe` (`core/src/read/walk.rs:597`) takes up to `HELPER_ATTEMPTS` (4)
+   attempts and `HELPER_LINKS` (8) links, so the reader keeps 0 attempts and 4 links.
+3. The helper's own walk reaches rank 0 with 2 links; the route search finds no route within
+   them and the probe fails at once (`Unreachable(Route)`, temporary trace in `fail_hop`). Its
+   other owners are `Unfunded`, so it answers `Unavailable`.
+4. The reader cannot fund ranks 1 and 2 and the attempt ends. The retry builds the same walk
+   (`Spread` is deterministic per requester and page, and the helper is chosen by a hash of the
+   requester), so it is shed and fails the same way until the read gives up.
+
+Rank 0's shed was an answer, so nothing demoted rank 0: the shed answer cleared the reader's
+silence entry. Hang2's experiment (keep rank 0 demoted after a timeout until it answers the
+reader) helped only because it happened to push some of these readers to rank 1 first.
+
+### Issue 53: root cause
+
+Temporary counters (not committed) in the same run: 37,990 pings, 18,412 from owners above rank
+0 whose probe of rank 0 timed out, 14,910 from readers whose probe of rank 0 timed out, 4,014
+from last-link senders after two unanswered exchanges. Of the pings rank 0 or another peer
+received, 99.6% reached a peer that was acquiring the pinged page (35,365 at the page's rank 0,
+1,557 elsewhere, 136 idle): the timed-out probes had joined real work. Nearly all pings are the
+first for their (prober, peer) pair; each pair pings at most once per `quiet` after an answered
+ping already. Two smaller causes were found:
+
+- `Silence::answered` removed the peer's entry, so a busy peer that answered one exchange and
+  left the next unanswered was pinged again at once, not after `quiet`.
+- Production did not note rank 0's own `Overloaded` (`Shed`) or `Unavailable` (`Failed`)
+  answers as answers (`src/read/candidates.rs`, the two match arms before the generic `Ok`
+  arm); the simulator did.
+
+Measured alternatives, each with a temporary knob: no pings for owners' rank 0 timeouts cut
+messages 470,202 to 426,663 but failed 81 reads instead of 3 with 50 hung members; no pings for
+readers' rank 0 timeouts cut messages to 442,590 but failed 28 instead of 3, and overlapped 185
+origin requests in `zipf` at 16 MiB instead of 136. A ping is the only signal that tells a busy
+peer from a hung one before the read deadline: a hung peer answers nothing, and the joined
+request of a busy one ends unanswered too.
+
+### Fix
+
+- Busy evidence (issue 54): `Silence::shed` (`core/src/peer/silence.rs:226`). A peer that itself
+  sheds an exchange of this node is alive (it answered, so any silence verdict and outstanding
+  ping are cleared) and busy until `quiet` (half a request timeout) passes or it answers
+  anything else. `Silence::unanswered` (`:349`) includes busy peers, so a reader's visit order
+  (`demote_unanswered`) puts it after the page's other owners; it is never pinged or silent for
+  a shed. Production: `LinkHealth::silence_shed` (`src/topology.rs:131`), called from the
+  `Shed` arm of `resolve_epoch_traced` (`src/read/candidates.rs:1441`); the simulator calls
+  `Silence::shed` for a shed answer the destination signed (`sim/src/node/world.rs:4213`).
+- Answers quiet a peer (issue 53): `Silence::answered(peer, now)` (`:332`) keeps an existing
+  entry and sets it as an answered ping does (no timeouts, not silent, no ping for `quiet`);
+  it creates no entry for an untracked peer. A peer that hangs right after answering is pinged
+  at most `quiet` later, the bound an answered ping already had.
+- Production notes rank 0's own `Failed` answer as an answer (`src/read/candidates.rs:1455`).
+- Simulator: knob `node.shed_busy` (default on; 0 measures without the shed rule), counter
+  `shed_repeats` (a page request shed by the same owner within half a request timeout, from the
+  last 8 sheds per node).
+
+Origin authority rules and budgets are unchanged: the rule only reorders a reader's visit of the
+page's owners. No wire change.
+
+### The bound (issue 53)
+
+A ping is sent only (a) after a probe of the page's rank 0 timed out, at most one per timeout,
+(b) after `LINK_TIMEOUTS` (2) unanswered exchanges over a last link, or (c) to recheck a silent
+peer every `hold`; and at most once per (sender, peer) per `quiet` after any answer. Each ping is
+one bodyless exchange (`FetchMode::Ping`, answered `Miss` at once) on its own grant
+(`NOTICE_LINKS` links, no attempts), never a reader's budget. So pings <= probe timeouts + last
+link timeouts / 2 + rechecks; asserted in
+`contention_scenarios::owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch`. In 5k `zipf`
+at 16 MiB pages, 37,382 pings against 60,757 probe timeouts and 60,171 last-link timeouts. Runs
+without probe timeouts send no pings (storm, default `zipf`, churn, full-cold-start, full-churn,
+full-failover seeds 1 and 3); the +22% messages appear only in a configuration where probes
+time out about 1.6 times per read. Resolved with that bound: removing either class of rank 0
+pings fails 9 to 27 times more reads with hung members (above).
+
+### Tests
+
+- racer-core `peer::silence::tests`:
+  `a_peer_that_answered_recently_is_not_pinged_for_the_quiet_time` (an answer sets `quiet`, a
+  later hang is pinged once it passes, an answer never shortens it),
+  `a_peer_that_shed_this_node_is_busy_for_the_quiet_time` (demoted, never pinged or silent,
+  ends after `quiet` or on another answer, a ping answer does not end it, a shed clears a
+  silent verdict and voids an outstanding ping, bounded), and the existing tests updated for
+  `answered(peer, now)`.
+- Production `read::tests::timeouts::reader_visits_an_owner_that_shed_it_after_the_others`: an
+  owner that sheds a reader is `Unanswered`, not silent, has no ping due, is visited last by the
+  next walk, regains its place when it answers, and after `quiet` without an answer. Fails
+  without the fix (checked by replacing `silence_shed` with `silence_answered`).
+- racer-sim `contention_scenarios::readers_do_not_return_first_to_an_owner_that_shed_them`: 512
+  readers storm one page twice; `shed_repeats` 153 without the rule, 11 with it; no silence
+  marks; one origin request.
+- `hot_page_readers_fan_out_through_helpers` now measures fan-out against an owners-only
+  baseline with `shed_busy` off: with the rule, owners whose flight is full shed readers whose
+  retries then visit the other owners first, and that alone completes all 513 reads of its
+  storm (the test asserted the baseline fails reads).
+
+### Evidence
+
+Release, seed 1 unless noted, 5k, configurations as in "Round 4: combined (wave 6)". Before:
+the wave 6 merge (`/tmp/opencode/m8/`; seed 2 rows `b-*` in `/tmp/opencode/r9-busy/`). Reads ok
+/ failed; origin requests, worst page, pages fetched more than once; overlapping
+(`concurrent`); peer messages; pings.
+
+| Run | Wave 6 | Busy |
+| --- | --- | --- |
+| 5k storm | 378,544 / 0; 1,024, 1, 0; 0; 797,657; 0 | 378,536 / 0; 1,024, 1, 0; 0; 797,861; 0 |
+| 5k zipf | 202,851 / 15; 40,404, 3, 1,452; 1,245; 758,332; 0 | same trace |
+| 5k churn | 291,482 / 93; 1,026, 2, 2; 0; 632,207; 0 | 291,476 / 93; 1,025, 2, 1; 0; 631,955; 0 |
+| 5k zipf 16 MiB | 37,639 / 29; 17,826, 3, 134; 120; 470,202; 37,990 | 37,647 / 0; 17,822, 3, 136; 131; 469,250; 37,382 |
+| 5k zipf 16 MiB seed 2 | 37,828 / 25; 17,551, 3, 146; 137; 463,718; 37,277 | 37,905 / 2; 17,521, 3, 116; 113; 462,589; 36,629 |
+| 5k zipf, 50 hung | 30,634 / 3; 11,843, 2, 24; 0; 105,757; 2,012 | 30,641 / 4; 11,853, 2, 27; 0; 105,765; 1,999 |
+| 5k zipf, 50 hung, seed 2 | 30,234 / 1 (hang2) | 30,233 / 1; 11,414, 2, 30; 0; 103,857; 1,864 |
+| 5k 1 Gbit/s storm | 95,107 / 0; 6,941, 2, 2 | 95,107 / 0; 6,942, 2, 2; 2 pings |
+| 5k full-cold-start | 95,107 / 0; 6,942, 2, 2 | same trace |
+| 5k full-failover (seeds 1, 2, 3) | 33,976 / 32; 33,747 / 23; 33,594 / 29 | same traces |
+| 5k full-churn | 34,073 / 0; 12,637, 4, 90 | same trace |
+
+- 5k `zipf` at 16 MiB: `shed_repeats` 157 to 2 (measured with `shed_busy` 0 and 1 on the same
+  binary), helper misses 303 to 197; the issue 31 overlap stays ~130 (120 to 131, seed 2 137 to
+  113) and origin ~17.8k. The 2 failures left at seed 2 were not traced.
+- 50 hung members: 3 to 4 failed reads (seed 2: 1 to 1); no sheds in that run, so the change
+  there is the answered-quiet rule's timing; within noise of the wave 6 runs (hang2: 3 and 1).
+- The storm run completes 8 fewer reads with none failed (ok plus failed 378,544 to 378,536):
+  reads still in flight at the end of the run; not traced further.
+- 16-scenario smoke at 200 nodes, 1 s: trace hashes equal the wave 6 merge except `storm`; no
+  invariant failure, `unexplained` 0.
