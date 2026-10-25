@@ -3354,6 +3354,8 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::DiagnosticHardware => "racer_diagnostic_hardware_total",
             Self::GpuDirectDiskRead => "racer_gpu_direct_disk_reads_total",
             Self::GpuDirectDiskReadBytes => "racer_gpu_direct_disk_read_bytes_total",
+            Self::SuccessorHint => "racer_successor_hints_total",
+            Self::SuccessorDeferral => "racer_successor_deferrals_total",
 }
 metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::WarmTrackedJobs => "racer_warm_tracked_jobs",

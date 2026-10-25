@@ -80,7 +80,14 @@ pub struct Coordinator {
     pub(super) credentials: Rc<CredentialCrypto>,
 
     availability: Rc<crate::control::Availability>,
+
+    /// Owners this node answered a page probe without a copy, by page
+    /// (Known issue 21; see `racer_core::read::successor`).
+    successors: std::cell::RefCell<Successors>,
 }
+
+type Successors =
+    racer_core::read::successor::SuccessorHints<crate::model::PageId, racer_control_wire::NodeId>;
 
 /// Metadata/bootstrap allowance. Normal pinned client ranges admit bounded page
 /// acquisitions separately; this is not a ceiling on successful pages delivered.
@@ -128,6 +135,110 @@ impl Coordinator {
             streams,
             credentials,
             availability,
+            successors: std::cell::RefCell::new(Successors::new(
+                racer_core::read::successor::HINT_CAPACITY,
+                racer_core::read::successor::HINT_TTL,
+            )),
+        }
+    }
+
+    /// The page's ranked owners under `membership`, or `None` when ranking
+    /// fails (successor hints are best effort).
+    async fn page_owners(
+        &self,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        page: &crate::model::PageId,
+        scope: &RequestScope,
+    ) -> Option<Vec<racer_control_wire::NodeId>> {
+        let mut owners = self
+            .fill
+            .dependencies
+            .candidates
+            .candidates_scoped(membership, &page.version.object, page.number, scope)
+            .await
+            .ok()?
+            .ordered;
+        owners.truncate(3);
+        Some(owners)
+    }
+
+    /// This node answered `requester`'s page probe without a copy: when both
+    /// own the page, remember that `requester` is likely to fetch it itself.
+    async fn note_successor(
+        &self,
+        page: &crate::model::PageId,
+        requester: &racer_control_wire::NodeId,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        scope: &RequestScope,
+    ) {
+        let local = &self.fill.dependencies.candidates.node;
+        if local == requester {
+            return;
+        }
+        let Some(owners) = self.page_owners(membership, page, scope).await else {
+            return;
+        };
+        if racer_core::read::successor::should_note(local, requester, &owners) {
+            self.successors.borrow_mut().note(
+                page.clone(),
+                requester.clone(),
+                uring_runtime::environment::now(),
+            );
+            self.fill
+                .metrics
+                .record(crate::telemetry::Event::SuccessorHint, 1);
+        }
+    }
+
+    /// Whether to answer a non-owner's page `Acquire` with `Miss` because
+    /// another owner fetched the page after this node answered it without a
+    /// copy (Known issue 21). Free when no hint names the page.
+    async fn defer_to_successor(
+        &self,
+        page: &crate::model::PageId,
+        requester: &racer_control_wire::NodeId,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        scope: &RequestScope,
+    ) -> bool {
+        use racer_core::read::successor::{MAX_DEFERRALS, successor_deferral};
+        let hints = self
+            .successors
+            .borrow()
+            .peek(page, uring_runtime::environment::now());
+        if hints.is_empty() {
+            return false;
+        }
+        let Some(owners) = self.page_owners(membership, page, scope).await else {
+            return false;
+        };
+        if successor_deferral(hints, requester, &owners).is_none() {
+            return false;
+        }
+        self.successors.borrow_mut().charge(page, MAX_DEFERRALS);
+        self.fill
+            .metrics
+            .record(crate::telemetry::Event::SuccessorDeferral, 1);
+        true
+    }
+
+    /// Serve a page copy-only: a local copy or `Miss`, never acquisition.
+    async fn serve_page_copy(
+        &self,
+        page: &crate::model::PageId,
+        scope: &RequestScope,
+    ) -> Result<PeerResponse> {
+        match self.fill.copy_only(page, scope).await? {
+            Some((metadata, ciphertext)) => {
+                metadata.immutable().validate_page(ciphertext.envelope())?;
+                if &ciphertext.envelope().page != page {
+                    return Err(Error::CorruptRecord);
+                }
+                Ok(PeerResponse::Page {
+                    metadata,
+                    ciphertext,
+                })
+            }
+            None => Ok(PeerResponse::Miss),
         }
     }
 
@@ -344,6 +455,29 @@ impl LocalPageService for Coordinator {
                 request.route.deadline.0,
             );
             effective.check()?;
+            // A non-owner's Acquire for a page another owner fetched after
+            // this node answered it without a copy is served copy-only: the
+            // reader asks that owner next instead of this node fetching the
+            // page again (Known issue 21).
+            if let PeerOperation::Page {
+                page,
+                mode: FetchMode::Acquire,
+            } = &request.operation
+                && self
+                    .defer_to_successor(page, &requester, membership.clone(), &effective)
+                    .await
+            {
+                return self.serve_page_copy(page, &effective).await;
+            }
+            // Answers to a page probe without a copy are noted below.
+            let noted = match &request.operation {
+                PeerOperation::Page { page, mode } => {
+                    Some((page.clone(), matches!(mode, FetchMode::CopyOnly)))
+                }
+                _ => None,
+            };
+            let noted_membership = membership.clone();
+            let noted_requester = requester.clone();
             // Copy-only never opens credentials and never invokes acquisition.
             // The ingress lease is still retained while serving those bytes.
             let result = match request.operation {
@@ -361,23 +495,7 @@ impl LocalPageService for Coordinator {
                 PeerOperation::Page {
                     page,
                     mode: FetchMode::CopyOnly,
-                } => self
-                    .fill
-                    .copy_only(&page, &effective)
-                    .await
-                    .and_then(|copy| match copy {
-                        Some((metadata, ciphertext)) => {
-                            metadata.immutable().validate_page(ciphertext.envelope())?;
-                            if ciphertext.envelope().page != page {
-                                return Err(Error::CorruptRecord);
-                            }
-                            Ok(PeerResponse::Page {
-                                metadata,
-                                ciphertext,
-                            })
-                        }
-                        None => Ok(PeerResponse::Miss),
-                    }),
+                } => self.serve_page_copy(&page, &effective).await,
                 PeerOperation::Metadata {
                     object,
                     selector,
@@ -477,6 +595,17 @@ impl LocalPageService for Coordinator {
                     }
                 }
             };
+            if let Some((page, copy_only)) = noted {
+                let missed = match &result {
+                    Ok(PeerResponse::Miss) => copy_only,
+                    Err(_) => !copy_only,
+                    Ok(_) => false,
+                };
+                if missed {
+                    self.note_successor(&page, &noted_requester, noted_membership, &effective)
+                        .await;
+                }
+            }
             match result {
                 Ok(response) => Ok(response),
                 Err(error) => {
