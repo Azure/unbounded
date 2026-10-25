@@ -835,7 +835,7 @@ Verified against the code at the start of this work.
    owner has no attempt left to wait or to fetch, so it answers `Unavailable`. Open (round 4,
    ctl3, wave 6).
 
-431. 50k `full-failover` failed reads rose with the offer2 changes: 266, 243, 265 to 343, 298,
+58. 50k `full-failover` failed reads rose with the offer2 changes: 266, 243, 265 to 343, 298,
    338 (seeds 1 to 3), a regression, not variance. Root cause: issue 51's offers to rank 1 make
    rank 1 defer readers to the offer's sender (`note_offer` adds the sender to an existing
    hint, which `peek` defers to). A reader reaches rank 1 when rank 0 failed it, often because
@@ -1397,7 +1397,7 @@ scenarios carry data-plane faults.
    wave 6).
 57. Owners with too little inherited budget fail when their rank 0 is behind on membership (4
    reads at 50k `full-cold-start`) (round 4, ctl3, wave 6).
-431. 50k `full-failover` failed reads about 258 to 326 after offer2 (seeds 1 to 3): rank 1
+58. 50k `full-failover` failed reads about 258 to 326 after offer2 (seeds 1 to 3): rank 1
    defers readers to issue 51's offer senders, often down; the direct fix fails DST seed 11.
    Open (round 4, offer2, wave 6).
 
@@ -6007,7 +6007,7 @@ worst page, pages fetched more than once. Orphans: all orphan repeats.
 - 50k `full-failover`: orphan repeats 189 to 130 (`unreachable` 92, `pending` 29, `noted` 9,
   `other` 0), `copy_held` 578 to 560, `failed` skips 1,062 to 1,023, offers 4,303 to 6,900 (cut
   2,064; offer partition link failures 1,869 of 24,252). Failed reads rose 266 to 343 (Known
-  issue 431). Wall 29:14, peak RSS 3.1 GiB (wave 5: 28:55, 3.1 GiB). `unexplained` 0, no hard
+  issue 58). Wall 29:14, peak RSS 3.1 GiB (wave 5: 28:55, 3.1 GiB). `unexplained` 0, no hard
   failure.
 - All 16 scenarios at 200 nodes, 1 s pass with no hard failure or violation; `cargo fmt
   --check`, `clippy -D warnings` (workspace, all targets) and the workspace tests pass; DST
@@ -6022,10 +6022,10 @@ worst page, pages fetched more than once. Orphans: all orphan repeats.
 - Issue 50's reduction is small (7%); the remaining offer link failures are bounded and on cut
   links only. Issue 51's rank 1 offers raise offers by about 45% (no bodies) and add offer link
   failures across partitions, which cut groups partly absorb.
-- New Known issue 431: 50k `full-failover` failed reads 266 to 343 (seed 1). A regression
+- New Known issue 58: 50k `full-failover` failed reads 266 to 343 (seed 1). A regression
   from rank 1 deferring readers to offer senders, open; see the follow-up below.
 
-### Known issue 431 follow-up
+### Known issue 58 follow-up
 
 50k `full-failover` (`/tmp/opencode/m4b/rr.json`), wave 5 base binary (5d1ea912b) against
 offer2 (c2ca119c7), one run per cell. Columns: ok / failed reads; origin requests, worst page,
