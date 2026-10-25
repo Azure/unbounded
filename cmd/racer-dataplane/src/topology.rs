@@ -398,6 +398,22 @@ impl Placement {
             .map(|ranked| candidates(membership, ranked))
     }
 
+    /// Cache-only: members ranked just below the page's owners, best first,
+    /// from a complete cached ranking (Known issue 34). Never ranks.
+    pub fn demoted(
+        &self,
+        membership: &Membership,
+        object: &ObjectId,
+        page: PageNumber,
+    ) -> Vec<NodeId> {
+        self.inner
+            .demoted(&membership.inner, &encoded_key(object, page))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|index| membership.members()[index].node.clone())
+            .collect()
+    }
+
     pub fn is_owner(
         &self,
         membership: &Membership,

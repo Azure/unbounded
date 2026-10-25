@@ -1080,10 +1080,40 @@ impl CandidatePolicy {
             } else {
                 [0; racer_core::read::walk::MAX_HANDOFF]
             };
+            // Lineage targets: later owners that arrived before this owner,
+            // then members ranked just below the owners that were owners
+            // when they arrived (Known issue 34, from the cached ranking
+            // only). All are asked on their own grant, so a rank 0 reached
+            // by a delegation with one credit asks them too (Known issue 35).
+            let lineage_nodes = match rank {
+                Some(rank) if page_operation => {
+                    let mut targets =
+                        racer_core::read::walk::lineage_targets(&candidates.ordered, &since, rank);
+                    let demoted = self.placement.demoted(&candidates.membership, object, page);
+                    let demoted_since: Vec<_> = demoted
+                        .iter()
+                        .map(|node| candidates.membership.since(node))
+                        .collect();
+                    for node in racer_core::read::walk::demoted_targets(
+                        &since,
+                        &demoted,
+                        &demoted_since,
+                        rank,
+                    ) {
+                        if targets.len() < racer_core::read::walk::MAX_HANDOFF
+                            && !targets.contains(&node)
+                        {
+                            targets.push(node);
+                        }
+                    }
+                    targets
+                }
+                _ => Vec::new(),
+            };
             let mut handoff = match rank {
-                Some(rank) if page_operation => racer_core::read::walk::merge_handoff(
+                Some(_) if page_operation => racer_core::read::walk::merge_handoff(
                     previous.handoff.clone(),
-                    racer_core::read::walk::lineage_targets(&candidates.ordered, &since, rank),
+                    lineage_nodes.clone(),
                 ),
                 Some(_) => previous.handoff.clone(),
                 None => Vec::new(),
@@ -1108,6 +1138,10 @@ impl CandidatePolicy {
                         racer_core::read::successor::with_successors(targets, &handoff);
                 }
             }
+            // Successor targets first, then lineage targets, each on its own
+            // grant; version - 1 targets after them spend the walk's credits.
+            let granted = successors
+                + racer_core::read::walk::granted_prefix(&handoff[successors..], &lineage_nodes);
             // A non-owner page walk may ask the page's overflow helper (Known
             // issue 16). It is chosen only when the walk asks for it.
             let helper = rank.is_none()
@@ -1133,7 +1167,7 @@ impl CandidatePolicy {
                 previous: previous.same_rank,
                 helper,
                 lineage,
-                successors,
+                granted,
             });
             // This node owns the page under version - 1, so the stale
             // fallback (Known issue 19) is not available to this walk.

@@ -230,13 +230,42 @@ impl Coordinator {
         true
     }
 
+    /// Whether a copy-only page request from `requester` may wait on this
+    /// node's running acquisition of the page
+    /// (`racer_core::read::serve::copy_join_allowed`, Known issue 311). Ranks
+    /// the page only while an acquisition runs.
+    async fn copy_join_allowed(
+        &self,
+        page: &crate::model::PageId,
+        requester: &racer_control_wire::NodeId,
+        membership: std::sync::Arc<crate::topology::Membership>,
+        scope: &RequestScope,
+    ) -> bool {
+        if !self.fill.dependencies.flights.acquiring(page) {
+            return true;
+        }
+        let Some(owners) = self.page_owners(membership, page, scope).await else {
+            return true;
+        };
+        let local = &self.fill.dependencies.candidates.node;
+        let allowed = racer_core::read::serve::copy_join_allowed(&owners, local, requester);
+        if !allowed {
+            self.fill
+                .metrics
+                .record(crate::telemetry::Event::CopyJoinDeclined, 1);
+        }
+        allowed
+    }
+
     /// Serve a page copy-only: a local copy or `Miss`, never acquisition.
+    /// `join` lets it wait on a running acquisition of the page.
     async fn serve_page_copy(
         &self,
         page: &crate::model::PageId,
         scope: &RequestScope,
+        join: bool,
     ) -> Result<PeerResponse> {
-        match self.fill.copy_only(page, scope).await? {
+        match self.fill.copy_only_joining(page, scope, join).await? {
             Some((metadata, ciphertext)) => {
                 metadata.immutable().validate_page(ciphertext.envelope())?;
                 if &ciphertext.envelope().page != page {
@@ -476,7 +505,7 @@ impl LocalPageService for Coordinator {
                     .defer_to_successor(page, &requester, membership.clone(), &effective)
                     .await
             {
-                return self.serve_page_copy(page, &effective).await;
+                return self.serve_page_copy(page, &effective, true).await;
             }
             // Answers to a page probe without a copy are noted below.
             let noted = match &request.operation {
@@ -504,7 +533,12 @@ impl LocalPageService for Coordinator {
                 PeerOperation::Page {
                     page,
                     mode: FetchMode::CopyOnly,
-                } => self.serve_page_copy(&page, &effective).await,
+                } => {
+                    let join = self
+                        .copy_join_allowed(&page, &requester, membership.clone(), &effective)
+                        .await;
+                    self.serve_page_copy(&page, &effective, join).await
+                }
                 PeerOperation::Metadata {
                     object,
                     selector,

@@ -1736,6 +1736,17 @@ impl Fill {
         page: &'a PageId,
         scope: &'a RequestScope,
     ) -> Operation<'a, Option<(ObjectMetadata, CiphertextPage)>> {
+        self.copy_only_joining(page, scope, true)
+    }
+
+    /// [`Self::copy_only`]; without `join` a running acquisition of the page
+    /// is a miss instead of something to wait on (Known issue 311).
+    pub fn copy_only_joining<'a>(
+        &'a self,
+        page: &'a PageId,
+        scope: &'a RequestScope,
+        join: bool,
+    ) -> Operation<'a, Option<(ObjectMetadata, CiphertextPage)>> {
         Box::pin(async move {
             scope.check()?;
             if let Some(copy) = self.metrics.lookup(
@@ -1765,6 +1776,9 @@ impl Fill {
                 }
                 Ok(None) | Err(Error::MissingKey | Error::Io | Error::Os(_)) => {}
                 Err(error) => return Err(error),
+            }
+            if !join {
+                return Ok(None);
             }
             match self.dependencies.flights.join_copy(page, scope)? {
                 JoinedCopy::Ciphertext(copy) => {
