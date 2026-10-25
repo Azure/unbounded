@@ -1723,6 +1723,13 @@ impl NodeWorld {
                 match result {
                     Ok(_) => self.send_reply(msg, dest, Reply::Response(ResponseKind::Page), now),
                     Err(e) => {
+                        if let Some(t) = self.failed_trace.as_mut() {
+                            t.entry((dest, page)).or_default().push(format!(
+                                "served {} copy_only {copy_only} err {e:?} at {}ms",
+                                m.requester,
+                                now / MILLIS
+                            ));
+                        }
                         // Production notes a failed acquire, not a failed
                         // copy-only wait (`Coordinator::serve_peer`).
                         if !copy_only {
@@ -3873,6 +3880,11 @@ impl NodeWorld {
                 let (attempts, links) = (m.attempts, m.links);
                 match inherited_budget(scope, route, attempts, links, m.path.len()) {
                     Err(e) => {
+                        if let Some(t) = self.failed_trace.as_mut() {
+                            t.entry((dest, page)).or_default().push(format!(
+                                "inherit {attempts}a/{links}l err {e:?} from {requester}"
+                            ));
+                        }
                         let reply = peer_error(e).map_or(Reply::Transport, Reply::Response);
                         self.send_reply(mid, dest, reply, now);
                     }
