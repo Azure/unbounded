@@ -514,3 +514,129 @@ fn deadline_takes_precedence_over_recorded_rejection() {
         Ok(Event::Failed(Error::Cancelled))
     );
 }
+
+/// Known issue 161: with handover allowed, an expired leader's running fill
+/// continues for the live waiter with the latest deadline. That waiter is not
+/// re-elected (no second fill), the elected capability still publishes, and
+/// every remaining waiter completes from the one fill.
+#[test]
+fn expired_leader_hands_running_fill_to_latest_waiter() {
+    let now = Instant::now();
+    let mut t = table(FlightLimits::default(), now);
+    let mut wakes = Vec::new();
+    let mut quota = Quota {
+        max_flights: 4,
+        ..Quota::default()
+    };
+    let p = page(30);
+    let secs = |s| now + Duration::from_secs(s);
+    let a = waiter(t.join(&p, now, secs(1), 2, true, &mut quota, &mut wakes));
+    assert_eq!(t.poll(&p, a, now, 1, &mut wakes), Ok(Event::Lead));
+    t.retain_operation(&p, a).unwrap();
+    t.allow_handover(&p, a).unwrap();
+    let b = waiter(t.join(&p, now, secs(3), 2, true, &mut quota, &mut wakes));
+    let c = waiter(t.join(&p, now, secs(2), 2, true, &mut quota, &mut wakes));
+    assert_eq!(t.poll(&p, b, now, 2, &mut wakes), Ok(Event::Pending));
+    assert_eq!(t.poll(&p, c, now, 3, &mut wakes), Ok(Event::Pending));
+    assert_eq!(t.leader_deadline(&p), Some(secs(1)));
+    assert!(!t.handed_over(&p));
+
+    t.refresh(&p, secs(1), &mut wakes);
+    assert!(t.handed_over(&p));
+    assert!(t.is_leader(&p, a), "the elected capability survives");
+    assert_eq!(t.leader_deadline(&p), Some(secs(3)), "latest deadline adopts");
+    assert_eq!(
+        t.poll(&p, a, secs(1), 1, &mut wakes),
+        Ok(Event::Failed(Error::DeadlineExceeded))
+    );
+    t.detach(&p, a, &mut quota, &mut wakes);
+    assert_eq!(t.poll(&p, b, secs(1), 2, &mut wakes), Ok(Event::Pending));
+    assert_eq!(t.poll(&p, c, secs(1), 3, &mut wakes), Ok(Event::Pending));
+
+    t.complete_operation(&p, &mut quota, &mut wakes).unwrap();
+    t.finish(&p, a, Outcome::Published(Acquired::Plain(7)), &mut wakes)
+        .unwrap();
+    assert_eq!(t.poll(&p, b, secs(1), 2, &mut wakes), Ok(Event::Complete(7)));
+    assert_eq!(t.poll(&p, c, secs(1), 3, &mut wakes), Ok(Event::Complete(7)));
+    t.detach(&p, b, &mut quota, &mut wakes);
+    t.detach(&p, c, &mut quota, &mut wakes);
+    assert!(t.is_empty());
+    assert_eq!((quota.waiters, quota.flights), (0, 0));
+}
+
+/// A handed-over fill that ends with the elected caller's deadline retries
+/// for the adopting waiter, which leads with its own unspent budget; once the
+/// last adopter expires the fill is revoked like before.
+#[test]
+fn handed_over_fill_deadline_retries_and_last_expiry_revokes() {
+    let now = Instant::now();
+    let mut t = table(FlightLimits::default(), now);
+    let mut wakes = Vec::new();
+    let mut quota = Quota {
+        max_flights: 4,
+        ..Quota::default()
+    };
+    let p = page(31);
+    let secs = |s| now + Duration::from_secs(s);
+    let a = waiter(t.join(&p, now, secs(1), 2, true, &mut quota, &mut wakes));
+    assert_eq!(t.poll(&p, a, now, 1, &mut wakes), Ok(Event::Lead));
+    t.retain_operation(&p, a).unwrap();
+    t.allow_handover(&p, a).unwrap();
+    let b = waiter(t.join(&p, now, secs(3), 2, true, &mut quota, &mut wakes));
+    t.refresh(&p, secs(1), &mut wakes);
+    assert!(t.handed_over(&p));
+    t.complete_operation(&p, &mut quota, &mut wakes).unwrap();
+    t.finish(
+        &p,
+        a,
+        Outcome::Failed(Error::DeadlineExceeded),
+        &mut wakes,
+    )
+    .unwrap();
+    assert_eq!(t.poll(&p, b, secs(1), 2, &mut wakes), Ok(Event::Lead));
+    t.retain_operation(&p, b).unwrap();
+    t.allow_handover(&p, b).unwrap();
+    t.refresh(&p, secs(3), &mut wakes);
+    assert!(!t.is_leader(&p, b), "no waiter left to adopt");
+    assert_eq!(t.leader_deadline(&p), None);
+    t.complete_operation(&p, &mut quota, &mut wakes).unwrap();
+    assert_eq!(
+        t.poll(&p, b, secs(3), 2, &mut wakes),
+        Ok(Event::Failed(Error::DeadlineExceeded))
+    );
+    t.detach(&p, a, &mut quota, &mut wakes);
+    t.detach(&p, b, &mut quota, &mut wakes);
+    assert!(t.is_empty());
+}
+
+/// Terminal failures other than the elected caller's own deadline or
+/// cancellation still fail the cohort after a handover.
+#[test]
+fn handover_outcome_maps_only_caller_scope_failures() {
+    let retry = |o: Outcome<u8, Error>| matches!(o, Outcome::Retry);
+    assert!(retry(handover_outcome(
+        true,
+        Outcome::Failed(Error::DeadlineExceeded)
+    )));
+    assert!(retry(handover_outcome(true, Outcome::Failed(Error::Cancelled))));
+    assert!(matches!(
+        handover_outcome(true, Outcome::<u8, _>::Failed(Error::Io)),
+        Outcome::Failed(Error::Io)
+    ));
+    assert!(matches!(
+        handover_outcome(false, Outcome::<u8, _>::Failed(Error::DeadlineExceeded)),
+        Outcome::Failed(Error::DeadlineExceeded)
+    ));
+    assert!(matches!(
+        handover_outcome(true, Outcome::Published(3u8)),
+        Outcome::Published(3)
+    ));
+    let now = Instant::now();
+    let d = now + Duration::from_secs(2);
+    assert_eq!(handover_ceiling(now, d, false), d);
+    assert_eq!(
+        handover_ceiling(now, d, true),
+        d + Duration::from_secs(2) * HANDOVER_SPANS
+    );
+    assert_eq!(handover_ceiling(d, now, true), now, "expired leader");
+}

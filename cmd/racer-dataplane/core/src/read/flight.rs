@@ -325,10 +325,41 @@ impl<C: Clone, P: Clone, O, S: BuildHasher> PageFlights<C, P, O, S> {
             .state
             .validate_leader(id, true)
             .map_err(|_| Error::Internal)?;
+        let outcome = handover_outcome(flight.state.handed_over(), outcome);
         flight.state.begin_completion(outcome);
         let idle = flight.idle();
         flight.state.settle(idle, Error::Unavailable, split, wakes);
         Ok(())
+    }
+
+    /// Let leader `id`'s running acquisition pass to another live waiter when
+    /// `id` expires or is canceled (production `Flights::allow_handover`, for
+    /// fills whose caller does not fence on the operation). See
+    /// [`handover_outcome`] and [`handover_ceiling`].
+    pub fn allow_handover(&mut self, page: &PageId, id: u64) -> Result<()> {
+        let flight = self.flights.get_mut(page).ok_or(Error::Internal)?;
+        flight
+            .state
+            .validate_leader(id, true)
+            .map_err(|_| Error::Internal)?;
+        flight.state.allow_handover();
+        Ok(())
+    }
+
+    /// Deadline of the waiter `page`'s running acquisition currently serves,
+    /// or `None` once it was revoked or settled.
+    pub fn leader_deadline(&self, page: &PageId) -> Option<Instant> {
+        self.flights
+            .get(page)
+            .and_then(|f| f.state.leader_deadline())
+    }
+
+    /// Whether `page`'s running acquisition passed to a waiter other than
+    /// the elected one.
+    pub fn handed_over(&self, page: &PageId) -> bool {
+        self.flights
+            .get(page)
+            .is_some_and(|f| f.state.handed_over())
     }
 
     /// Whether `id` is the active leader of `page`'s current acquisition.
@@ -452,6 +483,34 @@ impl<C: Clone, P: Clone, O, S: BuildHasher> PageFlights<C, P, O, S> {
         }
     }
 }
+
+/// Outcome of a handed-over acquisition. The elected caller's own deadline
+/// or cancellation no longer describes the cohort: an operation that ended
+/// with it retries for the adopting waiter instead of failing everyone.
+pub fn handover_outcome<O>(handed_over: bool, outcome: Outcome<O, Error>) -> Outcome<O, Error> {
+    match outcome {
+        Outcome::Failed(Error::DeadlineExceeded | Error::Cancelled) if handed_over => {
+            Outcome::Retry
+        }
+        outcome => outcome,
+    }
+}
+
+/// Hard ceiling of a fill that may be handed over (Known issue 161): the
+/// leader's deadline plus `HANDOVER_SPANS` times its remaining span. The fill
+/// normally ends earlier, when no live waiter remains to adopt it; the
+/// ceiling only bounds the owned scope's timers. Without handover the
+/// ceiling is the leader's deadline.
+pub fn handover_ceiling(now: Instant, leader_deadline: Instant, handover: bool) -> Instant {
+    if !handover {
+        return leader_deadline;
+    }
+    let span = leader_deadline.saturating_duration_since(now);
+    leader_deadline + span * HANDOVER_SPANS
+}
+
+/// Read lifetimes a handed-over fill may run past its elected leader's.
+pub const HANDOVER_SPANS: u32 = 4;
 
 fn refresh<C, P, O>(
     flight: &mut Flight<C, P, O>,
