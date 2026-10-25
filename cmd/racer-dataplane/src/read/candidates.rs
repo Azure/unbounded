@@ -1097,8 +1097,37 @@ impl CandidatePolicy {
                             let Some(refresh) = refresh else {
                                 // The destination is behind this node and no
                                 // newer membership exists locally: try the
-                                // next owner (Known issue 3).
+                                // next owner (Known issue 3). A non-owner
+                                // that recently replaced the previous
+                                // membership walks the page's owners under it
+                                // instead, once (Known issue 19).
                                 walk.complete(budget, WalkOutcome::StaleDestination)?;
+                                if let Some(previous) =
+                                    self.stale_fallback(&candidates, rank.is_some(), retried)
+                                {
+                                    walk.abandon(budget)?;
+                                    let previous = self
+                                        .candidates_scoped(previous, object, page, scope)
+                                        .await?;
+                                    if !racer_core::read::stale::fallback_rank_allowed(
+                                        previous.ordered.iter().position(|node| node == &self.node),
+                                    ) {
+                                        return Err(Error::Unavailable);
+                                    }
+                                    return self
+                                        .resolve_epoch_traced(
+                                            previous,
+                                            context,
+                                            operation,
+                                            scope,
+                                            budget,
+                                            validate,
+                                            true,
+                                            HedgeContinuation::default(),
+                                            trail,
+                                        )
+                                        .await;
+                                }
                                 continue;
                             };
                             walk.complete(budget, WalkOutcome::StaleMembership)?;
@@ -1388,6 +1417,43 @@ impl CandidatePolicy {
     /// `racer_core::read::walk::stale_action` whether to refresh. `Some` is the
     /// strictly newer membership to rank again; `None` means the destination
     /// is behind and the caller moves to the next owner.
+    /// After a destination under `candidates` was behind this node, the
+    /// previous membership to walk the page's owners under instead, when
+    /// `racer_core::read::stale` allows it: this node does not own the page,
+    /// has not refreshed or fallen back yet, and holds version - 1, replaced
+    /// within `PREVIOUS_MEMBERSHIP_WITHIN` (peers still resolve it) and
+    /// listing this node (peers reject non-members).
+    fn stale_fallback(
+        &self,
+        candidates: &Candidates,
+        owner: bool,
+        retried: bool,
+    ) -> Option<std::sync::Arc<crate::topology::Membership>> {
+        let mut facts = racer_core::read::stale::StaleSkip {
+            owner,
+            retried,
+            previous_recent_member: true,
+        };
+        if !racer_core::read::stale::previous_fallback(facts) {
+            return None;
+        }
+        let version = candidates.membership.version.0.checked_sub(1)?;
+        let previous = self
+            .published
+            .resolve_recent(
+                version,
+                uring_runtime::environment::now(),
+                racer_core::read::walk::PREVIOUS_MEMBERSHIP_WITHIN,
+            )
+            .ok()
+            .flatten()
+            .filter(|previous| previous.member(&self.node).is_ok());
+        facts.previous_recent_member = previous.is_some();
+        racer_core::read::stale::previous_fallback(facts)
+            .then_some(previous)
+            .flatten()
+    }
+
     fn refresh_membership(
         &self,
         previous: &Candidates,

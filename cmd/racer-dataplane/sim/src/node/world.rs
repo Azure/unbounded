@@ -49,6 +49,7 @@ use racer_core::read::policy::{
 };
 use racer_core::read::range::{PageBudget, SlotKind, direct_fills, first_failure};
 use racer_core::read::serve::{ServeAction, ServeFacts, serve_action, serve_deadline};
+use racer_core::read::stale::{StaleSkip, fallback_rank_allowed, previous_fallback};
 use racer_core::read::successor::{MAX_DEFERRALS, should_note, successor_deferral};
 use racer_core::read::walk::{
     AttemptInputs, AttemptPlan, CandidateWalk, Continuation, End, HedgeFacts, Mode, Outcome,
@@ -322,6 +323,12 @@ struct Fill {
     version: u64,
     rank: Option<usize>,
     retried: bool,
+    /// Owners this walk skipped as stale destinations (behind this node).
+    stale: u32,
+    /// This fill already walked the previous membership after its walk
+    /// under the current one ran out on stale destinations
+    /// (`stale_fallback`).
+    fell_back: bool,
     probe: Option<u64>,
     /// The leader's retention observation, used at publication.
     eligible: bool,
@@ -434,6 +441,8 @@ struct LastOrigin {
     /// For a fetch by an owner above rank 0: why rank 0 did not serve it
     /// (`origin_skips_*`).
     skip: Option<&'static str>,
+    /// Membership version of that request.
+    version: u64,
 }
 
 impl Fill {
@@ -1637,6 +1646,8 @@ impl NodeWorld {
                 version: 0,
                 rank: None,
                 retried: false,
+                stale: 0,
+                fell_back: false,
                 probe: None,
                 eligible,
                 order: VisitOrder::canonical(0),
@@ -1888,6 +1899,12 @@ impl NodeWorld {
             Err(e) => return self.hard_fail(id, e),
         };
         let rank = cands.iter().position(|c| *c == node);
+        if fill.fell_back && !fallback_rank_allowed(rank) {
+            // An owner under the previous membership only: its authority
+            // there must not reach the origin (`stale_fallback`).
+            self.metrics.incr("stale_fallback_owner");
+            return self.fail_walk(id, Error::Unavailable);
+        }
         let order = if rank.is_some() {
             VisitOrder::canonical(0)
         } else {
@@ -1906,6 +1923,7 @@ impl NodeWorld {
         };
         let fill = self.fills.get_mut(&id).expect("present");
         fill.cands = cands;
+        fill.stale = 0;
         fill.handoff.clear();
         fill.previous_member = false;
         fill.previous = 0;
@@ -3178,6 +3196,9 @@ impl NodeWorld {
                     Ok(StaleAction::Refresh) => Ok(Outcome::StaleMembership),
                     Ok(StaleAction::Skip) => {
                         self.metrics.incr("stale_destination_skips");
+                        if let Some(fill) = self.fills.get_mut(&probe.fill) {
+                            fill.stale += 1;
+                        }
                         if owner {
                             // An owner's predecessor is behind (Known issue 12).
                             self.metrics.incr("owner_stale_destination_skips");
@@ -3294,12 +3315,15 @@ impl NodeWorld {
             };
             fill.asked.push((dest, asked));
         }
+        // `reply` counted a skipped destination that is behind this node.
+        let skipped = outcome == Ok(Outcome::StaleDestination) && fill.stale > 0;
         match &mut fill.walk {
             Walking::Candidates(walk) => match outcome {
                 Err(e) => self.hard_fail(id, e),
                 Ok(outcome) => match walk.complete(&mut fill.budget, outcome) {
                     Err(e) => self.hard_fail(id, e),
                     Ok(Some(end)) => self.on_end(id, end),
+                    Ok(None) if skipped && self.stale_fallback(id) => {}
                     Ok(None) => self.step_walk(id),
                 },
             },
@@ -3315,6 +3339,54 @@ impl NodeWorld {
             },
             Walking::None => {}
         }
+    }
+
+    /// Production `resolve_epoch_traced`: at a destination behind this
+    /// node, a non-owner stops its walk and walks the page's owners under
+    /// membership version - 1 instead, once (`racer_core::read::stale`,
+    /// Known issue 19). Returns whether it did.
+    fn stale_fallback(&mut self, id: u64) -> bool {
+        let now = self.now();
+        let fill = &self.fills[&id];
+        let (node, w, page, version) = (fill.node, fill.worker, fill.page, fill.version);
+        let old = version
+            .checked_sub(1)
+            .and_then(|v| self.versions.get(v))
+            .map(|v| v.members.clone());
+        // As for owners' previous probes (`walk_ranked`): replaced within
+        // `PREVIOUS_MEMBERSHIP_WITHIN`, measured from the publication.
+        let recent = self.config.node.retained_versions >= 1
+            && self.versions.get(version).is_some_and(|v| {
+                now.saturating_sub(v.published) <= PREVIOUS_MEMBERSHIP_WITHIN.as_nanos() as Nanos
+            });
+        let member = old.as_ref().is_some_and(|m| position(m, node).is_some());
+        let go = previous_fallback(StaleSkip {
+            owner: fill.rank.is_some(),
+            retried: fill.retried,
+            previous_recent_member: recent && member,
+        });
+        let (true, Some(old)) = (go, old) else {
+            return false;
+        };
+        self.metrics.incr("stale_fallbacks");
+        let fill = self.fills.get_mut(&id).expect("present");
+        // The skipped probe completed: nothing is pending.
+        fill.walk = Walking::None;
+        fill.retried = true;
+        fill.fell_back = true;
+        // A fresh walk: the previous membership's owners were not asked.
+        fill.continuation = Continuation::default();
+        self.rank(
+            node,
+            w,
+            old,
+            page,
+            Then::Walk {
+                fill: id,
+                version: version - 1,
+            },
+        );
+        true
     }
 
     fn on_end(&mut self, id: u64, end: End) {
@@ -3351,6 +3423,9 @@ impl NodeWorld {
                 .plan
                 .walk(WalkResult::Failed(Error::VersionUnavailable)),
             End::Exhausted { funding } => {
+                if fill.stale > 0 {
+                    self.metrics.incr("walk_exhausted_stale");
+                }
                 self.metrics.incr(if funding {
                     "walk_exhausted_funding"
                 } else {
@@ -3662,6 +3737,7 @@ impl NodeWorld {
             ok: None,
             done: now,
             skip,
+            version: fill.version,
         };
         let Some(last) = self.last_origin.insert(page, next) else {
             return;
@@ -3676,6 +3752,21 @@ impl NodeWorld {
                         .any(|w| w.memory.pages.contains_key(&page)))
         };
         let class = if last.rank0 != rank0 {
+            // Why a move repeats (Known issue 20): the earlier fetcher lost
+            // the copy, or still holds it and this owner did or did not ask
+            // it; and whether the page moved over one version or more.
+            let sub = if !held(self) {
+                "origin_repeats_after_move_lost"
+            } else if fill.asked.iter().any(|&(dest, _)| dest == last.node) {
+                "origin_repeats_after_move_held_asked"
+            } else if fill.version > last.version + 2 {
+                "origin_repeats_after_move_held_unasked_older"
+            } else if fill.version == last.version + 2 {
+                "origin_repeats_after_move_held_unasked_two"
+            } else {
+                "origin_repeats_after_move_held_unasked"
+            };
+            self.metrics.incr(sub);
             "origin_repeats_after_move"
         } else if last.ok == Some(false) {
             "origin_repeats_after_failure"

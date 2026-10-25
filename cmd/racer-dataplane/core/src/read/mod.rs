@@ -15,6 +15,7 @@ pub mod policy;
 pub mod range;
 pub mod response;
 pub mod serve;
+pub mod stale;
 pub mod successor;
 pub mod walk;
 pub mod worker;

@@ -3388,6 +3388,198 @@ fn owner_with_stale_predecessor_reaches_origin() {
     assert_eq!(f.origin.calls.get(), 1);
 }
 
+/// Known issue 19: an owner of the page is behind this node (it answers
+/// `StaleMembership` to version 2 and nothing newer exists here). A
+/// non-owner that replaced version 1 recently and is a member of it stops
+/// walking version 2 and walks the owners under version 1, which they still
+/// resolve, instead of spending a funded probe on each owner that is behind
+/// and failing. Too old a replacement, or no version 1 listing this node,
+/// keeps the old behavior: one probe per owner, then `Unavailable`. The
+/// fallback never reaches the origin and never grows the budget.
+#[test]
+fn stale_owners_fall_back_to_the_recent_previous_membership() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    // (seconds since version 1 was replaced, version 1 lists this node,
+    // previous owners copy) -> fell back
+    for (age, member, copy, fell_back) in [
+        (0, true, true, true),
+        (9, true, true, true),
+        (11, true, true, false),
+        (0, false, true, false),
+        (0, true, false, true),
+    ] {
+        let mut f = fixture();
+        let (peers, ordered) = install_peers(&mut f, None);
+        let good = encrypted_copy(&mut f);
+        let members = f.membership.members().to_vec();
+        let local = node(peers.local);
+        let current = Arc::new(
+            Membership::validate(racer_control_wire::MembershipVersion(2), members.clone())
+                .unwrap(),
+        );
+        // Version 1 ranks the same owners: they are only behind.
+        let old = Arc::new(
+            Membership::validate(
+                racer_control_wire::MembershipVersion(1),
+                members
+                    .into_iter()
+                    .filter(|m| member || m.node != local)
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        let published = Arc::new(controlplane::Published::new(
+            crate::control::Snapshot::retention(2),
+        ));
+        let now = uring_runtime::environment::now();
+        for (i, (membership, at)) in [
+            (old.clone(), now - Duration::from_secs(60)),
+            (current.clone(), now - Duration::from_secs(age)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut snapshot = crate::control::Snapshot::membership_fixture(membership);
+            snapshot.sequence = racer_control_wire::PublicationSequence(i as u64 + 1);
+            published
+                .publish(Arc::new(snapshot), at, |_, _| Ok::<_, Error>(()), || ())
+                .unwrap();
+        }
+        let placement = Rc::new(Placement::new(16));
+        let previous = placement
+            .rank(old.clone(), &f.context.object, f.page.number)
+            .ordered;
+        if member {
+            assert_eq!(previous, ordered);
+        }
+        let mut deps = f.fill.dependencies.clone();
+        deps.candidates = Rc::new(CandidatePolicy::new(
+            local.clone(),
+            placement,
+            peers.requester(),
+            deps.credentials.clone(),
+            published,
+        ));
+        f.fill = Fill::new(deps);
+        f.membership = current;
+        if fell_back {
+            peers
+                .replies
+                .borrow_mut()
+                .push_back((ordered[0].clone(), Reply::Stale));
+            peers.replies.borrow_mut().extend(previous.iter().map(|n| {
+                (
+                    n.clone(),
+                    if copy {
+                        Reply::Copy(good.clone())
+                    } else {
+                        Reply::Miss
+                    },
+                )
+            }));
+        } else {
+            peers
+                .replies
+                .borrow_mut()
+                .extend(ordered.iter().map(|n| (n.clone(), Reply::Stale)));
+        }
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+        let result = acquire(&mut f, &mut budget);
+        let case = format!("age {age} member {member} copy {copy}");
+        let memberships = peers.memberships.borrow().clone();
+        if !fell_back {
+            assert!(matches!(result, Err(Error::Unavailable)), "{case}");
+            assert_eq!(memberships, vec![2; ordered.len()], "{case}");
+        } else if copy {
+            let result = result.unwrap_or_else(|e| panic!("{case}: {e:?} {memberships:?}"));
+            assert_eq!(result.plaintext.bytes(), b"abc", "{case}");
+            assert_eq!(memberships, [2, 1], "{case}");
+        } else {
+            assert!(matches!(result, Err(Error::Unavailable)), "{case}");
+            assert_eq!(memberships[0], 2, "{case}");
+            assert!(memberships.len() >= 2, "{case}: {memberships:?}");
+            assert!(memberships[1..].iter().all(|v| *v == 1), "{case}");
+        }
+        assert!(budget.remaining_attempts() < 8, "{case}");
+        assert_eq!(f.origin.calls.get(), 0, "{case}");
+    }
+}
+
+/// The fallback walks the previous membership only as a non-owner: a node
+/// that owned the page there ends `Unavailable` rather than reach the origin
+/// with authority it no longer has.
+#[test]
+fn stale_fallback_never_makes_a_previous_owner_fetch() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let (peers, ordered) = install_peers(&mut f, None);
+    let members = f.membership.members().to_vec();
+    let local = node(peers.local);
+    let current = Arc::new(
+        Membership::validate(racer_control_wire::MembershipVersion(2), members.clone()).unwrap(),
+    );
+    // Without rank 0, version 1 has three members, this node among them, so
+    // this node owns the page under version 1.
+    let old = Arc::new(
+        Membership::validate(
+            racer_control_wire::MembershipVersion(1),
+            members
+                .into_iter()
+                .filter(|m| m.node != ordered[0])
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let published = Arc::new(controlplane::Published::new(
+        crate::control::Snapshot::retention(2),
+    ));
+    let now = uring_runtime::environment::now();
+    for (i, (membership, at)) in [
+        (old.clone(), now - Duration::from_secs(60)),
+        (current.clone(), now),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut snapshot = crate::control::Snapshot::membership_fixture(membership);
+        snapshot.sequence = racer_control_wire::PublicationSequence(i as u64 + 1);
+        published
+            .publish(Arc::new(snapshot), at, |_, _| Ok::<_, Error>(()), || ())
+            .unwrap();
+    }
+    let placement = Rc::new(Placement::new(16));
+    assert!(
+        placement
+            .rank(old.clone(), &f.context.object, f.page.number)
+            .ordered
+            .contains(&local)
+    );
+    let mut deps = f.fill.dependencies.clone();
+    deps.candidates = Rc::new(CandidatePolicy::new(
+        local,
+        placement,
+        peers.requester(),
+        deps.credentials.clone(),
+        published,
+    ));
+    f.fill = Fill::new(deps);
+    f.membership = current;
+    peers
+        .replies
+        .borrow_mut()
+        .push_back((ordered[0].clone(), Reply::Stale));
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+    assert!(matches!(
+        acquire(&mut f, &mut budget),
+        Err(Error::Unavailable)
+    ));
+    assert_eq!(*peers.memberships.borrow(), [2]);
+    assert_eq!(f.origin.calls.get(), 0);
+    assert_unpublished(&f);
+}
+
 /// Without any published membership the stale answer stays terminal
 /// (`Unavailable` from `stale_action`), and nothing else is probed.
 #[test]
