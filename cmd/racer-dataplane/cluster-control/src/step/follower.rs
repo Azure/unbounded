@@ -63,7 +63,7 @@ pub fn read(r: &SecretRead<'_>) -> Read {
 /// than it (the same sequence is installed as usual, so a seat still
 /// learns it serves that sequence). The read may have been answered before that commit; it is
 /// dropped instead of failing closed. A genuine rollback is still refused by
-/// the next read, which starts after the installation (Known issue 421).
+/// the next read, which starts after the installation (Known issue 56).
 pub fn superseded(
     installed_during_read: bool,
     high_water: Option<&StateRecord>,

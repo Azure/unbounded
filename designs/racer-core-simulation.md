@@ -721,7 +721,7 @@ Verified against the code at the start of this work.
    re-ask spent all 16 links on that one owner and the other two were never asked. A verified
    `StaleMembership` now also returns the links past its answerer
    (`racer_core::read::budget::stale_unused_links`); 50k failed reads 11 to 4. The remainder is
-   Known issue 422 (round 4, ctl3, wave 6).
+   Known issue 57 (round 4, ctl3, wave 6).
 
 48. A seat follower takes the `shared.changed` generation after `follow_once`
    (`cluster-control/src/seat.rs`, `follower`), so a primary Lease change that arrives during the
@@ -799,13 +799,13 @@ Verified against the code at the start of this work.
    merge the 5k `full-failover` seed 2 worst page is 7 (wave 5: 6). Open (round 4, probes, wave
    6).
 
-421. Resolved: a primary's own seat follower failed closed when the primary committed while
+56. Resolved: a primary's own seat follower failed closed when the primary committed while
    the follower's state read was in flight: the read answered the record the commit replaced,
    which `install_record` refused as a rollback. Such a read is now dropped as superseded
    (`step::follower::superseded`, production and step model). Found by modeling follower read
    latency for Known issue 48 (round 4, ctl3, wave 6).
 
-422. 50k `full-cold-start` still fails 4 reads during enrollment: the reader now asks all three
+57. 50k `full-cold-start` still fails 4 reads during enrollment: the reader now asks all three
    owners, but each owner's own acquisition fails. An owner reached by a funded route inherits
    a few credits; its rank 0 (or the member it delegates to) is behind on membership (often a
    member whose client applied only its first version), answers `StaleMembership`, and the
@@ -1337,7 +1337,7 @@ scenarios carry data-plane faults.
 46. Holders ranked sixth or lower, or past the three-target cap, are not asked (157 of 188 5k
    `full-churn` moved repeats) (round 4, lineage, wave 5).
 47. Partly resolved: stale answers now return unused route links; 50k `full-cold-start` failed
-   reads 11 to 4, the rest is 422 (round 4, ctl3, wave 6).
+   reads 11 to 4, the rest is 57 (round 4, ctl3, wave 6).
 48. Resolved: seat followers reread after a primary Lease change during their read (round 4,
    ctl3, wave 6).
 49. Resolved with a tested bound: a second stale wait only at the last visit, rank 0 or 1
@@ -1356,9 +1356,9 @@ scenarios carry data-plane faults.
    hang2, wave 6).
 55. 50k `full-failover` `copy_held` 578 to 626 and worst page 6 to 8 after the probes change,
    not traced (round 4, probes, wave 6).
-421. Resolved: a primary's follower read overlapping its own commit failed closed (round 4, ctl3,
+56. Resolved: a primary's follower read overlapping its own commit failed closed (round 4, ctl3,
    wave 6).
-422. Owners with too little inherited budget fail when their rank 0 is behind on membership (4
+57. Owners with too little inherited budget fail when their rank 0 is behind on membership (4
    reads at 50k `full-cold-start`) (round 4, ctl3, wave 6).
 
 ## Round 2: production admission
@@ -5703,7 +5703,7 @@ put all 11 (then 10) failed reads in two classes:
   other two owners are `Unfunded`. Each retry repeats the same pattern in about 100 ms, so the
   four attempts fail within half a second of a 10 s deadline.
 - 3 of 11: the reader's owners each fail their own acquisition (`Unavailable`): see Known issue
-  422 below.
+  57 below.
 
 The same accounting is why the second stale wait (Known issue 49) was never affordable: the doc
 claimed it was affordable at the last owner, but a reader that waited at a funded first owner
@@ -5723,7 +5723,7 @@ nothing. No wire change.
 
 The second stale wait is kept; its bound is now true and tested (Known issue 49).
 
-### Issue 48: change, and Known issue 421
+### Issue 48: change, and Known issue 56
 
 - Production: `Shared::primary_lease`, notified only by `apply_primary`; the seat follower takes
   its generation before `follow_once` and waits on it or on `shared.changed` (taken after the
@@ -5733,7 +5733,7 @@ The second stale wait is kept; its bound is now true and tested (Known issue 49)
 - Step model (`step::cluster`): follower reads take `Settings::follow_read_ns` (20 ms), answer
   the state as of their start, and a Lease change during the read rereads at the 1 s floor
   (`a_commit_during_a_follower_read_is_served_by_the_next_read`, fails without the wake).
-- Modeling the read latency exposed Known issue 421: the primary's own follower read could
+- Modeling the read latency exposed Known issue 56: the primary's own follower read could
   answer the record its commit had just replaced, which `install_record` refused as a rollback
   and failed closed. `step::follower::superseded` drops a read that is older than a record some
   other installer (the primary) installed while it was in flight; a rollback is still refused by
@@ -5762,7 +5762,7 @@ total, worst page, pages fetched more than once.
 | 50k full-cold-start | 913,187 / 11 | 27,360, 3, 411 | 912,770 / 4 | 27,423, 3, 454 |
 
 - 50k `full-cold-start` (21:55 wall, peak RSS 4.5 GiB): failed reads 11 to 4, all
-  `Unavailable` between 105 and 156 s (Known issue 422); 5,524 links refunded by stale answers;
+  `Unavailable` between 105 and 156 s (Known issue 57); 5,524 links refunded by stale answers;
   `stale_waits_again` still 0. 417 fewer completed reads and 63 more origin requests (worst
   page unchanged at 3); `origin_repeat_explained` holds (`unexplained` 0).
 - 5k: unchanged where no membership changes (storm, zipf, zipf 16 MiB, hung members). Churn
@@ -5788,7 +5788,7 @@ total, worst page, pages fetched more than once.
 
 ### Deviations and open items
 
-- Issue 47 is partly resolved; the remaining 4 failed reads are Known issue 422 (owners with
+- Issue 47 is partly resolved; the remaining 4 failed reads are Known issue 57 (owners with
   too little inherited budget whose rank 0 is behind on membership). Fixing it means funding
   an owner reached by a funded route for a stale exchange plus its own fetch, or the owner
   waiting for a behind rank 0, which touches the handoff budgets; left open.

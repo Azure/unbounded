@@ -1169,7 +1169,7 @@ mod tests {
         });
     }
 
-    /// Known issue 421: the primary commits while its own follower's read is
+    /// Known issue 56: the primary commits while its own follower's read is
     /// in flight; the read answers the record the commit replaced. That is
     /// older news, not a rollback, and the primary keeps serving.
     #[test]
