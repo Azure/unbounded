@@ -5697,6 +5697,6 @@ every run, including the 16-scenario smoke at 200 nodes.
 
 - Overlapping origin requests in 5k `zipf` at 16 MiB: 130 to 120. `copy_held` repeats in 5k
   `full-failover`: 79 to 68 (seed 1), 79 to 86 (seed 2), 64 to 61 (seed 3).
-- The hung-member run trades 110 more origin requests for 137 fewer failed reads: owners above a
-  silent rank 0 fetch at once (issue 43).
+- The hung-member run trades 110 more origin requests for 137 fewer failed reads; the hang2
+  track measured the same (11,757 to 11,867): owners above a hung rank 0 now fetch the page.
 - 50k runs are deferred to part 2.
