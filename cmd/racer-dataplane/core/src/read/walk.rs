@@ -202,6 +202,20 @@ pub enum Outcome {
     /// worked); for a non-owner page walk it is also the one signal that asks
     /// the page's overflow helper.
     Shed,
+    /// The request was sent but no answer arrived before the attempt's own
+    /// time bound (its idle share or the attempt timeout) while the caller's
+    /// scope still runs: the destination may still be working on it.
+    /// Recorded like `Transport(Unreachable)`, except for an owner's page
+    /// probe of rank 0: a delegated `Acquire` waits on rank 0's acquisition, and a
+    /// copy-only probe answers at once unless it joined rank 0's running
+    /// acquisition (production `Flights::join_copy`). Either way rank 0 is
+    /// most likely still fetching (its origin request queued behind others),
+    /// so the timeout is not origin authority for this owner, whose own
+    /// request would only queue behind rank 0's at the same origin (Known
+    /// issue 31). Such a walk ends [`End::Exhausted`] instead of
+    /// [`End::Origin`]; a transport failure (rank 0 down or unreachable) or
+    /// a miss still lets the owner fetch.
+    TimedOut,
 }
 
 /// How the epoch ended.
@@ -246,6 +260,9 @@ pub struct CandidateWalk {
     pending: Option<Pending>,
     done: bool,
     helper: Helper,
+    /// An owner's probe of rank 0 timed out ([`Outcome::TimedOut`]): the
+    /// walk does not end with origin authority.
+    rank0_unanswered: bool,
 }
 
 /// Overflow helper state of a non-owner page walk.
@@ -270,6 +287,9 @@ struct Pending {
     handoff: bool,
     /// An owner's `Acquire` to rank 0.
     delegated: bool,
+    /// An owner's page probe of rank 0 (delegated `Acquire` or copy-only,
+    /// under either membership), not a handoff probe.
+    rank0: bool,
     /// Sent under the previous membership ([`WalkConfig::previous`]).
     previous: bool,
     /// The probe asks the overflow helper.
@@ -309,6 +329,7 @@ impl CandidateWalk {
             pending: None,
             done: false,
             helper: Helper::Unset,
+            rank0_unanswered: false,
         }
     }
 
@@ -345,6 +366,7 @@ impl CandidateWalk {
             bounded: Some(child),
             handoff: true,
             delegated: false,
+            rank0: false,
             helper: true,
             previous: false,
         });
@@ -397,6 +419,13 @@ impl CandidateWalk {
     /// as for a destination that is behind.
     pub fn pending_previous(&self) -> bool {
         self.pending.as_ref().is_some_and(|p| p.previous)
+    }
+
+    /// Whether rank 0 left this owner's probe unanswered
+    /// ([`Outcome::TimedOut`]), so the walk will not end with origin
+    /// authority.
+    pub fn rank0_unanswered(&self) -> bool {
+        self.rank0_unanswered
     }
 
     /// Whether the walk stopped because a probe could not be funded.
@@ -571,6 +600,7 @@ impl CandidateWalk {
                 bounded,
                 handoff,
                 delegated,
+                rank0: rank.is_some() && canonical == 0 && !handoff && self.config.page_operation,
                 previous,
                 helper: false,
             });
@@ -627,6 +657,13 @@ impl CandidateWalk {
         if let Some(bounded) = pending.bounded {
             budget.reunite(bounded)?;
         }
+        let outcome = match outcome {
+            Outcome::TimedOut => {
+                self.rank0_unanswered |= pending.rank0;
+                Outcome::Transport(ProbeOutcome::Unreachable)
+            }
+            outcome => outcome,
+        };
         if pending.helper {
             // The helper does not consume a visit-order position. Its
             // failure is only a miss (handled with handoff probes below).
@@ -698,6 +735,8 @@ impl CandidateWalk {
                 self.evidence.push(ProbeOutcome::Overloaded);
                 Ok(None)
             }
+            // Normalized above.
+            Outcome::TimedOut => Ok(None),
             Outcome::Probe(outcome) | Outcome::Transport(outcome) => {
                 self.saw_version |= outcome == ProbeOutcome::VersionUnavailable;
                 self.saw_transient |= transient(outcome);
@@ -714,7 +753,12 @@ impl CandidateWalk {
     }
 
     fn finish(&mut self) -> End {
-        if let Some(rank) = self.config.rank {
+        if self.config.rank.is_some() && self.rank0_unanswered {
+            // Rank 0 has not answered this owner's probe within the
+            // attempt: leave the fetch to it (Known issue 31). Callers retry
+            // and join rank 0's acquisition.
+            End::Exhausted { funding: false }
+        } else if let Some(rank) = self.config.rank {
             End::Origin {
                 rank,
                 evidence: std::mem::take(&mut self.evidence),
@@ -793,7 +837,7 @@ impl RemainingWalk {
             Outcome::Copy => return Some(RemainingEnd::Copy),
             Outcome::Probe(outcome) => self.transient |= transient(outcome),
             Outcome::Shed => self.transient = true,
-            Outcome::Transport(_) => {
+            Outcome::Transport(_) | Outcome::TimedOut => {
                 self.transient = true;
                 budget.note_route_failure();
             }

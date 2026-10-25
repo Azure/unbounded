@@ -1140,3 +1140,112 @@ fn destination_shed_is_evidence_but_not_a_route_failure() {
         assert_eq!(b.route_links(), if failed { 8 } else { 4 }, "{outcome:?}");
     }
 }
+
+/// Known issue 31: an owner whose probe of rank 0 (a delegated `Acquire`, or
+/// copy-only when it cannot fund one) is sent but unanswered within the
+/// attempt does not fetch origin: rank 0 is most likely still fetching, and
+/// this owner's request would queue behind it at the same origin.
+#[test]
+fn owner_leaves_the_fetch_to_rank_zero_after_a_timeout() {
+    // Delegated Acquire (rank 1, enough credits).
+    let mut walk = CandidateWalk::new(config(Some(1), 3, VisitOrder::canonical(3)));
+    let mut b = budget(8, 32);
+    let (probes, end) = drive(&mut walk, &mut b, |_, _| Outcome::TimedOut);
+    assert_eq!(probes.len(), 1);
+    assert_eq!(probes[0].0.mode, Mode::Acquire);
+    assert_eq!(end, End::Exhausted { funding: false });
+    assert!(walk.rank0_unanswered());
+    // Copy-only probe of rank 0 (too few credits to delegate): it joined
+    // rank 0's running acquisition, so the same holds.
+    let mut walk = CandidateWalk::new(config(Some(1), 3, VisitOrder::canonical(3)));
+    let (probes, end) = drive(&mut walk, &mut budget(2, 16), |_, _| Outcome::TimedOut);
+    assert_eq!(probes[0].0.mode, Mode::CopyOnly);
+    assert_eq!(end, End::Exhausted { funding: false });
+    // Rank 2: rank 0 timed out, rank 1 still asked copy-only; its copy wins.
+    let mut walk = CandidateWalk::new(config(Some(2), 3, VisitOrder::canonical(3)));
+    let (probes, end) = drive(&mut walk, &mut budget(8, 32), |p, _| {
+        if p.canonical == 0 {
+            Outcome::TimedOut
+        } else {
+            Outcome::Copy
+        }
+    });
+    assert_eq!(probes.len(), 2);
+    assert_eq!(end, End::Copy);
+    // Rank 2: rank 0 timed out and rank 1 missed: still no origin.
+    let mut walk = CandidateWalk::new(config(Some(2), 3, VisitOrder::canonical(3)));
+    let (_, end) = drive(&mut walk, &mut budget(8, 32), |p, _| {
+        if p.canonical == 0 {
+            Outcome::TimedOut
+        } else {
+            Outcome::Probe(ProbeOutcome::CopyMiss)
+        }
+    });
+    assert_eq!(end, End::Exhausted { funding: false });
+}
+
+/// The rule covers only an owner's probe of rank 0. A transport failure or a
+/// miss from rank 0 still gives an owner origin authority, a timeout of a
+/// later predecessor or a handoff target does not block it, and for a
+/// non-owner a timeout is the same evidence as `Transport(Unreachable)`.
+#[test]
+fn only_an_owner_probe_of_rank_zero_timing_out_withholds_origin() {
+    for outcome in [
+        Outcome::Transport(ProbeOutcome::Unreachable),
+        Outcome::Probe(ProbeOutcome::Overloaded),
+        Outcome::Probe(ProbeOutcome::CopyMiss),
+        Outcome::Shed,
+    ] {
+        let mut walk = CandidateWalk::new(config(Some(1), 3, VisitOrder::canonical(3)));
+        let (_, end) = drive(&mut walk, &mut budget(8, 32), |_, _| outcome);
+        assert!(matches!(end, End::Origin { rank: 1, .. }), "{outcome:?}");
+        assert!(!walk.rank0_unanswered());
+    }
+    // Rank 2: rank 1 timing out (copy-only) does not withhold origin.
+    let mut walk = CandidateWalk::new(config(Some(2), 3, VisitOrder::canonical(3)));
+    let (_, end) = drive(&mut walk, &mut budget(8, 32), |p, _| {
+        if p.canonical == 0 {
+            Outcome::Probe(ProbeOutcome::CopyMiss)
+        } else {
+            Outcome::TimedOut
+        }
+    });
+    assert_eq!(
+        end,
+        End::Origin {
+            rank: 2,
+            evidence: vec![ProbeOutcome::CopyMiss, ProbeOutcome::Unreachable]
+        }
+    );
+    // Non-page walks (metadata) keep the timeout as transient evidence.
+    let mut cfg = config(Some(1), 3, VisitOrder::canonical(3));
+    cfg.page_operation = false;
+    let mut walk = CandidateWalk::new(cfg);
+    let (_, end) = drive(&mut walk, &mut budget(8, 32), |_, _| Outcome::TimedOut);
+    assert!(matches!(end, End::Origin { rank: 1, .. }));
+    // A handoff target timing out is only a miss.
+    let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
+    cfg.handoff = 1;
+    let mut walk = CandidateWalk::new(cfg);
+    let (probes, end) = drive(&mut walk, &mut budget(8, 32), |_, _| Outcome::TimedOut);
+    assert_eq!(probes.len(), 1);
+    assert!(matches!(end, End::Origin { rank: 0, .. }));
+    // Non-owner: identical to an unreachable owner, including the route
+    // failure it notes.
+    let run = |outcome: Outcome| {
+        let mut walk = CandidateWalk::new(config(None, 2, VisitOrder::canonical(2)));
+        let mut b = budget(32, 96);
+        let (probes, end) = drive(&mut walk, &mut b, |_, _| outcome);
+        (probes.len(), end, b.route_links(), walk.rank0_unanswered())
+    };
+    assert_eq!(
+        run(Outcome::TimedOut),
+        run(Outcome::Transport(ProbeOutcome::Unreachable))
+    );
+    // The remaining walk treats a timeout as unavailable.
+    let mut remaining = RemainingWalk::new(0, 2);
+    let mut b = budget(8, 32);
+    remaining.next_probe().unwrap();
+    assert_eq!(remaining.complete(&mut b, Outcome::TimedOut), None);
+    assert_eq!(remaining.next_probe(), Err(RemainingEnd::Unavailable));
+}

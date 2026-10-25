@@ -936,10 +936,9 @@ impl NodeWorld {
                         Some(primary) => {
                             self.hedge_result(p.fill, primary, Err(Error::Unavailable))
                         }
-                        None => self.complete_probe(
-                            p.fill,
-                            Ok(Outcome::Transport(ProbeOutcome::Unreachable)),
-                        ),
+                        // Sent, but unanswered within the attempt's own bound
+                        // (production `request_traced`, attempt scope).
+                        None => self.complete_probe(p.fill, Ok(Outcome::TimedOut)),
                     }
                 }
             }
@@ -3379,7 +3378,7 @@ impl NodeWorld {
                         }
                         Err(Error::Unavailable)
                     }
-                    Ok(Outcome::Transport(_) | Outcome::StaleDestination) => {
+                    Ok(Outcome::Transport(_) | Outcome::StaleDestination | Outcome::TimedOut) => {
                         Err(Error::Unavailable)
                     }
                     Err(e) => Err(e),
@@ -3415,7 +3414,9 @@ impl NodeWorld {
         {
             let label = match &outcome {
                 Ok(Outcome::Copy) => "helper_copies",
-                Ok(Outcome::Transport(ProbeOutcome::Unreachable)) => "helper_unreachable",
+                Ok(Outcome::Transport(ProbeOutcome::Unreachable) | Outcome::TimedOut) => {
+                    "helper_unreachable"
+                }
                 Ok(Outcome::Transport(_) | Outcome::Probe(ProbeOutcome::Overloaded)) => {
                     "helper_overloaded"
                 }
@@ -3431,7 +3432,7 @@ impl NodeWorld {
                 Ok(Outcome::Probe(ProbeOutcome::CopyMiss | ProbeOutcome::VersionUnavailable)) => {
                     Asked::Miss
                 }
-                Ok(Outcome::Transport(ProbeOutcome::Unreachable)) => {
+                Ok(Outcome::Transport(ProbeOutcome::Unreachable) | Outcome::TimedOut) => {
                     Asked::Unreachable(fill.cut.take().unwrap_or(Cut::Other))
                 }
                 Ok(Outcome::Probe(ProbeOutcome::Unreachable)) => Asked::Failed,
@@ -3551,6 +3552,14 @@ impl NodeWorld {
     }
 
     fn on_end(&mut self, id: u64, end: End) {
+        let fill = self.fills.get_mut(&id).expect("present");
+        if let Walking::Candidates(walk) = &fill.walk
+            && walk.rank0_unanswered()
+        {
+            // Known issue 31: rank 0 has not answered this owner's probe
+            // within the attempt; the owner does not fetch origin too.
+            self.metrics.incr("origin_left_to_rank0");
+        }
         let fill = self.fills.get_mut(&id).expect("present");
         fill.walk = Walking::None;
         match end {

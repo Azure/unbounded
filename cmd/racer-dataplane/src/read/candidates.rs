@@ -1048,6 +1048,7 @@ impl CandidatePolicy {
                     },
                     None => &candidates.ordered[probe.canonical],
                 };
+                let mut timed_out = false;
                 let response = self
                     .request_traced(
                         membership,
@@ -1068,6 +1069,7 @@ impl CandidatePolicy {
                             RequestMode::SharedRoute
                         },
                         Some((trail, probe.canonical as u8)),
+                        &mut timed_out,
                     )
                     .await;
                 let outcome = match response {
@@ -1177,6 +1179,9 @@ impl CandidatePolicy {
                             }
                         }
                     }
+                    // Sent but unanswered within the attempt: an owner does
+                    // not take origin authority from rank 0 for this.
+                    Err(_) if timed_out => WalkOutcome::TimedOut,
                     Err(error) => match racer_core::read::Error::try_from(error)
                         .ok()
                         .and_then(racer_core::read::walk::transport_outcome)
@@ -1378,6 +1383,7 @@ impl CandidatePolicy {
                             probe.remaining_opportunities,
                             RequestMode::SharedRoute,
                             Some((&mut trail, probe.index as u8)),
+                            &mut false,
                         )
                         .await
                     {
@@ -1534,6 +1540,7 @@ impl CandidatePolicy {
             remaining_opportunities,
             request_mode,
             None,
+            &mut false,
         )
         .await
     }
@@ -1551,6 +1558,7 @@ impl CandidatePolicy {
         remaining_opportunities: u32,
         request_mode: RequestMode,
         trail: Option<(&mut CandidateTrail, u8)>,
+        timed_out: &mut bool,
     ) -> Result<VerifiedResponse> {
         match self
             .request_delivered(
@@ -1565,6 +1573,7 @@ impl CandidatePolicy {
                 request_mode,
                 trail,
                 None,
+                timed_out,
             )
             .await?
         {
@@ -1603,6 +1612,7 @@ impl CandidatePolicy {
             RequestMode::SharedRoute,
             None,
             Some(ordinal),
+            &mut false,
         )
         .await
     }
@@ -1627,7 +1637,9 @@ impl CandidatePolicy {
         request_mode: RequestMode,
         trail: Option<(&mut CandidateTrail, u8)>,
         landing: Option<i32>,
+        timed_out: &mut bool,
     ) -> Result<Delivered> {
+        *timed_out = false;
         let mut remote = [b'?'; 36];
         if trail.is_some() && racer_crypto::identity::canonical_uuid(&destination.0) {
             remote.copy_from_slice(destination.0.as_bytes());
@@ -1815,11 +1827,20 @@ impl CandidatePolicy {
             check_budget(scope, budget)?;
             let stop = stopped.or_else(|| attempt_scope.check().err());
             facts.stop = stop;
+            // The caller's scope and budget still hold here, so a deadline is
+            // the attempt's own bound: the request was sent and is unanswered
+            // (`WalkOutcome::TimedOut`, Known issue 31).
             match stop {
-                Some(Error::DeadlineExceeded) => Err(Error::Unavailable),
+                Some(Error::DeadlineExceeded) => {
+                    *timed_out = true;
+                    Err(Error::Unavailable)
+                }
                 Some(error) => Err(error),
                 None => match response {
-                    Err(Error::DeadlineExceeded) => Err(Error::Unavailable),
+                    Err(Error::DeadlineExceeded) => {
+                        *timed_out = true;
+                        Err(Error::Unavailable)
+                    }
                     result => result,
                 },
             }

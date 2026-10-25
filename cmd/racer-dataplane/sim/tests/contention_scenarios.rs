@@ -422,6 +422,39 @@ fn hot_page_readers_fan_out_through_helpers() {
     );
 }
 
+/// Known issue 31 (round 4, overload): with the origin far slower than the
+/// demand, rank 0's request for a page queues for seconds. Owners above rank
+/// 0 whose `Acquire` to rank 0 (or copy-only probe, which joins rank 0's
+/// running acquisition) timed out used to fetch the page themselves, behind
+/// rank 0's request at the same origin. They now leave the fetch to rank 0,
+/// so no origin request overlaps another node's request for the same page.
+#[test]
+fn owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch() {
+    let nodes = 300;
+    let mut config = quiet(nodes);
+    config.pages_per_object = 64;
+    // 64 MiB of cold pages at 8 MiB/s: rank 0's requests queue for up to
+    // 8 s, past the 2 s attempt timeout of the owners delegating to it.
+    config.origin_bps = 8 << 20;
+    config.duration_ns = 60 * SECONDS;
+    // Few enough readers that rank 0's flight never refuses a waiter (an
+    // `Overloaded` rank 0 is still transient evidence).
+    config.storms = vec![storm(0, 0, 48, 100 * MILLIS)];
+    let report = run(config, 3);
+    assert!(counter(&report, "origin_left_to_rank0") > 0, "{report}");
+    assert_eq!(
+        counter(&report, "origin_repeats_concurrent"),
+        0,
+        "{}",
+        report["origin_per_page"]
+    );
+    assert_eq!(
+        report["origin_per_page"]["max_requests_per_page"], 1,
+        "{}",
+        report["origin_per_page"]
+    );
+}
+
 /// Known issue 18 (round 4, relay): a relay forwarding a body still queued at
 /// a busy owner reserved its own NIC at the body's future send time, so its
 /// other sends queued behind the gap, backlogs spread from relay to relay and

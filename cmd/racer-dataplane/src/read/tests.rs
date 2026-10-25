@@ -2247,6 +2247,8 @@ mod timeouts {
         /// Answer Subscribes with a signed `Unavailable`, as a relay does
         /// when the provider behind it drops the exchange.
         relay_unavailable: Cell<bool>,
+        /// Page requests fail at once with a transport error (`Io`).
+        fail_pages: Cell<bool>,
     }
 
     impl Peers {
@@ -2340,11 +2342,13 @@ mod timeouts {
                 attempts: request.route.remaining_attempts,
                 links: request.route.remaining_links,
             });
-            let refused = self.refuse_flights.get()
+            let refused = (self.refuse_flights.get()
                 && matches!(
                     &request.operation,
                     PeerOperation::Subscribe { subscription, .. } if subscription.flights.is_some()
-                );
+                ))
+                || (self.fail_pages.get()
+                    && matches!(&request.operation, PeerOperation::Page { .. }));
             Box::pin(async move {
                 let _membership = membership;
                 if refused {
@@ -2423,6 +2427,7 @@ mod timeouts {
                 late_success,
                 refuse_flights: Cell::new(false),
                 relay_unavailable: Cell::new(false),
+                fail_pages: Cell::new(false),
             });
             let policy = CandidatePolicy::new(
                 local,
@@ -2777,6 +2782,61 @@ mod timeouts {
         assert_eq!(f.scope.check(), Ok(()));
     }
 
+    /// Known issue 31: an owner above rank 0 whose page `Acquire` to rank 0
+    /// is sent but unanswered within the attempt does not take origin
+    /// authority (rank 0 is most likely still fetching); the walk ends
+    /// `Unavailable` and the caller retries into rank 0's acquisition. A
+    /// transport failure from rank 0 still lets the owner fetch.
+    #[test]
+    fn owner_page_walk_leaves_the_fetch_to_a_rank_zero_that_times_out() {
+        for stalled in [1, 0] {
+            let clock = uring_runtime::environment::SimulationClock::new(201);
+            let _env = clock.environment(0).enter();
+            let mut f = Fixture::new(Some(1), stalled, false).bounded(201, 60, 24);
+            f.policy = f.policy.with_attempt_timeout(Duration::from_secs(1));
+            if stalled == 0 {
+                // Rank 0 refuses at once: a transport failure, not a timeout.
+                f.peers.fail_pages.set(true);
+            }
+            let operation = PeerOperation::Page {
+                page: crate::model::PageId {
+                    version: ObjectVersion {
+                        object: f.context.object.clone(),
+                        etag: StrongEtag::test_value("v"),
+                    },
+                    number: PageNumber(0),
+                },
+                mode: FetchMode::Acquire,
+            };
+            let rank0 = f.candidates.ordered[0].clone();
+            let mut resolve = f.policy.resolve_with_budget(
+                f.candidates,
+                &f.context,
+                operation,
+                &f.scope,
+                &mut f.budget,
+            );
+            if stalled != 0 {
+                assert!(poll(resolve.as_mut()).is_pending());
+                clock.advance(Duration::from_secs(2));
+            }
+            let Poll::Ready(result) = poll(resolve.as_mut()) else {
+                panic!("bounded resolution")
+            };
+            drop(resolve);
+            let calls = f.peers.calls.borrow();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].destination, rank0);
+            assert!(!calls[0].copy, "rank 1 delegates with an Acquire");
+            if stalled != 0 {
+                assert!(matches!(result, Err(Error::Unavailable)));
+            } else {
+                assert!(matches!(result, Ok(CandidateResolution::Origin(_))));
+            }
+            assert_eq!(f.scope.check(), Ok(()));
+        }
+    }
+
     #[test]
     fn candidate_final_remaining_copy_and_origin_miss_only_at_final_boundary() {
         let clock = uring_runtime::environment::SimulationClock::new(200);
@@ -2801,16 +2861,13 @@ mod timeouts {
             membership: f.candidates.membership.clone(),
             ordered: f.candidates.ordered.clone(),
         };
+        // A metadata walk: rank 1 takes origin authority from rank 0's
+        // timeout. (A page walk leaves the fetch to rank 0 instead, Known
+        // issue 31; see `owner_page_walk_leaves_the_fetch_to_a_rank_zero_that_times_out`.)
         let mut resolve = f.policy.resolve_with_budget(
             candidates,
             &f.context,
-            match &operation {
-                PeerOperation::Page { page, .. } => PeerOperation::Page {
-                    page: page.clone(),
-                    mode: FetchMode::Acquire,
-                },
-                _ => unreachable!(),
-            },
+            f.operation(),
             &f.scope,
             &mut f.budget,
         );
