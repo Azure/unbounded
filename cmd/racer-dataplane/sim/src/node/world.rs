@@ -815,6 +815,11 @@ pub struct NodeWorld {
     /// End times of all page bodies each node is still streaming.
     bodies: HashMap<u32, Vec<Nanos>, Fixed>,
     origin_per_page: HashMap<u64, u32, Fixed>,
+    /// Per page, origin requests classified `origin_repeats_after_failure`
+    /// (the previous request for the page failed). Known issue 55: the
+    /// worst pages are such retries; the report's
+    /// `max_requests_per_page_excluding_failure_retries` leaves them out.
+    failure_retries_per_page: HashMap<u64, u32, Fixed>,
     /// Earliest scheduled [`Event::OriginWake`], which delivers origin
     /// completions a cancellation moved earlier ([`Origin::pop_moved`]), so
     /// a cancellation schedules one event, not one per moved request.
@@ -947,6 +952,7 @@ impl NodeWorld {
             pings: HashMap::default(),
             bodies: HashMap::default(),
             origin_per_page: HashMap::default(),
+            failure_retries_per_page: HashMap::default(),
             origin_wake: None,
             last_origin: HashMap::default(),
             tasks: HashMap::default(),
@@ -5340,6 +5346,9 @@ impl NodeWorld {
             );
             "origin_repeats_copy_held"
         };
+        if class == "origin_repeats_after_failure" {
+            *self.failure_retries_per_page.entry(page).or_default() += 1;
+        }
         self.metrics.incr(class);
     }
 
@@ -5998,6 +6007,10 @@ impl NodeWorld {
                 + self.tasks.len() * (std::mem::size_of::<Task>() + 256),
         ));
         list.push(("origin_per_page", self.origin_per_page.capacity() * 16));
+        list.push((
+            "failure_retries_per_page",
+            self.failure_retries_per_page.capacity() * 16,
+        ));
         list.push(("last_origin", self.last_origin.capacity() * 32));
         list.push((
             "node_rng",
@@ -6022,6 +6035,21 @@ impl NodeWorld {
         let nodes = self.config.nodes.max(1) as usize;
         let duplicated = self.origin_per_page.values().filter(|c| **c > 1).count();
         let max_per_page = self.origin_per_page.values().copied().max().unwrap_or(0);
+        // Known issue 55: requests per page other than retries after a
+        // failed origin request, and the most such retries on one page.
+        let retries = |p: &u64| self.failure_retries_per_page.get(p).copied().unwrap_or(0);
+        let max_without_retries = self
+            .origin_per_page
+            .iter()
+            .map(|(p, c)| c - retries(p))
+            .max()
+            .unwrap_or(0);
+        let max_retries = self
+            .failure_retries_per_page
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0);
         let requests: u64 = self.origin_per_page.values().map(|c| u64::from(*c)).sum();
         let pages = self.origin_per_page.len();
         // Pages by origin request count.
@@ -6048,6 +6076,8 @@ impl NodeWorld {
                 "requests": requests,
                 "pages_fetched_more_than_once": duplicated,
                 "max_requests_per_page": max_per_page,
+                "max_requests_per_page_excluding_failure_retries": max_without_retries,
+                "max_failure_retries_per_page": max_retries,
                 "histogram": histogram,
                 "mean_requests_per_page": if pages == 0 { 0.0 } else { requests as f64 / pages as f64 },
                 "page_bytes": self.config.page_bytes,
