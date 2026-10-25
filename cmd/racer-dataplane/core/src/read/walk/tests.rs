@@ -1803,3 +1803,49 @@ fn retry_affordable_keeps_later_visits_funded() {
         b.remaining_attempts()
     );
 }
+
+/// Wave 5 interplay of the lineage grants (Known issues 34 and 35) with the
+/// rank 0 timeout rule (Known issues 31, 39 and 40): an owner above rank 0
+/// whose granted targets time out keeps origin authority, since only its
+/// probe of rank 0 decides it; a timeout of rank 0 still withholds it after
+/// granted probes; and the grants never draw on the walk's budget.
+#[test]
+fn granted_probes_leave_the_rank_zero_timeout_rule_alone() {
+    let with = |state: Rank0State| WalkConfig {
+        handoff: 2,
+        granted: 2,
+        rank0: state,
+        ..config(Some(1), 3, VisitOrder::canonical(3))
+    };
+    for state in [Rank0State::Unknown, Rank0State::Fetching] {
+        // Granted targets time out, rank 0 answers a miss: origin.
+        let mut walk = CandidateWalk::new(with(state));
+        let mut b = budget(8, 32);
+        let (probes, end) = drive(&mut walk, &mut b, |p, _| {
+            if p.canonical == 0 {
+                Outcome::Probe(ProbeOutcome::CopyMiss)
+            } else {
+                Outcome::TimedOut
+            }
+        });
+        assert!(probes.iter().any(|(p, ..)| p.canonical == 0), "{state:?}");
+        assert!(
+            probes.iter().filter(|(p, ..)| p.canonical >= 3).count() == 2,
+            "{state:?}: both granted targets asked"
+        );
+        assert!(matches!(end, End::Origin { rank: 1, .. }), "{state:?}");
+        assert!(!walk.rank0_unanswered(), "{state:?}");
+        assert!(b.remaining_attempts() <= 8 && b.remaining_links() <= 32);
+        // Rank 0 times out after the granted targets missed: withheld.
+        let mut walk = CandidateWalk::new(with(state));
+        let (_, end) = drive(&mut walk, &mut budget(8, 32), |p, _| {
+            if p.canonical == 0 {
+                Outcome::TimedOut
+            } else {
+                Outcome::Probe(ProbeOutcome::CopyMiss)
+            }
+        });
+        assert_eq!(end, End::Exhausted { funding: false }, "{state:?}");
+        assert!(walk.rank0_unanswered(), "{state:?}");
+    }
+}
