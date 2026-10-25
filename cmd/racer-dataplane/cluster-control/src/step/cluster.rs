@@ -680,6 +680,8 @@ impl ControlPlane {
         lease.spec = spec;
         lease.holder = Some(pod);
         lease.ready = None;
+        // A new holder serves nothing until its first follower read.
+        lease.served = None;
         self.stats.seat_claims += 1;
         let p = &mut self.pods[pod as usize];
         p.lottery.won();
@@ -997,6 +999,12 @@ impl ControlPlane {
         }
         self.pods[pod as usize].follow_at = u64::MAX;
         if self.pods[pod as usize].seat.is_none() {
+            return;
+        }
+        if self.pods[pod as usize].reading.is_some() {
+            // One read at a time (a seat claimed again while its last read
+            // is in flight): that read's completion reads again.
+            self.pods[pod as usize].woken_during_read = true;
             return;
         }
         self.stats.api_reads += 1;

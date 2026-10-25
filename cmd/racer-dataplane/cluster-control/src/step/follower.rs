@@ -59,8 +59,9 @@ pub fn read(r: &SecretRead<'_>) -> Read {
 
 /// Whether a state read is older news rather than a rollback: another
 /// installer (the primary's own commit, `primary.rs` `reconcile`) raised the
-/// high water mark while the read was in flight, and the read is not newer
-/// than it. The read may have been answered before that commit; it is
+/// high water mark while the read was in flight, and the read is older
+/// than it (the same sequence is installed as usual, so a seat still
+/// learns it serves that sequence). The read may have been answered before that commit; it is
 /// dropped instead of failing closed. A genuine rollback is still refused by
 /// the next read, which starts after the installation (Known issue 421).
 pub fn superseded(
@@ -68,7 +69,7 @@ pub fn superseded(
     high_water: Option<&StateRecord>,
     record: &StateRecord,
 ) -> bool {
-    installed_during_read && high_water.is_some_and(|h| record.sequence <= h.sequence)
+    installed_during_read && high_water.is_some_and(|h| record.sequence < h.sequence)
 }
 
 /// Whether `record` may replace the high water mark. A rollback is never
@@ -195,9 +196,10 @@ mod tests {
     #[test]
     fn superseded_reads_are_dropped_only_after_an_install_during_the_read() {
         let high = record(5);
-        // Older or equal news while another installer raised the mark.
+        // Older news while another installer raised the mark.
         assert!(superseded(true, Some(&high), &record(4)));
-        assert!(superseded(true, Some(&high), &record(5)));
+        // The same record: installed as usual.
+        assert!(!superseded(true, Some(&high), &record(5)));
         // Newer: installed as usual.
         assert!(!superseded(true, Some(&high), &record(6)));
         // Nothing installed during the read: a rollback is a rollback.
