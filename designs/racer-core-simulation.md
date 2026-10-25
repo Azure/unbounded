@@ -452,7 +452,13 @@ Verified against the code at the start of this work.
    3771e5c3f, 376 with the relay fixes, 0 after). See "Round 4: flight (wave 3)" (round 4,
    flight, wave 3).
 
-25. Partly resolved (round 4, history, wave 4, 8ba959e3f..f8ec46f53): membership chains record
+25. Resolved (round 4, lineage, wave 5, with Known issues 34 and 35): owners also ask the members
+   ranked just below them and ask every lineage target on its own grant; 5k `full-churn`
+   moved-page repeats 884 to 188 (origin requests 13,471 to 12,748, pages fetched more than once
+   852 to 216), 5k `full-cold-start` 37 to 12. What remains are holders that were never owners
+   or are ranked sixth or lower, holders that dropped the copy, and unreachable holders; bound in
+   "Round 4: lineage (wave 5)". See that section.
+   Was partly resolved (round 4, history, wave 4, 8ba959e3f..f8ec46f53): membership chains record
    when each member arrived (`topology::Membership::since`). Placement is rendezvous hashing, so
    a later owner that arrived before an owner ranked above it until then and may still hold the
    page, however many versions ago it moved. Owners ask such lineage targets copy-only before
@@ -543,14 +549,24 @@ Verified against the code at the start of this work.
    because the chosen receiver was not an overlay neighbor of the source and the read went through
    a relay. Harness precondition: the receiver is now a ranked candidate that neighbors the source.
 
-34. Holders ranked below the page's three owners are not asked. A member displaced from the
+34. Resolved (round 4, lineage, wave 5): placement keeps two more scores per slot
+   (`topology::RANKED_DEPTH` 5, `Placement::demoted`), and an owner asks, copy-only on its own
+   grant, the members ranked fourth and fifth that arrived before it and were owners when they
+   arrived (`walk::demoted_targets`). 5k `full-churn`: moved-page repeats 405 (lineage grants
+   alone) to 188; 9,476 demoted probes found 217 copies. See "Round 4: lineage (wave 5)".
+   Was: holders ranked below the page's three owners are not asked. A member displaced from the
    owners by later arrivals keeps its copy but now ranks fourth or lower, and placement keeps only
    the best three scores per slot (`topology::placement::Ranking`), so no lineage target names it.
    In an instrumented 5k `full-churn` run, 375 of 790 moved-page repeats whose holder was unasked
    had such a holder. Fixing it needs deeper rankings (keep more scores per slot, with the
    incremental update and memory bound that implies). Open (round 4, history, wave 4).
 
-35. Rank 0 reached by an owner's delegation usually carries one credit, which it keeps for its own
+35. Resolved (round 4, lineage, wave 5): every lineage target is asked on its own one-attempt
+   grant, like successor targets (`WalkConfig::granted`), so the walk's budget never grows and a
+   delegated rank 0 keeps its origin credit. Lineage probes then exposed Known issue 311, fixed
+   too. 5k `full-churn`: moved-page repeats 884 to 405 from the grants alone, failed reads 1 to 1.
+   See "Round 4: lineage (wave 5)".
+   Was: rank 0 reached by an owner's delegation usually carries one credit, which it keeps for its own
    origin attempt, so it cannot ask its lineage targets (in the instrumented 5k `full-churn` run,
    385 of 415 repeats whose holder was a listed but unasked lineage target started with one
    credit). Readers fund the delegating owner's lineage credits only from slack beyond every
@@ -579,6 +595,28 @@ Verified against the code at the start of this work.
    or admission) or the route to rank 0 fails, even though rank 0 is fetching the page: 958 route
    and 126 `Overloaded` skips of the 1,088 remaining overlapping requests in 5k `zipf` at 16 MiB
    pages. Open (round 4, overload, wave 4).
+
+311. Resolved (round 4, lineage, wave 5): a copy-only probe that reached a node with a running
+   acquisition of the page joined it (Known issue 31), also when the prober was an earlier owner.
+   Owners above rank 0 delegate to rank 0, so a later owner's acquisition usually waits on rank 0
+   itself: rank 0's lineage probe waited on its own answer until its time share ran out. With
+   lineage grants, 6,641 of 9,354 copy-only joins in 5k `full-churn` were such cycles, and 6,525 of
+   12,303 lineage probes failed (`TimedOut` or `Unavailable`). Production and the simulator now
+   decline the join for a requester that is an owner ranked before the destination, or an owner
+   asking a non-owner (`racer_core::read::serve::copy_join_allowed`,
+   `Coordinator::copy_join_allowed`); lineage probe failures 6,525 to 6.
+
+312. Lineage and demoted probes are sequential round trips before origin, and most miss (5k
+   `full-churn`: 21,313 probes, 776 copies). In the simulator's multi-hop network this raises the
+   mean read latency of 5k `full-churn` from 71 to 95 ms (p99 150 to 268 ms) and of 5k
+   `full-failover` from 76 to 89 ms; reads that fail do not change. Asking the granted targets
+   concurrently (or with a hedge) would bound the cost to one round trip. Open (round 4, lineage,
+   wave 5).
+
+313. Rendezvous ranks below the fifth are not kept, and a member that was never an owner while
+   the page was read has nothing to give; 157 of the 188 moved-page repeats left in 5k
+   `full-churn` had a holder older than version - 1 that was not asked (holders ranked sixth or
+   lower, or listed after the three-target cap). Open (round 4, lineage, wave 5).
 
 ## Simulator engine (racer-sim substrate)
 
@@ -1044,9 +1082,9 @@ scenarios carry data-plane faults.
    wave 4).
 24. Resolved: core `PageFlights` retains leader operations like production `Flights`; the
    simulator retains each fill (round 4, flight, wave 3).
-25. Partly resolved: owners ask, and readers visit first, later owners that arrived before them
-   (lineage); 50k `full-cold-start` moved-page repeats 2,629 to 1,919; rest is 34 and 35
-   (round 4, history, wave 4).
+25. Resolved: owners ask, and readers visit first, later owners that arrived before them
+   (lineage, round 4, history, wave 4), plus demoted members, all on their own grants (round 4,
+   lineage, wave 5); 5k `full-churn` moved-page repeats 884 to 188.
 26. Partly resolved: readers that cannot fall back wait once for an owner that is behind, and
    stale answers refund their remote credits; 50k `full-cold-start` failed reads 248 to 95; rest
    is 36 (round 4, history, wave 4).
@@ -1064,10 +1102,10 @@ scenarios carry data-plane faults.
    `zipf` at 16 MiB overlapping origin requests 18,030 to 1,088 (round 4, overload, wave 4).
 32. Resolved: DST native harness recovers stale links to re-added peers (round 4, leak).
 33. Resolved: DST native fault reads go to a neighbor of the source (round 4, leak).
-34. Holders ranked below the three owners are not asked (placement keeps three scores per
-   slot) (round 4, history, wave 4).
-35. Rank 0 reached by a delegation has too few credits to ask its lineage targets (round 4,
-   history, wave 4).
+34. Resolved: placement keeps five scores per slot; owners ask the fourth and fifth when they
+   were owners on arrival (round 4, lineage, wave 5).
+35. Resolved: lineage probes run on their own grant, like successor probes (round 4, lineage,
+   wave 5).
 36. One wait does not cover the 50k propagation window: 95 failed reads in `full-cold-start`
    (round 4, history, wave 4).
 37. Orphans whose holder never reached rank 0 still refetch (50k 893 left) (round 4, orphan2).
@@ -1076,6 +1114,12 @@ scenarios carry data-plane faults.
    overload, wave 4).
 40. Owners above rank 0 still fetch after a route failure or an `Overloaded` answer from a rank 0
    that is fetching (1,088 overlapping requests left) (round 4, overload, wave 4).
+311. Resolved: a copy-only probe from an earlier owner joined a later owner's acquisition that
+   waited on the prober; the join is now declined (round 4, lineage, wave 5).
+312. Sequential lineage and demoted probes add latency before origin (5k `full-churn` mean read
+   71 to 95 ms) (round 4, lineage, wave 5).
+313. Holders ranked sixth or lower, or past the three-target cap, are not asked (157 of 188 5k
+   `full-churn` moved repeats) (round 4, lineage, wave 5).
 
 ## Round 2: production admission
 
@@ -4319,3 +4363,142 @@ worst page, pages fetched more than once.
 ### Open issues after wave 4
 
 19 (partly), 25 (partly), 26 (partly), 34 to 40.
+
+## Round 4: lineage (wave 5)
+
+Known issues 25 (remainder), 34 and 35. Branch `racer-sim7-lineage` from racer-core-sim
+113a0990d. Nothing was cherry-picked. Evidence: `/tmp/opencode/r7-lineage/`.
+
+### Root causes
+
+- Issue 34: `Ranking::insert` kept only the best `REPLICAS` (3) scores per slot
+  (`topology/src/placement.rs:580-586` on 113a0990d), so a member that later arrivals pushed to
+  rank 4 or lower was invisible to every owner, although rendezvous scores never change and it
+  still held the copy it fetched while it was an owner.
+- Issue 35: handoff probes (lineage and version - 1 targets) spent the walk's budget and stopped
+  before the owner's own origin credit (`core/src/read/walk.rs:609` on 113a0990d,
+  `remaining_attempts() < 2`). A delegation carries rank 0's origin credit only, so a delegated
+  rank 0 asked none of them. Funding them from the reader's 8-attempt budget (tried in wave 4)
+  took credits that later visits needed.
+- Known issue 311, found here: once lineage probes ran, half of them failed. A temporary counter
+  in the simulator's `join_copy` showed that 6,641 of 9,354 copy-only flight joins in 5k
+  `full-churn` joined an acquisition whose fill had a pending probe to the requester itself. A
+  copy-only probe joins any running acquisition of the page (Known issue 31;
+  `src/read/fill.rs:1420` on 113a0990d, simulator `join_copy` at `sim/src/node/world.rs:3268`).
+  Rank 0's lineage targets are later owners, and a later owner with a running acquisition is
+  most likely delegating to rank 0, so the probe waited on its own answer until its time share
+  ran out (`TimedOut` 3,292, `Unavailable` 3,221 of 12,303 lineage probes).
+
+### Changes
+
+- topology: `RANKED_DEPTH` (5) scores per slot; `Placement::demoted` returns ranks 4 and 5 from a
+  complete cached ranking only (never ranks). `candidates()` still returns the three owners, so
+  every other caller is unchanged. The incremental update applies the same rule to all retained
+  scores (a retained member that leaves or loses weight forces a rescore), so ranks 4 and 5 are
+  exact; the update test compares them with full scoring. `Rankings::demoted` for `Scored` and
+  `Phantom`.
+- racer-core `walk`: `demoted_targets` (members ranked 4 and 5 that arrived before this owner
+  and had fewer than three members ranked above them present when they arrived, so they were
+  owners then; unknown arrivals count as present and never add a target), `granted_prefix`,
+  and `WalkConfig::granted` (renamed from `successors`): successor targets, then lineage
+  targets (later owners and demoted members), each probed copy-only on its own one-attempt,
+  eight-link grant that is never added back (the orphan2 mechanism). Version - 1 targets after
+  them are still funded from the walk.
+- racer-core `serve::copy_join_allowed(owners, local, requester)`: a copy-only request may wait on
+  a running acquisition only when the requester is not an owner or is an owner ranked after this
+  node (the Known issue 31 case: an owner asking a predecessor that fetches for everyone).
+- Production: `CandidatePolicy::resolve_epoch_traced` adds demoted targets to the lineage targets
+  (at most `MAX_HANDOFF` in all) and grants them; `Coordinator::copy_join_allowed` ranks the page
+  only while an acquisition of it runs and serves the request through
+  `FillEngine::copy_only_joining(page, scope, join)`; new counter
+  `racer_copy_join_declined_total`. No wire change.
+- Simulator: the same, with knobs `node.demoted_targets`, `node.lineage_grants`,
+  `node.lineage_slack` (reader slack funding of lineage credits, kept on like production) and
+  `node.copy_join_rank` (all default on), counters `lineage_grant_*`, `demoted_*`,
+  `copy_only_join_declined`, and the placement memo estimate raised from 192 to 240 bytes per
+  entry.
+
+### Tests
+
+- topology: `demoted_lists_the_next_ranks_from_complete_cached_rankings_only` (missing, partial,
+  obsolete and uncached rankings are `None`; matches full scoring; `Scored` equals `Phantom`);
+  the incremental update oracle now checks ranks 4 and 5; the entry budget test checks the larger
+  score vector (`ENTRY_BYTES` unchanged at 1,024).
+- racer-core: `demoted_targets_are_members_that_were_owners_when_they_arrived`,
+  `granted_prefix_counts_leading_successor_and_lineage_targets`,
+  `delegated_rank_zero_asks_granted_lineage_targets_and_keeps_origin_credit`,
+  `serve::tests::copy_only_joins_only_for_readers_and_later_owners`.
+- Production: `a_delegated_rank_zero_asks_lineage_and_demoted_targets_on_their_own_grant` (budget
+  1 attempt, 1 link: holder at rank 1, 2 or the fourth-ranked member gives a copy without origin
+  and the credit stays; no holder asks all three then fetches once; a chain whose members arrived
+  together asks no one; fails before the change with no peer call), and
+  `copy_only_without_join_misses_a_running_acquisition_and_with_join_waits` (fill tests). The
+  `Coordinator::copy_join_allowed` glue is covered by the simulator, not by a production test.
+- Simulator: `combined::tests::demoted_targets_and_lineage_grants_find_more_moved_copies` (500
+  nodes `full-churn`: grants cut moved-page repeats, demoted targets cut them further, the join
+  rule cuts lineage probe failures more than fourfold, failed reads do not grow).
+
+### Evidence
+
+Release, seed 1, 5k, the wave 4 configurations (`full-*` with `/tmp/opencode/m4b/rr.json`, `cs1g`
+and `z16` from `/tmp/opencode/m6/`). Before is the wave 4 merge (`/tmp/opencode/m6/a/`). Origin:
+requests, worst page, pages fetched more than once. "Move" is `after_owner_move` repeats. Latency:
+mean / p99 of `read_ns` in ms. Probes: lineage plus demoted granted probes / copies.
+
+| Run | Reads ok / failed | Origin | Move | `copy_held` | Latency | Probes | Joins declined |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| storm before | 378,544 / 0 | 1,024, 1, 0 | 0 | 0 | 47 / 167 | - | - |
+| storm after | 378,544 / 0 | 1,024, 1, 0 | 0 | 0 | 47 / 167 | 0 / 0 | 0 |
+| zipf before | 202,961 / 24 | 40,324, 3, 1,388 | 0 | 199 | 155 / 1,476 | - | - |
+| zipf after | 202,961 / 24 | 40,324, 3, 1,388 | 0 | 199 | 155 / 1,476 | 0 / 0 | 0 |
+| churn before | 291,542 / 90 | 1,029, 2, 5 | 5 | 0 | 41 / 125 | - | - |
+| churn after | 291,523 / 87 | 1,028, 2, 4 | 4 | 0 | 41 / 125 | 0 / 0 | 0 |
+| zipf 16 MiB before | 37,524 / 29 | 18,866, 3, 1,181 | 0 | 5 | 708 / 6,442 | - | - |
+| zipf 16 MiB after | 37,532 / 29 | 18,872, 3, 1,184 | 0 | 5 | 708 / 6,442 | 0 / 0 | 1 |
+| 1 Gbit/s storm before | 94,829 / 0 | 6,931, 3, 36 | 37 | 0 | 337 / 1,342 | - | - |
+| 1 Gbit/s storm after | 94,828 / 0 | 6,906, 2, 12 | 12 | 0 | 339 / 1,207 | 5,467 / 26 | 1,797 |
+| full-cold-start before | 94,830 / 0 | 6,931, 3, 36 | 37 | 0 | 50 / 134 | - | - |
+| full-cold-start after | 94,829 / 0 | 6,906, 2, 12 | 12 | 0 | 52 / 201 | 5,468 / 26 | 1,797 |
+| full-failover before | 33,794 / 37 | 13,018, 5, 425 | 52 | 125 | 76 / 301 | - | - |
+| full-failover after | 33,796 / 32 | 12,940, 6, 376 | 23 | 95 | 89 / 335 | 10,324 / 58 | 3,247 |
+| full-churn before | 33,996 / 1 | 13,471, 4, 852 | 884 | 6 | 71 / 150 | - | - |
+| full-churn after | 33,991 / 1 | 12,748, 3, 216 | 188 | 3 | 95 / 268 | 21,313 / 776 | 6,025 |
+
+Steps, 5k `full-churn` (same binary, knobs): grants without demoted targets and without the join
+rule: moved 202, origin 12,811, lineage probe failures 6,525, failed reads 3, worst page 6;
+grants with the join rule, no demoted targets: moved 405, origin 12,982, failures 12; all three:
+moved 188, origin 12,748. Turning reader slack funding off (`lineage_slack` 0) gave the same
+trace hash in `full-churn` and `full-failover`: with grants it no longer funds anything that
+matters here, but production keeps it.
+
+- Moved-page repeats fall 79% at 5k `full-churn` (884 to 188) and 56% at `full-failover` (52 to
+  23); origin requests fall 723 and 78; `full-cold-start` 37 to 12. Scenarios without membership
+  changes are unchanged (zipf, storm, zipf 16 MiB: same origin counts within noise).
+- Cost: one copy-only exchange per granted probe, at most three per owner fetch (`MAX_HANDOFF`),
+  most of which miss (Known issue 312: mean read latency in `full-churn` 71 to 95 ms).
+- Hard invariants, including `origin_repeat_explained` (`unexplained` 0) and
+  `budget_never_grows`, hold in every run.
+
+### Bounds
+
+- Granted probes: at most `MAX_HANDOFF` (3) per owner walk in all (successor, lineage, demoted,
+  in that order), each with one attempt and eight links that are never added to the walk's
+  budget, so budgets never grow and a delegated rank 0 keeps its origin credit. A cluster whose
+  members arrived together, or a node whose chain began after them, has no lineage or demoted
+  targets and pays nothing.
+- No origin authority changes: every new probe is copy-only (`only_owner_hits_origin` holds).
+- The join rule only turns a wait into a miss; a reader or later owner still joins.
+- Memory: `Ranking` keeps 5 scores (capacity 6, 144 bytes of scores instead of 96); the
+  production entry budget `Placement::ENTRY_BYTES` (1,024) still covers it, and the simulator's
+  shared memo grows by 48 bytes per (membership, slot).
+
+### Deviations and open items
+
+- Known issue 25 is resolved for what lineage can know: a moved page is now asked of every owner
+  that ranked above it on arrival among the five best-ranked members, within three probes. What
+  remains (5k `full-churn`: 157 unasked older holders, 26 lost copies, 3 unreachable) is Known
+  issue 313 (ranks below five, the three-target cap) and copies that were evicted.
+- New Known issue 312: the probes are sequential; probing granted targets concurrently would cap
+  the latency at one round trip.
+- The temporary counters used for the root cause of Known issue 311 were removed before
+  committing.
