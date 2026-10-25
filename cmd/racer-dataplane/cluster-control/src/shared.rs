@@ -48,6 +48,9 @@ pub struct Serving {
     /// [`crate::seat::fail_closed`], so a rolled back or wiped Secret is
     /// refused for the life of the process.
     pub high_water: Option<StateRecord>,
+    /// Records installed so far, by the follower or the primary (see
+    /// [`crate::step::follower::superseded`]).
+    pub installs: u64,
 }
 
 /// The issuer this process offers, reused across seat claims so that
@@ -92,6 +95,12 @@ pub struct Shared {
     pub serving: RefCell<Serving>,
     /// Notified when the image, bundle, or authority changes.
     pub changed: Signal,
+    /// Notified on every primary Lease change ([`crate::seat::apply_primary`]),
+    /// and only then: a seat follower takes its generation before reading
+    /// the state, so a change that arrives during the read wakes it again
+    /// (Known issue 48), without the follower's own installation (which
+    /// notifies `changed`) waking it.
+    pub primary_lease: Signal,
     pub verifier: Arc<DynamicClientVerifier>,
     /// Live seat holders by seat index, kept by the primary.
     pub seat_holders: RefCell<BTreeMap<usize, SeatHolder>>,
@@ -233,6 +242,7 @@ pub(crate) mod tests {
             issuer: RefCell::new(None),
             serving: RefCell::new(Serving::default()),
             changed: Signal::default(),
+            primary_lease: Signal::default(),
             verifier: DynamicClientVerifier::new(),
             seat_holders: RefCell::new(BTreeMap::new()),
             is_primary: Cell::new(false),

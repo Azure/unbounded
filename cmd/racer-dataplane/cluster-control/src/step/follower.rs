@@ -57,6 +57,20 @@ pub fn read(r: &SecretRead<'_>) -> Read {
     }
 }
 
+/// Whether a state read is older news rather than a rollback: another
+/// installer (the primary's own commit, `primary.rs` `reconcile`) raised the
+/// high water mark while the read was in flight, and the read is not newer
+/// than it. The read may have been answered before that commit; it is
+/// dropped instead of failing closed. A genuine rollback is still refused by
+/// the next read, which starts after the installation (Known issue 421).
+pub fn superseded(
+    installed_during_read: bool,
+    high_water: Option<&StateRecord>,
+    record: &StateRecord,
+) -> bool {
+    installed_during_read && high_water.is_some_and(|h| record.sequence <= h.sequence)
+}
+
 /// Whether `record` may replace the high water mark. A rollback is never
 /// accepted and makes the caller fail closed.
 pub fn admit(high_water: Option<&StateRecord>, record: &StateRecord) -> Result<(), StateError> {
@@ -82,6 +96,8 @@ pub struct Follower {
     pub record: Option<StateRecord>,
     pub confirmed: Option<Instant>,
     pub image: Option<Record>,
+    /// Records installed so far (see [`superseded`]).
+    pub installs: u64,
 }
 
 impl Follower {
@@ -94,6 +110,7 @@ impl Follower {
         self.high_water = Some(record.clone());
         self.record = Some(record);
         self.confirmed = Some(confirmed);
+        self.installs += 1;
         Ok(())
     }
 
@@ -173,6 +190,26 @@ mod tests {
             data,
             accepted_before: false,
         }
+    }
+
+    #[test]
+    fn superseded_reads_are_dropped_only_after_an_install_during_the_read() {
+        let high = record(5);
+        // Older or equal news while another installer raised the mark.
+        assert!(superseded(true, Some(&high), &record(4)));
+        assert!(superseded(true, Some(&high), &record(5)));
+        // Newer: installed as usual.
+        assert!(!superseded(true, Some(&high), &record(6)));
+        // Nothing installed during the read: a rollback is a rollback.
+        assert!(!superseded(false, Some(&high), &record(4)));
+        assert!(!superseded(true, None, &record(4)));
+        let mut f = Follower::default();
+        let now = Instant::now();
+        f.install(record(4), now).unwrap();
+        f.install(record(5), now).unwrap();
+        assert_eq!(f.installs, 2);
+        assert!(f.install(record(4), now).is_err());
+        assert_eq!(f.installs, 2, "a refused record is not an install");
     }
 
     #[test]

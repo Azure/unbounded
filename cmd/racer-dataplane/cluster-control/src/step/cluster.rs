@@ -65,6 +65,10 @@ pub struct Settings {
     /// false, a Pod reports only through [`ControlPlane::report_serving`],
     /// which the client model calls once the dataplane can serve peers.
     pub report_at_start: bool,
+    /// Duration of a seat follower's state Secret read. The read answers
+    /// the state as of its start, so a commit (and its primary Lease
+    /// change) during the read is not in it (Known issue 48).
+    pub follow_read_ns: u64,
 }
 
 impl Default for Settings {
@@ -77,6 +81,7 @@ impl Default for Settings {
             image_bytes_per_member: 128,
             node_monitor_grace: Some(Duration::from_secs(40)),
             report_at_start: true,
+            follow_read_ns: 20_000_000,
         }
     }
 }
@@ -129,8 +134,26 @@ struct Pod {
     follow_at: u64,
     /// Model time this Pod's follower last read the state.
     followed_at: Option<u64>,
+    /// The follower's read in flight: the state as of its start.
+    reading: Option<FollowRead>,
+    /// A primary Lease change arrived during that read
+    /// (`seat.rs` `follower` takes `primary_lease` before the read).
+    woken_during_read: bool,
     lease_fresh_until: Option<u64>,
     primary: Option<Writer>,
+}
+
+/// Model time `p`'s follower read started (`now` if it never read).
+fn p_followed(p: &Pod, now: u64) -> u64 {
+    p.followed_at.unwrap_or(now)
+}
+
+/// What a follower's state Secret read returned (the image is fetched from
+/// the primary after the read, as `seat::follow_once` does).
+struct FollowRead {
+    record: Option<StateRecord>,
+    /// The follower's installation count at the read's start.
+    installs: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -140,6 +163,8 @@ enum Ev {
     Renew(u32),
     Contend(u32),
     Follow(u32),
+    /// The follower's read answers.
+    FollowDone(u32),
     PrimaryRenew(u32),
     Reconcile(u32),
     /// The node lifecycle controller marks a crashed Pod's Node not ready.
@@ -210,6 +235,8 @@ impl ControlPlane {
                 follower: Follower::default(),
                 follow_at: u64::MAX,
                 followed_at: None,
+                reading: None,
+                woken_during_read: false,
                 lease_fresh_until: None,
                 primary: None,
             });
@@ -469,6 +496,8 @@ impl ControlPlane {
         p.follower = Follower::default();
         p.follow_at = u64::MAX;
         p.followed_at = None;
+        p.reading = None;
+        p.woken_during_read = false;
         p.lease_fresh_until = None;
         self.schedule(self.now, pod, Ev::Lottery(pod));
         if !self.node_ready(pod) {
@@ -495,6 +524,8 @@ impl ControlPlane {
             follower: Follower::default(),
             follow_at: u64::MAX,
             followed_at: None,
+            reading: None,
+            woken_during_read: false,
             lease_fresh_until: None,
             primary: None,
         });
@@ -545,6 +576,7 @@ impl ControlPlane {
                 | Ev::Renew(p)
                 | Ev::Contend(p)
                 | Ev::Follow(p)
+                | Ev::FollowDone(p)
                 | Ev::PrimaryRenew(p)
                 | Ev::Reconcile(p)
                 | Ev::NodeNotReady(p)
@@ -571,6 +603,7 @@ impl ControlPlane {
                 Ev::Renew(p) => self.renew(p),
                 Ev::Contend(p) => self.contend(p),
                 Ev::Follow(p) => self.follow(p),
+                Ev::FollowDone(p) => self.follow_done(p),
                 Ev::PrimaryRenew(p) => self.primary_renew(p),
                 Ev::Reconcile(p) => self.reconcile(p, true),
                 Ev::Wake(p) => self.reconcile(p, false),
@@ -935,14 +968,19 @@ impl ControlPlane {
 
     /// The primary Lease changed: every Pod watches it, and a seat
     /// follower wakes on the change (`seat.rs` `follower` waits on
-    /// `shared.changed`, which `apply_primary` notifies), reading at most
-    /// once a second.
+    /// `shared.primary_lease`, which `apply_primary` notifies), reading at
+    /// most once a second. A follower whose read is in flight reads again
+    /// once it completes (Known issue 48).
     fn wake_followers(&mut self) {
         let delay = WATCH_DELAY.as_nanos() as u64;
         let floor = Duration::from_secs(1).as_nanos() as u64;
         for i in 0..self.pods.len() {
-            let p = &self.pods[i];
+            let p = &mut self.pods[i];
             if !p.alive || p.seat.is_none() {
+                continue;
+            }
+            if p.reading.is_some() {
+                p.woken_during_read = true;
                 continue;
             }
             let at = (self.now + delay).max(p.followed_at.map_or(0, |t| t + floor));
@@ -958,16 +996,48 @@ impl ControlPlane {
             return;
         }
         self.pods[pod as usize].follow_at = u64::MAX;
-        let Some(index) = self.pods[pod as usize].seat else {
+        if self.pods[pod as usize].seat.is_none() {
+            return;
+        }
+        self.stats.api_reads += 1;
+        let read = FollowRead {
+            record: self.record.clone(),
+            installs: self.pods[pod as usize].follower.installs,
+        };
+        let p = &mut self.pods[pod as usize];
+        p.followed_at = Some(self.now);
+        p.reading = Some(read);
+        p.woken_during_read = false;
+        if self.settings.follow_read_ns == 0 {
+            return self.follow_done(pod);
+        }
+        let at = self.now + self.settings.follow_read_ns;
+        self.schedule(at, pod, Ev::FollowDone(pod));
+    }
+
+    /// The follower's read answered: install what it returned, then wait
+    /// for the next wake or `FOLLOW_INTERVAL`.
+    fn follow_done(&mut self, pod: u32) {
+        let p = &mut self.pods[pod as usize];
+        let Some(read) = p.reading.take() else {
             return;
         };
-        self.pods[pod as usize].followed_at = Some(self.now);
+        let woken = std::mem::take(&mut p.woken_during_read);
+        let Some(index) = p.seat else {
+            return;
+        };
+        let is_primary = p.primary.is_some();
         let now = self.at(self.now);
-        self.stats.api_reads += 1;
-        let is_primary = self.pods[pod as usize].primary.is_some();
-        if let Some(r) = self.record.clone() {
+        // Confirmed as of the read's start, as `seat::follow_once` passes
+        // `started`.
+        let started = self.at(p_followed(&self.pods[pod as usize], self.now));
+        let f = &self.pods[pod as usize].follower;
+        let record = read.record.filter(|r| {
+            !super::follower::superseded(f.installs != read.installs, f.high_water.as_ref(), r)
+        });
+        if let Some(r) = record {
             let f = &mut self.pods[pod as usize].follower;
-            if f.install(r.clone(), now).is_ok()
+            if f.install(r.clone(), started).is_ok()
                 && super::follower::need_image(&r, f.image.as_ref(), is_primary)
                 && let Some(i) = &self.image
                 && i.record.sequence == r.sequence
@@ -982,7 +1052,13 @@ impl ControlPlane {
                 self.serve_clients(index, r.sequence);
             }
         }
-        let next = self.now + crate::seat::FOLLOW_INTERVAL.as_nanos() as u64;
+        let next = if woken {
+            let floor = Duration::from_secs(1).as_nanos() as u64;
+            self.now
+                .max(self.pods[pod as usize].followed_at.map_or(0, |t| t + floor))
+        } else {
+            self.now + crate::seat::FOLLOW_INTERVAL.as_nanos() as u64
+        };
         self.follow_at(pod, next);
     }
 
@@ -1221,6 +1297,68 @@ mod tests {
         for i in seats {
             assert_eq!(cp.seat_served(i), seq, "seat {i}");
         }
+    }
+
+    /// Known issue 48: a commit that lands while a follower's read is in
+    /// flight is served once that read completes plus at most one more read
+    /// (the 1 s floor), not after another `FOLLOW_INTERVAL`. Slow reads make
+    /// every commit overlap some follower's read.
+    #[test]
+    fn a_commit_during_a_follower_read_is_served_by_the_next_read() {
+        const S: u64 = 1_000_000_000;
+        let read = 2 * S;
+        let mut cp = ControlPlane::new(
+            Settings {
+                pods: 30,
+                seed: 5,
+                follow_read_ns: read,
+                ..Default::default()
+            },
+            Instant::now(),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+        );
+        cp.advance_to(240 * S);
+        let mut overlapped = 0;
+        for _ in 0..4 {
+            let seq = cp.sequence().unwrap();
+            let holders = cp.seat_holders();
+            let victim = (0..30)
+                .find(|p| {
+                    Some(*p) != cp.primary_pod()
+                        && !holders.contains(&Some(*p))
+                        && cp.node_ready(*p)
+                })
+                .unwrap();
+            cp.crash(victim);
+            let mut t = cp.now_ns();
+            while cp.sequence() == Some(seq) {
+                t += S / 100;
+                cp.advance_to(t);
+                assert!(t < 1_000 * S, "no commit");
+            }
+            let committed = cp.commit_ns(cp.sequence().unwrap()).unwrap();
+            overlapped += cp
+                .pods
+                .iter()
+                .filter(|p| p.alive && p.seat.is_some() && p.reading.is_some())
+                .count();
+            // A read in flight at the commit completes within `read`; the
+            // next starts at the 1 s floor at the latest and takes `read`.
+            cp.advance_to(committed + read.max(S) + read + S / 10);
+            let seq = cp.sequence();
+            for i in 0..annotations::MAX_SEATS {
+                if cp.seat_holders().get(i).copied().flatten().is_some() {
+                    let p = &cp.pods[cp.seat_holders()[i].unwrap() as usize];
+                    assert_eq!(
+                        cp.seat_served(i),
+                        seq,
+                        "seat {i}: commit at {committed}, read at {:?}",
+                        p.followed_at
+                    );
+                }
+            }
+        }
+        assert!(overlapped > 0, "no commit overlapped a read");
     }
 
     #[test]

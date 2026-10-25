@@ -23,6 +23,7 @@ struct Inner {
     requests: RefCell<Vec<(String, String)>>,
     counter: RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>>,
     put_delay: RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicU64>>>,
+    get_delay: RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicU64>>>,
 }
 
 impl FakeApi {
@@ -33,6 +34,7 @@ impl FakeApi {
             requests: RefCell::new(Vec::new()),
             counter: RefCell::new(None),
             put_delay: RefCell::new(None),
+            get_delay: RefCell::new(None),
         }))
     }
 
@@ -45,6 +47,23 @@ impl FakeApi {
     /// `u64::MAX` hangs PUTs as a stuck API server would.
     pub fn delay_puts(&self, delay_ms: std::sync::Arc<std::sync::atomic::AtomicU64>) {
         *self.0.put_delay.borrow_mut() = Some(delay_ms);
+    }
+
+    /// Answer each GET with the object as it was when the GET arrived, but
+    /// only `delay_ms` later, as a slow API server would.
+    pub fn delay_gets(&self, delay_ms: std::sync::Arc<std::sync::atomic::AtomicU64>) {
+        *self.0.get_delay.borrow_mut() = Some(delay_ms);
+    }
+
+    fn get_delay(&self, method: &str) -> std::time::Duration {
+        let ms = self
+            .0
+            .get_delay
+            .borrow()
+            .as_ref()
+            .filter(|_| method == "GET")
+            .map_or(0, |d| d.load(std::sync::atomic::Ordering::SeqCst));
+        std::time::Duration::from_millis(ms)
     }
 
     fn put_delay(&self, method: &str) -> std::time::Duration {
@@ -226,6 +245,10 @@ pub fn serve(api: FakeApi, dir: &std::path::Path) -> KubeConfig {
                         exec::sleep(std::time::Duration::from_millis(20)).await;
                     }
                     let (status, value) = api.handle(&head.method, &head.target, &body);
+                    let answered = std::time::Instant::now();
+                    while answered.elapsed() < api.get_delay(&head.method) {
+                        exec::sleep(std::time::Duration::from_millis(20)).await;
+                    }
                     let body = serde_json::to_vec(&value).unwrap();
                     let mut out = http::response_head(
                         status,

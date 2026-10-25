@@ -164,6 +164,7 @@ fn run(
                 issuer: RefCell::new(None),
                 serving: RefCell::new(Serving::default()),
                 changed: Signal::default(),
+                primary_lease: Signal::default(),
                 verifier: DynamicClientVerifier::new(),
                 seat_holders: RefCell::new(Default::default()),
                 is_primary: Default::default(),

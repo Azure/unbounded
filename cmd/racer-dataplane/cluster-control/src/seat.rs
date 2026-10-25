@@ -127,6 +127,7 @@ pub fn apply_primary(
     if *current != list {
         *current = list;
     }
+    shared.primary_lease.notify();
     shared.changed.notify();
 }
 
@@ -604,9 +605,22 @@ pub async fn seat_task(shared: Rc<Shared>, seat: Rc<Seat>, mut object: serde_jso
 pub async fn follower(shared: Rc<Shared>, seat: Rc<Seat>) {
     while seat_still_mine(&shared, &seat) && !shared.stopping.get() {
         let started = Instant::now();
+        // Taken before the read: a primary Lease change (a commit publishes
+        // its sequence there) that arrives while the read is in flight may
+        // not be in what it returned, so it wakes the next read (Known
+        // issue 48). `changed` is taken after the read, because the read's
+        // own `install_record` notifies it.
+        let lease = shared.primary_lease.generation();
         let _ = follow_once(&shared, started).await;
         let generation = shared.changed.generation();
-        let _ = exec::timeout(FOLLOW_INTERVAL, shared.changed.changed(generation)).await;
+        let _ = exec::timeout(
+            FOLLOW_INTERVAL,
+            futures::future::select(
+                std::pin::pin!(shared.primary_lease.changed(lease)),
+                std::pin::pin!(shared.changed.changed(generation)),
+            ),
+        )
+        .await;
         // Wake on every change, but read at most every second.
         exec::sleep_until(started + Duration::from_secs(1)).await;
     }
@@ -614,6 +628,7 @@ pub async fn follower(shared: Rc<Shared>, seat: Rc<Seat>) {
 
 /// Read and install committed state once.
 pub async fn follow_once(shared: &Shared, started: Instant) -> Result<(), Error> {
+    let installs = shared.serving.borrow().installs;
     let secret = shared
         .lease_api
         .get(&paths::state(&shared.config.namespace))
@@ -644,6 +659,14 @@ pub async fn follow_once(shared: &Shared, started: Instant) -> Result<(), Error>
             return Err(Error::InvalidState);
         }
     };
+    let superseded = {
+        let s = shared.serving.borrow();
+        follower::superseded(installs != s.installs, s.high_water.as_ref(), &record)
+    };
+    if superseded {
+        // The primary committed while this read was in flight.
+        return Ok(());
+    }
     install_record(shared, record, started).map_err(|_| Error::InvalidState)?;
     let need_image = {
         let s = shared.serving.borrow();
@@ -727,6 +750,7 @@ pub fn install_record(
     s.high_water = Some(record.clone());
     s.record = Some(record);
     s.confirmed = Some(confirmed);
+    s.installs += 1;
     drop(s);
     shared.changed.notify();
     Ok(())
@@ -1142,6 +1166,104 @@ mod tests {
                 follow_once(&shared, Instant::now()).await.is_err(),
                 "stays closed"
             );
+        });
+    }
+
+    /// Known issue 421: the primary commits while its own follower's read is
+    /// in flight; the read answers the record the commit replaced. That is
+    /// older news, not a rollback, and the primary keeps serving.
+    #[test]
+    fn a_commit_during_the_primarys_follower_read_does_not_fail_closed() {
+        crate::kube::fake::run(|api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            let uid = shared.cluster.borrow().clone();
+            let path = paths::state(&shared.config.namespace);
+            let put = |r: &state::StateRecord| {
+                api.put_object(
+                    &path,
+                    serde_json::json!({"metadata": {"name": "racer-state", "uid": uid,
+                        "annotations": {annotations::INITIALIZED: uid, annotations::CLUSTER_ID: uid}},
+                        "data": {annotations::CLUSTER_KEY: STANDARD.encode(&uid),
+                            annotations::STATE_KEY: STANDARD.encode(state::encode(r).unwrap())}}),
+                );
+            };
+            shared.is_primary.set(true);
+            put(&record(4));
+            follow_once(&shared, Instant::now()).await.unwrap();
+            let delay = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(300));
+            api.delay_gets(delay);
+            let read = follow_once(&shared, Instant::now());
+            let commit = async {
+                exec::sleep(Duration::from_millis(100)).await;
+                // `primary.rs` `reconcile`: write, then install.
+                put(&record(5));
+                install_record(&shared, record(5), Instant::now()).unwrap();
+            };
+            let (read, ()) = futures::future::join(read, commit).await;
+            assert!(read.is_ok(), "{read:?}");
+            let sequence = shared.serving.borrow().record.as_ref().map(|r| r.sequence);
+            assert_eq!(sequence, Some(5));
+            assert_eq!(shared.last_error.get(), None);
+            // A rollback read after the commit is still refused.
+            api.delay_gets(std::sync::Arc::new(0.into()));
+            put(&record(4));
+            assert!(follow_once(&shared, Instant::now()).await.is_err());
+            assert!(shared.serving.borrow().record.is_none());
+        });
+    }
+
+    /// Known issue 48: a primary Lease change (a commit) that arrives while
+    /// the follower's read is in flight wakes the next read at the 1 s floor
+    /// instead of after `FOLLOW_INTERVAL`.
+    #[test]
+    fn follower_rereads_after_a_lease_change_during_its_read() {
+        crate::kube::fake::run(|api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            let uid = shared.cluster.borrow().clone();
+            let path = paths::state(&shared.config.namespace);
+            let put = |r: &state::StateRecord| {
+                api.put_object(
+                    &path,
+                    serde_json::json!({"metadata": {"name": "racer-state", "uid": uid,
+                        "annotations": {annotations::INITIALIZED: uid, annotations::CLUSTER_ID: uid}},
+                        "data": {annotations::CLUSTER_KEY: STANDARD.encode(&uid),
+                            annotations::STATE_KEY: STANDARD.encode(state::encode(r).unwrap())}}),
+                );
+            };
+            // The primary installs no image from itself.
+            shared.is_primary.set(true);
+            put(&record(4));
+            let delay = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(400));
+            api.delay_gets(delay.clone());
+            let seat = Rc::new(new_seat(&shared, 0).unwrap());
+            *shared.seat.borrow_mut() = Some(seat.clone());
+            let started = Instant::now();
+            exec::spawn(follower(shared.clone(), seat)).unwrap();
+            // The first read is in flight and answers sequence 4.
+            exec::sleep(Duration::from_millis(100)).await;
+            put(&record(5));
+            let endpoints: DiscoveredEndpoints = Default::default();
+            let changed = RefCell::new((String::new(), None));
+            let mut lease = LeaseObservation {
+                resource_version: "7".into(),
+                ..Default::default()
+            };
+            lease
+                .annotations
+                .insert(annotations::SEQUENCE.into(), "5".into());
+            apply_primary(&shared, &lease, &endpoints, &changed);
+            let sequence = || shared.serving.borrow().record.as_ref().map(|r| r.sequence);
+            exec::sleep_until(started + Duration::from_millis(600)).await;
+            assert_eq!(
+                sequence(),
+                Some(4),
+                "the in-flight read predates the change"
+            );
+            // Next read at the 1 s floor, answered 400 ms later.
+            exec::sleep_until(started + Duration::from_millis(2_500)).await;
+            assert_eq!(sequence(), Some(5), "woken by the change during the read");
+            shared.stopping.set(true);
+            shared.changed.notify();
         });
     }
 }
