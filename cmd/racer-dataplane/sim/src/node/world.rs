@@ -238,6 +238,9 @@ enum Then {
     /// An owner's ranking of the page under its previous membership, for
     /// copy-only handoff probes before origin.
     Handoff { fill: u64 },
+    /// Ranking under membership `version` (the previous one) for the stale
+    /// fallback (`NodeWorld::stale_fallback`).
+    Fallback { fill: u64, version: u64 },
     /// Re-ranking before origin (production `resolve_epoch_traced`).
     Origin {
         fill: u64,
@@ -325,10 +328,13 @@ struct Fill {
     retried: bool,
     /// Owners this walk skipped as stale destinations (behind this node).
     stale: u32,
-    /// This fill already walked the previous membership after its walk
-    /// under the current one ran out on stale destinations
+    /// This fill is ranking, or already walked, the previous membership
+    /// after a destination under the current one was behind
     /// (`stale_fallback`).
     fell_back: bool,
+    /// This node owns the page under the previous membership, so this walk
+    /// keeps the current one.
+    fallback_denied: bool,
     probe: Option<u64>,
     /// The leader's retention observation, used at publication.
     eligible: bool,
@@ -1648,6 +1654,7 @@ impl NodeWorld {
                 retried: false,
                 stale: 0,
                 fell_back: false,
+                fallback_denied: false,
                 probe: None,
                 eligible,
                 order: VisitOrder::canonical(0),
@@ -1825,6 +1832,10 @@ impl NodeWorld {
                 let previous = Self::to_nodes(&members, result);
                 self.handoff_ranked(fill, previous);
             }
+            Then::Fallback { fill, version } => {
+                let cands = Self::to_nodes(&members, result);
+                self.fallback_ranked(fill, version, members, cands);
+            }
             Then::Origin {
                 fill,
                 rank,
@@ -1899,12 +1910,6 @@ impl NodeWorld {
             Err(e) => return self.hard_fail(id, e),
         };
         let rank = cands.iter().position(|c| *c == node);
-        if fill.fell_back && !fallback_rank_allowed(rank) {
-            // An owner under the previous membership only: its authority
-            // there must not reach the origin (`stale_fallback`).
-            self.metrics.incr("stale_fallback_owner");
-            return self.fail_walk(id, Error::Unavailable);
-        }
         let order = if rank.is_some() {
             VisitOrder::canonical(0)
         } else {
@@ -3362,31 +3367,56 @@ impl NodeWorld {
         let member = old.as_ref().is_some_and(|m| position(m, node).is_some());
         let go = previous_fallback(StaleSkip {
             owner: fill.rank.is_some(),
-            retried: fill.retried,
+            retried: fill.retried || fill.fell_back,
             previous_recent_member: recent && member,
-        });
+        }) && !fill.fallback_denied;
         let (true, Some(old)) = (go, old) else {
             return false;
         };
-        self.metrics.incr("stale_fallbacks");
-        let fill = self.fills.get_mut(&id).expect("present");
-        // The skipped probe completed: nothing is pending.
-        fill.walk = Walking::None;
-        fill.retried = true;
-        fill.fell_back = true;
-        // A fresh walk: the previous membership's owners were not asked.
-        fill.continuation = Continuation::default();
+        // The skipped probe completed, so nothing is pending; the walk
+        // under the current membership waits for the ranking.
+        self.fills.get_mut(&id).expect("present").fell_back = true;
         self.rank(
             node,
             w,
             old,
             page,
-            Then::Walk {
+            Then::Fallback {
                 fill: id,
                 version: version - 1,
             },
         );
         true
+    }
+
+    /// The page is ranked under the previous membership: walk it there, or,
+    /// when this node owns it there, keep walking the current membership.
+    fn fallback_ranked(
+        &mut self,
+        id: u64,
+        version: u64,
+        members: Rc<Members>,
+        cands: Result<Vec<u32>, Error>,
+    ) {
+        let Some(fill) = self.fills.get_mut(&id) else {
+            return;
+        };
+        let allowed = match &cands {
+            Ok(c) if !c.is_empty() => fallback_rank_allowed(c.iter().position(|n| *n == fill.node)),
+            _ => false,
+        };
+        if !allowed {
+            self.metrics.incr("stale_fallback_denied");
+            fill.fell_back = false;
+            fill.fallback_denied = true;
+            return self.step_walk(id);
+        }
+        self.metrics.incr("stale_fallbacks");
+        fill.walk = Walking::None;
+        fill.retried = true;
+        // A fresh walk: the previous membership's owners were not asked.
+        fill.continuation = Continuation::default();
+        self.walk_ranked(id, version, members, cands);
     }
 
     fn on_end(&mut self, id: u64, end: End) {

@@ -1016,6 +1016,9 @@ impl CandidatePolicy {
                 previous: previous.same_rank,
                 helper,
             });
+            // This node owns the page under version - 1, so the stale
+            // fallback (Known issue 19) is not available to this walk.
+            let mut fallback_denied = false;
             let end = loop {
                 let probe = match walk.next(budget)? {
                     Step::Probe(probe) => probe,
@@ -1102,31 +1105,37 @@ impl CandidatePolicy {
                                 // membership walks the page's owners under it
                                 // instead, once (Known issue 19).
                                 walk.complete(budget, WalkOutcome::StaleDestination)?;
-                                if let Some(previous) =
-                                    self.stale_fallback(&candidates, rank.is_some(), retried)
+                                if let Some(previous) = self
+                                    .stale_fallback(&candidates, rank.is_some(), retried)
+                                    .filter(|_| !fallback_denied)
+                                    && let Ok(previous) =
+                                        self.candidates_scoped(previous, object, page, scope).await
                                 {
-                                    walk.abandon(budget)?;
-                                    let previous = self
-                                        .candidates_scoped(previous, object, page, scope)
-                                        .await?;
-                                    if !racer_core::read::stale::fallback_rank_allowed(
-                                        previous.ordered.iter().position(|node| node == &self.node),
-                                    ) {
-                                        return Err(Error::Unavailable);
+                                    // Never as an owner under version - 1:
+                                    // keep walking this membership instead.
+                                    fallback_denied =
+                                        !racer_core::read::stale::fallback_rank_allowed(
+                                            previous
+                                                .ordered
+                                                .iter()
+                                                .position(|node| node == &self.node),
+                                        );
+                                    if !fallback_denied {
+                                        walk.abandon(budget)?;
+                                        return self
+                                            .resolve_epoch_traced(
+                                                previous,
+                                                context,
+                                                operation,
+                                                scope,
+                                                budget,
+                                                validate,
+                                                true,
+                                                HedgeContinuation::default(),
+                                                trail,
+                                            )
+                                            .await;
                                     }
-                                    return self
-                                        .resolve_epoch_traced(
-                                            previous,
-                                            context,
-                                            operation,
-                                            scope,
-                                            budget,
-                                            validate,
-                                            true,
-                                            HedgeContinuation::default(),
-                                            trail,
-                                        )
-                                        .await;
                                 }
                                 continue;
                             };

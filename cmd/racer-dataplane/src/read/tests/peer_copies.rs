@@ -3507,8 +3507,8 @@ fn stale_owners_fall_back_to_the_recent_previous_membership() {
 }
 
 /// The fallback walks the previous membership only as a non-owner: a node
-/// that owned the page there ends `Unavailable` rather than reach the origin
-/// with authority it no longer has.
+/// that owned the page there keeps walking the current membership rather
+/// than reach the origin with authority it no longer has.
 #[test]
 fn stale_fallback_never_makes_a_previous_owner_fetch() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
@@ -3566,18 +3566,17 @@ fn stale_fallback_never_makes_a_previous_owner_fetch() {
     ));
     f.fill = Fill::new(deps);
     f.membership = current;
-    peers
-        .replies
-        .borrow_mut()
-        .push_back((ordered[0].clone(), Reply::Stale));
+    let good = encrypted_copy(&mut f);
+    peers.replies.borrow_mut().extend([
+        (ordered[0].clone(), Reply::Stale),
+        (ordered[1].clone(), Reply::Stale),
+        (ordered[2].clone(), Reply::Copy(good)),
+    ]);
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
-    assert!(matches!(
-        acquire(&mut f, &mut budget),
-        Err(Error::Unavailable)
-    ));
-    assert_eq!(*peers.memberships.borrow(), [2]);
+    let result = acquire(&mut f, &mut budget).unwrap();
+    assert_eq!(result.plaintext.bytes(), b"abc");
+    assert_eq!(*peers.memberships.borrow(), [2, 2, 2]);
     assert_eq!(f.origin.calls.get(), 0);
-    assert_unpublished(&f);
 }
 
 /// Without any published membership the stale answer stays terminal
