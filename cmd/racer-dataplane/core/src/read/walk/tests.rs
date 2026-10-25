@@ -2337,3 +2337,113 @@ fn funded_links_match_a_shared_route_below_a_full_route() {
     let b = super::super::budget::inherited_budget(deadline, deadline, 4, 8, 1).unwrap();
     assert_eq!(funded_links(&b), Some(7));
 }
+
+fn charge(walk: &mut CandidateWalk, b: &mut AcquisitionBudget, probe: &Probe) -> AttemptPlan {
+    let now = Instant::now();
+    let deadline = b.deadline();
+    plan_attempt(
+        walk.request_budget(b),
+        AttemptInputs {
+            now,
+            caller_deadline: deadline,
+            remaining_opportunities: probe.remaining_opportunities,
+            attempt_timeout: Duration::from_secs(1),
+            mode: probe.mode,
+            route: probe.route,
+            failure_links: 8,
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn in_order_owner_gets_the_credits_it_needs_when_a_share_is_short() {
+    // Known issue 57: a non-owner with three attempts at rank 1 (in visit
+    // order) shared one remote credit, which rank 1 spent probing rank 0.
+    let mut walk = CandidateWalk::new(config(None, 3, VisitOrder::canonical(3)));
+    let mut b = budget(6, 16);
+    let Step::Probe(first) = walk.next(&mut b).unwrap() else {
+        panic!()
+    };
+    assert_eq!((first.canonical, first.route), (0, RouteMode::SharedRoute));
+    // Rank 0's shared credits are unchanged: its share is not short.
+    assert_eq!(charge(&mut walk, &mut b, &first).remote_attempts, 2);
+    walk.complete(&mut b, Outcome::Probe(ProbeOutcome::Unreachable))
+        .unwrap();
+    assert_eq!(b.remaining_attempts(), 3);
+    assert!(shared_share_short(&b, 1, 2));
+    let Step::Probe(second) = walk.next(&mut b).unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        (second.canonical, second.mode, second.route),
+        (1, Mode::Acquire, RouteMode::FundedRoute)
+    );
+    let plan = charge(&mut walk, &mut b, &second);
+    // Rank 1 can probe rank 0 and still fetch; the links are a shared
+    // route's (failure routing after the route failure above).
+    assert_eq!(plan.remote_attempts, owner_funding_min(1) - 1);
+    assert_eq!(plan.links, 8);
+    walk.complete(&mut b, Outcome::Probe(ProbeOutcome::Unreachable))
+        .unwrap();
+    // Budgets never grow: nothing is left for rank 2, whose share (one
+    // credit) would only have bought the same probe of rank 0.
+    assert_eq!(b.remaining_attempts(), 0);
+    assert!(matches!(
+        walk.next(&mut b).unwrap(),
+        Step::Probe(_) | Step::End(_)
+    ));
+}
+
+#[test]
+fn shared_share_short_only_below_an_owners_minimum() {
+    // Rank 0 needs one remote credit: never short.
+    assert!(!shared_share_short(&budget(2, 8), 0, 3));
+    // Rank 1 needs two: after the exchange, three or more attempts over two
+    // visits share two; two share one.
+    assert!(!shared_share_short(&budget(4, 8), 1, 2));
+    assert!(shared_share_short(&budget(3, 8), 1, 2));
+    // Rank 2 needs three: as the last visit with four attempts it gets three.
+    assert!(!shared_share_short(&budget(4, 8), 2, 1));
+    assert!(shared_share_short(&budget(3, 8), 2, 1));
+}
+
+#[test]
+fn a_busy_owner_keeps_the_next_in_order_owner_on_its_share() {
+    // After rank 0 shed the reader, left it unanswered, or was overloaded
+    // (itself or a relay in front of it), rank 1 gets only its shared
+    // credits: it can still find rank 0's copy, but is not funded to fetch
+    // beside it. A route failure or a refusal still funds rank 1.
+    for (busy, outcome) in [
+        (true, Outcome::Shed),
+        (true, Outcome::TimedOut),
+        (true, Outcome::Probe(ProbeOutcome::Overloaded)),
+        (true, Outcome::Transport(ProbeOutcome::Overloaded)),
+        (false, Outcome::Failed),
+        (false, Outcome::Probe(ProbeOutcome::Unreachable)),
+        (false, Outcome::Transport(ProbeOutcome::Unreachable)),
+    ] {
+        let mut walk = CandidateWalk::new(config(None, 3, VisitOrder::canonical(3)));
+        let mut b = budget(6, 16);
+        let Step::Probe(first) = walk.next(&mut b).unwrap() else {
+            panic!()
+        };
+        charge(&mut walk, &mut b, &first);
+        walk.complete(&mut b, outcome).unwrap();
+        assert!(shared_share_short(&b, 1, 2));
+        let Step::Probe(second) = walk.next(&mut b).unwrap() else {
+            panic!()
+        };
+        let (route, remote) = if busy {
+            (RouteMode::SharedRoute, 1)
+        } else {
+            (RouteMode::FundedRoute, owner_funding_min(1) - 1)
+        };
+        assert_eq!((second.canonical, second.route), (1, route), "{outcome:?}");
+        assert_eq!(
+            charge(&mut walk, &mut b, &second).remote_attempts,
+            remote,
+            "{outcome:?}"
+        );
+    }
+}

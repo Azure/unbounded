@@ -216,6 +216,43 @@ pub fn funded_links(budget: &AcquisitionBudget) -> Option<u8> {
     }
 }
 
+/// Whether a shared route's Acquire to the owner at `canonical` would carry
+/// fewer remote credits than that owner needs to probe its predecessors and
+/// still fetch (`owner_funding_min(canonical) - 1`): [`plan_attempt`] grants
+/// a shared route only `remaining.div_ceil(opportunities)` after the
+/// exchange. A non-owner then funds the visit instead (in visit order too),
+/// with the minimum and the shared route's links ([`funded_links`]).
+///
+/// In 5k `full-failover` every owner that ended its walk with origin
+/// authority and no attempt left (161) was rank 1 holding one credit, sent
+/// in visit order by a non-owner with three attempts left: one went to the
+/// exchange and one remote credit to rank 1, which spent it on a copy-only
+/// probe of rank 0 that the reader had just visited (Known issue 57). The
+/// credit moves from the last owner, whose own share (one) would only buy
+/// the same probe of rank 0.
+///
+/// The walk does not do this after an owner was busy (it shed the walk,
+/// left a probe unanswered within its time bound, or it or a relay in
+/// front of it answered `Overloaded`): that owner is most
+/// likely serving or fetching the page, and funding the next one to fetch
+/// it would only add an origin request overlapping its own (Known issue 31,
+/// the reader-side counterpart of the [`Outcome::TimedOut`] rule; 5k `zipf`
+/// at 16 MiB pages: 120 to 165 overlapping requests without this
+/// exception, 128 with it). A route failure or a refusal (rank 0 down or its own
+/// acquisition failed) still funds the next owner.
+pub fn shared_share_short(
+    budget: &AcquisitionBudget,
+    canonical: usize,
+    opportunities: usize,
+) -> bool {
+    canonical > 0
+        && budget
+            .remaining_attempts()
+            .saturating_sub(1)
+            .div_ceil(opportunities.max(1) as u32)
+            < owner_funding_min(canonical) - 1
+}
+
 /// How long after this node replaced membership version - 1 its owners may
 /// still ask predecessors under it ([`WalkConfig::previous`]). Peers keep a
 /// superseded membership for a 30 s grace window
@@ -526,6 +563,12 @@ pub struct CandidateWalk {
     /// An owner's probe of rank 0 timed out ([`Outcome::TimedOut`]): the
     /// walk does not end with origin authority.
     rank0_unanswered: bool,
+    /// An earlier owner was busy: it shed this walk, left a probe
+    /// unanswered within its time bound, or it or a relay in front of it
+    /// answered `Overloaded` ([`Outcome::Shed`], [`Outcome::TimedOut`]), so
+    /// it is most likely serving or fetching the page
+    /// ([`shared_share_short`]).
+    saw_busy: bool,
 }
 
 /// Overflow helper state of a non-owner page walk.
@@ -596,6 +639,7 @@ impl CandidateWalk {
             done: false,
             helper: Helper::Unset,
             rank0_unanswered: false,
+            saw_busy: false,
         }
     }
 
@@ -924,7 +968,9 @@ impl CandidateWalk {
             } else if continuation.bounded_routes
                 || (rank.is_none()
                     && !copy_only
-                    && canonical > index
+                    && (canonical > index
+                        || (shared_share_short(budget, canonical, count - index)
+                            && !self.saw_busy))
                     && budget.remaining_attempts() >= owner_funding_min(canonical)
                     && funded_links(budget).is_some())
             {
@@ -1110,6 +1156,7 @@ impl CandidateWalk {
         }
         let outcome = match outcome {
             Outcome::TimedOut => {
+                self.saw_busy |= !pending.helper && !pending.handoff;
                 self.rank0_unanswered |= pending.rank0 && self.config.rank0 != Rank0State::Overdue;
                 Outcome::Transport(ProbeOutcome::Unreachable)
             }
@@ -1119,6 +1166,18 @@ impl CandidateWalk {
             }
             outcome => outcome,
         };
+        if !pending.helper
+            && !pending.handoff
+            && matches!(
+                outcome,
+                Outcome::Probe(ProbeOutcome::Overloaded)
+                    | Outcome::Transport(ProbeOutcome::Overloaded)
+            )
+        {
+            // Overloaded on the route to the owner or by the owner: load,
+            // not a missing owner ([`shared_share_short`]).
+            self.saw_busy = true;
+        }
         if pending.helper {
             // The helper does not consume a visit-order position. Its
             // failure is only a miss (handled with handoff probes below).
@@ -1188,6 +1247,7 @@ impl CandidateWalk {
             }
             // The route worked; the destination is busy.
             Outcome::Shed => {
+                self.saw_busy = true;
                 self.saw_transient = true;
                 self.evidence.push(ProbeOutcome::Overloaded);
                 Ok(None)
