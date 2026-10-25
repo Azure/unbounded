@@ -28,8 +28,33 @@
 //! which an authenticated owner could already set with a copy-only probe. A
 //! holder that no longer holds the page, or is no longer an owner above
 //! rank 0, drops the notice instead of sending it ([`notice_target`]).
+//!
+//! Cut groups (Known issue 50). Offers exist because a partition or a
+//! route failure cut the holder off from rank 0, and while the cut lasts
+//! every offer across it fails in transport and counts as a link failure
+//! (in the simulator, 5k `full-failover` seed 1: each of the 283 failed
+//! offers out of 728 was a partition link failure). So each target belongs
+//! to a group (its site): an offer that fails with cut evidence (a
+//! transport failure, or an answer signed by a relay rather than the
+//! target) blocks its group ([`OrphanNotices::cut`]) until that notice's
+//! next offer is due. Offers that come due for a blocked group are deferred
+//! to the end of the block without spending a try. When a block ends, one
+//! offer goes out as the group's probe and the group stays held for
+//! [`PROBE_HOLD`] or until that offer is reported; a delivered offer
+//! ([`OrphanNotices::reached`]) releases the group for new offers (those
+//! deferred behind the probe go when its hold ends), another cut blocks it
+//! again. The node's other exchanges feed the same table
+//! ([`OrphanNotices::observe`]): a read probe that fails in transport toward
+//! a group holds its offers, and one answered by a member of the group
+//! releases them, so offers wait out a cut the node's reads already see.
+//! While a cut lasts, a holder sends at most one offer per
+//! group per retry interval instead of one per notice. Tries are spent only
+//! by offers actually sent, so the bounds above hold. Blocked groups are
+//! bounded by the notice capacity. Members without a site share one group,
+//! which then holds all of this node's offers during a cut.
 
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::hash::Hash;
 use std::time::{Duration, Instant};
 
@@ -55,6 +80,10 @@ pub const NOTICE_CAPACITY: usize = 1024;
 /// [`crate::read::walk::SUCCESSOR_GRANT_LINKS`]). Offers carry no attempts.
 pub const NOTICE_LINKS: u8 = crate::read::walk::SUCCESSOR_GRANT_LINKS;
 
+/// How long a group stays held after its probe offer was sent, unless the
+/// offer is reported sooner (longer than any offer's attempt timeout).
+pub const PROBE_HOLD: Duration = Duration::from_secs(10);
+
 /// A due offer: send it to `target`, then report the outcome with
 /// [`OrphanNotices::delivered`] or [`OrphanNotices::failed`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,19 +105,163 @@ struct Entry<N> {
 /// Every notice with the same number of tries waits the same delay, so each
 /// try level is a FIFO queue in due order; [`Self::pop_due`] looks at the
 /// queue heads only. Queue items whose entry changed are skipped.
-pub struct OrphanNotices<K, N> {
+pub struct OrphanNotices<K, N, G = ()> {
     capacity: usize,
     entries: HashMap<K, Entry<N>>,
     queues: [VecDeque<(K, Instant)>; NOTICE_TRIES],
+    /// Notices deferred by a blocked group, by their new due time (an
+    /// insertion counter keeps the order stable without `K: Ord`).
+    deferred: BinaryHeap<Reverse<(Instant, u64)>>,
+    deferred_keys: HashMap<u64, K>,
+    seq: u64,
+    /// Blocked groups and until when.
+    blocked: HashMap<G, Instant>,
 }
 
-impl<K: Eq + Hash + Clone, N: Clone> OrphanNotices<K, N> {
+impl<K: Eq + Hash + Clone, N: Clone, G: Eq + Hash + Clone> OrphanNotices<K, N, G> {
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity: capacity.max(1),
             entries: HashMap::new(),
             queues: Default::default(),
+            deferred: BinaryHeap::new(),
+            deferred_keys: HashMap::new(),
+            seq: 0,
+            blocked: HashMap::new(),
         }
+    }
+
+    /// Whether some notice waits for a blocked group to open: callers that
+    /// schedule a timer per noted or failed offer also need one for
+    /// [`Self::next_due`] then.
+    pub fn has_deferred(&mut self) -> bool {
+        self.deferred_head().is_some()
+    }
+
+    /// Until when `group` is blocked at `now`, if it is.
+    pub fn blocked(&self, group: &G, now: Instant) -> Option<Instant> {
+        self.blocked
+            .get(group)
+            .copied()
+            .filter(|until| *until > now)
+    }
+
+    /// Remove and return the earliest notice due at `now` whose target's
+    /// group (`group_of`) is not blocked. Due notices of a blocked group are
+    /// deferred to the block's end without spending a try. The returned
+    /// offer holds its group for [`PROBE_HOLD`]: report it with
+    /// [`Self::reached`] or [`Self::cut`] (or [`Self::failed`] for a failure
+    /// that says nothing about the route).
+    pub fn pop_open(&mut self, now: Instant, group_of: impl Fn(&N) -> G) -> Option<Due<K, N>> {
+        loop {
+            let due = self.pop_due(now)?;
+            let group = group_of(&due.target);
+            match self.blocked(&group, now) {
+                Some(until) => self.defer(due, until),
+                None => {
+                    self.block(group, now + PROBE_HOLD, now);
+                    return Some(due);
+                }
+            }
+        }
+    }
+
+    /// An offer to a target in `group` was delivered: the route works,
+    /// release the group.
+    pub fn reached(&mut self, group: &G) {
+        self.blocked.remove(group);
+    }
+
+    /// Another exchange of this node with a member of `group` ended: a
+    /// route failure (`cut`: a transport failure or a relay's answer)
+    /// holds the group's offers for [`PROBE_HOLD`] (never shortening a
+    /// longer block); an answer signed by that member releases it. Only
+    /// while notices are pending, so the table stays empty otherwise.
+    pub fn observe(&mut self, group: G, cut: bool, now: Instant) {
+        if self.entries.is_empty() {
+            return;
+        }
+        if cut {
+            let until = now + PROBE_HOLD;
+            if self.blocked(&group, now).is_none_or(|u| u < until) {
+                self.block(group, until, now);
+            }
+        } else {
+            self.blocked.remove(&group);
+        }
+    }
+
+    /// A popped offer was not sent (the notice was dropped): release the
+    /// group's probe hold.
+    pub fn release(&mut self, group: &G) {
+        self.blocked.remove(group);
+    }
+
+    /// `due`'s offer to a target in `group` failed with cut evidence (a
+    /// transport failure, or an answer a relay signed): schedule the next
+    /// offer as [`Self::failed`] does and block the group until it is due
+    /// (or for the next retry delay, when the notice is done).
+    pub fn cut(&mut self, due: Due<K, N>, group: G, now: Instant) -> Option<Instant> {
+        let delay = NOTICE_DELAYS[(due.tries + 1).min(NOTICE_TRIES - 1)];
+        let next = self.failed(due, now);
+        self.block(group, next.unwrap_or(now + delay), now);
+        next
+    }
+
+    /// A failure that says nothing about the route (the target itself
+    /// refused): release the group's probe hold and schedule the next offer
+    /// as [`Self::failed`] does.
+    pub fn refused(&mut self, due: Due<K, N>, group: &G, now: Instant) -> Option<Instant> {
+        self.blocked.remove(group);
+        self.failed(due, now)
+    }
+
+    fn block(&mut self, group: G, until: Instant, now: Instant) {
+        if !self.blocked.contains_key(&group) && self.blocked.len() >= self.capacity {
+            self.blocked.retain(|_, u| *u > now);
+            if self.blocked.len() >= self.capacity {
+                return;
+            }
+        }
+        self.blocked.insert(group, until);
+    }
+
+    /// Hold `due` until `until` without spending a try.
+    fn defer(&mut self, due: Due<K, N>, until: Instant) {
+        if self.entries.contains_key(&due.key) {
+            // Noted again meanwhile: that note wins.
+            return;
+        }
+        while self.entries.len() >= self.capacity && self.evict() {}
+        self.seq += 1;
+        self.entries.insert(
+            due.key.clone(),
+            Entry {
+                target: due.target,
+                tries: due.tries,
+                due: until,
+            },
+        );
+        self.deferred.push(Reverse((until, self.seq)));
+        self.deferred_keys.insert(self.seq, due.key);
+        self.compact();
+    }
+
+    /// The live deferred head: (due, seq).
+    fn deferred_head(&mut self) -> Option<(Instant, u64)> {
+        while let Some(Reverse((at, seq))) = self.deferred.peek().copied() {
+            let live = self
+                .deferred_keys
+                .get(&seq)
+                .and_then(|k| self.entries.get(k))
+                .is_some_and(|e| e.due == at);
+            if live {
+                return Some((at, seq));
+            }
+            self.deferred.pop();
+            self.deferred_keys.remove(&seq);
+        }
+        None
     }
 
     pub fn len(&self) -> usize {
@@ -112,21 +285,32 @@ impl<K: Eq + Hash + Clone, N: Clone> OrphanNotices<K, N> {
     /// The earliest due time, if any notice is pending.
     pub fn next_due(&mut self) -> Option<Instant> {
         self.skip_stale();
+        let deferred = self.deferred_head().map(|(at, _)| at);
         self.queues
             .iter()
             .filter_map(|q| q.front().map(|(_, at)| *at))
+            .chain(deferred)
             .min()
     }
 
     /// Remove and return the earliest notice due at `now`.
     pub fn pop_due(&mut self, now: Instant) -> Option<Due<K, N>> {
         self.skip_stale();
-        let level = (0..NOTICE_TRIES)
+        let queued = (0..NOTICE_TRIES)
             .filter_map(|l| self.queues[l].front().map(|(_, at)| (*at, l)))
             .filter(|(at, _)| *at <= now)
-            .min_by_key(|(at, _)| *at)?
-            .1;
-        let (key, _) = self.queues[level].pop_front().expect("front");
+            .min_by_key(|(at, _)| *at);
+        let deferred = self.deferred_head().filter(|(at, _)| *at <= now);
+        let key = match (queued, deferred) {
+            (Some((queued, level)), deferred) if deferred.is_none_or(|(at, _)| queued <= at) => {
+                self.queues[level].pop_front().expect("front").0
+            }
+            (_, Some((_, seq))) => {
+                self.deferred.pop();
+                self.deferred_keys.remove(&seq).expect("live")
+            }
+            _ => return None,
+        };
         let entry = self.entries.remove(&key).expect("live");
         Some(Due {
             key,
@@ -161,7 +345,8 @@ impl<K: Eq + Hash + Clone, N: Clone> OrphanNotices<K, N> {
         due
     }
 
-    /// Drop the notice closest to giving up (most tries, oldest).
+    /// Drop the notice closest to giving up (most tries, oldest), then a
+    /// deferred one.
     fn evict(&mut self) -> bool {
         self.skip_stale();
         for level in (0..NOTICE_TRIES).rev() {
@@ -169,6 +354,12 @@ impl<K: Eq + Hash + Clone, N: Clone> OrphanNotices<K, N> {
                 self.entries.remove(&key);
                 return true;
             }
+        }
+        if let Some((_, seq)) = self.deferred_head() {
+            self.deferred.pop();
+            let key = self.deferred_keys.remove(&seq).expect("live");
+            self.entries.remove(&key);
+            return true;
         }
         false
     }
@@ -193,11 +384,24 @@ impl<K: Eq + Hash + Clone, N: Clone> OrphanNotices<K, N> {
 
     /// Bound the queues: drop items that no longer match.
     fn compact(&mut self) {
+        let entries = &self.entries;
+        if self.deferred.len() > 2 * self.capacity {
+            let keys = &mut self.deferred_keys;
+            self.deferred.retain(|Reverse((at, seq))| {
+                let live = keys
+                    .get(seq)
+                    .and_then(|k| entries.get(k))
+                    .is_some_and(|e| e.due == *at);
+                if !live {
+                    keys.remove(seq);
+                }
+                live
+            });
+        }
         let total: usize = self.queues.iter().map(VecDeque::len).sum();
         if total <= 2 * self.capacity {
             return;
         }
-        let entries = &self.entries;
         for (level, queue) in self.queues.iter_mut().enumerate() {
             queue.retain(|item| Self::live(entries, level, item));
         }
@@ -237,7 +441,7 @@ mod tests {
     #[test]
     fn first_offer_waits_the_first_delay() {
         let now = Instant::now();
-        let mut n = OrphanNotices::new(8);
+        let mut n: OrphanNotices<u64, u32> = OrphanNotices::new(8);
         assert_eq!(n.note(1u64, 0u32, now), at(now, 5));
         assert_eq!(n.next_due(), Some(at(now, 5)));
         assert_eq!(n.pop_due(at(now, 4)), None);
@@ -257,7 +461,7 @@ mod tests {
     #[test]
     fn failed_offers_back_off_then_give_up() {
         let start = Instant::now();
-        let mut n = OrphanNotices::new(8);
+        let mut n: OrphanNotices<u64, u32> = OrphanNotices::new(8);
         let mut now = n.note(1u64, 0u32, start);
         let mut sent = 0;
         while let Some(due) = n.pop_due(now) {
@@ -275,7 +479,7 @@ mod tests {
     #[test]
     fn delivered_offer_is_not_retried() {
         let now = Instant::now();
-        let mut n = OrphanNotices::new(8);
+        let mut n: OrphanNotices<u64, u32> = OrphanNotices::new(8);
         n.note(1u64, 0u32, now);
         let _delivered = n.pop_due(at(now, 5)).expect("due");
         assert_eq!(n.pop_due(at(now, 1000)), None);
@@ -284,7 +488,7 @@ mod tests {
     #[test]
     fn earliest_due_comes_first_across_try_levels() {
         let now = Instant::now();
-        let mut n = OrphanNotices::new(8);
+        let mut n: OrphanNotices<u64, u32> = OrphanNotices::new(8);
         n.note(1u64, 0u32, now);
         let due = n.pop_due(at(now, 5)).expect("due");
         // Retry due at 5 + 15 = 20 s; a new note at 10 s is due at 15 s.
@@ -301,7 +505,7 @@ mod tests {
     #[test]
     fn renewed_note_starts_over_and_wins_over_a_retry() {
         let now = Instant::now();
-        let mut n = OrphanNotices::new(8);
+        let mut n: OrphanNotices<u64, u32> = OrphanNotices::new(8);
         n.note(1u64, 0u32, now);
         let due = n.pop_due(at(now, 5)).expect("due");
         n.note(1, 3, at(now, 6));
@@ -319,7 +523,7 @@ mod tests {
     #[test]
     fn capacity_bounds_pending_notices() {
         let now = Instant::now();
-        let mut n = OrphanNotices::new(3);
+        let mut n: OrphanNotices<u64, u32> = OrphanNotices::new(3);
         for k in 0..10u64 {
             n.note(k, 0u32, now + Duration::from_millis(k));
             assert!(n.len() <= 3);
@@ -337,7 +541,7 @@ mod tests {
     #[test]
     fn eviction_prefers_notices_closest_to_giving_up() {
         let now = Instant::now();
-        let mut n = OrphanNotices::new(2);
+        let mut n: OrphanNotices<u64, u32> = OrphanNotices::new(2);
         n.note(1u64, 0u32, now);
         let due = n.pop_due(at(now, 5)).expect("due");
         n.note(2, 0, at(now, 5));
@@ -351,7 +555,7 @@ mod tests {
     #[test]
     fn forgotten_notice_is_never_due() {
         let now = Instant::now();
-        let mut n = OrphanNotices::new(8);
+        let mut n: OrphanNotices<u64, u32> = OrphanNotices::new(8);
         n.note(1u64, 0u32, now);
         n.forget(&1);
         assert_eq!(n.next_due(), None);
@@ -382,5 +586,141 @@ mod tests {
         assert!(!offer_noted(true, false));
         assert!(!offer_noted(false, true));
         assert!(!offer_noted(true, true));
+    }
+
+    /// Known issue 50: a cut blocks the target's group until the failed
+    /// notice's next offer; other notices of that group come due meanwhile
+    /// and are deferred without spending a try; after the block one probe
+    /// offer goes out, holding the group until it is reported.
+    #[test]
+    fn a_cut_holds_the_group_and_sends_one_probe_after_it() {
+        let now = Instant::now();
+        let mut n: OrphanNotices<u64, u32, u8> = OrphanNotices::new(16);
+        let site = |t: &u32| (*t / 10) as u8;
+        n.note(1, 10, now);
+        n.note(2, 11, now + Duration::from_secs(1));
+        n.note(3, 12, now + Duration::from_secs(2));
+        n.note(4, 20, now + Duration::from_secs(3));
+        let first = n.pop_open(at(now, 5), site).expect("due");
+        assert_eq!(first.key, 1);
+        // Held while the probe is out: 2 is due but deferred, untouched.
+        assert_eq!(n.pop_open(at(now, 6), site), None);
+        // Cut at 7 s: next offer of 1 at 22 s; group 1 blocked until then.
+        assert_eq!(n.cut(first, 1, at(now, 7)), Some(at(now, 22)));
+        assert_eq!(n.blocked(&1, at(now, 7)), Some(at(now, 22)));
+        // 3 comes due and is deferred; another group is unaffected.
+        assert_eq!(n.pop_open(at(now, 8), site).map(|d| d.key), Some(4));
+        assert_eq!(n.pop_open(at(now, 21), site), None);
+        assert_eq!(n.len(), 3);
+        assert_eq!(n.next_due(), Some(at(now, 22)));
+        // At 22 s one probe (no try spent by the deferred ones).
+        let probe = n.pop_open(at(now, 22), site).expect("probe");
+        assert_eq!(n.pop_open(at(now, 22), site), None);
+        // Delivered: the group opens; the deferred ones, held behind the
+        // probe, go with their tries once the probe hold ends.
+        n.reached(&1);
+        assert_eq!(n.next_due(), Some(at(now, 22) + PROBE_HOLD));
+        let later = at(now, 22) + PROBE_HOLD;
+        let mut rest: Vec<(u64, usize)> = std::iter::from_fn(|| {
+            n.pop_open(later, site).map(|d| {
+                n.reached(&1);
+                (d.key, d.tries)
+            })
+        })
+        .collect();
+        rest.sort();
+        let mut all = vec![(probe.key, probe.tries)];
+        all.extend(rest);
+        all.sort();
+        assert_eq!(all, vec![(1, 1), (2, 0), (3, 0)]);
+        assert!(n.is_empty());
+    }
+
+    #[test]
+    fn a_refusal_releases_the_group_and_spends_a_try() {
+        let now = Instant::now();
+        let mut n: OrphanNotices<u64, u32, u8> = OrphanNotices::new(8);
+        n.note(1, 10, now);
+        n.note(2, 11, now);
+        let due = n.pop_open(at(now, 5), |_| 1).expect("due");
+        assert_eq!(n.refused(due, &1, at(now, 5)), Some(at(now, 20)));
+        assert_eq!(n.blocked(&1, at(now, 5)), None);
+        assert_eq!(n.pop_open(at(now, 5), |_| 1).map(|d| d.key), Some(2));
+        // An unreported probe holds the group for `PROBE_HOLD` only.
+        assert!(n.blocked(&1, at(now, 5)).is_some());
+        assert_eq!(
+            n.blocked(&1, now + Duration::from_secs(5) + PROBE_HOLD),
+            None
+        );
+    }
+
+    #[test]
+    fn a_cut_on_the_last_try_still_blocks_and_drops_the_notice() {
+        let now = Instant::now();
+        let mut n: OrphanNotices<u64, u32, u8> = OrphanNotices::new(8);
+        n.note(1, 10, now);
+        let mut t = at(now, 5);
+        for _ in 0..NOTICE_TRIES - 1 {
+            let due = n.pop_open(t, |_| 1).expect("due");
+            t = n.cut(due, 1, t).expect("next");
+        }
+        let due = n.pop_open(t, |_| 1).expect("last");
+        assert_eq!(n.cut(due, 1, t), None);
+        assert!(n.is_empty());
+        assert_eq!(n.blocked(&1, t), Some(t + NOTICE_DELAYS[NOTICE_TRIES - 1]));
+    }
+
+    #[test]
+    fn deferred_notices_respect_capacity_renewal_and_forget() {
+        let now = Instant::now();
+        let mut n: OrphanNotices<u64, u32, u8> = OrphanNotices::new(4);
+        for k in 0..4u64 {
+            n.note(k, 10, now);
+        }
+        let due = n.pop_open(at(now, 5), |_| 1).expect("due");
+        n.cut(due, 1, at(now, 5));
+        assert_eq!(n.pop_open(at(now, 5), |_| 1), None);
+        assert_eq!(n.len(), 4);
+        // A renewed note wins over the deferral; a forgotten one is gone.
+        n.note(1, 10, at(now, 6));
+        n.forget(&2);
+        for k in 10..20u64 {
+            n.note(k, 30, at(now, 6));
+            assert!(n.len() <= 4);
+        }
+        for _ in 0..1000 {
+            n.note(10, 30, at(now, 6));
+        }
+        assert!(n.deferred.len() <= 2 * 4 + 1);
+        // Groups are bounded by the capacity too.
+        for g in 0..100u8 {
+            n.block(g, at(now, 100), at(now, 6));
+        }
+        assert!(n.blocked.len() <= 4);
+    }
+
+    /// Reads feed the cut groups: a transport failure toward a group holds
+    /// its offers for `PROBE_HOLD` (never shortening a longer block), an
+    /// answer signed by a member releases them; nothing is kept while no
+    /// notice is pending.
+    #[test]
+    fn reads_hold_and_release_offers_to_a_group() {
+        let now = Instant::now();
+        let mut n: OrphanNotices<u64, u32, u8> = OrphanNotices::new(8);
+        n.observe(1, true, now);
+        assert_eq!(n.blocked(&1, now), None);
+        n.note(1, 10, now);
+        n.observe(1, true, at(now, 4));
+        assert_eq!(n.blocked(&1, at(now, 4)), Some(at(now, 4) + PROBE_HOLD));
+        assert_eq!(n.pop_open(at(now, 5), |_| 1), None);
+        assert_eq!(n.len(), 1);
+        n.observe(1, false, at(now, 6));
+        // Deferred to the hold's end, then sent with no try spent.
+        let due = n.pop_open(at(now, 4) + PROBE_HOLD, |_| 1).expect("due");
+        assert_eq!(due.tries, 0);
+        // A read failure does not shorten a cut's longer block.
+        let next = n.cut(due, 1, at(now, 15)).expect("next");
+        n.observe(1, true, at(now, 16));
+        assert_eq!(n.blocked(&1, at(now, 16)), Some(next));
     }
 }

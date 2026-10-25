@@ -133,7 +133,22 @@ impl Drop for OfferFlight {
     }
 }
 
-pub(crate) type Notices = racer_core::read::notice::OrphanNotices<crate::model::PageId, NodeId>;
+/// Orphan notices grouped by their target's site (Known issue 50).
+pub(crate) type Notices =
+    racer_core::read::notice::OrphanNotices<crate::model::PageId, NodeId, String>;
+
+/// How a copy offer ended (Known issue 50).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OfferEnd {
+    /// Not sent: this node is no longer an owner after rank 0.
+    Dropped,
+    /// The target answered `Miss`.
+    Delivered,
+    /// The target itself answered something else.
+    Refused,
+    /// A transport failure or a relay's answer: the route is cut.
+    Cut,
+}
 
 /// Copy offers a node sends at once; more due offers wait for a later turn.
 pub(crate) const MAX_OFFERS_IN_FLIGHT: usize = 4;
@@ -710,6 +725,35 @@ impl CandidatePolicy {
             ) => watch.answered(page, rank0),
             _ => {}
         }
+    }
+
+    /// Feed a walk probe's route evidence to the orphan notices' cut groups
+    /// (Known issue 50): a transport failure or timeout toward
+    /// `destination` holds offers to its site, an answer signed by it
+    /// releases them. Answers that a relay may have signed say nothing.
+    fn observe_route(
+        &self,
+        membership: &crate::topology::Membership,
+        destination: &NodeId,
+        outcome: &WalkOutcome,
+    ) {
+        let cut = match outcome {
+            WalkOutcome::Transport(_) | WalkOutcome::TimedOut => true,
+            WalkOutcome::Copy
+            | WalkOutcome::Shed
+            | WalkOutcome::Failed
+            | WalkOutcome::Probe(ProbeOutcome::CopyMiss | ProbeOutcome::VersionUnavailable) => {
+                false
+            }
+            _ => return,
+        };
+        let site = membership
+            .member(destination)
+            .map(|m| m.site.clone())
+            .unwrap_or_default();
+        self.notices
+            .borrow_mut()
+            .observe(site, cut, uring_runtime::environment::now());
     }
 
     /// Whether this policy can wait for a destination that is behind.
@@ -1533,6 +1577,11 @@ impl CandidatePolicy {
                         note_validation(trail, &validated);
                         match validated {
                             Ok(Ok(copy)) => {
+                                self.observe_route(
+                                    &candidates.membership,
+                                    destination,
+                                    &WalkOutcome::Copy,
+                                );
                                 if walk.pending_rank0() {
                                     self.note_rank0(
                                         destination,
@@ -1571,6 +1620,7 @@ impl CandidatePolicy {
                         }
                     },
                 };
+                self.observe_route(&candidates.membership, destination, &outcome);
                 if walk.pending_rank0() && !relayed {
                     // Only rank 0's own answer (or its silence) says anything
                     // about rank 0.
@@ -2418,16 +2468,34 @@ impl CandidatePolicy {
         holds: impl Fn(&crate::model::PageId) -> bool,
         metrics: &Metrics,
     ) {
+        let membership = self
+            .published
+            .current()
+            .ok()
+            .flatten()
+            .map(|published| published.membership.clone());
+        // Offers are held per target site while a cut lasts (Known issue
+        // 50); members without a site, or unknown, share one group.
+        let site = move |node: &NodeId| -> String {
+            membership
+                .as_ref()
+                .and_then(|m| m.member(node).ok())
+                .map(|m| m.site.clone())
+                .unwrap_or_default()
+        };
         while self.offers.get() < MAX_OFFERS_IN_FLIGHT {
-            let Some(due) = self.notices.borrow_mut().pop_due(now) else {
+            let Some(due) = self.notices.borrow_mut().pop_open(now, &site) else {
                 return;
             };
+            let group = site(&due.target);
             if !holds(&due.key) {
+                self.notices.borrow_mut().release(&group);
                 continue;
             }
             let Ok(permit) = uring_runtime::drivers::reserve() else {
-                // No driver slot this turn: count it as a failed offer.
-                let _ = self.notices.borrow_mut().failed(due, now);
+                // No driver slot this turn: count it as a failed offer
+                // (local, so not a cut).
+                let _ = self.notices.borrow_mut().refused(due, &group, now);
                 return;
             };
             let flight = OfferFlight::new(self.offers.clone());
@@ -2436,13 +2504,22 @@ impl CandidatePolicy {
             permit.submit_detached(Box::pin(async move {
                 let _flight = flight;
                 metrics.record(Event::OrphanOfferSent, 1);
-                match policy.offer(&due).await {
-                    Ok(None) => {}
-                    Ok(Some(true)) => metrics.record(Event::OrphanOfferDelivered, 1),
-                    Ok(Some(false)) | Err(_) => {
+                let end = policy.offer(&due).await.unwrap_or(OfferEnd::Cut);
+                let now = uring_runtime::environment::now();
+                let mut notices = policy.notices.borrow_mut();
+                match end {
+                    OfferEnd::Dropped => notices.release(&group),
+                    OfferEnd::Delivered => {
+                        metrics.record(Event::OrphanOfferDelivered, 1);
+                        notices.reached(&group);
+                    }
+                    OfferEnd::Refused => {
                         metrics.record(Event::OrphanOfferFailed, 1);
-                        let now = uring_runtime::environment::now();
-                        let _ = policy.notices.borrow_mut().failed(due, now);
+                        let _ = notices.refused(due, &group, now);
+                    }
+                    OfferEnd::Cut => {
+                        metrics.record(Event::OrphanOfferFailed, 1);
+                        let _ = notices.cut(due, group, now);
                     }
                 }
                 Ok::<(), Error>(())
@@ -2539,13 +2616,13 @@ impl CandidatePolicy {
         }
     }
 
-    /// Send one copy offer for `due` to the page's current rank 0. `None`
-    /// when this node is no longer an owner after rank 0 (the notice is
-    /// dropped); otherwise whether rank 0 itself answered `Miss`.
+    /// Send one copy offer for `due` to the page's current rank 0, and
+    /// classify how it ended. Errors before sending are cut evidence too
+    /// (membership or route lookup).
     async fn offer(
         &self,
         due: &racer_core::read::notice::Due<crate::model::PageId, NodeId>,
-    ) -> Result<Option<bool>> {
+    ) -> Result<OfferEnd> {
         use racer_core::read::notice::{NOTICE_LINKS, notice_target};
         let page = &due.key;
         let deadline = uring_runtime::environment::now() + self.attempt_timeout;
@@ -2569,7 +2646,7 @@ impl CandidatePolicy {
             .ordered;
         owners.truncate(3);
         let Some(target) = notice_target(&self.node, &owners, true) else {
-            return Ok(None);
+            return Ok(OfferEnd::Dropped);
         };
         let context = OriginContext {
             object: page.version.object.clone(),
@@ -2596,9 +2673,14 @@ impl CandidatePolicy {
                 RequestMode::FundedRoute,
             )
             .await;
-        Ok(Some(response.is_ok_and(|response| {
-            matches!(response.response(), PeerResponse::Miss) && response.origin().node() == &target
-        })))
+        Ok(match response {
+            Ok(response) if response.origin().node() != &target => OfferEnd::Cut,
+            Ok(response) if matches!(response.response(), PeerResponse::Miss) => {
+                OfferEnd::Delivered
+            }
+            Ok(_) => OfferEnd::Refused,
+            Err(_) => OfferEnd::Cut,
+        })
     }
 
     pub fn origin_miss_error(&self, authority: &OriginAuthority) -> Error {

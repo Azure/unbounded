@@ -5001,6 +5001,115 @@ fn owner_after_rank_zero_offers_its_origin_fetch_later() {
     assert_eq!(f.origin.calls.get(), 1);
 }
 
+/// Known issue 50: an offer that fails in transport blocks its target's
+/// site (here every member has none, so one group) until the notice's next
+/// offer is due. Another notice that comes due meanwhile is deferred without
+/// a request or a spent try; when the block ends one offer goes out as the
+/// group's probe, and after it is delivered the deferred one follows.
+#[test]
+fn offers_wait_out_a_cut_toward_their_site() {
+    use crate::telemetry::Event;
+    use racer_core::read::notice::{NOTICE_DELAYS, PROBE_HOLD};
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let (peers, ordered) = install_peers(&mut f, Some(1));
+    publish_same_membership(&mut f, &peers);
+    f.fill
+        .dependencies
+        .writer
+        .retention()
+        .set_ownership(Rc::new(|_| true));
+    peers
+        .replies
+        .borrow_mut()
+        .push_back((ordered[0].clone(), Reply::Stale));
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+    assert!(acquire(&mut f, &mut budget).is_ok());
+    let candidates = f.fill.dependencies.candidates.clone();
+    let start = uring_runtime::environment::now();
+    let poll = |f: &mut Fixture, now: Instant, n: u64| {
+        let ended = |f: &Fixture| {
+            f.fill.metrics.count(Event::OrphanOfferDelivered)
+                + f.fill.metrics.count(Event::OrphanOfferFailed)
+        };
+        let target = ended(f) + n;
+        f.fill
+            .dependencies
+            .candidates
+            .poll_offers(now, |_| true, &f.fill.metrics);
+        let metrics = f.fill.metrics.clone();
+        drive(
+            std::future::poll_fn(|_| {
+                if metrics.count(Event::OrphanOfferDelivered)
+                    + metrics.count(Event::OrphanOfferFailed)
+                    >= target
+                {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }),
+            &mut f.engine,
+            &f.crypto,
+        );
+    };
+    // The first offer fails in transport: the group is blocked until its
+    // next offer, 15 s after the failure. The offer task reports at the
+    // runtime clock, which this test does not advance, so that is
+    // `start + 15 s` while `poll` passes later times explicitly.
+    peers
+        .replies
+        .borrow_mut()
+        .push_back((ordered[0].clone(), Reply::Deadline));
+    let first = start + NOTICE_DELAYS[0];
+    poll(&mut f, first, 1);
+    assert_eq!(peers.calls.borrow().len(), 2);
+    // A second notice, due at `first` too, is deferred: no request.
+    // A page with the same rank 0 and this node after it.
+    let local = candidates.node.clone();
+    let other = (1..256)
+        .map(|n| crate::model::PageId {
+            number: PageNumber(f.page.number.0 + n),
+            ..f.page.clone()
+        })
+        .find(|page| {
+            let owners = candidates
+                .candidates(f.membership.clone(), &f.context.object, page.number)
+                .ordered;
+            owners[0] == ordered[0] && owners[1..3].contains(&local)
+        })
+        .expect("a page ranked like the first");
+    assert!(candidates.note_orphan(&other, &ordered, 1));
+    poll(&mut f, first, 0);
+    poll(
+        &mut f,
+        start + NOTICE_DELAYS[1] - Duration::from_millis(1),
+        0,
+    );
+    assert_eq!(peers.calls.borrow().len(), 2);
+    assert_eq!(candidates.notices.borrow().len(), 2);
+    // The block ends: one probe offer, delivered; the other stays held
+    // behind it, then goes on its first try.
+    peers
+        .replies
+        .borrow_mut()
+        .push_back((ordered[0].clone(), Reply::Miss));
+    let open = start + NOTICE_DELAYS[1] + Duration::from_millis(1);
+    poll(&mut f, open, 1);
+    assert_eq!(peers.calls.borrow().len(), 3);
+    assert_eq!(candidates.notices.borrow().len(), 1);
+    peers
+        .replies
+        .borrow_mut()
+        .push_back((ordered[0].clone(), Reply::Miss));
+    poll(&mut f, open + PROBE_HOLD, 1);
+    assert_eq!(peers.calls.borrow().len(), 4);
+    assert_eq!(f.fill.metrics.count(Event::OrphanOfferSent), 3);
+    assert_eq!(f.fill.metrics.count(Event::OrphanOfferDelivered), 2);
+    assert!(candidates.notices.borrow().is_empty());
+}
+
 /// Known issue 37: a page this node no longer holds is not offered, and a
 /// rank 0 origin fetch leaves no notice.
 #[test]
