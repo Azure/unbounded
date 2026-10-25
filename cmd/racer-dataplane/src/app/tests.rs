@@ -1195,7 +1195,7 @@ fn worker_sizing_funds_derived_connection_pools() {
 impl WorkerApplication {
     // Keep private-field access local; shared fixture assembly belongs to test_support.
     pub(crate) fn into_test_coordinator(self) -> Rc<Coordinator> {
-        self.coordinator
+        self.coordinator.clone()
     }
 }
 

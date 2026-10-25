@@ -690,6 +690,17 @@ impl StopSignals {
     }
 }
 
+impl Drop for WorkerApplication {
+    /// Break the `Links` task cycle when the worker is dropped without a drain
+    /// (crash, failed startup, or an aborted group), so setup tasks release
+    /// their connections and admission charges.
+    fn drop(&mut self) {
+        if let Some(links) = &self.links {
+            links.abandon_setups();
+        }
+    }
+}
+
 impl Drop for StopSignals {
     fn drop(&mut self) {
         let mut installed = match INSTALLED.lock() {

@@ -1183,3 +1183,38 @@ fn half_open_link_after_peer_restart_breaks_on_first_use() {
     }
     assert!(w.a.links.wants(&b, RAIL));
 }
+
+/// Setup tasks hold an `Rc<Links>` (see `connect_link`), so `Links::tasks` is
+/// a reference cycle. `abandon_setups` must break it so an undrained owner
+/// releases the tasks and their admission charges (Known issue 145).
+#[test]
+fn abandon_setups_breaks_the_task_cycle_and_releases_charges() {
+    let w = world_for([node_id(1), node_id(2)], true);
+    let links = w.a.links.clone();
+    let charge =
+        w.a.admission
+            .reserve(None, ResourceClass::RequestContext, 128)
+            .unwrap();
+    let held = links.clone();
+    links.spawn(Box::pin(async move {
+        let _owned = (held, charge);
+        std::future::pending::<()>().await;
+        Ok(())
+    }));
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert_eq!(links.poll(&mut cx), 1);
+    assert_eq!(w.a.admission.used(ResourceClass::RequestContext), 128);
+    // The world, this test, and the pending task each own one reference.
+    assert_eq!(Rc::strong_count(&links), 3);
+
+    links.abandon_setups();
+    assert_eq!(links.setups(), 0);
+    assert_eq!(Rc::strong_count(&links), 2, "the task's reference is gone");
+    assert_eq!(w.a.admission.used(ResourceClass::RequestContext), 0);
+
+    // An abandoned facade refuses new setups, like a drained one.
+    links.spawn(Box::pin(async { Ok(()) }));
+    assert_eq!(links.setups(), 0);
+    // Idempotent.
+    links.abandon_setups();
+}
