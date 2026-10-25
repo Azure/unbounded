@@ -862,6 +862,11 @@ Verified against the code at the start of this work.
    issue 52 hold (`rank0_failure_hold` 0: 329 failed) nor cut groups (`offer_cut_groups` 0:
    374); `offer_predecessors` 0: 273.
 
+511. Funding short in-order owners (Known issue 57) makes them fetch after rank 0 failed the
+   reader instead of failing it: 5k `full-failover` origin +17 to +30 requests, `copy_held`
+   repeats 58/67/55 to 67/76/72 and worst page 5 to 6 (seeds 1, 2), for 4 to 15 fewer failed
+   reads. Open (round 4, budget, wave 7).
+
 ## Simulator engine (racer-sim substrate)
 
 `cmd/racer-dataplane/sim` provides the substrate the extracted logic plugs into:
@@ -1411,6 +1416,8 @@ scenarios carry data-plane faults.
 58. 50k `full-failover` failed reads about 258 to 326 after offer2 (seeds 1 to 3): rank 1
    defers readers to issue 51's offer senders, often down; the direct fix fails DST seed 11.
    Open (round 4, offer2, wave 6).
+511. Funded short in-order owners fetch after rank 0 failed the reader: 5k `full-failover`
+   origin +17 to +30, worst page 5 to 6, 4 to 15 fewer failed reads (round 4, budget, wave 7).
 
 ## Round 2: production admission
 
