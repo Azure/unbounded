@@ -3821,7 +3821,7 @@ fn a_delegated_rank_zero_asks_lineage_and_demoted_targets_on_their_own_grant() {
         // The member ranked fourth is cached below the owners.
         assert_eq!(
             placement.demoted(&current, &f.context.object, f.page.number),
-            [demoted.clone()],
+            std::slice::from_ref(&demoted),
             "{case}"
         );
     }
