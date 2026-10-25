@@ -78,6 +78,10 @@ pub struct NodeConfig {
     /// Rank 0 asks a successor that recently missed it before origin
     /// (production: always on; set 0 to measure without it, Known issue 21).
     pub successor_hints: bool,
+    /// Owners ask hinted later owners copy-only before origin, each probe on
+    /// its own grant (production: always on; set 0 to measure without it,
+    /// Known issue 21, round 4 orphan2). Needs `successor_hints`.
+    pub successor_targets: bool,
     /// Non-owners walk the recent previous membership at a destination that
     /// is behind (production: always on; set 0 to measure without it, Known
     /// issue 19).
@@ -123,6 +127,7 @@ impl Default for NodeConfig {
             hot_page_bodies: 0,
             flight_handover: true,
             successor_hints: true,
+            successor_targets: true,
             stale_fallback: true,
             lineage: true,
             stale_wait: true,
@@ -168,6 +173,7 @@ impl NodeConfig {
                 "hot_page_bodies" => self.hot_page_bodies = small()?,
                 "flight_handover" if n <= 1 => self.flight_handover = n == 1,
                 "successor_hints" if n <= 1 => self.successor_hints = n == 1,
+                "successor_targets" if n <= 1 => self.successor_targets = n == 1,
                 "stale_fallback" if n <= 1 => self.stale_fallback = n == 1,
                 "lineage" if n <= 1 => self.lineage = n == 1,
                 "stale_wait" if n <= 1 => self.stale_wait = n == 1,

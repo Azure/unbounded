@@ -558,6 +558,40 @@ mod tests {
         assert!(orphans(&on) < orphans(&off), "{}", on["origin_per_page"]);
     }
 
+    /// Known issue 21 (round 4, orphan2): an owner holding a successor hint
+    /// asks the hinted owner copy-only before origin on its own grant, so
+    /// rank 0 copies orphan copies instead of fetching them again. Without
+    /// successor targets no such probe is sent.
+    #[test]
+    fn failover_owners_copy_orphans_from_successors() {
+        let run_with = |targets: bool| {
+            let mut config = Config {
+                nodes: 400,
+                ..Config::default()
+            };
+            data_defaults(&mut config);
+            config.request_rate = 0.2;
+            config.node.successor_targets = targets;
+            run("full-failover", config, 2, Some(300 * SECONDS), None).unwrap()
+        };
+        let (off, on) = (run_with(false), run_with(true));
+        assert_clean(&on);
+        assert_eq!(counter(&off, "successor_probes"), 0);
+        assert!(counter(&on, "successor_copies") > 0, "{}", on["metrics"]);
+        let orphans = |r: &Value| {
+            let o = &r["origin_per_page"]["repeats"]["orphan"];
+            o["copy_only"].as_u64().unwrap() + o["failed"].as_u64().unwrap()
+        };
+        assert!(orphans(&on) < orphans(&off), "{}", on["origin_per_page"]);
+        // A refetch by rank 0 that noted the holder is rare: its one probe
+        // missed (the holder's fetch was still running or failed).
+        assert!(
+            counter(&on, "origin_repeats_orphan_noted") <= counter(&on, "successor_misses"),
+            "{}",
+            on["metrics"]
+        );
+    }
+
     /// Known issue 7: the Pod crashed for good at `d / 2 + 5 s` leaves the
     /// membership once its Node has been not ready for the grace, so peers
     /// stop choosing it. Before round 4 they chose it until the end.

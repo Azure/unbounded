@@ -52,7 +52,7 @@ use racer_core::read::serve::{ServeAction, ServeFacts, serve_action, serve_deadl
 use racer_core::read::stale::{
     StaleSkip, StaleWaitFacts, fallback_rank_allowed, previous_fallback, stale_wait,
 };
-use racer_core::read::successor::{MAX_DEFERRALS, defer_allowed, should_note, successor_deferral};
+use racer_core::read::successor::{MAX_DEFERRALS, defer_allowed, should_note, successor_deferral, successor_targets, with_successors};
 use racer_core::read::walk::{
     AttemptInputs, AttemptPlan, CandidateWalk, Continuation, End, HedgeFacts, MAX_HANDOFF, Mode,
     Outcome, PREVIOUS_MEMBERSHIP_WITHIN, Probe, RemainingWalk, RouteMode, StaleAction, Step,
@@ -332,6 +332,9 @@ struct Fill {
     /// This owner's lineage targets (`lineage_targets`), merged into
     /// `handoff` (Known issue 25).
     lineage_targets: Vec<u32>,
+    /// The first `successors` entries of `handoff` are successor targets
+    /// (`WalkConfig::successors`).
+    successors: usize,
     /// This owner is a member of membership version - 1, which is still
     /// retained and was replaced within `PREVIOUS_MEMBERSHIP_WITHIN`.
     previous_member: bool,
@@ -1734,6 +1737,7 @@ impl NodeWorld {
                 handoff: Vec::new(),
                 lineage: [0; MAX_HANDOFF],
                 lineage_targets: Vec::new(),
+                successors: 0,
                 previous_member: false,
                 previous: 0,
                 version: 0,
@@ -2036,6 +2040,7 @@ impl NodeWorld {
         fill.cands = cands;
         fill.stale = 0;
         fill.handoff = fill.lineage_targets.clone();
+        fill.successors = 0;
         fill.previous_member = false;
         fill.previous = 0;
         fill.version = version;
@@ -2092,11 +2097,41 @@ impl NodeWorld {
     }
 
     fn walk_owners(&mut self, id: u64) {
+        self.add_successor_targets(id);
         let fill = self.fills.get_mut(&id).expect("present");
         if *fill.plan.step() == FillStep::Hedge && self.try_hedge(id) {
             return;
         }
         self.start_candidates(id);
+    }
+
+    /// Production `CandidatePolicy::resolve_epoch_traced` successor targets
+    /// (Known issue 21): an owner holding a hint that a later owner asked it
+    /// for the page without getting a copy asks that owner copy-only before
+    /// origin, on its own grant. Each hint funds one such probe.
+    fn add_successor_targets(&mut self, id: u64) {
+        if !self.config.node.successor_targets || !self.config.node.successor_hints {
+            return;
+        }
+        let fill = &self.fills[&id];
+        let Some(rank) = fill.rank else {
+            return;
+        };
+        let (node, page) = (fill.node, fill.page);
+        if self.nodes[node as usize].hints.is_empty() {
+            return;
+        }
+        let instant = self.instant(self.now());
+        let hints = self.nodes[node as usize].hints.probe(&page, instant);
+        let fill = &self.fills[&id];
+        let targets = successor_targets(&hints, &fill.cands, rank, &fill.handoff);
+        if targets.is_empty() {
+            return;
+        }
+        let fill = self.fills.get_mut(&id).expect("present");
+        let (handoff, successors) = with_successors(targets, &fill.handoff);
+        fill.handoff = handoff;
+        fill.successors = successors;
     }
 
     /// Build the candidate walk from the fill's ranking and the carried
@@ -2122,6 +2157,7 @@ impl NodeWorld {
             // the helper is chosen when the walk asks for it.
             helper: fill.rank.is_none() && self.config.node.fanout && helpers_possible,
             lineage: fill.lineage,
+            successors: fill.successors,
         }));
         self.step_walk(id);
     }
@@ -2555,7 +2591,11 @@ impl NodeWorld {
         let fill = &self.fills[&id];
         let dest = match probe.canonical.checked_sub(fill.cands.len()) {
             Some(i) if fill.rank.is_some() => {
-                self.metrics.incr("handoff_probes");
+                self.metrics.incr(if i < fill.successors {
+                    "successor_probes"
+                } else {
+                    "handoff_probes"
+                });
                 fill.handoff[i]
             }
             Some(_) => match self.fanout_helper(id) {
@@ -3534,6 +3574,15 @@ impl NodeWorld {
             };
             self.metrics.incr(label);
         }
+        if let Walking::Candidates(walk) = &fill.walk
+            && walk.pending_successor()
+        {
+            self.metrics.incr(match &outcome {
+                Ok(Outcome::Copy) => "successor_copies",
+                Ok(Outcome::Probe(ProbeOutcome::CopyMiss)) => "successor_misses",
+                _ => "successor_failures",
+            });
+        }
         if let Some(dest) = fill.asking.take() {
             let asked = match &outcome {
                 Ok(Outcome::Copy) => Asked::Copy,
@@ -4163,9 +4212,16 @@ impl NodeWorld {
             self.metrics.incr(cause);
             // `A` fetched as an owner above rank 0, so rank 0 has no copy
             // and fetches again: charge the repeat to why `A` skipped it.
-            if let Some(skip) = last.skip {
+            if let Some(orphan) = last.skip {
                 self.metrics
-                    .incr(skip_counter("origin_repeats_orphan_", skip));
+                    .incr(skip_counter("origin_repeats_orphan_", orphan));
+                // Rank 0 refetching although it noted the holder (round 4,
+                // orphan2): its one successor probe of the hint was spent,
+                // missed, or the hint expired. Without a note, the holder
+                // never reached it (partition, route, a relay failure).
+                if skip.is_none() && self.nodes[node as usize].hints.names(&page, &last.node) {
+                    self.metrics.incr("origin_repeats_orphan_noted");
+                }
             }
             // Every such repeat is a skip itself (`F` above rank 0), an
             // orphan (`A` fetched as a skip), or raced. Anything else is
