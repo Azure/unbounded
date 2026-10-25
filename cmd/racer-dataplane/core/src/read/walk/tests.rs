@@ -1772,7 +1772,7 @@ fn retry_affordable_keeps_later_visits_funded() {
         // Links enough, attempts not.
         (6, 32, false),
     ] {
-        let mut walk = CandidateWalk::new(config(None, 3, order.clone()));
+        let mut walk = CandidateWalk::new(config(None, 3, order));
         let mut b = budget(attempts, links);
         let Step::Probe(_) = walk.next(&mut b).unwrap() else {
             panic!("expected a probe");

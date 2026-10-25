@@ -280,6 +280,9 @@ enum Then {
 /// A yielding ranking or route search: the real future, polled once per
 /// simulated CPU slice on its worker's CPU FIFO (see the design doc,
 /// "Round 2: fidelity").
+/// A page ranked under a membership version: version, members, owners.
+type Ranked = (u64, Rc<Members>, Result<Vec<u32>, Error>);
+
 struct Task {
     node: u32,
     worker: u8,
@@ -383,7 +386,7 @@ struct Fill {
     /// (production ranks first, Known issue 36).
     deferred_skip: bool,
     /// The ranking allowed the fallback: walk it once the skip completes.
-    fallback_ready: Option<(u64, Rc<Members>, Result<Vec<u32>, Error>)>,
+    fallback_ready: Option<Ranked>,
     probe: Option<u64>,
     /// The leader's retention observation, used at publication.
     eligible: bool,
