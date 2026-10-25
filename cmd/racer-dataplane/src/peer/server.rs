@@ -671,10 +671,14 @@ impl PeerServer {
             };
             let mut connection = received.connection;
             if let (Some(admitted), Ok(membership)) = (admitted, &membership) {
+                // A native (RDMA) page body counts toward the hot-page shed
+                // like an HTTP one, until it is written or abandoned.
+                let streaming = self.page_streaming(&response.response);
                 let (returned, sent) = self
                     .transfers
                     .send_native(connection, &response, admitted, membership, &request_scope)
                     .await?;
+                drop(streaming);
                 connection = returned;
                 if sent {
                     connection.finish_exchange()?;
