@@ -23,6 +23,7 @@ use crate::read::flight::AcquisitionFailure;
 use crate::read::flight::AcquisitionWaiter;
 use crate::read::flight::FlightLeader;
 use crate::read::flight::FlightLimits;
+use crate::read::flight::FlightOperation;
 use crate::read::flight::Flights;
 use crate::read::flight::JoinedFlight;
 use crate::runtime::RequestScope;
@@ -166,6 +167,9 @@ struct Pair {
     origin: &'static OriginContext,
     page: PageId,
     next_request: u8,
+    /// Production operations retained by leaders and not yet completed; core
+    /// counts the same operations per flight.
+    operations: Vec<FlightOperation>,
 }
 
 fn poll_prod(waiter: &mut AcquisitionWaiter<'static>) -> (Obs, Option<FlightLeader>) {
@@ -229,6 +233,7 @@ impl Pair {
             origin,
             page,
             next_request: 0,
+            operations: Vec::new(),
         }
     }
 
@@ -372,6 +377,45 @@ impl Pair {
         settle(prod, core);
     }
 
+    /// Retain one operation for `caller`'s leadership on both sides (the fill
+    /// driver's `retain_operation` before submission). Both accept an active
+    /// leader and reject a revoked one. Returns whether both retained.
+    fn retain(&mut self, caller: &Caller) -> bool {
+        let leader = caller.leader.as_ref().unwrap();
+        let prod = self.flights.retain_operation(
+            leader,
+            crate::telemetry::Metrics::default()
+                .lease(crate::telemetry::Gauge::ActiveFills)
+                .unwrap(),
+        );
+        let core = self.table.retain_operation(&self.page, caller.core);
+        assert_eq!(
+            core.is_ok(),
+            self.table.is_leader(&self.page, caller.core),
+            "core retain"
+        );
+        match prod {
+            Ok(operation) => {
+                assert_eq!(core, Ok(()), "retain");
+                self.operations.push(operation);
+                true
+            }
+            Err(e) => {
+                settle(Err(e), core);
+                false
+            }
+        }
+    }
+
+    /// Complete the retained operation at `index` on both sides.
+    fn complete(&mut self, index: usize) {
+        let operation = self.operations.swap_remove(index);
+        operation.complete().unwrap();
+        self.table
+            .complete_operation(&self.page, &mut self.count, &mut self.wakes)
+            .unwrap();
+    }
+
     fn refresh(&mut self) {
         self.table.refresh(&self.page, Self::now(), &mut self.wakes);
     }
@@ -423,7 +467,7 @@ fn flights_match_page_flights_on_seeded_traces() {
         let mut value = 0u8;
         for _ in 0..60 {
             let leader = callers.iter().position(|c| c.leader.is_some());
-            match rng.below(9) {
+            match rng.below(10) {
                 0 | 1 => {
                     let ttl = if rng.below(3) == 0 {
                         Duration::from_secs(1)
@@ -493,9 +537,27 @@ fn flights_match_page_flights_on_seeded_traces() {
                     pair.refresh();
                     *steps.entry("advance").or_default() += 1;
                 }
+                8 if leader.is_some() && pair.operations.len() < 3 => {
+                    let caller = &callers[leader.unwrap()];
+                    *steps
+                        .entry(if pair.retain(caller) {
+                            "retain"
+                        } else {
+                            "retain_stale"
+                        })
+                        .or_default() += 1;
+                }
+                9 if !pair.operations.is_empty() => {
+                    let i = rng.below(pair.operations.len() as u64) as usize;
+                    pair.complete(i);
+                    *steps.entry("complete_operation").or_default() += 1;
+                }
                 _ => {}
             }
             pair.check();
+        }
+        while !pair.operations.is_empty() {
+            pair.complete(0);
         }
         for caller in callers.drain(..) {
             pair.detach(caller);
@@ -518,12 +580,55 @@ fn flights_match_page_flights_on_seeded_traces() {
         "fail",
         "reject",
         "advance",
+        "retain",
+        "complete_operation",
     ] {
         assert!(
             steps.get(step).copied().unwrap_or(0) > 0,
             "{step}: {steps:?}"
         );
     }
+}
+
+/// Known issue 122: a leader whose deadline passes while its retained
+/// operation runs is revoked; its detach keeps the entry, a new caller waits
+/// rather than leading a concurrent acquisition, the stale publish is rejected
+/// by both tables, and only completing the operation elects the new caller.
+#[test]
+fn expired_leader_with_retained_operation_drains_before_reelection() {
+    let clock = uring_runtime::environment::SimulationClock::new(122);
+    let _environment = clock.environment(0).enter();
+    let mut pair = Pair::new(core::FlightLimits::default());
+    let mut a = pair.join(Duration::from_secs(1), 2).1.unwrap();
+    assert_eq!(pair.poll(&mut a), Obs::Lead);
+    assert!(pair.retain(&a));
+    clock.advance(Duration::from_secs(1));
+    pair.refresh();
+    assert_eq!(pair.poll(&mut a), Obs::Failed("DeadlineExceeded".into()));
+    // The driver still holds the leader capability; only the waiter detaches.
+    let leader = a.leader.take();
+    let a_core = a.core;
+    pair.detach(a);
+    pair.check();
+    assert_eq!(pair.count.flights, 1, "entry kept while the operation runs");
+    let mut b = pair.join(Duration::from_secs(60), 2).1.unwrap();
+    assert_eq!(pair.poll(&mut b), Obs::Pending);
+    let mut stale = Caller {
+        prod: None,
+        leader,
+        scope: b.scope,
+        core: a_core,
+    };
+    assert!(!pair.retain(&stale), "a revoked leader cannot retain");
+    pair.publish(&mut stale, 1);
+    assert_eq!(pair.poll(&mut b), Obs::Pending);
+    pair.complete(0);
+    assert_eq!(pair.poll(&mut b), Obs::Lead);
+    pair.publish(&mut b, 2);
+    assert_eq!(pair.poll(&mut b), Obs::Complete(2));
+    pair.detach(b);
+    pair.check();
+    assert!(pair.table.is_empty());
 }
 
 /// Known issue 8 (resolved): production `Flights::fail(OriginRejected)`
