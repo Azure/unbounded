@@ -579,12 +579,22 @@ Verified against the code at the start of this work.
    window (client lag p90 about 24 s) is longer than the wait, so 95 reads still fail in
    `full-cold-start` (57 to 161 s, during enrollment). Open (round 4, history, wave 4).
 
-37. Orphans whose holder never reached rank 0 leave no hint, so rank 0 still refetches them (50k
-   `full-failover`: `route` 285, `partition` 139, `busy` 79, most of `failed` 343). Needs the holder
-   to tell rank 0 later (round 4, orphan2).
+37. Resolved (round 4, orphan3, wave 5): orphans whose holder never reached rank 0 left no hint, so
+   rank 0 refetched them (50k `full-failover`: `route` 285, `partition` 139, `busy` 79, most of
+   `failed` 343). An owner above rank 0 that fetched a page from origin now offers it to rank 0
+   later (`racer_core::read::notice`, page requests in the new `offer` mode, at most 4 tries over
+   155 s, 1,024 notices per worker); rank 0 notes the holder for its own successor probe without
+   deferring readers. Two orphan2 gaps were fixed on the way: a hinted owner that was also a lineage
+   target was left as an unfunded handoff probe, and hints expired for the probe after 10 minutes.
+   5k `full-failover`, seeds 1 to 10: orphan repeats 542 to 119, `copy_held` 1,041 to 603, failed
+   reads 366 to 368. 50k `full-failover`: orphan repeats 850 to 192, `copy_held` 1,410 to 775,
+   origin requests 50,858 to 50,230. Residual: issues 331 and 332.
 
-38. The simulator's repeat classification counts `Unavailable` signed by a relay on the route as
-   `failed` (rank 0's own origin failure); split it (round 4, orphan2).
+38. Resolved (round 4, orphan3, wave 5): the simulator's repeat classification counted
+   `Unavailable` signed by a relay on the route as `failed` (rank 0's own origin failure). It is now
+   its own class, `relay` (`Asked::Relayed`, `origin_skips_relay`, `origin_repeats_orphan_relay`):
+   5k `full-failover` seed 1 `failed` orphans 38 split into 19 `failed` and 19 `relay`, skips 379
+   into 226 and 153. `origin_repeat_explained` is unchanged and exact (`unexplained` 0).
 
 39. An owner above rank 0 no longer fetches a page when its probe of rank 0 is accepted but never
    answered (rank 0, or a relay on the route, hangs without failing the connection): readers of
@@ -619,6 +629,17 @@ Verified against the code at the start of this work.
    `full-churn` had a holder older than version - 1 that was not asked. That these are holders
    ranked sixth or lower, or past the three-target cap, is an inference: the run has no counter
    for the holder's rank. Open (round 4, lineage, wave 5).
+331. Copy offers sent while a partition still cuts the route to rank 0 fail in transport and count
+   as link failures: 5k `full-failover` partition link failures rose 19,514 to 22,413 (seeds 1 to
+   10) for 8,603 offers. Failed reads did not change measurably (366 to 368), but the failures
+   lengthen link backoff. Holding an offer while the path cache or circuit to its target is known
+   down, without spending a try, would avoid most of them. Open (round 4, orphan3, wave 5).
+
+332. Orphan repeats that offers cannot remove: rank 0 refetches before the holder's offer arrives
+   (inside the first 5 s delay, or while a partition still cuts the route), or rank 0's successor
+   probe of the holder fails in transport; and an owner above rank 0 that skips rank 0 itself
+   refetches a page another owner above rank 0 holds (the `skip` side, which offers to rank 0 do not
+   address). 119 left over 5k `full-failover` seeds 1 to 10. Open (round 4, orphan3, wave 5).
 
 ## Simulator engine (racer-sim substrate)
 
@@ -1110,8 +1131,10 @@ scenarios carry data-plane faults.
    wave 5).
 36. One wait does not cover the 50k propagation window: 95 failed reads in `full-cold-start`
    (round 4, history, wave 4).
-37. Orphans whose holder never reached rank 0 still refetch (50k 893 left) (round 4, orphan2).
-38. Relay-signed `Unavailable` is classified as rank 0's `failed` (round 4, orphan2).
+37. Resolved: orphan holders offer their copy to rank 0 later; orphan repeats 50k `full-failover`
+   850 to 192, 5k 542 to 119 over seeds 1 to 10 (round 4, orphan3, wave 5).
+38. Resolved: relay-signed `Unavailable` is its own repeat class, `relay` (round 4, orphan3, wave
+   5).
 39. A hung rank 0 (accepts, never answers) now blocks the owners above it from fetching (round 4,
    overload, wave 4).
 40. Owners above rank 0 still fetch after a route failure or an `Overloaded` answer from a rank 0
@@ -1122,6 +1145,11 @@ scenarios carry data-plane faults.
    71 to 95 ms) (round 4, lineage, wave 5).
 313. Holders ranked sixth or lower, or past the three-target cap, are not asked (157 of 188 5k
    `full-churn` moved repeats) (round 4, lineage, wave 5).
+331. Copy offers during a partition add link failures (5k `full-failover` +15%) (round 4, orphan3,
+   wave 5).
+332. Orphan repeats offers cannot remove: rank 0 refetches before the offer arrives, or the holder
+   is itself an owner above rank 0 that another owner skipped to (119 over 10 seeds) (round 4,
+   orphan3, wave 5).
 
 ## Round 2: production admission
 
@@ -4516,3 +4544,146 @@ matters here, but production keeps it.
   the latency at one round trip.
 - The temporary counters used for the root cause of Known issue 311 were removed before
   committing.
+## Round 4: orphan3 (wave 5)
+
+Known issues 37 and 38. Branch `racer-sim7-orphan3` from 113a0990d. Commits: 3d492ebf0 (38,
+simulator), 75a9a2ba0 (racer-core `notice`), 136d0c58a (simulator offers), baab2c551 (successor
+targets and probe TTL), 702b027e1 (production), aff40f320 and 82451d486 (test fixes), 0e57d2339
+(simulator test), 9fa60700f (offers defer no readers), plus this section. Evidence:
+`/tmp/opencode/r7-orphan3/` (final binary and runs under `fin/`).
+
+### Issue 38: root cause and fix
+
+`complete_probe` (`sim/src/node/world.rs`) mapped every `Outcome::Probe(ProbeOutcome::Unreachable)`
+to `Asked::Failed`, the class for a destination that answered with a failure of its own. A relay
+that cannot forward (`fail_hop`, `relay_failure` gives `Respond(Unavailable)`) signs the same
+answer, so a relay's failure was counted as rank 0's own. `send_reply` now marks the fill when the
+signer is not the destination (`Fill::relayed`), and `complete_probe` maps such answers to
+`Asked::Relayed`, reported as `relay` in `origin_per_page.skips` and `repeats.orphan`. A second
+defect on the same path: the transport cause `Fill::cut` noted for a relay-signed answer was never
+taken, so it leaked into the next probe's classification; both are now reset per probe. The
+classification only changed names: 5k `full-failover` seed 1 has the same trace hash, `failed`
+orphans 38 became 19 `failed` and 19 `relay`, skips 379 became 226 and 153. In `copy_held` and
+`after_move` breakdowns `Relayed` counts as unreachable, so `origin_repeat_explained` stays exact.
+
+### Issue 37: root cause
+
+Rank 0 learns of an orphan copy only when the holder's probe reaches it and misses
+(`Coordinator::note_successor`). Temporary counters (5k `full-failover`, seeds 1 and 2) showed the
+remaining orphan repeats split three ways:
+
+- The holder never reached rank 0 (route, partition, relay, busy), and rank 0 refetched 10 s to
+  more than 5 minutes later (most gaps above 30 s): no hint at all. This is the issue as filed.
+- Rank 0 had a hint naming the holder, the holder was also one of rank 0's lineage handoff
+  targets, and the walk never asked it (11 of 14 rank 0 refetches in seed 1).
+  `successor::successor_targets` dropped hinted owners already in `handoff`, so the holder stayed
+  an opportunistic handoff probe, which a delegated rank 0 holding one credit never sends
+  (`CandidateWalk::next`, `remaining_attempts() < 2`), while `probe` had already consumed the hint.
+- Rank 0 had an unprobed hint older than `HINT_TTL` (10 minutes): `SuccessorHints::probe` used the
+  deferral TTL (8 of 21 in seed 2, orphans after the 180 s origin error burst refetched after
+  780 s).
+
+### Issue 37: change
+
+- racer-core `notice` (new): `OrphanNotices`, a bounded table (1,024 entries per table; FIFO
+  queue per try level, so `pop_due` reads queue heads only) of pages this node fetched from origin
+  as an owner above rank 0 (`should_notice`). After `NOTICE_DELAYS` (5, 15, 45, 90 s; at most
+  `NOTICE_TRIES` 4 offers, the last 155 s after the fetch) the holder sends the page's current
+  rank 0 a copy offer if it still holds the page and is still an owner above rank 0
+  (`notice_target`). An offer is delivered when rank 0 itself answers `Miss`; anything else
+  (transport, a relay's answer, shed, behind) schedules the next try. A receiver notes the sender
+  only when it neither holds the page nor is fetching it (`offer_noted`).
+- racer-core `successor`: `note_offer` arms the hint for this node's successor probe but defers no
+  readers (a new entry gets zero deferrals; an existing entry keeps its count). Deferring readers
+  on offers failed DST `dst_generated_traffic_churn_oracle` seed 1 with a 503 to a healthy client:
+  the holder is often far away or gone by the time a reader is sent to it, while rank 0 asks it on
+  its own grant anyway. `successor_targets` keeps hinted owners that are also handoff targets
+  (`with_successors` moves them to the granted front, no duplicate). `probe` accepts hints up to
+  `PROBE_TTL` (1 hour) or the deferral TTL if longer; a stale probe costs one granted miss.
+- Production: `FetchMode::Offer` (`racer-mode: offer`), valid only for page requests without
+  origin credentials or remote attempts (`request_head` refuses the rest; other encodings are
+  byte-identical). Receivers that predate it reject the request, which the sender counts as not
+  delivered. `Coordinator::serve_peer` answers an offer before any acquisition path
+  (`serve_offer`: `Miss`, never a body, never credentials), and hot-page shedding skips offers (no
+  body). `Fill::acquire_once` notes the notice after a successful origin fetch at rank above 0
+  (`CandidatePolicy::note_orphan`); `WorkerApplication::poll_services` calls
+  `Coordinator::poll_offers` each service turn, which sends due offers as detached driver tasks,
+  at most `MAX_OFFERS_IN_FLIGHT` (4) per worker, each on a fresh grant (one local attempt, no
+  remote attempts, `NOTICE_LINKS` 8 links, the attempt timeout) through the ordinary funded route.
+  Telemetry: `racer_orphan_notices_total`, `racer_orphan_offers_{sent,delivered,failed,noted}_total`.
+- Simulator: the same model (`note_notice`, `send_notices`, `launch_offer`, `offer_done`,
+  `serve_offer`, `Event::Notice`), switch `node.orphan_notices`, counters `orphan_notices_*` and
+  `orphan_offers_*`. The simulator does not cap offers in flight (production caps 4 per worker).
+
+Bounds: one notice per origin fetch by an owner above rank 0, at most 4 offers each, every offer on
+its own fixed grant (no reader budget, budgets never grow; `budget_never_grows` held everywhere).
+An offer cannot make the receiver fetch, send a body, or defer a reader; it only re-arms one
+granted successor probe, which a copy-only probe could already do. Memory: 1,024 notices per
+worker and the existing 4,096-entry hint table. Origin authority is unchanged.
+
+### Tests
+
+- racer-core `notice::tests` (11): delays, backoff and give-up after `NOTICE_TRIES`, delivered not
+  retried, ordering across try levels, renewal, capacity and eviction, `forget`, `should_notice`,
+  `notice_target`, `offer_noted`. `successor::tests::hinted_handoff_target_moves_to_the_granted_front`,
+  `probe_outlives_the_deferral_ttl`, `offers_arm_probes_without_deferrals`;
+  `successor_targets_are_later_owners_newest_first` and `probe_returns_each_note_once` updated.
+- Production (`src/read/tests/peer_copies.rs`): `rank_zero_notes_an_offer_and_copies_from_its_sender`
+  (no origin call, no deferral), `offer_to_a_holder_is_answered_without_a_body_or_hint`,
+  `offer_encoding_is_restricted_to_credential_free_page_requests`,
+  `owner_after_rank_zero_offers_its_origin_fetch_later` (first try fails, second delivered, then
+  nothing more; 0 remote attempts, at most `NOTICE_LINKS`),
+  `offers_need_a_held_copy_and_an_owner_after_rank_zero`.
+- Simulator: `combined::tests::failover_holders_offer_orphans_to_rank_zero` (400 nodes, seed 2:
+  offers delivered, sent at most 4 per notice and all accounted for, fewer orphans than without
+  offers, a `relay` skip class, `unexplained` 0).
+
+### Evidence
+
+Release, seed 1 unless noted, configurations of "Round 4: combined (wave 4)". Before: the wave 4
+merge (`/tmp/opencode/m6/a/`); seed 2 before is the issue 38 commit alone (same trace as the wave 4
+code). Origin: total, worst page, pages fetched more than once. Orphans: all orphan repeats.
+Offers: sent / delivered / noted.
+
+| Run | Reads ok / failed | Origin | `copy_held` | Orphans | Offers | Wall |
+| --- | --- | --- | --- | --- | --- | --- |
+| 5k storm before / after | 378,544 / 0 | 1,024, 1, 0 | 0 | 0 | - / 0 | 1:23 / 1:27 |
+| 5k zipf before / after | 202,961 / 24 | 40,324, 3, 1,388 | 199 | 0 | - / 0 | 1:59 / 2:02 |
+| 5k churn before / after | 291,542 / 90 | 1,029, 2, 5 | 0 | 0 | - / 0 | 1:15 / 1:19 |
+| 5k zipf 16 MiB before / after | 37,524 / 29 | 18,866, 3, 1,181 | 5 | 0 | - / 0 | 0:49 / 0:52 |
+| 5k full-cold-start before / after | 94,830 / 0 | 6,931, 3, 36 | 0 | 0 | - / 0 | 0:40 / 0:40 |
+| 5k full-failover before | 33,794 / 37 | 13,018, 5, 425 | 125 | 61 | - | 0:50 |
+| 5k full-failover after | 33,788 / 37 | 12,946, 6, 369 | 69 | 7 | 906 / 570 / 508 | 0:52 |
+| 5k full-failover seed 2 before | 33,498 / 29 | 13,013, 6, 404 | 109 | 54 | - | 0:51 |
+| 5k full-failover seed 2 after | 33,476 / 43 | 12,955, 6, 384 | 74 | 16 | 923 / 591 / 527 | 0:51 |
+| 5k full-churn before | 33,996 / 1 | 13,471, 4, 852 | 6 | 4 | - | 0:48 |
+| 5k full-churn after | 33,997 / 1 | 13,471, 4, 850 | 4 | 3 | 74 / 67 / 65 | 0:49 |
+| 50k full-failover before | 302,776 / 395 | 50,858, 6, 4,998 | 1,410 | 850 | - | 27:59 |
+| 50k full-failover after | 302,766 / 400 | 50,230, 8, 4,611 | 775 | 192 | 4,869 / 3,364 / 2,720 | 28:16 |
+
+- 5k `full-failover`, seeds 1 to 10, before and after: failed reads 366 / 368 (seed 2's 29 to 43
+  is within the per-seed spread, 27 to 45), origin requests 128,778 / 128,330, `copy_held` 1,041 /
+  603, orphan repeats 542 / 119, `unexplained` 0 / 0; 8,603 offers, partition link failures 19,514
+  / 22,413 (Known issue 331). Without offers (`orphan_notices` 0) but with the successor target
+  and TTL fixes, seeds 1 to 5 left 219 orphans and 179 failed reads.
+- 50k `full-failover`: orphan repeats 850 to 192 (`failed` 437 to 75 plus 34 `relay`, `route`
+  159 to 17, `partition` 128 to 17, `busy` 79 to 32, `copy_only` 45 to 15), `copy_held` 1,410 to
+  775, origin requests down 628 (1.2%), pages fetched more than once 4,998 to 4,611. Skips by
+  class (issue 38): `failed` 1,201 and `relay` 897 (before: 2,148 `failed` in all). The worst page
+  rose 6 to 8 and failed reads 395 to 400; partition link failures 20,775 to 21,969 (issue 331).
+  Peak RSS 3.0 GiB (unchanged). `unexplained` 0, no hard failure.
+- 5k `cs1g` (1 Gbit/s 1 s storm) is unchanged (94,829 / 0). Scenarios without failover send no
+  offers and are unchanged.
+- All 16 scenarios at 200 nodes, 1 s pass with no hard failure or violation; workspace tests,
+  clippy `-D warnings` and fmt pass; DST `dst_generated_traffic_churn_oracle` and its native
+  variant pass for seeds 1 to 20.
+
+### Deviations and open items
+
+- New Known issue 331: offers during a partition add link failures. New Known issue 332: the
+  orphan repeats offers cannot remove (rank 0 refetches before the offer arrives, the successor
+  probe fails in transport, or the next fetcher is itself an owner above rank 0).
+- The first design let offers defer readers like a copy-only miss; DST seed 1 found a 503 and the
+  offers now only arm rank 0's own probe.
+- Wire: `racer-mode: offer` is new. Old receivers reject it (the sender retries on schedule and
+  then drops the notice); nothing else on the wire changed.
