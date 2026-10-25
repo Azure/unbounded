@@ -820,7 +820,9 @@ Verified against the code at the start of this work.
    wave 5: 6 and 6. A temporary per-page trace (not committed) showed both worst pages are
    origin failure retries only: rank 0's origin request fails, an owner above rank 0 asks
    origin itself (skip `failed` or `copy_only`), its request fails too, and the cycle repeats
-   (the Known issue 52 class). Open (round 4, probes, wave 6; combined, wave 6).
+   (the Known issue 52 class). With offer2's issue 52 hold merged, the 5k worst pages are 5 and
+   5; 50k `full-failover` worst page 7, `copy_held` 527 (wave 5: 578). Open at 50k (round 4,
+   probes, wave 6; combined, wave 6).
 
 56. Resolved: a primary's own seat follower failed closed when the primary committed while
    the follower's state read was in flight: the read answered the record the commit replaced,
@@ -1391,8 +1393,8 @@ scenarios carry data-plane faults.
    failed fewer reads in 5k `zipf` at 16 MiB but overlapped more origin requests (round 4,
    hang2, wave 6).
 55. 50k `full-failover` `copy_held` 578 to 626 and worst page 6 to 8 after the probes change;
-   5k worst pages 7 and 8 after the ctl3 merge are origin failure retries (issue 52 class)
-   (round 4, probes, wave 6).
+   5k worst pages 7 and 8 after the ctl3 merge are origin failure retries (issue 52 class);
+   with offer2 5k worst pages 5, 50k worst page 7 and `copy_held` 527 (round 4, probes, wave 6).
 56. Resolved: a primary's follower read overlapping its own commit failed closed (round 4, ctl3,
    wave 6).
 57. Owners with too little inherited budget fail when their rank 0 is behind on membership (4
