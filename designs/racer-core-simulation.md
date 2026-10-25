@@ -615,8 +615,9 @@ Verified against the code at the start of this work.
 
 313. Rendezvous ranks below the fifth are not kept, and a member that was never an owner while
    the page was read has nothing to give; 157 of the 188 moved-page repeats left in 5k
-   `full-churn` had a holder older than version - 1 that was not asked (holders ranked sixth or
-   lower, or listed after the three-target cap). Open (round 4, lineage, wave 5).
+   `full-churn` had a holder older than version - 1 that was not asked. That these are holders
+   ranked sixth or lower, or past the three-target cap, is an inference: the run has no counter
+   for the holder's rank. Open (round 4, lineage, wave 5).
 
 ## Simulator engine (racer-sim substrate)
 
@@ -4496,8 +4497,9 @@ matters here, but production keeps it.
 
 - Known issue 25 is resolved for what lineage can know: a moved page is now asked of every owner
   that ranked above it on arrival among the five best-ranked members, within three probes. What
-  remains (5k `full-churn`: 157 unasked older holders, 26 lost copies, 3 unreachable) is Known
-  issue 313 (ranks below five, the three-target cap) and copies that were evicted.
+  remains (5k `full-churn`: 157 unasked older holders, 26 lost copies, 3 unreachable) is, by
+  inference, Known issue 313 (ranks below five, the three-target cap) and copies that were
+  evicted.
 - New Known issue 312: the probes are sequential; probing granted targets concurrently would cap
   the latency at one round trip.
 - The temporary counters used for the root cause of Known issue 311 were removed before
