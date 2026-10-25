@@ -375,16 +375,16 @@ Verified against the code at the start of this work.
    50,000 nodes in `full-cold-start`), suspected to share the cause of 14 (round 4, capacity).
    The remaining enrollment-time failures come from join versions (new issue 19).
 
-18. The relay hold from the capacity track (`Relay` reservation kept while a body streams, as in
-   `src/peer/server.rs:438-445` and `:660`) makes the 5k hot-page scenarios shed on the `Relay`
-   quota: `storm` 18,013 and `zipf` 4,627 reads fail `Unavailable` (692,964 and 366,626 relay
-   rejections), against 0 and 11 on the handoff branch. The capacity branch alone fails 23,040
-   `storm` reads (787,758 rejections), so the merge did not cause it; handoff's fixes reduce it.
-   Same family as issue 16 (fanout track). No invariant is relaxed.
-   After the wave 2 merge (fanout, join, repeat; seed 1, 5k): `storm` fails 461 reads with 14,756
-   relay rejections, so relays no longer dominate there; `zipf` still fails 4,373 reads
-   `Unavailable` with 339,136 relay rejections (3,430 and 309,552 with fanout alone) (inference: its traffic is spread over many warm pages, below the
-   hot-page shed threshold), so the issue stays open for `zipf`.
+18. Resolved (round 4, relay, wave 3, 0eba3d9c8): a simulator modeling artifact. A relay that
+   forwarded a body still queued at a busy owner reserved its own NIC at the body's far-future send
+   time (`Fabric::transfer_until`, `sim/src/resources.rs`), so its other sends queued behind an idle
+   gap, backlogs spread from relay to relay, and relays held their `Relay` reservation for about
+   190 ms per body instead of about 23 ms. 5k `zipf` (seed 1) now fails 17 reads (was 4,373) with
+   59,758 relay rejections (was 339,136); seeds 2 and 3 fail 18 and 30 (were 5,152 and 7,254); 5k
+   `storm` fails 0 (was 461). Production's hold (`src/peer/server.rs`, `relay.reservation`) is
+   correct and unchanged. See "Round 4: relay (wave 3)".
+   Was: the relay hold from the capacity track makes the 5k hot-page scenarios shed on the `Relay`
+   quota (`zipf` 4,373 failed reads, 339,136 relay rejections after the wave 2 merge).
 
 19. Join versions cause `StaleMembership` skips. A new member learns that it is listed at the
    same time as its peers, so a requester that already holds the version skips it as a stale
@@ -411,6 +411,22 @@ Verified against the code at the start of this work.
    debiting the attempt production debits after validating origin authority
    (`src/read/fill.rs:1810`), so an owner with a spent budget still fetched (135 requests in 5k
    `full-failover`). It now fails the fill like production (`origin_unfunded`).
+
+121. The wave 2 merge lost most of fan-out's gain in the overloaded 1 Gbit/s `full-cold-start`
+   storm (5k, seed 1, `nic_bps` 125,000,000, one 1 s storm at 300 s): the fanout branch alone
+   completed 94,798 reads with 102 failures; the merged base 3771e5c3f completes 56,399 with
+   38,430 failures (20,119 deadline, 18,311 unavailable), 288,896 relay rejections, 191,873 probe
+   timeouts and only 13,532 helper probes (77,285 on the fanout branch), while membership
+   adoptions go from 0 to 8,135 and `CopyOnly` requests from 1,552 to 23,972 (inference: the
+   join track's membership versions and handoff's previous-owner probes change the storm's walks).
+   With the relay fix: 63,745 / 31,084. Not root-caused (round 4, relay, wave 3).
+
+122. `flight_leader_valid` fails in 5k `zipf` at production page size under origin overload
+   (`page_bytes` 16 MiB, `request_rate` 1.25, 8 s; seed 1): 374 violations on the base 3771e5c3f
+   and 376 with the relay fixes, all `finish page P leader L: Err(Internal)` from
+   `PageFlights::finish` (`core/src/read/flight.rs:295`) after about 5.5 s, when origin demand is
+   about 16 times its 5 GB/s. Never seen with 1 MiB pages. Not root-caused (round 4, relay,
+   wave 3).
 
 ## Simulator engine (racer-sim substrate)
 
@@ -857,8 +873,9 @@ scenarios carry data-plane faults.
 16. Resolved: owners shed readers of a dominant hot page to the page's helpers; a page is sent by at
    most `REPLICAS` owners plus `fanout_width` helpers (round 4, fanout, 751b85b1e..f887fe173).
 17. Resolved: no read fails because a listed member cannot serve yet (round 4, join, 789725d9c).
-18. `zipf` at 5k sheds on the `Relay` quota since the relay hold (4,373 failed, 339,136 relay
-   rejections after wave 2); `storm` is down to 461 failed (round 4, combined waves 1 and 2).
+18. Resolved: relays no longer hold their transmit side idle for bodies queued upstream (a
+   simulator artifact); 5k `zipf` fails 17 reads (was 4,373), `storm` 0 (was 461) (round 4, relay,
+   wave 3, 0eba3d9c8).
 19. Join versions cause `StaleMembership` skips: 1,411 to 1,756 failed reads at 50k (round 4,
    join).
 20. Join versions cost origin fetches (50k `full-failover` worst page 9 to 12) and seat egress
@@ -866,6 +883,10 @@ scenarios carry data-plane faults.
 21. Owners above rank 0 without the credits or links to delegate fetch themselves and orphan the
    copy; 2.5% of 50k `full-failover` origin requests (round 4, repeat).
 22. Resolved: the simulator debits the origin attempt like production (round 4, repeat).
+121. The wave 2 merge lost most of fan-out's gain in the 5k 1 Gbit/s `full-cold-start` 1 s storm
+   (102 to 38,430 failed reads) (round 4, relay, wave 3).
+122. `flight_leader_valid` fails (`Err(Internal)`) in origin-overloaded 5k `zipf` with 16 MiB
+   pages (round 4, relay, wave 3).
 
 ## Round 2: production admission
 
@@ -2637,3 +2658,151 @@ Against wave 1 (`/tmp/opencode/m4/`): 50k `full-cold-start` failed reads 6,665 t
 failures 79,581 to 0, all enrolled at 172 s against 171 s); 50k `full-failover` failed reads 6,936
 to 1,527, link failures 97,579 to 20,019 (20,017 of them partitions), `copy_held` 5,473 to 2,451,
 worst page 8 to 9 (join versions, Known issue 20). Logs and reports: `/tmp/opencode/m4b/`.
+
+## Round 4: relay (wave 3)
+
+Scope: Known issue 18 (5k `zipf` sheds on the `Relay` quota) and the fanout tuning items left by
+"Round 4: fanout" (the 32-body shed threshold tuned on 1 MiB pages, hedges never asking the
+helper, native transfers not counted). Branch `racer-sim5-relay` from 3771e5c3f.
+
+### Root cause (issue 18)
+
+The four candidates from the brief, checked against the code and a 5k `zipf` run with temporary
+instrumentation (seed 1, release):
+
+- Routing concentration: no. Of 169,568 relay requests refused at a relay (the report's
+  `rejections.relay` shows 339,136 for the same run), 4,973 of 5,000 nodes refused at least one;
+  the busiest refused 119, the mean was 34. Rejections were spread evenly.
+- Mis-sized quota or production hold: no. Production holds the reservation from the relay's
+  `reserve` until the body has passed (`src/peer/server.rs`, `relay.reservation`, in the opaque
+  path; `Relay::forward_inner`, `src/peer.rs:383`, in the default path). That is what the quota is
+  for: it bounds the relayed exchanges (and their pipes or buffered pages) a worker carries. The
+  simulator's 16 per worker and 2 workers per node match the production per-worker default
+  (`core/src/admission.rs:150`).
+- Origin capacity: no. With `origin_bps` raised tenfold the run still failed 3,525 reads with
+  280,954 relay rejections.
+- Simulator modeling error: yes. Each relayed body held a relay for a mean of 191 ms of streaming
+  (p50 184 ms) for a 1 MiB page that needs 0.84 ms per 10 Gbit/s link, while the average node sent
+  under 4% of its NIC. The owner's and the relay's transmit queues (`tx_free`) were both about
+  134 ms ahead at p50. `Fabric::transfer_until` (`sim/src/resources.rs:198-210` on the base)
+  reserved each later hop's NIC as a slot at the chunk's arrival time: `start = ready.max(tx_free)`,
+  then `tx_free = start + send`. A relay forwarding a body still queued at a busy owner therefore
+  set its own `tx_free` to the body's future arrival, and every send it made afterwards, including
+  its own replies as an owner, waited behind that idle gap. Those replies then made the relay a
+  busy sender for the next relay, so backlogs spread through the cluster and relays held their
+  `Relay` reservation for hundreds of milliseconds. The receive side already avoided this
+  ("work-conserving backlog", the round 2 slow-sender fix); the transmit side did not. A real NIC
+  sends other streams during the gap.
+
+### Changes
+
+- `Fabric::transfer_until` (0eba3d9c8): the transmit side is a work-conserving backlog like the
+  receive side. A hop's NIC backlog grows by the chunk's service time from the transfer's issue
+  (`tx_free = max(tx_free, now) + send`), and the chunk leaves no earlier than it arrives
+  (`end = max(ready + send, tx_free, rx_free)`). With every hop ready at issue (one link) this is
+  the old FIFO slot. The abandon cutoff still stops any chunk that would start at or after it.
+- Relay hold metrics (57c03b03c): `relay_hold_wait_ns` (first relay's reservation until the
+  destination's answer is ready) and `relay_hold_stream_ns` (answer ready until the body has
+  passed or was abandoned).
+- Hot-page threshold in bytes (9046daac7): `HOT_PAGE_BODIES` (32) became
+  `hot_page_bodies(page_bytes)`, `HOT_PAGE_QUEUE_BYTES` (32 MiB) of queued bodies of one page, at
+  least `HOT_PAGE_MIN_BODIES` (2) (`core/src/read/fanout.rs`). That is 32 bodies for the
+  simulator's 1 MiB pages (unchanged) and 2 for production's 16 MiB pages (was 32, 512 MiB of
+  queued egress). `shed_hot_page` takes the threshold; production uses
+  `hot_page_threshold()` (`PAGE_BYTES`, `src/peer/server.rs`), the simulator its `page_bytes`
+  with an override `node.hot_page_bodies` for measurement.
+- Native transfers counted (17269023f): `send_native` (RDMA) page bodies now hold the same
+  `page_streaming` guard as `send_http_response`, so an owner serving over native transfers sheds
+  like one serving over HTTP.
+- Hedges still do not ask the helper. Hedging is off by default (`page_hedge_slots` 0), and
+  carrying "who signed the primary's `Overloaded`" through the hedge race needs a new
+  continuation field in core, production and the simulator; left as documented
+  (`hedged_primary_overload_does_not_ask_the_helper` still asserts it).
+
+No wire change. No invariant relaxed.
+
+### Shed threshold at production page size
+
+At 1 MiB pages the threshold barely matters once the transmit artifact is gone (5k, seed 1;
+failed reads, helper probes):
+
+| Threshold (bodies) | storm | zipf | churn | storm quiet 1G 15 s |
+| --- | --- | --- | --- | --- |
+| 8 | 1, 78,823 | 21, 6,291 | 160, 7,433 | 7,125, 143,275 |
+| 16 | 0, 64,577 | 12, 401 | 180, 3,004 | 7,107, 142,694 |
+| 32 (1 MiB default) | 0, 59,056 | 17, 34 | 165, 524 | 6,721, 141,275 |
+| 64 | 0, 56,434 | 15, 0 | 165, 30 | 5,416, 136,963 |
+
+With 16 MiB pages (`page_bytes` 16,777,216) and the background rate scaled to the same bytes per
+second (`request_rate` 1.25, `storm`, 8 s, 5k, seed 1) the byte rule matters:
+
+| Threshold (bodies) | Reads ok / failed | Relay rejections | Helper probes | Read p50 / p99 |
+| --- | --- | --- | --- | --- |
+| 2 (16 MiB default, 32 MiB queued) | 155,548 / 152 | 7,348 | 82,505 | 184 ms / 1.88 s |
+| 32 (old count, 512 MiB queued) | 152,337 / 3,406 | 7,884 | 83,132 | 469 ms / 2.15 s |
+
+Other 16 MiB runs: a quiet 30 s storm (`request_rate` 0) fails 7,234, 7,204 and 7,180 reads at
+thresholds 2, 8 and 32 (the residual helper bound from "Round 4: fanout", the same shape as the
+1 Gbit/s quiet storm with 1 MiB pages). The default 2 s `storm` at the unscaled rate of 20 reads
+per second is overloaded (each node asks for 320 MiB/s in the background): thresholds 1 to 32 fail
+17,566 to 19,310 reads, without fan-out 72,178, and with `relay_transfers` 64 13,552.
+
+### Tests
+
+- `resources::tests::relay_transmit_is_not_held_by_a_body_queued_upstream` (fails before:
+  the relay's later send ends about 100 chunks late).
+- `contention_scenarios::relays_hold_their_reservation_only_while_the_body_streams` (300 nodes,
+  Zipf over 1,024 objects): p99 relayed stream under 30 ms and no failed read; before the fix the
+  p99 was 42 ms.
+- `fanout::tests::hot_page_threshold_is_the_same_backlog_in_bytes` and the threshold-parameterized
+  `owners_shed_only_non_exempt_requesters_of_a_dominant_hot_page` (both page sizes).
+- Production: `peer::tests::opaque::page_bodies_count_toward_the_hot_page_shed_on_every_transport`;
+  `protocol_socket::hot_page_owner_sheds_non_helper_readers_with_signed_overload` now runs at the
+  production threshold (2).
+
+### Evidence
+
+Release, seed 1. "before" is the wave 2 merge (3771e5c3f, `/tmp/opencode/m4b/`); "after" is this
+branch (logs `/tmp/opencode/r5-relay/`). `full-*` use `{"request_rate": 0.005}`. Origin is total,
+max per page, pages fetched more than once. Repeats are `after_failure` / `after_move` /
+`copy_held` / `copy_lost` / `concurrent`. Helper is probes / copies / owner sheds.
+
+| Run | Reads ok / failed | Origin | Repeats | Relay rejections | Helper | Read p50 / p99 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 5k storm, before | 268,449 / 461 | 1,024, 1, 0 | 0 / 0 / 0 / 0 / 0 | 14,756 | 116,951 / 82,374 / 123,769 | 301 ms / 1.01 s |
+| 5k storm, after | 378,544 / 0 | 1,024, 1, 0 | 0 / 0 / 0 / 0 / 0 | 4,280 | 59,056 / 59,001 / 60,365 | 41 ms / 167 ms |
+| 5k zipf, before | 149,525 / 4,373 | 42,216, 3, 4,171 | 0 / 0 / 565 / 0 / 3,734 | 339,136 | 8,713 / 4,939 / 12,570 | 201 ms / 1.48 s |
+| 5k zipf, after | 202,878 / 17 | 40,880, 3, 1,897 | 0 / 0 / 191 / 0 / 1,733 | 59,758 | 34 / 34 / 34 | 46 ms / 1.48 s |
+| 5k zipf seed 2, before / after | 146,270 / 5,152; 204,056 / 18 | 41,710; 40,397 | | 356,582; 55,484 | | |
+| 5k zipf seed 3, before / after | 140,327 / 7,254; 202,484 / 30 | 41,826; 40,840 | | 409,242; 62,736 | | |
+| 5k churn, before | 172,701 / 450 | 1,040, 3, 15 | 0 / 9 / 7 / 0 / 0 | 16,932 | 3,434 / 2,986 / 3,179 | 369 ms / 738 ms |
+| 5k churn, after | 291,483 / 165 | 1,032, 2, 8 | 0 / 7 / 1 / 0 / 0 | 0 | 524 / 500 / 520 | 41 ms / 134 ms |
+| 5k full-cold-start, before / after | 94,829 / 1 both | 6,946, 2, 52 both | 0 / 47 / 5 / 0 / 0 both | 0 | 82; 0 | 46 ms / 134 ms |
+| 5k full-failover, before / after | 33,804 / 23 both | 13,075, 7, 458 both | 408 / 59 / 169 / 2 / 0 both | 0 | 0 | 62 ms / 268 ms |
+| 5k full-churn, before / after | 33,988 / 4 both | 13,653, 6, 991 both | 51 / 1,061 / 13 / 0 / 0 both | 0 | 0 | 62 ms / 150 ms |
+| 5k full-cold-start 1G 1 s, before | 56,399 / 38,430 | 6,959, 3, 63 | | 288,896 | 13,532 / 7,960 / 36,634 | 1.61 s / 9.66 s |
+| 5k full-cold-start 1G 1 s, after | 63,745 / 31,084 | 6,954, 2, 60 | | 259,460 | 10,720 / 8,273 / 32,272 | 1.61 s / 9.66 s |
+
+- `relay_hold_stream_ns` after: p50 23 ms, p99 38 ms in `zipf` (about two links' latency); before
+  (instrumented) p50 184 ms, p99 369 ms. `relay_hold_wait_ns` (the destination's acquire, often an
+  origin fetch or its own walk) is unchanged: p50 12 ms, p99 1.48 s.
+- The remaining `zipf` relay rejections (59,758) are relays holding the reservation while the
+  destination acquires the page, which is production's behavior and the quota's purpose; 17 reads
+  fail. Successful reads rose by a third in `zipf` and `storm` and by 69% in `churn` because peer
+  transfers no longer queue behind phantom gaps; the scenarios' arrivals are fixed, so more of them
+  complete within the 2 s window.
+- `full-*` at request rate 0.005 carry little relayed traffic and are identical except for 82 helper
+  probes in `full-cold-start` that are no longer needed.
+- Wall and peak RSS fell slightly (5k `zipf` 2:14 and 1.53 GiB to 2:00 and 1.42 GiB).
+- No hard invariant failure in any run above; the 16-scenario smoke at 200 nodes (1 s) is clean.
+
+### Deviations and open items
+
+- Issue 18 was a simulator artifact; production's relay hold is unchanged. The production changes
+  are the byte-based shed threshold (2 bodies instead of 32 for 16 MiB pages) and counting native
+  transfers.
+- The 1 Gbit/s `full-cold-start` 1 s storm regressed on the wave 2 merge before this branch (new
+  Known issue 121); this branch improves it but does not restore the fanout branch's result.
+- `flight_leader_valid` fails in origin-overloaded `zipf` with 16 MiB pages on the base too (new
+  Known issue 122).
+- Hedges still do not ask the helper (off by default; see Changes).
