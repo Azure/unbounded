@@ -797,3 +797,22 @@ fn expired_leaders_hand_their_fill_to_later_waiters() {
     );
     assert_eq!(counter(&after, "flight_unexpected_lead"), 0);
 }
+
+/// Known issue 36: a reader that owned the page under the previous
+/// membership may not walk it (no fallback), and ranks it there before it
+/// skips a destination that is behind, so it waits for that destination
+/// like a reader that joined in the current membership.
+#[test]
+fn previous_owners_wait_instead_of_skipping_owners_that_are_behind() {
+    let mut config = churny(120, 2);
+    config.request_rate = 40.0;
+    config.node.membership_lag_ns = config.node.membership_batch_ns;
+    let r = run(config, 3).1;
+    assert!(counter(&r, "stale_fallback_denied") > 0, "{r}");
+    assert_eq!(
+        counter(&r, "stale_waits_denied"),
+        counter(&r, "stale_fallback_denied"),
+        "{r}"
+    );
+    assert_eq!(counter(&r, "walk_exhausted_stale"), 0, "{r}");
+}

@@ -378,6 +378,12 @@ struct Fill {
     /// This node owns the page under the previous membership, so this walk
     /// keeps the current one.
     fallback_denied: bool,
+    /// The reply of a destination that is behind waits for the ranking
+    /// under the previous membership before it is skipped or waited for
+    /// (production ranks first, Known issue 36).
+    deferred_skip: bool,
+    /// The ranking allowed the fallback: walk it once the skip completes.
+    fallback_ready: Option<(u64, Rc<Members>, Result<Vec<u32>, Error>)>,
     probe: Option<u64>,
     /// The leader's retention observation, used at publication.
     eligible: bool,
@@ -1819,6 +1825,8 @@ impl NodeWorld {
                 stale: 0,
                 fell_back: false,
                 fallback_denied: false,
+                deferred_skip: false,
+                fallback_ready: None,
                 waits: 0,
                 stale_waiting: false,
                 probe: None,
@@ -3647,16 +3655,18 @@ impl NodeWorld {
                 let latest = self.adopt(node);
                 match stale_action(retried, previous, Some(latest)) {
                     Ok(StaleAction::Refresh) => Ok(Outcome::StaleMembership),
+                    Ok(StaleAction::Skip) if !owner && self.stale_rank_first(probe.fill) => {
+                        // Ranking the page under the previous membership
+                        // first (`fallback_ranked` decides).
+                        return;
+                    }
                     Ok(StaleAction::Skip) if !owner && self.stale_wait(probe.fill) => {
                         // Waiting for the destination to adopt this
                         // membership, then asking it again (Known issue 26).
                         return;
                     }
                     Ok(StaleAction::Skip) => {
-                        self.metrics.incr("stale_destination_skips");
-                        if let Some(fill) = self.fills.get_mut(&probe.fill) {
-                            fill.stale += 1;
-                        }
+                        self.count_stale_skip(probe.fill);
                         if owner {
                             // An owner's predecessor is behind (Known issue 12).
                             self.metrics.incr("owner_stale_destination_skips");
@@ -3880,6 +3890,46 @@ impl NodeWorld {
         (go, old, member, recent)
     }
 
+    /// A destination is behind this node: count the skip.
+    fn count_stale_skip(&mut self, id: u64) {
+        self.metrics.incr("stale_destination_skips");
+        if let Some(fill) = self.fills.get_mut(&id) {
+            fill.stale += 1;
+        }
+    }
+
+    /// Production `resolve_epoch_traced`: a non-owner that may walk the
+    /// previous membership ranks the page there before it decides between
+    /// the fallback, a wait and a skip, so a node that owns the page under
+    /// the previous membership (no fallback) still waits for this
+    /// destination (Known issue 36). The probe stays uncompleted until
+    /// `fallback_ranked`. Returns whether it ranks.
+    fn stale_rank_first(&mut self, id: u64) -> bool {
+        let fill = &self.fills[&id];
+        if !matches!(fill.walk, Walking::Candidates(_)) {
+            return false;
+        }
+        let (node, w, page, version) = (fill.node, fill.worker, fill.page, fill.version);
+        let (go, old, ..) = self.fallback_facts(id);
+        let (true, Some(old)) = (go, old) else {
+            return false;
+        };
+        let fill = self.fills.get_mut(&id).expect("present");
+        fill.fell_back = true;
+        fill.deferred_skip = true;
+        self.rank(
+            node,
+            w,
+            old,
+            page,
+            Then::Fallback {
+                fill: id,
+                version: version - 1,
+            },
+        );
+        true
+    }
+
     /// Production `resolve_epoch_traced` (Known issues 26 and 36): a non-owner that
     /// cannot walk the previous membership waits (at most `MAX_STALE_WAITS` times) for a destination
     /// that is behind, then asks it again (`racer_core::read::stale::stale_wait`).
@@ -3939,6 +3989,15 @@ impl NodeWorld {
     /// membership version - 1 instead, once (`racer_core::read::stale`,
     /// Known issue 19). Returns whether it did.
     fn stale_fallback(&mut self, id: u64) -> bool {
+        if let Some((version, members, cands)) = self
+            .fills
+            .get_mut(&id)
+            .and_then(|f| f.fallback_ready.take())
+        {
+            // Ranked before the skip (`stale_rank_first`).
+            self.fallback_walk(id, version, members, cands);
+            return true;
+        }
         let fill = &self.fills[&id];
         let (node, w, page, version) = (fill.node, fill.worker, fill.page, fill.version);
         let first = fill.rank.is_none() && !fill.retried && !fill.fell_back;
@@ -3988,12 +4047,40 @@ impl NodeWorld {
             Ok(c) if !c.is_empty() => fallback_rank_allowed(c.iter().position(|n| *n == fill.node)),
             _ => false,
         };
+        if std::mem::take(&mut fill.deferred_skip) {
+            // The destination's reply waited for this ranking.
+            if allowed {
+                fill.fallback_ready = Some((version, members, cands));
+            } else {
+                self.metrics.incr("stale_fallback_denied");
+                fill.fell_back = false;
+                fill.fallback_denied = true;
+                if self.stale_wait(id) {
+                    self.metrics.incr("stale_waits_denied");
+                    return;
+                }
+            }
+            self.count_stale_skip(id);
+            return self.complete_probe(id, Ok(Outcome::StaleDestination));
+        }
         if !allowed {
             self.metrics.incr("stale_fallback_denied");
             fill.fell_back = false;
             fill.fallback_denied = true;
             return self.step_walk(id);
         }
+        self.fallback_walk(id, version, members, cands);
+    }
+
+    /// Walk the page's owners under the previous membership instead.
+    fn fallback_walk(
+        &mut self,
+        id: u64,
+        version: u64,
+        members: Rc<Members>,
+        cands: Result<Vec<u32>, Error>,
+    ) {
+        let fill = self.fills.get_mut(&id).expect("present");
         self.metrics.incr("stale_fallbacks");
         fill.walk = Walking::None;
         fill.retried = true;

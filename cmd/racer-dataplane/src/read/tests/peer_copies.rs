@@ -3852,75 +3852,91 @@ fn a_delegated_rank_zero_asks_lineage_and_demoted_targets_on_their_own_grant() {
 
 /// The fallback walks the previous membership only as a non-owner: a node
 /// that owned the page there keeps walking the current membership rather
-/// than reach the origin with authority it no longer has.
+/// than reach the origin with authority it no longer has. It learns that
+/// before it skips the first owner that is behind, so it still waits for
+/// that owner when it can (Known issue 36).
 #[test]
 fn stale_fallback_never_makes_a_previous_owner_fetch() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    let mut f = fixture();
-    let (peers, ordered) = install_peers(&mut f, None);
-    let members = f.membership.members().to_vec();
-    let local = node(peers.local);
-    let current = Arc::new(
-        Membership::validate(racer_control_wire::MembershipVersion(2), members.clone()).unwrap(),
-    );
-    // Without rank 0, version 1 has three members, this node among them, so
-    // this node owns the page under version 1.
-    let old = Arc::new(
-        Membership::validate(
-            racer_control_wire::MembershipVersion(1),
-            members
-                .into_iter()
-                .filter(|m| m.node != ordered[0])
-                .collect(),
-        )
-        .unwrap(),
-    );
-    let published = Arc::new(controlplane::Published::new(
-        crate::control::Snapshot::retention(2),
-    ));
-    let now = uring_runtime::environment::now();
-    for (i, (membership, at)) in [
-        (old.clone(), now - Duration::from_secs(60)),
-        (current.clone(), now),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let mut snapshot = crate::control::Snapshot::membership_fixture(membership);
-        snapshot.sequence = racer_control_wire::PublicationSequence(i as u64 + 1);
-        published
-            .publish(Arc::new(snapshot), at, |_, _| Ok::<_, Error>(()), || ())
-            .unwrap();
+    for wait in [false, true] {
+        let mut f = fixture();
+        let (peers, ordered) = install_peers(&mut f, None);
+        let members = f.membership.members().to_vec();
+        let local = node(peers.local);
+        let current = Arc::new(
+            Membership::validate(racer_control_wire::MembershipVersion(2), members.clone())
+                .unwrap(),
+        );
+        // Without rank 0, version 1 has three members, this node among them, so
+        // this node owns the page under version 1.
+        let old = Arc::new(
+            Membership::validate(
+                racer_control_wire::MembershipVersion(1),
+                members
+                    .into_iter()
+                    .filter(|m| m.node != ordered[0])
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        let published = Arc::new(controlplane::Published::new(
+            crate::control::Snapshot::retention(2),
+        ));
+        let now = uring_runtime::environment::now();
+        for (i, (membership, at)) in [
+            (old.clone(), now - Duration::from_secs(60)),
+            (current.clone(), now),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut snapshot = crate::control::Snapshot::membership_fixture(membership);
+            snapshot.sequence = racer_control_wire::PublicationSequence(i as u64 + 1);
+            published
+                .publish(Arc::new(snapshot), at, |_, _| Ok::<_, Error>(()), || ())
+                .unwrap();
+        }
+        let placement = Rc::new(Placement::new(16));
+        assert!(
+            placement
+                .rank(old.clone(), &f.context.object, f.page.number)
+                .ordered
+                .contains(&local)
+        );
+        let mut deps = f.fill.dependencies.clone();
+        let policy = CandidatePolicy::new(
+            local,
+            placement,
+            peers.requester(),
+            deps.credentials.clone(),
+            published,
+        );
+        policy.instant_stale_wait.set(wait);
+        deps.candidates = Rc::new(policy);
+        f.fill = Fill::new(deps);
+        f.membership = current;
+        let good = encrypted_copy(&mut f);
+        if wait {
+            // The first owner adopts version 2 during the wait.
+            peers.replies.borrow_mut().extend([
+                (ordered[0].clone(), Reply::Stale),
+                (ordered[0].clone(), Reply::Copy(good)),
+            ]);
+        } else {
+            peers.replies.borrow_mut().extend([
+                (ordered[0].clone(), Reply::Stale),
+                (ordered[1].clone(), Reply::Stale),
+                (ordered[2].clone(), Reply::Copy(good)),
+            ]);
+        }
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+        let result = acquire(&mut f, &mut budget).unwrap();
+        assert_eq!(result.plaintext.bytes(), b"abc");
+        let expected: &[u64] = if wait { &[2, 2] } else { &[2, 2, 2] };
+        assert_eq!(*peers.memberships.borrow(), expected, "wait {wait}");
+        assert_eq!(f.origin.calls.get(), 0);
     }
-    let placement = Rc::new(Placement::new(16));
-    assert!(
-        placement
-            .rank(old.clone(), &f.context.object, f.page.number)
-            .ordered
-            .contains(&local)
-    );
-    let mut deps = f.fill.dependencies.clone();
-    deps.candidates = Rc::new(CandidatePolicy::new(
-        local,
-        placement,
-        peers.requester(),
-        deps.credentials.clone(),
-        published,
-    ));
-    f.fill = Fill::new(deps);
-    f.membership = current;
-    let good = encrypted_copy(&mut f);
-    peers.replies.borrow_mut().extend([
-        (ordered[0].clone(), Reply::Stale),
-        (ordered[1].clone(), Reply::Stale),
-        (ordered[2].clone(), Reply::Copy(good)),
-    ]);
-    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
-    let result = acquire(&mut f, &mut budget).unwrap();
-    assert_eq!(result.plaintext.bytes(), b"abc");
-    assert_eq!(*peers.memberships.borrow(), [2, 2, 2]);
-    assert_eq!(f.origin.calls.get(), 0);
 }
 
 /// Without any published membership the stale answer stays terminal

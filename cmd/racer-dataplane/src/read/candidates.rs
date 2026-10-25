@@ -1357,16 +1357,38 @@ impl CandidatePolicy {
                                 let fallback = self
                                     .stale_fallback(&candidates, rank.is_some(), retried)
                                     .filter(|_| !fallback_denied);
+                                // Rank the page under version - 1 before
+                                // deciding: a node that owns it there may not
+                                // walk it (that would give it origin
+                                // authority), and must not lose the wait it
+                                // would otherwise have had for this
+                                // destination (Known issue 36).
+                                let mut ranked = None;
+                                if let Some(previous) = fallback
+                                    && let Ok(previous) =
+                                        self.candidates_scoped(previous, object, page, scope).await
+                                {
+                                    fallback_denied =
+                                        !racer_core::read::stale::fallback_rank_allowed(
+                                            previous
+                                                .ordered
+                                                .iter()
+                                                .position(|node| node == &self.node),
+                                        );
+                                    if !fallback_denied {
+                                        ranked = Some(previous);
+                                    }
+                                }
                                 // One that cannot (it joined in this
-                                // membership) waits for the destination to
-                                // adopt it and asks again, at most
-                                // `MAX_STALE_WAITS` times (Known issues 26
-                                // and 36).
+                                // membership, or owns the page under version
+                                // - 1) waits for the destination to adopt it
+                                // and asks again, at most `MAX_STALE_WAITS`
+                                // times (Known issues 26 and 36).
                                 let now = uring_runtime::environment::now();
                                 if let Some(wait) = racer_core::read::stale::stale_wait(
                                     racer_core::read::stale::StaleWaitFacts {
                                         owner: rank.is_some(),
-                                        fallback: fallback.is_some(),
+                                        fallback: ranked.is_some(),
                                         waits: continuation.waits.saturating_add(waits),
                                         affordable: walk.retry_affordable(budget),
                                         remaining: budget
@@ -1382,38 +1404,24 @@ impl CandidatePolicy {
                                     continue;
                                 }
                                 walk.complete(budget, WalkOutcome::StaleDestination)?;
-                                if let Some(previous) = fallback
-                                    && let Ok(previous) =
-                                        self.candidates_scoped(previous, object, page, scope).await
-                                {
-                                    // Never as an owner under version - 1:
-                                    // keep walking this membership instead.
-                                    fallback_denied =
-                                        !racer_core::read::stale::fallback_rank_allowed(
-                                            previous
-                                                .ordered
-                                                .iter()
-                                                .position(|node| node == &self.node),
-                                        );
-                                    if !fallback_denied {
-                                        walk.abandon(budget)?;
-                                        return self
-                                            .resolve_epoch_traced(
-                                                previous,
-                                                context,
-                                                operation,
-                                                scope,
-                                                budget,
-                                                validate,
-                                                true,
-                                                HedgeContinuation {
-                                                    waits: continuation.waits.saturating_add(waits),
-                                                    ..Default::default()
-                                                },
-                                                trail,
-                                            )
-                                            .await;
-                                    }
+                                if let Some(previous) = ranked {
+                                    walk.abandon(budget)?;
+                                    return self
+                                        .resolve_epoch_traced(
+                                            previous,
+                                            context,
+                                            operation,
+                                            scope,
+                                            budget,
+                                            validate,
+                                            true,
+                                            HedgeContinuation {
+                                                waits: continuation.waits.saturating_add(waits),
+                                                ..Default::default()
+                                            },
+                                            trail,
+                                        )
+                                        .await;
                                 }
                                 continue;
                             };
