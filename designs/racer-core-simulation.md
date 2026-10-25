@@ -752,7 +752,7 @@ Verified against the code at the start of this work.
    rank 0 origin failure (or sharing a short negative result) would halve it. See "Round 4:
    combined (wave 5)". Open (round 4, combined, wave 5).
 
-401. Silence pings cost messages when many probes time out on busy owners: in 5k `zipf` at 16
+53. Silence pings cost messages when many probes time out on busy owners: in 5k `zipf` at 16
    MiB pages (8 s) 37,990 pings, peer messages 384,907 to 470,202 (+22%), simulator wall time
    49 to 61 s, with failed reads, origin requests and overlapping requests unchanged within
    seed noise. Most are readers' pings of a busy rank 0 whose acquisition their probe joined;
@@ -762,7 +762,7 @@ Verified against the code at the start of this work.
    ping when rank 0 answered this node anything recently, would cut most of them. Open (round
    4, hang2, wave 6).
 
-402. A reader whose probe of a busy rank 0 timed out returns to rank 0 first once rank 0 answers
+54. A reader whose probe of a busy rank 0 timed out returns to rank 0 first once rank 0 answers
    the ping. Keeping it demoted until rank 0 answers the reader itself (measured) failed 28 to
    11 reads in 5k `zipf` at 16 MiB pages (seed 2: 40 to 15), because the reader's retry goes to
    an owner above rank 0 that already holds or fetches the page, but overlapped 130 to 185
@@ -771,7 +771,7 @@ Verified against the code at the start of this work.
    that could tell a joined wait from an empty one (rank 0 answering "fetching" at once) would
    get both. Open (round 4, hang2, wave 6).
 
-411. After the probes change, 50k `full-failover` (seed 1) has more `copy_held` repeats (578 to
+55. After the probes change, 50k `full-failover` (seed 1) has more `copy_held` repeats (578 to
    626: `held` `unasked` 87 to 112, `unreachable` 488 to 514) and one page fetched 8 times (worst
    page was 6), while moved-page repeats fall 590 to 288 and origin requests 47,617 to 47,354. The
    5k runs do not show it (`copy_held` 79 to 68, 79 to 76, 64 to 65 for seeds 1 to 3).
@@ -1310,12 +1310,12 @@ scenarios carry data-plane faults.
    orphan3, wave 5).
 52. The worst `full-failover` pages are origin failure retries; owners above rank 0 retry origin
    after rank 0's origin request failed (round 4, combined, wave 5).
-401. Silence pings add peer messages when many probes time out on busy owners (5k `zipf` at 16
+53. Silence pings add peer messages when many probes time out on busy owners (5k `zipf` at 16
    MiB: +22%, outcomes unchanged) (round 4, hang2, wave 6).
-402. A reader returns to a busy rank 0 once it answers the reader's ping; keeping it demoted
+54. A reader returns to a busy rank 0 once it answers the reader's ping; keeping it demoted
    failed fewer reads in 5k `zipf` at 16 MiB but overlapped more origin requests (round 4,
    hang2, wave 6).
-411. 50k `full-failover` `copy_held` 578 to 626 and worst page 6 to 8 after the probes change,
+55. 50k `full-failover` `copy_held` 578 to 626 and worst page 6 to 8 after the probes change,
    not traced (round 4, probes, wave 6).
 
 ## Round 2: production admission
@@ -5409,7 +5409,7 @@ Steps (same binary and knobs, seed 1; "sequential" is `parallel_granted` 0, "cap
   once 212; failed reads 266 to 255; p99 latency 369 to 336 ms. Of the 166 unasked moved-page
   holders left, 157 rank 13 or lower. Peak RSS 3,223,472 to 3,372,624 kB, far below 32 GiB.
 - `copy_held` rises 578 to 626 and the worst page goes 6 to 8 (one page; one more at 7): Known
-  issue 411.
+  issue 55.
 
 ### Bounds
 
@@ -5536,7 +5536,7 @@ remainder was this class, so 40 is resolved too.
   rank 0), in production and in the simulator.
 - Rejected after measurement: readers pinging rank 0 only after a second timeout (24 and 25
   failed reads with hung members instead of 3 and 1); readers demoting an unanswered rank 0 until
-  it answers them, without a ping (Known issue 402); an owner whose rank 0 is `Overdue` giving
+  it answers them, without a ping (Known issue 54); an owner whose rank 0 is `Overdue` giving
   rank 0's probe a short time share (no change in any run).
 
 Origin authority rules are unchanged: a silent rank 0 is a transport failure, which always gave
@@ -5604,7 +5604,7 @@ Release, seed 1 unless noted, 5k, same configurations as the wave 5 table ("Roun
   pages it owns, which its readers previously did not get at all.
 - 5k `zipf` at 16 MiB pages (no hang): failed reads 28 to 29 (seed 2: 40 to 25), origin requests
   17,829 to 17,826 (17,531 to 17,551), overlap 130 to 120 (116 to 137); issue 31's gains hold
-  within seed noise. No peer is marked silent; 37,990 pings (Known issue 401). The rejected
+  within seed noise. No peer is marked silent; 37,990 pings (Known issue 53). The rejected
   first version of the rule (no ping) marked 3,374 and overlapped 678.
 - Runs without a probe timeout (storm, default `zipf`, churn, 1 Gbit/s storm, full-cold-start,
   full-churn, full-failover seed 1) have the wave 5 trace exactly; full-failover seeds 2 and 3
@@ -5632,9 +5632,9 @@ Release, seed 1 unless noted, 5k, same configurations as the wave 5 table ("Roun
   canonical order.
 - The simulator keeps one silence map per node; production keeps one per worker (with its link
   health), like the rank 0 watch.
-- New Known issues 401 (ping volume under contention) and 402 (a reader returns to a busy rank 0
+- New Known issues 53 (ping volume under contention) and 54 (a reader returns to a busy rank 0
   once it answers the ping).
 
 ### Open issues after wave 6 (hang2)
 
-45 to 52, 401, 402.
+45 to 52, 53, 54.
