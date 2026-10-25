@@ -651,6 +651,53 @@ mod tests {
         assert_eq!(on["origin_per_page"]["repeats"]["unexplained"], 0);
     }
 
+    /// Known issue 52: during an origin outage (every request fails), an
+    /// owner above rank 0 whose rank 0 answered that its own fetch failed
+    /// leaves the next attempt to rank 0, and fetches itself only once rank
+    /// 0 kept failing the page for `hang_after` (an overdue walk). Without
+    /// the hold every such answer made the owner ask origin too.
+    #[test]
+    fn owners_leave_origin_retries_to_a_failing_rank_zero() {
+        let run_with = |hold: bool| {
+            let mut config = Config {
+                nodes: 400,
+                ..Config::default()
+            };
+            data_defaults(&mut config);
+            config.request_rate = 0.2;
+            config.combined_faults.p5xx = 1.0;
+            config.node.rank0_failure_hold = hold;
+            run("full-failover", config, 1, Some(300 * SECONDS), None).unwrap()
+        };
+        let (off, on) = (run_with(false), run_with(true));
+        assert_clean(&on);
+        let skips = |r: &Value| {
+            r["origin_per_page"]["skips"]["failed"]
+                .as_u64()
+                .unwrap_or(0)
+        };
+        assert!(skips(&off) > 0, "{}", off["origin_per_page"]);
+        assert!(
+            counter(&on, "origin_left_to_rank0_failed") > 0,
+            "{}",
+            on["metrics"]
+        );
+        // The bound: one owner fetch per overdue walk at most.
+        assert!(
+            skips(&on) <= counter(&on, "rank0_watch_overdue_walks"),
+            "{} {}",
+            on["origin_per_page"],
+            on["metrics"]
+        );
+        assert!(
+            counter(&on, "origin_5xx") < counter(&off, "origin_5xx"),
+            "{} {}",
+            counter(&on, "origin_5xx"),
+            counter(&off, "origin_5xx")
+        );
+        assert_eq!(on["origin_per_page"]["repeats"]["unexplained"], 0);
+    }
+
     /// Known issue 7: the Pod crashed for good at `d / 2 + 5 s` leaves the
     /// membership once its Node has been not ready for the grace, so peers
     /// stop choosing it. Before round 4 they chose it until the end.

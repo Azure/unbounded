@@ -2438,6 +2438,7 @@ impl NodeWorld {
         match rank0 {
             Rank0State::Fetching => self.metrics.incr("rank0_watch_fetching_walks"),
             Rank0State::Overdue => self.metrics.incr("rank0_watch_overdue_walks"),
+            Rank0State::Failed => self.metrics.incr("rank0_watch_failed_walks"),
             Rank0State::Unknown => {}
         }
         let fill = self.fills.get_mut(&id).expect("present");
@@ -4275,9 +4276,12 @@ impl NodeWorld {
                         }
                         Err(Error::Unavailable)
                     }
-                    Ok(Outcome::Transport(_) | Outcome::StaleDestination | Outcome::TimedOut) => {
-                        Err(Error::Unavailable)
-                    }
+                    Ok(
+                        Outcome::Transport(_)
+                        | Outcome::StaleDestination
+                        | Outcome::TimedOut
+                        | Outcome::Failed,
+                    ) => Err(Error::Unavailable),
                     Err(e) => Err(e),
                 };
                 self.hedge_result(probe.fill, primary, result);
@@ -4301,11 +4305,21 @@ impl NodeWorld {
         })
     }
 
-    fn complete_probe(&mut self, id: u64, outcome: Result<Outcome, Error>) {
+    fn complete_probe(&mut self, id: u64, mut outcome: Result<Outcome, Error>) {
         let Some(fill) = self.fills.get_mut(&id) else {
             return;
         };
         fill.probe = None;
+        // Production `resolve_epoch_traced`: rank 0 itself, not a relay,
+        // answered an owner's probe `Unavailable` (Known issue 52).
+        if outcome == Ok(Outcome::Probe(ProbeOutcome::Unreachable))
+            && !fill.relayed
+            && self.config.node.rank0_watch
+            && self.config.node.rank0_failure_hold
+            && matches!(&fill.walk, Walking::Candidates(walk) if walk.pending_rank0())
+        {
+            outcome = Ok(Outcome::Failed);
+        }
         if let Walking::Candidates(walk) = &fill.walk
             && walk.pending_helper()
         {
@@ -4348,6 +4362,7 @@ impl NodeWorld {
             let watch = &mut self.nodes[node as usize].rank0;
             match &outcome {
                 Ok(Outcome::TimedOut) => watch.timed_out(page, rank0, instant, deadline),
+                Ok(Outcome::Failed) => watch.failed(page, rank0, instant),
                 Ok(
                     Outcome::Copy
                     | Outcome::Probe(
@@ -4378,7 +4393,7 @@ impl NodeWorld {
                     Asked::Unreachable(cut.unwrap_or(Cut::Other))
                 }
                 Ok(Outcome::Probe(ProbeOutcome::Unreachable)) if relayed => Asked::Relayed,
-                Ok(Outcome::Probe(ProbeOutcome::Unreachable)) => Asked::Failed,
+                Ok(Outcome::Probe(ProbeOutcome::Unreachable) | Outcome::Failed) => Asked::Failed,
                 Ok(_) => Asked::Busy,
                 Err(_) => Asked::Unfunded,
             };
@@ -4658,6 +4673,17 @@ impl NodeWorld {
             // Known issue 31: rank 0 has not answered this owner's probe
             // within the attempt; the owner does not fetch origin too.
             self.metrics.incr("origin_left_to_rank0");
+            // Known issue 52: rank 0's own acquisition failed.
+            let rank0 = fill.cands.first().copied();
+            if fill
+                .asked
+                .iter()
+                .rev()
+                .find(|(dest, _)| Some(*dest) == rank0)
+                .is_some_and(|(_, a)| *a == Asked::Failed)
+            {
+                self.metrics.incr("origin_left_to_rank0_failed");
+            }
         }
         let fill = self.fills.get_mut(&id).expect("present");
         fill.walk = Walking::None;
