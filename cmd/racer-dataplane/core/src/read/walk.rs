@@ -21,7 +21,7 @@
 //! }
 //! ```
 
-use super::budget::AcquisitionBudget;
+use super::budget::{AcquisitionBudget, MAX_ROUTE_LINKS};
 use super::candidates::{ProbeOutcome, VisitOrder};
 use super::error::{Error, Result};
 use super::fanout::{
@@ -184,6 +184,36 @@ pub fn owner_funding_min(canonical: usize) -> u32 {
 /// `Acquire` to rank 0 carries, so it can delegate the cold fetch.
 pub fn owner_funding(canonical: usize) -> u32 {
     owner_funding_min(canonical) + u32::from(canonical > 0)
+}
+
+/// Fewest links a funded out-of-order Acquire may carry: the owner keeps
+/// `links - 1` ([`super::budget::inherited_budget`]), at least one to reach
+/// its rank 0.
+pub const FUNDED_MIN_LINKS: u8 = 2;
+
+/// Links a non-owner funds an out-of-order Acquire with: a full failure
+/// route ([`MAX_ROUTE_LINKS`]) when it has one to give, else exactly what a
+/// shared route would charge ([`AcquisitionBudget::route_links`]), as long as
+/// that leaves the owner a link ([`FUNDED_MIN_LINKS`]). `None` when not even
+/// that is left.
+///
+/// A non-owner reached by a funded route inherits at most
+/// `MAX_ROUTE_LINKS - 1` links, so requiring a full route sent every
+/// out-of-order Acquire it forwarded over a shared route, which spends the
+/// same links but grants only a share of the attempts
+/// ([`plan_attempt`]): an owner above rank 0 then had one credit, spent it
+/// on a predecessor that was behind on membership, and could not fetch
+/// (Known issue 57). Funding with the shared route's links keeps every
+/// later visit's links exactly as before; only the attempts move to the
+/// owner, and only from the minimum the owner needs
+/// ([`owner_funding_min`]).
+pub fn funded_links(budget: &AcquisitionBudget) -> Option<u8> {
+    if budget.remaining_links() >= MAX_ROUTE_LINKS {
+        Some(MAX_ROUTE_LINKS)
+    } else {
+        let links = budget.route_links();
+        (links >= FUNDED_MIN_LINKS).then_some(links)
+    }
 }
 
 /// How long after this node replaced membership version - 1 its owners may
@@ -896,7 +926,7 @@ impl CandidateWalk {
                     && !copy_only
                     && canonical > index
                     && budget.remaining_attempts() >= owner_funding_min(canonical)
-                    && budget.remaining_links() >= 8)
+                    && funded_links(budget).is_some())
             {
                 // Fund by the destination's canonical rank: it probes all of its
                 // predecessors, wherever it falls in this visit.
@@ -931,7 +961,13 @@ impl CandidateWalk {
                 } else {
                     owner_funding_min(canonical)
                 };
-                let links = if rank.is_some() { 4 } else { 8 };
+                let links = if rank.is_some() {
+                    4
+                } else if continuation.bounded_routes {
+                    MAX_ROUTE_LINKS
+                } else {
+                    funded_links(budget).unwrap_or(MAX_ROUTE_LINKS)
+                };
                 if budget.remaining_attempts() < attempts || budget.remaining_links() < links {
                     // Never send an Acquire whose receiver cannot probe its
                     // predecessors and still exercise origin authority.

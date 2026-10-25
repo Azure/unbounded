@@ -2261,3 +2261,79 @@ fn remaining_walk_treats_a_failure_as_transient() {
     assert_eq!(walk.complete(&mut b, Outcome::Failed), None);
     assert_eq!(walk.next_probe(), Err(RemainingEnd::Unavailable));
 }
+
+#[test]
+fn forwarded_non_owner_funds_an_out_of_order_owner_with_its_route_links() {
+    // A non-owner reached by a funded route (Known issue 57): it inherits
+    // `owner_funding_min(2)` attempts and seven links, which is never a full
+    // failure route. It must still fund rank 2 with the attempts rank 2
+    // needs, not send a shared route that grants one credit.
+    let now = Instant::now();
+    let deadline = now + Duration::from_secs(60);
+    let order = visit_order(ReplicaSelection::Spread, 3, |r| r == 2, |_| 0);
+    assert_eq!(order.get(0), Some(2));
+    let mut b = super::super::budget::inherited_budget(deadline, deadline, 4, 8, 1).unwrap();
+    assert_eq!((b.remaining_attempts(), b.remaining_links()), (4, 7));
+    let mut walk = CandidateWalk::new(config(None, 3, order));
+    let Step::Probe(probe) = walk.next(&mut b).unwrap() else {
+        panic!()
+    };
+    assert_eq!((probe.canonical, probe.mode), (2, Mode::Acquire));
+    assert_eq!(probe.route, RouteMode::FundedRoute);
+    let request = walk.request_budget(&mut b);
+    // The same links a shared route charges, all the attempts rank 2 needs.
+    assert_eq!(
+        (request.remaining_attempts(), request.remaining_links()),
+        (owner_funding_min(2), 7)
+    );
+    let plan = plan_attempt(
+        request,
+        AttemptInputs {
+            now,
+            caller_deadline: deadline,
+            remaining_opportunities: probe.remaining_opportunities,
+            attempt_timeout: Duration::from_secs(1),
+            mode: probe.mode,
+            route: probe.route,
+            failure_links: 8,
+        },
+    )
+    .unwrap();
+    assert_eq!((plan.links, plan.remote_attempts), (7, 3));
+    // Budgets never grow: the walk kept nothing it did not have.
+    assert_eq!((b.remaining_attempts(), b.remaining_links()), (0, 0));
+
+    // Rank 2 with those three credits: rank 0 is behind on membership, rank
+    // 1 misses, and it still has the origin credit.
+    let mut owner = CandidateWalk::new(config(Some(2), 3, VisitOrder::canonical(3)));
+    let mut b = super::super::budget::inherited_budget(deadline, deadline, 3, 7, 1).unwrap();
+    let (probes, end) = drive(&mut owner, &mut b, |p, _| {
+        if p.canonical == 0 {
+            Outcome::StaleDestination
+        } else {
+            Outcome::Probe(ProbeOutcome::CopyMiss)
+        }
+    });
+    assert_eq!(probes.len(), 2);
+    assert!(matches!(end, End::Origin { rank: 2, .. }));
+    // `drive` does not charge exchanges: two copy-only probes spend two of
+    // the three credits, leaving the origin attempt.
+    assert_eq!(b.remaining_attempts() as usize - probes.len(), 1);
+}
+
+#[test]
+fn funded_links_match_a_shared_route_below_a_full_route() {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    assert_eq!(funded_links(&budget(4, 16)), Some(MAX_ROUTE_LINKS));
+    assert_eq!(funded_links(&budget(4, 8)), Some(MAX_ROUTE_LINKS));
+    // Normal routing: a shared route charges four.
+    assert_eq!(funded_links(&budget(4, 7)), Some(4));
+    assert_eq!(funded_links(&budget(4, 3)), Some(3));
+    assert_eq!(funded_links(&budget(4, 2)), Some(2));
+    // One link would leave the owner none.
+    assert_eq!(funded_links(&budget(4, 1)), None);
+    assert_eq!(funded_links(&budget(4, 0)), None);
+    // Failure routing (inherited from a funded route): all of them.
+    let b = super::super::budget::inherited_budget(deadline, deadline, 4, 8, 1).unwrap();
+    assert_eq!(funded_links(&b), Some(7));
+}
