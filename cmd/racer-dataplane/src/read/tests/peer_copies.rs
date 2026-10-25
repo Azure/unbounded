@@ -3528,7 +3528,9 @@ fn readers_that_cannot_fall_back_wait_for_an_owner_that_is_behind() {
         // Still behind after both waits: each owner once more as before.
         (true, 16, 32, &[0, 0, 0, 1, 2], false),
         // A default read (8 attempts, 16 links) cannot afford a second ask
-        // and still fund its later owners: one wait, then as before.
+        // and still fund its later owners: one wait, then as before. At the
+        // last owner (rank 2 here) four attempts are left, one short of a
+        // further exchange plus its minimum (Known issue 49).
         (true, 8, 16, &[0, 0, 1, 2], false),
         (true, 8, 16, &[0, 0, 1, 2], true),
         // No timer: as before the waits.
@@ -3606,6 +3608,13 @@ fn readers_that_cannot_fall_back_wait_for_an_owner_that_is_behind() {
             assert_eq!(
                 budget.remaining_attempts(),
                 attempts - calls.len() as u32,
+                "{case}"
+            );
+            // And the links past each owner that answered directly: only
+            // the link that carried each request is spent (Known issue 47).
+            assert_eq!(
+                budget.remaining_links(),
+                links - calls.len() as u8,
                 "{case}"
             );
         }

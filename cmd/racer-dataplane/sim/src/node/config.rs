@@ -95,6 +95,9 @@ pub struct NodeConfig {
     /// a destination that is behind (production `stale_wait`: always on;
     /// set 0 to measure without it, Known issue 26).
     pub stale_wait: bool,
+    /// A verified `StaleMembership` also returns the links past the
+    /// answering node (production: always on; Known issues 47 and 49).
+    pub stale_link_refund: bool,
     /// Owners also ask, before origin, members ranked just below the owners
     /// that were owners when they arrived (production `demoted_targets`:
     /// always on; set 0 to measure without it, Known issue 34). Needs
@@ -173,6 +176,7 @@ impl Default for NodeConfig {
             stale_fallback: true,
             lineage: true,
             stale_wait: true,
+            stale_link_refund: true,
             demoted_targets: true,
             lineage_grants: true,
             lineage_slack: true,
@@ -229,6 +233,7 @@ impl NodeConfig {
                 "stale_fallback" if n <= 1 => self.stale_fallback = n == 1,
                 "lineage" if n <= 1 => self.lineage = n == 1,
                 "stale_wait" if n <= 1 => self.stale_wait = n == 1,
+                "stale_link_refund" if n <= 1 => self.stale_link_refund = n == 1,
                 "demoted_targets" if n <= 1 => self.demoted_targets = n == 1,
                 "lineage_grants" if n <= 1 => self.lineage_grants = n == 1,
                 "lineage_slack" if n <= 1 => self.lineage_slack = n == 1,

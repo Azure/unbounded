@@ -37,7 +37,7 @@ use racer_core::peer::hop::{
 };
 use racer_core::peer::silence::{LINK_TIMEOUTS, NO_PING, RANK0_TIMEOUTS};
 use racer_core::read::Error;
-use racer_core::read::budget::{AcquisitionBudget, inherited_budget};
+use racer_core::read::budget::{AcquisitionBudget, inherited_budget, stale_unused_links};
 use racer_core::read::candidates::{
     Answering, AuthorityFacts, OperationKind, ProbeOutcome, ReplicaSelection, ResponseKind,
     VisitOrder, classify, demote_unanswered, lineage_first, replica_score,
@@ -636,6 +636,11 @@ struct Probing {
     /// Remote credits the request carried, refunded on a verified
     /// `StaleMembership` (`AcquisitionBudget::refund_remote`).
     remote: u32,
+    /// Links the request was charged (`AttemptPlan::links`).
+    links: u8,
+    /// Links the answer travelled back over (`forwarders + 1` on a verified
+    /// production answer), set when the answer is sent.
+    hops: usize,
     /// `Some(true)` for a hedge primary, `Some(false)` for its duplicate.
     hedge: Option<bool>,
     /// Index in the fill's `batch`: one of a run of granted probes sent at
@@ -3172,6 +3177,8 @@ impl NodeWorld {
                 fill: id,
                 acquire,
                 remote: plan.remote_attempts,
+                links: plan.links,
+                hops: 0,
                 hedge,
                 granted: None,
                 dest,
@@ -4043,6 +4050,9 @@ impl NodeWorld {
         }
         let costs = self.fabric.costs;
         let links = (route.len() - 1) as u64;
+        if let Some(p) = self.probes.get_mut(&m.probe) {
+            p.hops = route.len() - 1;
+        }
         let arrive = if reply == Reply::Response(ResponseKind::Page) {
             let bytes = self.config.page_bytes;
             let sealed = self.fabric.crypto(ready, from, costs.sign_ns);
@@ -4141,7 +4151,15 @@ impl NodeWorld {
                 Walking::Candidates(walk) => walk.request_budget(&mut fill.budget),
                 _ => &mut fill.budget,
             };
-            let refunded = budget.refund_remote(probe.remote);
+            // And the links past the answering node (Known issues 47, 49).
+            let unused = if self.config.node.stale_link_refund {
+                stale_unused_links(probe.links, probe.hops)
+            } else {
+                0
+            };
+            let refunded = budget
+                .refund_remote(probe.remote)
+                .and_then(|()| budget.refund_links(unused));
             self.invariants.check(
                 "budget_never_grows",
                 refunded.is_ok(),

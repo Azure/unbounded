@@ -196,6 +196,17 @@ impl AcquisitionBudget {
     }
 }
 
+/// Links a verified `StaleMembership` answer shows were never used: the
+/// answering node could not resolve the request's membership, so it neither
+/// served the request nor forwarded it, and every link past the `hops` the
+/// request travelled to it (`forwarders + 1` on the verified answer) was
+/// left unspent ([`AcquisitionBudget::refund_links`]). Like the remote
+/// credits ([`AcquisitionBudget::refund_remote`]), never more than was
+/// charged, so a refund cannot mint links (Known issues 47 and 49).
+pub fn stale_unused_links(charged: u8, hops: usize) -> u8 {
+    charged.saturating_sub(u8::try_from(hops).unwrap_or(u8::MAX))
+}
+
 /// Maximum links any route budget may carry (see `designs/racer-core-simulation.md`).
 pub const MAX_ROUTE_LINKS: u8 = 8;
 
@@ -233,6 +244,23 @@ pub fn inherited_budget(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn stale_answers_refund_only_the_links_past_the_answerer() {
+        assert_eq!(stale_unused_links(8, 1), 7);
+        assert_eq!(stale_unused_links(4, 3), 1);
+        assert_eq!(stale_unused_links(4, 4), 0);
+        assert_eq!(stale_unused_links(4, 9), 0);
+        assert_eq!(stale_unused_links(4, 1_000), 0);
+        let mut budget = AcquisitionBudget::new(Instant::now() + Duration::from_secs(1), 2, 16);
+        budget
+            .begin_peer_attempt(Instant::now(), budget.deadline(), 8)
+            .unwrap();
+        budget.refund_links(stale_unused_links(8, 2)).unwrap();
+        assert_eq!(budget.remaining_links(), 14);
+        // The links that carried the request stay spent: no second refund.
+        assert!(budget.refund_links(3).is_err());
+    }
 
     #[test]
     fn remote_credits_refund_only_what_was_sent() {

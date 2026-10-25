@@ -1820,6 +1820,96 @@ fn retry_affordable_keeps_later_visits_funded() {
     );
 }
 
+/// Known issue 49: the bound on a read's second stale wait. Every exchange
+/// reserves its route's links (`plan_attempt`; a funded first visit takes
+/// eight), and transport never returns them. Before a verified
+/// `StaleMembership` returned the links past its answerer
+/// (`stale_unused_links`), a default read (`PAGE_ATTEMPTS`, `PAGE_LINKS`)
+/// that waited once at a funded first owner had spent every link on that
+/// owner: it never reached the other two (Known issue 47), let alone
+/// afforded a second wait. With the refund, a reader whose three owners are
+/// all behind asks each of them and waits once at its first visit. The
+/// second wait is a fifth exchange: affordable only at its last visit, where
+/// no later owner needs the links, and only when that visit is rank 0 or 1
+/// (four attempts left must cover one exchange plus the visit's minimum,
+/// canonical + 2); with fewer owners, at every visit.
+#[test]
+fn a_default_read_reaches_every_owner_and_waits_again_at_its_last() {
+    use crate::read::range::{PAGE_ATTEMPTS, PAGE_LINKS};
+    // Walk `owners` owners that are all behind; wait once at the first.
+    // Returns, per visit, whether a second wait was affordable there.
+    let run_with = |owners: usize, attempts: u32, links: u8, hops: Option<usize>, rev: bool| {
+        let score = |r: usize| if rev { (owners - r) as u64 } else { r as u64 };
+        let order = visit_order(ReplicaSelection::Spread, owners, |_| true, score);
+        let mut walk = CandidateWalk::new(config(None, owners, order));
+        let mut b = budget(attempts, links);
+        let mut waited = false;
+        let mut affordable = Vec::new();
+        loop {
+            let probe = match walk.next(&mut b) {
+                Ok(Step::Probe(probe)) => probe,
+                Ok(Step::End(_)) | Err(_) => return affordable,
+            };
+            let deadline = b.deadline();
+            let request = walk.request_budget(&mut b);
+            let Ok(plan) = plan_attempt(
+                request,
+                AttemptInputs {
+                    now: Instant::now(),
+                    caller_deadline: deadline,
+                    remaining_opportunities: probe.remaining_opportunities,
+                    route: probe.route,
+                    mode: probe.mode,
+                    attempt_timeout: Duration::from_secs(1),
+                    failure_links: 8,
+                },
+            ) else {
+                return affordable;
+            };
+            // A verified `StaleMembership` returns the remote credits.
+            request.refund_remote(plan.remote_attempts).unwrap();
+            if let Some(hops) = hops {
+                request
+                    .refund_links(crate::read::budget::stale_unused_links(plan.links, hops))
+                    .unwrap();
+            }
+            if !waited {
+                waited = true;
+                walk.retry_pending(&mut b).unwrap();
+                continue;
+            }
+            affordable.push(walk.retry_affordable(&b));
+            if walk
+                .complete(&mut b, Outcome::StaleDestination)
+                .unwrap()
+                .is_some()
+            {
+                return affordable;
+            }
+        }
+    };
+    let run = |owners, attempts, links, hops| run_with(owners, attempts, links, hops, false);
+    // Without the refund: the first owner takes the whole budget.
+    assert_eq!(run(3, PAGE_ATTEMPTS, PAGE_LINKS, None), [false]);
+    for hops in 1..=3 {
+        let h = Some(hops);
+        assert_eq!(run(3, PAGE_ATTEMPTS, PAGE_LINKS, h), [false, false, true]);
+        assert_eq!(run(2, PAGE_ATTEMPTS, PAGE_LINKS, h), [true, true]);
+        assert_eq!(run(1, PAGE_ATTEMPTS, PAGE_LINKS, h), [true]);
+        // Four exchanges leave four attempts: the last visit's minimum
+        // (`owner_funding_min`, canonical + 2) plus one more exchange fits
+        // only for rank 0 or 1 there.
+        assert_eq!(
+            run_with(3, PAGE_ATTEMPTS, PAGE_LINKS, h, true),
+            [false, false, false]
+        );
+        assert_eq!(
+            run(3, 2 * PAGE_ATTEMPTS, 2 * PAGE_LINKS, h),
+            [true, true, true]
+        );
+    }
+}
+
 /// Wave 5 interplay of the lineage grants (Known issues 34 and 35) with the
 /// rank 0 timeout rule (Known issues 31, 39 and 40): an owner above rank 0
 /// whose granted targets time out keeps origin authority, since only its

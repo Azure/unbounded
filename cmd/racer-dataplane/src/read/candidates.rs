@@ -2320,11 +2320,17 @@ impl CandidatePolicy {
             }
             // A verified `StaleMembership` comes from a node that could not
             // resolve this request's membership, so the remote credits it
-            // carried were never used: return them (Known issue 26).
+            // carried were never used: return them (Known issue 26), and the
+            // links past the hops that carried it to that node (Known issues
+            // 47 and 49).
             if let Ok(Delivered::Response(response)) = &response
                 && matches!(response.response(), PeerResponse::StaleMembership)
             {
                 budget.refund_remote(attempts)?;
+                budget.refund_links(racer_core::read::budget::stale_unused_links(
+                    links,
+                    response.forwarders().len() + 1,
+                ))?;
             }
             check_budget(scope, budget)?;
             let stop = stopped.or_else(|| attempt_scope.check().err());
