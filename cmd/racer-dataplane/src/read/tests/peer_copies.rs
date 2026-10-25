@@ -4616,6 +4616,17 @@ fn offer_request(
     from: usize,
     id: u8,
 ) -> crate::peer::forwarding::VerifiedRequest {
+    page_request(f, peers, from, id, FetchMode::Offer)
+}
+
+/// A credential-free page request in `mode` from `from` to this node.
+fn page_request(
+    f: &Fixture,
+    peers: &ScriptedPeers,
+    from: usize,
+    id: u8,
+    mode: FetchMode,
+) -> crate::peer::forwarding::VerifiedRequest {
     let attempt = crate::model::AttemptId([id; 16]);
     let context = crate::security::OriginContext {
         object: f.context.object.clone(),
@@ -4625,7 +4636,7 @@ fn offer_request(
     let request = PeerRequest {
         operation: PeerOperation::Page {
             page: f.page.clone(),
-            mode: FetchMode::Offer,
+            mode,
         },
         route: crate::topology::RouteBudget {
             membership: f.membership.version,
@@ -4921,4 +4932,167 @@ fn offers_need_a_held_copy_and_an_owner_after_rank_zero() {
     assert_eq!(f.origin.calls.get(), 1);
     assert_eq!(f.fill.metrics.count(Event::OrphanNotice), 0);
     assert!(f.fill.dependencies.candidates.notices.borrow().is_empty());
+}
+
+/// Drive this node's due silence pings until `n` more of them ended.
+fn drive_pings(f: &mut Fixture, now: Instant, n: u64) {
+    use crate::telemetry::Event;
+    let candidates = f.fill.dependencies.candidates.clone();
+    let metrics = f.fill.metrics.clone();
+    let ended = |m: &crate::telemetry::Metrics| m.count(Event::SilencePingSent);
+    let target = ended(&metrics) + n;
+    candidates.poll_pings(now, &metrics);
+    drive(
+        std::future::poll_fn(|_| {
+            if candidates.pings.get() == 0 && ended(&metrics) >= target {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }),
+        &mut f.engine,
+        &f.crypto,
+    );
+    assert_eq!(ended(&metrics), target, "pings sent");
+}
+
+/// Known issues 41 and 43 (round 4, hang2): an owner above rank 0 whose
+/// probe of rank 0 went unanswered pings rank 0 (mode `ping`, on its own
+/// grant: no remote attempts, at most `NOTICE_LINKS` links). A ping left
+/// unanswered makes rank 0 silent: the owner's next walk fails it at once,
+/// without an exchange, and takes origin authority. A ping rank 0 answers
+/// clears it.
+#[test]
+fn an_owner_pings_a_rank_zero_that_timed_out_and_skips_it_while_silent() {
+    use crate::telemetry::Event;
+    use racer_core::read::notice::NOTICE_LINKS;
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let (peers, ordered) = install_peers(&mut f, Some(1));
+    publish_same_membership(&mut f, &peers);
+    let health = f.fill.dependencies.candidates.link_health();
+    // No minimum wait, so the scripted timeout counts.
+    health.set_silence(Duration::ZERO, Duration::from_secs(1));
+    peers
+        .replies
+        .borrow_mut()
+        .push_back((ordered[0].clone(), Reply::Deadline));
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+    let first = acquire(&mut f, &mut budget);
+    assert!(first.is_err());
+    assert_eq!(f.origin.calls.get(), 0);
+    assert!(!health.silent(&ordered[0]));
+    // The ping goes unanswered: rank 0 is silent.
+    peers
+        .replies
+        .borrow_mut()
+        .push_back((ordered[0].clone(), Reply::Deadline));
+    let now = uring_runtime::environment::now();
+    drive_pings(&mut f, now, 1);
+    {
+        let calls = peers.calls.borrow();
+        let (dest, copy_only, attempts, links, _) = calls.last().unwrap();
+        assert_eq!(dest, &ordered[0]);
+        assert!(!copy_only);
+        assert_eq!(*attempts, 0);
+        assert!(*links <= NOTICE_LINKS);
+    }
+    assert!(health.silent(&ordered[0]));
+    assert_eq!(f.fill.metrics.count(Event::SilencePeerSilent), 1);
+    let sent = peers.calls.borrow().len();
+    // The next walk fails rank 0 at once and fetches.
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+    let second = acquire(&mut f, &mut budget);
+    assert!(second.is_ok(), "{:?}", second.err());
+    assert_eq!(f.origin.calls.get(), 1);
+    assert_eq!(peers.calls.borrow().len(), sent);
+    // Recovered: the recheck ping (due at once with no hold) is answered.
+    peers
+        .replies
+        .borrow_mut()
+        .push_back((ordered[0].clone(), Reply::Miss));
+    drive_pings(&mut f, uring_runtime::environment::now(), 1);
+    assert!(!health.silent(&ordered[0]));
+    assert_eq!(f.fill.metrics.count(Event::SilencePeerSilent), 1);
+}
+
+/// Known issues 41 and 43: a ping is answered `Miss` at once, without a body
+/// or a hint, even by a node that holds the page; its encoding is restricted
+/// like an offer's.
+#[test]
+fn a_ping_is_answered_miss_at_once_without_a_body() {
+    use crate::telemetry::Event;
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut s = SuccessorFixture::new();
+    let (reader, holder) = (s.index(None), s.index(Some(1)));
+    assert!(matches!(
+        s.serve(reader, FetchMode::Acquire),
+        PeerResponse::Page { .. }
+    ));
+    assert_eq!(s.f.origin.calls.get(), 1);
+    s.ids += 1;
+    let admitted = page_request(&s.f, &s.peers, holder, s.ids, FetchMode::Ping);
+    assert!(matches!(
+        admitted.request().operation,
+        PeerOperation::Page {
+            mode: FetchMode::Ping,
+            ..
+        }
+    ));
+    let coordinator = s.coordinator.clone();
+    let response = {
+        use crate::peer::server::LocalPageService;
+        let f = &mut s.f;
+        drive(
+            coordinator.serve_peer(admitted, f.membership.clone(), &f.scope),
+            &mut f.engine,
+            &f.crypto,
+        )
+        .unwrap()
+    };
+    assert!(matches!(response, PeerResponse::Miss));
+    assert_eq!(s.count(Event::SilencePingAnswered), 1);
+    assert_eq!(s.count(Event::OrphanOfferNoted), 0);
+    assert_eq!(s.count(Event::SuccessorHint), 0);
+    assert_eq!(s.f.origin.calls.get(), 1);
+    // Encoding: no remote attempts, no origin credentials, pages only.
+    let f = &s.f;
+    let bare = crate::security::OriginContext {
+        object: f.context.object.clone(),
+        metadata: None,
+        authorization: None,
+    };
+    let base = |attempts: u32| PeerRequest {
+        operation: PeerOperation::Page {
+            page: f.page.clone(),
+            mode: FetchMode::Ping,
+        },
+        route: crate::topology::RouteBudget {
+            membership: f.membership.version,
+            request: f.scope.request,
+            attempt: crate::model::AttemptId([0x41; 16]),
+            destination: node(0),
+            visited: vec![node(1)],
+            remaining_links: 4,
+            remaining_attempts: attempts,
+            deadline: f.scope.deadline,
+        },
+        origin: f
+            .fill
+            .dependencies
+            .credentials
+            .seal(&bare, crate::model::AttemptId([0x41; 16]), &f.scope)
+            .unwrap(),
+    };
+    assert!(crate::peer::protocol::request_head(&base(0)).is_ok());
+    assert!(crate::peer::protocol::request_head(&base(1)).is_err());
+    let mut metadata = base(0);
+    metadata.operation = PeerOperation::Metadata {
+        object: f.context.object.clone(),
+        selector: crate::model::MetadataSelector::Fresh,
+        mode: FetchMode::Ping,
+    };
+    assert!(crate::peer::protocol::request_head(&metadata).is_err());
 }

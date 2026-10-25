@@ -3362,6 +3362,9 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::OrphanOfferDelivered => "racer_orphan_offers_delivered_total",
             Self::OrphanOfferFailed => "racer_orphan_offers_failed_total",
             Self::OrphanOfferNoted => "racer_orphan_offers_noted_total",
+            Self::SilencePingSent => "racer_silence_pings_sent_total",
+            Self::SilencePingAnswered => "racer_silence_pings_answered_total",
+            Self::SilencePeerSilent => "racer_silence_peers_silent_total",
 }
 metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::WarmTrackedJobs => "racer_warm_tracked_jobs",

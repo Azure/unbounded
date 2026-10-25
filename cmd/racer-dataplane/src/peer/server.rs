@@ -865,10 +865,13 @@ impl PeerServer {
                 };
             }
             let binding = request.binding().clone();
-            // A copy offer carries no body, so hot-page shedding does not
-            // apply (Known issue 37).
+            // A copy offer or a silence ping carries no body, so hot-page
+            // shedding does not apply (Known issues 37, 41 and 43).
             if let super::protocol::Operation::Page { page, mode } = &request.request().operation
-                && !matches!(mode, super::protocol::FetchMode::Offer)
+                && !matches!(
+                    mode,
+                    super::protocol::FetchMode::Offer | super::protocol::FetchMode::Ping
+                )
                 && self.shed_hot_page(page, request.origin().node(), &membership)
             {
                 self.metrics.record(crate::telemetry::Event::Overload, 1);

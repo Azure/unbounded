@@ -109,6 +109,8 @@ pub struct CandidatePolicy {
     pub(crate) notices: RefCell<Notices>,
     /// Copy offers in flight ([`MAX_OFFERS_IN_FLIGHT`]).
     offers: Rc<std::cell::Cell<usize>>,
+    /// Silence pings in flight ([`MAX_PINGS_IN_FLIGHT`]).
+    pub(crate) pings: Rc<std::cell::Cell<usize>>,
     /// Pages whose rank 0 this node, as an owner above it, found fetching
     /// (a probe timed out) or overdue (it missed that request's deadline);
     /// see `racer_core::read::rank0` (Known issue 39).
@@ -135,6 +137,10 @@ pub(crate) type Notices = racer_core::read::notice::OrphanNotices<crate::model::
 
 /// Copy offers a node sends at once; more due offers wait for a later turn.
 pub(crate) const MAX_OFFERS_IN_FLIGHT: usize = 4;
+
+/// Silence pings a worker sends at once (Known issues 41 and 43); more due
+/// pings wait for a later turn.
+pub(crate) const MAX_PINGS_IN_FLIGHT: usize = 16;
 
 /// When each of the page's owners arrived in this node's membership chain
 /// (`Membership::since`), for lineage targets (Known issue 25).
@@ -660,6 +666,7 @@ impl CandidatePolicy {
             )),
             notices: RefCell::new(Notices::new(racer_core::read::notice::NOTICE_CAPACITY)),
             offers: Rc::default(),
+            pings: Rc::default(),
             rank0_watch: RefCell::new(Rank0Watch::new(
                 racer_core::read::rank0::WATCH_CAPACITY,
                 racer_core::read::rank0::WATCH_TTL,
@@ -1335,6 +1342,9 @@ impl CandidatePolicy {
                     None => &candidates.ordered[probe.canonical],
                 };
                 let mut timed_out = false;
+                // A relay, not the destination, signed the answer.
+                let mut relayed = false;
+                let sent = uring_runtime::environment::now();
                 let response = self
                     .request_traced(
                         membership,
@@ -1369,6 +1379,7 @@ impl CandidatePolicy {
                         WalkOutcome::Shed
                     }
                     Ok(response) => {
+                        relayed = response.origin().node() != destination;
                         if matches!(response.response(), PeerResponse::StaleMembership) {
                             if walk.pending_handoff() || walk.pending_previous() {
                                 // A stale handoff target is only a miss, and
@@ -1530,12 +1541,30 @@ impl CandidatePolicy {
                         }
                     },
                 };
-                if walk.pending_rank0() {
+                if walk.pending_rank0() && !relayed {
+                    // Only rank 0's own answer (or its silence) says anything
+                    // about rank 0.
                     self.note_rank0(
                         destination,
                         &operation,
                         &outcome,
                         budget.deadline().min(scope.deadline.0),
+                    );
+                }
+                if walk.pending_rank0()
+                    && outcome == WalkOutcome::TimedOut
+                    && let PeerOperation::Page { page: id, .. } = &operation
+                {
+                    let health = self.peers.link_health();
+                    // Ask whether rank 0 answers at all (Known issue 43):
+                    // `poll_pings` sends the ping, and a silent rank 0 then
+                    // fails this owner's next probe at once, which gives it
+                    // origin authority without another wait.
+                    health.silence_timed_out(
+                        destination,
+                        id.clone(),
+                        sent,
+                        racer_core::peer::silence::RANK0_TIMEOUTS,
                     );
                 }
                 walk.complete(budget, outcome)?;
@@ -2083,6 +2112,11 @@ impl CandidatePolicy {
         };
         let result = async {
             check_budget(scope, budget)?;
+            // A destination this node holds silent fails at once, before any
+            // credit is spent (Known issues 41 and 43); its own pings go out.
+            if !matches!(mode, FetchMode::Ping) && self.peers.link_health().silent(destination) {
+                return Err(Error::Unavailable);
+            }
             // racer-core reserves the complete route and remote credits before
             // sending and derives the share, local cap, and body budget. Lost
             // responses cannot refund forwarded links; no retry gets fresh credits.
@@ -2349,6 +2383,95 @@ impl CandidatePolicy {
                 }
                 Ok::<(), Error>(())
             }));
+        }
+    }
+
+    /// This worker's link health (tests set its silence timing).
+    #[cfg(test)]
+    pub(crate) fn link_health(&self) -> Rc<crate::topology::LinkHealth> {
+        self.peers.link_health()
+    }
+
+    /// Send due silence pings (Known issues 41 and 43,
+    /// `racer_core::peer::silence`), at most [`MAX_PINGS_IN_FLIGHT`] at a
+    /// time, each on its own detached driver task and fixed route grant
+    /// (never a reader's budget). Call once per worker service turn.
+    pub(crate) fn poll_pings(self: &Rc<Self>, now: std::time::Instant, metrics: &Metrics) {
+        let health = self.peers.link_health();
+        let room = MAX_PINGS_IN_FLIGHT.saturating_sub(self.pings.get());
+        if room == 0 {
+            return;
+        }
+        for (peer, page) in health.due_pings(now, room) {
+            let Ok(permit) = uring_runtime::drivers::reserve() else {
+                // No driver slot this turn: the ping's slot goes stale and
+                // the next timeout asks again.
+                return;
+            };
+            let flight = OfferFlight::new(self.pings.clone());
+            let policy = self.clone();
+            let metrics = metrics.clone();
+            let health = health.clone();
+            permit.submit_detached(Box::pin(async move {
+                let _flight = flight;
+                metrics.record(Event::SilencePingSent, 1);
+                let answered = policy.ping(&peer, &page).await;
+                let now = uring_runtime::environment::now();
+                if health.ping_outcome(&peer, answered, now) {
+                    metrics.record(Event::SilencePeerSilent, 1);
+                }
+                Ok::<(), Error>(())
+            }));
+        }
+    }
+
+    /// Ping `peer` about `page` (mode `ping`, answered `Miss` at once).
+    /// `Some(true)`: `peer` signed an answer. `Some(false)`: unanswered
+    /// within the attempt, or a relay answered `Unavailable` (it holds `peer`
+    /// silent, or cannot reach it). `None`: anything else (a relay's
+    /// overload, a local failure) proves nothing.
+    async fn ping(&self, peer: &NodeId, page: &crate::model::PageId) -> Option<bool> {
+        use racer_core::read::notice::NOTICE_LINKS;
+        let deadline = uring_runtime::environment::now() + self.attempt_timeout;
+        let mut id = [0; 16];
+        uring_runtime::environment::fill_random(&mut id).ok()?;
+        let scope = RequestScope::new(crate::model::RequestId(id), deadline).ok()?;
+        let membership = self.published.current().ok()??.membership.clone();
+        let context = OriginContext {
+            object: page.version.object.clone(),
+            metadata: None,
+            authorization: None,
+        };
+        let operation = PeerOperation::Page {
+            page: page.clone(),
+            mode: FetchMode::Ping,
+        };
+        // A fresh grant: one local exchange, no remote attempts, and
+        // `NOTICE_LINKS` route links.
+        let mut budget = AcquisitionBudget::new(deadline, 1, NOTICE_LINKS);
+        let mut timed_out = false;
+        let response = self
+            .request_traced(
+                &membership,
+                peer,
+                &context,
+                &operation,
+                FetchMode::Ping,
+                &scope,
+                &mut budget,
+                1,
+                RequestMode::FundedRoute,
+                None,
+                &mut timed_out,
+            )
+            .await;
+        match response {
+            Ok(response) if response.origin().node() == peer => Some(true),
+            Ok(response) if matches!(response.response(), PeerResponse::Unavailable) => Some(false),
+            Ok(_) => None,
+            Err(_) if timed_out => Some(false),
+            Err(Error::DeadlineExceeded) => Some(false),
+            Err(_) => None,
         }
     }
 

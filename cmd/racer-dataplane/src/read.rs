@@ -264,6 +264,8 @@ impl Coordinator {
         fill.dependencies
             .candidates
             .poll_offers(now, |page| fill.holds(page), &fill.metrics);
+        // Silence pings (Known issues 41 and 43) share the turn.
+        fill.dependencies.candidates.poll_pings(now, &fill.metrics);
     }
 
     /// Answer a copy offer (Known issue 37): `requester` fetched `page` from
@@ -493,6 +495,21 @@ impl LocalPageService for Coordinator {
                     return Err(Error::InvalidRequest);
                 }
                 return self.serve_offer(page, &requester);
+            }
+            if let PeerOperation::Page {
+                page,
+                mode: FetchMode::Ping,
+            } = &request.operation
+            {
+                // A silence ping (Known issues 41 and 43): answered at once,
+                // never waiting on the cache or a flight.
+                if page.version.object != request.origin.object {
+                    return Err(Error::InvalidRequest);
+                }
+                self.fill
+                    .metrics
+                    .record(crate::telemetry::Event::SilencePingAnswered, 1);
+                return Ok(PeerResponse::Miss);
             }
             let object = match &request.operation {
                 PeerOperation::Subscribe { .. } => None,

@@ -58,6 +58,13 @@ pub enum FetchMode {
     /// body or acquires, and answers `Miss`. Receivers that predate it reject
     /// the request, which the sender treats as not delivered.
     Offer,
+    /// A silence ping (Known issues 41 and 43, `racer_core::peer::silence`):
+    /// the requester asks whether the receiver answers at all. Page requests
+    /// only, like [`Self::Offer`]; the receiver answers `Miss` at once
+    /// without looking at its cache or flights, so the answer never waits
+    /// on work. Receivers that predate it reject the request, which still
+    /// signs an answer and proves them alive.
+    Ping,
 }
 
 /// Retained HTTP provenance and exclusively socket-owned ordered sessions.
@@ -561,7 +568,7 @@ pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
     if !matches!(mode, FetchMode::Acquire) && request.route.remaining_attempts != 0 {
         return Err(Error::InvalidRequest);
     }
-    if matches!(mode, FetchMode::Offer)
+    if matches!(mode, FetchMode::Offer | FetchMode::Ping)
         && (!matches!(request.operation, Operation::Page { .. })
             || request.origin.authorization.is_some()
             || request.origin.metadata.is_some())
@@ -575,6 +582,7 @@ pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
             FetchMode::CopyOnly => "copy",
             FetchMode::Acquire => "acquire",
             FetchMode::Offer => "offer",
+            FetchMode::Ping => "ping",
         },
     );
     push_binary(&mut head, "racer-request", &request.origin.request.0);
@@ -1193,6 +1201,7 @@ impl SecurityCodec {
             "copy" => FetchMode::CopyOnly,
             "acquire" => FetchMode::Acquire,
             "offer" => FetchMode::Offer,
+            "ping" => FetchMode::Ping,
             _ => return Err(Error::InvalidRequest),
         };
         let object = object(head)?;
