@@ -207,7 +207,7 @@ impl Coordinator {
             .candidates
             .successors
             .borrow()
-            .peek(page, uring_runtime::environment::now());
+            .peek_for(page, requester, uring_runtime::environment::now());
         if hints.is_empty() {
             return false;
         }
@@ -223,7 +223,12 @@ impl Coordinator {
             .candidates
             .successors
             .borrow_mut()
-            .charge(page, MAX_DEFERRALS);
+            .charge(
+                page,
+                requester.clone(),
+                MAX_DEFERRALS,
+                uring_runtime::environment::now(),
+            );
         self.fill
             .metrics
             .record(crate::telemetry::Event::SuccessorDeferral, 1);

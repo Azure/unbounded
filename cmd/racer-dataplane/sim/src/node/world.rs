@@ -1783,8 +1783,12 @@ impl NodeWorld {
         {
             return false;
         }
-        let hints = n.hints.peek(&page, instant);
+        let hints = n.hints.peek_for(&page, &requester, instant);
         if hints.is_empty() {
+            if !n.hints.peek(&page, instant).is_empty() {
+                // Known issue 58: the requester came back after a deferral.
+                self.metrics.incr("successor_deferrals_declined_returning");
+            }
             return false;
         }
         let acquiring = n.workers[w as usize]
@@ -1794,10 +1798,16 @@ impl NodeWorld {
             return false;
         }
         let owners = self.owners_at(node, w, page, true);
-        if successor_deferral(hints, &node, &requester, &owners).is_none() {
+        let Some(to) = successor_deferral(hints, &node, &requester, &owners) else {
             return false;
+        };
+        if self.down_since.contains_key(&to) {
+            // Known issue 58: deferred to a crashed owner (simulator truth).
+            self.metrics.incr("successor_deferrals_to_down");
         }
-        self.nodes[node as usize].hints.charge(&page, MAX_DEFERRALS);
+        self.nodes[node as usize]
+            .hints
+            .charge(&page, requester, MAX_DEFERRALS, instant);
         true
     }
 

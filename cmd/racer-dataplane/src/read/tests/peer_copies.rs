@@ -4478,7 +4478,7 @@ fn rank_zero_defers_readers_to_the_owner_it_missed() {
     let mut s = SuccessorFixture::new();
     s.f.scope = RequestScope::new(
         s.f.scope.request,
-        uring_runtime::environment::now() + Duration::from_secs(60),
+        uring_runtime::environment::now() + Duration::from_secs(900),
     )
     .unwrap();
     let (reader, successor, other) = (s.index(None), s.index(Some(1)), s.index(Some(2)));
@@ -4495,16 +4495,17 @@ fn rank_zero_defers_readers_to_the_owner_it_missed() {
         PeerResponse::Miss
     ));
     assert_eq!(s.count(Event::SuccessorHint), 2);
+    // A reader that comes back within `RETURN_WITHIN` is not deferred
+    // again (Known issue 58), so each deferral here is a new read.
     for i in 0..MAX_DEFERRALS {
         assert!(
             matches!(s.serve(reader, FetchMode::Acquire), PeerResponse::Miss),
             "deferral {i}"
         );
+        clock.advance(racer_core::read::successor::RETURN_WITHIN + Duration::from_secs(1));
     }
     assert_eq!(s.count(Event::SuccessorDeferral), u64::from(MAX_DEFERRALS));
     assert_eq!(s.f.origin.calls.get(), 0);
-    // The hinted owner's own fetch has had time to finish.
-    clock.advance(racer_core::read::successor::PROBE_AFTER);
     // The deferrals are spent: rank 0 acquires for the reader, asking rank
     // 1 copy-only first (it missed: its own fetch failed).
     s.peers
@@ -4532,6 +4533,57 @@ fn rank_zero_defers_readers_to_the_owner_it_missed() {
     ));
     assert_eq!(s.f.origin.calls.get(), 1);
     assert_eq!(s.count(Event::SuccessorDeferral), u64::from(MAX_DEFERRALS));
+}
+
+/// Known issue 58: a reader deferred to the hinted owner that comes back
+/// for the page within `RETURN_WITHIN` did not get it there (the hinted
+/// owner may be down), so the deferring owner acquires for it instead of
+/// deferring it again (the window itself:
+/// `racer_core::read::successor::tests::returning_requesters_are_not_deferred_again`).
+#[test]
+fn a_returning_reader_is_not_deferred_again() {
+    use crate::telemetry::Event;
+    use racer_core::read::successor::PROBE_AFTER;
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let clock = uring_runtime::environment::SimulationClock::new(932);
+    let _env = clock.environment(0).enter();
+    let mut s = SuccessorFixture::new();
+    s.f.scope = RequestScope::new(
+        s.f.scope.request,
+        uring_runtime::environment::now() + Duration::from_secs(600),
+    )
+    .unwrap();
+    let (reader, successor) = (s.index(None), s.index(Some(1)));
+    assert!(matches!(
+        s.serve(successor, FetchMode::CopyOnly),
+        PeerResponse::Miss
+    ));
+    assert!(matches!(
+        s.serve(reader, FetchMode::Acquire),
+        PeerResponse::Miss
+    ));
+    assert_eq!(s.count(Event::SuccessorDeferral), 1);
+    // The reader's retry: rank 1 failed it. Rank 0 acquires, asking rank 1
+    // copy-only first (its successor probe), which misses here.
+    clock.advance(PROBE_AFTER);
+    s.peers
+        .replies
+        .borrow_mut()
+        .push_back((s.ordered[1].clone(), Reply::Miss));
+    assert!(matches!(
+        s.serve(reader, FetchMode::Acquire),
+        PeerResponse::Page { .. }
+    ));
+    assert_eq!(s.count(Event::SuccessorDeferral), 1);
+    assert_eq!(s.f.origin.calls.get(), 1);
+    assert_eq!(s.peers.calls.borrow().len(), 1);
+    // Holding the copy now, rank 0 serves it.
+    assert!(matches!(
+        s.serve(reader, FetchMode::Acquire),
+        PeerResponse::Page { .. }
+    ));
+    assert_eq!(s.f.origin.calls.get(), 1);
 }
 
 /// Known issue 21: owners are never deferred. Rank 2 delegating to rank 0
