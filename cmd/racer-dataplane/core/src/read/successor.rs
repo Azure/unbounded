@@ -60,6 +60,11 @@ pub const HINT_TTL: Duration = Duration::from_secs(600);
 /// Deferrals per hint before this owner fetches the page again.
 pub const MAX_DEFERRALS: u32 = 8;
 
+/// How old a hint must be before [`SuccessorHints::probe`] returns it. A
+/// younger hint names an owner whose own fetch is most likely still running
+/// (a concurrent cold miss), and a copy-only probe would only miss.
+pub const PROBE_AFTER: Duration = Duration::from_secs(2);
+
 /// Default bound on remembered pages per node.
 pub const HINT_CAPACITY: usize = 4096;
 
@@ -157,7 +162,11 @@ impl<K: Eq + Hash + Clone, N: Clone + PartialEq> SuccessorHints<K, N> {
     /// it names; a renewed note returns it again.
     pub fn probe(&mut self, key: &K, now: Instant) -> Vec<N> {
         match self.entries.get_mut(key) {
-            Some(e) if !e.probed && now.saturating_duration_since(e.at) <= self.ttl => {
+            Some(e)
+                if !e.probed
+                    && now.saturating_duration_since(e.at) <= self.ttl
+                    && now.saturating_duration_since(e.at) >= PROBE_AFTER =>
+            {
                 e.probed = true;
                 e.nodes.clone()
             }
@@ -333,7 +342,7 @@ mod tests {
         assert!(h.peek(&1, now).is_empty());
         // The hint stays for this node's own successor probe.
         assert_eq!(h.len(), 1);
-        assert_eq!(h.probe(&1, now), [7]);
+        assert_eq!(h.probe(&1, now + PROBE_AFTER), [7]);
         // Charging an absent key is a no-op.
         h.charge(&2, 1);
         assert_eq!(h.len(), 1);
@@ -342,20 +351,23 @@ mod tests {
     #[test]
     fn probe_returns_each_note_once() {
         let now = Instant::now();
-        let mut h = SuccessorHints::new(8, Duration::from_secs(1));
-        assert!(h.probe(&1u64, now).is_empty());
+        let later = now + PROBE_AFTER;
+        let mut h = SuccessorHints::new(8, PROBE_AFTER + Duration::from_secs(1));
+        assert!(h.probe(&1u64, later).is_empty());
         h.note(1u64, 7u32, now);
         h.note(1, 8, now);
-        assert_eq!(h.probe(&1, now), [7, 8]);
+        // Too young: the noted owner is most likely still fetching.
         assert!(h.probe(&1, now).is_empty());
+        assert_eq!(h.probe(&1, later), [7, 8]);
+        assert!(h.probe(&1, later).is_empty());
         // Deferrals still see it.
-        assert_eq!(h.peek(&1, now), [7, 8]);
+        assert_eq!(h.peek(&1, later), [7, 8]);
         // A renewed note re-arms it.
         h.note(1, 8, now);
-        assert_eq!(h.probe(&1, now), [7, 8]);
+        assert_eq!(h.probe(&1, later), [7, 8]);
         // Expired hints are never probed.
         h.note(2, 9, now);
-        assert!(h.probe(&2, now + Duration::from_secs(2)).is_empty());
+        assert!(h.probe(&2, later + Duration::from_secs(2)).is_empty());
         assert!(h.names(&2, &9));
         assert!(!h.names(&2, &7));
         assert!(!h.names(&3, &9));

@@ -4204,7 +4204,14 @@ fn rank_zero_defers_readers_to_the_owner_it_missed() {
     use racer_core::read::successor::MAX_DEFERRALS;
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
+    let clock = uring_runtime::environment::SimulationClock::new(931);
+    let _env = clock.environment(0).enter();
     let mut s = SuccessorFixture::new();
+    s.f.scope = RequestScope::new(
+        s.f.scope.request,
+        uring_runtime::environment::now() + Duration::from_secs(60),
+    )
+    .unwrap();
     let (reader, successor, other) = (s.index(None), s.index(Some(1)), s.index(Some(2)));
     // A copy-only miss is noted without ranking, but a reader's hint never
     // defers anyone: deferral checks that the hinted node owns the page.
@@ -4227,6 +4234,8 @@ fn rank_zero_defers_readers_to_the_owner_it_missed() {
     }
     assert_eq!(s.count(Event::SuccessorDeferral), u64::from(MAX_DEFERRALS));
     assert_eq!(s.f.origin.calls.get(), 0);
+    // The hinted owner's own fetch has had time to finish.
+    clock.advance(racer_core::read::successor::PROBE_AFTER);
     // The deferrals are spent: rank 0 acquires for the reader, asking rank
     // 1 copy-only first (it missed: its own fetch failed).
     s.peers
@@ -4266,13 +4275,22 @@ fn rank_zero_never_defers_owner_requesters() {
     use racer_core::read::walk::{SUCCESSOR_GRANT_ATTEMPTS, SUCCESSOR_GRANT_LINKS};
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
+    let clock = uring_runtime::environment::SimulationClock::new(931);
+    let _env = clock.environment(0).enter();
     let mut s = SuccessorFixture::new();
+    s.f.scope = RequestScope::new(
+        s.f.scope.request,
+        uring_runtime::environment::now() + Duration::from_secs(60),
+    )
+    .unwrap();
     let (successor, other) = (s.index(Some(1)), s.index(Some(2)));
     assert!(matches!(
         s.serve(successor, FetchMode::CopyOnly),
         PeerResponse::Miss
     ));
     assert_eq!(s.count(Event::SuccessorHint), 1);
+    // The hinted owner's own fetch has had time to finish.
+    clock.advance(racer_core::read::successor::PROBE_AFTER);
     s.peers
         .replies
         .borrow_mut()
@@ -4302,12 +4320,21 @@ fn rank_zero_copies_from_the_owner_it_missed() {
     use crate::telemetry::Event;
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
+    let clock = uring_runtime::environment::SimulationClock::new(931);
+    let _env = clock.environment(0).enter();
     let mut s = SuccessorFixture::new();
+    s.f.scope = RequestScope::new(
+        s.f.scope.request,
+        uring_runtime::environment::now() + Duration::from_secs(60),
+    )
+    .unwrap();
     let (successor, other) = (s.index(Some(1)), s.index(Some(2)));
     assert!(matches!(
         s.serve(successor, FetchMode::CopyOnly),
         PeerResponse::Miss
     ));
+    // The hinted owner's own fetch has had time to finish.
+    clock.advance(racer_core::read::successor::PROBE_AFTER);
     let copy = encrypted_copy(&mut s.f);
     s.peers
         .replies
