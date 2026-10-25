@@ -163,6 +163,38 @@ fn requesters_ahead_of_their_destination_skip_it() {
     }
 }
 
+/// Known issue 19: with a long adoption lag, requesters often adopt a
+/// version before the page's owners. Without the stale fallback, each owner
+/// behind costs a funded probe and walks run out on them; with it, a
+/// non-owner walks the previous membership's owners instead, so fewer walks
+/// end exhausted on stale destinations and fewer reads fail, and only
+/// owners reach the origin (`only_owner_hits_origin`, checked by `run`).
+#[test]
+fn stale_owners_send_non_owners_to_the_previous_membership() {
+    let with = |fallback: bool| {
+        let mut config = churny(120, 2);
+        config.request_rate = 40.0;
+        config.node.membership_lag_ns = config.node.membership_batch_ns;
+        config.node.stale_fallback = fallback;
+        run(config, 3).1
+    };
+    let off = with(false);
+    let on = with(true);
+    assert_eq!(counter(&off, "stale_fallbacks"), 0);
+    assert!(counter(&on, "stale_fallbacks") > 0, "{on}");
+    let exhausted = |r: &Value| counter(r, "walk_exhausted_stale");
+    assert!(exhausted(&off) > 0, "{off}");
+    assert!(
+        exhausted(&on) * 10 <= exhausted(&off),
+        "{} vs {}",
+        exhausted(&on),
+        exhausted(&off)
+    );
+    // Seed 3: 1,179 such walks and 53 failed reads without the fallback,
+    // 8 and 3 with it.
+    assert!(counter(&on, "reads_failed") * 4 <= counter(&off, "reads_failed"));
+}
+
 /// 412 continues with the remaining walk; 403 and 5xx fail the fill.
 #[test]
 fn origin_errors_follow_the_fill_plan() {

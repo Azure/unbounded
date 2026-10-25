@@ -3369,7 +3369,8 @@ impl NodeWorld {
             owner: fill.rank.is_some(),
             retried: fill.retried || fill.fell_back,
             previous_recent_member: recent && member,
-        }) && !fill.fallback_denied;
+        }) && !fill.fallback_denied
+            && self.config.node.stale_fallback;
         let (true, Some(old)) = (go, old) else {
             return false;
         };
