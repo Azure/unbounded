@@ -715,19 +715,38 @@ Verified against the code at the start of this work.
 
 47. 50k `full-cold-start` still fails 8 reads (`Unavailable`, 106 to 157 s, during enrollment),
    none after a stale skip (`walk_exhausted_stale` 0); not classified further (round 4, stale,
-   wave 5).
+   wave 5). Partly resolved: classified with `RACER_SIM_TRACE_FAILED`. Most were readers whose
+   first owner answered `StaleMembership` over a funded route: the answer refunded the remote
+   credits but not the 8 links the route reserved, so the stale skip and the fallback (or wait)
+   re-ask spent all 16 links on that one owner and the other two were never asked. A verified
+   `StaleMembership` now also returns the links past its answerer
+   (`racer_core::read::budget::stale_unused_links`); 50k failed reads 11 to 4. The remainder is
+   Known issue 422 (round 4, ctl3, wave 6).
 
 48. A seat follower takes the `shared.changed` generation after `follow_once`
    (`cluster-control/src/seat.rs`, `follower`), so a primary Lease change that arrives during the
    read is not seen until the next `FOLLOW_INTERVAL`. Taking it before the read would wake the
    follower every second, because `install_record` notifies the same signal. Rare (the window is
-   one GET); not modeled (round 4, stale, wave 5).
+   one GET); not modeled (round 4, stale, wave 5). Resolved: the follower takes a dedicated
+   `Shared::primary_lease` generation before its read; the step model gives follower reads a
+   duration (`Settings::follow_read_ns`) and rereads after a Lease change during one
+   (`a_commit_during_a_follower_read_is_served_by_the_next_read`,
+   `follower_rereads_after_a_lease_change_during_its_read`) (round 4, ctl3, wave 6).
 
 49. The second stale wait (`MAX_STALE_WAITS` 2) is never taken at 50k `full-cold-start`
    (`stale_waits_again` 0): a default read (8 attempts, 16 links, 4 links per funded route)
    cannot afford another exchange and still fund its later owners
    (`CandidateWalk::retry_affordable`), except at its last owner. Kept because it is bounded and
-   harmless; whether to fund it is open (round 4, stale, wave 5).
+   harmless; whether to fund it is open (round 4, stale, wave 5). Resolved with a bound: the
+   stated "except at its last owner" did not hold, because a stale answer kept every link its
+   route reserved and a reader that waited at a funded first owner had no links left at all
+   (Known issue 47). With the link refund, a default read whose three owners are all behind asks
+   each of them, waits once at its first visit, and can afford a second wait only at its last
+   visit and only when that visit is rank 0 or 1 (four attempts left must cover one exchange
+   plus the visit's minimum, canonical + 2). That is the intended preference for later owners
+   over asking a behind owner again; enforced by
+   `walk::tests::a_default_read_reaches_every_owner_and_waits_again_at_its_last` (round 4,
+   ctl3, wave 6).
 
 50. Copy offers sent while a partition still cuts the route to rank 0 fail in transport and count
    as link failures: 5k `full-failover` partition link failures rose 19,514 to 22,413 (seeds 1 to
@@ -779,6 +798,19 @@ Verified against the code at the start of this work.
    Known issue 52 class with shifted timing; that is an inference, not traced. After the wave 6
    merge the 5k `full-failover` seed 2 worst page is 7 (wave 5: 6). Open (round 4, probes, wave
    6).
+
+421. Resolved: a primary's own seat follower failed closed when the primary committed while
+   the follower's state read was in flight: the read answered the record the commit replaced,
+   which `install_record` refused as a rollback. Such a read is now dropped as superseded
+   (`step::follower::superseded`, production and step model). Found by modeling follower read
+   latency for Known issue 48 (round 4, ctl3, wave 6).
+
+422. 50k `full-cold-start` still fails 4 reads during enrollment: the reader now asks all three
+   owners, but each owner's own acquisition fails. An owner reached by a funded route inherits
+   a few credits; its rank 0 (or the member it delegates to) is behind on membership (often a
+   member whose client applied only its first version), answers `StaleMembership`, and the
+   owner has no attempt left to wait or to fetch, so it answers `Unavailable`. Open (round 4,
+   ctl3, wave 6).
 
 ## Simulator engine (racer-sim substrate)
 
@@ -1300,10 +1332,16 @@ scenarios carry data-plane faults.
 46. Resolved: rankings keep ranks to 12, owners ask up to six lineage targets, including demoted
    members of unknown age; 5k `full-churn` moved repeats 194 to 66; holders ranked below 12 or
    past six targets are not asked (round 4, probes, wave 6).
-47. 50k `full-cold-start` still fails 8 reads, none after a stale skip (round 4, stale, wave 5).
-48. A seat follower misses a primary Lease change that arrives during its read until its next
-   `FOLLOW_INTERVAL` (round 4, stale, wave 5).
-49. The second stale wait is almost never affordable for a default read (round 4, stale, wave 5).
+45. Sequential lineage and demoted probes add latency before origin (5k `full-churn` mean read
+   71 to 95 ms) (round 4, lineage, wave 5).
+46. Holders ranked sixth or lower, or past the three-target cap, are not asked (157 of 188 5k
+   `full-churn` moved repeats) (round 4, lineage, wave 5).
+47. Partly resolved: stale answers now return unused route links; 50k `full-cold-start` failed
+   reads 11 to 4, the rest is 422 (round 4, ctl3, wave 6).
+48. Resolved: seat followers reread after a primary Lease change during their read (round 4,
+   ctl3, wave 6).
+49. Resolved with a tested bound: a second stale wait only at the last visit, rank 0 or 1
+   (round 4, ctl3, wave 6).
 50. Copy offers during a partition add link failures (5k `full-failover` +15%) (round 4, orphan3,
    wave 5).
 51. Orphan repeats offers cannot remove: rank 0 refetches before the offer arrives, or the holder
@@ -1318,6 +1356,10 @@ scenarios carry data-plane faults.
    hang2, wave 6).
 55. 50k `full-failover` `copy_held` 578 to 626 and worst page 6 to 8 after the probes change,
    not traced (round 4, probes, wave 6).
+421. Resolved: a primary's follower read overlapping its own commit failed closed (round 4, ctl3,
+   wave 6).
+422. Owners with too little inherited budget fail when their rank 0 is behind on membership (4
+   reads at 50k `full-cold-start`) (round 4, ctl3, wave 6).
 
 ## Round 2: production admission
 
@@ -5639,6 +5681,119 @@ Release, seed 1 unless noted, 5k, same configurations as the wave 5 table ("Roun
 ### Open issues after wave 6 (hang2)
 
 45 to 52, 53, 54.
+
+## Round 4: ctl3 (wave 6)
+
+Known issues 47, 48 and 49. Branch `racer-sim8-ctl3` from racer-core-sim 5d1ea912b. Logs,
+reports and binaries: `/tmp/opencode/r8-ctl3/`.
+
+### Issue 47: classification and root cause
+
+A diagnostic (`RACER_SIM_TRACE_FAILED=1`, `sim/src/node/world.rs`, `describe_failed_fill`)
+prints, for every failed client read, each failed fill of that page on the reader (candidates,
+every walk probe's outcome and the budget left after it) and the destinations' own failed fills
+and failed serves of the page. Two 50k `full-cold-start` runs with it (seed 1, wave 5 config)
+put all 11 (then 10) failed reads in two classes:
+
+- 8 of 11: a reader's first visit is a funded route to rank 2 (eight links). The owner is
+  behind and answers `StaleMembership`. The answer returned the remote credits
+  (`refund_remote`) but not the links, which `plan_attempt` reserves in full and never returns.
+  The fallback walk under version - 1 (or the stale wait) asks the same owner again over
+  another funded route: all 16 links of a default read are gone after two exchanges, and the
+  other two owners are `Unfunded`. Each retry repeats the same pattern in about 100 ms, so the
+  four attempts fail within half a second of a 10 s deadline.
+- 3 of 11: the reader's owners each fail their own acquisition (`Unavailable`): see Known issue
+  422 below.
+
+The same accounting is why the second stale wait (Known issue 49) was never affordable: the doc
+claimed it was affordable at the last owner, but a reader that waited at a funded first owner
+had no links for any later owner (`a_default_read_reaches_every_owner_and_waits_again_at_its_last`,
+the case without the refund).
+
+### Issue 47 and 49: change
+
+A verified `StaleMembership` comes from a node that could not resolve the request's membership,
+so it neither served nor forwarded the request: only the links that carried the request to it
+were used. `racer_core::read::budget::stale_unused_links(charged, hops)` returns the rest;
+production (`src/read/candidates.rs`, next to `refund_remote`) uses `forwarders + 1` of the
+verified answer as the hops; the simulator uses the reply route length (`Probing::hops`,
+knob `node.stale_link_refund`, counter `stale_links_refunded`). Never more than was charged
+(`refund_links` checks the debit), so budgets never grow; lost or unverified answers refund
+nothing. No wire change.
+
+The second stale wait is kept; its bound is now true and tested (Known issue 49).
+
+### Issue 48: change, and Known issue 421
+
+- Production: `Shared::primary_lease`, notified only by `apply_primary`; the seat follower takes
+  its generation before `follow_once` and waits on it or on `shared.changed` (taken after the
+  read, as before). Test `seat::tests::follower_rereads_after_a_lease_change_during_its_read`
+  (fake API server answers GETs late with the state as of their arrival, `FakeApi::delay_gets`;
+  fails before the change).
+- Step model (`step::cluster`): follower reads take `Settings::follow_read_ns` (20 ms), answer
+  the state as of their start, and a Lease change during the read rereads at the 1 s floor
+  (`a_commit_during_a_follower_read_is_served_by_the_next_read`, fails without the wake).
+- Modeling the read latency exposed Known issue 421: the primary's own follower read could
+  answer the record its commit had just replaced, which `install_record` refused as a rollback
+  and failed closed. `step::follower::superseded` drops a read that is older than a record some
+  other installer (the primary) installed while it was in flight; a rollback is still refused by
+  the next read. Test `seat::tests::a_commit_during_the_primarys_follower_read_does_not_fail_closed`.
+- Also fixed in the model: a seat claim kept the previous holder's served sequence (invisible
+  while reads were instantaneous).
+
+### Evidence
+
+5k, release, seed 1, wave 5 configurations (`/tmp/opencode/m7/`). Reads ok / failed; origin
+total, worst page, pages fetched more than once.
+
+| Run | Wave 5 | Wave 5 origin | ctl3 | ctl3 origin |
+| --- | --- | --- | --- | --- |
+| 5k storm | 378,544 / 0 | 1,024, 1, 0 | 378,544 / 0 | 1,024, 1, 0 |
+| 5k zipf | 202,851 / 15 | 40,404, 3, 1,452 | 202,851 / 15 | 40,404, 3, 1,452 |
+| 5k churn | 291,474 / 87 | 1,028, 2, 4 | 291,482 / 93 | 1,026, 2, 2 |
+| 5k zipf 16 MiB | 37,637 / 28 | 17,829, 3, 139 | 37,637 / 28 | 17,829, 3, 139 |
+| 5k 1 Gbit/s storm | 95,158 / 0 | 6,970, 2, 16 | 95,106 / 0 | 6,946, 2, 5 |
+| 5k full-cold-start | 95,159 / 0 | 6,970, 2, 16 | 95,107 / 0 | 6,946, 2, 5 |
+| 5k full-failover | 33,970 / 33 | 12,951, 6, 342 | 33,974 / 35 | 12,998, 7, 345 |
+| 5k full-failover seed 2 | 33,740 / 30 | 12,975, 6, 368 | 33,743 / 30 | 12,994, 6, 379 |
+| 5k full-failover seed 3 | 33,715 / 37 | 12,907, 6, 287 | 33,583 / 36 | 12,904, 7, 288 |
+| 5k full-churn | 34,040 / 0 | 12,768, 3, 223 | 34,070 / 0 | 12,768, 3, 223 |
+| 5k zipf, 50 hung members | 30,478 / 140 | 11,757, 2, 25 | 30,478 / 140 | 11,757, 2, 25 |
+| 50k full-cold-start | 913,187 / 11 | 27,360, 3, 411 | 912,770 / 4 | 27,423, 3, 454 |
+
+- 50k `full-cold-start` (21:55 wall, peak RSS 4.5 GiB): failed reads 11 to 4, all
+  `Unavailable` between 105 and 156 s (Known issue 422); 5,524 links refunded by stale answers;
+  `stale_waits_again` still 0. 417 fewer completed reads and 63 more origin requests (worst
+  page unchanged at 3); `origin_repeat_explained` holds (`unexplained` 0).
+- 5k: unchanged where no membership changes (storm, zipf, zipf 16 MiB, hung members). Churn
+  87 to 93 failed reads at seed 1, but seeds 1 to 4 total 368 with the refund and 366 without
+  (`node.stale_link_refund` 0): no measurable change. The `full-*` runs move a little with the
+  control-plane timing (follower reads now take 20 ms); `full-failover` worst page 6 to 7 at
+  seeds 1 and 3.
+- Control (5k, seed 1): seat lag max (commit to a seat serving it) `enrollment-storm` 0.93 s
+  to 70 ms, `ctl-churn` 0.92 s to 0.21 s, `lagging` 0.93 s to 70 ms; member lag max
+  `enrollment-storm` 0.94 s to 0.52 s, `ctl-churn` 0.91 s to 0.19 s.
+- Hard invariants hold in every run above and in all 16 scenarios at 200 nodes, 1 s.
+- `cargo fmt --check`, `clippy --workspace --all-targets -D warnings` and the workspace tests
+  pass; DST seeds 1 to 20 pass, native and not.
+
+### Bounds
+
+- A stale answer returns at most the links its request was charged, less the hops it travelled
+  (`stale_answers_refund_only_the_links_past_the_answerer`).
+- A default read whose owners are all behind asks each owner, waits once, and waits a second
+  time only at its last visit when that visit is rank 0 or 1 (Known issue 49).
+- A seat follower serves a commit within the 1 s floor plus two reads even when the commit
+  lands during a read.
+
+### Deviations and open items
+
+- Issue 47 is partly resolved; the remaining 4 failed reads are Known issue 422 (owners with
+  too little inherited budget whose rank 0 is behind on membership). Fixing it means funding
+  an owner reached by a funded route for a stale exchange plus its own fetch, or the owner
+  waiting for a behind rank 0, which touches the handoff budgets; left open.
+- The `RACER_SIM_TRACE_FAILED` diagnostic is kept (off unless the variable is set).
+- The 50k run used the trace build of the final code; tracing only prints.
 
 ## Round 4: combined (wave 6)
 
