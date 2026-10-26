@@ -64,28 +64,11 @@ spec:
                       type: integer
                     runnerImage:
                       type: string
-                    script:
-                      properties:
-                        key:
-                          type: string
-                        name:
-                          type: string
-                      required:
-                      - key
-                      - name
-                      type: object
-                    scriptEnvironment:
-                      additionalProperties:
-                        type: string
-                      maxProperties: 32
-                      type: object
+                    scriptKey:
+                      minLength: 1
+                      type: string
                     workloadPolicy:
                       properties:
-                        capabilities:
-                          items:
-                            description: Capability represent POSIX capabilities type
-                            type: string
-                          type: array
                         hostNetwork:
                           type: boolean
                         hostPaths:
@@ -101,6 +84,8 @@ spec:
                             type: object
                           maxItems: 16
                           type: array
+                        ipcLock:
+                          type: boolean
                         privileged:
                           type: boolean
                         resources:
@@ -164,22 +149,16 @@ spec:
                                 More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                               type: object
                           type: object
-                        workingDir:
-                          type: string
                       type: object
                   required:
                   - backend
                   - backendActiveDeadline
                   - runnerImage
-                  - script
+                  - scriptKey
                   type: object
                   x-kubernetes-validations:
                   - message: backendActiveDeadline must be positive
                     rule: duration(self.backendActiveDeadline) > duration('0s')
-                  - message: scriptEnvironment names must not exceed 253 characters
-                      and values must not exceed 4096 characters
-                    rule: '!has(self.scriptEnvironment) || self.scriptEnvironment.all(k,
-                      size(k) <= 253 && size(self.scriptEnvironment[k]) <= 4096)'
                 maxItems: 15
                 minItems: 15
                 type: array
@@ -255,10 +234,14 @@ spec:
                 - count
                 - selector
                 type: object
+              scriptConfigMap:
+                minLength: 1
+                type: string
             required:
             - checks
             - deadline
             - participants
+            - scriptConfigMap
             type: object
             x-kubernetes-validations:
             - message: every backendActiveDeadline must leave at least 60 seconds

@@ -43,23 +43,6 @@ const (
 
 var runnerImagePattern = regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)
 
-var reservedEnvironmentNames = map[string]struct{}{
-	"BASH_ENV":        {},
-	"BASHOPTS":        {},
-	"CDPATH":          {},
-	"ENV":             {},
-	"GLOBIGNORE":      {},
-	"HOST_PROC_ROOT":  {},
-	"HOST_SYSFS_ROOT": {},
-	"IFS":             {},
-	"LD_LIBRARY_PATH": {},
-	"LD_PRELOAD":      {},
-	"PATH":            {},
-	"PYTHONHOME":      {},
-	"PYTHONPATH":      {},
-	"SHELLOPTS":       {},
-}
-
 type Config struct {
 	Namespace              string
 	WorkflowName           string
@@ -73,7 +56,6 @@ type Config struct {
 	RunnerImage            string
 	BackendKind            string
 	BackendDeadlineSeconds int64
-	ScriptEnvironmentJSON  string
 	WorkloadPolicyJSON     string
 	GPUResourceCount       string
 }
@@ -277,48 +259,7 @@ func ValidateConfig(config Config) ([]signalv1.Participant, []corev1.Toleration,
 		Effect:   corev1.TaintEffectNoSchedule,
 	}}
 
-	var environment map[string]string
-	if err := decodeJSONObject(config.ScriptEnvironmentJSON, &environment); err != nil {
-		return nil, nil, nil, fmt.Errorf("decode script-environment: %w", err)
-	}
-
-	if len(environment) > 32 {
-		return nil, nil, nil, errors.New("script-environment must not contain more than 32 entries")
-	}
-
-	environmentNames := make([]string, 0, len(environment))
-	for name := range environment {
-		environmentNames = append(environmentNames, name)
-	}
-
-	slices.Sort(environmentNames)
-
-	env := make([]corev1.EnvVar, 0, len(environmentNames)+4)
-	for _, name := range environmentNames {
-		if len(name) > 253 {
-			return nil, nil, nil, fmt.Errorf("script-environment name %q exceeds 253 bytes", name)
-		}
-
-		if errors := validation.IsEnvVarName(name); len(errors) > 0 {
-			return nil, nil, nil, fmt.Errorf("script-environment contains invalid name %q", name)
-		}
-
-		if strings.HasPrefix(name, "PROJECT_SIGNAL_") {
-			return nil, nil, nil, fmt.Errorf("script-environment contains reserved name %q", name)
-		}
-
-		if _, reserved := reservedEnvironmentNames[name]; reserved {
-			return nil, nil, nil, fmt.Errorf("script-environment contains reserved name %q", name)
-		}
-
-		if len(environment[name]) > 4096 {
-			return nil, nil, nil, fmt.Errorf("script-environment value for %q exceeds 4096 bytes", name)
-		}
-
-		env = append(env, corev1.EnvVar{Name: name, Value: environment[name]})
-	}
-
-	return participants, tolerations, env, nil
+	return participants, tolerations, nil, nil
 }
 
 func RenderResources(
@@ -1153,18 +1094,17 @@ func workloadContainer(
 		container.Resources.Limits[corev1.ResourceName("nvidia.com/gpu")] = gpu
 	}
 
-	if policy.Privileged || len(policy.Capabilities) > 0 {
+	if policy.Privileged || policy.IPCLock {
 		container.SecurityContext = &corev1.SecurityContext{
 			Privileged: ptr(policy.Privileged),
 		}
-		if len(policy.Capabilities) > 0 {
+		if policy.IPCLock {
 			container.SecurityContext.Capabilities = &corev1.Capabilities{
-				Add: slices.Clone(policy.Capabilities),
+				Add: []corev1.Capability{"IPC_LOCK"},
 			}
 		}
 	}
 
-	container.WorkingDir = policy.WorkingDir
 	container.VolumeMounts = append(resultVolumeMounts(), workloadVolumeMounts(policy)...)
 
 	return container

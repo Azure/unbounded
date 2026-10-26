@@ -68,7 +68,6 @@ func main() {
 		0,
 		"Active deadline for participant backend workloads",
 	)
-	flags.StringVar(&cfg.ScriptEnvironmentJSON, "script-environment", "{}", "JSON-encoded script environment")
 	flags.StringVar(&cfg.WorkloadPolicyJSON, "workload-policy", "{}", "JSON-encoded participant workload policy")
 	flags.StringVar(&cfg.GPUResourceCount, "gpu-resource-count", "0", "GPU resource limit per participant")
 	flags.StringVar(&cfg.outputDirectory, "output-directory", "/outputs", "Argo output directory")

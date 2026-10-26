@@ -64,6 +64,7 @@ certification suites:
 | `spec.participants.count` | Total Nodes selected for a Run |
 | `spec.participants.selector` | Labels every selected Node must match |
 | `spec.participants.minimumAllocatable` | Admission-time allocatable resource floor |
+| `spec.scriptConfigMap` | Source ConfigMap containing all 15 scripts |
 | `spec.checks` | Exactly 15 ordered checks; position defines R01 through R15 |
 | `spec.deadline` | Whole-suite deadline |
 
@@ -76,17 +77,16 @@ Each check contains:
 
 | Field | Meaning |
 |---|---|
-| `script` | Source ConfigMap name and key; admission snapshots the current bytes and computes their SHA-256 digest |
+| `scriptKey` | Key in `spec.scriptConfigMap`; admission snapshots the current bytes and computes their SHA-256 digest |
 | `runnerImage` | Digest-pinned check image |
 | `backend` | `Pod` or `MPIJob` |
 | `backendActiveDeadline` | Backend execution deadline |
 | `gpuCount` | GPU request; must be positive for MPIJob |
-| `scriptEnvironment` | At most 32 bounded, non-reserved environment values |
 | `workloadPolicy` | Narrow container resources and host access policy |
 
 Workload policy is intentionally constrained:
 
-- the only added Linux capability is `IPC_LOCK`;
+- `ipcLock` is the only supported added Linux capability;
 - host sources must be under `/proc`, `/sys`, or
   `/var/lib/project-signal`;
 - host mounts are read-only and their volume names and `Directory` type are

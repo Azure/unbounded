@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"reflect"
 	"regexp"
 	"slices"
@@ -59,25 +58,6 @@ const (
 )
 
 var runnerImageDigestPattern = regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)
-
-var reservedScriptEnvironmentNames = map[string]struct{}{
-	"BASH_ENV":                       {},
-	"BASHOPTS":                       {},
-	"CDPATH":                         {},
-	"ENV":                            {},
-	"GLOBIGNORE":                     {},
-	"HOST_PROC_ROOT":                 {},
-	"HOST_SYSFS_ROOT":                {},
-	"IFS":                            {},
-	"LD_LIBRARY_PATH":                {},
-	"LD_PRELOAD":                     {},
-	"PATH":                           {},
-	"PROJECT_SIGNAL_PARAMETERS_JSON": {},
-	"PROJECT_SIGNAL_RESULTS_DIR":     {},
-	"PYTHONHOME":                     {},
-	"PYTHONPATH":                     {},
-	"SHELLOPTS":                      {},
-}
 
 var workflowOutputLimits = map[string]int{
 	"backend-resources": signaladapter.MaxBackendOutputBytes,
@@ -204,10 +184,6 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 			return fmt.Errorf("profile %s check %s runner image must use an immutable sha256 digest", profile.Name, check.ID)
 		}
 
-		if err := validateScriptEnvironment(check.ScriptEnvironment); err != nil {
-			return fmt.Errorf("profile %s check %s script environment: %w", profile.Name, check.ID, err)
-		}
-
 		if err := signalworkload.Validate(check.WorkloadPolicy); err != nil {
 			return fmt.Errorf("profile %s check %s workload policy: %w", profile.Name, check.ID, err)
 		}
@@ -294,7 +270,7 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 		}
 	}()
 
-	snapshot, checkSnapshots, err := r.createSnapshot(ctx, runName, checks)
+	snapshot, checkSnapshots, err := r.createSnapshot(ctx, runName, profile.Spec.ScriptConfigMap, checks)
 	if err != nil {
 		return err
 	}
@@ -713,6 +689,7 @@ func (r *AdmissionReconciler) releaseParticipants(ctx context.Context, participa
 func (r *AdmissionReconciler) createSnapshot(
 	ctx context.Context,
 	runName string,
+	scriptConfigMap string,
 	checks []signalv1.CertificationCheck,
 ) (*corev1.ConfigMap, []signalv1.CertificationCheckSnapshot, error) {
 	immutable := true
@@ -727,25 +704,25 @@ func (r *AdmissionReconciler) createSnapshot(
 		Data:      map[string]string{},
 	}
 
+	var source corev1.ConfigMap
+	if err := r.Get(
+		ctx,
+		client.ObjectKey{Namespace: r.ScriptNamespace, Name: scriptConfigMap},
+		&source,
+	); err != nil {
+		return nil, nil, fmt.Errorf("get source script ConfigMap: %w", err)
+	}
+
 	checkSnapshots := make([]signalv1.CertificationCheckSnapshot, len(checks))
 	for index := range checks {
 		check := &checks[index]
 
-		var source corev1.ConfigMap
-		if err := r.Get(
-			ctx,
-			client.ObjectKey{Namespace: r.ScriptNamespace, Name: check.Script.Name},
-			&source,
-		); err != nil {
-			return nil, nil, fmt.Errorf("get source script ConfigMap for check %s: %w", check.ID, err)
-		}
-
-		content, ok := source.Data[check.Script.Key]
+		content, ok := source.Data[check.ScriptKey]
 		if !ok {
 			return nil, nil, fmt.Errorf(
 				"source script ConfigMap %s has no key %s for check %s",
 				source.Name,
-				check.Script.Key,
+				check.ScriptKey,
 				check.ID,
 			)
 		}
@@ -765,7 +742,6 @@ func (r *AdmissionReconciler) createSnapshot(
 			Backend:               check.Backend,
 			WorkloadPolicy:        *check.WorkloadPolicy.DeepCopy(),
 			GPUCount:              check.GPUCount,
-			ScriptEnvironment:     maps.Clone(check.ScriptEnvironment),
 			BackendActiveDeadline: check.BackendActiveDeadline,
 		}
 	}
@@ -1190,11 +1166,6 @@ func buildWorkflow(run *signalv1.CertificationRun) (*unstructured.Unstructured, 
 			return nil, fmt.Errorf("encode check %s participants: %w", check.ID, marshalErr)
 		}
 
-		environmentJSON, marshalErr := json.Marshal(check.ScriptEnvironment)
-		if marshalErr != nil {
-			return nil, fmt.Errorf("encode check %s script environment: %w", check.ID, marshalErr)
-		}
-
 		workloadPolicyJSON, encodeErr := signalworkload.Encode(check.WorkloadPolicy)
 		if encodeErr != nil {
 			return nil, fmt.Errorf("encode check %s workload policy: %w", check.ID, encodeErr)
@@ -1213,7 +1184,6 @@ func buildWorkflow(run *signalv1.CertificationRun) (*unstructured.Unstructured, 
 					check,
 					run.Spec.Participants,
 					string(participantsJSON),
-					string(environmentJSON),
 					workloadPolicyJSON,
 					strconv.FormatInt(int64(check.GPUCount), 10),
 				),
@@ -1265,7 +1235,6 @@ func checkWorkflowParameters(
 	check *signalv1.CertificationCheckSnapshot,
 	participants []signalv1.Participant,
 	participantsJSON string,
-	scriptEnvironmentJSON string,
 	workloadPolicyJSON string,
 	gpuCount string,
 ) []any {
@@ -1283,7 +1252,6 @@ func checkWorkflowParameters(
 			"value": fmt.Sprintf("%d", int64(check.BackendActiveDeadline.Seconds())),
 		},
 		map[string]any{"name": "runner-image", "value": check.RunnerImage},
-		map[string]any{"name": "script-environment", "value": scriptEnvironmentJSON},
 		map[string]any{"name": "workload-policy", "value": workloadPolicyJSON},
 		map[string]any{"name": "gpu-resource-count", "value": gpuCount},
 	}
@@ -1296,60 +1264,6 @@ func validateGPUCount(gpuCount int32, backend signalv1.ExecutionBackend) error {
 
 	if gpuCount < 0 || (backend == signalv1.ExecutionBackendMPIJob && gpuCount == 0) {
 		return errors.New("must be nonnegative and positive for MPIJob")
-	}
-
-	return nil
-}
-
-func validEnvironmentName(value string) bool {
-	if value == "" || (value[0] != '_' && (value[0] < 'A' || value[0] > 'Z')) {
-		return false
-	}
-
-	for index := 1; index < len(value); index++ {
-		character := value[index]
-		if (character < 'A' || character > 'Z') &&
-			(character < '0' || character > '9') &&
-			character != '_' {
-			return false
-		}
-	}
-
-	return true
-}
-
-func validateScriptEnvironment(environment map[string]string) error {
-	if len(environment) > 32 {
-		return errors.New("must not contain more than 32 entries")
-	}
-
-	keys := make([]string, 0, len(environment))
-	for key := range environment {
-		keys = append(keys, key)
-	}
-
-	sort.Strings(keys)
-
-	for _, name := range keys {
-		if len(name) > 253 {
-			return fmt.Errorf("name %q exceeds 253 bytes", name)
-		}
-
-		if !validEnvironmentName(name) {
-			return fmt.Errorf("name %q is invalid", name)
-		}
-
-		if strings.HasPrefix(name, "PROJECT_SIGNAL_") {
-			return fmt.Errorf("name %q is reserved", name)
-		}
-
-		if _, reserved := reservedScriptEnvironmentNames[name]; reserved {
-			return fmt.Errorf("name %q is reserved", name)
-		}
-
-		if len(environment[name]) > 4096 {
-			return fmt.Errorf("value for %q exceeds 4096 bytes", name)
-		}
 	}
 
 	return nil
@@ -2999,7 +2913,6 @@ func profileChecks(profile *signalv1.CertificationProfile) []signalv1.Certificat
 		checks[index].ID = signalv1.CheckID(fmt.Sprintf("R%02d", index+1))
 		checks[index].Order = int32(index)
 		checks[index].WorkloadPolicy = *profile.Spec.Checks[index].WorkloadPolicy.DeepCopy()
-		checks[index].ScriptEnvironment = maps.Clone(profile.Spec.Checks[index].ScriptEnvironment)
 	}
 
 	return checks

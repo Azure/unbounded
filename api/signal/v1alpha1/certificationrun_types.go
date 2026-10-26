@@ -70,19 +70,16 @@ type ScriptSnapshot struct {
 }
 
 // +kubebuilder:validation:XValidation:rule="duration(self.backendActiveDeadline) > duration('0s')",message="backendActiveDeadline must be positive"
-// +kubebuilder:validation:XValidation:rule="!has(self.scriptEnvironment) || self.scriptEnvironment.all(k, size(k) <= 253 && size(self.scriptEnvironment[k]) <= 4096)",message="scriptEnvironment names must not exceed 253 characters and values must not exceed 4096 characters"
 type CertificationCheckSnapshot struct {
 	// ID and Order are derived from the check's position and are never serialized.
-	ID             CheckID          `json:"-"`
-	Order          int32            `json:"-"`
-	Script         ScriptSnapshot   `json:"script"`
-	RunnerImage    string           `json:"runnerImage"`
-	Backend        ExecutionBackend `json:"backend"`
-	WorkloadPolicy WorkloadPolicy   `json:"workloadPolicy,omitempty"`
-	GPUCount       int32            `json:"gpuCount,omitempty"`
-	// +kubebuilder:validation:MaxProperties=32
-	ScriptEnvironment     map[string]string `json:"scriptEnvironment,omitempty"`
-	BackendActiveDeadline metav1.Duration   `json:"backendActiveDeadline"`
+	ID                    CheckID          `json:"-"`
+	Order                 int32            `json:"-"`
+	Script                ScriptSnapshot   `json:"script"`
+	RunnerImage           string           `json:"runnerImage"`
+	Backend               ExecutionBackend `json:"backend"`
+	WorkloadPolicy        WorkloadPolicy   `json:"workloadPolicy,omitempty"`
+	GPUCount              int32            `json:"gpuCount,omitempty"`
+	BackendActiveDeadline metav1.Duration  `json:"backendActiveDeadline"`
 }
 
 // +kubebuilder:validation:XValidation:rule="self.profile == oldSelf.profile",message="profile is immutable"

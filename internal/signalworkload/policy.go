@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"path"
-	"regexp"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -19,13 +18,7 @@ import (
 
 const MaxPolicyBytes = 16 * 1024
 
-var (
-	capabilityPattern   = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
-	allowedCapabilities = map[corev1.Capability]struct{}{
-		"IPC_LOCK": {},
-	}
-	allowedHostPathRoots = []string{"/proc", "/sys", "/var/lib/project-signal"}
-)
+var allowedHostPathRoots = []string{"/proc", "/sys", "/var/lib/project-signal"}
 
 func HostPathVolumeName(index int) string {
 	return fmt.Sprintf("host-%02d", index)
@@ -83,16 +76,6 @@ func Validate(policy signalv1.WorkloadPolicy) error {
 		return err
 	}
 
-	if err := validateCapabilities(policy.Capabilities); err != nil {
-		return err
-	}
-
-	if policy.WorkingDir != "" {
-		if err := validateAbsolutePath("workingDir", policy.WorkingDir); err != nil {
-			return err
-		}
-	}
-
 	if len(policy.HostPaths) > 16 {
 		return errors.New("workload policy must not contain more than 16 host paths")
 	}
@@ -142,28 +125,6 @@ func validateResources(resources corev1.ResourceRequirements) error {
 		if exists && quantity.Cmp(request) < 0 {
 			return fmt.Errorf("workload policy resource limit %q must not be less than its request", name)
 		}
-	}
-
-	return nil
-}
-
-func validateCapabilities(capabilities []corev1.Capability) error {
-	seen := map[corev1.Capability]struct{}{}
-
-	for _, capability := range capabilities {
-		if !capabilityPattern.MatchString(string(capability)) {
-			return fmt.Errorf("workload policy capability %q is invalid", capability)
-		}
-
-		if _, allowed := allowedCapabilities[capability]; !allowed {
-			return fmt.Errorf("workload policy capability %q is not allowlisted", capability)
-		}
-
-		if _, exists := seen[capability]; exists {
-			return fmt.Errorf("workload policy capability %q is repeated", capability)
-		}
-
-		seen[capability] = struct{}{}
 	}
 
 	return nil

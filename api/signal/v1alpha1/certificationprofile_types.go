@@ -8,28 +8,21 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-type ScriptReference struct {
-	Name string `json:"name"`
-	Key  string `json:"key"`
-}
-
 type CheckID string
 
 // +kubebuilder:validation:XValidation:rule="duration(self.backendActiveDeadline) > duration('0s')",message="backendActiveDeadline must be positive"
-// +kubebuilder:validation:XValidation:rule="!has(self.scriptEnvironment) || self.scriptEnvironment.all(k, size(k) <= 253 && size(self.scriptEnvironment[k]) <= 4096)",message="scriptEnvironment names must not exceed 253 characters and values must not exceed 4096 characters"
 type CertificationCheck struct {
 	// ID and Order are derived from the check's position and are never serialized.
-	ID             CheckID          `json:"-"`
-	Order          int32            `json:"-"`
-	Script         ScriptReference  `json:"script"`
+	ID    CheckID `json:"-"`
+	Order int32   `json:"-"`
+	// +kubebuilder:validation:MinLength=1
+	ScriptKey      string           `json:"scriptKey"`
 	RunnerImage    string           `json:"runnerImage"`
 	Backend        ExecutionBackend `json:"backend"`
 	WorkloadPolicy WorkloadPolicy   `json:"workloadPolicy,omitempty"`
 	// +kubebuilder:validation:Minimum=0
-	GPUCount int32 `json:"gpuCount,omitempty"`
-	// +kubebuilder:validation:MaxProperties=32
-	ScriptEnvironment     map[string]string `json:"scriptEnvironment,omitempty"`
-	BackendActiveDeadline metav1.Duration   `json:"backendActiveDeadline"`
+	GPUCount              int32           `json:"gpuCount,omitempty"`
+	BackendActiveDeadline metav1.Duration `json:"backendActiveDeadline"`
 }
 
 // +kubebuilder:validation:Enum=Pod;MPIJob
@@ -56,11 +49,10 @@ type WorkloadHostPath struct {
 }
 
 type WorkloadPolicy struct {
-	Resources    corev1.ResourceRequirements `json:"resources,omitempty"`
-	Privileged   bool                        `json:"privileged,omitempty"`
-	Capabilities []corev1.Capability         `json:"capabilities,omitempty"`
-	HostNetwork  bool                        `json:"hostNetwork,omitempty"`
-	WorkingDir   string                      `json:"workingDir,omitempty"`
+	Resources   corev1.ResourceRequirements `json:"resources,omitempty"`
+	Privileged  bool                        `json:"privileged,omitempty"`
+	IPCLock     bool                        `json:"ipcLock,omitempty"`
+	HostNetwork bool                        `json:"hostNetwork,omitempty"`
 	// +kubebuilder:validation:MaxItems=16
 	HostPaths []WorkloadHostPath `json:"hostPaths,omitempty"`
 }
@@ -69,6 +61,8 @@ type WorkloadPolicy struct {
 // +kubebuilder:validation:XValidation:rule="self.checks.map(c, duration(c.backendActiveDeadline) + duration('60s')).sum() <= duration(self.deadline)",message="deadline must cover every sequential backendActiveDeadline plus 60 seconds of evidence time per check"
 type CertificationProfileSpec struct {
 	Participants ParticipantPolicy `json:"participants"`
+	// +kubebuilder:validation:MinLength=1
+	ScriptConfigMap string `json:"scriptConfigMap"`
 	// +kubebuilder:validation:MinItems=15
 	// +kubebuilder:validation:MaxItems=15
 	Checks   []CertificationCheck `json:"checks"`
