@@ -898,11 +898,12 @@ Verified against the code at the start of this work.
    were not crashed when readers were deferred to them (0 of 958 deferrals at 50k seed 1), so
    "often down" above is not what the simulator shows; see "Round 4: failover (wave 7)".
 
-511. Funding short in-order owners (Known issue 57) makes them fetch after rank 0 failed the
+59. Funding short in-order owners (Known issue 57) makes them fetch after rank 0 failed the
    reader instead of failing it: 5k `full-failover` origin +17 to +30 requests, `copy_held`
    repeats 58/67/55 to 67/76/72 and worst page 5 to 6 (seeds 1, 2), for 4 to 15 fewer failed
    reads. Open (round 4, budget, wave 7).
-521. A non-owner reader's overflow helper probe (`Walk::helper_probe`,
+
+60. A non-owner reader's overflow helper probe (`Walk::helper_probe`,
    `core/src/read/walk.rs:597`) is funded with up to `HELPER_ATTEMPTS` (4) attempts and
    `HELPER_LINKS` (8) links from what the reader has left after rank 0 sheds it, which is often
    everything (4 attempts after the shed in 5k `zipf` at 16 MiB pages). A helper whose route to
@@ -1465,9 +1466,9 @@ scenarios carry data-plane faults.
 58. Resolved: a reader that comes back within 60 s after a deferral to an offer's sender is
    not deferred again; 50k `full-failover` failed reads 343, 307, 342 to 251, 248, 267 (seeds 1
    to 3), DST seed 11 passes (round 4, failover, wave 7).
-511. Funded short in-order owners fetch after rank 0 failed the reader: 5k `full-failover`
+59. Funded short in-order owners fetch after rank 0 failed the reader: 5k `full-failover`
    origin +17 to +30, worst page 5 to 6, 4 to 15 fewer failed reads (round 4, budget, wave 7).
-521. A reader's overflow helper probe takes every attempt the reader has left (up to
+60. A reader's overflow helper probe takes every attempt the reader has left (up to
    `HELPER_ATTEMPTS`), so when the helper fails (here: its route to rank 0 has 2 links) the
    reader cannot ask ranks 1 and 2 (round 4, busy, wave 7).
 
@@ -6373,7 +6374,7 @@ than once; overlapping (`concurrent`) origin requests where relevant.
 ### Deviations and open items
 
 - 50k seed 2 was not run (host time shared with other tracks); 5k seeds 1 to 3 cover failover.
-- New Known issue 511: the in-order funding trades 17 to 30 extra origin requests and a few
+- New Known issue 59: the in-order funding trades 17 to 30 extra origin requests and a few
   more `copy_held` repeats in 5k `full-failover` for 4 to 15 fewer failed reads; funded owners
   fetch after rank 0 failed where they previously failed the reader.
 
@@ -6535,13 +6536,13 @@ the wave 6 merge (`/tmp/opencode/m8/`; seed 2 rows `b-*` in `/tmp/opencode/r9-bu
   to it once rank 0 answers the ping; with the shed rule that costs no failed reads in any run.
 - Issue 53 is resolved with a bound rather than removed; the measured alternatives (no owner or
   no reader pings) fail more reads with hung members.
-- New Known issue 521 (the helper probe can take all of a reader's remaining credits), open.
+- New Known issue 60 (the helper probe can take all of a reader's remaining credits), open.
 - The simulator keeps one silence map per node; production keeps one per worker, so production
   sends up to one ping per worker where the simulator sends one per node (unchanged from hang2).
 
 ### Open issues after wave 7 (busy)
 
-47 (partly; 57), 55, 57, 58, 521.
+47 (partly; 57), 55, 57, 58, 60.
 
 ## Round 4: failover (wave 7)
 
