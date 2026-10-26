@@ -1184,6 +1184,7 @@ func buildWorkflow(run *signalv1.CertificationRun) (*unstructured.Unstructured, 
 
 	for index := range checks {
 		check := &checks[index]
+
 		participantsJSON, marshalErr := json.Marshal(run.Spec.Participants)
 		if marshalErr != nil {
 			return nil, fmt.Errorf("encode check %s participants: %w", check.ID, marshalErr)
