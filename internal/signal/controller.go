@@ -587,7 +587,7 @@ func selectParticipantPlan(
 	candidates []corev1.Node,
 	requestNodeName string,
 	count int32,
-	roles []signalv1.ParticipantRoleConstraint,
+	roles []signalv1.ParticipantRole,
 	topology []signalv1.ParticipantTopologyConstraint,
 ) ([]signalv1.Participant, error) {
 	assignments, err := solveParticipantRoles(
@@ -671,7 +671,7 @@ func solveParticipantRoles(
 	candidates []corev1.Node,
 	requestNodeName string,
 	participantCount int32,
-	roles []signalv1.ParticipantRoleConstraint,
+	roles []signalv1.ParticipantRole,
 	topology []signalv1.ParticipantTopologyConstraint,
 ) ([][]string, error) {
 	roleNames := make(map[string]struct{}, len(roles))
@@ -1126,15 +1126,6 @@ func (r *AdmissionReconciler) createSnapshot(
 		}
 
 		digest := digestString(content)
-		if check.Script.Digest != "" && digest != check.Script.Digest {
-			return nil, nil, fmt.Errorf(
-				"source script digest for check %s is %s, want %s",
-				check.ID,
-				digest,
-				check.Script.Digest,
-			)
-		}
-
 		key := fmt.Sprintf("%02d-%s", check.Order, sanitizeTaskName(string(check.ID)))
 
 		snapshot.Data[key] = content

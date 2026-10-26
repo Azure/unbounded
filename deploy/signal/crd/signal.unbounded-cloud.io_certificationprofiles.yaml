@@ -74,17 +74,11 @@ spec:
                       type: string
                     script:
                       properties:
-                        digest:
-                          description: Digest is the approved algorithm-qualified
-                            SHA-256 digest of the script bytes.
-                          pattern: ^sha256:[0-9a-f]{64}$
-                          type: string
                         key:
                           type: string
                         name:
                           type: string
                       required:
-                      - digest
                       - key
                       - name
                       type: object

@@ -11,14 +11,11 @@ import (
 type ScriptReference struct {
 	Name string `json:"name"`
 	Key  string `json:"key"`
-	// Digest is the approved algorithm-qualified SHA-256 digest of the script bytes.
-	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
-	Digest string `json:"digest"`
 }
 
 type CheckID string
 
-type ParticipantRoleConstraint struct {
+type ParticipantRole struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
@@ -101,7 +98,7 @@ type WorkloadPolicy struct {
 type CertificationProfileSpec struct {
 	Participants ParticipantPolicy `json:"participants"`
 	// +kubebuilder:validation:MaxItems=16
-	ParticipantRoles []ParticipantRoleConstraint `json:"participantRoles,omitempty"`
+	ParticipantRoles []ParticipantRole `json:"participantRoles,omitempty"`
 	// +kubebuilder:validation:MaxItems=16
 	TopologyConstraints []ParticipantTopologyConstraint `json:"topologyConstraints,omitempty"`
 	// +kubebuilder:validation:MinItems=15

@@ -78,7 +78,7 @@ Each check contains:
 
 | Field | Meaning |
 |---|---|
-| `script` | Source ConfigMap name, key, and approved SHA-256 digest |
+| `script` | Source ConfigMap name and key; admission snapshots the current bytes and computes their SHA-256 digest |
 | `runnerImage` | Digest-pinned check image |
 | `backend` | `Pod` or `MPIJob` |
 | `backendActiveDeadline` | Backend execution deadline |
