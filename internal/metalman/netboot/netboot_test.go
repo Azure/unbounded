@@ -1393,6 +1393,7 @@ func TestVendorDataTemplateScopesDefaultUserToHillsboroImage(t *testing.T) {
 			require.NoError(t, yaml.Unmarshal(result, &config))
 			_, found := config["users"]
 			require.Equal(t, !tt.preserveUsers, found)
+
 			if found {
 				require.Contains(t, string(result), "- name: unbounded-metal")
 			}
