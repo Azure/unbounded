@@ -927,7 +927,20 @@ Verified against the code at the start of this work.
    retry repeated this; now the retry visits ranks 1 and 2 first, so reads no longer fail, but
    the helper probe is still wasted: 197 of 2,446 helper probes miss in that run (seed 1).
    Funding the helper only from slack beyond what the next owner needs, or skipping a helper
-   whose route cannot be funded, would fix it. Open (round 4, busy, wave 7).
+   whose route cannot be funded, would fix it. Resolved: (round 4, helper, wave 8, 3aff29530)
+   the cause was the helper's route envelope, not its attempts. `helper_probe` partitioned
+   `HELPER_LINKS` (8) links but, unlike a funded owner probe (`child.note_route_failure()` in
+   `CandidateWalk::next`), left the child on a normal four-link route
+   (`AcquisitionBudget::route_links`), so a helper reached through a relay inherited two links.
+   The helper probe now forwards its whole funded envelope. 5k `zipf` at 16 MiB pages: helper
+   misses 195, 200, 171, 194 to 16, 16, 1, 32 (seeds 1 to 4); storm 18 to 0; 1 Gbit/s storm 51
+   to 0. Bound for the rest: a reader that rank 0 shed has 3 or 4 attempts left, and the
+   helper needs at least `HELPER_FLOOR_ATTEMPTS` (3) while rank 1 out of order needs
+   `owner_funding_min(1)` (3), so one walk cannot fund both; the helper is kept (Known issue
+   16) and a reader whose helper misses visits ranks 1 and 2 first on its retry (Known issue
+   54). Residual helper misses are at most 1.4% of helper probes in these runs, with 0 to 2
+   failed reads. Tests: `walk::tests::helper_probe_forwards_its_full_funded_envelope`,
+   `candidates::tests::shed_reader_asks_the_page_helper_once_then_the_other_owners`.
 
 ## Simulator engine (racer-sim substrate)
 
@@ -1484,9 +1497,10 @@ scenarios carry data-plane faults.
 59. Resolved with a bound: a minimum-funded owner sends at most one origin request, only with
    an owner's authority; its extra requests are newly served pages, failure retries and skips
    of a rank 0 behind a cut route, never a missed copy (round 4, funding, wave 8).
-60. A reader's overflow helper probe takes every attempt the reader has left (up to
-   `HELPER_ATTEMPTS`), so when the helper fails (here: its route to rank 0 has 2 links) the
-   reader cannot ask ranks 1 and 2 (round 4, busy, wave 7).
+60. Resolved: the helper probe now forwards its whole funded link envelope (it used a four-link
+   route, leaving a relayed helper 2 links); 5k `zipf` 16 MiB helper misses 195 to 16, and
+   the rest is bounded (one walk cannot fund both the helper and rank 1; the retry visits
+   ranks 1 and 2 first) (round 4, helper, wave 8, 3aff29530).
 
 ## Round 2: production admission
 
@@ -6867,3 +6881,85 @@ code changed (the 5k runs above match wave 7 exactly), so the wave 7 50k results
 
 None new. Known issue 60 belongs to the helper track.
 
+## Round 4: helper (wave 8)
+
+Branch `racer-sim10-helper` from racer-core-sim 2934d0301. Scratch, logs and reports:
+`/tmp/opencode/r10-helper/`.
+
+### Known issue 60: root cause
+
+A temporary sim counter (not committed) keyed each helper probe's outcome by the funding it
+carried and what the reader kept. In 5k `zipf` at 16 MiB pages (seed 1) every helper probe was
+funded with 8 links, and the reader kept 0 attempts in all of them, so "the helper takes all
+remaining attempts" was true of copies and misses alike. What separated the misses was the
+route: 194 of 195 misses came from readers that kept 4 links (they had not seen a route
+failure), against 1 of 1,525 from readers that kept 0.
+
+- `CandidateWalk::helper_probe` (`core/src/read/walk.rs:671`) partitions up to `HELPER_LINKS`
+  links into a child budget. `plan_attempt` sends a route of `route_links()` links
+  (`core/src/read/budget.rs:115`): 4 unless the budget saw a route failure. The helper's child
+  never did, so the request carried 4 links; one relay hop and `inherited_budget`'s `- 1` left
+  the helper 2, too few to reach rank 0 through a relay (route search `Unreachable`).
+- A funded owner probe already handles this: the non-owner marks the child
+  (`child.note_route_failure()`, `core/src/read/walk.rs:1030`) so the whole funded envelope is
+  forwarded. The helper probe, added later by the fanout track, did not.
+
+### Fix
+
+`helper_probe` marks its child the same way (`core/src/read/walk.rs:678`), so the helper
+receives every link it is funded with (`HELPER_FLOOR_LINKS` to `HELPER_LINKS`). No budget
+grows: the child's links come from the reader's partition, as before, and are only spent on
+this one route. Production runs the same walk (`src/read/candidates.rs`, `CandidateWalk::new`).
+`reunite` carries the child's route-failure flag back to the reader, as it does after a funded
+owner probe, so a reader whose helper missed routes its later probes with the full envelope.
+
+Tests (both fail before the fix):
+
+- `walk::tests::helper_probe_forwards_its_full_funded_envelope`: with 4, 8 and 16 links the
+  helper probe's route carries `min(links, HELPER_LINKS)` links.
+- `candidates::tests::shed_reader_asks_the_page_helper_once_then_the_other_owners` now
+  records each request's route links and asserts the helper's request carries more than
+  `NORMAL_ROUTE_LINKS`.
+
+### Bound for the remaining misses
+
+The attempts part of the issue is not changed. After rank 0 sheds a non-owner reader it has 3
+or 4 attempts left (all helper probes in the traced run). A helper probe needs at least
+`HELPER_FLOOR_ATTEMPTS` (3) and an out-of-order rank 1 needs `owner_funding_min(1)` (3), so one
+walk cannot fund both. Funding the helper only from slack beyond rank 1 would remove every
+helper here and give up Known issue 16. The helper is kept; when it misses, the read retries,
+and since Known issue 54 the retry visits ranks 1 and 2 before the shed rank 0. Remaining
+misses are helpers that do not get a copy in time (the owners shed the helper too, or its own
+walk fails), at most 1.4% of helper probes below, with failed reads unchanged (0 to 2).
+
+### Evidence
+
+Release, seed 1 unless noted, same configurations as wave 7. Reads ok / failed; origin
+requests, worst page, pages fetched more than once; then helper misses / helper probes.
+
+| Run | Wave 7 | Wave 8 helper |
+| --- | --- | --- |
+| 5k storm | 378,536 / 0; 1,024, 1, 0; 18 / 59,004 | 378,495 / 0; 1,024, 1, 0; 0 / 59,007 |
+| 5k zipf | 202,851 / 15; 40,404, 3, 1,452; 0 / 35 | 202,851 / 15; 40,404, 3, 1,452; 0 / 35 |
+| 5k zipf 16 MiB | 37,647 / 0; 17,824, 3, 140; 195 / 2,441 | 37,677 / 0; 17,850, 3, 164; 16 / 2,385 |
+| 5k zipf 16 MiB seed 2 | 37,917 / 2; 17,509, 3, 111; 200 / 2,376 | 37,924 / 1; 17,524, 3, 122; 16 / 2,328 |
+| 5k zipf 16 MiB seed 3 | 37,635 / 0; 17,779, -, -; 171 / 2,299 | 37,615 / 0; 17,792, -, -; 1 / 2,238 |
+| 5k zipf 16 MiB seed 4 | 38,021 / 1; 17,595, -, -; 194 / 2,466 | 37,960 / 2; 17,536, -, -; 32 / 2,434 |
+| 5k 1 Gbit/s storm | 95,107 / 0; 6,942, 2, 2; 51 / 72,217 | 95,106 / 0; 6,942, 2, 2; 0 / 72,157 |
+| 5k full-failover | 33,998 / 10; 12,999, 6, 327 | 33,998 / 10; 12,999, 6, 327 |
+
+- Seeds 3 and 4 were run for both binaries in this wave (the wave 7 binary from
+  `/tmp/opencode/m9/sim`); their worst page and repeat columns were not compared.
+- Overlapping origin requests (Known issue 31) at 5k `zipf` 16 MiB: 135, 108, 149, 137 to
+  160, 115, 148, 89 (seeds 1 to 4), within the seed-to-seed spread; silence pings 37,383 to
+  37,240 and peer messages 469,238 to 469,152 (seed 1).
+- The 1 Gbit/s storm's helper `Unreachable` answers (592 to 589) are timeouts, not route
+  funding, and are unchanged.
+- 5k `full-failover` and `zipf` are identical: helpers do not run there (or, in `zipf`, never
+  miss).
+- 50k `full-cold-start`: see below.
+
+Checks: `cargo fmt --check`, clippy `-D warnings`, workspace tests, DST seeds 1 to 20 native
+and non-native, 16-scenario smoke at 200 nodes (no invariant failures, `unexplained` 0).
+
+New issues: none.
