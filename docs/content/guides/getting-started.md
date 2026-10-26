@@ -76,9 +76,9 @@ chmod +x aks-quickstart.sh
 ```
 
 > The script creates an AKS cluster, adds a gateway node pool, runs
-> `kubectl unbounded install` to bootstrap the operator, then
-> `kubectl unbounded site init` to request the networking stack through the
-> cluster Site.
+> `kubectl unbounded install` to bootstrap the operator, then runs
+> `kubectl unbounded site init` once for the cluster Site and once for the
+> remote site, which requests the networking stack.
 
 | Flag | Description |
 |------|-------------|
@@ -237,10 +237,13 @@ If your remote site already has private L3 connectivity to the cluster (e.g. Azu
 
 ### Site Resources
 
+- **Site** -- defines network ranges; `site init` creates one per run, so the
+  script runs it for the AKS nodes (`cluster`) and for your remote site
 - **GatewayPool** (`gw-main`) -- selects gateway-labeled nodes for routing
-- **Site** -- defines network ranges; one for the AKS nodes (`cluster`), one
-  for your remote site
 - **SiteGatewayPoolAssignment** -- links each site to the gateway pool
+
+`site init` creates only the Sites; the script applies the GatewayPool and
+SiteGatewayPoolAssignments itself.
 
 ### Machina Controller and Bootstrap Token
 

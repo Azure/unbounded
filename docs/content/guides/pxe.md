@@ -32,8 +32,16 @@ Then enable metalman on a Site by passing `--enable-metalman` to `site init`, or
 setting the metalman entry in `Site.spec.components`:
 
 ```bash
-kubectl unbounded site init --name my-edge-site --enable-metalman
+kubectl unbounded site init \
+  --name my-edge-site \
+  --node-cidr 10.100.0.0/24 \
+  --pod-cidr 10.101.0.0/24 \
+  --enable-metalman
 ```
+
+`site init` creates one Site per run. If the cluster has no Sites yet, also run
+it once with `--name cluster` and the cluster's own node and pod CIDRs; see the
+[CLI reference]({{< relref "reference/cli#kubectl-unbounded-site-init" >}}).
 
 `kubectl unbounded site init` requires the operator to be installed first (the
 `kubectl unbounded install` step above), and errors otherwise. The operator then

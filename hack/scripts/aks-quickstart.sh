@@ -6,9 +6,11 @@
 # with gateway node pools and all required networking infrastructure.
 #
 # The script handles AKS infrastructure (resource group, cluster, gateway node
-# pool) and delegates Kubernetes-level setup to `kubectl unbounded site init`,
-# which installs unbounded-net, creates site resources, deploys the machina
-# controller, and generates bootstrap tokens.
+# pool) and delegates Kubernetes-level setup to `kubectl unbounded install`,
+# which bootstraps the unbounded-operator, and `kubectl unbounded site init`,
+# which creates one Site and its bootstrap token per run. It runs site init for
+# the reserved "cluster" Site and for the remote site, then routes both through
+# the gateway nodes with a GatewayPool and SiteGatewayPoolAssignments.
 #
 # Usage:
 #   aks-quickstart.sh create    [options]  Create a new AKS cluster from scratch
@@ -462,13 +464,59 @@ do_site_init() {
   log "Running kubectl unbounded install..."
   kubectl "${ctx_args[@]}" unbounded install
 
-  log "Running kubectl unbounded site init..."
+  # site init creates one Site per run: the reserved "cluster" Site for the
+  # AKS nodes, then the remote site.
+  log "Running kubectl unbounded site init for the cluster Site..."
+  kubectl "${ctx_args[@]}" unbounded site init \
+    --name cluster \
+    --node-cidr "$cluster_node_cidr" \
+    --pod-cidr "$cluster_pod_cidr"
+
+  log "Running kubectl unbounded site init for site '$site_name'..."
   kubectl "${ctx_args[@]}" unbounded site init \
     --name "$site_name" \
-    --cluster-node-cidr "$cluster_node_cidr" \
-    --cluster-pod-cidr "$cluster_pod_cidr" \
     --node-cidr "$remote_node_cidr" \
     --pod-cidr "$remote_pod_cidr"
+
+  # site init does not create gateway resources, so route both Sites through
+  # the gateway nodes the gwmain node pool labels. Applying under the field
+  # manager site init used for these objects lets re-runs, and clusters first
+  # set up by older releases, apply cleanly.
+  log "Applying the gw-main GatewayPool and SiteGatewayPoolAssignments..."
+  kubectl "${ctx_args[@]}" apply --server-side --field-manager=kubectl-unbounded -f - <<EOF
+apiVersion: net.unbounded-cloud.io/v1alpha1
+kind: GatewayPool
+metadata:
+  name: gw-main
+spec:
+  nodeSelector:
+    ${GATEWAY_LABEL%%=*}: "${GATEWAY_LABEL#*=}"
+  type: External
+---
+apiVersion: net.unbounded-cloud.io/v1alpha1
+kind: SiteGatewayPoolAssignment
+metadata:
+  name: cluster
+  labels:
+    unbounded-cloud.io/site: "cluster"
+spec:
+  sites:
+    - cluster
+  gatewayPools:
+    - gw-main
+---
+apiVersion: net.unbounded-cloud.io/v1alpha1
+kind: SiteGatewayPoolAssignment
+metadata:
+  name: ${site_name}
+  labels:
+    unbounded-cloud.io/site: "${site_name}"
+spec:
+  sites:
+    - ${site_name}
+  gatewayPools:
+    - gw-main
+EOF
 
   print_summary "$site_name"
 }
@@ -647,8 +695,9 @@ cmd_create() {
   # Step 6: Detect cluster CIDRs.
   detect_cluster_cidrs
 
-  # Step 7: Install the operator, then run site init (creates site resources,
-  # deploys machina). do_site_init runs `kubectl unbounded install` first.
+  # Step 7: Install the operator, create the cluster and remote Sites, and
+  # route them through the gateway nodes. do_site_init runs
+  # `kubectl unbounded install` first.
   do_site_init "$site_name" "$CLUSTER_NODE_CIDR" "$CLUSTER_POD_CIDR" "$CLUSTER_SERVICE_CIDR" "$remote_node_cidr" "$remote_pod_cidr"
 }
 
@@ -739,8 +788,9 @@ cmd_setup() {
   # Step 5: Detect cluster CIDRs.
   detect_cluster_cidrs
 
-  # Step 6: Install the operator, then run site init (creates site resources,
-  # deploys machina). do_site_init runs `kubectl unbounded install` first.
+  # Step 6: Install the operator, create the cluster and remote Sites, and
+  # route them through the gateway nodes. do_site_init runs
+  # `kubectl unbounded install` first.
   do_site_init "$site_name" "$CLUSTER_NODE_CIDR" "$CLUSTER_POD_CIDR" "$CLUSTER_SERVICE_CIDR" "$remote_node_cidr" "$remote_pod_cidr"
 }
 

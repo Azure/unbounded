@@ -499,13 +499,54 @@ jobs:
         if: env.MODE == 'init'
         run: |
           set -euo pipefail
+          # site init creates one Site per run: the reserved "cluster" Site for
+          # the cluster's own nodes, then the soak site.
+          ./bin/kubectl-unbounded site init \
+            --name cluster \
+            --node-cidr "${CLUSTER_NODE_CIDR}" \
+            --pod-cidr  "${CLUSTER_POD_CIDR}" \
+            --manage-cni-plugin="${MANAGE_CNI_PLUGIN}"
           ./bin/kubectl-unbounded site init \
             --name "${SITE_NAME}" \
-            --cluster-node-cidr "${CLUSTER_NODE_CIDR}" \
-            --cluster-pod-cidr  "${CLUSTER_POD_CIDR}" \
-            --node-cidr         "${SITE_NODE_CIDR}" \
-            --pod-cidr          "${SITE_POD_CIDR}" \
+            --node-cidr "${SITE_NODE_CIDR}" \
+            --pod-cidr  "${SITE_POD_CIDR}" \
             --manage-cni-plugin="${MANAGE_CNI_PLUGIN}"
+          # site init does not create gateway resources and forge only labels
+          # the gateway nodes, so route both Sites through them here.
+          kubectl apply --server-side --field-manager=kubectl-unbounded -f - <<EOF
+          apiVersion: net.unbounded-cloud.io/v1alpha1
+          kind: GatewayPool
+          metadata:
+            name: gw-main
+          spec:
+            nodeSelector:
+              unbounded-cloud.io/unbounded-net-gateway: "true"
+            type: External
+          ---
+          apiVersion: net.unbounded-cloud.io/v1alpha1
+          kind: SiteGatewayPoolAssignment
+          metadata:
+            name: cluster
+            labels:
+              unbounded-cloud.io/site: "cluster"
+          spec:
+            sites:
+              - cluster
+            gatewayPools:
+              - gw-main
+          ---
+          apiVersion: net.unbounded-cloud.io/v1alpha1
+          kind: SiteGatewayPoolAssignment
+          metadata:
+            name: ${SITE_NAME}
+            labels:
+              unbounded-cloud.io/site: "${SITE_NAME}"
+          spec:
+            sites:
+              - ${SITE_NAME}
+            gatewayPools:
+              - gw-main
+          EOF
 
       - name: Fetch deploy tooling from the workflow's own commit
         # The job's primary checkout is pinned to the resolved SNAPSHOT commit,

@@ -2,8 +2,8 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
-# get-aks-cluster-cidrs.sh -- Detect CIDRs for an AKS cluster and print a
-# ready-to-paste "kubectl unbounded site init" command.
+# get-aks-cluster-cidrs.sh -- Detect CIDRs for an AKS cluster and print
+# ready-to-paste "kubectl unbounded site init" commands.
 #
 # All options are optional for a standard AKS cluster connected to the current
 # kubeconfig context. Subscription, resource group, and cluster name are
@@ -173,8 +173,8 @@ SERVICE_CIDR="${_cidrs[1]:-}"
 [[ "$POD_CIDR" == "None" ]]     && POD_CIDR=""
 [[ "$SERVICE_CIDR" == "None" ]] && SERVICE_CIDR=""
 
-[[ -z "$POD_CIDR" ]]     && die "cluster has no pod CIDR in its network profile (possibly BYO CNI). Pass --cluster-pod-cidr explicitly to kubectl unbounded site init."
-[[ -z "$SERVICE_CIDR" ]] && die "could not determine service CIDR from AKS network profile. Pass --cluster-service-cidr explicitly to kubectl unbounded site init."
+[[ -z "$POD_CIDR" ]]     && die "cluster has no pod CIDR in its network profile (possibly BYO CNI). Pass the cluster's pod CIDR to 'kubectl unbounded site init --name cluster --pod-cidr' yourself."
+[[ -z "$SERVICE_CIDR" ]] && die "could not determine service CIDR from AKS network profile."
 
 # ip4_to_int <a.b.c.d> - print the IPv4 address as a decimal integer.
 ip4_to_int() {
@@ -218,7 +218,7 @@ NODE_CIDR=$(az network vnet list \
     subnet_contains_all "$prefix" "$NODE_IPS" && echo "$prefix" && break
   done)
 
-[[ -z "$NODE_CIDR" ]] && die "could not find a VNet subnet containing all node IPs. Pass --cluster-node-cidr explicitly to kubectl unbounded site init."
+[[ -z "$NODE_CIDR" ]] && die "could not find a VNet subnet containing all node IPs. Pass the cluster's node CIDR to 'kubectl unbounded site init --name cluster --node-cidr' yourself."
 
 # ── print results ─────────────────────────────────────────────────────────────
 
@@ -229,18 +229,30 @@ printf "  %-26s %s\n" "Cluster node CIDR:"    "$NODE_CIDR"
 printf "  %-26s %s\n" "Cluster pod CIDR:"     "$POD_CIDR"
 printf "  %-26s %s\n" "Cluster service CIDR:" "$SERVICE_CIDR"
 echo
-echo "Run the following to initialize an unbounded site."
+echo "Run the following to initialize the cluster Site and a remote site."
 echo "Edit <SITE-NAME>, <REMOTE-NODE-CIDR>, and <REMOTE-POD-CIDR> before running:"
 echo
 echo "  # Bootstrap the unbounded-operator first; 'site init' requires it and"
 echo "  # errors if it is not installed."
 echo "  kubectl unbounded install"
 echo
+echo "  # site init creates one Site per run. First the cluster's own nodes:"
+echo "  kubectl unbounded site init \\"
+echo "    --name cluster \\"
+printf "    --node-cidr %s \\\\\n" "$NODE_CIDR"
+printf "    --pod-cidr  %s\n" "$POD_CIDR"
+echo
+echo "  # Then the remote site:"
 echo "  kubectl unbounded site init \\"
 echo "    --name <SITE-NAME> \\"
-printf "    --cluster-node-cidr    %-20s\\\\\n" "$NODE_CIDR"
-printf "    --cluster-pod-cidr     %-20s\\\\\n" "$POD_CIDR"
-printf "    --cluster-service-cidr %-20s\\\\\n" "$SERVICE_CIDR"
 echo "    --node-cidr <REMOTE-NODE-CIDR> \\"
 echo "    --pod-cidr  <REMOTE-POD-CIDR>"
+echo
+echo "  # Route both Sites through the gateway nodes:"
+echo "  kubectl unbounded net create gatewaypool gw-main --type External \\"
+echo "    --node-selector unbounded-cloud.io/unbounded-net-gateway=true"
+echo "  kubectl unbounded net create sitegatewaypoolassignment cluster \\"
+echo "    --site cluster --gateway-pool gw-main"
+echo "  kubectl unbounded net create sitegatewaypoolassignment <SITE-NAME> \\"
+echo "    --site <SITE-NAME> --gateway-pool gw-main"
 echo

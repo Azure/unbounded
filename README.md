@@ -99,9 +99,9 @@ chmod +x aks-quickstart.sh
 ```
 
 > The script creates an AKS cluster, adds a gateway node pool, runs
-> `kubectl unbounded install` to bootstrap the operator, then
-> `kubectl unbounded site init` to request the networking stack through the
-> cluster Site.
+> `kubectl unbounded install` to bootstrap the operator, then runs
+> `kubectl unbounded site init` once for the cluster Site and once for the
+> remote site, which requests the networking stack.
 
 ### 3. Add a remote node
 

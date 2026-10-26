@@ -44,8 +44,9 @@ wg --version
 6. **Verify Connectivity**: Test with pod-to-pod ping across sites.
 
 > **Note:** After `kubectl unbounded install` bootstraps the operator,
-> `kubectl unbounded site init` creates the initial Site and gateway resources
-> (steps 2-4) and lets the operator deploy controller and node workloads. See the
+> `kubectl unbounded site init` creates the Sites (step 2), one per run, and lets
+> the operator deploy controller and node workloads. Create the gateway
+> resources (steps 3-4) with `kubectl unbounded net create`. See the
 > [Getting Started guide]({{< relref "guides/getting-started" >}}).
 
 ---
