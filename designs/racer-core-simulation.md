@@ -1,6 +1,6 @@
 # Racer core simulation
 
-Status: in progress.
+Status: in progress. Known issues 1 to 60 are all resolved as of "Round 4: combined (wave 8)".
 
 ## Summary
 
@@ -6964,3 +6964,66 @@ Checks: `cargo fmt --check`, clippy `-D warnings`, workspace tests, DST seeds 1 
 and non-native, 16-scenario smoke at 200 nodes (no invariant failures, `unexplained` 0).
 
 New issues: none.
+
+## Round 4: combined (wave 8)
+
+Branch `racer-sim10-merge` from racer-core-sim 2934d0301, with the funding and helper tracks
+cherry-picked in that order. Logs, reports and the binary: `/tmp/opencode/m10/`. The track
+sections above cite commit IDs from the track branches.
+
+### Merge
+
+- Code merged without conflicts (funding adds a comment on `walk::shared_share_short` and a
+  test; helper changes `Walk::helper_probe`). Only this document conflicted: the summary Known
+  issues list (funding's line for 59 and helper's line for 60 kept) and the two track sections
+  (both kept, in merge order).
+
+### Interplay
+
+- The helper fix calls `note_route_failure` on the helper's child budget, and
+  `AcquisitionBudget::reunite` ORs the child's `failed_route` back into the reader's budget
+  (`core/src/read/budget.rs`), so after a helper probe the reader's later probes route with up
+  to 8 links. `shared_share_short` looks only at attempts, so the in-order funding decision is
+  unchanged; and the helper runs only after rank 0 shed the reader, which sets
+  `CandidateWalk::saw_busy`, so the in-order exception is already off for that walk. In
+  `full-failover` the helper does not run at all: 5k seeds 1 to 3 and 50k seed 1 are identical
+  to wave 7 (failed, origin, worst page, `copy_held`), and
+  `walk::tests::a_minimum_funded_owner_fetches_at_most_once_and_only_with_authority` passes.
+- 5k `zipf` at 16 MiB pages matches the helper track exactly (helper misses 195 to 16,
+  overlapping origin requests 135 to 160, within the seed spread recorded there).
+
+### Evidence
+
+Release, seed 1 unless noted, same configurations as wave 7. Reads ok / failed; origin
+requests, worst page, pages fetched more than once. No invariant failures; `unexplained` 0 in
+every run, including the 16-scenario smoke at 200 nodes.
+
+| Run | Wave 7 | Wave 8 |
+| --- | --- | --- |
+| 5k storm | 378,536 / 0; 1,024, 1, 0 | 378,495 / 0; 1,024, 1, 0 |
+| 5k zipf | 202,851 / 15; 40,404, 3, 1,452 | 202,851 / 15; 40,404, 3, 1,452 |
+| 5k churn | 291,476 / 93; 1,025, 2, 1 | 291,446 / 92; 1,027, 2, 3 |
+| 5k zipf 16 MiB | 37,647 / 0; 17,824, 3, 140 | 37,677 / 0; 17,850, 3, 164 |
+| 5k zipf 16 MiB seed 2 | 37,917 / 2; 17,509, 3, 111 | 37,924 / 1; 17,524, 3, 122 |
+| 5k 1 Gbit/s storm | 95,107 / 0; 6,942, 2, 2 | 95,106 / 0; 6,942, 2, 2 |
+| 5k full-cold-start | 95,107 / 0; 6,942, 2, 2 | 95,107 / 0; 6,942, 2, 2 |
+| 5k full-failover | 33,998 / 10; 12,999, 6, 327 | 33,998 / 10; 12,999, 6, 327 |
+| 5k full-failover seed 2 | 33,758 / 15; 12,989, 6, 361 | 33,758 / 15; 12,989, 6, 361 |
+| 5k full-failover seed 3 | 33,613 / 17; 12,921, 5, 307 | 33,613 / 17; 12,921, 5, 307 |
+| 5k full-churn | 34,073 / 0; 12,638, 4, 91 | 34,073 / 0; 12,638, 4, 91 |
+| 5k zipf, 50 hung members | 30,647 / 2; 11,858, 2, 27 | 30,647 / 2; 11,858, 2, 27 |
+| 50k full-cold-start | 912,774 / 0; 27,158, 3, 194 | 912,776 / 0; 27,158, 3, 194 |
+| 50k full-failover | 303,383 / 152; 47,479, 9, 2,115 | 303,383 / 152; 47,479, 9, 2,115 |
+
+- 5k `zipf` at 16 MiB: helper probes 2,441 to 2,385, misses 195 to 16; silence pings 37,383
+  to 37,240; peer messages 469,238 to 469,152.
+- The storm and churn runs complete a few fewer reads with no more failed (reads still in
+  flight at the end), as in the helper track.
+- 50k `full-cold-start`: wall 22:20, peak RSS 4.6 GiB. 50k `full-failover`: `copy_held` 623,
+  wall 30:05, peak RSS 3.3 GiB.
+- `cargo fmt --check`, `clippy --workspace --all-targets -D warnings` and the workspace tests
+  pass. DST `dst_generated_traffic_churn_oracle` and its native variant pass for seeds 1 to 20.
+
+### Open issues after wave 8
+
+None. Known issues 1 to 60 are all resolved (59 with a stated, tested bound).
