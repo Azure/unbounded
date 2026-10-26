@@ -4,7 +4,7 @@
 // The attribute below also marks this file as test-only for tests/purity.rs.
 #[cfg(test)]
 use super::*;
-use crate::read::candidates::{ReplicaSelection, visit_order};
+use crate::read::candidates::{Answering, ReplicaSelection, demote_unanswered, visit_order};
 use crate::read::fanout::{
     HELPER_ATTEMPTS, HELPER_FLOOR_ATTEMPTS, HELPER_FLOOR_LINKS, HELPER_LINKS, HELPER_MIN_ATTEMPTS,
 };
@@ -2445,5 +2445,69 @@ fn a_busy_owner_keeps_the_next_in_order_owner_on_its_share() {
             remote,
             "{outcome:?}"
         );
+    }
+}
+
+#[test]
+fn a_shed_demoted_rank0_never_grows_budgets_per_hop() {
+    // Wave 7 merge: Known issue 54 demotes an owner that shed this node
+    // (`Silence::shed`) behind the other owners, so ranks 1 and 2 are
+    // visited first, out of order, and funded by their canonical rank.
+    // Known issue 57's in-order funding never applies to them there
+    // (canonical > index), and no hop carries more than its sender had.
+    let answering = |r: usize| {
+        if r == 0 {
+            Answering::Unanswered
+        } else {
+            Answering::Answers
+        }
+    };
+    for links in [7, 16] {
+        for attempts in 1..=8 {
+            for outcome in [Outcome::Shed, Outcome::Failed, Outcome::TimedOut] {
+                let order = demote_unanswered(VisitOrder::canonical(3), answering);
+                let mut walk = CandidateWalk::new(config(None, 3, order));
+                let mut b = budget(attempts, links);
+                let mut visited = Vec::new();
+                loop {
+                    let (before_attempts, before_links) =
+                        (b.remaining_attempts(), b.remaining_links());
+                    let Ok(Step::Probe(probe)) = walk.next(&mut b) else {
+                        break;
+                    };
+                    let deadline = b.deadline();
+                    let Ok(plan) = plan_attempt(
+                        walk.request_budget(&mut b),
+                        AttemptInputs {
+                            now: Instant::now(),
+                            caller_deadline: deadline,
+                            remaining_opportunities: probe.remaining_opportunities,
+                            attempt_timeout: Duration::from_secs(1),
+                            mode: probe.mode,
+                            route: probe.route,
+                            failure_links: 8,
+                        },
+                    ) else {
+                        // Not affordable: nothing is sent.
+                        break;
+                    };
+                    assert!(
+                        plan.remote_attempts < before_attempts,
+                        "{attempts} {outcome:?}"
+                    );
+                    assert!(plan.links <= before_links, "{attempts} {outcome:?}");
+                    assert!(b.remaining_attempts() < before_attempts);
+                    visited.push(probe.canonical);
+                    if walk.complete(&mut b, outcome).is_err() {
+                        break;
+                    }
+                }
+                // With too few attempts to fund rank 1, the walk may ask the
+                // demoted rank 0 first (a copy probe); otherwise it does not.
+                if attempts >= owner_funding(1) {
+                    assert_ne!(visited.first(), Some(&0), "{attempts} {links} {outcome:?}");
+                }
+            }
+        }
     }
 }
