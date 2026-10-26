@@ -269,7 +269,9 @@ func TestMediaFirstBootIgnoresForwardedLease(t *testing.T) {
 
 	w = httptest.NewRecorder()
 	h.handleCloudInitLog(w, r)
-	require.Equal(t, http.StatusNotFound, w.Code)
+	// The peer is not a Machine, so the report is acknowledged but not recorded.
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Empty(t, h.StatusRecorder.(*recordingStatusRecorder).conditionEvents())
 	o, claimed, err := h.Media.firstBootOwner(t.Context(), "192.0.2.20")
 	require.NoError(t, err)
 	require.True(t, claimed)
@@ -322,6 +324,12 @@ func TestMediaPathAliasesAuthorization(t *testing.T) {
 
 				want := http.StatusNotFound
 				if firstBoot && !forged {
+					want = http.StatusOK
+				}
+
+				// Forwarded headers are ignored. Log reports from a peer that is
+				// not a Machine are acknowledged but never recorded.
+				if forged && endpoint.body != "" && endpoint.path != "/pxe/disable" {
 					want = http.StatusOK
 				}
 
@@ -436,7 +444,14 @@ func TestFirstBootForwardedAuthorization(t *testing.T) {
 							h.Media = nil
 						}
 
+						remote = "192.0.2.99"
 						want, legacyReport = http.StatusOK, true
+					}
+
+					// Forwarded headers are ignored. A report from a peer that
+					// is not a Machine is acknowledged but never recorded.
+					if remote == "192.0.2.30" && endpoint.body != "" {
+						want = http.StatusOK
 					}
 
 					require.NoError(t, fc.Update(t.Context(), m))
@@ -530,18 +545,20 @@ func TestMediaArtifactForwardedAuthorization(t *testing.T) {
 				for path, content := range files {
 					t.Run(path, func(t *testing.T) {
 						ip := m.Spec.Netboot().DHCPLeases[0].IPv4
+						// X-Forwarded-For is ignored, so a spoofed lease never
+						// grants a non-Machine peer access to Machine artifacts.
 						for _, forwarded := range []string{ip, " " + ip + ", 192.0.2.31"} {
 							w := firstBootRequest(h, "/"+path, "192.0.2.30", "", forwarded)
-							require.Equal(t, want, w.Code, w.Body.String())
-
-							if want == http.StatusOK {
-								require.Equal(t, string(content), w.Body.String())
-							}
+							require.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
 						}
 
 						if scenario != "active media" {
 							w := firstBootRequest(h, "/"+path, ip, "")
 							require.Equal(t, want, w.Code, w.Body.String())
+
+							if want == http.StatusOK {
+								require.Equal(t, string(content), w.Body.String())
+							}
 						}
 					})
 				}

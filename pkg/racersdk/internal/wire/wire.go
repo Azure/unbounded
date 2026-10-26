@@ -597,7 +597,7 @@ func singletonHeader(name string) bool {
 	switch name {
 	case "host", "content-length", "content-type", "content-range", "etag", "if-match", "range",
 		"racer-expires-at", "racer-retain-until", "racer-content-type", "racer-metadata", "authorization", "racer-object-length",
-		"racer-range-start", "racer-range-end", "racer-page-credits", "racer-byte-credits", "racer-ordered":
+		"racer-cache", "racer-range-start", "racer-range-end", "racer-page-credits", "racer-byte-credits":
 		return true
 	default:
 		return false
@@ -618,7 +618,7 @@ func HeadHeaders(head []byte) http.Header {
 		switch strings.ToLower(name) {
 		case "content-length", "content-range", "range", "racer-expires-at", "racer-retain-until",
 			"racer-object-length", "racer-range-start", "racer-range-end",
-			"racer-page-credits", "racer-byte-credits", "racer-ordered":
+			"racer-page-credits", "racer-byte-credits":
 			value = strings.TrimPrefix(value, " ")
 		default:
 			value = strings.Trim(value, " \t")
@@ -659,6 +659,9 @@ type Request struct {
 	RetainSeconds                  uint64
 	Range                          Range
 	AdapterMetadata, Authorization string `json:"-"`
+	// CacheUID is the Racer-Cache header: the ClusterCache UID the dataplane
+	// expects the origin to serve. Empty when the header is absent.
+	CacheUID string `json:"-"`
 }
 
 // Format redacts request data using the SDK's diagnostic convention.
@@ -756,6 +759,7 @@ func requestFields(h http.Header) (Request, error) {
 		{"Racer-Metadata", &result.AdapterMetadata, ValidateOpaque},
 		{"Authorization", &result.Authorization, ValidateOpaque},
 		{"If-Match", &result.Pin, ValidateETag},
+		{"Racer-Cache", &result.CacheUID, ValidateOpaque},
 	} {
 		if values, ok := h[field.name]; ok {
 			*field.dest = values[0]
@@ -1210,26 +1214,21 @@ func OriginResponse(request Request, m Metadata) (Response, error) {
 
 // SubscriptionOptions carries the requested range, credits, and trusted snapshot.
 type SubscriptionOptions struct {
-	Offset, Length       uint64
-	PageCredits          int
-	ByteCredits          uint64
-	Ordered, SmallObject bool
-	Pin                  string
-	Metadata             *Metadata
+	Offset, Length uint64
+	PageCredits    int
+	ByteCredits    uint64
+	SmallObject    bool
+	Pin            string
+	Metadata       *Metadata
 }
 
 // SubscriptionHead builds the client POST envelope after SDK option validation.
 func SubscriptionHead(r Request, o SubscriptionOptions) ([]byte, error) {
 	var b strings.Builder
 
-	ordered := 0
-	if o.Ordered {
-		ordered = 1
-	}
-
 	fmt.Fprintf(&b, "POST %s%s HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\n"+
-		"Racer-Page-Credits: %d\r\nRacer-Byte-Credits: %d\r\nRacer-Ordered: %d\r\n",
-		ObjectPrefix, hex.EncodeToString(r.Key[:]), o.PageCredits, o.ByteCredits, ordered)
+		"Racer-Page-Credits: %d\r\nRacer-Byte-Credits: %d\r\n",
+		ObjectPrefix, hex.EncodeToString(r.Key[:]), o.PageCredits, o.ByteCredits)
 
 	if o.Offset != 0 || o.Length != 0 {
 		fmt.Fprintf(&b, "Range: bytes=%d-", o.Offset)
@@ -1380,7 +1379,7 @@ func validateSubscriptionSelection(m Metadata, first, end uint64, o Subscription
 type SubscriptionRequest struct {
 	Request                  Request
 	First, End               uint64
-	Ranged, Ordered          bool
+	Ranged                   bool
 	PageCredits, ByteCredits uint64
 }
 
@@ -1399,7 +1398,7 @@ func ParseSubscriptionRequest(r *http.Request) (SubscriptionRequest, error) {
 
 	for _, name := range []string{
 		"Content-Length", "If-Match", "Range", "Racer-Page-Credits", "Racer-Byte-Credits",
-		"Racer-Ordered", "Racer-Metadata", "Authorization",
+		"Racer-Metadata", "Authorization",
 	} {
 		if len(r.Header.Values(name)) > 1 {
 			return s, bad
@@ -1458,12 +1457,6 @@ func (s *SubscriptionRequest) parseCredits(h http.Header) error {
 			*credit.dest = n
 		}
 	}
-
-	if values, ok := h["Racer-Ordered"]; ok && values[0] != "0" && values[0] != "1" {
-		return bad
-	}
-
-	s.Ordered = h.Get("Racer-Ordered") == "1"
 
 	return nil
 }
@@ -1609,12 +1602,14 @@ type pageInterval struct{ first, end uint64 }
 // Counts advance on accepted headers; callers must consume each payload before the next.
 type Sequence struct {
 	first, end, pages, delivered, bytes uint64
-	ordered, complete                   bool
+	complete                            bool
 	intervals                           []pageInterval
 }
 
-func NewSequence(first, end uint64, ordered bool) *Sequence {
-	return &Sequence{first: first, end: end, pages: PageCount(first, end), ordered: ordered}
+// NewSequence tracks one subscription range. Pages must arrive strictly in order:
+// the server may fetch out of order, but it always delivers in page order.
+func NewSequence(first, end uint64) *Sequence {
+	return &Sequence{first: first, end: end, pages: PageCount(first, end)}
 }
 
 // Intervals reports bounded tracking storage for diagnostics after a receive operation.
@@ -1659,7 +1654,7 @@ func (s *Sequence) Accept(f Frame, operation string) error {
 	start := max(s.first, f.Number*PageSize)
 
 	end := min(s.end, (f.Number+1)*PageSize)
-	if f.Offset != start || uint64(f.Length) != end-start || s.ordered && f.Number != s.first/PageSize+s.delivered {
+	if f.Offset != start || uint64(f.Length) != end-start || f.Number != s.first/PageSize+s.delivered {
 		return bad
 	}
 

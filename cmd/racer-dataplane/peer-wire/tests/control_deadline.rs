@@ -92,7 +92,7 @@ fn head_and_sign_reject_unmappable_deadlines() {
         .sign(
             &signatures,
             signatures.node(),
-            Phase::Accept,
+            Phase::Finish,
             &[0; 32],
             0,
             vec![],
@@ -105,14 +105,14 @@ fn head_and_sign_reject_unmappable_deadlines() {
         ));
         let binding = binding(deadline);
         assert!(matches!(
-            binding.head(Phase::Accept, &[0; 32], 0, vec![]),
+            binding.head(Phase::Finish, &[0; 32], 0, vec![]),
             Err(Error::Runtime(uring_runtime::Error::InvalidInput))
         ));
         assert!(matches!(
             binding.sign(
                 &signatures,
                 signatures.node(),
-                Phase::Accept,
+                Phase::Finish,
                 &[0; 32],
                 0,
                 vec![]
@@ -131,7 +131,7 @@ fn representable_deadline_boundaries_preserve_verification_policy() {
             Ok(deadline)
         );
         let binding = binding(deadline);
-        let head = binding.head(Phase::Accept, &[0; 32], 0, vec![]).unwrap();
+        let head = binding.head(Phase::Finish, &[0; 32], 0, vec![]).unwrap();
         assert_eq!(
             head.unique("racer-payload-deadline").unwrap(),
             Some(deadline.to_string().as_bytes())
@@ -140,7 +140,7 @@ fn representable_deadline_boundaries_preserve_verification_policy() {
             .sign(
                 &signatures,
                 signatures.node(),
-                Phase::Accept,
+                Phase::Finish,
                 &[0; 32],
                 0,
                 vec![],
@@ -150,14 +150,14 @@ fn representable_deadline_boundaries_preserve_verification_policy() {
             &signatures,
             signatures.node(),
             signed,
-            &[Phase::Accept],
+            &[Phase::Finish],
             &[0; 32],
             0,
         );
         if deadline == 0 {
             assert!(matches!(verified, Err(Error::DeadlineExceeded)));
         } else {
-            assert_eq!(verified.unwrap().1, Phase::Accept);
+            assert_eq!(verified.unwrap().1, Phase::Finish);
         }
     }
 }
@@ -170,7 +170,7 @@ fn future_deadline_signs_and_verifies() {
         .sign(
             &signatures,
             signatures.node(),
-            Phase::Accept,
+            Phase::Finish,
             &[0; 32],
             0,
             vec![],
@@ -183,12 +183,12 @@ fn future_deadline_signs_and_verifies() {
                 &signatures,
                 signatures.node(),
                 signed,
-                &[Phase::Accept],
+                &[Phase::Finish],
                 &[0; 32],
                 0
             )
             .unwrap()
             .1,
-        Phase::Accept
+        Phase::Finish
     );
 }

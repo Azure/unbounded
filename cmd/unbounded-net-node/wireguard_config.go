@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sort"
@@ -94,15 +95,20 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 	// removeUnmanagedWireGuardInterfaces handles both cases by listing wg*
 	// links and deleting any that aren't in desiredGatewayIfaces.
 	if len(peers) == 0 && len(gatewayPeers) == 0 {
+		var cleanupErr error
+
 		if state.linkManager.Exists() {
 			klog.Infof("No WireGuard peers -- removing mesh interface %s", iface)
 
 			if err := state.linkManager.DeleteLink(); err != nil {
-				klog.V(2).Infof("Failed to remove unused WireGuard interface %s: %v", iface, err)
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove unused WireGuard interface %s: %w", iface, err))
 			}
 		}
 		// Tear down any tracked or kernel-resident gateway wg* interfaces.
-		removeUnmanagedWireGuardInterfaces(cfg, state, nil, iface)
+		cleanupErr = errors.Join(cleanupErr, removeUnmanagedWireGuardInterfaces(cfg, state, nil, iface))
+		if cleanupErr == nil && cfg.EnablePolicyRouting && state.gatewayPolicyManager != nil {
+			cleanupErr = errors.Join(cleanupErr, state.gatewayPolicyManager.ReconcileExpectedInterfaces(nil))
+		}
 		// Sync routes (clear WG routes, keep any GENEVE/IPIP additional routes)
 		if state.routeManager != nil {
 			if state.netlinkCache != nil {
@@ -110,7 +116,7 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 			}
 
 			if err := state.routeManager.SyncRoutes(additionalRoutes); err != nil {
-				klog.Errorf("Failed to sync routes: %v", err)
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("sync routes during WireGuard teardown: %w", err))
 			}
 
 			if state.netlinkCache != nil {
@@ -123,7 +129,7 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 			for peerName := range state.healthCheckManager.GetAllPeerStatuses() {
 				if !geneveHCPeers[peerName] {
 					if err := state.healthCheckManager.RemovePeer(peerName); err != nil {
-						klog.V(2).Infof("Healthcheck: failed to remove stale peer %s: %v", peerName, err)
+						cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove stale healthcheck peer %s: %w", peerName, err))
 					} else {
 						klog.V(4).Infof("Healthcheck: removed stale peer %s", peerName)
 					}
@@ -131,7 +137,7 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 			}
 		}
 
-		return nil
+		return cleanupErr
 	}
 
 	// Ensure WireGuard interface exists using netlink
@@ -271,6 +277,9 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 	if err := state.linkManager.SetLinkUp(); err != nil {
 		return fmt.Errorf("failed to bring up WireGuard interface: %w", err)
 	}
+
+	// A delegated CNI can reset default.rp_filter after our init container.
+	disableRPFilter(iface)
 
 	// Accept forwarded traffic arriving on the mesh WG interface.
 	if state.forwardManager != nil {
@@ -477,6 +486,8 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 			continue
 		}
 
+		disableRPFilter(gwIfaceName)
+
 		// Accept forwarded traffic arriving on the gateway WG interface.
 		if state.forwardManager != nil {
 			state.forwardManager.EnsureInterface(gwIfaceName)
@@ -490,8 +501,7 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 		// This ensures return traffic leaves via the same interface it arrived on
 		if cfg.EnablePolicyRouting && state.gatewayPolicyManager != nil {
 			if err := state.gatewayPolicyManager.ConfigureInterface(gwIfaceName, gwPort); err != nil {
-				klog.Warningf("Failed to configure policy routing for %s: %v", gwIfaceName, err)
-				// Continue - policy routing is not critical
+				return fmt.Errorf("configure policy routing for %s: %w", gwIfaceName, err)
 			}
 		}
 
@@ -545,7 +555,20 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 		}
 	}
 
-	for ifaceName := range staleGatewayIfaces {
+	// Remove old gateway interfaces that are no longer needed
+	for ifaceName, linkManager := range staleGatewayIfaces {
+		klog.Infof("Removing unused gateway interface %s", ifaceName)
+
+		if cfg.EnablePolicyRouting && state.gatewayPolicyManager != nil {
+			if err := state.gatewayPolicyManager.RemoveInterface(ifaceName); err != nil {
+				return fmt.Errorf("remove policy routing for %s: %w", ifaceName, err)
+			}
+		}
+
+		if err := linkManager.DeleteLink(); err != nil {
+			return fmt.Errorf("delete gateway interface %s: %w", ifaceName, err)
+		}
+
 		delete(state.gatewayLinkManagers, ifaceName)
 		delete(state.gatewayWireguardManagers, ifaceName)
 		delete(state.gatewayHealthEndpoints, ifaceName)
@@ -553,21 +576,6 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 		delete(state.gatewayRouteDistances, ifaceName)
 		delete(state.gatewaySiteCIDRs, ifaceName)
 		delete(state.gatewayPodCIDRs, ifaceName)
-	}
-
-	// Remove old gateway interfaces that are no longer needed
-	for ifaceName, linkManager := range staleGatewayIfaces {
-		klog.Infof("Removing unused gateway interface %s", ifaceName)
-
-		if cfg.EnablePolicyRouting && state.gatewayPolicyManager != nil {
-			if err := state.gatewayPolicyManager.RemoveInterface(ifaceName); err != nil {
-				klog.Warningf("Failed to remove policy routing for %s: %v", ifaceName, err)
-			}
-		}
-
-		if err := linkManager.DeleteLink(); err != nil {
-			klog.Warningf("Failed to delete gateway interface %s: %v", ifaceName, err)
-		}
 
 		if state.forwardManager != nil {
 			state.forwardManager.RemoveInterface(ifaceName)
@@ -580,13 +588,15 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 
 	if cfg.EnablePolicyRouting && state.gatewayPolicyManager != nil {
 		if err := state.gatewayPolicyManager.ReconcileExpectedInterfaces(desiredGatewayPolicyTables); err != nil {
-			klog.Warningf("Failed to reconcile gateway policy routing chains: %v", err)
+			return fmt.Errorf("reconcile gateway policy routing chains: %w", err)
 		}
 	}
 
 	// Full ownership reconcile: remove any unmanaged wg* interfaces not present
 	// in the current desired map (mesh interface + desired gateway interfaces).
-	removeUnmanagedWireGuardInterfaces(cfg, state, desiredGatewayIfaces, iface)
+	if err := removeUnmanagedWireGuardInterfaces(cfg, state, desiredGatewayIfaces, iface); err != nil {
+		return err
+	}
 
 	// === Sync all routes via unified route manager (netlink) ===
 	// This handles intra-site routes on the mesh interface, gateway-specific routes on gateway interfaces,

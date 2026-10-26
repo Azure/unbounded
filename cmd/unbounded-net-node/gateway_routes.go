@@ -298,9 +298,13 @@ func buildGatewayNodeRoutesForAssignedSitesStatus(
 	return merged
 }
 
-func syncGatewayNodeRoutesStatus(ctx context.Context, dynamicClient dynamic.Interface, gatewayNodeInformer cache.SharedIndexInformer, nodeName string, routes map[string]unboundednetv1alpha1.GatewayNodeRoute) error {
+func syncGatewayNodeRoutesStatus(ctx context.Context, dynamicClient dynamic.Interface, gatewayNodeInformer cache.SharedIndexInformer, nodeName string, routes map[string]unboundednetv1alpha1.GatewayNodeRoute, forwardingMTU int) error {
 	if dynamicClient == nil || nodeName == "" {
 		return nil
+	}
+
+	if forwardingMTU <= 0 || forwardingMTU > 65535 {
+		return fmt.Errorf("invalid gateway forwarding MTU %d", forwardingMTU)
 	}
 
 	// Build the routes patch. MergePatch preserves map keys that are absent
@@ -331,12 +335,29 @@ func syncGatewayNodeRoutesStatus(ctx context.Context, dynamicClient dynamic.Inte
 
 	statusPatch := map[string]interface{}{
 		"status": map[string]interface{}{
-			"lastUpdated": time.Now().UTC().Format(time.RFC3339),
-			"routes":      routesPatch,
+			"lastUpdated":   time.Now().UTC().Format(time.RFC3339),
+			"routes":        routesPatch,
+			"forwardingMTU": forwardingMTU,
 		},
 	}
 
 	return patchGatewayNodeStatus(ctx, dynamicClient, nodeName, statusPatch)
+}
+
+// clearGatewayNodeRoutesStatus removes every advertised route, including any
+// the informer cache has not observed yet.
+func clearGatewayNodeRoutesStatus(ctx context.Context, dynamicClient dynamic.Interface, nodeName string) error {
+	if dynamicClient == nil || nodeName == "" {
+		return nil
+	}
+
+	return patchGatewayNodeStatus(ctx, dynamicClient, nodeName, map[string]interface{}{
+		"status": map[string]interface{}{
+			"lastUpdated":   time.Now().UTC().Format(time.RFC3339),
+			"routes":        nil,
+			"forwardingMTU": nil,
+		},
+	})
 }
 
 func patchGatewayNodeStatus(ctx context.Context, dynamicClient dynamic.Interface, nodeName string, statusPatch map[string]interface{}) error {
@@ -517,7 +538,7 @@ func routedCIDRsForGatewayPeer(
 	staleAfter time.Duration,
 ) ([]string, map[string]int, map[string]unboundednetv1alpha1.GatewayNodeRoute) {
 	if gatewayNode == nil {
-		return fallback, map[string]int{}, map[string]unboundednetv1alpha1.GatewayNodeRoute{}
+		return nil, map[string]int{}, map[string]unboundednetv1alpha1.GatewayNodeRoute{}
 	}
 
 	planRoutes := make(map[string]routeplan.LearnedRoute, len(gatewayNode.Status.Routes))

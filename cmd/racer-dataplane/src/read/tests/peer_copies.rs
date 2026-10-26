@@ -46,6 +46,8 @@ struct ScriptedPeers {
     calls: RefCell<Vec<(NodeId, bool, u32, u8, Instant)>>,
 
     local_deadlines: RefCell<Vec<(Instant, Instant)>>,
+
+    demands: RefCell<Vec<crate::peer::subscriptions::Demand>>,
 }
 impl ScriptedPeers {
     fn requester(self: &Rc<Self>) -> Rc<Requester> {
@@ -84,6 +86,9 @@ impl ScriptedPeers {
             assert_eq!(overall, request.origin.scope().deadline.0);
             self.local_deadlines.borrow_mut().push((overall, share));
             let destination = request.route.destination.clone();
+            if let PeerOperation::Subscribe { subscription, .. } = &request.operation {
+                self.demands.borrow_mut().push(subscription.demand.clone());
+            }
             self.calls.borrow_mut().push((
                 destination.clone(),
                 matches!(
@@ -198,6 +203,7 @@ impl ScriptedPeers {
                             remaining_page_budget: subscription.page_budget - 1,
                             remaining_byte_budget: subscription.byte_budget
                                 - copy.ciphertext.bytes().len() as u64,
+                            flights: subscription.flights,
                         },
                         metadata: copy.metadata,
                         ciphertext: copy.ciphertext,
@@ -256,6 +262,7 @@ fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Ve
         replies: RefCell::new(VecDeque::new()),
         calls: RefCell::new(Vec::new()),
         local_deadlines: RefCell::new(Vec::new()),
+        demands: RefCell::new(Vec::new()),
     });
     let mut dependencies = f.fill.dependencies.clone();
     dependencies.candidates = Rc::new(CandidatePolicy::new(
@@ -858,9 +865,14 @@ fn invalid_signed_selection_falls_back_without_resetting_acquisition_budget() {
                 crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
             ])
             .unwrap();
-            let mut work = Box::pin(f.fill.select_subscription(
+            let scheduler = crate::read::range_stream::Scheduler::new(1);
+            let selection = crate::read::range_stream::Selection::for_test(
+                &scheduler,
                 f.page.version.clone(),
                 demand,
+            );
+            let mut work = Box::pin(f.fill.select_subscription(
+                &selection,
                 f.membership.clone(),
                 &f.context,
                 &f.scope,
@@ -898,6 +910,84 @@ fn invalid_signed_selection_falls_back_without_resetting_acquisition_budget() {
             endpoint.uninstall().unwrap();
         }
     }
+}
+
+#[test]
+fn subscription_behind_remote_warm_fills_only_the_published_head() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let (peers, ordered) = install_peers(&mut f, None);
+    peers
+        .replies
+        .borrow_mut()
+        .push_back((ordered[0].clone(), Reply::Copy(encrypted_copy(&mut f))));
+    let signers = network(4);
+    let (_local, mut endpoint, _published) =
+        super::hot_reads::coordinator(&f, &signers[peers.local], &f.membership, peers.requester());
+    let job = f
+        .fill
+        .dependencies
+        .metadata_owner
+        .warm
+        .begin_remote(&f.page.version, node(peers.local), f.membership.clone(), 4)
+        .unwrap();
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
+    // Page 0 starts a demand whose tail [1, 4) warm has not reached yet.
+    let demand =
+        crate::peer::subscriptions::Demand::new(vec![crate::peer::subscriptions::PageInterval {
+            start: 0,
+            end: 4,
+        }])
+        .unwrap();
+    let scheduler = crate::read::range_stream::Scheduler::new(1);
+    let selection =
+        crate::read::range_stream::Selection::for_test(&scheduler, f.page.version.clone(), demand);
+    let mut work = Box::pin(f.fill.select_subscription(
+        &selection,
+        f.membership.clone(),
+        &f.context,
+        &f.scope,
+        &mut budget,
+    ));
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    for _ in 0..64 {
+        assert!(work.as_mut().poll(&mut cx).is_pending());
+    }
+    assert!(
+        peers.calls.borrow().is_empty(),
+        "no page before warm completes it"
+    );
+    crate::read::warm::WarmRegistry::publish_through(&job, 1);
+    let mut result = None;
+    for _ in 0..4096 {
+        if let Poll::Ready(value) = work.as_mut().poll(&mut cx) {
+            result = Some(value);
+            break;
+        }
+        endpoint.poll(&mut cx, 64).unwrap();
+        uring_runtime::drivers::poll(&mut cx, 64);
+        uring_runtime::group::Service::poll_budgeted(
+            &mut f.engine,
+            &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
+            64,
+        )
+        .unwrap();
+        f.crypto.poll_budgeted(64).unwrap();
+        f.reactor.poll_budgeted(64).unwrap();
+    }
+    drop(work);
+    assert_eq!(
+        result.expect("published page").unwrap().plaintext.bytes(),
+        b"abc"
+    );
+    assert_eq!(peers.calls.borrow().len(), 1);
+    assert!(
+        peers.demands.borrow().is_empty(),
+        "no selection is offered while warm holds the head remotely"
+    );
+    assert_eq!(f.origin.calls.get(), 0);
+    drop(job);
 }
 
 #[test]
@@ -1205,7 +1295,14 @@ fn known_copy_admission_validates_before_reclaim_and_preserves_failures() {
         assert_eq!(f.crypto.outstanding(), 0);
         assert_eq!(f.origin.calls.get(), 0);
         if case != "success" {
-            assert!(f.fill.dependencies.memory.get(&f.page).unwrap().is_none());
+            assert!(
+                f.fill
+                    .dependencies
+                    .memory
+                    .ciphertext(&f.page)
+                    .unwrap()
+                    .is_none()
+            );
             admission.reclaim_buffers();
             assert_eq!(admission.used(ResourceClass::Plaintext), before);
         }
@@ -1226,11 +1323,16 @@ fn known_copy_reclaims_only_idle_bytes_after_validation() {
     let idle = crate::memory::tests::bundle_for(&admission, descriptor);
     let idle_id = idle.plaintext.page().clone();
     f.fill.dependencies.memory.publish(idle).unwrap();
+    // Only the busy reader's plaintext is charged; the cache released the idle
+    // page's plaintext at publication. Leave room for exactly one small page.
+    assert_eq!(admission.used(ResourceClass::Plaintext), 3);
     let pressure = admission
         .reserve(
             None,
             ResourceClass::Plaintext,
-            admission.limit(ResourceClass::Plaintext) - admission.used(ResourceClass::Plaintext),
+            admission.limit(ResourceClass::Plaintext)
+                - admission.used(ResourceClass::Plaintext)
+                - 3,
         )
         .unwrap();
     let mut wrong = copy.clone();
@@ -1239,10 +1341,25 @@ fn known_copy_reclaims_only_idle_bytes_after_validation() {
         f.fill.reserve_copy_plaintext(&f.page, &wrong),
         Err(Error::CorruptRecord)
     ));
-    assert!(f.fill.dependencies.memory.get(&idle_id).unwrap().is_some());
+    assert!(
+        f.fill
+            .dependencies
+            .memory
+            .ciphertext(&idle_id)
+            .unwrap()
+            .is_some()
+    );
     let reservation = f.fill.reserve_copy_plaintext(&f.page, &copy).unwrap();
     assert_eq!(reservation.amount(), 3);
-    assert!(f.fill.dependencies.memory.get(&idle_id).unwrap().is_none());
+    // Plaintext admission never needs to evict cached ciphertext.
+    assert!(
+        f.fill
+            .dependencies
+            .memory
+            .ciphertext(&idle_id)
+            .unwrap()
+            .is_some()
+    );
     assert!(
         f.fill
             .dependencies
@@ -2211,7 +2328,14 @@ fn assert_published(f: &Fixture, result: &PageResult, persist: bool) {
 }
 
 fn assert_unpublished(f: &Fixture) {
-    assert!(f.fill.dependencies.memory.get(&f.page).unwrap().is_none());
+    assert!(
+        f.fill
+            .dependencies
+            .memory
+            .ciphertext(&f.page)
+            .unwrap()
+            .is_none()
+    );
     assert!(
         f.fill
             .dependencies
@@ -2688,4 +2812,161 @@ fn replica_selection_orders_first_acquire_and_non_primary_owner_fills() {
         drop(calls);
         drop(endpoints);
     }
+}
+
+/// Wrap `copy`'s ciphertext as a received registered RDMA page on `f`'s pool.
+fn registered_copy(
+    f: &Fixture,
+    w: &mut crate::rdma::links::tests::World,
+    copy: &CiphertextCopy,
+    bytes: Vec<u8>,
+) -> CiphertextCopy {
+    let sent = crate::rdma::links::tests::page_with(
+        &w.b.admission,
+        copy.ciphertext.envelope().clone(),
+        bytes,
+    );
+    let received = crate::rdma::links::tests::receive_registered(w, &sent);
+    let admission = &f.fill.dependencies.admission;
+    let reservation = admission
+        .reserve(
+            Some(&f.context.object.cache),
+            ResourceClass::Ciphertext,
+            received.len(),
+        )
+        .unwrap();
+    let ciphertext = crate::memory::BufferPool::new(admission.clone())
+        .registered_ciphertext(reservation, copy.ciphertext.envelope().clone(), received)
+        .unwrap();
+    assert!(ciphertext.is_registered());
+    CiphertextCopy {
+        metadata: copy.metadata.clone(),
+        ciphertext,
+    }
+}
+
+fn free_buffers(w: &crate::rdma::links::tests::World) -> Option<usize> {
+    w.a.links
+        .buffers(racer_control_wire::RailId(7), rdma_verbs::BufferState::Free)
+}
+
+#[test]
+fn registered_ciphertext_decrypts_in_place_and_persists_a_copy() {
+    let mut f = fixture_with(3, None);
+    let mut w = crate::rdma::links::tests::world_for(
+        [
+            crate::rdma::links::tests::node_id(1),
+            crate::rdma::links::tests::node_id(2),
+        ],
+        false,
+    );
+    crate::rdma::links::tests::link_up(&mut w);
+    let good = encrypted_copy(&mut f);
+    // Tampered page-backed ciphertext fails authentication and frees the buffer.
+    let mut tampered = good.ciphertext.bytes().to_vec();
+    tampered[0] ^= 1;
+    let bad = registered_copy(&f, &mut w, &good, tampered);
+    let reservation = f.fill.reserve_bootstrap(&f.context.object.cache).unwrap();
+    let decrypted = drive(
+        f.fill
+            .decrypt(&f.page, bad, reservation, &f.scope, DecryptSource::Peer),
+        &mut f.engine,
+        &f.crypto,
+    );
+    assert_eq!(decrypted.err(), Some(Error::CorruptRecord));
+    crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
+    assert_eq!(free_buffers(&w), Some(2));
+    // Page-backed ciphertext decrypts in place, then is copied out once into
+    // pooled aligned storage so the cache and write queue share one page.
+    let copy = registered_copy(&f, &mut w, &good, good.ciphertext.bytes().to_vec());
+    let reservation = f.fill.reserve_bootstrap(&f.context.object.cache).unwrap();
+    let copies = crate::memory::registered_copy_outs();
+    let result = drive(
+        f.fill
+            .decrypt(&f.page, copy, reservation, &f.scope, DecryptSource::Peer),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    assert_eq!(result.plaintext.bytes(), b"abc");
+    assert!(!result.ciphertext.is_registered());
+    assert!(
+        result
+            .ciphertext
+            .is_disk_aligned(crate::memory::default_disk_alignment())
+    );
+    assert_eq!(crate::memory::registered_copy_outs(), copies + 1);
+    crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
+    assert_eq!(free_buffers(&w), Some(2), "released right after copy-out");
+    // Retaining for memory and the store copies nothing more.
+    let admission = &f.fill.dependencies.admission;
+    let dirty = admission
+        .reserve(
+            Some(&f.context.object.cache),
+            ResourceClass::DirtyCiphertext,
+            19,
+        )
+        .unwrap();
+    f.fill
+        .dependencies
+        .writer
+        .enqueue(result.copy(), dirty)
+        .unwrap();
+    assert_eq!(f.fill.dependencies.writer.pending_count(), 1);
+    f.fill.dependencies.memory.publish(result.clone()).unwrap();
+    let cached = f.fill.dependencies.memory.get(&f.page).unwrap().unwrap();
+    assert!(std::sync::Arc::ptr_eq(
+        &cached.ciphertext.inner,
+        &result.ciphertext.inner
+    ));
+    assert_eq!(crate::memory::registered_copy_outs(), copies + 1);
+    drop(result);
+    crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
+    assert_eq!(
+        free_buffers(&w),
+        Some(2),
+        "the queue does not pin the buffer"
+    );
+}
+
+#[test]
+fn registered_copy_out_refused_by_admission_keeps_the_registered_page() {
+    let mut f = fixture_with(3, None);
+    let mut w = crate::rdma::links::tests::world_for(
+        [
+            crate::rdma::links::tests::node_id(1),
+            crate::rdma::links::tests::node_id(2),
+        ],
+        false,
+    );
+    crate::rdma::links::tests::link_up(&mut w);
+    let good = encrypted_copy(&mut f);
+    let copy = registered_copy(&f, &mut w, &good, good.ciphertext.bytes().to_vec());
+    let reservation = f.fill.reserve_bootstrap(&f.context.object.cache).unwrap();
+    // Exhaust ciphertext admission so the optional copy-out is refused.
+    let admission = f.fill.dependencies.admission.clone();
+    let cache = f.context.object.cache.clone();
+    let mut held = Vec::new();
+    for amount in [65536, 4096, 1] {
+        while let Ok(charge) = admission.reserve(Some(&cache), ResourceClass::Ciphertext, amount) {
+            held.push(charge);
+        }
+    }
+    let used = admission.used(ResourceClass::Ciphertext);
+    let copies = crate::memory::registered_copy_outs();
+    let result = drive(
+        f.fill
+            .decrypt(&f.page, copy, reservation, &f.scope, DecryptSource::Peer),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    assert_eq!(result.plaintext.bytes(), b"abc");
+    assert!(result.ciphertext.is_registered(), "falls back as before");
+    assert_eq!(crate::memory::registered_copy_outs(), copies);
+    assert_eq!(admission.used(ResourceClass::Ciphertext), used, "no leak");
+    drop(result);
+    drop(held);
+    crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
+    assert_eq!(free_buffers(&w), Some(2));
 }

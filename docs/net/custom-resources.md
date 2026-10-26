@@ -65,7 +65,7 @@ status:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `assignmentEnabled` | `*bool` | No | Enables this assignment (default: `true`). Disabled assignments are ignored. |
+| `assignmentEnabled` | `*bool` | No | Enables this assignment. When omitted, inherits `manageCniPlugin` (default: `true`). Explicit `true` or `false` overrides that default. |
 | `cidrBlocks` | `[]string` | No | CIDR pools to allocate from (IPv4 and/or IPv6). |
 | `nodeBlockSizes.ipv4` | `int` | No | IPv4 subnet size for node allocations (default: `/24` when IPv4 pools exist). |
 | `nodeBlockSizes.ipv6` | `int` | No | IPv6 subnet size for node allocations (default: first IPv6 pool prefix + 16). |
@@ -91,10 +91,10 @@ The node agent reads this field only at startup. Restart the node agents after c
 
 | Value | CNI Config | Same-Site WireGuard Peers | Pod CIDR Assignment | Gateway WireGuard Links |
 |-------|------------|---------------------------|---------------------|------------------------|
-| `true` (default) | Written | Created | Enabled | Created |
-| `false` | **Not written** | **Not created** | **Disabled** | Created |
+| `true` (default) | Written | Created | Enabled by default | Created |
+| `false` | **Not written** | **Not created** | Disabled by default | Created |
 
-When `manageCniPlugin` is `false`, pod CIDR assignment by the controller is disabled even if `assignmentEnabled: true` is set on individual `podCidrAssignments` rules. The `podCidrAssignments` entries are still required because their CIDR blocks define the pod address ranges used for inter-site routing.
+When `manageCniPlugin` is `false`, omitted `assignmentEnabled` values resolve to `false`. Set `assignmentEnabled: true` on an individual `podCidrAssignments` rule to have the controller allocate Node PodCIDRs while an external CNI manages networking. Explicit `false` disables a rule regardless of `manageCniPlugin`. Omitted values are resolved dynamically, not persisted, so they follow later changes to `manageCniPlugin`. Existing explicit values remain unchanged. The `podCidrAssignments` entries are still required because their CIDR blocks define the pod address ranges used for inter-site routing.
 
 **Use `manageCniPlugin: false` when:**
 - Using an external CNI plugin (e.g., Cilium, Calico) for intra-site networking
@@ -481,11 +481,24 @@ status:
 | `spec.gatewayPool` | `string` | Yes | GatewayPool this node belongs to. |
 | `spec.site` | `string` | No | Site name (derived from node labels). |
 | `status.lastUpdated` | `string` | - | Read-only. Last heartbeat timestamp. |
+| `status.forwardingMTU` | `integer` | No | Effective local forwarding MTU in bytes, published after successful dataplane reconciliation. |
 | `status.routes` | `map[string]GatewayNodeRoute` | - | Read-only. Route advertisements keyed by CIDR. |
 | `status.routes[].type` | `string` | - | Route source type: `NodeCidr`, `PodCidr`, or `RoutedCidr`. |
 | `status.routes[].source` | `GatewayNodePathHop` | - | Originating object for this route (`type` + `name`). |
 | `status.routes[].intermediateHops` | `[]GatewayNodePathHop` | - | Additional path objects between source and destination. |
 | `status.routes[].paths` | `[][]GatewayNodePathHop` | - | Full end-to-end paths. Each item is an ordered hop sequence from origin to local advertiser (max 100). |
+
+Workers apply `status.forwardingMTU` from their next-hop gateway and candidate
+gateways in intermediate pools on accepted paths. This includes shared-interface
+limits even when a worker does not use the route that imposed the limit.
+Gateways do not consume other gateways' published MTUs, avoiding feedback that
+could prevent a previous minimum from increasing.
+
+Install the updated GatewayPoolNode CRD before upgrading agents so the API server
+preserves this optional field. Older gateways without the field retain
+topology-derived MTU handling; the additional shared-interface protection requires
+the updated gateway agent and CRD. Gateway peers whose GatewayPoolNode object is
+missing are not used as route destinations.
 
 ---
 

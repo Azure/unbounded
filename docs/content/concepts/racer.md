@@ -77,6 +77,10 @@ cache's socket directory, normally through a mount, and the required filesystem
 permissions. The `ClusterCache`'s Kubernetes UID is its identity, so deleting
 and recreating it gives it a new cache identity.
 
+Optional `spec.priority` (0 to 1000, default 500) sets how a cache shares each
+node's capacity with other caches. It is a relative weight, not a quota. See
+[Priority]({{< relref "reference/racer" >}}#priority).
+
 ### Objects, Keys, and Versions
 
 - **Key** -- 32 bytes chosen by the app, often a content digest such as a
@@ -102,7 +106,9 @@ An origin answers two kinds of requests:
 
 Origins do not push data into Racer. Any participating node can own a page, so
 Racer runs the origin on each such node, usually as a DaemonSet
-that mounts the cache's origin socket directory.
+that mounts the cache's origin socket directory. For Azure Blob, the operator
+can run this DaemonSet for you; see the
+[Azure Blob cache guide]({{< relref "guides/azure-blob-cache" >}}).
 
 The client can pass `Metadata` and `Authorization` values with each read. Racer
 forwards them to the origin unchanged on a cache miss. Use them to tell the
@@ -150,6 +156,12 @@ read. Other nodes' pages become eligible after a second read. This reduces the
 chance of one-off reads pushing out useful data. This policy is called
 **second-sight**. Eligibility does not guarantee retention: admission limits,
 available capacity, and eviction still apply.
+
+When caches compete for space, each gets a share of the node's capacity in
+proportion to its `spec.priority`. Under pressure, eviction prefers data from
+caches above their share, within bounded scans. Among pages in the same state,
+hotter pages and pages this node owns stay longer. A cache can use idle space
+beyond its share.
 
 The default storage is slab files under `/var/lib/racer/slabs`, with
 raw block devices as an alternative. Checkpoints let a node

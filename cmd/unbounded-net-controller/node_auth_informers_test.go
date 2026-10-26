@@ -11,18 +11,22 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/Azure/unbounded/internal/net/authn"
+	netcontroller "github.com/Azure/unbounded/internal/net/controller"
 )
 
 func nodeAuthObjects() (*corev1.Pod, *corev1.ServiceAccount, *authn.KubernetesServiceAccountIdentity) {
@@ -61,12 +65,55 @@ func waitNodeAuthCondition(t *testing.T, condition func() bool) {
 	}
 }
 
+// trackNodeAuthWatches reports whether the fake tracker has registered a watch
+// for both informed resources. HasSynced only proves the initial List finished.
+// The fake tracker replays objects added between List and Watch but drops
+// deletions, so tests must not mutate objects until both watches exist.
+func trackNodeAuthWatches(client *k8sfake.Clientset) func() bool {
+	var (
+		mu      sync.Mutex
+		watched = map[string]bool{}
+	)
+
+	next := slices.Clone(client.WatchReactionChain)
+	client.PrependWatchReactor("*", func(action k8stesting.Action) (bool, watch.Interface, error) {
+		for _, reactor := range next {
+			if !reactor.Handles(action) {
+				continue
+			}
+
+			handled, stream, err := reactor.React(action)
+			if !handled {
+				continue
+			}
+
+			if err == nil {
+				mu.Lock()
+				watched[action.GetResource().Resource] = true
+				mu.Unlock()
+			}
+
+			return true, stream, err
+		}
+
+		return false, nil, nil
+	})
+
+	return func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+
+		return watched["pods"] && watched["serviceaccounts"]
+	}
+}
+
 func startNodeAuthTestCaches(t *testing.T, client *k8sfake.Clientset) (*nodeAuthInformers, context.CancelFunc) {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
 
+	watching := trackNodeAuthWatches(client)
 	caches := newNodeAuthInformers(ctx, client, "unbounded-system", 0)
 	caches.start()
 	t.Cleanup(func() {
@@ -75,6 +122,7 @@ func startNodeAuthTestCaches(t *testing.T, client *k8sfake.Clientset) (*nodeAuth
 		caches.saFactory.Shutdown()
 	})
 	waitNodeAuthCondition(t, caches.ready)
+	waitNodeAuthCondition(t, watching)
 
 	return caches, cancel
 }
@@ -133,6 +181,11 @@ func TestNodeAuthInformersScopeAndLifecycle(t *testing.T) {
 
 	if _, err := caches.pods.Lister().Pods(pod.Namespace).Get(pod.Name); err != nil {
 		t.Fatal(err)
+	}
+
+	indexed, err := caches.pods.Informer().GetIndexer().ByIndex(netcontroller.NodeAgentPodNodeNameIndex, pod.Spec.NodeName)
+	if err != nil || len(indexed) != 1 || indexed[0].(*corev1.Pod).UID != pod.UID {
+		t.Fatalf("node-agent Pods indexed by Node = %#v, err=%v", indexed, err)
 	}
 
 	if _, err := caches.serviceAccounts.Lister().ServiceAccounts(sa.Namespace).Get(sa.Name); err != nil {

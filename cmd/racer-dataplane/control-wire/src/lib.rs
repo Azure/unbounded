@@ -89,6 +89,12 @@ pub const RENEW_AFTER: Duration = Duration::from_secs(16 * 60 * 60);
 /// Default member weight for local enrollment requests.
 pub const DEFAULT_SHARES: u32 = 4;
 
+/// Cache priority the controller publishes for a ClusterCache without spec.priority.
+pub const DEFAULT_PRIORITY: u16 = 500;
+
+/// Highest valid cache priority. The lowest is 0.
+pub const MAX_PRIORITY: u16 = 1000;
+
 /// Monotonic publication cursor within a cluster.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct PublicationSequence(pub u64);
@@ -477,6 +483,9 @@ mod definitions {
         pub client_socket: PathBuf,
 
         pub origin_socket: PathBuf,
+
+        /// Relative weight, 0 through `MAX_PRIORITY`, for sharing node disk and memory.
+        pub priority: u16,
     }
 
     impl KeyId {
@@ -552,7 +561,11 @@ mod definitions {
         let mut ids = HashSet::new();
         let mut names = HashSet::new();
         for d in definitions {
-            if !crate::valid_uuid(&d.id.0) || !ids.insert(&d.id) || !names.insert(&d.name) {
+            if !crate::valid_uuid(&d.id.0)
+                || !ids.insert(&d.id)
+                || !names.insert(&d.name)
+                || d.priority > crate::MAX_PRIORITY
+            {
                 return Err(Error::InvalidRequest);
             }
             let (client, origin) = canonical_socket_paths(&d.name)?;
@@ -1140,6 +1153,9 @@ mod codec {
         client_socket: String,
 
         origin_socket: String,
+
+        // Required: field order must match Go's canonical content.
+        priority: u16,
     }
 
     /// Full publication with decimal-string cursors for cross-language precision.
@@ -1207,6 +1223,7 @@ mod codec {
                 name: c.name,
                 client_socket: c.client_socket.into(),
                 origin_socket: c.origin_socket.into(),
+                priority: c.priority,
             })
             .collect();
         validate_definitions(&caches)?;
@@ -1250,6 +1267,7 @@ mod codec {
                     .to_str()
                     .ok_or(Error::InvalidRequest)?
                     .into(),
+                priority: c.priority,
             });
         }
         caches.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1712,6 +1730,47 @@ mod codec {
             assert_eq!(mh, hashes["membership"]);
             let b = encode_publication(&p).unwrap();
             assert_eq!(b, round_trip("publication.json", &b).unwrap());
+        }
+
+        /// Cache priority is required, bounded, and part of canonical content.
+        #[test]
+        fn cache_priority_round_trip_bounds_and_hashes() {
+            let raw = String::from_utf8(fixture("publication.json")).unwrap();
+            let p = decode_publication(raw.as_bytes()).unwrap();
+            assert_eq!(p.caches[0].priority, 250);
+            let (base_content, base_membership) = content_hashes(&p).unwrap();
+            for priority in [0, crate::DEFAULT_PRIORITY, crate::MAX_PRIORITY] {
+                let mut next = p.clone();
+                next.caches[0].priority = priority;
+                let b = encode_publication(&next).unwrap();
+                assert!(
+                    String::from_utf8(b.clone())
+                        .unwrap()
+                        .contains(&format!("\"priority\":{priority}}}"))
+                );
+                assert_eq!(decode_publication(&b).unwrap().caches, next.caches);
+                let (content, membership) = content_hashes(&next).unwrap();
+                assert_ne!(content, base_content);
+                assert_eq!(membership, base_membership);
+            }
+            let mut over = p.clone();
+            over.caches[0].priority = crate::MAX_PRIORITY + 1;
+            assert!(encode_publication(&over).is_err());
+            assert!(validate_publication(&over).is_err());
+            assert!(canonical_content(&over).is_err());
+            for bad in [
+                "",
+                ",\"priority\":1001",
+                ",\"priority\":-1",
+                ",\"priority\":null",
+                ",\"priority\":\"250\"",
+                ",\"priority\":250.0",
+                ",\"priority\":65536",
+            ] {
+                let changed = raw.replacen(",\"priority\":250", bad, 1);
+                assert_ne!(changed, raw);
+                assert!(decode_publication(changed.as_bytes()).is_err(), "{bad}");
+            }
         }
 
         /// Site additions, changes, and removals agree with Go and reject replay.

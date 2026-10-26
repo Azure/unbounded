@@ -130,7 +130,6 @@ mod body_progress {
             let transfers = transport::Transfers::new(
                 pool.clone(),
                 io.clone(),
-                None,
                 admission.clone(),
                 Rc::new(codec(&admission)),
                 signers[0].clone(),
@@ -1136,7 +1135,6 @@ mod encrypted_http {
         let transfers = transport::Transfers::new(
             pool.clone(),
             ios[0].clone(),
-            None,
             admissions[0].clone(),
             Rc::new(codec(&admissions[0])),
             identities[0].signatures.clone(),
@@ -1257,9 +1255,13 @@ mod encrypted_http {
                     if attempt == 0 {
                         prefix_sent.set(true);
                         // Do not let cancellation race ahead of receive admission:
-                        // the partial exchange must own a full ciphertext allocation.
+                        // the partial exchange must own a full aligned ciphertext
+                        // allocation, charged for its whole pooled size class.
                         futures::future::poll_fn(|_| {
-                            if admissions[0].used(ResourceClass::Ciphertext) == length + 16 {
+                            if admissions[0].used(ResourceClass::Ciphertext)
+                                == page_alloc::buffer_capacity((length + 16).next_multiple_of(4096))
+                                    .unwrap()
+                            {
                                 Poll::Ready(())
                             } else {
                                 Poll::Pending
@@ -1328,6 +1330,8 @@ mod encrypted_http {
                     ciphertext.bytes(),
                     pages[if attempt == 3 { 1 } else { index }].bytes()
                 );
+                // TCP receive lands in a zero-padded, disk-aligned body.
+                assert!(ciphertext.is_disk_aligned(crate::memory::default_disk_alignment()));
                 let pointer = ciphertext.bytes().as_ptr();
                 if let Some(previous) = reused {
                     assert_eq!(
@@ -1483,7 +1487,6 @@ mod requester_safety {
             Rc::new(Transfers::new(
                 pool,
                 io,
-                None,
                 admission.clone(),
                 Rc::new(crate::peer::tests::codec(&admission)),
                 signers[0].clone(),
@@ -1765,6 +1768,7 @@ mod subscriptions {
                 sequence: 0,
                 page_budget: 2,
                 byte_budget: 2 * crate::model::PAGE_BYTES + 32,
+                flights: None,
                 version: ObjectVersion {
                     object: request.origin.object.clone(),
                     etag: StrongEtag::test_value("v1"),
@@ -2269,6 +2273,7 @@ mod subscriptions {
                 .unwrap(),
             remaining_page_budget: 1,
             remaining_byte_budget: subscription.byte_budget - 19,
+            flights: None,
         };
         for case in 0..10 {
             let mut grant = good.clone();
@@ -2331,6 +2336,103 @@ mod subscriptions {
             destination.verify_request(signed).is_err(),
             "logical sequence must not be elided as a session auth field"
         );
+    }
+    #[test]
+    fn multi_flight_subscription_is_signed_and_grant_flights_bound_to_request() {
+        let signers = signers();
+        let sender = Forwarding::new(signers[0].clone());
+        let destination = Forwarding::new(signers[2].clone());
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        )));
+        for requested in [None, Some(4)] {
+            let set = |local: &mut PeerRequest, flights| {
+                let Operation::Subscribe { subscription, .. } = &mut local.operation else {
+                    panic!()
+                };
+                subscription.flights = flights;
+            };
+            let mut local = subscribe(&admission, A, 1, 0, FetchMode::CopyOnly);
+            set(&mut local, requested);
+            let head = protocol::request_head(&local).unwrap();
+            assert_eq!(
+                head.unique(protocol::SUBSCRIPTION_FLIGHTS).unwrap(),
+                requested.map(|_| b"4".as_slice()),
+                "the field is encoded only when requested"
+            );
+            if requested.is_some() {
+                // An older provider decodes without the field and re-encodes,
+                // so its exact agreement check refuses the request.
+                set(&mut local, None);
+                let older = protocol::request_head(&local).unwrap();
+                assert!(matches!(
+                    protocol::agrees(&head, &older, false),
+                    Err(Error::Unauthorized)
+                ));
+                set(&mut local, requested);
+            }
+            let (signed, binding) = sender.sign_request(local).unwrap();
+            let admitted = destination.verify_request(signed).unwrap();
+            let Operation::Subscribe { subscription, .. } = &admitted.request().operation else {
+                panic!()
+            };
+            assert_eq!(subscription.flights, requested);
+            let page = PageId {
+                version: subscription.version.clone(),
+                number: PageNumber(0),
+            };
+            for granted in [None, Some(1), Some(4), Some(5)] {
+                let grant = TransferGrant {
+                    subscription_id: subscription.id,
+                    sequence: 0,
+                    page: page.clone(),
+                    membership: MembershipVersion(1),
+                    receiver: NodeId(A.into()),
+                    deadline: crate::peer::protocol::encode_deadline(
+                        admitted.request().route.deadline,
+                    )
+                    .unwrap(),
+                    remaining_page_budget: 1,
+                    remaining_byte_budget: subscription.byte_budget - 19,
+                    flights: granted,
+                };
+                let copy = copy(&admission, page.clone());
+                let response = PeerResponse::Selected {
+                    metadata: copy.metadata,
+                    ciphertext: copy.ciphertext,
+                    grant,
+                };
+                let mut head = crate::peer::protocol::response_head(
+                    &response,
+                    &crate::peer::protocol::signed_digest(
+                        &admitted.signed().authentication.original,
+                    )
+                    .unwrap(),
+                    &[NodeId(A.into()), NodeId(C.into())],
+                )
+                .unwrap();
+                crate::peer::protocol::push(&mut head, "racer-receiver", A);
+                let signed = protocol::SignedResponse {
+                    authentication: crate::peer::forwarding::ForwardedHead {
+                        original: Arc::new(signers[2].sign(head).unwrap()),
+                        hops: vec![],
+                    },
+                    response,
+                };
+                let valid = match requested {
+                    None => granted.is_none(),
+                    Some(_) => matches!(granted, Some(1 | 4)),
+                };
+                let verified = sender.verify_response(signed, &binding);
+                assert_eq!(verified.is_ok(), valid, "{requested:?} {granted:?}");
+                if let Ok(verified) = verified {
+                    let PeerResponse::Selected { grant, .. } = verified.response() else {
+                        panic!()
+                    };
+                    assert_eq!(grant.flights, granted);
+                }
+            }
+        }
     }
     #[test]
     fn subscription_runs_through_real_tcp_requester_session_and_provider() {
@@ -3048,6 +3150,7 @@ fn receive_gate_operation_bypass_and_chained_small_caps_expire_and_recover() {
             sequence: 0,
             page_budget: 1,
             byte_budget: PAGE_BYTES + 16,
+            flights: None,
             version: ObjectVersion {
                 object: requests[1].origin.object.clone(),
                 etag: StrongEtag::test_value("incast"),
@@ -3152,7 +3255,6 @@ impl SocketFixture {
         Rc::new(transport::Transfers::new(
             self.pool.clone(),
             self.io.clone(),
-            None,
             self.admission.clone(),
             self.codec.clone(),
             signer,
@@ -3199,6 +3301,11 @@ impl NoOutbound {
 }
 impl Drop for NoOutbound {
     fn drop(&mut self) {
+        // A second panic while unwinding aborts the whole test binary and
+        // hides the original failure.
+        if std::thread::panicking() {
+            return;
+        }
         assert_eq!(
             self.requester.outbound_requests(),
             0,

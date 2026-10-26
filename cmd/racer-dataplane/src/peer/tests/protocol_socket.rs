@@ -680,7 +680,6 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
     let transfers = Rc::new(transport::Transfers::new(
         pool,
         io,
-        None,
         admission.clone(),
         Rc::new(codec(&admission)),
         signers[0].clone(),
@@ -1242,7 +1241,6 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     let transfers = transport::Transfers::new(
         pool,
         io.clone(),
-        None,
         admission.clone(),
         Rc::new(codec(&admission)),
         signers[0].clone(),

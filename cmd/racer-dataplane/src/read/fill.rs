@@ -67,6 +67,15 @@ pub struct FillDependencies {
     pub metadata_owner: Arc<super::dispatch::WorkerDirectory>,
 }
 type LocalCopies = flow_control::coalesce::shared::Table<PageId, Result<Option<UnverifiedPage>>>;
+/// Local plaintext recovery keyed by page: one decrypt of a retained or local
+/// copy is shared by every concurrent warm reader and by elected acquisitions
+/// that find the page cached. Local-only readers never start acquisition.
+type LocalPlaintext = flow_control::coalesce::shared::Table<PageId, Result<Option<PageResult>>>;
+/// Source key of each running local plaintext job, once its copy is chosen.
+/// New followers are admitted only while that key remains available.
+type LocalPlaintextKeys = std::cell::RefCell<
+    std::collections::BTreeMap<PageId, Rc<std::cell::Cell<Option<racer_control_wire::KeyId>>>>,
+>;
 
 /// Optional writes may use half of the aggregate class budget, with a floor
 /// sufficient for one valid page when the configured budget can hold it. Owned
@@ -81,6 +90,8 @@ pub struct Fill {
     pub(super) dependencies: FillDependencies,
     pub(super) metrics: Metrics,
     pub(super) local_copies: Rc<LocalCopies>,
+    pub(super) local_plaintext: Rc<LocalPlaintext>,
+    local_plaintext_keys: Rc<LocalPlaintextKeys>,
 
     diagnostic: Option<DriverDiagnostic>,
     fence_acquisition: bool,
@@ -111,6 +122,29 @@ impl DecryptSource {
         })
     }
 }
+/// Duration metrics for serial driver calls. Candidate calls are timed at their call sites.
+fn stage_events(stage: DriverStage) -> Option<(Event, Event)> {
+    match stage {
+        DriverStage::PlaintextReclaim => Some((
+            Event::FillPlaintextReclaimCount,
+            Event::FillPlaintextReclaimNs,
+        )),
+        DriverStage::PublishCall => Some((Event::FillPublishCount, Event::FillPublishNs)),
+        DriverStage::DecryptCall => Some((Event::FillDecryptCount, Event::FillDecryptNs)),
+        DriverStage::DiskReadCall => Some((Event::FillDiskReadCount, Event::FillDiskReadNs)),
+        DriverStage::OriginCall => Some((Event::FillOriginCount, Event::FillOriginNs)),
+        DriverStage::EncryptCall => Some((Event::FillEncryptCount, Event::FillEncryptNs)),
+        DriverStage::ChecksumCall => Some((Event::FillChecksumCount, Event::FillChecksumNs)),
+        DriverStage::Starting
+        | DriverStage::BetweenCalls
+        | DriverStage::CandidateCompositeCall
+        | DriverStage::WorkReturned => None,
+    }
+}
+/// Bound on retries after a joined local plaintext job fails under its
+/// starter's inherited scope.
+const LOCAL_PLAINTEXT_JOIN_RETRIES: usize = 2;
+
 impl Fill {
     pub(super) async fn warm_local(
         &self,
@@ -120,11 +154,202 @@ impl Fill {
         if let Some(result) = self.cached_page(page, scope)? {
             return Ok(result);
         }
-        match self.acquire_local_copy(page, scope, true).await? {
-            Some(AcquiredPage::Plaintext(result)) => Ok(result),
-            _ => Err(Error::Unavailable),
+        match self.local_plaintext_copy(page, scope, true).await? {
+            Some(result) => Ok(result),
+            None => Err(Error::Unavailable),
         }
     }
+
+    /// Coalesce local decrypts so concurrent warm readers and elected
+    /// acquisitions reserve and decrypt one plaintext. A detached worker driver
+    /// owns the shared work, so one caller's cancellation never fails another
+    /// caller. The driver only reads pending, cached, or disk copies; it never
+    /// contacts peers or origin, so a local-only caller cannot start acquisition.
+    ///
+    /// A `probe` caller owns its own Waiter charge, and a probe that starts the
+    /// job reserves a Flight charge retained by the detached driver until the
+    /// job completes. An elected acquisition already holds both through its
+    /// flight registration and awaits the job inside its retained operation,
+    /// staying attached through cancellation until the job completes.
+    /// New followers recheck current cache and source-key admission; callers
+    /// admitted earlier keep their completion rights.
+    async fn local_plaintext_copy(
+        &self,
+        page: &PageId,
+        scope: &RequestScope,
+        probe: bool,
+    ) -> Result<Option<PageResult>> {
+        use std::future::Future;
+        scope.check()?;
+        let _waiter = if probe {
+            Some(self.dependencies.admission.reserve(
+                Some(&page.version.object.cache),
+                ResourceClass::Waiter,
+                1,
+            )?)
+        } else {
+            None
+        };
+        let cancellation = scope.cancellation.subscribe()?;
+        // A joined job runs under the scope of the caller that started it. If
+        // that inherited scope expires or is cancelled while this caller's own
+        // scope is still valid, retry under this caller's own scope. A job this
+        // caller started shares its deadline, so its failure is final. The
+        // bound stops a stream of short-lived starters from looping forever.
+        let mut joins_left = LOCAL_PLAINTEXT_JOIN_RETRIES;
+        loop {
+            let mut started = false;
+            let mut receive = if let Some(existing) = self.local_plaintext.get(page) {
+                let key = self
+                    .local_plaintext_keys
+                    .borrow()
+                    .get(page)
+                    .and_then(|key| key.get());
+                self.dependencies.flights.admit_local(page, key)?;
+                existing
+            } else {
+                self.dependencies.flights.admit_local(page, None)?;
+                started = true;
+                let permit = uring_runtime::drivers::reserve().map_err(Error::from)?;
+                let flight = if probe {
+                    Some(self.dependencies.flights.reserve_copy_flight(page, scope)?)
+                } else {
+                    None
+                };
+                let owned_scope = RequestScope::new(scope.request, scope.deadline.0)?;
+                let (receive, completion) = self
+                    .local_plaintext
+                    .start(page.clone(), Err(Error::Unavailable));
+                if let Some(completion) = completion {
+                    let source = Rc::new(std::cell::Cell::new(None));
+                    self.local_plaintext_keys
+                        .borrow_mut()
+                        .insert(page.clone(), source.clone());
+                    let mut fill = self.clone();
+                    fill.diagnostic = None;
+                    let page = page.clone();
+                    permit.submit_detached(Box::pin(async move {
+                        let _flight = flight;
+                        let result = match fill.cached_page(&page, &owned_scope) {
+                            Ok(Some(result)) => Ok(Some(result)),
+                            Ok(None) => {
+                                match fill.retained_plaintext(&page, &owned_scope, &source).await {
+                                    Ok(Some(result)) => Ok(Some(result)),
+                                    Ok(None) => fill
+                                        .acquire_local_copy_from(
+                                            &page,
+                                            &owned_scope,
+                                            true,
+                                            Some(&source),
+                                        )
+                                        .await
+                                        .map(|acquired| match acquired {
+                                            Some(AcquiredPage::Plaintext(result)) => Some(result),
+                                            _ => None,
+                                        }),
+                                    Err(error) => Err(error),
+                                }
+                            }
+                            Err(error) => Err(error),
+                        };
+                        let mut keys = fill.local_plaintext_keys.borrow_mut();
+                        if keys.get(&page).is_some_and(|key| Rc::ptr_eq(key, &source)) {
+                            keys.remove(&page);
+                        }
+                        drop(keys);
+                        completion.finish(result);
+                        Ok::<_, Error>(())
+                    }));
+                }
+                receive
+            };
+            let result = std::future::poll_fn(|cx| {
+                cancellation.register(cx.waker());
+                // A probe-led job owns its own Flight charge, so a probe may
+                // detach. An acquisition-led job has no charge of its own and
+                // relies on the acquisition's retained operation, so acquisition
+                // callers stay attached until the job completes and only then
+                // report cancellation or deadline expiry.
+                if probe {
+                    scope.check()?;
+                }
+                uring_runtime::drivers::poll(cx, 64);
+                let result = std::task::ready!(std::pin::Pin::new(&mut receive).poll(cx));
+                scope.check()?;
+                std::task::Poll::Ready(result)
+            })
+            .await;
+            match result {
+                Err(Error::DeadlineExceeded | Error::Cancelled) if !started && joins_left > 0 => {
+                    scope.check()?;
+                    joins_left -= 1;
+                }
+                result => return result,
+            }
+        }
+    }
+    /// Decrypt the memory cache's retained ciphertext, the same copy an elected
+    /// acquisition previously decrypted on its own. A rejected copy is
+    /// invalidated, with its disk record, and reported as a miss so the caller
+    /// can try pending or disk copies.
+    async fn retained_plaintext(
+        &self,
+        page: &PageId,
+        scope: &RequestScope,
+        source_key: &std::cell::Cell<Option<racer_control_wire::KeyId>>,
+    ) -> Result<Option<PageResult>> {
+        let Some(cached) = self.metrics.lookup(
+            LookupTier::Ciphertext,
+            self.dependencies.memory.unverified(page),
+        )?
+        else {
+            return Ok(None);
+        };
+        // Disk-sourced copies already counted their disk hit.
+        if cached.disk_token.is_none() {
+            self.metrics.record(Event::MemoryHit, 1);
+        }
+        source_key.set(Some(cached.copy.ciphertext.envelope().key_id));
+        let result = async {
+            let reservation = self.observe_reservation(
+                scope,
+                page,
+                FillAdmissionSite::RetainedPlaintext,
+                || self.reserve_copy_plaintext(page, &cached.copy),
+            )?;
+            self.call(
+                DriverStage::DecryptCall,
+                self.decrypt(
+                    page,
+                    cached.copy.clone(),
+                    reservation,
+                    scope,
+                    DecryptSource::Retained,
+                ),
+            )
+            .await
+        }
+        .await;
+        match result {
+            Ok(result) => {
+                self.call(
+                    DriverStage::PublishCall,
+                    self.publish(result.clone(), None, scope),
+                )
+                .await?;
+                Ok(Some(result))
+            }
+            Err(Error::CorruptRecord | Error::MissingKey) => {
+                self.dependencies.memory.invalidate_ciphertext(&cached);
+                if let Some(token) = &cached.disk_token {
+                    self.dependencies.disk.invalidate(token)?;
+                }
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Mark this detached driver's call boundary, if it owns a diagnostic generation.
     fn stage(&self, stage: DriverStage) {
         if let Some(diagnostic) = &self.diagnostic {
@@ -138,7 +363,25 @@ impl Fill {
             .diagnostic
             .as_ref()
             .map(|diagnostic| diagnostic.call(stage));
-        work.await
+        let start = uring_runtime::environment::now();
+        let result = work.await;
+        if let Some((count, sum)) = stage_events(stage) {
+            self.metrics.record_duration(count, sum, start);
+        }
+        result
+    }
+
+    /// Time one awaited step into a count and nanosecond sum pair.
+    async fn timed<T>(
+        &self,
+        count: Event,
+        sum: Event,
+        work: impl std::future::Future<Output = T>,
+    ) -> T {
+        let start = uring_runtime::environment::now();
+        let result = work.await;
+        self.metrics.record_duration(count, sum, start);
+        result
     }
 
     #[cfg(test)]
@@ -162,15 +405,16 @@ impl Fill {
     }
     pub(crate) async fn select_subscription(
         &self,
-        version: crate::model::ObjectVersion,
-        demand: crate::peer::subscriptions::Demand,
+        selection: &super::range_stream::Selection,
         membership: std::sync::Arc<crate::topology::Membership>,
         context: &OriginContext,
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
     ) -> Result<PageResult> {
+        let version = selection.version.clone();
         let first = crate::model::PageNumber(
-            demand
+            selection
+                .demand
                 .intervals()
                 .first()
                 .ok_or(Error::InvalidRequest)?
@@ -183,13 +427,24 @@ impl Fill {
         if version.object != context.object {
             return Err(Error::InvalidRequest);
         }
-        if let Some(page) = self
+        match self
             .dependencies
             .metadata_owner
             .warmed_page(&head, scope)
             .await?
         {
-            return Ok(page);
+            super::dispatch::Warmed::Local(page) => return Ok(*page),
+            super::dispatch::Warmed::Unwarmed => {}
+            // A warm job holds the head on a remote owner. Fill only that page
+            // through the normal path, which reaches the held copy, rather
+            // than selecting pages the warm job may not have finished.
+            super::dispatch::Warmed::Remote => {
+                return self
+                    .dependencies
+                    .metadata_owner
+                    .acquire_unobserved(head, membership, context, scope, budget)
+                    .await;
+            }
         }
         // A new or credit-starved subscriber can lag behind provider completion.
         // Reuse its verified local head before asking for another node transfer.
@@ -197,7 +452,7 @@ impl Fill {
         if let Some(result) = self
             .dependencies
             .metadata_owner
-            .cached_page(head, scope)
+            .local_page(head, scope)
             .await?
         {
             return Ok(result);
@@ -206,9 +461,8 @@ impl Fill {
             .dependencies
             .candidates
             .subscribe(
-                version.clone(),
-                demand,
-                &self.dependencies.metadata_owner.subscriptions,
+                selection,
+                super::range_stream::REQUESTED_FLIGHTS,
                 membership.clone(),
                 context,
                 scope,
@@ -301,11 +555,14 @@ impl Fill {
                     self.reserve_with_reclamation(
                         &page.version.object.cache,
                         ResourceClass::Ciphertext,
-                        copy.ciphertext.inner.capacity(),
+                        self.selected_capacity(&copy.ciphertext),
                     )
                 },
             )?;
-            copy.ciphertext = copy.ciphertext.rehome(reservation)?;
+            copy.ciphertext = self
+                .dependencies
+                .buffers
+                .rehome_aligned(copy.ciphertext, reservation)?;
         }
         let reservation =
             self.observe_reservation(scope, &page, FillAdmissionSite::SelectedPlaintext, || {
@@ -372,17 +629,15 @@ impl Fill {
             else {
                 return false;
             };
-            let released =
-                self.dependencies
-                    .memory
-                    .reclaim_idle(class, owner.as_ref(), bytes, |page| {
-                        self.dependencies.writer.discard_idle_copy(page)
-                    });
-            if released < bytes && matches!(class, ResourceClass::Ciphertext) {
-                self.dependencies
-                    .writer
-                    .reclaim_ciphertext(owner.as_ref(), bytes - released);
-            }
+            // Global pressure takes over-share caches' idle bytes first.
+            self.dependencies.memory.reclaim(
+                class,
+                owner.as_ref(),
+                bytes,
+                |cache| self.dependencies.admission.excess(cache, class),
+                |page, ciphertext| self.dependencies.writer.discard_idle_copy(page, ciphertext),
+                |cache, bytes| self.dependencies.writer.reclaim_ciphertext(cache, bytes),
+            );
             true
         })
     }
@@ -415,7 +670,9 @@ impl Fill {
         let admission = &self.dependencies.admission;
         let cache = &page.version.object.cache;
         let amount = PAGE_BYTES as usize;
-        let mut cursor = self.dependencies.memory.plaintext_reclaim();
+        // The memory cache retains no plaintext, so nothing local can be
+        // reclaimed. Retry once after a yield, which lets completed readers
+        // drop their plaintext.
         let mut exhausted = false;
         loop {
             scope.check()?;
@@ -444,15 +701,9 @@ impl Fill {
                 );
                 return result;
             }
-            let (owner, bytes) = deficit.unwrap();
-            exhausted = self.dependencies.memory.reclaim_plaintext_quantum(
-                &mut cursor,
-                owner.as_ref(),
-                bytes,
-                |page| self.dependencies.writer.discard_idle_copy(page),
-            );
-            // Always yield between scan quanta and the next reservation, including
-            // the final retry. Cancellation never extends the original allowance.
+            exhausted = true;
+            // Always yield before the retry. Cancellation never extends the
+            // original allowance.
             uring_runtime::drivers::yield_now().await;
         }
     }
@@ -564,6 +815,8 @@ impl Fill {
             dependencies,
             metrics: Metrics::default(),
             local_copies: Rc::new(LocalCopies::default()),
+            local_plaintext: Rc::new(LocalPlaintext::default()),
+            local_plaintext_keys: Rc::default(),
             diagnostic: None,
             fence_acquisition: false,
         }
@@ -610,9 +863,7 @@ impl Fill {
     ) -> Operation<'a, PageResult> {
         Box::pin(async move {
             match self
-                .acquire_with_prefetch(
-                    page, membership, context, scope, budget, None, true, None, true,
-                )
+                .acquire_with_prefetch(page, membership, context, scope, budget, None, true, true)
                 .await?
             {
                 AcquiredPage::Plaintext(page) => Ok(page),
@@ -630,9 +881,7 @@ impl Fill {
         budget: &mut AcquisitionBudget,
     ) -> Result<PageResult> {
         match self
-            .acquire_with_prefetch(
-                page, membership, context, scope, budget, None, true, None, false,
-            )
+            .acquire_with_prefetch(page, membership, context, scope, budget, None, true, false)
             .await?
         {
             AcquiredPage::Plaintext(page) => Ok(page),
@@ -655,34 +904,6 @@ impl Fill {
             .await
     }
 
-    pub(crate) async fn acquire_ordered(
-        &self,
-        page: PageId,
-        membership: std::sync::Arc<crate::topology::Membership>,
-        context: &OriginContext,
-        scope: &RequestScope,
-        budget: &mut AcquisitionBudget,
-        guard: std::sync::Arc<super::range_stream::FixedAcquisition>,
-    ) -> Result<PageResult> {
-        match self
-            .acquire_with_prefetch(
-                page,
-                membership,
-                context,
-                scope,
-                budget,
-                None,
-                true,
-                Some(guard),
-                true,
-            )
-            .await?
-        {
-            AcquiredPage::Plaintext(page) => Ok(page),
-            AcquiredPage::Ciphertext(_) => Err(Error::CorruptRecord),
-        }
-    }
-
     pub fn acquire_ciphertext<'a>(
         &'a self,
         page: PageId,
@@ -693,9 +914,7 @@ impl Fill {
     ) -> Operation<'a, crate::memory::CiphertextCopy> {
         Box::pin(async move {
             Ok(self
-                .acquire_with_prefetch(
-                    page, membership, context, scope, budget, None, false, None, true,
-                )
+                .acquire_with_prefetch(page, membership, context, scope, budget, None, false, true)
                 .await?
                 .copy())
         })
@@ -726,7 +945,6 @@ impl Fill {
                     budget,
                     Some(origin),
                     true,
-                    None,
                     false,
                 )
                 .await?
@@ -748,7 +966,6 @@ impl Fill {
         budget: &'a mut AcquisitionBudget,
         mut prefetch: Option<crate::origin::OriginPage>,
         plaintext: bool,
-        guard: Option<std::sync::Arc<super::range_stream::FixedAcquisition>>,
         observe: bool,
     ) -> Operation<'a, AcquiredPage> {
         Box::pin(async move {
@@ -756,8 +973,10 @@ impl Fill {
             if page.version.object != context.object {
                 return Err(Error::InvalidRequest);
             }
-            // Verified memory is already deliverable. Optional cold ownership
-            // ranking must not introduce a yield/deadline failure before it.
+            // Plaintext another reader still holds is already deliverable.
+            // Optional cold ownership ranking must not introduce a
+            // yield/deadline failure before it. Cached ciphertext without live
+            // plaintext is decrypted by the elected flight below.
             let interest = crate::retention::Interest::default();
             if let Some(result) = self
                 .metrics
@@ -841,7 +1060,6 @@ impl Fill {
                             &mut waiter,
                             &mut prefetch,
                             plaintext,
-                            guard.clone(),
                             observation,
                         )
                         .await?;
@@ -852,8 +1070,8 @@ impl Fill {
     }
 
     /// Transfer elected work to the worker driver. The caller only waits for its
-    /// remaining budget; dropping that wait cannot release accepted work or the
-    /// ordered-selection guard before the operation completes.
+    /// remaining budget; dropping that wait cannot release accepted work before
+    /// the operation completes.
     // Keep the reader's latched observation explicit at the driver handoff rather
     // than re-observing retries or coupling it to the flight's ownership guards.
     #[allow(clippy::too_many_arguments)]
@@ -864,16 +1082,39 @@ impl Fill {
         waiter: &mut AcquisitionWaiter<'_>,
         prefetch: &mut Option<crate::origin::OriginPage>,
         plaintext: bool,
-        completion_guard: Option<Arc<super::range_stream::FixedAcquisition>>,
         observation: crate::retention::Observation,
     ) -> Result<()> {
         use std::future::Future;
 
-        let ready = self.dependencies.flights.ciphertext_for(&leader)?;
-        let ready = ready.or(self.metrics.lookup(
-            LookupTier::Ciphertext,
-            self.dependencies.memory.unverified(page),
-        )?);
+        let mut shared_local = false;
+        let ready = match self.dependencies.flights.ciphertext_for(&leader)? {
+            Some(ready) => Some(ready),
+            // Cached pages retain only ciphertext. A plaintext acquisition
+            // decrypts it through the shared local plaintext job, so range
+            // probes and warm readers of the same page share one reservation
+            // and one decrypt in either arrival order.
+            None if plaintext
+                && (self.local_plaintext.get(page).is_some()
+                    || self.dependencies.memory.unverified(page)?.is_some()) =>
+            {
+                shared_local = true;
+                None
+            }
+            None => {
+                let cached = self.metrics.lookup(
+                    LookupTier::Ciphertext,
+                    self.dependencies.memory.unverified(page),
+                )?;
+                // Disk-sourced copies already counted their disk hit.
+                if cached
+                    .as_ref()
+                    .is_some_and(|cached| cached.disk_token.is_none())
+                {
+                    self.metrics.record(Event::MemoryHit, 1);
+                }
+                cached
+            }
+        };
         let driver_permit = uring_runtime::drivers::reserve().map_err(Error::from)?;
         let acquisition = waiter.acquisition(&leader)?;
         // The driver stays on this owner. Admit an independent zeroizing context
@@ -900,10 +1141,28 @@ impl Fill {
         let diagnostic_lifetime = DriverDiagnostic::lifetime(fill.diagnostic.clone());
         let flights = self.dependencies.flights.clone();
         let (send, mut receive) = futures::channel::oneshot::channel();
+        let submitted = uring_runtime::environment::now();
         driver_permit.submit_detached(Box::pin(async move {
+            fill.metrics.record_duration(
+                Event::FillDriverStartCount,
+                Event::FillDriverStartNs,
+                submitted,
+            );
+            let started = uring_runtime::environment::now();
             let _diagnostic_lifetime = diagnostic_lifetime;
-            let _completion_guard = completion_guard;
             let mut work = Box::pin(async {
+                if shared_local {
+                    // A local miss or a rejected local copy falls through to
+                    // ordinary acquisition with this flight's own rights.
+                    match fill
+                        .local_plaintext_copy(&owned_page, &owned_scope, false)
+                        .await
+                    {
+                        Ok(Some(result)) => return Ok(result.into()),
+                        Ok(None) | Err(Error::MissingKey | Error::Unavailable) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
                 if let Some(copy) = ready {
                     if !plaintext {
                         return Ok(AcquiredPage::Ciphertext(copy));
@@ -979,6 +1238,8 @@ impl Fill {
             })
             .await;
             fill.stage(DriverStage::WorkReturned);
+            fill.metrics
+                .record_duration(Event::FillDriverCount, Event::FillDriverNs, started);
             drop(work);
             operation.complete()?;
             match result {
@@ -1226,13 +1487,38 @@ impl Fill {
         scope: &RequestScope,
         want_plaintext: bool,
     ) -> Result<Option<AcquiredPage>> {
+        self.acquire_local_copy_from(page, scope, want_plaintext, None)
+            .await
+    }
+
+    /// Record the chosen copy's key in `source_key` before decrypting it, so shared
+    /// local plaintext work can admit new followers against that key.
+    async fn acquire_local_copy_from(
+        &self,
+        page: &PageId,
+        scope: &RequestScope,
+        want_plaintext: bool,
+        source_key: Option<&std::cell::Cell<Option<racer_control_wire::KeyId>>>,
+    ) -> Result<Option<AcquiredPage>> {
         scope.check()?;
         // Pending copies already own ciphertext. Disk owns a separate complete
         // staging/decoded bundle; neither source needs speculative network bytes.
-        let local = self.metrics.lookup(
+        // The memory cache retains only ciphertext, so a page whose plaintext
+        // was released is decrypted from memory before trying disk.
+        let mut cached = None;
+        let local = match self.metrics.lookup(
             LookupTier::Pending,
             self.dependencies.writer.copy_only(page),
-        )?;
+        )? {
+            Some(copy) => Some(copy),
+            None => {
+                cached = self.metrics.lookup(
+                    LookupTier::Ciphertext,
+                    self.dependencies.memory.unverified(page),
+                )?;
+                cached.as_ref().map(|cached| cached.copy.clone())
+            }
+        };
         let (local, token) = match local {
             Some(copy) => (Some(copy), None),
             None => {
@@ -1289,6 +1575,9 @@ impl Fill {
             } else {
                 DecryptSource::Retained
             };
+            if let Some(source_key) = source_key {
+                source_key.set(Some(copy.ciphertext.envelope().key_id));
+            }
             let result = async {
                 scope.check()?;
                 let reservation = self.observe_reservation(
@@ -1327,6 +1616,14 @@ impl Fill {
                     }
                     if let Some(token) = &token {
                         self.dependencies.disk.invalidate(token)?;
+                    }
+                    if let Some(cached) = &cached {
+                        self.dependencies.memory.invalidate_ciphertext(cached);
+                        // A cached copy may have been read from disk; drop the
+                        // rejected disk record too so it cannot be served again.
+                        if let Some(token) = &cached.disk_token {
+                            self.dependencies.disk.invalidate(token)?;
+                        }
                     }
                 }
                 Err(error) => return Err(error),
@@ -1370,13 +1667,17 @@ impl Fill {
             return Ok(result);
         }
         let candidates = self
-            .call(
-                DriverStage::CandidateCompositeCall,
-                self.dependencies.candidates.candidates_scoped(
-                    membership,
-                    &page.version.object,
-                    page.number,
-                    scope,
+            .timed(
+                Event::FillCandidatesCount,
+                Event::FillCandidatesNs,
+                self.call(
+                    DriverStage::CandidateCompositeCall,
+                    self.dependencies.candidates.candidates_scoped(
+                        membership,
+                        &page.version.object,
+                        page.number,
+                        scope,
+                    ),
                 ),
             )
             .await?;
@@ -1398,40 +1699,55 @@ impl Fill {
             mode: FetchMode::Acquire,
         };
         let mut hedge_continuation = super::candidates::HedgeContinuation::default();
+        let hedge_start = uring_runtime::environment::now();
         if want_plaintext
             && let Some(result) = self
-                .call(
-                    DriverStage::CandidateCompositeCall,
-                    self.dependencies.candidates.hedge_page(
-                        &candidates,
-                        context,
-                        &operation,
-                        scope,
-                        budget,
-                        &self.dependencies.admission,
-                        &mut hedge_continuation,
-                        |response, child| {
-                            Box::pin(async move {
-                                let copy = response_copy(response.response(), page)?;
-                                if let Some(existing) =
-                                    self.retained_metadata(&page.version, &child).await?
-                                    && !existing.compatible(&copy.metadata.immutable())
-                                {
-                                    return Err(Error::CorruptRecord);
-                                }
-                                let result =
-                                    self.decrypt_response(page, response, None, &child).await?;
-                                // A sibling may publish while crypto runs. Recheck before
-                                // election, not only after a winner has canceled its peer.
-                                if let Some(existing) =
-                                    self.retained_metadata(&page.version, &child).await?
-                                    && !existing.compatible(&result.metadata.immutable())
-                                {
-                                    return Err(Error::CorruptRecord);
-                                }
-                                Ok(result)
-                            })
-                        },
+                .timed(
+                    Event::FillHedgeCount,
+                    Event::FillHedgeNs,
+                    self.call(
+                        DriverStage::CandidateCompositeCall,
+                        self.dependencies.candidates.hedge_page(
+                            &candidates,
+                            context,
+                            &operation,
+                            scope,
+                            budget,
+                            &self.dependencies.admission,
+                            &mut hedge_continuation,
+                            |response, child| {
+                                Box::pin(async move {
+                                    self.metrics.record_duration(
+                                        Event::FillPeerResponseCount,
+                                        Event::FillPeerResponseNs,
+                                        hedge_start,
+                                    );
+                                    let copy = response_copy(response.response(), page)?;
+                                    if let Some(existing) =
+                                        self.retained_metadata(&page.version, &child).await?
+                                        && !existing.compatible(&copy.metadata.immutable())
+                                    {
+                                        return Err(Error::CorruptRecord);
+                                    }
+                                    let result = self
+                                        .timed(
+                                            Event::FillPeerDecryptCount,
+                                            Event::FillPeerDecryptNs,
+                                            self.decrypt_response(page, response, None, &child),
+                                        )
+                                        .await?;
+                                    // A sibling may publish while crypto runs. Recheck before
+                                    // election, not only after a winner has canceled its peer.
+                                    if let Some(existing) =
+                                        self.retained_metadata(&page.version, &child).await?
+                                        && !existing.compatible(&result.metadata.immutable())
+                                    {
+                                        return Err(Error::CorruptRecord);
+                                    }
+                                    Ok(result)
+                                })
+                            },
+                        ),
                     ),
                 )
                 .await?
@@ -1638,6 +1954,56 @@ impl Fill {
             })
     }
 
+    /// Charge for rehoming selected ciphertext. Pages that must be copied
+    /// (registered or shared) are charged the pooled aligned size class so the
+    /// copy lands in this worker's pool; exclusive pages move in place under a
+    /// charge for their current capacity.
+    fn selected_capacity(&self, ciphertext: &crate::memory::CiphertextPage) -> usize {
+        let capacity = ciphertext.inner.capacity();
+        if !ciphertext.is_registered() && Arc::strong_count(&ciphertext.inner) == 1 {
+            return capacity;
+        }
+        self.dependencies
+            .buffers
+            .aligned_capacity(ciphertext.bytes().len())
+            .map_or(capacity, |aligned| aligned.max(capacity))
+    }
+
+    /// Copy an authenticated registered RDMA page once into pooled aligned
+    /// storage before it is published and persisted, so the memory cache and
+    /// the store share one page and the RDMA buffer returns to its pool.
+    ///
+    /// Copy-out admission is optional: when it is refused even after
+    /// reclamation, the registered page is kept and the memory cache and
+    /// store copy it out under their own admission as before.
+    fn detach_registered(
+        &self,
+        ciphertext: crate::memory::CiphertextPage,
+    ) -> crate::memory::CiphertextPage {
+        if !ciphertext.is_registered() {
+            return ciphertext;
+        }
+        let buffers = &self.dependencies.buffers;
+        let Ok(capacity) = buffers.aligned_capacity(ciphertext.bytes().len()) else {
+            return ciphertext;
+        };
+        let cache = ciphertext.envelope().page.version.object.cache.clone();
+        let Ok(reservation) =
+            self.reserve_with_reclamation(&cache, ResourceClass::Ciphertext, capacity)
+        else {
+            return ciphertext;
+        };
+        // Keep a handle so a failed copy falls back to the registered page.
+        let fallback = ciphertext.clone();
+        match buffers.detach_registered(ciphertext, reservation) {
+            Ok(detached) => {
+                drop(fallback);
+                detached
+            }
+            Err(_) => fallback,
+        }
+    }
+
     pub(super) async fn decrypt(
         &self,
         page: &PageId,
@@ -1661,7 +2027,7 @@ impl Fill {
             let result = PageResult {
                 metadata: copy.metadata,
                 plaintext,
-                ciphertext: copy.ciphertext,
+                ciphertext: self.detach_registered(copy.ciphertext),
             };
             result.validate_for(page)?;
             Ok(result)
@@ -1776,6 +2142,14 @@ impl Fill {
         let owned = retention.owned_only(id).eligible();
         let admission = &self.dependencies.admission;
         let amount = result.ciphertext.bytes().len();
+        // Optional pages of an over-share cache do not displace other caches'
+        // data once free segments reach the reserve. Owned pages compete
+        // through eviction instead.
+        if !owned && self.dependencies.writer.over_share_under_pressure(cache) {
+            retention.share_rejected();
+            retention.persistence_attempt(false);
+            return;
+        }
         if !owned
             && !optional_headroom(
                 admission.limit(ResourceClass::DirtyCiphertext),
@@ -1792,6 +2166,12 @@ impl Fill {
                 .reserve(Some(cache), ResourceClass::DirtyCiphertext, amount)
                 .map_err(Error::from)
         };
+        let page_charge = result
+            .ciphertext
+            .inner
+            .reservation()
+            .amount()
+            .max(PAGE_BYTES as usize + 16);
         let dirty = self.reserve_owned_persistence(
             id,
             ResourceClass::DirtyCiphertext,
@@ -1808,9 +2188,14 @@ impl Fill {
             .dependencies
             .writer
             .enqueue_reclaiming(result.copy(), dirty, |amount| {
-                // Ciphertext owns both the immutable page and exact padded disk
-                // staging. The one-page floor includes BOTH, even on tiny slabs.
-                let one_page = (PAGE_BYTES as usize + 16).saturating_add(amount);
+                // Ciphertext owns both the immutable page and its disk staging.
+                // The one-page floor includes BOTH, even on tiny slabs. The page
+                // term is the page's own Ciphertext charge, which for aligned
+                // pages covers the padded body pool class. `amount` is the
+                // staging request: only the padded header block when persist
+                // writes the aligned body in place, or the full padded record
+                // for the copy fallback, so the floor covers either path.
+                let one_page = page_charge.saturating_add(amount);
                 // Idle aligned buffers retain Ciphertext charges after completed
                 // writes. Release that backing before headroom rejection or any
                 // destructive queued-copy reclaim; this is one bounded pool.
@@ -1830,7 +2215,7 @@ impl Fill {
     /// Reclaim against the optional ceiling, not the larger hard quota. One
     /// bounded idle-only pass advances cursors for later independent interests.
     /// Never release queued copies or submitted/live owners to admit a write.
-    fn optional_staging_headroom(&self, amount: usize, one_page: usize) -> bool {
+    pub(super) fn optional_staging_headroom(&self, amount: usize, one_page: usize) -> bool {
         let admission = &self.dependencies.admission;
         let class = ResourceClass::Ciphertext;
         let limit = admission.limit(class);
@@ -1845,9 +2230,16 @@ impl Fill {
         admission.reclaim_buffers();
         let deficit = admission.used(class).saturating_sub(available_used);
         if deficit != 0 {
-            self.dependencies
-                .memory
-                .reclaim_idle(class, None, deficit, |_| 0);
+            // Over-share caches' idle bytes go first. Zero callbacks never
+            // discard queued or submitted copies.
+            self.dependencies.memory.reclaim(
+                class,
+                None,
+                deficit,
+                |cache| admission.excess(cache, class),
+                |_, _| 0,
+                |_, _| 0,
+            );
             // Evicted payloads may have returned backing to the recycler rather
             // than releasing their charges. Drop those idle allocations too.
             admission.reclaim_buffers();
@@ -1883,11 +2275,17 @@ impl Fill {
                     ) else {
                         break;
                     };
-                    // A zero callback never discards queued writes to make a cache
-                    // entry idle. Only unleased cache allocations may disappear.
-                    self.dependencies
-                        .memory
-                        .reclaim_idle(class, cache.as_ref(), bytes, |_| 0);
+                    // Zero callbacks never discard queued writes to make a cache
+                    // entry idle. Only unleased cache allocations may disappear,
+                    // over-share caches first under global pressure.
+                    self.dependencies.memory.reclaim(
+                        class,
+                        cache.as_ref(),
+                        bytes,
+                        |cache| self.dependencies.admission.excess(cache, class),
+                        |_, _| 0,
+                        |_, _| 0,
+                    );
                     result = reserve();
                 }
                 result

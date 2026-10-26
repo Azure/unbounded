@@ -67,3 +67,36 @@ subjects:
   - kind: ServiceAccount
     name: unbounded-net-node
     namespace: {{ default "unbounded-system" .Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: unbounded-net-node
+  namespace: {{ default "unbounded-system" .Namespace }}
+  labels:
+    app.kubernetes.io/name: unbounded-net-node
+    app.kubernetes.io/component: node
+rules:
+  # Pods: acknowledge the effective assignment on this agent's own Pod.
+  # ValidatingAdmissionPolicy restricts these verbs to the bound Pod and the
+  # two effective assignment annotations.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: unbounded-net-node
+  namespace: {{ default "unbounded-system" .Namespace }}
+  labels:
+    app.kubernetes.io/name: unbounded-net-node
+    app.kubernetes.io/component: node
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: unbounded-net-node
+subjects:
+  - kind: ServiceAccount
+    name: unbounded-net-node
+    namespace: {{ default "unbounded-system" .Namespace }}

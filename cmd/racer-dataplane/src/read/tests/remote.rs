@@ -303,6 +303,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
             name: "remote".into(),
             client_socket: "/run/racer/remote/client/socket".into(),
             origin_socket: "/run/racer/remote/origin/socket".into(),
+            priority: racer_control_wire::DEFAULT_PRIORITY,
         }],
         members: (0..4)
             .map(|i| racer_control_wire::Member {
@@ -354,7 +355,6 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     let transfers = Rc::new(Transfers::new(
         Rc::new(crate::http::new_pool(reactor.clone(), admission.clone(), 2)),
         io.clone(),
-        None,
         admission.clone(),
         codec.clone(),
         a.signatures.clone(),
@@ -550,7 +550,6 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
                                     range: None,
                                     page_credits: 1,
                                     byte_credits: crate::model::PAGE_BYTES,
-                                    ordered: false,
                                 }
                             } else {
                                 ReadKind::Head
@@ -932,6 +931,7 @@ fn metadata_coordinator_with_newer_publication(
             name: "remote".into(),
             client_socket: "/run/racer/remote/client/socket".into(),
             origin_socket: "/run/racer/remote/origin/socket".into(),
+            priority: racer_control_wire::DEFAULT_PRIORITY,
         }],
     };
     snapshots.apply(publication.clone()).unwrap();

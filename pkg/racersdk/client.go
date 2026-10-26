@@ -33,8 +33,9 @@ type ClientConfig struct {
 	// MaxConnections bounds concurrent [Client.Get] transfers without
 	// [ReadOptions.SmallObject]. Zero means 64. SmallObject transfers have a
 	// separate four-slot lane. [Client.Stat] and [Client.Warm] share another
-	// four-slot lane. Each lane has a bounded queue; calls fail with
-	// [ErrUnavailable] if it is full or the wait times out.
+	// lane with MaxConnections slots, so every transfer can be preceded by a
+	// Stat. Each lane has a bounded queue; calls fail with [ErrUnavailable] if
+	// it is full or the wait times out.
 	MaxConnections int
 }
 
@@ -46,8 +47,12 @@ const (
 	bulkQueue             = 128
 	smallConnections      = 4
 	smallQueue            = 128
-	statConnections       = 4
-	statQueue             = 16
+	statQueue             = 128
+	// statIdleConnections bounds pooled Stat and Warm connections apart from
+	// the Stat lane. Racer holds an ingress slot for each open connection,
+	// and Get always dials, so a burst of Stats must not leave the pool
+	// holding the slots a later Get needs.
+	statIdleConnections = 4
 	// pageCredits is the number of pages Racer may send ahead of the reader.
 	pageCredits = 2
 )
@@ -73,8 +78,9 @@ var defaultClientLimits = clientLimits{
 // Client reads objects from a Racer cache over its local Unix socket. It is
 // safe for concurrent use; create one per cache and share it.
 type Client struct {
-	path   string
-	limits clientLimits
+	path    string
+	limits  clientLimits
+	maxIdle int
 
 	bulk, small, stat lane
 
@@ -122,13 +128,14 @@ func newClient(config ClientConfig, path string) (*Client, error) {
 	ctx, cancel := context.WithCancelCause(context.Background())
 
 	return &Client{
-		path:   path,
-		limits: defaultClientLimits,
-		bulk:   newLane(config.MaxConnections, bulkQueue),
-		small:  newLane(smallConnections, smallQueue),
-		stat:   newLane(statConnections, statQueue),
-		ctx:    ctx,
-		cancel: cancel,
+		path:    path,
+		limits:  defaultClientLimits,
+		maxIdle: min(statIdleConnections, config.MaxConnections),
+		bulk:    newLane(config.MaxConnections, bulkQueue),
+		small:   newLane(smallConnections, smallQueue),
+		stat:    newLane(config.MaxConnections, statQueue),
+		ctx:     ctx,
+		cancel:  cancel,
 	}, nil
 }
 
@@ -202,6 +209,8 @@ func (c *Client) Stat(ctx context.Context, request Request) (Metadata, error) {
 // ttl must be positive and is rounded up to whole seconds. A duration whose
 // rounded value overflows time.Duration is invalid. A zero RetainUntil means
 // Racer refused retention; metadata is still returned. Warm shares Stat's lane.
+// Pages are held on each page's primary owner in the cache cluster, which is
+// not always the local node. Reads on this node wait for warm progress.
 func (c *Client) Warm(ctx context.Context, request Request, ttl time.Duration, opts WarmOptions) (WarmResult, error) {
 	const op = "warm"
 
@@ -359,7 +368,6 @@ func (c *Client) Get(ctx context.Context, request Request, options ...ReadOption
 		Length:      uint64(o.Length),
 		PageCredits: pageCredits,
 		ByteCredits: pageCredits * PageSize,
-		Ordered:     true,
 		SmallObject: o.SmallObject,
 		Pin:         o.ETag,
 	}
@@ -447,7 +455,7 @@ func (c *Client) open(ctx context.Context, head []byte, o wire.SubscriptionOptio
 		conn:     conn,
 		timeout:  c.limits.bodyTimeout,
 		metadata: fromWireMetadata(response.Metadata),
-		seq:      wire.NewSequence(response.First, response.End, true),
+		seq:      wire.NewSequence(response.First, response.End),
 		first:    response.First,
 		end:      response.End,
 		pages:    response.Pages,
@@ -571,7 +579,7 @@ func (c *Client) recycle(conn *clientConn) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.ctx.Err() != nil || len(c.idle) >= statConnections {
+	if c.ctx.Err() != nil || len(c.idle) >= c.maxIdle {
 		closeQuietly(conn)
 		return
 	}

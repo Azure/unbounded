@@ -201,12 +201,12 @@ func TestWriteCNIConfigWritesExpectedConflist(t *testing.T) {
 		t.Fatalf("unexpected bridge plugin config: %#v", got.Plugins[0])
 	}
 
-	if len(got.Plugins[0].IPAM.Ranges) != 2 {
-		t.Fatalf("expected two IPAM ranges, got %d", len(got.Plugins[0].IPAM.Ranges))
+	if got.Plugins[0].IPAM.Type != "unbounded-ipam" || got.Plugins[0].IPAM.SocketPath != "" {
+		t.Fatalf("expected argument-free unbounded-ipam, got %#v", got.Plugins[0].IPAM)
 	}
 
-	if got.Plugins[0].IPAM.Ranges[0][0].Subnet != podCIDRs[0] || got.Plugins[0].IPAM.Ranges[1][0].Subnet != podCIDRs[1] {
-		t.Fatalf("unexpected IPAM ranges: %#v", got.Plugins[0].IPAM.Ranges)
+	if strings.Contains(string(raw), "10.244.0.0") || strings.Contains(string(raw), "fd00:10::") {
+		t.Fatalf("conflist contains cached PodCIDRs: %s", raw)
 	}
 
 	if _, err := os.Stat(confPath + ".tmp"); !os.IsNotExist(err) {
@@ -487,6 +487,21 @@ func TestAnnotateNodeWithPubKeyAndTaintGatewayNode(t *testing.T) {
 
 	if count != 1 {
 		t.Fatalf("expected exactly one gateway taint, got %d taints=%#v", count, node.Spec.Taints)
+	}
+
+	if err := removeGatewayNodeTaint(ctx, client, nodeName); err != nil {
+		t.Fatalf("removeGatewayNodeTaint returned error: %v", err)
+	}
+
+	node, err = client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get node after taint removal failed: %v", err)
+	}
+
+	for _, taint := range node.Spec.Taints {
+		if taint.Key == GatewayNodeTaintKey {
+			t.Fatalf("gateway taint retained after removal: %#v", node.Spec.Taints)
+		}
 	}
 }
 

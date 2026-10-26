@@ -331,25 +331,123 @@ metrics:
 {{< callout type="warning" >}}
 Racer is pre-release. Its APIs, flags, and on-disk formats may change without a
 migration path. Cached data is disposable; Racer is not durable storage. Start
-with the [racer-object guide]({{< relref "guides/racer-object" >}}).
+with the [Azure Blob cache guide]({{< relref "guides/azure-blob-cache" >}}).
 {{< /callout >}}
 
 The installation and distribution flow above describe Gantry's default containerd
-backend. Racer mode instead uses Racer for object caching and peer reads, with
-Gantry supplying the registry origin adapter. Racer needs the
-Unbounded operator and the [node requirements]({{< relref "reference/racer" >}}#node-requirements).
-Create this cluster-scoped cache:
+backend. In Racer mode, Racer caches image content and shares it between nodes.
+Gantry still serves the local registry mirror, and it reads from upstream
+registries when Racer asks for content it does not have. Gantry does not use
+containerd storage or its own peer network in this mode.
+
+Racer mode needs the operator-managed Gantry install and the Racer
+[node requirements]({{< relref "reference/racer" >}}#node-requirements). The
+standalone Helm chart does not support Racer mode.
+
+### Turn On Racer Mode
+
+1. Enable Gantry on a Site. Gantry is on by default for every Site unless
+   `spec.components.gantry.enabled` is `false`.
+2. Create a cluster-scoped cache named `gantry`:
+
+   ```yaml
+   apiVersion: racer.unbounded-cloud.io/v1alpha1
+   kind: ClusterCache
+   metadata:
+     name: gantry
+   ```
+
+   Do not set `spec.origin` on this cache. Gantry is its origin. If
+   `spec.origin` is set, the operator keeps Gantry in default mode and reports
+   the reason `RacerOriginConflict`.
+
+Creating any ClusterCache makes the operator install Racer. When the `gantry`
+cache exists and Gantry is enabled, the operator changes the `gantry`
+DaemonSet in `unbounded-system`:
+
+- It sets `GANTRY_RACER_ENABLED=true`.
+- It mounts the Racer sockets from `/run/racer/gantry/client` and
+  `/run/racer/gantry/origin`.
+- It copies node affinity, node selector, and tolerations from the
+  `racer-dataplane` DaemonSet. Gantry then runs on every Racer node, so each
+  node can serve origin reads for the cache.
+
+The operator waits for `racer-dataplane` to exist before it makes these
+changes. The cache does not install Gantry. If no Site enables Gantry, the
+`gantry` cache is a plain Racer cache. The exception is a Gantry install the
+operator already manages. It stays in place after every Site turns Gantry off,
+and it still switches to Racer when the `gantry` cache exists. Workload
+overrides on the `gantry` DaemonSet still apply on top of these changes.
+
+### Configure Upstream Registries
+
+The operator creates `ConfigMap/gantry-config` in `unbounded-system` once and
+does not overwrite it. Edit `upstream_registries` there:
 
 ```yaml
-apiVersion: racer.unbounded-cloud.io/v1alpha1
-kind: ClusterCache
-metadata:
-  name: gantry
+upstream_registries:
+  - name: "registry.example.com"
+    endpoint: "https://registry.example.com"
 ```
 
-Creating any ClusterCache triggers operator-managed Racer installation.
+In Racer mode:
 
-Racer must run on the same nodes as Gantry. Run one Gantry origin owner on every
-eligible node that can supply origin reads for this cache, with consistent
-upstream registry configuration. Match placement and tolerations; installing
-Gantry on only the requesting nodes is not sufficient.
+- `name` must be a bare `host` or `host:port`, with no scheme or path.
+- Gantry fetches only from registries in this list. Requests for other
+  registries return `404`.
+- Gantry uses only requester-delegated credentials. It ignores
+  `credentials_path`. Delegated credentials need an `https` endpoint; `http`
+  endpoints work only for anonymous registries.
+- Containerd and the transfer listener are not used.
+
+Use the same `gantry-config` on every node. Any node can be asked to read from
+an upstream registry.
+
+### Verify Racer Mode
+
+Check that the DaemonSet runs in Racer mode and that each pod is ready:
+
+```bash
+kubectl -n unbounded-system get daemonset gantry \
+    -o jsonpath='{.spec.template.spec.containers[?(@.name=="gantry")].env}'
+kubectl -n unbounded-system rollout status daemonset/gantry
+kubectl -n unbounded-system logs -l app.kubernetes.io/name=gantry -c gantry \
+    --prefix --tail=-1 | grep "mirror startup gate released"
+```
+
+`/readyz` returns `503` until both Racer sockets accept connections. Then pull
+an image from a configured registry and check these metrics:
+
+| Signal | Expected result |
+| --- | --- |
+| `gantry_racer_mirror_requests_total{method,status,outcome}` | Increases for each mirror request served through Racer. |
+| `gantry_racer_mirror_bytes_total{method}` | Counts bytes sent to local containerd. |
+| `gantry_racer_mirror_duration_seconds` | Shows mirror request latency. |
+| `gantry_racer_origin_requests_total{method,status}` | Increases when Racer asks this node to read from an upstream registry. Stays flat when Racer already has the content. |
+| `gantry_racer_origin_bytes_total{kind}` | Counts bytes read from upstream registries. |
+
+### Troubleshooting
+
+- Every response from the Racer backend has a `Gantry-Racer-Request-ID`
+  header. Search Gantry logs for that ID.
+- A `503` from the mirror means Racer was not available. Gantry does not fall
+  back to its own peer network in Racer mode. Containerd handles the error as it
+  does for any failed mirror host.
+- A `404` without a `Gantry-Racer-Request-ID` header means the registry is not
+  in `upstream_registries`.
+- If Gantry pods stay not ready, check the `racer-dataplane` pod on the same
+  node and confirm that `/run/racer/gantry/client` and
+  `/run/racer/gantry/origin` exist.
+- If the operator reports `RacerPending` for Gantry, it is waiting for the
+  `racer-dataplane` DaemonSet.
+
+### Turn Off Racer Mode
+
+Delete the cache:
+
+```bash
+kubectl delete clustercache gantry
+```
+
+The operator removes the Racer settings and rolls Gantry back to the
+containerd backend. Racer stays installed while other ClusterCaches exist.

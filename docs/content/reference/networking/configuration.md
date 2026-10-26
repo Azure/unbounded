@@ -173,6 +173,111 @@ unless another Node or pending assignment still owns the CIDR.
 
 ## Node Agent Configuration
 
+### Large-cluster neighbor tables
+
+The node agent automatically sizes the IPv4 and IPv6 neighbor tables from the
+mesh endpoints it uses. No ConfigMap setting or command-line flag is required.
+Configured tunnel endpoints and currently learned WireGuard endpoints are
+included; a learned-only peer cannot be counted until its endpoint is known.
+Each reconciliation resolves the endpoints' routes and counts unique next-hop
+IP/interface pairs separately for each address family. Directly connected
+endpoints each need a neighbor entry; endpoints reached through the same router
+on the same interface share one. Live multipath next hops are included, while
+local routes, loopback, NOARP devices, and managed tunnel devices are excluded.
+
+The agent raises these thresholds when needed:
+
+| Sysctl | Minimum | For 2,000 next hops in that family |
+|--------|---------|----------------|
+| `net.ipv4.neigh.default.gc_thresh1` | 110% of IPv4 next hops, rounded up | 2200 |
+| `net.ipv4.neigh.default.gc_thresh2` | 120% of IPv4 next hops, rounded up | 2400 |
+| `net.ipv4.neigh.default.gc_thresh3` | 130% of IPv4 next hops, rounded up | 2600 |
+| `net.ipv6.neigh.default.gc_thresh1` | 110% of IPv6 next hops, rounded up | 2200 |
+| `net.ipv6.neigh.default.gc_thresh2` | 120% of IPv6 next hops, rounded up | 2400 |
+| `net.ipv6.neigh.default.gc_thresh3` | 130% of IPv6 next hops, rounded up | 2600 |
+
+Existing higher values are never reduced. Higher lower thresholds also act as
+floors for the upper thresholds to keep them ordered. The agent raises the
+hard limit first. Peer changes and periodic reconciliation recheck the routes
+even when mesh membership is unchanged. Removing peers or switching to shared
+routers never lowers existing values. A family with no resolved neighbor next
+hops is left untouched, without any sysctl reads or writes.
+
+An unexpected route lookup error, or a required sysctl that cannot be read,
+parsed, or raised, fails that reconciliation with an explicit error and is
+retried on a subsequent reconciliation. Unreachable endpoints are skipped.
+On hosts without the IPv6 neighbor
+table (`net.ipv6.neigh.default.gc_thresh1` is absent), the agent logs that IPv6
+tuning is skipped; permission errors, invalid values, and other missing
+thresholds still fail reconciliation.
+
+Despite the `default` path, Linux implements these as table-wide limits shared
+by **all interfaces**, including subsequently created ones. There is no
+`neigh/all/gc_thresh*` or per-interface `gc_thresh*` to set. IPv6 has a separate
+neighbor table sized from its own next-hop count. See the
+[kernel IP sysctl reference](https://docs.kernel.org/networking/ip-sysctl.html)
+and [neighbor sysctl registration](https://github.com/torvalds/linux/blob/master/net/core/neighbour.c).
+
+This is a minimum for mesh traffic, not a complete host-capacity estimate.
+Neighbor entries can also include local pods and unrelated directly connected
+hosts, which are not counted here. Existing larger operator-set values are
+preserved. Sizing is reapplied after an agent restart or host reboot; the agent
+does not write host `/etc/sysctl.d` files or restore lower values at shutdown.
+
+#### Neighbor table exhaustion warnings
+
+Before tuning, each reconciliation checks the host network namespace's actual
+IPv4 and IPv6 neighbor occupancy against that family's current `gc_thresh3`.
+Permanent, externally learned, externally validated, and loopback entries are
+excluded because they do not count toward the kernel's GC limit. Reaching or
+exceeding the limit produces a `neighborTableFullIPv4` or
+`neighborTableFullIPv6` warning: forced garbage collection may be needed before
+new neighbors can be allocated.
+
+The agent also watches per-CPU `table_fulls` counters in
+`/proc/net/stat/arp_cache` and `/proc/net/stat/ndisc_cache`. Increases indicate
+actual allocation failures at the GC hard limit and produce
+`neighborTableOverflowIPv4` or `neighborTableOverflowIPv6` warnings. These kernel
+counters also catch short-lived exhaustion between samples and failures caused
+by demand in other network namespaces. The initial sample establishes a
+baseline; historical failures are not repeatedly reported as new events.
+
+Warnings are logged and sent to the controller in both full and summary node
+status. An observed pressure or overflow warning remains visible for one minute
+after its last observation, even if automatic tuning raises the limit in the
+same cycle. Observation failures are reported separately as
+`neighborTableCheckFailed`, not as healthy or exhausted tables. Missing IPv6
+thresholds and unavailable proc counter files are skipped.
+
+#### Other scale-sensitive sysctls
+
+These require workload measurements, not a universal multiplier of node count,
+so automatic neighbor sizing does not change them:
+
+| Area | Sysctls | When to adjust |
+|------|---------|----------------|
+| Connection tracking | `net.netfilter.nf_conntrack_max`, `net.netfilter.nf_conntrack_buckets` | Increase for concurrent tracked flows and provision memory and hash buckets together. Check `nf_conntrack_count`, table-full messages, and insertion failures. The node agent already warns at 80% usage. Coordinate with kube-proxy, which can manage conntrack settings. |
+| Receive processing | `net.core.netdev_max_backlog`, `net.core.netdev_budget`, `net.core.netdev_budget_usecs` | Investigate `/proc/net/softnet_stat` drops and budget exhaustion before increasing queue or CPU-processing budgets. More queueing can increase latency. |
+| Socket buffers | `net.core.rmem_max`, `net.core.wmem_max`, `net.ipv4.udp_mem` | Tune for measured UDP/tunnel receive drops and memory pressure. Larger maximums alone do not enlarge an application's socket buffers. |
+| TCP connection bursts | `net.core.somaxconn`, `net.ipv4.tcp_max_syn_backlog` | Increase for measured listen/SYN queue overflow, with a matching application listen backlog. |
+| Fragment reassembly | `net.ipv4.ipfrag_high_thresh`, `net.ipv6.ip6frag_high_thresh` | Consider only if fragmentation counters show reassembly pressure; correct tunnel MTU first rather than masking fragmentation with memory. |
+
+Fragment reassembly thresholds are **memory limits in bytes**, not fragment
+or node counts. The corresponding retention timeouts are
+`net.ipv4.ipfrag_time` and `net.ipv6.ip6frag_time`, in seconds. Longer timeouts
+retain incomplete datagrams longer and can increase memory pressure. Inspect
+`IpReasmFails`/`IpReasmTimeout` and `Ip6ReasmFails`/`Ip6ReasmTimeout` when
+diagnosing reassembly loss. `net.ipv4.ipfrag_low_thresh` is obsolete on modern
+kernels; it is not an additional capacity knob to increase.
+
+Do not tune `net.ipv4.route.max_size`: Linux no longer uses the IPv4 route
+cache. IPv6 `route.max_size` is also deprecated on modern kernels. Do not
+adjust `neigh.default.gc_interval`, which is unused, to address table overflow.
+
+References: [IP sysctls](https://docs.kernel.org/networking/ip-sysctl.html),
+[network core sysctls](https://docs.kernel.org/admin-guide/sysctl/net.html),
+and [conntrack sysctls](https://docs.kernel.org/networking/nf_conntrack-sysctl.html).
+
 ### General
 
 | Flag | Default | Env Var | Description |
@@ -213,11 +318,18 @@ encapsulation overhead. For example, WireGuard over a 1500-byte route uses
 **Behavior:**
 - Each peer's effective MTU is the lowest applicable configured cap, CRD
   `tunnelMTU`, and route MTU after encapsulation overhead.
-- Sites and GatewayPools form a topology connected by SitePeerings,
-  SiteGatewayPoolAssignments, and GatewayPoolPeerings. The lowest `tunnelMTU`
-  in the local site's connected topology is applied site-wide, including
-  downstream multi-hop gateway paths.
-- The CNI MTU is the lowest effective peer or connected-topology MTU.
+- Forwarding-path scopes constrain a node. Direct mesh
+  peers use both endpoint Sites and their enabled SitePeering. Gateway paths
+  use assignments targeting the worker's own Site, the selected GatewayPool,
+  and GatewayPoolPeerings present in an advertised transit path.
+- Direct-mesh components also share the lowest configured Site or enabled
+  mesh-peering MTU. If A meshes with B at 1200 and C at 1400, A's shared pod
+  interfaces use 1200, so C must also use 1200 when sending to A. This propagates
+  an interface constraint, not B-C routes. Disabled and `meshNodes: false`
+  peerings, missing Sites, and disconnected components do not contribute.
+  Gateway assignments and pool peerings do not join direct-mesh components.
+- The CNI MTU is the lowest effective MTU among actual mesh and gateway peers
+  and the configured direct-mesh component cap.
 - At startup and whenever the effective CNI MTU changes, the node agent updates
   the CNI bridge and both endpoints of existing pod veth pairs.
 - Forwarded TCP SYN packets on every interface are MSS-clamped to the

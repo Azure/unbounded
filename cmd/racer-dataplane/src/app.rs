@@ -44,8 +44,7 @@ use crate::peer::forwarding::Forwarding;
 use crate::peer::protocol::Signatures;
 use crate::peer::server::PeerServer;
 use crate::peer::transport::Transfers;
-use crate::rdma::Devices;
-use crate::rdma::Sessions;
+use crate::rdma::Links;
 use crate::read::Coordinator;
 use crate::read::candidates::CandidatePolicy;
 use crate::read::dispatch::WorkerDirectory;
@@ -134,6 +133,11 @@ pub struct NodeState {
     devices: Option<devices::Plan>,
     inventory: Arc<crate::rdma::Inventory>,
 
+    /// Startup-fixed selector and claimed disks for `/debug/hardware`.
+    /// Shared via `Arc` so each request clones a pointer, not the disk list;
+    /// the report's own copy is still charged against the walk budget.
+    hardware: Arc<crate::hardware::Context>,
+
     send_crc: crate::telemetry::Samples,
 
     profiling: std::sync::OnceLock<Arc<crate::profiling::ProfilingController>>,
@@ -172,9 +176,12 @@ pub struct NodeState {
 
     observations: Observations,
 
-    native: native::NativePairs,
+    native: native::NativeNode,
 
     cache_rollout: controlplane::Rollout<WorkerId, Vec<CacheDefinition>>,
+
+    /// Process-wide memory-pressure level, written only by the control worker.
+    pressure: crate::pressure::SharedPressure,
 }
 
 impl Default for NodeState {
@@ -204,6 +211,7 @@ impl NodeState {
             devices: None,
             peer_receive: Default::default(),
             inventory: Arc::new(crate::rdma::Inventory::default()),
+            hardware: Default::default(),
             send_crc: Default::default(),
             profiling: Default::default(),
             hedges: std::sync::OnceLock::new(),
@@ -224,7 +232,8 @@ impl NodeState {
             periodic_checkpoint: Mutex::new(CheckpointCut::default()),
             recovery: Mutex::new(recovery::RecoveryCut::default()),
             observations: Observations::default(),
-            native: native::NativePairs::default(),
+            native: native::NativeNode::default(),
+            pressure: Default::default(),
         })
     }
 }
@@ -290,7 +299,15 @@ impl Application {
                 .checkpoint_bytes =
                 std::num::NonZeroUsize::new(devices.checkpoint_bytes).ok_or(Error::Internal)?;
         }
-        Arc::get_mut(&mut self.node).ok_or(Error::Internal)?.devices = devices;
+        let node = Arc::get_mut(&mut self.node).ok_or(Error::Internal)?;
+        node.hardware = Arc::new(crate::hardware::Context {
+            block_device_selector: selector.clone(),
+            claimed_disks: devices
+                .as_ref()
+                .map(devices::Plan::claimed_disks)
+                .unwrap_or_default(),
+        });
+        node.devices = devices;
         Arc::get_mut(&mut self.config)
             .ok_or(Error::InvalidConfiguration)?
             .node = identity;
@@ -532,6 +549,8 @@ pub struct WorkerApplication {
 
     next_health: std::time::Instant,
 
+    pressure: WorkerPressure,
+
     environment: uring_runtime::environment::Environment,
 
     drivers: Rc<uring_runtime::drivers::DriverQueue>,
@@ -562,17 +581,13 @@ pub struct WorkerApplication {
     /// Same table as Fill; the worker drives abandoned work without user futures.
     flights: Rc<Flights>,
 
-    rdma: Option<Rc<Sessions>>,
-
-    devices: Option<Rc<Devices>>,
+    links: Option<Rc<Links>>,
 
     discovered_nics: Vec<racer_control_wire::RailMapping>,
 
     actual_rails: Vec<racer_control_wire::RailMapping>,
 
     inventory_generation: u64,
-
-    native_numa: Option<native::NativePlacement>,
 
     native_task: Option<Operation<'static, Vec<racer_control_wire::RailMapping>>>,
 
@@ -622,6 +637,9 @@ pub struct WorkerApplication {
     diagnostic_scope: Option<RequestScope>,
 
     diagnostics_address: std::net::SocketAddr,
+
+    /// Root holding `disk/by-id`, reported by `/debug/hardware`.
+    device_directory: std::path::PathBuf,
 
     listener_scope: Option<RequestScope>,
 
@@ -802,7 +820,8 @@ impl WorkerApplication {
             runtime.crypto.clone(),
         ));
         let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
-        let crypto = Rc::new(PageCrypto::new(keys.clone(), runtime.crypto.clone()));
+        let is_sampler = worker == node.control_worker;
+        let node_pressure = node.pressure.clone();
         let control = if worker == node.control_worker {
             Some(Self::assemble_control(
                 config,
@@ -832,8 +851,20 @@ impl WorkerApplication {
             admission.clone(),
             crate::model::PAGE_BYTES + 16,
         ));
-        let buffers = BufferPool::new(admission.clone());
+        // Aligned ciphertext matches this worker's store devices so pages can
+        // be written without copying; file-backed slabs use the 4 KiB default.
+        let buffers = BufferPool::with_alignment(
+            admission.clone(),
+            node.devices
+                .as_ref()
+                .map_or_else(crate::memory::default_disk_alignment, |plan| {
+                    plan.workers[worker.0 as usize].alignment
+                }),
+        );
         let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
+        let crypto = Rc::new(
+            PageCrypto::new(keys.clone(), runtime.crypto.clone()).with_buffers(buffers.clone()),
+        );
         let pipes = Rc::new(new_pipe_pool(admission.clone()));
         let delivery = Rc::new(
             Delivery::new(reactor.clone(), config.reader_stall_timeout)
@@ -852,18 +883,21 @@ impl WorkerApplication {
         let disk = store.reader.clone();
         let writer = store.writer.clone();
 
-        let (sessions, rdma, devices) = if config.enable_rdma {
-            let devices = Rc::new(Devices::with_reactor(reactor.clone()));
-            if let Some(port) = node.native.io(worker)? {
-                devices.attach(port)?;
-            }
-            let sessions = Rc::new(Sessions::new(
-                devices.clone(),
-                config.limits.connections_per_neighbor.get(),
-            ));
-            (Some(sessions.clone()), Some(sessions), Some(devices))
+        let links = if config.enable_rdma {
+            node.native.client(worker)?.map(|client| {
+                Rc::new(
+                    Links::new(
+                        client,
+                        node.native.link_node(),
+                        config.node.clone(),
+                        limits.connections_per_neighbor.get(),
+                        Some(reactor.clone()),
+                    )
+                    .with_metrics(metrics.clone()),
+                )
+            })
         } else {
-            (None, None, None)
+            None
         };
 
         let paths = Rc::new(
@@ -889,7 +923,6 @@ impl WorkerApplication {
         let transfers = Transfers::new(
             http.clone(),
             io.clone(),
-            rdma.clone(),
             admission.clone(),
             wire.clone(),
             signatures.clone(),
@@ -908,8 +941,8 @@ impl WorkerApplication {
             memory.clone(),
             writer.clone(),
         ));
-        let transfers = Rc::new(match &sessions {
-            Some(sessions) => transfers.with_native(sessions.clone()),
+        let transfers = Rc::new(match &links {
+            Some(links) => transfers.with_links(links.clone()),
             None => transfers,
         });
         let requester = Rc::new(
@@ -1054,12 +1087,10 @@ impl WorkerApplication {
             coordinator,
             metadata,
             flights,
-            rdma,
-            devices,
+            links,
             discovered_nics,
             actual_rails: Vec::new(),
             inventory_generation: 0,
-            native_numa: node.native.numa(worker)?,
             native_task: None,
             native_retry: uring_runtime::environment::now(),
             telemetry: Rc::new(telemetry),
@@ -1086,6 +1117,7 @@ impl WorkerApplication {
             diagnostic_task: None,
             diagnostic_scope: None,
             diagnostics_address: config.diagnostics_listen,
+            device_directory: config.device_directory.clone(),
             listener_scope: None,
             task_scope: None,
             peer_address: config.peer_listen,
@@ -1102,6 +1134,7 @@ impl WorkerApplication {
             cache_preparing_generation: 0,
             control_scope: None,
             next_health: uring_runtime::environment::now(),
+            pressure: WorkerPressure::new(config.memory_pressure, &node_pressure, is_sampler),
         })
     }
 
@@ -1321,6 +1354,10 @@ impl WorkerApplication {
             config.admission_period,
             config.admission_mode == crate::config::AdmissionMode::SecondSight,
         )?));
+        // Disk shares use the same priority table as memory flow control.
+        writer
+            .retention()
+            .set_weights(runtime.admission.policy().weights().clone());
         metrics.observe_retention(writer.retention().snapshot());
         Ok(Store {
             reader,
@@ -1352,13 +1389,16 @@ impl WorkerApplication {
                 let Some((owner, bytes)) = admission.reclamation(cache, class, amount) else {
                     break;
                 };
-                let released = memory.reclaim_idle(class, owner.as_ref(), bytes, |page| {
-                    writer.discard_idle_copy(page)
-                });
-                if released < bytes {
-                    writer.reclaim_ciphertext(owner.as_ref(), bytes - released);
-                }
-                admission.reclaim_buffers();
+                // Global pressure takes over-share caches' idle bytes first.
+                memory.reclaim(
+                    class,
+                    owner.as_ref(),
+                    bytes,
+                    |cache| admission.excess(cache, class),
+                    |page, ciphertext| writer.discard_idle_copy(page, ciphertext),
+                    |cache, bytes| writer.reclaim_ciphertext(cache, bytes),
+                );
+                memory.buffers().reclaim_idle_buffers();
             }
         }
     }
@@ -1373,29 +1413,18 @@ impl WorkerApplication {
             && self.native_task.is_some()
         {
             self.native_task.take();
-            if let Some(devices) = &self.devices {
-                devices.close();
-            }
+            self.close_native();
         }
         if !self.actual_rails.is_empty() {
+            let registered = self
+                .runtime
+                .admission
+                .limit(crate::admission::ResourceClass::Registered);
             let compatible = self.native_publication().is_ok_and(|published_rails| {
-                published_rails.len() == self.actual_rails.len()
-                    && self.actual_rails.iter().all(|actual| {
-                        published_rails.iter().any(|published| {
-                            published.rail == actual.rail
-                                && published.device == actual.device
-                                && published.port == actual.port
-                                && published.gid.is_none_or(|gid| actual.gid == Some(gid))
-                                && published
-                                    .numa_node
-                                    .is_none_or(|numa| actual.numa_node == Some(numa))
-                        })
-                    })
+                native::rails_compatible(published_rails, &self.actual_rails, registered)
             });
             if !compatible {
-                if let Some(devices) = &self.devices {
-                    devices.close();
-                }
+                self.close_native();
                 self.actual_rails.clear();
             }
         }
@@ -1409,6 +1438,12 @@ impl WorkerApplication {
             }
         }
         current_scope.check()?;
+        // Priority changes apply live: memory shares are recomputed now, disk
+        // shares on the next ranking pass.
+        let admission = &self.runtime.admission;
+        if admission.policy().weights().update(&snapshot.caches) {
+            admission.reweigh();
+        }
         self.caches = snapshot.caches.clone();
         self.snapshot_sequence = Some(snapshot.sequence);
         Ok(())
@@ -1445,6 +1480,8 @@ impl WorkerApplication {
         stage_result(worker, "checkpoint", self.poll_checkpoint(cx))?;
         stage_result(worker, "ingress", self.poll_ingress(cx, budget))?;
         self.http.poll_waiters(budget);
+        self.poll_pressure(now);
+        self.maintain_pools(now);
         if let Some(gate) = self.node.peer_receive.get() {
             gate.poll_deadlines(budget);
         }
@@ -1464,10 +1501,141 @@ impl WorkerApplication {
         }
         let now = uring_runtime::environment::now();
         if now >= self.next_health {
+            self.observe_memory(now);
+            self.reclaim_cache_under_pressure();
             stage_result(worker, "health", self.observe_health())?;
             self.next_health = now + Duration::from_millis(100);
         }
         Ok(())
+    }
+
+    /// Advance demand sizing of the idle recycler, staging, and aligned pools.
+    /// Each pool is O(1) until its observation window elapses.
+    fn maintain_pools(&self, now: std::time::Instant) {
+        self.runtime.admission.maintain_buffers(now);
+        self.store.writer.maintain_staging(now);
+        // Expire idle cache entries first so their buffers reach the pools
+        // before those decay.
+        self.memory.expire_idle(now);
+        self.memory.buffers().maintain_idle_buffers(now);
+    }
+
+    /// Sample memory pressure on the sampling worker, then apply any level
+    /// change on this worker. O(1) between samples and level changes.
+    fn poll_pressure(&mut self, now: std::time::Instant) {
+        let Some(shared) = self.pressure.shared.clone() else {
+            return;
+        };
+        if let Some(monitor) = self.pressure.monitor.as_mut() {
+            let from = monitor.level();
+            let changed = monitor.poll(now);
+            let level = monitor.level();
+            if let Some(level) = changed {
+                let sample = monitor.last_sample().copied().unwrap_or_default();
+                eprintln!(
+                    "racer-dataplane: worker={} stage=memory-pressure from={from:?} to={level:?} cgroup_current_bytes={} cgroup_limit_bytes={} psi_some_avg10={} resident_bytes={}",
+                    self.worker.0,
+                    sample.current.map_or(-1, |v| v as i128),
+                    sample.limit.map_or(-1, |v| v as i128),
+                    sample.some_avg10.unwrap_or(-1.0),
+                    sample.resident.map_or(-1, |v| v as i128),
+                );
+                let metrics = &self.telemetry.metrics;
+                metrics.record(crate::telemetry::Event::MemoryPressureTransitions, 1);
+                metrics.set_gauge(crate::telemetry::Gauge::MemoryPressureLevel, level as u64);
+            }
+            let entered = changed.is_some_and(|level| level > from);
+            if self.pressure.trims.due(now, level, entered) {
+                crate::pressure::trim_allocator();
+                self.telemetry
+                    .metrics
+                    .record(crate::telemetry::Event::AllocatorTrims, 1);
+            }
+        }
+        if let Some(transition) = self.pressure.responder.on_level(shared.level()) {
+            self.apply_pressure(transition, now);
+        }
+    }
+
+    /// Apply one worker-local level change: constrain or release both idle
+    /// pools and, when severity rose, drop retained idle buffers and connections.
+    fn apply_pressure(&self, transition: crate::pressure::Transition, now: std::time::Instant) {
+        let actions = transition.actions;
+        self.constrain_pools(actions.constrain_pools);
+        if transition.reclaim {
+            if actions.reclaim_idle_buffers {
+                self.memory.buffers().reclaim_idle_buffers();
+                // Constrained maintenance releases idle staging immediately.
+                self.maintain_pools(now);
+            }
+            if actions.clear_idle_connections {
+                self.http.release_idle();
+            }
+        }
+    }
+
+    /// While Critical, release a bounded number of idle memory-cache quanta.
+    /// The cache holds only ciphertext; entries whose ciphertext is still
+    /// referenced by readers or queued writes are never evicted.
+    fn reclaim_cache_under_pressure(&self) {
+        let level = self.pressure.responder.level();
+        let quanta = crate::pressure::pressure_actions(level).reclaim_cache_quanta;
+        if quanta == 0 {
+            return;
+        }
+        for _ in 0..quanta {
+            let released = self.memory.reclaim_idle(
+                crate::admission::ResourceClass::Ciphertext,
+                None,
+                usize::MAX,
+                |_, _| 0,
+            );
+            if released == 0 {
+                break;
+            }
+        }
+        self.memory.buffers().reclaim_idle_buffers();
+    }
+
+    /// Publish this worker's staging pool and, on the sampling worker, the
+    /// process memory sample at most once per second.
+    fn observe_memory(&mut self, now: std::time::Instant) {
+        let metrics = &self.telemetry.metrics;
+        metrics.observe_staging_pool(self.worker, self.store.writer.staging_pool_stats());
+        if !self.pressure.samples_memory || now < self.pressure.next_memory_sample {
+            return;
+        }
+        self.pressure.next_memory_sample = now + crate::pressure::SAMPLE_INTERVAL;
+        // cgroup fields come from the monitor's last sample; RSS is read fresh
+        // because the monitor backs off to 30 s when the cgroup is unavailable.
+        let cgroup = self.pressure.monitor.as_ref().and_then(|m| m.last_sample());
+        let memory = crate::telemetry::ProcessMemory {
+            resident: crate::pressure::sample_resident(),
+            ..cgroup.map(Into::into).unwrap_or_default()
+        };
+        metrics.observe_memory(memory);
+    }
+
+    /// Hold every idle pool at its minimum while memory is constrained.
+    pub(crate) fn constrain_pools(&self, constrained: bool) {
+        self.runtime.admission.constrain_buffers(constrained);
+        self.store.writer.constrain_staging(constrained);
+        self.memory.buffers().constrain_idle_buffers(constrained);
+    }
+
+    /// Idle pool statistics as `(recycler, staging slab)`.
+    #[cfg(test)]
+    pub(crate) fn pool_stats(&self) -> (flow_control::PoolStats, flow_control::PoolStats) {
+        (
+            self.runtime.admission.buffer_pool_stats(),
+            self.store.writer.staging_pool_stats(),
+        )
+    }
+
+    /// Demand counters of this worker's aligned ciphertext pool.
+    #[cfg(test)]
+    pub(crate) fn aligned_pool_stats(&self) -> page_alloc::PoolStats {
+        self.memory.buffers().aligned_pool_stats()
     }
 
     /// Schedule placement progress or back off pinned capacity with a bounded warning rate.
@@ -1583,8 +1751,8 @@ impl WorkerApplication {
                     self.worker.0
                 );
             })?;
-        if let Some(rdma) = &self.rdma {
-            stage_result(self.worker, "rdma-progress", rdma.progress())?;
+        if let Some(links) = &self.links {
+            links.poll(cx);
         }
         if let Some(result) = poll_task(&mut self.peer_task, cx) {
             listener_completion(result, self.stopping, self.worker, "peer-listener")?;
@@ -1926,11 +2094,8 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
                 }
             })
             .await;
-            if let Some(rdma) = &self.rdma {
-                rdma.drain().await?;
-            }
-            if let Some(devices) = &self.devices {
-                devices.close();
+            if let Some(links) = &self.links {
+                links.drain().await?;
             }
             if let Some(scope) = &self.diagnostic_scope {
                 scope.cancel()?;
@@ -2207,6 +2372,29 @@ impl WorkerApplication {
                 Ok(diagnostic)
             }))
             .map_err(|_| Error::InvalidConfiguration)?;
+        let node = self.node.clone();
+        let device_directory = self.device_directory.clone();
+        self.telemetry
+            .hardware
+            .set(Rc::new(move || -> crate::telemetry::HardwareJob {
+                // Capture the small Racer view here; the helper thread walks sysfs.
+                let context = Arc::clone(&node.hardware);
+                let snapshot = node
+                    .inventory
+                    .snapshot()
+                    .map_err(|error| format!("{error:?}"));
+                let device_directory = device_directory.clone();
+                Box::new(move |walk| {
+                    crate::hardware::report_with_snapshot(
+                        walk,
+                        std::path::Path::new("/sys"),
+                        &device_directory,
+                        &context,
+                        snapshot,
+                    )
+                })
+            }))
+            .map_err(|_| Error::InvalidConfiguration)?;
         self.telemetry
             .attach_io(self.runtime.reactor.clone(), self.runtime.admission.clone())?;
         let diagnostic_scope = scope(Duration::from_secs(365 * 24 * 3600))?;
@@ -2234,6 +2422,7 @@ impl WorkerApplication {
             .metrics
             .observe_held(self.store.writer.index().held_snapshot());
         self.store.writer.observe_disks();
+        self.store.writer.observe_cache_disks(&self.caches);
         self.telemetry
             .metrics
             .observe_retention(self.store.writer.retention().snapshot());
@@ -2456,10 +2645,8 @@ fn partition_limits_with_cause(
     ] {
         *value = NonZeroUsize::new(value.get() / workers).ok_or_else(|| invalid(dimension))?;
     }
-    if rdma {
-        limits.registered_bytes = NonZeroUsize::new(node.registered_bytes.get() / workers)
-            .ok_or_else(|| invalid("registered_bytes"))?;
-    }
+    // Registered memory is one node-wide pool owned by a single native thread;
+    // it is never divided per worker.
     let page = crate::model::PAGE_BYTES as usize;
     let window = limits.range_window_pages.get();
     for (dimension, insufficient) in [
@@ -2479,7 +2666,7 @@ fn partition_limits_with_cause(
         ),
         (
             "registered_bytes",
-            rdma && native::slot_count(&limits).map_err(|error| ("registered_bytes", error))? == 0,
+            rdma && native::buffer_count(&limits) == 0,
         ),
         (
             "request_context_bytes",
@@ -2861,4 +3048,31 @@ mod lifecycle_policy_tests {
 /// metadata reservation engages before page fetches hold every outbound slot.
 pub(crate) fn origin_pool_capacity(configured: usize, outbound: usize) -> usize {
     configured.min(outbound).max(1)
+}
+
+/// Per-worker memory-pressure state. Every worker applies the shared level;
+/// only the sampling worker owns the cgroup monitor and trims the allocator.
+struct WorkerPressure {
+    /// None when `RACER_MEMORY_PRESSURE=false`.
+    shared: Option<crate::pressure::SharedPressure>,
+    responder: crate::pressure::PressureResponder,
+    monitor: Option<crate::pressure::PressureMonitor>,
+    trims: crate::pressure::TrimSchedule,
+    /// Whether this worker publishes process memory telemetry.
+    samples_memory: bool,
+    next_memory_sample: std::time::Instant,
+}
+
+impl WorkerPressure {
+    fn new(enabled: bool, shared: &crate::pressure::SharedPressure, sampler: bool) -> Self {
+        Self {
+            shared: enabled.then(|| shared.clone()),
+            responder: Default::default(),
+            monitor: (enabled && sampler)
+                .then(|| crate::pressure::PressureMonitor::new(shared.clone())),
+            trims: Default::default(),
+            samples_memory: sampler,
+            next_memory_sample: uring_runtime::environment::now(),
+        }
+    }
 }

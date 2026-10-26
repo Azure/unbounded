@@ -45,10 +45,7 @@ func buildSupernetRoutes(cfg *config, state *wireGuardState, meshPeers []meshPee
 		return nil
 	}
 
-	supernets := collectSupernets(state, meshPeers, gatewayPeers, gatewayPeers)
-	for _, cidr := range extraSupernets {
-		supernets[cidr] = true
-	}
+	supernets := collectSupernets(state, meshPeers, gatewayPeers, gatewayPeers, extraSupernets, state.manageCniPlugin || cfg.ManageSameSitePodRoutes)
 
 	supernets = excludeLocalSupernets(supernets, meshPeers, state.siteRouting.localCIDRs)
 
@@ -482,7 +479,7 @@ func configureTunnelPeers(
 	}
 
 	for _, gwPeer := range gatewayPeers {
-		if len(gwPeer.InternalIPs) == 0 || len(gwPeer.PodCIDRs) == 0 {
+		if !gatewayPeerReadyForTunnel(gwPeer) {
 			continue
 		}
 
@@ -538,6 +535,23 @@ func configureTunnelPeers(
 		len(meshPeers), len(gatewayPeers), len(bpfEntries), len(routes), ifName)
 
 	return routes, hcPeers, nil
+}
+
+// gatewayPeerReadyForTunnel reports whether a gateway peer can be programmed
+// into the tunnel BPF map. A gateway in a managed Site without a podCIDR is
+// still waiting for CNI setup (it publishes its WireGuard key first), so it
+// stays out of the map. A gateway in a Site with manageCniPlugin=false never
+// gets a podCIDR, so its routed CIDRs are what make it usable.
+func gatewayPeerReadyForTunnel(gwPeer gatewayPeerInfo) bool {
+	if len(gwPeer.InternalIPs) == 0 {
+		return false
+	}
+
+	if len(gwPeer.PodCIDRs) > 0 {
+		return true
+	}
+
+	return gwPeer.UnmanagedCNISite && len(gwPeer.RoutedCidrs) > 0
 }
 
 // addPeerBPFEntries adds LPM trie entries for a set of CIDRs pointing to a
@@ -611,11 +625,13 @@ func resolveTunnelPeerTarget(protocol string, geneveIfIdx, ipipIfIdx, vxlanIfIdx
 // allGatewayPeers includes ALL gateway peers (GENEVE, VXLAN, and WG) so that
 // cross-site supernet routes are created regardless of the tunnel protocol
 // used for the gateway link.
-func collectSupernets(state *wireGuardState, meshPeers []meshPeerInfo, gatewayPeers, allGatewayPeers []gatewayPeerInfo) map[string]bool {
+func collectSupernets(state *wireGuardState, meshPeers []meshPeerInfo, gatewayPeers, allGatewayPeers []gatewayPeerInfo, extraSupernets []string, manageLocalPodRoutes bool) map[string]bool {
 	supernets := make(map[string]bool)
 	// Site pod CIDR assignment pools (supernets covering all node podCIDRs).
-	for _, cidr := range state.sitePodCIDRPools {
-		supernets[cidr] = true
+	if manageLocalPodRoutes {
+		for _, cidr := range state.sitePodCIDRPools {
+			supernets[cidr] = true
+		}
 	}
 	// Gateway pool RoutedCidrs (cross-site supernets).
 	for _, cidr := range state.sitePodCIDRs {
@@ -627,6 +643,19 @@ func collectSupernets(state *wireGuardState, meshPeers []meshPeerInfo, gatewayPe
 	for _, gwPeer := range allGatewayPeers {
 		for _, cidr := range gwPeer.RoutedCidrs {
 			supernets[cidr] = true
+		}
+	}
+
+	for _, cidr := range extraSupernets {
+		supernets[cidr] = true
+	}
+
+	if !manageLocalPodRoutes {
+		localPools := buildNormalizedCIDRSet(state.sitePodCIDRPools)
+		for cidr := range supernets {
+			if _, local := localPools[normalizeCIDR(cidr)]; local {
+				delete(supernets, cidr)
+			}
 		}
 	}
 	// Remove the local node's own podCIDRs (those are handled by the bridge directly).
@@ -660,12 +689,20 @@ func collectSupernets(state *wireGuardState, meshPeers []meshPeerInfo, gatewayPe
 	}
 
 	for _, peer := range meshPeers {
+		if peer.SkipPodCIDRRoutes {
+			continue
+		}
+
 		for _, cidr := range peer.PodCIDRs {
 			addIfUncovered(cidr)
 		}
 	}
 
 	for _, gwPeer := range gatewayPeers {
+		if gwPeer.SkipPodCIDRRoutes {
+			continue
+		}
+
 		for _, cidr := range gwPeer.PodCIDRs {
 			addIfUncovered(cidr)
 		}

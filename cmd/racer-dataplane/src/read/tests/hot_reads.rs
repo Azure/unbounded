@@ -51,7 +51,6 @@ mod duplex_release {
                         range: None,
                         page_credits: 1,
                         byte_credits: PAGE_BYTES,
-                        ordered: true,
                     },
                     origin: OriginContext {
                         object: f.context.object.clone(),
@@ -239,7 +238,6 @@ mod duplex_release {
                 range: Some(ByteRange::From(PAGE_BYTES - 1)),
                 page_credits: 2,
                 byte_credits: 2 * PAGE_BYTES,
-                ordered: true,
             },
             origin: OriginContext {
                 object: f.context.object.clone(),
@@ -484,7 +482,13 @@ mod duplex_release {
             for _ in 0..4096 {
                 assert!(send.as_mut().poll(&mut cx).is_pending());
                 pump(&mut endpoint);
-                if f.fill.dependencies.memory.get(&third).unwrap().is_some() {
+                if f.fill
+                    .dependencies
+                    .memory
+                    .ciphertext(&third)
+                    .unwrap()
+                    .is_some()
+                {
                     break;
                 }
             }
@@ -493,7 +497,14 @@ mod duplex_release {
                 &[0, 1, 2],
                 "wire release must refill acquisition before page-one write completes"
             );
-            assert!(f.fill.dependencies.memory.get(&third).unwrap().is_some());
+            assert!(
+                f.fill
+                    .dependencies
+                    .memory
+                    .ciphertext(&third)
+                    .unwrap()
+                    .is_some()
+            );
             let mut done = None;
             for _ in 0..8192 {
                 if done.is_none()
@@ -555,6 +566,15 @@ mod duplex_release {
         for _ in 0..128 {
             pump(&mut endpoint);
         }
+        // A fixed pump count does not bound kernel completion latency. In eof mode the
+        // peer's SHUT_WR wakes the blocked send, and its EAGAIN retry can move to
+        // io-wq, where ASYNC_CANCEL completes asynchronously. Wait on the ring under
+        // a host watchdog until the abandoned write's fence drains.
+        let until = Instant::now() + Duration::from_secs(5);
+        while f.reactor.in_flight() != 0 && Instant::now() < until {
+            pump(&mut endpoint);
+            f.reactor.wait(Duration::from_millis(1)).unwrap();
+        }
         assert_eq!(
             f.reactor.in_flight(),
             0,
@@ -566,7 +586,20 @@ mod duplex_release {
 
 struct Link {
     client: Rc<Requester>,
+    /// The only node with a reachable peer endpoint.
+    provider: racer_control_wire::NodeId,
     demands: Rc<RefCell<Vec<u64>>>,
+    stats: Rc<LinkStats>,
+}
+/// Subscribe traffic one requester node sent.
+#[derive(Default)]
+struct LinkStats {
+    /// Drop multi-flight Subscribes without a response, as a provider
+    /// predating `Subscription::flights` does.
+    old_provider: bool,
+    outstanding: Cell<usize>,
+    max_outstanding: Cell<usize>,
+    flights: RefCell<Vec<Option<u16>>>,
 }
 impl Link {
     fn direct_hedge_available(
@@ -591,12 +624,37 @@ impl Link {
         scope: &'a RequestScope,
     ) -> Operation<'a, VerifiedResponse> {
         Box::pin(async move {
+            // Requester endpoints are unbound, so a request to one cannot
+            // succeed. Refuse it here as the closed port would: otherwise the
+            // health of the refused direct path decides whether the requester
+            // retries through the provider's relay, whose outbound stack is a
+            // stub, and the read then stalls on wall-clock timing.
+            if request.route.destination != self.provider {
+                return Err(Error::Os(libc::ECONNREFUSED));
+            }
+            // Direct window fills send page requests; selections send Subscribe.
             let PeerOperation::Subscribe { subscription, .. } = &request.operation else {
-                panic!("real range must emit Subscribe")
+                return self.client.request(request, membership, scope).await;
             };
             self.demands
                 .borrow_mut()
                 .push(subscription.demand.page_count());
+            self.stats.flights.borrow_mut().push(subscription.flights);
+            if self.stats.old_provider && subscription.flights.is_some() {
+                return Err(Error::Io);
+            }
+            struct Outstanding<'a>(&'a Cell<usize>);
+            impl Drop for Outstanding<'_> {
+                fn drop(&mut self) {
+                    self.0.set(self.0.get() - 1);
+                }
+            }
+            let outstanding = self.stats.outstanding.get() + 1;
+            self.stats.outstanding.set(outstanding);
+            let _outstanding = Outstanding(&self.stats.outstanding);
+            self.stats
+                .max_outstanding
+                .set(self.stats.max_outstanding.get().max(outstanding));
             self.client.request(request, membership, scope).await
         })
     }
@@ -661,6 +719,21 @@ pub(super) fn coordinator(
     crate::read::dispatch::WorkerEndpoint,
     Arc<Published<Snapshot>>,
 ) {
+    coordinator_with_window(f, signer, membership, peers, 2)
+}
+
+/// A read graph whose range streams use a `window`-page fetch window.
+fn coordinator_with_window(
+    f: &Fixture,
+    signer: &Rc<Signatures>,
+    membership: &std::sync::Arc<crate::topology::Membership>,
+    peers: Rc<Requester>,
+    window: usize,
+) -> (
+    Rc<Coordinator>,
+    crate::read::dispatch::WorkerEndpoint,
+    Arc<Published<Snapshot>>,
+) {
     let mut deps = f.fill.dependencies.clone();
     deps.candidates = Rc::new(CandidatePolicy::new(
         signer.node().clone(),
@@ -676,7 +749,7 @@ pub(super) fn coordinator(
             name: "hot-read",
             snapshots: 2,
             metadata: 32,
-            window: 2,
+            window,
             stall: Duration::from_secs(30),
             seed: Some(f.origin.metadata.immutable()),
         },
@@ -684,7 +757,7 @@ pub(super) fn coordinator(
 }
 
 #[test]
-fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
+fn concurrent_reads_share_page_work_and_bound_fetch_by_credit() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let signers = network(1);
@@ -693,7 +766,7 @@ fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
     let membership = local_membership(&signers[0]);
     let (local, mut endpoint, _publication) =
         coordinator(&f, &signers[0], &membership, NoPeer::requester());
-    let open = |ordered, credits, start| {
+    let open = |credits, start| {
         let request = ClientRequest {
             retain: None,
             kind: ReadKind::Subscription {
@@ -701,7 +774,6 @@ fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
                 range: Some(ByteRange::From(start)),
                 page_credits: credits,
                 byte_credits: PAGE_BYTES,
-                ordered,
             },
             origin: OriginContext {
                 object: f.context.object.clone(),
@@ -720,9 +792,9 @@ fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
     };
     // A one-byte first slice plus a whole page exceeds the byte credit despite
     // two available page slots. No page-one work may start yet.
-    let mut a = open(true, 2, PAGE_BYTES - 1);
-    let mut slow = open(true, 1, PAGE_BYTES - 1);
-    let mut unordered = open(false, 1, PAGE_BYTES - 1);
+    let mut a = open(2, PAGE_BYTES - 1);
+    let mut slow = open(1, PAGE_BYTES - 1);
+    let mut third = open(1, PAGE_BYTES - 1);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let mut pump = |endpoint: &mut crate::read::dispatch::WorkerEndpoint| {
         pump_worker(endpoint, &mut f.engine, &f.crypto, &f.reactor);
@@ -731,18 +803,18 @@ fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
     for _ in 0..32 {
         assert!(a.next_slice().as_mut().poll(&mut cx).is_pending());
         assert!(slow.next_slice().as_mut().poll(&mut cx).is_pending());
-        assert!(unordered.next_slice().as_mut().poll(&mut cx).is_pending());
+        assert!(third.next_slice().as_mut().poll(&mut cx).is_pending());
         pump(&mut endpoint);
     }
     assert_eq!(
         &*f.origin.started_pages.borrow(),
         &[0],
-        "same-page ordered work singleflights and unordered waits"
+        "same-page work singleflights across readers"
     );
     f.origin.blocked_pages.borrow_mut().clear();
     let mut first = None;
     let mut slow_first = None;
-    let mut unordered_first = None;
+    let mut third_first = None;
     for _ in 0..1024 {
         if first.is_none()
             && let Poll::Ready(result) = a.next_slice().as_mut().poll(&mut cx)
@@ -754,22 +826,22 @@ fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
         {
             slow_first = result.unwrap();
         }
-        if unordered_first.is_none()
-            && let Poll::Ready(result) = unordered.next_slice().as_mut().poll(&mut cx)
+        if third_first.is_none()
+            && let Poll::Ready(result) = third.next_slice().as_mut().poll(&mut cx)
         {
-            unordered_first = result.unwrap();
+            third_first = result.unwrap();
         }
-        if first.is_some() && slow_first.is_some() && unordered_first.is_some() {
+        if first.is_some() && slow_first.is_some() && third_first.is_some() {
             break;
         }
         pump(&mut endpoint);
     }
     assert_eq!(first.as_ref().unwrap().slice().length, 1);
-    assert!(slow_first.is_some() && unordered_first.is_some());
+    assert!(slow_first.is_some() && third_first.is_some());
     assert_eq!(
         f.origin.calls.get(),
         1,
-        "mixed reader reuses verified fixed-page result"
+        "every reader reuses the verified page result"
     );
     drop(first);
     a.release_page(PageNumber(0), 1).unwrap();
@@ -798,7 +870,7 @@ fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
     assert_eq!(second.slice().page, PageNumber(1));
     drop(second);
     a.release_page(PageNumber(1), PAGE_BYTES as u32).unwrap();
-    drop((a, slow, unordered, slow_first, unordered_first));
+    drop((a, slow, third, slow_first, third_first));
     for _ in 0..32 {
         pump(&mut endpoint);
     }
@@ -806,7 +878,7 @@ fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
 }
 
 #[test]
-fn ordered_acquisition_window_is_not_an_unreleased_credit_ceiling() {
+fn fetch_window_is_not_an_unreleased_credit_ceiling() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     // Full-page batch, then a one-byte boundary with byte credit just below
@@ -831,7 +903,6 @@ fn ordered_acquisition_window_is_not_an_unreleased_credit_ceiling() {
                     range: Some(ByteRange::From(start)),
                     page_credits: 4,
                     byte_credits: bytes,
-                    ordered: true,
                 },
                 origin: OriginContext {
                     object: f.context.object.clone(),
@@ -917,7 +988,120 @@ fn ordered_acquisition_window_is_not_an_unreleased_credit_ceiling() {
 }
 
 #[test]
-fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fence() {
+fn zero_priority_read_beside_active_cache_progresses_while_first_page_is_held() {
+    use crate::admission::ResourceClass;
+    use flow_control::Policy;
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let signers = network(1);
+    // Production sizes stream and admission windows from the same setting.
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    limits.range_window_pages = std::num::NonZeroUsize::new(2).unwrap();
+    limits.plaintext_bytes = std::num::NonZeroUsize::new(8 * PAGE_BYTES as usize).unwrap();
+    let mut f = fixture_with(3 * PAGE_BYTES + 7, Some(limits));
+    f.reactor.init().unwrap();
+    let admission = f.fill.dependencies.admission.clone();
+    let cold = f.page.version.object.cache.clone();
+    let hot = racer_control_wire::CacheId("hot".into());
+    let definition =
+        |id: &racer_control_wire::CacheId, priority| racer_control_wire::CacheDefinition {
+            id: id.clone(),
+            name: id.0.clone(),
+            client_socket: "/c".into(),
+            origin_socket: "/o".into(),
+            priority,
+        };
+    admission
+        .policy()
+        .weights()
+        .update(&[definition(&hot, 1000), definition(&cold, 0)]);
+    admission.reweigh();
+    // An active positive-priority cache leaves the read only its request-progress allowance.
+    let _hot = admission
+        .reserve(Some(&hot), ResourceClass::Plaintext, 1)
+        .unwrap();
+    assert_eq!(
+        admission.fair_limit(&cold, ResourceClass::Plaintext),
+        admission.policy().progress(ResourceClass::Plaintext)
+    );
+    let membership = local_membership(&signers[0]);
+    let (local, mut endpoint, _publication) =
+        coordinator(&f, &signers[0], &membership, NoPeer::requester());
+    let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+    let mut stream = match futures::executor::block_on(local.read(
+        ClientRequest {
+            retain: None,
+            kind: ReadKind::Subscription {
+                pin: Some(f.page.version.etag.clone()),
+                range: Some(ByteRange::From(0)),
+                page_credits: 4,
+                byte_credits: 4 * PAGE_BYTES,
+            },
+            origin: OriginContext {
+                object: f.context.object.clone(),
+                metadata: None,
+                authorization: None,
+            },
+        },
+        &scope,
+    ))
+    .unwrap()
+    .payload
+    {
+        crate::read::ReadPayload::Stream(stream) => stream,
+        crate::read::ReadPayload::Empty => panic!("expected a nonempty read stream"),
+    };
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut pump = |endpoint: &mut crate::read::dispatch::WorkerEndpoint| {
+        pump_worker(endpoint, &mut f.engine, &f.crypto, &f.reactor);
+    };
+    let mut held = Vec::new();
+    // Keep one delivered page held while the next one arrives; each page must succeed.
+    for number in 0..4 {
+        let mut reader = None;
+        for _ in 0..2048 {
+            if let Poll::Ready(result) = stream.next_slice().as_mut().poll(&mut cx) {
+                reader = Some(result);
+                break;
+            }
+            pump(&mut endpoint);
+        }
+        let reader = reader
+            .expect("page delivery stalled")
+            .unwrap_or_else(|error| {
+                panic!(
+                    "page {number} failed: {error:?} plaintext={} ciphertext={} cfair={} pfair={}",
+                    admission.used(ResourceClass::Plaintext),
+                    admission.used(ResourceClass::Ciphertext),
+                    admission.fair_limit(&cold, ResourceClass::Ciphertext),
+                    admission.fair_limit(&cold, ResourceClass::Plaintext),
+                )
+            })
+            .expect("page before end of range");
+        assert_eq!(reader.slice().page, PageNumber(number));
+        held.push(reader.slice());
+        drop(reader);
+        // Release all but the most recent page, keeping one page held while
+        // the next window is fetched.
+        if held.len() > 1 {
+            let slice = held.remove(0);
+            stream.release_page(slice.page, slice.length).unwrap();
+        }
+    }
+    assert!(
+        admission.used(ResourceClass::Plaintext)
+            <= admission.policy().progress(ResourceClass::Plaintext) + 1
+    );
+    futures::executor::block_on(stream.cancel()).unwrap();
+    drop(stream);
+    for _ in 0..128 {
+        pump(&mut endpoint);
+    }
+    endpoint.uninstall().unwrap();
+}
+
+#[test]
+fn later_page_completes_before_head_and_cancellation_keeps_completion_fence() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for mode in ["success", "cancel", "drop", "failure"] {
@@ -935,7 +1119,6 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
                 range: None,
                 page_credits: 64,
                 byte_credits: 64 * PAGE_BYTES,
-                ordered: true,
             },
             origin: OriginContext {
                 object: f.context.object.clone(),
@@ -950,21 +1133,6 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
             crate::read::ReadPayload::Stream(stream) => stream,
             crate::read::ReadPayload::Empty => panic!("expected a nonempty read stream"),
         };
-        let mut unordered = f
-            .fill
-            .dependencies
-            .metadata_owner
-            .subscriptions
-            .register(
-                f.page.version.clone(),
-                ByteRange::From(0)
-                    .resolve(f.origin.metadata.length)
-                    .unwrap(),
-                1,
-                PAGE_BYTES,
-                false,
-            )
-            .unwrap();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let mut pump = |endpoint: &mut crate::read::dispatch::WorkerEndpoint| {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -1010,7 +1178,6 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
         );
         assert_eq!(&*f.origin.started_pages.borrow(), &[0, 1]);
         assert_eq!(stream.buffered_pages(), 2);
-        assert!(unordered.poll_next(&mut cx).is_pending());
         if mode == "cancel" || mode == "drop" {
             if mode == "cancel" {
                 futures::executor::block_on(stream.cancel()).unwrap();
@@ -1020,17 +1187,15 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
                 pump(&mut endpoint);
             }
             assert!(
-                unordered.poll_next(&mut cx).is_pending(),
+                queue.pending() > 0,
                 "canceled waiter is not actual origin completion"
             );
             f.origin.blocked_pages.borrow_mut().clear();
             for _ in 0..1024 {
                 pump(&mut endpoint);
             }
-            assert!(matches!(
-                unordered.poll_next(&mut cx),
-                Poll::Ready(Ok(crate::read::range_stream::Next::Select(_)))
-            ));
+            assert_eq!(queue.pending(), 0, "accepted head work drains its fence");
+            assert_eq!(&*f.origin.started_pages.borrow(), &[0, 1]);
         } else if mode == "failure" {
             f.origin.version_unavailable.set(true);
             f.origin.blocked_pages.borrow_mut().clear();
@@ -1074,16 +1239,6 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
             stream
                 .release_page(PageNumber(0), PAGE_BYTES as u32)
                 .unwrap();
-            // The waiting unordered ticket must get its turn before ordered
-            // prefetch can refill, even though this stream still has credit.
-            stream.poll_prefetch(&mut cx);
-            assert_eq!(&*f.origin.started_pages.borrow(), &[0, 1]);
-            let Poll::Ready(Ok(crate::read::range_stream::Next::Select(selection))) =
-                unordered.poll_next(&mut cx)
-            else {
-                panic!("unordered turn after the fixed batch completes")
-            };
-            drop(selection);
             let delivery = Delivery::new(f.reactor.clone(), Duration::from_secs(30));
             let (socket, _stalled_client) = std::os::unix::net::UnixStream::pair().unwrap();
             let mut connection =
@@ -1125,7 +1280,6 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
             );
             drop((stream, write, third));
         }
-        drop(unordered);
         for _ in 0..32 {
             pump(&mut endpoint);
         }
@@ -1134,7 +1288,50 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
 }
 
 #[test]
-fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_local_readers() {
+fn production_range_windows_select_from_provider_share_node_work_and_deliver_in_order() {
+    let stats = production_range_windows(false);
+    assert!(
+        stats
+            .iter()
+            .flat_map(|stats| stats.flights.borrow().clone())
+            .any(|flights| flights == Some(crate::read::range_stream::REQUESTED_FLIGHTS))
+    );
+}
+#[test]
+fn production_range_windows_fall_back_to_single_flight_for_old_providers() {
+    let stats = production_range_windows(true);
+    assert!(!stats[0].flights.borrow().is_empty());
+    for stats in &stats {
+        let flights = stats.flights.borrow();
+        if flights.is_empty() {
+            continue;
+        }
+        // The first Subscribe asks for several flights and is dropped; every
+        // later one omits the field, and at most one is outstanding at a time.
+        assert_eq!(
+            flights[0],
+            Some(crate::read::range_stream::REQUESTED_FLIGHTS)
+        );
+        assert!(flights[1..].iter().all(Option::is_none), "{flights:?}");
+        assert!(stats.max_outstanding.get() <= 1);
+    }
+}
+/// Run three range windows on two requester nodes against provider node 2.
+/// The object and windows stay small: node 2's outbound stack is a stub, so
+/// larger windows that overload it and fall back to relayed fetches stall.
+/// Asserts in-order delivery and shared node work; returns each requester's
+/// Subscribe traffic.
+fn production_range_windows(old_provider: bool) -> Vec<Rc<LinkStats>> {
+    const PAGES: u64 = 4;
+    const WINDOW: usize = 4;
+    let stats: Vec<Rc<LinkStats>> = (0..2)
+        .map(|_| {
+            Rc::new(LinkStats {
+                old_provider,
+                ..Default::default()
+            })
+        })
+        .collect();
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let signers = network(3);
@@ -1162,7 +1359,9 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
         )
         .unwrap(),
     );
-    let mut fixtures: Vec<_> = (0..3).map(|_| fixture_with(4 * PAGE_BYTES, None)).collect();
+    let mut fixtures: Vec<_> = (0..3)
+        .map(|_| fixture_with(PAGES * PAGE_BYTES, None))
+        .collect();
     for fixture in &fixtures {
         fixture.reactor.init().unwrap();
     }
@@ -1189,7 +1388,6 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
             let transfers = Rc::new(crate::peer::transport::Transfers::new(
                 Rc::new(crate::http::new_pool(reactor, admission.clone(), 4)),
                 io,
-                None,
                 admission,
                 codec,
                 signers[i].clone(),
@@ -1209,7 +1407,9 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
             Requester::scripted(
                 Rc::new(Link {
                     client: requester,
+                    provider: node(2),
                     demands: demands.clone(),
+                    stats: stats[i].clone(),
                 }),
                 Link::direct_hedge_available,
                 Link::request,
@@ -1217,7 +1417,7 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
             )
         };
         let (local, endpoint, published) =
-            coordinator(&fixtures[i], &signers[i], &membership, peers);
+            coordinator_with_window(&fixtures[i], &signers[i], &membership, peers, WINDOW);
         locals.push(local);
         endpoints.push(endpoint);
         publications.push(published);
@@ -1269,9 +1469,8 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
             kind: ReadKind::Subscription {
                 pin: Some(f.page.version.etag.clone()),
                 range: Some(ByteRange::From(start * PAGE_BYTES)),
-                page_credits: 1,
-                byte_credits: PAGE_BYTES,
-                ordered: false,
+                page_credits: WINDOW,
+                byte_credits: WINDOW as u64 * PAGE_BYTES,
             },
             origin: OriginContext {
                 object: f.context.object.clone(),
@@ -1297,7 +1496,6 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
             range: None,
             page_credits: 1,
             byte_credits: PAGE_BYTES,
-            ordered: false,
         },
         origin: OriginContext {
             object: fixtures[0].context.object.clone(),
@@ -1337,127 +1535,66 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
             f.reactor.poll_budgeted(128).unwrap();
         }
     };
-    // First assignment is ordered progress, shared to both local subscribers.
-    let first = {
-        let mut work = a.next_slice();
-        let mut result = None;
-        for _ in 0..1024 {
-            if let Poll::Ready(value) = work.as_mut().poll(&mut cx) {
-                result = Some(value.unwrap().unwrap());
-                break;
+    // Every reader drives its own window; pages may arrive in any order but
+    // each reader receives its range strictly in order.
+    let mut delivered: [Vec<u64>; 3] = Default::default();
+    let ends = [PAGES; 3];
+    // Bounded by time, not iterations: under load, retries after a refused
+    // or failed exchange can wait on real timers.
+    let until = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < until {
+        for (index, stream) in [&mut a, &mut a2, &mut b].into_iter().enumerate() {
+            let page = match stream.next_slice().as_mut().poll(&mut cx) {
+                Poll::Ready(result) => result.unwrap().map(|reader| reader.slice().page),
+                Poll::Pending => None,
+            };
+            if let Some(page) = page {
+                stream.release_page(page, PAGE_BYTES as u32).unwrap();
+                delivered[index].push(page.0);
             }
-            pump(&mut endpoints);
         }
-        result.expect("first production page")
-    };
-    assert_eq!(first.slice().page.0, 0);
-    let duplicate = futures::executor::block_on(a2.next_slice())
-        .unwrap()
-        .unwrap();
-    assert_eq!(duplicate.slice().page.0, 0);
-    drop((first, duplicate));
-    a.release_page(PageNumber(0), PAGE_BYTES as u32).unwrap();
-    a2.release_page(PageNumber(0), PAGE_BYTES as u32).unwrap();
-    gate.blocked.set(true);
-    let mut wb = b.next_slice();
-    for _ in 0..32 {
-        assert!(wb.as_mut().poll(&mut cx).is_pending());
-        pump(&mut endpoints);
-    }
-    assert_eq!(&*gate.calls.borrow(), &[0, 2]);
-    let mut wa = a.next_slice();
-    for _ in 0..32 {
-        assert!(wa.as_mut().poll(&mut cx).is_pending());
-        pump(&mut endpoints);
-    }
-    assert_eq!(
-        &*gate.calls.borrow(),
-        &[0, 2],
-        "second receiving node joins provider work"
-    );
-    gate.blocked.set(false);
-    let mut ra = None;
-    let mut rb = None;
-    for _ in 0..1024 {
-        if ra.is_none()
-            && let Poll::Ready(value) = wa.as_mut().poll(&mut cx)
+        if delivered
+            .iter()
+            .zip([0, 0, 2])
+            .zip(ends)
+            .all(|((pages, start), end)| pages.len() as u64 == end - start)
         {
-            ra = Some(value.unwrap().unwrap());
-        }
-        if rb.is_none()
-            && let Poll::Ready(value) = wb.as_mut().poll(&mut cx)
-        {
-            rb = Some(value.unwrap().unwrap());
-        }
-        if ra.is_some() && rb.is_some() {
             break;
         }
         pump(&mut endpoints);
     }
-    assert_eq!(
-        ra.unwrap().slice().page.0,
-        2,
-        "provider chose page 2 before page 1"
-    );
-    assert_eq!(rb.unwrap().slice().page.0, 2);
-    drop((wa, wb));
-    let local = futures::executor::block_on(a2.next_slice())
-        .unwrap()
-        .unwrap();
-    assert_eq!(local.slice().page.0, 2);
+    assert_eq!(delivered[0], (0..PAGES).collect::<Vec<_>>());
+    assert_eq!(delivered[1], (0..PAGES).collect::<Vec<_>>());
+    assert_eq!(delivered[2], (2..PAGES).collect::<Vec<_>>());
     assert!(
         demands.borrow().iter().any(|count| *count > 1),
-        "not fixed-page wire requests"
+        "the window selects holes from the provider, not fixed pages"
     );
+    // The provider fills each page from origin once; receiving nodes and the
+    // second local reader share its transfers rather than the origin.
     assert_eq!(
-        demands.borrow().len(),
-        3,
-        "one transfer per receiving node, not per local subscriber"
+        gate.calls
+            .borrow()
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len() as u64,
+        PAGES
     );
-    drop(local);
-    a.release_page(PageNumber(2), PAGE_BYTES as u32).unwrap();
-    a2.release_page(PageNumber(2), PAGE_BYTES as u32).unwrap();
-    // The next turn restores oldest-page progress without redelivering page 2.
-    let next = {
-        let mut work = a.next_slice();
-        let mut result = None;
-        for _ in 0..2048 {
-            if let Poll::Ready(value) = work.as_mut().poll(&mut cx) {
-                result = Some(value.unwrap().unwrap());
-                break;
-            }
-            pump(&mut endpoints);
+    for stream in [&mut a, &mut a2, &mut b] {
+        assert!(
+            futures::executor::block_on(stream.next_slice())
+                .unwrap()
+                .is_none()
+        );
+    }
+    // A selection the windows outran still completes on its worker.
+    drop((a, a2, b));
+    for _ in 0..4096 {
+        if endpoints.iter().all(|endpoint| endpoint.is_drained()) {
+            break;
         }
-        result.expect("continued selection")
-    };
-    assert_eq!(next.slice().page.0, 1);
-    drop(next);
-    a.release_page(PageNumber(1), PAGE_BYTES as u32).unwrap();
-    drop(
-        futures::executor::block_on(a2.next_slice())
-            .unwrap()
-            .unwrap(),
-    );
-    a2.release_page(PageNumber(1), PAGE_BYTES as u32).unwrap();
-    let last = {
-        let mut work = a.next_slice();
-        let mut result = None;
-        for _ in 0..2048 {
-            if let Poll::Ready(value) = work.as_mut().poll(&mut cx) {
-                result = Some(value.unwrap().unwrap());
-                break;
-            }
-            pump(&mut endpoints);
-        }
-        result.expect("last selection")
-    };
-    assert_eq!(last.slice().page.0, 3);
-    drop(last);
-    assert!(
-        futures::executor::block_on(a.next_slice())
-            .unwrap()
-            .is_none()
-    );
+        pump(&mut endpoints);
+    }
     // A later local subscriber must reuse already verified pages without asking
     // the provider to transfer pages excluded by its completed-page ledger.
     let transfers = demands.borrow().len();
@@ -1502,15 +1639,16 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
             f.reactor.wait(Duration::from_millis(1)).unwrap();
         }
     }
-    assert_eq!(fixtures[2].origin.calls.get(), 4);
-    assert_eq!(
-        fixtures[0].origin.calls.get() + fixtures[1].origin.calls.get(),
-        0
-    );
-    drop((a, a2, b));
+    // Readers on one node share page work: no page starts twice per node.
+    for f in &fixtures {
+        let started = f.origin.started_pages.borrow();
+        let unique = started.iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), started.len(), "{started:?}");
+    }
     for endpoint in &mut endpoints {
         endpoint.uninstall().unwrap();
     }
+    stats
 }
 #[test]
 fn origin_fill_preserves_ciphertext_for_memory_and_pending_candidate_copy() {
@@ -1568,4 +1706,327 @@ fn origin_fill_preserves_ciphertext_for_memory_and_pending_candidate_copy() {
     ));
     assert_eq!(f.fill.metrics.count(Event::OriginFill), 1);
     assert_eq!(f.fill.metrics.count(Event::MemoryHit), 2);
+}
+
+/// Acquire `f.page` twice concurrently on the same worker.
+fn acquire_pair(f: &mut Fixture) -> (Result<PageResult>, Result<PageResult>) {
+    let mut first_budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let mut second_budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    drive(
+        futures::future::join(
+            f.fill.acquire(
+                f.page.clone(),
+                f.membership.clone(),
+                &f.context,
+                &f.scope,
+                &mut first_budget,
+            ),
+            f.fill.acquire(
+                f.page.clone(),
+                f.membership.clone(),
+                &f.context,
+                &f.scope,
+                &mut second_budget,
+            ),
+        ),
+        &mut f.engine,
+        &f.crypto,
+    )
+}
+
+/// Fill one page from origin, then release every plaintext owner.
+fn fill_and_release(f: &mut Fixture) -> CiphertextPage {
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let result = acquire(f, &mut budget).unwrap();
+    assert_eq!(result.plaintext.bytes(), b"abc");
+    let ciphertext = result.ciphertext.clone();
+    drop(result);
+    f.fill.dependencies.flights.poll_budgeted(64).unwrap();
+    ciphertext
+}
+
+#[test]
+fn memory_cache_retains_only_ciphertext_after_delivery() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let ciphertext = fill_and_release(&mut f);
+    let deps = &f.fill.dependencies;
+    deps.admission.reclaim_buffers();
+    assert_eq!(deps.admission.used(ResourceClass::Plaintext), 0);
+    assert!(deps.memory.get(&f.page).unwrap().is_none());
+    let cached = deps.memory.ciphertext(&f.page).unwrap().unwrap();
+    assert!(Arc::ptr_eq(&cached.ciphertext.inner, &ciphertext.inner));
+    assert!(deps.admission.used(ResourceClass::Ciphertext) > 0);
+}
+
+#[test]
+fn cached_ciphertext_hit_decrypts_without_refetching() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let ciphertext = fill_and_release(&mut f);
+    let decrypts = f.fill.metrics.count(Event::FillDecryptCount);
+    let hits = f.fill.metrics.count(Event::MemoryHit);
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let again = acquire(&mut f, &mut budget).unwrap();
+    assert_eq!(again.plaintext.bytes(), b"abc");
+    // The decrypt used the cached allocation; no origin, disk, or peer work.
+    assert!(Arc::ptr_eq(&again.ciphertext.inner, &ciphertext.inner));
+    assert_eq!(f.origin.calls.get(), 1);
+    assert_eq!(f.fill.metrics.count(Event::FillDecryptCount), decrypts + 1);
+    assert_eq!(f.fill.metrics.count(Event::MemoryHit), hits + 1);
+    assert_eq!(f.fill.metrics.count(Event::DiskHit), 0);
+    assert_eq!(f.fill.metrics.count(Event::PeerHit), 0);
+    // The decrypted plaintext is shared while held, then released.
+    let shared = f.fill.dependencies.memory.get(&f.page).unwrap().unwrap();
+    assert!(Arc::ptr_eq(&shared.plaintext.inner, &again.plaintext.inner));
+    drop((again, shared));
+    f.fill.dependencies.flights.poll_budgeted(64).unwrap();
+    f.fill.dependencies.admission.reclaim_buffers();
+    assert_eq!(
+        f.fill.dependencies.admission.used(ResourceClass::Plaintext),
+        0
+    );
+}
+
+#[test]
+fn concurrent_cached_ciphertext_hits_coalesce_into_one_decrypt() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    fill_and_release(&mut f);
+    let decrypts = f.fill.metrics.count(Event::FillDecryptCount);
+    let (first, second) = acquire_pair(&mut f);
+    let (first, second) = (first.unwrap(), second.unwrap());
+    assert_eq!(first.plaintext.bytes(), b"abc");
+    assert!(Arc::ptr_eq(&first.plaintext.inner, &second.plaintext.inner));
+    assert_eq!(f.fill.metrics.count(Event::FillDecryptCount), decrypts + 1);
+    assert_eq!(f.origin.calls.get(), 1);
+}
+
+#[test]
+fn live_plaintext_is_reused_without_another_decrypt() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let held = acquire(&mut f, &mut budget).unwrap();
+    f.fill.dependencies.flights.poll_budgeted(64).unwrap();
+    let decrypts = f.fill.metrics.count(Event::FillDecryptCount);
+    for _ in 0..3 {
+        let again = acquire(&mut f, &mut budget).unwrap();
+        assert!(Arc::ptr_eq(&again.plaintext.inner, &held.plaintext.inner));
+    }
+    assert_eq!(f.fill.metrics.count(Event::FillDecryptCount), decrypts);
+    assert_eq!(f.origin.calls.get(), 1);
+    // The weak handle never keeps the plaintext alive by itself.
+    let plaintext = Arc::downgrade(&held.plaintext.inner);
+    drop(held);
+    f.fill.dependencies.flights.poll_budgeted(64).unwrap();
+    assert!(plaintext.upgrade().is_none());
+    assert!(f.fill.dependencies.memory.get(&f.page).unwrap().is_none());
+}
+
+#[test]
+fn peers_receive_cached_ciphertext_without_plaintext() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let ciphertext = fill_and_release(&mut f);
+    let decrypts = f.fill.metrics.count(Event::FillDecryptCount);
+    let (metadata, copy) = futures::executor::block_on(f.fill.copy_only(&f.page, &f.scope))
+        .unwrap()
+        .unwrap();
+    assert_eq!(metadata.version, f.page.version);
+    assert!(Arc::ptr_eq(&copy.inner, &ciphertext.inner));
+    assert_eq!(copy.envelope().nonce, ciphertext.envelope().nonce);
+    // Serving ciphertext neither decrypts nor materializes plaintext.
+    assert_eq!(f.fill.metrics.count(Event::FillDecryptCount), decrypts);
+    assert!(f.fill.dependencies.memory.get(&f.page).unwrap().is_none());
+}
+
+/// A fixture whose memory cache can hold `pages` ciphertext pages.
+fn roomy_fixture(pages: u64) -> Fixture {
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    let bytes =
+        std::num::NonZeroUsize::new(2 * (pages as usize + 1) * PAGE_BYTES as usize).unwrap();
+    limits.ciphertext_bytes = bytes;
+    limits.plaintext_bytes = bytes;
+    fixture_with(pages * PAGE_BYTES, Some(limits))
+}
+
+/// Fill `pages` of `f` from origin through `membership`, then release every
+/// plaintext so the memory cache holds only their ciphertext.
+fn cache_ciphertext_only(
+    f: &mut Fixture,
+    membership: &std::sync::Arc<crate::topology::Membership>,
+    pages: &[u64],
+) {
+    for &number in pages {
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+        let page = PageId {
+            version: f.page.version.clone(),
+            number: PageNumber(number),
+        };
+        drop(
+            drive(
+                f.fill
+                    .acquire(page, membership.clone(), &f.context, &f.scope, &mut budget),
+                &mut f.engine,
+                &f.crypto,
+            )
+            .unwrap(),
+        );
+    }
+    f.fill.dependencies.flights.poll_budgeted(64).unwrap();
+    f.fill.dependencies.admission.reclaim_buffers();
+    assert_eq!(
+        f.fill.dependencies.admission.used(ResourceClass::Plaintext),
+        0
+    );
+    for &number in pages {
+        let page = PageId {
+            version: f.page.version.clone(),
+            number: PageNumber(number),
+        };
+        assert!(f.fill.dependencies.memory.get(&page).unwrap().is_none());
+        assert!(
+            f.fill
+                .dependencies
+                .memory
+                .ciphertext(&page)
+                .unwrap()
+                .is_some(),
+            "page {number} cached"
+        );
+    }
+}
+
+/// Read the whole object as one range stream and return the delivered pages.
+fn read_range(
+    f: &mut Fixture,
+    local: &Rc<Coordinator>,
+    endpoint: &mut crate::read::dispatch::WorkerEndpoint,
+    pages: u64,
+) -> Vec<u64> {
+    let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+    let request = ClientRequest {
+        retain: None,
+        kind: ReadKind::Subscription {
+            pin: Some(f.page.version.etag.clone()),
+            range: None,
+            page_credits: 64,
+            byte_credits: 64 * PAGE_BYTES,
+        },
+        origin: OriginContext {
+            object: f.context.object.clone(),
+            metadata: None,
+            authorization: None,
+        },
+    };
+    let mut stream = match futures::executor::block_on(local.read(request, &scope))
+        .unwrap()
+        .payload
+    {
+        crate::read::ReadPayload::Stream(stream) => stream,
+        crate::read::ReadPayload::Empty => panic!("expected a nonempty read stream"),
+    };
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut delivered = Vec::new();
+    for _ in 0..8192 {
+        let polled = stream.next_slice().as_mut().poll(&mut cx);
+        if let Poll::Ready(result) = polled {
+            let Some(reader) = result.unwrap() else {
+                break;
+            };
+            let slice = reader.slice();
+            delivered.push(slice.page.0);
+            drop(reader);
+            stream.release_page(slice.page, slice.length).unwrap();
+            continue;
+        }
+        endpoint.poll(&mut cx, 64).unwrap();
+        uring_runtime::drivers::poll(&mut cx, 64);
+        uring_runtime::group::Service::poll_budgeted(&mut f.engine, &mut cx, 64).unwrap();
+        f.crypto.poll_budgeted(64).unwrap();
+        f.reactor.poll_budgeted(128).unwrap();
+    }
+    assert_eq!(delivered.len() as u64, pages, "range stream completed");
+    drop(stream);
+    for _ in 0..32 {
+        endpoint.poll(&mut cx, 64).unwrap();
+        uring_runtime::drivers::poll(&mut cx, 64);
+    }
+    delivered
+}
+
+#[test]
+fn warm_range_reread_decrypts_cached_ciphertext_without_any_transfer() {
+    const PAGES: u64 = 6;
+    const WINDOW: usize = 4;
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let signers = network(2);
+    let mut f = roomy_fixture(PAGES);
+    f.reactor.init().unwrap();
+    // A heavily weighted remote node owns every page, so a missed probe
+    // selects the range from it. Any peer request panics.
+    let remote = Arc::new(
+        Membership::validate(
+            MembershipVersion(1),
+            (0..2)
+                .map(|i| Member {
+                    node: node(i),
+                    shares: NonZeroU32::new(if i == 1 { 1_000_000 } else { 1 }).unwrap(),
+                    peer_endpoint: format!("127.0.0.1:{}", 8100 + i),
+                    rails: vec![],
+                    site: String::new(),
+                })
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let all: Vec<u64> = (0..PAGES).collect();
+    let prefill = f.membership.clone();
+    cache_ciphertext_only(&mut f, &prefill, &all);
+    let origin = f.origin.calls.get();
+    let (local, mut endpoint, _publication) =
+        coordinator_with_window(&f, &signers[0], &remote, NoPeer::requester(), WINDOW);
+    assert_eq!(read_range(&mut f, &local, &mut endpoint, PAGES), all);
+    assert_eq!(f.origin.calls.get(), origin, "no origin requests");
+    assert_eq!(
+        local.fill.metrics.count(Event::FillDecryptCount),
+        PAGES,
+        "each page is decrypted exactly once"
+    );
+    endpoint.uninstall().unwrap();
+}
+
+#[test]
+fn warm_range_reread_transfers_only_uncached_pages() {
+    const PAGES: u64 = 6;
+    const WINDOW: usize = 4;
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let signers = network(1);
+    let mut f = roomy_fixture(PAGES);
+    f.reactor.init().unwrap();
+    let membership = local_membership(&signers[0]);
+    let prefill = f.membership.clone();
+    cache_ciphertext_only(&mut f, &prefill, &[0, 1, 2, 4, 5]);
+    f.origin.started_pages.borrow_mut().clear();
+    let (local, mut endpoint, _publication) =
+        coordinator_with_window(&f, &signers[0], &membership, NoPeer::requester(), WINDOW);
+    assert_eq!(
+        read_range(&mut f, &local, &mut endpoint, PAGES),
+        (0..PAGES).collect::<Vec<_>>()
+    );
+    assert_eq!(&*f.origin.started_pages.borrow(), &[3]);
+    assert_eq!(
+        local.fill.metrics.count(Event::FillDecryptCount),
+        5,
+        "cached pages are decrypted once each"
+    );
+    endpoint.uninstall().unwrap();
 }

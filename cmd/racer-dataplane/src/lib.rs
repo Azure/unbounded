@@ -12,11 +12,13 @@ pub mod client;
 pub mod config;
 pub mod control;
 pub mod error;
+pub mod hardware;
 pub mod http;
 pub mod memory;
 pub mod model;
 pub mod origin;
 pub mod peer;
+pub mod priority;
 pub mod profiling;
 pub mod rdma;
 pub mod read;
@@ -35,6 +37,8 @@ mod subscription_interop;
 #[cfg(feature = "subscription-interop")]
 #[doc(hidden)]
 pub use subscription_interop::go_sdk_subscription_server as run_subscription_interop_fixture;
+
+pub(crate) mod pressure;
 
 #[cfg(test)]
 mod contention;

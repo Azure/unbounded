@@ -76,6 +76,16 @@ spec:
             description: GatewayNodeStatus defines the advertised routes and lease
               heartbeat for a gateway node.
             properties:
+              forwardingMTU:
+                description: |-
+                  ForwardingMTU is the effective local forwarding MTU after a successful
+                  dataplane reconciliation. Workers use this cap for accepted gateway paths.
+                  Gateways do not consume it, avoiding feedback between advertised minima.
+                  Absent values identify agents that have not published a forwarding limit.
+                format: int32
+                maximum: 65535
+                minimum: 1
+                type: integer
               lastUpdated:
                 description: LastUpdated is the heartbeat timestamp updated by the
                   node agent.

@@ -17,6 +17,7 @@ import (
 
 	"golang.org/x/crypto/curve25519"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/types"
@@ -24,6 +25,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 
+	"github.com/Azure/unbounded/internal/net/ipam"
 	"github.com/Azure/unbounded/internal/version"
 )
 
@@ -57,6 +59,28 @@ func higherPriorityCNIConfigFiles(dir, ownConfFile string) ([]string, error) {
 }
 
 func waitForPodCIDRsAndConfigure(ctx context.Context, clientset kubernetes.Interface, cfg *config, healthState *nodeHealthState) ([]string, error) {
+	return waitForPodCIDRsAndConfigureValidated(ctx, clientset, cfg, healthState, nil)
+}
+
+func waitForAdoptedNodePodCIDRsAndConfigure(
+	ctx context.Context,
+	clientset kubernetes.Interface,
+	cfg *config,
+	healthState *nodeHealthState,
+	adopted nodeAssignment,
+) ([]string, error) {
+	return waitForPodCIDRsAndConfigureValidated(ctx, clientset, cfg, healthState, func(node *corev1.Node) error {
+		return validateAdoptedNodeAssignment(node, adopted)
+	})
+}
+
+func waitForPodCIDRsAndConfigureValidated(
+	ctx context.Context,
+	clientset kubernetes.Interface,
+	cfg *config,
+	healthState *nodeHealthState,
+	validateNode func(*corev1.Node) error,
+) ([]string, error) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -76,8 +100,18 @@ func waitForPodCIDRsAndConfigure(ctx context.Context, clientset kubernetes.Inter
 			continue
 		}
 
+		if validateNode != nil {
+			if err := validateNode(node); err != nil {
+				return nil, err
+			}
+		}
+
 		// Check if podCIDRs are already assigned
 		if len(node.Spec.PodCIDRs) > 0 {
+			if _, err := ipam.ConfigFromCIDRs(node.Spec.PodCIDRs); err != nil {
+				return nil, err
+			}
+
 			klog.V(4).Infof("Node %s has podCIDRs: %v", cfg.NodeName, node.Spec.PodCIDRs)
 
 			if err := guardedWriteCNIConfig(ctx, cfg, node.Spec.PodCIDRs, healthState); err != nil {
@@ -136,7 +170,20 @@ func waitForPodCIDRsAndConfigure(ctx context.Context, clientset kubernetes.Inter
 						continue
 					}
 
+					if validateNode != nil {
+						if err := validateNode(updatedNode); err != nil {
+							watcher.Stop()
+
+							return nil, err
+						}
+					}
+
 					if len(updatedNode.Spec.PodCIDRs) > 0 {
+						if _, err := ipam.ConfigFromCIDRs(updatedNode.Spec.PodCIDRs); err != nil {
+							watcher.Stop()
+							return nil, err
+						}
+
 						klog.Infof("Node %s podCIDRs assigned: %v", cfg.NodeName, updatedNode.Spec.PodCIDRs)
 						watcher.Stop()
 
@@ -204,10 +251,9 @@ func writeCNIConfigUnchecked(cfg *config, podCIDRs []string) error {
 }
 
 func doWriteCNIConfig(cfg *config, podCIDRs []string) error {
-	// Build IPAM ranges from podCIDRs
-	var ranges [][]IPRange
-	for _, cidr := range podCIDRs {
-		ranges = append(ranges, []IPRange{{Subnet: cidr}})
+	socketPath := cfg.IPAMSocketPath
+	if socketPath == ipam.DefaultSocketPath {
+		socketPath = ""
 	}
 
 	// Bridge MTU matches the configured WireGuard tunnel MTU (cfg.MTU is
@@ -229,8 +275,8 @@ func doWriteCNIConfig(cfg *config, podCIDRs []string) error {
 				HairpinMode:  true,
 				MTU:          bridgeMTU,
 				IPAM: &IPAMConfig{
-					Type:   "host-local",
-					Ranges: ranges,
+					Type:       "unbounded-ipam",
+					SocketPath: socketPath,
 				},
 			},
 			{
@@ -473,6 +519,102 @@ func taintGatewayNode(ctx context.Context, clientset kubernetes.Interface, nodeN
 	klog.Infof("Added gateway taint to node %s: %s=true:NoSchedule", nodeName, GatewayNodeTaintKey)
 
 	return nil
+}
+
+var (
+	gatewayTaintRemovalMaxAttempts  = 5
+	gatewayTaintRemovalInitialDelay = 100 * time.Millisecond
+	gatewayTaintRemovalMaxDelay     = time.Second
+)
+
+// isRetryableGatewayTaintPatchError reports whether a taint removal patch lost
+// a race with another writer. A failed JSON patch test operation is returned as
+// a 422 without object details, whereas admission denials also use 422 by
+// default but name the rejected object and are not retried.
+func isRetryableGatewayTaintPatchError(err error) bool {
+	if apierrors.IsConflict(err) {
+		return true
+	}
+
+	if !apierrors.IsInvalid(err) {
+		return false
+	}
+
+	var status apierrors.APIStatus
+	if !errors.As(err, &status) {
+		return false
+	}
+
+	details := status.Status().Details
+
+	return details == nil || (details.Kind == "" && details.Name == "")
+}
+
+func removeGatewayNodeTaint(ctx context.Context, clientset kubernetes.Interface, nodeName string) error {
+	delay := gatewayTaintRemovalInitialDelay
+
+	for attempt := 1; ; attempt++ {
+		node, err := clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("get node before removing gateway taint: %w", err)
+		}
+
+		index := -1
+
+		for i := range node.Spec.Taints {
+			if taint := node.Spec.Taints[i]; taint.Key == GatewayNodeTaintKey && taint.Value == "true" && taint.Effect == corev1.TaintEffectNoSchedule {
+				index = i
+
+				break
+			}
+		}
+
+		if index < 0 {
+			return nil
+		}
+
+		patch, err := json.Marshal([]map[string]interface{}{
+			{
+				"op":    "test",
+				"path":  fmt.Sprintf("/spec/taints/%d", index),
+				"value": node.Spec.Taints[index],
+			},
+			{
+				"op":   "remove",
+				"path": fmt.Sprintf("/spec/taints/%d", index),
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("marshal gateway taint removal patch: %w", err)
+		}
+
+		if _, err := clientset.CoreV1().Nodes().Patch(ctx, nodeName, types.JSONPatchType, patch, metav1.PatchOptions{}); err != nil {
+			if !isRetryableGatewayTaintPatchError(err) {
+				return fmt.Errorf("remove gateway taint: %w", err)
+			}
+
+			if attempt >= gatewayTaintRemovalMaxAttempts {
+				return fmt.Errorf("remove gateway taint after %d attempts: %w", attempt, err)
+			}
+
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+
+				return fmt.Errorf("remove gateway taint: %w", errors.Join(err, context.Cause(ctx)))
+			case <-timer.C:
+			}
+
+			delay = min(delay*2, gatewayTaintRemovalMaxDelay)
+
+			continue
+		}
+
+		klog.Infof("Removed gateway taint from node %s", nodeName)
+
+		return nil
+	}
 }
 
 func nodeAgentBuildInfo() *BuildInfo {

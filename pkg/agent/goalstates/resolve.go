@@ -45,15 +45,20 @@ type resolveNVIDIAHostFunc func(string) (NvidiaHost, error)
 // systemd-nspawn configuration for a machine. Unlike ResolveMachine, it does
 // not resolve network-dependent node services such as LocalDNS.
 func ResolveNSpawnConfig(cfg *config.AgentConfig, machineName string) (*RootFS, error) {
-	return resolveNSpawnConfig(cfg, machineName, ResolveNvidiaHost)
+	return resolveNSpawnConfig(cfg, machineName, ResolveNvidiaHost, true)
 }
 
 func resolveNSpawnConfig(
 	cfg *config.AgentConfig,
 	machineName string,
 	resolveNVIDIA resolveNVIDIAHostFunc,
+	requireNVIDIA bool,
 ) (*RootFS, error) {
 	if err := config.ValidateAdditionalHostDevices(cfg.AdditionalHostDevices); err != nil {
+		return nil, err
+	}
+
+	if err := config.ValidateNSpawnLifecycle(cfg.NSpawnLifecycle); err != nil {
 		return nil, err
 	}
 
@@ -68,7 +73,7 @@ func resolveNSpawnConfig(
 	}
 
 	nvidiaRequired := len(nvidia.GPUDevicePaths) > 0
-	if nvidiaRequired && !NVIDIAStateAvailable(nvidia) {
+	if requireNVIDIA && nvidiaRequired && !NVIDIAStateAvailable(nvidia) {
 		return nil, fmt.Errorf("%w for machine %s: fresh host state is incomplete", ErrNVIDIAStateUnavailable, machineName)
 	}
 
@@ -94,6 +99,7 @@ func resolveNSpawnConfig(
 		AMD:                    ResolveAMDHost(),
 		HostDevices:            DiscoverHostDevices(cfg.AdditionalHostDevices),
 		AdditionalHostMounts:   additionalHostMounts,
+		NSpawnLifecycle:        cfg.NSpawnLifecycle.DeepCopy(),
 	}, nil
 }
 
@@ -101,7 +107,17 @@ func resolveNSpawnConfig(
 // resolves the complete goal state for the named nspawn machine from an agent
 // config and caller-provided download overrides.
 func ResolveMachine(log *slog.Logger, cfg *config.AgentConfig, machineName string, downloads *DownloadOverrides) (*MachineGoalState, error) {
-	return resolveMachine(log, cfg, machineName, downloads, ResolveNvidiaHost)
+	return resolveMachine(log, cfg, machineName, downloads, ResolveNvidiaHost, true)
+}
+
+// ResolveMachineForPreflight resolves diagnostic inputs without enforcing NVIDIA
+// readiness or initializing devices. The named host checks report driver failures.
+// NVIDIA fields are best-effort and may be empty until devices are initialized.
+// Its result must not be used to provision or start a worker.
+func ResolveMachineForPreflight(log *slog.Logger, cfg *config.AgentConfig, machineName string, downloads *DownloadOverrides) (*MachineGoalState, error) {
+	return resolveMachine(log, cfg, machineName, downloads, func(arch string) (NvidiaHost, error) {
+		return resolveNvidiaHostWithReadiness(arch, false)
+	}, false)
 }
 
 func resolveMachine(
@@ -110,10 +126,11 @@ func resolveMachine(
 	machineName string,
 	downloads *DownloadOverrides,
 	resolveNVIDIA resolveNVIDIAHostFunc,
+	requireNVIDIA bool,
 ) (*MachineGoalState, error) {
 	sandboxImage := cfg.CRI.Containerd.SandboxImage
 
-	nspawnConfig, err := resolveNSpawnConfig(cfg, machineName, resolveNVIDIA)
+	nspawnConfig, err := resolveNSpawnConfig(cfg, machineName, resolveNVIDIA, requireNVIDIA)
 	if err != nil {
 		return nil, err
 	}
@@ -182,6 +199,7 @@ func resolveMachine(
 		AMD:                    amd,
 		HostDevices:            nspawnConfig.HostDevices,
 		AdditionalHostMounts:   nspawnConfig.AdditionalHostMounts,
+		NSpawnLifecycle:        nspawnConfig.NSpawnLifecycle,
 	}
 
 	containerd := ResolveContainerd(ContainerdOptions{
@@ -246,7 +264,8 @@ func resolveKubelet(cfg *config.AgentConfig) (Kubelet, error) {
 	// "no kubelet auth method configured" if attestation is also absent.
 	// Genuine misconfigurations (both fields set, or ExecCredential
 	// without a Command) are still caught here.
-	if cfg.Kubelet.Auth.BootstrapToken != "" || cfg.Kubelet.Auth.ExecCredential != nil {
+	if len(cfg.Kubelet.KubeconfigData) == 0 &&
+		(cfg.Kubelet.Auth.BootstrapToken != "" || cfg.Kubelet.Auth.ExecCredential != nil) {
 		if err := cfg.Kubelet.Auth.Validate(); err != nil {
 			return zero, fmt.Errorf("kubelet auth: %w", err)
 		}
@@ -263,6 +282,7 @@ func resolveKubelet(cfg *config.AgentConfig) (Kubelet, error) {
 	return Kubelet{
 		KubeletBinPath:          filepath.Join("/"+BinDir, "kubelet"),
 		KubeletAuthInfo:         cfg.Kubelet.Auth,
+		KubeconfigData:          slices.Clone(cfg.Kubelet.KubeconfigData),
 		APIServer:               cfg.Kubelet.ApiServer,
 		CACertData:              caCert,
 		ClusterDNS:              cfg.Cluster.ClusterDNS,

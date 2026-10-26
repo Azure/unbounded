@@ -160,7 +160,6 @@ fn borrowed_context_and_subscription_defaults_round_trip() {
             range: None,
             page_credits: 2,
             byte_credits: 2 * PAGE_BYTES,
-            ordered: false
         }
     );
     assert_eq!(
@@ -183,6 +182,21 @@ fn borrowed_context_and_subscription_defaults_round_trip() {
     );
 }
 
+/// The removed `Racer-Ordered` header from older SDKs is accepted and ignored with any
+/// value, including duplicates.
+#[test]
+fn racer_ordered_header_is_ignored_any_value() {
+    let parser = RequestParser::new(usize::MAX);
+    let expected = parser.parse(&request()).unwrap().kind;
+    for values in [&["1"][..], &["0"], &["2"], &["yes"], &["1", "0"]] {
+        let mut head = request();
+        for value in values {
+            head.headers.push(Header::new("Racer-Ordered", *value));
+        }
+        assert_eq!(parser.parse(&head).unwrap().kind, expected, "{values:?}");
+    }
+}
+
 /// Duplicate fields, oversized context, malformed credits, and HEAD ranges fail closed.
 #[test]
 fn request_failures_preserve_protocol_taxonomy() {
@@ -193,7 +207,6 @@ fn request_failures_preserve_protocol_taxonomy() {
         ("Racer-Page-Credits", "01", Error::InvalidRequest),
         ("Racer-Page-Credits", "65", Error::InvalidRequest),
         ("Racer-Byte-Credits", "1", Error::InvalidRequest),
-        ("Racer-Ordered", "2", Error::InvalidRequest),
         ("Range", "bytes=1-0", Error::InvalidRange),
     ] {
         let mut head = request();

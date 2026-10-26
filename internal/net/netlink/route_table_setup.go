@@ -295,7 +295,7 @@ func FlushRouteTable(tableID int) error {
 		for _, route := range routes {
 			r := route
 			if err := netlink.RouteDel(&r); err != nil {
-				klog.V(4).Infof("Failed removing route from table %d: %v", tableID, err)
+				return fmt.Errorf("remove route from table %d: %w", tableID, err)
 			}
 		}
 

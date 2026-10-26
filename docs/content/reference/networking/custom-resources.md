@@ -57,7 +57,7 @@ spec:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `assignmentEnabled` | `*bool` | No | Enables this assignment (default: `true`). |
+| `assignmentEnabled` | `*bool` | No | Enables this assignment. When omitted, inherits `manageCniPlugin` (default: `true`). Explicit `true` or `false` overrides that default. |
 | `cidrBlocks` | `[]string` | No | CIDR pools to allocate from (IPv4 and/or IPv6). |
 | `nodeBlockSizes.ipv4` | `int` | No | IPv4 subnet size for node allocations (default: `/24`). |
 | `nodeBlockSizes.ipv6` | `int` | No | IPv6 subnet size for node allocations (default: pool prefix + 16). |
@@ -80,6 +80,12 @@ spec:
 
 Set to `false` when using an external CNI plugin (e.g., Cilium, Calico) for
 intra-site networking while unbounded-net handles only cross-site routing.
+
+With `manageCniPlugin: false`, omitted `assignmentEnabled` values resolve to
+`false`. Set `podCidrAssignments[].assignmentEnabled: true` to allocate Node
+PodCIDRs without managing the external CNI. Explicit `false` always disables a
+rule. Inherited values are not persisted and follow changes to `manageCniPlugin`;
+existing explicit values remain unchanged.
 
 ### Admission Validation
 
@@ -228,7 +234,15 @@ advertisements and heartbeat timestamps.
 | `spec.gatewayPool` | `string` | Yes | Parent GatewayPool. |
 | `spec.site` | `string` | No | Site name (from node labels). |
 | `status.lastUpdated` | `string` | -- | Last heartbeat timestamp. |
+| `status.forwardingMTU` | `integer` | No | Effective local forwarding MTU in bytes after successful dataplane reconciliation. |
 | `status.routes` | `map[string]GatewayNodeRoute` | -- | Route advertisements keyed by CIDR. |
+
+Workers honor this MTU on the next-hop gateway and candidate gateways in
+intermediate pools on accepted paths. Gateways do not consume other gateways'
+published MTUs, avoiding feedback between advertised minima. Install the updated
+CRD before upgrading agents; older gateways without the field retain
+topology-derived caps but do not provide this additional shared-interface limit.
+Gateways without a GatewayPoolNode object are not used as route destinations.
 
 ---
 

@@ -35,6 +35,12 @@ use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
 
+/// End of the real (unpadded) v2 header, including its digest.
+fn real_header_end(bytes: &[u8]) -> usize {
+    16 + super::header_fields_len(&mut super::Decoder(&bytes[16..])).unwrap()
+        + super::HEADER_DIGEST_BYTES
+}
+
 mod index_pressure {
     use super::*;
     fn fixture(capacity: usize) -> Fixture {
@@ -402,6 +408,7 @@ fn hard_hold_checkpoint_roundtrip_restores_only_live_disk_reservations() {
     let index = f.store.writer.index();
     let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
     index.reserve_hold(&id.version, 1, until).unwrap();
+    let before = index.hold_epoch(&id.version).unwrap();
     drive(&f.reactor, f.store.writer.persist_held(copy, &scope())).unwrap();
     let shard = futures::executor::block_on(f.store.checkpoint.snapshot_shard()).unwrap();
     f.store.checkpoint.finish_snapshot();
@@ -419,6 +426,28 @@ fn hard_hold_checkpoint_roundtrip_restores_only_live_disk_reservations() {
     )
     .unwrap();
     assert_eq!(index.hold_expiry(&id.version), Some(until));
+    // Holder identities are not persisted: a restored page has one holder.
+    assert_eq!(index.hold_holders(&id), 1);
+    // A restored hold is a new lifetime: releases issued before the restore
+    // cannot reach it, while its own epoch still releases the page.
+    let restored = index.hold_epoch(&id.version).unwrap();
+    assert_ne!(restored, before);
+    let page = std::iter::once(id.number).collect();
+    index.release_hold_pages(
+        &id.version,
+        &page,
+        before,
+        crate::store::holds::HolderKind::Reader,
+    );
+    assert_eq!(index.hold_holders(&id), 1);
+    index.release_hold_pages(
+        &id.version,
+        &page,
+        restored,
+        crate::store::holds::HolderKind::Reader,
+    );
+    assert_eq!(index.hold_holders(&id), 0);
+    assert_eq!(index.hold_expiry(&id.version), None);
     let mut image = checkpoint::decode(&bytes).unwrap();
     for segment in &mut image.shards[0].segments {
         for (_, deadline) in &mut segment.retained_records {
@@ -960,7 +989,12 @@ fn second_sight_reclaim_scans_only_a_fixed_queue_prefix_and_makes_progress() {
     let last = crate::memory::tests::bundle_for(&f.admission, metadata);
     f.enqueue(last.copy()).unwrap();
     // Arbitrary idle-page reclamation must not walk a capacity-sized suffix.
-    assert_eq!(f.store.writer.discard_idle_copy(&last), 0);
+    assert_eq!(
+        f.store
+            .writer
+            .discard_idle_copy(last.plaintext.page(), &last.ciphertext),
+        0
+    );
     assert_eq!(f.store.writer.queued_count(), 65);
     let calls = Rc::new(Cell::new(0));
     let counted = calls.clone();
@@ -981,7 +1015,12 @@ fn second_sight_reclaim_scans_only_a_fixed_queue_prefix_and_makes_progress() {
     assert_eq!(f.store.writer.queued_count(), 1);
     assert_eq!(f.store.writer.discarded_count(), 64);
     // Later calls reach the untouched suffix; no queued page becomes pinned.
-    assert!(f.store.writer.discard_idle_copy(&last) > 0);
+    assert!(
+        f.store
+            .writer
+            .discard_idle_copy(last.plaintext.page(), &last.ciphertext)
+            > 0
+    );
     assert_eq!(f.store.writer.pending_count(), 0);
     assert_eq!(f.store.writer.discarded_count(), 65);
 }
@@ -1226,9 +1265,16 @@ impl Fixture {
         }
     }
     fn copy(&self, number: u8, length: usize) -> CiphertextCopy {
+        self.copy_in(
+            CacheId(crate::test_support::security::CACHE.into()),
+            number,
+            length,
+        )
+    }
+    fn copy_in(&self, cache: CacheId, number: u8, length: usize) -> CiphertextCopy {
         let version = ObjectVersion {
             object: ObjectId {
-                cache: CacheId(crate::test_support::security::CACHE.into()),
+                cache,
                 key: CacheKey([number; 32]),
             },
             etag: StrongEtag::parse(b"\"v1\"").unwrap(),
@@ -1263,6 +1309,31 @@ impl Fixture {
                 .pool
                 .ciphertext(reservation, envelope, vec![number; length + 16])
                 .unwrap(),
+        }
+    }
+    /// Like [`Self::copy`], but with the ciphertext sealed into this worker's
+    /// aligned pool, as AEAD output and TCP receives are.
+    fn aligned_copy(&self, number: u8, length: usize) -> CiphertextCopy {
+        let owned = self.copy(number, length);
+        let envelope = owned.ciphertext.envelope().clone();
+        let cache = &owned.metadata.version.object.cache;
+        let capacity = self.pool.aligned_capacity(length + 16).unwrap();
+        let reservation = self
+            .admission
+            .reserve(Some(cache), ResourceClass::Ciphertext, capacity)
+            .unwrap();
+        let mut buffer = self
+            .pool
+            .aligned_ciphertext(reservation, length + 16)
+            .unwrap();
+        buffer.as_mut_slice().fill(number);
+        let ciphertext = self
+            .pool
+            .aligned_ciphertext_page(buffer, envelope, None)
+            .unwrap();
+        CiphertextCopy {
+            metadata: owned.metadata,
+            ciphertext,
         }
     }
     fn enqueue(&self, copy: CiphertextCopy) -> Result<u64> {
@@ -1421,8 +1492,7 @@ fn concurrent_writes_reserve_distinct_extents_and_capacity_before_completion() {
 
 #[test]
 fn pipeline_out_of_order_failure_and_short_cqes_preserve_other_mapping() {
-    use uring_runtime::reactor::simulation::Fault;
-    use uring_runtime::reactor::simulation::Simulation;
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
     for fault in [Fault::Delay(6), Fault::Errno(libc::EIO), Fault::Short(512)] {
         let simulation = Simulation::new();
         let _environment = simulation.enter();
@@ -1472,15 +1542,8 @@ fn second_sight_delayed_sealed_write_keeps_publication_authority() {
     );
     let delayed = f.copy(2, 113);
     let id = delayed.ciphertext.envelope().page.clone();
-    let length = f
-        .store
-        .writer
-        .slabs()
-        .alignment()
-        .unwrap()
-        .extent(0, logical_length(&delayed).unwrap())
-        .unwrap()
-        .length();
+    let length =
+        crate::store::record_length(&delayed, f.store.writer.slabs().alignment().unwrap()).unwrap();
     drop(
         f.segments
             .append(f.segments.segment_bytes() as usize - length)
@@ -1755,7 +1818,7 @@ fn record_round_trip_preserves_ciphertext_zeroes_padding_and_rejects_torn_header
     for length in [3, crate::model::PAGE_BYTES as usize] {
         let page = f.copy(9, length);
         let disk = a
-            .extent(0, crate::store::logical_length(&page).unwrap())
+            .extent(0, crate::store::record_length(&page, a).unwrap())
             .unwrap();
         let reserve = f
             .admission
@@ -1944,12 +2007,7 @@ fn allocator_integration_reclaims_idle_charge_before_writer_admission_retry() {
     let page = f.copy(1, 64);
     let cache = &page.metadata.version.object.cache;
     let slab = f.store.writer.slabs();
-    let length = slab
-        .alignment()
-        .unwrap()
-        .extent(0, crate::store::logical_length(&page).unwrap())
-        .unwrap()
-        .length();
+    let length = crate::store::record_length(&page, slab.alignment().unwrap()).unwrap();
     let charge = f
         .admission
         .reserve(Some(cache), ResourceClass::Ciphertext, length)
@@ -2377,7 +2435,7 @@ fn other_format_version_and_unknown_cipher_records_are_cache_misses() {
         )
         .unwrap();
         let bytes = stored.bytes_mut().unwrap();
-        let header_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let header_len = real_header_end(bytes);
         let cipher_offset = header_len - 36;
         if other_version {
             // A well-formed record from another format version.
@@ -3024,6 +3082,166 @@ fn fill_accepted_before_stop_can_transfer_dirty_ownership_during_drain() {
     assert!(f.store.writer.is_idle());
 }
 
+#[test]
+fn registered_fill_accepted_before_stop_persists_during_drain() {
+    use crate::rdma::links::tests::{link_up, receive_registered, world};
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let mut page = f.copy(1, 64);
+    let id = page.ciphertext.envelope().page.clone();
+    let cache = page.metadata.version.object.cache.clone();
+    let mut w = world();
+    link_up(&mut w);
+    let received = receive_registered(&mut w, &page.ciphertext);
+    let length = received.len();
+    let reservation = f
+        .admission
+        .reserve(Some(&cache), ResourceClass::Ciphertext, length)
+        .unwrap();
+    page.ciphertext = crate::memory::BufferPool::new(f.admission.clone())
+        .registered_ciphertext(reservation, page.ciphertext.envelope().clone(), received)
+        .unwrap();
+    assert!(page.ciphertext.is_registered());
+    let dirty = f
+        .admission
+        .reserve(Some(&cache), ResourceClass::DirtyCiphertext, length)
+        .unwrap();
+    f.admission.stop();
+    f.store.writer.enqueue(page, dirty).unwrap();
+    drive(&f.reactor, f.store.writer.drain(&scope())).unwrap();
+    assert!(f.store.writer.index().lookup(&id).unwrap().is_some());
+    assert!(f.store.writer.is_idle());
+}
+
+#[test]
+fn registered_persistence_reclaims_cached_pages_through_callback() {
+    use crate::rdma::links::tests::{link_up, receive_registered, world};
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let mut page = f.copy(1, 64);
+    let id = page.ciphertext.envelope().page.clone();
+    let cache = page.metadata.version.object.cache.clone();
+    let mut w = world();
+    link_up(&mut w);
+    let received = receive_registered(&mut w, &page.ciphertext);
+    let length = received.len();
+    let reservation = f
+        .admission
+        .reserve(Some(&cache), ResourceClass::Ciphertext, length)
+        .unwrap();
+    page.ciphertext = crate::memory::BufferPool::new(f.admission.clone())
+        .registered_ciphertext(reservation, page.ciphertext.envelope().clone(), received)
+        .unwrap();
+    let dirty = f
+        .admission
+        .reserve(Some(&cache), ResourceClass::DirtyCiphertext, length)
+        .unwrap();
+    // Stand-in for reclaimable cached pages: fill the remaining Ciphertext
+    // quota so only the caller's reclamation can make room.
+    let cached = std::cell::RefCell::new(Vec::new());
+    let mut chunk = f.admission.limit(ResourceClass::Ciphertext);
+    while chunk > 0 {
+        match f
+            .admission
+            .reserve(Some(&cache), ResourceClass::Ciphertext, chunk)
+        {
+            Ok(charge) => cached.borrow_mut().push(charge),
+            Err(_) => chunk /= 2,
+        }
+    }
+    let calls = std::cell::Cell::new(0);
+    f.admission.stop();
+    let ticket = f
+        .store
+        .writer
+        .enqueue_reclaiming(page, dirty, |amount| {
+            calls.set(calls.get() + 1);
+            let reserve = || {
+                f.admission
+                    .reserve_completion(Some(&cache), ResourceClass::Ciphertext, amount)
+                    .map_err(Error::from)
+            };
+            match reserve() {
+                Err(Error::Overloaded) => {
+                    cached.borrow_mut().clear();
+                    reserve()
+                }
+                result => result,
+            }
+        })
+        .unwrap();
+    assert_ne!(ticket, 0);
+    // Both the registered copy-out and disk staging use the callback.
+    assert_eq!(calls.get(), 2);
+    assert!(cached.borrow().is_empty());
+    drive(&f.reactor, f.store.writer.drain(&scope())).unwrap();
+    assert!(f.store.writer.index().lookup(&id).unwrap().is_some());
+    assert!(f.store.writer.is_idle());
+}
+
+#[test]
+fn registered_page_cached_then_persisted_is_copied_out_once() {
+    use crate::rdma::links::tests::{link_up, receive_registered, world};
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let mut page = f.copy(1, 64);
+    let id = page.ciphertext.envelope().page.clone();
+    let cache = page.metadata.version.object.cache.clone();
+    let mut w = world();
+    link_up(&mut w);
+    let received = receive_registered(&mut w, &page.ciphertext);
+    let length = received.len();
+    let reservation = f
+        .admission
+        .reserve(Some(&cache), ResourceClass::Ciphertext, length)
+        .unwrap();
+    let pool = crate::memory::BufferPool::new(f.admission.clone());
+    page.ciphertext = pool
+        .registered_ciphertext(reservation, page.ciphertext.envelope().clone(), received)
+        .unwrap();
+    let copies = crate::memory::registered_copy_outs;
+    let before = copies();
+    // The memory cache retains first, as `publish` runs before `persist_verified`.
+    let cached = pool.retainable(page.ciphertext.clone()).unwrap();
+    assert!(!cached.is_registered());
+    assert_eq!(copies(), before + 1);
+    // A second retaining path for the same page shares that copy.
+    let again = pool.retainable(page.ciphertext.clone()).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&again.inner, &cached.inner));
+    let dirty = f
+        .admission
+        .reserve(Some(&cache), ResourceClass::DirtyCiphertext, length)
+        .unwrap();
+    let calls = std::cell::Cell::new(0);
+    f.store
+        .writer
+        .enqueue_reclaiming(page, dirty, |amount| {
+            calls.set(calls.get() + 1);
+            f.admission
+                .reserve_completion(Some(&cache), ResourceClass::Ciphertext, amount)
+                .map_err(Error::from)
+        })
+        .unwrap();
+    assert_eq!(calls.get(), 1, "disk staging only, no second copy-out");
+    assert_eq!(
+        copies(),
+        before + 1,
+        "one copy-out for cache and disk queue"
+    );
+    drive(&f.reactor, f.store.writer.drain(&scope())).unwrap();
+    assert!(f.store.writer.index().lookup(&id).unwrap().is_some());
+    drop((cached, again));
+    crate::rdma::links::tests::pump(&mut w.a.owner, &mut w.b.owner);
+    assert_eq!(
+        w.a.links
+            .buffers(racer_control_wire::RailId(7), rdma_verbs::BufferState::Free),
+        Some(2)
+    );
+}
+
 mod records {
     use super::*;
     use crate::admission::ResourceClass;
@@ -3109,18 +3327,19 @@ mod records {
             .collect()
     }
 
-    // Little-endian record header for `page(3, 0, "cache", "v1")` at
-    // generation 7, including the header digest and ciphertext. Bytes past the
-    // logical record are zero padding.
-    const GOLDEN_LOGICAL: &str = concat!(
-        "524352504147453101000000b900000007000000000000000300000000000000",
+    // Little-endian v2 record header for `page(3, 0, "cache", "v1")` at
+    // generation 7, including the header digest. The header is zero padded to
+    // 512 bytes, the ciphertext follows at offset 512, and bytes past the
+    // ciphertext are zero padding.
+    const GOLDEN_HEADER: &str = concat!(
+        "5243525041474531020000000002000007000000000000000300000000000000",
         "0000000000000000030000001300000001010101010101010101010101010101",
         "0202020202020202020202020202020202020202020202020303030303030303",
         "0303030303030303030303030303030303030303030303030500000004000000",
-        "6361636865227631227853ecbd5e15ca0c0000000001000000c49c9e3d747d13",
-        "105b9fa5b7cf40f7b7d36e745029bbc001738e28cfbaa6edaa02020202020202",
-        "020202020202020202020202",
+        "6361636865227631227853ecbd5e15ca0c0000000001000000f2ba12dc70a195",
+        "6526e93ce78625d77fac702d18ab8439512812f098a7e14afa",
     );
+    const GOLDEN_CIPHERTEXT: &str = "02020202020202020202020202020202020202";
 
     #[test]
     fn current_wire_bytes_and_reused_padding_across_page_and_alignment_boundaries() {
@@ -3162,7 +3381,12 @@ mod records {
                 logical,
                 128 + 16 + cache.len() + etag.len() + 2 + 32 + length + 16
             );
-            let extent = alignment.extent(offset, logical).unwrap();
+            let record = record_length(&page, alignment).unwrap();
+            let extent = alignment.extent(offset, record).unwrap();
+            assert_eq!(extent.length(), record);
+            let block = header_block_len(&page, alignment).unwrap();
+            assert_eq!(block % alignment.length(), 0);
+            assert_eq!(block + body_len(&page, alignment).unwrap(), record);
             let mut staging = buffer(&admission, alignment, extent.length());
             staging.bytes_mut().unwrap().fill(0xa5);
             let mut encoded =
@@ -3191,9 +3415,9 @@ mod records {
                 page.metadata.length -= 1;
             }
             inner.bytes.fill(0x6b);
-            let shortened_logical = logical - usize::from(length > 1);
             // At a rounding boundary, use a same-length replacement instead.
-            if alignment.extent(offset, shortened_logical).unwrap() != extent {
+            if record_length(&page, alignment).unwrap() != record {
+                let inner = Arc::get_mut(&mut page.ciphertext.inner).unwrap();
                 inner.bytes.push(0x6b);
                 inner.envelope.plaintext_length += 1;
                 inner.envelope.ciphertext_length += 1;
@@ -3316,7 +3540,7 @@ mod records {
                 &page,
                 Generation(7),
                 alignment,
-                buffer(&admission, alignment, 512),
+                buffer(&admission, alignment, 1024),
             )
             .unwrap();
             assert_eq!(
@@ -3338,7 +3562,7 @@ mod records {
                     Generation(0),
                     alignment,
                     1,
-                    buffer(&admission, alignment, 512)
+                    buffer(&admission, alignment, 1024)
                 )
                 .err(),
                 Some(Error::CorruptRecord)
@@ -3353,9 +3577,9 @@ mod records {
         let baseline = admission.used(ResourceClass::Ciphertext);
         let normal = Alignment::new(512, 512, 512).unwrap();
         for (alignment, offset, length, expected) in [
-            (normal, 1, 512, Error::InvalidConfiguration),
-            (normal, 0, 1024, Error::InvalidConfiguration),
-            (normal, u64::MAX - 511, 512, Error::CorruptRecord),
+            (normal, 1, 1024, Error::InvalidConfiguration),
+            (normal, 0, 1536, Error::InvalidConfiguration),
+            (normal, u64::MAX - 1023, 1024, Error::CorruptRecord),
             (
                 Alignment::new(512, 512, usize::MAX).unwrap(),
                 0,
@@ -3473,14 +3697,17 @@ mod records {
             &page,
             Generation(7),
             alignment,
-            buffer(&admission, alignment, 512),
+            buffer(&admission, alignment, 1024),
         )
         .unwrap();
         let bytes = encoded.buffer.bytes().unwrap();
-        let logical = logical_length(&page).unwrap();
-        assert_eq!(bytes[..logical], unhex(GOLDEN_LOGICAL));
-        assert!(bytes[logical..].iter().all(|&b| b == 0));
-        let parsed = parse_bytes(bytes, Extent::new(0, 512).unwrap()).unwrap();
+        let header = unhex(GOLDEN_HEADER);
+        let ciphertext = unhex(GOLDEN_CIPHERTEXT);
+        assert_eq!(bytes[..header.len()], header);
+        assert!(bytes[header.len()..512].iter().all(|&b| b == 0));
+        assert_eq!(bytes[512..512 + ciphertext.len()], ciphertext);
+        assert!(bytes[512 + ciphertext.len()..].iter().all(|&b| b == 0));
+        let parsed = parse_bytes(bytes, Extent::new(0, 1024).unwrap()).unwrap();
         assert_eq!(parsed.header.format_version, FORMAT_VERSION);
         assert_eq!(parsed.checksum, page.ciphertext.checksum());
     }
@@ -3495,7 +3722,7 @@ mod records {
             &page,
             Generation(7),
             alignment,
-            buffer(&admission, alignment, 512),
+            buffer(&admission, alignment, 1024),
         )
         .unwrap();
         let parsed = parse(&encoded.buffer, encoded.header.extent).unwrap();
@@ -3509,7 +3736,7 @@ mod records {
             .position(|w| w == b"text/plain")
             .unwrap();
         corrupted[start] = b'\r';
-        let end = u32::from_le_bytes(corrupted[12..16].try_into().unwrap()) as usize;
+        let end = real_header_end(&corrupted);
         let digest = Sha256::digest(&corrupted[..end - 32]);
         corrupted[end - 32..end].copy_from_slice(&digest);
         assert!(parse_bytes(&corrupted, encoded.header.extent).is_err());
@@ -3524,12 +3751,12 @@ mod records {
             &page,
             Generation(7),
             alignment,
-            buffer(&admission, alignment, 512),
+            buffer(&admission, alignment, 1024),
         )
         .unwrap();
         let original = encoded.buffer.bytes().unwrap();
         assert_eq!(&original[8..12], &FORMAT_VERSION.to_le_bytes());
-        let header_len = u32::from_le_bytes(original[12..16].try_into().unwrap()) as usize;
+        let header_len = real_header_end(original);
         let crc_offset = 128 + "cache".len() + "\"v1\"".len();
         assert_eq!(
             &original[crc_offset..crc_offset + 8],
@@ -3555,9 +3782,8 @@ mod records {
         // the framing hash and lengths have been recomputed by the producer.
         let mut missing_crc = original.to_vec();
         missing_crc.drain(crc_offset..crc_offset + 8);
-        missing_crc.resize(original.len(), 0);
+        missing_crc.splice(header_len - 8..header_len - 8, [0; 8]);
         let shorter_header = header_len - 8;
-        missing_crc[12..16].copy_from_slice(&(shorter_header as u32).to_le_bytes());
         let digest = Sha256::digest(&missing_crc[..shorter_header - 32]);
         missing_crc[shorter_header - 32..shorter_header].copy_from_slice(&digest);
         assert!(matches!(
@@ -3571,6 +3797,149 @@ mod records {
             parse_bytes(&damaged_crc, encoded.header.extent),
             Err(Error::CorruptRecord)
         ));
+    }
+
+    /// Encode `page(3, 0, "cache", etag)` at 512-byte alignment.
+    fn encoded_v2(
+        admission: &flow_control::Quotas<AdmissionPolicy>,
+        etag: &str,
+    ) -> (Vec<u8>, Extent) {
+        let page = page(admission, 3, 0, "cache", etag);
+        let alignment = Alignment::new(512, 512, 512).unwrap();
+        let length = record_length(&page, alignment).unwrap();
+        let encoded = encode(
+            &page,
+            Generation(7),
+            alignment,
+            buffer(admission, alignment, length),
+        )
+        .unwrap();
+        (
+            encoded.buffer.bytes().unwrap().to_vec(),
+            encoded.header.extent,
+        )
+    }
+
+    #[test]
+    fn v2_ciphertext_starts_at_aligned_header_block_across_boundaries() {
+        let admission = admission();
+        // The real header is 183 bytes plus the ETag length for "cache" IDs.
+        for unit in [512, 4096] {
+            let alignment = Alignment::new(unit, unit as u64, unit).unwrap();
+            for real in [512 - 1, 512, 512 + 1, 4096 - 1, 4096, 4096 + 1] {
+                let etag = "x".repeat(real - 183);
+                for content_type in [None, Some("text/plain")] {
+                    let mut page = page(&admission, 3, 0, "cache", &etag);
+                    page.metadata.content_type = content_type
+                        .map(|v| crate::model::ContentType::parse(v.as_bytes()).unwrap());
+                    let extra = content_type.map_or(0, str::len);
+                    let block = header_block_len(&page, alignment).unwrap();
+                    assert_eq!(block, (real + extra).next_multiple_of(unit));
+                    assert_eq!(body_len(&page, alignment).unwrap(), unit);
+                    let record = record_length(&page, alignment).unwrap();
+                    assert_eq!(record, block + unit);
+                    let mut staging = buffer(&admission, alignment, record);
+                    staging.bytes_mut().unwrap().fill(0xa5);
+                    let encoded =
+                        encode_at(&page, Generation(3), alignment, unit as u64, staging).unwrap();
+                    let bytes = encoded.buffer.bytes().unwrap();
+                    assert_eq!(real_header_end(bytes), real + extra);
+                    assert_eq!(
+                        u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize,
+                        block
+                    );
+                    assert!(bytes[real + extra..block].iter().all(|&b| b == 0));
+                    let parsed = parse(&encoded.buffer, encoded.header.extent).unwrap();
+                    assert_eq!(parsed.ciphertext, block..block + 19);
+                    assert_eq!(&bytes[parsed.ciphertext.clone()], page.ciphertext.bytes());
+                    assert!(bytes[block + 19..].iter().all(|&b| b == 0));
+                    assert_eq!(parsed.header.metadata, page.metadata.immutable());
+
+                    let mut header = vec![0xa5; block];
+                    write_header(&page, Generation(3), alignment, &mut header).unwrap();
+                    assert_eq!(header, bytes[..block]);
+                    let mut short = vec![0; block - 1];
+                    assert_eq!(
+                        write_header(&page, Generation(3), alignment, &mut short),
+                        Err(Error::InvalidConfiguration)
+                    );
+                }
+            }
+        }
+        admission.reclaim_buffers();
+    }
+
+    #[test]
+    fn v2_rejects_nonzero_padding_and_bad_header_lengths() {
+        let admission = admission();
+        let (original, extent) = encoded_v2(&admission, "v1");
+        let real = real_header_end(&original);
+        assert!(parse_bytes(&original, extent).is_ok());
+
+        for at in [real, 300, 511] {
+            let mut bytes = original.clone();
+            bytes[at] = 1;
+            assert_eq!(
+                parse_bytes(&bytes, extent).err(),
+                Some(Error::CorruptRecord),
+                "padding byte {at}"
+            );
+        }
+        // Misaligned, shorter than the real header, too large, and past the record.
+        for header_len in [513u32, 768, 256, real as u32, 0, 1024, 1536] {
+            let mut bytes = original.clone();
+            bytes[12..16].copy_from_slice(&header_len.to_le_bytes());
+            let digest = Sha256::digest(&bytes[..real - 32]);
+            bytes[real - 32..real].copy_from_slice(&digest);
+            assert_eq!(
+                parse_bytes(&bytes, extent).err(),
+                Some(Error::CorruptRecord),
+                "header_len {header_len}"
+            );
+        }
+        // A header block that leaves no room for the ciphertext.
+        let mut bytes = original.clone();
+        bytes[12..16].copy_from_slice(&1024u32.to_le_bytes());
+        let digest = Sha256::digest(&bytes[..real - 32]);
+        bytes[real - 32..real].copy_from_slice(&digest);
+        bytes.resize(1536, 0);
+        let moved: Vec<u8> = bytes[512..531].to_vec();
+        bytes[1024..1043].copy_from_slice(&moved);
+        bytes[512..531].fill(0);
+        assert!(parse_bytes(&bytes, Extent::new(0, 1536).unwrap()).is_ok());
+        assert_eq!(
+            parse_bytes(&bytes[..1024], Extent::new(0, 1024).unwrap()).err(),
+            Some(Error::CorruptRecord)
+        );
+        admission.reclaim_buffers();
+    }
+
+    #[test]
+    fn v1_layout_record_is_rejected() {
+        let admission = admission();
+        let (original, extent) = encoded_v2(&admission, "v1");
+        let real = real_header_end(&original);
+        // Rebuild the v1 layout: unpadded header, ciphertext right after it.
+        let mut bytes = vec![0; extent.length()];
+        bytes[..real].copy_from_slice(&original[..real]);
+        bytes[real..real + 19].copy_from_slice(&original[512..531]);
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&(real as u32).to_le_bytes());
+        let digest = Sha256::digest(&bytes[..real - 32]);
+        bytes[real - 32..real].copy_from_slice(&digest);
+        assert_eq!(
+            parse_bytes(&bytes, extent).err(),
+            Some(Error::CorruptRecord)
+        );
+        // Even claiming the current version, the unpadded header is rejected.
+        bytes[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        let digest = Sha256::digest(&bytes[..real - 32]);
+        bytes[real - 32..real].copy_from_slice(&digest);
+        assert_eq!(
+            parse_bytes(&bytes, extent).err(),
+            Some(Error::CorruptRecord)
+        );
+        admission.reclaim_buffers();
     }
 
     #[test]
@@ -4583,4 +4952,402 @@ mod checkpoint {
                 .is_some()
         );
     }
+}
+
+/// Ciphertext quota charged by enqueueing `page`, which is the staging reservation.
+fn enqueue_staging(f: &Fixture, page: CiphertextCopy) -> usize {
+    let before = f.admission.used(ResourceClass::Ciphertext);
+    f.enqueue(page).unwrap();
+    f.admission.used(ResourceClass::Ciphertext) - before
+}
+
+#[test]
+fn zero_copy_persist_stages_only_header_and_round_trips() {
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let alignment = f.store.writer.slabs().alignment().unwrap();
+    for length in [23, 4096, crate::model::PAGE_BYTES as usize] {
+        let number = (length % 251) as u8 + 1;
+        let page = f.aligned_copy(number, length);
+        assert!(zero_copy_body(&page, alignment).unwrap().is_some());
+        let header = header_block_len(&page, alignment).unwrap();
+        assert_eq!(staging_bytes(&page, alignment).unwrap(), header);
+        let id = page.ciphertext.envelope().page.clone();
+        let before = page.ciphertext.disk_body(alignment).unwrap().to_vec();
+        assert_eq!(enqueue_staging(&f, page.clone()), header);
+        let request = scope();
+        assert_eq!(
+            drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap(),
+            1
+        );
+        // The device write borrowed, and did not mutate, the shared page.
+        assert_eq!(page.ciphertext.disk_body(alignment).unwrap(), &before[..]);
+        let read = drive(&f.reactor, f.store.reader.read(&id, &request))
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.ciphertext.bytes(), page.ciphertext.bytes());
+        assert_eq!(read.ciphertext.envelope(), page.ciphertext.envelope());
+    }
+    assert_eq!(f.metrics.count(crate::telemetry::Event::PersistZeroCopy), 3);
+    assert_eq!(
+        f.metrics
+            .count(crate::telemetry::Event::PersistCopyFallback),
+        0
+    );
+    assert!(f.store.writer.is_idle());
+    assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
+}
+
+#[test]
+fn unaligned_page_persists_through_copy_fallback_with_full_staging() {
+    let f = Fixture::new();
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    f.reactor.init().unwrap();
+    let alignment = f.store.writer.slabs().alignment().unwrap();
+    let page = f.copy(9, 4096);
+    assert!(zero_copy_body(&page, alignment).unwrap().is_none());
+    let full = staging_capacity(record_length(&page, alignment).unwrap()).unwrap();
+    assert_eq!(staging_bytes(&page, alignment).unwrap(), full);
+    let id = page.ciphertext.envelope().page.clone();
+    assert_eq!(enqueue_staging(&f, page.clone()), full);
+    let request = scope();
+    assert_eq!(
+        drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap(),
+        1
+    );
+    let read = drive(&f.reactor, f.store.reader.read(&id, &request))
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.ciphertext.bytes(), page.ciphertext.bytes());
+    assert_eq!(f.metrics.count(crate::telemetry::Event::PersistZeroCopy), 0);
+    assert_eq!(
+        f.metrics
+            .count(crate::telemetry::Event::PersistCopyFallback),
+        1
+    );
+}
+
+#[test]
+fn zero_copy_body_serves_a_shorter_record_body_and_rejects_misfits() {
+    let f = Fixture::new();
+    let page = f.aligned_copy(4, 100);
+    let pool = f.pool.alignment();
+    let body = page.ciphertext.disk_body(pool).unwrap();
+    // A 512-byte device unit takes a unit-aligned prefix of the pool padding.
+    let device = Alignment::new(512, 512, 512).unwrap();
+    let prefix = disk_body_prefix(&page.ciphertext, device, 512).unwrap();
+    assert_eq!(prefix.as_ptr(), body.as_ptr());
+    assert_eq!(&prefix[..116], page.ciphertext.bytes());
+    assert!(prefix[116..].iter().all(|&b| b == 0));
+    // Lengths beyond the padding or off the device unit are refused.
+    assert!(disk_body_prefix(&page.ciphertext, device, body.len() + 512).is_none());
+    assert!(disk_body_prefix(&page.ciphertext, device, 100).is_none());
+    // Owned pages never expose a disk body.
+    assert!(disk_body_prefix(&f.copy(4, 100).ciphertext, device, 512).is_none());
+}
+
+#[test]
+fn zero_copy_write_failure_releases_charges_and_does_not_publish() {
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
+    for fault in [Fault::Errno(libc::EIO), Fault::Short(512)] {
+        let simulation = Simulation::new();
+        let _environment = simulation.enter();
+        let f = Fixture::new();
+        let _ = drive(&f.reactor, f.store.open()).unwrap();
+        let alignment = f.store.writer.slabs().alignment().unwrap();
+        let page = f.aligned_copy(5, 4096);
+        let id = page.ciphertext.envelope().page.clone();
+        let before = page.ciphertext.disk_body(alignment).unwrap().to_vec();
+        let page_charge = f.admission.used(ResourceClass::Ciphertext);
+        f.enqueue(page.clone()).unwrap();
+        simulation.inject("writev", fault).unwrap();
+        let request = scope();
+        // Progress may absorb the device error; it must not publish.
+        let _ = drive(&f.reactor, f.store.writer.progress(1, &request));
+        assert!(f.store.writer.is_idle());
+        assert!(f.store.writer.index().lookup(&id).unwrap().is_none());
+        assert_eq!(f.metrics.count(crate::telemetry::Event::DiskPublication), 0);
+        assert_eq!(f.metrics.count(crate::telemetry::Event::PersistZeroCopy), 1);
+        assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
+        f.store.writer.slabs().reclaim_idle();
+        assert_eq!(f.admission.used(ResourceClass::Ciphertext), page_charge);
+        assert_eq!(page.ciphertext.disk_body(alignment).unwrap(), &before[..]);
+    }
+}
+
+const OTHER_CACHE: &str = "44444444-4444-4444-8444-444444444444";
+
+/// Fixture cache at priority 1 next to `OTHER_CACHE` at 1000, with one
+/// indexed page so the fixture cache is over its share.
+fn over_share_fixture() -> (Fixture, CacheId, CacheId) {
+    let over = CacheId(crate::test_support::security::CACHE.into());
+    let under = CacheId(OTHER_CACHE.into());
+    let f = Fixture::assemble(
+        Directory::new(),
+        crate::test_support::availability_for(vec![over.clone(), under.clone()]),
+    );
+    let _ = futures::executor::block_on(f.store.open()).unwrap();
+    let definition = |id: &CacheId, priority| racer_control_wire::CacheDefinition {
+        id: id.clone(),
+        name: id.0.clone(),
+        client_socket: "/c".into(),
+        origin_socket: "/o".into(),
+        priority,
+    };
+    f.store
+        .writer
+        .retention()
+        .weights()
+        .update(&[definition(&over, 1), definition(&under, 1000)]);
+    let resident = f.copy_in(over.clone(), 200, crate::model::PAGE_BYTES as usize);
+    f.store
+        .writer
+        .index()
+        .publish(
+            resident.ciphertext.envelope().page.clone(),
+            catalog::IndexedPage {
+                metadata: crate::model::VersionMetadata {
+                    content_type: None,
+                    version: resident.metadata.version.clone(),
+                    length: resident.metadata.length,
+                },
+                key_id: resident.ciphertext.envelope().key_id,
+                location: RecordLocation {
+                    segment: SegmentId(0),
+                    generation: Generation(1),
+                    extent: page_alloc::Extent::new(0, 512).unwrap(),
+                },
+            },
+        )
+        .unwrap();
+    let capacity = f.store.writer.index().disk_capacity();
+    assert!(f.store.writer.retention().over_share(&over, capacity));
+    assert!(!f.store.writer.retention().over_share(&under, capacity));
+    (f, over, under)
+}
+
+#[test]
+fn full_queue_never_lets_over_share_page_displace_under_share_page() {
+    let (f, over, under) = over_share_fixture();
+    let retention = f.store.writer.retention();
+    let hot = f.copy_in(over.clone(), 1, 113);
+    let hot_id = hot.ciphertext.envelope().page.clone();
+    let kept = f.copy_in(under.clone(), 2, 113);
+    let kept_id = kept.ciphertext.envelope().page.clone();
+    f.enqueue(kept).unwrap();
+    f.enqueue(hot).unwrap();
+    for _ in 0..3 {
+        retention.touch(&hot_id);
+    }
+    // An over-share page cannot displace anything at equal or higher rank.
+    assert_eq!(
+        f.enqueue(f.copy_in(over.clone(), 3, 113)),
+        Err(Error::Overloaded)
+    );
+    // A cold under-share page displaces the hot over-share page.
+    let incoming = f.copy_in(under, 4, 113);
+    let incoming_id = incoming.ciphertext.envelope().page.clone();
+    f.enqueue(incoming).unwrap();
+    assert!(f.store.writer.copy_only(&hot_id).unwrap().is_none());
+    assert!(f.store.writer.copy_only(&kept_id).unwrap().is_some());
+    assert!(f.store.writer.copy_only(&incoming_id).unwrap().is_some());
+}
+
+#[test]
+fn write_order_and_ciphertext_reclaim_put_under_share_first() {
+    let (f, over, under) = over_share_fixture();
+    f.reactor.init().expect("queue tests require io_uring");
+    let retention = f.store.writer.retention();
+    let first = f.copy_in(over, 1, 113);
+    let first_id = first.ciphertext.envelope().page.clone();
+    let second = f.copy_in(under, 2, 113);
+    let second_id = second.ciphertext.envelope().page.clone();
+    f.enqueue(first).unwrap();
+    f.enqueue(second).unwrap();
+    for _ in 0..3 {
+        retention.touch(&first_id);
+    }
+    // Reclaim releases the over-share copy first despite its heat.
+    assert!(f.store.writer.reclaim_ciphertext(None, 1) > 0);
+    assert!(f.store.writer.copy_only(&first_id).unwrap().is_none());
+    assert!(f.store.writer.copy_only(&second_id).unwrap().is_some());
+    drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
+    assert!(f.store.writer.index().lookup(&second_id).unwrap().is_some());
+}
+
+#[test]
+fn optional_admission_pressure_requires_over_share_and_reserved_free_segments() {
+    let (f, over, under) = over_share_fixture();
+    let writer = &f.store.writer;
+    assert!(f.segments.free_count() > 1);
+    assert!(!writer.over_share_under_pressure(&over));
+    let _filled = f.segments.append(512).unwrap();
+    while f.segments.free_count() > 1 {
+        drop(f.segments.append(32 * 1024 * 1024).unwrap());
+    }
+    assert!(writer.over_share_under_pressure(&over));
+    assert!(!writer.over_share_under_pressure(&under));
+}
+
+fn cache_definition(id: &str, name: &str) -> racer_control_wire::CacheDefinition {
+    racer_control_wire::CacheDefinition {
+        id: CacheId(id.into()),
+        name: name.into(),
+        client_socket: "/c".into(),
+        origin_socket: "/o".into(),
+        priority: 1,
+    }
+}
+
+fn cache_disk(id: &str, resident: u64, share: u64) -> crate::retention::CacheDisk {
+    crate::retention::CacheDisk {
+        cache: CacheId(id.into()),
+        resident_bytes: resident,
+        share_bytes: share,
+    }
+}
+
+#[test]
+fn cache_disk_samples_label_by_name_and_drop_unpublished_caches() {
+    let caches = [
+        cache_definition("uid-b", "logs"),
+        cache_definition("uid-a", "models"),
+        cache_definition("uid-c", "empty"),
+    ];
+    let samples = super::cache_disk_samples(
+        &caches,
+        vec![
+            cache_disk("uid-a", 900, 800),
+            cache_disk("uid-b", 50, 200),
+            cache_disk("uid-c", 0, 300),
+            cache_disk("uid-removed", 70, 0),
+        ],
+    );
+    let got: Vec<_> = samples
+        .iter()
+        .map(|s| (s.cache.to_string(), s.resident, s.share))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("models".to_string(), 900, 800),
+            ("logs".to_string(), 50, 200),
+            ("empty".to_string(), 0, 300),
+        ]
+    );
+}
+
+#[test]
+fn cache_disk_samples_handle_empty_inputs() {
+    assert!(super::cache_disk_samples(&[], vec![cache_disk("uid-a", 1, 2)]).is_empty());
+    assert!(super::cache_disk_samples(&[cache_definition("uid-a", "a")], vec![]).is_empty());
+}
+
+#[test]
+fn cache_disk_samples_scale_to_large_catalogs() {
+    // Regression input for the old linear catalog search per sample, which
+    // made about 50 million id compares at this size. The map join makes one
+    // pass over each input. Reversed usage order checks that every lookup is
+    // by id, not by position.
+    const CACHES: usize = 10_000;
+    let caches: Vec<_> = (0..CACHES)
+        .map(|i| cache_definition(&format!("uid-{i:05}"), &format!("cache-{i}")))
+        .collect();
+    let usage: Vec<_> = (0..CACHES)
+        .rev()
+        .map(|i| cache_disk(&format!("uid-{i:05}"), i as u64, 1))
+        .collect();
+    let samples = super::cache_disk_samples(&caches, usage);
+    assert_eq!(samples.len(), CACHES);
+    for (sample, i) in samples.iter().zip((0..CACHES).rev()) {
+        assert_eq!(&*sample.cache, format!("cache-{i}"));
+        assert_eq!(sample.resident, i as u64);
+    }
+}
+
+/// Owned reservation reclaim follows the full-queue share rule: an unheld
+/// over-share incoming page only takes over-share optional writes. Held or
+/// under-share incoming pages may take any optional write, and the share
+/// classification is current, so a live reweight changes eligibility.
+#[test]
+fn owned_reclaim_never_lets_unheld_over_share_page_take_under_share_write() {
+    let (f, over, under) = over_share_fixture();
+    let writer = &f.store.writer;
+    let incoming = f
+        .copy_in(over.clone(), 9, 113)
+        .ciphertext
+        .envelope()
+        .page
+        .clone();
+    let owner = incoming.clone();
+    writer
+        .retention()
+        .set_ownership(Rc::new(move |page| page == &owner));
+    let kept = f.copy_in(under.clone(), 1, 113);
+    let kept_id = kept.ciphertext.envelope().page.clone();
+    f.enqueue(kept).unwrap();
+    let dirty = f.admission.used(ResourceClass::DirtyCiphertext);
+    // Failure: the only optional write is under share, so nothing is freed.
+    assert_eq!(
+        writer.reclaim_optional_for_owned(&incoming, None, usize::MAX, usize::MAX),
+        0
+    );
+    assert!(writer.copy_only(&kept_id).unwrap().is_some());
+    assert_eq!(writer.discarded_count(), 0);
+    assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), dirty);
+    // Success: an over-share optional write is replaced, the under-share one stays.
+    let victim = f.copy_in(over.clone(), 2, 113);
+    let victim_id = victim.ciphertext.envelope().page.clone();
+    f.enqueue(victim).unwrap();
+    assert_eq!(
+        writer.reclaim_optional_for_owned(&incoming, None, usize::MAX, usize::MAX),
+        1
+    );
+    assert!(writer.copy_only(&victim_id).unwrap().is_none());
+    assert!(writer.copy_only(&kept_id).unwrap().is_some());
+    assert_eq!(writer.discarded_count(), 1);
+    assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), dirty);
+    // A held incoming page is exempt, as in the full-queue path.
+    let until = uring_runtime::environment::wall_now() + Duration::from_secs(60);
+    writer
+        .index()
+        .reserve_hold(&incoming.version, 1, until)
+        .unwrap();
+    assert_eq!(writer.reclaim_optional_for_owned(&incoming, None, 1, 0), 1);
+    assert!(writer.copy_only(&kept_id).unwrap().is_none());
+    assert_eq!(writer.pending_count(), 0);
+    // Live reweight: once the incoming cache is under share, it may take an
+    // under-share optional write without being held.
+    let unheld = f
+        .copy_in(over.clone(), 10, 113)
+        .ciphertext
+        .envelope()
+        .page
+        .clone();
+    let owner = unheld.clone();
+    writer
+        .retention()
+        .set_ownership(Rc::new(move |page| page == &owner));
+    let other = f.copy_in(under.clone(), 3, 113);
+    let other_id = other.ciphertext.envelope().page.clone();
+    f.enqueue(other).unwrap();
+    assert_eq!(writer.reclaim_optional_for_owned(&unheld, None, 1, 0), 0);
+    let definition = |id: &CacheId, priority| racer_control_wire::CacheDefinition {
+        id: id.clone(),
+        name: id.0.clone(),
+        client_socket: "/c".into(),
+        origin_socket: "/o".into(),
+        priority,
+    };
+    writer
+        .retention()
+        .weights()
+        .update(&[definition(&over, 1000), definition(&under, 1)]);
+    let capacity = writer.index().disk_capacity();
+    assert!(!writer.retention().over_share(&over, capacity));
+    assert_eq!(writer.reclaim_optional_for_owned(&unheld, None, 1, 0), 1);
+    assert!(writer.copy_only(&other_id).unwrap().is_none());
+    assert_eq!(writer.pending_count(), 0);
+    assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
 }

@@ -27,6 +27,7 @@ import (
 	"unicode"
 
 	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
@@ -66,6 +67,11 @@ type AgentConfig struct {
 	// required.
 	AdditionalHostMounts []AdditionalHostMount `json:"AdditionalHostMounts,omitempty"`
 
+	// NSpawnLifecycle supplies the commands the machine's systemd hooks run
+	// before and after it starts, in place of the lifecycle helper, which the
+	// agent then does not install on the host. Nil runs the helper.
+	NSpawnLifecycle *NSpawnLifecycleConfig `json:"NSpawnLifecycle,omitempty"`
+
 	// OfflineArtifacts points to a complete offline binary artifact source.
 	// When set, it takes precedence over download overrides. Source is rendered
 	// as a strict Go template using the cluster Kubernetes version, then
@@ -92,6 +98,65 @@ func ValidateProvisioningFormat(format string) error {
 	default:
 		return fmt.Errorf("ProvisioningFormat must be %q or %q", ProvisioningFormatCloudInit, ProvisioningFormatIgnition)
 	}
+}
+
+// NSpawnLifecycleConfig supplies the nspawn lifecycle hooks' commands, for an
+// application that runs the agent's nspawn-lifecycle phases another way than
+// through the lifecycle helper, such as in a container. Each is a single systemd
+// command, as in ExecStart=, starting with the command's absolute path, in a
+// unit instance named after the machine, so %i expands to the machine's name.
+// Each must run its phase for that machine with the host's view of the
+// filesystem, and fail if the phase fails, as nspawn-lifecycle does.
+type NSpawnLifecycleConfig struct {
+	// PreStartCommand runs the pre-start phase, which regenerates the
+	// machine's host-side config before it starts.
+	PreStartCommand string `json:"PreStartCommand"`
+	// PostStartCommand runs the post-start phase once the machine has started.
+	PostStartCommand string `json:"PostStartCommand"`
+}
+
+// DeepCopy returns a copy of the lifecycle hook commands.
+func (l *NSpawnLifecycleConfig) DeepCopy() *NSpawnLifecycleConfig {
+	if l == nil {
+		return nil
+	}
+
+	out := *l
+
+	return &out
+}
+
+// ValidateNSpawnLifecycle checks that configured lifecycle hook commands are
+// present and safe to render into systemd units. Nil is valid.
+func ValidateNSpawnLifecycle(lifecycle *NSpawnLifecycleConfig) error {
+	if lifecycle == nil {
+		return nil
+	}
+
+	var errs []error
+
+	for _, hook := range []struct{ name, command string }{
+		{"PreStartCommand", lifecycle.PreStartCommand},
+		{"PostStartCommand", lifecycle.PostStartCommand},
+	} {
+		switch {
+		case strings.TrimSpace(hook.command) == "":
+			errs = append(errs, fmt.Errorf("NSpawnLifecycle.%s is required", hook.name))
+		case strings.IndexFunc(hook.command, unicode.IsControl) >= 0:
+			errs = append(errs, fmt.Errorf("NSpawnLifecycle.%s must not contain control characters", hook.name))
+		case !strings.HasPrefix(hook.command, "/"):
+			// This also rules out systemd's prefixes, such as "-", which ignores the
+			// command's failure.
+			errs = append(errs, fmt.Errorf("NSpawnLifecycle.%s must start with the command's absolute path", hook.name))
+		case slices.Contains(strings.Fields(hook.command), ";"):
+			// systemd starts another command, which may have a prefix, after a lone ";".
+			errs = append(errs, fmt.Errorf("NSpawnLifecycle.%s must be a single command, without a lone \";\"", hook.name))
+		case strings.HasSuffix(strings.TrimRightFunc(hook.command, unicode.IsSpace), `\`):
+			errs = append(errs, fmt.Errorf("NSpawnLifecycle.%s must not end in a backslash, which joins the unit's next line to it", hook.name))
+		}
+	}
+
+	return errors.Join(errs...)
 }
 
 // AgentOfflineArtifacts configures a complete offline source for binaries the
@@ -192,12 +257,15 @@ func (a *AgentConfig) DeepCopy() *AgentConfig {
 	out.Kubelet.RegisterWithTaints = slices.Clone(a.Kubelet.RegisterWithTaints)
 	out.Kubelet.Configuration = deepCopyKubeletConfiguration(a.Kubelet.Configuration)
 	out.Kubelet.ImageCredentialProvider = a.Kubelet.ImageCredentialProvider.DeepCopy()
+	out.Kubelet.KubeconfigData = slices.Clone(a.Kubelet.KubeconfigData)
 	out.AdditionalHostDevices = slices.Clone(a.AdditionalHostDevices)
 
 	out.AdditionalHostMounts = slices.Clone(a.AdditionalHostMounts)
 	if a.Gantry != nil {
 		out.Gantry = &GantryConfig{Disabled: a.Gantry.Disabled}
 	}
+
+	out.NSpawnLifecycle = a.NSpawnLifecycle.DeepCopy()
 
 	out.LocalDNS = a.LocalDNS.DeepCopy()
 
@@ -238,6 +306,10 @@ func (a *AgentConfig) Validate() error {
 		errs = append(errs, err)
 	}
 
+	if err := ValidateNSpawnLifecycle(a.NSpawnLifecycle); err != nil {
+		errs = append(errs, err)
+	}
+
 	if err := a.Kubelet.Validate(); err != nil {
 		errs = append(errs, err)
 	}
@@ -250,11 +322,13 @@ func (a *AgentConfig) Validate() error {
 		errs = append(errs, err)
 	}
 
-	apiServer := strings.TrimSpace(a.Kubelet.ApiServer)
-	if apiServer == "" {
-		errs = append(errs, fmt.Errorf("Kubelet.ApiServer is required"))
-	} else if u, err := url.Parse(apiServer); err != nil || u.Scheme == "" || u.Host == "" {
-		errs = append(errs, fmt.Errorf("Kubelet.ApiServer is invalid"))
+	if len(a.Kubelet.KubeconfigData) == 0 {
+		apiServer := strings.TrimSpace(a.Kubelet.ApiServer)
+		if apiServer == "" {
+			errs = append(errs, fmt.Errorf("Kubelet.ApiServer is required"))
+		} else if u, err := url.Parse(apiServer); err != nil || u.Scheme == "" || u.Host == "" {
+			errs = append(errs, fmt.Errorf("Kubelet.ApiServer is invalid"))
+		}
 	}
 
 	// Kubelet auth is intentionally not validated here. Some consumers provide
@@ -370,6 +444,9 @@ type AgentClusterConfig struct {
 // AgentKubeletConfig holds kubelet-specific overrides.
 type AgentKubeletConfig struct {
 	ApiServer string `json:"ApiServer"`
+	// KubeconfigData is a complete kubeconfig written verbatim for direct
+	// kubelet authentication. It is mutually exclusive with Auth.
+	KubeconfigData []byte `json:"KubeconfigData,omitempty"`
 	// NodeIP overrides kubelet --node-ip. Supports a single IP or a
 	// comma-separated dual-stack pair.
 	NodeIP             string            `json:"NodeIP,omitempty"`
@@ -417,7 +494,97 @@ func (a *AgentKubeletConfig) Validate() error {
 	return errors.Join(
 		validateKubeletConfiguration(a.Configuration),
 		a.ImageCredentialProvider.Validate(),
+		a.validateKubeconfigData(),
 	)
+}
+
+func (a *AgentKubeletConfig) validateKubeconfigData() error {
+	if len(a.KubeconfigData) == 0 {
+		return nil
+	}
+
+	if a.Auth.BootstrapToken != "" || a.Auth.ExecCredential != nil {
+		return fmt.Errorf("KubeconfigData, BootstrapToken, and ExecCredential are mutually exclusive")
+	}
+
+	kubeconfig, err := clientcmd.Load(a.KubeconfigData)
+	if err != nil {
+		return fmt.Errorf("Kubelet.KubeconfigData is not a valid kubeconfig")
+	}
+
+	currentContext := kubeconfig.CurrentContext
+	if currentContext == "" {
+		return fmt.Errorf("Kubelet.KubeconfigData current context is required")
+	}
+
+	contextConfig, ok := kubeconfig.Contexts[currentContext]
+	if !ok || contextConfig == nil {
+		return fmt.Errorf("Kubelet.KubeconfigData current context is invalid")
+	}
+
+	cluster, ok := kubeconfig.Clusters[contextConfig.Cluster]
+	if contextConfig.Cluster == "" || !ok || cluster == nil {
+		return fmt.Errorf("Kubelet.KubeconfigData current context must reference a valid cluster")
+	}
+
+	for _, configuredCluster := range kubeconfig.Clusters {
+		if configuredCluster == nil {
+			continue
+		}
+
+		server, err := url.Parse(configuredCluster.Server)
+		if err != nil || server.Scheme != "https" || server.Host == "" {
+			return fmt.Errorf("Kubelet.KubeconfigData cluster server must be a valid HTTPS URL")
+		}
+
+		if configuredCluster.CertificateAuthority != "" {
+			return fmt.Errorf("Kubelet.KubeconfigData cluster certificate-authority paths are not supported")
+		}
+	}
+
+	authInfo, ok := kubeconfig.AuthInfos[contextConfig.AuthInfo]
+	if contextConfig.AuthInfo == "" || !ok || authInfo == nil {
+		return fmt.Errorf("Kubelet.KubeconfigData current context must reference valid auth info")
+	}
+
+	for _, authInfo := range kubeconfig.AuthInfos {
+		if authInfo == nil {
+			continue
+		}
+
+		switch {
+		case authInfo.ClientCertificate != "":
+			return fmt.Errorf("Kubelet.KubeconfigData client-certificate paths are not supported")
+		case authInfo.ClientKey != "":
+			return fmt.Errorf("Kubelet.KubeconfigData client-key paths are not supported")
+		case authInfo.TokenFile != "":
+			return fmt.Errorf("Kubelet.KubeconfigData token-file paths are not supported")
+		case authInfo.Exec != nil && !filepath.IsAbs(authInfo.Exec.Command):
+			return fmt.Errorf("Kubelet.KubeconfigData exec command must be an absolute path")
+		}
+	}
+
+	if authInfo.Token == "" &&
+		(len(authInfo.ClientCertificateData) == 0 || len(authInfo.ClientKeyData) == 0) &&
+		(authInfo.Username == "" || authInfo.Password == "") &&
+		authInfo.Exec == nil &&
+		authInfo.AuthProvider == nil {
+		return fmt.Errorf("Kubelet.KubeconfigData current context must provide authentication credentials")
+	}
+
+	restConfig, err := clientcmd.NewDefaultClientConfig(
+		*kubeconfig,
+		&clientcmd.ConfigOverrides{CurrentContext: currentContext},
+	).ClientConfig()
+	if err != nil {
+		return fmt.Errorf("Kubelet.KubeconfigData cannot construct a client configuration")
+	}
+
+	if _, err := restConfig.TransportConfig(); err != nil {
+		return fmt.Errorf("Kubelet.KubeconfigData cannot construct a client transport")
+	}
+
+	return nil
 }
 
 // validateKubeletConfiguration validates the JSON-shaped kubelet

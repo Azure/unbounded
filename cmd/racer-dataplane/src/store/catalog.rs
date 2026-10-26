@@ -15,6 +15,7 @@ use page_alloc::Extent;
 use page_alloc::Generation;
 use page_alloc::SegmentId;
 use page_alloc::Segments;
+use racer_control_wire::CacheId;
 use racer_control_wire::KeyId;
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -58,10 +59,10 @@ pub struct Index {
 }
 /// Production mappings use randomized hashing, as did the original catalog.
 #[cfg(not(test))]
-type Pages = page_alloc::index::PageIndex<PageId, IndexedPage>;
+type Pages = page_alloc::index::PageIndex<PageId, IndexedPage, std::hash::RandomState, CacheId>;
 /// Simulation keeps its deterministic hash state across the extraction boundary.
 #[cfg(test)]
-type Pages = page_alloc::index::PageIndex<PageId, IndexedPage, crate::runtime::HashState>;
+type Pages = page_alloc::index::PageIndex<PageId, IndexedPage, crate::runtime::HashState, CacheId>;
 
 #[derive(Default)]
 struct State {
@@ -118,13 +119,13 @@ impl Drop for Resident {
 /// Capacity ownership acquired before a disk SQE. Drop releases unused capacity.
 pub struct PageTicket {
     index: Rc<Index>,
-    hold: Option<Rc<Cell<usize>>>,
+    hold: Option<(Rc<super::holds::Inflight>, crate::model::PageNumber)>,
 }
 impl Drop for PageTicket {
     fn drop(&mut self) {
         self.index.reserved.set(self.index.reserved.get() - 1);
-        if let Some(inflight) = &self.hold {
-            inflight.set(inflight.get() - 1);
+        if let Some((inflight, page)) = &self.hold {
+            inflight.remove(*page);
         }
     }
 }
@@ -172,6 +173,21 @@ impl IndexSnapshot {
         Ok(())
     }
 }
+/// Upper bound of `page_value`.
+const MAX_PAGE_VALUE: u8 = 2 * crate::retention::MAX_SCORE + 1;
+
+/// Per-byte segment value of one page. While any cache is over share, every
+/// under-share page outvalues every over-share page, so segments dominated by
+/// over-share data recycle first; the retention score still orders pages within
+/// one class. With no cache over share this is the plain retention score.
+fn page_value(scoring: &crate::retention::Scoring<'_>, page: &PageId) -> u8 {
+    let score = scoring.score(page);
+    if !scoring.any_over_share() || scoring.over_share(&page.version.object.cache) {
+        score
+    } else {
+        score + crate::retention::MAX_SCORE + 1
+    }
+}
 impl Index {
     pub(super) fn bind_hold_segments(&self, segments: Rc<Segments>, free_reserve: usize) {
         let mut holds = self.holds.borrow_mut();
@@ -191,15 +207,80 @@ impl Index {
         Ok(())
     }
 
-    /// Reserve this worker's page count at HEAD, before fetching any payload.
-    /// Repeated versions share capacity; extension never shortens an existing hold.
-    /// Existing disk pages become protected atomically, or this call fails unchanged.
+    /// Hold pages `0..pages` of `version` for a warm job. See [`Self::reserve_hold_pages`].
     pub fn reserve_hold(
         &self,
         version: &ObjectVersion,
         pages: usize,
         until: std::time::SystemTime,
     ) -> Result<()> {
+        if pages > self.page_capacity.get() {
+            return Err(Error::Overloaded);
+        }
+        self.reserve_warm_hold_pages(
+            version,
+            &super::holds::HoldPages::prefix(pages as u64),
+            until,
+        )
+        .map(drop)
+    }
+
+    /// Reserve exactly `pages` of `version` at HEAD, before fetching any payload.
+    /// The set merges with any existing hold for the version, so earlier promises
+    /// stay held and extension never shortens a deadline. Capacity is charged once
+    /// per member page; cached members count toward that charge and become
+    /// protected atomically, or this call fails unchanged. Cached pages outside
+    /// the set are not pinned.
+    ///
+    /// Each call adds one reader holder to every page in `pages`, to be given
+    /// back with [`Self::release_hold_pages`] and the returned epoch, which
+    /// identifies this reservation. Warm jobs use
+    /// [`Self::reserve_warm_hold_pages`] instead.
+    pub fn reserve_hold_pages(
+        &self,
+        version: &ObjectVersion,
+        pages: &super::holds::HoldPages,
+        until: std::time::SystemTime,
+    ) -> Result<super::holds::HoldEpoch> {
+        self.reserve_hold_inner(
+            version,
+            pages,
+            until,
+            Some(super::holds::HolderKind::Reader),
+        )
+    }
+
+    /// Like [`Self::reserve_hold_pages`], but the holders belong to a warm job:
+    /// [`Self::release_hold`] drops them from unpublished pages, and expiry
+    /// drops the rest. Releasing them with [`Self::release_hold_pages`] also
+    /// works when it is given [`super::holds::HolderKind::Warm`].
+    pub fn reserve_warm_hold_pages(
+        &self,
+        version: &ObjectVersion,
+        pages: &super::holds::HoldPages,
+        until: std::time::SystemTime,
+    ) -> Result<super::holds::HoldEpoch> {
+        self.reserve_hold_inner(version, pages, until, Some(super::holds::HolderKind::Warm))
+    }
+
+    /// Reserve with holders of `kind`; see [`Self::reserve_hold_pages`].
+    pub fn reserve_hold_kind(
+        &self,
+        version: &ObjectVersion,
+        pages: &super::holds::HoldPages,
+        until: std::time::SystemTime,
+        kind: super::holds::HolderKind,
+    ) -> Result<super::holds::HoldEpoch> {
+        self.reserve_hold_inner(version, pages, until, Some(kind))
+    }
+
+    fn reserve_hold_inner(
+        &self,
+        version: &ObjectVersion,
+        pages: &super::holds::HoldPages,
+        until: std::time::SystemTime,
+        kind: Option<super::holds::HolderKind>,
+    ) -> Result<super::holds::HoldEpoch> {
         let monotonic = super::holds::Holds::deadline(until)?;
         if !self.available(&version.object.cache) {
             return Err(Error::MissingKey);
@@ -207,13 +288,28 @@ impl Index {
         let state = self.state.borrow();
         let mut holds = self.holds.borrow_mut();
         holds.expire();
+        // Every holder-adding reservation gets a fresh epoch. Pages that join
+        // here record it, so releases issued before they joined (including
+        // for an earlier, trimmed membership of the same page) cannot reach them.
+        let fresh = kind.map(|_| holds.next_epoch());
         let segments = holds.segments.as_ref().ok_or(Error::InvalidConfiguration)?;
+        let old = holds.entries.get(version);
+        let epoch = fresh.or(old.map(|hold| hold.epoch)).unwrap_or_default();
+        let members = old.map_or_else(|| pages.clone(), |hold| hold.pages.union(pages));
+        // Empty sets need no disk guarantee or retained reservation entry.
+        if members.is_empty() {
+            return Ok(epoch);
+        }
         let mut locations = HashMap::default();
-        for (page, entry) in state
-            .pages
-            .iter()
-            .filter(|(page, _)| &page.version == version)
-        {
+        let mut page = PageId {
+            version: version.clone(),
+            number: crate::model::PageNumber(0),
+        };
+        for number in members.iter() {
+            page.number = number;
+            let Some(entry) = state.pages.get(&page) else {
+                continue;
+            };
             segments
                 .validate(
                     entry.location.segment,
@@ -221,23 +317,16 @@ impl Index {
                     &entry.location.extent,
                 )
                 .map_err(|_| Error::Overloaded)?;
-            locations.insert(page.number, entry.location.clone());
+            locations.insert(number, entry.location.clone());
         }
-        let old = holds.entries.get(version);
-        let count = pages
-            .max(locations.len())
-            .max(old.map_or(0, |hold| hold.pages));
-        // Zero-page objects need no disk guarantee or retained reservation entry.
-        if count == 0 {
-            return Ok(());
-        }
+        let count = members.len();
         let total = holds
             .entries
             .values()
-            .try_fold(0usize, |sum, hold| sum.checked_add(hold.pages))
+            .try_fold(0usize, |sum, hold| sum.checked_add(hold.pages.len()))
             .ok_or(Error::Overloaded)?;
         let total = total
-            .checked_sub(old.map_or(0, |hold| hold.pages))
+            .checked_sub(old.map_or(0, |hold| hold.pages.len()))
             .and_then(|n| n.checked_add(count))
             .ok_or(Error::Overloaded)?;
         let limit = (segments.count() * holds.percent / 100)
@@ -246,12 +335,26 @@ impl Index {
         if total > limit {
             return Err(Error::Overloaded);
         }
-        let inflight = old.map_or_else(|| Rc::new(Cell::new(0)), |hold| hold.inflight.clone());
+        let inflight = old.map_or_else(Rc::default, |hold| hold.inflight.clone());
         let active = old.map_or_else(|| Rc::new(Cell::new(0)), |hold| hold.active.clone());
         let unused = holds.unused() - old.map_or(0, super::holds::Hold::unused)
-            + count.saturating_sub(locations.len() + inflight.get());
+            + count.saturating_sub(locations.len() + inflight.within(&members));
         if state.pages.len() + self.reserved.get() + unused > self.page_capacity.get() {
             return Err(Error::Overloaded);
+        }
+        let mut holders = old.map_or_else(HashMap::default, |hold| hold.holders.clone());
+        if let Some(kind) = kind {
+            for number in pages.iter() {
+                let holder = holders.entry(number).or_insert(super::holds::PageHolders {
+                    count: 0,
+                    warm: 0,
+                    since: epoch,
+                });
+                holder.count = holder.count.checked_add(1).ok_or(Error::Overloaded)?;
+                if kind == super::holds::HolderKind::Warm {
+                    holder.warm += 1;
+                }
+            }
         }
         let until = old.map_or(until, |hold| hold.until.max(until));
         let monotonic = old.map_or(monotonic, |hold| hold.monotonic.max(monotonic));
@@ -260,13 +363,15 @@ impl Index {
             super::holds::Hold {
                 until,
                 monotonic,
-                pages: count,
+                pages: members,
+                holders,
+                epoch,
                 inflight,
                 active,
                 locations,
             },
         );
-        Ok(())
+        Ok(epoch)
     }
 
     /// Active reservation deadline, not proof that every requested page is on disk.
@@ -319,29 +424,132 @@ impl Index {
             .entries
             .get(version)
             .filter(|hold| hold.live())
-            .map(|hold| hold.pages)
+            .map(|hold| hold.pages.clone())
             .ok_or(Error::Unavailable)?;
-        self.reserve_hold(version, pages, until)
+        // Extension renews the deadline only; it adds no holders.
+        self.reserve_hold_inner(version, &pages, until, None)
+            .map(drop)
     }
 
     /// Release only unused capacity after a partial failure. Completed pages stay held.
     /// Call after this version's persistence futures and pending writes have finished.
+    /// Unpublished members lose their warm holders and leave the hold unless a
+    /// reader still holds them; published members keep all their holders.
     pub fn release_hold(&self, version: &ObjectVersion) -> Result<()> {
         let mut holds = self.holds.borrow_mut();
         if let Some(hold) = holds.entries.get_mut(version) {
-            if hold.inflight.get() != 0 || hold.active.get() != 0 {
+            if !hold.inflight.is_empty() || hold.active.get() != 0 {
                 return Err(Error::Overloaded);
             }
-            hold.pages = hold.locations.len();
-            if hold.pages == 0 {
+            let locations = &hold.locations;
+            hold.holders.retain(|page, holder| {
+                if !locations.contains_key(page) {
+                    holder.count -= holder.warm;
+                    holder.warm = 0;
+                }
+                holder.count != 0
+            });
+            let holders = &hold.holders;
+            hold.pages = hold
+                .pages
+                .iter()
+                .filter(|page| holders.contains_key(page) || locations.contains_key(page))
+                .collect();
+            if hold.pages.is_empty() {
                 holds.entries.remove(version);
             }
         }
         Ok(())
     }
 
+    /// Drop one holder from each of `pages` taken under `epoch`. A page whose count reaches zero
+    /// leaves the hold, returns its charged capacity and becomes evictable like
+    /// any other cached page. Pages that are not members are ignored, so a
+    /// release after expiry or [`Self::release_hold`] is a no-op. A page that
+    /// joined the hold after `epoch` was issued (it left and was reserved again,
+    /// or the entry expired, was released or restored) is skipped, so a stale
+    /// release cannot drop a later reservation's holder. Releasing a
+    /// page whose held write is still in flight is allowed; that write then
+    /// publishes as an ordinary cached page.
+    ///
+    /// `kind` must match the reservation's kind. A warm release drops a warm
+    /// holder and a reader release drops a reader holder; a page with no
+    /// holder of that kind is skipped, so one kind's release never consumes
+    /// the other's holder, and later warm cleanup ([`Self::release_hold`])
+    /// removes only the warm holders that remain.
+    pub fn release_hold_pages(
+        &self,
+        version: &ObjectVersion,
+        pages: &super::holds::HoldPages,
+        epoch: super::holds::HoldEpoch,
+        kind: super::holds::HolderKind,
+    ) {
+        let mut holds = self.holds.borrow_mut();
+        let Some(hold) = holds.entries.get_mut(version) else {
+            return;
+        };
+        let mut released = Vec::new();
+        for number in pages.iter() {
+            if let Some(holder) = hold
+                .holders
+                .get_mut(&number)
+                .filter(|holder| holder.since <= epoch)
+            {
+                match kind {
+                    super::holds::HolderKind::Warm if holder.warm != 0 => holder.warm -= 1,
+                    super::holds::HolderKind::Reader if holder.count > holder.warm => {}
+                    _ => continue,
+                }
+                holder.count -= 1;
+                if holder.count == 0 {
+                    hold.holders.remove(&number);
+                    hold.locations.remove(&number);
+                    released.push(number);
+                }
+            }
+        }
+        if released.is_empty() {
+            return;
+        }
+        let released: super::holds::HoldPages = released.into_iter().collect();
+        hold.pages = hold
+            .pages
+            .iter()
+            .filter(|page| !released.contains(*page))
+            .collect();
+        if hold.pages.is_empty() && hold.inflight.is_empty() && hold.active.get() == 0 {
+            holds.entries.remove(version);
+        }
+    }
+
+    /// Epoch of the latest reservation into `version`'s hold, live or not.
+    #[cfg(test)]
+    pub fn hold_epoch(&self, version: &ObjectVersion) -> Option<super::holds::HoldEpoch> {
+        self.holds
+            .borrow()
+            .entries
+            .get(version)
+            .map(|hold| hold.epoch)
+    }
+
+    /// Holder count of `page` in a live hold, or zero when it is not held.
+    pub fn hold_holders(&self, page: &PageId) -> u32 {
+        self.holds
+            .borrow()
+            .entries
+            .get(&page.version)
+            .filter(|hold| hold.live())
+            .and_then(|hold| hold.holders.get(&page.number).map(|holder| holder.count))
+            .unwrap_or(0)
+    }
+
+    /// Whether `page` is a member of a live hold, published or not.
     pub fn is_held(&self, page: &PageId) -> bool {
-        self.hold_expiry(&page.version).is_some()
+        self.holds
+            .borrow()
+            .entries
+            .get(&page.version)
+            .is_some_and(|hold| hold.live() && hold.pages.contains(page.number))
     }
 
     pub(super) fn protect_hold(&self, version: &ObjectVersion) -> Result<super::holds::HoldGuard> {
@@ -378,7 +586,10 @@ impl Index {
             .entries
             .get(&page.version)
             .is_some_and(|hold| {
-                hold.live() && hold.unused() != 0 && !hold.locations.contains_key(&page.number)
+                hold.live()
+                    && hold.unused() != 0
+                    && hold.pages.contains(page.number)
+                    && !hold.locations.contains_key(&page.number)
             })
     }
 
@@ -388,7 +599,7 @@ impl Index {
         if let Some(hold) = holds
             .entries
             .get_mut(&page.version)
-            .filter(|hold| hold.live())
+            .filter(|hold| hold.live() && hold.pages.contains(page.number))
         {
             if !hold.locations.contains_key(&page.number) && hold.unused() == 0 {
                 return Err(Error::Overloaded);
@@ -435,6 +646,9 @@ impl Index {
             }
         }
         let mut versions: HashMap<ObjectVersion, super::holds::Hold> = HashMap::default();
+        // Pages are visited in hash order; collect them and sort each set once
+        // rather than paying a vector shift per out-of-order insert.
+        let mut members: HashMap<ObjectVersion, Vec<crate::model::PageNumber>> = HashMap::default();
         for (page, entry) in self.state.borrow().pages.iter() {
             if let Some(until) = deadlines.get(&entry.location.extent.offset()) {
                 let Some(monotonic) = until
@@ -450,18 +664,36 @@ impl Index {
                         .or_insert_with(|| super::holds::Hold {
                             until: *until,
                             monotonic,
-                            pages: 0,
-                            inflight: Rc::new(Cell::new(0)),
+                            pages: super::holds::HoldPages::default(),
+                            holders: HashMap::default(),
+                            epoch: super::holds::HoldEpoch::default(),
+                            inflight: Rc::default(),
                             active: Rc::new(Cell::new(0)),
                             locations: HashMap::default(),
                         });
                 hold.until = hold.until.max(*until);
                 hold.monotonic = hold.monotonic.max(monotonic);
-                hold.pages += 1;
                 hold.locations.insert(page.number, entry.location.clone());
+                members
+                    .entry(page.version.clone())
+                    .or_default()
+                    .push(page.number);
             }
         }
-        self.holds.borrow_mut().entries = versions;
+        for (version, pages) in members {
+            if let Some(hold) = versions.get_mut(&version) {
+                hold.pages = pages.into_iter().collect();
+            }
+        }
+        let mut holds = self.holds.borrow_mut();
+        // Restored entries are new lifetimes; releases from before cannot match.
+        // Holder identities do not survive restart; each restored page keeps
+        // one reader holder until expiry or `release_hold_pages`.
+        for hold in versions.values_mut() {
+            hold.epoch = holds.next_epoch();
+            hold.holders = super::holds::Hold::single_holders(&hold.pages, hold.epoch);
+        }
+        holds.entries = versions;
         Ok(())
     }
 
@@ -480,16 +712,13 @@ impl Index {
                 }
             }
         }
-        let versions: HashSet<_> = snapshot
-            .entries
-            .iter()
-            .filter(|(_, entry)| offsets.contains(&entry.location.extent.offset()))
-            .map(|(page, _)| &page.version)
-            .collect();
+        // Count exactly what `restore_holds` restores as held: entries whose
+        // offsets carry a live deadline. Cached nonmember pages of a held
+        // version are not pinned by sparse holds and must not be charged.
         let pages = snapshot
             .entries
             .iter()
-            .filter(|(page, _)| versions.contains(&page.version))
+            .filter(|(_, entry)| offsets.contains(&entry.location.extent.offset()))
             .count();
         let holds = self.holds.borrow();
         let limit = (segments.len() * holds.percent / 100)
@@ -531,6 +760,20 @@ impl Index {
     }
     pub fn metadata_capacity(&self) -> usize {
         self.metadata_capacity
+    }
+    /// This worker's payload capacity for fair shares: the tighter of index
+    /// entries times a full page and slab segments times segment bytes. Either
+    /// one bounds how much payload the worker can keep resident. Segment space
+    /// is ignored until segments are bound.
+    pub fn disk_capacity(&self) -> u64 {
+        let pages = (self.page_capacity.get() as u64).saturating_mul(crate::model::PAGE_BYTES);
+        self.holds
+            .borrow()
+            .segments
+            .as_ref()
+            .map_or(pages, |segments| {
+                pages.min((segments.count() as u64).saturating_mul(segments.segment_bytes()))
+            })
     }
     pub fn page_capacity(&self) -> usize {
         self.page_capacity.get()
@@ -598,14 +841,32 @@ impl Index {
             payload: None,
         })
     }
-    /// Scan at most 64 candidates with a separate cursor. Publication ordering is
-    /// never changed by retention, so checkpoint traversal remains monotonic.
+    /// Pick one victim with bounded work and separate cursors. Publication
+    /// ordering is never changed by retention, so checkpoint traversal remains
+    /// monotonic.
+    ///
+    /// Over-share caches are scanned first through their own per-cache order,
+    /// so a full window of under-share pages cannot hide them. Candidates are
+    /// the over-share caches among the 64 with the highest pressure, and the
+    /// 64-page budget is split across them, at least one page each. Only when
+    /// that finds no unheld page does the global window rank all caches.
+    /// Work is at most 64 caches and 128 pages, independent of cache count,
+    /// except for one rebuild of the pressure order after a catalog change.
     fn victim(&self, state: &State) -> Option<PageId> {
+        const BUDGET: usize = 64;
         let retention = self.retention();
-        let scoring = retention.scoring_at(uring_runtime::environment::now());
-        state.pages.victim_if(64, |page, _| {
-            (!self.is_held(page)).then(|| u64::from(scoring.score(page)))
-        })
+        let scoring = retention.scoring_at(uring_runtime::environment::now(), self.disk_capacity());
+        let eligible =
+            |page: &PageId, _: &IndexedPage| (!self.is_held(page)).then(|| scoring.rank(page));
+        let over = scoring.over_share_candidates(BUDGET);
+        if !over.is_empty() {
+            let per_cache = (BUDGET / over.len()).max(1);
+            if let Some(victim) = state.pages.victim_in_groups(&over, per_cache, eligible) {
+                return Some(victim);
+            }
+        }
+        // Over-share pages go first, then lower score; the index breaks ties by age.
+        state.pages.victim_if(BUDGET, eligible)
     }
     /// Reserve one potential new mapping, optionally evicting a low-value mapping.
     /// Replacement writes also reserve: concurrent invalidation may remove the old
@@ -654,8 +915,8 @@ impl Index {
         self.reserved.set(self.reserved.get() + 1);
         let hold = held.map(|page| {
             let inflight = self.holds.borrow().entries[&page.version].inflight.clone();
-            inflight.set(inflight.get() + 1);
-            inflight
+            inflight.add(page.number);
+            (inflight, page.number)
         });
         Ok(PageTicket {
             index: self.clone(),
@@ -688,7 +949,10 @@ impl Index {
         }
         // Acquire first: replacement retains its existing heat without a gap.
         let mut resident = self.track(&page)?;
-        resident.payload = Some(self.retention().payload(payload_bytes, true));
+        resident.payload = Some(
+            self.retention()
+                .indexed_payload(&page.version.object.cache, payload_bytes),
+        );
         self.hold_published(&page, &entry.location)?;
         Self::remove_page(&mut state, &page);
         let version = state
@@ -697,9 +961,10 @@ impl Index {
             .or_insert((entry.metadata.clone(), 0));
         version.1 += 1;
         let segment = entry.location.segment;
+        let cache = page.version.object.cache.clone();
         state
             .pages
-            .insert(page, entry, segment)
+            .insert_in(page, entry, segment, cache)
             .expect("preflighted publication age");
         state.residents.insert(resident.page.clone(), resident);
         Ok(())
@@ -968,7 +1233,7 @@ impl Index {
         let retention = self.retention();
         self.segment_score_with(
             segment,
-            &retention.scoring_at(uring_runtime::environment::now()),
+            &retention.scoring_at(uring_runtime::environment::now(), self.disk_capacity()),
         )
     }
     fn segment_score_with(
@@ -977,15 +1242,24 @@ impl Index {
         scoring: &crate::retention::Scoring<'_>,
     ) -> u64 {
         let state = self.state.borrow();
-        state
-            .pages
-            .segment_score(segment, 256, crate::model::PAGE_BYTES * 4, |page, entry| {
+        state.pages.segment_score(
+            segment,
+            256,
+            // Charge unseen mappings at the highest value they could have.
+            crate::model::PAGE_BYTES
+                * u64::from(if scoring.any_over_share() {
+                    MAX_PAGE_VALUE
+                } else {
+                    crate::retention::MAX_SCORE
+                }),
+            |page, entry| {
                 let bytes = entry
                     .metadata
                     .page_length(page)
                     .unwrap_or(crate::model::PAGE_BYTES as u32);
-                u64::from(bytes) * u64::from(scoring.score(page))
-            })
+                u64::from(bytes) * u64::from(page_value(scoring, page))
+            },
+        )
     }
     pub fn remove_cache(&self, cache: &racer_control_wire::CacheId) {
         self.holds
@@ -1145,7 +1419,7 @@ impl SegmentClock {
     pub fn reclaim_now(&self) -> Result<()> {
         let now = uring_runtime::environment::now();
         let retention = self.index.retention();
-        let scoring = retention.scoring_at(now);
+        let scoring = retention.scoring_at(now, self.index.disk_capacity());
         self.clock
             .reclaim_scored(
                 &*self.index,
@@ -1163,6 +1437,7 @@ mod tests {
     use super::*;
     use crate::model::CacheKey;
     use crate::model::StrongEtag;
+    use crate::store::holds::HolderKind;
     use racer_control_wire::CacheId;
 
     fn segments(bytes: u64, count: usize) -> Segments {
@@ -1319,6 +1594,597 @@ mod tests {
             index.reserve_hold(&other, usize::MAX, until),
             Err(Error::Overloaded)
         );
+    }
+
+    fn page_set(numbers: &[u64]) -> super::super::holds::HoldPages {
+        numbers
+            .iter()
+            .copied()
+            .map(crate::model::PageNumber)
+            .collect()
+    }
+
+    #[test]
+    fn hold_page_holders_share_and_release_individual_pages() {
+        let segments = Rc::new(segments(1024, 6));
+        let index = Rc::new(index(8));
+        index.set_page_capacity(6).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let (page, entry) = indexed(descriptor("held", 17), 0);
+        drop(segments.append(1024).unwrap());
+        index.publish(page.clone(), entry).unwrap();
+        let version = page.version.clone();
+        let at = |number| PageId {
+            version: version.clone(),
+            number: crate::model::PageNumber(number),
+        };
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        // A warm holds 0..3 and a read independently holds 0 and 2.
+        let epoch = index
+            .reserve_hold_pages(&version, &page_set(&[0, 1, 2]), until)
+            .unwrap();
+        let read = index
+            .reserve_hold_pages(&version, &page_set(&[0, 2]), until)
+            .unwrap();
+        assert!(read > epoch, "every reservation takes a newer epoch");
+        assert_eq!(index.hold_holders(&at(0)), 2);
+        assert_eq!(index.hold_holders(&at(1)), 1);
+        assert_eq!(index.hold_holders(&at(2)), 2);
+        // Extension renews only; it adds no holders.
+        index.extend_hold(&version, until).unwrap();
+        assert_eq!(index.hold_holders(&at(0)), 2);
+        let other = descriptor("other", 17).version;
+        assert_eq!(index.reserve_hold(&other, 2, until), Err(Error::Overloaded));
+        // The read's release leaves the shared pages held by the warm.
+        index.release_hold_pages(&version, &page_set(&[0, 2]), epoch, HolderKind::Reader);
+        assert!(index.is_held(&at(0)));
+        assert!(index.is_held(&at(2)));
+        assert_eq!(index.hold_holders(&at(0)), 1);
+        assert!(index.victim(&index.state.borrow()).is_none());
+        // Releasing the last holder makes the published page evictable and
+        // returns its capacity; unknown pages are ignored.
+        index.release_hold_pages(&version, &page_set(&[0, 1, 9]), epoch, HolderKind::Reader);
+        assert!(!index.is_held(&at(0)));
+        assert!(!index.is_held(&at(1)));
+        assert_eq!(index.held_page_expiry(&at(0)), None);
+        assert_eq!(index.hold_holders(&at(0)), 0);
+        assert_eq!(index.victim(&index.state.borrow()), Some(page.clone()));
+        assert!(index.is_held(&at(2)));
+        index.reserve_hold(&other, 2, until).unwrap();
+        // The last page leaving removes the whole hold.
+        index.release_hold_pages(&version, &page_set(&[2]), epoch, HolderKind::Reader);
+        assert_eq!(index.hold_expiry(&version), None);
+        index.release_hold_pages(&version, &page_set(&[2]), epoch, HolderKind::Reader);
+        assert_eq!(index.hold_expiry(&version), None);
+    }
+
+    #[test]
+    fn stale_hold_page_release_cannot_drop_a_replacement_holder() {
+        let clock = uring_runtime::environment::SimulationClock::new(29);
+        let _environment = clock.environment(0).enter();
+        let segments = Rc::new(segments(1024, 6));
+        let index = Rc::new(index(8));
+        index.set_page_capacity(6).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let (page, entry) = indexed(descriptor("held", 17), 0);
+        drop(segments.append(1024).unwrap());
+        index.publish(page.clone(), entry).unwrap();
+        let version = page.version.clone();
+        let ttl = std::time::Duration::from_secs(10);
+        // A read holds page 0, then its hold expires before it delivers.
+        let original = index
+            .reserve_hold_pages(
+                &version,
+                &page_set(&[0]),
+                uring_runtime::environment::wall_now() + ttl,
+            )
+            .unwrap();
+        clock.advance(ttl + std::time::Duration::from_secs(1));
+        assert_eq!(index.hold_holders(&page), 0);
+        // Another reader or warm job re-reserves the page; the expired entry is
+        // pruned and the replacement is a new epoch.
+        let until = uring_runtime::environment::wall_now() + ttl;
+        let replacement = index
+            .reserve_hold_pages(&version, &page_set(&[0]), until)
+            .unwrap();
+        assert_ne!(replacement, original);
+        assert_eq!(index.hold_holders(&page), 1);
+        // The original read's delayed release must not consume that holder.
+        index.release_hold_pages(&version, &page_set(&[0]), original, HolderKind::Reader);
+        assert_eq!(index.hold_holders(&page), 1);
+        assert!(index.is_held(&page));
+        assert_eq!(index.held_page_expiry(&page), Some(until));
+        assert!(index.victim(&index.state.borrow()).is_none());
+        // The replacement's own release still works.
+        index.release_hold_pages(&version, &page_set(&[0]), replacement, HolderKind::Reader);
+        assert!(!index.is_held(&page));
+        assert_eq!(index.hold_expiry(&version), None);
+        assert_eq!(index.victim(&index.state.borrow()), Some(page.clone()));
+    }
+
+    #[test]
+    fn hold_epoch_changes_with_every_reservation_but_not_extension() {
+        let segments = Rc::new(segments(1024, 6));
+        let index = Rc::new(index(8));
+        index.set_page_capacity(6).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let (page, entry) = indexed(descriptor("held", 17), 0);
+        drop(segments.append(1024).unwrap());
+        index.publish(page.clone(), entry).unwrap();
+        let version = page.version.clone();
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        let first = index
+            .reserve_hold_pages(&version, &page_set(&[0]), until)
+            .unwrap();
+        index.extend_hold(&version, until).unwrap();
+        assert_eq!(index.hold_epoch(&version), Some(first));
+        // Releasing the last page removes the entry; the next reservation is
+        // a new lifetime and a repeated release of the first is ignored.
+        index.release_hold_pages(&version, &page_set(&[0]), first, HolderKind::Reader);
+        assert_eq!(index.hold_epoch(&version), None);
+        let second = index
+            .reserve_hold_pages(&version, &page_set(&[0]), until)
+            .unwrap();
+        assert_ne!(second, first);
+        index.release_hold_pages(&version, &page_set(&[0]), first, HolderKind::Reader);
+        assert_eq!(index.hold_holders(&page), 1);
+        // A reservation into a live entry also takes a newer epoch, which
+        // still releases pages that joined earlier.
+        let mut unpublished = page.clone();
+        unpublished.number = crate::model::PageNumber(1);
+        let joined = index
+            .reserve_warm_hold_pages(&version, &page_set(&[1]), until)
+            .unwrap();
+        assert!(joined > second);
+        assert_eq!(index.hold_epoch(&version), Some(joined));
+        index.release_hold_pages(&version, &page_set(&[0]), joined, HolderKind::Reader);
+        assert_eq!(index.hold_holders(&page), 0);
+        // Whole release followed by re-reservation starts a new membership.
+        index.release_hold(&version).unwrap();
+        assert_eq!(index.hold_epoch(&version), None);
+        let third = index
+            .reserve_hold_pages(&version, &page_set(&[1]), until)
+            .unwrap();
+        assert!(third > joined);
+        index.release_hold_pages(&version, &page_set(&[1]), second, HolderKind::Reader);
+        index.release_hold_pages(&version, &page_set(&[1]), joined, HolderKind::Reader);
+        assert!(index.is_held(&unpublished));
+        index.release_hold_pages(&version, &page_set(&[1]), third, HolderKind::Reader);
+        assert!(!index.is_held(&unpublished));
+    }
+
+    /// Warm cleanup drops only warm holders from unpublished pages: a reader's
+    /// page hold survives it and is still released by that reader's epoch.
+    #[test]
+    fn warm_cleanup_keeps_reader_holds_on_unpublished_pages() {
+        let segments = Rc::new(segments(1024, 6));
+        let index = Rc::new(index(8));
+        index.set_page_capacity(6).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let (page, entry) = indexed(descriptor("held", 3 * crate::model::PAGE_BYTES), 0);
+        drop(segments.append(1024).unwrap());
+        index.publish(page.clone(), entry).unwrap();
+        let version = page.version.clone();
+        let at = |number| PageId {
+            version: version.clone(),
+            number: crate::model::PageNumber(number),
+        };
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        index
+            .reserve_warm_hold_pages(&version, &page_set(&[0, 1, 2]), until)
+            .unwrap();
+        let reader = index
+            .reserve_hold_pages(&version, &page_set(&[1]), until)
+            .unwrap();
+        index.release_hold(&version).unwrap();
+        assert!(
+            index.is_held(&at(1)),
+            "the reader's holder survives warm cleanup"
+        );
+        assert_eq!(index.hold_holders(&at(1)), 1);
+        assert!(!index.is_held(&at(2)), "warm-only unpublished pages leave");
+        assert_eq!(
+            index.hold_holders(&at(0)),
+            1,
+            "published pages keep holders"
+        );
+        assert_eq!(index.hold_unused(), 1, "the reader's page keeps its slot");
+        index.release_hold_pages(&version, &page_set(&[1]), reader, HolderKind::Reader);
+        assert!(!index.is_held(&at(1)));
+        assert_eq!(index.hold_unused(), 0);
+        assert!(index.is_held(&page));
+    }
+
+    /// A page that leaves a hold and is reserved again belongs to the new
+    /// reservation: a delayed release taken before the trim cannot drop it,
+    /// even while a published page keeps the version's entry alive.
+    #[test]
+    fn delayed_release_cannot_drop_a_trimmed_and_re_reserved_page() {
+        let segments = Rc::new(segments(1024, 6));
+        let index = Rc::new(index(8));
+        index.set_page_capacity(6).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let (page, entry) = indexed(descriptor("held", 2 * crate::model::PAGE_BYTES), 0);
+        drop(segments.append(1024).unwrap());
+        index.publish(page.clone(), entry).unwrap();
+        let version = page.version.clone();
+        let mut unpublished = page.clone();
+        unpublished.number = crate::model::PageNumber(1);
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        let warm = index
+            .reserve_warm_hold_pages(&version, &page_set(&[0, 1]), until)
+            .unwrap();
+        let reader = index
+            .reserve_hold_pages(&version, &page_set(&[1]), until)
+            .unwrap();
+        // Trim the unpublished page: warm cleanup, then the reader's release.
+        index.release_hold(&version).unwrap();
+        index.release_hold_pages(&version, &page_set(&[1]), reader, HolderKind::Reader);
+        assert!(!index.is_held(&unpublished));
+        assert!(
+            index.is_held(&page),
+            "the published page keeps the entry alive"
+        );
+        // A new warm job reserves the trimmed page again.
+        index
+            .reserve_warm_hold_pages(&version, &page_set(&[1]), until)
+            .unwrap();
+        assert_eq!(index.hold_holders(&unpublished), 1);
+        // Delayed releases from before the trim do not reach the new holder.
+        index.release_hold_pages(&version, &page_set(&[1]), reader, HolderKind::Reader);
+        index.release_hold_pages(&version, &page_set(&[1]), warm, HolderKind::Warm);
+        assert!(index.is_held(&unpublished));
+        assert_eq!(index.hold_holders(&unpublished), 1);
+        assert_eq!(index.hold_unused(), 1);
+        // The published page joined before both epochs, so they still apply,
+        // but only to a holder of their own kind: page 0 has no reader holder.
+        index.release_hold_pages(&version, &page_set(&[0]), reader, HolderKind::Reader);
+        assert!(index.is_held(&page));
+        index.release_hold_pages(&version, &page_set(&[0]), warm, HolderKind::Warm);
+        assert!(!index.is_held(&page));
+        assert!(index.is_held(&unpublished));
+    }
+
+    /// Holds a published page 0 and an unpublished page 1 with one warm and
+    /// one reader holder each; returns the version, page 1 and both epochs.
+    fn mixed_holders(
+        index: &Rc<Index>,
+        segments: &Rc<Segments>,
+    ) -> (
+        ObjectVersion,
+        PageId,
+        crate::store::holds::HoldEpoch,
+        crate::store::holds::HoldEpoch,
+    ) {
+        let (page, entry) = indexed(descriptor("held", 2 * crate::model::PAGE_BYTES), 0);
+        drop(segments.append(1024).unwrap());
+        index.publish(page.clone(), entry).unwrap();
+        let version = page.version.clone();
+        let mut unpublished = page;
+        unpublished.number = crate::model::PageNumber(1);
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        let warm = index
+            .reserve_warm_hold_pages(&version, &page_set(&[0, 1]), until)
+            .unwrap();
+        let reader = index
+            .reserve_hold_pages(&version, &page_set(&[0, 1]), until)
+            .unwrap();
+        assert_eq!(index.hold_holders(&unpublished), 2);
+        (version, unpublished, warm, reader)
+    }
+
+    /// Releasing the warm holder of an unpublished page and then running warm
+    /// cleanup leaves the independent reader's holder and its capacity.
+    #[test]
+    fn warm_page_release_then_cleanup_keeps_the_reader_holder() {
+        let segments = Rc::new(segments(1024, 6));
+        let index = Rc::new(index(8));
+        index.set_page_capacity(6).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let (version, unpublished, warm, reader) = mixed_holders(&index, &segments);
+        index.release_hold_pages(&version, &page_set(&[1]), warm, HolderKind::Warm);
+        assert_eq!(index.hold_holders(&unpublished), 1);
+        // A repeated warm release finds no warm holder and leaves the reader's.
+        index.release_hold_pages(&version, &page_set(&[1]), warm, HolderKind::Warm);
+        assert_eq!(index.hold_holders(&unpublished), 1);
+        index.release_hold(&version).unwrap();
+        assert!(
+            index.is_held(&unpublished),
+            "the reader still holds the page"
+        );
+        assert_eq!(index.hold_holders(&unpublished), 1);
+        assert_eq!(index.hold_unused(), 1, "the reader's page keeps its slot");
+        index.release_hold_pages(&version, &page_set(&[1]), reader, HolderKind::Reader);
+        assert!(!index.is_held(&unpublished));
+        assert_eq!(index.hold_unused(), 0);
+    }
+
+    /// Releasing the reader holder of an unpublished page leaves the warm
+    /// holder for warm cleanup, and a repeated reader release cannot take it.
+    #[test]
+    fn reader_page_release_then_cleanup_drops_the_warm_holder() {
+        let segments = Rc::new(segments(1024, 6));
+        let index = Rc::new(index(8));
+        index.set_page_capacity(6).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let (version, unpublished, _warm, reader) = mixed_holders(&index, &segments);
+        index.release_hold_pages(&version, &page_set(&[1]), reader, HolderKind::Reader);
+        assert_eq!(index.hold_holders(&unpublished), 1);
+        index.release_hold_pages(&version, &page_set(&[1]), reader, HolderKind::Reader);
+        assert_eq!(
+            index.hold_holders(&unpublished),
+            1,
+            "a reader release cannot drop the warm holder"
+        );
+        assert_eq!(index.hold_unused(), 1);
+        index.release_hold(&version).unwrap();
+        assert!(
+            !index.is_held(&unpublished),
+            "warm cleanup drops the last holder"
+        );
+        assert_eq!(index.hold_unused(), 0);
+    }
+
+    #[test]
+    fn whole_hold_release_drops_unpublished_pages_and_keeps_published_counts() {
+        let segments = Rc::new(segments(1024, 6));
+        let index = Rc::new(index(8));
+        index.set_page_capacity(6).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let (page, entry) = indexed(descriptor("held", 17), 0);
+        drop(segments.append(1024).unwrap());
+        index.publish(page.clone(), entry).unwrap();
+        let mut unpublished = page.clone();
+        unpublished.number = crate::model::PageNumber(1);
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        let epoch = index
+            .reserve_warm_hold_pages(&page.version, &page_set(&[0, 1]), until)
+            .unwrap();
+        index
+            .reserve_warm_hold_pages(&page.version, &page_set(&[0, 1]), until)
+            .unwrap();
+        index.release_hold(&page.version).unwrap();
+        assert!(!index.is_held(&unpublished));
+        assert_eq!(index.hold_holders(&unpublished), 0);
+        assert_eq!(index.hold_holders(&page), 2);
+        index.release_hold_pages(&page.version, &page_set(&[0, 1]), epoch, HolderKind::Warm);
+        assert!(index.is_held(&page));
+        index.release_hold_pages(&page.version, &page_set(&[0]), epoch, HolderKind::Warm);
+        assert_eq!(index.hold_expiry(&page.version), None);
+    }
+
+    #[test]
+    fn hold_pages_sort_dedup_insert_and_union() {
+        let pages = page_set(&[5, 1, 3, 1]);
+        assert_eq!(pages, page_set(&[1, 3, 5]));
+        assert_eq!(pages.len(), 3);
+        assert!(pages.contains(crate::model::PageNumber(3)));
+        assert!(!pages.contains(crate::model::PageNumber(2)));
+        let mut grown = pages.clone();
+        grown.insert(crate::model::PageNumber(7));
+        grown.insert(crate::model::PageNumber(2));
+        grown.insert(crate::model::PageNumber(3));
+        assert_eq!(grown, page_set(&[1, 2, 3, 5, 7]));
+        assert_eq!(
+            pages.union(&page_set(&[0, 3, 9])),
+            page_set(&[0, 1, 3, 5, 9])
+        );
+        assert_eq!(pages.union(&page_set(&[])), pages);
+        assert!(super::super::holds::HoldPages::prefix(0).is_empty());
+        assert_eq!(super::super::holds::HoldPages::prefix(2), page_set(&[0, 1]));
+    }
+
+    #[test]
+    fn page_set_hold_ignores_cached_nonmember_and_charges_only_members() {
+        let segments = Rc::new(segments(1024, 8));
+        let index = Rc::new(index(8));
+        index.set_page_capacity(2).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let (cached, entry) = indexed(descriptor("primary", 2 * crate::model::PAGE_BYTES), 0);
+        drop(segments.append(1024).unwrap());
+        index.publish(cached.clone(), entry).unwrap();
+        let mut primary = cached.clone();
+        primary.number = crate::model::PageNumber(1);
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        index
+            .reserve_hold_pages(&cached.version, &page_set(&[]), until)
+            .unwrap();
+        assert_eq!(
+            index.hold_expiry(&cached.version),
+            None,
+            "empty set pins nothing"
+        );
+        index
+            .reserve_hold_pages(&cached.version, &page_set(&[1]), until)
+            .unwrap();
+        assert!(!index.is_held(&cached), "cached nonmember stays evictable");
+        assert!(index.is_held(&primary));
+        assert_eq!(index.hold_unused(), 1, "the missing member keeps its slot");
+        assert!(page_alloc::SegmentEntries::can_evict(&*index, SegmentId(0)));
+        // Capacity 2 holds the cached page plus the reserved member slot.
+        assert!(matches!(index.reserve_page(false), Err(Error::Overloaded)));
+        let (_, mut entry) = indexed(descriptor("primary", 2 * crate::model::PAGE_BYTES), 1);
+        drop(segments.append(1024).unwrap());
+        entry.location.extent = Extent::new(1024, 512).unwrap();
+        let ticket = index.reserve_page_for(&primary, false).unwrap();
+        ticket.publish(primary.clone(), entry).unwrap();
+        assert_eq!(index.held_page_expiry(&primary), Some(until));
+        assert_eq!(index.held_page_expiry(&cached), None);
+        assert_eq!(index.hold_unused(), 0);
+        assert_eq!(index.held_snapshot().pages, 1);
+        index.release_hold(&cached.version).unwrap();
+        assert_eq!(index.held_page_expiry(&primary), Some(until));
+        assert!(!index.is_held(&cached));
+    }
+
+    /// Releasing a page while its held write is in flight returns only that
+    /// page's capacity: the write keeps the entry alive, but no longer offsets
+    /// the unused reservation of the pages still held.
+    #[test]
+    fn released_page_with_held_write_in_flight_keeps_other_members_reserved() {
+        let segments = Rc::new(segments(1024, 8));
+        let index = Rc::new(index(8));
+        index.set_page_capacity(4).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let version = descriptor("inflight", 2 * crate::model::PAGE_BYTES).version;
+        let at = |number| PageId {
+            version: version.clone(),
+            number: crate::model::PageNumber(number),
+        };
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        let epoch = index
+            .reserve_hold_pages(&version, &page_set(&[0, 1]), until)
+            .unwrap();
+        assert_eq!(index.hold_unused(), 2);
+        let writing = index.reserve_page_for(&at(0), false).unwrap();
+        assert_eq!(index.hold_unused(), 1);
+        index.release_hold_pages(&version, &page_set(&[0]), epoch, HolderKind::Reader);
+        assert!(!index.is_held(&at(0)));
+        assert_eq!(index.hold_unused(), 1, "page 1 keeps its reservation");
+        assert_eq!(index.hold_epoch(&version), Some(epoch));
+        // Ordinary writes cannot take page 1's slot.
+        let ordinary = [
+            index.reserve_page(false).unwrap(),
+            index.reserve_page(false).unwrap(),
+        ];
+        assert!(matches!(index.reserve_page(false), Err(Error::Overloaded)));
+        let held = index.reserve_page_for(&at(1), false).unwrap();
+        assert_eq!(index.hold_unused(), 0);
+        drop((held, ordinary));
+        assert_eq!(index.hold_unused(), 1);
+        // The released page's write still owns the entry until it completes.
+        index.release_hold_pages(&version, &page_set(&[1]), epoch, HolderKind::Reader);
+        assert_eq!(index.hold_epoch(&version), Some(epoch));
+        assert_eq!(index.hold_unused(), 0);
+        assert_eq!(index.release_hold(&version), Err(Error::Overloaded));
+        drop(writing);
+        index.release_hold(&version).unwrap();
+        assert_eq!(index.hold_epoch(&version), None);
+    }
+
+    #[test]
+    fn page_set_hold_counts_cached_members_and_unions_earlier_promises() {
+        let segments = Rc::new(segments(1024, 8));
+        let index = Rc::new(index(8));
+        index.set_page_capacity(6).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let (cached, entry) = indexed(descriptor("union", 3 * crate::model::PAGE_BYTES), 0);
+        drop(segments.append(1024).unwrap());
+        index.publish(cached.clone(), entry).unwrap();
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        index
+            .reserve_warm_hold_pages(&cached.version, &page_set(&[0, 2]), until)
+            .unwrap();
+        assert_eq!(index.held_page_expiry(&cached), Some(until));
+        assert_eq!(
+            index.hold_unused(),
+            1,
+            "the cached member covers its own charge"
+        );
+        let later = until + std::time::Duration::from_secs(30);
+        index
+            .reserve_warm_hold_pages(&cached.version, &page_set(&[1]), later)
+            .unwrap();
+        assert_eq!(index.hold_unused(), 2, "union keeps page 2 and adds page 1");
+        for number in 0..3 {
+            let mut page = cached.clone();
+            page.number = crate::model::PageNumber(number);
+            assert!(index.is_held(&page));
+        }
+        assert_eq!(index.hold_expiry(&cached.version), Some(later));
+        index.extend_hold(&cached.version, until).unwrap();
+        assert_eq!(
+            index.hold_unused(),
+            2,
+            "extension keeps every promised page"
+        );
+        assert_eq!(index.hold_expiry(&cached.version), Some(later));
+        let mut other = descriptor("other", crate::model::PAGE_BYTES).version;
+        other.etag = crate::model::StrongEtag::test_value("other-union");
+        assert_eq!(
+            index.reserve_hold_pages(&other, &page_set(&[0]), until),
+            Err(Error::Overloaded),
+            "three members already reach the hold limit"
+        );
+        index.release_hold(&cached.version).unwrap();
+        assert_eq!(index.hold_unused(), 0);
+        assert_eq!(index.held_page_expiry(&cached), Some(later));
+        index
+            .reserve_hold_pages(&other, &page_set(&[0]), until)
+            .unwrap();
+    }
+
+    #[test]
+    fn restored_hold_rebuilds_sorted_page_set_from_unordered_visits() {
+        let segments = Rc::new(segments(1024, 64));
+        let index = Rc::new(index(64));
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let count = 40u64;
+        let bytes = count * crate::model::PAGE_BYTES;
+        let (first, _) = indexed(descriptor("many", bytes), 0);
+        for number in 0..count {
+            let (mut page, entry) = indexed(descriptor("many", bytes), number);
+            page.number = crate::model::PageNumber(number);
+            drop(segments.append(1024).unwrap());
+            index.publish(page, entry).unwrap();
+        }
+        let held: Vec<u64> = (0..count).rev().step_by(3).collect();
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        index
+            .reserve_hold_pages(&first.version, &page_set(&held), until)
+            .unwrap();
+        let mut snapshots = segments.snapshot();
+        let mut remaining = usize::MAX;
+        index
+            .snapshot_holds(&mut snapshots, &mut remaining)
+            .unwrap();
+        index.holds.borrow_mut().entries.clear();
+        index.restore_holds(&snapshots).unwrap();
+        let holds = index.holds.borrow();
+        let hold = &holds.entries[&first.version];
+        assert_eq!(hold.pages, page_set(&held));
+        let restored: Vec<u64> = hold.pages.iter().map(|p| p.0).collect();
+        let mut expected = held.clone();
+        expected.sort_unstable();
+        assert_eq!(restored, expected);
+        assert_eq!(hold.locations.len(), held.len());
+    }
+
+    #[test]
+    fn restored_sparse_hold_counts_only_held_pages_at_capacity_edge() {
+        let segments = Rc::new(segments(1024, 8));
+        let index = Rc::new(index(8));
+        index.set_page_capacity(4).unwrap();
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let (first, _) = indexed(descriptor("sparse", 3 * crate::model::PAGE_BYTES), 0);
+        let mut pages = Vec::new();
+        for number in 0..3u64 {
+            let (mut page, entry) =
+                indexed(descriptor("sparse", 3 * crate::model::PAGE_BYTES), number);
+            page.number = crate::model::PageNumber(number);
+            drop(segments.append(1024).unwrap());
+            index.publish(page.clone(), entry).unwrap();
+            pages.push(page);
+        }
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        index
+            .reserve_hold_pages(&first.version, &page_set(&[1]), until)
+            .unwrap();
+        assert_eq!(index.held_snapshot().pages, 1);
+        let mut snapshots = segments.snapshot();
+        let mut remaining = usize::MAX;
+        index
+            .snapshot_holds(&mut snapshots, &mut remaining)
+            .unwrap();
+        let image = index.snapshot().unwrap();
+        index.holds.borrow_mut().entries.clear();
+        // Three cached pages exceed the limit of two; one held page does not.
+        index.validate_restored_holds(&image, &snapshots).unwrap();
+        index.restore_holds(&snapshots).unwrap();
+        assert!(!index.is_held(&pages[0]), "nonmember stays evictable");
+        assert_eq!(index.held_page_expiry(&pages[1]), Some(until));
+        assert!(!index.is_held(&pages[2]), "nonmember stays evictable");
+        assert_eq!(index.held_snapshot().pages, 1);
     }
 
     #[test]
@@ -1908,5 +2774,502 @@ mod tests {
         index.restore(snapshot).unwrap();
         assert!(index.current(&m.version.object).unwrap().is_none());
         assert_eq!(index.version(&m.version).unwrap(), Some(m));
+    }
+}
+
+#[cfg(test)]
+mod priority_tests {
+    use super::*;
+    use crate::model::{CacheKey, StrongEtag};
+    use page_alloc::SegmentEntries;
+    use racer_control_wire::{CacheDefinition, CacheId};
+
+    const PAGE: u64 = crate::model::PAGE_BYTES;
+
+    /// Cache ids are UUIDs; derive a stable one from a short test name.
+    fn cache(name: &str) -> CacheId {
+        let digit = (b'a' + name.as_bytes()[0] % 6) as char;
+        let d = digit.to_string().repeat(12);
+        CacheId(format!(
+            "{}-{}-4{}-8{}-{d}",
+            &d[..8],
+            &d[..4],
+            &d[..3],
+            &d[..3]
+        ))
+    }
+
+    fn definition(name: &str, priority: u16) -> CacheDefinition {
+        CacheDefinition {
+            id: cache(name),
+            name: name.into(),
+            client_socket: "/client".into(),
+            origin_socket: "/origin".into(),
+            priority,
+        }
+    }
+
+    fn index(pages: usize, weights: &[(&str, u16)]) -> Rc<Index> {
+        let index = Rc::new(Index::new(
+            WorkerId(0),
+            64,
+            crate::test_support::availability_for(
+                weights.iter().map(|(name, _)| cache(name)).collect(),
+            ),
+        ));
+        index.set_page_capacity(pages).unwrap();
+        let table = crate::priority::Weights::default();
+        table.update(
+            &weights
+                .iter()
+                .map(|(name, priority)| definition(name, *priority))
+                .collect::<Vec<_>>(),
+        );
+        index.retention().set_weights(table);
+        index
+    }
+
+    /// One full-size page of `cache` recorded in `segment`.
+    fn page(cache_name: &str, etag: &str, segment: u64) -> (PageId, IndexedPage) {
+        let metadata = VersionMetadata {
+            content_type: None,
+            version: ObjectVersion {
+                object: ObjectId {
+                    cache: cache(cache_name),
+                    key: CacheKey([0; 32]),
+                },
+                etag: StrongEtag::test_value(etag),
+            },
+            length: PAGE,
+        };
+        (
+            PageId {
+                version: metadata.version.clone(),
+                number: crate::model::PageNumber(0),
+            },
+            IndexedPage {
+                metadata,
+                key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
+                location: RecordLocation {
+                    segment: SegmentId(segment),
+                    generation: Generation(1),
+                    extent: Extent::new(segment * 4 * PAGE, 512).unwrap(),
+                },
+            },
+        )
+    }
+
+    fn publish(index: &Index, cache_name: &str, etag: &str, segment: u64) -> PageId {
+        let (page, entry) = page(cache_name, etag, segment);
+        index.publish(page.clone(), entry).unwrap();
+        page
+    }
+
+    /// Per-cache counters must equal a recomputation from live mappings.
+    fn assert_accounting(index: &Index) {
+        let mut expected = crate::runtime::HashMap::<CacheId, u64>::default();
+        for page in index.state.borrow().pages.keys() {
+            *expected
+                .entry(page.version.object.cache.clone())
+                .or_default() += PAGE;
+        }
+        let retention = index.retention();
+        for (cache, bytes) in &expected {
+            assert_eq!(retention.cache_payload_bytes(cache), *bytes, "{cache:?}");
+        }
+        let charged: u64 = retention
+            .cache_disk(u64::MAX)
+            .iter()
+            .map(|c| c.resident_bytes)
+            .sum();
+        assert_eq!(charged, expected.values().sum::<u64>());
+        assert_eq!(retention.snapshot().indexed_payload_bytes, charged);
+    }
+
+    fn segments(count: usize) -> Rc<Segments> {
+        let s = Segments::new(4 * PAGE);
+        s.configure(
+            4 * PAGE * count as u64,
+            count,
+            page_alloc::Alignment::new(512, 512, 512).unwrap(),
+        )
+        .unwrap();
+        Rc::new(s)
+    }
+
+    #[test]
+    fn accounting_tracks_publish_replace_evict_remove_and_restore() {
+        let index = index(4, &[("a", 500), ("b", 500)]);
+        let a0 = publish(&index, "a", "0", 0);
+        publish(&index, "b", "0", 0);
+        publish(&index, "b", "1", 0);
+        assert_accounting(&index);
+        assert_eq!(index.retention().cache_payload_bytes(&cache("a")), PAGE);
+        assert_eq!(index.retention().cache_payload_bytes(&cache("b")), 2 * PAGE);
+        // Replacement charges once.
+        let (_, entry) = page("a", "0", 1);
+        index.publish(a0, entry).unwrap();
+        assert_accounting(&index);
+        assert_eq!(index.retention().cache_payload_bytes(&cache("a")), PAGE);
+        // Index eviction releases the victim's charge.
+        publish(&index, "a", "1", 0);
+        drop(index.reserve_page(true).unwrap());
+        assert_accounting(&index);
+        assert_eq!(index.state.borrow().pages.len(), 3);
+        // Segment removal releases charges too.
+        index.remove_bounded(SegmentId(1), 8);
+        assert_accounting(&index);
+        let snapshot = index.snapshot().unwrap();
+        let before = index.retention().cache_disk(u64::MAX);
+        // Restore rebuilds accounting from recovered mappings.
+        index.restore(snapshot).unwrap();
+        assert_accounting(&index);
+        assert_eq!(index.retention().cache_disk(u64::MAX), before);
+        index.remove_cache(&cache("b"));
+        assert_accounting(&index);
+        assert_eq!(index.retention().cache_payload_bytes(&cache("b")), 0);
+    }
+
+    #[test]
+    fn index_victim_takes_over_share_cache_first_and_keeps_holds() {
+        // Capacity 4 pages: "a" (900) gets 3.6 pages, "b" (100) gets 0.4.
+        let index = index(4, &[("a", 900), ("b", 100)]);
+        let segments = segments(4);
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        drop(segments.append(4 * PAGE as usize).unwrap());
+        let a = [publish(&index, "a", "0", 0), publish(&index, "a", "1", 0)];
+        let b = [publish(&index, "b", "0", 0), publish(&index, "b", "1", 0)];
+        // Make the over-share cache hotter: score alone would evict "a".
+        for page in &b {
+            for _ in 0..8 {
+                index.retention().touch(page);
+            }
+        }
+        let victim = index.victim(&index.state.borrow()).unwrap();
+        assert_eq!(victim.version.object.cache, cache("b"));
+        // Holds still veto eviction even for over-share pages.
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        for page in &b {
+            index.reserve_hold(&page.version, 1, until).unwrap();
+        }
+        let victim = index.victim(&index.state.borrow()).unwrap();
+        assert!(a.contains(&victim));
+        // Equal priorities: neither cache is over share, so score decides.
+        let even = self::index(4, &[("a", 500), ("b", 500)]);
+        publish(&even, "a", "0", 0);
+        let hot = publish(&even, "b", "0", 0);
+        for _ in 0..8 {
+            even.retention().touch(&hot);
+        }
+        let victim = even.victim(&even.state.borrow()).unwrap();
+        assert_eq!(victim.version.object.cache, cache("a"));
+    }
+
+    /// 64 older under-share pages fill the global window ahead of one newer
+    /// over-share page. The index holds 65 mappings.
+    fn window_hides_over_share(index: &Index) -> (Vec<PageId>, PageId) {
+        let a = (0..64)
+            .map(|n| publish(index, "a", &n.to_string(), 0))
+            .collect();
+        let z = publish(index, "z", "0", 0);
+        assert!(
+            index
+                .retention()
+                .over_share(&cache("z"), index.disk_capacity())
+        );
+        assert!(
+            !index
+                .retention()
+                .over_share(&cache("a"), index.disk_capacity())
+        );
+        (a, z)
+    }
+
+    #[test]
+    fn index_victim_finds_over_share_page_beyond_global_window() {
+        let index = index(65, &[("a", 1000), ("z", 0)]);
+        let (a, z) = window_hides_over_share(&index);
+        // Make every under-share page cold and the over-share page hot.
+        for _ in 0..8 {
+            index.retention().touch(&z);
+        }
+        assert_eq!(index.victim(&index.state.borrow()), Some(z));
+        drop(index.reserve_page(true).unwrap());
+        assert_accounting(&index);
+        assert_eq!(index.retention().cache_payload_bytes(&cache("z")), 0);
+        assert_eq!(
+            index.retention().cache_payload_bytes(&cache("a")),
+            64 * PAGE
+        );
+        // Nothing is over share any more: the global window decides.
+        let victim = index.victim(&index.state.borrow()).unwrap();
+        assert!(a.contains(&victim));
+    }
+
+    #[test]
+    fn index_victim_work_is_bounded_with_many_resident_caches() {
+        const PHANTOMS: usize = 3000;
+        let index = Rc::new(Index::new(
+            WorkerId(0),
+            64,
+            crate::test_support::availability_for(vec![cache("a"), cache("z")]),
+        ));
+        index.set_page_capacity(84).unwrap();
+        let segments = segments(50);
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        drop(segments.append(4 * PAGE as usize).unwrap());
+        // Many resident caches without index pages, each with weight 1, so
+        // "a" stays under share. Every tenth one is over share.
+        let mut definitions = vec![definition("a", 60000), definition("z", 0)];
+        let phantom = |n: usize| CacheId(format!("phantom-{n}"));
+        definitions.extend((0..PHANTOMS).map(|n| CacheDefinition {
+            id: phantom(n),
+            ..definition("a", 1)
+        }));
+        let table = crate::priority::Weights::default();
+        table.update(&definitions);
+        let retention = index.retention();
+        retention.set_weights(table.clone());
+        let phantoms: Vec<_> = (0..PHANTOMS)
+            .map(|n| {
+                let bytes = if n % 10 == 0 { PAGE } else { 1 };
+                retention.indexed_payload(&phantom(n), bytes)
+            })
+            .collect();
+        let calls = Rc::new(Cell::new(0u64));
+        let counted = calls.clone();
+        retention.set_ownership(Rc::new(move |_| {
+            counted.set(counted.get() + 1);
+            false
+        }));
+        for n in 0..64 {
+            publish(&index, "a", &n.to_string(), 0);
+        }
+        let z: Vec<_> = (0..20)
+            .map(|n| publish(&index, "z", &n.to_string(), 0))
+            .collect();
+        let capacity = index.disk_capacity();
+        assert!(!retention.over_share(&cache("a"), capacity));
+        assert!(retention.over_share(&cache("z"), capacity));
+        // Repeated decisions: the 64-page global window holds only "a".
+        let (rebuilds, _) = retention.pressure_counters();
+        for n in 0..10 {
+            let (_, visits) = retention.pressure_counters();
+            calls.set(0);
+            let before = retention.cache_payload_bytes(&cache("z"));
+            drop(index.reserve_page(true).unwrap());
+            assert_eq!(
+                retention.cache_payload_bytes(&cache("z")),
+                before - PAGE,
+                "decision {n}"
+            );
+            // Refill with an under-share page so the next decision evicts.
+            publish(&index, "a", &format!("new{n}"), 0);
+            assert!(calls.get() <= 2 * 128, "decision {n}: {}", calls.get());
+            assert!(retention.pressure_counters().1 - visits <= 2 * 64);
+        }
+        // Only the first decision builds the order.
+        assert_eq!(retention.pressure_counters().0, rebuilds + 1);
+        // Held over-share pages fall back to the global window, still bounded.
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        let live: Vec<_> = z
+            .iter()
+            .filter(|page| index.state.borrow().pages.contains_key(page))
+            .cloned()
+            .collect();
+        assert_eq!(live.len(), 10);
+        for page in &live {
+            index.reserve_hold(&page.version, 1, until).unwrap();
+        }
+        calls.set(0);
+        let victim = index.victim(&index.state.borrow()).unwrap();
+        assert_eq!(victim.version.object.cache, cache("a"));
+        assert!(calls.get() <= 128);
+        // A catalog update rebuilds the order once.
+        definitions[0].priority = 59999;
+        table.update(&definitions);
+        index.victim(&index.state.borrow());
+        index.victim(&index.state.borrow());
+        assert_eq!(retention.pressure_counters().0, rebuilds + 2);
+        drop(phantoms);
+        assert_accounting(&index);
+    }
+
+    #[test]
+    fn index_victim_beyond_window_falls_back_when_over_share_is_held() {
+        let index = index(65, &[("a", 1000), ("z", 0)]);
+        let segments = segments(17);
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        drop(segments.append(4 * PAGE as usize).unwrap());
+        let (a, z) = window_hides_over_share(&index);
+        let until = uring_runtime::environment::wall_now() + std::time::Duration::from_secs(60);
+        index.reserve_hold(&z.version, 1, until).unwrap();
+        // A held over-share page is never taken; an under-share page is.
+        let victim = index.victim(&index.state.borrow()).unwrap();
+        assert!(a.contains(&victim));
+        assert_ne!(victim, z);
+    }
+
+    #[test]
+    fn index_victim_beyond_window_takes_unavailable_over_share_cache() {
+        let index = index(65, &[("a", 1000), ("z", 0)]);
+        let (_, z) = window_hides_over_share(&index);
+        // "z" leaves the publication: its pages stay indexed but unreadable.
+        let mut index = Rc::into_inner(index).unwrap();
+        index.availability = crate::test_support::availability_for(vec![cache("a")]);
+        assert!(index.lookup(&z).unwrap().is_none());
+        assert_eq!(index.victim(&index.state.borrow()), Some(z));
+    }
+
+    #[test]
+    fn index_victim_beyond_window_follows_live_reweight() {
+        let index = index(65, &[("a", 1000), ("z", 0)]);
+        let (a, z) = window_hides_over_share(&index);
+        assert_eq!(index.victim(&index.state.borrow()), Some(z.clone()));
+        // Reweight without republishing: "a" is now over share and "z" is not.
+        let weights = index.retention().weights();
+        weights.update(&[definition("a", 0), definition("z", 1000)]);
+        let victim = index.victim(&index.state.borrow()).unwrap();
+        assert!(a.contains(&victim));
+        // Restore: the next decision sees the old weights again.
+        weights.update(&[definition("a", 1000), definition("z", 0)]);
+        assert_eq!(index.victim(&index.state.borrow()), Some(z));
+    }
+
+    #[test]
+    fn index_victim_splits_budget_across_over_share_caches() {
+        // A 16-page disk with 110 mappings: both caches are over share.
+        let index = index(200, &[("a", 500), ("b", 500)]);
+        let segments = segments(4);
+        let _clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        let a: Vec<_> = (0..100)
+            .map(|n| publish(&index, "a", &n.to_string(), 0))
+            .collect();
+        let b: Vec<_> = (0..10)
+            .map(|n| publish(&index, "b", &n.to_string(), 0))
+            .collect();
+        let capacity = index.disk_capacity();
+        assert_eq!(capacity, 16 * PAGE);
+        assert!(index.retention().over_share(&cache("a"), capacity));
+        assert!(index.retention().over_share(&cache("b"), capacity));
+        // The global window holds only hot "a" pages; "b" is cold.
+        for page in &a {
+            for _ in 0..8 {
+                index.retention().touch(page);
+            }
+        }
+        assert_eq!(index.victim(&index.state.borrow()), Some(b[0].clone()));
+    }
+
+    #[test]
+    fn priority_zero_keeps_idle_space_but_goes_first_under_pressure() {
+        let index = index(4, &[("a", 1000), ("z", 0)]);
+        for n in 0..3 {
+            publish(&index, "z", &n.to_string(), 0);
+        }
+        // Idle capacity: priority 0 data is still cached.
+        assert_eq!(index.retention().cache_payload_bytes(&cache("z")), 3 * PAGE);
+        let hot = publish(&index, "a", "0", 0);
+        for _ in 0..8 {
+            index.retention().touch(&hot);
+        }
+        for n in 1..4 {
+            drop(index.reserve_page(true).unwrap());
+            publish(&index, "a", &n.to_string(), 0);
+            assert_accounting(&index);
+        }
+        assert_eq!(index.retention().cache_payload_bytes(&cache("z")), 0);
+        assert_eq!(index.retention().cache_payload_bytes(&cache("a")), 4 * PAGE);
+    }
+
+    #[test]
+    fn segment_reclaim_prefers_segment_dominated_by_over_share_pages() {
+        let segments = segments(2);
+        let index = index(8, &[("a", 900), ("b", 100)]);
+        let clock = SegmentClock::new(index.clone(), segments.clone(), 1);
+        drop(segments.append(4 * PAGE as usize).unwrap());
+        drop(segments.append(4 * PAGE as usize).unwrap());
+        let a: Vec<_> = (0..2)
+            .map(|n| publish(&index, "a", &n.to_string(), 0))
+            .collect();
+        let b: Vec<_> = (0..3)
+            .map(|n| publish(&index, "b", &n.to_string(), 1))
+            .collect();
+        for page in &b {
+            for _ in 0..8 {
+                index.retention().touch(page);
+            }
+        }
+        let retention = index.retention();
+        let scoring =
+            retention.scoring_at(uring_runtime::environment::now(), index.disk_capacity());
+        assert!(scoring.over_share(&cache("b")));
+        assert!(!scoring.over_share(&cache("a")));
+        assert!(
+            index.segment_score_with(SegmentId(1), &scoring)
+                < index.segment_score_with(SegmentId(0), &scoring)
+        );
+        drop(scoring);
+        clock.reclaim_now().unwrap();
+        for page in &a {
+            assert!(index.lookup(page).unwrap().is_some());
+        }
+        for page in &b {
+            assert!(index.lookup(page).unwrap().is_none());
+        }
+        assert_accounting(&index);
+    }
+
+    #[test]
+    fn live_priority_change_flips_over_share() {
+        let index = index(4, &[("a", 900), ("b", 100)]);
+        publish(&index, "a", "0", 0);
+        publish(&index, "b", "0", 0);
+        let retention = index.retention();
+        let capacity = index.disk_capacity();
+        assert!(retention.over_share(&cache("b"), capacity));
+        assert!(!retention.over_share(&cache("a"), capacity));
+        assert!(
+            retention
+                .weights()
+                .update(&[definition("a", 100), definition("b", 900)])
+        );
+        assert!(retention.over_share(&cache("a"), capacity));
+        assert!(!retention.over_share(&cache("b"), capacity));
+    }
+
+    /// Deterministic churn: both caches insert one new page per round into a
+    /// full index. Returns resident pages of ("a", "b") after `rounds`.
+    fn churn(index: &Rc<Index>, rounds: usize, start: usize) -> (u64, u64) {
+        for round in start..start + rounds {
+            for name in ["a", "b"] {
+                drop(index.reserve_page(true).unwrap());
+                publish(index, name, &format!("{round}"), 0);
+            }
+            assert_accounting(index);
+        }
+        let retention = index.retention();
+        (
+            retention.cache_payload_bytes(&cache("a")) / PAGE,
+            retention.cache_payload_bytes(&cache("b")) / PAGE,
+        )
+    }
+
+    #[test]
+    fn simulated_churn_converges_to_priority_ratio_and_follows_live_change() {
+        let index = index(100, &[("a", 900), ("b", 100)]);
+        let (a, b) = churn(&index, 500, 0);
+        assert_eq!(a + b, 100);
+        assert!((6 * b..=14 * b).contains(&a), "{a}:{b}");
+        // Live change: the ratio moves toward the new weights without restart.
+        index
+            .retention()
+            .weights()
+            .update(&[definition("a", 100), definition("b", 900)]);
+        let (a, b) = churn(&index, 500, 500);
+        assert!((6 * a..=14 * a).contains(&b), "{a}:{b}");
+        let even = self::index(100, &[("a", 500), ("b", 500)]);
+        let (a, b) = churn(&even, 500, 0);
+        assert!(a.abs_diff(b) <= 4, "{a}:{b}");
     }
 }

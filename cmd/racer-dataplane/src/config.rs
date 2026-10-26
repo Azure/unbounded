@@ -127,6 +127,8 @@ pub struct Config {
     /// multi-segment signed heads, so Nagle stalls every round on a delayed ACK.
     /// Defaults on; set false only to reproduce the pre-nodelay socket behavior.
     pub peer_tcp_nodelay: bool,
+    /// cgroup v2 memory-pressure monitoring and reclaim. Defaults on.
+    pub memory_pressure: bool,
     pub pprof_enabled: bool,
     pub control_endpoint: String,
     pub peer_listen: std::net::SocketAddr,
@@ -192,6 +194,7 @@ impl Config {
                 max_jobs: to_usize(raw.warm_max_jobs.unwrap_or(16))?,
                 window: to_usize(raw.warm_window_pages.unwrap_or(2))?,
                 retained_percent: to_usize(raw.retained_segment_percent.unwrap_or(50))?,
+                range_spill_pages: to_usize(raw.range_spill_pages.unwrap_or(0))?,
             },
             send_crc_pair: raw
                 .send_crc_pair
@@ -238,6 +241,7 @@ impl Config {
             enable_rdma,
             opaque_relay: raw.opaque_relay.unwrap_or(false),
             peer_tcp_nodelay: raw.peer_tcp_nodelay.unwrap_or(true),
+            memory_pressure: raw.memory_pressure.unwrap_or(true),
             pprof_enabled: raw.pprof_enabled.unwrap_or(false),
             control_endpoint: raw.control_endpoint,
             peer_listen: parse_listener_address(
@@ -524,6 +528,8 @@ impl Config {
         }
         // Keep one page of acquisition progress beyond a full range window. The
         // ciphertext margin also fits one maximum unpadded storage record.
+        // Plaintext covers only in-flight decrypts and pages held by range
+        // streams; the memory cache retains ciphertext alone.
         let window = limits.range_window_pages.get() as u64;
         let plaintext = (window + 1)
             .checked_mul(PAGE_BYTES)
@@ -582,6 +588,7 @@ const ENV_NAMES: &[&str] = &[
     "ALLOW_SMT",
     "OPAQUE_RELAY",
     "PEER_TCP_NODELAY",
+    "MEMORY_PRESSURE",
     "PPROF_ENABLED",
     "PEER_LISTEN",
     "DIAGNOSTICS_LISTEN",
@@ -630,6 +637,7 @@ const ENV_NAMES: &[&str] = &[
     "CLIENT_CONNECTIONS",
     "PIPES",
     "RANGE_WINDOW_PAGES",
+    "RANGE_SPILL_PAGES",
     "HEADER_BYTES",
     "PLACEMENT_CACHE_BYTES",
     "CACHED_PATHS",
@@ -655,6 +663,7 @@ struct RawConfig {
     allow_smt: Option<bool>,
     opaque_relay: Option<bool>,
     peer_tcp_nodelay: Option<bool>,
+    memory_pressure: Option<bool>,
     pprof_enabled: Option<bool>,
     peer_listen: Option<String>,
     diagnostics_listen: Option<String>,
@@ -742,6 +751,8 @@ struct RawConfig {
     pipes: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
     range_window_pages: Option<u64>,
+    #[serde(default, deserialize_with = "decimal")]
+    range_spill_pages: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
     header_bytes: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
@@ -945,7 +956,8 @@ mod tests {
             .iter()
             .map(|name| {
                 let value = match *name {
-                    "ALLOW_SMT" | "OPAQUE_RELAY" | "PEER_TCP_NODELAY" | "PPROF_ENABLED" => "true",
+                    "ALLOW_SMT" | "OPAQUE_RELAY" | "PEER_TCP_NODELAY" | "MEMORY_PRESSURE"
+                    | "PPROF_ENABLED" => "true",
                     _ => "1",
                 };
                 ((*name).to_owned(), value.to_owned())
@@ -1351,22 +1363,32 @@ mod tests {
         assert_eq!(warm.max_ttl, Duration::from_secs(3600));
         assert_eq!(warm.fill_timeout, Duration::from_secs(600));
         assert_eq!(
-            (warm.max_jobs, warm.window, warm.retained_percent),
-            (16, 2, 50)
+            (
+                warm.max_jobs,
+                warm.window,
+                warm.retained_percent,
+                warm.range_spill_pages
+            ),
+            (16, 2, 50, 0)
         );
         let warm = parse(&[
             ("RACER_WARM_MAX_JOBS", "8"),
             ("RACER_WARM_WINDOW_PAGES", "4"),
+            ("RACER_RANGE_SPILL_PAGES", "1024"),
         ])
         .unwrap()
         .warm;
-        assert_eq!((warm.max_jobs, warm.window), (8, 4));
+        assert_eq!(
+            (warm.max_jobs, warm.window, warm.range_spill_pages),
+            (8, 4, 1024)
+        );
         for (name, value) in [
             ("RACER_WARM_MAX_TTL_SECS", "0"),
             ("RACER_WARM_FILL_TIMEOUT_SECS", "0"),
             ("RACER_WARM_MAX_JOBS", "0"),
             ("RACER_WARM_WINDOW_PAGES", "65"),
             ("RACER_RETAINED_SEGMENT_PERCENT", "101"),
+            ("RACER_RANGE_SPILL_PAGES", "1025"),
         ] {
             assert!(parse(&[(name, value)]).is_err());
         }
@@ -1780,6 +1802,11 @@ mod tests {
     #[test]
     fn pprof_requires_exact_boolean_and_defaults_off() {
         exact_boolean("RACER_PPROF_ENABLED", |c| c.pprof_enabled);
+    }
+
+    #[test]
+    fn memory_pressure_requires_exact_boolean_and_defaults_on() {
+        exact_boolean_default("RACER_MEMORY_PRESSURE", |c| c.memory_pressure, true);
     }
 
     #[test]

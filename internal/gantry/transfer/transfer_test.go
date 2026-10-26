@@ -267,6 +267,33 @@ func TestServeCapShedsBlobGetWith429(t *testing.T) {
 	_ = resp2.Body.Close() //nolint:errcheck // best-effort body close
 }
 
+func TestMissingBlobReturns404EvenAtServeCap(t *testing.T) {
+	s := New(fakes.NewCache(), WithMaxConcurrentServes(1))
+
+	release, ok := s.tryAcquireServe()
+	if !ok {
+		t.Fatal("could not occupy the serve slot")
+	}
+	defer release()
+
+	d := mustDigest([]byte("content that has been garbage-collected"))
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		req := httptest.NewRequest(method, "/v2/r/blobs/"+d.String(), nil)
+		req.Header.Set(MirroredHeader, "1")
+
+		resp := httptest.NewRecorder()
+		s.Handler().ServeHTTP(resp, req)
+
+		if resp.Code != http.StatusNotFound {
+			t.Fatalf("%s missing blob at capacity: status = %d, want 404", method, resp.Code)
+		}
+
+		if retryAfter := resp.Header().Get("Retry-After"); retryAfter != "" {
+			t.Fatalf("%s missing blob has a false capacity signal: Retry-After=%q", method, retryAfter)
+		}
+	}
+}
+
 func TestRangeRequest(t *testing.T) {
 	ts, cache, _ := newTestServer(t)
 	body := []byte("0123456789ABCDEF")

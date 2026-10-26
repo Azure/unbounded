@@ -186,15 +186,6 @@ func (h *HTTPServer) handleFile(w http.ResponseWriter, r *http.Request) {
 
 				return
 			}
-
-			if ip != remote {
-				if _, claimed, err := h.Media.artifactOwner(r.Context(), ip); claimed {
-					log.Warn("rejected forwarded boot media artifact request", "err", err)
-					http.NotFound(w, r)
-
-					return
-				}
-			}
 		}
 	}
 
@@ -444,8 +435,9 @@ func (h *HTTPServer) handleInstallLog(w http.ResponseWriter, r *http.Request) {
 
 var errMediaFirstBootUnauthorized = errors.New("no authorized media first-boot owner")
 
-// Only the direct peer can claim a frozen lease. Live-IP fallback, including
-// forwarding headers, is allowed only for Machines and leases without media owners.
+// Only the direct peer can claim a frozen lease. Live-IP fallback, also keyed
+// by the direct peer, is allowed only for Machines and leases without media
+// owners. Forwarding headers are never trusted.
 func (h *HTTPServer) firstBootMachine(r *http.Request) (*v1alpha3.Machine, *mediaOwner, error) {
 	if h.Media != nil {
 		remote, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -642,12 +634,10 @@ func (h *HTTPServer) recordCloudInitStatus(ctx context.Context, log *slog.Logger
 	}
 }
 
+// clientIP returns the host part of r.RemoteAddr, the address of the direct
+// TCP peer. Forwarding headers are never trusted. If RemoteAddr has no port,
+// it is returned unchanged.
 func clientIP(r *http.Request) string {
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		parts := strings.SplitN(fwd, ",", 2)
-		return strings.TrimSpace(parts[0])
-	}
-
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr

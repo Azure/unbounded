@@ -54,7 +54,7 @@ fn request(path: &Path, key: u64, range: &Expected, slow: bool) -> Result<u64, F
     let mut socket = connect(path)?;
     write!(
         socket,
-        "POST /v1/objects/{key:064x} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\nRacer-Ordered: 1\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nIf-Match: \"restart-v1\"\r\nRange: bytes={}-{}\r\nConnection: close\r\n\r\n",
+        "POST /v1/objects/{key:064x} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nIf-Match: \"restart-v1\"\r\nRange: bytes={}-{}\r\nConnection: close\r\n\r\n",
         range.start,
         range.end - 1
     )?;
@@ -615,7 +615,7 @@ fn production_aggregate_delivery_capacity() {
         let mut readers = Vec::new();
         for _ in 0..16 {
             let mut socket = connect(&path).unwrap();
-            write!(socket, "POST /v1/objects/{:064x} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\nRacer-Ordered: 1\r\nIf-Match: \"restart-v1\"\r\nRange: bytes=0-{}\r\nConnection: close\r\n\r\n", 0, PAGE_BYTES - 1).unwrap();
+            write!(socket, "POST /v1/objects/{:064x} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\nIf-Match: \"restart-v1\"\r\nRange: bytes=0-{}\r\nConnection: close\r\n\r\n", 0, PAGE_BYTES - 1).unwrap();
             readers.push(socket);
         }
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1107,7 +1107,7 @@ fn production_remote_bootstrap_one_get_and_empty() {
             origins.push(origin);
         }
         let mut socket = connect(&socket_path(&processes[receiver], 0)).unwrap();
-        write!(socket, "POST /v1/objects/{:064x} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\nRacer-Ordered: 1\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nConnection: close\r\n\r\n", 0).unwrap();
+        write!(socket, "POST /v1/objects/{:064x} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nConnection: close\r\n\r\n", 0).unwrap();
         assert_eq!(
             measurement::response(
                 &mut BufReader::new(socket),

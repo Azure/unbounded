@@ -56,7 +56,7 @@ mod acquisition {
         worker.origin.set_version(metadata.clone());
         worker.origin.set_body(vec![b'x'; metadata.length as usize]);
         let mut socket = fixture.connect();
-        socket.write_all(&request("POST", "If-Match: \"v1\"\r\nRange: bytes=0-\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\nRacer-Ordered: 1\r\n")).unwrap();
+        socket.write_all(&request("POST", "If-Match: \"v1\"\r\nRange: bytes=0-\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\n")).unwrap();
         let mut raw = fixture.receive(&mut socket, false);
         let end = raw.windows(4).position(|part| part == b"\r\n\r\n").unwrap() + 4;
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -155,7 +155,7 @@ mod directory {
         assert_eq!(after.mode() & 0o7777, mode);
     }
     #[test]
-    fn startup_hardens_existing_client_directory_without_changing_ancestors() {
+    fn startup_hardens_existing_client_directory_and_origin_without_changing_ancestors() {
         for mode in [0o777, 0o775, 0o757, 0o770, 0o722, 0o2775, 0o1777] {
             let fixture = Fixture::new();
             let path = fixture.socket().parent().unwrap().to_owned();
@@ -169,10 +169,16 @@ mod directory {
             fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
             let before = fs::metadata(&path).unwrap();
             fixture.reconcile(&[definition()]).unwrap();
-            assert_identity(&before, &fs::metadata(&path).unwrap(), mode & !0o022);
-            for ancestor in [&fixture.root.0, cache, &origin] {
+            assert_identity(
+                &before,
+                &fs::metadata(&path).unwrap(),
+                (mode & !0o022) | 0o011,
+            );
+            for ancestor in [&fixture.root.0, cache] {
                 assert_eq!(fs::metadata(ancestor).unwrap().mode() & 0o7777, 0o777);
             }
+            // The dataplane owns the origin directory layout and makes it private.
+            assert_eq!(fs::metadata(&origin).unwrap().mode() & 0o7777, 0o700);
             assert_eq!(
                 fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
                 0o666
@@ -192,7 +198,7 @@ mod directory {
     fn secure_client_directory_permissions_are_unchanged() {
         // Generic mode combinations live in uds-endpoint. Keep adapter coverage
         // for read-only/sticky modes and no metadata mutation on the first call.
-        for mode in [0o755, 0o500, 0o1700] {
+        for mode in [0o755, 0o711, 0o751, 0o511, 0o1711] {
             let root = Root::new();
             let directory = open_directory(&root.0).unwrap();
             directory
@@ -211,6 +217,147 @@ mod directory {
                 .set_permissions(fs::Permissions::from_mode(0o700))
                 .unwrap();
         }
+    }
+    #[test]
+    fn client_directory_preparation_grants_search_only() {
+        // Root origins used to leave 0700 or 0750 client directories, which
+        // nonroot SDK clients cannot traverse to reach the 0666 socket.
+        for (mode, wanted) in [
+            (0o700, 0o711),
+            (0o750, 0o751),
+            (0o500, 0o511),
+            (0o1700, 0o1711),
+            (0o2750, 0o2751),
+            (0o770, 0o751),
+            (0o707, 0o715),
+            (0o000, 0o011),
+        ] {
+            let root = Root::new();
+            let parent = open_directory(&root.0).unwrap();
+            let directory = child_directory(&parent, b"client").unwrap();
+            directory
+                .set_permissions(fs::Permissions::from_mode(mode))
+                .unwrap();
+            let before = directory.metadata().unwrap();
+            prepare_client_directory(&directory).unwrap();
+            let first = directory.metadata().unwrap();
+            assert_identity(&before, &first, wanted);
+            // Idempotent: the second call changes no metadata.
+            prepare_client_directory(&directory).unwrap();
+            let second = directory.metadata().unwrap();
+            assert_identity(&first, &second, wanted);
+            assert_eq!(
+                (second.ctime(), second.ctime_nsec()),
+                (first.ctime(), first.ctime_nsec())
+            );
+            directory
+                .set_permissions(fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+    }
+    #[test]
+    fn client_directory_search_grant_keeps_pinned_inode() {
+        let root = Root::new();
+        let parent = open_directory(&root.0).unwrap();
+        let directory = child_directory(&parent, b"client").unwrap();
+        directory
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let path = root.0.join("client");
+        let moved = root.0.join("moved");
+        fs::rename(&path, &moved).unwrap();
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        prepare_client_directory(&directory).unwrap();
+        assert_eq!(fs::metadata(&moved).unwrap().mode() & 0o7777, 0o711);
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o700);
+    }
+    /// Installs `fd` as descriptor 3 without close-on-exec. `dup2(3, 3)` is a
+    /// no-op that keeps FD_CLOEXEC, so the flag is cleared explicitly.
+    /// Must only call async-signal-safe functions; it runs in `pre_exec`.
+    fn inherit_as_fd3(fd: libc::c_int) -> std::io::Result<()> {
+        // SAFETY: dup2 and fcntl are async-signal-safe and touch only fds.
+        unsafe {
+            if libc::dup2(fd, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let flags = libc::fcntl(3, libc::F_GETFD);
+            if flags < 0 || libc::fcntl(3, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn inherit_as_fd3_survives_exec_for_self_and_other_descriptors() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+        let root = Root::new();
+        let directory = open_directory(&root.0).unwrap();
+        // Move the source to fd >= 4 so the normal case never self-dups.
+        // SAFETY: F_DUPFD_CLOEXEC returns a new fd that OwnedFd then owns.
+        use std::os::fd::FromRawFd;
+        let high = unsafe {
+            let raw = libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 4);
+            assert!(raw >= 4, "{}", std::io::Error::last_os_error());
+            std::os::fd::OwnedFd::from_raw_fd(raw)
+        };
+        let fd = high.as_raw_fd();
+        for self_dup in [false, true] {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "test -d /proc/self/fd/3"]);
+            // SAFETY: dup3 and inherit_as_fd3 only call async-signal-safe
+            // syscalls. The self-dup case first places a close-on-exec copy at
+            // fd 3 so inherit_as_fd3 deterministically sees dup2(3, 3).
+            unsafe {
+                command.pre_exec(move || {
+                    if !self_dup {
+                        return inherit_as_fd3(fd);
+                    }
+                    if libc::dup3(fd, 3, libc::O_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::fcntl(3, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    inherit_as_fd3(3)
+                });
+            }
+            assert!(command.status().unwrap().success(), "self_dup={self_dup}");
+        }
+    }
+    #[test]
+    fn nonroot_client_can_traverse_migrated_client_directory_when_root() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let root = Root::new();
+        let parent = open_directory(&root.0).unwrap();
+        let directory = child_directory(&parent, b"client").unwrap();
+        fs::write(root.0.join("client").join("probe"), b"").unwrap();
+        directory
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .unwrap();
+        // Reach the directory through an inherited descriptor so ancestors of
+        // the test root do not affect the result.
+        let probe = |directory: &File| {
+            let fd = directory.as_raw_fd();
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "test -e /proc/self/fd/3/probe"]);
+            // SAFETY: inherit_as_fd3 only calls async-signal-safe syscalls.
+            // Command drops supplementary groups itself when uid is set.
+            unsafe {
+                command.pre_exec(move || inherit_as_fd3(fd));
+            }
+            command.uid(65532).gid(65532).status().unwrap().success()
+        };
+        assert!(!probe(&directory));
+        prepare_client_directory(&directory).unwrap();
+        assert!(probe(&directory));
+        let after = directory.metadata().unwrap();
+        assert_eq!((after.uid(), after.mode() & 0o7777), (0, 0o711));
     }
     #[test]
     fn client_directory_preparation_pins_inode_across_path_replacement() {
@@ -252,6 +399,19 @@ mod directory {
             .unwrap();
         assert_eq!(prepare_client_directory(&directory), Err(Error::Io));
         assert_eq!(directory.metadata().unwrap().mode() & 0o7777, 0o777);
+        // A secure 0700 directory passes restrict_directory without chmod, so
+        // this reaches the fchmod in the search grant.
+        let secure = root.0.join("secure");
+        fs::create_dir(&secure).unwrap();
+        fs::set_permissions(&secure, fs::Permissions::from_mode(0o700)).unwrap();
+        let pinned = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&secure)
+            .unwrap();
+        let before = pinned.metadata().unwrap();
+        assert_eq!(prepare_client_directory(&pinned), Err(Error::Io));
+        assert_identity(&before, &pinned.metadata().unwrap(), 0o700);
         let link = root.0.join("link");
         std::os::unix::fs::symlink(&root.0, &link).unwrap();
         let link = OpenOptions::new()
@@ -801,6 +961,7 @@ fn definition() -> CacheDefinition {
         name: "example".into(),
         client_socket: "/run/racer/example/client/socket".into(),
         origin_socket: "/run/racer/example/origin/socket".into(),
+        priority: racer_control_wire::DEFAULT_PRIORITY,
     }
 }
 fn scope() -> RequestScope {
@@ -1085,11 +1246,24 @@ fn configured_timeout_bounds_idle_partial_headers_and_keepalive() {
             assert_no_head(&mut socket);
         }
         sleep_until(started + timeout + Duration::from_millis(20));
-        for _ in 0..64 {
+        // The expired budget closes the connection, but under load its timer
+        // and close completions can take more than a fixed number of pumps to
+        // be reaped. Wait for the close itself, bounded by wall-clock time.
+        let closed = Instant::now() + Duration::from_secs(5);
+        loop {
             fixture.pump(16);
+            if fixture.listeners.active_connections() == 0 {
+                match socket.read(&mut [0; 1]) {
+                    Ok(read) => {
+                        assert_eq!(read, 0, "{mode}");
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("{mode}: {error}"),
+                }
+            }
+            assert!(Instant::now() < closed, "{mode}: connection did not close");
         }
-        assert_eq!(fixture.listeners.active_connections(), 0, "{mode}");
-        assert_eq!(socket.read(&mut [0; 1]).unwrap(), 0, "{mode}");
         assert_eq!(fixture.completed_heads(), usize::from(mode == "keepalive"));
         assert_no_body_leases(&fixture);
     }
@@ -1735,7 +1909,11 @@ fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
     // Duplex completion frames and the next response head may be in flight
     // together, in addition to listener readiness. Keep reactor headroom
     // while proving that an exhausted relay pipe quota cannot block delivery.
-    let (mut fixture, pipes) = body_fixture(4, false);
+    // The ring must cover every connection's sends at once: the kernel reaps
+    // them asynchronously, so under CPU starvation all five connections can
+    // hold entries together, and a full ring closes a connection with
+    // Overloaded and no response. Pipe quota, not ring size, is under test.
+    let (mut fixture, pipes) = body_fixture(16, false);
     let failures = crate::telemetry::Failures::default();
     fixture.listeners.responses = Rc::new(
         Responses::new(
@@ -1750,9 +1928,11 @@ fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
     let held = pipes.acquire().unwrap();
     // Hold the shared page fill so no waiter can complete before the
     // overflow request is queued. Without this, whether a head arrives during
-    // start_body depends on how fast the origin thread answers.
+    // start_body depends on how fast the origin thread answers. These requests
+    // carry If-Match, so the fill resolves metadata with a pinned HEAD and then
+    // fetches the page with a pinned GET; gate the GET, not InitialGet.
     let origin = &fixture.worker.as_ref().unwrap().origin;
-    origin.block(RequestKind::InitialGet);
+    origin.block(RequestKind::PinnedGet);
     let mut first = start_body(&fixture);
     let mut second = start_body(&fixture);
     let mut third = start_body(&fixture);
@@ -1762,9 +1942,9 @@ fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
     assert_no_head(&mut third);
     assert_no_head(&mut fourth);
     let mut overflow = start_body(&fixture);
-    origin.release(RequestKind::InitialGet);
+    origin.release(RequestKind::PinnedGet);
     // Every request becomes ready when the fill lands. Drive one connection
-    // per pass so their response sends cannot together exhaust the 4-entry ring.
+    // per pass so their responses are written one at a time.
     let output = fixture.receive_budgeted(&mut overflow, true, 2);
     let mut diagnostics = String::new();
     failures.write(&mut diagnostics).unwrap();
@@ -1867,7 +2047,6 @@ fn actual_uds_empty_bootstrap_and_canceled_success() {
                     range: None,
                     page_credits: 2,
                     byte_credits: 2 * PAGE_BYTES,
-                    ordered: false,
                 },
                 Ok(ReadResponse {
                     retain_until: None,
@@ -2113,7 +2292,6 @@ fn response_payload_validation_preserves_range_pin_and_empty_contracts() {
         range,
         page_credits: 1,
         byte_credits: PAGE_BYTES,
-        ordered: false,
     };
     let pinned = subscription(Some(range), Some(response.metadata.version.etag.clone()));
     assert_eq!(responses.validate(&pinned, &response), Ok(()));
@@ -2647,6 +2825,70 @@ fn retirement_generations_are_bounded_and_removal_allows_immediate_recreation() 
 }
 
 #[test]
+fn priority_only_changes_reuse_listeners_beyond_retirement_bound() {
+    let fixture = Fixture::new();
+    let count = MAX_RETIRING_LISTENERS + 1;
+    let mut caches: Vec<_> = (0..count)
+        .map(|n| {
+            let name = format!("cache-{n}");
+            CacheDefinition {
+                id: CacheId(format!("00000000-0000-4000-8000-{:012x}", n + 100)),
+                client_socket: format!("/run/racer/{name}/client/socket").into(),
+                origin_socket: format!("/run/racer/{name}/origin/socket").into(),
+                name,
+                priority: racer_control_wire::DEFAULT_PRIORITY,
+            }
+        })
+        .collect();
+    fixture.reconcile(&caches).unwrap();
+    let before: Vec<_> = caches
+        .iter()
+        .map(|cache| Rc::as_ptr(&fixture.listeners.listeners.borrow()[&cache.id]))
+        .collect();
+    for cache in &mut caches {
+        cache.priority = 7;
+    }
+    let prepared =
+        futures::executor::block_on(fixture.listeners.prepare(&caches, &scope())).unwrap();
+    // The publication carries the new priorities even though sockets are reused.
+    assert_eq!(prepared.definitions(), caches.as_slice());
+    prepared.commit();
+    for (cache, old) in caches.iter().zip(&before) {
+        assert_eq!(
+            Rc::as_ptr(&fixture.listeners.listeners.borrow()[&cache.id]),
+            *old
+        );
+    }
+    // Endpoint identity changes still replace the listener.
+    caches[0].id = CacheId("00000000-0000-4000-8000-000000000fff".into());
+    fixture.reconcile(&caches).unwrap();
+    let listeners = fixture.listeners.listeners.borrow();
+    assert!(!listeners.contains_key(&CacheId("00000000-0000-4000-8000-000000000064".into())));
+    assert!(listeners.contains_key(&caches[0].id));
+    assert_eq!(Rc::as_ptr(&listeners[&caches[1].id]), before[1]);
+}
+
+#[test]
+fn listener_reuse_ignores_only_priority() {
+    use super::listener::same_endpoint;
+    let current = definition();
+    let mut next = definition();
+    next.priority = 0;
+    assert!(same_endpoint(&current, &next));
+    let changes: [fn(&mut CacheDefinition); 4] = [
+        |d| d.id = CacheId("00000000-0000-4000-8000-000000000fff".into()),
+        |d| d.name = "other".into(),
+        |d| d.client_socket = "/run/racer/other/client/socket".into(),
+        |d| d.origin_socket = "/run/racer/other/origin/socket".into(),
+    ];
+    for change in changes {
+        let mut next = definition();
+        change(&mut next);
+        assert!(!same_endpoint(&current, &next));
+    }
+}
+
+#[test]
 fn retirement_queued_authorization_outlives_fd_but_not_removal_or_explicit_stop() {
     use crate::admission::{Ingress, ResourceClass};
     use crate::model::WorkerId;
@@ -2947,8 +3189,9 @@ fn prepared_rename_failure_restores_already_exchanged_paths() {
 fn prepared_uid_reuse_and_foreign_replacement_are_inode_safe() {
     let fixture = Fixture::new();
     fixture.reconcile(&[definition()]).unwrap();
+    // The dataplane created the origin directory; the adapter owns its socket.
     let origin = fixture.root.0.join("example/origin");
-    fs::create_dir(&origin).unwrap();
+    assert!(fs::symlink_metadata(&origin).unwrap().is_dir());
     fs::write(origin.join("socket"), b"origin").unwrap();
     let mut replacement = definition();
     replacement.id = CacheId("00000000-0000-4000-8000-000000000002".into());
@@ -3490,7 +3733,6 @@ mod parser_tests {
                     }),
                     page_credits: 2,
                     byte_credits: 2 * PAGE_BYTES,
-                    ordered: false,
                 },
             ),
             (
@@ -3504,7 +3746,6 @@ mod parser_tests {
                     range: Some(ByteRange::Suffix(0)),
                     page_credits: 2,
                     byte_credits: 2 * PAGE_BYTES,
-                    ordered: false,
                 },
             ),
             (
@@ -3518,7 +3759,6 @@ mod parser_tests {
                     range: Some(ByteRange::From(PAGE_BYTES)),
                     page_credits: 2,
                     byte_credits: 2 * PAGE_BYTES,
-                    ordered: false,
                 },
             ),
         ] {
@@ -3615,7 +3855,6 @@ mod parser_tests {
                 range: None,
                 page_credits: 2,
                 byte_credits: 2 * PAGE_BYTES,
-                ordered: false
             }
         );
         for name in ["Racer-Page-Credits", "Racer-Byte-Credits"] {
@@ -3640,7 +3879,7 @@ mod parser_tests {
         }
         for pages in [1, 64] {
             for bytes in [PAGE_BYTES, 64 * PAGE_BYTES] {
-                for ordered in ["0", "1"] {
+                for ordered in ["0", "1", "2", "01"] {
                     let parsed = parse(head(
                         "POST",
                         &[
@@ -3651,7 +3890,7 @@ mod parser_tests {
                     ))
                     .unwrap();
                     assert!(
-                        matches!(parsed.kind, ReadKind::Subscription { page_credits, byte_credits, ordered: actual, .. } if page_credits == pages && byte_credits == bytes && actual == (ordered == "1"))
+                        matches!(parsed.kind, ReadKind::Subscription { page_credits, byte_credits, .. } if page_credits == pages && byte_credits == bytes)
                     );
                 }
             }
@@ -3660,17 +3899,16 @@ mod parser_tests {
             ("Racer-Page-Credits", "65".into()),
             ("Racer-Byte-Credits", (PAGE_BYTES - 1).to_string()),
             ("Racer-Byte-Credits", (64 * PAGE_BYTES + 1).to_string()),
-            ("Racer-Ordered", "2".into()),
-            ("Racer-Ordered", "01".into()),
         ] {
             assert!(parse(head("POST", &[(name, value.as_bytes())])).is_err());
         }
+        // The removed Racer-Ordered header is ignored, so duplicates are not rejected.
         assert!(
             parse(head(
                 "POST",
                 &[("Racer-Ordered", b"0"), ("racer-ordered", b"1")]
             ))
-            .is_err()
+            .is_ok()
         );
         let mut missing = head("POST", &[]);
         missing.headers.retain(|h| h.name != "Content-Length");
@@ -3798,4 +4036,40 @@ mod parser_tests {
             }
         }
     }
+}
+
+#[test]
+fn handoff_acceptor_drains_backlog_and_wakes_only_while_one_remains() {
+    use crate::admission::Ingress;
+    use crate::model::WorkerId;
+    use crate::test_support::WakeCounter;
+    use std::task::Waker;
+
+    let mut acceptor = Fixture::new();
+    let worker = Fixture::new();
+    let ingress = Arc::new(Ingress::new(&[WorkerId(1)]));
+    ingress
+        .install(WorkerId(1), &worker.listeners.admission)
+        .unwrap();
+    acceptor.listeners = acceptor.listeners.with_ingress(ingress.clone());
+    acceptor.reconcile(&[definition()]).unwrap();
+    let _sockets: Vec<_> = (0..3).map(|_| acceptor.connect()).collect();
+    assert!(
+        ingress
+            .pop_batch::<1>(WorkerId(1), futures::task::noop_waker_ref(), 1)
+            .unwrap()[0]
+            .is_none()
+    );
+    let wakes = Arc::new(WakeCounter::default());
+    let waker = Waker::from(wakes.clone());
+    let mut cx = Context::from_waker(&waker);
+    // One accept per listener per turn would leave two connections queued.
+    assert_eq!(acceptor.listeners.poll_budgeted(&mut cx, 2).unwrap(), 2);
+    assert_eq!(wakes.count(), 1, "the budget ran out with a backlog left");
+    assert_eq!(acceptor.listeners.poll_budgeted(&mut cx, 8).unwrap(), 1);
+    assert_eq!(wakes.count(), 1, "a drained backlog does not self-wake");
+    for _ in 0..3 {
+        worker.install_handoff(&ingress);
+    }
+    assert_eq!(worker.listeners.active_connections_for(&definition().id), 3);
 }

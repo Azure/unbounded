@@ -35,11 +35,51 @@ use uring_runtime::environment::Deadline;
 use uring_runtime::reactor::descriptor::Descriptor;
 
 pub use server::CONNECTION_TIMEOUT;
-pub use server::CONTROL_SLOTS;
 pub use server::MAX_CONNECTIONS;
 pub use server::MAX_REQUEST_BYTES;
 pub use server::MAX_RESPONSE_BYTES;
-pub use server::RESERVED_BYTES;
+
+/// Prepaid diagnostic submissions: the transport's connection slots plus the
+/// waits for one in-flight `/debug/hardware` producer, which is always attached.
+pub const CONTROL_SLOTS: usize = server::CONTROL_SLOTS + server::JSON_CONTROL_SLOTS;
+
+/// Prepaid diagnostic memory: transport buffers, the hardware producer's wait
+/// bookkeeping, and the `/debug/hardware` helper's peak footprint.
+///
+/// At most one helper exists at a time. Its peak is during encoding, when the
+/// discovered report (charged against `hardware::WORKING_BYTES` by
+/// `hardware::Walk`, which aborts with `response_too_large` when exhausted) is
+/// alive alongside the JSON buffer. The JSON buffer is allocated once with
+/// capacity `MAX_BODY_BYTES` (see `Bounded`), never grows, and becomes the
+/// result held for the response, so one `MAX_RESPONSE_BYTES` term covers both
+/// the encoding buffer and the held result. The report is dropped before the
+/// result is published. The detached discovery helper's thread stack
+/// (`HARDWARE_STACK_BYTES`) is charged too, since a blocked sysfs read can keep
+/// the helper alive after diagnostics teardown.
+pub const RESERVED_BYTES: usize = server::RESERVED_BYTES
+    + server::JSON_CONTROL_SLOTS * uring_runtime::reactor::SUBMISSION_BYTES
+    + server::MAX_RESPONSE_BYTES
+    + crate::hardware::WORKING_BYTES
+    + HARDWARE_STACK_BYTES;
+
+/// Stack size of the `/debug/hardware` discovery helper thread.
+const HARDWARE_STACK_BYTES: usize = 2 * 1024 * 1024;
+
+const _: () = assert!(server::MAX_BODY_BYTES <= server::MAX_RESPONSE_BYTES);
+const _: () = assert!(RESERVED_BYTES >= server::RESERVED_BYTES + HARDWARE_BYTES);
+
+/// Deadline for one `/debug/hardware` request, covering discovery and the response.
+pub(crate) const HARDWARE_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Owned, `Send` hardware discovery prepared on the control worker and run on a
+/// helper thread, so blocking sysfs reads never stall the worker. The job charges
+/// the walk's working budget and stops early once the request is cancelled.
+pub(crate) type HardwareJob = Box<
+    dyn FnOnce(
+            &crate::hardware::Walk,
+        ) -> std::result::Result<crate::hardware::Report, crate::hardware::Abort>
+        + Send,
+>;
 
 // Bounded diagnostics and HTTP endpoints, polled by an existing worker.
 
@@ -47,6 +87,11 @@ pub use server::RESERVED_BYTES;
 pub struct Telemetry {
     pub(crate) profiling: Option<Arc<crate::profiling::ProfilingController>>,
     pub(crate) membership: OnceCell<Rc<dyn Fn() -> Result<MembershipDiagnostic>>>,
+    /// Prepares live hardware discovery for `/debug/hardware`; installed on the
+    /// control worker only. The returned job runs on a helper thread.
+    pub(crate) hardware: OnceCell<Rc<dyn Fn() -> HardwareJob>>,
+    /// The current hardware helper, alive until both its thread and response finish.
+    hardware_active: std::cell::RefCell<std::sync::Weak<HardwareState>>,
     pub send_crc: crate::telemetry::Samples,
     pub failures: crate::telemetry::Failures,
     pub metrics: crate::telemetry::Metrics,
@@ -160,8 +205,20 @@ impl server::Scope for RequestScope {
 pub struct DiagnosticIo {
     reactor: Rc<Reactor>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+    /// `/debug/hardware` working set, helper stack, and result (`HARDWARE_BYTES` of
+    /// `RESERVED_BYTES`). Each helper and its session share this charge, so it is
+    /// returned only after this owner, every helper, and every response drop it.
+    hardware: HardwareCharge,
     server: Server,
 }
+
+/// Thread-safe hardware memory charge shared with detached discovery helpers.
+pub(crate) type HardwareCharge = Arc<flow_control::Charge<AdmissionPolicy>>;
+
+/// Portion of `RESERVED_BYTES` funding one hardware discovery, its helper
+/// stack, and its result.
+const HARDWARE_BYTES: usize =
+    server::MAX_RESPONSE_BYTES + crate::hardware::WORKING_BYTES + HARDWARE_STACK_BYTES;
 impl DiagnosticIo {
     /// Explicit startup acquisition, using the worker's already-budgeted reactor.
     /// Must run before ordinary request admission fills the memory quota.
@@ -191,7 +248,16 @@ impl DiagnosticIo {
         )?;
         let bookkeeping = memory.split(slots * uring_runtime::reactor::SUBMISSION_BYTES)?;
         let submissions = reactor.reserve_submissions(control, bookkeeping)?;
-        let mut server = Server::new(submissions.clone(), memory);
+        // The hardware report is always available, independent of pprof, with its
+        // own single in-flight slot so a running profile never makes it busy. Its
+        // working set and bounded result are split into a shared charge that the
+        // detached helper retains, so dropping this owner while a sysfs read is
+        // blocked cannot return memory the helper still uses.
+        let hardware = Arc::new(memory.split(HARDWARE_BYTES)?);
+        // Connection buffers also retain the shared charge through their fences,
+        // as they retain the rest of `memory`.
+        let mut server = Server::new(submissions.clone(), (memory, hardware.clone()))
+            .with_json(submissions.clone(), ());
         if binary {
             // The process-wide profiler budget includes the result allocation.
             server = server.with_binary(submissions, ());
@@ -199,6 +265,7 @@ impl DiagnosticIo {
         Ok(Self {
             reactor,
             admission,
+            hardware,
             server,
         })
     }
@@ -214,6 +281,7 @@ fn serve<'a>(
         let handler = DiagnosticHandler {
             telemetry,
             admission: &io.admission,
+            hardware: &io.hardware,
         };
         io.server
             .serve(&io.reactor, listener, &handler, scope)
@@ -224,6 +292,7 @@ fn serve<'a>(
 struct DiagnosticHandler<'a> {
     telemetry: &'a Telemetry,
     admission: &'a flow_control::Quotas<AdmissionPolicy>,
+    hardware: &'a HardwareCharge,
 }
 impl Handler for DiagnosticHandler<'_> {
     type Connection = ::telemetry::Lease;
@@ -260,7 +329,156 @@ impl Handler for DiagnosticHandler<'_> {
         {
             return Some(Err(server::BinaryError::Unavailable("stopping")));
         }
+        if path == "/debug/hardware" {
+            return Some(hardware_request(self.telemetry, self.hardware));
+        }
         profile_request(self.telemetry.profiling.as_ref(), path)
+    }
+}
+
+/// Start one `/debug/hardware` discovery on a helper thread.
+///
+/// The control worker only captures the tiny Racer view (selector, claimed disks,
+/// rails snapshot); the sysfs walk and JSON encoding run on a named, detached
+/// thread. At most one helper exists at a time: a request while the previous
+/// helper or its response is still alive gets 409 busy. The transport's own JSON
+/// slot is a second, worker-local bound. The worker never joins the helper, so a
+/// slow sysfs read cannot block it; on cancellation or deadline the helper stops
+/// at its next read, skips encoding, and drops its result. Discovery that exceeds
+/// `hardware::WORKING_BYTES` stops early with 503 `response_too_large`.
+fn hardware_request(
+    telemetry: &Telemetry,
+    charge: &HardwareCharge,
+) -> std::result::Result<server::BinaryResponse, server::BinaryError> {
+    telemetry.metrics.record(Event::DiagnosticHardware, 1);
+    let unavailable = server::BinaryError::Unavailable("unavailable");
+    let prepare = telemetry.hardware.get().ok_or(unavailable)?;
+    let mut active = telemetry.hardware_active.borrow_mut();
+    if active.strong_count() != 0 {
+        return Err(server::BinaryError::Busy);
+    }
+    let session = HardwareSession::start(prepare(), server::MAX_BODY_BYTES, charge.clone())?;
+    *active = Arc::downgrade(&session.state);
+    Ok(server::BinaryResponse {
+        kind: server::BinaryKind::Json,
+        duration: HARDWARE_DEADLINE,
+        session: Box::new(session),
+    })
+}
+
+/// State shared by one hardware helper thread and its response session.
+struct HardwareState {
+    completion: std::os::fd::OwnedFd,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    result: Mutex<Option<std::result::Result<Vec<u8>, server::BinaryError>>>,
+    /// Memory funding discovery and the result, held until the helper and the
+    /// response both finish, even if the diagnostics owner drops first.
+    _charge: HardwareCharge,
+}
+
+/// One live hardware discovery, polled through its eventfd. Drop cancels.
+struct HardwareSession {
+    state: Arc<HardwareState>,
+}
+
+impl HardwareSession {
+    /// Spawn the helper. `limit` bounds the encoded body.
+    fn start(
+        job: HardwareJob,
+        limit: usize,
+        charge: HardwareCharge,
+    ) -> std::result::Result<Self, server::BinaryError> {
+        use std::os::fd::FromRawFd;
+        let unavailable = server::BinaryError::Unavailable("unavailable");
+        // SAFETY: eventfd has no pointer arguments; ownership transfers only on success.
+        let raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if raw < 0 {
+            return Err(unavailable);
+        }
+        let state = Arc::new(HardwareState {
+            // SAFETY: raw is a new, successful eventfd descriptor.
+            completion: unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) },
+            cancelled: Arc::default(),
+            result: Mutex::new(None),
+            _charge: charge,
+        });
+        let helper = state.clone();
+        std::thread::Builder::new()
+            .name("racer-hardware".into())
+            .stack_size(HARDWARE_STACK_BYTES)
+            .spawn(move || helper.run(job, limit))
+            .map_err(|_| unavailable)?;
+        Ok(Self { state })
+    }
+}
+
+impl HardwareState {
+    /// Discover, encode unless cancelled, publish, then notify the worker.
+    fn run(&self, job: HardwareJob, limit: usize) {
+        use std::os::fd::AsRawFd;
+        use std::sync::atomic::Ordering;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let walk =
+                crate::hardware::Walk::new(self.cancelled.clone(), crate::hardware::WORKING_BYTES);
+            let report = match job(&walk) {
+                Ok(report) => report,
+                Err(crate::hardware::Abort::TooLarge) => {
+                    return Err(server::BinaryError::Unavailable("response_too_large"));
+                }
+                Err(crate::hardware::Abort::Cancelled) => {
+                    return Err(server::BinaryError::Unavailable("unavailable"));
+                }
+            };
+            if self.cancelled.load(Ordering::Acquire) {
+                return Err(server::BinaryError::Unavailable("unavailable"));
+            }
+            match encode_report(&report, limit) {
+                Ok(body) => Ok(body.into_bytes()),
+                Err(Encode::TooLarge) => {
+                    Err(server::BinaryError::Unavailable("response_too_large"))
+                }
+                Err(Encode::Failed) => Err(server::BinaryError::Unavailable("unavailable")),
+            }
+        }))
+        .unwrap_or(Err(server::BinaryError::Unavailable("unavailable")));
+        if self.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        *self.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+        let one = 1u64;
+        loop {
+            // SAFETY: the descriptor and eight-byte value remain live during write.
+            let n =
+                unsafe { libc::write(self.completion.as_raw_fd(), (&one as *const u64).cast(), 8) };
+            if n >= 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                break;
+            }
+        }
+    }
+}
+
+impl server::BinarySession for HardwareSession {
+    fn completion_fd(&self) -> std::result::Result<Descriptor, server::BinaryError> {
+        self.state
+            .completion
+            .try_clone()
+            .map(Into::into)
+            .map_err(|_| server::BinaryError::Unavailable("unavailable"))
+    }
+    /// Take the result once, without waiting for the helper or its mutex.
+    fn result(&self) -> Option<std::result::Result<Vec<u8>, server::BinaryError>> {
+        self.state.result.try_lock().ok()?.take()
+    }
+    fn cancel(&self) {
+        self.state
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Drop for HardwareSession {
+    fn drop(&mut self) {
+        server::BinarySession::cancel(self);
     }
 }
 
@@ -303,6 +521,7 @@ fn profile_request(
         let duration = duration?;
         let session = controller.start(duration).map_err(profile_error)?;
         Ok(server::BinaryResponse {
+            kind: server::BinaryKind::Profile,
             duration,
             session: Box::new(session),
         })
@@ -450,6 +669,127 @@ fn get(
     Ok(response)
 }
 
+/// Why a hardware report could not be encoded.
+#[derive(Debug, PartialEq, Eq)]
+enum Encode {
+    /// The pretty JSON plus trailing newline would exceed the byte limit.
+    TooLarge,
+    /// Serialization failed for another reason.
+    Failed,
+}
+
+/// Encode `report` as pretty JSON with a trailing newline, failing as soon as the output
+/// would exceed `limit` bytes so oversized reports never allocate the full body.
+fn encode_report(
+    report: &crate::hardware::Report,
+    limit: usize,
+) -> std::result::Result<String, Encode> {
+    let mut writer = Bounded::new(limit);
+    let result = serde_json::to_writer_pretty(&mut writer, report)
+        .map_err(|_| ())
+        .and_then(|()| std::io::Write::write_all(&mut writer, b"\n").map_err(|_| ()));
+    match result {
+        Ok(()) => String::from_utf8(writer.buffer).map_err(|_| Encode::Failed),
+        Err(()) if writer.exceeded => Err(Encode::TooLarge),
+        Err(()) => Err(Encode::Failed),
+    }
+}
+
+/// `io::Write` sink that refuses to grow past a fixed byte limit.
+///
+/// The buffer is allocated once with capacity `limit` so amortized growth can
+/// never exceed the limit charged in `RESERVED_BYTES`.
+struct Bounded {
+    buffer: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl Bounded {
+    fn new(limit: usize) -> Self {
+        Self {
+            buffer: Vec::with_capacity(limit),
+            limit,
+            exceeded: false,
+        }
+    }
+}
+
+impl std::io::Write for Bounded {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if data.len() > self.limit - self.buffer.len() {
+            self.exceeded = true;
+            return Err(std::io::ErrorKind::FileTooLarge.into());
+        }
+        self.buffer.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod encode_report_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    #[test]
+    fn bounded_writer_accepts_exact_limit_and_rejects_one_more() {
+        let mut writer = Bounded::new(4);
+        assert!(writer.write_all(b"abcd").is_ok());
+        assert_eq!(writer.buffer, b"abcd");
+        assert!(!writer.exceeded);
+        assert!(writer.write_all(b"e").is_err());
+        assert!(writer.exceeded);
+        assert_eq!(writer.buffer, b"abcd");
+        let mut writer = Bounded::new(4);
+        assert!(writer.write_all(b"abcde").is_err());
+        assert!(writer.exceeded);
+        assert!(writer.buffer.is_empty());
+        assert_eq!(writer.buffer.capacity(), 4);
+    }
+
+    #[test]
+    fn reserved_bytes_charges_hardware_working_budget_and_result() {
+        assert_eq!(
+            RESERVED_BYTES,
+            server::RESERVED_BYTES
+                + server::JSON_CONTROL_SLOTS * uring_runtime::reactor::SUBMISSION_BYTES
+                + server::MAX_RESPONSE_BYTES
+                + crate::hardware::WORKING_BYTES
+                + HARDWARE_STACK_BYTES
+        );
+        assert_eq!(HARDWARE_STACK_BYTES, 2 * 1024 * 1024);
+        assert_eq!(
+            HARDWARE_BYTES,
+            server::MAX_RESPONSE_BYTES + crate::hardware::WORKING_BYTES + HARDWARE_STACK_BYTES
+        );
+        let report = crate::hardware::Report::default();
+        let body = encode_report(&report, server::MAX_BODY_BYTES).unwrap();
+        assert!(body.capacity() <= server::MAX_RESPONSE_BYTES);
+    }
+
+    #[test]
+    fn encode_report_matches_pretty_json_and_enforces_limit() {
+        let report = crate::hardware::Report {
+            errors: vec!["x".into()],
+            ..Default::default()
+        };
+        let expected = serde_json::to_string_pretty(&report).unwrap() + "\n";
+        assert_eq!(
+            encode_report(&report, expected.len()).as_deref(),
+            Ok(expected.as_str())
+        );
+        assert_eq!(
+            encode_report(&report, expected.len() - 1),
+            Err(Encode::TooLarge)
+        );
+        assert_eq!(encode_report(&report, 0), Err(Encode::TooLarge));
+    }
+}
+
 #[cfg(test)]
 mod warm_metric_tests {
     use super::*;
@@ -531,6 +871,51 @@ mod warm_metric_tests {
             (WarmEvent::WaitCompleted, "racer_warm_wait_completed_total"),
             (WarmEvent::WaitFallback, "racer_warm_wait_fallback_total"),
             (WarmEvent::WaitFailed, "racer_warm_wait_failed_total"),
+            (
+                WarmEvent::RemoteHoldAccepted,
+                "racer_warm_remote_hold_accepted_total",
+            ),
+            (
+                WarmEvent::RemoteHoldRefused,
+                "racer_warm_remote_hold_refused_total",
+            ),
+            (
+                WarmEvent::RemoteFillCompleted,
+                "racer_warm_remote_fill_completed_total",
+            ),
+            (
+                WarmEvent::RemoteFillRetried,
+                "racer_warm_remote_fill_retried_total",
+            ),
+            (
+                WarmEvent::RemoteFillFailed,
+                "racer_warm_remote_fill_failed_total",
+            ),
+            (
+                WarmEvent::RemoteReleaseSent,
+                "racer_warm_remote_release_sent_total",
+            ),
+            (
+                WarmEvent::RemoteReleaseFailed,
+                "racer_warm_remote_release_failed_total",
+            ),
+            (
+                WarmEvent::OwnerHoldAccepted,
+                "racer_warm_owner_hold_accepted_total",
+            ),
+            (
+                WarmEvent::OwnerHoldRefused,
+                "racer_warm_owner_hold_refused_total",
+            ),
+            (
+                WarmEvent::OwnerFillCompleted,
+                "racer_warm_owner_fill_completed_total",
+            ),
+            (
+                WarmEvent::OwnerFillFailed,
+                "racer_warm_owner_fill_failed_total",
+            ),
+            (WarmEvent::OwnerReleased, "racer_warm_owner_released_total"),
         ] {
             workers[0].warm_event(event);
             workers[1].warm_event(event);
@@ -646,6 +1031,34 @@ mod retention_metric_tests {
                 u64::MAX
             )));
         }
+    }
+
+    #[test]
+    fn cache_disk_usage_sums_workers_by_name_and_drops_removed_caches() {
+        let workers = Metrics::for_workers(2).unwrap();
+        let mut output = String::new();
+        workers[0].write_cache_disks(&mut output).unwrap();
+        assert!(output.is_empty());
+        let sample = |cache: &str, resident, share| CacheDiskUsage {
+            cache: cache.into(),
+            resident,
+            share,
+        };
+        workers[0].observe_cache_disks(vec![sample("models", 900, 800), sample("logs", 50, 200)]);
+        workers[1].observe_cache_disks(vec![sample("models", 100, 800), sample("x\"\n", 1, 2)]);
+        workers[1].write_prometheus(&mut output).unwrap();
+        assert!(output.contains("# TYPE racer_cache_disk_resident_bytes gauge\n"));
+        assert!(output.contains("# TYPE racer_cache_disk_share_bytes gauge\n"));
+        assert!(output.contains("racer_cache_disk_resident_bytes{cache=\"models\"} 1000\n"));
+        assert!(output.contains("racer_cache_disk_share_bytes{cache=\"models\"} 1600\n"));
+        assert!(output.contains("racer_cache_disk_resident_bytes{cache=\"logs\"} 50\n"));
+        assert!(output.contains("racer_cache_disk_share_bytes{cache=\"x\\\"\\n\"} 2\n"));
+        workers[0].observe_cache_disks(vec![sample("models", 0, 1000)]);
+        workers[1].observe_cache_disks(vec![]);
+        output.clear();
+        workers[0].write_cache_disks(&mut output).unwrap();
+        assert!(!output.contains("logs"));
+        assert!(output.contains("racer_cache_disk_share_bytes{cache=\"models\"} 1000\n"));
     }
 
     #[test]
@@ -2547,6 +2960,18 @@ pub enum WarmEvent {
     WaitCompleted,
     WaitFallback,
     WaitFailed,
+    RemoteHoldAccepted,
+    RemoteHoldRefused,
+    RemoteFillCompleted,
+    RemoteFillRetried,
+    RemoteFillFailed,
+    RemoteReleaseSent,
+    RemoteReleaseFailed,
+    OwnerHoldAccepted,
+    OwnerHoldRefused,
+    OwnerFillCompleted,
+    OwnerFillFailed,
+    OwnerReleased,
 }
 impl WarmEvent {
     fn event(self) -> Event {
@@ -2559,6 +2984,18 @@ impl WarmEvent {
             Self::WaitCompleted => Event::WarmWaitCompleted,
             Self::WaitFallback => Event::WarmWaitFallback,
             Self::WaitFailed => Event::WarmWaitFailed,
+            Self::RemoteHoldAccepted => Event::WarmRemoteHoldAccepted,
+            Self::RemoteHoldRefused => Event::WarmRemoteHoldRefused,
+            Self::RemoteFillCompleted => Event::WarmRemoteFillCompleted,
+            Self::RemoteFillRetried => Event::WarmRemoteFillRetried,
+            Self::RemoteFillFailed => Event::WarmRemoteFillFailed,
+            Self::RemoteReleaseSent => Event::WarmRemoteReleaseSent,
+            Self::RemoteReleaseFailed => Event::WarmRemoteReleaseFailed,
+            Self::OwnerHoldAccepted => Event::WarmOwnerHoldAccepted,
+            Self::OwnerHoldRefused => Event::WarmOwnerHoldRefused,
+            Self::OwnerFillCompleted => Event::WarmOwnerFillCompleted,
+            Self::OwnerFillFailed => Event::WarmOwnerFillFailed,
+            Self::OwnerReleased => Event::WarmOwnerReleased,
         }
     }
 }
@@ -2577,7 +3014,119 @@ pub struct Metrics {
 
     disks: ::telemetry::SnapshotShards<Vec<DiskUsage>>,
 
+    memory: Arc<MemoryShards>,
+    cache_disks: ::telemetry::SnapshotShards<Vec<CacheDiskUsage>>,
+
     shard: usize,
+}
+
+/// Memory telemetry shared by every worker's handle, behind one pointer.
+struct MemoryShards {
+    staging: ::telemetry::SnapshotShards<Option<(WorkerId, flow_control::PoolStats)>>,
+
+    // One node-wide slot written by the sampling worker.
+    process: ::telemetry::SnapshotShards<ProcessMemory>,
+}
+
+/// Process and cgroup memory signals from the most recent sample.
+/// Absent fields are omitted from the exposition.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct ProcessMemory {
+    pub resident: Option<u64>,
+    pub cgroup_current: Option<u64>,
+    pub cgroup_limit: Option<u64>,
+    pub pressure_some_avg10: Option<f64>,
+}
+
+impl From<&crate::pressure::MemorySample> for ProcessMemory {
+    fn from(sample: &crate::pressure::MemorySample) -> Self {
+        Self {
+            resident: sample.resident,
+            cgroup_current: sample.current,
+            cgroup_limit: sample.limit,
+            pressure_some_avg10: sample.some_avg10,
+        }
+    }
+}
+
+/// Snake-case `class` label values for every admission class, in index order.
+const ADMISSION_CLASSES: [(crate::admission::ResourceClass, &str); 15] = {
+    use crate::admission::ResourceClass as C;
+    [
+        (C::Plaintext, "plaintext"),
+        (C::Ciphertext, "ciphertext"),
+        (C::DirtyCiphertext, "dirty_ciphertext"),
+        (C::Registered, "registered"),
+        (C::RequestContext, "request_context"),
+        (C::Flight, "flight"),
+        (C::Waiter, "waiter"),
+        (C::Connection, "connection"),
+        (C::Pipe, "pipe"),
+        (C::ControlProgress, "control_progress"),
+        (C::Relay, "relay"),
+        (C::IngressConnection, "ingress_connection"),
+        (C::OutboundConnection, "outbound_connection"),
+        (C::ControlConnection, "control_connection"),
+        (
+            C::OrdinaryOutboundConnection,
+            "ordinary_outbound_connection",
+        ),
+    ]
+};
+
+/// Node-wide idle pool series: name suffix, Prometheus kind, and value.
+fn pool_series(stats: &flow_control::PoolStats) -> [(&'static str, &'static str, u64); 7] {
+    [
+        ("entries", "gauge", stats.entries as u64),
+        ("bytes", "gauge", stats.bytes as u64),
+        ("target", "gauge", stats.target as u64),
+        ("hits_total", "counter", stats.hits),
+        ("misses_total", "counter", stats.misses),
+        ("rejects_total", "counter", stats.rejects),
+        ("trimmed_total", "counter", stats.trimmed),
+    ]
+}
+
+/// Write node-wide sums as `racer_{family}_*` and only retained bytes per
+/// worker as `racer_worker_{family}_bytes{worker="N"}`. Per-worker breakdowns of
+/// every series would not fit the bounded diagnostic response on large nodes.
+fn write_pools(
+    out: &mut impl Write,
+    family: &str,
+    samples: &[(WorkerId, flow_control::PoolStats)],
+) -> std::fmt::Result {
+    if samples.is_empty() {
+        return Ok(());
+    }
+    let mut totals = [0u64; 7];
+    for (_, stats) in samples {
+        for (total, (_, _, value)) in totals.iter_mut().zip(pool_series(stats)) {
+            *total = total.saturating_add(value);
+        }
+    }
+    for ((suffix, kind, _), total) in pool_series(&Default::default()).into_iter().zip(totals) {
+        writeln!(
+            out,
+            "# TYPE racer_{family}_{suffix} {kind}\nracer_{family}_{suffix} {total}"
+        )?;
+    }
+    writeln!(out, "# TYPE racer_worker_{family}_bytes gauge")?;
+    for (worker, stats) in samples {
+        writeln!(
+            out,
+            "racer_worker_{family}_bytes{{worker=\"{}\"}} {}",
+            worker.0, stats.bytes
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+/// One worker's indexed payload and fair disk share for a published cache.
+pub(crate) struct CacheDiskUsage {
+    pub cache: Arc<str>,
+    pub resident: u64,
+    pub share: u64,
 }
 
 #[derive(Clone)]
@@ -2599,7 +3148,7 @@ fn write_disk_label(out: &mut impl Write, disk: &str) -> std::fmt::Result {
     }
     Ok(())
 }
-const RETENTION_METRICS: [(&str, &str); 9] = [
+const RETENTION_METRICS: [(&str, &str); 10] = [
     ("racer_retention_observations_total", "counter"),
     ("racer_retention_qualified_total", "counter"),
     ("racer_retention_persistence_attempts_total", "counter"),
@@ -2609,6 +3158,11 @@ const RETENTION_METRICS: [(&str, &str); 9] = [
     ("racer_retention_heat_entries", "gauge"),
     ("racer_disk_pending_payload_bytes", "gauge"),
     ("racer_disk_indexed_payload_bytes", "gauge"),
+    ("racer_retention_share_rejected_total", "counter"),
+];
+const CACHE_DISK_METRICS: [&str; 2] = [
+    "racer_cache_disk_resident_bytes",
+    "racer_cache_disk_share_bytes",
 ];
 const HELD_METRICS: [(&str, &str); 3] = [
     ("racer_warm_held_pages", "gauge"),
@@ -2643,6 +3197,18 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::WarmWaitCompleted => "racer_warm_wait_completed_total",
             Self::WarmWaitFallback => "racer_warm_wait_fallback_total",
             Self::WarmWaitFailed => "racer_warm_wait_failed_total",
+            Self::WarmRemoteHoldAccepted => "racer_warm_remote_hold_accepted_total",
+            Self::WarmRemoteHoldRefused => "racer_warm_remote_hold_refused_total",
+            Self::WarmRemoteFillCompleted => "racer_warm_remote_fill_completed_total",
+            Self::WarmRemoteFillRetried => "racer_warm_remote_fill_retried_total",
+            Self::WarmRemoteFillFailed => "racer_warm_remote_fill_failed_total",
+            Self::WarmRemoteReleaseSent => "racer_warm_remote_release_sent_total",
+            Self::WarmRemoteReleaseFailed => "racer_warm_remote_release_failed_total",
+            Self::WarmOwnerHoldAccepted => "racer_warm_owner_hold_accepted_total",
+            Self::WarmOwnerHoldRefused => "racer_warm_owner_hold_refused_total",
+            Self::WarmOwnerFillCompleted => "racer_warm_owner_fill_completed_total",
+            Self::WarmOwnerFillFailed => "racer_warm_owner_fill_failed_total",
+            Self::WarmOwnerReleased => "racer_warm_owner_released_total",
             Self::PeerReceiveAdmitted => "racer_peer_receive_admitted_total",
             Self::PeerReceiveFull => "racer_peer_receive_full_total",
             Self::PeerReceiveTimeout => "racer_peer_receive_timeout_total",
@@ -2667,6 +3233,8 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::OriginFill => "racer_origin_fills_total",
             Self::DirtyDiscard => "racer_dirty_discards_total",
             Self::DiskPublication => "racer_disk_publications_total",
+            Self::PersistZeroCopy => "racer_persist_zero_copy_total",
+            Self::PersistCopyFallback => "racer_persist_copy_fallback_total",
             Self::Overload => "racer_overloads_total",
             Self::CorruptMiss => "racer_corrupt_misses_total",
             Self::DiagnosticAccepted => "racer_diagnostic_accepted_total",
@@ -2736,6 +3304,50 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::CryptoDecryptFailureCorruptAead => "racer_crypto_decrypt_failure_corrupt_aead_total",
             Self::CryptoDecryptFailureCorruptUnclassified => "racer_crypto_decrypt_failure_corrupt_unclassified_total",
             Self::CryptoDecryptFailureOther => "racer_crypto_decrypt_failure_other_total",
+            Self::MemoryPressureTransitions => "racer_memory_pressure_transitions_total",
+            Self::AllocatorTrims => "racer_allocator_trims_total",
+            Self::RdmaPagesSent => "racer_rdma_pages_sent_total",
+            Self::RdmaSentBytes => "racer_rdma_sent_bytes_total",
+            Self::RdmaPagesReceived => "racer_rdma_pages_received_total",
+            Self::RdmaReceivedBytes => "racer_rdma_received_bytes_total",
+            Self::RdmaHttpFallback => "racer_rdma_http_fallback_total",
+            Self::RdmaGrantCount => "racer_rdma_grant_nanoseconds_count",
+            Self::RdmaGrantNs => "racer_rdma_grant_nanoseconds_sum",
+            Self::RdmaHeadCount => "racer_rdma_head_nanoseconds_count",
+            Self::RdmaHeadNs => "racer_rdma_head_nanoseconds_sum",
+            Self::RdmaArrivalCount => "racer_rdma_arrival_nanoseconds_count",
+            Self::RdmaArrivalNs => "racer_rdma_arrival_nanoseconds_sum",
+            Self::RdmaSendCount => "racer_rdma_send_nanoseconds_count",
+            Self::RdmaSendNs => "racer_rdma_send_nanoseconds_sum",
+            Self::RdmaServeCount => "racer_rdma_serve_nanoseconds_count",
+            Self::RdmaServeNs => "racer_rdma_serve_nanoseconds_sum",
+            Self::FillDriverStartCount => "racer_fill_driver_start_nanoseconds_count",
+            Self::FillDriverStartNs => "racer_fill_driver_start_nanoseconds_sum",
+            Self::FillDriverCount => "racer_fill_driver_nanoseconds_count",
+            Self::FillDriverNs => "racer_fill_driver_nanoseconds_sum",
+            Self::FillCandidatesCount => "racer_fill_candidates_nanoseconds_count",
+            Self::FillCandidatesNs => "racer_fill_candidates_nanoseconds_sum",
+            Self::FillPlaintextReclaimCount => "racer_fill_plaintext_reclaim_nanoseconds_count",
+            Self::FillPlaintextReclaimNs => "racer_fill_plaintext_reclaim_nanoseconds_sum",
+            Self::FillPeerResponseCount => "racer_fill_peer_response_nanoseconds_count",
+            Self::FillPeerResponseNs => "racer_fill_peer_response_nanoseconds_sum",
+            Self::FillPeerDecryptCount => "racer_fill_peer_decrypt_nanoseconds_count",
+            Self::FillPeerDecryptNs => "racer_fill_peer_decrypt_nanoseconds_sum",
+            Self::FillHedgeCount => "racer_fill_hedge_nanoseconds_count",
+            Self::FillHedgeNs => "racer_fill_hedge_nanoseconds_sum",
+            Self::FillPublishCount => "racer_fill_publish_nanoseconds_count",
+            Self::FillPublishNs => "racer_fill_publish_nanoseconds_sum",
+            Self::FillDecryptCount => "racer_fill_decrypt_nanoseconds_count",
+            Self::FillDecryptNs => "racer_fill_decrypt_nanoseconds_sum",
+            Self::FillDiskReadCount => "racer_fill_disk_read_nanoseconds_count",
+            Self::FillDiskReadNs => "racer_fill_disk_read_nanoseconds_sum",
+            Self::FillOriginCount => "racer_fill_origin_nanoseconds_count",
+            Self::FillOriginNs => "racer_fill_origin_nanoseconds_sum",
+            Self::FillEncryptCount => "racer_fill_encrypt_nanoseconds_count",
+            Self::FillEncryptNs => "racer_fill_encrypt_nanoseconds_sum",
+            Self::FillChecksumCount => "racer_fill_checksum_nanoseconds_count",
+            Self::FillChecksumNs => "racer_fill_checksum_nanoseconds_sum",
+            Self::DiagnosticHardware => "racer_diagnostic_hardware_total",
 }
 metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::WarmTrackedJobs => "racer_warm_tracked_jobs",
@@ -2755,6 +3367,7 @@ metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::SegmentTailBytes => "racer_segment_tail_bytes",
             Self::DiskPageEntries => "racer_disk_page_index_capacity",
             Self::CheckpointSequence => "racer_checkpoint_sequence",
+            Self::MemoryPressureLevel => "racer_memory_pressure_level",
 }
 /// One nonempty intermediate HTTP relay_body call, after sending its response head.
 /// Success credits the entire ciphertext body only after both HTTP finish checks.
@@ -2874,6 +3487,36 @@ impl Metrics {
         Ok(())
     }
 
+    /// Replace this worker's per-cache disk samples. Only published caches are
+    /// sampled, so a removed cache's series disappear on the next tick.
+    pub(crate) fn observe_cache_disks(&self, samples: Vec<CacheDiskUsage>) {
+        self.cache_disks.replace(self.shard, samples);
+    }
+
+    fn write_cache_disks(&self, out: &mut impl Write) -> std::fmt::Result {
+        let mut totals = std::collections::BTreeMap::<Arc<str>, (u64, u64)>::new();
+        for shard in self.cache_disks.snapshots() {
+            for sample in shard {
+                let total = totals.entry(sample.cache).or_default();
+                total.0 = total.0.saturating_add(sample.resident);
+                total.1 = total.1.saturating_add(sample.share);
+            }
+        }
+        if !totals.is_empty() {
+            for metric in CACHE_DISK_METRICS {
+                writeln!(out, "# TYPE {metric} gauge")?;
+            }
+        }
+        for (cache, (resident, share)) in totals {
+            for (metric, value) in CACHE_DISK_METRICS.into_iter().zip([resident, share]) {
+                write!(out, "{metric}{{cache=\"")?;
+                write_disk_label(out, &cache)?;
+                writeln!(out, "\"}} {value}")?;
+            }
+        }
+        Ok(())
+    }
+
     /// Sample on the owning worker's health tick, never on a request hot path.
     /// Diagnostics aggregate fixed-size copies without accessing worker-local Rc.
     pub(crate) fn observe_retention(&self, snapshot: crate::retention::Snapshot) {
@@ -2894,6 +3537,7 @@ impl Metrics {
                 snapshot.heat_entries as u64,
                 snapshot.pending_payload_bytes,
                 snapshot.indexed_payload_bytes,
+                snapshot.share_rejected,
             ]) {
                 *total = total.saturating_add(value);
             }
@@ -2923,6 +3567,73 @@ impl Metrics {
             completed: false,
         })
     }
+    /// Replace this worker's slab staging pool statistics from its health tick.
+    pub(crate) fn observe_staging_pool(&self, worker: WorkerId, stats: flow_control::PoolStats) {
+        self.memory
+            .staging
+            .replace(self.shard, Some((worker, stats)));
+    }
+
+    /// Replace the node-wide process and cgroup memory sample.
+    pub(crate) fn observe_memory(&self, memory: ProcessMemory) {
+        self.memory.process.replace(0, memory);
+    }
+
+    fn write_memory(&self, out: &mut impl Write) -> std::fmt::Result {
+        let Some(memory) = self.memory.process.snapshots().next() else {
+            return Ok(());
+        };
+        for (name, value) in [
+            ("racer_process_resident_bytes", memory.resident),
+            ("racer_cgroup_memory_current_bytes", memory.cgroup_current),
+            ("racer_cgroup_memory_limit_bytes", memory.cgroup_limit),
+        ] {
+            if let Some(value) = value {
+                writeln!(out, "# TYPE {name} gauge\n{name} {value}")?;
+            }
+        }
+        if let Some(avg10) = memory.pressure_some_avg10.filter(|v| v.is_finite()) {
+            let name = "racer_cgroup_memory_pressure_some_avg10";
+            writeln!(out, "# TYPE {name} gauge\n{name} {avg10}")?;
+        }
+        Ok(())
+    }
+
+    /// Write node-wide admission for every class, plus recycler and staging pools.
+    fn write_worker_pools(&self, out: &mut impl Write) -> std::fmt::Result {
+        let installed: Vec<_> = self
+            .admission
+            .iter()
+            .filter_map(|shard| shard.get())
+            .collect();
+        if !installed.is_empty() {
+            for (name, used) in [
+                ("racer_admission_used", true),
+                ("racer_admission_limit", false),
+            ] {
+                writeln!(out, "# TYPE {name} gauge")?;
+                for (class, label) in ADMISSION_CLASSES {
+                    let total = installed.iter().fold(0u64, |total, (_, usage)| {
+                        let value = if used {
+                            usage.used(class)
+                        } else {
+                            usage.limit(class)
+                        };
+                        total.saturating_add(value as u64)
+                    });
+                    writeln!(out, "{name}{{class=\"{label}\"}} {total}")?;
+                }
+            }
+        }
+        let recycler: Vec<_> = installed
+            .iter()
+            .map(|(worker, usage)| (*worker, usage.buffer_pool_stats()))
+            .collect();
+        write_pools(out, "recycler", &recycler)?;
+        let staging: Vec<_> = self.memory.staging.snapshots().flatten().collect();
+        write_pools(out, "staging_pool", &staging)
+    }
+
     /// Install once during worker assembly, not on the admission hot path.
     pub(crate) fn observe_admission(
         &self,
@@ -2979,6 +3690,11 @@ impl Metrics {
         let retention = ::telemetry::SnapshotShards::new(count);
         let held = ::telemetry::SnapshotShards::new(count);
         let disks = ::telemetry::SnapshotShards::new(count);
+        let memory = Arc::new(MemoryShards {
+            staging: ::telemetry::SnapshotShards::new(count),
+            process: ::telemetry::SnapshotShards::new(1),
+        });
+        let cache_disks = ::telemetry::SnapshotShards::new(count);
         Ok(::telemetry::Metrics::shards(count)
             .into_iter()
             .enumerate()
@@ -2988,6 +3704,8 @@ impl Metrics {
                 retention: retention.clone(),
                 held: held.clone(),
                 disks: disks.clone(),
+                memory: memory.clone(),
+                cache_disks: cache_disks.clone(),
                 shard,
             })
             .collect())
@@ -3006,6 +3724,12 @@ impl Metrics {
     /// Saturate instead of wrapping a long-lived Prometheus counter.
     pub fn record(&self, event: Event, amount: u64) {
         self.core.add(event, amount);
+    }
+    /// Add one observation of the time since `start` to a count and nanosecond sum pair.
+    pub fn record_duration(&self, count: Event, sum: Event, start: std::time::Instant) {
+        let elapsed = uring_runtime::environment::now().saturating_duration_since(start);
+        self.record(sum, u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
+        self.record(count, 1);
     }
     pub(crate) fn writer_shard(&self) -> usize {
         self.shard
@@ -3042,6 +3766,9 @@ impl Metrics {
         self.write_retention(out)?;
         self.write_held(out)?;
         self.write_disks(out)?;
+        self.write_memory(out)?;
+        self.write_worker_pools(out)?;
+        self.write_cache_disks(out)?;
         // Quota labels use runtime worker IDs. Read the authority's actual charge,
         // including pooled ciphertext capacity, without sampling on worker polls.
         // A stalled worker therefore remains observable from another worker.
@@ -3216,6 +3943,356 @@ pub(crate) mod tests {
             assert!(!text.contains("synthetic"));
             finish(server, &scope, &reactor);
             text
+        }
+
+        /// A standalone hardware charge for sessions started without a server.
+        fn test_charge() -> HardwareCharge {
+            let admission = flow_control::Quotas::new(AdmissionPolicy::new(
+                crate::test_support::cluster::config(false).limits,
+            ));
+            Arc::new(
+                admission
+                    .reserve(None, ResourceClass::RequestContext, HARDWARE_BYTES)
+                    .unwrap(),
+            )
+        }
+
+        /// Exchange one GET without asserting the status.
+        fn diagnostic_response(telemetry: &Telemetry, path: &str) -> String {
+            let (_, reactor, io) = setup();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let scope = scope();
+            let mut server = telemetry.serve_listener_with_io(listener, io, &scope);
+            let request = format!("GET {path} HTTP/1.1\r\nHost: local\r\n\r\n");
+            let bytes = exchange_raw(address, request.as_bytes(), &mut server, &reactor);
+            finish(server, &scope, &reactor);
+            String::from_utf8(bytes).unwrap()
+        }
+
+        fn hardware_counter(telemetry: &Telemetry) -> bool {
+            let mut text = String::new();
+            telemetry.metrics.write_prometheus(&mut text).unwrap();
+            text.lines()
+                .any(|line| line == "racer_diagnostic_hardware_total 1")
+        }
+
+        /// Install a hardware job builder returning `report` from the helper thread.
+        fn set_hardware(telemetry: &Telemetry, report: fn() -> crate::hardware::Report) {
+            assert!(
+                telemetry
+                    .hardware
+                    .set(Rc::new(move || -> HardwareJob {
+                        Box::new(move |_| Ok(report()))
+                    }))
+                    .is_ok()
+            );
+        }
+
+        #[test]
+        fn hardware_endpoint_serves_json_and_counts_requests() {
+            let telemetry = Telemetry::default();
+            set_hardware(&telemetry, || crate::hardware::Report {
+                errors: vec!["rdma_devices: example".into()],
+                ..Default::default()
+            });
+            // `Telemetry::default()` has pprof disabled; hardware still works.
+            assert!(telemetry.profiling.is_none());
+            let text = diagnostic_text(&telemetry, "/debug/hardware");
+            let (head, body) = text.split_once("\r\n\r\n").unwrap();
+            assert!(head.contains("\r\nContent-Type: application/json\r\n"));
+            assert!(!head.contains("Content-Disposition"));
+            assert!(body.ends_with("}\n"));
+            let value: serde_json::Value = serde_json::from_str(body).unwrap();
+            for key in ["block_devices", "rdma_devices", "racer", "errors"] {
+                assert!(value.get(key).is_some(), "{key}");
+            }
+            assert_eq!(value["errors"][0], "rdma_devices: example");
+            assert!(hardware_counter(&telemetry));
+            // The finished helper released the single-flight slot.
+            assert_eq!(telemetry.hardware_active.borrow().strong_count(), 0);
+        }
+
+        #[test]
+        fn hardware_endpoint_unavailable_oversize_and_exact_path() {
+            let telemetry = Telemetry::default();
+            let text = diagnostic_response(&telemetry, "/debug/hardware");
+            assert_response(
+                text.as_bytes(),
+                "503 Service Unavailable",
+                Some("unavailable\n"),
+            );
+            assert!(hardware_counter(&telemetry));
+            let text = diagnostic_response(&telemetry, "/debug/hardware?x");
+            assert_response(text.as_bytes(), "404 Not Found", Some("not found\n"));
+            let text = diagnostic_response(&telemetry, "/debug/hardware/");
+            assert_response(text.as_bytes(), "404 Not Found", Some("not found\n"));
+            set_hardware(&telemetry, || crate::hardware::Report {
+                errors: vec!["x".repeat(::telemetry::server::MAX_BODY_BYTES)],
+                ..Default::default()
+            });
+            let text = diagnostic_response(&telemetry, "/debug/hardware");
+            assert_response(
+                text.as_bytes(),
+                "503 Service Unavailable",
+                Some("response_too_large\n"),
+            );
+        }
+
+        #[test]
+        fn hardware_budget_exhaustion_is_response_too_large() {
+            let telemetry = Telemetry::default();
+            assert!(
+                telemetry
+                    .hardware
+                    .set(Rc::new(|| -> HardwareJob {
+                        Box::new(|walk| {
+                            // The helper's walk carries exactly the fixed budget.
+                            assert_eq!(walk.remaining(), crate::hardware::WORKING_BYTES);
+                            walk.charge(crate::hardware::WORKING_BYTES + 1)?;
+                            Ok(crate::hardware::Report::default())
+                        })
+                    }))
+                    .is_ok()
+            );
+            let text = diagnostic_response(&telemetry, "/debug/hardware");
+            assert_response(
+                text.as_bytes(),
+                "503 Service Unavailable",
+                Some("response_too_large\n"),
+            );
+        }
+
+        #[test]
+        fn hardware_cancel_reaches_the_running_walk() {
+            use ::telemetry::server::BinarySession;
+            use std::sync::mpsc;
+            let (started, running) = mpsc::channel::<()>();
+            let (observed, seen) = mpsc::channel::<crate::hardware::Abort>();
+            let job: HardwareJob = Box::new(move |walk| {
+                let _ = started.send(());
+                let until = Instant::now() + Duration::from_secs(5);
+                let abort = loop {
+                    if let Err(abort) = walk.check() {
+                        break abort;
+                    }
+                    assert!(Instant::now() < until, "cancel never reached the walk");
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                let _ = observed.send(abort);
+                Err(abort)
+            });
+            let session =
+                HardwareSession::start(job, ::telemetry::server::MAX_BODY_BYTES, test_charge())
+                    .unwrap();
+            running.recv_timeout(Duration::from_secs(5)).unwrap();
+            session.cancel();
+            assert_eq!(
+                seen.recv_timeout(Duration::from_secs(5)).unwrap(),
+                crate::hardware::Abort::Cancelled
+            );
+            assert!(session.result().is_none(), "cancelled result is discarded");
+        }
+
+        #[test]
+        fn hardware_helper_panic_is_unavailable_and_releases_slot() {
+            let telemetry = Telemetry::default();
+            set_hardware(&telemetry, || panic!("synthetic discovery failure"));
+            for _ in 0..2 {
+                let text = diagnostic_response(&telemetry, "/debug/hardware");
+                assert_response(
+                    text.as_bytes(),
+                    "503 Service Unavailable",
+                    Some("unavailable\n"),
+                );
+            }
+        }
+
+        #[test]
+        fn hardware_discovery_runs_off_worker_and_is_single_flight() {
+            use std::sync::mpsc;
+            let telemetry = Telemetry::default();
+            let (release, gate) = mpsc::channel::<()>();
+            let gate = Arc::new(Mutex::new(gate));
+            let job_gate = gate.clone();
+            assert!(
+                telemetry
+                    .hardware
+                    .set(Rc::new(move || -> HardwareJob {
+                        let gate = job_gate.clone();
+                        Box::new(move |_| {
+                            // Simulate a slow sysfs read until the test releases it.
+                            let _ = gate.lock().unwrap().recv();
+                            Ok(crate::hardware::Report::default())
+                        })
+                    }))
+                    .is_ok()
+            );
+            let (_, reactor, io) = setup();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let scope = scope();
+            let mut server = telemetry.serve_listener_with_io(listener, io, &scope);
+            let mut slow = TcpStream::connect(address).unwrap();
+            slow.write_all(b"GET /debug/hardware HTTP/1.1\r\nHost: local\r\n\r\n")
+                .unwrap();
+            slow.set_nonblocking(true).unwrap();
+            let until = Instant::now() + Duration::from_secs(5);
+            while telemetry.hardware_active.borrow().strong_count() == 0 {
+                assert!(Instant::now() < until);
+                poll_server(&mut server, &reactor);
+            }
+            // The worker keeps serving health checks while discovery is blocked.
+            let bytes = exchange_raw(
+                address,
+                b"GET /healthz HTTP/1.1\r\nHost: local\r\n\r\n",
+                &mut server,
+                &reactor,
+            );
+            assert_response(&bytes, "200 OK", None);
+            // A concurrent discovery is refused rather than starting a second helper.
+            let bytes = exchange_raw(
+                address,
+                b"GET /debug/hardware HTTP/1.1\r\nHost: local\r\n\r\n",
+                &mut server,
+                &reactor,
+            );
+            assert_response(&bytes, "409 Conflict", Some("busy\n"));
+            release.send(()).unwrap();
+            let mut response = Vec::new();
+            loop {
+                assert!(Instant::now() < until, "hardware response stalled");
+                poll_server(&mut server, &reactor);
+                let mut bytes = [0; 512];
+                match slow.read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(count) => response.extend_from_slice(&bytes[..count]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => (),
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            assert_response(&response, "200 OK", None);
+            assert!(
+                std::str::from_utf8(&response)
+                    .unwrap()
+                    .contains("\r\nContent-Type: application/json\r\n")
+            );
+            finish(server, &scope, &reactor);
+            assert_eq!(telemetry.hardware_active.borrow().strong_count(), 0);
+        }
+
+        #[test]
+        fn hardware_cancelled_helper_finishes_detached_and_stays_busy_until_done() {
+            use std::sync::mpsc;
+            let (release, gate) = mpsc::channel::<()>();
+            let (done, finished) = mpsc::channel::<()>();
+            let job: HardwareJob = Box::new(move |_| {
+                let _ = gate.recv();
+                let _ = done.send(());
+                Ok(crate::hardware::Report::default())
+            });
+            let session =
+                HardwareSession::start(job, ::telemetry::server::MAX_BODY_BYTES, test_charge())
+                    .unwrap();
+            let weak = Arc::downgrade(&session.state);
+            // Dropping the session cancels without joining the blocked helper.
+            drop(session);
+            assert!(weak.strong_count() > 0, "helper still owns its state");
+            release.send(()).unwrap();
+            finished.recv_timeout(Duration::from_secs(5)).unwrap();
+            let until = Instant::now() + Duration::from_secs(5);
+            while weak.strong_count() > 0 {
+                assert!(Instant::now() < until);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        #[test]
+        fn hardware_charge_outlives_teardown_until_blocked_helper_finishes() {
+            use std::sync::mpsc;
+            let telemetry = Telemetry::default();
+            let (release, gate) = mpsc::channel::<()>();
+            let gate = Arc::new(Mutex::new(gate));
+            let job_gate = gate.clone();
+            assert!(
+                telemetry
+                    .hardware
+                    .set(Rc::new(move || -> HardwareJob {
+                        let gate = job_gate.clone();
+                        Box::new(move |_| {
+                            // A sysfs read that stays blocked across teardown.
+                            let _ = gate.lock().unwrap().recv();
+                            Ok(crate::hardware::Report::default())
+                        })
+                    }))
+                    .is_ok()
+            );
+            let (admission, reactor, io) = setup();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let scope = scope();
+            let mut server = telemetry.serve_listener_with_io(listener, io, &scope);
+            let mut slow = TcpStream::connect(address).unwrap();
+            slow.write_all(b"GET /debug/hardware HTTP/1.1\r\nHost: local\r\n\r\n")
+                .unwrap();
+            let until = Instant::now() + Duration::from_secs(5);
+            while telemetry.hardware_active.borrow().strong_count() == 0 {
+                assert!(Instant::now() < until);
+                poll_server(&mut server, &reactor);
+            }
+            // Tear down the session, the server, and the diagnostics owner while
+            // the helper is still blocked.
+            finish(server, &scope, &reactor);
+            drop(slow);
+            drop(reactor);
+            let class = ResourceClass::RequestContext;
+            assert!(
+                admission.used(class) >= HARDWARE_BYTES,
+                "blocked helper keeps its hardware charge after teardown"
+            );
+            assert!(
+                telemetry.hardware_active.borrow().strong_count() > 0,
+                "a later request stays busy while the charge is held"
+            );
+            release.send(()).unwrap();
+            while telemetry.hardware_active.borrow().strong_count() > 0 {
+                assert!(Instant::now() < until, "helper never finished");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(admission.used(class), 0, "helper returns the charge");
+        }
+
+        #[test]
+        fn hardware_session_publishes_then_signals() {
+            use ::telemetry::server::BinarySession;
+            let job: HardwareJob = Box::new(|_| Ok(crate::hardware::Report::default()));
+            let session =
+                HardwareSession::start(job, ::telemetry::server::MAX_BODY_BYTES, test_charge())
+                    .unwrap();
+            let fd = session.state.completion.try_clone().unwrap();
+            let mut poll = libc::pollfd {
+                fd: std::os::fd::AsRawFd::as_raw_fd(&fd),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd for the duration of the call.
+            assert_eq!(unsafe { libc::poll(&mut poll, 1, 5000) }, 1);
+            let body = session.result().unwrap().unwrap();
+            let expected =
+                serde_json::to_string_pretty(&crate::hardware::Report::default()).unwrap() + "\n";
+            assert_eq!(body, expected.as_bytes());
+            assert!(session.result().is_none(), "result is taken once");
+            let tiny: HardwareJob = Box::new(|_| Ok(crate::hardware::Report::default()));
+            let session = HardwareSession::start(tiny, 1, test_charge()).unwrap();
+            // SAFETY: one valid pollfd for the duration of the call.
+            poll.fd = std::os::fd::AsRawFd::as_raw_fd(&session.state.completion);
+            assert_eq!(unsafe { libc::poll(&mut poll, 1, 5000) }, 1);
+            assert_eq!(
+                session.result(),
+                Some(Err(::telemetry::server::BinaryError::Unavailable(
+                    "response_too_large"
+                )))
+            );
         }
 
         #[test]
@@ -3872,11 +4949,26 @@ pub(crate) mod tests {
                     metrics
                         .observe_admission(WorkerId(u16::MAX - index as u16), admission.shared())
                         .unwrap();
+                    metrics.observe_staging_pool(
+                        WorkerId(u16::MAX - index as u16),
+                        flow_control::PoolStats {
+                            entries: usize::MAX,
+                            bytes: usize::MAX,
+                            target: usize::MAX,
+                            max_depth: usize::MAX,
+                            hits: u64::MAX,
+                            misses: u64::MAX,
+                            rejects: u64::MAX,
+                            trimmed: u64::MAX,
+                            constrained: true,
+                        },
+                    );
                     metrics.observe_retention(crate::retention::Snapshot {
                         observations: u64::MAX,
                         qualified: u64::MAX,
                         persistence_attempts: u64::MAX,
                         persistence_accepted: u64::MAX,
+                        share_rejected: u64::MAX,
                         filter_set_bits: usize::MAX,
                         filter_bits: usize::MAX,
                         heat_entries: usize::MAX,
@@ -3920,7 +5012,21 @@ pub(crate) mod tests {
             for event in crate::telemetry::EVENTS {
                 telemetry.metrics.record(event, u64::MAX);
             }
+            telemetry.metrics.observe_memory(ProcessMemory {
+                resident: Some(u64::MAX),
+                cgroup_current: Some(u64::MAX),
+                cgroup_limit: Some(u64::MAX),
+                pressure_some_avg10: Some(100.0),
+            });
             let text = diagnostic_text(&telemetry, "/metrics");
+            for name in [
+                "racer_admission_used{class=\"ordinary_outbound_connection\"}",
+                "racer_staging_pool_trimmed_total ",
+                "racer_worker_staging_pool_bytes{worker=\"65535\"}",
+                "racer_cgroup_memory_pressure_some_avg10 100\n",
+            ] {
+                assert!(text.contains(name), "{name}");
+            }
             assert!(text.len() < MAX_RESPONSE_BYTES);
             for (name, kind) in crate::telemetry::RETENTION_METRICS
                 .into_iter()
@@ -3961,7 +5067,7 @@ pub(crate) mod tests {
                 text.lines()
                     .filter(|line| line.contains("{worker="))
                     .count(),
-                4 * 64
+                6 * 64
             );
             struct Small(usize);
             impl std::fmt::Write for Small {
@@ -4080,6 +5186,7 @@ pub(crate) mod tests {
                     profiling: enabled.then(|| crate::profiling::ProfilingController::new(true)),
                     ..Telemetry::default()
                 };
+                set_hardware(&telemetry, crate::hardware::Report::default);
                 reactor.init().unwrap();
                 let baseline = admission.used(ResourceClass::RequestContext);
                 telemetry
@@ -4149,6 +5256,19 @@ pub(crate) mod tests {
                     );
                     assert_response(&response, status, None);
                 }
+                // The hardware producer is attached whether or not pprof is.
+                let response = exchange_raw(
+                    address,
+                    b"GET /debug/hardware HTTP/1.1\r\nHost: local\r\n\r\n",
+                    &mut serving,
+                    &reactor,
+                );
+                assert_response(&response, "200 OK", None);
+                assert!(
+                    std::str::from_utf8(&response)
+                        .unwrap()
+                        .contains("\r\nContent-Type: application/json\r\n")
+                );
                 admission.stop();
                 let response = exchange_raw(
                     address,
@@ -4897,16 +6017,32 @@ pub(crate) mod tests {
             std::thread::spawn(move || drop((relay, ciphertext)))
                 .join()
                 .unwrap();
+            // Recycler stats come from the live authority and reset once it exits;
+            // quota charges must still match the idle scrape.
+            let quotas = |text: &str| {
+                text.lines()
+                    .filter(|line| !line.contains("recycler_"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
             assert_eq!(
-                scrape(),
-                idle,
+                quotas(&scrape()),
+                quotas(&idle),
                 "final release remains visible after owner exit"
             );
             assert_eq!(
                 idle.lines()
-                    .filter(|line| line.contains("{worker="))
+                    .filter(|line| line.starts_with("racer_worker_relay_")
+                        || line.starts_with("racer_worker_ciphertext_"))
                     .count(),
                 8
+            );
+            // Four compatibility series and retained recycler bytes per worker.
+            assert_eq!(
+                idle.lines()
+                    .filter(|line| line.contains("{worker="))
+                    .count(),
+                2 * (4 + 1)
             );
             assert!(!idle.contains("request="));
         }
@@ -4933,6 +6069,171 @@ pub(crate) mod tests {
             output.clear();
             metrics.write_prometheus(&mut output).unwrap();
             assert!(output.contains("racer_worker_ciphertext_used_bytes{worker=\"0\"} 0\n"));
+        }
+
+        #[test]
+        fn admission_classes_cover_every_class_in_index_order() {
+            use flow_control::Class;
+            assert_eq!(ADMISSION_CLASSES.len(), ResourceClass::COUNT);
+            for (index, (class, label)) in ADMISSION_CLASSES.iter().enumerate() {
+                assert_eq!(class.index(), index);
+                assert!(label.chars().all(|c| c.is_ascii_lowercase() || c == '_'));
+            }
+        }
+
+        #[test]
+        fn admission_and_pool_series_sum_workers_and_label_retained_bytes() {
+            let metrics = Metrics::for_workers(2).unwrap();
+            let mut output = String::new();
+            metrics[0].write_prometheus(&mut output).unwrap();
+            // Nothing installed: no admission, pool, or process memory series.
+            for absent in [
+                "racer_admission_used",
+                "racer_recycler_entries",
+                "racer_staging_pool_entries",
+                "racer_process_resident_bytes",
+            ] {
+                assert!(!output.contains(absent), "{absent}");
+            }
+            let quotas: Vec<_> = (0..2)
+                .map(|_| {
+                    flow_control::Quotas::new(AdmissionPolicy::new(
+                        crate::test_support::cluster::config(false).limits,
+                    ))
+                })
+                .collect();
+            for (index, (metrics, admission)) in metrics.iter().zip(&quotas).enumerate() {
+                metrics
+                    .observe_admission(WorkerId(3 + index as u16), admission.shared())
+                    .unwrap();
+            }
+            let mut reservation = quotas[0]
+                .reserve(None, ResourceClass::Ciphertext, 1 << 20)
+                .unwrap();
+            let bytes = reservation.buffer(1 << 20).unwrap();
+            reservation.recycle(bytes);
+            drop(reservation);
+            let _relay = quotas[1].reserve(None, ResourceClass::Relay, 1).unwrap();
+            let recycler = quotas[0].buffer_pool_stats();
+            assert!(recycler.bytes >= 1 << 20, "recycled buffer is retained");
+            let staging = |entries, bytes, counter| flow_control::PoolStats {
+                entries,
+                bytes,
+                target: 3,
+                max_depth: 8,
+                hits: counter,
+                misses: counter + 1,
+                rejects: counter + 2,
+                trimmed: counter + 3,
+                constrained: false,
+            };
+            metrics[0].observe_staging_pool(WorkerId(3), staging(2, 4096, 5));
+            metrics[1].observe_staging_pool(WorkerId(4), staging(1, 1024, 10));
+            output.clear();
+            metrics[1].write_prometheus(&mut output).unwrap();
+            let sum = |class| quotas.iter().map(|q| q.limit(class)).sum::<usize>();
+            let ciphertext_used = quotas[0].used(ResourceClass::Ciphertext);
+            for expected in [
+                "# TYPE racer_admission_used gauge\n".to_string(),
+                "# TYPE racer_admission_limit gauge\n".to_string(),
+                format!("racer_admission_used{{class=\"ciphertext\"}} {ciphertext_used}\n"),
+                "racer_admission_used{class=\"relay\"} 1\n".to_string(),
+                "racer_admission_used{class=\"plaintext\"} 0\n".to_string(),
+                format!(
+                    "racer_admission_limit{{class=\"relay\"}} {}\n",
+                    sum(ResourceClass::Relay)
+                ),
+                format!(
+                    "racer_admission_limit{{class=\"plaintext\"}} {}\n",
+                    sum(ResourceClass::Plaintext)
+                ),
+                format!("racer_recycler_entries {}\n", recycler.entries),
+                format!("racer_recycler_bytes {}\n", recycler.bytes),
+                "# TYPE racer_recycler_hits_total counter\n".to_string(),
+                format!(
+                    "racer_worker_recycler_bytes{{worker=\"3\"}} {}\n",
+                    recycler.bytes
+                ),
+                "racer_worker_recycler_bytes{worker=\"4\"} 0\n".to_string(),
+                "# TYPE racer_staging_pool_entries gauge\nracer_staging_pool_entries 3\n"
+                    .to_string(),
+                "racer_staging_pool_bytes 5120\n".to_string(),
+                "racer_staging_pool_target 6\n".to_string(),
+                "# TYPE racer_staging_pool_hits_total counter\nracer_staging_pool_hits_total 15\n"
+                    .to_string(),
+                "racer_staging_pool_misses_total 17\n".to_string(),
+                "racer_staging_pool_rejects_total 19\n".to_string(),
+                "racer_staging_pool_trimmed_total 21\n".to_string(),
+                "# TYPE racer_worker_staging_pool_bytes gauge\n".to_string(),
+                "racer_worker_staging_pool_bytes{worker=\"3\"} 4096\n".to_string(),
+                "racer_worker_staging_pool_bytes{worker=\"4\"} 1024\n".to_string(),
+                // Compatibility series remain per worker.
+                "racer_worker_relay_used{worker=\"4\"} 1\n".to_string(),
+            ] {
+                assert!(
+                    output.contains(&expected),
+                    "missing {expected:?} in {output}"
+                );
+            }
+            assert_eq!(
+                output
+                    .lines()
+                    .filter(|l| l.starts_with("racer_admission_used{"))
+                    .count(),
+                <ResourceClass as flow_control::Class>::COUNT
+            );
+            // Each TYPE line appears exactly once.
+            let types: Vec<_> = output
+                .lines()
+                .filter(|l| l.starts_with("# TYPE "))
+                .collect();
+            let unique: std::collections::BTreeSet<_> = types.iter().collect();
+            assert_eq!(types.len(), unique.len());
+        }
+
+        #[test]
+        fn process_memory_series_omit_absent_signals() {
+            let metrics = Metrics::default();
+            metrics.observe_memory(ProcessMemory {
+                resident: Some(4096),
+                ..Default::default()
+            });
+            let mut output = String::new();
+            metrics.write_prometheus(&mut output).unwrap();
+            assert!(output.contains(
+                "# TYPE racer_process_resident_bytes gauge\nracer_process_resident_bytes 4096\n"
+            ));
+            assert!(!output.contains("racer_cgroup_memory"));
+            metrics.observe_memory(ProcessMemory {
+                resident: Some(1),
+                cgroup_current: Some(800),
+                cgroup_limit: Some(1000),
+                pressure_some_avg10: Some(12.5),
+            });
+            metrics.set_gauge(Gauge::MemoryPressureLevel, 2);
+            metrics.record(Event::MemoryPressureTransitions, 3);
+            metrics.record(Event::AllocatorTrims, 1);
+            output.clear();
+            metrics.write_prometheus(&mut output).unwrap();
+            for expected in [
+                "racer_cgroup_memory_current_bytes 800\n",
+                "racer_cgroup_memory_limit_bytes 1000\n",
+                "racer_cgroup_memory_pressure_some_avg10 12.5\n",
+                "# TYPE racer_memory_pressure_level gauge\nracer_memory_pressure_level 2\n",
+                "# TYPE racer_memory_pressure_transitions_total counter\nracer_memory_pressure_transitions_total 3\n",
+                "# TYPE racer_allocator_trims_total counter\nracer_allocator_trims_total 1\n",
+            ] {
+                assert!(output.contains(expected), "missing {expected:?}");
+            }
+            // Non-finite PSI is not exported.
+            metrics.observe_memory(ProcessMemory {
+                pressure_some_avg10: Some(f64::NAN),
+                ..Default::default()
+            });
+            output.clear();
+            metrics.write_prometheus(&mut output).unwrap();
+            assert!(!output.contains("racer_cgroup_memory_pressure_some_avg10"));
+            assert!(!output.contains("racer_process_resident_bytes"));
         }
 
         #[test]

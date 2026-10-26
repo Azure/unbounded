@@ -168,6 +168,9 @@ func TestCacheChanges(t *testing.T) {
 		{"labels", func(c *racerv1.ClusterCache) { c.Labels = map[string]string{"test": "value"} }, false},
 		{"uid", func(c *racerv1.ClusterCache) { c.UID = testOtherUID }, true},
 		{"name", func(c *racerv1.ClusterCache) { c.Name = "other" }, true},
+		{"priority set", func(c *racerv1.ClusterCache) { c.Spec.Priority = ptr.To[int32](900) }, true},
+		{"priority zero", func(c *racerv1.ClusterCache) { c.Spec.Priority = ptr.To[int32](0) }, true},
+		{"priority set to default", func(c *racerv1.ClusterCache) { c.Spec.Priority = ptr.To(racerv1.DefaultPriority) }, false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			updated := cache.DeepCopy()
@@ -177,6 +180,12 @@ func TestCacheChanges(t *testing.T) {
 	}
 
 	require.True(t, p.Update(event.UpdateEvent{ObjectOld: &corev1.Node{}, ObjectNew: &cache}))
+
+	prioritized := cache.DeepCopy()
+	prioritized.Spec.Priority = ptr.To[int32](100)
+	cleared := prioritized.DeepCopy()
+	cleared.Spec.Priority = nil
+	require.True(t, p.Update(event.UpdateEvent{ObjectOld: prioritized, ObjectNew: cleared}))
 }
 
 func TestReplicationValidation(t *testing.T) {

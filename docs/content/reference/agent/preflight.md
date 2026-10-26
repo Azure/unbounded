@@ -146,6 +146,12 @@ printed. For example, invalid JSON, missing required config fields, invalid
 bootstrap authentication, unsupported download settings, or an unresolvable
 rootfs goal state can stop the command before check output is produced.
 
+NVIDIA discovery for preflight is diagnostic-only: it does not initialize GPU
+devices or require driver readiness during goal resolution. Driver failures are
+reported by the named `nvidia-driver` check, including in JSON output, and support
+`--ignore-preflight-errors=nvidia-driver`. Bootstrap still enforces readiness
+independently before provisioning; ignoring preflight errors does not bypass it.
+
 ## Current Checks
 
 After config loading and goal resolution succeed, the current preflight check
@@ -176,8 +182,14 @@ The `nvidia-driver` check can return multiple results with different targets:
 | `NVIDIA kernel modules` | Error or warning | Required modules are loaded: `nvidia`, `nvidia_modeset`, `nvidia_uvm`, and `nvidia_drm`. Missing modules are errors. An unknown module version is a warning. |
 | `NVIDIA device nodes` | Error or warning | Required device nodes exist, including `/dev/nvidiactl`, `/dev/nvidia-uvm`, and at least one `/dev/nvidia<N>` GPU node. Missing required nodes are errors. Missing UVM tools, capability, or DRI render nodes are warnings. |
 | `NVIDIA driver libraries` | Error | `ldconfig` can discover required host driver libraries for the host architecture, including `libcuda.so.1` and `libnvidia-ml.so.1`. |
-| `NVIDIA diagnostic tooling` | Error or warning | `nvidia-smi -L` can query GPUs. Missing `nvidia-smi` is a warning. A failed or empty query is an error. |
+| `NVIDIA diagnostic tooling` | Error | `nvidia-smi -L` successfully enumerates at least one GPU. Missing tooling, no-device messages (even with exit status zero), empty or unexpected output, command failures, and timeouts are errors. |
 | `NVIDIA persistence service` | Warning | `nvidia-persistence-mode.service` is installed and active when systemd is available. |
+
+Bootstrap also validates GPU enumeration during host discovery, before worker
+provisioning, even when the preflight command is bypassed or its errors are
+ignored. NVIDIA hosts with an unavailable driver fail rather than silently
+joining as CPU-only nodes. Correct the host driver initialization problem and
+verify that `nvidia-smi -L` lists GPUs before retrying bootstrap.
 
 ### Cluster API Check
 

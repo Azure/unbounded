@@ -667,6 +667,7 @@ pub(super) fn definition() -> racer_control_wire::CacheDefinition {
         name: "app-lifecycle".into(),
         client_socket,
         origin_socket,
+        priority: racer_control_wire::DEFAULT_PRIORITY,
     }
 }
 
@@ -1467,11 +1468,16 @@ fn composes_http_and_optional_rdma_without_operational_side_effects() {
             ..NodeState::default()
         };
         let node = Arc::new(state);
+        if enable_rdma {
+            node.native
+                .prepare(std::iter::once(WorkerId(0)), &config.limits)
+                .unwrap();
+        }
         let mut worker =
             WorkerApplication::assemble(&config, node.clone(), WorkerId(0), runtime, Vec::new())
                 .expect("valid side-effect-free worker composition");
         assert!(worker.control.is_some());
-        assert_eq!(worker.rdma.is_some(), enable_rdma);
+        assert_eq!(worker.links.is_some(), enable_rdma);
         assert_eq!(
             Rc::strong_count(&worker.flights),
             2,
@@ -1480,7 +1486,7 @@ fn composes_http_and_optional_rdma_without_operational_side_effects() {
         assert_eq!(
             Rc::strong_count(&crypto),
             4,
-            "runtime, page facade, and forwarding share one local crypto client"
+            "runtime, page facade, and forwarding share one local crypto client; RDMA holds none"
         );
         let second_admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             config.limits.clone(),
@@ -1690,8 +1696,9 @@ fn snapshot_refresh_retries_canceled_publication_and_applies_skipped_removal() {
     let index = worker.store.writer.index().clone();
     index.publish_version(metadata.clone()).unwrap();
     worker.memory.publish(page).unwrap();
-    assert!(worker.memory.get(&page_id).unwrap().is_some());
-    assert_eq!(retained_plaintext.strong_count(), 1);
+    assert!(worker.memory.ciphertext(&page_id).unwrap().is_some());
+    // The cache retains only ciphertext; published plaintext is released.
+    assert_eq!(retained_plaintext.strong_count(), 0);
     assert_eq!(retained_ciphertext.strong_count(), 1);
     assert_eq!(index.snapshot_metadata(), vec![metadata.clone()]);
 
@@ -1706,7 +1713,6 @@ fn snapshot_refresh_retries_canceled_publication_and_applies_skipped_removal() {
         .snapshots
         .apply(publication(&config, 3, vec![replacement.clone()]))
         .unwrap();
-    assert_eq!(retained_plaintext.strong_count(), 1);
     assert_eq!(retained_ciphertext.strong_count(), 1);
     assert_eq!(index.snapshot_metadata(), vec![metadata]);
     let canceled = scope(Duration::from_secs(1)).unwrap();
@@ -1722,7 +1728,7 @@ fn snapshot_refresh_retries_canceled_publication_and_applies_skipped_removal() {
     assert_eq!(worker.caches, vec![replacement]);
     assert_eq!(worker.snapshot_sequence, Some(wire::PublicationSequence(3)));
     worker.refresh_snapshot(&canceled).unwrap();
-    assert!(worker.memory.get(&page_id).unwrap().is_none());
+    assert!(worker.memory.ciphertext(&page_id).unwrap().is_none());
     assert!(index.snapshot_metadata().is_empty());
     assert!(worker.peer_task.is_none());
     assert!(worker.prepared_listeners.borrow().is_none());
@@ -2432,6 +2438,7 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
         name: "keep".into(),
         client_socket: "/run/racer/keep/client/socket".into(),
         origin_socket: "/run/racer/keep/origin/socket".into(),
+        priority: racer_control_wire::DEFAULT_PRIORITY,
     };
     *fixture.publication.lock().unwrap() =
         Some(publication(&config, 1, vec![definition(), keep.clone()]));
@@ -3376,7 +3383,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
         crate::security::CryptoInput::Encrypt {
             page,
             plaintext,
-            ciphertext,
+            ciphertext: ciphertext.into(),
         },
         worker
             .keys
@@ -3736,7 +3743,7 @@ fn disabled_rdma_turn_does_not_refresh_inventory() {
     node.inventory.update(vec![]).unwrap();
     node.inventory.restore(b"[]").unwrap();
     assert_ne!(generation, node.inventory.generation());
-    assert!(app.devices.is_none());
+    assert!(app.links.is_none());
     app.refresh_inventory().unwrap();
     app.poll_native(&mut Context::from_waker(futures::task::noop_waker_ref()))
         .unwrap();
@@ -4630,3 +4637,232 @@ mod lifecycle {
 }
 
 mod dst;
+
+#[test]
+fn shared_pressure_constrains_pools_and_releases_retained_buffers() {
+    use crate::admission::ResourceClass;
+    use crate::pressure::PressureLevel;
+    let mut worker = wake_test_worker();
+    // Drive the shared level directly instead of sampling this host's cgroup.
+    worker.pressure.monitor = None;
+    let shared = worker.node.pressure.clone();
+    let admission = worker.runtime.admission.clone();
+    let mut reservation = admission
+        .reserve(None, ResourceClass::Ciphertext, 1 << 20)
+        .unwrap();
+    let bytes = reservation.buffer(1 << 20).unwrap();
+    reservation.recycle(bytes);
+    drop(reservation);
+    let (recycler, staging) = worker.pool_stats();
+    assert!(recycler.bytes >= 1 << 20);
+    assert!(!recycler.constrained && !staging.constrained);
+    let now = uring_runtime::environment::now();
+    // Normal is the initial level: polling changes nothing.
+    worker.poll_pressure(now);
+    assert!(worker.pool_stats().0.bytes >= 1 << 20);
+
+    shared.store(PressureLevel::Elevated);
+    worker.poll_pressure(now);
+    let (recycler, staging) = worker.pool_stats();
+    assert!(recycler.constrained && staging.constrained);
+    assert!(worker.aligned_pool_stats().constrained);
+    assert_eq!(recycler.bytes, 0);
+    assert_eq!(staging.bytes, 0);
+    assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+    // Repeated polls at the same level are idempotent.
+    worker.poll_pressure(now);
+    assert!(worker.pool_stats().0.constrained);
+
+    shared.store(PressureLevel::Critical);
+    worker.poll_pressure(now);
+    assert_eq!(worker.pressure.responder.level(), PressureLevel::Critical);
+    // Critical cache reclaim on an empty cache is a no-op, not an error.
+    worker.reclaim_cache_under_pressure();
+    assert!(worker.pool_stats().1.constrained);
+
+    shared.store(PressureLevel::Normal);
+    worker.poll_pressure(now);
+    let (recycler, staging) = worker.pool_stats();
+    assert!(!recycler.constrained && !staging.constrained);
+    assert!(!worker.aligned_pool_stats().constrained);
+    assert_eq!(
+        worker
+            .telemetry
+            .metrics
+            .count(crate::telemetry::Event::AllocatorTrims),
+        0
+    );
+}
+
+#[test]
+fn disabled_pressure_ignores_shared_level_but_still_reports_resident_memory() {
+    use crate::pressure::PressureLevel;
+    let mut worker = wake_test_worker();
+    worker.pressure = WorkerPressure::new(false, &worker.node.pressure, true);
+    assert!(worker.pressure.monitor.is_none());
+    worker.node.pressure.store(PressureLevel::Critical);
+    let now = uring_runtime::environment::now();
+    worker.poll_pressure(now);
+    assert_eq!(worker.pressure.responder.level(), PressureLevel::Normal);
+    assert!(!worker.pool_stats().0.constrained);
+    worker.observe_memory(now);
+    let mut output = String::new();
+    worker
+        .telemetry
+        .metrics
+        .write_prometheus(&mut output)
+        .unwrap();
+    assert!(output.contains("racer_worker_staging_pool_bytes{worker=\"0\"}"));
+    if cfg!(target_os = "linux") {
+        assert!(output.contains("# TYPE racer_process_resident_bytes gauge\n"));
+    }
+    assert!(!output.contains("racer_cgroup_memory_current_bytes"));
+}
+
+#[test]
+fn sampling_worker_owns_the_monitor_and_others_do_not() {
+    let shared = crate::pressure::SharedPressure::default();
+    let sampler = WorkerPressure::new(true, &shared, true);
+    assert!(sampler.monitor.is_some() && sampler.shared.is_some() && sampler.samples_memory);
+    let other = WorkerPressure::new(true, &shared, false);
+    assert!(other.monitor.is_none() && other.shared.is_some() && !other.samples_memory);
+}
+
+#[test]
+fn maintain_pools_releases_idle_aligned_storage() {
+    use crate::admission::ResourceClass;
+    let worker = wake_test_worker();
+    let buffers = worker.memory.buffers();
+    let length = 4096;
+    let capacity = buffers.aligned_capacity(length).unwrap();
+    let take = || {
+        let reservation = worker
+            .runtime
+            .admission
+            .reserve(None, ResourceClass::Ciphertext, capacity)
+            .unwrap();
+        buffers.aligned_ciphertext(reservation, length).unwrap()
+    };
+    drop([take(), take()]);
+    assert_eq!(worker.aligned_pool_stats().entries, 2);
+    let window = page_alloc::DEFAULT_WINDOW;
+    let start = std::time::Instant::now();
+    worker.maintain_pools(start);
+    // Reuse within each window retains the storage.
+    for turn in 1..=3 {
+        drop([take(), take()]);
+        worker.maintain_pools(start + window * turn);
+        assert_eq!(worker.aligned_pool_stats().entries, 2);
+    }
+    // An idle worker releases it within a few windows.
+    for turn in 4..=6 {
+        worker.maintain_pools(start + window * turn);
+    }
+    let stats = worker.aligned_pool_stats();
+    assert_eq!((stats.entries, stats.bytes), (0, 0));
+}
+
+#[test]
+fn maintain_pools_expires_idle_cache_entries_then_their_aligned_storage() {
+    use crate::admission::ResourceClass;
+    use racer_control_wire as wire;
+    let config = crate::test_support::cluster::config(false);
+    let node = Arc::new(NodeState::default());
+    let (mut worker, _, _) = local_worker(&config, &node, 1);
+    let original = definition();
+    let current_scope = scope(Duration::from_secs(1)).unwrap();
+    worker
+        .snapshots
+        .apply(publication(&config, 1, vec![original.clone()]))
+        .unwrap();
+    worker.refresh_snapshot(&current_scope).unwrap();
+    let (_, _, roots) = crate::test_support::security::issued();
+    worker
+        .keys
+        .install(wire::KeyringBundle {
+            schema_version: wire::SCHEMA_VERSION,
+            cluster: config.cluster.clone(),
+            generation: wire::BundleGeneration(1),
+            peer_trust_roots: roots,
+            cache_keys: vec![wire::CacheEncryptionKey::new(
+                wire::CacheKeyRef {
+                    cache: original.id.clone(),
+                    id: crate::model::key_id_from_generation(1, 7).unwrap(),
+                    purpose: wire::CacheKeyPurpose::Page,
+                },
+                wire::CacheKeyState::Active,
+                zeroize::Zeroizing::new([19; 32]),
+            )],
+        })
+        .unwrap();
+    let mut page = page(&worker);
+    let page_id = page.plaintext.page().clone();
+    // Retain the ciphertext in this worker's aligned pool, as fills do.
+    let buffers = worker.memory.buffers();
+    let length = page.ciphertext.bytes().len();
+    let reservation = worker
+        .runtime
+        .admission
+        .reserve(
+            Some(&original.id),
+            ResourceClass::Ciphertext,
+            buffers.aligned_capacity(length).unwrap(),
+        )
+        .unwrap();
+    let shared = page.ciphertext.clone();
+    page.ciphertext = buffers.rehome_aligned(shared, reservation).unwrap();
+    worker.memory.publish(page).unwrap();
+    assert_eq!(worker.aligned_pool_stats().entries, 0);
+
+    let start = std::time::Instant::now();
+    let second = Duration::from_secs(1);
+    let mut now = start;
+    while now < start + crate::memory::CACHE_IDLE_TTL {
+        worker.maintain_pools(now);
+        now += second;
+    }
+    assert!(worker.memory.ciphertext(&page_id).unwrap().is_some());
+    // The hit renews the entry for another full TTL.
+    let renewed = now;
+    while now < renewed + crate::memory::CACHE_IDLE_TTL {
+        worker.maintain_pools(now);
+        assert_eq!(worker.aligned_pool_stats().entries, 0);
+        now += second;
+    }
+    worker.maintain_pools(now);
+    assert!(worker.memory.ciphertext(&page_id).unwrap().is_none());
+    // The released buffer is pooled, then decays once nothing reuses it.
+    assert_eq!(worker.aligned_pool_stats().entries, 1);
+    for _ in 0..6 {
+        now += page_alloc::DEFAULT_WINDOW;
+        worker.maintain_pools(now);
+    }
+    let stats = worker.aligned_pool_stats();
+    assert_eq!((stats.entries, stats.bytes), (0, 0));
+}
+
+#[test]
+fn snapshot_refresh_applies_priority_live_and_reweighs_memory() {
+    let config = crate::test_support::cluster::config(false);
+    let node = Arc::new(NodeState::default());
+    let (mut worker, _, _) = local_worker(&config, &node, 1);
+    let mut cache = definition();
+    let current_scope = scope(Duration::from_secs(1)).unwrap();
+    let admission = worker.runtime.admission.clone();
+    let class = crate::admission::ResourceClass::Plaintext;
+    let _charge = admission.reserve(Some(&cache.id), class, 1).unwrap();
+    for (sequence, priority) in [(1, 500), (2, 0), (3, 1000)] {
+        cache.priority = priority;
+        worker
+            .snapshots
+            .apply(publication(&config, sequence, vec![cache.clone()]))
+            .unwrap();
+        worker.refresh_snapshot(&current_scope).unwrap();
+        assert_eq!(admission.active_weight(), u64::from(priority));
+        // Disk retention shares the same live table.
+        assert_eq!(
+            worker.store.writer.retention().weights().weight(&cache.id),
+            u64::from(priority)
+        );
+    }
+}

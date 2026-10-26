@@ -28,6 +28,10 @@ spec:
           Each DNS label is limited to 63 characters to match the wire contract;
           Kubernetes metadata validation enforces DNS subdomain spelling.
           The bounded regex checks label lengths without a costly CEL split/all loop.
+          Whether spec.origin is set is fixed at creation. Cache entries are keyed by
+          the ClusterCache UID, not by their source, so removing and re-adding origin,
+          or switching between a managed origin and a self-deployed one, would serve
+          entries fetched from a different source.
         properties:
           apiVersion:
             description: |-
@@ -46,11 +50,162 @@ spec:
             type: string
           metadata:
             type: object
+          spec:
+            description: Spec configures optional cache features.
+            properties:
+              origin:
+                description: |-
+                  Origin deploys a managed racer-object origin for this cache. The operator runs
+                  one origin pod per dataplane node. Origin can be set only at creation and
+                  cannot be removed later; leave it unset to deploy your own origin.
+                properties:
+                  azure:
+                    description: Azure reads one Azure Blob Storage container.
+                    properties:
+                      containerURL:
+                        description: |-
+                          ContainerURL is the blob container URL, for example
+                          https://account.blob.core.windows.net/models. The last path segment is
+                          the container name. Azurite-style URLs may carry one account path
+                          segment before it, for example http://127.0.0.1:10000/account/models.
+                        maxLength: 320
+                        minLength: 1
+                        type: string
+                        x-kubernetes-validations:
+                        - message: containerURL must be an http or https URL
+                          rule: isURL(self) && url(self).getScheme() in ['http', 'https']
+                        - message: containerURL must not contain credentials, a query,
+                            or a fragment
+                          rule: '!self.contains(''?'') && !self.contains(''#'') &&
+                            !self.contains(''@'')'
+                        - message: containerURL must be an account URL followed by
+                            one valid container name, such as https://account.blob.core.windows.net/models
+                          rule: self.matches('^https?://[]A-Za-z0-9.:[-]+(/[A-Za-z0-9_-]+)?/[a-z0-9]+(-[a-z0-9]+)*$')
+                            && self.substring(self.lastIndexOf('/') + 1).size() >=
+                            3 && self.substring(self.lastIndexOf('/') + 1).size()
+                            <= 63
+                        - message: containerURL is immutable; create a new ClusterCache
+                            for a different container
+                          rule: self == oldSelf
+                      credential:
+                        description: Credential selects how the origin authenticates.
+                          When omitted, requests are anonymous.
+                        properties:
+                          default:
+                            description: |-
+                              Default uses DefaultAzureCredential, such as a managed identity or
+                              service principal environment variables from a Secret.
+                            properties:
+                              clientID:
+                                description: ClientID selects a user-assigned managed
+                                  identity.
+                                pattern: ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$
+                                type: string
+                              secretRef:
+                                description: |-
+                                  SecretRef names a Secret in the operator namespace whose keys are
+                                  injected as environment variables, for example AZURE_CLIENT_ID,
+                                  AZURE_TENANT_ID, and AZURE_CLIENT_SECRET.
+                                properties:
+                                  name:
+                                    description: Name of the Secret. It must be a
+                                      DNS-1123 subdomain.
+                                    maxLength: 253
+                                    minLength: 1
+                                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                                    type: string
+                                required:
+                                - name
+                                type: object
+                            type: object
+                            x-kubernetes-validations:
+                            - message: clientID and secretRef are mutually exclusive
+                              rule: '!(has(self.clientID) && has(self.secretRef))'
+                          workloadIdentity:
+                            description: |-
+                              WorkloadIdentity uses Microsoft Entra Workload ID. The cluster must run
+                              the Azure Workload Identity webhook, and the identity must trust the
+                              origin's ServiceAccount.
+                            properties:
+                              clientID:
+                                description: ClientID is the client ID of the federated
+                                  identity.
+                                pattern: ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$
+                                type: string
+                              tenantID:
+                                description: TenantID overrides the tenant configured
+                                  by the webhook.
+                                pattern: ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$
+                                type: string
+                            required:
+                            - clientID
+                            type: object
+                        type: object
+                        x-kubernetes-validations:
+                        - message: exactly one of default or workloadIdentity is required
+                          rule: '[has(self.default), has(self.workloadIdentity)].filter(x,
+                            x).size() == 1'
+                    required:
+                    - containerURL
+                    type: object
+                    x-kubernetes-validations:
+                    - message: containerURL must use https when a credential is configured
+                      rule: '!has(self.credential) || self.containerURL.startsWith(''https://'')'
+                  maxConcurrentRequests:
+                    description: |-
+                      MaxConcurrentRequests bounds concurrent upstream requests per origin pod.
+                      When unset, the racer-object default applies.
+                    format: int32
+                    maximum: 65536
+                    minimum: 1
+                    type: integer
+                  metadataTTL:
+                    description: |-
+                      MetadataTTL bounds how long object metadata is reused before it is revalidated.
+                      It must not be negative. When unset, the racer-object default applies.
+                    type: string
+                    x-kubernetes-validations:
+                    - message: metadataTTL must not be negative
+                      rule: duration(self) >= duration('0s')
+                  requestTimeout:
+                    description: |-
+                      RequestTimeout bounds each upstream request. It must be positive.
+                      When unset, the racer-object default applies.
+                    type: string
+                    x-kubernetes-validations:
+                    - message: requestTimeout must be positive
+                      rule: duration(self) > duration('0s')
+                type: object
+                x-kubernetes-validations:
+                - message: azure is required
+                  rule: has(self.azure)
+              priority:
+                description: |-
+                  Priority is the relative weight used to share node cache capacity among
+                  ClusterCaches. Disk shares are weighted across published caches, plus any
+                  unpublished caches that still hold data on the node, which count at the
+                  default weight. Memory shares are weighted across caches that are
+                  actively using memory, and each cache also gets a bounded working
+                  allowance from shared memory. Eviction prefers data from caches that use
+                  more than their share, within bounded scans. A priority of 0 gets no
+                  weighted share while caches with positive priority compete, but it keeps
+                  its working allowance. If every counted cache has priority 0, they share
+                  equally. When unset, the priority is 500. Priority may be changed at any
+                  time.
+                format: int32
+                maximum: 1000
+                minimum: 0
+                type: integer
+            type: object
         type: object
         x-kubernetes-validations:
         - message: name must fit the canonical Unix socket path
           rule: size(self.metadata.name) <= 82
         - message: each name label must be at most 63 characters
           rule: self.metadata.name.matches('^[^.]{1,63}([.][^.]{1,63})*$')
+        - message: spec.origin cannot be added or removed; create a new ClusterCache
+            to change the origin
+          rule: (has(self.spec) && has(self.spec.origin)) == (has(oldSelf.spec) &&
+            has(oldSelf.spec.origin))
     served: true
     storage: true

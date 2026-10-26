@@ -170,8 +170,10 @@ fn relevant_quota_failure_still_reclaims_recycled_payload() {
     for completing in [false, true] {
         for cache_records in [false, true] {
             let length = 1 << 20;
+            // The recycler retains at most half a class limit, so the limit
+            // must be twice the retained length for one entry to be pooled.
             let admission = Quotas::new(Limits {
-                bytes: length,
+                bytes: 2 * length,
                 keys: 1,
             });
             let first = "first".to_owned();
@@ -186,7 +188,7 @@ fn relevant_quota_failure_still_reclaims_recycled_payload() {
             let (cache, class, amount) = if cache_records {
                 (Some(&second), Resource::Context, 1)
             } else {
-                (None, Resource::Staging, length)
+                (None, Resource::Staging, 2 * length)
             };
             let reservation = if completing {
                 admission.reserve_completion(cache, class, amount)
@@ -227,6 +229,93 @@ fn recycled_payload_capacity_stays_admitted_zeroed_and_reclaimable() {
     assert_eq!(admission.used(Resource::Payload), 1024 * 1024);
     drop((bytes, reservation));
     assert_eq!(admission.retained_buffer_bytes(), 0);
+    assert_eq!(admission.used(Resource::Payload), 0);
+}
+
+/// Pooled backing reclaimed for the same class and size under quota pressure
+/// moves to the charge that needed its admission instead of being unmapped.
+fn pressured(length: usize) -> (Quotas<Limits>, flow_control::Charge<Limits>, *const u8) {
+    let admission = Quotas::new(Limits {
+        bytes: 2 * length,
+        keys: 4,
+    });
+    let cache = "pool".to_owned();
+    let live = admission
+        .reserve(Some(&cache), Resource::Payload, length)
+        .unwrap();
+    let mut old = admission
+        .reserve(Some(&cache), Resource::Payload, length)
+        .unwrap();
+    let mut bytes = old.buffer(length).unwrap();
+    let pointer = bytes.as_ptr();
+    bytes.fill(87);
+    old.recycle(bytes);
+    drop(old);
+    assert_eq!(admission.retained_buffer_bytes(), length);
+    assert_eq!(admission.used(Resource::Payload), 2 * length);
+    (admission, live, pointer)
+}
+
+#[test]
+fn pressure_reclaim_hands_pooled_backing_to_the_new_charge() {
+    let length = 1 << 20;
+    let (admission, live, pointer) = pressured(length);
+    let cache = "pool".to_owned();
+    let charge = admission
+        .reserve(Some(&cache), Resource::Payload, length)
+        .unwrap();
+    assert_eq!(admission.retained_buffer_bytes(), 0);
+    assert_eq!(admission.used(Resource::Payload), 2 * length);
+    let bytes = charge.buffer(length).unwrap();
+    assert_eq!(bytes.as_ptr(), pointer);
+    assert_eq!(bytes.len(), length);
+    assert!(bytes.iter().all(|b| *b == 0));
+    // The adopted backing is used once; a second checkout allocates.
+    let other = charge.buffer(length).unwrap();
+    assert_ne!(other.as_ptr(), pointer);
+    drop((bytes, other, charge, live));
+    assert_eq!(admission.used(Resource::Payload), 0);
+}
+
+#[test]
+fn adopted_backing_never_outlives_its_admission() {
+    let length = 1 << 20;
+    let (admission, live, _) = pressured(length);
+    let cache = "pool".to_owned();
+    let mut charge = admission
+        .reserve(Some(&cache), Resource::Payload, length)
+        .unwrap();
+    charge.shrink(length / 2).unwrap();
+    assert_eq!(admission.used(Resource::Payload), length + length / 2);
+    // The allocator may hand out the freed address again, so check the size.
+    let bytes = charge.buffer(length / 2).unwrap();
+    assert!(bytes.capacity() < length);
+    drop((bytes, charge, live));
+    assert_eq!(admission.used(Resource::Payload), 0);
+
+    // Unused adopted backing is released with the charge that holds it.
+    let (admission, live, _) = pressured(length);
+    let charge = admission
+        .reserve(Some(&cache), Resource::Payload, length)
+        .unwrap();
+    assert_eq!(admission.retained_buffer_bytes(), 0);
+    drop((charge, live));
+    assert_eq!(admission.used(Resource::Payload), 0);
+    assert_eq!(admission.retained_buffer_bytes(), 0);
+}
+
+#[test]
+fn smaller_request_does_not_adopt_larger_backing() {
+    let length = 1 << 20;
+    let (admission, live, _) = pressured(length);
+    let cache = "pool".to_owned();
+    let charge = admission
+        .reserve(Some(&cache), Resource::Payload, length / 2)
+        .unwrap();
+    // The allocator may hand out the freed address again, so check the size.
+    let bytes = charge.buffer(length / 2).unwrap();
+    assert!(bytes.capacity() < length);
+    drop((bytes, charge, live));
     assert_eq!(admission.used(Resource::Payload), 0);
 }
 

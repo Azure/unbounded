@@ -161,7 +161,6 @@ impl PeerServer {
                 1,
             )),
             io.clone(),
-            None,
             admission.clone(),
             wire.clone(),
             signatures.clone(),
@@ -330,6 +329,10 @@ impl PeerServer {
         self
     }
     #[cfg(test)]
+    pub(crate) fn transfers(&self) -> &Rc<super::transport::Transfers> {
+        &self.transfers
+    }
+    #[cfg(test)]
     pub fn with_transfers(mut self, transfers: Rc<super::transport::Transfers>) -> Self {
         self.transfers = transfers;
         self
@@ -376,6 +379,22 @@ impl PeerServer {
             let (authentication, length) = decode_envelope(received.value, false)?;
             if length != 0 {
                 return Err(Error::InvalidRequest);
+            }
+            if crate::peer::protocol::field(&authentication.original.head, "racer-kind")
+                .is_ok_and(|kind| kind == peer_wire::link::KIND)
+            {
+                if native_control.is_some() || !authentication.hops.is_empty() {
+                    return Err(Error::InvalidRequest);
+                }
+                return self
+                    .transfers
+                    .serve_link(
+                        received.connection,
+                        authentication.original,
+                        self.relay.network.current_membership(),
+                        &header_scope,
+                    )
+                    .await;
             }
             let request = codec.request(authentication, scope)?;
             // Listener scopes bound connection lifetime, while the signed request

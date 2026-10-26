@@ -2078,6 +2078,11 @@ mod timeouts {
         stalled: usize,
         fenced: Cell<bool>,
         late_success: bool,
+        /// Drop multi-flight Subscribes unanswered, as an older provider does.
+        refuse_flights: Cell<bool>,
+        /// Answer Subscribes with a signed `Unavailable`, as a relay does
+        /// when the provider behind it drops the exchange.
+        relay_unavailable: Cell<bool>,
     }
 
     impl Peers {
@@ -2108,6 +2113,9 @@ mod timeouts {
                 ),
             };
             let response = match &request.operation {
+                PeerOperation::Subscribe { .. } if self.relay_unavailable.get() => {
+                    PeerResponse::Unavailable
+                }
                 PeerOperation::Subscribe { .. } | PeerOperation::Page { .. } => PeerResponse::Miss,
                 _ => PeerResponse::Metadata(metadata),
             };
@@ -2153,6 +2161,7 @@ mod timeouts {
                 | PeerOperation::Page { mode, .. } => {
                     matches!(mode, FetchMode::CopyOnly)
                 }
+                PeerOperation::Warm { .. } => false,
             };
             let stalled = self.calls.borrow().len() < self.stalled;
             self.calls.borrow_mut().push(Call {
@@ -2167,8 +2176,16 @@ mod timeouts {
                 attempts: request.route.remaining_attempts,
                 links: request.route.remaining_links,
             });
+            let refused = self.refuse_flights.get()
+                && matches!(
+                    &request.operation,
+                    PeerOperation::Subscribe { subscription, .. } if subscription.flights.is_some()
+                );
             Box::pin(async move {
                 let _membership = membership;
+                if refused {
+                    return Err(Error::Io);
+                }
                 if stalled {
                     // A successful result computed before timeout is still inadmissible
                     // if its transport completion fence arrives after the attempt ends.
@@ -2240,6 +2257,8 @@ mod timeouts {
                 stalled,
                 fenced: Cell::new(true),
                 late_success,
+                refuse_flights: Cell::new(false),
+                relay_unavailable: Cell::new(false),
             });
             let policy = CandidatePolicy::new(
                 local,
@@ -2739,10 +2758,14 @@ mod timeouts {
             object: f.context.object.clone(),
             etag: StrongEtag::test_value("v1"),
         };
-        let mut subscribe = Box::pin(f.policy.subscribe(
+        let selection = crate::read::range_stream::Selection::for_test(
+            &scheduler,
             version.clone(),
             demand.clone(),
-            &scheduler,
+        );
+        let mut subscribe = Box::pin(f.policy.subscribe(
+            &selection,
+            1,
             f.candidates.membership.clone(),
             &f.context,
             &f.scope,
@@ -2787,12 +2810,14 @@ mod timeouts {
             .validate(&f.context.object, PageNumber(0))
             .unwrap();
         // Another selection keeps the original signed deadline and spent ceilings,
-        // even though its local attempt starts later.
+        // even though its local attempt starts later. Dropping the first
+        // selection frees the provider contract for it.
+        drop(selection);
+        let selection = crate::read::range_stream::Selection::for_test(&scheduler, version, demand);
         assert!(
             futures::executor::block_on(f.policy.subscribe(
-                version,
-                demand,
-                &scheduler,
+                &selection,
+                1,
                 f.candidates.membership.clone(),
                 &f.context,
                 &f.scope,
@@ -2843,6 +2868,148 @@ mod timeouts {
     }
 
     #[test]
+    fn multi_flight_subscribe_falls_back_to_single_flight_after_refusal() {
+        use crate::read::candidates::ProviderSelection;
+        let mut f = Fixture::new(Some(1), 0, false);
+        f.peers.refuse_flights.set(true);
+        let scheduler = crate::read::range_stream::Scheduler::new(1);
+        let demand = crate::peer::subscriptions::Demand::new(vec![
+            crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
+        ])
+        .unwrap();
+        let version = ObjectVersion {
+            object: f.context.object.clone(),
+            etag: StrongEtag::test_value("v1"),
+        };
+        let select = |f: &mut Fixture, flights: u16| {
+            let asked = Cell::new(None);
+            let selection = crate::read::range_stream::Selection::for_test(
+                &scheduler,
+                version.clone(),
+                demand.clone(),
+            );
+            let result = futures::executor::block_on(f.policy.subscribe_provider(
+                &version.object,
+                PageNumber(0),
+                flights,
+                |provider, requested| {
+                    asked.set(Some(requested));
+                    scheduler.contract(
+                        &selection,
+                        f.candidates.membership.version,
+                        provider.clone(),
+                        requested,
+                        f.scope.deadline.0,
+                    )
+                },
+                f.candidates.membership.clone(),
+                &f.context,
+                &f.scope,
+                &mut f.budget,
+            ))
+            .unwrap();
+            // Each request has finished; free the contract for the next.
+            drop(selection);
+            let sent = f.peers.calls.borrow().last().unwrap().subscription.clone();
+            (result, asked.get().unwrap(), sent.unwrap().flights)
+        };
+        // A single flight never sends the field.
+        let (result, asked, sent) = select(&mut f, 1);
+        assert!(matches!(result, ProviderSelection::Skipped));
+        assert_eq!((asked, sent), (None, None));
+        let (result, asked, sent) = select(&mut f, 4);
+        let ProviderSelection::Refused { provider } = result else {
+            panic!("an unanswered multi-flight request is a refusal")
+        };
+        assert_eq!(provider, f.peers.calls.borrow().last().unwrap().destination);
+        assert_eq!((asked, sent), (Some(4), Some(4)));
+        // The provider is now single-flight: the retry omits the field.
+        let (result, asked, sent) = select(&mut f, 4);
+        assert!(matches!(result, ProviderSelection::Skipped));
+        assert_eq!((asked, sent), (None, None));
+        let calls = f.peers.calls.borrow();
+        assert!(
+            calls
+                .windows(2)
+                .all(|pair| pair[0].subscription.as_ref().unwrap().sequence
+                    < pair[1].subscription.as_ref().unwrap().sequence),
+            "every request, refused or not, uses a new sequence"
+        );
+    }
+
+    #[test]
+    fn multi_flight_subscribe_falls_back_to_single_flight_after_relayed_refusal() {
+        use crate::read::candidates::ProviderSelection;
+        let mut f = Fixture::new(Some(1), 0, false);
+        // Every Subscribe reaches the provider through a relay that signs
+        // `Unavailable` for the dropped exchange.
+        f.peers.relay_unavailable.set(true);
+        let scheduler = crate::read::range_stream::Scheduler::new(1);
+        let demand = crate::peer::subscriptions::Demand::new(vec![
+            crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
+        ])
+        .unwrap();
+        let version = ObjectVersion {
+            object: f.context.object.clone(),
+            etag: StrongEtag::test_value("v1"),
+        };
+        let select = |f: &mut Fixture, flights: u16| {
+            let asked = Cell::new(None);
+            let selection = crate::read::range_stream::Selection::for_test(
+                &scheduler,
+                version.clone(),
+                demand.clone(),
+            );
+            let result = futures::executor::block_on(f.policy.subscribe_provider(
+                &version.object,
+                PageNumber(0),
+                flights,
+                |provider, requested| {
+                    asked.set(Some(requested));
+                    scheduler.contract(
+                        &selection,
+                        f.candidates.membership.version,
+                        provider.clone(),
+                        requested,
+                        f.scope.deadline.0,
+                    )
+                },
+                f.candidates.membership.clone(),
+                &f.context,
+                &f.scope,
+                &mut f.budget,
+            ))
+            .unwrap();
+            // Each request has finished; free the contract for the next.
+            drop(selection);
+            let sent = f.peers.calls.borrow().last().unwrap().subscription.clone();
+            (result, asked.get().unwrap(), sent.unwrap().flights)
+        };
+        // A single flight never sends the field and is merely skipped.
+        let (result, asked, sent) = select(&mut f, 1);
+        assert!(matches!(result, ProviderSelection::Skipped));
+        assert_eq!((asked, sent), (None, None));
+        let (result, asked, sent) = select(&mut f, 4);
+        let ProviderSelection::Refused { provider } = result else {
+            panic!("a relayed unavailable multi-flight request is a refusal")
+        };
+        assert_eq!(provider, f.peers.calls.borrow().last().unwrap().destination);
+        assert_eq!((asked, sent), (Some(4), Some(4)));
+        // The provider is now single-flight: the retry omits the field.
+        let (result, asked, sent) = select(&mut f, 4);
+        assert!(matches!(result, ProviderSelection::Skipped));
+        assert_eq!((asked, sent), (None, None));
+        let calls = f.peers.calls.borrow();
+        assert!(
+            calls
+                .windows(2)
+                .all(|pair| pair[0].subscription.as_ref().unwrap().sequence
+                    < pair[1].subscription.as_ref().unwrap().sequence),
+            "every request, refused or not, uses a new sequence"
+        );
+    }
+
+    #[test]
     fn subscription_parent_cancellation_waits_for_fence_without_fallback() {
         let mut f = Fixture::new(Some(1), 1, false);
         f.peers.fenced.set(false);
@@ -2851,13 +3018,17 @@ mod timeouts {
             crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
         ])
         .unwrap();
-        let mut subscribe = Box::pin(f.policy.subscribe(
+        let selection = crate::read::range_stream::Selection::for_test(
+            &scheduler,
             ObjectVersion {
                 object: f.context.object.clone(),
                 etag: StrongEtag::test_value("v1"),
             },
             demand,
-            &scheduler,
+        );
+        let mut subscribe = Box::pin(f.policy.subscribe(
+            &selection,
+            1,
             f.candidates.membership.clone(),
             &f.context,
             &f.scope,

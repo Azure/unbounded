@@ -217,6 +217,40 @@ pub unsafe trait SendBuffer: 'static {
     fn send_bytes(&self) -> Result<&[u8], Self::Error>;
 }
 
+/// Completion-owned immutable storage for the body of a vectored file write.
+///
+/// This is the file-write counterpart of [`SendBuffer`] and carries the same
+/// contract. It is blanket-implemented for every [`SendBuffer`] (and therefore
+/// every [`IoBuffer`]), so shared, reference-counted bodies can be written
+/// without copying them into exclusive storage.
+///
+/// # Safety
+/// Accessors must expose the same initialized allocation across owner moves.
+/// No shared alias may mutate, resize, or free the bytes before completion.
+pub unsafe trait SharedWriteBuffer: 'static {
+    /// Application error returned when access to this allocation is rejected.
+    type Error;
+
+    /// Borrow initialized immutable bytes for one write operation.
+    fn write_bytes(&self) -> Result<&[u8], Self::Error>;
+}
+
+/// Owners returned by [`Reactor::write_vectored_at`] after all applicable
+/// completion fences.
+pub struct VectoredCompletion<H: 'static, B: 'static, L: 'static = ()> {
+    /// Header allocation, written first.
+    pub header: H,
+
+    /// Body allocation, written immediately after the header.
+    pub body: B,
+
+    /// Bytes written across both segments, possibly less than their sum.
+    pub bytes: usize,
+
+    /// Caller-owned admission or reuse guard retained through completion.
+    pub lease: L,
+}
+
 /// Erased admission guard retained for the lifetime of its accounted owner.
 type Charge = Box<dyn std::any::Any>;
 
@@ -284,7 +318,7 @@ struct State<S: Scope> {
 
     ring_reservation: Option<Charge>,
 
-    entries: BTreeMap<IoId, Entry<S>>,
+    entries: Table<Entry<S>>,
 
     next: u64,
 
@@ -295,7 +329,16 @@ struct State<S: Scope> {
     fence_waiters: BTreeMap<(Option<IoId>, u64), FenceWaiter>,
 
     next_waiter: u64,
+
+    /// Reusable batch storage for poll_budgeted, empty between calls.
+    finished: Vec<FencedEntry<S>>,
+
+    /// Reusable cancellation scan snapshot, empty between calls.
+    scan_batch: Vec<ScanItem<S>>,
 }
+
+/// One scanned entry: its identifier, a retained view, and its policy result.
+type ScanItem<S> = (IoId, Rc<dyn Pending<S>>, Option<<S as Scope>::Error>);
 
 /// Independently charged wake registration for one fence caller.
 struct FenceWaiter {
@@ -456,6 +499,15 @@ struct Signal {
     waker: RefCell<Option<Waker>>,
 }
 
+/// Bookkeeping charge owned by one reply, or shared with a prepaid partition.
+enum Reservation {
+    /// An ordinary submission's own charge, released with its reply.
+    Owned(#[allow(dead_code)] Charge),
+
+    /// The prepaid partition's charge, released with its last reply.
+    Shared(#[allow(dead_code)] Rc<Charge>),
+}
+
 /// Fenced result and bookkeeping retained until consumed or abandoned.
 struct Reply<T, E> {
     // A reserved slot includes completion bookkeeping, not just the SQE. Keep it
@@ -465,14 +517,91 @@ struct Reply<T, E> {
     result: Option<Result<T, E>>,
 
     // Charge completed-but-unconsumed results as well as submitted work.
-    _reservation: Rc<Charge>,
+    _reservation: Reservation,
+}
+
+/// One submission's scope, delivery state, and completion owners, sharing one
+/// allocation between the reactor table and the waiting future.
+struct Submitted<S: Scope, T, F> {
+    scope: S,
+
+    signal: Signal,
+
+    reply: RefCell<Reply<T, S::Error>>,
+
+    // An ordinary slot is released at the kernel fence, before the callback.
+    slot: Cell<Option<SubmissionSlot>>,
+
+    // The callback owns every FD, buffer, lease and sockaddr backing.
+    finish: Cell<Option<F>>,
+}
+
+/// The reactor table's type-erased view of one submission.
+trait Pending<S: Scope> {
+    /// Borrow the scope that decides cancellation.
+    fn scope(&self) -> &S;
+
+    /// Borrow the delivery signal shared with the waiting future.
+    fn signal(&self) -> &Signal;
+
+    /// Release the owners through the callback once and return the waker to notify.
+    fn finish(&self, result: Result<KernelResult, S::Error>) -> Option<Waker>;
+}
+
+impl<S, T, F> Pending<S> for Submitted<S, T, F>
+where
+    S: Scope,
+    F: FnOnce(Result<KernelResult, S::Error>) -> Result<T, S::Error>,
+{
+    /// Borrow the submission's own scope.
+    fn scope(&self) -> &S {
+        &self.scope
+    }
+
+    /// Borrow the signal stored beside the reply.
+    fn signal(&self) -> &Signal {
+        &self.signal
+    }
+
+    /// Deliver unless abandoned; an abandoned result drops its owners here.
+    fn finish(&self, result: Result<KernelResult, S::Error>) -> Option<Waker> {
+        drop(self.slot.take());
+        let finish = self.finish.take().expect("submission finishes once");
+        let result = finish(result);
+        if !self.signal.abandoned.get() {
+            self.reply.borrow_mut().result = Some(result);
+        }
+        let mut pending_waker = self.signal.waker.borrow_mut();
+        let waker = pending_waker.take();
+        drop(pending_waker);
+        waker
+    }
+}
+
+/// The waiting future's type-erased view of one submission.
+trait Delivery<T, E> {
+    /// Borrow the delivery signal.
+    fn signal(&self) -> &Signal;
+
+    /// Borrow the fenced reply.
+    fn reply(&self) -> &RefCell<Reply<T, E>>;
+}
+
+impl<S: Scope, T, F> Delivery<T, S::Error> for Submitted<S, T, F> {
+    /// Borrow the signal stored beside the reply.
+    fn signal(&self) -> &Signal {
+        &self.signal
+    }
+
+    /// Borrow the reply stored beside the signal.
+    fn reply(&self) -> &RefCell<Reply<T, S::Error>> {
+        &self.reply
+    }
 }
 
 /// Result-only future; dropping it never releases submitted kernel resources.
 struct Waiting<T, E> {
-    reply: Rc<RefCell<Reply<T, E>>>,
-
-    signal: Rc<Signal>,
+    delivery: Rc<dyn Delivery<T, E>>,
 }
 
 impl<T, E> Future for Waiting<T, E> {
@@ -481,15 +610,15 @@ impl<T, E> Future for Waiting<T, E> {
 
     /// Consume a fenced reply or refresh delivery notification without driving I/O.
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let result = self.reply.borrow_mut().result.take();
+        let result = self.delivery.reply().borrow_mut().result.take();
         if let Some(result) = result {
             Poll::Ready(result)
         } else {
             let waker = cx.waker().clone();
-            let old = self.signal.waker.borrow_mut().replace(waker);
+            let old = self.delivery.signal().waker.borrow_mut().replace(waker);
             drop(old);
             // Clone/drop callbacks can drive completions before registration.
-            let result = self.reply.borrow_mut().result.take();
+            let result = self.delivery.reply().borrow_mut().result.take();
             match result {
                 Some(result) => Poll::Ready(result),
                 None => Poll::Pending,
@@ -501,8 +630,8 @@ impl<T, E> Future for Waiting<T, E> {
 impl<T, E> Drop for Waiting<T, E> {
     /// Abandon delivery while leaving submitted owners in the reactor table.
     fn drop(&mut self) {
-        self.signal.abandoned.set(true);
-        let old = self.signal.waker.borrow_mut().take();
+        self.delivery.signal().abandoned.set(true);
+        let old = self.delivery.signal().waker.borrow_mut().take();
         drop(old);
     }
 }
@@ -540,17 +669,10 @@ impl KernelResult {
     }
 }
 
-/// Own all submitted resources until completion, then produce a wake notification.
-type Finish<E> = Box<dyn FnOnce(Result<KernelResult, E>) -> Option<Waker>>;
-
 /// One published operation with independent original and cancellation accounting.
 struct Entry<S: Scope> {
-    // The finish closure owns every FD, buffer, lease and sockaddr backing.
-    finish: Finish<S::Error>,
-
-    signal: Rc<Signal>,
-
-    scope: Rc<S>,
+    // The submission owns every FD, buffer, lease and sockaddr backing.
+    pending: Rc<dyn Pending<S>>,
 
     completion: CompletionState,
 
@@ -679,7 +801,7 @@ impl<S: Scope> FencedEntry<S> {
             original,
         } = self;
         if entry.cancel_reason.is_none() {
-            entry.cancel_reason = entry.scope.check().err();
+            entry.cancel_reason = entry.pending.scope().check().err();
         }
         let result = match entry.cancel_reason {
             Some(error) => {
@@ -688,7 +810,7 @@ impl<S: Scope> FencedEntry<S> {
             }
             None => Ok(original),
         };
-        (entry.finish)(result)
+        entry.pending.finish(result)
     }
 }
 
@@ -700,6 +822,51 @@ unsafe impl<B: IoBuffer> SendBuffer for B {
     /// Borrow exclusive storage immutably under the stronger IoBuffer contract.
     fn send_bytes(&self) -> Result<&[u8], Self::Error> {
         self.bytes()
+    }
+}
+
+// SAFETY: the SendBuffer contract is the SharedWriteBuffer contract.
+unsafe impl<B: SendBuffer> SharedWriteBuffer for B {
+    /// Preserve the send allocation's application error type.
+    type Error = B::Error;
+
+    /// Borrow the same immutable bytes a send would publish.
+    fn write_bytes(&self) -> Result<&[u8], Self::Error> {
+        self.send_bytes()
+    }
+}
+
+/// Reactor-owned vectored write state. The iovec array lives in stable
+/// syscall backing so its address survives moves into completion closures.
+struct VectoredInFlight<H: 'static, B: 'static, L: 'static> {
+    file: Rc<Descriptor>,
+
+    header: H,
+
+    body: B,
+
+    lease: L,
+
+    iovecs: SyscallArg<[libc::iovec; 2]>,
+}
+
+impl<H: 'static, B: 'static, L: 'static> VectoredInFlight<H, B, L> {
+    /// Return both owners and admission only after the retry loop's final fence.
+    fn complete(self, bytes: usize) -> VectoredCompletion<H, B, L> {
+        let Self {
+            file,
+            header,
+            body,
+            lease,
+            iovecs,
+        } = self;
+        drop((file, iovecs));
+        VectoredCompletion {
+            header,
+            body,
+            bytes,
+            lease,
+        }
     }
 }
 
@@ -754,12 +921,14 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                 #[cfg(test)]
                 completions: Default::default(),
                 ring_reservation: None,
-                entries: BTreeMap::new(),
+                entries: Table::default(),
                 next: 1,
                 scan_after: IoId(0),
                 stopped: false,
                 fence_waiters: BTreeMap::new(),
                 next_waiter: 0,
+                finished: Vec::new(),
+                scan_batch: Vec::new(),
             }),
         }
     }
@@ -954,7 +1123,8 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                 reject(RejectionReason::Initialization, None, None, 1);
             }
         })?;
-        let scope = Rc::new(scope.clone());
+        // Clone before borrowing reactor state: a scope's Clone may reenter.
+        let scope = scope.clone();
         let bytes = std::mem::size_of::<Entry<S>>()
             + std::mem::size_of::<S>()
             + 2 * std::mem::size_of::<usize>()
@@ -981,7 +1151,10 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                 );
                 return Err(Error::Overloaded.into());
             }
-            (pool.memory.clone(), pool.active.clone())
+            (
+                Reservation::Shared(pool.memory.clone()),
+                pool.active.clone(),
+            )
         } else {
             let reserved = self
                 .reserved
@@ -1002,7 +1175,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                     reject(RejectionReason::Bookkeeping, None, None, bytes);
                 }
             })?;
-            (Rc::new(charge), self.ordinary.clone())
+            (Reservation::Owned(charge), self.ordinary.clone())
         };
         let mut state = self.state.borrow_mut();
         if state.stopped {
@@ -1046,35 +1219,26 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         } else {
             (Some(slot), None)
         };
-        let reply = Rc::new(RefCell::new(Reply {
-            _slot: reserved_slot,
-            result: None,
-            _reservation: reservation,
-        }));
-        let signal = Rc::new(Signal {
-            abandoned: Cell::new(false),
-            waker: RefCell::new(None),
+        let submitted = Rc::new(Submitted {
+            scope,
+            signal: Signal {
+                abandoned: Cell::new(false),
+                waker: RefCell::new(None),
+            },
+            reply: RefCell::new(Reply {
+                _slot: reserved_slot,
+                result: None,
+                _reservation: reservation,
+            }),
+            slot: Cell::new(ordinary_slot),
+            finish: Cell::new(Some(finish)),
         });
-        let output = reply.clone();
-        let notify = signal.clone();
         // Insert ownership BEFORE publishing the SQE. No fallible action may drop
         // this entry after publication; even submission errors leave it retained.
         state.entries.insert(
             id,
             Entry {
-                finish: Box::new(move |result| {
-                    drop(ordinary_slot);
-                    let result = finish(result);
-                    if !notify.abandoned.get() {
-                        output.borrow_mut().result = Some(result);
-                    }
-                    let mut pending_waker = notify.waker.borrow_mut();
-                    let waker = pending_waker.take();
-                    drop(pending_waker);
-                    waker
-                }),
-                signal: signal.clone(),
-                scope,
+                pending: submitted.clone(),
                 completion: CompletionState::new(if accept {
                     CompletionKind::Descriptor
                 } else {
@@ -1111,7 +1275,9 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         // Kernel submission is driven by poll_budgeted and by wait before sleeping,
         // including SQEs queued in the intervening service turn. Polling a future
         // only queues work; potentially blocking file operations use ASYNC.
-        Ok(Waiting { reply, signal })
+        Ok(Waiting {
+            delivery: submitted,
+        })
     }
 
     /// Only read/write/recv/send may use this helper. Connect and filesystem
@@ -1341,6 +1507,99 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             IssuePolicy::Inline,
             None,
         )
+    }
+
+    /// Write `header` then `body` contiguously at an explicit offset with one
+    /// vectored write, without copying either into a staging buffer.
+    ///
+    /// Both owners and the lease are retained until every completion fence.
+    /// Short progress is returned as is and may end inside either segment;
+    /// zero-progress `EINTR`/`EAGAIN` is retried like [`Self::write_at`]. A
+    /// combined length above `u32::MAX`, or an offset above `i64::MAX`, fails
+    /// with [`Error::InvalidInput`].
+    pub fn write_vectored_at<'a, H: IoBuffer, T: SharedWriteBuffer, L: 'static>(
+        &'a self,
+        file: Rc<Descriptor>,
+        offset: u64,
+        header: H,
+        body: T,
+        lease: L,
+        scope: &'a S,
+    ) -> Operation<'a, VectoredCompletion<H, T, L>, S::Error>
+    where
+        S::Error: From<H::Error> + From<T::Error>,
+    {
+        Box::pin(async move {
+            scope.check()?;
+            if offset > i64::MAX as u64 {
+                return Err(Error::InvalidInput.into());
+            }
+            let empty = libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            };
+            let owned = VectoredInFlight {
+                file,
+                header,
+                body,
+                lease,
+                iovecs: SyscallArg::new([empty; 2]),
+            };
+            let fd = owned.file.clone();
+            let (owned, bytes) = self
+                .retry_data(owned, fd, scope, None, libc::POLLOUT as u32, |owned| {
+                    self.vectored_submission(owned, offset)
+                })
+                .await?;
+            Ok(owned.complete(bytes))
+        })
+    }
+
+    /// Point the retained iovecs at both segments and prepare one positioned writev.
+    fn vectored_submission<H: IoBuffer, T: SharedWriteBuffer, L: 'static>(
+        &self,
+        owned: &mut VectoredInFlight<H, T, L>,
+        offset: u64,
+    ) -> Result<Submission, S::Error>
+    where
+        S::Error: From<H::Error> + From<T::Error>,
+    {
+        let header = owned.header.bytes()?;
+        let body = owned.body.write_bytes()?;
+        if header
+            .len()
+            .checked_add(body.len())
+            .is_none_or(|total| u32::try_from(total).is_err())
+        {
+            return Err(Error::InvalidInput.into());
+        }
+        let segments = [
+            libc::iovec {
+                iov_base: header.as_ptr().cast_mut().cast(),
+                iov_len: header.len(),
+            },
+            libc::iovec {
+                iov_base: body.as_ptr().cast_mut().cast(),
+                iov_len: body.len(),
+            },
+        ];
+        // SAFETY: the one-element backing is initialized and exclusively owned;
+        // the kernel only reads it after publication below.
+        unsafe { owned.iovecs.as_mut_ptr().write(segments) };
+        let iovecs = owned.iovecs.as_ptr().cast::<libc::iovec>();
+        Ok(submission!(
+            self,
+            simulation::Op::Writev {
+                fd: owned.file.clone(),
+                offset,
+                iovecs,
+                count: 2,
+            },
+            opcode::Writev::new(types::Fd(owned.file.as_raw_fd()), iovecs, 2)
+                .offset(offset)
+                .build()
+                .flags(IssuePolicy::Inline.flags())
+        ))
     }
 
     /// Receive into owned storage while retaining the caller's lease through fencing.
@@ -1653,7 +1912,8 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         if state.ring_reservation.is_none() {
             return Ok(0);
         }
-        let mut finished = Vec::new();
+        // Reuse batch storage; a reentrant call finds it taken and allocates.
+        let mut finished = std::mem::take(&mut state.finished);
         let mut fence_wakes = Vec::new();
         let mut failure = None;
         let mut completed = 0;
@@ -1683,7 +1943,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         // One panicking callback must not discard unrelated completed replies or
         // notifications. Finish the batch outside all reactor borrows, then unwind.
         let mut panic = None;
-        for entry in finished {
+        for entry in finished.drain(..) {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if let Some(waker) = entry.finish() {
                     waker.wake();
@@ -1691,6 +1951,12 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             }));
             if let Err(payload) = result {
                 panic.get_or_insert(payload);
+            }
+        }
+        {
+            let mut state = self.state.borrow_mut();
+            if state.finished.capacity() == 0 {
+                state.finished = finished;
             }
         }
         for waiter in fence_wakes {
@@ -1705,65 +1971,8 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         if let Some(error) = failure {
             return Err(error);
         }
+        self.queue_cancellations(budget);
         let mut state = self.state.borrow_mut();
-        let count = budget.min(state.entries.len());
-        for _ in 0..count {
-            let id = state
-                .entries
-                .range((
-                    std::ops::Bound::Excluded(state.scan_after),
-                    std::ops::Bound::Unbounded,
-                ))
-                .next()
-                .or_else(|| state.entries.first_key_value())
-                .map(|(id, _)| *id);
-            let Some(id) = id else {
-                break;
-            };
-            state.scan_after = id;
-            let scope = state.entries[&id].scope.clone();
-            drop(state);
-            let cancelled = Error::Cancelled.into();
-            let checked = scope.check().err();
-            drop(scope);
-            state = self.state.borrow_mut();
-            let stopped = state.stopped;
-            let Some(entry) = state.entries.get_mut(&id) else {
-                continue;
-            };
-            if entry.cancel_reason.is_none() {
-                entry.cancel_reason = if stopped || entry.signal.abandoned.get() {
-                    Some(cancelled)
-                } else {
-                    checked
-                };
-            }
-            if entry.cancel_reason.is_some() && entry.completion.needs_cancel() {
-                #[cfg(feature = "simulation")]
-                if let Some(driver) = &mut state.simulation {
-                    driver.cancel(id.0);
-                    state
-                        .entries
-                        .get_mut(&id)
-                        .unwrap()
-                        .completion
-                        .cancel_submitted();
-                    continue;
-                }
-                let sqe = opcode::AsyncCancel::new(id.0)
-                    .build()
-                    .user_data(id.0 | CANCEL_BIT);
-                // SAFETY: cancel uses only an ID, and its target entry is retained.
-                if unsafe { state.ring.as_mut().unwrap().submission().push(&sqe) }.is_ok() {
-                    state
-                        .entries
-                        .get_mut(&id)
-                        .unwrap()
-                        .completion
-                        .cancel_submitted();
-                }
-            }
-        }
         let submitted = state.submit_pending();
         if submitted.is_err() {
             state.stopped = true;
@@ -1771,9 +1980,105 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         submitted.map(|()| completed)
     }
 
+    /// Queue ASYNC_CANCEL for up to `budget` in-flight operations whose scope was
+    /// cancelled, resuming the round-robin scan where the previous call stopped.
+    fn queue_cancellations(&self, budget: usize) {
+        // Snapshot the next round-robin slice in one borrow, reusing the scratch
+        // storage; a reentrant scan finds it taken and allocates its own.
+        let mut batch = {
+            let mut state = self.state.borrow_mut();
+            let count = budget.min(state.entries.len());
+            if count == 0 {
+                return;
+            }
+            let mut batch = std::mem::take(&mut state.scan_batch);
+            let after = state.scan_after;
+            let next = state
+                .entries
+                .after(after)
+                .take(count)
+                .map(|(id, entry)| (*id, entry.pending.clone(), None));
+            batch.extend(next);
+            if let Some((last, _, _)) = batch.last() {
+                state.scan_after = *last;
+            }
+            batch
+        };
+        // Policy checks run outside reactor borrows and may reenter.
+        for (_, pending, checked) in &mut batch {
+            *checked = pending.scope().check().err();
+        }
+        {
+            let mut state = self.state.borrow_mut();
+            let stopped = state.stopped;
+            for (id, _, checked) in &mut batch {
+                let id = *id;
+                let Some(entry) = state.entries.get_mut(&id) else {
+                    continue;
+                };
+                if entry.cancel_reason.is_none() {
+                    entry.cancel_reason = if stopped || entry.pending.signal().abandoned.get() {
+                        Some(Error::Cancelled.into())
+                    } else {
+                        checked.take()
+                    };
+                }
+                if entry.cancel_reason.is_some() && entry.completion.needs_cancel() {
+                    #[cfg(feature = "simulation")]
+                    if let Some(driver) = &mut state.simulation {
+                        driver.cancel(id.0);
+                        state
+                            .entries
+                            .get_mut(&id)
+                            .unwrap()
+                            .completion
+                            .cancel_submitted();
+                        continue;
+                    }
+                    let sqe = opcode::AsyncCancel::new(id.0)
+                        .build()
+                        .user_data(id.0 | CANCEL_BIT);
+                    // SAFETY: cancel uses only an ID, and its target entry is retained.
+                    if unsafe { state.ring.as_mut().unwrap().submission().push(&sqe) }.is_ok() {
+                        state
+                            .entries
+                            .get_mut(&id)
+                            .unwrap()
+                            .completion
+                            .cancel_submitted();
+                    }
+                }
+            }
+        }
+        // Release snapshot owners outside reactor borrows, then keep the storage.
+        batch.clear();
+        let mut state = self.state.borrow_mut();
+        if state.scan_batch.capacity() == 0 {
+            state.scan_batch = batch;
+        }
+    }
+
     /// Sleep until a CQE/external wake, bounded by both duration and a 10ms timer
     /// fallback for producers that cannot yet attach the eventfd wake endpoint.
     pub fn wait(&self, duration: Duration) -> Result<()> {
+        // A scope cancelled during the service turn wakes nothing, and its
+        // fenced operation completes only after ASYNC_CANCEL. Queue those
+        // cancels now so their CQEs end the sleep instead of the timeout. A
+        // pending local wake skips the sleep, so the next poll_budgeted scans.
+        let local_pending = || {
+            self.state
+                .borrow()
+                .wake
+                .as_ref()
+                .is_some_and(|wake| wake.local.load(Ordering::Acquire))
+        };
+        if !duration.is_zero() && !local_pending() {
+            // Scope checks read the ambient clock, so scan in the reactor's
+            // captured environment exactly as poll_budgeted does.
+            let _environment = self.environment.enter();
+            let pending = self.state.borrow().entries.len();
+            self.queue_cancellations(pending);
+        }
         let mut state = self.state.borrow_mut();
         // Service polling can queue SQEs after poll_budgeted. Submit once before
         // sleeping so that work can produce the CQEs we wait for. Transient errors
@@ -1792,6 +2097,16 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         }
         #[cfg(feature = "simulation")]
         if state.simulation.is_some() {
+            return Ok(());
+        }
+        // Completions already posted, for example by inline issue during the
+        // submit above, end the wait without a ppoll; the next poll_budgeted
+        // reaps them. A pending remote token stays for the next sleeping wait.
+        if state
+            .ring
+            .as_mut()
+            .is_some_and(|ring| !ring.completion().is_empty())
+        {
             return Ok(());
         }
         let mut fds = [
@@ -1908,11 +2223,11 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                 .borrow()
                 .entries
                 .iter()
-                .map(|(id, entry)| (*id, entry.scope.clone()))
+                .map(|(id, entry)| (*id, entry.pending.clone()))
                 .collect();
             let ids: Vec<_> = scopes
                 .into_iter()
-                .filter(|(_, scope)| matches(scope))
+                .filter(|(_, pending)| matches(pending.scope()))
                 .map(|(id, _)| id)
                 .collect();
             let cancelled = Error::Cancelled.into();
@@ -2021,6 +2336,9 @@ impl<S: Scope> State<S> {
 
     /// Remove matching registrations for notification outside the state borrow.
     fn take_fence_wakers(&mut self, target: Option<IoId>) -> Vec<FenceWaiter> {
+        if self.fence_waiters.is_empty() {
+            return Vec::new();
+        }
         let keys: Vec<_> = self
             .fence_waiters
             .range((target, 0)..=(target, u64::MAX))
@@ -2038,18 +2356,169 @@ impl<S: Scope> State<S> {
         result: impl Into<KernelResult>,
     ) -> Result<Option<FencedEntry<S>>> {
         let id = IoId(tag & !CANCEL_BIT);
-        let entry = self.entries.get_mut(&id).ok_or(Error::Io)?;
-        let Some(original) = entry
+        // One lookup serves both the fence update and the owner's removal.
+        let index = self.entries.index_of(id).ok_or(Error::Io)?;
+        let Some(original) = self
+            .entries
+            .at_mut(index)
             .completion
             .complete(tag & CANCEL_BIT != 0, result.into())?
         else {
             return Ok(None);
         };
-        let entry = self
-            .entries
-            .remove(&id)
-            .expect("completed entry remains owned");
+        let entry = self.entries.remove_at(index);
         Ok(Some(FencedEntry { entry, original }))
+    }
+}
+
+/// In-flight entries ordered by their monotonic identifiers.
+///
+/// Identifiers are allocated in increasing order, so inserts append and the
+/// slots stay sorted for binary search. Removal leaves a tombstone that is
+/// trimmed from either end or compacted once tombstones outnumber live
+/// entries, which bounds the storage by the live count even when one old
+/// entry outlives many newer ones.
+struct Table<V> {
+    slots: std::collections::VecDeque<(IoId, Option<V>)>,
+
+    live: usize,
+}
+
+impl<V> Default for Table<V> {
+    /// Create an empty table.
+    fn default() -> Self {
+        Self {
+            slots: std::collections::VecDeque::new(),
+            live: 0,
+        }
+    }
+}
+
+impl<V> Table<V> {
+    /// Count live entries.
+    fn len(&self) -> usize {
+        self.live
+    }
+
+    /// Whether no entry is live.
+    fn is_empty(&self) -> bool {
+        self.live == 0
+    }
+
+    /// Find the slot holding a live entry for `id`.
+    fn index_of(&self, id: IoId) -> Option<usize> {
+        let index = self.slots.binary_search_by_key(&id, |(key, _)| *key).ok()?;
+        self.slots[index].1.is_some().then_some(index)
+    }
+
+    /// Borrow the live entry at a slot returned by [`Self::index_of`].
+    fn at_mut(&mut self, index: usize) -> &mut V {
+        self.slots[index].1.as_mut().expect("live table slot")
+    }
+
+    /// Borrow a live entry.
+    fn get(&self, id: &IoId) -> Option<&V> {
+        self.index_of(*id)
+            .and_then(|index| self.slots[index].1.as_ref())
+    }
+
+    /// Mutably borrow a live entry.
+    fn get_mut(&mut self, id: &IoId) -> Option<&mut V> {
+        let index = self.index_of(*id)?;
+        self.slots[index].1.as_mut()
+    }
+
+    /// Whether `id` is live.
+    fn contains_key(&self, id: &IoId) -> bool {
+        self.index_of(*id).is_some()
+    }
+
+    /// Insert or replace an entry, returning any replaced value.
+    fn insert(&mut self, id: IoId, value: V) -> Option<V> {
+        if self.slots.back().is_none_or(|(last, _)| *last < id) {
+            self.slots.push_back((id, Some(value)));
+            self.live += 1;
+            return None;
+        }
+        match self.slots.binary_search_by_key(&id, |(key, _)| *key) {
+            Ok(index) => {
+                let old = self.slots[index].1.replace(value);
+                if old.is_none() {
+                    self.live += 1;
+                }
+                old
+            }
+            Err(index) => {
+                self.slots.insert(index, (id, Some(value)));
+                self.live += 1;
+                None
+            }
+        }
+    }
+
+    /// Remove a live entry.
+    fn remove(&mut self, id: &IoId) -> Option<V> {
+        let index = self.index_of(*id)?;
+        Some(self.remove_at(index))
+    }
+
+    /// Remove the live entry at a slot returned by [`Self::index_of`].
+    fn remove_at(&mut self, index: usize) -> V {
+        let value = self.slots[index].1.take().expect("live table slot");
+        self.live -= 1;
+        while self.slots.front().is_some_and(|(_, value)| value.is_none()) {
+            self.slots.pop_front();
+        }
+        while self.slots.back().is_some_and(|(_, value)| value.is_none()) {
+            self.slots.pop_back();
+        }
+        if self.slots.len() > 2 * self.live + 16 {
+            self.slots.retain(|(_, value)| value.is_some());
+        }
+        value
+    }
+
+    /// Iterate live entries in identifier order.
+    fn iter(&self) -> impl Iterator<Item = (&IoId, &V)> {
+        self.slots
+            .iter()
+            .filter_map(|(id, value)| value.as_ref().map(|value| (id, value)))
+    }
+
+    /// Iterate live identifiers in order.
+    #[cfg(all(test, feature = "simulation"))]
+    fn keys(&self) -> impl Iterator<Item = &IoId> {
+        self.iter().map(|(id, _)| id)
+    }
+
+    /// Iterate live entries in identifier order.
+    #[cfg(test)]
+    fn values(&self) -> impl Iterator<Item = &V> {
+        self.iter().map(|(_, value)| value)
+    }
+
+    /// The live entry with the smallest identifier.
+    #[cfg(test)]
+    fn first_key_value(&self) -> Option<(&IoId, &V)> {
+        self.iter().next()
+    }
+
+    /// Iterate live entries after `id`, then wrap around to those at or before it.
+    fn after(&self, id: IoId) -> impl Iterator<Item = (&IoId, &V)> {
+        let split = self.slots.partition_point(|(key, _)| *key <= id);
+        self.slots
+            .range(split..)
+            .chain(self.slots.range(..split))
+            .filter_map(|(id, value)| value.as_ref().map(|value| (id, value)))
+    }
+}
+
+impl<V> std::ops::Index<&IoId> for Table<V> {
+    type Output = V;
+
+    /// Borrow a live entry, panicking if it is absent.
+    fn index(&self, id: &IoId) -> &V {
+        self.get(id).expect("live table entry")
     }
 }
 
@@ -3006,6 +3475,40 @@ pub mod ready_set {
             Ok(None)
         }
 
+        /// Report whether an index is cached or a registered descriptor is ready,
+        /// without waiting. Ready indices are cached for the next `next` call. An
+        /// outstanding idle wait owns the next wake, so this reports false.
+        pub fn has_ready(&mut self) -> Result<bool, E> {
+            if !self.ready.is_empty() {
+                return Ok(true);
+            }
+            if self.wait.is_some() {
+                return Ok(false);
+            }
+            let mut events = [libc::epoll_event { events: 0, u64: 0 }; 64];
+            // SAFETY: events is writable for the bounded requested event count.
+            let count = unsafe {
+                libc::epoll_wait(
+                    self.fd.as_raw_fd(),
+                    events.as_mut_ptr(),
+                    events.len() as i32,
+                    0,
+                )
+            };
+            if count < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    return Ok(true);
+                }
+                return Err(Error::Io.into());
+            }
+            self.ready.extend(
+                events[..count as usize]
+                    .iter()
+                    .map(|event| event.u64 as usize),
+            );
+            Ok(!self.ready.is_empty())
+        }
+
         /// Consume completed waits before propagating failure, preventing repolling.
         /// With no wait the caller can inspect the level-triggered index immediately.
         fn poll_wait(&mut self, cx: &mut Context<'_>) -> Result<Poll<()>, E> {
@@ -3109,6 +3612,31 @@ pub mod ready_set {
             set.next(&mut cx, 3, |_| panic!("ready")).unwrap();
             assert_eq!(set.ready.len(), 2);
             set.clear();
+            assert!(set.ready.is_empty());
+        }
+
+        #[test]
+        /// Probe level readiness without waiting, caching indices for `next`.
+        fn has_ready_caches_level_readiness_and_defers_to_an_idle_wait() {
+            let mut set = ReadySet::<Error>::new().unwrap();
+            let (mut reader, mut writer) = UnixStream::pair().unwrap();
+            reader.set_nonblocking(true).unwrap();
+            set.insert(reader.as_raw_fd(), 4).unwrap();
+            assert_eq!(set.has_ready(), Ok(false));
+            writer.write_all(b"x").unwrap();
+            assert_eq!(set.has_ready(), Ok(true));
+            assert_eq!(set.ready.len(), 1);
+            assert_eq!(set.has_ready(), Ok(true), "cached index is not refilled");
+            assert_eq!(set.ready.len(), 1);
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert_eq!(set.next(&mut cx, 1, |_| panic!("cached")), Ok(Some(4)));
+            reader.read_exact(&mut [0]).unwrap();
+            assert_eq!(
+                set.next(&mut cx, 1, |_| Box::pin(std::future::pending())),
+                Ok(None)
+            );
+            writer.write_all(b"x").unwrap();
+            assert_eq!(set.has_ready(), Ok(false), "the idle wait owns the wake");
             assert!(set.ready.is_empty());
         }
 

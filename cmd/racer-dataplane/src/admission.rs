@@ -58,12 +58,16 @@ pub struct AdmissionPolicy {
     limits: Limits,
 
     observer: OnceLock<Observer>,
+
+    /// Published cache priorities. Clones share one table.
+    weights: crate::priority::Weights,
 }
 impl Clone for AdmissionPolicy {
     fn clone(&self) -> Self {
         Self {
             limits: self.limits.clone(),
             observer: self.observer.clone(),
+            weights: self.weights.clone(),
         }
     }
 }
@@ -72,7 +76,12 @@ impl AdmissionPolicy {
         Self {
             limits,
             observer: OnceLock::new(),
+            weights: crate::priority::Weights::default(),
         }
+    }
+    /// Shared priority table. Call `Quotas::reweigh` after updating it.
+    pub fn weights(&self) -> &crate::priority::Weights {
+        &self.weights
     }
     pub fn limits(&self) -> &Limits {
         &self.limits
@@ -114,6 +123,115 @@ mod observer_tests {
         let policy = AdmissionPolicy::new(crate::test_support::cluster::config(false).limits);
         policy.set_observer(Observer::default());
         policy.set_observer(Observer::default());
+    }
+
+    #[test]
+    fn memory_fair_limits_follow_live_priority_with_floor() {
+        let mut limits = crate::test_support::cluster::config(false).limits;
+        limits.range_window_pages = std::num::NonZeroUsize::new(2).unwrap();
+        let quotas = Quotas::new(AdmissionPolicy::new(limits));
+        let class = ResourceClass::Plaintext;
+        let limit = quotas.limit(class);
+        let floor = quotas.policy().floor(class);
+        let a = CacheId("a".into());
+        let b = CacheId("b".into());
+        let definition = |id: &CacheId, priority| racer_control_wire::CacheDefinition {
+            id: id.clone(),
+            name: id.0.clone(),
+            client_socket: "/c".into(),
+            origin_socket: "/o".into(),
+            priority,
+        };
+        // Unknown caches use the default priority, so shares start equal.
+        assert_eq!(quotas.policy().weight(&a), 500);
+        let _ca = quotas.reserve(Some(&a), class, 1).unwrap();
+        let _cb = quotas.reserve(Some(&b), class, 1).unwrap();
+        assert_eq!(quotas.fair_limit(&a, class), quotas.fair_limit(&b, class));
+        assert!(
+            quotas
+                .policy()
+                .weights()
+                .update(&[definition(&a, 900), definition(&b, 100)])
+        );
+        quotas.reweigh();
+        assert_eq!(quotas.active_weight(), 1000);
+        // Weights never cut below the request-progress allowance or the
+        // equal split, whichever is smaller.
+        let progress = quotas.policy().progress(class).min(limit / 2);
+        assert!(progress > floor);
+        assert_eq!(quotas.fair_limit(&a, class), (limit * 9 / 10).max(progress));
+        assert_eq!(quotas.fair_limit(&b, class), (limit / 10).max(progress));
+        // Priority 0 keeps only the request-progress allowance.
+        quotas
+            .policy()
+            .weights()
+            .update(&[definition(&a, 1000), definition(&b, 0)]);
+        quotas.reweigh();
+        assert_eq!(quotas.fair_limit(&b, class), progress);
+        assert_eq!(quotas.fair_limit(&a, class), limit);
+    }
+
+    #[test]
+    fn zero_priority_cache_can_reserve_request_context_beside_active_cache() {
+        let mut limits = crate::test_support::cluster::config(false).limits;
+        limits.range_window_pages = std::num::NonZeroUsize::new(2).unwrap();
+        let quotas = Quotas::new(AdmissionPolicy::new(limits));
+        let a = CacheId("a".into());
+        let z = CacheId("z".into());
+        let definition = |id: &CacheId, priority| racer_control_wire::CacheDefinition {
+            id: id.clone(),
+            name: id.0.clone(),
+            client_socket: "/c".into(),
+            origin_socket: "/o".into(),
+            priority,
+        };
+        quotas
+            .policy()
+            .weights()
+            .update(&[definition(&a, 1000), definition(&z, 0)]);
+        quotas.reweigh();
+        let context = racer_object_wire::client::MAX_HEAD_BYTES;
+        let _active = quotas
+            .reserve(Some(&a), ResourceClass::RequestContext, context)
+            .unwrap();
+        let _page = quotas
+            .reserve(Some(&a), ResourceClass::Plaintext, PAGE_BYTES as usize)
+            .unwrap();
+        // The listener reserves a full head of context before reading a request.
+        let _zero = quotas
+            .reserve(Some(&z), ResourceClass::RequestContext, context)
+            .unwrap();
+        let limit = quotas.limit(ResourceClass::RequestContext);
+        assert_eq!(
+            quotas.fair_limit(&z, ResourceClass::RequestContext),
+            quotas.fair_limit(&a, ResourceClass::RequestContext)
+        );
+        assert_eq!(
+            quotas.fair_limit(&z, ResourceClass::RequestContext),
+            (limit / 2).max(1)
+        );
+        // Priority-0 page memory keeps its request-progress allowance.
+        let _zero_page = quotas
+            .reserve(Some(&z), ResourceClass::Plaintext, PAGE_BYTES as usize)
+            .unwrap();
+        let window = quotas.policy().limits().range_window_pages.get();
+        assert_eq!(
+            quotas.fair_limit(&z, ResourceClass::Plaintext),
+            (window + 1) * PAGE_BYTES as usize
+        );
+        // The allowance covers a full range window beyond the held page, and no more.
+        let _ahead = quotas
+            .reserve(
+                Some(&z),
+                ResourceClass::Plaintext,
+                window * PAGE_BYTES as usize,
+            )
+            .unwrap();
+        assert!(
+            quotas
+                .reserve(Some(&z), ResourceClass::Plaintext, 1)
+                .is_err()
+        );
     }
 }
 
@@ -188,6 +306,18 @@ impl Policy for AdmissionPolicy {
             ResourceClass::Relay => self.limits.relay_transfers.get(),
         }
     }
+    /// A cache's keyed fair share follows its published priority.
+    fn weight(&self, key: &CacheId) -> u64 {
+        self.weights.weight(key)
+    }
+    /// Priority weights page-memory budgets. Other request-serving classes
+    /// keep an equal split so a priority-0 cache can still serve requests.
+    fn weighted(class: ResourceClass) -> bool {
+        matches!(
+            class,
+            ResourceClass::Plaintext | ResourceClass::Ciphertext | ResourceClass::DirtyCiphertext
+        )
+    }
     fn floor(&self, class: ResourceClass) -> usize {
         match class {
             ResourceClass::Plaintext => PAGE_BYTES as usize,
@@ -198,6 +328,26 @@ impl Policy for AdmissionPolicy {
             .expect("bounded page capacity"),
             ResourceClass::DirtyCiphertext | ResourceClass::Registered => PAGE_BYTES as usize + 16,
             _ => 1,
+        }
+    }
+    /// Plaintext is request working memory; ciphertext is both working and
+    /// retained memory. Each cache keeps an allowance sized for one range
+    /// window, the same amount configuration validation requires of each whole
+    /// budget (`config.rs`). All concurrent requests on the cache share it, and
+    /// the equal-share cap can make it smaller, so a low-priority cache can still
+    /// see `Overloaded`. It limits how far low priority shrinks the share; it
+    /// does not guarantee progress.
+    fn progress(&self, class: ResourceClass) -> usize {
+        let window = self.limits.range_window_pages.get();
+        let record = PAGE_BYTES as usize + 16 + crate::store::MAX_HEADER_BYTES;
+        match class {
+            ResourceClass::Plaintext => {
+                window.saturating_add(1).saturating_mul(PAGE_BYTES as usize)
+            }
+            ResourceClass::Ciphertext => window
+                .saturating_mul(PAGE_BYTES as usize + 16)
+                .saturating_add(record),
+            _ => 0,
         }
     }
     fn max_keys(&self) -> usize {
@@ -522,6 +672,63 @@ mod tests {
             );
         }
         assert_eq!(policy.floor(ResourceClass::Plaintext), PAGE_BYTES as usize);
+    }
+
+    #[test]
+    fn request_progress_follows_range_window_and_never_exceeds_equal_split() {
+        use flow_control::Policy;
+        let mut limits = crate::test_support::cluster::config(false).limits;
+        let record = PAGE_BYTES as usize + 16 + crate::store::MAX_HEADER_BYTES;
+        for window in [1usize, 2, 4] {
+            limits.range_window_pages = std::num::NonZeroUsize::new(window).unwrap();
+            let policy = AdmissionPolicy::new(limits.clone());
+            assert_eq!(
+                policy.progress(ResourceClass::Plaintext),
+                (window + 1) * PAGE_BYTES as usize
+            );
+            assert_eq!(
+                policy.progress(ResourceClass::Ciphertext),
+                window * (PAGE_BYTES as usize + 16) + record
+            );
+            // Floors and unweighted classes are unchanged.
+            assert_eq!(policy.floor(ResourceClass::Plaintext), PAGE_BYTES as usize);
+            assert_eq!(policy.progress(ResourceClass::DirtyCiphertext), 0);
+            assert_eq!(policy.progress(ResourceClass::RequestContext), 0);
+        }
+        // With a small budget the allowance is clipped to the equal split, so
+        // a priority-0 cache cannot take more than an equal-priority peer.
+        let definition = |id: &CacheId, priority| racer_control_wire::CacheDefinition {
+            id: id.clone(),
+            name: id.0.clone(),
+            client_socket: "/c".into(),
+            origin_socket: "/o".into(),
+            priority,
+        };
+        limits.range_window_pages = std::num::NonZeroUsize::new(2).unwrap();
+        limits.plaintext_bytes = std::num::NonZeroUsize::new(4 * PAGE_BYTES as usize).unwrap();
+        let quotas = Quotas::new(AdmissionPolicy::new(limits));
+        let a = CacheId("a".into());
+        let z = CacheId("z".into());
+        quotas
+            .policy()
+            .weights()
+            .update(&[definition(&a, 1000), definition(&z, 0)]);
+        quotas.reweigh();
+        let _active = quotas
+            .reserve(Some(&a), ResourceClass::Plaintext, 1)
+            .unwrap();
+        let _held = quotas
+            .reserve(Some(&z), ResourceClass::Plaintext, 2 * PAGE_BYTES as usize)
+            .unwrap();
+        assert_eq!(
+            quotas.fair_limit(&z, ResourceClass::Plaintext),
+            2 * PAGE_BYTES as usize
+        );
+        assert!(
+            quotas
+                .reserve(Some(&z), ResourceClass::Plaintext, 1)
+                .is_err()
+        );
     }
 
     #[test]

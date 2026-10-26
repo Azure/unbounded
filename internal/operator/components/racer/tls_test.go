@@ -51,6 +51,18 @@ func verifyServing(t *testing.T, secret *corev1.Secret, trust []byte, now time.T
 	return err
 }
 
+func requireWebhookCABundle(t *testing.T, env *component.Env, roots []byte) {
+	t.Helper()
+
+	webhook := &admissionv1.MutatingWebhookConfiguration{}
+	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: webhookName}, webhook))
+	require.NotEmpty(t, webhook.Webhooks)
+
+	for _, hook := range webhook.Webhooks {
+		require.Equal(t, roots, hook.ClientConfig.CABundle)
+	}
+}
+
 func stateOf(t *testing.T, secret *corev1.Secret) tlsState {
 	t.Helper()
 
@@ -304,7 +316,7 @@ func TestRetainedTLSMaintenanceDoesNotRepairController(t *testing.T) {
 		at := now.Add(time.Duration(week) * caRotationInterval)
 		old := secret.DeepCopy()
 
-		for _, kind := range []string{"Secret", "ConfigMap"} {
+		for _, kind := range []string{"Secret", "ConfigMap", "MutatingWebhookConfiguration"} {
 			plan, result, err := planAt(t.Context(), env, at)
 			require.NoError(t, err)
 
@@ -327,6 +339,7 @@ func TestRetainedTLSMaintenanceDoesNotRepairController(t *testing.T) {
 		require.NoError(t, verifyServing(t, secret, old.Data["ca.crt"], at))
 		require.NoError(t, verifyServing(t, old, secret.Data[caBundleKey], at))
 		require.True(t, apierrors.IsNotFound(env.Client.Get(t.Context(), objectKey(env, controllerName), deployment)))
+		requireWebhookCABundle(t, env, servingRoots(secret))
 	}
 
 	require.NoError(t, env.Client.Delete(t.Context(), secret))
@@ -604,7 +617,7 @@ func TestTLSEstablishedMaintenanceBeforeUnrelatedFailures(t *testing.T) {
 					return c.List(ctx, list, opts...)
 				},
 			})
-			for _, name := range []string{tlsName, trustName} {
+			for _, name := range []string{tlsName, trustName, webhookName} {
 				plan, _, err := planAt(t.Context(), env, at)
 				require.NoError(t, err)
 				require.Len(t, plan.Operations, 1)
@@ -618,6 +631,7 @@ func TestTLSEstablishedMaintenanceBeforeUnrelatedFailures(t *testing.T) {
 			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, trustName), trust))
 			require.NoError(t, verifyServing(t, secret, []byte(trust.Data["ca.crt"]), at))
 			require.Error(t, verifyServing(t, secret, old.Data["ca.crt"], at))
+			requireWebhookCABundle(t, env, []byte(trust.Data["ca.crt"]))
 			plan, _, err := planAt(t.Context(), env, at)
 			require.Error(t, err)
 			require.Nil(t, plan)

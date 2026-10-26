@@ -27,25 +27,25 @@ import (
 )
 
 // NewAzureOrigin reads block blobs without caching. Schema-1 Bucket names the
-// container. Use a separate namespace and cache for each provider and account.
+// container, which must equal config.Bucket. Use a separate cache for each
+// provider, account, and container.
 func NewAzureOrigin(client *service.Client, config OriginConfig) (racersdk.Origin, error) {
 	if client == nil || config.MetadataTTL < 0 {
 		return nil, racersdk.ErrInvalidRequest
 	}
 
-	bound, err := newScope(config.Namespace, config.Buckets)
-	if err != nil {
+	if !validBucket(config.Bucket) {
 		return nil, racersdk.ErrInvalidRequest
 	}
 
-	origin := &azureOrigin{client: client, scope: bound, ttl: config.MetadataTTL}
+	origin := &azureOrigin{client: client, bucket: config.Bucket, ttl: config.MetadataTTL}
 
 	return origin.read, nil
 }
 
 type azureOrigin struct {
 	client *service.Client
-	scope  scope
+	bucket string
 	ttl    time.Duration
 }
 
@@ -54,7 +54,7 @@ func (o *azureOrigin) read(ctx context.Context, request racersdk.OriginRequest) 
 		return racersdk.Metadata{}, nil, classifyAzureError(err, false)
 	}
 
-	object, err := decodeObject(request, o.scope)
+	object, err := decodeObject(request, o.bucket)
 	if err != nil {
 		return racersdk.Metadata{}, nil, err
 	}

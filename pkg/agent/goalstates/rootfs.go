@@ -51,4 +51,14 @@ type RootFS struct {
 	// AdditionalHostMounts holds configured non-device host paths to be
 	// bind-mounted into the nspawn container.
 	AdditionalHostMounts []config.AdditionalHostMount
+
+	// NSpawnLifecycle holds the configured lifecycle hook commands. Nil means
+	// the hooks run the lifecycle helper, which provisioning installs.
+	NSpawnLifecycle *config.NSpawnLifecycleConfig
+}
+
+// UsesLifecycleHelper reports whether the machine's hooks run the lifecycle
+// helper, which must then be installed on the host.
+func (r *RootFS) UsesLifecycleHelper() bool {
+	return r.NSpawnLifecycle == nil
 }

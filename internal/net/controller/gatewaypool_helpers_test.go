@@ -14,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic/fake"
@@ -29,6 +30,23 @@ import (
 type fakeInformer struct {
 	cache.SharedIndexInformer
 	store cache.Store
+}
+
+type orderedNodeLister struct {
+	corev1listers.NodeLister
+	nodes []*corev1.Node
+}
+
+func (l orderedNodeLister) List(selector labels.Selector) ([]*corev1.Node, error) {
+	var result []*corev1.Node
+
+	for _, node := range l.nodes {
+		if selector.Matches(labels.Set(node.Labels)) {
+			result = append(result, node)
+		}
+	}
+
+	return result, nil
 }
 
 func (f *fakeInformer) GetStore() cache.Store { return f.store }
@@ -120,6 +138,7 @@ func TestNodeEligibilityAndPreferredPoolHelpers(t *testing.T) {
 			NodeSelector: map[string]string{"role": "gateway"},
 		},
 	}
+
 	poolExternalB := &unboundednetv1alpha1.GatewayPool{
 		ObjectMeta: metav1.ObjectMeta{Name: "pool-a"},
 		Spec: unboundednetv1alpha1.GatewayPoolSpec{
@@ -1096,4 +1115,280 @@ func TestCleanupStaleGatewayPoolNodesPreservesPreferredPoolHandoff(t *testing.T)
 	if got, _, _ := unstructured.NestedString(updated.Object, "spec", "gatewayPool"); got != internalPool.Name {
 		t.Fatalf("spec.gatewayPool = %q, want %q", got, internalPool.Name)
 	}
+}
+
+func TestReconcileNodeGatewayPoolAssignments(t *testing.T) {
+	t.Run("writes raw preferred pool and clears demoted state", func(t *testing.T) {
+		gateway := makeGatewayNode("gateway", map[string]string{"role": "gateway"}, true, "pub")
+		gateway.UID = "gateway-uid"
+		gateway.ResourceVersion = "1"
+		worker := makeGatewayNode("worker", map[string]string{
+			"example.com/preserved":                  "true",
+			"role":                                   "worker",
+			unboundednetv1alpha1.GatewayPoolLabelKey: "old-pool",
+		}, true, "pub-worker")
+		worker.UID = "worker-uid"
+		worker.ResourceVersion = "2"
+		worker.Annotations[WireGuardPortAnnotation] = "51822"
+		worker.Annotations["example.com/preserved"] = "true"
+
+		pool := unboundednetv1alpha1.GatewayPool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool.raw"},
+			Spec: unboundednetv1alpha1.GatewayPoolSpec{
+				Type:         gatewayPoolTypeExternal,
+				NodeSelector: map[string]string{"role": "gateway"},
+			},
+		}
+
+		client := kubefake.NewSimpleClientset(gateway, worker)
+
+		indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+		for _, node := range []*corev1.Node{gateway, worker} {
+			if err := indexer.Add(node); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		controller := &GatewayPoolController{
+			clientset:           client,
+			nodeLister:          corev1listers.NewNodeLister(indexer),
+			gatewayPoolInformer: &fakeInformer{store: gatewayPoolStore(t, &pool)},
+		}
+		if err := controller.reconcileNodeGatewayPoolAssignments(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+
+		gotGateway, err := client.CoreV1().Nodes().Get(t.Context(), gateway.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if gotGateway.Labels[unboundednetv1alpha1.GatewayPoolLabelKey] != pool.Name {
+			t.Fatalf("gateway labels = %#v, want raw pool name %q", gotGateway.Labels, pool.Name)
+		}
+
+		gotWorker, err := client.CoreV1().Nodes().Get(t.Context(), worker.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if _, ok := gotWorker.Labels[unboundednetv1alpha1.GatewayPoolLabelKey]; ok {
+			t.Fatalf("worker retained GatewayPool label: %#v", gotWorker.Labels)
+		}
+
+		if _, ok := gotWorker.Annotations[WireGuardPortAnnotation]; ok {
+			t.Fatalf("worker retained WireGuard port annotation: %#v", gotWorker.Annotations)
+		}
+
+		if gotWorker.Labels["example.com/preserved"] != "true" || gotWorker.Annotations["example.com/preserved"] != "true" {
+			t.Fatalf("worker unrelated metadata was not preserved: labels=%#v annotations=%#v", gotWorker.Labels, gotWorker.Annotations)
+		}
+	})
+
+	t.Run("adds labels map when absent", func(t *testing.T) {
+		node := makeGatewayNode("gateway", nil, true, "pub")
+		node.UID = "gateway-uid"
+		node.ResourceVersion = "1"
+		pool := unboundednetv1alpha1.GatewayPool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool.raw"},
+			Spec: unboundednetv1alpha1.GatewayPoolSpec{
+				Type: gatewayPoolTypeExternal,
+			},
+		}
+		client := kubefake.NewSimpleClientset(node)
+
+		indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+		if err := indexer.Add(node); err != nil {
+			t.Fatal(err)
+		}
+
+		controller := &GatewayPoolController{
+			clientset:           client,
+			nodeLister:          corev1listers.NewNodeLister(indexer),
+			gatewayPoolInformer: &fakeInformer{store: gatewayPoolStore(t, &pool)},
+		}
+
+		if err := controller.reconcileNodeGatewayPoolAssignments(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+
+		got, err := client.CoreV1().Nodes().Get(t.Context(), node.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if got.Labels[unboundednetv1alpha1.GatewayPoolLabelKey] != pool.Name {
+			t.Fatalf("gateway labels = %#v, want raw pool name %q", got.Labels, pool.Name)
+		}
+	})
+
+	t.Run("invalid raw name fails explicitly", func(t *testing.T) {
+		node := makeGatewayNode("gateway", map[string]string{"role": "gateway"}, true, "pub")
+		node.UID = "gateway-uid"
+		node.ResourceVersion = "1"
+		pool := unboundednetv1alpha1.GatewayPool{
+			ObjectMeta: metav1.ObjectMeta{Name: strings.Repeat("a", 64)},
+			Spec: unboundednetv1alpha1.GatewayPoolSpec{
+				Type:         gatewayPoolTypeExternal,
+				NodeSelector: map[string]string{"role": "gateway"},
+			},
+		}
+		validNode := makeGatewayNode("valid-gateway", map[string]string{"role": "valid-gateway"}, true, "pub-valid")
+		validNode.UID = "valid-uid"
+		validNode.ResourceVersion = "1"
+		validPool := &unboundednetv1alpha1.GatewayPool{
+			ObjectMeta: metav1.ObjectMeta{Name: "valid-pool"},
+			Spec: unboundednetv1alpha1.GatewayPoolSpec{
+				Type:         gatewayPoolTypeExternal,
+				NodeSelector: map[string]string{"role": "valid-gateway"},
+			},
+		}
+		client := kubefake.NewSimpleClientset(node, validNode)
+
+		indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+		if err := indexer.Add(node); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := indexer.Add(validNode); err != nil {
+			t.Fatal(err)
+		}
+
+		controller := &GatewayPoolController{
+			clientset:           client,
+			nodeLister:          corev1listers.NewNodeLister(indexer),
+			gatewayPoolInformer: &fakeInformer{store: gatewayPoolStore(t, &pool, validPool)},
+		}
+		controller.nodeLister = orderedNodeLister{
+			NodeLister: controller.nodeLister,
+			nodes:      []*corev1.Node{node, validNode},
+		}
+
+		err := controller.reconcileNodeGatewayPoolAssignments(t.Context())
+		if err == nil || !strings.Contains(err.Error(), "not a valid Kubernetes label value") {
+			t.Fatalf("error = %v", err)
+		}
+
+		got, getErr := client.CoreV1().Nodes().Get(t.Context(), node.Name, metav1.GetOptions{})
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+
+		if _, ok := got.Labels[unboundednetv1alpha1.GatewayPoolLabelKey]; ok {
+			t.Fatalf("invalid pool silently assigned: %#v", got.Labels)
+		}
+
+		gotValid, err := client.CoreV1().Nodes().Get(t.Context(), validNode.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if gotValid.Labels[unboundednetv1alpha1.GatewayPoolLabelKey] != validPool.Name {
+			t.Fatalf("valid assignment blocked by invalid pool: %#v", gotValid.Labels)
+		}
+	})
+
+	t.Run("same-name replacement is not modified", func(t *testing.T) {
+		cached := makeGatewayNode("gateway", map[string]string{"role": "gateway"}, true, "pub")
+		cached.UID = "old-uid"
+		cached.ResourceVersion = "1"
+		replacement := cached.DeepCopy()
+		replacement.UID = "replacement-uid"
+		replacement.ResourceVersion = "2"
+		replacement.Labels = map[string]string{"role": "worker", "example.com/preserved": "true"}
+
+		pool := unboundednetv1alpha1.GatewayPool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool.raw"},
+			Spec: unboundednetv1alpha1.GatewayPoolSpec{
+				Type:         gatewayPoolTypeExternal,
+				NodeSelector: map[string]string{"role": "gateway"},
+			},
+		}
+		client := kubefake.NewSimpleClientset(replacement)
+
+		indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+		if err := indexer.Add(cached); err != nil {
+			t.Fatal(err)
+		}
+
+		controller := &GatewayPoolController{
+			clientset:           client,
+			nodeLister:          corev1listers.NewNodeLister(indexer),
+			gatewayPoolInformer: &fakeInformer{store: gatewayPoolStore(t, &pool)},
+		}
+
+		err := controller.reconcileNodeGatewayPoolAssignments(t.Context())
+		if err == nil || !strings.Contains(err.Error(), "retry after informer refresh") {
+			t.Fatalf("error = %v, want cached identity precondition failure", err)
+		}
+
+		got, getErr := client.CoreV1().Nodes().Get(t.Context(), replacement.Name, metav1.GetOptions{})
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+
+		if _, ok := got.Labels[unboundednetv1alpha1.GatewayPoolLabelKey]; ok {
+			t.Fatalf("replacement node was assigned from stale cache: %#v", got.Labels)
+		}
+
+		if got.UID != replacement.UID || got.Labels["example.com/preserved"] != "true" {
+			t.Fatalf("replacement node metadata changed: %#v", got.ObjectMeta)
+		}
+	})
+
+	t.Run("changed resource version is not assigned from stale selector", func(t *testing.T) {
+		cached := makeGatewayNode("gateway", map[string]string{"role": "gateway"}, true, "pub")
+		cached.UID = "gateway-uid"
+		cached.ResourceVersion = "1"
+		fresh := cached.DeepCopy()
+		fresh.ResourceVersion = "2"
+		fresh.Labels = map[string]string{"role": "worker"}
+
+		pool := unboundednetv1alpha1.GatewayPool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool.raw"},
+			Spec: unboundednetv1alpha1.GatewayPoolSpec{
+				Type:         gatewayPoolTypeExternal,
+				NodeSelector: map[string]string{"role": "gateway"},
+			},
+		}
+		client := kubefake.NewSimpleClientset(fresh)
+
+		indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+		if err := indexer.Add(cached); err != nil {
+			t.Fatal(err)
+		}
+
+		controller := &GatewayPoolController{
+			clientset:           client,
+			nodeLister:          corev1listers.NewNodeLister(indexer),
+			gatewayPoolInformer: &fakeInformer{store: gatewayPoolStore(t, &pool)},
+		}
+
+		err := controller.reconcileNodeGatewayPoolAssignments(t.Context())
+		if err == nil || !strings.Contains(err.Error(), "retry after informer refresh") {
+			t.Fatalf("error = %v, want cached resourceVersion precondition failure", err)
+		}
+
+		got, getErr := client.CoreV1().Nodes().Get(t.Context(), fresh.Name, metav1.GetOptions{})
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+
+		if _, ok := got.Labels[unboundednetv1alpha1.GatewayPoolLabelKey]; ok {
+			t.Fatalf("fresh node was assigned from stale selector: %#v", got.Labels)
+		}
+	})
+}
+
+func gatewayPoolStore(t *testing.T, pools ...*unboundednetv1alpha1.GatewayPool) cache.Store {
+	t.Helper()
+
+	store := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	for _, pool := range pools {
+		if err := store.Add(toGatewayPoolUnstructured(t, pool)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	return store
 }

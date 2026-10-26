@@ -199,7 +199,12 @@ func (c *Collector) buildEntry(name, version string) (notice.Entry, error) {
 			return notice.Entry{}, fmt.Errorf("classifying %s: %w", licensePath, classifyErr)
 		}
 
-		licenseURL := fmt.Sprintf("https://docs.rs/crate/%s/%s/source/%s", name, version, filepath.Base(licensePath))
+		relPath, relErr := filepath.Rel(matches[0], licensePath)
+		if relErr != nil {
+			return notice.Entry{}, fmt.Errorf("locating %s: %w", licensePath, relErr)
+		}
+
+		licenseURL := fmt.Sprintf("https://docs.rs/crate/%s/%s/source/%s", name, version, filepath.ToSlash(relPath))
 
 		for _, licenseName := range licenseNames {
 			if !seenLicenses[licenseName] {
@@ -264,11 +269,47 @@ These are included as LICENSE-APACHE, LICENSE-MIT and LICENSE-ISC
 respectively. You may use this software under the terms of any
 of these licenses, at your option.`
 
+// ring uses this exact index instead of license terms. As with rustls, only
+// this body (apart from whitespace) is accepted, every referenced companion must
+// exist, and each companion is still classified separately.
+const ringLicenseIndex = `*ring* uses an "ISC" license, like BoringSSL used to use, for new code
+files. See LICENSE-other-bits for the text of that license.
+
+See LICENSE-BoringSSL for code that was sourced from BoringSSL under the
+Apache 2.0 license. Some code that was sourced from BoringSSL under the ISC
+license. In each case, the license info is at the top of the file.
+
+See src/polyfill/once_cell/LICENSE-APACHE and src/polyfill/once_cell/LICENSE-MIT
+for the license to code that was sourced from the once_cell project.`
+
+// ringIndexCompanions are the files referenced by ringLicenseIndex, relative
+// to the crate root.
+var ringIndexCompanions = []string{
+	"LICENSE-other-bits",
+	"LICENSE-BoringSSL",
+	"src/polyfill/once_cell/LICENSE-APACHE",
+	"src/polyfill/once_cell/LICENSE-MIT",
+}
+
+func isRingLicenseIndex(text []byte) bool {
+	return strings.Join(strings.Fields(string(text)), " ") == strings.Join(strings.Fields(ringLicenseIndex), " ")
+}
+
 var indexCopyright = regexp.MustCompile(`^Copyright (?:\(c\) |© )?[0-9]{4}(?:-[0-9]{4})? .+$`)
 
 func licenseIndex(path string, text []byte, paths []string) bool {
 	if filepath.Base(path) != "LICENSE" {
 		return false
+	}
+
+	if isRingLicenseIndex(text) {
+		for _, name := range ringIndexCompanions {
+			if !slices.Contains(paths, filepath.Join(filepath.Dir(path), filepath.FromSlash(name))) {
+				return false
+			}
+		}
+
+		return true
 	}
 
 	body := strings.TrimSpace(string(text))
@@ -316,6 +357,17 @@ func crateLicenseFiles(dir string) ([]string, error) {
 
 	if len(paths) == 0 {
 		return nil, fmt.Errorf("no license file found in %s", dir)
+	}
+
+	// ring's index references companions outside the crate root; include
+	// them so they are classified like any other license file.
+	if text, err := os.ReadFile(filepath.Join(dir, "LICENSE")); err == nil && isRingLicenseIndex(text) {
+		for _, name := range ringIndexCompanions {
+			path := filepath.Join(dir, filepath.FromSlash(name))
+			if info, statErr := os.Stat(path); statErr == nil && !info.IsDir() && !slices.Contains(paths, path) {
+				paths = append(paths, path)
+			}
+		}
 	}
 
 	sort.Strings(paths)

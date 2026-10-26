@@ -86,6 +86,7 @@ impl Control {
                         name,
                         client_socket,
                         origin_socket,
+                        priority: racer_control_wire::DEFAULT_PRIORITY,
                     }
                 })
                 .collect(),

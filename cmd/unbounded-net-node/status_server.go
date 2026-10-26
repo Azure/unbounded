@@ -43,14 +43,16 @@ var routeSubscribeWithOptions = netlink.RouteSubscribeWithOptions
 
 // nodeHealthState holds the shared state for health and status endpoints
 type nodeHealthState struct {
-	statusServer    *nodeStatusServer      // Set once WireGuard state is available
-	informersSynced []cache.InformerSynced // Informer HasSynced funcs for readiness
+	statusServer          *nodeStatusServer      // Set once WireGuard state is available
+	informersSynced       []cache.InformerSynced // Informer HasSynced funcs for readiness
+	gatewayInformersReady func() (bool, string)
 
-	nodeName  string
-	siteName  string
-	pubKey    string
-	podCIDRs  []string
-	isGateway bool
+	nodeName          string
+	siteName          string
+	pubKey            string
+	podCIDRs          []string
+	verifiedIPAMCIDRs []string
+	isGateway         bool
 
 	cniManaged            bool
 	cniReady              bool
@@ -183,6 +185,7 @@ func (h *nodeHealthState) setCNIReady(bridgeName string, podCIDRs []string) {
 	h.cniLastLogTime = time.Time{}
 
 	h.podCIDRs = append([]string(nil), podCIDRs...)
+	h.verifiedIPAMCIDRs = append([]string(nil), podCIDRs...)
 	h.mu.Unlock()
 
 	if wasBlocked {
@@ -496,6 +499,18 @@ func newHealthMux(healthState *nodeHealthState) *http.ServeMux {
 				w.WriteHeader(http.StatusServiceUnavailable)
 
 				if _, err := w.Write([]byte("informer caches not synced")); err != nil {
+					klog.V(4).Infof("readyz write failed: %v", err)
+				}
+
+				return
+			}
+		}
+
+		if healthState.gatewayInformersReady != nil {
+			if ready, reason := healthState.gatewayInformersReady(); !ready {
+				w.WriteHeader(http.StatusServiceUnavailable)
+
+				if _, err := w.Write([]byte(reason)); err != nil {
 					klog.V(4).Infof("readyz write failed: %v", err)
 				}
 
@@ -2517,6 +2532,7 @@ type nodeStatusServer struct {
 	sliceInformer       cache.SharedIndexInformer
 	gatewayPoolInformer cache.SharedIndexInformer
 	sitePeeringInformer cache.SharedIndexInformer
+	gatewayInformers    *gatewayInformerLifecycle
 
 	routingTableRefreshMu sync.Mutex
 	routingTableCacheMu   sync.RWMutex
@@ -3078,7 +3094,12 @@ func (s *nodeStatusServer) getNodeStatus() *NodeStatusResponse {
 
 	// Annotate routes with Expected/Present/PeerDestinations/Info
 	if len(status.RoutingTable.Routes) > 0 {
-		annotateNodeRoutes(status, s.cfg, s.siteInformer, s.sliceInformer, s.gatewayPoolInformer, s.sitePeeringInformer)
+		gatewayPoolInformer := s.gatewayPoolInformer
+		if s.gatewayInformers != nil {
+			gatewayPoolInformer = s.gatewayInformers.snapshot().pools
+		}
+
+		annotateNodeRoutes(status, s.cfg, s.siteInformer, s.sliceInformer, gatewayPoolInformer, s.sitePeeringInformer)
 	}
 
 	// Add managed route info from the unified route manager

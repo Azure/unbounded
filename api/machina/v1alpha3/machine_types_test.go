@@ -7,7 +7,31 @@ import (
 	"bytes"
 	"encoding/json"
 	"testing"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+func TestMachineNodeName(t *testing.T) {
+	tests := []struct {
+		name string
+		spec MachineSpec
+		want string
+	}{
+		{name: "no kubernetes spec", want: "m1"},
+		{name: "no node ref", spec: MachineSpec{Kubernetes: &KubernetesSpec{}}, want: "m1"},
+		{name: "empty node ref", spec: MachineSpec{Kubernetes: &KubernetesSpec{NodeRef: &LocalObjectReference{}}}, want: "m1"},
+		{name: "node ref", spec: MachineSpec{Kubernetes: &KubernetesSpec{NodeRef: &LocalObjectReference{Name: "node-a"}}}, want: "node-a"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := &Machine{ObjectMeta: metav1.ObjectMeta{Name: "m1"}, Spec: tt.spec}
+			if got := m.NodeName(); got != tt.want {
+				t.Fatalf("NodeName() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
 
 func TestKubernetesSpecOmitsUnsetBootstrapTokenRef(t *testing.T) {
 	spec := KubernetesSpec{

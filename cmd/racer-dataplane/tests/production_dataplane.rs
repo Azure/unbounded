@@ -529,7 +529,6 @@ impl Rig {
         let transfers = Rc::new(Transfers::new(
             http.clone(),
             io.clone(),
-            None,
             admission.clone(),
             Rc::new(racer_dataplane::peer::protocol::SecurityCodec::new(
                 admission.clone(),
@@ -861,6 +860,7 @@ fn fixture_publication() -> Publication {
             name: "production-fixture".into(),
             client_socket,
             origin_socket,
+            priority: racer_control_wire::DEFAULT_PRIORITY,
         }],
     }
 }
@@ -1064,12 +1064,15 @@ fn zero_ttl_bootstrap_reclaims_idle_versions_and_new_objects_beyond_byte_budget(
             assert_eq!(rig.adapter.calls().len(), version as usize);
             assert!(rig.admission.used(ResourceClass::Plaintext) <= 4 * P as usize);
             if version == 4 {
-                assert_eq!(rig.admission.used(ResourceClass::Plaintext), 4 * P as usize);
+                // The memory cache retains only ciphertext, so delivered
+                // plaintext is released once replies complete.
+                rig.admission.reclaim_buffers();
+                assert_eq!(rig.admission.used(ResourceClass::Plaintext), 0);
             }
         }
         assert!(
             rig.memory
-                .get(&page(if new_objects { 1 } else { 0xab }, 1))
+                .ciphertext(&page(if new_objects { 1 } else { 0xab }, 1))
                 .unwrap()
                 .is_none()
         );
@@ -1092,7 +1095,13 @@ fn bootstrap_preserves_active_reader_and_inflight_admission_until_cancellation()
     let rig = Rig::new(113, true, 2);
     check(&rig.bootstrap(0xab), 1, 0, 113, 113);
     rig.flush();
-    let held = rig.memory.get(&page(0xab, 1)).unwrap().unwrap().plaintext;
+    // An active local reader holds the cached ciphertext and the plaintext it
+    // decrypted from it. The memory cache itself retains no plaintext.
+    let held = rig.memory.ciphertext(&page(0xab, 1)).unwrap().unwrap();
+    let held_plaintext = rig
+        .admission
+        .reserve(Some(&CacheId(CACHE.into())), ResourceClass::Plaintext, 113)
+        .unwrap();
     {
         let mut state = rig.adapter.state.lock().unwrap();
         state.version = 2;
@@ -1130,8 +1139,8 @@ fn bootstrap_preserves_active_reader_and_inflight_admission_until_cancellation()
             rig.admission.used(ResourceClass::Plaintext),
             P as usize + 113
         );
-        assert!(rig.memory.get(&page(0xab, 1)).unwrap().is_some());
-        assert_eq!(held.bytes()[0], byte(1, 0));
+        assert!(rig.memory.ciphertext(&page(0xab, 1)).unwrap().is_some());
+        assert_eq!(held.ciphertext.bytes().len(), 113 + 16);
         pending_scope.cancel().unwrap();
     };
     let (pending_result, ()) =
@@ -1152,9 +1161,9 @@ fn bootstrap_preserves_active_reader_and_inflight_admission_until_cancellation()
     rig.adapter.state.lock().unwrap().version = 3;
     check(&rig.bootstrap(4), 3, 0, 113, 113);
     rig.flush();
-    assert_eq!(held.bytes()[0], byte(1, 0));
-    assert!(rig.memory.get(&page(0xab, 1)).unwrap().is_some());
-    drop(held);
+    assert_eq!(held.ciphertext.bytes().len(), 113 + 16);
+    assert!(rig.memory.ciphertext(&page(0xab, 1)).unwrap().is_some());
+    drop((held, held_plaintext));
     rig.memory.evict_idle(usize::MAX).unwrap();
     assert_eq!(rig.admission.used(ResourceClass::Plaintext), 0);
     assert_eq!(
@@ -1164,10 +1173,42 @@ fn bootstrap_preserves_active_reader_and_inflight_admission_until_cancellation()
 }
 
 #[test]
+fn idle_staging_is_sized_by_demand_and_released_when_constrained() {
+    let rig = Rig::new(113, true, 1);
+    check(&rig.bootstrap(0xab), 1, 0, 113, 113);
+    rig.flush();
+    let retained = rig.writer.retained_staging_bytes();
+    assert!(retained > 0, "writeback must leave idle staging");
+    let stats = rig.writer.staging_pool_stats();
+    assert_eq!(stats.bytes, retained);
+    assert!(stats.entries <= stats.target && stats.target <= stats.max_depth);
+    let start = std::time::Instant::now();
+    assert_eq!(rig.writer.maintain_staging(start), 0);
+    let charged = rig.admission.used(ResourceClass::Ciphertext);
+    rig.writer.constrain_staging(true);
+    assert_eq!(rig.writer.maintain_staging(start), retained);
+    assert_eq!(rig.writer.retained_staging_bytes(), 0);
+    assert_eq!(
+        rig.admission.used(ResourceClass::Ciphertext),
+        charged - retained
+    );
+    let stats = rig.writer.staging_pool_stats();
+    assert!(stats.constrained);
+    assert!(stats.trimmed >= 1);
+    rig.writer.constrain_staging(false);
+    assert!(!rig.writer.staging_pool_stats().constrained);
+}
+
+#[test]
 fn failed_and_empty_bootstraps_release_reclaimed_plaintext_reservations() {
     let rig = Rig::new(113, true, 1);
     check(&rig.bootstrap(0xab), 1, 0, 113, 113);
     rig.flush();
+    // Bootstrap plaintext admission never needs to evict the cached
+    // ciphertext, which keeps its own charge.
+    let cached =
+        rig.admission.used(ResourceClass::Ciphertext) - rig.writer.retained_staging_bytes();
+    assert!(rig.memory.ciphertext(&page(0xab, 1)).unwrap().is_some());
     rig.adapter.offline();
     for attempt in 0..3 {
         // These are separate half-open probes, rather than retries inside the
@@ -1182,7 +1223,7 @@ fn failed_and_empty_bootstraps_release_reclaimed_plaintext_reservations() {
         assert_eq!(rig.admission.used(ResourceClass::Plaintext), 0);
         assert_eq!(
             rig.admission.used(ResourceClass::Ciphertext),
-            rig.writer.retained_staging_bytes()
+            rig.writer.retained_staging_bytes() + cached
         );
         assert_eq!(rig.admission.used(ResourceClass::DirtyCiphertext), 0);
     }
@@ -1199,7 +1240,7 @@ fn failed_and_empty_bootstraps_release_reclaimed_plaintext_reservations() {
     assert_eq!(rig.admission.used(ResourceClass::Plaintext), 0);
     assert_eq!(
         rig.admission.used(ResourceClass::Ciphertext),
-        rig.writer.retained_staging_bytes()
+        rig.writer.retained_staging_bytes() + cached
     );
     rig.adapter.state.lock().unwrap().length = 113;
     // Use another version because an immutable version's length cannot change.
@@ -1276,7 +1317,12 @@ fn writeback_staging_preserves_live_readers_and_recovers_after_release() {
         rig.adapter.state.lock().unwrap().version = version;
         check(&rig.bootstrap(0xab), version, 0, P, P);
         rig.flush();
-        held.push(rig.memory.get(&page(0xab, version)).unwrap().unwrap());
+        held.push(
+            rig.memory
+                .ciphertext(&page(0xab, version))
+                .unwrap()
+                .unwrap(),
+        );
     }
     rig.adapter.state.lock().unwrap().version = 3;
     check(&rig.bootstrap(0xab), 3, 0, P, P);
@@ -1286,9 +1332,10 @@ fn writeback_staging_preserves_live_readers_and_recovers_after_release() {
         2,
         "live leases cannot be reclaimed to force persistence"
     );
-    for (index, page) in held.iter().enumerate() {
-        assert_eq!(page.plaintext.bytes()[0], byte(index as u8 + 1, 0));
-        assert!(rig.memory.get(page.plaintext.page()).unwrap().is_some());
+    for (index, copy) in held.iter().enumerate() {
+        let id = &copy.ciphertext.envelope().page;
+        assert_eq!(id, &page(0xab, index as u8 + 1));
+        assert!(rig.memory.ciphertext(id).unwrap().is_some());
     }
     drop(held);
     rig.adapter.state.lock().unwrap().version = 4;
@@ -1386,7 +1433,7 @@ fn request(method: &str, fields: &str) -> String {
 
 fn subscription_request(fields: &str) -> String {
     format!(
-        "POST /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nRacer-Ordered: 1\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: {P}\r\n{fields}\r\n",
+        "POST /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: {P}\r\n{fields}\r\n",
         "ab".repeat(32)
     )
 }

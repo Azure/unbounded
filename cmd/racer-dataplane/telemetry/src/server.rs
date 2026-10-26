@@ -10,7 +10,8 @@
 //!
 //! Each server permits one listener, four concurrent connections, 1024 request
 //! bytes, 64KiB text buffers, and two-second text/header deadlines. An optional
-//! binary producer has separate prepaid capacity and a bounded extended deadline. [`Scope`]
+//! asynchronous producer (a binary profile or a JSON report, each with its own single
+//! in-flight slot) has separate prepaid capacity and a bounded deadline. [`Scope`]
 //! must narrow the caller's deadline while preserving cancellation and metadata.
 //! Only HTTP/1.1 GET with one nonempty Host and no body is accepted; each connection
 //! closes after one response. Headers are scrubbed before dispatch, never echoed.
@@ -40,6 +41,12 @@ pub const MAX_REQUEST_BYTES: usize = 1024;
 /// Fixed buffer capacity shared by request parsing and response formatting.
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
+/// Bytes at the front of each response buffer reserved for the status line and headers.
+const HEAD_BYTES: usize = 256;
+
+/// Largest body a handler can write into a synchronous response.
+pub const MAX_BODY_BYTES: usize = MAX_RESPONSE_BYTES - HEAD_BYTES;
+
 /// Maximum lifetime of an exchange, further limited by the caller's deadline.
 pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -51,8 +58,16 @@ pub const CONTROL_SLOTS: usize = MAX_CONNECTIONS + 1;
 
 /// Extra prepaid waits for one binary producer and its socket disconnect watch.
 pub const BINARY_CONTROL_SLOTS: usize = 2;
+/// Extra prepaid waits for one JSON producer. Its exchange holds at most two
+/// submissions at once (completion wait plus disconnect watch, or the send plus
+/// the watch's pending cancel) and never more than one on its own socket, whose
+/// [`CONTROL_SLOTS`] entry is idle while it waits. One extra slot therefore
+/// covers it, even with every other connection and a profile in flight.
+pub const JSON_CONTROL_SLOTS: usize = 1;
 /// One binary result, allocated only by the admitted producer.
 pub const MAX_BINARY_BYTES: usize = 16 * 1024 * 1024;
+/// Longest deadline a JSON producer may request; JSON reports are short-lived.
+pub const MAX_JSON_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Fixed errors selected by the application, never raw operating-system messages.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,8 +85,24 @@ pub trait BinarySession {
     fn cancel(&self);
 }
 
-/// A bounded capture duration and its admitted, type-erased producer.
+/// Content produced by an asynchronous session, selecting its admission slot,
+/// deadline policy, size limit, and response headers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BinaryKind {
+    /// A pprof capture: `duration` is the 1..=60 s capture length, the deadline
+    /// adds 15 s of slack, the result may use [`MAX_BINARY_BYTES`], and it is sent
+    /// as an `application/octet-stream` attachment named `profile.pb`.
+    Profile,
+
+    /// A JSON document: `duration` is the whole deadline (at most
+    /// [`MAX_JSON_DEADLINE`]), the result is limited to [`MAX_BODY_BYTES`], and it
+    /// is sent inline as `application/json`.
+    Json,
+}
+
+/// A bounded duration and its admitted, type-erased producer.
 pub struct BinaryResponse {
+    pub kind: BinaryKind,
     pub duration: Duration,
     pub session: Box<dyn BinarySession>,
 }
@@ -90,6 +121,9 @@ pub enum Response {
 
     /// Send the handler's text with the Prometheus exposition content type.
     Metrics,
+
+    /// Send the handler's text as `application/json` with a successful status.
+    Json,
 
     /// Discard handler output and send the fixed not-found body.
     NotFound,
@@ -139,6 +173,10 @@ pub struct Server {
     resources: Rc<Resources>,
 
     binary: Option<Rc<BinaryResources>>,
+
+    /// JSON producers have their own single in-flight slot, so a long profile
+    /// capture never makes a short JSON report busy, and vice versa.
+    json: Option<Rc<BinaryResources>>,
 
     serving: Cell<bool>,
 }
@@ -191,6 +229,7 @@ impl Server {
             }),
             serving: Cell::new(false),
             binary: None,
+            json: None,
         }
     }
 
@@ -201,6 +240,17 @@ impl Server {
         memory: C,
     ) -> Self {
         self.binary = Some(Rc::new(BinaryResources {
+            submissions,
+            _memory: Box::new(memory),
+            active: Cell::new(false),
+        }));
+        self
+    }
+
+    /// Reserve a separate single-session slot for [`BinaryKind::Json`] producers.
+    /// The caller prepays [`JSON_CONTROL_SLOTS`] more submissions for it.
+    pub fn with_json<C: 'static>(mut self, submissions: Rc<SubmissionCapacity>, memory: C) -> Self {
+        self.json = Some(Rc::new(BinaryResources {
             submissions,
             _memory: Box::new(memory),
             active: Cell::new(false),
@@ -396,13 +446,31 @@ impl Server {
         response: Result<BinaryResponse, BinaryError>,
     ) -> Result<(), S::Error> {
         let mut scope = header_scope.clone();
+        let kind = response
+            .as_ref()
+            .map_or(BinaryKind::Profile, |response| response.kind);
+        let (limit, too_large) = match kind {
+            BinaryKind::Profile => (MAX_BINARY_BYTES, "resource_limit"),
+            BinaryKind::Json => (MAX_BODY_BYTES, "response_too_large"),
+        };
         let response = match response {
             Ok(response) => {
-                if response.duration < Duration::from_secs(1)
-                    || response.duration > Duration::from_secs(60)
-                {
+                let (valid, resources, extension) = match kind {
+                    BinaryKind::Profile => (
+                        response.duration >= Duration::from_secs(1)
+                            && response.duration <= Duration::from_secs(60),
+                        &self.binary,
+                        Duration::from_secs(15),
+                    ),
+                    BinaryKind::Json => (
+                        !response.duration.is_zero() && response.duration <= MAX_JSON_DEADLINE,
+                        &self.json,
+                        Duration::ZERO,
+                    ),
+                };
+                if !valid {
                     Err(BinaryError::BadRequest)
-                } else if let Some(resources) = &self.binary {
+                } else if let Some(resources) = resources {
                     if resources.active.replace(true) {
                         Err(BinaryError::Busy)
                     } else {
@@ -414,7 +482,7 @@ impl Server {
                         buffer.binary = Some(guard.clone());
                         scope = parent.with_deadline(
                             environment::now()
-                                .checked_add(response.duration + Duration::from_secs(15))
+                                .checked_add(response.duration + extension)
                                 .ok_or(Error::InvalidInput)?,
                         );
                         match guard.session.completion_fd() {
@@ -471,8 +539,8 @@ impl Server {
             Err(error) => Err(error),
         };
         let response = response.and_then(|bytes| {
-            if bytes.len() > MAX_BINARY_BYTES {
-                Err(BinaryError::Unavailable("resource_limit"))
+            if bytes.len() > limit {
+                Err(BinaryError::Unavailable(too_large))
             } else {
                 Ok(bytes)
             }
@@ -488,23 +556,25 @@ impl Server {
                 false,
             ),
         };
-        let content_type = if binary {
-            "application/octet-stream"
-        } else {
+        let content_type = if !binary {
             "text/plain; charset=utf-8"
+        } else if kind == BinaryKind::Json {
+            "application/json"
+        } else {
+            "application/octet-stream"
         };
         let mut head = Output {
             bytes: &mut buffer.bytes,
             used: 0,
         };
         write!(head, "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n", body.len()).map_err(|_| Error::Io)?;
-        if binary {
+        if binary && kind == BinaryKind::Profile {
             head.write_str("Content-Disposition: attachment; filename=\"profile.pb\"\r\n")
                 .map_err(|_| Error::Io)?;
         }
         head.write_str("\r\n").map_err(|_| Error::Io)?;
         buffer.pending = 0..head.used;
-        // Send the small head separately to avoid copying the 16MiB result on I/O.
+        // Send the small head separately to avoid copying a large result on I/O.
         for body in [None, Some(body)] {
             if let Some(body) = body {
                 buffer.bytes = body;
@@ -660,7 +730,8 @@ fn respond(
     route: Route<'_>,
     bytes: &mut [u8],
 ) -> Result<usize, fmt::Error> {
-    const HEAD: usize = 256;
+    const HEAD: usize = HEAD_BYTES;
+    const JSON: &str = "application/json";
     const TEXT: &str = "text/plain; charset=utf-8";
     const METRICS: &str = "text/plain; version=0.0.4; charset=utf-8";
     if bytes.len() < HEAD {
@@ -675,6 +746,7 @@ fn respond(
         Route::Get(path) => match handler.get(path, &mut output)? {
             Response::Text => ("200 OK", TEXT, None),
             Response::Metrics => ("200 OK", METRICS, None),
+            Response::Json => ("200 OK", JSON, None),
             Response::Unavailable => ("503 Service Unavailable", TEXT, None),
             Response::NotFound => ("404 Not Found", TEXT, Some("not found\n")),
         },
@@ -777,6 +849,204 @@ mod tests {
         }
     }
 
+    struct JsonProducer {
+        fd: OwnedFd,
+        body: Vec<u8>,
+    }
+
+    impl BinarySession for JsonProducer {
+        fn completion_fd(&self) -> Result<Descriptor, BinaryError> {
+            Ok(self.fd.try_clone().unwrap().into())
+        }
+        fn result(&self) -> Option<Result<Vec<u8>, BinaryError>> {
+            Some(Ok(self.body.clone()))
+        }
+        fn cancel(&self) {}
+    }
+
+    /// Run one JSON producer through `binary_exchange` on a fresh reactor and
+    /// return the raw response. `setup` builds the owner from prepaid submissions.
+    fn json_exchange(
+        setup: impl Fn(Rc<SubmissionCapacity>) -> Server,
+        occupied: usize,
+        busy: bool,
+        duration: Duration,
+        body: Vec<u8>,
+    ) -> String {
+        use std::{
+            io::{Read, Write as _},
+            os::unix::net::UnixStream,
+            task::{Context, Waker},
+        };
+        let clock = uring_runtime::environment::SimulationClock::new_at(
+            1,
+            Instant::now(),
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        let _clock = clock.environment(0).enter();
+        let reactor = Reactor::<TestScope, ()>::new(12, ());
+        let owner = setup(
+            reactor
+                .reserve_submissions(
+                    CONTROL_SLOTS + BINARY_CONTROL_SLOTS + JSON_CONTROL_SLOTS,
+                    (),
+                )
+                .unwrap(),
+        );
+        let scope = TestScope {
+            deadline: environment::now() + Duration::from_secs(100),
+            cancellation: uring_runtime::environment::Cancellation::new().unwrap(),
+        };
+        let mut cx = Context::from_waker(Waker::noop());
+        // Hold prepaid slots as the accept, other connections, or a profile would.
+        let (idle, _idle_peer) = UnixStream::pair().unwrap();
+        idle.set_nonblocking(true).unwrap();
+        let idle = Rc::new(Descriptor::from(OwnedFd::from(idle)));
+        let mut holders: Vec<_> = (0..occupied)
+            .map(|_| {
+                reactor.readiness_reserved(
+                    idle.clone(),
+                    1,
+                    (),
+                    owner.resources.submissions.clone(),
+                    &scope,
+                )
+            })
+            .collect();
+        for holder in &mut holders {
+            assert!(holder.as_mut().poll(&mut cx).is_pending());
+        }
+        let (completion, mut signal) = UnixStream::pair().unwrap();
+        completion.set_nonblocking(true).unwrap();
+        signal.write_all(&[1]).unwrap();
+        let (socket, mut client) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let response = BinaryResponse {
+            kind: BinaryKind::Json,
+            duration,
+            session: Box::new(JsonProducer {
+                fd: completion.into(),
+                body,
+            }),
+        };
+        let mut task = Box::pin(owner.binary_exchange(
+            &reactor,
+            Rc::new(OwnedFd::from(socket).into()),
+            owner.buffer(&Routes::default()).unwrap(),
+            &scope,
+            &scope,
+            Ok(response),
+        ));
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Poll::Ready(result) = task.as_mut().poll(&mut cx) {
+                result.unwrap();
+                break;
+            }
+            assert!(Instant::now() < until);
+            reactor.poll_budgeted(32).unwrap();
+            reactor.wait(Duration::from_millis(1)).unwrap();
+        }
+        drop(task);
+        drop(holders);
+        let mut drain = reactor.drain();
+        loop {
+            if let Poll::Ready(result) = drain.as_mut().poll(&mut cx) {
+                result.unwrap();
+                break;
+            }
+            assert!(Instant::now() < until);
+            reactor.poll_budgeted(32).unwrap();
+            reactor.wait(Duration::from_millis(1)).unwrap();
+        }
+        // The profile slot is never borrowed, and an admitted JSON session
+        // releases its slot after the fence.
+        if let Some(json) = &owner.json {
+            assert_eq!(json.active.get(), busy);
+        }
+        drop(owner);
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// Text-only owner with both producer kinds attached.
+    fn both(submissions: Rc<SubmissionCapacity>) -> Server {
+        Server::new(submissions.clone(), ())
+            .with_binary(submissions.clone(), ())
+            .with_json(submissions, ())
+    }
+
+    #[test]
+    fn json_producer_uses_json_headers_limit_deadline_and_own_slot() {
+        let second = Duration::from_secs(1);
+
+        // Success: inline JSON with no attachment header, even while a profile runs.
+        let profiling = |submissions| {
+            let owner = both(submissions);
+            owner.binary.as_ref().unwrap().active.set(true);
+            owner
+        };
+        let text = json_exchange(profiling, 0, false, second, b"{}\n".to_vec());
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
+        assert!(text.contains("\r\nContent-Type: application/json\r\n"));
+        assert!(text.contains("\r\nContent-Length: 3\r\n"));
+        assert!(text.contains("\r\nCache-Control: no-store\r\n"));
+        assert!(!text.contains("Content-Disposition"));
+        assert!(text.ends_with("\r\n\r\n{}\n"));
+
+        // Prepaid capacity suffices with the accept, every other connection, and a
+        // profile each holding their slots: only the JSON socket's own idle slot and
+        // JSON_CONTROL_SLOTS remain.
+        let text = json_exchange(
+            both,
+            MAX_CONNECTIONS + BINARY_CONTROL_SLOTS,
+            false,
+            second,
+            b"{}\n".to_vec(),
+        );
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
+
+        // The exact text body limit is accepted; one more byte is refused.
+        let text = json_exchange(both, 0, false, second, vec![b' '; MAX_BODY_BYTES]);
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(text.contains(&format!("\r\nContent-Length: {MAX_BODY_BYTES}\r\n")));
+        let text = json_exchange(both, 0, false, second, vec![b' '; MAX_BODY_BYTES + 1]);
+        assert!(text.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+        assert!(text.contains("\r\nContent-Type: text/plain; charset=utf-8\r\n"));
+        assert!(text.ends_with("\r\n\r\nresponse_too_large\n"));
+
+        // Deadlines are bounded by MAX_JSON_DEADLINE, not the profile range.
+        for duration in [Duration::ZERO, MAX_JSON_DEADLINE + Duration::from_nanos(1)] {
+            let text = json_exchange(both, 0, false, duration, b"{}\n".to_vec());
+            assert!(text.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{text}");
+        }
+        for duration in [Duration::from_millis(500), MAX_JSON_DEADLINE] {
+            let text = json_exchange(both, 0, false, duration, b"{}\n".to_vec());
+            assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
+        }
+
+        // A JSON session in flight makes only the next JSON request busy.
+        let busy = |submissions| {
+            let owner = both(submissions);
+            owner.json.as_ref().unwrap().active.set(true);
+            owner
+        };
+        let text = json_exchange(busy, 0, true, second, b"{}\n".to_vec());
+        assert!(text.starts_with("HTTP/1.1 409 Conflict\r\n"), "{text}");
+        assert!(text.ends_with("\r\n\r\nbusy\n"));
+
+        // Without JSON resources the producer is refused rather than borrowing the profile slot.
+        let text = json_exchange(
+            |submissions| Server::new(submissions.clone(), ()).with_binary(submissions, ()),
+            0,
+            false,
+            second,
+            b"{}\n".to_vec(),
+        );
+        assert!(text.ends_with("\r\n\r\nresource_limit\n"), "{text}");
+    }
+
     #[test]
     fn binary_small_window_abandonment_retains_output_and_session_until_fence() {
         use std::task::{Context, Waker};
@@ -799,6 +1069,7 @@ mod tests {
         let live = Rc::new(Cell::new(1));
         let cancelled = Rc::new(Cell::new(false));
         let response = BinaryResponse {
+            kind: BinaryKind::Profile,
             duration: Duration::from_secs(1),
             session: Box::new(SimProducer {
                 fd: RefCell::new(Some(completion)),
@@ -872,6 +1143,7 @@ mod tests {
                     .borrow_mut()
                     .take()
                     .map(|session| BinaryResponse {
+                        kind: BinaryKind::Profile,
                         duration: Duration::from_secs(30),
                         session: Box::new(session),
                     })
@@ -1152,6 +1424,16 @@ mod tests {
                     out.write_str("example_total 1\n")?;
                     Ok(Response::Metrics)
                 }
+                "/json" => {
+                    out.write_str("{}\n")?;
+                    Ok(Response::Json)
+                }
+                "/body" => {
+                    for _ in 0..MAX_BODY_BYTES {
+                        out.write_char('x')?;
+                    }
+                    Ok(Response::Text)
+                }
                 "/ready" => {
                     out.write_str("not ready\n")?;
                     Ok(Response::Unavailable)
@@ -1216,57 +1498,58 @@ mod tests {
     #[test]
     fn precise_wire_formats_redaction_and_output_bounds() {
         let handler = Routes::default();
-        for (route, status, body, metrics, allow) in [
-            (Route::Get("/live"), "200 OK", "ok\n", false, false),
+        for (route, status, body, kind, allow) in [
+            (Route::Get("/live"), "200 OK", "ok\n", 0, false),
             (
                 Route::Get("/stats"),
                 "200 OK",
                 "example_total 1\n",
-                true,
+                1,
                 false,
             ),
+            (Route::Get("/json"), "200 OK", "{}\n", 2, false),
             (
                 Route::Get("/ready"),
                 "503 Service Unavailable",
                 "not ready\n",
-                false,
+                0,
                 false,
             ),
             (
                 Route::Get("/secret"),
                 "404 Not Found",
                 "not found\n",
-                false,
+                0,
                 false,
             ),
             (
                 Route::Method,
                 "405 Method Not Allowed",
                 "method not allowed\n",
-                false,
+                0,
                 true,
             ),
             (
                 Route::BadRequest,
                 "400 Bad Request",
                 "bad request\n",
-                false,
+                0,
                 false,
             ),
             (
                 Route::TooLarge,
                 "431 Request Header Fields Too Large",
                 "headers too large\n",
-                false,
+                0,
                 false,
             ),
         ] {
             let mut bytes = vec![0; MAX_RESPONSE_BYTES];
             let used = respond(&handler, route, &mut bytes).unwrap();
-            let content_type = if metrics {
-                "text/plain; version=0.0.4; charset=utf-8"
-            } else {
-                "text/plain; charset=utf-8"
+            let content_type = match kind {
+                1 => "text/plain; version=0.0.4; charset=utf-8",
+                2 => "application/json",
+                _ => "text/plain; charset=utf-8",
             };
             let allow = if allow { "Allow: GET\r\n" } else { "" };
             assert_eq!(
@@ -1279,6 +1562,10 @@ mod tests {
             assert!(!bytes.windows(6).any(|w| w == b"secret"));
         }
         assert_eq!(*handler.0.borrow(), vec![Event::Rejected; 4]);
+        let mut bytes = vec![0; MAX_RESPONSE_BYTES];
+        let used = respond(&handler, Route::Get("/body"), &mut bytes).unwrap();
+        assert!(used <= MAX_RESPONSE_BYTES);
+        assert!(bytes[..used].ends_with(&[b'x'; MAX_BODY_BYTES]));
         for size in [0, 255, 256, 257] {
             assert!(respond(&handler, Route::Get("/live"), &mut vec![0; size]).is_err());
         }

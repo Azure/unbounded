@@ -35,6 +35,9 @@ Bind=/dev/nvidia0
 Bind=/dev/nvidiactl
 Bind=/dev/nvidia-uvm
 Bind=/dev/dri/renderD128
+# Expose the host udev database so GPUDirect Storage (cuFile) can resolve the
+# properties of the host's block devices.
+BindReadOnly=/run/udev
 # Stage host-matched NVIDIA helpers so node-start can copy them into the root
 # passed to nvidia-ctk with --driver-root. They are not run from this mount.
 BindReadOnly=/usr/bin:/run/host-nvidia-bin

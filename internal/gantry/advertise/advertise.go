@@ -9,7 +9,7 @@
 // - The local containerd content store is the source of truth for
 // "what we can serve to peers".
 // - The DHT is a hint layer: provider records say "this node might
-// have this digest", subject to ≤24 h TTL and eventual consistency.
+// have this digest", subject to configured validity and eventual consistency.
 // - This package owns the local "announced set" - the digests we
 // currently believe are present-and-advertised - and reconciles it
 // against an inventory source (typically containerdstore.Inventory)
@@ -27,10 +27,9 @@
 // longer keep it alive.
 //
 // The announced set is local rebuildable state - it is NOT persisted
-// across process restarts. On startup the first reconcile pass
-// re-Provides every present digest, which is the same operation
-// libp2p performs internally on its 12 h refresh schedule, so the
-// extra cost is bounded by inventory size.
+// across process restarts. On startup the first reconcile pass registers every
+// present digest with discovery's sweeping provider. The sweeper owns periodic
+// refresh for the rest of the process lifetime.
 package advertise
 
 import (
@@ -41,6 +40,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/semaphore"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
@@ -152,6 +153,12 @@ type Advertiser struct {
 
 	mu        sync.Mutex
 	announced map[string]struct{} // digest.String() set
+	pending   map[string]*digestOperation
+}
+
+type digestOperation struct {
+	gate *semaphore.Weighted
+	refs int
 }
 
 // New constructs an Advertiser. inv supplies the current local content
@@ -165,6 +172,7 @@ func New(inv Inventory, dht ifaces.DHT, opts ...Option) *Advertiser {
 		provideTimeout:    30 * time.Second,
 		withdrawTimeout:   10 * time.Second,
 		announced:         map[string]struct{}{},
+		pending:           map[string]*digestOperation{},
 	}
 	if open, ok := inv.(Openable); ok {
 		a.open = open
@@ -253,8 +261,8 @@ func (a *Advertiser) Reconcile(ctx context.Context) error {
 	}
 
 	// Compute deltas under lock. We hold the lock only long enough to
-	// snapshot the diff so Provide/Withdraw calls (which may block on
-	// network I/O) happen lock-free.
+	// snapshot the diff. Per-digest operations do not hold this lock
+	// while waiting for network I/O.
 	a.mu.Lock()
 	toProvide := make([]digest.Digest, 0)
 
@@ -291,10 +299,6 @@ func (a *Advertiser) Reconcile(ctx context.Context) error {
 
 	for _, d := range toProvide {
 		if a.provide(ctx, d) {
-			a.mu.Lock()
-			a.announced[d.String()] = struct{}{}
-			a.mu.Unlock()
-
 			added++
 		}
 	}
@@ -303,10 +307,6 @@ func (a *Advertiser) Reconcile(ctx context.Context) error {
 
 	for _, d := range toWithdraw {
 		if a.withdraw(ctx, d) {
-			a.mu.Lock()
-			delete(a.announced, d.String())
-			a.mu.Unlock()
-
 			removed++
 		}
 	}
@@ -336,26 +336,10 @@ func (a *Advertiser) Notify(ctx context.Context, d digest.Digest, present bool) 
 			return false
 		}
 
-		if a.provide(ctx, d) {
-			a.mu.Lock()
-			a.announced[d.String()] = struct{}{}
-			a.mu.Unlock()
-
-			return true
-		}
-
-		return false
+		return a.provide(ctx, d)
 	}
 
-	if a.withdraw(ctx, d) {
-		a.mu.Lock()
-		delete(a.announced, d.String())
-		a.mu.Unlock()
-
-		return true
-	}
-
-	return false
+	return a.withdraw(ctx, d)
 }
 
 func (a *Advertiser) openable(ctx context.Context, d digest.Digest) bool {
@@ -411,11 +395,52 @@ func (a *Advertiser) IsAnnounced(d digest.Digest) bool {
 	return ok
 }
 
+func (a *Advertiser) lockDigest(ctx context.Context, d digest.Digest) (func(), error) {
+	key := d.String()
+
+	a.mu.Lock()
+
+	op := a.pending[key]
+	if op == nil {
+		op = &digestOperation{gate: semaphore.NewWeighted(1)}
+		a.pending[key] = op
+	}
+
+	op.refs++
+	a.mu.Unlock()
+
+	releaseRef := func() {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+
+		op.refs--
+		if op.refs == 0 {
+			delete(a.pending, key)
+		}
+	}
+	if err := op.gate.Acquire(ctx, 1); err != nil {
+		releaseRef()
+		return nil, err
+	}
+
+	return func() {
+		op.gate.Release(1)
+		releaseRef()
+	}, nil
+}
+
 func (a *Advertiser) provide(ctx context.Context, d digest.Digest) bool {
 	pctx, cancel := context.WithTimeout(ctx, a.provideTimeout)
 	defer cancel()
 
-	if err := a.dht.Provide(pctx, d); err != nil {
+	unlock, err := a.lockDigest(pctx, d)
+	if err == nil {
+		defer unlock()
+
+		err = a.dht.Provide(pctx, d)
+	}
+
+	if err != nil {
 		if a.metrics.OnProvideError != nil {
 			a.metrics.OnProvideError()
 		}
@@ -428,6 +453,10 @@ func (a *Advertiser) provide(ctx context.Context, d digest.Digest) bool {
 		return false
 	}
 
+	a.mu.Lock()
+	a.announced[d.String()] = struct{}{}
+	a.mu.Unlock()
+
 	if a.metrics.OnProvide != nil {
 		a.metrics.OnProvide()
 	}
@@ -439,7 +468,14 @@ func (a *Advertiser) withdraw(ctx context.Context, d digest.Digest) bool {
 	wctx, cancel := context.WithTimeout(ctx, a.withdrawTimeout)
 	defer cancel()
 
-	if err := a.dht.Withdraw(wctx, d); err != nil {
+	unlock, err := a.lockDigest(wctx, d)
+	if err == nil {
+		defer unlock()
+
+		err = a.dht.Withdraw(wctx, d)
+	}
+
+	if err != nil {
 		if a.metrics.OnWithdrawError != nil {
 			a.metrics.OnWithdrawError()
 		}
@@ -451,6 +487,10 @@ func (a *Advertiser) withdraw(ctx context.Context, d digest.Digest) bool {
 
 		return false
 	}
+
+	a.mu.Lock()
+	delete(a.announced, d.String())
+	a.mu.Unlock()
 
 	if a.metrics.OnWithdraw != nil {
 		a.metrics.OnWithdraw()

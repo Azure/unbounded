@@ -12,8 +12,12 @@ type Kubelet struct {
 	KubeletBinPath string
 
 	// KubeletAuthInfo holds the authentication configuration for the
-	// kubelet. Exactly one of BootstrapToken or ExecCredential must be set.
+	// kubelet when KubeconfigData is empty.
 	config.KubeletAuthInfo
+
+	// KubeconfigData is a complete kubeconfig written verbatim for direct
+	// kubelet authentication.
+	KubeconfigData []byte
 
 	// APIServer is the HTTPS endpoint of the Kubernetes API server
 	// (e.g. "https://my-cluster.hcp.eastus.azmk8s.io:443").

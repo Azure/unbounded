@@ -97,7 +97,6 @@ fn host_normalization_does_not_normalize_numeric_or_opaque_fields() {
                 ("Content-Length", "0"),
                 ("Racer-Page-Credits", "2"),
                 ("Racer-Byte-Credits", "33554432"),
-                ("Racer-Ordered", "1"),
                 ("Authorization", "Bearer token"),
                 ("Racer-Metadata", "a,\\b"),
             ] {

@@ -492,16 +492,26 @@ fn same_name_new_uid_dials_replacement_without_reusing_old_keepalive() {
     let old_endpoint = client.endpoint(&old_context).unwrap();
     let scope = scope();
     let (release, held) = std::sync::mpsc::channel();
+    let old_uid = old_context.object.cache.0.clone();
     let old_server = thread::spawn(move || {
         // All three exchanges must use this one accepted socket, including the
-        // delayed old operation after the replacement starts serving.
+        // delayed old operation after the replacement starts serving. Each one
+        // names the old UID so a UID-bound origin can refuse foreign caches.
         let mut stream = accept(&old_listener);
+        let check_old = |stream: &mut _| {
+            let head = receive(stream);
+            check_request(&head, "HEAD", None, None, true);
+            assert_eq!(
+                head.unique("Racer-Cache").unwrap(),
+                Some(old_uid.as_bytes())
+            );
+        };
         for _ in 0..2 {
-            check_request(&receive(&mut stream), "HEAD", None, None, true);
+            check_old(&mut stream);
             stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: \"old\"\r\nRacer-Expires-At: 1234\r\n\r\n").unwrap();
         }
         held.recv_timeout(Duration::from_secs(5)).unwrap();
-        check_request(&receive(&mut stream), "HEAD", None, None, true);
+        check_old(&mut stream);
         stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: \"old\"\r\nRacer-Expires-At: 1234\r\n\r\n").unwrap();
     });
     for _ in 0..2 {
@@ -532,9 +542,14 @@ fn same_name_new_uid_dials_replacement_without_reusing_old_keepalive() {
     let replacement = thread::spawn(move || {
         let mut stream = accept(&replacement_listener);
         for _ in 0..2 {
+            let head = receive(&mut stream);
             assert_eq!(
-                receive(&mut stream).unique("Authorization").unwrap(),
+                head.unique("Authorization").unwrap(),
                 Some(b"replacement-credential".as_slice())
+            );
+            assert_eq!(
+                head.unique("Racer-Cache").unwrap(),
+                Some(b"55555555-5555-4555-8555-555555555555".as_slice())
             );
             stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: \"new\"\r\nRacer-Expires-At: 1234\r\n\r\n").unwrap();
         }
@@ -641,6 +656,7 @@ fn check_request(
         head.unique("Racer-Metadata").unwrap(),
         credentials.then_some(b"opaque\xff".as_slice())
     );
+    assert!(head.unique("Racer-Cache").unwrap().is_some());
 }
 
 #[test]
@@ -1187,6 +1203,10 @@ fn opaque_request_values_reject_present_empty_and_keep_obs_text() {
     assert!(opaque(&vec![b'x'; 8193]).is_err());
     let head = request(&context(), "HEAD").unwrap();
     check_request(&head, "HEAD", None, None, true);
+    assert_eq!(
+        head.unique("Racer-Cache").unwrap(),
+        Some(b"cache".as_slice())
+    );
 }
 
 #[test]

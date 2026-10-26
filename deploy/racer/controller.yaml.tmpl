@@ -75,6 +75,9 @@ spec:
               containerPort: 8081
             - name: metrics
               containerPort: 8080
+            - name: webhook
+              containerPort: 9443
+              protocol: TCP
           readinessProbe:
             httpGet:
               path: /readyz
@@ -127,3 +130,7 @@ spec:
     - name: https
       port: 8443
       targetPort: https
+    - name: webhook
+      port: 9443
+      targetPort: webhook
+      protocol: TCP

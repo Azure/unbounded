@@ -42,19 +42,14 @@ func TestConfigureNVIDIAContainerRuntime(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		enabled bool
 		runErr  error
 		wantErr string
-		wantRun bool
 	}{
-		{name: "Azure Linux uses CDI", enabled: true, wantRun: true},
-		{name: "Ubuntu remains automatic", enabled: false},
+		{name: "successful setup uses CDI"},
 		{
 			name:    "configuration failure is explicit",
-			enabled: true,
 			runErr:  errors.New("exit status 1"),
 			wantErr: "configure NVIDIA container runtime CDI mode",
-			wantRun: true,
 		},
 	}
 
@@ -68,9 +63,6 @@ func TestConfigureNVIDIAContainerRuntime(t *testing.T) {
 				log: slog.New(slog.DiscardHandler),
 				goalState: &goalstates.NodeStart{
 					MachineName: "kube1",
-					Nvidia: goalstates.NvidiaHost{
-						UseCDIRuntime: tt.enabled,
-					},
 				},
 				run: func(_ context.Context, _ *slog.Logger, machine string, args ...string) (string, error) {
 					require.Equal(t, "kube1", machine)
@@ -88,17 +80,13 @@ func TestConfigureNVIDIAContainerRuntime(t *testing.T) {
 				require.NoError(t, err)
 			}
 
-			if tt.wantRun {
-				require.Equal(t, []string{
-					goalstates.NvidiaCTKPath,
-					"config",
-					"--set",
-					"nvidia-container-runtime.mode=cdi",
-					"--in-place",
-				}, gotArgs)
-			} else {
-				require.Empty(t, gotArgs)
-			}
+			require.Equal(t, []string{
+				goalstates.NvidiaCTKPath,
+				"config",
+				"--set",
+				"nvidia-container-runtime.mode=cdi",
+				"--in-place",
+			}, gotArgs)
 		})
 	}
 }

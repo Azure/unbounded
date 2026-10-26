@@ -82,6 +82,8 @@ func TestClusterCacheDeploysDataplane(t *testing.T) {
 	require.Len(t, pod.Containers, 1)
 	container := pod.Containers[0]
 	require.Equal(t, "mirror.test/unbounded/racer-dataplane:v1", container.Image)
+	require.Equal(t, "1Gi", container.Resources.Requests.Memory().String())
+	require.Empty(t, container.Resources.Limits, "dataplane must not set a default limit")
 	require.Equal(t, []corev1.EnvFromSource{{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: dataplaneConfigName}}}}, container.EnvFrom)
 
 	values := map[string]string{}
@@ -225,9 +227,10 @@ func TestDataplaneOverrides(t *testing.T) {
 	initialize(t, env)
 
 	for _, tc := range []struct {
-		name      string
-		patch     map[string]any
-		wantError string
+		name        string
+		patch       map[string]any
+		wantError   string
+		wantRequest string
 	}{
 		{name: "tuning", patch: map[string]any{
 			"metadata": map[string]any{"annotations": map[string]any{"benchmark": "yes"}},
@@ -243,6 +246,9 @@ func TestDataplaneOverrides(t *testing.T) {
 				}},
 			},
 		}},
+		{name: "request", wantRequest: "2Gi", patch: map[string]any{"spec": map[string]any{"template": map[string]any{"spec": map[string]any{
+			"containers": []any{map[string]any{"name": "dataplane", "resources": map[string]any{"requests": map[string]any{"memory": "2Gi"}}}},
+		}}}}},
 		{name: "identity", wantError: "RACER_CONTROL_ENDPOINT", patch: map[string]any{"spec": map[string]any{"template": map[string]any{"spec": map[string]any{
 			"containers": []any{map[string]any{"name": "dataplane", "env": []any{map[string]any{"name": "RACER_CONTROL_ENDPOINT", "value": "https://evil:8443"}}}},
 		}}}}},
@@ -267,6 +273,16 @@ func TestDataplaneOverrides(t *testing.T) {
 			require.False(t, report.Failed(), "%v", report.Err())
 			require.Equal(t, count, plan.Len())
 
+			if tc.wantRequest != "" {
+				persist(t, env, plan)
+
+				resources := liveDataplane(t, env).Spec.Template.Spec.Containers[0].Resources
+				require.Equal(t, tc.wantRequest, resources.Requests.Memory().String())
+				require.Empty(t, resources.Limits)
+
+				return
+			}
+
 			obj := dataplaneOp(t, plan).Object
 			selector, _, err := unstructured.NestedStringMap(obj.Object, "spec", "template", "spec", "nodeSelector")
 			require.NoError(t, err)
@@ -278,6 +294,7 @@ func TestDataplaneOverrides(t *testing.T) {
 			ds := liveDataplane(t, env)
 			require.Equal(t, "50%", ds.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable.String())
 			require.Equal(t, "4Gi", ds.Spec.Template.Spec.Containers[0].Resources.Limits.Memory().String())
+			require.Equal(t, "1Gi", ds.Spec.Template.Spec.Containers[0].Resources.Requests.Memory().String())
 			require.Contains(t, ds.Spec.Template.Spec.Containers[0].Env, corev1.EnvVar{Name: "RACER_MAX_THREADS", Value: "8"})
 		})
 	}

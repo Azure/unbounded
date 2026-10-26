@@ -904,9 +904,23 @@ func TestTopologyOwnershipHistoryAndCatalogRestart(t *testing.T) {
 			withCache := reconcileTopology(t, r, t.Context())
 			published, err := wire.DecodePublication(strings.NewReader(withCache.encoded))
 			require.NoError(t, err)
-			require.Equal(t, []wire.CacheDefinition{{ID: testOtherUID, Name: "cache-a", ClientSocket: "/run/racer/cache-a/client/socket", OriginSocket: "/run/racer/cache-a/origin/socket"}}, published.Caches)
+			require.Equal(t, []wire.CacheDefinition{{ID: testOtherUID, Name: "cache-a", ClientSocket: "/run/racer/cache-a/client/socket", OriginSocket: "/run/racer/cache-a/origin/socket", Priority: wire.DefaultCachePriority}}, published.Caches)
 			require.Len(t, published.Members, 1)
 			require.Equal(t, first.record.MembershipVersion, withCache.record.MembershipVersion)
+
+			// A priority-only edit is new content without new membership.
+			require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(&cache), &cache))
+			cache.Spec.Priority = ptr.To[int32](900)
+			require.NoError(t, r.Update(t.Context(), &cache))
+			reprioritized := reconcileTopology(t, r, t.Context())
+			published, err = wire.DecodePublication(strings.NewReader(reprioritized.encoded))
+			require.NoError(t, err)
+			require.Equal(t, uint16(900), published.Caches[0].Priority)
+			require.Greater(t, reprioritized.record.Sequence, withCache.record.Sequence)
+			require.Equal(t, withCache.record.MembershipVersion, reprioritized.record.MembershipVersion)
+			require.Equal(t, withCache.record.MembershipHash, reprioritized.record.MembershipHash)
+			require.NotEqual(t, withCache.record.ContentHash, reprioritized.record.ContentHash)
+			withCache = reprioritized
 
 			// The workload was recreated while the old Pod still exists. A fresh
 			// process must recover history, not admit that Pod under its stale UID.

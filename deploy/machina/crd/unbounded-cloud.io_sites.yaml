@@ -188,10 +188,10 @@ spec:
                   CNI config is written and all same-site nodes are tunnel peers.
                   When false, only tunnel links to gateway pools for other sites are created,
                   allowing an external CNI plugin to manage intra-site networking.
-                  Pod CIDR assignment is also disabled when manageCniPlugin is false,
-                  regardless of the assignmentEnabled setting on individual podCidrAssignments
-                  rules. The podCidrAssignments are still required to define the CIDR ranges
-                  used for inter-site routing.
+                  Omitted assignmentEnabled values on podCidrAssignments default to this
+                  setting. Explicit assignmentEnabled values override that default.
+                  The podCidrAssignments are still required to define the CIDR ranges
+                  used for inter-site routing, even when assignment is disabled.
                 type: boolean
               nodeCidrs:
                 description: NodeCidrs are the CIDRs that contain the internal IPs
@@ -216,8 +216,10 @@ spec:
                     for nodes in a site.
                   properties:
                     assignmentEnabled:
-                      description: AssignmentEnabled controls whether this assignment
-                        is active. Defaults to true.
+                      description: |-
+                        AssignmentEnabled controls whether this assignment is active. When omitted,
+                        it inherits the Site's manageCniPlugin setting, which defaults to true.
+                        Explicit true or false overrides the inherited value.
                       type: boolean
                     cidrBlocks:
                       description: CidrBlocks are the CIDR pools to allocate from.

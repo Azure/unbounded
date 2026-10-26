@@ -259,6 +259,46 @@ pub enum Operation {
         selector: MetadataSelector,
         mode: FetchMode,
     },
+    /// Warm hold lifecycle sent directly to a page's primary owner. The lease
+    /// names one requester warm job; the owner scopes it by the authenticated
+    /// origin node, so distinct requesters never share or release a lease.
+    Warm {
+        version: ObjectVersion,
+        lease: [u8; 16],
+        action: WarmAction,
+    },
+}
+
+/// Largest object page count a warm hold may describe. The owner derives its
+/// own page set from this count, so the wire never carries a page list.
+pub const MAX_WARM_PAGES: u64 = 1 << 32;
+
+/// One step of the remote warm protocol. Every action is always `acquire` mode.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WarmAction {
+    /// Reserve hard holds for every page of `pages` that the receiver is the
+    /// primary owner of, until the requester's wall-clock `until`.
+    Hold { pages: u64, until: SystemTime },
+    /// Fill one held page onto the owner's disk and acknowledge without payload.
+    /// `length` and `content_type` are the requester's admitted immutable
+    /// metadata; the owner refuses to acknowledge a copy that disagrees.
+    Fill {
+        page: PageNumber,
+        length: u64,
+        content_type: Option<crate::model::ContentType>,
+    },
+    /// Drop this lease. The owner frees unused capacity after its last lease.
+    Release,
+}
+
+impl WarmAction {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Hold { .. } => "hold",
+            Self::Fill { .. } => "fill",
+            Self::Release => "release",
+        }
+    }
 }
 /// Locally constructed operation, not evidence of authenticated ingress.
 pub struct PeerRequest {
@@ -292,6 +332,14 @@ pub enum PeerResponse {
     OriginForbidden,
     /// Authenticated peer no longer retains the requested routing epoch.
     StaleMembership,
+    /// Warm holds accepted until this wall-clock time (millisecond precision).
+    Held {
+        until: SystemTime,
+    },
+    /// The requested warm page is published on the owner's disk under its hold.
+    Warmed,
+    /// The warm lease is gone. Unused capacity is freed after the last lease.
+    Released,
 }
 /// Owned, unverified wire input/output. The original and all forwarding signatures
 /// travel with the operation, including opaque encrypted origin credentials.
@@ -429,6 +477,11 @@ pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
             );
             push(&mut head, "racer-page-budget", subscription.page_budget);
             push(&mut head, "racer-byte-budget", subscription.byte_budget);
+            // Optional, so the single-flight request stays byte-identical to the
+            // encoding older providers accept. They refuse a request carrying it.
+            if let Some(flights) = subscription.flights {
+                push(&mut head, SUBSCRIPTION_FLIGHTS, flights);
+            }
             let mut intervals = Vec::new();
             for interval in subscription.demand.intervals() {
                 intervals.extend_from_slice(&interval.start.to_be_bytes());
@@ -479,6 +532,42 @@ pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
             }
             (id, mode)
         }
+        Operation::Warm {
+            version,
+            lease,
+            action,
+        } => {
+            push(&mut head, "racer-operation", "warm");
+            version_fields(&mut head, version)?;
+            push_binary(&mut head, "racer-warm-lease", lease);
+            push(&mut head, "racer-warm-action", action.name());
+            match action {
+                WarmAction::Hold { pages, until } => {
+                    if !(1..=MAX_WARM_PAGES).contains(pages) {
+                        return Err(Error::InvalidRequest);
+                    }
+                    push(&mut head, "racer-warm-pages", *pages);
+                    push(&mut head, "racer-warm-until", warm_until(*until)?);
+                }
+                WarmAction::Fill {
+                    page,
+                    length,
+                    content_type,
+                } => {
+                    if !warm_fill_in_range(page.0, *length) {
+                        return Err(Error::InvalidRequest);
+                    }
+                    push(&mut head, "racer-page", page.0);
+                    push(&mut head, "racer-length", *length);
+                    push(&mut head, "racer-metadata-version", 1);
+                    if let Some(content_type) = content_type {
+                        push(&mut head, "racer-content-type", content_type.as_str());
+                    }
+                }
+                WarmAction::Release => {}
+            }
+            (&version.object, &WARM_MODE)
+        }
     };
     if op_object != &request.origin.object {
         return Err(Error::InvalidRequest);
@@ -520,6 +609,70 @@ pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
     route_headers(&mut head, &request.route)?;
     Ok(head)
 }
+/// Warm operations always carry origin credentials for the owner's fill.
+const WARM_MODE: FetchMode = FetchMode::Acquire;
+
+/// Wall-clock hold expiry in whole milliseconds. Zero is never a valid expiry.
+fn warm_until(until: SystemTime) -> Result<u64> {
+    match millis(until)? {
+        0 => Err(Error::InvalidRequest),
+        value => Ok(value),
+    }
+}
+
+fn decode_warm_until(head: &MessageHead, name: &str) -> Result<SystemTime> {
+    match number(head, name)? {
+        0 => Err(Error::InvalidRequest),
+        value => std::time::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_millis(value))
+            .ok_or(Error::InvalidRequest),
+    }
+}
+
+/// A warm fill names an existing page of a nonempty object within the hold limit.
+fn warm_fill_in_range(page: u64, length: u64) -> bool {
+    page < MAX_WARM_PAGES
+        && page
+            .checked_mul(PAGE_BYTES)
+            .is_some_and(|start| start < length)
+}
+
+fn warm_action(head: &MessageHead) -> Result<WarmAction> {
+    Ok(match field(head, "racer-warm-action")?.as_str() {
+        "hold" => {
+            let pages = number(head, "racer-warm-pages")?;
+            if !(1..=MAX_WARM_PAGES).contains(&pages) {
+                return Err(Error::InvalidRequest);
+            }
+            WarmAction::Hold {
+                pages,
+                until: decode_warm_until(head, "racer-warm-until")?,
+            }
+        }
+        "fill" => {
+            let page = number(head, "racer-page")?;
+            let length = number(head, "racer-length")?;
+            if !warm_fill_in_range(page, length) {
+                return Err(Error::InvalidRequest);
+            }
+            let content_type = match head.unique("racer-metadata-version")? {
+                Some(b"1") => head
+                    .unique("racer-content-type")?
+                    .map(crate::model::ContentType::parse)
+                    .transpose()?,
+                _ => return Err(Error::InvalidRequest),
+            };
+            WarmAction::Fill {
+                page: PageNumber(page),
+                length,
+                content_type,
+            }
+        }
+        "release" => WarmAction::Release,
+        _ => return Err(Error::InvalidRequest),
+    })
+}
+
 fn metadata_fields(head: &mut MessageHead, metadata: &ObjectMetadata) -> Result<()> {
     version_fields(head, &metadata.version)?;
     push(head, "racer-length", metadata.length);
@@ -596,6 +749,12 @@ pub fn response_head(
         PeerResponse::OriginRejected => ("origin-rejected", 0),
         PeerResponse::OriginForbidden => ("origin-forbidden", 0),
         PeerResponse::StaleMembership => ("stale-membership", 0),
+        PeerResponse::Held { until } => {
+            push(&mut head, "racer-warm-until", warm_until(*until)?);
+            ("held", 0)
+        }
+        PeerResponse::Warmed => ("warmed", 0),
+        PeerResponse::Released => ("released", 0),
     };
     head.start = StartLine::Response {
         status: match response {
@@ -655,6 +814,9 @@ pub(crate) fn grant_fields(
     push(head, "racer-grant-deadline", grant.deadline);
     push(head, "racer-page-budget", grant.remaining_page_budget);
     push(head, "racer-byte-budget", grant.remaining_byte_budget);
+    if let Some(flights) = grant.flights {
+        push(head, SUBSCRIPTION_FLIGHTS, flights);
+    }
     Ok(())
 }
 fn page_fields(
@@ -765,6 +927,29 @@ impl SecurityCodec {
     pub fn new(admission: Rc<flow_control::Quotas<AdmissionPolicy>>, buffers: BufferPool) -> Self {
         Self { admission, buffers }
     }
+    /// The receiving worker's allocation front end.
+    pub(crate) fn buffers(&self) -> &BufferPool {
+        &self.buffers
+    }
+}
+
+/// A received response body and the admission that charged its staging.
+pub(crate) enum ResponseBody {
+    /// Vector staging. Without a reservation, the decoder charges the page.
+    Owned {
+        bytes: Vec<u8>,
+        reservation: Option<flow_control::Charge<AdmissionPolicy>>,
+    },
+    /// Aligned staging from the receiving worker's pool, already charged.
+    Aligned(crate::memory::CiphertextBuffer),
+}
+impl ResponseBody {
+    fn len(&self) -> usize {
+        match self {
+            Self::Owned { bytes, .. } => bytes.len(),
+            Self::Aligned(buffer) => buffer.len(),
+        }
+    }
 }
 fn bytes(head: &MessageHead, name: &str) -> Result<Vec<u8>> {
     decode_binary(field(head, name)?.as_bytes())
@@ -829,7 +1014,23 @@ pub(crate) fn grant(head: &MessageHead) -> Result<super::subscriptions::Transfer
             .try_into()
             .map_err(|_| Error::InvalidRequest)?,
         remaining_byte_budget: number(head, "racer-byte-budget")?,
+        flights: subscription_flights(head)?,
     })
+}
+
+/// Header carrying `Subscription::flights` and `TransferGrant::flights`.
+pub(crate) const SUBSCRIPTION_FLIGHTS: &str = "racer-subscription-flights";
+
+/// Decode the optional flight count, refusing zero and values above the cap.
+pub(crate) fn subscription_flights(head: &MessageHead) -> Result<Option<u16>> {
+    use super::subscriptions::MAX_SUBSCRIPTION_FLIGHTS;
+    if head.unique(SUBSCRIPTION_FLIGHTS)?.is_none() {
+        return Ok(None);
+    }
+    match u16::try_from(number(head, SUBSCRIPTION_FLIGHTS)?) {
+        Ok(flights) if (1..=MAX_SUBSCRIPTION_FLIGHTS).contains(&flights) => Ok(Some(flights)),
+        _ => Err(Error::InvalidRequest),
+    }
 }
 fn metadata(head: &MessageHead) -> Result<ObjectMetadata> {
     let content_type = match head.unique("racer-metadata-version")? {
@@ -931,6 +1132,11 @@ fn bodyless_response(head: &MessageHead, outcome: &str) -> Result<PeerResponse> 
         "origin-rejected" => PeerResponse::OriginRejected,
         "origin-forbidden" => PeerResponse::OriginForbidden,
         "stale-membership" => PeerResponse::StaleMembership,
+        "held" => PeerResponse::Held {
+            until: decode_warm_until(head, "racer-warm-until")?,
+        },
+        "warmed" => PeerResponse::Warmed,
+        "released" => PeerResponse::Released,
         _ => return Err(Error::InvalidRequest),
     })
 }
@@ -995,6 +1201,7 @@ impl SecurityCodec {
                         .try_into()
                         .map_err(|_| Error::InvalidRequest)?,
                     byte_budget: number(head, "racer-byte-budget")?,
+                    flights: subscription_flights(head)?,
                 },
                 mode,
             },
@@ -1018,6 +1225,16 @@ impl SecurityCodec {
                 },
                 mode,
             },
+            "warm" => {
+                if !matches!(mode, FetchMode::Acquire) {
+                    return Err(Error::InvalidRequest);
+                }
+                Operation::Warm {
+                    version: version(head)?,
+                    lease: array(head, "racer-warm-lease")?,
+                    action: warm_action(head)?,
+                }
+            }
             _ => return Err(Error::InvalidRequest),
         };
         let original_route = route(head)?;
@@ -1077,6 +1294,22 @@ impl SecurityCodec {
         reservation: Option<flow_control::Charge<AdmissionPolicy>>,
         scope: &RequestScope,
     ) -> Result<SignedResponse> {
+        self.response_body(
+            authentication,
+            ResponseBody::Owned {
+                bytes: body,
+                reservation,
+            },
+            scope,
+        )
+    }
+    /// Decode a response, keeping an aligned body in place as the page.
+    pub(crate) fn response_body(
+        &self,
+        authentication: ForwardedHead,
+        body: ResponseBody,
+        scope: &RequestScope,
+    ) -> Result<SignedResponse> {
         scope.check()?;
         let head = &authentication.original.head;
         let outcome = field(head, "racer-outcome")?;
@@ -1088,23 +1321,41 @@ impl SecurityCodec {
                 if body.len() != envelope.ciphertext_length as usize {
                     return Err(Error::InvalidRequest);
                 }
-                let reservation = match reservation {
-                    Some(reservation) => {
-                        reservation.validate(ResourceClass::Ciphertext, body.capacity())?;
-                        if !self.admission.owns(&reservation)
+                let ciphertext = match body {
+                    ResponseBody::Owned {
+                        bytes: body,
+                        reservation,
+                    } => {
+                        let reservation = match reservation {
+                            Some(reservation) => {
+                                reservation.validate(ResourceClass::Ciphertext, body.capacity())?;
+                                if !self.admission.owns(&reservation)
+                                    || reservation.key() != Some(&metadata.version.object.cache)
+                                {
+                                    return Err(Error::InvalidRequest);
+                                }
+                                reservation
+                            }
+                            None => self.admission.reserve(
+                                Some(&metadata.version.object.cache),
+                                ResourceClass::Ciphertext,
+                                body.capacity(),
+                            )?,
+                        };
+                        self.buffers.ciphertext(reservation, envelope, body)?
+                    }
+                    ResponseBody::Aligned(buffer) => {
+                        let reservation = buffer.charge();
+                        reservation.validate(ResourceClass::Ciphertext, buffer.capacity())?;
+                        if !self.admission.owns(reservation)
                             || reservation.key() != Some(&metadata.version.object.cache)
                         {
                             return Err(Error::InvalidRequest);
                         }
-                        reservation
+                        self.buffers
+                            .aligned_ciphertext_page(buffer, envelope, None)?
                     }
-                    None => self.admission.reserve(
-                        Some(&metadata.version.object.cache),
-                        ResourceClass::Ciphertext,
-                        body.capacity(),
-                    )?,
                 };
-                let ciphertext = self.buffers.ciphertext(reservation, envelope, body)?;
                 if outcome == "selected" {
                     PeerResponse::Selected {
                         metadata,
@@ -1127,7 +1378,7 @@ impl SecurityCodec {
                 }
             }
             outcome => {
-                if !body.is_empty() {
+                if body.len() != 0 {
                     return Err(Error::InvalidRequest);
                 }
                 bodyless_response(head, outcome)?
@@ -1248,6 +1499,7 @@ pub(crate) mod tests {
             deadline: 7,
             remaining_page_budget: 4,
             remaining_byte_budget: 80,
+            flights: None,
         };
         let prefix = vec![
             ("racer-kind", "response"),
@@ -1534,6 +1786,111 @@ pub(crate) mod tests {
                 }
                 assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
                 assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+                assert_eq!(foreign.used(ResourceClass::Ciphertext), 0);
+            }
+        }
+        #[test]
+        fn received_aligned_body_becomes_disk_aligned_page_and_rejects_mismatches() {
+            let signers = crate::peer::tests::signers();
+            let cache = CacheId("cccccccc-1111-4111-8111-111111111111".into());
+            let limits = crate::test_support::cluster::config(false).limits;
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+                limits.clone(),
+            )));
+            let foreign = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
+            let buffers = BufferPool::new(admission.clone());
+            let foreign_buffers = BufferPool::new(foreign.clone());
+            let codec = SecurityCodec::new(admission.clone(), buffers.clone());
+            let metadata = ObjectMetadata {
+                content_type: None,
+                version: ObjectVersion {
+                    object: ObjectId {
+                        cache: cache.clone(),
+                        key: CacheKey([3; 32]),
+                    },
+                    etag: StrongEtag::test_value("v1"),
+                },
+                length: 3,
+                expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
+            };
+            let page = buffers
+                .ciphertext(
+                    admission
+                        .reserve(Some(&cache), ResourceClass::Ciphertext, 19)
+                        .unwrap(),
+                    PageEnvelope {
+                        cipher: crate::model::PageCipher::Xaes256Gcm,
+                        page: PageId {
+                            version: metadata.version.clone(),
+                            number: PageNumber(0),
+                        },
+                        key_id: KeyId([1; 16]),
+                        nonce: Nonce([2; 24]),
+                        plaintext_length: 3,
+                        ciphertext_length: 19,
+                    },
+                    vec![9; 19],
+                )
+                .unwrap();
+            let response = PeerResponse::Page {
+                metadata,
+                ciphertext: page,
+            };
+            let mut head = response_head(
+                &response,
+                &[3; 32],
+                &[signers[0].node().clone(), signers[2].node().clone()],
+            )
+            .unwrap();
+            push(&mut head, "racer-receiver", &signers[0].node().0);
+            let original = std::sync::Arc::new(signers[2].sign(head).unwrap());
+            drop(response);
+            let scope = RequestScope::new(
+                RequestId([1; 16]),
+                uring_runtime::environment::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+            let alignment = crate::memory::default_disk_alignment();
+            let capacity = buffers.aligned_capacity(19).unwrap();
+            for case in 0..4 {
+                let (pool, quotas, key, length) = match case {
+                    1 => (&foreign_buffers, &foreign, cache.clone(), 19),
+                    2 => (&buffers, &admission, CacheId("other".into()), 19),
+                    3 => (&buffers, &admission, cache.clone(), 18),
+                    _ => (&buffers, &admission, cache.clone(), 19),
+                };
+                let mut body = pool
+                    .aligned_ciphertext(
+                        quotas
+                            .reserve(Some(&key), ResourceClass::Ciphertext, capacity)
+                            .unwrap(),
+                        length,
+                    )
+                    .unwrap();
+                body.as_mut_slice().fill(9);
+                let auth = ForwardedHead {
+                    original: original.clone(),
+                    hops: vec![],
+                };
+                let result = codec.response_body(auth, ResponseBody::Aligned(body), &scope);
+                if case == 0 {
+                    let result = result.unwrap();
+                    assert_eq!(admission.used(ResourceClass::Ciphertext), capacity);
+                    let PeerResponse::Page { ciphertext, .. } = result.response else {
+                        panic!("page required")
+                    };
+                    assert_eq!(ciphertext.bytes(), &[9; 19]);
+                    let disk = ciphertext.disk_body(alignment).expect("aligned page");
+                    assert_eq!(disk.len(), 4096);
+                    assert!(disk[19..].iter().all(|byte| *byte == 0));
+                    drop(ciphertext);
+                } else {
+                    assert!(
+                        matches!(result, Err(Error::InvalidRequest)),
+                        "mismatched aligned body accepted: {case}"
+                    );
+                }
+                assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
                 assert_eq!(foreign.used(ResourceClass::Ciphertext), 0);
             }
         }
@@ -2446,6 +2803,26 @@ pub(crate) mod tests {
             assert_eq!(encode_deadline(decoded).unwrap(), encoded);
             assert!(decoded.0 <= deadline.0);
             assert_eq!(MAX_HEAD, MAX_SIGNED_HEAD);
+        }
+    }
+
+    #[test]
+    fn subscription_flights_are_optional_and_bounded() {
+        let head = |value: Option<&str>| {
+            let mut head = MessageHead {
+                start: StartLine::Response { status: 200 },
+                headers: Vec::new(),
+            };
+            if let Some(value) = value {
+                push(&mut head, SUBSCRIPTION_FLIGHTS, value);
+            }
+            head
+        };
+        assert_eq!(subscription_flights(&head(None)).unwrap(), None);
+        assert_eq!(subscription_flights(&head(Some("1"))).unwrap(), Some(1));
+        assert_eq!(subscription_flights(&head(Some("64"))).unwrap(), Some(64));
+        for bad in ["0", "65", "70000", "01", "x"] {
+            assert!(subscription_flights(&head(Some(bad))).is_err(), "{bad}");
         }
     }
 }
