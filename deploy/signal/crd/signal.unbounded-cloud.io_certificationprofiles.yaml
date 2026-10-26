@@ -62,8 +62,6 @@ spec:
                       format: int32
                       minimum: 0
                       type: integer
-                    runnerImage:
-                      type: string
                     scriptKey:
                       minLength: 1
                       type: string
@@ -153,7 +151,6 @@ spec:
                   required:
                   - backend
                   - backendActiveDeadline
-                  - runnerImage
                   - scriptKey
                   type: object
                   x-kubernetes-validations:

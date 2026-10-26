@@ -99,6 +99,7 @@ PROJECT_SIGNAL_ADAPTER_BIN=bin/project-signal-adapter
 PROJECT_SIGNAL_ADAPTER_CMD=./cmd/project-signal-adapter
 SIGNAL_ADAPTER_IMAGE ?= example.invalid/project-signal-adapter@sha256:0000000000000000000000000000000000000000000000000000000000000000
 SIGNAL_ADAPTER_BUILD_IMAGE ?= example.invalid/project-signal-adapter:replace-me
+SIGNAL_CERTIFICATION_RUNNER_IMAGE ?= example.invalid/project-signal-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000
 SIGNAL_NAMESPACE ?= project-signal
 SIGNAL_MANIFEST_TEMPLATES_DIR := deploy/signal
 SIGNAL_MANIFEST_RENDERED_DIR := deploy/signal/rendered
@@ -1211,7 +1212,8 @@ signal-manifests: ## Render Project Signal manifests into deploy/signal/rendered
 		--output-dir $(SIGNAL_MANIFEST_RENDERED_DIR) \
 		--set Namespace=$(SIGNAL_NAMESPACE) \
 		--set ControllerImage=$(SIGNAL_CONTROLLER_IMAGE) \
-		--set AdapterImage=$(SIGNAL_ADAPTER_IMAGE)
+		--set AdapterImage=$(SIGNAL_ADAPTER_IMAGE) \
+		--set RunnerImage=$(SIGNAL_CERTIFICATION_RUNNER_IMAGE)
 	@mkdir -p $(SIGNAL_MANIFEST_RENDERED_DIR)/crd
 	@cp $(SIGNAL_MANIFEST_TEMPLATES_DIR)/crd/*.yaml $(SIGNAL_MANIFEST_RENDERED_DIR)/crd/
 	@echo "Rendered Project Signal manifests into $(SIGNAL_MANIFEST_RENDERED_DIR) (image: $(SIGNAL_CONTROLLER_IMAGE))"

@@ -86,6 +86,7 @@ type AdmissionReconciler struct {
 	APIReader       client.Reader
 	Namespace       string
 	ScriptNamespace string
+	RunnerImage     string
 	Recorder        recorder.EventRecorder
 	Now             func() time.Time
 	admissionMu     sync.Mutex
@@ -154,6 +155,10 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 	r.admissionMu.Lock()
 	defer r.admissionMu.Unlock()
 
+	if err := ValidateRunnerImage(r.RunnerImage); err != nil {
+		return err
+	}
+
 	if runName := node.Annotations[ReservationLabel]; runName != "" {
 		handled, err := r.resumeOrReleaseReservation(ctx, runName)
 		if err != nil || handled {
@@ -178,10 +183,6 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 			profile.Spec.Deadline.Duration,
 		); err != nil {
 			return fmt.Errorf("profile %s check %s runtime contract: %w", profile.Name, check.ID, err)
-		}
-
-		if !runnerImageDigestPattern.MatchString(check.RunnerImage) {
-			return fmt.Errorf("profile %s check %s runner image must use an immutable sha256 digest", profile.Name, check.ID)
 		}
 
 		if err := signalworkload.Validate(check.WorkloadPolicy); err != nil {
@@ -742,7 +743,7 @@ func (r *AdmissionReconciler) createSnapshot(
 				Key:    key,
 				Digest: digest,
 			},
-			RunnerImage:           check.RunnerImage,
+			RunnerImage:           r.RunnerImage,
 			Backend:               check.Backend,
 			WorkloadPolicy:        *check.WorkloadPolicy.DeepCopy(),
 			GPUCount:              check.GPUCount,
@@ -755,6 +756,14 @@ func (r *AdmissionReconciler) createSnapshot(
 	}
 
 	return snapshot, checkSnapshots, nil
+}
+
+func ValidateRunnerImage(image string) error {
+	if !runnerImageDigestPattern.MatchString(image) {
+		return errors.New("runner image must use an immutable sha256 digest")
+	}
+
+	return nil
 }
 
 func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

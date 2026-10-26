@@ -29,12 +29,14 @@ profile contains an `MPIJob` check.
 
 ## First deployment
 
-Render the manifests with immutable controller and adapter images:
+Render the manifests with the controller image plus immutable adapter and
+certification runner images:
 
 ```bash
 make signal-manifests \
   SIGNAL_CONTROLLER_IMAGE=<controller-image> \
-  SIGNAL_ADAPTER_IMAGE=<adapter-image>@sha256:<digest>
+  SIGNAL_ADAPTER_IMAGE=<adapter-image>@sha256:<digest> \
+  SIGNAL_CERTIFICATION_RUNNER_IMAGE=<runner-image>@sha256:<digest>
 ```
 
 Install the rendered CRDs and namespaced resources:
@@ -53,6 +55,8 @@ The install creates:
 
 The controller requires cluster permission to get, list, watch, and patch
 Nodes because it owns participant reservation markers and cordons.
+The deployment-owned runner image is copied into every immutable Run check
+snapshot. Profile authors cannot replace it.
 
 ## CertificationProfile contract
 
@@ -78,7 +82,6 @@ Each check contains:
 | Field | Meaning |
 |---|---|
 | `scriptKey` | Key in `spec.scriptConfigMap`; admission snapshots the current bytes and computes their SHA-256 digest |
-| `runnerImage` | Digest-pinned check image |
 | `backend` | `Pod` or `MPIJob` |
 | `backendActiveDeadline` | Backend execution deadline |
 | `gpuCount` | GPU request; must be positive for MPIJob |

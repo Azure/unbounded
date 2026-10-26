@@ -17,7 +17,6 @@ type CertificationCheck struct {
 	Order int32   `json:"-"`
 	// +kubebuilder:validation:MinLength=1
 	ScriptKey      string           `json:"scriptKey"`
-	RunnerImage    string           `json:"runnerImage"`
 	Backend        ExecutionBackend `json:"backend"`
 	WorkloadPolicy WorkloadPolicy   `json:"workloadPolicy,omitempty"`
 	// +kubebuilder:validation:Minimum=0

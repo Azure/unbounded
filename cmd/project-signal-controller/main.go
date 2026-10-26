@@ -31,6 +31,7 @@ const controllerName = "project-signal-controller"
 type config struct {
 	namespace         string
 	scriptNamespace   string
+	runnerImage       string
 	metricsAddress    string
 	probeAddress      string
 	leaderElect       bool
@@ -54,6 +55,7 @@ func main() {
 
 	cmd.Flags().StringVar(&cfg.namespace, "namespace", "project-signal", "Namespace for CertificationRuns and Workflows")
 	cmd.Flags().StringVar(&cfg.scriptNamespace, "script-namespace", "project-signal", "Namespace containing mutable source script ConfigMaps")
+	cmd.Flags().StringVar(&cfg.runnerImage, "runner-image", "", "Digest-pinned certification runner image")
 	cmd.Flags().StringVar(&cfg.metricsAddress, "metrics-bind-address", ":8080", "Address for metrics")
 	cmd.Flags().StringVar(&cfg.probeAddress, "health-probe-bind-address", ":8081", "Address for health probes")
 	cmd.Flags().BoolVar(&cfg.leaderElect, "leader-elect", true, "Enable leader election")
@@ -71,6 +73,10 @@ func run(ctx context.Context, cfg config) error {
 
 	if cfg.namespace == "" || cfg.scriptNamespace == "" {
 		return errors.New("namespace and script namespace are required")
+	}
+
+	if err := projectsignal.ValidateRunnerImage(cfg.runnerImage); err != nil {
+		return err
 	}
 
 	scheme := runtime.NewScheme()
@@ -113,6 +119,7 @@ func run(ctx context.Context, cfg config) error {
 		APIReader:       mgr.GetAPIReader(),
 		Namespace:       cfg.namespace,
 		ScriptNamespace: cfg.scriptNamespace,
+		RunnerImage:     cfg.runnerImage,
 		Recorder:        mgr.GetEventRecorder(controllerName),
 	}
 	if err := admission.SetupWithManager(mgr); err != nil {

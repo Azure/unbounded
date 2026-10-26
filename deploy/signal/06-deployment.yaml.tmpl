@@ -21,6 +21,7 @@ spec:
           args:
             - --namespace={{ default "project-signal" .Namespace }}
             - --script-namespace={{ default (default "project-signal" .Namespace) .ScriptNamespace }}
+            - --runner-image={{ default "example.invalid/project-signal-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000" .RunnerImage }}
             - --leader-elect=true
           ports:
             - name: metrics
