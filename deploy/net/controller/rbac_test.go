@@ -62,6 +62,10 @@ func TestBoundObjectCacheRBAC(t *testing.T) {
 							t.Fatalf("missing Pod %s permission in controller namespace", verb)
 						}
 					}
+
+					if !grantsPodRead(role.Rules, "delete") {
+						t.Fatal("missing targeted Pod delete permission in controller namespace")
+					}
 				}
 			}
 
