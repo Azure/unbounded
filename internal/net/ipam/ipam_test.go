@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -718,6 +719,54 @@ func TestServerShutdownClosesIdleConnections(t *testing.T) {
 
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("shutdown retained socket: %v", err)
+	}
+}
+
+func TestWriteMessagePeerClosesAfterFrame(t *testing.T) {
+	for _, version := range []uint32{0, ProtocolVersion} {
+		t.Run(fmt.Sprint(version), func(t *testing.T) {
+			left, right := net.Pipe()
+			defer left.Close()
+			defer right.Close()
+
+			if err := left.SetDeadline(time.Now().Add(RequestTimeout)); err != nil {
+				t.Fatal(err)
+			}
+
+			request := &ipamproto.GetIPAMConfigRequest{Version: version}
+			errs := make(chan error, 1)
+
+			go func() {
+				received := &ipamproto.GetIPAMConfigRequest{}
+				err := protodelim.UnmarshalFrom(bufio.NewReader(right), received)
+				right.Close()
+
+				if err == nil && !proto.Equal(request, received) {
+					err = fmt.Errorf("received %v, want %v", received, request)
+				}
+
+				errs <- err
+			}()
+
+			if err := writeMessage(left, request); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := <-errs; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestWriteMessageClosedPeer(t *testing.T) {
+	left, right := net.Pipe()
+	defer left.Close()
+
+	right.Close()
+
+	if err := writeMessage(left, &ipamproto.GetIPAMConfigRequest{}); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("write error = %v, want closed pipe", err)
 	}
 }
 

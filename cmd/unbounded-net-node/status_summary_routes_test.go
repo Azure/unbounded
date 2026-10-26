@@ -9,7 +9,9 @@ import (
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	"github.com/Azure/unbounded/internal/net/routeplan"
 	netstatus "github.com/Azure/unbounded/internal/net/status"
 )
@@ -35,6 +37,41 @@ func summaryRouteFixture() *nodeStatusServer {
 				4: &fakeLink{attrs: netlink.LinkAttrs{Index: 4, Name: "gn0"}},
 			},
 		},
+	}
+}
+
+func TestRouteSummaryUsesActiveGatewayGeneration(t *testing.T) {
+	s := summaryRouteFixture()
+	s.netlinkOps.(*fakeNetlinkOps).mainRoutes = map[int][]netlink.Route{
+		netlink.FAMILY_V4: {summaryRoute("10.9.0.1/32", 1, 0, 0)},
+	}
+
+	pools := newTestInformer()
+	if err := pools.GetStore().Add(toUnstructuredSiteWatch(t, &unboundednetv1alpha1.GatewayPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-g"},
+		Spec:       unboundednetv1alpha1.GatewayPoolSpec{Type: "External"},
+		Status: unboundednetv1alpha1.GatewayPoolStatus{Nodes: []unboundednetv1alpha1.GatewayNodeInfo{
+			{Name: "gateway", ExternalIPs: []string{"203.0.113.1"}},
+		}},
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	s.gatewayInformers = newGatewayInformerLifecycle(nil, 0)
+	s.gatewayInformers.active = &gatewayInformerGeneration{gatewayInformerSnapshot: gatewayInformerSnapshot{
+		available: true, pools: pools,
+	}}
+
+	peers := []routeplan.Peer{{
+		Name: "gateway", PeerType: "gateway", Interface: "wg51820", AllowedIPs: []string{"10.9.0.1/32", "203.0.113.1/32"},
+	}}
+	if count, mismatches := s.collectRouteSummary(peers, "local"); count != 1 || mismatches != 0 {
+		t.Fatalf("active generation summary = (%d,%d), want (1,0)", count, mismatches)
+	}
+
+	s.gatewayInformers.active = nil
+	if _, mismatches := s.collectRouteSummary(peers, "local"); mismatches == 0 {
+		t.Fatal("fixture did not distinguish absent gateway identities")
 	}
 }
 
