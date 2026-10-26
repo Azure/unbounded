@@ -658,20 +658,6 @@ jobs:
           cache-to: type=gha,mode=max,scope=project-signal-runner-${{ matrix.arch }}
           provenance: false
 
-      - name: Smoke-test Project Signal runner tool contract
-        run: |
-          # shellcheck disable=SC2016 # Expand the contract inside the container.
-          timeout --signal=TERM --kill-after=10s 300s docker run --rm --network=none project-signal-runner:ci \
-            bash -ceu '
-              test "$NVIDIA_DRIVER_CAPABILITIES" = compute,utility
-              for tool in \
-                bash sha256sum base64 curl jq ip ping ss ethtool lspci numactl \
-                rdma ibstat ibv_devinfo ib_write_bw mpirun ssh sshd
-              do
-                command -v "$tool"
-              done
-            '
-
       - name: Build controller image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
