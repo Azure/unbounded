@@ -92,6 +92,8 @@ MACHINE_OPS_CONTROLLER_NAME ?= machine-ops-controller
 MACHINE_OPS_PROVIDER ?=
 MACHINE_OPS_SITE ?=
 
+SIGNAL_RUNNER_IMAGE ?= $(CONTAINER_REGISTRY)/project-signal-runner:$(VERSION_TAG)
+
 METALMAN_BIN=bin/metalman
 METALMAN_CMD=./cmd/metalman
 NETBOOT_IMAGE ?= $(CONTAINER_REGISTRY)/netboot:$(VERSION_TAG)
@@ -237,6 +239,7 @@ REACT_DEV ?= false
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests gantry-chart-lint gantry-chart-package release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
+.PHONY: image-project-signal-runner-local
 
 ##@ General
 
@@ -313,6 +316,7 @@ help: ## Show this help
 	@echo "  image-machina-local              Build machina image with \$$(CONTAINER_ENGINE)"
 	@echo "  image-token-refresher-local      Build token-refresher image"
 	@echo "  image-machine-ops-controller-local Build machine-ops-controller image"
+	@echo "  image-project-signal-runner-local Build Project Signal runner image"
 	@echo "  image-metalman-local             Build metalman image"
 	@echo "  image-unbounded-operator-local   Build unbounded-operator image"
 	@echo "  image-unbounded-operator-push    Build and push unbounded-operator image"
@@ -1084,6 +1088,15 @@ machine-ops-controller-oci: image-machine-ops-controller-local ## Alias for imag
 
 machine-ops-controller-oci-push: machine-ops-controller-oci ## Build and push the machine-ops-controller image
 	$(CONTAINER_ENGINE) push $(MACHINE_OPS_CONTROLLER_IMAGE)
+
+image-project-signal-runner-local: ## Build Project Signal runner image locally
+	$(CONTAINER_ENGINE) build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		-t project-signal-runner:$(VERSION_TAG) -t $(SIGNAL_RUNNER_IMAGE) \
+		-f ./images/project-signal-runner/Containerfile .
+	$(call trivy-maybe,$(SIGNAL_RUNNER_IMAGE))
 
 MACHINA_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 MACHINA_API_SERVER_ENDPOINT ?=
