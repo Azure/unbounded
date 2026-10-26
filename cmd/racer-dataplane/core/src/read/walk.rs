@@ -240,6 +240,13 @@ pub fn funded_links(budget: &AcquisitionBudget) -> Option<u8> {
 /// at 16 MiB pages: 120 to 165 overlapping requests without this
 /// exception, 128 with it). A route failure or a refusal (rank 0 down or its own
 /// acquisition failed) still funds the next owner.
+///
+/// The cost is bounded (Known issue 59): an owner funded at its minimum
+/// asks its predecessors copy-only and sends at most one origin request,
+/// under the authority rules every owner follows. In 5k `full-failover`
+/// its extra requests are pages served that were not before, retries after
+/// an origin failure, and skips of a rank 0 that holds the page behind a
+/// cut route (`held_unreachable`), never a copy answered as missing.
 pub fn shared_share_short(
     budget: &AcquisitionBudget,
     canonical: usize,

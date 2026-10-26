@@ -905,7 +905,17 @@ Verified against the code at the start of this work.
 59. Funding short in-order owners (Known issue 57) makes them fetch after rank 0 failed the
    reader instead of failing it: 5k `full-failover` origin +17 to +30 requests, `copy_held`
    repeats 58/67/55 to 67/76/72 and worst page 5 to 6 (seeds 1, 2), for 4 to 15 fewer failed
-   reads. Open (round 4, budget, wave 7).
+   reads. Resolved with a bound (round 4, funding, wave 8): a minimum-funded owner asks its
+   predecessors copy-only and sends at most one origin request, only with the authority every
+   owner has (no request after a copy, after rank 0 left it unanswered while fetching, or after
+   rank 0 failed while its own request failed recently); the extra requests are pages served
+   that were not before (+17, +6, +13), retries after origin failures (+6, +4, -7), and skips of
+   a rank 0 that holds the page behind a cut route (`held_unreachable` +13, +2, +12), never a
+   copy answered as missing. The worst-page rise (5 to 6) is failure retries only: excluding
+   them the worst page is 3, 2, 2 to 2, 2, 2. Enforced by
+   `walk::tests::a_minimum_funded_owner_fetches_at_most_once_and_only_with_authority` and
+   `combined::tests::failover_repeats_are_skips_or_their_orphans`. See "Round 4: funding
+   (wave 8)".
 
 60. A non-owner reader's overflow helper probe (`Walk::helper_probe`,
    `core/src/read/walk.rs:671` at the wave 7 merge) is funded with up to `HELPER_ATTEMPTS` (4)
@@ -1471,8 +1481,9 @@ scenarios carry data-plane faults.
 58. Resolved: a reader that comes back within 60 s after a deferral to an offer's sender is
    not deferred again; 50k `full-failover` failed reads 343, 307, 342 to 251, 248, 267 (seeds 1
    to 3), DST seed 11 passes (round 4, failover, wave 7).
-59. Funded short in-order owners fetch after rank 0 failed the reader: 5k `full-failover`
-   origin +17 to +30, worst page 5 to 6, 4 to 15 fewer failed reads (round 4, budget, wave 7).
+59. Resolved with a bound: a minimum-funded owner sends at most one origin request, only with
+   an owner's authority; its extra requests are newly served pages, failure retries and skips
+   of a rank 0 behind a cut route, never a missed copy (round 4, funding, wave 8).
 60. A reader's overflow helper probe takes every attempt the reader has left (up to
    `HELPER_ATTEMPTS`), so when the helper fails (here: its route to rank 0 has 2 links) the
    reader cannot ask ranks 1 and 2 (round 4, busy, wave 7).
@@ -6769,3 +6780,90 @@ every run, including the 16-scenario smoke at 200 nodes.
 ### Open issues after wave 7
 
 59, 60 (47, 53, 54, 55, 57 and 58 are resolved).
+
+## Round 4: funding (wave 8)
+
+Known issue 59. Branch `racer-sim10-funding` from racer-core-sim 2934d0301. Logs and reports:
+`/tmp/opencode/r10-funding/` (`e/`: this branch, `u/`: wave 7 with the in-order funding of
+Known issue 57 disabled by a temporary switch in `walk::shared_share_short`, not committed).
+
+### Root cause
+
+The issue's description ("funded owners fetch after rank 0 failed the reader") suggested a
+rank 0 that answered the reader `Unavailable` (its own acquisition failed) and a funded rank 1
+asking origin right after it. A temporary reader-side rule (no in-order funding after rank 0
+itself answered `Unavailable`, mirroring Known issue 52's owner-side hold) fired 63 times in 5k
+`full-failover` seed 1 and changed no outcome: the reader never funds a short share after such
+an answer. A temporary counter of what rank 0 answered before each in-order funded Acquire in
+the same run: a relay-signed failure on the route (123), a partition cut (132), rank 0 down (1).
+Rank 0 failed the reader by being unreachable from it, not by refusing.
+
+The funded owner (rank 1 or 2, `owner_funding_min(c) - 1` remote credits) cannot delegate (a
+delegated Acquire needs one more credit: `delegated` in `CandidateWalk::next`,
+`core/src/read/walk.rs:880`), so it asks rank 0 copy-only and, without a copy, fetches
+itself. A/B per seed (wave 7 with and without the funding; reads failed; origin requests; how
+the difference splits):
+
+| 5k `full-failover` | Without | With (wave 7) | Extra origin requests |
+| --- | --- | --- | --- |
+| seed 1 | 33 failed; 12,962 | 10 failed; 12,999 | pages +17, after failure +6, owner move +1, `copy_held` +13 |
+| seed 2 | 28 failed; 12,975 | 15 failed; 12,989 | pages +6, after failure +4, owner move +3, `copy_held` +1 |
+| seed 3 | 28 failed; 12,902 | 17 failed; 12,921 | pages +13, after failure -7, `copy_held` +13 |
+
+- Pages: distinct pages fetched rise with the reads served; a page nobody fetched before must be
+  fetched once.
+- After failure: geometric 5xx retries (Known issue 55's bound). The worst page (5 to 6 at seeds
+  1 and 2) is entirely these: excluding failure retries the worst page is 3, 2, 2 without the
+  funding and 2, 2, 2 with it.
+- `copy_held`: `held.unreachable` +13, +2, +12, `held.unasked` 0, -1, +1, `held.missed` 0. A
+  temporary per-repeat trace (not committed) at seed 1 showed most of them are an owner above
+  rank 0 that skipped rank 0 after a relay failure (36) or a partition cut (22) while rank 0 held
+  the page: the owner asked the holder and the route failed. Serving the read on the reader's
+  side of the cut takes one origin request; the alternative is the failed read the funding
+  removed. Orphans (rank 0 fetching again after such a skip) rise 7 to 14, 15 to 18, 16 to 19;
+  each is charged to its skip (Known issue 15's `held <= skips + orphans`).
+- `origin_skips_copy_only` rises 170 to 216, 169 to 279, 165 to 231 (rank 0 reachable from the
+  owner and answering `Miss`), mostly fetches rank 0 would otherwise make on the reader's retry,
+  not repeats.
+
+No code change removes these without giving back the failed reads: the owner either fetches or
+fails the reader, and a delegation at the minimum would spend the owner's own origin credit on a
+rank 0 that is often unreachable (Known issue 57's case).
+
+### Change
+
+No behavior change. The bound is now stated and enforced:
+
+- `walk::tests::a_minimum_funded_owner_fetches_at_most_once_and_only_with_authority`: ranks 1
+  and 2 at their minimum, every rank 0 answer (copy, miss, transport and probe failure,
+  `Failed` with and without the owner's own recent origin failure, `TimedOut` with
+  `Unknown` and `Fetching`): only copy-only probes, at most one per predecessor, at most one
+  origin attempt (exactly one credit left), and none after a copy, a `TimedOut`, or `Failed`
+  while `Rank0State::Failed`.
+- `combined::tests::failover_repeats_are_skips_or_their_orphans` also asserts `held.missed` is 0
+  (200 and 400 nodes).
+- `walk::shared_share_short` documents the bound.
+
+### Evidence
+
+This branch (release, seed 1 unless noted) against the "Round 4: combined (wave 7)" table:
+identical, as expected with no behavior change. Reads ok / failed; origin requests, worst page,
+pages fetched more than once.
+
+| Run | Wave 7 | Funding |
+| --- | --- | --- |
+| 5k storm | 378,536 / 0; 1,024, 1, 0 | unchanged |
+| 5k zipf | 202,851 / 15; 40,404, 3, 1,452 | unchanged |
+| 5k full-cold-start | 95,107 / 0; 6,942, 2, 2 | unchanged |
+| 5k full-failover | 33,998 / 10; 12,999, 6, 327 | unchanged |
+| 5k full-failover seed 2 | 33,758 / 15; 12,989, 6, 361 | unchanged |
+| 5k full-failover seed 3 | 33,613 / 17; 12,921, 5, 307 | unchanged |
+
+The 50k runs were not repeated: the simulator is deterministic and no simulated or production
+code changed (the 5k runs above match wave 7 exactly), so the wave 7 50k results stand (50k
+`full-cold-start` 0 failed, 50k `full-failover` 152 failed). Issue 57's gains are kept.
+
+### Open issues after wave 8 (funding)
+
+None new. Known issue 60 belongs to the helper track.
+
