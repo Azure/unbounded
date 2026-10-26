@@ -852,6 +852,10 @@ Verified against the code at the start of this work.
    (529 at 50k seed 1) is `unreachable` 501 and `unasked` 27: the holder was asked and could
    not be reached (crash, partition), or the walk had no credits left. See "Round 4: failover
    (wave 7)".
+   At the wave 7 merge the bound holds per owner set, not per page: 50k `full-failover` seed 1
+   has one page (589) with 4 requests besides failure retries, issued under three owner sets
+   (two owner moves) and two of them skips (rank 0 `Busy`, partition), all classified; see
+   "Round 4: combined (wave 7)".
 
 56. Resolved: a primary's own seat follower failed closed when the primary committed while
    the follower's state read was in flight: the read answered the record the commit replaced,
@@ -1457,7 +1461,8 @@ scenarios carry data-plane faults.
    overlap unchanged) (round 4, busy, wave 7).
 55. Resolved with a bound: the worst `full-failover` pages are retries after failed origin
    requests (a geometric tail of independent 5xx tries); without them no page is fetched more
-   than 3 times at 5k or 50k, enforced by a simulator test (round 4, failover, wave 7).
+   than 3 times per owner set, enforced by a 200 and 400 node test; one 50k page has 4 across
+   two owner moves (round 4, failover, wave 7; combined, wave 7).
 56. Resolved: a primary's follower read overlapping its own commit failed closed (round 4, ctl3,
    wave 6).
 57. Resolved: non-owners fund forwarded and short in-order Acquires with the credits the owner
@@ -6673,3 +6678,94 @@ page, pages fetched more than once. Wave 6 is the merge binary (`/tmp/opencode/m
 - The Known issue 58 entry's "often down" is an inference the simulator does not support;
   the entry now says so.
 - No new Known issues.
+
+## Round 4: combined (wave 7)
+
+Branch `racer-sim9-merge` from racer-core-sim 985006526, with the budget, busy and failover
+tracks cherry-picked in that order. Logs, reports and the binary: `/tmp/opencode/m9/`. The
+track sections above cite commit IDs from the track branches.
+
+### Merge
+
+- Code merged without conflicts. Only this document conflicted: both Known issues lists
+  (each track's status lines for 53 to 58 kept; failover's 55 and 58 replace the older
+  open text) and the three track sections (all kept, in merge order).
+- New Known issues were renumbered: 511 to 59, 521 to 60, in this document (no code comment
+  or test named them). Known issue 60's line reference now points at `Walk::helper_probe` after
+  the merge (`core/src/read/walk.rs:671`).
+
+### Interplay
+
+- Budget's in-order funding (Known issue 57, `walk::shared_share_short`) against busy's shed
+  demotion (Known issue 54, `Silence::shed`, `candidates::demote_unanswered`): the "earlier
+  owner was busy" exception (`CandidateWalk::saw_busy`) is per walk and set only by outcomes
+  this walk saw. A rank 0 demoted by an earlier walk's shed is visited last, so ranks 1 and 2
+  come first, at indexes below their canonical rank, and are funded on the out-of-order path
+  (`canonical > index`), as a demoted silent owner already was (Known issue 41); the in-order
+  exception never applies to them. Funding takes `owner_funding_min` attempts and at most
+  `funded_links` from what the reader has, so no hop grows. New test
+  `walk::tests::a_shed_demoted_rank0_never_grows_budgets_per_hop` walks a demoted rank 0 with 1
+  to 8 attempts, 7 and 16 links, after `Shed`, `Failed` and `TimedOut`, and asserts that each
+  probe's remote attempts and links are below what the sender had and that a fundable walk
+  never visits the demoted rank 0 first.
+- Busy's Known issue 60 (the overflow helper takes all remaining attempts) against budget's
+  funding: they do not compound. The helper runs only after rank 0 itself sheds a non-owner
+  reader, which sets `saw_busy`, so the in-order exception is already off for that walk; with
+  demotion rank 0 is last, so the helper (if any) follows ranks 1 and 2. Known issue 60 stays
+  open as described.
+- Failover's returning-reader rule (`SuccessorHints::peek_for`, `charge`) is owner-side state
+  keyed by requester and page; busy's shed mark is reader-side silence state. They share no
+  state. Demotion sends readers to rank 1 first more often, which makes rank 1's deferral
+  memory see more readers, but the rule only stops a second deferral to an offer's sender.
+- Origin authority: unchanged by the merge. The issue 31 `TimedOut` rule and issue 52 hold
+  still apply (`walk::tests::*rank_zero*` pass); `unexplained` is 0 in every run.
+- Known issue 55's bound (no page more than `REPLICAS` times without failure retries) does
+  not hold per page at 50k `full-failover` seed 1 after the merge: one page has 4. A temporary
+  per-page trace (not committed) showed its requests were issued under three owner sets (two
+  owner moves, at 122 s and 156 s) by rank 0, rank 0, rank 2 after rank 0 answered `Busy`, and
+  rank 1 after a partition, each a classified repeat. The bound holds per owner set; the Known
+  issue 55 entries now say so. `Busy` skips are as rare as in wave 6 (`held.busy` 1 to 2,
+  `orphan.busy` 2 to 2).
+
+### Evidence
+
+Release, seed 1 unless noted, same configurations as wave 6. Reads ok / failed; origin
+requests, worst page, pages fetched more than once. No invariant failures; `unexplained` 0 in
+every run, including the 16-scenario smoke at 200 nodes.
+
+| Run | Wave 6 | Wave 7 |
+| --- | --- | --- |
+| 5k storm | 378,544 / 0; 1,024, 1, 0 | 378,536 / 0; 1,024, 1, 0 |
+| 5k zipf | 202,851 / 15; 40,404, 3, 1,452 | 202,851 / 15; 40,404, 3, 1,452 |
+| 5k churn | 291,482 / 93; 1,026, 2, 2 | 291,476 / 93; 1,025, 2, 1 |
+| 5k zipf 16 MiB | 37,639 / 29; 17,826, 3, 134 | 37,647 / 0; 17,824, 3, 140 |
+| 5k zipf 16 MiB seed 2 | 37,828 / 25; 17,551, 3, 146 | 37,917 / 2; 17,509, 3, 111 |
+| 5k 1 Gbit/s storm | 95,107 / 0; 6,941, 2, 2 | 95,107 / 0; 6,942, 2, 2 |
+| 5k full-cold-start | 95,107 / 0; 6,942, 2, 2 | 95,107 / 0; 6,942, 2, 2 |
+| 5k full-failover | 33,976 / 32; 12,963, 5, 320 | 33,998 / 10; 12,999, 6, 327 |
+| 5k full-failover seed 2 | 33,747 / 23; 12,976, 5, 348 | 33,758 / 15; 12,989, 6, 361 |
+| 5k full-failover seed 3 | 33,594 / 29; 12,902, 6, 292 | 33,613 / 17; 12,921, 5, 307 |
+| 5k full-churn | 34,073 / 0; 12,637, 4, 90 | 34,073 / 0; 12,638, 4, 91 |
+| 5k zipf, 50 hung members | 30,634 / 3; 11,843, 2, 24 | 30,647 / 2; 11,858, 2, 27 |
+| 50k full-cold-start | 912,774 / 3; 27,148, 3, 187 | 912,774 / 0; 27,158, 3, 194 |
+| 50k full-failover | 303,161 / 343; 47,320, 7, 1,981 | 303,383 / 152; 47,479, 9, 2,115 |
+
+- 5k `zipf` at 16 MiB: overlapping origin requests 120 to 135 (busy alone: 131), silence pings
+  37,383, peer messages 469,238 (busy alone: Known issue 53's bound). Seed 2: overlaps 108.
+- 5k `full-failover` fails 10, 15, 17 reads (budget alone 17, 19, 24; failover alone 33, 28,
+  28): the two fixes add up. Origin requests rise 36, 13 and 19 and `copy_held` 58, 67, 55 to
+  72, 71, 68, the cost recorded as Known issue 59.
+- 50k `full-cold-start`: 0 failed reads (budget alone: 0), `copy_held` 9 to 12, wall 24:39,
+  peak RSS 4.6 GiB.
+- 50k `full-failover`: 152 failed reads (failover alone 251, wave 6 343). Origin +159,
+  `copy_held` 527 to 623 (`unreachable` 593), worst page 9, of which at most 4 are not failure
+  retries (see Interplay). Wall 32:24, peak RSS 3.3 GiB.
+- The storm run completes 8 fewer reads with none failed, as in the busy track (reads still in
+  flight at the end).
+- `cargo fmt --check`, `clippy --workspace --all-targets -D warnings` and the workspace tests
+  pass. DST `dst_generated_traffic_churn_oracle` and its native variant pass for seeds 1 to 20,
+  and non-native seed 11 alone.
+
+### Open issues after wave 7
+
+59, 60 (47, 53, 54, 55, 57 and 58 are resolved).
