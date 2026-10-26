@@ -1202,7 +1202,6 @@ func validateBackendCoverage(
 	return nil
 }
 
-
 func resourceLabels(config Config, participant signalv1.Participant) map[string]string {
 	return map[string]string{
 		"app.kubernetes.io/name":                      "project-signal-adapter",
