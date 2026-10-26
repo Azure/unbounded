@@ -84,6 +84,15 @@ Each check contains:
 | `gpuCount` | GPU request; must be positive for MPIJob |
 | `workloadPolicy` | Narrow container resources and host access policy |
 
+Unbounded publishes `project-signal-runner` as the baseline runner image. It
+contains Bash, core utilities, network and RDMA diagnostics, OpenMPI, and SSH
+support for MPI execution. NVIDIA Container Runtime supplies driver-matched
+compute and utility libraries and tools when a workload receives an NVIDIA GPU
+allocation. The baseline image intentionally does not bundle a CUDA toolkit,
+NCCL tests, or the certification scripts themselves. Profiles must reference a
+published runner by digest, and admission copies the selected scripts from
+`spec.scriptConfigMap` into the Run-owned immutable script bundle.
+
 Workload policy is intentionally constrained:
 
 - `ipcLock` is the only supported added Linux capability;
