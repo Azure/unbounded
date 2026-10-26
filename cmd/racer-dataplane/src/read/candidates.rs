@@ -3763,7 +3763,7 @@ pub(super) mod tests {
         /// Owners fail at the transport (no signed reply) instead.
         transport: bool,
         #[allow(clippy::type_complexity)]
-        calls: RefCell<Vec<(NodeId, bool, u32)>>,
+        calls: RefCell<Vec<(NodeId, bool, u32, u8)>>,
     }
     impl ShedPeer {
         fn direct_hedge_available(
@@ -3800,6 +3800,7 @@ pub(super) mod tests {
                     destination.clone(),
                     copy,
                     request.route.remaining_attempts,
+                    request.route.remaining_links,
                 ));
                 let owner = self.owners.contains(&destination);
                 if owner && self.transport {
@@ -3935,10 +3936,17 @@ pub(super) mod tests {
                 assert!(visited[2..].iter().all(|n| candidates.ordered.contains(n)));
                 // The helper probe is an Acquire carrying fewer credits than a
                 // walk needs to ask a helper itself.
-                let (_, copy, attempts) = &calls[1];
+                let (_, copy, attempts, links) = &calls[1];
                 assert!(!copy);
                 assert!(*attempts >= 1);
                 assert!(*attempts < racer_core::read::fanout::HELPER_MIN_ATTEMPTS);
+                // It carries its whole funded envelope, not a normal
+                // four-link route, so the helper can still reach rank 0
+                // through a relay (Known issue 60).
+                assert!(
+                    *links > racer_core::read::budget::NORMAL_ROUTE_LINKS,
+                    "{links}"
+                );
             }
         });
     }

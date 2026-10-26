@@ -678,7 +678,11 @@ impl CandidateWalk {
     fn helper_probe(&mut self, budget: &mut AcquisitionBudget) -> Result<Step> {
         let attempts = budget.remaining_attempts().min(HELPER_ATTEMPTS);
         let links = budget.remaining_links().min(HELPER_LINKS);
-        let child = budget.partition(attempts, links)?;
+        let mut child = budget.partition(attempts, links)?;
+        // Forward every funded link, as for a funded owner probe: a normal
+        // four-link envelope leaves the helper two or three links, too few to
+        // route to rank 0 through a relay (Known issue 60).
+        child.note_route_failure();
         self.pending = Some(Pending {
             bounded: Some(child),
             handoff: true,

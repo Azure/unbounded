@@ -1033,6 +1033,31 @@ fn overloaded_owner_sends_the_reader_to_its_helper_once() {
 }
 
 #[test]
+fn helper_probe_forwards_its_full_funded_envelope() {
+    // Known issue 60: without a route failure the reader routes with four
+    // links per attempt, and a helper reached by such a route keeps two or
+    // three links, too few to reach rank 0 through a relay. The helper's
+    // envelope is every link it is funded with, as for a funded owner.
+    for links in [HELPER_FLOOR_LINKS, HELPER_LINKS, 16] {
+        let mut walk = CandidateWalk::new(helper_config(VisitOrder::canonical(3)));
+        let mut b = budget(8, links);
+        let mut seen = None;
+        let (_, end) = drive(&mut walk, &mut b, |p, request| {
+            if p.canonical == 3 {
+                seen = Some((request.route_links(), request.remaining_links()));
+                Outcome::Copy
+            } else {
+                Outcome::Shed
+            }
+        });
+        assert_eq!(end, End::Copy);
+        let (route, funded) = seen.expect("helper asked");
+        assert_eq!(route, funded, "links {links}");
+        assert_eq!(funded, links.min(HELPER_LINKS), "links {links}");
+    }
+}
+
+#[test]
 fn helper_miss_falls_back_to_remaining_owners_and_never_repeats() {
     let mut walk = CandidateWalk::new(helper_config(VisitOrder::canonical(3)));
     let mut b = budget(32, 64);
