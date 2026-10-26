@@ -1655,6 +1655,7 @@ func terminalCheckStatuses(
 		status.Measurements = outputs["measurements"]
 		allowPartialBackendEvidence := status.Verdict == "Inconclusive" &&
 			status.Reason == "BackendSetupFailed"
+
 		normalizedEvidence, complete, evidenceErr := groupedBackendEvidenceForParticipants(
 			outputs["backend-evidence"],
 			run.Spec.Participants,
@@ -2239,6 +2240,7 @@ func groupedBackendEvidenceComplete(
 			}
 
 			podUIDs[pod.UID] = struct{}{}
+
 			switch backend {
 			case signalv1.ExecutionBackendPod:
 				if pod.UID != participant.Resource.UID ||
@@ -2255,6 +2257,7 @@ func groupedBackendEvidenceComplete(
 					launcherPods++
 				case "worker":
 					workerPods++
+
 					if pod.NodeName != participants[participant.ParticipantIndex].NodeName ||
 						pod.NodeUID != participants[participant.ParticipantIndex].NodeUID {
 						return false, fmt.Errorf(
@@ -2269,6 +2272,7 @@ func groupedBackendEvidenceComplete(
 
 			complete = complete && pod.Phase != "" && len(pod.Containers) > 0
 			complete = complete && pod.NodeError == ""
+
 			for _, container := range pod.Containers {
 				complete = complete && container.Name != "" && container.State.State != "" &&
 					container.CurrentLog.Status == "captured" && container.CurrentLog.Error == "" &&
@@ -2282,6 +2286,7 @@ func groupedBackendEvidenceComplete(
 
 		if backend == signalv1.ExecutionBackendMPIJob {
 			complete = complete && workerPods == 1
+
 			if participant.LauncherJob != nil {
 				if participant.LauncherJob.Name == "" || participant.LauncherJob.UID == "" {
 					return false, errors.New("backend-evidence MPI launcher Job identity is incomplete")
@@ -2327,6 +2332,7 @@ func groupedBackendEvidenceForParticipants(
 	allowPartial bool,
 ) (string, bool, error) {
 	globalIndexes := participantIndexes(participants)
+
 	references, err := backendResourceReferences(resources, len(globalIndexes), namespace, allowPartial)
 	if err != nil {
 		return "", false, err

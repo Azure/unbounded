@@ -11,7 +11,6 @@ import (
 	"io"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -177,12 +176,12 @@ func (r *Runner) captureBackendEvidence(
 		switch backend.resource.GetKind() {
 		case "Pod":
 			if len(backend.participantIndexes) != 1 {
-				return "", false, errors.New("Pod backend evidence requires exactly one participant index")
+				return "", false, errors.New("pod backend evidence requires exactly one participant index")
 			}
 
 			participantIndex := backend.participantIndexes[0]
 			if participantIndex < 0 || int(participantIndex) >= len(participants) {
-				return "", false, fmt.Errorf("Pod backend participant index %d is out of range", participantIndex)
+				return "", false, fmt.Errorf("pod backend participant index %d is out of range", participantIndex)
 			}
 
 			participant, complete := r.capturePodBackendEvidence(
@@ -367,6 +366,7 @@ func (r *Runner) capturePodBackendEvidence(
 	podEvidence, podComplete := r.capturePodEvidence(ctx, config.Namespace, pod, "participant")
 	participant.Pods = []PodEvidence{podEvidence}
 	complete = complete && podComplete
+
 	if podEvidence.NodeName != expected.NodeName || podEvidence.NodeUID != expected.NodeUID {
 		participant.CaptureError = joinCaptureError(
 			participant.CaptureError,
@@ -398,6 +398,7 @@ func (r *Runner) captureMPIBackendEvidence(
 	object, err := r.Dynamic.Resource(backend.gvr).Namespace(config.Namespace).
 		Get(ctx, backend.resource.GetName(), metav1.GetOptions{})
 	objectCaptureError := ""
+
 	if err != nil {
 		complete = false
 		objectCaptureError = "get backend object: " + err.Error()
@@ -424,9 +425,10 @@ func (r *Runner) captureMPIBackendEvidence(
 		}
 	}
 
+	var launcherJob *JobEvidence
+
 	jobs, jobErr := r.Kubernetes.BatchV1().Jobs(config.Namespace).List(ctx, metav1.ListOptions{})
 	jobUIDs := map[types.UID]struct{}{}
-	var launcherJob *JobEvidence
 	launcherJobCount := 0
 
 	if jobErr != nil {
@@ -445,6 +447,8 @@ func (r *Runner) captureMPIBackendEvidence(
 		}
 	}
 
+	var launcherPod *corev1.Pod
+
 	pods, podErr := r.Kubernetes.CoreV1().Pods(config.Namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: runLabelSelector(config.RunName),
 	})
@@ -453,7 +457,6 @@ func (r *Runner) captureMPIBackendEvidence(
 	}
 
 	workerPods := make(map[string]*corev1.Pod, len(participants))
-	var launcherPod *corev1.Pod
 	launcherPodCount := 0
 	workerPodCount := 0
 
@@ -466,9 +469,11 @@ func (r *Runner) captureMPIBackendEvidence(
 				launcherPod = pod
 			case "worker":
 				workerPodCount++
+
 				if _, duplicate := workerPods[pod.Spec.NodeName]; duplicate {
 					complete = false
 				}
+
 				workerPods[pod.Spec.NodeName] = pod
 			}
 		}
@@ -522,6 +527,7 @@ func (r *Runner) captureMPIBackendEvidence(
 		}
 
 		expected := participants[participantIndex]
+
 		pod := workerPods[expected.NodeName]
 		if pod == nil {
 			evidence[evidenceIndex].CaptureError = joinCaptureError(
@@ -536,6 +542,7 @@ func (r *Runner) captureMPIBackendEvidence(
 		podEvidence, podComplete := r.capturePodEvidence(ctx, config.Namespace, pod, "worker")
 		evidence[evidenceIndex].Pods = append(evidence[evidenceIndex].Pods, podEvidence)
 		complete = complete && podComplete
+
 		if podEvidence.NodeUID != expected.NodeUID {
 			evidence[evidenceIndex].CaptureError = joinCaptureError(
 				evidence[evidenceIndex].CaptureError,
@@ -875,13 +882,6 @@ func boundedRedactedText(value string, limit int) string {
 	return value[:limit]
 }
 
-func participantLabelSelector(runName string, participantIndex int32) string {
-	return strings.Join([]string{
-		"signal.unbounded-cloud.io/run=" + runName,
-		"signal.unbounded-cloud.io/participant-index=" + strconv.FormatInt(int64(participantIndex), 10),
-	}, ",")
-}
-
 func runLabelSelector(runName string) string {
 	return "signal.unbounded-cloud.io/run=" + runName
 }
@@ -917,12 +917,6 @@ func capturedContainer(role, name string) bool {
 	default:
 		return false
 	}
-}
-
-func hasPodRole(pods []PodEvidence, role string) bool {
-	return slices.ContainsFunc(pods, func(pod PodEvidence) bool {
-		return pod.Role == role
-	})
 }
 
 func joinCaptureError(current, next string) string {

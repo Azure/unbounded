@@ -360,7 +360,7 @@ func BackendResource(
 	switch resource.GetKind() {
 	case "Pod":
 		if len(participantIndexes) != 1 {
-			return signalv1.BackendResourceReference{}, errors.New("Pod backend must identify exactly one participant")
+			return signalv1.BackendResourceReference{}, errors.New("pod backend must identify exactly one participant")
 		}
 
 		if label != strconv.FormatInt(int64(participantIndexes[0]), 10) {
@@ -1061,6 +1061,7 @@ func podTemplate(
 
 func mpiWorkerAffinity(runName string, participants []signalv1.Participant) *corev1.Affinity {
 	nodeNames := make([]string, len(participants))
+
 	nodeUIDs := make([]string, len(participants))
 	for index := range participants {
 		nodeNames[index] = participants[index].NodeName

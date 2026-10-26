@@ -130,6 +130,7 @@ func (r *Runner) Execute(ctx context.Context, config Config) (AggregateOutput, e
 
 	for index, rendered := range resources {
 		resource := rendered.Unstructured
+
 		gvr := podGVR
 		if resource.GetKind() == "MPIJob" {
 			gvr = mpiJobGVR
@@ -340,6 +341,7 @@ func containsMPIBackend(resources []createdResource) bool {
 
 func expandResults(resourceResults []Result, resources []createdResource) []Result {
 	total := 0
+
 	for index := range resources {
 		total += len(resources[index].participantIndexes)
 	}
