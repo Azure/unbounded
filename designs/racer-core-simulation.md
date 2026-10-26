@@ -6502,3 +6502,25 @@ the wave 6 merge (`/tmp/opencode/m8/`; seed 2 rows `b-*` in `/tmp/opencode/r9-bu
   reads still in flight at the end of the run; not traced further.
 - 16-scenario smoke at 200 nodes, 1 s: trace hashes equal the wave 6 merge except `storm`; no
   invariant failure, `unexplained` 0.
+- 50k `full-cold-start` (seed 1, `/tmp/opencode/m4b/rr.json`): 912,774 / 3 reads, origin
+  27,148, worst page 3, 187 pages fetched more than once, `copy_held` 9, as in the wave 6 merge;
+  hot-page sheds 129,596 to 130,072, `shed_repeats` 0, no pings. Wall 22:31, peak RSS 4.6 GiB.
+  No invariant failures, `unexplained` 0. 50k `full-failover` was not run: every 5k
+  `full-failover` trace is unchanged.
+- `cargo fmt --check` and `cargo clippy --workspace --all-targets -D warnings` are clean; the
+  workspace tests pass (3,566, `--no-fail-fast`); DST seeds 1 to 20 pass, native and not.
+
+### Deviations and open items
+
+- Issue 54's cause differs from its description: the failed reads were repeated shed walks, not
+  returns to a busy rank 0 after a ping. A reader whose probe of rank 0 timed out still returns
+  to it once rank 0 answers the ping; with the shed rule that costs no failed reads in any run.
+- Issue 53 is resolved with a bound rather than removed; the measured alternatives (no owner or
+  no reader pings) fail more reads with hung members.
+- New Known issue 521 (the helper probe can take all of a reader's remaining credits), open.
+- The simulator keeps one silence map per node; production keeps one per worker, so production
+  sends up to one ping per worker where the simulator sends one per node (unchanged from hang2).
+
+### Open issues after wave 7 (busy)
+
+47 (partly; 57), 55, 57, 58, 521.
