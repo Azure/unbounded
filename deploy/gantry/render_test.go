@@ -103,7 +103,8 @@ func TestDaemonSetMountsContainerdRuntimeDirectory(t *testing.T) {
 
 // TestAgentPreparesIdentityDirectoryItself pins how the agent gets its libp2p
 // identity hostPath without an init container: it starts as root with only the
-// capabilities it needs to re-own that directory and switch to UID 65532.
+// capabilities it needs to re-own that directory and switch to UID 65532, and
+// the pod's fsGroup keeps its service account token readable after the switch.
 func TestAgentPreparesIdentityDirectoryItself(t *testing.T) {
 	t.Parallel()
 
@@ -120,6 +121,9 @@ func TestAgentPreparesIdentityDirectoryItself(t *testing.T) {
 			Spec struct {
 				Template struct {
 					Spec struct {
+						SecurityContext struct {
+							FSGroup *int64 `yaml:"fsGroup"`
+						} `yaml:"securityContext"`
 						InitContainers []struct {
 							Name string `yaml:"name"`
 						} `yaml:"initContainers"`
@@ -147,6 +151,12 @@ func TestAgentPreparesIdentityDirectoryItself(t *testing.T) {
 
 		if initContainers := daemonSet.Spec.Template.Spec.InitContainers; len(initContainers) != 0 {
 			t.Fatalf("%s: init containers = %+v, want none", profile, initContainers)
+		}
+
+		// Kubelet writes the token root-only for a pod whose only container
+		// starts as root; without fsGroup the agent cannot read it as 65532.
+		if fsGroup := daemonSet.Spec.Template.Spec.SecurityContext.FSGroup; fsGroup == nil || *fsGroup != 65532 {
+			t.Fatalf("%s: pod fsGroup must be 65532 so the agent can read its service account token", profile)
 		}
 
 		found := false

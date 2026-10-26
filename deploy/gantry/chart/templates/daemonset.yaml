@@ -26,6 +26,11 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: gantry
+      # The only container starts as root, so kubelet writes the service account
+      # token root-owned with mode 0600. fsGroup makes it readable by this group,
+      # which the agent keeps when it switches to UID 65532.
+      securityContext:
+        fsGroup: 65532
       hostNetwork: false
       dnsPolicy: ClusterFirst
       priorityClassName: gantry-low

@@ -75,12 +75,25 @@ func identityConfig(dir string) *config.Config {
 	return &config.Config{Libp2pIdentityPath: filepath.Join(dir, "identity.key")}
 }
 
+// tempDir is t.TempDir with symlinks resolved, because the identity directory
+// step refuses a path that passes through one.
+func tempDir(t *testing.T) string {
+	t.Helper()
+
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return dir
+}
+
 // newIdentityDirFixture returns an identity directory holding the key, a nested
 // directory, and a symlink to a sibling directory outside it.
 func newIdentityDirFixture(t *testing.T) (dir, outside string) {
 	t.Helper()
 
-	base := t.TempDir()
+	base := tempDir(t)
 	dir = filepath.Join(base, "libp2p")
 	outside = filepath.Join(base, "outside")
 
@@ -180,7 +193,7 @@ func TestPrepareAgentRuntimeReownsIdentityDirectoryThenDropsRoot(t *testing.T) {
 }
 
 func TestPrepareAgentRuntimeCreatesMissingIdentityDirectory(t *testing.T) {
-	base := t.TempDir()
+	base := tempDir(t)
 	dir := filepath.Join(base, "state", "libp2p")
 
 	// Created parents must stay traversable by the agent. Compare them with a
@@ -221,6 +234,38 @@ func TestPrepareAgentRuntimeWithoutIdentityPathOnlyDropsRoot(t *testing.T) {
 	}
 }
 
+// TestPrepareAgentRuntimeRacerOnlyDropsRoot uses identity paths the directory
+// step would reject or create. Racer never loads the identity, so it must leave
+// them alone and still switch users.
+func TestPrepareAgentRuntimeRacerOnlyDropsRoot(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "libp2p")
+
+	for _, test := range []struct {
+		name string
+		path string
+	}{
+		{name: "relative path", path: "identity.key"},
+		{name: "missing directory", path: filepath.Join(missing, "identity.key")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fake := &fakeAgentRuntime{status: unprivilegedStatus}
+			c := &config.Config{RacerEnabled: true, Libp2pIdentityPath: test.path}
+
+			if err := prepareAgentRuntimeWith(c, discardLogger(), fake.deps()); err != nil {
+				t.Fatalf("prepareAgentRuntimeWith: %v", err)
+			}
+
+			if want := []string{"setuid 65532", "status"}; !slices.Equal(fake.calls, want) {
+				t.Fatalf("calls = %q, want %q", fake.calls, want)
+			}
+		})
+	}
+
+	if _, err := os.Lstat(missing); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Racer start created %s: %v", missing, err)
+	}
+}
+
 func TestPrepareAgentRuntimeRejectsUnsafeIdentityPaths(t *testing.T) {
 	for _, test := range []struct {
 		name string
@@ -243,6 +288,55 @@ func TestPrepareAgentRuntimeRejectsUnsafeIdentityPaths(t *testing.T) {
 			// startup stops here.
 			if len(fake.calls) != 0 {
 				t.Fatalf("calls = %q, want nothing", fake.calls)
+			}
+		})
+	}
+}
+
+// TestPrepareAgentRuntimeRefusesSymlinksInIdentityPath plants a link where the
+// identity directory or one of its parents belongs, as an agent that owns the
+// parent could. Following it would re-own and restrict whatever it points at,
+// so startup must stop before changing anything.
+func TestPrepareAgentRuntimeRefusesSymlinksInIdentityPath(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		link string
+		path string
+	}{
+		{name: "identity directory", link: "libp2p", path: "libp2p/identity.key"},
+		{name: "parent directory", link: "state", path: "state/libp2p/identity.key"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			base := tempDir(t)
+
+			target := filepath.Join(base, "target")
+			if err := os.Mkdir(target, 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := os.Symlink(target, filepath.Join(base, test.link)); err != nil {
+				t.Fatal(err)
+			}
+
+			mode := modeOf(t, target)
+			fake := &fakeAgentRuntime{status: unprivilegedStatus}
+
+			err := prepareAgentRuntimeWith(&config.Config{Libp2pIdentityPath: filepath.Join(base, test.path)}, discardLogger(), fake.deps())
+			if err == nil || !strings.Contains(err.Error(), "without following symlinks") {
+				t.Fatalf("err = %v, want the symlink refused", err)
+			}
+
+			if len(fake.calls) != 0 {
+				t.Fatalf("calls = %q, want nothing re-owned and root kept", fake.calls)
+			}
+
+			entries, err := os.ReadDir(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if len(entries) != 0 || modeOf(t, target) != mode {
+				t.Fatalf("symlink target changed: %d entries, mode %v; want none and %v", len(entries), modeOf(t, target), mode)
 			}
 		})
 	}
@@ -286,7 +380,7 @@ func TestPrepareAgentRuntimeStopsAtFirstFailure(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			fake := test.fake
 
-			err := prepareAgentRuntimeWith(identityConfig(t.TempDir()), discardLogger(), fake.deps())
+			err := prepareAgentRuntimeWith(identityConfig(tempDir(t)), discardLogger(), fake.deps())
 			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
 				t.Fatalf("err = %v, want it to contain %q", err, test.wantErr)
 			}

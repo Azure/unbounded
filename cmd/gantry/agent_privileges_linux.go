@@ -16,6 +16,8 @@ import (
 	"strings"
 	"syscall"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/Azure/unbounded/internal/gantry/config"
 )
 
@@ -52,13 +54,15 @@ func prepareAgentRuntime(c *config.Config, logger *slog.Logger) error {
 // prepareAgentRuntimeWith gives agentUID the libp2p identity directory and then
 // switches the process to agentUID. The directory is a hostPath that kubelet
 // creates root-owned, so the agent starts as root to re-own it and switches
-// before serving anything. A process that starts unprivileged changes nothing.
+// before serving anything. The Racer backend never starts libp2p, so it only
+// switches: its identity path goes unused and need not be valid or writable.
+// A process that starts unprivileged changes nothing.
 func prepareAgentRuntimeWith(c *config.Config, logger *slog.Logger, deps agentRuntimeDeps) error {
 	if deps.geteuid() != 0 {
 		return nil
 	}
 
-	if c.Libp2pIdentityPath != "" {
+	if c.Libp2pIdentityPath != "" && !c.RacerEnabled {
 		dir := filepath.Dir(c.Libp2pIdentityPath)
 		// Re-owning is recursive, so a relative path or the filesystem root
 		// would reach far beyond the agent's own state.
@@ -87,15 +91,20 @@ func prepareAgentRuntimeWith(c *config.Config, logger *slog.Logger, deps agentRu
 }
 
 // prepareIdentityDir is chown -R agentUID:identityDirGID followed by chmod 0700
-// on dir. The walk never follows symlinks, and os.Root keeps every change
+// on dir. No symlink is followed: openDirNoFollow refuses one anywhere in dir's
+// path, the walk never descends through one, and os.Root keeps every change
 // inside dir.
 func prepareIdentityDir(dir string, lchown func(*os.Root, string, int, int) error) (err error) {
-	// Created parents stay traversable; dir itself is restricted below.
-	if err = os.MkdirAll(dir, 0o755); err != nil {
+	opened, err := openDirNoFollow(dir)
+	if err != nil {
 		return err
 	}
 
-	root, err := os.OpenRoot(dir)
+	// Reopening through /proc reaches the directory already open, whatever dir
+	// names by now; reopening dir by name would follow a symlink again.
+	root, err := os.OpenRoot("/proc/self/fd/" + strconv.Itoa(int(opened.Fd())))
+	_ = opened.Close() //nolint:errcheck // The root holds its own descriptor.
+
 	if err != nil {
 		return err
 	}
@@ -114,6 +123,54 @@ func prepareIdentityDir(dir string, lchown func(*os.Root, string, int, int) erro
 	}
 
 	return root.Chmod(".", identityDirMode)
+}
+
+// openDirNoFollow opens dir one component at a time from /, the way racersdk
+// opens its origin directory, and creates missing components as it goes. It
+// refuses a symlink anywhere in the path: below a directory the agent owns, the
+// agent could replace a component with a link to another host path.
+func openDirNoFollow(dir string) (*os.File, error) {
+	current, err := os.Open("/")
+	if err != nil {
+		return nil, err
+	}
+
+	path := "/"
+
+	for _, part := range strings.Split(strings.TrimPrefix(dir, "/"), "/") {
+		path = filepath.Join(path, part)
+
+		fd, err := openOrMkdirNoFollow(int(current.Fd()), part)
+		_ = current.Close() //nolint:errcheck // Only the next component is kept.
+
+		if err != nil {
+			return nil, fmt.Errorf("open %s without following symlinks: %w", path, err)
+		}
+
+		current = os.NewFile(uintptr(fd), path)
+	}
+
+	return current, nil
+}
+
+// openOrMkdirNoFollow opens the directory name under parent without following
+// a symlink, creating it first if it is missing. Created directories stay
+// traversable; prepareIdentityDir restricts only the last one.
+func openOrMkdirNoFollow(parent int, name string) (int, error) {
+	const flags = unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
+
+	fd, err := unix.Openat(parent, name, flags, 0)
+	if !errors.Is(err, unix.ENOENT) {
+		return fd, err
+	}
+
+	// Another process may create the name first; the open below still refuses
+	// it if that is a symlink.
+	if err := unix.Mkdirat(parent, name, 0o755); err != nil && !errors.Is(err, unix.EEXIST) {
+		return -1, err
+	}
+
+	return unix.Openat(parent, name, flags, 0)
 }
 
 // dropRootPrivileges switches every thread of the process to uid. The kernel
