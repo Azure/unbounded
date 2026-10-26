@@ -842,6 +842,16 @@ Verified against the code at the start of this work.
    (the Known issue 52 class). With offer2's issue 52 hold merged, the 5k worst pages are 5 and
    5; 50k `full-failover` worst page 7, `copy_held` 527 (wave 5: 578). Open at 50k (round 4,
    probes, wave 6; combined, wave 6).
+   Resolved with a bound (round 4, failover, wave 7): the worst pages are retries after failed
+   origin requests, each an independent try against a 30% 5xx burst, so the worst page grows
+   with the number of pages fetched during the bursts (geometric tail), not with a defect.
+   Without those retries no page is fetched more than `REPLICAS` (3) times at 5k or 50k
+   (seeds 1 to 3); the simulator reports `max_requests_per_page_excluding_failure_retries`
+   and `failure_retries_histogram`, and `combined::tests::failover_repeats_are_skips_or_their_orphans`
+   enforces the bound and that failure retries never exceed failed origin requests. `copy_held`
+   (529 at 50k seed 1) is `unreachable` 501 and `unasked` 27: the holder was asked and could
+   not be reached (crash, partition), or the walk had no credits left. See "Round 4: failover
+   (wave 7)".
 
 56. Resolved: a primary's own seat follower failed closed when the primary committed while
    the follower's state read was in flight: the read answered the record the commit replaced,
@@ -879,6 +889,14 @@ Verified against the code at the start of this work.
    that skips senders likely down without losing that copy (round 4, offer2, wave 6). Not the
    issue 52 hold (`rank0_failure_hold` 0: 329 failed) nor cut groups (`offer_cut_groups` 0:
    374); `offer_predecessors` 0: 273.
+   Resolved (round 4, failover, wave 7): an owner remembers which requesters it deferred to an
+   offer's sender, and a requester that comes back for the page within `RETURN_WITHIN` (60 s)
+   is not deferred again; the owner acquires for it (`SuccessorHints::peek_for`,
+   `core/src/read/successor.rs`). 50k `full-failover` failed reads 343, 307, 342 (wave 6 merge)
+   to 251, 248, 267 (seeds 1 to 3); reads failed while members were crashed 56, 59, 37 to 2, 3, 3.
+   DST churn seed 11 still passes: the first deferral still finds the cached copy. The senders
+   were not crashed when readers were deferred to them (0 of 958 deferrals at 50k seed 1), so
+   "often down" above is not what the simulator shows; see "Round 4: failover (wave 7)".
 
 511. Funding short in-order owners (Known issue 57) makes them fetch after rank 0 failed the
    reader instead of failing it: 5k `full-failover` origin +17 to +30 requests, `copy_held`
@@ -1436,17 +1454,17 @@ scenarios carry data-plane faults.
 54. Resolved: the failed reads were shed walks repeated on retry; an owner that sheds a
    reader is visited after the other owners for `quiet` (5k `zipf` at 16 MiB: failed 29 to 0,
    overlap unchanged) (round 4, busy, wave 7).
-55. 50k `full-failover` `copy_held` 578 to 626 and worst page 6 to 8 after the probes change;
-   5k worst pages 7 and 8 after the ctl3 merge are origin failure retries (issue 52 class);
-   with offer2 5k worst pages 5, 50k worst page 7 and `copy_held` 527 (round 4, probes, wave 6).
+55. Resolved with a bound: the worst `full-failover` pages are retries after failed origin
+   requests (a geometric tail of independent 5xx tries); without them no page is fetched more
+   than 3 times at 5k or 50k, enforced by a simulator test (round 4, failover, wave 7).
 56. Resolved: a primary's follower read overlapping its own commit failed closed (round 4, ctl3,
    wave 6).
 57. Resolved: non-owners fund forwarded and short in-order Acquires with the credits the owner
    needs and the shared route's links; 50k `full-cold-start` failed reads 3 to 0 (round 4,
    budget, wave 7).
-58. 50k `full-failover` failed reads about 258 to 326 after offer2 (seeds 1 to 3): rank 1
-   defers readers to issue 51's offer senders, often down; the direct fix fails DST seed 11.
-   Open (round 4, offer2, wave 6).
+58. Resolved: a reader that comes back within 60 s after a deferral to an offer's sender is
+   not deferred again; 50k `full-failover` failed reads 343, 307, 342 to 251, 248, 267 (seeds 1
+   to 3), DST seed 11 passes (round 4, failover, wave 7).
 511. Funded short in-order owners fetch after rank 0 failed the reader: 5k `full-failover`
    origin +17 to +30, worst page 5 to 6, 4 to 15 fewer failed reads (round 4, budget, wave 7).
 521. A reader's overflow helper probe takes every attempt the reader has left (up to
@@ -6524,3 +6542,133 @@ the wave 6 merge (`/tmp/opencode/m8/`; seed 2 rows `b-*` in `/tmp/opencode/r9-bu
 ### Open issues after wave 7 (busy)
 
 47 (partly; 57), 55, 57, 58, 521.
+
+## Round 4: failover (wave 7)
+
+Known issues 58 and 55. Branch `racer-sim9-failover` from racer-core-sim 985006526. Commits:
+220a61f76 and 9152347c5 (58, racer-core, production and simulator), e3f0c724e and 83cb9b08e
+(55, simulator report and test), ec3db72a1 (58, simulator classification), plus this section.
+Evidence: `/tmp/opencode/r9-failover/` (50k reports `d-*.json`, 5k under `d/`, smoke under
+`smoke/`).
+
+### Issue 58: root cause
+
+An owner that answers a page probe without a copy notes the requester as a successor hint, and
+an offer (Known issue 51) adds its sender to the hint (`SuccessorHints::note_offer`,
+`core/src/read/successor.rs:192`). While the hint is fresh the owner answers a non-owner's
+`Acquire` with `Miss` (`successor_deferral`, `core/src/read/successor.rs:321`; production
+`Coordinator::defer_to_successor`, `src/read.rs:191`; simulator `defer_to_successor`,
+`sim/src/node/world.rs:1777`), up to `MAX_DEFERRALS` (8) times per hint, and the reader asks
+the hinted owner next. Nothing tied a deferral to its outcome: when the hinted owner did not
+serve the reader, the reader's walk ended, and every retry of the read (the simulator's
+`MAX_ATTEMPTS` is 4) reached the same owner and was deferred again to the same place. A
+reader reaches rank 1 when rank 0 failed it, so rank 1 was the one owner left that would have
+fetched, and the read failed.
+
+The wave 6 note says the senders are often down. The simulator does not show that: of 958
+deferrals at 50k seed 1 none went to a crashed member (`successor_deferrals_to_down` 0).
+When a returning reader is declined (80 times, seed 1), the sender it was most likely sent to
+still held the page in 68 cases, was cut off from the reader by the site partition in 11, and
+had no copy in 1 (`successor_returns_target_*`). So the reader failed on the way to a live
+holder: it reached rank 1 with what a failed rank 0 visit left of its budget, and the extra
+hop to a sender several relays away, during crashes of other members (relays) or across the
+partition, did not complete. Reads failed while members were crashed: 56 (seed 1). Either way
+the deferring owner cannot tell this from a sender that is down.
+
+### Issue 58: change
+
+`SuccessorHints` remembers, per page, the requesters it deferred to an offer's sender and when
+(at most `MAX_DEFERRALS`, kept when the hint is renewed). `peek_for`
+(`core/src/read/successor.rs:258`) returns nothing for a requester deferred within
+`RETURN_WITHIN` (60 s, twice the default request timeout: a read's retries, not a later read),
+so the owner acquires for it; `charge` (`core/src/read/successor.rs:275`) records the requester
+only when the deferral went to a node an offer noted (`senders`, cleared when the node is noted
+by its own miss or leaves the hint). Production and the simulator call `peek_for` and pass the
+deferral target to `charge`.
+
+Why not the alternatives:
+
+- Skipping offer senders with link or silence evidence: the deferring owner has none for the
+  sender. Offers arrive inbound, the sender is usually several hops away (link circuits cover
+  next hops only), and silence covers destinations this node asked.
+- Not deferring to offer senders above rank 0 (wave 6): fails DST churn seed 11, where the
+  deferral is how the reader finds the only cached copy while origin is offline. With this
+  change the first deferral still happens, so seed 11 passes.
+- Remembering every deferral, not only those to offer senders (commit 220a61f76 alone): 50k seed 1
+  failed 235 reads, but 5k `zipf` failed more (15 to 19, 14 to 18, 16 to 22 on seeds 1 to 3):
+  there the reader comes back because a busy hinted owner shed it, and the deferring owner,
+  reached last with the reader's leftover credits, fails its own acquisition. Owners noted from
+  their own miss asked moments ago and are fetching, so they keep the old rule.
+
+Bound: at most one extra acquisition per returning reader and page within 60 s; the deferral
+budget (`MAX_DEFERRALS`) and origin authority are unchanged, no budget grows, and the memory is
+at most `MAX_DEFERRALS` entries per hint (`HINT_CAPACITY` hints).
+
+### Issue 55: root cause and bound
+
+Per page the simulator now counts origin requests classified `after_failure` (the page's
+previous origin request failed or was canceled) and reports
+`max_requests_per_page_excluding_failure_retries`, `max_failure_retries_per_page` and
+`failure_retries_histogram` (`sim/src/node/world.rs`, `report`). At 50k seeds 1 to 3 the worst
+page is 8, 6 and 7, all failure retries (7, 5, 5 of them); without them the worst page is 3 on
+every seed, and 2 or 3 at 5k. The failure retries per page fall off geometrically with the
+`full-failover` burst's 5xx probability of 0.3 (seed 1: 850, 266, 77, 31, 10, 0, 1 pages with
+1 to 7 retries; ratios 0.31, 0.29, 0.40, 0.32). Each retry is an independent origin request
+by an owner that has origin authority; the next one fails with the burst's probability. So the
+worst page grows with the number of pages fetched during the bursts, which is why 50k shows
+7 or 8 and 5k shows 5 to 7; it is not an ownership or coordination defect. Suppressing those
+retries needs a shared negative result, which offer2 rejected (it would turn a 30% error rate
+into failed reads). `copy_held` (529 at seed 1) is `unreachable` 501 (the holder was asked and
+the route failed: crash or partition) and `unasked` 27.
+
+Bound, enforced by `combined::tests::failover_repeats_are_skips_or_their_orphans` (200 and 400
+nodes): failure retries never exceed failed or canceled origin requests, the worst page without
+them is at most `REPLICAS`, and the worst page is at most that plus the most failure retries
+of one page.
+
+### Tests
+
+- racer-core: `successor::tests::returning_requesters_are_not_deferred_again` (sender
+  deferrals remembered, miss-noted ones not, renewals keep the memory, the window lapses,
+  bounded memory, a sender pushed out of the hint stops being one).
+- Production: `read::tests::peer_copies::a_reader_returning_from_an_offer_sender_is_not_deferred_again`
+  (fails without the change: the second `Acquire` is answered `Miss`).
+  `rank_zero_defers_readers_to_the_owner_it_missed` is unchanged and still passes (miss-noted
+  hints defer the same reader eight times).
+- Simulator: the issue 55 bound above; counters `successor_deferrals_declined_returning`,
+  `successor_deferrals_to_down` and `successor_returns_target_*`.
+
+### Evidence
+
+Release, configuration `/tmp/opencode/m4b/rr.json`. Reads ok / failed; origin requests, worst
+page, pages fetched more than once. Wave 6 is the merge binary (`/tmp/opencode/m8/sim`), rerun for seeds
+2 and 3 in this track (`base-*.json`).
+
+| 50k `full-failover` | Wave 6 | Failover | worst page without failure retries | reads failed while crashed |
+| --- | --- | --- | --- | --- |
+| seed 1 | 303,161 / 343; 47,320, 7, 1,981 | 303,273 / 251; 47,326, 8, 1,964 | 3 | 56 to 2 |
+| seed 2 | 303,835 / 307; 47,487, 7, 1,999 | 303,880 / 248; 47,458, 6, 1,987 | 3 | 59 to 3 |
+| seed 3 | 301,939 / 342; 46,865, 6, 1,934 | 302,022 / 267; 46,898, 7, 1,958 | 3 | 37 to 3 |
+
+- Wave 5 (before offer2) failed 266, 243 and 265 reads on the same seeds, so the regression is
+  gone. Successor deferrals 1,658, 1,574, 1,526 to 958, 984, 925; returning readers declined
+  80, 71, 82. The worst page moves within the failure retry tail (Known issue 55): 7, 7, 6 to
+  8, 6, 7.
+  `copy_held` 527 to 529, `unexplained` 0, no invariant failures. Wall 30:12, peak RSS 3.3 GiB
+  (wave 6: 30:13, 3.3 GiB).
+- 5k (seed 1 unless noted): `storm`, `zipf`, `churn`, `zipf` at 16 MiB, 1 Gbit/s storm,
+  `full-cold-start` and `full-churn` are identical to wave 6 (same trace hashes). `full-failover`
+  seeds 1 to 3: 33,976 / 32, 33,747 / 23, 33,594 / 29 to 33,971 / 33, 33,743 / 28, 33,595 / 28
+  (seed noise; 5k never showed the regression). 50 hung members: 30,634 / 3 to 30,639 / 2.
+- All 16 scenarios at 200 nodes, 1 s pass with no hard failure or invariant failure;
+  `cargo fmt --check`, `clippy -D warnings` (workspace, all targets) and the workspace tests
+  pass; DST `dst_generated_traffic_churn_oracle` and its native variant pass for seeds 1 to 20.
+
+### Deviations and open items
+
+- The fix is a reader-outcome rule, not a liveness filter as the brief suggested: the
+  deferring owner has no link, silence or membership evidence about an offer's sender, and
+  the senders were not crashed; the readers lost the way to them (see the root cause).
+- The Known issue 58 entry's "often down" is an inference the simulator does not support;
+  the entry now says so.
+- No new Known issues.
