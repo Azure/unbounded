@@ -99,7 +99,6 @@ PROJECT_SIGNAL_ADAPTER_BIN=bin/project-signal-adapter
 PROJECT_SIGNAL_ADAPTER_CMD=./cmd/project-signal-adapter
 SIGNAL_ADAPTER_IMAGE ?= example.invalid/project-signal-adapter@sha256:0000000000000000000000000000000000000000000000000000000000000000
 SIGNAL_ADAPTER_BUILD_IMAGE ?= example.invalid/project-signal-adapter:replace-me
-SIGNAL_RUNNER_IMAGE ?= $(CONTAINER_REGISTRY)/project-signal-runner:$(VERSION_TAG)
 SIGNAL_NAMESPACE ?= project-signal
 SIGNAL_MANIFEST_TEMPLATES_DIR := deploy/signal
 SIGNAL_MANIFEST_RENDERED_DIR := deploy/signal/rendered
@@ -249,7 +248,6 @@ REACT_DEV ?= false
 .PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests gantry-chart-lint gantry-chart-package release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
-.PHONY: image-project-signal-runner-local
 
 ##@ General
 
@@ -331,7 +329,6 @@ help: ## Show this help
 	@echo "  image-machine-ops-controller-local Build machine-ops-controller image"
 	@echo "  image-project-signal-controller-local Build Project Signal controller image"
 	@echo "  image-project-signal-adapter-local Build Project Signal adapter image"
-	@echo "  image-project-signal-runner-local Build Project Signal runner image"
 	@echo "  image-metalman-local             Build metalman image"
 	@echo "  image-unbounded-operator-local   Build unbounded-operator image"
 	@echo "  image-unbounded-operator-push    Build and push unbounded-operator image"
@@ -1133,15 +1130,6 @@ image-project-signal-adapter-local: ## Build Project Signal adapter image locall
 		-t project-signal-adapter:$(VERSION_TAG) -t $(SIGNAL_ADAPTER_BUILD_IMAGE) \
 		-f ./images/project-signal-adapter/Containerfile .
 	$(call trivy-maybe,$(SIGNAL_ADAPTER_BUILD_IMAGE))
-
-image-project-signal-runner-local: ## Build Project Signal runner image locally
-	$(CONTAINER_ENGINE) build \
-		--build-arg VERSION=$(VERSION) \
-		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
-		--build-arg BUILD_TIME=$(BUILD_TIME) \
-		-t project-signal-runner:$(VERSION_TAG) -t $(SIGNAL_RUNNER_IMAGE) \
-		-f ./images/project-signal-runner/Containerfile .
-	$(call trivy-maybe,$(SIGNAL_RUNNER_IMAGE))
 
 MACHINA_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
 MACHINA_API_SERVER_ENDPOINT ?=
