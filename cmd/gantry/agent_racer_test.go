@@ -63,7 +63,7 @@ func TestRacerStartupSelection(t *testing.T) {
 		t.Run(test.enabled, func(t *testing.T) {
 			t.Setenv("GANTRY_RACER_ENABLED", test.enabled)
 
-			err := runAgent([]string{"--config", path})
+			err := runAgentWith([]string{"--config", path}, func(*config.Config, *slog.Logger) error { return nil })
 
 			if err == nil || !strings.HasPrefix(err.Error(), test.wantPrefix) {
 				t.Fatalf("got %v, want prefix %q", err, test.wantPrefix)

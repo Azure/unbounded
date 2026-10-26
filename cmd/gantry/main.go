@@ -125,6 +125,13 @@ func buildAgentFlagSet(c *config.Config) (*flag.FlagSet, *string) {
 }
 
 func runAgent(args []string) error {
+	return runAgentWith(args, prepareAgentRuntime)
+}
+
+// runAgentWith runs the agent once prepare has readied the process. Tests pass
+// a no-op prepare so a test binary running as root neither re-owns host paths
+// nor drops its own privileges.
+func runAgentWith(args []string, prepare func(*config.Config, *slog.Logger) error) error {
 	c, err := loadAgentConfig(args)
 	if err != nil {
 		return err
@@ -143,6 +150,10 @@ func runAgent(args []string) error {
 		slog.String("arch", runtime.GOARCH),
 		slog.Any("config", c.Redacted()),
 	)
+
+	if err := prepare(c, logger); err != nil {
+		return err
+	}
 
 	if c.RacerEnabled {
 		return runRacerAgent(c, logger)

@@ -34,33 +34,6 @@ spec:
       tolerations:
         {{- toYaml .Values.tolerations | nindent 8 }}
       terminationGracePeriodSeconds: 30
-      initContainers:
-        - name: chown-hostpaths
-          image: mcr.microsoft.com/cbl-mariner/busybox:2.0
-          imagePullPolicy: IfNotPresent
-          command:
-            - sh
-            - -c
-            - |
-              set -eu
-              chown -R 65532:65532 /var/lib/gantry/libp2p
-              chmod 0700 /var/lib/gantry/libp2p
-          securityContext:
-            runAsNonRoot: false
-            runAsUser: 0
-            runAsGroup: 0
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop: ["ALL"]
-              add: ["CHOWN", "FOWNER", "DAC_OVERRIDE"]
-            seccompProfile:
-              type: RuntimeDefault
-          resources:
-            {{- toYaml .Values.resources.init | nindent 12 }}
-          volumeMounts:
-            - name: libp2p
-              mountPath: /var/lib/gantry/libp2p
       containers:
         - name: gantry
           image: {{ include "gantry.image" . }}
@@ -112,13 +85,17 @@ spec:
           resources:
             {{- toYaml .Values.resources.agent | nindent 12 }}
           securityContext:
-            runAsNonRoot: true
-            runAsUser: 65532
+            # The agent starts as root only to give UID 65532 the libp2p
+            # identity hostPath, then switches to that UID with no capabilities
+            # before serving. Its groups stay as set here.
+            runAsNonRoot: false
+            runAsUser: 0
             runAsGroup: {{ .Values.containerd.socketGroup }}
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+              add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETUID"]
             seccompProfile:
               type: RuntimeDefault
           volumeMounts:

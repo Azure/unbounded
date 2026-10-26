@@ -34,20 +34,18 @@ func TestResolveContainerEngine(t *testing.T) {
 // TestPatchDaemonSetForE2E_TargetsGantryContainerOnly is the
 // regression test for the twelfth-review finding: the harness's
 // previous strings.Replace(..., 1) on the bare "imagePullPolicy:
-// IfNotPresent" string patched the FIRST occurrence (the busybox
-// initContainer), not the gantry container.
-//
-// On a fresh kind cluster the busybox init image is NOT preloaded, so setting
-// it to imagePullPolicy=Never caused ErrImageNeverPull and the
-// initContainer never started. Meanwhile the gantry container kept
-// imagePullPolicy=IfNotPresent, so kubelet would have tried to pull
-// the side-loaded :e2e tag from a registry that doesn't have it.
+// IfNotPresent" string patched the FIRST occurrence, which belonged to
+// a busybox init container the DaemonSet had at the time, not the
+// gantry container. The gantry container kept IfNotPresent, so kubelet
+// would have tried to pull the side-loaded :e2e tag from a registry
+// that doesn't have it.
 //
 // This test pins the contract that patchDaemonSetForE2E:
 //   - sets the gantry container to use the side-loaded e2e image,
 //   - sets the gantry container's imagePullPolicy to Never,
-//   - leaves the busybox initContainer's image and imagePullPolicy
-//     UNCHANGED so kind's containerd can pull busybox normally,
+//   - leaves no IfNotPresent behind. The gantry container is the
+//     DaemonSet's only container, so a container added later fails here
+//     until the harness decides how kind obtains its image,
 //   - and fails loudly if the anchor stops matching.
 func TestPatchDaemonSetForE2E_TargetsGantryContainerOnly(t *testing.T) {
 	repoRoot := repoRoot(t)
@@ -75,54 +73,14 @@ func TestPatchDaemonSetForE2E_TargetsGantryContainerOnly(t *testing.T) {
 		t.Errorf("patched manifest still contains the original gantry image reference; the swap did not apply to the gantry container")
 	}
 
-	// Busybox initContainer must be UNCHANGED. The reviewer's
-	// concrete case: busybox is not preloaded into kind, so it
-	// must keep imagePullPolicy=IfNotPresent (kind's containerd
-	// pulls it from the public registry on first boot).
-	const busyboxImage = "image: mcr.microsoft.com/cbl-mariner/busybox:2.0"
-	if !strings.Contains(patched, busyboxImage) {
-		t.Errorf("patched manifest is missing the busybox initContainer image; the helper accidentally rewrote it")
-	}
-
-	// Count imagePullPolicy occurrences: there must be exactly
-	// one "Never" (the gantry container) and one "IfNotPresent"
-	// (the busybox initContainer). Anything else means the
-	// swap leaked across containers.
-	neverCount := strings.Count(patched, "imagePullPolicy: Never")
-	ifNotPresentCount := strings.Count(patched, "imagePullPolicy: IfNotPresent")
-
-	if neverCount != 1 {
+	// The gantry container is the only one, so the patch must leave
+	// exactly one Never and no IfNotPresent.
+	if neverCount := strings.Count(patched, "imagePullPolicy: Never"); neverCount != 1 {
 		t.Errorf("imagePullPolicy=Never count = %d, want exactly 1 (only the gantry container should be Never)", neverCount)
 	}
 
-	if ifNotPresentCount != 1 {
-		t.Errorf("imagePullPolicy=IfNotPresent count = %d, want exactly 1 (the busybox initContainer must keep IfNotPresent so kind can pull it)", ifNotPresentCount)
-	}
-
-	// Specifically: the line that follows the busybox image
-	// must still be `imagePullPolicy: IfNotPresent`. This is the
-	// load-bearing assertion - it's the exact bug class the
-	// twelfth review flagged.
-	busyboxIdx := strings.Index(patched, busyboxImage)
-	if busyboxIdx < 0 {
-		t.Fatalf("patched: busybox not found")
-	}
-
-	after := patched[busyboxIdx:]
-	// Find the next imagePullPolicy line after the busybox image
-	// line.
-	policyIdx := strings.Index(after, "imagePullPolicy:")
-	if policyIdx < 0 {
-		t.Fatalf("patched: imagePullPolicy not found after busybox")
-	}
-	// Read the policy value (up to end of line).
-	policyLine := after[policyIdx:]
-	if nl := strings.IndexByte(policyLine, '\n'); nl >= 0 {
-		policyLine = policyLine[:nl]
-	}
-
-	if !strings.Contains(policyLine, "IfNotPresent") {
-		t.Errorf("busybox initContainer policy line = %q, want it to retain 'IfNotPresent' (the previous bug set busybox to Never which fails on kind because busybox is not preloaded)", policyLine)
+	if ifNotPresentCount := strings.Count(patched, "imagePullPolicy: IfNotPresent"); ifNotPresentCount != 0 {
+		t.Errorf("imagePullPolicy=IfNotPresent count = %d, want 0; a container besides gantry needs the harness to decide how kind obtains its image", ifNotPresentCount)
 	}
 }
 

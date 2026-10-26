@@ -51,13 +51,6 @@ resources:
     limits:
       cpu: "8"
       memory: 8Gi
-  init:
-    requests:
-      cpu: 10m
-      memory: 16Mi
-    limits:
-      cpu: 100m
-      memory: 32Mi
   nodeConfig:
     requests:
       cpu: 5m

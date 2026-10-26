@@ -59,8 +59,8 @@ const (
 	imageRepository = "gantry"
 
 	// agentContainerName is the gantry agent's main container. Only this
-	// container carries the operator-managed image; the DaemonSet's busybox
-	// init container keeps its pinned public image.
+	// container carries the operator-managed image; any other container in the
+	// DaemonSet, such as one added by a workload override, keeps its own image.
 	agentContainerName = "gantry"
 
 	// legacyNodeConfigName and legacyNodeConfigDaemonSetName were installed by

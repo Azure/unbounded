@@ -757,26 +757,21 @@ func (h *harness) applyConfigMap(ctx context.Context) error {
 
 // patchDaemonSetForE2E rewrites the rendered DaemonSet's gantry
 // container - and ONLY the gantry container - to use the
-// side-loaded e2e image with imagePullPolicy=Never. The busybox
-// initContainer (which also has `imagePullPolicy: IfNotPresent`)
-// is left untouched so kind's containerd can pull it from the
-// public registry on first boot.
+// side-loaded e2e image with imagePullPolicy=Never.
 //
 // This pure helper exists so the patch logic is unit-testable
 // without spinning up a kind cluster or shelling out to kubectl.
 // The harness's applyDaemonSet wraps it.
 //
-// Why this is structural rather than a bare strings.Replace call: the
-// DaemonSet has TWO
-// `imagePullPolicy: IfNotPresent` entries. A previous revision
-// used `strings.Replace(..., 1)` on the policy line alone, which
-// patched the busybox initContainer (first occurrence) instead of
-// gantry. The result on a fresh kind cluster was the busybox init image
-// being set to `Never` - but busybox is not preloaded into kind
-// so kubelet hit ErrImageNeverPull and the initContainer never
-// started. The eleventh-review fix was to anchor the swap on a
-// multi-line pattern that uniquely matches the gantry container,
-// then fail loud if the anchor stops matching.
+// Why this is structural rather than a bare strings.Replace call: a
+// previous revision used `strings.Replace(..., 1)` on the
+// `imagePullPolicy: IfNotPresent` line alone, which patched whichever
+// container came first. At the time that was a busybox init
+// container, which kind does not preload, so kubelet hit
+// ErrImageNeverPull and the init container never started. The
+// eleventh-review fix was to anchor the swap on a multi-line pattern
+// that uniquely matches the gantry container, then fail loud if the
+// anchor stops matching.
 func patchDaemonSetForE2E(raw, imageTag string) (string, error) {
 	const anchor = "        - name: gantry\n          image: "
 

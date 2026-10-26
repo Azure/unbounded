@@ -232,10 +232,14 @@ func TestOperatorManifestAllowlist(t *testing.T) {
 }
 
 // TestApplyMutatorImagesOnlyAgentContainer asserts the operator-derived image is
-// stamped only on the gantry agent's own container, leaving the busybox init
-// container with its pinned public image.
+// stamped only on the gantry agent's own container, leaving any other
+// container, such as an init container added by a workload override, with its
+// own image.
 func TestApplyMutatorImagesOnlyAgentContainer(t *testing.T) {
-	const derived = "ghcr.io/azure/gantry:v1.2.3"
+	const (
+		derived   = "ghcr.io/azure/gantry:v1.2.3"
+		initImage = "registry.example.com/tools/init:1.0"
+	)
 
 	agent := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "apps/v1",
@@ -245,7 +249,7 @@ func TestApplyMutatorImagesOnlyAgentContainer(t *testing.T) {
 			"metadata": map[string]any{},
 			"spec": map[string]any{
 				"initContainers": []any{
-					map[string]any{"name": "chown-hostpaths", "image": "mcr.microsoft.com/cbl-mariner/busybox:2.0"},
+					map[string]any{"name": "override-init", "image": initImage},
 				},
 				"containers": []any{
 					map[string]any{"name": agentContainerName, "image": "placeholder"},
@@ -258,8 +262,8 @@ func TestApplyMutatorImagesOnlyAgentContainer(t *testing.T) {
 		t.Fatalf("applyMutator: %v", err)
 	}
 
-	if initImg := containerImage(t, agent, "initContainers", "chown-hostpaths"); initImg != "mcr.microsoft.com/cbl-mariner/busybox:2.0" {
-		t.Fatalf("busybox init image was rewritten to %q; must stay pinned", initImg)
+	if initImg := containerImage(t, agent, "initContainers", "override-init"); initImg != initImage {
+		t.Fatalf("init container image was rewritten to %q; must keep its own image", initImg)
 	}
 
 	if agentImg := containerImage(t, agent, "containers", agentContainerName); agentImg != derived {

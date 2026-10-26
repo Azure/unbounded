@@ -101,6 +101,110 @@ func TestDaemonSetMountsContainerdRuntimeDirectory(t *testing.T) {
 	}
 }
 
+// TestAgentPreparesIdentityDirectoryItself pins how the agent gets its libp2p
+// identity hostPath without an init container: it starts as root with only the
+// capabilities it needs to re-own that directory and switch to UID 65532.
+func TestAgentPreparesIdentityDirectoryItself(t *testing.T) {
+	t.Parallel()
+
+	for profile, outputDir := range map[string]string{
+		"operator":   renderTemplates(t),
+		"standalone": renderStandaloneTemplates(t),
+	} {
+		raw, err := os.ReadFile(filepath.Join(outputDir, "daemonset.yaml"))
+		if err != nil {
+			t.Fatalf("%s: read rendered daemonset: %v", profile, err)
+		}
+
+		var daemonSet struct {
+			Spec struct {
+				Template struct {
+					Spec struct {
+						InitContainers []struct {
+							Name string `yaml:"name"`
+						} `yaml:"initContainers"`
+						Containers []struct {
+							Name            string `yaml:"name"`
+							SecurityContext struct {
+								RunAsNonRoot             *bool  `yaml:"runAsNonRoot"`
+								RunAsUser                *int64 `yaml:"runAsUser"`
+								RunAsGroup               *int64 `yaml:"runAsGroup"`
+								AllowPrivilegeEscalation *bool  `yaml:"allowPrivilegeEscalation"`
+								ReadOnlyRootFilesystem   *bool  `yaml:"readOnlyRootFilesystem"`
+								Capabilities             struct {
+									Add  []string `yaml:"add"`
+									Drop []string `yaml:"drop"`
+								} `yaml:"capabilities"`
+							} `yaml:"securityContext"`
+						} `yaml:"containers"`
+					} `yaml:"spec"`
+				} `yaml:"template"`
+			} `yaml:"spec"`
+		}
+		if err := yaml.Unmarshal(raw, &daemonSet); err != nil {
+			t.Fatalf("%s: unmarshal rendered daemonset: %v", profile, err)
+		}
+
+		if initContainers := daemonSet.Spec.Template.Spec.InitContainers; len(initContainers) != 0 {
+			t.Fatalf("%s: init containers = %+v, want none", profile, initContainers)
+		}
+
+		found := false
+
+		for _, container := range daemonSet.Spec.Template.Spec.Containers {
+			if container.Name != "gantry" {
+				continue
+			}
+
+			found = true
+			security := container.SecurityContext
+
+			if security.RunAsNonRoot == nil || *security.RunAsNonRoot || security.RunAsUser == nil || *security.RunAsUser != 0 {
+				t.Fatalf("%s: gantry must start as root to re-own its identity directory", profile)
+			}
+
+			if security.RunAsGroup == nil || *security.RunAsGroup != 0 {
+				t.Fatalf("%s: runAsGroup does not follow the default containerd.socketGroup", profile)
+			}
+
+			if security.AllowPrivilegeEscalation == nil || *security.AllowPrivilegeEscalation {
+				t.Fatalf("%s: privilege escalation must stay disallowed", profile)
+			}
+
+			if security.ReadOnlyRootFilesystem == nil || !*security.ReadOnlyRootFilesystem {
+				t.Fatalf("%s: root filesystem must stay read-only", profile)
+			}
+
+			if !reflect.DeepEqual(security.Capabilities.Drop, []string{"ALL"}) {
+				t.Fatalf("%s: dropped capabilities = %v, want [ALL]", profile, security.Capabilities.Drop)
+			}
+
+			if want := []string{"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETUID"}; !reflect.DeepEqual(security.Capabilities.Add, want) {
+				t.Fatalf("%s: added capabilities = %v, want %v", profile, security.Capabilities.Add, want)
+			}
+		}
+
+		if !found {
+			t.Fatalf("%s: rendered daemonset has no gantry container", profile)
+		}
+	}
+}
+
+// TestStandaloneSchemaAcceptsRetiredInitResources keeps upgrades working for
+// values that still set resources.init.
+func TestStandaloneSchemaAcceptsRetiredInitResources(t *testing.T) {
+	t.Parallel()
+
+	raw, err := os.ReadFile(filepath.Join(renderChart(t, false, "--set-string", "resources.init.requests.cpu=10m"), "daemonset.yaml"))
+	if err != nil {
+		t.Fatalf("read rendered daemonset: %v", err)
+	}
+
+	if bytes.Contains(raw, []byte("initContainers")) {
+		t.Fatal("resources.init rendered an init container")
+	}
+}
+
 func TestRendersFixedChairLeaseSet(t *testing.T) {
 	t.Parallel()
 
