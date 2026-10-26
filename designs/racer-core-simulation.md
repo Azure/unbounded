@@ -904,9 +904,9 @@ Verified against the code at the start of this work.
    reads. Open (round 4, budget, wave 7).
 
 60. A non-owner reader's overflow helper probe (`Walk::helper_probe`,
-   `core/src/read/walk.rs:597`) is funded with up to `HELPER_ATTEMPTS` (4) attempts and
-   `HELPER_LINKS` (8) links from what the reader has left after rank 0 sheds it, which is often
-   everything (4 attempts after the shed in 5k `zipf` at 16 MiB pages). A helper whose route to
+   `core/src/read/walk.rs:671` at the wave 7 merge) is funded with up to `HELPER_ATTEMPTS` (4)
+   attempts and `HELPER_LINKS` (8) links from what the reader has left after rank 0 sheds it,
+   which is often everything (4 attempts after the shed in 5k `zipf` at 16 MiB pages). A helper whose route to
    rank 0 needs more links than reach it (traced: 2 links left at the helper, route search
    `Unreachable`) fails at once, and the reader then has no credits for ranks 1 and 2
    (`Unfunded`), so its walk ends without asking them. Before Known issue 54's fix every
