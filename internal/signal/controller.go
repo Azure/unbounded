@@ -1655,11 +1655,9 @@ func terminalCheckStatuses(
 		status.Measurements = outputs["measurements"]
 		allowPartialBackendEvidence := status.Verdict == "Inconclusive" &&
 			status.Reason == "BackendSetupFailed"
-		globalIndexes := participantIndexes(run.Spec.Participants)
-
 		normalizedEvidence, complete, evidenceErr := groupedBackendEvidenceForParticipants(
 			outputs["backend-evidence"],
-			globalIndexes,
+			run.Spec.Participants,
 			outputs["backend-resources"],
 			check.Backend,
 			run.Namespace,
@@ -1683,7 +1681,7 @@ func terminalCheckStatuses(
 
 		resources, resourceErr := backendResourceReferencesForParticipants(
 			outputs["backend-resources"],
-			globalIndexes,
+			participantIndexes(run.Spec.Participants),
 			run.Namespace,
 			allowPartialBackendEvidence,
 		)
@@ -2064,6 +2062,14 @@ func backendResourceReferences(
 			}
 
 			seenIndexes[participantIndex] = struct{}{}
+			if covered[participantIndex] {
+				return nil, fmt.Errorf(
+					"backend-resources[%d] repeats participant index %d across workload identities",
+					index,
+					participantIndex,
+				)
+			}
+
 			covered[participantIndex] = true
 		}
 	}
@@ -2136,7 +2142,7 @@ func decodeWorkflowParametersWithLimits(parameters []any, limits map[string]int)
 
 func groupedBackendEvidenceComplete(
 	content string,
-	participantCount int,
+	participants []signalv1.Participant,
 	references []signalv1.BackendResourceReference,
 	backend signalv1.ExecutionBackend,
 	namespace string,
@@ -2145,6 +2151,8 @@ func groupedBackendEvidenceComplete(
 	if err := signaladapter.ValidateBackendEvidence(content); err != nil {
 		return false, err
 	}
+
+	participantCount := len(participants)
 
 	var evidence signaladapter.BackendEvidence
 	if err := json.Unmarshal([]byte(content), &evidence); err != nil {
@@ -2162,6 +2170,8 @@ func groupedBackendEvidenceComplete(
 	seen := make([]bool, participantCount)
 	complete := !allowPartial && evidence.Complete && evidence.CaptureError == ""
 	podUIDs := map[types.UID]struct{}{}
+	launcherPods := 0
+	launcherJobs := 0
 
 	expectedAPIVersion, expectedKind, err := backendIdentity(backend)
 	if err != nil {
@@ -2217,10 +2227,10 @@ func groupedBackendEvidenceComplete(
 		}
 
 		complete = complete && participant.CaptureError == "" && len(participant.Pods) > 0
-		launcher := false
+		workerPods := 0
 
 		for _, pod := range participant.Pods {
-			if pod.UID == "" || pod.Name == "" {
+			if pod.UID == "" || pod.Name == "" || pod.NodeName == "" || pod.NodeUID == "" {
 				return false, errors.New("backend-evidence Pod identity is incomplete")
 			}
 
@@ -2229,14 +2239,36 @@ func groupedBackendEvidenceComplete(
 			}
 
 			podUIDs[pod.UID] = struct{}{}
-			if backend == signalv1.ExecutionBackendPod && (pod.UID != participant.Resource.UID ||
-				pod.Name != participant.Resource.Name || pod.Role != "participant" || len(participant.Pods) != 1) {
-				return false, errors.New("backend-evidence Pod differs from its backend resource")
+			switch backend {
+			case signalv1.ExecutionBackendPod:
+				if pod.UID != participant.Resource.UID ||
+					pod.Name != participant.Resource.Name ||
+					pod.Role != "participant" ||
+					len(participant.Pods) != 1 ||
+					pod.NodeName != participants[participant.ParticipantIndex].NodeName ||
+					pod.NodeUID != participants[participant.ParticipantIndex].NodeUID {
+					return false, errors.New("backend-evidence Pod differs from its backend resource or immutable participant")
+				}
+			case signalv1.ExecutionBackendMPIJob:
+				switch pod.Role {
+				case "launcher":
+					launcherPods++
+				case "worker":
+					workerPods++
+					if pod.NodeName != participants[participant.ParticipantIndex].NodeName ||
+						pod.NodeUID != participants[participant.ParticipantIndex].NodeUID {
+						return false, fmt.Errorf(
+							"backend-evidence participant %d worker differs from the immutable participant Node",
+							participant.ParticipantIndex,
+						)
+					}
+				default:
+					return false, fmt.Errorf("backend-evidence MPI Pod role %q is invalid", pod.Role)
+				}
 			}
 
-			launcher = launcher || pod.Role == "launcher"
-
 			complete = complete && pod.Phase != "" && len(pod.Containers) > 0
+			complete = complete && pod.NodeError == ""
 			for _, container := range pod.Containers {
 				complete = complete && container.Name != "" && container.State.State != "" &&
 					container.CurrentLog.Status == "captured" && container.CurrentLog.Error == "" &&
@@ -2249,9 +2281,27 @@ func groupedBackendEvidenceComplete(
 		}
 
 		if backend == signalv1.ExecutionBackendMPIJob {
-			complete = complete && launcher && participant.LauncherJob != nil &&
-				participant.LauncherJob.Name != "" && participant.LauncherJob.UID != ""
+			complete = complete && workerPods == 1
+			if participant.LauncherJob != nil {
+				if participant.LauncherJob.Name == "" || participant.LauncherJob.UID == "" {
+					return false, errors.New("backend-evidence MPI launcher Job identity is incomplete")
+				}
+
+				launcherJobs++
+			}
 		}
+	}
+
+	if !allowPartial {
+		for index, present := range seen {
+			if !present {
+				return false, fmt.Errorf("backend-evidence does not cover participant index %d", index)
+			}
+		}
+	}
+
+	if backend == signalv1.ExecutionBackendMPIJob {
+		complete = complete && launcherPods == 1 && launcherJobs == 1
 	}
 
 	return complete, nil
@@ -2270,12 +2320,13 @@ func backendIdentity(backend signalv1.ExecutionBackend) (string, string, error) 
 
 func groupedBackendEvidenceForParticipants(
 	content string,
-	globalIndexes []int32,
+	participants []signalv1.Participant,
 	resources string,
 	backend signalv1.ExecutionBackend,
 	namespace string,
 	allowPartial bool,
 ) (string, bool, error) {
+	globalIndexes := participantIndexes(participants)
 	references, err := backendResourceReferences(resources, len(globalIndexes), namespace, allowPartial)
 	if err != nil {
 		return "", false, err
@@ -2283,7 +2334,7 @@ func groupedBackendEvidenceForParticipants(
 
 	complete, err := groupedBackendEvidenceComplete(
 		content,
-		len(globalIndexes),
+		participants,
 		references,
 		backend,
 		namespace,
@@ -2298,14 +2349,14 @@ func groupedBackendEvidenceForParticipants(
 		return "", false, fmt.Errorf("decode backend-evidence for participant mapping: %w", err)
 	}
 
-	var participants []map[string]json.RawMessage
-	if err := json.Unmarshal(evidence["participants"], &participants); err != nil {
+	var evidenceParticipants []map[string]json.RawMessage
+	if err := json.Unmarshal(evidence["participants"], &evidenceParticipants); err != nil {
 		return "", false, fmt.Errorf("decode backend-evidence participants for mapping: %w", err)
 	}
 
-	for index := range participants {
+	for index := range evidenceParticipants {
 		var localIndex int
-		if err := json.Unmarshal(participants[index]["participantIndex"], &localIndex); err != nil {
+		if err := json.Unmarshal(evidenceParticipants[index]["participantIndex"], &localIndex); err != nil {
 			return "", false, fmt.Errorf("decode backend-evidence participant index: %w", err)
 		}
 
@@ -2314,10 +2365,10 @@ func groupedBackendEvidenceForParticipants(
 			return "", false, fmt.Errorf("encode mapped backend-evidence participant index: %w", err)
 		}
 
-		participants[index]["participantIndex"] = mapped
+		evidenceParticipants[index]["participantIndex"] = mapped
 	}
 
-	mappedParticipants, err := json.Marshal(participants)
+	mappedParticipants, err := json.Marshal(evidenceParticipants)
 	if err != nil {
 		return "", false, fmt.Errorf("encode mapped backend-evidence participants: %w", err)
 	}

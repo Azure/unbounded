@@ -95,6 +95,11 @@ type AggregateOutput struct {
 	BackendEvidence  string                              `json:"backend-evidence"`
 }
 
+type RenderedResource struct {
+	*unstructured.Unstructured
+	ParticipantIndexes []int32
+}
+
 func ParseParticipants(
 	participantsJSON string,
 	participantCount int,
@@ -267,8 +272,8 @@ func RenderResources(
 	tolerations []corev1.Toleration,
 	environment []corev1.EnvVar,
 	workflow metav1.OwnerReference,
-) ([]*unstructured.Unstructured, error) {
-	resources := make([]*unstructured.Unstructured, 0, len(participants))
+) ([]RenderedResource, error) {
+	resources := make([]RenderedResource, 0, len(participants))
 
 	gpuCount, err := strconv.ParseInt(config.GPUResourceCount, 10, 64)
 	if err != nil || gpuCount < 0 {
@@ -293,66 +298,97 @@ func RenderResources(
 		return nil, errors.New("workload policy must not set nvidia.com/gpu limits; use gpu-resource-count")
 	}
 
-	for _, participant := range participants {
-		var object any
+	switch config.BackendKind {
+	case "Pod":
+		for _, participant := range participants {
+			object := ordinaryPod(
+				config,
+				participant,
+				tolerations,
+				environment,
+				policy,
+				workflow,
+				config.BackendDeadlineSeconds,
+				gpuCount,
+			)
 
-		switch config.BackendKind {
-		case "Pod":
-			object = ordinaryPod(
-				config,
-				participant,
-				tolerations,
-				environment,
-				policy,
-				workflow,
-				config.BackendDeadlineSeconds,
-				gpuCount,
-			)
-		case "MPIJob":
-			object, err = mpiJob(
-				config,
-				participant,
-				tolerations,
-				environment,
-				policy,
-				workflow,
-				config.BackendDeadlineSeconds,
-				gpuCount,
-			)
-			if err != nil {
-				return nil, fmt.Errorf("render MPIJob for participant %d: %w", participant.Index, err)
+			content, convertErr := runtime.DefaultUnstructuredConverter.ToUnstructured(object)
+			if convertErr != nil {
+				return nil, fmt.Errorf("convert Pod for participant %d: %w", participant.Index, convertErr)
 			}
-		default:
-			return nil, fmt.Errorf("unsupported backend kind %q", config.BackendKind)
+
+			resources = append(resources, RenderedResource{
+				Unstructured:       &unstructured.Unstructured{Object: content},
+				ParticipantIndexes: []int32{participant.Index},
+			})
+		}
+	case "MPIJob":
+		object, renderErr := mpiJob(
+			config,
+			participants,
+			tolerations,
+			environment,
+			policy,
+			workflow,
+			config.BackendDeadlineSeconds,
+			gpuCount,
+		)
+		if renderErr != nil {
+			return nil, fmt.Errorf("render coordinated MPIJob: %w", renderErr)
 		}
 
-		content, err := runtime.DefaultUnstructuredConverter.ToUnstructured(object)
-		if err != nil {
-			return nil, fmt.Errorf("convert %s for participant %d: %w", config.BackendKind, participant.Index, err)
-		}
-
-		resources = append(resources, &unstructured.Unstructured{Object: content})
+		resources = append(resources, RenderedResource{
+			Unstructured:       object,
+			ParticipantIndexes: participantIndexes(participants),
+		})
+	default:
+		return nil, fmt.Errorf("unsupported backend kind %q", config.BackendKind)
 	}
 
 	return resources, nil
 }
 
-func BackendResource(resource *unstructured.Unstructured, participantIndex int32) (signalv1.BackendResourceReference, error) {
+func BackendResource(
+	resource *unstructured.Unstructured,
+	participantIndexes []int32,
+) (signalv1.BackendResourceReference, error) {
+	if len(participantIndexes) == 0 {
+		return signalv1.BackendResourceReference{}, errors.New("backend resource must identify at least one participant")
+	}
+
 	label := resource.GetLabels()["signal.unbounded-cloud.io/participant-index"]
-	if label != strconv.FormatInt(int64(participantIndex), 10) {
+	switch resource.GetKind() {
+	case "Pod":
+		if len(participantIndexes) != 1 {
+			return signalv1.BackendResourceReference{}, errors.New("Pod backend must identify exactly one participant")
+		}
+
+		if label != strconv.FormatInt(int64(participantIndexes[0]), 10) {
+			return signalv1.BackendResourceReference{}, fmt.Errorf(
+				"backend resource participant label %q does not match index %d",
+				label,
+				participantIndexes[0],
+			)
+		}
+	case "MPIJob":
+		if label != "" {
+			return signalv1.BackendResourceReference{}, errors.New(
+				"coordinated MPIJob must not claim one participant index",
+			)
+		}
+	default:
 		return signalv1.BackendResourceReference{}, fmt.Errorf(
-			"backend resource participant label %q does not match index %d",
-			label,
-			participantIndex,
+			"unsupported backend resource kind %q",
+			resource.GetKind(),
 		)
 	}
 
-	return backendResourceIdentity(resource, participantIndex)
+	return backendResourceIdentity(resource, participantIndexes)
 }
 
 func backendResourceIdentity(
 	resource *unstructured.Unstructured,
-	participantIndex int32,
+	participantIndexes []int32,
 ) (signalv1.BackendResourceReference, error) {
 	if resource.GetAPIVersion() == "" ||
 		resource.GetKind() == "" ||
@@ -364,8 +400,17 @@ func backendResourceIdentity(
 	return signalv1.BackendResourceReference{
 		Name:               resource.GetName(),
 		UID:                resource.GetUID(),
-		ParticipantIndexes: []int32{participantIndex},
+		ParticipantIndexes: slices.Clone(participantIndexes),
 	}, nil
+}
+
+func participantIndexes(participants []signalv1.Participant) []int32 {
+	indexes := make([]int32, len(participants))
+	for index := range participants {
+		indexes[index] = participants[index].Index
+	}
+
+	return indexes
 }
 
 func MinimumPartialReasonBytes() int {
@@ -870,7 +915,7 @@ func ordinaryPod(
 
 func mpiJob(
 	config Config,
-	participant signalv1.Participant,
+	participants []signalv1.Participant,
 	tolerations []corev1.Toleration,
 	environment []corev1.EnvVar,
 	policy signalv1.WorkloadPolicy,
@@ -878,14 +923,30 @@ func mpiJob(
 	backendDeadlineSeconds int64,
 	gpuCount int64,
 ) (*unstructured.Unstructured, error) {
-	labels := resourceLabels(config, participant)
+	if len(participants) < 1 || len(participants) > MaxParticipants {
+		return nil, fmt.Errorf("MPIJob requires between 1 and %d participants", MaxParticipants)
+	}
 
-	jobName := resourceNameWithLimit(config.RunName, participant.Index, 63-len("-worker-0"))
-	launcherEnv := workloadEnvironment(config, participant, environment)
-	workerEnv := workloadEnvironment(config, participant, environment)
+	labels := runLabels(config)
+	launcherLabels := mapsClone(labels)
+	launcherLabels["signal.unbounded-cloud.io/mpi-role"] = "launcher"
+	workerLabels := mapsClone(labels)
+	workerLabels["signal.unbounded-cloud.io/mpi-role"] = "worker"
+
+	jobName := resourceNameWithSuffix(config.RunName, "-mpi", 63-len("-worker-0"))
+	launcherEnv := coordinatedEnvironment(config, len(participants), environment)
+	workerEnv := append(
+		coordinatedEnvironment(config, len(participants), environment),
+		corev1.EnvVar{
+			Name: "PROJECT_SIGNAL_NODE_NAME",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"},
+			},
+		},
+	)
 	readinessTimeout := mpiWorkerReadinessTimeout(backendDeadlineSeconds)
 
-	workerHosts, err := mpiWorkerHosts(config.Namespace, jobName, 1, gpuCount)
+	workerHosts, err := mpiWorkerHosts(config.Namespace, jobName, int64(len(participants)), gpuCount)
 	if err != nil {
 		return nil, err
 	}
@@ -919,16 +980,15 @@ func mpiJob(
 			"runPolicy": map[string]any{
 				"activeDeadlineSeconds": backendDeadlineSeconds,
 				"backoffLimit":          mpiBackoffLimit,
-				"cleanPodPolicy":        "Running",
+				"cleanPodPolicy":        "None",
 			},
 			"mpiReplicaSpecs": map[string]any{
 				"Launcher": map[string]any{
 					"replicas":      int64(1),
 					"restartPolicy": string(corev1.RestartPolicyNever),
 					"template": podTemplate(
-						labels,
-						"",
-						"",
+						launcherLabels,
+						nil,
 						tolerations,
 						corev1.Container{
 							Name:  "launcher",
@@ -945,12 +1005,11 @@ func mpiJob(
 					),
 				},
 				"Worker": map[string]any{
-					"replicas":      int64(1),
+					"replicas":      int64(len(participants)),
 					"restartPolicy": string(corev1.RestartPolicyNever),
 					"template": podTemplate(
-						labels,
-						participant.NodeName,
-						participant.NodeUID,
+						workerLabels,
+						mpiWorkerAffinity(config.RunName, participants),
 						tolerations,
 						worker,
 						config.ScriptConfigMap,
@@ -966,8 +1025,7 @@ func mpiJob(
 
 func podTemplate(
 	labels map[string]string,
-	nodeName string,
-	nodeUID types.UID,
+	affinity *corev1.Affinity,
 	tolerations []corev1.Toleration,
 	container corev1.Container,
 	scriptConfigMap string,
@@ -984,7 +1042,7 @@ func podTemplate(
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy:                corev1.RestartPolicyNever,
-			Affinity:                     participantNodeAffinity(nodeName, nodeUID),
+			Affinity:                     affinity,
 			Tolerations:                  tolerations,
 			AutomountServiceAccountToken: ptr(false),
 			Containers:                   []corev1.Container{container},
@@ -999,6 +1057,45 @@ func podTemplate(
 	}
 
 	return content
+}
+
+func mpiWorkerAffinity(runName string, participants []signalv1.Participant) *corev1.Affinity {
+	nodeNames := make([]string, len(participants))
+	nodeUIDs := make([]string, len(participants))
+	for index := range participants {
+		nodeNames[index] = participants[index].NodeName
+		nodeUIDs[index] = string(participants[index].NodeUID)
+	}
+
+	return &corev1.Affinity{
+		NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+					MatchFields: []corev1.NodeSelectorRequirement{{
+						Key:      "metadata.name",
+						Operator: corev1.NodeSelectorOpIn,
+						Values:   nodeNames,
+					}},
+					MatchExpressions: []corev1.NodeSelectorRequirement{{
+						Key:      signalv1.ReservationNodeUIDLabel,
+						Operator: corev1.NodeSelectorOpIn,
+						Values:   nodeUIDs,
+					}},
+				}},
+			},
+		},
+		PodAntiAffinity: &corev1.PodAntiAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+				LabelSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"signal.unbounded-cloud.io/run":      runName,
+						"signal.unbounded-cloud.io/mpi-role": "worker",
+					},
+				},
+				TopologyKey: corev1.LabelHostname,
+			}},
+		},
+	}
 }
 
 func participantNodeAffinity(nodeName string, nodeUID types.UID) *corev1.Affinity {
@@ -1055,6 +1152,24 @@ func workloadEnvironment(
 	)
 
 	return result
+}
+
+func coordinatedEnvironment(
+	config Config,
+	participantCount int,
+	environment []corev1.EnvVar,
+) []corev1.EnvVar {
+	result := slices.Clone(environment)
+
+	return append(
+		result,
+		corev1.EnvVar{Name: "PROJECT_SIGNAL_RUN_NAME", Value: config.RunName},
+		corev1.EnvVar{Name: "PROJECT_SIGNAL_RUN_UID", Value: string(config.RunUID)},
+		corev1.EnvVar{Name: "PROJECT_SIGNAL_PARTICIPANT_COUNT", Value: strconv.Itoa(participantCount)},
+		corev1.EnvVar{Name: "PROJECT_SIGNAL_SCRIPT_KEY", Value: config.ScriptKey},
+		corev1.EnvVar{Name: "PROJECT_SIGNAL_SCRIPT_DIGEST", Value: config.ScriptDigest},
+		corev1.EnvVar{Name: "PROJECT_SIGNAL_RESULTS_DIR", Value: "/results"},
+	)
 }
 
 func resultVolumes(scriptConfigMap string) []corev1.Volume {
@@ -1154,8 +1269,8 @@ func validateBackendCoverage(
 	participantCount int,
 	resources []signalv1.BackendResourceReference,
 ) error {
-	if len(resources) != participantCount {
-		return fmt.Errorf("backend-resources must contain exactly %d entries", participantCount)
+	if len(resources) < 1 || len(resources) > participantCount {
+		return fmt.Errorf("backend-resources must contain between 1 and %d entries", participantCount)
 	}
 
 	identities := make(map[string]struct{}, len(resources))
@@ -1176,20 +1291,31 @@ func validateBackendCoverage(
 
 		identities[identity] = struct{}{}
 
-		if len(resource.ParticipantIndexes) != 1 {
-			return fmt.Errorf("backend-resources[%d] must identify exactly one participant", index)
+		if len(resource.ParticipantIndexes) < 1 || len(resource.ParticipantIndexes) > participantCount {
+			return fmt.Errorf(
+				"backend-resources[%d] must identify between 1 and %d participants",
+				index,
+				participantCount,
+			)
 		}
 
-		participantIndex := resource.ParticipantIndexes[0]
-		if participantIndex < 0 || participantIndex >= int32(participantCount) {
-			return fmt.Errorf("backend-resources[%d] participant index %d is out of range", index, participantIndex)
-		}
+		withinResource := make(map[int32]struct{}, len(resource.ParticipantIndexes))
+		for _, participantIndex := range resource.ParticipantIndexes {
+			if participantIndex < 0 || participantIndex >= int32(participantCount) {
+				return fmt.Errorf("backend-resources[%d] participant index %d is out of range", index, participantIndex)
+			}
 
-		if covered[participantIndex] {
-			return fmt.Errorf("backend-resources[%d] repeats participant index %d", index, participantIndex)
-		}
+			if _, duplicate := withinResource[participantIndex]; duplicate {
+				return fmt.Errorf("backend-resources[%d] repeats participant index %d", index, participantIndex)
+			}
 
-		covered[participantIndex] = true
+			withinResource[participantIndex] = struct{}{}
+			if covered[participantIndex] {
+				return fmt.Errorf("backend-resources[%d] repeats participant index %d", index, participantIndex)
+			}
+
+			covered[participantIndex] = true
+		}
 	}
 
 	for index, present := range covered {
@@ -1202,10 +1328,16 @@ func validateBackendCoverage(
 }
 
 func resourceLabels(config Config, participant signalv1.Participant) map[string]string {
+	labels := runLabels(config)
+	labels["signal.unbounded-cloud.io/participant-index"] = strconv.FormatInt(int64(participant.Index), 10)
+
+	return labels
+}
+
+func runLabels(config Config) map[string]string {
 	return map[string]string{
-		"app.kubernetes.io/name":                      "project-signal-adapter",
-		"signal.unbounded-cloud.io/run":               config.RunName,
-		"signal.unbounded-cloud.io/participant-index": strconv.FormatInt(int64(participant.Index), 10),
+		"app.kubernetes.io/name":        "project-signal-adapter",
+		"signal.unbounded-cloud.io/run": config.RunName,
 	}
 }
 
@@ -1216,6 +1348,10 @@ func resourceName(runName string, participantIndex int32) string {
 func resourceNameWithLimit(runName string, participantIndex int32, maximumLength int) string {
 	suffix := fmt.Sprintf("-p%d", participantIndex)
 
+	return resourceNameWithSuffix(runName, suffix, maximumLength)
+}
+
+func resourceNameWithSuffix(runName, suffix string, maximumLength int) string {
 	maximumRunLength := maximumLength - len(suffix)
 	if len(runName) > maximumRunLength {
 		digest := fmt.Sprintf("%x", sha256.Sum256([]byte(runName)))[:8]
@@ -1224,6 +1360,15 @@ func resourceNameWithLimit(runName string, participantIndex int32, maximumLength
 	}
 
 	return runName + suffix
+}
+
+func mapsClone(values map[string]string) map[string]string {
+	result := make(map[string]string, len(values))
+	for key, value := range values {
+		result[key] = value
+	}
+
+	return result
 }
 
 func stringMapAny(values map[string]string) map[string]any {
@@ -1236,13 +1381,17 @@ func stringMapAny(values map[string]string) map[string]any {
 }
 
 func ownerReferenceMap(reference metav1.OwnerReference) map[string]any {
-	return map[string]any{
+	result := map[string]any{
 		"apiVersion": reference.APIVersion,
 		"kind":       reference.Kind,
 		"name":       reference.Name,
 		"uid":        string(reference.UID),
-		"controller": reference.Controller,
 	}
+	if reference.Controller != nil {
+		result["controller"] = *reference.Controller
+	}
+
+	return result
 }
 
 func shellQuote(value string) string {

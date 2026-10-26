@@ -16,9 +16,10 @@ fleet scheduling are intentionally deferred.
 - `project-signal-controller` admits Nodes, owns reservations and cordons,
   creates the Workflow, persists status and evidence, and performs teardown.
 - `project-signal-participant-adapter` creates Pod or MPIJob backends and
-  captures typed evidence. Ordinary Pods and completed MPI resources remain
-  until controller teardown; the MPI Operator removes still-running workers
-  after launcher completion so later sequential checks can use the GPUs.
+  captures typed evidence. Ordinary completed Pods remain until controller
+  teardown. The adapter retains MPI workers long enough to prove their Node
+  identities, persists that evidence, and then deletes the MPIJob before the
+  next sequential check so its GPUs are released.
   On setup, observation, or wall-clock deadline failures, the adapter first
   persists the available evidence and then quiesces uncertain backends.
 - `project-signal-participant-adapter` is a fixed WorkflowTemplate used by
@@ -122,8 +123,13 @@ Admission then:
 Ordinary workloads cannot schedule onto cordoned participants. Signal backend
 Pods receive only the fixed GPU toleration and the fixed
 `node.kubernetes.io/unschedulable` toleration needed to execute on the Nodes
-reserved by this Run. Required Node affinity pins every backend to the admitted
-Node name and UID.
+reserved by this Run. Ordinary Pod backends are pinned to one admitted Node
+name and UID. An MPI check creates one coordinated MPIJob with one launcher and
+one worker per participant. Required Node affinity limits workers to the exact
+admitted Node names and UIDs, required hostname anti-affinity places one worker
+per Node, and evidence maps each scheduled worker back to the immutable
+participant identity. The adapter has read-only `get` access to Nodes solely to
+record and verify the scheduled Node UID; it cannot mutate Nodes.
 
 ## CertificationRun contract
 
@@ -208,13 +214,14 @@ The evidence document includes:
 - a per-check cleanup disposition showing that deletion is deferred to the
   controller.
 
-The adapter persists typed backend evidence and leaves completed resources in
-place. MPI worker evidence is captured when still present; a worker may already
-be absent because `cleanPodPolicy: Running` releases its GPU after launcher
-completion. If an uncertain backend cannot be quiesced, the adapter task fails
-and later checks are skipped rather than overlapping execution. The controller
-deletes the Workflow and all remaining owned backends only after the final
-evidence document is durable.
+The adapter persists typed backend evidence and leaves completed ordinary Pods
+in place. MPIJobs use `cleanPodPolicy: None` so the launcher and every worker
+remain available for evidence capture. After that evidence is durable, the
+adapter deletes the MPIJob and waits for it to disappear before completing the
+task. If any backend cannot be quiesced, the adapter task fails and later checks
+are skipped rather than overlapping execution. The controller deletes the
+Workflow and all remaining owned backends only after the final evidence
+document is durable.
 `WorkloadCleanupComplete=True` is the authoritative record that this
 controller-owned cleanup finished.
 

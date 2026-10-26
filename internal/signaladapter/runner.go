@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -41,9 +42,9 @@ type Runner struct {
 }
 
 type createdResource struct {
-	gvr              schema.GroupVersionResource
-	resource         *unstructured.Unstructured
-	participantIndex int32
+	gvr                schema.GroupVersionResource
+	resource           *unstructured.Unstructured
+	participantIndexes []int32
 }
 
 const maxResultLogBytes = 64 * 1024
@@ -124,10 +125,11 @@ func (r *Runner) Execute(ctx context.Context, config Config) (AggregateOutput, e
 	created := make([]createdResource, 0, len(resources))
 	references := make([]signalv1.BackendResourceReference, 0, len(resources))
 	finishBackendFailure := func(cause error) (AggregateOutput, error) {
-		return r.backendFailureOutput(config, len(participants), created, references, cause)
+		return r.backendFailureOutput(config, participants, created, references, cause)
 	}
 
-	for index, resource := range resources {
+	for index, rendered := range resources {
+		resource := rendered.Unstructured
 		gvr := podGVR
 		if resource.GetKind() == "MPIJob" {
 			gvr = mpiJobGVR
@@ -137,37 +139,37 @@ func (r *Runner) Execute(ctx context.Context, config Config) (AggregateOutput, e
 			Create(executionContext, resource, metav1.CreateOptions{})
 		if createErr != nil {
 			if len(created) > 0 {
-				return finishBackendFailure(fmt.Errorf("create participant %d %s: %w", index, resource.GetKind(), createErr))
+				return finishBackendFailure(fmt.Errorf("create backend %d %s: %w", index, resource.GetKind(), createErr))
 			}
 
-			return AggregateOutput{}, fmt.Errorf("create participant %d %s: %w", index, resource.GetKind(), createErr)
+			return AggregateOutput{}, fmt.Errorf("create backend %d %s: %w", index, resource.GetKind(), createErr)
 		}
 
 		created = append(created, createdResource{
-			gvr:              gvr,
-			resource:         createdObject,
-			participantIndex: int32(index),
+			gvr:                gvr,
+			resource:           createdObject,
+			participantIndexes: slices.Clone(rendered.ParticipantIndexes),
 		})
 
-		reference, referenceErr := BackendResource(createdObject, int32(index))
+		reference, referenceErr := BackendResource(createdObject, rendered.ParticipantIndexes)
 		if referenceErr != nil {
-			fallbackReference, identityErr := backendResourceIdentity(createdObject, int32(index))
+			fallbackReference, identityErr := backendResourceIdentity(createdObject, rendered.ParticipantIndexes)
 			if identityErr != nil {
 				return AggregateOutput{}, errors.Join(
-					fmt.Errorf("record participant %d backend identity: %w", index, referenceErr),
+					fmt.Errorf("record backend %d identity: %w", index, referenceErr),
 					identityErr,
 				)
 			}
 
 			references = append(references, fallbackReference)
 
-			return finishBackendFailure(fmt.Errorf("record participant %d backend identity: %w", index, referenceErr))
+			return finishBackendFailure(fmt.Errorf("record backend %d identity: %w", index, referenceErr))
 		}
 
 		references = append(references, reference)
 	}
 
-	results := make([]Result, len(created))
+	resourceResults := make([]Result, len(created))
 
 	var waitGroup sync.WaitGroup
 
@@ -177,11 +179,13 @@ func (r *Runner) Execute(ctx context.Context, config Config) (AggregateOutput, e
 		go func() {
 			defer waitGroup.Done()
 
-			results[index] = r.waitForResult(executionContext, config, created[index])
+			resourceResults[index] = r.waitForResult(executionContext, config, created[index])
 		}()
 	}
 
 	waitGroup.Wait()
+
+	results := expandResults(resourceResults, created)
 
 	output, err := Aggregate(len(participants), references, results)
 	if err != nil {
@@ -196,6 +200,7 @@ func (r *Runner) Execute(ctx context.Context, config Config) (AggregateOutput, e
 	output.BackendEvidence, evidenceComplete, err = r.captureBackendEvidence(
 		captureContext,
 		config,
+		participants,
 		created,
 	)
 	if err != nil {
@@ -210,9 +215,9 @@ func (r *Runner) Execute(ctx context.Context, config Config) (AggregateOutput, e
 		return finishBackendFailure(fmt.Errorf("persist backend evidence: %w", err))
 	}
 
-	if resultsRequireQuiescence(results) {
+	if resultsRequireQuiescence(results) || containsMPIBackend(created) {
 		if err := r.quiesceBackends(created); err != nil {
-			return AggregateOutput{}, fmt.Errorf("quiesce uncertain backends: %w", err)
+			return AggregateOutput{}, fmt.Errorf("quiesce backends: %w", err)
 		}
 	}
 
@@ -221,7 +226,7 @@ func (r *Runner) Execute(ctx context.Context, config Config) (AggregateOutput, e
 
 func (r *Runner) backendFailureOutput(
 	config Config,
-	participantCount int,
+	participants []signalv1.Participant,
 	created []createdResource,
 	references []signalv1.BackendResourceReference,
 	cause error,
@@ -232,6 +237,7 @@ func (r *Runner) backendFailureOutput(
 	evidence, _, err := r.captureBackendEvidence(
 		captureContext,
 		config,
+		participants,
 		created,
 	)
 	if err != nil {
@@ -245,7 +251,7 @@ func (r *Runner) backendFailureOutput(
 
 	reason := boundedRedactedText(cause.Error(), maxEvidenceTextBytes)
 
-	results := make([]Result, participantCount)
+	results := make([]Result, len(participants))
 	for index := range results {
 		results[index] = Result{
 			ParticipantIndex: index,
@@ -256,7 +262,7 @@ func (r *Runner) backendFailureOutput(
 	}
 
 	measurements, err := json.Marshal(map[string]any{
-		"participantCount": participantCount,
+		"participantCount": len(participants),
 		"createdBackends":  len(created),
 		"error":            reason,
 		"results":          results,
@@ -326,6 +332,30 @@ func resultsRequireQuiescence(results []Result) bool {
 	return false
 }
 
+func containsMPIBackend(resources []createdResource) bool {
+	return slices.ContainsFunc(resources, func(resource createdResource) bool {
+		return resource.resource.GetKind() == "MPIJob"
+	})
+}
+
+func expandResults(resourceResults []Result, resources []createdResource) []Result {
+	total := 0
+	for index := range resources {
+		total += len(resources[index].participantIndexes)
+	}
+
+	results := make([]Result, 0, total)
+	for index := range resources {
+		for _, participantIndex := range resources[index].participantIndexes {
+			result := resourceResults[index]
+			result.ParticipantIndex = int(participantIndex)
+			results = append(results, result)
+		}
+	}
+
+	return results
+}
+
 func (r *Runner) quiesceBackends(backends []createdResource) error {
 	ctx, cancel := context.WithTimeout(context.Background(), r.captureWait())
 	defer cancel()
@@ -376,8 +406,9 @@ func (r *Runner) quiesceBackends(backends []createdResource) error {
 }
 
 func (r *Runner) waitForResult(ctx context.Context, config Config, backend createdResource) Result {
+	participantIndex := int(backend.participantIndexes[0])
 	result := Result{
-		ParticipantIndex: int(backend.participantIndex),
+		ParticipantIndex: participantIndex,
 		ExecutionState:   "Error",
 		Verdict:          "Inconclusive",
 		Reason:           "BackendExecutionFailed",
@@ -407,7 +438,7 @@ func (r *Runner) waitForResult(ctx context.Context, config Config, backend creat
 		if backend.resource.GetKind() == "MPIJob" && capturedResult == nil {
 			current := r.resultLogs(ctx, config, backend, false).current
 			if current.err == nil {
-				parsed, parseErr := ParseResultLog(current.content, int(backend.participantIndex))
+				parsed, parseErr := ParseResultLog(current.content, participantIndex)
 				if parseErr == nil {
 					parsed.ResultLog = &ResultLogMetadata{
 						Current:        current.metadata,
@@ -424,7 +455,7 @@ func (r *Runner) waitForResult(ctx context.Context, config Config, backend creat
 
 			completed, hardFailure := backendCompletionFromLogs(
 				logs,
-				int(backend.participantIndex),
+				participantIndex,
 				succeeded,
 			)
 			if completed.ExecutionState == "Succeeded" || hardFailure || capturedResult == nil {
@@ -629,7 +660,7 @@ func (r *Runner) resultLogs(
 		}
 
 		pods, err := r.Kubernetes.CoreV1().Pods(config.Namespace).List(ctx, metav1.ListOptions{
-			LabelSelector: participantLabelSelector(config.RunName, backend.participantIndex),
+			LabelSelector: runLabelSelector(config.RunName),
 		})
 		if err != nil {
 			source := resultLogSourceFromError(fmt.Errorf("list MPIJob Pods: %w", err))

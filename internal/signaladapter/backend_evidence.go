@@ -19,6 +19,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+
+	signalv1 "github.com/Azure/unbounded/api/signal/v1alpha1"
 )
 
 const (
@@ -90,6 +92,9 @@ type PodEvidence struct {
 	Name       string              `json:"name"`
 	UID        types.UID           `json:"uid"`
 	Role       string              `json:"role"`
+	NodeName   string              `json:"nodeName,omitempty"`
+	NodeUID    types.UID           `json:"nodeUID,omitempty"`
+	NodeError  string              `json:"nodeError,omitempty"`
 	Phase      corev1.PodPhase     `json:"phase,omitempty"`
 	Reason     string              `json:"reason,omitempty"`
 	Message    string              `json:"message,omitempty"`
@@ -158,19 +163,48 @@ func MinimumBackendEvidenceBytes(participantCount int) int {
 func (r *Runner) captureBackendEvidence(
 	ctx context.Context,
 	config Config,
+	participants []signalv1.Participant,
 	backends []createdResource,
 ) (string, bool, error) {
 	evidence := BackendEvidence{
 		Version:      backendEvidenceVersion,
 		Complete:     true,
-		Participants: make([]ParticipantBackendEvidence, len(backends)),
+		Participants: make([]ParticipantBackendEvidence, 0, len(participants)),
 	}
 
 	for index := range backends {
-		participant, complete := r.captureParticipantEvidence(ctx, config, backends[index])
-		evidence.Participants[index] = participant
-		evidence.Complete = evidence.Complete && complete
+		backend := backends[index]
+		switch backend.resource.GetKind() {
+		case "Pod":
+			if len(backend.participantIndexes) != 1 {
+				return "", false, errors.New("Pod backend evidence requires exactly one participant index")
+			}
+
+			participantIndex := backend.participantIndexes[0]
+			if participantIndex < 0 || int(participantIndex) >= len(participants) {
+				return "", false, fmt.Errorf("Pod backend participant index %d is out of range", participantIndex)
+			}
+
+			participant, complete := r.capturePodBackendEvidence(
+				ctx,
+				config,
+				participants[participantIndex],
+				backend,
+			)
+			evidence.Participants = append(evidence.Participants, participant)
+			evidence.Complete = evidence.Complete && complete
+		case "MPIJob":
+			captured, complete := r.captureMPIBackendEvidence(ctx, config, participants, backend)
+			evidence.Participants = append(evidence.Participants, captured...)
+			evidence.Complete = evidence.Complete && complete
+		default:
+			return "", false, fmt.Errorf("unsupported backend kind %q", backend.resource.GetKind())
+		}
 	}
+
+	slices.SortFunc(evidence.Participants, func(left, right ParticipantBackendEvidence) int {
+		return left.ParticipantIndex - right.ParticipantIndex
+	})
 
 	content, complete, err := marshalBackendEvidence(evidence, MaxBackendEvidenceBytes)
 	if err != nil {
@@ -277,13 +311,14 @@ func markBackendEvidenceIncomplete(content, captureError string, limit int) (str
 	return string(bounded), nil
 }
 
-func (r *Runner) captureParticipantEvidence(
+func (r *Runner) capturePodBackendEvidence(
 	ctx context.Context,
 	config Config,
+	expected signalv1.Participant,
 	backend createdResource,
 ) (ParticipantBackendEvidence, bool) {
 	participant := ParticipantBackendEvidence{
-		ParticipantIndex: int(backend.participantIndex),
+		ParticipantIndex: int(expected.Index),
 		Resource: BackendObjectEvidence{
 			APIVersion: backend.resource.GetAPIVersion(),
 			Kind:       backend.resource.GetKind(),
@@ -315,94 +350,209 @@ func (r *Runner) captureParticipantEvidence(
 		}
 	}
 
-	switch backend.resource.GetKind() {
-	case "Pod":
-		pod, podErr := r.Kubernetes.CoreV1().Pods(config.Namespace).
-			Get(ctx, backend.resource.GetName(), metav1.GetOptions{})
-		if podErr != nil {
-			participant.CaptureError = joinCaptureError(participant.CaptureError, "get participant Pod: "+podErr.Error())
+	pod, podErr := r.Kubernetes.CoreV1().Pods(config.Namespace).
+		Get(ctx, backend.resource.GetName(), metav1.GetOptions{})
+	if podErr != nil {
+		participant.CaptureError = joinCaptureError(participant.CaptureError, "get participant Pod: "+podErr.Error())
 
-			return participant, false
-		}
+		return participant, false
+	}
 
-		if pod.UID != backend.resource.GetUID() {
-			participant.CaptureError = joinCaptureError(participant.CaptureError, "participant Pod UID changed before evidence capture")
+	if pod.UID != backend.resource.GetUID() {
+		participant.CaptureError = joinCaptureError(participant.CaptureError, "participant Pod UID changed before evidence capture")
 
-			return participant, false
-		}
+		return participant, false
+	}
 
-		podEvidence, podComplete := r.capturePodEvidence(ctx, config.Namespace, pod, "participant")
-		participant.Pods = []PodEvidence{podEvidence}
-		complete = complete && podComplete
-	case "MPIJob":
-		jobs, jobErr := r.Kubernetes.BatchV1().Jobs(config.Namespace).List(ctx, metav1.ListOptions{})
-		if jobErr != nil {
-			participant.CaptureError = joinCaptureError(participant.CaptureError, "list launcher Jobs: "+jobErr.Error())
-			complete = false
-		}
-
-		jobUIDs := map[types.UID]struct{}{}
-
-		if jobErr == nil {
-			for index := range jobs.Items {
-				job := &jobs.Items[index]
-				if !ownedBy(job.OwnerReferences, backend.resource.GetUID()) {
-					continue
-				}
-
-				jobUIDs[job.UID] = struct{}{}
-				projected := projectJob(job)
-				participant.LauncherJob = &projected
-			}
-		}
-
-		pods, podErr := r.Kubernetes.CoreV1().Pods(config.Namespace).List(ctx, metav1.ListOptions{
-			LabelSelector: participantLabelSelector(config.RunName, backend.participantIndex),
-		})
-		if podErr != nil {
-			participant.CaptureError = joinCaptureError(participant.CaptureError, "list MPI Pods: "+podErr.Error())
-
-			return participant, false
-		}
-
-		for index := range pods.Items {
-			pod := &pods.Items[index]
-
-			role := mpiPodRole(pod, backend.resource.GetUID(), jobUIDs)
-			if role == "" {
-				continue
-			}
-
-			podEvidence, podComplete := r.capturePodEvidence(ctx, config.Namespace, pod, role)
-			participant.Pods = append(participant.Pods, podEvidence)
-			complete = complete && podComplete
-		}
-
-		slices.SortFunc(participant.Pods, func(left, right PodEvidence) int {
-			return strings.Compare(left.Name, right.Name)
-		})
-
-		if participant.LauncherJob == nil {
-			participant.CaptureError = joinCaptureError(participant.CaptureError, "MPI launcher Job was not found")
-			complete = false
-		}
-
-		if !hasPodRole(participant.Pods, "launcher") {
-			participant.CaptureError = joinCaptureError(
-				participant.CaptureError,
-				"MPI launcher Pod was not found",
-			)
-			complete = false
-		}
-	default:
+	podEvidence, podComplete := r.capturePodEvidence(ctx, config.Namespace, pod, "participant")
+	participant.Pods = []PodEvidence{podEvidence}
+	complete = complete && podComplete
+	if podEvidence.NodeName != expected.NodeName || podEvidence.NodeUID != expected.NodeUID {
 		participant.CaptureError = joinCaptureError(
 			participant.CaptureError,
-			fmt.Sprintf("unsupported backend kind %q", backend.resource.GetKind()),
+			"participant Pod ran on a different Node identity than the immutable participant",
 		)
 		complete = false
 	}
 
 	return participant, complete
+}
+
+func (r *Runner) captureMPIBackendEvidence(
+	ctx context.Context,
+	config Config,
+	participants []signalv1.Participant,
+	backend createdResource,
+) ([]ParticipantBackendEvidence, bool) {
+	evidence := make([]ParticipantBackendEvidence, len(backend.participantIndexes))
+	complete := len(backend.participantIndexes) == len(participants)
+
+	resource := BackendObjectEvidence{
+		APIVersion: backend.resource.GetAPIVersion(),
+		Kind:       backend.resource.GetKind(),
+		Namespace:  backend.resource.GetNamespace(),
+		Name:       backend.resource.GetName(),
+		UID:        backend.resource.GetUID(),
+	}
+
+	object, err := r.Dynamic.Resource(backend.gvr).Namespace(config.Namespace).
+		Get(ctx, backend.resource.GetName(), metav1.GetOptions{})
+	objectCaptureError := ""
+	if err != nil {
+		complete = false
+		objectCaptureError = "get backend object: " + err.Error()
+	} else if object.GetUID() != backend.resource.GetUID() {
+		complete = false
+		objectCaptureError = "backend object UID changed before evidence capture"
+	} else {
+		projected, projectErr := projectBackendObject(object)
+		if projectErr != nil {
+			complete = false
+			objectCaptureError = "project backend object: " + projectErr.Error()
+		} else {
+			resource = projected
+		}
+	}
+
+	for index, participantIndex := range backend.participantIndexes {
+		evidence[index] = ParticipantBackendEvidence{
+			ParticipantIndex: int(participantIndex),
+			Resource:         resource,
+		}
+		if objectCaptureError != "" {
+			evidence[index].CaptureError = boundedRedactedText(objectCaptureError, maxEvidenceTextBytes)
+		}
+	}
+
+	jobs, jobErr := r.Kubernetes.BatchV1().Jobs(config.Namespace).List(ctx, metav1.ListOptions{})
+	jobUIDs := map[types.UID]struct{}{}
+	var launcherJob *JobEvidence
+	launcherJobCount := 0
+
+	if jobErr != nil {
+		complete = false
+	} else {
+		for index := range jobs.Items {
+			job := &jobs.Items[index]
+			if !ownedBy(job.OwnerReferences, backend.resource.GetUID()) {
+				continue
+			}
+
+			launcherJobCount++
+			jobUIDs[job.UID] = struct{}{}
+			projected := projectJob(job)
+			launcherJob = &projected
+		}
+	}
+
+	pods, podErr := r.Kubernetes.CoreV1().Pods(config.Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: runLabelSelector(config.RunName),
+	})
+	if podErr != nil {
+		complete = false
+	}
+
+	workerPods := make(map[string]*corev1.Pod, len(participants))
+	var launcherPod *corev1.Pod
+	launcherPodCount := 0
+	workerPodCount := 0
+
+	if podErr == nil {
+		for index := range pods.Items {
+			pod := &pods.Items[index]
+			switch mpiPodRole(pod, backend.resource.GetUID(), jobUIDs) {
+			case "launcher":
+				launcherPodCount++
+				launcherPod = pod
+			case "worker":
+				workerPodCount++
+				if _, duplicate := workerPods[pod.Spec.NodeName]; duplicate {
+					complete = false
+				}
+				workerPods[pod.Spec.NodeName] = pod
+			}
+		}
+	}
+
+	if launcherJobCount != 1 || launcherPodCount != 1 || workerPodCount != len(participants) {
+		complete = false
+	}
+
+	if len(evidence) > 0 {
+		if jobErr != nil {
+			evidence[0].CaptureError = joinCaptureError(
+				evidence[0].CaptureError,
+				"list launcher Jobs: "+jobErr.Error(),
+			)
+		} else if launcherJobCount != 1 {
+			evidence[0].CaptureError = joinCaptureError(
+				evidence[0].CaptureError,
+				fmt.Sprintf("expected exactly one MPI launcher Job, found %d", launcherJobCount),
+			)
+		} else {
+			evidence[0].LauncherJob = launcherJob
+		}
+
+		if podErr != nil {
+			evidence[0].CaptureError = joinCaptureError(
+				evidence[0].CaptureError,
+				"list MPI Pods: "+podErr.Error(),
+			)
+		} else if launcherPodCount != 1 {
+			evidence[0].CaptureError = joinCaptureError(
+				evidence[0].CaptureError,
+				fmt.Sprintf("expected exactly one MPI launcher Pod, found %d", launcherPodCount),
+			)
+		} else {
+			podEvidence, podComplete := r.capturePodEvidence(ctx, config.Namespace, launcherPod, "launcher")
+			evidence[0].Pods = append(evidence[0].Pods, podEvidence)
+			complete = complete && podComplete
+		}
+	}
+
+	for evidenceIndex, participantIndex := range backend.participantIndexes {
+		if participantIndex < 0 || int(participantIndex) >= len(participants) {
+			evidence[evidenceIndex].CaptureError = joinCaptureError(
+				evidence[evidenceIndex].CaptureError,
+				fmt.Sprintf("participant index %d is out of range", participantIndex),
+			)
+			complete = false
+
+			continue
+		}
+
+		expected := participants[participantIndex]
+		pod := workerPods[expected.NodeName]
+		if pod == nil {
+			evidence[evidenceIndex].CaptureError = joinCaptureError(
+				evidence[evidenceIndex].CaptureError,
+				"MPI worker Pod was not found on the immutable participant Node",
+			)
+			complete = false
+
+			continue
+		}
+
+		podEvidence, podComplete := r.capturePodEvidence(ctx, config.Namespace, pod, "worker")
+		evidence[evidenceIndex].Pods = append(evidence[evidenceIndex].Pods, podEvidence)
+		complete = complete && podComplete
+		if podEvidence.NodeUID != expected.NodeUID {
+			evidence[evidenceIndex].CaptureError = joinCaptureError(
+				evidence[evidenceIndex].CaptureError,
+				"MPI worker ran on a different Node UID than the immutable participant",
+			)
+			complete = false
+		}
+	}
+
+	if workerPodCount != len(participants) && len(evidence) > 0 {
+		evidence[0].CaptureError = joinCaptureError(
+			evidence[0].CaptureError,
+			fmt.Sprintf("expected %d MPI worker Pods, found %d", len(participants), workerPodCount),
+		)
+	}
+
+	return evidence, complete
 }
 
 func (r *Runner) capturePodEvidence(
@@ -415,12 +565,26 @@ func (r *Runner) capturePodEvidence(
 		Name:       pod.Name,
 		UID:        pod.UID,
 		Role:       role,
+		NodeName:   pod.Spec.NodeName,
 		Phase:      pod.Status.Phase,
 		Reason:     boundedRedactedText(pod.Status.Reason, maxEvidenceTextBytes),
 		Message:    boundedRedactedText(pod.Status.Message, maxEvidenceTextBytes),
 		Conditions: projectPodConditions(pod.Status.Conditions),
 	}
 	complete := true
+
+	if pod.Spec.NodeName == "" {
+		evidence.NodeError = "Pod is not assigned to a Node"
+		complete = false
+	} else {
+		node, err := r.Kubernetes.CoreV1().Nodes().Get(ctx, pod.Spec.NodeName, metav1.GetOptions{})
+		if err != nil {
+			evidence.NodeError = boundedRedactedText("get Pod Node: "+err.Error(), maxEvidenceTextBytes)
+			complete = false
+		} else {
+			evidence.NodeUID = node.UID
+		}
+	}
 
 	statuses := append(slices.Clone(pod.Status.InitContainerStatuses), pod.Status.ContainerStatuses...)
 	for _, status := range statuses {
@@ -716,6 +880,10 @@ func participantLabelSelector(runName string, participantIndex int32) string {
 		"signal.unbounded-cloud.io/run=" + runName,
 		"signal.unbounded-cloud.io/participant-index=" + strconv.FormatInt(int64(participantIndex), 10),
 	}, ",")
+}
+
+func runLabelSelector(runName string) string {
+	return "signal.unbounded-cloud.io/run=" + runName
 }
 
 func mpiPodRole(pod *corev1.Pod, mpiJobUID types.UID, jobUIDs map[types.UID]struct{}) string {
