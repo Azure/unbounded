@@ -41,9 +41,6 @@ type Participant struct {
 	NodeName    string              `json:"nodeName"`
 	NodeUID     types.UID           `json:"nodeUID"`
 	Allocatable corev1.ResourceList `json:"allocatable,omitempty"`
-	Role        string              `json:"role,omitempty"`
-	// +kubebuilder:validation:MaxProperties=16
-	TopologyValues map[string]string `json:"topologyValues,omitempty"`
 }
 
 type BackendResourceReference struct {
@@ -84,9 +81,8 @@ type CertificationCheckSnapshot struct {
 	WorkloadPolicy WorkloadPolicy   `json:"workloadPolicy,omitempty"`
 	GPUCount       int32            `json:"gpuCount,omitempty"`
 	// +kubebuilder:validation:MaxProperties=32
-	ScriptEnvironment     map[string]string      `json:"scriptEnvironment,omitempty"`
-	BackendActiveDeadline metav1.Duration        `json:"backendActiveDeadline"`
-	ParticipantPolicy     CheckParticipantPolicy `json:"participantPolicy,omitempty"`
+	ScriptEnvironment     map[string]string `json:"scriptEnvironment,omitempty"`
+	BackendActiveDeadline metav1.Duration   `json:"backendActiveDeadline"`
 }
 
 // +kubebuilder:validation:XValidation:rule="self.profile == oldSelf.profile",message="profile is immutable"

@@ -191,10 +191,6 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 		return fmt.Errorf("profile %s checks: %w", profile.Name, err)
 	}
 
-	if err := validateParticipantConstraints(&profile, checks); err != nil {
-		return fmt.Errorf("profile %s participant constraints: %w", profile.Name, err)
-	}
-
 	for index := range checks {
 		check := &checks[index]
 		if err := signalv1.ValidateExecutionDeadlines(
@@ -223,27 +219,22 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 	}
 
 	for index := range checks {
-		checkParticipants, _, err := participantsForCheck(participants, checks[index].ParticipantPolicy)
-		if err != nil {
-			return fmt.Errorf("check %s participants: %w", checks[index].ID, err)
-		}
-
-		if len(checkParticipants) > signaladapter.MaxCheckParticipants {
+		if len(participants) > signaladapter.MaxCheckParticipants {
 			return fmt.Errorf(
 				"check %s selects %d participants, maximum is %d",
 				checks[index].ID,
-				len(checkParticipants),
+				len(participants),
 				signaladapter.MaxCheckParticipants,
 			)
 		}
 
-		minimumEvidenceBytes := signaladapter.MinimumBackendEvidenceBytes(len(checkParticipants))
+		minimumEvidenceBytes := signaladapter.MinimumBackendEvidenceBytes(len(participants))
 		if signaladapter.MaxBackendEvidenceBytes < minimumEvidenceBytes {
 			return fmt.Errorf(
 				"check %s fixed backend evidence limit %d cannot represent %d participants; requires at least %d bytes",
 				checks[index].ID,
 				signaladapter.MaxBackendEvidenceBytes,
-				len(checkParticipants),
+				len(participants),
 				minimumEvidenceBytes,
 			)
 		}
@@ -258,24 +249,24 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 			)
 		}
 
-		minimumMeasurementsBytes := signaladapter.MinimumPartialMeasurementsBytes(len(checkParticipants))
+		minimumMeasurementsBytes := signaladapter.MinimumPartialMeasurementsBytes(len(participants))
 		if signaladapter.MaxMeasurementsBytes < minimumMeasurementsBytes {
 			return fmt.Errorf(
 				"check %s fixed measurements limit %d cannot represent %d participants; requires at least %d bytes",
 				checks[index].ID,
 				signaladapter.MaxMeasurementsBytes,
-				len(checkParticipants),
+				len(participants),
 				minimumMeasurementsBytes,
 			)
 		}
 
-		minimumBackendResourcesBytes := signaladapter.MinimumPartialBackendResourcesBytes(len(checkParticipants))
+		minimumBackendResourcesBytes := signaladapter.MinimumPartialBackendResourcesBytes(len(participants))
 		if signaladapter.MaxBackendOutputBytes < minimumBackendResourcesBytes {
 			return fmt.Errorf(
 				"check %s fixed backend resource limit %d cannot represent %d participants; requires at least %d bytes",
 				checks[index].ID,
 				signaladapter.MaxBackendOutputBytes,
-				len(checkParticipants),
+				len(participants),
 				minimumBackendResourcesBytes,
 			)
 		}
@@ -530,18 +521,12 @@ func (r *AdmissionReconciler) selectParticipants(
 		)
 	}
 
-	selected, err := selectParticipantPlan(
-		candidates,
-		requestNode.Name,
-		count,
-		profile.Spec.ParticipantRoles,
-		profile.Spec.TopologyConstraints,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("profile %s participant constraints: %w", profile.Name, err)
+	participants := make([]signalv1.Participant, count)
+	for index := range participants {
+		participants[index] = participantSnapshot(&candidates[index], int32(index))
 	}
 
-	return selected, nil
+	return participants, nil
 }
 
 func (r *AdmissionReconciler) releaseOrphanedReservations(ctx context.Context, runName string) error {
@@ -577,366 +562,6 @@ func participantSnapshot(node *corev1.Node, index int32) signalv1.Participant {
 		NodeUID:     node.UID,
 		Allocatable: node.Status.Allocatable.DeepCopy(),
 	}
-}
-
-type participantRoleSlot struct {
-	name string
-}
-
-func selectParticipantPlan(
-	candidates []corev1.Node,
-	requestNodeName string,
-	count int32,
-	roles []signalv1.ParticipantRole,
-	topology []signalv1.ParticipantTopologyConstraint,
-) ([]signalv1.Participant, error) {
-	assignments, err := solveParticipantRoles(
-		candidates,
-		requestNodeName,
-		count,
-		roles,
-		topology,
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	selectedIndexes := make([]int, 0, count)
-	selected := make([]bool, len(candidates))
-
-	selectedIndexes = append(selectedIndexes, 0)
-	selected[0] = true
-
-	for index := range candidates {
-		if selected[index] || len(assignments[index]) == 0 {
-			continue
-		}
-
-		selectedIndexes = append(selectedIndexes, index)
-		selected[index] = true
-	}
-
-	for index := range candidates {
-		if int32(len(selectedIndexes)) == count {
-			break
-		}
-
-		if selected[index] {
-			continue
-		}
-
-		selectedIndexes = append(selectedIndexes, index)
-		selected[index] = true
-	}
-
-	if int32(len(selectedIndexes)) != count {
-		return nil, fmt.Errorf("participant plan selected %d participants, want %d", len(selectedIndexes), count)
-	}
-
-	participants := make([]signalv1.Participant, 0, count)
-	for _, candidateIndex := range selectedIndexes {
-		participant := participantSnapshot(&candidates[candidateIndex], int32(len(participants)))
-		if len(assignments[candidateIndex]) > 0 {
-			participant.Role = assignments[candidateIndex][0]
-		}
-
-		participant.TopologyValues = topologyValues(&candidates[candidateIndex], topology)
-		participants = append(participants, participant)
-	}
-
-	return participants, nil
-}
-
-func topologyValues(
-	node *corev1.Node,
-	constraints []signalv1.ParticipantTopologyConstraint,
-) map[string]string {
-	values := make(map[string]string)
-
-	for index := range constraints {
-		key := constraints[index].LabelKey
-		if value, exists := node.Labels[key]; exists {
-			values[key] = value
-		}
-	}
-
-	if len(values) == 0 {
-		return nil
-	}
-
-	return values
-}
-
-func solveParticipantRoles(
-	candidates []corev1.Node,
-	requestNodeName string,
-	participantCount int32,
-	roles []signalv1.ParticipantRole,
-	topology []signalv1.ParticipantTopologyConstraint,
-) ([][]string, error) {
-	roleNames := make(map[string]struct{}, len(roles))
-	roleSelectors := make(map[string]labels.Selector, len(roles))
-	slots := make([]participantRoleSlot, 0, participantCount)
-
-	for roleIndex := range roles {
-		role := &roles[roleIndex]
-		if _, duplicate := roleNames[role.Name]; duplicate {
-			return nil, fmt.Errorf("duplicate participant role %q", role.Name)
-		}
-
-		selector, err := metav1.LabelSelectorAsSelector(&role.Selector)
-		if err != nil {
-			return nil, fmt.Errorf("role %s selector: %w", role.Name, err)
-		}
-
-		roleNames[role.Name] = struct{}{}
-		roleSelectors[role.Name] = selector
-
-		for range role.Count {
-			slots = append(slots, participantRoleSlot{name: role.Name})
-		}
-	}
-
-	if int32(len(slots)) > participantCount {
-		return nil, fmt.Errorf(
-			"participant roles require %d assignments but participant count is %d",
-			len(slots),
-			participantCount,
-		)
-	}
-
-	for index := range topology {
-		if _, exists := roleNames[topology[index].Role]; !exists {
-			return nil, fmt.Errorf("topology constraint references unknown role %q", topology[index].Role)
-		}
-	}
-
-	assignments := make([][]string, len(candidates))
-	assigned := make([]bool, len(candidates))
-	slotAssignments := make([]int, len(slots))
-	candidateOrders := make(map[string][]int, len(roles))
-
-	for role, selector := range roleSelectors {
-		candidateOrders[role] = roleCandidateOrder(candidates, selector, role, topology)
-	}
-
-	const maximumSearchStates = 1_000_000
-
-	searchStates := 0
-	searchExhausted := false
-
-	var search func(int) bool
-
-	search = func(slotIndex int) bool {
-		if searchExhausted {
-			return false
-		}
-
-		searchStates++
-		if searchStates > maximumSearchStates {
-			searchExhausted = true
-
-			return false
-		}
-
-		if slotIndex == len(slots) {
-			requestAssigned := requestNodeName == ""
-			assignedCount := int32(0)
-
-			for index := range candidates {
-				if len(assignments[index]) == 0 {
-					continue
-				}
-
-				assignedCount++
-
-				if candidates[index].Name == requestNodeName {
-					requestAssigned = true
-				}
-			}
-
-			if !requestAssigned && assignedCount >= participantCount {
-				return false
-			}
-
-			return participantTopologySatisfied(candidates, assignments, topology)
-		}
-
-		slot := &slots[slotIndex]
-
-		firstCandidate := 0
-		if slotIndex > 0 && slots[slotIndex-1].name == slot.name {
-			firstCandidate = slotAssignments[slotIndex-1] + 1
-		}
-
-		order := candidateOrders[slot.name]
-		for candidatePosition := firstCandidate; candidatePosition < len(order); candidatePosition++ {
-			candidateIndex := order[candidatePosition]
-			if assigned[candidateIndex] {
-				continue
-			}
-
-			assigned[candidateIndex] = true
-			assignments[candidateIndex] = []string{slot.name}
-			slotAssignments[slotIndex] = candidatePosition
-
-			roleComplete := slotIndex+1 == len(slots) || slots[slotIndex+1].name != slot.name
-			if (!roleComplete || participantRoleTopologySatisfied(
-				candidates,
-				assignments,
-				slot.name,
-				topology,
-			)) && search(slotIndex+1) {
-				return true
-			}
-
-			assignments[candidateIndex] = nil
-			assigned[candidateIndex] = false
-		}
-
-		return false
-	}
-
-	if !search(0) {
-		if searchExhausted {
-			return nil, fmt.Errorf("participant role search exceeded %d states", maximumSearchStates)
-		}
-
-		return nil, errors.New("eligible participants cannot satisfy role and topology constraints")
-	}
-
-	return assignments, nil
-}
-
-func roleCandidateOrder(
-	candidates []corev1.Node,
-	selector labels.Selector,
-	role string,
-	topology []signalv1.ParticipantTopologyConstraint,
-) []int {
-	constraints := make([]signalv1.ParticipantTopologyConstraint, 0)
-
-	for index := range topology {
-		if topology[index].Role == role {
-			constraints = append(constraints, topology[index])
-		}
-	}
-
-	if len(constraints) == 0 {
-		order := make([]int, 0, len(candidates))
-		for index := range candidates {
-			if selector.Matches(labels.Set(candidates[index].Labels)) {
-				order = append(order, index)
-			}
-		}
-
-		return order
-	}
-
-	groups := map[string][]int{}
-
-	for index := range candidates {
-		if !selector.Matches(labels.Set(candidates[index].Labels)) {
-			continue
-		}
-
-		values := make([]string, len(constraints))
-		valid := true
-
-		for constraintIndex := range constraints {
-			values[constraintIndex] = candidates[index].Labels[constraints[constraintIndex].LabelKey]
-			if values[constraintIndex] == "" {
-				valid = false
-
-				break
-			}
-		}
-
-		if valid {
-			key := strings.Join(values, "\x00")
-			groups[key] = append(groups[key], index)
-		}
-	}
-
-	keys := slices.Sorted(maps.Keys(groups))
-	order := make([]int, 0, len(candidates))
-
-	for offset := 0; ; offset++ {
-		added := false
-
-		for _, key := range keys {
-			if offset >= len(groups[key]) {
-				continue
-			}
-
-			order = append(order, groups[key][offset])
-			added = true
-		}
-
-		if !added {
-			return order
-		}
-	}
-}
-
-func participantRoleTopologySatisfied(
-	candidates []corev1.Node,
-	assignments [][]string,
-	role string,
-	topology []signalv1.ParticipantTopologyConstraint,
-) bool {
-	for index := range topology {
-		if topology[index].Role != role {
-			continue
-		}
-
-		if !participantTopologyConstraintSatisfied(candidates, assignments, &topology[index]) {
-			return false
-		}
-	}
-
-	return true
-}
-
-func participantTopologySatisfied(
-	candidates []corev1.Node,
-	assignments [][]string,
-	topology []signalv1.ParticipantTopologyConstraint,
-) bool {
-	for constraintIndex := range topology {
-		if !participantTopologyConstraintSatisfied(
-			candidates,
-			assignments,
-			&topology[constraintIndex],
-		) {
-			return false
-		}
-	}
-
-	return true
-}
-
-func participantTopologyConstraintSatisfied(
-	candidates []corev1.Node,
-	assignments [][]string,
-	constraint *signalv1.ParticipantTopologyConstraint,
-) bool {
-	values := map[string]struct{}{}
-
-	for participantIndex := range candidates {
-		if !slices.Contains(assignments[participantIndex], constraint.Role) {
-			continue
-		}
-
-		value := candidates[participantIndex].Labels[constraint.LabelKey]
-		if value == "" {
-			return false
-		}
-
-		values[value] = struct{}{}
-	}
-
-	return int32(len(values)) >= constraint.MinDistinctValues
 }
 
 func nodeEligible(node *corev1.Node, required corev1.ResourceList) bool {
@@ -1142,7 +767,6 @@ func (r *AdmissionReconciler) createSnapshot(
 			GPUCount:              check.GPUCount,
 			ScriptEnvironment:     maps.Clone(check.ScriptEnvironment),
 			BackendActiveDeadline: check.BackendActiveDeadline,
-			ParticipantPolicy:     check.ParticipantPolicy,
 		}
 	}
 
@@ -1560,16 +1184,7 @@ func buildWorkflow(run *signalv1.CertificationRun) (*unstructured.Unstructured, 
 
 	for index := range checks {
 		check := &checks[index]
-
-		checkParticipants, _, participantErr := participantsForCheck(
-			run.Spec.Participants,
-			check.ParticipantPolicy,
-		)
-		if participantErr != nil {
-			return nil, fmt.Errorf("check %s participants: %w", check.ID, participantErr)
-		}
-
-		participantsJSON, marshalErr := json.Marshal(checkParticipants)
+		participantsJSON, marshalErr := json.Marshal(run.Spec.Participants)
 		if marshalErr != nil {
 			return nil, fmt.Errorf("encode check %s participants: %w", check.ID, marshalErr)
 		}
@@ -1595,7 +1210,7 @@ func buildWorkflow(run *signalv1.CertificationRun) (*unstructured.Unstructured, 
 				"parameters": checkWorkflowParameters(
 					run,
 					check,
-					checkParticipants,
+					run.Spec.Participants,
 					string(participantsJSON),
 					string(environmentJSON),
 					workloadPolicyJSON,
@@ -2112,20 +1727,7 @@ func terminalCheckStatuses(
 		status.Measurements = outputs["measurements"]
 		allowPartialBackendEvidence := status.Verdict == "Inconclusive" &&
 			status.Reason == "BackendSetupFailed"
-
-		_, globalIndexes, participantErr := participantsForCheck(
-			run.Spec.Participants,
-			check.ParticipantPolicy,
-		)
-		if participantErr != nil {
-			status.Phase = signalv1.CheckPhaseInconclusive
-			status.Verdict = "Inconclusive"
-			status.Reason = "ParticipantPolicyInvalid: " + participantErr.Error()
-			aggregateVerdict = "Inconclusive"
-			aggregateReason = "one or more checks had invalid participant policy"
-
-			continue
-		}
+		globalIndexes := participantIndexes(run.Spec.Participants)
 
 		normalizedEvidence, complete, evidenceErr := groupedBackendEvidenceForParticipants(
 			outputs["backend-evidence"],
@@ -3397,7 +2999,6 @@ func profileChecks(profile *signalv1.CertificationProfile) []signalv1.Certificat
 		checks[index].Order = int32(index)
 		checks[index].WorkloadPolicy = *profile.Spec.Checks[index].WorkloadPolicy.DeepCopy()
 		checks[index].ScriptEnvironment = maps.Clone(profile.Spec.Checks[index].ScriptEnvironment)
-		checks[index].ParticipantPolicy.Roles = slices.Clone(profile.Spec.Checks[index].ParticipantPolicy.Roles)
 	}
 
 	return checks
@@ -3408,12 +3009,7 @@ func validateCheckPlan(checks []signalv1.CertificationCheck, deadline time.Durat
 		return fmt.Errorf("must contain exactly %d checks", groupedCheckCount)
 	}
 
-	for index := range checks {
-		check := &checks[index]
-		if err := validateCheckParticipantPolicy(check.ID, check.ParticipantPolicy); err != nil {
-			return err
-		}
-
+	for range checks {
 		deadlines := make([]time.Duration, len(checks))
 		for index := range checks {
 			deadlines[index] = checks[index].BackendActiveDeadline.Duration
@@ -3478,110 +3074,13 @@ func fixedWorkflowOutputBytes() int64 {
 	return groupedCheckCount * perCheck
 }
 
-func validateCheckParticipantPolicy(id signalv1.CheckID, policy signalv1.CheckParticipantPolicy) error {
-	roles := make(map[string]struct{}, len(policy.Roles))
-	for _, role := range policy.Roles {
-		if role == "" {
-			return fmt.Errorf("check %s contains an empty participant role", id)
-		}
-
-		if _, duplicate := roles[role]; duplicate {
-			return fmt.Errorf("check %s repeats participant role %q", id, role)
-		}
-
-		roles[role] = struct{}{}
-	}
-
-	return nil
-}
-
-func validateParticipantConstraints(
-	profile *signalv1.CertificationProfile,
-	checks []signalv1.CertificationCheck,
-) error {
-	roles := make(map[string]struct{}, len(profile.Spec.ParticipantRoles))
-
-	var assigned int32
-
-	for index := range profile.Spec.ParticipantRoles {
-		role := &profile.Spec.ParticipantRoles[index]
-		if role.Name == "" || role.Count < 1 {
-			return fmt.Errorf("participant role %d has invalid name or count", index)
-		}
-
-		if _, duplicate := roles[role.Name]; duplicate {
-			return fmt.Errorf("duplicate participant role %q", role.Name)
-		}
-
-		if _, err := metav1.LabelSelectorAsSelector(&role.Selector); err != nil {
-			return fmt.Errorf("participant role %s selector: %w", role.Name, err)
-		}
-
-		roles[role.Name] = struct{}{}
-		assigned += role.Count
-	}
-
-	if len(profile.Spec.ParticipantRoles) > 0 && assigned != profile.Spec.Participants.Count {
-		return fmt.Errorf(
-			"participant roles require exactly %d assignments, got %d",
-			profile.Spec.Participants.Count,
-			assigned,
-		)
-	}
-
-	for index := range profile.Spec.TopologyConstraints {
-		constraint := &profile.Spec.TopologyConstraints[index]
-		if _, exists := roles[constraint.Role]; !exists {
-			return fmt.Errorf("topology constraint references unknown role %q", constraint.Role)
-		}
-
-		if constraint.LabelKey == "" || constraint.MinDistinctValues < 1 {
-			return fmt.Errorf("topology constraint %d has invalid label key or minimum", index)
-		}
-	}
-
-	for index := range checks {
-		for _, role := range checks[index].ParticipantPolicy.Roles {
-			if _, exists := roles[role]; !exists {
-				return fmt.Errorf("check %s references unknown participant role %q", checks[index].ID, role)
-			}
-		}
-	}
-
-	return nil
-}
-
-func participantsForCheck(
-	participants []signalv1.Participant,
-	policy signalv1.CheckParticipantPolicy,
-) ([]signalv1.Participant, []int32, error) {
-	included := make(map[string]struct{}, len(policy.Roles))
-	for _, role := range policy.Roles {
-		included[role] = struct{}{}
-	}
-
-	selected := make([]signalv1.Participant, 0, len(participants))
-
-	globalIndexes := make([]int32, 0, len(participants))
+func participantIndexes(participants []signalv1.Participant) []int32 {
+	indexes := make([]int32, len(participants))
 	for index := range participants {
-		participant := participants[index]
-		_, include := included[participant.Role]
-		include = len(included) == 0 || include
-
-		if !include {
-			continue
-		}
-
-		globalIndexes = append(globalIndexes, int32(index))
-		participant.Index = int32(len(selected))
-		selected = append(selected, participant)
+		indexes[index] = int32(index)
 	}
 
-	if len(selected) == 0 {
-		return nil, nil, errors.New("participant policy selected no participants")
-	}
-
-	return selected, globalIndexes, nil
+	return indexes
 }
 
 func sanitizeTaskName(value string) string {

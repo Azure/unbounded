@@ -64,15 +64,13 @@ certification suites:
 | `spec.participants.count` | Total Nodes selected for a Run |
 | `spec.participants.selector` | Labels every selected Node must match |
 | `spec.participants.minimumAllocatable` | Admission-time allocatable resource floor |
-| `spec.participantRoles` | Optional named role counts and role-specific selectors |
-| `spec.topologyConstraints` | Optional minimum topology diversity for a role |
 | `spec.checks` | Exactly 15 ordered checks; position defines R01 through R15 |
 | `spec.deadline` | Whole-suite deadline |
 
-If roles are configured, their counts must sum to the total participant count.
 The requesting Node is participant zero. The remaining participants are
 selected deterministically from currently ready, schedulable, unreserved
-Nodes.
+Nodes matching the participant selector and allocatable resource floor. Every
+check runs on this complete immutable participant set.
 
 Each check contains:
 
@@ -84,7 +82,6 @@ Each check contains:
 | `backendActiveDeadline` | Backend execution deadline |
 | `gpuCount` | GPU request; must be positive for MPIJob |
 | `scriptEnvironment` | At most 32 bounded, non-reserved environment values |
-| `participantPolicy.roles` | Optional included roles; omission means all participants |
 | `workloadPolicy` | Narrow container resources and host access policy |
 
 Workload policy is intentionally constrained:
@@ -130,8 +127,8 @@ Node name and UID.
 The Run spec snapshots:
 
 - Profile name, UID, and generation;
-- ordered participants with Node name, Node UID, admission-time allocatable
-  resources, optional role, and referenced topology values;
+- ordered participants with Node name, Node UID, and admission-time allocatable
+  resources;
 - the immutable script bundle name and UID;
 - 15 ordered check snapshots;
 - the suite deadline;

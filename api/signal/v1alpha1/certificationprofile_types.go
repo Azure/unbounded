@@ -15,33 +15,6 @@ type ScriptReference struct {
 
 type CheckID string
 
-type ParticipantRole struct {
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=63
-	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
-	Name string `json:"name"`
-	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:Maximum=64
-	Count int32 `json:"count"`
-	// Selector further constrains participants assigned to this role.
-	Selector metav1.LabelSelector `json:"selector,omitempty"`
-}
-
-type ParticipantTopologyConstraint struct {
-	// Role names the participant role whose selected Nodes are evaluated.
-	Role string `json:"role"`
-	// LabelKey is the Node label used to identify topology domains.
-	LabelKey string `json:"labelKey"`
-	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:Maximum=64
-	MinDistinctValues int32 `json:"minDistinctValues"`
-}
-
-type CheckParticipantPolicy struct {
-	// +kubebuilder:validation:MaxItems=16
-	Roles []string `json:"roles,omitempty"`
-}
-
 // +kubebuilder:validation:XValidation:rule="duration(self.backendActiveDeadline) > duration('0s')",message="backendActiveDeadline must be positive"
 // +kubebuilder:validation:XValidation:rule="!has(self.scriptEnvironment) || self.scriptEnvironment.all(k, size(k) <= 253 && size(self.scriptEnvironment[k]) <= 4096)",message="scriptEnvironment names must not exceed 253 characters and values must not exceed 4096 characters"
 type CertificationCheck struct {
@@ -55,9 +28,8 @@ type CertificationCheck struct {
 	// +kubebuilder:validation:Minimum=0
 	GPUCount int32 `json:"gpuCount,omitempty"`
 	// +kubebuilder:validation:MaxProperties=32
-	ScriptEnvironment     map[string]string      `json:"scriptEnvironment,omitempty"`
-	BackendActiveDeadline metav1.Duration        `json:"backendActiveDeadline"`
-	ParticipantPolicy     CheckParticipantPolicy `json:"participantPolicy,omitempty"`
+	ScriptEnvironment     map[string]string `json:"scriptEnvironment,omitempty"`
+	BackendActiveDeadline metav1.Duration   `json:"backendActiveDeadline"`
 }
 
 // +kubebuilder:validation:Enum=Pod;MPIJob
@@ -97,10 +69,6 @@ type WorkloadPolicy struct {
 // +kubebuilder:validation:XValidation:rule="self.checks.map(c, duration(c.backendActiveDeadline) + duration('60s')).sum() <= duration(self.deadline)",message="deadline must cover every sequential backendActiveDeadline plus 60 seconds of evidence time per check"
 type CertificationProfileSpec struct {
 	Participants ParticipantPolicy `json:"participants"`
-	// +kubebuilder:validation:MaxItems=16
-	ParticipantRoles []ParticipantRole `json:"participantRoles,omitempty"`
-	// +kubebuilder:validation:MaxItems=16
-	TopologyConstraints []ParticipantTopologyConstraint `json:"topologyConstraints,omitempty"`
 	// +kubebuilder:validation:MinItems=15
 	// +kubebuilder:validation:MaxItems=15
 	Checks   []CertificationCheck `json:"checks"`

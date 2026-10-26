@@ -69,14 +69,6 @@ spec:
                     gpuCount:
                       format: int32
                       type: integer
-                    participantPolicy:
-                      properties:
-                        roles:
-                          items:
-                            type: string
-                          maxItems: 16
-                          type: array
-                      type: object
                     runnerImage:
                       type: string
                     script:
@@ -224,13 +216,6 @@ spec:
                         don't ONLY use UUIDs, this is an alias to string.  Being a type captures
                         intent and helps make sure that UIDs and names do not get conflated.
                       type: string
-                    role:
-                      type: string
-                    topologyValues:
-                      additionalProperties:
-                        type: string
-                      maxProperties: 16
-                      type: object
                   required:
                   - nodeName
                   - nodeUID
