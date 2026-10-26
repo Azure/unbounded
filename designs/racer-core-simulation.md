@@ -6957,7 +6957,8 @@ requests, worst page, pages fetched more than once; then helper misses / helper 
   funding, and are unchanged.
 - 5k `full-failover` and `zipf` are identical: helpers do not run there (or, in `zipf`, never
   miss).
-- 50k `full-cold-start`: see below.
+- 50k `full-cold-start`: 912,774 / 0 to 912,776 / 0; origin 27,158, worst page 3, 194
+  pages fetched more than once, repeats identical; helper misses 28 / 129,891 to 0 / 129,730.
 
 Checks: `cargo fmt --check`, clippy `-D warnings`, workspace tests, DST seeds 1 to 20 native
 and non-native, 16-scenario smoke at 200 nodes (no invariant failures, `unexplained` 0).
