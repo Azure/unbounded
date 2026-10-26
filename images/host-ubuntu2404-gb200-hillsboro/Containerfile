@@ -1,0 +1,70 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+ARG SOURCE_IMAGE=ghcr.io/azure/host-ubuntu2404-gb200-nvidia-580167@sha256:39f4fd5312307ee2ef7ec5e236e420faa5d08e663853800d86fb6a3e162181bb
+ARG UBUNTU_IMAGE=docker.io/library/ubuntu@sha256:18b33ff3829707f31ada654a963b9ee35f2e6f0241b964bd17a22a9b330cb63d
+
+FROM ${SOURCE_IMAGE} AS source
+
+FROM ${UBUNTU_IMAGE} AS build
+ARG TARGETARCH
+ARG SSH_IMPORT_ID_VERSION=5.11-0ubuntu2.24.04.1
+ARG WGET_VERSION=1.21.4-1ubuntu4.5
+ENV LIBGUESTFS_BACKEND=direct \
+    LIBGUESTFS_BACKEND_SETTINGS=force_tcg
+
+RUN test "${TARGETARCH}" = arm64 && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+      cloud-init libguestfs-tools linux-image-virtual pigz python3-yaml && \
+    mkdir -p /packages && \
+    cd /packages && \
+    apt-get download \
+      "ssh-import-id=${SSH_IMPORT_ID_VERSION}" \
+      "wget=${WGET_VERSION}" && \
+    echo "97bb2840a271ee0573da934ce1811f961e4b844fe876e34602b4661db25135b5  ssh-import-id_${SSH_IMPORT_ID_VERSION}_all.deb" | sha256sum -c - && \
+    echo "ed71643b8873240cce1ac905b7993f3372436d39410894f413968f43839f84e6  wget_${WGET_VERSION}_arm64.deb" | sha256sum -c - && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=source /disk /disk
+COPY images/host-ubuntu2404-gb200-hillsboro/assets/ /usr/local/lib/hillsboro-image/
+COPY images/netboot/assets/vendor-data.tmpl /usr/local/lib/hillsboro-image/vendor-data.tmpl
+
+RUN python3 -m unittest discover \
+      -s /usr/local/lib/hillsboro-image -p test_verify.py && \
+    python3 /usr/local/lib/hillsboro-image/verify.py \
+      --image-config /usr/local/lib/hillsboro-image/90-hillsboro-users.cfg \
+      --vendor-template /usr/local/lib/hillsboro-image/vendor-data.tmpl && \
+    pigz --test /disk/disk.img.gz && \
+    pigz --decompress /disk/disk.img.gz && \
+    virt-customize --format raw -a /disk/disk.img --no-network \
+      --copy-in /packages:/tmp \
+      --copy-in /usr/local/lib/hillsboro-image/90-hillsboro-users.cfg:/etc/cloud/cloud.cfg.d \
+      --run /usr/local/lib/hillsboro-image/customize.sh && \
+    mkdir -p /verify && \
+    guestfish --ro --format=raw -a /disk/disk.img -i copy-out \
+      /etc/cloud/cloud.cfg.d/90-hillsboro-users.cfg /verify && \
+    guestfish --ro --format=raw -a /disk/disk.img -i copy-out \
+      /var/lib/dpkg/status /verify && \
+    guestfish --ro --format=raw -a /disk/disk.img -i copy-out \
+      /etc/machine-id /verify && \
+    cmp /usr/local/lib/hillsboro-image/90-hillsboro-users.cfg \
+      /verify/90-hillsboro-users.cfg && \
+    python3 /usr/local/lib/hillsboro-image/verify.py \
+      --image-config /verify/90-hillsboro-users.cfg \
+      --vendor-template /usr/local/lib/hillsboro-image/vendor-data.tmpl \
+      --dpkg-status /verify/status && \
+    test ! -s /verify/machine-id && \
+    ! guestfish --ro --format=raw -a /disk/disk.img -i ls /etc/ssh | grep -Eq '^ssh_host_.*_key$' && \
+    cp /usr/local/lib/hillsboro-image/image-inputs.json /disk/hillsboro-inputs.json && \
+    pigz -1 /disk/disk.img && \
+    pigz --test /disk/disk.img.gz && \
+    cd /disk && sha256sum disk.img.gz > disk.img.gz.sha256
+
+FROM scratch
+LABEL org.opencontainers.image.source="https://github.com/Azure/unbounded" \
+      org.opencontainers.image.description="Hillsboro Metalman Ubuntu 24.04 ARM64 GB200 host disk" \
+      io.unbounded.host.architecture="arm64" \
+      io.unbounded.host.base.digest="sha256:39f4fd5312307ee2ef7ec5e236e420faa5d08e663853800d86fb6a3e162181bb"
+COPY --from=build /disk /disk
+COPY LICENSE NOTICE /unbounded/licenses/
