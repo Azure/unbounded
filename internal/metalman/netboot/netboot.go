@@ -181,6 +181,8 @@ func (f *FileResolver) LookupNodeByIP(ctx context.Context, ip string) (*v1alpha3
 
 const userDataPath = "cloud-init/user-data"
 
+const hillsboroImageRepository = "ghcr.io/azure/host-ubuntu2404-gb200-hillsboro"
+
 // defaultUserData is the minimal cloud-config returned when no custom
 // user-data ConfigMap is configured on the Machine.
 const defaultUserData = "#cloud-config\n"
@@ -311,40 +313,58 @@ func (f *FileResolver) resolveUserDataFromConfigMap(ctx context.Context, node *v
 }
 
 type templateData struct {
-	Machine          *v1alpha3.Machine
-	BootLease        *v1alpha3.DHCPLease
-	ApiserverURL     string
-	ServeURL         string
-	AgentConfigJSON  string
-	InstallScript    string
-	InstallEnv       []string
-	InstallRequested bool
-	VirtualMedia     bool
-	ArtifactRoot     string
-	MediaCallbackURL string
+	Machine            *v1alpha3.Machine
+	BootLease          *v1alpha3.DHCPLease
+	ApiserverURL       string
+	ServeURL           string
+	AgentConfigJSON    string
+	InstallScript      string
+	InstallEnv         []string
+	InstallRequested   bool
+	VirtualMedia       bool
+	ArtifactRoot       string
+	MediaCallbackURL   string
+	PreserveImageUsers bool
 }
 
 func newTemplateData(node *v1alpha3.Machine, ci ClusterInfo, serveURL, agentConfigJSON, requestIP string, installRequested bool) templateData {
 	var (
-		agent     *v1alpha3.AgentSpec
-		bootLease *v1alpha3.DHCPLease
+		agent              *v1alpha3.AgentSpec
+		bootLease          *v1alpha3.DHCPLease
+		preserveImageUsers bool
 	)
 
 	if node != nil {
 		agent = node.Spec.Agent
 		bootLease = selectBootLease(node, requestIP)
+		if netboot := node.Spec.Netboot(); netboot != nil {
+			preserveImageUsers = preservesImageUsers(netboot.Image)
+		}
 	}
 
 	return templateData{
-		Machine:          node,
-		BootLease:        bootLease,
-		ApiserverURL:     ci.ApiserverURL,
-		ServeURL:         serveURL,
-		AgentConfigJSON:  agentConfigJSON,
-		InstallScript:    provision.UnboundedAgentInstallScript(),
-		InstallEnv:       provision.AgentInstallEnv(agent),
-		InstallRequested: installRequested,
+		Machine:            node,
+		BootLease:          bootLease,
+		ApiserverURL:       ci.ApiserverURL,
+		ServeURL:           serveURL,
+		AgentConfigJSON:    agentConfigJSON,
+		InstallScript:      provision.UnboundedAgentInstallScript(),
+		InstallEnv:         provision.AgentInstallEnv(agent),
+		InstallRequested:   installRequested,
+		PreserveImageUsers: preserveImageUsers,
 	}
+}
+
+func preservesImageUsers(imageRef string) bool {
+	repository := imageRef
+	if index := strings.IndexByte(repository, '@'); index >= 0 {
+		repository = repository[:index]
+	}
+	if colon := strings.LastIndexByte(repository, ':'); colon > strings.LastIndexByte(repository, '/') {
+		repository = repository[:colon]
+	}
+
+	return repository == hillsboroImageRepository
 }
 
 func selectBootLease(node *v1alpha3.Machine, requestIP string) *v1alpha3.DHCPLease {
