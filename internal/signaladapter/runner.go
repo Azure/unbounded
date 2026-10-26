@@ -347,6 +347,7 @@ func expandResults(resourceResults []Result, resources []createdResource) []Resu
 	}
 
 	results := make([]Result, 0, total)
+
 	for index := range resources {
 		for _, participantIndex := range resources[index].participantIndexes {
 			result := resourceResults[index]
