@@ -168,7 +168,7 @@ spec:
                 properties:
                   count:
                     format: int32
-                    maximum: 64
+                    maximum: 8
                     minimum: 1
                     type: integer
                   minimumAllocatable:

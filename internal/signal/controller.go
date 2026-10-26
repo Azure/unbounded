@@ -195,12 +195,12 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 	}
 
 	for index := range checks {
-		if len(participants) > signaladapter.MaxCheckParticipants {
+		if len(participants) > signaladapter.MaxParticipants {
 			return fmt.Errorf(
 				"check %s selects %d participants, maximum is %d",
 				checks[index].ID,
 				len(participants),
-				signaladapter.MaxCheckParticipants,
+				signaladapter.MaxParticipants,
 			)
 		}
 
@@ -434,8 +434,12 @@ func (r *AdmissionReconciler) selectParticipants(
 		return nil, fmt.Errorf("profile %s participant count must be positive", profile.Name)
 	}
 
-	if count > 64 {
-		return nil, fmt.Errorf("profile %s participant count must not exceed 64", profile.Name)
+	if count > signaladapter.MaxParticipants {
+		return nil, fmt.Errorf(
+			"profile %s participant count must not exceed %d",
+			profile.Name,
+			signaladapter.MaxParticipants,
+		)
 	}
 
 	reader := r.APIReader
@@ -1978,8 +1982,11 @@ func backendResourceReferences(
 	_ string,
 	allowPartial bool,
 ) ([]signalv1.BackendResourceReference, error) {
-	if participantCount < 1 || participantCount > 64 {
-		return nil, fmt.Errorf("participant count must be between 1 and 64")
+	if participantCount < 1 || participantCount > signaladapter.MaxParticipants {
+		return nil, fmt.Errorf(
+			"participant count must be between 1 and %d",
+			signaladapter.MaxParticipants,
+		)
 	}
 
 	if value == "" {
@@ -1999,8 +2006,11 @@ func backendResourceReferences(
 		return nil, fmt.Errorf("backend-resources contains trailing JSON values")
 	}
 
-	if len(references) == 0 || len(references) > 64 {
-		return nil, fmt.Errorf("backend-resources must contain between 1 and 64 entries")
+	if len(references) == 0 || len(references) > signaladapter.MaxParticipants {
+		return nil, fmt.Errorf(
+			"backend-resources must contain between 1 and %d entries",
+			signaladapter.MaxParticipants,
+		)
 	}
 
 	identities := make(map[string]struct{}, len(references))

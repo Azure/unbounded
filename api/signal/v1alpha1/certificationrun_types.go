@@ -47,7 +47,7 @@ type BackendResourceReference struct {
 	Name string    `json:"name"`
 	UID  types.UID `json:"uid"`
 	// +kubebuilder:validation:MinItems=1
-	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:MaxItems=8
 	ParticipantIndexes []int32 `json:"participantIndexes"`
 }
 
@@ -94,7 +94,7 @@ type CertificationCheckSnapshot struct {
 type CertificationRunSpec struct {
 	Profile PinnedProfile `json:"profile"`
 	// +kubebuilder:validation:MinItems=1
-	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:MaxItems=8
 	Participants []Participant         `json:"participants"`
 	ScriptBundle ScriptBundleReference `json:"scriptBundle"`
 	// +kubebuilder:validation:MinItems=15
@@ -156,7 +156,7 @@ type CheckStatus struct {
 	Reason string `json:"reason,omitempty"`
 	// +kubebuilder:validation:MaxLength=16384
 	Measurements string `json:"measurements,omitempty"`
-	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:MaxItems=8
 	BackendResources []BackendResourceReference `json:"backendResources,omitempty"`
 	BackendEvidence  BackendEvidenceStatus      `json:"backendEvidence,omitempty"`
 	StartedAt        *metav1.Time               `json:"startedAt,omitempty"`

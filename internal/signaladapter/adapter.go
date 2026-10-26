@@ -27,8 +27,7 @@ import (
 )
 
 const (
-	MaxParticipants         = 64
-	MaxCheckParticipants    = 8
+	MaxParticipants         = 8
 	MaxReasonBytes          = 512
 	MaxMeasurementsBytes    = 16 * 1024
 	MaxBackendOutputBytes   = 8 * 1024
@@ -100,8 +99,8 @@ func ParseParticipants(
 	participantsJSON string,
 	participantCount int,
 ) ([]signalv1.Participant, error) {
-	if participantCount < 1 || participantCount > MaxCheckParticipants {
-		return nil, fmt.Errorf("participant-count must be between 1 and %d", MaxCheckParticipants)
+	if participantCount < 1 || participantCount > MaxParticipants {
+		return nil, fmt.Errorf("participant-count must be between 1 and %d", MaxParticipants)
 	}
 
 	if strings.TrimSpace(participantsJSON) == "" {

@@ -206,7 +206,7 @@ spec:
                   - nodeName
                   - nodeUID
                   type: object
-                maxItems: 64
+                maxItems: 8
                 minItems: 1
                 type: array
               profile:
@@ -300,7 +300,7 @@ spec:
                             items:
                               format: int32
                               type: integer
-                            maxItems: 64
+                            maxItems: 8
                             minItems: 1
                             type: array
                           uid:
@@ -314,7 +314,7 @@ spec:
                         - participantIndexes
                         - uid
                         type: object
-                      maxItems: 64
+                      maxItems: 8
                       type: array
                     finishedAt:
                       format: date-time
