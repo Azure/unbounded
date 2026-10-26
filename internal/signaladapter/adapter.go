@@ -1202,32 +1202,6 @@ func validateBackendCoverage(
 	return nil
 }
 
-func decodeJSONObject[T any](content string, destination *T) error {
-	if strings.TrimSpace(content) == "" {
-		content = "[]"
-		if _, ok := any(destination).(*map[string]string); ok {
-			content = "{}"
-		}
-	}
-
-	decoder := json.NewDecoder(strings.NewReader(content))
-	decoder.DisallowUnknownFields()
-
-	if err := decoder.Decode(destination); err != nil {
-		return err
-	}
-
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return errors.New("contains trailing JSON values")
-		}
-
-		return err
-	}
-
-	return nil
-}
 
 func resourceLabels(config Config, participant signalv1.Participant) map[string]string {
 	return map[string]string{
