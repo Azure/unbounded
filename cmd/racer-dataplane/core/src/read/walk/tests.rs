@@ -2511,3 +2511,83 @@ fn a_shed_demoted_rank0_never_grows_budgets_per_hop() {
         }
     }
 }
+
+/// Known issue 59, the bound: an owner funded at its minimum
+/// ([`shared_share_short`]: `owner_funding_min(c) - 1` remote credits)
+/// asks each predecessor copy-only, never delegates, and ends with at most
+/// one origin attempt, only under the authority rules every owner follows:
+/// no origin after a copy, after rank 0 left it unanswered while presumed
+/// fetching (Known issue 31), or after rank 0 failed while this owner's own
+/// origin request failed recently (Known issue 52). The funding adds origin
+/// requests only where such an owner had authority and previously no credit
+/// to use it.
+#[test]
+fn a_minimum_funded_owner_fetches_at_most_once_and_only_with_authority() {
+    for rank in [1usize, 2] {
+        let credits = owner_funding_min(rank) - 1;
+        let cases = [
+            (Rank0State::Unknown, Outcome::Copy, false),
+            (
+                Rank0State::Unknown,
+                Outcome::Probe(ProbeOutcome::CopyMiss),
+                true,
+            ),
+            (
+                Rank0State::Unknown,
+                Outcome::Transport(ProbeOutcome::Unreachable),
+                true,
+            ),
+            (
+                Rank0State::Unknown,
+                Outcome::Probe(ProbeOutcome::Unreachable),
+                true,
+            ),
+            (Rank0State::Unknown, Outcome::Failed, true),
+            (Rank0State::Failed, Outcome::Failed, false),
+            (Rank0State::Unknown, Outcome::TimedOut, false),
+            (Rank0State::Fetching, Outcome::TimedOut, false),
+        ];
+        for (state, rank0, origin) in cases {
+            let mut walk = CandidateWalk::new(WalkConfig {
+                rank0: state,
+                ..config(Some(rank), 3, VisitOrder::canonical(3))
+            });
+            let mut b = budget(credits, 7);
+            let mut probes = Vec::new();
+            let end = loop {
+                match walk.next(&mut b).unwrap() {
+                    Step::Probe(p) => {
+                        // Spend each probe's exchange as the caller would.
+                        charge(&mut walk, &mut b, &p);
+                        probes.push(p);
+                        let result = if p.canonical == 0 {
+                            rank0
+                        } else {
+                            Outcome::Probe(ProbeOutcome::CopyMiss)
+                        };
+                        if let Some(end) = walk.complete(&mut b, result).unwrap() {
+                            break end;
+                        }
+                    }
+                    Step::Granted(_) => panic!("no granted probes configured"),
+                    Step::End(end) => break end,
+                }
+            };
+            let what = format!("rank {rank} {state:?} {rank0:?}: {end:?}");
+            // One copy-only probe per predecessor asked, never a delegation.
+            assert!(probes.iter().all(|p| p.mode == Mode::CopyOnly), "{what}");
+            assert!(probes.len() <= rank, "{what}");
+            if origin {
+                assert!(
+                    matches!(end, End::Origin { rank: r, .. } if r == rank),
+                    "{what}"
+                );
+                // Exactly the owner's own origin attempt is left.
+                assert_eq!(b.remaining_attempts(), 1, "{what}");
+                assert_eq!(probes.len(), rank, "{what}");
+            } else {
+                assert!(!matches!(end, End::Origin { .. }), "{what}");
+            }
+        }
+    }
+}

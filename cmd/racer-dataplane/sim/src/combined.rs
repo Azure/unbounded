@@ -536,6 +536,13 @@ mod tests {
                 n(&o["max_requests_per_page"]) <= without + n(&o["max_failure_retries_per_page"]),
                 "{o}"
             );
+            // Known issue 59: owners funded at their minimum
+            // (`walk::shared_share_short`) fetch only with the authority
+            // every owner has, so their requests land in the classes above
+            // (a new page, a retry after a failure, a skip or its orphan)
+            // and never in the one held class that means a copy was
+            // answered as missing.
+            assert_eq!(n(&repeats["held"]["missed"]), 0, "{o}");
         }
     }
 
