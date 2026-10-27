@@ -177,7 +177,7 @@ impl PageSource for DirectorySource {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     //! `DirectoryBackend` and `DirectorySource` over the real read path, with
     //! only the origin adapter scripted.
 
@@ -194,7 +194,7 @@ mod tests {
     use crate::test_support::ReadWorker;
     use crate::ublk::service::PageBytes;
 
-    const NAME: &str = "ublk-directory";
+    pub(crate) const NAME: &str = "ublk-directory";
     const LENGTH: u64 = 3000;
 
     fn etag(value: &[u8]) -> StrongEtag {
@@ -213,7 +213,7 @@ mod tests {
         }
     }
 
-    fn metadata(etag_value: &[u8]) -> ObjectMetadata {
+    fn metadata(etag_value: &[u8], length: u64) -> ObjectMetadata {
         ObjectMetadata {
             content_type: None,
             version: ObjectVersion {
@@ -223,7 +223,7 @@ mod tests {
                 },
                 etag: etag(etag_value),
             },
-            length: LENGTH,
+            length,
             expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
         }
     }
@@ -232,7 +232,7 @@ mod tests {
         (0..LENGTH).map(|i| (i * 7 % 251) as u8).collect()
     }
 
-    fn device(cache: &str, etag_value: Option<&[u8]>) -> UblkDeviceConfig {
+    pub(crate) fn device(cache: &str, etag_value: Option<&[u8]>) -> UblkDeviceConfig {
         UblkDeviceConfig {
             cache: cache.into(),
             key: CacheKey([5; 32]),
@@ -241,14 +241,24 @@ mod tests {
         }
     }
 
-    struct Fixture {
-        worker: ReadWorker,
-        reactor: Rc<Reactor>,
-        backend: Rc<DirectoryBackend>,
+    /// One read worker whose origin serves a single object of the cache
+    /// `NAME`, and a backend over it.
+    pub(crate) struct Fixture {
+        pub worker: ReadWorker,
+        pub reactor: Rc<Reactor>,
+        pub backend: Rc<DirectoryBackend>,
     }
 
     impl Fixture {
         fn new() -> Self {
+            let fixture = Self::object(LENGTH);
+            fixture.worker.origin.set_body(body());
+            fixture
+        }
+
+        /// An object of `length` bytes. Each page holds its page number in
+        /// every byte unless the caller sets a body.
+        pub(crate) fn object(length: u64) -> Self {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
@@ -259,13 +269,12 @@ mod tests {
             ));
             let worker = ReadWorker::new(
                 definition(),
-                metadata(b"\"v1\""),
+                metadata(b"\"v1\"", length),
                 admission,
                 reactor.clone(),
                 delivery,
                 1,
             );
-            worker.origin.set_body(body());
             let backend = Rc::new(DirectoryBackend {
                 directory: worker.directory.clone(),
                 snapshots: worker.snapshots.clone(),
@@ -387,7 +396,10 @@ mod tests {
         let config = device(NAME, None);
         let resolved = fixture.resolve(&config).unwrap();
         let source = fixture.backend.source(&config, &resolved).unwrap();
-        fixture.worker.origin.set_version(metadata(b"\"v2\""));
+        fixture
+            .worker
+            .origin
+            .set_version(metadata(b"\"v2\"", LENGTH));
         let result = fixture.run(source.page(0));
         assert_eq!(result.err(), Some(Error::VersionUnavailable));
     }

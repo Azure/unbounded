@@ -446,3 +446,127 @@ fn ublk_worker_queues_serve_reads() {
         char_path.display()
     );
 }
+
+/// Bytes of the directory-backed object: each page holds its page number.
+fn directory_expected(length: u64, offset: u64, len: usize) -> Vec<u8> {
+    (offset..offset + len as u64)
+        .map(|at| {
+            if at < length {
+                (at / PAGE_BYTES) as u8
+            } else {
+                0
+            }
+        })
+        .collect()
+}
+
+/// The full production read path behind a device: one worker serves the
+/// only queue through `DirectorySource`, `WorkerDirectory`, and a scripted
+/// origin, and reads through `/dev/ublkbN` match the origin object.
+#[test]
+fn ublk_device_serves_the_directory_read_path() {
+    use super::directory::tests::{Fixture, NAME, device};
+
+    if !enabled() {
+        return;
+    }
+    const LENGTH: u64 = 2 * PAGE_BYTES + 5000;
+    let config = crate::config::UblkConfig {
+        devices: vec![device(NAME, None)],
+        queue_depth: DEPTH,
+        max_io_bytes: MAX_IO,
+    };
+    let manager = Arc::new(super::manager::Manager::new(
+        &config,
+        1,
+        Path::new("/dev"),
+        Duration::from_secs(10),
+        Duration::from_secs(10),
+    ));
+    let done = Arc::new(AtomicBool::new(false));
+    let worker = {
+        let manager = manager.clone();
+        let done = done.clone();
+        thread::spawn(move || {
+            let fixture = Fixture::object(LENGTH);
+            let mut ublk = super::worker::UblkWorker::new(
+                0,
+                manager,
+                fixture.backend.clone(),
+                fixture.reactor.clone(),
+            );
+            let _queue = fixture.worker.drivers.enter();
+            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            while !(done.load(Ordering::Relaxed) && ublk.is_idle()) {
+                ublk.poll(&mut cx);
+                fixture.worker.poll(&mut cx);
+                fixture.reactor.poll_budgeted(64).expect("reactor poll");
+                fixture
+                    .reactor
+                    .wait(Duration::from_millis(1))
+                    .expect("reactor wait");
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while fixture.reactor.in_flight() > 0 && Instant::now() < deadline {
+                fixture.worker.poll(&mut cx);
+                fixture.reactor.poll_budgeted(64).expect("reactor poll");
+                fixture
+                    .reactor
+                    .wait(Duration::from_millis(1))
+                    .expect("reactor wait");
+            }
+        })
+    };
+    let control = {
+        let manager = manager.clone();
+        thread::spawn(move || manager.run())
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let id = loop {
+        if let Some(id) = manager.dev_id(0) {
+            break id;
+        }
+        assert!(Instant::now() < deadline, "device was not added");
+        thread::sleep(Duration::from_millis(10));
+    };
+    eprintln!("ublk directory test: device {id}");
+    let block_path = Path::new("/dev").join(format!("ublkb{id}"));
+    assert!(
+        wait_for(&block_path),
+        "{} did not appear",
+        block_path.display()
+    );
+    let block = loop {
+        match File::open(&block_path) {
+            Ok(block) => break block,
+            Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Err(error) => panic!("open {}: {error}", block_path.display()),
+        }
+    };
+    let size = LENGTH.div_ceil(512) * 512;
+    for (offset, len) in [
+        (0_u64, 4096_usize),
+        (PAGE_BYTES - 4096, 8192),
+        (2 * PAGE_BYTES - 1000, 6000),
+        (size - 512, 512),
+    ] {
+        let mut buf = vec![0xaa_u8; len];
+        block.read_exact_at(&mut buf, offset).expect("pread");
+        assert!(
+            buf == directory_expected(LENGTH, offset, len),
+            "mismatch at {offset}+{len}"
+        );
+    }
+    drop(block);
+
+    manager.request_stop();
+    control.join().expect("control thread");
+    assert!(manager.control_done());
+    done.store(true, Ordering::Relaxed);
+    worker.join().expect("worker thread");
+    assert!(
+        wait_gone(&block_path),
+        "{} still present",
+        block_path.display()
+    );
+}
