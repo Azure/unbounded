@@ -97,3 +97,35 @@ func TestInvalidDataplaneConfigKeepsDaemonSet(t *testing.T) {
 	require.ErrorContains(t, err, "RACER_GPU_STAGING_BYTES")
 	require.Equal(t, before, liveDataplane(t, env).Spec.Template.Annotations[dataplaneConfigHash])
 }
+
+func TestDataplaneCUDAImage(t *testing.T) {
+	env := testEnv(t, cacheObject("cache"))
+	initialize(t, env)
+
+	image := func() string { return liveDataplane(t, env).Spec.Template.Spec.Containers[0].Image }
+	require.Equal(t, "mirror.test/unbounded/racer-dataplane:v1", image())
+
+	set := func(value string) {
+		config := &corev1.ConfigMap{}
+		require.NoError(t, env.Client.Get(t.Context(), objectKey(env, dataplaneConfigName), config))
+		config.Data[CUDAKey] = value
+		require.NoError(t, env.Client.Update(t.Context(), config))
+	}
+
+	set("true")
+	persist(t, env, planPass(t, env))
+	require.Equal(t, "mirror.test/unbounded/racer-dataplane-cuda:v1", image())
+
+	set("false")
+	persist(t, env, planPass(t, env))
+	require.Equal(t, "mirror.test/unbounded/racer-dataplane:v1", image())
+
+	// An invalid value fails the plan and leaves the running image alone.
+	for _, value := range []string{"", "TRUE", "yes", "1"} {
+		set(value)
+
+		_, _, err := (Component{}).Plan(t.Context(), env, nil)
+		require.ErrorContains(t, err, CUDAKey, "value %q", value)
+		require.Equal(t, "mirror.test/unbounded/racer-dataplane:v1", image())
+	}
+}

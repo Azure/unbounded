@@ -97,7 +97,7 @@ func planDataplane(ctx context.Context, env *component.Env, plan *component.Plan
 
 	plan.Add(op)
 
-	cfg := workload.DefaultConfig(env.Namespace, env.Config.Image(dataplaneImageName), env.Config.Image(objectImageName))
+	cfg := workload.DefaultConfig(env.Namespace, dataplaneImage(env.Config.Image, config.Data), env.Config.Image(objectImageName))
 	// The NVIDIA mode changes the Pod shape, not only its environment, so it
 	// is read here rather than left to the ConfigMap import.
 	cfg.NVIDIA = workload.NVIDIAInjection(config.Data[workload.NVIDIAKey])

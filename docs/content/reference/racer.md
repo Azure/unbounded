@@ -795,6 +795,8 @@ only when a cache exists again.
 | Setting in `racer-dataplane-config` | Default | Purpose |
 |------------------------------------|---------|---------|
 | `RACER_CONTROL_SEATS` | `auto` | Choose the number of control seats automatically, or request 1 to 16 |
+| `RACER_DATAPLANE_CUDA` | `false` | `true` runs image `racer-dataplane-cuda` instead of `racer-dataplane`; see [GPU reads](#gpu-reads) |
+| `RACER_DATAPLANE_NVIDIA` | `env` | How the dataplane asks for NVIDIA driver libraries: `off`, `env`, or `cdi`; see [GPU reads](#gpu-reads) |
 
 Set `RACER_CONTROL_SEATS` in `racer-dataplane-config` to `auto` (the default) or
 an integer from 1 to 16. The active count cannot exceed the eligible node count.
@@ -1035,7 +1037,13 @@ container already sets `RACER_SOCKET` or mounts that path.
 GPU reads let a client on the node read an object straight into its own NVIDIA
 GPU memory. They need:
 
-- A dataplane image built with `--build-arg RACER_NATIVE_CUDA=true`.
+- The CUDA dataplane image. Release and nightly builds publish
+  `racer-dataplane-cuda` next to `racer-dataplane`, built with
+  `--build-arg RACER_NATIVE_CUDA=true`. Set `RACER_DATAPLANE_CUDA: "true"` in
+  `racer-dataplane-config` and the operator runs
+  `<registry>/racer-dataplane-cuda:<tag>`, with the same registry and tag as
+  its other images. To run your own build, push it as `racer-dataplane-cuda`
+  to the operator's registry, or override the DaemonSet container image.
 - An NVIDIA node set up by the unbounded agent, which installs the NVIDIA
   container runtime and a CDI spec.
 - `RACER_ENABLE_GPU` in `racer-dataplane-config`. `auto` turns GPU mode off
