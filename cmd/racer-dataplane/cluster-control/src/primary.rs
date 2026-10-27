@@ -1182,6 +1182,40 @@ mod tests {
     }
 
     #[test]
+    fn webhook_trust_patched_into_every_webhook() {
+        crate::kube::fake::run(|api, kube| async move {
+            let shared = crate::shared::tests::shared(kube);
+            let mwc = paths::webhook_configuration();
+            let slice = paths::endpoint_slice(&shared.config.namespace);
+            api.put_object(&mwc, json!({"metadata":{"name":"racer-object-sidecar-injector"},"webhooks":[
+                {"name":"a.racer","clientConfig":{"service":{"name":"racer-webhook"}}},
+                {"name":"b.racer","clientConfig":{"service":{"name":"racer-webhook"},"caBundle":"c3RhbGU="}}]}));
+            api.put_object(&slice, json!({"metadata":{"name":"racer-webhook"},"addressType":"IPv4","ports":[{"port":9443}],"endpoints":[]}));
+            let seat = WebhookSeat {
+                pod: "racer-dataplane-1".into(),
+                uid: "u1".into(),
+                ips: vec!["10.0.0.1".parse().unwrap()],
+                ca: keyring::tests::root(1),
+            };
+            let yes = || true;
+            reconcile_webhook(
+                &shared,
+                std::slice::from_ref(&seat),
+                &RetiredTrust::default(),
+                Instant::now(),
+                &yes,
+            )
+            .await
+            .unwrap();
+            let v = api.object(&mwc).unwrap();
+            let first = v["webhooks"][0]["clientConfig"]["caBundle"].clone();
+            assert_eq!(first, v["webhooks"][1]["clientConfig"]["caBundle"]);
+            let pem = parse_pem(&STANDARD.decode(first.as_str().unwrap()).unwrap());
+            assert!(pem.contains(&seat.ca));
+        });
+    }
+
+    #[test]
     fn webhook_expiry_during_read_prevents_the_first_write() {
         crate::kube::fake::run(|api, kube| async move {
             let shared = crate::shared::tests::shared(kube);

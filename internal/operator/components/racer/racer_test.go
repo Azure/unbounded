@@ -694,12 +694,15 @@ func TestDataplaneNVIDIAConfig(t *testing.T) {
 	persist(t, env, planPass(t, env))
 	require.Equal(t, workload.CDIAllGPUs, liveDataplane(t, env).Spec.Template.Annotations[workload.CDIAnnotation])
 
-	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, dataplaneConfigName), config))
-	config.Data[workload.NVIDIAKey] = "auto"
-	require.NoError(t, env.Client.Update(t.Context(), config))
+	// A present but empty value is not the default; only an absent key is.
+	for _, value := range []string{"auto", "", "true", "CDI"} {
+		require.NoError(t, env.Client.Get(t.Context(), objectKey(env, dataplaneConfigName), config))
+		config.Data[workload.NVIDIAKey] = value
+		require.NoError(t, env.Client.Update(t.Context(), config))
 
-	_, _, err := (Component{}).Plan(t.Context(), env, nil)
-	require.ErrorContains(t, err, workload.NVIDIAKey)
+		_, _, err := (Component{}).Plan(t.Context(), env, nil)
+		require.ErrorContains(t, err, workload.NVIDIAKey, "value %q", value)
+	}
 }
 
 func TestValidateDataplaneOverride(t *testing.T) {

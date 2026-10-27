@@ -250,6 +250,19 @@ mod tests {
     }
 
     #[test]
+    fn priority_change_republishes_without_membership_change() {
+        let p1 = prepare(&Record::default(), C, [member(1, 4)], vec![cache()]).unwrap();
+        let mut edited = cache();
+        edited.priority = 900;
+        let p2 = prepare(&p1.record, C, [member(1, 4)], vec![edited]).unwrap();
+        assert_eq!(p2.record.sequence, p1.record.sequence + 1);
+        assert_ne!(p2.record.content_hash, p1.record.content_hash);
+        assert_eq!(p2.record.membership_version, p1.record.membership_version);
+        assert_eq!(p2.record.membership_hash, p1.record.membership_hash);
+        assert_eq!(p2.publication.caches[0].priority, 900);
+    }
+
+    #[test]
     fn failover_never_reuses_counters() {
         let committed = prepare(&Record::default(), C, [member(1, 4)], vec![])
             .unwrap()

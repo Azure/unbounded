@@ -78,6 +78,29 @@ mod tests {
     }
 
     #[test]
+    fn mixed_priorities_sorted_by_uid() {
+        let with = |uid: &str, name: &str, priority: Option<i64>| CacheInfo {
+            priority,
+            ..c(uid, name)
+        };
+        let out = build(&[
+            with("33333333-3333-4333-8333-333333333333", "max", Some(1000)),
+            with("11111111-1111-4111-8111-111111111111", "min", Some(0)),
+            with("22222222-2222-4222-8222-222222222222", "unset", None),
+        ])
+        .unwrap();
+        let got: Vec<_> = out.iter().map(|d| (d.name.as_str(), d.priority)).collect();
+        assert_eq!(
+            got,
+            [
+                ("min", 0),
+                ("unset", wire::DEFAULT_PRIORITY),
+                ("max", wire::MAX_PRIORITY)
+            ]
+        );
+    }
+
+    #[test]
     fn priority_defaults_and_bounds() {
         let u = "11111111-1111-4111-8111-111111111111";
         let info = CacheInfo::from_json(
