@@ -162,8 +162,12 @@ RUN set -eu; \
 # adapter and CUDA shim under /usr/local/lib where the dynamic loader finds it by soname.
 COPY --from=builder /out/ /
 COPY LICENSE NOTICE /unbounded/licenses/
+# cuFile reads its configuration from CUFILE_ENV_PATH_JSON. Images built
+# without CUDA never load cuFile, so the file and variable are inert there.
+COPY images/racer-dataplane/cufile.json /etc/racer/cufile.json
 RUN ldconfig
 
+ENV CUFILE_ENV_PATH_JSON=/etc/racer/cufile.json
 ENV PATH="/unbounded/bin:${PATH}"
 
 WORKDIR /unbounded

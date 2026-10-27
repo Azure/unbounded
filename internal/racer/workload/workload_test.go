@@ -262,6 +262,25 @@ func TestNVIDIAInjectionModes(t *testing.T) {
 				t.Fatalf("udev volume/mount = %v/%v, want %v", hasUdevVolume, hasUdevMount, tc.wantEnv)
 			}
 
+			// cuFile writes its log to an emptyDir on the read-only root.
+			hasLogVolume, hasLogMount := false, false
+
+			for _, volume := range template.Spec.Volumes {
+				if volume.Name == "cufile-log" {
+					hasLogVolume = volume.EmptyDir != nil && volume.EmptyDir.SizeLimit != nil && volume.EmptyDir.SizeLimit.String() == CUFileLogSizeLimit
+				}
+			}
+
+			for _, mount := range container.VolumeMounts {
+				if mount.Name == "cufile-log" {
+					hasLogMount = mount.MountPath == CUFileLogDirectory && !mount.ReadOnly
+				}
+			}
+
+			if hasLogVolume != tc.wantEnv || hasLogMount != tc.wantEnv {
+				t.Fatalf("cufile-log volume/mount = %v/%v, want %v", hasLogVolume, hasLogMount, tc.wantEnv)
+			}
+
 			// GPU libraries must never come from a GPU resource request.
 			for _, list := range []corev1.ResourceList{container.Resources.Requests, container.Resources.Limits} {
 				if _, ok := list["nvidia.com/gpu"]; ok {

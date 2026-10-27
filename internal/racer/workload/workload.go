@@ -58,10 +58,10 @@ const (
 type NVIDIAInjection string
 
 const (
-	// NVIDIAOff adds no NVIDIA env, CDI annotation, or /run/udev mount.
+	// NVIDIAOff adds no NVIDIA env, CDI annotation, /run/udev mount, or cuFile log volume.
 	NVIDIAOff NVIDIAInjection = "off"
 	// NVIDIAEnv sets NVIDIA_VISIBLE_DEVICES and NVIDIA_DRIVER_CAPABILITIES and
-	// mounts /run/udev for cuFile.
+	// mounts /run/udev and a cuFile log emptyDir for cuFile.
 	// The NVIDIA container runtime acts on the variables; runc ignores them, so they
 	// are harmless on nodes without NVIDIA.
 	NVIDIAEnv NVIDIAInjection = "env"
@@ -80,6 +80,15 @@ const (
 	CDIAnnotation = "cdi.k8s.io/racer-dataplane"
 	// CDIAllGPUs is the fully qualified CDI name for every GPU on the node.
 	CDIAllGPUs = "nvidia.com/gpu=all"
+)
+
+const (
+	// CUFileLogDirectory is the logging.dir of the cufile.json in the
+	// dataplane image (images/racer-dataplane/cufile.json).
+	CUFileLogDirectory = "/var/log/cufile"
+	// CUFileLogSizeLimit bounds the cuFile log emptyDir. cuFile logs at
+	// ERROR level only, so this is far above normal use.
+	CUFileLogSizeLimit = "64Mi"
 )
 
 // ErrInvalid reports an invalid workload configuration.
@@ -288,6 +297,8 @@ func dataplaneVolumes(c Config) []corev1.Volume {
 	// database and refuses files it cannot classify.
 	if c.nvidiaMode() != NVIDIAOff {
 		volumes = append(volumes, corev1.Volume{Name: "udev", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/run/udev", Type: ptr.To(corev1.HostPathDirectoryOrCreate)}}})
+		// The root filesystem is read-only, so cuFile writes cufile.log here.
+		volumes = append(volumes, corev1.Volume{Name: "cufile-log", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(CUFileLogSizeLimit))}}})
 	}
 
 	return volumes
@@ -306,7 +317,7 @@ func dataplaneContainer(c Config) corev1.Container {
 		{Name: "devices", MountPath: "/host/dev", ReadOnly: true},
 	}
 	if c.nvidiaMode() != NVIDIAOff {
-		mounts = append(mounts, corev1.VolumeMount{Name: "udev", MountPath: "/run/udev", ReadOnly: true})
+		mounts = append(mounts, corev1.VolumeMount{Name: "udev", MountPath: "/run/udev", ReadOnly: true}, corev1.VolumeMount{Name: "cufile-log", MountPath: CUFileLogDirectory})
 	}
 
 	return corev1.Container{

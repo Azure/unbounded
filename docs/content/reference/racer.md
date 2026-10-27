@@ -1105,9 +1105,18 @@ The operator reads it and changes the DaemonSet:
 
 | `RACER_DATAPLANE_NVIDIA` | Behavior |
 |--------------------------|----------|
-| `env` (default) | Sets `NVIDIA_VISIBLE_DEVICES=all` and `NVIDIA_DRIVER_CAPABILITIES=compute,utility` on the dataplane container, and mounts the host `/run/udev` read-only at `/run/udev` (cuFile reads each slab device's filesystem type from the udev database). The NVIDIA runtime injects the libraries. Other runtimes ignore these variables, so nodes without NVIDIA are not affected |
+| `env` (default) | Sets `NVIDIA_VISIBLE_DEVICES=all` and `NVIDIA_DRIVER_CAPABILITIES=compute,utility` on the dataplane container, mounts the host `/run/udev` read-only at `/run/udev` (cuFile reads each slab device's filesystem type from the udev database), and mounts a 64 MiB `emptyDir` at `/var/log/cufile` for the cuFile log. The NVIDIA runtime injects the libraries. Other runtimes ignore these variables, so nodes without NVIDIA are not affected |
 | `cdi` | Everything `env` adds, plus the Pod annotation `cdi.k8s.io/racer-dataplane: nvidia.com/gpu=all`. containerd fails to create the container on any node that cannot resolve this CDI device, so use it only when every dataplane node has an NVIDIA CDI spec |
-| `off` | Adds none of these: no NVIDIA variables, no CDI annotation, and no `/run/udev` mount. Without driver libraries there is no GPU, so cuFile is not used |
+| `off` | Adds none of these: no NVIDIA variables, no CDI annotation, no `/run/udev` mount, and no cuFile log volume. Without driver libraries there is no GPU, so cuFile is not used |
+
+The dataplane image ships `/etc/racer/cufile.json` and sets
+`CUFILE_ENV_PATH_JSON` to it. It turns off cuFile compatibility mode, so
+cuFile fails instead of copying through host memory and Racer uses its own
+host read path, and it logs errors to `/var/log/cufile/cufile.log`. Other
+cuFile settings keep their built-in defaults. To use your own file, build an
+image from the dataplane image that adds it, and set `CUFILE_ENV_PATH_JSON`
+in `racer-dataplane-config`. `CUFILE_ALLOW_COMPAT_MODE` still turns
+compatibility mode back on.
 
 On nodes set up by the unbounded agent, the NVIDIA runtime is the default
 containerd runtime and runs in CDI mode, so `env` is enough there. These env
