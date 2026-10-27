@@ -1,8 +1,15 @@
+{{- $controllerImage := default "example.invalid/project-signal-controller@sha256:0000000000000000000000000000000000000000000000000000000000000000" .ControllerImage }}
+{{- if not (regexMatch "^[^@[:space:]]+@sha256:[0-9a-f]{64}$" $controllerImage) }}
+{{- fail "ControllerImage must be an immutable sha256 digest reference" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: project-signal-controller
   namespace: {{ default "project-signal" .Namespace }}
+  labels:
+    app.kubernetes.io/name: project-signal-controller
+    app.kubernetes.io/part-of: project-signal
 spec:
   replicas: 1
   selector:
@@ -12,17 +19,29 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: project-signal-controller
+        app.kubernetes.io/part-of: project-signal
     spec:
       serviceAccountName: project-signal-controller
+      automountServiceAccountToken: true
+      tolerations:
+        - key: node.kubernetes.io/unschedulable
+          operator: Exists
+          effect: NoSchedule
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: controller
-          image: {{ default "example.invalid/project-signal-controller:replace-me" .ControllerImage }}
+          image: {{ $controllerImage }}
           imagePullPolicy: IfNotPresent
           args:
             - --namespace={{ default "project-signal" .Namespace }}
             - --script-namespace={{ default (default "project-signal" .Namespace) .ScriptNamespace }}
             - --runner-image={{ default "example.invalid/project-signal-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000" .RunnerImage }}
             - --leader-elect=true
+            - --max-concurrent-runs=4
+            - --metrics-bind-address=:8080
+            - --health-probe-bind-address=:8081
           ports:
             - name: metrics
               containerPort: 8080

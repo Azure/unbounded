@@ -48,7 +48,7 @@ func main() {
 	flags := command.Flags()
 	flags.StringVar(&cfg.Namespace, "namespace", "", "Namespace for backend resources")
 	flags.StringVar(&cfg.WorkflowName, "workflow-name", "", "Owning Argo Workflow name")
-	flags.StringVar(&cfg.RunName, "run-name", "", "CertificationRun name")
+	flags.StringVar(&cfg.ExecutionName, "execution-name", "", "Check-specific backend execution name")
 	flags.Var(uidValue{target: &cfg.RunUID}, "run-uid", "CertificationRun UID")
 	flags.StringVar(&cfg.ParticipantsJSON, "participants-json", "", "Ordered participant snapshot JSON")
 	flags.IntVar(&cfg.ParticipantCount, "participant-count", 0, "Declared participant count")

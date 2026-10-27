@@ -45,7 +45,7 @@ var runnerImagePattern = regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)
 type Config struct {
 	Namespace              string
 	WorkflowName           string
-	RunName                string
+	ExecutionName          string
 	RunUID                 types.UID
 	ParticipantsJSON       string
 	ParticipantCount       int
@@ -177,7 +177,7 @@ func ValidateConfig(config Config) ([]signalv1.Participant, []corev1.Toleration,
 	for name, value := range map[string]string{
 		"namespace":        config.Namespace,
 		"workflow-name":    config.WorkflowName,
-		"run-name":         config.RunName,
+		"execution-name":   config.ExecutionName,
 		"run-uid":          string(config.RunUID),
 		"script-configmap": config.ScriptConfigMap,
 		"script-key":       config.ScriptKey,
@@ -193,7 +193,7 @@ func ValidateConfig(config Config) ([]signalv1.Participant, []corev1.Toleration,
 	for name, value := range map[string]string{
 		"namespace":        config.Namespace,
 		"workflow-name":    config.WorkflowName,
-		"run-name":         config.RunName,
+		"execution-name":   config.ExecutionName,
 		"script-configmap": config.ScriptConfigMap,
 	} {
 		if errors := validation.IsDNS1123Subdomain(value); len(errors) > 0 {
@@ -893,7 +893,7 @@ func ordinaryPod(
 	pod := &corev1.Pod{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:            resourceName(config.RunName, participant.Index),
+			Name:            resourceName(config.ExecutionName, participant.Index),
 			Namespace:       config.Namespace,
 			Labels:          labels,
 			OwnerReferences: []metav1.OwnerReference{workflow},
@@ -933,7 +933,7 @@ func mpiJob(
 	workerLabels := mapsClone(labels)
 	workerLabels["signal.unbounded-cloud.io/mpi-role"] = "worker"
 
-	jobName := resourceNameWithSuffix(config.RunName, "-mpi", 63-len("-worker-0"))
+	jobName := resourceNameWithSuffix(config.ExecutionName, "-mpi", 63-len("-worker-0"))
 	launcherEnv := coordinatedEnvironment(config, len(participants), environment)
 	workerEnv := append(
 		coordinatedEnvironment(config, len(participants), environment),
@@ -1009,7 +1009,7 @@ func mpiJob(
 					"restartPolicy": string(corev1.RestartPolicyNever),
 					"template": podTemplate(
 						workerLabels,
-						mpiWorkerAffinity(config.RunName, participants),
+						mpiWorkerAffinity(config.ExecutionName, participants),
 						tolerations,
 						worker,
 						config.ScriptConfigMap,
@@ -1142,7 +1142,7 @@ func workloadEnvironment(
 
 	result = append(
 		result,
-		corev1.EnvVar{Name: "PROJECT_SIGNAL_RUN_NAME", Value: config.RunName},
+		corev1.EnvVar{Name: "PROJECT_SIGNAL_RUN_NAME", Value: config.ExecutionName},
 		corev1.EnvVar{Name: "PROJECT_SIGNAL_RUN_UID", Value: string(config.RunUID)},
 		corev1.EnvVar{Name: "PROJECT_SIGNAL_PARTICIPANT_INDEX", Value: strconv.FormatInt(int64(participant.Index), 10)},
 		corev1.EnvVar{Name: "PROJECT_SIGNAL_NODE_NAME", Value: participant.NodeName},
@@ -1164,7 +1164,7 @@ func coordinatedEnvironment(
 
 	return append(
 		result,
-		corev1.EnvVar{Name: "PROJECT_SIGNAL_RUN_NAME", Value: config.RunName},
+		corev1.EnvVar{Name: "PROJECT_SIGNAL_RUN_NAME", Value: config.ExecutionName},
 		corev1.EnvVar{Name: "PROJECT_SIGNAL_RUN_UID", Value: string(config.RunUID)},
 		corev1.EnvVar{Name: "PROJECT_SIGNAL_PARTICIPANT_COUNT", Value: strconv.Itoa(participantCount)},
 		corev1.EnvVar{Name: "PROJECT_SIGNAL_SCRIPT_KEY", Value: config.ScriptKey},
@@ -1338,7 +1338,7 @@ func resourceLabels(config Config, participant signalv1.Participant) map[string]
 func runLabels(config Config) map[string]string {
 	return map[string]string{
 		"app.kubernetes.io/name":        "project-signal-adapter",
-		"signal.unbounded-cloud.io/run": config.RunName,
+		"signal.unbounded-cloud.io/run": config.ExecutionName,
 	}
 }
 

@@ -1222,9 +1222,10 @@ func buildWorkflow(run *signalv1.CertificationRun) (*unstructured.Unstructured, 
 			},
 		},
 		"spec": map[string]any{
-			"activeDeadlineSeconds": int64(run.Spec.Deadline.Seconds()),
-			"serviceAccountName":    adapterServiceAccountName,
-			"entrypoint":            "certification-suite",
+			"activeDeadlineSeconds":        int64(run.Spec.Deadline.Seconds()),
+			"serviceAccountName":           adapterServiceAccountName,
+			"automountServiceAccountToken": true,
+			"entrypoint":                   "certification-suite",
 			"templates": []any{
 				map[string]any{
 					"name": "certification-suite",
@@ -1252,7 +1253,7 @@ func checkWorkflowParameters(
 	gpuCount string,
 ) []any {
 	return []any{
-		map[string]any{"name": "run-name", "value": checkRunName(run.Name, check.ID)},
+		map[string]any{"name": "execution-name", "value": checkRunName(run.Name, check.ID)},
 		map[string]any{"name": "run-uid", "value": string(run.UID)},
 		map[string]any{"name": "participants-json", "value": participantsJSON},
 		map[string]any{"name": "participant-count", "value": fmt.Sprintf("%d", len(participants))},

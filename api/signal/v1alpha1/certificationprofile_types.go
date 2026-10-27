@@ -11,11 +11,14 @@ import (
 type CheckID string
 
 // +kubebuilder:validation:XValidation:rule="duration(self.backendActiveDeadline) > duration('0s')",message="backendActiveDeadline must be positive"
+// +kubebuilder:validation:XValidation:rule="self.backend != 'MPIJob' || (has(self.gpuCount) && self.gpuCount > 0)",message="MPIJob checks require a positive gpuCount"
 type CertificationCheck struct {
 	// ID and Order are derived from the check's position and are never serialized.
 	ID    CheckID `json:"-"`
 	Order int32   `json:"-"`
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[-._a-zA-Z0-9]+$`
 	ScriptKey      string           `json:"scriptKey"`
 	Backend        ExecutionBackend `json:"backend"`
 	WorkloadPolicy WorkloadPolicy   `json:"workloadPolicy,omitempty"`
@@ -32,6 +35,7 @@ const (
 	ExecutionBackendMPIJob ExecutionBackend = "MPIJob"
 )
 
+// +kubebuilder:validation:XValidation:rule="(has(self.selector.matchLabels) && size(self.selector.matchLabels) > 0) || (has(self.selector.matchExpressions) && size(self.selector.matchExpressions) > 0)",message="selector must contain at least one matchLabels or matchExpressions term"
 type ParticipantPolicy struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=8
@@ -42,9 +46,16 @@ type ParticipantPolicy struct {
 	MinimumAllocatable corev1.ResourceList `json:"minimumAllocatable,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="self.mountPath.startsWith('/') && !self.mountPath.contains('//') && !self.mountPath.contains('/./') && !self.mountPath.contains('/../') && !self.mountPath.endsWith('/.') && !self.mountPath.endsWith('/..')",message="mountPath must be a clean absolute path"
+// +kubebuilder:validation:XValidation:rule="self.mountPath != '/scripts' && self.mountPath != '/results'",message="mountPath must not replace a reserved Project Signal mount"
+// +kubebuilder:validation:XValidation:rule="(self.path == '/proc' || self.path.startsWith('/proc/') || self.path == '/sys' || self.path.startsWith('/sys/') || self.path == '/var/lib/project-signal' || self.path.startsWith('/var/lib/project-signal/')) && !self.path.contains('//') && !self.path.contains('/./') && !self.path.contains('/../') && !self.path.endsWith('/.') && !self.path.endsWith('/..')",message="path must be a clean absolute path under /proc, /sys, or /var/lib/project-signal"
 type WorkloadHostPath struct {
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=4096
 	MountPath string `json:"mountPath"`
-	Path      string `json:"path"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=4096
+	Path string `json:"path"`
 }
 
 type WorkloadPolicy struct {
@@ -53,6 +64,8 @@ type WorkloadPolicy struct {
 	IPCLock     bool                        `json:"ipcLock,omitempty"`
 	HostNetwork bool                        `json:"hostNetwork,omitempty"`
 	// +kubebuilder:validation:MaxItems=16
+	// +listType=map
+	// +listMapKey=mountPath
 	HostPaths []WorkloadHostPath `json:"hostPaths,omitempty"`
 }
 
@@ -61,6 +74,8 @@ type WorkloadPolicy struct {
 type CertificationProfileSpec struct {
 	Participants ParticipantPolicy `json:"participants"`
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	ScriptConfigMap string `json:"scriptConfigMap"`
 	// +kubebuilder:validation:MinItems=15
 	// +kubebuilder:validation:MaxItems=15

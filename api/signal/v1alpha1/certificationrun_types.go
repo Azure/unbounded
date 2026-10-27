@@ -35,34 +35,51 @@ func (p RunPhase) Terminal() bool {
 	}
 }
 
+// +kubebuilder:validation:XValidation:rule="size(self.nodeUID) > 0",message="nodeUID is required"
 type Participant struct {
 	// Index is derived from the participant's position and is never serialized.
-	Index       int32               `json:"-"`
+	Index int32 `json:"-"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	NodeName    string              `json:"nodeName"`
 	NodeUID     types.UID           `json:"nodeUID"`
 	Allocatable corev1.ResourceList `json:"allocatable,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="size(self.uid) > 0",message="uid is required"
 type BackendResourceReference struct {
+	// +kubebuilder:validation:MinLength=1
 	Name string    `json:"name"`
 	UID  types.UID `json:"uid"`
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:items:Minimum=0
+	// +kubebuilder:validation:items:Maximum=7
+	// +listType=set
 	ParticipantIndexes []int32 `json:"participantIndexes"`
 }
 
+// +kubebuilder:validation:XValidation:rule="size(self.uid) > 0",message="uid is required"
 type PinnedProfile struct {
-	Name       string    `json:"name"`
-	UID        types.UID `json:"uid"`
-	Generation int64     `json:"generation"`
+	// +kubebuilder:validation:MinLength=1
+	Name string    `json:"name"`
+	UID  types.UID `json:"uid"`
+	// +kubebuilder:validation:Minimum=1
+	Generation int64 `json:"generation"`
 }
 
+// +kubebuilder:validation:XValidation:rule="size(self.uid) > 0",message="uid is required"
 type ScriptBundleReference struct {
+	// +kubebuilder:validation:MinLength=1
 	Name string    `json:"name"`
 	UID  types.UID `json:"uid"`
 }
 
 type ScriptSnapshot struct {
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[-._a-zA-Z0-9]+$`
 	Key string `json:"key"`
 	// Digest is the algorithm-qualified SHA-256 digest of the selected script bytes.
 	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
@@ -70,16 +87,19 @@ type ScriptSnapshot struct {
 }
 
 // +kubebuilder:validation:XValidation:rule="duration(self.backendActiveDeadline) > duration('0s')",message="backendActiveDeadline must be positive"
+// +kubebuilder:validation:XValidation:rule="self.backend != 'MPIJob' || (has(self.gpuCount) && self.gpuCount > 0)",message="MPIJob checks require a positive gpuCount"
 type CertificationCheckSnapshot struct {
 	// ID and Order are derived from the check's position and are never serialized.
-	ID                    CheckID          `json:"-"`
-	Order                 int32            `json:"-"`
-	Script                ScriptSnapshot   `json:"script"`
-	RunnerImage           string           `json:"runnerImage"`
-	Backend               ExecutionBackend `json:"backend"`
-	WorkloadPolicy        WorkloadPolicy   `json:"workloadPolicy,omitempty"`
-	GPUCount              int32            `json:"gpuCount,omitempty"`
-	BackendActiveDeadline metav1.Duration  `json:"backendActiveDeadline"`
+	ID     CheckID        `json:"-"`
+	Order  int32          `json:"-"`
+	Script ScriptSnapshot `json:"script"`
+	// +kubebuilder:validation:Pattern=`^[^@\s]+@sha256:[0-9a-f]{64}$`
+	RunnerImage    string           `json:"runnerImage"`
+	Backend        ExecutionBackend `json:"backend"`
+	WorkloadPolicy WorkloadPolicy   `json:"workloadPolicy,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	GPUCount              int32           `json:"gpuCount,omitempty"`
+	BackendActiveDeadline metav1.Duration `json:"backendActiveDeadline"`
 }
 
 // +kubebuilder:validation:XValidation:rule="self.profile == oldSelf.profile",message="profile is immutable"
@@ -87,6 +107,7 @@ type CertificationCheckSnapshot struct {
 // +kubebuilder:validation:XValidation:rule="self.scriptBundle == oldSelf.scriptBundle",message="scriptBundle is immutable"
 // +kubebuilder:validation:XValidation:rule="self.checks == oldSelf.checks",message="checks are immutable"
 // +kubebuilder:validation:XValidation:rule="self.deadline == oldSelf.deadline",message="deadline is immutable"
+// +kubebuilder:validation:XValidation:rule="self.participants.all(x, self.participants.filter(y, y.nodeName == x.nodeName).size() == 1)",message="participants must use unique nodeName values"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.cancel) || !oldSelf.cancel || (has(self.cancel) && self.cancel)",message="cancel cannot be cleared"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.release) || !oldSelf.release || (has(self.release) && self.release)",message="release cannot be cleared"
 // +kubebuilder:validation:XValidation:rule="self.checks.all(c, duration(self.deadline) - duration(c.backendActiveDeadline) >= duration('60s'))",message="every backendActiveDeadline must leave at least 60 seconds before deadline"

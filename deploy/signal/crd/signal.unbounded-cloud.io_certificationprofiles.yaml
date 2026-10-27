@@ -63,7 +63,9 @@ spec:
                       minimum: 0
                       type: integer
                     scriptKey:
+                      maxLength: 253
                       minLength: 1
+                      pattern: ^[-._a-zA-Z0-9]+$
                       type: string
                     workloadPolicy:
                       properties:
@@ -73,15 +75,39 @@ spec:
                           items:
                             properties:
                               mountPath:
+                                maxLength: 4096
+                                minLength: 1
                                 type: string
                               path:
+                                maxLength: 4096
+                                minLength: 1
                                 type: string
                             required:
                             - mountPath
                             - path
                             type: object
+                            x-kubernetes-validations:
+                            - message: mountPath must be a clean absolute path
+                              rule: self.mountPath.startsWith('/') && !self.mountPath.contains('//')
+                                && !self.mountPath.contains('/./') && !self.mountPath.contains('/../')
+                                && !self.mountPath.endsWith('/.') && !self.mountPath.endsWith('/..')
+                            - message: mountPath must not replace a reserved Project
+                                Signal mount
+                              rule: self.mountPath != '/scripts' && self.mountPath
+                                != '/results'
+                            - message: path must be a clean absolute path under /proc,
+                                /sys, or /var/lib/project-signal
+                              rule: (self.path == '/proc' || self.path.startsWith('/proc/')
+                                || self.path == '/sys' || self.path.startsWith('/sys/')
+                                || self.path == '/var/lib/project-signal' || self.path.startsWith('/var/lib/project-signal/'))
+                                && !self.path.contains('//') && !self.path.contains('/./')
+                                && !self.path.contains('/../') && !self.path.endsWith('/.')
+                                && !self.path.endsWith('/..')
                           maxItems: 16
                           type: array
+                          x-kubernetes-list-map-keys:
+                          - mountPath
+                          x-kubernetes-list-type: map
                         ipcLock:
                           type: boolean
                         privileged:
@@ -156,6 +182,9 @@ spec:
                   x-kubernetes-validations:
                   - message: backendActiveDeadline must be positive
                     rule: duration(self.backendActiveDeadline) > duration('0s')
+                  - message: MPIJob checks require a positive gpuCount
+                    rule: self.backend != 'MPIJob' || (has(self.gpuCount) && self.gpuCount
+                      > 0)
                 maxItems: 15
                 minItems: 15
                 type: array
@@ -231,8 +260,16 @@ spec:
                 - count
                 - selector
                 type: object
+                x-kubernetes-validations:
+                - message: selector must contain at least one matchLabels or matchExpressions
+                    term
+                  rule: (has(self.selector.matchLabels) && size(self.selector.matchLabels)
+                    > 0) || (has(self.selector.matchExpressions) && size(self.selector.matchExpressions)
+                    > 0)
               scriptConfigMap:
+                maxLength: 253
                 minLength: 1
+                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                 type: string
             required:
             - checks

@@ -94,7 +94,7 @@ MACHINE_OPS_SITE ?=
 
 PROJECT_SIGNAL_CONTROLLER_BIN=bin/project-signal-controller
 PROJECT_SIGNAL_CONTROLLER_CMD=./cmd/project-signal-controller
-SIGNAL_CONTROLLER_IMAGE ?= example.invalid/project-signal-controller:replace-me
+SIGNAL_CONTROLLER_IMAGE ?= example.invalid/project-signal-controller@sha256:0000000000000000000000000000000000000000000000000000000000000000
 PROJECT_SIGNAL_ADAPTER_BIN=bin/project-signal-adapter
 PROJECT_SIGNAL_ADAPTER_CMD=./cmd/project-signal-adapter
 SIGNAL_ADAPTER_IMAGE ?= example.invalid/project-signal-adapter@sha256:0000000000000000000000000000000000000000000000000000000000000000

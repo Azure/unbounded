@@ -663,7 +663,7 @@ func (r *Runner) resultLogs(
 		}
 
 		pods, err := r.Kubernetes.CoreV1().Pods(config.Namespace).List(ctx, metav1.ListOptions{
-			LabelSelector: runLabelSelector(config.RunName),
+			LabelSelector: runLabelSelector(config.ExecutionName),
 		})
 		if err != nil {
 			source := resultLogSourceFromError(fmt.Errorf("list MPIJob Pods: %w", err))

@@ -450,7 +450,7 @@ func (r *Runner) captureMPIBackendEvidence(
 	var launcherPod *corev1.Pod
 
 	pods, podErr := r.Kubernetes.CoreV1().Pods(config.Namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: runLabelSelector(config.RunName),
+		LabelSelector: runLabelSelector(config.ExecutionName),
 	})
 	if podErr != nil {
 		complete = false

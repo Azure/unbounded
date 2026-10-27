@@ -30,12 +30,12 @@ profile contains an `MPIJob` check.
 
 ## First deployment
 
-Render the manifests with the controller image plus immutable adapter and
-certification runner images:
+Render the manifests with immutable controller, adapter, and certification
+runner images:
 
 ```bash
 make signal-manifests \
-  SIGNAL_CONTROLLER_IMAGE=<controller-image> \
+  SIGNAL_CONTROLLER_IMAGE=<controller-image>@sha256:<digest> \
   SIGNAL_ADAPTER_IMAGE=<adapter-image>@sha256:<digest> \
   SIGNAL_CERTIFICATION_RUNNER_IMAGE=<runner-image>@sha256:<digest>
 ```

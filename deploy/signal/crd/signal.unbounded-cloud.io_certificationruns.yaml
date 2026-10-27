@@ -68,8 +68,10 @@ spec:
                       type: string
                     gpuCount:
                       format: int32
+                      minimum: 0
                       type: integer
                     runnerImage:
+                      pattern: ^[^@\s]+@sha256:[0-9a-f]{64}$
                       type: string
                     script:
                       properties:
@@ -79,6 +81,9 @@ spec:
                           pattern: ^sha256:[0-9a-f]{64}$
                           type: string
                         key:
+                          maxLength: 253
+                          minLength: 1
+                          pattern: ^[-._a-zA-Z0-9]+$
                           type: string
                       required:
                       - digest
@@ -92,15 +97,39 @@ spec:
                           items:
                             properties:
                               mountPath:
+                                maxLength: 4096
+                                minLength: 1
                                 type: string
                               path:
+                                maxLength: 4096
+                                minLength: 1
                                 type: string
                             required:
                             - mountPath
                             - path
                             type: object
+                            x-kubernetes-validations:
+                            - message: mountPath must be a clean absolute path
+                              rule: self.mountPath.startsWith('/') && !self.mountPath.contains('//')
+                                && !self.mountPath.contains('/./') && !self.mountPath.contains('/../')
+                                && !self.mountPath.endsWith('/.') && !self.mountPath.endsWith('/..')
+                            - message: mountPath must not replace a reserved Project
+                                Signal mount
+                              rule: self.mountPath != '/scripts' && self.mountPath
+                                != '/results'
+                            - message: path must be a clean absolute path under /proc,
+                                /sys, or /var/lib/project-signal
+                              rule: (self.path == '/proc' || self.path.startsWith('/proc/')
+                                || self.path == '/sys' || self.path.startsWith('/sys/')
+                                || self.path == '/var/lib/project-signal' || self.path.startsWith('/var/lib/project-signal/'))
+                                && !self.path.contains('//') && !self.path.contains('/./')
+                                && !self.path.contains('/../') && !self.path.endsWith('/.')
+                                && !self.path.endsWith('/..')
                           maxItems: 16
                           type: array
+                          x-kubernetes-list-map-keys:
+                          - mountPath
+                          x-kubernetes-list-type: map
                         ipcLock:
                           type: boolean
                         privileged:
@@ -176,6 +205,9 @@ spec:
                   x-kubernetes-validations:
                   - message: backendActiveDeadline must be positive
                     rule: duration(self.backendActiveDeadline) > duration('0s')
+                  - message: MPIJob checks require a positive gpuCount
+                    rule: self.backend != 'MPIJob' || (has(self.gpuCount) && self.gpuCount
+                      > 0)
                 maxItems: 15
                 minItems: 15
                 type: array
@@ -195,6 +227,9 @@ spec:
                         pairs.
                       type: object
                     nodeName:
+                      maxLength: 253
+                      minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
                       type: string
                     nodeUID:
                       description: |-
@@ -206,6 +241,9 @@ spec:
                   - nodeName
                   - nodeUID
                   type: object
+                  x-kubernetes-validations:
+                  - message: nodeUID is required
+                    rule: size(self.nodeUID) > 0
                 maxItems: 8
                 minItems: 1
                 type: array
@@ -213,8 +251,10 @@ spec:
                 properties:
                   generation:
                     format: int64
+                    minimum: 1
                     type: integer
                   name:
+                    minLength: 1
                     type: string
                   uid:
                     description: |-
@@ -227,11 +267,15 @@ spec:
                 - name
                 - uid
                 type: object
+                x-kubernetes-validations:
+                - message: uid is required
+                  rule: size(self.uid) > 0
               release:
                 type: boolean
               scriptBundle:
                 properties:
                   name:
+                    minLength: 1
                     type: string
                   uid:
                     description: |-
@@ -243,6 +287,9 @@ spec:
                 - name
                 - uid
                 type: object
+                x-kubernetes-validations:
+                - message: uid is required
+                  rule: size(self.uid) > 0
             required:
             - checks
             - deadline
@@ -261,6 +308,9 @@ spec:
               rule: self.checks == oldSelf.checks
             - message: deadline is immutable
               rule: self.deadline == oldSelf.deadline
+            - message: participants must use unique nodeName values
+              rule: self.participants.all(x, self.participants.filter(y, y.nodeName
+                == x.nodeName).size() == 1)
             - message: cancel cannot be cleared
               rule: '!has(oldSelf.cancel) || !oldSelf.cancel || (has(self.cancel)
                 && self.cancel)'
@@ -295,14 +345,18 @@ spec:
                       items:
                         properties:
                           name:
+                            minLength: 1
                             type: string
                           participantIndexes:
                             items:
                               format: int32
+                              maximum: 7
+                              minimum: 0
                               type: integer
                             maxItems: 8
                             minItems: 1
                             type: array
+                            x-kubernetes-list-type: set
                           uid:
                             description: |-
                               UID is a type that holds unique ID values, including UUIDs.  Because we
@@ -314,6 +368,9 @@ spec:
                         - participantIndexes
                         - uid
                         type: object
+                        x-kubernetes-validations:
+                        - message: uid is required
+                          rule: size(self.uid) > 0
                       maxItems: 8
                       type: array
                     finishedAt:
