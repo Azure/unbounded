@@ -211,21 +211,9 @@ spec:
                 maxItems: 15
                 minItems: 15
                 type: array
-              deadline:
-                type: string
               participants:
                 items:
                   properties:
-                    allocatable:
-                      additionalProperties:
-                        anyOf:
-                        - type: integer
-                        - type: string
-                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                        x-kubernetes-int-or-string: true
-                      description: ResourceList is a set of (resource name, quantity)
-                        pairs.
-                      type: object
                     nodeName:
                       maxLength: 253
                       minLength: 1
@@ -292,7 +280,6 @@ spec:
                   rule: size(self.uid) > 0
             required:
             - checks
-            - deadline
             - participants
             - profile
             - scriptBundle
@@ -306,8 +293,6 @@ spec:
               rule: self.scriptBundle == oldSelf.scriptBundle
             - message: checks are immutable
               rule: self.checks == oldSelf.checks
-            - message: deadline is immutable
-              rule: self.deadline == oldSelf.deadline
             - message: participants must use unique nodeName values
               rule: self.participants.all(x, self.participants.filter(y, y.nodeName
                 == x.nodeName).size() == 1)
@@ -317,68 +302,11 @@ spec:
             - message: release cannot be cleared
               rule: '!has(oldSelf.release) || !oldSelf.release || (has(self.release)
                 && self.release)'
-            - message: every backendActiveDeadline must leave at least 60 seconds
-                before deadline
-              rule: self.checks.all(c, duration(self.deadline) - duration(c.backendActiveDeadline)
-                >= duration('60s'))
-            - message: deadline must cover every sequential backendActiveDeadline
-                plus 60 seconds of evidence time per check
-              rule: self.checks.map(c, duration(c.backendActiveDeadline) + duration('60s')).sum()
-                <= duration(self.deadline)
           status:
             properties:
               checks:
                 items:
                   properties:
-                    backendEvidence:
-                      properties:
-                        complete:
-                          type: boolean
-                        digest:
-                          description: |-
-                            Digest identifies the complete backend-evidence v1 document retained in
-                            the durable evidence artifact.
-                          pattern: ^sha256:[0-9a-f]{64}$
-                          type: string
-                      type: object
-                    backendResources:
-                      items:
-                        properties:
-                          name:
-                            minLength: 1
-                            type: string
-                          participantIndexes:
-                            items:
-                              format: int32
-                              maximum: 7
-                              minimum: 0
-                              type: integer
-                            maxItems: 8
-                            minItems: 1
-                            type: array
-                            x-kubernetes-list-type: set
-                          uid:
-                            description: |-
-                              UID is a type that holds unique ID values, including UUIDs.  Because we
-                              don't ONLY use UUIDs, this is an alias to string.  Being a type captures
-                              intent and helps make sure that UIDs and names do not get conflated.
-                            type: string
-                        required:
-                        - name
-                        - participantIndexes
-                        - uid
-                        type: object
-                        x-kubernetes-validations:
-                        - message: uid is required
-                          rule: size(self.uid) > 0
-                      maxItems: 8
-                      type: array
-                    finishedAt:
-                      format: date-time
-                      type: string
-                    measurements:
-                      maxLength: 16384
-                      type: string
                     phase:
                       enum:
                       - Pending
@@ -390,9 +318,6 @@ spec:
                       type: string
                     reason:
                       maxLength: 1024
-                      type: string
-                    startedAt:
-                      format: date-time
                       type: string
                   required:
                   - phase
@@ -469,9 +394,6 @@ spec:
                   uri:
                     type: string
                 type: object
-              finishedAt:
-                format: date-time
-                type: string
               observedGeneration:
                 format: int64
                 type: integer
@@ -486,9 +408,6 @@ spec:
                 type: string
               reason:
                 maxLength: 1024
-                type: string
-              startedAt:
-                format: date-time
                 type: string
               workflow:
                 properties:

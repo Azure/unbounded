@@ -42,8 +42,6 @@ type ParticipantPolicy struct {
 	Count int32 `json:"count"`
 
 	Selector metav1.LabelSelector `json:"selector"`
-
-	MinimumAllocatable corev1.ResourceList `json:"minimumAllocatable,omitempty"`
 }
 
 // +kubebuilder:validation:XValidation:rule="self.mountPath.startsWith('/') && !self.mountPath.contains('//') && !self.mountPath.contains('/./') && !self.mountPath.contains('/../') && !self.mountPath.endsWith('/.') && !self.mountPath.endsWith('/..')",message="mountPath must be a clean absolute path"
@@ -69,8 +67,6 @@ type WorkloadPolicy struct {
 	HostPaths []WorkloadHostPath `json:"hostPaths,omitempty"`
 }
 
-// +kubebuilder:validation:XValidation:rule="self.checks.all(c, duration(self.deadline) - duration(c.backendActiveDeadline) >= duration('60s'))",message="every backendActiveDeadline must leave at least 60 seconds before deadline"
-// +kubebuilder:validation:XValidation:rule="self.checks.map(c, duration(c.backendActiveDeadline) + duration('60s')).sum() <= duration(self.deadline)",message="deadline must cover every sequential backendActiveDeadline plus 60 seconds of evidence time per check"
 type CertificationProfileSpec struct {
 	Participants ParticipantPolicy `json:"participants"`
 	// +kubebuilder:validation:MinLength=1
@@ -79,8 +75,7 @@ type CertificationProfileSpec struct {
 	ScriptConfigMap string `json:"scriptConfigMap"`
 	// +kubebuilder:validation:MinItems=15
 	// +kubebuilder:validation:MaxItems=15
-	Checks   []CertificationCheck `json:"checks"`
-	Deadline metav1.Duration      `json:"deadline"`
+	Checks []CertificationCheck `json:"checks"`
 }
 
 // +kubebuilder:object:root=true

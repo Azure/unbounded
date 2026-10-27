@@ -68,15 +68,14 @@ certification suites:
 |---|---|
 | `spec.participants.count` | Total Nodes selected for a Run |
 | `spec.participants.selector` | Labels every selected Node must match |
-| `spec.participants.minimumAllocatable` | Admission-time allocatable resource floor |
 | `spec.scriptConfigMap` | Source ConfigMap containing all 15 scripts |
 | `spec.checks` | Exactly 15 ordered checks; position defines R01 through R15 |
-| `spec.deadline` | Whole-suite deadline |
 
 The requesting Node is participant zero. The remaining participants are
 selected deterministically from currently ready, schedulable, unreserved
-Nodes matching the participant selector and allocatable resource floor. Every
-check runs on this complete immutable participant set.
+Nodes matching the participant selector and the resource floor derived from
+the largest per-Node check request. Every check runs on this complete immutable
+participant set.
 
 Each check contains:
 
@@ -136,12 +135,13 @@ record and verify the scheduled Node UID; it cannot mutate Nodes.
 The Run spec snapshots:
 
 - Profile name, UID, and generation;
-- ordered participants with Node name, Node UID, and admission-time allocatable
-  resources;
+- ordered participants with Node name and Node UID;
 - the immutable script bundle name and UID;
 - 15 ordered check snapshots;
-- the suite deadline;
 - monotonic `cancel` and `release` actions.
+
+The controller derives the Workflow deadline from the 15 immutable backend
+deadlines plus a fixed one-minute evidence reserve for each check.
 
 Participant and check identity is positional. Participant zero is the
 requesting Node. Check positions zero through fourteen are R01 through R15.
@@ -154,13 +154,11 @@ Run status contains:
 - phase and bounded reason;
 - Workflow name, UID, and observed phase;
 - evidence URI and SHA-256 digest;
-- positional check phases, bounded reasons and measurements, backend
-  identities, and backend-evidence digest/completeness;
-- start and finish timestamps;
+- positional check phases and bounded reasons;
 - `Cordoned`, `WorkloadCleanupComplete`, and `Released` conditions.
 
-Detailed Pod and MPIJob evidence is retained in the durable evidence document,
-not duplicated into CR status.
+Measurements, backend identities, backend evidence, and execution timestamps
+are retained only in the durable evidence document.
 
 ## Terminal behavior
 

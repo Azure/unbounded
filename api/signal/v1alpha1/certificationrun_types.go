@@ -4,7 +4,6 @@
 package v1alpha1
 
 import (
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -42,9 +41,8 @@ type Participant struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
-	NodeName    string              `json:"nodeName"`
-	NodeUID     types.UID           `json:"nodeUID"`
-	Allocatable corev1.ResourceList `json:"allocatable,omitempty"`
+	NodeName string    `json:"nodeName"`
+	NodeUID  types.UID `json:"nodeUID"`
 }
 
 // +kubebuilder:validation:XValidation:rule="size(self.uid) > 0",message="uid is required"
@@ -106,12 +104,9 @@ type CertificationCheckSnapshot struct {
 // +kubebuilder:validation:XValidation:rule="self.participants == oldSelf.participants",message="participants are immutable"
 // +kubebuilder:validation:XValidation:rule="self.scriptBundle == oldSelf.scriptBundle",message="scriptBundle is immutable"
 // +kubebuilder:validation:XValidation:rule="self.checks == oldSelf.checks",message="checks are immutable"
-// +kubebuilder:validation:XValidation:rule="self.deadline == oldSelf.deadline",message="deadline is immutable"
 // +kubebuilder:validation:XValidation:rule="self.participants.all(x, self.participants.filter(y, y.nodeName == x.nodeName).size() == 1)",message="participants must use unique nodeName values"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.cancel) || !oldSelf.cancel || (has(self.cancel) && self.cancel)",message="cancel cannot be cleared"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.release) || !oldSelf.release || (has(self.release) && self.release)",message="release cannot be cleared"
-// +kubebuilder:validation:XValidation:rule="self.checks.all(c, duration(self.deadline) - duration(c.backendActiveDeadline) >= duration('60s'))",message="every backendActiveDeadline must leave at least 60 seconds before deadline"
-// +kubebuilder:validation:XValidation:rule="self.checks.map(c, duration(c.backendActiveDeadline) + duration('60s')).sum() <= duration(self.deadline)",message="deadline must cover every sequential backendActiveDeadline plus 60 seconds of evidence time per check"
 type CertificationRunSpec struct {
 	Profile PinnedProfile `json:"profile"`
 	// +kubebuilder:validation:MinItems=1
@@ -120,10 +115,9 @@ type CertificationRunSpec struct {
 	ScriptBundle ScriptBundleReference `json:"scriptBundle"`
 	// +kubebuilder:validation:MinItems=15
 	// +kubebuilder:validation:MaxItems=15
-	Checks   []CertificationCheckSnapshot `json:"checks"`
-	Deadline metav1.Duration              `json:"deadline"`
-	Cancel   bool                         `json:"cancel,omitempty"`
-	Release  bool                         `json:"release,omitempty"`
+	Checks  []CertificationCheckSnapshot `json:"checks"`
+	Cancel  bool                         `json:"cancel,omitempty"`
+	Release bool                         `json:"release,omitempty"`
 }
 
 type WorkflowStatus struct {
@@ -175,13 +169,13 @@ type CheckStatus struct {
 	Verdict          string     `json:"-"`
 	// +kubebuilder:validation:MaxLength=1024
 	Reason string `json:"reason,omitempty"`
-	// +kubebuilder:validation:MaxLength=16384
-	Measurements string `json:"measurements,omitempty"`
-	// +kubebuilder:validation:MaxItems=8
-	BackendResources []BackendResourceReference `json:"backendResources,omitempty"`
-	BackendEvidence  BackendEvidenceStatus      `json:"backendEvidence,omitempty"`
-	StartedAt        *metav1.Time               `json:"startedAt,omitempty"`
-	FinishedAt       *metav1.Time               `json:"finishedAt,omitempty"`
+	// Measurements, backend identities, backend evidence, and timestamps are
+	// transient inputs to the durable evidence document, not CR status.
+	Measurements     string                     `json:"-"`
+	BackendResources []BackendResourceReference `json:"-"`
+	BackendEvidence  BackendEvidenceStatus      `json:"-"`
+	StartedAt        *metav1.Time               `json:"-"`
+	FinishedAt       *metav1.Time               `json:"-"`
 	Cleanup          CheckCleanupStatus         `json:"-"`
 }
 
@@ -193,9 +187,7 @@ type CertificationRunStatus struct {
 	Workflow WorkflowStatus `json:"workflow,omitempty"`
 	Evidence EvidenceStatus `json:"evidence,omitempty"`
 	// +kubebuilder:validation:MaxItems=15
-	Checks     []CheckStatus `json:"checks,omitempty"`
-	StartedAt  *metav1.Time  `json:"startedAt,omitempty"`
-	FinishedAt *metav1.Time  `json:"finishedAt,omitempty"`
+	Checks []CheckStatus `json:"checks,omitempty"`
 	// +listType=map
 	// +listMapKey=type
 	// +kubebuilder:validation:MaxItems=8

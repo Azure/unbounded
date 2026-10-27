@@ -30,32 +30,24 @@ func ValidateExecutionDeadlines(backendDeadline, outerDeadline time.Duration) er
 	return nil
 }
 
-func ValidateSuiteDeadlines(backendDeadlines []time.Duration, suiteDeadline time.Duration) error {
-	if suiteDeadline <= 0 || suiteDeadline%time.Second != 0 {
-		return errors.New("suite deadline must be a positive whole number of seconds")
-	}
-
+func DeriveSuiteDeadline(backendDeadlines []time.Duration) (time.Duration, error) {
 	var required time.Duration
 
 	for _, backendDeadline := range backendDeadlines {
 		if backendDeadline <= 0 || backendDeadline%time.Second != 0 {
-			return errors.New("backend active deadlines must be positive whole numbers of seconds")
+			return 0, errors.New("backend active deadlines must be positive whole numbers of seconds")
 		}
 
 		if backendDeadline > time.Duration(1<<63-1)-required-MinimumBackendDeadlineReserve {
-			return errors.New("combined check deadlines overflow")
+			return 0, errors.New("combined check deadlines overflow")
 		}
 
 		required += backendDeadline + MinimumBackendDeadlineReserve
 	}
 
-	if required > suiteDeadline {
-		return fmt.Errorf(
-			"combined backend deadlines and evidence reserves require %s, suite deadline is %s",
-			required,
-			suiteDeadline,
-		)
+	if required == 0 {
+		return 0, errors.New("at least one backend active deadline is required")
 	}
 
-	return nil
+	return required, nil
 }

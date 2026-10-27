@@ -68,19 +68,20 @@ func projectTesting(ctx context.Context, kube client.Client, run *signalv1.Certi
 	})
 }
 
-func projectTerminal(ctx context.Context, kube client.Client, run *signalv1.CertificationRun) error {
-	if run.Status.FinishedAt == nil {
-		return nil
-	}
-
-	finishedAt := run.Status.FinishedAt.UTC().Format(time.RFC3339)
+func projectTerminal(
+	ctx context.Context,
+	kube client.Client,
+	run *signalv1.CertificationRun,
+	completedAt time.Time,
+) error {
+	finishedAt := completedAt.UTC().Format(time.RFC3339)
 
 	return projectParticipants(ctx, kube, run.Spec.Participants, false, func(node *corev1.Node) error {
 		if node.Annotations[ReservationLabel] != run.Name {
 			return nil
 		}
 
-		if projectionTimeAfter(node.Annotations[LastRunAtAnnotation], run.Status.FinishedAt.Time) {
+		if projectionTimeAfter(node.Annotations[LastRunAtAnnotation], completedAt) {
 			return nil
 		}
 
@@ -95,7 +96,7 @@ func projectTerminal(ctx context.Context, kube client.Client, run *signalv1.Cert
 			node.Labels[StateLabel] = "passed"
 			node.Labels[EligibilityLabel] = "production"
 
-			if !projectionTimeAfter(node.Annotations[LastSuccessfulAtAnnotation], run.Status.FinishedAt.Time) {
+			if !projectionTimeAfter(node.Annotations[LastSuccessfulAtAnnotation], completedAt) {
 				node.Annotations[LastSuccessfulRunAnnotation] = boundedAnnotationValue(run.Name)
 				node.Annotations[LastSuccessfulAtAnnotation] = finishedAt
 			}
