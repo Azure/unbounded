@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import collections
 import logging
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Iterator
 
 import racer
 
-from .model import ModelURI, weight_files
+from .model import ModelURI, _changed, stat_pinned, weight_files
 from .safetensors import Chunk, TensorInfo, header_length, parse_header, plan_chunks
 
 log = logging.getLogger(__name__)
@@ -54,16 +56,65 @@ class Backend:
         """Block until work queued by the consumer on target has finished."""
 
 
-def _file_chunks(client: racer.Client, uri: ModelURI, staging_bytes: int, page_bytes: int):
-    for name in weight_files(client, uri):
+class LoadStats:
+    """Counts of one load, safe to update from reader threads."""
+
+    def __init__(self, clock=time.monotonic) -> None:
+        self._clock = clock
+        self._lock = threading.Lock()
+        self.started = clock()
+        self.finished: float | None = None
+        self.files = 0
+        self.bytes = 0
+        self.reads = {racer.GPU: 0, racer.HOST: 0, racer.STREAM: 0}
+        self.bytes_by_mode = {racer.GPU: 0, racer.HOST: 0, racer.STREAM: 0}
+
+    def add_read(self, delivery: str, nbytes: int) -> None:
+        with self._lock:
+            self.reads[delivery] = self.reads.get(delivery, 0) + 1
+            self.bytes_by_mode[delivery] = self.bytes_by_mode.get(delivery, 0) + nbytes
+            self.bytes += nbytes
+
+    def finish(self) -> None:
+        if self.finished is None:
+            self.finished = self._clock()
+
+    @property
+    def seconds(self) -> float:
+        end = self.finished if self.finished is not None else self._clock()
+        return max(end - self.started, 0.0)
+
+    def summary(self, where: str) -> str:
+        secs = self.seconds
+        gib = self.bytes / (1 << 30)
+        rate = gib / secs if secs > 0 else 0.0
+        modes = " ".join(
+            f"{m}={self.reads.get(m, 0)} ({self.bytes_by_mode.get(m, 0) / (1 << 30):.2f} GiB)"
+            for m in (racer.GPU, racer.HOST, racer.STREAM)
+        )
+        return (
+            f"racer: loaded {self.files} files, {gib:.2f} GiB in {secs:.2f}s ({rate:.2f} GiB/s) "
+            f"from {where}; reads by delivery mode: {modes}"
+        )
+
+
+def _pin_files(client: racer.Client, uri: ModelURI, files: list, pins: dict) -> list:
+    """Stat every file up front, at its pinned ETag when there is one."""
+    return [(name, stat_pinned(client, uri, name, pins.get(name))) for name in files]
+
+
+def _file_chunks(client: racer.Client, uri: ModelURI, files: list, staging_bytes: int, page_bytes: int):
+    for name, meta in files:
         req = uri.request(name)
-        meta = client.stat(req)
-        prefix = client.read(req, 0, 8, if_match=meta.etag)
-        n = header_length(prefix)
-        header = parse_header(client.read(req, 8, n, if_match=meta.etag), meta.size)
+        try:
+            prefix = client.read(req, 0, 8, if_match=meta.etag)
+            n = header_length(prefix)
+            header = parse_header(client.read(req, 8, n, if_match=meta.etag), meta.size)
+        except (racer.VersionUnavailable, racer.NotFound):
+            raise _changed(uri, name, meta.etag) from None
         log.debug("racer: %s has %d tensors", name, len(header.tensors))
         for chunk in plan_chunks(header.tensors, staging_bytes, page_bytes):
-            yield req, meta.etag, chunk
+            yield name, req, meta.etag, chunk
 
 
 def iter_weights(
@@ -73,8 +124,18 @@ def iter_weights(
     staging_bytes: int = DEFAULT_STAGING_BYTES,
     depth: int = DEFAULT_DEPTH,
     page_bytes: int = racer.PAGE_SIZE,
+    files: list | None = None,
+    pins: dict | None = None,
+    stats: LoadStats | None = None,
 ) -> Iterator[tuple]:
     """Yield (name, tensor) for every tensor in the model.
+
+    files lists the safetensors files to read (default: weight_files()).
+    Every file is stat'ed before the first read, at the ETag in pins when
+    there is one, and every later read uses If-Match on that ETag, so the
+    whole model is read at one version. A file that changes mid-load raises
+    ModelChangedError. stats, when given, counts files, bytes and reads per
+    delivery mode.
 
     Up to ``depth`` chunks are read ahead, each into its own staging buffer,
     so reads overlap with the consumer. A staging buffer is reused only after
@@ -93,16 +154,27 @@ def iter_weights(
     """
     if depth < 1:
         raise ValueError("depth must be at least 1")
+    pins = pins or {}
+    if files is None:
+        files = weight_files(client, uri, pins)
+    pinned = _pin_files(client, uri, files, pins)
+    if stats is not None:
+        stats.files += len(pinned)
     free = [backend.new_staging(staging_bytes) for _ in range(depth)]
-    chunks = _file_chunks(client, uri, staging_bytes, page_bytes)
+    chunks = _file_chunks(client, uri, pinned, staging_bytes, page_bytes)
     joined: dict = {}
     inflight: collections.deque = collections.deque()
     pool = ThreadPoolExecutor(max_workers=depth, thread_name_prefix="racer-read")
 
-    def read(req, etag, chunk: Chunk, target):
+    def read(name, req, etag, chunk: Chunk, target):
         backend.wait(target)
         if chunk.length:
-            client.read_into_gpu(req, target, 0, offset=chunk.start, length=chunk.length, if_match=etag)
+            try:
+                r = client.read_into_gpu(req, target, 0, offset=chunk.start, length=chunk.length, if_match=etag)
+            except (racer.VersionUnavailable, racer.NotFound):
+                raise _changed(uri, name, etag) from None
+            if stats is not None:
+                stats.add_read(r.delivery, r.length)
         return target
 
     def fill() -> bool:
@@ -110,12 +182,12 @@ def iter_weights(
             nxt = next(chunks, None)
             if nxt is None:
                 return bool(inflight)
-            req, etag, chunk = nxt
+            name, req, etag, chunk = nxt
             if chunk.dedicated:
                 target = backend.new_dedicated(chunk.length)
             else:
                 target = free.pop()
-            inflight.append((pool.submit(read, req, etag, chunk, target), chunk))
+            inflight.append((pool.submit(read, name, req, etag, chunk, target), chunk))
         return True
 
     active = None
