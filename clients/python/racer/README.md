@@ -44,6 +44,10 @@ fallback. It tries the mode again after `mode_retry_seconds` (default 300;
 `None` never retries), or at once when the socket file is replaced, which
 happens when the dataplane restarts. `racer.forget_modes()` clears the memory.
 
+`gpu-read` sends the GPU's UUID (`cuda.device_uuid`) so the dataplane finds
+the right GPU even when device numbers in this container differ from the
+host's. A custom destination can provide it with a `gpu_uuid()` method.
+
 `GpuAllocation` uses the CUDA driver API (`libcuda.so.1`, through ctypes).
 Set `RACER_LIBCUDA` to load a different library. torch is needed only for
 `racer.tensors`. A tensor from `as_tensor` keeps the allocation alive.

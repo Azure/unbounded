@@ -37,6 +37,7 @@ If-Match: "<etag>"                      optional, as for Get
 Racer-Destination-Offset: <u64>         required
 Racer-Destination-Length: <u64>         required, > 0
 Racer-Allocation-Size: <u64>            required for gpu-read only
+Racer-Gpu-Uuid: GPU-<uuid>              optional, gpu-read only
 ```
 
 - The client sends exactly one file descriptor with the request head, as
@@ -46,6 +47,13 @@ Racer-Allocation-Size: <u64>            required for gpu-read only
 - For `gpu-read` the descriptor comes from `cuMemExportToShareableHandle` with
   `CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR`. `Racer-Allocation-Size` is the size
   passed to `cuMemCreate`.
+- `Racer-Gpu-Uuid` is the UUID of the GPU that holds the allocation, from
+  `cuDeviceGetUuid`, in the `GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` form
+  `nvidia-smi` prints. The `GPU-` prefix is optional and hex is case
+  insensitive. Device numbers differ between the client's container and the
+  dataplane (a pod with one GPU sees it as device 0), but UUIDs do not, so the
+  dataplane uses the UUID to pick its own context for that GPU. Without it
+  (older clients), the dataplane tries each usable GPU in turn.
 - `Range`, `If-Match`, `Authorization` and `Racer-Metadata` mean the same as for
   Get. `Racer-Page-Credits` and `Racer-Byte-Credits` are ignored.
 
@@ -57,14 +65,19 @@ The dataplane rejects the request with 400, before writing anything, when:
 - a destination header is missing, duplicated, malformed, or
   `offset + length` overflows;
 - for `host-read`, the descriptor is not a regular file;
-- for `gpu-read`, `offset + length > Racer-Allocation-Size`.
+- for `gpu-read`, `offset + length > Racer-Allocation-Size`;
+- for `gpu-read`, `Racer-Gpu-Uuid` is malformed or duplicated.
 
 After resolving the range, the dataplane rejects with 400 if the destination
 length is smaller than the range length. Range and version errors keep their
 Get status codes (412, 416, and so on).
 
-`gpu-read` returns 501 when the dataplane has no usable GPU, or when the
-allocation is on a GPU the dataplane did not discover.
+`gpu-read` returns 501 when the dataplane has no usable GPU, when
+`Racer-Gpu-Uuid` names a GPU the dataplane cannot use (it logs
+`stage=gpu state=import-skipped reason=unknown-gpu-uuid uuid=<uuid>`), or when
+the allocation is on a GPU the dataplane did not discover. If the named GPU
+does not own the allocation, the dataplane tries the others and logs
+`stage=gpu state=uuid-mismatch` when another one does.
 
 ### Response
 
@@ -93,7 +106,10 @@ the kind 2 frame, as for Get. The destination may then hold partial data.
 
 1. The dataplane receives the descriptor with `recvmsg` and `MSG_CMSG_CLOEXEC`.
 2. For `gpu-read` it imports the handle, maps the whole allocation into its own
-   CUDA context, and grants itself read and write access.
+   CUDA context, and grants itself read and write access. Before mapping, the
+   shim checks that the allocation lives on the context's GPU. It resolves the
+   device the driver reports for the handle in the dataplane's own numbering
+   and compares GPU UUIDs, not ordinals.
 3. It writes pages.
 4. When the read ends for any reason, including a client disconnect, it waits
    for all GPU work that touches the allocation, then unmaps it, releases the

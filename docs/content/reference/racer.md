@@ -407,8 +407,13 @@ Racer-Destination-Length: <length>
 - The descriptor comes from `cuMemExportToShareableHandle` with the POSIX file
   descriptor handle type. `Racer-Allocation-Size` is required and must be the
   size passed to `cuMemCreate`.
+- `Racer-Gpu-Uuid` is optional: the UUID of the GPU that holds the memory, as
+  `nvidia-smi` prints it (`GPU-xxxxxxxx-...`). Device numbers in the client's
+  container can differ from the dataplane's, so the dataplane uses the UUID to
+  find the GPU. Without it, the dataplane tries each GPU. The Python client
+  sends it.
 - The answer is 501 when GPU mode is off or the memory is on a GPU the
-  dataplane did not find. It is 400 when the size does not match the memory or
+  dataplane did not find, including an unknown `Racer-Gpu-Uuid`. It is 400 when the size does not match the memory or
   the window does not fit in it.
 - A success has `Racer-Delivery: gpu`. A page frame means the GPU copy of that
   page is complete.
