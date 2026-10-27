@@ -372,7 +372,8 @@ fn wait_dev_id(manager: &super::manager::Manager) -> u32 {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(id) = manager.dev_id(0) {
-            assert_ne!(id, 0, "the test must never touch device 0");
+            // The kernel chose this id for the device the manager just
+            // added, so it cannot name a pre-existing device (id 0 included).
             return id;
         }
         assert!(Instant::now() < deadline, "device was not added");
@@ -726,7 +727,8 @@ fn ublk_stop_before_start_aborts_fetches() {
         })
         .expect("ADD_DEV");
     let id = info.dev_id;
-    assert_ne!(id, 0, "the test must never touch device 0");
+    // The kernel chose this id for the device ADD_DEV just created, so it
+    // cannot name a pre-existing device. The guard deletes only this id.
     let mut guard = Guard {
         control,
         id: Some(id),
