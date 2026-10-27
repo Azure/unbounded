@@ -366,6 +366,7 @@ help: ## Show this help
 	@echo ""
 	@echo "Racer:"
 	@echo "  racer-test                       Test the Rust Racer workspace and Go Racer API and wire contracts"
+	@echo "  racer-gpu-test                   Build the CUDA shim with kernels and run GPU hardware tests"
 	@echo "  racer-envtest                    Run Racer API-server tests with KUBEBUILDER_ASSETS"
 	@echo "  racer-envtest-ci                 Provision pinned assets and run Racer API-server tests"
 	@echo "  racer-generate                   Generate Racer deepcopy and CRD artifacts"
@@ -574,6 +575,21 @@ racer-rust-test: ## Test the Rust Racer workspace, including the embedded cluste
 	timeout --signal=TERM --kill-after=10s 1500s cargo test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --workspace
 
 racer-test: racer-go-test racer-rust-test ## Check Racer
+
+RACER_GPU_NATIVE ?= $(CURDIR)/bin/racer-gpu-native
+# 1 skips when no GPU is found; require fails instead (dedicated GPU runners).
+RACER_GPU_TESTS ?= require
+
+.PHONY: racer-gpu-test
+racer-gpu-test: ## Build the CUDA shim with kernels (needs nvcc) and run GPU hardware tests (needs a GPU)
+	RACER_GPU_REQUIRE_PTX=1 timeout --signal=TERM --kill-after=10s 600s sh images/racer-dataplane/build-native-cuda.sh cmd/racer-dataplane/gpu/native "$(RACER_GPU_NATIVE)/libracer_gpu_cuda.so.1"
+	LD_LIBRARY_PATH="$(RACER_GPU_NATIVE)$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" timeout --signal=TERM --kill-after=10s 300s cargo test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p racer-gpu --no-default-features --features native --lib ffi::tests::required_native_shim_loads_abi_and_symbols -- --exact --ignored
+	LD_LIBRARY_PATH="$(RACER_GPU_NATIVE)$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" RACER_GPU_TESTS=$(RACER_GPU_TESTS) timeout --signal=TERM --kill-after=10s 900s cargo test --locked --manifest-path cmd/racer-dataplane/Cargo.toml -p racer-gpu --no-default-features --features native --test hardware -- --nocapture --test-threads=1
+	@if [ -n "$$RACER_GPU_E2E_SOCKET" ]; then \
+		test -x "$(RACER_PY_VENV)/bin/pytest" || { timeout --signal=TERM --kill-after=10s 120s python3 -m venv "$(RACER_PY_VENV)" && \
+			timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/pip" install -q pytest; }; \
+		cd clients/python/racer && PYTHONPATH=src timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/pytest" -q -p no:cacheprovider -m gpu -rs; \
+	else echo "RACER_GPU_E2E_SOCKET unset: skipping the Python gpu-read test against a live dataplane"; fi
 
 RACER_PY_VENV ?= $(CURDIR)/tmp/racer-python-venv
 
