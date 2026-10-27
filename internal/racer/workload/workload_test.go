@@ -231,6 +231,16 @@ func TestNVIDIAInjectionModes(t *testing.T) {
 				t.Fatalf("CDI annotation = %q (present %v), want present %v", value, hasCDI, tc.wantCDI)
 			}
 
+			// /dev/nvidia-fs* reaches the container through privileged
+			// mode, not the runtime's NVIDIA_GDS hook.
+			if _, ok := env["NVIDIA_GDS"]; ok {
+				t.Fatal("NVIDIA_GDS must not be set")
+			}
+
+			if container.SecurityContext == nil || container.SecurityContext.Privileged == nil || !*container.SecurityContext.Privileged {
+				t.Fatal("dataplane must be privileged to see /dev/nvidia-fs*")
+			}
+
 			// cuFile classifies slab devices through the host udev database.
 			hasUdevVolume := false
 

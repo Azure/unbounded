@@ -371,7 +371,9 @@ func dataplaneEnvironment(c Config) []corev1.EnvVar {
 	}
 
 	// Ask the NVIDIA runtime for driver libraries only. The privileged
-	// container already sees /dev/nvidia*; no GPU resource is requested.
+	// container already sees /dev/nvidia*, including the GPUDirect Storage
+	// /dev/nvidia-fs* nodes that exist when the Pod starts, so NVIDIA_GDS is
+	// not needed. No GPU resource is requested.
 	if c.nvidiaMode() != NVIDIAOff {
 		env = append(env,
 			corev1.EnvVar{Name: "NVIDIA_VISIBLE_DEVICES", Value: "all"},
