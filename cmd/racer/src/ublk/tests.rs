@@ -263,3 +263,186 @@ fn wait_gone(path: &Path) -> bool {
     }
     false
 }
+
+/// Stub backend: the object is the `pattern` bytes, one version, no cache.
+struct StubBackend;
+
+#[derive(Clone)]
+struct StubPage(std::rc::Rc<Vec<u8>>);
+
+impl super::service::PageBytes for StubPage {
+    fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+#[derive(Default)]
+struct StubSource {
+    pages: std::cell::RefCell<std::collections::HashMap<u64, StubPage>>,
+}
+
+impl super::service::PageSource for StubSource {
+    type Page = StubPage;
+
+    fn page(&self, number: u64) -> super::service::Local<'_, crate::error::Result<StubPage>> {
+        let page = self
+            .pages
+            .borrow_mut()
+            .entry(number)
+            .or_insert_with(|| {
+                let start = number * PAGE_BYTES;
+                let end = (start + PAGE_BYTES).min(OBJECT_LEN);
+                StubPage(std::rc::Rc::new(expected(start, (end - start) as usize)))
+            })
+            .clone();
+        Box::pin(async move { Ok(page) })
+    }
+}
+
+impl super::worker::Backend for StubBackend {
+    type Source = StubSource;
+
+    fn resolve(
+        self: std::rc::Rc<Self>,
+        _device: crate::config::UblkDeviceConfig,
+    ) -> super::service::Local<'static, crate::error::Result<super::manager::Resolved>> {
+        Box::pin(async move {
+            Ok(super::manager::Resolved {
+                cache: racer_control_wire::CacheId("stub".into()),
+                etag: crate::model::StrongEtag::parse(b"\"v1\"").unwrap(),
+                length: OBJECT_LEN,
+            })
+        })
+    }
+
+    fn source(
+        &self,
+        _device: &crate::config::UblkDeviceConfig,
+        _resolved: &super::manager::Resolved,
+    ) -> crate::error::Result<StubSource> {
+        Ok(StubSource::default())
+    }
+}
+
+/// Runs one worker: a real reactor serving queue `q` until `done`.
+fn run_worker(q: u16, manager: Arc<super::manager::Manager>, done: Arc<AtomicBool>) {
+    let reactor = crate::test_support::enrollment::reactor().expect("io_uring");
+    let mut worker =
+        super::worker::UblkWorker::new(q, manager, std::rc::Rc::new(StubBackend), reactor.clone());
+    let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+    while !(done.load(Ordering::Relaxed) && worker.is_idle()) {
+        worker.poll(&mut cx);
+        reactor.poll_budgeted(64).expect("reactor poll");
+        reactor
+            .wait(Duration::from_millis(2))
+            .expect("reactor wait");
+    }
+    // Let canceled commands reach their fence before the reactor drops.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while reactor.in_flight() > 0 && Instant::now() < deadline {
+        reactor.poll_budgeted(64).expect("reactor poll");
+        reactor
+            .wait(Duration::from_millis(2))
+            .expect("reactor wait");
+    }
+}
+
+/// The dataplane queue path end to end: the manager's control thread adds
+/// and starts a device, two worker threads serve its queues through the
+/// reactor, and reads through `/dev/ublkbN` match the object.
+#[test]
+fn ublk_worker_queues_serve_reads() {
+    if !enabled() {
+        return;
+    }
+    let config = crate::config::UblkConfig {
+        devices: vec![crate::config::UblkDeviceConfig {
+            cache: "stub".into(),
+            key: crate::model::CacheKey([3; 32]),
+            etag: None,
+            id: None,
+        }],
+        queue_depth: DEPTH,
+        max_io_bytes: MAX_IO,
+    };
+    let manager = Arc::new(super::manager::Manager::new(
+        &config,
+        2,
+        Path::new("/dev"),
+        Duration::from_secs(10),
+        Duration::from_secs(10),
+    ));
+    let done = Arc::new(AtomicBool::new(false));
+    let workers: Vec<_> = (0..2)
+        .map(|q| {
+            let manager = manager.clone();
+            let done = done.clone();
+            thread::spawn(move || run_worker(q, manager, done))
+        })
+        .collect();
+    let control = {
+        let manager = manager.clone();
+        thread::spawn(move || manager.run())
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let id = loop {
+        if let Some(id) = manager.dev_id(0) {
+            break id;
+        }
+        assert!(Instant::now() < deadline, "device was not added");
+        thread::sleep(Duration::from_millis(10));
+    };
+    eprintln!("ublk worker test: device {id}");
+    let block_path = Path::new("/dev").join(format!("ublkb{id}"));
+    assert!(
+        wait_for(&block_path),
+        "{} did not appear",
+        block_path.display()
+    );
+    let size = OBJECT_LEN.div_ceil(512) * 512;
+    let block = loop {
+        // The node can appear just before START_DEV returns.
+        match File::open(&block_path) {
+            Ok(block) => break block,
+            Err(_) if Instant::now() < deadline + Duration::from_secs(5) => {
+                thread::sleep(Duration::from_millis(10))
+            }
+            Err(error) => panic!("open {}: {error}", block_path.display()),
+        }
+    };
+    // O_DIRECT is not needed: each range is read once and compared.
+    for (offset, len) in [
+        (0_u64, 4096_usize),
+        (12_345, 100_000),
+        (PAGE_BYTES - 4096, 8192),
+        (2 * PAGE_BYTES - 1000, 3 * MIB as usize),
+        (size - 4096, 4096),
+        (size - 512, 512),
+    ] {
+        let mut buf = vec![0xaa_u8; len];
+        block.read_exact_at(&mut buf, offset).expect("pread");
+        assert!(buf == expected(offset, len), "mismatch at {offset}+{len}");
+    }
+    let mut past = [0_u8; 16];
+    assert_eq!(block.read_at(&mut past, size).expect("read at end"), 0);
+    drop(block);
+
+    manager.request_stop();
+    control.join().expect("control thread");
+    assert!(manager.control_done());
+    done.store(true, Ordering::Relaxed);
+    for worker in workers {
+        worker.join().expect("worker thread");
+    }
+    assert!(
+        wait_gone(&block_path),
+        "{} still present",
+        block_path.display()
+    );
+    let char_path = Path::new("/dev").join(format!("ublkc{id}"));
+    assert!(
+        wait_gone(&char_path),
+        "{} still present",
+        char_path.display()
+    );
+}

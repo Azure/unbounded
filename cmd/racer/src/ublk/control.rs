@@ -21,9 +21,6 @@ use super::uapi::{
     U_CMD_START_DEV, U_CMD_STOP_DEV,
 };
 
-/// Production directory holding `ublk-control` and the device nodes.
-pub(crate) const DEFAULT_DEVICE_DIR: &str = "/host/dev";
-
 /// Size of the payload page. It holds the largest payload (`Params`).
 const PAYLOAD_LEN: usize = 4096;
 
@@ -55,6 +52,7 @@ pub(crate) enum UblkError {
 
 impl UblkError {
     /// The kernel errno, if the kernel rejected the command.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn errno(&self) -> Option<i32> {
         match self {
             Self::Kernel { errno, .. } => Some(*errno),
@@ -198,11 +196,6 @@ impl Control {
         })
     }
 
-    /// Whether a completion was lost and the channel is unusable.
-    pub(crate) fn is_poisoned(&self) -> bool {
-        self.poisoned
-    }
-
     fn sqe(&mut self, op: u32, dev_id: u32, data: u64, payload_len: usize) -> squeue::Entry128 {
         let mut cmd = CtrlCmd {
             dev_id,
@@ -344,6 +337,7 @@ impl Control {
     }
 
     /// GET_DEV_INFO.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn get_dev_info(&mut self, id: u32) -> Result<DevInfo> {
         let mut out = [0_u8; DEV_INFO_SIZE];
         let res = self.command(U_CMD_GET_DEV_INFO, id, 0, &[], &mut out)?;

@@ -38,6 +38,7 @@ const fn ior(nr: u32, size: usize) -> u32 {
 }
 
 /// `UBLK_U_CMD_GET_DEV_INFO`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const U_CMD_GET_DEV_INFO: u32 = ior(0x02, CTRL_CMD_SIZE);
 /// `UBLK_U_CMD_ADD_DEV`.
 pub(crate) const U_CMD_ADD_DEV: u32 = iowr(0x04, CTRL_CMD_SIZE);
@@ -72,9 +73,11 @@ pub(crate) const UBLK_IO_RES_OK: i32 = 0;
 /// `UBLK_IO_RES_ABORT`: the fetch completed because the queue is going away.
 pub(crate) const UBLK_IO_RES_ABORT: i32 = -libc::ENODEV;
 
-/// `UBLK_S_DEV_DEAD`.
+/// `UBLK_S_DEV_DEAD`. Kept to mirror the UAPI header.
+#[allow(dead_code)]
 pub(crate) const UBLK_S_DEV_DEAD: u16 = 0;
 /// `UBLK_S_DEV_LIVE`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const UBLK_S_DEV_LIVE: u16 = 1;
 
 /// `UBLK_IO_OP_*` values in the low byte of `ublksrv_io_desc.op_flags`.
@@ -304,6 +307,7 @@ impl Params {
 }
 
 impl IoDesc {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn to_bytes(self) -> [u8; IO_DESC_SIZE] {
         // SAFETY: IoDesc is repr(C), padding-free (size test), integers only.
         unsafe { pod_bytes(&self) }

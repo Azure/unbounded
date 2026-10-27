@@ -48,10 +48,6 @@ impl IoDescriptors {
         Ok(Self { ptr, len, depth })
     }
 
-    pub(crate) fn depth(&self) -> u16 {
-        self.depth
-    }
-
     /// Reads tag `tag`'s descriptor. Call only after the tag's fetch completed
     /// and before it is committed; the kernel rewrites it per request.
     pub(crate) fn get(&self, tag: u16) -> IoDesc {
