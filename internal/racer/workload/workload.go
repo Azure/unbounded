@@ -58,10 +58,11 @@ const (
 type NVIDIAInjection string
 
 const (
-	// NVIDIAOff adds nothing.
+	// NVIDIAOff adds no NVIDIA env, CDI annotation, or /run/udev mount.
 	NVIDIAOff NVIDIAInjection = "off"
-	// NVIDIAEnv sets NVIDIA_VISIBLE_DEVICES and NVIDIA_DRIVER_CAPABILITIES.
-	// The NVIDIA container runtime acts on them; runc ignores them, so they
+	// NVIDIAEnv sets NVIDIA_VISIBLE_DEVICES and NVIDIA_DRIVER_CAPABILITIES and
+	// mounts /run/udev for cuFile.
+	// The NVIDIA container runtime acts on the variables; runc ignores them, so they
 	// are harmless on nodes without NVIDIA.
 	NVIDIAEnv NVIDIAInjection = "env"
 	// NVIDIACDI also adds the CDI pod annotation. containerd fails container
