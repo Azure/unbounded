@@ -544,6 +544,7 @@ func minimumAllocatableForChecks(checks []signalv1.CertificationCheck) corev1.Re
 
 	for index := range checks {
 		resources := checks[index].WorkloadPolicy.Resources
+
 		effectiveRequests := resources.Requests.DeepCopy()
 		if effectiveRequests == nil {
 			effectiveRequests = corev1.ResourceList{}
@@ -1162,6 +1163,7 @@ func (r *RunReconciler) finishInvalidExecutionPlan(
 		Phase: "Error",
 	}
 	evidenceRun.Status.Checks = initialCheckStatuses(run.Spec.Checks)
+
 	for index := range evidenceRun.Status.Checks {
 		evidenceRun.Status.Checks[index].Phase = signalv1.CheckPhaseInconclusive
 		evidenceRun.Status.Checks[index].Verdict = "Inconclusive"
@@ -1170,6 +1172,7 @@ func (r *RunReconciler) finishInvalidExecutionPlan(
 
 	startedAt := groupedStartedAt(nil, run)
 	finishedAt := metav1.NewTime(r.now())
+
 	evidence, err := r.evidenceDocument(
 		ctx,
 		evidenceRun,
@@ -1234,6 +1237,7 @@ func (r *RunReconciler) recordWorkflowStarted(
 
 func buildWorkflow(run *signalv1.CertificationRun) (*unstructured.Unstructured, error) {
 	checks := run.Spec.Checks
+
 	suiteDeadline, err := validateRunCheckPlan(checks)
 	if err != nil {
 		return nil, err
