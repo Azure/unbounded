@@ -117,8 +117,10 @@ Clients try modes in order: GPU, then host, then stream.
   `recv`.
 - A new dataplane without a usable GPU answers `gpu-read` with 501.
 
-A client remembers an unsupported mode for the socket path until the process
-exits:
+A client remembers an unsupported mode for the socket path, logs one warning
+with the status, and tries the mode again after a retry interval (300 seconds
+by default in the Python client) or when the socket file is replaced by a
+restarted dataplane:
 
 - 501 marks the mode unsupported at once.
 - 400, 404 and 405 can also mean a bad request, so the client falls back for

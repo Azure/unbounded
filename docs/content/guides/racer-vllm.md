@@ -90,8 +90,9 @@ spec:
 
 The webhook mounts `/run/racer/models/client` read-only into the container and
 sets `RACER_SOCKET` to the socket in it. To limit the mount to some containers,
-add `racer.unbounded-cloud.io/client-containers: vllm`. The webhook does not
-change init containers, so run `racer-vllm-fetch` in the vLLM container.
+add `racer.unbounded-cloud.io/client-containers: vllm`. The webhook mounts the
+socket into init containers too, so `racer-vllm-fetch` can also run in an init
+container that writes to the shared `emptyDir`.
 
 ## 3. Install racer-vllm
 
@@ -100,6 +101,9 @@ Install both Python packages into the vLLM image:
 ```bash
 pip install ./clients/python/racer ./clients/python/racer-vllm
 ```
+
+`make racer-python-dist` builds wheels for both packages into
+`tmp/racer-python-dist`.
 
 `racer-vllm` registers the `racer` load format with vLLM through a plugin entry
 point. No other code change is needed.
@@ -111,10 +115,27 @@ takes two steps:
 
 1. `racer-vllm-fetch racer://<cache>/<bucket>/<prefix> <dir>` copies
    `config.json`, the tokenizer files, and the safetensors index into `<dir>`.
-   It also writes `racer-model.json`, which records the `racer://` location.
+   It also writes `racer-model.json`, which records the `racer://` location and
+   the ETag of each fetched file and each weight file.
    The prefix is the directory that holds `model.safetensors.index.json` and
    the safetensors files.
-2. `vllm serve <dir> --load-format racer` reads the weights through Racer.
+2. `vllm serve <dir> --load-format racer` reads the weights through Racer, at
+   the ETags in `racer-model.json`. If the model changed at the origin since
+   the fetch, or changes during the load, the load fails with
+   `ModelChangedError`. Run `racer-vllm-fetch` again to pick up the new
+   version.
+
+After each load, vLLM's log shows one `racer: loaded ...` line with the file
+count, bytes, time, throughput, and the number of reads in each delivery mode
+(`gpu`, `host`, `stream`). When the dataplane refuses a mode, the client logs a
+warning with the reason once, then retries the mode after
+`mode_retry_seconds` (default 300) or when the dataplane restarts.
+
+With tensor parallelism, each rank reads every weight file of a regular
+checkpoint. Ranks on one node share the dataplane, so repeat reads come from
+its cache, not the origin. To have each rank read only its own files, save a
+vLLM `sharded_state` checkpoint and pass
+`--model-loader-extra-config '{"sharded_state": true}'`.
 
 See the `racer-vllm` README for loader options such as `staging_bytes`.
 
