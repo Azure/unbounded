@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"strconv"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -74,26 +73,8 @@ func planDataplaneConfig(ctx context.Context, env *component.Env, plan *componen
 		return nil, err
 	}
 
-	if value, ok := config.Data[workload.ControlSeatsKey]; ok && value != "auto" {
-		// The runtime accepts only the canonical decimal form, so reject
-		// leading zeros, signs, and whitespace before Pods roll.
-		seats, err := strconv.ParseUint(value, 10, 8)
-		if err != nil || strconv.FormatUint(seats, 10) != value || seats < 1 || seats > workload.MaxControlSeats {
-			return nil, fmt.Errorf("ConfigMap %s %s must be auto or an integer from 1 to %d", dataplaneConfigName, workload.ControlSeatsKey, workload.MaxControlSeats)
-		}
-	}
-
-	if value, ok := config.Data[workload.NVIDIAKey]; ok {
-		if mode := workload.NVIDIAInjection(value); mode != workload.NVIDIAOff && mode != workload.NVIDIAEnv && mode != workload.NVIDIACDI {
-			return nil, fmt.Errorf("ConfigMap %s %s must be off, env, or cdi", dataplaneConfigName, workload.NVIDIAKey)
-		}
-	}
-
-	if value, ok := config.Data["RACER_MAX_THREADS"]; ok {
-		threads, err := strconv.ParseUint(value, 10, 64)
-		if err != nil || threads < minThreads {
-			return nil, fmt.Errorf("ConfigMap %s RACER_MAX_THREADS must be an integer of at least %d, including the control plane thread", dataplaneConfigName, minThreads)
-		}
+	if err := validateDataplaneConfig(config.Data); err != nil {
+		return nil, err
 	}
 
 	return config, nil

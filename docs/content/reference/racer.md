@@ -197,6 +197,13 @@ Tune `racer-dataplane-config` in the installation namespace (normally `unbounded
 The operator preserves administrator data and hashes edits into managed rollouts.
 Explicit workload environment wiring takes precedence over ConfigMap imports.
 Numeric values are unsigned decimal strings: `268435456`, not `256Mi`.
+The operator checks each value with the same per-key rules the dataplane uses at
+startup: enum and boolean values, decimal syntax, nonzero and range limits, the
+2 MiB multiples of the GPU byte settings, and setting `RACER_IO_WORKERS` and
+`RACER_CRYPTO_HELPERS` together. When a value is invalid, reconciliation fails
+with an error that names every bad key, and the DaemonSet keeps its current
+configuration until the ConfigMap is fixed. Limits that depend on the node, such
+as CPU count or memory, are still checked only by the dataplane at startup.
 
 | Setting | Default | Scope / constraint |
 |---------|---------|--------------------|
