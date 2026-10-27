@@ -1,6 +1,6 @@
 # Racer dataplane ublk devices
 
-Status: draft.
+Status: implemented (draft PR). See "Implementation" for what was built.
 
 ## Summary
 
@@ -81,8 +81,10 @@ itself.
 1. A worker resolves metadata for the cache key, with the pinned ETag if one is set. This
    gives the version and length. It waits until the cache appears in the snapshot.
 2. The control thread sends `ADD_DEV` and `SET_PARAMS`.
-3. Each worker opens `/dev/ublkcN`, maps its descriptor array, and sends `FETCH_REQ` for
-   every tag.
+3. The control thread opens `/dev/ublkcN` once. The kernel allows only one open of the
+   character device, so each worker takes a `dup` of that descriptor, maps its own queue's
+   descriptor array, and sends `FETCH_REQ` for every tag. The control thread drops its own
+   copy once every worker has attached.
 4. The control thread sends `START_DEV`. The kernel waits until every tag has a fetch
    outstanding, then adds the disk. Workers are already serving, so the partition scan reads
    complete.
@@ -118,8 +120,44 @@ sequential reader also starts the next page early.
    When all tags of a queue are aborted, the worker closes its `/dev/ublkcN` descriptor.
 3. When every worker has closed its descriptor, the control thread sends `DEL_DEV`.
 
+Every wait is bounded by `RACER_SHUTDOWN_TIMEOUT_MS`. If queues are still attached after
+that, the control thread tells workers to abandon them. A worker also abandons its queues
+when its own drain deadline passes or when the control thread has exited. Abandoning drops
+the tag futures. The reactor sends `ASYNC_CANCEL` for each outstanding command and keeps the
+descriptor open until the kernel completes it, so no kernel reference outlives its owner.
+
 If the process dies, closing the rings and descriptors aborts all requests. The device stays
 until something deletes it. A fixed `id` lets the next start replace it.
+
+## Implementation
+
+Code lives in `cmd/racer/src/ublk/`.
+
+- `service.rs`: the per-tag loop (`serve_tag`) and `QueueService`, which runs every tag of
+  one queue plus readahead. The kernel side (`QueueKernel`) and the pages (`PageSource`) are
+  traits, so tests drive the loop without a device.
+- `worker.rs`: `UblkWorker`, one per I/O worker. It resolves device versions (worker 0 only),
+  attaches queues, and polls them. `ReactorKernel` implements `QueueKernel` with
+  `Reactor::uring_cmd` and `write_shared_at` on the worker's ring.
+- `directory.rs`: `DirectoryBackend` and `DirectorySource`. They resolve metadata with
+  `WorkerDirectory::resolve_with_budget` and read pages with `WorkerDirectory::acquire`,
+  pinned to the resolved version. A version lookup retries every second while the cache is
+  missing from the snapshot or the read path is unavailable.
+- `manager.rs`: `Manager`, the node-level device table shared by workers and the
+  `ublk-control` thread, and the control loop. `DeviceControl` abstracts the control
+  commands for tests.
+- `app.rs`: `Application::start_ublk` creates the manager and thread only when devices are
+  configured. `reserve_ublk_submissions` adds `2 * devices * queue_depth` reactor queue
+  entries and the matching request-context bytes to each worker, for the long-lived queue
+  commands plus one write per tag. `WorkerApplication` polls `UblkWorker` from
+  `poll_services`, signals stop from `stop_admission`, and does not finish `drain` until its
+  queues are closed.
+
+Workers find out about new devices on their next poll. The control thread wakes them through
+the task waker each worker registers with the manager.
+
+Readahead is simple. When a read ends in the last quarter of a page, the queue starts
+fetching the next page, at most two pages at a time per queue.
 
 ## Differences from racer-block
 
@@ -135,8 +173,25 @@ until something deletes it. A fixed `id` lets the next start replace it.
 
 - Unit tests for the UAPI layouts, config parsing, request decoding, and page range math.
 - Simulation tests for the new `uring_cmd` reactor operation.
-- A root-only integration test adds a real device, reads it with `pread`, and compares the
-  bytes with the object. It is skipped without root or `/dev/ublk-control`.
+- Unit tests for the tag loop against an in-memory kernel: page crossing, zero tail, short
+  writes, error mapping, aborts, command failures, and readahead.
+- Unit tests for the control loop against a fake kernel: normal lifecycle, fixed id
+  replacement, resolve, attach, start, and serving failures, and shutdown timeouts.
+- Tests that ublk off does nothing and that queue headroom is reserved.
+- Two root-only tests, run with `RACER_UBLK_TEST=1` as root. One drives the raw kernel
+  interface. The other runs the real `Manager`, control thread, and two worker threads with
+  real reactors serving through `UblkWorker`, reads `/dev/ublkbN` with `pread` at several
+  offsets (including across a 16 MiB page and the zero tail), then stops and checks that the
+  device is gone. That test uses a stub page source instead of the full dataplane read path.
+
+## Follow-ups not done
+
+- An end-to-end test through the full dataplane (`WorkerDirectory`, origin, peers). The root
+  test covers the kernel and reactor path with a stub page source; `DirectorySource` is a
+  thin adapter over the existing read path.
+- A device that fails is not retried. It stays down until the dataplane restarts.
+- No metrics for ublk requests yet. Failures are logged.
+- No per-request deadline from the kernel. Each page read uses `RACER_REQUEST_TIMEOUT_MS`.
 
 ## Open questions
 
