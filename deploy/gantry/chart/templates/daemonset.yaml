@@ -41,8 +41,6 @@ spec:
           args:
             - init
           securityContext:
-            # gantry init gives UID 65532 the libp2p identity hostPath, which
-            # kubelet creates root-owned.
             runAsNonRoot: false
             runAsUser: 0
             runAsGroup: 0
