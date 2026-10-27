@@ -115,7 +115,9 @@ sequential reader also starts the next page early.
 ### Shutdown
 
 1. On stop, the control thread sends `STOP_DEV` for each started device. The kernel waits
-   for in-flight requests, which workers keep serving while they drain.
+   for in-flight requests, which workers keep serving while they drain. Until the control
+   thread exits, or the drain deadline passes, each worker keeps its read mailbox open and
+   does not stop its flights, so these reads can still reach the cache, peers, and origin.
 2. The kernel then completes every outstanding fetch with `UBLK_IO_RES_ABORT` (`-ENODEV`).
    When all tags of a queue are aborted, the worker closes its `/dev/ublkcN` descriptor.
 3. When every worker has closed its descriptor, the control thread sends `DEL_DEV`.
@@ -178,17 +180,21 @@ fetching the next page, at most two pages at a time per queue.
 - Unit tests for the control loop against a fake kernel: normal lifecycle, fixed id
   replacement, resolve, attach, start, and serving failures, and shutdown timeouts.
 - Tests that ublk off does nothing and that queue headroom is reserved.
-- Two root-only tests, run with `RACER_UBLK_TEST=1` as root. One drives the raw kernel
-  interface. The other runs the real `Manager`, control thread, and two worker threads with
-  real reactors serving through `UblkWorker`, reads `/dev/ublkbN` with `pread` at several
-  offsets (including across a 16 MiB page and the zero tail), then stops and checks that the
-  device is gone. That test uses a stub page source instead of the full dataplane read path.
+- Unit tests for `DirectoryBackend` and `DirectorySource` over a real `WorkerDirectory` and
+  read worker with a scripted origin: missing cache, fresh and pinned lookups, page bytes,
+  and version and not-found errors.
+- Tests that a stopping worker keeps its read mailbox open until the control thread exits.
+- Three root-only tests, run with `RACER_UBLK_TEST=1` as root. One drives the raw kernel
+  interface. One runs the real `Manager`, control thread, and two worker threads with real
+  reactors serving through `UblkWorker` and a stub page source. It reads `/dev/ublkbN` with
+  `pread` at several offsets (including across a 16 MiB page and the zero tail), then stops
+  and checks that the device is gone. The third serves one queue through `DirectorySource`,
+  `WorkerDirectory`, and a scripted origin, and compares the bytes read.
 
 ## Follow-ups not done
 
-- An end-to-end test through the full dataplane (`WorkerDirectory`, origin, peers). The root
-  test covers the kernel and reactor path with a stub page source; `DirectorySource` is a
-  thin adapter over the existing read path.
+- An end-to-end test through a full multi-worker dataplane with peers. The root tests cover
+  one worker's read path with a scripted origin, not `WorkerApplication` startup or peers.
 - A device that fails is not retried. It stays down until the dataplane restarts.
 - No metrics for ublk requests yet. Failures are logged.
 - No per-request deadline from the kernel. Each page read uses `RACER_REQUEST_TIMEOUT_MS`.
