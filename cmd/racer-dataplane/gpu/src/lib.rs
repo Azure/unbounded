@@ -36,6 +36,7 @@
 //! - Neither: [`Gpu::load`] returns [`Error::Unavailable`].
 //!
 //! Hardware-free tests: `cargo test -p racer-gpu --features simulation`.
+//! Tests on a real GPU: `make racer-gpu-test` (`tests/hardware.rs`).
 mod ffi;
 pub mod gcm;
 

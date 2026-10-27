@@ -1104,6 +1104,33 @@ On nodes set up by the unbounded agent, the NVIDIA runtime is the default
 containerd runtime and runs in CDI mode, so `env` is enough there. These env
 entries are operator wiring: workload overrides cannot change them.
 
+### Testing on GPUs
+
+Regular CI has no GPU. It compiles the decrypt kernels with `nvcc` and runs
+them on the CPU through an emulation, but never loads them on a GPU. On a
+machine with an NVIDIA driver, `nvcc`, and Rust, run:
+
+```sh
+make racer-gpu-test
+```
+
+This builds `libracer_gpu_cuda.so.1` with its kernels and runs the hardware
+tests in `cmd/racer-dataplane/gpu/tests/hardware.rs`: shim load, device
+discovery, import of an exported client allocation, GPU decrypt checked
+against the CPU, and cuFile reads. It fails when no GPU is found; pass
+`RACER_GPU_TESTS=1` to skip instead. cuFile tests skip when cuFile cannot open
+or the directory does not support `O_DIRECT` (set `RACER_GPU_TEST_DIR`); set
+`RACER_GPU_TESTS_CUFILE=require` to make that a failure. To also test
+`gpu-read` end to end from the Python client, set `RACER_GPU_E2E_SOCKET` to a
+running dataplane's client socket and `RACER_GPU_E2E_KEY` to the hex key of an
+object it can serve (`RACER_GPU_E2E_METADATA` and
+`RACER_GPU_E2E_AUTHORIZATION` are optional).
+
+The `racer gpu` workflow (`.github/workflows/racer-gpu.yaml`) runs this target
+nightly and on demand. It runs only when the repository variable
+`RACER_GPU_RUNNER` holds the GPU runner labels as a JSON array, for example
+`["self-hosted", "linux", "gpu"]`.
+
 See [Load vLLM models from Racer]({{< relref "guides/racer-vllm" >}}).
 
 ## RDMA
