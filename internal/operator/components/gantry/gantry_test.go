@@ -183,9 +183,14 @@ func TestApplyMutatorStampsDaemonSetAndSkipsConfig(t *testing.T) {
 		"metadata":   map[string]any{"name": daemonSetName},
 		"spec": map[string]any{"template": map[string]any{
 			"metadata": map[string]any{},
-			"spec": map[string]any{"containers": []any{
-				map[string]any{"name": agentContainerName, "image": "placeholder"},
-			}},
+			"spec": map[string]any{
+				"initContainers": []any{
+					map[string]any{"name": initContainerName, "image": "placeholder"},
+				},
+				"containers": []any{
+					map[string]any{"name": agentContainerName, "image": "placeholder"},
+				},
+			},
 		}},
 	}}
 
@@ -231,11 +236,11 @@ func TestOperatorManifestAllowlist(t *testing.T) {
 	}
 }
 
-// TestApplyMutatorImagesOnlyAgentContainer asserts the operator-derived image is
-// stamped only on the gantry agent's own container, leaving any other
-// container, such as an init container added by a workload override, with its
-// own image.
-func TestApplyMutatorImagesOnlyAgentContainer(t *testing.T) {
+// TestApplyMutatorImagesOnlyGantryContainers asserts the operator-derived image
+// is stamped on the gantry agent and its init container, both of which run the
+// gantry image, and on no other container, such as an init container added by a
+// workload override.
+func TestApplyMutatorImagesOnlyGantryContainers(t *testing.T) {
 	const (
 		derived   = "ghcr.io/azure/gantry:v1.2.3"
 		initImage = "registry.example.com/tools/init:1.0"
@@ -249,6 +254,7 @@ func TestApplyMutatorImagesOnlyAgentContainer(t *testing.T) {
 			"metadata": map[string]any{},
 			"spec": map[string]any{
 				"initContainers": []any{
+					map[string]any{"name": initContainerName, "image": "placeholder"},
 					map[string]any{"name": "override-init", "image": initImage},
 				},
 				"containers": []any{
@@ -266,8 +272,13 @@ func TestApplyMutatorImagesOnlyAgentContainer(t *testing.T) {
 		t.Fatalf("init container image was rewritten to %q; must keep its own image", initImg)
 	}
 
-	if agentImg := containerImage(t, agent, "containers", agentContainerName); agentImg != derived {
-		t.Fatalf("agent container image = %q, want derived %q", agentImg, derived)
+	for _, gantry := range []struct{ field, name string }{
+		{field: "initContainers", name: initContainerName},
+		{field: "containers", name: agentContainerName},
+	} {
+		if img := containerImage(t, agent, gantry.field, gantry.name); img != derived {
+			t.Fatalf("%s image = %q, want derived %q", gantry.name, img, derived)
+		}
 	}
 
 	// The standalone node-config DaemonSet is not an operator-managed workload.

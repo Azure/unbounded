@@ -18,8 +18,6 @@ import (
 	"syscall"
 	"testing"
 	"time"
-
-	"github.com/Azure/unbounded/internal/gantry/config"
 )
 
 // unprivilegedStatus is the part of /proc/self/status that
@@ -69,10 +67,6 @@ func (f *fakeAgentRuntime) deps() agentRuntimeDeps {
 			return root.Lchown(name, os.Getuid(), os.Getgid())
 		},
 	}
-}
-
-func identityConfig(dir string) *config.Config {
-	return &config.Config{Libp2pIdentityPath: filepath.Join(dir, "identity.key")}
 }
 
 // tempDir is t.TempDir with symlinks resolved, because the identity directory
@@ -151,7 +145,7 @@ func TestPrepareAgentRuntimeLeavesUnprivilegedProcessAlone(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "libp2p")
 	fake := &fakeAgentRuntime{euid: agentUID}
 
-	if err := prepareAgentRuntimeWith(identityConfig(dir), discardLogger(), fake.deps()); err != nil {
+	if err := prepareAgentRuntimeWith(dir, discardLogger(), fake.deps()); err != nil {
 		t.Fatalf("prepareAgentRuntimeWith: %v", err)
 	}
 
@@ -168,7 +162,7 @@ func TestPrepareAgentRuntimeReownsIdentityDirectoryThenDropsRoot(t *testing.T) {
 	dir, _ := newIdentityDirFixture(t)
 	fake := &fakeAgentRuntime{status: unprivilegedStatus}
 
-	if err := prepareAgentRuntimeWith(identityConfig(dir), discardLogger(), fake.deps()); err != nil {
+	if err := prepareAgentRuntimeWith(dir, discardLogger(), fake.deps()); err != nil {
 		t.Fatalf("prepareAgentRuntimeWith: %v", err)
 	}
 
@@ -205,7 +199,7 @@ func TestPrepareAgentRuntimeCreatesMissingIdentityDirectory(t *testing.T) {
 
 	fake := &fakeAgentRuntime{status: unprivilegedStatus}
 
-	if err := prepareAgentRuntimeWith(identityConfig(dir), discardLogger(), fake.deps()); err != nil {
+	if err := prepareAgentRuntimeWith(dir, discardLogger(), fake.deps()); err != nil {
 		t.Fatalf("prepareAgentRuntimeWith: %v", err)
 	}
 
@@ -222,77 +216,6 @@ func TestPrepareAgentRuntimeCreatesMissingIdentityDirectory(t *testing.T) {
 	}
 }
 
-func TestPrepareAgentRuntimeWithoutIdentityPathOnlyDropsRoot(t *testing.T) {
-	fake := &fakeAgentRuntime{status: unprivilegedStatus}
-
-	if err := prepareAgentRuntimeWith(&config.Config{}, discardLogger(), fake.deps()); err != nil {
-		t.Fatalf("prepareAgentRuntimeWith: %v", err)
-	}
-
-	if want := []string{"setuid 65532", "status"}; !slices.Equal(fake.calls, want) {
-		t.Fatalf("calls = %q, want %q", fake.calls, want)
-	}
-}
-
-// TestPrepareAgentRuntimeRacerOnlyDropsRoot uses identity paths the directory
-// step would reject or create. Racer never loads the identity, so it must leave
-// them alone and still switch users.
-func TestPrepareAgentRuntimeRacerOnlyDropsRoot(t *testing.T) {
-	missing := filepath.Join(t.TempDir(), "libp2p")
-
-	for _, test := range []struct {
-		name string
-		path string
-	}{
-		{name: "relative path", path: "identity.key"},
-		{name: "missing directory", path: filepath.Join(missing, "identity.key")},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			fake := &fakeAgentRuntime{status: unprivilegedStatus}
-			c := &config.Config{RacerEnabled: true, Libp2pIdentityPath: test.path}
-
-			if err := prepareAgentRuntimeWith(c, discardLogger(), fake.deps()); err != nil {
-				t.Fatalf("prepareAgentRuntimeWith: %v", err)
-			}
-
-			if want := []string{"setuid 65532", "status"}; !slices.Equal(fake.calls, want) {
-				t.Fatalf("calls = %q, want %q", fake.calls, want)
-			}
-		})
-	}
-
-	if _, err := os.Lstat(missing); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("Racer start created %s: %v", missing, err)
-	}
-}
-
-func TestPrepareAgentRuntimeRejectsUnsafeIdentityPaths(t *testing.T) {
-	for _, test := range []struct {
-		name string
-		path string
-	}{
-		{name: "relative file", path: "identity.key"},
-		{name: "relative directory", path: "state/identity.key"},
-		{name: "filesystem root", path: "/identity.key"},
-		{name: "filesystem root after cleaning", path: "/var/../identity.key"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			fake := &fakeAgentRuntime{status: unprivilegedStatus}
-
-			err := prepareAgentRuntimeWith(&config.Config{Libp2pIdentityPath: test.path}, discardLogger(), fake.deps())
-			if err == nil || !strings.Contains(err.Error(), "must be an absolute path below /") {
-				t.Fatalf("err = %v, want the identity path rejected", err)
-			}
-
-			// Nothing is re-owned, and the process keeps root only because
-			// startup stops here.
-			if len(fake.calls) != 0 {
-				t.Fatalf("calls = %q, want nothing", fake.calls)
-			}
-		})
-	}
-}
-
 // TestPrepareAgentRuntimeRefusesSymlinksInIdentityPath plants a link where the
 // identity directory or one of its parents belongs, as an agent that owns the
 // parent could. Following it would re-own and restrict whatever it points at,
@@ -301,10 +224,10 @@ func TestPrepareAgentRuntimeRefusesSymlinksInIdentityPath(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		link string
-		path string
+		dir  string
 	}{
-		{name: "identity directory", link: "libp2p", path: "libp2p/identity.key"},
-		{name: "parent directory", link: "state", path: "state/libp2p/identity.key"},
+		{name: "identity directory", link: "libp2p", dir: "libp2p"},
+		{name: "parent directory", link: "state", dir: "state/libp2p"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			base := tempDir(t)
@@ -321,7 +244,7 @@ func TestPrepareAgentRuntimeRefusesSymlinksInIdentityPath(t *testing.T) {
 			mode := modeOf(t, target)
 			fake := &fakeAgentRuntime{status: unprivilegedStatus}
 
-			err := prepareAgentRuntimeWith(&config.Config{Libp2pIdentityPath: filepath.Join(base, test.path)}, discardLogger(), fake.deps())
+			err := prepareAgentRuntimeWith(filepath.Join(base, test.dir), discardLogger(), fake.deps())
 			if err == nil || !strings.Contains(err.Error(), "without following symlinks") {
 				t.Fatalf("err = %v, want the symlink refused", err)
 			}
@@ -380,7 +303,7 @@ func TestPrepareAgentRuntimeStopsAtFirstFailure(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			fake := test.fake
 
-			err := prepareAgentRuntimeWith(identityConfig(tempDir(t)), discardLogger(), fake.deps())
+			err := prepareAgentRuntimeWith(tempDir(t), discardLogger(), fake.deps())
 			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
 				t.Fatalf("err = %v, want it to contain %q", err, test.wantErr)
 			}
@@ -478,36 +401,72 @@ func TestPrepareIdentityDirChangesOwnershipAsRoot(t *testing.T) {
 	}
 }
 
-// TestPrepareAgentRuntimeDropsRootAsRoot switches users in a child process,
-// because the switch cannot be undone and would leave the remaining tests
-// running unprivileged.
+// TestPrepareAgentRuntimeDropsRootAsRoot runs the real routine in a child
+// process, because the switch cannot be undone and would leave the remaining
+// tests running unprivileged.
 func TestPrepareAgentRuntimeDropsRootAsRoot(t *testing.T) {
 	const child = "GANTRY_DROP_ROOT_TEST_CHILD"
 
-	if os.Getenv(child) == "" {
-		if os.Geteuid() != 0 {
-			t.Skip("dropping root privileges needs root")
-		}
-
-		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-		defer cancel()
-
-		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^"+t.Name()+"$", "-test.count=1")
-
-		cmd.Env = append(os.Environ(), child+"=1")
-		if output, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("child: %v\n%s", err, output)
-		}
+	if dir := os.Getenv(child); dir != "" {
+		dropRootInChild(t, dir)
 
 		return
 	}
+
+	if os.Geteuid() != 0 {
+		t.Skip("dropping root privileges needs root")
+	}
+
+	// The parent stays root, so it can remove the directory afterward. Like
+	// /var/lib/gantry in the pod, the directory holding the identity directory
+	// must let the agent user through, which t.TempDir's do not.
+	base, err := os.MkdirTemp("", "gantry-init-")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+
+	if err := os.Chmod(base, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	base, err = filepath.EvalSymlinks(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := filepath.Join(base, "libp2p")
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^"+t.Name()+"$", "-test.count=1")
+
+	cmd.Env = append(os.Environ(), child+"="+dir)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("child: %v\n%s", err, output)
+	}
+
+	for _, path := range []string{dir, filepath.Join(dir, "identity.key")} {
+		if uid, _ := ownerOf(t, path); uid != agentUID {
+			t.Fatalf("%s is owned by uid %d, want %d", path, uid, agentUID)
+		}
+	}
+}
+
+// dropRootInChild runs gantry init's routine for real on dir, then checks that
+// the process is the agent user, kept its groups, cannot regain root, and can
+// write the identity key the way the agent will.
+func dropRootInChild(t *testing.T, dir string) {
+	t.Helper()
 
 	groups, err := os.Getgroups()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err := prepareAgentRuntime(&config.Config{}, discardLogger()); err != nil {
+	if err := prepareAgentRuntime(dir, discardLogger()); err != nil {
 		t.Fatalf("prepareAgentRuntime: %v", err)
 	}
 
@@ -526,5 +485,9 @@ func TestPrepareAgentRuntimeDropsRootAsRoot(t *testing.T) {
 
 	if err := syscall.Setuid(0); !errors.Is(err, syscall.EPERM) {
 		t.Fatalf("Setuid(0) after the switch = %v, want EPERM", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "identity.key"), nil, 0o600); err != nil {
+		t.Fatalf("write the identity key as the agent user: %v", err)
 	}
 }

@@ -7,13 +7,11 @@ package main
 
 import (
 	"log/slog"
-
-	"github.com/Azure/unbounded/internal/gantry/config"
 )
 
-// prepareAgentRuntime is a no-op on non-linux. Only the linux agent, which is
-// what the DaemonSet runs, re-owns its identity directory and drops root;
-// non-linux builds are dev/test only.
-func prepareAgentRuntime(_ *config.Config, _ *slog.Logger) error {
+// prepareAgentRuntime, which runs gantry init, is a no-op on non-linux. Only
+// the linux build, which is what the DaemonSet runs, re-owns the identity
+// directory and drops root; non-linux builds are dev/test only.
+func prepareAgentRuntime(_ string, _ *slog.Logger) error {
 	return nil
 }

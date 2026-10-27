@@ -58,10 +58,13 @@ const (
 	// the other components.
 	imageRepository = "gantry"
 
-	// agentContainerName is the gantry agent's main container. Only this
-	// container carries the operator-managed image; any other container in the
-	// DaemonSet, such as one added by a workload override, keeps its own image.
+	// agentContainerName and initContainerName are the gantry agent's main
+	// container and the init container that prepares its identity directory.
+	// Both run the gantry image, so only they carry the operator-managed image;
+	// any other container in the DaemonSet, such as one added by a workload
+	// override, keeps its own image.
 	agentContainerName = "gantry"
+	initContainerName  = "gantry-init"
 
 	// legacyNodeConfigName and legacyNodeConfigDaemonSetName were installed by
 	// older operator versions. The unbounded agent owns this host configuration.
@@ -362,7 +365,7 @@ func legacyCleanupOperations(componentName, namespace string) []component.Operat
 // applyMutator skips CRDs and the separately reconciled gantry-config ConfigMap,
 // stamps the operator-derived agent image onto the agent DaemonSet, and stamps
 // the config payload hash on its pod template so a config change rolls the
-// DaemonSet. Only the agent's own container is re-imaged. A non-nil
+// DaemonSet. Only the agent and its init container are re-imaged. A non-nil
 // racerPlacement switches the agent to the Racer backend.
 func applyMutator(agentImage, configHash string, racerPlacement *workload.NodePlacement) func(*unstructured.Unstructured) error {
 	return func(obj *unstructured.Unstructured) error {
@@ -379,8 +382,10 @@ func applyMutator(agentImage, configHash string, racerPlacement *workload.NodePl
 		}
 
 		if obj.GetKind() == "DaemonSet" && obj.GetName() == daemonSetName {
-			if err := component.SetNamedContainerImage(obj, agentContainerName, agentImage); err != nil {
-				return fmt.Errorf("set gantry agent image: %w", err)
+			for _, name := range []string{initContainerName, agentContainerName} {
+				if err := component.SetNamedContainerImage(obj, name, agentImage); err != nil {
+					return fmt.Errorf("set gantry %s image: %w", name, err)
+				}
 			}
 
 			if racerPlacement != nil {

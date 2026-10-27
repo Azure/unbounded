@@ -101,12 +101,35 @@ func TestDaemonSetMountsContainerdRuntimeDirectory(t *testing.T) {
 	}
 }
 
-// TestAgentPreparesIdentityDirectoryItself pins how the agent gets its libp2p
-// identity hostPath without an init container: it starts as root with only the
-// capabilities it needs to re-own that directory and switch to UID 65532, and
-// the pod's fsGroup keeps its service account token readable after the switch.
-func TestAgentPreparesIdentityDirectoryItself(t *testing.T) {
+// TestInitContainerPreparesIdentityDirectory pins how the agent gets its libp2p
+// identity hostPath: the gantry-init container runs gantry init from the
+// agent's own image, as root with only the capabilities it needs, and the agent
+// itself runs as UID 65532 with none.
+func TestInitContainerPreparesIdentityDirectory(t *testing.T) {
 	t.Parallel()
+
+	type securityContext struct {
+		RunAsNonRoot             *bool  `yaml:"runAsNonRoot"`
+		RunAsUser                *int64 `yaml:"runAsUser"`
+		AllowPrivilegeEscalation *bool  `yaml:"allowPrivilegeEscalation"`
+		ReadOnlyRootFilesystem   *bool  `yaml:"readOnlyRootFilesystem"`
+		Capabilities             struct {
+			Add  []string `yaml:"add"`
+			Drop []string `yaml:"drop"`
+		} `yaml:"capabilities"`
+	}
+
+	type container struct {
+		Name            string          `yaml:"name"`
+		Image           string          `yaml:"image"`
+		ImagePullPolicy string          `yaml:"imagePullPolicy"`
+		Args            []string        `yaml:"args"`
+		SecurityContext securityContext `yaml:"securityContext"`
+		VolumeMounts    []struct {
+			Name      string `yaml:"name"`
+			MountPath string `yaml:"mountPath"`
+		} `yaml:"volumeMounts"`
+	}
 
 	for profile, outputDir := range map[string]string{
 		"operator":   renderTemplates(t),
@@ -121,26 +144,8 @@ func TestAgentPreparesIdentityDirectoryItself(t *testing.T) {
 			Spec struct {
 				Template struct {
 					Spec struct {
-						SecurityContext struct {
-							FSGroup *int64 `yaml:"fsGroup"`
-						} `yaml:"securityContext"`
-						InitContainers []struct {
-							Name string `yaml:"name"`
-						} `yaml:"initContainers"`
-						Containers []struct {
-							Name            string `yaml:"name"`
-							SecurityContext struct {
-								RunAsNonRoot             *bool  `yaml:"runAsNonRoot"`
-								RunAsUser                *int64 `yaml:"runAsUser"`
-								RunAsGroup               *int64 `yaml:"runAsGroup"`
-								AllowPrivilegeEscalation *bool  `yaml:"allowPrivilegeEscalation"`
-								ReadOnlyRootFilesystem   *bool  `yaml:"readOnlyRootFilesystem"`
-								Capabilities             struct {
-									Add  []string `yaml:"add"`
-									Drop []string `yaml:"drop"`
-								} `yaml:"capabilities"`
-							} `yaml:"securityContext"`
-						} `yaml:"containers"`
+						InitContainers []container `yaml:"initContainers"`
+						Containers     []container `yaml:"containers"`
 					} `yaml:"spec"`
 				} `yaml:"template"`
 			} `yaml:"spec"`
@@ -149,69 +154,77 @@ func TestAgentPreparesIdentityDirectoryItself(t *testing.T) {
 			t.Fatalf("%s: unmarshal rendered daemonset: %v", profile, err)
 		}
 
-		if initContainers := daemonSet.Spec.Template.Spec.InitContainers; len(initContainers) != 0 {
-			t.Fatalf("%s: init containers = %+v, want none", profile, initContainers)
+		initContainers := daemonSet.Spec.Template.Spec.InitContainers
+		if len(initContainers) != 1 || initContainers[0].Name != "gantry-init" {
+			t.Fatalf("%s: init containers = %+v, want only gantry-init", profile, initContainers)
 		}
 
-		// Kubelet writes the token root-only for a pod whose only container
-		// starts as root; without fsGroup the agent cannot read it as 65532.
-		if fsGroup := daemonSet.Spec.Template.Spec.SecurityContext.FSGroup; fsGroup == nil || *fsGroup != 65532 {
-			t.Fatalf("%s: pod fsGroup must be 65532 so the agent can read its service account token", profile)
+		initContainer := initContainers[0]
+
+		var agent *container
+
+		for i := range daemonSet.Spec.Template.Spec.Containers {
+			if daemonSet.Spec.Template.Spec.Containers[i].Name == "gantry" {
+				agent = &daemonSet.Spec.Template.Spec.Containers[i]
+			}
 		}
 
-		found := false
+		if agent == nil {
+			t.Fatalf("%s: rendered daemonset has no gantry container", profile)
+		}
 
-		for _, container := range daemonSet.Spec.Template.Spec.Containers {
-			if container.Name != "gantry" {
-				continue
+		if initContainer.Image != agent.Image || initContainer.ImagePullPolicy != agent.ImagePullPolicy {
+			t.Fatalf("%s: gantry-init runs %s (%s), want the agent's %s (%s)",
+				profile, initContainer.Image, initContainer.ImagePullPolicy, agent.Image, agent.ImagePullPolicy)
+		}
+
+		if !reflect.DeepEqual(initContainer.Args, []string{"init"}) {
+			t.Fatalf("%s: gantry-init args = %q, want [init] after the image's gantry entrypoint", profile, initContainer.Args)
+		}
+
+		mounted := false
+
+		for _, mount := range initContainer.VolumeMounts {
+			if mount.Name == "libp2p" && mount.MountPath == "/var/lib/gantry/libp2p" {
+				mounted = true
 			}
+		}
 
-			found = true
-			security := container.SecurityContext
+		if !mounted {
+			t.Fatalf("%s: gantry-init does not mount the libp2p volume at /var/lib/gantry/libp2p", profile)
+		}
 
-			if security.RunAsNonRoot == nil || *security.RunAsNonRoot || security.RunAsUser == nil || *security.RunAsUser != 0 {
-				t.Fatalf("%s: gantry must start as root to re-own its identity directory", profile)
-			}
+		for _, want := range []struct {
+			name     string
+			security securityContext
+			uid      int64
+			add      []string
+		}{
+			{name: "gantry-init", security: initContainer.SecurityContext, uid: 0, add: []string{"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETUID"}},
+			{name: "gantry", security: agent.SecurityContext, uid: 65532},
+		} {
+			security := want.security
 
-			if security.RunAsGroup == nil || *security.RunAsGroup != 0 {
-				t.Fatalf("%s: runAsGroup does not follow the default containerd.socketGroup", profile)
+			if security.RunAsUser == nil || *security.RunAsUser != want.uid || security.RunAsNonRoot == nil || *security.RunAsNonRoot != (want.uid != 0) {
+				t.Fatalf("%s: %s must run as UID %d with runAsNonRoot %t", profile, want.name, want.uid, want.uid != 0)
 			}
 
 			if security.AllowPrivilegeEscalation == nil || *security.AllowPrivilegeEscalation {
-				t.Fatalf("%s: privilege escalation must stay disallowed", profile)
+				t.Fatalf("%s: %s must disallow privilege escalation", profile, want.name)
 			}
 
 			if security.ReadOnlyRootFilesystem == nil || !*security.ReadOnlyRootFilesystem {
-				t.Fatalf("%s: root filesystem must stay read-only", profile)
+				t.Fatalf("%s: %s root filesystem must stay read-only", profile, want.name)
 			}
 
 			if !reflect.DeepEqual(security.Capabilities.Drop, []string{"ALL"}) {
-				t.Fatalf("%s: dropped capabilities = %v, want [ALL]", profile, security.Capabilities.Drop)
+				t.Fatalf("%s: %s drops capabilities %v, want [ALL]", profile, want.name, security.Capabilities.Drop)
 			}
 
-			if want := []string{"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETUID"}; !reflect.DeepEqual(security.Capabilities.Add, want) {
-				t.Fatalf("%s: added capabilities = %v, want %v", profile, security.Capabilities.Add, want)
+			if !reflect.DeepEqual(security.Capabilities.Add, want.add) {
+				t.Fatalf("%s: %s adds capabilities %v, want %v", profile, want.name, security.Capabilities.Add, want.add)
 			}
 		}
-
-		if !found {
-			t.Fatalf("%s: rendered daemonset has no gantry container", profile)
-		}
-	}
-}
-
-// TestStandaloneSchemaAcceptsRetiredInitResources keeps upgrades working for
-// values that still set resources.init.
-func TestStandaloneSchemaAcceptsRetiredInitResources(t *testing.T) {
-	t.Parallel()
-
-	raw, err := os.ReadFile(filepath.Join(renderChart(t, false, "--set-string", "resources.init.requests.cpu=10m"), "daemonset.yaml"))
-	if err != nil {
-		t.Fatalf("read rendered daemonset: %v", err)
-	}
-
-	if bytes.Contains(raw, []byte("initContainers")) {
-		t.Fatal("resources.init rendered an init container")
 	}
 }
 

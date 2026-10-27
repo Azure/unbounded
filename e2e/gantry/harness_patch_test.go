@@ -31,7 +31,7 @@ func TestResolveContainerEngine(t *testing.T) {
 	}
 }
 
-// TestPatchDaemonSetForE2E_TargetsGantryContainerOnly is the
+// TestPatchDaemonSetForE2E_TargetsGantryContainers is the
 // regression test for the twelfth-review finding: the harness's
 // previous strings.Replace(..., 1) on the bare "imagePullPolicy:
 // IfNotPresent" string patched the FIRST occurrence, which belonged to
@@ -41,13 +41,13 @@ func TestResolveContainerEngine(t *testing.T) {
 // that doesn't have it.
 //
 // This test pins the contract that patchDaemonSetForE2E:
-//   - sets the gantry container to use the side-loaded e2e image,
-//   - sets the gantry container's imagePullPolicy to Never,
-//   - leaves no IfNotPresent behind. The gantry container is the
-//     DaemonSet's only container, so a container added later fails here
-//     until the harness decides how kind obtains its image,
-//   - and fails loudly if the anchor stops matching.
-func TestPatchDaemonSetForE2E_TargetsGantryContainerOnly(t *testing.T) {
+//   - sets the gantry-init and gantry containers, the two that run the
+//     gantry image, to use the side-loaded e2e image,
+//   - sets both containers' imagePullPolicy to Never,
+//   - leaves no IfNotPresent behind, so a container added later fails
+//     here until the harness decides how kind obtains its image,
+//   - and fails loudly if an anchor stops matching.
+func TestPatchDaemonSetForE2E_TargetsGantryContainers(t *testing.T) {
 	repoRoot := repoRoot(t)
 	manifests := renderGantryChart(t, repoRoot)
 
@@ -63,24 +63,22 @@ func TestPatchDaemonSetForE2E_TargetsGantryContainerOnly(t *testing.T) {
 		t.Fatalf("patchDaemonSetForE2E: %v", err)
 	}
 
-	// Gantry container must reference the side-loaded tag with
-	// imagePullPolicy=Never.
-	if !strings.Contains(patched, "image: "+e2eTag) {
-		t.Errorf("patched manifest missing 'image: %s'; gantry container was not retargeted", e2eTag)
+	// Both gantry-image containers must reference the side-loaded tag
+	// with imagePullPolicy=Never.
+	if retargeted := strings.Count(patched, "image: "+e2eTag); retargeted != 2 {
+		t.Errorf("'image: %s' count = %d, want 2 (gantry-init and gantry)", e2eTag, retargeted)
 	}
 
-	if strings.Contains(patched, "image: gantry:rendered-fixture") {
-		t.Errorf("patched manifest still contains the original gantry image reference; the swap did not apply to the gantry container")
+	if strings.Contains(patched, "image: "+imageTag) {
+		t.Errorf("patched manifest still contains the rendered image %q; the swap missed a container", imageTag)
 	}
 
-	// The gantry container is the only one, so the patch must leave
-	// exactly one Never and no IfNotPresent.
-	if neverCount := strings.Count(patched, "imagePullPolicy: Never"); neverCount != 1 {
-		t.Errorf("imagePullPolicy=Never count = %d, want exactly 1 (only the gantry container should be Never)", neverCount)
+	if neverCount := strings.Count(patched, "imagePullPolicy: Never"); neverCount != 2 {
+		t.Errorf("imagePullPolicy=Never count = %d, want exactly 2 (only gantry-init and gantry should be Never)", neverCount)
 	}
 
 	if ifNotPresentCount := strings.Count(patched, "imagePullPolicy: IfNotPresent"); ifNotPresentCount != 0 {
-		t.Errorf("imagePullPolicy=IfNotPresent count = %d, want 0; a container besides gantry needs the harness to decide how kind obtains its image", ifNotPresentCount)
+		t.Errorf("imagePullPolicy=IfNotPresent count = %d, want 0; a container besides gantry-init and gantry needs the harness to decide how kind obtains its image", ifNotPresentCount)
 	}
 }
 

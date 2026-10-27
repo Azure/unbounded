@@ -212,6 +212,7 @@
       "additionalProperties": false,
       "required": [
         "agent",
+        "init",
         "nodeConfig"
       ],
       "properties": {
@@ -219,9 +220,7 @@
           "type": "object"
         },
         "init": {
-          "type": "object",
-          "deprecated": true,
-          "description": "Ignored. The agent no longer has an init container; accepted so existing values still validate."
+          "type": "object"
         },
         "nodeConfig": {
           "type": "object"
