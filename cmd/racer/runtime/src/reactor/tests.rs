@@ -4241,6 +4241,61 @@ mod uring_cmd {
         }
 
         #[test]
+        /// A command partition admits its commands when ordinary slots are
+        /// full, refuses commands beyond its size, and coexists with the
+        /// ordinary reserved partition.
+        fn command_partition_is_dedicated() {
+            let sim = Simulation::new();
+            let _environment = sim.enter();
+            let reactor = Reactor::new(Rc::new(Admission::new(limits(5))));
+            let request = scope();
+            let (fd, _peer) = sim.socket_pair();
+            let fd = Rc::new(fd);
+            let control = reactor.reserve_submissions(1, ()).unwrap();
+            assert!(matches!(
+                reactor.reserve_command_submissions(5, ()),
+                Err(Error::InvalidConfiguration)
+            ));
+            let commands = reactor.reserve_command_submissions(2, ()).unwrap();
+            assert!(matches!(
+                reactor.reserve_command_submissions(1, ()),
+                Err(Error::InvalidConfiguration)
+            ));
+            // Two ordinary slots remain.
+            let mut ordinary: Vec<_> = (0..2)
+                .map(|n| reactor.uring_cmd(fd.clone(), 9, [n; 16], (), &request))
+                .collect();
+            for op in &mut ordinary {
+                assert!(poll(op).is_pending());
+            }
+            let mut full = reactor.uring_cmd(fd.clone(), 9, [7; 16], (), &request);
+            assert!(matches!(
+                poll(&mut full),
+                Poll::Ready(Err(Error::Overloaded))
+            ));
+            let mut first =
+                reactor.uring_cmd_reserved(fd.clone(), 1, [1; 16], (), commands.clone(), &request);
+            let mut second =
+                reactor.uring_cmd_reserved(fd.clone(), 1, [2; 16], (), commands.clone(), &request);
+            assert!(poll(&mut first).is_pending());
+            assert!(poll(&mut second).is_pending());
+            let mut third =
+                reactor.uring_cmd_reserved(fd.clone(), 1, [3; 16], (), commands.clone(), &request);
+            assert!(matches!(
+                poll(&mut third),
+                Poll::Ready(Err(Error::Overloaded))
+            ));
+            sim.complete_uring_cmd(&fd, 1, Some([1; 16]), -libc::ENODEV)
+                .unwrap();
+            assert_eq!(drive(&reactor, first).unwrap(), -libc::ENODEV);
+            // The consumed result freed its slot.
+            let mut again =
+                reactor.uring_cmd_reserved(fd.clone(), 1, [4; 16], (), commands.clone(), &request);
+            assert!(poll(&mut again).is_pending());
+            drop((ordinary, second, again, control, commands));
+        }
+
+        #[test]
         /// Scope cancellation fences an outstanding command and releases its owners.
         fn cancellation_fences_outstanding_command() {
             let sim = Simulation::new();

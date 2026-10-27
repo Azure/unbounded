@@ -78,6 +78,10 @@ pub struct Reactor<S: Scope, B: Budget> {
     ordinary: Rc<Cell<usize>>,
 
     reserved: RefCell<Weak<SubmissionCapacity>>,
+
+    /// A second partition kept for long-lived passthrough commands such as
+    /// ublk FETCH, so they never compete with [`Self::reserved`] traffic.
+    commands: RefCell<Weak<SubmissionCapacity>>,
 }
 
 /// Caller-owned event sink, invoked only when admission fails.
@@ -1041,6 +1045,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             queue_entries,
             ordinary: Rc::new(Cell::new(0)),
             reserved: RefCell::default(),
+            commands: RefCell::default(),
             state: RefCell::new(State {
                 ring: None,
                 wake: None,
@@ -1178,9 +1183,33 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         capacity: usize,
         charge: C,
     ) -> Result<Rc<SubmissionCapacity>> {
-        if self.reserved.borrow().upgrade().is_some()
-            || self.ordinary.get() > self.queue_entries.saturating_sub(capacity)
-            || capacity > self.queue_entries
+        self.reserve_partition(&self.reserved, capacity, charge)
+    }
+
+    /// Like [`Self::reserve_submissions`], but for a separate partition used
+    /// only by [`Self::uring_cmd_reserved`]. It is independent of the
+    /// [`Self::reserve_submissions`] partition, so long-lived passthrough
+    /// commands (ublk FETCH and COMMIT_AND_FETCH) can neither be refused
+    /// because ordinary or control traffic filled the queue nor starve it.
+    /// Only one live command partition is allowed.
+    pub fn reserve_command_submissions<C: 'static>(
+        &self,
+        capacity: usize,
+        charge: C,
+    ) -> Result<Rc<SubmissionCapacity>> {
+        self.reserve_partition(&self.commands, capacity, charge)
+    }
+
+    fn reserve_partition<C: 'static>(
+        &self,
+        slot: &RefCell<Weak<SubmissionCapacity>>,
+        capacity: usize,
+        charge: C,
+    ) -> Result<Rc<SubmissionCapacity>> {
+        let partitioned = self.partitioned();
+        if slot.borrow().upgrade().is_some()
+            || capacity > self.queue_entries.saturating_sub(partitioned)
+            || self.ordinary.get() > self.queue_entries - partitioned - capacity
         {
             return Err(Error::InvalidConfiguration);
         }
@@ -1190,8 +1219,26 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             active: Rc::new(Cell::new(0)),
             capacity,
         });
-        *self.reserved.borrow_mut() = Rc::downgrade(&reserved);
+        *slot.borrow_mut() = Rc::downgrade(&reserved);
         Ok(reserved)
+    }
+
+    /// Queue entries held by live partitions, which ordinary work cannot use.
+    fn partitioned(&self) -> usize {
+        [&self.reserved, &self.commands]
+            .iter()
+            .filter_map(|slot| slot.borrow().upgrade())
+            .map(|pool| pool.capacity)
+            .sum()
+    }
+
+    /// Whether `pool` is one of this reactor's live partitions.
+    fn owns_partition(&self, pool: &Rc<SubmissionCapacity>) -> bool {
+        [&self.reserved, &self.commands].iter().any(|slot| {
+            slot.borrow()
+                .upgrade()
+                .is_some_and(|own| Rc::ptr_eq(&own, pool))
+        })
     }
 
     /// Retain a budget guard independently of the concrete accounting implementation.
@@ -1270,13 +1317,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             + std::mem::size_of::<Signal>()
             + std::mem::size_of::<libc::sockaddr_storage>();
         let (reservation, active) = if let Some(pool) = &capacity {
-            if !self
-                .reserved
-                .borrow()
-                .upgrade()
-                .is_some_and(|own| Rc::ptr_eq(&own, pool))
-                || bytes > SUBMISSION_BYTES
-            {
+            if !self.owns_partition(pool) || bytes > SUBMISSION_BYTES {
                 return Err(Error::InvalidConfiguration.into());
             }
             if pool.active.get() >= pool.capacity {
@@ -1293,11 +1334,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                 pool.active.clone(),
             )
         } else {
-            let reserved = self
-                .reserved
-                .borrow()
-                .upgrade()
-                .map_or(0, |pool| pool.capacity);
+            let reserved = self.partitioned();
             if self.ordinary.get() >= self.queue_entries - reserved {
                 reject(
                     RejectionReason::OrdinaryFull,
@@ -1320,7 +1357,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
             return Err(Error::Unavailable.into());
         }
         let available = capacity.as_ref().map_or_else(
-            || self.queue_entries - self.reserved.borrow().upgrade().map_or(0, |p| p.capacity),
+            || self.queue_entries - self.partitioned(),
             |pool| pool.capacity,
         );
         if state.entries.len() >= self.queue_entries || active.get() >= available {
@@ -2051,6 +2088,35 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         lease: L,
         scope: &'a S,
     ) -> Operation<'a, i32, S::Error> {
+        self.uring_cmd_capacity(fd, cmd_op, cmd, lease, None, scope)
+    }
+
+    /// Like [`Self::uring_cmd`], but admitted from a partition made by
+    /// [`Self::reserve_command_submissions`] (or
+    /// [`Self::reserve_submissions`]). The slot stays taken until the result
+    /// is consumed, so a partition sized to the number of commands that may
+    /// be outstanding at once never refuses one.
+    pub fn uring_cmd_reserved<'a, L: 'static>(
+        &'a self,
+        fd: Rc<Descriptor>,
+        cmd_op: u32,
+        cmd: [u8; 16],
+        lease: L,
+        capacity: Rc<SubmissionCapacity>,
+        scope: &'a S,
+    ) -> Operation<'a, i32, S::Error> {
+        self.uring_cmd_capacity(fd, cmd_op, cmd, lease, Some(capacity), scope)
+    }
+
+    fn uring_cmd_capacity<'a, L: 'static>(
+        &'a self,
+        fd: Rc<Descriptor>,
+        cmd_op: u32,
+        cmd: [u8; 16],
+        lease: L,
+        capacity: Option<Rc<SubmissionCapacity>>,
+        scope: &'a S,
+    ) -> Operation<'a, i32, S::Error> {
         Box::pin(async move {
             let sqe = submission!(
                 self,
@@ -2063,7 +2129,7 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                     .cmd(cmd)
                     .build()
             );
-            self.submit(sqe, scope, false, move |result| {
+            self.submit_reserved(sqe, scope, false, capacity, move |result| {
                 drop((fd, lease));
                 match result? {
                     KernelResult::Value(res) => Ok(res),
