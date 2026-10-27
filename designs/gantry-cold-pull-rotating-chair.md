@@ -70,6 +70,14 @@ use cachedSnapshot
 - A dial failure triggers an immediate targeted chair refresh, even if the global epoch is unchanged.
 - If Kubernetes is unavailable, the old snapshot remains usable as dial hints, but no chair may be claimed.
 
+**Bootstrap Address Discovery**
+
+Chair snapshots also seed libp2p bootstrap connections. Only occupied,
+unexpired holders supply bootstrap addresses. Expired chairs remain in the
+snapshot and can still be reclaimed, even after a long absence. A holder that
+resumes renewal becomes a bootstrap candidate again on the next snapshot refresh.
+This filter does not change cold-pull selection or its stale-snapshot fallback.
+
 **Initial Startup**
 
 When all configured Leases are empty:
