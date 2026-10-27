@@ -400,6 +400,24 @@ impl Reactor {
                 other => other.into(),
             })
     }
+    /// Reserve `capacity` submission slots for long-lived passthrough
+    /// commands (ublk queue commands), with their bookkeeping charged now
+    /// from the request-context quota. See
+    /// [`uring_runtime::reactor::Reactor::reserve_command_submissions`].
+    pub(crate) fn reserve_commands(&self, capacity: usize) -> Result<Rc<SubmissionCapacity>> {
+        let bytes = capacity
+            .checked_mul(SUBMISSION_BYTES)
+            .ok_or(Error::InvalidConfiguration)?;
+        let memory = self
+            .admission
+            .reserve(None, ResourceClass::RequestContext, bytes)?;
+        self.core
+            .reserve_command_submissions(capacity, memory)
+            .map_err(|error| match error {
+                uring_runtime::Error::InvalidInput => Error::InvalidConfiguration,
+                other => other.into(),
+            })
+    }
     pub fn file_fence(&self, request: RequestId) -> Operation<'_, ()> {
         self.core
             .fence_matching(move |scope| scope.request == request)

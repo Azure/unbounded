@@ -5,13 +5,19 @@
 //! kernel aborts the tag with `UBLK_IO_RES_ABORT`. The kernel side and the
 //! page source are traits so tests can drive the loop without a device or a
 //! reactor.
+//!
+//! Once the kernel hands a request to a tag, only an answer from that tag
+//! completes it, and STOP_DEV waits for it. So a tag never gives up on a
+//! request: a command the reactor refuses is retried with a short pause, and
+//! an abandoned queue answers every request with `EIO` at once instead of
+//! dropping it.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 use futures::stream::{FuturesUnordered, StreamExt};
 
@@ -60,8 +66,13 @@ pub(crate) trait PageSource: 'static {
 
 /// The kernel side of one queue.
 pub(crate) trait QueueKernel: 'static {
-    /// Send a queue command and return the raw CQE result.
+    /// Send a queue command and return the raw CQE result. The command must
+    /// be submitted by the first poll: an `Err` from that poll means the
+    /// kernel never saw it, and the caller sends it again.
     fn command(&self, cmd_op: u32, cmd: [u8; 16]) -> Local<'_, Result<i32>>;
+
+    /// Wait a little before retry number `attempt` of a refused command.
+    fn pause(&self, attempt: u32) -> Local<'_, ()>;
 
     /// Read a fetched tag's descriptor.
     fn descriptor(&self, tag: u16) -> IoDesc;
@@ -232,21 +243,126 @@ async fn write_all<K: QueueKernel, P: PageBytes>(
     Ok(())
 }
 
+/// After this many refused attempts in a row, a command's error is
+/// reported as a queue failure so the device is torn down. The tag keeps
+/// retrying.
+pub(crate) const REPORT_AFTER: u32 = 32;
+
+/// Once the queue is abandoned, a command is given up after this many
+/// refused attempts in a row. The request it answers is then left to the
+/// kernel, which aborts it when the character device is released.
+pub(crate) const ABANDONED_ATTEMPTS: u32 = 64;
+
+/// State shared by the tag loops of one queue.
+#[derive(Default)]
+struct TagState {
+    /// Answer every request with `EIO` and stop reading pages.
+    abandoned: Cell<bool>,
+    /// Tags holding a request whose answer the kernel has not accepted yet.
+    owned: Cell<usize>,
+    /// First failure seen by any tag.
+    failure: Cell<Option<Error>>,
+    /// Wakers of tags waiting for a page, woken on abandon.
+    wakers: RefCell<Vec<Option<Waker>>>,
+}
+
+impl TagState {
+    fn fail(&self, error: Error) {
+        if self.failure.get().is_none() {
+            self.failure.set(Some(error));
+        }
+    }
+
+    /// Ready once the queue is abandoned.
+    fn abandoned(&self, tag: u16) -> impl Future<Output = ()> + '_ {
+        std::future::poll_fn(move |cx| {
+            if self.abandoned.get() {
+                return Poll::Ready(());
+            }
+            let mut wakers = self.wakers.borrow_mut();
+            let slot = usize::from(tag);
+            if wakers.len() <= slot {
+                wakers.resize(slot + 1, None);
+            }
+            wakers[slot] = Some(cx.waker().clone());
+            Poll::Pending
+        })
+    }
+
+    fn abandon(&self) {
+        self.abandoned.set(true);
+        for waker in self.wakers.borrow_mut().iter_mut().filter_map(Option::take) {
+            waker.wake();
+        }
+    }
+}
+
+/// Send one command until the kernel has it. A command refused before
+/// submission is sent again after a pause. `owns` says the tag holds a
+/// request this command answers; it stops counting as owned once the
+/// kernel accepts the command. Returns the CQE result, or the last error
+/// if the command was given up.
+async fn send<K: QueueKernel>(
+    kernel: &K,
+    state: &TagState,
+    cmd_op: u32,
+    cmd: [u8; 16],
+    owns: bool,
+) -> Result<i32> {
+    let release = || {
+        if owns {
+            state.owned.set(state.owned.get() - 1);
+        }
+    };
+    let mut attempt = 0_u32;
+    loop {
+        let mut command = kernel.command(cmd_op, cmd);
+        let mut submitted = false;
+        let result = std::future::poll_fn(|cx| {
+            let poll = command.as_mut().poll(cx);
+            if !submitted && !matches!(poll, Poll::Ready(Err(_))) {
+                // Pending, or done at once: either way the kernel has it.
+                submitted = true;
+                release();
+            }
+            poll
+        })
+        .await;
+        match result {
+            Ok(res) => return Ok(res),
+            Err(error) if submitted => return Err(error),
+            Err(error) => {
+                attempt += 1;
+                if attempt == REPORT_AFTER {
+                    state.fail(error);
+                }
+                if state.abandoned.get() && attempt >= ABANDONED_ATTEMPTS {
+                    state.fail(error);
+                    release();
+                    return Err(error);
+                }
+                drop(command);
+                kernel.pause(attempt).await;
+            }
+        }
+    }
+}
+
 /// Run one tag until the kernel aborts it.
-pub(crate) async fn serve_tag<K: QueueKernel, S: PageSource>(
+async fn serve_tag<K: QueueKernel, S: PageSource>(
     kernel: Rc<K>,
     source: Rc<S>,
     shape: QueueShape,
     readahead: Rc<Readahead>,
+    state: Rc<TagState>,
     tag: u16,
 ) -> TagExit {
     let mut cmd_op = U_IO_FETCH_REQ;
     let mut result = 0;
     loop {
-        let res = match kernel
-            .command(cmd_op, io_cmd_bytes(shape.q, tag, result))
-            .await
-        {
+        let owns = cmd_op == U_IO_COMMIT_AND_FETCH_REQ;
+        let cmd = io_cmd_bytes(shape.q, tag, result);
+        let res = match send(&*kernel, &state, cmd_op, cmd, owns).await {
             Ok(res) => res,
             Err(error) => return TagExit::Failed(error),
         };
@@ -254,14 +370,24 @@ pub(crate) async fn serve_tag<K: QueueKernel, S: PageSource>(
             return TagExit::Aborted;
         }
         if res != UBLK_IO_RES_OK {
+            // The kernel refused the command, so this tag owns no request.
             return TagExit::Failed(if res < 0 { Error::Os(-res) } else { Error::Io });
         }
-        result = match Request::decode(kernel.descriptor(tag), shape.max_io_bytes) {
-            Action::Complete(code) => code,
-            Action::Read { offset, len } => {
-                serve_read(&*kernel, &*source, &shape, &readahead, tag, offset, len)
-                    .await
-                    .unwrap_or(-libc::EIO)
+        state.owned.set(state.owned.get() + 1);
+        result = if state.abandoned.get() {
+            -libc::EIO
+        } else {
+            match Request::decode(kernel.descriptor(tag), shape.max_io_bytes) {
+                Action::Complete(code) => code,
+                Action::Read { offset, len } => {
+                    let read = serve_read(&*kernel, &*source, &shape, &readahead, tag, offset, len);
+                    let abandoned = state.abandoned(tag);
+                    futures::pin_mut!(read, abandoned);
+                    match futures::future::select(read, abandoned).await {
+                        futures::future::Either::Left((result, _)) => result.unwrap_or(-libc::EIO),
+                        futures::future::Either::Right(((), _)) => -libc::EIO,
+                    }
+                }
             }
         };
         cmd_op = U_IO_COMMIT_AND_FETCH_REQ;
@@ -284,7 +410,7 @@ pub(crate) struct QueueService<K: QueueKernel, S: PageSource> {
     readahead: Rc<Readahead>,
     tags: FuturesUnordered<Local<'static, TagExit>>,
     prefetch: FuturesUnordered<Local<'static, ()>>,
-    failure: Option<Error>,
+    state: Rc<TagState>,
     _kernel: Rc<K>,
 }
 
@@ -292,6 +418,7 @@ impl<K: QueueKernel, S: PageSource> QueueService<K, S> {
     /// Start a loop for every tag. Nothing is sent until the first poll.
     pub(crate) fn new(kernel: Rc<K>, source: Rc<S>, shape: QueueShape) -> Self {
         let readahead = Rc::new(Readahead::default());
+        let state = Rc::new(TagState::default());
         let tags = FuturesUnordered::new();
         for tag in 0..shape.depth {
             tags.push(Box::pin(serve_tag(
@@ -299,6 +426,7 @@ impl<K: QueueKernel, S: PageSource> QueueService<K, S> {
                 source.clone(),
                 shape,
                 readahead.clone(),
+                state.clone(),
                 tag,
             )) as Local<'static, TagExit>);
         }
@@ -307,23 +435,39 @@ impl<K: QueueKernel, S: PageSource> QueueService<K, S> {
             readahead,
             tags,
             prefetch: FuturesUnordered::new(),
-            failure: None,
+            state,
             _kernel: kernel,
         }
+    }
+
+    /// Stop serving reads: answer every request held now or handed out
+    /// later with `EIO`. The tag loops still run until the kernel aborts
+    /// them, which STOP_DEV does.
+    pub(crate) fn abandon(&mut self) {
+        self.state.abandon();
+        self.prefetch.clear();
+    }
+
+    /// Tags holding a request whose answer the kernel has not accepted.
+    pub(crate) fn owned(&self) -> usize {
+        self.state.owned.get()
     }
 
     /// Advance tag loops and readahead.
     pub(crate) fn poll(&mut self, cx: &mut Context<'_>) -> QueueState {
         while let Poll::Ready(Some(exit)) = self.tags.poll_next_unpin(cx) {
             if let TagExit::Failed(error) = exit {
-                self.failure.get_or_insert(error);
+                self.state.fail(error);
             }
         }
         if self.tags.is_empty() {
             self.prefetch.clear();
             return QueueState::Finished {
-                failure: self.failure,
+                failure: self.state.failure.get(),
             };
+        }
+        if self.state.abandoned.get() {
+            return QueueState::Running;
         }
         while self.prefetch.len() < READAHEAD_IN_FLIGHT {
             let Some(number) = self.readahead.take() else {
@@ -341,7 +485,7 @@ impl<K: QueueKernel, S: PageSource> QueueService<K, S> {
 
     /// Whether any tag has failed so far.
     pub(crate) fn failure(&self) -> Option<Error> {
-        self.failure
+        self.state.failure.get()
     }
 }
 
@@ -378,6 +522,8 @@ mod tests {
     struct Source {
         calls: RefCell<Vec<u64>>,
         fail: Cell<bool>,
+        /// Pages never arrive.
+        hang: Cell<bool>,
     }
 
     impl PageSource for Source {
@@ -386,6 +532,9 @@ mod tests {
         fn page(&self, number: u64) -> Local<'_, Result<TestPage>> {
             self.calls.borrow_mut().push(number);
             let fail = self.fail.get();
+            if self.hang.get() {
+                return Box::pin(futures::future::pending());
+            }
             Box::pin(async move {
                 if fail {
                     return Err(Error::Unavailable);
@@ -411,10 +560,20 @@ mod tests {
         buffers: RefCell<HashMap<u16, Vec<u8>>>,
         /// Largest write accepted at once, to exercise short writes.
         max_write: Cell<usize>,
+        /// Refuse this many commands before submission, like a full reactor.
+        refuse: Cell<u32>,
+        /// Commands refused so far.
+        refused: Cell<u32>,
+        pauses: Cell<u32>,
     }
 
     impl QueueKernel for Kernel {
         fn command(&self, cmd_op: u32, cmd: [u8; 16]) -> Local<'_, Result<i32>> {
+            if self.refuse.get() > 0 {
+                self.refuse.set(self.refuse.get() - 1);
+                self.refused.set(self.refused.get() + 1);
+                return Box::pin(async { Err(Error::Overloaded) });
+            }
             let (reply, done) = oneshot::channel();
             let cmd = IoCmd {
                 q_id: u16::from_ne_bytes([cmd[0], cmd[1]]),
@@ -432,6 +591,11 @@ mod tests {
 
         fn descriptor(&self, tag: u16) -> IoDesc {
             self.descs.borrow()[&tag]
+        }
+
+        fn pause(&self, _attempt: u32) -> Local<'_, ()> {
+            self.pauses.set(self.pauses.get() + 1);
+            Box::pin(async {})
         }
 
         fn write<P: PageBytes>(
@@ -612,6 +776,97 @@ mod tests {
             let command = harness.kernel.take(tag);
             command.reply.send(Ok(UBLK_IO_RES_ABORT)).ok().unwrap();
         }
+        assert_eq!(harness.poll(), QueueState::Finished { failure: None });
+    }
+
+    #[test]
+    fn refused_commit_is_retried_and_the_request_answered() {
+        let mut harness = Harness::new(1);
+        harness.poll();
+        harness.kernel.refuse.set(3);
+        harness.kernel.request(0, UBLK_IO_OP_READ, 0, 512);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert_eq!(harness.queue.poll(&mut cx), QueueState::Running);
+        assert_eq!(harness.kernel.refused.get(), 3);
+        assert_eq!(harness.kernel.pauses.get(), 3);
+        let commands = harness.kernel.commands.borrow();
+        assert_eq!(commands.len(), 1, "the tag was not dropped");
+        assert_eq!(commands[0].op, U_IO_COMMIT_AND_FETCH_REQ);
+        assert_eq!(commands[0].cmd.result, 512);
+        drop(commands);
+        assert_eq!(harness.queue.owned(), 0);
+        assert_eq!(
+            harness.queue.failure(),
+            None,
+            "a retried refusal is no failure"
+        );
+    }
+
+    #[test]
+    fn long_refusal_is_reported_but_still_retried() {
+        let mut harness = Harness::new(1);
+        harness.poll();
+        harness.kernel.refuse.set(REPORT_AFTER + 5);
+        harness.kernel.request(0, UBLK_IO_OP_FLUSH, 0, 0);
+        assert_eq!(harness.poll(), QueueState::Running);
+        assert_eq!(harness.queue.failure(), Some(Error::Overloaded));
+        assert_eq!(harness.kernel.commands.borrow().len(), 1);
+        assert_eq!(harness.queue.owned(), 0);
+    }
+
+    #[test]
+    fn abandoned_queue_gives_up_a_refused_command_eventually() {
+        let mut harness = Harness::new(1);
+        harness.poll();
+        harness.queue.abandon();
+        harness.kernel.refuse.set(u32::MAX);
+        harness.kernel.request(0, UBLK_IO_OP_READ, 0, 512);
+        assert_eq!(
+            harness.poll(),
+            QueueState::Finished {
+                failure: Some(Error::Overloaded)
+            }
+        );
+        assert_eq!(harness.kernel.refused.get(), ABANDONED_ATTEMPTS);
+        assert_eq!(harness.queue.owned(), 0);
+    }
+
+    #[test]
+    fn abandon_answers_a_pending_read_with_eio() {
+        let mut harness = Harness::new(2);
+        harness.poll();
+        harness.source.hang.set(true);
+        harness.kernel.request(0, UBLK_IO_OP_READ, 0, 512);
+        assert_eq!(harness.poll(), QueueState::Running);
+        assert_eq!(harness.queue.owned(), 1, "the read is waiting for a page");
+        assert!(
+            harness
+                .kernel
+                .commands
+                .borrow()
+                .iter()
+                .all(|c| c.cmd.tag != 0)
+        );
+        harness.queue.abandon();
+        assert_eq!(harness.poll(), QueueState::Running);
+        assert_eq!(harness.queue.owned(), 0);
+        let command = harness.kernel.take(0);
+        assert_eq!(command.op, U_IO_COMMIT_AND_FETCH_REQ);
+        assert_eq!(command.cmd.result, -libc::EIO);
+        // Later requests are answered with EIO without reading pages.
+        command.reply.send(Ok(UBLK_IO_RES_ABORT)).ok().unwrap();
+        harness.source.hang.set(false);
+        let calls = harness.source.calls.borrow().len();
+        assert_eq!(harness.serve(1, UBLK_IO_OP_READ, 0, 512), -libc::EIO);
+        assert_eq!(harness.source.calls.borrow().len(), calls);
+        // The tags still finish only when the kernel aborts them.
+        harness
+            .kernel
+            .take(1)
+            .reply
+            .send(Ok(UBLK_IO_RES_ABORT))
+            .ok()
+            .unwrap();
         assert_eq!(harness.poll(), QueueState::Finished { failure: None });
     }
 

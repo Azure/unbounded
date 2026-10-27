@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::task::Context;
 use std::time::Duration;
 
-use uring_runtime::reactor::SendBuffer;
 use uring_runtime::reactor::descriptor::Descriptor;
+use uring_runtime::reactor::{SendBuffer, SubmissionCapacity};
 
 use super::manager::{Attach, Manager, QueueReport, Resolved};
 use super::queue::IoDescriptors;
@@ -53,12 +53,17 @@ unsafe impl<P: PageBytes> SendBuffer for Slice<P> {
     }
 }
 
+/// Longest pause between retries of a refused queue command.
+const MAX_PAUSE: Duration = Duration::from_millis(100);
+
 /// One queue of a real device, served through the worker's reactor.
 pub(crate) struct ReactorKernel {
     reactor: Rc<Reactor>,
     fd: Rc<Descriptor>,
     descriptors: IoDescriptors,
     scope: RequestScope,
+    /// Slots kept for queue commands, one per tag of every device.
+    commands: Option<Rc<SubmissionCapacity>>,
 }
 
 impl ReactorKernel {
@@ -66,6 +71,7 @@ impl ReactorKernel {
     /// device's `/dev/ublkcN` descriptor.
     pub(crate) fn open(
         reactor: Rc<Reactor>,
+        commands: Option<Rc<SubmissionCapacity>>,
         fd: OwnedFd,
         q: u16,
         depth: u16,
@@ -81,14 +87,54 @@ impl ReactorKernel {
             fd: Rc::new(Descriptor::from(fd)),
             descriptors,
             scope,
+            commands,
         })
     }
 }
 
 impl QueueKernel for ReactorKernel {
     fn command(&self, cmd_op: u32, cmd: [u8; 16]) -> Local<'_, Result<i32>> {
-        self.reactor
-            .uring_cmd(self.fd.clone(), cmd_op, cmd, (), &self.scope)
+        match &self.commands {
+            Some(commands) => self.reactor.uring_cmd_reserved(
+                self.fd.clone(),
+                cmd_op,
+                cmd,
+                (),
+                commands.clone(),
+                &self.scope,
+            ),
+            None => self
+                .reactor
+                .uring_cmd(self.fd.clone(), cmd_op, cmd, (), &self.scope),
+        }
+    }
+
+    fn pause(&self, attempt: u32) -> Local<'_, ()> {
+        Box::pin(async move {
+            let wait = Duration::from_millis(1 << attempt.min(7)).min(MAX_PAUSE);
+            let until = uring_runtime::environment::now() + wait;
+            let slept = self
+                .reactor
+                .sleep_until(
+                    until,
+                    uring_runtime::reactor::timer::SleepMode::Kernel,
+                    &self.scope,
+                )
+                .await;
+            if slept.is_err() {
+                // The timer was refused too. Yield once so other work runs.
+                let mut yielded = false;
+                std::future::poll_fn(|cx| {
+                    if yielded {
+                        return std::task::Poll::Ready(());
+                    }
+                    yielded = true;
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                })
+                .await;
+            }
+        })
     }
 
     fn descriptor(&self, tag: u16) -> IoDesc {
@@ -139,11 +185,20 @@ pub(crate) struct UblkWorker<B: Backend> {
     manager: Arc<Manager>,
     backend: Rc<B>,
     reactor: Rc<Reactor>,
+    commands: Option<Rc<SubmissionCapacity>>,
     devices: Vec<Device<B::Source>>,
 }
 
 impl<B: Backend> UblkWorker<B> {
-    pub(crate) fn new(q: u16, manager: Arc<Manager>, backend: Rc<B>, reactor: Rc<Reactor>) -> Self {
+    /// `commands` holds one submission slot per tag of every device. Without
+    /// it, queue commands use ordinary slots.
+    pub(crate) fn new(
+        q: u16,
+        manager: Arc<Manager>,
+        backend: Rc<B>,
+        reactor: Rc<Reactor>,
+        commands: Option<Rc<SubmissionCapacity>>,
+    ) -> Self {
         let devices = (0..manager.device_count())
             .map(|_| Device::default())
             .collect();
@@ -152,25 +207,37 @@ impl<B: Backend> UblkWorker<B> {
             manager,
             backend,
             reactor,
+            commands,
             devices,
         }
     }
 
-    /// No queue is attached and no resolution is running.
+    /// Nothing here can still hold up a device. Either no queue is
+    /// attached, or the control thread has finished and no queue holds a
+    /// request the kernel waits on. A queue left in the second case only
+    /// has FETCH commands outstanding, which a later STOP_DEV, or closing
+    /// the ring at exit, completes.
     pub(crate) fn is_idle(&self) -> bool {
-        self.devices
-            .iter()
-            .all(|device| device.queue.is_none() && device.resolving.is_none())
+        let control_done = self.manager.control_done();
+        self.devices.iter().all(|device| {
+            device.resolving.is_none()
+                && device
+                    .queue
+                    .as_ref()
+                    .is_none_or(|queue| control_done && queue.owned() == 0)
+        })
     }
 
-    /// Drop every queue and resolution now. Outstanding kernel commands are
-    /// canceled by the reactor, which keeps their descriptors until the fence.
+    /// Stop serving reads now. Every queue answers the requests it holds,
+    /// and any it is handed later, with `EIO`. The queues are not dropped:
+    /// dropping a pending ublk command does not cancel it, and a dropped
+    /// request would block STOP_DEV. They end when the kernel aborts them.
     pub(crate) fn abandon(&mut self) {
-        for (index, device) in self.devices.iter_mut().enumerate() {
+        for device in &mut self.devices {
             device.resolving = None;
-            if device.queue.take().is_some() {
-                self.manager
-                    .report_queue(index, self.q, QueueReport::Closed);
+            device.attach_done = true;
+            if let Some(queue) = &mut device.queue {
+                queue.abandon();
             }
         }
     }
@@ -178,6 +245,8 @@ impl<B: Backend> UblkWorker<B> {
     /// Advance resolution, attachment, and every attached queue.
     pub(crate) fn poll(&mut self, cx: &mut Context<'_>) {
         let views = self.manager.view(self.q, cx.waker());
+        let (reactor, commands, q) = (&self.reactor, &self.commands, self.q);
+        let open = |fd, depth| ReactorKernel::open(reactor.clone(), commands.clone(), fd, q, depth);
         for (index, view) in views.into_iter().enumerate() {
             let device = &mut self.devices[index];
             if view.resolve && !device.resolve_started {
@@ -198,12 +267,10 @@ impl<B: Backend> UblkWorker<B> {
                 self.manager.report_resolved(index, result);
             }
             if view.abandon {
-                if device.queue.take().is_some() {
-                    self.manager
-                        .report_queue(index, self.q, QueueReport::Closed);
-                }
                 device.attach_done = true;
-                continue;
+                if let Some(queue) = &mut device.queue {
+                    queue.abandon();
+                }
             }
             if let Some(attach) = view.attach
                 && !device.attach_done
@@ -211,7 +278,7 @@ impl<B: Backend> UblkWorker<B> {
                 Self::attach(
                     &self.manager,
                     &*self.backend,
-                    &self.reactor,
+                    &open,
                     self.q,
                     index,
                     device,
@@ -228,7 +295,17 @@ impl<B: Backend> UblkWorker<B> {
                     }
                     QueueState::Finished { failure } => {
                         device.queue = None;
-                        if failure.is_some() && !device.failure_reported {
+                        // Tags end without a failure only when the kernel
+                        // aborts them. If this process did not stop the
+                        // device, someone else did.
+                        let external = failure.is_none() && !self.manager.stopping(index);
+                        if external {
+                            eprintln!(
+                                "racer: component=ublk device={index} queue={} stage=serve state=stopped_externally",
+                                self.q
+                            );
+                        }
+                        if (failure.is_some() || external) && !device.failure_reported {
                             device.failure_reported = true;
                             self.manager.report_failure(index, self.q);
                         }
@@ -243,7 +320,7 @@ impl<B: Backend> UblkWorker<B> {
     fn attach(
         manager: &Manager,
         backend: &B,
-        reactor: &Rc<Reactor>,
+        open: &dyn Fn(OwnedFd, u16) -> std::io::Result<ReactorKernel>,
         q: u16,
         index: usize,
         device: &mut Device<B::Source>,
@@ -251,10 +328,7 @@ impl<B: Backend> UblkWorker<B> {
     ) {
         let config = manager.device_config(index);
         device.attach_done = true;
-        let kernel = match manager
-            .char_fd(index)
-            .and_then(|fd| ReactorKernel::open(reactor.clone(), fd, q, attach.depth))
-        {
+        let kernel = match manager.char_fd(index).and_then(|fd| open(fd, attach.depth)) {
             Ok(kernel) => kernel,
             Err(error) => {
                 eprintln!(

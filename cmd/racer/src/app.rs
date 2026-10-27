@@ -1568,11 +1568,19 @@ impl WorkerApplication {
             reactor: runtime.reactor.clone(),
             timeout: config.request_timeout,
         });
+        // One slot per tag of every device: each tag has exactly one queue
+        // command outstanding or being retried at a time.
+        let commands = manager
+            .device_count()
+            .checked_mul(usize::from(config.ublk.queue_depth))
+            .ok_or(Error::InvalidConfiguration)?;
+        let commands = runtime.reactor.reserve_commands(commands)?;
         Ok(Some(crate::ublk::worker::UblkWorker::new(
             q,
             manager.clone(),
             backend,
             runtime.reactor.clone(),
+            Some(commands),
         )))
     }
 
@@ -2354,8 +2362,10 @@ const MAX_UBLK_QUEUE_ENTRIES: usize = 16_384;
 
 /// Grow each worker's reactor queue and request-context quota for ublk.
 /// Every tag keeps a FETCH or COMMIT_AND_FETCH outstanding for the life of
-/// the device, and a request being served adds one write at a time. Without
-/// this headroom the long-lived commands would starve ordinary traffic.
+/// the device, and a request being served adds one write at a time. The
+/// first half of this headroom is then reserved for the queue commands (see
+/// `assemble_ublk`), so they can neither starve ordinary traffic nor be
+/// refused because of it. The writes share the rest with ordinary work.
 fn reserve_ublk_submissions(ublk: &crate::config::UblkConfig, limits: &mut Limits) -> Result<()> {
     if !ublk.enabled() {
         return Ok(());
@@ -3469,8 +3479,18 @@ mod ublk_tests {
 
     /// A real worker graph on worker 0 of the default two-worker node, with
     /// its read endpoint installed as `start` would.
-    fn worker_with(ublk: Option<Arc<crate::ublk::manager::Manager>>) -> WorkerApplication {
-        let config = crate::test_support::cluster::config(false);
+    fn worker_with(
+        ublk: Option<(
+            Arc<crate::ublk::manager::Manager>,
+            crate::config::UblkConfig,
+        )>,
+    ) -> WorkerApplication {
+        let mut config = crate::test_support::cluster::config(false);
+        let ublk = ublk.map(|(manager, ublk)| {
+            reserve_ublk_submissions(&ublk, &mut config.limits).unwrap();
+            config.ublk = ublk;
+            manager
+        });
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             config.limits.clone(),
         )));
@@ -3525,7 +3545,7 @@ mod ublk_tests {
             Duration::from_secs(1),
             Duration::from_secs(1),
         ));
-        let mut worker = worker_with(Some(manager.clone()));
+        let mut worker = worker_with(Some((manager.clone(), ublk(1, 4))));
         assert!(worker.ublk.is_some());
         uring_runtime::group::Service::stop_admission(&mut worker).unwrap();
         // STOP_DEV waits for in-flight reads, so the read path stays open and

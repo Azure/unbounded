@@ -326,10 +326,16 @@ impl super::worker::Backend for StubBackend {
 }
 
 /// Runs one worker: a real reactor serving queue `q` until `done`.
-fn run_worker(q: u16, manager: Arc<super::manager::Manager>, done: Arc<AtomicBool>) {
+/// Returns the reactor operations still in flight at the end.
+fn run_worker(q: u16, manager: Arc<super::manager::Manager>, done: Arc<AtomicBool>) -> usize {
     let reactor = crate::test_support::enrollment::reactor().expect("io_uring");
-    let mut worker =
-        super::worker::UblkWorker::new(q, manager, std::rc::Rc::new(StubBackend), reactor.clone());
+    let mut worker = super::worker::UblkWorker::new(
+        q,
+        manager,
+        std::rc::Rc::new(StubBackend),
+        reactor.clone(),
+        None,
+    );
     let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
     while !(done.load(Ordering::Relaxed) && worker.is_idle()) {
         worker.poll(&mut cx);
@@ -345,6 +351,126 @@ fn run_worker(q: u16, manager: Arc<super::manager::Manager>, done: Arc<AtomicBoo
         reactor
             .wait(Duration::from_millis(2))
             .expect("reactor wait");
+    }
+    reactor.in_flight()
+}
+
+fn stub_config() -> crate::config::UblkConfig {
+    crate::config::UblkConfig {
+        devices: vec![crate::config::UblkDeviceConfig {
+            cache: "stub".into(),
+            key: crate::model::CacheKey([3; 32]),
+            etag: None,
+            id: None,
+        }],
+        queue_depth: DEPTH,
+        max_io_bytes: MAX_IO,
+    }
+}
+
+fn wait_dev_id(manager: &super::manager::Manager) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(id) = manager.dev_id(0) {
+            assert_ne!(id, 0, "the test must never touch device 0");
+            return id;
+        }
+        assert!(Instant::now() < deadline, "device was not added");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A device whose queues never all attach is never started. The manager
+/// still sends STOP_DEV, which aborts the attached queue's fetches, so the
+/// worker's reactor ends with nothing in flight and the device is deleted
+/// while the control thread keeps running.
+#[test]
+fn ublk_never_started_device_is_stopped_and_deleted() {
+    if !enabled() {
+        return;
+    }
+    let manager = Arc::new(super::manager::Manager::new(
+        &stub_config(),
+        2,
+        Path::new("/dev"),
+        Duration::from_secs(10),
+        Duration::from_secs(1),
+    ));
+    let done = Arc::new(AtomicBool::new(false));
+    // Only queue 0 has a worker, so attaching times out.
+    let worker = {
+        let manager = manager.clone();
+        let done = done.clone();
+        thread::spawn(move || run_worker(0, manager, done))
+    };
+    let control = {
+        let manager = manager.clone();
+        thread::spawn(move || manager.run())
+    };
+    let id = wait_dev_id(&manager);
+    let char_path = Path::new("/dev").join(format!("ublkc{id}"));
+    assert!(
+        wait_gone(&char_path),
+        "{} still present",
+        char_path.display()
+    );
+    assert!(!manager.control_done(), "deleted by teardown, not at exit");
+    assert!(!manager.view(0, futures::task::noop_waker_ref())[0].abandon);
+    manager.request_stop();
+    control.join().expect("control thread");
+    done.store(true, Ordering::Relaxed);
+    assert_eq!(worker.join().expect("worker thread"), 0);
+}
+
+/// Another process stopping a running device counts as a failure: the
+/// manager tears it down and deletes it, and the workers' reactors end
+/// with nothing in flight.
+#[test]
+fn ublk_external_stop_is_torn_down() {
+    if !enabled() {
+        return;
+    }
+    let manager = Arc::new(super::manager::Manager::new(
+        &stub_config(),
+        2,
+        Path::new("/dev"),
+        Duration::from_secs(10),
+        Duration::from_secs(10),
+    ));
+    let done = Arc::new(AtomicBool::new(false));
+    let workers: Vec<_> = (0..2)
+        .map(|q| {
+            let manager = manager.clone();
+            let done = done.clone();
+            thread::spawn(move || run_worker(q, manager, done))
+        })
+        .collect();
+    let control = {
+        let manager = manager.clone();
+        thread::spawn(move || manager.run())
+    };
+    let id = wait_dev_id(&manager);
+    let block_path = Path::new("/dev").join(format!("ublkb{id}"));
+    assert!(
+        wait_for(&block_path),
+        "{} did not appear",
+        block_path.display()
+    );
+    let mut other = Control::open(Path::new("/dev")).expect("open ublk-control");
+    other.stop_dev(id).expect("external STOP_DEV");
+    let char_path = Path::new("/dev").join(format!("ublkc{id}"));
+    assert!(
+        wait_gone(&char_path),
+        "{} still present",
+        char_path.display()
+    );
+    assert!(manager.stopping(0));
+    assert!(!manager.control_done());
+    manager.request_stop();
+    control.join().expect("control thread");
+    done.store(true, Ordering::Relaxed);
+    for worker in workers {
+        assert_eq!(worker.join().expect("worker thread"), 0);
     }
 }
 
@@ -433,7 +559,7 @@ fn ublk_worker_queues_serve_reads() {
     assert!(manager.control_done());
     done.store(true, Ordering::Relaxed);
     for worker in workers {
-        worker.join().expect("worker thread");
+        assert_eq!(worker.join().expect("worker thread"), 0);
     }
     assert!(
         wait_gone(&block_path),
@@ -495,6 +621,12 @@ fn ublk_device_serves_the_directory_read_path() {
                 manager,
                 fixture.backend.clone(),
                 fixture.reactor.clone(),
+                Some(
+                    fixture
+                        .reactor
+                        .reserve_commands(usize::from(DEPTH))
+                        .expect("reserve ublk command slots"),
+                ),
             );
             let _queue = fixture.worker.drivers.enter();
             let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());

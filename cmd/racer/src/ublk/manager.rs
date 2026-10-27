@@ -58,8 +58,11 @@ struct DeviceShared {
     /// The one open `/dev/ublkcN`. The kernel allows a single open, so each
     /// worker serves its queue through a duplicate of this descriptor.
     char_fd: Option<Arc<OwnedFd>>,
-    /// Workers must drop their queues now, without waiting for aborts.
+    /// Workers must stop serving reads and answer every request with EIO.
     abandon: bool,
+    /// This process is stopping the device. A queue whose tags all end
+    /// before this is set was stopped by someone else.
+    stopping: bool,
     queues: Vec<QueueReport>,
     failed: Vec<bool>,
 }
@@ -91,13 +94,22 @@ pub(crate) trait DeviceControl {
         should_stop: &dyn Fn() -> bool,
     ) -> Result<(), UblkError>;
     fn stop_dev(&mut self, id: u32) -> Result<(), UblkError>;
+    fn get_dev_info(&mut self, id: u32) -> Result<DevInfo, UblkError>;
+    /// Delete a device whose character device the caller holds open.
     fn del_dev(&mut self, id: u32) -> Result<(), UblkError>;
+    /// Delete a device nobody in this process holds.
+    fn del_dev_unpinned(&mut self, id: u32) -> Result<(), UblkError>;
+    /// Whether a command's outcome is unknown, so no more are sent.
+    fn is_poisoned(&self) -> bool;
 
     /// Open `<directory>/ublkcN` read-write.
     fn open_char(&mut self, directory: &Path, id: u32) -> std::io::Result<OwnedFd> {
         open_char(directory, id)
     }
 }
+
+/// Shortest bound on one control command.
+const MIN_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How long to retry opening `/dev/ublkcN` after ADD_DEV. The node is
 /// normally there at once, but a host `/dev` mount can lag.
@@ -145,8 +157,20 @@ impl DeviceControl for Control {
         Control::stop_dev(self, id)
     }
 
+    fn get_dev_info(&mut self, id: u32) -> Result<DevInfo, UblkError> {
+        Control::get_dev_info(self, id)
+    }
+
     fn del_dev(&mut self, id: u32) -> Result<(), UblkError> {
         Control::del_dev(self, id)
+    }
+
+    fn del_dev_unpinned(&mut self, id: u32) -> Result<(), UblkError> {
+        Control::del_dev_unpinned(self, id)
+    }
+
+    fn is_poisoned(&self) -> bool {
+        Control::is_poisoned(self)
     }
 }
 
@@ -278,6 +302,20 @@ impl Manager {
         self.lock().devices[index].char_fd = None;
     }
 
+    /// Keep the manager's character descriptor open until the process
+    /// exits. A delete whose outcome is unknown may still be running, and
+    /// closing the device could let its id be freed and reused under it.
+    fn leak_char(&self, index: usize) {
+        if let Some(fd) = self.lock().devices[index].char_fd.take() {
+            std::mem::forget(fd);
+        }
+    }
+
+    /// Whether this process has started stopping the device.
+    pub(crate) fn stopping(&self, index: usize) -> bool {
+        self.lock().devices[index].stopping
+    }
+
     /// The resolved version of a device, once a worker found it.
     pub(crate) fn resolved(&self, index: usize) -> Result<Resolved, Error> {
         self.lock().devices[index]
@@ -341,7 +379,10 @@ impl Manager {
     /// Open `/dev/ublk-control` and run the control loop until stop.
     pub(crate) fn run(&self) {
         match Control::open(&self.device_directory) {
-            Ok(mut control) => self.run_with(&mut control),
+            Ok(mut control) => {
+                control.set_timeout(self.shutdown_timeout.max(MIN_COMMAND_TIMEOUT));
+                self.run_with(&mut control);
+            }
             Err(error) => {
                 log(None, "open", &format!("error=\"{error}\""));
                 self.finish();
@@ -384,7 +425,7 @@ impl Manager {
                 Phase::Waiting => self.bring_up(control, index),
                 Phase::Started(id) => {
                     log(Some(index), "serve", &format!("state=failed id={id}"));
-                    self.teardown(control, &[(index, id, true)]);
+                    self.teardown(control, &[(index, id)]);
                     Phase::Failed
                 }
                 phase => phase,
@@ -394,7 +435,7 @@ impl Manager {
             .iter()
             .enumerate()
             .filter_map(|(i, phase)| match phase {
-                Phase::Started(id) => Some((i, *id, true)),
+                Phase::Started(id) => Some((i, *id)),
                 _ => None,
             })
             .collect();
@@ -422,17 +463,10 @@ impl Manager {
             return Phase::Failed;
         }
         let device = &self.devices[index];
-        if let Some(id) = device.id {
-            // A device left by an earlier run with this id. Missing is fine.
-            let _ = control.stop_dev(id);
-            if let Err(error) = control.del_dev(id) {
-                log(
-                    Some(index),
-                    "replace",
-                    &format!("state=failed id={id} error=\"{error}\""),
-                );
-                return Phase::Failed;
-            }
+        if let Some(id) = device.id
+            && !self.replace_stale(control, index, id)
+        {
+            return Phase::Failed;
         }
         let spec = DevSpec {
             id: device.id,
@@ -442,8 +476,8 @@ impl Manager {
             flags: UBLK_F_CMD_IOCTL_ENCODE | UBLK_F_USER_COPY,
             cookie: cookie(index),
         };
-        let id = match control.add_dev(&spec) {
-            Ok(info) => info.dev_id,
+        let info = match control.add_dev(&spec) {
+            Ok(info) => info,
             Err(error) => {
                 log(
                     Some(index),
@@ -453,49 +487,63 @@ impl Manager {
                 return Phase::Failed;
             }
         };
+        let id = info.dev_id;
+        // Hold the character device from here on: while it is open the
+        // kernel cannot free the id, so a later command by id can only reach
+        // this device.
+        let fd = match control.open_char(&self.device_directory, id) {
+            Ok(fd) => fd,
+            Err(error) => {
+                // Nothing pins the id, so it may already belong to another
+                // device. Send nothing by id and leave it for an operator.
+                log(
+                    Some(index),
+                    "open",
+                    &format!(
+                        "state=failed id={id} error=\"{error}\" action=left_for_manual_cleanup"
+                    ),
+                );
+                return Phase::Failed;
+            }
+        };
+        self.update(|shared| shared.devices[index].char_fd = Some(Arc::new(fd)));
+        // The kernel may adjust what was asked for, for example rounding the
+        // buffer size to a page. Serve with what it granted.
+        let Some((depth, max_io_bytes)) = self.granted(&spec, &info) else {
+            log(
+                Some(index),
+                "add",
+                &format!(
+                    "state=failed id={id} error=\"unusable device info: queues={} depth={} max_io_bytes={}\"",
+                    info.nr_hw_queues, info.queue_depth, info.max_io_buf_bytes
+                ),
+            );
+            self.teardown(control, &[(index, id)]);
+            return Phase::Failed;
+        };
         let size = resolved.length.div_ceil(512) * 512;
-        if let Err(error) =
-            control.set_params(id, &Params::read_only_basic(size, self.max_io_bytes))
-        {
+        if let Err(error) = control.set_params(id, &Params::read_only_basic(size, max_io_bytes)) {
             log(
                 Some(index),
                 "params",
                 &format!("state=failed id={id} error=\"{error}\""),
             );
-            self.teardown(control, &[(index, id, false)]);
+            self.teardown(control, &[(index, id)]);
             return Phase::Failed;
         }
-        let fd = match control.open_char(&self.device_directory, id) {
-            Ok(fd) => fd,
-            Err(error) => {
-                log(
-                    Some(index),
-                    "open",
-                    &format!("state=failed id={id} error=\"{error}\""),
-                );
-                self.teardown(control, &[(index, id, false)]);
-                return Phase::Failed;
-            }
-        };
         let attach = Attach {
             dev_id: id,
-            depth: self.queue_depth,
-            max_io_bytes: self.max_io_bytes,
+            depth,
+            max_io_bytes,
             length: resolved.length,
         };
-        self.update(|shared| {
-            let device = &mut shared.devices[index];
-            device.char_fd = Some(Arc::new(fd));
-            device.attach = Some(attach);
-        });
+        self.update(|shared| shared.devices[index].attach = Some(attach));
         let attached = self.wait_until(Instant::now() + self.attach_timeout, |shared| {
             let device = &shared.devices[index];
             shared.stop
                 || device.failed.iter().any(|f| *f)
                 || device.queues.iter().all(|q| *q == QueueReport::Attached)
         });
-        // Every worker that will attach has its own duplicate by now.
-        self.release_char(index);
         let all_attached = {
             let shared = self.lock();
             let device = &shared.devices[index];
@@ -505,7 +553,7 @@ impl Manager {
         };
         if !attached || !all_attached {
             log(Some(index), "attach", &format!("state=failed id={id}"));
-            self.teardown(control, &[(index, id, false)]);
+            self.teardown(control, &[(index, id)]);
             return Phase::Failed;
         }
         let should_stop = || {
@@ -518,7 +566,7 @@ impl Manager {
                 "start",
                 &format!("state=failed id={id} error=\"{error}\""),
             );
-            self.teardown(control, &[(index, id, false)]);
+            self.teardown(control, &[(index, id)]);
             return Phase::Failed;
         }
         log(
@@ -534,35 +582,102 @@ impl Manager {
         Phase::Started(id)
     }
 
-    /// Stop the given devices, let their queues drain, and delete them.
-    /// `started` devices get STOP_DEV first so the kernel aborts every tag.
-    /// Queues still attached after the timeout are abandoned by their workers.
-    fn teardown(&self, control: &mut dyn DeviceControl, devices: &[(usize, u32, bool)]) {
-        for &(index, _, _) in devices {
-            self.release_char(index);
+    /// The queue depth and buffer size the kernel granted in ADD_DEV, or
+    /// `None` if they cannot be served.
+    fn granted(&self, spec: &DevSpec, info: &DevInfo) -> Option<(u16, u32)> {
+        let usable = info.nr_hw_queues == spec.queues
+            && (1..=spec.depth).contains(&info.queue_depth)
+            && info.max_io_buf_bytes >= 4096
+            && info.max_io_buf_bytes.is_multiple_of(512);
+        usable.then_some((info.queue_depth, info.max_io_buf_bytes))
+    }
+
+    /// Remove a device an earlier run left with this fixed id. Returns
+    /// whether the id is free now.
+    fn replace_stale(&self, control: &mut dyn DeviceControl, index: usize, id: u32) -> bool {
+        let fail = |what: &str, error: &dyn std::fmt::Display| {
+            log(
+                Some(index),
+                "replace",
+                &format!("state=failed id={id} step={what} error=\"{error}\""),
+            );
+            false
+        };
+        match control.get_dev_info(id) {
+            Ok(_) => {}
+            Err(error) if error.errno() == Some(libc::ENODEV) => return true,
+            Err(error) => return fail("info", &error),
         }
-        for &(index, id, started) in devices {
-            if started && let Err(error) = control.stop_dev(id) {
-                log(
+        if let Err(error) = control.stop_dev(id)
+            && error.errno() != Some(libc::ENODEV)
+        {
+            return fail("stop", &error);
+        }
+        // Hold the character device so the id cannot be reused while it is
+        // deleted. A live server elsewhere holds it and makes this fail.
+        let fd = match control.open_char(&self.device_directory, id) {
+            Ok(fd) => fd,
+            Err(error) if error.raw_os_error() == Some(libc::EBUSY) => {
+                return fail("open", &"device is in use by another server");
+            }
+            Err(_) => {
+                // No node to hold, for example a host /dev that lags. The
+                // device was stopped; delete it by id.
+                return match control.del_dev_unpinned(id) {
+                    Ok(()) => true,
+                    Err(error) => fail("delete", &error),
+                };
+            }
+        };
+        match control.del_dev(id) {
+            Ok(()) => true,
+            Err(error) => {
+                if control.is_poisoned() {
+                    std::mem::forget(fd);
+                }
+                fail("delete", &error)
+            }
+        }
+    }
+
+    /// Stop the given devices, let their queues finish, and delete them.
+    ///
+    /// Every device gets STOP_DEV, started or not: it makes the kernel
+    /// abort every outstanding fetch, which is the only way the queues end.
+    /// Dropping a queue's commands does not cancel them. Queues still
+    /// attached after the timeout are told to answer every request with
+    /// EIO, which lets a STOP_DEV still waiting on them finish. The manager
+    /// keeps the character device open until the delete is done.
+    fn teardown(&self, control: &mut dyn DeviceControl, devices: &[(usize, u32)]) {
+        self.update(|shared| {
+            for &(index, _) in devices {
+                shared.devices[index].stopping = true;
+            }
+        });
+        for &(index, id) in devices {
+            match control.stop_dev(id) {
+                Ok(()) => {}
+                Err(error) if error.errno() == Some(libc::ENODEV) => {
+                    log(Some(index), "stop", &format!("state=gone id={id}"))
+                }
+                Err(error) => log(
                     Some(index),
                     "stop",
                     &format!("state=failed id={id} error=\"{error}\""),
-                );
+                ),
             }
         }
         let closed = |shared: &Shared| {
-            devices.iter().all(|&(index, _, _)| {
+            devices.iter().all(|&(index, _)| {
                 shared.devices[index]
                     .queues
                     .iter()
                     .all(|q| *q != QueueReport::Attached)
             })
         };
-        // A device that never started has no requests to abort.
-        let any_started = devices.iter().any(|&(_, _, started)| started);
-        if !any_started || !self.wait_until(Instant::now() + self.shutdown_timeout, closed) {
+        if !self.wait_until(Instant::now() + self.shutdown_timeout, closed) {
             self.update(|shared| {
-                for &(index, _, _) in devices {
+                for &(index, _) in devices {
                     shared.devices[index].abandon = true;
                 }
             });
@@ -570,14 +685,35 @@ impl Manager {
                 log(None, "teardown", "state=timeout");
             }
         }
-        for &(index, id, _) in devices {
-            match control.del_dev(id) {
-                Ok(()) => log(Some(index), "delete", &format!("state=deleted id={id}")),
-                Err(error) => log(
+        for &(index, id) in devices {
+            if control.is_poisoned() {
+                log(
                     Some(index),
                     "delete",
-                    &format!("state=failed id={id} error=\"{error}\""),
-                ),
+                    &format!(
+                        "state=skipped id={id} reason=control_unusable action=left_for_manual_cleanup"
+                    ),
+                );
+                self.leak_char(index);
+                continue;
+            }
+            match control.del_dev(id) {
+                Ok(()) => {
+                    log(Some(index), "delete", &format!("state=deleted id={id}"));
+                    self.release_char(index);
+                }
+                Err(error) => {
+                    log(
+                        Some(index),
+                        "delete",
+                        &format!("state=failed id={id} error=\"{error}\""),
+                    );
+                    if control.is_poisoned() {
+                        self.leak_char(index);
+                    } else {
+                        self.release_char(index);
+                    }
+                }
             }
         }
     }
@@ -615,6 +751,16 @@ mod tests {
     struct Fake {
         ops: Arc<Mutex<Vec<String>>>,
         fail_start: bool,
+        /// A device with the fixed id already exists.
+        stale: bool,
+        /// ADD_DEV grants this depth and buffer size instead.
+        grant: Option<(u16, u32)>,
+        stop_errno: Option<i32>,
+        /// DEL_DEV fails with an unknown outcome and poisons the channel.
+        del_unknown: bool,
+        poisoned: Arc<Mutex<bool>>,
+        /// The manager, to check it still holds the char device on delete.
+        manager: Arc<Mutex<Option<Arc<Manager>>>>,
     }
 
     impl Fake {
@@ -633,14 +779,21 @@ mod tests {
                 "add id={:?} queues={} depth={} max={} flags={:#x}",
                 spec.id, spec.queues, spec.depth, spec.max_io_bytes, spec.flags
             ));
+            let (depth, max) = self.grant.unwrap_or((spec.depth, spec.max_io_bytes));
             Ok(DevInfo {
                 dev_id: spec.id.unwrap_or(DEV_ID),
+                nr_hw_queues: spec.queues,
+                queue_depth: depth,
+                max_io_buf_bytes: max,
                 ..Default::default()
             })
         }
 
         fn set_params(&mut self, id: u32, params: &Params) -> Result<(), UblkError> {
-            self.push(format!("params {id} sectors={}", params.basic.dev_sectors));
+            self.push(format!(
+                "params {id} sectors={} max_sectors={}",
+                params.basic.dev_sectors, params.basic.max_sectors
+            ));
             Ok(())
         }
 
@@ -662,12 +815,47 @@ mod tests {
 
         fn stop_dev(&mut self, id: u32) -> Result<(), UblkError> {
             self.push(format!("stop {id}"));
-            Ok(())
+            match self.stop_errno {
+                Some(errno) => Err(UblkError::Kernel {
+                    op: "STOP_DEV",
+                    errno,
+                }),
+                None => Ok(()),
+            }
+        }
+
+        fn get_dev_info(&mut self, id: u32) -> Result<DevInfo, UblkError> {
+            self.push(format!("info {id}"));
+            if self.stale {
+                Ok(DevInfo::default())
+            } else {
+                Err(UblkError::Kernel {
+                    op: "GET_DEV_INFO",
+                    errno: libc::ENODEV,
+                })
+            }
         }
 
         fn del_dev(&mut self, id: u32) -> Result<(), UblkError> {
-            self.push(format!("del {id}"));
+            let held =
+                self.manager.lock().unwrap().as_ref().is_none_or(|manager| {
+                    manager.dev_id(0) != Some(id) || manager.char_fd(0).is_ok()
+                });
+            self.push(format!("del {id}{}", if held { "" } else { " unpinned" }));
+            if self.del_unknown {
+                *self.poisoned.lock().unwrap() = true;
+                return Err(UblkError::TimedOut { op: "DEL_DEV" });
+            }
             Ok(())
+        }
+
+        fn del_dev_unpinned(&mut self, id: u32) -> Result<(), UblkError> {
+            self.push(format!("del-unpinned {id}"));
+            Ok(())
+        }
+
+        fn is_poisoned(&self) -> bool {
+            *self.poisoned.lock().unwrap()
         }
 
         fn open_char(&mut self, _directory: &Path, _id: u32) -> std::io::Result<OwnedFd> {
@@ -721,6 +909,7 @@ mod tests {
     fn spawn(manager: &Arc<Manager>, fake: &Fake) -> std::thread::JoinHandle<()> {
         let manager = manager.clone();
         let mut fake = fake.clone();
+        *fake.manager.lock().unwrap() = Some(manager.clone());
         std::thread::spawn(move || manager.run_with(&mut fake))
     }
 
@@ -762,7 +951,7 @@ mod tests {
                     "add id=None queues=2 depth=4 max=1048576 flags={:#x}",
                     UBLK_F_CMD_IOCTL_ENCODE | UBLK_F_USER_COPY
                 ),
-                format!("params {DEV_ID} sectors=2"),
+                format!("params {DEV_ID} sectors=2 max_sectors=2048"),
                 format!("start {DEV_ID}"),
                 format!("stop {DEV_ID}"),
                 format!("del {DEV_ID}"),
@@ -770,10 +959,95 @@ mod tests {
         );
         assert!(manager.control_done());
         assert!(view(&manager, 0).abandon, "workers drop queues after exit");
+        assert!(manager.char_fd(0).is_err(), "closed after the delete");
     }
 
     #[test]
-    fn fixed_id_replaces_a_stale_device() {
+    fn kernel_adjusted_device_info_is_used() {
+        let manager = manager(None);
+        let fake = Fake {
+            grant: Some((2, 64 << 10)),
+            ..Default::default()
+        };
+        let thread = spawn(&manager, &fake);
+        manager.report_resolved(0, Ok(resolved()));
+        eventually("attach", || view(&manager, 0).attach.is_some());
+        let attach = view(&manager, 0).attach.unwrap();
+        assert_eq!((attach.depth, attach.max_io_bytes), (2, 64 << 10));
+        assert!(
+            fake.ops()
+                .contains(&format!("params {DEV_ID} sectors=2 max_sectors=128"))
+        );
+        manager.request_stop();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn unusable_device_info_is_deleted() {
+        let manager = manager(None);
+        let fake = Fake {
+            grant: Some((0, 1 << 20)),
+            ..Default::default()
+        };
+        let thread = spawn(&manager, &fake);
+        manager.report_resolved(0, Ok(resolved()));
+        eventually("del", || fake.ops().contains(&format!("del {DEV_ID}")));
+        manager.request_stop();
+        thread.join().unwrap();
+        assert!(view(&manager, 0).attach.is_none());
+        assert!(!fake.ops().iter().any(|op| op.starts_with("params")));
+    }
+
+    #[test]
+    fn external_stop_tears_down_and_ignores_enodev() {
+        let manager = manager(None);
+        let fake = Fake {
+            stop_errno: Some(libc::ENODEV),
+            ..Default::default()
+        };
+        let thread = spawn(&manager, &fake);
+        manager.report_resolved(0, Ok(resolved()));
+        eventually("attach", || view(&manager, 0).attach.is_some());
+        manager.report_queue(0, 0, QueueReport::Attached);
+        manager.report_queue(0, 1, QueueReport::Attached);
+        eventually("start", || fake.ops().contains(&format!("start {DEV_ID}")));
+        assert!(!manager.stopping(0));
+        // A worker whose tags all aborted while the device was not being
+        // stopped reports a failure and closes.
+        manager.report_failure(0, 0);
+        manager.report_queue(0, 0, QueueReport::Closed);
+        manager.report_queue(0, 1, QueueReport::Closed);
+        eventually("del", || fake.ops().contains(&format!("del {DEV_ID}")));
+        assert!(manager.stopping(0));
+        manager.request_stop();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn unknown_delete_keeps_the_char_device_open() {
+        let manager = manager(None);
+        let fake = Fake {
+            del_unknown: true,
+            ..Default::default()
+        };
+        let thread = spawn(&manager, &fake);
+        manager.report_resolved(0, Ok(resolved()));
+        eventually("attach", || view(&manager, 0).attach.is_some());
+        manager.report_queue(0, 0, QueueReport::Attached);
+        manager.report_queue(0, 1, QueueReport::Attached);
+        eventually("start", || fake.ops().contains(&format!("start {DEV_ID}")));
+        manager.request_stop();
+        eventually("stop", || fake.ops().contains(&format!("stop {DEV_ID}")));
+        manager.report_queue(0, 0, QueueReport::Closed);
+        manager.report_queue(0, 1, QueueReport::Closed);
+        thread.join().unwrap();
+        assert_eq!(fake.ops().last().unwrap(), &format!("del {DEV_ID}"));
+        // Leaked, not closed: the manager no longer hands it out either.
+        assert!(manager.char_fd(0).is_err());
+    }
+
+    #[test]
+    fn fixed_id_without_a_stale_device_adds_directly() {
         let manager = manager(Some(9));
         let fake = Fake::default();
         let thread = spawn(&manager, &fake);
@@ -782,9 +1056,30 @@ mod tests {
         manager.request_stop();
         thread.join().unwrap();
         let ops = fake.ops();
-        assert_eq!(ops[0], "stop 9");
-        assert_eq!(ops[1], "del 9");
-        assert!(ops[2].starts_with("add id=Some(9)"));
+        assert_eq!(ops[0], "info 9");
+        assert!(
+            ops[1].starts_with("add id=Some(9)"),
+            "no stale device: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn fixed_id_replaces_a_stale_device() {
+        let manager = manager(Some(9));
+        let fake = Fake {
+            stale: true,
+            ..Default::default()
+        };
+        let thread = spawn(&manager, &fake);
+        manager.report_resolved(0, Ok(resolved()));
+        eventually("attach", || view(&manager, 0).attach.is_some());
+        manager.request_stop();
+        thread.join().unwrap();
+        let ops = fake.ops();
+        assert_eq!(ops[0], "info 9");
+        assert_eq!(ops[1], "stop 9");
+        assert_eq!(ops[2], "del 9");
+        assert!(ops[3].starts_with("add id=Some(9)"));
     }
 
     #[test]
@@ -818,7 +1113,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_failure_abandons_and_deletes_without_start() {
+    fn attach_failure_stops_and_deletes_without_start() {
         let manager = manager(None);
         let fake = Fake::default();
         let thread = spawn(&manager, &fake);
@@ -826,13 +1121,16 @@ mod tests {
         eventually("attach", || view(&manager, 0).attach.is_some());
         manager.report_queue(0, 0, QueueReport::Attached);
         manager.report_failure(0, 1);
-        eventually("abandon", || view(&manager, 0).abandon);
+        // STOP_DEV aborts the fetches of a never-started device, so the
+        // attached queue closes without being abandoned.
+        eventually("stop", || fake.ops().contains(&format!("stop {DEV_ID}")));
+        assert!(!view(&manager, 0).abandon);
         manager.report_queue(0, 0, QueueReport::Closed);
         eventually("del", || fake.ops().contains(&format!("del {DEV_ID}")));
         manager.request_stop();
         thread.join().unwrap();
         assert!(!fake.ops().iter().any(|op| op.starts_with("start")));
-        assert!(!fake.ops().iter().any(|op| op.starts_with("stop")));
+        assert!(!fake.ops().iter().any(|op| op.contains("unpinned")));
     }
 
     #[test]
@@ -847,7 +1145,7 @@ mod tests {
         eventually("attach", || view(&manager, 0).attach.is_some());
         manager.report_queue(0, 0, QueueReport::Attached);
         manager.report_queue(0, 1, QueueReport::Attached);
-        eventually("abandon", || view(&manager, 0).abandon);
+        eventually("stop", || fake.ops().contains(&format!("stop {DEV_ID}")));
         manager.report_queue(0, 0, QueueReport::Closed);
         manager.report_queue(0, 1, QueueReport::Closed);
         eventually("del", || fake.ops().contains(&format!("del {DEV_ID}")));
