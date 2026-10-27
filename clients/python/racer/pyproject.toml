@@ -1,15 +1,35 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "racer-client"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python client for the Racer node-local object cache"
 readme = "README.md"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
+authors = [{ name = "Microsoft Corporation" }]
+keywords = ["racer", "unbounded", "kubernetes", "cache", "gpu"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Azure/unbounded"
+Documentation = "https://github.com/Azure/unbounded/tree/main/docs/content/guides/racer-vllm.md"
+Source = "https://github.com/Azure/unbounded/tree/main/clients/python/racer"
+Issues = "https://github.com/Azure/unbounded/issues"
 
 [project.optional-dependencies]
 torch = ["torch"]

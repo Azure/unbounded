@@ -423,3 +423,20 @@ def test_iter_weights_releases_dedicated_when_consumed(server, uri):
     gc.collect()
     assert refs[0]() is None
     gen.close()
+
+
+def test_package_versions_agree():
+    tomllib = pytest.importorskip("tomllib")
+    here = os.path.dirname(__file__)
+    with open(os.path.join(here, "..", "pyproject.toml"), "rb") as f:
+        vllm_proj = tomllib.load(f)["project"]
+    with open(os.path.join(here, "..", "..", "racer", "pyproject.toml"), "rb") as f:
+        client_proj = tomllib.load(f)["project"]
+    # racer-vllm needs the racer-client release built from the same tree.
+    dep = [d for d in vllm_proj["dependencies"] if d.startswith("racer-client")]
+    assert dep == [f"racer-client>={client_proj['version']},<0.3"]
+    for proj in (vllm_proj, client_proj):
+        assert proj["license"] == "Apache-2.0" and proj["license-files"] == ["LICENSE"]
+        assert proj["urls"]["Source"].startswith("https://github.com/Azure/unbounded")
+    for d in ("racer", "racer-vllm"):
+        assert os.path.exists(os.path.join(here, "..", "..", d, "LICENSE"))

@@ -600,6 +600,14 @@ racer-python-test: ## Run the Racer Python client and vLLM plugin tests (no GPU 
 	cd clients/python/racer && PYTHONPATH=src timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/pytest" -q -p no:cacheprovider
 	cd clients/python/racer-vllm && PYTHONPATH=src:../racer/src timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/pytest" -q -p no:cacheprovider
 
+.PHONY: racer-python-dist
+racer-python-dist: ## Build sdists and wheels for racer-client and racer-vllm into tmp/racer-python-dist
+	@test -x "$(RACER_PY_VENV)/bin/pyproject-build" || { timeout --signal=TERM --kill-after=10s 120s python3 -m venv "$(RACER_PY_VENV)" && \
+		timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/pip" install -q build; }
+	rm -rf tmp/racer-python-dist
+	timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/python" -m build -o tmp/racer-python-dist clients/python/racer
+	timeout --signal=TERM --kill-after=10s 300s "$(RACER_PY_VENV)/bin/python" -m build -o tmp/racer-python-dist clients/python/racer-vllm
+
 $(SETUP_ENVTEST):
 	@mkdir -p bin tmp/envtest-tools
 	TMPDIR="$(CURDIR)/tmp/envtest-tools" GOBIN="$(CURDIR)/bin" timeout --signal=TERM --kill-after=10s 300s $(GOCMD) install sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION)
