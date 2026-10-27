@@ -1,4 +1,4 @@
-//! Pod mutation: the racer-object sidecar.
+//! Pod mutation: the racer-object sidecar and the client socket mount.
 
 use serde_json::{Map, Value, json};
 
@@ -12,6 +12,7 @@ pub(crate) fn mutate(pod: &Value, image: &str) -> Result<Vec<Value>, Reject> {
     }
     let mut out = pod.clone();
     mutate_sidecar(&mut out, image)?;
+    mutate_client_socket(&mut out)?;
     let mut ops = Vec::new();
     diff(pod, &out, &mut String::new(), &mut ops);
     Ok(ops)
@@ -128,6 +129,131 @@ fn mutate_sidecar(pod: &mut Value, image: &str) -> Result<(), Reject> {
     require_racer_node(pod)?;
     set_annotation(pod, INJECTED_ANNOTATION, image);
     Ok(())
+}
+
+/// Mounts `/run/racer/<cache>/client` read-only at the same path in the
+/// selected app containers and sets [`SOCKET_ENV`]. A read-only mount still
+/// permits connect(2) on the socket: write permission on the socket inode is
+/// checked, not the mount's read-only flag. Pods without the label, or already
+/// marked with [`CLIENT_SOCKET_INJECTED_ANNOTATION`], are left unchanged.
+/// Ports Go `mutateClientSocket`.
+fn mutate_client_socket(pod: &mut Value) -> Result<(), Reject> {
+    let p = Pod::read(pod)?;
+
+    if get_str(p.labels, CLIENT_SOCKET_LABEL) != Some(ENABLED_VALUE) {
+        return Ok(());
+    }
+    if p.annotations
+        .is_some_and(|a| a.contains_key(CLIENT_SOCKET_INJECTED_ANNOTATION))
+    {
+        return Ok(());
+    }
+
+    let Some(cache) = get_str(p.annotations, CLIENT_CACHE_ANNOTATION) else {
+        return Err(deny(format!(
+            "annotation {CLIENT_CACHE_ANNOTATION} is required and must name the ClusterCache to bind to"
+        )));
+    };
+    if !valid_cache(cache) {
+        return Err(deny(format!(
+            "annotation {CLIENT_CACHE_ANNOTATION} has invalid cache name {cache:?}"
+        )));
+    }
+    let cache = cache.to_owned();
+
+    let containers = p.containers.map(Vec::as_slice).unwrap_or_default();
+    let targets = client_targets(p.annotations, containers)?;
+    check_linux(&p, "Racer client socket")?;
+
+    let client_dir = format!("/run/racer/{cache}/client");
+    let socket = format!("{client_dir}/socket");
+
+    // Reuse a volume that already mounts this directory, such as the one the
+    // racer-object sidecar adds for the same cache.
+    let mut volume = p.volumes.into_iter().flatten().find_map(|v| {
+        let path = v.get("hostPath")?.get("path")?.as_str()?;
+        (path == client_dir)
+            .then(|| v.get("name").and_then(Value::as_str).unwrap_or(""))
+            .map(str::to_owned)
+    });
+    if volume.is_none() && has_name(p.volumes, CLIENT_VOLUME_NAME) {
+        return Err(deny(format!(
+            "pod already defines a volume named {CLIENT_VOLUME_NAME:?}"
+        )));
+    }
+
+    for &i in &targets {
+        let c = containers[i].as_object().expect("checked by Pod::read");
+        let name = get_str(Some(c), "name").unwrap_or("");
+        let base = format!("spec.containers[{i}]");
+        let mounts = array(c, "volumeMounts", &format!("{base}.volumeMounts"))?;
+        for m in mounts.into_iter().flatten() {
+            let m = m
+                .as_object()
+                .ok_or_else(|| bad(format!("{base}.volumeMounts items must be objects")))?;
+            if string(m, "mountPath", &format!("{base}.volumeMounts.mountPath"))?
+                == Some(client_dir.as_str())
+            {
+                return Err(deny(format!(
+                    "container {name:?} already mounts {client_dir}"
+                )));
+            }
+        }
+        let env = array(c, "env", &format!("{base}.env"))?;
+        named_items(env, &format!("{base}.env"))?;
+        if has_name(env, SOCKET_ENV) {
+            return Err(deny(format!(
+                "container {name:?} already sets {SOCKET_ENV}"
+            )));
+        }
+    }
+
+    let s = child(pod, "spec");
+    let volume = match volume.take() {
+        Some(v) => v,
+        None => {
+            child_array(s, "volumes").push(json!({
+                "name": CLIENT_VOLUME_NAME,
+                "hostPath": {"path": client_dir, "type": "Directory"},
+            }));
+            CLIENT_VOLUME_NAME.to_owned()
+        }
+    };
+    let containers = child_array(s, "containers");
+    for &i in &targets {
+        let c = containers[i].as_object_mut().expect("checked by Pod::read");
+        child_array(c, "volumeMounts")
+            .push(json!({"name": volume, "mountPath": client_dir, "readOnly": true}));
+        child_array(c, "env").push(json!({"name": SOCKET_ENV, "value": socket}));
+    }
+    require_racer_node(pod)?;
+    set_annotation(pod, CLIENT_SOCKET_INJECTED_ANNOTATION, &cache);
+    Ok(())
+}
+
+/// Returns indexes into `spec.containers`. Ports Go `clientTargets`.
+fn client_targets(
+    annotations: Option<&Map<String, Value>>,
+    containers: &[Value],
+) -> Result<Vec<usize>, Reject> {
+    let Some(value) = get_str(annotations, CLIENT_CONTAINERS_ANNOTATION) else {
+        return Ok((0..containers.len()).collect());
+    };
+    let mut targets = Vec::new();
+    for name in value.split(',').map(str::trim) {
+        let i = containers
+            .iter()
+            .position(|c| c.get("name").and_then(Value::as_str) == Some(name));
+        match i {
+            Some(i) if !targets.contains(&i) => targets.push(i),
+            _ => {
+                return Err(deny(format!(
+                    "annotation {CLIENT_CONTAINERS_ANNOTATION} must list distinct app container names, separated by commas"
+                )));
+            }
+        }
+    }
+    Ok(targets)
 }
 
 /// Appends JSON Patch operations that turn `a` into `b`. Objects are diffed

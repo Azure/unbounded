@@ -1,5 +1,7 @@
 //! Mutating admission logic for Racer pods. [`ENABLED_LABEL`] injects the
 //! racer-object sidecar as a native sidecar (a restartable init container).
+//! [`CLIENT_SOCKET_LABEL`] mounts the Racer client socket into app containers.
+//! The two opt-ins are independent and both apply when a pod sets both labels.
 //!
 //! It reads an `admission.k8s.io/v1` `AdmissionReview` and returns the
 //! complete response review. A separate HTTP server serves [`PATH`].
@@ -43,6 +45,21 @@ pub const CPU_LIMIT_ANNOTATION: &str = "racer.unbounded-cloud.io/object-cpu-limi
 pub const MEMORY_REQUEST_ANNOTATION: &str = "racer.unbounded-cloud.io/object-memory-request";
 pub const MEMORY_LIMIT_ANNOTATION: &str = "racer.unbounded-cloud.io/object-memory-limit";
 pub const INJECTED_ANNOTATION: &str = "racer.unbounded-cloud.io/object-sidecar-injected";
+/// Opts a pod into a read-only mount of the Racer client socket directory,
+/// independent of the racer-object sidecar.
+pub const CLIENT_SOCKET_LABEL: &str = "racer.unbounded-cloud.io/client-socket";
+/// Names the ClusterCache whose client socket is mounted.
+pub const CLIENT_CACHE_ANNOTATION: &str = "racer.unbounded-cloud.io/client-cache";
+/// Optionally lists, comma-separated, the app containers that get the mount.
+/// The default is every app container.
+pub const CLIENT_CONTAINERS_ANNOTATION: &str = "racer.unbounded-cloud.io/client-containers";
+/// Records the mounted cache.
+pub const CLIENT_SOCKET_INJECTED_ANNOTATION: &str =
+    "racer.unbounded-cloud.io/client-socket-injected";
+/// Volume added when no volume already mounts the cache's client directory.
+pub const CLIENT_VOLUME_NAME: &str = "racer-client-socket";
+/// Tells clients where the socket is.
+pub const SOCKET_ENV: &str = "RACER_SOCKET";
 /// Node label that keeps Racer workloads off a node. Same as Go `wire.ExclusionLabel`.
 pub const EXCLUSION_LABEL: &str = "racer.unbounded-cloud.io/exclude";
 

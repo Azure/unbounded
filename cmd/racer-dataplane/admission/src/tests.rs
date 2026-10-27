@@ -828,3 +828,194 @@ fn patch_paths_escape_and_create_parents() {
     assert_eq!(out["metadata"]["annotations"]["a/b~c"], "x");
     assert_eq!(out["spec"]["volumes"][0]["name"], VOLUME_NAME);
 }
+
+const CLIENT_DIR: &str = "/run/racer/test-cache/client";
+
+/// Pod opted into the client socket only. A `null` annotation value removes the key.
+fn client_pod(anno: Value) -> Value {
+    let mut a = json!({CLIENT_CACHE_ANNOTATION: CACHE});
+    for (k, v) in anno.as_object().cloned().unwrap_or_default() {
+        if v.is_null() {
+            a.as_object_mut().unwrap().remove(&k);
+        } else {
+            a[k] = v;
+        }
+    }
+    json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": "p", "namespace": "ns", "labels": {CLIENT_SOCKET_LABEL: ENABLED_VALUE}, "annotations": a},
+        "spec": {
+            "initContainers": [{"name": "setup", "image": "app"}],
+            "containers": [{"name": "app", "image": "app"}, {"name": "helper", "image": "app"}],
+        },
+    })
+}
+
+fn socket_mounted(c: &Value, volume: &str) -> bool {
+    let mounts = c["volumeMounts"].as_array().cloned().unwrap_or_default();
+    let env = c["env"].as_array().cloned().unwrap_or_default();
+    mounts.contains(&json!({"name": volume, "mountPath": CLIENT_DIR, "readOnly": true}))
+        && env.contains(&json!({"name": SOCKET_ENV, "value": format!("{CLIENT_DIR}/socket")}))
+}
+
+#[test]
+fn client_socket_all_containers() {
+    let out = run(&client_pod(json!({}))).unwrap();
+    for c in out["spec"]["containers"].as_array().unwrap() {
+        assert!(socket_mounted(c, CLIENT_VOLUME_NAME), "{c}");
+    }
+    assert_eq!(
+        out["spec"]["initContainers"],
+        json!([{"name": "setup", "image": "app"}]),
+        "init containers must be untouched and no sidecar added"
+    );
+    assert_eq!(
+        out["spec"]["volumes"],
+        json!([{"name": CLIENT_VOLUME_NAME, "hostPath": {"path": CLIENT_DIR, "type": "Directory"}}])
+    );
+    assert_eq!(out["spec"]["nodeSelector"][OS_LABEL], "linux");
+    assert_eq!(
+        out["spec"]["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"],
+        json!({"nodeSelectorTerms": [{"matchExpressions": [excl()]}]})
+    );
+    let a = &out["metadata"]["annotations"];
+    assert_eq!(a[CLIENT_SOCKET_INJECTED_ANNOTATION], CACHE);
+    assert!(a.get(INJECTED_ANNOTATION).is_none());
+
+    // A second admission pass must not change anything.
+    assert_eq!(run(&out).unwrap(), out);
+}
+
+#[test]
+fn client_socket_selected_containers() {
+    let out = run(&client_pod(
+        json!({CLIENT_CONTAINERS_ANNOTATION: " helper "}),
+    ))
+    .unwrap();
+    let c = out["spec"]["containers"].as_array().unwrap();
+    assert!(!socket_mounted(&c[0], CLIENT_VOLUME_NAME));
+    assert!(socket_mounted(&c[1], CLIENT_VOLUME_NAME));
+}
+
+#[test]
+fn client_socket_with_sidecar_shares_volume() {
+    let mut p = pod(json!({CLIENT_CACHE_ANNOTATION: CACHE}));
+    p["metadata"]["labels"][CLIENT_SOCKET_LABEL] = json!(ENABLED_VALUE);
+    let out = run(&p).unwrap();
+    let volumes = out["spec"]["volumes"].as_array().unwrap();
+    assert_eq!(volumes.len(), 1, "{volumes:?}");
+    assert_eq!(volumes[0]["name"], VOLUME_NAME);
+    assert_eq!(out["spec"]["initContainers"][0]["name"], CONTAINER_NAME);
+    assert!(socket_mounted(&out["spec"]["containers"][0], VOLUME_NAME));
+
+    // Distinct caches get distinct volumes.
+    let mut p = pod(json!({CLIENT_CACHE_ANNOTATION: "other"}));
+    p["metadata"]["labels"][CLIENT_SOCKET_LABEL] = json!(ENABLED_VALUE);
+    let out = run(&p).unwrap();
+    let volumes = out["spec"]["volumes"].as_array().unwrap();
+    assert_eq!(volumes.len(), 2, "{volumes:?}");
+    assert_eq!(volumes[1]["name"], CLIENT_VOLUME_NAME);
+    assert_eq!(volumes[1]["hostPath"]["path"], "/run/racer/other/client");
+}
+
+#[test]
+fn client_socket_host_network_allowed() {
+    let mut p = client_pod(json!({}));
+    p["spec"]["hostNetwork"] = json!(true);
+    assert!(run(&p).is_ok());
+}
+
+#[test]
+fn client_socket_noop() {
+    let mut unlabeled = client_pod(json!({}));
+    unlabeled["metadata"]
+        .as_object_mut()
+        .unwrap()
+        .retain(|k, _| k != "labels" && k != "annotations");
+    let mut disabled = client_pod(json!({}));
+    disabled["metadata"]["labels"][CLIENT_SOCKET_LABEL] = json!("disabled");
+    let mut injected = client_pod(json!({}));
+    injected["metadata"]["annotations"] = json!({CLIENT_SOCKET_INJECTED_ANNOTATION: CACHE});
+    for p in [unlabeled, disabled, injected] {
+        assert_eq!(run(&p).unwrap(), p);
+    }
+}
+
+#[test]
+fn client_socket_denials() {
+    let with = |anno: Value, modify: &dyn Fn(&mut Value)| {
+        let mut p = client_pod(anno);
+        modify(&mut p);
+        p
+    };
+    let none = |_: &mut Value| {};
+    let cases = [
+        (
+            with(json!({CLIENT_CACHE_ANNOTATION: null}), &none),
+            CLIENT_CACHE_ANNOTATION,
+        ),
+        (
+            with(json!({CLIENT_CACHE_ANNOTATION: "../x"}), &none),
+            CLIENT_CACHE_ANNOTATION,
+        ),
+        (
+            with(json!({CLIENT_CONTAINERS_ANNOTATION: "nope"}), &none),
+            CLIENT_CONTAINERS_ANNOTATION,
+        ),
+        (
+            with(json!({CLIENT_CONTAINERS_ANNOTATION: "setup"}), &none),
+            CLIENT_CONTAINERS_ANNOTATION,
+        ),
+        (
+            with(json!({CLIENT_CONTAINERS_ANNOTATION: "app,app"}), &none),
+            CLIENT_CONTAINERS_ANNOTATION,
+        ),
+        (
+            with(json!({CLIENT_CONTAINERS_ANNOTATION: ""}), &none),
+            CLIENT_CONTAINERS_ANNOTATION,
+        ),
+        (
+            with(json!({}), &|p| {
+                p["spec"]["volumes"] = json!([{"name": CLIENT_VOLUME_NAME}])
+            }),
+            CLIENT_VOLUME_NAME,
+        ),
+        (
+            with(json!({}), &|p| {
+                p["spec"]["containers"][0]["volumeMounts"] =
+                    json!([{"name": "x", "mountPath": CLIENT_DIR}])
+            }),
+            "already mounts",
+        ),
+        (
+            with(json!({}), &|p| {
+                p["spec"]["containers"][1]["env"] = json!([{"name": SOCKET_ENV, "value": "x"}])
+            }),
+            SOCKET_ENV,
+        ),
+        (
+            with(json!({}), &|p| p["spec"]["os"] = json!({"name": "windows"})),
+            "spec.os.name",
+        ),
+        (
+            with(json!({}), &|p| {
+                p["spec"]["nodeSelector"] = json!({OS_LABEL: "windows"})
+            }),
+            OS_LABEL,
+        ),
+    ];
+    for (p, want) in cases {
+        assert_denied(&p, want);
+    }
+}
+
+#[test]
+fn client_socket_bad_container_fields_are_400() {
+    for field in ["volumeMounts", "env"] {
+        let mut p = client_pod(json!({}));
+        p["spec"]["containers"][0][field] = json!("x");
+        let resp = run(&p).expect_err("expected rejection");
+        assert_eq!(resp["status"]["code"], 400, "{field}: {resp}");
+    }
+}
