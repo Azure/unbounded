@@ -177,16 +177,60 @@ fn stale_membership_ends_and_returns_child_credits() {
     assert_eq!(probes.len(), 1);
     assert_eq!(end, End::StaleMembership);
     assert_eq!((b.remaining_attempts(), b.remaining_links()), (32, 96));
+    assert_eq!(stale_action(true, 1, Some(2)), Ok(StaleAction::Skip));
+    assert_eq!(stale_action(false, 2, Some(2)), Ok(StaleAction::Skip));
+    assert_eq!(stale_action(false, 3, Some(2)), Ok(StaleAction::Skip));
+    assert_eq!(stale_action(false, 2, None), Err(Error::Unavailable));
+    assert_eq!(stale_action(false, 2, Some(3)), Ok(StaleAction::Refresh));
+}
+
+/// Known issue 3: a requester ahead of its destination skips the stale owner
+/// and reaches the next one instead of failing the read.
+#[test]
+fn stale_destination_moves_to_the_next_owner() {
+    let mut walk = CandidateWalk::new(config(None, 3, VisitOrder::canonical(3)));
+    let mut b = budget(32, 96);
+    let (probes, end) = drive(&mut walk, &mut b, |p, _| {
+        if p.canonical == 0 {
+            Outcome::StaleDestination
+        } else {
+            Outcome::Copy
+        }
+    });
+    assert_eq!(probes.len(), 2);
+    assert_eq!(end, End::Copy);
+    // A stale answer is not a route failure: the next probe keeps the normal
+    // per-attempt route ceiling.
+    assert_eq!(b.route_links(), 4);
+}
+
+#[test]
+fn stale_destinations_everywhere_end_exhausted_or_at_origin() {
+    let mut walk = CandidateWalk::new(config(None, 2, VisitOrder::canonical(2)));
+    let mut b = budget(32, 96);
+    let (probes, end) = drive(&mut walk, &mut b, |_, _| Outcome::StaleDestination);
+    assert_eq!(probes.len(), 2);
+    assert_eq!(end, End::Exhausted { funding: false });
+    // An owner keeps its origin authority, with transient evidence for the
+    // stale predecessor.
+    let mut walk = CandidateWalk::new(config(Some(1), 2, VisitOrder::canonical(2)));
+    let (_, end) = drive(&mut walk, &mut b, |_, _| Outcome::StaleDestination);
     assert_eq!(
-        refresh_allowed(true, 1, Some(2)),
-        Err(Error::IncompatibleMembership)
+        end,
+        End::Origin {
+            rank: 1,
+            evidence: vec![ProbeOutcome::Unreachable]
+        }
     );
-    assert_eq!(
-        refresh_allowed(false, 2, Some(2)),
-        Err(Error::IncompatibleMembership)
-    );
-    assert_eq!(refresh_allowed(false, 2, None), Err(Error::Unavailable));
-    assert_eq!(refresh_allowed(false, 2, Some(3)), Ok(()));
+}
+
+#[test]
+fn remaining_walk_treats_a_stale_destination_as_unavailable() {
+    let mut walk = RemainingWalk::new(0, 2);
+    let mut b = budget(4, 8);
+    walk.next_probe().unwrap();
+    assert_eq!(walk.complete(&mut b, Outcome::StaleDestination), None);
+    assert_eq!(walk.next_probe(), Err(RemainingEnd::Unavailable));
 }
 
 #[test]
@@ -380,4 +424,50 @@ fn hedge_rules() {
         Some(ProbeOutcome::Overloaded)
     );
     assert_eq!(transport_outcome(Error::Unauthorized), None);
+    assert_eq!(transport_outcome(Error::DeadlineExceeded), None);
+    // Known issue 5: a local hop budget shortfall is evidence, not terminal.
+    assert_eq!(
+        transport_outcome(Error::HopBudgetExhausted),
+        Some(ProbeOutcome::Unreachable)
+    );
+}
+
+/// Known issue 5: once the links are spent, each later probe fails locally in
+/// `plan_attempt` and is recorded as unreachable; the walk ends `Exhausted`
+/// (recoverable) instead of abandoning with `HopBudgetExhausted`.
+#[test]
+fn spent_links_end_the_walk_exhausted() {
+    let mut walk = CandidateWalk::new(config(None, 3, VisitOrder::canonical(3)));
+    let mut b = budget(32, 16);
+    b.note_route_failure();
+    let now = Instant::now();
+    let mut ends = Vec::new();
+    let end = loop {
+        match walk.next(&mut b).unwrap() {
+            Step::End(end) => break end,
+            Step::Probe(probe) => {
+                let inputs = AttemptInputs {
+                    now,
+                    caller_deadline: now + Duration::from_secs(10),
+                    remaining_opportunities: probe.remaining_opportunities,
+                    route: probe.route,
+                    mode: probe.mode,
+                    attempt_timeout: Duration::from_secs(1),
+                    failure_links: 8,
+                };
+                let outcome = match plan_attempt(walk.request_budget(&mut b), inputs) {
+                    // The route was spent on an overloaded relay.
+                    Ok(_) => ProbeOutcome::Overloaded,
+                    Err(error) => {
+                        ends.push(error);
+                        transport_outcome(error).expect("recoverable")
+                    }
+                };
+                walk.complete(&mut b, Outcome::Transport(outcome)).unwrap();
+            }
+        }
+    };
+    assert!(ends.contains(&Error::HopBudgetExhausted), "{ends:?}");
+    assert_eq!(end, End::Exhausted { funding: false });
+    assert_eq!(b.remaining_links(), 0);
 }

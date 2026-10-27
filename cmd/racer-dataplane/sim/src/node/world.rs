@@ -50,8 +50,8 @@ use racer_core::read::range::{PageBudget, SlotKind, direct_fills, first_failure}
 use racer_core::read::serve::{ServeAction, ServeFacts, serve_action, serve_deadline};
 use racer_core::read::walk::{
     AttemptInputs, AttemptPlan, CandidateWalk, Continuation, End, HedgeFacts, Mode, Outcome, Probe,
-    RemainingWalk, RouteMode, Step, WalkConfig, hedge_budgets, hedge_eligible, hedge_fallback,
-    plan_attempt, refresh_allowed, transport_outcome,
+    RemainingWalk, RouteMode, StaleAction, Step, WalkConfig, hedge_budgets, hedge_eligible,
+    hedge_fallback, plan_attempt, stale_action, transport_outcome,
 };
 use racer_core::route::MAX_LINKS;
 use racer_core::time::SplitMix64;
@@ -1843,11 +1843,17 @@ impl NodeWorld {
             };
             let (retried, previous) = (fill.retried, fill.version);
             let latest = self.adopt(node);
-            return match refresh_allowed(retried, previous, Some(latest)) {
-                Ok(()) => {
+            return match stale_action(retried, previous, Some(latest)) {
+                Ok(StaleAction::Refresh) => {
                     self.metrics.incr("walk_membership_refreshes");
                     self.fills.get_mut(&id).expect("present").retried = true;
                     self.begin_walk(id)
+                }
+                // The stale contender is behind this node (Known issue 3):
+                // walk this epoch with bounded routes.
+                Ok(StaleAction::Skip) => {
+                    self.metrics.incr("stale_destination_skips");
+                    self.start_candidates(id)
                 }
                 Err(e) => self.fail_walk(id, e),
             };
@@ -2448,6 +2454,21 @@ impl NodeWorld {
         let page = fill.page;
         let outcome = match reply {
             Reply::Transport => Ok(Outcome::Transport(ProbeOutcome::Unreachable)),
+            Reply::Response(ResponseKind::StaleMembership) if probe.hedge.is_none() => {
+                // Production `resolve_epoch_traced`: refresh only to a strictly
+                // newer membership, once; otherwise the destination is behind
+                // and the walk moves on (Known issue 3).
+                let (node, retried, previous) = (fill.node, fill.retried, fill.version);
+                let latest = self.adopt(node);
+                match stale_action(retried, previous, Some(latest)) {
+                    Ok(StaleAction::Refresh) => Ok(Outcome::StaleMembership),
+                    Ok(StaleAction::Skip) => {
+                        self.metrics.incr("stale_destination_skips");
+                        Ok(Outcome::StaleDestination)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
             Reply::Response(ResponseKind::StaleMembership) => Ok(Outcome::StaleMembership),
             Reply::Response(kind) => {
                 // A phantom page claims the page it was asked for; the
@@ -2486,7 +2507,9 @@ impl NodeWorld {
                         }
                         Err(Error::Unavailable)
                     }
-                    Ok(Outcome::Transport(_)) => Err(Error::Unavailable),
+                    Ok(Outcome::Transport(_) | Outcome::StaleDestination) => {
+                        Err(Error::Unavailable)
+                    }
                     Err(e) => Err(e),
                 };
                 self.hedge_result(probe.fill, primary, result);
@@ -2539,11 +2562,17 @@ impl NodeWorld {
             End::StaleMembership => {
                 let (node, retried, previous) = (fill.node, fill.retried, fill.version);
                 let latest = self.adopt(node);
-                match refresh_allowed(retried, previous, Some(latest)) {
-                    Ok(()) => {
+                match stale_action(retried, previous, Some(latest)) {
+                    Ok(StaleAction::Refresh) => {
                         self.metrics.incr("walk_membership_refreshes");
                         self.fills.get_mut(&id).expect("present").retried = true;
                         return self.begin_walk(id);
+                    }
+                    // `reply` already turned a skip into `StaleDestination`.
+                    Ok(StaleAction::Skip) => {
+                        let fill = self.fills.get_mut(&id).expect("present");
+                        fill.plan
+                            .walk(WalkResult::Failed(Error::IncompatibleMembership));
                     }
                     Err(e) => {
                         let fill = self.fills.get_mut(&id).expect("present");

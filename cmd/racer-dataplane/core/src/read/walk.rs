@@ -92,8 +92,15 @@ pub enum Outcome {
     Probe(ProbeOutcome),
     /// A recoverable transport failure (see [`transport_outcome`]).
     Transport(ProbeOutcome),
-    /// The peer reported a stale membership epoch.
+    /// The peer reported a stale membership epoch and the caller will refresh
+    /// (see [`stale_action`]).
     StaleMembership,
+    /// The peer reported a stale membership epoch, but the caller holds no
+    /// newer membership to refresh to (or already refreshed once): the
+    /// destination is behind. The walk records transient evidence and moves
+    /// on to the next owner without charging a route failure; the route
+    /// itself worked.
+    StaleDestination,
 }
 
 /// How the epoch ended.
@@ -305,6 +312,11 @@ impl CandidateWalk {
                 self.done = true;
                 Ok(Some(End::StaleMembership))
             }
+            Outcome::StaleDestination => {
+                self.saw_transient = true;
+                self.evidence.push(ProbeOutcome::Unreachable);
+                Ok(None)
+            }
             Outcome::Probe(outcome) | Outcome::Transport(outcome) => {
                 self.saw_version |= outcome == ProbeOutcome::VersionUnavailable;
                 self.saw_transient |= transient(outcome);
@@ -402,7 +414,7 @@ impl RemainingWalk {
                 self.transient = true;
                 budget.note_route_failure();
             }
-            Outcome::StaleMembership => {}
+            Outcome::StaleMembership | Outcome::StaleDestination => self.transient = true,
         }
         None
     }
@@ -417,25 +429,46 @@ fn transient(outcome: ProbeOutcome) -> bool {
 
 /// Map a probe transport error to walk evidence. `None` means the error is
 /// terminal and must propagate.
+///
+/// `HopBudgetExhausted` is local: [`plan_attempt`] or the local route search
+/// found too few links left for this probe, before anything was sent. It is
+/// evidence that this owner is unreachable within the budget, not a reason to
+/// abandon the walk: later probes that cannot be funded fail the same way
+/// without I/O, and the walk ends as `Exhausted` (a recoverable `Unavailable`)
+/// or, at an owner, with origin authority. Budgets never grow.
 pub fn transport_outcome(error: Error) -> Option<ProbeOutcome> {
     match error {
-        Error::Unavailable | Error::Io | Error::Os(_) => Some(ProbeOutcome::Unreachable),
+        Error::Unavailable | Error::Io | Error::Os(_) | Error::HopBudgetExhausted => {
+            Some(ProbeOutcome::Unreachable)
+        }
         Error::Overloaded => Some(ProbeOutcome::Overloaded),
         _ => None,
     }
 }
 
-/// Whether a stale-membership retry may refresh to `latest`. Each epoch walk
-/// retries at most once, and only to a strictly newer membership.
-pub fn refresh_allowed(retried: bool, previous: u64, latest: Option<u64>) -> Result<()> {
-    if retried {
-        return Err(Error::IncompatibleMembership);
-    }
+/// What to do after a peer answered `StaleMembership`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StaleAction {
+    /// Refresh to the strictly newer local membership and start a new walk
+    /// (complete the probe with [`Outcome::StaleMembership`]).
+    Refresh,
+    /// No newer membership is available locally, or this walk already
+    /// refreshed once: the destination is behind this node. Complete the
+    /// probe with [`Outcome::StaleDestination`] and try the next owner.
+    Skip,
+}
+
+/// Decide how to handle a `StaleMembership` answer. Each epoch walk refreshes
+/// at most once, and only to a strictly newer membership; otherwise the stale
+/// destination is skipped like an unreachable one, so a requester that adopted
+/// a publication before its destination still reaches the other owners.
+pub fn stale_action(retried: bool, previous: u64, latest: Option<u64>) -> Result<StaleAction> {
     let latest = latest.ok_or(Error::Unavailable)?;
-    if latest <= previous {
-        return Err(Error::IncompatibleMembership);
-    }
-    Ok(())
+    Ok(if !retried && latest > previous {
+        StaleAction::Refresh
+    } else {
+        StaleAction::Skip
+    })
 }
 
 /// Times and credits for one peer exchange.

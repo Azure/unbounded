@@ -913,9 +913,16 @@ impl CandidatePolicy {
                 return Err(Error::InvalidRequest);
             }
             if continuation.stale {
-                let next = self
-                    .refresh_candidates(&candidates, object, page, scope, retried)
-                    .await?;
+                // A stale hedge refreshes to a newer membership when one is
+                // available. Otherwise the stale contender is behind this node
+                // (Known issue 3): walk this epoch's owners with bounded routes.
+                let (next, retried) = match self.refresh_membership(&candidates, retried)? {
+                    Some(latest) => (
+                        self.candidates_scoped(latest, object, page, scope).await?,
+                        true,
+                    ),
+                    None => (candidates, retried),
+                };
                 return self
                     .resolve_epoch_traced(
                         next,
@@ -924,7 +931,7 @@ impl CandidatePolicy {
                         scope,
                         budget,
                         validate,
-                        true,
+                        retried,
                         HedgeContinuation {
                             bounded_routes: true,
                             ..Default::default()
@@ -995,10 +1002,22 @@ impl CandidatePolicy {
                 let outcome = match response {
                     Ok(response) => {
                         if matches!(response.response(), PeerResponse::StaleMembership) {
+                            let refresh = match self.refresh_membership(&candidates, retried) {
+                                Ok(refresh) => refresh,
+                                Err(error) => {
+                                    walk.abandon(budget)?;
+                                    return Err(error);
+                                }
+                            };
+                            let Some(refresh) = refresh else {
+                                // The destination is behind this node and no
+                                // newer membership exists locally: try the
+                                // next owner (Known issue 3).
+                                walk.complete(budget, WalkOutcome::StaleDestination)?;
+                                continue;
+                            };
                             walk.complete(budget, WalkOutcome::StaleMembership)?;
-                            let next = self
-                                .refresh_candidates(&candidates, object, page, scope, retried)
-                                .await?;
+                            let next = self.candidates_scoped(refresh, object, page, scope).await?;
                             // Preserve the original operation (including ETag),
                             // cancellation/deadline and already spent link/attempt credits.
                             return self
@@ -1184,27 +1203,28 @@ impl CandidatePolicy {
         })
     }
 
-    async fn refresh_candidates(
+    /// After a `StaleMembership` answer, decide with
+    /// `racer_core::read::walk::stale_action` whether to refresh. `Some` is the
+    /// strictly newer membership to rank again; `None` means the destination
+    /// is behind and the caller moves to the next owner.
+    fn refresh_membership(
         &self,
         previous: &Candidates,
-        object: &ObjectId,
-        page: PageNumber,
-        scope: &RequestScope,
         retried: bool,
-    ) -> Result<Candidates> {
-        if retried {
-            return Err(Error::IncompatibleMembership);
-        }
+    ) -> Result<Option<std::sync::Arc<crate::topology::Membership>>> {
         let latest = self
             .published
             .current()?
-            .ok_or(Error::Unavailable)?
-            .membership
-            .clone();
-        if latest.version.0 <= previous.membership.version.0 {
-            return Err(Error::IncompatibleMembership);
-        }
-        self.candidates_scoped(latest, object, page, scope).await
+            .map(|published| published.membership.clone());
+        let action = racer_core::read::walk::stale_action(
+            retried,
+            previous.membership.version.0,
+            latest.as_ref().map(|latest| latest.version.0),
+        )?;
+        Ok(match action {
+            racer_core::read::walk::StaleAction::Refresh => latest,
+            racer_core::read::walk::StaleAction::Skip => None,
+        })
     }
 
     /// Request a peer copy using the accepted membership and remaining budget.

@@ -1558,24 +1558,25 @@ fn hedge_stale_membership_refreshes_once_without_fresh_credits() {
                     .borrow_mut()
                     .push_back((ordered[0].clone(), Reply::Stale));
             }
-            peers.replies.borrow_mut().extend([(
-                next[0].clone(),
-                if stale_again {
-                    Reply::Stale
-                } else {
-                    Reply::Copy(good)
-                },
-            )]);
+            if stale_again {
+                // Known issue 3: a second stale answer after the one refresh
+                // skips that owner and tries the next one.
+                peers.replies.borrow_mut().extend([
+                    (next[0].clone(), Reply::Stale),
+                    (next[1].clone(), Reply::Copy(good)),
+                ]);
+            } else {
+                peers
+                    .replies
+                    .borrow_mut()
+                    .push_back((next[0].clone(), Reply::Copy(good)));
+            }
             let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
             let result = acquire(&mut f, &mut budget);
-            if stale_again {
-                assert!(matches!(result, Err(Error::IncompatibleMembership)));
-            } else {
-                assert_eq!(result.unwrap().plaintext.bytes(), b"abc");
-            }
+            assert_eq!(result.unwrap().plaintext.bytes(), b"abc");
             assert_eq!(
                 peers.calls.borrow().len(),
-                if secondary_stale { 3 } else { 2 }
+                usize::from(secondary_stale) + usize::from(stale_again) + 2
             );
             assert!(budget.remaining_attempts() < 10 && budget.remaining_links() < 18);
             assert_eq!(budget.deadline(), f.scope.deadline.0);
@@ -2557,7 +2558,10 @@ fn corrupt_copies_exhaust_sources_or_original_credits_without_origin_for_noncand
     for (attempts, links, expected_calls, expected_error) in [
         (8, 16, 3, Error::Unavailable),
         (1, 16, 1, Error::Unavailable),
-        (8, 4, 1, Error::HopBudgetExhausted),
+        // Known issue 5: once the links are spent, later owners fail
+        // locally before any send and the walk ends with a recoverable
+        // `Unavailable`, not `HopBudgetExhausted`.
+        (8, 4, 1, Error::Unavailable),
     ] {
         let mut f = fixture();
         let (peers, ordered) = install_peers(&mut f, None);
@@ -3267,4 +3271,109 @@ mod landing {
         assert!(l.peers.calls.borrow().len() >= 3);
         assert_eq!(landed_count(&l.helper), 0);
     }
+}
+
+/// Install a published membership equal to the fixture's (version 1), so a
+/// `StaleMembership` answer finds nothing newer to refresh to.
+fn publish_same_membership(f: &mut Fixture, peers: &Rc<ScriptedPeers>) {
+    let mut deps = f.fill.dependencies.clone();
+    deps.candidates = Rc::new(CandidatePolicy::new(
+        node(peers.local),
+        Rc::new(Placement::new(16)),
+        peers.requester(),
+        deps.credentials.clone(),
+        crate::test_support::published_membership(f.membership.clone()),
+    ));
+    f.fill = Fill::new(deps);
+}
+
+/// Known issue 3: a requester that adopted a membership its destination has not
+/// (here: no newer local membership to refresh to) skips the stale owner and
+/// reads from the next one instead of failing with `IncompatibleMembership`.
+#[test]
+fn stale_destination_without_newer_membership_tries_the_next_owner() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let (peers, ordered) = install_peers(&mut f, None);
+    publish_same_membership(&mut f, &peers);
+    let good = encrypted_copy(&mut f);
+    peers.replies.borrow_mut().extend([
+        (ordered[0].clone(), Reply::Stale),
+        (ordered[1].clone(), Reply::Copy(good)),
+    ]);
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+    let result = acquire(&mut f, &mut budget);
+    assert_eq!(result.unwrap().plaintext.bytes(), b"abc");
+    assert_eq!(peers.calls.borrow().len(), 2);
+    assert!(budget.remaining_attempts() < 8 && budget.remaining_links() < 16);
+    assert_eq!(f.origin.calls.get(), 0);
+}
+
+/// Every owner behind: the read ends with a recoverable `Unavailable` (the
+/// client retries) after one probe per owner, never `IncompatibleMembership`,
+/// and never reaches the origin from a non-owner.
+#[test]
+fn all_stale_destinations_end_unavailable_after_one_probe_each() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let (peers, ordered) = install_peers(&mut f, None);
+    publish_same_membership(&mut f, &peers);
+    peers
+        .replies
+        .borrow_mut()
+        .extend(ordered.iter().map(|n| (n.clone(), Reply::Stale)));
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+    assert!(matches!(
+        acquire(&mut f, &mut budget),
+        Err(Error::Unavailable)
+    ));
+    assert_eq!(peers.calls.borrow().len(), ordered.len());
+    assert_eq!(f.origin.calls.get(), 0);
+    assert_unpublished(&f);
+}
+
+/// An owner whose predecessor is behind keeps its origin authority.
+#[test]
+fn owner_with_stale_predecessor_reaches_origin() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let (peers, ordered) = install_peers(&mut f, Some(1));
+    publish_same_membership(&mut f, &peers);
+    f.fill
+        .dependencies
+        .writer
+        .retention()
+        .set_ownership(Rc::new(|_| true));
+    peers
+        .replies
+        .borrow_mut()
+        .push_back((ordered[0].clone(), Reply::Stale));
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+    let result = acquire(&mut f, &mut budget);
+    assert!(result.is_ok(), "{:?}", result.err());
+    assert_eq!(peers.calls.borrow().len(), 1);
+    assert_eq!(f.origin.calls.get(), 1);
+}
+
+/// Without any published membership the stale answer stays terminal
+/// (`Unavailable` from `stale_action`), and nothing else is probed.
+#[test]
+fn stale_answer_without_published_membership_is_unavailable() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let (peers, ordered) = install_peers(&mut f, None);
+    peers
+        .replies
+        .borrow_mut()
+        .push_back((ordered[0].clone(), Reply::Stale));
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+    assert!(matches!(
+        acquire(&mut f, &mut budget),
+        Err(Error::Unavailable)
+    ));
+    assert_eq!(peers.calls.borrow().len(), 1);
 }
