@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -33,27 +32,22 @@ const (
 // agentRuntimeDeps keeps gantry init tests independent of the real process
 // credentials and file ownership.
 type agentRuntimeDeps struct {
-	geteuid    func() int
-	setuid     func(uid int) error
-	procStatus func() ([]byte, error)
-	lchown     func(root *os.Root, name string, uid, gid int) error
+	geteuid func() int
+	lchown  func(root *os.Root, name string, uid, gid int) error
 }
 
 // prepareAgentRuntime is gantry init: prepareAgentRuntimeWith with the real
 // process credentials.
 func prepareAgentRuntime(dir string, logger *slog.Logger) error {
 	return prepareAgentRuntimeWith(dir, logger, agentRuntimeDeps{
-		geteuid:    os.Geteuid,
-		setuid:     syscall.Setuid,
-		procStatus: func() ([]byte, error) { return os.ReadFile("/proc/self/status") },
-		lchown:     (*os.Root).Lchown,
+		geteuid: os.Geteuid,
+		lchown:  (*os.Root).Lchown,
 	})
 }
 
-// prepareAgentRuntimeWith gives agentUID the libp2p identity directory dir and
-// then switches the process to agentUID. The directory is a hostPath that
-// kubelet creates root-owned, so this needs root; a process that starts
-// unprivileged changes nothing.
+// prepareAgentRuntimeWith gives agentUID the libp2p identity directory dir. The
+// directory is a hostPath that kubelet creates root-owned, so this needs root;
+// a process that starts unprivileged changes nothing.
 func prepareAgentRuntimeWith(dir string, logger *slog.Logger, deps agentRuntimeDeps) error {
 	if deps.geteuid() != 0 {
 		return nil
@@ -68,12 +62,6 @@ func prepareAgentRuntimeWith(dir string, logger *slog.Logger, deps agentRuntimeD
 		slog.Int("uid", agentUID),
 		slog.Int("gid", identityDirGID),
 	)
-
-	if err := dropRootPrivileges(agentUID, deps); err != nil {
-		return fmt.Errorf("drop root privileges: %w", err)
-	}
-
-	logger.Info("dropped root privileges", slog.Int("uid", agentUID), slog.Int("gid", os.Getgid()))
 
 	return nil
 }
@@ -159,58 +147,4 @@ func openOrMkdirNoFollow(parent int, name string) (int, error) {
 	}
 
 	return unix.Openat(parent, name, flags, 0)
-}
-
-// dropRootPrivileges switches every thread of the process to uid. The kernel
-// clears all capabilities when a root process takes a non-zero UID, and /proc
-// confirms it. Groups stay as the container runtime set them, so runAsGroup and
-// fsGroup still grant access to the containerd socket.
-func dropRootPrivileges(uid int, deps agentRuntimeDeps) error {
-	if err := deps.setuid(uid); err != nil {
-		return fmt.Errorf("setuid %d: %w", uid, err)
-	}
-
-	status, err := deps.procStatus()
-	if err != nil {
-		return fmt.Errorf("read process status: %w", err)
-	}
-
-	return verifyDroppedPrivileges(status, uid)
-}
-
-// verifyDroppedPrivileges checks a /proc/<pid>/status document: the real,
-// effective, saved, and filesystem UIDs must all be uid, and the permitted and
-// effective capability sets must be empty.
-func verifyDroppedPrivileges(status []byte, uid int) error {
-	fields := make(map[string]string)
-
-	for line := range strings.Lines(string(status)) {
-		if key, value, ok := strings.Cut(line, ":"); ok {
-			fields[key] = strings.TrimSpace(value)
-		}
-	}
-
-	uids := strings.Fields(fields["Uid"])
-	if len(uids) != 4 {
-		return fmt.Errorf("unexpected Uid line %q", fields["Uid"])
-	}
-
-	for _, id := range uids {
-		if id != strconv.Itoa(uid) {
-			return fmt.Errorf("process UIDs are %s, want all %d", strings.Join(uids, " "), uid)
-		}
-	}
-
-	for _, set := range []string{"CapPrm", "CapEff"} {
-		caps, err := strconv.ParseUint(fields[set], 16, 64)
-		if err != nil {
-			return fmt.Errorf("parse %s %q: %w", set, fields[set], err)
-		}
-
-		if caps != 0 {
-			return fmt.Errorf("%s is %s, want no capabilities", set, fields[set])
-		}
-	}
-
-	return nil
 }

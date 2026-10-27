@@ -200,7 +200,7 @@ func TestInitContainerPreparesIdentityDirectory(t *testing.T) {
 			uid      int64
 			add      []string
 		}{
-			{name: "gantry-init", security: initContainer.SecurityContext, uid: 0, add: []string{"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETUID"}},
+			{name: "gantry-init", security: initContainer.SecurityContext, uid: 0, add: []string{"CHOWN", "FOWNER", "DAC_OVERRIDE"}},
 			{name: "gantry", security: agent.SecurityContext, uid: 65532},
 		} {
 			security := want.security

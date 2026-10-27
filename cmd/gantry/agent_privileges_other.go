@@ -11,7 +11,7 @@ import (
 
 // prepareAgentRuntime, which runs gantry init, is a no-op on non-linux. Only
 // the linux build, which is what the DaemonSet runs, re-owns the identity
-// directory and drops root; non-linux builds are dev/test only.
+// directory; non-linux builds are dev/test only.
 func prepareAgentRuntime(_ string, _ *slog.Logger) error {
 	return nil
 }

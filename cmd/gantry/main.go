@@ -6,7 +6,7 @@
 // Subcommands:
 //
 //	gantry agent    run the full agent (mirror + transfer + libp2p + ...)
-//	gantry init     prepare the libp2p identity directory and drop root
+//	gantry init     prepare the libp2p identity directory
 //	gantry version  print build information and exit
 package main
 

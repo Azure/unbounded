@@ -87,10 +87,10 @@ func writeAgentHelp(w io.Writer) {
 func newCmdInit(prepare func(dir string, logger *slog.Logger) error) *cobra.Command {
 	return &cobra.Command{
 		Use:   "init",
-		Short: "Prepare the libp2p identity directory and drop root",
-		Long: "Run as root, init gives UID 65532 " + identityDir + " and everything in it,\n" +
-			"restricts the directory to that user, and switches the process to it.\n" +
-			"Run as any other user, it changes nothing.",
+		Short: "Prepare the libp2p identity directory",
+		Long: "Run as root, init gives UID 65532 " + identityDir + " and everything in it\n" +
+			"and restricts the directory to that user. Run as any other user, it changes\n" +
+			"nothing.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return prepare(identityDir, gantrylog.New(cmd.ErrOrStderr(), "info", "json"))
