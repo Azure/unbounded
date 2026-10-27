@@ -490,6 +490,8 @@ pub(crate) struct ReadWorker {
     pub membership: std::sync::Arc<crate::topology::Membership>,
     pub origin: AdapterOrigin,
     pub drivers: Rc<DriverQueue>,
+    pub directory: Arc<WorkerDirectory>,
+    pub snapshots: Rc<PublicationTarget>,
     endpoint: RefCell<WorkerEndpoint>,
     engine: RefCell<PageCryptoEngine>,
     crypto: Rc<CryptoClient>,
@@ -640,6 +642,7 @@ impl ReadWorker {
         ));
         let streams = Rc::new(RangeStreams::new(directory.clone(), delivery, window));
         let membership = snapshots.current().unwrap().membership.clone();
+        let published = snapshots.clone();
         let coordinator = Rc::new(Coordinator::new(
             snapshots.published.clone(),
             metadata,
@@ -655,6 +658,8 @@ impl ReadWorker {
             membership,
             origin,
             drivers: Rc::new(DriverQueue::new(1024)),
+            directory: directory.clone(),
+            snapshots: published,
             endpoint: RefCell::new(endpoint),
             engine: RefCell::new(PageCryptoEngine::new(CryptoRuntime { port: engine })),
             crypto,
