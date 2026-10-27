@@ -8,5 +8,6 @@
 #![allow(dead_code)]
 
 pub(crate) mod control;
+pub(crate) mod queue;
 pub(crate) mod uapi;
 
