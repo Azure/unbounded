@@ -20,6 +20,7 @@ func DeriveScriptBundleDigest(checks []CertificationCheck, scripts map[string]st
 	}
 
 	var manifest strings.Builder
+
 	for index := range checks {
 		content, found := scripts[checks[index].ScriptKey]
 		if !found {
@@ -41,6 +42,7 @@ func DeriveScriptSnapshotBundleDigest(checks []CertificationCheckSnapshot) (stri
 	}
 
 	var manifest strings.Builder
+
 	for index := range checks {
 		if !IsSHA256Digest(checks[index].Script.Digest) {
 			return "", fmt.Errorf("check %d script digest is invalid", index)
