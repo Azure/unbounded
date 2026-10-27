@@ -57,6 +57,8 @@ COPY cmd/racer-dataplane/cluster-control/Cargo.toml ./cluster-control/Cargo.toml
 COPY cmd/racer-dataplane/cluster-control/src ./cluster-control/src
 COPY cmd/racer-dataplane/admission/Cargo.toml ./admission/Cargo.toml
 COPY cmd/racer-dataplane/admission/src ./admission/src
+COPY cmd/racer-dataplane/core/Cargo.toml ./core/Cargo.toml
+COPY cmd/racer-dataplane/core/src ./core/src
 COPY cmd/racer-dataplane/peer-wire/Cargo.toml ./peer-wire/Cargo.toml
 COPY cmd/racer-dataplane/peer-wire/src ./peer-wire/src
 COPY cmd/racer-dataplane/object-wire/Cargo.toml ./object-wire/Cargo.toml
@@ -87,6 +89,8 @@ COPY cmd/racer-dataplane/uds-endpoint/src ./uds-endpoint/src
 COPY cmd/racer-dataplane/wire-codec/Cargo.toml ./wire-codec/Cargo.toml
 COPY cmd/racer-dataplane/wire-codec/src ./wire-codec/src
 COPY cmd/racer-dataplane/wire-codec/tests ./wire-codec/tests
+COPY cmd/racer-dataplane/sim/Cargo.toml ./sim/Cargo.toml
+COPY cmd/racer-dataplane/sim/src ./sim/src
 COPY images/racer-dataplane/build-native.sh ./build-native.sh
 COPY images/racer-dataplane/build-native-cuda.sh ./build-native-cuda.sh
 COPY images/racer-dataplane/check-debug-info.sh ./check-debug-info.sh
