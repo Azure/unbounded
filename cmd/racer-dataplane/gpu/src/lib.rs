@@ -167,15 +167,7 @@ impl DeviceInfo {
 
     /// The UUID in `GPU-xxxxxxxx-xxxx-...` form, as `nvidia-smi` prints it.
     pub fn uuid_string(&self) -> String {
-        let hex: String = self.uuid.iter().map(|b| format!("{b:02x}")).collect();
-        format!(
-            "GPU-{}-{}-{}-{}-{}",
-            &hex[..8],
-            &hex[8..12],
-            &hex[12..16],
-            &hex[16..20],
-            &hex[20..]
-        )
+        uuid_string(&self.uuid)
     }
 
     /// From the C record.
@@ -642,6 +634,19 @@ pub enum Verdict {
 
     /// Verification did not run (a launch failed). Nothing was written.
     NotRun,
+}
+
+/// A GPU UUID in `GPU-xxxxxxxx-xxxx-...` form, as `nvidia-smi` prints it.
+pub fn uuid_string(uuid: &[u8; 16]) -> String {
+    let hex: String = uuid.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "GPU-{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
 }
 
 /// A CUDA stream. Work is visible only after [`Stream::synchronize`].

@@ -46,6 +46,10 @@ pub enum ReadKind {
 
         /// The size the client passed to `cuMemCreate`.
         allocation_size: u64,
+
+        /// The UUID of the GPU that holds the allocation, from
+        /// `Racer-Gpu-Uuid`. Absent from older clients.
+        gpu_uuid: Option<[u8; 16]>,
     },
 }
 
@@ -183,6 +187,7 @@ impl RequestParser {
         let mut destination_offset = None;
         let mut destination_length = None;
         let mut allocation_size = None;
+        let mut gpu_uuid = None;
         let mut seen = HashSet::new();
         let mut host = None;
         let mut pin = None;
@@ -275,6 +280,12 @@ impl RequestParser {
                 "racer-allocation-size" if direct == Some(DirectDelivery::Gpu) => {
                     once(&mut allocation_size, parse_decimal(value)?)?;
                 }
+                "racer-gpu-uuid" if direct == Some(DirectDelivery::Gpu) => {
+                    if gpu_uuid.is_some() {
+                        return Err(Error::InvalidRequest);
+                    }
+                    gpu_uuid = Some(parse_gpu_uuid(trim_ows(value))?);
+                }
                 "racer-metadata" => {
                     validate_opaque(value)?;
                     metadata = Some(value);
@@ -322,6 +333,7 @@ impl RequestParser {
                             range,
                             destination,
                             allocation_size,
+                            gpu_uuid,
                         }
                     }
                 }
@@ -410,6 +422,32 @@ fn parse_max_age(value: &[u8], max_age: &mut Option<u64>) -> Result<()> {
 }
 
 /// Store a destination field, rejecting a repeated one.
+/// Parse a GPU UUID as `nvidia-smi` prints it, `GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`.
+/// The `GPU-` prefix is optional and hex digits may be either case.
+pub fn parse_gpu_uuid(value: &[u8]) -> Result<[u8; 16]> {
+    let value = match value.get(..4) {
+        Some(prefix) if prefix.eq_ignore_ascii_case(b"GPU-") => &value[4..],
+        _ => value,
+    };
+    if value.len() != 36 {
+        return Err(Error::InvalidRequest);
+    }
+    let mut uuid = [0; 16];
+    let mut digits = 0;
+    for (i, &b) in value.iter().enumerate() {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            if b != b'-' {
+                return Err(Error::InvalidRequest);
+            }
+            continue;
+        }
+        let nibble = (b as char).to_digit(16).ok_or(Error::InvalidRequest)? as u8;
+        uuid[digits / 2] |= if digits % 2 == 0 { nibble << 4 } else { nibble };
+        digits += 1;
+    }
+    Ok(uuid)
+}
+
 fn once(slot: &mut Option<u64>, value: u64) -> Result<()> {
     if slot.replace(value).is_some() {
         return Err(Error::InvalidRequest);

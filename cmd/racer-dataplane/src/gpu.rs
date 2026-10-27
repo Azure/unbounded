@@ -337,6 +337,8 @@ enum Job {
         fd: OwnedFd,
         allocation_size: u64,
         window: Range<u64>,
+        /// The client's `Racer-Gpu-Uuid`, when it sent one.
+        gpu_uuid: Option<[u8; 16]>,
         reply: oneshot::Sender<Result<i32>>,
     },
     /// Read ciphertext from a file straight into a staging slot.
@@ -645,6 +647,7 @@ impl GpuService for GpuClient {
         descriptor: OwnedFd,
         destination: Destination,
         allocation_size: u64,
+        gpu_uuid: Option<[u8; 16]>,
     ) -> Result<Box<dyn DirectSink>> {
         let window = destination.offset..destination.end();
         if window.start >= window.end || window.end > allocation_size {
@@ -669,6 +672,7 @@ impl GpuService for GpuClient {
             fd: descriptor,
             allocation_size,
             window,
+            gpu_uuid,
             reply,
         })?;
         sink.import = Some(answer);
@@ -872,6 +876,8 @@ fn reader_main(
 struct Helper {
     gpu: racer_gpu::Gpu,
     contexts: Vec<racer_gpu::Context>,
+    /// Each context's GPU UUID, in the same order as `contexts`.
+    uuids: Vec<[u8; 16]>,
     /// Each GPU's staging buffer, allocated on first sealed page.
     staging: HashMap<i32, racer_gpu::StagingBuffer>,
     /// Registered files by (device, inode). The slab descriptors are few and
@@ -925,10 +931,12 @@ fn helper_main(
                 }
             }
             let opener = open_cufile(&gpu, &state.cufile);
+            let uuids = usable.iter().map(|device| device.uuid).collect();
             let _ = ready.send(Ok((usable, decrypt)));
             Helper {
                 gpu,
                 contexts,
+                uuids,
                 staging: HashMap::new(),
                 files: HashMap::new(),
                 open: HashMap::new(),
@@ -1101,9 +1109,10 @@ impl Helper {
                 fd,
                 allocation_size,
                 window,
+                gpu_uuid,
                 reply,
             } => {
-                let result = self.import(id, fd, allocation_size, window);
+                let result = self.import(id, fd, allocation_size, window, gpu_uuid);
                 self.note_leaks();
                 let _ = reply.send(result);
             }
@@ -1181,13 +1190,45 @@ impl Helper {
         })
     }
 
-    /// Try each usable GPU until one owns the allocation.
-    fn import(&mut self, id: u64, fd: OwnedFd, size: u64, window: Range<u64>) -> Result<i32> {
+    /// Import the allocation on the GPU that owns it. With the client's GPU
+    /// UUID, that GPU is tried first: device numbers differ between the
+    /// client's container and the dataplane, but UUIDs do not. An unknown
+    /// UUID is a GPU the dataplane cannot use, so the read falls back to the
+    /// host (501). Without a UUID (older clients), each usable GPU is tried
+    /// until one owns the allocation.
+    fn import(
+        &mut self,
+        id: u64,
+        fd: OwnedFd,
+        size: u64,
+        window: Range<u64>,
+        gpu_uuid: Option<[u8; 16]>,
+    ) -> Result<i32> {
+        let mut order: Vec<usize> = (0..self.contexts.len()).collect();
+        if let Some(uuid) = gpu_uuid {
+            let Some(first) = self.uuids.iter().position(|known| *known == uuid) else {
+                eprintln!(
+                    "racer-dataplane: stage=gpu state=import-skipped reason=unknown-gpu-uuid uuid={}",
+                    racer_gpu::uuid_string(&uuid)
+                );
+                return Err(Error::NotImplemented);
+            };
+            order.retain(|&index| index != first);
+            order.insert(0, first);
+        }
         let mut last = racer_gpu::Error::WrongDevice;
-        for context in &self.contexts {
-            let attempt = fd.try_clone().map_err(|_| Error::Unavailable)?;
-            match context.import(attempt, size, window.clone()) {
+        for (attempt, index) in order.into_iter().enumerate() {
+            let context = &self.contexts[index];
+            let handle = fd.try_clone().map_err(|_| Error::Unavailable)?;
+            match context.import(handle, size, window.clone()) {
                 Ok(import) => {
+                    if attempt > 0 && gpu_uuid.is_some() {
+                        eprintln!(
+                            "racer-dataplane: stage=gpu state=uuid-mismatch ordinal={} uuid={}",
+                            context.ordinal(),
+                            racer_gpu::uuid_string(&self.uuids[index])
+                        );
+                    }
                     let stream = context.stream().map_err(import_error)?;
                     self.requests.insert(id, Request { stream, import });
                     return Ok(context.ordinal());
@@ -1554,6 +1595,7 @@ pub(crate) mod testing {
                 fd: fd.try_clone().unwrap(),
                 allocation_size: size,
                 window: 0..size,
+                gpu_uuid: None,
                 reply,
             })
             .unwrap();

@@ -131,8 +131,11 @@ pub struct Config {
     /// `gpu-read` support. Resolved against hardware at startup, on the GPU
     /// helper thread, because GPU handles cannot move between threads.
     pub enable_gpu: GpuMode,
-    /// Per-GPU cap on dataplane-owned ciphertext staging memory. Parsed and
-    /// validated now; plaintext `gpu-read` does not allocate staging.
+    /// Per-GPU size of the dataplane-owned staging buffer that `gpu-read`
+    /// decrypts sealed (ciphertext) pages through: two scratch slots plus
+    /// slots for cuFile reads. Allocated on a GPU's first sealed page; pages
+    /// that arrive as plaintext are copied straight to the client and never
+    /// touch it. Below two slots, GPU decrypt is off and the CPU decrypts.
     pub gpu_staging_bytes: u64,
     /// Per-GPU GPU memory that peers' NICs write `gpu-read` ciphertext into
     /// over RDMA (GPUDirect RDMA landing). 0 turns landing off.

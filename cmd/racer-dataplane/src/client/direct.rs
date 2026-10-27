@@ -113,11 +113,13 @@ pub trait GpuService {
     /// request. Called after the request is validated and before any read.
     /// Return [`Error::NotImplemented`] when the allocation is on a GPU the
     /// dataplane cannot use; [`Error::InvalidRequest`] for a bad handle.
+    /// `gpu_uuid` names the client's GPU when the client sent it.
     fn open(
         &self,
         descriptor: OwnedFd,
         destination: Destination,
         allocation_size: u64,
+        gpu_uuid: Option<[u8; 16]>,
     ) -> Result<Box<dyn DirectSink>>;
 }
 
@@ -225,11 +227,13 @@ pub(crate) fn open_sink(
         (
             DirectDelivery::Gpu,
             ReadKind::GpuRead {
-                allocation_size, ..
+                allocation_size,
+                gpu_uuid,
+                ..
             },
         ) => gpu
             .ok_or(Error::NotImplemented)?
-            .open(descriptor, destination, *allocation_size)
+            .open(descriptor, destination, *allocation_size, *gpu_uuid)
             .map(Some),
         _ => Err(Error::Internal),
     }

@@ -372,6 +372,18 @@ static int import_release(struct gpu_import *a) {
     return RACER_GPU_OK;
 }
 
+/* Whether device `ordinal` in this process is the context's GPU. */
+static int same_device(struct gpu_context *c, int ordinal) {
+    CUdevice dev;
+    CUuuid mine, theirs;
+    if (ordinal < 0 || cu.cuDeviceGet(&dev, ordinal) != CUDA_SUCCESS) return 0;
+    if (dev == c->dev) return 1;
+    if (cu.cuDeviceGetUuid(&theirs, dev) != CUDA_SUCCESS ||
+        cu.cuDeviceGetUuid(&mine, c->dev) != CUDA_SUCCESS)
+        return 0;
+    return !memcmp(mine.bytes, theirs.bytes, sizeof(mine.bytes));
+}
+
 int racer_gpu_import(void *context, int fd, uint64_t size, void **out) {
     struct gpu_context *c = context;
     if (!c || fd < 0 || !size || size > SIZE_MAX || !out) return RACER_GPU_EINVAL;
@@ -395,7 +407,15 @@ int racer_gpu_import(void *context, int fd, uint64_t size, void **out) {
     a->has_handle = 1;
     rc = drv(cu.cuMemGetAllocationPropertiesFromHandle(&prop, a->handle));
     if (rc) goto fail;
-    if (prop.location.type != CU_MEM_LOCATION_TYPE_DEVICE || prop.location.id != c->ordinal) {
+    if (prop.location.type != CU_MEM_LOCATION_TYPE_DEVICE) {
+        rc = RACER_GPU_EDEVICE;
+        goto fail;
+    }
+    /* The driver reports the location in this process's device numbering,
+     * which can differ from the exporter's (CUDA_VISIBLE_DEVICES). Compare
+     * physical GPUs by UUID, not ordinals, so a stale or foreign number can
+     * never pass. A number this process cannot resolve is another GPU. */
+    if (!same_device(c, prop.location.id)) {
         rc = RACER_GPU_EDEVICE;
         goto fail;
     }

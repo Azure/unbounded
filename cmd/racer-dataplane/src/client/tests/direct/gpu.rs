@@ -90,6 +90,70 @@ fn gpu_read_writes_the_range_at_the_destination_offset() {
     assert_no_body_leases(&fixture);
 }
 
+/// A UUID header as `nvidia-smi` prints it for simulated GPU `index`.
+fn uuid_field(index: u8) -> String {
+    format!(
+        "Racer-Gpu-Uuid: {}\r\n",
+        racer_gpu::uuid_string(&[index; 16])
+    )
+}
+
+/// Serve a five-byte `gpu-read` into an allocation on GPU `ordinal` of four,
+/// sending `extra` fields. Returns the status line and the import attempts.
+fn read_on_four_gpus(ordinal: i32, extra: &str) -> (String, usize, Vec<u8>) {
+    let helper = start(GpuMode::Required, 4).unwrap();
+    let fixture = gpu_fixture(b"hello".to_vec(), &helper);
+    let allocation = allocate(&helper, ordinal, GRANULE);
+    let from = trace_len(&helper);
+    let output = exchange(
+        &fixture,
+        &direct_request("gpu-read", &format!("{}{extra}", fields("", 0, 5, GRANULE))),
+        &[allocation.as_raw_fd()],
+    );
+    let (head, _) = split(&output);
+    let status = head.lines().next().unwrap().to_string();
+    let imports = calls(&helper, from, Operation::Import);
+    settle(&fixture);
+    assert_released(&helper);
+    assert_no_body_leases(&fixture);
+    (status, imports, read_allocation(&allocation, 0, 5))
+}
+
+#[test]
+fn gpu_read_uuid_selects_a_nonzero_ordinal_first() {
+    // The client's container sees this GPU as device 0; the dataplane sees it
+    // as device 3. The UUID is the same in both.
+    let (status, imports, written) = read_on_four_gpus(3, &uuid_field(3));
+    assert!(status.starts_with("http/1.1 200"), "{status}");
+    assert_eq!(imports, 1, "only the named GPU is tried");
+    assert_eq!(written, b"hello");
+}
+
+#[test]
+fn gpu_read_without_uuid_tries_each_gpu() {
+    let (status, imports, written) = read_on_four_gpus(3, "");
+    assert!(status.starts_with("http/1.1 200"), "{status}");
+    assert_eq!(imports, 4);
+    assert_eq!(written, b"hello");
+}
+
+#[test]
+fn gpu_read_unknown_uuid_is_501_so_the_client_uses_the_host() {
+    let (status, imports, written) = read_on_four_gpus(3, &uuid_field(9));
+    assert!(status.starts_with("http/1.1 501"), "{status}");
+    assert_eq!(imports, 0, "nothing is imported");
+    assert_eq!(written, [0; 5]);
+}
+
+#[test]
+fn gpu_read_wrong_uuid_still_finds_the_owning_gpu() {
+    let (status, imports, written) = read_on_four_gpus(2, &uuid_field(1));
+    assert!(status.starts_with("http/1.1 200"), "{status}");
+    // GPU 1 first, then 0, then 2.
+    assert_eq!(imports, 3);
+    assert_eq!(written, b"hello");
+}
+
 #[test]
 fn gpu_read_spans_pages() {
     let length = 2 * PAGE_BYTES as usize + 7;

@@ -412,6 +412,7 @@ fn gpu_read_is_validated_then_501_without_a_backend() {
 #[derive(Default)]
 struct Recorded {
     opened: Vec<(Destination, u64)>,
+    uuids: Vec<Option<[u8; 16]>>,
     writes: Vec<(u64, Vec<u8>)>,
     finished: usize,
 }
@@ -426,11 +427,12 @@ impl GpuService for FakeGpu {
         descriptor: OwnedFd,
         destination: Destination,
         allocation_size: u64,
+        gpu_uuid: Option<[u8; 16]>,
     ) -> Result<Box<dyn DirectSink>> {
-        self.0
-            .borrow_mut()
-            .opened
-            .push((destination, allocation_size));
+        let mut recorded = self.0.borrow_mut();
+        recorded.opened.push((destination, allocation_size));
+        recorded.uuids.push(gpu_uuid);
+        drop(recorded);
         Ok(Box::new(FakeSink(self.0.clone(), descriptor)))
     }
 }
@@ -505,9 +507,52 @@ fn gpu_read_delivers_pages_through_the_backend_seam() {
         );
         assert_eq!(recorded.writes, [(100, b"llo".to_vec())]);
         assert_eq!(recorded.finished, 1);
+        // An older client sends no GPU UUID.
+        assert_eq!(recorded.uuids, [None]);
     }
     settle(&fixture);
     assert_eq!(memfd.open_copies(), 1);
+}
+
+#[test]
+fn gpu_read_passes_the_client_gpu_uuid_to_the_backend() {
+    let recorded = Rc::new(RefCell::new(Recorded::default()));
+    let fixture = direct_fixture(b"hello".to_vec(), Some(Rc::new(FakeGpu(recorded.clone()))));
+    let memfd = Memfd::new();
+    let output = exchange(
+        &fixture,
+        &direct_request(
+            "gpu-read",
+            "Racer-Destination-Offset: 0\r\nRacer-Destination-Length: 5\r\n\
+             Racer-Allocation-Size: 4096\r\n\
+             Racer-Gpu-Uuid: GPU-03030303-0303-0303-0303-030303030303\r\n",
+        ),
+        &[memfd.file.as_raw_fd()],
+    );
+    let (head, _) = split(&output);
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert_eq!(recorded.borrow().uuids, [Some([3; 16])]);
+    settle(&fixture);
+}
+
+#[test]
+fn gpu_read_rejects_a_malformed_gpu_uuid() {
+    let recorded = Rc::new(RefCell::new(Recorded::default()));
+    let fixture = direct_fixture(b"hello".to_vec(), Some(Rc::new(FakeGpu(recorded.clone()))));
+    let memfd = Memfd::new();
+    let output = exchange(
+        &fixture,
+        &direct_request(
+            "gpu-read",
+            "Racer-Destination-Offset: 0\r\nRacer-Destination-Length: 5\r\n\
+             Racer-Allocation-Size: 4096\r\nRacer-Gpu-Uuid: 0\r\n",
+        ),
+        &[memfd.file.as_raw_fd()],
+    );
+    let (head, _) = split(&output);
+    assert!(head.starts_with("http/1.1 400"), "{head}");
+    assert!(recorded.borrow().opened.is_empty());
+    settle(&fixture);
 }
 
 mod gpu;
