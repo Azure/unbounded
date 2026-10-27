@@ -90,9 +90,9 @@ spec:
 
 The webhook mounts `/run/racer/models/client` read-only into the container and
 sets `RACER_SOCKET` to the socket in it. To limit the mount to some containers,
-add `racer.unbounded-cloud.io/client-containers: vllm`. The webhook mounts the
-socket into init containers too, so `racer-vllm-fetch` can also run in an init
-container that writes to the shared `emptyDir`.
+add `racer.unbounded-cloud.io/client-containers: vllm`. Init containers get
+the mount too, so `racer-vllm-fetch` can run in an init container that writes
+to the shared `emptyDir`.
 
 ## 3. Install racer-vllm
 

@@ -1010,7 +1010,7 @@ directory read-only and tells the app where the socket is.
 |-----|---------|
 | Label `racer.unbounded-cloud.io/client-socket: enabled` | Turns on the mount |
 | Annotation `racer.unbounded-cloud.io/client-cache` | ClusterCache name. Required |
-| Annotation `racer.unbounded-cloud.io/client-containers` | Optional comma-separated app container names. Default: every app container. Init containers are never changed |
+| Annotation `racer.unbounded-cloud.io/client-containers` | Optional comma-separated init or app container names. Default: every init and app container, except the injected `racer-object` sidecar |
 | Annotation `racer.unbounded-cloud.io/client-socket-injected` | Set by the webhook to the cache name; do not edit |
 
 Each selected container gets:
@@ -1019,7 +1019,9 @@ Each selected container gets:
   mount still allows `connect` and `sendmsg` on the socket.
 - `RACER_SOCKET=/run/racer/<cache>/client/socket`.
 
-The pod is placed on Linux nodes without the `exclude` label, like sidecar pods.
+Init containers, including native sidecars (`restartPolicy: Always`), get the
+same mount, so an init container can fetch through the socket before the app
+starts. The pod is placed on Linux nodes without the `exclude` label, like sidecar pods.
 The hostPath type is `Directory`, so the pod waits until the dataplane has
 created the cache directory. Host networking is allowed.
 

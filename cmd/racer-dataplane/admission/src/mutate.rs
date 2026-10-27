@@ -132,7 +132,7 @@ fn mutate_sidecar(pod: &mut Value, image: &str) -> Result<(), Reject> {
 }
 
 /// Mounts `/run/racer/<cache>/client` read-only at the same path in the
-/// selected app containers and sets [`SOCKET_ENV`]. A read-only mount still
+/// selected init and app containers and sets [`SOCKET_ENV`]. A read-only mount still
 /// permits connect(2) on the socket: write permission on the socket inode is
 /// checked, not the mount's read-only flag. Pods without the label, or already
 /// marked with [`CLIENT_SOCKET_INJECTED_ANNOTATION`], are left unchanged.
@@ -161,8 +161,9 @@ fn mutate_client_socket(pod: &mut Value) -> Result<(), Reject> {
     }
     let cache = cache.to_owned();
 
+    let init_containers = p.init_containers.map(Vec::as_slice).unwrap_or_default();
     let containers = p.containers.map(Vec::as_slice).unwrap_or_default();
-    let targets = client_targets(p.annotations, containers)?;
+    let targets = client_targets(p.annotations, init_containers, containers)?;
     check_linux(&p, "Racer client socket")?;
 
     let client_dir = format!("/run/racer/{cache}/client");
@@ -182,10 +183,15 @@ fn mutate_client_socket(pod: &mut Value) -> Result<(), Reject> {
         )));
     }
 
-    for &i in &targets {
-        let c = containers[i].as_object().expect("checked by Pod::read");
+    for &(field, i) in &targets {
+        let list = if field == "initContainers" {
+            init_containers
+        } else {
+            containers
+        };
+        let c = list[i].as_object().expect("checked by Pod::read");
         let name = get_str(Some(c), "name").unwrap_or("");
-        let base = format!("spec.containers[{i}]");
+        let base = format!("spec.{field}[{i}]");
         let mounts = array(c, "volumeMounts", &format!("{base}.volumeMounts"))?;
         for m in mounts.into_iter().flatten() {
             let m = m
@@ -219,9 +225,10 @@ fn mutate_client_socket(pod: &mut Value) -> Result<(), Reject> {
             CLIENT_VOLUME_NAME.to_owned()
         }
     };
-    let containers = child_array(s, "containers");
-    for &i in &targets {
-        let c = containers[i].as_object_mut().expect("checked by Pod::read");
+    for &(field, i) in &targets {
+        let c = child_array(s, field)[i]
+            .as_object_mut()
+            .expect("checked by Pod::read");
         child_array(c, "volumeMounts")
             .push(json!({"name": volume, "mountPath": client_dir, "readOnly": true}));
         child_array(c, "env").push(json!({"name": SOCKET_ENV, "value": socket}));
@@ -231,24 +238,47 @@ fn mutate_client_socket(pod: &mut Value) -> Result<(), Reject> {
     Ok(())
 }
 
-/// Returns indexes into `spec.containers`. Ports Go `clientTargets`.
+/// A selected container: its pod spec field (`initContainers` or
+/// `containers`) and its index there.
+type Target = (&'static str, usize);
+
+/// Returns the containers to mount the client socket into. Without
+/// [`CLIENT_CONTAINERS_ANNOTATION`] that is every init and app container,
+/// except the injected racer-object sidecar, so an init container can fetch
+/// through the socket before the app starts. With it, each listed name must
+/// match one init or app container. Ports Go `clientTargets`.
 fn client_targets(
     annotations: Option<&Map<String, Value>>,
+    init_containers: &[Value],
     containers: &[Value],
-) -> Result<Vec<usize>, Reject> {
+) -> Result<Vec<Target>, Reject> {
+    let name = |c: &Value| c.get("name").and_then(Value::as_str).map(str::to_owned);
+    let all = init_containers
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| name(c).as_deref() != Some(CONTAINER_NAME))
+        .map(|(i, c)| (("initContainers", i), name(c)))
+        .chain(
+            containers
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (("containers", i), name(c))),
+        )
+        .collect::<Vec<_>>();
     let Some(value) = get_str(annotations, CLIENT_CONTAINERS_ANNOTATION) else {
-        return Ok((0..containers.len()).collect());
+        return Ok(all.into_iter().map(|(t, _)| t).collect());
     };
     let mut targets = Vec::new();
-    for name in value.split(',').map(str::trim) {
-        let i = containers
+    for wanted in value.split(',').map(str::trim) {
+        let found = all
             .iter()
-            .position(|c| c.get("name").and_then(Value::as_str) == Some(name));
-        match i {
-            Some(i) if !targets.contains(&i) => targets.push(i),
+            .find(|(_, n)| n.as_deref() == Some(wanted))
+            .map(|(t, _)| *t);
+        match found {
+            Some(t) if !targets.contains(&t) => targets.push(t),
             _ => {
                 return Err(deny(format!(
-                    "annotation {CLIENT_CONTAINERS_ANNOTATION} must list distinct app container names, separated by commas"
+                    "annotation {CLIENT_CONTAINERS_ANNOTATION} must list distinct init or app container names, separated by commas"
                 )));
             }
         }
