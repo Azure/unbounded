@@ -331,6 +331,7 @@ pub mod cluster {
             peer_attempt_timeout: Duration::from_secs(30),
             reader_stall_timeout: Duration::from_secs(10),
             shutdown_timeout: Duration::from_secs(30),
+            ublk: crate::config::UblkConfig::default(),
             limits: Limits {
                 plaintext_bytes: bytes,
                 ciphertext_bytes: bytes,

@@ -5,7 +5,9 @@
 
 use crate::error::Error;
 use crate::error::Result;
+use crate::model::CacheKey;
 use crate::model::PAGE_BYTES;
+use crate::model::StrongEtag;
 use crate::store::MAX_HEADER_BYTES;
 use racer_control_wire::ClusterId;
 use racer_control_wire::DEFAULT_SHARES;
@@ -160,6 +162,139 @@ pub struct Config {
     pub peer_attempt_timeout: Duration,
     pub reader_stall_timeout: Duration,
     pub shutdown_timeout: Duration,
+    /// Read-only ublk block devices, one per cache key. Empty turns ublk off.
+    pub ublk: UblkConfig,
+}
+
+/// Default `RACER_UBLK_QUEUE_DEPTH`.
+pub const DEFAULT_UBLK_QUEUE_DEPTH: u16 = 128;
+/// Largest accepted `RACER_UBLK_QUEUE_DEPTH`.
+pub const MAX_UBLK_QUEUE_DEPTH: u16 = 4096;
+/// Default `RACER_UBLK_MAX_IO_BYTES`: 1 MiB.
+pub const DEFAULT_UBLK_MAX_IO_BYTES: u32 = 1024 * 1024;
+/// Largest accepted `RACER_UBLK_MAX_IO_BYTES`: 32 MiB.
+pub const MAX_UBLK_MAX_IO_BYTES: u32 = 32 * 1024 * 1024;
+/// `RACER_UBLK_MAX_IO_BYTES` must be a multiple of this.
+pub const UBLK_IO_UNIT: u32 = 4096;
+/// Largest accepted explicit ublk device id.
+pub const MAX_UBLK_DEVICE_ID: u32 = (1 << 20) - 1;
+/// Largest accepted number of ublk devices.
+pub const MAX_UBLK_DEVICES: usize = 64;
+/// Byte limit for `RACER_UBLK_DEVICES`. Larger than the 4096 used for other
+/// variables so that [`MAX_UBLK_DEVICES`] entries with long names still fit.
+pub const MAX_UBLK_DEVICES_TEXT: usize = 64 * 1024;
+
+/// Linux ublk block devices served by this dataplane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UblkConfig {
+    pub devices: Vec<UblkDeviceConfig>,
+    pub queue_depth: u16,
+    pub max_io_bytes: u32,
+}
+
+impl UblkConfig {
+    /// ublk is on only when at least one device is configured.
+    pub fn enabled(&self) -> bool {
+        !self.devices.is_empty()
+    }
+}
+
+impl Default for UblkConfig {
+    fn default() -> Self {
+        Self {
+            devices: Vec::new(),
+            queue_depth: DEFAULT_UBLK_QUEUE_DEPTH,
+            max_io_bytes: DEFAULT_UBLK_MAX_IO_BYTES,
+        }
+    }
+}
+
+/// One read-only ublk device backed by a single cache key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UblkDeviceConfig {
+    /// Cache name from the control plane snapshot.
+    pub cache: String,
+    pub key: CacheKey,
+    /// Pinned version; when absent the current version is resolved once.
+    pub etag: Option<StrongEtag>,
+    /// Requested kernel device id; when absent the kernel picks one.
+    pub id: Option<u32>,
+}
+
+/// Wire shape of one `RACER_UBLK_DEVICES` entry before validation.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawUblkDevice {
+    cache: String,
+    key: String,
+    #[serde(default)]
+    etag: Option<String>,
+    #[serde(default)]
+    id: Option<u32>,
+}
+
+/// Parse and validate the ublk settings. Unset or empty devices turn ublk off.
+fn parse_ublk(
+    devices: Option<&str>,
+    queue_depth: Option<u64>,
+    max_io_bytes: Option<u64>,
+) -> Result<UblkConfig> {
+    let queue_depth = match queue_depth {
+        None => DEFAULT_UBLK_QUEUE_DEPTH,
+        Some(value) => u16::try_from(value)
+            .ok()
+            .filter(|depth| (1..=MAX_UBLK_QUEUE_DEPTH).contains(depth))
+            .ok_or(Error::InvalidConfiguration)?,
+    };
+    let max_io_bytes = match max_io_bytes {
+        None => DEFAULT_UBLK_MAX_IO_BYTES,
+        Some(value) => u32::try_from(value)
+            .ok()
+            .filter(|bytes| {
+                *bytes != 0 && bytes.is_multiple_of(UBLK_IO_UNIT) && *bytes <= MAX_UBLK_MAX_IO_BYTES
+            })
+            .ok_or(Error::InvalidConfiguration)?,
+    };
+    let raw: Vec<RawUblkDevice> = match devices {
+        None | Some("") => Vec::new(),
+        Some(text) => serde_json::from_str(text).map_err(|_| Error::InvalidConfiguration)?,
+    };
+    if raw.len() > MAX_UBLK_DEVICES {
+        return Err(Error::InvalidConfiguration);
+    }
+    let mut ids = std::collections::HashSet::new();
+    let mut targets = std::collections::HashSet::new();
+    let mut parsed = Vec::with_capacity(raw.len());
+    for device in raw {
+        racer_control_wire::canonical_socket_paths(&device.cache)
+            .map_err(|_| Error::InvalidConfiguration)?;
+        let key =
+            CacheKey::parse_hex(device.key.as_bytes()).map_err(|_| Error::InvalidConfiguration)?;
+        let etag = device
+            .etag
+            .map(|etag| StrongEtag::parse(etag.as_bytes()))
+            .transpose()
+            .map_err(|_| Error::InvalidConfiguration)?;
+        if let Some(id) = device.id
+            && (id > MAX_UBLK_DEVICE_ID || !ids.insert(id))
+        {
+            return Err(Error::InvalidConfiguration);
+        }
+        if !targets.insert((device.cache.clone(), key)) {
+            return Err(Error::InvalidConfiguration);
+        }
+        parsed.push(UblkDeviceConfig {
+            cache: device.cache,
+            key,
+            etag,
+            id: device.id,
+        });
+    }
+    Ok(UblkConfig {
+        devices: parsed,
+        queue_depth,
+        max_io_bytes,
+    })
 }
 
 impl Config {
@@ -173,7 +308,13 @@ impl Config {
         let mut values = Vec::new();
         for name in ENV_NAMES {
             if let Some(value) = lookup(&format!("RACER_{name}"))? {
-                if *name != "SEND_CRC_PAIR" {
+                // An empty device list is an explicit "off".
+                if *name == "UBLK_DEVICES" && value.is_empty() {
+                    continue;
+                }
+                if *name == "UBLK_DEVICES" {
+                    validate_text(&value, MAX_UBLK_DEVICES_TEXT)?;
+                } else if *name != "SEND_CRC_PAIR" {
                     validate_text(&value, 4096)?;
                 }
                 values.push(((*name).to_owned(), value));
@@ -421,6 +562,11 @@ impl Config {
                 raw.reader_stall_timeout_ms.unwrap_or(10_000),
             ),
             shutdown_timeout: Duration::from_millis(raw.shutdown_timeout_ms.unwrap_or(30_000)),
+            ublk: parse_ublk(
+                raw.ublk_devices.as_deref(),
+                raw.ublk_queue_depth,
+                raw.ublk_max_io_bytes,
+            )?,
         };
         // Standalone mode needs both static values; managed mode must set neither.
         if raw.cluster_id.is_some() != raw.control_endpoint.is_some() {
@@ -818,6 +964,9 @@ const ENV_NAMES: &[&str] = &[
     "ADMISSION_HISTORY_BYTES",
     "CHECKPOINT_BYTES",
     "SEND_CRC_PAIR",
+    "UBLK_DEVICES",
+    "UBLK_QUEUE_DEPTH",
+    "UBLK_MAX_IO_BYTES",
 ];
 
 /// Parsed values before application defaults, conversions, and cross-field policy.
@@ -950,6 +1099,11 @@ struct RawConfig {
     admission_history_bytes: Option<u64>,
     #[serde(default, deserialize_with = "decimal")]
     checkpoint_bytes: Option<u64>,
+    ublk_devices: Option<String>,
+    #[serde(default, deserialize_with = "decimal")]
+    ublk_queue_depth: Option<u64>,
+    #[serde(default, deserialize_with = "decimal")]
+    ublk_max_io_bytes: Option<u64>,
 }
 
 /// Keep decimal syntax stricter than Rust's unsigned FromStr, which accepts '+'.
@@ -2685,5 +2839,140 @@ mod tests {
         assert_eq!(config.validate(), Err(Error::InvalidConfiguration));
         config.peer_attempt_timeout = Duration::from_millis(86_400_001);
         assert_eq!(config.validate(), Err(Error::InvalidConfiguration));
+    }
+
+    const UBLK_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const UBLK_KEY2: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    fn ublk_devices(json: &str) -> Result<UblkConfig> {
+        parse(&[("RACER_UBLK_DEVICES", json)]).map(|config| config.ublk)
+    }
+
+    #[test]
+    fn ublk_unset_or_empty_is_disabled_with_defaults() {
+        for config in [
+            parse(&[]).unwrap().ublk,
+            ublk_devices("").unwrap(),
+            ublk_devices("[]").unwrap(),
+        ] {
+            assert!(!config.enabled());
+            assert_eq!(config, UblkConfig::default());
+            assert_eq!(config.queue_depth, 128);
+            assert_eq!(config.max_io_bytes, 1024 * 1024);
+        }
+    }
+
+    #[test]
+    fn ublk_accepts_single_and_multiple_devices() {
+        let single =
+            ublk_devices(&format!(r#"[{{"cache":"models","key":"{UBLK_KEY}"}}]"#)).unwrap();
+        assert!(single.enabled());
+        assert_eq!(
+            single.devices,
+            vec![UblkDeviceConfig {
+                cache: "models".into(),
+                key: CacheKey::parse_hex(UBLK_KEY.as_bytes()).unwrap(),
+                etag: None,
+                id: None,
+            }]
+        );
+        let multi = ublk_devices(&format!(
+            "[{},{},{}]",
+            format_args!(r#"{{"cache":"models","key":"{UBLK_KEY}","etag":"\"v1\"","id":7}}"#),
+            format_args!(r#"{{"cache":"models","key":"{UBLK_KEY2}","id":1048575}}"#),
+            format_args!(r#"{{"cache":"other.cache","key":"{UBLK_KEY}"}}"#),
+        ))
+        .unwrap();
+        assert_eq!(multi.devices.len(), 3);
+        assert_eq!(
+            multi.devices[0].etag,
+            Some(StrongEtag::parse(b"\"v1\"").unwrap())
+        );
+        assert_eq!(multi.devices[0].id, Some(7));
+        assert_eq!(multi.devices[1].id, Some(MAX_UBLK_DEVICE_ID));
+        assert_eq!(multi.devices[2].cache, "other.cache");
+        assert_eq!(multi.devices[2].etag, None);
+    }
+
+    #[test]
+    fn ublk_rejects_invalid_devices() {
+        let upper = UBLK_KEY.to_uppercase();
+        let short = &UBLK_KEY[..62];
+        let long = format!("{UBLK_KEY}00");
+        let cases = [
+            "not json".to_owned(),
+            "{}".to_owned(),
+            r#"[{"cache":"models"}]"#.to_owned(),
+            format!(r#"[{{"cache":"models","key":"{UBLK_KEY}","extra":1}}]"#),
+            format!(r#"[{{"cache":"models","key":"{upper}"}}]"#),
+            format!(r#"[{{"cache":"models","key":"{short}"}}]"#),
+            format!(r#"[{{"cache":"models","key":"{long}"}}]"#),
+            format!(r#"[{{"cache":"","key":"{UBLK_KEY}"}}]"#),
+            format!(r#"[{{"cache":"Models","key":"{UBLK_KEY}"}}]"#),
+            format!(r#"[{{"cache":"models","key":"{UBLK_KEY}","etag":"W/\"v1\""}}]"#),
+            format!(r#"[{{"cache":"models","key":"{UBLK_KEY}","etag":"v1"}}]"#),
+            format!(r#"[{{"cache":"models","key":"{UBLK_KEY}","etag":""}}]"#),
+            format!(r#"[{{"cache":"models","key":"{UBLK_KEY}","id":1048576}}]"#),
+            format!(r#"[{{"cache":"models","key":"{UBLK_KEY}","id":-1}}]"#),
+            format!(
+                r#"[{{"cache":"models","key":"{UBLK_KEY}","id":3}},{{"cache":"models","key":"{UBLK_KEY2}","id":3}}]"#
+            ),
+            format!(
+                r#"[{{"cache":"models","key":"{UBLK_KEY}"}},{{"cache":"models","key":"{UBLK_KEY}","etag":"\"v2\""}}]"#
+            ),
+        ];
+        for case in cases {
+            assert!(
+                matches!(ublk_devices(&case), Err(Error::InvalidConfiguration)),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn ublk_device_count_is_capped() {
+        let device = |i: usize| format!(r#"{{"cache":"c{i}","key":"{UBLK_KEY}"}}"#);
+        let list = |n: usize| format!("[{}]", (0..n).map(device).collect::<Vec<_>>().join(","));
+        assert_eq!(
+            ublk_devices(&list(MAX_UBLK_DEVICES)).unwrap().devices.len(),
+            MAX_UBLK_DEVICES
+        );
+        assert!(ublk_devices(&list(MAX_UBLK_DEVICES + 1)).is_err());
+    }
+
+    #[test]
+    fn ublk_devices_obey_text_limit() {
+        // Whitespace padding keeps the JSON valid; only the length changes.
+        let body = format!(r#"[{{"cache":"models","key":"{UBLK_KEY}"}}]"#);
+        let fits = format!("{body}{}", " ".repeat(MAX_UBLK_DEVICES_TEXT - body.len()));
+        assert!(ublk_devices(&fits).unwrap().enabled());
+        let over = format!("{fits} ");
+        assert!(matches!(
+            ublk_devices(&over),
+            Err(Error::InvalidConfiguration)
+        ));
+        assert!(ublk_devices(&format!("{body}\n")).is_err());
+    }
+
+    #[test]
+    fn ublk_queue_depth_is_bounded() {
+        let depth = |value: &str| parse(&[("RACER_UBLK_QUEUE_DEPTH", value)]).map(|c| c.ublk);
+        assert_eq!(depth("1").unwrap().queue_depth, 1);
+        assert_eq!(depth("64").unwrap().queue_depth, 64);
+        assert_eq!(depth("4096").unwrap().queue_depth, 4096);
+        for bad in ["0", "4097", "65536", "-1", "+1", "", "x"] {
+            assert!(depth(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn ublk_max_io_bytes_is_bounded() {
+        let bytes = |value: &str| parse(&[("RACER_UBLK_MAX_IO_BYTES", value)]).map(|c| c.ublk);
+        assert_eq!(bytes("4096").unwrap().max_io_bytes, 4096);
+        assert_eq!(bytes("524288").unwrap().max_io_bytes, 524288);
+        assert_eq!(bytes("33554432").unwrap().max_io_bytes, 33554432);
+        for bad in ["0", "4095", "4097", "33558528", "4294967296", ""] {
+            assert!(bytes(bad).is_err(), "{bad}");
+        }
     }
 }
