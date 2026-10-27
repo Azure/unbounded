@@ -381,6 +381,8 @@ flowchart TD
     W -->|Yes| OK[Included in Pool Status]
 ```
 
+A node that matches the `nodeSelector` of any GatewayPool is left out of SiteNodeSlices, even when a SitePeering with `meshNodes: true` covers its Site. Other nodes can reach it only as a gateway peer of the pool it is assigned to. A node that matches several pools is assigned to the first one by name. A selector that matches every node of a Site therefore leaves the Site with no SiteNodeSlices and no mesh peers. Select gateway nodes with a dedicated label, such as `unbounded-cloud.io/unbounded-net-gateway: "true"`.
+
 ### Gateway Peer IP Resolution
 
 When connecting to a gateway peer, the node agent resolves the endpoint IP:
