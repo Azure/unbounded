@@ -43,10 +43,13 @@ pub use crate::{
 };
 use std::time::Duration;
 
-/// Pseudo-random delay below `max`, spread by Pod UID, `salt`, and `rng`.
-pub fn jitter(pod_uid: &str, rng: &mut dyn Entropy, salt: u32, max: Duration) -> Duration {
+/// Pseudo-random delay below `max`, spread by Pod UID, `stream`, and `rng`.
+///
+/// `stream` separates independent delays drawn for the same Pod; it is not a
+/// cryptographic input.
+pub fn jitter(pod_uid: &str, rng: &mut dyn Entropy, stream: u32, max: Duration) -> Duration {
     let r = rng.u32_or_zero();
-    crate::authority::election::claim_delay(pod_uid, salt ^ r, max)
+    crate::authority::election::claim_delay(pod_uid, stream ^ r, max)
 }
 
 #[cfg(test)]
