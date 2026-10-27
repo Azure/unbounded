@@ -1,7 +1,11 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 # Injects the racer-object native sidecar into pods labeled
-# racer.unbounded-cloud.io/object-sidecar=enabled. The operator fills caBundle.
+# racer.unbounded-cloud.io/object-sidecar=enabled, and mounts the Racer client
+# socket into pods labeled racer.unbounded-cloud.io/client-socket=enabled.
+# Label selectors cannot express OR, so each label has its own webhook. Both
+# call the same handler, which applies both opt-ins idempotently.
+# The operator fills caBundle.
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingWebhookConfiguration
 metadata:
@@ -34,6 +38,38 @@ webhooks:
         expression: >-
           !object.spec.containers.exists(c, c.name == 'racer-object') &&
           (!has(object.spec.initContainers) || !object.spec.initContainers.exists(c, c.name == 'racer-object'))
+    failurePolicy: Fail
+    matchPolicy: Equivalent
+    sideEffects: None
+    reinvocationPolicy: Never
+    timeoutSeconds: 5
+  - name: racer-client-socket.racer.unbounded-cloud.io
+    admissionReviewVersions: ["v1"]
+    clientConfig:
+      service:
+        name: racer-controller
+        namespace: {{ .Namespace | default "unbounded-system" }}
+        path: /mutate-racer-object-sidecar
+        port: 9443
+    rules:
+      - operations: ["CREATE"]
+        apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods"]
+        scope: Namespaced
+    objectSelector:
+      matchLabels:
+        racer.unbounded-cloud.io/client-socket: enabled
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: [{{ .Namespace | default "unbounded-system" | quote }}]
+    matchConditions:
+      - name: not-already-injected
+        expression: >-
+          !has(object.metadata.annotations) ||
+          !('racer.unbounded-cloud.io/client-socket-injected' in object.metadata.annotations)
     failurePolicy: Fail
     matchPolicy: Equivalent
     sideEffects: None

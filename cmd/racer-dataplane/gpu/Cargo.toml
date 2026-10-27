@@ -1,0 +1,24 @@
+[package]
+name = "racer-gpu"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "CUDA GPU discovery, client allocation import, staging, and GPU page decryption"
+
+[features]
+default = []
+# Load libracer_gpu_cuda.so.1 (native/gpu_cuda.c) at runtime.
+native = []
+# In-process fake GPUs backed by host memory, for tests without hardware.
+simulation = []
+
+[dependencies]
+libc = "0.2"
+zeroize = "1"
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+racer-crypto = { path = "../crypto" }

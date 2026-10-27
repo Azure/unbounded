@@ -918,6 +918,33 @@ mod identity_workflows {
         }
     }
 
+    /// Offload derivation equals the primitive and enforces the lease binding.
+    #[test]
+    fn derived_page_subkey_matches_primitive_and_enforces_binding() {
+        let (_, _, roots) = issued_with(|_| {});
+        let keys = keyring(roots);
+        let cache = CacheId(CACHE.into());
+        let page = keys.active(&cache, KeyPurpose::Page).unwrap();
+        let credentials = keys.active(&cache, KeyPurpose::OriginCredentials).unwrap();
+        let nonce = *b"abcdefghijklMNOPQRSTUVWX";
+        let derived = page.derive_page_subkey(&cache, page.id(), &nonce).unwrap();
+        let expected = racer_crypto::xaes_derive(&[7; 32], &nonce);
+        assert_eq!(derived.key(), expected.key());
+        assert_eq!(derived.nonce(), b"MNOPQRSTUVWX");
+        assert!(matches!(
+            page.derive_page_subkey(&cache, credentials.id(), &nonce),
+            Err(Error::MissingKey)
+        ));
+        assert!(matches!(
+            page.derive_page_subkey(&CacheId("wrong".into()), page.id(), &nonce),
+            Err(Error::MissingKey)
+        ));
+        assert!(matches!(
+            credentials.derive_page_subkey(&cache, credentials.id(), &nonce),
+            Err(Error::MissingKey)
+        ));
+    }
+
     /// Page and credential operations enforce bindings without touching failed output.
     #[test]
     fn borrowed_outputs_enforce_purpose_cache_id_and_retained_epoch() {
@@ -1347,4 +1374,45 @@ fn xaes_tamper_zeroes_output_and_length_errors_do_not() {
     let mut long = vec![0xa5; plaintext.len() + TAG_LEN + 1];
     assert!(seal(&key, &nonce, aad, &plaintext, &mut long).is_err());
     assert!(long.iter().all(|byte| *byte == 0xa5));
+}
+
+/// The XAES derivation lets plain AES-256-GCM open XAES-256-GCM pages, and it
+/// matches the upstream implementation for nonce halves and key bytes.
+#[test]
+fn xaes_derivation_matches_upstream_xaes_256_gcm() {
+    use xaes_256_gcm::aes_gcm::{
+        Aes256Gcm, KeyInit,
+        aead::{AeadInOut, inout::InOutBuf},
+    };
+
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state as u8
+    };
+    for round in 0..64 {
+        let key: [u8; 32] = std::array::from_fn(|_| next());
+        let nonce: [u8; 24] = std::array::from_fn(|_| next());
+        let plaintext: Vec<u8> = (0..round * 7).map(|_| next()).collect();
+        let aad: Vec<u8> = (0..round % 40).map(|_| next()).collect();
+        let mut sealed = vec![0; plaintext.len() + TAG_LEN];
+        seal(&key, &nonce, &aad, &plaintext, &mut sealed).unwrap();
+
+        let derived = racer_crypto::xaes_derive(&key, &nonce);
+        assert_eq!(derived.nonce(), &nonce[12..]);
+        let cipher = Aes256Gcm::new(derived.key().into());
+        let (ciphertext, tag) = sealed.split_at(plaintext.len());
+        let mut out = vec![0; plaintext.len()];
+        cipher
+            .decrypt_inout_detached(
+                derived.nonce().into(),
+                &aad,
+                InOutBuf::new(ciphertext, &mut out).unwrap(),
+                tag.try_into().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(out, plaintext);
+    }
 }

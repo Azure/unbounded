@@ -77,7 +77,7 @@ pub use node::{
     BACKOFF_MAX, BACKOFF_MIN, BACKOFF_RESET, COMMAND_QUEUE, Client, LinkKey, LinkSelector,
     LinkState, NodeConfig, Opened, Owner, OwnerPort, SETUP_TIMEOUT, Setup, node,
 };
-pub use pool::{BufferState, RegisteredPage};
+pub use pool::{BufferState, DevicePage, RegisteredPage};
 
 #[cfg(any(test, feature = "simulation"))]
 pub use ffi::simulation;
@@ -99,6 +99,37 @@ pub fn inventory() -> Result<Vec<PortInfo>> {
         })
         .collect())
 }
+
+/// Memory outside this crate that the NIC reaches through a Linux dma-buf,
+/// such as GPU memory exported with `cuMemGetHandleForAddressRange`.
+///
+/// A device pool built over it (see [`Client::attach_device`]) lets peers
+/// write pages straight into this memory. The CPU never maps or copies it:
+/// device pages can only receive, and their bytes are only reachable through
+/// the owner (for example a GPU kernel).
+///
+/// The crate keeps the owning [`DeviceMemory`] alive while the memory is
+/// registered. If deregistration fails, the owner is leaked on purpose, like a
+/// [`Guard`], so the memory is never freed while the NIC may still write it.
+pub trait DmabufMemory: Send + Sync {
+    /// The dma-buf descriptor. Read only on the native thread, during
+    /// registration. The kernel keeps its own reference after that.
+    fn fd(&self) -> std::os::fd::BorrowedFd<'_>;
+
+    /// Byte offset of this memory inside the dma-buf.
+    fn offset(&self) -> u64;
+
+    /// Usable bytes from [`Self::offset`]. Split into page buffers of the
+    /// node's buffer length.
+    fn length(&self) -> usize;
+
+    /// The address the NIC uses for the first byte. Windows over this memory
+    /// bind from it.
+    fn iova(&self) -> u64;
+}
+
+/// The owner of a device pool's memory. See [`DmabufMemory`].
+pub type DeviceMemory = Arc<dyn DmabufMemory>;
 
 /// Any value you want kept alive as long as a slot's RDMA resources live.
 ///

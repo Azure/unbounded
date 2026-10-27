@@ -23,6 +23,10 @@ use crate::model::PageNumber;
 use crate::model::ResolvedRange;
 #[cfg(test)]
 use crate::read::dispatch::WorkerMap;
+use crate::read::sealed::Fetched;
+use crate::read::sealed::SealedPage;
+use crate::read::sealed::SealedReport;
+use crate::read::sealed::SealedTarget;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
 use crate::store::holds::HoldEpoch;
@@ -40,7 +44,8 @@ use std::task::Waker;
 use std::time::Duration;
 use std::time::Instant;
 
-/// Direct fills a read keeps in flight beyond its head page.
+/// Direct fills a read keeps in flight beyond its head page. A sealed read
+/// fills its whole window directly (see `RangeStream::direct_ahead`).
 const DIRECT_AHEAD: usize = 1;
 
 /// Provider selections a read keeps in flight. Beyond the first, a read only
@@ -478,6 +483,16 @@ impl RangeBudget {
 
 type Fetch = Operation<'static, (Result<PageResult>, AcquisitionBudget)>;
 
+/// A direct fill in sealed mode, which may return ciphertext for the GPU.
+type SealedFetch = Operation<'static, (Result<Fetched>, AcquisitionBudget)>;
+
+/// One page for a direct read: plaintext, or ciphertext the sink verifies.
+pub(crate) enum DirectItem {
+    Plaintext(ReaderLease),
+    /// A sealed page and the slice of it the range covers.
+    Sealed(Box<SealedPage>, crate::model::PageSlice),
+}
+
 /// One page of the read window, `slots[i]` is page `next + i`.
 #[allow(clippy::large_enum_variant)] // Avoid allocating again when an in-window page becomes ready.
 enum Slot {
@@ -488,6 +503,10 @@ enum Slot {
     Missing { select: bool },
     /// A direct fill through the owning worker.
     Fetching(Fetch),
+    /// A direct fill in sealed mode.
+    FetchingSealed(SealedFetch),
+    /// Fetched as ciphertext for the GPU to verify.
+    Sealed(Box<SealedPage>),
     /// Covered by an outstanding provider selection.
     Selecting,
     /// Fetched, or failed. An error waits here until the page reaches the head.
@@ -576,6 +595,9 @@ pub struct RangeStream {
 
     spill: Option<Spill>,
 
+    /// Set for direct GPU reads: misses are fetched sealed for this GPU.
+    sealed: Option<SealedTarget>,
+
     terminated: bool,
 }
 
@@ -591,6 +613,11 @@ impl RangeStreams {
             delivery,
             window_pages,
         }
+    }
+
+    /// The configured `range_window_pages` of each stream.
+    pub(crate) fn window_pages(&self) -> usize {
+        self.window_pages
     }
 
     /// Share the same metadata and page owners used by newly opened streams.
@@ -640,6 +667,7 @@ impl RangeStreams {
             slots: VecDeque::new(),
             selections: Vec::new(),
             spill: None,
+            sealed: None,
             terminated: false,
         })
     }
@@ -676,6 +704,21 @@ impl RangeStream {
             held: BTreeMap::new(),
         });
         Ok(())
+    }
+
+    /// Fetch pages that are not verified plaintext in memory as sealed pages
+    /// for `target`'s GPU. Call before the first delivery.
+    pub(crate) fn set_sealed(&mut self, target: SealedTarget) -> Result<()> {
+        if self.terminated || !self.slots.is_empty() {
+            return Err(Error::InvalidRequest);
+        }
+        self.sealed = Some(target);
+        Ok(())
+    }
+
+    /// Tell a sealed page's owner what the GPU decided.
+    pub(crate) fn report_sealed(&self, report: SealedReport, passed: bool) {
+        self.directory.report_sealed(report, passed, &self.scope);
     }
 
     /// Release exactly one delivered page and its retained plaintext charge.
@@ -739,11 +782,18 @@ impl RangeStream {
             };
             let directory = self.directory.clone();
             let scope = scope.clone();
+            let sealed = self.sealed.is_some();
             let spilled = self
                 .spill
                 .as_mut()
                 .and_then(|spill| spill.pages.remove(&number.0));
             self.slots.push_back(Slot::Probing(match spilled {
+                // A sealed read probes live plaintext only. Cached or disk
+                // ciphertext is then fetched sealed, so the GPU rather than
+                // the CPU decrypts it.
+                None if sealed => {
+                    Box::pin(async move { directory.cached_page(page, &scope).await })
+                }
                 // Holding pages stay with the spill state until the hold
                 // completes, so the hold is released exactly once.
                 None => Box::pin(async move { directory.local_page(page, &scope).await }),
@@ -753,8 +803,21 @@ impl RangeStream {
                         .unwrap()
                         .pages
                         .insert(number.0, Spilling::Holding(holding));
-                    Box::pin(async move { directory.local_page(page, &scope).await })
+                    if sealed {
+                        Box::pin(async move { directory.cached_page(page, &scope).await })
+                    } else {
+                        Box::pin(async move { directory.local_page(page, &scope).await })
+                    }
                 }
+                // A sealed read probes memory only: a spilled page on disk is
+                // then fetched sealed, so the GPU decrypts it.
+                Some(Spilling::Spilled) if sealed => {
+                    Box::pin(async move { directory.cached_page(page, &scope).await })
+                }
+                Some(Spilling::Warming(warming)) if sealed => Box::pin(async move {
+                    let _ = warming.await;
+                    directory.cached_page(page, &scope).await
+                }),
                 // A spilled page is read back from memory or its held disk copy.
                 // If that fails the page is fetched normally.
                 Some(Spilling::Spilled) => {
@@ -825,6 +888,28 @@ impl RangeStream {
                             lease.offer(page);
                         }
                         Slot::Ready(self.budget.complete(remaining).and(result))
+                    }
+                    Poll::Ready(Err(error)) => Slot::Ready(Err(error)),
+                },
+                Slot::FetchingSealed(fetch) => match fetch.as_mut().poll(cx) {
+                    Poll::Pending => continue,
+                    Poll::Ready(Ok((result, remaining))) => {
+                        let completed = self.budget.complete(remaining);
+                        match result {
+                            Ok(Fetched::Page(page)) => {
+                                if let Some(lease) = &self.lease {
+                                    lease.offer(&page);
+                                }
+                                Slot::Ready(completed.map(|()| page))
+                            }
+                            Ok(Fetched::Sealed(sealed)) => match completed
+                                .and_then(|()| self.validate_sealed(&sealed, number))
+                            {
+                                Ok(()) => Slot::Sealed(sealed),
+                                Err(error) => Slot::Ready(Err(error)),
+                            },
+                            Err(error) => Slot::Ready(completed.and(Err(error))),
+                        }
                     }
                     Poll::Ready(Err(error)) => Slot::Ready(Err(error)),
                 },
@@ -903,10 +988,10 @@ impl RangeStream {
             || self
                 .slots
                 .iter()
-                .any(|slot| matches!(slot, Slot::Fetching(_)))
+                .any(|slot| matches!(slot, Slot::Fetching(_) | Slot::FetchingSealed(_)))
     }
 
-    /// Start a direct fill for the head page, up to `DIRECT_AHEAD` more holes,
+    /// Start a direct fill for the head page, up to `direct_ahead` more holes,
     /// and provider selections for the remaining holes.
     fn admit(&mut self, scope: &RequestScope) -> Result<bool> {
         // A failed page stops admission at and after it until it reaches the
@@ -933,7 +1018,7 @@ impl RangeStream {
             .slots
             .iter()
             .skip(1)
-            .filter(|slot| matches!(slot, Slot::Fetching(_)))
+            .filter(|slot| matches!(slot, Slot::Fetching(_) | Slot::FetchingSealed(_)))
             .count();
         // Pages another window is selecting or filling arrive through its
         // fan-out. Only the head is always filled directly, so it never waits
@@ -945,7 +1030,8 @@ impl RangeStream {
             .map(WindowLease::busy_elsewhere)
             .unwrap_or_default();
         let mut index = 1;
-        while ahead < DIRECT_AHEAD && index < limit {
+        let direct_ahead = self.direct_ahead();
+        while ahead < direct_ahead && index < limit {
             if matches!(self.slots[index], Slot::Missing { .. })
                 && !elsewhere.contains(&self.page_at(index))
             {
@@ -965,6 +1051,18 @@ impl RangeStream {
         Ok(changed)
     }
 
+    /// Direct fills to keep in flight beyond the head page. Provider selections
+    /// deliver verified plaintext, so a sealed read fills its whole window
+    /// directly. Its direct fills stage disk pages with cuFile and keep
+    /// ciphertext for the GPU to decrypt.
+    fn direct_ahead(&self) -> usize {
+        if self.sealed.is_some() {
+            self.window_pages.saturating_sub(1).max(DIRECT_AHEAD)
+        } else {
+            DIRECT_AHEAD
+        }
+    }
+
     /// Returns false when the range budget admits no more work for now.
     fn start_fetch(&mut self, index: usize, scope: &RequestScope) -> Result<bool> {
         let Some(child) = self.budget.next_page(self.pending())? else {
@@ -972,20 +1070,34 @@ impl RangeStream {
         };
         let mut child_scope = scope.clone();
         child_scope.deadline.0 = child.deadline();
-        let fetch = self.directory.start_page(
-            PageId {
-                version: self.metadata.version.clone(),
-                number: PageNumber(self.page_at(index)),
-            },
-            self.membership.clone(),
-            &self.context,
-            &child_scope,
-            child,
-        );
-        self.slots[index] = match fetch {
-            Ok(fetch) => Slot::Fetching(fetch),
-            Err(error) => Slot::Ready(Err(error)),
+        let page = PageId {
+            version: self.metadata.version.clone(),
+            number: PageNumber(self.page_at(index)),
         };
+        let fetch = match &self.sealed {
+            Some(target) => self
+                .directory
+                .start_page_sealed(
+                    page,
+                    self.membership.clone(),
+                    &self.context,
+                    &child_scope,
+                    child,
+                    target.clone(),
+                )
+                .map(Slot::FetchingSealed),
+            None => self
+                .directory
+                .start_page(
+                    page,
+                    self.membership.clone(),
+                    &self.context,
+                    &child_scope,
+                    child,
+                )
+                .map(Slot::Fetching),
+        };
+        self.slots[index] = fetch.unwrap_or_else(|error| Slot::Ready(Err(error)));
         Ok(true)
     }
 
@@ -1139,7 +1251,7 @@ impl RangeStream {
                     wants.insert(number);
                     busy.insert(number);
                 }
-                Slot::Fetching(_) => {
+                Slot::Fetching(_) | Slot::FetchingSealed(_) => {
                     busy.insert(number);
                 }
                 Slot::Probing(_) | Slot::Missing { .. } => {
@@ -1337,6 +1449,13 @@ impl RangeStream {
         }
         scope
     }
+    fn validate_sealed(&self, sealed: &SealedPage, number: PageNumber) -> Result<()> {
+        validate_pin(&self.metadata, &sealed.metadata)?;
+        sealed.validate_for(&PageId {
+            version: self.metadata.version.clone(),
+            number,
+        })
+    }
     fn validate(&self, result: &PageResult, number: PageNumber) -> Result<()> {
         validate_pin(&self.metadata, &result.metadata)?;
         result.validate_for(&PageId {
@@ -1347,6 +1466,22 @@ impl RangeStream {
     /// Deliver the next page in order. Pending futures live in the stream, so
     /// dropping next_slice cannot restart a page or refill its retries.
     pub fn next_slice(&mut self) -> Operation<'_, Option<ReaderLease>> {
+        Box::pin(async move {
+            match self.next_direct().await? {
+                None => Ok(None),
+                Some(DirectItem::Plaintext(reader)) => Ok(Some(reader)),
+                // Only direct GPU reads set a sealed target.
+                Some(DirectItem::Sealed(..)) => {
+                    self.terminate();
+                    Err(Error::Internal)
+                }
+            }
+        })
+    }
+
+    /// Deliver the next page in order for a direct read, sealed if the
+    /// stream has a sealed target and the page was fetched as ciphertext.
+    pub(crate) fn next_direct(&mut self) -> Operation<'_, Option<DirectItem>> {
         Box::pin(async move {
             if self.terminated {
                 return Ok(None);
@@ -1384,10 +1519,10 @@ impl RangeStream {
 
     /// Whether the head page can be handed to the client now.
     fn deliverable(&self) -> bool {
-        matches!(self.slots.front(), Some(Slot::Ready(_)))
+        matches!(self.slots.front(), Some(Slot::Ready(_) | Slot::Sealed(_)))
     }
 
-    async fn deliver(&mut self) -> Result<Option<ReaderLease>> {
+    async fn deliver(&mut self) -> Result<Option<DirectItem>> {
         let scope = self.operation_scope();
         let cancellation = scope.cancellation.subscribe()?;
         poll_fn(|cx| -> Poll<Result<()>> {
@@ -1408,20 +1543,37 @@ impl RangeStream {
             return Ok(None);
         }
         scope.check()?;
-        let Some(Slot::Ready(result)) = self.slots.pop_front() else {
-            return Err(Error::StaleFlight);
-        };
         let number = PageNumber(self.next);
-        self.next += 1;
-        let result = result?;
+        let result = match self.slots.pop_front() {
+            Some(Slot::Ready(result)) => {
+                self.next += 1;
+                result?
+            }
+            Some(Slot::Sealed(sealed)) => {
+                self.next += 1;
+                self.validate_sealed(&sealed, number)?;
+                let slice = self.range.slice_at(number)?.ok_or(Error::CorruptRecord)?;
+                self.issue(number)?;
+                return Ok(Some(DirectItem::Sealed(sealed, slice)));
+            }
+            _ => return Err(Error::StaleFlight),
+        };
         self.validate(&result, number)?;
         let slice = self.range.slice_at(number)?.ok_or(Error::CorruptRecord)?;
+        self.issue(number)?;
+        self.retained.insert(number, result.plaintext.clone());
+        self.delivery
+            .attach(result.plaintext, slice)
+            .map(|reader| Some(DirectItem::Plaintext(reader)))
+    }
+
+    /// Account one page as handed to the client, and drop its spill hold.
+    fn issue(&mut self, number: PageNumber) -> Result<()> {
         self.credits
             .as_mut()
             .ok_or(Error::InvalidRequest)?
             .issued(number)
             .map_err(window_error)?;
-        self.retained.insert(number, result.plaintext.clone());
         if let Some(spill) = self.spill.as_mut()
             && let Some(epoch) = spill.held.remove(&number.0)
         {
@@ -1431,14 +1583,23 @@ impl RangeStream {
                 self.scope.request,
             );
         }
-        self.delivery.attach(result.plaintext, slice).map(Some)
+        Ok(())
     }
 
     /// Pages admitted into the window: fetched, being fetched or selected.
     pub fn buffered_pages(&self) -> usize {
         self.slots
             .iter()
-            .filter(|slot| matches!(slot, Slot::Fetching(_) | Slot::Selecting | Slot::Ready(_)))
+            .filter(|slot| {
+                matches!(
+                    slot,
+                    Slot::Fetching(_)
+                        | Slot::FetchingSealed(_)
+                        | Slot::Selecting
+                        | Slot::Ready(_)
+                        | Slot::Sealed(_)
+                )
+            })
             .count()
     }
 }
@@ -1594,6 +1755,92 @@ pub(super) mod tests {
                 }),
             },
         }
+    }
+
+    #[test]
+    fn sealed_reads_fill_their_whole_window_directly() {
+        for (window, sealed) in [(1, 1), (2, 1), (8, 7)] {
+            let f = Fixture::new(crate::test_support::cluster::config(false).limits, window);
+            let mut metadata = metadata();
+            metadata.length = 16 * PAGE_BYTES;
+            let range = ByteRange::From(0).resolve(metadata.length).unwrap();
+            let scope =
+                RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(60))
+                    .unwrap();
+            let mut stream = f.open(&metadata, range, scope);
+            assert_eq!(stream.direct_ahead(), DIRECT_AHEAD);
+            stream
+                .set_sealed(SealedTarget {
+                    helper: crate::gpu::testing::helper(&[None]),
+                    ordinal: 0,
+                })
+                .unwrap();
+            assert_eq!(stream.direct_ahead(), sealed, "window {window}");
+        }
+    }
+
+    #[test]
+    fn sealed_pages_are_delivered_in_order_only_to_direct_readers() {
+        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+        let admission = &f.admission;
+        let mut metadata = metadata();
+        metadata.length = 2 * PAGE_BYTES;
+        let range = ByteRange::Closed {
+            first: 5,
+            last: PAGE_BYTES + 9,
+        }
+        .resolve(metadata.length)
+        .unwrap();
+        let scope = || {
+            RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(60)).unwrap()
+        };
+        let mut stream = f.open(&metadata, range, scope());
+        stream.configure_subscription(4, 4 * PAGE_BYTES).unwrap();
+        let first = crate::read::sealed::tests::sealed(&page_result(admission, &metadata, 0));
+        stream.inject(Slot::Sealed(Box::new(first)));
+        stream.inject(Slot::Ready(Ok(page_result(admission, &metadata, 1))));
+        match futures::executor::block_on(stream.next_direct()).unwrap() {
+            Some(DirectItem::Sealed(page, slice)) => {
+                assert_eq!(page.page().number, PageNumber(0));
+                assert_eq!(
+                    (slice.page, slice.offset, slice.length),
+                    (PageNumber(0), 5, PAGE_BYTES as u32 - 5)
+                );
+            }
+            _ => panic!("expected a sealed page"),
+        }
+        stream
+            .release_page(PageNumber(0), PAGE_BYTES as u32 - 5)
+            .unwrap();
+        match futures::executor::block_on(stream.next_direct()).unwrap() {
+            Some(DirectItem::Plaintext(reader)) => {
+                assert_eq!(reader.slice().page, PageNumber(1));
+                assert_eq!(reader.slice().length, 10);
+            }
+            _ => panic!("expected plaintext"),
+        }
+        assert!(
+            futures::executor::block_on(stream.next_direct())
+                .unwrap()
+                .is_none()
+        );
+
+        // A sealed page for another page number fails that page.
+        let mut stream = f.open(&metadata, range, scope());
+        stream.configure_subscription(4, 4 * PAGE_BYTES).unwrap();
+        let other = crate::read::sealed::tests::sealed(&page_result(admission, &metadata, 1));
+        stream.inject(Slot::Sealed(Box::new(other)));
+        assert!(futures::executor::block_on(stream.next_direct()).is_err());
+
+        // A Get stream never yields sealed pages.
+        let mut stream = f.open(&metadata, range, scope());
+        stream.configure_subscription(4, 4 * PAGE_BYTES).unwrap();
+        let first = crate::read::sealed::tests::sealed(&page_result(admission, &metadata, 0));
+        stream.inject(Slot::Sealed(Box::new(first)));
+        assert_eq!(
+            futures::executor::block_on(stream.next_slice()).err(),
+            Some(Error::Internal)
+        );
     }
 
     #[test]

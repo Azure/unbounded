@@ -23,7 +23,7 @@ use std::{
 use futures::task::AtomicWaker;
 
 use crate::{
-    Endpoint, Error, Guard, GuardOwner, PortInfo, Result, Selection,
+    DeviceMemory, Endpoint, Error, Guard, GuardOwner, PortInfo, Result, Selection,
     channel::{self, Completer, Op, op},
     ffi::{self, Access, NativeDevice, NativeRegion},
     link::{self, Break, Epoch, Granted, Limits, Link, Phase, Role, Source},
@@ -157,9 +157,16 @@ enum Command {
         done: Completer<()>,
     },
 
+    AttachDevice {
+        rail: u16,
+        memory: DeviceMemory,
+        done: Completer<usize>,
+    },
+
     Grant {
         key: LinkKey,
         epoch: Epoch,
+        device: bool,
         transfer: [u8; 16],
         length: u32,
         deadline: Instant,
@@ -191,6 +198,9 @@ struct NodeShared {
 
     pools: RwLock<BTreeMap<u16, Arc<PoolShared>>>,
 
+    /// Device pools by rail, once attached.
+    device_pools: RwLock<BTreeMap<u16, Arc<PoolShared>>>,
+
     /// Breaks that did not fit in a command queue.
     breaks: Mutex<Vec<(LinkKey, Epoch)>>,
 
@@ -214,6 +224,7 @@ pub fn node(workers: usize) -> Result<(Vec<Client>, OwnerPort)> {
     let shared = Arc::new(NodeShared {
         links: RwLock::new(BTreeMap::new()),
         pools: RwLock::new(BTreeMap::new()),
+        device_pools: RwLock::new(BTreeMap::new()),
         breaks: Mutex::new(Vec::new()),
         closed: AtomicBool::new(false),
         drained: AtomicBool::new(false),
@@ -344,11 +355,47 @@ impl Client {
         self.submit(|done| Command::Grant {
             key,
             epoch,
+            device: false,
             transfer,
             length,
             deadline,
             done,
         })
+    }
+
+    /// Receiver: like [`Self::grant`], but over a free buffer of the rail's
+    /// device pool (see [`Self::attach_device`]). The arrival is
+    /// [`crate::Arrival::Device`]. The fence is the same: the page is handed
+    /// out only after the peer's write completion and the window's signaled
+    /// invalidation, so the peer can no longer write it. Fails with
+    /// `Unavailable` if the rail has no device pool, and `Overloaded` if no
+    /// device buffer is free. Nothing falls back to host memory.
+    pub fn grant_device(
+        &self,
+        key: LinkKey,
+        epoch: Epoch,
+        transfer: [u8; 16],
+        length: u32,
+        deadline: Instant,
+    ) -> Op<Granted> {
+        self.submit(|done| Command::Grant {
+            key,
+            epoch,
+            device: true,
+            transfer,
+            length,
+            deadline,
+            done,
+        })
+    }
+
+    /// Register `memory` (a dma-buf, such as GPU memory) on `rail` as its
+    /// device pool, split into page buffers of the node's buffer length.
+    /// Once per rail per round, after [`Self::activate`]. Resolves to the
+    /// number of device buffers. The memory stays registered until the node
+    /// drains; it is never read or written by the CPU.
+    pub fn attach_device(&self, rail: u16, memory: DeviceMemory) -> Op<usize> {
+        self.submit(|done| Command::AttachDevice { rail, memory, done })
     }
 
     /// Sender: write `source` into the peer's grant `tag` with immediate,
@@ -402,6 +449,13 @@ impl Client {
     /// Page buffers of `rail` in `state`, for diagnostics.
     pub fn buffers(&self, rail: u16, state: BufferState) -> Option<usize> {
         let pools = self.shared.pools.try_read().ok()?;
+        Some(pools.get(&rail)?.count_in(state))
+    }
+
+    /// Device page buffers of `rail` in `state`, for diagnostics. `None`
+    /// without a device pool.
+    pub fn device_buffers(&self, rail: u16, state: BufferState) -> Option<usize> {
+        let pools = self.shared.device_pools.try_read().ok()?;
         Some(pools.get(&rail)?.count_in(state))
     }
 
@@ -554,7 +608,7 @@ impl Owner {
         self.shared.owner.register(waker);
 
         for device in self.devices.values() {
-            device.pool.shared().register_owner(waker);
+            device.pool.register_owner(waker);
         }
     }
 
@@ -661,15 +715,21 @@ impl Owner {
             } => {
                 let _ = done.complete(self.connect(key, epoch, remote, link_id, now));
             }
+            Command::AttachDevice { rail, memory, done } => {
+                let _ = done.complete(self.attach_device(rail, memory));
+            }
             Command::Grant {
                 key,
                 epoch,
+                device,
                 transfer,
                 length,
                 deadline,
                 done,
             } => match self.ready(key, epoch) {
-                Some((link, pool)) => link.grant(pool, transfer, length, deadline, done, now),
+                Some((link, pool)) => {
+                    link.grant(pool, device, transfer, length, deadline, done, now)
+                }
                 None => {
                     let _ = done.complete(Err(Error::Unavailable));
                 }
@@ -727,6 +787,33 @@ impl Owner {
         {
             self.leaked = true;
         }
+    }
+
+    /// Register `memory` as `rail`'s device pool.
+    fn attach_device(&mut self, rail: u16, memory: DeviceMemory) -> Result<usize> {
+        #[cfg(any(test, feature = "simulation"))]
+        let _simulation = self
+            .simulation
+            .as_ref()
+            .map(crate::simulation::Simulation::enter);
+        let quota = self.quota.clone().ok_or(Error::InvalidRequest)?;
+        let state = self.devices.get_mut(&rail).ok_or(Error::InvalidRequest)?;
+
+        if state.pool.device_shared().is_some() {
+            return Err(Error::InvalidRequest);
+        }
+
+        let region = NativeRegion::dmabuf(state.device.clone(), memory, quota)?;
+        state.pool.attach_device(region)?;
+        // The driver waker reaches the device pool on its next registration.
+        let shared = state.pool.device_shared().expect("just attached").clone();
+        let count = shared.count();
+        self.shared
+            .device_pools
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(rail, shared);
+        Ok(count)
     }
 
     fn activate(&mut self, config: NodeConfig) -> Result<Vec<Selection>> {
@@ -1052,6 +1139,11 @@ impl Owner {
             Err(_) => return,
         }
 
+        match self.shared.device_pools.try_write() {
+            Ok(mut pools) => pools.clear(),
+            Err(_) => return,
+        }
+
         if self.devices.values().any(|d| !d.pool.idle()) {
             return;
         }
@@ -1155,6 +1247,11 @@ impl Drop for Owner {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        self.shared
+            .device_pools
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
         // Pools leak their regions if pages are still held (see `pool.rs`).
         self.devices.clear();
     }
@@ -1169,6 +1266,7 @@ fn fail(command: Command, error: Error) {
         | Command::Write { done, .. }
         | Command::Release { done, .. } => drop(done.complete(Err(error))),
         Command::Grant { done, .. } => drop(done.complete(Err(error))),
+        Command::AttachDevice { done, .. } => drop(done.complete(Err(error))),
         Command::Break(..) => {}
     }
 }

@@ -27,7 +27,7 @@ func TestMutatingWebhookManifest(t *testing.T) {
 	require.NoError(t, yaml.UnmarshalStrict(data, &config))
 	require.Equal(t, "MutatingWebhookConfiguration", config.Kind)
 	require.Equal(t, "racer-object-sidecar-injector", config.Name)
-	require.Len(t, config.Webhooks, 1)
+	require.Len(t, config.Webhooks, 2)
 
 	hook := config.Webhooks[0]
 	require.Equal(t, "racer-object-sidecar.racer.unbounded-cloud.io", hook.Name)
@@ -61,6 +61,19 @@ func TestMutatingWebhookManifest(t *testing.T) {
 	require.Equal(t, admissionregistrationv1.NeverReinvocationPolicy, *hook.ReinvocationPolicy)
 	require.Equal(t, int32(5), *hook.TimeoutSeconds)
 	require.Equal(t, []string{"v1"}, hook.AdmissionReviewVersions)
+
+	// The client-socket webhook matches its own label and skips pods that
+	// already carry the injected marker; everything else is identical.
+	socket := config.Webhooks[1]
+	require.Equal(t, "racer-client-socket.racer.unbounded-cloud.io", socket.Name)
+	require.Equal(t, map[string]string{injector.ClientSocketLabel: injector.EnabledValue}, socket.ObjectSelector.MatchLabels)
+	require.Empty(t, socket.ObjectSelector.MatchExpressions)
+	require.Len(t, socket.MatchConditions, 1)
+	require.Equal(t, "not-already-injected", socket.MatchConditions[0].Name)
+	require.Contains(t, socket.MatchConditions[0].Expression, "'"+injector.ClientSocketInjectedAnnotation+"'")
+
+	socket.Name, socket.ObjectSelector, socket.MatchConditions = hook.Name, hook.ObjectSelector, hook.MatchConditions
+	require.Equal(t, hook, socket)
 }
 
 func TestControllerExposesWebhookPort(t *testing.T) {

@@ -93,6 +93,41 @@ pub struct LinkNode {
 
     /// Source of reservation tokens for `initiating`.
     reservations: std::sync::atomic::AtomicU64,
+
+    /// GPU helper and per-GPU landing bytes, when `gpu-read` pages may land
+    /// in GPU memory (GPUDirect RDMA).
+    gpu_landing: Mutex<Option<(Arc<crate::gpu::GpuHelper>, u64)>>,
+
+    /// The GPU landing buffer registered on each rail this round.
+    landings: Mutex<HashMap<u16, Arc<crate::gpu::GpuLanding>>>,
+}
+
+/// Pick at most one GPU per rail for landing, and each GPU for at most one
+/// rail. A rail first takes a free GPU on its NUMA node, then any free GPU.
+/// `rails` and `gpus` give each one's NUMA node, if known. PCI distance is
+/// not used: only NUMA locality is known on both sides.
+pub fn assign_landing(
+    rails: &[(RailId, Option<usize>)],
+    gpus: &[(i32, Option<usize>)],
+) -> Vec<(RailId, i32)> {
+    let mut free: Vec<(i32, Option<usize>)> = gpus.to_vec();
+    let mut assigned = Vec::new();
+    let mut later = Vec::new();
+    for &(rail, numa) in rails {
+        match free
+            .iter()
+            .position(|&(_, node)| numa.is_some() && node == numa)
+        {
+            Some(index) => assigned.push((rail, free.remove(index).0)),
+            None => later.push(rail),
+        }
+    }
+    for rail in later {
+        if !free.is_empty() {
+            assigned.push((rail, free.remove(0).0));
+        }
+    }
+    assigned
 }
 
 /// One setup this node initiated: reserved before the owner answers, then
@@ -150,7 +185,20 @@ impl LinkNode {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// Let `gpu-read` pages land in GPU memory: on each activation, give
+    /// each rail one GPU's landing buffer of `bytes` (see
+    /// [`assign_landing`]). 0 bytes turns landing off.
+    pub fn set_gpu_landing(&self, helper: Arc<crate::gpu::GpuHelper>, bytes: u64) {
+        *Self::lock(&self.gpu_landing) = (bytes != 0).then_some((helper, bytes));
+    }
+
+    /// The GPU landing buffer on `rail` this round, if any.
+    pub fn landing(&self, rail: RailId) -> Option<Arc<crate::gpu::GpuLanding>> {
+        Self::lock(&self.landings).get(&rail.0).cloned()
+    }
+
     fn reset(&self) {
+        Self::lock(&self.landings).clear();
         Self::lock(&self.active).clear();
         self.settled
             .store(false, std::sync::atomic::Ordering::Release);
@@ -343,6 +391,9 @@ impl Links {
             let result = self
                 .activate_inner(publication, admission, registered_bytes, scope)
                 .await;
+            if let Ok(rails) = &result {
+                self.attach_landings(rails, scope).await;
+            }
             match &result {
                 Ok(rails) => self.node.settle(rails.clone()),
                 Err(Error::Cancelled | Error::DeadlineExceeded) => {}
@@ -429,6 +480,62 @@ impl Links {
                 Some(mapping)
             })
             .collect())
+    }
+
+    /// Register GPU landing buffers on the activated `rails`. Failures only
+    /// log: pages then land in host memory as usual.
+    async fn attach_landings(&self, rails: &[RailMapping], scope: &RequestScope) {
+        let Some((helper, bytes)) = LinkNode::lock(&self.node.gpu_landing).clone() else {
+            return;
+        };
+        if bytes < BUFFER_LEN as u64 {
+            eprintln!(
+                "racer-dataplane: stage=gpu-landing state=disabled reason=too-small bytes={bytes}"
+            );
+            return;
+        }
+        let gpus: Vec<(i32, Option<usize>)> = helper
+            .devices()
+            .iter()
+            .filter(|device| helper.decrypts(device.ordinal))
+            .map(|device| (device.ordinal, device.numa_node.map(|n| n as usize)))
+            .collect();
+        let rails: Vec<(RailId, Option<usize>)> =
+            rails.iter().map(|m| (m.rail, m.numa_node)).collect();
+        for (rail, ordinal) in assign_landing(&rails, &gpus) {
+            let landing = match helper.landing(ordinal, bytes, scope).await {
+                Ok(landing) => landing,
+                Err(error) => {
+                    eprintln!(
+                        "racer-dataplane: stage=gpu-landing rail={} ordinal={ordinal} state=failed reason={error}",
+                        rail.0
+                    );
+                    continue;
+                }
+            };
+            let memory = landing.clone() as rdma_verbs::DeviceMemory;
+            match self
+                .wait(self.client.attach_device(rail.0, memory), scope)
+                .await
+            {
+                Ok(slots) => {
+                    eprintln!(
+                        "racer-dataplane: stage=gpu-landing rail={} ordinal={ordinal} state=enabled slots={slots}",
+                        rail.0
+                    );
+                    LinkNode::lock(&self.node.landings).insert(rail.0, landing);
+                }
+                Err(error) => eprintln!(
+                    "racer-dataplane: stage=gpu-landing rail={} ordinal={ordinal} state=failed reason={error}",
+                    rail.0
+                ),
+            }
+        }
+    }
+
+    /// The GPU whose landing buffer is on `rail`, if any.
+    pub fn landing_ordinal(&self, rail: RailId) -> Option<i32> {
+        self.node.landing(rail).map(|landing| landing.ordinal())
     }
 
     /// Close the node: every link breaks and the owner drains. A later
@@ -682,6 +789,52 @@ impl Links {
             rail,
             transfer,
             arrival: granted.arrival,
+            landing: None,
+        })
+    }
+
+    /// Receiver: like [`Self::grant`], but the window is over a slot of the
+    /// GPU landing buffer on `rail`, which must be on GPU `ordinal`. Fails
+    /// with `Unavailable` if it is not, and `Overloaded` if no slot is free;
+    /// the caller then grants host memory.
+    pub async fn grant_landing(
+        &self,
+        peer: &NodeId,
+        rail: RailId,
+        transfer: TransferId,
+        ordinal: i32,
+        scope: &RequestScope,
+    ) -> Result<PendingReceive> {
+        scope.check()?;
+        let landing = self
+            .node
+            .landing(rail)
+            .filter(|landing| landing.ordinal() == ordinal)
+            .ok_or(Error::Unavailable)?;
+        let (epoch, link) = self.ready(peer, rail).ok_or(Error::Unavailable)?;
+        let length = MAX_CIPHERTEXT as u32;
+        let granted = self
+            .wait(
+                self.client.grant_device(
+                    link_key(peer, rail),
+                    epoch,
+                    transfer.0,
+                    length,
+                    scope.deadline.0,
+                ),
+                scope,
+            )
+            .await?;
+        Ok(PendingReceive {
+            metrics: self.metrics.clone(),
+            retry: self.retry.clone(),
+            link,
+            tag: granted.tag,
+            length,
+            rail,
+            transfer,
+            arrival: granted.arrival,
+            landing: Some(landing),
         })
     }
 
@@ -791,9 +944,65 @@ pub struct PendingReceive {
     rail: RailId,
     transfer: TransferId,
     arrival: Op<Arrival>,
+
+    /// The GPU landing buffer the grant is over, for a landing grant.
+    landing: Option<Arc<crate::gpu::GpuLanding>>,
 }
 
 impl PendingReceive {
+    /// True for a grant over a GPU landing slot ([`Links::grant_landing`]).
+    pub fn is_landing(&self) -> bool {
+        self.landing.is_some()
+    }
+
+    /// Check the signed completion against this grant and the envelope.
+    fn check_completion(&self, head: &VerifiedHead, envelope: &PageEnvelope) -> Result<u32> {
+        validate_envelope(envelope)?;
+        let length = envelope.ciphertext_length;
+        if signed_value(head, COMPLETION_HEADER, COMPLETE_LEN)?
+            != completion_value(self.link, self.tag, length, self.transfer)
+            || length > self.length
+        {
+            return Err(Error::Unauthorized);
+        }
+        Ok(length)
+    }
+
+    /// Like [`Self::finish`] for a landing grant: the ciphertext stays in GPU
+    /// memory and comes back as [`crate::gpu::LandedCiphertext`]. The CPU
+    /// never reads it; the GPU checks the tag before writing plaintext.
+    pub async fn finish_landed(
+        self,
+        head: &VerifiedHead,
+        envelope: &PageEnvelope,
+        scope: &RequestScope,
+    ) -> Result<crate::gpu::LandedCiphertext> {
+        scope.check()?;
+        let length = self.check_completion(head, envelope)?;
+        let landing = self.landing.clone().ok_or(Error::Internal)?;
+        let arrival = self
+            .retry
+            .wait(scope, poll_fn(|cx| self.arrival.poll(cx)))
+            .await;
+        let page = match arrival {
+            Ok(Arrival::Device(page)) => page,
+            Ok(Arrival::Released | Arrival::Page(_)) => return Err(Error::Io),
+            Err(error @ Error::Cancelled) => return Err(error),
+            Err(_) => {
+                scope.check()?;
+                return Err(Error::Io);
+            }
+        };
+        if page.len() != length as usize {
+            return Err(Error::InvalidRange);
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.record(crate::telemetry::Event::RdmaPagesReceived, 1);
+            metrics.record(crate::telemetry::Event::RdmaReceivedBytes, length.into());
+            metrics.record(crate::telemetry::Event::RdmaPagesLanded, 1);
+        }
+        crate::gpu::LandedCiphertext::new(&landing, page)
+    }
     /// Base64 value of the signed `GRANT_HEADER` extension.
     pub fn header_value(&self) -> Vec<u8> {
         STANDARD
@@ -834,14 +1043,7 @@ impl PendingReceive {
         scope: &RequestScope,
     ) -> Result<CiphertextPage> {
         scope.check()?;
-        validate_envelope(&envelope)?;
-        let length = envelope.ciphertext_length;
-        if signed_value(head, COMPLETION_HEADER, COMPLETE_LEN)?
-            != completion_value(self.link, self.tag, length, self.transfer)
-            || length > self.length
-        {
-            return Err(Error::Unauthorized);
-        }
+        let length = self.check_completion(head, &envelope)?;
         let reservation = admission.reserve(
             Some(&envelope.page.version.object.cache),
             ResourceClass::Ciphertext,
@@ -853,7 +1055,8 @@ impl PendingReceive {
             .await;
         let page = match arrival {
             Ok(Arrival::Page(page)) => page,
-            Ok(Arrival::Released) => return Err(Error::Io),
+            // A landing grant finishes with `finish_landed`.
+            Ok(Arrival::Released | Arrival::Device(_)) => return Err(Error::Io),
             Err(error @ Error::Cancelled) => return Err(error),
             Err(_) => {
                 scope.check()?;

@@ -310,6 +310,9 @@ pub mod cluster {
             memory_pressure: true,
             pprof_enabled: false,
             enable_rdma,
+            enable_gpu: crate::config::GpuMode::Disabled,
+            gpu_staging_bytes: crate::config::DEFAULT_GPU_STAGING_BYTES,
+            gpu_landing_bytes: crate::config::DEFAULT_GPU_LANDING_BYTES,
             control_endpoint: "https://control.invalid".into(),
             peer_listen: "127.0.0.1:0".parse().unwrap(),
             diagnostics_listen: "127.0.0.1:0".parse().unwrap(),
@@ -489,6 +492,12 @@ pub(crate) struct ReadWorker {
     writer: Rc<StoreWriter>,
     memory: Rc<MemoryCache>,
     cache: racer_control_wire::CacheId,
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+    clock: Rc<SegmentClock>,
+    reactor: Rc<Reactor>,
+    metrics: crate::telemetry::Metrics,
+    /// Keep cached pages and queued disk writes between polls.
+    retain: std::cell::Cell<bool>,
 }
 
 /// Publish a topology-only fixture through the real generic publication authority.
@@ -553,7 +562,7 @@ impl ReadWorker {
         let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
         // Reads use an empty disk index. No slabs need to be opened or written.
         let slabs = Rc::new(page_alloc::Slab::new(
-            origin.root.join("slabs/worker-0-slab-0.dat"),
+            Self::disk_root(&origin).join("slabs/worker-0-slab-0.dat"),
             256 * 1024 * 1024,
             64 * 1024 * 1024,
             crate::model::PAGE_BYTES as usize + crate::store::MAX_HEADER_BYTES + 16,
@@ -566,8 +575,9 @@ impl ReadWorker {
             reactor.clone(),
             availability.clone(),
         ));
+        let clock = Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1));
         let disk = Rc::new(StoreReader::new(
-            Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1)),
+            clock.clone(),
             index.clone(),
             segments,
             slabs,
@@ -578,6 +588,10 @@ impl ReadWorker {
         let (port, engine) =
             crate::security::pair(WorkerId(0), 0, std::num::NonZeroUsize::new(16).unwrap());
         let crypto = Rc::new(CryptoClient::new(port));
+        let metrics = crate::telemetry::Metrics::default();
+        crypto.set_metrics(metrics.clone());
+        let worker_admission = admission.clone();
+        let worker_reactor = reactor.clone();
         let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
         let candidates = Rc::new(CandidatePolicy::new(
             keys.node().clone(),
@@ -593,19 +607,22 @@ impl ReadWorker {
             buffers.clone(),
         );
         let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
-        let fill = Rc::new(Fill::new(FillDependencies {
-            memory: memory.clone(),
-            buffers,
-            disk,
-            writer: writer.clone(),
-            origin: client.clone(),
-            candidates: candidates.clone(),
-            flights: Rc::new(Flights::new(admission.clone(), availability.clone())),
-            crypto: Rc::new(PageCrypto::new(keys, crypto.clone())),
-            credentials: credentials.clone(),
-            admission,
-            metadata_owner: directory.clone(),
-        }));
+        let fill = Rc::new(
+            Fill::new(FillDependencies {
+                memory: memory.clone(),
+                buffers,
+                disk,
+                writer: writer.clone(),
+                origin: client.clone(),
+                candidates: candidates.clone(),
+                flights: Rc::new(Flights::new(admission.clone(), availability.clone())),
+                crypto: Rc::new(PageCrypto::new(keys, crypto.clone())),
+                credentials: credentials.clone(),
+                admission,
+                metadata_owner: directory.clone(),
+            })
+            .with_metrics(metrics.clone()),
+        );
         let metadata = Rc::new(MetadataService::new(
             candidates,
             client,
@@ -640,7 +657,101 @@ impl ReadWorker {
             writer,
             memory,
             cache: cache.id,
+            admission: worker_admission,
+            clock,
+            reactor: worker_reactor,
+            metrics,
+            retain: std::cell::Cell::new(false),
         }
+    }
+
+    /// Keep cached pages and queued disk writes between polls, so a test can
+    /// arrange memory and disk contents across requests.
+    pub fn retain(&self, retain: bool) {
+        self.retain.set(retain);
+    }
+
+    /// This worker's page cache.
+    pub fn memory(&self) -> &Rc<MemoryCache> {
+        &self.memory
+    }
+
+    /// CPU page decryptions started on this worker's crypto engine.
+    pub fn cpu_decrypts(&self) -> u64 {
+        self.metrics
+            .count(crate::telemetry::Event::CryptoDecryptStarted)
+    }
+
+    /// This worker's count of `event`.
+    pub fn metric(&self, event: crate::telemetry::Event) -> u64 {
+        self.metrics.count(event)
+    }
+
+    /// Open this worker's slab so pages can be written to and read from disk.
+    pub fn open_disk(&self) {
+        std::fs::create_dir_all(Self::disk_root(&self.origin).join("slabs")).unwrap();
+        self.writer
+            .configure(self.admission.clone(), self.clock.clone(), 8, 64)
+            .unwrap();
+        let _ = futures::executor::block_on(self.writer.open()).unwrap();
+    }
+
+    /// Write `copy` to disk and wait until it is published.
+    pub fn persist(&self, copy: crate::memory::CiphertextCopy) {
+        use crate::admission::ResourceClass;
+        let id = copy.ciphertext.envelope().page.clone();
+        let dirty = self
+            .admission
+            .reserve(
+                Some(&id.version.object.cache),
+                ResourceClass::DirtyCiphertext,
+                copy.ciphertext.bytes().len(),
+            )
+            .unwrap();
+        self.writer.enqueue(copy, dirty).unwrap();
+        let scope = crate::runtime::RequestScope::new(
+            crate::model::RequestId([1; 16]),
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        let mut progress = self.writer.progress(1, &scope);
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while self.writer.index().lookup(&id).unwrap().is_none() {
+            if progress.as_mut().poll(&mut cx).is_ready() {
+                progress = self.writer.progress(1, &scope);
+            }
+            self.reactor.poll_budgeted(32).unwrap();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "disk write did not finish"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// The published disk location of a page, if any.
+    pub fn disk_location(
+        &self,
+        page: &crate::model::PageId,
+    ) -> Option<crate::store::catalog::RecordLocation> {
+        self.writer
+            .index()
+            .lookup(page)
+            .unwrap()
+            .map(|entry| entry.location)
+    }
+
+    /// The slab file backing this worker's disk.
+    pub fn slab_path(&self) -> std::path::PathBuf {
+        Self::disk_root(&self.origin).join("slabs/worker-0-slab-0.dat")
+    }
+
+    /// The origin's directory by its real path. The slab refuses to open
+    /// through the `/proc` symlink that `root` is.
+    fn disk_root(origin: &AdapterOrigin) -> std::path::PathBuf {
+        std::fs::read_link(&origin.root).unwrap_or_else(|_| origin.root.clone())
     }
 
     /// Whether every command submitted to this worker has completed.
@@ -659,6 +770,9 @@ impl ReadWorker {
         )
         .unwrap();
         self.crypto.poll_budgeted(64).unwrap();
+        if self.retain.get() {
+            return;
+        }
         // Exercise acquisition/authentication, not persistence or cache retention.
         // Delivered leases remain charged even after the cache drops its copy.
         self.writer.discard_unsubmitted();
