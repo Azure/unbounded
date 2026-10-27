@@ -906,11 +906,11 @@ notices:
       - Copyright (c) 2016 Joseph Birr-Pixton <jpixton@gmail.com>
     license:
       - name: Apache License, Version 2.0
-        link: https://docs.rs/crate/rustls/0.23.45/source/LICENSE-APACHE
+        link: https://docs.rs/crate/rustls/0.23.46/source/LICENSE-APACHE
       - name: ISC License
-        link: https://docs.rs/crate/rustls/0.23.45/source/LICENSE-ISC
+        link: https://docs.rs/crate/rustls/0.23.46/source/LICENSE-ISC
       - name: MIT License
-        link: https://docs.rs/crate/rustls/0.23.45/source/LICENSE-MIT
+        link: https://docs.rs/crate/rustls/0.23.46/source/LICENSE-MIT
   - dependency: rustls-pemfile
     ecosystem: cargo
     copyright:
