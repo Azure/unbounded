@@ -805,3 +805,67 @@ fn collect_fetches(ring: &mut IoUring, aborted: &mut usize, cancel_res: &mut Opt
         }
     }
 }
+
+/// Deleting a stale device whose character device someone else holds open,
+/// including through a dup, must not block inside `io_uring_enter`: the
+/// delete returns within the channel timeout, and the id is freed once the
+/// last fd closes.
+#[test]
+fn ublk_unpinned_delete_with_held_dups_does_not_block() {
+    if !enabled() {
+        return;
+    }
+    let dev_dir = Path::new("/dev");
+    let mut control = Control::open(dev_dir).expect("open ublk-control");
+    let info = control
+        .add_dev(&DevSpec {
+            id: None,
+            queues: 1,
+            depth: DEPTH,
+            max_io_bytes: MAX_IO,
+            flags: UBLK_F_CMD_IOCTL_ENCODE | UBLK_F_USER_COPY,
+            cookie: 0x5241_4346,
+        })
+        .expect("ADD_DEV");
+    // The kernel chose this id for the device ADD_DEV just created, so it
+    // cannot name a pre-existing device. The guard deletes only this id.
+    let id = info.dev_id;
+    let mut guard = Guard {
+        control,
+        id: Some(id),
+    };
+    let char_path = dev_dir.join(format!("ublkc{id}"));
+    assert!(
+        wait_for(&char_path),
+        "{} did not appear",
+        char_path.display()
+    );
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&char_path)
+        .expect("open char device");
+    let dup = file.try_clone().expect("dup char device");
+    let started = Instant::now();
+    guard.id = None;
+    guard
+        .control
+        .del_dev_unpinned(id)
+        .expect("delete while another holder has the device open");
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "delete blocked on the held character device"
+    );
+    assert!(!guard.control.is_poisoned());
+    drop(file);
+    drop(dup);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match guard.control.get_dev_info(id) {
+            Err(err) if err.errno() == Some(libc::ENODEV) => break,
+            _ => {}
+        }
+        assert!(Instant::now() < deadline, "device {id} was not freed");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
