@@ -1,5 +1,6 @@
-//! Root-only end-to-end test of the ublk kernel interface, without the
-//! reactor. Runs only as root with `/dev/ublk-control` present and
+//! Root-only end-to-end tests of ublk: the raw kernel interface on a plain
+//! io_uring, and the manager and workers serving devices through the
+//! reactor. They run only as root with `/dev/ublk-control` present and
 //! `RACER_UBLK_TEST=1`.
 
 use std::fs::{File, OpenOptions};
@@ -569,4 +570,104 @@ fn ublk_device_serves_the_directory_read_path() {
         "{} still present",
         block_path.display()
     );
+}
+
+/// STOP_DEV on a device that was never started completes every pending
+/// FETCH with `UBLK_IO_RES_ABORT`, and ASYNC_CANCEL cannot cancel one.
+/// The manager relies on both: it stops never-started devices so their
+/// queues finish, rather than relying on the reactor's cancel.
+#[test]
+fn ublk_stop_before_start_aborts_fetches() {
+    if !enabled() {
+        return;
+    }
+    let dev_dir = Path::new("/dev");
+    let mut control = Control::open(dev_dir).expect("open ublk-control");
+    let info = control
+        .add_dev(&DevSpec {
+            id: None,
+            queues: 1,
+            depth: DEPTH,
+            max_io_bytes: MAX_IO,
+            flags: UBLK_F_CMD_IOCTL_ENCODE | UBLK_F_USER_COPY,
+            cookie: 0x5241_4346,
+        })
+        .expect("ADD_DEV");
+    let id = info.dev_id;
+    assert_ne!(id, 0, "the test must never touch device 0");
+    let mut guard = Guard {
+        control,
+        id: Some(id),
+    };
+    guard
+        .control
+        .set_params(
+            id,
+            &Params::read_only_basic(OBJECT_LEN.div_ceil(512) * 512, MAX_IO),
+        )
+        .expect("SET_PARAMS");
+    let char_path = dev_dir.join(format!("ublkc{id}"));
+    assert!(
+        wait_for(&char_path),
+        "{} did not appear",
+        char_path.display()
+    );
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&char_path)
+        .expect("open char device");
+    let _descs = IoDescriptors::map(file.as_fd(), 0, DEPTH).expect("map descriptors");
+    let mut ring = IoUring::new(u32::from(DEPTH) * 2).expect("ring");
+    let fd = types::Fd(std::os::fd::AsRawFd::as_raw_fd(&file));
+    for tag in 0..DEPTH {
+        let entry = opcode::UringCmd16::new(fd, U_IO_FETCH_REQ)
+            .cmd(io_cmd_bytes(0, tag, -1))
+            .build()
+            .user_data(u64::from(tag));
+        // SAFETY: the command carries no pointers.
+        unsafe { ring.submission().push(&entry) }.expect("sq room");
+    }
+    ring.submit().expect("submit fetches");
+    let cancel = opcode::AsyncCancel::new(0).build().user_data(1000);
+    // SAFETY: ASYNC_CANCEL carries no pointers.
+    unsafe { ring.submission().push(&cancel) }.expect("sq room");
+    ring.submit_and_wait(1).expect("cancel");
+    let mut aborted = 0;
+    let mut cancel_res = None;
+    collect_fetches(&mut ring, &mut aborted, &mut cancel_res);
+    assert_eq!(
+        cancel_res,
+        Some(-libc::ENOENT),
+        "a pending FETCH is not cancelable"
+    );
+    assert_eq!(aborted, 0, "no FETCH completes before STOP_DEV");
+    guard
+        .control
+        .stop_dev(id)
+        .expect("STOP_DEV before START_DEV");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while aborted < usize::from(DEPTH) {
+        assert!(
+            Instant::now() < deadline,
+            "STOP_DEV left FETCH commands pending"
+        );
+        let ts = types::Timespec::from(Duration::from_millis(100));
+        let args = types::SubmitArgs::new().timespec(&ts);
+        let _ = ring.submitter().submit_with_args(1, &args);
+        collect_fetches(&mut ring, &mut aborted, &mut cancel_res);
+    }
+    guard.id = None;
+    guard.control.del_dev(id).expect("DEL_DEV");
+}
+
+fn collect_fetches(ring: &mut IoUring, aborted: &mut usize, cancel_res: &mut Option<i32>) {
+    for cqe in ring.completion() {
+        if cqe.user_data() == 1000 {
+            *cancel_res = Some(cqe.result());
+        } else {
+            assert_eq!(cqe.result(), UBLK_IO_RES_ABORT, "tag {}", cqe.user_data());
+            *aborted += 1;
+        }
+    }
 }
