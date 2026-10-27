@@ -29,7 +29,18 @@ func TestWebhookInstalledWithExpectedShape(t *testing.T) {
 	marker := &corev1.ConfigMap{}
 	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, markerName), marker))
 	require.NoError(t, validateRuntimeOwner(webhook, marker.UID))
-	require.Len(t, webhook.Webhooks, 1)
+	require.Len(t, webhook.Webhooks, 2)
+
+	// The client-socket webhook differs only in its label and match condition.
+	socketHook := webhook.Webhooks[1]
+	require.Equal(t, "racer-client-socket.racer.unbounded-cloud.io", socketHook.Name)
+	require.Equal(t, &metav1.LabelSelector{MatchLabels: map[string]string{"racer.unbounded-cloud.io/client-socket": "enabled"}}, socketHook.ObjectSelector)
+	require.Len(t, socketHook.MatchConditions, 1)
+	require.Contains(t, socketHook.MatchConditions[0].Expression, "racer.unbounded-cloud.io/client-socket-injected")
+	require.Equal(t, webhook.Webhooks[0].ClientConfig, socketHook.ClientConfig)
+	require.Equal(t, webhook.Webhooks[0].Rules, socketHook.Rules)
+	require.Equal(t, webhook.Webhooks[0].NamespaceSelector, socketHook.NamespaceSelector)
+	require.Equal(t, ptr.To(admissionv1.Fail), socketHook.FailurePolicy)
 
 	hook := webhook.Webhooks[0]
 	require.Equal(t, []admissionv1.RuleWithOperations{{

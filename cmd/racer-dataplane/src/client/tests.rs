@@ -1095,6 +1095,7 @@ impl Fixture {
                     &scope,
                     &mut observation,
                     Duration::from_secs(5),
+                    None,
                 )
                 .await?;
                 Ok(())
@@ -1853,8 +1854,15 @@ fn client_disconnect_cancels_pending_metadata_before_acquisition_deadline() {
     assert_eq!(scope.check(), Ok(()));
     fixture.wait_for_origin(RequestKind::Head, 1);
     drop(socket);
-    for _ in 0..64 {
+    // The hangup completion can arrive late on a loaded host: pump until it
+    // is observed and the connection is gone, well inside the acquisition
+    // deadline.
+    let wait = Instant::now() + Duration::from_secs(1);
+    while (!scope.cancellation.is_cancelled() || fixture.listeners.active_connections() != 0)
+        && Instant::now() < wait
+    {
         fixture.pump(16);
+        std::thread::yield_now();
     }
     assert!(scope.cancellation.is_cancelled());
     assert!(Instant::now() < scope.deadline.0);
@@ -4073,3 +4081,4 @@ fn handoff_acceptor_drains_backlog_and_wakes_only_while_one_remains() {
     }
     assert_eq!(worker.listeners.active_connections_for(&definition().id), 3);
 }
+mod direct;

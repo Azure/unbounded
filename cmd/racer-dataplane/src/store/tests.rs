@@ -3515,7 +3515,7 @@ mod records {
                     generation,
                     alignment,
                     1,
-                    buffer(&admission, alignment, 1024),
+                    buffer(&admission, alignment, 8192),
                 )
                 .err();
                 assert_eq!(actual, Some(Error::CorruptRecord));
@@ -3540,7 +3540,7 @@ mod records {
                 &page,
                 Generation(7),
                 alignment,
-                buffer(&admission, alignment, 1024),
+                buffer(&admission, alignment, 8192),
             )
             .unwrap();
             assert_eq!(
@@ -3562,7 +3562,7 @@ mod records {
                     Generation(0),
                     alignment,
                     1,
-                    buffer(&admission, alignment, 1024)
+                    buffer(&admission, alignment, 8192)
                 )
                 .err(),
                 Some(Error::CorruptRecord)
@@ -3693,10 +3693,11 @@ mod records {
         let admission = admission();
         let page = page(&admission, 3, 0, "cache", "v1");
         let alignment = Alignment::new(512, 512, 512).unwrap();
-        let encoded = encode(
+        let encoded = crate::store::encode_unit_aligned_at(
             &page,
             Generation(7),
             alignment,
+            0,
             buffer(&admission, alignment, 1024),
         )
         .unwrap();
@@ -3722,7 +3723,7 @@ mod records {
             &page,
             Generation(7),
             alignment,
-            buffer(&admission, alignment, 1024),
+            buffer(&admission, alignment, 8192),
         )
         .unwrap();
         let parsed = parse(&encoded.buffer, encoded.header.extent).unwrap();
@@ -3751,7 +3752,7 @@ mod records {
             &page,
             Generation(7),
             alignment,
-            buffer(&admission, alignment, 1024),
+            buffer(&admission, alignment, 8192),
         )
         .unwrap();
         let original = encoded.buffer.bytes().unwrap();
@@ -3799,19 +3800,20 @@ mod records {
         ));
     }
 
-    /// Encode `page(3, 0, "cache", etag)` at 512-byte alignment.
+    /// Encode `page(3, 0, "cache", etag)` with a 512-byte record unit, the
+    /// densest layout readers accept.
     fn encoded_v2(
         admission: &flow_control::Quotas<AdmissionPolicy>,
         etag: &str,
     ) -> (Vec<u8>, Extent) {
         let page = page(admission, 3, 0, "cache", etag);
         let alignment = Alignment::new(512, 512, 512).unwrap();
-        let length = record_length(&page, alignment).unwrap();
-        let encoded = encode(
+        let encoded = crate::store::encode_unit_aligned_at(
             &page,
             Generation(7),
             alignment,
-            buffer(admission, alignment, length),
+            0,
+            buffer(admission, alignment, 1024),
         )
         .unwrap();
         (
@@ -3833,11 +3835,13 @@ mod records {
                     page.metadata.content_type = content_type
                         .map(|v| crate::model::ContentType::parse(v.as_bytes()).unwrap());
                     let extra = content_type.map_or(0, str::len);
+                    // The record unit has a 4 KiB floor for direct reads.
+                    let record_unit = unit.max(crate::store::CIPHERTEXT_ALIGNMENT);
                     let block = header_block_len(&page, alignment).unwrap();
-                    assert_eq!(block, (real + extra).next_multiple_of(unit));
-                    assert_eq!(body_len(&page, alignment).unwrap(), unit);
+                    assert_eq!(block, (real + extra).next_multiple_of(record_unit));
+                    assert_eq!(body_len(&page, alignment).unwrap(), record_unit);
                     let record = record_length(&page, alignment).unwrap();
-                    assert_eq!(record, block + unit);
+                    assert_eq!(record, block + record_unit);
                     let mut staging = buffer(&admission, alignment, record);
                     staging.bytes_mut().unwrap().fill(0xa5);
                     let encoded =
@@ -3939,6 +3943,43 @@ mod records {
             parse_bytes(&bytes, extent).err(),
             Some(Error::CorruptRecord)
         );
+        admission.reclaim_buffers();
+    }
+
+    #[test]
+    fn prefix_parse_and_direct_range_cover_new_and_unit_aligned_records() {
+        let admission = admission();
+        for unit in [512, 4096] {
+            let alignment = Alignment::new(unit, unit as u64, unit).unwrap();
+            let page = page(&admission, 3, 0, "cache", "v1");
+            let length = record_length(&page, alignment).unwrap();
+            let encoded = encode(
+                &page,
+                Generation(7),
+                alignment,
+                buffer(&admission, alignment, length),
+            )
+            .unwrap();
+            let bytes = encoded.buffer.bytes().unwrap();
+            let extent = encoded.header.extent;
+            let full = parse_bytes(bytes, extent).unwrap();
+            let block = header_block_len(&page, alignment).unwrap();
+            let prefix = parse_prefix(&bytes[..block], extent).unwrap();
+            assert_eq!(prefix.ciphertext, full.ciphertext);
+            assert_eq!(prefix.header.metadata, full.header.metadata);
+            assert!(parse_prefix(&bytes[..block - 1], extent).is_err());
+            let mut long = bytes.to_vec();
+            long.push(0);
+            assert!(parse_prefix(&long, extent).is_err());
+            // The 4 KiB record unit floor makes every new record eligible.
+            assert_eq!(full.direct_range(), Some(4096..4096 + 19));
+        }
+        // Records written with a 512-byte header block still parse, but must
+        // be read through host memory.
+        let (bytes, extent) = encoded_v2(&admission, "v1");
+        let old = parse_bytes(&bytes, extent).unwrap();
+        assert_eq!(old.ciphertext, 512..512 + 19);
+        assert_eq!(old.direct_range(), None);
         admission.reclaim_buffers();
     }
 

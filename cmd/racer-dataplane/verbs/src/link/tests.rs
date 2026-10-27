@@ -142,7 +142,7 @@ fn poll<T>(op: &Op<T>) -> Option<Result<T>> {
 fn grant(side: &mut Side, length: u32, deadline: Instant, now: Instant) -> Op<Granted> {
     let (granted, done) = op();
     side.link
-        .grant(&side.pool, [7; 16], length, deadline, done, now);
+        .grant(&side.pool, false, [7; 16], length, deadline, done, now);
     granted
 }
 
@@ -182,7 +182,7 @@ fn transfer(p: &mut Pair, to_a: bool, bytes: &[u8]) -> RegisteredPage {
     assert_eq!(poll(&written), Some(Ok(())));
     match poll(&arrival).unwrap().unwrap() {
         Arrival::Page(page) => page,
-        Arrival::Released => panic!("expected a page"),
+        Arrival::Released | Arrival::Device(_) => panic!("expected a page"),
     }
 }
 
@@ -1017,7 +1017,7 @@ fn direct_write_reads_in_place_and_holds_the_source_until_completion() {
     assert_eq!(Arc::strong_count(&source), 1, "released on completion");
     match poll(&arrival).unwrap().unwrap() {
         Arrival::Page(page) => assert_eq!(page.bytes(), &source[..]),
-        Arrival::Released => panic!("expected a page"),
+        Arrival::Released | Arrival::Device(_) => panic!("expected a page"),
     }
     finish(p);
 }
@@ -1047,7 +1047,7 @@ fn direct_writes_accept_boxed_and_static_sources() {
         assert_eq!(Arc::strong_count(&source), 1, "released on completion");
         match poll(&arrival).unwrap().unwrap() {
             Arrival::Page(page) => assert_eq!(page.bytes(), &expected[..]),
-            Arrival::Released => panic!("expected a page"),
+            Arrival::Released | Arrival::Device(_) => panic!("expected a page"),
         }
     }
     finish(p);

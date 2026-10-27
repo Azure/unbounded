@@ -513,15 +513,25 @@ impl<C: Charge> Slab<C> {
         buffer: &AlignedBuffer<C>,
         lease: &SegmentLease,
     ) -> Result<(Rc<Descriptor>, Extent)> {
-        self.locate(extent, lease, |alignment, extent| {
+        self.locate_checked(extent, lease, |alignment, extent| {
             alignment.check(extent, buffer)
         })
+    }
+
+    /// Translate a leased logical extent to the worker-local descriptor and the
+    /// physical byte range on it, without submitting I/O or checking a buffer.
+    /// File backings return the logical extent unchanged; device backings add
+    /// the segment's placement offset. Callers that bypass io_uring (for
+    /// example cuFile) must keep the lease alive for the whole transfer, as
+    /// the leased generation is what keeps the bytes from being recycled.
+    pub fn locate(&self, extent: Extent, lease: &SegmentLease) -> Result<(Rc<Descriptor>, Extent)> {
+        self.locate_checked(extent, lease, |_, _| Ok(()))
     }
 
     /// Validate a request's lease and extent, resolving its physical destination.
     /// `check` validates the transfer memory against both the logical and the
     /// physical extent with the slab's alignment.
-    fn locate(
+    fn locate_checked(
         &self,
         extent: Extent,
         lease: &SegmentLease,
@@ -676,7 +686,7 @@ impl<C: Charge> Slab<C> {
             let (file, extent) = {
                 let body = body.write_bytes()?;
                 let header = header.as_slice();
-                self.locate(extent, &lease, |alignment, extent| {
+                self.locate_checked(extent, &lease, |alignment, extent| {
                     check_vectored(alignment, extent, header, body)
                 })?
             };
@@ -1507,11 +1517,24 @@ mod tests {
         .unwrap();
         let segments = Segments::new(4096);
         let _ = slab.open_configured(&segments).unwrap();
-        drop(segments.append(4096).unwrap());
+        let (first, first_extent) = segments.append(4096).unwrap();
         let (lease, extent) = segments.append(4096).unwrap();
         let buffer = slab.allocate(4096, ()).unwrap();
         let (_, physical) = slab.submission(extent, &buffer, &lease).unwrap();
         assert_eq!(physical, Extent::new(0, 4096).unwrap());
+        // locate performs the same translation without a buffer.
+        let (descriptor, located) = slab.locate(extent, &lease).unwrap();
+        assert_eq!(located, physical);
+        assert!(std::os::fd::AsRawFd::as_raw_fd(descriptor.as_ref()) >= 0);
+        assert_eq!(
+            slab.locate(first_extent, &first).unwrap().1,
+            Extent::new(8192, 4096).unwrap()
+        );
+        drop(first);
+        assert!(matches!(
+            slab.locate(Extent::new(8192, 4096).unwrap(), &lease),
+            Err(Error::Corrupt)
+        ));
         assert!(matches!(
             slab.submission(Extent::new(0, 4096).unwrap(), &buffer, &lease),
             Err(Error::Corrupt)
@@ -1546,6 +1569,13 @@ mod tests {
             };
             placements[1].offset = offset;
             drop(opened);
+            // Translation itself does not enforce buffer alignment.
+            if offset == 1 {
+                assert_eq!(
+                    slab.locate(extent, &lease).unwrap().1,
+                    Extent::new(1, 4096).unwrap()
+                );
+            }
             assert!(
                 matches!(slab.submission(extent, &buffer, &lease), Err(error) if error == expected)
             );

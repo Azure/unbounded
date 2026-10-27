@@ -31,6 +31,31 @@ const (
 	PodNetworkDaemonSetName = "racer-dataplane-podnet"
 )
 
+// NVIDIAInjection selects how the dataplane asks the container runtime for
+// the host NVIDIA driver libraries. No mode requests nvidia.com/gpu.
+type NVIDIAInjection string
+
+const (
+	// NVIDIAOff adds nothing.
+	NVIDIAOff NVIDIAInjection = "off"
+	// NVIDIAEnv sets NVIDIA_VISIBLE_DEVICES and NVIDIA_DRIVER_CAPABILITIES.
+	// The NVIDIA container runtime acts on them; runc ignores them, so they
+	// are harmless on nodes without NVIDIA.
+	NVIDIAEnv NVIDIAInjection = "env"
+	// NVIDIACDI also adds the CDI pod annotation. containerd fails container
+	// creation when a CDI device cannot be resolved, so use this only when
+	// every dataplane node has an NVIDIA CDI spec.
+	NVIDIACDI NVIDIAInjection = "cdi"
+)
+
+const (
+	// CDIAnnotation requests the NVIDIA CDI device on the dataplane Pod.
+	// containerd treats every key with the cdi.k8s.io/ prefix as a CDI request.
+	CDIAnnotation = "cdi.k8s.io/racer-dataplane"
+	// CDIAllGPUs is the fully qualified CDI name for every GPU on the node.
+	CDIAllGPUs = "nvidia.com/gpu=all"
+)
+
 // ManagedNames contains only the explicitly configured workload.
 func ManagedNames(daemonSetName string) []string {
 	return []string{daemonSetName}
@@ -52,6 +77,8 @@ type Config struct {
 	DiagnosticsPort         uint16
 	DataplaneServiceAccount string
 	DaemonSetName           string
+	// Empty selects NVIDIAEnv.
+	NVIDIA NVIDIAInjection
 }
 
 // ConfigFromLookup reads operator deployment wiring without loading or
@@ -73,6 +100,15 @@ func ConfigFromLookup(lookup func(string) (string, bool)) (Config, error) {
 	hostNetwork := env("RACER_HOST_NETWORK", "false")
 	if hostNetwork != "true" && hostNetwork != "false" {
 		return Config{}, fmt.Errorf("RACER_HOST_NETWORK must be true or false: %w", wire.InvalidRequest)
+	}
+
+	// Unset keeps the zero value, which selects NVIDIAEnv.
+	var nvidia NVIDIAInjection
+	if value, ok := lookup("RACER_DATAPLANE_NVIDIA"); ok {
+		nvidia = NVIDIAInjection(value)
+		if nvidia != NVIDIAOff && nvidia != NVIDIAEnv && nvidia != NVIDIACDI {
+			return Config{}, fmt.Errorf("RACER_DATAPLANE_NVIDIA must be off, env, or cdi: %w", wire.InvalidRequest)
+		}
 	}
 
 	var diagnosticsPort uint64
@@ -102,6 +138,7 @@ func ConfigFromLookup(lookup func(string) (string, bool)) (Config, error) {
 		DiagnosticsPort:         uint16(diagnosticsPort),
 		DataplaneServiceAccount: env("RACER_DATAPLANE_SERVICE_ACCOUNT", "racer-dataplane"),
 		DaemonSetName:           env("RACER_DAEMONSET_NAME", "racer-dataplane"),
+		NVIDIA:                  nvidia,
 	}
 
 	return cfg, cfg.Validate()
@@ -116,7 +153,19 @@ func (c Config) Validate() error {
 		return err
 	}
 
+	if mode := c.nvidiaMode(); mode != NVIDIAOff && mode != NVIDIAEnv && mode != NVIDIACDI {
+		return fmt.Errorf("NVIDIA injection must be off, env, or cdi: %w", wire.InvalidRequest)
+	}
+
 	return c.validateEndpoint()
+}
+
+func (c Config) nvidiaMode() NVIDIAInjection {
+	if c.NVIDIA == "" {
+		return NVIDIAEnv
+	}
+
+	return c.NVIDIA
 }
 
 func (c Config) validateNetworkNodes() error {
@@ -186,6 +235,11 @@ func buildDaemonSet(c Config) *appsv1.DaemonSet {
 	// Use workload identity, not the manager's identity, for the Pod selector.
 	labels := map[string]string{"app.kubernetes.io/name": "racer-dataplane", "app.kubernetes.io/instance": c.DaemonSetName}
 
+	var annotations map[string]string
+	if c.nvidiaMode() == NVIDIACDI {
+		annotations = map[string]string{CDIAnnotation: CDIAllGPUs}
+	}
+
 	return &appsv1.DaemonSet{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"},
 		ObjectMeta: metav1.ObjectMeta{Name: c.DaemonSetName, Namespace: c.Namespace, Labels: labels},
@@ -200,7 +254,7 @@ func buildDaemonSet(c Config) *appsv1.DaemonSet {
 			},
 			// Require sustained readiness across probe periods before advancing a rollout.
 			MinReadySeconds: 10,
-			Template:        corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: labels}, Spec: dataplanePod(c)},
+			Template:        corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: labels, Annotations: annotations}, Spec: dataplanePod(c)},
 		},
 	}
 }
@@ -310,11 +364,32 @@ func dataplaneVolumes(c Config) []corev1.Volume {
 		volumes = append(volumes, corev1.Volume{Name: mount.name, VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: mount.path, Type: ptr.To(corev1.HostPathDirectoryOrCreate)}}})
 	}
 
+	// cuFile reads the filesystem type of each slab device from the udev
+	// database and refuses files it cannot classify.
+	if c.nvidiaMode() != NVIDIAOff {
+		volumes = append(volumes, corev1.Volume{Name: "udev", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/run/udev", Type: ptr.To(corev1.HostPathDirectoryOrCreate)}}})
+	}
+
 	return volumes
 }
 
 func dataplaneContainer(c Config) corev1.Container {
 	diagnosticsPort := diagnosticsPort(c)
+
+	mounts := []corev1.VolumeMount{
+		{Name: "token", MountPath: "/var/run/racer-token", ReadOnly: true},
+		{Name: "bootstrap", MountPath: "/etc/racer/bootstrap", ReadOnly: true},
+		{Name: "identity", MountPath: "/var/lib/racer/identity"},
+		{Name: "slabs", MountPath: "/var/lib/racer/slabs"},
+		{Name: "sockets", MountPath: "/run/racer"},
+		// Protect directory entries, not device I/O or the host
+		// from this privileged container.
+		{Name: "infiniband", MountPath: "/dev/infiniband", ReadOnly: true},
+		{Name: "devices", MountPath: "/host/dev", ReadOnly: true},
+	}
+	if c.nvidiaMode() != NVIDIAOff {
+		mounts = append(mounts, corev1.VolumeMount{Name: "udev", MountPath: "/run/udev", ReadOnly: true})
+	}
 
 	return corev1.Container{
 		Name:                     "dataplane",
@@ -341,22 +416,12 @@ func dataplaneContainer(c Config) corev1.Container {
 			// implies escalation and all capabilities; do not claim otherwise.
 			Privileged: ptr.To(true), AllowPrivilegeEscalation: ptr.To(true), ReadOnlyRootFilesystem: ptr.To(true),
 		},
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: "token", MountPath: "/var/run/racer-token", ReadOnly: true},
-			{Name: "bootstrap", MountPath: "/etc/racer/bootstrap", ReadOnly: true},
-			{Name: "identity", MountPath: "/var/lib/racer/identity"},
-			{Name: "slabs", MountPath: "/var/lib/racer/slabs"},
-			{Name: "sockets", MountPath: "/run/racer"},
-			// Protect directory entries, not device I/O or the host
-			// from this privileged container.
-			{Name: "infiniband", MountPath: "/dev/infiniband", ReadOnly: true},
-			{Name: "devices", MountPath: "/host/dev", ReadOnly: true},
-		},
+		VolumeMounts: mounts,
 	}
 }
 
 func dataplaneEnvironment(c Config, diagnosticsPort int32) []corev1.EnvVar {
-	return []corev1.EnvVar{
+	env := []corev1.EnvVar{
 		{
 			Name:  "RACER_CLUSTER_ID",
 			Value: string(c.Cluster),
@@ -407,6 +472,17 @@ func dataplaneEnvironment(c Config, diagnosticsPort int32) []corev1.EnvVar {
 			Value: "/host/dev",
 		},
 	}
+
+	// Ask the NVIDIA runtime for driver libraries only. The privileged
+	// container already sees /dev/nvidia*; no GPU resource is requested.
+	if c.nvidiaMode() != NVIDIAOff {
+		env = append(env,
+			corev1.EnvVar{Name: "NVIDIA_VISIBLE_DEVICES", Value: "all"},
+			corev1.EnvVar{Name: "NVIDIA_DRIVER_CAPABILITIES", Value: "compute,utility"},
+		)
+	}
+
+	return env
 }
 
 // DesiredDaemonSets builds steady-state placement, not a safe migration plan.

@@ -31,6 +31,11 @@ data:
   # Discovery and authentication of the operator-managed dataplane workload.
   RACER_DATAPLANE_SERVICE_ACCOUNT: "racer-dataplane"
   RACER_DAEMONSET_NAME: "racer-dataplane"
+  # NVIDIA driver libraries for the dataplane: off, env (default), or cdi.
+  # env sets NVIDIA_VISIBLE_DEVICES=all and NVIDIA_DRIVER_CAPABILITIES=compute,utility.
+  # cdi also adds the Pod annotation cdi.k8s.io/racer-dataplane: nvidia.com/gpu=all;
+  # containerd then fails the Pod on any node without an NVIDIA CDI spec.
+  # RACER_DATAPLANE_NVIDIA: "env"
   RACER_CREDENTIALS_SECRET_NAME: {{ .CredentialsSecretName | default "racer-credentials" | quote }}
   RACER_VERSION_CONFIGMAP_NAME: {{ .VersionConfigMapName | default "racer-version" | quote }}
   RACER_INSTALLATION_CONFIGMAP_NAME: {{ .InstallationConfigMapName | default "racer-installation" | quote }}

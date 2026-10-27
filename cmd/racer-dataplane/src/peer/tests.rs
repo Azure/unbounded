@@ -351,6 +351,7 @@ mod body_progress {
                 None,
                 Rc::new(Cell::new(false)),
                 Some(&mut timing),
+                None,
                 &scope,
             );
             let result = loop {
@@ -1309,6 +1310,7 @@ mod encrypted_http {
                         None,
                         Rc::new(Cell::new(false)),
                         None,
+                        None,
                         turn,
                     )
                     .await;
@@ -1708,6 +1710,7 @@ mod requester_safety {
                     matches!(response.response, PeerResponse::Overloaded),
                     case == "overloaded"
                 ),
+                RelayResponse::Landed(_) => panic!("nothing asked for landing"),
             }
         }
         assert_eq!(metrics.count(Event::PeerProbe), u64::from(case != "direct"));

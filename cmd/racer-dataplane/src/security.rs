@@ -317,6 +317,22 @@ impl PageCrypto {
         self.buffers = Some(buffers);
         self
     }
+    /// Derive the AES-256-GCM key and nonce that XAES-256-GCM uses for this
+    /// page, so a GPU can authenticate and decrypt it. Checks the cache, key ID
+    /// and purpose exactly as [`Self::decrypt`] does. The derived key is valid
+    /// for this one page nonce and is wiped on drop. Three AES blocks, so it
+    /// runs on the I/O thread rather than queueing on the crypto worker.
+    pub(crate) fn derive_page_key(
+        &self,
+        envelope: &PageEnvelope,
+    ) -> Result<racer_crypto::DerivedPageKey> {
+        let cache = &envelope.page.version.object.cache;
+        let key = self
+            .keys
+            .lease(Some(cache), envelope.key_id, KeyPurpose::Page)?;
+        key.derive_page_subkey(cache, envelope.key_id, &envelope.nonce.0)
+            .map_err(|_| Error::MissingKey)
+    }
     /// Authenticate the entire page before constructing a publishable lease.
     /// Futures stay on I/O, even though inputs/completions are Send:
     /// ```compile_fail

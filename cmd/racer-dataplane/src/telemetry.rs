@@ -3310,6 +3310,7 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::RdmaSentBytes => "racer_rdma_sent_bytes_total",
             Self::RdmaPagesReceived => "racer_rdma_pages_received_total",
             Self::RdmaReceivedBytes => "racer_rdma_received_bytes_total",
+            Self::RdmaPagesLanded => "racer_rdma_pages_landed_total",
             Self::RdmaHttpFallback => "racer_rdma_http_fallback_total",
             Self::RdmaGrantCount => "racer_rdma_grant_nanoseconds_count",
             Self::RdmaGrantNs => "racer_rdma_grant_nanoseconds_sum",
@@ -3348,6 +3349,8 @@ metrics! { Event, EVENTS, EVENT_COUNT;
             Self::FillChecksumCount => "racer_fill_checksum_nanoseconds_count",
             Self::FillChecksumNs => "racer_fill_checksum_nanoseconds_sum",
             Self::DiagnosticHardware => "racer_diagnostic_hardware_total",
+            Self::GpuDirectDiskRead => "racer_gpu_direct_disk_reads_total",
+            Self::GpuDirectDiskReadBytes => "racer_gpu_direct_disk_read_bytes_total",
 }
 metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::WarmTrackedJobs => "racer_warm_tracked_jobs",
