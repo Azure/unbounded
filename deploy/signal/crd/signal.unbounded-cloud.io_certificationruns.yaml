@@ -262,6 +262,12 @@ spec:
                 type: boolean
               scriptBundle:
                 properties:
+                  digest:
+                    description: |-
+                      Digest is the aggregate algorithm-qualified SHA-256 digest derived from
+                      the selected script bytes in check order.
+                    pattern: ^sha256:[0-9a-f]{64}$
+                    type: string
                   name:
                     minLength: 1
                     type: string
@@ -272,6 +278,7 @@ spec:
                       intent and helps make sure that UIDs and names do not get conflated.
                     type: string
                 required:
+                - digest
                 - name
                 - uid
                 type: object

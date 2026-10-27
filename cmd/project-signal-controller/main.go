@@ -54,7 +54,7 @@ func main() {
 	}
 
 	cmd.Flags().StringVar(&cfg.namespace, "namespace", "project-signal", "Namespace for CertificationRuns and Workflows")
-	cmd.Flags().StringVar(&cfg.scriptNamespace, "script-namespace", "project-signal", "Namespace containing mutable source script ConfigMaps")
+	cmd.Flags().StringVar(&cfg.scriptNamespace, "script-namespace", "project-signal", "Namespace containing immutable source script ConfigMaps")
 	cmd.Flags().StringVar(&cfg.runnerImage, "runner-image", "", "Digest-pinned certification runner image")
 	cmd.Flags().StringVar(&cfg.metricsAddress, "metrics-bind-address", ":8080", "Address for metrics")
 	cmd.Flags().StringVar(&cfg.probeAddress, "health-probe-bind-address", ":8081", "Address for health probes")

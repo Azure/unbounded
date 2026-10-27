@@ -184,6 +184,11 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 		}
 	}
 
+	sourceScripts, err := r.loadScriptBundle(ctx, profile.Spec.ScriptBundle, checks)
+	if err != nil {
+		return err
+	}
+
 	participants, err := r.selectParticipants(ctx, node, &profile, checks)
 	if err != nil {
 		return err
@@ -265,7 +270,7 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 		}
 	}()
 
-	snapshot, checkSnapshots, err := r.createSnapshot(ctx, runName, profile.Spec.ScriptConfigMap, checks)
+	snapshot, checkSnapshots, err := r.createSnapshot(ctx, runName, sourceScripts, checks)
 	if err != nil {
 		return err
 	}
@@ -293,8 +298,9 @@ func (r *AdmissionReconciler) admitNode(ctx context.Context, node *corev1.Node, 
 			},
 			Participants: participants,
 			ScriptBundle: signalv1.ScriptBundleReference{
-				Name: snapshot.Name,
-				UID:  snapshot.UID,
+				Name:   snapshot.Name,
+				UID:    snapshot.UID,
+				Digest: profile.Spec.ScriptBundle.Digest,
 			},
 			Checks: checkSnapshots,
 		},
@@ -720,10 +726,54 @@ func (r *AdmissionReconciler) releaseParticipants(ctx context.Context, participa
 	return errors.Join(errs...)
 }
 
+func (r *AdmissionReconciler) loadScriptBundle(
+	ctx context.Context,
+	scriptBundle signalv1.ScriptBundleSource,
+	checks []signalv1.CertificationCheck,
+) (*corev1.ConfigMap, error) {
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
+	var source corev1.ConfigMap
+	if err := reader.Get(
+		ctx,
+		client.ObjectKey{Namespace: r.ScriptNamespace, Name: scriptBundle.Name},
+		&source,
+	); err != nil {
+		return nil, fmt.Errorf("get source script ConfigMap: %w", err)
+	}
+
+	if source.Immutable == nil || !*source.Immutable {
+		return nil, fmt.Errorf("source script ConfigMap %s must be immutable", source.Name)
+	}
+
+	if len(source.BinaryData) != 0 {
+		return nil, fmt.Errorf("source script ConfigMap %s must not contain binaryData", source.Name)
+	}
+
+	derivedBundleDigest, err := signalv1.DeriveScriptBundleDigest(checks, source.Data)
+	if err != nil {
+		return nil, fmt.Errorf("derive source script bundle digest: %w", err)
+	}
+
+	if derivedBundleDigest != scriptBundle.Digest {
+		return nil, fmt.Errorf(
+			"source script ConfigMap %s digest %s does not match pinned digest %s",
+			source.Name,
+			derivedBundleDigest,
+			scriptBundle.Digest,
+		)
+	}
+
+	return &source, nil
+}
+
 func (r *AdmissionReconciler) createSnapshot(
 	ctx context.Context,
 	runName string,
-	scriptConfigMap string,
+	source *corev1.ConfigMap,
 	checks []signalv1.CertificationCheck,
 ) (*corev1.ConfigMap, []signalv1.CertificationCheckSnapshot, error) {
 	immutable := true
@@ -736,15 +786,6 @@ func (r *AdmissionReconciler) createSnapshot(
 		},
 		Immutable: &immutable,
 		Data:      map[string]string{},
-	}
-
-	var source corev1.ConfigMap
-	if err := r.Get(
-		ctx,
-		client.ObjectKey{Namespace: r.ScriptNamespace, Name: scriptConfigMap},
-		&source,
-	); err != nil {
-		return nil, nil, fmt.Errorf("get source script ConfigMap: %w", err)
 	}
 
 	checkSnapshots := make([]signalv1.CertificationCheckSnapshot, len(checks))
@@ -957,6 +998,15 @@ func (r *RunReconciler) verifyScriptBundle(ctx context.Context, run *signalv1.Ce
 		if digestString(content) != check.Script.Digest {
 			return fmt.Errorf("script bundle digest does not match check %s", check.ID)
 		}
+	}
+
+	derivedBundleDigest, err := signalv1.DeriveScriptSnapshotBundleDigest(run.Spec.Checks)
+	if err != nil {
+		return fmt.Errorf("derive immutable script bundle digest: %w", err)
+	}
+
+	if derivedBundleDigest != run.Spec.ScriptBundle.Digest {
+		return errors.New("script bundle aggregate digest does not match the run")
 	}
 
 	return nil

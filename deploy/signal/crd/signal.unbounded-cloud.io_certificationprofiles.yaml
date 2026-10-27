@@ -254,15 +254,27 @@ spec:
                   rule: (has(self.selector.matchLabels) && size(self.selector.matchLabels)
                     > 0) || (has(self.selector.matchExpressions) && size(self.selector.matchExpressions)
                     > 0)
-              scriptConfigMap:
-                maxLength: 253
-                minLength: 1
-                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
-                type: string
+              scriptBundle:
+                properties:
+                  digest:
+                    description: |-
+                      Digest is the aggregate algorithm-qualified SHA-256 digest derived from
+                      the selected script bytes in check order.
+                    pattern: ^sha256:[0-9a-f]{64}$
+                    type: string
+                  name:
+                    maxLength: 253
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                    type: string
+                required:
+                - digest
+                - name
+                type: object
             required:
             - checks
             - participants
-            - scriptConfigMap
+            - scriptBundle
             type: object
         required:
         - spec

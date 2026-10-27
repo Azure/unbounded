@@ -67,12 +67,20 @@ type WorkloadPolicy struct {
 	HostPaths []WorkloadHostPath `json:"hostPaths,omitempty"`
 }
 
-type CertificationProfileSpec struct {
-	Participants ParticipantPolicy `json:"participants"`
+type ScriptBundleSource struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=253
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
-	ScriptConfigMap string `json:"scriptConfigMap"`
+	Name string `json:"name"`
+	// Digest is the aggregate algorithm-qualified SHA-256 digest derived from
+	// the selected script bytes in check order.
+	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
+	Digest string `json:"digest"`
+}
+
+type CertificationProfileSpec struct {
+	Participants ParticipantPolicy  `json:"participants"`
+	ScriptBundle ScriptBundleSource `json:"scriptBundle"`
 	// +kubebuilder:validation:MinItems=15
 	// +kubebuilder:validation:MaxItems=15
 	Checks []CertificationCheck `json:"checks"`

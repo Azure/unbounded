@@ -68,7 +68,8 @@ certification suites:
 |---|---|
 | `spec.participants.count` | Total Nodes selected for a Run |
 | `spec.participants.selector` | Labels every selected Node must match |
-| `spec.scriptConfigMap` | Source ConfigMap containing all 15 scripts |
+| `spec.scriptBundle.name` | Immutable source ConfigMap containing the selected scripts |
+| `spec.scriptBundle.digest` | Aggregate SHA-256 digest of the 15 selected script contents in check order |
 | `spec.checks` | Exactly 15 ordered checks; position defines R01 through R15 |
 
 The requesting Node is participant zero. The remaining participants are
@@ -77,11 +78,19 @@ Nodes matching the participant selector and the resource floor derived from
 the largest per-Node check request. Every check runs on this complete immutable
 participant set.
 
+The source ConfigMap must set `immutable: true` and must not use `binaryData`.
+The aggregate digest is derived by computing the algorithm-qualified SHA-256
+digest of each selected script's exact bytes, writing those 15 digest strings
+with one newline after each string in Profile check order, and computing the
+SHA-256 digest of that manifest. Admission rejects the Profile if the current
+source bytes do not match the pinned aggregate digest. Unreferenced ConfigMap
+keys are not part of the digest because they cannot execute in that Profile.
+
 Each check contains:
 
 | Field | Meaning |
 |---|---|
-| `scriptKey` | Key in `spec.scriptConfigMap`; admission snapshots the current bytes and computes their SHA-256 digest |
+| `scriptKey` | Key in `spec.scriptBundle.name`; admission snapshots the verified bytes and records their SHA-256 digest |
 | `backend` | `Pod` or `MPIJob` |
 | `backendActiveDeadline` | Backend execution deadline |
 | `gpuCount` | GPU request; must be positive for MPIJob |
@@ -111,7 +120,7 @@ kubectl label node <node-name> \
 
 Admission then:
 
-1. validates the Profile and all 15 checks;
+1. validates the Profile, all 15 checks, source ConfigMap immutability, and the pinned aggregate script digest;
 2. selects the requesting Node plus any additional participants;
 3. atomically records the Run reservation name, participant Node UID, and
    `spec.unschedulable=true` on each participant;
@@ -136,7 +145,7 @@ The Run spec snapshots:
 
 - Profile name, UID, and generation;
 - ordered participants with Node name and Node UID;
-- the immutable script bundle name and UID;
+- the immutable script bundle name, UID, and aggregate digest;
 - 15 ordered check snapshots;
 - monotonic `cancel` and `release` actions.
 

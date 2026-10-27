@@ -72,6 +72,10 @@ type ScriptBundleReference struct {
 	// +kubebuilder:validation:MinLength=1
 	Name string    `json:"name"`
 	UID  types.UID `json:"uid"`
+	// Digest is the aggregate algorithm-qualified SHA-256 digest derived from
+	// the selected script bytes in check order.
+	// +kubebuilder:validation:Pattern=`^sha256:[0-9a-f]{64}$`
+	Digest string `json:"digest"`
 }
 
 type ScriptSnapshot struct {
