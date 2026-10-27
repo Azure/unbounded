@@ -20,3 +20,4 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["gpu: needs a GPU and a live dataplane (see tests/test_gpu_e2e.py)"]
