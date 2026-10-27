@@ -24,6 +24,12 @@ pub const DEFAULT_MAX_THREADS: usize = usize::MAX;
 pub const DEFAULT_ORIGIN_CONNECTIONS_PER_CACHE: usize = 32;
 /// Not a Node UID. Only verified enrollment/local identity recovery may replace it.
 pub const UNRESOLVED_NODE_ID: &str = "";
+/// Not a cluster UID. Managed startup replaces it from the elected control bootstrap.
+pub const UNRESOLVED_CLUSTER_ID: &str = "";
+/// Projected control-audience token used by managed deployments.
+pub const MANAGED_SERVICE_ACCOUNT_TOKEN: &str = "/var/run/racer-token/token";
+/// Smallest explicit thread cap in managed mode: I/O, crypto, and cluster control.
+pub const MANAGED_MIN_THREADS: usize = 3;
 const MIB: u64 = 1024 * 1024;
 const MAX_BYTES: u64 = 64 * 1024 * MIB;
 const MAX_ENTRIES: usize = 1_048_576;
@@ -107,6 +113,7 @@ pub struct Config {
     pub admission_history_bytes: NonZeroUsize,
     pub admission_period: Duration,
     pub checkpoint_bytes: NonZeroUsize,
+    /// Explicit standalone cluster, or unresolved until managed bootstrap adopts it.
     pub cluster: ClusterId,
     /// Resolved by verified bootstrap/local identity recovery before workers start,
     /// not from a caller-provided UID or the Downward API's node name.
@@ -139,13 +146,21 @@ pub struct Config {
     /// cgroup v2 memory-pressure monitoring and reclaim. Defaults on.
     pub memory_pressure: bool,
     pub pprof_enabled: bool,
-    pub control_endpoint: String,
+    /// Static standalone controller URL. `None` selects managed mode, where
+    /// elected endpoints and their pinned certificates come from cluster control.
+    pub control_endpoint: Option<String>,
+    /// Managed-mode endpoints and report sink, attached after control bootstrap.
+    pub managed_control: Option<crate::control::Managed>,
     pub peer_listen: std::net::SocketAddr,
     pub diagnostics_listen: std::net::SocketAddr,
     pub trust_bundle: PathBuf,
     pub service_account_token: PathBuf,
     /// Node-private persistent keys, separate from projected Secrets and slabs.
     pub identity_directory: PathBuf,
+    /// Enrollment identity location when it differs from `identity_directory`.
+    /// Managed mode binds it to a cluster-scoped subdirectory, leaving any
+    /// legacy standalone identity untouched. Rail journals stay in the root.
+    pub enrollment_directory: Option<PathBuf>,
     pub slab_directory: PathBuf,
     pub device_directory: PathBuf,
     /// Startup bound for retrying selected devices whose exclusive open reports
@@ -257,7 +272,11 @@ impl Config {
             admission_history_bytes: nonzero_usize(raw.admission_history_bytes.unwrap_or(4 * MIB))?,
             admission_period: Duration::from_secs(raw.admission_period_secs.unwrap_or(60)),
             checkpoint_bytes: nonzero_usize(raw.checkpoint_bytes.unwrap_or(64 * MIB))?,
-            cluster: ClusterId(raw.cluster_id),
+            cluster: ClusterId(
+                raw.cluster_id
+                    .clone()
+                    .unwrap_or_else(|| UNRESOLVED_CLUSTER_ID.into()),
+            ),
             node: NodeId(UNRESOLVED_NODE_ID.into()),
             max_threads: to_usize(raw.max_threads.unwrap_or(DEFAULT_MAX_THREADS as u64))?,
             io_workers: raw.io_workers.map(to_usize).transpose()?,
@@ -271,7 +290,9 @@ impl Config {
             peer_tcp_nodelay: raw.peer_tcp_nodelay.unwrap_or(true),
             memory_pressure: raw.memory_pressure.unwrap_or(true),
             pprof_enabled: raw.pprof_enabled.unwrap_or(false),
-            control_endpoint: raw.control_endpoint,
+            control_endpoint: raw.control_endpoint.clone(),
+            managed_control: None,
+            enrollment_directory: None,
             peer_listen: parse_listener_address(
                 raw.peer_listen.as_deref().unwrap_or("0.0.0.0:7443"),
             )?,
@@ -286,7 +307,13 @@ impl Config {
                 .into(),
             service_account_token: raw
                 .service_account_token
-                .unwrap_or_else(|| "/var/run/secrets/racer-control/token".into())
+                .unwrap_or_else(|| {
+                    if raw.control_endpoint.is_some() {
+                        "/var/run/secrets/racer-control/token".into()
+                    } else {
+                        MANAGED_SERVICE_ACCOUNT_TOKEN.into()
+                    }
+                })
                 .into(),
             identity_directory: raw
                 .identity_directory
@@ -363,6 +390,10 @@ impl Config {
             ),
             shutdown_timeout: Duration::from_millis(raw.shutdown_timeout_ms.unwrap_or(30_000)),
         };
+        // Standalone mode needs both static values; managed mode must set neither.
+        if raw.cluster_id.is_some() != raw.control_endpoint.is_some() {
+            return Err(Error::InvalidConfiguration);
+        }
         if raw.origin_connections_per_cache.is_none() {
             // The default must not reject a smaller explicit client budget.
             config.origin_connections_per_cache = config
@@ -453,13 +484,18 @@ impl Config {
         {
             return Err(Error::InvalidConfiguration);
         }
-        if !valid_uuid(&self.cluster.0)
+        let cluster_resolved = valid_uuid(&self.cluster.0);
+        // Only managed mode may run with the unresolved placeholder.
+        if (!cluster_resolved
+            && (self.control_endpoint.is_some() || self.cluster.0 != UNRESOLVED_CLUSTER_ID))
             || (self.node.0 != UNRESOLVED_NODE_ID && !valid_uuid(&self.node.0))
             || self.max_threads < 2
         {
             return Err(Error::InvalidConfiguration);
         }
-        validate_endpoint(&self.control_endpoint)?;
+        if let Some(endpoint) = &self.control_endpoint {
+            validate_endpoint(endpoint)?;
+        }
         for address in [self.peer_listen, self.diagnostics_listen] {
             validate_socket(address)?;
         }
@@ -597,6 +633,52 @@ impl Config {
         Ok(())
     }
 
+    /// Whether elected cluster control, not a static endpoint, provides the controller.
+    pub fn managed(&self) -> bool {
+        self.control_endpoint.is_none()
+    }
+
+    /// Withhold one thread from an explicit cap for the cluster-control thread.
+    ///
+    /// The control thread is unpinned and mostly blocked on network I/O. With
+    /// no explicit cap, worker sizing is already bounded by eligible CPUs, so
+    /// nothing is withheld. An explicit cap must leave at least one I/O and one
+    /// crypto thread, so managed mode requires a cap of at least three.
+    pub fn reserve_control_thread(&mut self) -> Result<()> {
+        if !self.managed() {
+            return Err(Error::InvalidConfiguration);
+        }
+        if self.max_threads == DEFAULT_MAX_THREADS {
+            return Ok(());
+        }
+        if self.max_threads < MANAGED_MIN_THREADS {
+            return Err(Error::InvalidConfiguration);
+        }
+        let reserved = self.max_threads - 1;
+        // An exact worker pair must still fit beside the control thread.
+        if let (Some(io), Some(helpers)) = (self.io_workers, self.crypto_helpers)
+            && io.checked_add(helpers).is_none_or(|n| n > reserved)
+        {
+            return Err(Error::InvalidConfiguration);
+        }
+        self.max_threads = reserved;
+        Ok(())
+    }
+
+    /// Bind a managed configuration to the cluster returned by control bootstrap.
+    ///
+    /// The cluster is adopted exactly once; a different later value is refused.
+    pub fn adopt_cluster(&mut self, cluster: ClusterId) -> Result<()> {
+        if !self.managed() || !valid_uuid(&cluster.0) {
+            return Err(Error::InvalidConfiguration);
+        }
+        if self.cluster.0 != UNRESOLVED_CLUSTER_ID && self.cluster != cluster {
+            return Err(Error::Unauthorized);
+        }
+        self.cluster = cluster;
+        Ok(())
+    }
+
     /// Never round a small share up past the node budget. Retention rounds the
     /// allocation down to whole 32-byte Bloom units after this partition.
     pub(crate) fn admission_history_per_worker(&self, workers: usize) -> Result<usize> {
@@ -709,8 +791,8 @@ const ENV_NAMES: &[&str] = &[
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
-    cluster_id: String,
-    control_endpoint: String,
+    cluster_id: Option<String>,
+    control_endpoint: Option<String>,
     enable_rdma: Option<String>,
     enable_gpu: Option<String>,
     #[serde(default, deserialize_with = "decimal")]
@@ -1077,7 +1159,8 @@ mod tests {
         assert!(validate_text("ok", 2).is_ok());
         assert!(validate_text("é", 2).is_ok());
         assert!(validate_text("é", 1).is_err());
-        assert!(Config::from_lookup(|_| Ok(None)).is_err());
+        // An empty environment selects managed mode with an unresolved cluster.
+        assert!(Config::from_lookup(|_| Ok(None)).unwrap().managed());
         assert_eq!(parse(&[]).unwrap().max_threads, DEFAULT_MAX_THREADS);
         for value in ["", "a\n", "\0", "\u{85}", "abc"] {
             assert!(validate_text(value, 2).is_err());
@@ -1300,7 +1383,7 @@ mod tests {
     // RDMA NIC configuration arrives only through authenticated enrollment wire NICs.
     fn nic_request(nics: &str) -> Vec<u8> {
         String::from_utf8(
-            include_bytes!("../../../internal/racer/wire/testdata/bootstrap-request.json").to_vec(),
+            include_bytes!("../control-wire/testdata/bootstrap-request.json").to_vec(),
         )
         .unwrap()
         .replace("\"rdma_nics\":[]", &format!("\"rdma_nics\":{nics}"))
@@ -1456,6 +1539,90 @@ mod tests {
                     && rdma_verbs::inventory().is_ok_and(|ports| !ports.is_empty())
             );
         }
+    }
+
+    fn parse_managed(overrides: &[(&str, &str)]) -> Result<Config> {
+        Config::from_lookup(|name| {
+            Ok(overrides
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned()))
+        })
+    }
+
+    #[test]
+    fn managed_mode_omits_static_control_and_leaves_cluster_unresolved() {
+        let config = parse_managed(&[]).unwrap();
+        assert!(config.managed());
+        assert_eq!(config.cluster.0, UNRESOLVED_CLUSTER_ID);
+        assert!(config.managed_control.is_none());
+        assert_eq!(
+            config.service_account_token,
+            PathBuf::from(MANAGED_SERVICE_ACCOUNT_TOKEN)
+        );
+        let explicit = parse(&[]).unwrap();
+        assert!(!explicit.managed());
+        assert_eq!(
+            explicit.service_account_token,
+            PathBuf::from("/var/run/secrets/racer-control/token")
+        );
+        // Half of the standalone pair is ambiguous and rejected.
+        for partial in [
+            ("RACER_CLUSTER_ID", "00000000-0000-4000-8000-000000000001"),
+            ("RACER_CONTROL_ENDPOINT", "https://control.example"),
+        ] {
+            assert!(parse_managed(&[partial]).is_err(), "{partial:?}");
+        }
+        // Standalone mode still requires a resolved cluster.
+        let mut unresolved = parse(&[]).unwrap();
+        unresolved.cluster = ClusterId(UNRESOLVED_CLUSTER_ID.into());
+        assert!(unresolved.validate().is_err());
+    }
+
+    #[test]
+    fn managed_cluster_is_adopted_once() {
+        let mut config = parse_managed(&[]).unwrap();
+        assert!(
+            config
+                .adopt_cluster(ClusterId("not-a-uuid".into()))
+                .is_err()
+        );
+        let first = ClusterId("11111111-1111-4111-8111-111111111111".into());
+        config.adopt_cluster(first.clone()).unwrap();
+        config.validate().unwrap();
+        config.adopt_cluster(first.clone()).unwrap();
+        assert_eq!(
+            config.adopt_cluster(ClusterId("22222222-2222-4222-8222-222222222222".into())),
+            Err(Error::Unauthorized)
+        );
+        assert_eq!(config.cluster, first);
+        assert_eq!(
+            parse(&[]).unwrap().adopt_cluster(first),
+            Err(Error::InvalidConfiguration)
+        );
+    }
+
+    #[test]
+    fn managed_mode_reserves_one_thread_for_cluster_control() {
+        let mut unlimited = parse_managed(&[]).unwrap();
+        unlimited.reserve_control_thread().unwrap();
+        assert_eq!(unlimited.max_threads, DEFAULT_MAX_THREADS);
+        let mut capped = parse_managed(&[("RACER_MAX_THREADS", "3")]).unwrap();
+        capped.reserve_control_thread().unwrap();
+        assert_eq!(capped.max_threads, 2);
+        let mut minimal = parse_managed(&[("RACER_MAX_THREADS", "2")]).unwrap();
+        assert!(minimal.reserve_control_thread().is_err());
+        assert_eq!(minimal.max_threads, 2);
+        // An exact pair that no longer fits after reservation is rejected unchanged.
+        let mut exact = parse_managed(&[
+            ("RACER_MAX_THREADS", "4"),
+            ("RACER_IO_WORKERS", "2"),
+            ("RACER_CRYPTO_HELPERS", "2"),
+        ])
+        .unwrap();
+        assert!(exact.reserve_control_thread().is_err());
+        assert_eq!(exact.max_threads, 4);
+        assert!(parse(&[]).unwrap().reserve_control_thread().is_err());
     }
 
     fn parse(overrides: &[(&str, &str)]) -> Result<Config> {
@@ -2178,10 +2345,11 @@ mod tests {
 
     #[test]
     fn required_identity_and_lookup_errors_fail_closed() {
-        assert!(matches!(
-            Config::from_lookup(|_| Ok(None)),
-            Err(Error::InvalidConfiguration)
-        ));
+        // Without static control, the cluster stays unresolved until bootstrap.
+        assert_eq!(
+            Config::from_lookup(|_| Ok(None)).unwrap().cluster.0,
+            UNRESOLVED_CLUSTER_ID
+        );
         assert!(matches!(
             Config::from_lookup(|_| Err(Error::InvalidConfiguration)),
             Err(Error::InvalidConfiguration)

@@ -1,85 +1,101 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: racer-controller
-  namespace: {{ .Namespace | default "unbounded-system" }}
----
+#
+# Every racer-dataplane Pod runs the Racer control plane under this one
+# ServiceAccount, so every Pod holds the same permissions. Seat and primary
+# roles are runtime state, not a security boundary. The admission policies in
+# policies.yaml narrow each write further; the operator binds these grants only
+# after those policies are installed and revokes the bindings if a policy is
+# missing or altered.
+{{- $ns := .Namespace | default "unbounded-system" }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: racer-controller
+  name: racer-dataplane
 rules:
-  # Admission restricts Node patches to three enrollment/recovery annotations.
+  # Membership is computed from Nodes. No Node writes.
   - apiGroups: [""]
     resources: ["nodes"]
-    verbs: ["get", "list", "watch", "patch"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["racer.unbounded-cloud.io"]
     resources: ["clustercaches"]
     verbs: ["get", "list", "watch"]
+  # Seats authenticate dataplane Pods from their racer-control audience token.
   - apiGroups: ["authentication.k8s.io"]
     resources: ["tokenreviews"]
     verbs: ["create"]
+  # The primary publishes only caBundle; admission rejects any other change.
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["mutatingwebhookconfigurations"]
+    resourceNames: ["racer-object-sidecar-injector"]
+    verbs: ["get", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: racer-controller
+  name: racer-dataplane
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: racer-controller
+  name: racer-dataplane
 subjects:
   - kind: ServiceAccount
-    name: racer-controller
-    namespace: {{ .Namespace | default "unbounded-system" }}
+    name: racer-dataplane
+    namespace: {{ $ns }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: racer-controller
-  namespace: {{ .Namespace | default "unbounded-system" }}
+  name: racer-dataplane
+  namespace: {{ $ns }}
 rules:
-  - apiGroups: [""]
-    resources: ["pods", "serviceaccounts"]
-    verbs: ["get", "list", "watch"]
+  # Seat and primary Leases. The operator creates all 17; the runtime never
+  # creates or deletes them. RBAC authorizes list and watch by resourceNames
+  # only for requests with a metadata.name field selector, so the runtime
+  # gets or watches each Lease by name. A namespace-wide Lease list is denied.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames:
+{{- range $seat := until 16 }}
+      - racer-seat-{{ $seat }}
+{{- end }}
+      - racer-primary
+    verbs: ["get", "list", "watch", "update"]
+  # Durable control state. The operator creates it empty; no create or delete.
   - apiGroups: [""]
     resources: ["secrets"]
-    resourceNames: [{{ .CredentialsSecretName | default "racer-credentials" | quote }}]
-    # List/watch require the matching metadata.name field selector.
-    verbs: ["get", "list", "watch", "update", "patch"]
+    resourceNames: ["racer-state"]
+    verbs: ["get", "update"]
+  # Dataplane Pods report their own capabilities in one annotation. RBAC
+  # cannot restrict a patch to the caller's own Pod; admission does that.
   - apiGroups: [""]
-    resources: ["configmaps"]
-    resourceNames: [{{ .InstallationConfigMapName | default "racer-installation" | quote }}, {{ .VersionConfigMapName | default "racer-version" | quote }}]
-    # Each cache uses its own matching metadata.name field selector.
-    verbs: ["get", "list", "watch", "update", "patch"]
-  # External workload identity checks only; no workload writes.
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "patch"]
+  # Workload identity checks only.
   - apiGroups: ["apps"]
     resources: ["daemonsets"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["coordination.k8s.io"]
-    resources: ["leases"]
-    # RBAC cannot restrict create by name; LeaseLock needs no list/watch.
-    verbs: ["create"]
-  - apiGroups: ["coordination.k8s.io"]
-    resources: ["leases"]
-    resourceNames: ["racer-controller"]
-    verbs: ["get", "update"]
+    resourceNames: ["racer-dataplane"]
+    verbs: ["get"]
   - apiGroups: [""]
-    resources: ["events"]
-    verbs: ["create", "patch"]
+    resources: ["serviceaccounts"]
+    resourceNames: ["racer-dataplane"]
+    verbs: ["get"]
+  # Ready seat webhook endpoints, published by the primary.
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    resourceNames: ["racer-webhook"]
+    verbs: ["get", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: racer-controller
-  namespace: {{ .Namespace | default "unbounded-system" }}
+  name: racer-dataplane
+  namespace: {{ $ns }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: racer-controller
+  name: racer-dataplane
 subjects:
   - kind: ServiceAccount
-    name: racer-controller
-    namespace: {{ .Namespace | default "unbounded-system" }}
+    name: racer-dataplane
+    namespace: {{ $ns }}

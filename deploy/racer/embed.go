@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package racer embeds the Racer controller and dataplane templates applied by
-// the operator. Manifests are rendered in memory with template defaults.
+// Package racer embeds the Racer dataplane templates applied by the operator.
+// Manifests are rendered in memory with template defaults.
 package racer
 
 import (
@@ -13,21 +13,16 @@ import (
 	"text/template"
 
 	"github.com/Masterminds/sprig/v3"
-
-	"github.com/Azure/unbounded/internal/version"
 )
 
-// The dataplane DaemonSet is built in Go (internal/racer/workload). Bootstrap
-// trust, installation, and create-restriction state are written by the
-// operator directly, so those templates are excluded.
+// The dataplane DaemonSet is built in Go (internal/racer/workload), and so is
+// the racer-webhook EndpointSlice, whose address type follows the cluster.
 //
-//go:embed config.yaml.tmpl controller.yaml.tmpl dataplane-config.yaml.tmpl controller-pdb.yaml.tmpl mutating-webhook.yaml.tmpl node-restriction.yaml.tmpl rbac.yaml.tmpl
+//go:embed control.yaml.tmpl dataplane-config.yaml.tmpl mutating-webhook.yaml.tmpl policies.yaml.tmpl rbac.yaml.tmpl
 var sources embed.FS
 
 // Manifests exposes the embedded templates as rendered flat *.yaml names. It
-// contains no DaemonSet or generated CRDs. The controller image
-// defaults to the binary version; the operator replaces it with its configured
-// registry and tag before applying resources.
+// contains no DaemonSet or generated CRDs.
 var Manifests fs.FS = manifestFS{}
 
 type manifestFS struct{}
@@ -66,10 +61,7 @@ func (manifestFS) Open(name string) (fs.File, error) {
 	}
 
 	var rendered bytes.Buffer
-	if err := tmpl.Execute(&rendered, map[string]string{
-		"ControllerImage": "ghcr.io/azure/racer-controller:" + version.Version,
-		"ObjectImage":     "ghcr.io/azure/racer-object:" + version.Version,
-	}); err != nil {
+	if err := tmpl.Execute(&rendered, map[string]string{}); err != nil {
 		return nil, err
 	}
 

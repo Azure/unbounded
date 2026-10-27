@@ -11,8 +11,8 @@ Service, or a Gantry Service. The parent deployment files are unchanged.
 
 - Install and configure the Unbounded operator, including the
   `racer.unbounded-cloud.io/v1alpha1` ClusterCache CRD. Any ClusterCache triggers
-  operator-managed Racer installation. Wait for the controller, node dataplane,
-  installation identity/trust, and required admission policies before starting load.
+  operator-managed Racer installation. Wait for the dataplane DaemonSet, its
+  elected control seats, and required admission policies before starting load.
 - Configure Racer's node storage and capacity before starting load. ClusterCache
   has no `spec` or `status`. Capacity is not configured through this object.
   It is not a PVC or a durability

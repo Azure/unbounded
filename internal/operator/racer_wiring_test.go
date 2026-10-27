@@ -14,6 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -95,16 +96,19 @@ func TestRacerReconcilesWithoutSites(t *testing.T) {
 		cache      bool
 		failList   bool
 		failCreate bool
-		wantClaim  bool
+		wantState  bool
 		wantErr    bool
 	}{
-		{name: "first cache starts installation", cache: true, wantClaim: true},
+		{name: "first cache starts installation", cache: true, wantState: true},
 		{name: "no cache is inert"},
 		{name: "list failure is retryable", failList: true, wantErr: true},
-		{name: "claim write failure is retryable", cache: true, failCreate: true, wantErr: true},
+		{name: "state write failure is retryable", cache: true, failCreate: true, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			scheme := newReconcilerTestScheme(t)
+			if err := clientgoscheme.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
 
 			builder := fake.NewClientBuilder().WithScheme(scheme)
 			if tc.cache {
@@ -146,23 +150,25 @@ func TestRacerReconcilesWithoutSites(t *testing.T) {
 				t.Fatalf("Reconcile error = %v", err)
 			}
 
-			var claims corev1.ConfigMapList
-			if err := cl.List(t.Context(), &claims); err != nil {
+			var states corev1.SecretList
+			if err := cl.List(t.Context(), &states); err != nil {
 				t.Fatal(err)
 			}
 
-			wantClaims := 0
-			if tc.wantClaim {
-				wantClaims = 1
+			wantStates := 0
+			if tc.wantState {
+				wantStates = 1
 			}
 
-			if len(claims.Items) != wantClaims {
-				t.Fatalf("claims = %v", claims.Items)
+			if len(states.Items) != wantStates {
+				t.Fatalf("state Secrets = %v", states.Items)
 			}
 
-			if tc.wantClaim {
-				if claims.Items[0].Name != "racer-operator-installation" || len(claims.Items[0].OwnerReferences) != 0 {
-					t.Fatalf("unexpected claim: %+v", claims.Items[0])
+			if tc.wantState {
+				// The empty state Secret comes first; the dataplane follows
+				// once its UID is known.
+				if states.Items[0].Name != "racer-state" || len(states.Items[0].Data) != 0 || len(states.Items[0].OwnerReferences) != 0 {
+					t.Fatalf("unexpected state Secret: %+v", states.Items[0])
 				}
 
 				if result.RequeueAfter != 5*time.Second {

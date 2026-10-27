@@ -4,23 +4,23 @@
 package override
 
 import (
-	"io/fs"
 	"reflect"
 	"strings"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/util/yaml"
 
-	manifests "github.com/Azure/unbounded/deploy/racer"
 	"github.com/Azure/unbounded/internal/operator/component"
 	"github.com/Azure/unbounded/internal/operator/components/racer"
+	"github.com/Azure/unbounded/internal/racer/workload"
 )
 
 func TestApplyRacerEnvironmentParity(t *testing.T) {
-	env := []any{map[string]any{"name": "POD_NAMESPACE", "valueFrom": map[string]any{"fieldRef": map[string]any{"fieldPath": "metadata.namespace"}}}}
+	env := []any{
+		map[string]any{"name": "POD_NAMESPACE", "valueFrom": map[string]any{"fieldRef": map[string]any{"fieldPath": "metadata.namespace"}}},
+	}
 	envFrom := []any{
-		map[string]any{"configMapRef": map[string]any{"name": "racer-config"}},
+		map[string]any{"configMapRef": map[string]any{"name": "racer-dataplane-config"}},
 		map[string]any{"configMapRef": map[string]any{"name": "defaults"}, "prefix": "DEFAULT_"},
 	}
 
@@ -33,13 +33,14 @@ func TestApplyRacerEnvironmentParity(t *testing.T) {
 	}{
 		{name: "resources and security", container: map[string]any{"resources": map[string]any{"limits": map[string]any{"memory": "512Mi"}}, "securityContext": map[string]any{"runAsNonRoot": true}}},
 		{name: "identical environment", container: map[string]any{"env": env, "envFrom": envFrom}},
-		{name: "explicit env", container: map[string]any{"env": []any{map[string]any{"name": "RACER_CLUSTER", "value": "other"}}}, wantError: "env"},
+		{name: "added env", container: map[string]any{"env": []any{map[string]any{"name": "RACER_EXTRA", "value": "allowed"}}}},
+		{name: "explicit env", container: map[string]any{"env": []any{map[string]any{"name": "RACER_CONTROL_SEATS", "value": "16"}}}, wantError: "env"},
 		{name: "env field source", container: map[string]any{"env": []any{map[string]any{"name": "POD_NAMESPACE", "valueFrom": map[string]any{"fieldRef": map[string]any{"fieldPath": "metadata.name"}}}}}, wantError: "env"},
 		{name: "envFrom source", container: map[string]any{"envFrom": []any{map[string]any{"secretRef": map[string]any{"name": "other"}}}}, wantError: "envFrom"},
 		{name: "envFrom configMap name", container: map[string]any{"envFrom": []any{map[string]any{"configMapRef": map[string]any{"name": "other"}}, envFrom[1]}}, wantError: "envFrom"},
-		{name: "envFrom optional", container: map[string]any{"envFrom": []any{map[string]any{"configMapRef": map[string]any{"name": "racer-config", "optional": true}}, envFrom[1]}}, wantError: "envFrom"},
+		{name: "envFrom optional", container: map[string]any{"envFrom": []any{map[string]any{"configMapRef": map[string]any{"name": "racer-dataplane-config", "optional": true}}, envFrom[1]}}, wantError: "envFrom"},
 		{name: "envFrom order", container: map[string]any{"envFrom": []any{envFrom[1], envFrom[0]}}, wantError: "envFrom"},
-		{name: "envFrom prefix", container: map[string]any{"envFrom": []any{map[string]any{"configMapRef": map[string]any{"name": "racer-config"}, "prefix": "OTHER_"}, envFrom[1]}}, wantError: "envFrom"},
+		{name: "envFrom prefix", container: map[string]any{"envFrom": []any{map[string]any{"configMapRef": map[string]any{"name": "racer-dataplane-config"}, "prefix": "OTHER_"}, envFrom[1]}}, wantError: "envFrom"},
 		{name: "envFrom removal", container: map[string]any{"envFrom": []any{}}, wantError: "envFrom"},
 		{name: "container replacement removes env", container: map[string]any{"image": "racer:test"}, bypassValidate: true, wantError: "env"},
 		{name: "controller removal", container: map[string]any{"$patch": "delete"}, bypassValidate: true, wantError: "exactly one"},
@@ -47,25 +48,29 @@ func TestApplyRacerEnvironmentParity(t *testing.T) {
 		{name: "other component envFrom", component: "machina", container: map[string]any{"envFrom": []any{map[string]any{"configMapRef": map[string]any{"name": "other"}}}}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			workload := testWorkload("racer")
-			workload.SetName("racer-controller")
-
-			if err := setNestedSlice(workload.Object, []any{map[string]any{"name": "controller", "image": "racer:test", "env": env, "envFrom": envFrom}}, "spec", "template", "spec", "containers"); err != nil {
-				t.Fatal(err)
-			}
-
-			original := workload.DeepCopy()
-
 			componentName := tt.component
 			if componentName == "" {
 				componentName = "racer"
 			}
 
+			workload := testWorkload("racer")
+			workload.SetName("racer-dataplane")
+
+			if componentName == "racer" {
+				workload.SetKind("DaemonSet")
+			}
+
+			if err := setNestedSlice(workload.Object, []any{map[string]any{"name": "dataplane", "image": "racer:test", "env": env, "envFrom": envFrom}}, "spec", "template", "spec", "containers"); err != nil {
+				t.Fatal(err)
+			}
+
+			original := workload.DeepCopy()
+
 			plan := component.NewPlan()
 
 			op := component.Operation{Kind: component.OpApply, Object: workload, Component: componentName, Overridable: true}
 			if componentName == "racer" {
-				op.ValidateOverride = racer.ValidateOverride
+				op.ValidateOverride = racer.ValidateDataplaneOverride
 			}
 
 			plan.Add(op)
@@ -74,7 +79,7 @@ func TestApplyRacerEnvironmentParity(t *testing.T) {
 			plan.Add(component.Operation{Kind: component.OpApply, Object: unrelated, Component: "metalman", Site: "unrelated", Overridable: true})
 
 			container := deepCopyMap(tt.container)
-			container["name"] = "controller"
+			container["name"] = "dataplane"
 
 			patch := map[string]any{"spec": map[string]any{"template": map[string]any{"spec": map[string]any{
 				"priorityClassName": "high-priority",
@@ -86,7 +91,7 @@ func TestApplyRacerEnvironmentParity(t *testing.T) {
 				}
 			}
 
-			entries := []SourcedEntry{{Source: Source{Key: "racer.yaml", Index: 0}, Entry: Entry{Component: componentName, Kind: "Deployment", Patch: patch, AddContainers: []string{"sidecar"}}}}
+			entries := []SourcedEntry{{Source: Source{Key: "racer.yaml", Index: 0}, Entry: Entry{Component: componentName, Kind: workload.GetKind(), Patch: patch, AddContainers: []string{"sidecar"}}}}
 
 			if !tt.bypassValidate {
 				if err := ValidateErr(entries); err != nil {
@@ -96,7 +101,7 @@ func TestApplyRacerEnvironmentParity(t *testing.T) {
 
 			report := Apply(plan, entries, nil)
 			if tt.wantError != "" {
-				if !report.Failed() || !strings.Contains(report.Err().Error(), tt.wantError) || !strings.Contains(report.Err().Error(), "ConfigMap racer-config") {
+				if !report.Failed() || !strings.Contains(report.Err().Error(), tt.wantError) || !strings.Contains(report.Err().Error(), "ConfigMap racer-dataplane-config") {
 					t.Fatalf("error = %v, want %q and tuning interface", report.Err(), tt.wantError)
 				}
 
@@ -104,7 +109,7 @@ func TestApplyRacerEnvironmentParity(t *testing.T) {
 					t.Fatal("failed racer Deployment must be withheld without dropping unrelated operations")
 				}
 
-				if len(report.Withheld) != 1 || report.Withheld[0].Component != "racer" || report.Withheld[0].Ref.Name != "racer-controller" || report.Workloads[0].Hash == "" {
+				if len(report.Withheld) != 1 || report.Withheld[0].Component != "racer" || report.Withheld[0].Ref.Name != "racer-dataplane" || report.Workloads[0].Hash == "" {
 					t.Fatalf("failure attribution = %+v", report)
 				}
 			} else {
@@ -119,7 +124,7 @@ func TestApplyRacerEnvironmentParity(t *testing.T) {
 
 				if tt.name == "resources and security" {
 					for _, controller := range pod.Containers {
-						if controller.Name == "controller" && (controller.Resources.Limits.Memory().String() != "512Mi" || controller.SecurityContext == nil || controller.SecurityContext.RunAsNonRoot == nil || !*controller.SecurityContext.RunAsNonRoot) {
+						if controller.Name == "dataplane" && (controller.Resources.Limits.Memory().String() != "512Mi" || controller.SecurityContext == nil || controller.SecurityContext.RunAsNonRoot == nil || !*controller.SecurityContext.RunAsNonRoot) {
 							t.Fatalf("controller resources or security settings lost: %+v", controller)
 						}
 					}
@@ -134,19 +139,12 @@ func TestApplyRacerEnvironmentParity(t *testing.T) {
 }
 
 func TestApplyRacerManifestEnvironmentParity(t *testing.T) {
-	manifest, err := fs.ReadFile(manifests.Manifests, "controller.yaml")
+	ds, err := workload.DaemonSet(workload.DefaultConfig("unbounded-system", "racer-dataplane:test", "racer-object:test"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	canonical := &unstructured.Unstructured{}
-	if err := yaml.NewYAMLOrJSONDecoder(strings.NewReader(string(manifest)), 4096).Decode(canonical); err != nil {
-		t.Fatal(err)
-	}
-
-	if canonical.GetKind() != "Deployment" || canonical.GetName() != "racer-controller" {
-		t.Fatalf("unexpected first Racer manifest: %s %s", canonical.GetKind(), canonical.GetName())
-	}
+	canonical := component.ToUnstructured(ds)
 
 	for _, tt := range []struct {
 		name      string
@@ -155,19 +153,21 @@ func TestApplyRacerManifestEnvironmentParity(t *testing.T) {
 		wantError bool
 	}{
 		{name: "valid resources", field: "resources", value: map[string]any{"limits": map[string]any{"memory": "512Mi"}}},
-		{name: "explicit env override", field: "env", value: []any{map[string]any{"name": "RACER_CLUSTER", "value": "other"}}, wantError: true},
+		{name: "added env", field: "env", value: []any{map[string]any{"name": "RACER_EXTRA", "value": "allowed"}}},
+		{name: "explicit env override", field: "env", value: []any{map[string]any{"name": "RACER_CONTROL_SEATS", "value": "16"}}, wantError: true},
+		{name: "volume mount override", field: "volumeMounts", value: []any{map[string]any{"name": "token", "mountPath": "/elsewhere"}}, wantError: true},
 		{name: "envFrom override", field: "envFrom", value: []any{map[string]any{"configMapRef": map[string]any{"name": "other"}}}, wantError: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			plan := component.NewPlan()
-			plan.Add(component.Operation{Kind: component.OpApply, Component: "racer", Object: canonical.DeepCopy(), Overridable: true, ValidateOverride: racer.ValidateOverride})
+			plan.Add(component.Operation{Kind: component.OpApply, Component: "racer", Object: canonical.DeepCopy(), Overridable: true, ValidateOverride: racer.ValidateDataplaneOverride})
 
 			patch := map[string]any{}
-			if err := setNestedSlice(patch, []any{map[string]any{"name": "controller", tt.field: tt.value}}, "spec", "template", "spec", "containers"); err != nil {
+			if err := setNestedSlice(patch, []any{map[string]any{"name": "dataplane", tt.field: tt.value}}, "spec", "template", "spec", "containers"); err != nil {
 				t.Fatal(err)
 			}
 
-			entries := []SourcedEntry{{Source: Source{Key: "racer.yaml", Index: 0}, Entry: Entry{Component: "racer", Kind: "Deployment", Patch: patch}}}
+			entries := []SourcedEntry{{Source: Source{Key: "racer.yaml", Index: 0}, Entry: Entry{Component: "racer", Kind: "DaemonSet", Patch: patch}}}
 			if err := ValidateErr(entries); err != nil {
 				t.Fatal(err)
 			}
@@ -178,7 +178,7 @@ func TestApplyRacerManifestEnvironmentParity(t *testing.T) {
 			}
 
 			if tt.wantError {
-				if len(plan.Operations) != 0 || len(report.Withheld) != 1 || !strings.Contains(report.Err().Error(), "ConfigMap racer-config") {
+				if len(plan.Operations) != 0 || len(report.Withheld) != 1 || !strings.Contains(report.Err().Error(), "ConfigMap racer-dataplane-config") {
 					t.Fatalf("invalid manifest override was not withheld: %+v", report)
 				}
 
@@ -192,11 +192,11 @@ func TestApplyRacerManifestEnvironmentParity(t *testing.T) {
 			before := podSpec(t, canonical)
 
 			after := podSpec(t, plan.Operations[0].Object)
-			if len(after.Containers) != 1 || after.Containers[0].Name != "controller" || after.Containers[0].Resources.Limits.Memory().String() != "512Mi" {
+			if len(after.Containers) != 1 || after.Containers[0].Name != "dataplane" || (tt.name == "valid resources" && after.Containers[0].Resources.Limits.Memory().String() != "512Mi") {
 				t.Fatalf("valid resource override did not apply: %+v", after.Containers)
 			}
 
-			if !reflect.DeepEqual(before.Containers[0].Env, after.Containers[0].Env) || !reflect.DeepEqual(before.Containers[0].EnvFrom, after.Containers[0].EnvFrom) {
+			if tt.name != "added env" && !reflect.DeepEqual(before.Containers[0].Env, after.Containers[0].Env) || !reflect.DeepEqual(before.Containers[0].EnvFrom, after.Containers[0].EnvFrom) {
 				t.Fatal("canonical manifest environment changed")
 			}
 		})

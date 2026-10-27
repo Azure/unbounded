@@ -233,7 +233,7 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
     );
     let mut bundle: serde_json::Value = serde_json::from_slice(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../internal/racer/wire/testdata/bundle.json"
+        "/control-wire/testdata/bundle.json"
     )))
     .unwrap();
     for (i, key) in bundle["cache_keys"]

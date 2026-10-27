@@ -525,6 +525,8 @@ struct Script {
     requests: Requests,
 
     closed: Rc<Cell<bool>>,
+
+    demoted: Rc<Cell<usize>>,
 }
 
 impl Script {
@@ -534,6 +536,7 @@ impl Script {
             replies: Rc::new(RefCell::new(replies.into_iter().collect())),
             requests: Rc::new(RefCell::new(Vec::new())),
             closed: Rc::new(Cell::new(false)),
+            demoted: Rc::new(Cell::new(0)),
         }
     }
 }
@@ -570,6 +573,62 @@ impl Source<TestHost> for Script {
     fn close(&self) {
         self.closed.set(true);
     }
+
+    fn demote(&self) {
+        self.demoted.set(self.demoted.get() + 1);
+    }
+}
+
+/// A rejected response demotes its seat; success and 204 do not.
+#[test]
+fn feed_demotes_seat_after_stale_cursor_or_error_only() {
+    futures::executor::block_on(async {
+        let feed = Feed::new(Numbers, "/watch".into(), 16).unwrap();
+        let script = Script::new([
+            full(3),
+            Reply::Response(204, vec![]),
+            // A stale seat answers with an older document.
+            full(2),
+            Reply::Error(Failure::Core(Error::Replay), None),
+            full(4),
+        ]);
+        let scope = Scope::new();
+        assert_eq!(
+            *feed
+                .fetch::<TestHost, _>(&script, &scope)
+                .await
+                .unwrap()
+                .unwrap(),
+            3
+        );
+        assert!(
+            feed.fetch::<TestHost, _>(&script, &scope)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(script.demoted.get(), 0);
+        assert_eq!(
+            feed.fetch::<TestHost, _>(&script, &scope)
+                .await
+                .unwrap_err()
+                .error,
+            Failure::Core(Error::Replay)
+        );
+        assert_eq!(script.demoted.get(), 1);
+        assert!(feed.fetch::<TestHost, _>(&script, &scope).await.is_err());
+        assert_eq!(script.demoted.get(), 2);
+        assert_eq!(
+            *feed
+                .fetch::<TestHost, _>(&script, &scope)
+                .await
+                .unwrap()
+                .unwrap(),
+            4
+        );
+        assert_eq!(script.demoted.get(), 2);
+        assert_eq!(*feed.last().unwrap(), 4);
+    });
 }
 
 /// Encode one complete integer document as a successful response.

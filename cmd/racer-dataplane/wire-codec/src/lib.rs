@@ -209,6 +209,29 @@ pub fn encode_hex(bytes: &[u8]) -> String {
     value
 }
 
+/// One elected controller endpoint and the exact certificate it must present.
+///
+/// Discovery publishes these from coordination state. The certificate is
+/// both the sole trust anchor and the only accepted end-entity certificate,
+/// so hostname, validity, and signature checks still apply to the pin.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscoveredEndpoint {
+    /// HTTPS authority without a path, query, or credentials.
+    pub url: String,
+
+    /// DER self-signed serving certificate pinned for this endpoint.
+    pub certificate: Vec<u8>,
+
+    /// Opaque election generation; a change invalidates pooled connections.
+    pub generation: String,
+}
+
+/// Shared endpoint set replaced by discovery and read on every checkout.
+pub type DiscoveredEndpoints = std::sync::Arc<std::sync::RwLock<Vec<DiscoveredEndpoint>>>;
+
+/// Maximum discovered endpoints considered by one connection attempt.
+pub const MAX_DISCOVERED_ENDPOINTS: usize = 16;
+
 #[cfg(feature = "rest")]
 pub mod rest {
     //! Bounded TLS 1.3 JSON HTTP on caller-owned readiness, deadlines, and leases.
@@ -329,6 +352,8 @@ pub mod rest {
         pub max_error_body: usize,
     }
 
+    pub use crate::{DiscoveredEndpoint, DiscoveredEndpoints, MAX_DISCOVERED_ENDPOINTS};
+
     /// Borrowed DER certificates and PKCS#8 key. Caller validates identity policy.
     #[derive(Clone, Copy)]
     pub struct Identity<'a> {
@@ -386,6 +411,62 @@ pub mod rest {
 
         /// Only the current attachment keeps its recycling authorization alive.
         owner: RefCell<Rc<()>>,
+
+        /// Discovered endpoints replacing the static URL and trust file when set.
+        discovered: RefCell<Option<DiscoveredEndpoints>>,
+
+        /// Discovered seat ranking hints shared with checked-out connections.
+        health: Rc<std::cell::Cell<Health>>,
+    }
+
+    /// Ranking hints for discovered seats. Both values are endpoint epochs.
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct Health {
+        /// Seat that last served a successful response; tried first.
+        preferred: Option<[u8; 32]>,
+
+        /// Seat that last failed after connecting; tried last.
+        avoid: Option<[u8; 32]>,
+    }
+
+    impl Health {
+        /// Move `epoch` from first to last place in the next ranking.
+        fn demote(&mut self, epoch: [u8; 32]) {
+            if self.preferred == Some(epoch) {
+                self.preferred = None;
+            }
+            self.avoid = Some(epoch);
+        }
+    }
+
+    /// The discovered seat a connection reached, so a bad response demotes it.
+    struct Route {
+        /// Ranking hints of the transport that opened the connection.
+        health: std::rc::Weak<std::cell::Cell<Health>>,
+
+        /// Endpoint epoch of the seat.
+        epoch: [u8; 32],
+    }
+
+    impl Route {
+        fn demote(&self) {
+            if let Some(health) = self.health.upgrade() {
+                let mut value = health.get();
+                value.demote(self.epoch);
+                health.set(value);
+            }
+        }
+
+        fn promote(&self) {
+            if let Some(health) = self.health.upgrade() {
+                let mut value = health.get();
+                value.preferred = Some(self.epoch);
+                if value.avoid == Some(self.epoch) {
+                    value.avoid = None;
+                }
+                health.set(value);
+            }
+        }
     }
 
     /// An exclusive TLS connection, consumed by one request before possible reuse.
@@ -407,6 +488,9 @@ pub mod rest {
 
         /// Maximum response body size for statuses other than 200.
         max_error_body: usize,
+
+        /// Discovered seat, if any, ranked by this connection's outcome.
+        route: Option<Route>,
     }
 
     /// A framed JSON response whose body is erased when it is dropped.
@@ -578,7 +662,34 @@ pub mod rest {
                 io: RefCell::new(None),
                 idle: Rc::new(RefCell::new(None)),
                 owner: RefCell::new(Rc::new(())),
+                discovered: RefCell::new(None),
+                health: Rc::new(std::cell::Cell::new(Health::default())),
             }
+        }
+
+        /// Use a discovered, pinned endpoint set instead of the static URL and trust.
+        ///
+        /// Replaces the owner token as well as the idle slot, so a connection
+        /// checked out under the previous set can never be recycled afterward.
+        pub fn set_endpoints(&self, endpoints: DiscoveredEndpoints) {
+            *self.owner.borrow_mut() = Rc::new(());
+            self.idle.borrow_mut().take();
+            self.health.set(Health::default());
+            *self.discovered.borrow_mut() = Some(endpoints);
+        }
+
+        /// Move the last successful discovered seat to the end of the next ranking.
+        ///
+        /// For failures seen above HTTP, such as a stale cursor in a 200
+        /// response. Drops the idle connection so the next request reconnects.
+        /// No effect without discovered endpoints.
+        pub fn demote(&self) {
+            self.idle.borrow_mut().take();
+            let mut health = self.health.get();
+            if let Some(preferred) = health.preferred {
+                health.demote(preferred);
+            }
+            self.health.set(health);
         }
 
         /// Replace the owner, discarding idle TLS and invalidating old recycling rights.
@@ -612,6 +723,10 @@ pub mod rest {
                 if identity.is_some_and(|i| uring_runtime::environment::wall_now() >= i.expires) {
                     return Err(Error::Unauthorized.into());
                 }
+                let discovered = self.discovered.borrow().clone();
+                if let Some(discovered) = discovered {
+                    return self.connect_discovered(&discovered, identity, scope).await;
+                }
                 let endpoint = endpoint(&self.config.url)?;
                 let io = self.io()?;
                 let owner = Rc::downgrade(&self.owner.borrow());
@@ -624,53 +739,150 @@ pub mod rest {
                     .await?;
                 let epoch = trust_epoch(trust.as_ref(), identity);
                 if owner.upgrade().is_some()
-                    && let Some(connection) = self.checkout(identity, epoch, scope)
+                    && let Some(connection) = self.checkout(identity, &[epoch], scope)
                 {
                     return Ok(connection);
                 }
                 let config = tls_config(trust.as_ref(), identity)?;
-                let addresses = if let Ok(ip) = endpoint.host.parse() {
-                    vec![SocketAddr::new(ip, endpoint.port)]
-                } else {
-                    io.resolve(&endpoint.host, endpoint.port, scope).await?
-                };
-                if addresses.is_empty() || addresses.len() > 64 {
-                    return Err(Error::Unavailable.into());
-                }
-                let socket = connect_addresses(io.as_ref(), &addresses, scope).await?;
-                let server = rustls::pki_types::ServerName::try_from(endpoint.host)
-                    .map_err(|_| Error::InvalidConfiguration)?;
-                let mut tls = rustls::ClientConnection::new(Arc::new(config), server)
-                    .map_err(|_| Error::Unauthorized)?;
-                tls.set_buffer_limit(Some(64 * 1024));
-                let authentication = self.authentication(identity, epoch, owner)?;
-                let mut connection = Connection {
-                    socket,
-                    tls,
-                    io,
-                    host: endpoint.authority,
-                    authentication,
-                    max_error_body: self.config.max_error_body,
-                };
-                while connection.tls.is_handshaking() {
-                    connection.step(scope).await?;
-                }
-                Ok(connection)
+                self.handshake(io, endpoint, config, identity, epoch, owner, scope)
+                    .await
             })
+        }
+
+        /// Reuse a connection to any current endpoint, else try each in ranked order.
+        ///
+        /// Every endpoint receives a share of the remaining deadline. Failures,
+        /// including pin mismatches against a stale endpoint, move on to the next
+        /// endpoint and finally report `Unavailable` so callers retry with backoff
+        /// after discovery refreshes the set.
+        async fn connect_discovered(
+            &self,
+            discovered: &DiscoveredEndpoints,
+            identity: Option<Identity<'_>>,
+            scope: &I::Scope,
+        ) -> Result<Connection<I>, I::Error> {
+            let endpoints = discovered
+                .read()
+                .map_err(|_| Error::Internal)?
+                .iter()
+                .take(MAX_DISCOVERED_ENDPOINTS)
+                .cloned()
+                .collect::<Vec<_>>();
+            let io = self.io()?;
+            let owner = Rc::downgrade(&self.owner.borrow());
+            let epochs = endpoints
+                .iter()
+                .map(|e| discovered_epoch(e, identity))
+                .collect::<Vec<_>>();
+            if owner.upgrade().is_some()
+                && let Some(connection) = self.checkout(identity, &epochs, scope)
+            {
+                return Ok(connection);
+            }
+            let mut random = [0; 8];
+            uring_runtime::environment::fill_random(&mut random).map_err(|_| Error::Io)?;
+            let health = self.health.get();
+            let order = rank(
+                &epochs,
+                health.preferred,
+                health.avoid,
+                u64::from_ne_bytes(random),
+            );
+            for (index, position) in order.iter().enumerate() {
+                scope.check()?;
+                let candidate = &endpoints[*position];
+                let Ok(parsed) = endpoint(&candidate.url) else {
+                    continue;
+                };
+                let Ok(config) = pinned_tls_config(&candidate.certificate, identity) else {
+                    continue;
+                };
+                let now = uring_runtime::environment::now();
+                let share =
+                    scope.deadline().saturating_duration_since(now) / (order.len() - index) as u32;
+                let attempt = scope.narrowed(now + share);
+                let result = self
+                    .handshake(
+                        io.clone(),
+                        parsed,
+                        config,
+                        identity,
+                        epochs[*position],
+                        owner.clone(),
+                        &attempt,
+                    )
+                    .await;
+                scope.check()?;
+                if let Ok(mut connection) = result {
+                    // Ranking changes only after a response, so a seat that
+                    // accepts TLS but answers badly is not preferred.
+                    connection.route = Some(Route {
+                        health: Rc::downgrade(&self.health),
+                        epoch: epochs[*position],
+                    });
+                    return Ok(connection);
+                }
+            }
+            let mut health = self.health.get();
+            health.preferred = None;
+            self.health.set(health);
+            Err(Error::Unavailable.into())
+        }
+
+        /// Resolve, connect, and complete TLS before any request bytes are written.
+        #[allow(clippy::too_many_arguments)]
+        async fn handshake(
+            &self,
+            io: Rc<I>,
+            endpoint: Endpoint,
+            config: rustls::ClientConfig,
+            identity: Option<Identity<'_>>,
+            epoch: [u8; 32],
+            owner: std::rc::Weak<()>,
+            scope: &I::Scope,
+        ) -> Result<Connection<I>, I::Error> {
+            let addresses = if let Ok(ip) = endpoint.host.parse() {
+                vec![SocketAddr::new(ip, endpoint.port)]
+            } else {
+                io.resolve(&endpoint.host, endpoint.port, scope).await?
+            };
+            if addresses.is_empty() || addresses.len() > 64 {
+                return Err(Error::Unavailable.into());
+            }
+            let socket = connect_addresses(io.as_ref(), &addresses, scope).await?;
+            let server = rustls::pki_types::ServerName::try_from(endpoint.host)
+                .map_err(|_| Error::InvalidConfiguration)?;
+            let mut tls = rustls::ClientConnection::new(Arc::new(config), server)
+                .map_err(|_| Error::Unauthorized)?;
+            tls.set_buffer_limit(Some(64 * 1024));
+            let authentication = self.authentication(identity, epoch, owner)?;
+            let mut connection = Connection {
+                socket,
+                tls,
+                io,
+                host: endpoint.authority,
+                authentication,
+                max_error_body: self.config.max_error_body,
+                route: None,
+            };
+            while connection.tls.is_handshaking() {
+                connection.step(scope).await?;
+            }
+            Ok(connection)
         }
 
         /// Consume the idle slot even when its identity, epoch, or age is ineligible.
         fn checkout(
             &self,
             identity: Option<Identity<'_>>,
-            epoch: [u8; 32],
+            epochs: &[[u8; 32]],
             scope: &I::Scope,
         ) -> Option<Connection<I>> {
             let mut idle = self.idle.borrow_mut();
             let connection = idle.take()?;
             if let Authentication::Authenticated(auth) = &connection.authentication
                 && identity.is_some()
-                && auth.epoch == epoch
+                && epochs.contains(&auth.epoch)
                 && auth.owner.upgrade().is_some()
                 && connection.within_max_age()
                 && uring_runtime::environment::now().saturating_duration_since(auth.idle_since)
@@ -856,8 +1068,30 @@ pub mod rest {
                     limit,
                 } = request;
                 let request = request_head(&self.host, method, path, token, body.len(), header)?;
-                self.send(request.as_bytes(), body, scope).await?;
-                let completed = self.receive_response(limit, scope).await?;
+                let route = self.route.take();
+                let exchange = async {
+                    self.send(request.as_bytes(), body, scope).await?;
+                    self.receive_response(limit, scope).await
+                };
+                let completed = match exchange.await {
+                    Ok(completed) => completed,
+                    Err(error) => {
+                        if let Some(route) = &route {
+                            route.demote();
+                        }
+                        return Err(error);
+                    }
+                };
+                // Any non-success status, including 401, 403, and 503 from a
+                // live but stale seat, moves the next attempt to another seat.
+                if let Some(route) = &route {
+                    if matches!(completed.head.status, 200 | 204) {
+                        route.promote();
+                    } else {
+                        route.demote();
+                    }
+                }
+                self.route = route;
                 self.recycle(&completed);
                 Ok(Response {
                     status: completed.head.status,
@@ -1209,6 +1443,144 @@ pub mod rest {
         epoch.finalize().into()
     }
 
+    /// Bind pooled reuse to one endpoint's URL, pin, election generation, and identity.
+    fn discovered_epoch(endpoint: &DiscoveredEndpoint, identity: Option<Identity<'_>>) -> [u8; 32] {
+        use sha2::Digest;
+        let mut epoch = sha2::Sha256::new();
+        epoch.update(b"racer-discovered-endpoint\0");
+        for field in [
+            endpoint.url.as_bytes(),
+            &endpoint.certificate,
+            endpoint.generation.as_bytes(),
+        ] {
+            epoch.update((field.len() as u64).to_be_bytes());
+            epoch.update(field);
+        }
+        epoch.update(trust_epoch(&[], identity));
+        epoch.finalize().into()
+    }
+
+    /// Order the last successful endpoint first, then the rest from a random rotation.
+    ///
+    /// The random start spreads many nodes across live seats after a failure,
+    /// instead of every node retrying the first listed endpoint at once.
+    fn rank(
+        epochs: &[[u8; 32]],
+        preferred: Option<[u8; 32]>,
+        avoid: Option<[u8; 32]>,
+        random: u64,
+    ) -> Vec<usize> {
+        let count = epochs.len();
+        if count == 0 {
+            return Vec::new();
+        }
+        let start = (random % count as u64) as usize;
+        let mut order = (0..count)
+            .map(|offset| (start + offset) % count)
+            .collect::<Vec<_>>();
+        if let Some(avoid) = avoid
+            && let Some(position) = order.iter().position(|i| epochs[*i] == avoid)
+        {
+            let last = order.remove(position);
+            order.push(last);
+        }
+        if let Some(preferred) = preferred
+            && Some(preferred) != avoid
+            && let Some(position) = order.iter().position(|i| epochs[*i] == preferred)
+        {
+            let first = order.remove(position);
+            order.insert(0, first);
+        }
+        order
+    }
+
+    /// Accept exactly the pinned certificate, after full WebPKI verification against it.
+    #[derive(Debug)]
+    struct PinnedVerifier {
+        /// Exact DER end-entity certificate the server must present.
+        pinned: Vec<u8>,
+
+        /// Hostname, validity, usage, and signature checks rooted at the pin.
+        inner: Arc<rustls::client::WebPkiServerVerifier>,
+    }
+
+    impl rustls::client::danger::ServerCertVerifier for PinnedVerifier {
+        /// Require the exact pinned leaf with no chain, then delegate WebPKI checks.
+        fn verify_server_cert(
+            &self,
+            end_entity: &rustls::pki_types::CertificateDer<'_>,
+            intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            server_name: &rustls::pki_types::ServerName<'_>,
+            ocsp: &[u8],
+            now: rustls::pki_types::UnixTime,
+        ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error>
+        {
+            if end_entity.as_ref() != self.pinned.as_slice() || !intermediates.is_empty() {
+                return Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::UnknownIssuer,
+                ));
+            }
+            self.inner
+                .verify_server_cert(end_entity, intermediates, server_name, ocsp, now)
+        }
+
+        /// TLS 1.2 is never negotiated; delegate for completeness.
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+        {
+            self.inner.verify_tls12_signature(message, cert, dss)
+        }
+
+        /// Verify the handshake signature with the pinned key.
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+        {
+            self.inner.verify_tls13_signature(message, cert, dss)
+        }
+
+        /// Offer the provider's supported signature schemes.
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.inner.supported_verify_schemes()
+        }
+    }
+
+    /// Build TLS 1.3 configuration trusting only one pinned self-signed certificate.
+    fn pinned_tls_config(
+        certificate: &[u8],
+        identity: Option<Identity<'_>>,
+    ) -> Result<rustls::ClientConfig> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(
+                certificate.to_vec(),
+            ))
+            .map_err(|_| Error::Unauthorized)?;
+        let inner = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            provider.clone(),
+        )
+        .build()
+        .map_err(|_| Error::Unauthorized)?;
+        let builder = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|_| Error::Unauthorized)?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedVerifier {
+                pinned: certificate.to_vec(),
+                inner,
+            }));
+        finish_tls_config(builder, identity)
+    }
+
     /// Build fresh TLS 1.3 trust and optional client authentication without resumption.
     fn tls_config(
         mut trust: &[u8],
@@ -1229,6 +1601,14 @@ pub mod rest {
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|_| Error::Unauthorized)?
         .with_root_certificates(roots);
+        finish_tls_config(builder, identity)
+    }
+
+    /// Add optional client authentication, HTTP/1.1 ALPN, and disable resumption.
+    fn finish_tls_config(
+        builder: rustls::ConfigBuilder<rustls::ClientConfig, rustls::client::WantsClientCert>,
+        identity: Option<Identity<'_>>,
+    ) -> Result<rustls::ClientConfig> {
         let mut config = if let Some(identity) = identity {
             builder
                 .with_client_auth_cert(
@@ -1248,6 +1628,98 @@ pub mod rest {
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
         config.resumption = rustls::client::Resumption::disabled();
         Ok(config)
+    }
+
+    #[cfg(test)]
+    mod discovery_tests {
+        use super::*;
+
+        /// Ranking is a permutation that leads with the preferred seat when present.
+        #[test]
+        fn rank_prefers_last_success_and_spreads_start() {
+            assert!(rank(&[], None, None, 7).is_empty());
+            let epochs = [[1; 32], [2; 32], [3; 32]];
+            let mut starts = std::collections::BTreeSet::new();
+            for random in 0..6 {
+                let mut order = rank(&epochs, None, None, random);
+                starts.insert(order[0]);
+                order.sort();
+                assert_eq!(order, [0, 1, 2]);
+                assert_eq!(rank(&epochs, Some([3; 32]), None, random)[0], 2);
+                assert_eq!(
+                    rank(&epochs, Some([9; 32]), None, random)[0],
+                    (random % 3) as usize
+                );
+            }
+            assert_eq!(starts.len(), 3);
+        }
+
+        /// A failed seat goes last, even when it was preferred.
+        #[test]
+        fn rank_moves_failed_seat_last() {
+            let epochs = [[1; 32], [2; 32], [3; 32]];
+            for random in 0..6 {
+                let order = rank(&epochs, None, Some([1; 32]), random);
+                assert_eq!(order[2], 0);
+                let order = rank(&epochs, Some([1; 32]), Some([1; 32]), random);
+                assert_eq!(order[2], 0);
+                let order = rank(&epochs, Some([3; 32]), Some([1; 32]), random);
+                assert_eq!((order[0], order[2]), (2, 0));
+                let mut sorted = order.clone();
+                sorted.sort();
+                assert_eq!(sorted, [0, 1, 2]);
+            }
+        }
+
+        /// Health keeps one preferred and one avoided seat.
+        #[test]
+        fn health_demote_clears_matching_preference() {
+            let mut health = Health {
+                preferred: Some([1; 32]),
+                avoid: None,
+            };
+            health.demote([2; 32]);
+            assert_eq!(health.preferred, Some([1; 32]));
+            assert_eq!(health.avoid, Some([2; 32]));
+            health.demote([1; 32]);
+            assert_eq!(health.preferred, None);
+            assert_eq!(health.avoid, Some([1; 32]));
+        }
+
+        /// Endpoint epochs separate URL, pin, generation, and client identity.
+        #[test]
+        fn discovered_epoch_binds_every_field() {
+            let base = DiscoveredEndpoint {
+                url: "https://10.0.0.1:8443".into(),
+                certificate: vec![1, 2],
+                generation: "g".into(),
+            };
+            let mut url = base.clone();
+            url.url = "https://10.0.0.2:8443".into();
+            let mut pin = base.clone();
+            pin.certificate = vec![1, 3];
+            let mut generation = base.clone();
+            generation.generation = "h".into();
+            let chain = vec![vec![9]];
+            let identity = Identity {
+                certificate_chain: &chain,
+                private_key: &[],
+                expires: SystemTime::UNIX_EPOCH,
+            };
+            let epochs = [
+                discovered_epoch(&base, None),
+                discovered_epoch(&url, None),
+                discovered_epoch(&pin, None),
+                discovered_epoch(&generation, None),
+                discovered_epoch(&base, Some(identity)),
+            ];
+            for (i, left) in epochs.iter().enumerate() {
+                for right in &epochs[i + 1..] {
+                    assert_ne!(left, right);
+                }
+            }
+            assert_eq!(discovered_epoch(&base, None), epochs[0]);
+        }
     }
 
     /// Supported, unambiguous HTTP body boundaries.

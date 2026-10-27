@@ -6,14 +6,16 @@ package racer
 import (
 	"context"
 	"errors"
-	"fmt"
+	"strings"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
+	admissionv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -21,8 +23,8 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/intstr"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -30,8 +32,7 @@ import (
 
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/operator/component"
-	"github.com/Azure/unbounded/internal/operator/override"
-	racercore "github.com/Azure/unbounded/internal/racer"
+	"github.com/Azure/unbounded/internal/racer/workload"
 )
 
 func testEnv(t *testing.T, objects ...client.Object) *component.Env {
@@ -46,7 +47,8 @@ func testEnv(t *testing.T, objects ...client.Object) *component.Env {
 			return c.Create(ctx, obj, opts...)
 		},
 		Apply: func(ctx context.Context, c client.WithWatch, cfg runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
-			// Model persistence only; this fake does not enforce admission or RBAC.
+			// Model persistence only; this fake does not enforce admission,
+			// RBAC, or server-side apply field ownership.
 			data, err := runtime.DefaultUnstructuredConverter.ToUnstructured(cfg)
 			if err != nil {
 				return err
@@ -57,6 +59,7 @@ func testEnv(t *testing.T, objects ...client.Object) *component.Env {
 
 			err = c.Get(ctx, client.ObjectKeyFromObject(obj), current)
 			if apierrors.IsNotFound(err) {
+				obj.SetUID(types.UID(uuid.NewString()))
 				return c.Create(ctx, obj)
 			}
 
@@ -64,7 +67,7 @@ func testEnv(t *testing.T, objects ...client.Object) *component.Env {
 				return err
 			}
 
-			if (obj.GetUID() != "" && obj.GetUID() != current.GetUID()) || (obj.GetResourceVersion() != "" && obj.GetResourceVersion() != current.GetResourceVersion()) {
+			if obj.GetUID() != "" && obj.GetUID() != current.GetUID() {
 				return apierrors.NewConflict(corev1.Resource(obj.GetKind()), obj.GetName(), errors.New("apply precondition failed"))
 			}
 
@@ -84,8 +87,7 @@ func cacheObject(name string) *racerv1.ClusterCache {
 
 func planPass(t *testing.T, env *component.Env) *component.Plan {
 	t.Helper()
-	plan, _, err := (Component{}).Plan(t.Context(), env, nil)
-	require.NoError(t, err)
+	plan, _ := planResult(t, env)
 
 	return plan
 }
@@ -100,439 +102,1100 @@ func persist(t *testing.T, env *component.Env, plan *component.Plan) {
 	}
 }
 
-func initialize(t *testing.T, env *component.Env) racercore.Config {
+// initialize runs passes until the dataplane is installed.
+func initialize(t *testing.T, env *component.Env) {
 	t.Helper()
 
-	for range 9 {
-		plan := planPass(t, env)
+	for range 5 {
+		plan, result := planResult(t, env)
 		persist(t, env, plan)
+
+		if result.Reason != reasonInitializing && result.Reason != reasonMigrating {
+			return
+		}
 	}
 
-	cm := &corev1.ConfigMap{}
-	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, configName), cm))
-
-	cfg, err := racercore.ConfigFromLookup(func(key string) (string, bool) {
-		if key == "POD_NAMESPACE" {
-			return env.Namespace, true
-		}
-
-		value, ok := cm.Data[key]
-
-		return value, ok
-	})
-	require.NoError(t, err)
-	require.Equal(t, env.Config.Image(objectImageName), cfg.ObjectImage)
-	require.NoError(t, racercore.Assemble(cfg, env.Client, env.APIReader).Recover(t.Context(), env.Client))
-
-	return cfg
+	t.Fatal("installation did not converge")
 }
 
-func TestClusterCacheActivationUsesLiveReader(t *testing.T) {
+func dataplaneOp(t *testing.T, plan *component.Plan) component.Operation {
+	t.Helper()
+
+	for _, op := range plan.Operations {
+		if op.Object.GetKind() == "DaemonSet" && op.Object.GetName() == dataplaneName {
+			return op
+		}
+	}
+
+	t.Fatal("dataplane DaemonSet not planned")
+
+	return component.Operation{}
+}
+
+func liveDataplane(t *testing.T, env *component.Env) *appsv1.DaemonSet {
+	t.Helper()
+
+	ds := &appsv1.DaemonSet{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, dataplaneName), ds))
+
+	return ds
+}
+
+func managed() map[string]string { return map[string]string{managerAnnotation: component.FieldOwner} }
+
+func TestNoClusterCacheIsInert(t *testing.T) {
 	env := testEnv(t)
-	require.Zero(t, planPass(t, env).Len())
+	plan, result := planResult(t, env)
+	require.Zero(t, plan.Len())
+	require.True(t, result.Ready)
 
-	listed := false
-	live := testEnv(t, cacheObject("cache"))
-	env.APIReader = interceptor.NewClient(live.Client.(client.WithWatch), interceptor.Funcs{
-		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-			_, listed = list.(*racerv1.ClusterCacheList)
-			require.True(t, listed)
-			require.EqualValues(t, 1, (&client.ListOptions{}).ApplyOptions(opts).Limit)
-
-			return c.List(ctx, list, opts...)
-		},
-	})
-	plan := planPass(t, env)
-	require.True(t, listed)
-	require.Len(t, plan.Operations, 1)
-	require.Equal(t, claimName, plan.Operations[0].Object.GetName())
-
-	env.APIReader = interceptor.NewClient(live.Client.(client.WithWatch), interceptor.Funcs{
-		List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
-			return errors.New("unavailable")
-		},
-	})
-	plan, _, err := (Component{}).Plan(t.Context(), env, nil)
-	require.Error(t, err)
-	require.Nil(t, plan)
-}
-
-func TestLifecycleWithoutSites(t *testing.T) {
-	env := testEnv(t, cacheObject("first"))
-	cfg := initialize(t, env)
-	plan := planPass(t, env)
-	persist(t, env, plan)
-
-	daemonSets := 0
-
-	for _, op := range plan.Operations {
-		require.NotEqual(t, "NetworkPolicy", op.Object.GetKind())
-		require.Empty(t, op.Object.GetOwnerReferences())
-
-		if op.Object.GetKind() == "DaemonSet" {
-			daemonSets++
-
-			require.Equal(t, dataplaneName, op.Object.GetName())
-		}
-	}
-
-	require.Equal(t, 1, daemonSets)
-
-	deployment := &appsv1.Deployment{}
-	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), deployment))
-	require.EqualValues(t, 3, *deployment.Spec.Replicas)
-	require.Zero(t, deployment.Spec.Strategy.RollingUpdate.MaxUnavailable.IntValue())
-	require.Equal(t, 1, deployment.Spec.Strategy.RollingUpdate.MaxSurge.IntValue())
-	pod := deployment.Spec.Template.Spec
-	require.Equal(t, controllerName, pod.ServiceAccountName)
-	require.True(t, pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken)
-	require.Len(t, pod.Containers, 1)
-	require.Empty(t, pod.InitContainers)
-	container := pod.Containers[0]
-	require.Equal(t, env.Config.Image(controllerName), container.Image)
-	require.Empty(t, container.Args)
-	require.Equal(t, "/readyz", container.ReadinessProbe.HTTPGet.Path)
-	require.Equal(t, "/healthz", container.LivenessProbe.HTTPGet.Path)
-	require.Equal(t, []corev1.ContainerPort{{Name: "https", ContainerPort: 8443}, {Name: "probes", ContainerPort: 8081}, {Name: "metrics", ContainerPort: 8080}, {Name: "webhook", ContainerPort: 9443, Protocol: corev1.ProtocolTCP}}, container.Ports)
-	require.Equal(t, []corev1.KeyToPath{{Key: "tls.crt", Path: "tls.crt"}, {Key: "tls.key", Path: "tls.key"}, {Key: caBundleKey, Path: "ca.crt"}}, pod.Volumes[0].Secret.Items)
-	token := pod.Volumes[1].Projected.Sources[0].ServiceAccountToken
-	require.Equal(t, racercore.ReplicationAudience, token.Audience)
-	require.EqualValues(t, 3600, *token.ExpirationSeconds)
-	require.EqualValues(t, 0o400, *pod.Volumes[1].Projected.DefaultMode)
-	require.Equal(t, cfg.ReplicationTokenFile, container.VolumeMounts[1].MountPath+"/"+token.Path)
-	require.Equal(t, controllerName+"."+env.Namespace+".svc", cfg.ReplicationServerName)
-	require.EqualValues(t, 8443, cfg.ReplicationPort)
-
-	budget := &policyv1.PodDisruptionBudget{}
-	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), budget))
-	require.Nil(t, budget.Spec.MinAvailable)
-	require.NotNil(t, budget.Spec.MaxUnavailable)
-	require.Equal(t, intstr.FromInt32(1), *budget.Spec.MaxUnavailable)
-	require.Equal(t, deployment.Spec.Selector, budget.Spec.Selector)
-
-	service := &corev1.Service{}
-	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), service))
-	require.Equal(t, deployment.Spec.Template.Labels, service.Spec.Selector)
-	require.False(t, service.Spec.PublishNotReadyAddresses)
-
-	accounts := &corev1.ServiceAccountList{}
-	require.NoError(t, env.Client.List(t.Context(), accounts))
-	require.Len(t, accounts.Items, 2)
-	require.ElementsMatch(t, []string{controllerName, dataplaneName}, []string{accounts.Items[0].Name, accounts.Items[1].Name})
-
-	before := &corev1.ConfigMap{}
-	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, versionName), before))
-	require.NoError(t, env.Client.Delete(t.Context(), cacheObject("first")))
-	require.Zero(t, planPass(t, env).Len())
-	require.NoError(t, env.Client.Delete(t.Context(), deployment))
-	require.Zero(t, planPass(t, env).Len())
-	require.NoError(t, env.Client.Create(t.Context(), cacheObject("later")))
-	persist(t, env, planPass(t, env))
-
-	after := &corev1.ConfigMap{}
-	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, versionName), after))
-	require.Equal(t, before, after)
-	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), deployment))
-}
-
-func TestControllerPDBReplicaOverrides(t *testing.T) {
-	for _, replicas := range []int64{0, 1, 2, 3, 5} {
-		t.Run(fmt.Sprintf("replicas=%d", replicas), func(t *testing.T) {
-			env := testEnv(t, cacheObject("cache"))
-			initialize(t, env)
-			plan := planPass(t, env)
-			entries := []override.SourcedEntry{{
-				Source: override.Source{Key: "racer.yaml", Index: 0},
-				Entry: override.Entry{
-					Component: "racer", Kind: "Deployment",
-					Patch: map[string]any{"spec": map[string]any{"replicas": replicas}},
-				},
-			}}
-			require.NoError(t, override.ValidateErr(entries))
-
-			report := override.Apply(plan, entries, nil)
-			require.NoError(t, report.Err())
-			require.Empty(t, report.Withheld)
-			require.Len(t, report.Workloads, 1)
-			persist(t, env, plan)
-
-			deployment := &appsv1.Deployment{}
-			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), deployment))
-			require.EqualValues(t, replicas, *deployment.Spec.Replicas)
-			require.Equal(t, intstr.FromInt32(0), *deployment.Spec.Strategy.RollingUpdate.MaxUnavailable)
-			require.Equal(t, intstr.FromInt32(1), *deployment.Spec.Strategy.RollingUpdate.MaxSurge)
-
-			budget := &policyv1.PodDisruptionBudget{}
-			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), budget))
-			require.Nil(t, budget.Spec.MinAvailable)
-			require.NotNil(t, budget.Spec.MaxUnavailable)
-			require.Equal(t, intstr.FromInt32(1), *budget.Spec.MaxUnavailable)
-			require.Equal(t, deployment.Spec.Selector, budget.Spec.Selector)
-		})
-	}
-}
-
-func TestDamagedStateFailsClosed(t *testing.T) {
-	for _, target := range []string{claimName, markerName, versionName, tlsName, "wrong-version-binding", "replaced-marker", "corrupt-version"} {
-		t.Run(target, func(t *testing.T) {
-			env := testEnv(t, cacheObject("cache"))
-			initialize(t, env)
-
-			var obj client.Object = &corev1.ConfigMap{}
-
-			key := target
-			switch target {
-			case tlsName:
-				obj = &corev1.Secret{}
-			case "wrong-version-binding", "corrupt-version":
-				key = versionName
-			case "replaced-marker":
-				key = markerName
-			}
-
-			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, key), obj))
-
-			switch target {
-			case "wrong-version-binding":
-				obj.SetAnnotations(nil)
-				require.NoError(t, env.Client.Update(t.Context(), obj))
-			case "corrupt-version":
-				obj.(*corev1.ConfigMap).Data["sequence"] = "0"
-				require.NoError(t, env.Client.Update(t.Context(), obj))
-			default:
-				require.NoError(t, env.Client.Delete(t.Context(), obj))
-
-				if target == "replaced-marker" {
-					obj.SetResourceVersion("")
-					require.NoError(t, env.Client.Create(t.Context(), obj))
-				}
-			}
-
-			plan, _, err := (Component{}).Plan(t.Context(), env, nil)
-			require.Error(t, err)
-			require.Nil(t, plan)
-		})
-	}
-}
-
-func TestStandaloneDataplaneBlocksNewInstallation(t *testing.T) {
-	ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "racer-dataplane", Namespace: "custom-system", UID: "external"}}
-	sa := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "racer-dataplane", Namespace: "custom-system", UID: "external"}}
-	env := testEnv(t, cacheObject("cache"), ds, sa)
-
-	plan, _, err := (Component{}).Plan(t.Context(), env, nil)
-	require.ErrorContains(t, err, "standalone installations are not adopted")
-	require.Nil(t, plan)
-
-	actual := &appsv1.DaemonSet{}
-	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKeyFromObject(ds), actual))
-	require.Equal(t, ds.Spec, actual.Spec)
-	require.Equal(t, ds.UID, actual.UID)
-
-	account := &corev1.ServiceAccount{}
-	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKeyFromObject(sa), account))
-	require.Equal(t, sa.UID, account.UID)
-}
-
-func TestControllerConfigPreservesTuningAndValidates(t *testing.T) {
-	env := testEnv(t, cacheObject("cache"))
+	// Removing the last cache retains everything, including runtime state.
+	env = testEnv(t, cacheObject("cache"))
 	initialize(t, env)
+	require.NoError(t, env.Client.Delete(t.Context(), cacheObject("cache")))
 
-	cm := &corev1.ConfigMap{}
-	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, configName), cm))
-
-	for _, key := range []string{"RACER_DATAPLANE_IMAGE", "RACER_CONTROL_URL", "RACER_HOST_NETWORK", "RACER_BOOTSTRAP_TRUST_CONFIGMAP", "RACER_DIAGNOSTICS_PORT"} {
-		require.NotContains(t, cm.Data, key)
-	}
-
-	cm.Data["RACER_HANDSHAKE_TIMEOUT"] = "9s"
-	cm.Data["ADMIN_SETTING"] = "keep"
-	cm.Data["RACER_CLUSTER_ID"] = "incorrect"
-	delete(cm.Data, "RACER_SNAPSHOT_MAX_AGE")
-	require.NoError(t, env.Client.Update(t.Context(), cm))
-	persist(t, env, planPass(t, env))
-	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, configName), cm))
-	require.Equal(t, "9s", cm.Data["RACER_HANDSHAKE_TIMEOUT"])
-	require.Equal(t, "keep", cm.Data["ADMIN_SETTING"])
-	require.NotEqual(t, "incorrect", cm.Data["RACER_CLUSTER_ID"])
-	require.NotContains(t, cm.Data, "RACER_SNAPSHOT_MAX_AGE")
-	cm.Data["RACER_HANDSHAKE_TIMEOUT"] = "bad"
-	require.NoError(t, env.Client.Update(t.Context(), cm))
-	plan, _, err := (Component{}).Plan(t.Context(), env, nil)
-	require.Error(t, err)
-	require.Nil(t, plan)
+	plan, result = planResult(t, env)
+	require.Zero(t, plan.Len())
+	require.True(t, result.Ready)
+	liveDataplane(t, env)
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, stateName), &corev1.Secret{}))
 }
 
-func TestPoliciesGateControllerPermissions(t *testing.T) {
+func TestInstallCreatesStateBeforeDataplane(t *testing.T) {
 	env := testEnv(t, cacheObject("cache"))
-	initialize(t, env)
-	plan := planPass(t, env)
-	_, err := plan.ExecutionOrder()
-	require.NoError(t, err)
 
-	var policies []component.ObjectRef
-
-	for _, op := range plan.Operations {
-		if op.Object.GetKind() == "ValidatingAdmissionPolicy" || op.Object.GetKind() == "ValidatingAdmissionPolicyBinding" {
-			policies = append(policies, op.Ref())
-		}
-
-		if op.Object.GetKind() == "ValidatingAdmissionPolicy" {
-			conditions, _, err := unstructured.NestedSlice(op.Object.Object, "spec", "matchConditions")
-			require.NoError(t, err)
-			require.Equal(t, `request.userInfo.username == "system:serviceaccount:custom-system:racer-controller"`, conditions[0].(map[string]any)["expression"])
-		}
-	}
-
-	require.Len(t, policies, 2)
+	plan, result := planResult(t, env)
+	require.Equal(t, reasonInitializing, result.Reason)
+	require.False(t, planHasObject(plan, "DaemonSet", dataplaneName))
 
 	for _, op := range plan.Operations {
 		switch op.Object.GetKind() {
-		case "RoleBinding", "ClusterRoleBinding", "Deployment":
-			for _, policy := range policies {
-				require.Contains(t, op.DependsOn, policy)
-			}
+		case "Secret", "Lease", "ConfigMap":
+			require.Equal(t, component.OpCreateIfAbsent, op.Kind, "%s", op.Ref())
 		}
 	}
 
-	role := &rbacv1.Role{}
-	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), role))
+	persist(t, env, plan)
 
-	for _, rule := range role.Rules {
-		for _, resource := range rule.Resources {
-			if resource == "daemonsets" || resource == "pods" || resource == "serviceaccounts" {
-				require.ElementsMatch(t, []string{"get", "list", "watch"}, rule.Verbs)
-			}
-		}
+	state := &corev1.Secret{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, stateName), state))
+	require.Equal(t, corev1.SecretTypeOpaque, state.Type)
+	require.Empty(t, state.Data)
+	require.Equal(t, component.FieldOwner, state.Labels[managerLabel])
+
+	leases := &coordinationv1.LeaseList{}
+	require.NoError(t, env.Client.List(t.Context(), leases, client.InNamespace(env.Namespace)))
+	require.Len(t, leases.Items, 17)
+
+	for _, lease := range leases.Items {
+		require.True(t, lease.Name == "racer-primary" || strings.HasPrefix(lease.Name, "racer-seat-"), lease.Name)
+		require.Equal(t, "true", lease.Labels["racer.unbounded-cloud.io/control"])
+		require.Nil(t, lease.Spec.HolderIdentity)
 	}
 
-	clusterRole := &rbacv1.ClusterRole{}
-	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: controllerName}, clusterRole))
-	require.Contains(t, clusterRole.Rules, rbacv1.PolicyRule{APIGroups: []string{"racer.unbounded-cloud.io"}, Resources: []string{"clustercaches"}, Verbs: []string{"get", "list", "watch"}})
-}
+	initialize(t, env)
 
-func TestPolicyFailuresSkipBindingsAndStartup(t *testing.T) {
-	for _, policyName := range []string{"racer-runtime-write-restriction", "racer-node-write-restriction"} {
-		for _, kind := range []string{"ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"} {
-			t.Run(policyName+"/"+kind, func(t *testing.T) {
-				env := testEnv(t, cacheObject("cache"))
-				initialize(t, env)
+	ds := liveDataplane(t, env)
+	require.Equal(t, string(state.UID), ds.Annotations[stateUIDAnnotation])
 
-				obj := &unstructured.Unstructured{}
-				obj.SetAPIVersion("admissionregistration.k8s.io/v1")
-				obj.SetKind(kind)
-				obj.SetName(policyName)
+	account := &corev1.ServiceAccount{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, dataplaneName), account))
+	require.Equal(t, string(state.UID), account.Annotations[stateUIDAnnotation])
+	require.False(t, *account.AutomountServiceAccountToken)
 
-				if policyName == retiredRuntimeGuard {
-					require.True(t, apierrors.IsNotFound(env.Client.Get(t.Context(), client.ObjectKeyFromObject(obj), obj)))
-					persist(t, env, planPass(t, env))
-					assertControllerBindings(t, env, true)
-					require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), &appsv1.Deployment{}))
+	slice := &discoveryv1.EndpointSlice{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, webhookName), slice))
+	require.Equal(t, discoveryv1.AddressTypeIPv4, slice.AddressType)
+	require.Empty(t, slice.Endpoints)
+	require.Equal(t, webhookName, slice.Labels[discoveryv1.LabelServiceName])
 
-					return
-				}
+	service := &corev1.Service{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, webhookName), service))
+	require.Empty(t, service.Spec.Selector)
 
-				require.NoError(t, env.Client.Delete(t.Context(), obj))
-				containment := planPass(t, env)
-				require.Len(t, containment.Operations, 2)
+	webhook := &admissionv1.MutatingWebhookConfiguration{}
+	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: webhookConfigName}, webhook))
+	require.Empty(t, webhook.Webhooks[0].ClientConfig.CABundle)
+	require.Equal(t, webhookName, webhook.Webhooks[0].ClientConfig.Service.Name)
+	require.Equal(t, env.Namespace, webhook.Webhooks[0].ClientConfig.Service.Namespace)
+	// The client-socket webhook differs only in its label and match condition.
+	require.Len(t, webhook.Webhooks, 2)
+	socketHook := webhook.Webhooks[1]
+	require.Equal(t, "racer-client-socket.racer.unbounded-cloud.io", socketHook.Name)
+	require.Equal(t, &metav1.LabelSelector{MatchLabels: map[string]string{"racer.unbounded-cloud.io/client-socket": "enabled"}}, socketHook.ObjectSelector)
+	require.Len(t, socketHook.MatchConditions, 1)
+	require.Contains(t, socketHook.MatchConditions[0].Expression, "racer.unbounded-cloud.io/client-socket-injected")
+	require.Equal(t, webhook.Webhooks[0].ClientConfig, socketHook.ClientConfig)
+	require.Equal(t, webhook.Webhooks[0].Rules, socketHook.Rules)
+	require.Equal(t, webhook.Webhooks[0].NamespaceSelector, socketHook.NamespaceSelector)
+	require.Equal(t, admissionv1.Fail, *socketHook.FailurePolicy)
 
-				for _, op := range containment.Operations {
-					require.Equal(t, component.OpDelete, op.Kind)
-				}
+	// No controller workload or authority material.
+	require.True(t, apierrors.IsNotFound(env.Client.Get(t.Context(), objectKey(env, legacyController), &appsv1.Deployment{})))
+	require.True(t, apierrors.IsNotFound(env.Client.Get(t.Context(), objectKey(env, "racer-config"), &corev1.ConfigMap{})))
 
-				persist(t, env, containment)
-				assertControllerBindings(t, env, false)
-				plan := planPass(t, env)
-				original := env.Client
-				env.Client = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
-					Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-						if obj.GetObjectKind().GroupVersionKind().Kind == kind && obj.GetName() == policyName {
-							return errors.New("policy unavailable")
-						}
+	container := ds.Spec.Template.Spec.Containers[0]
+	require.Equal(t, "mirror.test/unbounded/racer-dataplane:v1", container.Image)
+	require.Equal(t, []corev1.EnvFromSource{{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: dataplaneConfigName}}}}, container.EnvFrom)
 
-						return c.Create(ctx, obj, opts...)
-					},
-					Apply: func(ctx context.Context, c client.WithWatch, cfg runtime.ApplyConfiguration, opts ...client.ApplyOption) error {
-						data, err := runtime.DefaultUnstructuredConverter.ToUnstructured(cfg)
-						require.NoError(t, err)
-
-						if data["kind"] == kind && data["metadata"].(map[string]any)["name"] == policyName {
-							return errors.New("policy unavailable")
-						}
-
-						return c.Apply(ctx, cfg, opts...)
-					},
-				})
-				result, err := env.Execute(t.Context(), plan)
-				require.NoError(t, err)
-				require.Len(t, result.Failed(), 1)
-
-				for _, op := range result.Results {
-					switch op.Ref.GVK.Kind {
-					case "RoleBinding", "ClusterRoleBinding", "Deployment":
-						require.Equal(t, component.OpSkipped, op.Status)
-					}
-				}
-
-				assertControllerBindings(t, env, false)
-				env.Client = original
-				persist(t, env, planPass(t, env))
-				assertControllerBindings(t, env, true)
-			})
+	for _, e := range container.Env {
+		if e.Name == "RACER_OBJECT_IMAGE" {
+			require.Equal(t, "mirror.test/unbounded/racer-object:v1", e.Value)
 		}
+
+		// The dataplane namespace is retargeted.
+		require.NotContains(t, e.Value, "unbounded-system")
+	}
+
+	policies := &admissionv1.ValidatingAdmissionPolicyList{}
+	require.NoError(t, env.Client.List(t.Context(), policies))
+	require.Len(t, policies.Items, 5)
+
+	for _, policy := range policies.Items {
+		require.Contains(t, policy.Spec.MatchConditions[0].Expression, "system:serviceaccount:custom-system:racer-dataplane")
 	}
 }
 
-func TestStartupWatchIgnoresCounterUpdates(t *testing.T) {
-	env := testEnv(t)
-	predicate := startupConfigPredicate(env)
-	version := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: versionName, Namespace: env.Namespace}, Data: map[string]string{"sequence": "1"}}
-	next := version.DeepCopy()
-	next.Data["sequence"] = "2"
-	require.False(t, predicate.Update(event.UpdateEvent{ObjectOld: version, ObjectNew: next}))
-	require.True(t, predicate.Create(event.CreateEvent{Object: version}))
-	require.True(t, predicate.Delete(event.DeleteEvent{Object: version}))
-	marker := version.DeepCopy()
-	marker.Name = markerName
-	changed := marker.DeepCopy()
-	changed.Data["state"] = "consumed"
-	require.True(t, predicate.Update(event.UpdateEvent{ObjectOld: marker, ObjectNew: changed}))
+func TestBindingsAndDataplaneWaitForPolicies(t *testing.T) {
+	env := testEnv(t, cacheObject("cache"))
+	initialize(t, env)
+
+	plan := planPass(t, env)
+
+	var guards, bindings []component.ObjectRef
+
+	for _, op := range plan.Operations {
+		switch op.Object.GetKind() {
+		case "ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding":
+			guards = append(guards, op.Ref())
+		}
+	}
+
+	require.Len(t, guards, 10)
+
+	for _, op := range plan.Operations {
+		switch op.Object.GetKind() {
+		case "RoleBinding", "ClusterRoleBinding":
+			require.ElementsMatch(t, guards, op.DependsOn)
+			require.True(t, op.RevokeOnDependencyFailure)
+
+			bindings = append(bindings, op.Ref())
+		}
+	}
+
+	require.Len(t, bindings, 2)
+	require.Subset(t, dataplaneOp(t, plan).DependsOn, bindings)
+
+	rendered, err := plan.ExecutionOrder()
+	require.NoError(t, err)
+
+	order := strings.Split(rendered, "\n")
+
+	for _, binding := range bindings {
+		for _, guard := range guards {
+			require.Less(t, positionOf(t, order, guard), positionOf(t, order, binding))
+		}
+	}
 }
 
-func TestInactiveAtEveryInstallationBoundary(t *testing.T) {
-	for phase := range 6 {
-		t.Run(time.Duration(phase).String(), func(t *testing.T) {
+func positionOf(t *testing.T, order []string, ref component.ObjectRef) int {
+	t.Helper()
+
+	for i, step := range order {
+		if strings.HasSuffix(step, " "+ref.String()) {
+			return i
+		}
+	}
+
+	t.Fatalf("%s not in execution order %v", ref, order)
+
+	return -1
+}
+
+func TestRuntimeOwnedStateIsNeverWritten(t *testing.T) {
+	env := testEnv(t, cacheObject("cache"))
+	initialize(t, env)
+
+	// Simulate the runtime initializing state, holding a seat, and
+	// publishing webhook trust and endpoints.
+	state := &corev1.Secret{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, stateName), state))
+	state.Annotations = map[string]string{"racer.unbounded-cloud.io/initialized": "1"}
+	state.Data = map[string][]byte{"cluster": []byte(state.UID), "state": []byte("{}")}
+	require.NoError(t, env.Client.Update(t.Context(), state))
+
+	lease := &coordinationv1.Lease{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, "racer-seat-0"), lease))
+	lease.Spec.HolderIdentity = ptr.To("racer-dataplane-abc")
+	lease.Annotations = map[string]string{"racer.unbounded-cloud.io/endpoint": "https://10.0.0.1:8443"}
+	require.NoError(t, env.Client.Update(t.Context(), lease))
+
+	webhook := &admissionv1.MutatingWebhookConfiguration{}
+	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: webhookConfigName}, webhook))
+	webhook.Webhooks[0].ClientConfig.CABundle = []byte("runtime-ca")
+	require.NoError(t, env.Client.Update(t.Context(), webhook))
+
+	plan := planPass(t, env)
+
+	for _, op := range plan.Operations {
+		switch op.Object.GetKind() {
+		case "Secret", "Lease", "EndpointSlice":
+			t.Fatalf("runtime-owned %s must not be written after creation", op.Ref())
+		case "MutatingWebhookConfiguration":
+			// The apply never declares caBundle, so it never takes the field
+			// from the runtime's field manager.
+			webhooks, _, err := unstructured.NestedSlice(op.Object.Object, "webhooks")
+			require.NoError(t, err)
+
+			_, found, err := unstructured.NestedFieldNoCopy(webhooks[0].(map[string]any), "clientConfig", "caBundle")
+			require.NoError(t, err)
+			require.False(t, found)
+		}
+	}
+}
+
+func TestMissingOrReplacedStateFailsClosed(t *testing.T) {
+	for _, replace := range []bool{false, true} {
+		t.Run(map[bool]string{false: "missing", true: "replaced"}[replace], func(t *testing.T) {
 			env := testEnv(t, cacheObject("cache"))
-			for range phase {
-				persist(t, env, planPass(t, env))
+			initialize(t, env)
+
+			state := &corev1.Secret{}
+			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, stateName), state))
+			require.NoError(t, env.Client.Delete(t.Context(), state))
+
+			if replace {
+				require.NoError(t, env.Client.Create(t.Context(), &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: stateName, Namespace: env.Namespace, Labels: map[string]string{managerLabel: component.FieldOwner}},
+					Type:       corev1.SecretTypeOpaque,
+				}))
 			}
 
-			require.NoError(t, env.Client.Delete(t.Context(), cacheObject("cache")))
-			require.Zero(t, planPass(t, env).Len())
+			_, _, err := (Component{}).Plan(t.Context(), env, nil)
+			require.ErrorContains(t, err, map[bool]string{false: "missing", true: "replaced"}[replace])
+
+			if !replace {
+				require.True(t, apierrors.IsNotFound(env.Client.Get(t.Context(), objectKey(env, stateName), &corev1.Secret{})))
+			}
+
+			// Deleting the dataplane workload and account starts a new identity.
+			require.NoError(t, env.Client.Delete(t.Context(), liveDataplane(t, env)))
+			require.NoError(t, env.Client.Delete(t.Context(), &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: dataplaneName, Namespace: env.Namespace}}))
+			initialize(t, env)
+		})
+	}
+}
+
+func TestUnmanagedObjectsAreNotAdopted(t *testing.T) {
+	ns := "custom-system"
+
+	for name, obj := range map[string]client.Object{
+		"state":        &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: stateName, Namespace: ns}},
+		"lease":        &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: "racer-seat-3", Namespace: ns}},
+		"dataplane":    &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: dataplaneName, Namespace: ns}},
+		"account":      &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: dataplaneName, Namespace: ns}},
+		"config":       &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: dataplaneConfigName, Namespace: ns}},
+		"binding":      &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: dataplaneName, Namespace: ns}},
+		"webhook":      &admissionv1.MutatingWebhookConfiguration{ObjectMeta: metav1.ObjectMeta{Name: webhookConfigName}},
+		"endpoints":    &discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{Name: webhookName, Namespace: ns}, AddressType: discoveryv1.AddressTypeIPv4},
+		"legacyDeploy": &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: legacyController, Namespace: ns}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			obj.SetUID(types.UID(uuid.NewString()))
+			env := testEnv(t, cacheObject("cache"), obj)
+
+			var err error
+
+			for range 5 {
+				var plan *component.Plan
+
+				plan, _, err = (Component{}).Plan(t.Context(), env, nil)
+				if err != nil {
+					break
+				}
+
+				persist(t, env, plan)
+			}
+
+			require.ErrorIs(t, err, errNotOwned)
+		})
+	}
+}
+
+func TestGuardContainment(t *testing.T) {
+	for name, damage := range map[string]func(*testing.T, *component.Env){
+		"deleted policy": func(t *testing.T, env *component.Env) {
+			require.NoError(t, env.Client.Delete(t.Context(), &admissionv1.ValidatingAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: "racer-dataplane-lease"}}))
+		},
+		"deleted binding": func(t *testing.T, env *component.Env) {
+			require.NoError(t, env.Client.Delete(t.Context(), &admissionv1.ValidatingAdmissionPolicyBinding{ObjectMeta: metav1.ObjectMeta{Name: "racer-dataplane-state"}}))
+		},
+		"tampered policy": func(t *testing.T, env *component.Env) {
+			policy := &admissionv1.ValidatingAdmissionPolicy{}
+			require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: "racer-dataplane-pod-report"}, policy))
+			policy.Spec.Validations = policy.Spec.Validations[:1]
+			require.NoError(t, env.Client.Update(t.Context(), policy))
+		},
+		"audit only binding": func(t *testing.T, env *component.Env) {
+			binding := &admissionv1.ValidatingAdmissionPolicyBinding{}
+			require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: "racer-dataplane-webhook-configuration"}, binding))
+			binding.Spec.ValidationActions = []admissionv1.ValidationAction{admissionv1.Audit}
+			require.NoError(t, env.Client.Update(t.Context(), binding))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := testEnv(t, cacheObject("cache"))
+			initialize(t, env)
+			damage(t, env)
+
+			plan, result := planResult(t, env)
+			require.Equal(t, reasonGuards, result.Reason)
+			require.False(t, planHasObject(plan, "DaemonSet", dataplaneName), "containment must not touch workloads")
+
+			deleted := map[string]bool{}
+
+			for _, op := range plan.Operations {
+				if op.Kind == component.OpDelete {
+					deleted[op.Object.GetKind()] = true
+				} else {
+					require.Contains(t, []string{"ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"}, op.Object.GetKind())
+				}
+			}
+
+			require.Equal(t, map[string]bool{"RoleBinding": true, "ClusterRoleBinding": true}, deleted)
+			persist(t, env, plan)
+
+			require.True(t, apierrors.IsNotFound(env.Client.Get(t.Context(), objectKey(env, dataplaneName), &rbacv1.RoleBinding{})))
+			liveDataplane(t, env)
+
+			// Policies are intact again, so the grants return.
+			plan, result = planResult(t, env)
+			require.NotEqual(t, reasonGuards, result.Reason)
+			persist(t, env, plan)
+			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, dataplaneName), &rbacv1.RoleBinding{}))
+		})
+	}
+}
+
+func TestContainmentLeavesUnmanagedBindings(t *testing.T) {
+	env := testEnv(t, cacheObject("cache"))
+	initialize(t, env)
+
+	binding := &rbacv1.ClusterRoleBinding{}
+	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: dataplaneName}, binding))
+	binding.Annotations = nil
+	require.NoError(t, env.Client.Update(t.Context(), binding))
+	require.NoError(t, env.Client.Delete(t.Context(), &admissionv1.ValidatingAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: "racer-dataplane-lease"}}))
+
+	plan := planPass(t, env)
+
+	for _, op := range plan.Operations {
+		require.False(t, op.Kind == component.OpDelete && op.Object.GetKind() == "ClusterRoleBinding")
+	}
+}
+
+func legacyObjects(ns string) []client.Object {
+	stamped := func() map[string]string {
+		return map[string]string{managerAnnotation: component.FieldOwner, legacyInstallationUID: "marker-uid"}
+	}
+	meta := func(name string) metav1.ObjectMeta {
+		return metav1.ObjectMeta{Name: name, Namespace: ns, UID: types.UID(uuid.NewString()), Annotations: stamped()}
+	}
+	cluster := func(name string) metav1.ObjectMeta {
+		return metav1.ObjectMeta{Name: name, UID: types.UID(uuid.NewString()), Annotations: stamped()}
+	}
+
+	return []client.Object{
+		&appsv1.Deployment{ObjectMeta: meta(legacyController), Spec: appsv1.DeploymentSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": legacyController}}}},
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "racer-controller-1", Namespace: ns, Labels: map[string]string{"app": legacyController}}},
+		&corev1.Service{ObjectMeta: meta(legacyController)},
+		&policyv1.PodDisruptionBudget{ObjectMeta: meta(legacyController)},
+		&rbacv1.RoleBinding{ObjectMeta: meta(legacyController)},
+		&rbacv1.Role{ObjectMeta: meta(legacyController)},
+		&rbacv1.ClusterRoleBinding{ObjectMeta: cluster(legacyController)},
+		&rbacv1.ClusterRole{ObjectMeta: cluster(legacyController)},
+		&corev1.ServiceAccount{ObjectMeta: meta(legacyController)},
+		&corev1.Secret{ObjectMeta: meta("racer-controller-tls")},
+		&corev1.ConfigMap{ObjectMeta: meta("racer-config")},
+		&corev1.ConfigMap{ObjectMeta: meta("racer-bootstrap-trust")},
+		&admissionv1.ValidatingAdmissionPolicy{ObjectMeta: cluster("racer-node-write-restriction")},
+		&admissionv1.ValidatingAdmissionPolicyBinding{ObjectMeta: cluster("racer-node-write-restriction")},
+		// The retired controller's leader Lease was never operator-managed.
+		&coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: legacyController, Namespace: ns}},
+		// Old dataplane wiring is replaced in place.
+		&appsv1.DaemonSet{
+			ObjectMeta: metav1.ObjectMeta{Name: dataplaneName, Namespace: ns, UID: "old-dataplane", Annotations: map[string]string{managerAnnotation: component.FieldOwner, legacyInstallationUID: "marker-uid"}},
+			Spec: appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: dataplaneContainerName, Env: []corev1.EnvVar{{Name: "RACER_CLUSTER_ID", Value: "old"}, {Name: "RACER_CONTROL_ENDPOINT", Value: "https://racer-controller"}}}},
+				Volumes:    []corev1.Volume{{Name: "bootstrap"}},
+			}}},
+		},
+		&corev1.ServiceAccount{ObjectMeta: meta(dataplaneName)},
+		&admissionv1.MutatingWebhookConfiguration{
+			ObjectMeta: cluster(webhookConfigName),
+			Webhooks: []admissionv1.MutatingWebhook{{Name: "racer-object-sidecar.racer.unbounded-cloud.io", ClientConfig: admissionv1.WebhookClientConfig{
+				CABundle: []byte("old-ca"), Service: &admissionv1.ServiceReference{Name: legacyController, Namespace: ns},
+			}}},
+		},
+	}
+}
+
+func legacyIdentity(ns string, bound bool) []client.Object {
+	claim := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: legacyClaim, Namespace: ns, UID: "claim-uid", Annotations: managed()}, Data: map[string]string{"cluster": "c1", legacyMarkerUIDKey: "marker-uid"}}
+	marker := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: legacyMarker, Namespace: ns, UID: "marker-uid", Annotations: map[string]string{managerAnnotation: component.FieldOwner, legacyClaimUID: "claim-uid"}}, Data: map[string]string{"cluster": "c1"}}
+	versionBinding := "marker-uid"
+
+	if !bound {
+		versionBinding = "another-marker"
+	}
+
+	version := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: legacyVersion, Namespace: ns, UID: "version-uid", Annotations: map[string]string{legacyBoundUID: versionBinding, legacyCredentialID: "credentials-uid"}}}
+	credentials := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: legacyCredentials, Namespace: ns, UID: "credentials-uid"}}
+
+	return []client.Object{claim, marker, version, credentials}
+}
+
+func exists(t *testing.T, env *component.Env, obj client.Object) bool {
+	t.Helper()
+
+	err := env.Client.Get(t.Context(), client.ObjectKeyFromObject(obj), obj)
+	if apierrors.IsNotFound(err) {
+		return false
+	}
+
+	require.NoError(t, err)
+
+	return true
+}
+
+func TestLegacyControllerMigration(t *testing.T) {
+	ns := "custom-system"
+	objects := append(legacyObjects(ns), legacyIdentity(ns, true)...)
+	// Unmanaged look-alikes survive.
+	objects = append(objects, cacheObject("cache"), &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "racer-bootstrap-trust-copy", Namespace: ns}})
+	env := testEnv(t, objects...)
+
+	// Step 1: stop the controller and nothing else.
+	plan, result := planResult(t, env)
+	require.Equal(t, reasonMigrating, result.Reason)
+	require.Len(t, plan.Operations, 1)
+	require.Equal(t, component.OpDelete, plan.Operations[0].Kind)
+	require.Equal(t, "Deployment", plan.Operations[0].Object.GetKind())
+	require.NotEmpty(t, plan.Operations[0].Object.GetUID(), "deletes carry a UID precondition")
+	persist(t, env, plan)
+
+	// Step 2: wait while a controller Pod is still terminating.
+	plan, result = planResult(t, env)
+	require.Equal(t, reasonMigrating, result.Reason)
+	require.Zero(t, plan.Len())
+	require.NoError(t, env.Client.Delete(t.Context(), &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "racer-controller-1", Namespace: ns}}))
+
+	// Step 3: remove managed controller objects and install.
+	initialize(t, env)
+	settle(t, env)
+
+	for _, obj := range legacyObjects(ns)[:14] {
+		require.False(t, exists(t, env, obj), "%T %s survived", obj, obj.GetName())
+	}
+
+	for _, obj := range legacyIdentity(ns, true) {
+		require.False(t, exists(t, env, obj), "%T %s survived", obj, obj.GetName())
+	}
+
+	require.True(t, exists(t, env, &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: legacyController, Namespace: ns}}))
+	require.True(t, exists(t, env, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "racer-bootstrap-trust-copy", Namespace: ns}}))
+
+	ds := liveDataplane(t, env)
+	require.NotContains(t, ds.Annotations, "unbounded-cloud.io/racer-installation-uid")
+
+	for _, e := range ds.Spec.Template.Spec.Containers[0].Env {
+		require.NotContains(t, []string{"RACER_CLUSTER_ID", "RACER_CONTROL_ENDPOINT", "RACER_TRUST_BUNDLE"}, e.Name)
+	}
+
+	for _, v := range ds.Spec.Template.Spec.Volumes {
+		require.NotEqual(t, "bootstrap", v.Name)
+	}
+
+	state := &corev1.Secret{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, stateName), state))
+	require.Equal(t, string(state.UID), ds.Annotations[stateUIDAnnotation])
+
+	webhook := &admissionv1.MutatingWebhookConfiguration{}
+	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: webhookConfigName}, webhook))
+	require.Equal(t, webhookName, webhook.Webhooks[0].ClientConfig.Service.Name)
+}
+
+func TestLegacyMigrationKeepsUnboundAndUnmanagedObjects(t *testing.T) {
+	ns := "custom-system"
+	unmanagedService := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: legacyController, Namespace: ns}}
+	env := testEnv(t, append(legacyIdentity(ns, false), cacheObject("cache"), unmanagedService)...)
+	initialize(t, env)
+	settle(t, env)
+
+	identity := legacyIdentity(ns, false)
+	require.False(t, exists(t, env, identity[0]), "managed claim is removed")
+	require.False(t, exists(t, env, identity[1]), "managed marker is removed")
+	require.True(t, exists(t, env, identity[2]), "version not bound to the marker is kept")
+	require.True(t, exists(t, env, identity[3]), "credentials without a bound version are kept")
+	require.True(t, exists(t, env, unmanagedService))
+}
+
+func TestDataplaneConfig(t *testing.T) {
+	env := testEnv(t, cacheObject("cache"))
+	initialize(t, env)
+
+	before := liveDataplane(t, env).Spec.Template.Annotations[dataplaneConfigHash]
+	require.NotEmpty(t, before)
+
+	config := &corev1.ConfigMap{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, dataplaneConfigName), config))
+	require.Equal(t, component.FieldOwner, config.Annotations[managerAnnotation])
+	require.NotContains(t, config.Data, "RACER_MAX_THREADS")
+
+	config.Data["RACER_SHARES"] = "8"
+	config.Data["RACER_MAX_THREADS"] = "3"
+	require.NoError(t, env.Client.Update(t.Context(), config))
+
+	plan := planPass(t, env)
+	persist(t, env, plan)
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, dataplaneConfigName), config))
+	require.Equal(t, "8", config.Data["RACER_SHARES"], "administrator edits survive")
+	require.NotEqual(t, before, liveDataplane(t, env).Spec.Template.Annotations[dataplaneConfigHash])
+
+	for _, value := range []string{"2", "x", "-1"} {
+		config.Data["RACER_MAX_THREADS"] = value
+		require.NoError(t, env.Client.Update(t.Context(), config))
+
+		_, _, err := (Component{}).Plan(t.Context(), env, nil)
+		require.ErrorContains(t, err, "RACER_MAX_THREADS")
+	}
+}
+
+func TestDataplaneNVIDIAConfig(t *testing.T) {
+	env := testEnv(t, cacheObject("cache"))
+	initialize(t, env)
+
+	// The default asks the NVIDIA runtime for driver libraries through env only.
+	ds := liveDataplane(t, env)
+	values := map[string]string{}
+
+	for _, e := range ds.Spec.Template.Spec.Containers[0].Env {
+		values[e.Name] = e.Value
+	}
+
+	require.Equal(t, "all", values["NVIDIA_VISIBLE_DEVICES"])
+	require.Equal(t, "compute,utility", values["NVIDIA_DRIVER_CAPABILITIES"])
+	require.NotContains(t, ds.Spec.Template.Annotations, workload.CDIAnnotation)
+
+	config := &corev1.ConfigMap{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, dataplaneConfigName), config))
+	config.Data[workload.NVIDIAKey] = "cdi"
+	require.NoError(t, env.Client.Update(t.Context(), config))
+	persist(t, env, planPass(t, env))
+	require.Equal(t, workload.CDIAllGPUs, liveDataplane(t, env).Spec.Template.Annotations[workload.CDIAnnotation])
+
+	// A present but empty value is not the default; only an absent key is.
+	for _, value := range []string{"auto", "", "true", "CDI"} {
+		require.NoError(t, env.Client.Get(t.Context(), objectKey(env, dataplaneConfigName), config))
+		config.Data[workload.NVIDIAKey] = value
+		require.NoError(t, env.Client.Update(t.Context(), config))
+
+		_, _, err := (Component{}).Plan(t.Context(), env, nil)
+		require.ErrorContains(t, err, workload.NVIDIAKey, "value %q", value)
+	}
+}
+
+func TestValidateDataplaneOverride(t *testing.T) {
+	env := testEnv(t, cacheObject("cache"))
+	initialize(t, env)
+
+	original := dataplaneOp(t, planPass(t, env)).Object
+
+	for name, tc := range map[string]struct {
+		mutate func(map[string]any, map[string]any)
+		ok     bool
+	}{
+		"resources":     {mutate: func(_, c map[string]any) { c["resources"] = map[string]any{"limits": map[string]any{"memory": "1Gi"}} }, ok: true},
+		"node selector": {mutate: func(p, _ map[string]any) { p["nodeSelector"] = map[string]any{"pool": "cache"} }, ok: true},
+		"host network":  {mutate: func(p, _ map[string]any) { p["hostNetwork"] = true }, ok: true},
+		"extra env": {mutate: func(_, c map[string]any) {
+			c["env"] = append(c["env"].([]any), map[string]any{"name": "RUST_LOG", "value": "debug"})
+		}, ok: true},
+		"owned env": {mutate: func(_, c map[string]any) {
+			c["env"].([]any)[0] = map[string]any{"name": "RACER_NAMESPACE", "value": "other"}
+		}},
+		"envFrom":           {mutate: func(_, c map[string]any) { c["envFrom"] = []any{} }},
+		"volume mounts":     {mutate: func(_, c map[string]any) { c["volumeMounts"] = []any{} }},
+		"volumes":           {mutate: func(p, _ map[string]any) { p["volumes"] = []any{} }},
+		"service account":   {mutate: func(p, _ map[string]any) { p["serviceAccountName"] = "default" }},
+		"automount":         {mutate: func(p, _ map[string]any) { p["automountServiceAccountToken"] = true }},
+		"malformed env":     {mutate: func(_, c map[string]any) { c["env"] = "x" }},
+		"missing container": {mutate: func(_, c map[string]any) { c["name"] = "other" }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := original.DeepCopy()
+			pod, _, err := unstructured.NestedMap(candidate.Object, "spec", "template", "spec")
+			require.NoError(t, err)
+
+			container := pod["containers"].([]any)[0].(map[string]any)
+			tc.mutate(pod, container)
+			require.NoError(t, unstructured.SetNestedMap(candidate.Object, pod, "spec", "template", "spec"))
+
+			err = ValidateDataplaneOverride(original, candidate)
+			if tc.ok {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
 		})
 	}
 }
 
 func TestClusterCachePredicate(t *testing.T) {
-	t.Parallel()
-
 	p := clusterCachePredicate()
-	cache := func(gen int64, deleting bool, labels map[string]string) *racerv1.ClusterCache {
-		c := &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "c", Generation: gen, Labels: labels}}
+	old := cacheObject("cache")
+	deleting := old.DeepCopy()
+	deleting.DeletionTimestamp = ptr.To(metav1.Now())
 
-		if deleting {
-			now := metav1.Now()
-			c.DeletionTimestamp = &now
-			c.Finalizers = []string{"example.com/hold"}
-		}
+	require.True(t, p.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: deleting}))
+	require.False(t, p.Update(event.UpdateEvent{ObjectOld: deleting, ObjectNew: deleting}))
+}
 
-		return c
+func TestGuardPredicate(t *testing.T) {
+	p := guardPredicate()
+	require.True(t, p.Generic(event.GenericEvent{Object: &admissionv1.ValidatingAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: "racer-dataplane-lease"}}}))
+	require.False(t, p.Generic(event.GenericEvent{Object: &admissionv1.ValidatingAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: "other"}}}))
+}
+
+func TestLegacyMigrationRequiresInstallationStamp(t *testing.T) {
+	ns := "custom-system"
+	managedOnly := func(obj client.Object) client.Object {
+		obj.SetAnnotations(managed())
+		obj.SetUID(types.UID(uuid.NewString()))
+
+		return obj
 	}
 
-	require.True(t, p.Create(event.CreateEvent{Object: cache(1, false, nil)}))
-	require.True(t, p.Delete(event.DeleteEvent{Object: cache(1, false, nil)}))
-	require.True(t, p.Update(event.UpdateEvent{ObjectOld: cache(1, false, nil), ObjectNew: cache(2, false, nil)}), "generation change")
-	require.True(t, p.Update(event.UpdateEvent{ObjectOld: cache(1, false, nil), ObjectNew: cache(1, true, nil)}), "deletion timestamp set")
-	require.False(t, p.Update(event.UpdateEvent{ObjectOld: cache(1, false, nil), ObjectNew: cache(1, false, map[string]string{"a": "b"})}), "label-only update")
-	require.False(t, p.Update(event.UpdateEvent{ObjectOld: cache(1, true, nil), ObjectNew: cache(1, true, map[string]string{"a": "b"})}), "already terminating")
+	t.Run("deployment", func(t *testing.T) {
+		env := testEnv(t, cacheObject("cache"), managedOnly(&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: legacyController, Namespace: ns}}))
+		_, _, err := (Component{}).Plan(t.Context(), env, nil)
+		require.ErrorIs(t, err, errNotOwned)
+		require.True(t, exists(t, env, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: legacyController, Namespace: ns}}))
+	})
+
+	t.Run("objects", func(t *testing.T) {
+		role := managedOnly(&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: legacyController}})
+		config := managedOnly(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: legacyConfig, Namespace: ns}})
+		env := testEnv(t, cacheObject("cache"), role, config)
+		initialize(t, env)
+		require.True(t, exists(t, env, role))
+		require.True(t, exists(t, env, config))
+	})
+}
+
+func TestLegacyMigrationRefusesDroppedWorkloadSettings(t *testing.T) {
+	ns := "custom-system"
+
+	for name, tc := range map[string]struct {
+		data map[string]string
+		want string
+	}{
+		"peer port":       {data: map[string]string{"RACER_PEER_PORT": "9000"}, want: "RACER_PEER_PORT"},
+		"diagnostics":     {data: map[string]string{"RACER_DIAGNOSTICS_PORT": "9191"}, want: "RACER_DIAGNOSTICS_PORT"},
+		"host network":    {data: map[string]string{"RACER_HOST_NETWORK": "true"}, want: "RACER_HOST_NETWORK"},
+		"bad bool":        {data: map[string]string{"RACER_HOST_NETWORK": "yes"}, want: "RACER_HOST_NETWORK"},
+		"pod network":     {data: map[string]string{"RACER_POD_NETWORK_NODES": "a"}, want: "RACER_POD_NETWORK_NODES"},
+		"nvidia":          {data: map[string]string{"RACER_DATAPLANE_NVIDIA": "cdi"}, want: "RACER_DATAPLANE_NVIDIA"},
+		"defaults accept": {data: map[string]string{"RACER_PEER_PORT": "8082", "RACER_HOST_NETWORK": "false", "RACER_DATAPLANE_NVIDIA": "env"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			objects := legacyObjects(ns)
+			for _, obj := range objects {
+				if cm, ok := obj.(*corev1.ConfigMap); ok && cm.Name == legacyConfig {
+					cm.Data = tc.data
+				}
+			}
+
+			env := testEnv(t, append(append(objects, legacyIdentity(ns, true)...), cacheObject("cache"))...)
+			plan, _, err := (Component{}).Plan(t.Context(), env, nil)
+
+			if tc.want == "" {
+				require.NoError(t, err)
+				require.Equal(t, "Deployment", plan.Operations[0].Object.GetKind())
+
+				return
+			}
+
+			require.ErrorContains(t, err, tc.want)
+			require.True(t, exists(t, env, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: legacyController, Namespace: ns}}), "controller keeps running")
+		})
+	}
+}
+
+func TestTerminatingDataplaneStillRecordsState(t *testing.T) {
+	env := testEnv(t, cacheObject("cache"))
+	initialize(t, env)
+
+	ds := liveDataplane(t, env)
+	ds.Finalizers = []string{"test/hold"}
+	require.NoError(t, env.Client.Update(t.Context(), ds))
+	require.NoError(t, env.Client.Delete(t.Context(), ds))
+	require.NoError(t, env.Client.Delete(t.Context(), &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: dataplaneName, Namespace: env.Namespace}}))
+	require.NoError(t, env.Client.Delete(t.Context(), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: stateName, Namespace: env.Namespace}}))
+
+	_, _, err := (Component{}).Plan(t.Context(), env, nil)
+	require.ErrorContains(t, err, "missing")
+}
+
+func TestControlSeatsConfig(t *testing.T) {
+	for value, ok := range map[string]bool{"auto": true, "1": true, "2": true, "16": true, "0": false, "17": false, "-1": false, "Auto": false, "": false, "01": false, "+1": false, " 1": false, "1 ": false, "\t2": false} {
+		t.Run("value "+value, func(t *testing.T) {
+			env := testEnv(t, cacheObject("cache"), &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: dataplaneConfigName, Namespace: "custom-system", UID: "cfg", Annotations: managed()},
+				Data:       map[string]string{"RACER_CONTROL_SEATS": value},
+			})
+
+			if !ok {
+				_, _, err := (Component{}).Plan(t.Context(), env, nil)
+				require.ErrorContains(t, err, "RACER_CONTROL_SEATS")
+
+				return
+			}
+
+			initialize(t, env)
+
+			if value != "2" {
+				return
+			}
+
+			// The ConfigMap value reaches the Pod: no explicit env shadows it.
+			container := liveDataplane(t, env).Spec.Template.Spec.Containers[0]
+			for _, e := range container.Env {
+				require.NotEqual(t, "RACER_CONTROL_SEATS", e.Name)
+			}
+
+			require.Equal(t, dataplaneConfigName, container.EnvFrom[0].ConfigMapRef.Name)
+		})
+	}
+
+	t.Run("seeded default", func(t *testing.T) {
+		env := testEnv(t, cacheObject("cache"))
+		initialize(t, env)
+
+		cm := &corev1.ConfigMap{}
+		require.NoError(t, env.Client.Get(t.Context(), objectKey(env, dataplaneConfigName), cm))
+		require.Equal(t, "auto", cm.Data["RACER_CONTROL_SEATS"])
+	})
+}
+
+func TestOverrideCannotShadowOrDuplicateEnv(t *testing.T) {
+	env := testEnv(t, cacheObject("cache"))
+	original := dataplaneOp(t, planAfterInit(t, env)).Object
+
+	withEnv := func(extra ...any) *unstructured.Unstructured {
+		candidate := original.DeepCopy()
+		containers, _, _ := unstructured.NestedSlice(candidate.Object, "spec", "template", "spec", "containers")
+		c := containers[0].(map[string]any)
+		envs, _ := c["env"].([]any)
+		c["env"] = append(append([]any{}, envs...), extra...)
+
+		require.NoError(t, unstructured.SetNestedSlice(candidate.Object, containers, "spec", "template", "spec", "containers"))
+
+		return candidate
+	}
+
+	require.NoError(t, ValidateDataplaneOverride(original, withEnv(map[string]any{"name": "RACER_EXTRA", "value": "1"})))
+	require.ErrorContains(t, ValidateDataplaneOverride(original, withEnv(map[string]any{"name": "RACER_CONTROL_SEATS", "value": "16"})), "shadow")
+	require.ErrorContains(t, ValidateDataplaneOverride(original, withEnv(map[string]any{"name": "RACER_PEER_LISTEN", "value": "[::]:1"})), "more than once")
+	require.ErrorContains(t, ValidateDataplaneOverride(original, withEnv(map[string]any{"name": "RACER_EXTRA", "value": "1"}, map[string]any{"name": "RACER_EXTRA", "value": "2"})), "more than once")
+}
+
+func planAfterInit(t *testing.T, env *component.Env) *component.Plan {
+	t.Helper()
+	initialize(t, env)
+
+	return planPass(t, env)
+}
+
+func TestRetainedInstallStillContainsGuards(t *testing.T) {
+	env := testEnv(t, cacheObject("cache"))
+	initialize(t, env)
+	require.NoError(t, env.Client.Delete(t.Context(), cacheObject("cache")))
+	require.NoError(t, env.Client.Delete(t.Context(), &admissionv1.ValidatingAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: "racer-dataplane-pod-report"}}))
+
+	plan, result := planResult(t, env)
+	require.Equal(t, reasonGuards, result.Reason)
+
+	for _, op := range plan.Operations {
+		require.Contains(t, []string{"ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding", "RoleBinding", "ClusterRoleBinding"}, op.Object.GetKind(), "no workload repair")
+	}
+
+	persist(t, env, plan)
+	require.True(t, apierrors.IsNotFound(env.Client.Get(t.Context(), objectKey(env, dataplaneName), &rbacv1.RoleBinding{})))
+	require.True(t, apierrors.IsNotFound(env.Client.Get(t.Context(), client.ObjectKey{Name: dataplaneName}, &rbacv1.ClusterRoleBinding{})))
+	require.NoError(t, env.Client.Get(t.Context(), client.ObjectKey{Name: "racer-dataplane-pod-report"}, &admissionv1.ValidatingAdmissionPolicy{}))
+
+	// Retained mode never re-grants; a later cache restores the bindings.
+	plan, result = planResult(t, env)
+	require.Zero(t, plan.Len())
+	require.True(t, result.Ready)
+	liveDataplane(t, env)
+}
+
+// settle runs passes until a plan holds no delete or patch, failing when it
+// does not.
+func settle(t *testing.T, env *component.Env) {
+	t.Helper()
+
+	for range 12 {
+		plan := planPass(t, env)
+
+		pending := false
+
+		for _, op := range plan.Operations {
+			pending = pending || op.Kind == component.OpDelete || op.Kind == component.OpMergePatch
+		}
+
+		persist(t, env, plan)
+
+		if !pending {
+			return
+		}
+	}
+
+	t.Fatal("plan did not settle")
+}
+
+func stampedWith(obj client.Object, stamp string) client.Object {
+	obj.SetAnnotations(map[string]string{managerAnnotation: component.FieldOwner, legacyInstallationUID: stamp})
+	obj.SetUID(types.UID(uuid.NewString()))
+
+	return obj
+}
+
+func TestLegacyForeignStampIsNeverDeletedOrAdopted(t *testing.T) {
+	ns := "custom-system"
+
+	t.Run("deployment", func(t *testing.T) {
+		deploy := stampedWith(&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: legacyController, Namespace: ns}}, "other-marker")
+		env := testEnv(t, append(legacyIdentity(ns, true), cacheObject("cache"), deploy)...)
+		_, _, err := (Component{}).Plan(t.Context(), env, nil)
+		require.ErrorIs(t, err, errNotOwned)
+		require.True(t, exists(t, env, deploy))
+	})
+
+	t.Run("static objects", func(t *testing.T) {
+		role := stampedWith(&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: legacyController}}, "other-marker")
+		svc := stampedWith(&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: legacyController, Namespace: ns}}, "other-marker")
+		env := testEnv(t, append(legacyIdentity(ns, true), cacheObject("cache"), role, svc)...)
+		initialize(t, env)
+		settle(t, env)
+		require.True(t, exists(t, env, role))
+		require.True(t, exists(t, env, svc))
+	})
+
+	for name, obj := range map[string]client.Object{
+		"dataplane": &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: dataplaneName, Namespace: ns}},
+		"account":   &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: dataplaneName, Namespace: ns}},
+		"webhook":   &admissionv1.MutatingWebhookConfiguration{ObjectMeta: metav1.ObjectMeta{Name: webhookConfigName}},
+		"config":    &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: dataplaneConfigName, Namespace: ns}},
+	} {
+		t.Run("adopt "+name, func(t *testing.T) {
+			env := testEnv(t, append(legacyIdentity(ns, true), cacheObject("cache"), stampedWith(obj, "other-marker"))...)
+
+			var err error
+
+			for range 6 {
+				var plan *component.Plan
+
+				plan, _, err = (Component{}).Plan(t.Context(), env, nil)
+				if err != nil {
+					break
+				}
+
+				persist(t, env, plan)
+			}
+
+			require.ErrorIs(t, err, errNotOwned)
+		})
+	}
+}
+
+func TestLegacyAnchorsMissingOrInconsistentFailClosed(t *testing.T) {
+	ns := "custom-system"
+
+	for name, mutate := range map[string]func([]client.Object) []client.Object{
+		"no anchors":      func(o []client.Object) []client.Object { return nil },
+		"marker missing":  func(o []client.Object) []client.Object { return o[:1] },
+		"claim missing":   func(o []client.Object) []client.Object { return o[1:2] },
+		"replaced marker": func(o []client.Object) []client.Object { o[1].SetUID("marker-2"); return o },
+		"claim rebound": func(o []client.Object) []client.Object {
+			o[1].SetAnnotations(map[string]string{managerAnnotation: component.FieldOwner, legacyClaimUID: "x"})
+			return o
+		},
+		"cluster mismatch": func(o []client.Object) []client.Object { o[1].(*corev1.ConfigMap).Data["cluster"] = "c2"; return o },
+	} {
+		t.Run(name, func(t *testing.T) {
+			legacyObjs := legacyObjects(ns)
+			env := testEnv(t, append(append(legacyObjs, mutate(legacyIdentity(ns, true))...), cacheObject("cache"))...)
+
+			_, _, err := (Component{}).Plan(t.Context(), env, nil)
+			require.ErrorIs(t, err, errNotOwned)
+
+			// Once the controller is gone by hand, unproven objects stay.
+			require.NoError(t, env.Client.Delete(t.Context(), legacyObjs[0]))
+			require.NoError(t, env.Client.Delete(t.Context(), legacyObjs[1]))
+
+			for range 4 {
+				plan, _, err := (Component{}).Plan(t.Context(), env, nil)
+				if err != nil {
+					break
+				}
+
+				for _, op := range plan.Operations {
+					require.NotEqual(t, component.OpDelete, op.Kind, "deleted %s %s", op.Object.GetKind(), op.Object.GetName())
+				}
+
+				persist(t, env, plan)
+			}
+
+			for _, obj := range legacyObjects(ns)[2:14] {
+				require.True(t, exists(t, env, obj), "%T %s removed", obj, obj.GetName())
+			}
+		})
+	}
+}
+
+func TestLegacyCleanupIsStagedAndResumable(t *testing.T) {
+	ns := "custom-system"
+	objects := append(legacyObjects(ns), legacyIdentity(ns, true)...)
+	objects = append(objects, cacheObject("cache"))
+	env := testEnv(t, objects...)
+	require.NoError(t, env.Client.Delete(t.Context(), &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "racer-controller-1", Namespace: ns}}))
+
+	var failed bool
+
+	for pass := 0; pass < 15; pass++ {
+		plan, _, err := (Component{}).Plan(t.Context(), env, nil)
+		require.NoError(t, err)
+
+		// Anchors are never deleted while a dependent object remains.
+		for _, op := range plan.Operations {
+			if op.Kind != component.OpDelete {
+				continue
+			}
+
+			switch op.Object.GetName() {
+			case legacyMarker:
+				require.False(t, exists(t, env, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: legacyVersion, Namespace: ns}}))
+				require.False(t, exists(t, env, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: legacyCredentials, Namespace: ns}}))
+				require.False(t, exists(t, env, &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: legacyController, Namespace: ns}}))
+				require.NotContains(t, liveDataplane(t, env).Annotations, legacyInstallationUID)
+			case legacyClaim:
+				require.False(t, exists(t, env, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: legacyMarker, Namespace: ns}}))
+			case legacyVersion:
+				require.False(t, exists(t, env, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: legacyCredentials, Namespace: ns}}))
+			}
+		}
+
+		// Simulate a crash: drop every other pass's writes once.
+		if !failed && pass == 1 {
+			failed = true
+			continue
+		}
+
+		_, err = env.Execute(t.Context(), plan)
+		require.NoError(t, err)
+	}
+
+	for _, obj := range legacyIdentity(ns, true) {
+		require.False(t, exists(t, env, obj), "%T %s survived", obj, obj.GetName())
+	}
+}
+
+// migratedEnv returns an env whose controller is stopped and whose legacy
+// identity is built by mutate.
+func migratedEnv(t *testing.T, mutate func(marker, version *corev1.ConfigMap)) *component.Env {
+	t.Helper()
+
+	ns := "custom-system"
+	identity := legacyIdentity(ns, true)
+	mutate(identity[1].(*corev1.ConfigMap), identity[2].(*corev1.ConfigMap))
+
+	objects := append(legacyObjects(ns), identity...)
+	env := testEnv(t, append(objects, cacheObject("cache"))...)
+	require.NoError(t, env.Client.Delete(t.Context(), &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "racer-controller-1", Namespace: ns}}))
+
+	return env
+}
+
+func runPasses(t *testing.T, env *component.Env, passes int) error {
+	t.Helper()
+
+	for range passes {
+		plan, _, err := (Component{}).Plan(t.Context(), env, nil)
+		if err != nil {
+			return err
+		}
+
+		_, err = env.Execute(t.Context(), plan)
+		require.NoError(t, err)
+	}
+
+	return nil
+}
+
+func TestLegacyTerminatingVersionHoldsMarker(t *testing.T) {
+	for name, recorded := range map[string]string{"pending marker": "", "consumed marker": "version-uid"} {
+		t.Run(name, func(t *testing.T) {
+			env := migratedEnv(t, func(marker, version *corev1.ConfigMap) {
+				if recorded != "" {
+					marker.Data[legacyVersionUIDKey] = recorded
+				}
+
+				version.Finalizers = []string{"test/hold"}
+			})
+			ns := env.Namespace
+			version := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: legacyVersion, Namespace: ns}}
+			marker := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: legacyMarker, Namespace: ns}}
+
+			require.NoError(t, runPasses(t, env, 12))
+			require.True(t, exists(t, env, version))
+			require.NotNil(t, version.DeletionTimestamp, "bound version is being deleted")
+			require.True(t, exists(t, env, marker), "marker kept while the version terminates")
+			require.True(t, exists(t, env, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: legacyClaim, Namespace: ns}}))
+
+			// The finalizer completes later; cleanup resumes.
+			version.Finalizers = nil
+			require.NoError(t, env.Client.Update(t.Context(), version))
+			require.NoError(t, runPasses(t, env, 4))
+
+			for _, obj := range legacyIdentity(ns, true) {
+				require.False(t, exists(t, env, obj), "%T %s survived", obj, obj.GetName())
+			}
+		})
+	}
+}
+
+func TestLegacyReplacedVersionIsPreserved(t *testing.T) {
+	for name, mutate := range map[string]func(marker, version *corev1.ConfigMap){
+		"replaced uid": func(marker, version *corev1.ConfigMap) { marker.Data[legacyVersionUIDKey] = "version-old" },
+		"rebound to other": func(marker, version *corev1.ConfigMap) {
+			marker.Data[legacyVersionUIDKey] = "version-uid"
+			version.Annotations[legacyBoundUID] = "x"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := migratedEnv(t, mutate)
+			ns := env.Namespace
+
+			err := runPasses(t, env, 12)
+			require.ErrorContains(t, err, legacyVersion)
+
+			for _, obj := range legacyIdentity(ns, true) {
+				require.True(t, exists(t, env, obj), "%T %s removed", obj, obj.GetName())
+				require.Nil(t, obj.GetDeletionTimestamp())
+			}
+		})
+	}
 }

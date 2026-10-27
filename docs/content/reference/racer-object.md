@@ -34,7 +34,7 @@ name.
 
 Unbounded releases publish the image as `ghcr.io/azure/racer-object:vX.Y.Z`; use
 the same [release](https://github.com/Azure/unbounded/releases) tag as your
-operator's `racer-controller` and `racer-dataplane` images. Contributors can build
+operator's `racer-dataplane` image. Contributors can build
 from source with `make racer-object` (binary at `bin/racer-object`) or
 `make image-racer-object-local`.
 
@@ -238,15 +238,16 @@ so the pod's namespace must allow hostPath volumes under Pod Security Admission.
 
 ### Automatic Injection
 
-`racer-controller` runs a mutating admission webhook that adds the sidecar to
-opted-in pods. The unbounded operator installs the
-`MutatingWebhookConfiguration` named `racer-object-sidecar-injector` and manages
-its CA bundle. The webhook:
+Elected control seats in `racer-dataplane` run a mutating admission webhook that
+adds the sidecar to opted-in pods. The unbounded operator installs the
+`MutatingWebhookConfiguration` named `racer-object-sidecar-injector`. The elected
+primary maintains its CA bundle and the `racer-webhook` Service's endpoints.
+The webhook:
 
 - Handles only pod `CREATE`. Existing pods are not changed.
 - Matches only pods with the label
   `racer.unbounded-cloud.io/object-sidecar: enabled`.
-- Skips the racer-controller namespace.
+- Skips the Racer installation namespace.
 - Skips pods that already have a container named `racer-object`.
 - Uses `failurePolicy: Fail`. If the webhook is down or an annotation is invalid,
   the pod is not created.
@@ -312,7 +313,7 @@ The webhook makes these changes to the pod:
 
 - Adds an init container named `racer-object` with `restartPolicy: Always`, placed
   first. It uses the `racer-object` image of the same release as
-  `racer-controller`, and the args
+  `racer-dataplane`, and the args
   `sidecar --cache=...` plus `--api` and `--listen`
   when set.
 - Sets the security context described below, with `RuntimeDefault` seccomp.
@@ -343,7 +344,7 @@ Other denial causes:
   be reachable by other host-network workloads on the node.
 
 If the pod is created without a sidecar, check that the label is on the pod (not
-only on the Deployment), that the pod is not in the racer-controller namespace,
+only on the Deployment), that the pod is not in the Racer installation namespace,
 and that no container is already named `racer-object`.
 
 ### Manual Pod Spec

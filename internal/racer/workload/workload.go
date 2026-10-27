@@ -1,15 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package workload builds dataplane workloads. The Unbounded operator deploys
-// them; the controller only observes and authenticates them.
+// Package workload builds the Racer dataplane DaemonSet. The Unbounded
+// operator deploys it. Each dataplane Pod also runs the Racer control plane,
+// so there is no separate controller workload.
 package workload
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
-	"net/url"
-	"slices"
 	"strconv"
 	"strings"
 
@@ -20,15 +19,38 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/utils/ptr"
-
-	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
-// Workload configuration and construction.
-
 const (
-	DataplaneDaemonSetName  = "racer-dataplane"
-	PodNetworkDaemonSetName = "racer-dataplane-podnet"
+	// DataplaneDaemonSetName names the dataplane DaemonSet and its ServiceAccount.
+	DataplaneDaemonSetName = "racer-dataplane"
+
+	// ContainerName names the dataplane container.
+	ContainerName = "dataplane"
+
+	// ExclusionLabel removes a Node from dataplane placement and membership.
+	ExclusionLabel = "racer.unbounded-cloud.io/exclude"
+
+	// ControlTokenAudience is the audience of the token a Pod presents to
+	// control seats.
+	ControlTokenAudience = "racer-control"
+
+	// ControlPort serves the control API on seat holders.
+	ControlPort = 8443
+
+	// WebhookPort serves the object sidecar admission webhook on seat holders.
+	WebhookPort = 9443
+
+	// ControlSeatsKey is the administrator seat policy, read from
+	// racer-dataplane-config: auto picks 1 to 16 seats, or a fixed count of
+	// 1 to 16. It is never injected as explicit env so the ConfigMap wins.
+	ControlSeatsKey = "RACER_CONTROL_SEATS"
+	// MaxControlSeats bounds a fixed seat count.
+	MaxControlSeats = 16
+
+	// APITokenPath is where the default-audience API credentials are
+	// projected, the standard in-cluster client location.
+	APITokenPath = "/var/run/secrets/kubernetes.io/serviceaccount"
 )
 
 // NVIDIAInjection selects how the dataplane asks the container runtime for
@@ -49,6 +71,9 @@ const (
 )
 
 const (
+	// NVIDIAKey selects the NVIDIAInjection mode, read from
+	// racer-dataplane-config by the operator. Unset selects NVIDIAEnv.
+	NVIDIAKey = "RACER_DATAPLANE_NVIDIA"
 	// CDIAnnotation requests the NVIDIA CDI device on the dataplane Pod.
 	// containerd treats every key with the cdi.k8s.io/ prefix as a CDI request.
 	CDIAnnotation = "cdi.k8s.io/racer-dataplane"
@@ -56,108 +81,56 @@ const (
 	CDIAllGPUs = "nvidia.com/gpu=all"
 )
 
-// ManagedNames contains only the explicitly configured workload.
-func ManagedNames(daemonSetName string) []string {
-	return []string{daemonSetName}
-}
+// ErrInvalid reports an invalid workload configuration.
+var ErrInvalid = errors.New("invalid racer dataplane configuration")
 
-// Config contains only the inputs needed to build the dataplane DaemonSet.
-// Controller limits, rotation policy, serving TLS, and durable state are independent.
+// Config holds the inputs of the dataplane DaemonSet.
 type Config struct {
-	Cluster                 wire.ClusterID
-	Namespace               string
-	ControlURL              string
-	BootstrapTrustConfigMap string
-	DataplaneImage          string
-	PeerPort                uint16
-	HostNetwork             bool
-	PodNetworkNodes         []string
-	// Zero selects the automatic diagnostics port (9090, or 9091 when the peer
-	// port is 9090).
-	DiagnosticsPort         uint16
-	DataplaneServiceAccount string
-	DaemonSetName           string
+	Namespace      string
+	DataplaneImage string
+	// ObjectImage is the racer-object sidecar image the webhook injects.
+	ObjectImage string
+	PeerPort    uint16
+	HostNetwork bool
+	// Zero selects 9090, or 9091 when the peer port is 9090.
+	DiagnosticsPort uint16
 	// Empty selects NVIDIAEnv.
 	NVIDIA NVIDIAInjection
 }
 
-// ConfigFromLookup reads operator deployment wiring without loading or
-// validating controller runtime configuration. Shared settings retain the same defaults.
-func ConfigFromLookup(lookup func(string) (string, bool)) (Config, error) {
-	env := func(key, fallback string) string {
-		if value, ok := lookup(key); ok {
-			return value
-		}
-
-		return fallback
-	}
-
-	port, err := strconv.ParseUint(env("RACER_PEER_PORT", "8082"), 10, 16)
-	if err != nil {
-		return Config{}, fmt.Errorf("RACER_PEER_PORT: %w", wire.InvalidRequest)
-	}
-
-	hostNetwork := env("RACER_HOST_NETWORK", "false")
-	if hostNetwork != "true" && hostNetwork != "false" {
-		return Config{}, fmt.Errorf("RACER_HOST_NETWORK must be true or false: %w", wire.InvalidRequest)
-	}
-
-	// Unset keeps the zero value, which selects NVIDIAEnv.
-	var nvidia NVIDIAInjection
-	if value, ok := lookup("RACER_DATAPLANE_NVIDIA"); ok {
-		nvidia = NVIDIAInjection(value)
-		if nvidia != NVIDIAOff && nvidia != NVIDIAEnv && nvidia != NVIDIACDI {
-			return Config{}, fmt.Errorf("RACER_DATAPLANE_NVIDIA must be off, env, or cdi: %w", wire.InvalidRequest)
-		}
-	}
-
-	var diagnosticsPort uint64
-	if value, ok := lookup("RACER_DIAGNOSTICS_PORT"); ok {
-		diagnosticsPort, err = strconv.ParseUint(value, 10, 16)
-		if err != nil || diagnosticsPort < 1024 {
-			return Config{}, fmt.Errorf("RACER_DIAGNOSTICS_PORT must be 1024..65535: %w", wire.InvalidRequest)
-		}
-	}
-
-	var podNetworkNodes []string
-	if value, ok := lookup("RACER_POD_NETWORK_NODES"); ok {
-		if err := json.Unmarshal([]byte(value), &podNetworkNodes); err != nil || podNetworkNodes == nil {
-			return Config{}, fmt.Errorf("RACER_POD_NETWORK_NODES must be a JSON array: %w", wire.InvalidRequest)
-		}
-	}
-
-	cfg := Config{
-		Cluster:                 wire.ClusterID(env("RACER_CLUSTER_ID", "")),
-		Namespace:               env("POD_NAMESPACE", "unbounded-system"),
-		ControlURL:              env("RACER_CONTROL_URL", ""),
-		BootstrapTrustConfigMap: env("RACER_BOOTSTRAP_TRUST_CONFIGMAP", "racer-bootstrap-trust"),
-		DataplaneImage:          env("RACER_DATAPLANE_IMAGE", ""),
-		PeerPort:                uint16(port),
-		HostNetwork:             hostNetwork == "true",
-		PodNetworkNodes:         podNetworkNodes,
-		DiagnosticsPort:         uint16(diagnosticsPort),
-		DataplaneServiceAccount: env("RACER_DATAPLANE_SERVICE_ACCOUNT", "racer-dataplane"),
-		DaemonSetName:           env("RACER_DAEMONSET_NAME", "racer-dataplane"),
-		NVIDIA:                  nvidia,
-	}
-
-	return cfg, cfg.Validate()
+// DefaultConfig returns the managed defaults for a namespace and images.
+func DefaultConfig(namespace, dataplaneImage, objectImage string) Config {
+	return Config{Namespace: namespace, DataplaneImage: dataplaneImage, ObjectImage: objectImage, PeerPort: 8082}
 }
 
+// Validate checks names, images, and that every listener port is distinct.
 func (c Config) Validate() error {
-	if err := c.validateNetworkNodes(); err != nil {
-		return err
+	if len(validation.IsDNS1123Label(c.Namespace)) != 0 {
+		return fmt.Errorf("namespace %q: %w", c.Namespace, ErrInvalid)
 	}
 
-	if err := c.validateIdentityAndPorts(); err != nil {
-		return err
+	if strings.TrimSpace(c.DataplaneImage) == "" || strings.TrimSpace(c.ObjectImage) == "" {
+		return fmt.Errorf("dataplane and object images are required: %w", ErrInvalid)
+	}
+
+	if c.PeerPort < 1024 || (c.DiagnosticsPort != 0 && c.DiagnosticsPort < 1024) {
+		return fmt.Errorf("ports must be 1024..65535: %w", ErrInvalid)
 	}
 
 	if mode := c.nvidiaMode(); mode != NVIDIAOff && mode != NVIDIAEnv && mode != NVIDIACDI {
-		return fmt.Errorf("NVIDIA injection must be off, env, or cdi: %w", wire.InvalidRequest)
+		return fmt.Errorf("NVIDIA injection must be off, env, or cdi: %w", ErrInvalid)
 	}
 
-	return c.validateEndpoint()
+	ports := map[int32]bool{}
+	for _, port := range []int32{int32(c.PeerPort), c.diagnosticsPort(), ControlPort, WebhookPort} {
+		if ports[port] {
+			return fmt.Errorf("peer, diagnostics, control, and webhook ports must be distinct: %w", ErrInvalid)
+		}
+
+		ports[port] = true
+	}
+
+	return nil
 }
 
 func (c Config) nvidiaMode() NVIDIAInjection {
@@ -168,72 +141,28 @@ func (c Config) nvidiaMode() NVIDIAInjection {
 	return c.NVIDIA
 }
 
-func (c Config) validateNetworkNodes() error {
-	if len(c.PodNetworkNodes) != 0 && (!c.HostNetwork || c.DaemonSetName != DataplaneDaemonSetName) {
-		return fmt.Errorf("pod network exceptions require host networking and the fixed dataplane name: %w", wire.InvalidRequest)
+func (c Config) diagnosticsPort() int32 {
+	if c.DiagnosticsPort != 0 {
+		return int32(c.DiagnosticsPort)
 	}
 
-	seen := make(map[string]bool, len(c.PodNetworkNodes))
-	for _, node := range c.PodNetworkNodes {
-		if len(validation.IsDNS1123Subdomain(node)) != 0 || seen[node] {
-			return fmt.Errorf("pod network nodes must be unique valid node names: %w", wire.InvalidRequest)
-		}
-
-		seen[node] = true
+	if c.PeerPort == 9090 {
+		return 9091
 	}
 
-	return nil
+	return 9090
 }
 
-func (c Config) validateIdentityAndPorts() error {
-	if !wire.ValidUUID(string(c.Cluster)) || len(validation.IsDNS1123Label(c.Namespace)) != 0 || c.PeerPort < 1024 {
-		return fmt.Errorf("cluster, namespace, or peer port: %w", wire.InvalidRequest)
-	}
-
-	if c.DiagnosticsPort != 0 && (c.DiagnosticsPort < 1024 || c.DiagnosticsPort == c.PeerPort) {
-		return fmt.Errorf("diagnostics port must be 1024..65535 and distinct from peer port: %w", wire.InvalidRequest)
-	}
-
-	for _, name := range []string{c.DaemonSetName, c.BootstrapTrustConfigMap, c.DataplaneServiceAccount} {
-		if len(validation.IsDNS1123Subdomain(name)) != 0 {
-			return fmt.Errorf("resource name: %w", wire.InvalidRequest)
-		}
-	}
-
-	// The workload name is also the immutable instance selector label value.
-	if len(validation.IsValidLabelValue(c.DaemonSetName)) != 0 {
-		return fmt.Errorf("DaemonSet name must fit a label value: %w", wire.InvalidRequest)
-	}
-
-	return nil
+// Labels are the immutable selector labels of the dataplane Pods.
+func Labels() map[string]string {
+	return map[string]string{"app.kubernetes.io/name": DataplaneDaemonSetName, "app.kubernetes.io/instance": DataplaneDaemonSetName}
 }
 
-func (c Config) validateEndpoint() error {
-	u, err := url.Parse(c.ControlURL)
-	if err != nil {
-		return fmt.Errorf("workload endpoint or image: %w", wire.InvalidRequest)
+// DaemonSet builds the dataplane DaemonSet.
+func DaemonSet(c Config) (*appsv1.DaemonSet, error) {
+	if err := c.Validate(); err != nil {
+		return nil, err
 	}
-
-	validOrigin := u.Scheme == "https" && u.Hostname() != "" && u.User == nil
-
-	plainRoot := u.RawQuery == "" && !u.ForceQuery && u.Fragment == "" && u.RawPath == "" && (u.Path == "" || u.Path == "/")
-	if !validOrigin || !plainRoot || strings.TrimSpace(c.DataplaneImage) == "" {
-		return fmt.Errorf("workload endpoint or image: %w", wire.InvalidRequest)
-	}
-
-	if u.Port() != "" {
-		port, err := strconv.ParseUint(u.Port(), 10, 16)
-		if err != nil || port == 0 {
-			return fmt.Errorf("workload endpoint port: %w", wire.InvalidRequest)
-		}
-	}
-
-	return nil
-}
-
-func buildDaemonSet(c Config) *appsv1.DaemonSet {
-	// Use workload identity, not the manager's identity, for the Pod selector.
-	labels := map[string]string{"app.kubernetes.io/name": "racer-dataplane", "app.kubernetes.io/instance": c.DaemonSetName}
 
 	var annotations map[string]string
 	if c.nvidiaMode() == NVIDIACDI {
@@ -242,9 +171,9 @@ func buildDaemonSet(c Config) *appsv1.DaemonSet {
 
 	return &appsv1.DaemonSet{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"},
-		ObjectMeta: metav1.ObjectMeta{Name: c.DaemonSetName, Namespace: c.Namespace, Labels: labels},
+		ObjectMeta: metav1.ObjectMeta{Name: DataplaneDaemonSetName, Namespace: c.Namespace, Labels: Labels()},
 		Spec: appsv1.DaemonSetSpec{
-			Selector: &metav1.LabelSelector{MatchLabels: labels},
+			Selector: &metav1.LabelSelector{MatchLabels: Labels()},
 			UpdateStrategy: appsv1.DaemonSetUpdateStrategy{
 				Type: appsv1.RollingUpdateDaemonSetStrategyType,
 				RollingUpdate: &appsv1.RollingUpdateDaemonSet{
@@ -254,14 +183,15 @@ func buildDaemonSet(c Config) *appsv1.DaemonSet {
 			},
 			// Require sustained readiness across probe periods before advancing a rollout.
 			MinReadySeconds: 10,
-			Template:        corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: labels, Annotations: annotations}, Spec: dataplanePod(c)},
+			Template:        corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: Labels(), Annotations: annotations}, Spec: dataplanePod(c)},
 		},
-	}
+	}, nil
 }
 
 func dataplanePod(c Config) corev1.PodSpec {
 	pod := corev1.PodSpec{
-		ServiceAccountName:            c.DataplaneServiceAccount,
+		ServiceAccountName: DataplaneDaemonSetName,
+		// The API credentials are projected explicitly instead, see apiVolume.
 		AutomountServiceAccountToken:  ptr.To(false),
 		RestartPolicy:                 corev1.RestartPolicyAlways,
 		DNSPolicy:                     corev1.DNSClusterFirst,
@@ -282,20 +212,6 @@ func dataplanePod(c Config) corev1.PodSpec {
 	return pod
 }
 
-func diagnosticsPort(c Config) int32 {
-	// Zero selects the automatic port; explicit ports are validated rather than
-	// silently moved on collision.
-	diagnosticsPort := int32(c.DiagnosticsPort)
-	if diagnosticsPort == 0 {
-		diagnosticsPort = 9090
-		if c.PeerPort == uint16(diagnosticsPort) {
-			diagnosticsPort++
-		}
-	}
-
-	return diagnosticsPort
-}
-
 // DataplaneAffinity is the default node affinity of dataplane Pods. Workloads
 // that must share nodes with the dataplane reuse it.
 func DataplaneAffinity() *corev1.Affinity {
@@ -304,19 +220,34 @@ func DataplaneAffinity() *corev1.Affinity {
 			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
 				NodeSelectorTerms: []corev1.NodeSelectorTerm{{
 					MatchExpressions: []corev1.NodeSelectorRequirement{
-						{
-							Key:      wire.ExclusionLabel,
-							Operator: corev1.NodeSelectorOpDoesNotExist,
-						},
-						{
-							Key:      "kubernetes.io/os",
-							Operator: corev1.NodeSelectorOpIn,
-							Values:   []string{"linux"},
-						},
+						{Key: ExclusionLabel, Operator: corev1.NodeSelectorOpDoesNotExist},
+						{Key: "kubernetes.io/os", Operator: corev1.NodeSelectorOpIn, Values: []string{"linux"}},
 					},
 				}},
 			},
 		},
+	}
+}
+
+// apiVolume replaces the automounted credentials with the same three files:
+// a default-audience token, the namespace, and the cluster CA. Mounting them
+// explicitly keeps the API token separate from the control token volume.
+func apiVolume() corev1.Volume {
+	return corev1.Volume{
+		Name: "kube-api-access",
+		VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+			DefaultMode: ptr.To(int32(0o444)),
+			Sources: []corev1.VolumeProjection{
+				{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{ExpirationSeconds: ptr.To(int64(3607)), Path: "token"}},
+				{ConfigMap: &corev1.ConfigMapProjection{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "kube-root-ca.crt"},
+					Items:                []corev1.KeyToPath{{Key: "ca.crt", Path: "ca.crt"}},
+				}},
+				{DownwardAPI: &corev1.DownwardAPIProjection{Items: []corev1.DownwardAPIVolumeFile{{
+					Path: "namespace", FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: "metadata.namespace"},
+				}}}},
+			},
+		}},
 	}
 }
 
@@ -328,6 +259,7 @@ func dataplaneVolumes(c Config) []corev1.Volume {
 				HostPath: &corev1.HostPathVolumeSource{Path: "/dev", Type: ptr.To(corev1.HostPathDirectory)},
 			},
 		},
+		apiVolume(),
 		{
 			Name: "token",
 			VolumeSource: corev1.VolumeSource{
@@ -335,23 +267,10 @@ func dataplaneVolumes(c Config) []corev1.Volume {
 					DefaultMode: ptr.To(int32(0o400)),
 					Sources: []corev1.VolumeProjection{{
 						ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
-							Audience:          wire.TokenAudience,
+							Audience:          ControlTokenAudience,
 							ExpirationSeconds: ptr.To(int64(3600)),
 							Path:              "token",
 						},
-					}},
-				},
-			},
-		},
-		{
-			Name: "bootstrap",
-			VolumeSource: corev1.VolumeSource{
-				ConfigMap: &corev1.ConfigMapVolumeSource{
-					LocalObjectReference: corev1.LocalObjectReference{Name: c.BootstrapTrustConfigMap},
-					DefaultMode:          ptr.To(int32(0o444)),
-					Items: []corev1.KeyToPath{{
-						Key:  "ca.crt",
-						Path: "ca.crt",
 					}},
 				},
 			},
@@ -374,11 +293,9 @@ func dataplaneVolumes(c Config) []corev1.Volume {
 }
 
 func dataplaneContainer(c Config) corev1.Container {
-	diagnosticsPort := diagnosticsPort(c)
-
 	mounts := []corev1.VolumeMount{
+		{Name: "kube-api-access", MountPath: APITokenPath, ReadOnly: true},
 		{Name: "token", MountPath: "/var/run/racer-token", ReadOnly: true},
-		{Name: "bootstrap", MountPath: "/etc/racer/bootstrap", ReadOnly: true},
 		{Name: "identity", MountPath: "/var/lib/racer/identity"},
 		{Name: "slabs", MountPath: "/var/lib/racer/slabs"},
 		{Name: "sockets", MountPath: "/run/racer"},
@@ -392,15 +309,17 @@ func dataplaneContainer(c Config) corev1.Container {
 	}
 
 	return corev1.Container{
-		Name:                     "dataplane",
+		Name:                     ContainerName,
 		Image:                    c.DataplaneImage,
 		ImagePullPolicy:          corev1.PullIfNotPresent,
 		TerminationMessagePath:   corev1.TerminationMessagePathDefault,
 		TerminationMessagePolicy: corev1.TerminationMessageReadFile,
-		Env:                      dataplaneEnvironment(c, diagnosticsPort),
+		Env:                      dataplaneEnvironment(c),
 		Ports: []corev1.ContainerPort{
 			{Name: "peer", ContainerPort: int32(c.PeerPort), Protocol: corev1.ProtocolTCP},
-			{Name: "diagnostics", ContainerPort: diagnosticsPort, Protocol: corev1.ProtocolTCP},
+			{Name: "diagnostics", ContainerPort: c.diagnosticsPort(), Protocol: corev1.ProtocolTCP},
+			{Name: "control", ContainerPort: ControlPort, Protocol: corev1.ProtocolTCP},
+			{Name: "webhook", ContainerPort: WebhookPort, Protocol: corev1.ProtocolTCP},
 		},
 		// Readiness may wait on enrollment/recovery indefinitely without probe
 		// restarts. Membership must continue to include unready Pods.
@@ -420,57 +339,35 @@ func dataplaneContainer(c Config) corev1.Container {
 	}
 }
 
-func dataplaneEnvironment(c Config, diagnosticsPort int32) []corev1.EnvVar {
+func fieldEnv(name, path string) corev1.EnvVar {
+	return corev1.EnvVar{Name: name, ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{APIVersion: "v1", FieldPath: path}}}
+}
+
+func dataplaneEnvironment(c Config) []corev1.EnvVar {
+	listen := func(port int32) string { return "[$(RACER_POD_IP)]:" + strconv.Itoa(int(port)) }
+
 	env := []corev1.EnvVar{
-		{
-			Name:  "RACER_CLUSTER_ID",
-			Value: string(c.Cluster),
-		},
-		{
-			Name:  "RACER_CONTROL_ENDPOINT",
-			Value: c.ControlURL,
-		},
+		fieldEnv("RACER_NAMESPACE", "metadata.namespace"),
+		fieldEnv("RACER_POD_NAME", "metadata.name"),
+		fieldEnv("RACER_POD_UID", "metadata.uid"),
+		fieldEnv("RACER_NODE_NAME", "spec.nodeName"),
 		// This is only a bind address, never an authority for node identity.
-		// Define it first so kubelet expands either Pod IP family below.
-		{
-			Name: "RACER_POD_IP",
-			ValueFrom: &corev1.EnvVarSource{
-				FieldRef: &corev1.ObjectFieldSelector{
-					APIVersion: "v1",
-					FieldPath:  "status.podIP",
-				},
-			},
-		},
-		{
-			Name:  "RACER_PEER_LISTEN",
-			Value: "[$(RACER_POD_IP)]:" + strconv.Itoa(int(c.PeerPort)),
-		},
-		{
-			Name:  "RACER_DIAGNOSTICS_LISTEN",
-			Value: "[$(RACER_POD_IP)]:" + strconv.Itoa(int(diagnosticsPort)),
-		},
-		{
-			Name:  "RACER_TRUST_BUNDLE",
-			Value: "/etc/racer/bootstrap/ca.crt",
-		},
-		{
-			Name:  "RACER_SERVICE_ACCOUNT_TOKEN",
-			Value: "/var/run/racer-token/token",
-		},
+		// Define it before the listeners so kubelet expands either IP family.
+		fieldEnv("RACER_POD_IP", "status.podIP"),
+		// Every Pod IP. The webhook also serves the other family, since the
+		// racer-webhook Service primary family need not match status.podIP.
+		fieldEnv("RACER_POD_IPS", "status.podIPs"),
+		{Name: "RACER_PEER_LISTEN", Value: listen(int32(c.PeerPort))},
+		{Name: "RACER_DIAGNOSTICS_LISTEN", Value: listen(c.diagnosticsPort())},
+		{Name: "RACER_CONTROL_LISTEN", Value: listen(ControlPort)},
+		{Name: "RACER_WEBHOOK_LISTEN", Value: listen(WebhookPort)},
+		{Name: "RACER_OBJECT_IMAGE", Value: c.ObjectImage},
+		{Name: "RACER_SERVICE_ACCOUNT_TOKEN", Value: "/var/run/racer-token/token"},
 		// Kubelet creates the hostPath mount with mode 0755. Let the
 		// dataplane create its private 0700 directory beneath it.
-		{
-			Name:  "RACER_IDENTITY_DIRECTORY",
-			Value: "/var/lib/racer/identity/private",
-		},
-		{
-			Name:  "RACER_SLAB_DIRECTORY",
-			Value: "/var/lib/racer/slabs",
-		},
-		{
-			Name:  "RACER_DEVICE_DIRECTORY",
-			Value: "/host/dev",
-		},
+		{Name: "RACER_IDENTITY_DIRECTORY", Value: "/var/lib/racer/identity/private"},
+		{Name: "RACER_SLAB_DIRECTORY", Value: "/var/lib/racer/slabs"},
+		{Name: "RACER_DEVICE_DIRECTORY", Value: "/host/dev"},
 	}
 
 	// Ask the NVIDIA runtime for driver libraries only. The privileged
@@ -483,53 +380,6 @@ func dataplaneEnvironment(c Config, diagnosticsPort int32) []corev1.EnvVar {
 	}
 
 	return env
-}
-
-// DesiredDaemonSets builds steady-state placement, not a safe migration plan.
-// The operator must additionally exclude occupied destination nodes until every
-// source Pod, including terminating Pods, has disappeared.
-func DesiredDaemonSets(c Config) ([]*appsv1.DaemonSet, error) {
-	if err := c.Validate(); err != nil {
-		return nil, err
-	}
-
-	nodes := slices.Clone(c.PodNetworkNodes)
-	slices.Sort(nodes)
-
-	c.PodNetworkNodes = nil
-
-	host := buildDaemonSet(c)
-
-	if len(nodes) == 0 {
-		return []*appsv1.DaemonSet{host}, nil
-	}
-
-	c.HostNetwork = false
-	c.DaemonSetName = PodNetworkDaemonSetName
-
-	pod := buildDaemonSet(c)
-
-	// The existing selector is immutable. Use a distinct app value, not an
-	// additional label that would still match the original workload selector.
-	pod.Labels["app.kubernetes.io/name"] = PodNetworkDaemonSetName
-	pod.Spec.Selector.MatchLabels["app.kubernetes.io/name"] = PodNetworkDaemonSetName
-	pod.Spec.Template.Labels["app.kubernetes.io/name"] = PodNetworkDaemonSetName
-	hostSelector := host.Spec.Template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
-	podSelector := pod.Spec.Template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
-	base := podSelector.NodeSelectorTerms[0].DeepCopy()
-	podSelector.NodeSelectorTerms = nil
-	// Field selectors accept one value per requirement. Host exclusions are
-	// ANDed; each pod-network node gets an OR term retaining the base constraints.
-	for _, node := range nodes {
-		hostSelector.NodeSelectorTerms[0].MatchFields = append(hostSelector.NodeSelectorTerms[0].MatchFields, corev1.NodeSelectorRequirement{
-			Key: "metadata.name", Operator: corev1.NodeSelectorOpNotIn, Values: []string{node},
-		})
-		term := base.DeepCopy()
-		term.MatchFields = []corev1.NodeSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{node}}}
-		podSelector.NodeSelectorTerms = append(podSelector.NodeSelectorTerms, *term)
-	}
-
-	return []*appsv1.DaemonSet{host, pod}, nil
 }
 
 // DataplaneMemoryRequest is the default memory request for the dataplane

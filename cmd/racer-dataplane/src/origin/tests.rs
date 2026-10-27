@@ -170,7 +170,7 @@ fn published_client() -> (
     let (mut client, admission, reactor) = client();
     let publication = racer_control_wire::decode_publication(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../internal/racer/wire/testdata/publication.json"
+        "/control-wire/testdata/publication.json"
     )))
     .unwrap();
     client.snapshots = Arc::new(Published::new(Snapshot::retention(2)));
@@ -479,7 +479,7 @@ fn same_name_new_uid_dials_replacement_without_reusing_old_keepalive() {
     let (mut client, admission, reactor) = self::client();
     let mut publication = racer_control_wire::decode_publication(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../internal/racer/wire/testdata/publication.json"
+        "/control-wire/testdata/publication.json"
     )))
     .unwrap();
     publication.sequence.0 = 1;

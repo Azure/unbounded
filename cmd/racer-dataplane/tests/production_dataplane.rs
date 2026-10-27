@@ -875,7 +875,7 @@ fn fixture_keys() -> (Rc<Keyring>, Rc<Keyring>) {
     // requires distinct material. These are deterministic test-only keys.
     let mut bundle: serde_json::Value = serde_json::from_slice(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../internal/racer/wire/testdata/bundle.json"
+        "/control-wire/testdata/bundle.json"
     )))
     .unwrap();
     for (i, key) in bundle["cache_keys"]

@@ -388,7 +388,7 @@ impl ControlFixture {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let mut config = crate::test_support::cluster::config(false);
-        config.control_endpoint = format!("https://{}", listener.local_addr().unwrap());
+        config.control_endpoint = Some(format!("https://{}", listener.local_addr().unwrap()));
         config.trust_bundle = directory.join("trust.pem");
         config.service_account_token = directory.join("token");
         config.identity_directory = directory.join("identity");
@@ -591,6 +591,8 @@ fn control_fixture_survives_request_abandoned_mid_body() {
         .as_ref()
         .unwrap()
         .control_endpoint
+        .as_deref()
+        .unwrap()
         .trim_start_matches("https://")
         .to_owned();
     let mut roots = rustls::RootCertStore::empty();
@@ -1524,7 +1526,7 @@ fn composes_http_and_optional_rdma_without_operational_side_effects() {
         // Admission bounds retained generations once across the node.
         let mut publication = racer_control_wire::decode_publication(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../internal/racer/wire/testdata/publication.json"
+            "/control-wire/testdata/publication.json"
         )))
         .unwrap();
         publication.cluster = config.cluster.clone();
@@ -1557,7 +1559,7 @@ fn multiworker_memberships_retire_after_request_leases_and_reuse_capacity() {
     use racer_control_wire::MembershipVersion;
     let mut publication = racer_control_wire::decode_publication(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../internal/racer/wire/testdata/publication.json"
+        "/control-wire/testdata/publication.json"
     )))
     .unwrap();
     let local = publication.members[0].node.clone();
@@ -3401,11 +3403,23 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     drop(accepted);
     accepted_scope.cancel().unwrap();
     let shard = futures::executor::block_on(worker.store.checkpoint.snapshot_shard()).unwrap();
-    futures::executor::block_on(worker.store.checkpoint.publish(vec![shard])).unwrap();
+    futures::executor::block_on(
+        worker
+            .store
+            .checkpoint
+            .publish(worker.keys.cluster().clone(), vec![shard]),
+    )
+    .unwrap();
     worker.store.checkpoint.finish_snapshot();
     assert!(fixture.directory.join("slabs/checkpoint.0").is_file());
     let shard = futures::executor::block_on(worker.store.checkpoint.snapshot_shard()).unwrap();
-    futures::executor::block_on(worker.store.checkpoint.publish(vec![shard])).unwrap();
+    futures::executor::block_on(
+        worker
+            .store
+            .checkpoint
+            .publish(worker.keys.cluster().clone(), vec![shard]),
+    )
+    .unwrap();
     worker.store.checkpoint.finish_snapshot();
     assert!(fixture.directory.join("slabs/checkpoint.1").is_file());
     worker

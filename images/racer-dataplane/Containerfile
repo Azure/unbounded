@@ -49,6 +49,10 @@ COPY cmd/racer-dataplane/control-wire/Cargo.toml ./control-wire/Cargo.toml
 COPY cmd/racer-dataplane/control-wire/src ./control-wire/src
 COPY cmd/racer-dataplane/controlplane/Cargo.toml ./controlplane/Cargo.toml
 COPY cmd/racer-dataplane/controlplane/src ./controlplane/src
+COPY cmd/racer-dataplane/cluster-control/Cargo.toml ./cluster-control/Cargo.toml
+COPY cmd/racer-dataplane/cluster-control/src ./cluster-control/src
+COPY cmd/racer-dataplane/admission/Cargo.toml ./admission/Cargo.toml
+COPY cmd/racer-dataplane/admission/src ./admission/src
 COPY cmd/racer-dataplane/peer-wire/Cargo.toml ./peer-wire/Cargo.toml
 COPY cmd/racer-dataplane/peer-wire/src ./peer-wire/src
 COPY cmd/racer-dataplane/object-wire/Cargo.toml ./object-wire/Cargo.toml
@@ -166,8 +170,8 @@ WORKDIR /unbounded
 
 USER 65532:65532
 
-# Peer HTTP and loopback diagnostics. Client/origin traffic uses mounted UDS paths.
-EXPOSE 7443 9090
+# Peer HTTP, diagnostics, and elected control listeners. Clients use mounted UDS paths.
+EXPOSE 7443 8082 8443 9443 9090
 STOPSIGNAL SIGTERM
 
 ENTRYPOINT ["/unbounded/bin/racer-dataplane"]

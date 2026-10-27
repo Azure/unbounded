@@ -26,16 +26,8 @@ another fetch.
 
 ## Architecture
 
-Racer has two components:
-
-**Controller** (`racer-controller`) -- A Deployment with one elected leader:
-
-- Builds the member list from Nodes and dataplane pods, and publishes it to
-  every node.
-- Enrolls each dataplane pod and issues it a short-lived certificate.
-- Creates and rotates the encryption keys for each cache.
-
-**Dataplane** (`racer-dataplane`) -- A DaemonSet on participating nodes:
+Racer runs as one **DaemonSet**, `racer-dataplane`. Each pod runs the same Rust
+binary. It:
 
 - Serves app reads on per-cache Unix sockets under `/run/racer/<cache>/`.
 - Keeps pages in memory and on local disk.
@@ -45,11 +37,19 @@ Racer has two components:
 - Calls the local origin when this node is responsible for a page that no
   node has yet.
 
+Some dataplane pods also hold **control seats**, elected through Kubernetes
+Leases. One seat is the **primary**. It builds the member list and cache catalog
+and commits their versions and encryption keys to Kubernetes. The seats serve
+that committed state, enroll dataplane pods, and run the object-sidecar webhook.
+Every node discovers seats through the Leases and connects to them directly.
+There is no separate controller Deployment or controller image.
+
 Apps and origins use the Go SDK (`pkg/racersdk`). It provides a `Client` for
 reads and `ServeOrigin` for origins.
 
-The Unbounded operator deploys the controller and dataplane when any
-`ClusterCache` exists.
+The Unbounded operator installs the DaemonSet and its supporting Kubernetes
+resources when any `ClusterCache` exists. Origin adapters and application
+sidecars remain separate from the Racer control plane.
 
 ## Core Concepts
 
@@ -170,15 +170,15 @@ the source available to refill missing pages.
 
 ## Security
 
-The security model combines controller-issued credentials with
-dataplane protections:
+The security model combines credentials issued by elected seats with dataplane
+protections:
 
-- **Enrollment** -- Each dataplane pod proves its identity to the controller
-  with a projected ServiceAccount token. The controller checks that the pod
+- **Enrollment** -- Each dataplane pod proves its identity to a control seat
+  with a projected ServiceAccount token. The seat checks that the pod
   belongs to the Racer DaemonSet, then issues a short-lived certificate
   (24 hours by default).
 - **Encryption** -- Pages are encrypted with a per-cache key, both between
-  nodes and on disk. The controller rotates keys every 24 hours by default.
+  nodes and on disk. The elected control plane creates and rotates these keys.
 - **Signed requests** -- Every node signs each request it sends or forwards to
   another node.
 - **Credentials** -- `Authorization` and `Metadata` are sealed
