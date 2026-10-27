@@ -7,5 +7,6 @@
 // Removed once the worker integration lands and uses these items.
 #![allow(dead_code)]
 
+pub(crate) mod control;
 pub(crate) mod uapi;
 
