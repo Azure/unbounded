@@ -177,6 +177,35 @@ def available() -> bool:
     return True
 
 
+class CUuuid(ctypes.Structure):
+    _fields_ = [("bytes", ctypes.c_ubyte * 16)]
+
+
+def format_uuid(raw: bytes) -> str:
+    """Format 16 UUID bytes as ``GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx``, like nvidia-smi."""
+    if len(raw) != 16:
+        raise ValueError("a GPU UUID is 16 bytes")
+    h = raw.hex()
+    return f"GPU-{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
+
+
+def device_uuid(device: int = 0) -> str:
+    """Return the UUID of CUDA device ``device`` (an ordinal in this process).
+
+    Ordinals depend on CUDA_VISIBLE_DEVICES and the container's GPU set, so
+    they differ between this process and the dataplane. The UUID does not.
+    """
+    lib = _load()
+    fn = getattr(lib, "cuDeviceGetUuid_v2", None) or getattr(lib, "cuDeviceGetUuid", None)
+    if fn is None:
+        raise CudaUnavailable("libcuda has no cuDeviceGetUuid")
+    dev = ctypes.c_int(0)
+    _check("cuDeviceGet", lib.cuDeviceGet(ctypes.byref(dev), device))
+    uuid = CUuuid()
+    _check("cuDeviceGetUuid", fn(ctypes.byref(uuid), dev.value))
+    return format_uuid(bytes(uuid.bytes))
+
+
 def ensure_context(device: int = 0) -> None:
     """Make sure a context is current; retain the primary context if not.
 
@@ -309,6 +338,10 @@ class GpuAllocation:
             except BaseException:
                 self.close()
                 raise
+
+    def gpu_uuid(self) -> str:
+        """The UUID of the GPU that holds the allocation, sent with gpu-read."""
+        return device_uuid(self.device)
 
     def export_fd(self) -> int:
         """Return a new POSIX file descriptor for the allocation. The caller closes it."""

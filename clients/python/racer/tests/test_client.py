@@ -203,6 +203,52 @@ def test_gpu_read_success(server, gpu_writer):
         g.close()
 
 
+UUID = "GPU-00112233-4455-6677-8899-aabbccddeeff"
+
+
+def _boom():
+    raise RuntimeError("no uuid")
+
+
+@pytest.mark.parametrize(
+    "uuid, sent",
+    [
+        (None, None),  # older destinations: no header, the dataplane tries each GPU
+        (UUID, UUID),
+        (UUID[4:], UUID),  # torch prints the UUID without the GPU- prefix
+        ("MIG-00112233-4455-6677-8899-aabbccddeeff", None),
+        ("junk", None),
+        (_boom, None),  # a failed lookup never fails the read
+    ],
+)
+def test_gpu_read_sends_gpu_uuid(server, gpu_writer, uuid, sent):
+    req = add(server)
+    server.gpu_status = 200
+    server.gpu_write = gpu_writer
+    g = FakeGpu(len(DATA), uuid=uuid)
+    try:
+        r = client(server).read_into_gpu(req, g)
+        assert r.delivery == racer.GPU
+        assert server.seen[-1].headers.get("racer-gpu-uuid") == sent
+    finally:
+        g.close()
+
+
+def test_gpu_read_unknown_uuid_falls_back_to_host(server):
+    # The dataplane answers 501 for a GPU it cannot use.
+    req = add(server)
+    server.gpu_status = 501
+    g = FakeGpu(len(DATA), uuid=UUID)
+    try:
+        c = client(server)
+        r = c.read_into_gpu(req, g)
+        assert r.delivery == racer.HOST
+        assert g.read(0, len(DATA)) == DATA
+        assert c.mode_state(racer.GPU) == "unsupported"
+    finally:
+        g.close()
+
+
 def test_gpu_falls_back_to_host_chunks(server):
     req = add(server)
     g = FakeGpu(len(DATA))

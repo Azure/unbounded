@@ -13,6 +13,7 @@ import array
 import contextlib
 import logging
 import os
+import re
 import socket
 import threading
 import time
@@ -73,6 +74,30 @@ def _dest_device(dest) -> int | None:
         return device
     index = getattr(device, "index", None)
     return index if isinstance(index, int) else None
+
+
+_UUID = re.compile(r"GPU-[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+
+
+def _dest_uuid(dest) -> str | None:
+    """Return the GPU UUID of a gpu-read destination, or None if unknown.
+
+    The dataplane uses it to pick its context for the client's GPU, because
+    device ordinals differ between containers. Without it the dataplane tries
+    each GPU, so failing to learn the UUID is never an error.
+    """
+    get = getattr(dest, "gpu_uuid", None)
+    if get is None:
+        return None
+    try:
+        uuid = get() if callable(get) else get
+    except Exception:
+        return None
+    if not isinstance(uuid, str):
+        return None
+    if not uuid.upper().startswith("GPU-"):
+        uuid = "GPU-" + uuid
+    return uuid if _UUID.fullmatch(uuid) else None
 
 
 def socket_path_for(cache: str | None = None, socket_path: str | None = None) -> str:
@@ -492,6 +517,7 @@ class Client:
         if_match: str | None,
         on_frame: Callable[[int, int], None] | None,
         on_head: Callable[[], None] | None = None,
+        gpu_uuid: str | None = None,
     ) -> ReadResult:
         if dest_offset < 0 or dest_length <= 0:
             raise RacerError("invalid destination window")
@@ -503,6 +529,10 @@ class Client:
         head += f"Racer-Destination-Offset: {dest_offset}\r\nRacer-Destination-Length: {dest_length}\r\n"
         if allocation_size is not None:
             head += f"Racer-Allocation-Size: {allocation_size}\r\n"
+        if gpu_uuid is not None:
+            if not _UUID.fullmatch(gpu_uuid):
+                raise RacerError("invalid GPU UUID")
+            head += f"Racer-Gpu-Uuid: {gpu_uuid}\r\n"
         head += self._context_headers(request) + "\r\n"
         conn = self._connect()
         try:
@@ -560,11 +590,29 @@ class Client:
         length: int | None = None,
         if_match: str | None = None,
         on_page: OnPage = None,
+        gpu_uuid: str | None = None,
     ) -> ReadResult:
-        """One gpu-read RPC with no fallback. fd comes from cuMemExportToShareableHandle."""
+        """One gpu-read RPC with no fallback. fd comes from cuMemExportToShareableHandle.
+
+        gpu_uuid (``GPU-xxxxxxxx-...``, see racer.cuda.device_uuid) names the
+        GPU that holds the allocation. Send it when the process sees more than
+        one GPU or its device numbers may differ from the host's.
+        """
         if dest_offset + dest_length > allocation_size:
             raise RacerError("destination window is outside the allocation")
-        return self._rpc(GPU, request, fd, dest_offset, dest_length, allocation_size, offset, length, if_match, on_page)
+        return self._rpc(
+            GPU,
+            request,
+            fd,
+            dest_offset,
+            dest_length,
+            allocation_size,
+            offset,
+            length,
+            if_match,
+            on_page,
+            gpu_uuid=gpu_uuid,
+        )
 
     # Fallback driver -------------------------------------------------------
 
@@ -678,9 +726,9 @@ class Client:
 
         dest is a racer.cuda.GpuAllocation, a racer.tensors.TensorTarget, or
         any object with ``size``, ``copy_from_host(offset, data)`` and
-        optionally ``export_fd()``. Modes: gpu-read, then host-read into a
-        pinned staging memfd plus a host-to-device copy, then stream into the
-        staging buffer plus a copy. on_page(object_offset, length) runs once a
+        optionally ``export_fd()`` and ``gpu_uuid()``. Modes: gpu-read, then
+        host-read into a pinned staging memfd plus a host-to-device copy, then
+        stream into the staging buffer plus a copy. on_page(object_offset, length) runs once a
         page is in GPU memory.
         """
         window = dest.size - dest_offset
@@ -699,7 +747,18 @@ class Client:
                     raise _Skip() from None
                 try:
                     return self._rpc(
-                        GPU, request, fd, dest_offset, window, dest.size, offset, length, if_match, on_page, ok
+                        GPU,
+                        request,
+                        fd,
+                        dest_offset,
+                        window,
+                        dest.size,
+                        offset,
+                        length,
+                        if_match,
+                        on_page,
+                        ok,
+                        gpu_uuid=_dest_uuid(dest),
                     )
                 finally:
                     os.close(fd)
