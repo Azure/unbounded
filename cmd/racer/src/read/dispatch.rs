@@ -1128,6 +1128,10 @@ impl WorkerEndpoint {
         self.directory.warm.stop();
         self.mailbox.stop_admission();
     }
+    /// Whether this worker's mailbox still admits new read commands.
+    pub fn is_admitting(&self) -> bool {
+        self.mailbox.inner.is_open()
+    }
     pub fn is_drained(&self) -> bool {
         self.mailbox.outstanding() == 0 && self.directory.warm.drained(self.mailbox.worker)
     }

@@ -1148,6 +1148,15 @@ mod ownership_maintenance_tests {
 }
 
 impl WorkerApplication {
+    /// Whether ublk devices may still send reads. True until the control
+    /// thread has stopped every device.
+    fn ublk_holds_reads(&self) -> bool {
+        self.node
+            .ublk
+            .as_ref()
+            .is_some_and(|manager| !manager.control_done())
+    }
+
     /// All constructors below only connect dependencies. Runtime commands route
     /// listener work to page/metadata owners before any acquisition is dispatched.
     pub fn assemble(
@@ -2549,7 +2558,11 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
                 .transition(crate::telemetry::State::Draining)?;
         }
         self.clients.stop_admission();
-        if let Some(endpoint) = &self.endpoint {
+        // ublk reads go through every worker's mailbox. STOP_DEV waits for
+        // them, so keep the mailbox open until the devices are stopped.
+        if !self.ublk_holds_reads()
+            && let Some(endpoint) = &self.endpoint
+        {
             endpoint.stop_admission();
         }
         if let Some(scope) = &self.listener_scope {
@@ -2580,7 +2593,9 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
             let flights = self.flights.clone();
             let fence_scope = scope(Duration::from_secs(365 * 24 * 3600))?;
             let mut client_drain = clients.drain(&deadline);
-            let mut flight_drain = flights.drain(&fence_scope);
+            // Flights fetch ublk pages from origin and peers, so their drain
+            // waits like the endpoint's until the devices are stopped.
+            let mut flight_drain = None;
             let mut clients_done = false;
             let mut flights_done = false;
             let mut first_error = None;
@@ -2605,13 +2620,20 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
                     }
                     clients_done = true;
                 }
-                if !flights_done && let Poll::Ready(result) = flight_drain.as_mut().poll(cx) {
+                let holding = self.ublk_holds_reads() && deadline.check().is_ok();
+                if !holding && flight_drain.is_none() {
+                    flight_drain = Some(flights.drain(&fence_scope));
+                }
+                if !flights_done
+                    && let Some(drain) = &mut flight_drain
+                    && let Poll::Ready(result) = drain.as_mut().poll(cx)
+                {
                     if let Err(error) = result {
                         first_error.get_or_insert(error);
                     }
                     flights_done = true;
                 }
-                if let Some(endpoint) = &mut self.endpoint {
+                if !holding && let Some(endpoint) = &mut self.endpoint {
                     let mut drain = endpoint.drain(&deadline);
                     if let Poll::Ready(Err(error)) = drain.as_mut().poll(cx) {
                         first_error.get_or_insert(error);
@@ -3443,6 +3465,85 @@ mod ublk_tests {
         assert_eq!(manager.queues(), 2);
         // Opening the missing control device fails; the thread exits on its own.
         thread.join().unwrap();
+    }
+
+    /// A real worker graph on worker 0 of the default two-worker node, with
+    /// its read endpoint installed as `start` would.
+    fn worker_with(ublk: Option<Arc<crate::ublk::manager::Manager>>) -> WorkerApplication {
+        let config = crate::test_support::cluster::config(false);
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+            config.limits.clone(),
+        )));
+        let (io, _engine) = crate::security::pair(WorkerId(0), 0, config.limits.queue_entries);
+        let node = NodeState {
+            ublk,
+            ..Default::default()
+        };
+        let mut worker = WorkerApplication::assemble(
+            &config,
+            Arc::new(node),
+            WorkerId(0),
+            WorkerRuntime {
+                reactor: Rc::new(Reactor::new(admission.clone())),
+                admission,
+                crypto: Rc::new(crate::security::CryptoClient::new(io)),
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        worker.endpoint = Some(
+            worker
+                .directory
+                .install(worker.worker, worker.coordinator.clone())
+                .unwrap(),
+        );
+        worker
+    }
+
+    fn admitting(worker: &WorkerApplication) -> bool {
+        worker
+            .endpoint
+            .as_ref()
+            .is_some_and(WorkerEndpoint::is_admitting)
+    }
+
+    #[test]
+    fn stop_admission_closes_reads_without_ublk() {
+        let mut worker = worker_with(None);
+        assert!(admitting(&worker));
+        uring_runtime::group::Service::stop_admission(&mut worker).unwrap();
+        assert!(!worker.ublk_holds_reads());
+        assert!(!admitting(&worker));
+    }
+
+    #[test]
+    fn stop_admission_keeps_ublk_reads_open_until_devices_stop() {
+        let manager = Arc::new(crate::ublk::manager::Manager::new(
+            &ublk(1, 4),
+            2,
+            std::path::Path::new("/nonexistent-ublk-test"),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ));
+        let mut worker = worker_with(Some(manager.clone()));
+        assert!(worker.ublk.is_some());
+        uring_runtime::group::Service::stop_admission(&mut worker).unwrap();
+        // STOP_DEV waits for in-flight reads, so the read path stays open and
+        // the ublk queue keeps being polled while the worker is stopping.
+        assert!(worker.stopping);
+        assert!(worker.ublk_holds_reads());
+        assert!(admitting(&worker));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let views = manager.view(0, cx.waker());
+        assert!(!views[0].resolve, "stop must end version lookups");
+        worker.ublk.as_mut().unwrap().poll(&mut cx);
+        // The control thread exits after stopping every device. Opening the
+        // missing control device fails, which ends the thread the same way.
+        manager.run();
+        assert!(manager.control_done());
+        assert!(!worker.ublk_holds_reads());
+        uring_runtime::group::Service::stop_admission(&mut worker).unwrap();
+        assert!(!admitting(&worker));
     }
 }
 

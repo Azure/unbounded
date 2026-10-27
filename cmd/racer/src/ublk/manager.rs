@@ -260,8 +260,8 @@ impl Manager {
             .map(|attach| attach.dev_id)
     }
 
-    /// Whether the control thread has exited.
-    #[cfg(test)]
+    /// Whether the control thread has exited. Every device it started has
+    /// been stopped by then, so no kernel request still waits for a read.
     pub(crate) fn control_done(&self) -> bool {
         self.lock().control_done
     }
