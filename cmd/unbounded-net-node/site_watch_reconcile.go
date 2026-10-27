@@ -1084,8 +1084,6 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 	}
 
 	// Parse all sites
-	var allSites []unboundedv1alpha3.Site
-
 	siteMap := make(map[string]*unboundedv1alpha3.Site)
 
 	for _, item := range siteInformer.GetStore().List() {
@@ -1100,7 +1098,6 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 			continue
 		}
 
-		allSites = append(allSites, *site)
 		siteMap[site.Name] = site
 	}
 
@@ -1480,7 +1477,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		isGatewayNode = gatewayNodePubKeys[myPubKey]
 	}
 
-	siteRouting, err := collectSiteRoutingConfig(siteMap, mySiteName, isGatewayNode)
+	siteRouting, err := collectSiteRoutingConfig(siteMap, mySiteName, isGatewayNode, networkPeeredSites)
 	if err != nil {
 		return err
 	}
@@ -1738,34 +1735,6 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 				profile.TransmitInterval,
 			)
 		}
-	}
-
-	// Collect CIDRs from non-network-peered remote sites (nodeCidrs only; pod CIDRs are per-node and tracked elsewhere)
-	// Network-peered sites (including meshNodes=false) should not install nodeCIDR routes via gateways.
-	var otherSitesNodeCIDRs []string
-
-	for _, site := range allSites {
-		// Skip our own site and any network-peered sites (if we have a site)
-		if mySiteName != "" && networkPeeredSites[site.Name] {
-			continue
-		}
-
-		otherSitesNodeCIDRs = append(otherSitesNodeCIDRs, site.Spec.NodeCidrs...)
-	}
-
-	otherSitesNodeCIDRs = dedupeStrings(otherSitesNodeCIDRs)
-	shouldLogOtherSitesNodeCIDRs := false
-
-	state.mu.Lock()
-	if !reflect.DeepEqual(state.otherSitesNodeCIDRs, otherSitesNodeCIDRs) {
-		shouldLogOtherSitesNodeCIDRs = true
-
-		state.otherSitesNodeCIDRs = append([]string(nil), otherSitesNodeCIDRs...)
-	}
-	state.mu.Unlock()
-
-	if shouldLogOtherSitesNodeCIDRs && len(otherSitesNodeCIDRs) > 0 {
-		klog.V(2).Infof("Collected node CIDRs from other sites: %v", otherSitesNodeCIDRs)
 	}
 
 	// Get all slices from the informer cache
@@ -2345,13 +2314,14 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		// (WG, GENEVE, IPIP, VXLAN). The BPF program on unbounded0 performs
 		// the per-destination redirect.
 		//
-		// On gateway nodes, also pull in every remote site's pod-CIDR pool
-		// and NodeCidr so packets to remote-site underlay IPs (e.g. kubelet
-		// probes to a peered site's gateway node) are funneled through
-		// unbounded0 and the BPF program's per-gateway /32 entries get a
-		// chance to pin them to the correct WG tunnel. The gateway's own
-		// site NodeCidr is excluded because that traffic must keep using
-		// the host's default route.
+		// On gateway nodes, also pull in every Site's pod-CIDR pool and the
+		// NodeCidrs of Sites reached through gateway pools, so packets to
+		// those underlay IPs (e.g. kubelet probes to a remote gateway node)
+		// are funneled through unbounded0 and the BPF program's per-gateway
+		// /32 entries get a chance to pin them to the correct WG tunnel. The
+		// gateway's own Site and any Site it shares a SitePeering with are
+		// excluded: that traffic must keep using the host's own routes,
+		// because those node IPs are also tunnel endpoints.
 		tunnelRoutes = append(tunnelRoutes, buildSupernetRoutes(cfg, state, peers, gatewayPeers, siteRouting.gatewaySupernets)...)
 	} else {
 		wgMeshPeers = peers

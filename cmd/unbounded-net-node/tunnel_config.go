@@ -34,11 +34,12 @@ const unbounded0DeviceName = "unbounded0"
 // per-destination redirect once traffic reaches unbounded0.
 //
 // extraSupernets is a set of additional CIDRs the caller has already
-// reasoned about (typically every other site's pod-CIDR pool and NodeCidr
-// on a gateway node, so packets to remote-site underlay node IPs are
-// directed through the BPF program instead of out the default route).
-// The caller is responsible for excluding any CIDR that should keep
-// using the host default route (e.g. the gateway's own site NodeCidr).
+// reasoned about (on a gateway node, every Site's pod-CIDR pool plus the
+// NodeCidrs of Sites reached through gateway pools, so packets to those
+// underlay node IPs are directed through the BPF program instead of out the
+// default route). The caller is responsible for excluding any CIDR that
+// should keep using the host default route (e.g. the NodeCidrs of the
+// gateway's own Site and of Sites it shares a SitePeering with).
 func buildSupernetRoutes(cfg *config, state *wireGuardState, meshPeers []meshPeerInfo, gatewayPeers []gatewayPeerInfo, extraSupernets []string) []unboundednetnetlink.DesiredRoute {
 	devIface, err := net.InterfaceByName(unbounded0DeviceName)
 	if err != nil {
