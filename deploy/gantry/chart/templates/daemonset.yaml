@@ -35,16 +35,11 @@ spec:
         {{- toYaml .Values.tolerations | nindent 8 }}
       terminationGracePeriodSeconds: 30
       initContainers:
-        - name: chown-hostpaths
-          image: mcr.microsoft.com/cbl-mariner/busybox:2.0
-          imagePullPolicy: IfNotPresent
-          command:
-            - sh
-            - -c
-            - |
-              set -eu
-              chown -R 65532:65532 /var/lib/gantry/libp2p
-              chmod 0700 /var/lib/gantry/libp2p
+        - name: gantry-init
+          image: {{ include "gantry.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - init
           securityContext:
             runAsNonRoot: false
             runAsUser: 0

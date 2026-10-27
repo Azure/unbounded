@@ -755,41 +755,49 @@ func (h *harness) applyConfigMap(ctx context.Context) error {
 	return nil
 }
 
-// patchDaemonSetForE2E rewrites the rendered DaemonSet's gantry
-// container - and ONLY the gantry container - to use the
-// side-loaded e2e image with imagePullPolicy=Never. The busybox
-// initContainer (which also has `imagePullPolicy: IfNotPresent`)
-// is left untouched so kind's containerd can pull it from the
-// public registry on first boot.
+// patchDaemonSetForE2E rewrites the rendered DaemonSet's gantry-init and
+// gantry containers - the two that run the gantry image, and ONLY those -
+// to use the side-loaded e2e image with imagePullPolicy=Never.
 //
 // This pure helper exists so the patch logic is unit-testable
 // without spinning up a kind cluster or shelling out to kubectl.
 // The harness's applyDaemonSet wraps it.
 //
-// Why this is structural rather than a bare strings.Replace call: the
-// DaemonSet has TWO
-// `imagePullPolicy: IfNotPresent` entries. A previous revision
-// used `strings.Replace(..., 1)` on the policy line alone, which
-// patched the busybox initContainer (first occurrence) instead of
-// gantry. The result on a fresh kind cluster was the busybox init image
-// being set to `Never` - but busybox is not preloaded into kind
-// so kubelet hit ErrImageNeverPull and the initContainer never
-// started. The eleventh-review fix was to anchor the swap on a
-// multi-line pattern that uniquely matches the gantry container,
-// then fail loud if the anchor stops matching.
+// Why this is structural rather than a bare strings.Replace call: a
+// previous revision used `strings.Replace(..., 1)` on the
+// `imagePullPolicy: IfNotPresent` line alone, which patched whichever
+// container came first. At the time that was a busybox init
+// container, which kind does not preload, so kubelet hit
+// ErrImageNeverPull and the init container never started. The
+// eleventh-review fix was to anchor the swap on a multi-line pattern
+// that uniquely matches each container by name, then fail loud if an
+// anchor stops matching.
 func patchDaemonSetForE2E(raw, imageTag string) (string, error) {
-	const anchor = "        - name: gantry\n          image: "
+	for _, name := range []string{"gantry-init", "gantry"} {
+		var err error
+
+		raw, err = patchContainerImageForE2E(raw, name, imageTag)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	return raw, nil
+}
+
+func patchContainerImageForE2E(raw, name, imageTag string) (string, error) {
+	anchor := "        - name: " + name + "\n          image: "
 
 	start := strings.Index(raw, anchor)
 	if start < 0 {
-		return "", errors.New("patchDaemonSetForE2E: gantry container anchor not found in rendered daemonset.yaml")
+		return "", fmt.Errorf("patchDaemonSetForE2E: %s container anchor not found in rendered daemonset.yaml", name)
 	}
 
 	imageStart := start + len(anchor)
 
 	imageEnd := strings.IndexByte(raw[imageStart:], '\n')
 	if imageEnd < 0 {
-		return "", errors.New("patchDaemonSetForE2E: gantry image line is incomplete")
+		return "", fmt.Errorf("patchDaemonSetForE2E: %s image line is incomplete", name)
 	}
 
 	imageEnd += imageStart
@@ -798,12 +806,10 @@ func patchDaemonSetForE2E(raw, imageTag string) (string, error) {
 
 	policyStart := imageEnd + 1
 	if !strings.HasPrefix(raw[policyStart:], policy) {
-		return "", errors.New("patchDaemonSetForE2E: gantry imagePullPolicy anchor not found in rendered daemonset.yaml")
+		return "", fmt.Errorf("patchDaemonSetForE2E: %s imagePullPolicy anchor not found in rendered daemonset.yaml", name)
 	}
 
-	patched := raw[:imageStart] + imageTag + "\n          imagePullPolicy: Never" + raw[policyStart+len(policy):]
-
-	return patched, nil
+	return raw[:imageStart] + imageTag + "\n          imagePullPolicy: Never" + raw[policyStart+len(policy):], nil
 }
 
 // configMapUpstreamRegistriesAnchor is the multi-line block in

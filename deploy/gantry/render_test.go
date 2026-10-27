@@ -101,6 +101,133 @@ func TestDaemonSetMountsContainerdRuntimeDirectory(t *testing.T) {
 	}
 }
 
+// TestInitContainerPreparesIdentityDirectory pins how the agent gets its libp2p
+// identity hostPath: the gantry-init container runs gantry init from the
+// agent's own image, as root with only the capabilities it needs, and the agent
+// itself runs as UID 65532 with none.
+func TestInitContainerPreparesIdentityDirectory(t *testing.T) {
+	t.Parallel()
+
+	type securityContext struct {
+		RunAsNonRoot             *bool  `yaml:"runAsNonRoot"`
+		RunAsUser                *int64 `yaml:"runAsUser"`
+		AllowPrivilegeEscalation *bool  `yaml:"allowPrivilegeEscalation"`
+		ReadOnlyRootFilesystem   *bool  `yaml:"readOnlyRootFilesystem"`
+		Capabilities             struct {
+			Add  []string `yaml:"add"`
+			Drop []string `yaml:"drop"`
+		} `yaml:"capabilities"`
+	}
+
+	type container struct {
+		Name            string          `yaml:"name"`
+		Image           string          `yaml:"image"`
+		ImagePullPolicy string          `yaml:"imagePullPolicy"`
+		Args            []string        `yaml:"args"`
+		SecurityContext securityContext `yaml:"securityContext"`
+		VolumeMounts    []struct {
+			Name      string `yaml:"name"`
+			MountPath string `yaml:"mountPath"`
+		} `yaml:"volumeMounts"`
+	}
+
+	for profile, outputDir := range map[string]string{
+		"operator":   renderTemplates(t),
+		"standalone": renderStandaloneTemplates(t),
+	} {
+		raw, err := os.ReadFile(filepath.Join(outputDir, "daemonset.yaml"))
+		if err != nil {
+			t.Fatalf("%s: read rendered daemonset: %v", profile, err)
+		}
+
+		var daemonSet struct {
+			Spec struct {
+				Template struct {
+					Spec struct {
+						InitContainers []container `yaml:"initContainers"`
+						Containers     []container `yaml:"containers"`
+					} `yaml:"spec"`
+				} `yaml:"template"`
+			} `yaml:"spec"`
+		}
+		if err := yaml.Unmarshal(raw, &daemonSet); err != nil {
+			t.Fatalf("%s: unmarshal rendered daemonset: %v", profile, err)
+		}
+
+		initContainers := daemonSet.Spec.Template.Spec.InitContainers
+		if len(initContainers) != 1 || initContainers[0].Name != "gantry-init" {
+			t.Fatalf("%s: init containers = %+v, want only gantry-init", profile, initContainers)
+		}
+
+		initContainer := initContainers[0]
+
+		var agent *container
+
+		for i := range daemonSet.Spec.Template.Spec.Containers {
+			if daemonSet.Spec.Template.Spec.Containers[i].Name == "gantry" {
+				agent = &daemonSet.Spec.Template.Spec.Containers[i]
+			}
+		}
+
+		if agent == nil {
+			t.Fatalf("%s: rendered daemonset has no gantry container", profile)
+		}
+
+		if initContainer.Image != agent.Image || initContainer.ImagePullPolicy != agent.ImagePullPolicy {
+			t.Fatalf("%s: gantry-init runs %s (%s), want the agent's %s (%s)",
+				profile, initContainer.Image, initContainer.ImagePullPolicy, agent.Image, agent.ImagePullPolicy)
+		}
+
+		if !reflect.DeepEqual(initContainer.Args, []string{"init"}) {
+			t.Fatalf("%s: gantry-init args = %q, want [init] after the image's gantry entrypoint", profile, initContainer.Args)
+		}
+
+		mounted := false
+
+		for _, mount := range initContainer.VolumeMounts {
+			if mount.Name == "libp2p" && mount.MountPath == "/var/lib/gantry/libp2p" {
+				mounted = true
+			}
+		}
+
+		if !mounted {
+			t.Fatalf("%s: gantry-init does not mount the libp2p volume at /var/lib/gantry/libp2p", profile)
+		}
+
+		for _, want := range []struct {
+			name     string
+			security securityContext
+			uid      int64
+			add      []string
+		}{
+			{name: "gantry-init", security: initContainer.SecurityContext, uid: 0, add: []string{"CHOWN", "FOWNER", "DAC_OVERRIDE"}},
+			{name: "gantry", security: agent.SecurityContext, uid: 65532},
+		} {
+			security := want.security
+
+			if security.RunAsUser == nil || *security.RunAsUser != want.uid || security.RunAsNonRoot == nil || *security.RunAsNonRoot != (want.uid != 0) {
+				t.Fatalf("%s: %s must run as UID %d with runAsNonRoot %t", profile, want.name, want.uid, want.uid != 0)
+			}
+
+			if security.AllowPrivilegeEscalation == nil || *security.AllowPrivilegeEscalation {
+				t.Fatalf("%s: %s must disallow privilege escalation", profile, want.name)
+			}
+
+			if security.ReadOnlyRootFilesystem == nil || !*security.ReadOnlyRootFilesystem {
+				t.Fatalf("%s: %s root filesystem must stay read-only", profile, want.name)
+			}
+
+			if !reflect.DeepEqual(security.Capabilities.Drop, []string{"ALL"}) {
+				t.Fatalf("%s: %s drops capabilities %v, want [ALL]", profile, want.name, security.Capabilities.Drop)
+			}
+
+			if !reflect.DeepEqual(security.Capabilities.Add, want.add) {
+				t.Fatalf("%s: %s adds capabilities %v, want %v", profile, want.name, security.Capabilities.Add, want.add)
+			}
+		}
+	}
+}
+
 func TestRendersFixedChairLeaseSet(t *testing.T) {
 	t.Parallel()
 

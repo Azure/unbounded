@@ -5,8 +5,9 @@
 //
 // Subcommands:
 //
-//	gantry version print build information and exit
-//	gantry agent run the full agent (mirror + transfer + libp2p + ...)
+//	gantry agent    run the full agent (mirror + transfer + libp2p + ...)
+//	gantry init     prepare the libp2p identity directory
+//	gantry version  print build information and exit
 package main
 
 import (
@@ -55,7 +56,7 @@ import (
 )
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	if err := newCmdRoot(runAgent, prepareAgentRuntime).Execute(); err != nil {
 		if !errors.Is(err, flag.ErrHelp) {
 			fmt.Fprintln(os.Stderr, err)
 		}
@@ -64,58 +65,9 @@ func main() {
 	}
 }
 
-func run(args []string) error {
-	if len(args) == 0 {
-		printUsage(os.Stderr)
-		return errors.New("gantry: subcommand required")
-	}
-
-	switch args[0] {
-	case "version", "-version", "--version":
-		fmt.Printf("gantry %s %s/%s (go %s, commit %s, built %s)\n",
-			version.Version, runtime.GOOS, runtime.GOARCH, runtime.Version(),
-			version.GitCommit, version.BuildTime)
-
-		return nil
-	case "agent":
-		return runAgent(args[1:])
-	case "help", "-h", "-help", "--help":
-		return runHelp(args[1:])
-	default:
-		printUsage(os.Stderr)
-		return fmt.Errorf("gantry: unknown subcommand %q", args[0])
-	}
-}
-
-func printUsage(w *os.File) {
-	//nolint:errcheck // best-effort write
-	_, _ = fmt.Fprintln(w, `Usage: gantry <subcommand> [flags]
-
-Subcommands:
-  agent      run the Gantry P2P agent
-  version    print build information
-  help       print help for the agent subcommand`)
-}
-
-func runHelp(args []string) error {
-	if len(args) == 0 || args[0] == "agent" {
-		fs, _ := buildAgentFlagSet(config.NewDefault())
-		fs.SetOutput(os.Stdout)
-		_, _ = fmt.Fprintln(os.Stdout, "Usage: gantry agent [flags]") //nolint:errcheck // best-effort write
-		_, _ = fmt.Fprintln(os.Stdout)                                //nolint:errcheck // best-effort write
-		_, _ = fmt.Fprintln(os.Stdout, "Flags:")                      //nolint:errcheck // best-effort write
-
-		fs.PrintDefaults()
-
-		return nil
-	}
-
-	return fmt.Errorf("gantry help: unknown topic %q", args[0])
-}
-
 // buildAgentFlagSet constructs the `gantry agent` flag set bound to c. The
 // returned *string is the --config flag's value (read before re-parsing
-// with the file-derived defaults). Exposed for runHelp.
+// with the file-derived defaults). Also used for the agent's help text.
 func buildAgentFlagSet(c *config.Config) (*flag.FlagSet, *string) {
 	fs := flag.NewFlagSet("agent", flag.ContinueOnError)
 	configPath := fs.String("config", "", "path to YAML config file")
