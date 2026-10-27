@@ -1169,7 +1169,10 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
 
     /// Partition existing queue capacity using a caller-owned prepaid charge.
     /// Only one live partition is allowed. Its slots include unread completions;
-    /// ordinary slots instead become reusable at the kernel fence.
+    /// ordinary slots instead become reusable at the kernel fence. Long-lived
+    /// operations such as [`Self::uring_cmd`] (for example ublk FETCH) occupy
+    /// ordinary slots until their kernel completion, so size queues to cover
+    /// every such command plus the remaining traffic.
     pub fn reserve_submissions<C: 'static>(
         &self,
         capacity: usize,
@@ -2023,6 +2026,52 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
         scope: &'a S,
     ) -> Operation<'a, u32, S::Error> {
         self.readiness_capacity(fd, interest, lease, Some(capacity), scope)
+    }
+
+    /// Submit a 16-byte `IORING_OP_URING_CMD` and return the raw CQE result.
+    ///
+    /// The command payload is copied into the SQE. The CQE result is returned
+    /// as `Ok(res)` even when negative, because passthrough protocols such as
+    /// ublk use negative values (for example `-ENODEV` or `UBLK_IO_RES_ABORT`)
+    /// as protocol signals. `EINTR` and `EAGAIN` are not retried. Only
+    /// reactor-level failures (admission, initialization, scope checks, and
+    /// cancellation) are returned as `Err`.
+    ///
+    /// The command may stay outstanding indefinitely (ublk FETCH completes only
+    /// when a block request arrives); the reactor imposes no timeout. The
+    /// caller's scope deadline and cancellation still apply: cancellation
+    /// publishes an `AsyncCancel`, and `fd` and `lease` stay retained until the
+    /// kernel's final CQE fence even if this future is dropped. While pending
+    /// the command occupies an ordinary submission slot.
+    pub fn uring_cmd<'a, L: 'static>(
+        &'a self,
+        fd: Rc<Descriptor>,
+        cmd_op: u32,
+        cmd: [u8; 16],
+        lease: L,
+        scope: &'a S,
+    ) -> Operation<'a, i32, S::Error> {
+        Box::pin(async move {
+            let sqe = submission!(
+                self,
+                simulation::Op::UringCmd {
+                    fd: fd.clone(),
+                    cmd_op,
+                    cmd
+                },
+                opcode::UringCmd16::new(types::Fd(fd.as_raw_fd()), cmd_op)
+                    .cmd(cmd)
+                    .build()
+            );
+            self.submit(sqe, scope, false, move |result| {
+                drop((fd, lease));
+                match result? {
+                    KernelResult::Value(res) => Ok(res),
+                    KernelResult::Accepted(_) => Err(Error::Io.into()),
+                }
+            })?
+            .await
+        })
     }
 
     fn readiness_capacity<'a, L: 'static>(
