@@ -520,18 +520,14 @@ impl Control {
     }
 
     /// Deletes a device nobody in this process holds, such as one left by
-    /// an earlier run. Tries DEL_DEV_ASYNC, then plain DEL_DEV, which waits
-    /// for the character device to be released, at most the channel
-    /// timeout.
+    /// an earlier run. Takes the same path as [`Control::del_dev`]: a plain
+    /// DEL_DEV must never be issued inline, because it blocks inside
+    /// `io_uring_enter` while any character device fd is open, so the
+    /// fallback is the bounded, cancelable pinned DEL_DEV on an io-wq
+    /// worker. If another process holds the character device, the device is
+    /// still marked deleted and its id is freed when that holder closes.
     pub(crate) fn del_dev_unpinned(&mut self, id: u32) -> Result<()> {
-        let mut res = self.command("DEL_DEV_ASYNC", U_CMD_DEL_DEV_ASYNC, id, &[], &mut [])?;
-        if del_needs_fallback(res) {
-            res = self.command("DEL_DEV", U_CMD_DEL_DEV, id, &[], &mut [])?;
-        }
-        if res == -libc::ENODEV {
-            return Ok(());
-        }
-        kernel("DEL_DEV", res).map(drop)
+        self.del_dev(id)
     }
 }
 
