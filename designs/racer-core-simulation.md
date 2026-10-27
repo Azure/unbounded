@@ -7027,3 +7027,41 @@ every run, including the 16-scenario smoke at 200 nodes.
 ### Open issues after wave 8
 
 None. Known issues 1 to 60 are all resolved (59 with a stated, tested bound).
+
+## Rebase onto PR #994 (final)
+
+The branch was replayed commit by commit onto the rebased PR #994 head (de824e00b). History
+was not squashed. Commit hashes cited in earlier sections refer to the history before this
+rebase. Semantic conflicts and how they were resolved:
+
+- Memory cache lanes. PR #994 added per-cache reclaim lanes and a rotating pressure window to
+  `src/memory.rs`; this branch had moved the recency indexes into `racer_core::cache::lru`. The
+  lanes now live there (`Grouping`, `Lanes`, `PRESSURE_WINDOW`) and `TickLru` and `OrderedLru`
+  keep them in step with every insert, touch, and removal. The dataplane groups by cache
+  (`ByCache` in `src/memory.rs`); the simulator uses `Ungrouped`, which skips lane bookkeeping.
+- Segment value. PR #994 made over-share pages worth less than under-share pages in
+  `store/catalog.rs`. The rule moved to `racer_core::cache::segment` (`class_score`,
+  `unseen_value_for`, `MAX_SCORE`, `MAX_PAGE_VALUE`). `unseen_value` keeps the no-over-share
+  value the simulator uses.
+- Cache priority admission. PR #994 added `Policy::progress` and `Policy::weighted`. Both
+  now come from `racer_core::admission::Rules` (`Floors::record` was added). The dataplane and
+  `SimPolicy` delegate to them, and `rules_equivalence_tests` checks them against the old
+  code. Priority weights stay in the dataplane. The simulator uses one cache key, so the
+  weights have no effect there.
+- GPU landing. A `RelayResponse::Landed` exchange counts as a complete, not overloaded,
+  exchange (`hop::Exchange::Complete`) for link health, admission, and silence. Relays still
+  refuse it before `hop::relay_failure`. `CandidatePolicy::request_delivered` takes the
+  walk's `timed_out` flag. Landing requests ignore it, and the `StaleMembership` credit
+  refund matches only `Delivered::Response`.
+- Textual conflicts: workspace members (`gpu` plus `core` and `sim`), Makefile targets,
+  telemetry metric names, appended tests, and the `keyring` test path in
+  `cluster-control/src/primary.rs`.
+
+Verification on the rebased head: `cargo fmt --check`, workspace clippy `-D warnings` (default
+and all features), and workspace tests (default and all features) pass, along with the CI
+runtime and allocator gates. DST seeds 1 to 20 pass, native and not. All 16 scenarios pass at
+200 nodes. The 5k seed 1 runs of `storm`, `zipf`, `full-cold-start`, and `full-failover`
+match wave 8 in every simulated result. The only changes are host timings and accounted
+memory per node: `node_struct` +64 bytes, `memory_lru` +48 bytes, and `quotas` +32 bytes.
+These come from the larger index and quota structs, which now include the lane fields and
+PR #994's flow-control weight state. The rebase added no new Known issues.
