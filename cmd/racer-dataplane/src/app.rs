@@ -315,14 +315,20 @@ impl Application {
         let (identity, enrolled_selector) = if self.config.managed() {
             // Election and enrollment outlive any data request deadline; keep the
             // embedded control alive and retry bounded attempts until stopped.
-            retry_enrollment(
+            let enrolled = retry_enrollment(
                 || {
                     let attempt = scope(MANAGED_ENROLLMENT_ATTEMPT)?;
                     bootstrap(&self.config, &self.node, &self.limits, &attempt)
                 },
                 || STOP_REQUESTED.load(Ordering::Relaxed),
                 MANAGED_ENROLLMENT_PACE,
-            )?
+            );
+            match enrolled {
+                Ok(enrolled) => enrolled,
+                // A signal during enrollment is a clean stop, as it is once running.
+                Err(error) if signal_stop(error, signals.requested()) => return Ok(()),
+                Err(error) => return Err(error),
+            }
         } else {
             let scope = scope(self.config.request_timeout)?;
             bootstrap(&self.config, &self.node, &self.limits, &scope)?
@@ -359,12 +365,17 @@ impl Application {
         } else {
             workers.run(&self)
         };
-        if signals.requested() && result == Err(Error::Cancelled) {
-            Ok(())
-        } else {
-            result
+        match result {
+            Err(error) if signal_stop(error, signals.requested()) => Ok(()),
+            result => result,
         }
     }
+}
+
+/// Whether `error` is the cancellation a requested SIGTERM/SIGINT produces, so the
+/// process stops cleanly instead of reporting a fatal failure.
+fn signal_stop(error: Error, requested: bool) -> bool {
+    requested && error == Error::Cancelled
 }
 
 /// Budget for one managed enrollment attempt, independent of data request deadlines.
@@ -3098,6 +3109,10 @@ mod lifecycle_policy_tests {
     fn enrollment_stop_is_prompt() {
         // Stop before any attempt.
         let result: Result<()> = retry_enrollment(|| unreachable!(), || true, Duration::ZERO);
+        // Only a signal-requested cancellation is a clean stop; other errors stay fatal.
+        assert!(signal_stop(result.unwrap_err(), true));
+        assert!(!signal_stop(Error::Cancelled, false));
+        assert!(!signal_stop(Error::Unavailable, true));
         assert_eq!(result, Err(Error::Cancelled));
         // Stop during a long pace is observed within a short slice.
         let begun = std::time::Instant::now();
