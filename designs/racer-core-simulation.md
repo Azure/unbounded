@@ -46,16 +46,18 @@ Depends only on `topology`, `racer-object-wire`, `racer-control-wire`, `flow-con
 | `liveness` | `Silence` (silent next hops and pings) and `Rank0Watch` (rank 0 owners that hang or fail) |
 | `route` | Route budget rules shared by app and wire (`forward`, `relay`, `search_budget`, `validate`), `decide_hop`, relay plans, exchange outcomes, and response validity rules |
 | `subscriptions` | Sans-IO subscription scheduler |
-| `read` | Errors, worker map, peer responses, metadata refresh, serve and persist policy, range slots, `FillPlan`, candidate order and response classes |
+| `read` | Errors, worker map, peer responses, metadata refresh, serve and persist policy, range slots, candidate order and response classes |
 | `read::budget` | `AcquisitionBudget`, `MAX_ROUTE_LINKS` (8), hot page shedding to helpers |
-| `read::walk` | `CandidateWalk`: probe order, hedges, post-412 walk, stale membership handling |
+| `read::walk` | `Fill`: one read's acquisition as a sans-IO state machine (owner targets, the candidate walk, hedges, stale membership refresh, fallback and waits, origin, the post-412 walk, publication), driven by both the dataplane and the simulator |
 | `read::hints` | Orphan copy notices and successor hints |
 | `read::flight` | Singleflight step functions (join gates, wait/elect, publish, fail) shared by production `Flights` and the sim's `PageFlights` table |
 
 ### Production callers
 
 - The dataplane (`cmd/racer-dataplane/src`) calls `racer_core` directly. For example, page fill
-  acquisition drives `racer_core::read::FillPlan` (`src/read/fill.rs:2033`), range reads use
+  acquisition and candidate resolution drive `racer_core::read::walk::Fill`
+  (`CandidatePolicy::drive` in `src/read/candidates.rs`, `acquire_once` in `src/read/fill.rs`), and
+  the simulator drives the same machine (`NodeWorld::drive` in `sim/src/node/world.rs`). Range reads use
   `racer_core::read` range slots (`src/read/candidates.rs:3909`), and the memory cache uses
   `racer_core::cache` with `ByCache` grouping (`src/memory.rs`).
 - The wire hop limit comes from core: `peer-wire/src/lib.rs:505` sets
@@ -102,8 +104,10 @@ and its own `flow_control::Quotas`. `WorkerMap::select` picks the worker for a p
 `Paths` route cache, `flow_control::Circuits` link health, a phantom disk, and retention history
 (`SecondSight`, `Heat`).
 
-A read checks memory, then disk, then joins a flight. The leader runs `FillPlan`: rank, then
-`CandidateWalk`. Probes go hop by hop and every hop runs `decide_hop`. Relays take a `Relay` quota
+A read checks memory, then disk, then joins a flight. The leader drives the same `Fill` machine as
+production: it performs each action (rank, probe, wait, origin, publish) as a scheduled event.
+Where the simulator still differs from production, a temporary `Features::SIM_*` bit says so
+(`SIM_DIVERGENCES` in `world.rs`). Probes go hop by hop and every hop runs `decide_hop`. Relays take a `Relay` quota
 and search their own route. The destination applies the serve action. Before origin, the leader
 checks origin authority. Admission uses `racer_core::admission::Rules`.
 
