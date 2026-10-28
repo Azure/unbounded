@@ -1,11 +1,15 @@
-//! Measures per-node heap cost of phantom placement and replayed routes at
-//! production default capacities, for simulator memory planning.
+//! Measures per-node heap cost of phantom placement, replayed routes, and
+//! payload-free disk entries, for simulator memory planning.
 
+use page_alloc::{PhantomEntries, SegmentId};
 use racer_sim::phantom::{Phantom, SharedRoutes};
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     num::NonZeroU32,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::{Context, Poll, Waker},
 };
 use topology::{Member, Membership, PathQuery, Paths, Placement, Rankings};
@@ -44,6 +48,9 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
+/// Tests share `LIVE`, so they measure one at a time.
+static SERIAL: Mutex<()> = Mutex::new(());
+
 /// Test member.
 struct Node(Vec<u8>);
 
@@ -73,6 +80,7 @@ const PLACEMENT_ENTRIES: usize = 16 * 1024 * 1024 / 1024;
 
 #[test]
 fn phantom_placement_and_routes_per_node_bytes() {
+    let _serial = SERIAL.lock().unwrap();
     let membership = members(64);
     let shared = Phantom::new();
     // Warm the shared memo outside the measured region.
@@ -123,4 +131,21 @@ fn phantom_placement_and_routes_per_node_bytes() {
     );
     assert!(paths / node.cached_entries() <= 256);
     drop((node, warm));
+}
+
+/// Payload-free disk entries stay within the simulator's per-mapping charge.
+#[test]
+fn phantom_entries_stay_small_per_page() {
+    let _serial = SERIAL.lock().unwrap();
+    let pages = 100_000u64;
+    let before = LIVE.load(Ordering::Relaxed);
+    let entries = PhantomEntries::<u64>::default();
+    for page in 0..pages {
+        entries.publish(page, 4096, SegmentId(page / 64)).unwrap();
+    }
+    let used = LIVE.load(Ordering::Relaxed) - before;
+    let per_page = used / usize::try_from(pages).unwrap();
+    println!("phantom segment entries: {per_page} bytes per page");
+    assert!(per_page <= 160, "{per_page}");
+    drop(entries);
 }
