@@ -2909,28 +2909,13 @@ fn validate_payload(response: &PeerResponse, operation: &PeerOperation) -> Resul
     }
 }
 
-// Opt-in, node-shared speculative page capacity. No background task or byte bypass.
-//
-// RACER_PAGE_HEDGE_SLOTS=0 disables hedging. RACER_PAGE_HEDGE_DELAY_MS defaults
-// to 100; RACER_PAGE_HEDGE_BYTES defaults to one maximum duplicate
-// plaintext+ciphertext pair (32 MiB + 16).
-// Only noncandidate plaintext fixed-page reads with two direct healthy neighbors
-// qualify. Their distinct destinations are pinned first hops over HTTP. Metadata,
-// subscription selection, ciphertext relays, native paths and full GETs do not race.
-// One CopyOnly secondary may start; normal acquisition credits are partitioned,
-// never replenished. Duplicate escrow is held in addition to actual buffer quota,
-// intentionally over-accounting rather than requiring a transport-wide reservation
-// handoff. Admission also preflights two full contender buffers before credits:
-// the existing serial page plus escrow plus both contenders require 64 MiB of
-// plaintext capacity in an otherwise empty worker. Low quotas fall back serially.
-// Pair exchanges have a local one-third-remaining cap; signed authority stays
-// unchanged. Serial continuation skips the consumed primary, keeps the CopyOnly
-// secondary eligible for Acquire, and preserves credits for later candidates.
-// One authorized cold fallback requires six original attempts/ten links; the
-// standard eight/sixteen allowance can hedge without budget inflation. A second
-// cold fallback needs additional original credits and is skipped if underfunded.
-// A valid winner waits for the losing exchange/crypto fence before return:
-// this can limit the latency benefit and is not an early-publication implementation.
+// Opt-in, node-shared speculative page hedging (`RACER_PAGE_HEDGE_SLOTS=0` disables it;
+// `RACER_PAGE_HEDGE_DELAY_MS` defaults to 100, `RACER_PAGE_HEDGE_BYTES` to one duplicate
+// plaintext+ciphertext pair). Only non-owner plaintext page reads with two direct healthy owners
+// race, over pinned first hops. Credits are partitioned, never replenished; duplicate escrow is held
+// on top of buffer quota, and admission preflights both contender buffers before spending credits,
+// so low quotas fall back to the serial walk. The serial continuation skips the consumed primary.
+// A winner waits for the loser's exchange and crypto fence before returning.
 
 pub const DUPLICATE_BYTES: usize =
     racer_core::read::duplicate_bytes(crate::model::PAGE_BYTES as usize);

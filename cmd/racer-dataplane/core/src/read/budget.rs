@@ -402,42 +402,17 @@ mod budget_tests {
     }
 }
 
-// Overflow fan-out for hot pages.
+// Overflow fan-out for hot pages. Only a page's owners serve it, so an owner streaming
+// [`hot_page_bodies`] bodies sheds further readers ([`shed_hot_page`]), and a shed non-owner asks one
+// of the page's [`fanout_width`] hash-chosen helpers (non-owner members) to acquire it
+// ([`crate::read::walk::WalkConfig::helper`]). Every node computes the same helpers, so readers
+// converge on them and owners see at most that many extra requests.
 //
-// Only a page's ranked owners (at most `REPLICAS`) are candidates, so a page
-// that every node reads at once can be sent no faster than `REPLICAS` NICs
-// allow. An owner already streaming [`hot_page_bodies`] bodies of a page
-// sheds further readers with a signed `Overloaded` ([`shed_hot_page`]), and
-// a non-owner whose owner sheds it asks one *helper* to acquire the page for
-// it (see
-// [`crate::read::walk::WalkConfig::helper`]). A helper is an ordinary member that
-// is not an owner of the page; it runs its own non-owner walk against the
-// owners, coalesces concurrent requests for the page in its page flight, and
-// keeps the copy, so later requests are served from its cache.
-//
-// Each page has at most [`fanout_width`] helpers, chosen by a hash of the page
-// that every node computes the same way, so readers of a hot page converge on
-// the same few helpers and the owners see at most that many extra requests.
-// A requester picks one of them by a hash of its own ID.
-//
-// Bounds:
-// - Depth: a helper probe is funded with at most [`HELPER_ATTEMPTS`]
-//   attempts, and only walks that start with at least [`HELPER_MIN_ATTEMPTS`]
-//   (> [`HELPER_ATTEMPTS`]) may ask a helper. A helper's inherited budget is
-//   therefore always too small to ask another helper: requests never chain.
-// - Owner probes are planned exactly as without a helper; the helper is paid
-//   from what is left after the owner that shed the request.
-// - Origin: helpers are non-owners, so their walks never reach origin
-//   (`End::Exhausted` instead of `End::Origin`); origin authority is
-//   unchanged.
-// - Copies: at most [`fanout_width`] extra copies of a page are made per
-//   membership version, and only while owners shed load.
-//
-// Security: a helper's answer is an ordinary signed peer `Page` response,
-// validated exactly like an owner's (`validate_payload` checks the envelope
-// against the immutable metadata, and the reader opens the AEAD ciphertext
-// itself). A helper never holds credentials it would not hold as a reader:
-// it acquires with the requester's signed origin context, as any owner does.
+// Bounds: a helper probe carries at most [`HELPER_ATTEMPTS`] and only walks starting with
+// [`HELPER_MIN_ATTEMPTS`] (more) may ask one, so requests never chain. Owner probes are planned as
+// without a helper. Helpers are non-owners, so they never reach origin. A helper's answer is an
+// ordinary signed `Page` response validated like an owner's, and it acquires with the requester's
+// signed origin context.
 
 /// Most attempts a requester funds a helper probe with: the exchange plus
 /// the helper's own walk of the owners.

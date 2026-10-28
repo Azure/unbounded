@@ -1,60 +1,25 @@
-//! Orphan notices: an owner above rank 0 that fetched a page from origin tells rank 0 later that it
-//! holds the page.
+//! Orphan notices and successor hints: keep rank 0 from refetching a page another owner fetched.
 //!
-//! An owner above rank 0 reaches origin only after its probe of rank 0 ended
-//! without a copy. When that probe reached rank 0, rank 0 noted the owner as a
-//! successor hint ([`crate::read::hints`]) and asks it before its own next
-//! origin fetch. When it did not (the route failed, a partition cut it, a
-//! relay or rank 0 shed it, a relay answered `Unavailable`), rank 0 never
-//! learned of the copy and fetches the page again on its next cold miss,
-//! usually tens of seconds to minutes later.
+//! An owner above rank 0 reaches origin only after its probe of rank 0 ended without a copy. When
+//! that probe reached rank 0, rank 0 noted the owner as a successor hint ([`SuccessorHints::note`]).
+//! When it did not (route failure, partition, shed), the holder remembers the page
+//! ([`OrphanNotices::note`]) and later sends each owner ranked before it that did not answer its
+//! walk ([`notice_indexes`]) a copy offer: a page request in offer mode with no credentials and no
+//! attempts, answered `Miss` without a body, which the receiver notes as a hint
+//! ([`SuccessorHints::note_offer`]). Unsigned or failed offers retry after [`NOTICE_DELAYS`], at
+//! most [`NOTICE_TRIES`] times.
 //!
-//! So the holder remembers the page ([`OrphanNotices::note`]) and, after
-//! [`NOTICE_DELAYS`]`[0]`, sends rank 0 a copy offer: a page request in
-//! offer mode that carries no origin credentials and no attempts, and is
-//! answered `Miss` without a body. A receiver that neither holds the page nor
-//! is acquiring it notes the requester as a successor hint, exactly as if it
-//! had missed a copy-only probe ([`SuccessorHints::note_offer`]); its next walk then copies
-//! the page from the holder instead of fetching it. An offer that does not get
-//! an answer signed by its destination (transport failure, a relay's answer,
-//! shed) is tried again after the next delay, at most [`NOTICE_TRIES`] times
-//! over about 155 s (longer than the simulator's 90 s partitions).
+//! Bounds: at most two notices per origin fetch, [`NOTICE_TRIES`] offers each on a fixed
+//! [`NOTICE_LINKS`] grant (never a reader's budget), [`NOTICE_CAPACITY`] pending per node. An offer
+//! only notes a hint, which an authenticated owner could already set with a copy-only probe. A
+//! holder that no longer holds the page or owns it drops the notice ([`notice_target`]).
 //!
-//! Every predecessor. A holder at rank 2 also offers the copy to rank 1: when rank 1 later cannot
-//! reach rank 0 it fetches the page itself, and it asks only later owners it has a hint for (its
-//! successor targets). Without the offer it had none whenever the holder's own walk did not reach
-//! it, and fetched again although the holder was its own successor (5k `full-failover`, seeds 1 to
-//! 3: 9 of 43 orphan repeats, all minutes after the holder's fetch). So a fetch notes one notice
-//! per owner ranked before the holder that did not answer its walk ([`notice_indexes`]), keyed by
-//! the page and that rank, each scheduled and bounded like the rank 0 notice.
-//!
-//! Bounds: one notice per origin fetch by an owner above rank 0 and owner
-//! ranked before it (at most two); each sends
-//! at most [`NOTICE_TRIES`] offers, each funded by its own fixed route grant
-//! ([`NOTICE_LINKS`] links, no attempts), never by a reader's budget. At most
-//! [`NOTICE_CAPACITY`] notices are pending per node (the oldest give way). An
-//! offer cannot make the receiver fetch or send a body: it only notes a hint,
-//! which an authenticated owner could already set with a copy-only probe. A
-//! holder that no longer holds the page, or is no longer an owner above
-//! rank 0, drops the notice instead of sending it ([`notice_target`]).
-//!
-//! Cut groups. Offers exist because a partition or a route failure cut the holder off from rank 0,
-//! and while the cut lasts every offer across it fails in transport and counts as a link failure
-//! (in the simulator, 5k `full-failover` seed 1: each of the 283 failed offers out of 728 was a
-//! partition link failure). So each target belongs to a group (its site): an offer that fails with
-//! cut evidence (a transport failure, or an answer signed by a relay rather than the target) blocks
-//! its group ([`OrphanNotices::cut`]) until that notice's next offer is due. Offers that come due
-//! for a blocked group are deferred to the end of the block without spending a try. When a block
-//! ends, one offer goes out as the group's probe and the group stays held for [`PROBE_HOLD`] or
-//! until that offer is reported; a delivered offer ([`OrphanNotices::reached`]) releases the group
-//! for new offers (those deferred behind the probe go when its hold ends), another cut blocks it
-//! again. The node's other exchanges feed the same table ([`OrphanNotices::observe`]): a read probe
-//! that fails in transport toward a group holds its offers, and one answered by a member of the
-//! group releases them, so offers wait out a cut the node's reads already see. While a cut lasts, a
-//! holder sends at most one offer per group per retry interval instead of one per notice. Tries are
-//! spent only by offers actually sent, so the bounds above hold. Blocked groups are bounded by the
-//! notice capacity. Members without a site share one group, which then holds all of this node's
-//! offers during a cut.
+//! Cut groups: an offer that fails with cut evidence (transport failure, or an answer signed by a
+//! relay) blocks its target's site ([`OrphanNotices::cut`]) until that notice's next offer is due;
+//! offers due meanwhile are deferred without spending a try. When the block ends one offer probes
+//! the group for at most [`PROBE_HOLD`]; delivery ([`OrphanNotices::reached`]) releases it. Read
+//! probes feed the same table ([`OrphanNotices::observe`]), so offers wait out cuts reads already
+//! see.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
@@ -845,51 +810,17 @@ mod notice_tests {
     }
 }
 
-// Successor hints: an owner remembering which other owner fetched a page it answered without a
-// copy, so readers ask that owner instead of making it fetch the page again.
+// Successor hints. Rank 0 cannot ask an orphan's holder itself: requests reaching it carry too few
+// credits and links to route to another owner. A reader can, so an owner that answers another
+// owner's page probe without a copy notes the requester ([`SuccessorHints::note`]) and, while the
+// hint is fresh, answers a non-owner's `Acquire` with `Miss` ([`successor_deferral`]) so the reader
+// moves on to the holder. Owner requesters are never deferred: they keep too few links to reach the
+// holder. An owner's own walk also asks hinted owners copy-only before origin
+// ([`successor_targets`]), each on a fixed grant, one probe per hint ([`SuccessorHints::probe`]).
 //
-// An owner above rank 0 reaches origin only after its probe of rank 0 ended
-// without a copy: rank 0 missed a copy-only probe (the owner could not fund
-// a delegation) or rank 0's own acquisition failed. The owner then fetches
-// the page itself, an orphan copy rank 0 does not know about, and rank 0
-// fetches it again on its next cold miss. Rank 0 cannot ask the orphan's
-// holder itself: the requests that reach it carry one or two credits and a
-// few links, too few to route to another owner (the simulator measured
-// hint probes from rank 0 missing nine times in ten, mostly on route search).
-//
-// The reader that reaches rank 0 does have the budget: it visits every owner
-// anyway. So an owner that answers another owner's page probe without a copy
-// notes the requester ([`SuccessorHints::note`]; a copy-only miss is noted
-// without ranking, and [`successor_deferral`] checks ownership), and while the hint is fresh
-// it answers a non-owner's page `Acquire` with `Miss` instead of acquiring
-// ([`successor_deferral`]). The reader goes on to the next owner in its visit
-// order, which includes the holder. Owner requesters are never deferred: an
-// owner asks only its predecessors, and an owner below the holder keeps one
-// link per later predecessor, too few to reach it (deferring them made rank 2
-// fetch more pages itself in the simulator).
-//
-// Readers do not cover every refetch: owners ranked after this node also
-// delegate to it (their `Acquire` carries one origin credit and a few
-// links), and a reader's deferral budget runs out. So an owner's own walk
-// also asks the hinted owners copy-only before origin
-// ([`successor_targets`], [`crate::read::walk::WalkConfig::successors`]),
-// each probe funded by a fixed grant rather than the requester's budget
-// (the walk's credits never grow; the grant's leftovers are dropped). A hint
-// funds one such probe ([`SuccessorHints::probe`]), so the extra exchanges
-// are bounded by the hints noted.
-//
-// Only owners ranked after this node are deferred to or probed: an owner
-// fetches after asking its predecessors, so a predecessor that asked this
-// node (rank 0's successor probe answered `Miss`) has no copy either, and
-// deferring to it bounced readers between two owners without one.
-//
-// Costs: a hint is noted only on a page probe this node already answered
-// without a copy, and needs no message of its own. Each hint defers at most
-// [`MAX_DEFERRALS`] requests and expires after [`HINT_TTL`], so a holder
-// that lost its copy costs each deferred reader one extra owner probe, and
-// at most [`MAX_DEFERRALS`] of them, before this owner fetches again. Origin
-// authority is unchanged: a deferral never fetches, and the reader never
-// gains authority (non-owners never reach origin).
+// Only owners ranked after this node are deferred to or probed: a predecessor that asked this node
+// has no copy either. Each hint defers at most [`MAX_DEFERRALS`] requests and expires after
+// [`HINT_TTL`]. A deferral never fetches, so origin authority is unchanged.
 
 /// Nodes remembered per page (the latest ones win).
 pub const HINTS_PER_PAGE: usize = 2;
