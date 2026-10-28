@@ -62,6 +62,29 @@ worker_affinity() {
 EOF
 }
 
+# ds_records waits until every pod of DaemonSet <app> has logged a line that
+# starts with <prefix>, or <timeout> seconds pass, and prints the first such
+# line from each pod. The pods have no readiness probe, so rollout status alone
+# returns before their work is done.
+ds_records() {
+	local app=$1 prefix=$2 timeout=$3 deadline pods records
+	deadline=$(($(date +%s) + timeout))
+	while :; do
+		pods=$(kubectl -n "$NS" get pods -l "app=$app" -o name)
+		records=$(printf '%s\n' "$pods" | grep . |
+			xargs -r -P 64 -I{} sh -c "kubectl -n $NS logs {} 2>/dev/null | grep -m 1 '^$prefix' || true") || true
+		if [ "$(printf '%s\n' "$records" | grep -c .)" -ge "$(printf '%s\n' "$pods" | grep -c .)" ]; then
+			break
+		fi
+		if [ "$(date +%s)" -ge "$deadline" ]; then
+			echo "warning: $(printf '%s\n' "$records" | grep -c .) of $(printf '%s\n' "$pods" | grep -c .) $app pods reported $prefix" >&2
+			break
+		fi
+		sleep 10
+	done
+	printf '%s\n' "$records" | grep . || true
+}
+
 cmd_prep() {
 	kubectl apply -f - <<EOF
 apiVersion: apps/v1
@@ -184,8 +207,7 @@ $(worker_affinity)
             path: /
 EOF
 	kubectl -n "$NS" rollout status ds/prune --timeout=15m
-	kubectl -n "$NS" get pods -l app=prune -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' |
-		xargs -P 64 -I{} kubectl -n "$NS" logs {} 2>/dev/null | grep '^PRUNED' | sort -k3 -n | tail -n 5
+	ds_records prune PRUNED 900 | sort -k3 -n | tail -n 5
 	kubectl -n "$NS" delete ds prune --wait=false >/dev/null
 }
 
@@ -236,8 +258,7 @@ $(sed 's/^/              /' "$DIR/diskprep.sh")
             path: /
 EOF
 	kubectl -n "$NS" rollout status ds/diskprep --timeout=15m
-	kubectl -n "$NS" get pods -l app=diskprep -o name |
-		xargs -P 64 -I{} sh -c "kubectl -n $NS logs {} | grep '^DISK' || true" >"$OUT/disks.txt"
+	ds_records diskprep DISK 900 >"$OUT/disks.txt"
 	awk '$3 != "none" {print $2, $3}' "$OUT/disks.txt" |
 		xargs -P 64 -n 2 sh -c 'kubectl annotate node "$0" --overwrite "racer.unbounded-cloud.io/block-devices=^$1\$" >/dev/null'
 	awk '{print $3 == "none" ? $4 : "device"}' "$OUT/disks.txt" | sort | uniq -c
