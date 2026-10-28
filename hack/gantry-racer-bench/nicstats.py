@@ -25,19 +25,20 @@ def main():
     step = int(sys.argv[2]) if len(sys.argv) > 2 else 5
     nodes = {}
     skipped = 0
-    for line in open(path):
-        f = line.split()
-        if not f or f[0] != "NIC":
-            continue
-        samples = []
-        try:
-            for s in f[2:]:
-                i, tx, rx = s.split(":")
-                samples.append((int(i), int(tx), int(rx)))
-        except ValueError:
-            skipped += 1
-            continue
-        nodes[f[1]] = samples
+    with open(path) as fh:
+        for line in fh:
+            f = line.split()
+            if not f or f[0] != "NIC":
+                continue
+            samples = []
+            try:
+                for s in f[2:]:
+                    i, tx, rx = s.split(":")
+                    samples.append((int(i), int(tx), int(rx)))
+            except ValueError:
+                skipped += 1
+                continue
+            nodes[f[1]] = samples
     if not nodes:
         sys.exit("no NIC lines")
     if skipped:
