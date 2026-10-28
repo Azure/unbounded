@@ -51,19 +51,6 @@ pub fn page_value(bytes: Option<u32>, page_bytes: u32, score: u8) -> u64 {
     u64::from(bytes.unwrap_or(page_bytes)) * u64::from(score)
 }
 
-/// Sum page values for a segment holding `count` mappings, of which `known`
-/// yields the first at most [`SCAN_BUDGET`].
-#[must_use]
-pub fn segment_value(known: impl IntoIterator<Item = u64>, count: usize, page_bytes: u64) -> u64 {
-    let sum = known
-        .into_iter()
-        .take(SCAN_BUDGET)
-        .fold(0u64, u64::saturating_add);
-    sum.saturating_add(
-        (count.saturating_sub(SCAN_BUDGET) as u64).saturating_mul(unseen_value(page_bytes)),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,14 +78,5 @@ mod tests {
         assert_eq!(unseen_value(10), 40);
         assert_eq!(unseen_value_for(10, false), 40);
         assert_eq!(unseen_value_for(10, true), 90);
-    }
-
-    #[test]
-    fn segment_value_bounds_scan_and_charges_suffix() {
-        assert_eq!(segment_value([], 0, 1), 0);
-        assert_eq!(segment_value([1, 2, 3], 3, 1), 6);
-        assert_eq!(segment_value(vec![1; 300], 300, 10), 256 + 44 * 40);
-        assert_eq!(segment_value([u64::MAX, 1], 2, 1), u64::MAX);
-        assert_eq!(segment_value([], usize::MAX, u64::MAX), u64::MAX);
     }
 }

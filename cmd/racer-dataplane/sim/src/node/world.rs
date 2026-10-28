@@ -6206,11 +6206,6 @@ impl NodeWorld {
     }
 
     /// Origin requests for `page` so far.
-    /// Origin requests still outstanding (canceled ones excluded).
-    pub fn origin_outstanding(&self) -> usize {
-        self.origin.outstanding()
-    }
-
     pub fn origin_requests(&self, page: u64) -> u32 {
         self.origin_per_page.get(&page).copied().unwrap_or(0)
     }

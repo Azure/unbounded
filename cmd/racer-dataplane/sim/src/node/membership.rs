@@ -118,10 +118,6 @@ impl Versions {
         }
     }
 
-    pub fn is_external(&self) -> bool {
-        self.external.is_some()
-    }
-
     /// Combined mode: record the committed membership `number` with
     /// `members` (node ids). Returns false (and changes nothing) when
     /// `number` is not newer than the latest known version.
