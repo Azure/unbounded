@@ -6,23 +6,29 @@
 #
 # The guest boots an Ubuntu generic kernel chosen by GUEST_KERNEL: 6.8 from
 # Ubuntu 24.04 (noble) or 7.0 from Ubuntu 26.04 (resolute). Its initramfs holds
-# busybox-static, the Rust test binary, its shared libraries, and ublk_drv.ko.
+# busybox-static, the Rust test binaries, their shared libraries, and ublk_drv.ko.
 # The host needs no ublk support and no root, and nothing is installed: the
 # kernel packages are downloaded with a private, signature-checked APT
 # configuration and unpacked under WORK_DIR.
 #
 # Usage:
-#   TEST_BIN=<path> hack/scripts/racer-ublk-vm-test.sh
+#   TEST_BIN="<path> [<path>...]" [DATAPLANE_BIN=<path>] \
+#     hack/scripts/racer-ublk-vm-test.sh
 #
-# TEST_BIN is the racer unit test binary, for example the path
-# printed by `cargo test -p racer --no-run`. The guest runs
-# `TEST_BIN $TEST_FILTER --test-threads=1` as root with RACER_UBLK_TEST=1. The
-# script fails unless QEMU exits zero, the binary exits zero, libtest prints
-# "test result: ok." with at least one passed test, and no test reports that it
-# skipped the kernel checks.
+# TEST_BIN is one or more space-separated racer test binaries, for
+# example the unit test binary and the process_restart integration test binary
+# printed by `cargo test -p racer --no-run`. The guest runs each as
+# `<bin> $TEST_FILTER --test-threads=1` as root with RACER_UBLK_TEST=1. Tests
+# that launch the real dataplane need DATAPLANE_BIN, the racer
+# executable; the guest passes it as RACER_TEST_DATAPLANE and keeps test
+# scratch, which needs O_DIRECT, on a loop-mounted ext2 image through
+# RACER_TEST_SCRATCH. The script fails unless QEMU
+# exits zero, every binary exits zero, each prints "test result: ok." with at
+# least one passed test, and no test reports that it skipped the kernel checks.
 #
 # Environment:
-#   TEST_BIN          test binary (required)
+#   TEST_BIN          space-separated test binaries (required)
+#   DATAPLANE_BIN     racer executable for real-process tests
 #   TEST_FILTER       libtest filter (default ublk)
 #   GUEST_KERNEL      6.8 or 7.0 (default 6.8)
 #   WORK_DIR          scratch output (default bin/racer-vm/$GUEST_KERNEL)
@@ -32,13 +38,14 @@
 #   VM_TIMEOUT        seconds before QEMU is terminated (default 600)
 #   GUEST_TIMEOUT     guest watchdog seconds for the test binary (default 540)
 #   VM_MEMORY         guest memory (default 4G)
-#   VM_CPUS           guest CPUs (default 2)
+#   VM_CPUS           guest CPUs (default 4: two I/O workers and crypto)
 #   VM_ACCEL          kvm, tcg, or auto (default auto)
 #   QEMU              QEMU binary (default qemu-system-x86_64)
 
 set -euo pipefail
 
 TEST_BIN="${TEST_BIN:-}"
+DATAPLANE_BIN="${DATAPLANE_BIN:-}"
 TEST_FILTER="${TEST_FILTER:-ublk}"
 GUEST_KERNEL="${GUEST_KERNEL:-6.8}"
 WORK_DIR="${WORK_DIR:-bin/racer-vm/$GUEST_KERNEL}"
@@ -48,7 +55,7 @@ ARCHIVE_KEYRING="${ARCHIVE_KEYRING:-/usr/share/keyrings/ubuntu-archive-keyring.g
 VM_TIMEOUT="${VM_TIMEOUT:-600}"
 GUEST_TIMEOUT="${GUEST_TIMEOUT:-540}"
 VM_MEMORY="${VM_MEMORY:-4G}"
-VM_CPUS="${VM_CPUS:-2}"
+VM_CPUS="${VM_CPUS:-4}"
 VM_ACCEL="${VM_ACCEL:-auto}"
 QEMU="${QEMU:-qemu-system-x86_64}"
 
@@ -61,7 +68,12 @@ die() {
 for tool in "$QEMU" apt-get apt-cache dpkg-deb busybox cpio gzip zstd ldd modinfo file timeout tee; do
 	command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
 done
-[[ -n "$TEST_BIN" && -x "$TEST_BIN" ]] || die "TEST_BIN must name an executable test binary"
+read -r -a test_bins <<<"$TEST_BIN"
+((${#test_bins[@]} > 0)) || die "TEST_BIN must name at least one test binary"
+for bin in "${test_bins[@]}"; do
+	[[ -x "$bin" ]] || die "TEST_BIN entry is not an executable: $bin"
+done
+[[ -z "$DATAPLANE_BIN" || -x "$DATAPLANE_BIN" ]] || die "DATAPLANE_BIN is not an executable: $DATAPLANE_BIN"
 case "$GUEST_KERNEL" in
 6.8) RELEASE=noble ;;
 7.0) RELEASE=resolute ;;
@@ -170,27 +182,44 @@ build_initramfs() {
 	moddir="$WORK_DIR/kernel-root/lib/modules/$version"
 	[[ -d "$moddir" ]] || moddir="$WORK_DIR/kernel-root/usr/lib/modules/$version"
 	rm -rf "$root"
-	mkdir -p "$root"/{bin,dev,proc,sys,tmp,modules,tests}
+	mkdir -p "$root"/{bin,dev,proc,run,sys,tmp,modules,tests}
 	cp "$busybox" "$root/bin/busybox"
 	ln -s busybox "$root/bin/sh"
 	: >"$root/modules/order"
 	add_module "$root" "$moddir" ublk_drv
-	cp "$TEST_BIN" "$root/tests/test-bin"
-	if ldd "$TEST_BIN" >/dev/null 2>&1; then
-		for lib in $(ldd "$TEST_BIN" | grep -oE '/[^ ]+'); do
-			mkdir -p "$root$(dirname "$lib")"
-			cp -L "$lib" "$root$lib"
-		done
+	local i=0 bin run=""
+	for bin in "${test_bins[@]}" ${DATAPLANE_BIN:+"$DATAPLANE_BIN"}; do
+		if ldd "$bin" >/dev/null 2>&1; then
+			for lib in $(ldd "$bin" | grep -oE '/[^ ]+'); do
+				mkdir -p "$root$(dirname "$lib")"
+				cp -L "$lib" "$root$lib"
+			done
+		fi
+	done
+	for bin in "${test_bins[@]}"; do
+		cp "$bin" "$root/tests/test-bin-$i"
+		run+="/tests/test-bin-$i '$TEST_FILTER' --test-threads=1 --nocapture 2>&1
+echo \"RACER_VM_RESULT \$?\"
+"
+		i=$((i + 1))
+	done
+	if [[ -n "$DATAPLANE_BIN" ]]; then
+		cp "$DATAPLANE_BIN" "$root/tests/racer"
 	fi
 	cat >"$root/init" <<EOF
 #!/bin/sh
 /bin/busybox --install -s /bin
 export PATH=/bin HOME=/tmp TMPDIR=/tmp RACER_UBLK_TEST=1 RUST_BACKTRACE=1
+export RACER_TEST_SCRATCH=/scratch RACER_TEST_DATAPLANE=/tests/racer
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
 mount -t tmpfs tmpfs /tmp
+ip link set lo up
 fatal() { echo "RACER_VM_FATAL \$*"; poweroff -n -f; }
+# tmpfs lacks O_DIRECT, which the dataplane's slab store requires.
+truncate -s 1536M /tmp/scratch.img && loop=\$(losetup -f) && losetup "\$loop" /tmp/scratch.img &&
+	mke2fs -q "\$loop" && mkdir -p /scratch && mount "\$loop" /scratch || fatal "scratch filesystem"
 echo "RACER_VM_KERNEL \$(uname -r)"
 [ "\$(uname -r)" = '$version' ] || fatal "booted \$(uname -r), expected $version"
 while read -r m; do insmod "/modules/\$m.ko" || fatal "insmod \$m failed"; done </modules/order
@@ -200,9 +229,7 @@ while [ ! -c /dev/ublk-control ] && [ \$i -lt 50 ]; do sleep 0.1; i=\$((i + 1));
 if [ -f /proc/sys/kernel/io_uring_disabled ]; then echo 0 >/proc/sys/kernel/io_uring_disabled; fi
 ( sleep $GUEST_TIMEOUT; echo "RACER_VM_FATAL tests hung for ${GUEST_TIMEOUT}s"; poweroff -n -f ) &
 cd /tmp
-/tests/test-bin '$TEST_FILTER' --test-threads=1 --nocapture 2>&1
-echo "RACER_VM_RESULT \$?"
-poweroff -n -f
+${run}poweroff -n -f
 EOF
 	chmod +x "$root/init"
 	(cd "$root" && find . -print0 | cpio --null -o -H newc --quiet) | gzip -1 >"$WORK_DIR/initramfs.cpio.gz"
@@ -233,12 +260,13 @@ if grep -qE 'Kernel panic|BUG: |Oops: |RACER_VM_FATAL' <<<"$text"; then
 	log "error: guest reported a fatal error"
 	rc=1
 fi
-[[ "$(sed -n 's/^RACER_VM_RESULT \([0-9]*\)$/\1/p' <<<"$text" | tail -n 1)" == 0 ]] || {
-	log "error: test binary did not exit zero"
+results="$(sed -n 's/^RACER_VM_RESULT \([0-9]*\)$/\1/p' <<<"$text")"
+[[ "$(grep -c '^0$' <<<"$results")" == "${#test_bins[@]}" && "$(wc -l <<<"$results")" == "${#test_bins[@]}" ]] || {
+	log "error: not every test binary exited zero"
 	rc=1
 }
-grep -qE '^test result: ok\. [1-9][0-9]* passed' <<<"$text" || {
-	log "error: no passing libtest summary"
+[[ "$(grep -cE '^test result: ok\. [1-9][0-9]* passed' <<<"$text")" == "${#test_bins[@]}" ]] || {
+	log "error: not every test binary printed a passing libtest summary"
 	rc=1
 }
 if grep -q 'skipping ublk kernel test' <<<"$text"; then
