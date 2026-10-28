@@ -1,38 +1,18 @@
-//! Bearer authorization caching and API budget, lifted from `auth.rs`.
+//! Bearer authorization caching and API budget (`auth.rs`).
 //!
-//! A full bearer authorization costs one TokenReview POST and four GETs
-//! (Pod, DaemonSet, ServiceAccount, Node). During an enrollment storm every
-//! seat runs up to [`limits::MAX_BOOTSTRAPS`] of these at once, and an
-//! unenrolled client authorizes again for its bearer keyring poll and again
-//! when that poll returns data. [`AuthCache`] removes the repeated calls and
-//! [`ApiBudget`] keeps the remainder under a per-process rate so a storm is
-//! shed locally with `Overloaded` instead of by API server 429s, which would
-//! waste the calls already made for the same authorization.
-//!
-//! What is cached, and why it is safe:
-//! - A successful TokenReview, keyed by the SHA-256 of the token, for at most
-//!   [`REVIEW_TTL`] and never past the token's `exp`. This is the same
-//!   window kube-apiserver uses for its own token authentication cache. A
-//!   review result for a bound token only says the signature is valid and
-//!   the bound Pod, Node and ServiceAccount existed. Revocation by deleting
-//!   the Pod or Node is still seen at once: both are read live on every
-//!   authorization and must match the review by UID. Deleting the
-//!   ServiceAccount is seen within [`BINDINGS_TTL`] through the binding
-//!   cache. Failed reviews are never cached.
-//! - A whole successful authorization (review plus the live Pod and Node
-//!   checks), keyed by token, for at most [`CALLER_TTL`] and never past
-//!   `exp`. This is what lets the bootstrap that follows an unenrolled
-//!   client's keyring poll skip the API. Pod, Node or ServiceAccount
-//!   revocation is therefore seen within `CALLER_TTL` rather than at once;
-//!   that is the same order as [`BINDINGS_TTL`], short against the issued
-//!   certificate's lifetime, and the primary drops a deleted Pod's Node from
-//!   membership on its own watch regardless. A long poll that waited (the
-//!   keyring recheck after up to `POLL_WAIT`) outlives it and so re-reads.
-//! - The DaemonSet and ServiceAccount UIDs, shared by every caller, for at
-//!   most [`BINDINGS_TTL`]. Both are cluster objects an operator changes
-//!   rarely; a replaced or deleting DaemonSet or ServiceAccount is refused
-//!   at most `BINDINGS_TTL` later. A failed authorization against cached
-//!   bindings drops them, so the next attempt reads them live.
+//! A full authorization costs a TokenReview POST and four GETs (Pod,
+//! DaemonSet, ServiceAccount, Node). [`AuthCache`] removes repeated calls and
+//! [`ApiBudget`] keeps the rest under a per-process rate, so a storm is shed
+//! locally with `Overloaded` instead of by API server 429s. Why caching is
+//! safe:
+//! - Successful TokenReviews, keyed by the token's SHA-256, for at most
+//!   [`REVIEW_TTL`] (kube-apiserver's own window) and never past `exp`. Pod
+//!   and Node are still read live and matched by UID; failures are not cached.
+//! - Whole successful authorizations for at most [`CALLER_TTL`], so the
+//!   bootstrap after a keyring poll skips the API. Revocation is seen within
+//!   `CALLER_TTL`, short against the certificate lifetime.
+//! - DaemonSet and ServiceAccount UIDs for at most [`BINDINGS_TTL`]; a failed
+//!   authorization against cached bindings drops them.
 
 use crate::limits;
 use sha2::{Digest, Sha256};
@@ -51,8 +31,7 @@ pub const BINDINGS_TTL: Duration = Duration::from_secs(5);
 /// live Pod and Node reads) is reused for the same token.
 pub const CALLER_TTL: Duration = Duration::from_secs(5);
 
-/// Bound on cached reviews, and separately on cached authorizations; expired entries are dropped first, then the
-/// entry closest to expiry.
+/// Bound on cached reviews, and separately on cached authorizations.
 pub const MAX_REVIEWS: usize = 8192;
 
 /// API calls of an authorization with nothing cached.
@@ -92,7 +71,6 @@ pub struct AuthCache<C = ()> {
     reviews: BTreeMap<TokenKey, (Reviewed, Instant)>,
     callers: BTreeMap<TokenKey, (C, Instant)>,
     bindings: Option<(Bindings, Instant)>,
-    pub stats: CacheStats,
 }
 
 impl<C> Default for AuthCache<C> {
@@ -101,7 +79,6 @@ impl<C> Default for AuthCache<C> {
             reviews: BTreeMap::new(),
             callers: BTreeMap::new(),
             bindings: None,
-            stats: CacheStats::default(),
         }
     }
 }
@@ -126,23 +103,11 @@ fn put_bounded<V>(
     map.insert(key, (v, until));
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct CacheStats {
-    pub review_hits: u64,
-    pub review_misses: u64,
-    pub binding_hits: u64,
-    pub binding_misses: u64,
-    pub caller_hits: u64,
-}
-
 impl<C: Clone> AuthCache<C> {
     /// A whole authorization of `key` younger than [`CALLER_TTL`].
     pub fn caller(&mut self, key: &TokenKey, now: Instant) -> Option<C> {
         match self.callers.get(key) {
-            Some((c, until)) if now < *until => {
-                self.stats.caller_hits += 1;
-                Some(c.clone())
-            }
+            Some((c, until)) if now < *until => Some(c.clone()),
             Some(_) => {
                 self.callers.remove(key);
                 None
@@ -163,19 +128,12 @@ impl<C: Clone> AuthCache<C> {
     /// A cached review of `key` still valid at `now`.
     pub fn review(&mut self, key: &TokenKey, now: Instant) -> Option<Reviewed> {
         match self.reviews.get(key) {
-            Some((r, until)) if now < *until => {
-                self.stats.review_hits += 1;
-                Some(r.clone())
-            }
+            Some((r, until)) if now < *until => Some(r.clone()),
             Some(_) => {
                 self.reviews.remove(key);
-                self.stats.review_misses += 1;
                 None
             }
-            None => {
-                self.stats.review_misses += 1;
-                None
-            }
+            None => None,
         }
     }
 
@@ -200,13 +158,9 @@ impl<C: Clone> AuthCache<C> {
     /// Cached bindings still valid at `now`.
     pub fn bindings(&mut self, now: Instant) -> Option<Bindings> {
         match &self.bindings {
-            Some((b, until)) if now < *until => {
-                self.stats.binding_hits += 1;
-                Some(b.clone())
-            }
+            Some((b, until)) if now < *until => Some(b.clone()),
             _ => {
                 self.bindings = None;
-                self.stats.binding_misses += 1;
                 None
             }
         }
@@ -251,16 +205,10 @@ impl<C: Clone> AuthCache<C> {
 }
 
 /// Per-process token bucket for authorization API calls. An authorization
-/// reserves all of its calls up front, so it either runs to completion
-/// under the budget or is refused before its first call.
-///
-/// The rate adapts to the API server (additive increase, multiplicative
-/// decrease): an API 429 halves it, at most once per [`CUT_INTERVAL`] so a
-/// burst of 429s from calls already in flight counts once, and drops the
-/// saved burst. It never falls below 1/16 of the configured rate and grows
-/// back to it linearly over [`RECOVERY`]. Seats share one API server
-/// without coordinating, so this is what keeps their sum near its capacity
-/// instead of each retrying into 429s.
+/// reserves all of its calls up front, so it runs to completion or is refused
+/// before its first call. AIMD against the API server: a 429 halves the rate
+/// (once per [`CUT_INTERVAL`]) and drops the saved burst; it never falls below
+/// 1/16 of the configured rate and recovers linearly over [`RECOVERY`].
 #[derive(Clone, Debug)]
 pub struct ApiBudget {
     pub max_qps: f64,
@@ -324,11 +272,8 @@ impl ApiBudget {
     }
 
     /// Reserve `calls` tokens at `now`, borrowing against future refill:
-    /// returns how long the caller must wait before making the calls, at
-    /// most `max_wait`. Fails, taking nothing, when the wait would be
-    /// longer. Waiting a little in the seat instead of refusing keeps
-    /// clients out of exponential backoff, whose tail would otherwise set
-    /// the time to enroll everyone.
+    /// returns how long to wait before the calls, at most `max_wait`. Fails,
+    /// taking nothing, when the wait would be longer.
     pub fn reserve(&mut self, calls: u32, now: Instant, max_wait: Duration) -> Option<Duration> {
         self.refill(now);
         let n = f64::from(calls);
@@ -398,7 +343,6 @@ mod tests {
         // Already expired: nothing stored.
         c.put_review(k, reviewed("p"), Duration::ZERO, t0);
         assert_eq!(c.review(&k, t0), None);
-        assert_eq!(c.stats.review_hits, 2);
     }
 
     #[test]
@@ -417,7 +361,6 @@ mod tests {
         c.put_caller(k, 7, Duration::from_secs(60), t0);
         c.drop_review(&k);
         assert_eq!(c.caller(&k, t0), None);
-        assert_eq!(c.stats.caller_hits, 1);
     }
 
     #[test]
