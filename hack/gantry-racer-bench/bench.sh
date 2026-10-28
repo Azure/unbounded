@@ -267,7 +267,7 @@ EOF
 	kubectl -n "$NS" rollout status ds/diskprep --timeout=15m
 	ds_records diskprep DISK 900 >"$OUT/disks.txt"
 	awk '$3 != "none" {print $2, $3}' "$OUT/disks.txt" |
-		xargs -P 64 -n 2 sh -c 'kubectl annotate node "$0" --overwrite "racer.unbounded-cloud.io/block-devices=^$1\$" >/dev/null'
+		xargs -r -P 64 -n 2 sh -c 'kubectl annotate node "$0" --overwrite "racer.unbounded-cloud.io/block-devices=^$1\$" >/dev/null'
 	awk '{print $3 == "none" ? $4 : "device"}' "$OUT/disks.txt" | sort | uniq -c
 	kubectl -n "$NS" delete ds diskprep --wait=false >/dev/null
 }
