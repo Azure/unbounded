@@ -176,6 +176,3 @@ See the `racer-vllm` README for loader options such as `staging_bytes`.
 
 The first load fills the cache from the origin. Later loads on any node read
 from the cache.
-
-To read from disk and from peers straight into GPU memory, see
-[GPUDirect Model Loading with Racer]({{< relref "guides/racer-gpudirect" >}}).
