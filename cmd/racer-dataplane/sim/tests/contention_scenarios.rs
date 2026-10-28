@@ -311,7 +311,6 @@ fn seed_matrix_replays_identical_reports() {
         let strip = |mut v: Value| {
             let o = v.as_object_mut().unwrap();
             o.remove("wall_ms");
-            o.remove("profile_wall_ms");
             o["memory"]
                 .as_object_mut()
                 .unwrap()

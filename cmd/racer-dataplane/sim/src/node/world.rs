@@ -401,49 +401,55 @@ enum Cut {
     Other,
 }
 
-/// Skip causes (`classify_repeat`), as `&'static` counter names.
-const SKIPS: [&str; 11] = [
-    "not_serving",
-    "partition",
-    "down",
-    "route",
-    "circuit",
-    "timeout",
-    "failed",
-    "relay",
-    "busy",
-    "copy_only",
-    "unfunded",
+/// Skip causes (`classify_repeat`) with their `origin_skips_*` and `origin_repeats_orphan_*`
+/// counters; `copy` never orphans and is not reported.
+const SKIPS: [(&str, &str, &str); 12] = [
+    (
+        "not_serving",
+        "origin_skips_not_serving",
+        "origin_repeats_orphan_not_serving",
+    ),
+    (
+        "partition",
+        "origin_skips_partition",
+        "origin_repeats_orphan_partition",
+    ),
+    ("down", "origin_skips_down", "origin_repeats_orphan_down"),
+    ("route", "origin_skips_route", "origin_repeats_orphan_route"),
+    (
+        "circuit",
+        "origin_skips_circuit",
+        "origin_repeats_orphan_circuit",
+    ),
+    (
+        "timeout",
+        "origin_skips_timeout",
+        "origin_repeats_orphan_timeout",
+    ),
+    (
+        "failed",
+        "origin_skips_failed",
+        "origin_repeats_orphan_failed",
+    ),
+    ("relay", "origin_skips_relay", "origin_repeats_orphan_relay"),
+    ("busy", "origin_skips_busy", "origin_repeats_orphan_busy"),
+    (
+        "copy_only",
+        "origin_skips_copy_only",
+        "origin_repeats_orphan_copy_only",
+    ),
+    (
+        "unfunded",
+        "origin_skips_unfunded",
+        "origin_repeats_orphan_unfunded",
+    ),
+    ("copy", "origin_skips_copy", "origin_repeats_orphan_copy"),
 ];
 
-/// `prefix` + `skip` as a static counter name (`copy` never orphans).
-fn skip_counter(prefix: &'static str, skip: &'static str) -> &'static str {
-    match (prefix, skip) {
-        ("origin_skips_", "not_serving") => "origin_skips_not_serving",
-        ("origin_skips_", "partition") => "origin_skips_partition",
-        ("origin_skips_", "down") => "origin_skips_down",
-        ("origin_skips_", "route") => "origin_skips_route",
-        ("origin_skips_", "circuit") => "origin_skips_circuit",
-        ("origin_skips_", "timeout") => "origin_skips_timeout",
-        ("origin_skips_", "failed") => "origin_skips_failed",
-        ("origin_skips_", "relay") => "origin_skips_relay",
-        ("origin_skips_", "busy") => "origin_skips_busy",
-        ("origin_skips_", "copy_only") => "origin_skips_copy_only",
-        ("origin_skips_", "copy") => "origin_skips_copy",
-        ("origin_skips_", _) => "origin_skips_unfunded",
-        (_, "not_serving") => "origin_repeats_orphan_not_serving",
-        (_, "partition") => "origin_repeats_orphan_partition",
-        (_, "down") => "origin_repeats_orphan_down",
-        (_, "route") => "origin_repeats_orphan_route",
-        (_, "circuit") => "origin_repeats_orphan_circuit",
-        (_, "timeout") => "origin_repeats_orphan_timeout",
-        (_, "failed") => "origin_repeats_orphan_failed",
-        (_, "relay") => "origin_repeats_orphan_relay",
-        (_, "busy") => "origin_repeats_orphan_busy",
-        (_, "copy_only") => "origin_repeats_orphan_copy_only",
-        (_, "copy") => "origin_repeats_orphan_copy",
-        (_, _) => "origin_repeats_orphan_unfunded",
-    }
+/// The `SKIPS` entry for `skip` (unknown causes count as `unfunded`).
+fn skip_counters(skip: &str) -> (&'static str, &'static str) {
+    let (_, s, o) = SKIPS.iter().find(|e| e.0 == skip).unwrap_or(&SKIPS[10]);
+    (s, o)
 }
 
 /// The last origin request for a page ([`NodeWorld::classify_repeat`]).
@@ -513,8 +519,6 @@ struct Msg {
     /// When the requester abandons this exchange (its attempt timeout).
     abandon: Nanos,
     relays: Vec<SimCharge>,
-    /// When the first relay took its `Relay` reservation.
-    relay_first: Nanos,
     /// A pinned single-link hedge exchange.
     direct: bool,
     /// An orphan notice's copy offer: answered `Miss` without a body.
@@ -635,6 +639,10 @@ fn err_name(e: Error) -> &'static str {
     }
 }
 
+fn err_reply(e: Error) -> Reply {
+    peer_error(e).map_or(Reply::Transport, Reply::Response)
+}
+
 fn response_kind(r: Response) -> ResponseKind {
     match r {
         Response::Overloaded => ResponseKind::Overloaded,
@@ -715,19 +723,9 @@ pub struct NodeWorld {
     /// Task ids woken since the last drain (see [`TaskWaker`]).
     woken: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
     publish_scheduled: bool,
-    profile: Profile,
 }
 
-/// Host wall time spent in the real topology code, for the report only (never feeds simulated time
-/// or decisions).
-#[derive(Debug, Default)]
-struct Profile {
-    rank_ns: u64,
-    route_ns: u64,
-    publish_ns: u64,
-}
-
-#[allow(clippy::disallowed_methods)] // Profiling only; see `Profile`.
+#[allow(clippy::disallowed_methods)] // Only a base for offsets; runs replay.
 fn wall_clock() -> Instant {
     Instant::now()
 }
@@ -829,7 +827,6 @@ impl NodeWorld {
             down_since: HashMap::default(),
             woken: std::sync::Arc::default(),
             publish_scheduled: false,
-            profile: Profile::default(),
             config,
         };
         world.schedule_initial(&streams);
@@ -919,9 +916,7 @@ impl NodeWorld {
     /// Combined mode: the control plane committed membership `number` with `members` (node ids) at
     /// `now`. Prunes versions no live node needs.
     pub fn commit_membership(&mut self, number: u64, members: Vec<u32>, now: Nanos) {
-        let started = wall_clock();
         let added = self.versions.commit(number, members, now);
-        self.profile.publish_ns += started.elapsed().as_nanos() as u64;
         if !added {
             return;
         }
@@ -1066,9 +1061,7 @@ impl NodeWorld {
     fn publish(&mut self) {
         self.publish_scheduled = false;
         let now = self.now();
-        let started = wall_clock();
         let dropped = self.versions.publish(now);
-        self.profile.publish_ns += started.elapsed().as_nanos() as u64;
         self.metrics.incr("membership_publications");
         if dropped {
             self.shared.phantom.forget(&self.versions.identities());
@@ -1547,9 +1540,6 @@ impl NodeWorld {
                         } else {
                             self.metrics.incr("reads_failed");
                             self.metrics.incr(err_name(e));
-                            // When reads fail, to attribute them to faults.
-                            self.metrics
-                                .observe("read_failed_at_s", self.now() / SECONDS);
                             if self.hangs
                                 && crate::faults::hung(&self.config.faults, r.node, self.now())
                             {
@@ -1579,7 +1569,7 @@ impl NodeWorld {
                         if !copy_only {
                             self.note_hint(dest, page, m.requester, false);
                         }
-                        let reply = peer_error(e).map_or(Reply::Transport, Reply::Response);
+                        let reply = err_reply(e);
                         self.send_reply(msg, dest, reply, now);
                     }
                 }
@@ -1888,14 +1878,12 @@ impl NodeWorld {
             return self.task_done(task);
         }
         task.parked = false;
-        let started = wall_clock();
         let waker = Waker::from(std::sync::Arc::new(TaskWaker {
             task: id,
             woken: self.woken.clone(),
         }));
         let mut cx = Context::from_waker(&waker);
         let poll = task.future.as_mut().poll(&mut cx);
-        let spent = started.elapsed().as_nanos() as u64;
         task.polls += 1;
         let cost = if task.polls == 1 {
             task.first_ns
@@ -1904,12 +1892,10 @@ impl NodeWorld {
         };
         let (node, worker, route) = (task.node, task.worker, task.route);
         if route {
-            self.profile.route_ns += spent;
             if task.polls > 1 {
                 self.metrics.incr("route_search_polls");
             }
         } else {
-            self.profile.rank_ns += spent;
             self.metrics.incr("ranking_polls");
         }
         let end = if cost == 0 {
@@ -2984,7 +2970,6 @@ impl NodeWorld {
             deadline,
             abandon: self.nanos(plan.attempt_end).max(now + 1),
             relays: Vec::new(),
-            relay_first: 0,
             direct,
             offer: false,
             ping: false,
@@ -3171,15 +3156,25 @@ impl NodeWorld {
         }
     }
 
-    /// Ping `dest` from `node` (production `CandidatePolicy::poll_pings`): a page request in mode
-    /// `ping` on its own route grant ([`NOTICE_LINKS`], no attempts), which the destination answers
-    /// `Miss` at once.
+    /// Ping `dest` from `node` (production `CandidatePolicy::poll_pings`), answered `Miss` at once.
     fn launch_ping(&mut self, node: u32, dest: u32, page: u64) {
-        let now = self.now();
-        let timeout = now + self.config.node.attempt_timeout_ns;
-        let version = self.nodes[node as usize].version;
-        let incarnation = self.nodes[node as usize].incarnation;
         self.nodes[node as usize].pings += 1;
+        let pid = self.launch_control(node, dest, page, false);
+        let incarnation = self.nodes[node as usize].incarnation;
+        let ping = SimPing {
+            node,
+            incarnation,
+            dest,
+            relayed: false,
+        };
+        self.pings.insert(pid, ping);
+        self.metrics.incr("silence_pings");
+    }
+
+    /// Send a ping or copy offer from `node` on its own route grant ([`NOTICE_LINKS`], no
+    /// attempts); returns its probe id.
+    fn launch_control(&mut self, node: u32, dest: u32, page: u64, offer: bool) -> u64 {
+        let timeout = self.now() + self.config.node.attempt_timeout_ns;
         let pid = self.fresh();
         let mid = self.fresh();
         let msg = Msg {
@@ -3187,7 +3182,7 @@ impl NodeWorld {
             requester: node,
             at: node,
             dest,
-            version,
+            version: self.nodes[node as usize].version,
             page,
             acquire: false,
             path: vec![node],
@@ -3196,24 +3191,14 @@ impl NodeWorld {
             deadline: timeout,
             abandon: timeout,
             relays: Vec::new(),
-            relay_first: 0,
             direct: false,
-            offer: false,
-            ping: true,
+            offer,
+            ping: !offer,
         };
-        self.pings.insert(
-            pid,
-            SimPing {
-                node,
-                incarnation,
-                dest,
-                relayed: false,
-            },
-        );
         self.msgs.insert(mid, msg);
         self.engine.at(timeout, Event::ProbeTimeout { probe: pid });
-        self.metrics.incr("silence_pings");
         self.forward(mid, node, None);
+        pid
     }
 
     /// A ping ended with `reply`, or unanswered within its time bound (`None`), classified by
@@ -3350,9 +3335,7 @@ impl NodeWorld {
         if let Some(cut) = cut {
             self.note_cut(mid, cut);
         }
-        let target = &self.nodes[next as usize];
-        let unready =
-            (!target.down && !self.versions.enrolled(next)).then_some(target.incarnation > 0);
+        let unready = cut == Some(Cut::NotServing);
         let n = &mut self.nodes[holder as usize];
         if up {
             n.links.success(&next);
@@ -3373,7 +3356,6 @@ impl NodeWorld {
         } else {
             self.metrics.incr("link_failures");
             if partitioned {
-                self.metrics.incr("partition_link_failures");
                 if let Some(m) = self.msgs.get(&mid)
                     && m.offer
                 {
@@ -3381,12 +3363,9 @@ impl NodeWorld {
                     self.metrics.incr("partition_link_failures_offers");
                 }
             }
-            if let Some(restarted) = unready {
+            if unready {
                 // A member that has not applied a membership yet: no peer listener.
                 self.metrics.incr("unready_member_links");
-                if restarted {
-                    self.metrics.incr("unready_member_links_restarted");
-                }
             }
             if let Some(since) = self.down_since.get(&next) {
                 // A peer chose a crashed member: how long after the crash.
@@ -3535,9 +3514,6 @@ impl NodeWorld {
                 match reserve(quotas, ResourceClass::Relay, 1) {
                     Ok(charge) => {
                         let m = self.msgs.get_mut(&mid).expect("message");
-                        if m.relays.is_empty() {
-                            m.relay_first = now;
-                        }
                         m.relays.push(charge);
                         self.forward(mid, at, Some(plan));
                     }
@@ -3642,7 +3618,7 @@ impl NodeWorld {
         }
         if self.shed_hot(dest, requester, page) {
             self.metrics.incr("hot_page_sheds");
-            let reply = peer_error(Error::Overloaded).map_or(Reply::Transport, Reply::Response);
+            let reply = err_reply(Error::Overloaded);
             self.send_reply(mid, dest, reply, now);
             return;
         }
@@ -3655,7 +3631,7 @@ impl NodeWorld {
         });
         match action {
             ServeAction::Reject(e) => {
-                let reply = peer_error(e).map_or(Reply::Transport, Reply::Response);
+                let reply = err_reply(e);
                 self.send_reply(mid, dest, reply, now);
             }
             ServeAction::Miss => {
@@ -3696,7 +3672,7 @@ impl NodeWorld {
                 let (attempts, links) = (m.attempts, m.links);
                 match inherited_budget(scope, route, attempts, links, m.path.len()) {
                     Err(e) => {
-                        let reply = peer_error(e).map_or(Reply::Transport, Reply::Response);
+                        let reply = err_reply(e);
                         self.send_reply(mid, dest, reply, now);
                     }
                     Ok(budget) => {
@@ -3780,7 +3756,7 @@ impl NodeWorld {
             }
             Err(e) => {
                 self.metrics.incr("copy_only_join_rejected");
-                let reply = peer_error(e).map_or(Reply::Transport, Reply::Response);
+                let reply = err_reply(e);
                 self.send_reply(mid, dest, reply, t);
                 true
             }
@@ -3886,10 +3862,6 @@ impl NodeWorld {
             let done = self.fabric.transfer_until(sealed, &route, bytes, m.abandon);
             let release = done.unwrap_or(m.abandon);
             if !m.relays.is_empty() {
-                // How long the first relay holds its `Relay` reservation: waiting for the
-                // destination's answer, then streaming.
-                self.metrics
-                    .observe("relay_hold_wait_ns", ready.saturating_sub(m.relay_first));
                 self.metrics
                     .observe("relay_hold_stream_ns", release.saturating_sub(ready));
             }
@@ -4413,7 +4385,7 @@ impl NodeWorld {
             }
         });
         if let Some(skip) = skip {
-            self.metrics.incr(skip_counter("origin_skips_", skip));
+            self.metrics.incr(skip_counters(skip).0);
         }
         let next = LastOrigin {
             node,
@@ -4467,8 +4439,7 @@ impl NodeWorld {
             // `A` fetched as an owner above rank 0, so rank 0 has no copy and fetches again: charge
             // the repeat to why `A` skipped it.
             if let Some(orphan) = last.skip {
-                self.metrics
-                    .incr(skip_counter("origin_repeats_orphan_", orphan));
+                self.metrics.incr(skip_counters(orphan).1);
                 // Rank 0 refetching although it noted the holder (round 4, orphan2): its one
                 // successor probe of the hint was spent, missed, or the hint expired.
                 if skip.is_none() && self.nodes[node as usize].hints.names(&page, &last.node) {
@@ -4687,40 +4658,12 @@ impl NodeWorld {
         }
     }
 
-    /// Send one copy offer for `due` from `node`, on its own route grant ([`NOTICE_LINKS`], no
-    /// attempts).
     fn launch_offer(&mut self, node: u32, due: OfferDue) {
-        let now = self.now();
-        let timeout = now + self.config.node.attempt_timeout_ns;
-        let version = self.nodes[node as usize].version;
         let incarnation = self.nodes[node as usize].incarnation;
-        let pid = self.fresh();
-        let mid = self.fresh();
-        let msg = Msg {
-            probe: pid,
-            requester: node,
-            at: node,
-            dest: due.target,
-            version,
-            page: due.key.0,
-            acquire: false,
-            path: vec![node],
-            links: NOTICE_LINKS,
-            attempts: 0,
-            deadline: timeout,
-            abandon: timeout,
-            relays: Vec::new(),
-            relay_first: 0,
-            direct: false,
-            offer: true,
-            ping: false,
-        };
         self.nodes[node as usize].offers += 1;
+        let pid = self.launch_control(node, due.target, due.key.0, true);
         self.offers.insert(pid, (node, incarnation, due));
-        self.msgs.insert(mid, msg);
-        self.engine.at(timeout, Event::ProbeTimeout { probe: pid });
         self.metrics.incr("orphan_offers_sent");
-        self.forward(mid, node, None);
     }
 
     /// A copy offer ended: delivered, or try again after the next delay.
@@ -5098,26 +5041,9 @@ impl NodeWorld {
             .copied()
             .max()
             .unwrap_or(0);
-        let mut retry_counts = std::collections::BTreeMap::<u32, u64>::new();
-        for c in self.failure_retries_per_page.values() {
-            *retry_counts.entry(*c).or_default() += 1;
-        }
-        let retry_histogram: serde_json::Map<_, _> = retry_counts
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), json!(v)))
-            .collect();
+        let c = |k: &str| self.metrics.get(k);
         let requests: u64 = self.origin_per_page.values().map(|c| u64::from(*c)).sum();
         let pages = self.origin_per_page.len();
-        // Pages by origin request count.
-        let mut counts = std::collections::BTreeMap::<u32, u64>::new();
-        for c in self.origin_per_page.values() {
-            *counts.entry(*c).or_default() += 1;
-        }
-        let histogram: serde_json::Map<_, _> = counts
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), json!(v)))
-            .collect();
-        let c = |k: &str| self.metrics.get(k);
         json!({
             "scenario": scenario,
             "logic": "real",
@@ -5134,11 +5060,6 @@ impl NodeWorld {
                 "max_requests_per_page": max_per_page,
                 "max_requests_per_page_excluding_failure_retries": max_without_retries,
                 "max_failure_retries_per_page": max_retries,
-                "failure_retries_histogram": retry_histogram,
-                "histogram": histogram,
-                "mean_requests_per_page": if pages == 0 { 0.0 } else { requests as f64 / pages as f64 },
-                "page_bytes": self.config.page_bytes,
-                "bytes_per_page": if pages == 0 { 0 } else { c("origin_bytes") / pages as u64 },
                 "repeats": {
                     "after_owner_move": c("origin_repeats_after_move"),
                     "copy_lost": c("origin_repeats_copy_lost"),
@@ -5154,31 +5075,15 @@ impl NodeWorld {
                         "unasked": c("origin_repeats_held_unasked"),
                     },
                     "unexplained": c("origin_repeats_held_unexplained"),
-                    "orphan": SKIPS
+                    "orphan": SKIPS[..11]
                         .iter()
-                        .map(|k| (k.to_string(), json!(c(skip_counter("origin_repeats_orphan_", k)))))
+                        .map(|(k, _, o)| (k.to_string(), json!(c(o))))
                         .collect::<serde_json::Map<_, _>>(),
                 },
-                "skips": SKIPS
+                "skips": SKIPS[..11]
                     .iter()
-                    .map(|k| (k.to_string(), json!(c(skip_counter("origin_skips_", k)))))
+                    .map(|(k, sk, _)| (k.to_string(), json!(c(sk))))
                     .collect::<serde_json::Map<_, _>>(),
-            },
-            "cache": {
-                "memory_hits": c("memory_hits"),
-                "disk_hits": c("disk_hits"),
-                "peer_memory_hits": c("peer_memory_hits"),
-                "peer_disk_hits": c("peer_disk_hits"),
-                "copy_only_hits": c("copy_only_hits"),
-                "local_misses": c("local_misses"),
-                "memory_evictions": c("memory_evictions"),
-                "disk_evictions": c("disk_evictions"),
-                "flight_joins": c("flight_joins"),
-            },
-            "peer": {
-                "bytes": c("peer_bytes"),
-                "messages": c("peer_messages"),
-                "relays": c("relays"),
             },
             "rejections": self.rejections(),
             "membership": {
@@ -5188,11 +5093,6 @@ impl NodeWorld {
                 "route_memo_entries": self.shared.routes.memo_len(),
             },
             "invariants": self.invariants.to_json(),
-            "profile_wall_ms": {
-                "placement_ranking": self.profile.rank_ns / 1_000_000,
-                "route_search": self.profile.route_ns / 1_000_000,
-                "membership_build": self.profile.publish_ns / 1_000_000,
-            },
             "memory": {
                 "components": memory.iter().map(|(k, v)| ((*k).to_owned(), json!(v))).collect::<serde_json::Map<_, _>>(),
                 "accounted_bytes": total,
@@ -5238,17 +5138,20 @@ impl NodeWorld {
 
 /// Counter for a granted probe of `kind` that ended `what`.
 fn granted_counter(kind: &str, what: &str) -> &'static str {
-    match (kind, what) {
-        ("successor", "copies") => "successor_copies",
-        ("successor", "misses") => "successor_misses",
-        ("successor", _) => "successor_failures",
-        ("demoted", "copies") => "demoted_copies",
-        ("demoted", "misses") => "demoted_misses",
-        ("demoted", _) => "demoted_failures",
-        (_, "copies") => "lineage_grant_copies",
-        (_, "misses") => "lineage_grant_misses",
-        _ => "lineage_grant_failures",
-    }
+    let row = match kind {
+        "successor" => ["successor_copies", "successor_misses", "successor_failures"],
+        "demoted" => ["demoted_copies", "demoted_misses", "demoted_failures"],
+        _ => [
+            "lineage_grant_copies",
+            "lineage_grant_misses",
+            "lineage_grant_failures",
+        ],
+    };
+    row[match what {
+        "copies" => 0,
+        "misses" => 1,
+        _ => 2,
+    }]
 }
 
 #[cfg(test)]
