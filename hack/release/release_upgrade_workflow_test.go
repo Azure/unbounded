@@ -35,87 +35,39 @@ func TestPublishRequiresResolvedRelease(t *testing.T) {
 	}
 }
 
-type workflowStep struct {
-	ID   string            `yaml:"id"`
-	Uses string            `yaml:"uses"`
-	Run  string            `yaml:"run"`
-	With map[string]string `yaml:"with"`
-	Env  map[string]string `yaml:"env"`
-}
-
 type workflowJob struct {
 	If          string            `yaml:"if"`
 	Needs       any               `yaml:"needs"`
 	Permissions map[string]string `yaml:"permissions"`
-	Steps       []workflowStep    `yaml:"steps"`
+	Environment any               `yaml:"environment"`
+	Steps       []struct {
+		ID   string            `yaml:"id"`
+		Uses string            `yaml:"uses"`
+		Run  string            `yaml:"run"`
+		With map[string]string `yaml:"with"`
+	} `yaml:"steps"`
 }
 
-func readWorkflow(t *testing.T, name string) (on map[string]any, jobs map[string]workflowJob) {
-	t.Helper()
+func TestReleaseUpgradeDeploysLatestDocs(t *testing.T) {
+	t.Parallel()
 
-	data, err := os.ReadFile("../../.github/workflows/" + name)
+	if _, err := os.Stat("../../.github/workflows/docs.yaml"); !os.IsNotExist(err) {
+		t.Fatalf("standalone docs workflow must not exist: %v", err)
+	}
+
+	data, err := os.ReadFile("../../.github/workflows/release-upgrade.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	var wf struct {
-		On   map[string]any         `yaml:"on"`
 		Jobs map[string]workflowJob `yaml:"jobs"`
 	}
 	if err := yaml.Unmarshal(data, &wf); err != nil {
 		t.Fatal(err)
 	}
 
-	return wf.On, wf.Jobs
-}
-
-func TestDocsDeploysLatestReleaseOnDispatchOnly(t *testing.T) {
-	t.Parallel()
-
-	on, jobs := readWorkflow(t, "docs.yaml")
-	if inputs, ok := on["workflow_dispatch"]; len(on) != 1 || !ok || inputs != nil {
-		t.Fatalf("docs must trigger only on input-less workflow_dispatch: %v", on)
-	}
-
-	build := jobs["build"]
-	if build.If != "github.ref == 'refs/heads/main'" {
-		t.Fatalf("build must be guarded to main: %q", build.If)
-	}
-
-	if len(build.Steps) == 0 || build.Steps[0].ID != "release" ||
-		!strings.Contains(build.Steps[0].Run, `releases/latest`) || build.Steps[0].Env["GH_TOKEN"] == "" {
-		t.Fatalf("first build step must resolve the latest release: %+v", build.Steps)
-	}
-
-	checkouts := 0
-
-	for name, job := range jobs {
-		for _, s := range job.Steps {
-			if s.Uses != "" && !strings.HasPrefix(s.Uses, "actions/") {
-				t.Errorf("job %s uses non-official action %q", name, s.Uses)
-			}
-
-			if strings.HasPrefix(s.Uses, "actions/checkout@") {
-				checkouts++
-
-				if s.With["ref"] != "refs/tags/${{ steps.release.outputs.tag }}" {
-					t.Errorf("checkout must use the latest release tag, got %q", s.With["ref"])
-				}
-			}
-		}
-	}
-
-	if checkouts != 1 {
-		t.Fatalf("expected exactly one checkout, got %d", checkouts)
-	}
-}
-
-func TestReleaseUpgradeDispatchesLatestDocs(t *testing.T) {
-	t.Parallel()
-
-	_, jobs := readWorkflow(t, "release-upgrade.yaml")
-	docs := jobs["docs"]
-
+	docs := wf.Jobs["docs"]
 	if fmt.Sprint(docs.Needs) != "[resolve publish publish-forced]" {
 		t.Fatalf("docs needs = %v", docs.Needs)
 	}
@@ -130,12 +82,49 @@ func TestReleaseUpgradeDispatchesLatestDocs(t *testing.T) {
 		}
 	}
 
-	if len(docs.Permissions) != 1 || docs.Permissions["actions"] != "write" {
-		t.Errorf("docs permissions = %v, want only actions: write", docs.Permissions)
+	if fmt.Sprint(docs.Permissions) != "map[contents:read id-token:write pages:write]" {
+		t.Errorf("docs permissions = %v", docs.Permissions)
 	}
 
-	if len(docs.Steps) != 1 || docs.Steps[0].Uses != "" ||
-		strings.TrimSpace(docs.Steps[0].Run) != "gh workflow run docs.yaml --ref main" {
-		t.Errorf("docs must only dispatch docs.yaml on main: %+v", docs.Steps)
+	if fmt.Sprint(docs.Environment) != "map[name:github-pages url:${{ steps.deployment.outputs.page_url }}]" {
+		t.Errorf("docs environment = %v", docs.Environment)
+	}
+
+	var uses []string
+
+	for _, s := range docs.Steps {
+		if strings.Contains(s.Run, "gh workflow") {
+			t.Errorf("docs must not dispatch another workflow: %q", s.Run)
+		}
+
+		if s.Uses == "" {
+			continue
+		}
+
+		if !strings.HasPrefix(s.Uses, "actions/") {
+			t.Errorf("docs uses non-official action %q", s.Uses)
+		}
+
+		name, _, _ := strings.Cut(s.Uses, "@")
+		uses = append(uses, name)
+
+		switch name {
+		case "actions/checkout":
+			if s.With["ref"] != "refs/tags/${{ needs.resolve.outputs.tag }}" {
+				t.Errorf("checkout must use the release tag, got %q", s.With["ref"])
+			}
+		case "actions/upload-pages-artifact":
+			if s.With["path"] != "docs/public" {
+				t.Errorf("pages artifact path = %q", s.With["path"])
+			}
+		case "actions/deploy-pages":
+			if s.ID != "deployment" {
+				t.Errorf("deploy-pages id = %q", s.ID)
+			}
+		}
+	}
+
+	if fmt.Sprint(uses) != "[actions/checkout actions/upload-pages-artifact actions/deploy-pages]" {
+		t.Errorf("docs actions = %v, want checkout, upload, deploy in order", uses)
 	}
 }
