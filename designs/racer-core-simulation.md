@@ -1075,8 +1075,7 @@ copy of these rules.
   (`hedge_eligible`, `hedge_budgets`, `hedge_fallback`), `transport_outcome`, and
   `refresh_allowed`. Production `resolve_epoch_traced`, `remaining_validated_copy`,
   `request_traced`, and `hedge_page` drive these.
-- `response`: `PeerResponse<P, G>` is generic over payload and grant, and `Payload` has
-  `PhantomPage` for the simulator. The dataplane's `PeerResponse` is an alias with `CiphertextPage`
+- `response`: `PeerResponse<P, G>` is generic over payload and grant. The dataplane's `PeerResponse` is an alias with `CiphertextPage`
   and `TransferGrant`.
 - `flight`: `PageFlights` is a sans-IO singleflight with `Token` wakes, an admission trait, and a
   seedable hasher. Its join gates (`join_budget_gate`, `waiter_cap_gate`, `entry_cap_gate`) are the

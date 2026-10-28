@@ -324,16 +324,6 @@ pub struct PeerRequest {
 pub type PeerResponse =
     racer_core::read::response::PeerResponse<CiphertextPage, super::subscriptions::TransferGrant>;
 
-impl racer_core::read::response::Payload for CiphertextPage {
-    fn len(&self) -> usize {
-        self.bytes().len()
-    }
-
-    fn page_id(&self) -> &PageId {
-        &self.envelope().page
-    }
-}
-
 /// Owned, unverified wire input/output. The original and all forwarding signatures
 /// travel with the operation, including opaque encrypted origin credentials.
 /// Verification must check that the operation and effective route agree with the
