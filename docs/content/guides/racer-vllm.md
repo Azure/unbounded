@@ -96,7 +96,13 @@ to the shared `emptyDir`.
 
 ## 3. Install racer-vllm
 
-Install both Python packages into the vLLM image:
+Release and nightly builds publish the image `racer-vllm` next to the other
+images, at the same registry and tag. It is `vllm/vllm-openai:v0.25.1` with
+both packages installed, so it needs no changes.
+
+To use another vLLM image, install both Python packages into it. Each release
+attaches their wheels and sdists (`racer_client-*` and `racer_vllm-*`) to the
+GitHub release. From a checkout:
 
 ```bash
 pip install ./clients/python/racer ./clients/python/racer-vllm

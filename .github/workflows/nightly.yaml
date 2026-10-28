@@ -268,6 +268,9 @@ jobs:
   #   - orca                          : deployed separately by deploy-orca
   #   - racer-object                  : injected sidecars and per-ClusterCache
   #                                     origin DaemonSets from the racer component
+  #   - racer-dataplane-cuda          : racer dataplane with GPU reads, selected
+  #                                     by RACER_DATAPLANE_CUDA=true
+  #   - racer-vllm                    : vLLM with the Racer loader; not deployed
   #
   # machine-ops-controller is omitted on purpose: the operator synthesizes
   # metalman per Site instead, so machine-ops is never rolled out here.
@@ -295,8 +298,13 @@ jobs:
             file: images/gantry/Containerfile
           - name: racer-dataplane
             file: images/racer-dataplane/Containerfile
+          - name: racer-dataplane-cuda
+            file: images/racer-dataplane/Containerfile
           - name: racer-object
             file: images/racer-object/Containerfile
+          - name: racer-vllm
+            file: images/racer-vllm/Containerfile
+            large: true
           - name: orca
             file: images/orca/Containerfile
           - name: inventory-aggregator
@@ -316,6 +324,14 @@ jobs:
       - name: Normalize container registry to lowercase
         run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
 
+      - name: Free disk space for large images
+        # The vLLM base image alone is larger than a hosted runner's free disk.
+        if: matrix.component.large
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to ghcr.io
@@ -330,6 +346,9 @@ jobs:
         # it needs that arg (images/metalman/Containerfile declares it and feeds
         # it to make). REGISTRY is lowercased by the step above.
         #
+        # racer-dataplane-cuda is the racer-dataplane Containerfile with the
+        # CUDA build enabled.
+        #
         # Nothing else needs one. Which component images the operator deploys is
         # decided at reconcile time from its own compiled version, so VERSION,
         # passed to every build below, is what selects them.
@@ -340,6 +359,9 @@ jobs:
             case "${{ matrix.component.name }}" in
               metalman)
                 echo "CONTAINER_REGISTRY=${REGISTRY}"
+                ;;
+              racer-dataplane-cuda)
+                echo "RACER_NATIVE_CUDA=true"
                 ;;
             esac
             echo 'EOF'
