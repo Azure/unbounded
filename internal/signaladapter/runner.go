@@ -380,6 +380,7 @@ func (r *Runner) quiesceBackends(backends []createdResource) error {
 			for _, worker := range workers {
 				gracePeriodSeconds := int64(0)
 				background := metav1.DeletePropagationBackground
+
 				err := r.Kubernetes.CoreV1().Pods(backend.resource.GetNamespace()).
 					Delete(ctx, worker.name, metav1.DeleteOptions{
 						GracePeriodSeconds: &gracePeriodSeconds,
