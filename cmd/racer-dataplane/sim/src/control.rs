@@ -401,7 +401,7 @@ fn member_pod(node: &str) -> Option<u32> {
 /// Control plane plus clients on one deterministic timeline.
 pub struct ControlSim {
     pub settings: Settings,
-    cp: ControlPlane,
+    pub(crate) cp: ControlPlane,
     engine: Engine<Ev>,
     api: Store,
     seats: Vec<Seat>,
@@ -543,7 +543,7 @@ impl ControlSim {
 
     fn add_client(&mut self) -> u32 {
         let c = self.state.len() as u32;
-        let p = self.cp.pod_count();
+        let p = self.cp.pods.len() as u32;
         let c = if p > c { c } else { self.cp.add_pod() };
         debug_assert_eq!(c as usize, self.state.len());
         self.api
@@ -600,17 +600,12 @@ impl ControlSim {
 
     /// The committed membership version, if any.
     pub fn committed_membership_version(&self) -> Option<u64> {
-        self.cp.record().map(|r| r.membership_version)
-    }
-
-    /// The control plane model.
-    pub fn model(&self) -> &ControlPlane {
-        &self.cp
+        self.cp.record.as_ref().map(|r| r.membership_version)
     }
 
     /// Current time.
     pub fn now_ns(&self) -> Nanos {
-        self.engine.now().max(self.cp.now_ns())
+        self.engine.now().max(self.cp.now)
     }
 
     /// Next pending event of either queue.
@@ -689,12 +684,12 @@ impl ControlSim {
             "ctl_single_primary",
             s.dual_primary == self.last_dual,
             at,
-            self.cp.primary_pod(),
+            self.cp.primary.holder,
             || format!("dual_primary {} -> {}", self.last_dual, s.dual_primary),
         );
         self.last_dual = s.dual_primary;
         // Primary availability: lost when its Pod dies, back on a new term.
-        let primary = self.cp.primary_pod().filter(|p| self.cp.alive(*p));
+        let primary = self.cp.primary.holder.filter(|p| self.cp.alive(*p));
         if primary != self.last_primary {
             match (self.last_primary, primary) {
                 (Some(_), None) => self.primary_lost_ns = Some(at),
@@ -708,7 +703,7 @@ impl ControlSim {
             }
             self.last_primary = primary;
         }
-        if let Some(r) = self.cp.record() {
+        if let Some(r) = self.cp.record.as_ref() {
             let (seq, mv) = (r.sequence, r.membership_version);
             self.hashes
                 .entry(seq)
@@ -720,7 +715,7 @@ impl ControlSim {
                     .check("ctl_sequence_monotonic", ok, at, None, || {
                         format!("{last:?} -> ({seq}, {mv})")
                     });
-                let commit = self.cp.commit_ns(seq).unwrap_or(at);
+                let commit = self.cp.commit_at.get(&seq).copied().unwrap_or(at);
                 if let Some((t, _, m)) = last {
                     self.metrics.observe("ctl_commit_interval_ns", commit - t);
                     if mv != m {
@@ -730,7 +725,7 @@ impl ControlSim {
                     self.metrics.incr("ctl_membership_versions");
                 }
                 if self.record && last.is_none_or(|(_, _, m)| m != mv) {
-                    match self.cp.image().filter(|i| i.record.sequence == seq) {
+                    match self.cp.image.as_ref().filter(|i| i.record.sequence == seq) {
                         Some(i) => {
                             let pods = i
                                 .publication
@@ -749,9 +744,15 @@ impl ControlSim {
                 self.metrics.observe("ctl_publication_bytes", bytes);
                 if let Some(d) = self
                     .cp
-                    .image()
+                    .image
+                    .as_ref()
                     .and_then(|i| i.delta.as_ref())
-                    .filter(|_| self.cp.image().is_some_and(|i| i.record.sequence == seq))
+                    .filter(|_| {
+                        self.cp
+                            .image
+                            .as_ref()
+                            .is_some_and(|i| i.record.sequence == seq)
+                    })
                 {
                     self.metrics.observe("ctl_delta_bytes", d.2.len() as u64);
                 }
@@ -768,7 +769,7 @@ impl ControlSim {
             self.seats[i].served = served;
             if let Some(t) = served
                 .filter(|_| previous.is_some())
-                .and_then(|q| self.cp.commit_ns(q))
+                .and_then(|q| self.cp.commit_at.get(&q).copied())
             {
                 // Commit to this seat serving it (follower read cadence).
                 self.metrics
@@ -1181,7 +1182,7 @@ impl ControlSim {
             return;
         };
         let after = Some(self.applied_seq[c as usize]).filter(|a| *a > 0);
-        let image = self.cp.image().filter(|i| i.record.sequence == seq);
+        let image = self.cp.image.as_ref().filter(|i| i.record.sequence == seq);
         let mv = match image {
             Some(i) => i.record.membership_version,
             None => self
@@ -1207,7 +1208,10 @@ impl ControlSim {
             Body::Full => (
                 "ctl_full_replies",
                 image.map_or(
-                    self.cp.record().map_or(0, |r| r.publication_bytes as usize),
+                    self.cp
+                        .record
+                        .as_ref()
+                        .map_or(0, |r| r.publication_bytes as usize),
                     |i| i.encoded.len(),
                 ),
             ),
@@ -1264,7 +1268,7 @@ impl ControlSim {
         }
         // Lag from the commit, or from the client's start if it joined
         // (or restarted) after the commit.
-        if let Some(t) = self.cp.commit_ns(seq) {
+        if let Some(t) = self.cp.commit_at.get(&seq).copied() {
             let from = t.max(self.started_ns[c as usize]);
             self.metrics
                 .observe("ctl_client_lag_ns", now.saturating_sub(from));
@@ -1287,7 +1291,7 @@ impl ControlSim {
     }
 
     fn victims(&mut self, count: u32, seats_only: bool) -> Vec<u32> {
-        let primary = self.cp.primary_pod();
+        let primary = self.cp.primary.holder;
         let mut out = Vec::new();
         if seats_only {
             for h in self.cp.seat_holders().into_iter().flatten() {
@@ -1324,7 +1328,7 @@ impl ControlSim {
             CtlFault::CrashPrimary {
                 restart_after_ns, ..
             } => {
-                if let Some(p) = self.cp.primary_pod().filter(|p| self.cp.alive(*p)) {
+                if let Some(p) = self.cp.primary.holder.filter(|p| self.cp.alive(*p)) {
                     self.crash(p, restart_after_ns);
                 }
             }
@@ -1552,7 +1556,7 @@ impl ControlSim {
                 "enrolled": enrolled,
                 "sequence": self.cp.sequence(),
                 "membership_version": self.committed_membership_version(),
-                "primary": self.cp.primary_pod(),
+                "primary": self.cp.primary.holder,
                 "ready_seats": self.cp.ready_seats(),
                 "model_stats": format!("{:?}", self.cp.stats),
             },
@@ -1957,7 +1961,7 @@ mod tests {
             .count();
         assert!(caught_up > 50, "{caught_up}");
         assert!(sim.applied_sequence(0) > 0);
-        assert!(sim.model().sequence().is_some());
+        assert!(sim.cp.sequence().is_some());
     }
 
     /// Delta only for a client that applied the base sequence and holds its

@@ -115,17 +115,17 @@ pub struct Stats {
 }
 
 #[derive(Clone, Debug, Default)]
-struct Lease {
+pub(crate) struct Lease {
     rv: u64,
     uid: u64,
     spec: LeaseSpec,
-    holder: Option<u32>,
+    pub(crate) holder: Option<u32>,
     ready: Option<u64>,
     /// Last sequence this seat delivered to its clients.
     served: Option<u64>,
 }
 
-struct Pod {
+pub(crate) struct Pod {
     alive: bool,
     /// Bumped on crash so stale events are ignored.
     epoch: u32,
@@ -184,18 +184,18 @@ pub struct ControlPlane {
     settings: Settings,
     base: Instant,
     wall_base: SystemTime,
-    now: u64,
+    pub(crate) now: u64,
     seq: u64,
     queue: BinaryHeap<Reverse<(u64, u64, u32, Ev)>>,
     rng: Seeded,
-    pods: Vec<Pod>,
+    pub(crate) pods: Vec<Pod>,
     seats: Vec<Lease>,
-    primary: Lease,
+    pub(crate) primary: Lease,
     view: PrimaryView,
     view_changed_at: Option<Instant>,
-    record: Option<StateRecord>,
-    image: Option<Image>,
-    commit_at: BTreeMap<u64, u64>,
+    pub(crate) record: Option<StateRecord>,
+    pub(crate) image: Option<Image>,
+    pub(crate) commit_at: BTreeMap<u64, u64>,
     inventory: Inventory,
     ownership: Ownership,
     policy: Policy,
@@ -337,7 +337,7 @@ impl ControlPlane {
         p.annotations
             .insert(annotations::REPORT.to_owned(), REPORT.to_owned());
         self.stats.watch_events += 1;
-        if let Some(primary) = self.primary_pod()
+        if let Some(primary) = self.primary.holder
             && !self.wake_pending
         {
             self.wake_pending = true;
@@ -373,11 +373,6 @@ impl ControlPlane {
         self.schedule(at, pod, ev);
     }
 
-    /// Current model time.
-    pub fn now_ns(&self) -> u64 {
-        self.now
-    }
-
     /// Time of the next pending event.
     pub fn next_event_ns(&self) -> Option<u64> {
         self.queue.peek().map(|Reverse((t, ..))| *t)
@@ -386,11 +381,6 @@ impl ControlPlane {
     /// Committed publication sequence.
     pub fn sequence(&self) -> Option<u64> {
         self.record.as_ref().map(|r| r.sequence)
-    }
-
-    /// Pod currently acting as primary, if any.
-    pub fn primary_pod(&self) -> Option<u32> {
-        self.primary.holder
     }
 
     /// Seat holders, by seat index.
@@ -407,16 +397,6 @@ impl ControlPlane {
             .count()
     }
 
-    /// Committed state record, if any.
-    pub fn record(&self) -> Option<&StateRecord> {
-        self.record.as_ref()
-    }
-
-    /// Image prepared by the primary for the committed record, if any.
-    pub fn image(&self) -> Option<&Image> {
-        self.image.as_ref()
-    }
-
     /// Sequence seat `index` last served to its clients, while its holder
     /// is alive and still holds the seat.
     pub fn seat_served(&self, index: usize) -> Option<u64> {
@@ -424,16 +404,6 @@ impl ControlPlane {
         let h = s.holder?;
         let p = &self.pods[h as usize];
         (p.alive && p.seat == Some(index as u8)).then_some(s.served)?
-    }
-
-    /// Model time at which `sequence` was committed.
-    pub fn commit_ns(&self, sequence: u64) -> Option<u64> {
-        self.commit_at.get(&sequence).copied()
-    }
-
-    /// Number of Pods ever added (live or not).
-    pub fn pod_count(&self) -> u32 {
-        self.pods.len() as u32
     }
 
     /// Whether Pod `pod` is running.
@@ -1154,7 +1124,7 @@ mod tests {
     fn cold_start_elects_seats_primary_and_publishes() {
         let cp = run(50, 240, 1);
         assert_eq!(cp.stats.primary_terms, 1, "{:?}", cp.stats);
-        assert!(cp.primary_pod().is_some());
+        assert!(cp.primary.holder.is_some());
         assert_eq!(
             cp.seat_holders().iter().filter(|s| s.is_some()).count(),
             3,
@@ -1175,27 +1145,27 @@ mod tests {
     #[test]
     fn primary_failover_and_growth() {
         let mut cp = run(40, 240, 3);
-        let first = cp.primary_pod().unwrap();
+        let first = cp.primary.holder.unwrap();
         let seq = cp.sequence().unwrap();
         cp.crash(first);
-        let t = cp.now_ns();
+        let t = cp.now;
         cp.advance_to(t + 180_000_000_000);
-        let second = cp.primary_pod().unwrap();
+        let second = cp.primary.holder.unwrap();
         assert_ne!(first, second);
         assert_eq!(cp.stats.primary_terms, 2);
         assert_eq!(cp.stats.dual_primary, 0);
         cp.add_pod();
-        let t = cp.now_ns();
+        let t = cp.now;
         cp.advance_to(t + 60_000_000_000);
         assert!(cp.sequence().unwrap() > seq, "growth publishes");
         cp.restart(first);
-        let t = cp.now_ns();
+        let t = cp.now;
         cp.advance_to(t + 60_000_000_000);
         assert!(cp.approximate_bytes() > 0);
     }
 
     fn members(cp: &ControlPlane) -> usize {
-        cp.image().map_or(0, |i| i.publication.members.len())
+        cp.image.as_ref().map_or(0, |i| i.publication.members.len())
     }
 
     #[test]
@@ -1203,10 +1173,10 @@ mod tests {
         const S: u64 = 1_000_000_000;
         let mut cp = run(30, 240, 5);
         assert_eq!(members(&cp), 30);
-        let mv = cp.record().unwrap().membership_version;
-        let victim = (0..30).find(|p| Some(*p) != cp.primary_pod()).unwrap();
+        let mv = cp.record.as_ref().unwrap().membership_version;
+        let victim = (0..30).find(|p| Some(*p) != cp.primary.holder).unwrap();
         cp.crash(victim);
-        let t = cp.now_ns();
+        let t = cp.now;
         // Before the node monitor grace plus the readiness grace: kept.
         cp.advance_to(t + 39 * S);
         assert!(cp.node_ready(victim));
@@ -1214,17 +1184,17 @@ mod tests {
         assert!(!cp.node_ready(victim));
         cp.advance_to(t + 65 * S);
         assert_eq!(members(&cp), 30, "dropped inside the grace");
-        assert_eq!(cp.record().unwrap().membership_version, mv);
+        assert_eq!(cp.record.as_ref().unwrap().membership_version, mv);
         // One pass period after both graces: gone, in one version.
         cp.advance_to(t + 85 * S);
         assert_eq!(members(&cp), 29);
-        assert_eq!(cp.record().unwrap().membership_version, mv + 1);
+        assert_eq!(cp.record.as_ref().unwrap().membership_version, mv + 1);
         cp.restart(victim);
         assert!(cp.node_ready(victim));
-        let t = cp.now_ns();
+        let t = cp.now;
         cp.advance_to(t + 15 * S);
         assert_eq!(members(&cp), 30);
-        assert_eq!(cp.record().unwrap().membership_version, mv + 2);
+        assert_eq!(cp.record.as_ref().unwrap().membership_version, mv + 2);
     }
 
     /// Known issue 14: with reports only from serving dataplanes, a Pod
@@ -1254,7 +1224,7 @@ mod tests {
         // Woken by the watch: the first member joins after the debounce.
         cp.advance_to(122 * S);
         assert_eq!(members(&cp), 1);
-        let mv = cp.record().unwrap().membership_version;
+        let mv = cp.record.as_ref().unwrap().membership_version;
         for p in 1..40 {
             cp.report_serving(p);
             cp.advance_to(122 * S + u64::from(p) * S / 10);
@@ -1265,18 +1235,18 @@ mod tests {
         cp.advance_to(160 * S);
         assert_eq!(members(&cp), 40);
         assert!(
-            cp.record().unwrap().membership_version <= mv + 2,
+            cp.record.as_ref().unwrap().membership_version <= mv + 2,
             "joins are batched"
         );
         // A crash and restart keeps the report: no new version.
-        let mv = cp.record().unwrap().membership_version;
-        let victim = (0..40).find(|p| Some(*p) != cp.primary_pod()).unwrap();
+        let mv = cp.record.as_ref().unwrap().membership_version;
+        let victim = (0..40).find(|p| Some(*p) != cp.primary.holder).unwrap();
         cp.crash(victim);
         cp.advance_to(170 * S);
         cp.restart(victim);
         cp.advance_to(240 * S);
         assert!(cp.reported(victim));
-        assert_eq!(cp.record().unwrap().membership_version, mv);
+        assert_eq!(cp.record.as_ref().unwrap().membership_version, mv);
     }
 
     /// Known issue 36: the primary publishes each commit on its Lease, so
@@ -1289,18 +1259,18 @@ mod tests {
         let seq = cp.sequence().unwrap();
         let holders = cp.seat_holders();
         let victim = (0..30)
-            .find(|p| Some(*p) != cp.primary_pod() && !holders.contains(&Some(*p)))
+            .find(|p| Some(*p) != cp.primary.holder && !holders.contains(&Some(*p)))
             .unwrap();
         cp.crash(victim);
         // Step until the commit that drops the victim, then check every
         // seat 1.1 s later.
-        let mut t = cp.now_ns();
+        let mut t = cp.now;
         while cp.sequence() == Some(seq) {
             t += S / 100;
             cp.advance_to(t);
             assert!(t < 400 * S, "no commit");
         }
-        let committed = cp.commit_ns(cp.sequence().unwrap()).unwrap();
+        let committed = cp.commit_at[&cp.sequence().unwrap()];
         cp.advance_to(committed + S + S / 10);
         let seq = cp.sequence();
         let seats: Vec<usize> = (0..annotations::MAX_SEATS)
@@ -1337,19 +1307,19 @@ mod tests {
             let holders = cp.seat_holders();
             let victim = (0..30)
                 .find(|p| {
-                    Some(*p) != cp.primary_pod()
+                    Some(*p) != cp.primary.holder
                         && !holders.contains(&Some(*p))
                         && cp.node_ready(*p)
                 })
                 .unwrap();
             cp.crash(victim);
-            let mut t = cp.now_ns();
+            let mut t = cp.now;
             while cp.sequence() == Some(seq) {
                 t += S / 100;
                 cp.advance_to(t);
                 assert!(t < 1_000 * S, "no commit");
             }
-            let committed = cp.commit_ns(cp.sequence().unwrap()).unwrap();
+            let committed = cp.commit_at[&cp.sequence().unwrap()];
             overlapped += cp
                 .pods
                 .iter()
@@ -1378,38 +1348,38 @@ mod tests {
     fn quick_restart_keeps_membership() {
         const S: u64 = 1_000_000_000;
         let mut cp = run(30, 240, 5);
-        let mv = cp.record().unwrap().membership_version;
-        let victim = (0..30).find(|p| Some(*p) != cp.primary_pod()).unwrap();
+        let mv = cp.record.as_ref().unwrap().membership_version;
+        let victim = (0..30).find(|p| Some(*p) != cp.primary.holder).unwrap();
         cp.crash(victim);
-        let t = cp.now_ns();
+        let t = cp.now;
         cp.advance_to(t + 30 * S);
         cp.restart(victim);
         cp.advance_to(t + 200 * S);
         assert!(cp.node_ready(victim));
         assert_eq!(members(&cp), 30);
-        assert_eq!(cp.record().unwrap().membership_version, mv);
+        assert_eq!(cp.record.as_ref().unwrap().membership_version, mv);
     }
 
     #[test]
     fn accessors_and_removal() {
         let mut cp = run(30, 240, 5);
         let seq = cp.sequence().unwrap();
-        assert_eq!(cp.record().map(|r| r.sequence), Some(seq));
-        assert_eq!(cp.image().map(|i| i.record.sequence), Some(seq));
-        assert!(cp.commit_ns(seq).is_some_and(|t| t <= cp.now_ns()));
+        assert_eq!(cp.record.as_ref().map(|r| r.sequence), Some(seq));
+        assert_eq!(cp.image.as_ref().map(|i| i.record.sequence), Some(seq));
+        assert!(cp.commit_at.get(&seq).copied().is_some_and(|t| t <= cp.now));
         let served: Vec<_> = (0..annotations::MAX_SEATS)
             .filter_map(|i| cp.seat_served(i))
             .collect();
         assert_eq!(served.len(), cp.ready_seats(), "{served:?}");
-        assert_eq!(cp.pod_count(), 30);
-        let mv = cp.record().unwrap().membership_version;
-        let victim = (0..30).find(|p| Some(*p) != cp.primary_pod()).unwrap();
+        assert_eq!(cp.pods.len() as u32, 30);
+        let mv = cp.record.as_ref().unwrap().membership_version;
+        let victim = (0..30).find(|p| Some(*p) != cp.primary.holder).unwrap();
         cp.remove_pod(victim);
         cp.remove_pod(victim);
         assert!(!cp.alive(victim));
-        let t = cp.now_ns();
+        let t = cp.now;
         cp.advance_to(t + 60_000_000_000);
-        assert!(cp.record().unwrap().membership_version > mv);
+        assert!(cp.record.as_ref().unwrap().membership_version > mv);
         assert_eq!(cp.seat_served(99), None);
     }
 
