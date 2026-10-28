@@ -1,0 +1,23 @@
+# Pins the gantry DaemonSet to a dev image built from this branch by the
+# images.yaml workflow, and raises the racer mirror retry budget.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unbounded-component-overrides
+  namespace: unbounded-system
+data:
+  gantry.yaml: |
+    apiVersion: overrides.unbounded-cloud.io/v1alpha1
+    overrides:
+      - component: gantry
+        kind: DaemonSet
+        patch:
+          spec:
+            template:
+              spec:
+                containers:
+                  - name: gantry
+                    image: ghcr.io/azure/gantry:d226e8db6efab49d5b413b80f699d41f0c863239
+                    env:
+                      - name: GANTRY_RACER_RETRY_BUDGET
+                        value: 120s

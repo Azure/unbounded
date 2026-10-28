@@ -22,6 +22,13 @@ BUSYBOX=mcr.microsoft.com/azurelinux/busybox:1.36
 
 mkdir -p "$OUT"
 
+# Refuse to touch a cluster other than the one named in BENCH_CONTEXT. The
+# harness deletes images and writes host files on every node it can reach.
+if [[ -z ${BENCH_CONTEXT:-} || $(kubectl config current-context) != "$BENCH_CONTEXT" ]]; then
+	echo "set BENCH_CONTEXT to the current kubectl context to confirm the target cluster" >&2
+	exit 1
+fi
+
 origin_tx() {
 	kubectl -n "$NS" exec "$(tools_pod)" -- wget -qO- http://origin:5001/metrics |
 		awk '$1 == "process_network_transmit_bytes_total" {printf "%.0f\n", $2}'
