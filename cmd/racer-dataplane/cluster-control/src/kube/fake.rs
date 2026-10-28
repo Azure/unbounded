@@ -1,18 +1,18 @@
 //! In-memory Kubernetes API server for tests.
 //!
-//! It serves a plain-value [`crate::apiserver::Store`] (GET, list, PUT with
-//! resourceVersion CAS, POST, merge and JSON PATCH, watch, field selectors,
-//! fault injection) over TLS on loopback.
+//! It serves a plain-value [`Store`] (GET, list, PUT with resourceVersion
+//! CAS, POST, merge and JSON PATCH, watch with compaction (410 Gone), field
+//! selectors, fault injection) over TLS on loopback.
 
 use super::{Kube, KubeConfig};
 use crate::{
-    apiserver::{Store, field_name},
     exec::{self, Executor, Listener, Signal},
     http::{self, Conn, TlsStream},
 };
 use serde_json::{Value, json};
 use std::{
     cell::RefCell,
+    collections::{BTreeMap, VecDeque},
     future::Future,
     rc::Rc,
     sync::{
@@ -122,7 +122,7 @@ impl FakeApi {
         if let Some(c) = self.0.counter.borrow().as_ref() {
             c.fetch_add(1, SeqCst);
         }
-        let (status, value, _) = self.0.store.borrow_mut().handle(method, target, body, 0);
+        let (status, value) = self.0.store.borrow_mut().handle(method, target, body);
         if (200..300).contains(&status) && method != "GET" {
             self.0.changed.notify();
         }
@@ -298,4 +298,409 @@ where
         body(api, kube).await;
     });
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Watch event kind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventKind {
+    Added,
+    Modified,
+    Deleted,
+}
+
+impl EventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Added => "ADDED",
+            Self::Modified => "MODIFIED",
+            Self::Deleted => "DELETED",
+        }
+    }
+}
+
+/// One logged change.
+#[derive(Clone, Debug)]
+pub struct Event {
+    pub version: u64,
+    pub path: String,
+    pub kind: EventKind,
+    pub object: Value,
+}
+
+/// The watch start is older than the retained log.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Gone;
+
+type Hook = Box<dyn Fn(&str, &Value) -> Option<(u16, Value)>>;
+
+/// The API server state.
+pub struct Store {
+    objects: BTreeMap<String, Value>,
+    log: VecDeque<Event>,
+    version: u64,
+    compacted: u64,
+    uids: u64,
+    faults: VecDeque<u16>,
+    post_hook: Option<Hook>,
+}
+
+impl Store {
+    pub fn new() -> Self {
+        Self {
+            objects: BTreeMap::new(),
+            log: VecDeque::new(),
+            version: 10,
+            compacted: 0,
+            uids: 1,
+            faults: VecDeque::new(),
+            post_hook: None,
+        }
+    }
+
+    /// Current resourceVersion.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    fn bump(&mut self) -> u64 {
+        self.version += 1;
+        self.version
+    }
+
+    /// Store an object, set its resourceVersion and a UID and name if missing.
+    pub fn put_object(&mut self, path: &str, mut object: Value) -> Value {
+        let v = self.bump();
+        let existed = self.objects.contains_key(path);
+        object["metadata"]["resourceVersion"] = v.to_string().into();
+        if str_at(&object, &["metadata", "uid"]).is_empty() {
+            let n = self.uids;
+            self.uids += 1;
+            object["metadata"]["uid"] = format!("00000000-0000-4000-8000-{n:012x}").into();
+        }
+        if str_at(&object, &["metadata", "name"]).is_empty() {
+            object["metadata"]["name"] = path.rsplit('/').next().unwrap_or_default().into();
+        }
+        self.objects.insert(path.into(), object.clone());
+        let kind = if existed {
+            EventKind::Modified
+        } else {
+            EventKind::Added
+        };
+        self.log.push_back(Event {
+            version: v,
+            path: path.into(),
+            kind,
+            object: object.clone(),
+        });
+        object
+    }
+
+    /// Delete an object. Returns it when it existed.
+    pub fn delete_object(&mut self, path: &str) -> Option<Value> {
+        let o = self.objects.remove(path)?;
+        let v = self.bump();
+        self.log.push_back(Event {
+            version: v,
+            path: path.into(),
+            kind: EventKind::Deleted,
+            object: o.clone(),
+        });
+        Some(o)
+    }
+
+    pub fn object(&self, path: &str) -> Option<&Value> {
+        self.objects.get(path)
+    }
+
+    /// Forget watch history so older resourceVersions get 410.
+    pub fn compact(&mut self) {
+        self.compacted = self.version;
+        self.log.clear();
+    }
+
+    /// Handle POSTs, for example TokenReview.
+    pub fn on_post(&mut self, hook: impl Fn(&str, &Value) -> Option<(u16, Value)> + 'static) {
+        self.post_hook = Some(Box::new(hook));
+    }
+
+    /// Fail the next requests with these statuses.
+    pub fn fail_next(&mut self, statuses: &[u16]) {
+        self.faults.extend(statuses.iter().copied());
+    }
+
+    /// Direct children of `collection`, optionally with this name.
+    pub fn list(&self, collection: &str, name: Option<&str>) -> Vec<Value> {
+        let prefix = format!("{collection}/");
+        self.objects
+            .range(prefix.clone()..)
+            .take_while(|(k, _)| k.starts_with(&prefix))
+            .filter(|(k, _)| !k[prefix.len()..].contains('/'))
+            .filter(|(_, v)| name.is_none_or(|n| str_at(v, &["metadata", "name"]) == n))
+            .map(|(_, v)| v.clone())
+            .collect()
+    }
+
+    /// Serve one request. `target` is a path with an optional query.
+    pub fn handle(&mut self, method: &str, target: &str, body: &[u8]) -> (u16, Value) {
+        if let Some(s) = self.faults.pop_front() {
+            return (s, json!({"kind":"Status","code":s}));
+        }
+        let (path, query) = match target.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (target, None),
+        };
+        let request: Value = if body.is_empty() {
+            Value::Null
+        } else {
+            match serde_json::from_slice(body) {
+                Ok(v) => v,
+                Err(_) => return (400, json!({})),
+            }
+        };
+        self.apply(method, path, query, &request)
+    }
+
+    fn apply(
+        &mut self,
+        method: &str,
+        path: &str,
+        query: Option<&str>,
+        request: &Value,
+    ) -> (u16, Value) {
+        let name = field_name(query.unwrap_or(""));
+        match method {
+            "GET" => {
+                if let Some(o) = self.objects.get(path).cloned() {
+                    return (200, o);
+                }
+                let items = self.list(path, name.as_deref());
+                if items.is_empty() && !path.ends_with('s') {
+                    return (404, json!({"code":404}));
+                }
+                (
+                    200,
+                    json!({"metadata":{"resourceVersion":self.version.to_string()},"items":items}),
+                )
+            }
+            "PUT" => {
+                let Some(current) = self.object(path) else {
+                    return (404, json!({}));
+                };
+                let rv = str_at(request, &["metadata", "resourceVersion"]);
+                if rv != str_at(current, &["metadata", "resourceVersion"]) {
+                    return (409, json!({"code":409}));
+                }
+                let mut next = request.clone();
+                next["metadata"]["uid"] = current["metadata"]["uid"].clone();
+                (200, self.put_object(path, next))
+            }
+            "POST" => {
+                if let Some(r) = self.post_hook.as_ref().and_then(|h| h(path, request)) {
+                    return r;
+                }
+                let name = str_at(request, &["metadata", "name"]).to_owned();
+                let full = format!("{path}/{name}");
+                if name.is_empty() || self.object(&full).is_some() {
+                    return (409, json!({}));
+                }
+                (201, self.put_object(&full, request.clone()))
+            }
+            "PATCH" => {
+                let Some(mut current) = self.object(path).cloned() else {
+                    return (404, json!({}));
+                };
+                if request.is_array() {
+                    if let Err(s) = json_patch(&mut current, request) {
+                        return (s, json!({}));
+                    }
+                } else {
+                    merge(&mut current, request);
+                }
+                (200, self.put_object(path, current))
+            }
+            "DELETE" => match self.delete_object(path) {
+                Some(o) => (200, o),
+                None => (404, json!({"code":404})),
+            },
+            _ => (405, json!({})),
+        }
+    }
+
+    /// Events under `collection` after `from`, optionally for one name.
+    pub fn events_since(
+        &self,
+        collection: &str,
+        name: Option<&str>,
+        from: u64,
+    ) -> Result<Vec<Event>, Gone> {
+        if from < self.compacted {
+            return Err(Gone);
+        }
+        let prefix = format!("{collection}/");
+        Ok(self
+            .log
+            .iter()
+            .filter(|e| {
+                e.version > from
+                    && e.path.starts_with(&prefix)
+                    && name.is_none_or(|n| str_at(&e.object, &["metadata", "name"]) == n)
+            })
+            .cloned()
+            .collect())
+    }
+}
+
+fn str_at<'a>(v: &'a Value, path: &[&str]) -> &'a str {
+    let mut cur = v;
+    for p in path {
+        cur = &cur[*p];
+    }
+    cur.as_str().unwrap_or("")
+}
+
+/// `metadata.name` from a field selector query.
+pub fn field_name(query: &str) -> Option<String> {
+    query
+        .split('&')
+        .find_map(|kv| {
+            kv.strip_prefix("fieldSelector=metadata.name%3D")
+                .or_else(|| kv.strip_prefix("fieldSelector=metadata.name="))
+        })
+        .map(str::to_owned)
+}
+
+/// RFC 7386 merge patch.
+pub fn merge(target: &mut Value, patch: &Value) {
+    if let Value::Object(p) = patch {
+        if !target.is_object() {
+            *target = json!({});
+        }
+        let t = target.as_object_mut().expect("object");
+        for (k, v) in p {
+            if v.is_null() {
+                t.remove(k);
+            } else {
+                merge(t.entry(k.clone()).or_insert(Value::Null), v);
+            }
+        }
+    } else {
+        *target = patch.clone();
+    }
+}
+
+/// RFC 6902 subset: add, replace, remove, test.
+pub fn json_patch(target: &mut Value, ops: &Value) -> Result<(), u16> {
+    for op in ops.as_array().ok_or(400u16)? {
+        let pointer = op["path"].as_str().ok_or(400u16)?.to_owned();
+        match op["op"].as_str().ok_or(400u16)? {
+            "test" => {
+                if target.pointer(&pointer) != Some(&op["value"]) {
+                    return Err(422);
+                }
+            }
+            "replace" => *target.pointer_mut(&pointer).ok_or(422u16)? = op["value"].clone(),
+            "add" => {
+                let (parent, key) = pointer.rsplit_once('/').ok_or(400u16)?;
+                let key = key.replace("~1", "/").replace("~0", "~");
+                match target.pointer_mut(parent).ok_or(422u16)? {
+                    Value::Object(m) => {
+                        m.insert(key, op["value"].clone());
+                    }
+                    Value::Array(a) if key == "-" => a.push(op["value"].clone()),
+                    _ => return Err(422),
+                }
+            }
+            "remove" => {
+                let (parent, key) = pointer.rsplit_once('/').ok_or(400u16)?;
+                let key = key.replace("~1", "/").replace("~0", "~");
+                target
+                    .pointer_mut(parent)
+                    .and_then(Value::as_object_mut)
+                    .and_then(|m| m.remove(&key))
+                    .ok_or(422u16)?;
+            }
+            _ => return Err(400),
+        }
+    }
+    Ok(())
+}
+
+mod store_tests {
+    use super::*;
+
+    const LEASES: &str = "/apis/coordination.k8s.io/v1/namespaces/ns/leases";
+
+    fn lease(name: &str) -> Value {
+        json!({"metadata": {"name": name}, "spec": {}})
+    }
+
+    #[test]
+    fn cas_put_and_create() {
+        let mut s = Store::new();
+        let body = serde_json::to_vec(&lease("a")).unwrap();
+        let (st, created) = s.handle("POST", LEASES, &body);
+        assert_eq!(st, 201);
+        assert_eq!(s.handle("POST", LEASES, &body).0, 409);
+        let path = format!("{LEASES}/a");
+        let mut next = created.clone();
+        next["spec"]["holderIdentity"] = "p".into();
+        let (st, put) = s.handle("PUT", &path, &serde_json::to_vec(&next).unwrap());
+        assert_eq!(st, 200);
+        assert_eq!(put["metadata"]["uid"], created["metadata"]["uid"]);
+        // Stale resourceVersion conflicts.
+        assert_eq!(
+            s.handle("PUT", &path, &serde_json::to_vec(&next).unwrap())
+                .0,
+            409
+        );
+        assert_eq!(s.handle("PUT", &format!("{LEASES}/x"), b"{}").0, 404);
+        assert_eq!(s.handle("GET", &format!("{LEASES}/x"), b"").0, 404);
+        assert_eq!(s.handle("GET", "/x/y", b"{").0, 400);
+    }
+
+    #[test]
+    fn list_selectors_and_patches() {
+        let mut s = Store::new();
+        s.put_object(&format!("{LEASES}/a"), lease("a"));
+        s.put_object(&format!("{LEASES}/b"), lease("b"));
+        s.put_object(&format!("{LEASES}/b/sub"), lease("sub"));
+        let (_, l) = s.handle("GET", LEASES, b"");
+        assert_eq!(l["items"].as_array().unwrap().len(), 2);
+        let (_, l) = s.handle(
+            "GET",
+            &format!("{LEASES}?fieldSelector=metadata.name%3Db"),
+            b"",
+        );
+        assert_eq!(l["items"].as_array().unwrap().len(), 1);
+        let p = format!("{LEASES}/a");
+        assert_eq!(s.handle("PATCH", &p, br#"{"spec":{"x":1}}"#).0, 200);
+        assert_eq!(s.object(&p).unwrap()["spec"]["x"], 1);
+        let ops = br#"[{"op":"test","path":"/spec/x","value":2}]"#;
+        assert_eq!(s.handle("PATCH", &p, ops).0, 422);
+        let ops = br#"[{"op":"test","path":"/spec/x","value":1},{"op":"remove","path":"/spec/x"}]"#;
+        assert_eq!(s.handle("PATCH", &p, ops).0, 200);
+        assert!(s.object(&p).unwrap()["spec"].get("x").is_none());
+        assert_eq!(s.handle("DELETE", &p, b"").0, 200);
+        assert_eq!(s.handle("DELETE", &p, b"").0, 404);
+        assert!(matches!(&s.log.back().unwrap().kind, EventKind::Deleted));
+        let start = 10;
+        assert_eq!(
+            s.events_since(LEASES, Some("b"), start).unwrap().len(),
+            1,
+            "history is kept until compaction"
+        );
+        s.compact();
+        assert_eq!(s.events_since(LEASES, None, start).unwrap_err(), Gone);
+    }
+
+    #[test]
+    fn faults_and_post_hook() {
+        let mut s = Store::new();
+        s.fail_next(&[500, 503]);
+        assert_eq!(s.handle("GET", LEASES, b"").0, 500);
+        assert_eq!(s.handle("GET", LEASES, b"").0, 503);
+        assert_eq!(s.handle("GET", LEASES, b"").0, 200);
+        s.on_post(|_, _| Some((201, json!({"status": {"authenticated": true}}))));
+        assert_eq!(s.handle("POST", "/apis/review", b"{}").0, 201);
+    }
 }

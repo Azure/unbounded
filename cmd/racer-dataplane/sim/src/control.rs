@@ -16,7 +16,6 @@ use std::{
 
 use racer_cluster_control::{
     PrimaryView, SeatPolicy, annotations,
-    apiserver::{Store, TokenBucket},
     authority::{
         election::{self, LeaseObservation, LeaseSpec},
         keyring::Policy,
@@ -103,7 +102,6 @@ pub struct Settings {
     /// Invariant check period and convergence bound after faults heal.
     pub check_ns: Nanos,
     pub converge_ns: Nanos,
-    pub image_bytes_per_member: u64,
     /// Crash to Node `Ready=Unknown` (`node-monitor-grace-period`); 0 never
     /// marks crashed Nodes.
     pub node_monitor_grace_ns: Nanos,
@@ -148,7 +146,6 @@ impl Default for Settings {
             slow_delay_ns: 20 * SECONDS,
             check_ns: 10 * SECONDS,
             converge_ns: 180 * SECONDS,
-            image_bytes_per_member: 128,
             node_monitor_grace_ns: 40 * SECONDS,
             auth: AuthModel::Cached,
             auth_qps: limits::AUTH_API_QPS,
@@ -203,7 +200,6 @@ impl Settings {
                 "slow_delay_ns" => self.slow_delay_ns = u()?,
                 "check_ns" => self.check_ns = u()?.max(MILLIS),
                 "converge_ns" => self.converge_ns = u()?,
-                "image_bytes_per_member" => self.image_bytes_per_member = u()?,
                 "node_monitor_grace_ns" => self.node_monitor_grace_ns = u()?,
                 "follow_read_ns" => self.follow_read_ns = u()?,
                 "auth" => {
@@ -425,6 +421,28 @@ impl Pod {
     }
 }
 
+/// Kubernetes API server rate limit: `qps` sustained, `burst` capacity.
+struct ApiLimit {
+    qps: f64,
+    burst: f64,
+    tokens: f64,
+    at_ns: Nanos,
+}
+
+impl ApiLimit {
+    /// Take a token at `now`; false answers 429.
+    fn admit(&mut self, now: Nanos) -> bool {
+        let elapsed = now.saturating_sub(self.at_ns) as f64 / 1e9;
+        self.at_ns = self.at_ns.max(now);
+        self.tokens = (self.tokens + elapsed * self.qps).min(self.burst);
+        let ok = self.tokens >= 1.0;
+        if ok {
+            self.tokens -= 1.0;
+        }
+        ok
+    }
+}
+
 /// Token cache key of client `c` (production hashes the token).
 fn client_key(c: u32) -> TokenKey {
     let mut k = [0u8; 32];
@@ -471,7 +489,7 @@ fn identity(pod: u32) -> String {
 pub struct ControlSim {
     pub settings: Settings,
     engine: Engine<Ev>,
-    api: Store,
+    api: ApiLimit,
     seats: Vec<Seat>,
     rng: SplitMix64,
     /// Origin of the simulated monotonic clock; wall time starts at 1.8e9
@@ -513,8 +531,6 @@ pub struct ControlSim {
     /// Time after which every live client must converge.
     settled_ns: Nanos,
     commits: Vec<(Nanos, u64, u64)>,
-    /// First time any client applied each membership version.
-    first_adopt: HashMap<u64, Nanos>,
     /// Content hash fingerprint per committed sequence.
     hashes: HashMap<u64, u64>,
     last_primary: Option<u32>,
@@ -535,25 +551,15 @@ pub struct ControlSim {
 impl ControlSim {
     pub fn new(settings: Settings, seed: u64, faults: Vec<CtlFault>) -> Self {
         let initial = settings.initial_pods.clamp(1, settings.pods.max(1));
-        let mut api = Store::new();
-        api.set_admission(Some(TokenBucket::new(
-            settings.api_qps,
-            settings.api_burst,
-            settings.api_latency_ns,
-        )));
-        api.on_post(|path, _| {
-            path.ends_with("/tokenreviews")
-                .then(|| (201, json!({"status": {"authenticated": true}})))
-        });
-        api.put_object(DAEMONSET, json!({"metadata": {"name": "racer-dataplane"}}));
-        api.put_object(
-            SERVICE_ACCOUNT,
-            json!({"metadata": {"name": "racer-dataplane"}}),
-        );
         let mut sim = Self {
             rng: Streams::new(seed).stream(Role::Control, 0),
             engine: Engine::new(),
-            api,
+            api: ApiLimit {
+                qps: settings.api_qps,
+                burst: settings.api_burst,
+                tokens: settings.api_burst,
+                at_ns: 0,
+            },
             seats: (0..annotations::MAX_SEATS)
                 .map(|i| Seat {
                     lease: Lease {
@@ -588,7 +594,7 @@ impl ControlSim {
                 ..Default::default()
             },
             ownership: Ownership {
-                namespace: NS.into(),
+                namespace: "racer-system".into(),
                 daemonset: "racer-dataplane".into(),
                 uid: uuid(0, 0xd5),
                 service_account: "racer-dataplane".into(),
@@ -612,7 +618,6 @@ impl ControlSim {
             settled_ns: faults.iter().map(CtlFault::heals_at).max().unwrap_or(0),
             faults,
             commits: Vec::new(),
-            first_adopt: HashMap::new(),
             hashes: HashMap::new(),
             last_primary: None,
             primary_lost_ns: None,
@@ -677,12 +682,6 @@ impl ControlSim {
         );
         self.pods.push(Pod::new(0));
         self.schedule(self.engine.now(), c, PodEv::Lottery);
-        self.api
-            .put_object(&pod_path(c), json!({"metadata": {"name": format!("p{c}")}}));
-        self.api.put_object(
-            &node_path(c),
-            json!({"metadata": {"name": format!("n{c}")}}),
-        );
         self.state.push(State::Idle);
         self.epoch.push(0);
         self.seat.push(NO_SEAT);
@@ -736,8 +735,9 @@ impl ControlSim {
         self.engine.trace.record(at, tag, a, b);
     }
 
-    fn count_api(&mut self, at: Nanos, n: u64) {
-        let second = at / SECONDS;
+    /// Count `n` API calls toward the per-second peak.
+    fn api_calls(&mut self, n: u64) {
+        let second = self.engine.now() / SECONDS;
         if second != self.qps_second {
             self.qps_second = second;
             self.qps_count = 0;
@@ -747,13 +747,6 @@ impl ControlSim {
         if self.qps_count > peak {
             self.metrics.add("ctl_api_qps_peak", self.qps_count - peak);
         }
-    }
-
-    /// Lease and state API calls of the control plane.
-    fn lease_api(&mut self, reads: u64, writes: u64) {
-        self.metrics.add("ctl_api_lease_reads", reads);
-        self.metrics.add("ctl_api_lease_writes", writes);
-        self.count_api(self.engine.now(), reads + writes);
     }
 
     /// Fold control-plane changes into the client model after a step.
@@ -779,13 +772,6 @@ impl ControlSim {
             }
             let previous = self.seats[i].served;
             self.seats[i].served = served;
-            if let Some(t) = served
-                .filter(|_| previous.is_some())
-                .and_then(|q| self.commit_at.get(&q).copied())
-            {
-                self.metrics
-                    .observe("ctl_seat_lag_ns", at.saturating_sub(t));
-            }
             self.trace(at, 0xC4, i as u64, served.unwrap_or(u64::MAX));
             let waiters = std::mem::take(&mut self.seats[i].waiters);
             // One O(1) waker registration per waiter (`exec::Changed`).
@@ -823,7 +809,6 @@ impl ControlSim {
             return;
         };
         let (seq, mv) = (r.sequence, r.membership_version);
-        let bytes = r.publication_bytes;
         self.hashes.insert(seq, fingerprint(&r.content_hash));
         let last = self.commits.last().copied();
         let ok = last.is_none_or(|(_, s, m)| seq > s && mv >= m);
@@ -831,33 +816,20 @@ impl ControlSim {
             .check("ctl_sequence_monotonic", ok, at, None, || {
                 format!("{last:?} -> ({seq}, {mv})")
             });
-        if let Some((t, _, _)) = last {
-            self.metrics.observe("ctl_commit_interval_ns", at - t);
-        }
-        let image = self.image.as_ref().filter(|i| i.record.sequence == seq);
         if last.is_none_or(|(_, _, m)| m != mv) {
             self.metrics.incr("ctl_membership_versions");
-            if self.record {
-                match image {
-                    Some(i) => {
-                        let pods = i
-                            .publication
-                            .members
-                            .iter()
-                            .filter_map(|m| member_pod(&m.node.0))
-                            .collect();
-                        self.changes.memberships.push((mv, pods));
-                    }
-                    None => self.metrics.incr("ctl_membership_without_image"),
-                }
+            if self.record
+                && let Some(i) = self.image.as_ref().filter(|i| i.record.sequence == seq)
+            {
+                let pods = i
+                    .publication
+                    .members
+                    .iter()
+                    .filter_map(|m| member_pod(&m.node.0))
+                    .collect();
+                self.changes.memberships.push((mv, pods));
             }
         }
-        if let Some(d) = image.and_then(|i| i.delta.as_ref()) {
-            self.metrics.observe("ctl_delta_bytes", d.2.len() as u64);
-        }
-        self.metrics.incr("ctl_sequences");
-        self.metrics.add("ctl_publication_bytes", bytes);
-        self.metrics.observe("ctl_publication_bytes", bytes);
         self.commits.push((at, seq, mv));
         self.trace(at, 0xC3, seq, mv);
     }
@@ -944,7 +916,6 @@ impl ControlSim {
                     *pod = Pod::new(pod.epoch + 1);
                     self.schedule(now, p, PodEv::Lottery);
                     self.set_node_ready(p, true);
-                    self.metrics.incr("ctl_restarts");
                     if self.record {
                         self.changes.lives.push((p, Life::Restarted));
                     }
@@ -970,14 +941,12 @@ impl ControlSim {
             return;
         }
         let Some(s) = self.pick_seat(c, NO_SEAT) else {
-            self.metrics.incr("ctl_no_ready_seat");
             let d = self.backoff(c);
             self.engine.after(d, Ev::Enroll(c, e));
             return;
         };
         self.state[c as usize] = State::Enrolling;
         if !self.seats[s as usize].bootstraps.try_take() {
-            self.metrics.incr("ctl_bootstrap_overloaded");
             let d = self.backoff(c);
             self.engine.after(d, Ev::Enroll(c, e));
             return;
@@ -1020,54 +989,39 @@ impl ControlSim {
                 self.metrics.incr("ctl_auth_overloaded");
                 return false;
             };
-            if !wait.is_zero() {
-                self.metrics.incr("ctl_auth_waited");
-                self.metrics
-                    .observe("ctl_auth_wait_ns", wait.as_nanos() as u64);
-            }
             *latency += wait.as_nanos() as Nanos;
         }
-        let pod = pod_path(c);
-        let node = node_path(c);
-        let review_cached = cached && seat.auth.review(&key, at(now + *latency)).is_some();
-        let mut calls: Vec<(&str, &str, &[u8], &'static str)> = Vec::with_capacity(5);
-        if !review_cached {
-            calls.push(("POST", TOKEN_REVIEWS, b"{}", "ctl_api_tokenreviews"));
-        }
-        calls.push(("GET", &pod, b"", "ctl_api_gets"));
-        let bindings_index = calls.len();
-        calls.push(("GET", DAEMONSET, b"", "ctl_api_gets"));
-        calls.push(("GET", SERVICE_ACCOUNT, b"", "ctl_api_gets"));
-        calls.push(("GET", &node, b"", "ctl_api_gets"));
+        let (api, metrics) = (&mut self.api, &mut self.metrics);
+        let api_latency = self.settings.api_latency_ns;
         let mut issued = 0u32;
-        let mut throttled = false;
-        let mut i = 0;
-        while i < calls.len() {
-            if i == bindings_index && cached && seat.auth.bindings(at(now + *latency)).is_some() {
-                i += 2;
-                continue;
-            }
-            let (method, path, body, counter) = calls[i];
-            let (status, _, l) = self.api.handle(method, path, body, now + *latency);
+        let mut call = |counter: &'static str, latency: &mut Nanos| {
             issued += 1;
-            if status == 429 {
-                throttled = true;
-                break;
+            let ok = api.admit(now + *latency);
+            if ok {
+                metrics.incr(counter);
+                *latency += api_latency;
             }
-            self.metrics.incr(counter);
-            *latency += l;
-            if cached {
+            ok
+        };
+        let mut ok = cached && seat.auth.review(&key, at(now + *latency)).is_some() || {
+            let ok = call("ctl_api_tokenreviews", latency);
+            if ok && cached {
                 let t = at(now + *latency);
-                if method == "POST" {
-                    seat.auth
-                        .put_review(key, Reviewed::default(), Duration::from_secs(3600), t);
-                } else if i == bindings_index + 1 {
-                    seat.auth.put_bindings(Bindings::default(), t);
-                }
+                seat.auth
+                    .put_review(key, Reviewed::default(), Duration::from_secs(3600), t);
             }
-            i += 1;
+            ok
+        };
+        ok = ok && call("ctl_api_gets", latency);
+        if ok && !(cached && seat.auth.bindings(at(now + *latency)).is_some()) {
+            ok = call("ctl_api_gets", latency) && call("ctl_api_gets", latency);
+            if ok && cached {
+                seat.auth
+                    .put_bindings(Bindings::default(), at(now + *latency));
+            }
         }
-        if throttled {
+        ok = ok && call("ctl_api_gets", latency);
+        if !ok {
             if cached {
                 seat.budget.throttled(at(now + *latency));
                 seat.budget.refund(reserved.saturating_sub(issued));
@@ -1077,8 +1031,10 @@ impl ControlSim {
             seat.auth
                 .put_caller(key, (), Duration::from_secs(3600), at(now + *latency));
         }
-        self.count_api(now, u64::from(issued));
-        !throttled
+        self.metrics
+            .add("ctl_apiserver_requests", u64::from(issued));
+        self.api_calls(u64::from(issued));
+        ok
     }
 
     fn poll(&mut self, c: u32, e: u32, now: Nanos) {
@@ -1091,14 +1047,10 @@ impl ControlSim {
         let mut s = self.seat[c as usize];
         if s == NO_SEAT || self.seats[s as usize].served.is_none() {
             let Some(next) = self.pick_seat(c, s) else {
-                self.metrics.incr("ctl_no_ready_seat");
                 let d = self.backoff(c);
                 self.engine.after(d, Ev::Poll(c, e));
                 return;
             };
-            if s != NO_SEAT {
-                self.metrics.incr("ctl_seat_failovers");
-            }
             s = next;
             self.seat[c as usize] = s;
         }
@@ -1110,7 +1062,6 @@ impl ControlSim {
             Ok(Poll::Wait) => self.seats[s as usize].waiters.push((c, e)),
             Err(ProtocolFailure::Unavailable) => {
                 // Ahead of this seat (`check_ahead`): 503, try another.
-                self.metrics.incr("ctl_503_ahead");
                 if let Some(next) = self.pick_seat(c, s) {
                     self.seat[c as usize] = next;
                 }
@@ -1118,7 +1069,6 @@ impl ControlSim {
                 self.engine.after(d, Ev::Poll(c, e));
             }
             Err(_) => {
-                self.metrics.incr("ctl_poll_overloaded");
                 let d = self.backoff(c);
                 self.engine.after(d, Ev::Poll(c, e));
             }
@@ -1246,7 +1196,6 @@ impl ControlSim {
                 )
             }
         };
-        self.metrics.add("ctl_reply_bytes", bytes);
         self.metrics.incr("ctl_client_replies");
         let write =
             self.settings.write_ns + bytes.saturating_mul(SECONDS) / self.settings.slot_bps.max(1);
@@ -1279,28 +1228,15 @@ impl ControlSim {
             self.metrics.incr("ctl_reports");
         }
         // Lag from the commit, or from the client's start if later.
-        if let Some(t) = self.commit_at.get(&seq).copied() {
-            let from = t.max(self.started_ns[c as usize]);
+        if let Some(t) = self.commit_at.get(&seq) {
+            let from = (*t).max(self.started_ns[c as usize]);
             self.metrics
                 .observe("ctl_client_lag_ns", now.saturating_sub(from));
-            if old_seq > 0 && mv != old_mv {
-                self.metrics
-                    .observe("ctl_member_lag_ns", now.saturating_sub(t));
-            }
-        }
-        if mv != old_mv {
-            // Window in which a peer that adopted `mv` asks one still behind.
-            let first = *self.first_adopt.entry(mv).or_insert(now);
-            if old_seq > 0 {
-                self.metrics
-                    .observe("ctl_adopt_spread_ns", now.saturating_sub(first));
-            }
         }
         self.trace(now, 0xD2, u64::from(c), seq);
     }
 
     fn fault(&mut self, i: usize, now: Nanos) {
-        self.metrics.incr("ctl_faults");
         self.trace(now, 0xF0, i as u64, 0);
         let primary = self.primary.holder.filter(|p| self.alive(*p));
         let choose = |sim: &mut Self, fraction: f64| -> Vec<usize> {
@@ -1436,13 +1372,6 @@ impl ControlSim {
     /// client that started at least [`Self::bound`] ago must have applied
     /// every sequence committed `converge_ns` ago.
     fn check(&mut self, now: Nanos) {
-        let current = self.commits.last().map_or(0, |c| c.1);
-        for c in 0..self.state.len() {
-            if self.state[c] == State::Polling {
-                let behind = current.saturating_sub(self.applied_seq[c]);
-                self.metrics.observe("ctl_sequences_behind", behind);
-            }
-        }
         let bound = self.settings.converge_ns;
         if now < self.settled_ns.saturating_add(bound) {
             return;
@@ -1503,8 +1432,6 @@ impl ControlSim {
             ),
             ("ctl_engine", self.engine.approximate_bytes()),
             ("ctl_clients", clients + seats),
-            // Two small JSON objects per Pod in the fake API server.
-            ("ctl_api_store", self.api.len() * 256),
             (
                 "ctl_commits",
                 self.commits.capacity() * 24 + self.hashes.capacity() * 24,
@@ -1513,14 +1440,6 @@ impl ControlSim {
     }
 
     pub fn report(&mut self, scenario: &str, seed: u64) -> Value {
-        let st = self.api.stats.clone();
-        for (k, v) in [
-            ("ctl_apiserver_requests", st.requests),
-            ("ctl_apiserver_throttled", st.throttled),
-        ] {
-            let have = self.metrics.get(k);
-            self.metrics.add(k, v.saturating_sub(have));
-        }
         let memory = self.memory();
         let total: usize = memory.iter().map(|(_, b)| b).sum();
         let pods = self.state.len().max(1);
@@ -1607,7 +1526,7 @@ impl ControlSim {
             p.annotations
                 .insert(annotations::REPORT.to_owned(), REPORT.to_owned());
         }
-        self.lease_api(0, 1);
+        self.api_calls(1);
         if new
             && let Some(primary) = self.primary.holder
             && !self.wake_pending
@@ -1755,7 +1674,7 @@ impl ControlSim {
         }
         let now = self.at(ns);
         self.pods[pod as usize].lottery.begin();
-        self.lease_api(1, 0);
+        self.api_calls(1);
         let obs = self.observe(
             &self.seats[index as usize].lease,
             annotations::seat_lease(index as usize),
@@ -1769,7 +1688,7 @@ impl ControlSim {
         ) {
             return;
         }
-        self.lease_api(0, 1);
+        self.api_calls(1);
         let spec = election::claim(&obs.spec, &format!("p{pod}"), &self.wall_micro());
         let seat = &mut self.seats[index as usize];
         seat.lease.rv += 1;
@@ -1777,7 +1696,6 @@ impl ControlSim {
         seat.lease.holder = Some(pod);
         seat.lease.ready = None;
         seat.lease_served = None;
-        self.metrics.incr("ctl_seat_claims");
         let p = &mut self.pods[pod as usize];
         p.lottery.won();
         p.seat = Some(index);
@@ -1812,8 +1730,7 @@ impl ControlSim {
         let lost = match schedule.decide(now, inputs) {
             rules::Action::Wait => false,
             rules::Action::Release => {
-                self.lease_api(0, 1);
-                self.metrics.incr("ctl_seat_releases");
+                self.api_calls(1);
                 let lease = &mut self.seats[index as usize].lease;
                 lease.rv += 1;
                 lease.spec = election::release(&lease.spec);
@@ -1822,7 +1739,7 @@ impl ControlSim {
                 true
             }
             rules::Action::Renew => {
-                self.lease_api(0, 1);
+                self.api_calls(1);
                 schedule.put_started(now);
                 let wall = self.wall_micro();
                 let lease = &mut self.seats[index as usize].lease;
@@ -1836,8 +1753,7 @@ impl ControlSim {
                     false
                 } else {
                     // Taken over after expiry: the re-read shows another term.
-                    self.metrics.incr("ctl_model_conflicts");
-                    self.lease_api(1, 0);
+                    self.api_calls(1);
                     let _ = schedule.conflict(Some(false), now);
                     true
                 }
@@ -1870,13 +1786,13 @@ impl ControlSim {
         if self.pods[pod as usize].primary.is_some() {
             return;
         }
-        self.lease_api(1, 0);
+        self.api_calls(1);
         let obs = self.observe(&self.primary, annotations::PRIMARY_LEASE.into());
         let now = self.at(ns);
         if !self.pods[pod as usize].contend.observe(&obs, now, true) {
             return;
         }
-        self.lease_api(0, 1);
+        self.api_calls(1);
         self.primary.rv += 1;
         self.primary.spec = election::claim(&obs.spec, &format!("p{pod}"), &self.wall_micro());
         self.primary.holder = Some(pod);
@@ -1915,8 +1831,6 @@ impl ControlSim {
         let ns = self.engine.now();
         self.view_changed_at = Some(self.at(ns));
         self.view.holder = self.primary.holder.map(identity);
-        let alive = self.pods.iter().filter(|p| p.alive).count() as u64;
-        self.metrics.add("ctl_watch_events", alive);
         for i in 0..self.pods.len() {
             let p = &mut self.pods[i];
             if !p.alive || p.seat.is_none() {
@@ -1937,9 +1851,8 @@ impl ControlSim {
         if self.pods[pod as usize].primary.is_none() {
             return;
         }
-        self.lease_api(0, 1);
+        self.api_calls(1);
         if self.primary.holder != Some(pod) {
-            self.metrics.incr("ctl_model_conflicts");
             self.pods[pod as usize].primary = None;
             return;
         }
@@ -1954,9 +1867,8 @@ impl ControlSim {
         if self.pods[pod as usize].primary.is_none() {
             return;
         }
-        self.metrics.incr("ctl_passes");
         // Seat reads, primary Lease and state reads.
-        self.lease_api(annotations::MAX_SEATS as u64 + 2, 0);
+        self.api_calls(annotations::MAX_SEATS as u64 + 2);
         let ns = self.engine.now();
         let current = self.committed.clone();
         let lease_uid = format!("lease-{}", self.primary.uid);
@@ -2006,7 +1918,7 @@ impl ControlSim {
                 .as_ref()
                 .is_none_or(|c| state::check_monotonic(c, &plan.next).is_ok())
         {
-            self.lease_api(0, 1);
+            self.api_calls(1);
             self.metrics.incr("ctl_commits");
             if current
                 .as_ref()
@@ -2056,7 +1968,7 @@ impl ControlSim {
             self.view.desired = desired;
             self.view.seat_nodes = nodes;
             self.view.claim_window = window;
-            self.lease_api(0, 1);
+            self.api_calls(1);
             self.primary.rv += 1;
             self.primary_changed();
         }
@@ -2095,7 +2007,7 @@ impl ControlSim {
         p.followed_at = Some(ns);
         p.reading = Some((self.committed.clone(), p.follower.installs));
         p.woken_during_read = false;
-        self.lease_api(1, 0);
+        self.api_calls(1);
         if self.settings.follow_read_ns == 0 {
             return self.follow_done(pod);
         }
@@ -2127,11 +2039,6 @@ impl ControlSim {
                 && let Some(i) = &self.image
                 && i.record.sequence == r.sequence
             {
-                self.metrics.incr("ctl_image_fetches");
-                self.metrics.add(
-                    "ctl_image_bytes",
-                    i.publication.members.len() as u64 * self.settings.image_bytes_per_member,
-                );
                 f.install_image(i.record.clone());
             }
             if f.ready(now) {
@@ -2145,20 +2052,6 @@ impl ControlSim {
         };
         self.follow_at(pod, next);
     }
-}
-
-// Paths as in cluster-control `kube::paths`.
-const NS: &str = "racer-system";
-const TOKEN_REVIEWS: &str = "/apis/authentication.k8s.io/v1/tokenreviews";
-const DAEMONSET: &str = "/apis/apps/v1/namespaces/racer-system/daemonsets/racer-dataplane";
-const SERVICE_ACCOUNT: &str = "/api/v1/namespaces/racer-system/serviceaccounts/racer-dataplane";
-
-fn pod_path(c: u32) -> String {
-    format!("/api/v1/namespaces/{NS}/pods/p{c}")
-}
-
-fn node_path(c: u32) -> String {
-    format!("/api/v1/nodes/n{c}")
 }
 
 /// Scenario defaults: duration and fault plan for `nodes` Pods.
@@ -2576,6 +2469,19 @@ mod tests {
         );
         assert!(c("ctl_delta_replies") > 0);
         assert_eq!(r["invariants"]["hard_failures"], 0);
+    }
+
+    #[test]
+    fn api_limit_refills_at_qps() {
+        let mut a = ApiLimit {
+            qps: 10.0,
+            burst: 2.0,
+            tokens: 2.0,
+            at_ns: 0,
+        };
+        assert!(a.admit(0) && a.admit(0) && !a.admit(0));
+        // 100 ms refills one token at 10 qps.
+        assert!(a.admit(100 * MILLIS) && !a.admit(100 * MILLIS));
     }
 
     #[test]
