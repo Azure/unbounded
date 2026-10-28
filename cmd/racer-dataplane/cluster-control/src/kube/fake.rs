@@ -11,7 +11,16 @@ use crate::{
     http::{self, Conn, TlsStream},
 };
 use serde_json::{Value, json};
-use std::{cell::RefCell, future::Future, rc::Rc, sync::Arc};
+use std::{
+    cell::RefCell,
+    future::Future,
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst},
+    },
+    time::Duration,
+};
 
 /// Shared fake server state: a [`Store`] plus wakeups and test hooks.
 #[derive(Clone)]
@@ -21,9 +30,9 @@ struct Inner {
     store: RefCell<Store>,
     changed: Signal,
     requests: RefCell<Vec<(String, String)>>,
-    counter: RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>>,
-    put_delay: RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicU64>>>,
-    get_delay: RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicU64>>>,
+    counter: RefCell<Option<Arc<AtomicUsize>>>,
+    put_delay: RefCell<Option<Arc<AtomicU64>>>,
+    get_delay: RefCell<Option<Arc<AtomicU64>>>,
 }
 
 impl FakeApi {
@@ -39,42 +48,33 @@ impl FakeApi {
     }
 
     /// Count every request in `counter`, readable from other threads.
-    pub fn count_into(&self, counter: std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    pub fn count_into(&self, counter: Arc<AtomicUsize>) {
         *self.0.counter.borrow_mut() = Some(counter);
     }
 
-    /// Hold each PUT until it is `delay_ms` old, re-read while waiting;
-    /// `u64::MAX` hangs PUTs as a stuck API server would.
-    pub fn delay_puts(&self, delay_ms: std::sync::Arc<std::sync::atomic::AtomicU64>) {
+    /// Hold each PUT until it is `delay_ms` old; `u64::MAX` hangs PUTs as a
+    /// stuck API server would.
+    pub fn delay_puts(&self, delay_ms: Arc<AtomicU64>) {
         *self.0.put_delay.borrow_mut() = Some(delay_ms);
     }
 
     /// Answer each GET with the object as it was when the GET arrived, but
-    /// only `delay_ms` later, as a slow API server would.
-    pub fn delay_gets(&self, delay_ms: std::sync::Arc<std::sync::atomic::AtomicU64>) {
+    /// only `delay_ms` later.
+    pub fn delay_gets(&self, delay_ms: Arc<AtomicU64>) {
         *self.0.get_delay.borrow_mut() = Some(delay_ms);
     }
 
-    fn get_delay(&self, method: &str) -> std::time::Duration {
-        let ms = self
-            .0
-            .get_delay
-            .borrow()
-            .as_ref()
-            .filter(|_| method == "GET")
-            .map_or(0, |d| d.load(std::sync::atomic::Ordering::SeqCst));
-        std::time::Duration::from_millis(ms)
-    }
-
-    fn put_delay(&self, method: &str) -> std::time::Duration {
-        let ms = self
-            .0
-            .put_delay
-            .borrow()
-            .as_ref()
-            .filter(|_| method == "PUT")
-            .map_or(0, |d| d.load(std::sync::atomic::Ordering::SeqCst));
-        std::time::Duration::from_millis(ms)
+    /// Delays of a `method` request before and after it is handled.
+    fn delays(&self, method: &str) -> (Duration, Duration) {
+        let ms = |d: &RefCell<Option<Arc<AtomicU64>>>, m: &str| {
+            let ms = d
+                .borrow()
+                .as_ref()
+                .filter(|_| method == m)
+                .map_or(0, |d| d.load(SeqCst));
+            Duration::from_millis(ms)
+        };
+        (ms(&self.0.put_delay, "PUT"), ms(&self.0.get_delay, "GET"))
     }
 
     /// Store an object, set its resourceVersion and a UID if missing.
@@ -84,7 +84,6 @@ impl FakeApi {
         o
     }
 
-    #[allow(dead_code)]
     pub fn delete_object(&self, path: &str) {
         if self.0.store.borrow_mut().delete_object(path).is_some() {
             self.0.changed.notify();
@@ -106,7 +105,6 @@ impl FakeApi {
     }
 
     /// Fail the next requests with these statuses.
-    #[allow(dead_code)]
     pub fn fail_next(&self, statuses: &[u16]) {
         self.0.store.borrow_mut().fail_next(statuses);
     }
@@ -122,7 +120,7 @@ impl FakeApi {
             .borrow_mut()
             .push((method.into(), target.into()));
         if let Some(c) = self.0.counter.borrow().as_ref() {
-            c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            c.fetch_add(1, SeqCst);
         }
         let (status, value, _) = self.0.store.borrow_mut().handle(method, target, body, 0);
         if (200..300).contains(&status) && method != "GET" {
@@ -240,14 +238,15 @@ pub fn serve(api: FakeApi, dir: &std::path::Path) -> KubeConfig {
                         api.serve_watch(&mut conn, path, query.unwrap()).await;
                         return;
                     }
+                    // Delays are re-read while waiting.
                     let received = std::time::Instant::now();
-                    while received.elapsed() < api.put_delay(&head.method) {
-                        exec::sleep(std::time::Duration::from_millis(20)).await;
+                    while received.elapsed() < api.delays(&head.method).0 {
+                        exec::sleep(Duration::from_millis(20)).await;
                     }
                     let (status, value) = api.handle(&head.method, &head.target, &body);
                     let answered = std::time::Instant::now();
-                    while answered.elapsed() < api.get_delay(&head.method) {
-                        exec::sleep(std::time::Duration::from_millis(20)).await;
+                    while answered.elapsed() < api.delays(&head.method).1 {
+                        exec::sleep(Duration::from_millis(20)).await;
                     }
                     let body = serde_json::to_vec(&value).unwrap();
                     let mut out = http::response_head(
@@ -272,11 +271,11 @@ pub fn serve(api: FakeApi, dir: &std::path::Path) -> KubeConfig {
     }
 }
 
-static DIRS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DIRS: AtomicUsize = AtomicUsize::new(0);
 
 /// Project-local scratch directory for one test.
 pub fn scratch() -> std::path::PathBuf {
-    let n = DIRS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let n = DIRS.fetch_add(1, SeqCst);
     let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../../tmp/racer-cluster-control-tests")
         .join(format!("{}-{n}", std::process::id()));

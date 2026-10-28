@@ -1,17 +1,11 @@
-//! Plain-value Kubernetes API server model.
+//! Plain-value Kubernetes API server model for tests and the simulator.
 //!
-//! [`Store`] keeps JSON objects by path and implements the subset of the
-//! API the control plane uses: GET and list, PUT with resourceVersion CAS,
-//! POST create, merge PATCH, JSON PATCH (add, replace, remove, test),
-//! DELETE, `metadata.name` field selectors, and watches with a bounded event
-//! log, compaction (410 Gone), and fan-out to many watchers. It has no
-//! sockets, TLS, threads, or clocks: callers pass `now_ns` and drive
-//! delivery, so the simulator can serve tens of thousands of clients from
-//! one thread. The TLS test server (`kube::fake`) wraps it.
-//!
-//! Fault injection ([`Store::fail_next`]) and an optional [`TokenBucket`]
-//! (API priority and fairness 429s, per-request latency) model a loaded API
-//! server.
+//! [`Store`] keeps JSON objects by path and serves the API subset the control
+//! plane uses: GET and list, PUT with resourceVersion CAS, POST, merge and
+//! JSON PATCH, DELETE, `metadata.name` field selectors, and an event log for
+//! watches with compaction (410 Gone). No sockets or clocks: callers pass
+//! `now_ns`. Fault injection and an optional [`TokenBucket`] (429s, latency)
+//! model a loaded server. The TLS test server (`kube::fake`) wraps it.
 
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
@@ -46,16 +40,6 @@ pub struct Event {
 /// The watch start is older than the retained log.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Gone;
-
-/// Watch handle.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct WatchId(pub u64);
-
-struct Watch {
-    prefix: String,
-    name: Option<String>,
-    seen: u64,
-}
 
 /// Token bucket applied before each request: `qps` sustained, `burst`
 /// capacity, fixed latency.
@@ -97,14 +81,7 @@ impl TokenBucket {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Stats {
     pub requests: u64,
-    pub gets: u64,
-    pub lists: u64,
-    pub writes: u64,
-    pub conflicts: u64,
     pub throttled: u64,
-    pub injected: u64,
-    pub watch_events: u64,
-    pub gone: u64,
 }
 
 type Hook = Box<dyn Fn(&str, &Value) -> Option<(u16, Value)>>;
@@ -119,10 +96,6 @@ pub struct Store {
     faults: VecDeque<u16>,
     post_hook: Option<Hook>,
     admission: Option<TokenBucket>,
-    watches: BTreeMap<WatchId, Watch>,
-    next_watch: u64,
-    /// Keep at most this many log events; older ones compact away.
-    pub log_limit: usize,
     pub stats: Stats,
 }
 
@@ -143,9 +116,6 @@ impl Store {
             faults: VecDeque::new(),
             post_hook: None,
             admission: None,
-            watches: BTreeMap::new(),
-            next_watch: 0,
-            log_limit: usize::MAX,
             stats: Stats::default(),
         }
     }
@@ -155,25 +125,9 @@ impl Store {
         self.version
     }
 
-    /// Next UID counter, shared with callers that mint objects.
-    pub fn next_uid(&mut self) -> u64 {
-        let n = self.uids;
-        self.uids += 1;
-        n
-    }
-
     fn bump(&mut self) -> u64 {
         self.version += 1;
         self.version
-    }
-
-    fn record(&mut self, event: Event) {
-        self.log.push_back(event);
-        while self.log.len() > self.log_limit {
-            if let Some(e) = self.log.pop_front() {
-                self.compacted = self.compacted.max(e.version);
-            }
-        }
     }
 
     /// Store an object, set its resourceVersion and a UID and name if missing.
@@ -182,7 +136,8 @@ impl Store {
         let existed = self.objects.contains_key(path);
         object["metadata"]["resourceVersion"] = v.to_string().into();
         if str_at(&object, &["metadata", "uid"]).is_empty() {
-            let n = self.next_uid();
+            let n = self.uids;
+            self.uids += 1;
             object["metadata"]["uid"] = format!("00000000-0000-4000-8000-{n:012x}").into();
         }
         if str_at(&object, &["metadata", "name"]).is_empty() {
@@ -194,7 +149,7 @@ impl Store {
         } else {
             EventKind::Added
         };
-        self.record(Event {
+        self.log.push_back(Event {
             version: v,
             path: path.into(),
             kind,
@@ -207,7 +162,7 @@ impl Store {
     pub fn delete_object(&mut self, path: &str) -> Option<Value> {
         let o = self.objects.remove(path)?;
         let v = self.bump();
-        self.record(Event {
+        self.log.push_back(Event {
             version: v,
             path: path.into(),
             kind: EventKind::Deleted,
@@ -273,7 +228,6 @@ impl Store {
     ) -> (u16, Value, u64) {
         self.stats.requests += 1;
         if let Some(s) = self.faults.pop_front() {
-            self.stats.injected += 1;
             return (s, json!({"kind":"Status","code":s}), 0);
         }
         let (path, query) = match target.split_once('?') {
@@ -311,10 +265,8 @@ impl Store {
         match method {
             "GET" => {
                 if let Some(o) = self.objects.get(path).cloned() {
-                    self.stats.gets += 1;
                     return (200, o);
                 }
-                self.stats.lists += 1;
                 let items = self.list(path, name.as_deref());
                 if items.is_empty() && !path.ends_with('s') {
                     return (404, json!({"code":404}));
@@ -330,12 +282,10 @@ impl Store {
                 };
                 let rv = str_at(request, &["metadata", "resourceVersion"]);
                 if rv != str_at(current, &["metadata", "resourceVersion"]) {
-                    self.stats.conflicts += 1;
                     return (409, json!({"code":409}));
                 }
                 let mut next = request.clone();
                 next["metadata"]["uid"] = current["metadata"]["uid"].clone();
-                self.stats.writes += 1;
                 (200, self.put_object(path, next))
             }
             "POST" => {
@@ -345,10 +295,8 @@ impl Store {
                 let name = str_at(request, &["metadata", "name"]).to_owned();
                 let full = format!("{path}/{name}");
                 if name.is_empty() || self.object(&full).is_some() {
-                    self.stats.conflicts += 1;
                     return (409, json!({}));
                 }
-                self.stats.writes += 1;
                 (201, self.put_object(&full, request.clone()))
             }
             "PATCH" => {
@@ -362,14 +310,10 @@ impl Store {
                 } else {
                     merge(&mut current, request);
                 }
-                self.stats.writes += 1;
                 (200, self.put_object(path, current))
             }
             "DELETE" => match self.delete_object(path) {
-                Some(o) => {
-                    self.stats.writes += 1;
-                    (200, o)
-                }
+                Some(o) => (200, o),
                 None => (404, json!({"code":404})),
             },
             _ => (405, json!({})),
@@ -397,69 +341,6 @@ impl Store {
             })
             .cloned()
             .collect())
-    }
-
-    /// Open a watch from resourceVersion `from`.
-    pub fn watch(
-        &mut self,
-        collection: &str,
-        name: Option<&str>,
-        from: u64,
-    ) -> Result<WatchId, Gone> {
-        if from < self.compacted {
-            self.stats.gone += 1;
-            return Err(Gone);
-        }
-        let id = WatchId(self.next_watch);
-        self.next_watch += 1;
-        self.watches.insert(
-            id,
-            Watch {
-                prefix: format!("{collection}/"),
-                name: name.map(Into::into),
-                seen: from,
-            },
-        );
-        Ok(id)
-    }
-
-    pub fn unwatch(&mut self, id: WatchId) {
-        self.watches.remove(&id);
-    }
-
-    /// Open watches.
-    pub fn watchers(&self) -> usize {
-        self.watches.len()
-    }
-
-    /// Deliver new events to every watch. Watches that fell behind the log
-    /// get `Err(Gone)` and close. Cost is O(watches x new events).
-    pub fn deliver(&mut self) -> Vec<(WatchId, Result<Event, Gone>)> {
-        let mut out = Vec::new();
-        let mut gone = Vec::new();
-        for (id, w) in &mut self.watches {
-            if w.seen < self.compacted {
-                gone.push(*id);
-                out.push((*id, Err(Gone)));
-                continue;
-            }
-            for e in self.log.iter().filter(|e| e.version > w.seen) {
-                if e.path.starts_with(&w.prefix)
-                    && w.name
-                        .as_deref()
-                        .is_none_or(|n| str_at(&e.object, &["metadata", "name"]) == n)
-                {
-                    out.push((*id, Ok(e.clone())));
-                }
-            }
-            w.seen = self.version;
-        }
-        self.stats.watch_events += out.iter().filter(|(_, e)| e.is_ok()).count() as u64;
-        self.stats.gone += gone.len() as u64;
-        for id in gone {
-            self.watches.remove(&id);
-        }
-        out
     }
 }
 
@@ -567,7 +448,6 @@ mod tests {
                 .0,
             409
         );
-        assert_eq!(s.stats.conflicts, 2);
         assert_eq!(s.handle("PUT", &format!("{LEASES}/x"), b"{}", 0).0, 404);
         assert_eq!(s.handle("GET", &format!("{LEASES}/x"), b"", 0).0, 404);
         assert_eq!(s.handle("GET", "/x/y", b"{", 0).0, 400);
@@ -598,48 +478,15 @@ mod tests {
         assert!(s.object(&p).unwrap()["spec"].get("x").is_none());
         assert_eq!(s.handle("DELETE", &p, b"", 0).0, 200);
         assert_eq!(s.handle("DELETE", &p, b"", 0).0, 404);
-    }
-
-    #[test]
-    fn watches_fan_out_and_compact() {
-        let mut s = Store::new();
-        let start = s.version();
-        let all = s.watch(LEASES, None, start).unwrap();
-        let one = s.watch(LEASES, Some("b"), start).unwrap();
-        s.put_object(&format!("{LEASES}/a"), lease("a"));
-        s.put_object(&format!("{LEASES}/b"), lease("b"));
-        s.put_object("/other/c", lease("c"));
-        let got = s.deliver();
-        assert_eq!(got.iter().filter(|(w, _)| *w == all).count(), 2);
-        assert_eq!(got.iter().filter(|(w, _)| *w == one).count(), 1);
-        assert!(s.deliver().is_empty(), "delivered once");
-        s.delete_object(&format!("{LEASES}/b"));
-        let got = s.deliver();
-        assert!(matches!(&got[0].1, Ok(e) if e.kind == EventKind::Deleted));
+        assert!(matches!(&s.log.back().unwrap().kind, EventKind::Deleted));
+        let start = 10;
         assert_eq!(
-            s.events_since(LEASES, None, start).unwrap().len(),
-            3,
+            s.events_since(LEASES, Some("b"), start).unwrap().len(),
+            1,
             "history is kept until compaction"
         );
         s.compact();
         assert_eq!(s.events_since(LEASES, None, start).unwrap_err(), Gone);
-        assert_eq!(s.watch(LEASES, None, start).unwrap_err(), Gone);
-        // Live watches are caught up, so they stay open.
-        assert!(s.deliver().is_empty());
-        assert_eq!(s.watchers(), 2);
-    }
-
-    #[test]
-    fn bounded_log_closes_lagging_watches() {
-        let mut s = Store::new();
-        s.log_limit = 2;
-        let w = s.watch(LEASES, None, s.version()).unwrap();
-        for n in 0..4 {
-            s.put_object(&format!("{LEASES}/l{n}"), lease("l"));
-        }
-        let got = s.deliver();
-        assert!(matches!(got.as_slice(), [(id, Err(Gone))] if *id == w));
-        assert_eq!(s.watchers(), 0);
     }
 
     #[test]
@@ -656,7 +503,7 @@ mod tests {
         // 100 ms refills one token at 10 qps.
         assert_eq!(s.handle("GET", LEASES, b"", 100_000_000).0, 200);
         assert_eq!(s.stats.throttled, 1);
-        assert_eq!(s.stats.injected, 2);
+        assert_eq!(s.stats.requests, 7);
         s.on_post(|_, _| Some((201, json!({"status": {"authenticated": true}}))));
         assert_eq!(
             s.handle("POST", "/apis/review", b"{}", 1_000_000_000).0,
