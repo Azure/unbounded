@@ -265,13 +265,16 @@ fn wait_gone(path: &Path) -> bool {
     false
 }
 
-/// While set, reads of [`STALLED_PAGE`] never finish.
-static STALL: AtomicBool = AtomicBool::new(false);
 /// A page the partition scan at start does not read.
 const STALLED_PAGE: u64 = 1;
 
 /// Stub backend: the object is the `pattern` bytes, one version, no cache.
-struct StubBackend;
+/// While `stall` is set, reads of [`STALLED_PAGE`] never finish. Each test
+/// owns its flag, so a stall cannot leak into tests running in parallel.
+#[derive(Default)]
+struct StubBackend {
+    stall: Arc<AtomicBool>,
+}
 
 #[derive(Clone)]
 struct StubPage(std::rc::Rc<Vec<u8>>);
@@ -284,8 +287,8 @@ unsafe impl super::service::PageBytes for StubPage {
     }
 }
 
-#[derive(Default)]
 struct StubSource {
+    stall: Arc<AtomicBool>,
     pages: std::cell::RefCell<std::collections::HashMap<u64, StubPage>>,
 }
 
@@ -293,7 +296,7 @@ impl super::service::PageSource for StubSource {
     type Page = StubPage;
 
     fn page(&self, number: u64) -> super::service::Local<'_, crate::error::Result<StubPage>> {
-        if number == STALLED_PAGE && STALL.load(Ordering::Relaxed) {
+        if number == STALLED_PAGE && self.stall.load(Ordering::Relaxed) {
             // A read that never finishes, like a hung origin fetch.
             return Box::pin(std::future::pending());
         }
@@ -332,29 +335,34 @@ impl super::worker::Backend for StubBackend {
         _device: &crate::config::UblkDeviceConfig,
         _resolved: &super::manager::Resolved,
     ) -> crate::error::Result<StubSource> {
-        Ok(StubSource::default())
+        Ok(StubSource {
+            stall: self.stall.clone(),
+            pages: Default::default(),
+        })
     }
 }
 
 /// Runs one worker: a real reactor serving queue `q` until `done`.
 /// Returns the reactor operations still in flight at the end.
 fn run_worker(q: u16, manager: Arc<super::manager::Manager>, done: Arc<AtomicBool>) -> usize {
-    run_draining_worker(q, manager, done, None)
+    run_draining_worker(q, manager, done, None, Arc::default())
 }
 
 /// Like [`run_worker`], but abandons its queues once `abandon_at` holds a
 /// time that has passed, as the dataplane does at its drain deadline.
+/// `stall` is shared with the worker's page sources (see [`StubBackend`]).
 fn run_draining_worker(
     q: u16,
     manager: Arc<super::manager::Manager>,
     done: Arc<AtomicBool>,
     abandon_at: Option<Arc<std::sync::Mutex<Option<Instant>>>>,
+    stall: Arc<AtomicBool>,
 ) -> usize {
     let reactor = crate::test_support::enrollment::reactor().expect("io_uring");
     let mut worker = super::worker::UblkWorker::new(
         q,
         manager,
-        std::rc::Rc::new(StubBackend),
+        std::rc::Rc::new(StubBackend { stall }),
         reactor.clone(),
         None,
     );
@@ -624,10 +632,12 @@ fn ublk_stuck_read_at_shutdown_still_deletes_the_device() {
     ));
     let done = Arc::new(AtomicBool::new(false));
     let abandon_at = Arc::new(std::sync::Mutex::new(None));
+    let stall = Arc::new(AtomicBool::new(false));
     let workers: Vec<_> = (0..2)
         .map(|q| {
             let (manager, done, at) = (manager.clone(), done.clone(), abandon_at.clone());
-            thread::spawn(move || run_draining_worker(q, manager, done, Some(at)))
+            let stall = stall.clone();
+            thread::spawn(move || run_draining_worker(q, manager, done, Some(at), stall))
         })
         .collect();
     let control = {
@@ -649,7 +659,7 @@ fn ublk_stuck_read_at_shutdown_still_deletes_the_device() {
             Err(error) => panic!("open {}: {error}", block_path.display()),
         }
     };
-    STALL.store(true, Ordering::Relaxed);
+    stall.store(true, Ordering::Relaxed);
     let reader = thread::spawn(move || {
         let mut buf = vec![0_u8; 4096];
         block.read_at(&mut buf, STALLED_PAGE * PAGE_BYTES)
@@ -660,7 +670,7 @@ fn ublk_stuck_read_at_shutdown_still_deletes_the_device() {
     manager.request_stop();
     *abandon_at.lock().unwrap() = Some(Instant::now() + shutdown + Duration::from_millis(300));
     let result = reader.join().expect("reader thread");
-    STALL.store(false, Ordering::Relaxed);
+    stall.store(false, Ordering::Relaxed);
     control.join().expect("control thread");
     done.store(true, Ordering::Relaxed);
     for worker in workers {
