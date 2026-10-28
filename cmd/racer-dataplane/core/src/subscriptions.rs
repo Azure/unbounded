@@ -119,16 +119,6 @@ pub enum Kind {
     InvalidRequest,
 }
 
-/// Error type the scheduler stores in response slots. Work failures supplied
-/// by the caller pass through unchanged.
-pub trait Fault: Clone {
-    fn of(kind: Kind) -> Self;
-
-    /// An origin rejection of the supplier's credentials: elect exactly one
-    /// other retained follower to retry with its own credentials.
-    fn promotes(&self) -> bool;
-}
-
 /// One request on a contract.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Contract<V> {
@@ -392,7 +382,7 @@ where
     R: Clone + Eq + Hash,
     V: Clone + Eq + Hash,
     P: Clone,
-    E: Fault,
+    E: Clone + From<Kind>,
 {
     /// `None` when the limits are invalid (see [`SubscriptionLimits::valid`]).
     pub fn new(limits: SubscriptionLimits) -> Option<Self> {
@@ -417,7 +407,7 @@ where
     pub fn advance(&mut self, now_ms: u64) {
         self.now = self.now.max(now_ms);
         self.fanout
-            .expire(self.now, || E::of(Kind::DeadlineExceeded), &mut self.wake);
+            .expire(self.now, || E::from(Kind::DeadlineExceeded), &mut self.wake);
         if self.now < self.next_prune {
             return;
         }
@@ -452,7 +442,7 @@ where
     ) -> Result<Admitted<M, R>, E> {
         self.advance(now_ms);
         self.admit_at(subscription, membership, receiver, deadline)
-            .map_err(E::of)
+            .map_err(E::from)
     }
 
     fn admit_at(
@@ -578,7 +568,7 @@ where
         eligible: impl Fn(u64) -> Option<bool>,
     ) -> Result<Result<Selected<V>, u64>, E> {
         self.advance(now_ms);
-        self.select_at(admitted, eligible).map_err(E::of)
+        self.select_at(admitted, eligible).map_err(E::from)
     }
 
     fn select_at(
@@ -709,26 +699,33 @@ where
     }
 
     /// Finish acquisition `work` with the payload and its byte length, or a
-    /// failure. Every waiter on the flight receives its own grant or error. A
-    /// credential failure ([`Fault::promotes`]) elects one retained follower
-    /// instead. `now_ms` expires deadlines first when present.
-    pub fn complete(&mut self, work: u64, result: Result<(P, u64), E>, now_ms: Option<u64>) {
+    /// failure. Every waiter on the flight receives its own grant or error.
+    /// `promote` marks an origin rejection of the supplier's credentials: it
+    /// elects one retained follower to retry with its own credentials instead.
+    /// `now_ms` expires deadlines first when present.
+    pub fn complete(
+        &mut self,
+        work: u64,
+        result: Result<(P, u64), E>,
+        promote: bool,
+        now_ms: Option<u64>,
+    ) {
         if let Some(now) = now_ms {
             self.advance(now);
         }
-        self.finish(work, result);
+        self.finish(work, result, promote);
     }
 
     /// Abandon acquisition `work` (the dataplane drops `Work` unfinished).
     pub fn cancel_work(&mut self, work: u64) {
-        self.finish(work, Err(E::of(Kind::Cancelled)));
+        self.finish(work, Err(E::from(Kind::Cancelled)), false);
     }
 
-    fn finish(&mut self, flight: u64, result: Result<(P, u64), E>) {
+    fn finish(&mut self, flight: u64, result: Result<(P, u64), E>, promote: bool) {
         // An origin rejection says nothing about another credential supplier.
         // Elect exactly one retained follower to retry with its own verified
         // request and original route credits. Never clone or refund authority.
-        let promote = result.as_ref().is_err_and(E::promotes);
+        let promote = promote && result.is_err();
         let limit = self.limits.max_completed_intervals;
         let entries = &mut self.entries;
         let completed_intervals = &mut self.completed_intervals;
@@ -739,23 +736,23 @@ where
                 let (payload, bytes) = result.as_ref().map_err(Clone::clone)?;
                 let entry = entries
                     .get_mut(owner)
-                    .ok_or(E::of(Kind::DeadlineExceeded))?;
+                    .ok_or(E::from(Kind::DeadlineExceeded))?;
                 let reservation = &entry
                     .pending
                     .iter()
                     .find(|flight| flight.token == token)
-                    .ok_or(E::of(Kind::StaleFlight))?
+                    .ok_or(E::from(Kind::StaleFlight))?
                     .reservation;
                 // Charge at least what newer ceilings set aside for this flight.
                 let contract = entry
                     .subscription
                     .byte_budget
                     .checked_sub((*bytes).max(reservation.covered_bytes))
-                    .ok_or(E::of(Kind::Unavailable))?;
+                    .ok_or(E::from(Kind::Unavailable))?;
                 let remaining = reservation
                     .byte_budget
                     .checked_sub(*bytes)
-                    .ok_or(E::of(Kind::Unavailable))?;
+                    .ok_or(E::from(Kind::Unavailable))?;
                 // Report the grant relative to the selecting request. The
                 // selection already debited one page from a nonzero budget.
                 let grant = Grant {
@@ -778,7 +775,7 @@ where
                 let completed = include_page(&entry.completed, key.page);
                 let count = *completed_intervals - entry.completed.len() + completed.len();
                 if count > limit {
-                    return Err(E::of(Kind::Overloaded));
+                    return Err(E::from(Kind::Overloaded));
                 }
                 *completed_intervals = count;
                 entry.completed = completed;
@@ -817,7 +814,7 @@ where
     pub fn poll(&mut self, waiter: u64, now_ms: u64) -> Polled<Result<Delivery<P, M, R, V>, E>> {
         self.advance(now_ms);
         let Some(pending) = self.fanout.pending_mut(waiter) else {
-            return Polled::Ready(Err(E::of(Kind::StaleFlight)));
+            return Polled::Ready(Err(E::from(Kind::StaleFlight)));
         };
         if pending.result.is_none() {
             pending.waker = Some(waiter);
@@ -895,13 +892,9 @@ mod tests {
         Io,
     }
 
-    impl Fault for Err {
-        fn of(kind: Kind) -> Self {
+    impl From<Kind> for Err {
+        fn from(kind: Kind) -> Self {
             Self::Kind(kind)
-        }
-
-        fn promotes(&self) -> bool {
-            *self == Self::Rejected
         }
     }
 
@@ -960,7 +953,7 @@ mod tests {
         assert_eq!(s.flight_count(), 1);
         assert!(matches!(s.poll(follow.waiter, 2), Polled::Pending));
         assert!(s.take_wakes().is_empty());
-        s.complete(work, Ok(("page", 40)), Some(3));
+        s.complete(work, Ok(("page", 40)), false, Some(3));
         assert_eq!(s.take_wakes(), vec![follow.waiter]);
         let got = ready(s.poll(follow.waiter, 3)).unwrap();
         assert_eq!(got.payload, "page");
@@ -984,7 +977,7 @@ mod tests {
         let lead = s.select(&a, 1, |_| Some(true)).unwrap().unwrap();
         let follow = s.select(&b, 1, |_| Some(true)).unwrap().unwrap();
         assert!(matches!(s.poll(follow.waiter, 1), Polled::Pending));
-        s.complete(lead.work.unwrap(), Err(Err::Rejected), None);
+        s.complete(lead.work.unwrap(), Err(Err::Rejected), true, None);
         assert_eq!(s.take_wakes(), vec![follow.waiter]);
         assert_eq!(ready(s.poll(lead.waiter, 1)).unwrap_err(), Err::Rejected);
         let (work, version, page) = s.take_work(follow.waiter, 1).expect("elected");
@@ -1005,7 +998,7 @@ mod tests {
         let b = s.admit(contract(2, 1, 1, None), 1, 2, 1000, 1).unwrap();
         let lead = s.select(&a, 1, |_| Some(true)).unwrap().unwrap();
         let follow = s.select(&b, 1, |_| Some(true)).unwrap().unwrap();
-        s.complete(lead.work.unwrap(), Err(Err::Rejected), None);
+        s.complete(lead.work.unwrap(), Err(Err::Rejected), true, None);
         s.cancel_waiter(follow.waiter);
         assert_eq!(s.flight_count(), 0);
         s.cancel_waiter(lead.waiter);
@@ -1025,7 +1018,7 @@ mod tests {
             Err::Kind(Kind::DeadlineExceeded)
         );
         assert_eq!(s.flight_count(), 1, "unfenced owner keeps capacity");
-        s.complete(lead.work.unwrap(), Err(Err::Io), None);
+        s.complete(lead.work.unwrap(), Err(Err::Io), false, None);
         assert_eq!(s.flight_count(), 0);
         s.advance(99);
         assert_eq!(s.now(), 100, "time never moves backward");
@@ -1071,7 +1064,7 @@ mod tests {
         };
         let entry = s.entry(&key).unwrap();
         assert_eq!((entry.flights, entry.pending), (3, 1));
-        s.complete(selected.work.unwrap(), Ok(("p", 10)), None);
+        s.complete(selected.work.unwrap(), Ok(("p", 10)), false, None);
         let grant = ready(s.poll(selected.waiter, 1)).unwrap().grant;
         assert_eq!((grant.sequence, grant.flights), (2, Some(3)));
     }

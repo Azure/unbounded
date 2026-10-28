@@ -90,8 +90,8 @@ type Delivery = racer_core::subscriptions::Delivery<
     ObjectVersion,
 >;
 
-impl racer_core::subscriptions::Fault for Error {
-    fn of(kind: racer_core::subscriptions::Kind) -> Self {
+impl From<racer_core::subscriptions::Kind> for Error {
+    fn from(kind: racer_core::subscriptions::Kind) -> Self {
         use racer_core::subscriptions::Kind;
         match kind {
             Kind::DeadlineExceeded => Self::DeadlineExceeded,
@@ -102,13 +102,6 @@ impl racer_core::subscriptions::Fault for Error {
             Kind::Replay => Self::Replay,
             Kind::InvalidRequest => Self::InvalidRequest,
         }
-    }
-
-    fn promotes(&self) -> bool {
-        matches!(
-            self,
-            Self::OriginRejected | Self::OriginForbidden | Self::Unauthorized
-        )
     }
 }
 
@@ -412,16 +405,22 @@ impl Work {
             let bytes = copy.ciphertext.bytes().len() as u64;
             ((copy.metadata.clone(), copy.ciphertext.clone()), bytes)
         });
+        // Structural failures never promote a follower.
         let token = self.token.take().expect("owned work");
         self.scheduler
-            .with_state(|core| core.complete(token, result, Some(now_ms)));
+            .with_state(|core| core.complete(token, result, false, Some(now_ms)));
         valid
     }
 
     pub fn fail(mut self, error: Error) {
+        // An origin rejection of the supplier's credentials promotes a follower.
+        let promote = matches!(
+            error,
+            Error::OriginRejected | Error::OriginForbidden | Error::Unauthorized
+        );
         let token = self.token.take().expect("owned work");
         self.scheduler
-            .with_state(|core| core.complete(token, Err(error), None));
+            .with_state(|core| core.complete(token, Err(error), promote, None));
     }
 }
 
