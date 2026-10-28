@@ -466,11 +466,11 @@ impl ControlSim {
             SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
         );
         let mut api = Store::new();
-        api.set_admission(Some(Box::new(TokenBucket::new(
+        api.set_admission(Some(TokenBucket::new(
             settings.api_qps,
             settings.api_burst,
             settings.api_latency_ns,
-        ))));
+        )));
         api.on_post(|path, _| {
             path.ends_with("/tokenreviews")
                 .then(|| (201, json!({"status": {"authenticated": true}})))

@@ -9,9 +9,9 @@
 //! delivery, so the simulator can serve tens of thousands of clients from
 //! one thread. The TLS test server (`kube::fake`) wraps it.
 //!
-//! Fault injection ([`Store::fail_next`]) and an optional admission hook
-//! ([`Admission`], for example [`TokenBucket`] for API priority and
-//! fairness 429s and per-request latency) model a loaded API server.
+//! Fault injection ([`Store::fail_next`]) and an optional [`TokenBucket`]
+//! (API priority and fairness 429s, per-request latency) model a loaded API
+//! server.
 
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
@@ -57,26 +57,13 @@ struct Watch {
     seen: u64,
 }
 
-/// Admission decision for one request.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Admit {
-    /// Serve after this much service latency.
-    Serve { latency_ns: u64 },
-    /// Reject with this status (429 for throttling).
-    Reject(u16),
-}
-
-/// Rate limiting and latency model applied before each request.
-pub trait Admission {
-    fn admit(&mut self, method: &str, path: &str, now_ns: u64) -> Admit;
-}
-
-/// Token bucket: `qps` sustained, `burst` capacity, fixed latency.
+/// Token bucket applied before each request: `qps` sustained, `burst`
+/// capacity, fixed latency.
 #[derive(Clone, Debug)]
 pub struct TokenBucket {
-    pub qps: f64,
-    pub burst: f64,
-    pub latency_ns: u64,
+    qps: f64,
+    burst: f64,
+    latency_ns: u64,
     tokens: f64,
     at_ns: u64,
 }
@@ -91,20 +78,17 @@ impl TokenBucket {
             at_ns: 0,
         }
     }
-}
 
-impl Admission for TokenBucket {
-    fn admit(&mut self, _: &str, _: &str, now_ns: u64) -> Admit {
+    /// Service latency, or `None` to throttle with 429.
+    fn admit(&mut self, now_ns: u64) -> Option<u64> {
         let elapsed = now_ns.saturating_sub(self.at_ns) as f64 / 1e9;
         self.at_ns = self.at_ns.max(now_ns);
         self.tokens = (self.tokens + elapsed * self.qps).min(self.burst);
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
-            Admit::Serve {
-                latency_ns: self.latency_ns,
-            }
+            Some(self.latency_ns)
         } else {
-            Admit::Reject(429)
+            None
         }
     }
 }
@@ -134,7 +118,7 @@ pub struct Store {
     uids: u64,
     faults: VecDeque<u16>,
     post_hook: Option<Hook>,
-    admission: Option<Box<dyn Admission>>,
+    admission: Option<TokenBucket>,
     watches: BTreeMap<WatchId, Watch>,
     next_watch: u64,
     /// Keep at most this many log events; older ones compact away.
@@ -262,7 +246,7 @@ impl Store {
     }
 
     /// Apply `admission` to every later request.
-    pub fn set_admission(&mut self, admission: Option<Box<dyn Admission>>) {
+    pub fn set_admission(&mut self, admission: Option<TokenBucket>) {
         self.admission = admission;
     }
 
@@ -296,16 +280,12 @@ impl Store {
             Some((p, q)) => (p, Some(q)),
             None => (target, None),
         };
-        let latency = match self
-            .admission
-            .as_mut()
-            .map(|a| a.admit(method, path, now_ns))
-        {
-            Some(Admit::Reject(s)) => {
+        let latency = match self.admission.as_mut().map(|a| a.admit(now_ns)) {
+            Some(None) => {
                 self.stats.throttled += 1;
-                return (s, json!({"kind":"Status","code":s}), 0);
+                return (429, json!({"kind":"Status","code":429}), 0);
             }
-            Some(Admit::Serve { latency_ns }) => latency_ns,
+            Some(Some(latency_ns)) => latency_ns,
             None => 0,
         };
         let request: Value = if body.is_empty() {
@@ -669,7 +649,7 @@ mod tests {
         assert_eq!(s.handle("GET", LEASES, b"", 0).0, 500);
         assert_eq!(s.handle("GET", LEASES, b"", 0).0, 503);
         assert_eq!(s.handle("GET", LEASES, b"", 0).0, 200);
-        s.set_admission(Some(Box::new(TokenBucket::new(10.0, 2.0, 1_000))));
+        s.set_admission(Some(TokenBucket::new(10.0, 2.0, 1_000)));
         assert_eq!(s.handle("GET", LEASES, b"", 0).2, 1_000);
         assert_eq!(s.handle("GET", LEASES, b"", 0).0, 200);
         assert_eq!(s.handle("GET", LEASES, b"", 0).0, 429);
