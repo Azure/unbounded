@@ -67,7 +67,7 @@ use racer_core::read::{ServeAction, ServeFacts, copy_join_allowed, serve_action,
 use racer_core::route::Fault;
 use racer_core::route::MAX_LINKS;
 use racer_core::route::{
-    Hop, HopRoute, RelayFailure, RelayPlan, Response, decide_hop, relay_failure_for,
+    Hop, HopRoute, RelayFailure, RelayPlan, Response, decide_hop, relay_failure,
 };
 use racer_core::time::SplitMix64;
 use serde_json::{Value, json};
@@ -3722,7 +3722,7 @@ impl NodeWorld {
             return;
         }
         let now = self.now();
-        let reply = match relay_failure_for(fault, m.ping) {
+        let reply = match relay_failure(fault, m.ping) {
             RelayFailure::Respond(r) => Some(Reply::Response(response_kind(r))),
             RelayFailure::RespondIfLive(r) => {
                 (now < m.deadline).then_some(Reply::Response(response_kind(r)))

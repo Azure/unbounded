@@ -1093,16 +1093,17 @@ impl Requester {
             };
             // Unavailable/deadline/protocol errors can arise locally or at a
             // downstream node. Do not blame an immediate peer without evidence.
-            if let Some(outcome) = route::exchange_link_outcome(exchange, permit.is_some()) {
+            let (link, admission, silence) = route::exchange_evidence(exchange, permit.is_some());
+            if let Some(outcome) = link {
                 health.observe(&next, outcome)?;
             }
             if let Some(permit) = permit {
                 // A downstream overload is not attributable to the immediate
                 // peer. It also must not increase its admission or recover a probe.
-                permit.observe(route::exchange_admission_outcome(exchange));
+                permit.observe(admission);
             }
             if let Some(page) = last_page {
-                match route::silence_evidence(exchange) {
+                match silence {
                     Some(true) => health.silence_answered(&next),
                     // `CandidatePolicy::poll_pings` sends the ping.
                     Some(false) => {

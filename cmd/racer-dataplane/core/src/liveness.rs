@@ -189,7 +189,7 @@ impl<N: Eq + Hash + Clone, P: Clone> Silence<N, P> {
     /// unanswered since the peer last answered, a ping is wanted. Returns
     /// whether a ping is wanted now;
     /// [`Self::due_pings`] or [`Self::start_ping`] sends it, and the caller
-    /// then reports [`Self::ping_answered`] or [`Self::ping_failed`].
+    /// then reports [`Self::ping_result`].
     pub fn timed_out(
         &mut self,
         peer: N,

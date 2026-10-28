@@ -406,9 +406,20 @@ pub enum RelayFailure {
     Propagate,
 }
 
-/// Relay failure table (`dispatch_verified`, relay branch).
-pub fn relay_failure(fault: Fault) -> RelayFailure {
+/// Relay failure table (`dispatch_verified`, relay branch) for one
+/// forwarded exchange; `ping` marks a silence ping (`racer-mode: ping`).
+///
+/// The pinging node reads a relay's signed `Unavailable` as "the
+/// destination is unreachable" and holds it silent (Known issues 41 and
+/// 43), so a ping's relay signs it only for a refusal of its own
+/// (`Unavailable`: it holds the destination silent, or has no route) and
+/// never for a transport failure (`Io`, `Os`). A destination that predates
+/// the ping mode rejects the request and closes the connection, which the
+/// relay sees as `Io`: that destination is alive. The error then propagates
+/// unsigned, which the pinging node counts as inconclusive.
+pub fn relay_failure(fault: Fault, ping: bool) -> RelayFailure {
     match fault {
+        Fault::Io | Fault::Os if ping => RelayFailure::Propagate,
         Fault::Overloaded => RelayFailure::Respond(Response::Overloaded),
         Fault::Unavailable
         | Fault::Io
@@ -417,23 +428,6 @@ pub fn relay_failure(fault: Fault) -> RelayFailure {
         | Fault::IncompatibleMembership => RelayFailure::RespondIfLive(Response::Unavailable),
         _ => RelayFailure::Propagate,
     }
-}
-
-/// Relay failure table for one forwarded exchange; `ping` marks a silence
-/// ping (`racer-mode: ping`). The pinging node reads a relay's signed
-/// `Unavailable` as "the destination is unreachable" and holds it silent
-/// (Known issues 41 and 43), so a ping's relay signs it only for a refusal
-/// of its own (`Unavailable`: it holds the destination silent, or has no
-/// route) and never for a transport failure (`Io`, `Os`). A destination
-/// that predates the ping mode rejects the request and closes the
-/// connection, which the relay sees as `Io`: that destination is alive.
-/// The error then propagates unsigned, which the pinging node counts as
-/// inconclusive. Other modes use [`relay_failure`].
-pub fn relay_failure_for(fault: Fault, ping: bool) -> RelayFailure {
-    if ping && matches!(fault, Fault::Io | Fault::Os) {
-        return RelayFailure::Propagate;
-    }
-    relay_failure(fault)
 }
 
 /// Local service failure table (`dispatch_verified`, destination branch).
@@ -491,48 +485,50 @@ pub enum Exchange {
     Failed { fault: Fault, socket_failure: bool },
 }
 
-/// Link evidence for an exchange (`Requester::exchange`). Without adaptive
-/// admission, only a socket failure blames the immediate peer; downstream
-/// errors are not evidence against it.
-pub fn exchange_link_outcome(exchange: Exchange, admitted: bool) -> Option<LinkOutcome> {
-    match exchange {
-        Exchange::Complete { .. } => Some(LinkOutcome::Success),
-        Exchange::Failed {
-            socket_failure: true,
-            ..
-        } if !admitted => Some(LinkOutcome::Refused),
-        _ => None,
-    }
-}
-
-/// Silence evidence (`crate::liveness`) from an exchange over the last link
-/// to its destination: `Some(true)` when the destination answered (a
+/// What one exchange (`Requester::exchange`) is evidence of: link evidence
+/// against the immediate peer, adaptive admission evidence, and silence
+/// evidence (`crate::liveness`) for the exchange's destination.
+///
+/// Link: without adaptive admission (`admitted`), only a socket failure
+/// blames the immediate peer; downstream errors are not evidence against
+/// it. Admission: a downstream overload is not attributable to the
+/// immediate peer. Silence: `Some(true)` when the destination answered (a
 /// response or a body), `Some(false)` when the exchange ended unanswered by
 /// a time bound or the upstream's cancellation without a socket failure,
 /// and `None` otherwise (a failed connection is link health's evidence).
-pub fn silence_evidence(exchange: Exchange) -> Option<bool> {
-    match exchange {
-        Exchange::Complete { .. } | Exchange::Streaming => Some(true),
-        Exchange::Failed {
-            fault: Fault::DeadlineExceeded | Fault::Cancelled,
-            socket_failure: false,
-        } => Some(false),
-        Exchange::Failed { .. } => None,
-    }
-}
-
-/// Adaptive admission evidence for an exchange (`Requester::exchange`).
-/// A downstream overload is not attributable to the immediate peer.
-pub fn exchange_admission_outcome(exchange: Exchange) -> flow_control::AdaptiveOutcome {
+pub fn exchange_evidence(
+    exchange: Exchange,
+    admitted: bool,
+) -> (
+    Option<LinkOutcome>,
+    flow_control::AdaptiveOutcome,
+    Option<bool>,
+) {
     use flow_control::AdaptiveOutcome as Outcome;
     match exchange {
-        Exchange::Complete { overloaded: true } => Outcome::Neutral,
-        Exchange::Complete { overloaded: false } => Outcome::Verified,
+        Exchange::Complete { overloaded } => (
+            Some(LinkOutcome::Success),
+            if overloaded {
+                Outcome::Neutral
+            } else {
+                Outcome::Verified
+            },
+            Some(true),
+        ),
+        Exchange::Streaming => (None, Outcome::Neutral, Some(true)),
         Exchange::Failed {
-            fault: Fault::Overloaded,
-            ..
-        } => Outcome::LocalPressure,
-        _ => Outcome::Neutral,
+            fault,
+            socket_failure,
+        } => (
+            (socket_failure && !admitted).then_some(LinkOutcome::Refused),
+            if fault == Fault::Overloaded {
+                Outcome::LocalPressure
+            } else {
+                Outcome::Neutral
+            },
+            (!socket_failure && matches!(fault, Fault::DeadlineExceeded | Fault::Cancelled))
+                .then_some(false),
+        ),
     }
 }
 
@@ -604,7 +600,7 @@ mod hop_tests {
             Other,
         ];
         for fault in all {
-            let relay = relay_failure(fault);
+            let relay = relay_failure(fault, false);
             let expected = match fault {
                 Overloaded => RelayFailure::Respond(Response::Overloaded),
                 Unavailable | Io | Os | HopBudgetExhausted | IncompatibleMembership => {
@@ -615,24 +611,23 @@ mod hop_tests {
             assert_eq!(relay, expected, "{fault:?}");
             // Other modes keep the table; a ping drops only transport
             // failures to unsigned.
-            assert_eq!(relay_failure_for(fault, false), expected, "{fault:?}");
             let ping = if matches!(fault, Io | Os) {
                 RelayFailure::Propagate
             } else {
                 expected
             };
-            assert_eq!(relay_failure_for(fault, true), ping, "{fault:?}");
+            assert_eq!(relay_failure(fault, true), ping, "{fault:?}");
         }
         // A pre-ping destination closes on the unknown mode (`Io` at the
         // relay): unsigned, not an `Unavailable` that silences it. A relay
         // that holds the destination silent still signs `Unavailable`.
-        assert_eq!(relay_failure_for(Io, true), RelayFailure::Propagate);
+        assert_eq!(relay_failure(Io, true), RelayFailure::Propagate);
         assert_eq!(
-            relay_failure_for(Unavailable, true),
+            relay_failure(Unavailable, true),
             RelayFailure::RespondIfLive(Response::Unavailable)
         );
         assert_eq!(
-            relay_failure_for(Overloaded, true),
+            relay_failure(Overloaded, true),
             RelayFailure::Respond(Response::Overloaded)
         );
         for fault in all {
@@ -671,30 +666,30 @@ mod hop_tests {
             socket_failure,
         };
         assert_eq!(
-            exchange_link_outcome(Exchange::Complete { overloaded: true }, true),
+            exchange_evidence(Exchange::Complete { overloaded: true }, true).0,
             Some(LinkOutcome::Success)
         );
         assert_eq!(
-            exchange_link_outcome(failed(Fault::Io, true), false),
+            exchange_evidence(failed(Fault::Io, true), false).0,
             Some(LinkOutcome::Refused)
         );
-        assert_eq!(exchange_link_outcome(failed(Fault::Io, true), true), None);
-        assert_eq!(exchange_link_outcome(failed(Fault::Io, false), false), None);
-        assert_eq!(exchange_link_outcome(Exchange::Streaming, false), None);
+        assert_eq!(exchange_evidence(failed(Fault::Io, true), true).0, None);
+        assert_eq!(exchange_evidence(failed(Fault::Io, false), false).0, None);
+        assert_eq!(exchange_evidence(Exchange::Streaming, false).0, None);
         assert!(matches!(
-            exchange_admission_outcome(Exchange::Complete { overloaded: true }),
+            exchange_evidence(Exchange::Complete { overloaded: true }, false).1,
             A::Neutral
         ));
         assert!(matches!(
-            exchange_admission_outcome(Exchange::Complete { overloaded: false }),
+            exchange_evidence(Exchange::Complete { overloaded: false }, false).1,
             A::Verified
         ));
         assert!(matches!(
-            exchange_admission_outcome(failed(Fault::Overloaded, false)),
+            exchange_evidence(failed(Fault::Overloaded, false), false).1,
             A::LocalPressure
         ));
         assert!(matches!(
-            exchange_admission_outcome(Exchange::Streaming),
+            exchange_evidence(Exchange::Streaming, false).1,
             A::Neutral
         ));
     }
@@ -702,33 +697,45 @@ mod hop_tests {
     #[test]
     fn silence_evidence_counts_answers_and_unanswered_exchanges_only() {
         assert_eq!(
-            silence_evidence(Exchange::Complete { overloaded: true }),
+            exchange_evidence(Exchange::Complete { overloaded: true }, false).2,
             Some(true)
         );
-        assert_eq!(silence_evidence(Exchange::Streaming), Some(true));
+        assert_eq!(exchange_evidence(Exchange::Streaming, false).2, Some(true));
         for fault in [Fault::DeadlineExceeded, Fault::Cancelled] {
             assert_eq!(
-                silence_evidence(Exchange::Failed {
-                    fault,
-                    socket_failure: false
-                }),
+                exchange_evidence(
+                    Exchange::Failed {
+                        fault,
+                        socket_failure: false
+                    },
+                    false
+                )
+                .2,
                 Some(false)
             );
             // A failed socket is link health's evidence.
             assert_eq!(
-                silence_evidence(Exchange::Failed {
-                    fault,
-                    socket_failure: true
-                }),
+                exchange_evidence(
+                    Exchange::Failed {
+                        fault,
+                        socket_failure: true
+                    },
+                    false
+                )
+                .2,
                 None
             );
         }
         for fault in [Fault::Unavailable, Fault::Io, Fault::Overloaded] {
             assert_eq!(
-                silence_evidence(Exchange::Failed {
-                    fault,
-                    socket_failure: false
-                }),
+                exchange_evidence(
+                    Exchange::Failed {
+                        fault,
+                        socket_failure: false
+                    },
+                    false
+                )
+                .2,
                 None
             );
         }

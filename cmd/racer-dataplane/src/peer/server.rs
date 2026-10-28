@@ -631,7 +631,7 @@ impl PeerServer {
                         }
                         Err(error) => {
                             use racer_core::route::{self, RelayFailure};
-                            match route::relay_failure_for(error.fault(), ping) {
+                            match route::relay_failure(error.fault(), ping) {
                                 RelayFailure::Respond(response) => self
                                     .forwarding
                                     .sign_response(&binding, peer_response(response))?,
@@ -854,7 +854,7 @@ impl PeerServer {
                     Ok(response) => return Ok(response),
                     Err(error) => error,
                 };
-                return match route::relay_failure_for(error.fault(), ping) {
+                return match route::relay_failure(error.fault(), ping) {
                     RelayFailure::Respond(response) => self
                         .forwarding
                         .sign_response(&binding, peer_response(response)),
@@ -1066,7 +1066,7 @@ fn header_scope(
     );
     Ok(header)
 }
-/// Whether `request` is a silence ping (`route::relay_failure_for`).
+/// Whether `request` is a silence ping (`route::relay_failure`).
 fn is_ping(request: &VerifiedRequest) -> bool {
     matches!(
         request.request().operation,
