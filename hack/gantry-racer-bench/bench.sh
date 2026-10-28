@@ -177,6 +177,7 @@ cmd_run() {
 	local start_at=$(($(date +%s) + LEAD))
 	local name="pull-$(date +%s)"
 	local layers=""
+	local nic_secs=${NIC_SECS:-0}
 
 	if [ "$mode" = curl ]; then
 		layers=$(kubectl -n "$NS" exec "$(tools_pod)" -- wget -qO- \
@@ -250,6 +251,16 @@ $(worker_affinity)
               done
               echo "READY \$NODE \$(date +%s.%N)"
               while [ "\$(date +%s)" -lt "\$START_AT" ]; do sleep 0.02; done
+              # Optional NIC sampler: eth0 cumulative tx:rx bytes once per second for
+              # NIC_SECS seconds, printed as one NIC line before RESULT.
+              nicf=/tmp/bench-nic.\$\$
+              if [ "$nic_secs" -gt 0 ]; then
+                (for i in \$(seq 0 $nic_secs); do
+                   echo "\$i:\$(cat /sys/class/net/eth0/statistics/tx_bytes):\$(cat /sys/class/net/eth0/statistics/rx_bytes)"
+                   sleep 1
+                 done | tr '\n' ' ' > "\$nicf") &
+                nicpid=\$!
+              fi
               t0=\$(date +%s.%N)
               rc=0
               bytes=0
@@ -266,6 +277,11 @@ $(worker_affinity)
                 rm -f "\$tmp"
               fi
               t1=\$(date +%s.%N)
+              if [ "$nic_secs" -gt 0 ]; then
+                wait "\$nicpid"
+                echo "NIC \$NODE \$(cat "\$nicf")"
+                rm -f "\$nicf"
+              fi
               echo "RESULT \$NODE \$MODE \$t0 \$t1 \$rc \$bytes"
               [ "\$rc" -eq 0 ] || echo "ERROR \$NODE \$(echo "\$out" | tr '\n' ' ' | head -c 500)"
               exec sleep infinity
@@ -316,7 +332,7 @@ EOF
 collect() {
 	local name=$1
 	kubectl -n "$NS" get pods -l run="$name" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' |
-		xargs -P 64 -I{} sh -c "kubectl -n $NS logs {} 2>/dev/null | grep -E '^(READY|RESULT|ERROR)' || true"
+		xargs -P 64 -I{} sh -c "kubectl -n $NS logs {} 2>/dev/null | grep -E '^(READY|RESULT|ERROR|NIC)' || true"
 }
 
 cmd_summarize() {
