@@ -99,6 +99,23 @@ pub fn relay_failure(fault: Fault) -> RelayFailure {
     }
 }
 
+/// Relay failure table for one forwarded exchange; `ping` marks a silence
+/// ping (`racer-mode: ping`). The pinging node reads a relay's signed
+/// `Unavailable` as "the destination is unreachable" and holds it silent
+/// (Known issues 41 and 43), so a ping's relay signs it only for a refusal
+/// of its own (`Unavailable`: it holds the destination silent, or has no
+/// route) and never for a transport failure (`Io`, `Os`). A destination
+/// that predates the ping mode rejects the request and closes the
+/// connection, which the relay sees as `Io`: that destination is alive.
+/// The error then propagates unsigned, which the pinging node counts as
+/// inconclusive. Other modes use [`relay_failure`].
+pub fn relay_failure_for(fault: Fault, ping: bool) -> RelayFailure {
+    if ping && matches!(fault, Fault::Io | Fault::Os) {
+        return RelayFailure::Propagate;
+    }
+    relay_failure(fault)
+}
+
 /// Local service failure table (`dispatch_verified`, destination branch).
 /// `None` propagates the error unsigned.
 pub fn serve_failure(fault: Fault) -> Option<Response> {
@@ -276,6 +293,29 @@ mod tests {
                 _ => RelayFailure::Propagate,
             };
             assert_eq!(relay, expected, "{fault:?}");
+            // Other modes keep the table; a ping drops only transport
+            // failures to unsigned.
+            assert_eq!(relay_failure_for(fault, false), expected, "{fault:?}");
+            let ping = if matches!(fault, Io | Os) {
+                RelayFailure::Propagate
+            } else {
+                expected
+            };
+            assert_eq!(relay_failure_for(fault, true), ping, "{fault:?}");
+        }
+        // A pre-ping destination closes on the unknown mode (`Io` at the
+        // relay): unsigned, not an `Unavailable` that silences it. A relay
+        // that holds the destination silent still signs `Unavailable`.
+        assert_eq!(relay_failure_for(Io, true), RelayFailure::Propagate);
+        assert_eq!(
+            relay_failure_for(Unavailable, true),
+            RelayFailure::RespondIfLive(Response::Unavailable)
+        );
+        assert_eq!(
+            relay_failure_for(Overloaded, true),
+            RelayFailure::Respond(Response::Overloaded)
+        );
+        for fault in all {
             assert_eq!(
                 waiter_failure(fault).is_some(),
                 fault == Overloaded,

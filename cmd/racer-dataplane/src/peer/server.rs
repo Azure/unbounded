@@ -538,6 +538,7 @@ impl PeerServer {
                         .node();
                     network.endpoint(membership, previous)?;
                     let binding = request.binding().clone();
+                    let ping = is_ping(&request);
                     let result = match self
                         .admission
                         .reserve(None, ResourceClass::Relay, 1)
@@ -630,7 +631,7 @@ impl PeerServer {
                         }
                         Err(error) => {
                             use racer_core::peer::hop::{self, RelayFailure};
-                            match hop::relay_failure(error.fault()) {
+                            match hop::relay_failure_for(error.fault(), ping) {
                                 RelayFailure::Respond(response) => self
                                     .forwarding
                                     .sign_response(&binding, peer_response(response))?,
@@ -842,6 +843,7 @@ impl PeerServer {
             network.endpoint(&membership, previous)?;
             if let Hop::Relay(_) = hop {
                 let binding = request.binding().clone();
+                let ping = is_ping(&request);
                 let result = self.relay.forward(request, membership, &scope).await;
                 let result = self.admission.policy().observer().result(
                     crate::telemetry::Stage::PeerRelay,
@@ -852,7 +854,7 @@ impl PeerServer {
                     Ok(response) => return Ok(response),
                     Err(error) => error,
                 };
-                return match hop::relay_failure(error.fault()) {
+                return match hop::relay_failure_for(error.fault(), ping) {
                     RelayFailure::Respond(response) => self
                         .forwarding
                         .sign_response(&binding, peer_response(response)),
@@ -1064,6 +1066,17 @@ fn header_scope(
     );
     Ok(header)
 }
+/// Whether `request` is a silence ping (`hop::relay_failure_for`).
+fn is_ping(request: &VerifiedRequest) -> bool {
+    matches!(
+        request.request().operation,
+        super::protocol::Operation::Page {
+            mode: super::protocol::FetchMode::Ping,
+            ..
+        }
+    )
+}
+
 /// Signed response for a failure class chosen by `racer_core::peer::hop`.
 fn peer_response(response: racer_core::peer::hop::Response) -> PeerResponse {
     use racer_core::peer::hop::Response;

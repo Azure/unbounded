@@ -33,7 +33,7 @@ use page_alloc::SegmentId;
 use racer_core::cache::segment::{SCAN_BUDGET, page_value, unseen_value};
 use racer_core::peer::Fault;
 use racer_core::peer::hop::{
-    Hop, HopRoute, RelayFailure, RelayPlan, Response, decide_hop, relay_failure,
+    Hop, HopRoute, RelayFailure, RelayPlan, Response, decide_hop, relay_failure_for,
 };
 use racer_core::peer::silence::{LINK_TIMEOUTS, NO_PING, RANK0_TIMEOUTS};
 use racer_core::read::Error;
@@ -3723,7 +3723,7 @@ impl NodeWorld {
             return;
         }
         let now = self.now();
-        let reply = match relay_failure(fault) {
+        let reply = match relay_failure_for(fault, m.ping) {
             RelayFailure::Respond(r) => Some(Reply::Response(response_kind(r))),
             RelayFailure::RespondIfLive(r) => {
                 (now < m.deadline).then_some(Reply::Response(response_kind(r)))

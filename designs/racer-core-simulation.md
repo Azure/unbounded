@@ -5733,8 +5733,14 @@ remainder was this class, so 40 is resolved too.
 Origin authority rules are unchanged: a silent rank 0 is a transport failure, which always gave
 authority, and only ranked owners take it. No budget grows: a ping has its own fixed grant, and a
 silent destination fails before credits are spent. Wire: one new mode value (`racer-mode: ping`);
-receivers that predate it reject the request, which still signs an answer and so proves them
-alive. Timing in production: half the client request timeout (`config.request_timeout / 2`) and
+receivers that predate it fail to decode the mode (`InvalidRequest`) and close the connection
+without a signed answer. Sent directly, that is an `Io` failure with no socket-failure mark: the
+ping is inconclusive and charges neither silence nor link health (`hop::silence_evidence`,
+`hop::exchange_link_outcome`). Through a relay, the relay sees the same `Io`; a relay signing
+`Unavailable` for it would make the pinging node hold a healthy old peer silent, so for a ping a
+relay propagates `Io` and `Os` unsigned instead (`hop::relay_failure_for`), which is again
+inconclusive. A relay that itself holds the destination silent still signs `Unavailable`. Copy
+offers to such a target end `Cut` and back off as any failed offer. Timing in production: half the client request timeout (`config.request_timeout / 2`) and
 one peer attempt per ping (`config.peer_attempt_timeout`), set in `src/app.rs`; in the simulator
 `read_timeout_ns / 2` and `attempt_timeout_ns`. Knob `node.silence` (default on); counters
 `silence_timeouts`, `silence_pings`, `silence_marks`, `silence_rechecks`,
