@@ -253,7 +253,11 @@ above:
 - The helper opens the cuFile driver on another thread at startup. Opening it
   probes every GPU and can take most of a second, which would otherwise delay
   the first disk read. A cuFile driver or registration failure turns cuFile off
-  until restart. A failed read only drops that file's registration.
+  until restart. When registration fails because cuFile does not support the
+  file, its filesystem, or its device (`CU_FILE_IO_NOT_SUPPORTED`,
+  `CU_FILE_DEVICE_NOT_SUPPORTED`, `CU_FILE_INVALID_FILE_TYPE`), only that
+  device (`st_dev`) skips cuFile until restart. A failed read only drops that
+  file's registration.
 - At startup the helper runs a zero-length decrypt on each GPU. A GPU whose
   shim has no decrypt kernels, or a staging cap smaller than the two scratch
   slots, gets plaintext pages only.

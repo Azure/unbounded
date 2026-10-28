@@ -1076,7 +1076,11 @@ Where the bytes come from decides who decrypts them:
   `racer_gpu_direct_disk_read_bytes_total` count these reads. After a cuFile
   driver or registration failure the dataplane logs
   `stage=gpu state=cufile-disabled` and reads through host memory until it
-  restarts.
+  restarts. When cuFile only rejects a file because its filesystem or device
+  is not supported, the dataplane logs
+  `stage=gpu state=cufile-unsupported dev=<major>:<minor> reason=<error>` once
+  for that device, reads files on that device through host memory until it
+  restarts, and keeps cuFile on for other devices.
 
 - With RDMA on, a page from a peer can be written by the peer's NIC straight
   into GPU memory on this node (GPUDirect RDMA). See below.
