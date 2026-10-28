@@ -771,13 +771,13 @@ fn response_kind(r: Response) -> ResponseKind {
     }
 }
 
-/// Link retry backoff, shaped like production `backoff` (`src/topology.rs`):
-/// 100 ms doubling per failure up to 20 s, plus up to a quarter of jitter. The
-/// jitter comes from a fixed mix instead of SHA-256 of the node name.
+/// Production link backoff (`racer_core::route::link_backoff`), with jitter
+/// from a fixed mix instead of SHA-256 of the node name.
 fn link_backoff(node: &u32, failures: u32) -> Duration {
-    let base = (100u64 << failures.saturating_sub(1).min(8)).min(20_000);
-    let jitter = mix((u64::from(*node) << 32) | u64::from(failures)) % (base / 4 + 1);
-    Duration::from_millis(base + jitter)
+    racer_core::route::link_backoff(
+        failures,
+        mix((u64::from(*node) << 32) | u64::from(failures)),
+    )
 }
 
 pub struct NodeWorld {

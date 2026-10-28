@@ -150,8 +150,28 @@ pub fn relay<N: PartialEq>(
     links.checked_sub(1).ok_or(RouteFault::HopBudgetExhausted)
 }
 
+/// Link retry backoff after `failures` consecutive failures: 100 ms
+/// doubling per failure up to 20 s, plus `jitter` reduced to at most a
+/// quarter of the base. Callers supply `jitter` deterministically per link.
+pub fn link_backoff(failures: u32, jitter: u64) -> std::time::Duration {
+    let base = (100u64 << failures.saturating_sub(1).min(8)).min(20_000);
+    std::time::Duration::from_millis(base + jitter % (base / 4 + 1))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn link_backoff_doubles_caps_and_bounds_jitter() {
+        use std::time::Duration;
+        assert_eq!(link_backoff(0, 0), Duration::from_millis(100));
+        assert_eq!(link_backoff(1, 0), Duration::from_millis(100));
+        assert_eq!(link_backoff(2, 0), Duration::from_millis(200));
+        assert_eq!(link_backoff(40, 0), Duration::from_millis(20_000));
+        assert_eq!(link_backoff(1, 25), Duration::from_millis(125));
+        assert_eq!(link_backoff(1, 26), Duration::from_millis(100));
+        assert!(link_backoff(40, u64::MAX) <= Duration::from_millis(25_000));
+    }
+
     use super::*;
     use std::time::Duration;
 

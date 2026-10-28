@@ -216,13 +216,14 @@ impl LinkHealth {
 pub const SILENCE_PING_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn backoff(node: &NodeId, failures: u32) -> Duration {
-    let base = (100u64 << failures.saturating_sub(1).min(8)).min(20_000);
     let mut digest = hash_domain(b"racer/link-backoff/v1\0");
     hash_bytes(&mut digest, node.0.as_bytes());
     digest.update(failures.to_be_bytes());
     let digest = hash_finish(digest);
-    let jitter = u64::from(u16::from_be_bytes([digest[0], digest[1]])) % (base / 4 + 1);
-    Duration::from_millis(base + jitter)
+    racer_core::route::link_backoff(
+        failures,
+        u64::from(u16::from_be_bytes([digest[0], digest[1]])),
+    )
 }
 
 pub(crate) fn hash_object(hash: &mut Sha256, object: &ObjectId, page: PageNumber) {
