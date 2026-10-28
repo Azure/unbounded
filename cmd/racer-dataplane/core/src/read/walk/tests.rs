@@ -259,10 +259,7 @@ fn owner_asks_handoff_targets_copy_only_after_predecessors() {
     // A stale handoff target is only a miss.
     let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
     cfg.handoff = 1;
-    let mut walk = CandidateWalk::new(cfg);
-    let (probes, end) = drive(&mut walk, &mut budget(8, 32), |_, _| {
-        Outcome::StaleMembership
-    });
+    let (probes, end) = run(cfg, 8, 32, |_, _| Outcome::StaleMembership);
     assert_eq!(probes.len(), 1);
     assert!(matches!(end, End::Origin { rank: 0, .. }));
     // A handoff target's copy wins.
@@ -281,8 +278,7 @@ fn owner_asks_handoff_targets_copy_only_after_predecessors() {
     let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
     cfg.handoff = 3;
     cfg.page_operation = false;
-    let mut walk = CandidateWalk::new(cfg);
-    let (probes, _) = drive(&mut walk, &mut budget(8, 32), |_, _| unreachable!());
+    let (probes, _) = run(cfg, 8, 32, |_, _| unreachable!());
     assert!(probes.is_empty());
 }
 
@@ -316,14 +312,12 @@ fn handoff_probes_never_spend_the_origin_credit() {
     // One credit: straight to origin.
     let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
     cfg.handoff = 3;
-    let mut walk = CandidateWalk::new(cfg);
-    let (probes, _) = drive(&mut walk, &mut budget(1, 32), |_, _| unreachable!());
+    let (probes, _) = run(cfg, 1, 32, |_, _| unreachable!());
     assert!(probes.is_empty());
     // No links left for a route: straight to origin.
     let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
     cfg.handoff = 1;
-    let mut walk = CandidateWalk::new(cfg);
-    let (probes, _) = drive(&mut walk, &mut budget(8, 0), |_, _| unreachable!());
+    let (probes, _) = run(cfg, 8, 0, |_, _| unreachable!());
     assert!(probes.is_empty());
 }
 
@@ -945,8 +939,7 @@ fn predecessors_with_unchanged_rank_are_asked_under_the_previous_membership() {
     // A copy from the predecessor asked under the previous membership wins.
     let mut cfg = config(Some(1), 3, VisitOrder::canonical(3));
     cfg.previous = 0b01;
-    let mut walk = CandidateWalk::new(cfg);
-    let (probes, end) = drive(&mut walk, &mut budget(8, 32), |_, _| Outcome::Copy);
+    let (probes, end) = run(cfg, 8, 32, |_, _| Outcome::Copy);
     assert!(probes[0].0.previous);
     assert_eq!(end, End::Copy);
     // Non-owners and non-page walks ignore the bits.
@@ -1118,17 +1111,23 @@ fn owner_probes_are_planned_exactly_as_without_a_helper() {
 fn helper_never_chains_and_owners_never_use_helpers() {
     // A helper inherits at most HELPER_ATTEMPTS - 1: too few to be eligible.
     const { assert!(HELPER_ATTEMPTS < HELPER_MIN_ATTEMPTS) };
-    let mut walk = CandidateWalk::new(helper_config(VisitOrder::canonical(3)));
-    let mut b = budget(HELPER_ATTEMPTS, 8);
-    let (probes, _) = drive(&mut walk, &mut b, |_, _| Outcome::Shed);
+    let (probes, _) = run(
+        helper_config(VisitOrder::canonical(3)),
+        HELPER_ATTEMPTS,
+        8,
+        |_, _| Outcome::Shed,
+    );
     assert!(probes.iter().all(|(p, ..)| p.canonical < 3));
     // Owners ignore the helper flag.
-    let mut walk = CandidateWalk::new(WalkConfig {
-        helper: true,
-        ..config(Some(2), 3, VisitOrder::canonical(3))
-    });
-    let mut b = budget(8, 16);
-    let (probes, end) = drive(&mut walk, &mut b, |_, _| Outcome::Shed);
+    let (probes, end) = run(
+        WalkConfig {
+            helper: true,
+            ..config(Some(2), 3, VisitOrder::canonical(3))
+        },
+        8,
+        16,
+        |_, _| Outcome::Shed,
+    );
     assert!(probes.iter().all(|(p, ..)| p.canonical < 2));
     assert!(matches!(end, End::Origin { rank: 2, .. }));
 }
@@ -1161,9 +1160,7 @@ fn small_budget_non_owner_visits_rank_zero_first() {
     // funding before any probe.
     let order = visit_order(ReplicaSelection::Spread, 3, |r| r == 2, |_| 0);
     assert_eq!(order.get(0), Some(2));
-    let mut walk = CandidateWalk::new(config(None, 3, order));
-    let mut b = budget(HELPER_ATTEMPTS - 1, 7);
-    let (probes, end) = drive(&mut walk, &mut b, |p, _| {
+    let (probes, end) = run(config(None, 3, order), HELPER_ATTEMPTS - 1, 7, |p, _| {
         if p.canonical == 0 {
             Outcome::Copy
         } else {
@@ -1222,30 +1219,42 @@ fn owner_leaves_the_fetch_to_rank_zero_after_a_timeout() {
     assert!(walk.rank0_unanswered());
     // Copy-only probe of rank 0 (too few credits to delegate): it joined
     // rank 0's running acquisition, so the same holds.
-    let mut walk = CandidateWalk::new(config(Some(1), 3, VisitOrder::canonical(3)));
-    let (probes, end) = drive(&mut walk, &mut budget(2, 16), |_, _| Outcome::TimedOut);
+    let (probes, end) = run(
+        config(Some(1), 3, VisitOrder::canonical(3)),
+        2,
+        16,
+        |_, _| Outcome::TimedOut,
+    );
     assert_eq!(probes[0].0.mode, Mode::CopyOnly);
     assert_eq!(end, End::Exhausted { funding: false });
     // Rank 2: rank 0 timed out, rank 1 still asked copy-only; its copy wins.
-    let mut walk = CandidateWalk::new(config(Some(2), 3, VisitOrder::canonical(3)));
-    let (probes, end) = drive(&mut walk, &mut budget(8, 32), |p, _| {
-        if p.canonical == 0 {
-            Outcome::TimedOut
-        } else {
-            Outcome::Copy
-        }
-    });
+    let (probes, end) = run(
+        config(Some(2), 3, VisitOrder::canonical(3)),
+        8,
+        32,
+        |p, _| {
+            if p.canonical == 0 {
+                Outcome::TimedOut
+            } else {
+                Outcome::Copy
+            }
+        },
+    );
     assert_eq!(probes.len(), 2);
     assert_eq!(end, End::Copy);
     // Rank 2: rank 0 timed out and rank 1 missed: still no origin.
-    let mut walk = CandidateWalk::new(config(Some(2), 3, VisitOrder::canonical(3)));
-    let (_, end) = drive(&mut walk, &mut budget(8, 32), |p, _| {
-        if p.canonical == 0 {
-            Outcome::TimedOut
-        } else {
-            Outcome::Probe(ProbeOutcome::CopyMiss)
-        }
-    });
+    let (_, end) = run(
+        config(Some(2), 3, VisitOrder::canonical(3)),
+        8,
+        32,
+        |p, _| {
+            if p.canonical == 0 {
+                Outcome::TimedOut
+            } else {
+                Outcome::Probe(ProbeOutcome::CopyMiss)
+            }
+        },
+    );
     assert_eq!(end, End::Exhausted { funding: false });
 }
 
@@ -1267,14 +1276,18 @@ fn only_an_owner_probe_of_rank_zero_timing_out_withholds_origin() {
         assert!(!walk.rank0_unanswered());
     }
     // Rank 2: rank 1 timing out (copy-only) does not withhold origin.
-    let mut walk = CandidateWalk::new(config(Some(2), 3, VisitOrder::canonical(3)));
-    let (_, end) = drive(&mut walk, &mut budget(8, 32), |p, _| {
-        if p.canonical == 0 {
-            Outcome::Probe(ProbeOutcome::CopyMiss)
-        } else {
-            Outcome::TimedOut
-        }
-    });
+    let (_, end) = run(
+        config(Some(2), 3, VisitOrder::canonical(3)),
+        8,
+        32,
+        |p, _| {
+            if p.canonical == 0 {
+                Outcome::Probe(ProbeOutcome::CopyMiss)
+            } else {
+                Outcome::TimedOut
+            }
+        },
+    );
     assert_eq!(
         end,
         End::Origin {
@@ -1285,14 +1298,12 @@ fn only_an_owner_probe_of_rank_zero_timing_out_withholds_origin() {
     // Non-page walks (metadata) keep the timeout as transient evidence.
     let mut cfg = config(Some(1), 3, VisitOrder::canonical(3));
     cfg.page_operation = false;
-    let mut walk = CandidateWalk::new(cfg);
-    let (_, end) = drive(&mut walk, &mut budget(8, 32), |_, _| Outcome::TimedOut);
+    let (_, end) = run(cfg, 8, 32, |_, _| Outcome::TimedOut);
     assert!(matches!(end, End::Origin { rank: 1, .. }));
     // A handoff target timing out is only a miss.
     let mut cfg = config(Some(0), 3, VisitOrder::canonical(3));
     cfg.handoff = 1;
-    let mut walk = CandidateWalk::new(cfg);
-    let (probes, end) = drive(&mut walk, &mut budget(8, 32), |_, _| Outcome::TimedOut);
+    let (probes, end) = run(cfg, 8, 32, |_, _| Outcome::TimedOut);
     assert_eq!(probes.len(), 1);
     assert!(matches!(end, End::Origin { rank: 0, .. }));
     // Non-owner: identical to an unreachable owner, including the route
@@ -1338,8 +1349,7 @@ fn rank_zero_watch_bounds_the_timeout_rule() {
         Outcome::Probe(ProbeOutcome::CopyMiss),
         Outcome::Probe(ProbeOutcome::Unreachable),
     ] {
-        let mut walk = CandidateWalk::new(with(1, Rank0State::Fetching));
-        let (_, end) = drive(&mut walk, &mut budget(8, 32), |_, _| outcome);
+        let (_, end) = run(with(1, Rank0State::Fetching), 8, 32, |_, _| outcome);
         assert!(matches!(end, End::Origin { rank: 1, .. }), "{outcome:?}");
     }
     // Overdue: a timeout is a transport failure again, at rank 1 and 2.
@@ -1347,8 +1357,7 @@ fn rank_zero_watch_bounds_the_timeout_rule() {
     let (_, end) = drive(&mut walk, &mut budget(8, 32), |_, _| Outcome::TimedOut);
     assert!(matches!(end, End::Origin { rank: 1, .. }));
     assert!(!walk.rank0_unanswered());
-    let mut walk = CandidateWalk::new(with(2, Rank0State::Overdue));
-    let (_, end) = drive(&mut walk, &mut budget(8, 32), |p, _| {
+    let (_, end) = run(with(2, Rank0State::Overdue), 8, 32, |p, _| {
         if p.canonical == 0 {
             Outcome::TimedOut
         } else {
@@ -2225,8 +2234,7 @@ fn rank_zero_failure_withholds_origin_after_an_own_origin_failure() {
     assert_eq!(end, End::Exhausted { funding: false });
     assert!(walk.rank0_unanswered());
     // Rank 2: rank 1 is still asked copy-only and its copy wins.
-    let mut walk = CandidateWalk::new(with(2, Rank0State::Failed));
-    let (probes, end) = drive(&mut walk, &mut budget(8, 32), |p, _| {
+    let (probes, end) = run(with(2, Rank0State::Failed), 8, 32, |p, _| {
         if p.canonical == 0 {
             Outcome::Failed
         } else {
@@ -2236,8 +2244,7 @@ fn rank_zero_failure_withholds_origin_after_an_own_origin_failure() {
     assert_eq!(probes.len(), 2);
     assert_eq!(end, End::Copy);
     // Copy-only probe of rank 0 (too few credits to delegate).
-    let mut walk = CandidateWalk::new(with(1, Rank0State::Failed));
-    let (probes, end) = drive(&mut walk, &mut budget(2, 16), |_, _| Outcome::Failed);
+    let (probes, end) = run(with(1, Rank0State::Failed), 2, 16, |_, _| Outcome::Failed);
     assert_eq!(probes[0].0.mode, Mode::CopyOnly);
     assert_eq!(end, End::Exhausted { funding: false });
     // Without an own failure the owner fetches.
@@ -2261,8 +2268,7 @@ fn rank_zero_failure_withholds_origin_after_an_own_origin_failure() {
         Outcome::Probe(ProbeOutcome::CopyMiss),
         Outcome::Shed,
     ] {
-        let mut walk = CandidateWalk::new(with(1, Rank0State::Failed));
-        let (_, end) = drive(&mut walk, &mut budget(8, 32), |_, _| outcome);
+        let (_, end) = run(with(1, Rank0State::Failed), 8, 32, |_, _| outcome);
         assert!(matches!(end, End::Origin { rank: 1, .. }), "{outcome:?}");
     }
     // Same probes and budget as an Unavailable signed by a relay.
