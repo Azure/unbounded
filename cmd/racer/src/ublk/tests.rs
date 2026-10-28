@@ -763,6 +763,7 @@ fn ublk_device_serves_the_directory_read_path() {
                     .wait(Duration::from_millis(1))
                     .expect("reactor wait");
             }
+            fixture.reactor.in_flight()
         })
     };
     let control = {
@@ -811,7 +812,11 @@ fn ublk_device_serves_the_directory_read_path() {
     control.join().expect("control thread");
     assert!(manager.control_done());
     done.store(true, Ordering::Relaxed);
-    worker.join().expect("worker thread");
+    assert_eq!(
+        worker.join().expect("worker thread"),
+        0,
+        "the worker fenced every reactor operation"
+    );
     assert!(
         wait_gone(&block_path),
         "{} still present",
