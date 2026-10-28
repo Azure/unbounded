@@ -78,27 +78,18 @@ pub struct PassInputs<'a> {
 }
 
 /// Shortest join hold-down: after a membership version change, new members
-/// wait at least this long before the next version admits them, so a storm
-/// of joining Pods costs at most one membership version per hold instead of
-/// one per debounced pass. Passes run at least every `LEASE_RENEW` (10 s),
-/// so a held join lands within one hold plus one pass. Removals are not
-/// held. See [`join_hold_secs`].
+/// wait at least this long, so a storm of joining Pods costs one version per
+/// hold. Removals are not held. See [`join_hold_secs`].
 pub const JOIN_HOLD_SECS: u64 = 10;
 
 /// Longest join hold-down.
 pub const MAX_JOIN_HOLD_SECS: u64 = 60;
 
 /// Join hold-down for a cluster of `members` (the larger of the membership
-/// and the Nodes with an eligible Pod): one second per thousand, within [`JOIN_HOLD_SECS`] and [`MAX_JOIN_HOLD_SECS`].
-///
-/// Every version costs each client a reply, and a client that is two or
-/// more versions behind gets the full image (about 120 bytes per member)
-/// instead of a delta. The cost of one round of full replies grows with
-/// the square of the membership while seat capacity grows only linearly
-/// (`MEMBERS_PER_SEAT`), so the hold grows with the membership to keep
-/// clients within one version. At 50,000 members a 10 s hold produced 33
-/// versions during enrollment, 646k full fallbacks and 2.9 TB of seat
-/// egress (designs/racer-core-simulation.md, "Joining members").
+/// and the Nodes with an eligible Pod): one second per thousand, within
+/// [`JOIN_HOLD_SECS`] and [`MAX_JOIN_HOLD_SECS`]. Full-image replies to
+/// clients two versions behind cost the square of the membership, so the
+/// hold grows with it to keep clients within one version.
 pub fn join_hold_secs(members: usize) -> u64 {
     (members as u64 / 1000).clamp(JOIN_HOLD_SECS, MAX_JOIN_HOLD_SECS)
 }
@@ -248,10 +239,8 @@ pub fn plan_pass(i: &PassInputs<'_>, rng: &mut dyn Entropy) -> Result<PassPlan, 
         || next.desired_seats != base.desired_seats
         || next.sequence != base.sequence
         || next.membership_version != base.membership_version;
-    // An unchanged record keeps the previous image, and with it the delta
-    // from the version before: rebuilding it against itself would drop the
-    // delta, so every client one version behind would get the full image
-    // (Known issue 20), and it would re-encode the image on every pass.
+    // An unchanged record keeps the previous image and its delta from the
+    // version before; rebuilding it against itself would drop the delta.
     let image = prepared.map(|p| match i.previous_image {
         Some(prev) if prev.record == p.record => prev.clone(),
         _ => Image::new(p.record, p.publication, p.encoded, i.previous_image),
@@ -363,8 +352,7 @@ pub fn discovery(
     }
 }
 
-/// Primary Lease contention (`primary::contend`).
-/// Contention state of one seat holder.
+/// Primary Lease contention state of one seat holder (`primary::contend`).
 #[derive(Default)]
 pub struct Contend {
     observer: Observer,
@@ -400,6 +388,7 @@ mod tests {
     use serde_json::json;
 
     const C: &str = "c1c1c1c1-0000-4000-8000-000000000001";
+    const NOW: u64 = 1_800_000_000;
 
     fn ownership() -> Ownership {
         Ownership {
@@ -447,81 +436,71 @@ mod tests {
         })
     }
 
-    fn inputs<'a>(
-        inv: &'a Inventory,
-        own: &'a Ownership,
-        policy: &'a Policy,
-        live: &'a BTreeMap<usize, LeaseObservation>,
-        w: &'a Writer,
-        current: Option<&'a StateRecord>,
-        image: Option<&'a Image>,
-    ) -> PassInputs<'a> {
-        PassInputs {
-            cluster: C,
-            pod_uid: "pod-uid",
-            seats: SeatPolicy::Auto,
-            peer_port: 8082,
-            policy,
-            inventory: inv,
-            synced: inv.synced(),
-            ownership: own,
-            current,
-            previous_image: image,
-            live,
-            writer: w,
-            wall_unix: 1_800_000_000,
-            membership_changed_unix: None,
-        }
+    /// One pass over `inv` with no live seats, after `prev` (committed
+    /// record and image) and a membership change at `changed`.
+    fn pass(
+        inv: &Inventory,
+        prev: Option<(&StateRecord, &Image)>,
+        changed: Option<u64>,
+        rng: &mut dyn Entropy,
+    ) -> Result<PassPlan, StateError> {
+        let (own, live, w) = (ownership(), BTreeMap::new(), writer());
+        let policy = Policy::from(crate::Rotation::default());
+        plan_pass(
+            &PassInputs {
+                cluster: C,
+                pod_uid: "pod-uid",
+                seats: SeatPolicy::Auto,
+                peer_port: 8082,
+                policy: &policy,
+                inventory: inv,
+                synced: inv.synced(),
+                ownership: &own,
+                current: prev.map(|p| p.0),
+                previous_image: prev.map(|p| p.1),
+                live: &live,
+                writer: &w,
+                wall_unix: NOW,
+                membership_changed_unix: changed,
+            },
+            rng,
+        )
     }
 
-    /// Known issue 14: Pods that have not reported (not serving yet) wait,
-    /// but still size the seats; reporting admits them.
+    fn seeded(inv: &Inventory, prev: Option<(&StateRecord, &Image)>, seed: u64) -> PassPlan {
+        pass(inv, prev, None, &mut SplitMix64::new(seed)).unwrap()
+    }
+
+    fn members(p: PassPlan) -> usize {
+        p.image.unwrap().publication.members.len()
+    }
+
+    fn report(inv: &mut Inventory, pod: &str) {
+        inv.pods.get_mut(pod).unwrap().annotations.insert(
+            annotations::REPORT.into(),
+            r#"{"shares":1,"rdma_nics":[]}"#.into(),
+        );
+    }
+
+    /// Pods that have not reported (not serving yet) wait, but still size
+    /// the seats; reporting admits them.
     #[test]
     fn unreported_pods_wait_but_size_seats() {
         let mut inv = inventory(40);
         for p in inv.pods.values_mut() {
             p.annotations.clear();
         }
-        let own = ownership();
-        let policy = Policy::from(crate::Rotation::default());
-        let live = BTreeMap::new();
-        let w = writer();
-        let p = plan_pass(
-            &inputs(&inv, &own, &policy, &live, &w, None, None),
-            &mut SplitMix64::new(1),
-        )
-        .unwrap();
+        let p = seeded(&inv, None, 1);
         let image = p.image.expect("image");
         // Bootstrap: an empty membership is published.
         assert!(image.publication.members.is_empty());
-        let all = plan_pass(
-            &inputs(&inventory(40), &own, &policy, &live, &w, None, None),
-            &mut SplitMix64::new(1),
-        )
-        .unwrap();
+        let all = seeded(&inventory(40), None, 1);
         assert_eq!(p.desired, all.desired);
         // One Pod reports: it joins at once (empty history, no hold).
-        let committed = p.next;
-        let pod = inv.pods.get_mut("0").unwrap();
-        pod.annotations.insert(
-            annotations::REPORT.into(),
-            r#"{"shares":1,"rdma_nics":[]}"#.into(),
-        );
-        let p2 = plan_pass(
-            &inputs(
-                &inv,
-                &own,
-                &policy,
-                &live,
-                &w,
-                Some(&committed),
-                Some(&image),
-            ),
-            &mut SplitMix64::new(2),
-        )
-        .unwrap();
-        assert_eq!(p2.image.unwrap().publication.members.len(), 1);
+        report(&mut inv, "0");
+        let p2 = seeded(&inv, Some((&p.next, &image)), 2);
         assert_eq!(p2.desired, all.desired);
+        assert_eq!(members(p2), 1);
     }
 
     #[test]
@@ -537,45 +516,19 @@ mod tests {
     /// the cluster, not by the small membership.
     #[test]
     fn join_hold_is_sized_by_eligible_pods() {
-        let own = ownership();
-        let policy = Policy::from(crate::Rotation::default());
-        let live = BTreeMap::new();
-        let w = writer();
         let mut inv = inventory(11_000);
         for (k, p) in inv.pods.iter_mut() {
             if k.parse::<usize>().unwrap() >= 4 {
                 p.annotations.clear();
             }
         }
-        let first = plan_pass(
-            &inputs(&inv, &own, &policy, &live, &w, None, None),
-            &mut SplitMix64::new(1),
-        )
-        .unwrap();
+        let first = seeded(&inv, None, 1);
         let (committed, image) = (first.next, first.image.unwrap());
         assert_eq!(image.publication.members.len(), 4);
-        inv.pods.get_mut("4").unwrap().annotations.insert(
-            annotations::REPORT.into(),
-            r#"{"shares":1,"rdma_nics":[]}"#.into(),
-        );
+        report(&mut inv, "4");
         let at = |since: u64| {
-            let mut i = inputs(
-                &inv,
-                &own,
-                &policy,
-                &live,
-                &w,
-                Some(&committed),
-                Some(&image),
-            );
-            i.membership_changed_unix = Some(1_800_000_000 - since);
-            plan_pass(&i, &mut SplitMix64::new(2))
-                .unwrap()
-                .image
-                .unwrap()
-                .publication
-                .members
-                .len()
+            let prev = Some((&committed, &image));
+            members(pass(&inv, prev, Some(NOW - since), &mut SplitMix64::new(2)).unwrap())
         };
         assert_eq!(join_hold_secs(11_000), 11);
         assert_eq!(at(JOIN_HOLD_SECS), 4, "held for 11 s, not 10");
@@ -583,36 +536,16 @@ mod tests {
     }
 
     /// New members are batched: within the hold after a membership change
-    /// they wait; afterwards they join.
+    /// they wait; afterwards they join. Removals are never held.
     #[test]
     fn join_hold_batches_new_members() {
-        let own = ownership();
-        let policy = Policy::from(crate::Rotation::default());
-        let live = BTreeMap::new();
-        let w = writer();
-        let inv = inventory(4);
-        let first = plan_pass(
-            &inputs(&inv, &own, &policy, &live, &w, None, None),
-            &mut SplitMix64::new(1),
-        )
-        .unwrap();
+        let first = seeded(&inventory(4), None, 1);
         let (committed, image) = (first.next, first.image.unwrap());
-        let more = inventory(6);
-        let at = |changed: Option<u64>| {
-            let mut i = inputs(
-                &more,
-                &own,
-                &policy,
-                &live,
-                &w,
-                Some(&committed),
-                Some(&image),
-            );
-            i.membership_changed_unix = changed;
-            plan_pass(&i, &mut SplitMix64::new(2)).unwrap()
+        let prev = Some((&committed, &image));
+        let at = |n: usize, changed: Option<u64>| {
+            pass(&inventory(n), prev, changed, &mut SplitMix64::new(2)).unwrap()
         };
-        let now = 1_800_000_000;
-        let held = at(Some(now - JOIN_HOLD_SECS + 1));
+        let held = at(6, Some(NOW - JOIN_HOLD_SECS + 1));
         assert!(!held.changed, "joins wait inside the hold");
         let held_image = held.image.unwrap();
         assert_eq!(held_image.publication.members.len(), 4);
@@ -620,103 +553,39 @@ mod tests {
             held_image.record.membership_version,
             committed.membership_version
         );
-        let open = at(Some(now - JOIN_HOLD_SECS));
+        let open = at(6, Some(NOW - JOIN_HOLD_SECS));
         assert!(open.changed);
-        assert_eq!(open.image.unwrap().publication.members.len(), 6);
+        assert_eq!(members(open), 6);
         // A new primary (no change recorded) does not hold.
-        assert_eq!(at(None).image.unwrap().publication.members.len(), 6);
-        // Removals are never held.
-        let fewer = inventory(3);
-        let mut i = inputs(
-            &fewer,
-            &own,
-            &policy,
-            &live,
-            &w,
-            Some(&committed),
-            Some(&image),
-        );
-        i.membership_changed_unix = Some(now);
-        let p = plan_pass(&i, &mut SplitMix64::new(3)).unwrap();
-        assert_eq!(p.image.unwrap().publication.members.len(), 3);
+        assert_eq!(members(at(6, None)), 6);
+        assert_eq!(members(at(3, Some(NOW))), 3);
     }
 
     #[test]
     fn first_pass_commits_then_settles() {
         let inv = inventory(4);
-        let own = ownership();
-        let policy = Policy::from(crate::Rotation::default());
-        let live = BTreeMap::new();
-        let w = writer();
-        let p = plan_pass(
-            &inputs(&inv, &own, &policy, &live, &w, None, None),
-            &mut SplitMix64::new(1),
-        )
-        .unwrap();
+        let p = seeded(&inv, None, 1);
         assert!(p.changed);
-        assert_eq!(p.desired, 3);
-        assert_eq!(p.eligible, 4);
+        assert_eq!((p.desired, p.eligible), (3, 4));
         let image = p.image.expect("complete observation builds an image");
         assert_eq!(image.record.sequence, p.next.sequence);
-        assert_eq!(
-            image.publication.members.len(),
-            4,
-            "{:?}",
-            image.publication.members
-        );
+        assert_eq!(image.publication.members.len(), 4);
         // Same observation over the committed record: nothing to write.
         let committed = p.next;
-        let p2 = plan_pass(
-            &inputs(
-                &inv,
-                &own,
-                &policy,
-                &live,
-                &w,
-                Some(&committed),
-                Some(&image),
-            ),
-            &mut SplitMix64::new(2),
-        )
-        .unwrap();
+        let p2 = seeded(&inv, Some((&committed, &image)), 2);
         assert!(!p2.changed);
         assert_eq!(p2.next.sequence, committed.sequence);
         // A new Node bumps the sequence and membership.
         let more = inventory(5);
-        let p3 = plan_pass(
-            &inputs(
-                &more,
-                &own,
-                &policy,
-                &live,
-                &w,
-                Some(&committed),
-                Some(&image),
-            ),
-            &mut SplitMix64::new(3),
-        )
-        .unwrap();
+        let p3 = seeded(&more, Some((&committed, &image)), 3);
         assert!(p3.changed);
         assert_eq!(p3.next.sequence, committed.sequence + 1);
         assert_eq!(p3.next.membership_version, committed.membership_version + 1);
         let image3 = p3.image.unwrap();
         assert!(image3.delta.is_some());
         // A later pass with nothing new keeps that image and its delta, so
-        // clients one version behind still get a delta (Known issue 20).
-        let committed3 = p3.next;
-        let p4 = plan_pass(
-            &inputs(
-                &more,
-                &own,
-                &policy,
-                &live,
-                &w,
-                Some(&committed3),
-                Some(&image3),
-            ),
-            &mut SplitMix64::new(4),
-        )
-        .unwrap();
+        // clients one version behind still get a delta.
+        let p4 = seeded(&more, Some((&p3.next, &image3)), 4);
         assert!(!p4.changed);
         let image4 = p4.image.expect("complete observation keeps an image");
         assert_eq!(image4.record, image3.record);
@@ -731,15 +600,7 @@ mod tests {
     fn incomplete_observation_keeps_publication() {
         let mut inv = inventory(2);
         inv.pods_synced = false;
-        let own = ownership();
-        let policy = Policy::from(crate::Rotation::default());
-        let live = BTreeMap::new();
-        let w = writer();
-        let p = plan_pass(
-            &inputs(&inv, &own, &policy, &live, &w, None, None),
-            &mut Failing,
-        )
-        .unwrap();
+        let p = pass(&inv, None, None, &mut Failing).unwrap();
         assert!(p.image.is_none());
         assert_eq!(p.next.sequence, 0);
         // Term change alone still needs a commit.
@@ -756,14 +617,9 @@ mod tests {
                 "spec": {}
             })),
         );
-        let own = ownership();
-        let policy = Policy::from(crate::Rotation::default());
-        let live = BTreeMap::new();
-        let w = writer();
-        let i = inputs(&inv, &own, &policy, &live, &w, None, None);
         // A cache that fails to build is simply not in the catalog; when it
         // builds, keys need entropy and a failing source skips the pass.
-        if let Ok(p) = plan_pass(&i, &mut Failing) {
+        if let Ok(p) = pass(&inv, None, None, &mut Failing) {
             assert!(p.next.keyring.keys.is_empty());
         }
     }
@@ -827,19 +683,12 @@ mod tests {
         assert_eq!(d.ready, vec![0, 2]);
         assert_eq!(d.extra[annotations::CLAIM_WINDOW].as_deref(), Some("10"));
     }
-}
-
-#[cfg(test)]
-mod contend_tests {
-    use super::*;
-    use crate::{authority::election::LeaseSpec, entropy::Failing};
-    use racer_core::time::SplitMix64;
 
     fn primary(rv: &str, holder: Option<&str>) -> LeaseObservation {
         LeaseObservation {
             name: crate::annotations::PRIMARY_LEASE.into(),
             resource_version: rv.into(),
-            spec: LeaseSpec {
+            spec: election::LeaseSpec {
                 holder: holder.map(Into::into),
                 duration_secs: 30,
                 ..Default::default()
