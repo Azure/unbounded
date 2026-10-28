@@ -16,8 +16,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
+	"github.com/Azure/unbounded/internal/gantry/metrics"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
 	"github.com/Azure/unbounded/pkg/racersdk"
 )
@@ -412,7 +415,20 @@ func TestRacerRetryResumeMetadataMismatchAborts(t *testing.T) {
 	}
 }
 
-func TestRacerRetryMetricStageLabels(t *testing.T) {
+func TestRacerRetryMetrics(t *testing.T) {
+	m := NewMetrics(metrics.New())
+	m.MirrorRetry("get")
+	m.MirrorRetry("write_body")
+	m.MirrorRetry("unexpected")
+
+	for stage, want := range map[string]float64{"get": 1, "write_body": 1, "other": 1, "stat": 0} {
+		if got := testutil.ToFloat64(m.retries.WithLabelValues(stage)); got != want {
+			t.Fatalf("%s retries = %v, want %v", stage, got, want)
+		}
+	}
+}
+
+func TestRacerRetryWaitBudget(t *testing.T) {
 	var stages retryStages
 
 	r := &retryState{policy: retryPolicy{budget: time.Second, base: time.Millisecond, cap: time.Millisecond, observe: stages.observe}, deadline: time.Now().Add(time.Second)}
