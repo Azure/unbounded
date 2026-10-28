@@ -28,14 +28,13 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use flow_control::coalesce::flight::state::Outcome as FlightOutcome;
 use page_alloc::SegmentId;
 use racer_core::cache::{SCAN_BUDGET, page_value, unseen_value};
 use racer_core::liveness::{LINK_TIMEOUTS, NO_PING, RANK0_TIMEOUTS};
 use racer_core::read::Error;
 use racer_core::read::budget::{AcquisitionBudget, inherited_budget, stale_unused_links};
 use racer_core::read::budget::{fanout_helper, hot_page_bodies, is_helper, shed_hot_page};
-use racer_core::read::flight::{Event as FlightEvent, Joined, JoinedCopy};
+use racer_core::read::flight::{Joined, Wait as FlightEvent};
 use racer_core::read::hints::{
     Due, NOTICE_LINKS, notice_indexes, notice_target, offer_noted, should_notice,
 };
@@ -59,7 +58,7 @@ use racer_core::read::{
     validate_origin_authority, visit_order,
 };
 use racer_core::read::{DIRECT_AHEAD, PageBudget, SlotKind, direct_fills, first_failure};
-use racer_core::read::{FailureKind, FillPlan, FillStep, Source, WalkResult};
+use racer_core::read::{FillPlan, FillStep, Source, WalkResult};
 use racer_core::read::{
     Persist, PersistFacts, peer_error, persist, recoverable, retention_eligible, retention_score,
 };
@@ -73,7 +72,7 @@ use racer_core::time::SplitMix64;
 use serde_json::{Value, json};
 use topology::{PathQuery, Phantom, Placement, SharedRoutes};
 
-use super::admission::{Admit, PAGE_BYTES, Rejections, ResourceClass, SimCharge, reserve};
+use super::admission::{PAGE_BYTES, Rejections, ResourceClass, SimCharge, flight_charge, reserve};
 use super::ids::Ids;
 use super::membership::{Members, Versions, position};
 use super::state::{Components, Disk, Node, Shared, record_bytes};
@@ -1500,18 +1499,14 @@ impl NodeWorld {
         let n = &mut self.nodes[node as usize];
         let incarnation = n.incarnation;
         let worker = &mut n.workers[w as usize];
-        let mut admit = Admit {
-            quotas: &worker.quotas,
-            charges: &mut worker.charges,
-            ids: &self.ids,
-        };
+        let quotas = &worker.quotas;
         let joined = worker.flights.join(
             &page_id,
             instant,
             budget.deadline(),
             budget.remaining_attempts(),
             plaintext,
-            &mut admit,
+            |kind| flight_charge(quotas, kind),
             &mut wakes,
         );
         match joined {
@@ -1519,7 +1514,8 @@ impl NodeWorld {
                 self.metrics.incr("flight_join_rejected");
                 self.resolve_at(want, Err(e), t);
             }
-            Ok(Joined::Complete(_) | Joined::Partial(_)) => {
+            Ok(Joined::Miss) => unreachable!("acquisition joins never miss"),
+            Ok(Joined::Settled(_)) => {
                 self.metrics.incr("flight_completed_joins");
                 if !peer {
                     self.persist_page(node, w, page, eligible);
@@ -1529,9 +1525,14 @@ impl NodeWorld {
             Ok(Joined::Waiter(id)) => {
                 self.next_id += 1;
                 let token = self.next_id;
-                let event = worker
-                    .flights
-                    .poll(&page_id, id, instant, token, &mut wakes);
+                let event = worker.flights.poll(
+                    &page_id,
+                    id,
+                    instant,
+                    budget.remaining_attempts(),
+                    token,
+                    &mut wakes,
+                );
                 self.tokens.insert(
                     token,
                     Waiting {
@@ -1556,7 +1557,7 @@ impl NodeWorld {
                         }
                         self.metrics.incr("flight_joins");
                     }
-                    Ok(FlightEvent::Complete(_) | FlightEvent::Failed(_)) => wakes.push(token),
+                    Ok(FlightEvent::Ready(_) | FlightEvent::Failed(_)) => wakes.push(token),
                     Err(e) => {
                         self.tokens.remove(&token);
                         self.detach(node, w, page, id);
@@ -1574,12 +1575,7 @@ impl NodeWorld {
         let page_id = self.ids.page(page);
         let mut wakes = Vec::new();
         let worker = &mut self.nodes[node as usize].workers[w as usize];
-        let mut admit = Admit {
-            quotas: &worker.quotas,
-            charges: &mut worker.charges,
-            ids: &self.ids,
-        };
-        worker.flights.detach(&page_id, id, &mut admit, &mut wakes);
+        worker.flights.detach(&page_id, id, &mut wakes);
         for token in wakes {
             self.wake(token);
         }
@@ -1597,15 +1593,19 @@ impl NodeWorld {
         let now = self.instant(self.now());
         let mut wakes = Vec::new();
         let worker = &mut self.nodes[waiting.node as usize].workers[waiting.worker as usize];
+        let attempts = waiting
+            .budget
+            .as_ref()
+            .map_or(0, AcquisitionBudget::remaining_attempts);
         let event = worker
             .flights
-            .poll(&page_id, waiting.id, now, token, &mut wakes);
+            .poll(&page_id, waiting.id, now, attempts, token, &mut wakes);
         let result = match event {
             Ok(FlightEvent::Pending) => {
                 self.tokens.insert(token, waiting);
                 return;
             }
-            Ok(FlightEvent::Complete(_)) => {
+            Ok(FlightEvent::Ready(_)) => {
                 if let Want::Client(_) = waiting.want {
                     self.persist_page(waiting.node, waiting.worker, waiting.page, waiting.eligible);
                 }
@@ -1614,7 +1614,7 @@ impl NodeWorld {
             Ok(FlightEvent::Failed(e)) | Err(e) => Err(e),
             Ok(FlightEvent::Lead) if waiting.budget.is_some() => {
                 // The previous leader's origin attempt was rejected for its
-                // credentials (`PageFlights::reject`); this waiter fills with
+                // credentials (`PageFlights::finish`); this waiter fills with
                 // its own budget, as production re-elects in `Flights::fail`.
                 self.metrics.incr("flight_reelected");
                 let mut waiting = waiting;
@@ -1971,13 +1971,23 @@ impl NodeWorld {
                 }
             }
         }
-        // Production retains the fill as a flight operation before submitting
-        // it (`src/read/fill.rs`, `retain_operation`): a revoked leader's
+        // Production lets the running fill pass to another live waiter when
+        // its leader expires (Known issue 30, `Flights::allow_handover`),
+        // bounded by a hard ceiling on its owned scope. It then retains the
+        // fill as a flight operation before submitting it
+        // (`Flights::retain_driver_operation`): a revoked leader's
         // still-running fill keeps the flight draining, so no second leader
         // starts a concurrent fill for the page (Known issue 24).
-        let retained = self.nodes[node as usize].workers[w as usize]
-            .flights
-            .retain_operation(&self.ids.page(page), leader);
+        let handover = self.config.node.flight_handover;
+        let page_id = self.ids.page(page);
+        let mut wakes = Vec::new();
+        let flights = &mut self.nodes[node as usize].workers[w as usize].flights;
+        let retained = if handover {
+            flights.allow_handover(&page_id, leader, &mut wakes)
+        } else {
+            Ok(())
+        }
+        .and_then(|()| flights.retain_operation(&page_id, leader, &mut wakes));
         self.invariants.check(
             "flight_leader_valid",
             retained.is_ok(),
@@ -1985,15 +1995,6 @@ impl NodeWorld {
             Some(node),
             || format!("retain page {page} leader {leader}: {retained:?}"),
         );
-        // Production lets the running fill pass to another live waiter when
-        // its leader expires (Known issue 30, `Flights::allow_handover`),
-        // bounded by a hard ceiling on its owned scope.
-        let handover = self.config.node.flight_handover;
-        if handover {
-            let _ = self.nodes[node as usize].workers[w as usize]
-                .flights
-                .allow_handover(&self.ids.page(page), leader);
-        }
         let scope = racer_core::read::flight::handover_ceiling(
             self.instant(self.engine.now()),
             budget.deadline(),
@@ -2058,6 +2059,9 @@ impl NodeWorld {
         match failed {
             Some(e) => self.finish_fill(id, Err(e)),
             None => self.begin_walk(id),
+        }
+        for token in wakes {
+            self.wake(token);
         }
     }
 
@@ -4065,17 +4069,17 @@ impl NodeWorld {
         let n = &mut self.nodes[dest as usize];
         let incarnation = n.incarnation;
         let worker = &mut n.workers[w as usize];
-        let mut admit = Admit {
-            quotas: &worker.quotas,
-            charges: &mut worker.charges,
-            ids: &self.ids,
-        };
-        let joined = worker
-            .flights
-            .join_copy(&page_id, instant, deadline, &mut admit, &mut wakes);
+        let quotas = &worker.quotas;
+        let joined = worker.flights.join_copy(
+            &page_id,
+            instant,
+            deadline,
+            |kind| flight_charge(quotas, kind),
+            &mut wakes,
+        );
         let handled = match joined {
-            Ok(JoinedCopy::Miss) => false,
-            Ok(JoinedCopy::Complete(_) | JoinedCopy::Partial(_)) => {
+            Ok(Joined::Miss) => false,
+            Ok(Joined::Settled(_)) => {
                 self.metrics.incr("copy_only_flight_hits");
                 self.send_reply(mid, dest, Reply::Response(ResponseKind::Page), t);
                 true
@@ -4086,14 +4090,14 @@ impl NodeWorld {
                 self.send_reply(mid, dest, reply, t);
                 true
             }
-            Ok(JoinedCopy::Waiter(id)) => {
+            Ok(Joined::Waiter(id)) => {
                 self.metrics.incr("copy_only_flight_joins");
                 self.next_id += 1;
                 let token = self.next_id;
                 let worker = &mut self.nodes[dest as usize].workers[w as usize];
                 let event = worker
                     .flights
-                    .poll(&page_id, id, instant, token, &mut wakes);
+                    .poll(&page_id, id, instant, 0, token, &mut wakes);
                 self.tokens.insert(
                     token,
                     Waiting {
@@ -5945,11 +5949,6 @@ impl NodeWorld {
         // and `let _ = flights.publish_acquired(..)`): a leader revoked while
         // its fill ran (canceled or past its deadline) cannot settle the
         // flight, which already drained to a retry once the fill completed.
-        let mut admit = Admit {
-            quotas: &worker.quotas,
-            charges: &mut worker.charges,
-            ids: &self.ids,
-        };
         if fill.canceled {
             // Production cancels the fill because the leader's scope expired
             // (`Operation::cancellation_requested`) and completes the
@@ -5960,38 +5959,24 @@ impl NodeWorld {
                 .flights
                 .refresh(&page_id, self.base + Duration::from_nanos(now), &mut wakes);
         }
-        let completed = worker
-            .flights
-            .complete_operation(&page_id, &mut admit, &mut wakes);
+        let completed = worker.flights.complete_operation(&page_id, &mut wakes);
         let active = worker.flights.is_leader(&page_id, fill.leader);
         if !active {
             self.metrics.incr("flight_stale_finishes");
         }
         // Same leader settlement as production `Fill` (`src/read/fill.rs`):
         // a credential rejection fails only the leader and re-elects.
-        let finished = match result.map_err(racer_core::read::acquisition_failure) {
-            _ if !active => Ok(()),
-            Ok(_) => worker.flights.finish(
+        let finished = if active {
+            worker.flights.finish(
                 &page_id,
                 fill.leader,
-                FlightOutcome::Published(self.config.page_bytes as u32),
+                result
+                    .map(|_| self.config.page_bytes as u32)
+                    .map_err(racer_core::read::acquisition_failure),
                 &mut wakes,
-            ),
-            Err(FailureKind::OriginRejected) => {
-                worker
-                    .flights
-                    .reject(&page_id, fill.leader, Error::OriginRejected, &mut wakes)
-            }
-            Err(FailureKind::OriginForbidden) => {
-                worker
-                    .flights
-                    .reject(&page_id, fill.leader, Error::OriginForbidden, &mut wakes)
-            }
-            Err(FailureKind::Terminal(e)) => {
-                worker
-                    .flights
-                    .finish(&page_id, fill.leader, FlightOutcome::Failed(e), &mut wakes)
-            }
+            )
+        } else {
+            Ok(())
         };
         self.invariants.check(
             "flight_leader_valid",

@@ -12,18 +12,15 @@
 //! simulated cache), so a charge never clones a `CacheId` string.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
 
 use flow_control::{Charge, Policy, Quotas, Rejection};
 use racer_core::read::Error;
-use racer_core::read::flight::FlightAdmission;
-use racer_object_wire::model::PageId;
+use racer_core::read::flight::Reserve;
 
 use super::config::NodeConfig;
-use super::ids::{CACHE, Ids};
-use crate::engine::Fixed;
+use super::ids::CACHE;
 
 pub use racer_core::admission::ResourceClass;
 use racer_core::admission::{Floors, Limits, Rules};
@@ -145,68 +142,14 @@ pub fn reserve(
         .map_err(read_error)
 }
 
-/// Flight and waiter charges held per page, as production `Flights` holds
-/// them with each waiter and flight.
-#[derive(Default)]
-pub struct PageCharges {
-    flight: Option<SimCharge>,
-    waiters: Vec<SimCharge>,
-}
-
-/// `FlightAdmission` over a worker's quotas.
-pub struct Admit<'a> {
-    pub quotas: &'a SimQuotas,
-    pub charges: &'a mut HashMap<u64, PageCharges, Fixed>,
-    pub ids: &'a Ids,
-}
-
-impl Admit<'_> {
-    fn entry(&mut self, page: &PageId) -> &mut PageCharges {
-        self.charges.entry(self.ids.key(page)).or_default()
-    }
-
-    fn tidy(&mut self, page: &PageId) {
-        let key = self.ids.key(page);
-        if self
-            .charges
-            .get(&key)
-            .is_some_and(|c| c.flight.is_none() && c.waiters.is_empty())
-        {
-            self.charges.remove(&key);
-        }
-    }
-}
-
-impl FlightAdmission for Admit<'_> {
-    fn waiter(&mut self, page: &PageId) -> Result<(), Error> {
-        let charge = reserve(self.quotas, ResourceClass::Waiter, 1);
-        match charge {
-            Ok(charge) => {
-                self.entry(page).waiters.push(charge);
-                Ok(())
-            }
-            Err(error) => {
-                self.tidy(page);
-                Err(error)
-            }
-        }
-    }
-
-    fn flight(&mut self, page: &PageId) -> Result<(), Error> {
-        let charge = reserve(self.quotas, ResourceClass::Flight, 1)?;
-        self.entry(page).flight = Some(charge);
-        Ok(())
-    }
-
-    fn release_waiter(&mut self, page: &PageId) {
-        self.entry(page).waiters.pop();
-        self.tidy(page);
-    }
-
-    fn release_flight(&mut self, page: &PageId) {
-        self.entry(page).flight = None;
-        self.tidy(page);
-    }
+/// A flight table reservation (`PageFlights::join`), held by the waiter or
+/// flight it admits as production `Flights` holds it.
+pub fn flight_charge(quotas: &SimQuotas, kind: Reserve) -> Result<SimCharge, Error> {
+    let class = match kind {
+        Reserve::Waiter => ResourceClass::Waiter,
+        Reserve::Flight => ResourceClass::Flight,
+    };
+    reserve(quotas, class, 1)
 }
 
 #[cfg(test)]
@@ -224,25 +167,21 @@ mod tests {
         let quotas = SimQuotas::new(SimPolicy::new(&config, rejections.clone()));
         assert_eq!(quotas.limit(ResourceClass::Waiter), 2);
         assert_eq!(quotas.limit(ResourceClass::Relay), 16);
-        let ids = Ids::new(1, 2, 4);
-        let mut charges = HashMap::default();
-        let mut admit = Admit {
-            quotas: &quotas,
-            charges: &mut charges,
-            ids: &ids,
-        };
-        let (a, b) = (ids.page(0), ids.page(1));
-        admit.waiter(&a).unwrap();
-        admit.flight(&a).unwrap();
-        admit.waiter(&b).unwrap();
-        assert_eq!(admit.flight(&b), Err(Error::Overloaded));
-        assert_eq!(admit.waiter(&b), Err(Error::Overloaded));
+        let wa = flight_charge(&quotas, Reserve::Waiter).unwrap();
+        let fa = flight_charge(&quotas, Reserve::Flight).unwrap();
+        let wb = flight_charge(&quotas, Reserve::Waiter).unwrap();
+        assert!(matches!(
+            flight_charge(&quotas, Reserve::Flight),
+            Err(Error::Overloaded)
+        ));
+        assert!(matches!(
+            flight_charge(&quotas, Reserve::Waiter),
+            Err(Error::Overloaded)
+        ));
         assert_eq!(quotas.used(ResourceClass::Waiter), 2);
-        admit.release_waiter(&a);
-        admit.release_flight(&a);
-        admit.release_waiter(&b);
-        assert!(charges.is_empty());
+        drop((wa, fa, wb));
         assert_eq!(quotas.used(ResourceClass::Waiter), 0);
+        assert_eq!(quotas.used(ResourceClass::Flight), 0);
         // Policy sees every failed attempt, including the reclamation retry.
         let counts = *rejections.borrow();
         assert!(counts[ResourceClass::Flight as usize] >= 1);

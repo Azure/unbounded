@@ -28,6 +28,7 @@ use crate::model::PageId;
 use crate::runtime::RequestScope;
 use crate::security::OriginContext;
 use flow_control::coalesce;
+use racer_core::read::flight;
 use std::cell::RefCell;
 use std::future::poll_fn;
 use std::rc::Rc;
@@ -104,7 +105,7 @@ impl Drop for FlightCharge {
 }
 
 /// Local caps in addition to shared admission quotas.
-pub use racer_core::read::flight::FlightLimits;
+pub use flight::FlightLimits;
 
 #[cfg(not(test))]
 type FlightHashState = std::collections::hash_map::RandomState;
@@ -476,16 +477,7 @@ pub struct AcquisitionContext<'a> {
     pub budget: &'a mut AcquisitionBudget,
 }
 
-pub enum AcquisitionFailure {
-    /// A validated credential-specific origin rejection, not generic peer auth
-    /// failure, a copy miss, or proof that this version is unavailable.
-    OriginRejected,
-    /// Credential-specific origin 403; retry with independent credentials while
-    /// preserving the supplying caller's HTTP status.
-    OriginForbidden,
-    /// Terminal only for this cohort; never negative-cache a page/version here.
-    Terminal(Error),
-}
+pub type AcquisitionFailure = racer_core::read::FailureKind<Error>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FlightState {
@@ -542,61 +534,42 @@ impl AcquisitionWaiter<'_> {
                     Err(error) => return Poll::Ready(Err(error)),
                 };
                 refresh(entry, wakes);
-                let waiter = entry.state.waiters.get_mut(&self.registration.id).unwrap();
-                if let Some(error) = waiter.error {
-                    return Poll::Ready(Ok(AcquisitionEvent::Failed(error)));
-                }
-                if let Phase::Complete(result) = &entry.state.phase {
-                    return Poll::Ready(Ok(AcquisitionEvent::Complete(result.clone())));
-                }
-                if !waiter.complete
-                    && let Some(copy) = &entry.state.partial
-                {
-                    return Poll::Ready(Ok(AcquisitionEvent::Ciphertext(copy.clone())));
-                }
-                if let Phase::Failed(error) = entry.state.phase {
-                    return Poll::Ready(Ok(AcquisitionEvent::Failed(error)));
-                }
-                if matches!(entry.state.phase, Phase::RetryPending) && !waiter.issued {
-                    if uring_runtime::environment::now() >= self.budget.deadline()
-                        || (self.budget.remaining_attempts() == 0 && entry.state.partial.is_none())
-                    {
-                        let error = if self.budget.remaining_attempts() == 0 {
-                            Error::Unavailable
-                        } else {
-                            Error::DeadlineExceeded
-                        };
-                        waiter.error = Some(error);
-                        refresh(entry, wakes);
-                        return Poll::Ready(Ok(AcquisitionEvent::Failed(error)));
+                let idle = entry.operations.is_empty();
+                let event = flight::wait(
+                    &mut entry.state,
+                    self.registration.id,
+                    &mut entry.fence.identity,
+                    flights.limits.generations_per_flight,
+                    self.budget.deadline(),
+                    self.budget.remaining_attempts(),
+                    idle,
+                    uring_runtime::environment::now,
+                    split_result,
+                    wakes,
+                    |slot| {
+                        retired = coalesce::flight::state::store_waker(slot, waker.take().unwrap())
+                    },
+                );
+                Poll::Ready(Ok(match event {
+                    flight::Wait::Pending => return Poll::Pending,
+                    flight::Wait::Ready(flight::Settled::Complete(result)) => {
+                        AcquisitionEvent::Complete(result)
                     }
-                    if entry
-                        .state
-                        .elect(
-                            self.registration.id,
-                            &mut entry.fence.identity,
-                            flights.limits.generations_per_flight,
-                        )
-                        .is_err()
-                    {
-                        entry
-                            .state
-                            .begin_completion(Outcome::Failed(Error::Unavailable));
-                        settle(entry, wakes);
-                        return Poll::Ready(Ok(AcquisitionEvent::Failed(Error::Unavailable)));
+                    flight::Wait::Ready(flight::Settled::Partial(copy)) => {
+                        AcquisitionEvent::Ciphertext(copy)
                     }
-                    self.registration.fence.generation = entry.fence.generation;
-                    entry.diagnostic = None;
-                    return Poll::Ready(Ok(AcquisitionEvent::Lead(FlightLeader {
-                        flights: flights.clone(),
-                        fence: entry.fence.clone(),
-                        caller: self.registration.id,
-                        active: true,
-                    })));
-                }
-                retired =
-                    coalesce::flight::state::store_waker(&mut waiter.waker, waker.take().unwrap());
-                Poll::Pending
+                    flight::Wait::Failed(error) => AcquisitionEvent::Failed(error),
+                    flight::Wait::Lead => {
+                        self.registration.fence.generation = entry.fence.generation;
+                        entry.diagnostic = None;
+                        AcquisitionEvent::Lead(FlightLeader {
+                            flights: flights.clone(),
+                            fence: entry.fence.clone(),
+                            caller: self.registration.id,
+                            active: true,
+                        })
+                    }
+                }))
             });
             drop(retired);
             result
@@ -649,22 +622,16 @@ impl CopyWaiter<'_> {
                     Err(error) => return Poll::Ready(Err(error)),
                 };
                 refresh(entry, wakes);
-                let waiter = entry.state.waiters.get_mut(&self.registration.id).unwrap();
-                if let Some(error) = waiter.error {
-                    return Poll::Ready(Err(error));
+                let parked = flight::copy_wait(&mut entry.state, self.registration.id, |slot| {
+                    retired = coalesce::flight::state::store_waker(slot, waker.take().unwrap());
+                });
+                match parked {
+                    None => Poll::Pending,
+                    Some(result) => Poll::Ready(result.map(|settled| match settled {
+                        flight::Settled::Complete(result) => result.into(),
+                        flight::Settled::Partial(copy) => AcquiredPage::Ciphertext(copy),
+                    })),
                 }
-                if let Phase::Failed(error) = entry.state.phase {
-                    return Poll::Ready(Err(error));
-                }
-                if let Phase::Complete(result) = &entry.state.phase {
-                    return Poll::Ready(Ok(result.clone().into()));
-                }
-                if let Some(copy) = &entry.state.partial {
-                    return Poll::Ready(Ok(AcquiredPage::Ciphertext(copy.clone())));
-                }
-                retired =
-                    coalesce::flight::state::store_waker(&mut waiter.waker, waker.take().unwrap());
-                Poll::Pending
             });
             drop(retired);
             result
@@ -871,28 +838,29 @@ impl Flights {
             self.admit_join(&page, table.get(&page))?;
             if let Some(entry) = table.get_mut(&page) {
                 refresh(entry, wakes);
-                if let Phase::Complete(result) = &entry.phase {
-                    return Ok(JoinedFlight::Complete(result.clone()));
-                }
-                if !plaintext && let Some(copy) = &entry.partial {
-                    return Ok(JoinedFlight::Ciphertext(copy.clone()));
-                }
-                if let Phase::Failed(error) = entry.phase {
-                    gate = crate::telemetry::JoinGate::ExistingFailed;
-                    return Err(error);
-                }
-                if racer_core::read::flight::waiter_cap_gate(entry.waiters.len(), &self.limits)
-                    .is_err()
-                {
-                    gate = crate::telemetry::JoinGate::WaiterCap;
-                    occupancy = (
-                        Some(entry.waiters.len()),
-                        Some(self.limits.waiters_per_flight),
-                    );
-                    return Err(Error::Overloaded);
+                match flight::join_existing(&entry.state, plaintext, &self.limits) {
+                    Ok(None) => {}
+                    Ok(Some(flight::Settled::Complete(result))) => {
+                        return Ok(JoinedFlight::Complete(result));
+                    }
+                    Ok(Some(flight::Settled::Partial(copy))) => {
+                        return Ok(JoinedFlight::Ciphertext(copy));
+                    }
+                    Err(reject) => {
+                        if reject == flight::JoinReject::WaiterCap {
+                            gate = crate::telemetry::JoinGate::WaiterCap;
+                            occupancy = (
+                                Some(entry.waiters.len()),
+                                Some(self.limits.waiters_per_flight),
+                            );
+                        } else {
+                            gate = crate::telemetry::JoinGate::ExistingFailed;
+                        }
+                        return Err(reject.error());
+                    }
                 }
             }
-            racer_core::read::flight::join_budget_gate(
+            flight::join_budget_gate(
                 uring_runtime::environment::now(),
                 budget.deadline(),
                 budget.remaining_attempts(),
@@ -917,7 +885,7 @@ impl Flights {
                 Error::Overloaded
             })?;
             if !table.contains_key(&page) {
-                if racer_core::read::flight::entry_cap_gate(table.len(), &self.limits).is_err() {
+                if flight::entry_cap_gate(table.len(), &self.limits).is_err() {
                     gate = crate::telemetry::JoinGate::EntryCap;
                     occupancy = (Some(table.len()), Some(self.limits.entries));
                     return Err(Error::Overloaded);
@@ -1347,23 +1315,23 @@ impl Flights {
                 return Ok(JoinedCopy::Miss);
             }
             refresh(entry, wakes);
-            if let Phase::Complete(result) = &entry.phase {
-                return Ok(JoinedCopy::Complete(result.clone()));
-            }
-            if let Some(copy) = &entry.partial {
-                return Ok(JoinedCopy::Ciphertext(copy.clone()));
-            }
-            if matches!(entry.phase, Phase::Failed(_) | Phase::Draining(_)) {
-                return Ok(JoinedCopy::Miss);
-            }
-            if racer_core::read::flight::waiter_cap_gate(entry.waiters.len(), &self.limits).is_err()
-            {
-                gate = crate::telemetry::JoinGate::WaiterCap;
-                occupancy = (
-                    Some(entry.waiters.len()),
-                    Some(self.limits.waiters_per_flight),
-                );
-                return Err(Error::Overloaded);
+            match flight::join_copy_existing(&entry.state, &self.limits) {
+                Ok(flight::CopyJoin::Register) => {}
+                Ok(flight::CopyJoin::Miss) => return Ok(JoinedCopy::Miss),
+                Ok(flight::CopyJoin::Settled(flight::Settled::Complete(result))) => {
+                    return Ok(JoinedCopy::Complete(result));
+                }
+                Ok(flight::CopyJoin::Settled(flight::Settled::Partial(copy))) => {
+                    return Ok(JoinedCopy::Ciphertext(copy));
+                }
+                Err(error) => {
+                    gate = crate::telemetry::JoinGate::WaiterCap;
+                    occupancy = (
+                        Some(entry.waiters.len()),
+                        Some(self.limits.waiters_per_flight),
+                    );
+                    return Err(error);
+                }
             }
             let cancellation = scope.cancellation.subscribe()?;
             let (reservation, detail) =
@@ -1466,9 +1434,9 @@ impl Flights {
         self.update(|table, wakes| {
             let entry = self.leader_entry(table, &leader, wakes)?;
             page.validate_for(&entry.fence.page)?;
-            entry.state.begin_completion(Outcome::Published(page));
             leader.active = false;
-            settle(entry, wakes);
+            let idle = entry.operations.is_empty();
+            flight::publish(&mut entry.state, page, idle, split_result, wakes);
             Ok(entry.phase.state())
         })
     }
@@ -1486,28 +1454,16 @@ impl Flights {
     ) -> Result<FlightState> {
         self.update(|table, wakes| {
             let entry = self.leader_entry(table, &leader, wakes)?;
-            let outcome = match failure {
-                AcquisitionFailure::OriginRejected => {
-                    entry.state.cancel(leader.caller, Error::OriginRejected);
-                    Outcome::Retry
-                }
-                AcquisitionFailure::OriginForbidden => {
-                    entry.state.cancel(leader.caller, Error::OriginForbidden);
-                    Outcome::Retry
-                }
-                // After a handover the elected caller's own deadline or
-                // cancellation does not end the cohort: retry for the adopter.
-                AcquisitionFailure::Terminal(Error::DeadlineExceeded | Error::Cancelled)
-                    if entry.state.handed_over() =>
-                {
-                    Outcome::Retry
-                }
-                AcquisitionFailure::Terminal(error) => Outcome::Failed(error),
-            };
-            entry.state.begin_completion(outcome);
             leader.active = false;
-            notify(entry, wakes);
-            settle(entry, wakes);
+            let idle = entry.operations.is_empty();
+            flight::fail(
+                &mut entry.state,
+                leader.caller,
+                failure,
+                idle,
+                split_result,
+                wakes,
+            );
             Ok(entry.phase.state())
         })
     }

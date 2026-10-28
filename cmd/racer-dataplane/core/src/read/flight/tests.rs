@@ -6,6 +6,9 @@
 use super::*;
 use racer_control_wire::CacheId;
 use racer_object_wire::model::{CacheKey, ObjectId, ObjectVersion, PageNumber, StrongEtag};
+use std::cell::Cell;
+use std::collections::hash_map::RandomState;
+use std::rc::Rc;
 use std::time::Duration;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,10 +37,19 @@ fn page(n: u64) -> PageId {
     }
 }
 
-type Table = PageFlights<u32, u32, Acquired>;
+type Table<R = ()> = PageFlights<u32, u32, Acquired, R, RandomState>;
 
-fn table(limits: FlightLimits, now: Instant) -> Table {
-    PageFlights::with_hasher(limits, split, now, RandomState::new())
+fn table<R>(limits: FlightLimits, now: Instant) -> Table<R> {
+    PageFlights::new(limits, split, now, RandomState::new())
+}
+
+/// Admission that never rejects.
+fn free(_: Reserve) -> Result<()> {
+    Ok(())
+}
+
+fn published(v: Acquired) -> std::result::Result<Acquired, FailureKind> {
+    Ok(v)
 }
 
 fn waiter(joined: Result<Joined<u32, u32>>) -> u64 {
@@ -54,23 +66,26 @@ fn first_caller_leads_followers_share_completion() {
     let mut t = table(FlightLimits::default(), now);
     let mut wakes = Vec::new();
     let p = page(0);
-    let a = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
-    let b = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
+    let a = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
+    let b = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
     assert_eq!(t.len(), 1);
     assert_eq!(t.waiters(&p), 2);
-    assert_eq!(t.poll(&p, a, now, 10, &mut wakes), Ok(Event::Lead));
-    assert_eq!(t.poll(&p, b, now, 11, &mut wakes), Ok(Event::Pending));
-    t.finish(&p, a, Outcome::Published(Acquired::Plain(7)), &mut wakes)
+    assert_eq!(t.poll(&p, a, now, 2, 10, &mut wakes), Ok(Wait::Lead));
+    assert_eq!(t.poll(&p, b, now, 2, 11, &mut wakes), Ok(Wait::Pending));
+    t.finish(&p, a, published(Acquired::Plain(7)), &mut wakes)
         .unwrap();
     assert_eq!(wakes, [11]);
-    assert_eq!(t.poll(&p, b, now, 11, &mut wakes), Ok(Event::Complete(7)));
+    assert_eq!(
+        t.poll(&p, b, now, 2, 11, &mut wakes),
+        Ok(Wait::Ready(Settled::Complete(7)))
+    );
     // Late joiners see the completed result without registering.
     assert_eq!(
-        t.join(&p, now, deadline, 0, true, &mut Unlimited, &mut wakes),
-        Ok(Joined::Complete(7))
+        t.join(&p, now, deadline, 0, true, free, &mut wakes),
+        Ok(Joined::Settled(Settled::Complete(7)))
     );
-    t.detach(&p, a, &mut Unlimited, &mut wakes);
-    t.detach(&p, b, &mut Unlimited, &mut wakes);
+    t.detach(&p, a, &mut wakes);
+    t.detach(&p, b, &mut wakes);
     assert!(t.is_empty());
 }
 
@@ -82,11 +97,11 @@ fn acquiring_only_while_a_leader_fetches() {
     let mut wakes = Vec::new();
     let p = page(0);
     assert!(!t.acquiring(&p));
-    let a = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
-    assert_eq!(t.poll(&p, a, now, 10, &mut wakes), Ok(Event::Lead));
+    let a = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
+    assert_eq!(t.poll(&p, a, now, 2, 10, &mut wakes), Ok(Wait::Lead));
     assert!(t.acquiring(&p));
     assert!(!t.acquiring(&page(1)));
-    t.finish(&p, a, Outcome::Published(Acquired::Plain(7)), &mut wakes)
+    t.finish(&p, a, published(Acquired::Plain(7)), &mut wakes)
         .unwrap();
     assert!(!t.acquiring(&p));
 }
@@ -98,25 +113,28 @@ fn partial_result_serves_ciphertext_callers_and_reelects_plaintext() {
     let mut t = table(FlightLimits::default(), now);
     let mut wakes = Vec::new();
     let p = page(1);
-    let a = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
-    let b = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
-    assert_eq!(t.poll(&p, a, now, 1, &mut wakes), Ok(Event::Lead));
-    t.finish(&p, a, Outcome::Published(Acquired::Cipher(3)), &mut wakes)
+    let a = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
+    let b = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
+    assert_eq!(t.poll(&p, a, now, 2, 1, &mut wakes), Ok(Wait::Lead));
+    t.finish(&p, a, published(Acquired::Cipher(3)), &mut wakes)
         .unwrap();
     // Ciphertext callers take the partial; with zero attempts a plaintext
     // caller may still join because a partial exists.
     assert_eq!(
-        t.join(&p, now, deadline, 0, false, &mut Unlimited, &mut wakes),
-        Ok(Joined::Partial(3))
+        t.join(&p, now, deadline, 0, false, free, &mut wakes),
+        Ok(Joined::Settled(Settled::Partial(3)))
     );
-    let c = waiter(t.join(&p, now, deadline, 0, true, &mut Unlimited, &mut wakes));
+    let c = waiter(t.join(&p, now, deadline, 0, true, free, &mut wakes));
     // Plaintext waiters regain an acquisition opportunity.
-    assert_eq!(t.poll(&p, a, now, 1, &mut wakes), Ok(Event::Lead));
-    assert_eq!(t.poll(&p, b, now, 2, &mut wakes), Ok(Event::Pending));
-    assert_eq!(t.poll(&p, c, now, 3, &mut wakes), Ok(Event::Pending));
-    t.finish(&p, a, Outcome::Published(Acquired::Plain(4)), &mut wakes)
+    assert_eq!(t.poll(&p, a, now, 2, 1, &mut wakes), Ok(Wait::Lead));
+    assert_eq!(t.poll(&p, b, now, 2, 2, &mut wakes), Ok(Wait::Pending));
+    assert_eq!(t.poll(&p, c, now, 2, 3, &mut wakes), Ok(Wait::Pending));
+    t.finish(&p, a, published(Acquired::Plain(4)), &mut wakes)
         .unwrap();
-    assert_eq!(t.poll(&p, c, now, 3, &mut wakes), Ok(Event::Complete(4)));
+    assert_eq!(
+        t.poll(&p, c, now, 2, 3, &mut wakes),
+        Ok(Wait::Ready(Settled::Complete(4)))
+    );
 }
 
 #[test]
@@ -126,33 +144,42 @@ fn failure_and_retry_semantics() {
     let mut t = table(FlightLimits::default(), now);
     let mut wakes = Vec::new();
     let p = page(2);
-    let a = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
-    let b = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
-    assert_eq!(t.poll(&p, a, now, 1, &mut wakes), Ok(Event::Lead));
-    // Retry hands the next eligible waiter leadership.
-    t.finish(&p, a, Outcome::Retry, &mut wakes).unwrap();
-    assert_eq!(t.poll(&p, b, now, 2, &mut wakes), Ok(Event::Lead));
-    t.finish(&p, b, Outcome::Failed(Error::OriginForbidden), &mut wakes)
+    let a = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
+    let b = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
+    assert_eq!(t.poll(&p, a, now, 2, 1, &mut wakes), Ok(Wait::Lead));
+    // A rejection retries: the next eligible waiter leads.
+    t.finish(&p, a, Err(FailureKind::OriginRejected), &mut wakes)
         .unwrap();
+    assert_eq!(t.poll(&p, b, now, 2, 2, &mut wakes), Ok(Wait::Lead));
+    // A terminal failure fails the cohort.
+    t.finish(
+        &p,
+        b,
+        Err(FailureKind::Terminal(Error::OriginForbidden)),
+        &mut wakes,
+    )
+    .unwrap();
     assert_eq!(
-        t.poll(&p, a, now, 1, &mut wakes),
-        Ok(Event::Failed(Error::OriginForbidden))
+        t.poll(&p, b, now, 2, 2, &mut wakes),
+        Ok(Wait::Failed(Error::OriginForbidden))
     );
     assert_eq!(
-        t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes),
+        t.join(&p, now, deadline, 2, true, free, &mut wakes),
         Err(Error::OriginForbidden)
     );
     // Retry with no eligible waiter fails as unavailable.
     let q = page(3);
-    let c = waiter(t.join(&q, now, deadline, 2, true, &mut Unlimited, &mut wakes));
-    assert_eq!(t.poll(&q, c, now, 1, &mut wakes), Ok(Event::Lead));
-    t.finish(&q, c, Outcome::Retry, &mut wakes).unwrap();
+    let c = waiter(t.join(&q, now, deadline, 2, true, free, &mut wakes));
+    assert_eq!(t.poll(&q, c, now, 2, 1, &mut wakes), Ok(Wait::Lead));
+    let d = waiter(t.join_copy(&q, now, deadline, free, &mut wakes));
+    t.finish(&q, c, Err(FailureKind::OriginRejected), &mut wakes)
+        .unwrap();
     assert_eq!(
-        t.poll(&q, c, now, 1, &mut wakes),
-        Ok(Event::Failed(Error::Unavailable))
+        t.poll(&q, d, now, 0, 2, &mut wakes),
+        Ok(Wait::Failed(Error::Unavailable))
     );
     assert_eq!(
-        t.finish(&q, c, Outcome::Retry, &mut wakes),
+        t.finish(&q, c, Err(FailureKind::OriginRejected), &mut wakes),
         Err(Error::Internal)
     );
 }
@@ -164,40 +191,44 @@ fn rejected_leader_fails_and_next_waiter_leads() {
     let mut t = table(FlightLimits::default(), now);
     let mut wakes = Vec::new();
     let p = page(4);
-    let a = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
-    let b = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
-    assert_eq!(t.poll(&p, a, now, 1, &mut wakes), Ok(Event::Lead));
-    assert_eq!(t.poll(&p, b, now, 2, &mut wakes), Ok(Event::Pending));
-    // Only leader-held flights accept a rejection, and only origin errors.
+    let a = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
+    let b = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
+    assert_eq!(t.poll(&p, a, now, 2, 1, &mut wakes), Ok(Wait::Lead));
+    assert_eq!(t.poll(&p, b, now, 2, 2, &mut wakes), Ok(Wait::Pending));
+    // Only leader-held flights accept a rejection.
     assert_eq!(
-        t.reject(&p, b, Error::OriginRejected, &mut wakes),
+        t.finish(&p, b, Err(FailureKind::OriginRejected), &mut wakes),
         Err(Error::Internal)
     );
-    assert_eq!(t.reject(&p, a, Error::Io, &mut wakes), Err(Error::Internal));
     wakes.clear();
-    t.reject(&p, a, Error::OriginRejected, &mut wakes).unwrap();
+    t.finish(&p, a, Err(FailureKind::OriginRejected), &mut wakes)
+        .unwrap();
     assert!(wakes.contains(&2), "{wakes:?}");
     assert_eq!(
-        t.poll(&p, a, now, 1, &mut wakes),
-        Ok(Event::Failed(Error::OriginRejected))
+        t.poll(&p, a, now, 2, 1, &mut wakes),
+        Ok(Wait::Failed(Error::OriginRejected))
     );
-    assert_eq!(t.poll(&p, b, now, 2, &mut wakes), Ok(Event::Lead));
-    t.finish(&p, b, Outcome::Published(Acquired::Plain(5)), &mut wakes)
+    assert_eq!(t.poll(&p, b, now, 2, 2, &mut wakes), Ok(Wait::Lead));
+    t.finish(&p, b, published(Acquired::Plain(5)), &mut wakes)
         .unwrap();
     // The rejected caller is not served another caller's result.
     assert_eq!(
-        t.poll(&p, a, now, 1, &mut wakes),
-        Ok(Event::Failed(Error::OriginRejected))
+        t.poll(&p, a, now, 2, 1, &mut wakes),
+        Ok(Wait::Failed(Error::OriginRejected))
     );
-    assert_eq!(t.poll(&p, b, now, 2, &mut wakes), Ok(Event::Complete(5)));
+    assert_eq!(
+        t.poll(&p, b, now, 2, 2, &mut wakes),
+        Ok(Wait::Ready(Settled::Complete(5)))
+    );
     // A forbidden sole leader fails with its own error; no waiter remains.
     let q = page(5);
-    let c = waiter(t.join(&q, now, deadline, 2, true, &mut Unlimited, &mut wakes));
-    assert_eq!(t.poll(&q, c, now, 1, &mut wakes), Ok(Event::Lead));
-    t.reject(&q, c, Error::OriginForbidden, &mut wakes).unwrap();
+    let c = waiter(t.join(&q, now, deadline, 2, true, free, &mut wakes));
+    assert_eq!(t.poll(&q, c, now, 2, 1, &mut wakes), Ok(Wait::Lead));
+    t.finish(&q, c, Err(FailureKind::OriginForbidden), &mut wakes)
+        .unwrap();
     assert_eq!(
-        t.poll(&q, c, now, 1, &mut wakes),
-        Ok(Event::Failed(Error::OriginForbidden))
+        t.poll(&q, c, now, 2, 1, &mut wakes),
+        Ok(Wait::Failed(Error::OriginForbidden))
     );
 }
 
@@ -208,17 +239,17 @@ fn canceled_leader_is_revoked_and_follower_takes_over() {
     let mut t = table(FlightLimits::default(), now);
     let mut wakes = Vec::new();
     let p = page(4);
-    let a = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
-    let b = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
-    assert_eq!(t.poll(&p, a, now, 1, &mut wakes), Ok(Event::Lead));
-    assert_eq!(t.poll(&p, b, now, 2, &mut wakes), Ok(Event::Pending));
+    let a = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
+    let b = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
+    assert_eq!(t.poll(&p, a, now, 2, 1, &mut wakes), Ok(Wait::Lead));
+    assert_eq!(t.poll(&p, b, now, 2, 2, &mut wakes), Ok(Wait::Pending));
     wakes.clear();
     t.cancel(&p, a, &mut wakes);
     assert!(wakes.contains(&2));
-    assert_eq!(t.poll(&p, b, now, 2, &mut wakes), Ok(Event::Lead));
+    assert_eq!(t.poll(&p, b, now, 2, 2, &mut wakes), Ok(Wait::Lead));
     assert_eq!(
-        t.poll(&p, a, now, 1, &mut wakes),
-        Ok(Event::Failed(Error::Cancelled))
+        t.poll(&p, a, now, 2, 1, &mut wakes),
+        Ok(Wait::Failed(Error::Cancelled))
     );
 }
 
@@ -234,7 +265,7 @@ fn deadlines_expire_waiters_at_explicit_time() {
         now + Duration::from_secs(1),
         2,
         true,
-        &mut Unlimited,
+        free,
         &mut wakes,
     ));
     let b = waiter(t.join(
@@ -243,18 +274,18 @@ fn deadlines_expire_waiters_at_explicit_time() {
         now + Duration::from_secs(5),
         2,
         true,
-        &mut Unlimited,
+        free,
         &mut wakes,
     ));
-    assert_eq!(t.poll(&p, a, now, 1, &mut wakes), Ok(Event::Lead));
-    assert_eq!(t.poll(&p, b, now, 2, &mut wakes), Ok(Event::Pending));
+    assert_eq!(t.poll(&p, a, now, 2, 1, &mut wakes), Ok(Wait::Lead));
+    assert_eq!(t.poll(&p, b, now, 2, 2, &mut wakes), Ok(Wait::Pending));
     let later = now + Duration::from_secs(1);
     t.refresh(&p, later, &mut wakes);
     assert_eq!(
-        t.poll(&p, a, later, 1, &mut wakes),
-        Ok(Event::Failed(Error::DeadlineExceeded))
+        t.poll(&p, a, later, 2, 1, &mut wakes),
+        Ok(Wait::Failed(Error::DeadlineExceeded))
     );
-    assert_eq!(t.poll(&p, b, later, 2, &mut wakes), Ok(Event::Lead));
+    assert_eq!(t.poll(&p, b, later, 2, 2, &mut wakes), Ok(Wait::Lead));
 }
 
 #[test]
@@ -271,55 +302,85 @@ fn gates_follow_production_order() {
     let mut wakes = Vec::new();
     let p = page(6);
     assert_eq!(
-        t.join(&p, deadline, deadline, 2, true, &mut Unlimited, &mut wakes),
+        t.join(&p, deadline, deadline, 2, true, free, &mut wakes),
         Err(Error::DeadlineExceeded)
     );
     assert_eq!(
-        t.join(&p, now, deadline, 0, true, &mut Unlimited, &mut wakes),
+        t.join(&p, now, deadline, 0, true, free, &mut wakes),
         Err(Error::Unavailable)
     );
-    let a = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
+    let _a = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
     assert_eq!(
-        t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes),
+        t.join(&p, now, deadline, 2, true, free, &mut wakes),
         Err(Error::Overloaded)
     );
     assert_eq!(
-        t.join(&page(7), now, deadline, 2, true, &mut Unlimited, &mut wakes),
+        t.join(&page(7), now, deadline, 2, true, free, &mut wakes),
         Err(Error::Overloaded)
     );
-    // One generation: the first election succeeds, a retry cannot re-elect.
-    assert_eq!(t.poll(&p, a, now, 1, &mut wakes), Ok(Event::Lead));
-    t.finish(&p, a, Outcome::Retry, &mut wakes).unwrap();
+    // One generation: the first election succeeds, a retry cannot elect
+    // another waiter and fails the cohort.
+    let mut t = table(
+        FlightLimits {
+            generations_per_flight: 1,
+            ..FlightLimits::default()
+        },
+        now,
+    );
+    let a = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
+    let b = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
+    assert_eq!(t.poll(&p, a, now, 2, 1, &mut wakes), Ok(Wait::Lead));
+    t.finish(&p, a, Err(FailureKind::OriginRejected), &mut wakes)
+        .unwrap();
     assert_eq!(
-        t.poll(&p, a, now, 1, &mut wakes),
-        Ok(Event::Failed(Error::Unavailable))
+        t.poll(&p, b, now, 2, 2, &mut wakes),
+        Ok(Wait::Failed(Error::Unavailable))
+    );
+    assert_eq!(
+        t.join(&p, now, deadline, 2, true, free, &mut wakes),
+        Err(Error::Unavailable)
     );
 }
 
-#[derive(Default)]
-struct Quota {
-    waiters: usize,
-    flights: usize,
-    max_flights: usize,
-}
+/// Waiter and flight counts with a flight cap; charges release on drop.
+#[derive(Clone, Default)]
+struct Quota(Rc<Cell<(usize, usize, usize)>>);
 
-impl FlightAdmission for Quota {
-    fn waiter(&mut self, _: &PageId) -> Result<()> {
-        self.waiters += 1;
-        Ok(())
+impl Quota {
+    fn new(max_flights: usize) -> Self {
+        Self(Rc::new(Cell::new((0, 0, max_flights))))
     }
-    fn flight(&mut self, _: &PageId) -> Result<()> {
-        if self.flights == self.max_flights {
-            return Err(Error::Overloaded);
+
+    fn used(&self) -> (usize, usize) {
+        let (waiters, flights, _) = self.0.get();
+        (waiters, flights)
+    }
+
+    fn reserve(&self) -> impl FnMut(Reserve) -> Result<Charge> + use<> {
+        let quota = self.clone();
+        move |kind| {
+            let (mut waiters, mut flights, max) = quota.0.get();
+            match kind {
+                Reserve::Waiter => waiters += 1,
+                Reserve::Flight if flights == max => return Err(Error::Overloaded),
+                Reserve::Flight => flights += 1,
+            }
+            quota.0.set((waiters, flights, max));
+            Ok(Charge(quota.clone(), kind))
         }
-        self.flights += 1;
-        Ok(())
     }
-    fn release_waiter(&mut self, _: &PageId) {
-        self.waiters -= 1;
-    }
-    fn release_flight(&mut self, _: &PageId) {
-        self.flights -= 1;
+}
+
+struct Charge(Quota, Reserve);
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        let (mut waiters, mut flights, max) = self.0.0.get();
+        match self.1 {
+            Reserve::Waiter => waiters -= 1,
+            Reserve::Flight => flights -= 1,
+        }
+        self.0.0.set((waiters, flights, max));
     }
 }
 
@@ -329,18 +390,31 @@ fn admission_is_released_on_rejection_and_detach() {
     let deadline = now + Duration::from_secs(10);
     let mut t = table(FlightLimits::default(), now);
     let mut wakes = Vec::new();
-    let mut quota = Quota {
-        max_flights: 1,
-        ..Quota::default()
-    };
-    let a = waiter(t.join(&page(8), now, deadline, 2, true, &mut quota, &mut wakes));
+    let quota = Quota::new(1);
+    let a = waiter(t.join(
+        &page(8),
+        now,
+        deadline,
+        2,
+        true,
+        quota.reserve(),
+        &mut wakes,
+    ));
     assert_eq!(
-        t.join(&page(9), now, deadline, 2, true, &mut quota, &mut wakes),
+        t.join(
+            &page(9),
+            now,
+            deadline,
+            2,
+            true,
+            quota.reserve(),
+            &mut wakes
+        ),
         Err(Error::Overloaded)
     );
-    assert_eq!((quota.waiters, quota.flights), (1, 1));
-    t.detach(&page(8), a, &mut quota, &mut wakes);
-    assert_eq!((quota.waiters, quota.flights), (0, 0));
+    assert_eq!(quota.used(), (1, 1));
+    t.detach(&page(8), a, &mut wakes);
+    assert_eq!(quota.used(), (0, 0));
     assert!(t.is_empty());
 }
 
@@ -360,8 +434,9 @@ fn budget_gates() {
         Ok(())
     );
     let limits = FlightLimits::default();
-    assert_eq!(waiter_cap_gate(256, &limits), Err(Error::Overloaded));
-    assert_eq!(waiter_cap_gate(255, &limits), Ok(()));
+    assert_eq!(Error::from(JoinReject::WaiterCap), Error::Overloaded);
+    assert_eq!(Error::from(JoinReject::Failed(Error::Io)), Error::Io);
+    assert_eq!(entry_cap_gate(1023, &limits), Ok(()));
     assert_eq!(entry_cap_gate(1024, &limits), Err(Error::Overloaded));
 }
 
@@ -377,10 +452,7 @@ fn expired_leader_with_retained_operation_blocks_reelection_until_complete() {
     let now = Instant::now();
     let mut t = table(FlightLimits::default(), now);
     let mut wakes = Vec::new();
-    let mut quota = Quota {
-        max_flights: 4,
-        ..Quota::default()
-    };
+    let quota = Quota::new(4);
     let p = page(20);
     let a = waiter(t.join(
         &p,
@@ -388,43 +460,46 @@ fn expired_leader_with_retained_operation_blocks_reelection_until_complete() {
         now + Duration::from_secs(1),
         2,
         true,
-        &mut quota,
+        quota.reserve(),
         &mut wakes,
     ));
-    assert_eq!(t.poll(&p, a, now, 1, &mut wakes), Ok(Event::Lead));
-    t.retain_operation(&p, a).unwrap();
+    assert_eq!(t.poll(&p, a, now, 2, 1, &mut wakes), Ok(Wait::Lead));
+    t.retain_operation(&p, a, &mut wakes).unwrap();
     assert!(t.is_leader(&p, a));
 
     let later = now + Duration::from_secs(1);
     t.refresh(&p, later, &mut wakes);
     assert!(!t.is_leader(&p, a));
     assert_eq!(
-        t.poll(&p, a, later, 1, &mut wakes),
-        Ok(Event::Failed(Error::DeadlineExceeded))
+        t.poll(&p, a, later, 2, 1, &mut wakes),
+        Ok(Wait::Failed(Error::DeadlineExceeded))
     );
-    t.detach(&p, a, &mut quota, &mut wakes);
-    assert_eq!((quota.waiters, quota.flights), (0, 1), "entry kept");
+    t.detach(&p, a, &mut wakes);
+    assert_eq!(quota.used(), (0, 1), "entry kept");
 
     let deadline = later + Duration::from_secs(5);
-    let b = waiter(t.join(&p, later, deadline, 2, true, &mut quota, &mut wakes));
-    assert_eq!(t.poll(&p, b, later, 2, &mut wakes), Ok(Event::Pending));
+    let b = waiter(t.join(&p, later, deadline, 2, true, quota.reserve(), &mut wakes));
+    assert_eq!(t.poll(&p, b, later, 2, 2, &mut wakes), Ok(Wait::Pending));
     assert_eq!(
-        t.finish(&p, a, Outcome::Published(Acquired::Plain(1)), &mut wakes),
+        t.finish(&p, a, published(Acquired::Plain(1)), &mut wakes),
         Err(Error::Internal)
     );
-    assert_eq!(t.poll(&p, b, later, 2, &mut wakes), Ok(Event::Pending));
+    assert_eq!(t.poll(&p, b, later, 2, 2, &mut wakes), Ok(Wait::Pending));
 
     wakes.clear();
-    t.complete_operation(&p, &mut quota, &mut wakes).unwrap();
+    t.complete_operation(&p, &mut wakes).unwrap();
     assert!(wakes.contains(&2));
-    assert_eq!(t.poll(&p, b, later, 2, &mut wakes), Ok(Event::Lead));
-    t.retain_operation(&p, b).unwrap();
-    t.complete_operation(&p, &mut quota, &mut wakes).unwrap();
-    t.finish(&p, b, Outcome::Published(Acquired::Plain(2)), &mut wakes)
+    assert_eq!(t.poll(&p, b, later, 2, 2, &mut wakes), Ok(Wait::Lead));
+    t.retain_operation(&p, b, &mut wakes).unwrap();
+    t.complete_operation(&p, &mut wakes).unwrap();
+    t.finish(&p, b, published(Acquired::Plain(2)), &mut wakes)
         .unwrap();
-    assert_eq!(t.poll(&p, b, later, 2, &mut wakes), Ok(Event::Complete(2)));
-    t.detach(&p, b, &mut quota, &mut wakes);
-    assert_eq!((quota.waiters, quota.flights), (0, 0));
+    assert_eq!(
+        t.poll(&p, b, later, 2, 2, &mut wakes),
+        Ok(Wait::Ready(Settled::Complete(2)))
+    );
+    t.detach(&p, b, &mut wakes);
+    assert_eq!(quota.used(), (0, 0));
     assert!(t.is_empty());
 }
 
@@ -444,13 +519,13 @@ fn expired_leader_without_operation_is_stale_after_new_leader() {
         now + Duration::from_secs(1),
         2,
         true,
-        &mut Unlimited,
+        free,
         &mut wakes,
     ));
-    assert_eq!(t.poll(&p, a, now, 1, &mut wakes), Ok(Event::Lead));
+    assert_eq!(t.poll(&p, a, now, 2, 1, &mut wakes), Ok(Wait::Lead));
     let later = now + Duration::from_secs(1);
     t.refresh(&p, later, &mut wakes);
-    t.detach(&p, a, &mut Unlimited, &mut wakes);
+    t.detach(&p, a, &mut wakes);
     assert!(t.is_empty());
     let b = waiter(t.join(
         &p,
@@ -458,13 +533,13 @@ fn expired_leader_without_operation_is_stale_after_new_leader() {
         later + Duration::from_secs(5),
         2,
         true,
-        &mut Unlimited,
+        free,
         &mut wakes,
     ));
-    assert_eq!(t.poll(&p, b, later, 2, &mut wakes), Ok(Event::Lead));
+    assert_eq!(t.poll(&p, b, later, 2, 2, &mut wakes), Ok(Wait::Lead));
     assert!(!t.is_leader(&p, a));
     assert_eq!(
-        t.finish(&p, a, Outcome::Published(Acquired::Plain(1)), &mut wakes),
+        t.finish(&p, a, published(Acquired::Plain(1)), &mut wakes),
         Err(Error::Internal)
     );
     assert!(t.is_leader(&p, b));
@@ -477,31 +552,27 @@ fn operation_errors_and_completed_operation_settles_published_result() {
     let mut t = table(FlightLimits::default(), now);
     let mut wakes = Vec::new();
     let p = page(22);
-    assert_eq!(t.retain_operation(&p, 0), Err(Error::Internal));
-    assert_eq!(
-        t.complete_operation(&p, &mut Unlimited, &mut wakes),
-        Err(Error::Internal)
-    );
-    let a = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
-    let b = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
+    assert_eq!(t.retain_operation(&p, 0, &mut wakes), Err(Error::Internal));
+    assert_eq!(t.complete_operation(&p, &mut wakes), Err(Error::Internal));
+    let a = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
+    let b = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
     // Not elected yet.
-    assert_eq!(t.retain_operation(&p, a), Err(Error::Internal));
-    assert_eq!(
-        t.complete_operation(&p, &mut Unlimited, &mut wakes),
-        Err(Error::Internal)
-    );
-    assert_eq!(t.poll(&p, a, now, 1, &mut wakes), Ok(Event::Lead));
-    assert_eq!(t.retain_operation(&p, b), Err(Error::Internal));
-    t.retain_operation(&p, a).unwrap();
+    assert_eq!(t.retain_operation(&p, a, &mut wakes), Err(Error::Internal));
+    assert_eq!(t.complete_operation(&p, &mut wakes), Err(Error::Internal));
+    assert_eq!(t.poll(&p, a, now, 2, 1, &mut wakes), Ok(Wait::Lead));
+    assert_eq!(t.retain_operation(&p, b, &mut wakes), Err(Error::Internal));
+    t.retain_operation(&p, a, &mut wakes).unwrap();
     // Publication while the operation is still retained stays draining.
-    t.finish(&p, a, Outcome::Published(Acquired::Plain(7)), &mut wakes)
+    t.finish(&p, a, published(Acquired::Plain(7)), &mut wakes)
         .unwrap();
-    assert_eq!(t.poll(&p, b, now, 2, &mut wakes), Ok(Event::Pending));
+    assert_eq!(t.poll(&p, b, now, 2, 2, &mut wakes), Ok(Wait::Pending));
     wakes.clear();
-    t.complete_operation(&p, &mut Unlimited, &mut wakes)
-        .unwrap();
+    t.complete_operation(&p, &mut wakes).unwrap();
     assert!(wakes.contains(&2));
-    assert_eq!(t.poll(&p, b, now, 2, &mut wakes), Ok(Event::Complete(7)));
+    assert_eq!(
+        t.poll(&p, b, now, 2, 2, &mut wakes),
+        Ok(Wait::Ready(Settled::Complete(7)))
+    );
 }
 
 /// Production checks a waiter's scope before its recorded error: a rejected
@@ -514,22 +585,23 @@ fn deadline_takes_precedence_over_recorded_rejection() {
     let mut t = table(FlightLimits::default(), now);
     let mut wakes = Vec::new();
     let p = page(23);
-    let a = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
-    let b = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
-    assert_eq!(t.poll(&p, a, now, 1, &mut wakes), Ok(Event::Lead));
-    t.reject(&p, a, Error::OriginRejected, &mut wakes).unwrap();
+    let a = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
+    let b = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
+    assert_eq!(t.poll(&p, a, now, 2, 1, &mut wakes), Ok(Wait::Lead));
+    t.finish(&p, a, Err(FailureKind::OriginRejected), &mut wakes)
+        .unwrap();
     t.cancel(&p, b, &mut wakes);
     assert_eq!(
-        t.poll(&p, a, now, 1, &mut wakes),
-        Ok(Event::Failed(Error::OriginRejected))
+        t.poll(&p, a, now, 2, 1, &mut wakes),
+        Ok(Wait::Failed(Error::OriginRejected))
     );
     assert_eq!(
-        t.poll(&p, a, deadline, 1, &mut wakes),
-        Ok(Event::Failed(Error::DeadlineExceeded))
+        t.poll(&p, a, deadline, 2, 1, &mut wakes),
+        Ok(Wait::Failed(Error::DeadlineExceeded))
     );
     assert_eq!(
-        t.poll(&p, b, deadline, 2, &mut wakes),
-        Ok(Event::Failed(Error::Cancelled))
+        t.poll(&p, b, deadline, 2, 2, &mut wakes),
+        Ok(Wait::Failed(Error::Cancelled))
     );
 }
 
@@ -542,20 +614,17 @@ fn expired_leader_hands_running_fill_to_latest_waiter() {
     let now = Instant::now();
     let mut t = table(FlightLimits::default(), now);
     let mut wakes = Vec::new();
-    let mut quota = Quota {
-        max_flights: 4,
-        ..Quota::default()
-    };
+    let quota = Quota::new(4);
     let p = page(30);
     let secs = |s| now + Duration::from_secs(s);
-    let a = waiter(t.join(&p, now, secs(1), 2, true, &mut quota, &mut wakes));
-    assert_eq!(t.poll(&p, a, now, 1, &mut wakes), Ok(Event::Lead));
-    t.retain_operation(&p, a).unwrap();
-    t.allow_handover(&p, a).unwrap();
-    let b = waiter(t.join(&p, now, secs(3), 2, true, &mut quota, &mut wakes));
-    let c = waiter(t.join(&p, now, secs(2), 2, true, &mut quota, &mut wakes));
-    assert_eq!(t.poll(&p, b, now, 2, &mut wakes), Ok(Event::Pending));
-    assert_eq!(t.poll(&p, c, now, 3, &mut wakes), Ok(Event::Pending));
+    let a = waiter(t.join(&p, now, secs(1), 2, true, quota.reserve(), &mut wakes));
+    assert_eq!(t.poll(&p, a, now, 2, 1, &mut wakes), Ok(Wait::Lead));
+    t.retain_operation(&p, a, &mut wakes).unwrap();
+    t.allow_handover(&p, a, &mut wakes).unwrap();
+    let b = waiter(t.join(&p, now, secs(3), 2, true, quota.reserve(), &mut wakes));
+    let c = waiter(t.join(&p, now, secs(2), 2, true, quota.reserve(), &mut wakes));
+    assert_eq!(t.poll(&p, b, now, 2, 2, &mut wakes), Ok(Wait::Pending));
+    assert_eq!(t.poll(&p, c, now, 2, 3, &mut wakes), Ok(Wait::Pending));
     assert_eq!(t.leader_deadline(&p), Some(secs(1)));
     assert!(!t.handed_over(&p));
 
@@ -568,28 +637,28 @@ fn expired_leader_hands_running_fill_to_latest_waiter() {
         "latest deadline adopts"
     );
     assert_eq!(
-        t.poll(&p, a, secs(1), 1, &mut wakes),
-        Ok(Event::Failed(Error::DeadlineExceeded))
+        t.poll(&p, a, secs(1), 2, 1, &mut wakes),
+        Ok(Wait::Failed(Error::DeadlineExceeded))
     );
-    t.detach(&p, a, &mut quota, &mut wakes);
-    assert_eq!(t.poll(&p, b, secs(1), 2, &mut wakes), Ok(Event::Pending));
-    assert_eq!(t.poll(&p, c, secs(1), 3, &mut wakes), Ok(Event::Pending));
+    t.detach(&p, a, &mut wakes);
+    assert_eq!(t.poll(&p, b, secs(1), 2, 2, &mut wakes), Ok(Wait::Pending));
+    assert_eq!(t.poll(&p, c, secs(1), 2, 3, &mut wakes), Ok(Wait::Pending));
 
-    t.complete_operation(&p, &mut quota, &mut wakes).unwrap();
-    t.finish(&p, a, Outcome::Published(Acquired::Plain(7)), &mut wakes)
+    t.complete_operation(&p, &mut wakes).unwrap();
+    t.finish(&p, a, published(Acquired::Plain(7)), &mut wakes)
         .unwrap();
     assert_eq!(
-        t.poll(&p, b, secs(1), 2, &mut wakes),
-        Ok(Event::Complete(7))
+        t.poll(&p, b, secs(1), 2, 2, &mut wakes),
+        Ok(Wait::Ready(Settled::Complete(7)))
     );
     assert_eq!(
-        t.poll(&p, c, secs(1), 3, &mut wakes),
-        Ok(Event::Complete(7))
+        t.poll(&p, c, secs(1), 2, 3, &mut wakes),
+        Ok(Wait::Ready(Settled::Complete(7)))
     );
-    t.detach(&p, b, &mut quota, &mut wakes);
-    t.detach(&p, c, &mut quota, &mut wakes);
+    t.detach(&p, b, &mut wakes);
+    t.detach(&p, c, &mut wakes);
     assert!(t.is_empty());
-    assert_eq!((quota.waiters, quota.flights), (0, 0));
+    assert_eq!(quota.used(), (0, 0));
 }
 
 /// A handed-over fill that ends with the elected caller's deadline retries
@@ -600,63 +669,91 @@ fn handed_over_fill_deadline_retries_and_last_expiry_revokes() {
     let now = Instant::now();
     let mut t = table(FlightLimits::default(), now);
     let mut wakes = Vec::new();
-    let mut quota = Quota {
-        max_flights: 4,
-        ..Quota::default()
-    };
+    let quota = Quota::new(4);
     let p = page(31);
     let secs = |s| now + Duration::from_secs(s);
-    let a = waiter(t.join(&p, now, secs(1), 2, true, &mut quota, &mut wakes));
-    assert_eq!(t.poll(&p, a, now, 1, &mut wakes), Ok(Event::Lead));
-    t.retain_operation(&p, a).unwrap();
-    t.allow_handover(&p, a).unwrap();
-    let b = waiter(t.join(&p, now, secs(3), 2, true, &mut quota, &mut wakes));
+    let a = waiter(t.join(&p, now, secs(1), 2, true, quota.reserve(), &mut wakes));
+    assert_eq!(t.poll(&p, a, now, 2, 1, &mut wakes), Ok(Wait::Lead));
+    t.retain_operation(&p, a, &mut wakes).unwrap();
+    t.allow_handover(&p, a, &mut wakes).unwrap();
+    let b = waiter(t.join(&p, now, secs(3), 2, true, quota.reserve(), &mut wakes));
     t.refresh(&p, secs(1), &mut wakes);
     assert!(t.handed_over(&p));
-    t.complete_operation(&p, &mut quota, &mut wakes).unwrap();
-    t.finish(&p, a, Outcome::Failed(Error::DeadlineExceeded), &mut wakes)
-        .unwrap();
-    assert_eq!(t.poll(&p, b, secs(1), 2, &mut wakes), Ok(Event::Lead));
-    t.retain_operation(&p, b).unwrap();
-    t.allow_handover(&p, b).unwrap();
+    t.complete_operation(&p, &mut wakes).unwrap();
+    t.finish(
+        &p,
+        a,
+        Err(FailureKind::Terminal(Error::DeadlineExceeded)),
+        &mut wakes,
+    )
+    .unwrap();
+    assert_eq!(t.poll(&p, b, secs(1), 2, 2, &mut wakes), Ok(Wait::Lead));
+    t.retain_operation(&p, b, &mut wakes).unwrap();
+    t.allow_handover(&p, b, &mut wakes).unwrap();
     t.refresh(&p, secs(3), &mut wakes);
     assert!(!t.is_leader(&p, b), "no waiter left to adopt");
     assert_eq!(t.leader_deadline(&p), None);
-    t.complete_operation(&p, &mut quota, &mut wakes).unwrap();
+    t.complete_operation(&p, &mut wakes).unwrap();
     assert_eq!(
-        t.poll(&p, b, secs(3), 2, &mut wakes),
-        Ok(Event::Failed(Error::DeadlineExceeded))
+        t.poll(&p, b, secs(3), 2, 2, &mut wakes),
+        Ok(Wait::Failed(Error::DeadlineExceeded))
     );
-    t.detach(&p, a, &mut quota, &mut wakes);
-    t.detach(&p, b, &mut quota, &mut wakes);
+    t.detach(&p, a, &mut wakes);
+    t.detach(&p, b, &mut wakes);
     assert!(t.is_empty());
 }
 
 /// Terminal failures other than the elected caller's own deadline or
 /// cancellation still fail the cohort after a handover.
 #[test]
-fn handover_outcome_maps_only_caller_scope_failures() {
-    let retry = |o: Outcome<u8, Error>| matches!(o, Outcome::Retry);
-    assert!(retry(handover_outcome(
-        true,
-        Outcome::Failed(Error::DeadlineExceeded)
-    )));
-    assert!(retry(handover_outcome(
-        true,
-        Outcome::Failed(Error::Cancelled)
-    )));
-    assert!(matches!(
-        handover_outcome(true, Outcome::<u8, _>::Failed(Error::Io)),
-        Outcome::Failed(Error::Io)
+fn handover_failure_retries_only_caller_scope_failures() {
+    // Whether `fail` settles to a retry (`RetryPending`) or the cohort fails.
+    let retry = |handed_over: bool, failure: FailureKind| {
+        let now = Rc::new(Cell::new(Instant::now()));
+        let mut state: State<u8, u8, u8, Waiter<()>, Token> = State::default();
+        for id in 0..2 {
+            let deadline = now.get() + Duration::from_secs(1);
+            let now = now.clone();
+            state.register(
+                id,
+                Waiter {
+                    deadline,
+                    now,
+                    _charge: (),
+                },
+                true,
+                true,
+            );
+        }
+        let mut identity = Identity {
+            owner: Rc::new(()),
+            incarnation: 0,
+            generation: 0,
+        };
+        assert_eq!(state.elect(0, &mut identity, 1), Ok(true));
+        if handed_over {
+            state.leader = Some(1);
+        }
+        assert_eq!(state.handed_over(), handed_over);
+        fail(
+            &mut state,
+            0,
+            failure,
+            true,
+            Published::Complete,
+            &mut Vec::new(),
+        );
+        matches!(state.phase, Phase::RetryPending)
+    };
+    assert!(retry(true, FailureKind::Terminal(Error::DeadlineExceeded)));
+    assert!(retry(true, FailureKind::Terminal(Error::Cancelled)));
+    assert!(!retry(true, FailureKind::Terminal(Error::Io)));
+    assert!(!retry(
+        false,
+        FailureKind::Terminal(Error::DeadlineExceeded)
     ));
-    assert!(matches!(
-        handover_outcome(false, Outcome::<u8, _>::Failed(Error::DeadlineExceeded)),
-        Outcome::Failed(Error::DeadlineExceeded)
-    ));
-    assert!(matches!(
-        handover_outcome(true, Outcome::Published(3u8)),
-        Outcome::Published(3)
-    ));
+    assert!(!retry(false, FailureKind::Terminal(Error::Cancelled)));
+    assert!(retry(false, FailureKind::OriginRejected));
     let now = Instant::now();
     let d = now + Duration::from_secs(2);
     assert_eq!(handover_ceiling(now, d, false), d);
@@ -667,9 +764,9 @@ fn handover_outcome_maps_only_caller_scope_failures() {
     assert_eq!(handover_ceiling(d, now, true), now, "expired leader");
 }
 
-fn copy_waiter(joined: Result<JoinedCopy<u32, u32>>) -> u64 {
+fn copy_waiter(joined: Result<Joined<u32, u32>>) -> u64 {
     match joined.unwrap() {
-        JoinedCopy::Waiter(id) => id,
+        Joined::Waiter(id) => id,
         other => panic!("{other:?}"),
     }
 }
@@ -685,26 +782,29 @@ fn copy_join_waits_for_the_running_acquisition_and_never_leads() {
     let p = page(0);
     // No flight: a miss, and no flight is created.
     assert_eq!(
-        t.join_copy(&p, now, deadline, &mut Unlimited, &mut wakes),
-        Ok(JoinedCopy::Miss)
+        t.join_copy(&p, now, deadline, free, &mut wakes),
+        Ok(Joined::Miss)
     );
     assert!(t.is_empty());
-    let a = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
-    assert_eq!(t.poll(&p, a, now, 10, &mut wakes), Ok(Event::Lead));
-    let c = copy_waiter(t.join_copy(&p, now, deadline, &mut Unlimited, &mut wakes));
+    let a = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
+    assert_eq!(t.poll(&p, a, now, 2, 10, &mut wakes), Ok(Wait::Lead));
+    let c = copy_waiter(t.join_copy(&p, now, deadline, free, &mut wakes));
     assert_eq!(t.waiters(&p), 2);
-    assert_eq!(t.poll(&p, c, now, 11, &mut wakes), Ok(Event::Pending));
-    t.finish(&p, a, Outcome::Published(Acquired::Plain(7)), &mut wakes)
+    assert_eq!(t.poll(&p, c, now, 2, 11, &mut wakes), Ok(Wait::Pending));
+    t.finish(&p, a, published(Acquired::Plain(7)), &mut wakes)
         .unwrap();
     assert_eq!(wakes, [11]);
-    assert_eq!(t.poll(&p, c, now, 11, &mut wakes), Ok(Event::Complete(7)));
+    assert_eq!(
+        t.poll(&p, c, now, 2, 11, &mut wakes),
+        Ok(Wait::Ready(Settled::Complete(7)))
+    );
     // Settled results are returned without registering.
     assert_eq!(
-        t.join_copy(&p, now, deadline, &mut Unlimited, &mut wakes),
-        Ok(JoinedCopy::Complete(7))
+        t.join_copy(&p, now, deadline, free, &mut wakes),
+        Ok(Joined::Settled(Settled::Complete(7)))
     );
-    t.detach(&p, a, &mut Unlimited, &mut wakes);
-    t.detach(&p, c, &mut Unlimited, &mut wakes);
+    t.detach(&p, a, &mut wakes);
+    t.detach(&p, c, &mut wakes);
     assert!(t.is_empty());
 }
 
@@ -715,22 +815,27 @@ fn copy_join_misses_failed_and_takes_partial_results() {
     let mut t = table(FlightLimits::default(), now);
     let mut wakes = Vec::new();
     let p = page(1);
-    let a = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
-    assert_eq!(t.poll(&p, a, now, 1, &mut wakes), Ok(Event::Lead));
-    t.finish(&p, a, Outcome::Published(Acquired::Cipher(3)), &mut wakes)
+    let a = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
+    assert_eq!(t.poll(&p, a, now, 2, 1, &mut wakes), Ok(Wait::Lead));
+    t.finish(&p, a, published(Acquired::Cipher(3)), &mut wakes)
         .unwrap();
     assert_eq!(
-        t.join_copy(&p, now, deadline, &mut Unlimited, &mut wakes),
-        Ok(JoinedCopy::Partial(3))
+        t.join_copy(&p, now, deadline, free, &mut wakes),
+        Ok(Joined::Settled(Settled::Partial(3)))
     );
     let q = page(2);
-    let b = waiter(t.join(&q, now, deadline, 2, true, &mut Unlimited, &mut wakes));
-    assert_eq!(t.poll(&q, b, now, 2, &mut wakes), Ok(Event::Lead));
-    t.finish(&q, b, Outcome::Failed(Error::Unavailable), &mut wakes)
-        .unwrap();
+    let b = waiter(t.join(&q, now, deadline, 2, true, free, &mut wakes));
+    assert_eq!(t.poll(&q, b, now, 2, 2, &mut wakes), Ok(Wait::Lead));
+    t.finish(
+        &q,
+        b,
+        Err(FailureKind::Terminal(Error::Unavailable)),
+        &mut wakes,
+    )
+    .unwrap();
     assert_eq!(
-        t.join_copy(&q, now, deadline, &mut Unlimited, &mut wakes),
-        Ok(JoinedCopy::Miss)
+        t.join_copy(&q, now, deadline, free, &mut wakes),
+        Ok(Joined::Miss)
     );
 }
 
@@ -745,19 +850,19 @@ fn copy_join_respects_the_waiter_cap_and_a_lost_leader_fails_copy_waiters() {
     let mut t = table(limits, now);
     let mut wakes = Vec::new();
     let p = page(3);
-    let a = waiter(t.join(&p, now, deadline, 2, true, &mut Unlimited, &mut wakes));
-    assert_eq!(t.poll(&p, a, now, 1, &mut wakes), Ok(Event::Lead));
-    let c = copy_waiter(t.join_copy(&p, now, deadline, &mut Unlimited, &mut wakes));
+    let a = waiter(t.join(&p, now, deadline, 2, true, free, &mut wakes));
+    assert_eq!(t.poll(&p, a, now, 2, 1, &mut wakes), Ok(Wait::Lead));
+    let c = copy_waiter(t.join_copy(&p, now, deadline, free, &mut wakes));
     assert_eq!(
-        t.join_copy(&p, now, deadline, &mut Unlimited, &mut wakes),
+        t.join_copy(&p, now, deadline, free, &mut wakes),
         Err(Error::Overloaded)
     );
-    assert_eq!(t.poll(&p, c, now, 2, &mut wakes), Ok(Event::Pending));
+    assert_eq!(t.poll(&p, c, now, 2, 2, &mut wakes), Ok(Wait::Pending));
     // The leader goes away; the copy waiter cannot adopt or lead.
     t.abandon(&p, a, &mut wakes);
-    t.detach(&p, a, &mut Unlimited, &mut wakes);
+    t.detach(&p, a, &mut wakes);
     assert!(matches!(
-        t.poll(&p, c, now, 2, &mut wakes),
-        Ok(Event::Failed(_))
+        t.poll(&p, c, now, 2, 2, &mut wakes),
+        Ok(Wait::Failed(_))
     ));
 }

@@ -1139,6 +1139,11 @@ pub mod flight {
         }
 
         impl<W: WaiterPolicy, T> Waiter<W, T> {
+            /// Whether this caller can acquire rather than only observe results.
+            pub fn acquisition(&self) -> bool {
+                self.acquisition
+            }
+
             /// Whether an unissued acquisition opportunity remains usable.
             fn eligible(&self) -> bool {
                 self.acquisition && !self.issued && self.error.is_none()

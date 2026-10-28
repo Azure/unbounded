@@ -1012,12 +1012,16 @@ pub fn leader_source(
     }
 }
 
-/// How a failed leader settles its flight.
+/// How a failed leader settles its flight. `E` is the driver's error type
+/// (production `AcquisitionFailure` is `FailureKind<racer_dataplane::Error>`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FailureKind {
+pub enum FailureKind<E = Error> {
+    /// A validated credential-specific origin rejection.
     OriginRejected,
+    /// Credential-specific origin 403; retry with independent credentials.
     OriginForbidden,
-    Terminal(Error),
+    /// Terminal only for this cohort; never negative-cache a page here.
+    Terminal(E),
 }
 
 /// Map a leader's acquisition error to its flight failure.

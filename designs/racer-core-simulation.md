@@ -50,7 +50,7 @@ Depends only on `topology`, `racer-object-wire`, `racer-control-wire`, `flow-con
 | `read::budget` | `AcquisitionBudget`, `MAX_ROUTE_LINKS` (8), hot page shedding to helpers |
 | `read::walk` | `CandidateWalk`: probe order, hedges, post-412 walk, stale membership handling |
 | `read::hints` | Orphan copy notices and successor hints |
-| `read::flight` | `PageFlights` singleflight table |
+| `read::flight` | Singleflight step functions (join gates, wait/elect, publish, fail) shared by production `Flights` and the sim's `PageFlights` table |
 
 ### Production callers
 

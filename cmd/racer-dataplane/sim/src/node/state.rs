@@ -1,6 +1,5 @@
 //! Per-node and per-worker state: the real caches and tables, payload-free.
 
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -15,13 +14,13 @@ use racer_core::read::hints::{HINT_CAPACITY, HINT_TTL, SuccessorHints};
 use racer_core::read::hints::{NOTICE_CAPACITY, OrphanNotices};
 use topology::{MAX_DEGREE, Paths, Phantom, Placement, SharedRoutes};
 
-use super::admission::{PageCharges, Rejections, SimPolicy, SimQuotas};
+use super::admission::{Rejections, SimCharge, SimPolicy, SimQuotas};
 use super::config::NodeConfig;
 use crate::engine::Fixed;
 use flow_control::coalesce::flight::state::Published;
 
 /// Flight results carry the published page length.
-pub type Flights = PageFlights<u32, u32, u32, Fixed>;
+pub type Flights = PageFlights<u32, u32, u32, SimCharge, Fixed>;
 
 fn split(len: u32) -> Published<u32, u32> {
     Published::Complete(len)
@@ -44,7 +43,6 @@ pub struct Worker {
     pub flights: Flights,
     pub memory: TickLru<u64, u32, Fixed>,
     pub quotas: SimQuotas,
-    pub charges: HashMap<u64, PageCharges, Fixed>,
 }
 
 impl Worker {
@@ -64,10 +62,9 @@ impl Worker {
                 config.placement_entries as usize,
                 phantom.clone(),
             )),
-            flights: PageFlights::with_hasher(limits, split, now, Fixed::default()),
+            flights: PageFlights::new(limits, split, now, Fixed::default()),
             memory: TickLru::default(),
             quotas: SimQuotas::new(SimPolicy::new(config, rejections.clone())),
-            charges: HashMap::default(),
         }
     }
 }
@@ -247,9 +244,7 @@ impl Node {
             out.flights += std::mem::size_of::<Flights>() + w.flights.len() * 256;
             out.memory_lru +=
                 std::mem::size_of_val(&w.memory) + w.memory.len() * TICK_LRU_ENTRY_BYTES;
-            out.quotas += std::mem::size_of::<SimQuotas>()
-                + 512
-                + w.charges.capacity() * (8 + std::mem::size_of::<PageCharges>());
+            out.quotas += std::mem::size_of::<SimQuotas>() + 512;
         }
         out.paths += std::mem::size_of::<Paths<SharedRoutes>>()
             + self.paths.cached_entries() * ROUTE_ENTRY_BYTES;
