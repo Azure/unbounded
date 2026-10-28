@@ -100,6 +100,9 @@ pub struct LinkNode {
 
     /// GPU landing slices registered this round, by rail and GPU.
     landings: Mutex<HashMap<(u16, i32), Arc<crate::gpu::GpuLanding>>>,
+
+    /// NIC slots in each registered landing slice this round, by rail and GPU.
+    landing_slots: Mutex<HashMap<(u16, i32), usize>>,
 }
 
 /// Split each GPU's landing buffer of `slots` page slots across `rails`.
@@ -206,8 +209,38 @@ impl LinkNode {
         Self::lock(&self.landings).get(&(rail.0, ordinal)).cloned()
     }
 
+    /// Landing state of each active rail, for metrics: the rail, and the
+    /// `(ordinal, slots)` of each GPU landing slice registered on it.
+    pub fn landing_state(&self) -> Vec<(u16, Vec<(i32, usize)>)> {
+        let slots = Self::lock(&self.landing_slots);
+        let mut rails: Vec<u16> = Self::lock(&self.active)
+            .iter()
+            .map(|mapping| mapping.rail.0)
+            .collect();
+        rails.sort_unstable();
+        rails.dedup();
+        rails
+            .into_iter()
+            .map(|rail| {
+                let mut gpus: Vec<(i32, usize)> = slots
+                    .iter()
+                    .filter(|((r, _), _)| *r == rail)
+                    .map(|(&(_, ordinal), &count)| (ordinal, count))
+                    .collect();
+                gpus.sort_unstable();
+                (rail, gpus)
+            })
+            .collect()
+    }
+
+    /// Whether GPU landing is configured (GPU decrypt and RDMA both on).
+    pub fn gpu_landing_configured(&self) -> bool {
+        Self::lock(&self.gpu_landing).is_some()
+    }
+
     fn reset(&self) {
         Self::lock(&self.landings).clear();
+        Self::lock(&self.landing_slots).clear();
         Self::lock(&self.active).clear();
         self.settled
             .store(false, std::sync::atomic::Ordering::Release);
@@ -559,6 +592,7 @@ impl Links {
                             rail.0
                         );
                         LinkNode::lock(&self.node.landings).insert((rail.0, ordinal), slice);
+                        LinkNode::lock(&self.node.landing_slots).insert((rail.0, ordinal), slots);
                     }
                     Err(error) => eprintln!(
                         "racer-dataplane: stage=gpu-landing rail={} ordinal={ordinal} state=failed reason={error}",
@@ -845,7 +879,7 @@ impl Links {
         let landing = self.node.landing(rail, ordinal).ok_or(Error::Unavailable)?;
         let (epoch, link) = self.ready(peer, rail).ok_or(Error::Unavailable)?;
         let length = MAX_CIPHERTEXT as u32;
-        let granted = self
+        let granted = match self
             .wait(
                 self.client.grant_device(
                     link_key(peer, rail),
@@ -857,7 +891,20 @@ impl Links {
                 ),
                 scope,
             )
-            .await?;
+            .await
+        {
+            Ok(granted) => granted,
+            Err(Error::Overloaded) => {
+                if let Some((helper, _)) = LinkNode::lock(&self.node.gpu_landing).as_ref() {
+                    helper
+                        .counters()
+                        .landing_exhausted
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return Err(Error::Overloaded);
+            }
+            Err(error) => return Err(error),
+        };
         Ok(PendingReceive {
             metrics: self.metrics.clone(),
             retry: self.retry.clone(),

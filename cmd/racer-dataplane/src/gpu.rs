@@ -372,6 +372,47 @@ pub struct GpuCounters {
 
     /// Sealed pages decrypted from an RDMA landing buffer.
     pub landed: AtomicU64,
+
+    /// Verified plaintext pages copied from host memory (decrypted by the
+    /// CPU or already plaintext in cache).
+    pub plaintext: AtomicU64,
+
+    /// RDMA landing grants that found no free landing slot.
+    pub landing_exhausted: AtomicU64,
+
+    /// Times cuFile was turned off, indexed by [`CufileDisable`].
+    pub cufile_disabled: [AtomicU64; CufileDisable::ALL.len()],
+}
+
+/// Why cuFile was turned off.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CufileDisable {
+    /// The cuFile driver failed to open at startup.
+    DriverOpen,
+    /// A staging buffer could not be registered with cuFile.
+    StagingRegister,
+    /// A file could not be registered with cuFile.
+    FileOpen,
+}
+
+impl CufileDisable {
+    pub const ALL: [Self; 3] = [Self::DriverOpen, Self::StagingRegister, Self::FileOpen];
+
+    /// Metric label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DriverOpen => "driver_open",
+            Self::StagingRegister => "staging_register",
+            Self::FileOpen => "file_open",
+        }
+    }
+}
+
+impl GpuCounters {
+    /// Count one cuFile turn-off.
+    pub(crate) fn cufile_disabled(&self, reason: CufileDisable) {
+        self.cufile_disabled[reason as usize].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Per-GPU state shared with I/O threads.
@@ -1023,7 +1064,7 @@ fn helper_main(
                     readers.push(thread);
                 }
             }
-            let opener = open_cufile(&gpu, &state.cufile);
+            let opener = open_cufile(&gpu, &state.cufile, &state.counters);
             let uuids = usable.iter().map(|device| device.uuid).collect();
             let _ = ready.send(Ok((usable, decrypt)));
             Helper {
@@ -1080,17 +1121,20 @@ fn helper_main(
 fn open_cufile(
     gpu: &racer_gpu::Gpu,
     cufile: &Arc<AtomicBool>,
+    counters: &Arc<GpuCounters>,
 ) -> Option<std::thread::JoinHandle<()>> {
     if !cufile.load(Ordering::Relaxed) {
         return None;
     }
     let (reader, cufile) = (gpu.file_reader(), cufile.clone());
+    let counters = counters.clone();
     std::thread::Builder::new()
         .name("racer-gpu-cufile".into())
         .spawn(move || {
             if let Err(error) = reader.open_driver()
                 && cufile.swap(false, Ordering::Relaxed)
             {
+                counters.cufile_disabled(CufileDisable::DriverOpen);
                 eprintln!("racer-dataplane: stage=gpu state=cufile-disabled reason={error}");
             }
         })
@@ -1365,7 +1409,12 @@ impl Helper {
             .copy_from_host(destination, offset, plaintext.clone());
         // Synchronize even after a failed queue call: part of it may run.
         let synchronized = request.stream.synchronize();
-        queued.and(synchronized).map_err(gpu_error)
+        queued.and(synchronized).map_err(gpu_error)?;
+        self.state
+            .counters
+            .plaintext
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// This GPU's staging buffer, allocated on first use.
@@ -1419,7 +1468,7 @@ impl Helper {
                 .counters
                 .file_failures
                 .fetch_add(1, Ordering::Relaxed);
-            self.disable_cufile(error);
+            self.disable_cufile(error, CufileDisable::StagingRegister);
             return Err((Error::Unavailable, reply));
         }
         let id = match self.files.get(&identity) {
@@ -1454,7 +1503,7 @@ impl Helper {
                             self.unsupported_device(identity.0, error);
                             return Err((Error::Unavailable, reply));
                         }
-                        self.disable_cufile(error);
+                        self.disable_cufile(error, CufileDisable::FileOpen);
                         return Err((Error::Unavailable, reply));
                     }
                 }
@@ -1536,8 +1585,9 @@ impl Helper {
     }
 
     /// Stop trying cuFile after a failure that is not about one read.
-    fn disable_cufile(&self, error: racer_gpu::Error) {
+    fn disable_cufile(&self, error: racer_gpu::Error, reason: CufileDisable) {
         if self.state.cufile.swap(false, Ordering::Relaxed) {
+            self.state.counters.cufile_disabled(reason);
             eprintln!("racer-dataplane: stage=gpu state=cufile-disabled reason={error}");
         }
     }
