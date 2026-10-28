@@ -141,6 +141,8 @@ open flavor supports Turing and later GPUs only.
   (CUDA 12.8) or later. It needs no `nvidia-fs`. The `nvidia-fs` path to local
   NVMe also needs NVMe patches from MLNX_OFED or DOCA. The Azure Linux host
   images do not install `nvidia-fs`; its repository has no package for it.
+  cuFile uses P2PDMA only when asked: for Racer, set
+  `RACER_GPU_PCI_P2PDMA=true` in `racer-dataplane-config`.
 
 On Ubuntu Azure VMs, `hack/agent/azure-gpu-vm/install-nvidia-drivers.sh`
 installs `nvidia-fs` when you pass `--gds`:

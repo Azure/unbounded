@@ -258,6 +258,11 @@ above:
   `CU_FILE_DEVICE_NOT_SUPPORTED`, `CU_FILE_INVALID_FILE_TYPE`), only that
   device (`st_dev`) skips cuFile until restart. A failed read only drops that
   file's registration.
+- `RACER_GPU_PCI_P2PDMA=true` makes the shim set cuFile's `use_pci_p2pdma`
+  (`cuFileSetParameterBool`) before it opens the driver, so local NVMe reads
+  use PCI P2PDMA without `nvidia-fs`. If cuFile cannot set it, the open fails
+  and cuFile is off, as for any failed open. The flag is an argument of
+  `racer_gpu_file_open`, so the shim ABI is version 2.
 - At startup the helper runs a zero-length decrypt on each GPU. A GPU whose
   shim has no decrypt kernels, or a staging cap smaller than the two scratch
   slots, gets plaintext pages only.
