@@ -26,6 +26,7 @@ const agentUpgradeLockRetryDelay = 2 * time.Second
 type machineOperationTarget struct {
 	installation *installstate.Store
 	client.Client
+	operationReader      client.Reader
 	log                  *slog.Logger
 	machineName          string
 	nodeOperator         nodeOperator

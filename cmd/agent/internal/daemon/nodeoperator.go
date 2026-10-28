@@ -43,6 +43,10 @@ type nodeOperator interface {
 	EnsureLifecycleMigration(context.Context, *slog.Logger, *ActiveMachine) error
 	// RestartNode restarts the provided active nspawn-backed node in place.
 	RestartNode(context.Context, *slog.Logger, *ActiveMachine) error
+	// HostBootID identifies the current host OS boot.
+	HostBootID() (string, error)
+	// RebootHost requests a host OS reboot.
+	RebootHost(context.Context, *slog.Logger) error
 	// ResetAgentResources removes the unbounded-agent and associated resources
 	// without stopping the currently running daemon process.
 	ResetAgentResources(context.Context, *slog.Logger) error

@@ -80,6 +80,7 @@ func runController(
 	machineOperations := &machineOperationTarget{
 		installation:         installation,
 		Client:               c,
+		operationReader:      mgr.GetAPIReader(),
 		log:                  log,
 		machineName:          machineName,
 		nodeOperator:         nodeOperator,
@@ -94,6 +95,7 @@ func runController(
 		nodeName,
 		daemon.MachineOperationHandlers{
 			v1alpha3.OperationNodeReboot:   machineOperations.reconcileNodeReboot,
+			v1alpha3.OperationHostOSReboot: machineOperations.reconcileHostOSReboot,
 			v1alpha3.OperationAgentUpgrade: machineOperations.reconcileAgentUpgrade,
 			v1alpha3.OperationAgentReset:   machineOperations.reconcileAgentReset,
 		},

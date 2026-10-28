@@ -123,6 +123,7 @@ spec:
                 - NodeReboot
                 - AgentUpgrade
                 - AgentReset
+                - HostOSReboot
                 - HostReboot
                 - HostPowerOff
                 - HostPowerOn
@@ -150,6 +151,10 @@ spec:
             required:
             - operationKind
             type: object
+            x-kubernetes-validations:
+            - message: HostOSReboot requires machineRef
+              rule: self.operationKind != 'HostOSReboot' || (has(self.machineRef)
+                && size(self.machineRef) > 0)
           status:
             description: MachineOperationStatus defines the observed state of a MachineOperation.
             properties:
@@ -218,6 +223,11 @@ spec:
                   - type
                   type: object
                 type: array
+              hostBootID:
+                description: |-
+                  HostBootID is the host boot ID observed before issuing HostOSReboot.
+                  The daemon completes the operation only after this ID changes.
+                type: string
               message:
                 description: Message is a human-readable description of the current
                   state.

@@ -84,6 +84,11 @@ func (r *MachineOperationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return r.reconcileTerminal(ctx, &op)
 	}
 
+	// HostOSReboot is owned by the daemon, not an out-of-band provider.
+	if op.Spec.OperationKind == unboundedv1alpha3.OperationHostOSReboot {
+		return ctrl.Result{}, nil
+	}
+
 	if op.Spec.MachineRef == "" {
 		if op.Spec.MachineSelector != nil {
 			logger.V(1).Info("selector-based operation not handled by external power controller", "operation", op.Name)

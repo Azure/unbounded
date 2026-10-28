@@ -5,8 +5,9 @@ description: "Power management and host replacement operations."
 ---
 
 Host operations change the power state of the VM, PXE host, or bare-metal
-machine. They are handled by `machine-ops-controller` for cloud VMs and by
-`metalman` for PXE/bare-metal machines with BMC.
+machine. Out-of-band operations are handled by `machine-ops-controller` for
+cloud VMs and by `metalman` for PXE/bare-metal machines with BMC.
+`HostOSReboot` is handled by the daemon agent running on the host.
 
 For metalman-managed bare-metal machines, host operations may target a single
 machine with `spec.machineRef` or multiple machines with `spec.machineSelector`.
@@ -23,22 +24,47 @@ the operation.
 
 ## Provider Requirements
 
-Host operations require out-of-band management access to the machine through a
+Out-of-band host operations require management access to the machine through a
 cloud provider API or BMC. The controller executing the operation communicates
 directly with the provider rather than through the agent on the host.
 
 Machines joined via SSH do not have a cloud provider or BMC backing them.
 `HostPowerOn` and `HostReplace` cannot work for SSH-joined machines because
 there is no out-of-band API to power on or recreate a machine that is off.
-`HostReboot` and `HostPowerOff` can be performed from within the host OS by the
-agent, but `HostPowerOn` after a power-off requires external intervention.
+Use `HostOSReboot` to reboot from within the host OS through the daemon agent.
+Powering on an SSH-joined host after a power-off requires external intervention.
 
 | Operation | Cloud VM | Bare metal (BMC) | SSH-joined |
 |-----------|----------|-------------------|------------|
-| `HostReboot` | Yes | Yes | Agent-initiated only |
-| `HostPowerOff` | Yes | Yes | Agent-initiated only |
+| `HostOSReboot` | Daemon required | Daemon required | Daemon required |
+| `HostReboot` | Yes | Yes | Not supported |
+| `HostPowerOff` | Yes | Yes | Not supported |
 | `HostPowerOn` | Yes | Yes | Not supported |
 | `HostReplace` | Yes | Yes | Not supported |
+
+## HostOSReboot
+
+Runs `reboot` on the host through the unbounded daemon agent. This restarts the
+entire host OS, unlike `NodeReboot`, which restarts only the nspawn-backed node.
+It does not use a cloud provider API or BMC.
+
+```bash
+kubectl unbounded machine operation create os-reboot-worker-01 \
+  --kind HostOSReboot --machine worker-01 --wait
+```
+
+Use one operation per machine; `HostOSReboot` requires `spec.machineRef` rather
+than a selector. The daemon records the current host boot ID in operation status
+before requesting the reboot. After the host boots and the daemon reconnects,
+it reports `Complete` only if the boot ID changed. Restarting only the daemon
+does not complete the operation or issue another reboot.
+
+Command failures are reported as `Failed`. If the daemon remains running on the
+same boot for five minutes after the request, it reports `RebootTimeout`.
+If the host never returns, the operation stays `InProgress` until the daemon can
+report a result. Completion confirms the OS reboot, not Kubernetes Node readiness.
+The operation does not cordon or drain the node; arrange workload evacuation
+before requesting a reboot when needed.
 
 ## HostReboot
 

@@ -777,6 +777,35 @@ func TestMachineOperationReconciler_UnsupportedOperationIsIgnored(t *testing.T) 
 	require.Empty(t, updated.Status.Phase)
 }
 
+func TestMachineOperationReconciler_HostOSRebootIsIgnored(t *testing.T) {
+	t.Parallel()
+
+	for _, withMachine := range []bool{false, true} {
+		t.Run(fmt.Sprint(withMachine), func(t *testing.T) {
+			t.Parallel()
+
+			op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostOSReboot)
+
+			builder := fake.NewClientBuilder().WithScheme(newOperationTestScheme(t)).WithObjects(op).WithStatusSubresource(op)
+			if withMachine {
+				builder.WithObjects(newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM))
+			}
+
+			c := builder.Build()
+			provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderAzureVM}
+			r := &MachineOperationReconciler{Client: c, Providers: []*Provider{newRecordingProviderRegistration(provider)}}
+			result, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(op)})
+			require.NoError(t, err)
+			require.Zero(t, result)
+			require.Empty(t, provider.calls)
+
+			var updated unboundedv1alpha3.MachineOperation
+			require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(op), &updated))
+			require.Empty(t, updated.Status.Phase)
+		})
+	}
+}
+
 func TestMachineOperationReconciler_FailsUnsupportedExternalOperation(t *testing.T) {
 	t.Parallel()
 
