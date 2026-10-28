@@ -171,22 +171,9 @@ impl Options {
         Ok(options)
     }
 
-    /// Build the configuration: scenario defaults, then `--config` JSON, then `--nodes` and
+    /// Build the configuration: scenario defaults, then the `--config` JSON, then `--nodes` and
     /// `--duration`, then scenario-generated schedules (only when the config left them empty).
-    pub fn build_config(&self) -> Result<Config, String> {
-        self.build_config_with(self.read_config()?.as_deref())
-    }
-
-    /// Contents of the `--config` file, if one was given.
-    fn read_config(&self) -> Result<Option<String>, String> {
-        self.config
-            .as_deref()
-            .map(|path| std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}")))
-            .transpose()
-    }
-
-    /// [`Self::build_config`] with the `--config` file contents given.
-    pub fn build_config_with(&self, json: Option<&str>) -> Result<Config, String> {
+    pub fn build_config(&self, json: Option<&str>) -> Result<Config, String> {
         let mut config = Config::default();
         if self.scenario == "zipf" {
             config.objects = 4096;
@@ -273,7 +260,10 @@ fn scenario_schedules(scenario: &str, config: &mut Config, seed: u64) {
 pub fn run(options: &Options) -> Result<Value, String> {
     let scenario = options.scenario.as_str();
     let mut json = options
-        .read_config()?
+        .config
+        .as_deref()
+        .map(|path| std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}")))
+        .transpose()?
         .map(|text| serde_json::from_str::<Value>(&text))
         .transpose()
         .map_err(|e| format!("parse config: {e}"))?;
@@ -285,7 +275,7 @@ pub fn run(options: &Options) -> Result<Value, String> {
             .remove("control")
     })
     .flatten();
-    let config = options.build_config_with(json.map(|v| v.to_string()).as_deref())?;
+    let config = options.build_config(json.map(|v| v.to_string()).as_deref())?;
     if control::SCENARIOS.contains(&scenario) {
         return control::run(
             scenario,
@@ -334,7 +324,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_all_flags() {
+    fn parses_options_and_durations() {
+        assert_eq!(Options::parse(&[]).unwrap(), Options::default());
         let o = Options::parse(&args(&[
             "--scenario",
             "zipf",
@@ -359,15 +350,6 @@ mod tests {
                 out: Some("r.json".into())
             }
         );
-    }
-
-    #[test]
-    fn defaults_when_empty() {
-        assert_eq!(Options::parse(&[]).unwrap(), Options::default());
-    }
-
-    #[test]
-    fn rejects_bad_input() {
         for bad in [
             &["--nodes"][..],
             &["--nodes", "x"],
@@ -380,6 +362,11 @@ mod tests {
         ] {
             assert!(Options::parse(&args(bad)).is_err(), "{bad:?}");
         }
+        assert_eq!(parse_duration("2").unwrap(), 2 * SECONDS);
+        assert_eq!(parse_duration("7ns").unwrap(), 7);
+        assert_eq!(parse_duration("3us").unwrap(), 3000);
+        assert!(parse_duration("99999999999999999999s").is_err());
+        assert!(parse_duration("").is_err());
     }
 
     #[test]
@@ -404,26 +391,17 @@ mod tests {
     }
 
     #[test]
-    fn durations() {
-        assert_eq!(parse_duration("2").unwrap(), 2 * SECONDS);
-        assert_eq!(parse_duration("7ns").unwrap(), 7);
-        assert_eq!(parse_duration("3us").unwrap(), 3000);
-        assert!(parse_duration("99999999999999999999s").is_err());
-        assert!(parse_duration("").is_err());
-    }
-
-    #[test]
     fn config_file_and_flag_precedence() {
         let mut o = Options::default();
         let json = r#"{"nodes": 5, "sites": 2}"#;
-        let c = o.build_config_with(Some(json)).unwrap();
+        let c = o.build_config(Some(json)).unwrap();
         assert_eq!((c.nodes, c.sites), (5, 2));
         o.nodes = Some(9);
-        assert_eq!(o.build_config_with(Some(json)).unwrap().nodes, 9);
-        assert!(o.build_config_with(Some("{")).is_err());
-        assert!(o.build_config_with(Some(r#"{"nodes": "x"}"#)).is_err());
+        assert_eq!(o.build_config(Some(json)).unwrap().nodes, 9);
+        assert!(o.build_config(Some("{")).is_err());
+        assert!(o.build_config(Some(r#"{"nodes": "x"}"#)).is_err());
         o.config = Some("/nonexistent/racer-sim/config.json".into());
-        assert!(o.build_config().is_err());
+        assert!(run(&o).is_err());
     }
 
     #[test]
@@ -439,7 +417,8 @@ mod tests {
         assert_ne!(a["trace_hash"], b["trace_hash"]);
     }
 
-    /// CI smoke: ~200 nodes, every scenario, no hard invariant failures.
+    /// CI smoke: ~200 nodes, every scenario, no hard invariant failures, and each scenario
+    /// exercises its feature.
     #[test]
     fn smoke_scenarios_hold_invariants() {
         for scenario in SCENARIOS {
@@ -449,63 +428,41 @@ mod tests {
                 "{scenario}: {}",
                 r["invariants"]
             );
-            let counters = &r["metrics"]["counters"];
             if *scenario == "empty" {
                 assert_eq!(r["events"], 0);
                 continue;
             }
-            assert!(
-                counters["reads_completed"].as_u64().unwrap() > 0,
-                "{scenario}"
-            );
-            assert!(
-                counters["origin_requests"].as_u64().unwrap() > 0,
-                "{scenario}"
-            );
+            let c = &r["metrics"]["counters"];
+            let n = |k: &str| c[k].as_u64().unwrap_or(0);
+            assert!(n("reads_completed") > 0, "{scenario}");
+            assert!(n("origin_requests") > 0, "{scenario}");
             assert!(r["memory"]["accounted_bytes"].as_u64().unwrap() > 0);
+            match *scenario {
+                "storm" => {
+                    assert!(n("flight_joins") > 0);
+                    // Without errors each page reaches the origin at most once per ranked owner.
+                    let max = r["origin_per_page"]["max_requests_per_page"]
+                        .as_u64()
+                        .unwrap();
+                    assert!((1..=topology::REPLICAS as u64).contains(&max), "{max}");
+                }
+                "churn" => assert!(n("membership_changes") > 0),
+                "faults" => {
+                    assert_eq!((n("crashes"), n("restarts")), (1, 1));
+                    assert!(n("origin_5xx") > 0, "{c}");
+                }
+                "smoke" => {
+                    assert!(n("range_reads") > 0 && n("peer_bytes") > 0);
+                    assert!(
+                        r["metrics"]["histograms"]["read_ns"]["count"]
+                            .as_u64()
+                            .unwrap()
+                            > 0
+                    );
+                }
+                _ => {}
+            }
         }
-    }
-
-    #[test]
-    fn scenarios_exercise_their_features() {
-        let storm = run(&opts("storm", 200, 1)).unwrap();
-        assert!(
-            storm["metrics"]["counters"]["flight_joins"]
-                .as_u64()
-                .unwrap()
-                > 0
-        );
-        // Singleflight per owner: without errors each page reaches the origin at most once per
-        // ranked owner.
-        let max = storm["origin_per_page"]["max_requests_per_page"]
-            .as_u64()
-            .unwrap();
-        assert!((1..=topology::REPLICAS as u64).contains(&max), "{max}");
-
-        let churn = run(&opts("churn", 200, 1)).unwrap();
-        assert!(
-            churn["metrics"]["counters"]["membership_changes"]
-                .as_u64()
-                .unwrap()
-                > 0
-        );
-
-        let faults = run(&opts("faults", 200, 1)).unwrap();
-        let c = &faults["metrics"]["counters"];
-        assert_eq!(c["crashes"], 1);
-        assert_eq!(c["restarts"], 1);
-        assert!(c["origin_5xx"].as_u64().unwrap() > 0, "{c}");
-
-        let smoke = run(&opts("smoke", 200, 1)).unwrap();
-        let c = &smoke["metrics"]["counters"];
-        assert!(c["range_reads"].as_u64().unwrap() > 0);
-        assert!(c["peer_bytes"].as_u64().unwrap() > 0);
-        assert!(
-            smoke["metrics"]["histograms"]["read_ns"]["count"]
-                .as_u64()
-                .unwrap()
-                > 0
-        );
     }
 
     /// 50k nodes x 2 workers, substrate only, must fit far below 32 GiB. Run with `cargo test
