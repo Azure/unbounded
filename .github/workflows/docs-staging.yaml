@@ -78,3 +78,5 @@ jobs:
           external_repository: ${{ vars.DOCS_STAGING_REPOSITORY }}
           publish_branch: gh-pages
           publish_dir: docs/public
+          # Each deploy replaces CNAME. Leave the variable unset for github.io URLs.
+          cname: ${{ vars.DOCS_STAGING_CNAME }}

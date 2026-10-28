@@ -128,6 +128,11 @@ func TestDocsStagingCannotPublishToProductionPages(t *testing.T) {
 		t.Fatalf("publish must use the staging deploy key, got %q", publish.With["deploy_key"])
 	}
 
+	// An unset variable expands to an empty input, so no CNAME is written.
+	if publish.With["cname"] != "${{ vars.DOCS_STAGING_CNAME }}" {
+		t.Fatalf("publish cname = %q, want the DOCS_STAGING_CNAME variable", publish.With["cname"])
+	}
+
 	if publish.With["github_token"] != "" || publish.With["personal_token"] != "" {
 		t.Fatal("publish must not use the workflow token or a personal token")
 	}

@@ -47,6 +47,12 @@ To enable it:
    | `DOCS_STAGING_BASE_URL` | `https://azure.github.io/unbounded-docs-staging/` |
 
    Use the staging site's actual HTTPS URL, including its path and trailing slash.
+
+   For a custom domain, also set `DOCS_STAGING_CNAME` to the bare host name,
+   such as `staging.example.com`, and use `https://staging.example.com/` as the
+   base URL. Each deploy replaces the `CNAME` file, so a domain set only in the
+   staging repository's Pages settings is lost on the next deploy. Leave
+   `DOCS_STAGING_CNAME` unset for a `github.io` URL.
 5. Run **unbounded docs staging** from `main` to create the `gh-pages` branch.
    In the staging repository's Pages settings, select **Deploy from a branch**,
    then `gh-pages` and `/ (root)`. Run the workflow again if needed to start the
