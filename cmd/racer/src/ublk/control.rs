@@ -518,17 +518,6 @@ impl Control {
         }
         result
     }
-
-    /// Deletes a device nobody in this process holds, such as one left by
-    /// an earlier run. Takes the same path as [`Control::del_dev`]: a plain
-    /// DEL_DEV must never be issued inline, because it blocks inside
-    /// `io_uring_enter` while any character device fd is open, so the
-    /// fallback is the bounded, cancelable pinned DEL_DEV on an io-wq
-    /// worker. If another process holds the character device, the device is
-    /// still marked deleted and its id is freed when that holder closes.
-    pub(crate) fn del_dev_unpinned(&mut self, id: u32) -> Result<()> {
-        self.del_dev(id)
-    }
 }
 
 /// User data of a pinned DEL_DEV and its cancel.

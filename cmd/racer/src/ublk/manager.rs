@@ -100,8 +100,6 @@ pub(crate) trait DeviceControl {
     fn get_dev_info(&mut self, id: u32) -> Result<DevInfo, UblkError>;
     /// Delete a device whose character device the caller holds open.
     fn del_dev(&mut self, id: u32) -> Result<(), UblkError>;
-    /// Delete a device nobody in this process holds.
-    fn del_dev_unpinned(&mut self, id: u32) -> Result<(), UblkError>;
     /// Whether a command's outcome is unknown, so no more are sent.
     fn is_poisoned(&self) -> bool;
 
@@ -166,10 +164,6 @@ impl DeviceControl for Control {
 
     fn del_dev(&mut self, id: u32) -> Result<(), UblkError> {
         Control::del_dev(self, id)
-    }
-
-    fn del_dev_unpinned(&mut self, id: u32) -> Result<(), UblkError> {
-        Control::del_dev_unpinned(self, id)
     }
 
     fn is_poisoned(&self) -> bool {
@@ -729,19 +723,23 @@ impl Manager {
             return fail("stop", &error);
         }
         // Hold the character device so the id cannot be reused while it is
-        // deleted. A live server elsewhere holds it and makes this fail.
+        // deleted. Without it, a DEL_DEV retry could delete another
+        // process's new device that took the id between attempts, so a
+        // device whose node cannot be opened is left for manual cleanup.
+        // A live server elsewhere holds it and makes the open fail.
         let fd = match control.open_char(&self.device_directory, id) {
             Ok(fd) => fd,
             Err(error) if error.raw_os_error() == Some(libc::EBUSY) => {
                 return fail("open", &"device is in use by another server");
             }
-            Err(_) => {
-                // No node to hold, for example a host /dev that lags. The
-                // device was stopped; delete it by id.
-                return match control.del_dev_unpinned(id) {
-                    Ok(()) => true,
-                    Err(error) => fail("delete", &error),
-                };
+            Err(error) => {
+                return fail(
+                    "open",
+                    &format!(
+                        "cannot hold /dev/ublkc{id} ({error}); not deleting it, \
+                         delete the stale device manually"
+                    ),
+                );
             }
         };
         match control.del_dev(id) {
@@ -913,6 +911,8 @@ mod tests {
         poisoned: Arc<Mutex<bool>>,
         /// The manager, to check it still holds the char device on delete.
         manager: Arc<Mutex<Option<Arc<Manager>>>>,
+        /// Opening a character device fails with this errno.
+        open_errno: Option<i32>,
     }
 
     impl Fake {
@@ -1001,16 +1001,15 @@ mod tests {
             Ok(())
         }
 
-        fn del_dev_unpinned(&mut self, id: u32) -> Result<(), UblkError> {
-            self.push(format!("del-unpinned {id}"));
-            Ok(())
-        }
-
         fn is_poisoned(&self) -> bool {
             *self.poisoned.lock().unwrap()
         }
 
-        fn open_char(&mut self, _directory: &Path, _id: u32) -> std::io::Result<OwnedFd> {
+        fn open_char(&mut self, _directory: &Path, id: u32) -> std::io::Result<OwnedFd> {
+            if let Some(errno) = self.open_errno {
+                self.push(format!("open {id} failed"));
+                return Err(std::io::Error::from_raw_os_error(errno));
+            }
             Ok(std::fs::File::open("/dev/null")?.into())
         }
     }
@@ -1232,6 +1231,31 @@ mod tests {
         assert_eq!(ops[1], "stop 9");
         assert_eq!(ops[2], "del 9");
         assert!(ops[3].starts_with("add id=Some(9)"));
+    }
+
+    #[test]
+    fn fixed_id_stale_device_without_char_node_is_left_alone() {
+        for errno in [libc::ENOENT, libc::EBUSY, libc::EACCES] {
+            let manager = manager(Some(9));
+            let fake = Fake {
+                stale: true,
+                open_errno: Some(errno),
+                ..Default::default()
+            };
+            let thread = spawn(&manager, &fake);
+            manager.report_resolved(0, Ok(resolved()));
+            eventually("open", || fake.ops().contains(&"open 9 failed".to_string()));
+            manager.request_stop();
+            thread.join().unwrap();
+            let ops = fake.ops();
+            assert_eq!(ops[..3], ["info 9", "stop 9", "open 9 failed"], "{ops:?}");
+            assert!(
+                !ops.iter()
+                    .any(|op| op.starts_with("del") || op.starts_with("add")),
+                "errno {errno}: no delete without a held char device: {ops:?}"
+            );
+            assert!(view(&manager, 0).attach.is_none());
+        }
     }
 
     fn device(id: Option<u32>, seed: u8) -> UblkDeviceConfig {

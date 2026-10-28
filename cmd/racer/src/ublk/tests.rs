@@ -808,12 +808,11 @@ fn collect_fetches(ring: &mut IoUring, aborted: &mut usize, cancel_res: &mut Opt
     }
 }
 
-/// Deleting a stale device whose character device someone else holds open,
-/// including through a dup, must not block inside `io_uring_enter`: the
-/// delete returns within the channel timeout, and the id is freed once the
-/// last fd closes.
+/// Deleting a device while holding its character device, including through a
+/// dup, must not block inside `io_uring_enter`: the delete returns within the
+/// channel timeout, and the id is freed once the last fd closes.
 #[test]
-fn ublk_unpinned_delete_with_held_dups_does_not_block() {
+fn ublk_held_delete_with_dups_does_not_block() {
     if !enabled() {
         return;
     }
@@ -852,8 +851,8 @@ fn ublk_unpinned_delete_with_held_dups_does_not_block() {
     guard.id = None;
     guard
         .control
-        .del_dev_unpinned(id)
-        .expect("delete while another holder has the device open");
+        .del_dev(id)
+        .expect("delete while holding the device and a dup");
     assert!(
         started.elapsed() < Duration::from_secs(30),
         "delete blocked on the held character device"
@@ -899,9 +898,6 @@ impl super::manager::DeviceControl for PanicOnStop {
     }
     fn del_dev(&mut self, id: u32) -> super::control::Result<()> {
         self.0.del_dev(id)
-    }
-    fn del_dev_unpinned(&mut self, id: u32) -> super::control::Result<()> {
-        self.0.del_dev_unpinned(id)
     }
     fn is_poisoned(&self) -> bool {
         self.0.is_poisoned()

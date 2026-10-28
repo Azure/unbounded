@@ -48,7 +48,10 @@ Each device is an object:
 - `key` is the cache key.
 - `etag` is optional. When unset, the dataplane resolves the current version once and pins it.
 - `id` is optional. When unset, the kernel picks the device id. When set and a stale device
-  with that id exists, the dataplane stops and deletes it first. Fixed and automatic ids can be
+  with that id exists, the dataplane stops and deletes it first. It deletes the stale device only
+while holding its character device open, so the id cannot be reused mid-delete. If
+`ublkcN` cannot be opened (missing, busy, or denied), that device fails with a log asking for
+manual cleanup; the dataplane and other devices keep running. Fixed and automatic ids can be
   mixed: every device with a fixed id is added before any automatic device, so the kernel cannot
   give an automatic device of this dataplane a configured id. An automatic device therefore waits
   until each fixed-id device has resolved and started or failed. The control thread never stops or
