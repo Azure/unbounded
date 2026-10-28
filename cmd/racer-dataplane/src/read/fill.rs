@@ -1494,13 +1494,11 @@ impl Fill {
             handover,
         );
         let owned_scope = RequestScope::new(caller_scope.request, ceiling)?;
-        let mut operation = self
-            .dependencies
-            .flights
-            .retain_operation(&leader, self.metrics.lease(Gauge::ActiveFills)?)?;
-        if handover {
-            self.dependencies.flights.allow_handover(&leader)?;
-        }
+        let mut operation = self.dependencies.flights.retain_driver_operation(
+            &leader,
+            self.metrics.lease(Gauge::ActiveFills)?,
+            handover,
+        )?;
         let mut owned_budget = acquisition.budget.transfer();
         let owned_membership = acquisition.membership.clone();
         let owned_page = page.clone();

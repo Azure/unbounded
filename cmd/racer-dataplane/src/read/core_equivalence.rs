@@ -674,6 +674,58 @@ fn expired_leader_with_retained_operation_drains_before_reelection() {
     assert!(pair.table.is_empty());
 }
 
+/// A leader canceled before its driver is submitted must not leave a retained
+/// operation behind: `retain_driver_operation` fails without holding a
+/// `FlightOperation`, so the entry and its charges are released and the
+/// table drains. A live leader retains with handover enabled.
+#[test]
+fn canceled_leader_retains_no_driver_operation_before_submission() {
+    let clock = uring_runtime::environment::SimulationClock::new(203);
+    let _environment = clock.environment(0).enter();
+    let mut pair = Pair::new(core::FlightLimits::default());
+    let lease = || {
+        crate::telemetry::Metrics::default()
+            .lease(crate::telemetry::Gauge::ActiveFills)
+            .unwrap()
+    };
+    let mut a = pair.join(Duration::from_secs(1), 2).1.unwrap();
+    assert_eq!(pair.poll(&mut a), Obs::Lead);
+    pair.cancel(&mut a);
+    for handover in [true, false] {
+        let result =
+            pair.flights
+                .retain_driver_operation(a.leader.as_ref().unwrap(), lease(), handover);
+        assert!(matches!(result, Err(Error::StaleFlight)), "{handover}");
+    }
+    pair.detach(a);
+    pair.check();
+    assert_eq!(pair.quotas.used(ResourceClass::Flight), 0, "entry released");
+    assert_eq!(pair.quotas.used(ResourceClass::ControlProgress), 0);
+    assert!(pair.table.is_empty());
+    let mut b = pair.join(Duration::from_secs(1), 2).1.unwrap();
+    let mut c = pair.join(Duration::from_secs(60), 2).1.unwrap();
+    assert_eq!(pair.poll(&mut b), Obs::Lead);
+    let operation = pair
+        .flights
+        .retain_driver_operation(b.leader.as_ref().unwrap(), lease(), true)
+        .unwrap();
+    pair.table.retain_operation(&pair.page, b.core).unwrap();
+    pair.table.allow_handover(&pair.page, b.core).unwrap();
+    pair.operations.push(operation);
+    clock.advance(Duration::from_secs(1));
+    pair.refresh();
+    assert!(pair.handed_over(), "handover was enabled");
+    assert_eq!(pair.poll(&mut c), Obs::Pending);
+    pair.complete(0);
+    pair.detach(b);
+    pair.detach(c);
+    pair.check();
+    assert!(pair.table.is_empty());
+    let scope =
+        RequestScope::new(RequestId([0xee; 16]), Pair::now() + Duration::from_secs(1)).unwrap();
+    futures::executor::block_on(pair.flights.drain(&scope)).unwrap();
+}
+
 /// Known issue 30: an expired leader's running operation passes to the
 /// live waiter with the latest deadline on both tables; the elected
 /// capability's deadline failure then retries for the adopter, which leads

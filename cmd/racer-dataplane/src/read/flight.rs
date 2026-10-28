@@ -1654,6 +1654,25 @@ impl Flights {
         })
     }
 
+    /// Retain the operation a fill driver is about to submit, first enabling
+    /// handover when requested. Handover is enabled before the operation is
+    /// retained so that no fallible step runs while an unsubmitted
+    /// `FlightOperation` is held: dropping one keeps its table slot and
+    /// admission charge (see `FlightOperation`), which would leave the flight
+    /// fenced and block `drain`. Enabling handover without a running
+    /// operation is inert, so a failed retain leaves nothing behind.
+    pub(crate) fn retain_driver_operation(
+        self: &Rc<Self>,
+        leader: &FlightLeader,
+        resources: telemetry::Lease,
+        handover: bool,
+    ) -> Result<FlightOperation> {
+        if handover {
+            self.allow_handover(leader)?;
+        }
+        self.retain_operation(leader, resources)
+    }
+
     pub(super) fn complete_operation(&self, fence: &Fence, id: u64) -> Result<()> {
         // Drop caller-owned resource bundles outside the table borrow.
         let resources = self.update(|table, _wakes| {
