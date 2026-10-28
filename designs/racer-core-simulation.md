@@ -178,8 +178,7 @@ make racer-sim ARGS='--scenario zipf --nodes 50000 --config cfg.json --out zipf.
 ```
 
 `--config` takes a JSON object of `Config` fields (unknown keys are errors), with `"node"` and
-`"control"` sub-objects. `RACER_SIM_TIMEOUT` (default 7200s) bounds the make target. Setting
-`RACER_SIM_TRACE_FAILED` adds per-probe and per-page diagnostics for failed reads.
+`"control"` sub-objects. `RACER_SIM_TIMEOUT` (default 7200s) bounds the make target.
 
 ## Invariants
 
@@ -243,4 +242,5 @@ These are bounded behaviors, not bugs, and are covered by tests or the invariant
 - A minimum-funded walk cannot fund both a helper probe (`HELPER_FLOOR_ATTEMPTS`) and an
   out-of-order rank 1 probe. When the helper misses, the read retries.
 - Silence pings add peer messages under many probe timeouts. Each ping follows a timeout or a
-  recheck.
+  recheck, and a node has at most `MAX_PINGS_IN_FLIGHT` pings and `MAX_OFFERS_IN_FLIGHT` copy
+  offers in flight, as in production.

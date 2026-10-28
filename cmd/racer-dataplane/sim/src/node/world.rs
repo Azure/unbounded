@@ -353,8 +353,6 @@ struct Fill {
     /// Walk probes so far: destination and how each ended (repeat classification,
     /// [`NodeWorld::classify_repeat`]).
     asked: Vec<(u32, Asked)>,
-    /// Diagnostic (`RACER_SIM_TRACE_FAILED`): each walk probe's outcome.
-    outcomes: Vec<String>,
     /// Outstanding origin request and its outcome (drawn at issue).
     origin: Option<(OriginHandle, OriginOutcome)>,
     /// The fill was canceled at its scope.
@@ -718,9 +716,6 @@ pub struct NodeWorld {
     woken: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
     publish_scheduled: bool,
     profile: Profile,
-    /// Diagnostic (`RACER_SIM_TRACE_FAILED`): per (node, page), why its failed fills failed,
-    /// printed when a client read of it fails.
-    failed_trace: Option<HashMap<(u32, u64), Vec<String>, Fixed>>,
 }
 
 /// Host wall time spent in the real topology code, for the report only (never feeds simulated time
@@ -834,7 +829,6 @@ impl NodeWorld {
             down_since: HashMap::default(),
             woken: std::sync::Arc::default(),
             publish_scheduled: false,
-            failed_trace: std::env::var_os("RACER_SIM_TRACE_FAILED").map(|_| HashMap::default()),
             profile: Profile::default(),
             config,
         };
@@ -1553,25 +1547,6 @@ impl NodeWorld {
                         } else {
                             self.metrics.incr("reads_failed");
                             self.metrics.incr(err_name(e));
-                            if let Some(t) = self.failed_trace.as_ref() {
-                                eprintln!(
-                                    "FAILED read node {} page {} start {} now {} err {e:?} \
-                                     attempt {} enrolled_latest {} fills {:?}",
-                                    r.node,
-                                    r.page,
-                                    r.start,
-                                    now,
-                                    r.attempt,
-                                    self.versions.latest_number(),
-                                    t.get(&(r.node, r.page))
-                                );
-                                // The destinations' own failed fills of the page.
-                                for (k, v) in t.iter() {
-                                    if k.1 == r.page && k.0 != r.node {
-                                        eprintln!("  DEST {} {v:?}", k.0);
-                                    }
-                                }
-                            }
                             // When reads fail, to attribute them to faults.
                             self.metrics
                                 .observe("read_failed_at_s", self.now() / SECONDS);
@@ -1599,13 +1574,6 @@ impl NodeWorld {
                 match result {
                     Ok(_) => self.send_reply(msg, dest, Reply::Response(ResponseKind::Page), now),
                     Err(e) => {
-                        if let Some(t) = self.failed_trace.as_mut() {
-                            t.entry((dest, page)).or_default().push(format!(
-                                "served {} copy_only {copy_only} err {e:?} at {}ms",
-                                m.requester,
-                                now / MILLIS
-                            ));
-                        }
                         // Production notes a failed acquire, not a failed copy-only wait
                         // (`Coordinator::serve_peer`).
                         if !copy_only {
@@ -1852,7 +1820,6 @@ impl NodeWorld {
                 cut: None,
                 relayed: false,
                 asked: Vec::new(),
-                outcomes: Vec::new(),
                 origin: None,
                 canceled: false,
                 concurrent: false,
@@ -3733,11 +3700,6 @@ impl NodeWorld {
                 let (attempts, links) = (m.attempts, m.links);
                 match inherited_budget(scope, route, attempts, links, m.path.len()) {
                     Err(e) => {
-                        if let Some(t) = self.failed_trace.as_mut() {
-                            t.entry((dest, page)).or_default().push(format!(
-                                "inherit {attempts}a/{links}l err {e:?} from {requester}"
-                            ));
-                        }
                         let reply = peer_error(e).map_or(Reply::Transport, Reply::Response);
                         self.send_reply(mid, dest, reply, now);
                     }
@@ -4181,8 +4143,6 @@ impl NodeWorld {
                 Rank0Note::Answered => watch.answered(&page, &rank0),
             }
         }
-        let now_ms = self.now() / MILLIS;
-        let tracing = self.failed_trace.is_some();
         let Some(fill) = self.fills.get_mut(&id) else {
             return;
         };
@@ -4207,19 +4167,6 @@ impl NodeWorld {
             Err(_) => Asked::Unfunded,
         };
         fill.asked.push((dest, asked));
-        if tracing {
-            let mode = if evidence.remaining {
-                "remaining"
-            } else {
-                "walk"
-            };
-            fill.outcomes.push(format!(
-                "{dest}:{outcome:?}@{}ms {mode} left {}a/{}l",
-                now_ms,
-                fill.budget.remaining_attempts(),
-                fill.budget.remaining_links()
-            ));
-        }
         // This node's reads see cuts its offers would cross.
         let cut = match asked {
             Asked::Unreachable(_) => Some(true),
@@ -4990,47 +4937,6 @@ impl NodeWorld {
         self.engine.at(done, Event::Written { write });
     }
 
-    /// Diagnostic line for a failed fill (`RACER_SIM_TRACE_FAILED`).
-    fn describe_failed_fill(&self, fill: &Fill, e: Error) -> String {
-        let now = self.now();
-        let state = |n: u32| {
-            let node = &self.nodes[n as usize];
-            format!(
-                "{n}[v{} enr {} down {}]",
-                node.version,
-                self.versions.enrolled(n),
-                node.down
-            )
-        };
-        let asked: Vec<String> = fill
-            .asked
-            .iter()
-            .map(|(d, a)| format!("{}:{a:?}", state(*d)))
-            .collect();
-        let cands: Vec<String> = fill.core.owners.iter().map(|c| state(*c)).collect();
-        format!(
-            "fill@{}..{} err {e:?} self {} v{} rank {:?} cands {cands:?} handoff {:?} asked {asked:?} outcomes {:?} \
-             stale {} waits {} fell_back {} denied {} retried {} attempts_left {} deadline_in {:?} canceled {}",
-            fill.started,
-            now,
-            state(fill.node),
-            fill.core.version,
-            fill.core.rank,
-            &fill.core.handoff,
-            fill.outcomes,
-            fill.core.stale,
-            fill.core.waits,
-            fill.core.fell_back,
-            fill.core.fallback_denied,
-            fill.core.retried,
-            fill.budget.remaining_attempts(),
-            fill.budget
-                .deadline()
-                .checked_duration_since(self.instant(now)),
-            fill.canceled,
-        )
-    }
-
     fn finish_fill(&mut self, id: u64, result: Result<Source, Error>) {
         let Some(fill) = self.fills.remove(&id) else {
             return;
@@ -5045,12 +4951,6 @@ impl NodeWorld {
         let n = &mut self.nodes[fill.node as usize];
         if n.incarnation != fill.incarnation {
             return;
-        }
-        if let (Err(e), Some(_)) = (&result, &self.failed_trace) {
-            let line = self.describe_failed_fill(&fill, *e);
-            if let Some(t) = self.failed_trace.as_mut() {
-                t.entry((fill.node, fill.page)).or_default().push(line);
-            }
         }
         let n = &mut self.nodes[fill.node as usize];
         self.metrics.incr(match result {
