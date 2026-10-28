@@ -252,12 +252,26 @@ cmd_gen() {
 	tools=$(tools_pod)
 	seed=$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')
 	created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-	refs=$(for ip in $(origin_ips); do
-		kubectl -n "$NS" exec "$tools" -- /tmp/genimage -registry "http://$ip:5000" \
-			-repo "bench/$name" -layers "$layers" -layer-bytes "$bytes" -parallel 8 \
-			-seed "$seed" -created "$created" &
-	done | sort -u)
-	wait
+	# Wait for every push inside the substitution: the parent shell cannot
+	# observe jobs started there, and a failed push prints no reference.
+	refs=$(
+		pids=()
+		for ip in $(origin_ips); do
+			kubectl -n "$NS" exec "$tools" -- /tmp/genimage -registry "http://$ip:5000" \
+				-repo "bench/$name" -layers "$layers" -layer-bytes "$bytes" -parallel 8 \
+				-seed "$seed" -created "$created" &
+			pids+=($!)
+		done
+		rc=0
+		for pid in "${pids[@]}"; do
+			wait "$pid" || rc=1
+		done
+		exit "$rc"
+	) || {
+		echo "image push to an origin replica failed" >&2
+		exit 1
+	}
+	refs=$(printf '%s\n' "$refs" | sort -u)
 	if [ "$(printf '%s\n' "$refs" | grep -c .)" -ne 1 ]; then
 		echo "origin replicas disagree: $refs" >&2
 		exit 1
