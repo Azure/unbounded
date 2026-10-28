@@ -4487,7 +4487,7 @@ fn offer_encoding_is_restricted_to_credential_free_page_requests() {
 }
 
 /// Drive this node's due copy offers until `n` more of them ended.
-fn drive_offers(f: &mut Fixture, now: Instant, n: u64) {
+fn drive_offers(f: &mut Fixture, now: Instant, n: u64, holds_all: bool) {
     use crate::telemetry::Event;
     let ended = |f: &Fixture| {
         f.fill.metrics.count(Event::OrphanOfferDelivered)
@@ -4495,10 +4495,11 @@ fn drive_offers(f: &mut Fixture, now: Instant, n: u64) {
     };
     let target = ended(f) + n;
     let fill = f.fill.clone();
-    f.fill
-        .dependencies
-        .candidates
-        .poll_offers(now, |page| fill.holds(page), &fill.metrics);
+    f.fill.dependencies.candidates.poll_offers(
+        now,
+        |page| holds_all || fill.holds(page),
+        &fill.metrics,
+    );
     let metrics = f.fill.metrics.clone();
     drive(
         std::future::poll_fn(|_| {
@@ -4544,7 +4545,7 @@ fn owner_after_rank_zero_offers_its_origin_fetch_later() {
     // Due: the first offer fails in transport and is rescheduled.
     peers.reply(&ordered[0], Reply::Deadline);
     let first = start + NOTICE_DELAYS[0];
-    drive_offers(&mut f, first, 1);
+    drive_offers(&mut f, first, 1, false);
     assert_eq!(f.fill.metrics.count(Event::OrphanOfferFailed), 1);
     {
         let calls = peers.calls.borrow();
@@ -4558,7 +4559,7 @@ fn owner_after_rank_zero_offers_its_origin_fetch_later() {
     assert_eq!(candidates.notices.borrow().len(), 1);
     // Delivered on the next try: rank 0 answers `Miss` itself.
     peers.reply(&ordered[0], Reply::Miss);
-    drive_offers(&mut f, first + NOTICE_DELAYS[1], 1);
+    drive_offers(&mut f, first + NOTICE_DELAYS[1], 1, false);
     assert_eq!(f.fill.metrics.count(Event::OrphanOfferDelivered), 1);
     assert_eq!(f.fill.metrics.count(Event::OrphanOfferSent), 2);
     assert!(candidates.notices.borrow().is_empty());
@@ -4592,32 +4593,7 @@ fn offers_wait_out_a_cut_toward_their_site() {
     assert!(acquire(&mut f, &mut budget).is_ok());
     let candidates = f.fill.dependencies.candidates.clone();
     let start = uring_runtime::environment::now();
-    let poll = |f: &mut Fixture, now: Instant, n: u64| {
-        let ended = |f: &Fixture| {
-            f.fill.metrics.count(Event::OrphanOfferDelivered)
-                + f.fill.metrics.count(Event::OrphanOfferFailed)
-        };
-        let target = ended(f) + n;
-        f.fill
-            .dependencies
-            .candidates
-            .poll_offers(now, |_| true, &f.fill.metrics);
-        let metrics = f.fill.metrics.clone();
-        drive(
-            std::future::poll_fn(|_| {
-                if metrics.count(Event::OrphanOfferDelivered)
-                    + metrics.count(Event::OrphanOfferFailed)
-                    >= target
-                {
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                }
-            }),
-            &mut f.engine,
-            &f.crypto,
-        );
-    };
+    let poll = |f: &mut Fixture, now: Instant, n: u64| drive_offers(f, now, n, true);
     // The first offer fails in transport: the group is blocked until its
     // next offer, 15 s after the failure. The offer task reports at the
     // runtime clock, which this test does not advance, so that is
