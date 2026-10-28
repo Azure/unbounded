@@ -2796,8 +2796,8 @@ impl Harness {
                 }
             }
             // A crash-restart of `b` leaves `a` holding a half-open `Ready`
-            // link that `a` only discovers on use, so `a` never wants a setup
-            // (Known issue 27). In production the restarted peer sets up the
+            // link that `a` only discovers on use, so `a` never wants a setup.
+            // In production the restarted peer sets up the
             // link when it needs one and `a` replaces the stale link; do that.
             let (from, to, target) = if links.ready(&peer, rail).is_some() {
                 (b, a, local)

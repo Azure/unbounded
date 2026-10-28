@@ -190,8 +190,8 @@ impl WorkerApplication {
             return Ok(());
         }
         let publication = match self.native_publication() {
-            // Not a member yet: a new node joins only after it serves
-            // (Known issue 14). Activate once a publication lists it.
+            // Not a member yet: a new node joins only after it serves.
+            // Activate once a publication lists it.
             Err(Error::IncompatibleMembership) => return Ok(()),
             result => result?,
         };
@@ -1262,7 +1262,7 @@ mod tests {
     }
 
     /// Readiness needs this node in its own membership: a new node is
-    /// listed only after it serves (Known issue 14).
+    /// listed only after it serves.
     #[test]
     fn membership_is_usable_only_when_it_lists_the_node() {
         let app = configured();

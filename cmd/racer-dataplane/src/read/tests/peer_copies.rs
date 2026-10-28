@@ -1566,7 +1566,7 @@ fn hedge_stale_membership_refreshes_once_without_fresh_credits() {
                     .push_back((ordered[0].clone(), Reply::Stale));
             }
             if stale_again {
-                // Known issue 3: a second stale answer after the one refresh
+                // A second stale answer after the one refresh
                 // skips that owner and tries the next one.
                 peers.replies.borrow_mut().extend([
                     (next[0].clone(), Reply::Stale),
@@ -2574,7 +2574,7 @@ fn corrupt_copies_exhaust_sources_or_original_credits_without_origin_for_noncand
     for (attempts, links, expected_calls, expected_error) in [
         (8, 16, 3, Error::Unavailable),
         (1, 16, 1, Error::Unavailable),
-        // Known issue 5: once the links are spent, later owners fail
+        // Once the links are spent, later owners fail
         // locally before any send and the walk ends with a recoverable
         // `Unavailable`, not `HopBudgetExhausted`.
         (8, 4, 1, Error::Unavailable),
@@ -2684,7 +2684,7 @@ fn corrupt_copy_cannot_extend_original_budget_deadline() {
 
 /// A non-owner in `Spread` mode sends its first Acquire to the owner chosen by
 /// its visiting order. A non-primary owner then checks its local copy and asks
-/// rank 0 to acquire, so rank 0 alone fills from origin (Known issue 4).
+/// rank 0 to acquire, so rank 0 alone fills from origin.
 /// `Primary` mode keeps the primary-first order.
 #[test]
 fn replica_selection_orders_first_acquire_and_non_primary_owner_fills() {
@@ -3317,7 +3317,7 @@ fn publish_same_membership(f: &mut Fixture, peers: &Rc<ScriptedPeers>) {
     f.fill = Fill::new(deps);
 }
 
-/// Known issue 3: a requester that adopted a membership its destination has not
+/// A requester that adopted a membership its destination has not
 /// (here: no newer local membership to refresh to) skips the stale owner and
 /// reads from the next one instead of failing with `IncompatibleMembership`.
 #[test]
@@ -3388,7 +3388,7 @@ fn owner_with_stale_predecessor_reaches_origin() {
     assert_eq!(f.origin.calls.get(), 1);
 }
 
-/// Known issue 19: an owner of the page is behind this node (it answers
+/// An owner of the page is behind this node (it answers
 /// `StaleMembership` to version 2 and nothing newer exists here). A
 /// non-owner that replaced version 1 recently and is a member of it stops
 /// walking version 2 and walks the owners under version 1, which they still
@@ -3506,7 +3506,7 @@ fn stale_owners_fall_back_to_the_recent_previous_membership() {
     }
 }
 
-/// Known issues 26 and 36: a reader that joined in version 2 is not a member
+/// A reader that joined in version 2 is not a member
 /// of version 1, so it cannot walk the previous membership when an owner is
 /// behind. It waits and asks the same owner again, at most
 /// `MAX_STALE_WAITS` times; a verified
@@ -3530,7 +3530,7 @@ fn readers_that_cannot_fall_back_wait_for_an_owner_that_is_behind() {
         // A default read (8 attempts, 16 links) cannot afford a second ask
         // and still fund its later owners: one wait, then as before. At the
         // last owner (rank 2 here) four attempts are left, one short of a
-        // further exchange plus its minimum (Known issue 49).
+        // further exchange plus its minimum.
         (true, 8, 16, &[0, 0, 1, 2], false),
         (true, 8, 16, &[0, 0, 1, 2], true),
         // No timer: as before the waits.
@@ -3611,7 +3611,7 @@ fn readers_that_cannot_fall_back_wait_for_an_owner_that_is_behind() {
                 "{case}"
             );
             // And the links past each owner that answered directly: only
-            // the link that carried each request is spent (Known issue 47).
+            // the link that carried each request is spent.
             assert_eq!(
                 budget.remaining_links(),
                 links - calls.len() as u8,
@@ -3622,7 +3622,7 @@ fn readers_that_cannot_fall_back_wait_for_an_owner_that_is_behind() {
     }
 }
 
-/// Known issue 25: rank 0 arrived in version 2, after the page's other
+/// Rank 0 arrived in version 2, after the page's other
 /// owners, which ranked above it before and may hold the copy one of them
 /// fetched however many versions ago. On a cold miss it asks them copy-only
 /// (lineage first, then version 1's previous owners) before the origin. In a
@@ -3699,8 +3699,8 @@ fn a_newer_owner_asks_older_later_owners_before_origin() {
             }
             // Then version 1's other owner, which is not a current one. It
             // is also the member ranked fourth, a demoted target granted with
-            // the lineage targets, so all three go out at once (Known issue
-            // 45) whoever holds the copy.
+            // the lineage targets, so all three go out at once
+            // whoever holds the copy.
             let other = members
                 .iter()
                 .map(|m| m.node.clone())
@@ -3739,7 +3739,7 @@ fn a_newer_owner_asks_older_later_owners_before_origin() {
     }
 }
 
-/// Known issues 34, 35 and 45: rank 0 reached by a delegation carries one
+/// Rank 0 reached by a delegation carries one
 /// credit, kept for its origin attempt. It still asks its lineage targets
 /// (later owners that arrived before it) and the member ranked fourth, which
 /// was an owner before rank 0 arrived, each copy-only on its own grant, all
@@ -3845,7 +3845,7 @@ fn a_delegated_rank_zero_asks_lineage_and_demoted_targets_on_their_own_grant() {
             // The grants never touched the walk's own credit.
             assert_eq!(budget.remaining_attempts(), 1, "{case}");
         }
-        // All three went out at once (Known issue 45): each on its own
+        // All three went out at once: each on its own
         // one-attempt grant, sharing the first one's time share (up to the
         // test clock's progress), where one after the other each would have
         // had a larger share of what the earlier ones left.
@@ -3869,7 +3869,7 @@ fn a_delegated_rank_zero_asks_lineage_and_demoted_targets_on_their_own_grant() {
     }
 }
 
-/// Known issues 41 and 45 (round 4, combined, wave 6): a batch of granted
+/// A batch of granted
 /// probes feeds silence evidence as sequential granted probes do. A target
 /// that leaves its probe unanswered is demoted (`Answering::Unanswered`, no
 /// ping: a granted target is never rank 0), one that answers is cleared, and
@@ -3939,7 +3939,7 @@ fn a_granted_batch_feeds_silence_evidence() {
         (ordered[1].clone(), Reply::Deadline),
         (ordered[2].clone(), Reply::Miss),
         // A verified `StaleMembership` refunds unused links and credits
-        // (Known issues 26, 47 and 49) into the probe's own grant, never
+        // into the probe's own grant, never
         // into the walk's budget.
         (demoted.clone(), Reply::Stale),
     ];
@@ -3966,7 +3966,7 @@ fn a_granted_batch_feeds_silence_evidence() {
 /// that owned the page there keeps walking the current membership rather
 /// than reach the origin with authority it no longer has. It learns that
 /// before it skips the first owner that is behind, so it still waits for
-/// that owner when it can (Known issue 36).
+/// that owner when it can.
 #[test]
 fn stale_fallback_never_makes_a_previous_owner_fetch() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
@@ -4071,7 +4071,7 @@ fn stale_answer_without_published_membership_is_unavailable() {
     assert_eq!(peers.calls.borrow().len(), 1);
 }
 
-/// Known issue 6: a page owner whose ranking moved with the last membership
+/// A page owner whose ranking moved with the last membership
 /// asks the page's previous owners copy-only before origin. Here the local
 /// node is rank 0 of version 2 and was not a member of version 1, so every
 /// version 1 owner is a handoff target. A copy there avoids origin; when all
@@ -4170,7 +4170,7 @@ fn owner_asks_previous_membership_owners_before_origin() {
     }
 }
 
-/// Known issue 12: an owner asks a predecessor that held the same rank under
+/// An owner asks a predecessor that held the same rank under
 /// the previous membership under that membership, while it replaced it
 /// recently (`PREVIOUS_MEMBERSHIP_WITHIN`). A predecessor that has not adopted
 /// the current version yet then serves (here rank 0 answers the delegated
@@ -4284,7 +4284,7 @@ fn owner_asks_unchanged_predecessors_under_the_recent_previous_membership() {
     }
 }
 
-/// Known issue 13: an owner above rank 0 that sees an ownership change (it
+/// An owner above rank 0 that sees an ownership change (it
 /// has handoff targets) still delegates the cold fetch to rank 0 with the
 /// credits a reader funds it with (handoff probes reserve nothing), and
 /// forwards its spare credits so rank 0 can ask the previous owners too.
@@ -4462,7 +4462,7 @@ impl SuccessorFixture {
     }
 }
 
-/// Known issue 21: rank 0 answered rank 1's copy-only probe without a copy,
+/// Rank 0 answered rank 1's copy-only probe without a copy,
 /// so rank 1 fetches the page itself. A reader's later `Acquire` is then
 /// answered `Miss` (the reader asks rank 1 next) instead of rank 0 fetching
 /// the page again, at most `MAX_DEFERRALS` times; a reader's own miss is no
@@ -4496,7 +4496,7 @@ fn rank_zero_defers_readers_to_the_owner_it_missed() {
     ));
     assert_eq!(s.count(Event::SuccessorHint), 2);
     // A deferral to an owner noted from its own miss is not remembered
-    // (Known issue 58 applies to offer senders only): the same reader is
+    // (only offer senders are): the same reader is
     // deferred each time.
     for i in 0..MAX_DEFERRALS {
         assert!(
@@ -4537,7 +4537,7 @@ fn rank_zero_defers_readers_to_the_owner_it_missed() {
     assert_eq!(s.count(Event::SuccessorDeferral), u64::from(MAX_DEFERRALS));
 }
 
-/// Known issue 58: a reader deferred to an offer's sender (Known issue 51)
+/// A reader deferred to an offer's sender
 /// that comes back for the page within `RETURN_WITHIN` did not get it
 /// there (the sender may have crashed since it offered), so the deferring
 /// owner acquires for it instead of deferring it again (the window itself:
@@ -4596,9 +4596,9 @@ fn a_reader_returning_from_an_offer_sender_is_not_deferred_again() {
     assert_eq!(s.f.origin.calls.get(), 1);
 }
 
-/// Known issue 21: owners are never deferred. Rank 2 delegating to rank 0
+/// Owners are never deferred. Rank 2 delegating to rank 0
 /// after rank 1 missed there gets rank 0's acquisition, which asks rank 1
-/// copy-only before origin on its own grant (round 4, orphan2): the
+/// copy-only before origin on its own grant: the
 /// delegation's single credit stays for origin.
 #[test]
 fn rank_zero_never_defers_owner_requesters() {
@@ -4642,7 +4642,7 @@ fn rank_zero_never_defers_owner_requesters() {
     assert!(*links <= SUCCESSOR_GRANT_LINKS);
 }
 
-/// Known issue 21 (round 4, orphan2): rank 0 asks the owner it answered
+/// Rank 0 asks the owner it answered
 /// without a copy before origin; that owner's orphan copy is served and
 /// origin is not asked again. The hint funds one probe: a second miss of
 /// rank 0's later acquisition goes straight to origin.
@@ -4771,7 +4771,7 @@ fn rank_zero_never_defers_to_a_reader() {
     assert_eq!(s.count(Event::SuccessorDeferral), 0);
 }
 
-/// A copy offer from `from` to the fixture's local node (Known issue 37),
+/// A copy offer from `from` to the fixture's local node,
 /// signed and verified as on the wire: no origin credentials, no remote
 /// attempts.
 fn offer_request(
@@ -4839,7 +4839,7 @@ impl SuccessorFixture {
     }
 }
 
-/// Known issue 37: rank 1 fetched the page from origin without ever
+/// Rank 1 fetched the page from origin without ever
 /// reaching rank 0, then offers it. Rank 0 answers `Miss` without a body,
 /// notes rank 1 as a successor hint that defers no readers, and its next
 /// acquisition (for a reader) copies the page from rank 1 instead of
@@ -4879,7 +4879,7 @@ fn rank_zero_notes_an_offer_and_copies_from_its_sender() {
     assert_eq!(s.count(Event::SuccessorDeferral), 0);
 }
 
-/// Known issue 37: an offer to a rank 0 that holds the page is answered
+/// An offer to a rank 0 that holds the page is answered
 /// `Miss` (never the body) and noted nowhere; a malformed offer for another
 /// object is refused.
 #[test]
@@ -4991,7 +4991,7 @@ fn drive_offers(f: &mut Fixture, now: Instant, n: u64) {
     );
 }
 
-/// Known issue 37: an owner after rank 0 that fetched the page from origin
+/// An owner after rank 0 that fetched the page from origin
 /// offers it to rank 0 after the first notice delay, on a fresh grant with no
 /// remote attempts; an offer that fails is tried again after the next delay,
 /// and a delivered one is not repeated.
@@ -5063,7 +5063,7 @@ fn owner_after_rank_zero_offers_its_origin_fetch_later() {
     assert_eq!(f.origin.calls.get(), 1);
 }
 
-/// Known issue 50: an offer that fails in transport blocks its target's
+/// An offer that fails in transport blocks its target's
 /// site (here every member has none, so one group) until the notice's next
 /// offer is due. Another notice that comes due meanwhile is deferred without
 /// a request or a spent try; when the block ends one offer goes out as the
@@ -5177,7 +5177,7 @@ fn offers_wait_out_a_cut_toward_their_site() {
     assert!(candidates.notices.borrow().is_empty());
 }
 
-/// Known issue 51: a rank 2 owner that fetched from origin offers the copy
+/// A rank 2 owner that fetched from origin offers the copy
 /// to rank 1 too when rank 1 did not answer its walk, and the offer is keyed
 /// apart from the rank 0 one; when rank 1 answered (it noted this owner
 /// then), only rank 0 is offered.
@@ -5259,7 +5259,7 @@ fn rank_two_offers_its_origin_fetch_to_rank_one_too() {
     }
 }
 
-/// Known issue 37: a page this node no longer holds is not offered, and a
+/// A page this node no longer holds is not offered, and a
 /// rank 0 origin fetch leaves no notice.
 #[test]
 fn offers_need_a_held_copy_and_an_owner_after_rank_zero() {
@@ -5316,7 +5316,7 @@ fn drive_pings(f: &mut Fixture, now: Instant, n: u64) {
     assert_eq!(ended(&metrics), target, "pings sent");
 }
 
-/// Known issues 41 and 43 (round 4, hang2): an owner above rank 0 whose
+/// An owner above rank 0 whose
 /// probe of rank 0 went unanswered pings rank 0 (mode `ping`, on its own
 /// grant: no remote attempts, at most `NOTICE_LINKS` links). A ping left
 /// unanswered makes rank 0 silent: the owner's next walk fails it at once,
@@ -5377,7 +5377,7 @@ fn an_owner_pings_a_rank_zero_that_timed_out_and_skips_it_while_silent() {
     assert_eq!(f.fill.metrics.count(Event::SilencePeerSilent), 1);
 }
 
-/// Known issues 41 and 43: a ping is answered `Miss` at once, without a body
+/// A ping is answered `Miss` at once, without a body
 /// or a hint, even by a node that holds the page; its encoding is restricted
 /// like an offer's.
 #[test]
@@ -5459,8 +5459,8 @@ fn a_ping_is_answered_miss_at_once_without_a_body() {
 
 /// An owner whose walk refreshed to a newer membership after a
 /// `StaleMembership` answer gets origin authority at its rank under the
-/// newer ranking. Its orphan notice (Known issue 37) and rank 0 failure hold
-/// (Known issue 52) must use that ranking, not the caller's: indexing the
+/// newer ranking. Its orphan notice and rank 0 failure hold
+/// must use that ranking, not the caller's: indexing the
 /// caller's owners with the new rank names another node (or none), and the
 /// bookkeeping was skipped or aimed at the wrong rank 0.
 #[test]

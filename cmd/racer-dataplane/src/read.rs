@@ -189,7 +189,7 @@ impl Coordinator {
 
     /// Whether to answer a non-owner's page `Acquire` with `Miss` because
     /// another owner fetched the page after this node answered it without a
-    /// copy (Known issue 21). Free when no hint names the page.
+    /// copy. Free when no hint names the page.
     async fn defer_to_successor(
         &self,
         page: &crate::model::PageId,
@@ -238,7 +238,7 @@ impl Coordinator {
 
     /// Whether a copy-only page request from `requester` may wait on this
     /// node's running acquisition of the page
-    /// (`racer_core::read::copy_join_allowed`, Known issue 44). Ranks
+    /// (`racer_core::read::copy_join_allowed`). Ranks
     /// the page only while an acquisition runs.
     async fn copy_join_allowed(
         &self,
@@ -263,18 +263,18 @@ impl Coordinator {
         allowed
     }
 
-    /// Send this node's due copy offers (Known issue 37); call once per
+    /// Send this node's due copy offers; call once per
     /// worker service turn.
     pub(crate) fn poll_offers(&self, now: std::time::Instant) {
         let fill = &self.fill;
         fill.dependencies
             .candidates
             .poll_offers(now, |page| fill.holds(page), &fill.metrics);
-        // Silence pings (Known issues 41 and 43) share the turn.
+        // Silence pings share the turn.
         fill.dependencies.candidates.poll_pings(now, &fill.metrics);
     }
 
-    /// Answer a copy offer (Known issue 37): `requester` fetched `page` from
+    /// Answer a copy offer: `requester` fetched `page` from
     /// origin as an owner ranked after this node. Note it as a successor
     /// hint for this node's own next acquisition (it defers no readers,
     /// `SuccessorHints::note_offer`), unless this node holds the page or is
@@ -507,7 +507,7 @@ impl LocalPageService for Coordinator {
                 mode: FetchMode::Ping,
             } = &request.operation
             {
-                // A silence ping (Known issues 41 and 43): answered at once,
+                // A silence ping: answered at once,
                 // never waiting on the cache or a flight.
                 if page.version.object != request.origin.object {
                     return Err(Error::InvalidRequest);
@@ -572,7 +572,7 @@ impl LocalPageService for Coordinator {
             // A non-owner's Acquire for a page another owner fetched after
             // this node answered it without a copy is served copy-only: the
             // reader asks that owner next instead of this node fetching the
-            // page again (Known issue 21).
+            // page again.
             if let PeerOperation::Page {
                 page,
                 mode: FetchMode::Acquire,

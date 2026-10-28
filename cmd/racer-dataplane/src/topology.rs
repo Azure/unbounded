@@ -127,7 +127,7 @@ impl LinkHealth {
             .answered(peer, uring_runtime::environment::now());
     }
     /// `peer` itself shed an exchange for `page` (an `Overloaded` it
-    /// signed): it is alive and busy; see `Silence::shed` (Known issue 54).
+    /// signed): it is alive and busy; see `Silence::shed`.
     pub fn silence_shed(&self, peer: &NodeId, page: crate::model::PageId) {
         self.silence
             .borrow_mut()
@@ -154,7 +154,7 @@ impl LinkHealth {
         }
     }
     /// What this worker last learned about `peer`'s answers (readers'
-    /// visit order, Known issue 41).
+    /// visit order).
     pub fn answering(&self, peer: &NodeId) -> racer_core::read::Answering {
         use racer_core::read::Answering;
         let now = uring_runtime::environment::now();
@@ -191,11 +191,11 @@ impl LinkHealth {
         self.available_at(neighbor, uring_runtime::environment::now())
     }
     pub fn available_at(&self, neighbor: &NodeId, now: Instant) -> Result<bool> {
-        // A silent neighbor is routed around (Known issue 41).
+        // A silent neighbor is routed around.
         Ok(self.inner.available(neighbor, now) && !self.silent_at(neighbor, now))
     }
     /// Circuit state only: whether `neighbor` may carry a ping meant for
-    /// itself even while this node holds it silent (Known issue 43).
+    /// itself even while this node holds it silent.
     pub fn circuit_available_at(&self, neighbor: &NodeId, now: Instant) -> bool {
         self.inner.available(neighbor, now)
     }
@@ -505,7 +505,7 @@ impl Placement {
     }
 
     /// Cache-only: members ranked just below the page's owners, best first,
-    /// from a complete cached ranking (Known issue 34). Never ranks.
+    /// from a complete cached ranking. Never ranks.
     pub fn demoted(
         &self,
         membership: &Membership,
@@ -732,7 +732,7 @@ impl Paths {
 
     /// Like [`Self::shortest_async`]. With `ping`, the budget's destination
     /// is not routed around for silence: an origin's recovery ping must be
-    /// able to reach the peer it holds silent (Known issue 43). Circuit
+    /// able to reach the peer it holds silent. Circuit
     /// health and peer admission still apply, and silent intermediate
     /// neighbors are still routed around.
     pub fn shortest_probe_async<'a>(
@@ -847,7 +847,7 @@ fn map_error(error: ::topology::Error) -> Error {
 pub(crate) mod tests {
     use super::*;
 
-    /// Known issues 41 and 43: a destination whose ping went unanswered is
+    /// A destination whose ping went unanswered is
     /// silent: unavailable for routing until it answers anything.
     #[test]
     fn a_silent_peer_is_routed_around_until_it_answers() {
@@ -1698,7 +1698,7 @@ pub(crate) mod tests {
                 ping,
             ))
         }
-        /// Known issue 43: an origin's recovery ping to a neighbor it holds
+        /// An origin's recovery ping to a neighbor it holds
         /// silent goes over the direct link; other requests route around it,
         /// and an open circuit or a silent intermediate still blocks.
         #[test]
@@ -1779,7 +1779,7 @@ pub(crate) mod tests {
                 Error::Internal
             );
         }
-        /// Known issue 10: production `Paths::new` queues searches beyond its 8
+        /// Production `Paths::new` queues searches beyond its 8
         /// slots instead of failing them with `Overloaded`; a queued search runs
         /// when a slot frees, and a cancelled one leaves the queue.
         #[test]

@@ -1089,7 +1089,7 @@ impl WorkerApplication {
 
         let paths = Rc::new(
             Paths::with_limits(
-                // Silence (Known issues 41 and 43): the rank 0 watch's
+                // Silence: the rank 0 watch's
                 // allowance, and one peer attempt per ping.
                 Rc::new(
                     LinkHealth::default()
@@ -2731,7 +2731,7 @@ impl WorkerApplication {
             self.start_listeners().await?;
             // Only now may managed control report this Pod: a primary
             // admits a new member once it reports, so peers never route to
-            // a member whose listener is not open (Known issue 14).
+            // a member whose listener is not open.
             if let Some(control) = &self.control {
                 control.mark_serving();
             }

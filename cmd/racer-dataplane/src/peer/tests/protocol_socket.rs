@@ -557,7 +557,7 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
     }
 }
 
-/// Known issues 41 and 43: a relay that holds the destination silent (a ping
+/// A relay that holds the destination silent (a ping
 /// to it went unanswered) answers `Unavailable` at once instead of sending
 /// the request to a peer that would never answer it.
 #[test]
@@ -1893,7 +1893,7 @@ mod established_sessions {
     }
 }
 
-/// Known issue 16: an owner already writing `hot_page_threshold()` bodies of a page,
+/// An owner already writing `hot_page_threshold()` bodies of a page,
 /// at least half of all bodies it writes, answers a signed `Overloaded` to a
 /// requester that is neither an owner nor a helper of the page, without
 /// calling the page service; below either threshold, for a page it does not

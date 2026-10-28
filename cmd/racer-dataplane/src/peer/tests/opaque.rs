@@ -908,7 +908,7 @@ struct RelayFixture {
     page: crate::memory::CiphertextPage,
 }
 
-/// Known issue 16 gap (round 4, relay): a page body counts toward the
+/// A page body counts toward the
 /// hot-page shed whichever transport writes it. `send_native` (RDMA) used to
 /// bypass the count that only `send_http_response` took, so an owner serving
 /// mostly over native transfers shed less. Both paths now take the same

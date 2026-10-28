@@ -1221,7 +1221,7 @@ mod flight {
             );
         }
 
-        /// Successor hints (Known issue 21) never defer a reader away from a
+        /// Successor hints never defer a reader away from a
         /// running acquisition: `acquiring` is true only while a leader runs.
         #[test]
         fn acquiring_only_while_a_leader_runs() {
@@ -1238,7 +1238,7 @@ mod flight {
             assert!(!flights.acquiring(&page));
         }
 
-        /// Known issue 30: a canceled leader's running operation continues for
+        /// A canceled leader's running operation continues for
         /// the remaining acquisition waiter instead of being canceled; the
         /// elected capability publishes and the adopter completes without
         /// leading a second fill or spending its budget.
@@ -2850,7 +2850,7 @@ mod timeouts {
         assert_eq!(f.scope.check(), Ok(()));
     }
 
-    /// Known issue 31: an owner above rank 0 whose page `Acquire` to rank 0
+    /// An owner above rank 0 whose page `Acquire` to rank 0
     /// is sent but unanswered within the attempt does not take origin
     /// authority (rank 0 is most likely still fetching); the walk ends
     /// `Unavailable` and the caller retries into rank 0's acquisition. A
@@ -2905,7 +2905,7 @@ mod timeouts {
         }
     }
 
-    /// Known issue 39: after rank 0 timed out, another timeout of rank 0
+    /// After rank 0 timed out, another timeout of rank 0
     /// does not give rank 1 authority for `with_rank0_hang_after`, even past the first request's short
     /// deadline (rank 0's acquisition outlives it while other waiters join);
     /// a rank 0 still silent after that (hung) no longer blocks the page: the
@@ -2972,7 +2972,7 @@ mod timeouts {
         assert!(calls.iter().all(|c| c.destination == rank0 && !c.copy));
     }
 
-    /// Known issue 52: rank 0 itself answering an owner's delegation that
+    /// Rank 0 itself answering an owner's delegation that
     /// its fetch failed gives the owner origin authority, unless the owner's
     /// own origin request for the page failed less than
     /// `with_rank0_hang_after` ago; then the retry is left to rank 0. A
@@ -3051,7 +3051,7 @@ mod timeouts {
         assert!(calls.iter().all(|c| c.destination == rank0 && !c.copy));
     }
 
-    /// Known issue 41 (round 4, hang2): a reader whose probe of an owner
+    /// A reader whose probe of an owner
     /// went unanswered visits that owner after the page's other owners on
     /// its next walk, instead of first again (`Spread` is deterministic per
     /// requester and page); an answer from it restores its place.
@@ -3131,7 +3131,7 @@ mod timeouts {
         assert_eq!(visited(&f, before)[0], hung);
     }
 
-    /// Known issue 54 (round 4, busy): an owner that itself shed a reader's
+    /// An owner that itself shed a reader's
     /// request (a signed `Overloaded`, as a hot page's owner does) is busy,
     /// not hung. The reader's next walks visit it after the page's other
     /// owners for the quiet time (half a request timeout), without a ping,

@@ -52,13 +52,13 @@ use uring_runtime::environment::Deadline;
 pub enum FetchMode {
     CopyOnly,
     Acquire,
-    /// A copy offer (Known issue 37, `racer_core::read::hints`): the
+    /// A copy offer (`racer_core::read::hints`): the
     /// requester holds the page and tells its rank 0. Page requests only, with
     /// no origin credentials and no remote attempts; the receiver never sends a
     /// body or acquires, and answers `Miss`. Receivers that predate it reject
     /// the request, which the sender treats as not delivered.
     Offer,
-    /// A silence ping (Known issues 41 and 43, `racer_core::liveness`):
+    /// A silence ping (`racer_core::liveness`):
     /// the requester asks whether the receiver answers at all. Page requests
     /// only, like [`Self::Offer`]; the receiver answers `Miss` at once
     /// without looking at its cache or flights, so the answer never waits

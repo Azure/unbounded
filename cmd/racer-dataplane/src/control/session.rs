@@ -1493,7 +1493,7 @@ pub(super) mod tests {
         assert_eq!(*seen.lock().unwrap(), vec![(4, vec![]), (4, vec![rail])]);
     }
 
-    /// Known issue 14: nothing is reported before the peer listener is
+    /// Nothing is reported before the peer listener is
     /// open; then only the newest rails, once.
     #[test]
     fn managed_report_waits_until_serving() {

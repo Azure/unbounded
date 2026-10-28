@@ -263,7 +263,7 @@ impl PeerNetwork {
 /// domain or extending the original deadline.
 /// The page that selects an RDMA rail for `operation`, if any. Bodyless page
 /// modes (ping, offer) have none: they take HTTP and never wait for an RDMA
-/// link, window grant, or landing slot before sending (Known issue 43).
+/// link, window grant, or landing slot before sending.
 pub(crate) fn rail_hint(operation: &protocol::Operation) -> Option<crate::model::PageId> {
     match operation {
         protocol::Operation::Page {
@@ -869,7 +869,7 @@ impl Requester {
             check_membership(&request, &membership)?;
             let search_budget = search_budget(&request.route, &network.local)?;
             // An origin's own recovery ping may use the link to the peer it
-            // holds silent; that link is what it tests (Known issue 43).
+            // holds silent; that link is what it tests.
             let ping = matches!(
                 request.operation,
                 protocol::Operation::Page {
@@ -956,8 +956,7 @@ impl Requester {
     }
 }
 impl Requester {
-    /// This worker's link health (silence included, Known issues 41 and
-    /// 43).
+    /// This worker's link health (silence included).
     pub(crate) fn link_health(&self) -> Rc<crate::topology::LinkHealth> {
         match self {
             Self::Network { health, .. } => health.clone(),
@@ -1039,7 +1038,7 @@ impl Requester {
                 crate::rdma::TransportPlan::Http
             };
             // The last link: this sender learns whether the destination
-            // answers (Known issues 41 and 43).
+            // answers.
             let last_page = match &request.request.operation {
                 protocol::Operation::Page { page, .. } if next == budget.destination => {
                     Some(page.clone())

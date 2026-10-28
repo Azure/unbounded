@@ -1124,7 +1124,7 @@ fn restart_b(w: &mut World) {
     pump!(w);
 }
 
-/// Known issue 27: after a peer restarts, the survivor's link stays `Ready`
+/// After a peer restarts, the survivor's link stays `Ready`
 /// (no traffic means no completion reports the dead peer), so the survivor
 /// never wants a setup. The restarted peer's setup replaces the stale link and
 /// both ends become ready again.
@@ -1162,7 +1162,7 @@ fn half_open_link_after_peer_restart_recovers_when_the_peer_initiates() {
     assert_ne!(id_a, old, "the stale link was replaced");
 }
 
-/// Known issue 27: the survivor's first use of the half-open link fails at
+/// The survivor's first use of the half-open link fails at
 /// the transport and breaks it, so its own setups resume after the backoff.
 #[test]
 fn half_open_link_after_peer_restart_breaks_on_first_use() {
@@ -1186,7 +1186,7 @@ fn half_open_link_after_peer_restart_breaks_on_first_use() {
 
 /// Setup tasks hold an `Rc<Links>` (see `connect_link`), so `Links::tasks` is
 /// a reference cycle. `abandon_setups` must break it so an undrained owner
-/// releases the tasks and their admission charges (Known issue 28).
+/// releases the tasks and their admission charges.
 #[test]
 fn abandon_setups_breaks_the_task_cycle_and_releases_charges() {
     let w = world_for([node_id(1), node_id(2)], true);

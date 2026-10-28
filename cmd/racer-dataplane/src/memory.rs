@@ -3488,7 +3488,7 @@ pub(crate) mod tests {
             );
             assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
         }
-        /// Known issue 9: a duplicate publish is not a use, so the oldest
+        /// A duplicate publish is not a use, so the oldest
         /// insert is still evicted first (the simulator's `memory_insert`
         /// keeps the same order).
         #[test]
