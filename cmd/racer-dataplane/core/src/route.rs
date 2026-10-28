@@ -1,4 +1,8 @@
 //! The single route budget rule shared by the dataplane and `peer-wire`.
+//!
+//! A route `origin, relay.., destination` uses at most [`MAX_LINKS`] links. Wire form (signed
+//! headers) counts the sender in `visited`: `visited.len() + links <= MAX_LINKS + 1`. Search form
+//! excludes the holder: `visited.len() + links <= MAX_LINKS`. [`search_budget`] converts.
 
 use std::time::Instant;
 
@@ -116,7 +120,8 @@ pub fn relay<N: PartialEq>(
 }
 
 /// Link retry backoff after `failures` consecutive failures: 100 ms doubling per failure up to 20
-/// s, plus `jitter` reduced to at most a quarter of the base.
+/// s, plus `jitter` reduced to at most a quarter of the base. Callers supply `jitter`
+/// deterministically per link.
 pub fn link_backoff(failures: u32, jitter: u64) -> std::time::Duration {
     let base = (100u64 << failures.saturating_sub(1).min(8)).min(20_000);
     std::time::Duration::from_millis(base + jitter % (base / 4 + 1))
@@ -205,7 +210,8 @@ pub enum RelayFailure {
     Propagate,
 }
 
-/// Relay failure table.
+/// Relay failure table. A relay never signs `Unavailable` for a ping's transport failure, which
+/// would hold a possibly alive destination silent.
 pub fn relay_failure(fault: Fault, ping: bool) -> RelayFailure {
     match fault {
         Fault::Io | Fault::Os if ping => RelayFailure::Propagate,
@@ -606,7 +612,8 @@ mod tests {
             assert_eq!(relay_failure(fault, true), ping, "{fault:?}");
         }
         // A pre-ping destination closes on the unknown mode (`Io` at the relay): unsigned, not an
-        // `Unavailable` that silences it.
+        // `Unavailable` that silences it. A relay that holds the destination silent still signs
+        // `Unavailable`.
         assert_eq!(relay_failure(Io, true), RelayFailure::Propagate);
         assert_eq!(
             relay_failure(Unavailable, true),

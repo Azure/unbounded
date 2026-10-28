@@ -1,4 +1,9 @@
 //! Token-based subscription scheduler without locks, wakers, or clocks.
+//!
+//! Methods that take `now_ms` first expire deadlines at that time; the others do not read time. A
+//! transition may ready parked response slots; the caller notifies [`Scheduler::take_wakes`] after
+//! it. Dataplane handle drops map to [`Scheduler::cancel_work`], [`Scheduler::cancel_waiter`], and
+//! [`Scheduler::release`].
 
 use flow_control::subscriptions::{Fanout, Interval, include as include_page};
 use std::collections::HashMap;
@@ -31,7 +36,8 @@ pub struct SubscriptionLimits {
     pub max_pending: usize,
 
     /// Most selections one subscription may have pending at once. A request asking for more is
-    /// granted this many.
+    /// granted this many. Bounded by `max_inflight`, `max_pending` and
+    /// [`MAX_SUBSCRIPTION_FLIGHTS`].
     pub max_flights_per_subscription: usize,
 }
 
@@ -273,7 +279,10 @@ impl<V> Entry<V> {
         self.subscription.byte_budget = self.subscription.byte_budget.saturating_sub(bytes);
     }
 
-    /// Apply a newer request's ceilings.
+    /// Apply a newer request's ceilings. They already exclude every earlier outstanding request's
+    /// reservation, so widen them by at most those reservations (never above current budgets) and
+    /// record the widening; each outstanding request must charge or forfeit its share, so the
+    /// contract minus every recorded widening never exceeds the newest ceiling.
     fn apply_ceiling(&mut self, sequence: u64, page_budget: u32, byte_budget: u64) {
         let older = |r: &&mut Reservation| r.sequence != sequence;
         // Lower sequences in the window that have not arrived. Must run after
@@ -332,7 +341,8 @@ impl<V> Entry<V> {
     }
 
     /// Take a flight slot for `reservation`, superseding the oldest admitted request if every slot
-    /// is taken.
+    /// is taken. A request older than every admitted one would be superseded at once, so it is a
+    /// replay.
     fn reserve(&mut self, reservation: Reservation) -> Result<(), Kind> {
         if self.pending.len() >= self.flights {
             return Err(Kind::Overloaded);
@@ -404,7 +414,9 @@ where
     }
 
     /// Admit one request on its contract. The caller has validated the fields (nonzero membership,
-    /// bounded receiver and cache names, flights in `1..=MAX_SUBSCRIPTION_FLIGHTS`).
+    /// bounded receiver and cache names, flights in `1..=MAX_SUBSCRIPTION_FLIGHTS`). With
+    /// `flights > 1` a sequence below the highest admitted one is accepted once if within the
+    /// granted flight window; only the highest sequence replaces demand, budgets and deadline.
     pub fn admit(
         &mut self,
         subscription: Contract<V>,
@@ -529,7 +541,9 @@ where
         }
     }
 
-    /// Select one page for an admitted request.
+    /// Select one page for an admitted request. `eligible(page)` says whether this node should
+    /// supply `page`; an unknown endpoint (`None`) is returned as `Ok(Err(page))` without reserving
+    /// a flight, so the caller can rank it and repeat.
     pub fn select(
         &mut self,
         admitted: &Admitted<M, R>,
@@ -667,7 +681,9 @@ where
     }
 
     /// Finish acquisition `work` with the payload and its byte length, or a failure. Every waiter
-    /// on the flight receives its own grant or error.
+    /// on the flight receives its own grant or error. `promote` marks an origin rejection of the
+    /// supplier's credentials and elects one retained follower to retry with its own. `now_ms`
+    /// expires deadlines first when present.
     pub fn complete(
         &mut self,
         work: u64,
@@ -689,6 +705,7 @@ where
     fn finish(&mut self, flight: u64, result: Result<(P, u64), E>, promote: bool) {
         // An origin rejection says nothing about another credential supplier. Elect exactly one
         // retained follower to retry with its own verified request and original route credits.
+        // Never clone or refund authority.
         let promote = promote && result.is_err();
         let limit = self.limits.max_completed_intervals;
         let entries = &mut self.entries;

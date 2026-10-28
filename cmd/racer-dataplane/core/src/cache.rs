@@ -9,7 +9,8 @@ use std::{
 /// Most entries one reclamation pass examines, per lane or overall.
 pub const RECLAIM_WINDOW: usize = 256;
 
-/// Most lanes one global pressure pass examines.
+/// Most lanes one global pressure pass examines. The window rotates, so every lane with entries is
+/// checked within `ceil(lanes / PRESSURE_WINDOW)` full passes.
 pub const PRESSURE_WINDOW: usize = 8;
 
 /// Assigns each key to a lane (for the dataplane, its cache) so one lane's
@@ -287,7 +288,8 @@ fn expiring<K: Clone>(
     (selected, next)
 }
 
-/// Unverified entries ordered by key, with a recency tick per entry for idle expiry.
+/// Unverified entries ordered by key, with a recency tick per entry for idle expiry. Every mutation
+/// goes through these methods so the tick index never drifts from the entries.
 pub struct OrderedLru<K, V, H = RandomState, G: Grouping<K> = Ungrouped> {
     /// Entries by key.
     pub pages: BTreeMap<K, V>,
@@ -424,7 +426,9 @@ impl Expiry {
         {
             self.checkpoints.push_back((now, verified, ciphertext));
             // Each new checkpoint may move the cutoff: start a fresh pass that also revisits
-            // entries that were busy last time.
+            // entries that were busy last time. An unfinished pass keeps its cursor so a long busy
+            // prefix cannot starve later entries; adopting the newer cutoff is safe because a
+            // touched entry moves to a tick above every aged checkpoint.
             self.verified.get_or_insert(0);
             self.ciphertext.get_or_insert(0);
         }
@@ -646,7 +650,9 @@ pub const fn unseen_value_for(page_bytes: u64, any_over_share: bool) -> u64 {
     })
 }
 
-/// Per-byte value of one page given its retention `score` (at most [`MAX_SCORE`]).
+/// Per-byte value of one page given its retention `score` (at most [`MAX_SCORE`]). While any cache
+/// is over share, every under-share page outvalues every over-share page; otherwise this is the
+/// plain retention score.
 #[must_use]
 pub const fn class_score(score: u8, any_over_share: bool, page_over_share: bool) -> u8 {
     if !any_over_share || page_over_share {

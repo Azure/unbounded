@@ -6,6 +6,12 @@ use racer_object_wire::model::{ObjectId, PageNumber};
 use std::time::Instant;
 
 /// Original acquisition budget, owned by one metadata/bootstrap operation or page acquisition.
+/// Retry never rebuilds one from defaults; fanout partitions credits, and route attempts charge
+/// actual forwarded links. No Clone: a replacement caller uses its own remaining credits.
+/// ```compile_fail
+/// use racer_core::read::AcquisitionBudget;
+/// fn duplicate(budget: AcquisitionBudget) { let _other = budget.clone(); }
+/// ```
 pub struct AcquisitionBudget {
     deadline: Instant,
     attempts: u32,
@@ -41,7 +47,8 @@ impl AcquisitionBudget {
 
     /// Return remote credits that a verified `StaleMembership` answer shows were never used: the
     /// answering node could not resolve the request's membership, so neither it nor the destination
-    /// behind it acted on the request.
+    /// behind it acted on the request. Never more than was sent, so a refund cannot mint credits;
+    /// lost or unverified answers are not refunded.
     pub fn refund_remote(&mut self, attempts: u32) -> Result<()> {
         let sent = self
             .remote_sent
@@ -188,7 +195,7 @@ impl AcquisitionBudget {
 /// Links a verified `StaleMembership` answer shows were never used: the answering node could not
 /// resolve the request's membership, so it neither served the request nor forwarded it, and every
 /// link past the `hops` the request travelled to it (`forwarders + 1` on the verified answer) was
-/// left unspent ([`AcquisitionBudget::refund_links`]).
+/// left unspent ([`AcquisitionBudget::refund_links`]), never more than was charged.
 pub fn stale_unused_links(charged: u8, hops: usize) -> u8 {
     charged.saturating_sub(u8::try_from(hops).unwrap_or(u8::MAX))
 }
@@ -201,6 +208,7 @@ pub(crate) const MAX_ROUTE_LINKS: u8 = 8;
 pub const NORMAL_ROUTE_LINKS: u8 = 4;
 
 /// Inherit a forwarded peer's remaining route allowance without extending its deadline.
+/// `scope_deadline` is the local request deadline; the caller checks cancellation.
 pub fn inherited_budget(
     scope_deadline: Instant,
     route_deadline: Instant,
@@ -386,7 +394,11 @@ mod budget_tests {
     }
 }
 
-// Overflow fan-out for hot pages.
+// Overflow fan-out for hot pages. An owner streaming [`hot_page_bodies`] bodies sheds further
+// readers ([`shed_hot_page`]); a shed non-owner asks one of the page's [`fanout_width`] hash-chosen
+// helpers ([`crate::read::walk::WalkConfig::helper`]). A helper probe carries at most
+// [`HELPER_ATTEMPTS`] and only walks starting with [`HELPER_MIN_ATTEMPTS`] may ask one, so requests
+// never chain. Helpers are non-owners, so they never reach origin.
 
 /// Most attempts a requester funds a helper probe with: the exchange plus
 /// the helper's own walk of the owners.
@@ -402,7 +414,8 @@ pub const HELPER_FLOOR_ATTEMPTS: u32 = 3;
 /// Fewest links left for a helper probe: a route to the helper and a route from it to an owner.
 pub const HELPER_FLOOR_LINKS: u8 = 4;
 
-/// A walk may ask a helper only if it starts with at least this many attempts.
+/// A walk may ask a helper only if it starts with at least this many attempts. Larger than
+/// [`HELPER_ATTEMPTS`], so a helper never asks another helper.
 pub const HELPER_MIN_ATTEMPTS: u32 = HELPER_ATTEMPTS + 1;
 
 /// Most helpers one page has.
@@ -412,7 +425,7 @@ const _: () = assert!(HELPER_MIN_ATTEMPTS > HELPER_ATTEMPTS);
 const _: () = assert!(HELPER_FLOOR_ATTEMPTS <= HELPER_ATTEMPTS);
 
 /// Helpers per page for a membership of `members`: the integer square root, at most
-/// [`MAX_HELPERS`].
+/// [`MAX_HELPERS`]. With `n` readers, owners and each helper then send about `sqrt(n)` copies.
 pub fn fanout_width(members: usize) -> usize {
     members.isqrt().min(MAX_HELPERS)
 }
@@ -435,7 +448,8 @@ fn fnv(parts: &[&[u8]]) -> u64 {
 }
 
 /// Queued egress of one page, in bytes, an owner writes before it may shed further readers of that
-/// page with `Overloaded` (see [`shed_hot_page`] and [`hot_page_bodies`]).
+/// page with `Overloaded` (see [`shed_hot_page`] and [`hot_page_bodies`]). In bytes so the rule
+/// means the same backlog (about 27 ms at 10 Gbit/s) for any page size.
 pub const HOT_PAGE_QUEUE_BYTES: u64 = 32 << 20;
 
 /// Fewest concurrent bodies of one page before an owner may shed, whatever the page size: below
@@ -443,7 +457,8 @@ pub const HOT_PAGE_QUEUE_BYTES: u64 = 32 << 20;
 pub const HOT_PAGE_MIN_BODIES: usize = 2;
 
 /// Concurrent bodies of one `page_bytes` page an owner writes before it may shed:
-/// [`HOT_PAGE_QUEUE_BYTES`] of that page, at least [`HOT_PAGE_MIN_BODIES`].
+/// [`HOT_PAGE_QUEUE_BYTES`] of that page, at least [`HOT_PAGE_MIN_BODIES`]. 32 for 1 MiB pages, 2
+/// for 16 MiB.
 pub const fn hot_page_bodies(page_bytes: u64) -> usize {
     let bodies = HOT_PAGE_QUEUE_BYTES / if page_bytes == 0 { 1 } else { page_bytes };
     if bodies < HOT_PAGE_MIN_BODIES as u64 {
@@ -457,7 +472,9 @@ pub const fn hot_page_bodies(page_bytes: u64) -> usize {
 
 /// Whether `local` sheds `requester`'s request for a page it is already writing to at least
 /// `threshold` requesters ([`hot_page_bodies`]), when that page is at least half of the `all`
-/// bodies it is writing (otherwise moving readers to helpers only adds a relayed hop).
+/// bodies it is writing (otherwise moving readers to helpers only adds a relayed hop). Only one
+/// of the first three ranked `owners` sheds, and never sheds another owner or one of the page's
+/// helpers (`helper`, evaluated last), so the owner's NIC feeds at most [`fanout_width`] helpers.
 pub fn shed_hot_page<N: PartialEq>(
     owners: &[N],
     local: &N,
@@ -486,7 +503,10 @@ pub fn is_helper(object: &ObjectId, page: PageNumber, position: usize, members: 
 }
 
 /// Position (in membership order) of the member `requester` asks to acquire `page` for it, or
-/// `None` when the membership has no eligible helper.
+/// `None` when the membership has no eligible helper. `excluded(position)` must be true for the
+/// page's owners and the requester. Starting at `hash(requester, page) % width`, takes the first
+/// non-excluded `preferred` (direct neighbor) helper, else the first non-excluded one; scans at
+/// most [`fanout_width`] helpers.
 pub fn fanout_helper(
     object: &ObjectId,
     page: PageNumber,

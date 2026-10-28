@@ -1,4 +1,15 @@
 //! Orphan notices and successor hints: keep rank 0 from refetching a page another owner fetched.
+//!
+//! An owner above rank 0 reaches origin only after its probe of rank 0 ended without a copy. If the
+//! probe reached rank 0, rank 0 noted a successor hint ([`SuccessorHints::note`]). If not, the
+//! holder remembers the page ([`OrphanNotices::note`]) and later sends each unanswered predecessor
+//! ([`notice_indexes`]) a copy offer: a body-less, credential-less page request answered `Miss`,
+//! which the receiver notes as a hint ([`SuccessorHints::note_offer`]).
+//!
+//! Bounds: [`NOTICE_TRIES`] offers per notice on a fixed [`NOTICE_LINKS`] grant (never a reader's
+//! budget), [`NOTICE_CAPACITY`] pending per node. A holder that no longer holds or owns the page
+//! drops the notice ([`notice_target`]). An offer failing with cut evidence blocks its target's
+//! group ([`OrphanNotices::offer_result`]); read probes feed the same table ([`OrphanNotices::observe`]).
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
@@ -28,7 +39,7 @@ pub const NOTICE_LINKS: u8 = crate::read::walk::SUCCESSOR_GRANT_LINKS;
 pub const PROBE_HOLD: Duration = Duration::from_secs(10);
 
 /// A due offer: send it to `target`, then report the outcome with
-/// [`OrphanNotices::delivered`] or [`OrphanNotices::failed`].
+/// [`OrphanNotices::offer_result`] or [`OrphanNotices::failed`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Due<K, N> {
     pub key: K,
@@ -90,7 +101,9 @@ impl<K: Eq + Hash + Clone, N: Clone, G: Eq + Hash + Clone> OrphanNotices<K, N, G
     }
 
     /// Remove and return the earliest notice due at `now` whose target's group (`group_of`) is not
-    /// blocked.
+    /// blocked. Due notices of a blocked group are deferred to the block's end without spending a
+    /// try. An offer to a group whose block just ended holds it for [`PROBE_HOLD`]; report every
+    /// offer with [`Self::offer_result`] or [`Self::failed`].
     pub fn pop_open(&mut self, now: Instant, group_of: impl Fn(&N) -> G) -> Option<Due<K, N>> {
         loop {
             let due = self.pop_due(now)?;
@@ -111,7 +124,8 @@ impl<K: Eq + Hash + Clone, N: Clone, G: Eq + Hash + Clone> OrphanNotices<K, N, G
 
     /// Another exchange of this node with a member of `group` ended: a route failure (`cut`: a
     /// transport failure or a relay's answer) holds the group's offers for [`PROBE_HOLD`] (never
-    /// shortening a longer block); an answer signed by that member releases it.
+    /// shortening a longer block); an answer signed by that member releases it. Only while notices
+    /// are pending, so the table stays empty otherwise.
     pub fn observe(&mut self, group: G, cut: bool, now: Instant) {
         if self.entries.is_empty() {
             return;
@@ -133,7 +147,10 @@ impl<K: Eq + Hash + Clone, N: Clone, G: Eq + Hash + Clone> OrphanNotices<K, N, G
     }
 
     /// `due`'s offer to a target in `group` ended with `end`; returns when the next offer for it is
-    /// due. Delivered or dropped: release the group's probe hold.
+    /// due. Delivered or dropped: release the group's probe hold. Refused (says nothing about the
+    /// route): release it and schedule the next offer as [`Self::failed`] does. Cut (a transport
+    /// failure or a relay's answer): schedule the same way and block the group until it is due (or
+    /// for the next retry delay, when the notice is done).
     pub fn offer_result(
         &mut self,
         due: Due<K, N>,
@@ -378,7 +395,8 @@ pub fn should_notice(rank: Option<usize>) -> bool {
 
 /// The owner ranks an origin fetch at `rank` notices: rank 0, and each later owner ranked before
 /// this one that did not answer this owner's walk without a copy (`evidence[i]`, the walk's
-/// predecessor evidence in rank order, is not `CopyMiss` or `VersionUnavailable`).
+/// predecessor evidence in rank order, is not `CopyMiss` or `VersionUnavailable`): an owner that
+/// answered already noted a hint. Rank 0 is always noticed. Empty unless [`should_notice`].
 pub fn notice_indexes(rank: Option<usize>, evidence: &[crate::read::ProbeOutcome]) -> Vec<u8> {
     use crate::read::ProbeOutcome;
     (0..rank.map_or(0, |r| r.min(2)))
@@ -394,7 +412,8 @@ pub fn notice_indexes(rank: Option<usize>, evidence: &[crate::read::ProbeOutcome
 }
 
 /// Where a due notice for owner rank `index` goes under the current membership: the page's owner at
-/// that rank, when `local` still holds the page and is still an owner ranked after it.
+/// that rank, when `local` still holds the page and is still an owner ranked after it. `None` drops
+/// the notice.
 pub fn notice_target<N: PartialEq + Clone>(
     local: &N,
     owners: &[N],
@@ -762,7 +781,13 @@ mod notice_tests {
 }
 
 // Successor hints. Rank 0 cannot ask an orphan's holder itself: requests reaching it carry too few
-// credits and links to route to another owner.
+// credits and links to route to another owner. So an owner that answers another owner's page probe
+// without a copy notes the requester ([`SuccessorHints::note`]) and, while the hint is fresh,
+// answers a non-owner's `Acquire` with `Miss` ([`successor_deferral`]) so the reader moves on to the
+// holder. Owner requesters are never deferred (too few links to reach the holder). An owner's own
+// walk also asks hinted owners copy-only before origin ([`successor_targets`]). Only owners ranked
+// after this node are deferred to or probed. Each hint defers at most [`MAX_DEFERRALS`] requests
+// and expires after [`HINT_TTL`]. A deferral never fetches, so origin authority is unchanged.
 
 /// Nodes remembered per page (the latest ones win).
 pub const HINTS_PER_PAGE: usize = 2;
@@ -771,13 +796,15 @@ pub const HINTS_PER_PAGE: usize = 2;
 pub const HINT_TTL: Duration = Duration::from_secs(600);
 
 /// How long a hint stays usable for this node's own successor probe ([`SuccessorHints::probe`]), at
-/// least the deferral TTL.
+/// least the deferral TTL. Longer than [`HINT_TTL`]: a stale probe costs one granted copy-only
+/// miss, while a stale deferral costs every deferred reader an extra owner visit.
 pub const PROBE_TTL: Duration = Duration::from_secs(3600);
 
 /// Deferrals per hint before this owner fetches the page again.
 pub const MAX_DEFERRALS: u32 = 8;
 
-/// How old a hint must be before [`SuccessorHints::probe`] returns it.
+/// How old a hint must be before [`SuccessorHints::probe`] returns it. A younger hint names an owner
+/// whose own fetch is most likely still running, so a copy-only probe would only miss.
 pub const PROBE_AFTER: Duration = Duration::from_secs(2);
 
 /// Default bound on remembered pages per node.
@@ -785,7 +812,8 @@ pub const HINT_CAPACITY: usize = 4096;
 
 /// How long a requester deferred to an offer's sender is remembered ([`SuccessorHints::peek_for`]):
 /// a requester that comes back for the page within this window lost the deferral (the sender failed
-/// it, for example because it crashed), so this node acquires instead of deferring it again.
+/// it, for example because it crashed), so this node acquires instead of deferring it again. Twice
+/// the default request timeout: it covers a read's retries, not a new read minutes later.
 pub const RETURN_WITHIN: Duration = Duration::from_secs(60);
 
 struct HintEntry<N> {
@@ -804,7 +832,8 @@ struct HintEntry<N> {
     /// and not since by [`SuccessorHints::note`].
     senders: Vec<N>,
     /// Requesters deferred to an offer's sender on this entry and when, newest last, at most
-    /// [`MAX_DEFERRALS`] ([`SuccessorHints::charge`]).
+    /// [`MAX_DEFERRALS`] ([`SuccessorHints::charge`]). Kept when the hint is renewed: the
+    /// requester's return says the deferral failed it, whoever noted the hint since.
     deferred: Vec<(N, Instant)>,
 }
 
@@ -882,7 +911,10 @@ impl<K: Eq + Hash + Clone, N: Clone + PartialEq> SuccessorHints<K, N> {
         self.compact();
     }
 
-    /// `node` offered its copy of `key` ([`crate::read::hints`]).
+    /// `node` offered its copy of `key` ([`crate::read::hints`]). Like [`Self::note`], but a new
+    /// hint defers no readers and an existing one keeps its deferral count: the holder may be far
+    /// away or gone by then. Notes only when this node `holds` no copy and is not `acquiring` one;
+    /// returns whether it noted. Either way the offer is answered `Miss`.
     pub fn note_offer(
         &mut self,
         key: K,
@@ -914,7 +946,9 @@ impl<K: Eq + Hash + Clone, N: Clone + PartialEq> SuccessorHints<K, N> {
     }
 
     /// The hints for `key` not older than [`PROBE_TTL`] (or the deferral TTL, if longer), oldest
-    /// first, for this node's own walk to ask before origin ([`successor_targets`]).
+    /// first, for this node's own walk to ask before origin (`successor_targets`). Each noted hint
+    /// is returned once (a renewed note returns it again). A hint younger than [`PROBE_AFTER`] is
+    /// held back unless an offer noted it, since an offer's sender holds the copy.
     pub fn probe(&mut self, key: &K, now: Instant) -> Vec<N> {
         let ttl = self.ttl.max(PROBE_TTL);
         match self.entries.get_mut(key) {
@@ -939,7 +973,10 @@ impl<K: Eq + Hash + Clone, N: Clone + PartialEq> SuccessorHints<K, N> {
     }
 
     /// [`Self::peek`] for a deferral of `requester`: nothing if this node deferred `requester` for
-    /// `key` to an offer's sender within [`RETURN_WITHIN`].
+    /// `key` to an offer's sender within [`RETURN_WITHIN`]: a requester that comes back did not get
+    /// the page there, and the sender may have crashed, so deferring it again would fail the read.
+    /// Deferrals to an owner noted from its own miss are not remembered: that owner is fetching,
+    /// and a returning requester was most likely shed by it while busy.
     pub fn peek_for(&self, key: &K, requester: &N, now: Instant) -> Vec<N> {
         let returned = self.entries.get(key).is_some_and(|e| {
             e.deferred.iter().any(|(n, at)| {
@@ -953,7 +990,9 @@ impl<K: Eq + Hash + Clone, N: Clone + PartialEq> SuccessorHints<K, N> {
     }
 
     /// Count one deferral of `requester` to `to` on `key`'s hints; [`Self::peek`] stops returning
-    /// them after `max` (they stay for [`Self::probe`] until they expire or are evicted).
+    /// them after `max` (they stay for [`Self::probe`] until they expire or are evicted). If `to`
+    /// is an offer's sender, [`Self::peek_for`] returns nothing for `requester` within
+    /// [`RETURN_WITHIN`].
     pub fn charge(&mut self, key: &K, requester: N, to: &N, max: u32, now: Instant) {
         if let Some(entry) = self.entries.get_mut(key) {
             entry.uses += 1;
@@ -993,7 +1032,9 @@ pub fn should_note<N: PartialEq>(local: &N, requester: &N, owners: &[N]) -> bool
 
 /// The hint `local`, holding no copy, defers a page `Acquire` to, if any: the newest hinted node
 /// that is still one of the page's `owners`, when `local` is an owner and the requester is not (see
-/// the module docs for why owners are not deferred).
+/// the module docs for why owners are not deferred). The caller checks [`defer_allowed`] first,
+/// answers `Miss`, and charges the hint. Hints may be noted without ranking, so this is where
+/// ownership is checked.
 pub fn successor_deferral<N: PartialEq>(
     hints: Vec<N>,
     local: &N,
@@ -1013,13 +1054,17 @@ pub fn successor_deferral<N: PartialEq>(
         .find(|n| n != requester && owners.iter().position(|o| o == n).is_some_and(|r| r > me))
 }
 
-/// Whether a deferral may be considered at all.
+/// Whether a deferral may be considered at all. While this node's own acquisition of the page runs,
+/// the requester joins it instead: a hint only says another owner asked and got no copy, not that
+/// its fetch succeeded.
 pub fn defer_allowed(acquiring: bool) -> bool {
     !acquiring
 }
 
 /// Hinted owners an owner walk at `rank` asks copy-only before origin
-/// ([`crate::read::walk::WalkConfig::successors`]), newest first.
+/// ([`crate::read::walk::WalkConfig::successors`]), newest first. Only current owners ranked after
+/// this node qualify. A hinted owner that is also a handoff or lineage target stays a successor
+/// target ([`with_successors`] moves it to the front on its own grant).
 pub(crate) fn successor_targets<N: PartialEq + Copy + Default>(
     hints: &[N],
     owners: &[N],
@@ -1038,6 +1083,8 @@ pub(crate) fn successor_targets<N: PartialEq + Copy + Default>(
 /// The handoff targets of an owner walk with `successors` first (at most
 /// [`crate::read::walk::MAX_HANDOFF`] of them), at most [`crate::read::walk::MAX_TARGETS`] in all,
 /// and how many of them are successor targets ([`crate::read::walk::WalkConfig::granted`]).
+/// Successors come first: they are funded by their own grant, while previous-membership targets
+/// stop when the walk's credits run short.
 pub(crate) fn with_successors<N: PartialEq + Copy + Default>(
     successors: &[N],
     handoff: &[N],
@@ -1161,7 +1208,8 @@ mod successor_tests {
 
     /// A requester this node deferred to an offer's sender that comes back within [`RETURN_WITHIN`]
     /// is not deferred again (the sender failed it); other requesters still are, renewals keep the
-    /// memory, and it lapses after the window.
+    /// memory, and it lapses after the window. Deferrals to an owner noted from its own miss are
+    /// not remembered.
     #[test]
     fn returning_requesters_are_not_deferred_again() {
         let now = Instant::now();

@@ -1,4 +1,8 @@
 //! Sans-IO page singleflight rules.
+//!
+//! Flight transitions run in `flow_control::coalesce::flight::state::State`; these step functions
+//! add the business decisions on top and are generic over the wake target `T` (production `Waker`s,
+//! simulator [`Token`]s).
 
 use crate::read::{Error, FailureKind, Result};
 use flow_control::coalesce::flight::Identity;
@@ -94,7 +98,8 @@ impl From<JoinReject> for Error {
 }
 
 /// Gates of an acquisition join on an existing, refreshed flight: a complete result, then a partial
-/// result for a ciphertext caller, then a settled failure, then the waiter cap.
+/// result for a ciphertext caller, then a settled failure, then the waiter cap. `None` means
+/// register a waiter (after [`join_budget_gate`] and admission).
 pub fn join_existing<
     C: Clone,
     P: Clone,
@@ -133,7 +138,8 @@ pub enum CopyJoin<C, P> {
 }
 
 /// Gates of a copy-only join on an existing, refreshed flight: a settled result first, then a
-/// failed or draining phase (a miss), then the waiter cap (`Overloaded`).
+/// failed or draining phase (a miss), then the waiter cap (`Overloaded`). A copy join never
+/// creates a flight.
 pub fn join_copy_existing<
     C: Clone,
     P: Clone,
@@ -201,7 +207,10 @@ pub fn settle<C, P, O, W: WaiterPolicy<Error = E>, T, E: Copy + PartialEq + From
 }
 
 /// Poll acquisition waiter `id` of a refreshed flight. The caller already checked its request
-/// scope.
+/// scope. Order: the waiter's recorded error, a complete result, a partial result for a ciphertext
+/// waiter, a settled failure; then on a pending retry an unissued waiter re-checks its own budget
+/// and is elected under `identity`. An exhausted generation fails the cohort `Unavailable`.
+/// Otherwise `park` stores the wake target.
 #[allow(clippy::too_many_arguments)] // The waiter's budget plus the flight's step inputs.
 pub fn wait<
     C: Clone,
@@ -304,7 +313,8 @@ pub fn publish<C, P, O, W: WaiterPolicy<Error = E>, T, E: Copy + PartialEq + Fro
 }
 
 /// The validated leader `caller` failed. A credential-specific origin rejection fails only `caller`
-/// and retries for the next eligible waiter.
+/// and retries for the next eligible waiter; after a handover it also retries for the adopter.
+/// Other errors fail the cohort. Waiters are notified at once, before retained operations drain.
 pub fn fail<C, P, O, W: WaiterPolicy<Error = E>, T, E: Copy + PartialEq + From<Error>>(
     state: &mut State<C, P, O, W, T>,
     caller: u64,
@@ -337,7 +347,8 @@ pub fn fail<C, P, O, W: WaiterPolicy<Error = E>, T, E: Copy + PartialEq + From<E
 }
 
 /// Hard ceiling of a fill that may be handed over: the leader's deadline plus `HANDOVER_SPANS`
-/// times its remaining span.
+/// times its remaining span. It only bounds the owned scope's timers; without handover it is the
+/// leader's deadline.
 pub fn handover_ceiling(now: Instant, leader_deadline: Instant, handover: bool) -> Instant {
     if !handover {
         return leader_deadline;
@@ -398,7 +409,9 @@ pub enum Joined<C, P> {
     Waiter(u64),
 }
 
-/// Single-owner page flight table for sans-IO drivers (the simulator).
+/// Single-owner page flight table for sans-IO drivers (the simulator), mirroring production
+/// `Flights` with an explicit clock and [`Token`] wakes. `R` is the admission charge each waiter
+/// and flight owns; dropping it releases the charge.
 pub struct PageFlights<C, P, O, R, S> {
     flights: HashMap<PageId, Flight<C, P, O, R>, S>,
     limits: FlightLimits,
@@ -540,6 +553,7 @@ impl<C: Clone, P: Clone, O, R, S: BuildHasher> PageFlights<C, P, O, R, S> {
 
     /// Poll waiter `id` at `now` with its remaining `attempts`; parks `token` when nothing is
     /// ready. Copy waiters follow production `CopyWaiter::wait`, others `AcquisitionWaiter::wait`.
+    /// A canceled waiter fails `Cancelled`; one past its deadline fails `DeadlineExceeded`.
     pub fn poll(
         &mut self,
         page: &PageId,
@@ -659,7 +673,8 @@ impl<C: Clone, P: Clone, O, R, S: BuildHasher> PageFlights<C, P, O, R, S> {
     }
 
     /// Retain one operation for leader `id` before it starts (production
-    /// `Flights::retain_operation`).
+    /// `Flights::retain_operation`). Until [`PageFlights::complete_operation`] runs, a revoked
+    /// acquisition stays draining and the entry is kept.
     pub fn retain_operation(
         &mut self,
         page: &PageId,

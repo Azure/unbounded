@@ -1,4 +1,10 @@
 //! Peer silence: a neighbor that accepts requests and never answers them.
+//!
+//! A timeout cannot tell a hung peer from a busy one, so it only raises a question that a ping
+//! (answered `Miss` at once) settles. The sender over the last link asks, so no relay is blamed. A
+//! silent peer fails its requests at once and is routed around until it answers anything; it is
+//! pinged again every [`Silence::hold`]. Any answer, or a signed shed, quiets it for
+//! [`Silence::quiet`].
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
@@ -44,6 +50,8 @@ struct SilenceEntry<P> {
 }
 
 /// Classify a ping: `Ok((by_peer, unavailable))` for a signed answer, `Err(timed_out)` for none.
+/// `Some(true)` alive, `Some(false)` silent (a relay's `Unavailable` or a timeout), `None` proves
+/// nothing.
 pub fn ping_verdict(answer: Result<(bool, bool), bool>) -> Option<bool> {
     match answer {
         Ok((true, _)) => Some(true),
@@ -419,7 +427,8 @@ mod silence_tests {
 
     #[test]
     fn a_peer_that_shed_this_node_is_busy_for_the_quiet_time() {
-        // An owner that signed `Overloaded` for this node is alive and busy.
+        // An owner that signed `Overloaded` for this node is alive and busy: visited last until the
+        // quiet time passes or it answers something else, never pinged or silent for it.
         let t = Instant::now();
         let mut s = silence();
         assert!(!s.unanswered(&1, t));
@@ -531,6 +540,11 @@ mod silence_tests {
 }
 
 // Rank 0 watch: what an owner above rank 0 last learned about rank 0's acquisition of a page.
+// A probe timeout marks the page `Fetching` for `hang_after` (or until the request deadline, if
+// later); past that it is `Overdue` and a further timeout gives origin authority and marks rank 0
+// silent. An own origin failure marks it `Failed` for `hang_after`, so a later `Unavailable` from
+// rank 0 does not cost a second origin request. Any answer signed by rank 0 forgets the page. Only
+// timeouts withhold origin.
 
 /// Default bound on watched pages per node.
 pub const WATCH_CAPACITY: usize = 4096;

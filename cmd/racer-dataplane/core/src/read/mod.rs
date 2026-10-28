@@ -16,7 +16,8 @@ pub mod flight;
 pub mod hints;
 pub mod walk;
 
-// Read-path decision errors.
+// Read-path decision errors: a subset of the dataplane's, so core decisions never widen what the
+// dataplane can observe.
 
 /// Errors produced or interpreted by sans-IO read decisions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -365,7 +366,9 @@ pub fn serve_deadline(scope: Instant, route: Instant) -> Instant {
 
 /// Whether a copy-only page request from `requester` may wait on this node's (`local`) running
 /// acquisition of the page, given the page's `owners` (canonical order) under the request's
-/// membership.
+/// membership. Yes for a reader, or an owner ranked after this node. No for an owner ranked before
+/// it, or when this node is not an owner: this node's acquisition most likely waits on the
+/// requester itself, so a local copy or a miss is the whole answer.
 pub fn copy_join_allowed<N: PartialEq>(owners: &[N], local: &N, requester: &N) -> bool {
     let Some(theirs) = owners.iter().position(|n| n == requester) else {
         return true;
@@ -463,7 +466,8 @@ mod serve_tests {
 
 // Small read-path policy rules shared by fill, serve, and race drivers.
 
-/// Whether a contender's failure leaves the other contender of a race free to win.
+/// Whether a contender's failure leaves the other contender of a race free to win. Malformed framing
+/// is local to that contender, not authority to cancel another usable page.
 pub fn recoverable(error: Error) -> bool {
     matches!(
         error,
@@ -496,7 +500,8 @@ pub fn peer_error(error: Error) -> Option<ResponseKind> {
 }
 
 /// Optional writes may use half of the aggregate class budget, with a floor sufficient for one
-/// valid page when the configured budget can hold it.
+/// valid page when the configured budget can hold it. Quota admission remains the authority for
+/// per-cache fairness.
 pub fn optional_headroom(limit: usize, used: usize, amount: usize, one_page: usize) -> bool {
     let ceiling = optional_ceiling(limit, one_page);
     amount <= ceiling && used <= ceiling - amount
@@ -692,7 +697,8 @@ mod policy_tests {
 pub const DIRECT_AHEAD: usize = 1;
 
 /// Provider selections a read keeps in flight. Beyond the first, a read only starts another while
-/// some contract of its version has an unused granted flight.
+/// some contract of its version has an unused granted flight. Each selection demands a disjoint
+/// share of the selectable holes.
 pub const SELECTIONS: usize = 4;
 
 /// Attempts and links each independently admitted page receives.
@@ -716,7 +722,8 @@ pub enum SlotKind {
 
 /// Slots to start direct fills for, in order: the head when it is a hole or only selected, then up
 /// to `direct_ahead` (normally [`DIRECT_AHEAD`]) more missing holes that no other window is busy
-/// with.
+/// with. Nothing at or after the first failed slot is planned; the driver stops at the first fill
+/// the budget refuses.
 pub fn direct_fills(
     slots: &[SlotKind],
     direct_ahead: usize,
@@ -945,7 +952,8 @@ pub enum LeaderSource {
     Cached,
 }
 
-/// Order of local sources for an elected leader.
+/// Order of local sources for an elected leader. `retained` is the flight's partial ciphertext;
+/// `local_job` is an existing shared plaintext job; `unverified` is cached ciphertext in memory.
 pub fn leader_source(
     retained: bool,
     plaintext: bool,
@@ -1054,13 +1062,16 @@ pub enum ProbeOutcome {
     /// An authenticated response carried a copy that could not be used locally.
     UnusableCopy,
 }
-/// How a non-owner requester orders its remote attempts across a page's ranked owners.
+/// How a non-owner requester orders its remote attempts across a page's ranked owners. Placement,
+/// rank, and origin authority are unchanged.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ReplicaSelection {
     /// Visit owners in canonical rank order, so every remote read of a page
     /// lands on the primary owner first.
     Primary,
-    /// Visit owners that are direct overlay neighbors before owners that need a relay hop.
+    /// Visit owners that are direct overlay neighbors before owners that need a relay hop. Among
+    /// equally preferred owners, a rendezvous hash of requester and page picks a stable order, so
+    /// one requester reuses a replica while different requesters spread the load.
     #[default]
     Spread,
 }
@@ -1098,6 +1109,8 @@ impl VisitOrder {
 }
 
 /// Order `len` canonical ranks for a non-owner requester. `Primary` returns the canonical order.
+/// `Spread` visits ranks for which `neighbor` holds first, then orders each group by descending
+/// `score` (ties keep canonical order).
 pub fn visit_order(
     selection: ReplicaSelection,
     len: usize,
@@ -1117,7 +1130,10 @@ pub fn visit_order(
 }
 
 /// When the owner a non-owner would visit first arrived after a later owner (`since`, see
-/// [`crate::read::walk::lineage_targets`]), visit that later owner first.
+/// `crate::read::walk::lineage_targets`), visit that later owner first: it outranked the first
+/// one before that arrived and may hold a copy. Members with equal or unknown arrival never move,
+/// and a non-neighbor never moves ahead of a direct `neighbor` visited first (its route would
+/// spend most of the reader's links).
 pub fn lineage_first(
     mut order: VisitOrder,
     since: &[Option<u32>],
@@ -1160,7 +1176,8 @@ pub enum Answering {
 }
 
 /// Visit owners that recently left one of this node's requests unanswered after the others, and
-/// silent owners last, keeping the order within each group.
+/// silent owners last, keeping the order within each group. Otherwise every retry of a read visits
+/// the same hung owner first (`Spread` is deterministic) and fails with healthy owners left.
 pub fn demote_unanswered(order: VisitOrder, answering: impl Fn(usize) -> Answering) -> VisitOrder {
     let len = usize::from(order.len);
     let mut ranks = [0u8; 3];
@@ -1252,7 +1269,10 @@ impl ResponseKind {
     }
 }
 
-/// Classify one authenticated candidate response.
+/// Classify one authenticated candidate response. `acquire` describes the actual probe, which may be
+/// CopyOnly even when the operation requests acquisition. Payloads of the operation's kind call
+/// `validate`; mismatched kinds are `CorruptRecord` without calling it. `Ok(None)` is a usable
+/// payload; `Ok(Some(outcome))` a recoverable probe outcome.
 pub fn classify<E: From<Error>>(
     response: ResponseKind,
     operation: OperationKind,
@@ -1288,7 +1308,8 @@ pub fn classify<E: From<Error>>(
     Ok(Some(outcome))
 }
 
-/// Map a payload validation failure to a recoverable probe outcome.
+/// Map a payload validation failure to a recoverable probe outcome. Only page content validation is
+/// recoverable; `Unauthorized` remains terminal.
 pub fn unusable_copy(error: Error, operation: OperationKind) -> Option<ProbeOutcome> {
     (matches!(error, Error::CorruptRecord | Error::MissingKey)
         && matches!(operation, OperationKind::Page | OperationKind::Bootstrap))
@@ -1321,7 +1342,8 @@ pub struct AuthorityFacts<'a> {
     pub member: bool,
 }
 
-/// Validate an origin authority for `object`/`page`.
+/// Validate an origin authority for `object`/`page`. Private construction follows a recomputed
+/// ranking under an immutable membership, so validation need not rehash the cluster.
 pub fn validate_origin_authority(
     facts: AuthorityFacts<'_>,
     object: &ObjectId,

@@ -1,4 +1,7 @@
 //! Racer resource classes and the pure parts of the admission policy.
+//!
+//! The dataplane and simulator admission policies both delegate to [`Rules`] so they cannot drift;
+//! rejection reporting stays with each caller.
 
 use std::num::NonZeroUsize;
 
@@ -116,7 +119,8 @@ fn nz(value: usize) -> NonZeroUsize {
 }
 
 impl Default for Limits {
-    /// Per-worker defaults used for every dimension the environment leaves unset.
+    /// Per-worker defaults used for every dimension the environment leaves unset. Byte and count
+    /// dimensions are stated per worker and scaled by the I/O worker count during sizing.
     fn default() -> Self {
         Self {
             plaintext_bytes: nz(64 * MIB),
@@ -222,7 +226,9 @@ impl Rules {
     }
 
     /// Per-cache working allowance of a weighted class (`Policy::progress`). Plaintext is request
-    /// working memory; ciphertext is both working and retained memory.
+    /// working memory; ciphertext is both working and retained memory. Sized for one range window
+    /// and shared by all requests on the cache; the equal-share cap can shrink it, so this limits
+    /// how far low priority shrinks the share but does not guarantee progress.
     pub fn progress(&self, class: ResourceClass) -> usize {
         let window = self.limits.range_window_pages.get();
         match class {
