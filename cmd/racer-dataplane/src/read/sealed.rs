@@ -1,15 +1,4 @@
 //! Sealed pages: ciphertext a GPU authenticates and decrypts itself.
-//!
-//! A `gpu-read` asks its range stream for sealed pages
-//! ([`super::range_stream::RangeStream::set_sealed`]). Pages that are verified
-//! plaintext in memory still arrive as [`Fetched::Page`], and so do pages that
-//! the CPU had to produce anyway (origin fills, which encrypt) or that another
-//! reader authenticated first. Every other page arrives as a [`SealedPage`]:
-//! the envelope, the AAD, the expected CRC, the XAES-derived page key, and the
-//! ciphertext in host memory or already in GPU staging.
-//!
-//! The derived key is wiped on drop and is never logged: [`SealedPage`] has no
-//! `Debug` implementation.
 
 use crate::error::Error;
 use crate::error::Result;
@@ -66,9 +55,8 @@ pub enum SealedSource {
         token: ReadToken,
     },
 
-    /// Ciphertext a peer's NIC wrote straight into the target GPU's RDMA
-    /// landing buffer. No host copy exists, so nothing is shared, published,
-    /// or persisted, and the page is used once.
+    /// Ciphertext a peer's NIC wrote straight into the target GPU's RDMA landing buffer. No host
+    /// copy exists, so nothing is shared, published, or persisted, and the page is used once.
     Landed(LandedCiphertext),
 }
 

@@ -16,17 +16,6 @@ use std::time::Duration;
 use std::time::Instant;
 
 /// Implemented by the existing read coordinator, never a second acquisition graph.
-/// Ingress must be verified; the local result is unsigned until the server signs
-/// it with a retained clone of the request binding.
-///
-/// ```compile_fail
-/// use racer_dataplane::{peer::{server::LocalPageService, protocol::PeerRequest},
-///     runtime::RequestScope, topology::Membership};
-/// fn unverified(service: &dyn LocalPageService, request: PeerRequest,
-///     membership: std::sync::Arc<Membership>, scope: &RequestScope) {
-///     service.serve_peer(request, membership, scope);
-/// }
-/// ```
 pub trait LocalPageService {
     fn serve_peer<'a>(
         &'a self,
@@ -393,13 +382,9 @@ impl PeerServer {
             .collect::<Vec<_>>()
     }
 
-    /// Whether to answer a page request with `Overloaded` because this node
-    /// owns the page and is already writing [`hot_page_threshold`] bodies of it to
-    /// other requesters, at least half of all the bodies it is writing (Known
-    /// issue 16). The requester then asks one of the
-    /// page's helpers, which, like the page's owners, is never shed. The
-    /// ranking is only computed for a page that is already hot, and stays in
-    /// this server's placement cache.
+    /// Whether to answer a page request with `Overloaded` because this node owns the page and is
+    /// already writing [`hot_page_threshold`] bodies of it to other requesters, at least half of
+    /// all the bodies it is writing (Known issue 16).
     fn shed_hot_page(
         &self,
         page: &crate::model::PageId,
@@ -780,9 +765,7 @@ impl PeerServer {
         connection.state_mut().relay.reservation = None;
         Ok(connection)
     }
-    /// Verify the complete ingress envelope before service or relay. Sign a local
-    /// result against its binding; return a relayed signed result without replacing
-    /// the responder's original signature or discarding forwarding headers.
+    /// Verify the complete ingress envelope before service or relay.
     pub fn dispatch<'a>(
         &'a self,
         request: SignedRequest,
@@ -870,8 +853,7 @@ impl PeerServer {
                 };
             }
             let binding = request.binding().clone();
-            // A copy offer or a silence ping carries no body, so hot-page
-            // shedding does not apply.
+            // A copy offer or a silence ping carries no body, so hot-page shedding does not apply.
             if let super::protocol::Operation::Page { page, mode } = &request.request().operation
                 && !matches!(
                     mode,

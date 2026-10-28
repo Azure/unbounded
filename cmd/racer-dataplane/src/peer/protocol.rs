@@ -293,8 +293,6 @@ pub enum WarmAction {
     /// primary owner of, until the requester's wall-clock `until`.
     Hold { pages: u64, until: SystemTime },
     /// Fill one held page onto the owner's disk and acknowledge without payload.
-    /// `length` and `content_type` are the requester's admitted immutable
-    /// metadata; the owner refuses to acknowledge a copy that disagrees.
     Fill {
         page: PageNumber,
         length: u64,
@@ -324,10 +322,8 @@ pub struct PeerRequest {
 pub type PeerResponse =
     racer_core::read::PeerResponse<CiphertextPage, super::subscriptions::TransferGrant>;
 
-/// Owned, unverified wire input/output. The original and all forwarding signatures
-/// travel with the operation, including opaque encrypted origin credentials.
-/// Verification must check that the operation and effective route agree with the
-/// original signed fields and the complete forwarding chain before admitting work.
+/// Owned, unverified wire input/output. The original and all forwarding signatures travel with the
+/// operation, including opaque encrypted origin credentials.
 pub struct SignedRequest {
     pub authentication: ForwardedHead,
     pub request: PeerRequest,
@@ -345,7 +341,6 @@ pub use peer_wire::{
 };
 /// Per-worker progress floor: retained inbound/outbound envelopes, decoded context,
 /// signing/encoding scratch and simultaneous receive/send staging during a relay.
-/// Runtime admission still rejects concurrent work when this shared budget is full.
 pub const MIN_REQUEST_CONTEXT_BYTES: usize = 8 * MAX_ENVELOPE_HEAD;
 
 // The profile's opaque payload cap must track the application's page contract.

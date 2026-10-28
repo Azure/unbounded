@@ -1,9 +1,4 @@
 //! Local disk -> ranked peer -> authorized origin acquisition and publication.
-//!
-//! Reserve mandatory progress memory before download. Decrypt each copy once;
-//! encrypt origin data once. Publish only verified whole pages, with original
-//! ciphertext queued best effort under second-sight policy. Disk failure may discard dirty
-//! bytes. Origin 412 does not prove old copies absent from other permitted caches.
 
 use super::candidates::CandidatePolicy;
 use super::flight::AcquisitionBudget;
@@ -103,8 +98,6 @@ pub struct Fill {
 }
 
 /// Immediate acquisition tier, not the original producer or corruption location.
-/// Retained includes flights, memory cache, and pending writer copies, even when
-/// the retained copy still has a disk invalidation token.
 #[derive(Clone, Copy)]
 pub(super) enum DecryptSource {
     Disk,
@@ -146,14 +139,11 @@ fn stage_events(stage: DriverStage) -> Option<(Event, Event)> {
         | DriverStage::WorkReturned => None,
     }
 }
-/// Bound on retries after a joined local plaintext job fails under its
-/// starter's inherited scope.
+/// Bound on retries after a joined local plaintext job fails under its starter's inherited scope.
 const LOCAL_PLAINTEXT_JOIN_RETRIES: usize = 2;
 
-/// Providers a `gpu-read` asks, in visit order, to land a page in GPU
-/// memory before it takes the usual path. Each is one CopyOnly request
-/// against the read's acquisition budget; more would add a round trip per
-/// miss before the usual path asks the same providers again.
+/// Providers a `gpu-read` asks, in visit order, to land a page in GPU memory before it takes the
+/// usual path.
 const LANDING_PROVIDERS: usize = 2;
 
 impl Fill {
@@ -171,19 +161,8 @@ impl Fill {
         }
     }
 
-    /// Coalesce local decrypts so concurrent warm readers and elected
-    /// acquisitions reserve and decrypt one plaintext. A detached worker driver
-    /// owns the shared work, so one caller's cancellation never fails another
-    /// caller. The driver only reads pending, cached, or disk copies; it never
-    /// contacts peers or origin, so a local-only caller cannot start acquisition.
-    ///
-    /// A `probe` caller owns its own Waiter charge, and a probe that starts the
-    /// job reserves a Flight charge retained by the detached driver until the
-    /// job completes. An elected acquisition already holds both through its
-    /// flight registration and awaits the job inside its retained operation,
-    /// staying attached through cancellation until the job completes.
-    /// New followers recheck current cache and source-key admission; callers
-    /// admitted earlier keep their completion rights.
+    /// Coalesce local decrypts so concurrent warm readers and elected acquisitions reserve and
+    /// decrypt one plaintext.
     async fn local_plaintext_copy(
         &self,
         page: &PageId,
@@ -202,11 +181,7 @@ impl Fill {
             None
         };
         let cancellation = scope.cancellation.subscribe()?;
-        // A joined job runs under the scope of the caller that started it. If
-        // that inherited scope expires or is cancelled while this caller's own
-        // scope is still valid, retry under this caller's own scope. A job this
-        // caller started shares its deadline, so its failure is final. The
-        // bound stops a stream of short-lived starters from looping forever.
+        // A joined job runs under the scope of the caller that started it.
         let mut joins_left = LOCAL_PLAINTEXT_JOIN_RETRIES;
         loop {
             let mut started = false;
@@ -276,11 +251,7 @@ impl Fill {
             };
             let result = std::future::poll_fn(|cx| {
                 cancellation.register(cx.waker());
-                // A probe-led job owns its own Flight charge, so a probe may
-                // detach. An acquisition-led job has no charge of its own and
-                // relies on the acquisition's retained operation, so acquisition
-                // callers stay attached until the job completes and only then
-                // report cancellation or deadline expiry.
+                // A probe-led job owns its own Flight charge, so a probe may detach.
                 if probe {
                     scope.check()?;
                 }
@@ -299,10 +270,8 @@ impl Fill {
             }
         }
     }
-    /// Decrypt the memory cache's retained ciphertext, the same copy an elected
-    /// acquisition previously decrypted on its own. A rejected copy is
-    /// invalidated, with its disk record, and reported as a miss so the caller
-    /// can try pending or disk copies.
+    /// Decrypt the memory cache's retained ciphertext, the same copy an elected acquisition
+    /// previously decrypted on its own.
     async fn retained_plaintext(
         &self,
         page: &PageId,
@@ -446,9 +415,7 @@ impl Fill {
         {
             super::dispatch::Warmed::Local(page) => return Ok(*page),
             super::dispatch::Warmed::Unwarmed => {}
-            // A warm job holds the head on a remote owner. Fill only that page
-            // through the normal path, which reaches the held copy, rather
-            // than selecting pages the warm job may not have finished.
+            // A warm job holds the head on a remote owner.
             super::dispatch::Warmed::Remote => {
                 return self
                     .dependencies
@@ -626,9 +593,6 @@ impl Fill {
         reserve: impl Fn() -> Result<flow_control::Charge<AdmissionPolicy>>,
     ) -> Result<flow_control::Charge<AdmissionPolicy>> {
         // At most two bounded scans, rechecking cache/global pressure each time.
-        // Zero released bytes does not mean exhaustion: the memory cursor may
-        // have crossed only busy or other-cache entries. No await allows new
-        // local charges to interleave; remote completions can only free bytes.
         flow_control::progress::reclaim_retry(2, reserve, |error| {
             if *error != Error::Overloaded {
                 return false;
@@ -681,9 +645,8 @@ impl Fill {
         let admission = &self.dependencies.admission;
         let cache = &page.version.object.cache;
         let amount = PAGE_BYTES as usize;
-        // The memory cache retains no plaintext, so nothing local can be
-        // reclaimed. Retry once after a yield, which lets completed readers
-        // drop their plaintext.
+        // The memory cache retains no plaintext, so nothing local can be reclaimed. Retry once
+        // after a yield, which lets completed readers drop their plaintext.
         let mut exhausted = false;
         loop {
             scope.check()?;
@@ -694,9 +657,7 @@ impl Fill {
             }
             let deficit = admission.reclamation(cache, ResourceClass::Plaintext, amount);
             if deficit.is_none() {
-                // A remote completion may clear pressure after rejection. None
-                // also means an impossible request, so retry exactly once here,
-                // without restarting the scan or extending the caller's budget.
+                // A remote completion may clear pressure after rejection.
                 scope.check()?;
                 (result, detail) = crate::admission::capture_rejection(admission, &mut reserve);
                 if !matches!(result, Err(Error::Overloaded)) {
@@ -900,12 +861,9 @@ impl Fill {
         }
     }
 
-    /// Acquire one page for direct GPU delivery: verified plaintext when a
-    /// reader still holds it on the CPU, otherwise ciphertext (from memory
-    /// first, then disk, peers or origin) for the GPU to verify and
-    /// decrypt. Network and disk copies keep the usual single-flight sharing,
-    /// memory publication and disk persistence; only the CPU decrypt and the
-    /// plaintext publication are skipped.
+    /// Acquire one page for direct GPU delivery: verified plaintext when a reader still holds it on
+    /// the CPU, otherwise ciphertext (from memory first, then disk, peers or origin) for the GPU to
+    /// verify and decrypt.
     pub(crate) async fn acquire_sealed(
         &self,
         page: PageId,
@@ -924,9 +882,8 @@ impl Fill {
                 .await
                 .map(Fetched::Page);
         }
-        // The memory cache keeps only ciphertext once readers drop the
-        // plaintext. A cached copy skips the disk and peer paths and is sealed
-        // for the GPU from host memory below.
+        // The memory cache keeps only ciphertext once readers drop the plaintext. A cached copy
+        // skips the disk and peer paths and is sealed for the GPU from host memory below.
         let cached = self.dependencies.memory.unverified(&page)?.is_some();
         if !cached
             && target.helper.cufile()
@@ -984,18 +941,7 @@ impl Fill {
         }
     }
 
-    /// Fetch a page from a peer straight into a GPU landing buffer (GPUDirect
-    /// RDMA). This is a private fetch for one sealed read: it does not join
-    /// or create a shared single flight, and a landed page is never published
-    /// to memory or persisted, because there are no host bytes to share.
-    ///
-    /// Up to [`LANDING_PROVIDERS`] providers are asked in visit order, one
-    /// CopyOnly request each; a miss or failure moves on to the next. None
-    /// means use the usual path: no landing buffer on the request's GPU, a
-    /// local copy exists, this node owns the page, or every provider asked
-    /// missed or failed. A page a provider sent to host memory instead (no
-    /// free landing slot, or HTTP) is used privately in the same way, so it
-    /// is not fetched twice.
+    /// Fetch a page from a peer straight into a GPU landing buffer (GPUDirect RDMA).
     async fn land_from_peer(
         &self,
         page: &PageId,
@@ -1122,10 +1068,8 @@ impl Fill {
         Ok(sealed)
     }
 
-    /// Read a local v2 record's ciphertext straight into GPU staging with
-    /// cuFile. Only the header passes through host memory. None means the
-    /// page must be read through host memory: a miss, a v1 or unaligned
-    /// record, no free staging slot, or cuFile unavailable.
+    /// Read a local v2 record's ciphertext straight into GPU staging with cuFile. Only the header
+    /// passes through host memory.
     async fn stage_from_disk(
         &self,
         page: &PageId,
@@ -1264,9 +1208,8 @@ impl Fill {
         })
     }
 
-    /// An initial GET discovers the identity before its body can enter a page
-    /// flight. Join that exact flight; an existing leader wins and this redundant
-    /// plaintext is dropped. Only the elected supplier encrypts/publishes it.
+    /// An initial GET discovers the identity before its body can enter a page flight. Join that
+    /// exact flight; an existing leader wins and this redundant plaintext is dropped.
     pub fn publish_bootstrap_with_context<'a>(
         &'a self,
         origin: crate::origin::OriginPage,
@@ -1413,9 +1356,8 @@ impl Fill {
         })
     }
 
-    /// Transfer elected work to the worker driver. The caller only waits for its
-    /// remaining budget; dropping that wait cannot release accepted work before
-    /// the operation completes.
+    /// Transfer elected work to the worker driver. The caller only waits for its remaining budget;
+    /// dropping that wait cannot release accepted work before the operation completes.
     // Keep the reader's latched observation explicit at the driver handoff rather
     // than re-observing retries or coupling it to the flight's ownership guards.
     #[allow(clippy::too_many_arguments)]
@@ -1432,10 +1374,7 @@ impl Fill {
 
         let mut shared_local = false;
         let retained = self.dependencies.flights.ciphertext_for(&leader)?;
-        // racer-core orders the local sources. Cached pages retain only
-        // ciphertext; a plaintext acquisition decrypts it through the shared
-        // local plaintext job, so range probes and warm readers of the same
-        // page share one reservation and one decrypt in either arrival order.
+        // racer-core orders the local sources.
         let local_job = || self.local_plaintext.get(page).is_some();
         let unverified =
             || -> Result<bool> { Ok(self.dependencies.memory.unverified(page)?.is_some()) };
@@ -1480,10 +1419,7 @@ impl Fill {
         let caller_cancellation = caller_scope.cancellation.subscribe()?;
         // Unless the caller fences on this work (warm gates), the running fill continues for
         // another live acquisition waiter when the leader expires or is canceled, instead of being
-        // canceled and restarted from scratch by the next leader. The owned scope then runs to a
-        // hard ceiling; the driver cancels it as soon as no live waiter remains
-        // (`FlightOperation::poll_cancellation`). Attempts and links stay charged to the leader's
-        // budget; the extra time is within the adopting waiter's own deadline and budget.
+        // canceled and restarted from scratch by the next leader.
         let handover = !self.fence_acquisition;
         let ceiling = racer_core::read::flight::handover_ceiling(
             uring_runtime::environment::now(),
@@ -1722,9 +1658,8 @@ impl Fill {
         self.metrics.record(Event::OriginFill, 1);
         Ok(result)
     }
-    /// Whether this node holds a copy of `page` in memory, pending write, or
-    /// the disk index, without reading it (orphan notices and copy offers).
-    /// Lookup errors count as not held.
+    /// Whether this node holds a copy of `page` in memory, pending write, or the disk index,
+    /// without reading it (orphan notices and copy offers). Lookup errors count as not held.
     pub(crate) fn holds(&self, page: &PageId) -> bool {
         let deps = &self.dependencies;
         deps.memory.ciphertext(page).is_ok_and(|c| c.is_some())
@@ -1804,9 +1739,6 @@ impl Fill {
     }
 
     /// Coalesce only local disk work, with no origin context or election rights.
-    /// The worker driver owns the entry and its charge until the disk completion
-    /// fence, even if every caller detaches. Each caller owns a bounded waiter and
-    /// cancellation subscription; one caller cannot cancel another caller's read.
     async fn local_disk_copy(
         &self,
         page: &PageId,
@@ -1894,10 +1826,8 @@ impl Fill {
         source_key: Option<&std::cell::Cell<Option<racer_control_wire::KeyId>>>,
     ) -> Result<Option<AcquiredPage>> {
         scope.check()?;
-        // Pending copies already own ciphertext. Disk owns a separate complete
-        // staging/decoded bundle; neither source needs speculative network bytes.
-        // The memory cache retains only ciphertext, so a page whose plaintext
-        // was released is decrypted from memory before trying disk.
+        // Pending copies already own ciphertext. Disk owns a separate complete staging/decoded
+        // bundle; neither source needs speculative network bytes.
         let mut cached = None;
         let local = match self.metrics.lookup(
             LookupTier::Pending,
@@ -2047,10 +1977,8 @@ impl Fill {
         result
     }
 
-    /// Drive the read's racer-core acquisition
-    /// ([`super::candidates::CandidatePolicy::drive`]): it decides each step,
-    /// and this loop performs the hedge, origin fetch, and publication.
-    /// Errors raised by the I/O itself return directly.
+    /// Drive the read's racer-core acquisition ([`super::candidates::CandidatePolicy::drive`]): it
+    /// decides each step, and this loop performs the hedge, origin fetch, and publication.
     pub(super) async fn acquire_once(
         &self,
         page: &PageId,
@@ -2176,8 +2104,7 @@ impl Fill {
                                                     ),
                                                 )
                                                 .await?;
-                                            // A sibling may publish while crypto runs. Recheck before
-                                            // election, not only after a winner has canceled its peer.
+                                            // A sibling may publish while crypto runs.
                                             if let Some(existing) = self
                                                 .retained_metadata(&page.version, &child)
                                                 .await?
@@ -2237,8 +2164,7 @@ impl Fill {
                     {
                         Ok(origin) => {
                             // An owner after rank 0 holds a copy rank 0 may not know of: offer it
-                            // later. The authority's owners: a walk that refreshed its membership
-                            // ranks under the newer one.
+                            // later.
                             if policy.note_orphan(
                                 page,
                                 authority.owners(),
@@ -2355,10 +2281,7 @@ impl Fill {
             })
     }
 
-    /// Charge for rehoming selected ciphertext. Pages that must be copied
-    /// (registered or shared) are charged the pooled aligned size class so the
-    /// copy lands in this worker's pool; exclusive pages move in place under a
-    /// charge for their current capacity.
+    /// Charge for rehoming selected ciphertext.
     fn selected_capacity(&self, ciphertext: &crate::memory::CiphertextPage) -> usize {
         let capacity = ciphertext.inner.capacity();
         if !ciphertext.is_registered() && Arc::strong_count(&ciphertext.inner) == 1 {
@@ -2370,13 +2293,9 @@ impl Fill {
             .map_or(capacity, |aligned| aligned.max(capacity))
     }
 
-    /// Copy an authenticated registered RDMA page once into pooled aligned
-    /// storage before it is published and persisted, so the memory cache and
-    /// the store share one page and the RDMA buffer returns to its pool.
-    ///
-    /// Copy-out admission is optional: when it is refused even after
-    /// reclamation, the registered page is kept and the memory cache and
-    /// store copy it out under their own admission as before.
+    /// Copy an authenticated registered RDMA page once into pooled aligned storage before it is
+    /// published and persisted, so the memory cache and the store share one page and the RDMA
+    /// buffer returns to its pool.
     fn detach_registered(
         &self,
         ciphertext: crate::memory::CiphertextPage,
@@ -2413,9 +2332,7 @@ impl Fill {
         scope: &RequestScope,
         source: DecryptSource,
     ) -> Result<PageResult> {
-        // These source counters include structural CorruptRecord rejections in
-        // this helper. They are independent of the exact CRC/AEAD engine counters,
-        // which are reaped even if a waiting fill has been abandoned.
+        // These source counters include structural CorruptRecord rejections in this helper.
         let result = async {
             validate_copy(&copy, page)?;
             // Keep the original immutable ciphertext lease across crypto submission.
@@ -2494,8 +2411,6 @@ impl Fill {
                 .await;
             if scope.check().is_ok() {
                 // Never query/insert Bloom history twice for the same interest.
-                // Only a now-current owned classification can additionally grant
-                // first-sight persistence; the original second-sight latch stays.
                 let decision = if observation.eligible() {
                     observation
                 } else {
@@ -2556,9 +2471,8 @@ impl Fill {
         let owned = retention.owned_only(id).eligible();
         let admission = &self.dependencies.admission;
         let amount = copy.ciphertext.bytes().len();
-        // Optional pages of an over-share cache do not displace other caches'
-        // data once free segments reach the reserve. Owned pages compete
-        // through eviction instead.
+        // Optional pages of an over-share cache do not displace other caches' data once free
+        // segments reach the reserve. Owned pages compete through eviction instead.
         if !owned && self.dependencies.writer.over_share_under_pressure(cache) {
             retention.share_rejected();
             retention.persistence_attempt(false);
@@ -2602,17 +2516,10 @@ impl Fill {
             .dependencies
             .writer
             .enqueue_reclaiming(copy, dirty, |amount| {
-                // Ciphertext owns both the immutable page and its disk staging.
-                // The one-page floor includes BOTH, even on tiny slabs. The page
-                // term is the page's own Ciphertext charge, which for aligned
-                // pages covers the padded body pool class. `amount` is the
-                // staging request: only the padded header block when persist
-                // writes the aligned body in place, or the full padded record
-                // for the copy fallback, so the floor covers either path.
+                // Ciphertext owns both the immutable page and its disk staging. The one-page floor
+                // includes BOTH, even on tiny slabs.
                 let one_page = page_charge.saturating_add(amount);
-                // Idle aligned buffers retain Ciphertext charges after completed
-                // writes. Release that backing before headroom rejection or any
-                // destructive queued-copy reclaim; this is one bounded pool.
+                // Idle aligned buffers retain Ciphertext charges after completed writes.
                 self.dependencies.writer.slabs().reclaim_idle();
                 if !owned && !self.optional_staging_headroom(amount, one_page) {
                     return Err(Error::Overloaded);
@@ -2626,9 +2533,8 @@ impl Fill {
         retention.persistence_attempt(result.is_ok());
     }
 
-    /// Reclaim against the optional ceiling, not the larger hard quota. One
-    /// bounded idle-only pass advances cursors for later independent interests.
-    /// Never release queued copies or submitted/live owners to admit a write.
+    /// Reclaim against the optional ceiling, not the larger hard quota. One bounded idle-only pass
+    /// advances cursors for later independent interests.
     pub(super) fn optional_staging_headroom(&self, amount: usize, one_page: usize) -> bool {
         let admission = &self.dependencies.admission;
         let class = ResourceClass::Ciphertext;

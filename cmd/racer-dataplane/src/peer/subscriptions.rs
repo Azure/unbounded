@@ -1,8 +1,4 @@
 //! Node-wide bounded provider selection. Authentication and acquisition stay in PeerServer.
-//!
-//! All shared mutations are synchronous. No guard escapes into Fill or a future;
-//! wakers are invoked only after releasing the mutex. Live handles, including
-//! completed responses, retain capacity until consumed or dropped.
 
 use crate::error::Error;
 use crate::error::Result;
@@ -41,10 +37,8 @@ pub struct Subscription {
 
     pub byte_budget: u64,
 
-    /// Selections the receiver asks to keep in flight on this contract.
-    /// `None` is the original single-flight contract and is not encoded on the
-    /// wire, so older providers still accept it. `Some(n)` requires
-    /// `1..=MAX_SUBSCRIPTION_FLIGHTS`; older providers refuse the request.
+    /// Selections the receiver asks to keep in flight on this contract. `None` is the original
+    /// single-flight contract and is not encoded on the wire, so older providers still accept it.
     pub flights: Option<u16>,
 }
 
@@ -186,8 +180,7 @@ impl Subscriptions {
         })
     }
 
-    /// Run one core transition, then invoke the wakers it readied after
-    /// releasing the mutex.
+    /// Run one core transition, then invoke the wakers it readied after releasing the mutex.
     fn with_state<T>(&self, f: impl FnOnce(&mut Core) -> T) -> T {
         self.with_wakers(|state| f(&mut state.core))
     }
@@ -241,9 +234,7 @@ impl Subscriptions {
             .map_err(|_| Error::Internal)
     }
 
-    /// Retain the accepted sequence before yielding, but spend no credits until
-    /// selection commits. Every retry sweeps current demand and checks the exact
-    /// sequence, capacity, expiry and pending owner under the scheduler mutex.
+    /// Retain the accepted sequence before yielding, but spend no credits until selection commits.
     pub(crate) async fn schedule_scoped(
         self: &Arc<Self>,
         subscription: Subscription,
@@ -334,15 +325,13 @@ impl Subscriptions {
         self.with_state(|core| core.admit(contract, membership, receiver, deadline, now_ms))
     }
 
-    /// Drop an admitted request that will not select. Its sequence stays in
-    /// the replay window.
+    /// Drop an admitted request that will not select. Its sequence stays in the replay window.
     fn release(&self, key: &(EntryKey, u64)) {
         self.with_state(|core| core.release(key));
     }
 
-    /// Select one page for an admitted request. An unknown eligibility endpoint
-    /// is returned without reserving a flight. The caller computes it outside
-    /// the lock, then repeats this transaction.
+    /// Select one page for an admitted request. An unknown eligibility endpoint is returned without
+    /// reserving a flight. The caller computes it outside the lock, then repeats this transaction.
     fn select(
         self: &Arc<Self>,
         key: &(EntryKey, u64),
