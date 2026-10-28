@@ -38,10 +38,11 @@ test = ["pytest"]
 racer = "racer_vllm:register"
 
 [project.scripts]
-racer-vllm-fetch = "racer_vllm.model:main"
+racer-vllm-fetch = "racer_vllm:main"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.setuptools]
+py-modules = ["racer_vllm"]
+package-dir = {"" = "src"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
