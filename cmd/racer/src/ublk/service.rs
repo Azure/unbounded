@@ -164,14 +164,19 @@ impl Readahead {
 }
 
 /// Serve one read into the request buffer. Returns the byte count to commit.
+///
+/// Abandonment is raced only against page acquisition. A write to the char
+/// device is always awaited to its completion, because dropping its future
+/// does not fence the copy in the kernel: committing the tag while the copy
+/// is still in flight could complete or reuse the request under it.
 async fn serve_read<K: QueueKernel, S: PageSource>(
     kernel: &K,
     source: &S,
     shape: &QueueShape,
     readahead: &Readahead,
+    state: &TagState,
     tag: u16,
-    offset: u64,
-    len: u32,
+    (offset, len): (u64, u32),
 ) -> Result<i32> {
     let parts = spans(offset, len, shape.length, shape.page_bytes);
     if let Some(Span::Page {
@@ -187,6 +192,9 @@ async fn serve_read<K: QueueKernel, S: PageSource>(
         readahead.observe(shape, *number, page_offset + u64::from(*len));
     }
     for span in parts {
+        if state.abandoned.get() {
+            return Err(Error::Cancelled);
+        }
         match span {
             Span::Page {
                 number,
@@ -194,13 +202,21 @@ async fn serve_read<K: QueueKernel, S: PageSource>(
                 len,
                 request_offset,
             } => {
-                let page = source.page(number).await?;
+                let page = {
+                    let page = source.page(number);
+                    let abandoned = state.abandoned(tag);
+                    futures::pin_mut!(page, abandoned);
+                    match futures::future::select(page, abandoned).await {
+                        futures::future::Either::Left((page, _)) => page?,
+                        futures::future::Either::Right(((), _)) => return Err(Error::Cancelled),
+                    }
+                };
                 let start = usize::try_from(page_offset).map_err(|_| Error::InvalidRange)?;
                 let end = start + len as usize;
                 if page.bytes().len() < end {
                     return Err(Error::InvalidRange);
                 }
-                write_all(kernel, shape, tag, page, start..end, request_offset).await?;
+                write_all(kernel, shape, state, tag, page, start..end, request_offset).await?;
             }
             Span::Zero {
                 request_offset,
@@ -212,6 +228,7 @@ async fn serve_read<K: QueueKernel, S: PageSource>(
                     write_all(
                         kernel,
                         shape,
+                        state,
                         tag,
                         Zeros,
                         0..take as usize,
@@ -226,10 +243,12 @@ async fn serve_read<K: QueueKernel, S: PageSource>(
     i32::try_from(len).map_err(|_| Error::InvalidRange)
 }
 
-/// Write the whole range, continuing after short writes.
+/// Write the whole range, continuing after short writes. Each write is
+/// awaited to completion; once the queue is abandoned no new write starts.
 async fn write_all<K: QueueKernel, P: PageBytes>(
     kernel: &K,
     shape: &QueueShape,
+    state: &TagState,
     tag: u16,
     page: P,
     range: Range<usize>,
@@ -238,6 +257,9 @@ async fn write_all<K: QueueKernel, P: PageBytes>(
     let mut written = 0usize;
     let length = range.len();
     while written < length {
+        if state.abandoned.get() {
+            return Err(Error::Cancelled);
+        }
         let at = request_offset
             .checked_add(u32::try_from(written).map_err(|_| Error::InvalidRange)?)
             .ok_or(Error::InvalidRange)?;
@@ -393,13 +415,19 @@ async fn serve_tag<K: QueueKernel, S: PageSource>(
             match Request::decode(kernel.descriptor(tag), shape.max_io_bytes) {
                 Action::Complete(code) => code,
                 Action::Read { offset, len } => {
-                    let read = serve_read(&*kernel, &*source, &shape, &readahead, tag, offset, len);
-                    let abandoned = state.abandoned(tag);
-                    futures::pin_mut!(read, abandoned);
-                    match futures::future::select(read, abandoned).await {
-                        futures::future::Either::Left((result, _)) => result.unwrap_or(-libc::EIO),
-                        futures::future::Either::Right(((), _)) => -libc::EIO,
-                    }
+                    // Runs every started write to completion before the
+                    // commit below; see `serve_read`.
+                    serve_read(
+                        &*kernel,
+                        &*source,
+                        &shape,
+                        &readahead,
+                        &state,
+                        tag,
+                        (offset, len),
+                    )
+                    .await
+                    .unwrap_or(-libc::EIO)
                 }
             }
         };
@@ -595,6 +623,9 @@ mod tests {
         /// Commands refused so far.
         refused: Cell<u32>,
         pauses: Cell<u32>,
+        /// Hold each write in flight until its sender is released.
+        hold_writes: Cell<bool>,
+        held: RefCell<Vec<oneshot::Sender<()>>>,
     }
 
     impl QueueKernel for Kernel {
@@ -646,6 +677,14 @@ mod tests {
                 buffer.resize(offset + take, 0xaa);
             }
             buffer[offset..offset + take].copy_from_slice(&data);
+            if self.hold_writes.get() {
+                let (release, wait) = oneshot::channel();
+                self.held.borrow_mut().push(release);
+                return Box::pin(async move {
+                    wait.await.ok();
+                    Ok(take)
+                });
+            }
             Box::pin(async move { Ok(take) })
         }
     }
@@ -898,6 +937,38 @@ mod tests {
             .ok()
             .unwrap();
         assert_eq!(harness.poll(), QueueState::Finished { failure: None });
+    }
+
+    #[test]
+    fn abandon_waits_for_a_pending_write_before_commit() {
+        let mut harness = Harness::new(1);
+        harness.kernel.max_write.set(700);
+        harness.poll();
+        harness.kernel.hold_writes.set(true);
+        let len = PAGE as u32 + 1024;
+        harness.kernel.request(0, UBLK_IO_OP_READ, 0, len);
+        assert_eq!(harness.poll(), QueueState::Running);
+        assert_eq!(
+            harness.kernel.held.borrow().len(),
+            1,
+            "a write is in flight"
+        );
+        harness.queue.abandon();
+        assert_eq!(harness.poll(), QueueState::Running);
+        assert!(
+            harness.kernel.commands.borrow().is_empty(),
+            "no commit while the write is in flight"
+        );
+        assert_eq!(harness.queue.owned(), 1);
+        let release = harness.kernel.held.borrow_mut().remove(0);
+        release.send(()).unwrap();
+        assert_eq!(harness.poll(), QueueState::Running);
+        // The short write is not continued once abandoned.
+        assert!(harness.kernel.held.borrow().is_empty());
+        let command = harness.kernel.take(0);
+        assert_eq!(command.op, U_IO_COMMIT_AND_FETCH_REQ);
+        assert_eq!(command.cmd.result, -libc::EIO);
+        assert_eq!(harness.queue.owned(), 0);
     }
 
     #[test]

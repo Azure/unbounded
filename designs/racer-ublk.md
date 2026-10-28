@@ -160,8 +160,11 @@ abandon them. A worker also abandons its queues when its own drain deadline pass
 Abandoning does not drop the queues. Dropping a pending `uring_cmd` makes the reactor send
 `ASYNC_CANCEL`, which cannot cancel it: the kernel completes it with `-ENOENT` (checked by a
 root test). Instead, an abandoned queue answers every request it holds, or is handed later,
-with `EIO`. That lets a waiting `STOP_DEV` finish, and the abort then ends the queue. A
-worker's drain finishes once the control thread has exited and its queues hold no request.
+with `EIO`. That lets a waiting `STOP_DEV` finish, and the abort then ends the queue.
+Abandoning cuts short only a wait for a page. A copy into the request that has already
+been sent to the kernel is awaited first, because dropping it would not stop it, and the
+tag must not be committed while the copy is still running. No new copy starts after that.
+A worker's drain finishes once the control thread has exited and its queues hold no request.
 
 A worker's runtime fence still waits for the queue's outstanding fetches, and only the
 kernel can end them. So when the control loop ends with any queue still attached, because
@@ -234,7 +237,7 @@ fetching the next page, at most two pages at a time per queue.
 - Simulation tests for the dedicated command partition.
 - Unit tests for the tag loop against an in-memory kernel: page crossing, zero tail, short
   writes, error mapping, aborts, command failures, refused commands retried, abandon
-  answering with `EIO`, and readahead.
+  answering with `EIO`, abandon waiting for an in-flight copy before the commit, and readahead.
 - Unit tests for the pinned `DEL_DEV` against a scripted ring, and for the
   `DEL_DEV_ASYNC` fallback rule.
 - Unit tests for the control loop against a fake kernel: normal lifecycle, fixed id
