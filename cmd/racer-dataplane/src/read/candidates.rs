@@ -1143,7 +1143,7 @@ impl CandidatePolicy {
             // The walk took the previous membership's ranking (Known issue 19).
             if a.fallback
                 .as_ref()
-                .is_some_and(|c| c.membership.version.0 == a.fill.version())
+                .is_some_and(|c| c.membership.version.0 == a.fill.version)
             {
                 a.current = a.fallback.take();
             }
@@ -1178,7 +1178,7 @@ impl CandidatePolicy {
                         .filter_map(|node| membership.position(node).ok())
                         .map(|p| p as u32)
                         .collect();
-                    let rank0 = match a.fill.rank() {
+                    let rank0 = match a.fill.rank {
                         Some(rank) if rank > 0 => {
                             self.rank0_watch
                                 .borrow()
@@ -1256,7 +1256,7 @@ impl CandidatePolicy {
                 } => {
                     let current = a.current.as_ref().expect("ranked");
                     let membership = current.membership.clone();
-                    let targets = &a.fill.handoff()[first..first + count];
+                    let targets = &a.fill.handoff[first..first + count];
                     match self
                         .granted_batch(
                             &membership,
@@ -1409,7 +1409,7 @@ impl CandidatePolicy {
             }
             Ranking::Authority => {
                 check_budget(scope, budget)?;
-                if a.fill.funding_stopped() {
+                if a.fill.funding {
                     a.trail.site = CandidateSite::Funding;
                 }
                 let current = a.current.as_ref().expect("ranked");
@@ -1622,7 +1622,7 @@ impl CandidatePolicy {
         scope: &RequestScope,
         budget: &AcquisitionBudget,
     ) -> Error {
-        if a.phase == Phase::Walk && a.fill.funding_stopped() {
+        if a.phase == Phase::Walk && a.fill.funding {
             a.trail.site = CandidateSite::Funding;
         }
         if evidence.notes & (Notes::EXHAUSTED | Notes::EXHAUSTED_FUNDING) != 0
@@ -1653,7 +1653,7 @@ impl CandidatePolicy {
                 error,
                 std::mem::take(&mut a.trail),
             ),
-            Phase::Remaining => match (a.fill.remaining_end(), &a.authority) {
+            Phase::Remaining => match (a.fill.remaining_end, &a.authority) {
                 (Some(RemainingEnd::None), Some(authority)) => {
                     // Record the miss diagnostic; the walk classifies it.
                     self.final_origin_miss(authority, operation, scope, budget);
@@ -1694,7 +1694,7 @@ impl CandidatePolicy {
             object: object.clone(),
             owners: current.ordered.clone(),
             page,
-            predecessor_evidence: a.fill.origin_evidence().to_vec(),
+            predecessor_evidence: a.fill.evidence.to_vec(),
             rank,
         })
     }

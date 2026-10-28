@@ -2970,7 +2970,7 @@ fn fill_stale_membership_refreshes_falls_back_waits_or_skips() {
         vec![Event::Ranked(Ok(owners(4, None)))],
     );
     assert!(matches!(actions[0], Action::Probe(_)));
-    assert_eq!(f.version(), 4);
+    assert_eq!(f.version, 4);
     assert_ne!(notes & Notes::FALLBACK, 0);
     // This node owns the page under version - 1: no fallback; it waits.
     let (mut f, _, _) = stale(Features::PRODUCTION, 5, true);
@@ -2982,7 +2982,7 @@ fn fill_stale_membership_refreshes_falls_back_waits_or_skips() {
     assert!(matches!(actions[0], Action::Wait(_)));
     assert_ne!(notes & (Notes::FALLBACK_DENIED | Notes::WAIT_DENIED), 0);
     assert!(matches!(actions[1], Action::Probe(p) if p.canonical == 0));
-    assert_eq!(f.waits(), 1);
+    assert_eq!(f.waits, 1);
     // Not a member of version - 1: wait, and without waits skip.
     let (_, action, _) = stale(Features::PRODUCTION, 5, false);
     assert!(matches!(action, Action::Wait(_)));
@@ -3103,7 +3103,7 @@ fn fill_successor_hints_become_a_granted_batch() {
             remaining_opportunities: 2 + SUCCESSOR_SHARE_DIVISOR,
         }
     );
-    assert_eq!(f.handoff(), [12]);
+    assert_eq!(f.handoff, [12]);
     assert_eq!(f.target_kind(0), TargetKind::Successor);
     assert_eq!(actions[4], Action::Publish(Source::Peer));
 }

@@ -1,25 +1,5 @@
-//! Sans-IO candidate walk for one membership epoch.
-//!
-//! [`CandidateWalk`] owns the arithmetic and ordering of the dataplane's
-//! candidate resolution: which ranked owner to probe next, whether the probe
-//! may start acquisition, how credits are partitioned for it, how responses
-//! accumulate predecessor evidence, and how the walk ends. The caller performs
-//! each probe (network, simulation, or test script) and reports the outcome.
-//!
-//! Driving loop:
-//!
-//! ```text
-//! let mut walk = CandidateWalk::new(config);
-//! loop {
-//!     match walk.next(&mut budget)? {
-//!         Step::Probe(probe) => {
-//!             let outcome = exchange(probe, walk.request_budget(&mut budget));
-//!             if let Some(end) = walk.complete(&mut budget, outcome)? { break end }
-//!         }
-//!         Step::End(end) => break end,
-//!     }
-//! }
-//! ```
+//! Sans-IO acquisition of one page: [`Fill`] drives one [`CandidateWalk`]
+//! per membership epoch, and the caller performs each [`Action`].
 
 pub use crate::liveness::Rank0State;
 use crate::read::budget::{AcquisitionBudget, MAX_ROUTE_LINKS};
@@ -67,83 +47,42 @@ pub(crate) struct WalkConfig {
     pub rank: Option<usize>,
     /// Number of ranked owners (1..=3).
     pub owners: usize,
-    /// Visit order for a non-owner; ignored for owners, which probe their
-    /// predecessors canonically.
+    /// Visit order for a non-owner; owners probe predecessors canonically.
     pub order: VisitOrder,
     /// The operation is a fixed page fetch (`Operation::Page`).
     pub page_operation: bool,
     pub continuation: Continuation,
-    /// Previous-membership owners an owner may ask copy-only before origin
-    /// (at most [`MAX_HANDOFF`]); see [`handoff_targets`]. A probe of handoff
-    /// target `i` reports `canonical = owners + i`. Ignored for non-owners and
-    /// for operations other than pages.
+    /// Previous-membership owners asked copy-only before origin; a probe of
+    /// target `i` reports `canonical = owners + i`.
     pub handoff: usize,
-    /// Predecessors (bit `c` for canonical rank `c`) to ask under membership
-    /// version - 1 ([`Probe::previous`]): the caller replaced that version at
-    /// most [`PREVIOUS_MEMBERSHIP_WITHIN`] ago, this node is a member of
-    /// it, and the predecessor held the same rank
-    /// there, so the request carries the same authority and a predecessor
-    /// that has not adopted the current version yet still serves it (Known
-    /// issue 12); see [`same_rank_previous`]. Ignored for non-owners, for
-    /// handoff targets, and for non-page walks.
+    /// Predecessors (bit `c` for rank `c`) asked under version - 1, where
+    /// they held the same rank, so one that has not adopted the current
+    /// version still serves (Known issue 12).
     pub previous: u8,
-    /// A non-owner page walk has an overflow helper (see
-    /// [`crate::read::budget`]); a probe of it reports `canonical = owners`.
-    /// The walk is eligible only when it starts with at least
-    /// [`HELPER_MIN_ATTEMPTS`] attempts (so a helper, which inherits fewer,
-    /// never asks another helper). It asks the helper at most once, right
-    /// after an owner itself sheds the probe ([`Outcome::Shed`]; an
-    /// `Overloaded` signed by a relay or a timeout does not count, since
-    /// those say the route, not the page, is congested), funded with up to
-    /// [`HELPER_ATTEMPTS`] attempts and
-    /// [`HELPER_LINKS`] links from what is left. Owner probes are planned
-    /// exactly as without a helper. Ignored for owners and non-pages.
+    /// A non-owner page walk may ask an overflow helper (`canonical =
+    /// owners`) once, right after an owner itself sheds the probe. A relay's
+    /// `Overloaded` or a timeout says the route is congested, not the page.
     pub helper: bool,
-    /// Per canonical owner rank, how many lineage targets that owner has
-    /// ([`lineage_targets`]): later owners that arrived before it and so may
-    /// hold a copy fetched before it was an owner (Known issue 25). Funds
-    /// their copy-only probes from slack: a non-owner's out-of-order
-    /// `Acquire` to that owner carries one more credit per target (and per
-    /// rank 0 target, for the owner's delegation to rank 0), and a
-    /// delegation to rank 0 forwards spare credits for rank 0's. Never
-    /// reserved: without slack the walk funds exactly as before.
+    /// Lineage targets per owner rank (Known issue 25), funded from slack
+    /// only: without slack the walk funds exactly as before.
     pub lineage: [u8; MAX_HANDOFF],
-    /// The first `granted` handoff targets are asked copy-only once, before
-    /// origin, each with its own grant ([`SUCCESSOR_GRANT_ATTEMPTS`],
-    /// [`SUCCESSOR_GRANT_LINKS`]) instead of the walk's budget, whose
-    /// credits a delegated rank 0 needs for origin. They are successor
-    /// targets ([`crate::read::hints::successor_targets`]: later owners
-    /// this owner answered without a copy, which then likely fetched the
-    /// page themselves, Known issue 21), then lineage targets
-    /// ([`lineage_targets`], [`demoted_targets`]: members that ranked above
-    /// this owner before it arrived, Known issues 34 and 35); see
-    /// [`granted_prefix`]. The grant's unused credits are dropped, never
-    /// added to the walk's budget, so the walk's credits never grow.
+    /// The first `granted` handoff targets (successors, then lineage) are
+    /// asked copy-only on their own grant, never the walk's budget, so a
+    /// delegated rank 0 keeps its origin credit (Known issues 21, 34, 35).
     pub granted: usize,
-    /// Send the granted probes of a run of consecutive granted targets at
-    /// once ([`Step::Granted`]) instead of one after the other (Known issue
-    /// 45). Each still has its own grant and only a copy changes the walk,
-    /// so the order of their outcomes cannot matter; the run costs one time
-    /// share instead of one per target.
+    /// Send a run of granted probes at once ([`Step::Granted`], Known issue
+    /// 45). Only a copy changes the walk, so their order cannot matter.
     pub parallel_granted: bool,
-    /// What this owner last learned about rank 0's acquisition of the page
-    /// ([`crate::liveness::Rank0Watch`], Known issue 39). `Overdue`: a
-    /// timeout of rank 0 gives origin authority like a transport failure,
-    /// since rank 0 stayed silent too long
-    /// ([`crate::liveness::Rank0Watch::hang_after`]). `Fetching` and
-    /// `Unknown` keep the [`Outcome::TimedOut`] rule. `Failed`: this
-    /// owner's own origin request for the page failed recently, so
-    /// [`Outcome::Failed`] withholds authority too (Known issue 52). Ignored
-    /// unless this node is an owner above rank 0 on a page walk.
+    /// What this owner knows about rank 0's acquisition (Known issues 39,
+    /// 52): `Overdue` makes a rank 0 timeout grant authority, `Failed` makes
+    /// [`Outcome::Failed`] withhold it.
     pub rank0: Rank0State,
 }
 
-/// Attempts granted to one successor probe ([`WalkConfig::successors`]): the
-/// copy-only exchange.
+/// Attempts granted to one successor probe.
 pub const SUCCESSOR_GRANT_ATTEMPTS: u32 = 1;
 
-/// Extra opportunities a successor probe's time share is divided by, so it
-/// takes at most a fifth of the time left ([`plan_attempt`]).
+/// Divides a successor probe's time share so it takes at most a fifth.
 pub(crate) const SUCCESSOR_SHARE_DIVISOR: u32 = 4;
 
 /// Links granted to one successor probe, as a reader funds an owner.
@@ -152,63 +91,40 @@ pub const SUCCESSOR_GRANT_LINKS: u8 = 8;
 /// Most previous-membership owners one walk asks (the replica count).
 pub const MAX_HANDOFF: usize = 3;
 
-/// Most lineage targets (later owners and demoted members,
-/// [`lineage_targets`], [`demoted_targets`]) one owner walk asks, each on its
-/// own grant (Known issue 46). Larger than [`MAX_HANDOFF`] because granted
-/// probes are sent at once ([`WalkConfig::parallel_granted`]): more targets
-/// add copy-only exchanges, not latency, and never draw on the walk's
-/// budget.
+/// Most lineage targets one owner walk asks (Known issue 46). Granted probes
+/// go out at once, so more targets add exchanges, not latency.
 pub const MAX_LINEAGE: usize = 6;
 
-/// Most handoff targets one owner walk lists ([`WalkConfig::handoff`]):
-/// successor targets (later owners, at most two) and lineage targets.
+/// Most handoff targets: successor targets plus lineage targets.
 pub(crate) const MAX_TARGETS: usize = REPLICAS_BELOW + MAX_LINEAGE;
 
 /// Later owners an owner can have (successor targets).
 const REPLICAS_BELOW: usize = MAX_HANDOFF - 1;
 
-/// The grant a granted probe spends ([`Step::Granted`],
-/// [`WalkConfig::granted`]): fresh credits that are never added to the
-/// walk's budget.
+/// The fresh grant a granted probe spends.
 pub fn granted_budget(deadline: Instant) -> AcquisitionBudget {
     AcquisitionBudget::new(deadline, SUCCESSOR_GRANT_ATTEMPTS, SUCCESSOR_GRANT_LINKS)
 }
 
-/// Fewest attempts a non-owner funds an out-of-order Acquire to the owner at
-/// `canonical` rank with: the exchange itself, one copy-only probe per
-/// predecessor, and the owner's own origin attempt.
+/// Fewest attempts a non-owner funds an out-of-order Acquire to `canonical`
+/// with: the exchange, one probe per predecessor, and the owner's origin.
 pub fn owner_funding_min(canonical: usize) -> u32 {
     canonical as u32 + 2
 }
 
-/// Attempts a non-owner funds an out-of-order Acquire with when it can:
-/// [`owner_funding_min`] plus, above rank 0, the remote credit the owner's
-/// `Acquire` to rank 0 carries, so it can delegate the cold fetch.
+/// [`owner_funding_min`] plus, above rank 0, the credit for the owner's
+/// delegation to rank 0.
 pub fn owner_funding(canonical: usize) -> u32 {
     owner_funding_min(canonical) + u32::from(canonical > 0)
 }
 
-/// Fewest links a funded out-of-order Acquire may carry: the owner keeps
-/// `links - 1` ([`crate::read::budget::inherited_budget`]), at least one to reach
-/// its rank 0.
+/// Fewest links of a funded Acquire: the owner keeps one to reach rank 0.
 pub(crate) const FUNDED_MIN_LINKS: u8 = 2;
 
-/// Links a non-owner funds an out-of-order Acquire with: a full failure
-/// route ([`MAX_ROUTE_LINKS`]) when it has one to give, else exactly what a
-/// shared route would charge ([`AcquisitionBudget::route_links`]), as long as
-/// that leaves the owner a link ([`FUNDED_MIN_LINKS`]). `None` when not even
-/// that is left.
-///
-/// A non-owner reached by a funded route inherits at most
-/// `MAX_ROUTE_LINKS - 1` links, so requiring a full route sent every
-/// out-of-order Acquire it forwarded over a shared route, which spends the
-/// same links but grants only a share of the attempts
-/// ([`plan_attempt`]): an owner above rank 0 then had one credit, spent it
-/// on a predecessor that was behind on membership, and could not fetch
-/// (Known issue 57). Funding with the shared route's links keeps every
-/// later visit's links exactly as before; only the attempts move to the
-/// owner, and only from the minimum the owner needs
-/// ([`owner_funding_min`]).
+/// Links a non-owner funds an out-of-order Acquire with: a full route when
+/// available, else what a shared route would charge, if that leaves the
+/// owner a link. Requiring a full route left forwarded owners with one
+/// credit (Known issue 57).
 pub fn funded_links(budget: &AcquisitionBudget) -> Option<u8> {
     if budget.remaining_links() >= MAX_ROUTE_LINKS {
         Some(MAX_ROUTE_LINKS)
@@ -218,37 +134,12 @@ pub fn funded_links(budget: &AcquisitionBudget) -> Option<u8> {
     }
 }
 
-/// Whether a shared route's Acquire to the owner at `canonical` would carry
-/// fewer remote credits than that owner needs to probe its predecessors and
-/// still fetch (`owner_funding_min(canonical) - 1`): [`plan_attempt`] grants
-/// a shared route only `remaining.div_ceil(opportunities)` after the
-/// exchange. A non-owner then funds the visit instead (in visit order too),
-/// with the minimum and the shared route's links ([`funded_links`]).
-///
-/// In 5k `full-failover` every owner that ended its walk with origin
-/// authority and no attempt left (161) was rank 1 holding one credit, sent
-/// in visit order by a non-owner with three attempts left: one went to the
-/// exchange and one remote credit to rank 1, which spent it on a copy-only
-/// probe of rank 0 that the reader had just visited (Known issue 57). The
-/// credit moves from the last owner, whose own share (one) would only buy
-/// the same probe of rank 0.
-///
-/// The walk does not do this after an owner was busy (it shed the walk,
-/// left a probe unanswered within its time bound, or it or a relay in
-/// front of it answered `Overloaded`): that owner is most
-/// likely serving or fetching the page, and funding the next one to fetch
-/// it would only add an origin request overlapping its own (Known issue 31,
-/// the reader-side counterpart of the [`Outcome::TimedOut`] rule; 5k `zipf`
-/// at 16 MiB pages: 120 to 165 overlapping requests without this
-/// exception, 128 with it). A route failure or a refusal (rank 0 down or its own
-/// acquisition failed) still funds the next owner.
-///
-/// The cost is bounded (Known issue 59): an owner funded at its minimum
-/// asks its predecessors copy-only and sends at most one origin request,
-/// under the authority rules every owner follows. In 5k `full-failover`
-/// its extra requests are pages served that were not before, retries after
-/// an origin failure, and skips of a rank 0 that holds the page behind a
-/// cut route (`held_unreachable`), never a copy answered as missing.
+/// Whether a shared route would give the owner at `canonical` fewer remote
+/// credits than it needs to probe its predecessors and still fetch (Known
+/// issue 57). The walk then funds the owner instead, unless an earlier owner
+/// was busy: it is likely fetching, and funding the next one would only
+/// overlap its origin request (Known issue 31). The cost is bounded: a
+/// funded owner sends at most one origin request (Known issue 59).
 pub fn shared_share_short(
     budget: &AcquisitionBudget,
     canonical: usize,
@@ -262,16 +153,11 @@ pub fn shared_share_short(
             < owner_funding_min(canonical) - 1
 }
 
-/// How long after this node replaced membership version - 1 its owners may
-/// still ask predecessors under it ([`WalkConfig::previous`]). Peers keep a
-/// superseded membership for a 30 s grace window
-/// (`Snapshot::retention`), so this leaves 20 s for a peer that adopted the
-/// current membership before this node; past it, a peer may answer
-/// `StaleMembership` and the probe would be wasted.
+/// How long after replacing version - 1 an owner may still ask predecessors
+/// under it. Peers keep a superseded membership for 30 s.
 pub const PREVIOUS_MEMBERSHIP_WITHIN: Duration = Duration::from_secs(10);
 
-/// A short list of node identities in a fixed array: the target lists of one
-/// walk never allocate.
+/// A short fixed-capacity list, so target lists never allocate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct List<T, const N: usize> {
     items: [T; N],
@@ -337,28 +223,17 @@ impl<T: PartialEq, const N: usize> PartialEq<Vec<T>> for List<T, N> {
     }
 }
 
-/// Predecessors an owner at `rank` may ask under the previous membership
-/// ([`WalkConfig::previous`]): bit `c` is set when canonical rank `c` <
-/// `rank` names the same node in `previous` and `current`. Such a request
-/// carries the same authority under either version, and a predecessor that
-/// has not adopted the current version yet still resolves the previous one,
-/// so it serves (or, at rank 0, fetches for everyone) instead of answering
-/// `StaleMembership` and leaving the page to this owner (Known issue 12).
-/// [`Fill`] sets nothing unless the caller replaced the previous membership
-/// at most [`PREVIOUS_MEMBERSHIP_WITHIN`] ago and is a member of it.
+/// Predecessors an owner at `rank` may ask under the previous membership:
+/// bit `c` is set when rank `c` names the same node in both (Known issue 12).
 fn same_rank_previous<N: PartialEq>(previous: &[N], current: &[N], rank: usize) -> u8 {
     (0..rank.min(current.len()).min(8))
         .filter(|c| previous.get(*c).is_some_and(|p| *p == current[*c]))
         .fold(0, |bits, c| bits | (1 << c))
 }
 
-/// Which previous-membership owners a page owner should ask before origin.
-///
-/// `previous` and `current` are the page's ranked owners under the previous
-/// and current membership; `rank` is this node's current rank. Returns the
-/// previous owners in previous rank order, without this node and without the
-/// current predecessors (the walk asks those anyway). Empty when the owner
-/// set did not change, so a steady cold miss pays no extra probe.
+/// Previous owners a page owner asks before origin, in previous rank order,
+/// without this node and its current predecessors. Empty when the owner set
+/// did not change, so a steady cold miss pays no extra probe.
 fn handoff_targets<N: PartialEq + Copy + Default>(
     previous: &[N],
     current: &[N],
@@ -376,20 +251,9 @@ fn handoff_targets<N: PartialEq + Copy + Default>(
         .collect()
 }
 
-/// Lineage handoff targets of the owner at `rank` (Known issue 25): later
-/// owners (`k > rank`) that arrived in this node's membership chain before
-/// that owner (`since[k] < since[rank]`, see `topology::Membership::since`).
-///
-/// Placement is rendezvous hashing, so a member ranks below the owner at
-/// `rank` in every membership listing both. Such a later owner could have
-/// held a higher rank, and fetched the page, only while that owner was not
-/// a member yet: a page that moved to a member that joined is still held by
-/// the owner it displaced, however many versions ago that was, while the
-/// version - 1 [`handoff_targets`] see only the last move. Members with
-/// equal or unknown arrival never qualify, so a cluster whose members
-/// arrived together pays nothing. A target can only miss, so it costs one
-/// copy-only probe at most, funded opportunistically like other handoff
-/// probes.
+/// Later owners that arrived before the owner at `rank` (Known issue 25).
+/// Under rendezvous hashing they could only have outranked it, and fetched
+/// the page, before it arrived. Equal or unknown arrivals never qualify.
 fn lineage_targets<N: Copy + Default>(
     owners: &[N],
     since: &[Option<u32>],
@@ -407,32 +271,12 @@ fn lineage_targets<N: Copy + Default>(
         .collect()
 }
 
-/// Lineage targets ranked below the owners (Known issue 34): members of
-/// `demoted` (the ranks just below the owners, best first, see
-/// `topology::Placement::demoted`) that arrived before the owner at `rank`
-/// and were owners when they arrived, so they may still hold a copy fetched
-/// then. `since` covers the owners, `demoted_since` the demoted members.
-///
-/// Rendezvous scores never change, so a member ranked `k` is an owner
-/// whenever fewer than [`MAX_HANDOFF`] of the members ranked above it are
-/// present. It was one when it arrived (generation `s`) if fewer than
-/// [`MAX_HANDOFF`] members above it have an arrival at or before `s`.
-/// Members with an unknown arrival count as present, so an unknown never
-/// adds a target. Members that left since are not seen, which can only
-/// make a member look like it was an owner when it was not: the probe then
-/// misses, costing one granted copy-only exchange.
-///
-/// Members whose arrival is `oldest`, the generation this node's membership
-/// chain began at (production `Membership::since` 0), qualify too: their
-/// arrival is unknown, only that they are at least as old as the chain, so
-/// no arrival rule can tell whether one of them was an owner before the
-/// chain began (Known issue 46). In 5k `full-churn` most holders left
-/// unasked without them were such members, tied at the chain's start with
-/// the owners above them. When this owner arrived after the chain began,
-/// they qualify in rank order: a member ranked higher is an owner whenever
-/// fewer members above it are present, so it is the likelier holder. At
-/// most [`MAX_LINEAGE`] in all, each a granted copy-only probe that can only
-/// miss.
+/// Demoted members (ranked just below the owners) that arrived before the
+/// owner at `rank` and were owners then (Known issue 34): fewer than
+/// [`MAX_HANDOFF`] members above them had arrived. Unknown arrivals count as
+/// present, so they never add a target. Members whose arrival is `oldest`
+/// (the start of this node's membership chain) always qualify, since no rule
+/// can tell (Known issue 46).
 fn demoted_targets<N: Copy + Default>(
     since: &[Option<u32>],
     demoted: &[N],
@@ -462,17 +306,12 @@ fn demoted_targets<N: Copy + Default>(
         .collect()
 }
 
-/// How many leading `handoff` targets are in `granted` (successor and
-/// lineage targets), for [`WalkConfig::granted`]. [`Fill`] orders the
-/// handoff targets so these come first ([`merge_handoff`],
-/// [`crate::read::hints::with_successors`]); version - 1 targets after them
-/// stay funded from the walk's budget.
+/// How many leading `handoff` targets are in `granted`.
 fn granted_prefix<N: PartialEq>(handoff: &[N], granted: &[N]) -> usize {
     handoff.iter().take_while(|n| granted.contains(n)).count()
 }
 
-/// [`lineage_targets`] counts for every canonical owner rank, for
-/// [`WalkConfig::lineage`].
+/// [`lineage_targets`] counts for every owner rank.
 fn lineage_counts(since: &[Option<u32>]) -> [u8; MAX_HANDOFF] {
     let mut counts = [0; MAX_HANDOFF];
     for (rank, count) in counts.iter_mut().enumerate() {
@@ -487,14 +326,10 @@ fn lineage_counts(since: &[Option<u32>]) -> [u8; MAX_HANDOFF] {
     counts
 }
 
-/// The handoff targets an owner asks: lineage targets ([`lineage_targets`],
-/// [`demoted_targets`], at most [`MAX_LINEAGE`]) first, then the version - 1
-/// targets ([`handoff_targets`]) not already listed while fewer than
-/// [`MAX_HANDOFF`] targets are listed (the walk funds those from its own
-/// budget, so their number does not grow with the lineage cap). Lineage
-/// targets come first: each was an owner above this one before it arrived,
-/// so it fetched the page if anyone read it then, while a version - 1 owner
-/// that was displaced since may never have been asked for it.
+/// Lineage targets first, then version - 1 targets while fewer than
+/// [`MAX_HANDOFF`] are listed (those spend the walk's budget). A lineage
+/// target outranked this owner before it arrived, so it is the likelier
+/// holder.
 fn merge_handoff<N: PartialEq + Copy + Default>(
     previous: &[N],
     lineage: &[N],
@@ -540,50 +375,20 @@ pub enum Outcome {
     /// The peer reported a stale membership epoch and the caller will refresh
     /// (see [`stale_action`]).
     StaleMembership,
-    /// The peer reported a stale membership epoch, but the caller holds no
-    /// newer membership to refresh to (or already refreshed once): the
-    /// destination is behind. The walk records transient evidence and moves
-    /// on to the next owner without charging a route failure; the route
-    /// itself worked.
+    /// The destination is behind and there is nothing newer to refresh to:
+    /// transient evidence, not a route failure.
     StaleDestination,
-    /// The destination itself answered `Overloaded` (signed by the
-    /// destination, not by a relay in front of it): for example an owner
-    /// shedding readers of a hot page
-    /// ([`crate::read::budget::shed_hot_page`]). Recorded like
-    /// `Probe(Overloaded)` but without charging a route failure (the route
-    /// worked); for a non-owner page walk it is also the one signal that asks
-    /// the page's overflow helper.
+    /// The destination itself (not a relay) answered `Overloaded`. Like
+    /// `Probe(Overloaded)` without a route failure; asks a reader's helper.
     Shed,
-    /// The request was sent but no answer arrived before the attempt's own
-    /// time bound (its idle share or the attempt timeout) while the caller's
-    /// scope still runs: the destination may still be working on it.
-    /// Recorded like `Transport(Unreachable)`, except for an owner's page
-    /// probe of rank 0: a delegated `Acquire` waits on rank 0's acquisition, and a
-    /// copy-only probe answers at once unless it joined rank 0's running
-    /// acquisition (production `Flights::join_copy`). Either way rank 0 is
-    /// most likely still fetching (its origin request queued behind others),
-    /// so the timeout is not origin authority for this owner, whose own
-    /// request would only queue behind rank 0's at the same origin (Known
-    /// issue 31). Such a walk ends [`End::Exhausted`] instead of
-    /// [`End::Origin`]; a transport failure (rank 0 down or unreachable) or
-    /// a miss still lets the owner fetch. [`WalkConfig::rank0`] bounds the
-    /// rule: once rank 0 stayed silent too long (`Overdue`) a timeout gives
-    /// authority again (Known issue 39).
+    /// Unanswered within the attempt's time bound. Like
+    /// `Transport(Unreachable)`, except that an owner's probe of rank 0
+    /// withholds origin authority: rank 0 is most likely still fetching
+    /// (Known issue 31), unless it is `Overdue` (Known issue 39).
     TimedOut,
-    /// Rank 0 itself (the response is signed by the destination, not by a
-    /// relay) answered an owner's page probe of it `Unavailable`: its own
-    /// acquisition of the page failed. Callers report it only for
-    /// [`CandidateWalk::pending_rank0`] probes; anywhere else it is
-    /// recorded as `Probe(Unreachable)`.
-    ///
-    /// Recorded like `Probe(Unreachable)`, except that when this owner's
-    /// own origin request for the page failed recently
-    /// ([`WalkConfig::rank0`] is `Failed`, see
-    /// [`crate::liveness::Rank0Watch::failed`]) it withholds origin
-    /// authority like [`Outcome::TimedOut`] (Known issue 52): origin is
-    /// failing for the page, this owner's request would go to it right
-    /// after rank 0's failed, and the reader's retry sends rank 0 to origin
-    /// again anyway.
+    /// Rank 0 itself answered an owner's probe `Unavailable`. Like
+    /// `Probe(Unreachable)`, except that it withholds authority when this
+    /// owner's own origin request failed recently (Known issue 52).
     Failed,
 }
 
@@ -610,9 +415,8 @@ pub enum End {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Step {
     Probe(Probe),
-    /// Granted probes to send at once ([`WalkConfig::parallel_granted`]),
-    /// each copy-only on its own [`granted_budget`]. Report them together
-    /// with [`CandidateWalk::complete_granted`] once all have answered.
+    /// Granted probes to send at once, reported with
+    /// [`CandidateWalk::complete_granted`].
     Granted(Vec<Probe>),
     /// No probes remain. The caller still checks its scope before acting.
     End(End),
@@ -635,14 +439,10 @@ pub(crate) struct CandidateWalk {
     pending: Option<Pending>,
     done: bool,
     helper: Helper,
-    /// An owner's probe of rank 0 timed out ([`Outcome::TimedOut`]): the
-    /// walk does not end with origin authority.
+    /// An owner's probe of rank 0 went unanswered: no origin authority.
     rank0_unanswered: bool,
-    /// An earlier owner was busy: it shed this walk, left a probe
-    /// unanswered within its time bound, or it or a relay in front of it
-    /// answered `Overloaded` ([`Outcome::Shed`], [`Outcome::TimedOut`]), so
-    /// it is most likely serving or fetching the page
-    /// ([`shared_share_short`]).
+    /// An earlier owner was busy ([`Outcome::Shed`], [`Outcome::TimedOut`],
+    /// `Overloaded`), so it is likely fetching ([`shared_share_short`]).
     saw_busy: bool,
 }
 
@@ -663,13 +463,11 @@ enum Helper {
 
 struct Pending {
     bounded: Option<AcquisitionBudget>,
-    /// The probe asks a previous-membership owner; its outcome is not
-    /// predecessor evidence.
+    /// A previous-membership owner: not predecessor evidence.
     handoff: bool,
     /// An owner's `Acquire` to rank 0.
     delegated: bool,
-    /// An owner's page probe of rank 0 (delegated `Acquire` or copy-only,
-    /// under either membership), not a handoff probe.
+    /// An owner's page probe of rank 0, not a handoff probe.
     rank0: bool,
     /// Sent under the previous membership ([`WalkConfig::previous`]).
     previous: bool,
@@ -718,11 +516,8 @@ impl CandidateWalk {
         }
     }
 
-    /// Decide once, from the starting budget, whether this walk may ask an
-    /// overflow helper. A non-owner that cannot fund its first out-of-order
-    /// owner at all (which would end the walk on funding before any probe)
-    /// visits the owners canonically instead, starting at rank 0; a helper's
-    /// small inherited budget can take this path.
+    /// Decide whether this walk may ask a helper. A non-owner that cannot
+    /// fund its first out-of-order owner visits the owners canonically.
     fn start(&mut self, budget: &AcquisitionBudget) {
         let eligible = self.config.helper
             && self.config.rank.is_none()
@@ -741,15 +536,13 @@ impl CandidateWalk {
         }
     }
 
-    /// An owner (or a relay in front of it) shed this walk's request or timed
-    /// out: ask the page's helper to acquire it, funded from what is left.
+    /// Ask the page's helper, funded from what is left.
     fn helper_probe(&mut self, budget: &mut AcquisitionBudget) -> Result<Step> {
         let attempts = budget.remaining_attempts().min(HELPER_ATTEMPTS);
         let links = budget.remaining_links().min(HELPER_LINKS);
         let mut child = budget.partition(attempts, links)?;
-        // Forward every funded link, as for a funded owner probe: a normal
-        // four-link envelope leaves the helper two or three links, too few to
-        // route to rank 0 through a relay (Known issue 60).
+        // Forward every funded link: fewer cannot reach rank 0 through a
+        // relay (Known issue 60).
         child.note_route_failure();
         self.pending = Some(Pending {
             bounded: Some(child),
@@ -770,8 +563,7 @@ impl CandidateWalk {
         }))
     }
 
-    /// Whether the pending probe is a granted successor probe
-    /// ([`WalkConfig::successors`]).
+    /// Whether the pending probe is a granted successor probe.
     pub fn pending_successor(&self) -> bool {
         self.pending.as_ref().is_some_and(|p| p.granted)
     }
@@ -781,9 +573,7 @@ impl CandidateWalk {
         self.pending.as_ref().is_some_and(|p| p.helper)
     }
 
-    /// Credits the funded visits after `index` need at least: minimum
-    /// funding for each out-of-order owner (every owner on bounded routes).
-    /// Shared visits take a share of whatever is left.
+    /// Minimum credits the funded visits after `index` need.
     fn later_minimum(&self, index: usize) -> u32 {
         (index + 1..self.count)
             .filter_map(|later| self.target(later).map(|c| (later, c)))
@@ -792,10 +582,8 @@ impl CandidateWalk {
             .sum()
     }
 
-    /// What every later visit needs to still reach the origin through its
-    /// owner, in order or not ([`owner_funding_min`]): lineage credits
-    /// (Known issue 25) are slack beyond this, so they never cost a later
-    /// owner its visit.
+    /// What every later visit needs to still reach origin; lineage credits
+    /// are slack beyond this (Known issue 25).
     fn later_reserve(&self, index: usize) -> u32 {
         (index + 1..self.count)
             .filter_map(|later| self.target(later))
@@ -812,32 +600,24 @@ impl CandidateWalk {
         }
     }
 
-    /// Whether the pending probe asks a previous-membership owner (handoff
-    /// target). A `StaleMembership` answer from one is only a miss: callers
-    /// must neither refresh membership nor skip it as a stale destination.
+    /// The pending probe asks a handoff target: a `StaleMembership` answer
+    /// is only a miss.
     pub fn pending_handoff(&self) -> bool {
         self.pending.as_ref().is_some_and(|p| p.handoff)
     }
 
-    /// Whether the pending probe is sent under the previous membership. A
-    /// `StaleMembership` answer to it (the destination no longer resolves
-    /// that version) must not refresh this walk's membership: report
-    /// [`Outcome::StaleMembership`] and the walk records transient evidence,
-    /// as for a destination that is behind.
+    /// The pending probe is sent under the previous membership: a
+    /// `StaleMembership` answer is transient evidence, not a refresh.
     pub fn pending_previous(&self) -> bool {
         self.pending.as_ref().is_some_and(|p| p.previous)
     }
 
-    /// Whether rank 0 left this owner's probe unanswered
-    /// ([`Outcome::TimedOut`]) or answered that its own acquisition failed
-    /// ([`Outcome::Failed`]), so the walk will not end with origin
-    /// authority.
+    /// Rank 0 timed out or failed this owner's probe: no origin authority.
     pub fn rank0_unanswered(&self) -> bool {
         self.rank0_unanswered
     }
 
-    /// The pending probe is this owner's page probe of rank 0: the caller
-    /// updates its [`crate::liveness::Rank0Watch`] from the outcome.
+    /// The pending probe is this owner's page probe of rank 0.
     pub fn pending_rank0(&self) -> bool {
         self.pending.as_ref().is_some_and(|p| p.rank0)
     }
@@ -876,8 +656,7 @@ impl CandidateWalk {
             let handoff = canonical >= self.config.owners;
             let granted = handoff && canonical - self.config.owners < self.config.granted;
             if granted && self.config.parallel_granted {
-                // Every granted target from here on, at once (Known issue
-                // 45): one time share for the run, each on its own grant.
+                // Every granted target from here on, at once (Known issue 45).
                 let remaining_opportunities =
                     (self.count - index + 1) as u32 + SUCCESSOR_SHARE_DIVISOR;
                 let mut probes = Vec::new();
@@ -899,8 +678,7 @@ impl CandidateWalk {
                 return Ok(Step::Granted(probes));
             }
             if granted {
-                // A successor probe spends its own grant, never the walk's
-                // credits.
+                // A successor probe spends its own grant, never the walk's.
                 let child = AcquisitionBudget::new(
                     budget.deadline(),
                     SUCCESSOR_GRANT_ATTEMPTS,
@@ -919,8 +697,7 @@ impl CandidateWalk {
                     index,
                     canonical,
                     mode: Mode::CopyOnly,
-                    // A short time share: the requester waiting on this
-                    // owner must not time out while it asks a successor.
+                    // A short time share: the requester waits on this.
                     remaining_opportunities: (self.count - index + 1) as u32
                         + SUCCESSOR_SHARE_DIVISOR,
                     route: RouteMode::FundedRoute,
@@ -1148,10 +925,7 @@ impl CandidateWalk {
         }
     }
 
-    /// Report the granted probes of the last [`Step::Granted`]: whether any
-    /// of them returned a validated, usable copy. Every other outcome
-    /// (miss, failure, timeout, stale or shed answer) is only a miss, and the
-    /// grants are dropped, so the walk's budget and evidence are as before.
+    /// Report the last [`Step::Granted`] batch: whether any returned a copy.
     pub fn complete_granted(&mut self, copy: bool) -> Option<End> {
         assert!(self.batch > 0, "no granted probes outstanding");
         self.batch = 0;
@@ -1161,8 +935,7 @@ impl CandidateWalk {
         })
     }
 
-    /// Return the pending probe's child credits without recording an outcome,
-    /// for a probe that failed terminally.
+    /// Return the pending probe's child credits without an outcome.
     pub fn abandon(&mut self, budget: &mut AcquisitionBudget) -> Result<()> {
         self.done = true;
         self.batch = 0;
@@ -1177,10 +950,8 @@ impl CandidateWalk {
         Ok(())
     }
 
-    /// The pending probe's destination is behind this node and the caller
-    /// waits for it ([`stale_wait`], Known issue 26): return
-    /// the child credits and plan the same destination again on the next
-    /// [`Self::next`], instead of recording an outcome and moving on.
+    /// The pending destination is behind and the caller waits to ask it
+    /// again: return its credits and plan it once more.
     pub fn retry_pending(&mut self, budget: &mut AcquisitionBudget) -> Result<()> {
         if let Some(Pending {
             bounded: Some(bounded),
@@ -1192,13 +963,8 @@ impl CandidateWalk {
         Ok(())
     }
 
-    /// Whether asking the pending destination once more (one more exchange,
-    /// after [`Self::retry_pending`]) still leaves the walk enough attempts
-    /// to fund that visit and every later one at its minimum
-    /// ([`owner_funding_min`]), and links for a full route share
-    /// ([`AcquisitionBudget::route_links`]) to each. A read's further waits
-    /// for a destination that is behind take this (Known issue 36), so
-    /// waiting never starves a later owner that may already be current.
+    /// Whether asking the pending destination again still leaves every later
+    /// visit funded.
     pub fn retry_affordable(&self, budget: &AcquisitionBudget) -> bool {
         // The pending probe's child holds its credits and its route share.
         let (attempts, links, route) = match &self.pending {
@@ -1221,8 +987,7 @@ impl CandidateWalk {
         attempts >= need && links >= route * (1 + later)
     }
 
-    /// Record the pending probe's outcome. Returns an end when the walk stops
-    /// early (copy or stale membership).
+    /// Record the pending probe's outcome; returns an end when the walk stops.
     pub fn complete(
         &mut self,
         budget: &mut AcquisitionBudget,
@@ -1370,9 +1135,7 @@ impl CandidateWalk {
     }
 }
 
-/// After an origin version miss, old copies on later candidates remain useful.
-/// This walk probes the owners after `rank` copy-only and never asks another
-/// node to start acquisition.
+/// After an origin version miss, old copies on later owners remain useful.
 pub struct RemainingWalk {
     owners: usize,
     index: usize,
@@ -1451,15 +1214,8 @@ fn transient(outcome: ProbeOutcome) -> bool {
     )
 }
 
-/// Map a probe transport error to walk evidence. `None` means the error is
-/// terminal and must propagate.
-///
-/// `HopBudgetExhausted` is local: [`plan_attempt`] or the local route search
-/// found too few links left for this probe, before anything was sent. It is
-/// evidence that this owner is unreachable within the budget, not a reason to
-/// abandon the walk: later probes that cannot be funded fail the same way
-/// without I/O, and the walk ends as `Exhausted` (a recoverable `Unavailable`)
-/// or, at an owner, with origin authority. Budgets never grow.
+/// Map a transport error to walk evidence; `None` is terminal.
+/// `HopBudgetExhausted` is local: the owner is unreachable within budget.
 pub fn transport_outcome(error: Error) -> Option<ProbeOutcome> {
     match error {
         Error::Unavailable | Error::Io | Error::Os(_) | Error::HopBudgetExhausted => {
@@ -1473,19 +1229,14 @@ pub fn transport_outcome(error: Error) -> Option<ProbeOutcome> {
 /// What to do after a peer answered `StaleMembership`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StaleAction {
-    /// Refresh to the strictly newer local membership and start a new walk
-    /// (complete the probe with [`Outcome::StaleMembership`]).
+    /// Refresh to the strictly newer local membership.
     Refresh,
-    /// No newer membership is available locally, or this walk already
-    /// refreshed once: the destination is behind this node. Complete the
-    /// probe with [`Outcome::StaleDestination`] and try the next owner.
+    /// Nothing newer, or already refreshed: the destination is behind.
     Skip,
 }
 
-/// Decide how to handle a `StaleMembership` answer. Each epoch walk refreshes
-/// at most once, and only to a strictly newer membership; otherwise the stale
-/// destination is skipped like an unreachable one, so a requester that adopted
-/// a publication before its destination still reaches the other owners.
+/// Each epoch refreshes at most once, and only to a strictly newer
+/// membership.
 fn stale_action(retried: bool, previous: u64, latest: Option<u64>) -> Result<StaleAction> {
     let latest = latest.ok_or(Error::Unavailable)?;
     Ok(if !retried && latest > previous {
@@ -1529,10 +1280,7 @@ pub struct AttemptInputs {
     pub failure_links: u8,
 }
 
-/// Reserve the complete permitted route and remote credits before sending.
-/// Lost responses cannot refund an unknown number of forwarded links, and no
-/// retry gets fresh credits. Remote credits stay spent unless a verified
-/// `StaleMembership` shows they were never used (`AcquisitionBudget::refund_remote`).
+/// Reserve the route and remote credits before sending.
 pub fn plan_attempt(budget: &mut AcquisitionBudget, inputs: AttemptInputs) -> Result<AttemptPlan> {
     let links = budget.route_links();
     if links == 0 {
@@ -1604,10 +1352,7 @@ struct HedgeFacts {
     pub remaining_links: u8,
 }
 
-/// Whether to hedge before direct-link availability is checked. Only rank 0 can
-/// serve as hedge primary, and one cold fallback must remain fundable:
-/// primary(2) + duplicate(1) + the second visited owner at rank r
-/// ([`owner_funding_min`]), with links 1 + 1 + 8.
+/// Whether to hedge before direct-link availability is checked.
 fn hedge_eligible(facts: HedgeFacts) -> bool {
     facts.page_operation
         && !facts.is_candidate
@@ -1646,47 +1391,22 @@ pub fn hedge_fallback(error: Error) -> bool {
 #[allow(clippy::disallowed_methods)] // Tests build instants to feed the API.
 mod tests;
 
-// Walking the previous membership when the current one's owners are behind.
-//
-// While a membership version propagates, a requester that already adopted
-// version N asks owners that still hold N - 1. They cannot resolve N and
-// answer `StaleMembership`; with nothing newer to refresh to, the requester
-// skipped them as stale destinations ([`crate::read::walk::stale_action`]), each
-// skip spending the credits that funded the probe. When every owner of a
-// page was behind (for example all of them joined in N), the walk was
-// exhausted and the read failed, although the page's owners under N - 1,
-// which every peer still resolves during the grace window, could serve it
-// (Known issue 19).
-//
-// [`previous_fallback`] decides when a non-owner, at its first stale
-// destination, stops walking N and walks the page's owners under N - 1
-// instead, once, with what is left of the same budget. A destination behind
-// N resolves N - 1, and so does one that adopted N (grace retention), so
-// the second walk does not meet the same skips. Budgets never grow, and the
-// walk under N - 1 must not give this node origin authority:
-// [`fallback_rank_allowed`] ends it when this node owns the page there.
-//
-// A reader that cannot fall back (it joined in N, so it is not a member of
-// N - 1) waits for the destination to adopt N instead, at most
-// [`MAX_STALE_WAITS`] times ([`stale_wait`], Known issues 26 and 36).
+// Stale destinations (Known issues 19, 26, 36). A non-owner whose destination
+// is behind walks the page's owners under N - 1 instead, once
+// ([`previous_fallback`]), unless it owns the page there. A reader that cannot
+// fall back waits for the destination to adopt N ([`stale_wait`]).
 
-/// Most time one wait for a destination that is behind may take
-/// ([`stale_wait`]).
+/// Most time one wait for a destination that is behind may take.
 pub const MAX_STALE_WAIT: Duration = Duration::from_secs(4);
 
-/// Most waits one read makes for destinations that are behind
-/// ([`stale_wait`]). A membership reaches every client within the seats'
-/// write window after a commit (about 5 s at 50,000 clients, Known issue
-/// 36): with a 10 s deadline, two waits (a third, then a third of the rest)
-/// cover 5.5 s and leave the rest for the remaining owners.
+/// Most waits one read makes: a membership reaches every client within about
+/// 5 s (Known issue 36), and two waits of a third cover that.
 pub const MAX_STALE_WAITS: u8 = 2;
 
-/// Shortest wait worth making: below this the destination is unlikely to
-/// have adopted the membership, and the read keeps walking instead.
+/// Shortest wait worth making.
 pub const MIN_STALE_WAIT: Duration = Duration::from_millis(250);
 
-/// Facts about a destination that answered `StaleMembership` because it is
-/// behind this node, for a reader that cannot walk the previous membership.
+/// A destination behind this node, for a reader that cannot fall back.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct StaleWaitFacts {
     /// This node owns the page (owners go on to their own fetch).
@@ -1695,30 +1415,16 @@ struct StaleWaitFacts {
     pub fallback: bool,
     /// Waits this read already made for destinations that are behind.
     pub waits: u8,
-    /// One more exchange with the destination still leaves the walk
-    /// enough attempts for its later visits
-    /// (`crate::read::walk::CandidateWalk::retry_affordable`). Required for every
-    /// wait after the first.
+    /// Asking again leaves later visits funded (required after the first).
     pub affordable: bool,
     /// Time left until the read's deadline.
     pub remaining: Duration,
 }
 
-/// How long a non-owner waits before asking the same destination again,
-/// instead of skipping it, when the destination is behind this node's
-/// membership and the previous membership is no help (Known issue 26).
-///
-/// A reader that joined in membership N is not a member of N - 1, so peers
-/// would reject it there ([`previous_fallback`] refuses), and an owner still
-/// on N - 1 cannot resolve N. Skipping every such owner exhausted the walk
-/// and failed the read, although the owners adopt N within the propagation
-/// window. Waiting a third of the time left (at most [`MAX_STALE_WAIT`],
-/// at most [`MAX_STALE_WAITS`] times per read, never below
-/// [`MIN_STALE_WAIT`]) leaves the rest of the
-/// deadline for the remaining owners. The destination's verified
-/// `StaleMembership` returns the credits it was sent
-/// ([`crate::read::budget::AcquisitionBudget::refund_remote`]), so the second ask
-/// costs one exchange and its links, like any probe; budgets never grow.
+/// How long a non-owner waits before asking a destination that is behind
+/// again: a third of the time left, within [`MIN_STALE_WAIT`] and
+/// [`MAX_STALE_WAIT`], at most [`MAX_STALE_WAITS`] times. The verified
+/// `StaleMembership` refunds the probe's credits, so budgets never grow.
 fn stale_wait(facts: StaleWaitFacts) -> Option<Duration> {
     if facts.owner
         || facts.fallback
@@ -1734,27 +1440,20 @@ fn stale_wait(facts: StaleWaitFacts) -> Option<Duration> {
 /// Facts about a walk under membership N whose destination was behind.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct StaleSkip {
-    /// This node owns the page under N (owners have their own
-    /// previous-membership probes, `WalkConfig::previous` and handoff
-    /// targets, and their origin authority comes from N).
+    /// This node owns the page under N.
     pub owner: bool,
     /// This read already refreshed its membership or fell back once.
     pub retried: bool,
-    /// N - 1 is still resolvable here, was replaced within
-    /// [`crate::read::walk::PREVIOUS_MEMBERSHIP_WITHIN`] (so peers that adopted N
-    /// still hold it), and lists this node (peers reject non-members).
+    /// N - 1 is resolvable here, recent, and lists this node.
     pub previous_recent_member: bool,
 }
 
-/// Whether to walk the page's owners under N - 1 instead of skipping a
-/// destination that is behind.
+/// Whether to walk the page's owners under N - 1 instead of skipping.
 fn previous_fallback(s: StaleSkip) -> bool {
     !s.owner && !s.retried && s.previous_recent_member
 }
 
-/// Whether the fallback walk may proceed with this node at `rank` under
-/// N - 1. A page owner under N - 1 that is not one under N would gain
-/// origin authority it no longer has, so the walk ends instead.
+/// A page owner under N - 1 would gain origin authority it no longer has.
 fn fallback_rank_allowed(rank: Option<usize>) -> bool {
     rank.is_none()
 }
@@ -1899,30 +1598,9 @@ mod stale_tests {
     }
 }
 
-// One read's acquisition: the walk, the stale-membership tree, and the fill
-// plan, as a single sans-IO state machine.
-//
-// [`Fill`] owns every decision of an acquisition after the local tiers
-// missed: which ranking to compute, which targets an owner asks before
-// origin, the candidate walk and its funding, what a peer's answer means,
-// whether to refresh membership, fall back to the previous one, or wait for
-// a destination that is behind, and how the walk's end becomes an origin
-// fetch, a publication, or a failure. The caller performs the I/O each
-// [`Action`] names and feeds the result back as an [`Event`]:
-//
-// ```text
-// let mut event = Event::Start { local_hit };
-// loop {
-//     let (action, evidence) = fill.on(event, &mut budget, now());
-//     apply(evidence);
-//     event = match action { /* perform it */ };
-// }
-// ```
-//
-// Production drives it with async I/O (`src/read/candidates.rs`,
-// `src/read/fill.rs`), the simulator with scheduled events
-// (`sim/src/node/world.rs`). Node identities are `u32`s the caller chooses
-// (production: membership positions; simulator: node numbers).
+// [`Fill`]: one read's acquisition as a sans-IO state machine. Production
+// drives it from `src/read/candidates.rs`, the simulator from
+// `sim/src/node/world.rs`. Node identities are caller-chosen `u32`s.
 
 /// Previous owners that are not current members ([`Ranking::Previous`]).
 pub const NOT_MEMBER: u32 = u32::MAX;
@@ -2310,16 +1988,16 @@ pub struct Fill {
     hedge: bool,
     ranking: Ranking,
     refresh: Refresh,
-    // The walked ranking.
-    version: u64,
-    owners: List<u32, MAX_HANDOFF>,
-    rank: Option<usize>,
+    /// The walked ranking. Public fields are read-only to callers.
+    pub version: u64,
+    pub owners: List<u32, MAX_HANDOFF>,
+    pub rank: Option<usize>,
     order: VisitOrder,
     members: usize,
     lineage: [u8; MAX_HANDOFF],
     lineage_targets: List<u32, MAX_LINEAGE>,
     demoted: List<u32, MAX_LINEAGE>,
-    handoff: List<u32, MAX_TARGETS>,
+    pub handoff: List<u32, MAX_TARGETS>,
     successors: usize,
     granted: usize,
     previous: u8,
@@ -2331,21 +2009,21 @@ pub struct Fill {
     probe: Option<Probe>,
     /// The last answer was signed by its destination.
     signed: bool,
-    // Across epochs.
-    retried: bool,
-    fell_back: bool,
-    fallback_denied: bool,
-    waits: u8,
+    /// Across epochs. `funding`: the last walk could not fund a probe.
+    pub retried: bool,
+    pub fell_back: bool,
+    pub fallback_denied: bool,
+    pub waits: u8,
     waiting: bool,
-    stale: u32,
+    pub stale: u32,
     latest: u64,
-    evidence: Vec<ProbeOutcome>,
+    pub evidence: Vec<ProbeOutcome>,
     origin_rank: usize,
     /// [`Action::Origin`] awaits [`Event::Origin`].
     origin_pending: bool,
     source: Source,
-    funding: bool,
-    remaining_end: Option<RemainingEnd>,
+    pub funding: bool,
+    pub remaining_end: Option<RemainingEnd>,
     out: Evidence,
 }
 
@@ -2446,63 +2124,9 @@ impl Fill {
         }
     }
 
-    /// The walked ranking's membership version, owners, and this node's rank.
-    pub fn version(&self) -> u64 {
-        self.version
-    }
-
-    pub fn owners(&self) -> &[u32] {
-        &self.owners
-    }
-
-    pub fn rank(&self) -> Option<usize> {
-        self.rank
-    }
-
-    pub fn handoff(&self) -> &[u32] {
-        &self.handoff
-    }
-
-    /// Waits this read made for destinations that are behind.
-    pub fn waits(&self) -> u8 {
-        self.waits
-    }
-
-    /// Destinations this walk skipped as behind this node, and whether the
-    /// read refreshed or fell back, is falling back, or may not fall back.
-    pub fn stale(&self) -> u32 {
-        self.stale
-    }
-
-    pub fn retried(&self) -> bool {
-        self.retried
-    }
-
-    pub fn fell_back(&self) -> bool {
-        self.fell_back
-    }
-
-    pub fn fallback_denied(&self) -> bool {
-        self.fallback_denied
-    }
-
-    /// The remaining-copy walk runs, and how it ended.
+    /// The remaining-copy walk runs.
     pub fn remaining(&self) -> bool {
         matches!(self.walk, Walking::Remaining(_))
-    }
-
-    pub fn remaining_end(&self) -> Option<RemainingEnd> {
-        self.remaining_end
-    }
-
-    /// The last walk stopped because a probe could not be funded.
-    pub fn funding_stopped(&self) -> bool {
-        self.funding
-    }
-
-    /// The origin authority's predecessor evidence ([`Action::Origin`]).
-    pub fn origin_evidence(&self) -> &[ProbeOutcome] {
-        &self.evidence
     }
 
     fn page(&self) -> bool {

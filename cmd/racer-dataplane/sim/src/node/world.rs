@@ -2243,7 +2243,7 @@ impl NodeWorld {
                 } => return self.send_granted(id, first, count, remaining_opportunities),
                 Action::Wait(wait) => {
                     let fill = self.fills.get_mut(&id).expect("present");
-                    if fill.core.waits() > 1 {
+                    if fill.core.waits > 1 {
                         // A further wait (Known issue 36).
                         self.metrics.incr("stale_waits_again");
                     }
@@ -2336,7 +2336,7 @@ impl NodeWorld {
                 // Previous owners that are no longer members are not asked.
                 let current = self
                     .versions
-                    .get(fill.core.version())
+                    .get(fill.core.version)
                     .map(|v| v.members.clone());
                 let owners: Vec<u32> = cands
                     .iter()
@@ -2438,8 +2438,8 @@ impl NodeWorld {
         let (node, page, rank, rank0) = (
             fill.node,
             fill.page,
-            fill.core.rank(),
-            fill.core.owners().first().copied(),
+            fill.core.rank,
+            fill.core.owners.first().copied(),
         );
         let instant = self.instant(self.now());
         let hints = if self.config.node.successor_targets
@@ -2479,7 +2479,7 @@ impl NodeWorld {
     fn previous_facts(&self, id: u64) -> (bool, bool) {
         let now = self.now();
         let fill = &self.fills[&id];
-        let (node, version) = (fill.node, fill.core.version());
+        let (node, version) = (fill.node, fill.core.version);
         let member = version
             .checked_sub(1)
             .and_then(|v| self.versions.get(v))
@@ -2552,7 +2552,7 @@ impl NodeWorld {
         if notes & Notes::RANK0_LEFT != 0 {
             // Known issue 52: rank 0's own acquisition failed.
             let fill = &self.fills[&id];
-            let rank0 = fill.core.owners().first().copied();
+            let rank0 = fill.core.owners.first().copied();
             if fill
                 .asked
                 .iter()
@@ -2587,7 +2587,7 @@ impl NodeWorld {
         if !enabled {
             return false;
         }
-        let (a, b) = (fill.core.owners()[first], fill.core.owners()[second]);
+        let (a, b) = (fill.core.owners[first], fill.core.owners[second]);
         let started = eligible && self.direct_available(node, a) && self.direct_available(node, b);
         let reservation = started
             .then(|| {
@@ -2684,8 +2684,8 @@ impl NodeWorld {
             Some(node),
             || format!("hedge plan {} links {} attempts from {before_links} links {before_attempts} attempts", plan.links, plan.remote_attempts),
         );
-        let dest = fill.core.owners()[canonical];
-        let version = self.fills[&id].core.version();
+        let dest = fill.core.owners[canonical];
+        let version = self.fills[&id].core.version;
         let pid = self.launch(
             id,
             dest,
@@ -2722,7 +2722,7 @@ impl NodeWorld {
         if race.launched || race.secondary_done || race.winner.is_some() || race.fatal.is_some() {
             return;
         }
-        let (node, w, dest) = (fill.node, fill.worker, fill.core.owners()[race.second]);
+        let (node, w, dest) = (fill.node, fill.worker, fill.core.owners[race.second]);
         // Recheck the link and local headroom after the delay.
         let quotas = &self.nodes[node as usize].workers[w as usize].quotas;
         let ok = self.direct_available(node, dest) && hedge_pages(quotas, 1).is_ok();
@@ -2890,7 +2890,7 @@ impl NodeWorld {
         for i in first..first + count {
             let kind = self.handoff_kind(id, i).unwrap_or("successor");
             let fill = self.fills.get_mut(&id).expect("present");
-            let dest = fill.core.handoff()[i];
+            let dest = fill.core.handoff[i];
             let scope = fill.scope.min(fill.budget.deadline());
             let mut grant = granted_budget(fill.budget.deadline());
             let (before_attempts, before_links) =
@@ -2927,7 +2927,7 @@ impl NodeWorld {
                     )
                 },
             );
-            let version = fill.core.version();
+            let version = fill.core.version;
             let index = fill.batch.len();
             fill.batch.push(BatchProbe {
                 pid: 0,
@@ -3013,7 +3013,7 @@ impl NodeWorld {
         let instant = self.instant(now);
         let attempt_timeout = Duration::from_nanos(self.config.node.attempt_timeout_ns);
         let fill = &self.fills[&id];
-        let owners = fill.core.owners().len();
+        let owners = fill.core.owners.len();
         let dest = match fill.core.dest(&probe) {
             Some(dest) => {
                 if let Some(i) = probe.canonical.checked_sub(owners) {
@@ -3035,8 +3035,8 @@ impl NodeWorld {
         // Peer exchanges stay within the leader's own budget deadline
         // (`src/read/candidates.rs`, `scope.deadline.0.min(budget.deadline())`).
         let scope = fill.scope.min(fill.budget.deadline());
-        let rank = fill.core.rank();
-        let version = fill.core.version() - u64::from(probe.previous);
+        let rank = fill.core.rank;
+        let version = fill.core.version - u64::from(probe.previous);
         let budget = fill.core.request_budget(&mut fill.budget);
         let (before_attempts, before_links) =
             (budget.remaining_attempts(), budget.remaining_links());
@@ -3703,7 +3703,7 @@ impl NodeWorld {
     fn fanout_helper(&self, id: u64) -> Option<u32> {
         let fill = &self.fills[&id];
         let (node, page) = (fill.node, fill.page);
-        let members = &self.versions.get(fill.core.version())?.members;
+        let members = &self.versions.get(fill.core.version)?.members;
         let me = position(members, node);
         let at = |p: usize| members.members()[p].node;
         fanout_helper(
@@ -3711,7 +3711,7 @@ impl NodeWorld {
             self.ids.number(page),
             self.ids.node(node),
             members.members().len(),
-            |p| at(p) == node || fill.core.owners().contains(&at(p)),
+            |p| at(p) == node || fill.core.owners.contains(&at(p)),
             |p| me.is_some_and(|me| members.is_neighbor(me, p)),
         )
         .map(at)
@@ -4303,7 +4303,7 @@ impl NodeWorld {
         {
             // Production `CandidatePolicy::apply` (Known issue 39).
             let (node, page, deadline) = (fill.node, fill.page, fill.budget.deadline());
-            let rank0 = fill.core.owners()[0];
+            let rank0 = fill.core.owners[0];
             let instant = self.instant(self.now());
             let watch = &mut self.nodes[node as usize].rank0;
             match note {
@@ -4378,7 +4378,7 @@ impl NodeWorld {
     fn origin_authority(&mut self, id: u64, rank: usize) -> Result<(), Error> {
         let now = self.now();
         let fill = &self.fills[&id];
-        let (node, page, version) = (fill.node, fill.page, fill.core.version());
+        let (node, page, version) = (fill.node, fill.page, fill.core.version);
         let members = self
             .versions
             .get(version)
@@ -4391,19 +4391,19 @@ impl NodeWorld {
                 object: &object,
                 page: number,
                 rank,
-                predecessor_evidence: fill.core.origin_evidence().len(),
+                predecessor_evidence: fill.core.evidence.len(),
                 member: position(&members, node).is_some(),
             },
             &object,
             number,
         );
-        let owner = fill.core.owners().get(rank) == Some(&node);
+        let owner = fill.core.owners.get(rank) == Some(&node);
         let ok = owner && authority.is_ok();
         self.invariants
             .check("only_owner_hits_origin", ok, now, Some(node), || {
                 format!(
                     "page {page} rank {rank} owners {:?} authority {authority:?}",
-                    self.fills[&id].core.owners()
+                    self.fills[&id].core.owners
                 )
             });
         if !ok {
@@ -4580,7 +4580,7 @@ impl NodeWorld {
         let fill = &self.fills[&id];
         let Some(members) = self
             .versions
-            .get(fill.core.version())
+            .get(fill.core.version)
             .map(|v| v.members.clone())
         else {
             return "moved_unasked_holder_rank_unknown";
@@ -4642,11 +4642,11 @@ impl NodeWorld {
         let now = self.now();
         let fill = &self.fills[&id];
         let (node, page) = (fill.node, fill.page);
-        let rank0 = fill.core.owners().first().copied().unwrap_or(node);
+        let rank0 = fill.core.owners.first().copied().unwrap_or(node);
         // An owner above rank 0 reaches origin only with transient evidence
         // against rank 0: record why rank 0 did not serve (the last probe of
         // rank 0 decides).
-        let skip = (fill.core.rank().is_some_and(|r| r > 0)).then(|| {
+        let skip = (fill.core.rank.is_some_and(|r| r > 0)).then(|| {
             let last = fill
                 .asked
                 .iter()
@@ -4679,7 +4679,7 @@ impl NodeWorld {
             ok: None,
             done: now,
             skip,
-            version: fill.core.version(),
+            version: fill.core.version,
         };
         let Some(last) = self.last_origin.insert(page, next) else {
             return;
@@ -4714,19 +4714,18 @@ impl NodeWorld {
                     Asked::Busy => "origin_repeats_after_move_held_asked_busy",
                     Asked::Unfunded => "origin_repeats_after_move_held_asked_unfunded",
                 }
-            } else if fill.core.version() == last.version + 1
-                && fill.core.handoff().contains(&last.node)
+            } else if fill.core.version == last.version + 1
+                && fill.core.handoff.contains(&last.node)
             {
                 "origin_repeats_after_move_held_unasked_target"
-            } else if fill.core.version() == last.version + 1
-                && fill.core.owners().contains(&last.node)
+            } else if fill.core.version == last.version + 1 && fill.core.owners.contains(&last.node)
             {
                 "origin_repeats_after_move_held_unasked_owner"
-            } else if fill.core.version() == last.version {
+            } else if fill.core.version == last.version {
                 "origin_repeats_after_move_held_unasked_same"
-            } else if fill.core.version() > last.version + 2 {
+            } else if fill.core.version > last.version + 2 {
                 "origin_repeats_after_move_held_unasked_older"
-            } else if fill.core.version() == last.version + 2 {
+            } else if fill.core.version == last.version + 2 {
                 "origin_repeats_after_move_held_unasked_two"
             } else {
                 "origin_repeats_after_move_held_unasked"
@@ -4797,7 +4796,7 @@ impl NodeWorld {
                 // owner's rank is still scheduled (not yet due, or held by
                 // a cut); `noted`: this owner knew of the holder; `other`:
                 // none of these.
-                let index = fill.core.owners().iter().position(|c| *c == node);
+                let index = fill.core.owners.iter().position(|c| *c == node);
                 let pending = index.is_some_and(|i| {
                     self.nodes[last.node as usize]
                         .notices
@@ -4905,14 +4904,14 @@ impl NodeWorld {
         let (node, page) = (fill.node, fill.page);
         let ok = result.is_ok();
         let failed = matches!(result, Err(Error::Unavailable));
-        let notice = ok && should_notice(fill.core.rank());
+        let notice = ok && should_notice(fill.core.rank);
         // The walk's predecessor evidence in rank order (the last answer of
         // each predecessor; production `OriginAuthority`).
         let evidence: Vec<ProbeOutcome> = fill
             .core
-            .owners()
+            .owners
             .iter()
-            .take(fill.core.rank().unwrap_or(0))
+            .take(fill.core.rank.unwrap_or(0))
             .map(|c| {
                 match fill
                     .asked
@@ -4926,9 +4925,9 @@ impl NodeWorld {
                 }
             })
             .collect();
-        let targets: Vec<(u8, u32)> = notice_indexes(fill.core.rank(), &evidence)
+        let targets: Vec<(u8, u32)> = notice_indexes(fill.core.rank, &evidence)
             .into_iter()
-            .filter_map(|i| fill.core.owners().get(usize::from(i)).map(|t| (i, *t)))
+            .filter_map(|i| fill.core.owners.get(usize::from(i)).map(|t| (i, *t)))
             .collect();
         if failed {
             self.note_origin_failure(id);
@@ -4955,8 +4954,7 @@ impl NodeWorld {
             return;
         }
         let fill = &self.fills[&id];
-        let (Some(rank), Some(rank0)) = (fill.core.rank(), fill.core.owners().first().copied())
-        else {
+        let (Some(rank), Some(rank0)) = (fill.core.rank, fill.core.owners.first().copied()) else {
             return;
         };
         if rank == 0 {
@@ -5298,22 +5296,22 @@ impl NodeWorld {
             .iter()
             .map(|(d, a)| format!("{}:{a:?}", state(*d)))
             .collect();
-        let cands: Vec<String> = fill.core.owners().iter().map(|c| state(*c)).collect();
+        let cands: Vec<String> = fill.core.owners.iter().map(|c| state(*c)).collect();
         format!(
             "fill@{}..{} err {e:?} self {} v{} rank {:?} cands {cands:?} handoff {:?} asked {asked:?} outcomes {:?} \
              stale {} waits {} fell_back {} denied {} retried {} attempts_left {} deadline_in {:?} canceled {}",
             fill.started,
             now,
             state(fill.node),
-            fill.core.version(),
-            fill.core.rank(),
-            fill.core.handoff(),
+            fill.core.version,
+            fill.core.rank,
+            &*fill.core.handoff,
             fill.outcomes,
-            fill.core.stale(),
-            fill.core.waits(),
-            fill.core.fell_back(),
-            fill.core.fallback_denied(),
-            fill.core.retried(),
+            fill.core.stale,
+            fill.core.waits,
+            fill.core.fell_back,
+            fill.core.fallback_denied,
+            fill.core.retried,
             fill.budget.remaining_attempts(),
             fill.budget
                 .deadline()
