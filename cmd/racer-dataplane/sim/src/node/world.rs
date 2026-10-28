@@ -80,12 +80,15 @@ use super::ids::Ids;
 use super::membership::{Members, Versions, position};
 use super::state::{Components, Disk, Node, Shared, record_bytes};
 use crate::config::Config;
+use crate::engine::Fixed;
 use crate::engine::{Engine, MILLIS, Nanos, Role, SECONDS, Streams, mix};
 use crate::faults::{Fault as SimFault, Partitions, origin_errors_at};
 use crate::report::{Invariants, Metrics, peak_rss_bytes};
 use crate::resources::{Fabric, Origin, OriginHandle, OriginOutcome};
-use crate::scenario::{Fixed, MAX_ATTEMPTS};
 use crate::workload::{Poisson, Reads, page_id};
+
+/// Maximum read attempts before a read fails.
+const MAX_ATTEMPTS: u8 = 4;
 
 /// Where a resolved page came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -17,7 +17,7 @@ use topology::{MAX_DEGREE, Paths, Phantom, Placement, SharedRoutes};
 
 use super::admission::{PageCharges, Rejections, SimPolicy, SimQuotas};
 use super::config::NodeConfig;
-use crate::scenario::Fixed;
+use crate::engine::Fixed;
 use flow_control::coalesce::flight::state::Published;
 
 /// Flight results carry the published page length.

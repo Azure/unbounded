@@ -81,9 +81,9 @@ pub struct Config {
     pub range_fraction: f64,
     /// Pages per range read.
     pub range_pages: u32,
-    /// Stand-in memory tier capacity, pages per node.
+    /// Memory tier capacity, pages per node.
     pub memory_pages: u32,
-    /// Stand-in disk tier capacity, pages per node.
+    /// Disk tier capacity, pages per node.
     pub disk_pages: u32,
     /// Hop budget for peer requests (links).
     pub hop_limit: u8,

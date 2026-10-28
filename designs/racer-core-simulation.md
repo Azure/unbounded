@@ -956,15 +956,8 @@ Verified against the code at the start of this work.
   crash/restart (disk survives), slow nodes, origin error windows; every knob overridable with `--config`.
 - `report`: fixed-memory log-bucket histograms, counters, `Invariants` (named checks, capped violation log,
   relaxed invariants with a reason), `MemoryUsage::approximate_bytes`, peak RSS from `VmHWM`.
-- `logic::NodeLogic`: owner, route, tier lookup/insert and crash hooks. `StandIn` (hash ownership,
-  direct or one-relay routes, direct-mapped tiers) is a placeholder; the module docs list where phantom
-  `Placement`, `Paths`, memory LRU and `SegmentClock` plug in. `scenario::World` holds the fixed caches-only
-  read flow (owner fetch with per-page singleflight) that the `racer-core` walk and fill plan replace.
-
-With the stand-ins, a 2 s caches-only run at 50,000 nodes processes about 6M events in about 8 s (release)
-with 180 MiB peak RSS; the empty substrate accounts about 2.6 KiB per node. The stand-in owner check re-ranks
-at the owner and retries when membership changed in flight, so `only_owner_hits_origin` holds by
-construction until real placement replaces it.
+- The first stand-in world (hash ownership, direct-mapped tiers, a fixed owner-fetch flow) served as a
+  substrate baseline and was removed once every scenario ran the real `racer-core` read path.
 
 ## Cache track (phases 4 and 5)
 
@@ -1168,8 +1161,7 @@ model state is 135 MB, mostly the model's inventory and image.
 
 ## Node integration
 
-`racer-sim` now runs the real read path for every scenario except `standin` (the old stand-in world,
-kept for substrate comparisons). Code: `cmd/racer-dataplane/sim/src/node/`.
+`racer-sim` runs the real read path for every scenario. Code: `cmd/racer-dataplane/sim/src/node/`.
 
 Per node, with 2 workers:
 

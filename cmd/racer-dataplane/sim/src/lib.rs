@@ -12,22 +12,16 @@
 //!   partitions, crashes, slow nodes, origin errors.
 //! - [`report`]: histograms, counters, invariants, memory accounting.
 //! - [`node`]: real node logic (placement, routes, walk, flights, fill,
-//!   serve, caches, admission) driven by events; every scenario except
-//!   `standin` runs it.
-//! - [`logic`] and [`scenario`]: the original stand-in world (hash
-//!   ownership, direct-mapped caches), kept as the `standin` scenario for
-//!   substrate comparisons.
+//!   serve, caches, admission) driven by events; every scenario runs it.
 
 pub mod combined;
 pub mod config;
 pub mod control;
 pub mod engine;
 pub mod faults;
-pub mod logic;
 pub mod node;
 pub mod report;
 pub mod resources;
-pub mod scenario;
 pub mod workload;
 
 use serde_json::Value;
@@ -35,14 +29,12 @@ use serde_json::Value;
 use crate::config::Config;
 use crate::engine::{MILLIS, Nanos, Role, SECONDS, Streams};
 use crate::faults::Fault;
-use crate::logic::StandIn;
 use crate::node::NodeWorld;
-use crate::scenario::World;
 use crate::workload::{Churn, Storm};
 
 pub const USAGE: &str = "usage: racer-sim [--scenario NAME] [--nodes N] [--seed S] \
 [--duration D] [--config FILE.json] [--out PATH]\n\
-scenarios: smoke, caches-only, zipf, storm, churn, faults, empty, standin,\n\
+scenarios: smoke, caches-only, zipf, storm, churn, faults, empty,\n\
            enrollment-storm, failover, ctl-churn, lagging,\n\
            full-cold-start, full-failover, full-churn, full-lagging\n\
 durations: integer with ns, us, ms or s suffix (plain numbers are seconds)";
@@ -55,7 +47,6 @@ pub const SCENARIOS: &[&str] = &[
     "churn",
     "faults",
     "empty",
-    "standin",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -246,20 +237,12 @@ fn scenario_schedules(scenario: &str, config: &mut Config, seed: u64) {
     }
 }
 
-/// Build the stand-in world for `options` without running it.
-pub fn build(options: &Options) -> Result<World<StandIn>, String> {
-    let config = options.build_config()?;
-    let logic = StandIn::new(config.nodes, config.memory_pages, config.disk_pages);
-    Ok(World::new(config, options.seed, logic))
-}
-
 /// Build the real-logic world for `options` without running it.
 pub fn build_node(options: &Options) -> Result<NodeWorld, String> {
     Ok(NodeWorld::new(options.build_config()?, options.seed))
 }
 
-/// Run a scenario and return its JSON report. `standin` runs the stand-in
-/// world; every other scenario runs real node logic.
+/// Run a scenario and return its JSON report.
 pub fn run(options: &Options) -> Result<Value, String> {
     if control::SCENARIOS.contains(&options.scenario.as_str()) {
         return run_control(options);
@@ -280,17 +263,10 @@ pub fn run(options: &Options) -> Result<Value, String> {
     }
     #[allow(clippy::disallowed_methods)] // Wall time is reported, never simulated.
     let started = std::time::Instant::now();
-    let mut report = if options.scenario == "standin" {
-        let mut world = build(options)?;
-        let end = world.config.duration_ns;
-        world.run(end);
-        world.report(&options.scenario, options.seed)
-    } else {
-        let mut world = build_node(options)?;
-        let end = world.config.duration_ns;
-        world.run(end);
-        world.report(&options.scenario, options.seed)
-    };
+    let mut world = build_node(options)?;
+    let end = world.config.duration_ns;
+    world.run(end);
+    let mut report = world.report(&options.scenario, options.seed);
     report["wall_ms"] = serde_json::json!(started.elapsed().as_millis() as u64);
     Ok(report)
 }

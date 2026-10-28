@@ -23,7 +23,7 @@ use racer_object_wire::model::PageId;
 
 use super::config::NodeConfig;
 use super::ids::{CACHE, Ids};
-use crate::scenario::Fixed;
+use crate::engine::Fixed;
 
 pub use racer_core::admission::ResourceClass;
 use racer_core::admission::{Floors, Limits, Rules};

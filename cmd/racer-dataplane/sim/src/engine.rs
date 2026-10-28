@@ -19,6 +19,9 @@ pub const MICROS: Nanos = 1_000;
 pub const MILLIS: Nanos = 1_000_000;
 pub const SECONDS: Nanos = 1_000_000_000;
 
+/// Deterministic hasher for simulator maps (fixed-key SipHash).
+pub type Fixed = std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>;
+
 struct Entry<E> {
     at: Nanos,
     seq: u64,
