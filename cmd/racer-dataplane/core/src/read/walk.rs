@@ -704,14 +704,11 @@ impl CandidateWalk {
                     previous: false,
                 }));
             }
-            // Credits the delegation must leave: one per later predecessor
-            // probe and one for this owner's own origin attempt. Handoff
-            // probes are opportunistic and never reserve credits, so they
-            // cannot turn a delegation into a local fetch (Known issue 13).
+            // The delegation leaves one credit per later predecessor and one
+            // for this owner's origin; handoff probes reserve none (Known
+            // issue 13).
             let left = rank.map_or(0, |rank| rank.min(2).saturating_sub(index)) as u32;
             if handoff && (budget.remaining_attempts() < 2 || budget.remaining_links() == 0) {
-                // Handoff probes are opportunistic: never spend the credit
-                // the owner's own origin attempt needs.
                 break;
             }
             // A predecessor that held the same rank under the previous
@@ -721,12 +718,9 @@ impl CandidateWalk {
                 && self.config.page_operation
                 && canonical < 8
                 && self.config.previous & (1 << canonical) != 0;
-            // An owner above rank 0 asks rank 0 to acquire, so one owner per
-            // membership fetches a cold page and concurrent misses coalesce in
-            // rank 0's flight. The Acquire costs two credits (the exchange and
-            // rank 0's origin credit); the owner keeps one per later probe
-            // and one for its own origin attempt if rank 0 fails
-            // ([`owner_funding`] provides them).
+            // An owner above rank 0 asks rank 0 to acquire, so concurrent
+            // misses coalesce in rank 0's flight; it costs the exchange plus
+            // rank 0's origin credit ([`owner_funding`]).
             let delegated = rank.is_some_and(|rank| rank > 0)
                 && canonical == 0
                 && self.config.page_operation
@@ -754,14 +748,8 @@ impl CandidateWalk {
                 Mode::Acquire
             };
             let count = self.count;
-            // When this owner sees an ownership change (it has handoff
-            // targets), rank 0 has previous owners to ask too, but an
-            // Acquire that carries only its origin credit leaves rank 0
-            // none to ask them with (Known issue 13). Forward spare credits,
-            // up to one per previous owner: they would otherwise fund this
-            // owner's own handoff probes, which only run if rank 0 fails.
-            // Rank 0's own lineage targets (Known issue 25) are funded the
-            // same way.
+            // A delegating owner with handoff or lineage targets forwards
+            // spare credits so rank 0 can ask them too (Known issues 13, 25).
             let spare_for = if self.config.handoff > 0 {
                 MAX_HANDOFF as u32
             } else {
@@ -773,10 +761,8 @@ impl CandidateWalk {
                 0
             };
             let owner_attempts = 1 + u32::from(delegated) + spare;
-            // Probes that share the owner's inherited links with this one:
-            // the remaining predecessors, or the remaining handoff targets.
-            // Opportunistic handoff probes never shrink a predecessor's
-            // route; they get whatever links the predecessors left.
+            // Probes sharing the owner's inherited links; handoff probes take
+            // what the predecessors left.
             let sharing = if handoff {
                 1
             } else {
@@ -785,14 +771,9 @@ impl CandidateWalk {
                     .max(1)
             };
             let bounded = if delegated {
-                // The exchange and rank 0's origin credit: a funded route
-                // forwards all of it, and this owner keeps what later probes
-                // and its own origin attempt need. The delegation decides
-                // whether rank 0 fetches for everyone, so its route comes
-                // first: later copy-only predecessors (which matter only if
-                // rank 0 fails) keep one link each, not an equal share
-                // (an equal share left rank 2 too few links to reach rank 0
-                // and made it fetch itself; Known issue 13).
+                // The delegation decides whether rank 0 fetches for everyone,
+                // so its route comes first; later predecessors keep one link
+                // each (Known issue 13).
                 let links = budget
                     .route_links()
                     .min(budget.remaining_links().saturating_sub(sharing as u8 - 1))
@@ -807,13 +788,9 @@ impl CandidateWalk {
                 // eight-link envelope selected failure routing.
                 let remaining = sharing as u8;
                 let links = if canonical == 0 && !handoff && self.config.page_operation {
-                    // A copy-only probe of rank 0 decides, like a
-                    // delegation, whether this owner leaves the fetch to
-                    // rank 0 (which joins it to its running acquisition,
-                    // Known issue 31): later predecessors keep one link each.
-                    // An equal share left rank 2 too few links to route to
-                    // rank 0, and a route failure gives origin authority
-                    // (Known issue 40).
+                    // Like a delegation, this decides whether rank 0 fetches;
+                    // later predecessors keep one link each (Known issues 31,
+                    // 40).
                     budget
                         .route_links()
                         .min(budget.remaining_links().saturating_sub(remaining - 1))
@@ -831,15 +808,10 @@ impl CandidateWalk {
                     && budget.remaining_attempts() >= owner_funding_min(canonical)
                     && funded_links(budget).is_some())
             {
-                // Fund by the destination's canonical rank: it probes all of its
-                // predecessors, wherever it falls in this visit.
-                // Prefer the funding that lets the owner delegate to rank 0,
-                // but only from slack: later visits keep the credits they had
-                // before delegation, so the walk's reach does not shrink.
-                // One more credit per lineage target of the destination and,
-                // above rank 0, of rank 0, which the destination delegates
-                // to and forwards spare credits for (Known issue 25); only
-                // from slack as well.
+                // Fund by the destination's canonical rank, preferring the
+                // funding that lets it delegate (plus lineage credits), but
+                // only from slack so later visits keep their credits (Known
+                // issue 25).
                 let lineage = self
                     .config
                     .lineage
@@ -1608,9 +1580,8 @@ pub const NOT_MEMBER: u32 = u32::MAX;
 /// Members ranked just below the owners ([`Ranked::demoted`]).
 pub const DEMOTED: usize = topology::RETAINED_DEPTH - topology::REPLICAS;
 
-/// Optional rules. Production runs [`Features::PRODUCTION`]; the simulator
-/// switches rules off to measure them, and keeps a few temporary `SIM_*`
-/// bits where it still differs from production.
+/// Optional rules: production runs [`Features::PRODUCTION`]; `SIM_*` bits
+/// mark where the simulator still differs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Features {
     bits: u32,
@@ -1704,23 +1675,17 @@ pub enum Ranking {
     /// The membership this read walks: the caller's own (`version: None`),
     /// or the newer one a refresh adopted.
     Current,
-    /// An owner's version - 1 ranking, for handoff targets and predecessors
-    /// asked under it. Owners that are not current members are
-    /// [`NOT_MEMBER`]; [`Ranked::recent_member`] says whether the caller
-    /// replaced that membership within [`PREVIOUS_MEMBERSHIP_WITHIN`] and is
-    /// a member of it.
+    /// The version - 1 ranking, for handoff targets and predecessors.
+    /// Non-member owners are [`NOT_MEMBER`].
     Previous,
-    /// The previous membership a non-owner walks instead when the current
-    /// one's destination is behind (Known issue 19).
+    /// The previous membership a non-owner walks when a destination is behind.
     Fallback,
-    /// The walk's own ranking again, before origin: only a ranked owner may
-    /// fetch.
+    /// The walk's ranking again before origin: only a ranked owner fetches.
     Authority,
 }
 
-/// One ranking of the page under membership `version` ([`Event::Ranked`]).
-/// The caller computes what needs its membership: arrivals, the visit
-/// order, and the members ranked just below the owners.
+/// One ranking of the page under `version`; the caller computes what needs
+/// its membership.
 #[derive(Clone, Copy, Debug)]
 pub struct Ranked {
     pub version: u64,
@@ -1770,9 +1735,8 @@ pub enum HedgeEnd {
     NotStarted,
     /// A contender returned a validated page.
     Won,
-    /// Neither won. `primary` is the primary's own outcome, `stale` whether
-    /// a contender answered `StaleMembership`, `error` the race's terminal
-    /// error, if any.
+    /// Neither won: whether a contender was stale, the primary's outcome,
+    /// and the terminal error, if any.
     Lost {
         stale: bool,
         primary: Option<ProbeOutcome>,
@@ -1789,9 +1753,8 @@ pub enum Reply {
     /// Sent, but unanswered within the attempt's own time bound while the
     /// request's scope still runs.
     TimedOut,
-    /// The exchange failed without a response. `sent` is false when it
-    /// never left this node (the probe could not be planned); `scope_live`
-    /// when the request's own scope still runs.
+    /// Failed without a response; `sent` is false when it never left this
+    /// node.
     Failed {
         error: Error,
         sent: bool,
@@ -1828,9 +1791,8 @@ pub enum Event<'a> {
     },
     /// [`Action::Wait`] elapsed.
     Timer,
-    /// [`Action::Refresh`]: the newest membership this node adopted, and
-    /// whether its predecessor is still resolvable by peers, was replaced
-    /// within [`PREVIOUS_MEMBERSHIP_WITHIN`], and lists this node.
+    /// [`Action::Refresh`]: the newest adopted membership, and whether
+    /// version - 1 is recent and lists this node.
     Membership {
         latest: Option<u64>,
         previous_recent_member: bool,
@@ -1852,9 +1814,7 @@ pub enum Action {
     },
     /// Answer [`Event::Hints`].
     Hints,
-    /// Race a hedge if enabled, `eligible`, and admitted: the primary is
-    /// canonical owner `first`, the duplicate `second`; answer
-    /// [`Event::Hedge`].
+    /// Race a hedge if enabled, `eligible`, and admitted.
     Hedge {
         eligible: bool,
         first: usize,
@@ -1862,15 +1822,13 @@ pub enum Action {
     },
     /// Report the newest adopted membership; answer [`Event::Membership`].
     Refresh,
-    /// Send this probe to [`Fill::dest`] (the helper when `None`) with
-    /// [`Fill::request_budget`]; answer [`Event::Reply`] or
-    /// [`Event::NoHelper`].
+    /// Send to [`Fill::dest`] (the helper when `None`) with
+    /// [`Fill::request_budget`].
     Probe(Probe),
     /// Validate the payload of the last answer; answer [`Event::Validated`].
     Validate,
-    /// Send copy-only probes to handoff targets `first..first + count` at
-    /// once, each on its own [`granted_budget`]; answer
-    /// [`Event::BatchDone`].
+    /// Send copy-only probes to handoff targets `first..first + count`, each
+    /// on its own [`granted_budget`].
     Batch {
         first: usize,
         count: usize,
@@ -2217,10 +2175,8 @@ impl Fill {
                             bounded_routes: true,
                         };
                         if stale {
-                            // A stale hedge refreshes to a newer membership when
-                            // one is available. Otherwise the stale contender is
-                            // behind this node (Known issue 3): walk this epoch's
-                            // owners with bounded routes.
+                            // Refresh, or walk this epoch with bounded routes
+                            // (Known issue 3).
                             self.refresh = Refresh::Hedge;
                             return Ok(Action::Refresh);
                         }
@@ -2301,10 +2257,8 @@ impl Fill {
         } else {
             ranked.order
         };
-        // Arrival order of the page's owners in this node's membership
-        // chain: an owner may ask later owners that arrived before it, which
-        // it may have displaced however many versions ago (Known issue 25),
-        // and readers and delegations fund those probes.
+        // Owners may ask later owners that arrived before them (Known issue
+        // 25).
         self.lineage = if !page
             || (self.has(Features::LINEAGE_GRANTS) && !self.has(Features::LINEAGE_SLACK))
         {
@@ -2312,11 +2266,8 @@ impl Fill {
         } else {
             lineage_counts(since)
         };
-        // Lineage targets: later owners that arrived before this owner, then
-        // members ranked just below the owners that were owners when they
-        // arrived (Known issue 34). All are asked on their own grant, so a
-        // rank 0 reached by a delegation with one credit asks them too
-        // (Known issue 35).
+        // Later owners that arrived earlier, then demoted members that were
+        // owners when they arrived (Known issues 34, 35).
         self.lineage_targets = List::default();
         self.demoted = List::default();
         if let (Some(rank), true) = (ranked.rank, page) {
@@ -2361,9 +2312,8 @@ impl Fill {
         if !self.hedge {
             return self.start_walk(budget);
         }
-        // The hedge primary and duplicate are the first two owners in the
-        // visit order the walk uses, so `primary_consumed` skips exactly the
-        // owner the hedge already asked.
+        // The hedge asks the walk's first two owners, so `primary_consumed`
+        // skips exactly that owner.
         let (first, second) = (
             self.order.get(0).unwrap_or(0),
             self.order.get(1).unwrap_or(0),
@@ -2476,10 +2426,8 @@ impl Fill {
                         self.out.outcome = Some(Err(Error::IncompatibleMembership));
                         return Err(Error::IncompatibleMembership);
                     }
-                    // A stale handoff target is only a miss, and a
-                    // predecessor asked under the previous membership no
-                    // longer resolves it: neither refreshes this walk's
-                    // membership.
+                    // A handoff target or a predecessor asked under the
+                    // previous membership never refreshes.
                     ResponseKind::StaleMembership if no_refresh => Outcome::StaleMembership,
                     ResponseKind::StaleMembership => {
                         self.refresh = if remaining {
@@ -2516,11 +2464,8 @@ impl Fill {
                     },
                 }
             }
-            // Sent but unanswered within the attempt: an owner does not take
-            // origin authority from rank 0 for this. A probe of the page's
-            // rank 0 (an owner's, or a reader's) asks whether rank 0 answers
-            // at all (Known issue 43); any other timeout only demotes the
-            // destination in this node's visit order (Known issue 41).
+            // Unanswered: a probe of rank 0 asks a ping (Known issue 43);
+            // others only demote the destination (Known issue 41).
             Reply::TimedOut => {
                 if page {
                     let rank0 = self.out.rank0_probe
@@ -2567,9 +2512,8 @@ impl Fill {
         self.complete(outcome, budget)
     }
 
-    /// Report what the outstanding probe asked; whether a `StaleMembership`
-    /// answer to it must not refresh membership (a handoff target, or a
-    /// predecessor asked under the previous membership).
+    /// Note what the outstanding probe asked; true when a `StaleMembership`
+    /// answer must not refresh.
     fn pending(&mut self) -> bool {
         match &self.walk {
             Walking::Candidates(walk) => {
@@ -2649,10 +2593,8 @@ impl Fill {
         budget: &mut AcquisitionBudget,
         now: Instant,
     ) -> Result<Action> {
-        // Each epoch walk refreshes at most once, and only to a strictly
-        // newer membership; otherwise the stale destination is skipped like
-        // an unreachable one, so a requester that adopted a publication
-        // before its destination still reaches the other owners.
+        // Refresh at most once, to a strictly newer membership; otherwise
+        // skip the destination like an unreachable one.
         let action = match stale_action(self.retried, self.version, latest) {
             Ok(action) => action,
             Err(error) => {
@@ -2680,12 +2622,9 @@ impl Fill {
             }
             (Refresh::Probe, StaleAction::Skip) => {
                 let owner = self.rank.is_some();
-                // A non-owner that recently replaced the previous membership
-                // walks the page's owners under it instead, once (Known issue
-                // 19). It ranks the page there before deciding: a node that
-                // owns it there may not walk it (that would give it origin
-                // authority), and must not lose the wait it would otherwise
-                // have had for this destination (Known issue 36).
+                // Fall back to version - 1 once (Known issue 19), ranking it
+                // first: a node that owns the page there may not walk it, and
+                // keeps its wait (Known issue 36).
                 if self.has(Features::STALE_FALLBACK)
                     && !self.fallback_denied
                     && previous_fallback(StaleSkip {
