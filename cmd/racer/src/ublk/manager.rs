@@ -531,15 +531,25 @@ impl Manager {
         }
     }
 
-    /// Run `body`, even if it panics, then mark the control thread done and
-    /// [`settle`](Manager::settle) with `reopen`.
+    /// Run `body`, even if it panics, then [`settle`](Manager::settle) with
+    /// `reopen` and mark the control thread done.
     pub(super) fn run_guarded(&self, body: impl FnOnce(&Self), reopen: &mut Reopen<'_>) -> bool {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(self)));
         if outcome.is_err() {
             log(None, "control", "state=panicked");
         }
+        // Workers keep serving until settle returns: STOP_DEV waits for every
+        // request the kernel hands out, and a worker that saw the control
+        // thread done could finish its drain and stop answering them.
+        // Marking every device stopping refuses late queue claims meanwhile.
+        self.update(|shared| {
+            for device in &mut shared.devices {
+                device.stopping = true;
+            }
+        });
+        let settled = self.settle(reopen);
         self.finish();
-        self.settle(reopen)
+        settled
     }
 
     /// Make sure no attached queue still waits on the kernel once the
@@ -1880,6 +1890,39 @@ mod tests {
         assert!(manager.control_done(), "a panic still marks the loop done");
         assert!(view(&manager, 0).abandon, "workers stop serving reads");
         assert_eq!(fake.ops(), ["reopen".to_string(), format!("stop {DEV_ID}")]);
+    }
+
+    #[test]
+    fn workers_keep_serving_while_settling() {
+        let fake = Fake::default();
+        let manager = started_with_stuck_queue(&fake);
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let (runner, seen, reopen_fake) = (manager.clone(), observed.clone(), fake.clone());
+        let thread = std::thread::spawn(move || {
+            let inner = runner.clone();
+            runner.run_guarded(
+                |manager| {
+                    manager.update(|shared| {
+                        shared.devices[0].attach = Some(Attach {
+                            dev_id: DEV_ID,
+                            depth: 4,
+                            max_io_bytes: 1 << 20,
+                            length: 1000,
+                        });
+                        shared.devices[0].queues[0] = QueueReport::Attached;
+                    });
+                    panic!("injected control panic");
+                },
+                &mut || {
+                    // STOP_DEV waits on requests only workers can answer.
+                    *seen.lock().unwrap() = Some((inner.control_done(), inner.claim_queue(0, 0)));
+                    Ok(Box::new(reopen_fake.clone()))
+                },
+            )
+        });
+        assert!(thread.join().unwrap());
+        assert_eq!(*observed.lock().unwrap(), Some((false, false)));
+        assert!(manager.control_done());
     }
 
     #[test]
