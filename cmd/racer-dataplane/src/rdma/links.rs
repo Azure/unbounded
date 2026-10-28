@@ -98,6 +98,12 @@ pub struct LinkNode {
     /// in GPU memory (GPUDirect RDMA).
     gpu_landing: Mutex<Option<(Arc<crate::gpu::GpuHelper>, u64)>>,
 
+    /// Landing was configured after the current rails attached theirs, so
+    /// the owner must attach landings on the rails already active. Set and
+    /// cleared under the `gpu_landing` lock, so an activation that reads the
+    /// new configuration consumes it and rails never attach twice.
+    landing_pending: std::sync::atomic::AtomicBool,
+
     /// GPU landing slices registered this round, by rail and GPU.
     landings: Mutex<HashMap<(u16, i32), Arc<crate::gpu::GpuLanding>>>,
 
@@ -204,8 +210,32 @@ impl LinkNode {
     /// Let `gpu-read` pages land in GPU memory: on each activation, give
     /// each decrypting GPU a landing buffer of `bytes`, split across the
     /// rails (see [`plan_landing`]). 0 bytes turns landing off.
+    ///
+    /// Configuring it while rails are already active (the GPU helper started
+    /// lazily on the first `gpu-read`) marks those rails pending; the owner
+    /// worker attaches them on its next turn (see [`Self::take_landing_pending`]).
     pub fn set_gpu_landing(&self, helper: Arc<crate::gpu::GpuHelper>, bytes: u64) {
-        *Self::lock(&self.gpu_landing) = (bytes != 0).then_some((helper, bytes));
+        let mut landing = Self::lock(&self.gpu_landing);
+        *landing = (bytes != 0).then_some((helper, bytes));
+        self.landing_pending
+            .store(landing.is_some(), std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether landing still needs attaching on the rails already active.
+    /// Clears the mark; the caller must then attach them.
+    pub fn take_landing_pending(&self) -> bool {
+        let _landing = Self::lock(&self.gpu_landing);
+        self.landing_pending
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// The landing configuration, consuming any pending mark: the caller
+    /// attaches with it.
+    fn take_gpu_landing(&self) -> Option<(Arc<crate::gpu::GpuHelper>, u64)> {
+        let landing = Self::lock(&self.gpu_landing);
+        self.landing_pending
+            .store(false, std::sync::atomic::Ordering::Release);
+        landing.clone()
     }
 
     /// GPU `ordinal`'s landing slice on `rail` this round, if any.
@@ -557,7 +587,7 @@ impl Links {
     /// log: pages then land in host memory as usual. A GPU whose buffer no
     /// rail registered drops it again, which frees the GPU memory.
     pub(crate) async fn attach_landings(&self, rails: &[RailMapping], scope: &RequestScope) {
-        let Some((helper, bytes)) = LinkNode::lock(&self.node.gpu_landing).clone() else {
+        let Some((helper, bytes)) = self.node.take_gpu_landing() else {
             return;
         };
         let slots = (bytes / BUFFER_LEN as u64) as usize;

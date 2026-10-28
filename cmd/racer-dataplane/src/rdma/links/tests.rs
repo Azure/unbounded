@@ -1081,3 +1081,28 @@ fn landing_failures_leave_rails_host_only() {
     assert!(w.a.links.has_landing(RAIL, 0));
     assert_eq!(helper.run(crate::gpu::testing::live_staging), 1);
 }
+
+#[test]
+/// A GPU helper that starts after the rails activated (lazy `gpu-read`
+/// start) marks them pending; attaching on the active rails registers the
+/// landing buffer and consumes the mark, so rails never attach twice.
+fn late_gpu_landing_attaches_on_active_rails_once() {
+    let helper = crate::gpu::testing::helper(&[None]);
+    let mut w = world();
+    link_up(&mut w);
+    let node = w.a.links.node().clone();
+    assert!(!node.take_landing_pending());
+    node.set_gpu_landing(helper.clone(), 0);
+    assert!(!node.take_landing_pending(), "0 bytes turns landing off");
+    let bytes = (BUFFER_LEN as u64).next_multiple_of(crate::config::GPU_STAGING_UNIT);
+    node.set_gpu_landing(helper.clone(), bytes);
+    assert!(!w.a.links.has_landing(RAIL, 0));
+    // `attach_landing` sets the landing again, then attaches like the owner
+    // worker does on its next turn.
+    attach_landing(&mut w, &helper, bytes);
+    assert!(w.a.links.has_landing(RAIL, 0));
+    assert!(!node.take_landing_pending(), "the attach consumed the mark");
+    node.set_gpu_landing(helper, bytes);
+    assert!(node.take_landing_pending());
+    assert!(!node.take_landing_pending());
+}

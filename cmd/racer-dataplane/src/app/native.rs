@@ -166,6 +166,22 @@ impl WorkerApplication {
             }
         }
         self.actual_rails = links.active();
+        // The GPU helper started lazily after these rails activated: attach
+        // its landing buffers to them now. Only the owner registers memory.
+        if self.native_owner()
+            && self.native_task.is_none()
+            && !self.actual_rails.is_empty()
+            && links.node().take_landing_pending()
+        {
+            let rails = self.actual_rails.clone();
+            let turn = scope(Duration::from_secs(5))?;
+            self.native_task = Some(Box::pin(async move {
+                links.attach_landings(&rails, &turn).await;
+                Ok(rails)
+            }));
+            cx.waker().wake_by_ref();
+            return Ok(());
+        }
         if !self.native_owner()
             || self.native_task.is_some()
             || !self.actual_rails.is_empty()
