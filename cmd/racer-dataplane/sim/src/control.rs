@@ -25,7 +25,7 @@
 //!   `limits::MAX_WRITE_WAITERS`; a poll still queued past its poll deadline
 //!   plus `limits::WRITE_QUEUE_GRACE` answers 429), and [`body_for`] for
 //!   delta versus full bodies. Waiters wake when their seat serves a new
-//!   sequence; the wake costs [`cost::notify`] registrations (O(W)).
+//!   sequence; the wake costs one waker registration per waiter (O(W)).
 //! - Each client holds the content hash of the image it applied (none
 //!   after a process restart) and sends it with its applied sequence, as
 //!   production clients do; `body_for` answers a delta only when both
@@ -34,7 +34,7 @@
 //! Faults: crash the primary or seat holders, restart, partition a fraction
 //! of clients from the control plane, slow clients, grow and shrink.
 
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use racer_cluster_control::{
     annotations,
@@ -47,8 +47,7 @@ use racer_cluster_control::{
 };
 use racer_control_wire::ProtocolFailure;
 
-use crate::cluster::{ControlPlane, Settings as ModelSettings};
-use crate::cost;
+use crate::cluster::ControlPlane;
 use racer_core::time::SplitMix64;
 use serde_json::{Value, json};
 
@@ -444,19 +443,10 @@ pub struct ControlSim {
 impl ControlSim {
     pub fn new(settings: Settings, seed: u64, faults: Vec<CtlFault>) -> Self {
         let initial = settings.initial_pods.clamp(1, settings.pods.max(1));
-        let cp = ControlPlane::new(
-            ModelSettings {
-                pods: initial,
-                seed,
-                image_bytes_per_member: settings.image_bytes_per_member,
-                node_monitor_grace: (settings.node_monitor_grace_ns > 0)
-                    .then(|| Duration::from_nanos(settings.node_monitor_grace_ns)),
-                report_at_start: settings.report_at_start,
-                ..ModelSettings::default()
-            },
-            Instant::now(),
-            SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
-        );
+        let mut cp = ControlPlane::new(initial, seed, settings.report_at_start);
+        cp.image_bytes_per_member = settings.image_bytes_per_member;
+        cp.node_monitor_grace = (settings.node_monitor_grace_ns > 0)
+            .then(|| Duration::from_nanos(settings.node_monitor_grace_ns));
         let mut api = Store::new();
         api.set_admission(Some(TokenBucket::new(
             settings.api_qps,
@@ -766,10 +756,9 @@ impl ControlSim {
             }
             self.trace(at, 0xC4, i as u64, served.unwrap_or(u64::MAX));
             let waiters = std::mem::take(&mut self.seats[i].waiters);
-            self.metrics.add(
-                "ctl_notify_registrations",
-                cost::notify(waiters.len() as u64).registrations,
-            );
+            // One O(1) waker registration per waiter (`exec::Changed`).
+            self.metrics
+                .add("ctl_notify_registrations", waiters.len() as u64);
             match served {
                 Some(_) if previous.is_some() => {
                     // New sequence: every live waiter replies now.

@@ -20,7 +20,6 @@ pub mod cluster;
 pub mod combined;
 pub mod config;
 pub mod control;
-pub mod cost;
 pub mod engine;
 pub mod faults;
 pub mod node {

@@ -90,7 +90,7 @@ Path: `cmd/racer-dataplane/sim`, crate and binary `racer-sim`.
 | `node` | Real node logic for every node (below) |
 | `phantom` | Shared-memo `Phantom` rankings and `SharedRoutes` searches for every node's caches |
 | `config` | One `Config` (with its `node` knobs) parsed from `--config` JSON and validated in one place |
-| `cluster`, `cost` | `ControlPlane`: a whole-cluster model built from the `cluster-control` steps; notify and write-drain cost models |
+| `cluster` | `ControlPlane`: a whole-cluster model built from the `cluster-control` steps, with the write-drain cost model |
 | `control` | `ControlSim`: the `cluster` model plus a client model |
 | `combined` | Control plane and data plane on one timeline |
 | `report` | Histograms, counters, invariants, memory accounting, JSON output |

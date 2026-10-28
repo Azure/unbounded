@@ -8,14 +8,13 @@
 //! state record are typed values with resourceVersion counters rather than
 //! JSON objects, and every API read or write is counted. Client long polls
 //! are modeled per seat with the real write-slot limit and the
-//! [`crate::cost`] notify model, so the simulator sees 429s and delivery lag
+//! [`drain`] queue model, so the simulator sees 429s and delivery lag
 //! at 50k Pods without one socket or thread per Pod.
 //!
 //! Time is `u64` nanoseconds from an `Instant` base chosen by the caller;
 //! wall time is `wall_base + ns`. Randomness comes from one [`SplitMix64`]
 //! stream, so runs replay exactly.
 
-use crate::cost;
 use racer_cluster_control::{
     PrimaryView, SeatPolicy, annotations,
     authority::{
@@ -47,46 +46,8 @@ const DEBOUNCE: Duration = Duration::from_secs(1);
 /// Primary Lease write to watch event at the seat followers.
 const WATCH_DELAY: Duration = Duration::from_millis(50);
 
-/// Model settings.
-#[derive(Clone, Debug)]
-pub struct Settings {
-    pub pods: u32,
-    pub seats: SeatPolicy,
-    pub seed: u64,
-    /// Time to write one publication body to one client.
-    pub write_ns: u64,
-    /// Bytes of one image copy from the primary to a seat (for accounting).
-    pub image_bytes_per_member: u64,
-    /// Time after a crash until the node lifecycle controller marks the
-    /// Node `Ready=Unknown` (Kubernetes `node-monitor-grace-period`, 40 s
-    /// by default). A crash here is the whole node: the kubelet stops
-    /// heartbeating with it. `None` never marks crashed Nodes.
-    pub node_monitor_grace: Option<Duration>,
-    /// Pods carry the report annotation from creation, as dataplanes from
-    /// before round 4 (join) did: they reported before enrollment. When
-    /// false, a Pod reports only through [`ControlPlane::report_serving`],
-    /// which the client model calls once the dataplane can serve peers.
-    pub report_at_start: bool,
-    /// Duration of a seat follower's state Secret read. The read answers
-    /// the state as of its start, so a commit (and its primary Lease
-    /// change) during the read is not in it (Known issue 48).
-    pub follow_read_ns: u64,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            pods: 100,
-            seats: SeatPolicy::Auto,
-            seed: 1,
-            write_ns: 2_000_000,
-            image_bytes_per_member: 128,
-            node_monitor_grace: Some(Duration::from_secs(40)),
-            report_at_start: true,
-            follow_read_ns: 20_000_000,
-        }
-    }
-}
+/// Time to write one publication body to one client.
+const WRITE_NS: u64 = 2_000_000;
 
 /// Counters reported by the model.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -145,6 +106,27 @@ pub(crate) struct Pod {
     primary: Option<Writer>,
 }
 
+impl Pod {
+    /// A freshly started process (fresh lottery and fence) at `epoch`.
+    fn new(epoch: u32) -> Self {
+        Self {
+            alive: true,
+            epoch,
+            lottery: Lottery::default(),
+            seat: None,
+            renew: None,
+            contend: Contend::default(),
+            follower: Follower::default(),
+            follow_at: u64::MAX,
+            followed_at: None,
+            reading: None,
+            woken_during_read: false,
+            lease_fresh_until: None,
+            primary: None,
+        }
+    }
+}
+
 /// Model time `p`'s follower read started (`now` if it never read).
 fn p_followed(p: &Pod, now: u64) -> u64 {
     p.followed_at.unwrap_or(now)
@@ -178,9 +160,23 @@ enum Ev {
 
 /// The control plane of a simulated cluster.
 pub struct ControlPlane {
-    settings: Settings,
+    /// Bytes of one image copy from the primary to a seat (for accounting).
+    pub(crate) image_bytes_per_member: u64,
+    /// Time after a crash until the node lifecycle controller marks the
+    /// Node `Ready=Unknown` (Kubernetes `node-monitor-grace-period`, 40 s
+    /// by default). A crash here is the whole node: the kubelet stops
+    /// heartbeating with it. `None` never marks crashed Nodes.
+    pub(crate) node_monitor_grace: Option<Duration>,
+    /// Pods carry the report annotation from creation, as dataplanes from
+    /// before round 4 (join) did: they reported before enrollment. When
+    /// false, a Pod reports only through [`ControlPlane::report_serving`],
+    /// which the client model calls once the dataplane can serve peers.
+    report_at_start: bool,
+    /// Duration of a seat follower's state Secret read. The read answers
+    /// the state as of its start, so a commit (and its primary Lease
+    /// change) during the read is not in it (Known issue 48).
+    pub(crate) follow_read_ns: u64,
     base: Instant,
-    wall_base: SystemTime,
     pub(crate) now: u64,
     seq: u64,
     queue: BinaryHeap<Reverse<(u64, u64, u32, Ev)>>,
@@ -210,8 +206,9 @@ fn uuid(i: u64, tag: u16) -> String {
 }
 
 impl ControlPlane {
-    /// Build a cluster of `settings.pods` Nodes and Pods, all synced.
-    pub fn new(settings: Settings, base: Instant, wall_base: SystemTime) -> Self {
+    /// Build a cluster of `pods` Nodes and Pods, all synced. Wall time
+    /// starts at 1.8e9 Unix seconds.
+    pub fn new(pods: u32, seed: u64, report_at_start: bool) -> Self {
         let ownership = Ownership {
             namespace: "racer-system".into(),
             daemonset: "racer-dataplane".into(),
@@ -224,34 +221,20 @@ impl ControlPlane {
             caches_synced: true,
             ..Default::default()
         };
-        let mut pods = Vec::with_capacity(settings.pods as usize);
-        for i in 0..settings.pods {
-            Self::add_objects(&mut inventory, &ownership, i, settings.report_at_start);
-            pods.push(Pod {
-                alive: true,
-                epoch: 0,
-                lottery: Lottery::default(),
-                seat: None,
-                renew: None,
-                contend: Contend::default(),
-                follower: Follower::default(),
-                follow_at: u64::MAX,
-                followed_at: None,
-                reading: None,
-                woken_during_read: false,
-                lease_fresh_until: None,
-                primary: None,
-            });
+        for i in 0..pods {
+            Self::add_objects(&mut inventory, &ownership, i, report_at_start);
         }
         let mut cp = Self {
-            rng: SplitMix64::new(settings.seed),
-            settings,
-            base,
-            wall_base,
+            rng: SplitMix64::new(seed),
+            image_bytes_per_member: 128,
+            node_monitor_grace: Some(Duration::from_secs(40)),
+            report_at_start,
+            follow_read_ns: 20_000_000,
+            base: Instant::now(),
             now: 0,
             seq: 0,
             queue: BinaryHeap::new(),
-            pods,
+            pods: (0..pods).map(|_| Pod::new(0)).collect(),
             seats: (0..annotations::MAX_SEATS)
                 .map(|i| Lease {
                     uid: 1000 + i as u64,
@@ -275,7 +258,7 @@ impl ControlPlane {
             wake_pending: false,
             stats: Stats::default(),
         };
-        for i in 0..cp.settings.pods {
+        for i in 0..pods {
             cp.schedule(0, i, Ev::Lottery(i));
         }
         cp
@@ -356,7 +339,7 @@ impl ControlPlane {
     }
 
     fn wall(&self) -> SystemTime {
-        self.wall_base + Duration::from_nanos(self.now)
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000) + Duration::from_nanos(self.now)
     }
 
     fn schedule(&mut self, at: u64, pod: u32, ev: Ev) {
@@ -428,7 +411,7 @@ impl ControlPlane {
         p.seat = None;
         p.renew = None;
         p.primary = None;
-        if let Some(grace) = self.settings.node_monitor_grace {
+        if let Some(grace) = self.node_monitor_grace {
             self.after(grace, pod, Ev::NodeNotReady(pod));
         }
     }
@@ -461,16 +444,7 @@ impl ControlPlane {
     /// Restart a crashed Pod with a new process (fresh lottery and fence).
     pub fn restart(&mut self, pod: u32) {
         let p = &mut self.pods[pod as usize];
-        p.alive = true;
-        p.epoch += 1;
-        p.lottery = Lottery::default();
-        p.contend = Contend::default();
-        p.follower = Follower::default();
-        p.follow_at = u64::MAX;
-        p.followed_at = None;
-        p.reading = None;
-        p.woken_during_read = false;
-        p.lease_fresh_until = None;
+        *p = Pod::new(p.epoch + 1);
         self.schedule(self.now, pod, Ev::Lottery(pod));
         if !self.node_ready(pod) {
             self.set_node_ready(pod, true);
@@ -484,23 +458,9 @@ impl ControlPlane {
             &mut self.inventory,
             &self.ownership,
             i,
-            self.settings.report_at_start,
+            self.report_at_start,
         );
-        self.pods.push(Pod {
-            alive: true,
-            epoch: 0,
-            lottery: Lottery::default(),
-            seat: None,
-            renew: None,
-            contend: Contend::default(),
-            follower: Follower::default(),
-            follow_at: u64::MAX,
-            followed_at: None,
-            reading: None,
-            woken_during_read: false,
-            lease_fresh_until: None,
-            primary: None,
-        });
+        self.pods.push(Pod::new(0));
         self.schedule(self.now, i, Ev::Lottery(i));
         i
     }
@@ -588,10 +548,6 @@ impl ControlPlane {
 
     fn lottery(&mut self, pod: u32) {
         let now = self.at(self.now);
-        let initial = match self.settings.seats {
-            SeatPolicy::Fixed(n) => n,
-            SeatPolicy::Auto => limits::MIN_AUTO_SEATS,
-        };
         let node = format!("n{pod}");
         let uid = uuid(u64::from(pod), 1);
         let p = &mut self.pods[pod as usize];
@@ -603,7 +559,7 @@ impl ControlPlane {
                 primary_changed_at: self.view_changed_at,
                 node: &node,
                 pod_uid: &uid,
-                initial_seats: initial,
+                initial_seats: limits::MIN_AUTO_SEATS,
             },
             now,
             &mut self.rng,
@@ -834,7 +790,7 @@ impl ControlPlane {
             &PassInputs {
                 cluster: &self.cluster,
                 pod_uid: &uuid(u64::from(pod), 1),
-                seats: self.settings.seats,
+                seats: SeatPolicy::Auto,
                 peer_port: 8082,
                 policy: &self.policy,
                 inventory: &self.inventory,
@@ -988,10 +944,10 @@ impl ControlPlane {
         p.followed_at = Some(self.now);
         p.reading = Some(read);
         p.woken_during_read = false;
-        if self.settings.follow_read_ns == 0 {
+        if self.follow_read_ns == 0 {
             return self.follow_done(pod);
         }
-        let at = self.now + self.settings.follow_read_ns;
+        let at = self.now + self.follow_read_ns;
         self.schedule(at, pod, Ev::FollowDone(pod));
     }
 
@@ -1024,7 +980,7 @@ impl ControlPlane {
             {
                 self.stats.image_fetches += 1;
                 self.stats.image_bytes +=
-                    i.publication.members.len() as u64 * self.settings.image_bytes_per_member;
+                    i.publication.members.len() as u64 * self.image_bytes_per_member;
                 f.install_image(i.record.clone());
             }
             if f.ready(now) && self.seats[index as usize].served != Some(r.sequence) {
@@ -1056,18 +1012,20 @@ impl ControlPlane {
         // Woken polls queue for the write slots (`exec::Slots::acquire`);
         // only those still queued after the grace answer 429. A poll woken
         // mid-wait has at least the grace, so it is the model's bound.
-        let d = cost::drain(
+        let (replies, last_ns) = drain(
             polls,
             limits::MAX_WRITES as u64,
-            self.settings.write_ns,
+            WRITE_NS,
             limits::WRITE_QUEUE_GRACE.as_nanos() as u64,
             limits::MAX_WRITE_WAITERS as u64,
         );
-        self.stats.client_replies += d.replies;
-        self.stats.client_429s += d.rejected;
-        self.stats.notify_registrations += cost::notify(polls).registrations;
+        self.stats.client_replies += replies;
+        self.stats.client_429s += polls - replies;
+        // Each woken poll re-registers its waker once (an O(1) slab insert;
+        // before round 3 each scanned the list, W(W-1)/2 per notify).
+        self.stats.notify_registrations += polls;
         if let Some(at) = self.commit_at.get(&sequence) {
-            let lag = self.now.saturating_sub(*at) + d.last_ns;
+            let lag = self.now.saturating_sub(*at) + last_ns;
             self.stats.max_client_lag_ns = self.stats.max_client_lag_ns.max(lag);
         }
     }
@@ -1099,20 +1057,34 @@ impl ControlPlane {
     }
 }
 
+/// `polls` woken together, `write_slots` concurrent writes of `write_ns`
+/// each, FIFO queue (`step::admission::WriteQueue`), each poll willing to
+/// wait `wait_ns` for a slot and at most `max_waiting` queued. Round k
+/// starts at `k * write_ns`. Returns the polls answered (the rest get 429)
+/// and when the last reply finished, from the wake.
+fn drain(
+    polls: u64,
+    write_slots: u64,
+    write_ns: u64,
+    wait_ns: u64,
+    max_waiting: u64,
+) -> (u64, u64) {
+    let slots = write_slots.max(1);
+    let overflow = polls.saturating_sub(slots).saturating_sub(max_waiting);
+    // Rounds whose start is within the wait: 0..=wait_ns / write_ns.
+    let rounds_in_time = wait_ns
+        .checked_div(write_ns)
+        .map_or(u64::MAX, |r| r.saturating_add(1));
+    let replies = (polls - overflow).min(rounds_in_time.saturating_mul(slots));
+    (replies, replies.div_ceil(slots).saturating_mul(write_ns))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn run(pods: u32, secs: u64, seed: u64) -> ControlPlane {
-        let mut cp = ControlPlane::new(
-            Settings {
-                pods,
-                seed,
-                ..Default::default()
-            },
-            Instant::now(),
-            SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
-        );
+        let mut cp = ControlPlane::new(pods, seed, true);
         cp.advance_to(secs * 1_000_000_000);
         cp
     }
@@ -1200,16 +1172,7 @@ mod tests {
     #[test]
     fn pods_join_once_serving_in_batches() {
         const S: u64 = 1_000_000_000;
-        let mut cp = ControlPlane::new(
-            Settings {
-                pods: 40,
-                seed: 3,
-                report_at_start: false,
-                ..Default::default()
-            },
-            Instant::now(),
-            SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
-        );
+        let mut cp = ControlPlane::new(40, 3, false);
         cp.advance_to(120 * S);
         assert_eq!(members(&cp), 0, "nobody serves yet");
         assert!(cp.sequence().is_some(), "an empty membership is published");
@@ -1287,16 +1250,8 @@ mod tests {
     fn a_commit_during_a_follower_read_is_served_by_the_next_read() {
         const S: u64 = 1_000_000_000;
         let read = 2 * S;
-        let mut cp = ControlPlane::new(
-            Settings {
-                pods: 30,
-                seed: 5,
-                follow_read_ns: read,
-                ..Default::default()
-            },
-            Instant::now(),
-            SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
-        );
+        let mut cp = ControlPlane::new(30, 5, true);
+        cp.follow_read_ns = read;
         cp.advance_to(240 * S);
         let mut overlapped = 0;
         for _ in 0..4 {
@@ -1413,5 +1368,24 @@ mod tests {
             cp.stats
         );
         assert_eq!(cp.stats.client_429s, 0, "{:?}", cp.stats);
+    }
+
+    #[test]
+    fn drain_queues_within_the_wait() {
+        // 3125 polls, 64 slots, 2 ms writes, 5 s wait: 49 rounds, no 429.
+        assert_eq!(
+            drain(3125, 64, 2_000_000, 5_000_000_000, 16_384),
+            (3125, 98_000_000)
+        );
+        // Wait shorter than the drain: rounds starting after it are 429.
+        assert_eq!(drain(1000, 10, 1_000, 9_999, 16_384).0, 100);
+        // Queue bound: beyond slots + max_waiting is 429 at once.
+        assert_eq!(drain(100, 10, 1, u64::MAX, 20).0, 30);
+        // Zero write time: everything admitted is answered.
+        assert_eq!(drain(100, 10, 0, 0, 1000).0, 100);
+        assert_eq!(drain(0, 64, 1, 1, 1), (0, 0));
+        // 12,500 polls need 196 rounds of 64 slots; zero slots act as one.
+        assert_eq!(drain(12_500, 64, 1, u64::MAX, u64::MAX).1, 196);
+        assert_eq!(drain(5, 0, 1, u64::MAX, u64::MAX), (5, 5));
     }
 }
