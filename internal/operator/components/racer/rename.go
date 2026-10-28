@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/unbounded/internal/operator/component"
+	"github.com/Azure/unbounded/internal/racer/workload"
 )
 
 // Names used before the racer-dataplane component was renamed to racer. The
@@ -56,17 +57,38 @@ func renamedConfigData(ctx context.Context, env *component.Env) (map[string]stri
 		return nil, fmt.Errorf("%s is %T, not a ConfigMap", renamedConfig, live)
 	}
 
-	data := map[string]string{}
+	return translateRenamedKeys(cm.Data), nil
+}
 
-	for key, value := range cm.Data {
+// translateRenamedKeys renames "RACER_DATAPLANE_" keys to "RACER_". When both
+// spellings of a key are present, the one that was in effect before the
+// rename wins, so the result never depends on map iteration order. The
+// pre-rename operator read only "RACER_DATAPLANE_NVIDIA" (now
+// workload.NVIDIAKey), so that prefixed value wins. Every other key reached the
+// dataplane only through envFrom, where it read the unprefixed "RACER_" name,
+// so the unprefixed value wins.
+func translateRenamedKeys(in map[string]string) map[string]string {
+	data := make(map[string]string, len(in))
+
+	for key, value := range in {
 		if rest, found := strings.CutPrefix(key, renamedKeyPrefix); found {
-			key = "RACER_" + rest
+			data["RACER_"+rest] = value
+		}
+	}
+
+	for key, value := range in {
+		if strings.HasPrefix(key, renamedKeyPrefix) {
+			continue
+		}
+
+		if _, prefixed := in[renamedKeyPrefix+"NVIDIA"]; prefixed && key == workload.NVIDIAKey {
+			continue
 		}
 
 		data[key] = value
 	}
 
-	return data, nil
+	return data
 }
 
 // planRenamedCleanup deletes the operator-owned objects left under the

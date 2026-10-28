@@ -437,3 +437,35 @@ func TestRenamedStateRecordFailsClosed(t *testing.T) {
 	_, _, err := (Component{}).Plan(t.Context(), env, nil)
 	require.ErrorContains(t, err, "missing")
 }
+
+func TestTranslateRenamedKeys(t *testing.T) {
+	for name, tc := range map[string]struct {
+		in, want map[string]string
+	}{
+		"prefixed wins over unprefixed": {
+			in:   map[string]string{"RACER_DATAPLANE_NVIDIA": "cdi", "RACER_NVIDIA": "off"},
+			want: map[string]string{"RACER_NVIDIA": "cdi"},
+		},
+		"prefixed wins the other way": {
+			in:   map[string]string{"RACER_DATAPLANE_NVIDIA": "off", "RACER_NVIDIA": "cdi"},
+			want: map[string]string{"RACER_NVIDIA": "off"},
+		},
+		"unprefixed wins for keys the dataplane read": {
+			in:   map[string]string{"RACER_DATAPLANE_SHARES": "3", "RACER_SHARES": "7"},
+			want: map[string]string{"RACER_SHARES": "7"},
+		},
+		"no collision": {
+			in:   map[string]string{"RACER_DATAPLANE_NVIDIA": "env", "RACER_SHARES": "7"},
+			want: map[string]string{"RACER_NVIDIA": "env", "RACER_SHARES": "7"},
+		},
+		"empty": {in: nil, want: map[string]string{}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			// Map iteration order varies per range; repeat so an order
+			// dependence cannot pass by luck.
+			for range 100 {
+				require.Equal(t, tc.want, translateRenamedKeys(tc.in))
+			}
+		})
+	}
+}
