@@ -8,27 +8,32 @@
 //! state record are typed values with resourceVersion counters rather than
 //! JSON objects, and every API read or write is counted. Client long polls
 //! are modeled per seat with the real write-slot limit and the
-//! [`super::cost`] notify model, so the simulator sees 429s and delivery lag
+//! [`crate::cost`] notify model, so the simulator sees 429s and delivery lag
 //! at 50k Pods without one socket or thread per Pod.
 //!
 //! Time is `u64` nanoseconds from an `Instant` base chosen by the caller;
 //! wall time is `wall_base + ns`. Randomness comes from one [`Seeded`]
 //! stream, so runs replay exactly.
 
-use super::{
-    Image, LeaseObservation, LeaseSpec, NodeInfo, Ownership, PodInfo, Policy, PrimaryView,
-    Readiness, Seeded, StateRecord, Term, Writer,
-    contend::Contend,
-    cost,
-    follower::Follower,
-    lottery::{self, Lottery},
-    primary::{Inventory, PassInputs, discovery, plan_pass},
-    renew::{self, SeatRenew},
-};
-use crate::{
-    SeatPolicy, annotations,
-    authority::{election, members::Owner, state},
+use crate::cost;
+use racer_cluster_control::{
+    PrimaryView, SeatPolicy, annotations,
+    authority::{
+        election::{self, LeaseObservation, LeaseSpec},
+        keyring::Policy,
+        members::{NodeInfo, Owner, Ownership, PodInfo, Readiness},
+        publication::Image,
+        state::{self, StateRecord, Term, Writer},
+    },
+    entropy::Seeded,
     limits,
+    step::{
+        contend::Contend,
+        follower::{self, Follower},
+        lottery::{self, Lottery},
+        primary::{Inventory, PassInputs, discovery, plan_pass},
+        renew::{self, SeatRenew},
+    },
 };
 use std::{
     cmp::Reverse,
@@ -267,7 +272,7 @@ impl ControlPlane {
             commit_at: BTreeMap::new(),
             inventory,
             ownership,
-            policy: Policy::from(crate::Rotation::default()),
+            policy: Policy::from(racer_cluster_control::Rotation::default()),
             cluster: "c1c1c1c1-0000-4000-8000-000000000001".into(),
             membership_changed: None,
             wake_pending: false,
@@ -1041,12 +1046,12 @@ impl ControlPlane {
         let started = self.at(p_followed(&self.pods[pod as usize], self.now));
         let f = &self.pods[pod as usize].follower;
         let record = read.record.filter(|r| {
-            !super::follower::superseded(f.installs != read.installs, f.high_water.as_ref(), r)
+            !follower::superseded(f.installs != read.installs, f.high_water.as_ref(), r)
         });
         if let Some(r) = record {
             let f = &mut self.pods[pod as usize].follower;
             if f.install(r.clone(), started).is_ok()
-                && super::follower::need_image(&r, f.image.as_ref(), is_primary)
+                && follower::need_image(&r, f.image.as_ref(), is_primary)
                 && let Some(i) = &self.image
                 && i.record.sequence == r.sequence
             {
@@ -1065,7 +1070,7 @@ impl ControlPlane {
             self.now
                 .max(self.pods[pod as usize].followed_at.map_or(0, |t| t + floor))
         } else {
-            self.now + crate::seat::FOLLOW_INTERVAL.as_nanos() as u64
+            self.now + limits::FOLLOW_INTERVAL.as_nanos() as u64
         };
         self.follow_at(pod, next);
     }

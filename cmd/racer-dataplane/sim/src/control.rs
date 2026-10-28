@@ -43,11 +43,12 @@ use racer_cluster_control::{
     step::{
         admission::{Admit, Body, Poll, SeatAdmission, WriteWaiter, body_for},
         authz::{ApiBudget, AuthCache, Bindings, Reviewed, TokenKey},
-        cluster::{ControlPlane, Settings as ModelSettings},
-        cost,
     },
 };
 use racer_control_wire::ProtocolFailure;
+
+use crate::cluster::{ControlPlane, Settings as ModelSettings};
+use crate::cost;
 use racer_core::time::SplitMix64;
 use serde_json::{Value, json};
 
@@ -392,7 +393,7 @@ impl Changes {
 }
 
 /// Pod index of a published member: the model names Node `i` with the UID
-/// `{i:08x}-0000-...` (`step::cluster` `uuid`).
+/// `{i:08x}-0000-...` (`cluster` `uuid`).
 fn member_pod(node: &str) -> Option<u32> {
     u32::from_str_radix(node.get(..8)?, 16).ok()
 }

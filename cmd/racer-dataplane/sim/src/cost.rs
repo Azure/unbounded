@@ -61,11 +61,7 @@ pub fn drain(polls: u64, write_slots: u64, write_ns: u64, wait_ns: u64, max_wait
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        exec::{Executor, Signal},
-        limits,
-    };
-    use std::{cell::Cell, rc::Rc};
+    use racer_cluster_control::limits;
 
     #[test]
     fn linear_model() {
@@ -104,30 +100,5 @@ mod tests {
                 last_ns: 0
             }
         );
-    }
-
-    /// The model's wake count matches the real Signal: every waiter is
-    /// polled once per notify.
-    #[test]
-    fn signal_wakes_every_waiter() {
-        let mut ex = Executor::new(64).unwrap();
-        let signal = Signal::default();
-        let woken = Rc::new(Cell::new(0u64));
-        ex.block_on(async {
-            for _ in 0..8 {
-                let s = signal.clone();
-                let w = woken.clone();
-                crate::exec::spawn(async move {
-                    let g = s.generation();
-                    s.changed(g).await;
-                    w.set(w.get() + 1);
-                })
-                .unwrap();
-            }
-            crate::exec::sleep(std::time::Duration::from_millis(5)).await;
-            signal.notify();
-            crate::exec::sleep(std::time::Duration::from_millis(5)).await;
-        });
-        assert_eq!(woken.get(), notify(8).wakes);
     }
 }

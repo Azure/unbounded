@@ -712,6 +712,30 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
 
+    /// Every waiter is polled once per notify (the sim's notify cost model).
+    #[test]
+    fn signal_wakes_every_waiter() {
+        let mut ex = Executor::new(64).unwrap();
+        let signal = Signal::default();
+        let woken = Rc::new(Cell::new(0u64));
+        ex.block_on(async {
+            for _ in 0..8 {
+                let s = signal.clone();
+                let w = woken.clone();
+                spawn(async move {
+                    let g = s.generation();
+                    s.changed(g).await;
+                    w.set(w.get() + 1);
+                })
+                .unwrap();
+            }
+            sleep(Duration::from_millis(5)).await;
+            signal.notify();
+            sleep(Duration::from_millis(5)).await;
+        });
+        assert_eq!(woken.get(), 8);
+    }
+
     #[test]
     fn timers_fire_in_order_and_deadline_cancels() {
         let mut ex = Executor::new(16).unwrap();

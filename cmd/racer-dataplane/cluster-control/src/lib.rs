@@ -39,7 +39,7 @@
 pub mod annotations;
 pub mod apiserver;
 mod auth;
-mod authority;
+pub mod authority;
 mod config;
 mod control;
 pub mod entropy;
@@ -59,6 +59,7 @@ mod tests;
 
 pub use config::{Config, Rotation, SeatPolicy};
 pub use control::{Bootstrap, Diagnostics, Handle, Role, start};
+pub use shared::PrimaryView;
 
 /// Threads started by [`start`]. The dataplane counts this against its budget.
 pub const CONTROL_THREADS: usize = 1;

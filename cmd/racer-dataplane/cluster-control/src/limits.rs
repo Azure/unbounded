@@ -15,7 +15,7 @@ pub const LEASE_FRESHNESS: Duration = Duration::from_secs(20);
 /// Committed state older than this, by local clock, is not served.
 ///
 /// Every seat rereads the state Secret at least every
-/// [`crate::seat::FOLLOW_INTERVAL`] (5s), so 30s tolerates several failed
+/// [`FOLLOW_INTERVAL`] (5s), so 30s tolerates several failed
 /// reads while bounding how long a seat that cannot reach the API keeps
 /// serving a stale image. Seat Lease freshness ([`LEASE_FRESHNESS`]) is the
 /// tighter bound on authority in the common case.
@@ -57,7 +57,7 @@ pub const MIN_WRITE_BYTES_PER_SEC: u64 = 100 * 1024;
 /// a seat with 12500 polls drains a new publication in about 12500 / 64
 /// write rounds with no client retries. Waking W polls costs O(W): each
 /// `Signal::changed` waiter owns one waker slot and re-registers in O(1)
-/// (see [`crate::step::cost::notify`]).
+/// (modeled in `racer-sim`).
 pub const MAX_CONTROL_CONNECTIONS: usize = 16384;
 
 /// Maximum concurrent TLS handshakes, the CPU-heavy stage of a connection.
@@ -211,6 +211,9 @@ pub const MEMBERS_PER_SEAT: usize = 2048;
 /// Minimum automatic seat count.
 pub const MIN_AUTO_SEATS: usize = 3;
 
+/// Interval between state Secret reads by a seat.
+pub const FOLLOW_INTERVAL: Duration = Duration::from_secs(5);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,7 +245,7 @@ mod tests {
 
     #[test]
     fn freshness_bounds() {
-        assert!(STATE_FRESHNESS >= crate::seat::FOLLOW_INTERVAL * 4);
+        assert!(STATE_FRESHNESS >= FOLLOW_INTERVAL * 4);
         assert!(STATE_FRESHNESS <= LEASE_DURATION);
         assert!(LEASE_FRESHNESS < LEASE_DURATION);
     }

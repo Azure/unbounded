@@ -36,9 +36,6 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-/// Interval between state Secret reads by a seat.
-pub const FOLLOW_INTERVAL: Duration = Duration::from_secs(5);
-
 impl PrimaryView {
     /// Whether `node` holds a seat that is kept. A seat at or beyond
     /// `desired` is being shrunk away (possibly ours, just released), so it
@@ -614,7 +611,7 @@ pub async fn follower(shared: Rc<Shared>, seat: Rc<Seat>) {
         let _ = follow_once(&shared, started).await;
         let generation = shared.changed.generation();
         let _ = exec::timeout(
-            FOLLOW_INTERVAL,
+            crate::limits::FOLLOW_INTERVAL,
             futures::future::select(
                 std::pin::pin!(shared.primary_lease.changed(lease)),
                 std::pin::pin!(shared.changed.changed(generation)),
@@ -1214,7 +1211,7 @@ mod tests {
 
     /// Known issue 48: a primary Lease change (a commit) that arrives while
     /// the follower's read is in flight wakes the next read at the 1 s floor
-    /// instead of after `FOLLOW_INTERVAL`.
+    /// instead of after `crate::limits::FOLLOW_INTERVAL`.
     #[test]
     fn follower_rereads_after_a_lease_change_during_its_read() {
         crate::kube::fake::run(|api, kube| async move {
