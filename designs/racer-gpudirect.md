@@ -267,24 +267,37 @@ above:
 
 ### GPUDirect RDMA landing
 
-When GPU decryption and RDMA are both on, each GPU can get one landing
-buffer: GPU memory separate from the staging buffer, sized by
-`RACER_GPU_LANDING_BYTES` (default 256 MiB per GPU, 0 turns landing off).
-The GPU helper allocates it once, exports it once as a dma-buf, and keeps it
-until the process exits. At each RDMA activation, every rail is matched with
-at most one GPU, and every GPU with at most one rail: a GPU on the rail's
-NUMA node first, then any free GPU (`assign_landing` in
-`src/rdma/links.rs`). PCI distance is not used; only NUMA nodes are known on
-both sides. The rail registers the landing buffer as its `rdma_verbs` device
-pool, so the buffer is split into page-sized slots. If allocation, export, or
-registration fails, the rail stays host-only.
+When GPU decryption and RDMA are both on, each decrypting GPU gets one
+landing buffer: GPU memory separate from the staging buffer, sized by
+`RACER_GPU_LANDING_BYTES` (default 256 MiB per GPU, not per rail; 0 turns
+landing off). At each RDMA activation the GPU helper allocates it and exports
+it once as a dma-buf. `plan_landing` in `src/rdma/links.rs` splits it into
+disjoint slices, one per rail, so every GPU can land over every rail and a
+node with more GPUs than rails leaves no GPU out. If the buffer has fewer
+page slots than there are rails, rails on the GPU's NUMA node come first,
+then the rest in rail order. PCI distance is not used; only NUMA nodes are
+known on both sides. Each slice is registered as its own `rdma_verbs` device
+pool on its rail, keyed by GPU ordinal, so a rail can hold one pool per GPU.
+If allocation, export, or registration fails, that rail and GPU stay
+host-only.
+
+Lifetime: the buffer is freed when nothing refers to it. NIC registrations
+and landed pages hold references, so it is freed after the RDMA node closes
+and drains (shutdown, or before a new activation round), or right away when
+no rail registered it. A registration `rdma_verbs` leaks on purpose (failed
+deregistration) keeps its reference, so that memory is never freed under the
+NIC. The next activation allocates and registers again. Buffers are not
+resized at runtime: `RACER_GPU_LANDING_BYTES` comes from the ConfigMap, and
+the operator restarts the pods when it changes.
 
 A `gpu-read` page then takes this path (`Fill::land_from_peer`):
 
 1. If this node is not a candidate for the page, has no local copy, and has
-   a landing buffer on the request's GPU, it sends one CopyOnly request to the
-   first provider in visit order, carrying the GPU ordinal.
-2. When the hop is RDMA and the rail's landing buffer is on that GPU, the
+   a landing buffer on the request's GPU, it sends a CopyOnly request,
+   carrying the GPU ordinal, to the first provider in visit order. On a miss
+   or failure it asks the next one, up to two providers
+   (`LANDING_PROVIDERS`), then takes the usual path.
+2. When the hop is RDMA and the rail has a landing slice for that GPU, the
    receiver grants a landing slot instead of a host buffer. If no slot is
    free, it grants host memory as usual.
 3. The sender writes the ciphertext into the slot. After the usual fence, the
@@ -299,9 +312,19 @@ A landed page is used once. It does not join or create a single flight, is
 not published to memory, and is not persisted, because there are no host
 bytes to share. The slot is held until the GPU job finishes. If the provider
 answers with a host page (no free slot, or HTTP), that page is used once in
-the same way, so it is not fetched twice. A miss, any failure, or a landing
-buffer on another GPU falls back to the usual path. Host-only nodes and
-non-GPU reads do not change. Relays never ask for landing.
+the same way, so it is not fetched twice. If every provider asked misses or
+fails, or the rail has no slice for that GPU, the read takes the usual path.
+Host-only nodes and non-GPU reads do not change. Relays never ask for
+landing.
+
+Not caching landed pages is a design choice, not a gap. The host memory and
+disk tiers are the cache. Putting a landed page there would need a
+device-to-host copy of the ciphertext, which is the cost landing exists to
+avoid. Keeping landed pages in GPU memory would hold scarce slots that peers
+need for new pages, and a page landed on one GPU is not usable by a read on
+another without a GPU-to-GPU copy. Concurrent reads of one page on the same
+GPU each land their own copy; that is rare, since a model's shards are
+usually read once per GPU.
 
 `racer_rdma_pages_landed_total` counts pages that landed, and the GPU
 helper's `landed` counter counts landed pages it decrypted. A landed page the

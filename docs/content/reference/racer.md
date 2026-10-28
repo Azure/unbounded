@@ -1084,15 +1084,20 @@ Where the bytes come from decides who decrypts them:
 If the GPU finds a damaged page, the read fails and the dataplane drops that
 copy from memory or disk, as it does when the CPU finds one.
 
-When both GPU reads and RDMA are on, each GPU can get a landing buffer of
-`RACER_GPU_LANDING_BYTES`, split into page slots. Each RDMA rail gets at most
-one GPU's landing buffer, preferring a GPU on the rail's NUMA node. A GPU
-read that needs a page from a peer over that rail, on that GPU, asks the peer
-to write the encrypted page into a free slot. The GPU then checks and
-decrypts it. Such a page is used only by that read: it is not kept in memory,
-written to disk, or shared with other reads. When no slot is free, the GPUs
-do not match, or anything fails, the page comes through host memory as
-before. The dataplane logs `stage=gpu-landing` lines at RDMA activation, and
+When both GPU reads and RDMA are on, each GPU that can decrypt gets a landing
+buffer of `RACER_GPU_LANDING_BYTES` (per GPU, not per rail), split into page
+slots. The buffer is divided across the RDMA rails, so every GPU can land
+pages over every rail. If the buffer has fewer slots than there are rails,
+the rails on the GPU's NUMA node come first. A GPU read that needs a page
+from a peer asks up to two providers, in turn, to write the encrypted page
+into a free slot of that GPU's share on the link's rail. The GPU then checks
+and decrypts it. Such a page is used only by that read: it is not kept in
+memory, written to disk, or shared with other reads, because the host never
+has its bytes. When no slot is free or anything fails, the page comes through
+host memory as before. Landing buffers are registered at each RDMA
+activation and freed when the RDMA node closes or when no rail could register
+them. They are not resized at runtime; changing the setting restarts the
+pods. The dataplane logs `stage=gpu-landing` lines at RDMA activation, and
 `racer_rdma_pages_landed_total` counts pages that landed in GPU memory.
 
 `RACER_GPU_STAGING_BYTES` is the GPU memory the dataplane keeps on each GPU for
