@@ -38,6 +38,11 @@ copy.
 | `RACER_UBLK_QUEUE_DEPTH` | 128 | Tags per queue, 1 to 4096. |
 | `RACER_UBLK_MAX_IO_BYTES` | 1048576 | Largest request, a multiple of 4096, at most 32 MiB. |
 
+At most 64 devices, and the number of devices times the queue depth must not exceed 4096.
+Every worker serves one queue of every device, so this bounds the reactor queue entries ublk
+adds to each worker (see `reserve_ublk_submissions` below). Larger settings are refused while
+parsing the configuration, with a `component=ublk stage=config` log line.
+
 Each device is an object:
 
 ```json
@@ -234,7 +239,9 @@ Code lives in `cmd/racer/src/ublk/`.
   configured. `reserve_ublk_submissions` adds `2 * devices * queue_depth` reactor queue
   entries and the matching request-context bytes to each worker, for the long-lived queue
   commands plus one write per tag. `assemble_ublk` reserves half of them as the dedicated
-  command partition. `WorkerApplication` polls `UblkWorker` from `poll_services`, signals
+  command partition. A worker's reactor queue may not exceed 16384 entries; if the ordinary
+  queue plus the ublk share would, startup fails with a `component=ublk stage=reserve` log
+  line naming both sizes. `WorkerApplication` polls `UblkWorker` from `poll_services`, signals
   stop from `stop_admission`, and does not finish `drain` until the control thread has
   exited and its queues hold no request.
 

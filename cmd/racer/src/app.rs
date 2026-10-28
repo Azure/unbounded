@@ -2398,12 +2398,20 @@ fn reserve_ublk_submissions(ublk: &crate::config::UblkConfig, limits: &mut Limit
         .checked_mul(usize::from(ublk.queue_depth))
         .and_then(|tags| tags.checked_mul(2))
         .ok_or(Error::InvalidConfiguration)?;
-    let entries = limits
+    let Some(entries) = limits
         .queue_entries
         .get()
         .checked_add(extra)
         .filter(|entries| *entries <= MAX_UBLK_QUEUE_ENTRIES)
-        .ok_or(Error::InvalidConfiguration)?;
+    else {
+        // Config parsing bounds the ublk share; the per-worker ordinary
+        // queue can still push the total over the cap. Say which sizes did.
+        eprintln!(
+            "racer-dataplane: component=ublk stage=reserve error=reactor queue too large queue_entries={} ublk_entries={extra} limit={MAX_UBLK_QUEUE_ENTRIES}",
+            limits.queue_entries.get()
+        );
+        return Err(Error::InvalidConfiguration);
+    };
     let bytes = extra
         .checked_mul(uring_runtime::reactor::SUBMISSION_BYTES)
         .and_then(|bytes| limits.request_context_bytes.get().checked_add(bytes))
@@ -3477,6 +3485,26 @@ mod ublk_tests {
             config.limits.request_context_bytes.get()
                 + 3 * 16 * 2 * uring_runtime::reactor::SUBMISSION_BYTES
         );
+    }
+
+    #[test]
+    fn largest_accepted_ublk_config_leaves_room_for_ordinary_queue() {
+        let tags = crate::config::MAX_UBLK_TAGS;
+        let mut limits = crate::test_support::cluster::config(false).limits;
+        // Half of the cap stays for the worker's ordinary queue.
+        limits.queue_entries = NonZeroUsize::new(MAX_UBLK_QUEUE_ENTRIES - 2 * tags).unwrap();
+        reserve_ublk_submissions(&ublk(1, tags as u16), &mut limits).unwrap();
+        assert_eq!(limits.queue_entries.get(), MAX_UBLK_QUEUE_ENTRIES);
+        // One more ordinary entry no longer fits and is refused, not clamped.
+        let mut limits = crate::test_support::cluster::config(false).limits;
+        limits.queue_entries = NonZeroUsize::new(MAX_UBLK_QUEUE_ENTRIES - 2 * tags + 1).unwrap();
+        let before = limits.clone();
+        assert_eq!(
+            reserve_ublk_submissions(&ublk(1, tags as u16), &mut limits),
+            Err(Error::InvalidConfiguration)
+        );
+        assert_eq!(limits.queue_entries, before.queue_entries);
+        assert_eq!(limits.request_context_bytes, before.request_context_bytes);
     }
 
     #[test]

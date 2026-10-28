@@ -180,6 +180,12 @@ pub const UBLK_IO_UNIT: u32 = 4096;
 pub const MAX_UBLK_DEVICE_ID: u32 = (1 << 20) - 1;
 /// Largest accepted number of ublk devices.
 pub const MAX_UBLK_DEVICES: usize = 64;
+/// Largest accepted `devices * RACER_UBLK_QUEUE_DEPTH`. Every worker serves
+/// one queue of every device and reserves two reactor queue entries per tag
+/// on top of its ordinary queue, which the runtime caps at 16384 entries.
+/// This bound keeps the ublk share at no more than half of that cap, so a
+/// setting that could never start is refused while parsing the configuration.
+pub const MAX_UBLK_TAGS: usize = 4096;
 /// Byte limit for `RACER_UBLK_DEVICES`. Larger than the 4096 used for other
 /// variables so that [`MAX_UBLK_DEVICES`] entries with long names still fit.
 pub const MAX_UBLK_DEVICES_TEXT: usize = 64 * 1024;
@@ -262,6 +268,13 @@ fn parse_ublk(
         Some(text) => serde_json::from_str(text).map_err(|_| Error::InvalidConfiguration)?,
     };
     if raw.len() > MAX_UBLK_DEVICES {
+        return Err(Error::InvalidConfiguration);
+    }
+    if raw.len() * usize::from(queue_depth) > MAX_UBLK_TAGS {
+        eprintln!(
+            "racer-dataplane: component=ublk stage=config error=too many tags devices={} queue_depth={queue_depth} limit={MAX_UBLK_TAGS}",
+            raw.len()
+        );
         return Err(Error::InvalidConfiguration);
     }
     let mut ids = std::collections::HashSet::new();
@@ -2935,11 +2948,20 @@ mod tests {
     fn ublk_device_count_is_capped() {
         let device = |i: usize| format!(r#"{{"cache":"c{i}","key":"{UBLK_KEY}"}}"#);
         let list = |n: usize| format!("[{}]", (0..n).map(device).collect::<Vec<_>>().join(","));
+        // The full device count fits only with a depth inside MAX_UBLK_TAGS.
+        let depth = (MAX_UBLK_TAGS / MAX_UBLK_DEVICES).to_string();
+        let devices = |n: usize| {
+            parse(&[
+                ("RACER_UBLK_DEVICES", list(n).as_str()),
+                ("RACER_UBLK_QUEUE_DEPTH", depth.as_str()),
+            ])
+            .map(|config| config.ublk)
+        };
         assert_eq!(
-            ublk_devices(&list(MAX_UBLK_DEVICES)).unwrap().devices.len(),
+            devices(MAX_UBLK_DEVICES).unwrap().devices.len(),
             MAX_UBLK_DEVICES
         );
-        assert!(ublk_devices(&list(MAX_UBLK_DEVICES + 1)).is_err());
+        assert!(devices(MAX_UBLK_DEVICES + 1).is_err());
     }
 
     #[test]
@@ -2965,6 +2987,30 @@ mod tests {
         for bad in ["0", "4097", "65536", "-1", "+1", "", "x"] {
             assert!(depth(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn ublk_tags_across_devices_are_bounded() {
+        let config = |devices: usize, depth: u16| {
+            let list = (0..devices)
+                .map(|i| format!(r#"{{"cache":"c{i}","key":"{UBLK_KEY}"}}"#))
+                .collect::<Vec<_>>()
+                .join(",");
+            parse(&[
+                ("RACER_UBLK_DEVICES", format!("[{list}]").as_str()),
+                ("RACER_UBLK_QUEUE_DEPTH", depth.to_string().as_str()),
+            ])
+            .map(|c| c.ublk)
+        };
+        // Exactly at the limit, in both shapes.
+        assert_eq!(config(1, 4096).unwrap().devices.len(), 1);
+        assert_eq!(config(32, 128).unwrap().devices.len(), 32);
+        // One tag over the limit.
+        assert!(matches!(config(2, 2049), Err(Error::InvalidConfiguration)));
+        assert!(matches!(config(64, 128), Err(Error::InvalidConfiguration)));
+        assert!(matches!(config(64, 4096), Err(Error::InvalidConfiguration)));
+        // No devices means no tags, whatever the depth.
+        assert!(!config(0, 4096).unwrap().enabled());
     }
 
     #[test]
