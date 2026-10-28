@@ -24,17 +24,24 @@ def main():
     path = sys.argv[1]
     step = int(sys.argv[2]) if len(sys.argv) > 2 else 5
     nodes = {}
+    skipped = 0
     for line in open(path):
         f = line.split()
         if not f or f[0] != "NIC":
             continue
         samples = []
-        for s in f[2:]:
-            i, tx, rx = s.split(":")
-            samples.append((int(i), int(tx), int(rx)))
+        try:
+            for s in f[2:]:
+                i, tx, rx = s.split(":")
+                samples.append((int(i), int(tx), int(rx)))
+        except ValueError:
+            skipped += 1
+            continue
         nodes[f[1]] = samples
     if not nodes:
         sys.exit("no NIC lines")
+    if skipped:
+        print(f"skipped {skipped} malformed NIC lines")
     n = min(len(s) for s in nodes.values())
     mb = 1e6
     print(f"nodes={len(nodes)} seconds={n - 1} (rates MB/s over {step}s windows)")

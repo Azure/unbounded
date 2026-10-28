@@ -46,6 +46,8 @@ func main() {
 	layerBytes := flag.Int64("layer-bytes", 1<<30, "random payload bytes per layer")
 	seed := flag.Uint64("seed", uint64(time.Now().UnixNano()), "PRNG seed")
 	parallel := flag.Int("parallel", 8, "layers generated and pushed in parallel")
+	created := flag.String("created", time.Now().UTC().Format(time.RFC3339),
+		"image config creation time; fix it together with -seed to push identical images to several registries")
 
 	flag.Parse()
 
@@ -88,7 +90,7 @@ func main() {
 	config := map[string]any{
 		"architecture": "amd64",
 		"os":           "linux",
-		"created":      time.Now().UTC().Format(time.RFC3339),
+		"created":      *created,
 		"config":       map[string]any{"Cmd": []string{"/data/none"}},
 		"rootfs":       map[string]any{"type": "layers", "diff_ids": diffIDs},
 	}

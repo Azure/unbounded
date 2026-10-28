@@ -29,9 +29,19 @@ if [[ -z ${BENCH_CONTEXT:-} || $(kubectl config current-context) != "$BENCH_CONT
 	exit 1
 fi
 
+# origin_ips lists the IPs of every origin registry replica. The Service
+# spreads connections over them, so each replica must hold the same images.
+origin_ips() {
+	kubectl -n "$NS" get pod -l app=origin -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}'
+}
+
+# origin_tx sums network egress over all origin replicas.
 origin_tx() {
-	kubectl -n "$NS" exec "$(tools_pod)" -- wget -qO- http://origin:5001/metrics |
-		awk '$1 == "process_network_transmit_bytes_total" {printf "%.0f\n", $2}'
+	local tools ip
+	tools=$(tools_pod)
+	for ip in $(origin_ips); do
+		kubectl -n "$NS" exec "$tools" -- wget -qO- "http://$ip:5001/metrics"
+	done | awk '$1 == "process_network_transmit_bytes_total" {s += $2} END {printf "%.0f\n", s}'
 }
 
 tools_pod() {
@@ -165,10 +175,25 @@ EOF
 	kubectl -n "$NS" delete ds diskprep --wait=false >/dev/null
 }
 
+# cmd_gen pushes the same image (fixed seed and creation time) to every
+# origin replica and prints its repo@digest once all pushes agree.
 cmd_gen() {
 	local name=$1 layers=$2 bytes=$3
-	kubectl -n "$NS" exec "$(tools_pod)" -- /tmp/genimage -registry http://origin:5000 \
-		-repo "bench/$name" -layers "$layers" -layer-bytes "$bytes" -parallel 8
+	local tools seed created ip refs
+	tools=$(tools_pod)
+	seed=$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')
+	created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+	refs=$(for ip in $(origin_ips); do
+		kubectl -n "$NS" exec "$tools" -- /tmp/genimage -registry "http://$ip:5000" \
+			-repo "bench/$name" -layers "$layers" -layer-bytes "$bytes" -parallel 8 \
+			-seed "$seed" -created "$created" &
+	done | sort -u)
+	wait
+	if [ "$(printf '%s\n' "$refs" | grep -c .)" -ne 1 ]; then
+		echo "origin replicas disagree: $refs" >&2
+		exit 1
+	fi
+	echo "$refs"
 }
 
 cmd_run() {
@@ -331,8 +356,14 @@ EOF
 # collect prints READY/RESULT/ERROR lines from every pod of a run.
 collect() {
 	local name=$1
+	# Each pod's lines go to their own file so that concurrent writers cannot
+	# interleave long NIC lines (pipe writes over PIPE_BUF are not atomic).
+	local dir
+	dir=$(mktemp -d "$OUT/collect.XXXXXX")
 	kubectl -n "$NS" get pods -l run="$name" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' |
-		xargs -P 64 -I{} sh -c "kubectl -n $NS logs {} 2>/dev/null | grep -E '^(READY|RESULT|ERROR|NIC)' || true"
+		xargs -P 64 -I{} sh -c "kubectl -n $NS logs {} 2>/dev/null | grep -E '^(READY|RESULT|ERROR|NIC)' > $dir/{} || true"
+	cat "$dir"/* 2>/dev/null || true
+	rm -rf "$dir"
 }
 
 cmd_summarize() {

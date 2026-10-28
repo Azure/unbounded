@@ -1,6 +1,8 @@
 # In-cluster origin registry for the Gantry vs Gantry+Racer benchmark.
-# Plain HTTP distribution registry pinned to one system node, backed by the
-# node's local disk, so origin bandwidth is the same for every run.
+# Plain HTTP distribution registry, one replica per system node, each backed by
+# its node's local disk. Replicas do not share storage: `bench.sh gen` pushes
+# identical images to every replica, and the Service spreads pulls over them so
+# origin bandwidth is the same for every run.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -12,7 +14,11 @@ metadata:
   name: origin
   namespace: gantry-bench
 spec:
-  replicas: 1
+  replicas: 3
+  # Replicas are pinned one per system node by anti-affinity, so a rolling
+  # update has nowhere to place a surge pod.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: origin
@@ -22,7 +28,14 @@ spec:
         app: origin
     spec:
       nodeSelector:
-        kubernetes.io/hostname: aks-system-36530849-vmss000002
+        kubernetes.azure.com/mode: system
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: origin
+              topologyKey: kubernetes.io/hostname
       containers:
         - name: registry
           image: ghcr.io/distribution/distribution:3.0.0
