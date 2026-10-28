@@ -66,6 +66,11 @@ type Config struct {
 	RacerMaxConnections           int `yaml:"racer_max_connections"`
 	RacerOriginConcurrentRequests int `yaml:"racer_origin_concurrent_requests"`
 
+	// RacerRetryBudget bounds the total backoff one mirror request may spend
+	// retrying transient Racer failures, including resuming a response body
+	// after a mid-stream failure. Zero disables retries; negative is invalid.
+	RacerRetryBudget time.Duration `yaml:"racer_retry_budget"`
+
 	// ---------- Listeners ----------
 
 	// MirrorListen is the loopback address for containerd's mirror endpoint
@@ -491,6 +496,7 @@ func NewDefault() *Config {
 		RacerEnabled:                  false,
 		RacerMaxConnections:           64,
 		RacerOriginConcurrentRequests: 64,
+		RacerRetryBudget:              30 * time.Second,
 		MirrorListen:                  "127.0.0.1:5000",
 		MirrorBindAllowNonLoopback:    false,
 		TransferListen:                "0.0.0.0:5001",
@@ -690,6 +696,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setBool("RACER_ENABLED", &c.RacerEnabled)
 	setInt("RACER_MAX_CONNECTIONS", &c.RacerMaxConnections)
 	setInt("RACER_ORIGIN_CONCURRENT_REQUESTS", &c.RacerOriginConcurrentRequests)
+	setDur("RACER_RETRY_BUDGET", &c.RacerRetryBudget)
 	setStr("MIRROR_LISTEN", &c.MirrorListen)
 	setBool("MIRROR_BIND_ALLOW_NON_LOOPBACK", &c.MirrorBindAllowNonLoopback)
 	setStr("TRANSFER_LISTEN", &c.TransferListen)
@@ -792,6 +799,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.RacerMaxConnections, "racer-max-connections", c.RacerMaxConnections, "Racer bulk connection and live value limit (0 uses 64)")
 	fs.IntVar(&c.RacerOriginConcurrentRequests, "racer-origin-concurrent-requests", c.RacerOriginConcurrentRequests, "Racer origin concurrent GET callback and body limit (0 uses 64)")
+	fs.DurationVar(&c.RacerRetryBudget, "racer-retry-budget", c.RacerRetryBudget, "Total backoff per mirror request for retrying transient Racer failures (0 disables retries)")
 	fs.StringVar(&c.MirrorListen, "mirror-listen", c.MirrorListen, "address for the containerd-facing mirror endpoint (loopback)")
 	fs.BoolVar(&c.MirrorBindAllowNonLoopback, "mirror-bind-allow-non-loopback", c.MirrorBindAllowNonLoopback, "opt in to a non-loopback mirror bind (e.g. when using hostPort + hostIP=127.0.0.1 in Kubernetes)")
 	fs.StringVar(&c.TransferListen, "transfer-listen", c.TransferListen, "address for the peer-facing transfer endpoint")
@@ -1101,6 +1109,10 @@ func (c *Config) Validate() error {
 			if value < 0 {
 				errs = append(errs, fmt.Errorf("%s: must be >= 0 (zero selects the default)", field))
 			}
+		}
+
+		if c.RacerRetryBudget < 0 {
+			errs = append(errs, fmt.Errorf("racer_retry_budget: must be >= 0 (zero disables retries), got %v", c.RacerRetryBudget))
 		}
 
 		return errors.Join(errs...)
