@@ -132,8 +132,10 @@ sequential reader also starts the next page early.
 1. On stop, or when a device fails, the control thread sends `STOP_DEV`. It does this for
    every device it added, started or not. The kernel waits for requests already handed to
    workers, which workers keep serving while they drain. Until the control thread exits,
-   each worker keeps its read mailbox open and does not stop its flights, so these reads can
-   still reach the cache, peers, and origin.
+   each worker keeps its read mailbox open, does not stop its flights, and leaves its
+   buffer quotas open, so these reads can still reach the cache, peers, and origin. New
+   client connections are still refused. The quotas stop once the control thread exits or
+   the drain deadline passes.
 2. The kernel then completes every outstanding fetch with `UBLK_IO_RES_ABORT` (`-ENODEV`).
    This also happens for a device that was never started (checked by a root test on 7.0).
    When all tags of a queue are aborted, the worker closes its `/dev/ublkcN` descriptor.
@@ -239,7 +241,8 @@ fetching the next page, at most two pages at a time per queue.
 - Unit tests for `DirectoryBackend` and `DirectorySource` over a real `WorkerDirectory` and
   read worker with a scripted origin: missing cache, fresh and pinned lookups, page bytes,
   and version and not-found errors.
-- Tests that a stopping worker keeps its read mailbox open until the control thread exits.
+- Tests that a stopping worker keeps its read mailbox and buffer quotas open until the
+  control thread exits, and stops the quotas at the drain deadline.
 - Root-only tests, run with `RACER_UBLK_TEST=1` as root:
   - The raw kernel interface, round trip.
   - `STOP_DEV` before `START_DEV` aborts every fetch, and `ASYNC_CANCEL` of a fetch returns

@@ -1157,6 +1157,18 @@ impl WorkerApplication {
             .is_some_and(|manager| !manager.control_done())
     }
 
+    /// Stop the worker quotas once ublk no longer holds reads, or at once when
+    /// `force` is set (the drain deadline passed). Until then ublk reads of
+    /// uncached pages, and the peer fills they cause, still reserve buffers.
+    fn release_ublk_quotas(&self, force: bool) {
+        let admission = &self.runtime.admission;
+        if !admission.policy().stop_deferred() || (!force && self.ublk_holds_reads()) {
+            return;
+        }
+        admission.policy().defer_stop(false);
+        admission.stop();
+    }
+
     /// All constructors below only connect dependencies. Runtime commands route
     /// listener work to page/metadata owners before any acquisition is dispatched.
     pub fn assemble(
@@ -1472,6 +1484,8 @@ impl WorkerApplication {
             }
         }
         let ublk = Self::assemble_ublk(config, &node, worker, &runtime, &snapshots)?;
+        // Worker shutdown must not stop the quotas while devices still read.
+        runtime.admission.policy().defer_stop(ublk.is_some());
         Ok(Self {
             ublk,
             ingress_peers: futures::stream::FuturesUnordered::new(),
@@ -2568,6 +2582,7 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
                 .transition(crate::telemetry::State::Draining)?;
         }
         self.clients.stop_admission();
+        self.release_ublk_quotas(false);
         // ublk reads go through every worker's mailbox. STOP_DEV waits for
         // them, so keep the mailbox open until the devices are stopped.
         if !self.ublk_holds_reads()
@@ -2621,6 +2636,7 @@ impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
                     // The control thread did not stop the devices in time.
                     ublk.abandon();
                 }
+                self.release_ublk_quotas(deadline.check().is_err());
                 if let Err(error) = self.poll_services(cx, 64) {
                     first_error.get_or_insert(error);
                 }
@@ -3564,6 +3580,88 @@ mod ublk_tests {
         assert!(!worker.ublk_holds_reads());
         uring_runtime::group::Service::stop_admission(&mut worker).unwrap();
         assert!(!admitting(&worker));
+    }
+
+    fn reserve_page(admission: &flow_control::Quotas<AdmissionPolicy>) -> Result<()> {
+        admission
+            .reserve(
+                None,
+                crate::admission::ResourceClass::Plaintext,
+                crate::model::PAGE_BYTES as usize,
+            )
+            .map(drop)
+            .map_err(Into::into)
+    }
+
+    /// Wrap the worker like `build_lane` so the I/O service stop runs too.
+    fn lane(
+        worker: WorkerApplication,
+    ) -> (
+        Box<dyn uring_runtime::group::Service<RequestScope>>,
+        Rc<flow_control::Quotas<AdmissionPolicy>>,
+    ) {
+        let admission = worker.runtime.admission.clone();
+        let runtime = WorkerRuntime {
+            reactor: worker.runtime.reactor.clone(),
+            admission: admission.clone(),
+            crypto: worker.runtime.crypto.clone(),
+        };
+        (
+            crate::worker::io_service(runtime, Box::new(worker)),
+            admission,
+        )
+    }
+
+    #[test]
+    fn stop_admission_stops_quotas_without_ublk() {
+        let (mut service, admission) = lane(worker_with(None));
+        assert!(!admission.policy().stop_deferred());
+        service.stop_admission().unwrap();
+        assert!(admission.is_stopped());
+        assert!(reserve_page(&admission).is_err());
+    }
+
+    #[test]
+    fn ublk_reads_reserve_plaintext_until_devices_stop() {
+        let manager = Arc::new(crate::ublk::manager::Manager::new(
+            &ublk(1, 4),
+            2,
+            std::path::Path::new("/nonexistent-ublk-test"),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ));
+        let worker = worker_with(Some((manager.clone(), ublk(1, 4))));
+        let (mut service, admission) = lane(worker);
+        service.stop_admission().unwrap();
+        // An uncached ublk page, local or filled for a peer, still needs a
+        // plaintext reservation while STOP_DEV waits for the read.
+        assert!(!admission.is_stopped());
+        reserve_page(&admission).expect("ublk read admitted during drain");
+        manager.run();
+        assert!(manager.control_done());
+        service.stop_admission().unwrap();
+        assert!(admission.is_stopped());
+        assert!(reserve_page(&admission).is_err());
+    }
+
+    #[test]
+    fn ublk_quotas_stop_at_drain_deadline() {
+        let manager = Arc::new(crate::ublk::manager::Manager::new(
+            &ublk(1, 4),
+            2,
+            std::path::Path::new("/nonexistent-ublk-test"),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ));
+        let mut worker = worker_with(Some((manager.clone(), ublk(1, 4))));
+        uring_runtime::group::Service::stop_admission(&mut worker).unwrap();
+        worker.release_ublk_quotas(false);
+        assert!(!worker.runtime.admission.is_stopped());
+        // Devices still hold reads, but the deadline forces the stop.
+        assert!(worker.ublk_holds_reads());
+        worker.release_ublk_quotas(true);
+        assert!(worker.runtime.admission.is_stopped());
+        assert!(!worker.runtime.admission.policy().stop_deferred());
     }
 }
 
