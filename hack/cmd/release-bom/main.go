@@ -43,6 +43,7 @@ var releaseImageNames = []string{
 	"orca",
 	"racer-dataplane",
 	"racer-object",
+	"racer-vllm",
 	"token-refresher",
 	"unbounded-net-controller",
 	"unbounded-net-node",
