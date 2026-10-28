@@ -1,4 +1,10 @@
 //! Event-driven read path over real node logic.
+//!
+//! One client page read: dispatch to a worker, then the memory and disk indexes. A miss joins the
+//! worker's `PageFlights`; the leader drives `racer_core::read::walk::Fill`, routing each probe hop
+//! by hop (`decide_hop`, `search_budget`/`relay`). The destination applies `serve_action`. Only a
+//! walk that ends with validated origin authority reaches origin; publication inserts into memory
+//! and applies the `persist` rule.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -1683,7 +1689,7 @@ impl NodeWorld {
         let cap = (self.config.memory_pages / u32::from(self.fabric.workers)).max(1) as usize;
         let memory = &mut self.nodes[node as usize].workers[w as usize].memory;
         // Production `MemoryCache::publish` keeps a resident page's position: a duplicate publish
-        // is not a use (`src/memory.rs`, "must not ...
+        // is not a use and must not renew freshness (`src/memory.rs`).
         if memory.pages.contains_key(&page) {
             return;
         }
@@ -2123,7 +2129,8 @@ impl NodeWorld {
         };
         // Production asks predecessors under the previous membership only within
         // `PREVIOUS_MEMBERSHIP_WITHIN` of replacing it, and only with grace retention on
-        // (`Published::resolve_recent`), so peers still resolve it.
+        // (`Published::resolve_recent`), so peers still resolve it. Measuring from the version's
+        // publication is the stricter of the two.
         let recent = ranking == Ranking::Previous && {
             let (member, recent) = self.previous_facts(id);
             member && recent
@@ -2200,8 +2207,8 @@ impl NodeWorld {
         let rank = cands.iter().position(|c| *c == node);
         let me = members.position(&node.to_be_bytes());
         let neighbor = |r: usize| matches!((me, members.position(&cands[r].to_be_bytes())), (Some(a), Some(b)) if members.is_neighbor(a, b));
-        // Arrival order of the owners in this node's chain (production `Membership::since`, Known
-        // issue 25): the shared chain clamped to the generation this node's process started from.
+        // Arrival order of the owners in this node's chain (production `Membership::since`): the
+        // shared chain clamped to the generation this node's process started from.
         let since = self.since_of(node, members, cands);
         let mut ranked = Ranked::new(version, cands, rank);
         ranked.members = members.members().len();
@@ -2376,7 +2383,7 @@ impl NodeWorld {
             });
         }
         if notes & Notes::RANK0_LEFT != 0 {
-            // rank 0's own acquisition failed.
+            // Rank 0's own acquisition failed.
             let fill = &self.fills[&id];
             let rank0 = fill.core.owners.first().copied();
             if fill
@@ -3327,13 +3334,12 @@ impl NodeWorld {
             self.engine.at(arrive, Event::Hop { msg: mid });
         } else {
             self.metrics.incr("link_failures");
-            if partitioned {
-                if let Some(m) = self.msgs.get(&mid)
-                    && m.offer
-                {
-                    // A copy offer crossed the cut.
-                    self.metrics.incr("partition_link_failures_offers");
-                }
+            if partitioned
+                && let Some(m) = self.msgs.get(&mid)
+                && m.offer
+            {
+                // A copy offer crossed the cut.
+                self.metrics.incr("partition_link_failures_offers");
             }
             if unready {
                 // A member that has not applied a membership yet: no peer listener.
@@ -4300,8 +4306,9 @@ impl NodeWorld {
         self.origin_check_at(id)
     }
 
-    /// Counter for the rendezvous rank of `holder` for fill `id`'s page in the fill's membership,
-    /// and whether it arrived before the fetching owner (so a lineage rule could have named it):.
+    /// Classify a repeated origin request for a page against the last request `A` for it: rank 0
+    /// moved, `A` failed, `A` still in flight (concurrent), `A` lost its copy, or `A` still holds it
+    /// (`origin_repeats_held_*`, the avoidable class unless a skip, orphan or race).
     fn classify_repeat(&mut self, id: u64) {
         let now = self.now();
         let fill = &self.fills[&id];
@@ -4759,11 +4766,11 @@ impl NodeWorld {
             } = n;
             let ids = &self.ids;
             let owned = |p: &u64| match (&members, me) {
-                (Some(m), Some(me)) => workers[ids.worker(*p) as usize].placement.is_owner(
-                    &*m,
-                    &p.to_be_bytes(),
-                    |o| o == me,
-                ),
+                (Some(m), Some(me)) => {
+                    workers[ids.worker(*p) as usize]
+                        .placement
+                        .is_owner(m, &p.to_be_bytes(), |o| o == me)
+                }
                 _ => false,
             };
             let _ = disk
