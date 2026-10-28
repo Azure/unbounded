@@ -97,14 +97,17 @@ impl Drop for PollGuard<'_> {
     }
 }
 
+/// Hold the one long poll `node` may have open, admitted by
+/// [`crate::step::admission::start_poll`] against `current`.
 fn admit_poll<'a>(
     set: &'a RefCell<HashSet<String>>,
     node: &str,
+    after: Option<u64>,
+    current: Option<u64>,
 ) -> Result<PollGuard<'a>, ProtocolFailure> {
-    if !set.borrow_mut().insert(node.into()) {
-        return Err(ProtocolFailure::Overloaded);
-    }
-    Ok(PollGuard(set, node.into()))
+    let node = node.to_string();
+    start_poll(&mut set.borrow_mut(), &node, after, current)?;
+    Ok(PollGuard(set, node))
 }
 
 /// Parse `after=N`. Absent means no cursor. Zero is a conflict.
@@ -123,7 +126,7 @@ pub fn cursor(query: Option<&str>) -> Result<Option<u64>, ProtocolFailure> {
     Ok(Some(n))
 }
 
-use crate::step::admission::check_ahead;
+use crate::step::admission::start_poll;
 
 fn pki_failure(e: PkiError) -> ProtocolFailure {
     match e {
@@ -644,10 +647,8 @@ impl Server {
         chain: &[Vec<u8>],
     ) -> Result<Reply<'_>, ProtocolFailure> {
         let id = self.certificate(chain)?;
-        let poll = admit_poll(&self.polls, &id.node)?;
-        let image = self.shared.image().ok_or(ProtocolFailure::Unavailable)?;
-        check_ahead(after, image.record.sequence)?;
-        drop(image);
+        let current = self.shared.image().map(|i| i.record.sequence);
+        let poll = admit_poll(&self.polls, &id.node, after, current)?;
         let deadline = self.poll_deadline(id.expires)?;
         let newer = |i: &Image| crate::step::admission::newer(after, i.record.sequence);
         let found = self
@@ -719,9 +720,8 @@ impl Server {
             let id = self.certificate(chain)?;
             (id.node, id.expires)
         };
-        let poll = admit_poll(&self.keyring_polls, &node)?;
-        let (generation, _) = self.shared.bundle().ok_or(ProtocolFailure::Unavailable)?;
-        check_ahead(after, generation)?;
+        let current = self.shared.bundle().map(|(g, _)| g);
+        let poll = admit_poll(&self.keyring_polls, &node, after, current)?;
         let deadline = self.poll_deadline(expires)?;
         let newer = || {
             self.shared
@@ -1272,10 +1272,7 @@ mod tests {
 
     #[test]
     fn lagging_seat_cursor_is_unavailable() {
-        assert_eq!(check_ahead(None, 5), Ok(()));
-        assert_eq!(check_ahead(Some(5), 5), Ok(()));
-        assert_eq!(check_ahead(Some(4), 5), Ok(()));
-        let e = check_ahead(Some(6), 5).unwrap_err();
+        let e = crate::step::admission::check_ahead(Some(6), 5).unwrap_err();
         assert_eq!(e, ProtocolFailure::Unavailable);
         let r = String::from_utf8(error_response(e)).unwrap();
         assert!(r.starts_with("HTTP/1.1 503") && r.contains("Retry-After: 1"));
@@ -2027,13 +2024,13 @@ mod tests {
     #[test]
     fn poll_admission_is_per_node() {
         let set = RefCell::new(HashSet::new());
-        let g = admit_poll(&set, "n").unwrap();
+        let g = admit_poll(&set, "n", None, Some(1)).unwrap();
         assert_eq!(
-            admit_poll(&set, "n").err(),
+            admit_poll(&set, "n", None, Some(1)).err(),
             Some(ProtocolFailure::Overloaded)
         );
-        assert!(admit_poll(&set, "m").is_ok());
+        assert!(admit_poll(&set, "m", None, Some(1)).is_ok());
         drop(g);
-        assert!(admit_poll(&set, "n").is_ok());
+        assert!(admit_poll(&set, "n", None, Some(1)).is_ok());
     }
 }

@@ -168,6 +168,35 @@ pub enum Poll {
     Wait,
 }
 
+/// Start a long poll for `node` against `current` (`None` when the seat
+/// has nothing to serve). One poll per node: a second answers 429. On `Ok`
+/// the poll stays in `set` until the caller removes it; on `Err` it is not
+/// held.
+pub fn start_poll<K: Eq + std::hash::Hash + Clone>(
+    set: &mut HashSet<K>,
+    node: &K,
+    after: Option<u64>,
+    current: Option<u64>,
+) -> Result<Poll, ProtocolFailure> {
+    if !set.insert(node.clone()) {
+        return Err(ProtocolFailure::Overloaded);
+    }
+    let result = match current {
+        None => Err(ProtocolFailure::Unavailable),
+        Some(c) => check_ahead(after, c).map(|()| {
+            if newer(after, c) {
+                Poll::Reply
+            } else {
+                Poll::Wait
+            }
+        }),
+    };
+    if result.is_err() {
+        set.remove(node);
+    }
+    result
+}
+
 /// A long poll queued for a write slot, in simulator terms: the client,
 /// its connection epoch, and the clock (ns) after which it gives up.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -212,7 +241,7 @@ impl SeatAdmission {
         after: Option<u64>,
         current: Option<u64>,
     ) -> Result<Poll, ProtocolFailure> {
-        Self::poll(&mut self.polls, node, after, current)
+        start_poll(&mut self.polls, &node, after, current)
     }
 
     /// Start a keyring long poll, like [`SeatAdmission::snapshot`].
@@ -222,32 +251,7 @@ impl SeatAdmission {
         after: Option<u64>,
         generation: Option<u64>,
     ) -> Result<Poll, ProtocolFailure> {
-        Self::poll(&mut self.keyring_polls, node, after, generation)
-    }
-
-    fn poll(
-        set: &mut HashSet<u32>,
-        node: u32,
-        after: Option<u64>,
-        current: Option<u64>,
-    ) -> Result<Poll, ProtocolFailure> {
-        if !set.insert(node) {
-            return Err(ProtocolFailure::Overloaded);
-        }
-        let result = match current {
-            None => Err(ProtocolFailure::Unavailable),
-            Some(c) => check_ahead(after, c).map(|()| {
-                if newer(after, c) {
-                    Poll::Reply
-                } else {
-                    Poll::Wait
-                }
-            }),
-        };
-        if result.is_err() {
-            set.remove(&node);
-        }
-        result
+        start_poll(&mut self.keyring_polls, &node, after, generation)
     }
 
     /// The poll of `node` finished (reply written or 204).
