@@ -1214,7 +1214,9 @@ jobs:
   # Publish the Python packages to PyPI with trusted publishing (OIDC, no
   # stored token). Runs only when the repository variable PYPI_PUBLISH is
   # "true", after the PyPI projects trust this workflow and the "pypi"
-  # environment. Prereleases are not published.
+  # environment. Prereleases are not published. The packages carry their own
+  # versions in pyproject.toml; bump them to publish a new version. A version
+  # already on PyPI is skipped, so a re-run of this job succeeds.
   # ---------------------------------------------------------------------------
   pypi-publish:
     needs: [version, python-packages]
@@ -1230,9 +1232,10 @@ jobs:
           path: dist
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@ec4db0b4ddc65acdf4bff5fa45ac92d78b56bdf0 # v1.9.0
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           packages-dir: dist
+          skip-existing: true
 
   # ---------------------------------------------------------------------------
   # Attach the manifests tarball + krew manifest to the draft release that
