@@ -1,0 +1,43 @@
+# Workaround: racer-dataplane refuses to start (fatal InvalidConfiguration)
+# when slab files/checkpoints on disk were written with a different
+# RACER_SLAB_BYTES or worker count. This DaemonSet wipes the slab directory
+# once per node while no racer-dataplane process is running.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: slabwipe
+  namespace: gantry-bench
+spec:
+  selector:
+    matchLabels: {app: slabwipe}
+  template:
+    metadata:
+      labels: {app: slabwipe}
+    spec:
+      hostPID: true
+      nodeSelector:
+        kubernetes.azure.com/agentpool: ddsv6
+      tolerations: [{operator: Exists}]
+      containers:
+      - name: wipe
+        image: mcr.microsoft.com/azurelinux/busybox:1.36
+        securityContext: {privileged: true}
+        env:
+        - name: MARK
+          value: "1"
+        command:
+        - chroot
+        - /host
+        - bash
+        - -c
+        - |
+          m=/var/lib/racer/.bench-wiped-$MARK
+          while [ ! -e $m ]; do
+            if ! pgrep -x racer-dataplane >/dev/null; then
+              rm -f /var/lib/racer/slabs/*; touch $m; echo "WIPED $(hostname)"; break
+            fi
+            sleep 1
+          done
+          sleep infinity
+        volumeMounts: [{name: host, mountPath: /host}]
+      volumes: [{name: host, hostPath: {path: /}}]
