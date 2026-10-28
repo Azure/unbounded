@@ -858,16 +858,13 @@ impl Manager {
             Err(error) if error.errno() == Some(libc::ENODEV) => return true,
             Err(error) => return fail("info", &error),
         }
-        if let Err(error) = control.stop_dev(id)
-            && error.errno() != Some(libc::ENODEV)
-        {
-            return fail("stop", &error);
-        }
-        // Hold the character device so the id cannot be reused while it is
-        // deleted. Without it, a DEL_DEV retry could delete another
-        // process's new device that took the id between attempts, so a
-        // device whose node cannot be opened is left for manual cleanup.
-        // A live server elsewhere holds it and makes the open fail.
+        // Hold the character device before sending any command by id, so
+        // the id cannot be reused while the device is stopped and deleted.
+        // Without it, a DEL_DEV retry could delete another process's new
+        // device that took the id between attempts, so a device whose node
+        // cannot be opened is left for manual cleanup. A live server
+        // elsewhere holds it and makes the open fail, so its device is
+        // never stopped.
         let fd = match control.open_char(&self.device_directory, id) {
             Ok(fd) => fd,
             Err(error) if error.raw_os_error() == Some(libc::EBUSY) => {
@@ -883,6 +880,14 @@ impl Manager {
                 );
             }
         };
+        if let Err(error) = control.stop_dev(id)
+            && error.errno() != Some(libc::ENODEV)
+        {
+            if control.is_poisoned() {
+                std::mem::forget(fd);
+            }
+            return fail("stop", &error);
+        }
         match control.del_dev(id) {
             Ok(()) => true,
             Err(error) => {
@@ -1452,14 +1457,33 @@ mod tests {
             manager.request_stop();
             thread.join().unwrap();
             let ops = fake.ops();
-            assert_eq!(ops[..3], ["info 9", "stop 9", "open 9 failed"], "{ops:?}");
+            assert_eq!(ops[..2], ["info 9", "open 9 failed"], "{ops:?}");
             assert!(
-                !ops.iter()
-                    .any(|op| op.starts_with("del") || op.starts_with("add")),
-                "errno {errno}: no delete without a held char device: {ops:?}"
+                !ops.iter().any(|op| op.starts_with("stop")
+                    || op.starts_with("del")
+                    || op.starts_with("add")),
+                "errno {errno}: no command by id without a held char device: {ops:?}"
             );
             assert!(view(&manager, 0).attach.is_none());
         }
+    }
+
+    #[test]
+    fn fixed_id_stale_device_that_fails_to_stop_is_not_deleted() {
+        let manager = manager(Some(9));
+        let fake = Fake {
+            stale: true,
+            ..Default::default()
+        };
+        *fake.stop_errno.lock().unwrap() = Some(libc::EIO);
+        let thread = spawn(&manager, &fake);
+        manager.report_resolved(0, Ok(resolved()));
+        eventually("stop", || fake.ops().contains(&"stop 9".to_string()));
+        manager.request_stop();
+        thread.join().unwrap();
+        let ops = fake.ops();
+        assert_eq!(ops, ["info 9", "stop 9"]);
+        assert!(view(&manager, 0).attach.is_none());
     }
 
     fn device(id: Option<u32>, seed: u8) -> UblkDeviceConfig {
