@@ -270,6 +270,69 @@ func TestRenamedContainment(t *testing.T) {
 	}
 }
 
+func TestRecordedStateUIDReadsRenamedObjects(t *testing.T) {
+	ns := "custom-system"
+	record := func(uid string) map[string]string {
+		return map[string]string{managerAnnotation: component.FieldOwner, stateUIDAnnotation: uid}
+	}
+	now := metav1.Now()
+
+	for label, tc := range map[string]struct {
+		objects []client.Object
+		want    string
+		err     string
+	}{
+		"no records": {},
+		"only old DaemonSet records": {
+			objects: []client.Object{&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: renamedDataplane, Namespace: ns, UID: "ds", Annotations: record("state-1")}}},
+			want:    "state-1",
+		},
+		"only old ServiceAccount records": {
+			objects: []client.Object{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: renamedDataplane, Namespace: ns, UID: "sa", Annotations: record("state-1")}}},
+			want:    "state-1",
+		},
+		"old DaemonSet terminating": {
+			objects: []client.Object{&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
+				Name: renamedDataplane, Namespace: ns, UID: "ds", Annotations: record("state-1"),
+				DeletionTimestamp: &now, Finalizers: []string{"example.com/hold"},
+			}}},
+			want: "state-1",
+		},
+		"old and new agree": {
+			objects: []client.Object{
+				&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: renamedDataplane, Namespace: ns, UID: "old", Annotations: record("state-1")}},
+				&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: dataplaneName, Namespace: ns, UID: "new", Annotations: record("state-1")}},
+			},
+			want: "state-1",
+		},
+		"old and new conflict": {
+			objects: []client.Object{
+				&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: renamedDataplane, Namespace: ns, UID: "old", Annotations: record("state-1")}},
+				&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: dataplaneName, Namespace: ns, UID: "new", Annotations: record("state-2")}},
+			},
+			err: "different racer-state UIDs",
+		},
+		"unmanaged old object ignored": {
+			objects: []client.Object{&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
+				Name: renamedDataplane, Namespace: ns, UID: "ds", Annotations: map[string]string{stateUIDAnnotation: "state-1"},
+			}}},
+		},
+	} {
+		t.Run(label, func(t *testing.T) {
+			env := testEnv(t, tc.objects...)
+
+			uid, err := recordedStateUID(t.Context(), env)
+			if tc.err != "" {
+				require.ErrorContains(t, err, tc.err)
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, tc.want, uid)
+		})
+	}
+}
+
 func TestRenamedContainmentKeepsUnmanagedGrants(t *testing.T) {
 	ns := "custom-system"
 	objects := renamedObjects(ns, func() map[string]string { return nil })
@@ -341,4 +404,17 @@ func objectKind(obj client.Object) string {
 	}
 
 	return ""
+}
+
+func TestRenamedStateRecordFailsClosed(t *testing.T) {
+	ns := "custom-system"
+	ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
+		Name: renamedDataplane, Namespace: ns, UID: "ds",
+		Annotations: map[string]string{managerAnnotation: component.FieldOwner, stateUIDAnnotation: "lost-state"},
+	}}
+	env := testEnv(t, ds, cacheObject("cache"))
+
+	// racer-state is gone, so the first pass must not mint a new identity.
+	_, _, err := (Component{}).Plan(t.Context(), env, nil)
+	require.ErrorContains(t, err, "missing")
 }

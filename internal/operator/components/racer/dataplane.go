@@ -145,35 +145,39 @@ func planDataplane(ctx context.Context, env *component.Env, plan *component.Plan
 // recordedStateUID returns the racer-state UID an existing installation runs
 // on, or empty when no managed dataplane object records one. The retired
 // controller's DaemonSet records none, so migration starts a new identity.
+// The pre-rename DaemonSet and ServiceAccount are read too, until
+// planRenamedCleanup removes them, so the rename keeps failing closed.
 func recordedStateUID(ctx context.Context, env *component.Env) (string, error) {
 	var uid string
 
-	for _, obj := range []client.Object{&corev1.ServiceAccount{}, &unstructured.Unstructured{Object: map[string]any{"apiVersion": "apps/v1", "kind": "DaemonSet"}}} {
-		err := env.LiveReader().Get(ctx, objectKey(env, dataplaneName), obj)
-		if apierrors.IsNotFound(err) {
-			continue
-		}
+	for _, objName := range []string{dataplaneName, renamedDataplane} {
+		for _, obj := range []client.Object{&corev1.ServiceAccount{}, &unstructured.Unstructured{Object: map[string]any{"apiVersion": "apps/v1", "kind": "DaemonSet"}}} {
+			err := env.LiveReader().Get(ctx, objectKey(env, objName), obj)
+			if apierrors.IsNotFound(err) {
+				continue
+			}
 
-		if err != nil {
-			return "", err
-		}
+			if err != nil {
+				return "", err
+			}
 
-		// A terminating object still records the identity its Pods may be
-		// running on, so it keeps failing closed until it is gone.
-		if obj.GetUID() == "" || (obj.GetAnnotations()[managerAnnotation] != component.FieldOwner && obj.GetLabels()[managerLabel] != component.FieldOwner) {
-			continue
-		}
+			// A terminating object still records the identity its Pods may be
+			// running on, so it keeps failing closed until it is gone.
+			if obj.GetUID() == "" || (obj.GetAnnotations()[managerAnnotation] != component.FieldOwner && obj.GetLabels()[managerLabel] != component.FieldOwner) {
+				continue
+			}
 
-		recorded := obj.GetAnnotations()[stateUIDAnnotation]
-		if recorded == "" {
-			continue
-		}
+			recorded := obj.GetAnnotations()[stateUIDAnnotation]
+			if recorded == "" {
+				continue
+			}
 
-		if uid != "" && uid != recorded {
-			return "", fmt.Errorf("racer dataplane ServiceAccount and DaemonSet record different racer-state UIDs")
-		}
+			if uid != "" && uid != recorded {
+				return "", fmt.Errorf("racer dataplane ServiceAccounts and DaemonSets (%s, %s) record different racer-state UIDs", dataplaneName, renamedDataplane)
+			}
 
-		uid = recorded
+			uid = recorded
+		}
 	}
 
 	return uid, nil
