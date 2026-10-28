@@ -250,7 +250,7 @@ pub(crate) mod tests {
             stopping: Cell::new(false),
             releasing: Cell::new(0),
             last_error: Cell::new(None),
-            rng: RefCell::new(Box::new(crate::entropy::Seeded::new(1))),
+            rng: RefCell::new(Box::new(racer_core::time::SplitMix64::new(1))),
             authz: Default::default(),
             auth_budget: Default::default(),
         })

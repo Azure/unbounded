@@ -12,7 +12,7 @@
 //! at 50k Pods without one socket or thread per Pod.
 //!
 //! Time is `u64` nanoseconds from an `Instant` base chosen by the caller;
-//! wall time is `wall_base + ns`. Randomness comes from one [`Seeded`]
+//! wall time is `wall_base + ns`. Randomness comes from one [`SplitMix64`]
 //! stream, so runs replay exactly.
 
 use crate::cost;
@@ -25,13 +25,13 @@ use racer_cluster_control::{
         publication::Image,
         state::{self, StateRecord, Term, Writer},
     },
-    entropy::Seeded,
     limits,
     step::{
         primary::{Contend, Inventory, PassInputs, discovery, plan_pass},
         seat::{self as rules, Follower, Lottery, SeatRenew},
     },
 };
+use racer_core::time::SplitMix64;
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BinaryHeap},
@@ -184,7 +184,7 @@ pub struct ControlPlane {
     pub(crate) now: u64,
     seq: u64,
     queue: BinaryHeap<Reverse<(u64, u64, u32, Ev)>>,
-    rng: Seeded,
+    rng: SplitMix64,
     pub(crate) pods: Vec<Pod>,
     seats: Vec<Lease>,
     pub(crate) primary: Lease,
@@ -244,7 +244,7 @@ impl ControlPlane {
             });
         }
         let mut cp = Self {
-            rng: Seeded::new(settings.seed),
+            rng: SplitMix64::new(settings.seed),
             settings,
             base,
             wall_base,

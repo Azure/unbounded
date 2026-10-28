@@ -458,25 +458,21 @@ impl Follower {
 #[cfg(test)]
 mod lottery_tests {
     use super::*;
+    use racer_core::time::SplitMix64;
 
     #[test]
     fn jitter_is_bounded_and_seeded() {
-        use crate::entropy::{Failing, Seeded};
+        use crate::entropy::Failing;
         let max = Duration::from_secs(5);
-        let a = jitter("u", &mut Seeded::new(1), 0, max);
+        let a = jitter("u", &mut SplitMix64::new(1), 0, max);
         assert!(a < max);
-        assert_eq!(a, jitter("u", &mut Seeded::new(1), 0, max));
+        assert_eq!(a, jitter("u", &mut SplitMix64::new(1), 0, max));
         assert_eq!(
             jitter("u", &mut Failing, 3, max),
             election::claim_delay("u", 3, max)
         );
     }
-    use crate::{
-        annotations,
-        authority::election::LeaseSpec,
-        entropy::{Failing, Seeded},
-        limits,
-    };
+    use crate::{annotations, authority::election::LeaseSpec, entropy::Failing, limits};
 
     fn view(desired: usize, nodes: &[&str]) -> PrimaryView {
         PrimaryView {
@@ -530,7 +526,7 @@ mod lottery_tests {
         let v = view(3, &["a", "", "b"]);
         let mut l = Lottery::default();
         for seed in 0..32 {
-            match l.plan(&inputs(&v, Some(now)), now, &mut Seeded::new(seed)) {
+            match l.plan(&inputs(&v, Some(now)), now, &mut SplitMix64::new(seed)) {
                 Plan::Attempt { delay, index } => {
                     assert_eq!(index, 1);
                     assert!(delay < Duration::from_secs(30));
@@ -562,7 +558,7 @@ mod lottery_tests {
         let mut max_delay = Duration::ZERO;
         for _ in 0..20 {
             if let Plan::Attempt { delay, index } =
-                l.plan(&inputs(&v, None), now, &mut Seeded::new(7))
+                l.plan(&inputs(&v, None), now, &mut SplitMix64::new(7))
             {
                 assert!(index < 3);
                 assert!(delay < Duration::from_secs(MAX_COLD_WINDOW));

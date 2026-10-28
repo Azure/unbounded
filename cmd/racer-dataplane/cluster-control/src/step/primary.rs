@@ -392,10 +392,8 @@ impl Contend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        authority::state::Term,
-        entropy::{Failing, Seeded},
-    };
+    use crate::{authority::state::Term, entropy::Failing};
+    use racer_core::time::SplitMix64;
     use serde_json::json;
 
     const C: &str = "c1c1c1c1-0000-4000-8000-000000000001";
@@ -487,7 +485,7 @@ mod tests {
         let w = writer();
         let p = plan_pass(
             &inputs(&inv, &own, &policy, &live, &w, None, None),
-            &mut Seeded::new(1),
+            &mut SplitMix64::new(1),
         )
         .unwrap();
         let image = p.image.expect("image");
@@ -495,7 +493,7 @@ mod tests {
         assert!(image.publication.members.is_empty());
         let all = plan_pass(
             &inputs(&inventory(40), &own, &policy, &live, &w, None, None),
-            &mut Seeded::new(1),
+            &mut SplitMix64::new(1),
         )
         .unwrap();
         assert_eq!(p.desired, all.desired);
@@ -516,7 +514,7 @@ mod tests {
                 Some(&committed),
                 Some(&image),
             ),
-            &mut Seeded::new(2),
+            &mut SplitMix64::new(2),
         )
         .unwrap();
         assert_eq!(p2.image.unwrap().publication.members.len(), 1);
@@ -548,7 +546,7 @@ mod tests {
         }
         let first = plan_pass(
             &inputs(&inv, &own, &policy, &live, &w, None, None),
-            &mut Seeded::new(1),
+            &mut SplitMix64::new(1),
         )
         .unwrap();
         let (committed, image) = (first.next, first.image.unwrap());
@@ -568,7 +566,7 @@ mod tests {
                 Some(&image),
             );
             i.membership_changed_unix = Some(1_800_000_000 - since);
-            plan_pass(&i, &mut Seeded::new(2))
+            plan_pass(&i, &mut SplitMix64::new(2))
                 .unwrap()
                 .image
                 .unwrap()
@@ -592,7 +590,7 @@ mod tests {
         let inv = inventory(4);
         let first = plan_pass(
             &inputs(&inv, &own, &policy, &live, &w, None, None),
-            &mut Seeded::new(1),
+            &mut SplitMix64::new(1),
         )
         .unwrap();
         let (committed, image) = (first.next, first.image.unwrap());
@@ -608,7 +606,7 @@ mod tests {
                 Some(&image),
             );
             i.membership_changed_unix = changed;
-            plan_pass(&i, &mut Seeded::new(2)).unwrap()
+            plan_pass(&i, &mut SplitMix64::new(2)).unwrap()
         };
         let now = 1_800_000_000;
         let held = at(Some(now - JOIN_HOLD_SECS + 1));
@@ -636,7 +634,7 @@ mod tests {
             Some(&image),
         );
         i.membership_changed_unix = Some(now);
-        let p = plan_pass(&i, &mut Seeded::new(3)).unwrap();
+        let p = plan_pass(&i, &mut SplitMix64::new(3)).unwrap();
         assert_eq!(p.image.unwrap().publication.members.len(), 3);
     }
 
@@ -649,7 +647,7 @@ mod tests {
         let w = writer();
         let p = plan_pass(
             &inputs(&inv, &own, &policy, &live, &w, None, None),
-            &mut Seeded::new(1),
+            &mut SplitMix64::new(1),
         )
         .unwrap();
         assert!(p.changed);
@@ -675,7 +673,7 @@ mod tests {
                 Some(&committed),
                 Some(&image),
             ),
-            &mut Seeded::new(2),
+            &mut SplitMix64::new(2),
         )
         .unwrap();
         assert!(!p2.changed);
@@ -692,7 +690,7 @@ mod tests {
                 Some(&committed),
                 Some(&image),
             ),
-            &mut Seeded::new(3),
+            &mut SplitMix64::new(3),
         )
         .unwrap();
         assert!(p3.changed);
@@ -713,7 +711,7 @@ mod tests {
                 Some(&committed3),
                 Some(&image3),
             ),
-            &mut Seeded::new(4),
+            &mut SplitMix64::new(4),
         )
         .unwrap();
         assert!(!p4.changed);
@@ -831,10 +829,8 @@ mod tests {
 #[cfg(test)]
 mod contend_tests {
     use super::*;
-    use crate::{
-        authority::election::LeaseSpec,
-        entropy::{Failing, Seeded},
-    };
+    use crate::{authority::election::LeaseSpec, entropy::Failing};
+    use racer_core::time::SplitMix64;
 
     fn primary(rv: &str, holder: Option<&str>) -> LeaseObservation {
         LeaseObservation {
@@ -868,7 +864,7 @@ mod contend_tests {
     fn wait_is_bounded() {
         assert_eq!(Contend::wait(&mut Failing), limits::LEASE_RENEW);
         for s in 0..16 {
-            let w = Contend::wait(&mut Seeded::new(s));
+            let w = Contend::wait(&mut SplitMix64::new(s));
             assert!(w >= limits::LEASE_RENEW && w < limits::LEASE_RENEW + Duration::from_secs(3));
         }
     }

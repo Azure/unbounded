@@ -9,6 +9,7 @@ description = "Racer control plane embedded in racer-dataplane: Lease seats, pri
 [dependencies]
 racer-control-wire = { path = "../control-wire" }
 racer-admission = { path = "../admission" }
+racer-core = { path = "../core" }
 regex = "1"
 wire-codec = { path = "../wire-codec" }
 base64 = "0.22"

@@ -1,9 +1,10 @@
 //! Randomness passed in by callers.
 //!
 //! Production uses [`OsEntropy`] (`getrandom`). The simulator and tests pass
-//! [`Seeded`], a deterministic SplitMix64 stream, so key ids, key material,
-//! jitter, and claim delays replay exactly. `Seeded` is not for production
-//! key material.
+//! [`SplitMix64`], so key ids, key material, jitter, and claim delays
+//! replay exactly. `SplitMix64` is not for production key material.
+
+use racer_core::time::SplitMix64;
 
 /// Entropy failed. Production callers fail closed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,32 +40,9 @@ impl Entropy for OsEntropy {
     }
 }
 
-/// Deterministic SplitMix64 stream for simulation and tests.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Seeded {
-    state: u64,
-}
-
-impl Seeded {
-    pub const fn new(seed: u64) -> Self {
-        Self { state: seed }
-    }
-
-    pub fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-}
-
-impl Entropy for Seeded {
+impl Entropy for SplitMix64 {
     fn fill(&mut self, out: &mut [u8]) -> Result<(), EntropyError> {
-        for chunk in out.chunks_mut(8) {
-            let bytes = self.next_u64().to_le_bytes();
-            chunk.copy_from_slice(&bytes[..chunk.len()]);
-        }
+        SplitMix64::fill(self, out);
         Ok(())
     }
 }
@@ -85,19 +63,16 @@ mod tests {
 
     #[test]
     fn seeded_replays() {
-        let (mut a, mut b) = (Seeded::new(9), Seeded::new(9));
+        let (mut a, mut b) = (SplitMix64::new(9), SplitMix64::new(9));
         let (mut x, mut y) = ([0u8; 13], [0u8; 13]);
-        a.fill(&mut x).unwrap();
-        b.fill(&mut y).unwrap();
+        Entropy::fill(&mut a, &mut x).unwrap();
+        Entropy::fill(&mut b, &mut y).unwrap();
         assert_eq!(x, y);
         assert_ne!(x, [0u8; 13]);
-        assert_ne!(Seeded::new(1).u32_or_zero(), Seeded::new(2).u32_or_zero());
-    }
-
-    #[test]
-    fn splitmix_reference() {
-        // Same reference vector as racer_core::time::SplitMix64.
-        assert_eq!(Seeded::new(0).next_u64(), 0xE220_A839_7B1D_CDAF);
+        assert_ne!(
+            SplitMix64::new(1).u32_or_zero(),
+            SplitMix64::new(2).u32_or_zero()
+        );
     }
 
     #[test]

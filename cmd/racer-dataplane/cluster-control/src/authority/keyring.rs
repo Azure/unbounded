@@ -559,7 +559,8 @@ pub fn plan_with(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::entropy::{Failing, OsEntropy, Seeded};
+    use crate::entropy::{Failing, OsEntropy};
+    use racer_core::time::SplitMix64;
 
     const CLUSTER: &str = "11111111-1111-4111-8111-111111111111";
     const DAY: u64 = 86400;
@@ -957,14 +958,38 @@ pub(crate) mod tests {
         let catalog: Vec<_> = (0..2).map(cache).collect();
         let d = Durable::default();
         let t = now();
-        let a = plan_with(&policy(), &d, Some(&catalog), &[], t, &mut Seeded::new(5)).unwrap();
-        let b = plan_with(&policy(), &d, Some(&catalog), &[], t, &mut Seeded::new(5)).unwrap();
+        let a = plan_with(
+            &policy(),
+            &d,
+            Some(&catalog),
+            &[],
+            t,
+            &mut SplitMix64::new(5),
+        )
+        .unwrap();
+        let b = plan_with(
+            &policy(),
+            &d,
+            Some(&catalog),
+            &[],
+            t,
+            &mut SplitMix64::new(5),
+        )
+        .unwrap();
         assert!(a.changed);
         assert_eq!(
             serde_json::to_vec(&a.durable).unwrap(),
             serde_json::to_vec(&b.durable).unwrap()
         );
-        let c = plan_with(&policy(), &d, Some(&catalog), &[], t, &mut Seeded::new(6)).unwrap();
+        let c = plan_with(
+            &policy(),
+            &d,
+            Some(&catalog),
+            &[],
+            t,
+            &mut SplitMix64::new(6),
+        )
+        .unwrap();
         assert_ne!(
             serde_json::to_vec(&a.durable).unwrap(),
             serde_json::to_vec(&c.durable).unwrap()

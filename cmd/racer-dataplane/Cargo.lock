@@ -833,6 +833,7 @@ dependencies = [
  "libc",
  "racer-admission",
  "racer-control-wire",
+ "racer-core",
  "racer-crypto",
  "rcgen",
  "regex",
