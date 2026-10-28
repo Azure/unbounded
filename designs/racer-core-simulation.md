@@ -92,8 +92,7 @@ Path: `cmd/racer-dataplane/sim`, crate and binary `racer-sim`.
 | `node` | Real node logic for every node (below) |
 | `phantom` | Shared-memo `Phantom` rankings and `SharedRoutes` searches for every node's caches |
 | `config` | One `Config` (with its `node` knobs) parsed from `--config` JSON and validated in one place |
-| `control` (model) | `ControlPlane`: a whole-cluster model built from the `cluster-control` steps, with the write-drain cost model |
-| `control` | `ControlSim`: the `ControlPlane` model plus a client model |
+| `control` | `ControlSim`: every Pod runs the `cluster-control` steps, plus one client per Pod, on one event queue |
 | `combined` | Control plane and data plane on one timeline |
 | `report` | Histograms, counters, invariants, memory accounting, JSON output |
 
@@ -125,9 +124,8 @@ Differences from production:
 
 ### Control model
 
-`ControlSim` co-steps the `ControlPlane` model (`sim/src/control.rs`: lottery, seats, primary,
-commits, built from the `cluster-control` steps) with one
-client per Pod. Clients enroll through seat bootstrap slots and the bearer authorization API calls
+`ControlSim` (`sim/src/control.rs`) runs every Pod's lottery, seat, primary, and commit steps from
+`cluster-control` and one client per Pod on a single event queue and RNG stream. Clients enroll through seat bootstrap slots and the bearer authorization API calls
 against a rate-limited fake API server, then long poll snapshots with the real seat admission
 steps (write slots, a bounded FIFO, delta or full bodies). Clients send the base hash they hold.
 See the header of `sim/src/control.rs` for details.
