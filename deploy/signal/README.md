@@ -224,11 +224,12 @@ The evidence document includes:
 The adapter persists typed backend evidence and leaves completed ordinary Pods
 in place. MPIJobs use `cleanPodPolicy: None` so the launcher and every worker
 remain available for evidence capture. After that evidence is durable, the
-adapter deletes the MPIJob and waits for it to disappear before completing the
-task. If any backend cannot be quiesced, the adapter task fails and later checks
-are skipped rather than overlapping execution. The controller deletes the
-Workflow and all remaining owned backends only after the final evidence
-document is durable.
+adapter terminates the retained MPI workers without their ordinary Pod grace
+period, deletes the MPIJob in the foreground, and waits for the complete
+ownership tree to disappear before completing the task. If any backend cannot
+be quiesced, the adapter task fails and later checks are skipped rather than
+overlapping execution. The controller deletes the Workflow and all remaining
+owned backends only after the final evidence document is durable.
 `WorkloadCleanupComplete=True` is the authoritative record that this
 controller-owned cleanup finished.
 

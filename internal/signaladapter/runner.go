@@ -47,6 +47,11 @@ type createdResource struct {
 	participantIndexes []int32
 }
 
+type objectIdentity struct {
+	name string
+	uid  types.UID
+}
+
 const maxResultLogBytes = 64 * 1024
 
 type resultLogSource struct {
@@ -366,6 +371,27 @@ func (r *Runner) quiesceBackends(backends []createdResource) error {
 	propagation := metav1.DeletePropagationForeground
 
 	for _, backend := range backends {
+		if backend.resource.GetKind() == "MPIJob" {
+			workers, err := r.mpiWorkerPods(ctx, backend)
+			if err != nil {
+				return fmt.Errorf("list MPI worker Pods: %w", err)
+			}
+
+			for _, worker := range workers {
+				gracePeriodSeconds := int64(0)
+				background := metav1.DeletePropagationBackground
+				err := r.Kubernetes.CoreV1().Pods(backend.resource.GetNamespace()).
+					Delete(ctx, worker.name, metav1.DeleteOptions{
+						GracePeriodSeconds: &gracePeriodSeconds,
+						Preconditions:      &metav1.Preconditions{UID: &worker.uid},
+						PropagationPolicy:  &background,
+					})
+				if err != nil && !apierrors.IsNotFound(err) {
+					return fmt.Errorf("delete MPI worker Pod %s: %w", worker.name, err)
+				}
+			}
+		}
+
 		uid := backend.resource.GetUID()
 		err := r.Dynamic.Resource(backend.gvr).Namespace(backend.resource.GetNamespace()).
 			Delete(ctx, backend.resource.GetName(), metav1.DeleteOptions{
@@ -406,6 +432,33 @@ func (r *Runner) quiesceBackends(backends []createdResource) error {
 	}
 
 	return nil
+}
+
+func (r *Runner) mpiWorkerPods(ctx context.Context, backend createdResource) ([]objectIdentity, error) {
+	runName := backend.resource.GetLabels()["signal.unbounded-cloud.io/run"]
+	if runName == "" {
+		return nil, errors.New("MPIJob is missing the Signal run label")
+	}
+
+	pods, err := r.Kubernetes.CoreV1().Pods(backend.resource.GetNamespace()).List(
+		ctx,
+		metav1.ListOptions{LabelSelector: runLabelSelector(runName)},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	workers := make([]objectIdentity, 0, len(pods.Items))
+	for index := range pods.Items {
+		pod := &pods.Items[index]
+		if mpiPodRole(pod, backend.resource.GetUID(), nil) != "worker" {
+			continue
+		}
+
+		workers = append(workers, objectIdentity{name: pod.Name, uid: pod.UID})
+	}
+
+	return workers, nil
 }
 
 func (r *Runner) waitForResult(ctx context.Context, config Config, backend createdResource) Result {
