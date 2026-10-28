@@ -265,6 +265,7 @@ fn gates_follow_production_order() {
         entries: 1,
         waiters_per_flight: 1,
         generations_per_flight: 1,
+        ..FlightLimits::default()
     };
     let mut t = table(limits, now);
     let mut wakes = Vec::new();

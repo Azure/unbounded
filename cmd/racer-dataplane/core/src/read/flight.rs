@@ -20,11 +20,14 @@ use std::time::Instant;
 /// Opaque wake target chosen by the driver (for example, a simulated task id).
 pub type Token = u64;
 
-/// Table bounds; defaults match production `FlightLimits`.
+/// Table bounds shared with production `Flights`. All dimensions must be
+/// nonzero. `PageFlights` does not bound retained operations; production
+/// caps them at `operations_per_flight`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FlightLimits {
     pub entries: usize,
     pub waiters_per_flight: usize,
+    pub operations_per_flight: usize,
     pub generations_per_flight: u64,
 }
 
@@ -33,6 +36,7 @@ impl Default for FlightLimits {
         Self {
             entries: 1024,
             waiters_per_flight: 256,
+            operations_per_flight: 64,
             generations_per_flight: 1024,
         }
     }

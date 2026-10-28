@@ -3245,6 +3245,24 @@ pub(crate) mod tests {
             );
             assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
         }
+        /// Known issue 9: a duplicate publish is not a use, so the oldest
+        /// insert is still evicted first (the simulator's `memory_insert`
+        /// keeps the same order).
+        #[test]
+        fn duplicate_publish_does_not_touch() {
+            let admission = admission(2);
+            let cache = MemoryCache::new(
+                BufferPool::new(admission.clone()),
+                crate::test_support::availability(),
+            );
+            let id = |v: &str| bundle(&admission, v).plaintext.page().clone();
+            for version in ["v0", "v1", "v0", "v2"] {
+                cache.publish(bundle(&admission, version)).unwrap();
+            }
+            let resident = cache.resident();
+            assert!(!resident.contains(&id("v0")));
+            assert!(resident.contains(&id("v1")) && resident.contains(&id("v2")));
+        }
         #[test]
         fn capacity_evicts_least_recent_idle_entry_and_rejects_all_busy() {
             let admission = admission(2);

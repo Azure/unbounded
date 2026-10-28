@@ -103,24 +103,8 @@ impl Drop for FlightCharge {
     }
 }
 
-/// Local caps in addition to shared admission quotas. All dimensions must be nonzero.
-#[derive(Clone, Copy, Debug)]
-pub struct FlightLimits {
-    pub entries: usize,
-    pub waiters_per_flight: usize,
-    pub operations_per_flight: usize,
-    pub generations_per_flight: u64,
-}
-impl Default for FlightLimits {
-    fn default() -> Self {
-        Self {
-            entries: 1024,
-            waiters_per_flight: 256,
-            operations_per_flight: 64,
-            generations_per_flight: 1024,
-        }
-    }
-}
+/// Local caps in addition to shared admission quotas.
+pub use racer_core::read::flight::FlightLimits;
 
 #[cfg(not(test))]
 type FlightHashState = std::collections::hash_map::RandomState;
@@ -803,15 +787,6 @@ impl Flights {
         Ok(())
     }
 
-    /// Bounds shared with the racer-core join gates.
-    fn core_limits(&self) -> racer_core::read::flight::FlightLimits {
-        racer_core::read::flight::FlightLimits {
-            entries: self.limits.entries,
-            waiters_per_flight: self.limits.waiters_per_flight,
-            generations_per_flight: self.limits.generations_per_flight,
-        }
-    }
-
     fn update<T>(&self, f: impl FnOnce(&mut Table, &mut Vec<Waker>) -> T) -> T {
         coalesce::flight::update(&self.table, f)
     }
@@ -906,11 +881,8 @@ impl Flights {
                     gate = crate::telemetry::JoinGate::ExistingFailed;
                     return Err(error);
                 }
-                if racer_core::read::flight::waiter_cap_gate(
-                    entry.waiters.len(),
-                    &self.core_limits(),
-                )
-                .is_err()
+                if racer_core::read::flight::waiter_cap_gate(entry.waiters.len(), &self.limits)
+                    .is_err()
                 {
                     gate = crate::telemetry::JoinGate::WaiterCap;
                     occupancy = (
@@ -945,9 +917,7 @@ impl Flights {
                 Error::Overloaded
             })?;
             if !table.contains_key(&page) {
-                if racer_core::read::flight::entry_cap_gate(table.len(), &self.core_limits())
-                    .is_err()
-                {
+                if racer_core::read::flight::entry_cap_gate(table.len(), &self.limits).is_err() {
                     gate = crate::telemetry::JoinGate::EntryCap;
                     occupancy = (Some(table.len()), Some(self.limits.entries));
                     return Err(Error::Overloaded);
@@ -1284,17 +1254,6 @@ impl Flights {
         self.expiry_snapshot(now, now, None)
     }
 
-    /// Refresh `page` and report whether its acquisition was handed over.
-    #[cfg(test)]
-    pub(super) fn handed_over(&self, page: &PageId) -> bool {
-        self.update(|table, wakes| {
-            table.get_mut(page).is_some_and(|entry| {
-                refresh(entry, wakes);
-                entry.state.handed_over()
-            })
-        })
-    }
-
     /// Inspect admission ownership in lifecycle regressions.
     #[cfg(test)]
     pub(super) fn admission_state(&self) -> (usize, usize, bool) {
@@ -1397,7 +1356,8 @@ impl Flights {
             if matches!(entry.phase, Phase::Failed(_) | Phase::Draining(_)) {
                 return Ok(JoinedCopy::Miss);
             }
-            if entry.waiters.len() >= self.limits.waiters_per_flight {
+            if racer_core::read::flight::waiter_cap_gate(entry.waiters.len(), &self.limits).is_err()
+            {
                 gate = crate::telemetry::JoinGate::WaiterCap;
                 occupancy = (
                     Some(entry.waiters.len()),
