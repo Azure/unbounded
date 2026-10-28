@@ -2225,8 +2225,7 @@ mod tests {
         assert_eq!(r["control"]["enrolled"], 200);
     }
 
-    /// Known issue 11 (control-plane half): with the legacy authorization
-    /// model an enrollment storm makes three full authorizations per
+    /// With the legacy authorization model an enrollment storm makes three full authorizations per
     /// client and the API server sheds them with 429s part way through.
     /// The cached model (`step::authz`) makes at most two, reuses the
     /// TokenReview and binding reads, and its adaptive budget keeps the
@@ -2301,7 +2300,7 @@ mod tests {
     }
 
     /// More polls per seat than write slots: woken polls queue and drain in
-    /// FIFO order instead of answering 429 (Known issue 1).
+    /// FIFO order instead of answering 429.
     #[test]
     fn mass_wake_queues_for_write_slots() {
         let overrides = json!({"write_ns": 20_000_000u64});
@@ -2371,7 +2370,7 @@ mod tests {
         assert!(checks(&r, "ctl_client_converges") > 0);
         // A primary pass that changes nothing keeps the image's delta, so
         // a client one version behind never gets a full image for lack of
-        // one (Known issue 20).
+        // one.
         assert_eq!(
             counter(&r, "ctl_full_fallbacks_no_delta"),
             0,

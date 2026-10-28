@@ -25,23 +25,13 @@ pub const SCENARIOS: &[&str] = &[
 ];
 
 /// The control scenario whose plan (settings and faults) a combined
-/// scenario uses.
-pub fn control_scenario(scenario: &str) -> &'static str {
+/// scenario uses, and its default duration.
+fn control_plan(scenario: &str) -> (&'static str, Nanos) {
     match scenario {
-        "full-cold-start" => "enrollment-storm",
-        "full-failover" => "failover",
-        "full-churn" => "ctl-churn",
-        _ => "lagging",
-    }
-}
-
-/// Default simulated duration of a combined scenario.
-pub fn default_duration(scenario: &str) -> Nanos {
-    match scenario {
-        "full-cold-start" => 400 * SECONDS,
-        "full-failover" => 900 * SECONDS,
-        "full-churn" => 1200 * SECONDS,
-        _ => 900 * SECONDS,
+        "full-cold-start" => ("enrollment-storm", 400 * SECONDS),
+        "full-failover" => ("failover", 900 * SECONDS),
+        "full-churn" => ("ctl-churn", 1200 * SECONDS),
+        _ => ("lagging", 900 * SECONDS),
     }
 }
 
@@ -191,7 +181,7 @@ impl DataFaults {
 }
 
 /// Data-plane schedules generated after `--config` (only when empty).
-pub fn data_schedules(scenario: &str, config: &mut Config) {
+fn data_schedules(scenario: &str, config: &mut Config) {
     if config.faults.is_empty() {
         config.faults = config
             .combined_faults
@@ -212,7 +202,7 @@ pub fn data_schedules(scenario: &str, config: &mut Config) {
 /// Arrival window of the `full-cold-start` storm: at least one second, and
 /// twice the owner egress the storm needs (`nodes * page_bytes / (REPLICAS *
 /// nic_bps)`), so it offers at most half of what a page's owners can send.
-pub fn cold_start_window_ns(config: &Config) -> Nanos {
+fn cold_start_window_ns(config: &Config) -> Nanos {
     let replicas = topology::REPLICAS as u128;
     let egress = u128::from(config.nodes) * u128::from(config.page_bytes) * u128::from(SECONDS)
         / (replicas * u128::from(config.nic_bps.max(1)));
@@ -355,11 +345,11 @@ pub fn run(
     duration: Option<Nanos>,
     overrides: Option<&Value>,
 ) -> Result<Value, String> {
-    let end = duration.unwrap_or_else(|| default_duration(scenario));
+    let (ctl_scenario, default) = control_plan(scenario);
+    let end = duration.unwrap_or(default);
     config.duration_ns = end;
     data_schedules(scenario, &mut config);
-    let (mut settings, _, faults) =
-        control::plan(control_scenario(scenario), config.nodes, Some(end));
+    let (mut settings, _, faults) = control::plan(ctl_scenario, config.nodes, Some(end));
     if let Some(o) = overrides {
         settings.apply_json(o)?;
         settings.initial_pods = settings.initial_pods.clamp(1, config.nodes);
@@ -500,7 +490,7 @@ mod tests {
         assert!(counter(&r, "reads_completed") > 0);
     }
 
-    /// Known issue 15: in a failover run (crashes, a site partition, origin
+    /// In a failover run (crashes, a site partition, origin
     /// error bursts, members enrolling) every repeated origin request is
     /// classified, and every repeat while the previous fetcher still held
     /// the page is a skip (an owner above rank 0 that fetched after a
@@ -535,7 +525,7 @@ mod tests {
             assert!(skips > 0, "{o}");
             assert!(orphans <= skips, "{o}");
             assert!(held <= skips + orphans, "{o}");
-            // Known issue 55: the worst pages are retries after failed
+            // The worst pages are retries after failed
             // origin requests. Each follows a failed (or canceled) request
             // for the page, and without them no page is fetched more than
             // once per owner.
@@ -550,7 +540,7 @@ mod tests {
                 n(&o["max_requests_per_page"]) <= without + n(&o["max_failure_retries_per_page"]),
                 "{o}"
             );
-            // Known issue 59: owners funded at their minimum
+            // Owners funded at their minimum
             // (`walk::shared_share_short`) fetch only with the authority
             // every owner has, so their requests land in the classes above
             // (a new page, a retry after a failure, a skip or its orphan)
@@ -560,7 +550,7 @@ mod tests {
         }
     }
 
-    /// Known issue 21: an owner that answered another owner's page probe
+    /// An owner that answered another owner's page probe
     /// without a copy defers readers to it instead of fetching the page
     /// again, so fewer pages are fetched by rank 0 while a successor's orphan
     /// copy is held (`copy_only` and `failed` orphans). Without successor
@@ -585,7 +575,7 @@ mod tests {
         assert!(orphans(&on) < orphans(&off), "{}", on["origin_per_page"]);
     }
 
-    /// Known issue 21 (round 4, orphan2): an owner holding a successor hint
+    /// An owner holding a successor hint
     /// asks the hinted owner copy-only before origin on its own grant, so
     /// rank 0 copies orphan copies instead of fetching them again. Without
     /// successor targets no such probe is sent.
@@ -603,7 +593,7 @@ mod tests {
         assert!(orphans(&on) < orphans(&off), "{}", on["origin_per_page"]);
         // A refetch by rank 0 that noted the holder is rare: its one probe
         // missed (the holder's fetch had failed) or failed. Since copy-only
-        // requests join a running acquisition (Known issue 31), a probe that
+        // requests join a running acquisition, a probe that
         // reaches a holder still fetching waits in its flight and runs out
         // of its short time share, which counts as a failure, not a miss.
         assert!(
@@ -614,10 +604,10 @@ mod tests {
         );
     }
 
-    /// Known issue 37: an owner after rank 0 that fetched a page from origin
+    /// An owner after rank 0 that fetched a page from origin
     /// offers it to rank 0 later, so rank 0 copies orphans whose holder never
     /// reached it instead of fetching them again. Offers are bounded by the
-    /// notice schedule. Known issue 38: relay-signed failures are their own
+    /// notice schedule. Relay-signed failures are their own
     /// skip class, apart from rank 0's own failures.
     #[test]
     fn failover_holders_offer_orphans_to_rank_zero() {
@@ -630,7 +620,7 @@ mod tests {
         let (off, on) = (run_with(false), run_with(true));
         assert_clean(&on);
         assert_eq!(counter(&off, "orphan_offers_sent"), 0);
-        // Known issue 50: only offers that failed with cut evidence cross
+        // Only offers that failed with cut evidence cross
         // a partition, and without cut groups offers cross it at least as
         // often.
         assert!(
@@ -654,7 +644,7 @@ mod tests {
             on["metrics"]
         );
         assert!(sent <= noted * NOTICE_TRIES as u64, "{}", on["metrics"]);
-        // Known issue 51: rank 2 holders also notice rank 1.
+        // Rank 2 holders also notice rank 1.
         assert!(
             counter(&on, "orphan_notices_noted_rank1") > 0,
             "{}",
@@ -675,14 +665,14 @@ mod tests {
                 .sum::<u64>()
         };
         assert!(orphans(&on) < orphans(&off), "{}", on["origin_per_page"]);
-        // Known issue 38: the skip classes partition the skips, and the
+        // The skip classes partition the skips, and the
         // relay class is reported.
         let skips = &on["origin_per_page"]["skips"];
         assert!(skips.get("relay").is_some(), "{skips}");
         assert_eq!(on["origin_per_page"]["repeats"]["unexplained"], 0);
     }
 
-    /// Known issue 52: during an origin outage (every request fails), an
+    /// During an origin outage (every request fails), an
     /// owner above rank 0 whose own origin request for a page failed leaves
     /// the retries after rank 0's own failures to rank 0 for `hang_after`.
     /// Without the hold every such answer made the owner ask origin too.
@@ -718,9 +708,8 @@ mod tests {
         assert_eq!(on["origin_per_page"]["repeats"]["unexplained"], 0);
     }
 
-    /// Known issue 7: the Pod crashed for good at `d / 2 + 5 s` leaves the
-    /// membership once its Node has been not ready for the grace, so peers
-    /// stop choosing it. Before round 4 they chose it until the end.
+    /// The Pod crashed for good at `d / 2 + 5 s` leaves the membership once
+    /// its Node has been not ready for the grace, so peers stop choosing it.
     #[test]
     fn failover_drops_the_dead_member() {
         let r = quick("full-failover", 200, 300, 1, 0.2);
@@ -737,11 +726,7 @@ mod tests {
         );
     }
 
-    /// Known issues 14 and 17: members join only once they serve, so no
-    /// peer link fails toward a member that has not applied a membership,
-    /// and no read fails while one is listed. With the pre-round-4
-    /// reporting (`report_at_start`) both happen.
-    /// Known issue 25: as members join and leave, pages move to members that
+    /// As members join and leave, pages move to members that
     /// arrived after their other owners, which may still hold copies they
     /// fetched before, however many versions ago. Owners ask those lineage
     /// targets before origin and readers visit them first, so fewer moved
@@ -770,7 +755,7 @@ mod tests {
         assert!(counter(&on, "reads_failed") <= counter(&off, "reads_failed"));
     }
 
-    /// Known issues 34, 35 and 44: owners also ask members ranked just
+    /// Owners also ask members ranked just
     /// below them that were owners when they arrived, every lineage probe
     /// runs on its own grant (so a delegated rank 0 with one credit asks
     /// too), and a copy-only probe from an earlier owner does not wait on
@@ -819,11 +804,11 @@ mod tests {
         assert!(counter(&all, "reads_failed") <= counter(&before, "reads_failed") + 1);
     }
 
-    /// Known issues 45 and 46: granted probes go out at once, which bounds
+    /// Granted probes go out at once, which bounds
     /// their cost to one time share and lowers read latency against sending
     /// them one after the other; deeper ranks, a lineage cap of
     /// `MAX_LINEAGE` and unknown-age demoted members find more moved copies
-    /// than the wave 5 rules (three targets from ranks 4 and 5 by arrival).
+    /// than three targets from ranks 4 and 5 by arrival.
     #[test]
     fn parallel_deep_lineage_probes_find_more_copies_without_more_latency() {
         let run_with = |parallel: bool, cap: usize, unknown: bool| {
@@ -858,7 +843,7 @@ mod tests {
             mean(&parallel),
             mean(&sequential)
         );
-        // Every holder ranked fourth or fifth is asked (Known issue 46).
+        // Every holder ranked fourth or fifth is asked.
         assert_eq!(
             counter(&parallel, "moved_unasked_holder_rank_4_5_older")
                 + counter(&parallel, "moved_unasked_holder_rank_4_5"),
@@ -869,6 +854,9 @@ mod tests {
         assert!(counter(&parallel, "reads_failed") <= counter(&narrow, "reads_failed") + 1);
     }
 
+    /// Members join only once they serve, so no peer link fails toward a
+    /// member that has not applied a membership, and no read fails while one
+    /// is listed. With `report_at_start` both happen.
     #[test]
     fn cold_start_members_serve_before_they_are_routable() {
         let run_with = |report_at_start: bool| {
@@ -912,7 +900,7 @@ mod tests {
             versions <= 3 + window / racer_cluster_control::step::primary::JOIN_HOLD_SECS,
             "{versions} versions in {window} s"
         );
-        // No client skipped a version on the way (Known issue 20).
+        // No client skipped a version on the way.
         assert_eq!(ctl_counter(&after, "ctl_full_fallbacks_skipped"), 0);
         assert_eq!(ctl_counter(&after, "ctl_full_fallbacks_other"), 0);
     }

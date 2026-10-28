@@ -867,7 +867,7 @@ mod tests {
         p
     }
 
-    /// Known issue 14: a new Node joins only once its Pod reports, which
+    /// A new Node joins only once its Pod reports, which
     /// the dataplane does after its peer listener is open.
     #[test]
     fn new_nodes_join_once_serving() {

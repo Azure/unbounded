@@ -97,8 +97,8 @@ pub struct Shared {
     pub changed: Signal,
     /// Notified on every primary Lease change ([`crate::seat::apply_primary`]),
     /// and only then: a seat follower takes its generation before reading
-    /// the state, so a change that arrives during the read wakes it again
-    /// (Known issue 48), without the follower's own installation (which
+    /// the state, so a change that arrives during the read wakes it again,
+    /// without the follower's own installation (which
     /// notifies `changed`) waking it.
     pub primary_lease: Signal,
     pub verifier: Arc<DynamicClientVerifier>,

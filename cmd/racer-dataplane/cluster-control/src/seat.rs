@@ -1155,7 +1155,7 @@ mod tests {
         });
     }
 
-    /// Known issue 56: the primary commits while its own follower's read is
+    /// The primary commits while its own follower's read is
     /// in flight; the read answers the record the commit replaced. That is
     /// older news, not a rollback, and the primary keeps serving.
     #[test]
@@ -1198,7 +1198,7 @@ mod tests {
         });
     }
 
-    /// Known issue 48: a primary Lease change (a commit) that arrives while
+    /// A primary Lease change (a commit) that arrives while
     /// the follower's read is in flight wakes the next read at the 1 s floor
     /// instead of after `crate::limits::FOLLOW_INTERVAL`.
     #[test]
