@@ -184,53 +184,53 @@ pub struct NodeConfig {
     /// Speculative bytes per node (production `page_hedge_bytes`, default one `DUPLICATE_BYTES`).
     pub hedge_bytes: u64,
     // Ablation switches: production always has these on (except `lineage_slack`); set false to
-    // measure without the fix for the Known issue named.
-    /// Overflow fan-out to page helpers (16).
+    // measure without the fix.
+    /// Overflow fan-out to page helpers.
     pub fanout: bool,
     /// Bodies of one page an owner streams before shedding its readers; 0 derives it from the page
     /// size like production.
     pub hot_page_bodies: u32,
-    /// Fill handover to a live waiter when the leader expires (30).
+    /// Fill handover to a live waiter when the leader expires.
     pub flight_handover: bool,
-    /// Rank 0 asks a successor that recently missed it before origin (21).
+    /// Rank 0 asks a successor that recently missed it before origin.
     pub successor_hints: bool,
-    /// Owners ask hinted later owners copy-only first (21). Needs `successor_hints`.
+    /// Owners ask hinted later owners copy-only first. Needs `successor_hints`.
     pub successor_targets: bool,
-    /// Non-owners walk the previous membership at a lagging destination (19).
+    /// Non-owners walk the previous membership at a lagging destination.
     pub stale_fallback: bool,
-    /// Lineage targets and lineage-first visit order (25).
+    /// Lineage targets and lineage-first visit order.
     pub lineage: bool,
-    /// A non-owner that cannot fall back waits once (26).
+    /// A non-owner that cannot fall back waits once.
     pub stale_wait: bool,
-    /// `StaleMembership` refunds the links past the answerer (47, 49).
+    /// `StaleMembership` refunds the links past the answerer.
     pub stale_link_refund: bool,
-    /// Owners also ask members just below past owners (34). Needs `lineage`.
+    /// Owners also ask members just below past owners. Needs `lineage`.
     pub demoted_targets: bool,
-    /// Lineage targets get their own grant (35).
+    /// Lineage targets get their own grant.
     pub lineage_grants: bool,
-    /// With `lineage_grants`, still fund lineage probes from slack (35; production off).
+    /// With `lineage_grants`, still fund lineage probes from slack (production off).
     pub lineage_slack: bool,
-    /// Copy-only requests from earlier-ranked owners do not join (44).
+    /// Copy-only requests from earlier-ranked owners do not join.
     pub copy_join_rank: bool,
-    /// Owners above rank 0 offer origin copies to rank 0 (37). Needs `successor_hints`.
+    /// Owners above rank 0 offer origin copies to rank 0. Needs `successor_hints`.
     pub orphan_notices: bool,
-    /// Owners above rank 0 track rank 0 per page (39).
+    /// Owners above rank 0 track rank 0 per page.
     pub rank0_watch: bool,
-    /// Granted probes go out at once (45).
+    /// Granted probes go out at once.
     pub parallel_granted: bool,
-    /// Most lineage targets per owner walk (46; production `walk::MAX_LINEAGE`).
+    /// Most lineage targets per owner walk (production `walk::MAX_LINEAGE`).
     pub lineage_cap: usize,
-    /// Unknown-age demoted members are lineage targets too (46).
+    /// Unknown-age demoted members are lineage targets too.
     pub unknown_age_targets: bool,
-    /// Hold unanswering next hops silent (41, 43).
+    /// Hold unanswering next hops silent.
     pub silence: bool,
-    /// Visit owners that shed us last (54). Needs `silence`.
+    /// Visit owners that shed us last. Needs `silence`.
     pub shed_busy: bool,
-    /// Leave the retry to rank 0 after its own failure (52). Needs `rank0_watch`.
+    /// Leave the retry to rank 0 after its own failure. Needs `rank0_watch`.
     pub rank0_failure_hold: bool,
-    /// Copy offers wait out a cut toward their target's site (50).
+    /// Copy offers wait out a cut toward their target's site.
     pub offer_cut_groups: bool,
-    /// Rank 2 holders also offer origin copies to rank 1 (51).
+    /// Rank 2 holders also offer origin copies to rank 1.
     pub offer_predecessors: bool,
 }
 

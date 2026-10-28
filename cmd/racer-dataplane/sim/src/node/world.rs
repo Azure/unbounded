@@ -279,7 +279,7 @@ enum Then {
 }
 
 /// A yielding ranking or route search: the real future, polled once per simulated CPU slice on its
-/// worker's CPU FIFO (see the design doc, "Round 2: fidelity").
+/// worker's CPU FIFO.
 struct Task {
     node: u32,
     worker: u8,
@@ -637,6 +637,23 @@ fn err_name(e: Error) -> &'static str {
         Error::Io => "error_io",
         Error::Os(_) => "error_os",
     }
+}
+
+/// Bodies in `map[key]` still streaming at `now`; drops finished ones.
+fn live_ends<K: std::hash::Hash + Eq>(
+    map: &mut HashMap<K, Vec<Nanos>, Fixed>,
+    key: K,
+    now: Nanos,
+) -> usize {
+    let Some(ends) = map.get_mut(&key) else {
+        return 0;
+    };
+    ends.retain(|end| *end > now);
+    let n = ends.len();
+    if n == 0 {
+        map.remove(&key);
+    }
+    n
 }
 
 fn err_reply(e: Error) -> Reply {
@@ -3557,32 +3574,12 @@ impl NodeWorld {
     /// page.
     fn shed_hot(&mut self, dest: u32, requester: u32, page: u64) -> bool {
         let now = self.now();
-        let streaming = match self.streaming.get_mut(&(dest, page)) {
-            Some(ends) => {
-                ends.retain(|end| *end > now);
-                let n = ends.len();
-                if n == 0 {
-                    self.streaming.remove(&(dest, page));
-                }
-                n
-            }
-            None => 0,
-        };
+        let streaming = live_ends(&mut self.streaming, (dest, page), now);
         let threshold = self.hot_page_threshold();
         if streaming < threshold || !self.config.node.fanout {
             return false;
         }
-        let all = match self.bodies.get_mut(&dest) {
-            Some(ends) => {
-                ends.retain(|end| *end > now);
-                let n = ends.len();
-                if n == 0 {
-                    self.bodies.remove(&dest);
-                }
-                n
-            }
-            None => 0,
-        };
+        let all = live_ends(&mut self.bodies, dest, now);
         // Production ranks the page here (`PeerServer::shed_hot_page`, `placement.rank`), not only
         // from the placement cache: an owner that holds the page without having ranked it under its
         // current membership (fetched under an older one, or never missed it since) still sheds.
@@ -4440,7 +4437,7 @@ impl NodeWorld {
             // the repeat to why `A` skipped it.
             if let Some(orphan) = last.skip {
                 self.metrics.incr(skip_counters(orphan).1);
-                // Rank 0 refetching although it noted the holder (round 4, orphan2): its one
+                // Rank 0 refetching although it noted the holder: its one
                 // successor probe of the hint was spent, missed, or the hint expired.
                 if skip.is_none() && self.nodes[node as usize].hints.names(&page, &last.node) {
                     self.metrics.incr("origin_repeats_orphan_noted");
@@ -5024,7 +5021,6 @@ impl NodeWorld {
         let memory = self.memory();
         let total: usize = memory.iter().map(|(_, b)| b).sum();
         let nodes = self.config.nodes.max(1) as usize;
-        let duplicated = self.origin_per_page.values().filter(|c| **c > 1).count();
         let max_per_page = self.origin_per_page.values().copied().max().unwrap_or(0);
         // Requests per page other than retries after a failed origin request, and the most such
         // retries on one page.
@@ -5056,7 +5052,6 @@ impl NodeWorld {
             "origin_per_page": {
                 "pages": pages,
                 "requests": requests,
-                "pages_fetched_more_than_once": duplicated,
                 "max_requests_per_page": max_per_page,
                 "max_requests_per_page_excluding_failure_retries": max_without_retries,
                 "max_failure_retries_per_page": max_retries,
@@ -5087,10 +5082,7 @@ impl NodeWorld {
             },
             "rejections": self.rejections(),
             "membership": {
-                "latest_version": self.versions.latest_number(),
-                "publications": c("membership_publications"),
                 "placement_memo_entries": self.shared.phantom.memo_len(),
-                "route_memo_entries": self.shared.routes.memo_len(),
             },
             "invariants": self.invariants.to_json(),
             "memory": {

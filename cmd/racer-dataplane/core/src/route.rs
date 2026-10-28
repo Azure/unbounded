@@ -703,47 +703,27 @@ mod tests {
 
     #[test]
     fn silence_evidence_counts_answers_and_unanswered_exchanges_only() {
-        assert_eq!(
-            exchange_evidence(Exchange::Complete { overloaded: true }, false).2,
-            Some(true)
-        );
-        assert_eq!(exchange_evidence(Exchange::Streaming, false).2, Some(true));
-        for fault in [Fault::DeadlineExceeded, Fault::Cancelled] {
+        let failed = |fault, socket_failure| Exchange::Failed {
+            fault,
+            socket_failure,
+        };
+        use Fault::*;
+        // A failed socket is link health's evidence, not silence.
+        for (exchange, silence) in [
+            (Exchange::Complete { overloaded: true }, Some(true)),
+            (Exchange::Streaming, Some(true)),
+            (failed(DeadlineExceeded, false), Some(false)),
+            (failed(Cancelled, false), Some(false)),
+            (failed(DeadlineExceeded, true), None),
+            (failed(Cancelled, true), None),
+            (failed(Unavailable, false), None),
+            (failed(Io, false), None),
+            (failed(Overloaded, false), None),
+        ] {
             assert_eq!(
-                exchange_evidence(
-                    Exchange::Failed {
-                        fault,
-                        socket_failure: false
-                    },
-                    false
-                )
-                .2,
-                Some(false)
-            );
-            // A failed socket is link health's evidence.
-            assert_eq!(
-                exchange_evidence(
-                    Exchange::Failed {
-                        fault,
-                        socket_failure: true
-                    },
-                    false
-                )
-                .2,
-                None
-            );
-        }
-        for fault in [Fault::Unavailable, Fault::Io, Fault::Overloaded] {
-            assert_eq!(
-                exchange_evidence(
-                    Exchange::Failed {
-                        fault,
-                        socket_failure: false
-                    },
-                    false
-                )
-                .2,
-                None
+                exchange_evidence(exchange, false).2,
+                silence,
+                "{exchange:?}"
             );
         }
     }

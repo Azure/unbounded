@@ -250,14 +250,9 @@ fn reads_recover_after_partition_heals() {
 /// Old: `two_thousand_nodes_keep_per_worker_bounds_under_cold_start` (small version). Every node
 /// cold-starts on one object; every read terminates, each page reaches the origin at most once per
 /// owner, and admission invariants (per-worker quotas) hold. The old model asserted that every read
-/// succeeds. With the real logic, before round 3 the flight table cap (`NodeConfig::flights`)
-/// rejected joins under this storm and the rejected walks ended in `HopBudgetExhausted`: 851 of
-/// 6,400 reads at 400 nodes and 7,122 of 32,000 at 2,000 nodes (seed 8). A local hop budget
-/// shortfall is now walk evidence and route searches queue, so no read fails that way. Reads may
-/// fail only with admission `Overloaded` or a recoverable `Unavailable` after the client's retries,
-/// at most 1 in 100. With rank-0 delegation (round 3 origin) one read of 6,400 at 400 nodes (seed
-/// 8) ends `Unavailable`: rejected flight joins end walks `Exhausted` and that read ran out of
-/// retries.
+/// succeeds. Here a local hop budget shortfall is walk evidence and route searches queue, so no
+/// read fails with `HopBudgetExhausted`. Reads may fail only with admission `Overloaded` or a
+/// recoverable `Unavailable` after the client's retries, at most 1 in 100.
 #[test]
 fn cold_start_completes_with_bounded_origin_traffic() {
     cold_start(400);
@@ -342,7 +337,6 @@ fn seed_matrix_replays_identical_reports() {
     );
 }
 
-/// (data plane, round 4 capacity).
 #[test]
 fn overloaded_hot_page_owners_do_not_stream_to_abandoned_requesters() {
     let nodes = 96;
@@ -375,7 +369,7 @@ fn overloaded_hot_page_owners_do_not_stream_to_abandoned_requesters() {
     );
 }
 
-/// (round 4 fanout). One warm page read by 512 nodes within a millisecond over 32 MiB/s NICs: in a
+/// One warm page read by 512 nodes within a millisecond over 32 MiB/s NICs: in a
 /// 2 s attempt the page's 3 owners can send about 192 copies, so without fan-out readers queue on
 /// the owners until their attempts time out and some reads fail. With fan-out, owners already
 /// streaming `hot_page_bodies` bodies of the page shed further readers with `Overloaded`, and a
@@ -414,7 +408,7 @@ fn hot_page_readers_fan_out_through_helpers() {
     );
 }
 
-/// (round 4, overload): with the origin far slower than the demand, rank 0's request for a page
+/// With the origin far slower than the demand, rank 0's request for a page
 /// queues for seconds.
 #[test]
 fn owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch() {
@@ -456,7 +450,7 @@ fn owners_above_rank_zero_do_not_overlap_a_slow_origin_fetch() {
     assert!(pings <= bound, "{pings} pings, bound {bound}: {report}");
 }
 
-/// (round 4, relay): a relay forwarding a body still queued at a busy owner reserved its own NIC at
+/// Before the fix, a relay forwarding a body still queued at a busy owner reserved its own NIC at
 /// the body's future send time, so its other sends queued behind the gap, backlogs spread from
 /// relay to relay and relays held their `Relay` reservations for hundreds of milliseconds (5k
 /// `zipf`: 339k relay rejections, 4,373 failed reads).
@@ -557,7 +551,7 @@ fn hung_peers_are_found_and_recovered_peers_are_used_again() {
     assert_eq!(late, 0, "{report}");
 }
 
-/// (round 4, busy): an owner that sheds a reader (a signed `Overloaded`, here a hot page's owner)
+/// An owner that sheds a reader (a signed `Overloaded`, here a hot page's owner)
 /// is busy, not hung.
 #[test]
 fn readers_do_not_return_first_to_an_owner_that_shed_them() {
@@ -602,7 +596,6 @@ fn single_reader_then_storm_reuses_copies() {
     let per_page: Vec<u32> = (0..pages)
         .map(|p| world.origin_requests(3 * pages + p))
         .collect();
-    // Before owners delegated to rank 0 this was 33.
     assert_eq!(origin, pages, "{per_page:?}");
     assert!(counter(&report, "peer_bytes") > 0);
     assert!(counter(&report, "flight_joins") + counter(&report, "peer_memory_hits") > 0);
@@ -959,7 +952,6 @@ fn joined_owners_copy_from_previous_owners() {
     let per_page: Vec<u32> = (0..pages)
         .map(|p| world.origin_requests(3 * pages + p))
         .collect();
-    // Without handoff probes this was 19 (three pages fetched twice).
     assert!(counter(&report, "handoff_probes") > 0, "{report}");
     assert_eq!(counter(&report, "origin_requests"), pages, "{per_page:?}");
     assert_eq!(all_repeats(&report), 0, "{}", report["origin_per_page"]);

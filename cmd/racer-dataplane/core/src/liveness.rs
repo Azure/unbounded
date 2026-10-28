@@ -1,5 +1,4 @@
-//! Peer silence: a neighbor that accepts requests and never answers them
-//! (Known issues 41, 43, 53, 54).
+//! Peer silence: a neighbor that accepts requests and never answers them.
 //!
 //! A timeout alone cannot tell a hung peer from a busy one, so a timeout only
 //! raises a question and a ping (answered `Miss` at once, never waiting on
@@ -240,7 +239,7 @@ impl<N: Eq + Hash + Clone, P: Clone> Silence<N, P> {
         became
     }
 
-    /// `peer` answered: clear its evidence and quiet it (Known issue 53).
+    /// `peer` answered: clear its evidence and quiet it.
     /// Untracked peers get no entry.
     pub fn answered(&mut self, peer: &N, now: Instant) {
         let quiet = self.quiet();
@@ -405,9 +404,8 @@ mod silence_tests {
 
     #[test]
     fn a_peer_that_answered_recently_is_not_pinged_for_the_quiet_time() {
-        // Known issue 53: a busy peer answers some exchanges and leaves
-        // others (that joined its running work) unanswered; each answer
-        // used to forget it, so every later timeout pinged it again.
+        // A busy peer answers some exchanges and leaves others (that joined
+        // its running work) unanswered; an answer must not forget it.
         let t = Instant::now();
         let mut s = silence();
         assert!(s.timed_out(1, (), t, t + 2 * S, RANK0_TIMEOUTS));
@@ -434,7 +432,7 @@ mod silence_tests {
 
     #[test]
     fn a_peer_that_shed_this_node_is_busy_for_the_quiet_time() {
-        // Known issue 54: an owner that signed `Overloaded` for this node is
+        // An owner that signed `Overloaded` for this node is
         // alive and busy. Readers visit it after the other owners until the
         // quiet time passes or it answers something else; it is never
         // pinged or silent for it.
@@ -550,7 +548,7 @@ mod silence_tests {
     }
 }
 
-// Rank 0 watch (Known issues 39, 52): what an owner above rank 0 last
+// Rank 0 watch: what an owner above rank 0 last
 // learned about rank 0's acquisition of a page.
 //
 // A probe timeout marks the page `Fetching` for `hang_after` (or until the
@@ -560,7 +558,7 @@ mod silence_tests {
 // marks the page `Failed` for `hang_after`, so a later `Unavailable` from
 // rank 0 does not cost a second origin request. Any answer signed by rank 0
 // forgets the page. Only timeouts withhold origin: in the sim, withholding it
-// after relay `Overloaded` too failed 29 to 55 more reads (Known issue 40).
+// after relay `Overloaded` too failed 29 to 55 more reads.
 
 /// Default bound on watched pages per node.
 pub const WATCH_CAPACITY: usize = 4096;
