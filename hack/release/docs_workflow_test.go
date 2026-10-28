@@ -17,6 +17,7 @@ import (
 
 type docsStep struct {
 	ID   string            `yaml:"id"`
+	If   string            `yaml:"if"`
 	Name string            `yaml:"name"`
 	Uses string            `yaml:"uses"`
 	Run  string            `yaml:"run"`
@@ -24,9 +25,15 @@ type docsStep struct {
 	Env  map[string]string `yaml:"env"`
 }
 
+type docsConcurrency struct {
+	Group            string `yaml:"group"`
+	CancelInProgress bool   `yaml:"cancel-in-progress"`
+}
+
 type docsJob struct {
 	Needs       any               `yaml:"needs"`
 	If          string            `yaml:"if"`
+	Concurrency *docsConcurrency  `yaml:"concurrency"`
 	Uses        string            `yaml:"uses"`
 	With        map[string]string `yaml:"with"`
 	Permissions map[string]string `yaml:"permissions"`
@@ -36,11 +43,8 @@ type docsJob struct {
 type docsWorkflow struct {
 	On          map[string]yaml.Node `yaml:"on"`
 	Permissions map[string]string    `yaml:"permissions"`
-	Concurrency struct {
-		Group            string `yaml:"group"`
-		CancelInProgress bool   `yaml:"cancel-in-progress"`
-	} `yaml:"concurrency"`
-	Jobs map[string]docsJob `yaml:"jobs"`
+	Concurrency *docsConcurrency     `yaml:"concurrency"`
+	Jobs        map[string]docsJob   `yaml:"jobs"`
 }
 
 func loadWorkflow(t *testing.T, name string) docsWorkflow {
@@ -108,8 +112,21 @@ func TestDocsWorkflowTriggers(t *testing.T) {
 		}
 	}
 
-	if wf.Concurrency.Group != "pages" || wf.Concurrency.CancelInProgress {
-		t.Fatalf("concurrency = %+v, want pages without cancel", wf.Concurrency)
+	// Ineligible runs must exit before entering the pages group, so only
+	// deploy holds it, and it never cancels a running deployment.
+	if wf.Concurrency != nil {
+		t.Fatalf("workflow-level concurrency = %+v, want none", wf.Concurrency)
+	}
+
+	for name, job := range wf.Jobs {
+		c := job.Concurrency
+		if name == "deploy" {
+			if c == nil || c.Group != "pages" || c.CancelInProgress {
+				t.Fatalf("deploy concurrency = %+v, want pages without cancel", c)
+			}
+		} else if c != nil {
+			t.Fatalf("%s concurrency = %+v, want none", name, c)
+		}
 	}
 }
 
@@ -130,13 +147,26 @@ func TestDocsWorkflowPermissionsAndOrdering(t *testing.T) {
 	}
 
 	deploy := wf.Jobs["deploy"]
-	if len(deploy.Permissions) != 2 || deploy.Permissions["pages"] != "write" ||
-		deploy.Permissions["id-token"] != "write" {
+	if len(deploy.Permissions) != 3 || deploy.Permissions["pages"] != "write" ||
+		deploy.Permissions["id-token"] != "write" || deploy.Permissions["contents"] != "read" {
 		t.Fatalf("deploy permissions = %v", deploy.Permissions)
 	}
 
-	if deploy.Needs != "build" {
-		t.Fatalf("deploy needs = %v, want build", deploy.Needs)
+	needs, _ := deploy.Needs.([]any)
+	if len(needs) != 2 || needs[0] != "resolve" || needs[1] != "build" ||
+		deploy.If != "needs.resolve.outputs.tag != ''" {
+		t.Fatalf("deploy must wait for resolve and build: needs=%v if=%q", deploy.Needs, deploy.If)
+	}
+
+	if len(deploy.Steps) != 2 || deploy.Steps[0].ID != "recheck" ||
+		deploy.Steps[0].Env["TAG"] != "${{ needs.resolve.outputs.tag }}" ||
+		strings.Contains(deploy.Steps[0].Run, "${{") {
+		t.Fatalf("deploy must recheck the validated tag via env first: %+v", deploy.Steps)
+	}
+
+	if !strings.HasPrefix(deploy.Steps[1].Uses, "actions/deploy-pages@") ||
+		deploy.Steps[1].If != "steps.recheck.outputs.current == 'true'" {
+		t.Fatalf("deploy-pages must run only when the tag is still current: %+v", deploy.Steps[1])
 	}
 
 	build := wf.Jobs["build"]
@@ -431,6 +461,85 @@ func TestDocsResolveScript(t *testing.T) {
 
 			if string(got) != want {
 				t.Fatalf("outputs = %q, want %q\n%s", got, want, out)
+			}
+		})
+	}
+}
+
+func TestDocsDeployRecheckScript(t *testing.T) {
+	t.Parallel()
+
+	var script string
+
+	for _, step := range loadWorkflow(t, "docs.yaml").Jobs["deploy"].Steps {
+		if step.ID == "recheck" {
+			script = step.Run
+		}
+	}
+
+	if script == "" {
+		t.Fatal("recheck step not found")
+	}
+
+	cases := []struct {
+		name    string
+		latest  string
+		wantErr bool
+		want    string
+	}{
+		{name: "still latest", latest: latestTag, want: "current=true\n"},
+		{name: "newer release published", latest: "v1.5.0", want: "current=false\n"},
+		{name: "lookup fails", latest: "", wantErr: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if err := os.MkdirAll("../../tmp", 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			dir, err := os.MkdirTemp("../../tmp", "docs-recheck-")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+			dir, err = filepath.Abs(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(fakeGH), 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			output := filepath.Join(dir, "output")
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			cmd := exec.CommandContext(ctx, "bash", "-c", script)
+			cmd.Dir = dir
+			cmd.Env = []string{
+				"PATH=" + dir + ":" + os.Getenv("PATH"),
+				"GITHUB_OUTPUT=" + output,
+				"GITHUB_REPOSITORY=Azure/unbounded",
+				"GH_LOG=" + filepath.Join(dir, "gh.log"),
+				"TAG=" + latestTag,
+				"FAKE_LATEST=" + tc.latest,
+			}
+
+			out, err := cmd.CombinedOutput()
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("err = %v, wantErr %v\n%s", err, tc.wantErr, out)
+			}
+
+			got, _ := os.ReadFile(output)
+			if string(got) != tc.want {
+				t.Fatalf("outputs = %q, want %q\n%s", got, tc.want, out)
 			}
 		})
 	}

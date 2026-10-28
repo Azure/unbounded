@@ -20,6 +20,11 @@ name: unbounded docs
 # Whatever the trigger, `resolve` checks the tag against the repository's
 # latest published release before anything is checked out. Drafts and
 # prereleases are never returned by releases/latest, so they cannot pass.
+#
+# Only `deploy` holds the `pages` concurrency group, so an ineligible run
+# exits in `resolve` without replacing a queued valid run. A newer release
+# can still finish first, so `deploy` checks the tag again once it holds the
+# group and skips publishing if a newer release has become the latest.
 # ---------------------------------------------------------------------------
 
 on:
@@ -33,10 +38,6 @@ on:
         type: string
 permissions:
   contents: read
-
-concurrency:
-  group: pages
-  cancel-in-progress: false
 
 jobs:
   resolve:
@@ -153,14 +154,44 @@ jobs:
           path: docs/public
 
   deploy:
-    needs: build
+    needs: [resolve, build]
+    if: needs.resolve.outputs.tag != ''
     runs-on: ubuntu-latest
+    # Never cancel: a stale run must not abort a deployment in progress.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     permissions:
+      contents: read
       pages: write
       id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      # Queued and approval-gated runs can start after a newer release has
+      # been published. Skip if the validated tag is no longer the latest.
+      - name: Recheck latest release
+        id: recheck
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          LATEST_TAG="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)" \
+            || { echo "::error::could not look up the latest release"; exit 1; }
+          if [ -z "$LATEST_TAG" ]; then
+            echo "::error::latest release lookup returned no tag"
+            exit 1
+          fi
+          if [ "$TAG" != "$LATEST_TAG" ]; then
+            echo "::notice::Skipping deploy: ${TAG} is no longer the latest published release (${LATEST_TAG})"
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "current=true" >> "$GITHUB_OUTPUT"
+
       - id: deployment
+        if: steps.recheck.outputs.current == 'true'
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
