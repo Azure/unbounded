@@ -1088,7 +1088,7 @@ copy of these rules.
 - `serve`: `serve_action` and `serve_deadline` from `Coordinator::serve_peer`. `policy` has
   `peer_error`, `recoverable`, `optional_headroom`, the retention eligibility and score rules, and
   `persist`.
-- `metadata`: the sans-IO `MetadataCohorts` (`MAX_WAITERS`, `MAX_REFRESH_ATTEMPTS`),
+- `metadata`: the cohort bounds (`MAX_WAITERS`, `MAX_REFRESH_ATTEMPTS`),
   `RefreshPurpose`, and `refresh_settlement`. `range`: `direct_fills`, `may_select`, `share`,
   `selection_demand`, `PageBudget`, `DIRECT_AHEAD`, and `SELECTIONS`.
 - `worker`: `WorkerMap::select`.
@@ -1108,8 +1108,7 @@ function. For each, the sans-IO version has its own tests, and production calls 
 - Production `Flights` keeps its async table and calls the core gates and the shared `State`.
 - Production `Fill` calls the `fill` helpers rather than driving `FillPlan`.
 - Production `MetadataService` keeps `flow_control::coalesce::Table` and uses the core constants
-  and `refresh_settlement`. `MetadataCohorts` reproduces the `coalesce::Table` election rules,
-  with a deterministic wake order.
+  and `refresh_settlement`.
 
 `request_traced` now reserves remote credits (`plan_attempt`) before it builds the attempt scope,
 where it used to reserve them after. These can only fail in different order if `Cancellation::new`
