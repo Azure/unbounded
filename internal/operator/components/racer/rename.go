@@ -5,6 +5,7 @@ package racer
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
@@ -50,9 +51,14 @@ func renamedConfigData(ctx context.Context, env *component.Env) (map[string]stri
 		return nil, err
 	}
 
+	cm, ok := live.(*corev1.ConfigMap)
+	if !ok {
+		return nil, fmt.Errorf("%s is %T, not a ConfigMap", renamedConfig, live)
+	}
+
 	data := map[string]string{}
 
-	for key, value := range live.(*corev1.ConfigMap).Data {
+	for key, value := range cm.Data {
 		if rest, found := strings.CutPrefix(key, renamedKeyPrefix); found {
 			key = "RACER_" + rest
 		}

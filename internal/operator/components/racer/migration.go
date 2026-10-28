@@ -291,7 +291,11 @@ func planLegacyRestamp(ctx context.Context, env *component.Env, plan *component.
 	// The retired installation applied its dataplane under the pre-rename
 	// names. planRenamedCleanup removes those; keep the anchors until it has.
 	for _, candidate := range named[:6] {
-		renamed := candidate.obj.DeepCopyObject().(client.Object)
+		renamed, ok := candidate.obj.DeepCopyObject().(client.Object)
+		if !ok {
+			return false, errors.New("legacy anchor copy is not a client object")
+		}
+
 		renamed.SetName(renamedDataplane)
 		named = append(named, legacy(renamed, candidate.gvk))
 	}
