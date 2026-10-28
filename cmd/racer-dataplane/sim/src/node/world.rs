@@ -448,25 +448,6 @@ fn skip_counter(prefix: &'static str, skip: &'static str) -> &'static str {
     }
 }
 
-/// `origin_repeats_concurrent_skip_<skip>`: a concurrent repeat by an owner above rank 0, by why it
-/// skipped rank 0.
-fn concurrent_counter(skip: &'static str) -> &'static str {
-    match skip {
-        "not_serving" => "origin_repeats_concurrent_skip_not_serving",
-        "partition" => "origin_repeats_concurrent_skip_partition",
-        "down" => "origin_repeats_concurrent_skip_down",
-        "route" => "origin_repeats_concurrent_skip_route",
-        "circuit" => "origin_repeats_concurrent_skip_circuit",
-        "timeout" => "origin_repeats_concurrent_skip_timeout",
-        "failed" => "origin_repeats_concurrent_skip_failed",
-        "relay" => "origin_repeats_concurrent_skip_relay",
-        "busy" => "origin_repeats_concurrent_skip_busy",
-        "copy_only" => "origin_repeats_concurrent_skip_copy_only",
-        "copy" => "origin_repeats_concurrent_skip_copy",
-        _ => "origin_repeats_concurrent_skip_unfunded",
-    }
-}
-
 /// The last origin request for a page ([`NodeWorld::classify_repeat`]).
 #[derive(Clone, Copy, Debug)]
 struct LastOrigin {
@@ -479,8 +460,6 @@ struct LastOrigin {
     done: Nanos,
     /// For a fetch by an owner above rank 0: why rank 0 did not serve it (`origin_skips_*`).
     skip: Option<&'static str>,
-    /// Membership version of that request.
-    version: u64,
 }
 
 impl Fill {
@@ -1596,28 +1575,12 @@ impl NodeWorld {
                             // When reads fail, to attribute them to faults.
                             self.metrics
                                 .observe("read_failed_at_s", self.now() / SECONDS);
-                            if !self.down_since.is_empty() {
-                                self.metrics.incr("reads_failed_while_crashed");
-                            }
                             if self.hangs
                                 && crate::faults::hung(&self.config.faults, r.node, self.now())
                             {
                                 // The reader's own peer server hangs: the answers to its requests
                                 // are lost.
                                 self.metrics.incr("reads_failed_on_hung_nodes");
-                            } else if self.hangs {
-                                // Whose hang it was.
-                                let now = self.now();
-                                let owners = self.owners_at(r.node, 0, r.page, true);
-                                let hung =
-                                    |n: &u32| crate::faults::hung(&self.config.faults, *n, now);
-                                self.metrics.incr(if owners.first().is_some_and(hung) {
-                                    "reads_failed_rank0_hung"
-                                } else if owners.iter().any(hung) {
-                                    "reads_failed_owner_hung"
-                                } else {
-                                    "reads_failed_other_hang"
-                                });
                             }
                             if self.versions.unready_members() > 0 {
                                 // Reads failing while some member cannot serve yet.
@@ -1672,33 +1635,6 @@ impl NodeWorld {
         }
         let hints = n.hints.peek_for(&page, &requester, instant);
         if hints.is_empty() {
-            let all = n.hints.peek(&page, instant);
-            if !all.is_empty() {
-                // The requester came back after a deferral.
-                self.metrics.incr("successor_deferrals_declined_returning");
-                let owners = self.owners_at(node, w, page, false);
-                if let Some(to) = successor_deferral(all, &node, &requester, &owners) {
-                    let t = &self.nodes[to as usize];
-                    let site = |x: u32| self.fabric.site[x as usize];
-                    let why = if t.down {
-                        "successor_returns_target_down"
-                    } else if !self.versions.enrolled(to) {
-                        "successor_returns_target_not_serving"
-                    } else if self
-                        .partitions
-                        .blocked(self.now(), site(requester), site(to))
-                    {
-                        "successor_returns_target_partition"
-                    } else if t.disk.entries.get(&page).is_some()
-                        || t.workers.iter().any(|x| x.memory.pages.contains_key(&page))
-                    {
-                        "successor_returns_target_holds"
-                    } else {
-                        "successor_returns_target_no_copy"
-                    };
-                    self.metrics.incr(why);
-                }
-            }
             return false;
         }
         let acquiring = n.workers[w as usize]
@@ -1711,10 +1647,6 @@ impl NodeWorld {
         let Some(to) = successor_deferral(hints, &node, &requester, &owners) else {
             return false;
         };
-        if self.down_since.contains_key(&to) {
-            // Deferred to a crashed owner (simulator truth).
-            self.metrics.incr("successor_deferrals_to_down");
-        }
         self.nodes[node as usize]
             .hints
             .charge(&page, requester, &to, MAX_DEFERRALS, instant);
@@ -4503,68 +4435,9 @@ impl NodeWorld {
 
     /// Counter for the rendezvous rank of `holder` for fill `id`'s page in the fill's membership,
     /// and whether it arrived before the fetching owner (so a lineage rule could have named it):.
-    fn holder_rank_bucket(&self, id: u64, holder: u32) -> &'static str {
-        let fill = &self.fills[&id];
-        let Some(members) = self
-            .versions
-            .get(fill.core.version)
-            .map(|v| v.members.clone())
-        else {
-            return "moved_unasked_holder_rank_unknown";
-        };
-        let Some(at) = members.position(&holder.to_be_bytes()) else {
-            return "moved_unasked_holder_not_member";
-        };
-        let rank = topology::rank_of(&members, &fill.page.to_be_bytes(), at);
-        let mine = self.since_of(fill.node, &members, &[fill.node])[0];
-        let theirs = self.since_of(fill.node, &members, &[holder])[0];
-        let older = matches!((theirs, mine), (Some(t), Some(m)) if t < m);
-        match (rank, older) {
-            (0..3, _) => "moved_unasked_holder_rank_owner",
-            (3..5, true) => "moved_unasked_holder_rank_4_5_older",
-            (3..5, false) => "moved_unasked_holder_rank_4_5",
-            (5..8, true) => "moved_unasked_holder_rank_6_8_older",
-            (5..8, false) => "moved_unasked_holder_rank_6_8",
-            (8..12, true) => "moved_unasked_holder_rank_9_12_older",
-            (8..12, false) => "moved_unasked_holder_rank_9_12",
-            (12..16, true) => "moved_unasked_holder_rank_13_16_older",
-            (12..16, false) => "moved_unasked_holder_rank_13_16",
-            (_, true) => "moved_unasked_holder_rank_17_older",
-            (_, false) => "moved_unasked_holder_rank_17",
-        }
-    }
-
-    /// Classify a repeated origin request for a page (Known issues 6, 12,
-    /// 13, 15). With `A` the node that last asked origin for the page and
-    /// `F` the fill asking now:
-    ///
-    /// - `origin_repeats_after_move`: the page's rank 0 differs from rank 0
-    ///   under `A`'s request, so ownership moved in between. At most one
-    ///   such fetch per move is the bound the walk aims for: the new rank 0
-    ///   finds `A` only through handoff probes (previous membership) or not
-    ///   at all once that membership is gone.
-    /// - `origin_repeats_after_failure`: same rank 0, and `A`'s request
-    ///   failed (origin 5xx, 412, 403), so nobody got the page from it.
-    /// - `origin_repeats_concurrent`: same rank 0, and `A`'s request is
-    ///   still in flight (two cold misses that did not coalesce).
-    /// - `origin_repeats_copy_lost`: same rank 0, `A`'s request succeeded,
-    ///   and `A` no longer holds the page (evicted or crashed).
-    /// - `origin_repeats_copy_held`: same rank 0 and `A` still holds the
-    ///   page, split by why `F` did not get it from `A`
-    ///   (`origin_repeats_held_*`):
-    ///   - `raced`: `A`'s copy landed after `F` started, so `F` may have
-    ///     asked before it existed (concurrency);
-    ///   - `unreachable`: `F` asked `A` and the probe failed in transport
-    ///     (`A` or the route to it down, partitioned, not serving yet);
-    ///   - `busy`: `F` asked `A` and it, or a relay, shed the request or
-    ///     was behind on membership;
-    ///   - `unfunded`: `F` had a probe for `A` but no budget to send it;
-    ///   - `missed`: `F` asked `A` and was told it had no copy although
-    ///     it held one before `F` started (should not happen);
-    ///   - `unasked`: `F` never asked `A`. This is the avoidable class
-    ///     (Known issue 15): owners ask predecessors, handoff targets and
-    ///     successors, so `A` goes unasked only when it is no current or
-    ///     previous owner, or the walk ran out of credits first.
+    /// Classify a repeated origin request for a page against the last request `A` for it:
+    /// rank 0 moved, `A` failed, `A` still in flight (concurrent), `A` lost its copy, or `A` still
+    /// holds it (`origin_repeats_held_*`, the avoidable class unless a skip, orphan or race).
     fn classify_repeat(&mut self, id: u64) {
         let now = self.now();
         let fill = &self.fills[&id];
@@ -4605,7 +4478,6 @@ impl NodeWorld {
             ok: None,
             done: now,
             skip,
-            version: fill.core.version,
         };
         let Some(last) = self.last_origin.insert(page, next) else {
             return;
@@ -4620,63 +4492,10 @@ impl NodeWorld {
                         .any(|w| w.memory.pages.contains_key(&page)))
         };
         let class = if last.rank0 != rank0 {
-            // Why a move repeats: the earlier fetcher lost the copy, or still holds it and this
-            // owner did or did not ask it; and whether the page moved over one version or more.
-            let sub = if !held(self) {
-                "origin_repeats_after_move_lost"
-            } else if let Some(&(_, a)) = fill
-                .asked
-                .iter()
-                .rev()
-                .find(|&&(dest, _)| dest == last.node)
-            {
-                match a {
-                    Asked::Miss => "origin_repeats_after_move_held_asked_miss",
-                    Asked::Copy => "origin_repeats_after_move_held_asked_copy",
-                    Asked::Unreachable(_) | Asked::Failed | Asked::Relayed => {
-                        "origin_repeats_after_move_held_asked_unreachable"
-                    }
-                    Asked::Busy => "origin_repeats_after_move_held_asked_busy",
-                    Asked::Unfunded => "origin_repeats_after_move_held_asked_unfunded",
-                }
-            } else if fill.core.version == last.version + 1
-                && fill.core.handoff.contains(&last.node)
-            {
-                "origin_repeats_after_move_held_unasked_target"
-            } else if fill.core.version == last.version + 1 && fill.core.owners.contains(&last.node)
-            {
-                "origin_repeats_after_move_held_unasked_owner"
-            } else if fill.core.version == last.version {
-                "origin_repeats_after_move_held_unasked_same"
-            } else if fill.core.version > last.version + 2 {
-                "origin_repeats_after_move_held_unasked_older"
-            } else if fill.core.version == last.version + 2 {
-                "origin_repeats_after_move_held_unasked_two"
-            } else {
-                "origin_repeats_after_move_held_unasked"
-            };
-            self.metrics.incr(sub);
-            if sub.contains("_unasked") {
-                // Where the unasked holder ranks for this page in the fetching owner's membership.
-                let bucket = self.holder_rank_bucket(id, last.node);
-                self.metrics.incr(bucket);
-            }
             "origin_repeats_after_move"
         } else if last.ok == Some(false) {
             "origin_repeats_after_failure"
         } else if last.ok.is_none() {
-            // Who overlaps whom. `F` above rank 0 skipped rank 0 (why), or `F` is rank 0 and `A`
-            // skipped it earlier.
-            let sub = if last.node == node {
-                "origin_repeats_concurrent_same_node"
-            } else if let Some(skip) = skip {
-                concurrent_counter(skip)
-            } else if last.skip.is_some() {
-                "origin_repeats_concurrent_rank0_after_skip"
-            } else {
-                "origin_repeats_concurrent_other"
-            };
-            self.metrics.incr(sub);
             self.fills.get_mut(&id).expect("present").concurrent = true;
             "origin_repeats_concurrent"
         } else if !held(self) {
@@ -4712,25 +4531,6 @@ impl NodeWorld {
                 if skip.is_none() && self.nodes[node as usize].hints.names(&page, &last.node) {
                     self.metrics.incr("origin_repeats_orphan_noted");
                 }
-                // Why the holder's copy did not reach this owner.
-                let index = fill.core.owners.iter().position(|c| *c == node);
-                let pending = index.is_some_and(|i| {
-                    self.nodes[last.node as usize]
-                        .notices
-                        .pending(&(page, i as u8))
-                });
-                let why = if asked(|a| {
-                    matches!(a, Asked::Unreachable(_) | Asked::Failed | Asked::Relayed)
-                }) {
-                    "origin_repeats_orphan_why_unreachable"
-                } else if pending {
-                    "origin_repeats_orphan_why_pending"
-                } else if self.nodes[node as usize].hints.names(&page, &last.node) {
-                    "origin_repeats_orphan_why_noted"
-                } else {
-                    "origin_repeats_orphan_why_other"
-                };
-                self.metrics.incr(why);
             }
             // Every such repeat is a skip itself (`F` above rank 0), an orphan (`A` fetched as a
             // skip), or raced.
