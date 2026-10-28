@@ -16,7 +16,6 @@
 //! - [`node`]: real node logic (placement, routes, walk, flights, fill,
 //!   serve, caches, admission) driven by events; every scenario runs it.
 
-pub mod cluster;
 pub mod combined;
 pub mod config;
 pub mod control;
