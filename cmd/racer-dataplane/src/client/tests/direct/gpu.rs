@@ -994,3 +994,93 @@ fn required_starts_eagerly_and_off_modes_never_load() {
     assert!(futures::executor::block_on(unbuilt.get_or_start()).is_none());
     assert_eq!(calls_now(&off), 0);
 }
+
+/// A loader like [`counted_loader`] on one GPU that first waits for `gate`,
+/// standing in for a CUDA initialization that stalls.
+fn gated_loader(
+    calls: &Arc<std::sync::atomic::AtomicUsize>,
+    gate: std::sync::mpsc::Receiver<()>,
+) -> crate::gpu::Loader {
+    let load = counted_loader(1, calls);
+    Box::new(move || {
+        let _ = gate.recv();
+        load()
+    })
+}
+
+#[test]
+/// A `gpu-read` that expires or is cancelled while the GPU start stalls
+/// stops waiting and releases its connection; the shared start keeps going
+/// and a later `gpu-read` uses the helper it started.
+fn stalled_gpu_start_honors_request_expiry_and_cancellation() {
+    for mode in ["expire", "cancel"] {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (open, gate) = std::sync::mpsc::channel();
+        let slot = slot(
+            GpuMode::Auto,
+            gated_loader(&calls, gate),
+            Default::default(),
+            None,
+        )
+        .unwrap();
+        let mut fixture = lazy_fixture(b"hello".to_vec(), &slot);
+        let timeout = Duration::from_millis(200);
+        if mode == "expire" {
+            fixture.listeners = fixture.listeners.with_request_timeout(timeout);
+        }
+        let memfd = Memfd::new();
+        let mut socket = fixture.connect();
+        send_with_fds(
+            &socket,
+            &direct_request("gpu-read", &fields("", 0, 5, GRANULE)),
+            &[memfd.file.as_raw_fd()],
+        );
+        let started = Instant::now();
+        for _ in 0..16 {
+            fixture.pump(16);
+        }
+        // The start is pending, so the request is still waiting on it.
+        assert!(slot.standby(), "{mode}");
+        assert_eq!(fixture.listeners.active_connections(), 1, "{mode}");
+        if mode == "expire" {
+            std::thread::sleep(
+                (started + timeout + Duration::from_millis(20))
+                    .saturating_duration_since(Instant::now()),
+            );
+        } else {
+            fixture.listeners.cancel_cache(&definition().id).unwrap();
+        }
+        let output = fixture.receive(&mut socket, true);
+        let (head, _) = split(&output);
+        assert!(head.starts_with("http/1.1 503"), "{mode}: {head}");
+        settle(&fixture);
+        // Giving up did not cancel the shared start.
+        assert!(slot.standby(), "{mode}");
+        open.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while slot.standby() {
+            assert!(Instant::now() < deadline, "{mode}: start did not finish");
+            std::thread::yield_now();
+        }
+        assert_eq!(calls_now(&calls), 1, "{mode}");
+        let helper = slot.get().unwrap().clone();
+        if mode == "expire" {
+            // A later request gets the helper the stalled start produced.
+            fixture.listeners = fixture
+                .listeners
+                .with_request_timeout(Duration::from_secs(30));
+            let allocation = allocate(&helper, 0, GRANULE);
+            let output = exchange(
+                &fixture,
+                &direct_request("gpu-read", &fields("", 0, 5, GRANULE)),
+                &[allocation.as_raw_fd()],
+            );
+            let (head, _) = split(&output);
+            assert!(head.starts_with("http/1.1 200"), "{head}");
+            assert_eq!(read_allocation(&allocation, 0, 5), b"hello");
+            settle(&fixture);
+            assert_released(&helper);
+            assert_eq!(calls_now(&calls), 1);
+        }
+    }
+}

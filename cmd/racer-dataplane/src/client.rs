@@ -873,20 +873,33 @@ impl Responses {
     /// process's first `gpu-read`, or pick up one another worker started.
     /// Awaits without blocking the worker. Other requests never call this,
     /// so nothing else touches a GPU.
-    pub(crate) async fn prepare_gpu(&self) {
+    ///
+    /// The wait honors `scope`: an expired or cancelled request stops waiting
+    /// and releases its connection, while the shared start keeps running for
+    /// later requests.
+    pub(crate) async fn prepare_gpu(&self, scope: &RequestScope) -> Result<()> {
         if self.gpu.borrow().is_some() {
-            return;
+            return Ok(());
         }
         let Some(slot) = &self.lazy_gpu else {
-            return;
+            return Ok(());
         };
-        let Some(helper) = slot.get_or_start().await else {
-            return;
+        let cancellation = scope.cancellation.subscribe()?;
+        let mut start = std::pin::pin!(slot.get_or_start());
+        let started = std::future::poll_fn(|cx| {
+            cancellation.register(cx.waker());
+            scope.check()?;
+            start.as_mut().poll(cx).map(Ok::<_, Error>)
+        })
+        .await?;
+        let Some(helper) = started else {
+            return Ok(());
         };
         let mut gpu = self.gpu.borrow_mut();
         if gpu.is_none() {
             *gpu = Some(Rc::new(crate::gpu::GpuClient::new(helper)));
         }
+        Ok(())
     }
 
     /// Whether this worker serves `gpu-read`.

@@ -972,9 +972,10 @@ async fn serve_connection(
         });
         // A `gpu-read` head is the only request that may start the GPU
         // helper (`RACER_ENABLE_GPU=auto`); see `Responses::prepare_gpu`.
-        if gpu_read {
-            responses.prepare_gpu().await;
-        }
+        let parsed = match parsed {
+            Ok(parsed) if gpu_read => responses.prepare_gpu(scope).await.map(|()| parsed),
+            other => other,
+        };
         let parsed = parsed.and_then(|(request, descriptors)| {
             let sink = responses.open_sink(&request.kind, descriptors)?;
             Ok((request, sink))
