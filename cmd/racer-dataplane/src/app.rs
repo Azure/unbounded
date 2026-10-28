@@ -2691,7 +2691,7 @@ impl WorkerApplication {
 
     /// The worker applied `snapshot` and it lists this node. A node not
     /// listed in its own membership cannot route a read; a new node is
-    /// listed only after it serves (Known issue 14 in
+    /// listed only after it serves ("Joining members" in
     /// designs/racer-core-simulation.md), so it is not ready until then.
     fn membership_usable(&self, snapshot: Option<&Snapshot>) -> bool {
         snapshot.is_some_and(|s| {

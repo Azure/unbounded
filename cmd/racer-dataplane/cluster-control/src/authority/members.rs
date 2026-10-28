@@ -275,7 +275,7 @@ pub struct Result {
 /// A dataplane Pod accepts peer links only after it enrolled and applied a
 /// publication (`App::start` opens listeners last). A member listed before
 /// that is routable but refuses every link, so peers fail toward it and
-/// reads fail while it enrolls (Known issues 14 and 17 in
+/// reads fail while it enrolls ("Joining members" in
 /// designs/racer-core-simulation.md).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Joins {

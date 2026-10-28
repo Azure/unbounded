@@ -16,7 +16,7 @@
 //! [`world::NodeWorld`] drives these with events: read arrival, peer request
 //! hops (`decide_hop` at every hop), replies, origin completions, membership
 //! publications and faults. See `designs/racer-core-simulation.md`, section
-//! "Node integration".
+//! "Node model".
 
 pub mod admission;
 pub mod config;

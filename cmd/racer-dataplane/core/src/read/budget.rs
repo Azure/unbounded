@@ -207,7 +207,8 @@ pub fn stale_unused_links(charged: u8, hops: usize) -> u8 {
     charged.saturating_sub(u8::try_from(hops).unwrap_or(u8::MAX))
 }
 
-/// Maximum links any route budget may carry (see `designs/racer-core-simulation.md`).
+/// Maximum links any route budget may carry (see "Route budget" in
+/// `designs/racer-core-simulation.md`).
 pub const MAX_ROUTE_LINKS: u8 = 8;
 
 /// Links per attempt before any route failure has been observed.

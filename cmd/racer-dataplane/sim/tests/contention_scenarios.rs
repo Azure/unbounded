@@ -2,9 +2,8 @@
 //!
 //! The old model ran payload-free abstractions of queues and page ownership.
 //! These tests keep the same intent but run the real node logic (placement,
-//! walks, flights, fill plans, admission, caches) inside `racer-sim`. See
-//! "Round 2: contention model retired" in `designs/racer-core-simulation.md`
-//! for the mapping from each old test to its replacement.
+//! walks, flights, fill plans, admission, caches) inside `racer-sim`.
+//! See "Scenarios" in `designs/racer-core-simulation.md`.
 
 use racer_sim::config::Config;
 use racer_sim::engine::{MILLIS, SECONDS};

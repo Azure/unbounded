@@ -93,7 +93,7 @@ pub const MAX_JOIN_HOLD_SECS: u64 = 60;
 /// (`MEMBERS_PER_SEAT`), so the hold grows with the membership to keep
 /// clients within one version. At 50,000 members a 10 s hold produced 33
 /// versions during enrollment, 646k full fallbacks and 2.9 TB of seat
-/// egress (designs/racer-core-simulation.md, "Round 4: join").
+/// egress (designs/racer-core-simulation.md, "Joining members").
 pub fn join_hold_secs(members: usize) -> u64 {
     (members as u64 / 1000).clamp(JOIN_HOLD_SECS, MAX_JOIN_HOLD_SECS)
 }

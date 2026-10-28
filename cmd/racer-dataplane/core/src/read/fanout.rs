@@ -93,8 +93,8 @@ fn fnv(parts: &[&[u8]]) -> u64 {
 /// further readers of that page with `Overloaded` (see [`shed_hot_page`] and
 /// [`hot_page_bodies`]). Stated in bytes so the rule means the same backlog
 /// (about 27 ms at 10 Gbit/s) for the simulator's 1 MiB pages and
-/// production's 16 MiB pages. Chosen by measurement ("Round 4: fanout" and
-/// "Round 4: relay (wave 3)" in `designs/racer-core-simulation.md`).
+/// production's 16 MiB pages. Chosen by measurement in `racer-sim` ("Hot page
+/// fanout" in `designs/racer-core-simulation.md`).
 pub const HOT_PAGE_QUEUE_BYTES: u64 = 32 << 20;
 
 /// Fewest concurrent bodies of one page before an owner may shed, whatever
