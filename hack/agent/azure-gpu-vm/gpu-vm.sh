@@ -179,9 +179,11 @@ cmd_setup-nvidia() {
     echo "    GDS:             ${GDS}"
     echo ""
 
-    local params=("${VM_SIZE}")
+    # Use name=value so az does not parse "--gds" as its own option. For
+    # Linux scripts the values are passed to the script positionally.
+    local params=("sku=${VM_SIZE}")
     if [[ "${GDS}" == true ]]; then
-        params+=(--gds)
+        params+=("gds=--gds")
     fi
 
     echo "==> Uploading and executing driver install script..."
