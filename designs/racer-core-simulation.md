@@ -3666,6 +3666,10 @@ waiters still wanted the page:
     `FlightOperation::poll_cancellation`, which refreshes the entry (so an adopter can take over)
     and registers a wake at the current leader's deadline in the worker's deadline registry. The
     fill is canceled once no live waiter remains.
+  - `poll_cancellation` also records the driver's waker in the flight entry. Canceling or
+    dropping any waiter of a flight with a running operation wakes the driver, so when the last
+    adopter goes away the fill cancels its fetch and releases its reservations right away instead
+    of at the leader's deadline alarm, the scope ceiling, or unrelated I/O.
   - `Flights::fail` turns the elected caller's own `DeadlineExceeded` or `Cancelled` into a
     retry after a handover, so the adopter leads with its own unspent budget instead of failing.
 - Core `PageFlights`: `allow_handover`, `leader_deadline`, `handed_over`, `abandon` (production
@@ -3697,7 +3701,8 @@ Budgets and authority:
   `handed_over_fill_deadline_retries_and_last_expiry_revokes`, and
   `handover_outcome_maps_only_caller_scope_failures`.
 - Production flights: `canceled_leader_hands_running_operation_to_live_waiter`,
-  `handover_ends_with_last_adopter_and_caller_scope_failure_retries`, and
+  `handover_ends_with_last_adopter_and_caller_scope_failure_retries`,
+  `last_adopter_gone_wakes_driver_promptly`, and
   `without_handover_canceled_leader_revokes_running_operation`.
 - Production fill driver: `canceled_leader_fill_driver_continues_for_remaining_caller` checks
   that the driver never sees a cancellation request and that the remaining caller completes

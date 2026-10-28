@@ -1330,6 +1330,59 @@ mod flight {
             failed(&mut e, Error::Io);
         }
 
+        /// Dropping or canceling the last adopter wakes the driver polling the
+        /// handed-over operation so it cancels its fetch and releases its
+        /// charges promptly, while a remaining adopter keeps the work running.
+        #[test]
+        fn last_adopter_gone_wakes_driver_promptly() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            struct Wakes(AtomicUsize);
+            impl futures::task::ArcWake for Wakes {
+                fn wake_by_ref(arc_self: &std::sync::Arc<Self>) {
+                    arc_self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            let wakes = std::sync::Arc::new(Wakes(AtomicUsize::new(0)));
+            let waker = futures::task::waker(wakes.clone());
+            let cx = &mut Context::from_waker(&waker);
+            let flights = flights(FlightLimits::default());
+            let (context, scope_a, scope_b, scope_c) = (origin(), scope(), scope(), scope());
+            let (mut a_budget, mut b_budget, mut c_budget) = (budget(), budget(), budget());
+            let mut a = join(&flights, &context, &scope_a, &mut a_budget);
+            let b = join(&flights, &context, &scope_b, &mut b_budget);
+            let mut c = join(&flights, &context, &scope_c, &mut c_budget);
+            let leader = lead(&mut a);
+            let page = fence().page;
+            let mut operation = flights.retain_operation(&leader, metric_lease()).unwrap();
+            flights.allow_handover(&leader).unwrap();
+            assert!(!operation.poll_cancellation(cx));
+            scope_a.cancel().unwrap();
+            failed(&mut a, Error::Cancelled);
+            drop(a);
+            assert!(!operation.poll_cancellation(cx), "b and c adopt");
+            let before = wakes.0.load(Ordering::SeqCst);
+            drop(b);
+            assert!(wakes.0.load(Ordering::SeqCst) > before, "driver re-checks");
+            assert!(!operation.poll_cancellation(cx), "c keeps the fill running");
+            let before = wakes.0.load(Ordering::SeqCst);
+            scope_c.cancel().unwrap();
+            assert!(poll(c.wait()).is_ready());
+            assert!(
+                wakes.0.load(Ordering::SeqCst) > before,
+                "canceling the last adopter wakes the driver"
+            );
+            assert!(operation.poll_cancellation(cx));
+            drop(c);
+            operation.complete().unwrap();
+            let _ = flights.fail(leader, AcquisitionFailure::Terminal(Error::Cancelled));
+            assert!(!flights.acquiring(&page));
+            let drain_scope = scope();
+            assert!(
+                matches!(poll(flights.drain(&drain_scope)), Poll::Ready(Ok(()))),
+                "no flight charges remain"
+            );
+        }
+
         /// Without handover (warm gates fence on the operation) the old
         /// cancellation stands even when another waiter remains.
         #[test]

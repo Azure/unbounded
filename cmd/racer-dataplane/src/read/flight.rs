@@ -134,6 +134,10 @@ pub(super) struct Entry {
 
     fence: Fence,
     state: FlightCore,
+    /// Driver polling a handover-enabled operation, woken when a waiter
+    /// detaches or is canceled so it re-evaluates whether any live waiter
+    /// still needs the work (Known issue 30).
+    driver_waker: Option<Waker>,
     operations: coalesce::flight::Operations<Retained, FlightHashState>,
     _reservation: FlightCharge,
 }
@@ -317,12 +321,12 @@ impl FlightOperation {
     /// Refreshes the entry first, so an expired leader of a handover-enabled
     /// acquisition passes to another live waiter rather than ending the work.
     pub fn cancellation_requested(&self) -> bool {
-        self.leader_deadline().is_none()
+        self.leader_deadline(None).is_none()
     }
 
     /// Deadline of the waiter this operation currently serves, or `None` once
     /// the acquisition was revoked, settled, or stopped.
-    fn leader_deadline(&self) -> Option<Instant> {
+    fn leader_deadline(&self, waker: Option<&Waker>) -> Option<Instant> {
         self.flights.update(|table, wakes| {
             if table.is_stopping() {
                 return None;
@@ -330,6 +334,12 @@ impl FlightOperation {
             let entry = table.get_mut(&self.fence.page)?;
             self.fence.validate(&entry.fence).ok()?;
             refresh(entry, wakes);
+            if let Some(waker) = waker {
+                match &mut entry.driver_waker {
+                    Some(current) if current.will_wake(waker) => {}
+                    slot => *slot = Some(waker.clone()),
+                }
+            }
             let waiter = entry.leader.and_then(|id| entry.waiters.get(&id))?;
             if !matches!(entry.phase, Phase::Acquiring) || waiter.scope.check().is_err() {
                 return None;
@@ -342,7 +352,7 @@ impl FlightOperation {
     /// woken at the current leader's deadline (Known issue 30). The worker
     /// expires the alarm through [`Flights::poll_with_context`].
     pub(super) fn poll_cancellation(&mut self, cx: &mut Context<'_>) -> bool {
-        let Some(deadline) = self.leader_deadline() else {
+        let Some(deadline) = self.leader_deadline(Some(cx.waker())) else {
             self.alarm = None;
             return true;
         };
@@ -969,6 +979,7 @@ impl Flights {
                             identity,
                         },
                         state: FlightCore::default(),
+                        driver_waker: None,
                         operations: coalesce::flight::Operations::default(),
                         _reservation: flight,
                     },
@@ -1761,6 +1772,15 @@ fn refresh(entry: &mut Entry, wakes: &mut Vec<Waker>) {
         wakes,
     );
 }
+/// A detached or canceled waiter may have been the last one the running
+/// driver serves; let it re-check instead of waiting for its alarm or I/O.
+fn wake_driver(entry: &mut Entry, wakes: &mut Vec<Waker>) {
+    if !entry.operations.is_empty()
+        && let Some(waker) = entry.driver_waker.take()
+    {
+        wakes.push(waker);
+    }
+}
 fn validate_leader(entry: &Entry, leader: &FlightLeader) -> Result<()> {
     leader.fence.validate(&entry.fence)?;
     entry
@@ -1792,6 +1812,7 @@ impl Registration {
             if let Ok(entry) = registered(table, self) {
                 entry.state.cancel(self.id, error);
                 refresh(entry, wakes);
+                wake_driver(entry, wakes);
             }
         });
     }
@@ -1800,6 +1821,7 @@ impl Registration {
             let entry = registered(table, self)?;
             entry.state.detach(self.id);
             refresh(entry, wakes);
+            wake_driver(entry, wakes);
             let state = entry.phase.state();
             let removed = table.remove_quiescent(&self.fence.page);
             if removed.is_some() {
